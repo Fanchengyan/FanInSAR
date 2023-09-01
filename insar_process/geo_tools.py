@@ -1,9 +1,11 @@
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import rasterio
 import xarray as xr
 from rasterio import transform
+from rasterio.crs import CRS
 from rasterio.io import MemoryFile
 from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
@@ -69,7 +71,7 @@ def latlon_from_meta(meta: Dict) -> np.ndarray:
 def write_geoinfo_into_ds(
     ds: Union[xr.DataArray, xr.Dataset],
     vars: Optional[Union[str, Tuple, List]] = None,
-    crs: Union[str, int, Dict] = "EPSG:4326",
+    crs: Union[str, int, Dict, CRS] = "EPSG:4326",
     x_dim: str = "lon",
     y_dim: str = "lat"
 ):
@@ -82,7 +84,7 @@ def write_geoinfo_into_ds(
         vars should be set
     vars: str, tuple or list
         variables that need to be added geoinformation
-    crs: str or int
+    crs: str, int, dict or rasterio.crs.CRS object
         the coordinate reference system. Could be any type that
         rasterio.crs.from_user_input accepts, such as:
           - EPSG code/string
@@ -113,7 +115,12 @@ def write_geoinfo_into_ds(
 
 
 def write_geoinfo_into_nc(
-    nc_file, vars, crs="EPSG:4326", x_dim="lon", y_dim="lat", encode_time=False
+    nc_file: Union[str, Path],
+    vars: Optional[Union[str, Tuple, List]] = None,
+    crs: Union[str, int, Dict, CRS] = "EPSG:4326",
+    x_dim: str = "lon",
+    y_dim: str = "lat",
+    encode_time: bool = False
 ):
     """write geoinformation in to the given nc file and making it could be
     opened with geoinformation in QGIS directly.
@@ -126,7 +133,7 @@ def write_geoinfo_into_nc(
         variables that need to be added geoinformation
     x_dim/y_dim: str
         the coordinate name that presents the x/y dimension
-    crs: str or int
+    crs: str, int, dict or rasterio.crs.CRS object
         the coordinate reference system. Could be any type that
         rasterio.crs.from_user_input accepts, such as:
           - EPSG code/string
