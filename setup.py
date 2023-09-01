@@ -33,10 +33,10 @@ setuptools.setup(
     description="Scripts for processing InSAR data",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/Fanchengyan/licsbas_temp",
+    url="https://github.com/Fanchengyan/InSAR_Process",
     packages=setuptools.find_packages(),
     install_requires=install_requires,
-    package_data={'LiCSBAS': get_scm_files()},
+    package_data={'insar_process': get_scm_files()},
     include_package_data=True,
     classifiers=[
         "Programming Language :: Python :: 3",
