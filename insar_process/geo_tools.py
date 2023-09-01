@@ -45,22 +45,22 @@ def transform_from_latlon(lat, lon) -> Affine:
     return tf
 
 
-def latlon_from_transform(tf: Affine, width: int, height: int) -> np.ndarray:
-    '''get the latitude and longitude from rasterio.transform
+def latlon_from_meta(meta: Dict) -> np.ndarray:
+    '''get the latitude and longitude from rasterio meta data
 
     Parameters:
     -----------
-    tf: rasterio.Affine
-        the transform of the rasterio
-    width: int
-        the width of the image
-    height: int
-        the height of the image
+    meta: dict
+        the meta data of rasterio dataset. It can be get from
+        rasterio.open().meta
 
     Returns:
     --------
     lat, lon: numpy.ndarray
     '''
+    tf = meta["transform"]
+    width = meta["width"]
+    height = meta["height"]
     lon = tf.xoff + tf.a * np.arange(width) + tf.a*0.5
     lat = tf.yoff + tf.e * np.arange(height) + tf.e*0.5
     return lat, lon
