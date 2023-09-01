@@ -2,6 +2,7 @@ import csv
 from pathlib import Path
 
 import setuptools
+from insar_process import __version__ as version
 
 with open("README.md", "r", encoding='UTF-8') as fh:
     long_description = fh.read()
@@ -17,7 +18,7 @@ def get_scm_files():
     """
     Returns a list of all files in the SCM directory and its subdirectories.
     """
-    scm_dir = Path('insar_process/SCM')
+    scm_dir = Path('insar_process/cmaps/SCM')
     scm_files = []
     for file_path in scm_dir.glob('**/*'):
         if file_path.is_file():
@@ -27,7 +28,7 @@ def get_scm_files():
 
 setuptools.setup(
     name="INSAR_PROCESS",
-    version="0.0.1",
+    version=version,
     author="Fancy",
     author_email="fanchy14@lzu.edu.cn",
     description="Scripts for processing InSAR data",

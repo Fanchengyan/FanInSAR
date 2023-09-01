@@ -8,6 +8,6 @@ except:
     print('hyp3_sdk not installed')
     print('install with: pip install hyp3_sdk')
     print('or: conda install -c conda-forge hyp3_sdk -y')
-    sys.exit(1)
+
 
 
