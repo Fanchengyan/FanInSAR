@@ -17,3 +17,5 @@ for name in __all__:
     file = cwd / name / f'{name}.txt'
     cm_data = np.loadtxt(file)
     vars()[name] = LinearSegmentedColormap.from_list(name, cm_data)
+    vars()["{name}_r"] = LinearSegmentedColormap.from_list(f"{name}_r", cm_data[::-1])
+    
