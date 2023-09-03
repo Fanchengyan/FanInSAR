@@ -1,5 +1,8 @@
 from pathlib import Path
 import numpy as np
+import pandas as pd
+from typing import List, Union, Tuple, Optional, Callable
+from datetime import datetime
 
 
 class SBAS_Network:
@@ -94,7 +97,7 @@ class SBAS_Network:
 
     def unw_file_of_pair(self, pair, pattern="*unw_phase.tif"):
         '''return path to unw file for a given pair
-        
+
         Parameters
         ----------
         pair : tuple
@@ -125,3 +128,72 @@ class SBAS_Network:
         '''return all pairs of a given date'''
         pairs = [pair for pair in self.pairs if date in pair]
         return pairs
+
+
+class Loops:
+    '''Loops class to handle loop files for a given directory.'''
+
+    def __init__(
+        self,
+        home_dir: Union[str, Path],
+        file_type: str = 'tif',
+    ) -> None:
+        '''initialize the loops class
+
+        Parameters:
+        ----------
+        home_dir: Path
+            Path to the home directory containing all the loops.
+        file_type: str, one of ['tif', 'nc']
+            File type of the loops. Default is 'tif'.
+        '''
+        self.home_dir = Path(home_dir)
+        self.loop_files = sorted(self.home_dir.glob(f'*.{file_type}'))
+
+    @staticmethod
+    def get_loop_file_dates(
+        loop_file: Union[str, Path],
+        parse_function: Optional[Callable] = None,
+        date_args: Optional[dict] = None,
+    ) -> Tuple[datetime, datetime, datetime]:
+        '''parse three Dates from loop file name
+
+        Parameters:
+        ----------
+        loop_file: str or Path
+            Path to the loop file.
+        parse_function: Callable, optional
+            Function to parse the date strings from the loop file name.
+            If None, the loop file name will be split by '_' and 
+            the last 3 items will be used. Default is None.
+        date_args: dict, optional
+            Keyword arguments for pd.to_datetime() to convert the date strings 
+            to datetime objects. For example, {'format': '%Y%m%d'}. 
+            Default is None.
+            
+        Returns:
+        --------
+        date1, date2, date3: datetime
+            Three Dates of the loop file with format of datetime.
+        '''
+        loop_str = Path(loop_file).stem
+        if parse_function is not None:
+            date1, date2, date3 = parse_function(loop_str)
+        else:
+            items = loop_str.split('_')
+            if len(items) >= 3:
+                date1, date2, date3 = items[-3:]
+                if not (len(date1) == len(date2) == len(date3)):
+                    raise ValueError(
+                        f'Loop file name {loop_file} not recognized.')
+            else:
+                raise ValueError(f'Loop file name {loop_file} not recognized.')
+
+        if date_args is None:
+            date_args = {}
+        date_args.update({"errors": 'raise'})
+
+        date1 = pd.to_datetime(date1, **date_args)
+        date2 = pd.to_datetime(date2, **date_args)
+        date3 = pd.to_datetime(date3, **date_args)
+        return date1, date2, date3
