@@ -39,16 +39,16 @@ class SBASNetwork:
         Make loop matrix (containing 1, -1, 0) from ifg_dates.
 
         Returns:
+        --------
         Loops : Loop matrix with 1 for pair12/pair23 and -1 for pair13
-                (n_loop, n_ifg)
-
+                with the shape of (n_loop, n_ifg)
         """
         n_ifg = len(self.pairs)
         Loops = []
-
         for idx_pair12, pair12 in enumerate(self.pairs):
-            pairs23 = [pair for pair in self.pairs if pair[0]
-                       == pair12[1]]  # all candidates of ifg23
+            pairs23 = [
+                pair for pair in self.pairs if pair[0] == pair12[1]
+            ]  # all candidates of ifg23
 
             for pair23 in pairs23:  # for each candidate of ifg23
                 try:
@@ -67,52 +67,29 @@ class SBASNetwork:
 
         return np.array(Loops)
 
-    def _ifg_pairs_from_hyp3_names(self, ifg_names):
-        """Get interferogram pairs from hyp3 names.
-
-        Parameters:
-        -----------
-        ifg_names: list
-            List of interferogram names in hyp3 format.
-        """
-        def _name2pair(name):
-            pair = name.split("_")[1:3]
-            pair = pair[0][:8], pair[1][:8]
-            return pair
-
-        pairs = [_name2pair(i) for i in ifg_names]
-        return pairs
-
-    def _get_ifg_pairs_from_list(self, ifg_names):
-        '''Get interferogram pairs from a list of interferogram names.
-
-        Parameters:
-        -----------
-        ifg_names: list
-            List of interferogram names. Each name should be in the format 
-            of 'yyyymmdd_yyyymmdd'. For example, '20190101_20190201'.
-        '''
-        pairs = [name.split("_") for name in ifg_names]
-        return pairs
-
     @classmethod
-    def from_dir(cls, ifg_dir, type='hyp3'):
+    def from_ifg_dir(cls, ifg_dir, ifg_type='hyp3'):
         '''initialize SBASNetwork class from a directory of interferograms
 
         Parameters
         ----------
         ifg_dir : Path or str
             Path to directory containing interferograms.
-        type : str, optional
+        ifg_type : str, optional
             Type of interferogram. The default is 'hyp3'.
         '''
         ifg_dir = Path(ifg_dir)
         if not ifg_dir.exists():
             raise FileNotFoundError(f"{ifg_dir} not found")
 
-        if type == 'hyp3':
+        if ifg_type == 'hyp3':
             ifg_names = [i.name for i in ifg_dir.iterdir()]
-            pairs = cls._ifg_pairs_from_hyp3_names(ifg_names)
+
+            def _name2pair(name):
+                pair = name.split("_")[1:3]
+                pair = pair[0][:8], pair[1][:8]
+                return pair
+            pairs = [_name2pair(i) for i in ifg_names]
         else:
             # TODO: add other types
             pass
@@ -120,15 +97,18 @@ class SBASNetwork:
         return cls(pairs)
 
     @classmethod
-    def from_name_list(cls, ifg_names):
-        '''initialize SBASNetwork class from a list of interferogram names
+    def from_pair_names(cls, ifg_names):
+        '''initialize SBASNetwork class from a list of pair names
 
         Parameters:
         -----------
         ifg_names: list
-            List of interferogram names.
+            List of pair names. Each pair name should be in the format 
+            of 'yyyymmdd_yyyymmdd'.
         '''
-        pairs = cls._get_ifg_pairs_from_list(ifg_names)
+        if not isinstance(ifg_names, list):
+            raise TypeError('ifg_names should be a list.')
+        pairs = pairs = [tuple(name.split("_")) for name in ifg_names]
         return cls(pairs)
 
     @property
@@ -237,7 +217,7 @@ class Loops:
         return cls(loops)
 
     @classmethod
-    def from_name_list(
+    def from_pair_names(
         cls,
         loop_names: List[str],
         parse_function: Optional[Callable] = None,
