@@ -1,10 +1,14 @@
+import pprint
+from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 import rasterio
 import xarray as xr
-from rasterio import transform
+from rasterio import Affine, dtypes, transform
 from rasterio.crs import CRS
 from rasterio.io import MemoryFile
 from rasterio.transform import Affine
@@ -56,7 +60,7 @@ def latlon_from_meta(meta: Dict) -> np.ndarray:
         the meta data of rasterio dataset. It can be get from
         rasterio.open().meta
 
-    Returns:
+    Returns
     --------
     lat, lon: numpy.ndarray
     '''
@@ -218,3 +222,414 @@ def match_to_raster(
                         )
                     arr_dst = dst.read(indexes)
     return arr_dst
+
+
+class GeoDataFormatConverter:
+    '''A class to convert data format between raster and binary.
+
+    Examples
+    --------
+    ::
+
+        >>> from pathlib import Path
+        >>> from data_tool import GeoDataFormatConverter
+        >>> phase_file = Path("phase.tif")
+        >>> amplitude_file = Path("amplitude.tif")
+        >>> binary_file = Path("phase.int")
+
+        load/add raster and convert to binary
+
+        >>> gfc = GeoDataFormatConverter()
+        >>> gfc.load_raster(phase_file)
+        >>> gfc.add_band_from_raster(amplitude_file)
+        >>> gfc.to_binary(binary_file)
+
+        load binary file
+
+        >>> gfc.load_binary(binary_file)
+        >>> print(gfc.arr.shape)
+    '''
+
+    def __init__(self) -> None:
+        self.arr: np.ndarray = None
+        self.profile: dict = None
+
+    @property
+    def _profile_str(self):
+        return pprint.pformat(self.profile, sort_dicts=False)
+
+    def __str__(self) -> str:
+        return f"DataConverter: \n{self._profile_str}"
+
+    def __repr__(self) -> str:
+        return str(self)
+
+    def _load_raster(self, raster_file: Union[str, Path]):
+        '''Load a raster file into the data array.'''
+        with rasterio.open(raster_file) as ds:
+            arr = ds.read()
+            profile = ds.profile.copy()
+        return arr, profile
+
+    def load_binary(self, binary_file: Union[str, Path], order='BSQ', dtype='auto'):
+        '''Load a binary file into the data array.
+
+        Parameters
+        ----------
+        binary_file : str or Path
+            The binary file to be loaded. the binary file should be with a profile file with the same name.
+        order : str, one of ['BSQ', 'BIP', 'BIL']
+            The order of the data array. 'BSQ' for band sequential, 'BIP' for band interleaved by pixel, 
+            'BIL' for band interleaved by line. Default is 'BSQ'. 
+            See: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
+        '''
+        binary_profile_file = str(binary_file) + '.profile'
+        if not Path(binary_profile_file).exists():
+            raise FileNotFoundError(f"{binary_profile_file} not found")
+
+        with open(binary_profile_file, 'r') as f:
+            profile = eval(f.read())
+
+        # todo: auto detect dtype by shape
+        if dtype == 'auto':
+            dtype = np.float32
+
+        arr = np.fromfile(binary_file, dtype=dtype)
+        if order == 'BSQ':
+            arr = arr.reshape(profile['count'],
+                              profile['height'],
+                              profile['width'])
+        elif order == 'BIP':
+            arr = (arr.reshape(profile['height'],
+                               profile['width'],
+                               profile['count'])
+                   .transpose(2, 0, 1))
+        elif order == 'BIL':
+            arr = (arr.reshape(profile['height'],
+                               profile['count'],
+                               profile['width'])
+                   .transpose(1, 0, 2))
+        else:
+            raise ValueError(
+                "order should be one of ['BSQ', 'BIP', 'BIL'],"
+                f" but got {order}"
+            )
+
+        if 'dtype' not in profile:
+            profile['dtype'] = dtypes.get_minimum_dtype(arr)
+
+        self.arr = arr
+        self.profile = profile
+
+    def load_raster(self, raster_file: Union[str, Path]):
+        '''Load a raster file into the data array.
+
+        Parameters
+        ----------
+        raster_file : str or Path
+            The raster file to be loaded. raster format should be supported by gdal. 
+            See: https://gdal.org/drivers/raster/index.html
+        '''
+        self.arr, self.profile = self._load_raster(raster_file)
+
+    def to_binary(self, out_file: Union[str, Path], order='BSQ'):
+        '''Write the data array into a binary file.
+
+        Parameters
+        ----------
+        out_file : str or Path
+            The binary file to be written. the binary file will be with a profile file with the same name.
+        order : str, one of ['BSQ', 'BIP', 'BIL']
+            The order of the data array. 'BSQ' for band sequential, 'BIP' for band interleaved by pixel, 
+            'BIL' for band interleaved by line. Default is 'BSQ'. 
+            See: https://desktop.arcgis.com/en/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
+        '''
+        if order == 'BSQ':
+            arr = self.arr
+        elif order == 'BIL':
+            arr = np.transpose(self.arr, (1, 2, 0))
+        elif order == 'BIP':
+            arr = np.transpose(self.arr, (1, 0, 2))
+
+        # write data into a binary file
+        (arr.astype(np.float32)
+         .tofile(out_file))
+
+        # write profile into a file with the same name
+        out_profile_file = str(out_file) + '.profile'
+        with open(out_profile_file, 'w') as f:
+            f.write(self._profile_str)
+
+    def to_raster(self, out_file: Union[str, Path], driver='GTiff'):
+        '''Write the data array into a raster file.
+
+        Parameters
+        ----------
+        out_file : str or Path
+            The raster file to be written. 
+        driver : str
+            The driver to be used to write the raster file. See: https://gdal.org/drivers/raster/index.html
+        '''
+        self.profile.update({'driver': driver})
+        with rasterio.open(out_file, 'w', **self.profile) as ds:
+            bands = range(1, self.profile['count']+1)
+            ds.write(self.arr, bands)
+
+    def add_band(self, arr: np.ndarray):
+        '''Add a band to the data array.
+
+        Parameters
+        ----------
+        arr : 2D or 3D numpy.ndarray
+            The array to be added. The shape of the array should be (height, width) or (band, height, width).
+        '''
+        if not isinstance(arr, np.ndarray):
+            try:
+                arr = np.array(arr)
+            except:
+                raise TypeError("arr can not be converted to numpy array")
+
+        if len(arr.shape) == 2:
+            arr = np.concatenate((self.arr, arr[None, :, :]), axis=0)
+        if len(arr.shape) == 3:
+            arr = np.concatenate((self.arr, arr), axis=0)
+
+        self.update_arr(arr)
+
+    def add_band_from_raster(self, raster_file: Union[str, Path]):
+        '''Add band to the data array from a raster file.
+
+        Parameters
+        ----------
+        raster_file : str or Path
+            The raster file to be added. raster format should be supported by gdal. See: https://gdal.org/drivers/raster/index.html
+        '''
+        arr, profile = self._load_raster(raster_file)
+        self.add_band(arr)
+
+    def add_band_from_binary(self, binary_file: Union[str, Path]):
+        '''Add band to the data array from a binary file.
+
+        Parameters
+        ----------
+        binary_file : str or Path
+            The binary file to be added. the binary file should be with a profile file with the same name.
+        '''
+        arr, profile = self._load_binary(binary_file)
+        self.add_band(arr)
+
+    def update_arr(
+        self,
+        arr: np.ndarray,
+        dtype: str = 'auto',
+        nodata: Union[int, float, None, str] = 'auto',
+        error_if_nodata_invalid: bool = True,
+    ):
+        '''update the data array.
+
+        Parameters
+        ----------
+        arr : numpy.ndarray
+            The array to be updated. The profile will be updated accordingly.
+        dtype : str or numpy.dtype
+            The dtype of the array. If 'auto', the minimum dtype will be used. Default is 'auto'.
+        nodata : int, float, None or 'auto'
+            The nodata value of the array. If 'auto', the nodata value will be set to the nodata value of the profile if valid, otherwise None. Default is 'auto'.
+        error_if_nodata_invalid : bool
+            Whether to raise error if nodata is out of dtype range. Default is True.
+        '''
+        self.arr = arr
+        if not hasattr(self, 'profile'):
+            raise AttributeError("profile is not set yet")
+
+        # update profile info
+        self.profile['count'] = arr.shape[0]
+        self.profile['height'] = arr.shape[1]
+        self.profile['width'] = arr.shape[2]
+
+        if dtype == 'auto':
+            self.profile['dtype'] = dtypes.get_minimum_dtype(arr)
+        else:
+            if not dtypes.check_dtype(dtype):
+                raise ValueError(f"dtype {dtype} is not supported")
+            self.profile['dtype'] = dtype
+
+        if nodata == 'auto':
+            nodata = self.profile['nodata']
+            error_if_nodata_invalid = False
+
+        if nodata is None:
+            self.profile['nodata'] = None
+        else:
+            dtype_ranges = dtypes.dtype_ranges[self.profile['dtype']]
+            if dtypes.in_dtype_range(nodata, self.profile['dtype']):
+                self.profile['nodata'] = nodata
+            else:
+                if error_if_nodata_invalid:
+                    raise ValueError(
+                        f"nodata {nodata} is out of dtype range {dtype_ranges}")
+                else:
+                    print('Warning: nodata is out of dtype range, '
+                          'nodata will be set to None')
+                    self.profile['nodata'] = None
+
+
+class PhaseDeformationConverter:
+    '''A class to convert between phase and deformation(LOS) for SAR interferometry.'''
+
+    def __init__(self, wavelength: float = None, frequency: float = None) -> None:
+        '''Initialize the converter. Either wavelength or frequency should be provided. If both are provided, wavelength will be recalculated by frequency.
+
+        Parameters
+        ----------
+        wavelength : float
+            The wavelength of the radar signal. Unit: meter.
+        frequency : float
+            The frequency of the radar signal. Unit: Hz.
+        '''
+        speed_of_light = 299792458
+        if wavelength is None and frequency is None:
+            raise ValueError(
+                "Either wavelength or frequency should be provided.")
+        elif frequency is not None:
+            self.wavelength = speed_of_light/frequency  # meter
+            self.frequency = frequency
+        elif wavelength is not None and frequency is None:
+            self.frequency = speed_of_light/wavelength
+            self.wavelength = wavelength
+        else:
+            raise ValueError(
+                "Either wavelength or frequency should be provided.")
+
+        # convert radian to mm
+        self.coef_rd2mm = - wavelength/4/np.pi*1000
+
+    def __str__(self) -> str:
+        return f"PhaseDeformationConverter(wavelength={self.wavelength})"
+
+    def __repr__(self) -> str:
+        return str(self)
+
+    def phase2deformation(self, phase: np.ndarray):
+        return phase * self.coef_rd2mm
+
+    def deformation2phase(self, deformation: np.ndarray):
+        return deformation / self.coef_rd2mm
+
+    def wrap_phase(self, phase: np.ndarray):
+        return np.mod(phase, 2*np.pi)
+
+
+class Profile:
+    '''a class to manage the profile of a raster file. 
+    The profile is the metadata of the raster file and 
+    can be recognized by rasterio package'''
+
+    def __init__(self, profile: dict = None) -> None:
+        self.profile = profile
+
+    def __str__(self) -> str:
+        return pprint.pformat(self.profile, sort_dicts=False)
+
+    def __repr__(self) -> str:
+        return str(self)
+
+    def __getitem__(self, key):
+        return self.profile[key]
+
+    def __setitem__(self, key, value):
+        self.profile[key] = value
+
+    def __contains__(self, key):
+        return key in self.profile
+
+    def __iter__(self):
+        return iter(self.profile)
+
+    def __len__(self):
+        return len(self.profile)
+
+    def __delitem__(self, key):
+        del self.profile[key]
+
+    def __eq__(self, other):
+        return self.profile == other.profile
+
+    def __ne__(self, other):
+        return self.profile != other.profile
+
+    @classmethod
+    def from_raster_file(cls, raster_file: Union[str, Path]):
+        '''Create a Profile object from a raster file.'''
+        with rasterio.open(raster_file) as ds:
+            profile = ds.profile.copy()
+        return cls(profile)
+
+    @classmethod
+    def from_ascii_header_file(cls, ascii_file: Union[str, Path]):
+        '''Create a Profile object from an ascii header file. 
+        The ascii header file is the metadata of a binary.
+        More information can be found at: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm
+
+        Example of an ascii header file
+        -------------------------------
+        ::
+
+            ncols         43200
+            nrows         18000
+            xllcorner     -180.000000
+            yllcorner     -60.000000
+            cellsize      0.008333
+            NODATA_value  -9999
+        '''
+        df = pd.read_csv(ascii_file, sep='\s+', header=None, index_col=0)
+        df.index = df.index.str.lower()
+
+        width = int(df.loc['ncols', 1])
+        height = int(df.loc['nrows', 1])
+        cell_size = float(df.loc['cellsize', 1])
+        try:
+            left = float(df.loc['xllcorner', 1])
+            bottom = float(df.loc['yllcorner', 1])
+        except:
+            left = float(df.loc['xllcenter', 1]) - cell_size/2
+            bottom = float(df.loc['yllcenter', 1]) - cell_size/2
+
+        # pixel left lower corner to pixel left upper corner (rasterio transform)
+        top = bottom + (height+1) * cell_size
+
+        tf = transform.from_origin(left, top, cell_size, cell_size)
+
+        nodata = None
+        if 'nodata_value' in df.index:
+            nodata = float(df.loc['nodata_value', 1])
+
+        profile = {
+            'width': width,
+            'height': height,
+            'transform': tf,
+            'count': 1,
+            'nodata': nodata,
+        }
+
+        return cls(profile)
+
+    @classmethod
+    def from_dict(cls, profile: dict):
+        '''Create a Profile object from a dict.'''
+        return cls(profile)
+
+    @classmethod
+    def from_profile_file(cls, profile_file: Union[str, Path]):
+        '''Create a Profile object from a profile file.'''
+        with open(profile_file, 'r') as f:
+            profile = eval(f.read())
+        return cls(profile)
+
+    def to_file(self, file: Union[str, Path]):
+        '''Write the profile into a file.'''
+        file = Path(file)
+        if file.suffix != '.profile':
+            file = file.parent / (file.name + '.profile')
+        with open(file, 'w') as f:
+            f.write(str(self))

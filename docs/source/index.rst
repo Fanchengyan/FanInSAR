@@ -4,9 +4,8 @@
    contain the root `toctree` directive.
 
 ==================================
-Welcome to FanSAR's documentation!
+Welcome to FancySAR's documentation!
 ==================================
-
 
 
 Introduction
