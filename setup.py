@@ -2,7 +2,7 @@ import csv
 from pathlib import Path
 
 import setuptools
-from insar_process import __version__ as version
+from faninsar import __version__ as version
 
 with open("README.md", "r", encoding='UTF-8') as fh:
     long_description = fh.read()
