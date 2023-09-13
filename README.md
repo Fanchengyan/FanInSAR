@@ -1,2 +1,3 @@
-# InSAR_Process
-Scripts for processing InSAR data
+# FanInSAR
+
+A fantastic InSAR processing library, in a more pythonic way, to accelerate your InSAR processing workflow.

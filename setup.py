@@ -27,11 +27,11 @@ def get_scm_files():
 
 
 setuptools.setup(
-    name="INSAR_PROCESS",
+    name="FanInSAR",
     version=version,
     author="Fancy",
     author_email="fanchy14@lzu.edu.cn",
-    description="Scripts for processing InSAR data",
+    description="A fantastic InSAR processing library, in a more pythonic way, to accelerate your InSAR processing workflow.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/Fanchengyan/InSAR_Process",
