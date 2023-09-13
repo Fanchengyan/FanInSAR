@@ -394,12 +394,12 @@ class Pairs:
         ascending: bool = True,
         return_index: bool = False
     ) -> Optional[np.ndarray]:
-        '''sort the loops
+        '''sort the pairs
 
         Parameters
         ----------
         order: str or list of str, optional
-            By which fields to sort the loops. This argument specifies
+            By which fields to sort the pairs. This argument specifies
             which fields to compare first, second, etc. Default is 'pairs'.
 
             The available options are one or a list of:
@@ -407,7 +407,7 @@ class Pairs:
         ascending: bool, optional
             Whether to sort ascending. Default is True.
         return_index: bool, optional
-            Whether to return the index of the sorted loops. Default is False.
+            Whether to return the index of the sorted pairs. Default is False.
 
         Returns
         -------
@@ -427,8 +427,8 @@ class Pairs:
             if i not in item_map.keys():
                 raise ValueError(
                     f"order should be one of {list(item_map.keys())}, but got {order}.")
-            _values.append(item_map[i])
-        _values = np.array(_values).T
+            _values.append(item_map[i].reshape(self._length, -1))
+        _values = np.hstack(_values)
         _, _index = np.unique(
             _values, axis=0, return_index=True)
         if not ascending:
@@ -1043,8 +1043,8 @@ class Loops:
             if i not in item_map.keys():
                 raise ValueError(
                     f"order should be one of {list(item_map.keys())}, but got {order}.")
-            _values.append(item_map[i])
-        _values = np.array(_values).T
+            _values.append(item_map[i].reshape(self._length, -1))
+        _values = np.hstack(_values)
         _, _index = np.unique(
             _values, axis=0, return_index=True)
         if not ascending:
