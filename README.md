@@ -1,2 +1,2 @@
-# InSAR_Process
+# FanInSAR
 Scripts for processing InSAR data
