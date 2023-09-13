@@ -806,6 +806,11 @@ class Loops:
         return self._dates
 
     @property
+    def shape(self) -> Tuple[int, int]:
+        '''return the shape of the loop array'''
+        return self._values.shape
+
+    @property
     def pairs(self) -> Pairs:
         '''return the sorted all pairs of the loops.
 
@@ -925,8 +930,10 @@ class Loops:
         loops: Loops
             unsorted Loops object.
         '''
-        loops = [cls.dates_of_loop(i, parse_function, date_args)
-                 for i in names]
+        loops = []
+        for name in names:
+            loop = Loop.from_name(name, parse_function, date_args)
+            loops.append(loop.values)
         return cls(loops, sort=False)
 
     def to_names(self, prefix: Optional[str] = None) -> List[str]:
@@ -964,6 +971,7 @@ class Loops:
             raise ValueError(
                 f"target should be 'pairs' or 'dates', but got {target}.")
 
+    # @njit() # TODO: accelerate the function using numba
     def to_matrix(self) -> np.ndarray:
         """
         return loop matrix (containing 1, -1, 0) from pairs.
@@ -978,19 +986,20 @@ class Loops:
             - -1: pair13
             - 0: otherwise
         """
+
         n_loop = len(self)
         n_pair = len(self.pairs)
         matrix = np.zeros((n_loop, n_pair))
+        pairs_ls = self.pairs.values.tolist()
         for i, loop in enumerate(self.values):
-            matrix[i, self.pairs.values.tolist().index(loop[:2].tolist())] = 1
-            matrix[i, self.pairs.values.tolist().index(loop[1:].tolist())] = 1
-            matrix[i, self.pairs.values.tolist().index(
-                loop[[0, 2]].tolist())] = -1
+            matrix[i, pairs_ls.index(loop[:2].tolist())] = 1
+            matrix[i, pairs_ls.index(loop[1:].tolist())] = 1
+            matrix[i, pairs_ls.index(loop[[0, 2]].tolist())] = -1
         return matrix
 
     def sort(
         self,
-        order: Union[str, list] = 'pairs',
+        order: Union[str, List] = 'pairs',
         ascending: bool = True,
         return_index: bool = False
     ) -> Optional[np.ndarray]:
