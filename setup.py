@@ -18,7 +18,7 @@ def get_scm_files():
     """
     Returns a list of all files in the SCM directory and its subdirectories.
     """
-    scm_dir = Path('insar_process/cmaps/SCM')
+    scm_dir = Path('faninsar/cmaps/SCM')
     scm_files = []
     for file_path in scm_dir.glob('**/*'):
         if file_path.is_file():
@@ -34,10 +34,10 @@ setuptools.setup(
     description="A fantastic InSAR processing library, in a more pythonic way, to accelerate your InSAR processing workflow.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/Fanchengyan/InSAR_Process",
+    url="https://github.com/Fanchengyan/FanInSAR",
     packages=setuptools.find_packages(),
     install_requires=install_requires,
-    package_data={'insar_process': get_scm_files()},
+    package_data={'faninsar': get_scm_files()},
     include_package_data=True,
     classifiers=[
         "Programming Language :: Python :: 3",
