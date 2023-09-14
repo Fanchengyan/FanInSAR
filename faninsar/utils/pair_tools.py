@@ -273,7 +273,7 @@ class Pairs:
                     return Pairs(_pairs)
                 else:
                     return None
-        elif isinstance(index, int):
+        elif isinstance(index, int, np.integer):
             if index >= self._length:
                 raise IndexError(
                     f"Index {index} out of range. Pairs number is {self._length}.")
@@ -727,7 +727,7 @@ class Loops:
                     return Loops(_loops)
                 else:
                     return None
-        elif isinstance(index, int):
+        elif isinstance(index, int, np.integer):
             if index >= self._length:
                 raise IndexError(
                     f"Index {index} out of range. Loops number is {self._length}.")
@@ -971,7 +971,6 @@ class Loops:
             raise ValueError(
                 f"target should be 'pairs' or 'dates', but got {target}.")
 
-    # @njit() # TODO: accelerate the function using numba
     def to_matrix(self) -> np.ndarray:
         """
         return loop matrix (containing 1, -1, 0) from pairs.
