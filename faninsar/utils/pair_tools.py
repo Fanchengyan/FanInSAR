@@ -273,7 +273,7 @@ class Pairs:
                     return Pairs(_pairs)
                 else:
                     return None
-        elif isinstance(index, int, np.integer):
+        elif isinstance(index, (int, np.integer)):
             if index >= self._length:
                 raise IndexError(
                     f"Index {index} out of range. Pairs number is {self._length}.")
@@ -298,13 +298,10 @@ class Pairs:
             if not index.ndim == 1:
                 raise IndexError(
                     f"Index should be 1D array, but got {index.ndim}D array.")
-            if not index.dtype == bool:
-                raise TypeError(
-                    f"Index should be bool array, but got {index.dtype}.")
-            if not len(index) == self._length:
+            if len(index) > self._length:
                 raise IndexError(
-                    f"Index length should be equal to pairs length {self._length}"
-                    f" for boolean indexing, but got {len(index)}.")
+                    f"Index length should be less than pairs length {self._length},"
+                    f" but got {len(index)}.")
             return Pairs(self._values[index])
 
         else:
@@ -387,6 +384,24 @@ class Pairs:
             pair = Pair.from_name(name, parse_function, date_args)
             pairs.append(pair.values)
         return cls(pairs, sort=False)
+
+    def where(self, pair: Union[str, Pair]) -> Optional[int]:
+        '''return the index of the pair
+
+        Parameters
+        ----------
+        pair: str or Pair
+            Pair name or Pair object.
+        '''
+        if isinstance(pair, str):
+            pair = Pair.from_name(pair)
+        elif not isinstance(pair, Pair):
+            raise TypeError(
+                f"pair should be str or Pair, but got {type(pair)}.")
+        if pair in self:
+            return np.where(np.all(self._values == pair.values, axis=1))[0][0]
+        else:
+            return None
 
     def sort(
         self,
@@ -727,7 +742,7 @@ class Loops:
                     return Loops(_loops)
                 else:
                     return None
-        elif isinstance(index, int, np.integer):
+        elif isinstance(index, (int, np.integer)):
             if index >= self._length:
                 raise IndexError(
                     f"Index {index} out of range. Loops number is {self._length}.")
@@ -752,13 +767,10 @@ class Loops:
             if not index.ndim == 1:
                 raise IndexError(
                     f"Index should be 1D array, but got {index.ndim}D array.")
-            if not index.dtype == bool:
-                raise TypeError(
-                    f"Index should be bool array, but got {index.dtype}.")
-            if not len(index) == self._length:
+            if len(index) > self._length:
                 raise IndexError(
-                    f"Index length should be equal to loops length {self._length}"
-                    f" for boolean indexing, but got {len(index)}.")
+                    f"Index length should be less than pairs length {self._length},"
+                    f" but got {len(index)}.")
             return Loops(self._values[index])
         else:
             raise TypeError(
@@ -995,6 +1007,24 @@ class Loops:
             matrix[i, pairs_ls.index(loop[1:].tolist())] = 1
             matrix[i, pairs_ls.index(loop[[0, 2]].tolist())] = -1
         return matrix
+
+    def where(self, loop: Union[str, Loop]) -> Optional[int]:
+        '''return the index of the loop
+
+        Parameters
+        ----------
+        loop: str or Loop
+            Loop name or Loop object.
+        '''
+        if isinstance(loop, str):
+            loop = Loop.from_name(loop)
+        elif not isinstance(loop, Loop):
+            raise TypeError(
+                f"loop should be str or Loop, but got {type(loop)}.")
+        if loop in self:
+            return np.where(np.all(self._values == loop.values, axis=1))[0][0]
+        else:
+            return None
 
     def sort(
         self,
