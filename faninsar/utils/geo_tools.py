@@ -625,6 +625,14 @@ class Profile:
         with open(profile_file, 'r') as f:
             profile = eval(f.read())
         return cls(profile)
+    
+    def to_file(self, file: Union[str, Path]):
+        '''Write the profile into a file.'''
+        file = Path(file)
+        if file.suffix != '.profile':
+            file = file.parent / (file.name + '.profile')
+        with open(file, 'w') as f:
+            f.write(str(self))
 
     def to_file(self, file: Union[str, Path]):
         '''Write the profile into a file.'''
