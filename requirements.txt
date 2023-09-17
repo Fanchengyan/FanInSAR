@@ -2,3 +2,6 @@ pandas
 numpy
 matplotlib
 data_downloader
+rasterio
+xarray
+rioxarray

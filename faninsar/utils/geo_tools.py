@@ -615,17 +615,47 @@ class Profile:
         return cls(profile)
 
     @classmethod
-    def from_dict(cls, profile: dict):
-        '''Create a Profile object from a dict.'''
-        return cls(profile)
-
-    @classmethod
     def from_profile_file(cls, profile_file: Union[str, Path]):
         '''Create a Profile object from a profile file.'''
         with open(profile_file, 'r') as f:
             profile = eval(f.read())
         return cls(profile)
-    
+
+    @classmethod
+    def from_bounds_res(
+        cls,
+        bounds: Tuple[float, float, float, float],
+        res: float | Tuple[float, float],
+    ):
+        '''Create a Profile object from bounds and resolution.
+
+        Parameters
+        ----------
+        bounds : tuple of float (left/W, bottom/S, right/E, top/N)
+            The bounds of the raster file. 
+        res : float or tuple of float (x_res, y_res)
+            The resolution of the raster file. If a float is provided, 
+            the x_res and y_res will be the same.
+
+        Returns
+        -------
+        Profile : Profile
+            A Profile object only with width, height and transform.
+        '''
+        if isinstance(res, (int, float, np.integer, np.floating)):
+            res = (float(res), float(res))
+        dst_w, dst_s, dst_e, dst_n = bounds
+        width = int(round((dst_e - dst_w) / res[0]))
+        height = int(round((dst_n - dst_s) / res[1]))
+        tf = Affine.translation(dst_w, dst_n) * Affine.scale(res[0], -res[1])
+
+        profile = {
+            'width': width,
+            'height': height,
+            'transform': tf
+        }
+        return cls(profile)
+
     def to_file(self, file: Union[str, Path]):
         '''Write the profile into a file.'''
         file = Path(file)

@@ -1,1 +1,39 @@
 # Custom Dictionary Words
+faninsar
+
+# insar Words
+interferogram
+interferograms
+SBAS
+NSBAS
+SBASInvert
+InSAR
+
+# geo Words
+Geospatial
+reproject
+
+# programming Words
+LiCSAR
+LiCSBAS
+isce
+torchgeo
+rasterio
+dtype
+dtypes
+astype
+ndarray
+pyproj
+rtree
+splitx
+splity
+cmap
+ncols       
+nrows       
+xllcorner   
+yllcorner   
+xllcenter
+yllcenter
+cellsize    
+NODATA_value
+
