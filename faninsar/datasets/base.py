@@ -45,38 +45,37 @@ class BoundingBox:
         class from the torchgeo package. The modifications are:
 
         * date bounds are removed
-        * using "xmin, xmax, ymin, ymax" instead of "minx, maxx, miny, maxy" 
-        * the bounds order is changed to (xmin, ymin, xmax, ymax) which is the same as
-            the order of the bounds returned by :meth:`rasterio.DatasetReader.bounds`
+        * the bounds is changed to (left, bottom, right, top) which is the same as
+            rasterio :class:`rasterio.coords.BoundingBox`
         * added :meth:`to_rasterio_bounds` method to convert the bounding box to a
             rasterio bounds tuple
     """
 
     #: western boundary
-    xmin: float
+    left: float
     #: southern boundary
-    ymin: float
+    bottom: float
     #: eastern boundary
-    xmax: float
+    right: float
     #: northern boundary
-    ymax: float
+    top: float
 
     def __post_init__(self) -> None:
         """Validate the arguments passed to :meth:`__init__`.
 
         Raises:
             ValueError: if bounding box is invalid
-                (xmin > xmax, ymin > ymax)
+                (left > right, bottom > top)
 
         .. versionadded:: 0.2
         """
-        if self.xmin > self.xmax:
+        if self.left > self.right:
             raise ValueError(
-                f"Bounding box is invalid: 'xmin={self.xmin}' > 'xmax={self.xmax}'"
+                f"Bounding box is invalid: 'left={self.left}' > 'right={self.right}'"
             )
-        if self.ymin > self.ymax:
+        if self.bottom > self.top:
             raise ValueError(
-                f"Bounding box is invalid: 'ymin={self.ymin}' > 'ymax={self.ymax}'"
+                f"Bounding box is invalid: 'bottom={self.bottom}' > 'top={self.top}'"
             )
 
     # https://github.com/PyCQA/pydocstyle/issues/525
@@ -89,7 +88,7 @@ class BoundingBox:
         pass
 
     def __getitem__(self, key: int | slice) -> float | list[float]:
-        """Index the (xmin, ymin, xmax,  ymax) tuple.
+        """Index the (left, bottom, right,  top) tuple.
 
         Args:
             key: integer or slice object
@@ -100,7 +99,7 @@ class BoundingBox:
         Raises:
             IndexError: if key is out of bounds
         """
-        return [self.xmin, self.ymin, self.xmax, self.ymax][key]
+        return [self.left, self.bottom, self.right, self.top][key]
 
     def __iter__(self) -> Iterator[float]:
         """Container iterator.
@@ -108,7 +107,7 @@ class BoundingBox:
         Returns:
             iterator object that iterates over all objects in the container
         """
-        yield from [self.xmin, self.ymin, self.xmax, self.ymax]
+        yield from [self.left, self.bottom, self.right, self.top]
 
     def __contains__(self, other: 'BoundingBox') -> bool:
         """Whether or not other is within the bounds of this bounding box.
@@ -120,10 +119,10 @@ class BoundingBox:
             True if other is within this bounding box, else False
         """
         return (
-            (self.xmin <= other.xmin <= self.xmax)
-            and (self.xmin <= other.xmax <= self.xmax)
-            and (self.ymin <= other.ymin <= self.ymax)
-            and (self.ymin <= other.ymax <= self.ymax)
+            (self.left <= other.left <= self.right)
+            and (self.left <= other.right <= self.right)
+            and (self.bottom <= other.bottom <= self.top)
+            and (self.bottom <= other.top <= self.top)
         )
 
     def __or__(self, other: 'BoundingBox') -> 'BoundingBox':
@@ -136,10 +135,10 @@ class BoundingBox:
             the minimum bounding box that contains both self and other
         """
         return BoundingBox(
-            min(self.xmin, other.xmin),
-            max(self.xmax, other.xmax),
-            min(self.ymin, other.ymin),
-            max(self.ymax, other.ymax)
+            min(self.left, other.left),
+            max(self.right, other.right),
+            min(self.bottom, other.bottom),
+            max(self.top, other.top)
         )
 
     def __and__(self, other: 'BoundingBox') -> 'BoundingBox':
@@ -156,10 +155,10 @@ class BoundingBox:
         """
         try:
             return BoundingBox(
-                max(self.xmin, other.xmin),
-                min(self.xmax, other.xmax),
-                max(self.ymin, other.ymin),
-                min(self.ymax, other.ymax),
+                max(self.left, other.left),
+                min(self.right, other.right),
+                max(self.bottom, other.bottom),
+                min(self.top, other.top),
             )
         except ValueError:
             raise ValueError(
@@ -174,7 +173,15 @@ class BoundingBox:
         Returns: 
             area
         """
-        return (self.xmax - self.xmin) * (self.ymax - self.ymin)
+        return (self.right - self.left) * (self.top - self.bottom)
+
+    def to_dict(self) -> dict[str, float]:
+        """Convert the bounding box to a dictionary.
+
+        Returns:
+            dictionary with keys 'left', 'bottom', 'right', 'top'
+        """
+        return {'left': self.left, 'bottom': self.bottom, 'right': self.right, 'top': self.top}
 
     def intersects(self, other: 'BoundingBox') -> bool:
         """Whether or not two bounding boxes intersect.
@@ -186,19 +193,11 @@ class BoundingBox:
             True if bounding boxes intersect, else False
         """
         return (
-            self.xmin <= other.xmax
-            and self.xmax >= other.xmin
-            and self.ymin <= other.ymax
-            and self.ymax >= other.ymin
+            self.left <= other.right
+            and self.right >= other.left
+            and self.bottom <= other.top
+            and self.top >= other.bottom
         )
-
-    def to_rasterio_bounds(self) -> BBox:
-        """Convert the bounding box to a rasterio bounds tuple.
-
-        Returns:
-            rasterio bounds tuple (left, bottom, right, top)
-        """
-        return BBox(self.xmin, self.ymin, self.xmax, self.ymax)
 
     def split(
         self, proportion: float, horizontal: bool = True
@@ -218,22 +217,22 @@ class BoundingBox:
             raise ValueError("Input proportion must be between 0 and 1.")
 
         if horizontal:
-            w = self.xmax - self.xmin
-            splitx = self.xmin + w * proportion
+            w = self.right - self.left
+            splitx = self.left + w * proportion
             bbox1 = BoundingBox(
-                self.xmin, splitx, self.ymin, self.ymax
+                self.left, splitx, self.bottom, self.top
             )
             bbox2 = BoundingBox(
-                splitx, self.xmax, self.ymin, self.ymax
+                splitx, self.right, self.bottom, self.top
             )
         else:
-            h = self.ymax - self.ymin
-            splity = self.ymin + h * proportion
+            h = self.top - self.bottom
+            splity = self.bottom + h * proportion
             bbox1 = BoundingBox(
-                self.xmin, self.xmax, self.ymin, splity
+                self.left, self.right, self.bottom, splity
             )
             bbox2 = BoundingBox(
-                self.xmin, self.xmax, splity, self.ymax
+                self.left, self.right, splity, self.top
             )
 
         return bbox1, bbox2
@@ -438,10 +437,17 @@ class GeoDataset(abc.ABC):
             region of interest of the dataset in the CRS of the dataset.
         """
         if isinstance(new_roi, Iterable):
-            new_roi = np.asarray(new_roi)
+            new_roi = np.asarray([i for i in new_roi])
         if len(new_roi) != 4:
             raise ValueError(
                 f"ROI must be a tuple of length 4, got {len(new_roi)}"
+            )
+        if (new_roi[0] < self.bounds[0]
+                or new_roi[1] < self.bounds[1]
+                or new_roi[2] > self.bounds[2]
+                or new_roi[3] > self.bounds[3]):
+            raise ValueError(
+                f"ROI must be within the dataset bounds: {self.bounds}, but got {BoundingBox(*new_roi)}"
             )
         self._roi = BoundingBox(*new_roi)
 
@@ -525,7 +531,7 @@ class GeoDataset(abc.ABC):
         Returns
         -------
         bounds: BoundingBox object
-            (minx, xmax, ymin, ymax) of the dataset
+            (minx, right, bottom, top) of the dataset
         """
         return BoundingBox(*self.index.bounds)
 
@@ -622,6 +628,7 @@ class RasterDataset(GeoDataset):
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        verbose: bool = False,
     ) -> None:
         """Initialize a new Dataset instance.
 
@@ -654,6 +661,8 @@ class RasterDataset(GeoDataset):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        verbose : bool, optional
+            if True, print verbose output
 
         Raises
         ------
@@ -664,22 +673,23 @@ class RasterDataset(GeoDataset):
         self.bands = bands or self.all_bands
         self.cache = cache
         self.resampling = resampling
+        self.verbose = verbose
 
         if file_paths is None:
             file_paths = []
             pathname = os.path.join(root, "**", self.filename_glob)
             filename_regex = re.compile(self.filename_regex, re.VERBOSE)
-            for filepath in glob.iglob(pathname, recursive=True):
-                match = re.match(filename_regex, os.path.basename(filepath))
+            for file_path in glob.iglob(pathname, recursive=True):
+                match = re.match(filename_regex, os.path.basename(file_path))
                 if match is not None:
-                    file_paths.append(filepath)
+                    file_paths.append(file_path)
 
         # Populate the dataset index
         count = 0
         files_valid = []
-        for filepath in file_paths:
+        for file_path in file_paths:
             try:
-                with rasterio.open(filepath) as src:
+                with rasterio.open(file_path) as src:
                     # See if file has a color map
                     if len(self.cmap) == 0:
                         try:
@@ -703,7 +713,7 @@ class RasterDataset(GeoDataset):
                 files_valid.append(False)
                 continue
             else:
-                self.index.insert(count, coords, filepath)
+                self.index.insert(count, coords, file_path)
                 files_valid.append(True)
                 count += 1
 
@@ -714,10 +724,10 @@ class RasterDataset(GeoDataset):
             raise FileNotFoundError(msg)
 
         self._files = pd.DataFrame(
-            {"filepath": file_paths, "valid": files_valid}
+            {"file_paths": file_paths, "valid": files_valid}
         )
         if not self._files.valid.all():
-            files_invalid = self._files.filepath[~self._files.valid].tolist()
+            files_invalid = self._files.file_paths[~self._files.valid].tolist()
             print(
                 f"Unable to read {len(files_invalid)} files in {self.__class__.__name__} dataset:"
                 "\n\t" + "\n\t".join(files_invalid),
@@ -747,7 +757,7 @@ class RasterDataset(GeoDataset):
         """Retrieve image/mask and metadata indexed by query.
 
         Args:
-            query: (xmin, xmax, ymin, ymax) coordinates to index
+            query: (left, right, bottom, top) coordinates to index
 
         Returns:
             sample of image/mask and metadata at that index
@@ -755,19 +765,11 @@ class RasterDataset(GeoDataset):
         Raises:
             IndexError: if query is not found in the index
         """
-        hits = self.index.intersection(tuple(query), objects=True)
-        filepaths = cast(list[str], [hit.object for hit in hits])
-
-        if not filepaths:
-            raise IndexError(
-                f"query: {query} not found in index with bounds: {self.bounds}"
-            )
-
-        data = self._merge_files(filepaths, query, self.band_indexes)
+        file_paths = self.files[self.files.valid].file_paths
+        data = self._stack_files(file_paths, query)
 
         sample = {"crs": self.crs, "bbox": query}
 
-        data = data.astype(self.dtype)
         if self.is_image:
             sample["image"] = data
         else:
@@ -775,66 +777,83 @@ class RasterDataset(GeoDataset):
 
         return sample
 
-    def _merge_files(
+    def _stack_files(
         self,
-        filepaths: Sequence[str],
+        file_paths: Sequence[str],
         query: BoundingBox,
-        band_indexes: Optional[Sequence[int]] = None,
     ) -> np.ndarray:
-        """Load and merge one or more files.
+        """Stack files into a single 3D array.
 
-        Args:
-            filepaths: one or more files to load and merge
-            query: (xmin, xmax, ymin, ymax) coordinates to index
-            band_indexes: indexes of bands to be used
+        Parameters
+        ----------
+        file_paths : list of str
+            list of paths for files to stack
+        query : BoundingBox
+            bounding box to index
 
-        Returns:
-            image/mask at that index
+        Returns
+        -------
+        dest : numpy.ndarray
+            stacked array
+        tf : affine.Affine
+            affine transform of the stacked array
         """
         if self.cache:
-            vrt_fhs = [self._cached_load_warp_file(fp) for fp in filepaths]
+            vrt_fhs = [self._cached_load_warp_file(fp) for fp in file_paths]
         else:
-            vrt_fhs = [self._load_warp_file(fp) for fp in filepaths]
+            vrt_fhs = [self._load_warp_file(fp) for fp in file_paths]
 
-        bounds = (query.xmin, query.ymin, query.xmax, query.ymax)
-        dest, _ = rasterio.merge.merge(
-            vrt_fhs,
-            bounds,
-            self.res,
-            self.nodata,
-            self.dtype,
-            indexes=band_indexes,
-            resampling=self.resampling,
-        )
+        if self.verbose:
+            vrt_fhs = tqdm(
+                vrt_fhs,
+                desc="Loading files",
+                unit=" files"
+            )
 
-        if dest.dtype == np.uint16:
-            dest = dest.astype(np.int32)
-        elif dest.dtype == np.uint32:
-            dest = dest.astype(np.int64)
+        data_list = []
+        for vrt_fh in vrt_fhs:
+            win = vrt_fh.window(*query)
+            data = vrt_fh.read(
+                out_shape=(
+                    1,
+                    int((query.top - query.bottom) / self.res[1]),
+                    int((query.right - query.left) / self.res[0]),
+                ),
+                resampling=self.resampling,
+                indexes=self.band_indexes,
+                window=win,
+                boundless=True,
+                fill_value=self.nodata,
+            )
+            data_list.append(data)
+        dest = np.concatenate(data_list, axis=0)
+
+        print(win)
+
         return dest
 
     @functools.lru_cache(maxsize=128)
-    def _cached_load_warp_file(self, filepath: str) -> DatasetReader:
+    def _cached_load_warp_file(self, file_path: str) -> DatasetReader:
         """Cached version of :meth:`_load_warp_file`.
 
         Args:
-            filepath: file to load and warp
+            file_path: file to load and warp
 
         Returns:
             file handle of warped VRT
         """
-        return self._load_warp_file(filepath)
+        return self._load_warp_file(file_path)
 
-    def _load_warp_file(self, filepath: str) -> DatasetReader:
+    def _load_warp_file(self, file_path: str) -> DatasetReader:
         """Load and warp a file to the correct CRS and resolution.
 
         Args:
-            filepath: file to load and warp
+            file_path: file to load and warp
 
         Returns:
             file handle of warped VRT
         """
-        src = rasterio.open(filepath)
+        src = rasterio.open(file_path)
 
         # Only warp if necessary
         if src.crs != self.crs:
@@ -885,7 +904,7 @@ class RasterDataset(GeoDataset):
                 xs, ys = warp_transform(crs, self.crs, xy[:, 0], xy[:, 1])
                 xy = np.column_stack((xs, ys))
 
-        files = self.files[self.files.valid].filepath
+        files = self.files[self.files.valid].file_paths
 
         if verbose:
             files = tqdm(
@@ -895,24 +914,8 @@ class RasterDataset(GeoDataset):
             )
 
         values = []
-        for filepath in files:
-            with rasterio.open(filepath) as src:
+        for file_path in files:
+            with rasterio.open(file_path) as src:
                 values.append(list(src.sample(xy)))
 
         return np.asarray(values).squeeze()
-
-
-if __name__ == '__main__':
-    from pathlib import Path
-    home_dir = Path(r'E:\hyp3_result\ifgs')
-    files = list(home_dir.rglob('*unw_phase_clip.tif'))
-
-    ds = RasterDataset(file_paths=files)
-    points = [
-        (490357, 4283413),
-        (491048, 4283411),
-        (490317, 4284829)
-    ]
-    points = ds.sample(points, verbose=True)
-    bbox = BoundingBox(477168, 4299129, 493638, 4309230)
-    sample = ds[bbox]

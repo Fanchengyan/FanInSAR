@@ -24,6 +24,8 @@ dtypes
 astype
 ndarray
 pyproj
+tqdm
+ndim
 rtree
 splitx
 splity
