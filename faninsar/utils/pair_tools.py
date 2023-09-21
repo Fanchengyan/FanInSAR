@@ -1322,7 +1322,7 @@ class SBASNetwork:
         pass
 
 
-class PairsGenerator:
+class PairsFactory:
     '''This class is used to generate interferometric pairs for InSAR  
     processing. 
 
