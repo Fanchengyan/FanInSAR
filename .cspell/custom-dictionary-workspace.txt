@@ -38,4 +38,5 @@ xllcenter
 yllcenter
 cellsize    
 NODATA_value
+cmaps
 
