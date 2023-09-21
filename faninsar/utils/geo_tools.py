@@ -625,7 +625,7 @@ class Profile:
     def from_bounds_res(
         cls,
         bounds: Tuple[float, float, float, float],
-        res: float | Tuple[float, float],
+        res: Union[float, Tuple[float, float]],
     ):
         '''Create a Profile object from bounds and resolution.
 

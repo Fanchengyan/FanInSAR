@@ -87,7 +87,7 @@ class BoundingBox:
     def __getitem__(self, key: slice) -> list[float]:  # noqa: D105
         pass
 
-    def __getitem__(self, key: int | slice) -> float | list[float]:
+    def __getitem__(self, key: Union[int, slice]) -> Union[float, list[float]]:
         """Index the (left, bottom, right,  top) tuple.
 
         Args:
@@ -254,7 +254,7 @@ class GeoDataset(abc.ABC):
     _dtype: Optional[np.dtype] = None
     _count: int = 0
     _roi: Optional[BoundingBox] = None
-    _nodata: Optional[float | int | Any] = None
+    _nodata: Optional[Union[float, int, Any]] = None
 
     def __init__(self):
         self.index = Index(interleaved=True, properties=Property(dimension=2))
@@ -315,7 +315,7 @@ class GeoDataset(abc.ABC):
         return self._crs
 
     @crs.setter
-    def crs(self, new_crs: CRS | str) -> None:
+    def crs(self, new_crs: Union[CRS, str]) -> None:
         """Change the :term:`coordinate reference system (CRS)` of a GeoDataset.
 
         If ``new_crs == self.crs``, does nothing, otherwise updates the R-tree index.
@@ -388,7 +388,7 @@ class GeoDataset(abc.ABC):
         return self._res
 
     @res.setter
-    def res(self, new_res: float | Tuple[float, float]) -> None:
+    def res(self, new_res: Union[float, Tuple[float, float]]) -> None:
         """Set the resolution of the dataset.
 
         Parameters
@@ -428,7 +428,7 @@ class GeoDataset(abc.ABC):
             return self.bounds
 
     @roi.setter
-    def roi(self, new_roi: BoundingBox | Iterable[float]):
+    def roi(self, new_roi: Union[BoundingBox, Iterable[float]]):
         """Set the region of interest of the dataset.
 
         Parameters
@@ -474,7 +474,7 @@ class GeoDataset(abc.ABC):
         self._dtype = new_dtype
 
     @property
-    def nodata(self) -> Optional[float | int | Any]:
+    def nodata(self) -> Optional[Union[float, int, Any]]:
         """No data value of the dataset.
 
         Returns
@@ -485,7 +485,7 @@ class GeoDataset(abc.ABC):
         return self._nodata
 
     @nodata.setter
-    def nodata(self, new_nodata: float | int | Any) -> None:
+    def nodata(self, new_nodata: Union[float, int, Any]) -> None:
         """Set the no data value of the dataset.
 
         Parameters
@@ -621,9 +621,9 @@ class RasterDataset(GeoDataset):
         root: str = "data",
         file_paths: Optional[Sequence[str]] = None,
         crs: Optional[CRS] = None,
-        res: Optional[float | Tuple[float, float]] = None,
+        res: Optional[Union[float, Tuple[float, float]]] = None,
         dtype: Optional[np.dtype] = None,
-        nodata: Optional[float | int | Any] = None,
+        nodata: Optional[Union[float, int, Any]] = None,
         rio: Optional[BoundingBox] = None,
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
@@ -875,7 +875,7 @@ class RasterDataset(GeoDataset):
     def sample(
         self,
         xy: Iterable,
-        crs: Optional[CRS | str] = None,
+        crs: Optional[Union[CRS, str]] = None,
         verbose: bool = False,
     ) -> np.ndarray:
         """Sample values from dataset for given points.

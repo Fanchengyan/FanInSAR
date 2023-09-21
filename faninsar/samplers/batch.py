@@ -23,7 +23,7 @@ class RowSampler(abc.ABC):
     def __init__(
         self,
         dataset: GeoDataset,
-        roi: Optional[BoundingBox | Iterable[float]] = None,
+        roi: Optional[Union[BoundingBox, Iterable[float]]] = None,
         patch_size: Optional[int] = None,
         patch_num: Optional[int] = None,
         verbose: bool = False
