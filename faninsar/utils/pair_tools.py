@@ -479,6 +479,24 @@ class Pairs:
                     loops.append([pair12[0], pair12[1], pair23[1]])
         return Loops(loops)
 
+    def to_matrix(self) -> np.ndarray:
+        '''return the SBAS matrix
+
+        Parameters
+        ----------
+        matrix: np.ndarray
+            SBAS matrix in shape of (n_pairs, n_dates-1). The dates between
+            pairs are set to 1, otherwise 0.
+        '''
+        matrix = np.zeros((len(self), len(self.dates)-1))
+        dates = self.dates.tolist()
+        for i, pair in enumerate(self.values):
+            index1 = dates.index(pair[0])
+            index2 = dates.index(pair[1])
+            matrix[i, index1:index2] = 1
+
+        return matrix
+
     def dates_string(self, format='%Y%m%d') -> List[str]:
         '''return the dates of the pairs with format of str
 
