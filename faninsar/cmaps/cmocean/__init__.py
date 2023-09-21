@@ -3,15 +3,13 @@ from pathlib import Path
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 
-cwd = Path(__file__).parent.absolute()
-
-names = ['acton', 'bamako', 'batlow', 'berlin', 'bilbao', 'broc',
-         'brocO', 'buda', 'cork', 'corkO', 'davos', 'devon', 'grayC',
-         'hawaii', 'imola', 'lajolla', 'lapaz', 'lisbon', 'nuuk',
-         'oleron', 'oslo', 'roma', 'romaO', 'tofino', 'tokyo',
-         'turku', 'vik', 'vikO']
-
+names = [
+    'algae', 'amp', 'balance', 'curl', 'deep', 'delta', 'dense', 'diff', 'gray', 'haline', 'ice', 'matter', 'oxy', 'phase', 'rain', 'solar', 'speed', 'tarn', 'tempo', 'thermal', 'topo', 'turbid'
+]
 __all__ = names.copy()
+
+
+cwd = Path(__file__).parent.absolute()
 
 for name in names:
     file = cwd / name / f'{name}.txt'
