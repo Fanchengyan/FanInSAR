@@ -24,7 +24,7 @@ def get_scm_files():
     """
     Returns a list of all files in the SCM directory and its subdirectories.
     """
-    scm_dir = Path('faninsar/cmaps/SCM')
+    scm_dir = Path('faninsar/cmaps')
     scm_files = []
     for file_path in scm_dir.glob('**/*'):
         if file_path.is_file():

@@ -5,8 +5,8 @@ import numpy as np
 import psutil
 from tqdm import tqdm
 
-from faninsar import Pairs
 from faninsar.models.ts_models import TimeSeriesModels
+from faninsar.utils.pair_tools import Pairs
 
 
 class NSBASMatrixFactory:
