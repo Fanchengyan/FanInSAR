@@ -1,4 +1,6 @@
 # from .utils import data, geo_tools
+from faninsar.models import *
+
 from .utils.geo_tools import (GeoDataFormatConverter,
                               PhaseDeformationConverter, Profile)
 from .utils.pair_tools import (DateManager, Loop, Loops, Pair, Pairs,
