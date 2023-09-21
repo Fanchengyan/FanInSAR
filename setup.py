@@ -2,7 +2,6 @@ import csv
 from pathlib import Path
 
 import setuptools
-from faninsar import __version__ as version
 
 with open("README.md", "r", encoding='UTF-8') as fh:
     long_description = fh.read()
@@ -13,6 +12,13 @@ with open("requirements.txt", "r", encoding='UTF-8') as fh:
     for row in reader:
         install_requires.append(row[0])
 
+with open("faninsar/__init__.py") as f:
+    for line in f:
+        if line.find("__version__") >= 0:
+            version = line.split("=")[1].strip()
+            version = version.strip('"')
+            version = version.strip("'")
+            continue
 
 def get_scm_files():
     """
