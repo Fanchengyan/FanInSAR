@@ -475,34 +475,34 @@ class GeoDataFormatConverter:
 
 
 class PhaseDeformationConverter:
-    '''A class to convert between phase and deformation(LOS) for SAR interferometry.'''
+    '''A class to convert between phase and deformation(mm) for SAR interferometry.'''
 
-    def __init__(self, wavelength: float = None, frequency: float = None) -> None:
-        '''Initialize the converter. Either wavelength or frequency should be provided. If both are provided, wavelength will be recalculated by frequency.
+    def __init__(self, frequency: float = None, wavelength: float = None) -> None:
+        '''Initialize the converter. Either wavelength or frequency should be provided. 
+        If both are provided, wavelength will be recalculated by frequency.
 
         Parameters
         ----------
+        frequency : float
+            The frequency of the radar signal. Unit: Hz. 
         wavelength : float
             The wavelength of the radar signal. Unit: meter.
-        frequency : float
-            The frequency of the radar signal. Unit: Hz.
+            this parameter will be ignored if frequency is provided.
         '''
         speed_of_light = 299792458
-        if wavelength is None and frequency is None:
-            raise ValueError(
-                "Either wavelength or frequency should be provided.")
-        elif frequency is not None:
+
+        if frequency is not None:
             self.wavelength = speed_of_light/frequency  # meter
             self.frequency = frequency
-        elif wavelength is not None and frequency is None:
-            self.frequency = speed_of_light/wavelength
+        elif wavelength is not None:
             self.wavelength = wavelength
+            self.frequency = speed_of_light/wavelength
         else:
             raise ValueError(
                 "Either wavelength or frequency should be provided.")
 
         # convert radian to mm
-        self.coef_rd2mm = - wavelength/4/np.pi*1000
+        self.coef_rd2mm = - self.wavelength/4/np.pi*1000
 
     def __str__(self) -> str:
         return f"PhaseDeformationConverter(wavelength={self.wavelength})"
