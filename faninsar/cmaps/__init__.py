@@ -1,19 +1,16 @@
 import matplotlib.colors as mcolors
 
+from . import GMT, SCM, cmocean, colorcet
 from .cmocean import *
-from .cmocean import __all__ as cmocean__all__
 from .colorcet import *
-from .colorcet import __all__ as colorcet__all__
 from .GMT import *
-from .GMT import __all__ as GMT__all__
 from .SCM import *
-from .SCM import __all__ as SCM__all__
 
-__all__ = SCM__all__.copy()
-__all__.extend(GMT__all__)
-__all__.extend(cmocean__all__)
-__all__.extend(colorcet__all__)
-__all__.extend(['GnBu_RdPl', 'WtBuPl', 'WtHeatRed'])
+__all__ = ['GnBu_RdPl', 'WtBuPl', 'WtHeatRed']
+__all__ += SCM.__all__
+__all__ += GMT.__all__
+__all__ += cmocean.__all__
+__all__ += colorcet.__all__
 
 white = '0.95'
 
@@ -45,7 +42,6 @@ WtHeatRed_r = mcolors.LinearSegmentedColormap.from_list(
     "WtHeatRed_r", colors[::-1], N=100)
 
 
-del vars()['mcolors']
-del vars()['colors']
-del vars()['white']
-del vars()['SCM__all__']
+del mcolors
+del colors
+del white

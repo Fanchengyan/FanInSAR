@@ -23,3 +23,13 @@ for name in names:
     vars()[name] = LinearSegmentedColormap.from_list(name, cm_data)
     vars()[f"{name}_r"] = LinearSegmentedColormap.from_list(
         f"{name}_r", cm_data[::-1])
+
+del name
+del names
+del file
+del f_new
+del cm_data
+del cwd
+del Path
+del LinearSegmentedColormap
+del np
