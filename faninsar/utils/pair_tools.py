@@ -1,7 +1,7 @@
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -979,7 +979,10 @@ class Loops:
         else:
             return [Loop(i).name for i in self._values]
 
-    def to_frame(self, target: str = 'pairs') -> pd.DataFrame:
+    def to_frame(
+        self,
+        target: Literal['pairs', 'dates'] = 'pairs'
+    ) -> pd.DataFrame:
         '''return the loops as a DataFrame
 
         Parameters

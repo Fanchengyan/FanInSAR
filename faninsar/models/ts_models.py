@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from datetime import datetime
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -9,13 +9,17 @@ import pandas as pd
 class TimeSeriesModels:
     '''Base class for time series models'''
 
-    _unit: str = 'year'
+    _unit: Literal['year', 'day'] = 'day'
     _dates: pd.DatetimeIndex = None
     _date_diff: np.ndarray = None
     _G_br: np.ndarray = None
     _param_names: List[str] = []
 
-    def __init__(self, dates, unit='day'):
+    def __init__(
+        self,
+        dates,
+        unit='day'
+    ):
 
         dates = pd.to_datetime(dates)
         date_diff = (dates-dates[0]).days.values

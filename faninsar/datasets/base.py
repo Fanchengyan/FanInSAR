@@ -9,7 +9,8 @@ import sys
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable, Optional, Tuple, Union, cast, overload
+from typing import (Any, Callable, Literal, Optional, Tuple, Union, cast,
+                    overload)
 
 import fiona
 import fiona.transform
@@ -535,7 +536,10 @@ class GeoDataset(abc.ABC):
         """
         return BoundingBox(*self.index.bounds)
 
-    def get_profile(self, bbox: str = 'roi') -> Optional[Profile]:
+    def get_profile(
+        self,
+        bbox: Literal['roi', 'bounds'] = 'roi'
+    ) -> Optional[Profile]:
         """Return the profile of the dataset
 
         Parameters
@@ -570,6 +574,7 @@ class GeoDataset(abc.ABC):
         profile["dtype"] = self.dtype
         profile["nodata"] = self.nodata
         profile["crs"] = self.crs
+
         return profile
 
 

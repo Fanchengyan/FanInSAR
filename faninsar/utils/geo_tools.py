@@ -2,7 +2,7 @@ import pprint
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -271,7 +271,12 @@ class GeoDataFormatConverter:
             profile = ds.profile.copy()
         return arr, profile
 
-    def load_binary(self, binary_file: Union[str, Path], order='BSQ', dtype='auto'):
+    def load_binary(
+        self,
+        binary_file: Union[str, Path],
+        order: Literal['BSQ', 'BIP', 'BIL'] = 'BSQ',
+        dtype='auto'
+    ):
         '''Load a binary file into the data array.
 
         Parameters
@@ -332,7 +337,11 @@ class GeoDataFormatConverter:
         '''
         self.arr, self.profile = self._load_raster(raster_file)
 
-    def to_binary(self, out_file: Union[str, Path], order='BSQ'):
+    def to_binary(
+        self,
+        out_file: Union[str, Path],
+        order: Literal['BSQ', 'BIP', 'BIL'] = 'BSQ'
+    ):
         '''Write the data array into a binary file.
 
         Parameters
@@ -664,10 +673,3 @@ class Profile:
         with open(file, 'w') as f:
             f.write(str(self))
 
-    def to_file(self, file: Union[str, Path]):
-        '''Write the profile into a file.'''
-        file = Path(file)
-        if file.suffix != '.profile':
-            file = file.parent / (file.name + '.profile')
-        with open(file, 'w') as f:
-            f.write(str(self))
