@@ -325,7 +325,7 @@ class Pairs:
             raise TypeError(
                 f"item should be Pair, str, or Iterable, but got {type(item)}.")
 
-        return item in self.values
+        return np.any(np.all(item == self.values,axis=1))
 
     @property
     def values(self) -> np.ndarray:
@@ -811,7 +811,7 @@ class Loops:
             raise TypeError(
                 f"item should be Loop, str, or Iterable, but got {type(item)}.")
 
-        return item in self.values
+        return np.any(np.all(item == self.values,axis=1))
 
     @property
     def values(self) -> np.ndarray:
