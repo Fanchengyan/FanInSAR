@@ -325,7 +325,7 @@ class Pairs:
             raise TypeError(
                 f"item should be Pair, str, or Iterable, but got {type(item)}.")
 
-        return np.any(np.all(item == self.values,axis=1))
+        return np.any(np.all(item == self.values, axis=1))
 
     @property
     def values(self) -> np.ndarray:
@@ -475,7 +475,7 @@ class Pairs:
         loops = []
         for i, pair12 in enumerate(self._values):
             for pair23 in self._values[i+1:]:
-                if pair12[1] == pair23[0] and np.array([pair12[0], pair23[1]]) in self._values:
+                if pair12[1] == pair23[0] and Pair([pair12[0], pair23[1]]) in self:
                     loops.append([pair12[0], pair12[1], pair23[1]])
         return Loops(loops)
 
@@ -811,7 +811,7 @@ class Loops:
             raise TypeError(
                 f"item should be Loop, str, or Iterable, but got {type(item)}.")
 
-        return np.any(np.all(item == self.values,axis=1))
+        return np.any(np.all(item == self.values, axis=1))
 
     @property
     def values(self) -> np.ndarray:
@@ -1656,27 +1656,19 @@ class DateManager:
 
 
 if __name__ == '__main__':
-    dates = pd.date_range('20130101', '20231231').values
-    loop_ls = []
-    for i in range(5):
-        np.random.seed(i)
-        loop_ls.append(dates[np.random.randint(0, len(dates), 3)])
+    names = ['20170111_20170204',
+             '20170111_20170222',
+             '20170111_20170318',
+             '20170204_20170222',
+             '20170204_20170318',
+             '20170204_20170330',
+             '20170222_20170318',
+             '20170222_20170330',
+             '20170222_20170411',
+             '20170318_20170330']
+    
+    
 
-    loops = Loops(loop_ls)
-    print(loops)
-
-    # # select pairs by date slice
-    # pairs1 = loops['2018-03-09':]
-    # print(pairs1)
-
-    # # pairs can be added (union)  and subtracted (difference)
-    # pairs2 = loops - pairs1
-    # pairs3 = pairs1 + pairs2
-    # print(pairs2)
-    # print(pairs3)
-
-    # # pairs can be compared with `==`and `!=`
-    # print(pairs3 == loops)
-    # print(pairs3 != loops)
-
-    # # loops = Loops(loop_ls)
+    pairs = Pairs.from_names(names)
+    loops = pairs.to_loops()
+    pairs1 = loops.pairs
