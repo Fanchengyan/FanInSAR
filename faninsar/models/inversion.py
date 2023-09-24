@@ -24,13 +24,38 @@ class NSBASMatrixFactory:
 
     Examples
     --------
+    >>> import faninsar as fis
+    >>> import numpy as np
+    
+    >>> names = ['20170111_20170204',
+                '20170111_20170222',
+                '20170111_20170318',
+                '20170204_20170222',
+                '20170204_20170318',
+                '20170204_20170330',
+                '20170222_20170318',
+                '20170222_20170330',
+                '20170222_20170411',
+                '20170318_20170330']
 
+    >>> pairs = fis.Pairs.from_names(names)
+    >>> unw = np.random.randint(0, 255, (len(pairs),5))
+    >>> model = fis.models.AnnualSinusoidalModel(pairs.dates)
+    >>> nsbas_matrix = NSBASMatrixFactory(unw, pairs, model)
+    >>> nsbas_matrix
+    ... NSBASMatrixFactory(
+          pairs: Pairs(10)
+          model: AnnualSinusoidalModel(dates: 6, unit: day)
+          gamma: 0.0001
+          G shape: (16, 9)
+          d shape: (16, 5)
+        )
     '''
-    _pairs: Pairs = []
-    _model: TimeSeriesModels = None
-    _gamma: float = 0.0001
-    _G: np.ndarray = None
-    _d: np.ndarray = None
+    _pairs: Pairs
+    _model: TimeSeriesModels
+    _gamma: float
+    _G: np.ndarray
+    _d: np.ndarray
 
     slots = ['_pairs', '_model', '_gamma', '_G', '_d']
 
@@ -61,9 +86,27 @@ class NSBASMatrixFactory:
         else:
             raise TypeError('pairs must be either Pairs or Iterable')
 
+        self._model = None
+        self._gamma = None
+        
         self.d = unw
-        self.model = model
         self.gamma = gamma
+        self.model = model
+
+    def __str__(self):
+        _str = (
+            f'{self.__class__.__name__}(\n'
+            f'  pairs: {self.pairs}\n'
+            f'  model: {str(self.model)}\n'
+            f'  gamma: {self.gamma}\n'
+            f'  G shape: {self.G.shape}\n'
+            f'  d shape: {self.d.shape}\n'
+            ')'
+        )
+        return _str
+    
+    def __repr__(self):
+        return str(self)
 
     @property
     def pairs(self):
@@ -96,13 +139,13 @@ class NSBASMatrixFactory:
         '''Update gamma and G by input gamma'''
         if not isinstance(gamma, (float, int)):
             raise TypeError('gamma must be either float or int')
-        if gamma == self._gamma:
+        if hasattr(self, '_gamma') and gamma == self._gamma:
             return
         if gamma <= 0:
             raise ValueError('gamma must be positive')
 
         self._gamma = gamma
-        if self.model is not None:
+        if self._model is not None:
             self.G = self._make_nsbas_matrix(self.model.G_br, gamma)
 
     @property
@@ -239,7 +282,7 @@ def device_mem_size(gpu_id):
     return mem_size
 
 
-def get_patchcol_matric(G, d, mem_size, dtype, safe_factor=2):
+def _get_patch_col(G, d, mem_size, dtype, safe_factor=2):
     """
     Get patch number of cols for memory size (in MB) for GPU.
 
@@ -303,7 +346,7 @@ def batch_lstsq(G, d, gpu_id=None, desc='', unit='patch'):
 
     mem_size = device_mem_size(gpu_id)
 
-    patchcol = get_patchcol_matric(
+    patchcol = _get_patch_col(
         G, d, mem_size, np.dtype(np.float64))
 
     if desc:

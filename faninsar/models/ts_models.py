@@ -9,13 +9,13 @@ import pandas as pd
 class TimeSeriesModels:
     '''Base class for time series models'''
 
-    _unit: Literal['year', 'day'] = 'day'
-    _dates: pd.DatetimeIndex = None
-    _date_spans: np.ndarray = None
+    _unit: Literal['year', 'day']
+    _dates: pd.DatetimeIndex
+    _date_spans: np.ndarray
 
     # Following attributes should be set in subclasses
-    _G_br: np.ndarray = None
-    _param_names: List[str] = []
+    _G_br: np.ndarray
+    _param_names: List[str]
 
     __slots__ = ['_unit', '_dates', '_date_spans', '_G_br', '_param_names']
 
@@ -24,14 +24,24 @@ class TimeSeriesModels:
         dates: Union[pd.DatetimeIndex, Iterable[datetime]],
         unit: Literal['year', 'day'] = 'day'
     ):
-        self.dates = dates
+        self._unit = None
+        self._dates = None
+        self._date_spans = None
+
         self.unit = unit
+        self.dates = dates
 
     def __str__(self) -> str:
-        return f'{self.__class__.__name__}({self.unit})'
+        return f'{self.__class__.__name__}(dates: {len(self.dates)}, unit: {self.unit})'
 
     def __repr__(self) -> str:
-        return str(self)
+        _str = (f'{self.__class__.__name__}(\n'
+                f'  dates: {len(self.dates)}\n'
+                f'  unit: {self.unit}\n'
+                f'  param_names: {self.param_names}\n'
+                f'  G_br shape: {self.G_br.shape})\n'
+                ')')
+        return _str
 
     @property
     def unit(self) -> str:
@@ -44,8 +54,9 @@ class TimeSeriesModels:
         if unit not in ['day', 'year']:
             raise ValueError('unit must be either day or year')
         if unit != self._unit:
-            self._date_spans = self._date_spans * \
-                (1/365.25 if unit == 'year' else 365.25)
+            if self._unit is not None:
+                self._date_spans = self._date_spans * \
+                    (1/365.25 if unit == 'year' else 365.25)
         self._unit = unit
 
     @property

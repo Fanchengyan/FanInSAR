@@ -219,10 +219,10 @@ class Pairs:
         return self._length
 
     def __str__(self) -> str:
-        return self.to_frame().__repr__()
+        return f"Pairs({self._length})"
 
     def __repr__(self) -> str:
-        return str(self)
+        return self.to_frame().__repr__()
 
     def __eq__(self, other: 'Pairs') -> bool:
         return np.array_equal(self.values, other.values)
@@ -704,10 +704,10 @@ class Loops:
         self._length = self._values.shape[0]
 
     def __str__(self) -> str:
-        return self.to_frame('dates').__repr__()
+        return f"Loops({self._length})"
 
     def __repr__(self) -> str:
-        return str(self)
+        return self.to_frame('dates').__repr__()
 
     def __len__(self) -> int:
         return self._length
