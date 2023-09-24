@@ -11,7 +11,7 @@ class TimeSeriesModels:
 
     _unit: Literal['year', 'day'] = 'day'
     _dates: pd.DatetimeIndex = None
-    _date_diff: np.ndarray = None
+    _date_spans: np.ndarray = None
     _G_br: np.ndarray = None
     _param_names: List[str] = []
 
@@ -22,13 +22,13 @@ class TimeSeriesModels:
     ):
 
         dates = pd.to_datetime(dates)
-        date_diff = (dates-dates[0]).days.values
+        date_spans = (dates-dates[0]).days.values
         if unit == 'year':
-            date_diff = date_diff / 365.25
+            date_spans = date_spans / 365.25
 
         self.unit = unit
         self.dates = dates
-        self.date_diff = date_diff
+        self.date_spans = date_spans
 
     def __str__(self) -> str:
         return f'{self.__class__.__name__}({self.unit})'
@@ -65,9 +65,9 @@ class TimeSeriesModels:
         self._dates = dates
 
     @property
-    def date_diff(self) -> np.ndarray:
-        '''Return date_diff'''
-        return self._date_diff
+    def date_spans(self) -> np.ndarray:
+        '''Return date_spans'''
+        return self._date_spans
 
     @property
     def G_br(self) -> np.ndarray:
@@ -87,8 +87,8 @@ class LinearModel(TimeSeriesModels):
         super().__init__(dates, unit=unit)
 
         self.G_br = np.array(
-            [self.date_diff,
-             np.ones_like(self.date_diff)]
+            [self.date_spans,
+             np.ones_like(self.date_spans)]
         ).T
         self.param_names = ['velocity', 'constant']
 
@@ -99,9 +99,9 @@ class QuadraticModel(TimeSeriesModels):
     def __init__(self, dates, unit='day'):
         super().__init__(dates, unit=unit)
         self.G_br = np.array(
-            [self.date_diff**2,
-             self.date_diff,
-             np.ones_like(self.date_diff)]
+            [self.date_spans**2,
+             self.date_spans,
+             np.ones_like(self.date_spans)]
         ).T
         self.param_names = ['1/2_acceleration', 'initial_velocity', 'constant']
 
@@ -112,10 +112,10 @@ class CubicModel(TimeSeriesModels):
     def __init__(self, dates, unit='day'):
         super().__init__(dates, unit=unit)
         self.G_br = np.array(
-            [self.date_diff**3,
-             self.date_diff**2,
-             self.date_diff,
-             np.ones_like(self.date_diff)]
+            [self.date_spans**3,
+             self.date_spans**2,
+             self.date_spans,
+             np.ones_like(self.date_spans)]
         ).T
         self.param_names = ['Rate of Change',
                             'acceleration', 'velocity', 'constant']
@@ -132,10 +132,10 @@ class AnnualSinusoidalModel(TimeSeriesModels):
             coeff = 2*np.pi
 
         self.G_br = np.array(
-            [np.sin(self.date_diff*coeff),
-             np.cos(self.date_diff*coeff),
-             self.date_diff,
-             np.ones_like(self.date_diff)]
+            [np.sin(self.date_spans*coeff),
+             np.cos(self.date_spans*coeff),
+             self.date_spans,
+             np.ones_like(self.date_spans)]
         ).T
         self.param_names = ['sin(T)', 'cos(T)',
                             'velocity', 'constant']
@@ -153,12 +153,12 @@ class AnnualSemiannualSinusoidal(TimeSeriesModels):
             coeff = 2*np.pi
 
         G_br = np.array(
-            [np.sin(self.date_diff*coeff),
-             np.cos(self.date_diff*coeff),
-             np.sin(self.date_diff*coeff*2),
-             np.cos(self.date_diff*coeff*2),
-             self.date_diff,
-             np.ones_like(self.date_diff)]
+            [np.sin(self.date_spans*coeff),
+             np.cos(self.date_spans*coeff),
+             np.sin(self.date_spans*coeff*2),
+             np.cos(self.date_spans*coeff*2),
+             self.date_spans,
+             np.ones_like(self.date_spans)]
         ).T
         param_names = ['sin(T)', 'cos(T)', 'sin(T/2)',
                        'cos(T/2)', 'velocity', 'constant']
