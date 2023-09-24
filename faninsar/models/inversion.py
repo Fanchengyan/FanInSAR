@@ -84,8 +84,7 @@ class NSBASMatrixFactory:
             return
 
         self._model = model
-        if hasattr(self, 'gamma'):
-            self.G = self._make_nsbas_matrix(model.G_br, self.gamma)
+        self.G = self._make_nsbas_matrix(model.G_br, self.gamma)
 
     @property
     def gamma(self):
@@ -103,7 +102,7 @@ class NSBASMatrixFactory:
             raise ValueError('gamma must be positive')
 
         self._gamma = gamma
-        if hasattr(self, 'model'):
+        if self.model is not None:
             self.G = self._make_nsbas_matrix(self.model.G_br, gamma)
 
     @property
