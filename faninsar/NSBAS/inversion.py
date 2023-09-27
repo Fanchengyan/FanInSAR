@@ -5,7 +5,7 @@ import numpy as np
 import psutil
 from tqdm import tqdm
 
-from faninsar.models.ts_models import TimeSeriesModels
+from faninsar.NSBAS.tsmodels import TimeSeriesModels
 from faninsar.utils.pair_tools import Pairs
 
 
@@ -26,7 +26,7 @@ class NSBASMatrixFactory:
     --------
     >>> import faninsar as fis
     >>> import numpy as np
-    
+
     >>> names = ['20170111_20170204',
                 '20170111_20170222',
                 '20170111_20170318',
@@ -40,8 +40,8 @@ class NSBASMatrixFactory:
 
     >>> pairs = fis.Pairs.from_names(names)
     >>> unw = np.random.randint(0, 255, (len(pairs),5))
-    >>> model = fis.models.AnnualSinusoidalModel(pairs.dates)
-    >>> nsbas_matrix = NSBASMatrixFactory(unw, pairs, model)
+    >>> model = fis.AnnualSinusoidalModel(pairs.dates)
+    >>> nsbas_matrix = fis.NSBASMatrixFactory(unw, pairs, model)
     >>> nsbas_matrix
     ... NSBASMatrixFactory(
           pairs: Pairs(10)
@@ -88,12 +88,15 @@ class NSBASMatrixFactory:
 
         self._model = None
         self._gamma = None
-        
+
         self.d = unw
         self.gamma = gamma
         self.model = model
 
     def __str__(self):
+        return f"{self.__class__.__name__}(pairs: {self.pairs}, model: {self.model}, gamma: {self.gamma})"
+
+    def __repr__(self):
         _str = (
             f'{self.__class__.__name__}(\n'
             f'  pairs: {self.pairs}\n'
@@ -104,9 +107,6 @@ class NSBASMatrixFactory:
             ')'
         )
         return _str
-    
-    def __repr__(self):
-        return str(self)
 
     @property
     def pairs(self):
@@ -238,6 +238,9 @@ class NSBASInversion:
         self.n_param = len(matrix_factory.model.param_names)
         self.n_pair = len(matrix_factory.pairs)
 
+    def __str__(self):
+        return f"{self.__class__.__name__}()"
+
     def inverse(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         '''Calculate increment displacement difference by NSBAS inversion.
 
@@ -268,6 +271,56 @@ class NSBASInversion:
         residual_tsm = residual[self.n_pair:]
 
         return incs, params, residual_pair, residual_tsm
+
+
+class PhaseDeformationConverter:
+    '''A class to convert between phase and deformation(mm) for SAR interferometry.'''
+
+    def __init__(self, frequency: float = None, wavelength: float = None) -> None:
+        '''Initialize the converter. Either wavelength or frequency should be provided. 
+        If both are provided, wavelength will be recalculated by frequency.
+
+        Parameters
+        ----------
+        frequency : float
+            The frequency of the radar signal. Unit: GHz. 
+        wavelength : float
+            The wavelength of the radar signal. Unit: meter.
+            this parameter will be ignored if frequency is provided.
+        '''
+        speed_of_light = 299792458
+
+        if frequency is not None:
+            frequency = frequency * 1e9  # GHz to Hz
+            self.wavelength = speed_of_light/frequency  # meter
+            self.frequency = frequency
+        elif wavelength is not None:
+            self.wavelength = wavelength
+            self.frequency = speed_of_light/wavelength
+        else:
+            raise ValueError(
+                "Either wavelength or frequency should be provided.")
+
+        # convert radian to mm
+        self.coef_rd2mm = - self.wavelength/4/np.pi*1000
+
+    def __str__(self) -> str:
+        return f"PhaseDeformationConverter(wavelength={self.wavelength})"
+
+    def __repr__(self) -> str:
+        return str(self)
+
+    def phase2deformation(self, phase: np.ndarray):
+        '''Convert phase to deformation(mm)'''
+        return phase * self.coef_rd2mm
+
+    def deformation2phase(self, deformation: np.ndarray):
+        '''Convert deformation(mm) to phase (radian)'''
+        return deformation / self.coef_rd2mm
+
+    def wrap_phase(self, phase: np.ndarray):
+        '''Wrap phase to [0, 2*pi]'''
+        return np.mod(phase, 2*np.pi)
 
 
 def device_mem_size(gpu_id):

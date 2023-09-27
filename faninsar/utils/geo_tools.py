@@ -483,52 +483,6 @@ class GeoDataFormatConverter:
                     self.profile['nodata'] = None
 
 
-class PhaseDeformationConverter:
-    '''A class to convert between phase and deformation(mm) for SAR interferometry.'''
-
-    def __init__(self, frequency: float = None, wavelength: float = None) -> None:
-        '''Initialize the converter. Either wavelength or frequency should be provided. 
-        If both are provided, wavelength will be recalculated by frequency.
-
-        Parameters
-        ----------
-        frequency : float
-            The frequency of the radar signal. Unit: Hz. 
-        wavelength : float
-            The wavelength of the radar signal. Unit: meter.
-            this parameter will be ignored if frequency is provided.
-        '''
-        speed_of_light = 299792458
-
-        if frequency is not None:
-            self.wavelength = speed_of_light/frequency  # meter
-            self.frequency = frequency
-        elif wavelength is not None:
-            self.wavelength = wavelength
-            self.frequency = speed_of_light/wavelength
-        else:
-            raise ValueError(
-                "Either wavelength or frequency should be provided.")
-
-        # convert radian to mm
-        self.coef_rd2mm = - self.wavelength/4/np.pi*1000
-
-    def __str__(self) -> str:
-        return f"PhaseDeformationConverter(wavelength={self.wavelength})"
-
-    def __repr__(self) -> str:
-        return str(self)
-
-    def phase2deformation(self, phase: np.ndarray):
-        return phase * self.coef_rd2mm
-
-    def deformation2phase(self, deformation: np.ndarray):
-        return deformation / self.coef_rd2mm
-
-    def wrap_phase(self, phase: np.ndarray):
-        return np.mod(phase, 2*np.pi)
-
-
 class Profile:
     '''a class to manage the profile of a raster file. 
     The profile is the metadata of the raster file and 
