@@ -31,7 +31,7 @@ from rtree.index import Index, Property
 from shapely import ops
 from tqdm import tqdm
 
-from faninsar.utils.geo_tools import Profile
+from faninsar._core.geo_tools import Profile
 
 __all__ = ("BoundingBox", "GeoDataset", "RasterDataset")
 

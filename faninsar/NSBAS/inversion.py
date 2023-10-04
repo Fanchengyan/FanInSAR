@@ -6,7 +6,7 @@ import psutil
 from tqdm import tqdm
 
 from faninsar.NSBAS.tsmodels import TimeSeriesModels
-from faninsar.utils.pair_tools import Pairs
+from faninsar._core.pair_tools import Pairs
 
 
 class NSBASMatrixFactory:

@@ -344,8 +344,8 @@ class Pairs:
 
     @property
     def index(self) -> np.ndarray:
-        '''return the index of the pairs'''
-        return np.arange(self._length)
+        '''return the index of the pairs in the dates coordinate'''
+        return np.searchsorted(self._dates, self._values)
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -924,14 +924,14 @@ class Loops:
 
     @property
     def index(self) -> np.ndarray:
-        '''return the index of the loops.
+        '''return the index of the loops in dates coordinates.
 
         Returns
         -------
         index: np.ndarray
-            Index of the loops.
+            Index of the loops in dates coordinates.
         '''
-        return np.arange(self._length)
+        return np.searchsorted(self._dates, self._values)
 
     @classmethod
     def from_names(
@@ -1435,7 +1435,7 @@ class PairsFactory:
         '''
 
         years = sorted(set(self.dates.year))
-        df_dates = pd.Series(dates.strftime('%Y%m%d'), index=dates)
+        df_dates = pd.Series(self.dates.strftime('%Y%m%d'), index=self.dates)
 
         # check if period_start and period_end are in the same year. If not, the period_end should be
         # in the next year
@@ -1473,6 +1473,7 @@ class PairsFactory:
         return Pairs(_pairs)
 
     def from_summer_winter(
+        self,
         dates_str: str,
         date_format: str = '%Y%m%d',
         summer_start: str = '0801',
@@ -1502,9 +1503,9 @@ class PairsFactory:
         -------
         _pairs: a list containing interferometric pairs with each pair as a tuple of two dates
         '''
-        dates = pd.to_datetime(dates_str, format=date_format)
-        years = sorted(set(dates.year))
-        df_dates = pd.Series(dates.strftime(date_format), index=dates)
+        years = sorted(set(self.dates.year))
+        df_dates = pd.Series(self.dates.strftime(date_format),
+                             index=self.dates)
 
         _pairs = []
         for year in years:
@@ -1666,8 +1667,6 @@ if __name__ == '__main__':
              '20170222_20170330',
              '20170222_20170411',
              '20170318_20170330']
-    
-    
 
     pairs = Pairs.from_names(names)
     loops = pairs.to_loops()
