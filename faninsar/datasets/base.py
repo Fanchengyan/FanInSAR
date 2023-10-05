@@ -24,6 +24,7 @@ from rasterio.coords import BoundingBox as BBox
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.io import DatasetReader
+from rasterio.transform import rowcol, xy
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import calculate_default_transform
 from rasterio.warp import transform as warp_transform
@@ -876,6 +877,85 @@ class RasterDataset(GeoDataset):
             list of all files in the dataset
         """
         return self._files
+
+    def row_col(
+        self,
+        xy: Iterable,
+        crs: Optional[Union[CRS, str]] = None,
+    ) -> np.ndarray:
+        '''Convert x, y coordinates to row, col in the dataset.
+
+        Parameters
+        ----------
+        xy: Iterable
+            Pairs of x, y coordinates (floats)
+        crs: CRS or str, optional
+            The CRS of the points. If None, the CRS of the dataset will be used.
+            allowed CRS formats are the same as those supported by rasterio.
+
+        Returns
+        -------
+        row_col: np.ndarray
+            row, col in the dataset for the given points(xy)
+        '''
+        xy = np.asarray(xy)
+        if xy.ndim == 1:
+            xy = xy.reshape(1, -1)
+        if xy.ndim != 2 or xy.shape[1] != 2:
+            raise ValueError(
+                f"Expected xy to be an array of shape (n, 2), got {xy.shape}"
+            )
+        if crs is not None:
+            crs = CRS.from_user_input(crs)
+            if crs != self.crs:
+                xs, ys = warp_transform(crs, self.crs, xy[:, 0], xy[:, 1])
+                xy = np.column_stack((xs, ys))
+
+        profile = self.get_profile('bounds')
+
+        rows, cols = rowcol(profile['transform'], xy[:, 0], xy[:, 1])
+        row_col = np.column_stack((rows, cols))
+        return row_col
+
+    def xy(
+        self,
+        row_col: Iterable,
+        crs: Optional[Union[CRS, str]] = None,
+    ) -> np.ndarray:
+        '''Convert row, col in the dataset to x, y coordinates.
+
+        Parameters
+        ----------
+        row_col: Iterable
+            Pairs of row, col in the dataset (floats)
+        crs: CRS or str, optional
+            The CRS of the points. If None, the CRS of the dataset will be used.
+            allowed CRS formats are the same as those supported by rasterio.
+
+        Returns
+        -------
+        xy: np.ndarray
+            x, y coordinates in the given CRS (default is the CRS of the dataset)
+        '''
+        row_col = np.asarray(row_col)
+        if row_col.ndim == 1:
+            row_col = row_col.reshape(1, -1)
+        if row_col.ndim != 2 or row_col.shape[1] != 2:
+            raise ValueError(
+                f"Expected row_col to be an array of shape (n, 2), got {row_col.shape}"
+            )
+
+        profile = self.get_profile('bounds')
+
+        xs, ys = xy(profile['transform'], row_col[:, 0], row_col[:, 1])
+
+        if crs is not None:
+            crs = CRS.from_user_input(crs)
+            if crs != self.crs:
+                xs, ys = warp_transform(crs, self.crs, xy[:, 0], xy[:, 1])
+        xy = np.column_stack((xs, ys))
+
+        return xy
 
     def sample(
         self,
