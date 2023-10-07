@@ -8,7 +8,8 @@ import re
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import (Any, Literal, Optional, Tuple, Union, overload)
+from typing import Any, Literal, Optional, Tuple, Union, overload
+
 import numpy as np
 import pandas as pd
 import pyproj
@@ -28,8 +29,8 @@ from rtree.index import Index, Property
 from shapely import ops
 from tqdm import tqdm
 
-from faninsar._core.geo_tools import Profile
 from faninsar._core import geo_tools
+from faninsar._core.geo_tools import Profile
 
 __all__ = ("BoundingBox", "GeoDataset", "RasterDataset")
 
@@ -426,8 +427,12 @@ class GeoDataset(abc.ABC):
         new_roi : BoundingBox or Iterable
             region of interest of the dataset in the CRS of the dataset.
         """
+        if new_roi is None:
+            self._roi = None
+            return
         if isinstance(new_roi, Iterable):
             new_roi = np.asarray([i for i in new_roi])
+
         if len(new_roi) != 4:
             raise ValueError(f"ROI must be a tuple of length 4, got {len(new_roi)}")
         if (
@@ -1161,7 +1166,7 @@ class InterferogramDataset(RasterDataset):
         ds = xr.Dataset(
             {
                 "unw": (["band", "lat", "lon"], self[roi]["image"]),
-                "coh": (["band", "lat", "lon"], self.coh_dataset[roi]["image"])
+                "coh": (["band", "lat", "lon"], self.coh_dataset[roi]["image"]),
             },
             coords={
                 "band": list(range(profile["count"])),
