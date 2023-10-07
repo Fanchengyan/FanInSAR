@@ -24,6 +24,14 @@ dtypes
 astype
 ndarray
 pyproj
+xarray
+arange
+xoff
+yoff
+latlon
+geoinfo
+geoinformation
+QGIS
 tqdm
 ndim
 rtree

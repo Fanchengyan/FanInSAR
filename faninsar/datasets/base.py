@@ -5,21 +5,17 @@ import functools
 import glob
 import os
 import re
-import sys
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import (Any, Callable, Literal, Optional, Tuple, Union, cast,
-                    overload)
-
-import fiona
-import fiona.transform
+from pathlib import Path
+from typing import (Any, Literal, Optional, Tuple, Union, overload)
 import numpy as np
 import pandas as pd
 import pyproj
 import rasterio
 import rasterio.merge
 import shapely
+import xarray as xr
 from rasterio.coords import BoundingBox as BBox
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
@@ -33,6 +29,7 @@ from shapely import ops
 from tqdm import tqdm
 
 from faninsar._core.geo_tools import Profile
+from faninsar._core import geo_tools
 
 __all__ = ("BoundingBox", "GeoDataset", "RasterDataset")
 
@@ -111,7 +108,7 @@ class BoundingBox:
         """
         yield from [self.left, self.bottom, self.right, self.top]
 
-    def __contains__(self, other: 'BoundingBox') -> bool:
+    def __contains__(self, other: "BoundingBox") -> bool:
         """Whether or not other is within the bounds of this bounding box.
 
         Args:
@@ -127,7 +124,7 @@ class BoundingBox:
             and (self.bottom <= other.top <= self.top)
         )
 
-    def __or__(self, other: 'BoundingBox') -> 'BoundingBox':
+    def __or__(self, other: "BoundingBox") -> "BoundingBox":
         """The union operator.
 
         Args:
@@ -140,10 +137,10 @@ class BoundingBox:
             min(self.left, other.left),
             max(self.right, other.right),
             min(self.bottom, other.bottom),
-            max(self.top, other.top)
+            max(self.top, other.top),
         )
 
-    def __and__(self, other: 'BoundingBox') -> 'BoundingBox':
+    def __and__(self, other: "BoundingBox") -> "BoundingBox":
         """The intersection operator.
 
         Args:
@@ -163,8 +160,7 @@ class BoundingBox:
                 min(self.top, other.top),
             )
         except ValueError:
-            raise ValueError(
-                f"Bounding boxes {self} and {other} do not overlap")
+            raise ValueError(f"Bounding boxes {self} and {other} do not overlap")
 
     @property
     def area(self) -> float:
@@ -172,7 +168,7 @@ class BoundingBox:
 
         Area is defined as spatial area.
 
-        Returns: 
+        Returns:
             area
         """
         return (self.right - self.left) * (self.top - self.bottom)
@@ -183,9 +179,14 @@ class BoundingBox:
         Returns:
             dictionary with keys 'left', 'bottom', 'right', 'top'
         """
-        return {'left': self.left, 'bottom': self.bottom, 'right': self.right, 'top': self.top}
+        return {
+            "left": self.left,
+            "bottom": self.bottom,
+            "right": self.right,
+            "top": self.top,
+        }
 
-    def intersects(self, other: 'BoundingBox') -> bool:
+    def intersects(self, other: "BoundingBox") -> bool:
         """Whether or not two bounding boxes intersect.
 
         Args:
@@ -203,7 +204,7 @@ class BoundingBox:
 
     def split(
         self, proportion: float, horizontal: bool = True
-    ) -> tuple['BoundingBox', 'BoundingBox']:
+    ) -> tuple["BoundingBox", "BoundingBox"]:
         """Split BoundingBox in two.
 
         Args:
@@ -221,33 +222,29 @@ class BoundingBox:
         if horizontal:
             w = self.right - self.left
             splitx = self.left + w * proportion
-            bbox1 = BoundingBox(
-                self.left, splitx, self.bottom, self.top
-            )
-            bbox2 = BoundingBox(
-                splitx, self.right, self.bottom, self.top
-            )
+            bbox1 = BoundingBox(self.left, splitx, self.bottom, self.top)
+            bbox2 = BoundingBox(splitx, self.right, self.bottom, self.top)
         else:
             h = self.top - self.bottom
             splity = self.bottom + h * proportion
-            bbox1 = BoundingBox(
-                self.left, self.right, self.bottom, splity
-            )
-            bbox2 = BoundingBox(
-                self.left, self.right, splity, self.top
-            )
+            bbox1 = BoundingBox(self.left, self.right, self.bottom, splity)
+            bbox2 = BoundingBox(self.left, self.right, splity, self.top)
 
         return bbox1, bbox2
 
 
 class GeoDataset(abc.ABC):
-    """Abstract base class for all :mod:`faninsar` datasets. This class is used to
-    represent a geospatial dataset and provides methods to index the dataset and
-    retrieve information about the dataset, such as CRS, resolution, and bounds.
+    """Abstract base class for all :mod:`faninsar` datasets. This class is used
+    to represent a geospatial dataset and provides methods to index the dataset
+    and retrieve information about the dataset, such as CRS, resolution, data type,
+    no data value, and a bounds.
 
     .. Note::
 
-        Although this :class:`GeoDataset` class is based on the ``GeoDataset`` class in the torchgeo package, it has been extensively modified to the point where the two classes are completely distinct. When using this :class:`GeoDataset` class, you should not make any assumptions based on the torchgeo version, as the implementations differ significantly.
+        Although this :class:`GeoDataset` class is based on the ``GeoDataset``
+        class in the torchgeo package, it has been extensively modified.  When
+        using this :class:`GeoDataset` class, you should not make any assumptions
+        based on the torchgeo version.
     """
 
     # following attributes should be set by the subclass
@@ -325,9 +322,9 @@ class GeoDataset(abc.ABC):
         Parameters
         ----------
         new_crs: CRS or str
-            New :term:`coordinate reference system (CRS)`. It can be a CRS object 
+            New :term:`coordinate reference system (CRS)`. It can be a CRS object
             or a string, which will be parsed to a CRS object. The string can be
-            in any format supported by `rasterio.crs.CRS.from_user_input() 
+            in any format supported by `rasterio.crs.CRS.from_user_input()
             <https://rasterio.readthedocs.io/en/stable/api/rasterio.crs.html#rasterio.crs.CRS.from_user_input>`_.
         """
         if isinstance(new_crs, str):
@@ -337,39 +334,32 @@ class GeoDataset(abc.ABC):
 
         if self.crs is not None and len(self) > 0:
             # update the resolution
-            profile = self.get_profile('bounds')
+            profile = self.get_profile("bounds")
             tf, *_ = calculate_default_transform(
                 self.crs,
                 new_crs,
-                profile['width'],
-                profile['height'],
+                profile["width"],
+                profile["height"],
                 self.bounds[0],
                 self.bounds[1],
                 self.bounds[2],
-                self.bounds[3]
+                self.bounds[3],
             )
             new_res = (abs(float(tf.a)), abs(float(tf.e)))
-            if (new_res[0] != self.res[0]
-                    or new_res[1] != self.res[1]):
+            if new_res[0] != self.res[0] or new_res[1] != self.res[1]:
                 print(
                     f"Warning: the resolution of the dataset has been changed from {self.res} to {new_res}."
                 )
                 self.res = new_res
 
             # reproject the index
-            new_index = Index(
-                interleaved=True,
-                properties=Property(dimension=2)
-            )
+            new_index = Index(interleaved=True, properties=Property(dimension=2))
             project = pyproj.Transformer.from_crs(
-                pyproj.CRS(str(self.crs)),
-                pyproj.CRS(str(new_crs)),
-                always_xy=True
+                pyproj.CRS(str(self.crs)), pyproj.CRS(str(new_crs)), always_xy=True
             ).transform
             for hit in self.index.intersection(self.index.bounds, objects=True):
                 old_xmin, old_xmax, old_ymin, old_ymax = hit.bounds
-                old_box = shapely.geometry.box(
-                    old_xmin, old_ymin, old_xmax, old_ymax)
+                old_box = shapely.geometry.box(old_xmin, old_ymin, old_xmax, old_ymax)
                 new_box = ops.transform(project, old_box)
                 new_bounds = tuple(new_box.bounds)
                 new_index.insert(hit.id, new_bounds, hit.object)
@@ -409,9 +399,7 @@ class GeoDataset(abc.ABC):
             try:
                 new_res = tuple(float(i) for i in new_res)
             except ValueError:
-                raise ValueError(
-                    "Resolution must be a float or a tuple of floats"
-                )
+                raise ValueError("Resolution must be a float or a tuple of floats")
         self._res = new_res
 
     @property
@@ -421,7 +409,7 @@ class GeoDataset(abc.ABC):
         Returns
         -------
         roi: BoundingBox object
-            region of interest of the dataset. If None, the bounds of 
+            region of interest of the dataset. If None, the bounds of
             entire dataset will be used.
         """
         if self._roi:
@@ -441,13 +429,13 @@ class GeoDataset(abc.ABC):
         if isinstance(new_roi, Iterable):
             new_roi = np.asarray([i for i in new_roi])
         if len(new_roi) != 4:
-            raise ValueError(
-                f"ROI must be a tuple of length 4, got {len(new_roi)}"
-            )
-        if (new_roi[0] < self.bounds[0]
-                or new_roi[1] < self.bounds[1]
-                or new_roi[2] > self.bounds[2]
-                or new_roi[3] > self.bounds[3]):
+            raise ValueError(f"ROI must be a tuple of length 4, got {len(new_roi)}")
+        if (
+            new_roi[0] < self.bounds[0]
+            or new_roi[1] < self.bounds[1]
+            or new_roi[2] > self.bounds[2]
+            or new_roi[3] > self.bounds[3]
+        ):
             raise ValueError(
                 f"ROI must be within the dataset bounds: {self.bounds}, but got {BoundingBox(*new_roi)}"
             )
@@ -499,12 +487,12 @@ class GeoDataset(abc.ABC):
 
     @property
     def count(self) -> int:
-        """Number of valid files in the dataset. 
+        """Number of valid files in the dataset.
 
         .. Note::
 
-            This is different from the length of the dataset ``len(GeoDataset)``, 
-            which is the total number of files in the dataset, including invalid 
+            This is different from the length of the dataset ``len(GeoDataset)``,
+            which is the total number of files in the dataset, including invalid
             files that cannot be read by rasterio.
 
         Returns
@@ -527,7 +515,7 @@ class GeoDataset(abc.ABC):
 
     @property
     def bounds(self) -> BoundingBox:
-        """Bounds of the overall dataset. It is the union of all the files in the 
+        """Bounds of the overall dataset. It is the union of all the files in the
         dataset.
 
         Returns
@@ -538,10 +526,11 @@ class GeoDataset(abc.ABC):
         return BoundingBox(*self.index.bounds)
 
     def get_profile(
-        self,
-        bbox: Literal['roi', 'bounds'] = 'roi'
+        self, bbox: Union[BoundingBox, Literal["roi", "bounds"]] = "roi"
     ) -> Optional[Profile]:
-        """Return the profile of the dataset
+        """Return the profile information of the dataset for the given bounding
+        box type. The profile information includes the width, height, transform,
+        count, data type, no data value, and CRS of the dataset.
 
         Parameters
         ----------
@@ -553,21 +542,24 @@ class GeoDataset(abc.ABC):
         Returns
         -------
         profile: Profile object or None
-            profile of the dataset for the given bounding box type. 
+            profile of the dataset for the given bounding box type.
         """
-        if bbox == 'bounds':
+        if bbox == "bounds":
             if self.bounds is None:
                 return None
             else:
                 bounds = self.bounds
-        elif bbox == 'roi':
+        elif bbox == "roi":
             if self.roi is None:
                 return None
             else:
                 bounds = self.roi
+        elif isinstance(bbox, BoundingBox):
+            bounds = bbox
         else:
             raise ValueError(
-                f"bbox must be one of ['bounds', 'roi'], but got {bbox}"
+                "bbox must be one of ['bounds', 'roi'] or a "
+                f"BoundingBox, but got {bbox}"
             )
 
         profile = Profile.from_bounds_res(bounds, self.res)
@@ -580,17 +572,7 @@ class GeoDataset(abc.ABC):
 
 
 class RasterDataset(GeoDataset):
-    """A base class for raster datasets.
-
-    .. Note::
-
-        This class is a modified version of the ``RasterDataset`` class from the 
-        torchgeo package. The modifications are:
-
-        * the ``__init__`` method is modified to accept more parameters for the dataset
-        * add :property:`files` property to return a DataFrame of all files in the dataset, including invalid files and information about whether the file is valid
-        * add :meth:`sample` method to sample values from the dataset for given points
-    """
+    """A base class for raster datasets."""
 
     #: Glob expression used to search for files.
     #:
@@ -630,7 +612,7 @@ class RasterDataset(GeoDataset):
         res: Optional[Union[float, Tuple[float, float]]] = None,
         dtype: Optional[np.dtype] = None,
         nodata: Optional[Union[float, int, Any]] = None,
-        rio: Optional[BoundingBox] = None,
+        roi: Optional[BoundingBox] = None,
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
@@ -729,9 +711,7 @@ class RasterDataset(GeoDataset):
                 msg += f" with `bands={self.bands}`"
             raise FileNotFoundError(msg)
 
-        self._files = pd.DataFrame(
-            {"file_paths": file_paths, "valid": files_valid}
-        )
+        self._files = pd.DataFrame({"file_paths": file_paths, "valid": files_valid})
         if not self._files.valid.all():
             files_invalid = self._files.file_paths[~self._files.valid].tolist()
             print(
@@ -742,9 +722,7 @@ class RasterDataset(GeoDataset):
         self.band_indexes = None
         if self.bands:
             if self.all_bands:
-                self.band_indexes = [
-                    self.all_bands.index(i) + 1 for i in self.bands
-                ]
+                self.band_indexes = [self.all_bands.index(i) + 1 for i in self.bands]
             else:
                 msg = (
                     f"{self.__class__.__name__} is missing an `all_bands` "
@@ -754,7 +732,7 @@ class RasterDataset(GeoDataset):
 
         self.crs = crs
         self.res = res
-        self.rio = rio
+        self.roi = roi
         self.dtype = dtype
         self.nodata = nodata
         self.count = count
@@ -810,11 +788,7 @@ class RasterDataset(GeoDataset):
             vrt_fhs = [self._load_warp_file(fp) for fp in file_paths]
 
         if self.verbose:
-            vrt_fhs = tqdm(
-                vrt_fhs,
-                desc="Loading files",
-                unit=" files"
-            )
+            vrt_fhs = tqdm(vrt_fhs, desc="Loading files", unit=" files")
 
         data_list = []
         for vrt_fh in vrt_fhs:
@@ -883,7 +857,7 @@ class RasterDataset(GeoDataset):
         xy: Iterable,
         crs: Optional[Union[CRS, str]] = None,
     ) -> np.ndarray:
-        '''Convert x, y coordinates to row, col in the dataset.
+        """Convert x, y coordinates to row, col in the dataset.
 
         Parameters
         ----------
@@ -897,7 +871,7 @@ class RasterDataset(GeoDataset):
         -------
         row_col: np.ndarray
             row, col in the dataset for the given points(xy)
-        '''
+        """
         xy = np.asarray(xy)
         if xy.ndim == 1:
             xy = xy.reshape(1, -1)
@@ -911,9 +885,9 @@ class RasterDataset(GeoDataset):
                 xs, ys = warp_transform(crs, self.crs, xy[:, 0], xy[:, 1])
                 xy = np.column_stack((xs, ys))
 
-        profile = self.get_profile('bounds')
+        profile = self.get_profile("bounds")
 
-        rows, cols = rowcol(profile['transform'], xy[:, 0], xy[:, 1])
+        rows, cols = rowcol(profile["transform"], xy[:, 0], xy[:, 1])
         row_col = np.column_stack((rows, cols))
         return row_col
 
@@ -922,7 +896,7 @@ class RasterDataset(GeoDataset):
         row_col: Iterable,
         crs: Optional[Union[CRS, str]] = None,
     ) -> np.ndarray:
-        '''Convert row, col in the dataset to x, y coordinates.
+        """Convert row, col in the dataset to x, y coordinates.
 
         Parameters
         ----------
@@ -936,7 +910,7 @@ class RasterDataset(GeoDataset):
         -------
         xy: np.ndarray
             x, y coordinates in the given CRS (default is the CRS of the dataset)
-        '''
+        """
         row_col = np.asarray(row_col)
         if row_col.ndim == 1:
             row_col = row_col.reshape(1, -1)
@@ -945,9 +919,9 @@ class RasterDataset(GeoDataset):
                 f"Expected row_col to be an array of shape (n, 2), got {row_col.shape}"
             )
 
-        profile = self.get_profile('bounds')
+        profile = self.get_profile("bounds")
 
-        xs, ys = xy(profile['transform'], row_col[:, 0], row_col[:, 1])
+        xs, ys = xy(profile["transform"], row_col[:, 0], row_col[:, 1])
 
         if crs is not None:
             crs = CRS.from_user_input(crs)
@@ -992,11 +966,7 @@ class RasterDataset(GeoDataset):
         files = self.files[self.files.valid].file_paths
 
         if verbose:
-            files = tqdm(
-                files,
-                desc="Sampling values",
-                unit=" files"
-            )
+            files = tqdm(files, desc="Sampling values", unit=" files")
 
         values = []
         for file_path in files:
@@ -1004,3 +974,202 @@ class RasterDataset(GeoDataset):
                 values.append(list(src.sample(xy)))
 
         return np.asarray(values).squeeze()
+
+    def to_netcdf(
+        self,
+        filename: str,
+        roi: Optional[BoundingBox] = None,
+    ) -> None:
+        """Save the dataset to a netCDF file for given region of interest.
+
+        Parameters
+        ----------
+        filename : str
+            path to the netCDF file to save
+        roi : BoundingBox, optional
+            region of interest to save. If None, the roi of the dataset will be used.
+        """
+        if roi is None:
+            roi = self.roi
+
+        profile = self.get_profile(roi)
+        lat, lon = profile.to_latlon()
+        sample = self[roi]
+
+        ds = xr.Dataset(
+            {"image": (["band", "lat", "lon"], sample["image"])},
+            coords={
+                "band": list(range(profile["count"])),
+                "lat": lat,
+                "lon": lon,
+            },
+        )
+        ds = geo_tools.write_geoinfo_into_ds(
+            ds, "image", crs=self.crs, x_dim="lon", y_dim="lat"
+        )
+        ds.to_netcdf(filename)
+
+
+class InterferogramDataset(RasterDataset):
+    """
+    A base class for interferogram datasets. The unwrapped interferogram will be
+    used as this dataset's ``image`` data. The ``coherence``, ``dem`` and ``mask``
+    data are optional and can be accessed as attributes of the dataset.
+    """
+
+    #: Glob expression used to search for files.
+    #:
+    #: This expression is used to find the interferogram files.
+    filename_glob_unw = "*"
+
+    #: This expression is used to find the coherence files.
+    filename_glob_coh = "*"
+
+    #: Date format string used to parse date from filename.
+    #:
+    #: Not used if :attr:`filename_regex` does not contain a ``date`` group.
+    date_format = "%Y%m%d"
+
+    #: True if dataset contains imagery, False if dataset contains mask
+    is_image = True
+
+    #: Color map for the dataset, used for plotting
+    cmap: dict[int, tuple[int, int, int, int]] = {}
+
+    def __init__(
+        self,
+        root: str = "data",
+        file_paths_unw: Optional[Sequence[str]] = None,
+        file_paths_coh: Optional[Sequence[str]] = None,
+        dem: Optional[Any] = None,
+        mask: Optional[Any] = None,
+        crs: Optional[CRS] = None,
+        res: Optional[Union[float, Tuple[float, float]]] = None,
+        dtype: Optional[np.dtype] = None,
+        nodata: Optional[Union[float, int, Any]] = None,
+        roi: Optional[BoundingBox] = None,
+        bands: Optional[Sequence[str]] = None,
+        cache: bool = True,
+        resampling=Resampling.nearest,
+        verbose=False,
+    ) -> None:
+        """Initialize a new InterferogramDataset instance.
+        # TODO: add dem and mask support
+
+        Parameters
+        ----------
+        root: str
+            Root directory where dataset can be found.
+        file_paths_unw: list of str, optional
+            list of unwrapped interferogram file paths to use instead of searching
+            for files in ``root``. If None, files will be searched for in ``root``.
+        file_paths_coh: list of str, optional
+            list of coherence file paths to use instead of searching for files in
+            ``root``. If None, files will be searched for in ``root``.
+        dem: Any, optional
+            DEM data. If None, no DEM data will be used.
+        mask: Any, optional
+            Mask data. If None, no mask data will be used.
+        crs: CRS, optional
+            the output term:`coordinate reference system (CRS)` of the dataset.
+            If None, the CRS of the first file found will be used.
+        res: float, optional
+            resolution of the output dataset in units of CRS. If None, the resolution
+            of the first file found will be used.
+        dtype: numpy.dtype, optional
+            data type of the output dataset. If None, the data type of the first
+            file found will be used.
+        nodata: float or int, optional
+            no data value of the output dataset. If None, the no data value of the
+            first file found will be used.
+        roi: BoundingBox, optional
+            region of interest to load from the dataset. If None, the union of all
+            files bounds in the dataset will be used.
+        bands: list of str, optional
+            names of bands to return (defaults to all bands)
+        cache: bool, optional
+            if True, cache file handle to speed up repeated sampling
+        resampling: Resampling, optional
+            Resampling algorithm used when reading input files.
+            Default: `Resampling.nearest`.
+        verbose: bool, optional
+            if True, print verbose output.
+        """
+        root_dir = Path(root)
+        self.root_dir = root_dir
+
+        if file_paths_unw is None:
+            file_paths_unw = sorted(root_dir.rglob(self.filename_glob_unw))
+        if file_paths_coh is None:
+            file_paths_coh = sorted(root_dir.rglob(self.filename_glob_coh))
+
+        if len(file_paths_unw) != len(file_paths_coh):
+            raise ValueError(
+                f"Number of interferogram files ({len(file_paths_unw)}) does not match "
+                f"number of coherence files ({len(file_paths_coh)})"
+            )
+
+        super().__init__(
+            root=root,
+            file_paths=file_paths_unw,
+            crs=crs,
+            res=res,
+            dtype=dtype,
+            nodata=nodata,
+            roi=roi,
+            bands=bands,
+            cache=cache,
+            resampling=resampling,
+            verbose=verbose,
+        )
+
+        self.coh_dataset = RasterDataset(
+            root=root,
+            file_paths=file_paths_coh,
+            crs=self.crs,
+            res=self.res,
+            dtype=self.dtype,
+            nodata=self.nodata,
+            roi=self.roi,
+            bands=bands,
+            cache=cache,
+            resampling=resampling,
+            verbose=verbose,
+        )
+
+    def to_netcdf(
+        self,
+        filename: str,
+        roi: Optional[BoundingBox] = None,
+    ) -> None:
+        """Save the dataset to a netCDF file for given region of interest.
+
+        Parameters
+        ----------
+        filename : str
+            path to the netCDF file to save
+        roi : BoundingBox, optional
+            region of interest to save. If None, the roi of the dataset will be used.
+        """
+        if roi is None:
+            roi = self.roi
+
+        # TODO: add dem and mask
+        profile = self.get_profile(roi)
+        lat, lon = profile.to_latlon()
+
+        ds = xr.Dataset(
+            {
+                "unw": (["band", "lat", "lon"], self[roi]["image"]),
+                "coh": (["band", "lat", "lon"], self.coh_dataset[roi]["image"])
+            },
+            coords={
+                "band": list(range(profile["count"])),
+                "lat": lat,
+                "lon": lon,
+            },
+        )
+        ds = geo_tools.write_geoinfo_into_ds(
+            ds, "image", crs=self.crs, x_dim="lon", y_dim="lat"
+        )
+        ds.to_netcdf(filename)
