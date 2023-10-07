@@ -1025,4 +1025,13 @@ class Profile:
             file = file.parent / (file.name + '.profile')
         with open(file, 'w') as f:
             f.write(str(self))
+            
+    def to_latlon(self) -> Tuple[np.ndarray, np.ndarray]:
+        '''get the latitude and longitude from profile data'''
+        tf = self.profile["transform"]
+        width = self.profile["width"]
+        height = self.profile["height"]
+        lon = tf.xoff + tf.a * np.arange(width) + tf.a * 0.5
+        lat = tf.yoff + tf.e * np.arange(height) + tf.e * 0.5
+        return lat, lon
 
