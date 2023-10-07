@@ -5,16 +5,10 @@ import functools
 import glob
 import os
 import re
-import sys
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import (Any, Callable, Literal, Optional, Tuple, Union, cast,
-                    overload)
-
-import fiona
-import fiona.transform
+from typing import (Any, Literal, Optional, Tuple, Union, overload)
 import numpy as np
 import pandas as pd
 import pyproj
@@ -34,7 +28,7 @@ from rtree.index import Index, Property
 from shapely import ops
 from tqdm import tqdm
 
-from faninsar import Profile
+from faninsar._core.geo_tools import Profile
 from faninsar._core import geo_tools
 
 __all__ = ("BoundingBox", "GeoDataset", "RasterDataset")
