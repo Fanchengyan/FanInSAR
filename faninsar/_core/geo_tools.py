@@ -1007,8 +1007,8 @@ class Profile:
         if isinstance(res, (int, float, np.integer, np.floating)):
             res = (float(res), float(res))
         dst_w, dst_s, dst_e, dst_n = bounds
-        width = int(round((dst_e - dst_w) / res[0]))
-        height = int(round((dst_n - dst_s) / res[1]))
+        width = int((dst_e - dst_w) / res[0])
+        height = int((dst_n - dst_s) / res[1])
         tf = Affine.translation(dst_w, dst_n) * Affine.scale(res[0], -res[1])
 
         profile = {
