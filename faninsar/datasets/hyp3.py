@@ -80,7 +80,7 @@ class HyP3(InterferogramDataset):
         """
         super().__init__(
             root=root,
-            file_paths=file_paths_unw,
+            file_paths_unw=file_paths_unw,
             file_paths_coh=file_paths_coh,
             dem=dem,
             mask=mask,
