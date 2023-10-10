@@ -557,7 +557,9 @@ class Points:
             The Points object.
         """
         gdf = gpd.read_file(filename, **kwargs)
-        return cls.from_GeoDataFrame(gdf, x_field, y_field)
+        x_field, y_field = cls._ensure_fields(gdf, "auto", "auto")
+
+        return cls(gdf[[x_field, y_field]].values, crs=gdf.crs)
 
     @classmethod
     def from_csv(
@@ -659,7 +661,7 @@ class GeoQuery:
         Parameters
         ----------
         bbox : Optional[Union[BoundingBox, list[BoundingBox]]], optional, default: None
-            The :class:`BoundingBox` or a list of :class:`BoundingBox`. for querying 
+            The :class:`BoundingBox` or a list of :class:`BoundingBox`. for querying
             the samples.If None, the samples will be queried from the points.
         points : Optional[Union[Points, Point]], optional, default: None
             The :class:`Points` for querying the samples. If None, the samples
