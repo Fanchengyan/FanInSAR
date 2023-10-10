@@ -17,6 +17,7 @@ reproject
 LiCSAR
 LiCSBAS
 isce
+geopandas
 torchgeo
 rasterio
 dtype

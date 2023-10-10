@@ -5,10 +5,11 @@ import functools
 import glob
 import os
 import re
+import warnings
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional, Tuple, Union, overload
+from typing import Any, Literal, Optional, Union, overload
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,9 @@ import rasterio
 import rasterio.merge
 import shapely
 import xarray as xr
+from faninsar._core import geo_tools
+from faninsar._core.geo_tools import Profile
+from faninsar.datasets.query import BoundingBox, GeoQuery, Points
 from rasterio.coords import BoundingBox as BBox
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
@@ -29,209 +33,7 @@ from rtree.index import Index, Property
 from shapely import ops
 from tqdm import tqdm
 
-from faninsar._core import geo_tools
-from faninsar._core.geo_tools import Profile
-
-__all__ = ("BoundingBox", "GeoDataset", "RasterDataset")
-
-
-@dataclass(frozen=True)
-class BoundingBox:
-    """Data class for indexing interferogram data using a spatial bounding box.
-
-    .. Note::
-
-        The :class:`BoundingBox` class a modified version of the ``BoundingBox``
-        class from the torchgeo package. The modifications are:
-
-        * date bounds are removed
-        * the bounds is changed to (left, bottom, right, top) which is the same as
-            rasterio :class:`rasterio.coords.BoundingBox`
-        * added :meth:`to_rasterio_bounds` method to convert the bounding box to a
-            rasterio bounds tuple
-    """
-
-    #: western boundary
-    left: float
-    #: southern boundary
-    bottom: float
-    #: eastern boundary
-    right: float
-    #: northern boundary
-    top: float
-
-    def __post_init__(self) -> None:
-        """Validate the arguments passed to :meth:`__init__`.
-
-        Raises:
-            ValueError: if bounding box is invalid
-                (left > right, bottom > top)
-
-        .. versionadded:: 0.2
-        """
-        if self.left > self.right:
-            raise ValueError(
-                f"Bounding box is invalid: 'left={self.left}' > 'right={self.right}'"
-            )
-        if self.bottom > self.top:
-            raise ValueError(
-                f"Bounding box is invalid: 'bottom={self.bottom}' > 'top={self.top}'"
-            )
-
-    # https://github.com/PyCQA/pydocstyle/issues/525
-    @overload
-    def __getitem__(self, key: int) -> float:  # noqa: D105
-        pass
-
-    @overload
-    def __getitem__(self, key: slice) -> list[float]:  # noqa: D105
-        pass
-
-    def __getitem__(self, key: Union[int, slice]) -> Union[float, list[float]]:
-        """Index the (left, bottom, right,  top) tuple.
-
-        Args:
-            key: integer or slice object
-
-        Returns:
-            the value(s) at that index
-
-        Raises:
-            IndexError: if key is out of bounds
-        """
-        return [self.left, self.bottom, self.right, self.top][key]
-
-    def __iter__(self) -> Iterator[float]:
-        """Container iterator.
-
-        Returns:
-            iterator object that iterates over all objects in the container
-        """
-        yield from [self.left, self.bottom, self.right, self.top]
-
-    def __contains__(self, other: "BoundingBox") -> bool:
-        """Whether or not other is within the bounds of this bounding box.
-
-        Args:
-            other: another bounding box
-
-        Returns:
-            True if other is within this bounding box, else False
-        """
-        return (
-            (self.left <= other.left <= self.right)
-            and (self.left <= other.right <= self.right)
-            and (self.bottom <= other.bottom <= self.top)
-            and (self.bottom <= other.top <= self.top)
-        )
-
-    def __or__(self, other: "BoundingBox") -> "BoundingBox":
-        """The union operator.
-
-        Args:
-            other: another bounding box
-
-        Returns:
-            the minimum bounding box that contains both self and other
-        """
-        return BoundingBox(
-            min(self.left, other.left),
-            max(self.right, other.right),
-            min(self.bottom, other.bottom),
-            max(self.top, other.top),
-        )
-
-    def __and__(self, other: "BoundingBox") -> "BoundingBox":
-        """The intersection operator.
-
-        Args:
-            other: another bounding box
-
-        Returns:
-            the intersection of self and other
-
-        Raises:
-            ValueError: if self and other do not intersect
-        """
-        try:
-            return BoundingBox(
-                max(self.left, other.left),
-                min(self.right, other.right),
-                max(self.bottom, other.bottom),
-                min(self.top, other.top),
-            )
-        except ValueError:
-            raise ValueError(f"Bounding boxes {self} and {other} do not overlap")
-
-    @property
-    def area(self) -> float:
-        """Area of bounding box.
-
-        Area is defined as spatial area.
-
-        Returns:
-            area
-        """
-        return (self.right - self.left) * (self.top - self.bottom)
-
-    def to_dict(self) -> dict[str, float]:
-        """Convert the bounding box to a dictionary.
-
-        Returns:
-            dictionary with keys 'left', 'bottom', 'right', 'top'
-        """
-        return {
-            "left": self.left,
-            "bottom": self.bottom,
-            "right": self.right,
-            "top": self.top,
-        }
-
-    def intersects(self, other: "BoundingBox") -> bool:
-        """Whether or not two bounding boxes intersect.
-
-        Args:
-            other: another bounding box
-
-        Returns:
-            True if bounding boxes intersect, else False
-        """
-        return (
-            self.left <= other.right
-            and self.right >= other.left
-            and self.bottom <= other.top
-            and self.top >= other.bottom
-        )
-
-    def split(
-        self, proportion: float, horizontal: bool = True
-    ) -> tuple["BoundingBox", "BoundingBox"]:
-        """Split BoundingBox in two.
-
-        Args:
-            proportion: split proportion in range (0,1)
-            horizontal: whether the split is horizontal or vertical
-
-        Returns:
-            A tuple with the resulting BoundingBoxes
-
-        .. versionadded:: 0.5
-        """
-        if not (0.0 < proportion < 1.0):
-            raise ValueError("Input proportion must be between 0 and 1.")
-
-        if horizontal:
-            w = self.right - self.left
-            splitx = self.left + w * proportion
-            bbox1 = BoundingBox(self.left, splitx, self.bottom, self.top)
-            bbox2 = BoundingBox(splitx, self.right, self.bottom, self.top)
-        else:
-            h = self.top - self.bottom
-            splity = self.bottom + h * proportion
-            bbox1 = BoundingBox(self.left, self.right, self.bottom, splity)
-            bbox2 = BoundingBox(self.left, self.right, splity, self.top)
-
-        return bbox1, bbox2
+__all__ = ("GeoDataset", "RasterDataset")
 
 
 class GeoDataset(abc.ABC):
@@ -250,7 +52,7 @@ class GeoDataset(abc.ABC):
 
     # following attributes should be set by the subclass
     _crs: Optional[CRS] = None
-    _res: Tuple[float, float] = (0.0, 0.0)
+    _res: tuple[float, float] = (0.0, 0.0)
     _dtype: Optional[np.dtype] = None
     _count: int = 0
     _roi: Optional[BoundingBox] = None
@@ -263,7 +65,7 @@ class GeoDataset(abc.ABC):
         return f"""\
 {self.__class__.__name__} Dataset
     bbox: {self.bounds} 
-    size: {len(self)}"""
+    file count: {len(self)}"""
 
     def __str__(self):
         return self.__repr__()
@@ -370,7 +172,7 @@ class GeoDataset(abc.ABC):
         self._crs = new_crs
 
     @property
-    def res(self) -> Tuple[float, float]:
+    def res(self) -> tuple[float, float]:
         """Return the resolution of the dataset.
 
         Returns
@@ -381,7 +183,7 @@ class GeoDataset(abc.ABC):
         return self._res
 
     @res.setter
-    def res(self, new_res: Union[float, Tuple[float, float]]) -> None:
+    def res(self, new_res: Union[float, tuple[float, float]]) -> None:
         """Set the resolution of the dataset.
 
         Parameters
@@ -577,7 +379,58 @@ class GeoDataset(abc.ABC):
 
 
 class RasterDataset(GeoDataset):
-    """A base class for raster datasets."""
+    """A base class for raster datasets.
+
+    Examples
+    --------
+    >>> from pathlib import Path
+    >>> from faninsar.datasets import BoundingBox, GeoQuery, Points, RasterDataset
+    >>> home_dir = Path("./work/data")
+    >>> files = list(home_dir.rglob("*unw_phase.tif"))
+
+    initialize a RasterDataset and GeoQuery object
+
+    >>> ds = RasterDataset(file_paths=files)
+    >>> points = Points(
+        [(490357, 4283413),
+        (491048, 4283411),
+        (490317, 4284829)]
+        )
+    >>> query = GeoQuery(points=points, bbox=[ds.bounds, ds.bounds])
+
+    use the GeoQuery object to index the RasterDataset
+
+    >>> sample = ds[query]
+
+    output the samples shapes:
+
+    >>> print('bbox shape:', sample['bbox'].shape)
+    bbox shape: (2, 7, 68, 80)
+
+    >>> print('points shape:', sample['points'].shape)
+    points shape: (7, 3)
+
+    of course, you can also use the BoundingBox or Points directly to index the
+    RasterDataset. Those two types will be automatically converted to GeoQuery
+    object.
+
+    >>> sample = ds[points]
+    >>> sample
+    {'query': GeoQuery(
+        bbox=None
+        points=Points(count=3)
+    ),
+    'bbox': None,
+    'points': array([...], dtype=float32)}
+
+    >>> sample = ds[ds.bounds]
+    query': GeoQuery(
+        bbox=[1 BoundingBox]
+        points=None
+    ),
+    'bbox': array([...], dtype=float32),
+    'points': None}
+    """
 
     #: Glob expression used to search for files.
     #:
@@ -597,9 +450,6 @@ class RasterDataset(GeoDataset):
     #: Not used if :attr:`filename_regex` does not contain a ``date`` group.
     date_format = "%Y%m%d"
 
-    #: True if dataset contains imagery, False if dataset contains mask
-    is_image = True
-
     #: Names of all available bands in the dataset
     all_bands: list[str] = []
 
@@ -614,14 +464,14 @@ class RasterDataset(GeoDataset):
         root: str = "data",
         file_paths: Optional[Sequence[str]] = None,
         crs: Optional[CRS] = None,
-        res: Optional[Union[float, Tuple[float, float]]] = None,
+        res: Optional[Union[float, tuple[float, float]]] = None,
         dtype: Optional[np.dtype] = None,
         nodata: Optional[Union[float, int, Any]] = None,
         roi: Optional[BoundingBox] = None,
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
-        verbose: bool = False,
+        verbose: bool = True,
     ) -> None:
         """Initialize a new Dataset instance.
 
@@ -654,7 +504,7 @@ class RasterDataset(GeoDataset):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
-        verbose : bool, optional
+        verbose : bool, optional, default: True
             if True, print verbose output
 
         Raises
@@ -742,50 +592,63 @@ class RasterDataset(GeoDataset):
         self.nodata = nodata
         self.count = count
 
-    def __getitem__(self, query: BoundingBox) -> dict[str, Any]:
-        """Retrieve image/mask and metadata indexed by query.
+    def __getitem__(
+        self, query: Union[GeoQuery, BoundingBox, Points]
+    ) -> dict[str, np.ndarray]:
+        """Retrieve image values for given query.
 
-        Args:
-            query: (left, right, bottom, top) coordinates to index
+        Parameters
+        ----------
+        query : Union[GeoQuery, BoundingBox, Points]
+            query to index the dataset. It can be a :class:`BoundingBox` or a
+            :class:`Points` or a :class:`GeoQuery` (recommended) object.
 
-        Returns:
-            sample of image/mask and metadata at that index
+        Returns
+        -------
+        sample : dict
+            a dictionary containing the image values, corresponding query.
+            The keys of the dictionary are:
 
-        Raises:
-            IndexError: if query is not found in the index
+            * ``query``: a GeoQuery object, the query used to index the dataset
+            * ``bbox``: a numpy array of shape (n_bbox, n_file, height, width)
+                containing the values of the bounding boxes in the query.
+            * ``points``: a numpy array of shape (n_file, n_point) containing the
+                values of the points in the query.
+
+            .. Note::
+
+                ``bbox`` and ``points`` will be None if the query does not contain
+                bounding boxes or points.
         """
+        if isinstance(query, BoundingBox):
+            query = GeoQuery(bbox=query)
+        if isinstance(query, Points):
+            query = GeoQuery(points=query)
+
         file_paths = self.files[self.files.valid].file_paths
-        data = self._stack_files(file_paths, query)
+        data = self._sample_files(file_paths, query)
 
-        sample = {"crs": self.crs, "bbox": query}
-
-        if self.is_image:
-            sample["image"] = data
-        else:
-            sample["mask"] = data
+        sample = {"query": query}
+        sample.update(data)
 
         return sample
 
-    def _stack_files(
-        self,
-        file_paths: Sequence[str],
-        query: BoundingBox,
-    ) -> np.ndarray:
+    def _sample_files(
+        self, file_paths: Sequence[str], query: GeoQuery
+    ) -> dict[Union[Literal["bbox", "points"], np.ndarray]]:
         """Stack files into a single 3D array.
 
         Parameters
         ----------
         file_paths : list of str
             list of paths for files to stack
-        query : BoundingBox
-            bounding box to index
+        query : GeoQuery
+            a GeoQuery object containing the BoundingBox(es) and/or Points object
 
         Returns
         -------
         dest : numpy.ndarray
             stacked array
-        tf : affine.Affine
-            affine transform of the stacked array
         """
         if self.cache:
             vrt_fhs = [self._cached_load_warp_file(fp) for fp in file_paths]
@@ -795,26 +658,58 @@ class RasterDataset(GeoDataset):
         if self.verbose:
             vrt_fhs = tqdm(vrt_fhs, desc="Loading files", unit=" files")
 
-        data_list = []
+        files_bbox_list = []
+        files_points_list = []
         for vrt_fh in vrt_fhs:
-            win = vrt_fh.window(*query)
-            data = vrt_fh.read(
-                out_shape=(
-                    1,
-                    int((query.top - query.bottom) / self.res[1]),
-                    int((query.right - query.left) / self.res[0]),
-                ),
-                resampling=self.resampling,
-                indexes=self.band_indexes,
-                window=win,
-                boundless=True,
-                fill_value=self.nodata,
+            # Get the bounding boxes values
+            bbox_list = []
+            if query.bbox is not None:
+                for bbox in query.bbox:
+                    win = vrt_fh.window(*bbox)
+                    data = vrt_fh.read(
+                        out_shape=(
+                            1,
+                            int((bbox.top - bbox.bottom) / self.res[1]),
+                            int((bbox.right - bbox.left) / self.res[0]),
+                        ),
+                        resampling=self.resampling,
+                        indexes=self.band_indexes,
+                        window=win,
+                        boundless=True,
+                        fill_value=self.nodata,
+                    )
+                    bbox_list.append(data)
+
+                files_bbox_list.append(bbox_list)
+            # Get the points values
+            if query.points is not None:
+                crs_points = query.points.crs
+                xy = query.points.values
+                if crs_points is None:
+                    warnings.warn(
+                        "No CRS is specified for the points, assuming they are in the same CRS as the dataset."
+                    )
+                else:
+                    if crs_points != self.crs:
+                        xs, ys = warp_transform(
+                            crs_points, self.crs, xy[:, 0], xy[:, 1]
+                        )
+                        xy = np.column_stack((xs, ys))
+                files_points_list.append(list(vrt_fh.sample(xy)))
+
+        # Stack the bounding boxes values
+        bbox_values = None
+        if len(files_bbox_list) > 0:
+            bbox_values = (
+                np.asarray(files_bbox_list).squeeze(axis=2).transpose(1, 0, 2, 3)
             )
-            data_list.append(data)
-        dest = np.concatenate(data_list, axis=0)
 
-        print(win)
+        # Stack the points values
+        points_values = None
+        if len(files_points_list) > 0:
+            points_values = np.asarray(files_points_list).squeeze()
 
+        dest = {"bbox": bbox_values, "points": points_values}
         return dest
 
     @functools.lru_cache(maxsize=128)
@@ -936,50 +831,6 @@ class RasterDataset(GeoDataset):
 
         return xy
 
-    def sample(
-        self,
-        xy: Iterable,
-        crs: Optional[Union[CRS, str]] = None,
-        verbose: bool = False,
-    ) -> np.ndarray:
-        """Sample values from dataset for given points.
-
-        Parameters
-        ----------
-        xy: Iterable
-            Pairs of x, y coordinates (floats)
-        crs: CRS or str, optional
-            The CRS of the points. If None, the CRS of the dataset will be used.
-            allowed CRS formats are the same as those supported by rasterio.
-        verbose: bool, optional
-            If True, show progress
-
-        Returns:
-            array of values at those points
-        """
-        xy = np.asarray(xy)
-        if xy.ndim != 2 or xy.shape[1] != 2:
-            raise ValueError(
-                f"Expected xy to be an array of shape (n, 2), got {xy.shape}"
-            )
-        if crs is not None:
-            crs = CRS.from_user_input(crs)
-            if crs != self.crs:
-                xs, ys = warp_transform(crs, self.crs, xy[:, 0], xy[:, 1])
-                xy = np.column_stack((xs, ys))
-
-        files = self.files[self.files.valid].file_paths
-
-        if verbose:
-            files = tqdm(files, desc="Sampling values", unit=" files")
-
-        values = []
-        for file_path in files:
-            with rasterio.open(file_path) as src:
-                values.append(list(src.sample(xy)))
-
-        return np.asarray(values).squeeze()
-
     def to_netcdf(
         self,
         filename: str,
@@ -1049,14 +900,14 @@ class InterferogramDataset(RasterDataset):
         dem: Optional[Any] = None,
         mask: Optional[Any] = None,
         crs: Optional[CRS] = None,
-        res: Optional[Union[float, Tuple[float, float]]] = None,
+        res: Optional[Union[float, tuple[float, float]]] = None,
         dtype: Optional[np.dtype] = None,
         nodata: Optional[Union[float, int, Any]] = None,
         roi: Optional[BoundingBox] = None,
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
-        verbose=False,
+        verbose=True,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
         # TODO: add dem and mask support
@@ -1097,7 +948,7 @@ class InterferogramDataset(RasterDataset):
         resampling: Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
-        verbose: bool, optional
+        verbose: bool, optional, default: True
             if True, print verbose output.
         """
         root_dir = Path(root)

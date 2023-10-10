@@ -2,10 +2,11 @@ from collections.abc import Sequence
 from typing import Any, Optional, Tuple, Union
 
 import numpy as np
+from faninsar.datasets.base import InterferogramDataset
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 
-from faninsar.datasets.base import BoundingBox, InterferogramDataset
+from .query import BoundingBox
 
 
 class HyP3(InterferogramDataset):

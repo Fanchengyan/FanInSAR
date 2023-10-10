@@ -1,30 +1,26 @@
 from pathlib import Path
 
+from faninsar import samplers
+from faninsar.datasets import RasterDataset,BoundingBox,Points
 from tqdm import tqdm
 
-from faninsar.datasets import BoundingBox, RasterDataset
-from faninsar.samplers.batch import RowSampler
+home_dir = Path("/home/fancy/work/data/test")
+files = list(home_dir.rglob("*unw_phase_clip.tif"))
 
-home_dir = Path(r'E:\hyp3_result\ifgs')
-files = list(home_dir.rglob('*unw_phase_clip.tif'))
-
-ds = RasterDataset(file_paths=files[:5])
+ds = RasterDataset(file_paths=files)
+points = Points([(490357, 4283413), (491048, 4283411), (490317, 4284829)])
 
 
 def test_row_sampler():
     for n in [10, 100, 1000]:
-        sampler = RowSampler(ds, patch_num=n)
+        sampler = samplers.RowSampler(ds, patch_num=n)
         print(len(list(sampler)))
 
 
 def test_sample():
-    points = [
-        (490357, 4283413),
-        (491048, 4283411),
-        (490317, 4284829)
-    ]
     points = ds.sample(points, verbose=True)
     print(points)
+    print(ds[points])
 
 
 def test_bbox_index():
@@ -34,7 +30,7 @@ def test_bbox_index():
 
 
 def test_batch_sampler():
-    sampler = RowSampler(ds, patch_num=10)
+    sampler = samplers.RowSampler(ds, patch_num=10)
     samples = []
     for bbox in tqdm(sampler):
         samples.append(ds[bbox])

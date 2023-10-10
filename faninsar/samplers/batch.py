@@ -1,24 +1,18 @@
-import abc
 import math
 from collections.abc import Iterator
 from typing import Iterable, Optional, Union
 
-import rasterio
-# from rasterio.windows import Window, WindowMethodsMixin
-from rtree.index import Index, Property
-from tqdm import tqdm
-
-from faninsar.datasets import BoundingBox, GeoDataset, RasterDataset
+from faninsar.datasets import BoundingBox, GeoDataset
 
 
-class RowSampler(abc.ABC):
-    '''A sampler samples data from a dataset in a row-wise manner. 
+class RowSampler:
+    """A sampler samples data from a dataset in a row-wise manner.
 
     This class is used to sample data from a dataset. The dataset is
     represented by a bounding box, and the sampler is used to sample
     data in the bounding box. The result of sampling is an iterator
     that yields data from the dataset.
-    '''
+    """
 
     def __init__(
         self,
@@ -26,9 +20,9 @@ class RowSampler(abc.ABC):
         roi: Optional[Union[BoundingBox, Iterable[float]]] = None,
         patch_size: Optional[int] = None,
         patch_num: Optional[int] = None,
-        verbose: bool = False
+        verbose: bool = False,
     ) -> None:
-        '''Initialize a sampler.
+        """Initialize a sampler.
 
         Parameters
         ----------
@@ -51,28 +45,28 @@ class RowSampler(abc.ABC):
             is provided, this parameter will be ignored.
         verbose : bool, optional
             Whether to print verbose information. Default is False.
-        '''
+        """
         self.dataset = dataset
         self.verbose = verbose
 
         if roi is not None:
             self.dataset.roi = roi
 
-        profile = dataset.get_profile('roi')
-        height = profile['height']
+        profile = dataset.get_profile("roi")
+        height = profile["height"]
 
         if patch_size is not None:
             patch_size = int(patch_size)
             patch_num = math.ceil(height / patch_size)
         else:
             if patch_num is None:
-                raise ValueError(
-                    'Either patch_size or patch_num must be provided.')
+                raise ValueError("Either patch_size or patch_num must be provided.")
             if patch_num > height:
-                print(f'Warning: patch_num ({patch_num}) is larger than the height ({height })\n'
-                      'of the dataset. The patch_num will be set to the height of the dataset.\n'
-                      'If this cannot meet your requirement, please try to choose other Sampler.'
-                      )
+                print(
+                    f"Warning: patch_num ({patch_num}) is larger than the height ({height })\n"
+                    "of the dataset. The patch_num will be set to the height of the dataset.\n"
+                    "If this cannot meet your requirement, please try to choose other Sampler."
+                )
                 patch_num = height
             patch_num = int(patch_num)
             patch_size = math.floor(height / patch_num)
