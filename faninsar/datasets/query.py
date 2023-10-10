@@ -659,11 +659,11 @@ class GeoQuery:
         Parameters
         ----------
         bbox : Optional[Union[BoundingBox, list[BoundingBox]]], optional, default: None
-            The bounding box(es) of the samples. If None, the samples will be
-            extracted from the points.
+            The :class:`BoundingBox` or a list of :class:`BoundingBox`. for querying 
+            the samples.If None, the samples will be queried from the points.
         points : Optional[Union[Points, Point]], optional, default: None
-            The points of the samples. If None, the samples will be extracted
-            from the bounding boxes.
+            The :class:`Points` for querying the samples. If None, the samples
+            will be queried from the bbox.
 
         Raises
         ------

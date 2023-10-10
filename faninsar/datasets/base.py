@@ -833,7 +833,7 @@ class RasterDataset(GeoDataset):
 
     def to_netcdf(
         self,
-        filename: str,
+        filename: Union[str, Path],
         roi: Optional[BoundingBox] = None,
     ) -> None:
         """Save the dataset to a netCDF file for given region of interest.
@@ -850,10 +850,11 @@ class RasterDataset(GeoDataset):
 
         profile = self.get_profile(roi)
         lat, lon = profile.to_latlon()
+
         sample = self[roi]
 
         ds = xr.Dataset(
-            {"image": (["band", "lat", "lon"], sample["image"])},
+            {"image": (["band", "lat", "lon"], sample["bbox"])},
             coords={
                 "band": list(range(profile["count"])),
                 "lat": lat,
@@ -995,8 +996,9 @@ class InterferogramDataset(RasterDataset):
 
     def to_netcdf(
         self,
-        filename: str,
+        filename: Union[str, Path],
         roi: Optional[BoundingBox] = None,
+        ref_points: Optional[Points] = None,
     ) -> None:
         """Save the dataset to a netCDF file for given region of interest.
 
@@ -1005,7 +1007,10 @@ class InterferogramDataset(RasterDataset):
         filename : str
             path to the netCDF file to save
         roi : BoundingBox, optional
-            region of interest to save. If None, the roi of the dataset will be used.
+            region of interest to save. If None, the roi of the dataset will be
+            used.
+        ref_points : Points, optional, default: None
+            reference points to save. If None, will keep the original values.
         """
         if roi is None:
             roi = self.roi
@@ -1014,10 +1019,20 @@ class InterferogramDataset(RasterDataset):
         profile = self.get_profile(roi)
         lat, lon = profile.to_latlon()
 
+        query = GeoQuery(bbox=roi, points=ref_points)
+
+        sample_unw = self[query]
+        sample_coh = self.coh_dataset[query]
+
+        ref_values = np.nanmean(sample_unw["points"], axis=1)
+
         ds = xr.Dataset(
             {
-                "unw": (["band", "lat", "lon"], self[roi]["image"]),
-                "coh": (["band", "lat", "lon"], self.coh_dataset[roi]["image"]),
+                "unw": (
+                    ["band", "lat", "lon"],
+                    sample_unw["bbox"] - ref_values[:, None, None],
+                ),
+                "coh": (["band", "lat", "lon"], sample_coh["bbox"]),
             },
             coords={
                 "band": list(range(profile["count"])),
@@ -1026,6 +1041,6 @@ class InterferogramDataset(RasterDataset):
             },
         )
         ds = geo_tools.write_geoinfo_into_ds(
-            ds, "image", crs=self.crs, x_dim="lon", y_dim="lat"
+            ds, ["unw", "coh"], crs=self.crs, x_dim="lon", y_dim="lat"
         )
         ds.to_netcdf(filename)
