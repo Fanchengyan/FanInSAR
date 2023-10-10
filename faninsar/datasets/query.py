@@ -1,3 +1,4 @@
+import pprint
 from collections.abc import Iterator
 from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass
@@ -354,9 +355,11 @@ class Points:
 
     def __str__(self) -> str:
         return f"Points(count={len(self)})"
+        return self.__repr__()
 
     def __repr__(self) -> str:
-        return f"Points(\n{self.to_DataFrame().__repr__()}\n)"
+        data_str = _arr_to_point_str(self.values, indent=8, max_height=10, crs=self.crs)
+        return f"Points(\n{data_str}\n)"
 
     def __array__(self, dtype=None) -> np.ndarray:
         if dtype is not None:
@@ -379,9 +382,8 @@ class Points:
             return None
         return Points(values)
 
-    def _find_field(
-        self, gdf: gpd.GeoDataFrame, field_names: list[str]
-    ) -> Optional[str]:
+    @staticmethod
+    def _find_field(gdf: gpd.GeoDataFrame, field_names: list[str]) -> Optional[str]:
         """Find the field name in the GeoDataFrame.
 
         Parameters
@@ -400,8 +402,9 @@ class Points:
             if name.lower() in field_names:
                 return name
 
+    @classmethod
     def _ensure_fields(
-        self, gdf: gpd.GeoDataFrame, x_field: str, y_field: str
+        cls, gdf: gpd.GeoDataFrame, x_field: str, y_field: str
     ) -> Optional[np.ndarray]:
         """Parse the field from the GeoDataFrame.
 
@@ -418,7 +421,7 @@ class Points:
             The values of the field. If the field does not exist, return None.
         """
         if x_field == "auto":
-            x_field = self._find_field(
+            x_field = cls._find_field(
                 gdf, ["x", "xs", "lon", "longitude", "long", "longs", "longitudes"]
             )
             if x_field is None:
@@ -427,7 +430,7 @@ class Points:
                     "Please provide the field name manually."
                 )
         if y_field == "auto":
-            y_field = self._find_field(
+            y_field = cls._find_field(
                 gdf, ["y", "ys", "lat", "latitude", "lats", "latitudes"]
             )
             if y_field is None:
@@ -515,8 +518,10 @@ class Points:
         gdf : gpd.GeoDataFrame
             The GeoDataFrame to be parsed.
         x_field/y_field : str, optional, default: "auto"
-            The field name of the x/y coordinates. If ``auto``, will try to find
-            the field name automatically from following fields (case insensitive):
+            The field name of the x/y coordinates if ``geometry`` not exists.
+            If ``auto``, will try to find the field name automatically from
+            following fields (case insensitive):
+
             * ``x``: x, xs, lon, longitude, long, longs, longitudes
             * ``y``: y, ys, lat, latitude, lats, latitudes
 
@@ -525,8 +530,12 @@ class Points:
         Points
             The Points object.
         """
-        x_field, y_field = cls._ensure_fields(gdf, "auto", "auto")
-        return cls(gdf[[x_field, y_field]].values, crs=gdf.crs)
+        if "geometry" not in gdf.columns:
+            x_field, y_field = cls._ensure_fields(gdf, "auto", "auto")
+            return cls(gdf[[x_field, y_field]].values, crs=gdf.crs)
+        else:
+            points = list(zip(gdf.geometry.values.x, gdf.geometry.values.y))
+            return cls(points, crs=gdf.crs)
 
     @classmethod
     def from_shapefile(
@@ -557,9 +566,8 @@ class Points:
             The Points object.
         """
         gdf = gpd.read_file(filename, **kwargs)
-        x_field, y_field = cls._ensure_fields(gdf, "auto", "auto")
 
-        return cls(gdf[[x_field, y_field]].values, crs=gdf.crs)
+        return cls.from_GeoDataFrame(gdf, x_field, y_field)
 
     @classmethod
     def from_csv(
@@ -593,9 +601,12 @@ class Points:
             The Points object.
         """
         df = pd.read_csv(filename, **kwargs)
+        gdf = gpd.GeoDataFrame(
+            df, geometry=gpd.points_from_xy(df["x"], df["y"]), crs=crs
+        )
         x_field, y_field = cls._ensure_fields(df, x_field, y_field)
 
-        return cls(df[[x_field, y_field]].values, crs=crs)
+        return cls.from_GeoDataFrame(gdf, x_field, y_field)
 
     def to_DataFrame(self) -> pd.DataFrame:
         """Convert the Points to a DataFrame.
@@ -714,3 +725,46 @@ class GeoQuery:
     def points(self) -> Optional[Points]:
         """Return the points of the samples."""
         return self._points
+
+
+def _arr_to_point_str(
+    arr: np.ndarray, indent: int = 4, max_height: int = 10, crs: CRS = None
+) -> str:
+    if arr.shape[0] > max_height:
+        num = max_height // 2
+        char_len = len(str(eval(arr.__repr__().split("\n")[1].strip(","))[0]))
+        arr = np.vstack(
+            [
+                arr[:num],
+                np.full((1, arr.shape[1]), "..."),
+                arr[-num:],
+            ]
+        )
+        arr = np.char.ljust(arr, char_len)
+
+    string_arr_list = arr.__repr__().split("\n")
+    string_arr_list[0] = string_arr_list[0].replace("array([", "       ")
+    string_arr_list[-1] = ",".join(string_arr_list[-1].split(",")[:-1])
+
+    line_span_l = " " * (7 + char_len // 2)
+    line_span_m = " " * char_len
+    line_span_s = " " * 4
+    line_span_indent = " " * indent
+
+    # header
+    header = f"{line_span_l} 'x'{line_span_m}'y'"
+    string_arr_list.insert(0, header)
+
+    str_list = []
+    for str_line in string_arr_list:
+        str_list.append(f"{line_span_indent}{str_line[7:]}")
+    
+    str_list.insert(0,f"{line_span_s}values:")
+
+    # tail
+    str_list.append(f"{line_span_s}shape: {arr.shape}")
+    str_list.append(f"{line_span_s}CRS: {crs}")
+
+    formatted_string = "\n".join(str_list)
+
+    return formatted_string
