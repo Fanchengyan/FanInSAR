@@ -1,11 +1,6 @@
-.. Geo-SAM documentation master file, created by
-   sphinx-quickstart on Sun Aug 13 16:07:25 2023.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
-
-==================================
+====================================
 Welcome to FanInSAR's documentation!
-==================================
+====================================
 
 
 Introduction
@@ -15,10 +10,10 @@ Introduction
    :maxdepth: 2
    :caption: Contents:
 
-   Installation
-   Usage/index
-   future
-   Citation
-   Acknowledgement
+   intro
+   User Guide <user_guide/index>
+   FanInSAR API Reference <api/index>
+   terminology
+
 
 

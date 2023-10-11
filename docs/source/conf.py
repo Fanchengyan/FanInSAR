@@ -17,7 +17,6 @@ release = 'v1.0'
 extensions = [
     'myst_parser',
     'sphinx.ext.autodoc',
-    'sphinxcontrib.video',
     'sphinx.ext.doctest',
     'sphinx.ext.intersphinx',
     'sphinx.ext.napoleon',
@@ -37,5 +36,10 @@ exclude_patterns = []
 
 html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
+
+# General information about the project.
+project = u'faninsar'
+copyright = u'2023, Fancy'
+author = u'Chengyan Fan'
 
 video_enforce_extra_source = True

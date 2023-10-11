@@ -10,7 +10,7 @@ examples that describe many common tasks that you can accomplish with FanSAR.
    :maxdepth: 2
    :hidden:
 
-   terminology
-   data-structures
-   indexing
+
+   data_structures
+   Indexing_data
   
