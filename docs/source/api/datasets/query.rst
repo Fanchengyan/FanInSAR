@@ -3,9 +3,10 @@ geospatial Queries
 
 Geospatial Query in FanInSAR is used to sample values from GeoDataset. Query includes:
 
-* **Rectangular/BoundingBox query**: :class:`faninsar.datasets.query.BoundingBox`  
-* **Point query**: :class:`faninsar.datasets.query.Point`, :class:`faninsar.datasets.query.Points` 
-* **a combination of BoundingBox and Point**: :class:`faninsar.datasets.query.GeoQuery`.
+* :class:`.BoundingBox` : a bounding box, can be used to sample rectangular region values from GeoDataset.
+* :class:`.Point` : a single point. can be used to sample a single pixel value from GeoDataset.
+* :class:`.Points` : a collection of points, can be used to sample multiple pixel values from GeoDataset.
+* :class:`.GeoQuery` : **a combination** of :class:`.BoundingBox` and :class:`.Points`, highly recommended if you want to sample multiple rectangular region and pixel values from GeoDataset simultaneously.
 
 
 Bounding Box query

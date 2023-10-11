@@ -5,10 +5,13 @@ Geospatial Datasets are used to process large amounts of geospatial data files t
 
 The following datasets are available:
 
-* :class:`.GeoDataset`
-* :class:`.RasterDataset`
-* :class:`.InterferogramDataset`
-* :class:`.HyP3`
+* basic geospatial Datasets:
+   * :class:`.GeoDataset`
+   * :class:`.RasterDataset`
+* InSAR Datasets:
+   * :class:`.InterferogramDataset` : base Datasets for all Interferogram productions
+   * InSAR Datasets from well known productions:
+      * :class:`.HyP3`
 
 
 GeoDataset
