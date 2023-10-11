@@ -973,7 +973,14 @@ class InterferogramDataset(RasterDataset):
             resampling=resampling,
             verbose=verbose,
         )
-        self._parse_pairs_from_filenames()
+
+        try:
+            self.pairs_parser()
+        except:
+            warnings.warn(
+                "Unable to parse pairs from filenames. "
+                "Please rewrite the pairs_parser method."
+            )
 
         self.coh_dataset = RasterDataset(
             root=root,
@@ -991,36 +998,35 @@ class InterferogramDataset(RasterDataset):
 
     def pairs_parser(self):
         """Used to parse pairs from filenames. Must be implemented in subclass.
-        
+
         .. Note::
-                
-            This method must set the ``_pairs`` attribute of the dataset. The 
+
+            This method must set the ``_pairs`` attribute of the dataset. The
             file paths of the dataset are available in the ``files`` attribute.
-            
+
         Example
         -------
         for the HyP3 dataset, pairs are parsed from the filenames as follows:
-        
+
         >>> names = [f.name for f in self.files.file_paths[self.files.valid]]
-        
+
         `self.files.file_paths[self.files.valid]]` is used to get the valid files.
         `f.name` is used to get the file name of each path.
-        
+
         >>> pair_names = ['_'.join(i.split("_")[1:3]) for i in names]
-        
+
         for the HyP3 dataset, the pair names are the second and third parts of the
-        filename, separated by an underscore. After parsing the pair names, 
+        filename, separated by an underscore. After parsing the pair names,
         the Pairs object can be created by using the ``from_names`` method.
-        
+
         >>> self._pairs = Pairs.from_names(pair_names)
-        
+
         Raises
         ------
         NotImplementedError: if not implemented in subclass or directly using
             InterferogramDataset.
         """
         raise NotImplementedError("pairs_parser must be implemented in subclass")
-
 
     @property
     def pairs(self) -> Pairs:
@@ -1065,11 +1071,11 @@ class InterferogramDataset(RasterDataset):
 
         ds = xr.Dataset(
             {
-                "unw": (["band", "lat", "lon"], unw),
-                "coh": (["band", "lat", "lon"], sample_coh["bbox"][0]),
+                "unw": (["pair", "lat", "lon"], unw),
+                "coh": (["pair", "lat", "lon"], sample_coh["bbox"][0]),
             },
             coords={
-                "band": self.pairs.to_names(),
+                "pair": self.pairs.to_names(),
                 "lat": lat,
                 "lon": lon,
             },
