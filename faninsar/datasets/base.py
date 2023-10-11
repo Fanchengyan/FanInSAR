@@ -118,14 +118,14 @@ class GeoDataset(abc.ABC):
 
     @crs.setter
     def crs(self, new_crs: Union[CRS, str]) -> None:
-        """Change the :term:`coordinate reference system (CRS)` of a GeoDataset.
+        """Change the coordinate reference system :term:`(CRS)` of a GeoDataset.
 
         If ``new_crs == self.crs``, does nothing, otherwise updates the R-tree index.
 
         Parameters
         ----------
         new_crs: CRS or str
-            New :term:`coordinate reference system (CRS)`. It can be a CRS object
+            New coordinate reference system :term:`(CRS)`. It can be a CRS object
             or a string, which will be parsed to a CRS object. The string can be
             in any format supported by `rasterio.crs.CRS.from_user_input()
             <https://rasterio.readthedocs.io/en/stable/api/rasterio.crs.html#rasterio.crs.CRS.from_user_input>`_.
@@ -928,7 +928,7 @@ class InterferogramDataset(RasterDataset):
         mask: Any, optional
             Mask data. If None, no mask data will be used.
         crs: CRS, optional
-            the output term:`coordinate reference system (CRS)` of the dataset.
+            the output coordinate reference system term:`(CRS)` of the dataset.
             If None, the CRS of the first file found will be used.
         res: float, optional
             resolution of the output dataset in units of CRS. If None, the resolution
