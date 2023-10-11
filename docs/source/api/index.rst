@@ -1,6 +1,11 @@
 Python API Reference
 ====================
 
+
 .. toctree::
 
-   faninsar
+   datasets/index
+   samplers/index
+   NSBAS/index
+   
+

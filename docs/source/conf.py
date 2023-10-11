@@ -43,3 +43,11 @@ copyright = u'2023, Fancy'
 author = u'Chengyan Fan'
 
 video_enforce_extra_source = True
+
+autodoc_default_options = {
+    'members': True,
+    'undoc-members': True,
+    'member-order': 'bysource',
+    'special-members': '__init__',
+    ':show-inheritance:': True,
+}

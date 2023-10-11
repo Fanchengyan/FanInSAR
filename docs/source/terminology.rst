@@ -22,3 +22,6 @@ Terminology
 
     SBASNetwork
         A collection of loops and pairs.
+
+    CRS
+        A coordinate reference system (CRS) is a coordinate-based local, regional or global system used to locate geographical entities. In FanInSAR, the CRS is handled by the ``rasterio`` package.

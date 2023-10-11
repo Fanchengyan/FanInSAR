@@ -109,10 +109,10 @@ class GeoDataset(abc.ABC):
 
     @property
     def crs(self) -> Optional[CRS]:
-        """:term:`coordinate reference system (CRS)` of the dataset.
+        """coordinate reference system (:term:`CRS`) of the dataset.
 
         Returns:
-            The :term:`coordinate reference system (CRS)`.
+            The coordinate reference system (:term:`CRS`).
         """
         return self._crs
 

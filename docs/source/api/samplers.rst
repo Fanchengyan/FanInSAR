@@ -1,7 +1,4 @@
-faninsar.samplers module
-========================
+faninsar.samplers
+=================
 
 .. automodule:: faninsar.samplers
-    :members:
-    :undoc-members:
-    :show-inheritance:
