@@ -16,11 +16,9 @@ import pandas as pd
 import pyproj
 import rasterio
 import rasterio.merge
+import rioxarray
 import shapely
 import xarray as xr
-from faninsar._core import geo_tools
-from faninsar._core.geo_tools import Profile
-from faninsar.datasets.query import BoundingBox, GeoQuery, Points
 from rasterio.coords import BoundingBox as BBox
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
@@ -32,6 +30,10 @@ from rasterio.warp import transform as warp_transform
 from rtree.index import Index, Property
 from shapely import ops
 from tqdm import tqdm
+
+from faninsar._core import geo_tools
+from faninsar._core.geo_tools import Profile
+from faninsar.datasets.query import BoundingBox, GeoQuery, Points
 
 __all__ = ("GeoDataset", "RasterDataset")
 
@@ -1015,7 +1017,7 @@ class InterferogramDataset(RasterDataset):
         if roi is None:
             roi = self.roi
 
-        # TODO: add dem and mask
+        # TODO: 1. add dem and mask 2. using netcdf4 to save the data to avoid the memory issue
         profile = self.get_profile(roi)
         lat, lon = profile.to_latlon()
 
@@ -1024,15 +1026,16 @@ class InterferogramDataset(RasterDataset):
         sample_unw = self[query]
         sample_coh = self.coh_dataset[query]
 
-        ref_values = np.nanmean(sample_unw["points"], axis=1)
+        if ref_points is None:
+            unw = sample_unw["bbox"][0]
+        else:
+            ref_mean = np.nanmean(sample_unw["points"], axis=1)
+            unw = sample_unw["bbox"][0] - ref_mean[:, None, None]
 
         ds = xr.Dataset(
             {
-                "unw": (
-                    ["band", "lat", "lon"],
-                    sample_unw["bbox"] - ref_values[:, None, None],
-                ),
-                "coh": (["band", "lat", "lon"], sample_coh["bbox"]),
+                "unw": (["band", "lat", "lon"], unw),
+                "coh": (["band", "lat", "lon"], sample_coh["bbox"][0]),
             },
             coords={
                 "band": list(range(profile["count"])),
@@ -1040,6 +1043,7 @@ class InterferogramDataset(RasterDataset):
                 "lon": lon,
             },
         )
+
         ds = geo_tools.write_geoinfo_into_ds(
             ds, ["unw", "coh"], crs=self.crs, x_dim="lon", y_dim="lat"
         )

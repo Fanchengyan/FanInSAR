@@ -501,7 +501,7 @@ class Points:
         if self.crs == crs:
             return self
         else:
-            values = np.array(zip(warp_transform(self.crs, crs, self.x, self.y)))
+            values = np.array(list(zip(*warp_transform(self.crs, crs, self.x, self.y))))
             return Points(values, crs=crs)
 
     @classmethod
@@ -758,8 +758,8 @@ def _arr_to_point_str(
     str_list = []
     for str_line in string_arr_list:
         str_list.append(f"{line_span_indent}{str_line[7:]}")
-    
-    str_list.insert(0,f"{line_span_s}values:")
+
+    str_list.insert(0, f"{line_span_s}values:")
 
     # tail
     str_list.append(f"{line_span_s}shape: {arr.shape}")
