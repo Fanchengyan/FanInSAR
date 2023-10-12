@@ -33,6 +33,7 @@ from tqdm import tqdm
 
 from faninsar._core import geo_tools
 from faninsar._core.geo_tools import Profile
+from faninsar._core.pair_tools import Pairs
 from faninsar.datasets.query import BoundingBox, GeoQuery, Points
 
 __all__ = ("GeoDataset", "RasterDataset")
@@ -884,16 +885,7 @@ class InterferogramDataset(RasterDataset):
     #: This expression is used to find the coherence files.
     filename_glob_coh = "*"
 
-    #: Date format string used to parse date from filename.
-    #:
-    #: Not used if :attr:`filename_regex` does not contain a ``date`` group.
-    date_format = "%Y%m%d"
-
-    #: True if dataset contains imagery, False if dataset contains mask
-    is_image = True
-
-    #: Color map for the dataset, used for plotting
-    cmap: dict[int, tuple[int, int, int, int]] = {}
+    _pairs: Optional[Pairs] = None
 
     def __init__(
         self,
@@ -982,6 +974,14 @@ class InterferogramDataset(RasterDataset):
             verbose=verbose,
         )
 
+        try:
+            self.pairs_parser()
+        except:
+            warnings.warn(
+                "Unable to parse pairs from filenames. "
+                "Please rewrite the pairs_parser method."
+            )
+
         self.coh_dataset = RasterDataset(
             root=root,
             file_paths=file_paths_coh,
@@ -995,6 +995,43 @@ class InterferogramDataset(RasterDataset):
             resampling=resampling,
             verbose=verbose,
         )
+
+    def pairs_parser(self):
+        """Used to parse pairs from filenames. Must be implemented in subclass.
+
+        .. Note::
+
+            This method must set the ``_pairs`` attribute of the dataset. The
+            file paths of the dataset are available in the ``files`` attribute.
+
+        Example
+        -------
+        for the HyP3 dataset, pairs are parsed from the filenames as follows:
+
+        >>> names = [f.name for f in self.files.file_paths[self.files.valid]]
+
+        `self.files.file_paths[self.files.valid]]` is used to get the valid files.
+        `f.name` is used to get the file name of each path.
+
+        >>> pair_names = ['_'.join(i.split("_")[1:3]) for i in names]
+
+        for the HyP3 dataset, the pair names are the second and third parts of the
+        filename, separated by an underscore. After parsing the pair names,
+        the Pairs object can be created by using the ``from_names`` method.
+
+        >>> self._pairs = Pairs.from_names(pair_names)
+
+        Raises
+        ------
+        NotImplementedError: if not implemented in subclass or directly using
+            InterferogramDataset.
+        """
+        raise NotImplementedError("pairs_parser must be implemented in subclass")
+
+    @property
+    def pairs(self) -> Pairs:
+        """Return Pairs parsed from filenames."""
+        return self._pairs
 
     def to_netcdf(
         self,
@@ -1034,11 +1071,11 @@ class InterferogramDataset(RasterDataset):
 
         ds = xr.Dataset(
             {
-                "unw": (["band", "lat", "lon"], unw),
-                "coh": (["band", "lat", "lon"], sample_coh["bbox"][0]),
+                "unw": (["pair", "lat", "lon"], unw),
+                "coh": (["pair", "lat", "lon"], sample_coh["bbox"][0]),
             },
             coords={
-                "band": list(range(profile["count"])),
+                "pair": self.pairs.to_names(),
                 "lat": lat,
                 "lon": lon,
             },

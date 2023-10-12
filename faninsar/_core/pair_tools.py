@@ -180,7 +180,7 @@ class Pairs:
         self,
         pairs: Union[Iterable[Iterable[datetime, datetime]],
                      Iterable[Pair]],
-        sort: bool = True
+        sort: bool = True,
     ) -> None:
         '''initialize the pairs class
 
@@ -207,13 +207,14 @@ class Pairs:
                     f"pairs should be an Iterable containing Iterable or Pair object, but got {type(pair)}.")
             pairs_ls.append(_pair.values)
 
-        _values, _index = np.unique(pairs_ls, axis=0, return_index=True)
-        if not sort:
-            _values = _values[_index]
+        _values = np.array(pairs_ls)
 
         self._values = _values
         self._dates = np.unique(pairs_ls)
         self._length = self._values.shape[0]
+        
+        if sort:
+            self.sort()
 
     def __len__(self) -> int:
         return self._length
@@ -403,6 +404,7 @@ class Pairs:
         else:
             return None
 
+    # TODO: 1. not duplicated pairs 2. add duplicate function
     def sort(
         self,
         order: Union[str, list] = 'pairs',

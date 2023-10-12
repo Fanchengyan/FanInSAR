@@ -2,9 +2,11 @@ from collections.abc import Sequence
 from typing import Any, Optional, Tuple, Union
 
 import numpy as np
-from faninsar.datasets.base import InterferogramDataset
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
+
+from faninsar._core.pair_tools import Pairs
+from faninsar.datasets.base import InterferogramDataset
 
 from .query import BoundingBox
 
@@ -95,3 +97,12 @@ class HyP3(InterferogramDataset):
             resampling=resampling,
             verbose=verbose,
         )
+
+    def pairs_parser(self):
+        """Parse the primary and secondary date/acquisition of the interferogram
+        to generate Pairs object.
+        """
+        names = [f.name for f in self.files.file_paths[self.files.valid]]
+        pair_names = ['_'.join(i.split("_")[1:3]) for i in names]
+        self._pairs = Pairs.from_names(pair_names)
+        
