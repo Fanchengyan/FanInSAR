@@ -687,8 +687,8 @@ class RasterDataset(GeoDataset):
                     data = vrt_fh.read(
                         out_shape=(
                             1,
-                            int((bbox.top - bbox.bottom) / self.res[1]),
-                            int((bbox.right - bbox.left) / self.res[0]),
+                            round((bbox.top - bbox.bottom) / self.res[1]),
+                            round((bbox.right - bbox.left) / self.res[0]),
                         ),
                         resampling=self.resampling,
                         indexes=self.band_indexes,
