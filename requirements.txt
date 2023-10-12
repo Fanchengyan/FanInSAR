@@ -6,5 +6,7 @@ data_downloader
 rasterio
 xarray
 rioxarray
+netcdf4
+h5netcdf
 tqdm
 rtree
