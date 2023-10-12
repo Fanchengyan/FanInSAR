@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Optional, Tuple, Union
 
 import numpy as np
@@ -98,11 +99,11 @@ class HyP3(InterferogramDataset):
             verbose=verbose,
         )
 
-    def pairs_parser(self):
+    def pairs_parser(self, file_paths: list[Path]) -> Pairs:
         """Parse the primary and secondary date/acquisition of the interferogram
         to generate Pairs object.
         """
-        names = [f.name for f in self.files.file_paths[self.files.valid]]
-        pair_names = ['_'.join(i.split("_")[1:3]) for i in names]
-        self._pairs = Pairs.from_names(pair_names)
-        
+        names = [f.name for f in file_paths]
+        pair_names = ["_".join(i.split("_")[1:3]) for i in names]
+        pairs = Pairs.from_names(pair_names)
+        return pairs
