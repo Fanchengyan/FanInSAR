@@ -1,16 +1,16 @@
-
 from typing import Iterable, Optional, Tuple, Union
 
 import numpy as np
 import psutil
-from tqdm import tqdm
-
-from faninsar.NSBAS.tsmodels import TimeSeriesModels
+import torch
+from faninsar._core.device import parse_device
 from faninsar._core.pair_tools import Pairs
+from faninsar.NSBAS.tsmodels import TimeSeriesModels
+from tqdm import tqdm
 
 
 class NSBASMatrixFactory:
-    '''Factory class for NSBAS matrix. The NSBAS matrix is usually expressed as:
+    """Factory class for NSBAS matrix. The NSBAS matrix is usually expressed as:
     ``d = Gm``, where ``d`` is the unwrapped interferograms matrix, ``G`` is the
     NSBAS matrix, and ``m`` is the model parameters, which is the combination of
     the deformation increment and the model parameters. see paper: TODO for more
@@ -18,7 +18,7 @@ class NSBASMatrixFactory:
 
     .. note::
 
-        After initialization, the ``model`` and ``gamma`` can still be updated 
+        After initialization, the ``model`` and ``gamma`` can still be updated
         by setting the corresponding attributes. The ``G`` and ``d`` will be
         updated automatically.
 
@@ -50,23 +50,24 @@ class NSBASMatrixFactory:
           G shape: (16, 9)
           d shape: (16, 5)
         )
-    '''
+    """
+
     _pairs: Pairs
     _model: TimeSeriesModels
     _gamma: float
     _G: np.ndarray
     _d: np.ndarray
 
-    slots = ['_pairs', '_model', '_gamma', '_G', '_d']
+    slots = ["_pairs", "_model", "_gamma", "_G", "_d"]
 
     def __init__(
         self,
         unw: np.ndarray,
         pairs: Union[Pairs, Iterable[str]],
         model: TimeSeriesModels,
-        gamma: float = 0.0001
+        gamma: float = 0.0001,
     ):
-        '''Initialize NSBASMatrixFactory
+        """Initialize NSBASMatrixFactory
 
         Parameters
         ----------
@@ -78,13 +79,13 @@ class NSBASMatrixFactory:
             Time series model
         gamma : float, optional
             weight for the model component, by default 0.0001
-        '''
+        """
         if isinstance(pairs, Pairs):
             self._pairs = pairs
         elif isinstance(pairs, Iterable):
             self._pairs = Pairs.from_names(pairs)
         else:
-            raise TypeError('pairs must be either Pairs or Iterable')
+            raise TypeError("pairs must be either Pairs or Iterable")
 
         self._model = None
         self._gamma = None
@@ -98,31 +99,31 @@ class NSBASMatrixFactory:
 
     def __repr__(self):
         _str = (
-            f'{self.__class__.__name__}(\n'
-            f'  pairs: {self.pairs}\n'
-            f'  model: {str(self.model)}\n'
-            f'  gamma: {self.gamma}\n'
-            f'  G shape: {self.G.shape}\n'
-            f'  d shape: {self.d.shape}\n'
-            ')'
+            f"{self.__class__.__name__}(\n"
+            f"  pairs: {self.pairs}\n"
+            f"  model: {str(self.model)}\n"
+            f"  gamma: {self.gamma}\n"
+            f"  G shape: {self.G.shape}\n"
+            f"  d shape: {self.d.shape}\n"
+            ")"
         )
         return _str
 
     @property
     def pairs(self):
-        '''Return pairs'''
+        """Return pairs"""
         return self._pairs
 
     @property
     def model(self):
-        '''Return model'''
+        """Return model"""
         return self._model
 
     @model.setter
     def model(self, model):
-        '''Update model and G by input model'''
+        """Update model and G by input model"""
         if not isinstance(model, TimeSeriesModels):
-            raise TypeError('model must be a TimeSeriesModels instance')
+            raise TypeError("model must be a TimeSeriesModels instance")
         if self._model == model:
             return
 
@@ -131,18 +132,18 @@ class NSBASMatrixFactory:
 
     @property
     def gamma(self):
-        '''Return gamma'''
+        """Return gamma"""
         return self._gamma
 
     @gamma.setter
     def gamma(self, gamma):
-        '''Update gamma and G by input gamma'''
+        """Update gamma and G by input gamma"""
         if not isinstance(gamma, (float, int)):
-            raise TypeError('gamma must be either float or int')
-        if hasattr(self, '_gamma') and gamma == self._gamma:
+            raise TypeError("gamma must be either float or int")
+        if hasattr(self, "_gamma") and gamma == self._gamma:
             return
         if gamma <= 0:
-            raise ValueError('gamma must be positive')
+            raise ValueError("gamma must be positive")
 
         self._gamma = gamma
         if self._model is not None:
@@ -150,35 +151,35 @@ class NSBASMatrixFactory:
 
     @property
     def d(self):
-        '''Return d for NSBAS: d = Gm'''
+        """Return d for NSBAS: d = Gm"""
         return self._d
 
     @d.setter
     def d(self, unw):
-        '''Update d: restructure unw by appending model matrix part'''
+        """Update d: restructure unw by appending model matrix part"""
         if not isinstance(unw, np.ndarray):
-            raise TypeError('d must be a numpy array')
+            raise TypeError("d must be a numpy array")
         if len(unw.shape) != 2:
-            raise ValueError('d must be a 2D array')
+            raise ValueError("d must be a 2D array")
         if unw.shape[0] != len(self.pairs):
-            raise ValueError(
-                'input unw must have the same rows number as pairs number')
+            raise ValueError("input unw must have the same rows number as pairs number")
 
         self._d = self._restructure_unw(unw)
 
     @property
     def G(self):
-        '''Return G for NSBAS: d = Gm'''
+        """Return G for NSBAS: d = Gm"""
         return self._G
 
     @G.setter
     def G(self, G):
-        '''Update G by input G'''
+        """Update G by input G"""
         if not isinstance(G, np.ndarray):
-            raise TypeError('G must be a numpy array')
+            raise TypeError("G must be a numpy array")
         if G.shape[0] != (len(self.pairs) + len(self.pairs.dates)):
             raise ValueError(
-                'G must have the same number of rows as (pairs number + dates number)')
+                "G must have the same number of rows as (pairs number + dates number)"
+            )
 
         self._G = G
 
@@ -191,9 +192,8 @@ class NSBASMatrixFactory:
         n_param = G_br.shape[1]
 
         n_date = len(self.pairs.dates)
-        G_bl = np.tril(np.ones((n_date, n_date-1),
-                               dtype=np.float32), k=-1)
-        G_b = np.hstack((G_bl, G_br))*gamma
+        G_bl = np.tril(np.ones((n_date, n_date - 1), dtype=np.float32), k=-1)
+        G_b = np.hstack((G_bl, G_br)) * gamma
         G_t = np.hstack((G_tl, np.zeros((len(self._pairs), n_param))))
         G = np.vstack((G_t, G_b))
 
@@ -205,7 +205,7 @@ class NSBASMatrixFactory:
 
 
 class NSBASInversion:
-    '''NSBAS inversion class. The NSBAS inversion is usually expressed as: 
+    """NSBAS inversion class. The NSBAS inversion is usually expressed as:
     ``d = Gm``, where ``d`` is the unwrapped interferograms matrix, ``G`` is the
     NSBAS matrix, and ``m`` is the model parameters, which is the combination of
     the deformation increment and the model parameters. see paper: TODO for more
@@ -214,24 +214,25 @@ class NSBASInversion:
     Examples
     --------
 
-    '''
+    """
 
     def __init__(
-            self,
-            matrix_factory: NSBASMatrixFactory,
-            gpu_id: Optional[int] = None
+        self,
+        matrix_factory: NSBASMatrixFactory,
+        device: Optional[Union[str, torch.device]] = None,
     ):
-        '''Initialize NSBASInversion
+        """Initialize NSBASInversion
 
         Parameters
         ----------
         matrix_factory : NSBASMatrixFactory
             NSBASMatrixFactory instance
-        gpu_id : int or None, optional
-            GPU ID, if None, use CPU, by default None
-        '''
+        device : Optional[Union[str, torch.device]], optional
+            device of torch.tensor used for computation. If None, use GPU if
+            available, otherwise use CPU.
+        """
         self.matrix_factory = matrix_factory
-        self.gpu_id = gpu_id
+        self.device = parse_device(device)
 
         self.G = matrix_factory.G
         self.d = matrix_factory.d
@@ -242,7 +243,7 @@ class NSBASInversion:
         return f"{self.__class__.__name__}()"
 
     def inverse(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        '''Calculate increment displacement difference by NSBAS inversion.
+        """Calculate increment displacement difference by NSBAS inversion.
 
         Returns
         -------
@@ -254,55 +255,50 @@ class NSBASInversion:
             residual between interferograms and model result
         residual_tsm: np.ndarray (n_date, n_pt)
             residual between time-series model and model result
-        '''
+        """
         result = batch_lstsq(
-            self.G,
-            self.d,
-            self.gpu_id,
-            desc='  NSBAS inversion'
+            self.G, self.d, device=self.device, desc="  NSBAS inversion"
         )
-
         residual = np.dot(self.G, result) - self.d
 
-        incs = result[:-self.n_param, :]
-        params = result[-self.n_param:, :]
+        incs = result[: -self.n_param, :]
+        params = result[-self.n_param :, :]
 
-        residual_pair = residual[:self.n_pair]
-        residual_tsm = residual[self.n_pair:]
+        residual_pair = residual[: self.n_pair]
+        residual_tsm = residual[self.n_pair :]
 
         return incs, params, residual_pair, residual_tsm
 
 
 class PhaseDeformationConverter:
-    '''A class to convert between phase and deformation(mm) for SAR interferometry.'''
+    """A class to convert between phase and deformation(mm) for SAR interferometry."""
 
     def __init__(self, frequency: float = None, wavelength: float = None) -> None:
-        '''Initialize the converter. Either wavelength or frequency should be provided. 
+        """Initialize the converter. Either wavelength or frequency should be provided.
         If both are provided, wavelength will be recalculated by frequency.
 
         Parameters
         ----------
         frequency : float
-            The frequency of the radar signal. Unit: GHz. 
+            The frequency of the radar signal. Unit: GHz.
         wavelength : float
             The wavelength of the radar signal. Unit: meter.
             this parameter will be ignored if frequency is provided.
-        '''
+        """
         speed_of_light = 299792458
 
         if frequency is not None:
             frequency = frequency * 1e9  # GHz to Hz
-            self.wavelength = speed_of_light/frequency  # meter
+            self.wavelength = speed_of_light / frequency  # meter
             self.frequency = frequency
         elif wavelength is not None:
             self.wavelength = wavelength
-            self.frequency = speed_of_light/wavelength
+            self.frequency = speed_of_light / wavelength
         else:
-            raise ValueError(
-                "Either wavelength or frequency should be provided.")
+            raise ValueError("Either wavelength or frequency should be provided.")
 
         # convert radian to mm
-        self.coef_rd2mm = - self.wavelength/4/np.pi*1000
+        self.coef_rd2mm = -self.wavelength / 4 / np.pi * 1000
 
     def __str__(self) -> str:
         return f"PhaseDeformationConverter(wavelength={self.wavelength})"
@@ -311,26 +307,39 @@ class PhaseDeformationConverter:
         return str(self)
 
     def phase2deformation(self, phase: np.ndarray):
-        '''Convert phase to deformation(mm)'''
+        """Convert phase to deformation(mm)"""
         return phase * self.coef_rd2mm
 
     def deformation2phase(self, deformation: np.ndarray):
-        '''Convert deformation(mm) to phase (radian)'''
+        """Convert deformation(mm) to phase (radian)"""
         return deformation / self.coef_rd2mm
 
     def wrap_phase(self, phase: np.ndarray):
-        '''Wrap phase to [0, 2*pi]'''
-        return np.mod(phase, 2*np.pi)
+        """Wrap phase to [0, 2*pi]"""
+        return np.mod(phase, 2 * np.pi)
 
 
-def device_mem_size(gpu_id):
-    if gpu_id is not None:
-        import cupy as cp
-        mem_gpu_free = cp.cuda.Device(gpu_id).mem_info[0]
-        mem_size = int(mem_gpu_free/1024**2)
+def device_mem_size(device: Optional[Union[str, torch.device]]) -> int:
+    """Get memory size (in MB) for GPU or CPU.
+
+    Parameters
+    ----------
+    device : Optional[Union[str, torch.device]]
+        device of torch.tensor used for computation.
+
+    Returns
+    -------
+    mem_size : int
+        memory size (in MB) for GPU or CPU.
+    """
+    device_type = parse_device(device).type
+    if device_type == "cuda":
+        free_memory, _ = torch.cuda.mem_get_info()
+        mem_size = int(free_memory / 1024**2)
     else:
+        # macos share memory with CPU
         mem_free = psutil.virtual_memory().available
-        mem_size = int(mem_free/1024**2)
+        mem_size = int(mem_free / 1024**2)
 
     return mem_size
 
@@ -341,7 +350,7 @@ def _get_patch_col(G, d, mem_size, dtype, safe_factor=2):
 
     Parameters:
     -----------
-    dtype: numpy.dtype
+    dtype: numpy.dtype or torch.dtype
         dtype of ndarray
 
     Returns:
@@ -352,9 +361,8 @@ def _get_patch_col(G, d, mem_size, dtype, safe_factor=2):
     r = G.shape[-1]
 
     # rough value of n_patch
-    n_patch = int(np.ceil(
-        m * n * r**2 * dtype.itemsize * safe_factor
-        / 2 ** 20 / mem_size)
+    n_patch = int(
+        np.ceil(m * n * r**2 * dtype.itemsize * safe_factor / 2**20 / mem_size)
     )
 
     # accurate value of n_patch
@@ -370,105 +378,140 @@ def _get_patch_col(G, d, mem_size, dtype, safe_factor=2):
     return patchcol
 
 
-def batch_lstsq(G, d, gpu_id=None, desc='', unit='patch'):
-    '''This function calculates the least-squares solution for a batch of linear equations 
-    using the given G matrix and the data in  d , using (optionally) the GPU with 
-     gpu_id . 
+def batch_lstsq(
+    G: Union[np.ndarray, torch.Tensor],
+    d: Union[np.ndarray, torch.Tensor],
+    dtype: torch.dtype = torch.float64,
+    device: Optional[Union[str, torch.device]] = None,
+    verbose=True,
+    **tqdm_args,
+):
+    """This function calculates the least-squares solution for a batch of linear equations
+    using the given G matrix and the data in  d , using (optionally) the GPU with
+     device .
 
-    Parameters 
-    ---------- 
-    G : array-like (n_im, n_param) or (n_pt, n_im, n_param)
-        A 2D/3D array containing the linear equations 
-    d : 2D array (n_im, n_pt)
-        2D array containing the data associated with the equations in G 
-    gpu_id : int, optional 
-        An integer specifying the ID of the GPU to use for accelerated computation 
-    desc : string, optional 
-        A brief description of the task for the progress bar. If None, no progress bar
-
-    Returns 
-    ------- 
-    result : 2D array (n_param, n_pt)
-        A 2D array containing the least-squares solutions to the equations 
-        specified in G 
-    '''
-    n_pt = d.shape[1]
-    n_param = G.shape[1] if G.ndim == 2 else G.shape[2]
-
-    result = np.full((n_param, n_pt), np.nan, dtype=np.float32)
-
-    mem_size = device_mem_size(gpu_id)
-
-    patchcol = _get_patch_col(
-        G, d, mem_size, np.dtype(np.float64))
-
-    if desc:
-        patchcol = tqdm(patchcol, desc=desc, unit=unit)
-    for col in patchcol:
-        if G.ndim == 2:
-            result[:, col[0]:col[1]] = censored_lstsq(
-                G, d[:, col[0]:col[1]], gpu_id)
-        elif G.ndim == 3:
-            result[:, col[0]:col[1]] = censored_lstsq(
-                G[col[0]:col[1], :, :], d[:, col[0]:col[1]], gpu_id)
-        else:
-            raise ValueError('Dimension of G must be 2 or 3')
-    return result
-
-
-def censored_lstsq(G, d, gpu_id=None):
-    """Solves least squares problem subject to missing data.
-    Reference: http://alexhwilliams.info/itsneuronalblog/2018/02/26/censored-lstsq/
-
-    Note: uses a broadcasted solve for speed.
-
-    Args
-    ----
-    G (ndarray) : m x r or n x m x r matrix
-        model field
-    d (ndarray) : m x n matrix
-        data field
+    Parameters
+    ----------
+    G : Union[np.ndarray, torch.Tensor], (n_im, n_param) or (n_pt, n_im, n_param)
+        model field matrix. If G is 3D, the first dimension is the G matrix for
+        each pixel.
+    d : Union[np.ndarray, torch.Tensor], (n_im, n_pt) matrix
+        data field matrix.
+    dtype : torch.dtype, optional
+        dtype of torch.tensor used for computation
+    device : Optional[Union[str, torch.device]], optional
+        device of torch.tensor used for computation. If None, use GPU if
+            available, otherwise use CPU.
+    verbose : bool, optional
+        If True, show progress bar, by default True
+    tqdm_args : dict, optional
+        Arguments to be passed to `tqdm.tqdm <https://tqdm.github.io/docs/tqdm/#tqdm-objects>`_
+        Object for progress bar.
 
     Returns
     -------
-    X (ndarray) : r x n matrix that minimizes norm(M*(GX - d))
+    X : torch.Tensor, (r x n) matrix
+        r x n matrix that minimizes norm(M*(GX - d))
     """
-    if gpu_id is not None:
-        import cupy as xp
-        xp.cuda.Device(gpu_id).use()
-        G = xp.asarray(G)
-        d = xp.asarray(d)
-    else:
-        xp = np
+    tqdm_args.setdefault("desc", "Batch least-squares")
+    tqdm_args.setdefault("unit", "Batch")
+    n_pt = d.shape[1]
+    n_param = G.shape[1] if G.ndim == 2 else G.shape[2]
+    device = parse_device(device)
 
-    G = G.astype('f8')
-    d = d.astype('f8')
+    result = torch.full((n_param, n_pt), torch.nan, dtype=dtype)
+    mem_size = device_mem_size(device)
+    patchcol = _get_patch_col(G, d, mem_size, dtype)
+
+    if verbose:
+        patchcol = tqdm(patchcol, **tqdm_args)
+    for col in patchcol:
+        if G.ndim == 2:
+            result[:, col[0] : col[1]] = censored_lstsq(
+                G, d[:, col[0] : col[1]], dtype, device
+            )
+        elif G.ndim == 3:
+            result[:, col[0] : col[1]] = censored_lstsq(
+                G[col[0] : col[1], :, :], d[:, col[0] : col[1]], dtype, device
+            )
+        else:
+            raise ValueError("Dimension of G must be 2 or 3")
+    return result
+
+
+def censored_lstsq(
+    G: Union[np.ndarray, torch.Tensor],
+    d: Union[np.ndarray, torch.Tensor],
+    dtype: torch.dtype = torch.float64,
+    device: Optional[Union[str, torch.device]] = None,
+) -> torch.Tensor:
+    """Solves least squares problem subject to missing data.
+    Reference: http://alexhwilliams.info/itsneuronalblog/2018/02/26/censored-lstsq/
+
+    .. note::
+        This function is used for solving the least squares problem with **missing
+        data**. The missing data is represented by nan values in the data matrix
+        ``d``. If there are no nan values in d, you are recommended to use
+        ``torch.linalg.lstsq`` instead.
+
+    Parameters
+    ----------
+    G : Union[np.ndarray, torch.Tensor], (n_im, n_param) or (n_pt, n_im, n_param)
+        model field matrix. If G is 3D, the first dimension is the G matrix for
+        each pixel.
+    d : Union[np.ndarray, torch.Tensor], (n_im, n_pt) matrix
+        data field matrix.
+    dtype : torch.dtype
+        dtype of torch.tensor used for computation.
+    device : Optional[Union[str, torch.device]]
+        device of torch.tensor used for computation. If None, use GPU if
+            available, otherwise use CPU.
+
+    Returns
+    -------
+    X : torch.Tensor, (n_im x n_pt) matrix
+        n_im x n_pt matrix that minimizes norm(M*(GX - d))
+    """
+    device = parse_device(device)
+
+    G = torch.tensor(G, dtype=dtype, device=device)
+    d = torch.tensor(d, dtype=dtype, device=device)
 
     # set nan values to zero
-    d_nan = xp.isnan(d)
+    d_nan = torch.isnan(d)
     d[d_nan] = 0
     M = ~d_nan
 
     # get the filter for pixels that could be solved
-    m = xp.sum(M, axis=0) > G.shape[-1]
+    m = torch.sum(M, axis=0) > G.shape[-1]
 
-    X = xp.full((G.shape[-1], d.shape[-1]), np.nan, dtype=np.float32)
+    X = torch.full((G.shape[-1], d.shape[-1]), torch.nan, dtype=dtype, device=device)
 
     if G.ndim == 2:
-        rhs = xp.dot(G.T, M[:, m] * d[:, m]).T[:, :, None]  # n x r x 1 tensor
-        T = xp.matmul(G.T[None, :, :], M[:, m].T[:, :, None] *
-                      G[None, :, :])  # n x r x r tensor
+        rhs = torch.matmul(G.T, M[:, m] * d[:, m]).T[:, :, None]  # n x r x 1 tensor
+        T = torch.matmul(
+            G.T[None, :, :], M[:, m].T[:, :, None] * G[None, :, :]
+        )  # n x r x r tensor
     else:
-        rhs = xp.matmul(G[m].transpose(0, 2, 1),
-                        (M[:, m] * d[:, m]).T[:, :, None])  # n x r x 1 tensor
+        rhs = torch.matmul(
+            G[m].transpose(0, 2, 1), (M[:, m] * d[:, m]).T[:, :, None]
+        )  # n x r x 1 tensor
         # n x r x r tensor
-        T = xp.matmul(G[m].transpose(0, 2, 1), M[:, m].T[:, :, None] * G[m])
-    X[:, m] = xp.squeeze(xp.linalg.solve(T, rhs)).T  # transpose to get r x n
+        T = torch.matmul(G[m].transpose(0, 2, 1), M[:, m].T[:, :, None] * G[m])
 
-    if gpu_id is not None:
-        X_np = xp.asnumpy(X)
+    X[:, m] = torch.squeeze(
+        torch.linalg.solve(T, rhs), dim=2
+    ).T  # transpose to get r x n
+
+    device_type = device.type
+    if device_type != "cpu":
+        X_np = X.detach().cpu()
         G, d, M, d_nan = None, None, None, None
         rhs, T, X = None, None, None
+        if device_type == "cuda":
+            torch.cuda.empty_cache()
+        elif device_type == "mps":
+            torch.mps.empty_cache()
         return X_np
     else:
         return X

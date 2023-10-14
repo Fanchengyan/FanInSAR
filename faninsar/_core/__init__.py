@@ -10,3 +10,4 @@ from .geo_tools import (
 )
 
 from .pair_tools import Pair, Pairs, Loop, Loops, SBASNetwork, PairsFactory, DateManager
+from .device import cuda_available, mps_available, gpu_available, parse_device
