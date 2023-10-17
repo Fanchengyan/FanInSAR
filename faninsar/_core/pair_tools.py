@@ -1346,20 +1346,20 @@ class PairsFactory:
 
     def __init__(
         self,
-        dates_str: Iterable[str],
-        date_args: Optional[dict] = None
+        dates: Iterable,
+        **kwargs
     ) -> None:
         '''initialize the PairGenerator class
 
         Parameters
         ----------
-        dates_str: Iterable
-            Iterable object of date strings. Each date string is a string
+        dates: Iterable
+            Iterable object that contains the dates. Can be any object that
+            can be passed to pd.to_datetime(). For example, ['20190101', '20190201'].
         date_args: dict, optional
-            Keyword arguments for pd.to_datetime() to convert the date strings
-            to datetime objects. For example, {'format': '%Y%m%d'}.
+            Keyword arguments for pd.to_datetime().
         '''
-        self.dates = pd.to_datetime(dates_str, **date_args)
+        self.dates = pd.to_datetime(dates, **kwargs)
 
     def from_interval(
         self,
