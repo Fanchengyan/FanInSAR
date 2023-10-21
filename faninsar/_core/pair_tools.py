@@ -2,7 +2,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, List, Literal, Optional, Tuple, Union
-
+import functools
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -174,7 +174,7 @@ class Pairs:
     _dates: np.ndarray
     _length: int
 
-    __slots__ = ['_values', '_dates', '_length']
+    __slots__ = ['_values', '_dates', '_length', '_edge_index']
 
     def __init__(
         self,
@@ -212,6 +212,8 @@ class Pairs:
         self._values = _values
         self._dates = np.unique(pairs_ls)
         self._length = self._values.shape[0]
+        
+        self._edge_index = np.searchsorted(self._dates, self._values)
         
         if sort:
             self.sort()
@@ -344,9 +346,10 @@ class Pairs:
         return (self._values[:, 1] - self._values[:, 0]).astype(int)
 
     @property
-    def index(self) -> np.ndarray:
-        '''return the index of the pairs in the dates coordinate'''
-        return np.searchsorted(self._dates, self._values)
+    def edge_index(self) -> np.ndarray:
+        '''return the index of the pairs in the dates coordinate (edge index in 
+        graph theory)'''
+        return self._edge_index
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -481,6 +484,24 @@ class Pairs:
                     loops.append([pair12[0], pair12[1], pair23[1]])
         return Loops(loops)
 
+    # def to_matrix(self) -> np.ndarray:
+    #     '''return the SBAS matrix
+
+    #     Parameters
+    #     ----------
+    #     matrix: np.ndarray
+    #         SBAS matrix in shape of (n_pairs, n_dates-1). The dates between
+    #         pairs are set to 1, otherwise 0.
+    #     '''
+    #     matrix = np.zeros((len(self), len(self.dates)-1))
+    #     dates = self.dates.tolist()
+    #     for i, pair in enumerate(self.values):
+    #         index1 = dates.index(pair[0])
+    #         index2 = dates.index(pair[1])
+    #         matrix[i, index1:index2] = 1
+
+    #     return matrix
+    
     def to_matrix(self) -> np.ndarray:
         '''return the SBAS matrix
 
@@ -491,11 +512,9 @@ class Pairs:
             pairs are set to 1, otherwise 0.
         '''
         matrix = np.zeros((len(self), len(self.dates)-1))
-        dates = self.dates.tolist()
-        for i, pair in enumerate(self.values):
-            index1 = dates.index(pair[0])
-            index2 = dates.index(pair[1])
-            matrix[i, index1:index2] = 1
+        col_idx = self.edge_index.copy()
+        for idx, i in enumerate(col_idx):
+            matrix[idx, i[0]:i[1]] = 1
 
         return matrix
 
