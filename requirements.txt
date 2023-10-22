@@ -1,6 +1,7 @@
 geopandas
 pandas
 numpy
+torch
 matplotlib
 data_downloader
 rasterio
