@@ -346,7 +346,7 @@ def device_mem_size(device: Optional[Union[str, torch.device]]) -> int:
 
 def _get_patch_col(G, d, mem_size, dtype, safe_factor=2):
     """
-    Get patch number of cols for memory size (in MB) for GPU.
+    Get patch number of cols for memory size (in MB) for SBAS inversion.
 
     Parameters:
     -----------
@@ -362,7 +362,15 @@ def _get_patch_col(G, d, mem_size, dtype, safe_factor=2):
 
     # rough value of n_patch
     n_patch = int(
-        np.ceil(m * n * r**2 * dtype.itemsize * safe_factor / 2**20 / mem_size)
+        np.ceil(
+            m
+            * n
+            * r**2
+            * torch.tensor([], dtype=dtype).element_size()
+            * safe_factor
+            / 2**20
+            / mem_size
+        )
     )
 
     # accurate value of n_patch
