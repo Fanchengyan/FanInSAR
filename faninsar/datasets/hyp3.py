@@ -9,7 +9,7 @@ from rasterio.enums import Resampling
 from faninsar._core.pair_tools import Pairs
 from faninsar.datasets.base import InterferogramDataset
 
-from .query import BoundingBox
+from ..query.query import BoundingBox
 
 
 class HyP3(InterferogramDataset):

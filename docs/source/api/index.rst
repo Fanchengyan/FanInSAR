@@ -4,8 +4,9 @@ Python API Reference
 
 .. toctree::
 
-   datasets/index
+   datasets/datasets
    samplers/index
+   query/query
    NSBAS/index
    
 

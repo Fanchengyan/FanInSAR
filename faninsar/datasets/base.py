@@ -34,7 +34,7 @@ from tqdm import tqdm
 from faninsar._core import geo_tools
 from faninsar._core.geo_tools import Profile
 from faninsar._core.pair_tools import Pairs
-from faninsar.datasets.query import BoundingBox, GeoQuery, Points
+from faninsar.query.query import BoundingBox, GeoQuery, Points
 
 __all__ = ("GeoDataset", "RasterDataset")
 
