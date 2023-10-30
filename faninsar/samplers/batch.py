@@ -2,8 +2,8 @@ import math
 from collections.abc import Iterator
 from typing import Iterable, Optional, Union
 
-from faninsar.datasets import BoundingBox, GeoDataset
-
+from faninsar.datasets import GeoDataset
+from faninsar.query import BoundingBox
 
 class RowSampler:
     """A sampler samples data from a dataset in a row-wise manner.

@@ -12,7 +12,7 @@ Geospatial Query in FanInSAR is used to sample values from GeoDataset. Query inc
 Bounding Box query
 ^^^^^^^^^^^^^^^^^^
 
-.. autoclass:: faninsar.datasets.query.BoundingBox
+.. autoclass:: faninsar.query.BoundingBox
    :members:
    :undoc-members:
    :member-order: bysource
@@ -21,7 +21,7 @@ Bounding Box query
 Point query
 ^^^^^^^^^^^
 
-.. autoclass:: faninsar.datasets.query.Point
+.. autoclass:: faninsar.query.Point
    :members:
    :undoc-members:
    :member-order: bysource
@@ -30,7 +30,7 @@ Point query
 Points query
 ^^^^^^^^^^^^
 
-.. autoclass:: faninsar.datasets.query.Points
+.. autoclass:: faninsar.query.Points
    :members:
    :undoc-members:
    :member-order: bysource
@@ -39,7 +39,7 @@ Points query
 GeoQuery
 ^^^^^^^^
 
-.. autoclass:: faninsar.datasets.query.GeoQuery
+.. autoclass:: faninsar.query.GeoQuery
    :members:
    :undoc-members:
    :member-order: bysource

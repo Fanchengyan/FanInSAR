@@ -400,7 +400,8 @@ class RasterDataset(GeoDataset):
     Examples
     --------
     >>> from pathlib import Path
-    >>> from faninsar.datasets import BoundingBox, GeoQuery, Points, RasterDataset
+    >>> from faninsar.datasets import RasterDataset
+    >>> from faninsar.query import BoundingBox, GeoQuery, Points,
     >>> home_dir = Path("./work/data")
     >>> files = list(home_dir.rglob("*unw_phase.tif"))
 
