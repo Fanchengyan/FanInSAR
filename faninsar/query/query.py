@@ -11,9 +11,9 @@ import pandas as pd
 import rasterio
 from rasterio.crs import CRS
 from rasterio.warp import transform as warp_transform
+from rasterio.warp import transform_bounds
 
 
-@dataclass(frozen=True)
 class BoundingBox:
     """Data class for indexing interferogram data using a spatial bounding box.
 
@@ -29,32 +29,50 @@ class BoundingBox:
             rasterio bounds tuple
     """
 
-    #: western boundary
-    left: float
-    #: southern boundary
-    bottom: float
-    #: eastern boundary
-    right: float
-    #: northern boundary
-    top: float
+    def __init__(
+        self,
+        left: float,
+        bottom: float,
+        right: float,
+        top: float,
+        crs: Optional[Union[CRS, str]] = None,
+    ) -> None:
+        """Initialize a BoundingBox.
 
-    def __post_init__(self) -> None:
-        """Validate the arguments passed to :meth:`__init__`.
-
-        Raises:
-            ValueError: if bounding box is invalid
-                (left > right, bottom > top)
-
-        .. versionadded:: 0.2
+        Parameters
+        ----------
+        left : float
+            The western boundary.
+        right : float
+            The eastern boundary.
+        bottom : float
+            The southern boundary.
+        top : float
+            The northern boundary.
+        crs : Optional[Union[CRS, str]], optional, default: None
+            The coordinate reference system of the bounding box. Can be any object
+            that can be passed to :func:`rasterio.crs.CRS.from_user_input`.
         """
-        if self.left > self.right:
+        if left > right:
             raise ValueError(
-                f"Bounding box is invalid: 'left={self.left}' > 'right={self.right}'"
+                f"Bounding box is invalid: 'left={left}' > 'right={right}'"
             )
-        if self.bottom > self.top:
+        if bottom > top:
             raise ValueError(
-                f"Bounding box is invalid: 'bottom={self.bottom}' > 'top={self.top}'"
+                f"Bounding box is invalid: 'bottom={bottom}' > 'top={top}'"
             )
+
+        self.left = left
+        self.right = right
+        self.bottom = bottom
+        self.top = top
+        self.crs = crs
+
+    def __str__(self) -> str:
+        return f"BoundingBox(left={self.left}, bottom={self.bottom}, right={self.right}, top={self.top}, crs={self.crs})"
+
+    def __repr__(self) -> str:
+        return self.__str__()
 
     # https://github.com/PyCQA/pydocstyle/issues/525
     @overload
@@ -152,6 +170,39 @@ class BoundingBox:
         """
         return (self.right - self.left) * (self.top - self.bottom)
 
+    def to_crs(self, crs: Union[CRS, str]) -> "BoundingBox":
+        """Convert the bounding box to a new coordinate reference system.
+
+        Parameters
+        ----------
+        crs : Union[CRS, str]
+            The new coordinate reference system. Can be any object that can be
+            passed to :func:`rasterio.crs.CRS.from_user_input`.
+        """
+        if self.crs is None:
+            raise ValueError(
+                "The current coordinate reference system is None. "
+                "Please set the crs using set_crs() first."
+            )
+        crs = CRS.from_user_input(crs)
+        if self.crs == crs:
+            return self
+        else:
+            left, bottom, right, top = transform_bounds(
+                self.crs, crs, self.left, self.bottom, self.right, self.top
+            )
+            return BoundingBox(left, bottom, right, top, crs=crs)
+
+    def set_crs(self, crs: Union[CRS, str]) -> None:
+        """Set the coordinate reference system of the bounding box.
+
+        .. warning::
+            This method will only set the crs attribute without converting the
+            bounding box to a new coordinate reference system. If you want to convert
+            the bounding box values to a new coordinate, please use :meth:`to_crs`
+        """
+        self.crs = CRS.from_user_input(crs)
+
     def to_dict(self) -> dict[str, float]:
         """Convert the bounding box to a dictionary.
 
@@ -210,8 +261,6 @@ class BoundingBox:
             bbox2 = BoundingBox(self.left, self.right, splity, self.top)
 
         return bbox1, bbox2
-
-
 @dataclass(frozen=True)
 class Point:
     x: float

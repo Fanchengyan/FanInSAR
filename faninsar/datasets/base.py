@@ -220,37 +220,56 @@ class GeoDataset(abc.ABC):
             entire dataset will be used.
         """
         if self._roi:
-            return BoundingBox(*self._roi)
+            return self._roi
         else:
             return self.bounds
 
     @roi.setter
-    def roi(self, new_roi: Union[BoundingBox, Iterable[float]]):
+    def roi(self, new_roi: Optional[BoundingBox]):
         """Set the region of interest of the dataset.
 
         Parameters
         ----------
-        new_roi : BoundingBox or Iterable
-            region of interest of the dataset in the CRS of the dataset.
+        new_roi : BoundingBox object, optional
+            region of interest of the dataset in the CRS of the dataset. If the
+            crs of the new_roi is different from the crs of the dataset, the new_roi
+            will be reprojected to the crs of the dataset. If None, the crs of the
+            dataset will be used.
         """
-        if new_roi is None:
-            self._roi = None
-            return
-        if isinstance(new_roi, Iterable):
-            new_roi = np.asarray([i for i in new_roi])
+        new_roi = self._check_roi(new_roi)
 
-        if len(new_roi) != 4:
-            raise ValueError(f"ROI must be a tuple of length 4, got {len(new_roi)}")
-        if (
-            new_roi[0] < self.bounds[0]
-            or new_roi[1] < self.bounds[1]
-            or new_roi[2] > self.bounds[2]
-            or new_roi[3] > self.bounds[3]
-        ):
-            raise ValueError(
-                f"ROI must be within the dataset bounds: {self.bounds}, but got {BoundingBox(*new_roi)}"
-            )
-        self._roi = BoundingBox(*new_roi)
+        self._roi = new_roi
+        
+    def _check_roi(self, roi: Optional[BoundingBox]) -> BoundingBox:
+        """Check the roi and return a valid roi.
+
+        Parameters
+        ----------
+        roi : BoundingBox object, optional
+            region of interest of the dataset in the CRS of the dataset. If the
+            crs of the new_roi is different from the crs of the dataset, the new_roi
+            will be reprojected to the crs of the dataset. If None, the crs of the
+            dataset will be used.
+
+        Returns
+        -------
+        roi: BoundingBox object
+            region of interest of the dataset. If None, the bounds of
+            entire dataset will be used.
+        """
+        if roi is None:
+            return self.roi
+        else:
+            if not isinstance(roi, BoundingBox):
+                raise TypeError(
+                    f"roi must be a BoundingBox object, got {type(roi)} instead."
+                )
+            if roi.crs != self.crs:
+                if roi.crs is None:
+                    roi = BoundingBox(*roi, crs=self.crs)
+                else:
+                    roi = roi.to_crs(self.crs)
+            return roi
 
     @property
     def dtype(self) -> Optional[np.dtype]:
@@ -346,7 +365,7 @@ class GeoDataset(abc.ABC):
         bounds: BoundingBox object
             (minx, right, bottom, top) of the dataset
         """
-        return BoundingBox(*self.index.bounds)
+        return BoundingBox(*self.index.bounds, crs=self.crs)
 
     def get_profile(
         self, bbox: Union[BoundingBox, Literal["roi", "bounds"]] = "roi"
@@ -606,10 +625,10 @@ class RasterDataset(GeoDataset):
 
         self.crs = crs
         self.res = res
-        self.roi = roi
         self.dtype = dtype
         self.nodata = nodata
         self.count = count
+        self.roi = roi
 
     def __getitem__(
         self, query: Union[GeoQuery, BoundingBox, Points]
@@ -652,6 +671,24 @@ class RasterDataset(GeoDataset):
 
         return sample
 
+    def _bbox_query(self, bbox: BoundingBox, vrt_fh) -> np.ndarray:
+        """Return the index of files that intersect with the given bounding box."""
+        win = vrt_fh.window(*bbox)
+        data = vrt_fh.read(
+            out_shape=(
+                1,
+                round((bbox.top - bbox.bottom) / self.res[1]),
+                round((bbox.right - bbox.left) / self.res[0]),
+            ),
+            resampling=self.resampling,
+            indexes=self.band_indexes,
+            window=win,
+            boundless=True,
+            fill_value=self.nodata,
+        )
+
+        return data
+
     def _sample_files(
         self, file_paths: Sequence[str], query: GeoQuery
     ) -> dict[Union[Literal["bbox", "points"], np.ndarray]]:
@@ -666,8 +703,19 @@ class RasterDataset(GeoDataset):
 
         Returns
         -------
-        dest : numpy.ndarray
-            stacked array
+        dest : dict
+            a dictionary containing the stacked files. The keys of the dictionary
+            are:
+
+            * ``bbox``: a numpy array of shape (n_bbox, n_file, height, width)
+                containing the values of the bounding boxes in the query.
+            * ``points``: a numpy array of shape (n_file, n_point) containing the
+                values of the points in the query.
+
+            .. Note::
+
+                ``bbox`` and ``points`` will be None if the query does not contain
+                bounding boxes or points.
         """
         if self.cache:
             vrt_fhs = [self._cached_load_warp_file(fp) for fp in file_paths]
@@ -685,18 +733,7 @@ class RasterDataset(GeoDataset):
             if query.bbox is not None:
                 for bbox in query.bbox:
                     win = vrt_fh.window(*bbox)
-                    data = vrt_fh.read(
-                        out_shape=(
-                            1,
-                            round((bbox.top - bbox.bottom) / self.res[1]),
-                            round((bbox.right - bbox.left) / self.res[0]),
-                        ),
-                        resampling=self.resampling,
-                        indexes=self.band_indexes,
-                        window=win,
-                        boundless=True,
-                        fill_value=self.nodata,
-                    )
+                    data = self._bbox_query(bbox, vrt_fh)
                     bbox_list.append(data)
 
                 files_bbox_list.append(bbox_list)
@@ -849,6 +886,32 @@ class RasterDataset(GeoDataset):
         xy = np.column_stack((xs, ys))
 
         return xy
+
+    def to_tiffs(
+        self,
+        out_dir: Union[str, Path],
+        roi: Optional[BoundingBox] = None,
+    ):
+        '''Save the dataset to a directory of tiff files for given region of interest.
+        
+        Parameters
+        ----------
+        out_dir : str or Path
+            path to the directory to save the tiff files
+        roi : BoundingBox, optional
+            region of interest to save. If None, the roi of the dataset will be used.
+        '''
+        roi = self._check_roi(roi)
+
+        profile = self.get_profile(roi)
+        profile["count"] = 1
+
+        for f in self.files.file_paths[self.valid]:
+            out_file = Path(out_dir) / f.name
+            with rasterio.open(f) as src:
+                dest_arr = self._bbox_query(roi, src).squeeze(0)
+            with rasterio.open(out_file, "w", **profile.profile) as dst:
+                dst.write(dest_arr, 1)
 
     def to_netcdf(
         self,
