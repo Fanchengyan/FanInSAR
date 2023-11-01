@@ -426,7 +426,7 @@ class RasterDataset(GeoDataset):
 
     initialize a RasterDataset and GeoQuery object
 
-    >>> ds = RasterDataset(file_paths=files)
+    >>> ds = RasterDataset(paths=files)
     >>> points = Points(
         [(490357, 4283413),
         (491048, 4283411),
@@ -497,8 +497,8 @@ class RasterDataset(GeoDataset):
 
     def __init__(
         self,
-        root: str = "data",
-        file_paths: Optional[Sequence[str]] = None,
+        root_dir: str = "data",
+        paths: Optional[Sequence[str]] = None,
         crs: Optional[CRS] = None,
         res: Optional[Union[float, tuple[float, float]]] = None,
         dtype: Optional[np.dtype] = None,
@@ -513,11 +513,11 @@ class RasterDataset(GeoDataset):
 
         Parameters
         ----------
-        root : str or Path
-            Root directory where dataset can be found.
-        file_paths : list of str, optional
-            list of file paths to use instead of searching for files in ``root``.
-            If None, files will be searched for in ``root``.
+        root_dir : str or Path
+            root_dir directory where dataset can be found.
+        paths : list of str, optional
+            list of file paths to use instead of searching for files in ``root_dir``.
+            If None, files will be searched for in ``root_dir``.
         crs : CRS, optional
             the output term:`coordinate reference system (CRS)` of the dataset.
             If None, the CRS of the first file found will be used.
@@ -545,28 +545,28 @@ class RasterDataset(GeoDataset):
 
         Raises
         ------
-            FileNotFoundError: if no files are found in ``root``
+            FileNotFoundError: if no files are found in ``root_dir``
         """
         super().__init__()
-        self.root = root
+        self.root_dir = root_dir
         self.bands = bands or self.all_bands
         self.cache = cache
         self.resampling = resampling
         self.verbose = verbose
 
-        if file_paths is None:
-            file_paths = []
-            pathname = os.path.join(root, "**", self.filename_glob)
+        if paths is None:
+            paths = []
+            pathname = os.path.join(root_dir, "**", self.filename_glob)
             filename_regex = re.compile(self.filename_regex, re.VERBOSE)
             for file_path in glob.iglob(pathname, recursive=True):
                 match = re.match(filename_regex, os.path.basename(file_path))
                 if match is not None:
-                    file_paths.append(file_path)
+                    paths.append(file_path)
 
         # Populate the dataset index
         count = 0
         files_valid = []
-        for file_path in file_paths:
+        for file_path in paths:
             try:
                 with rasterio.open(file_path) as src:
                     # See if file has a color map
@@ -597,16 +597,16 @@ class RasterDataset(GeoDataset):
                 count += 1
 
         if count == 0:
-            msg = f"No {self.__class__.__name__} data was found in `root='{self.root}'`"
+            msg = f"No {self.__class__.__name__} data was found in `root_dir='{self.root_dir}'`"
             if self.bands:
                 msg += f" with `bands={self.bands}`"
             raise FileNotFoundError(msg)
 
-        self._files = pd.DataFrame({"file_paths": file_paths, "valid": files_valid})
+        self._files = pd.DataFrame({"paths": paths, "valid": files_valid})
         self._valid = np.array(files_valid)
 
         if not self._files.valid.all():
-            files_invalid = self._files.file_paths[~self._files.valid].tolist()
+            files_invalid = self._files.paths[~self._files.valid].tolist()
             print(
                 f"Unable to read {len(files_invalid)} files in {self.__class__.__name__} dataset:"
                 "\n\t" + "\n\t".join(files_invalid),
@@ -663,8 +663,8 @@ class RasterDataset(GeoDataset):
         if isinstance(query, Points):
             query = GeoQuery(points=query)
 
-        file_paths = self.files[self.files.valid].file_paths
-        data = self._sample_files(file_paths, query)
+        paths = self.files[self.files.valid].paths
+        data = self._sample_files(paths, query)
 
         sample = {"query": query}
         sample.update(data)
@@ -690,13 +690,13 @@ class RasterDataset(GeoDataset):
         return data
 
     def _sample_files(
-        self, file_paths: Sequence[str], query: GeoQuery
+        self, paths: Sequence[str], query: GeoQuery
     ) -> dict[Union[Literal["bbox", "points"], np.ndarray]]:
         """Stack files into a single 3D array.
 
         Parameters
         ----------
-        file_paths : list of str
+        paths : list of str
             list of paths for files to stack
         query : GeoQuery
             a GeoQuery object containing the BoundingBox(es) and/or Points object
@@ -718,9 +718,9 @@ class RasterDataset(GeoDataset):
                 bounding boxes or points.
         """
         if self.cache:
-            vrt_fhs = [self._cached_load_warp_file(fp) for fp in file_paths]
+            vrt_fhs = [self._cached_load_warp_file(fp) for fp in paths]
         else:
-            vrt_fhs = [self._load_warp_file(fp) for fp in file_paths]
+            vrt_fhs = [self._load_warp_file(fp) for fp in paths]
 
         if self.verbose:
             vrt_fhs = tqdm(vrt_fhs, desc="Loading files", unit=" files")
@@ -906,7 +906,7 @@ class RasterDataset(GeoDataset):
         profile = self.get_profile(roi)
         profile["count"] = 1
 
-        for f in self.files.file_paths[self.valid]:
+        for f in self.files.paths[self.valid]:
             out_file = Path(out_dir) / f.name
             with rasterio.open(f) as src:
                 dest_arr = self._bbox_query(roi, src).squeeze(0)
@@ -968,9 +968,9 @@ class InterferogramDataset(RasterDataset):
 
     def __init__(
         self,
-        root: str = "data",
-        file_paths_unw: Optional[Sequence[str]] = None,
-        file_paths_coh: Optional[Sequence[str]] = None,
+        root_dir: str = "data",
+        paths_unw: Optional[Sequence[str]] = None,
+        paths_coh: Optional[Sequence[str]] = None,
         dem: Optional[Any] = None,
         mask: Optional[Any] = None,
         crs: Optional[CRS] = None,
@@ -988,14 +988,14 @@ class InterferogramDataset(RasterDataset):
 
         Parameters
         ----------
-        root: str
-            Root directory where dataset can be found.
-        file_paths_unw: list of str, optional
+        root_dir: str
+            root_dir directory where dataset can be found.
+        paths_unw: list of str, optional
             list of unwrapped interferogram file paths to use instead of searching
-            for files in ``root``. If None, files will be searched for in ``root``.
-        file_paths_coh: list of str, optional
+            for files in ``root_dir``. If None, files will be searched for in ``root_dir``.
+        paths_coh: list of str, optional
             list of coherence file paths to use instead of searching for files in
-            ``root``. If None, files will be searched for in ``root``.
+            ``root_dir``. If None, files will be searched for in ``root_dir``.
         dem: Any, optional
             DEM data. If None, no DEM data will be used.
         mask: Any, optional
@@ -1025,35 +1025,35 @@ class InterferogramDataset(RasterDataset):
         verbose: bool, optional, default: True
             if True, print verbose output.
         """
-        root_dir = Path(root)
-        self.root_dir = root_dir
+        root_dir_dir = Path(root_dir)
+        self.root_dir_dir = root_dir_dir
 
-        if file_paths_unw is None:
-            file_paths_unw = sorted(root_dir.rglob(self.filename_glob_unw))
-        if file_paths_coh is None:
-            file_paths_coh = sorted(root_dir.rglob(self.filename_glob_coh))
+        if paths_unw is None:
+            paths_unw = sorted(root_dir_dir.rglob(self.filename_glob_unw))
+        if paths_coh is None:
+            paths_coh = sorted(root_dir_dir.rglob(self.filename_glob_coh))
 
-        if len(file_paths_unw) != len(file_paths_coh):
+        if len(paths_unw) != len(paths_coh):
             raise ValueError(
-                f"Number of interferogram files ({len(file_paths_unw)}) does not match "
-                f"number of coherence files ({len(file_paths_coh)})"
+                f"Number of interferogram files ({len(paths_unw)}) does not match "
+                f"number of coherence files ({len(paths_coh)})"
             )
 
         # ensure there are no duplicate pairs
-        pairs = self.pairs_parser(file_paths_unw)
+        pairs = self.pairs_parser(paths_unw)
         index = pairs.sort(return_index=True)
-        if len(index) < len(file_paths_unw):
+        if len(index) < len(paths_unw):
             warnings.warn(
                 f"Duplicate pairs found in dataset, keeping only the first occurrence"
             )
-            file_paths_unw = [file_paths_unw[i] for i in index]
-            file_paths_coh = [file_paths_coh[i] for i in index]
+            paths_unw = [paths_unw[i] for i in index]
+            paths_coh = [paths_coh[i] for i in index]
 
         self._pairs = pairs
 
         super().__init__(
-            root=root,
-            file_paths=file_paths_unw,
+            root_dir=root_dir,
+            paths=paths_unw,
             crs=crs,
             res=res,
             dtype=dtype,
@@ -1066,8 +1066,8 @@ class InterferogramDataset(RasterDataset):
         )
 
         self.coh_dataset = RasterDataset(
-            root=root,
-            file_paths=file_paths_coh,
+            root_dir=root_dir,
+            paths=paths_coh,
             crs=self.crs,
             res=self.res,
             dtype=self.dtype,
@@ -1079,19 +1079,19 @@ class InterferogramDataset(RasterDataset):
             verbose=verbose,
         )
 
-    def pairs_parser(self, file_paths: list[Path]) -> Pairs:
+    def pairs_parser(self, paths: list[Path]) -> Pairs:
         """Used to parse pairs from filenames. Must be implemented in subclass.
 
         Parameters
         ----------
-        file_paths : list of pathlib.Path
+        paths : list of pathlib.Path
             list of file paths to parse pairs
 
         Example
         -------
         for the HyP3 dataset, pairs are parsed from the filenames as follows:
 
-        >>> names = [f.name for f in file_paths]]
+        >>> names = [f.name for f in paths]]
         >>> pair_names = ['_'.join(i.split("_")[1:3]) for i in names]
 
         for the HyP3 dataset, the pair names are the second and third parts of the

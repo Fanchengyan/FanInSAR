@@ -25,9 +25,9 @@ class HyP3(InterferogramDataset):
 
     def __init__(
         self,
-        root: str = "data",
-        file_paths_unw: Optional[Sequence[str]] = None,
-        file_paths_coh: Optional[Sequence[str]] = None,
+        root_dir: str = "data",
+        paths_unw: Optional[Sequence[str]] = None,
+        paths_coh: Optional[Sequence[str]] = None,
         dem: Optional[Any] = None,
         mask: Optional[Any] = None,
         crs: Optional[CRS] = None,
@@ -45,14 +45,14 @@ class HyP3(InterferogramDataset):
 
         Parameters
         ----------
-        root: str
+        root_dir: str
             Root directory where dataset can be found.
-        file_paths_unw: list of str, optional
+        paths_unw: list of str, optional
             list of unwrapped interferogram file paths to use instead of searching
-            for files in ``root``. If None, files will be searched for in ``root``.
-        file_paths_coh: list of str, optional
+            for files in ``root_dir``. If None, files will be searched for in ``root_dir``.
+        paths_coh: list of str, optional
             list of coherence file paths to use instead of searching for files in
-            ``root``. If None, files will be searched for in ``root``.
+            ``root_dir``. If None, files will be searched for in ``root_dir``.
         dem: Any, optional
             DEM data. If None, no DEM data will be used.
         mask: Any, optional
@@ -83,9 +83,9 @@ class HyP3(InterferogramDataset):
             if True, print verbose output.
         """
         super().__init__(
-            root=root,
-            file_paths_unw=file_paths_unw,
-            file_paths_coh=file_paths_coh,
+            root_dir=root_dir,
+            paths_unw=paths_unw,
+            paths_coh=paths_coh,
             dem=dem,
             mask=mask,
             crs=crs,
