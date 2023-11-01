@@ -99,7 +99,7 @@ class HyP3(InterferogramDataset):
             verbose=verbose,
         )
 
-    def pairs_parser(self, file_paths: list[Path]) -> Pairs:
+    def parse_pairs(self, file_paths: list[Path]) -> Pairs:
         """Parse the primary and secondary date/acquisition of the interferogram
         to generate Pairs object.
         """

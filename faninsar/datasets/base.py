@@ -1040,7 +1040,7 @@ class InterferogramDataset(RasterDataset):
             )
 
         # ensure there are no duplicate pairs
-        pairs = self.pairs_parser(paths_unw)
+        pairs = self.parse_pairs(paths_unw)
         index = pairs.sort(return_index=True)
         if len(index) < len(paths_unw):
             warnings.warn(
@@ -1079,7 +1079,7 @@ class InterferogramDataset(RasterDataset):
             verbose=verbose,
         )
 
-    def pairs_parser(self, paths: list[Path]) -> Pairs:
+    def parse_pairs(self, paths: list[Path]) -> Pairs:
         """Used to parse pairs from filenames. Must be implemented in subclass.
 
         Parameters
@@ -1102,17 +1102,17 @@ class InterferogramDataset(RasterDataset):
 
         .. Note::
 
-            * The ``pairs_parser`` method must be implemented in subclass. If you are
+            * The ``parse_pairs`` method must be implemented in subclass. If you are
               using :class:`InterferogramDataset` directly, you must implement the
-              `pairs_parser` method in your code.
-            * The ``pairs_parser`` method must return a :class:`Pairs` object.
+              `parse_pairs` method in your code.
+            * The ``parse_pairs`` method must return a :class:`Pairs` object.
 
         Raises
         ------
         NotImplementedError: if not implemented in subclass or directly using
             InterferogramDataset.
         """
-        raise NotImplementedError("pairs_parser must be implemented in subclass")
+        raise NotImplementedError("parse_pairs must be implemented in subclass")
 
     @property
     def pairs(self) -> Pairs:
