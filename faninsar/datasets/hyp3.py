@@ -28,8 +28,8 @@ class HyP3(InterferogramDataset):
         root_dir: str = "data",
         paths_unw: Optional[Sequence[str]] = None,
         paths_coh: Optional[Sequence[str]] = None,
-        dem: Optional[Any] = None,
-        mask: Optional[Any] = None,
+        dem_file: Optional[Any] = None,
+        mask_file: Optional[Any] = None,
         crs: Optional[CRS] = None,
         res: Optional[Union[float, Tuple[float, float]]] = None,
         dtype: Optional[np.dtype] = None,
@@ -41,7 +41,6 @@ class HyP3(InterferogramDataset):
         verbose=False,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
-        # TODO: add dem and mask support
 
         Parameters
         ----------
@@ -53,10 +52,10 @@ class HyP3(InterferogramDataset):
         paths_coh: list of str, optional
             list of coherence file paths to use instead of searching for files in
             ``root_dir``. If None, files will be searched for in ``root_dir``.
-        dem: Any, optional
+        dem_file: Any, optional
             DEM data. If None, no DEM data will be used.
-        mask: Any, optional
-            Mask data. If None, no mask data will be used.
+        mask_file: Any, optional
+            Mask data. If None, no Mask data will be used.
         crs: CRS, optional
             the output term:`coordinate reference system (CRS)` of the dataset.
             If None, the CRS of the first file found will be used.
@@ -86,8 +85,8 @@ class HyP3(InterferogramDataset):
             root_dir=root_dir,
             paths_unw=paths_unw,
             paths_coh=paths_coh,
-            dem=dem,
-            mask=mask,
+            dem_file=dem_file,
+            mask_file=mask_file,
             crs=crs,
             res=res,
             dtype=dtype,

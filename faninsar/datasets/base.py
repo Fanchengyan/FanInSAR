@@ -951,9 +951,10 @@ class RasterDataset(GeoDataset):
 
 class InterferogramDataset(RasterDataset):
     """
-    A base class for interferogram datasets. The unwrapped interferogram will be
-    used as this dataset's ``image`` data. The ``coherence``, ``dem`` and ``mask``
-    data are optional and can be accessed as attributes of the dataset.
+    A base class for interferogram datasets.
+    
+    .. Note::
+        The unwrapped interferograms are used to initialize this dataset. The coherence, dem, and mask files can be accessed as attributes ``ds_coh``, ``ds_dem``, and ``ds_mask`` respectively.
     """
 
     #: Glob expression used to search for files.
@@ -971,8 +972,8 @@ class InterferogramDataset(RasterDataset):
         root_dir: str = "data",
         paths_unw: Optional[Sequence[str]] = None,
         paths_coh: Optional[Sequence[str]] = None,
-        dem: Optional[Any] = None,
-        mask: Optional[Any] = None,
+        dem_file: Optional[Union[str, Path]] = None,
+        mask_file: Optional[Union[str, Path]] = None,
         crs: Optional[CRS] = None,
         res: Optional[Union[float, tuple[float, float]]] = None,
         dtype: Optional[np.dtype] = None,
@@ -984,7 +985,6 @@ class InterferogramDataset(RasterDataset):
         verbose=True,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
-        # TODO: add dem and mask support
 
         Parameters
         ----------
@@ -996,10 +996,10 @@ class InterferogramDataset(RasterDataset):
         paths_coh: list of str, optional
             list of coherence file paths to use instead of searching for files in
             ``root_dir``. If None, files will be searched for in ``root_dir``.
-        dem: Any, optional
-            DEM data. If None, no DEM data will be used.
-        mask: Any, optional
-            Mask data. If None, no mask data will be used.
+        dem_file: str or Path, optional
+            path to the DEM file. If None, no DEM data will be used.
+        mask_file: str or Path, optional
+            path to the mask file. If None, no Mask data will be used.
         crs: CRS, optional
             the output coordinate reference system term:`(CRS)` of the dataset.
             If None, the CRS of the first file found will be used.
@@ -1065,7 +1065,7 @@ class InterferogramDataset(RasterDataset):
             verbose=verbose,
         )
 
-        self.coh_dataset = RasterDataset(
+        self.ds_coh = RasterDataset(
             root_dir=root_dir,
             paths=paths_coh,
             crs=self.crs,
@@ -1078,6 +1078,35 @@ class InterferogramDataset(RasterDataset):
             resampling=resampling,
             verbose=verbose,
         )
+        
+        self.ds_dem = None
+        if dem_file is not None:
+            self.ds_dem = RasterDataset(
+                paths=[dem_file],
+                crs=self.crs,
+                res=self.res,
+                dtype=self.dtype,
+                nodata=self.nodata,
+                roi=self.roi,
+                cache=cache,
+                resampling=resampling,
+                verbose=verbose,
+            )
+            
+        self.ds_mask = None
+        if mask_file is not None:
+            self.ds_mask = RasterDataset(
+                paths=[mask_file],
+                crs=self.crs,
+                res=self.res,
+                dtype=self.dtype,
+                nodata=self.nodata,
+                roi=self.roi,
+                cache=cache,
+                resampling=resampling,
+                verbose=verbose,
+            )
+        
 
     def parse_pairs(self, paths: list[Path]) -> Pairs:
         """Used to parse pairs from filenames. Must be implemented in subclass.
