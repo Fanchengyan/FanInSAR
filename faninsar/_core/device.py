@@ -30,14 +30,17 @@ def parse_device(device: Optional[Union[str, torch.device]]):
 
 
 def _parse_device_str(device: str):
-    if device is None:
-        if gpu_available():
+    if device is None or device.lower() == "gpu":
+        if cuda_available():
             device = "cuda"
+        elif mps_available():
+            device = "mps"
         else:
-            device = "cpu"
-    elif device.lower() == "gpu":
-        if not gpu_available():
-            warnings.warn("GPU is not available, using CPU instead.")
+            if isinstance(device, str):
+                warnings.warn(
+                    "No GPU detected. Falling back to CPU. "
+                    "If you would like to use a GPU, please install PyTorch with CUDA support."
+                )
             device = "cpu"
     else:
         device = device.lower()
