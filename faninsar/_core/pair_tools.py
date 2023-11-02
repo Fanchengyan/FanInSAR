@@ -2,7 +2,7 @@ import functools
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Literal, Optional,  Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -212,11 +212,10 @@ class Pairs:
         self._values = _values
         self._dates = np.unique(pairs_ls)
         self._length = self._values.shape[0]
-
         self._edge_index = np.searchsorted(self._dates, self._values)
 
         if sort:
-            self.sort()
+            self.sort(inplace=True)
 
     def __len__(self) -> int:
         return self._length
@@ -360,7 +359,7 @@ class Pairs:
         return self._edge_index
 
     @property
-    def shape(self) -> Tuple[int, int]:
+    def shape(self) -> tuple[int, int]:
         """return the shape of the pairs array"""
         return self._values.shape
 
@@ -414,13 +413,12 @@ class Pairs:
         else:
             return None
 
-    # TODO: 1. not duplicated pairs 2. add duplicate function
     def sort(
         self,
         order: Union[str, list] = "pairs",
         ascending: bool = True,
-        return_index: bool = False,
-    ) -> Optional[np.ndarray]:
+        inplace: bool = True,
+    ) -> Optional[tuple["Pairs", np.ndarray]]:
         """sort the pairs
 
         Parameters
@@ -433,13 +431,14 @@ class Pairs:
             ['pairs', 'primary', 'secondary', 'days'].
         ascending: bool, optional
             Whether to sort ascending. Default is True.
-        return_index: bool, optional
-            Whether to return the index of the sorted pairs. Default is False.
+        inplace: bool, optional
+            Whether to sort the pairs inplace. Default is True.
 
         Returns
         -------
-        None or np.ndarray. if return_index is True, return the index of the
-        sorted pairs.
+        None or (Pairs, np.ndarray). if inplace is True, return the sorted pairs
+        and the index of the sorted pairs in the original pairs. Otherwise,
+        return None.
         """
         item_map = {
             "pairs": self._values,
@@ -449,23 +448,26 @@ class Pairs:
         }
         if isinstance(order, str):
             order = [order]
-        _values = []
+        _values_ = []
         for i in order:
             if i not in item_map.keys():
                 raise ValueError(
                     f"order should be one of {list(item_map.keys())}, but got {order}."
                 )
-            _values.append(item_map[i].reshape(self._length, -1))
-        _values = np.hstack(_values)
-        _, _index = np.unique(_values, axis=0, return_index=True)
+            _values_.append(item_map[i].reshape(self._length, -1))
+        _values_ = np.hstack(_values_)
+        _values, _index = np.unique(_values, axis=0, return_index=True)
         if not ascending:
             _index = _index[::-1]
-        self._values = self._values[_index]
+        if inplace:
+            self._values = _values
+            self._dates = np.unique(self._values)
+            self._edge_index = np.searchsorted(self._dates, self._values)
+            self._length = self._values.shape[0]
+        else:
+            return Pairs(_values), _index
 
-        if return_index:
-            return _index
-
-    def to_names(self, prefix: Optional[str] = None) -> List[str]:
+    def to_names(self, prefix: Optional[str] = None) -> list[str]:
         """generate pair names string with prefix
 
         Parameters
@@ -507,7 +509,7 @@ class Pairs:
 
         return matrix
 
-    def dates_string(self, format="%Y%m%d") -> List[str]:
+    def dates_string(self, format="%Y%m%d") -> list[str]:
         """return the dates of the pairs with format of str
 
         Parameters
@@ -534,7 +536,7 @@ class Loop:
 
     _values: np.ndarray
     _name: str
-    _pairs: List[Pair]
+    _pairs: list[Pair]
 
     __slots__ = ["_values", "_pairs", "_name", "_days12", "_days23", "_days13"]
 
@@ -580,13 +582,13 @@ class Loop:
         return self._values
 
     @property
-    def pairs(self) -> List[Pair]:
+    def pairs(self) -> list[Pair]:
         """return all three pairs of the loop.
 
         Returns
         -------
         pairs: list
-            List containing three pairs. Each pair is a Pair class.
+            list containing three pairs. Each pair is a Pair class.
         """
         return self._pairs
 
@@ -702,13 +704,14 @@ class Loops:
                 )
             loops_ls.append(_loop.values)
 
-        _values, _index = np.unique(loops_ls, axis=0, return_index=True)
-        if not sort:
-            _values = _values[_index]
+        _values = np.array(loops_ls)
 
         self._values = _values
         self._dates = np.unique(loops_ls)
         self._length = self._values.shape[0]
+        
+        if sort:
+            self.sort(inplace=True)
 
     def __str__(self) -> str:
         return f"Loops({self._length})"
@@ -851,7 +854,7 @@ class Loops:
         return self._dates
 
     @property
-    def shape(self) -> Tuple[int, int]:
+    def shape(self) -> tuple[int, int]:
         """return the shape of the loop array"""
         return self._values.shape
 
@@ -952,7 +955,7 @@ class Loops:
     @classmethod
     def from_names(
         cls,
-        names: List[str],
+        names: list[str],
         parse_function: Optional[Callable] = None,
         date_args: Optional[dict] = None,
     ) -> "Loops":
@@ -961,7 +964,7 @@ class Loops:
         Parameters
         ----------
         names: list
-            List of loop file names.
+            list of loop file names.
         parse_function: Callable, optional
             Function to parse the date strings from the loop file name.
             If None, the loop file name will be split by '_' and
@@ -982,7 +985,7 @@ class Loops:
             loops.append(loop.values)
         return cls(loops, sort=False)
 
-    def to_names(self, prefix: Optional[str] = None) -> List[str]:
+    def to_names(self, prefix: Optional[str] = None) -> list[str]:
         """return the string name of each loop.
 
         Returns
@@ -1057,9 +1060,9 @@ class Loops:
 
     def sort(
         self,
-        order: Union[str, List] = "pairs",
+        order: Union[str, list] = "pairs",
         ascending: bool = True,
-        return_index: bool = False,
+        inplace: bool = True,
     ) -> Optional[np.ndarray]:
         """sort the loops
 
@@ -1084,8 +1087,9 @@ class Loops:
 
         Returns
         -------
-        None or np.ndarray. if return_index is True, return the index of the
-        sorted loops.
+        None or (Loops, np.ndarray). if inplace is True, return the sorted loops 
+        and the index of the sorted loops in the original loops. Otherwise,
+        return None.
         """
         item_map = {
             "date1": self._values[:, 0],
@@ -1116,10 +1120,12 @@ class Loops:
         _, _index = np.unique(_values, axis=0, return_index=True)
         if not ascending:
             _index = _index[::-1]
-        self._values = self._values[_index]
-
-        if return_index:
-            return _index
+        if inplace:
+            self._values = self._values[_index]
+            self._dates = np.unique(self._values)
+            self._length = self._values.shape[0]
+        else:
+            return Loops(self._values[_index]), _index
 
     def to_seasons(self):
         """return the season of each loop.
@@ -1127,7 +1133,7 @@ class Loops:
         Returns
         -------
         seasons: list
-            List of seasons of each loop.
+            list of seasons of each loop.
                 0: not the same season
                 1: spring
                 2: summer
@@ -1201,7 +1207,7 @@ class SBASNetwork:
         self.baseline = baseline
         self._loops = self._pairs.to_loops()
         if sort:
-            self.sort()
+            self.sort(inplace=True)
 
     @property
     def pairs(self) -> Pairs:
@@ -1261,13 +1267,13 @@ class SBASNetwork:
         self._baseline = value
 
     @property
-    def dates(self) -> List[str]:
+    def dates(self) -> list[str]:
         return self._pairs.dates
 
     @classmethod
     def from_names(
         cls,
-        names: List[str],
+        names: list[str],
         parse_function: Optional[Callable] = None,
         date_args: Optional[dict] = None,
     ) -> "SBASNetwork":
@@ -1276,7 +1282,7 @@ class SBASNetwork:
         Parameters
         ----------
         names: list
-            List of loop file names.
+            list of loop file names.
         parse_function: Callable, optional
             Function to parse the date strings from the loop file name.
             If None, the loop file name will be split by '_' and
@@ -1298,7 +1304,7 @@ class SBASNetwork:
         self,
         order: Union[str, list] = "pairs",
         ascending: bool = True,
-        return_index: bool = False,
+        inplace: bool = True,
     ):
         """sort the pairs and corresponding baseline of the network
 
@@ -1312,14 +1318,23 @@ class SBASNetwork:
             ['pairs', 'primary', 'secondary', 'days'].
         ascending: bool, optional
             Whether to sort ascending. Default is True.
-        return_index: bool, optional
-            Whether to return the index of the sorted loops. Default is False.
+        inplace: bool, optional
+            Whether to sort the pairs and loops inplace. Default is True.
+            
+        Returns
+        -------
+        None or (SBASNetwork, np.ndarray). if inplace is True, return the sorted 
+        SBASNetwork and the index of the sorted pairs in the original pairs. 
+        Otherwise, return None.
         """
-        _index = self._pairs.sort(order, ascending)
+        pairs, _index = self._pairs.sort(order, ascending, inplace=False)
         if self.baseline is not None:
             self.baseline = self.baseline[_index]
-        if return_index:
-            return _index
+        if inplace:
+            self._pairs = pairs
+            self._loops = pairs.to_loops()
+        else:
+            return SBASNetwork(pairs, self.baseline), _index
 
     def plot(
         self,
@@ -1432,7 +1447,6 @@ class PairsFactory:
         -------
         pairs: Pairs object
         """
-
         years = sorted(set(self.dates.year))
         df_dates = pd.Series(self.dates.strftime("%Y%m%d"), index=self.dates)
 
@@ -1473,8 +1487,6 @@ class PairsFactory:
 
     def from_summer_winter(
         self,
-        dates_str: str,
-        date_format: str = "%Y%m%d",
         summer_start: str = "0801",
         summer_end: str = "1001",
         winter_start: str = "1201",
@@ -1487,12 +1499,6 @@ class PairsFactory:
 
         Parameters
         ---------
-        dates_str: str
-            date string with format of '%Y%m%d'
-        date_format : str
-            format of dates string, which is used to convert string to datetime object.
-            Default is '%Y%m%d'. More information can be found at:
-            https://docs.python.org/3.11/library/datetime.html#strftime-strptime-behavior
         summer_start, summer_end:  str
             start and end date for the summer which expressed as month and day with format '%m%d'
         winter_start, winter_end:  str
@@ -1500,10 +1506,10 @@ class PairsFactory:
 
         Returns
         -------
-        _pairs: a list containing interferometric pairs with each pair as a tuple of two dates
+        Pairs object 
         """
         years = sorted(set(self.dates.year))
-        df_dates = pd.Series(self.dates.strftime(date_format), index=self.dates)
+        df_dates = pd.Series(self.dates.strftime('%Y%m%d'), index=self.dates)
 
         _pairs = []
         for year in years:
