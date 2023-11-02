@@ -403,12 +403,10 @@ class Points:
         return np.any(np.all(self._values == item, axis=1))
 
     def __str__(self) -> str:
-        return f"Points(count={len(self)})"
-        return self.__repr__()
-
+        return f"Points(count={len(self)}, crs='{self.crs}')"
+    
     def __repr__(self) -> str:
-        data_str = _arr_to_point_str(self.values, indent=8, max_height=10, crs=self.crs)
-        return f"Points(\n{data_str}\n)"
+        return self.__str__()
 
     def __array__(self, dtype=None) -> np.ndarray:
         if dtype is not None:
@@ -774,46 +772,3 @@ class GeoQuery:
     def points(self) -> Optional[Points]:
         """Return the points of the samples."""
         return self._points
-
-
-def _arr_to_point_str(
-    arr: np.ndarray, indent: int = 4, max_height: int = 10, crs: CRS = None
-) -> str:
-    if arr.shape[0] > max_height:
-        num = max_height // 2
-        char_len = len(str(eval(arr.__repr__().split("\n")[1].strip(","))[0]))
-        arr = np.vstack(
-            [
-                arr[:num],
-                np.full((1, arr.shape[1]), "..."),
-                arr[-num:],
-            ]
-        )
-        arr = np.char.ljust(arr, char_len)
-
-    string_arr_list = arr.__repr__().split("\n")
-    string_arr_list[0] = string_arr_list[0].replace("array([", "       ")
-    string_arr_list[-1] = ",".join(string_arr_list[-1].split(",")[:-1])
-
-    line_span_l = " " * (7 + char_len // 2)
-    line_span_m = " " * char_len
-    line_span_s = " " * 4
-    line_span_indent = " " * indent
-
-    # header
-    header = f"{line_span_l} 'x'{line_span_m}'y'"
-    string_arr_list.insert(0, header)
-
-    str_list = []
-    for str_line in string_arr_list:
-        str_list.append(f"{line_span_indent}{str_line[7:]}")
-
-    str_list.insert(0, f"{line_span_s}values:")
-
-    # tail
-    str_list.append(f"{line_span_s}shape: {arr.shape}")
-    str_list.append(f"{line_span_s}CRS: {crs}")
-
-    formatted_string = "\n".join(str_list)
-
-    return formatted_string
