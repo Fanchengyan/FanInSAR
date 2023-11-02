@@ -220,6 +220,7 @@ class NSBASInversion:
         self,
         matrix_factory: NSBASMatrixFactory,
         device: Optional[Union[str, torch.device]] = None,
+        dtype: torch.dtype = torch.float64,
     ):
         """Initialize NSBASInversion
 
@@ -230,9 +231,12 @@ class NSBASInversion:
         device : Optional[Union[str, torch.device]], optional
             device of torch.tensor used for computation. If None, use GPU if
             available, otherwise use CPU.
+        dtype : torch.dtype
+            dtype of torch.tensor used for computation.
         """
         self.matrix_factory = matrix_factory
         self.device = parse_device(device)
+        self.dtype = dtype
 
         self.G = matrix_factory.G
         self.d = matrix_factory.d
@@ -257,7 +261,7 @@ class NSBASInversion:
             residual between time-series model and model result
         """
         result = batch_lstsq(
-            self.G, self.d, device=self.device, desc="  NSBAS inversion"
+            self.G, self.d, dtype=self.dtype, device=self.device, desc="  NSBAS inversion"
         )
         residual = np.dot(self.G, result) - self.d
 
