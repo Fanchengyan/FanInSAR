@@ -239,7 +239,7 @@ class GeoDataset(abc.ABC):
         new_roi = self._check_roi(new_roi)
 
         self._roi = new_roi
-        
+
     def _check_roi(self, roi: Optional[BoundingBox]) -> BoundingBox:
         """Check the roi and return a valid roi.
 
@@ -689,6 +689,22 @@ class RasterDataset(GeoDataset):
 
         return data
 
+    def _points_query(self, points: Points, vrt_fh) -> np.ndarray:
+        """Return the index of files that intersect with the given points."""
+        crs_points = points.crs
+        xy = points.values
+        if crs_points is None:
+            warnings.warn(
+                "No CRS is specified for the points, assuming they are in the"
+                " same CRS as the dataset."
+            )
+        else:
+            if crs_points != self.crs:
+                xs, ys = warp_transform(crs_points, self.crs, xy[:, 0], xy[:, 1])
+                xy = np.column_stack((xs, ys))
+        data = list(vrt_fh.sample(xy))
+        return data
+
     def _sample_files(
         self, paths: Sequence[str], query: GeoQuery
     ) -> dict[Union[Literal["bbox", "points"], np.ndarray]]:
@@ -732,26 +748,13 @@ class RasterDataset(GeoDataset):
             bbox_list = []
             if query.bbox is not None:
                 for bbox in query.bbox:
-                    win = vrt_fh.window(*bbox)
                     data = self._bbox_query(bbox, vrt_fh)
                     bbox_list.append(data)
-
                 files_bbox_list.append(bbox_list)
             # Get the points values
             if query.points is not None:
-                crs_points = query.points.crs
-                xy = query.points.values
-                if crs_points is None:
-                    warnings.warn(
-                        "No CRS is specified for the points, assuming they are in the same CRS as the dataset."
-                    )
-                else:
-                    if crs_points != self.crs:
-                        xs, ys = warp_transform(
-                            crs_points, self.crs, xy[:, 0], xy[:, 1]
-                        )
-                        xy = np.column_stack((xs, ys))
-                files_points_list.append(list(vrt_fh.sample(xy)))
+                data = self._points_query(query.points, vrt_fh)
+                files_points_list.append(data)
 
         # Stack the bounding boxes values
         bbox_values = None
@@ -892,15 +895,15 @@ class RasterDataset(GeoDataset):
         out_dir: Union[str, Path],
         roi: Optional[BoundingBox] = None,
     ):
-        '''Save the dataset to a directory of tiff files for given region of interest.
-        
+        """Save the dataset to a directory of tiff files for given region of interest.
+
         Parameters
         ----------
         out_dir : str or Path
             path to the directory to save the tiff files
         roi : BoundingBox, optional
             region of interest to save. If None, the roi of the dataset will be used.
-        '''
+        """
         roi = self._check_roi(roi)
 
         profile = self.get_profile(roi)
@@ -952,7 +955,7 @@ class RasterDataset(GeoDataset):
 class InterferogramDataset(RasterDataset):
     """
     A base class for interferogram datasets.
-    
+
     .. Note::
         The unwrapped interferograms are used to initialize this dataset. The coherence, dem, and mask files can be accessed as attributes ``ds_coh``, ``ds_dem``, and ``ds_mask`` respectively.
     """
@@ -1029,9 +1032,9 @@ class InterferogramDataset(RasterDataset):
         self.root_dir_dir = root_dir_dir
 
         if paths_unw is None:
-            paths_unw = sorted(root_dir_dir.rglob(self.filename_glob_unw))
+            paths_unw = np.unique(list(root_dir_dir.rglob(self.filename_glob_unw)))
         if paths_coh is None:
-            paths_coh = sorted(root_dir_dir.rglob(self.filename_glob_coh))
+            paths_coh = np.unique(list(root_dir_dir.rglob(self.filename_glob_coh)))
 
         if len(paths_unw) != len(paths_coh):
             raise ValueError(
@@ -1041,15 +1044,19 @@ class InterferogramDataset(RasterDataset):
 
         # ensure there are no duplicate pairs
         pairs = self.parse_pairs(paths_unw)
-        index = pairs.sort(return_index=True)
+        pairs1, index = pairs.sort(inplace=False)
         if len(index) < len(paths_unw):
+            deduplicated = "".join(
+                [f"\n\t{i.parent.stem}" for i in set(paths_unw) - set(paths_unw[index])]
+            )
             warnings.warn(
                 f"Duplicate pairs found in dataset, keeping only the first occurrence"
+                f"\nDeduplicate pairs: {deduplicated}"
             )
-            paths_unw = [paths_unw[i] for i in index]
-            paths_coh = [paths_coh[i] for i in index]
+            paths_unw = paths_unw[index]
+            paths_coh = paths_coh[index]
 
-        self._pairs = pairs
+        self._pairs = pairs1
 
         super().__init__(
             root_dir=root_dir,
@@ -1078,7 +1085,7 @@ class InterferogramDataset(RasterDataset):
             resampling=resampling,
             verbose=verbose,
         )
-        
+
         self.ds_dem = None
         if dem_file is not None:
             self.ds_dem = RasterDataset(
@@ -1092,7 +1099,7 @@ class InterferogramDataset(RasterDataset):
                 resampling=resampling,
                 verbose=verbose,
             )
-            
+
         self.ds_mask = None
         if mask_file is not None:
             self.ds_mask = RasterDataset(
@@ -1106,7 +1113,6 @@ class InterferogramDataset(RasterDataset):
                 resampling=resampling,
                 verbose=verbose,
             )
-        
 
     def parse_pairs(self, paths: list[Path]) -> Pairs:
         """Used to parse pairs from filenames. Must be implemented in subclass.
