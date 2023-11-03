@@ -673,6 +673,14 @@ class RasterDataset(GeoDataset):
 
     def _bbox_query(self, bbox: BoundingBox, vrt_fh) -> np.ndarray:
         """Return the index of files that intersect with the given bounding box."""
+        if bbox.crs is None:
+            warnings.warn(
+                "No CRS is specified for the bounding box, assuming it is in the"
+                " same CRS as the dataset."
+            )
+        elif bbox.crs != self.crs:
+            bbox = bbox.to_crs(self.crs)
+            
         win = vrt_fh.window(*bbox)
         data = vrt_fh.read(
             out_shape=(
