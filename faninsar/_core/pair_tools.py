@@ -456,7 +456,7 @@ class Pairs:
                 )
             _values_.append(item_map[i].reshape(self._length, -1))
         _values_ = np.hstack(_values_)
-        _values, _index = np.unique(_values, axis=0, return_index=True)
+        _values, _index = np.unique(_values_, axis=0, return_index=True)
         if not ascending:
             _index = _index[::-1]
         if inplace:
