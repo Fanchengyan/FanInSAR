@@ -301,10 +301,6 @@ class Pairs:
                 return None
         elif isinstance(index, Iterable):
             index = np.array(index)
-            if not index.ndim == 1:
-                raise IndexError(
-                    f"Index should be 1D array, but got {index.ndim}D array."
-                )
             if len(index) > self._length:
                 raise IndexError(
                     f"Index length should be less than pairs length {self._length},"
