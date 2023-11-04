@@ -261,22 +261,6 @@ class BoundingBox:
             bbox2 = BoundingBox(self.left, self.right, splity, self.top)
 
         return bbox1, bbox2
-@dataclass(frozen=True)
-class Point:
-    x: float
-    y: float
-
-    def __array__(self, dtype=None) -> np.ndarray:
-        """Return the values of the point as a numpy array with shape (2,)."""
-        if dtype is not None:
-            return np.array([self.x, self.y], dtype=dtype)
-        return self.values
-
-    @property
-    def values(self) -> np.ndarray:
-        """Return the values of the point as a numpy array with shape (2,)."""
-        return np.array([self.x, self.y], dtype=np.float64)
-
 
 class Points:
     """A class to represent a collection of points.
@@ -294,9 +278,11 @@ class Points:
     0  1.0  2.0
     1  3.0  4.0
 
+    [count=2, crs='None']
+
     set union of two Points:
 
-    >>> pts + Point(1,5)
+    >>> pts + Points([1,5])
     Points:
         x    y
     0  1.0  2.0
@@ -304,17 +290,19 @@ class Points:
     2  3.0  4.0
     3  1.0  5.0
 
+    [count=4, crs='None']
+
     in operator:
 
     >>> pts[1] in pts
     True
 
-    >>> Point(1, 5) in pts
+    >>> Points([1, 5]) in pts
     False
 
     convert to numpy array using ``np.array``:
 
-    >>> np.array(pts,dtype=np.int16)
+    >>> np.array(pts, dtype=np.int16)
     array([[1, 2],
             [2, 3],
             [3, 4]], dtype=int16)
@@ -349,7 +337,7 @@ class Points:
 
     def __init__(
         self,
-        points: Sequence[Union[Point, Sequence[float]]],
+        points: Sequence[Union[float, Sequence[float]]],
         crs: Optional[Union[CRS, str]] = None,
         dtype: np.dtype = np.float32,
     ) -> None:
@@ -357,10 +345,11 @@ class Points:
 
         Parameters
         ----------
-        points : Sequence[Union[Point, Sequence[float]]]
-            The points to be sampled. The shape of the points should be (n, 2)
+        points : Sequence[Union[float, Sequence[float]]]
+            The points to be sampled. The shape of the points can be (2) or (n, 2)
             where n is the number of points. The first column is the x coordinate
-            and the second column is the y coordinate.
+            and the second column is the y coordinate. if the shape is (2), the
+            points will be reshaped to (1, 2).
         crs: Optional[Union[CRS, str]], optional, default: None
             The coordinate reference system of the points. Can be any object
             that can be passed to :func:`rasterio.crs.CRS.from_user_input`.
@@ -374,6 +363,8 @@ class Points:
         """
         self._values = np.asarray(points, dtype=dtype)
         self._crs = crs
+        if self._values.ndim == 1:
+            self._values = self._values.reshape(1, -1)
         if self._values.ndim != 2 or self._values.shape[1] != 2:
             raise ValueError(
                 f"points must be a 2D array with 2 columns. Got {self._values}"
@@ -385,44 +376,47 @@ class Points:
     def __iter__(self) -> Iterator:
         yield from self._values
 
-    def __getitem__(self, key: int) -> Point:
-        return Point(self._values[key, 0], self._values[key, 1])
+    def __getitem__(self, key: int) -> 'Points':
+        return Points(self._values[key, :], crs=self.crs)
 
-    def __contains__(self, item: Union[Point, Sequence[float]]) -> bool:
-        if isinstance(item, Point):
+    def __contains__(self, item: Union['Points', Sequence[float]]) -> bool:
+        if isinstance(item, Points):
             item = item.values
-        if isinstance(item, SequenceABC):
+        elif isinstance(item, SequenceABC):
             item = np.array(item, dtype=np.float64)
         else:
-            raise TypeError(f"item must be an Point or Sequence. Got {type(item)}")
-        if item.ndim != 1 or item.shape[0] != 2:
+            raise TypeError(f"item must be an Points or Sequence. Got {type(item)}")
+        if item.ndim > 2 or item.shape[1] != 2:
             raise ValueError(
-                f"item must be a 1D array with 2 elements. Got {item.tolist()}"
+                f"item must be a 2D array with shape (n, 2). Got {item.shape()}"
             )
 
         return np.any(np.all(self._values == item, axis=1))
 
     def __str__(self) -> str:
         return f"Points(count={len(self)}, crs='{self.crs}')"
-    
+
     def __repr__(self) -> str:
-        return self.__str__()
+        prefix = "Points:\n"
+        middle = self.to_DataFrame().to_string(max_rows=10)
+        suffix = f"\n\n[count={len(self)}, crs='{self.crs}']"
+        
+        return f"{prefix}{middle}{suffix}"
 
     def __array__(self, dtype=None) -> np.ndarray:
         if dtype is not None:
             return self._values.astype(dtype)
         return self._values
 
-    def __add__(self, other: Union["Points", Point]) -> "Points":
-        if not isinstance(other, (Points, Point)):
+    def __add__(self, other: "Points") -> "Points":
+        if not isinstance(other, Points):
             raise TypeError(f"other must be an instance of Points. Got {type(other)}")
         return Points(np.vstack([self.values, other.values]))
 
-    def __sub__(self, other: Union["Points", Point]) -> Optional["Points"]:
-        if not isinstance(other, (Points, Point)):
+    def __sub__(self, other: "Points") -> Optional["Points"]:
+        if not isinstance(other, Points):
             raise TypeError(f"other must be an instance of Points. Got {type(other)}")
-        if isinstance(other, Point):
-            other = Points([other.values])
+
         mask = ~np.all(self._values == other._values, axis=1)
         values = self._values[mask]
         if len(values) == 0:
@@ -705,14 +699,14 @@ class GeoQuery:
     """
 
     _bbox: Union[BoundingBox, list[BoundingBox]]
-    _points: Optional[Union[Points, Point]]
+    _points: Optional[Points]
 
     __slots__ = ["_bbox", "_points"]
 
     def __init__(
         self,
         bbox: Optional[Union[BoundingBox, list[BoundingBox]]] = None,
-        points: Optional[Union[Points, Point]] = None,
+        points: Optional[Points] = None,
     ) -> None:
         """Initialize a sampler.
 
@@ -721,7 +715,7 @@ class GeoQuery:
         bbox : Optional[Union[BoundingBox, list[BoundingBox]]], optional, default: None
             The :class:`BoundingBox` or a list of :class:`BoundingBox`. for querying
             the samples.If None, the samples will be queried from the points.
-        points : Optional[Union[Points, Point]], optional, default: None
+        points : Optional[Points], optional, default: None
             The :class:`Points` for querying the samples. If None, the samples
             will be queried from the bbox.
 
@@ -745,10 +739,6 @@ class GeoQuery:
                     raise TypeError(
                         f"bbox must be a BoundingBox or a list of BoundingBox. Got {type(bbox)}"
                     )
-
-        if points is not None:
-            if isinstance(points, Point):
-                points = Points([points])
 
         self._bbox = bbox
         self._points = points
