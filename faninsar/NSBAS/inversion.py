@@ -6,7 +6,7 @@ import torch
 from faninsar._core.device import parse_device
 from faninsar._core.pair_tools import Pairs
 from faninsar.NSBAS.tsmodels import TimeSeriesModels
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 
 class NSBASMatrixFactory:

@@ -29,7 +29,7 @@ from rasterio.warp import calculate_default_transform
 from rasterio.warp import transform as warp_transform
 from rtree.index import Index, Property
 from shapely import ops
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from faninsar._core import geo_tools
 from faninsar._core.geo_tools import Profile

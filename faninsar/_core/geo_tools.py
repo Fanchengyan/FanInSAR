@@ -11,7 +11,7 @@ from rasterio.crs import CRS
 from rasterio.io import MemoryFile
 from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 
 class GeoDataFormatConverter:
