@@ -787,19 +787,11 @@ class Loops:
                 return None
         elif isinstance(index, Iterable):
             index = np.array(index)
-            if not index.ndim == 1:
-                raise IndexError(
-                    f"Index should be 1D array, but got {index.ndim}D array."
-                )
-            if len(index) > self._length:
-                raise IndexError(
-                    f"Index length should be less than pairs length {self._length},"
-                    f" but got {len(index)}."
-                )
             return Loops(self._values[index])
         else:
             raise TypeError(
-                f"Index should be int, slice, datetime, str, or 1D bool array, but got {type(index)}."
+                f"Index should be int, slice, datetime, str, or bool or int array"
+                f"indexing, but got {type(index)}."
             )
 
     def __hash__(self) -> int:
