@@ -1,14 +1,11 @@
-import pprint
 from collections.abc import Iterator
 from collections.abc import Sequence as SequenceABC
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union, overload
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-import rasterio
 from rasterio.crs import CRS
 from rasterio.warp import transform as warp_transform
 from rasterio.warp import transform_bounds
