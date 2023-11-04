@@ -1,1 +1,1 @@
-from .query import BoundingBox, GeoQuery, Point, Points
+from .query import BoundingBox, GeoQuery, Points
