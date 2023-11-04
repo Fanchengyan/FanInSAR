@@ -301,16 +301,11 @@ class Pairs:
                 return None
         elif isinstance(index, Iterable):
             index = np.array(index)
-            if len(index) > self._length:
-                raise IndexError(
-                    f"Index length should be less than pairs length {self._length},"
-                    f" but got {len(index)}."
-                )
             return Pairs(self._values[index])
-
         else:
             raise TypeError(
-                f"Index should be int, slice, datetime, str, or 1D bool array, but got {type(index)}."
+                "Index should be int, slice, datetime, str, or bool or int array"
+                f" indexing, but got {type(index)}."
             )
 
     def __hash__(self) -> int:
