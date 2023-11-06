@@ -274,7 +274,6 @@ class Points:
         x    y
     0  1.0  2.0
     1  3.0  4.0
-
     [count=2, crs='None']
 
     set union of two Points:
@@ -286,7 +285,6 @@ class Points:
     1  2.0  3.0
     2  3.0  4.0
     3  1.0  5.0
-
     [count=4, crs='None']
 
     in operator:
@@ -396,7 +394,7 @@ class Points:
     def __repr__(self) -> str:
         prefix = "Points:\n"
         middle = self.to_DataFrame().to_string(max_rows=10)
-        suffix = f"\n\n[count={len(self)}, crs='{self.crs}']"
+        suffix = f"\n[count={len(self)}, crs='{self.crs}']"
         
         return f"{prefix}{middle}{suffix}"
 
