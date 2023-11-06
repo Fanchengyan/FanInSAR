@@ -3,10 +3,11 @@ from typing import Iterable, Optional, Tuple, Union
 import numpy as np
 import psutil
 import torch
+from tqdm.auto import tqdm
+
 from faninsar._core.device import parse_device
 from faninsar._core.pair_tools import Pairs
 from faninsar.NSBAS.tsmodels import TimeSeriesModels
-from tqdm.auto import tqdm
 
 
 class NSBASMatrixFactory:
@@ -18,9 +19,10 @@ class NSBASMatrixFactory:
 
     .. note::
 
-        After initialization, the ``model`` and ``gamma`` can still be updated
-        by setting the corresponding attributes. The ``G`` and ``d`` will be
-        updated automatically.
+        After initialization, the ``d`` can still be updated by assigning a new
+        unwrapped interferograms matrix to ``d``. This is useful when the
+        unwrapped interferograms is divided into multiple patches and the NSBAS
+        matrix is calculated for each patch separately.
 
     Examples
     --------
@@ -43,17 +45,28 @@ class NSBASMatrixFactory:
     >>> model = fis.AnnualSinusoidalModel(pairs.dates)
     >>> nsbas_matrix = fis.NSBASMatrixFactory(unw, pairs, model)
     >>> nsbas_matrix
-    ... NSBASMatrixFactory(
-          pairs: Pairs(10)
-          model: AnnualSinusoidalModel(dates: 6, unit: day)
-          gamma: 0.0001
-          G shape: (16, 9)
-          d shape: (16, 5)
-        )
+    NSBASMatrixFactory(
+        pairs: Pairs(10)
+        model: AnnualSinusoidalModel(dates: 6, unit: day)
+        gamma: 0.0001
+        G shape: (16, 9)
+        d shape: (16, 5)
+    )
+
+    reset ``d`` by assigning a new unwrapped interferograms matrix with same pairs
+
+    >>> nsbas_matrix.d = np.random.randint(0, 255, (len(pairs), 10))
+    NSBASMatrixFactory(
+        pairs: Pairs(10)
+        model: AnnualSinusoidalModel(dates: 6, unit: day)
+        gamma: 0.0001
+        G shape: (16, 9)
+        d shape: (16, 10)
+    )
     """
 
     _pairs: Pairs
-    _model: TimeSeriesModels
+    _model: Optional[TimeSeriesModels]
     _gamma: float
     _G: np.ndarray
     _d: np.ndarray
@@ -64,7 +77,7 @@ class NSBASMatrixFactory:
         self,
         unw: np.ndarray,
         pairs: Union[Pairs, Iterable[str]],
-        model: TimeSeriesModels,
+        model: Optional[TimeSeriesModels] = None,
         gamma: float = 0.0001,
     ):
         """Initialize NSBASMatrixFactory
@@ -75,10 +88,12 @@ class NSBASMatrixFactory:
             Unwrapped interferograms matrix
         pairs : Union[Pairs, Iterable[str]]
             Pairs or iterable of pair names
-        model : TimeSeriesModels
-            Time series model
+        model : Optional[TimeSeriesModels], optional
+            Time series model. If None, generate SBAS matrix rather than NSBAS
+            matrix, by default None.
         gamma : float, optional
-            weight for the model component, by default 0.0001
+            weight for the model component, by default 0.0001. This parameter
+            will be ignored if model is None.
         """
         if isinstance(pairs, Pairs):
             self._pairs = pairs
@@ -90,9 +105,15 @@ class NSBASMatrixFactory:
         self._model = None
         self._gamma = None
 
+        if model is not None:
+            self._check_model(model)
+            self._check_gamma(gamma)
+            self._model = model
+            self._gamma = gamma
+            self.G = self._make_nsbas_matrix(model.G_br, gamma)
+        else:
+            self.G = self._make_sbas_matrix()
         self.d = unw
-        self.gamma = gamma
-        self.model = model
 
     def __str__(self):
         return f"{self.__class__.__name__}(pairs: {self.pairs}, model: {self.model}, gamma: {self.gamma})"
@@ -100,11 +121,11 @@ class NSBASMatrixFactory:
     def __repr__(self):
         _str = (
             f"{self.__class__.__name__}(\n"
-            f"  pairs: {self.pairs}\n"
-            f"  model: {str(self.model)}\n"
-            f"  gamma: {self.gamma}\n"
-            f"  G shape: {self.G.shape}\n"
-            f"  d shape: {self.d.shape}\n"
+            f"    pairs: {self.pairs}\n"
+            f"    model: {str(self.model)}\n"
+            f"    gamma: {self.gamma}\n"
+            f"    G shape: {self.G.shape}\n"
+            f"    d shape: {self.d.shape}\n"
             ")"
         )
         return _str
@@ -119,39 +140,26 @@ class NSBASMatrixFactory:
         """Return model"""
         return self._model
 
-    @model.setter
-    def model(self, model):
-        """Update model and G by input model"""
+    def _check_model(self, model):
+        """Check model"""
         if not isinstance(model, TimeSeriesModels):
             raise TypeError("model must be a TimeSeriesModels instance")
-        if self._model == model:
-            return
-
-        self._model = model
-        self.G = self._make_nsbas_matrix(model.G_br, self.gamma)
 
     @property
     def gamma(self):
         """Return gamma"""
         return self._gamma
 
-    @gamma.setter
-    def gamma(self, gamma):
+    def _check_gamma(self, gamma):
         """Update gamma and G by input gamma"""
         if not isinstance(gamma, (float, int)):
             raise TypeError("gamma must be either float or int")
-        if hasattr(self, "_gamma") and gamma == self._gamma:
-            return
         if gamma <= 0:
             raise ValueError("gamma must be positive")
 
-        self._gamma = gamma
-        if self._model is not None:
-            self.G = self._make_nsbas_matrix(self.model.G_br, gamma)
-
     @property
     def d(self):
-        """Return d for NSBAS: d = Gm"""
+        """Return ``d`` matrix for NSBAS ``d = Gm``"""
         return self._d
 
     @d.setter
@@ -164,11 +172,14 @@ class NSBASMatrixFactory:
         if unw.shape[0] != len(self.pairs):
             raise ValueError("input unw must have the same rows number as pairs number")
 
-        self._d = self._restructure_unw(unw)
+        if self.model is None:
+            self._d = unw
+        else:
+            self._d = self._restructure_unw(unw)
 
     @property
     def G(self):
-        """Return G for NSBAS: d = Gm"""
+        """Return ``G`` matrix for NSBAS ``d = Gm``"""
         return self._G
 
     @G.setter
@@ -176,9 +187,12 @@ class NSBASMatrixFactory:
         """Update G by input G"""
         if not isinstance(G, np.ndarray):
             raise TypeError("G must be a numpy array")
-        if G.shape[0] != (len(self.pairs) + len(self.pairs.dates)):
+        if (self.model is not None) & (
+            G.shape[0] != (len(self.pairs) + len(self.pairs.dates))
+        ):
             raise ValueError(
-                "G must have the same number of rows as (pairs number + dates number)"
+                "G must have the same number of rows as (n_pairs + n_dates)"
+                " if model is not None."
             )
 
         self._G = G
@@ -199,8 +213,12 @@ class NSBASMatrixFactory:
 
         return G
 
+    def _make_sbas_matrix(self):
+        return self.pairs.to_matrix()
+
     def _restructure_unw(self, unw):
-        unw = np.vstack((unw, np.zeros((len(self.pairs.dates), unw.shape[1]))))
+        if self.model is not None:
+            unw = np.vstack((unw, np.zeros((len(self.pairs.dates), unw.shape[1]))))
         return unw
 
 
@@ -261,7 +279,11 @@ class NSBASInversion:
             residual between time-series model and model result
         """
         result = batch_lstsq(
-            self.G, self.d, dtype=self.dtype, device=self.device, desc="  NSBAS inversion"
+            self.G,
+            self.d,
+            dtype=self.dtype,
+            device=self.device,
+            desc="  NSBAS inversion",
         )
         residual = np.dot(self.G, result) - self.d
 
@@ -275,7 +297,7 @@ class NSBASInversion:
 
 
 class PhaseDeformationConverter:
-    """A class to convert between phase and deformation(mm) for SAR interferometry."""
+    """A class to convert between phase and deformation (mm) for SAR interferometry."""
 
     def __init__(self, frequency: float = None, wavelength: float = None) -> None:
         """Initialize the converter. Either wavelength or frequency should be provided.
@@ -311,15 +333,15 @@ class PhaseDeformationConverter:
         return str(self)
 
     def phase2deformation(self, phase: np.ndarray):
-        """Convert phase to deformation(mm)"""
+        """Convert phase to deformation (mm)"""
         return phase * self.coef_rd2mm
 
     def deformation2phase(self, deformation: np.ndarray):
-        """Convert deformation(mm) to phase (radian)"""
+        """Convert deformation (mm) to phase (radian)"""
         return deformation / self.coef_rd2mm
 
     def wrap_phase(self, phase: np.ndarray):
-        """Wrap phase to [0, 2*pi]"""
+        """Wrap phase to [0, 2π]"""
         return np.mod(phase, 2 * np.pi)
 
 
@@ -358,7 +380,7 @@ def _get_patch_col(G, d, mem_size, dtype, safe_factor=2):
         dtype of ndarray
 
     Returns:
-        patchcol : List of the number of rows for each patch.
+        patch_col : List of the number of rows for each patch.
                 ex) [[0, 1234], [1235, 2469],... ]
     """
     m, n = d.shape
@@ -378,16 +400,16 @@ def _get_patch_col(G, d, mem_size, dtype, safe_factor=2):
     )
 
     # accurate value of n_patch
-    rowspacing = int(n / n_patch)
-    n_patch = int(np.ceil(n / rowspacing))
+    row_spacing = int(n / n_patch)
+    n_patch = int(np.ceil(n / row_spacing))
 
-    patchcol = []
+    patch_col = []
     for i in range(n_patch):
-        patchcol.append([i * rowspacing, (i + 1) * rowspacing])
+        patch_col.append([i * row_spacing, (i + 1) * row_spacing])
         if i == n_patch - 1:
-            patchcol[-1][-1] = n
+            patch_col[-1][-1] = n
 
-    return patchcol
+    return patch_col
 
 
 def batch_lstsq(
@@ -398,32 +420,31 @@ def batch_lstsq(
     verbose=True,
     **tqdm_args,
 ):
-    """This function calculates the least-squares solution for a batch of linear equations
-    using the given G matrix and the data in  d , using (optionally) the GPU with
-     device .
+    """This function calculates the least-squares solution for a batch of linear
+    equations using the given G matrix and the data in d.
 
     Parameters
     ----------
-    G : Union[np.ndarray, torch.Tensor], (n_im, n_param) or (n_pt, n_im, n_param)
-        model field matrix. If G is 3D, the first dimension is the G matrix for
-        each pixel.
-    d : Union[np.ndarray, torch.Tensor], (n_im, n_pt) matrix
-        data field matrix.
+    G : Union[np.ndarray, torch.Tensor]
+        model field matrix with shape of (n_im, n_param) or (n_pt, n_im, n_param).
+        If G is 3D, the first dimension is the G matrix for every pixel.
+    d : Union[np.ndarray, torch.Tensor]
+        data field matrix with shape of (n_im, n_pt).
     dtype : torch.dtype, optional
         dtype of torch.tensor used for computation
     device : Optional[Union[str, torch.device]], optional
         device of torch.tensor used for computation. If None, use GPU if
-            available, otherwise use CPU.
+        available, otherwise use CPU.
     verbose : bool, optional
         If True, show progress bar, by default True
     tqdm_args : dict, optional
-        Arguments to be passed to `tqdm.tqdm <https://tqdm.github.io/docs/tqdm/#tqdm-objects>`_
+        Arguments to be passed to `tqdm.tqdm <https://tqdm.github.io/docs/tqdm#tqdm-objects>`_
         Object for progress bar.
 
     Returns
     -------
-    X : torch.Tensor, (r x n) matrix
-        r x n matrix that minimizes norm(M*(GX - d))
+    X : torch.Tensor
+        (n_im x n_pt) matrix that minimizes norm(M*(GX - d))
     """
     tqdm_args.setdefault("desc", "Batch least-squares")
     tqdm_args.setdefault("unit", "Batch")
@@ -433,11 +454,11 @@ def batch_lstsq(
 
     result = torch.full((n_param, n_pt), torch.nan, dtype=dtype)
     mem_size = device_mem_size(device)
-    patchcol = _get_patch_col(G, d, mem_size, dtype)
+    patch_col = _get_patch_col(G, d, mem_size, dtype)
 
     if verbose:
-        patchcol = tqdm(patchcol, **tqdm_args)
-    for col in patchcol:
+        patch_col = tqdm(patch_col, **tqdm_args)
+    for col in patch_col:
         if G.ndim == 2:
             result[:, col[0] : col[1]] = censored_lstsq(
                 G, d[:, col[0] : col[1]], dtype, device
@@ -481,8 +502,8 @@ def censored_lstsq(
 
     Returns
     -------
-    X : torch.Tensor, (n_im x n_pt) matrix
-        n_im x n_pt matrix that minimizes norm(M*(GX - d))
+    X : torch.Tensor
+        (n_im x n_pt) matrix that minimizes norm(M*(GX - d))
     """
     device = parse_device(device)
 
