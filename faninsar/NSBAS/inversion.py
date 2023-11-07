@@ -285,7 +285,7 @@ class NSBASInversion:
             device=self.device,
             desc="  NSBAS inversion",
         )
-        residual = np.dot(self.G, result) - self.d
+        residual = self.d - np.dot(self.G, result)
 
         incs = result[: -self.n_param, :]
         params = result[-self.n_param :, :]
