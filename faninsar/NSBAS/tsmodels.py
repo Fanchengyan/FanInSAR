@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from datetime import datetime
-from typing import Iterable, Literal, Union, list
+from typing import Iterable, Literal, Union
 
 import numpy as np
 import pandas as pd
