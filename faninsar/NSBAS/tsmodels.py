@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 from datetime import datetime
-from typing import Iterable, List, Literal, Optional, Tuple, Union
+from typing import Iterable, Literal, Union, list
 
 import numpy as np
 import pandas as pd
 
 
 class TimeSeriesModels:
-    '''Base class for time series models'''
+    """Base class for time series models"""
 
-    _unit: Literal['year', 'day']
+    _unit: Literal["year", "day"]
     _dates: pd.DatetimeIndex
     _date_spans: np.ndarray
 
     # Following attributes should be set in subclasses
     _G_br: np.ndarray
-    _param_names: List[str]
+    _param_names: list[str]
 
-    __slots__ = ['_unit', '_dates', '_date_spans', '_G_br', '_param_names']
+    __slots__ = ["_unit", "_dates", "_date_spans", "_G_br", "_param_names"]
 
     def __init__(
         self,
         dates: Union[pd.DatetimeIndex, Iterable[datetime]],
-        unit: Literal['year', 'day'] = 'day'
+        unit: Literal["year", "day"] = "day",
     ):
         self._unit = None
         self._dates = None
@@ -32,199 +32,200 @@ class TimeSeriesModels:
         self.dates = dates
 
     def __str__(self) -> str:
-        return f'{self.__class__.__name__}(dates: {len(self.dates)}, unit: {self.unit})'
+        return f"{self.__class__.__name__}(dates: {len(self.dates)}, unit: {self.unit})"
 
     def __repr__(self) -> str:
-        _str = (f'{self.__class__.__name__}(\n'
-                f'  dates: {len(self.dates)}\n'
-                f'  unit: {self.unit}\n'
-                f'  param_names: {self.param_names}\n'
-                f'  G_br shape: {self.G_br.shape})\n'
-                ')')
+        _str = (
+            f"{self.__class__.__name__}(\n"
+            f"    dates: {len(self.dates)}\n"
+            f"    unit: {self.unit}\n"
+            f"    param_names: {self.param_names}\n"
+            f"    G_br shape: {self.G_br.shape})\n"
+            ")"
+        )
         return _str
 
     @property
     def unit(self) -> str:
-        '''Return unit of datetime in time series model'''
+        """Return unit of datetime in time series model"""
         return self._unit
 
     @unit.setter
     def unit(self, unit) -> None:
-        '''Update unit'''
-        if unit not in ['day', 'year']:
-            raise ValueError('unit must be either day or year')
+        """Update unit"""
+        if unit not in ["day", "year"]:
+            raise ValueError("unit must be either day or year")
         if unit != self._unit:
             if self._unit is not None:
-                self._date_spans = self._date_spans * \
-                    (1/365.25 if unit == 'year' else 365.25)
+                self._date_spans = self._date_spans * (
+                    1 / 365.25 if unit == "year" else 365.25
+                )
         self._unit = unit
 
     @property
     def dates(self) -> pd.DatetimeIndex:
-        '''Return dates'''
+        """Return dates"""
         return self._dates
 
     @dates.setter
     def dates(self, dates) -> None:
-        '''Update dates'''
+        """Update dates"""
         if not isinstance(dates, pd.DatetimeIndex):
             try:
                 dates = pd.to_datetime(dates)
             except:
                 raise TypeError(
-                    'dates must be either pd.DatetimeIndex or iterable of datetime')
+                    "dates must be either pd.DatetimeIndex or iterable of datetime"
+                )
         self._dates = dates
-        date_spans = (dates-dates[0]).days.values
-        if self.unit == 'year':
-            date_spans = date_spans/365.25
+        date_spans = (dates - dates[0]).days.values
+        if self.unit == "year":
+            date_spans = date_spans / 365.25
         self._date_spans = date_spans
 
     @property
     def date_spans(self) -> np.ndarray:
-        '''Return date_spans'''
+        """Return date_spans"""
         return self._date_spans
 
     @property
     def G_br(self) -> np.ndarray:
-        '''Return G_br'''
+        """Return G_br"""
         return self._G_br
 
     @property
-    def param_names(self) -> List[str]:
-        '''Return param_names'''
+    def param_names(self) -> list[str]:
+        """Return param_names"""
         return self._param_names
 
 
 class LinearModel(TimeSeriesModels):
-    '''Linear model'''
+    """Linear model"""
 
     def __init__(
         self,
         dates: Union[pd.DatetimeIndex, Iterable[datetime]],
-        unit: Literal['year', 'day'] = 'day'
+        unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
 
-        self._G_br = np.array(
-            [self.date_spans,
-             np.ones_like(self.date_spans)]
-        ).T
-        self._param_names = ['velocity', 'constant']
+        self._G_br = np.array([self.date_spans, np.ones_like(self.date_spans)]).T
+        self._param_names = ["velocity", "constant"]
 
 
 class QuadraticModel(TimeSeriesModels):
-    '''Quadratic model'''
+    """Quadratic model"""
 
     def __init__(
         self,
         dates: Union[pd.DatetimeIndex, Iterable[datetime]],
-        unit: Literal['year', 'day'] = 'day'
+        unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
         self._G_br = np.array(
-            [self.date_spans**2,
-             self.date_spans,
-             np.ones_like(self.date_spans)]
+            [self.date_spans**2, self.date_spans, np.ones_like(self.date_spans)]
         ).T
-        self._param_names = ['1/2_acceleration',
-                             'initial_velocity',
-                             'constant']
+        self._param_names = ["1/2_acceleration", "initial_velocity", "constant"]
 
 
 class CubicModel(TimeSeriesModels):
-    '''Cubic model'''
+    """Cubic model"""
 
     def __init__(
         self,
         dates: Union[pd.DatetimeIndex, Iterable[datetime]],
-        unit: Literal['year', 'day'] = 'day'
+        unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
         self._G_br = np.array(
-            [self.date_spans**3,
-             self.date_spans**2,
-             self.date_spans,
-             np.ones_like(self.date_spans)]
+            [
+                self.date_spans**3,
+                self.date_spans**2,
+                self.date_spans,
+                np.ones_like(self.date_spans),
+            ]
         ).T
-        self._param_names = ['Rate of Change',
-                             'acceleration',
-                             'velocity',
-                             'constant']
+        self._param_names = ["Rate of Change", "acceleration", "velocity", "constant"]
 
 
 class AnnualSinusoidalModel(TimeSeriesModels):
-    '''A sinusoidal model with annual period'''
+    """A sinusoidal model with annual period"""
 
     def __init__(
         self,
         dates: Union[pd.DatetimeIndex, Iterable[datetime]],
-        unit: Literal['year', 'day'] = 'day'
+        unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
-        if self.unit == 'day':
-            coeff = 2*np.pi/365.25
+        if self.unit == "day":
+            coeff = 2 * np.pi / 365.25
         else:
-            coeff = 2*np.pi
+            coeff = 2 * np.pi
 
         self._G_br = np.array(
-            [np.sin(self.date_spans*coeff),
-             np.cos(self.date_spans*coeff),
-             self.date_spans,
-             np.ones_like(self.date_spans)]
+            [
+                np.sin(self.date_spans * coeff),
+                np.cos(self.date_spans * coeff),
+                self.date_spans,
+                np.ones_like(self.date_spans),
+            ]
         ).T
-        self._param_names = ['sin(T)', 'cos(T)',
-                             'velocity', 'constant']
+        self._param_names = ["sin(T)", "cos(T)", "velocity", "constant"]
 
 
 class AnnualSemiannualSinusoidal(TimeSeriesModels):
-    '''A compose sinusoidal model that contains annual and semi-annual periods'''
+    """A compose sinusoidal model that contains annual and semi-annual periods"""
 
     def __init__(
         self,
         dates: Union[pd.DatetimeIndex, Iterable[datetime]],
-        unit: Literal['year', 'day'] = 'day'
+        unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
 
-        if self.unit == 'day':
-            coeff = 2*np.pi/365.25
+        if self.unit == "day":
+            coeff = 2 * np.pi / 365.25
         else:
-            coeff = 2*np.pi
+            coeff = 2 * np.pi
 
         self._G_br = np.array(
-            [np.sin(self.date_spans*coeff),
-             np.cos(self.date_spans*coeff),
-             np.sin(self.date_spans*coeff*2),
-             np.cos(self.date_spans*coeff*2),
-             self.date_spans,
-             np.ones_like(self.date_spans)]
+            [
+                np.sin(self.date_spans * coeff),
+                np.cos(self.date_spans * coeff),
+                np.sin(self.date_spans * coeff * 2),
+                np.cos(self.date_spans * coeff * 2),
+                self.date_spans,
+                np.ones_like(self.date_spans),
+            ]
         ).T
-        self._param_names = ['sin(T)', 'cos(T)', 'sin(T/2)',
-                             'cos(T/2)', 'velocity', 'constant']
+        self._param_names = [
+            "sin(T)",
+            "cos(T)",
+            "sin(T/2)",
+            "cos(T/2)",
+            "velocity",
+            "constant",
+        ]
 
 
 class FreezeThawCycleModel(TimeSeriesModels):
-    '''A pure Freeze-thaw cycle model without velocity'''
+    """A pure Freeze-thaw cycle model without velocity"""
 
     def __init__(
-            self,
-            t1s,
-            t2s,
-            t3s,
-            years,
-            ftc,
-            dates: Union[pd.DatetimeIndex, Iterable[datetime]],
-            unit: Literal['year', 'day'] = 'day'
-
+        self,
+        t1s,
+        t2s,
+        t3s,
+        years,
+        ftc,
+        dates: Union[pd.DatetimeIndex, Iterable[datetime]],
+        unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
 
-        df_br = pd.DataFrame(np.full(
-            (len(self.dates), 2),
-            np.nan,
-            dtype=np.float32
-        ),
-            index=self.dates)
+        df_br = pd.DataFrame(
+            np.full((len(self.dates), 2), np.nan, dtype=np.float32), index=self.dates
+        )
         bias = np.zeros((1, 2), dtype=np.float32)
 
         for year in years:
@@ -242,10 +243,10 @@ class FreezeThawCycleModel(TimeSeriesModels):
 
             if pd.isna(DDT[0]):
                 DDT[0] = 0
-            DDF[:f'{year}-07-01'] = 0
+            DDF[:f"{year}-07-01"] = 0
 
-            DDT = DDT.fillna(method='ffill')
-            DDF = DDF.fillna(method='ffill')
+            DDT = DDT.fillna(method="ffill")
+            DDF = DDF.fillna(method="ffill")
 
             t3 = t3s[year]
             if not pd.isnull(t3):
@@ -258,10 +259,9 @@ class FreezeThawCycleModel(TimeSeriesModels):
             DDF_A4 = np.sqrt(DDF[imdates].values)
 
             try:
-                df_br[start:end] = np.array(
-                    [DDT_A1, DDF_A4]).T + bias
+                df_br[start:end] = np.array([DDT_A1, DDF_A4]).T + bias
             except:
-                raise ValueError(f'{bias}\n\n{df_br[start:end]}')
+                raise ValueError(f"{bias}\n\n{df_br[start:end]}")
             # df_br[start:end] = np.array(
             #     [DDT_A1, DDF_A4]).T + bias
 
@@ -271,27 +271,27 @@ class FreezeThawCycleModel(TimeSeriesModels):
             bias = bias + np.asarray([[DDT_A1_end, DDF_A4_end]])
 
         self._G_br = df_br.values
-        self._param_names = ['E_t', 'E_f']
+        self._param_names = ["E_t", "E_f"]
 
 
 class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
-    '''A Freeze-thaw cycle model with velocity'''
+    """A Freeze-thaw cycle model with velocity"""
 
     def __init__(
-            self,
-            t1s,
-            t2s,
-            t3s,
-            years,
-            ftc,
-            dates: Union[pd.DatetimeIndex, Iterable[datetime]],
-            unit: Literal['year', 'day'] = 'day'
+        self,
+        t1s,
+        t2s,
+        t3s,
+        years,
+        ftc,
+        dates: Union[pd.DatetimeIndex, Iterable[datetime]],
+        unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
 
         df_br = pd.DataFrame(
-            np.full((len(self.dates), 3), np.nan, dtype=np.float32),
-            index=self.dates)
+            np.full((len(self.dates), 3), np.nan, dtype=np.float32), index=self.dates
+        )
         bias = 0
         for year in years:
             start = ftc.get_year_start(t1s, t2s, year)
@@ -305,10 +305,10 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
 
             if pd.isna(DDT[0]):
                 DDT[0] = 0
-            DDF[:f'{year}-07-01'] = 0
+            DDF[:f"{year}-07-01"] = 0
 
-            DDT = DDT.fillna(method='ffill')
-            DDF = DDF.fillna(method='ffill')
+            DDT = DDT.fillna(method="ffill")
+            DDF = DDF.fillna(method="ffill")
 
             t3 = t3s[year]
             if not pd.isnull(t3):
@@ -320,10 +320,9 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
             DDT_A1 = np.sqrt(DDT[imdates].values)
             DDF_A4 = np.sqrt(DDF[imdates].values)
 
-            df_br[start:end] = np.array(
-                [DDT_A1, DDF_A4, np.full_like(DDF_A4, bias)]).T
+            df_br[start:end] = np.array([DDT_A1, DDF_A4, np.full_like(DDF_A4, bias)]).T
 
             bias = bias + 1
 
         self._G_br = df_br.values
-        self._param_names = ['E_t', 'E_f', 'V']
+        self._param_names = ["E_t", "E_f", "V"]
