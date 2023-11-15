@@ -608,7 +608,7 @@ class RasterDataset(GeoDataset):
 
         if not self._files.valid.all():
             files_invalid = [str(i) for i in self._files.paths[~self._files.valid]]
-            files_invalid_str = "\t"  + "\n\t".join(files_invalid)
+            files_invalid_str = "\t" + "\n\t".join(files_invalid)
             warnings.warn(
                 f"Unable to read {len(files_invalid)} files in "
                 f"{self.__class__.__name__} dataset:\n{files_invalid_str}",
@@ -970,9 +970,9 @@ class InterferogramDataset(RasterDataset):
     .. Note::
         1. Only the pairs that **both unwrapped interferograms and coherence files
         are valid will be used**.
-        
-        2. The unwrapped interferograms are used to initialize this dataset. 
-        The ``coherence``, ``dem``, and ``mask`` files can be accessed as attributes 
+
+        2. The unwrapped interferograms are used to initialize this dataset.
+        The ``coherence``, ``dem``, and ``mask`` files can be accessed as attributes
         :attr:`coh_dataset`, :attr:`dem_dataset`, and :attr:`mask_dataset` respectively.
     """
 
@@ -1221,7 +1221,7 @@ class InterferogramDataset(RasterDataset):
     @property
     def datetime(self) -> pd.DatetimeIndex:
         """Return the datetime for each pair in the dataset."""
-        return self.pairs.to_datetime()
+        return self._datetime
 
     def to_netcdf(
         self,
