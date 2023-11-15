@@ -110,6 +110,7 @@ class HyP3(InterferogramDataset):
 
     def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse the datetime of the interferogram to generate DatetimeIndex object."""
-        pair_names = self.parse_pairs(paths).to_names()
+        names = [f.name for f in paths]
+        pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         date_names = np.unique([i.split("_") for i in pair_names])
         return pd.DatetimeIndex(date_names)
