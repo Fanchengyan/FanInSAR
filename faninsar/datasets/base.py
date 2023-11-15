@@ -587,8 +587,9 @@ class RasterDataset(GeoDataset):
 
                     with WarpedVRT(src, crs=crs) as vrt:
                         coords = tuple(vrt.bounds)
-            except rasterio.errors.RasterioIOError:
+            except Exception as e:
                 # Skip files that rasterio is unable to read
+                warnings.warn(f"Unable to read {file_path}: \n--> : {e}", UserWarning)
                 files_valid.append(False)
                 continue
             else:
@@ -606,10 +607,12 @@ class RasterDataset(GeoDataset):
         self._valid = np.array(files_valid)
 
         if not self._files.valid.all():
-            files_invalid = self._files.paths[~self._files.valid].tolist()
-            print(
-                f"Unable to read {len(files_invalid)} files in {self.__class__.__name__} dataset:"
-                "\n\t" + "\n\t".join(files_invalid),
+            files_invalid = [str(i) for i in self._files.paths[~self._files.valid]]
+            files_invalid_str = "\t"  + "\n\t".join(files_invalid)
+            warnings.warn(
+                f"Unable to read {len(files_invalid)} files in "
+                f"{self.__class__.__name__} dataset:\n{files_invalid_str}",
+                UserWarning,
             )
 
         self.band_indexes = None
@@ -680,7 +683,7 @@ class RasterDataset(GeoDataset):
             )
         elif bbox.crs != self.crs:
             bbox = bbox.to_crs(self.crs)
-            
+
         win = vrt_fh.window(*bbox)
         data = vrt_fh.read(
             out_shape=(
@@ -691,7 +694,7 @@ class RasterDataset(GeoDataset):
             resampling=self.resampling,
             indexes=self.band_indexes,
             window=win,
-            boundless=True,
+            boundless=False,  # TODO: check this
             fill_value=self.nodata,
         )
 
@@ -965,7 +968,12 @@ class InterferogramDataset(RasterDataset):
     A base class for interferogram datasets.
 
     .. Note::
-        The unwrapped interferograms are used to initialize this dataset. The coherence, dem, and mask files can be accessed as attributes ``ds_coh``, ``ds_dem``, and ``ds_mask`` respectively.
+        1. Only the pairs that **both unwrapped interferograms and coherence files
+        are valid will be used**.
+        
+        2. The unwrapped interferograms are used to initialize this dataset. 
+        The ``coherence``, ``dem``, and ``mask`` files can be accessed as attributes 
+        :attr:`coh_dataset`, :attr:`dem_dataset`, and :attr:`mask_dataset` respectively.
     """
 
     #: Glob expression used to search for files.
@@ -977,6 +985,10 @@ class InterferogramDataset(RasterDataset):
     filename_glob_coh = "*"
 
     _pairs: Optional[Pairs] = None
+
+    _ds_coh: RasterDataset
+    _ds_dem: Optional[RasterDataset] = None
+    _ds_mask: Optional[RasterDataset] = None
 
     def __init__(
         self,
@@ -1050,7 +1062,7 @@ class InterferogramDataset(RasterDataset):
                 f"number of coherence files ({len(paths_coh)})"
             )
 
-        # ensure there are no duplicate pairs
+        # Pairs: ensure there are no duplicate pairs
         pairs = self.parse_pairs(paths_unw)
         pairs1, index = pairs.sort(inplace=False)
         if len(index) < len(paths_unw):
@@ -1063,8 +1075,6 @@ class InterferogramDataset(RasterDataset):
             )
             paths_unw = paths_unw[index]
             paths_coh = paths_coh[index]
-
-        self._pairs = pairs1
 
         super().__init__(
             root_dir=root_dir,
@@ -1080,7 +1090,7 @@ class InterferogramDataset(RasterDataset):
             verbose=verbose,
         )
 
-        self.ds_coh = RasterDataset(
+        self._ds_coh = RasterDataset(
             root_dir=root_dir,
             paths=paths_coh,
             crs=self.crs,
@@ -1094,9 +1104,21 @@ class InterferogramDataset(RasterDataset):
             verbose=verbose,
         )
 
-        self.ds_dem = None
+        _valid = self._valid & self._ds_coh.valid
+
+        # remove invalid files for unw and coh
+        self._files = self._files[_valid]
+        self._valid = self._valid[_valid]
+        self._ds_coh._files = self._ds_coh._files[_valid]
+        self._ds_coh._valid = self._ds_coh._valid[_valid]
+
+        # remove invalid pairs
+        self._pairs = pairs1[_valid]
+        # get the datetime from pairs
+        self._datetime = self.parse_datetime(paths_unw[_valid])
+
         if dem_file is not None:
-            self.ds_dem = RasterDataset(
+            self._ds_dem = RasterDataset(
                 paths=[dem_file],
                 crs=self.crs,
                 res=self.res,
@@ -1108,9 +1130,8 @@ class InterferogramDataset(RasterDataset):
                 verbose=verbose,
             )
 
-        self.ds_mask = None
         if mask_file is not None:
-            self.ds_mask = RasterDataset(
+            self._ds_mask = RasterDataset(
                 paths=[mask_file],
                 crs=self.crs,
                 res=self.res,
@@ -1123,12 +1144,17 @@ class InterferogramDataset(RasterDataset):
             )
 
     def parse_pairs(self, paths: list[Path]) -> Pairs:
-        """Used to parse pairs from filenames. Must be implemented in subclass.
+        """Used to parse pairs from filenames. *Must be implemented in subclass*.
 
         Parameters
         ----------
         paths : list of pathlib.Path
             list of file paths to parse pairs
+
+        Returns
+        -------
+        pairs : Pairs object
+            pairs parsed from filenames
 
         Example
         -------
@@ -1157,10 +1183,45 @@ class InterferogramDataset(RasterDataset):
         """
         raise NotImplementedError("parse_pairs must be implemented in subclass")
 
+    def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
+        """Used to parse datetime from filenames. *Must be implemented in subclass*.
+
+        Parameters
+        ----------
+        paths : list of pathlib.Path
+            list of file paths to parse datetime
+
+        Returns
+        -------
+        datetime : pd.DatetimeIndex
+            datetime parsed from filenames
+        """
+        raise NotImplementedError("parse_datetime must be implemented in subclass")
+
     @property
     def pairs(self) -> Pairs:
         """Return Pairs parsed from filenames."""
         return self._pairs
+
+    @property
+    def coh_dataset(self) -> RasterDataset:
+        """Return the coherence dataset."""
+        return self._ds_coh
+
+    @property
+    def dem_dataset(self) -> Optional[RasterDataset]:
+        """Return the DEM dataset. If None, no DEM data is used."""
+        return self._ds_dem
+
+    @property
+    def mask_dataset(self) -> Optional[RasterDataset]:
+        """Return the mask dataset. If None, no Mask data is used."""
+        return self._ds_mask
+
+    @property
+    def datetime(self) -> pd.DatetimeIndex:
+        """Return the datetime for each pair in the dataset."""
+        return self.pairs.to_datetime()
 
     def to_netcdf(
         self,
