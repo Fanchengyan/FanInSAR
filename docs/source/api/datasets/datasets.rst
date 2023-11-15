@@ -12,6 +12,7 @@ The following datasets are available:
    * :class:`.InterferogramDataset` : base Datasets for all Interferogram productions
    * InSAR Datasets from well known productions:
       * :class:`.HyP3`
+      * :class:`.LiCSAR`
 
 
 GeoDataset
@@ -51,4 +52,15 @@ HyP3
    :undoc-members:
    :member-order: bysource
    :show-inheritance:
+
+LiCSAR
+------
+
+.. autoclass:: faninsar.datasets.LiCSAR
+   :members:
+   :undoc-members:
+   :member-order: bysource
+   :show-inheritance:
+
+
    
