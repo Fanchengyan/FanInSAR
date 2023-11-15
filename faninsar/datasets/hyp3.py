@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 
@@ -98,11 +99,17 @@ class HyP3(InterferogramDataset):
             verbose=verbose,
         )
 
-    def parse_pairs(self, file_paths: list[Path]) -> Pairs:
+    def parse_pairs(self, paths: list[Path]) -> Pairs:
         """Parse the primary and secondary date/acquisition of the interferogram
         to generate Pairs object.
         """
-        names = [f.name for f in file_paths]
+        names = [f.name for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         pairs = Pairs.from_names(pair_names)
         return pairs
+
+    def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
+        """Parse the datetime of the interferogram to generate DatetimeIndex object."""
+        pair_names = self.parse_pairs(paths)
+        date_names = np.unique([i.split("_") for i in pair_names])
+        return pd.DatetimeIndex(date_names)
