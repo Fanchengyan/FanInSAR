@@ -397,7 +397,7 @@ class GeoDataset(abc.ABC):
             else:
                 bounds = self.roi
         elif isinstance(bbox, BoundingBox):
-            bounds = bbox
+            bounds = self._check_roi(bbox)
         else:
             raise ValueError(
                 "bbox must be one of ['bounds', 'roi'] or a "
@@ -826,6 +826,7 @@ class RasterDataset(GeoDataset):
         self,
         xy: Iterable,
         crs: Optional[Union[CRS, str]] = None,
+        bbox: Union[BoundingBox, Literal["roi", "bounds"]] = "roi",
     ) -> np.ndarray:
         """Convert x, y coordinates to row, col in the dataset.
 
@@ -836,6 +837,9 @@ class RasterDataset(GeoDataset):
         crs: CRS or str, optional
             The CRS of the points. If None, the CRS of the dataset will be used.
             allowed CRS formats are the same as those supported by rasterio.
+        bbox : str, one of ['bounds', 'roi'], optional
+            the bounding box used to calculate the ``width``, ``height``
+            and ``transform`` of the dataset for the profile. Default is 'roi'.
 
         Returns
         -------
@@ -855,7 +859,7 @@ class RasterDataset(GeoDataset):
                 xs, ys = warp_transform(crs, self.crs, xy[:, 0], xy[:, 1])
                 xy = np.column_stack((xs, ys))
 
-        profile = self.get_profile("bounds")
+        profile = self.get_profile(bbox)
 
         rows, cols = rowcol(profile["transform"], xy[:, 0], xy[:, 1])
         row_col = np.column_stack((rows, cols))
@@ -865,6 +869,7 @@ class RasterDataset(GeoDataset):
         self,
         row_col: Iterable,
         crs: Optional[Union[CRS, str]] = None,
+        bbox: Union[BoundingBox, Literal["roi", "bounds"]] = "roi",
     ) -> np.ndarray:
         """Convert row, col in the dataset to x, y coordinates.
 
@@ -875,7 +880,10 @@ class RasterDataset(GeoDataset):
         crs: CRS or str, optional
             The CRS of the points. If None, the CRS of the dataset will be used.
             allowed CRS formats are the same as those supported by rasterio.
-
+        bbox : str, one of ['bounds', 'roi'], optional
+            the bounding box used to calculate the ``width``, ``height``
+            and ``transform`` of the dataset for the profile. Default is 'roi'.
+            
         Returns
         -------
         xy: np.ndarray
@@ -889,7 +897,7 @@ class RasterDataset(GeoDataset):
                 f"Expected row_col to be an array of shape (n, 2), got {row_col.shape}"
             )
 
-        profile = self.get_profile("bounds")
+        profile = self.get_profile(bbox)
 
         xs, ys = xy(profile["transform"], row_col[:, 0], row_col[:, 1])
 
