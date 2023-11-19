@@ -1,3 +1,4 @@
+import warnings
 from collections.abc import Iterator
 from collections.abc import Sequence as SequenceABC
 from pathlib import Path
@@ -127,11 +128,13 @@ class BoundingBox:
         Returns:
             the minimum bounding box that contains both self and other
         """
+        other, crs_new = self._ensure_points_crs(other)
         return BoundingBox(
             min(self.left, other.left),
             max(self.right, other.right),
             min(self.bottom, other.bottom),
             max(self.top, other.top),
+            crs=crs_new,
         )
 
     def __and__(self, other: "BoundingBox") -> "BoundingBox":
@@ -147,14 +150,32 @@ class BoundingBox:
             ValueError: if self and other do not intersect
         """
         try:
+            other, crs_new = self._ensure_points_crs(other)
             return BoundingBox(
                 max(self.left, other.left),
                 min(self.right, other.right),
                 max(self.bottom, other.bottom),
                 min(self.top, other.top),
+                crs=crs_new,
             )
         except ValueError:
             raise ValueError(f"Bounding boxes {self} and {other} do not overlap")
+
+    def _ensure_points_crs(self, other: "BoundingBox"):
+        """Ensure the coordinate reference system of the bbox are the same."""
+        if self.crs != other.crs:
+            if self.crs is None or other.crs is None:
+                crs_new = self.crs or other.crs
+                warnings.warn(
+                    "Cannot find the coordinate reference system of the bbox. "
+                    "The crs of two bbox will assume to be the same. "
+                )
+            else:
+                other = other.to_crs(self.crs)
+                crs_new = self.crs
+        else:
+            crs_new = self.crs
+        return other, crs_new
 
     @property
     def area(self) -> float:
@@ -258,6 +279,7 @@ class BoundingBox:
             bbox2 = BoundingBox(self.left, self.right, splity, self.top)
 
         return bbox1, bbox2
+
 
 class Points:
     """A class to represent a collection of points.
@@ -371,10 +393,10 @@ class Points:
     def __iter__(self) -> Iterator:
         yield from self._values
 
-    def __getitem__(self, key: int) -> 'Points':
+    def __getitem__(self, key: int) -> "Points":
         return Points(self._values[key, :], crs=self.crs)
 
-    def __contains__(self, item: Union['Points', Sequence[float]]) -> bool:
+    def __contains__(self, item: Union["Points", Sequence[float]]) -> bool:
         if isinstance(item, Points):
             item = item.values
         elif isinstance(item, SequenceABC):
@@ -395,7 +417,7 @@ class Points:
         prefix = "Points:\n"
         middle = self.to_DataFrame().to_string(max_rows=10)
         suffix = f"\n[count={len(self)}, crs='{self.crs}']"
-        
+
         return f"{prefix}{middle}{suffix}"
 
     def __array__(self, dtype=None) -> np.ndarray:
@@ -406,17 +428,37 @@ class Points:
     def __add__(self, other: "Points") -> "Points":
         if not isinstance(other, Points):
             raise TypeError(f"other must be an instance of Points. Got {type(other)}")
-        return Points(np.vstack([self.values, other.values]))
+
+        other, crs_new = self._ensure_points_crs(other)
+        return Points(np.vstack([self.values, other.values]), crs=crs_new)
 
     def __sub__(self, other: "Points") -> Optional["Points"]:
         if not isinstance(other, Points):
             raise TypeError(f"other must be an instance of Points. Got {type(other)}")
 
+        other, crs_new = self._ensure_points_crs(other)
+
         mask = ~np.all(self._values == other._values, axis=1)
         values = self._values[mask]
         if len(values) == 0:
             return None
-        return Points(values)
+        return Points(values, crs=crs_new)
+
+    def _ensure_points_crs(self, other: "Points"):
+        """Ensure the coordinate reference system of the points are the same."""
+        if self.crs != other.crs:
+            if self.crs is None or other.crs is None:
+                crs_new = self.crs or other.crs
+                warnings.warn(
+                    "Cannot find the coordinate reference system of the points. "
+                    "The crs of two points will assume to be the same. "
+                )
+            else:
+                other = other.to_crs(self.crs)
+                crs_new = self.crs
+        else:
+            crs_new = self.crs
+        return other, crs_new
 
     @staticmethod
     def _find_field(gdf: gpd.GeoDataFrame, field_names: list[str]) -> Optional[str]:
