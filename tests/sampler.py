@@ -1,8 +1,10 @@
 from pathlib import Path
 
-from faninsar import samplers
-from faninsar.datasets import RasterDataset,BoundingBox,Points
 from tqdm import tqdm
+
+from faninsar import samplers
+from faninsar.datasets import RasterDataset
+from faninsar.query import BoundingBox, Points
 
 home_dir = Path("/home/fancy/work/data/test")
 files = list(home_dir.rglob("*unw_phase_clip.tif"))
