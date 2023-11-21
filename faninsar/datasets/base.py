@@ -2,21 +2,18 @@
 
 import abc
 import functools
-import glob
-import os
 import re
 import warnings
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional, Union, overload
+from typing import Any, Literal, Optional, Sequence, Union, overload
 
 import numpy as np
 import pandas as pd
 import pyproj
 import rasterio
 import rasterio.merge
-import rioxarray
 import shapely
 import xarray as xr
 from rasterio.coords import BoundingBox as BBox
@@ -36,7 +33,7 @@ from faninsar._core.geo_tools import Profile
 from faninsar._core.pair_tools import Pairs
 from faninsar.query.query import BoundingBox, GeoQuery, Points
 
-__all__ = ("GeoDataset", "RasterDataset")
+__all__ = ("GeoDataset", "RasterDataset", "InterferogramDataset", "ApsDataset")
 
 
 class GeoDataset(abc.ABC):
@@ -508,6 +505,7 @@ class RasterDataset(GeoDataset):
         cache: bool = True,
         resampling=Resampling.nearest,
         verbose: bool = True,
+        ds_name: str = "",
     ) -> None:
         """Initialize a new Dataset instance.
 
@@ -540,28 +538,32 @@ class RasterDataset(GeoDataset):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
-        verbose : bool, optional, default: True
-            if True, print verbose output
+        verbose : bool, optional
+            if True, print verbose output, default: True
+        ds_name : str, optional
+            name of the dataset. used for printing verbose output, default: ""
 
         Raises
         ------
             FileNotFoundError: if no files are found in ``root_dir``
         """
         super().__init__()
-        self.root_dir = root_dir
+        self.root_dir = Path(root_dir)
         self.bands = bands or self.all_bands
         self.cache = cache
         self.resampling = resampling
         self.verbose = verbose
+        self.ds_name = ds_name
 
         if paths is None:
             paths = []
-            pathname = os.path.join(root_dir, "**", self.filename_glob)
             filename_regex = re.compile(self.filename_regex, re.VERBOSE)
-            for file_path in glob.iglob(pathname, recursive=True):
-                match = re.match(filename_regex, os.path.basename(file_path))
+            for file_path in self.root_dir.rglob(self.filename_glob):
+                match = re.match(filename_regex, file_path.name)
                 if match is not None:
                     paths.append(file_path)
+        else:
+            paths = [Path(path) for path in np.sort(paths)]
 
         # Populate the dataset index
         count = 0
@@ -653,8 +655,9 @@ class RasterDataset(GeoDataset):
             * ``query``: a GeoQuery object, the query used to index the dataset
             * ``bbox``: a numpy array of shape (n_bbox, n_file, height, width)
                 containing the values of the bounding boxes in the query.
-            * ``points``: a numpy array of shape (n_file, n_point) containing the
-                values of the points in the query.
+            * ``points``: a masked numpy array of shape (n_file, n_point)
+                containing the values of the points in the query. The points that
+                outside the dataset will be masked.
 
             .. Note::
 
@@ -676,13 +679,7 @@ class RasterDataset(GeoDataset):
 
     def _bbox_query(self, bbox: BoundingBox, vrt_fh) -> np.ndarray:
         """Return the index of files that intersect with the given bounding box."""
-        if bbox.crs is None:
-            warnings.warn(
-                "No CRS is specified for the bounding box, assuming it is in the"
-                " same CRS as the dataset."
-            )
-        elif bbox.crs != self.crs:
-            bbox = bbox.to_crs(self.crs)
+        bbox = self._ensure_query_crs(bbox)
 
         win = vrt_fh.window(*bbox)
         data = vrt_fh.read(
@@ -701,20 +698,50 @@ class RasterDataset(GeoDataset):
         return data
 
     def _points_query(self, points: Points, vrt_fh) -> np.ndarray:
-        """Return the index of files that intersect with the given points."""
-        crs_points = points.crs
-        xy = points.values
-        if crs_points is None:
+        """Return the index of files that intersect with the given points. Points that outside the dataset will be masked."""
+        points = self._ensure_query_crs(points)
+        data = np.ma.hstack(list(vrt_fh.sample(points.values, masked=True)))
+
+        return data
+
+    @overload
+    def _ensure_query_crs(self, query: BoundingBox) -> BoundingBox:
+        ...
+
+    @overload
+    def _ensure_query_crs(self, query: Points) -> Points:
+        ...
+
+    def _ensure_query_crs(
+        self, query: Union[BoundingBox, Points]
+    ) -> Union[BoundingBox, Points]:
+        """Ensure that the query has the same CRS as the dataset."""
+        if query.crs is None:
             warnings.warn(
-                "No CRS is specified for the points, assuming they are in the"
-                " same CRS as the dataset."
+                f"No CRS is specified for the {query}, assuming they are in the"
+                f" same CRS as the dataset ({self.crs})."
             )
         else:
-            if crs_points != self.crs:
-                xs, ys = warp_transform(crs_points, self.crs, xy[:, 0], xy[:, 1])
-                xy = np.column_stack((xs, ys))
-        data = list(vrt_fh.sample(xy))
-        return data
+            if query.crs != self.crs:
+                query = query.to_crs(self.crs)
+        return query
+
+    def _ensure_loading_verbose(self, sequence: Sequence) -> Sequence:
+        if self.verbose:
+            sequence = tqdm(
+                sequence, desc=f"Loading {self.ds_name} Files", unit=" files"
+            )
+        return sequence
+
+    def _ensure_saving_verbose(
+        self,
+        sequence: Sequence,
+        ds_name: str,
+        unit: str = " files",
+    ) -> Sequence:
+        if self.verbose:
+            sequence = tqdm(sequence, desc=f"Saving {ds_name} Files", unit=unit)
+        return sequence
 
     def _sample_files(
         self, paths: Sequence[str], query: GeoQuery
@@ -749,8 +776,7 @@ class RasterDataset(GeoDataset):
         else:
             vrt_fhs = [self._load_warp_file(fp) for fp in paths]
 
-        if self.verbose:
-            vrt_fhs = tqdm(vrt_fhs, desc="Loading files", unit=" files")
+        vrt_fhs = self._ensure_loading_verbose(vrt_fhs)
 
         files_bbox_list = []
         files_points_list = []
@@ -883,7 +909,7 @@ class RasterDataset(GeoDataset):
         bbox : str, one of ['bounds', 'roi'], optional
             the bounding box used to calculate the ``width``, ``height``
             and ``transform`` of the dataset for the profile. Default is 'roi'.
-            
+
         Returns
         -------
         xy: np.ndarray
@@ -930,8 +956,8 @@ class RasterDataset(GeoDataset):
 
         for f in self.files.paths[self.valid]:
             out_file = Path(out_dir) / f.name
-            with rasterio.open(f) as src:
-                dest_arr = self._bbox_query(roi, src).squeeze(0)
+            src = self._load_warp_file(f)
+            dest_arr = self._bbox_query(roi, src).squeeze(0)
             with rasterio.open(out_file, "w", **profile.profile) as dst:
                 dst.write(dest_arr, 1)
 
@@ -997,12 +1023,15 @@ class InterferogramDataset(RasterDataset):
     _ds_coh: RasterDataset
     _ds_dem: Optional[RasterDataset] = None
     _ds_mask: Optional[RasterDataset] = None
+    _ds_aps: Optional[RasterDataset] = None
 
     def __init__(
         self,
         root_dir: str = "data",
-        paths_unw: Optional[Sequence[str]] = None,
-        paths_coh: Optional[Sequence[str]] = None,
+        paths_unw: Optional[Sequence[Union[str, Path]]] = None,
+        paths_coh: Optional[Sequence[Union[str, Path]]] = None,
+        paths_aps: Optional[Sequence[Union[str, Path]]] = None,
+        los_file: Optional[Union[str, Path]] = None,
         dem_file: Optional[Union[str, Path]] = None,
         mask_file: Optional[Union[str, Path]] = None,
         crs: Optional[CRS] = None,
@@ -1027,6 +1056,16 @@ class InterferogramDataset(RasterDataset):
         paths_coh: list of str, optional
             list of coherence file paths to use instead of searching for files in
             ``root_dir``. If None, files will be searched for in ``root_dir``.
+        paths_aps: list of str, optional
+            list of paths of aps (Atmospheric Phase Screen) files corresponding to
+            acquisition dates of the interferograms. If None, no atmospheric phase
+            screen correction will be applied.
+        los_file : str or Path, optional
+            path to the los file. los file could be incidence angle (relative to
+            vertical) or look angle (relative to horizontal). This file is used
+            to convert differential atmospheric phase from vertical to line-of-sight
+            (LOS) direction or convert differential interferometric phase from
+            line-of-sight (LOS) to vertical direction.
         dem_file: str or Path, optional
             path to the DEM file. If None, no DEM data will be used.
         mask_file: str or Path, optional
@@ -1096,6 +1135,7 @@ class InterferogramDataset(RasterDataset):
             cache=cache,
             resampling=resampling,
             verbose=verbose,
+            ds_name="Interferogram",
         )
 
         self._ds_coh = RasterDataset(
@@ -1110,6 +1150,7 @@ class InterferogramDataset(RasterDataset):
             cache=cache,
             resampling=resampling,
             verbose=verbose,
+            ds_name="Coherence",
         )
 
         _valid = self._valid & self._ds_coh.valid
@@ -1125,6 +1166,34 @@ class InterferogramDataset(RasterDataset):
         # get the datetime from pairs
         self._datetime = self.parse_datetime(paths_unw[_valid])
 
+        if paths_aps is not None:
+            self._ds_aps = RasterDataset(
+                paths=paths_aps,
+                crs=self.crs,
+                res=self.res,
+                dtype=self.dtype,
+                nodata=self.nodata,
+                roi=self.roi,
+                cache=cache,
+                resampling=resampling,
+                verbose=verbose,
+                ds_name="APS",
+            )
+
+        if los_file is not None:
+            self._ds_los = RasterDataset(
+                paths=[los_file],
+                crs=self.crs,
+                res=self.res,
+                dtype=self.dtype,
+                nodata=self.nodata,
+                roi=self.roi,
+                cache=cache,
+                resampling=resampling,
+                verbose=verbose,
+                ds_name="LOS",
+            )
+
         if dem_file is not None:
             self._ds_dem = RasterDataset(
                 paths=[dem_file],
@@ -1136,6 +1205,7 @@ class InterferogramDataset(RasterDataset):
                 cache=cache,
                 resampling=resampling,
                 verbose=verbose,
+                ds_name="DEM",
             )
 
         if mask_file is not None:
@@ -1149,6 +1219,7 @@ class InterferogramDataset(RasterDataset):
                 cache=cache,
                 resampling=resampling,
                 verbose=verbose,
+                ds_name="Mask",
             )
 
     def parse_pairs(self, paths: list[Path]) -> Pairs:
@@ -1217,6 +1288,16 @@ class InterferogramDataset(RasterDataset):
         return self._ds_coh
 
     @property
+    def aps_dataset(self) -> Optional[RasterDataset]:
+        """Return the aps (Atmospheric Phase Screen) dataset. If None, no aps data is used."""
+        return self._ds_aps
+
+    @property
+    def los_dataset(self) -> Optional[RasterDataset]:
+        """Return the theta dataset. If None, no theta data is used."""
+        return self._ds_los
+
+    @property
     def dem_dataset(self) -> Optional[RasterDataset]:
         """Return the DEM dataset. If None, no DEM data is used."""
         return self._ds_dem
@@ -1230,6 +1311,37 @@ class InterferogramDataset(RasterDataset):
     def datetime(self) -> pd.DatetimeIndex:
         """Return the datetime for each pair in the dataset."""
         return self._datetime
+
+    def load_los_ratio(
+        self,
+        roi: Optional[BoundingBox] = None,
+        angle_type: Literal["incidence", "look"] = "look",
+    ) -> np.ndarray:
+        """load and convert los angle map to ratio map for given region of
+        interest. The ratio map is used to convert differential atmospheric
+        phase from vertical to line-of-sight (LOS) direction or convert LOS
+        deformation phase to vertical
+
+        Parameters
+        ----------
+        roi : BoundingBox, optional
+            region of interest to load. If None, the roi of the dataset will be
+            used.
+        angle_type : Literal['incidence', 'look'], optional
+            angle type, one of ['incidence', 'look']. 'incidence' means incidence
+            angle (relative to vertical) and 'look' means look angle (relative to
+            horizontal). Default is 'look'.
+        """
+        if self.los_dataset is None:
+            return None
+
+        sample_theta = self.los_dataset[roi]
+        arr_theta = sample_theta["bbox"].squeeze((0, 1))
+        if angle_type == "incidence":
+            los_ratio = np.cos(arr_theta)
+        elif angle_type == "look":
+            los_ratio = np.sin(arr_theta)
+        return los_ratio
 
     def to_netcdf(
         self,
@@ -1283,3 +1395,162 @@ class InterferogramDataset(RasterDataset):
             ds, ["unw", "coh"], crs=self.crs, x_dim="lon", y_dim="lat"
         )
         ds.to_netcdf(filename)
+
+
+class ApsDataset(RasterDataset):
+    """
+    A base class for aps (atmospheric phase screen) datasets.
+    """
+
+    #: This expression is used to find the APS files.
+    filename_glob = "*"
+
+    def __init__(
+        self,
+        root_dir: str = "data",
+        paths: Optional[Sequence[str]] = None,
+        crs: Optional[CRS] = None,
+        res: Optional[Union[float, tuple[float, float]]] = None,
+        dtype: Optional[np.dtype] = None,
+        nodata: Optional[Union[float, int, Any]] = None,
+        roi: Optional[BoundingBox] = None,
+        bands: Optional[Sequence[str]] = None,
+        cache: bool = True,
+        resampling=Resampling.nearest,
+        verbose: bool = True,
+        ds_name: str = "",
+    ) -> None:
+        """Initialize a new ApsDataset instance.
+
+        Parameters
+        ----------
+        root_dir : str or Path
+            root_dir directory where dataset can be found.
+        paths : list of str, optional
+            list of file paths to use instead of searching for files in ``root_dir``.
+            If None, files will be searched for in ``root_dir``.
+        crs : CRS, optional
+            the output term:`coordinate reference system (CRS)` of the dataset.
+            If None, the CRS of the first file found will be used.
+        res : float, optional
+            resolution of the output dataset in units of CRS. If None, the
+            resolution of the first file found will be used.
+        dtype : numpy.dtype, optional
+            data type of the output dataset. If None, the data type of the first
+            file found will be used.
+        nodata : float or int, optional
+            no data value of the output dataset. If None, the no data value of
+            the first file found will be used.
+        roi : BoundingBox, optional
+            region of interest to load from the dataset. If None, the union of
+            all files bounds in the dataset will be used.
+        bands : list of str, optional
+            names of bands to return (defaults to all bands)
+        cache : bool, optional
+            if True, cache file handle to speed up repeated sampling
+        resampling : Resampling, optional
+            Resampling algorithm used when reading input files.
+            Default: `Resampling.nearest`.
+        verbose : bool, optional
+            if True, print verbose output, default: True
+        ds_name : str, optional
+            name of the dataset. used for printing verbose output, default: ""
+        """
+        super().__init__(
+            root_dir,
+            paths,
+            crs,
+            res,
+            dtype,
+            nodata,
+            roi,
+            bands,
+            cache,
+            resampling,
+            verbose,
+            ds_name,
+        )
+
+    def to_pair_files(
+        self,
+        out_dir: Union[str, Path],
+        pairs: Pairs,
+        ref_points: Points,
+        roi: Optional[BoundingBox] = None,
+        overwrite: bool = False,
+        prefix: str = "APS",
+    ):
+        """Generate aps-pair files for given pairs and reference points.
+
+        Parameters
+        ----------
+        out_dir : str or Path
+            path to the directory to save the aps-pair files
+        pairs : Pairs
+            pairs to generate aps-pair files
+        ref_points : Points
+            reference points which values are subtracted for all aps-pair files
+        roi : BoundingBox, optional
+            region of interest to save. If None, the roi of the dataset will be used.
+        overwrite : bool, optional
+            if True, overwrite existing files, default: False
+        prefix : str, optional
+            prefix of the aps-pair files, default: "APS"
+        """
+        if roi is None:
+            roi = self.roi
+
+        profile = self.get_profile(roi)
+        profile["count"] = 1
+        dates = self.parse_dates()
+
+        dates_missing = np.setdiff1d(pairs.dates, dates)
+        if len(dates_missing) > 0:
+            warnings.warn(
+                f"Following dates are missing in the {self.ds_name} dataset. \n{dates_missing}"
+            )
+
+        df_paths = pd.Series(self.files.paths.values, index=dates)
+
+        mask = ~np.any(np.isin(pairs.values, dates_missing), axis=1)
+        pairs = pairs[mask]
+
+        pairs_names = self._ensure_saving_verbose(
+            pairs.to_names(), ds_name=f"{self.ds_name} Pair", unit=" pairs"
+        )
+
+        for pair_name in pairs_names:
+            primary, secondary = pair_name.split("_")
+            out_file = Path(out_dir) / f"{prefix}_{pair_name}.tif"
+            if out_file.exists() and not overwrite:
+                print(f"{out_file.name} already exists, skipping")
+                continue
+            with rasterio.open(out_file, "w", **profile.profile) as dst:
+                src_primary = self._load_warp_file(df_paths[primary])
+                src_secondary = self._load_warp_file(df_paths[secondary])
+                dest_arr = (
+                    self._bbox_query(roi, src_primary).squeeze(0)
+                    - self._bbox_query(roi, src_secondary).squeeze(0)
+                    - (
+                        self._points_query(ref_points, src_primary)
+                        - self._points_query(ref_points, src_secondary)
+                    ).mean()
+                )
+
+                dst.write(dest_arr, 1)
+
+    def parse_dates(self):
+        """Used to parse acquisition dates from filenames. *Must be implemented
+        in subclass*.
+
+        Parameters
+        ----------
+        paths : list of pathlib.Path
+            list of file paths to parse datetime
+
+        Returns
+        -------
+        datetime : pd.DatetimeIndex
+            datetime parsed from filenames
+        """
+        raise NotImplementedError("parse_datetime must be implemented in subclass")
