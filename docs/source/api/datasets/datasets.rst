@@ -7,10 +7,14 @@ The following datasets are available:
 
 * basic geospatial Datasets:
    * :class:`.GeoDataset`
-   * :class:`.RasterDataset`
-* InSAR Datasets:
-   * :class:`.InterferogramDataset` : base Datasets for all Interferogram productions
-   * InSAR Datasets from well known productions:
+   * :class:`.RasterDataset` : base Datasets for all Raster-like productions.
+* InSAR related Datasets:
+   * :class:`.ApsDataset` : base Datasets for all APS (Atmospheric Phase Screen) productions. Child classes:
+      * :class:`.GACOS`
+   * :class:`.PairDataset` : base Datasets for all Pair-like productions. Child classes:
+      * :class:`.InterferogramDataset`
+      * :class:`.GACOSPairs` 
+   * :class:`.InterferogramDataset` : base Datasets for all Interferogram productions. Child classes (well known productions):
       * :class:`.HyP3`
       * :class:`.LiCSAR`
 
@@ -33,6 +37,16 @@ RasterDataset
    :undoc-members:
    :member-order: bysource
    :show-inheritance:
+
+PairDataset
+-----------
+
+.. autoclass:: faninsar.datasets.PairDataset
+   :members:
+   :undoc-members:
+   :member-order: bysource
+   :show-inheritance:
+
 
 InterferogramDataset
 --------------------
@@ -62,5 +76,29 @@ LiCSAR
    :member-order: bysource
    :show-inheritance:
 
+ApsDataset
+----------
 
-   
+.. autoclass:: faninsar.datasets.ApsDataset
+   :members:
+   :undoc-members:
+   :member-order: bysource
+   :show-inheritance:
+
+GACOS
+-----
+
+.. autoclass:: faninsar.datasets.GACOS
+   :members:
+   :undoc-members:
+   :member-order: bysource
+   :show-inheritance:
+
+GACOSPairs
+----------
+
+.. autoclass:: faninsar.datasets.GACOSPairs
+   :members:
+   :undoc-members:
+   :member-order: bysource
+   :show-inheritance:

@@ -8,7 +8,7 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 
 from faninsar._core.pair_tools import Pairs
-from faninsar.datasets.base import InterferogramDataset
+from faninsar.datasets.ifg import InterferogramDataset
 
 from ..query.query import BoundingBox
 
@@ -41,7 +41,7 @@ class HyP3(InterferogramDataset):
         resampling=Resampling.nearest,
         verbose=False,
     ) -> None:
-        """Initialize a new InterferogramDataset instance.
+        """Initialize a new HyP3 instance.
 
         Parameters
         ----------
