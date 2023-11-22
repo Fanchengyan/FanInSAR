@@ -1457,19 +1457,20 @@ class ApsDataset(RasterDataset):
             name of the dataset. used for printing verbose output, default: ""
         """
         super().__init__(
-            root_dir,
-            paths,
-            crs,
-            res,
-            dtype,
-            nodata,
-            roi,
-            bands,
-            cache,
-            resampling,
-            verbose,
-            ds_name,
+            root_dir=root_dir,
+            paths=paths,
+            crs=crs,
+            res=res,
+            dtype=dtype,
+            nodata=nodata,
+            roi=roi,
+            bands=bands,
+            cache=cache,
+            resampling=resampling,
+            verbose=verbose,
+            ds_name=ds_name,
         )
+        self._pairs = None
 
     def to_pair_files(
         self,

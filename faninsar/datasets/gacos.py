@@ -103,18 +103,18 @@ class GACOS(ApsDataset):
             name of the dataset. used for printing verbose output, default: "GACOS"
         """
         super().__init__(
-            root_dir,
-            paths,
-            crs,
-            res,
-            dtype,
-            nodata,
-            roi,
-            bands,
-            cache,
-            resampling,
-            verbose,
-            ds_name,
+            root_dir=root_dir,
+            paths=paths,
+            crs=crs,
+            res=res,
+            dtype=dtype,
+            nodata=nodata,
+            roi=roi,
+            bands=bands,
+            cache=cache,
+            resampling=resampling,
+            verbose=verbose,
+            ds_name=ds_name,
         )
 
     def parse_dates(self):
@@ -149,4 +149,3 @@ class GACOS(ApsDataset):
             prefix of the aps-pair files, default: "GACOS"
         """
         return super().to_pair_files(out_dir, pairs, ref_points, roi, overwrite, prefix)
-
