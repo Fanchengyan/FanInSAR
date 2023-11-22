@@ -324,6 +324,32 @@ class Pairs:
     def __array__(self) -> np.ndarray:
         return self._values
 
+    def _ensure_pairs(
+        self, pairs: Union[str, Pair, "Pairs", Iterable[str], Iterable[Pair]]
+    ) -> "Pairs":
+        """ensure the pairs are in the Pairs object"""
+        if isinstance(pairs, str):
+            pairs = Pairs.from_names([pairs])
+        elif isinstance(pairs, Pair):
+            pairs = Pairs([pairs])
+        elif isinstance(pairs, Pairs):
+            return pairs
+        elif isinstance(pairs, Iterable):
+            pairs = np.asarray(pairs)
+            if pairs.ndim == 1 and pairs.dtype == "O":
+                pairs = Pairs.from_names(pairs)
+            elif pairs.ndim == 2 and pairs.shape[1] == 2:
+                pairs = Pairs(pairs)
+            else:
+                raise ValueError(
+                    f"pairs should be 1D array of str, 2D array of datetime, or Pairs, but got {pairs}."
+                )
+        else:
+            raise TypeError(
+                f"pairs should be str, Pair, list of str, list of Pair, or Pairs, but got {type(pairs)}."
+            )
+        return pairs
+
     @property
     def values(self) -> np.ndarray:
         """return the pairs array in type of np.datetime64[D]"""
@@ -400,6 +426,71 @@ class Pairs:
         else:
             return None
 
+    def where(
+        self, pairs: Union[list[str], list[Pair], "Pairs"]
+    ) -> Optional[np.ndarray]:
+        """return the index of the pairs
+
+        Parameters
+        ----------
+        pairs: list of str or Pair, or Pairs
+            Pair names or Pair objects, or Pairs object.
+        """
+        pairs = self._ensure_pairs(pairs)
+        con_ref = np.isin(self.values[:, 0], pairs.values[:, 0])
+        con_sec = np.isin(self.values[:, 1], pairs.values[:, 1])
+        con = np.logical_and(con_ref, con_sec)
+        if np.any(con):
+            return np.where(con)[0]
+        else:
+            return None
+
+    def intersect(
+        self, pairs: Union[list[str], list[Pair], "Pairs"]
+    ) -> Optional["Pairs"]:
+        """return the intersection of the pairs. The pairs both in self and 
+        input pairs.
+
+        Parameters
+        ----------
+        pairs: list of str or Pair, or Pairs
+            Pair names or Pair objects, or Pairs object.
+        """
+        pairs = self._ensure_pairs(pairs)
+        con_ref = np.isin(self.values[:, 0], pairs.values[:, 0])
+        con_sec = np.isin(self.values[:, 1], pairs.values[:, 1])
+        con = np.logical_and(con_ref, con_sec)
+        if np.any(con):
+            return Pairs(self.values[con])
+        else:
+            return None
+
+    def union(self, pairs: Union[list[str], list[Pair], "Pairs"]) -> "Pairs":
+        """return the union of the pairs. All pairs that in self and input pairs. 
+        A more robust operation than addition.
+
+        Parameters
+        ----------
+        pairs: list of str or Pair, or Pairs
+            Pair names or Pair objects, or Pairs object.
+        """
+        pairs = self._ensure_pairs(pairs)
+        return self + pairs
+
+    def difference(
+        self, pairs: Union[list[str], list[Pair], "Pairs"]
+    ) -> Optional["Pairs"]:
+        """return the difference of the pairs. The pairs in self but not in pairs. 
+        A more robust operation than subtraction.
+
+        Parameters
+        ----------
+        pairs: list of str or Pair, or Pairs
+            Pair names or Pair objects, or Pairs object.
+        """
+        pairs = self._ensure_pairs(pairs)
+        return self - pairs
+    
     def sort(
         self,
         order: Union[str, list] = "pairs",
