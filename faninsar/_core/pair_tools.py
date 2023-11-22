@@ -304,7 +304,8 @@ class Pairs:
         return hash("".join(self.to_names()))
 
     def __iter__(self):
-        return iter(self.values)
+        pairs_ls = [Pair(i) for i in self._values]
+        return iter(pairs_ls)
 
     def __contains__(self, item):
         if isinstance(item, Pair):
