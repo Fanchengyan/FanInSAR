@@ -273,7 +273,7 @@ class InterferogramDataset(PairDataset):
     def _ensure_ds(
         self,
         dataset: Optional[RasterDataset],
-        ds_name: str,
+        ds_str: str,
         ds_class: RasterDataset = RasterDataset,
         **kwargs,
     ):
@@ -284,7 +284,7 @@ class InterferogramDataset(PairDataset):
             dataset = ds_class(**kwargs)
         elif not isinstance(dataset, ds_class):
             raise TypeError(
-                f"{ds_name} must be an instance of {ds_class}, got {type(dataset)}"
+                f"{ds_str} must be an instance of {ds_class}, got {type(dataset)}"
             )
         return dataset
 
