@@ -29,14 +29,13 @@ class LiCSAR(InterferogramDataset):
         root_dir: str = "data",
         paths_unw: Optional[Sequence[str]] = None,
         paths_coh: Optional[Sequence[str]] = None,
-        dem_file: Optional[Any] = None,
-        mask_file: Optional[Any] = None,
         crs: Optional[CRS] = None,
         res: Optional[Union[float, Tuple[float, float]]] = None,
         dtype: Optional[np.dtype] = None,
         nodata: Optional[Union[float, int, Any]] = None,
         roi: Optional[BoundingBox] = None,
-        bands: Optional[Sequence[str]] = None,
+        bands_unw: Optional[Sequence[str]] = None,
+        bands_coh: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
         verbose=False,
@@ -53,10 +52,6 @@ class LiCSAR(InterferogramDataset):
         paths_coh: list of str, optional
             list of coherence file paths to use instead of searching for files in
             ``root_dir``. If None, files will be searched for in ``root_dir``.
-        dem_file: Any, optional
-            DEM data. If None, no DEM data will be used.
-        mask_file: Any, optional
-            Mask data. If None, no Mask data will be used.
         crs: CRS, optional
             the output term:`coordinate reference system (CRS)` of the dataset.
             If None, the CRS of the first file found will be used.
@@ -86,14 +81,13 @@ class LiCSAR(InterferogramDataset):
             root_dir=root_dir,
             paths_unw=paths_unw,
             paths_coh=paths_coh,
-            dem_file=dem_file,
-            mask_file=mask_file,
             crs=crs,
             res=res,
             dtype=dtype,
             nodata=nodata,
             roi=roi,
-            bands=bands,
+            bands_unw=bands_unw,
+            bands_coh=bands_coh,
             cache=cache,
             resampling=resampling,
             verbose=verbose,
@@ -109,7 +103,6 @@ class LiCSAR(InterferogramDataset):
 
     def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse the datetime of the interferogram to generate DatetimeIndex object."""
-        pass
-        # pair_names = self.parse_pairs(paths)
-        # date_names = np.unique([i.split("_") for i in pair_names])
-        # return pd.DatetimeIndex(date_names)
+        pair_names = [f.parent.stem for f in paths]
+        date_names = np.unique([i.split("_") for i in pair_names])
+        return pd.DatetimeIndex(date_names)

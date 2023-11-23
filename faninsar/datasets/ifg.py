@@ -45,16 +45,13 @@ class InterferogramDataset(PairDataset):
         root_dir: str = "data",
         paths_unw: Optional[Sequence[Union[str, Path]]] = None,
         paths_coh: Optional[Sequence[Union[str, Path]]] = None,
-        aps_dataset: Optional[ApsPairs] = None,
-        los_file: Optional[Union[str, Path]] = None,
-        dem_file: Optional[Union[str, Path]] = None,
-        mask_file: Optional[Union[str, Path]] = None,
         crs: Optional[CRS] = None,
         res: Optional[Union[float, tuple[float, float]]] = None,
         dtype: Optional[np.dtype] = None,
         nodata: Optional[Union[float, int, Any]] = None,
         roi: Optional[BoundingBox] = None,
-        bands: Optional[Sequence[str]] = None,
+        bands_unw: Optional[Sequence[str]] = None,
+        bands_coh: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
         verbose=True,
@@ -71,20 +68,6 @@ class InterferogramDataset(PairDataset):
         paths_coh: list of str, optional
             list of coherence file paths to use instead of searching for files in
             ``root_dir``. If None, files will be searched for in ``root_dir``.
-        aps_dataset: ApsPairs, optional
-            A ApsPairs object. ApsPairs is used to remove the atmospheric phase
-            screen (APS) from the unwrapped interferograms. If None, no APS data
-            is used.
-        los_file : str or Path, optional
-            path to the los file. los file could be incidence angle (relative to
-            vertical) or look angle (relative to horizontal). This file is used
-            to convert differential atmospheric phase from vertical to line-of-sight
-            (LOS) direction or convert differential interferometric phase from
-            line-of-sight (LOS) to vertical direction.
-        dem_file: str or Path, optional
-            path to the DEM file. If None, no DEM data will be used.
-        mask_file: str or Path, optional
-            path to the mask file. If None, no Mask data will be used.
         crs: CRS, optional
             the output coordinate reference system term:`(CRS)` of the dataset.
             If None, the CRS of the first file found will be used.
@@ -100,8 +83,10 @@ class InterferogramDataset(PairDataset):
         roi: BoundingBox, optional
             region of interest to load from the dataset. If None, the union of all
             files bounds in the dataset will be used.
-        bands: list of str, optional
-            names of bands to return (defaults to all bands)
+        bands_unw: list of str, optional
+            names of bands to return (defaults to all bands) for unwrapped interferograms.
+        bands_coh: list of str, optional
+            names of bands to return (defaults to all bands) for coherence.
         cache: bool, optional
             if True, cache file handle to speed up repeated sampling
         resampling: Resampling, optional
@@ -149,7 +134,7 @@ class InterferogramDataset(PairDataset):
             dtype=dtype,
             nodata=nodata,
             roi=roi,
-            bands=bands,
+            bands=bands_unw,
             cache=cache,
             resampling=resampling,
             verbose=verbose,
@@ -164,7 +149,7 @@ class InterferogramDataset(PairDataset):
             dtype=self.dtype,
             nodata=self.nodata,
             roi=self.roi,
-            bands=bands,
+            bands=bands_coh,
             cache=cache,
             resampling=resampling,
             verbose=verbose,
@@ -183,18 +168,6 @@ class InterferogramDataset(PairDataset):
         self._pairs = pairs1[_valid]
         # get the datetime from pairs
         self._datetime = self.parse_datetime(paths_unw[_valid])
-
-        if aps_dataset is not None:
-            self.set_aps_dataset(aps_dataset)
-
-        if los_file is not None:
-            self.set_los_dataset(los_file)
-
-        if dem_file is not None:
-            self.set_dem_dataset(dem_file)
-
-        if mask_file is not None:
-            self.set_mask_dataset(mask_file)
 
     def parse_pairs(self, paths: list[Path]) -> Pairs:
         """Used to parse pairs from filenames. *Must be implemented in subclass*.
@@ -276,56 +249,112 @@ class InterferogramDataset(PairDataset):
         """Return the mask dataset. If None, no Mask data is used."""
         return self._ds_mask
 
-    def set_aps_dataset(self, aps_dataset: Optional[ApsPairs] = None):
-        if not isinstance(aps_dataset, ApsPairs):
+    def _ensure_ds_kwargs(self, kwargs: dict) -> dict:
+        """Format the kwargs for creating a new RasterDataset object.
+
+        Parameters
+        ----------
+        kwargs : dict
+            Keyword arguments used to create a new RasterDataset object.
+
+        Returns
+        -------
+        kwargs : dict
+            Formatted keyword arguments.
+        """
+        kwargs.setdefault("crs", self.crs)
+        kwargs.setdefault("res", self.res)
+        kwargs.setdefault("roi", self.roi)
+        kwargs.setdefault("cache", self.cache)
+        kwargs.setdefault("resampling", self.resampling)
+        kwargs.setdefault("verbose", self.verbose)
+        return kwargs
+
+    def _ensure_ds(
+        self,
+        dataset: Optional[RasterDataset],
+        ds_name: str,
+        ds_class: RasterDataset = RasterDataset,
+        **kwargs,
+    ):
+        """Ensure the dataset is an instance of ds_class. If dataset is None, a
+        new ``ds_class`` object will be created using the kwargs."""
+        if dataset is None:
+            kwargs = self._ensure_ds_kwargs(kwargs)
+            dataset = ds_class(**kwargs)
+        elif not isinstance(dataset, ds_class):
             raise TypeError(
-                f"aps_dataset must be an instance of ApsPairs, got {type(aps_dataset)}"
+                f"{ds_name} must be an instance of {ds_class}, got {type(dataset)}"
             )
-        self._ds_aps = aps_dataset
+        return dataset
 
-    def set_los_dataset(self, los_file: Optional[Union[str, Path]] = None):
+    def set_aps_dataset(
+        self,
+        aps_dataset: Optional[ApsPairs] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Set the aps dataset. If aps_dataset is None, a new ApsPairs object will
+        be created using the kwargs.
+
+        Parameters
+        ----------
+        aps_dataset : ApsPairs, optional
+            A ApsPairs object. ApsPairs is used to remove the atmospheric phase
+            screen (APS) from the unwrapped interferograms. If None, no APS data
+            is used.
+        **kwargs : dict, optional
+            Keyword arguments used to create a new ApsPairs object if aps_dataset
+            is None.
+        """
+        kwargs.setdefault("ds_name", "ApsPairs")
+        self._ds_aps = self._ensure_ds(aps_dataset, "aps_dataset", ApsPairs, **kwargs)
+
+    def set_los_dataset(
+        self,
+        los_dataset: Optional[RasterDataset] = None,
+        **kwargs: Any,
+    ) -> None:
         """Set the los dataset. los file could be incidence angle (relative to
-        vertical) or look angle (relative to horizontal). This file is used"""
-        self._ds_los = RasterDataset(
-            paths=[los_file],
-            crs=self.crs,
-            res=self.res,
-            dtype=self.dtype,
-            nodata=self.nodata,
-            roi=self.roi,
-            cache=self.cache,
-            resampling=self.resampling,
-            verbose=self.verbose,
-            ds_name="LOS",
-        )
+        vertical) or look angle (relative to horizontal). This file is used to
+        convert differential atmospheric phase from vertical to line-of-sight (LOS)
+        direction or convert LOS deformation phase to vertical.
 
-    def set_dem_dataset(self, dem_file: Optional[Union[str, Path]] = None):
-        self._ds_dem = RasterDataset(
-            paths=[dem_file],
-            crs=self.crs,
-            res=self.res,
-            dtype=self.dtype,
-            nodata=self.nodata,
-            roi=self.roi,
-            cache=self.cache,
-            resampling=self.resampling,
-            verbose=self.verbose,
-            ds_name="DEM",
-        )
+        Parameters
+        ----------
+        los_dataset : RasterDataset, optional
+            A RasterDataset object containing the los files.
+        **kwargs : dict, optional
+            Keyword arguments used to create a new RasterDataset object if
+            ``los_dataset`` is None.
+        """
+        kwargs.setdefault("ds_name", "LOS")
+        self._ds_los = self._ensure_ds(los_dataset, "los_dataset", **kwargs)
 
-    def set_mask_dataset(self, mask_file: Optional[Union[str, Path]] = None):
-        self._ds_mask = RasterDataset(
-            paths=[mask_file],
-            crs=self.crs,
-            res=self.res,
-            dtype=self.dtype,
-            nodata=self.nodata,
-            roi=self.roi,
-            cache=self.cache,
-            resampling=self.resampling,
-            verbose=self.verbose,
-            ds_name="Mask",
-        )
+    def set_dem_dataset(
+        self,
+        dem_dataset: Optional[RasterDataset] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Set the dem dataset.
+
+        Parameters
+        ----------
+        dem_dataset : RasterDataset, optional
+            A RasterDataset object containing the dem file.
+        **kwargs : dict, optional
+            Keyword arguments used to create a new RasterDataset object if
+            ``dem_dataset`` is None.
+        """
+        kwargs.setdefault("ds_name", "DEM")
+        self._ds_dem = self._ensure_ds(dem_dataset, "dem_dataset", **kwargs)
+
+    def set_mask_dataset(
+        self,
+        mask_dataset: Optional[RasterDataset] = None,
+        **kwargs,
+    ) -> None:
+        kwargs.setdefault("ds_name", "Mask")
+        self._ds_mask = self._ensure_ds(mask_dataset, "mask_dataset", **kwargs)
 
     def load_los_ratio(
         self,
@@ -379,7 +408,7 @@ class InterferogramDataset(PairDataset):
         if roi is None:
             roi = self.roi
 
-        # TODO: 1. add dem and mask 2. using netcdf4 to save the data to avoid the memory issue
+        # TODO: using netcdf4 to save the data to avoid the memory issue
         profile = self.get_profile(roi)
         lat, lon = profile.to_latlon()
 

@@ -27,19 +27,18 @@ class HyP3(InterferogramDataset):
     def __init__(
         self,
         root_dir: str = "data",
-        paths_unw: Optional[Sequence[str]] = None,
-        paths_coh: Optional[Sequence[str]] = None,
-        dem_file: Optional[Any] = None,
-        mask_file: Optional[Any] = None,
+        paths_unw: Optional[Sequence[Union[str, Path]]] = None,
+        paths_coh: Optional[Sequence[Union[str, Path]]] = None,
         crs: Optional[CRS] = None,
-        res: Optional[Union[float, Tuple[float, float]]] = None,
+        res: Optional[Union[float, tuple[float, float]]] = None,
         dtype: Optional[np.dtype] = None,
         nodata: Optional[Union[float, int, Any]] = None,
         roi: Optional[BoundingBox] = None,
-        bands: Optional[Sequence[str]] = None,
+        bands_unw: Optional[Sequence[str]] = None,
+        bands_coh: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
-        verbose=False,
+        verbose=True,
     ) -> None:
         """Initialize a new HyP3 instance.
 
@@ -53,10 +52,6 @@ class HyP3(InterferogramDataset):
         paths_coh: list of str, optional
             list of coherence file paths to use instead of searching for files in
             ``root_dir``. If None, files will be searched for in ``root_dir``.
-        dem_file: Any, optional
-            DEM data. If None, no DEM data will be used.
-        mask_file: Any, optional
-            Mask data. If None, no Mask data will be used.
         crs: CRS, optional
             the output term:`coordinate reference system (CRS)` of the dataset.
             If None, the CRS of the first file found will be used.
@@ -72,8 +67,10 @@ class HyP3(InterferogramDataset):
         roi: BoundingBox, optional
             region of interest to load from the dataset. If None, the union of all
             files bounds in the dataset will be used.
-        bands: list of str, optional
-            names of bands to return (defaults to all bands)
+        bands_unw: list of str, optional
+            names of bands to return (defaults to all bands) for unwrapped interferograms.
+        bands_coh: list of str, optional
+            names of bands to return (defaults to all bands) for coherence.
         cache: bool, optional
             if True, cache file handle to speed up repeated sampling
         resampling: Resampling, optional
@@ -86,14 +83,13 @@ class HyP3(InterferogramDataset):
             root_dir=root_dir,
             paths_unw=paths_unw,
             paths_coh=paths_coh,
-            dem_file=dem_file,
-            mask_file=mask_file,
             crs=crs,
             res=res,
             dtype=dtype,
             nodata=nodata,
             roi=roi,
-            bands=bands,
+            bands_unw=bands_unw,
+            bands_coh=bands_coh,
             cache=cache,
             resampling=resampling,
             verbose=verbose,
