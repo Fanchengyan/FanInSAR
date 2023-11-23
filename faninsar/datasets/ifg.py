@@ -165,7 +165,7 @@ class InterferogramDataset(PairDataset):
         self._ds_coh._valid = self._ds_coh._valid[_valid]
 
         # remove invalid pairs
-        self._pairs = pairs1[_valid]
+        self._pairs = self.parse_pairs(self._files.paths)
         # get the datetime from pairs
         self._datetime = self.parse_datetime(paths_unw[_valid])
 
