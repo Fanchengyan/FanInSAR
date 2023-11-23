@@ -239,6 +239,7 @@ class NSBASInversion:
         matrix_factory: NSBASMatrixFactory,
         device: Optional[Union[str, torch.device]] = None,
         dtype: torch.dtype = torch.float64,
+        verbose=True,
     ):
         """Initialize NSBASInversion
 
@@ -255,6 +256,7 @@ class NSBASInversion:
         self.matrix_factory = matrix_factory
         self.device = parse_device(device)
         self.dtype = dtype
+        self.verbose = verbose
 
         self.G = matrix_factory.G
         self.d = matrix_factory.d
@@ -284,6 +286,7 @@ class NSBASInversion:
             dtype=self.dtype,
             device=self.device,
             desc="  NSBAS inversion",
+            verbose=self.verbose,
         )
         residual = self.d - np.dot(self.G, result)
 
