@@ -563,7 +563,7 @@ class RasterDataset(GeoDataset):
                 if match is not None:
                     paths.append(file_path)
         else:
-            paths = [Path(path) for path in np.sort(paths)]
+            paths = [Path(path) for path in paths]
 
         # Populate the dataset index
         count = 0
