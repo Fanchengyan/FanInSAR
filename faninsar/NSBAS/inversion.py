@@ -403,7 +403,7 @@ def _get_patch_col(G, d, mem_size, dtype, safe_factor=2):
     )
 
     # accurate value of n_patch
-    row_spacing = int(n / n_patch)
+    row_spacing = int(np.ceil(n / n_patch))
     n_patch = int(np.ceil(n / row_spacing))
 
     patch_col = []
