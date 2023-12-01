@@ -45,8 +45,8 @@ class Pair:
     def __hash__(self) -> int:
         return hash(self._name)
 
-    def __array__(self) -> np.ndarray:
-        return self._values
+    def __array__(self, dtype=None) -> np.ndarray:
+        return np.asarray(self._values, dtype=dtype)
 
     @property
     def values(self):
@@ -80,6 +80,38 @@ class Pair:
             Time span of the pair in days.
         """
         return self._days
+
+    @property
+    def primary(self) -> np.ndarray:
+        """return the primary dates of all pairs"""
+        return self.values[0]
+
+    @property
+    def secondary(self) -> np.ndarray:
+        """return the secondary dates of all pairs"""
+        return self.values[1]
+
+    def primary_string(self, date_format="%Y%m%d") -> np.ndarray:
+        """return the primary dates of all pairs in string format
+
+        Parameters
+        ----------
+        date_format: str
+            Format of the date string. Default is '%Y%m%d'. See more at
+            `strftime Format Codes <https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes>`_.
+        """
+        return pd.to_datetime(self.values[0]).strftime(date_format).values
+
+    def secondary_string(self, date_format="%Y%m%d") -> np.ndarray:
+        """return the secondary dates of all pairs in string format
+
+        Parameters
+        ----------
+        date_format: str
+            Format of the date string. Default is '%Y%m%d'. See more at
+            `strftime Format Codes <https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes>`_.
+        """
+        return pd.to_datetime(self.values[1]).strftime(date_format).values
 
     @classmethod
     def from_name(
@@ -321,8 +353,8 @@ class Pairs:
 
         return np.any(np.all(item == self.values, axis=1))
 
-    def __array__(self) -> np.ndarray:
-        return self._values
+    def __array__(self, dtype=None) -> np.ndarray:
+        return np.asarray(self._values, dtype=dtype)
 
     def _ensure_pairs(
         self, pairs: Union[str, Pair, "Pairs", Iterable[str], Iterable[Pair]]
@@ -364,6 +396,38 @@ class Pairs:
     def days(self) -> np.ndarray:
         """return the time span of all pairs in days"""
         return (self._values[:, 1] - self._values[:, 0]).astype(int)
+
+    @property
+    def primary(self) -> np.ndarray:
+        """return the primary dates of all pairs"""
+        return self._values[:, 0]
+
+    @property
+    def secondary(self) -> np.ndarray:
+        """return the secondary dates of all pairs"""
+        return self._values[:, 1]
+
+    def primary_string(self, date_format="%Y%m%d") -> np.ndarray:
+        """return the primary dates of all pairs in string format
+
+        Parameters
+        ----------
+        date_format: str
+            Format of the date string. Default is '%Y%m%d'. See more at
+            `strftime Format Codes <https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes>`_.
+        """
+        return pd.to_datetime(self.values[:, 0]).strftime(date_format).values
+
+    def secondary_string(self, date_format="%Y%m%d") -> np.ndarray:
+        """return the secondary dates of all pairs in string format
+
+        Parameters
+        ----------
+        date_format: str
+            Format of the date string. Default is '%Y%m%d'. See more at
+            `strftime Format Codes <https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes>`_.
+        """
+        return pd.to_datetime(self.values[:, 1]).strftime(date_format).values
 
     @property
     def edge_index(self) -> np.ndarray:
@@ -427,7 +491,9 @@ class Pairs:
             return None
 
     def where(
-        self, pairs: Union[list[str], list[Pair], "Pairs"]
+        self,
+        pairs: Union[list[str], list[Pair], "Pairs"],
+        return_type: Literal["index", "mask"] = "index",
     ) -> Optional[np.ndarray]:
         """return the index of the pairs
 
@@ -435,20 +501,25 @@ class Pairs:
         ----------
         pairs: list of str or Pair, or Pairs
             Pair names or Pair objects, or Pairs object.
+        return_type: str, optional
+            Whether to return the index or mask of the pairs. Default is 'index'.
         """
         pairs = self._ensure_pairs(pairs)
-        con_ref = np.isin(self.values[:, 0], pairs.values[:, 0])
-        con_sec = np.isin(self.values[:, 1], pairs.values[:, 1])
-        con = np.logical_and(con_ref, con_sec)
-        if np.any(con):
-            return np.where(con)[0]
+        con = np.isin(self.to_names(), pairs.to_names())
+        if return_type == "mask":
+            return con
+        elif return_type == "index":
+            if np.any(con):
+                return np.where(con)[0]
         else:
-            return None
+            raise ValueError(
+                f"return_type should be one of ['index', 'mask'], but got {return_type}."
+            )
 
     def intersect(
         self, pairs: Union[list[str], list[Pair], "Pairs"]
     ) -> Optional["Pairs"]:
-        """return the intersection of the pairs. The pairs both in self and 
+        """return the intersection of the pairs. The pairs both in self and
         input pairs.
 
         Parameters
@@ -466,7 +537,7 @@ class Pairs:
             return None
 
     def union(self, pairs: Union[list[str], list[Pair], "Pairs"]) -> "Pairs":
-        """return the union of the pairs. All pairs that in self and input pairs. 
+        """return the union of the pairs. All pairs that in self and input pairs.
         A more robust operation than addition.
 
         Parameters
@@ -480,7 +551,7 @@ class Pairs:
     def difference(
         self, pairs: Union[list[str], list[Pair], "Pairs"]
     ) -> Optional["Pairs"]:
-        """return the difference of the pairs. The pairs in self but not in pairs. 
+        """return the difference of the pairs. The pairs in self but not in pairs.
         A more robust operation than subtraction.
 
         Parameters
@@ -490,7 +561,7 @@ class Pairs:
         """
         pairs = self._ensure_pairs(pairs)
         return self - pairs
-    
+
     def sort(
         self,
         order: Union[str, list] = "pairs",
@@ -545,31 +616,77 @@ class Pairs:
         else:
             return Pairs(_values), _index
 
-    def to_names(self, prefix: Optional[str] = None) -> list[str]:
-        """generate pair names string with prefix
+    def to_names(self, prefix: Optional[str] = None) -> np.ndarray:
+        """generate pairs names string with prefix
 
         Parameters
         ----------
         prefix: str
-            Prefix of the pair file names. Default is ''.
+            Prefix of the pair file names. Default is None.
+
+        Returns
+        -------
+        names: np.ndarray
+            Pairs names string with format of '%Y%m%d_%Y%m%d'.
         """
+        names = (
+            pd.DatetimeIndex(self.primary).strftime("%Y%m%d")
+            + "_"
+            + pd.DatetimeIndex(self.secondary).strftime("%Y%m%d")
+        )
         if prefix:
-            return [f"{prefix}_{Pair(i).name}" for i in self._values]
-        else:
-            return [Pair(i).name for i in self._values]
+            names = prefix + "_" + names
+
+        return names.values
 
     def to_frame(self) -> pd.DataFrame:
         """return the pairs as a DataFrame"""
         return pd.DataFrame(self._values, columns=["primary", "secondary"])
 
-    def to_loops(self) -> "Loops":
+    def to_triloops(self) -> "TriLoops":
         """return all possible loops from the pairs"""
         loops = []
         for i, pair12 in enumerate(self._values):
             for pair23 in self._values[i + 1 :]:
                 if pair12[1] == pair23[0] and Pair([pair12[0], pair23[1]]) in self:
                     loops.append([pair12[0], pair12[1], pair23[1]])
-        return Loops(loops)
+        return TriLoops(loops)
+
+    def to_loops(
+        self,
+        max_length: int = 6,
+        interval_days: Optional[int] = 12,
+    ) -> "Loops":
+        """return all possible loops from the pairs
+
+        Parameters
+        ----------
+        max_length: int
+            Maximum length/number of pairs in the loops. Default is 6.
+        interval_days: int, optional
+            Minimum interval days between the pair in the loops. Used to exclude
+            pairs between which there are absences of nearest connections pair
+            that with the interval days. If None, no interval days requirement.
+            Default is 12.
+        """
+        loops = []
+        for i in self:
+            if not is_pair_loop_full_rank(i, self, interval_days):
+                continue
+            pair_start, pair_end = i.values[0], i.values[1]
+            m_first = (self.primary == pair_start) & (self.secondary < pair_end)
+            if not m_first.any():
+                continue
+            pairs_first = self[m_first]
+
+            loop = [pair_start]  # a list of acquisition dates that form a loop
+            # a list containing all loops
+
+            find_loops(
+                self, pairs_first, loops, loop, pair_end, max_length, interval_days
+            )
+
+        return loops
 
     def to_matrix(self) -> np.ndarray:
         """return the SBAS matrix
@@ -598,8 +715,8 @@ class Pairs:
         return [i.strftime(format) for i in self._dates.astype(datetime)]
 
 
-class Loop:
-    """Loop class containing three pairs/acquisitions.
+class TriLoop:
+    """TriLoop class containing three pairs/acquisitions.
 
     Examples
     --------
@@ -619,7 +736,7 @@ class Loop:
     __slots__ = ["_values", "_pairs", "_name", "_days12", "_days23", "_days13"]
 
     def __init__(self, loop: Iterable[datetime, datetime, datetime]) -> None:
-        """initialize the Loop class
+        """initialize the TriLoop class
 
         Parameters
         ----------
@@ -640,7 +757,7 @@ class Loop:
         return self._name
 
     def __repr__(self) -> str:
-        return f"Loop({self._name})"
+        return f"TriLoop({self._name})"
 
     def __eq__(self, other) -> bool:
         return self.name == other.name
@@ -648,8 +765,8 @@ class Loop:
     def __hash__(self) -> int:
         return hash(self.name)
 
-    def __array__(self) -> np.ndarray:
-        return self._values
+    def __array__(self, dtype=None) -> np.ndarray:
+        return np.asarray(self._values, dtype=dtype)
 
     @property
     def values(self) -> np.ndarray:
@@ -723,13 +840,13 @@ class Loop:
         name: str,
         parse_function: Optional[Callable] = None,
         date_args: Optional[dict] = None,
-    ) -> "Loop":
+    ) -> "TriLoop":
         """initialize the loop class from a loop name
 
         Parameters
         ----------
         name: str
-            Loop name.
+            TriLoop name.
         parse_function: Callable, optional
             Function to parse the date strings from the loop name.
             If None, the loop name will be split by '_' and the
@@ -741,15 +858,15 @@ class Loop:
 
         Returns
         -------
-        loop: Loop
-            Loop object.
+        loop: TriLoop
+            TriLoop object.
         """
         dates = DateManager.str_to_dates(name, 3, parse_function, date_args)
         return cls(dates)
 
 
-class Loops:
-    """Loops class to handle loops"""
+class TriLoops:
+    """TriLoops class to handle loops"""
 
     _values: np.ndarray
     _dates: np.ndarray
@@ -759,7 +876,9 @@ class Loops:
 
     def __init__(
         self,
-        loops: Union[Iterable[Iterable[datetime, datetime, datetime]], Iterable[Loop]],
+        loops: Union[
+            Iterable[Iterable[datetime, datetime, datetime]], Iterable[TriLoop]
+        ],
         sort: bool = True,
     ) -> None:
         """initialize the loops class
@@ -768,7 +887,7 @@ class Loops:
         ----------
         loops: Iterable
             Iterable object of loops. Each loop is an Iterable object
-            of three dates with format of datetime or Loop object.
+            of three dates with format of datetime or TriLoop object.
             For example, [(date1, date2, date3), ...].
         """
         if loops is None or len(loops) == 0:
@@ -784,7 +903,7 @@ class Loops:
             self.sort(inplace=True)
 
     def __str__(self) -> str:
-        return f"Loops({self._length})"
+        return f"TriLoops({self._length})"
 
     def __repr__(self) -> str:
         return self.to_frame("dates").__repr__()
@@ -792,19 +911,19 @@ class Loops:
     def __len__(self) -> int:
         return self._length
 
-    def __eq__(self, other: "Loops") -> bool:
+    def __eq__(self, other: "TriLoops") -> bool:
         return np.array_equal(self.values, other.values)
 
-    def __add__(self, other: "Loops") -> "Loops":
+    def __add__(self, other: "TriLoops") -> "TriLoops":
         _loops = np.union1d(self.to_names(), other.to_names())
-        return Loops.from_names(_loops)
+        return TriLoops.from_names(_loops)
 
-    def __sub__(self, other: "Loops") -> Optional["Loops"]:
+    def __sub__(self, other: "TriLoops") -> Optional["TriLoops"]:
         _loops = np.setdiff1d(self.to_names(), other.to_names())
         if len(_loops) > 0:
-            return Loops.from_names(_loops)
+            return TriLoops.from_names(_loops)
 
-    def __getitem__(self, index: int) -> Union["Loop", "Loops"]:
+    def __getitem__(self, index: int) -> Union["TriLoop", "TriLoops"]:
         if isinstance(index, slice):
             start, stop, step = index.start, index.stop, index.step
             if isinstance(start, (int, np.integer, type(None))) and isinstance(
@@ -814,7 +933,7 @@ class Loops:
                     start = 0
                 if stop is None:
                     stop = self._length
-                return Loops(self._values[start:stop:step])
+                return TriLoops(self._values[start:stop:step])
             elif isinstance(
                 start, (datetime, np.datetime64, pd.Timestamp, str, type(None))
             ) and isinstance(
@@ -841,15 +960,15 @@ class Loops:
                     if np.all((start <= loop) & (loop <= stop)):
                         _loops.append(loop)
                 if len(_loops) > 0:
-                    return Loops(_loops)
+                    return TriLoops(_loops)
                 else:
                     return None
         elif isinstance(index, (int, np.integer)):
             if index >= self._length:
                 raise IndexError(
-                    f"Index {index} out of range. Loops number is {self._length}."
+                    f"Index {index} out of range. TriLoops number is {self._length}."
                 )
-            return Loop(self._values[index])
+            return TriLoop(self._values[index])
         elif isinstance(index, (datetime, np.datetime64, pd.Timestamp, str)):
             if isinstance(index, str):
                 try:
@@ -861,12 +980,12 @@ class Loops:
                 if index in loop:
                     loops.append(loop)
             if len(loops) > 0:
-                return Loops(loops)
+                return TriLoops(loops)
             else:
                 return None
         elif isinstance(index, Iterable):
             index = np.array(index)
-            return Loops(self._values[index])
+            return TriLoops(self._values[index])
         else:
             raise TypeError(
                 f"Index should be int, slice, datetime, str, or bool or int array"
@@ -880,21 +999,21 @@ class Loops:
         return iter(self.values)
 
     def __contains__(self, item):
-        if isinstance(item, Loop):
+        if isinstance(item, TriLoop):
             item = item.values
         elif isinstance(item, str):
-            item = Loop.from_name(item).values
+            item = TriLoop.from_name(item).values
         elif isinstance(item, Iterable):
             item = np.sort(item)
         else:
             raise TypeError(
-                f"item should be Loop, str, or Iterable, but got {type(item)}."
+                f"item should be TriLoop, str, or Iterable, but got {type(item)}."
             )
 
         return np.any(np.all(item == self.values, axis=1))
 
-    def __array__(self) -> np.ndarray:
-        return self._values
+    def __array__(self, dtype=None) -> np.ndarray:
+        return np.asarray(self._values, dtype=dtype)
 
     @property
     def values(self) -> np.ndarray:
@@ -1023,7 +1142,7 @@ class Loops:
         names: list[str],
         parse_function: Optional[Callable] = None,
         date_args: Optional[dict] = None,
-    ) -> "Loops":
+    ) -> "TriLoops":
         """initialize the loops class from a list of loop file names.
 
         Parameters
@@ -1041,27 +1160,40 @@ class Loops:
 
         Returns
         -------
-        loops: Loops
-            unsorted Loops object.
+        loops: TriLoops
+            unsorted TriLoops object.
         """
         loops = []
         for name in names:
-            loop = Loop.from_name(name, parse_function, date_args)
+            loop = TriLoop.from_name(name, parse_function, date_args)
             loops.append(loop.values)
         return cls(loops, sort=False)
 
-    def to_names(self, prefix: Optional[str] = None) -> list[str]:
+    def to_names(self, prefix: Optional[str] = None) -> np.ndarray:
         """return the string name of each loop.
+
+        Parameters
+        ----------
+        prefix: str, optional
+            Prefix of the output loop names. Default is None.
 
         Returns
         -------
-        prefix: str, optional
-            Prefix of the output loop names. Default is None.
+        names: np.ndarray
+            String names of the loops.
         """
+
+        names = (
+            pd.DatetimeIndex(self.values[:, 0]).strftime("%Y%m%d")
+            + "_"
+            + pd.DatetimeIndex(self.values[:, 1]).strftime("%Y%m%d")
+            + "_"
+            + pd.DatetimeIndex(self.values[:, 1]).strftime("%Y%m%d")
+        )
         if prefix:
-            return [f"{prefix}_{Loop(i).name}" for i in self._values]
-        else:
-            return [Loop(i).name for i in self._values]
+            names = prefix + "_" + names
+
+        return names.values
 
     def to_frame(self, target: Literal["pairs", "dates"] = "pairs") -> pd.DataFrame:
         """return the loops as a DataFrame
@@ -1088,7 +1220,7 @@ class Loops:
         Returns
         -------
         matrix: np.ndarray
-            Loop matrix with the shape of (n_loop, n_pair). The values of each
+            TriLoop matrix with the shape of (n_loop, n_pair). The values of each
             loop/row in matrix are:
 
             - 1: pair12 and pair23
@@ -1106,22 +1238,26 @@ class Loops:
             matrix[i, pairs_ls.index(loop[[0, 2]].tolist())] = -1
         return matrix
 
-    def where(self, loop: Union[str, Loop]) -> Optional[int]:
+    def where(
+        self,
+        loop: Union[str, TriLoop],
+        return_type: Literal["index", "mask"] = "index",
+    ) -> Optional[int]:
         """return the index of the loop
 
         Parameters
         ----------
-        loop: str or Loop
-            Loop name or Loop object.
+        loop: str or TriLoop
+            TriLoop name or TriLoop object.
+        return_type: str, optional
+            Whether to return the index or mask of the loop. Default is 'index'.
         """
         if isinstance(loop, str):
-            loop = Loop.from_name(loop)
-        elif not isinstance(loop, Loop):
-            raise TypeError(f"loop should be str or Loop, but got {type(loop)}.")
-        if loop in self:
-            return np.where(np.all(self._values == loop.values, axis=1))[0][0]
-        else:
-            return None
+            loop = TriLoop.from_name(loop)
+        elif not isinstance(loop, TriLoop):
+            raise TypeError(f"loop should be str or TriLoop, but got {type(loop)}.")
+        
+        # TODO: finish this function
 
     def sort(
         self,
@@ -1152,7 +1288,7 @@ class Loops:
 
         Returns
         -------
-        None or (Loops, np.ndarray). if inplace is True, return the sorted loops
+        None or (TriLoops, np.ndarray). if inplace is True, return the sorted loops
         and the index of the sorted loops in the original loops. Otherwise,
         return None.
         """
@@ -1190,7 +1326,7 @@ class Loops:
             self._dates = np.unique(self._values)
             self._length = self._values.shape[0]
         else:
-            return Loops(self._values[_index]), _index
+            return TriLoops(self._values[_index]), _index
 
     def to_seasons(self):
         """return the season of each loop.
@@ -1217,6 +1353,107 @@ class Loops:
         return seasons
 
 
+class Loop:
+    """Loop class containing multiple pairs/acquisitions."""
+
+    def __init__(self, loop: Iterable[datetime], loops_paris: Pairs) -> None:
+        """Initialize the Loop class
+
+        loop: Iterable
+            Iterable object of dates. Each date is a datetime object.
+            For example, (date1, ..., date_n).
+        loops_paris: Pairs
+            all pairs of the loops. used to generate the loop matrix.
+        """
+        self._loops_pairs = loops_paris
+
+        self._values = np.asarray(loop).astype("M8[D]")
+        loop_dt = self._values.astype(datetime)
+        self._name = "_".join([i.strftime("%Y%m%d") for i in loop_dt])
+
+        num = len(self._values)
+        self._length = num
+
+        _pairs = []
+        for i in range(num - 1):
+            _pair = Pair([loop_dt[i], loop_dt[i + 1]])
+            _pairs.append(_pair)
+        _pairs.append(Pair([loop_dt[0], loop_dt[-1]]))
+        self._pairs = Pairs(_pairs, sort=False)
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __str__(self) -> str:
+        return self._name
+
+    def __repr__(self) -> str:
+        return f"Loop({self._name})"
+
+    def __eq__(self, other) -> bool:
+        return self.name == other.name
+
+    def __hash__(self) -> int:
+        return hash(self.name)
+
+    def __array__(self, dtype=None) -> np.ndarray:
+        """return the loop matrix"""
+        matrix = np.isin(self.loops_pairs.to_names(), self.pairs.to_names()).astype(int)
+        matrix[self.loops_pairs.where(self.pairs[-1])] = -1
+        return matrix
+
+    @property
+    def values(self) -> np.ndarray:
+        """return the values array of the loop.
+
+        Returns
+        -------
+        values: np.ndarray
+            dates of the loop with format of np.datetime64[D].
+        """
+        return self._values
+
+    @property
+    def pairs(self) -> Pairs:
+        """return all pairs of the loop.
+
+        Returns
+        -------
+        pairs: Pairs
+            Pairs of the loop.
+        """
+        return self._pairs
+
+    @property
+    def name(self) -> str:
+        """return the string format the loop.
+
+        Returns
+        -------
+        name: str
+            String of the loop.
+        """
+        return self._name
+
+    @property
+    def loops_pairs(self) -> str:
+        """return all pairs of the loop.
+
+        Returns
+        -------
+        pairs: Pairs
+            Pairs of the loop.
+        """
+        return self._loops_pairs
+
+
+class Loops:
+    """Loops class to handle loops with multiple acquisitions."""
+
+    def __init__(self) -> None:
+        pass
+
+
 class SBASNetwork:
     """SBAS network class to handle pairs and loops.
 
@@ -1233,7 +1470,7 @@ class SBASNetwork:
     """
 
     _pairs: Pairs
-    _loops: Loops
+    _loops: TriLoops
     _baseline: np.ndarray
 
     __slots__ = ["_pairs", "_loops", "_baseline"]
@@ -1286,13 +1523,13 @@ class SBASNetwork:
         return self._pairs
 
     @property
-    def loops(self) -> Loops:
+    def loops(self) -> TriLoops:
         """return the loops of the network
 
         Returns
         -------
-        loops: Loops
-            Loops of the network.
+        loops: TriLoops
+            TriLoops of the network.
         """
         return self._loops
 
@@ -1723,6 +1960,74 @@ class DateManager:
         return tuple(dates)
 
 
+def find_loops(
+    loops_pairs: Pairs,
+    pairs_left: Pairs,
+    loops: list[Loop],
+    loop: Loop,
+    pair_end: datetime,
+    max_loop_length=6,
+    interval_days: Optional[int] = None,
+) -> None:
+    for p in pairs_left:
+        m_candidate = (loops_pairs.primary == p.secondary) & (
+            loops_pairs.secondary <= pair_end
+        )
+        if not m_candidate.any():
+            continue
+        pairs_candidate = loops_pairs[m_candidate]
+        for p2 in pairs_candidate:
+            if not is_pair_loop_full_rank(p2, loops_pairs, interval_days):
+                continue
+            loop_i = loop.copy()
+            loop_i.append(p2.primary)
+            if p2.secondary == pair_end:
+                loop_i.append(p2.secondary)
+                loops.append(Loop(loop_i, loops_pairs))
+            else:
+                if len(loop_i) + 1 < max_loop_length:
+                    find_loops(
+                        loops_pairs,
+                        pairs_candidate,
+                        loops,
+                        loop_i,
+                        pair_end,
+                        max_loop_length,
+                        interval_days,
+                    )
+
+
+def is_pair_loop_full_rank(
+    pair: Pair, pairs: Pairs, interval_days: Optional[int] = None
+) -> bool:
+    """check the rank of the pair in the loop (whether can be form full-rank loop)
+
+    Parameters
+    ----------
+    pair: Pair
+        Pair to be checked.
+    pairs: Pairs
+        All pairs of the loop.
+
+    Returns
+    -------
+    rank: bool
+        Whether can be form full-rank loop.
+    """
+    full_rank = False
+    start_date, end_date = pair.values
+    mask_middle = (pairs.primary >= start_date) & (pairs.secondary <= end_date)
+    if interval_days is not None:
+        mask_middle = mask_middle & (pairs.days <= interval_days)
+    if not mask_middle.any():
+        return full_rank
+    pairs_middle = pairs[mask_middle]
+    if pairs_middle.days.sum() >= pair.days:
+        full_rank = True
+
+    return full_rank
+
+
 if __name__ == "__main__":
     names = [
         "20170111_20170204",
@@ -1739,4 +2044,4 @@ if __name__ == "__main__":
 
     pairs = Pairs.from_names(names)
     loops = pairs.to_loops()
-    pairs1 = loops.pairs
+    # pairs1 = loops.pairs
