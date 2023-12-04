@@ -678,7 +678,7 @@ class RasterDataset(GeoDataset):
         return sample
 
     def _bbox_query(self, bbox: BoundingBox, vrt_fh) -> np.ndarray:
-        """Return the index of files that intersect with the given bounding box."""
+        """Return the index of the give file that intersect with the given bounding box."""
         bbox = self._ensure_query_crs(bbox)
 
         win = vrt_fh.window(*bbox)
@@ -698,7 +698,7 @@ class RasterDataset(GeoDataset):
         return data
 
     def _points_query(self, points: Points, vrt_fh) -> np.ndarray:
-        """Return the index of files that intersect with the given points. Points that outside the dataset will be masked."""
+        """Return the index of the given file that intersect with the given points. Points that outside the dataset will be masked."""
         points = self._ensure_query_crs(points)
         data = np.ma.hstack(list(vrt_fh.sample(points.values, masked=True)))
 

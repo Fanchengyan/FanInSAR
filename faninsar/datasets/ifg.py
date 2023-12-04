@@ -4,13 +4,16 @@ from typing import Any, Literal, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
+import rasterio
 import xarray as xr
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
+from tqdm.auto import tqdm
 
 from faninsar._core import geo_tools
 from faninsar._core.pair_tools import Pairs
 from faninsar.datasets.base import ApsPairs, PairDataset, RasterDataset
+from faninsar.NSBAS import PhaseDeformationConverter
 from faninsar.query.query import BoundingBox, GeoQuery, Points
 
 
@@ -439,3 +442,103 @@ class InterferogramDataset(PairDataset):
             ds, ["unw", "coh"], crs=self.crs, x_dim="lon", y_dim="lat"
         )
         ds.to_netcdf(filename)
+
+    def to_tiffs(
+        self,
+        out_dir: Union[str, Path],
+        roi: Optional[BoundingBox] = None,
+        ref_points: Optional[Points] = None,
+        pairs: Optional[Pairs] = None,
+        pdc: Optional[PhaseDeformationConverter] = False,
+        los_ratio: Optional[np.ndarray] = None,
+        names_unw: Optional[list[str]] = None,
+        names_coh: Optional[list[str]] = None,
+        overwrite: bool = True,
+    ) -> None:
+        """Save the dataset to files for given region of interest.
+
+        Parameters
+        ----------
+        out_dir : str
+            path to the directory to save the files
+        roi : BoundingBox, optional
+            region of interest to save. If None, the roi of the dataset will be
+            used.
+        ref_points : Points, optional, default: None
+            reference points to save. If None, will keep the original values.
+        pairs : Pairs, optional
+            pairs to save. If None, will save all pairs.
+        pdc : PhaseDeformationConverter, optional
+            PhaseDeformationConverter object used to convert the phase to
+            deformation. If None, will save the phase.
+        los_ratio : np.ndarray, optional
+            los angle ratio map used to convert deformation from line-of-sight
+            (LOS) direction to vertical. You can use the method :meth:`load_los_ratio`
+            to load the los angle ratio map. If None, will save the LOS deformation.
+        names_unw : list of str, optional
+            names of the unwrapped interferograms to save. If None, original names
+            files to save. If None, original names will be used.
+            If pairs is not None, names should be with the same length as pairs.
+        names_coh : list of str, optional
+            names of the files to save. If None, original names will be used.
+            If pairs is not None, names should be with the same length as pairs.
+        overwrite : bool, optional
+            if True, overwrite the existing files. Default is True.
+        """
+        out_dir = Path(out_dir)
+        if roi is None:
+            roi = self.roi
+
+        profile = self.get_profile(roi)
+        profile["count"] = 1
+
+        if pairs is None:
+            pairs = self.pairs
+
+        m_pairs = self.pairs.where(pairs, return_type="mask")
+        files_unw = self.files.paths[m_pairs].values
+        files_coh = self._ds_coh.files.paths[m_pairs].values
+
+        if self.verbose:
+            files_unw = tqdm(files_unw, desc="Saving unwrapped interferograms")
+        for i, f_unw in enumerate(files_unw):
+            if names_unw is None:
+                out_file = out_dir / Path(f_unw).name
+            else:
+                out_file = out_dir / names_unw[i]
+
+            if out_file.exists() and not overwrite:
+                print(f"File {out_file} exists, skip")
+                continue
+
+            src = self._load_warp_file(f_unw)
+            dest_arr = self._bbox_query(roi, src).squeeze(0)
+
+            if ref_points is not None:
+                ref_val = (self._points_query(ref_points, src)).mean()
+                dest_arr = dest_arr - ref_val
+            if pdc is not None:
+                dest_arr = pdc.phase2deformation(dest_arr)
+            if los_ratio is not None:
+                dest_arr = dest_arr / los_ratio
+
+            with rasterio.open(out_file, "w", **profile) as dst:
+                dst.write(dest_arr, 1)
+
+        if self.verbose:
+            files_coh = tqdm(files_coh, desc="Saving coherence files")
+        for i, f_coh in enumerate(files_coh):
+            if names_coh is None:
+                out_file = out_dir / Path(f_coh).name
+            else:
+                out_file = out_dir / names_coh[i]
+
+            if out_file.exists() and not overwrite:
+                print(f"File {out_file} exists, skip")
+                continue
+
+            src = self._load_warp_file(f_coh)
+            dest_arr = self._bbox_query(roi, src).squeeze(0)
+
+            with rasterio.open(out_file, "w", **profile) as dst:
+                dst.write(dest_arr, 1)
