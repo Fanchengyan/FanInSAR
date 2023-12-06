@@ -996,6 +996,45 @@ class RasterDataset(GeoDataset):
         )
         ds.to_netcdf(filename)
 
+    def save_arr_to_tiff(
+        self,
+        arr: np.ndarray,
+        filename: Union[str, Path],
+        roi: Optional[BoundingBox] = None,
+        profile: Optional[Profile] = None,
+    ) -> None:
+        """Save a numpy array to a tiff file using the geoinformation of the dataset.
+
+        Parameters
+        ----------
+        arr : numpy.ndarray
+            numpy array to save
+        filename : str or Path
+            path to the tiff file to save
+        roi : BoundingBox, optional
+            Region of interest to save. only used if profile is None.
+        profile : Profile, optional
+            profile of the tiff file. If None, the roi must be specified.
+        """
+        if arr.ndim == 2:
+            indexes = [1]
+            arr = arr[np.newaxis, :, :]
+        elif arr.ndim == 3:
+            indexes = [i + 1 for i in range(arr.shape[0])]
+        else:
+            raise ValueError(
+                f"Expected arr to be an array of shape (n, m) or (n, m, k), got {arr.shape}"
+            )
+
+        if profile is None:
+            if roi is None:
+                raise ValueError("roi must be specified if profile is None")
+            profile = self.get_profile(roi)
+            profile["count"] = arr.shape[0]
+
+        with rasterio.open(filename, "w", **profile) as dst:
+            dst.write(arr, indexes)
+
 
 class PairDataset(RasterDataset):
     """A base class for pair datasets."""
