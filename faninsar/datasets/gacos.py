@@ -125,10 +125,10 @@ class GACOS(ApsDataset):
 
     def to_pair_files(
         self,
-        out_dir: str | Path,
+        out_dir: Union[str, Path],
         pairs: Pairs,
         ref_points: Points,
-        roi: BoundingBox | None = None,
+        roi: Union[BoundingBox, None] = None,
         overwrite: bool = False,
         prefix: str = "GACOS",
     ):
