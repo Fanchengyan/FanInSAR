@@ -1008,7 +1008,8 @@ class RasterDataset(GeoDataset):
         Parameters
         ----------
         arr : numpy.ndarray
-            numpy array to save
+            numpy array to save. arr can be a 2D array or a 3D array. If arr is a
+            3D array, the first dimension is the band dimension.
         filename : str or Path
             path to the tiff file to save
         roi : BoundingBox, optional
