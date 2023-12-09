@@ -5,6 +5,7 @@ from typing import Dict, List, Literal, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import rasterio
+import rioxarray
 import xarray as xr
 from rasterio import Affine, dtypes, transform
 from rasterio.crs import CRS
@@ -1037,5 +1038,3 @@ class Profile:
         lon = tf.xoff + tf.a * np.arange(width) + tf.a * 0.5
         lat = tf.yoff + tf.e * np.arange(height) + tf.e * 0.5
         return lat, lon
-
-
