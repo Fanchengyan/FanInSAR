@@ -13,6 +13,12 @@ from rasterio.io import MemoryFile
 from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
 from tqdm.auto import tqdm
+from faninsar._core.logger import setup_logger
+
+
+logger = setup_logger(
+    log_name="FanInSAR.geo_tools", log_format="%(levelname)s - %(message)s"
+)
 
 
 class GeoDataFormatConverter:
@@ -262,9 +268,8 @@ class GeoDataFormatConverter:
                         f"nodata {nodata} is out of dtype range {dtype_ranges}"
                     )
                 else:
-                    print(
-                        "Warning: nodata is out of dtype range, "
-                        "nodata will be set to None"
+                    logger.warning(
+                        "nodata is out of dtype range, " "nodata will be set to None"
                     )
                     self.profile["nodata"] = None
 
@@ -558,7 +563,7 @@ def write_geoinfo_into_nc(
         if "time" in ds:
             encode.update({"time": {"units": "days since 2000-01-01 00:00:00"}})
         else:
-            print(
+            logger.warning(
                 f'there is no "time" dimension in {nc_file}, '
                 "encoding process will be ignored"
             )
@@ -871,9 +876,8 @@ class GeoDataFormatConverter:
                         f"nodata {nodata} is out of dtype range {dtype_ranges}"
                     )
                 else:
-                    print(
-                        "Warning: nodata is out of dtype range, "
-                        "nodata will be set to None"
+                    logger.warning(
+                        "nodata is out of dtype range, " "nodata will be set to None"
                     )
                     self.profile["nodata"] = None
 

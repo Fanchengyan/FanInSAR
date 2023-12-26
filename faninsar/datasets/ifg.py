@@ -11,10 +11,15 @@ from rasterio.enums import Resampling
 from tqdm.auto import tqdm
 
 from faninsar._core import geo_tools
+from faninsar._core.logger import setup_logger
 from faninsar._core.pair_tools import Pairs
 from faninsar.datasets.base import ApsPairs, PairDataset, RasterDataset
 from faninsar.NSBAS import PhaseDeformationConverter
 from faninsar.query.query import BoundingBox, GeoQuery, Points
+
+logger = setup_logger(
+    log_name="FanInSAR.datasets.ifg", log_format="%(levelname)s - %(message)s"
+)
 
 
 class InterferogramDataset(PairDataset):
@@ -508,7 +513,7 @@ class InterferogramDataset(PairDataset):
                 out_file = out_dir / names_unw[i]
 
             if out_file.exists() and not overwrite:
-                print(f"File {out_file} exists, skip")
+                logger.info(f"File {out_file} exists, skip")
                 continue
 
             src = self._load_warp_file(f_unw)
@@ -534,7 +539,7 @@ class InterferogramDataset(PairDataset):
                 out_file = out_dir / names_coh[i]
 
             if out_file.exists() and not overwrite:
-                print(f"File {out_file} exists, skip")
+                logger.info(f"File {out_file} exists, skip")
                 continue
 
             src = self._load_warp_file(f_coh)

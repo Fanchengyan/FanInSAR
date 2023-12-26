@@ -2,8 +2,14 @@ import math
 from collections.abc import Iterator
 from typing import Iterable, Optional, Union
 
+from faninsar._core.logger import setup_logger
 from faninsar.datasets import GeoDataset
 from faninsar.query import BoundingBox
+
+logger = setup_logger(
+    log_name="FanInSAR.samplers.batch", log_format="%(levelname)s - %(message)s"
+)
+
 
 class RowSampler:
     """A sampler samples data from a dataset in a row-wise manner.
@@ -62,8 +68,8 @@ class RowSampler:
             if patch_num is None:
                 raise ValueError("Either patch_size or patch_num must be provided.")
             if patch_num > height:
-                print(
-                    f"Warning: patch_num ({patch_num}) is larger than the height ({height })\n"
+                logger.warning(
+                    f"patch_num ({patch_num}) is larger than the height ({height })\n"
                     "of the dataset. The patch_num will be set to the height of the dataset.\n"
                     "If this cannot meet your requirement, please try to choose other Sampler."
                 )

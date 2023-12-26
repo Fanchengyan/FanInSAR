@@ -29,11 +29,16 @@ from shapely import ops
 from tqdm.auto import tqdm
 
 from faninsar._core import geo_tools
+from faninsar._core.logger import setup_logger
 from faninsar._core.geo_tools import Profile
 from faninsar._core.pair_tools import Pairs
 from faninsar.query.query import BoundingBox, GeoQuery, Points
 
 __all__ = ("GeoDataset", "RasterDataset", "PairDataset", "ApsDataset")
+
+logger = setup_logger(
+    log_name="FanInSAR.datasets.base", log_format="%(levelname)s - %(message)s"
+)
 
 
 class GeoDataset(abc.ABC):
@@ -151,8 +156,8 @@ class GeoDataset(abc.ABC):
             )
             new_res = (abs(float(tf.a)), abs(float(tf.e)))
             if new_res[0] != self.res[0] or new_res[1] != self.res[1]:
-                print(
-                    f"Warning: the resolution of the dataset has been changed from {self.res} to {new_res}."
+                logger.warning(
+                    f"the resolution of the dataset has been changed from {self.res} to {new_res}."
                 )
                 self.res = new_res
 
@@ -1294,7 +1299,7 @@ class ApsDataset(RasterDataset):
             primary, secondary = pair_name.split("_")
             out_file = Path(out_dir) / f"{prefix}_{pair_name}.tif"
             if out_file.exists() and not overwrite:
-                print(f"{out_file.name} already exists, skipping")
+                logger.info(f"{out_file.name} already exists, skipping")
                 continue
             with rasterio.open(out_file, "w", **profile.profile) as dst:
                 src_primary = self._load_warp_file(df_paths[primary])
