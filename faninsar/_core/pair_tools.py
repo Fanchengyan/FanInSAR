@@ -643,26 +643,26 @@ class Pairs:
         """return the pairs as a DataFrame"""
         return pd.DataFrame(self._values, columns=["primary", "secondary"])
 
-    def to_triloops(self) -> "TriLoops":
-        """return all possible loops from the pairs"""
+    def to_triplet_loops(self) -> "TripletLoops":
+        """return all possible triplet loops from the pairs"""
         loops = []
         for i, pair12 in enumerate(self._values):
             for pair23 in self._values[i + 1 :]:
                 if pair12[1] == pair23[0] and Pair([pair12[0], pair23[1]]) in self:
                     loops.append([pair12[0], pair12[1], pair23[1]])
-        return TriLoops(loops)
+        return TripletLoops(loops)
 
     def to_loops(
         self,
-        max_length: int = 6,
+        max_acquisition: int = 5,
         interval_days: Optional[int] = 12,
     ) -> "Loops":
         """return all possible loops from the pairs
 
         Parameters
         ----------
-        max_length: int
-            Maximum length/number of pairs in the loops. Default is 6.
+        max_acquisition: int
+            Maximum number of acquisition in the loops.
         interval_days: int, optional
             Minimum interval days between the pair in the loops. Used to exclude
             pairs between which there are absences of nearest connections pair
@@ -683,7 +683,13 @@ class Pairs:
             # a list containing all loops
 
             find_loops(
-                self, pairs_first, loops, loop, pair_end, max_length, interval_days
+                self,
+                pairs_first,
+                loops,
+                loop,
+                pair_end,
+                max_acquisition + 1,  # +1 to include the opposite-direction pair
+                interval_days,
             )
 
         return loops
@@ -715,8 +721,8 @@ class Pairs:
         return [i.strftime(format) for i in self._dates.astype(datetime)]
 
 
-class TriLoop:
-    """TriLoop class containing three pairs/acquisitions.
+class TripletLoop:
+    """TripletLoop class containing three pairs/acquisitions.
 
     Examples
     --------
@@ -736,7 +742,7 @@ class TriLoop:
     __slots__ = ["_values", "_pairs", "_name", "_days12", "_days23", "_days13"]
 
     def __init__(self, loop: Iterable[datetime, datetime, datetime]) -> None:
-        """initialize the TriLoop class
+        """initialize the TripletLoop class
 
         Parameters
         ----------
@@ -757,7 +763,7 @@ class TriLoop:
         return self._name
 
     def __repr__(self) -> str:
-        return f"TriLoop({self._name})"
+        return f"TripletLoop({self._name})"
 
     def __eq__(self, other) -> bool:
         return self.name == other.name
@@ -840,13 +846,13 @@ class TriLoop:
         name: str,
         parse_function: Optional[Callable] = None,
         date_args: Optional[dict] = None,
-    ) -> "TriLoop":
+    ) -> "TripletLoop":
         """initialize the loop class from a loop name
 
         Parameters
         ----------
         name: str
-            TriLoop name.
+            TripletLoop name.
         parse_function: Callable, optional
             Function to parse the date strings from the loop name.
             If None, the loop name will be split by '_' and the
@@ -858,15 +864,15 @@ class TriLoop:
 
         Returns
         -------
-        loop: TriLoop
-            TriLoop object.
+        loop: TripletLoop
+            TripletLoop object.
         """
         dates = DateManager.str_to_dates(name, 3, parse_function, date_args)
         return cls(dates)
 
 
-class TriLoops:
-    """TriLoops class to handle loops"""
+class TripletLoops:
+    """TripletLoops class to handle loops"""
 
     _values: np.ndarray
     _dates: np.ndarray
@@ -877,7 +883,7 @@ class TriLoops:
     def __init__(
         self,
         loops: Union[
-            Iterable[Iterable[datetime, datetime, datetime]], Iterable[TriLoop]
+            Iterable[Iterable[datetime, datetime, datetime]], Iterable[TripletLoop]
         ],
         sort: bool = True,
     ) -> None:
@@ -887,7 +893,7 @@ class TriLoops:
         ----------
         loops: Iterable
             Iterable object of loops. Each loop is an Iterable object
-            of three dates with format of datetime or TriLoop object.
+            of three dates with format of datetime or TripletLoop object.
             For example, [(date1, date2, date3), ...].
         """
         if loops is None or len(loops) == 0:
@@ -903,7 +909,7 @@ class TriLoops:
             self.sort(inplace=True)
 
     def __str__(self) -> str:
-        return f"TriLoops({self._length})"
+        return f"TripletLoops({self._length})"
 
     def __repr__(self) -> str:
         return self.to_frame("dates").__repr__()
@@ -911,19 +917,19 @@ class TriLoops:
     def __len__(self) -> int:
         return self._length
 
-    def __eq__(self, other: "TriLoops") -> bool:
+    def __eq__(self, other: "TripletLoops") -> bool:
         return np.array_equal(self.values, other.values)
 
-    def __add__(self, other: "TriLoops") -> "TriLoops":
+    def __add__(self, other: "TripletLoops") -> "TripletLoops":
         _loops = np.union1d(self.to_names(), other.to_names())
-        return TriLoops.from_names(_loops)
+        return TripletLoops.from_names(_loops)
 
-    def __sub__(self, other: "TriLoops") -> Optional["TriLoops"]:
+    def __sub__(self, other: "TripletLoops") -> Optional["TripletLoops"]:
         _loops = np.setdiff1d(self.to_names(), other.to_names())
         if len(_loops) > 0:
-            return TriLoops.from_names(_loops)
+            return TripletLoops.from_names(_loops)
 
-    def __getitem__(self, index: int) -> Union["TriLoop", "TriLoops"]:
+    def __getitem__(self, index: int) -> Union["TripletLoop", "TripletLoops"]:
         if isinstance(index, slice):
             start, stop, step = index.start, index.stop, index.step
             if isinstance(start, (int, np.integer, type(None))) and isinstance(
@@ -933,7 +939,7 @@ class TriLoops:
                     start = 0
                 if stop is None:
                     stop = self._length
-                return TriLoops(self._values[start:stop:step])
+                return TripletLoops(self._values[start:stop:step])
             elif isinstance(
                 start, (datetime, np.datetime64, pd.Timestamp, str, type(None))
             ) and isinstance(
@@ -960,15 +966,15 @@ class TriLoops:
                     if np.all((start <= loop) & (loop <= stop)):
                         _loops.append(loop)
                 if len(_loops) > 0:
-                    return TriLoops(_loops)
+                    return TripletLoops(_loops)
                 else:
                     return None
         elif isinstance(index, (int, np.integer)):
             if index >= self._length:
                 raise IndexError(
-                    f"Index {index} out of range. TriLoops number is {self._length}."
+                    f"Index {index} out of range. TripletLoops number is {self._length}."
                 )
-            return TriLoop(self._values[index])
+            return TripletLoop(self._values[index])
         elif isinstance(index, (datetime, np.datetime64, pd.Timestamp, str)):
             if isinstance(index, str):
                 try:
@@ -980,12 +986,12 @@ class TriLoops:
                 if index in loop:
                     loops.append(loop)
             if len(loops) > 0:
-                return TriLoops(loops)
+                return TripletLoops(loops)
             else:
                 return None
         elif isinstance(index, Iterable):
             index = np.array(index)
-            return TriLoops(self._values[index])
+            return TripletLoops(self._values[index])
         else:
             raise TypeError(
                 f"Index should be int, slice, datetime, str, or bool or int array"
@@ -999,15 +1005,15 @@ class TriLoops:
         return iter(self.values)
 
     def __contains__(self, item):
-        if isinstance(item, TriLoop):
+        if isinstance(item, TripletLoop):
             item = item.values
         elif isinstance(item, str):
-            item = TriLoop.from_name(item).values
+            item = TripletLoop.from_name(item).values
         elif isinstance(item, Iterable):
             item = np.sort(item)
         else:
             raise TypeError(
-                f"item should be TriLoop, str, or Iterable, but got {type(item)}."
+                f"item should be TripletLoop, str, or Iterable, but got {type(item)}."
             )
 
         return np.any(np.all(item == self.values, axis=1))
@@ -1142,7 +1148,7 @@ class TriLoops:
         names: list[str],
         parse_function: Optional[Callable] = None,
         date_args: Optional[dict] = None,
-    ) -> "TriLoops":
+    ) -> "TripletLoops":
         """initialize the loops class from a list of loop file names.
 
         Parameters
@@ -1160,12 +1166,12 @@ class TriLoops:
 
         Returns
         -------
-        loops: TriLoops
-            unsorted TriLoops object.
+        loops: TripletLoops
+            unsorted TripletLoops object.
         """
         loops = []
         for name in names:
-            loop = TriLoop.from_name(name, parse_function, date_args)
+            loop = TripletLoop.from_name(name, parse_function, date_args)
             loops.append(loop.values)
         return cls(loops, sort=False)
 
@@ -1220,7 +1226,7 @@ class TriLoops:
         Returns
         -------
         matrix: np.ndarray
-            TriLoop matrix with the shape of (n_loop, n_pair). The values of each
+            TripletLoop matrix with the shape of (n_loop, n_pair). The values of each
             loop/row in matrix are:
 
             - 1: pair12 and pair23
@@ -1240,23 +1246,23 @@ class TriLoops:
 
     def where(
         self,
-        loop: Union[str, TriLoop],
+        loop: Union[str, TripletLoop],
         return_type: Literal["index", "mask"] = "index",
     ) -> Optional[int]:
         """return the index of the loop
 
         Parameters
         ----------
-        loop: str or TriLoop
-            TriLoop name or TriLoop object.
+        loop: str or TripletLoop
+            TripletLoop name or TripletLoop object.
         return_type: str, optional
             Whether to return the index or mask of the loop. Default is 'index'.
         """
         if isinstance(loop, str):
-            loop = TriLoop.from_name(loop)
-        elif not isinstance(loop, TriLoop):
-            raise TypeError(f"loop should be str or TriLoop, but got {type(loop)}.")
-        
+            loop = TripletLoop.from_name(loop)
+        elif not isinstance(loop, TripletLoop):
+            raise TypeError(f"loop should be str or TripletLoop, but got {type(loop)}.")
+
         # TODO: finish this function
 
     def sort(
@@ -1288,7 +1294,7 @@ class TriLoops:
 
         Returns
         -------
-        None or (TriLoops, np.ndarray). if inplace is True, return the sorted loops
+        None or (TripletLoops, np.ndarray). if inplace is True, return the sorted loops
         and the index of the sorted loops in the original loops. Otherwise,
         return None.
         """
@@ -1326,7 +1332,7 @@ class TriLoops:
             self._dates = np.unique(self._values)
             self._length = self._values.shape[0]
         else:
-            return TriLoops(self._values[_index]), _index
+            return TripletLoops(self._values[_index]), _index
 
     def to_seasons(self):
         """return the season of each loop.
@@ -1470,7 +1476,7 @@ class SBASNetwork:
     """
 
     _pairs: Pairs
-    _loops: TriLoops
+    _loops: TripletLoops
     _baseline: np.ndarray
 
     __slots__ = ["_pairs", "_loops", "_baseline"]
@@ -1523,13 +1529,13 @@ class SBASNetwork:
         return self._pairs
 
     @property
-    def loops(self) -> TriLoops:
+    def loops(self) -> TripletLoops:
         """return the loops of the network
 
         Returns
         -------
-        loops: TriLoops
-            TriLoops of the network.
+        loops: TripletLoops
+            TripletLoops of the network.
         """
         return self._loops
 
