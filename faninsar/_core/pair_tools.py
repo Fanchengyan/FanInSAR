@@ -1726,11 +1726,75 @@ class PairsFactory:
 
         return Pairs(_pairs)
 
+    def linking_winter(
+        self,
+        winter_start: str = "0101",
+        winter_end: str = "0331",
+        n_per_winter: int = 5,
+        max_winter_interval: int = 1,
+    ) -> Pairs:
+        """generate interferometric pairs linking winter in each year. winter
+        is defined by month and day for each year. For example, winter_start='0101',
+        winter_end='0331' means the winter is from Jan 1 to Mar 31 for each year in
+        the time series. This will be useful to add pairs for completely frozen
+        period across years in permafrost region.
+
+        Parameters
+        ----------
+        winter_start, winter_end:  str
+            start and end date for the winter which expressed as month and day
+            with format '%m%d'
+        n_per_winter: int
+            how many dates will be used for each winter. Those dates will be
+            selected randomly in each winter. Default is 5
+        max_winter_interval: int
+            max interval between winters for interferometric pair. If 
+            max_winter_interval=1, hen the interferometric pairs will be generated 
+            between neighboring winters.
+
+        Returns
+        -------
+        pairs: Pairs object
+        """
+        years = sorted(set(self.dates.year))
+        df_dates = pd.Series(self.dates, index=self.dates)
+
+        # check if period_start and period_end are in the same year. If not,
+        # the period_end should be in the next year
+        same_year = True if int(winter_start) < int(winter_end) else False
+
+        # randomly select n_per_period dates in each period/year
+        date_years = []
+        for year in years:
+            start = pd.to_datetime(f"{year}{winter_start}", format="%Y%m%d")
+            if same_year:
+                end = pd.to_datetime(f"{year}{winter_end}", format="%Y%m%d")
+            else:
+                end = pd.to_datetime(f"{year+1}{winter_end}", format="%Y%m%d")
+
+            dt_year = df_dates[start:end]
+            if len(dt_year) > 0:
+                np.random.shuffle(dt_year)
+                date_years.append(dt_year[:n_per_winter].to_list())
+
+        n_years = len(years)
+
+        _pairs = []
+        for i, date_year in enumerate(date_years):
+            # primary/reference dates
+            for date_primary in date_year:
+                for j in range(1, max_winter_interval + 1):
+                    if i + j < n_years:
+                        # secondary dates
+                        for date_secondary in date_years[i + j]:
+                            _pairs.append((date_primary, date_secondary))
+        return Pairs(_pairs)
+
     def from_period(
         self,
         period_start: str = "1201",
         period_end: str = "0331",
-        n_per_period: str = 3,
+        n_per_period: int = 3,
         n_primary_period: Optional[str] = None,
         primary_years: Optional[list[int]] = None,
     ) -> Pairs:
