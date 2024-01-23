@@ -663,6 +663,12 @@ class Pairs:
         ----------
         max_acquisition: int
             Maximum number of acquisition in the loops. It should be at least 3.
+
+            .. note::
+
+                the number of acquisition is equal to the number of intervals + 1
+                :math:`n_{edge pairs} = n_{intervals}  =  n_{acquisition} - 1`.
+
         edge_days: int, optional
             The maximum days of the edge pairs, used to identify the edge pairs
             and exclude the not valid diagonal pairs that cannot form loops using
@@ -685,13 +691,7 @@ class Pairs:
 
             # find loops with the primary acquisition
             find_loops(
-                self,
-                loops,
-                loop,
-                pairs_primary,
-                pair_end,
-                edge_days,
-                max_acquisition + 1,  # +1 to include the diagonal pair
+                self, loops, loop, pairs_primary, pair_end, edge_days, max_acquisition
             )
 
         return loops
@@ -725,16 +725,6 @@ class Pairs:
 
 class TripletLoop:
     """TripletLoop class containing three pairs/acquisitions.
-
-    Examples
-    --------
-
-        prepare dates and loops for examples:
-
-        Get pairs of loops and then convert back to loops to check if they are equal
-
-        >>> loops == loops.pairs.to_loops()
-        True
     """
 
     _values: np.ndarray
@@ -874,7 +864,7 @@ class TripletLoop:
 
 
 class TripletLoops:
-    """TripletLoops class to handle loops"""
+    """TripletLoops class to handle loops with three pairs/acquisitions."""
 
     _values: np.ndarray
     _dates: np.ndarray
@@ -1230,7 +1220,7 @@ class TripletLoops:
         matrix: np.ndarray
             TripletLoop matrix with the shape of (n_loop, n_pair). The values of each
             loop/row in matrix are:
-
+            
             - 1: pair12 and pair23
             - -1: pair13
             - 0: otherwise
@@ -1284,8 +1274,8 @@ class TripletLoops:
             The available options are one or a list of:
 
             - **date:**: 'date1', 'date2', 'date3'
-            - **pairs:*: 'pairs12', 'pairs23', 'pairs13'
-            - **days:**: 'days12', 'days23', 'days13'
+            - **pairs:** 'pairs12', 'pairs23', 'pairs13'
+            - **days:** 'days12', 'days23', 'days13'
             - **short name:** 'date', 'pairs', 'days'. short name will be
                 treated as a combination of the above options. For example,
                 'date' is equivalent to ['date1', 'date2', 'date3'].
@@ -2039,7 +2029,7 @@ def find_loops(
     pairs_left: Pairs,
     pair_end: datetime,
     edge_days: Optional[int] = None,
-    max_loop_length=6,
+    max_acquisition=5,
 ) -> None:
     """recursively find all available loops within pairs_left and pair_end."""
     for pair_left in pairs_left:
@@ -2058,7 +2048,8 @@ def find_loops(
                 loop_i.append(pair_middle.secondary)
                 loops.append(Loop(loop_i, loops_pairs))
             else:
-                if len(loop_i) + 1 < max_loop_length:
+                # +1 for end pair
+                if len(loop_i) + 1 < max_acquisition:
                     find_loops(
                         loops_pairs,
                         loops,
@@ -2066,7 +2057,7 @@ def find_loops(
                         pairs_candidate,
                         pair_end,
                         edge_days,
-                        max_loop_length,
+                        max_acquisition,
                     )
 
 
