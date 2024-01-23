@@ -655,41 +655,43 @@ class Pairs:
     def to_loops(
         self,
         max_acquisition: int = 5,
-        interval_days: Optional[int] = 12,
+        edge_days: Optional[int] = 12,
     ) -> "Loops":
         """return all possible loops from the pairs
 
         Parameters
         ----------
         max_acquisition: int
-            Maximum number of acquisition in the loops.
-        interval_days: int, optional
-            Minimum interval days between the pair in the loops. Used to exclude
-            pairs between which there are absences of nearest connections pair
-            that with the interval days. If None, no interval days requirement.
-            Default is 12.
+            Maximum number of acquisition in the loops. It should be at least 3.
+        edge_days: int, optional
+            The maximum days of the edge pairs, used to identify the edge pairs
+            and exclude the not valid diagonal pairs that cannot form loops using
+            the edge pairs. If None, all available diagonal pairs will be used to
+            form loops. Default is 12.
         """
+        # a list containing all loops
         loops = []
         for i in self:
-            if not is_pair_loop_full_rank(i, self, interval_days):
+            if not valid_diagonal_pair(i, self, edge_days):
                 continue
             pair_start, pair_end = i.values[0], i.values[1]
-            m_first = (self.primary == pair_start) & (self.secondary < pair_end)
-            if not m_first.any():
+            mask_primaries = (self.primary == pair_start) & (self.secondary < pair_end)
+            if not mask_primaries.any():
                 continue
-            pairs_first = self[m_first]
+            pairs_primary = self[mask_primaries]
 
-            loop = [pair_start]  # a list of acquisition dates that form a loop
-            # a list containing all loops
+            # initialize a loop with the primary acquisition
+            loop = [pair_start]
 
+            # find loops with the primary acquisition
             find_loops(
                 self,
-                pairs_first,
                 loops,
                 loop,
+                pairs_primary,
                 pair_end,
-                max_acquisition + 1,  # +1 to include the opposite-direction pair
-                interval_days,
+                edge_days,
+                max_acquisition + 1,  # +1 to include the diagonal pair
             )
 
         return loops
@@ -1748,8 +1750,8 @@ class PairsFactory:
             how many dates will be used for each winter. Those dates will be
             selected randomly in each winter. Default is 5
         max_winter_interval: int
-            max interval between winters for interferometric pair. If 
-            max_winter_interval=1, hen the interferometric pairs will be generated 
+            max interval between winters for interferometric pair. If
+            max_winter_interval=1, hen the interferometric pairs will be generated
             between neighboring winters.
 
         Returns
@@ -1777,15 +1779,15 @@ class PairsFactory:
                 np.random.shuffle(dt_year)
                 date_years.append(dt_year[:n_per_winter].to_list())
 
-        n_years = len(years)
+        n_years = len(date_years)
 
         _pairs = []
         for i, date_year in enumerate(date_years):
             # primary/reference dates
             for date_primary in date_year:
+                # secondary dates
                 for j in range(1, max_winter_interval + 1):
                     if i + j < n_years:
-                        # secondary dates
                         for date_secondary in date_years[i + j]:
                             _pairs.append((date_primary, date_secondary))
         return Pairs(_pairs)
@@ -2032,70 +2034,76 @@ class DateManager:
 
 def find_loops(
     loops_pairs: Pairs,
-    pairs_left: Pairs,
     loops: list[Loop],
     loop: Loop,
+    pairs_left: Pairs,
     pair_end: datetime,
+    edge_days: Optional[int] = None,
     max_loop_length=6,
-    interval_days: Optional[int] = None,
 ) -> None:
-    for p in pairs_left:
-        m_candidate = (loops_pairs.primary == p.secondary) & (
+    """recursively find all available loops within pairs_left and pair_end."""
+    for pair_left in pairs_left:
+        m_candidate = (loops_pairs.primary == pair_left.secondary) & (
             loops_pairs.secondary <= pair_end
         )
         if not m_candidate.any():
             continue
         pairs_candidate = loops_pairs[m_candidate]
-        for p2 in pairs_candidate:
-            if not is_pair_loop_full_rank(p2, loops_pairs, interval_days):
+        for pair_middle in pairs_candidate:
+            if not valid_diagonal_pair(pair_middle, loops_pairs, edge_days):
                 continue
             loop_i = loop.copy()
-            loop_i.append(p2.primary)
-            if p2.secondary == pair_end:
-                loop_i.append(p2.secondary)
+            loop_i.append(pair_middle.primary)
+            if pair_middle.secondary == pair_end:
+                loop_i.append(pair_middle.secondary)
                 loops.append(Loop(loop_i, loops_pairs))
             else:
                 if len(loop_i) + 1 < max_loop_length:
                     find_loops(
                         loops_pairs,
-                        pairs_candidate,
                         loops,
                         loop_i,
+                        pairs_candidate,
                         pair_end,
+                        edge_days,
                         max_loop_length,
-                        interval_days,
                     )
 
 
-def is_pair_loop_full_rank(
-    pair: Pair, pairs: Pairs, interval_days: Optional[int] = None
+def valid_diagonal_pair(
+    pair: Pair, pairs: Pairs, edge_days: Optional[int] = None
 ) -> bool:
-    """check the rank of the pair in the loop (whether can be form full-rank loop)
+    """check if the pair is a valid diagonal pair that can be used to form a loop
+    using the edge pairs.
 
     Parameters
     ----------
     pair: Pair
-        Pair to be checked.
+        Pair to be checked if it is a valid diagonal pair.
     pairs: Pairs
         All pairs of the loop.
+    edge_days: int, optional
+        Max days of the edge pairs, which is used to identify the edge pairs.
+        If None, any pair can be used as edge pair. Default is None.
 
     Returns
     -------
-    rank: bool
-        Whether can be form full-rank loop.
+    valid: bool
+        Whether the pair is a valid diagonal pair.
     """
-    full_rank = False
+    valid = False
     start_date, end_date = pair.values
-    mask_middle = (pairs.primary >= start_date) & (pairs.secondary <= end_date)
-    if interval_days is not None:
-        mask_middle = mask_middle & (pairs.days <= interval_days)
-    if not mask_middle.any():
-        return full_rank
-    pairs_middle = pairs[mask_middle]
-    if pairs_middle.days.sum() >= pair.days:
-        full_rank = True
+    mask_edge = (pairs.primary >= start_date) & (pairs.secondary <= end_date)
+    if edge_days is not None:
+        mask_edge = mask_edge & (pairs.days <= edge_days)
 
-    return full_rank
+    if not mask_edge.any():
+        return False
+
+    edge_pairs = pairs[mask_edge]
+    if edge_pairs.days.sum() >= pair.days:
+        valid = True
+    return valid
 
 
 if __name__ == "__main__":
