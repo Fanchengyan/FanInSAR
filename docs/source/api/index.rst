@@ -8,5 +8,6 @@ Python API Reference
    query/query
    samplers/index
    NSBAS/index
+   insar_class/pairs
    
 
