@@ -6,9 +6,9 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = "FanSAR"
-copyright = "2023, Fancy"
-author = "Fancy"
+project = "FanInSAR"
+copyright = "2023, Fan Chengyan (Fancy)"
+author = "Fan Chengyan (Fancy)"
 release = "v1.0"
 
 # -- General configuration ---------------------------------------------------
@@ -37,10 +37,6 @@ exclude_patterns = []
 html_theme = "sphinx_rtd_theme"
 # html_static_path = ['_static']
 
-# General information about the project.
-project = "faninsar"
-copyright = "2023, Fancy"
-author = "Chengyan Fan"
 
 video_enforce_extra_source = True
 

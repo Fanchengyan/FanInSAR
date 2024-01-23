@@ -10,6 +10,7 @@ examples that describe many common tasks that you can accomplish with FanSAR.
    :maxdepth: 2
    :hidden:
 
+   quick_start
    data_structures
    Indexing_data
 

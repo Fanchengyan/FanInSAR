@@ -14,11 +14,11 @@ or from GitHub:
     pip install git+https://github.com/Fanchengyan/FanInSAR.git
 
 
-Optional dependencies
----------------------
+.. Optional dependencies
+.. ---------------------
 
-The following dependencies are optional:
+.. The following dependencies are optional:
 
-- isce3: for reading and writing ISCE products (TODO)
-- zarr: for reading and writing Zarr products (TODO)
+.. - isce3: for reading and writing ISCE products (TODO)
+.. - zarr: for reading and writing Zarr products (TODO)
 
