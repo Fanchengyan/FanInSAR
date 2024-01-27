@@ -1,6 +1,6 @@
 recommonmark
 sphinx>=7
-myst-parser
+myst-nb
 sphinx_rtd_theme
 Jinja2
 git+https://github.com/Fanchengyan/FanInSAR.git@main
