@@ -11,6 +11,7 @@ examples that describe many common tasks that you can accomplish with FanSAR.
    :hidden:
 
    quick_start
+   colormap
    data_structures
    Indexing_data
 
