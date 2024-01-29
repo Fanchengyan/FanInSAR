@@ -687,9 +687,10 @@ class RasterDataset(GeoDataset):
         bbox = self._ensure_query_crs(bbox)
 
         win = vrt_fh.window(*bbox)
+        bands = self.band_indexes or vrt_fh.indexes
         data = vrt_fh.read(
             out_shape=(
-                1,
+                len(bands),
                 round((bbox.top - bbox.bottom) / self.res[1]),
                 round((bbox.right - bbox.left) / self.res[0]),
             ),
@@ -797,13 +798,16 @@ class RasterDataset(GeoDataset):
             if query.points is not None:
                 data = self._points_query(query.points, vrt_fh)
                 files_points_list.append(data)
+        files_bbox_list = np.asarray(files_bbox_list)
 
         # Stack the bounding boxes values
         bbox_values = None
         if len(files_bbox_list) > 0:
-            bbox_values = (
-                np.asarray(files_bbox_list).squeeze(axis=2).transpose(1, 0, 2, 3)
-            )
+            n_band = files_bbox_list.shape[2]
+            if n_band == 1:
+                bbox_values = files_bbox_list.squeeze(axis=2).transpose(1, 0, 2, 3)
+            else:
+                bbox_values = files_bbox_list.transpose(1, 0, 2, 3, 4)
 
         # Stack the points values
         points_values = None
