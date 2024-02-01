@@ -22,7 +22,6 @@ for name in names:
         f"{name}_r", cm_data[::-1])
 
 del name
-del names
 del file
 del cm_data
 del cwd

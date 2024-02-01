@@ -285,8 +285,8 @@ class NSBASInversion:
             self.d,
             dtype=self.dtype,
             device=self.device,
-            desc="  NSBAS inversion",
             verbose=self.verbose,
+            tqdm_args={"desc": "  NSBAS inversion"},
         )
         residual = self.d - np.dot(self.G, result)
 
@@ -420,8 +420,8 @@ def batch_lstsq(
     d: Union[np.ndarray, torch.Tensor],
     dtype: torch.dtype = torch.float64,
     device: Optional[Union[str, torch.device]] = None,
-    verbose=True,
-    **tqdm_args,
+    verbose: bool = True,
+    tqdm_args: dict = {},
 ):
     """This function calculates the least-squares solution for a batch of linear
     equations using the given G matrix and the data in d.
@@ -551,3 +551,64 @@ def censored_lstsq(
         return X_np
     else:
         return X
+
+
+def calculate_U(
+    C: np.ndarray,
+    pairs: Pairs,
+    delta_phi: np.ndarray,
+    interval_days: int,
+    device: Optional[Union[str, torch.device]] = None,
+    dtype: torch.dtype = torch.float64,
+) -> np.ndarray:
+    """Calculate correction matrix U by loop closure phase using least square.
+    More details see paper: TODO add paper link.
+
+    Parameters
+    ----------
+    C : ndarray
+        Loop matrix (n_loop, n_pair). Each row is a loop. Each column is a pair.
+        The value is 1 (edge pair) or -1 (diagonal pair) if the pair is used in
+        the loop, otherwise 0. All pairs in C should be used in loops (no column
+        with all 0).
+    pairs : Pairs
+        Pairs object. The pairs used in the loops.
+    delta_phi : ndarray
+        unwrapped interferograms phases with shape of (n_pair, n_pixel).
+    interval_days : int, optional
+        interval days of nearest-acquisition pairs.
+    device : Optional[Union[str, torch.device]], optional
+        device of torch.tensor used for computation. If None, use GPU if
+        available, otherwise use CPU.
+    dtype : torch.dtype, optional
+        dtype of torch.tensor used for computation.
+    """
+    contain_nan = False
+    if np.any(np.isnan(delta_phi)):
+        contain_nan = True
+    # edge pairs are not contributing to the loop closure phase
+    # remove them from the matrix C to avoid being involved in the calculation of U
+    mask = pairs.days > interval_days
+    Cc = C[:, mask]
+
+    U = np.zeros_like(delta_phi)
+
+    C = torch.tensor(C, dtype=dtype, device=device)
+    delta_phi = torch.tensor(delta_phi, dtype=dtype, device=device)
+    Cc = torch.tensor(Cc, dtype=dtype, device=device)
+
+    closure_phase = torch.mm(C, delta_phi)
+
+    if contain_nan:
+        _Uc = batch_lstsq(
+            Cc,
+            closure_phase,
+            dtype=dtype,
+            device=device,
+            tqdm_args={"desc": "  Calculate U"},
+        ).numpy()
+    else:
+        _Uc = np.round(torch.linalg.lstsq(Cc, closure_phase).solution.numpy())
+
+    U[mask] = _Uc / (2 * np.pi)
+    return U

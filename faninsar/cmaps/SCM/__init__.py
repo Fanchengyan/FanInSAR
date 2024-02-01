@@ -1,30 +1,85 @@
+"""
+    ScientificColourMaps8
+
+    Usage
+    -----
+    from faninsar import cmaps
+    plt.imshow(data, cmap=cmaps.berlin)
+
+    Available colourmaps
+    ---------------------
+    acton, bam, bamako, bamO, batlow, batlowK, batlowW, 
+    berlin, bilbao, broc, brocO, buda, bukavu, cork, corkO,
+    davos, devon, fes, glasgow, grayC, hawaii, imola, lajolla, lapaz,
+    lisbon, lipari, nuuk, managua, navia, nuuk, 
+    oleron, oslo, roma, romaO, tofino, tokyo,
+    turku, vanimo, vik, vikO
+"""
 from pathlib import Path
 
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 
+version = "8.0.1"
+
 cwd = Path(__file__).parent.absolute()
 
-names = ['acton', 'bamako', 'batlow', 'berlin', 'bilbao', 'broc',
-         'brocO', 'buda', 'cork', 'corkO', 'davos', 'devon', 'grayC',
-         'hawaii', 'imola', 'lajolla', 'lapaz', 'lisbon', 'nuuk',
-         'oleron', 'oslo', 'roma', 'romaO', 'tofino', 'tokyo',
-         'turku', 'vik', 'vikO']
+names = [
+    "acton",
+    "bam",
+    "bamako",
+    "bamO",
+    "batlow",
+    "batlowK",
+    "batlowW",
+    "berlin",
+    "bilbao",
+    "broc",
+    "brocO",
+    "buda",
+    "bukavu",
+    "cork",
+    "corkO",
+    "davos",
+    "devon",
+    "fes",
+    "glasgow",
+    "grayC",
+    "hawaii",
+    "imola",
+    "lajolla",
+    "lapaz",
+    "lisbon",
+    "lipari",
+    "managua",
+    "navia",
+    "nuuk",
+    "oleron",
+    "oslo",
+    "roma",
+    "romaO",
+    "tofino",
+    "tokyo",
+    "turku",
+    "vanimo",
+    "vik",
+    "vikO",
+]
 
 __all__ = names.copy()
 
 for name in names:
-    file = cwd / name / f'{name}.txt'
+    file = cwd / name / f"{name}.txt"
     cm_data = np.loadtxt(file)
 
-    __all__.append(f'{name}_r')
+    __all__.append(f"{name}_r")
 
     vars()[name] = LinearSegmentedColormap.from_list(name, cm_data)
     vars()[f"{name}_r"] = LinearSegmentedColormap.from_list(
-        f"{name}_r", cm_data[::-1])
+        f"{name}_r", np.flip(cm_data, axis=0)
+    )
 
 del name
-del names
 del file
 del cm_data
 del cwd
