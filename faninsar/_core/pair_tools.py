@@ -656,6 +656,7 @@ class Pairs:
         self,
         max_acquisition: int = 5,
         edge_days: Optional[int] = 12,
+        max_days: Optional[int] = None,
     ) -> "Loops":
         """return all possible loops from the pairs
 
@@ -674,10 +675,15 @@ class Pairs:
             and exclude the not valid diagonal pairs that cannot form loops using
             the edge pairs. If None, all available diagonal pairs will be used to
             form loops. Default is 12.
+        max_days: int, optional
+            Maximum days of the pairs in the loops. If None, all available pairs
+            will be used. Default is None.
         """
         # a list containing all loops
         loops = []
         for i in self:
+            if max_days is not None and i.days > max_days:
+                continue
             if not valid_diagonal_pair(i, self, edge_days):
                 continue
             pair_start, pair_end = i.values[0], i.values[1]
