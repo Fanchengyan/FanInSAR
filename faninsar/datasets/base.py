@@ -16,6 +16,7 @@ import rasterio
 import rasterio.merge
 import shapely
 import xarray as xr
+from rasterio import fill
 from rasterio.coords import BoundingBox as BBox
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
@@ -29,8 +30,8 @@ from shapely import ops
 from tqdm.auto import tqdm
 
 from faninsar._core import geo_tools
-from faninsar._core.logger import setup_logger
 from faninsar._core.geo_tools import Profile
+from faninsar._core.logger import setup_logger
 from faninsar._core.pair_tools import Pairs
 from faninsar.query.query import BoundingBox, GeoQuery, Points
 
@@ -509,6 +510,8 @@ class RasterDataset(GeoDataset):
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        masked: bool = True,
+        fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
     ) -> None:
@@ -543,6 +546,13 @@ class RasterDataset(GeoDataset):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        masked : bool, optional
+            if True, the returned array will be masked, default: True. If
+            :param:`fill_nodata` is True, the returned array will be not be masked
+            that be filled with interpolated values.
+        fill_nodata : bool, optional
+            Whether to fill holes in raster data by interpolation using the
+            `rasterio.fill.fillnodata` function. Default: False.
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -557,6 +567,8 @@ class RasterDataset(GeoDataset):
         self.bands = bands or self.all_bands
         self.cache = cache
         self.resampling = resampling
+        self.masked = masked
+        self.fill_nodata = fill_nodata
         self.verbose = verbose
         self.ds_name = ds_name
 
@@ -685,6 +697,10 @@ class RasterDataset(GeoDataset):
     def _bbox_query(self, bbox: BoundingBox, vrt_fh) -> np.ndarray:
         """Return the index of the give file that intersect with the given bounding box."""
         bbox = self._ensure_query_crs(bbox)
+        if self.fill_nodata:
+            masked = True
+        else:
+            masked = self.masked
 
         win = vrt_fh.window(*bbox)
         bands = self.band_indexes or vrt_fh.indexes
@@ -697,9 +713,13 @@ class RasterDataset(GeoDataset):
             resampling=self.resampling,
             indexes=self.band_indexes,
             window=win,
+            masked=masked,
             boundless=False,  # TODO: check this
-            fill_value=self.nodata,
+            # fill_value=self.nodata,
         )
+
+        if self.fill_nodata:
+            data = fill.fillnodata(data)
 
         return data
 
@@ -711,12 +731,10 @@ class RasterDataset(GeoDataset):
         return data
 
     @overload
-    def _ensure_query_crs(self, query: BoundingBox) -> BoundingBox:
-        ...
+    def _ensure_query_crs(self, query: BoundingBox) -> BoundingBox: ...
 
     @overload
-    def _ensure_query_crs(self, query: Points) -> Points:
-        ...
+    def _ensure_query_crs(self, query: Points) -> Points: ...
 
     def _ensure_query_crs(
         self, query: Union[BoundingBox, Points]
@@ -798,7 +816,11 @@ class RasterDataset(GeoDataset):
             if query.points is not None:
                 data = self._points_query(query.points, vrt_fh)
                 files_points_list.append(data)
-        files_bbox_list = np.asarray(files_bbox_list)
+
+        if self.masked:
+            files_bbox_list = np.ma.asarray(files_bbox_list)
+        else:
+            files_bbox_list = np.asarray(files_bbox_list)
 
         # Stack the bounding boxes values
         bbox_values = None
@@ -1064,6 +1086,8 @@ class PairDataset(RasterDataset):
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        masked: bool = True,
+        fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
     ) -> None:
@@ -1098,6 +1122,13 @@ class PairDataset(RasterDataset):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        masked : bool, optional
+            if True, the returned array will be masked, default: True. If
+            :param:`fill_nodata` is True, the returned array will be not be masked
+            that be filled with interpolated values.
+        fill_nodata : bool, optional
+            Whether to fill holes in raster data by interpolation using the
+            `rasterio.fill.fillnodata` function. Default: False.
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -1118,6 +1149,8 @@ class PairDataset(RasterDataset):
             bands=bands,
             cache=cache,
             resampling=resampling,
+            masked=masked,
+            fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name=ds_name,
         )
@@ -1196,6 +1229,8 @@ class ApsDataset(RasterDataset):
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        masked: bool = True,
+        fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
     ) -> None:
@@ -1230,6 +1265,13 @@ class ApsDataset(RasterDataset):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        masked : bool, optional
+            if True, the returned array will be masked, default: True. If
+            :param:`fill_nodata` is True, the returned array will be not be masked
+            that be filled with interpolated values.
+        fill_nodata : bool, optional
+            Whether to fill holes in raster data by interpolation using the
+            `rasterio.fill.fillnodata` function. Default: False.
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -1246,6 +1288,8 @@ class ApsDataset(RasterDataset):
             bands=bands,
             cache=cache,
             resampling=resampling,
+            masked=masked,
+            fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name=ds_name,
         )
@@ -1356,6 +1400,8 @@ class ApsPairs(PairDataset):
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        masked: bool = True,
+        fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
     ) -> None:
@@ -1390,6 +1436,13 @@ class ApsPairs(PairDataset):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        masked : bool, optional
+            if True, the returned array will be masked, default: True. If
+            :param:`fill_nodata` is True, the returned array will be not be masked
+            that be filled with interpolated values.
+        fill_nodata : bool, optional
+            Whether to fill holes in raster data by interpolation using the
+            `rasterio.fill.fillnodata` function. Default: False.
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -1410,6 +1463,8 @@ class ApsPairs(PairDataset):
             bands=bands,
             cache=cache,
             resampling=resampling,
+            masked=masked,
+            fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name=ds_name,
         )

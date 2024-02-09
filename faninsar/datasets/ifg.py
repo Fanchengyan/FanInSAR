@@ -62,6 +62,8 @@ class InterferogramDataset(PairDataset):
         bands_coh: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        masked: bool = True,
+        fill_nodata: bool = False,
         verbose=True,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
@@ -100,6 +102,13 @@ class InterferogramDataset(PairDataset):
         resampling: Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        masked : bool, optional
+            if True, the returned array will be masked, default: True. If
+            :param:`fill_nodata` is True, the returned array will be not be masked
+            that be filled with interpolated values.
+        fill_nodata : bool, optional
+            Whether to fill holes in raster data by interpolation using the
+            `rasterio.fill.fillnodata` function. Default: False.
         verbose: bool, optional, default: True
             if True, print verbose output.
         """
@@ -145,6 +154,8 @@ class InterferogramDataset(PairDataset):
             bands=bands_unw,
             cache=cache,
             resampling=resampling,
+            masked=masked,
+            fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name="Interferogram",
         )
@@ -160,6 +171,8 @@ class InterferogramDataset(PairDataset):
             bands=bands_coh,
             cache=cache,
             resampling=resampling,
+            masked=masked,
+            fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name="Coherence",
         )
