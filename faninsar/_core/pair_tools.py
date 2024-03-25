@@ -561,6 +561,10 @@ class Pairs:
         """
         pairs = self._ensure_pairs(pairs)
         return self - pairs
+    
+    def copy(self) -> "Pairs":
+        """return a copy of the pairs"""
+        return Pairs(self._values.copy())
 
     def sort(
         self,
