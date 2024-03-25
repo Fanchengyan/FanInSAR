@@ -476,7 +476,7 @@ class RasterDataset(GeoDataset):
     #: This expression should be specific enough that it will not pick up files from
     #: other datasets. It should not include a file extension, as the dataset may be in
     #: a different file format than what it was originally downloaded as.
-    filename_glob = "*"
+    pattern = "*"
 
     #: When :attr:`~RasterDataset.separate_files` is True, the following additional
     #: groups are searched for to find other files:
@@ -575,7 +575,7 @@ class RasterDataset(GeoDataset):
         if paths is None:
             paths = []
             filename_regex = re.compile(self.filename_regex, re.VERBOSE)
-            for file_path in sorted(self.root_dir.rglob(self.filename_glob)):
+            for file_path in sorted(self.root_dir.rglob(self.pattern)):
                 match = re.match(filename_regex, file_path.name)
                 if match is not None:
                     paths.append(file_path)
@@ -1215,7 +1215,7 @@ class ApsDataset(RasterDataset):
     """
 
     #: This expression is used to find the APS files.
-    filename_glob = "*"
+    pattern = "*"
 
     def __init__(
         self,
@@ -1386,7 +1386,7 @@ class ApsPairs(PairDataset):
     """
 
     #: This expression is used to find the GACOSPairs files.
-    filename_glob = "*.tif"
+    pattern = "*.tif"
 
     def __init__(
         self,

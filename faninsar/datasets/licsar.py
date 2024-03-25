@@ -1,15 +1,15 @@
+import warnings
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from rasterio.crs import CRS
-from rasterio.enums import Resampling
-
 from faninsar._core.pair_tools import Pairs
 from faninsar.datasets.ifg import InterferogramDataset
 from faninsar.query.query import BoundingBox
+from rasterio.crs import CRS
+from rasterio.enums import Resampling
 
 
 class LiCSAR(InterferogramDataset):
@@ -21,8 +21,15 @@ class LiCSAR(InterferogramDataset):
     from `COMET-LiCS-portal <https://comet.nerc.ac.uk/COMET-LiCS-portal/>`_.
     """
 
-    filename_glob_unw = "*geo.unw.tif"
-    filename_glob_coh = "*geo.cc.tif"
+    pattern_unw = "*geo.unw.tif"
+    pattern_coh = "*geo.cc.tif"
+
+    pattern_dem = "*geo.hgt.tif"
+    pattern_E = "*geo.E.tif"
+    pattern_N = "*geo.N.tif"
+    pattern_U = "*geo.U.tif"
+    pattern_baselines = "baselines"
+    pattern_polygon = "*-poly.txt"
 
     def __init__(
         self,
@@ -93,16 +100,44 @@ class LiCSAR(InterferogramDataset):
             verbose=verbose,
         )
 
+    @property
+    def meta_files(self) -> pd.DataFrame:
+        """return the metadata files of the dataset in a DataFrame.
+        metadata files include: DEM, U, E, N, baseline, polygon.
+        """
+        def parse_file(pattern: str) -> Path:
+            result = list(self.root_dir.rglob(pattern))
+            if len(result) == 0:
+                warnings.warn(f"File not found: {pattern}")
+                return None
+            return result[0]
+        
+        dem_file = parse_file(self.pattern_dem)
+        U_file = parse_file(self.pattern_U)
+        E_file = parse_file(self.pattern_E)
+        N_file = parse_file(self.pattern_N)
+        baseline_file = parse_file(self.pattern_baselines)
+        polygon_file = parse_file(self.pattern_polygon)
+
+        df = pd.Series(
+            [dem_file, U_file, E_file, N_file, baseline_file, polygon_file],
+            index=['dem','U','E','N','baseline','polygon']
+        )
+
+        return df
+
     def parse_pairs(self, paths: list[Path]) -> Pairs:
         """Parse the primary and secondary date/acquisition of the interferogram
         to generate Pairs object.
         """
-        pair_names = [f.parent.stem for f in paths]
+        pair_names = [f.name.split(".")[0] for f in paths]
         pairs = Pairs.from_names(pair_names)
         return pairs
 
     def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse the datetime of the interferogram to generate DatetimeIndex object."""
-        pair_names = [f.parent.stem for f in paths]
+        pair_names = [f.name.split(".")[0] for f in paths]
         date_names = np.unique([i.split("_") for i in pair_names])
         return pd.DatetimeIndex(date_names)
+
+home_dir = "/Volumes/Data/GeoData/YNG/Sentinel1/LiCSAR/106D_05248_131313"

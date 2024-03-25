@@ -1,6 +1,6 @@
 from .base import ApsDataset, ApsPairs, GeoDataset, PairDataset, RasterDataset
 from .gacos import GACOS, GACOSPairs
-from .hyp3 import HyP3
+from .hyp3 import HyP3S1, HyP3S1Burst
 from .ifg import InterferogramDataset
 from .licsar import LiCSAR
 
@@ -18,7 +18,8 @@ available = [
 ]
 
 MAPPING_PAIRS = {
-    "hyp3": HyP3,
+    "hyp3s1": HyP3S1,
+    'hyp3s1burst': HyP3S1Burst,
     "licsar": LiCSAR,
 }
 

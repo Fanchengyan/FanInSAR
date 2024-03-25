@@ -50,7 +50,7 @@ class GACOS(ApsDataset):
     """
 
     #: This expression is used to find the GACOS files.
-    filename_glob = "*.ztd.tif"
+    pattern = "*.ztd.tif"
 
     def __init__(
         self,
@@ -158,7 +158,7 @@ class GACOSPairs(ApsPairs):
     """
 
     #: This expression is used to find the GACOSPairs files.
-    filename_glob = "*.tif"
+    pattern = "*.tif"
 
     def __init__(
         self,

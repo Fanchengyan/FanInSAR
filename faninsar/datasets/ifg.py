@@ -38,10 +38,10 @@ class InterferogramDataset(PairDataset):
     #: Glob expression used to search for files.
     #:
     #: This expression is used to find the interferogram files.
-    filename_glob_unw = "*"
+    pattern_unw = "*"
 
     #: This expression is used to find the coherence files.
-    filename_glob_coh = "*"
+    pattern_coh = "*"
 
     _ds_coh: RasterDataset
     _ds_dem: Optional[RasterDataset] = None
@@ -65,6 +65,7 @@ class InterferogramDataset(PairDataset):
         masked: bool = True,
         fill_nodata: bool = False,
         verbose=True,
+        keep_common: bool = True,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
 
@@ -111,27 +112,44 @@ class InterferogramDataset(PairDataset):
             `rasterio.fill.fillnodata` function. Default: False.
         verbose: bool, optional, default: True
             if True, print verbose output.
+        keep_common: bool, optional, default: True
+            Only used when the number of interferograms and coherence files are 
+            not equal. If True, keep the common pairs of interferograms and 
+            coherence files and raise a warning. If False, raise an error.
         """
-        root_dir_dir = Path(root_dir)
-        self.root_dir_dir = root_dir_dir
+        root_dir = Path(root_dir)
+        self.root_dir = root_dir
         self.cache = cache
         self.resampling = resampling
         self.verbose = verbose
 
         if paths_unw is None:
-            paths_unw = np.unique(list(root_dir_dir.rglob(self.filename_glob_unw)))
+            paths_unw = np.unique(list(root_dir.rglob(self.pattern_unw)))
         if paths_coh is None:
-            paths_coh = np.unique(list(root_dir_dir.rglob(self.filename_glob_coh)))
-
-        if len(paths_unw) != len(paths_coh):
-            raise ValueError(
-                f"Number of interferogram files ({len(paths_unw)}) does not match "
-                f"number of coherence files ({len(paths_coh)})"
-            )
+            paths_coh = np.unique(list(root_dir.rglob(self.pattern_coh)))
 
         # Pairs: ensure there are no duplicate pairs
-        pairs = self.parse_pairs(paths_unw)
-        pairs1, index = pairs.sort(inplace=False)
+        pairs_unw = self.parse_pairs(paths_unw)
+        pairs_coh = self.parse_pairs(paths_coh)
+        
+        # different number of interferograms and coherence files
+        if len(paths_unw) != len(paths_coh):
+            mismatch_info = (
+                f"Number of interferogram files ({len(paths_unw)}) does not match "
+                f"number of coherence files ({len(paths_coh)})."
+            )
+            if not keep_common:
+                raise ValueError(mismatch_info)
+            
+            mismatch_info += " Only keeping the common pairs."
+            warnings.warn(mismatch_info)
+            # keep paths only with the common pairs
+            pairs = pairs_unw.intersect(pairs_coh)
+            paths_unw = paths_unw[pairs_unw.where(pairs, return_type="mask")]
+            paths_coh = paths_coh[pairs_coh.where(pairs, return_type="mask")]
+        
+        # remove duplicate pairs
+        _, index = pairs.sort(inplace=False)
         if len(index) < len(paths_unw):
             deduplicated = "".join(
                 [f"\n\t{i.parent.stem}" for i in set(paths_unw) - set(paths_unw[index])]
@@ -467,7 +485,7 @@ class InterferogramDataset(PairDataset):
         roi: Optional[BoundingBox] = None,
         ref_points: Optional[Points] = None,
         pairs: Optional[Pairs] = None,
-        pdc: Optional[PhaseDeformationConverter] = False,
+        pdc: Optional[PhaseDeformationConverter] = None,
         los_ratio: Optional[np.ndarray] = None,
         names_unw: Optional[list[str]] = None,
         names_coh: Optional[list[str]] = None,
