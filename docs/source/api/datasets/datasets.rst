@@ -15,7 +15,7 @@ The following datasets are available:
       * :class:`.InterferogramDataset`
       * :class:`.GACOSPairs` 
    * :class:`.InterferogramDataset` : base Datasets for all Interferogram productions. Child classes (well known productions):
-      * :class:`.HyP3`
+      * :class:`.HyP3S1`, :class:`.HyP3S1Burst`,
       * :class:`.LiCSAR`
 
 
@@ -58,10 +58,19 @@ InterferogramDataset
    :show-inheritance:
 
 
-HyP3
-----
+HyP3S1
+------
 
-.. autoclass:: faninsar.datasets.HyP3
+.. autoclass:: faninsar.datasets.HyP3S1
+   :members:
+   :undoc-members:
+   :member-order: bysource
+   :show-inheritance:
+
+HyP3S1Burst
+------
+
+.. autoclass:: faninsar.datasets.HyP3S1Burst
    :members:
    :undoc-members:
    :member-order: bysource
