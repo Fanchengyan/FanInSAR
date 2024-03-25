@@ -38,7 +38,10 @@ class HyP3S1(InterferogramDataset):
         bands_coh: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        masked: bool = True,
+        fill_nodata: bool = False,
         verbose=True,
+        keep_common: bool = True,
     ) -> None:
         """Initialize a new HyP3S1 instance.
 
@@ -76,8 +79,21 @@ class HyP3S1(InterferogramDataset):
         resampling: Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        masked : bool, optional
+            if True, the returned will be a masked array with a mask
+            for no data values. Default: True.
+
+            .. note::
+                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
+        fill_nodata : bool, optional
+            Whether to fill holes in raster data by interpolation using the
+            ``rasterio.fill.fillnodata`` function. Default: False.
         verbose: bool, optional
             if True, print verbose output.
+        keep_common: bool, optional, default: True
+            Only used when the number of interferograms and coherence files are
+            not equal. If True, keep the common pairs of interferograms and
+            coherence files and raise a warning. If False, raise an error.
         """
         super().__init__(
             root_dir=root_dir,
@@ -92,7 +108,10 @@ class HyP3S1(InterferogramDataset):
             bands_coh=bands_coh,
             cache=cache,
             resampling=resampling,
+            masked=masked,
+            fill_nodata=fill_nodata,
             verbose=verbose,
+            keep_common=keep_common,
         )
 
     def parse_pairs(self, paths: list[Path]) -> Pairs:
@@ -137,7 +156,10 @@ class HyP3S1Burst(InterferogramDataset):
         bands_coh: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        masked: bool = True,
+        fill_nodata: bool = False,
         verbose=True,
+        keep_common: bool = True,
     ) -> None:
         """Initialize a new HyP3 instance.
 
@@ -175,8 +197,21 @@ class HyP3S1Burst(InterferogramDataset):
         resampling: Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        masked : bool, optional
+            if True, the returned will be a masked array with a mask
+            for no data values. Default: True.
+
+            .. note::
+                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
+        fill_nodata : bool, optional
+            Whether to fill holes in raster data by interpolation using the
+            ``rasterio.fill.fillnodata`` function. Default: False.
         verbose: bool, optional
             if True, print verbose output.
+        keep_common: bool, optional, default: True
+            Only used when the number of interferograms and coherence files are
+            not equal. If True, keep the common pairs of interferograms and
+            coherence files and raise a warning. If False, raise an error.
         """
         super().__init__(
             root_dir=root_dir,
@@ -191,7 +226,10 @@ class HyP3S1Burst(InterferogramDataset):
             bands_coh=bands_coh,
             cache=cache,
             resampling=resampling,
+            masked=masked,
+            fill_nodata=fill_nodata,
             verbose=verbose,
+            keep_common=keep_common,
         )
 
     def parse_pairs(self, paths: list[Path]) -> Pairs:

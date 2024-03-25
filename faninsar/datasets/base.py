@@ -547,12 +547,14 @@ class RasterDataset(GeoDataset):
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
         masked : bool, optional
-            if True, the returned array will be masked, default: True. If
-            :param:`fill_nodata` is True, the returned array will be not be masked
-            that be filled with interpolated values.
+            if True, the returned will be a masked array with a mask
+            for no data values. Default: True.
+
+            .. note::
+                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
         fill_nodata : bool, optional
             Whether to fill holes in raster data by interpolation using the
-            `rasterio.fill.fillnodata` function. Default: False.
+            ``rasterio.fill.fillnodata`` function. Default: False.
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -1123,12 +1125,14 @@ class PairDataset(RasterDataset):
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
         masked : bool, optional
-            if True, the returned array will be masked, default: True. If
-            :param:`fill_nodata` is True, the returned array will be not be masked
-            that be filled with interpolated values.
+            if True, the returned will be a masked array with a mask
+            for no data values. Default: True.
+
+            .. note::
+                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
         fill_nodata : bool, optional
             Whether to fill holes in raster data by interpolation using the
-            `rasterio.fill.fillnodata` function. Default: False.
+            ``rasterio.fill.fillnodata`` function. Default: False.
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -1266,12 +1270,14 @@ class ApsDataset(RasterDataset):
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
         masked : bool, optional
-            if True, the returned array will be masked, default: True. If
-            :param:`fill_nodata` is True, the returned array will be not be masked
-            that be filled with interpolated values.
+            if True, the returned will be a masked array with a mask
+            for no data values. Default: True.
+
+            .. note::
+                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
         fill_nodata : bool, optional
             Whether to fill holes in raster data by interpolation using the
-            `rasterio.fill.fillnodata` function. Default: False.
+            ``rasterio.fill.fillnodata`` function. Default: False.
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -1437,12 +1443,14 @@ class ApsPairs(PairDataset):
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
         masked : bool, optional
-            if True, the returned array will be masked, default: True. If
-            :param:`fill_nodata` is True, the returned array will be not be masked
-            that be filled with interpolated values.
+            if True, the returned will be a masked array with a mask
+            for no data values. Default: True.
+
+            .. note::
+                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
         fill_nodata : bool, optional
             Whether to fill holes in raster data by interpolation using the
-            `rasterio.fill.fillnodata` function. Default: False.
+            ``rasterio.fill.fillnodata`` function. Default: False.
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional

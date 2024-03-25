@@ -68,7 +68,7 @@ HyP3S1
    :show-inheritance:
 
 HyP3S1Burst
-------
+-----------
 
 .. autoclass:: faninsar.datasets.HyP3S1Burst
    :members:

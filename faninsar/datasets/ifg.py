@@ -35,12 +35,9 @@ class InterferogramDataset(PairDataset):
         :attr:`coh_dataset`, :attr:`dem_dataset`, and :attr:`mask_dataset` respectively.
     """
 
-    #: Glob expression used to search for files.
-    #:
-    #: This expression is used to find the interferogram files.
+    #: pattern used to find interferogram files.
     pattern_unw = "*"
-
-    #: This expression is used to find the coherence files.
+    #: pattern used to find coherence files.
     pattern_coh = "*"
 
     _ds_coh: RasterDataset
@@ -104,17 +101,19 @@ class InterferogramDataset(PairDataset):
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
         masked : bool, optional
-            if True, the returned array will be masked, default: True. If
-            :param:`fill_nodata` is True, the returned array will be not be masked
-            that be filled with interpolated values.
+            if True, the returned will be a masked array with a mask
+            for no data values. Default: True.
+
+            .. note::
+                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
         fill_nodata : bool, optional
             Whether to fill holes in raster data by interpolation using the
-            `rasterio.fill.fillnodata` function. Default: False.
+            ``rasterio.fill.fillnodata`` function. Default: False.
         verbose: bool, optional, default: True
             if True, print verbose output.
         keep_common: bool, optional, default: True
-            Only used when the number of interferograms and coherence files are 
-            not equal. If True, keep the common pairs of interferograms and 
+            Only used when the number of interferograms and coherence files are
+            not equal. If True, keep the common pairs of interferograms and
             coherence files and raise a warning. If False, raise an error.
         """
         root_dir = Path(root_dir)
@@ -131,7 +130,7 @@ class InterferogramDataset(PairDataset):
         # Pairs: ensure there are no duplicate pairs
         pairs_unw = self.parse_pairs(paths_unw)
         pairs_coh = self.parse_pairs(paths_coh)
-        
+
         # different number of interferograms and coherence files
         if len(paths_unw) != len(paths_coh):
             mismatch_info = (
@@ -140,14 +139,14 @@ class InterferogramDataset(PairDataset):
             )
             if not keep_common:
                 raise ValueError(mismatch_info)
-            
+
             mismatch_info += " Only keeping the common pairs."
             warnings.warn(mismatch_info)
             # keep paths only with the common pairs
             pairs = pairs_unw.intersect(pairs_coh)
             paths_unw = paths_unw[pairs_unw.where(pairs, return_type="mask")]
             paths_coh = paths_coh[pairs_coh.where(pairs, return_type="mask")]
-        
+
         # remove duplicate pairs
         _, index = pairs.sort(inplace=False)
         if len(index) < len(paths_unw):

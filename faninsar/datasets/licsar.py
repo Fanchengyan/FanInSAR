@@ -24,11 +24,19 @@ class LiCSAR(InterferogramDataset):
     pattern_unw = "*geo.unw.tif"
     pattern_coh = "*geo.cc.tif"
 
+    #: pattern used to find dem file
     pattern_dem = "*geo.hgt.tif"
+
+    #: pattern used to find E files
     pattern_E = "*geo.E.tif"
+
+    #: pattern used to find N files
     pattern_N = "*geo.N.tif"
+    #: pattern used to find U files
     pattern_U = "*geo.U.tif"
+    #: pattern used to find baselines file
     pattern_baselines = "baselines"
+    #: pattern used to find polygon file
     pattern_polygon = "*-poly.txt"
 
     def __init__(
@@ -45,7 +53,10 @@ class LiCSAR(InterferogramDataset):
         bands_coh: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        masked: bool = True,
+        fill_nodata: bool = False,
         verbose=False,
+        keep_common: bool = True,
     ) -> None:
         """Initialize a new LiCSAR instance.
 
@@ -81,8 +92,21 @@ class LiCSAR(InterferogramDataset):
         resampling: Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        masked : bool, optional
+            if True, the returned will be a masked array with a mask 
+            for no data values. Default: True.
+            
+            .. note::
+                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
+        fill_nodata : bool, optional
+            Whether to fill holes in raster data by interpolation using the
+            ``rasterio.fill.fillnodata`` function. Default: False.
         verbose: bool, optional
             if True, print verbose output.
+        keep_common: bool, optional, default: True
+            Only used when the number of interferograms and coherence files are
+            not equal. If True, keep the common pairs of interferograms and
+            coherence files and raise a warning. If False, raise an error.
         """
         super().__init__(
             root_dir=root_dir,
@@ -97,13 +121,16 @@ class LiCSAR(InterferogramDataset):
             bands_coh=bands_coh,
             cache=cache,
             resampling=resampling,
+            masked=masked,
+            fill_nodata=fill_nodata,
             verbose=verbose,
+            keep_common=keep_common,
         )
 
     @property
-    def meta_files(self) -> pd.DataFrame:
-        """return the metadata files of the dataset in a DataFrame.
-        metadata files include: DEM, U, E, N, baseline, polygon.
+    def meta_files(self) -> pd.Series:
+        """return the paths of LiCSAR metadata files in a pandas Series.
+        metadata files include: DEM, U, E, N, baselines, polygon.
         """
         def parse_file(pattern: str) -> Path:
             result = list(self.root_dir.rglob(pattern))
@@ -111,7 +138,7 @@ class LiCSAR(InterferogramDataset):
                 warnings.warn(f"File not found: {pattern}")
                 return None
             return result[0]
-        
+
         dem_file = parse_file(self.pattern_dem)
         U_file = parse_file(self.pattern_U)
         E_file = parse_file(self.pattern_E)
@@ -121,9 +148,8 @@ class LiCSAR(InterferogramDataset):
 
         df = pd.Series(
             [dem_file, U_file, E_file, N_file, baseline_file, polygon_file],
-            index=['dem','U','E','N','baseline','polygon']
+            index=['DEM','U','E','N','baselines','polygon']
         )
-
         return df
 
     def parse_pairs(self, paths: list[Path]) -> Pairs:
