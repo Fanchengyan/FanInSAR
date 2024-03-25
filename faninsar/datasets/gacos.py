@@ -64,6 +64,8 @@ class GACOS(ApsDataset):
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        masked: bool = True,
+        fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "GACOS",
     ) -> None:
@@ -98,6 +100,15 @@ class GACOS(ApsDataset):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        masked : bool, optional
+            if True, the returned will be a masked array with a mask
+            for no data values. Default: True.
+
+            .. note::
+                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
+        fill_nodata : bool, optional
+            Whether to fill holes in raster data by interpolation using the
+            ``rasterio.fill.fillnodata`` function. Default: False.
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -114,6 +125,8 @@ class GACOS(ApsDataset):
             bands=bands,
             cache=cache,
             resampling=resampling,
+            masked=masked,
+            fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name=ds_name,
         )
@@ -172,6 +185,8 @@ class GACOSPairs(ApsPairs):
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
+        masked: bool = True,
+        fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
     ) -> None:
@@ -206,6 +221,15 @@ class GACOSPairs(ApsPairs):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
+        masked : bool, optional
+            if True, the returned will be a masked array with a mask
+            for no data values. Default: True.
+
+            .. note::
+                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
+        fill_nodata : bool, optional
+            Whether to fill holes in raster data by interpolation using the
+            ``rasterio.fill.fillnodata`` function. Default: False.
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -226,6 +250,8 @@ class GACOSPairs(ApsPairs):
             bands=bands,
             cache=cache,
             resampling=resampling,
+            masked=masked,
+            fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name=ds_name,
         )

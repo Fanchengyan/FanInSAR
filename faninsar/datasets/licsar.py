@@ -165,5 +165,3 @@ class LiCSAR(InterferogramDataset):
         pair_names = [f.name.split(".")[0] for f in paths]
         date_names = np.unique([i.split("_") for i in pair_names])
         return pd.DatetimeIndex(date_names)
-
-home_dir = "/Volumes/Data/GeoData/YNG/Sentinel1/LiCSAR/106D_05248_131313"
