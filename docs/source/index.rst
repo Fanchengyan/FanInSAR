@@ -8,14 +8,14 @@ Welcome to FanInSAR's documentation!
 
 Introduction
 ------------
-FanInSAR is a fancy InSAR processing library written in Python. It is designed to help you process InSAR data in a pythonic, fast, and flexible way. If you want to implement your InSAR algorithm, FanInSAR is a highly recommended choice.
+FanInSAR is a fancy InSAR post-processing library written in Python. It is specifically designed to assist in the efficient processing of InSAR data, offering a Pythonic, fast, and flexible approach. If you are looking to implement your own InSAR algorithm, FanInSAR is highly recommended.
 
 Highlight Features
 ------------------
 
-- **Fast**: The heavy computation core in FanInSAR is written in ``Pytorch``, a high-performance deep learning library. You can easily run FanInSAR on GPU to speed up the processing.
-- **Pythonic**: FanInSAR is written in Python, and the API is designed to be simple and intuitive. We design the class structure to be high-level and easy to use for the InSAR user. For example, you can easily load the ``HyP3`` product and process it with a few lines of code. 
-- **Flexible**: FanInSAR is designed to be flexible. You can easily inherit the class or customize the processing pipeline to meet your needs. 
+- **Fast**: The core computation in FanInSAR is implemented using ``PyTorch``, a high-performance deep learning library. This allows for efficient processing on both CPU and GPU, enabling faster execution.
+- **Pythonic**: FanInSAR is written in Python and provides a user-friendly API. The API is designed to be simple and intuitive, making it easy for InSAR users to work with. For example, loading data from ``HyP3`` or ``LiCSAR`` products is as simple as providing the corresponding home directory. Filtering interferometric pairs can be performed by a time slice, similar to the ``pandas`` package. The complex processing pipeline is abstracted away, allowing users to focus on algorithm development.
+- **Flexible**: FanInSAR is designed to be flexible, allowing for customization and extension. Users can easily inherit classes or customize the processing pipeline to suit their specific needs.
 
 
 .. toctree::
