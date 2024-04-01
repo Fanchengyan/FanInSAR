@@ -152,7 +152,8 @@ class LiCSAR(InterferogramDataset):
         )
         return df
 
-    def parse_pairs(self, paths: list[Path]) -> Pairs:
+    @classmethod
+    def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Parse the primary and secondary date/acquisition of the interferogram
         to generate Pairs object.
         """
@@ -160,7 +161,8 @@ class LiCSAR(InterferogramDataset):
         pairs = Pairs.from_names(pair_names)
         return pairs
 
-    def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
+    @classmethod
+    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse the datetime of the interferogram to generate DatetimeIndex object."""
         pair_names = [f.name.split(".")[0] for f in paths]
         date_names = np.unique([i.split("_") for i in pair_names])

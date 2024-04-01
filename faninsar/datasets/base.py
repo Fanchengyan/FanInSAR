@@ -534,7 +534,7 @@ class RasterDataset(GeoDataset):
             data type of the output dataset. If None, the data type of the first file
             found will be used.
         nodata : float or int, optional
-            no data value of the output dataset. If None, the no data value of the first
+            no data value of the dataset. If None, the no data value of the first
             file found will be used.
         roi : BoundingBox, optional
             region of interest to load from the dataset. If None, the union of all files
@@ -699,10 +699,6 @@ class RasterDataset(GeoDataset):
     def _bbox_query(self, bbox: BoundingBox, vrt_fh) -> np.ndarray:
         """Return the index of the give file that intersect with the given bounding box."""
         bbox = self._ensure_query_crs(bbox)
-        if self.fill_nodata:
-            masked = True
-        else:
-            masked = self.masked
 
         win = vrt_fh.window(*bbox)
         bands = self.band_indexes or vrt_fh.indexes
@@ -715,12 +711,13 @@ class RasterDataset(GeoDataset):
             resampling=self.resampling,
             indexes=self.band_indexes,
             window=win,
-            masked=masked,
+            masked=True,
             boundless=False,  # TODO: check this
-            # fill_value=self.nodata,
         )
-
+        
         if self.fill_nodata:
+            if data.mask.ndim==0:
+                data = np.ma.masked_array(data, data == self.nodata)
             data = fill.fillnodata(data)
 
         return data
@@ -1159,7 +1156,8 @@ class PairDataset(RasterDataset):
             ds_name=ds_name,
         )
 
-    def parse_pairs(self, paths: list[Path]) -> Pairs:
+    @classmethod
+    def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Used to parse pairs from filenames. *Must be implemented in subclass*.
 
         Parameters
@@ -1187,7 +1185,8 @@ class PairDataset(RasterDataset):
         """
         raise NotImplementedError("parse_pairs must be implemented in subclass")
 
-    def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
+    @classmethod
+    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Used to parse datetime from filenames. *Must be implemented in subclass*.
 
         Parameters
@@ -1369,7 +1368,7 @@ class ApsDataset(RasterDataset):
 
                 dst.write(dest_arr, 1)
 
-    def parse_dates(self):
+    def parse_dates(self, paths: Optional[Sequence[str]] = None) -> pd.DatetimeIndex:
         """Used to parse acquisition dates from filenames. *Must be implemented
         in subclass*.
 
@@ -1479,14 +1478,16 @@ class ApsPairs(PairDataset):
         self._pairs = self.parse_pairs(self.files.paths[self.valid])
         self._datetime = self.parse_datetime(self.files.paths[self.valid])
 
-    def parse_pairs(self, paths: list[Path]) -> Pairs:
+    @classmethod
+    def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Parse pairs from a list of APS-pair file paths."""
         names = [f.stem for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         pairs = Pairs.from_names(pair_names)
         return pairs
 
-    def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
+    @classmethod
+    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse datetime from a list of APS-pair file paths."""
         names = [f.stem for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]

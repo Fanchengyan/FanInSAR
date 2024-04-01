@@ -128,8 +128,11 @@ class InterferogramDataset(PairDataset):
             paths_coh = np.unique(list(root_dir.rglob(self.pattern_coh)))
 
         # Pairs: ensure there are no duplicate pairs
-        pairs_unw = self.parse_pairs(paths_unw)
-        pairs_coh = self.parse_pairs(paths_coh)
+        # remove duplicate pairs
+        paths_unw, pairs_unw = self._deduplicate_pairs(
+            paths_unw, "unwrapped interferograms"
+        )
+        paths_coh, pairs_coh = self._deduplicate_pairs(paths_coh, "coherence files")
 
         # different number of interferograms and coherence files
         if len(paths_unw) != len(paths_coh):
@@ -140,25 +143,12 @@ class InterferogramDataset(PairDataset):
             if not keep_common:
                 raise ValueError(mismatch_info)
 
-            mismatch_info += " Only keeping the common pairs."
+            mismatch_info += " Only common pairs will be used."
             warnings.warn(mismatch_info)
             # keep paths only with the common pairs
             pairs = pairs_unw.intersect(pairs_coh)
-            paths_unw = paths_unw[pairs_unw.where(pairs, return_type="mask")]
-            paths_coh = paths_coh[pairs_coh.where(pairs, return_type="mask")]
-
-        # remove duplicate pairs
-        _, index = pairs.sort(inplace=False)
-        if len(index) < len(paths_unw):
-            deduplicated = "".join(
-                [f"\n\t{i.parent.stem}" for i in set(paths_unw) - set(paths_unw[index])]
-            )
-            warnings.warn(
-                f"Duplicate pairs found in dataset, keeping only the first occurrence"
-                f"\nDeduplicate pairs: {deduplicated}"
-            )
-            paths_unw = paths_unw[index]
-            paths_coh = paths_coh[index]
+            paths_unw = paths_unw[pairs_unw.where(pairs)]
+            paths_coh = paths_coh[pairs_coh.where(pairs)]
 
         super().__init__(
             root_dir=root_dir,
@@ -207,7 +197,22 @@ class InterferogramDataset(PairDataset):
         # get the datetime from pairs
         self._datetime = self.parse_datetime(paths_unw[_valid])
 
-    def parse_pairs(self, paths: list[Path]) -> Pairs:
+    def _deduplicate_pairs(self, paths: list[Path], dataset_name: str) -> list[Path]:
+        """Remove duplicate pairs from the list of paths."""
+        pairs = self.parse_pairs(paths)
+        _, index = pairs.sort(inplace=False)
+        if len(index) < len(paths):
+            deduplicated = "".join(
+                [f"\n\t{i.parent.stem}" for i in set(paths) - set(paths[index])]
+            )
+            warnings.warn(
+                f"Duplicate pairs found in dataset {dataset_name}, keeping only the first occurrence"
+                f"\nDeduplicate pairs: {deduplicated}"
+            )
+        return paths[index], pairs
+
+    @classmethod
+    def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Used to parse pairs from filenames. *Must be implemented in subclass*.
 
         Parameters
@@ -247,7 +252,8 @@ class InterferogramDataset(PairDataset):
         """
         super().parse_pairs(paths)
 
-    def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
+    @classmethod
+    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Used to parse datetime from filenames. *Must be implemented in subclass*.
 
         Parameters

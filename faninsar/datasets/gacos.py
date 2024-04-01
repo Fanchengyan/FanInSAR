@@ -258,10 +258,12 @@ class GACOSPairs(ApsPairs):
         self._pairs = self.parse_pairs(self.files.paths[self.valid])
         self._datetime = self.parse_datetime(self.files.paths[self.valid])
 
-    def parse_pairs(self, paths: list[Path]) -> Pairs:
+    @classmethod
+    def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Parse pairs from a list of GACOS-pair file paths."""
         return super().parse_pairs(paths)
 
-    def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
+    @classmethod
+    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse datetime from a list of GACOS-pair file paths."""
         return super().parse_datetime(paths)
