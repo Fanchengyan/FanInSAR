@@ -119,7 +119,7 @@ class HyP3S1(InterferogramDataset):
         """Parse the primary and secondary date/acquisition of the interferogram
         to generate Pairs object.
         """
-        names = [f.name for f in paths]
+        names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         pairs = Pairs.from_names(pair_names)
         return pairs
@@ -127,7 +127,7 @@ class HyP3S1(InterferogramDataset):
     @classmethod
     def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse the datetime of the interferogram to generate DatetimeIndex object."""
-        names = [f.name for f in paths]
+        names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         date_names = np.unique([i.split("_") for i in pair_names])
         return pd.DatetimeIndex(date_names)
@@ -235,11 +235,11 @@ class HyP3S1Burst(InterferogramDataset):
         )
 
     @classmethod
-    def parse_pairs(self, paths: list[Path]) -> Pairs:
+    def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Parse the primary and secondary date/acquisition of the interferogram
         to generate Pairs object.
         """
-        names = [f.name for f in paths]
+        names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[3:5]) for i in names]
         pairs = Pairs.from_names(pair_names)
         return pairs
@@ -247,7 +247,7 @@ class HyP3S1Burst(InterferogramDataset):
     @classmethod
     def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse the datetime of the interferogram to generate DatetimeIndex object."""
-        names = [f.name for f in paths]
+        names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[3:5]) for i in names]
         date_names = np.unique([i.split("_") for i in pair_names])
         return pd.DatetimeIndex(date_names)

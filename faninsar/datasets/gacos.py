@@ -131,8 +131,9 @@ class GACOS(ApsDataset):
             ds_name=ds_name,
         )
 
-    def parse_dates(self):
-        dates_str = [i.stem.split(".")[0] for i in self.files.paths]
+    @classmethod
+    def parse_dates(cls, paths: list[Path]):
+        dates_str = [Path(i).stem.split(".")[0] for i in paths]
         dates = pd.to_datetime(dates_str, format="%Y%m%d")
         return dates
 

@@ -1331,7 +1331,7 @@ class ApsDataset(RasterDataset):
 
         profile = self.get_profile(roi)
         profile["count"] = 1
-        dates = self.parse_dates()
+        dates = self.parse_dates(self.files.paths)
 
         dates_missing = np.setdiff1d(pairs.dates, dates)
         if len(dates_missing) > 0:
@@ -1368,7 +1368,8 @@ class ApsDataset(RasterDataset):
 
                 dst.write(dest_arr, 1)
 
-    def parse_dates(self, paths: Optional[Sequence[str]] = None) -> pd.DatetimeIndex:
+    @classmethod
+    def parse_dates(cls, paths: Optional[Sequence[str]] = None) -> pd.DatetimeIndex:
         """Used to parse acquisition dates from filenames. *Must be implemented
         in subclass*.
 
@@ -1481,7 +1482,7 @@ class ApsPairs(PairDataset):
     @classmethod
     def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Parse pairs from a list of APS-pair file paths."""
-        names = [f.stem for f in paths]
+        names = [Path(f).stem for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         pairs = Pairs.from_names(pair_names)
         return pairs
@@ -1489,7 +1490,7 @@ class ApsPairs(PairDataset):
     @classmethod
     def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse datetime from a list of APS-pair file paths."""
-        names = [f.stem for f in paths]
+        names = [Path(f).stem for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         date_names = np.unique([i.split("_") for i in pair_names])
         return pd.DatetimeIndex(date_names)
