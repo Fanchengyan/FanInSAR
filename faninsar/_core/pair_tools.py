@@ -388,9 +388,9 @@ class Pairs:
         return self._values
 
     @property
-    def dates(self) -> np.ndarray:
+    def dates(self) -> pd.DatetimeIndex:
         """return the sorted dates array of all pairs in type of np.datetime64[D]"""
-        return self._dates
+        return pd.to_datetime(self._dates)
 
     @property
     def days(self) -> np.ndarray:
@@ -398,16 +398,16 @@ class Pairs:
         return (self._values[:, 1] - self._values[:, 0]).astype(int)
 
     @property
-    def primary(self) -> np.ndarray:
+    def primary(self) -> pd.DatetimeIndex:
         """return the primary dates of all pairs"""
-        return self._values[:, 0]
+        return pd.to_datetime(self._values[:, 0])
 
     @property
-    def secondary(self) -> np.ndarray:
+    def secondary(self) -> pd.DatetimeIndex:
         """return the secondary dates of all pairs"""
-        return self._values[:, 1]
+        return pd.to_datetime(self._values[:, 1])
 
-    def primary_string(self, date_format="%Y%m%d") -> np.ndarray:
+    def primary_string(self, date_format="%Y%m%d") -> pd.Index:
         """return the primary dates of all pairs in string format
 
         Parameters
@@ -416,9 +416,9 @@ class Pairs:
             Format of the date string. Default is '%Y%m%d'. See more at
             `strftime Format Codes <https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes>`_.
         """
-        return pd.to_datetime(self.values[:, 0]).strftime(date_format).values
+        return self.primary.strftime(date_format)
 
-    def secondary_string(self, date_format="%Y%m%d") -> np.ndarray:
+    def secondary_string(self, date_format="%Y%m%d") -> pd.Index:
         """return the secondary dates of all pairs in string format
 
         Parameters
@@ -427,7 +427,7 @@ class Pairs:
             Format of the date string. Default is '%Y%m%d'. See more at
             `strftime Format Codes <https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes>`_.
         """
-        return pd.to_datetime(self.values[:, 1]).strftime(date_format).values
+        return self.secondary.strftime(date_format)
 
     @property
     def edge_index(self) -> np.ndarray:
