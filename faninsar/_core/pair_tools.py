@@ -528,13 +528,7 @@ class Pairs:
             Pair names or Pair objects, or Pairs object.
         """
         pairs = self._ensure_pairs(pairs)
-        con_ref = np.isin(self.values[:, 0], pairs.values[:, 0])
-        con_sec = np.isin(self.values[:, 1], pairs.values[:, 1])
-        con = np.logical_and(con_ref, con_sec)
-        if np.any(con):
-            return Pairs(self.values[con])
-        else:
-            return None
+        return self[self.where(pairs)]
 
     def union(self, pairs: Union[list[str], list[Pair], "Pairs"]) -> "Pairs":
         """return the union of the pairs. All pairs that in self and input pairs.
@@ -561,7 +555,7 @@ class Pairs:
         """
         pairs = self._ensure_pairs(pairs)
         return self - pairs
-    
+
     def copy(self) -> "Pairs":
         """return a copy of the pairs"""
         return Pairs(self._values.copy())
