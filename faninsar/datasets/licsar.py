@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
@@ -5,11 +7,12 @@ from typing import Any, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+from rasterio.crs import CRS
+from rasterio.enums import Resampling
+
 from faninsar._core.pair_tools import Pairs
 from faninsar.datasets.ifg import InterferogramDataset
 from faninsar.query.query import BoundingBox
-from rasterio.crs import CRS
-from rasterio.enums import Resampling
 
 
 class LiCSAR(InterferogramDataset):
@@ -93,9 +96,9 @@ class LiCSAR(InterferogramDataset):
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
         masked : bool, optional
-            if True, the returned will be a masked array with a mask 
+            if True, the returned will be a masked array with a mask
             for no data values. Default: True.
-            
+
             .. note::
                 If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
         fill_nodata : bool, optional
@@ -132,6 +135,7 @@ class LiCSAR(InterferogramDataset):
         """return the paths of LiCSAR metadata files in a pandas Series.
         metadata files include: DEM, U, E, N, baselines, polygon.
         """
+
         def parse_file(pattern: str) -> Path:
             result = list(self.root_dir.rglob(pattern))
             if len(result) == 0:
@@ -148,7 +152,7 @@ class LiCSAR(InterferogramDataset):
 
         df = pd.Series(
             [dem_file, U_file, E_file, N_file, baseline_file, polygon_file],
-            index=['DEM','U','E','N','baselines','polygon']
+            index=["DEM", "U", "E", "N", "baselines", "polygon"],
         )
         return df
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pprint
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple, Union
@@ -13,8 +15,8 @@ from rasterio.io import MemoryFile
 from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
 from tqdm.auto import tqdm
-from faninsar._core.logger import setup_logger
 
+from faninsar._core.logger import setup_logger
 
 logger = setup_logger(
     log_name="FanInSAR.geo_tools", log_format="%(levelname)s - %(message)s"

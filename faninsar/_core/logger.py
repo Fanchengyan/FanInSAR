@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import Literal
 
@@ -50,7 +52,7 @@ def setup_logger(
 
     # create a formatter
     formatter = logging.Formatter(log_format)
-    
+
     def create_handler():
         if log_file:
             handler = logging.FileHandler(log_file)
@@ -63,25 +65,25 @@ def setup_logger(
             handler.setLevel(log_level)
             handler.setFormatter(formatter)
         return handler
-    
+
     handler_names = [i.name for i in logger.handlers]
     if log_name in handler_names:
         handler = logger.handlers[handler_names.index(log_name)]
         if not keep_handlers:
             logger.removeHandler(handler)
-            handler = create_handler()  
-            logger.addHandler(handler)            
+            handler = create_handler()
+            logger.addHandler(handler)
     else:
         handler = create_handler()
         logger.addHandler(handler)
-        
+
     if capture_warnings:
         logging.captureWarnings(True)
         warning_logger = logging.getLogger("py.warnings")
         if warning_logger.handlers and not keep_handlers:
             warning_logger.removeHandler(warning_logger.handlers[0])
             warning_logger.addHandler(handler)
-        
+
     if return_handler:
         return logger, handler
     else:

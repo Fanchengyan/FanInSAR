@@ -1,5 +1,7 @@
 """Base classes for all :mod:`faninsar` datasets. all classes in this script are modified from the torchgeo package."""
 
+from __future__ import annotations
+
 import abc
 import functools
 import re
@@ -714,9 +716,9 @@ class RasterDataset(GeoDataset):
             masked=True,
             boundless=False,  # TODO: check this
         )
-        
+
         if self.fill_nodata:
-            if data.mask.ndim==0:
+            if data.mask.ndim == 0:
                 data = np.ma.masked_array(data, data == self.nodata)
             data = fill.fillnodata(data)
 
