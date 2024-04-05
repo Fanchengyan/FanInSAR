@@ -6,7 +6,7 @@ Terminology
 .. glossary::
 
     Acquisition
-        The date of a SAR acquisition, and is expressed as ``datetime.datetime`` object.
+        The date of a SAR acquisition/image, and is expressed as ``datetime.datetime`` object.
 
     Pair
         A pair is a combination of two SAR acquisitions in acquisition order.
@@ -40,7 +40,7 @@ Terminology
     CRS
         A coordinate reference system (CRS) is a coordinate-based local, regional or global system used to locate geographical entities. In FanInSAR, the CRS is handled by the ``rasterio`` package.
 
-.. [1] : Fan, Chengyan, Cuicui Mu, Lin Liu, and Zhuoyi Zhao. “Does InSAR Time Series Using C-Band Sentinel-1 Data Underestimate Surface Deformation Over Permafrost Regions on Qinghai-Tibetan Plateau?,”.
+.. [1] : Fan, Chengyan, Lin Liu, Zhuoyi Zhao and Cuicui Mu. “Unwrapping errors matter: Pronounced underestimation of surface deformation over Tibetan Plateau permafrost by Sentinel-1 InSAR and its correction”.
 
 
 

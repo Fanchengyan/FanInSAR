@@ -1,7 +1,7 @@
 Installation
 ============
 
-FanInSAR is a Python package, and requires ``Python >= 3.9``. It can be installed using ``pip`` from PyPI:
+FanInSAR is a Python package, and requires ``Python >= 3.8``. It can be installed using ``pip`` from PyPI:
 
 .. code-block:: bash
 

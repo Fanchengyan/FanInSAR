@@ -1,6 +1,8 @@
 recommonmark
 sphinx>=7
 myst-nb
-sphinx_rtd_theme
+sphinx-copybutton
+sphinx-design
+pydata_sphinx_theme
 Jinja2
 git+https://github.com/Fanchengyan/FanInSAR.git@main

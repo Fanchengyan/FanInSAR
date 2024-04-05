@@ -12,7 +12,7 @@ FanInSAR is a fancy InSAR post-processing library written in Python. It is speci
 
 ## Installation 
 
-FanInSAR is a Python package, and requires ``Python >= 3.9``. You can install the latest release of FanInSAR using ``pip``:
+FanInSAR is a Python package, and requires ``Python >= 3.8``. You can install the latest release of FanInSAR using ``pip``:
 
 ```bash
 pip install git+https://github.com/Fanchengyan/FanInSAR.git

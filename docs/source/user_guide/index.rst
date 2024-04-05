@@ -8,7 +8,7 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
 
 .. toctree::
    :maxdepth: 2
-   :hidden:
+   :caption: Contents:
 
    quick_start
    colormap

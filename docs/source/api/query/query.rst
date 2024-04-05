@@ -26,6 +26,15 @@ Points query
    :member-order: bysource
    :show-inheritance:
 
+Polygons query
+^^^^^^^^^^^^^^
+
+.. autoclass:: faninsar.query.Polygons
+   :members:
+   :undoc-members:
+   :member-order: bysource
+   :show-inheritance:
+
 GeoQuery
 ^^^^^^^^
 

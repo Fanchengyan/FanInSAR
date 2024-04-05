@@ -4,7 +4,7 @@ numpy
 torch
 matplotlib
 data_downloader
-rasterio
+rasterio >= 1.0.26
 xarray
 psutil
 rioxarray

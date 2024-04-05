@@ -52,8 +52,9 @@ class GeoDataset(abc.ABC):
 
     .. Note::
 
-        Although this :class:`GeoDataset` class is based on the ``GeoDataset``
-        class in the torchgeo package, it has been extensively modified.  When
+        Although this :class:`GeoDataset` class is based on the 
+        :class:`torchgeo.datasets.GeoDataset` class in the torchgeo package, 
+        it has been extensively modified.  When
         using this :class:`GeoDataset` class, you should not make any assumptions
         based on the torchgeo version.
     """
@@ -136,8 +137,7 @@ class GeoDataset(abc.ABC):
         new_crs: CRS or str
             New coordinate reference system :term:`(CRS)`. It can be a CRS object
             or a string, which will be parsed to a CRS object. The string can be
-            in any format supported by `rasterio.crs.CRS.from_user_input()
-            <https://rasterio.readthedocs.io/en/stable/api/rasterio.crs.html#rasterio.crs.CRS.from_user_input>`_.
+            in any format supported by :meth:`pyproj.crs.CRS.from_user_input`.
         """
         if isinstance(new_crs, str):
             new_crs = CRS.from_user_input(new_crs)
