@@ -16,27 +16,30 @@ class GeoQuery:
         GeoDataset instead of using BoundingBox(es) and Points separately.
     """
 
-    _bbox: BoundingBox | list[BoundingBox]
     _points: Points | None
+    _bbox: BoundingBox | list[BoundingBox] | None
+    _polygons: Polygons | None
 
     __slots__ = ["_bbox", "_points"]
 
     def __init__(
         self,
-        bbox: BoundingBox | list[BoundingBox] | None = None,
         points: Points | None = None,
+        bbox: BoundingBox | list[BoundingBox] | None = None,
+        polygons: Polygons | None = None,
     ) -> None:
         """Initialize a sampler.
 
         Parameters
         ----------
+        points : Points | None, optional
+            The :class:`Points` for querying the samples. Default is None.
         bbox : BoundingBox | list[BoundingBox] | None, optional
             The :class:`BoundingBox` or a list of :class:`BoundingBox`. for querying
-            the samples.If None, the samples will be queried from the points.
-            default: None
-        points : Optional[Points], optional
-            The :class:`Points` for querying the samples. If None, the samples
-            will be queried from the bbox. default: None
+            the samples. Default is None.
+        polygons: Polygons | None, optional
+            The :class:`Polygons` for querying the samples. If None, the samples
+            will be queried from the bbox. Default is None.
 
         Raises
         ------
@@ -45,8 +48,12 @@ class GeoQuery:
         TypeError:
             If bbox is not a BoundingBox or a list of BoundingBox.
         """
-        if bbox is None and points is None:
-            raise ValueError("bbox and points cannot be both None.")
+        if bbox is None and points is None and polygons is None:
+            raise ValueError("One of bbox, points or polygons must be provided.")
+        if points is not None and not isinstance(points, Points):
+            raise TypeError(f"points must be a Points. Got {type(points)}")
+        if polygons is not None and not isinstance(polygons, Polygons):
+            raise TypeError(f"polygons must be a Polygons. Got {type(polygons)}")
         if bbox is not None:
             if isinstance(bbox, BoundingBox):
                 bbox = [bbox]
@@ -58,19 +65,24 @@ class GeoQuery:
                     raise TypeError(
                         f"bbox must be a BoundingBox or a list of BoundingBox. Got {type(bbox)}"
                     )
-
-        self._bbox = bbox
         self._points = points
+        self._bbox = bbox
+        self._polygons = polygons
 
     def __str__(self) -> str:
         bbox = f"[{len(self.bbox)} BoundingBox]" if self.bbox is not None else None
         points = self.points if self.points is not None else None
-        return f"GeoQuery(bbox={bbox}, points={points})"
+        return f"GeoQuery(bbox={bbox}, points={points}, polygons={self.polygons})"
 
     def __repr__(self) -> str:
         bbox = f"[{len(self.bbox)} BoundingBox]" if self.bbox is not None else None
         points = self.points if self.points is not None else None
-        return f"GeoQuery(\n    bbox={bbox}\n    points={points}\n)"
+        return f"GeoQuery(\n    bbox={bbox}\n    points={points}\n   polygons={self.polygons}\n)"
+
+    @property
+    def points(self) -> Points | None:
+        """Return the points of the samples."""
+        return self._points
 
     @property
     def bbox(self) -> list[BoundingBox] | None:
@@ -78,6 +90,6 @@ class GeoQuery:
         return self._bbox
 
     @property
-    def points(self) -> Points | None:
-        """Return the points of the samples."""
-        return self._points
+    def polygons(self) -> Points | None:
+        """Return the polygons of the samples."""
+        return self._polygons
