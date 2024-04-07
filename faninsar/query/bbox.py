@@ -9,17 +9,15 @@ from rasterio.warp import transform_bounds
 
 
 class BoundingBox:
-    """Data class for indexing interferogram data using a spatial bounding box.
-
-    .. Note::
-
-        The :class:`BoundingBox` class a modified version of the
-        :class:`torchgeo.datasets.BoundingBox`
-        class from the torchgeo package. The modifications are:
-
-        * date bounds are removed
-        * the bounds is changed to (left, bottom, right, top) which is the same as rasterio :class:`rasterio.coords.BoundingBox`
-        * added :meth:`to_rasterio_bounds` method to convert the bounding box to a rasterio bounds tuple
+    """a class used for indexing datasets using a spatial bounding box.
+    
+    Note:
+        This class is a modified version of the BoundingBox class from the torchgeo package.
+        The main modifications include:
+        
+        - Removal of ``date bounds``
+        - Change of the bounding box to (left, bottom, right, top), which aligns with the :class:`rasterio.coords.BoundingBox` class.
+        - Addition of the CRS attribute to automatically convert the bounding box to the CRS of the dataset.
     """
 
     def __init__(

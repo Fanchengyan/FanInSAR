@@ -1,6 +1,9 @@
 Inversion
 =========
 
+.. currentmodule:: faninsar.NSBAS.inversion
+
+
 Classes and functions for inverting the NSBAS problem.
 
 Classes
@@ -9,7 +12,7 @@ Classes
 NSBASInversion
 ^^^^^^^^^^^^^^
 
-.. autoclass:: faninsar.NSBAS.inversion.NSBASInversion
+.. autoclass:: NSBASInversion
     :members:
     :undoc-members:
     :member-order: bysource
@@ -18,7 +21,7 @@ NSBASInversion
 NSBASMatrixFactory
 ^^^^^^^^^^^^^^^^^^
 
-.. autoclass:: faninsar.NSBAS.inversion.NSBASMatrixFactory
+.. autoclass:: NSBASMatrixFactory
     :members:
     :undoc-members:
     :member-order: bysource
@@ -27,7 +30,7 @@ NSBASMatrixFactory
 PhaseDeformationConverter
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-.. autoclass:: faninsar.NSBAS.inversion.PhaseDeformationConverter
+.. autoclass:: PhaseDeformationConverter
     :members:
     :undoc-members:
     :member-order: bysource
@@ -39,9 +42,9 @@ Basis Functions
 batch_lstsq
 ^^^^^^^^^^^
 
-.. autofunction:: faninsar.NSBAS.inversion.batch_lstsq
+.. autofunction:: batch_lstsq
 
 censored_lstsq
 ^^^^^^^^^^^^^^
 
-.. autofunction:: faninsar.NSBAS.inversion.censored_lstsq
+.. autofunction:: censored_lstsq

@@ -143,6 +143,12 @@ class Polygons:
     def undesired(self) -> "Polygons":
         """undesired part of polygons."""
         return Polygons(self._gdf[self.types == "undesired"], types="undesired")
+    
+    @property
+    def is_mixed(self) -> bool:
+        """whether the polygons contain both desired and undesired polygons."""
+        return len(self.desired) > 0 and len(self.undesired) > 0
+
 
     def to_desired(self) -> "Polygons":
         """Return a desired polygons, with the regions of undesired polygons being removed.
@@ -161,7 +167,7 @@ class Polygons:
         return self._gdf.crs
 
     def to_crs(self, crs: Any) -> "Polygons":
-        """Return a new Polygons object with a new CRS.
+        """Return a new Polygons object with new CRS.
 
         Parameters
         ----------

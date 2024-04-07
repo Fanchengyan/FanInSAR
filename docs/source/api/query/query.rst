@@ -1,26 +1,34 @@
 geospatial Queries
 ==================
 
+.. currentmodule:: faninsar.query
+
 Geospatial Query in FanInSAR is used to sample values from GeoDataset. Query includes:
 
-* :class:`.BoundingBox` : a bounding box, can be used to sample rectangular region values from GeoDataset.
-* :class:`.Points` : a collection of points, can be used to sample multiple pixel values from GeoDataset.
-* :class:`.GeoQuery` : **a combination** of :class:`.BoundingBox` and :class:`.Points`, highly recommended if you want to sample multiple rectangular region and pixel values from GeoDataset simultaneously.
+.. csv-table::
+   :header: "Query Type", "Description"
+
+   :class:`Points`, "A collection of points, can be used to sample multiple pixel values from GeoDataset."
+   :class:`BoundingBox`, "A bounding box, can be used to sample rectangular region values from GeoDataset."
+   :class:`Polygons`, "A collection of polygons, can be used to sample multiple pixel values from GeoDataset."
+   :class:`GeoQuery`, "A combination of :class:`Points`, :class:`BoundingBox`, and :class:`Polygons`. It is highly recommended if you want to sample values using multiple query types simultaneously from a GeoDataset."
 
 
-Bounding Box query
-^^^^^^^^^^^^^^^^^^
 
-.. autoclass:: faninsar.query.BoundingBox
+
+Points query
+^^^^^^^^^^^^
+
+.. autoclass:: Points
    :members:
    :undoc-members:
    :member-order: bysource
    :show-inheritance:
 
-Points query
-^^^^^^^^^^^^
+Bounding Box query
+^^^^^^^^^^^^^^^^^^
 
-.. autoclass:: faninsar.query.Points
+.. autoclass:: BoundingBox
    :members:
    :undoc-members:
    :member-order: bysource
@@ -29,7 +37,7 @@ Points query
 Polygons query
 ^^^^^^^^^^^^^^
 
-.. autoclass:: faninsar.query.Polygons
+.. autoclass:: Polygons
    :members:
    :undoc-members:
    :member-order: bysource
@@ -38,7 +46,7 @@ Polygons query
 GeoQuery
 ^^^^^^^^
 
-.. autoclass:: faninsar.query.GeoQuery
+.. autoclass:: GeoQuery
    :members:
    :undoc-members:
    :member-order: bysource
