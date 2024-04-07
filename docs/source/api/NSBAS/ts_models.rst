@@ -1,22 +1,22 @@
 Time-Series Models
 ==================
 
-the time-series models include the following:
+.. currentmodule:: faninsar.NSBAS.tsmodels
 
-* :class:`TimeSeriesModels`
-* :class:`LinearModel`
-* :class:`QuadraticModel`
-* :class:`CubicModel`
-* :class:`AnnualSinusoidalModel`
-* :class:`AnnualSemiannualSinusoidal`
-* :class:`FreezeThawCycleModel`
-* :class:`FreezeThawCycleModelWithVelocity`
+Table of Models
+~~~~~~~~~~~~~~~
 
+.. csv-table:: Time-Series Models currently implemented in the package
+   :file: tables/models.csv
+   :header-rows: 1
+   
+Classes
+~~~~~~~
 
 TimeSeriesModels
 ----------------
 
-.. autoclass:: faninsar.NSBAS.tsmodels.TimeSeriesModels
+.. autoclass:: TimeSeriesModels
    :members:
    :undoc-members:
    :member-order: bysource
@@ -26,7 +26,7 @@ TimeSeriesModels
 LinearModel
 -----------
 
-.. autoclass:: faninsar.NSBAS.tsmodels.LinearModel
+.. autoclass:: LinearModel
    :members:
    :undoc-members:
    :member-order: bysource
@@ -35,7 +35,7 @@ LinearModel
 QuadraticModel
 --------------
 
-.. autoclass:: faninsar.NSBAS.tsmodels.QuadraticModel
+.. autoclass:: QuadraticModel
    :members:
    :undoc-members:
    :member-order: bysource
@@ -45,7 +45,7 @@ QuadraticModel
 CubicModel
 ----------
 
-.. autoclass:: faninsar.NSBAS.tsmodels.CubicModel
+.. autoclass:: CubicModel
    :members:
    :undoc-members:
    :member-order: bysource
@@ -54,7 +54,7 @@ CubicModel
 AnnualSinusoidalModel
 ---------------------
 
-.. autoclass:: faninsar.NSBAS.tsmodels.AnnualSinusoidalModel
+.. autoclass:: AnnualSinusoidalModel
    :members:
    :undoc-members:
    :member-order: bysource
@@ -63,7 +63,7 @@ AnnualSinusoidalModel
 AnnualSemiannualSinusoidal
 ---------------------------
 
-.. autoclass:: faninsar.NSBAS.tsmodels.AnnualSemiannualSinusoidal
+.. autoclass:: AnnualSemiannualSinusoidal
    :members:
    :undoc-members:
    :member-order: bysource
@@ -72,7 +72,7 @@ AnnualSemiannualSinusoidal
 FreezeThawCycleModel
 --------------------
 
-.. autoclass:: faninsar.NSBAS.tsmodels.FreezeThawCycleModel
+.. autoclass:: FreezeThawCycleModel
    :members:
    :undoc-members:
    :member-order: bysource
@@ -82,7 +82,7 @@ FreezeThawCycleModel
 FreezeThawCycleModelWithVelocity
 ---------------------------------
 
-.. autoclass:: faninsar.NSBAS.tsmodels.FreezeThawCycleModelWithVelocity
+.. autoclass:: FreezeThawCycleModelWithVelocity
    :members:
    :undoc-members:
    :member-order: bysource

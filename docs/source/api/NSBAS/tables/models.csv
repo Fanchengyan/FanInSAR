@@ -1,0 +1,9 @@
+Model, Description
+:class:`.TimeSeriesModels`, Base class for time series models
+:class:`.LinearModel`, Linear time series model
+:class:`.QuadraticModel`, Quadratic time series model
+:class:`.CubicModel` , Cubic time series model
+:class:`.AnnualSinusoidalModel` , Annual sinusoidal time series model
+:class:`.AnnualSemiannualSinusoidal`, Annual and semiannual sinusoidal time series model
+:class:`.FreezeThawCycleModel`, Freeze-thaw cycle time series model
+:class:`.FreezeThawCycleModelWithVelocity`, Freeze-thaw cycle time series model with velocity

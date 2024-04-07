@@ -9,7 +9,7 @@
 project = "FanInSAR"
 copyright = "2024, Fan Chengyan (Fancy)"
 author = "Fan Chengyan (Fancy)"
-release = "v1.0"
+release = "v0.1"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
