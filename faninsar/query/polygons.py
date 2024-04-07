@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Any, Literal, Sequence, TypeAlias
+from typing import Any, Literal, Sequence
 
 import geopandas as gpd
 import pandas as pd
@@ -10,31 +10,28 @@ from matplotlib.axes import Axes
 from pyproj.crs import CRS
 from rasterio.errors import CRSError
 
-PolygonTypes: TypeAlias = (
-    Literal["desired", "undesired"] | Sequence[Literal["desired", "undesired"]]
-)
-
 
 class Polygons:
     """Polygons object is used to store the regions that need to be retrieved
     ("desired") or removed ("undesired") from a dataset.
 
-    .. Tip::
+    Tip:
         When a mixed-types Polygons, where both "desired" and "undesired"
         polygons, are provided:
 
         * the "undesired" polygons will only be useful when there are overlapping regions with the "desired" polygons. Otherwise, the "desired" polygons are enough.
 
         * you can use :meth:`to_desired` to get the desired polygons from a mixed-types Polygons object.
-
-
     """
 
     def __init__(
         self,
         gdf: gpd.GeoDataFrame | gpd.GeoSeries,
-        types: PolygonTypes = "desired",
+        types: (
+            Literal["desired", "undesired"] | Sequence[Literal["desired", "undesired"]]
+        ) = "desired",
         crs: Any = None,
+        crop: bool = True,
     ) -> None:
         """Initialize a Polygons object.
 
@@ -51,6 +48,9 @@ class Polygons:
             The CRS of the polygons. Can be any object that can be passed to
             :meth:`pyproj.crs.CRS.from_user_input` .
             If None, the CRS of the input geometry will be used. Default is None.
+        crop : bool, optional
+            Whether to crop the sampled values to the extent of polygons.
+            Default is True.
         """
         self._gdf = self._format_geometry(gdf, types, crs)
 
@@ -83,7 +83,9 @@ class Polygons:
     def _format_geometry(
         self,
         gdf: gpd.GeoDataFrame | gpd.GeoSeries | "Polygons",
-        types: PolygonTypes,
+        types: (
+            Literal["desired", "undesired"] | Sequence[Literal["desired", "undesired"]]
+        ),
         crs: Any,
     ) -> gpd.GeoDataFrame:
         """Format the geometry column of the GeoDataFrame."""
@@ -125,7 +127,7 @@ class Polygons:
         return self._gdf.geometry
 
     @property
-    def types(self) -> PolygonTypes:
+    def types(self) -> pd.Series:
         """the types of polygons."""
         return self._gdf["types"]
 
@@ -143,12 +145,11 @@ class Polygons:
     def undesired(self) -> "Polygons":
         """undesired part of polygons."""
         return Polygons(self._gdf[self.types == "undesired"], types="undesired")
-    
+
     @property
     def is_mixed(self) -> bool:
         """whether the polygons contain both desired and undesired polygons."""
         return len(self.desired) > 0 and len(self.undesired) > 0
-
 
     def to_desired(self) -> "Polygons":
         """Return a desired polygons, with the regions of undesired polygons being removed.
@@ -227,7 +228,9 @@ class Polygons:
     def from_file(
         cls,
         filename: str | Path,
-        types: PolygonTypes = "desired",
+        types: (
+            Literal["desired", "undesired"] | Sequence[Literal["desired", "undesired"]]
+        ) = "desired",
         crs: Any = None,
         **kwargs,
     ) -> "Polygons":
@@ -309,5 +312,3 @@ if __name__ == "__main__":
     pg3 = pg2.to_crs(pg1.crs)
 
     (pg2 + pg3).plot()
-
-    
