@@ -17,7 +17,7 @@ from faninsar._core.logger import setup_logger
 from faninsar._core.pair_tools import Pairs
 from faninsar.datasets.base import ApsPairs, PairDataset, RasterDataset
 from faninsar.NSBAS import PhaseDeformationConverter
-from faninsar.query.query import BoundingBox, GeoQuery, Points
+from faninsar.query import BoundingBox, GeoQuery, Points
 
 logger = setup_logger(
     log_name="FanInSAR.datasets.ifg", log_format="%(levelname)s - %(message)s"

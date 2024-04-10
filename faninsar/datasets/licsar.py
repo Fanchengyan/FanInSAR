@@ -12,7 +12,7 @@ from rasterio.enums import Resampling
 
 from faninsar._core.pair_tools import Pairs
 from faninsar.datasets.ifg import InterferogramDataset
-from faninsar.query.query import BoundingBox
+from faninsar.query import BoundingBox
 
 
 class LiCSAR(InterferogramDataset):

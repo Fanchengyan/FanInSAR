@@ -12,7 +12,6 @@ logger = setup_logger(
     log_name="FanInSAR.samplers.batch", log_format="%(levelname)s - %(message)s"
 )
 
-
 class RowSampler:
     """A sampler samples data from a dataset in a row-wise manner.
 

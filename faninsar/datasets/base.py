@@ -1,4 +1,4 @@
-"""Base classes for all :mod:`faninsar` datasets. all classes in this script are modified from the torchgeo package."""
+"""Base classes for all :mod:`faninsar` datasets. The base class RasterDataset in this script is modified from the torchgeo package."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ from faninsar._core import geo_tools
 from faninsar._core.geo_tools import Profile
 from faninsar._core.logger import setup_logger
 from faninsar._core.pair_tools import Pairs
-from faninsar.query.query import BoundingBox, GeoQuery, Points
+from faninsar.query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
 
 __all__ = ("GeoDataset", "RasterDataset", "PairDataset", "ApsDataset")
 
@@ -49,14 +49,6 @@ class GeoDataset(abc.ABC):
     to represent a geospatial dataset and provides methods to index the dataset
     and retrieve information about the dataset, such as CRS, resolution, data type,
     no data value, and a bounds.
-
-    .. Note::
-
-        Although this :class:`GeoDataset` class is based on the 
-        :class:`torchgeo.datasets.GeoDataset` class in the torchgeo package, 
-        it has been extensively modified.  When
-        using this :class:`GeoDataset` class, you should not make any assumptions
-        based on the torchgeo version.
     """
 
     # following attributes should be set by the subclass
@@ -118,7 +110,7 @@ class GeoDataset(abc.ABC):
             self.index.insert(*item)
 
     @property
-    def crs(self) -> Optional[CRS]:
+    def crs(self) -> CRS | None:
         """coordinate reference system (:term:`CRS`) of the dataset.
 
         Returns:
@@ -215,7 +207,7 @@ class GeoDataset(abc.ABC):
         self._res = new_res
 
     @property
-    def roi(self) -> Optional[BoundingBox]:
+    def roi(self) -> BoundingBox | None:
         """Return the region of interest of the dataset.
 
         Returns
@@ -245,7 +237,7 @@ class GeoDataset(abc.ABC):
 
         self._roi = new_roi
 
-    def _check_roi(self, roi: Optional[BoundingBox]) -> BoundingBox:
+    def _check_roi(self, roi: BoundingBox | None) -> BoundingBox:
         """Check the roi and return a valid roi.
 
         Parameters
@@ -277,7 +269,7 @@ class GeoDataset(abc.ABC):
             return roi
 
     @property
-    def dtype(self) -> Optional[np.dtype]:
+    def dtype(self) -> np.dtype | None:
         """Data type of the dataset.
 
         Returns
@@ -299,7 +291,7 @@ class GeoDataset(abc.ABC):
         self._dtype = new_dtype
 
     @property
-    def nodata(self) -> Optional[Union[float, int, Any]]:
+    def nodata(self) -> float | int | Any | None:
         """No data value of the dataset.
 
         Returns
@@ -310,7 +302,7 @@ class GeoDataset(abc.ABC):
         return self._nodata
 
     @nodata.setter
-    def nodata(self, new_nodata: Union[float, int, Any]) -> None:
+    def nodata(self, new_nodata: float | int | Any) -> None:
         """Set the no data value of the dataset.
 
         Parameters
@@ -373,15 +365,15 @@ class GeoDataset(abc.ABC):
         return BoundingBox(*self.index.bounds, crs=self.crs)
 
     def get_profile(
-        self, bbox: Union[BoundingBox, Literal["roi", "bounds"]] = "roi"
-    ) -> Optional[Profile]:
+        self, bbox: BoundingBox | Literal["roi", "bounds"] = "roi"
+    ) -> Profile | None:
         """Return the profile information of the dataset for the given bounding
         box type. The profile information includes the width, height, transform,
         count, data type, no data value, and CRS of the dataset.
 
         Parameters
         ----------
-        bbox : str, one of ['bounds', 'roi'], optional
+        bbox : BoundingBox | Literal["roi", "bounds"], optional
             the bounding box used to calculate the ``width``, ``height``
             and ``transform`` of the dataset for the profile. Default is
             'roi'.
@@ -503,16 +495,15 @@ class RasterDataset(GeoDataset):
     def __init__(
         self,
         root_dir: str = "data",
-        paths: Optional[Sequence[str]] = None,
-        crs: Optional[CRS] = None,
-        res: Optional[Union[float, tuple[float, float]]] = None,
-        dtype: Optional[np.dtype] = None,
-        nodata: Optional[Union[float, int, Any]] = None,
-        roi: Optional[BoundingBox] = None,
-        bands: Optional[Sequence[str]] = None,
+        paths: Sequence[str] | None = None,
+        crs: CRS | None = None,
+        res: float | tuple[float, float] | None = None,
+        dtype: np.dtype | None = None,
+        nodata: float | int | Any | None = None,
+        roi: BoundingBox | None = None,
+        bands: Sequence[str] | None = None,
         cache: bool = True,
         resampling=Resampling.nearest,
-        masked: bool = True,
         fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
@@ -548,15 +539,13 @@ class RasterDataset(GeoDataset):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
-        masked : bool, optional
-            if True, the returned will be a masked array with a mask
-            for no data values. Default: True.
-
-            .. note::
-                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
         fill_nodata : bool, optional
             Whether to fill holes in raster data by interpolation using the
-            ``rasterio.fill.fillnodata`` function. Default: False.
+            :func:`rasterio.fill.fillnodata` function. Default: False.
+
+            .. note::
+                This parameter is only used when querying bounding boxes!
+
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -571,7 +560,6 @@ class RasterDataset(GeoDataset):
         self.bands = bands or self.all_bands
         self.cache = cache
         self.resampling = resampling
-        self.masked = masked
         self.fill_nodata = fill_nodata
         self.verbose = verbose
         self.ds_name = ds_name
@@ -657,15 +645,16 @@ class RasterDataset(GeoDataset):
         self.roi = roi
 
     def __getitem__(
-        self, query: Union[GeoQuery, BoundingBox, Points]
+        self, query: GeoQuery | Points | BoundingBox | Polygons
     ) -> dict[str, np.ndarray]:
         """Retrieve image values for given query.
 
         Parameters
         ----------
-        query : Union[GeoQuery, BoundingBox, Points]
-            query to index the dataset. It can be a :class:`BoundingBox` or a
-            :class:`Points` or a :class:`GeoQuery` (recommended) object.
+        query : GeoQuery | Points | BoundingBox | Polygons
+            query to index the dataset. It can be :class:`Points`,
+            :class:`BoundingBox`, :class:`Polygons`, or a composite
+            :class:`GeoQuery` (recommended) object.
 
         Returns
         -------
@@ -674,32 +663,40 @@ class RasterDataset(GeoDataset):
             The keys of the dictionary are:
 
             * ``query``: a GeoQuery object, the query used to index the dataset
-            * ``bbox``: a numpy array of shape (n_bbox, n_file, height, width)
-                containing the values of the bounding boxes in the query.
             * ``points``: a masked numpy array of shape (n_file, n_point)
                 containing the values of the points in the query. The points that
                 outside the dataset will be masked.
+            * ``bbox``: a numpy array of shape (n_bbox, n_file, height, width)
+                containing the values of the bounding boxes in the query.
+            * ``polygons``: a numpy array of shape (n_polygon, n_file, height, width)
+                containing the values of the polygons in the query.
 
             .. Note::
-
-                ``bbox`` and ``points`` will be None if the query does not contain
-                bounding boxes or points.
+                ``bbox``, ``points``, and ``polygons`` will be None if the query
+                does not contain bounding boxes, points, or polygons.
         """
-        if isinstance(query, BoundingBox):
-            query = GeoQuery(bbox=query)
         if isinstance(query, Points):
             query = GeoQuery(points=query)
+        if isinstance(query, BoundingBox):
+            query = GeoQuery(bbox=query)
+        if isinstance(query, Polygons):
+            query = GeoQuery(polygons=query)
 
         paths = self.files[self.files.valid].paths
-        data = self._sample_files(paths, query)
+        result = self._sample_files(paths, query)
 
-        sample = {"query": query}
-        sample.update(data)
+        sample = {"query": query, "results": result}
 
         return sample
 
+    def _points_query(self, points: Points, vrt_fh) -> np.ndarray:
+        """Return the values of dataset at given points. Points that outside the dataset will be masked."""
+        points = self._ensure_query_crs(points)
+        data = np.ma.hstack(list(vrt_fh.sample(points.values, masked=True)))
+        return data
+
     def _bbox_query(self, bbox: BoundingBox, vrt_fh) -> np.ndarray:
-        """Return the index of the give file that intersect with the given bounding box."""
+        """Return the values of the dataset at the given bounding box."""
         bbox = self._ensure_query_crs(bbox)
 
         win = vrt_fh.window(*bbox)
@@ -717,19 +714,46 @@ class RasterDataset(GeoDataset):
             boundless=False,  # TODO: check this
         )
 
+        if data.mask.ndim == 0:
+            data = np.ma.masked_array(data.data, data == self.nodata)
         if self.fill_nodata:
-            if data.mask.ndim == 0:
-                data = np.ma.masked_array(data, data == self.nodata)
             data = fill.fillnodata(data)
-
         return data
 
-    def _points_query(self, points: Points, vrt_fh) -> np.ndarray:
-        """Return the index of the given file that intersect with the given points. Points that outside the dataset will be masked."""
-        points = self._ensure_query_crs(points)
-        data = np.ma.hstack(list(vrt_fh.sample(points.values, masked=True)))
+    def _polygons_query(self, polygons: Polygons, vrt_fh) -> np.ndarray:
+        """Return the values of the dataset at the given polygons."""
+        polygons = self._ensure_query_crs(polygons)
 
-        return data
+        shapes = polygons.frame.geometry.to_list()
+        if len(polygons.desired) > 0:
+            data_ls = []
+            transform_ls = []
+            for shp in shapes:
+                out_image, out_transform = rasterio.mask.mask(
+                    vrt_fh,
+                    [shp],
+                    filled=False,
+                    pad=polygons.pad,
+                    all_touched=polygons.all_touched,
+                    invert=False,
+                    crop=True,
+                )
+                data_ls.append(out_image)
+                transform_ls.append(out_transform)
+        else:
+            data, out_transform = rasterio.mask.mask(
+                vrt_fh,
+                shapes,
+                filled=False,
+                pad=polygons.pad,
+                all_touched=polygons.all_touched,
+                invert=True,
+                crop=False,
+            )
+            data_ls = [data]
+            transform_ls = [out_transform]
+
+        return data_ls, transform_ls
 
     @overload
     def _ensure_query_crs(self, query: BoundingBox) -> BoundingBox: ...
@@ -737,9 +761,12 @@ class RasterDataset(GeoDataset):
     @overload
     def _ensure_query_crs(self, query: Points) -> Points: ...
 
+    @overload
+    def _ensure_query_crs(self, query: Polygons) -> Polygons: ...
+
     def _ensure_query_crs(
-        self, query: Union[BoundingBox, Points]
-    ) -> Union[BoundingBox, Points]:
+        self, query: Points | BoundingBox | Polygons
+    ) -> Points | BoundingBox | Polygons:
         """Ensure that the query has the same CRS as the dataset."""
         if query.crs is None:
             warnings.warn(
@@ -770,7 +797,7 @@ class RasterDataset(GeoDataset):
 
     def _sample_files(
         self, paths: Sequence[str], query: GeoQuery
-    ) -> dict[Union[Literal["bbox", "points"], np.ndarray]]:
+    ) -> dict[Literal["bbox", "points", "polygons"], np.ndarray | None]:
         """Stack files into a single 3D array.
 
         Parameters
@@ -786,15 +813,16 @@ class RasterDataset(GeoDataset):
             a dictionary containing the stacked files. The keys of the dictionary
             are:
 
-            * ``bbox``: a numpy array of shape (n_bbox, n_file, height, width)
-                containing the values of the bounding boxes in the query.
             * ``points``: a numpy array of shape (n_file, n_point) containing the
                 values of the points in the query.
+            * ``bbox``: a numpy array of shape (n_bbox, n_file, height, width)
+                containing the values of the bounding boxes in the query.
+            * ``polygons``: a numpy array of shape (n_polygon, n_file, height, width)
+                containing the values of the polygons in the query.
 
             .. Note::
-
-                ``bbox`` and ``points`` will be None if the query does not contain
-                bounding boxes or points.
+                ``points``, ``bbox`` and ``polygons`` will be None if the query
+                does not contain bounding boxes, points or polygons.
         """
         if self.cache:
             vrt_fhs = [self._cached_load_warp_file(fp) for fp in paths]
@@ -803,28 +831,34 @@ class RasterDataset(GeoDataset):
 
         vrt_fhs = self._ensure_loading_verbose(vrt_fhs)
 
-        files_bbox_list = []
         files_points_list = []
+        files_bbox_list = []
+        files_polygons_list = []
         for vrt_fh in vrt_fhs:
+            # Get the points values
+            if query.points is not None:
+                data = self._points_query(query.points, vrt_fh)
+                files_points_list.append(data)
             # Get the bounding boxes values
             bbox_list = []
             if query.bbox is not None:
                 for bbox in query.bbox:
                     data = self._bbox_query(bbox, vrt_fh)
                     bbox_list.append(data)
-                files_bbox_list.append(bbox_list)
-            # Get the points values
-            if query.points is not None:
-                data = self._points_query(query.points, vrt_fh)
-                files_points_list.append(data)
+                files_bbox_list.append(np.ma.asarray(bbox_list))
+            # Get the polygons values
+            if query.polygons is not None:
+                data, transform_ls = self._polygons_query(query.polygons, vrt_fh)
+                files_polygons_list.append(data)
 
-        if self.masked:
-            files_bbox_list = np.ma.asarray(files_bbox_list)
-        else:
-            files_bbox_list = np.asarray(files_bbox_list)
+        # Stack the points values
+        points_values = None
+        if len(files_points_list) > 0:
+            points_values = np.ma.asarray(files_points_list).squeeze()
 
         # Stack the bounding boxes values
         bbox_values = None
+        files_bbox_list = np.ma.asarray(files_bbox_list)
         if len(files_bbox_list) > 0:
             n_band = files_bbox_list.shape[2]
             if n_band == 1:
@@ -832,13 +866,44 @@ class RasterDataset(GeoDataset):
             else:
                 bbox_values = files_bbox_list.transpose(1, 0, 2, 3, 4)
 
-        # Stack the points values
-        points_values = None
-        if len(files_points_list) > 0:
-            points_values = np.asarray(files_points_list).squeeze()
+        # Stack the polygons values
+        polygons_values = None
+        if len(files_polygons_list) > 0:
+            num_polygons = len(query.polygons)
+            arr_list = [[] for _ in range(num_polygons)]
+            for data in files_polygons_list:
+                for i, d in enumerate(data):
+                    arr_list[i].append(d)
+            polygons_values = [np.ma.asarray(arr).squeeze(1) for arr in arr_list]
 
-        dest = {"bbox": bbox_values, "points": points_values}
-        return dest
+        points_result = (
+            None
+            if points_values is None
+            else {
+                "data": points_values,
+                "dims": "(n_files, n_point)",
+            }
+        )
+        bbox_result = (
+            None
+            if bbox_values is None
+            else {
+                "data": bbox_values,
+                "dims": "(n_boxes, (n_files, height, width))",
+            }
+        )
+        polygons_result = (
+            None
+            if polygons_values is None
+            else {
+                "data": polygons_values,
+                "transforms": transform_ls if polygons_values is not None else None,
+                "dims": "(n_polygons, (n_files, height, width))",
+            }
+        )
+        result = QueryResult(points_result, bbox_result, polygons_result)
+
+        return result
 
     @functools.lru_cache(maxsize=128)
     def _cached_load_warp_file(self, file_path: str) -> DatasetReader:
