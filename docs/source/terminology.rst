@@ -9,11 +9,10 @@ Terminology
         The date of SAR acquisition or image, expressed as a ``datetime.datetime`` object.
 
     Pair
-        A pair is a combination of two SAR acquisitions in acquisition order.
+        A pair is a combination of two SAR acquisitions in acquisition order. 
 
-        .. note::
-
-            In FanInSAR, a ``Pair`` must be in acquisition order, meaning that the first acquisition should be earlier than the second acquisition. For example, a pair of (2018-01-01, 2018-02-01) is valid, but a pair of (2018-02-01, 2018-01-01) is invalid. It is important to follow this rule to ensure expected and accurate results.
+        .. warning::
+            In FanInSAR, a ``Pair`` must be in acquisition order, which means that the first acquisition should be earlier than the second acquisition. For example, a pair of (2018-01-01, 2018-02-01) is valid, but a pair of (2018-02-01, 2018-01-01) is invalid. If an invalid pair is provided, FanInSAR may yield unexpected results.
 
     Pairs
         A collection of pairs. 
