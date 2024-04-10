@@ -10,6 +10,8 @@ from matplotlib.axes import Axes
 from pyproj.crs import CRS
 from rasterio.errors import CRSError
 
+from .bbox import BoundingBox
+
 
 class Polygons:
     """Polygons object is used to store the regions that need to be retrieved
@@ -31,7 +33,8 @@ class Polygons:
             Literal["desired", "undesired"] | Sequence[Literal["desired", "undesired"]]
         ) = "desired",
         crs: Any = None,
-        crop: bool = True,
+        all_touched=True,
+        pad: bool = False,
     ) -> None:
         """Initialize a Polygons object.
 
@@ -48,11 +51,17 @@ class Polygons:
             The CRS of the polygons. Can be any object that can be passed to
             :meth:`pyproj.crs.CRS.from_user_input` .
             If None, the CRS of the input geometry will be used. Default is None.
-        crop : bool, optional
-            Whether to crop the sampled values to the extent of polygons.
-            Default is True.
+        all_touched : bool, optional
+            Whether to include all pixels touched by the polygon. Default is True.
+        pad : bool, optional
+            If True, the features will be padded in each direction by
+            one half of a pixel prior to cropping raster. Defaults to False.
         """
-        self._gdf = self._format_geometry(gdf, types, crs)
+        self._gdf = self._format_geometry(gdf, types, crs).sort_values(
+            by="types", ascending=True
+        )
+        self.pad = pad
+        self.all_touched = all_touched
 
     def __str__(self) -> str:
         return f"Polygons(count={len(self)}, crs='{self.crs}')"
@@ -122,6 +131,28 @@ class Polygons:
         return gdf
 
     @property
+    def all_touched(self) -> bool:
+        """whether to include all pixels touched by the polygon."""
+        return self._all_touched
+
+    @all_touched.setter
+    def all_touched(self, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise TypeError(f"all_touched must be a bool. Got {type(value)}")
+        self._all_touched = value
+
+    @property
+    def pad(self) -> bool:
+        """whether to pad the features in each direction by one half of a pixel prior to cropping raster."""
+        return self._pad
+
+    @pad.setter
+    def pad(self, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise TypeError(f"pad must be a bool. Got {type(value)}")
+        self._pad = value
+
+    @property
     def geometry(self) -> gpd.GeoSeries:
         """the geometry column of the polygons."""
         return self._gdf.geometry
@@ -161,6 +192,19 @@ class Polygons:
         """
         df = gpd.overlay(self.desired.frame, self.undesired.frame, how="difference")
         return Polygons(df, types="desired")
+
+    def to_bbox(self) -> list[BoundingBox]:
+        """Return a list of BoundingBox objects representing the bounding boxes 
+        of the polygons.
+        
+        .. Warning::
+            This method will only return the bounding boxes of the desired polygons.
+            If the Polygons object only contains "undesired" polygons, the returned
+            list will be empty.
+        """
+        df = self.to_desired().frame
+        
+        
 
     @property
     def crs(self) -> CRS:
@@ -279,36 +323,16 @@ class Polygons:
             The matplotlib axes.
         """
         kwargs.update({"column": "types", "kind": "geo"})
-        kwargs.setdefault("cmap", "RdYlGn_r")
         kwargs.setdefault("legend", True)
-        return self._gdf.plot(**kwargs)
+        cmap = "RdYlGn" if not self.is_mixed and len(self.undesired) > 0 else "RdYlGn_r"
+        kwargs.update(
+            {
+                "legend_kwds": {
+                    "loc": "center left",
+                    "bbox_to_anchor": (1.01, 0.5),
+                },
+                "cmap": cmap,
+            }
+        )
 
-
-if __name__ == "__main__":
-    file1 = "/Volumes/Data/temp/huyan/RGV-2024-0329/SHP_RGU_outline_all/Bru_outline.shp"
-    file2 = "/Volumes/Data/temp/huyan/RGV-2024-0329/SHP_RGU_outline_all/Distelhorn_outline.shp"
-    file3 = (
-        "/Volumes/Data/temp/huyan/RGV-2024-0329/SHP_RGU_outline_all/Outline_rechy.shp"
-    )
-    file4 = "/Volumes/Data/temp/huyan/RGV-2024-0329/SHP_RGU_outline_all/Steint刲li_outline.shp"
-    file_all = "/Volumes/Data/temp/huyan/RGV-2024-0329/SHP_RGU_outline_all/1_RG_all.shp"
-
-    df1 = gpd.read_file(file1)
-    df2 = gpd.read_file(file2)
-    df3 = gpd.read_file(file3)
-    df4 = gpd.read_file(file4)
-    df_all = gpd.read_file(file_all)
-
-    se1 = df1.geometry
-    se2 = df2.geometry
-    se3 = df3.geometry
-    se4 = df4.geometry
-    se_all = df_all.geometry
-
-    pg1 = Polygons(se1, types="desired")
-    pg2 = Polygons.from_file(file2, types="undesired")
-    pg3 = Polygons(se3, types="undesired")
-
-    pg3 = pg2.to_crs(pg1.crs)
-
-    (pg2 + pg3).plot()
+        return self.frame.plot(**kwargs)

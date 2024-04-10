@@ -20,7 +20,7 @@ class GeoQuery:
     _bbox: BoundingBox | list[BoundingBox] | None
     _polygons: Polygons | None
 
-    __slots__ = ["_bbox", "_points"]
+    __slots__ = ["_points", "_bbox", "_polygons"]
 
     def __init__(
         self,
@@ -50,14 +50,12 @@ class GeoQuery:
         """
         if bbox is None and points is None and polygons is None:
             raise ValueError("One of bbox, points or polygons must be provided.")
+
         if points is not None and not isinstance(points, Points):
             raise TypeError(f"points must be a Points. Got {type(points)}")
-        if polygons is not None and not isinstance(polygons, Polygons):
-            raise TypeError(f"polygons must be a Polygons. Got {type(polygons)}")
         if bbox is not None:
             if isinstance(bbox, BoundingBox):
                 bbox = [bbox]
-
             if not isinstance(bbox, list):
                 try:
                     bbox = list(bbox)
@@ -65,6 +63,12 @@ class GeoQuery:
                     raise TypeError(
                         f"bbox must be a BoundingBox or a list of BoundingBox. Got {type(bbox)}"
                     )
+        if polygons is not None:
+            if not isinstance(polygons, Polygons):
+                raise TypeError(f"polygons must be a Polygons. Got {type(polygons)}")
+            if polygons.is_mixed:
+                polygons = polygons.to_desired()
+
         self._points = points
         self._bbox = bbox
         self._polygons = polygons
@@ -72,12 +76,18 @@ class GeoQuery:
     def __str__(self) -> str:
         bbox = f"[{len(self.bbox)} BoundingBox]" if self.bbox is not None else None
         points = self.points if self.points is not None else None
-        return f"GeoQuery(bbox={bbox}, points={points}, polygons={self.polygons})"
+        return f"GeoQuery(points={points}, bbox={bbox}, polygons={self.polygons})"
 
     def __repr__(self) -> str:
         bbox = f"[{len(self.bbox)} BoundingBox]" if self.bbox is not None else None
         points = self.points if self.points is not None else None
-        return f"GeoQuery(\n    bbox={bbox}\n    points={points}\n   polygons={self.polygons}\n)"
+        return (
+            "GeoQuery("
+            f"\n    points={points}"
+            f"\n    bbox={bbox}"
+            f"\n    polygons={self.polygons}"
+            f"\n)"
+        )
 
     @property
     def points(self) -> Points | None:

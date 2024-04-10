@@ -348,7 +348,7 @@ class Points:
             return cls(points, crs=gdf.crs)
 
     @classmethod
-    def from_file(
+    def from_shapefile(
         cls,
         filename: str | Path,
         x_field: str = "auto",
@@ -360,7 +360,7 @@ class Points:
         Parameters
         ----------
         filename : str | Path
-            The path to the file. file type can be any type that can be
+            The path to the shapefile. file type can be any type that can be
             passed to :func:`geopandas.read_file`.
         x_field/y_field : str, optional, default: "auto"
             The field name of the x/y coordinates. If "auto", will try to
