@@ -7,9 +7,8 @@ import functools
 import re
 import warnings
 from collections.abc import Iterable
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence, Union, overload
+from typing import Any, Literal, Optional, Sequence, overload
 
 import numpy as np
 import pandas as pd
@@ -19,11 +18,10 @@ import rasterio.merge
 import shapely
 import xarray as xr
 from rasterio import fill
-from rasterio.coords import BoundingBox as BBox
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.io import DatasetReader
-from rasterio.transform import rowcol, xy
+from rasterio.transform import rowcol
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import calculate_default_transform
 from rasterio.warp import transform as warp_transform
@@ -57,7 +55,7 @@ class GeoDataset(abc.ABC):
     _dtype: Optional[np.dtype] = None
     _count: int = 0
     _roi: Optional[BoundingBox] = None
-    _nodata: Optional[Union[float, int, Any]] = None
+    _nodata: Any = None
     _valid: np.ndarray
 
     def __init__(self):
@@ -119,7 +117,7 @@ class GeoDataset(abc.ABC):
         return self._crs
 
     @crs.setter
-    def crs(self, new_crs: Union[CRS, str]) -> None:
+    def crs(self, new_crs: CRS | str) -> None:
         """Change the coordinate reference system :term:`(CRS)` of a GeoDataset.
 
         If ``new_crs == self.crs``, does nothing, otherwise updates the R-tree index.
@@ -184,7 +182,7 @@ class GeoDataset(abc.ABC):
         return self._res
 
     @res.setter
-    def res(self, new_res: Union[float, tuple[float, float]]) -> None:
+    def res(self, new_res: float | tuple[float, float]) -> None:
         """Set the resolution of the dataset.
 
         Parameters
@@ -508,7 +506,7 @@ class RasterDataset(GeoDataset):
         verbose: bool = True,
         ds_name: str = "",
     ) -> None:
-        """Initialize a new Dataset instance.
+        f"""Initialize a new {self.__class__.__name__} instance.
 
         Parameters
         ----------
@@ -948,8 +946,8 @@ class RasterDataset(GeoDataset):
     def row_col(
         self,
         xy: Iterable,
-        crs: Optional[Union[CRS, str]] = None,
-        bbox: Union[BoundingBox, Literal["roi", "bounds"]] = "roi",
+        crs: Optional[CRS | str] = None,
+        bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
     ) -> np.ndarray:
         """Convert x, y coordinates to row, col in the dataset.
 
@@ -991,8 +989,8 @@ class RasterDataset(GeoDataset):
     def xy(
         self,
         row_col: Iterable,
-        crs: Optional[Union[CRS, str]] = None,
-        bbox: Union[BoundingBox, Literal["roi", "bounds"]] = "roi",
+        crs: Optional[CRS | str] = None,
+        bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
     ) -> np.ndarray:
         """Convert row, col in the dataset to x, y coordinates.
 
@@ -1034,7 +1032,7 @@ class RasterDataset(GeoDataset):
 
     def to_tiffs(
         self,
-        out_dir: Union[str, Path],
+        out_dir: str | Path,
         roi: Optional[BoundingBox] = None,
     ):
         """Save the dataset to a directory of tiff files for given region of interest.
@@ -1060,7 +1058,7 @@ class RasterDataset(GeoDataset):
 
     def to_netcdf(
         self,
-        filename: Union[str, Path],
+        filename: str | Path,
         roi: Optional[BoundingBox] = None,
     ) -> None:
         """Save the dataset to a netCDF file for given region of interest.
@@ -1096,7 +1094,7 @@ class RasterDataset(GeoDataset):
     def save_arr_to_tiff(
         self,
         arr: np.ndarray,
-        filename: Union[str, Path],
+        filename: str | Path,
         roi: Optional[BoundingBox] = None,
         profile: Optional[Profile] = None,
     ) -> None:
@@ -1140,89 +1138,6 @@ class PairDataset(RasterDataset):
     _pairs: Optional[Pairs] = None
     _datetime: Optional[pd.DatetimeIndex] = None
 
-    def __init__(
-        self,
-        root_dir: str = "data",
-        paths: Optional[Sequence[str]] = None,
-        crs: Optional[CRS] = None,
-        res: Optional[Union[float, tuple[float, float]]] = None,
-        dtype: Optional[np.dtype] = None,
-        nodata: Optional[Union[float, int, Any]] = None,
-        roi: Optional[BoundingBox] = None,
-        bands: Optional[Sequence[str]] = None,
-        cache: bool = True,
-        resampling=Resampling.nearest,
-        masked: bool = True,
-        fill_nodata: bool = False,
-        verbose: bool = True,
-        ds_name: str = "",
-    ) -> None:
-        """Initialize a new PairDataset instance.
-
-        Parameters
-        ----------
-        root_dir : str or Path
-            root_dir directory where dataset can be found.
-        paths : list of str, optional
-            list of file paths to use instead of searching for files in ``root_dir``.
-            If None, files will be searched for in ``root_dir``.
-        crs : CRS, optional
-            the output term:`coordinate reference system (CRS)` of the dataset.
-            If None, the CRS of the first file found will be used.
-        res : float, optional
-            resolution of the output dataset in units of CRS. If None, the resolution
-            of the first file found will be used.
-        dtype : numpy.dtype, optional
-            data type of the output dataset. If None, the data type of the first file
-            found will be used.
-        nodata : float or int, optional
-            no data value of the output dataset. If None, the no data value of the first
-            file found will be used.
-        roi : BoundingBox, optional
-            region of interest to load from the dataset. If None, the union of all files
-            bounds in the dataset will be used.
-        bands : list of str, optional
-            names of bands to return (defaults to all bands)
-        cache : bool, optional
-            if True, cache file handle to speed up repeated sampling
-        resampling : Resampling, optional
-            Resampling algorithm used when reading input files.
-            Default: `Resampling.nearest`.
-        masked : bool, optional
-            if True, the returned will be a masked array with a mask
-            for no data values. Default: True.
-
-            .. note::
-                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
-        fill_nodata : bool, optional
-            Whether to fill holes in raster data by interpolation using the
-            ``rasterio.fill.fillnodata`` function. Default: False.
-        verbose : bool, optional
-            if True, print verbose output, default: True
-        ds_name : str, optional
-            name of the dataset. used for printing verbose output, default: ""
-
-        Raises
-        ------
-            FileNotFoundError: if no files are found in ``root_dir``
-        """
-        super().__init__(
-            root_dir=root_dir,
-            paths=paths,
-            crs=crs,
-            res=res,
-            dtype=dtype,
-            nodata=nodata,
-            roi=roi,
-            bands=bands,
-            cache=cache,
-            resampling=resampling,
-            masked=masked,
-            fill_nodata=fill_nodata,
-            verbose=verbose,
-            ds_name=ds_name,
-        )
-
     @classmethod
     def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Used to parse pairs from filenames. *Must be implemented in subclass*.
@@ -1252,6 +1167,7 @@ class PairDataset(RasterDataset):
         """
         raise NotImplementedError("parse_pairs must be implemented in subclass")
 
+    @abc.abstractmethod
     @classmethod
     def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Used to parse datetime from filenames. *Must be implemented in subclass*.
@@ -1266,7 +1182,6 @@ class PairDataset(RasterDataset):
         datetime : pd.DatetimeIndex
             datetime parsed from filenames
         """
-        raise NotImplementedError("parse_datetime must be implemented in subclass")
 
     @property
     def pairs(self) -> Pairs:
@@ -1287,89 +1202,11 @@ class ApsDataset(RasterDataset):
     #: This expression is used to find the APS files.
     pattern = "*"
 
-    def __init__(
-        self,
-        root_dir: str = "data",
-        paths: Optional[Sequence[str]] = None,
-        crs: Optional[CRS] = None,
-        res: Optional[Union[float, tuple[float, float]]] = None,
-        dtype: Optional[np.dtype] = None,
-        nodata: Optional[Union[float, int, Any]] = None,
-        roi: Optional[BoundingBox] = None,
-        bands: Optional[Sequence[str]] = None,
-        cache: bool = True,
-        resampling=Resampling.nearest,
-        masked: bool = True,
-        fill_nodata: bool = False,
-        verbose: bool = True,
-        ds_name: str = "",
-    ) -> None:
-        """Initialize a new ApsDataset instance.
-
-        Parameters
-        ----------
-        root_dir : str or Path
-            root_dir directory where dataset can be found.
-        paths : list of str, optional
-            list of file paths to use instead of searching for files in ``root_dir``.
-            If None, files will be searched for in ``root_dir``.
-        crs : CRS, optional
-            the output term:`coordinate reference system (CRS)` of the dataset.
-            If None, the CRS of the first file found will be used.
-        res : float, optional
-            resolution of the output dataset in units of CRS. If None, the
-            resolution of the first file found will be used.
-        dtype : numpy.dtype, optional
-            data type of the output dataset. If None, the data type of the first
-            file found will be used.
-        nodata : float or int, optional
-            no data value of the output dataset. If None, the no data value of
-            the first file found will be used.
-        roi : BoundingBox, optional
-            region of interest to load from the dataset. If None, the union of
-            all files bounds in the dataset will be used.
-        bands : list of str, optional
-            names of bands to return (defaults to all bands)
-        cache : bool, optional
-            if True, cache file handle to speed up repeated sampling
-        resampling : Resampling, optional
-            Resampling algorithm used when reading input files.
-            Default: `Resampling.nearest`.
-        masked : bool, optional
-            if True, the returned will be a masked array with a mask
-            for no data values. Default: True.
-
-            .. note::
-                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
-        fill_nodata : bool, optional
-            Whether to fill holes in raster data by interpolation using the
-            ``rasterio.fill.fillnodata`` function. Default: False.
-        verbose : bool, optional
-            if True, print verbose output, default: True
-        ds_name : str, optional
-            name of the dataset. used for printing verbose output, default: ""
-        """
-        super().__init__(
-            root_dir=root_dir,
-            paths=paths,
-            crs=crs,
-            res=res,
-            dtype=dtype,
-            nodata=nodata,
-            roi=roi,
-            bands=bands,
-            cache=cache,
-            resampling=resampling,
-            masked=masked,
-            fill_nodata=fill_nodata,
-            verbose=verbose,
-            ds_name=ds_name,
-        )
-        self._pairs = None
+    _pairs = None
 
     def to_pair_files(
         self,
-        out_dir: Union[str, Path],
+        out_dir: str | Path,
         pairs: Pairs,
         ref_points: Points,
         roi: Optional[BoundingBox] = None,
@@ -1435,6 +1272,7 @@ class ApsDataset(RasterDataset):
 
                 dst.write(dest_arr, 1)
 
+    @abc.abstractmethod
     @classmethod
     def parse_dates(cls, paths: Optional[Sequence[str]] = None) -> pd.DatetimeIndex:
         """Used to parse acquisition dates from filenames. *Must be implemented
@@ -1450,7 +1288,6 @@ class ApsDataset(RasterDataset):
         datetime : pd.DatetimeIndex
             datetime parsed from filenames
         """
-        raise NotImplementedError("parse_datetime must be implemented in subclass")
 
 
 class ApsPairs(PairDataset):
@@ -1466,9 +1303,9 @@ class ApsPairs(PairDataset):
         root_dir: str = "data",
         paths: Optional[Sequence[str]] = None,
         crs: Optional[CRS] = None,
-        res: Optional[Union[float, tuple[float, float]]] = None,
+        res: Optional[float | tuple[float, float]] = None,
         dtype: Optional[np.dtype] = None,
-        nodata: Optional[Union[float, int, Any]] = None,
+        nodata: Optional[float | int | Any] = None,
         roi: Optional[BoundingBox] = None,
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
@@ -1556,7 +1393,7 @@ class ApsPairs(PairDataset):
 
     @classmethod
     def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
-        """Parse datetime from a list of APS-pair file paths."""
+        f"""Parse datetime from a list of {cls.__class__.__name__} file paths."""
         names = [Path(f).stem for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         date_names = np.unique([i.split("_") for i in pair_names])

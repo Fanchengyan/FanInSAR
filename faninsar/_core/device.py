@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 
@@ -21,7 +21,7 @@ def gpu_available() -> bool:
     return cuda_available() or mps_available()
 
 
-def parse_device(device: Optional[Union[str, torch.device]]):
+def parse_device(device: Optional[str | torch.device]):
     if isinstance(device, (str, type(None))):
         device = torch.device(_parse_device_str(device))
     elif isinstance(device, torch.device):

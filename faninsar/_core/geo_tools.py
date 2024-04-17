@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import pprint
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import rasterio
-import rioxarray
 import xarray as xr
 from rasterio import Affine, dtypes, transform
-from rasterio.crs import CRS
 from rasterio.io import MemoryFile
 from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
@@ -63,7 +61,7 @@ class GeoDataFormatConverter:
     def __repr__(self) -> str:
         return str(self)
 
-    def _load_raster(self, raster_file: Union[str, Path]):
+    def _load_raster(self, raster_file: str | Path):
         """Load a raster file into the data array."""
         with rasterio.open(raster_file) as ds:
             arr = ds.read()
@@ -72,7 +70,7 @@ class GeoDataFormatConverter:
 
     def load_binary(
         self,
-        binary_file: Union[str, Path],
+        binary_file: str | Path,
         order: Literal["BSQ", "BIP", "BIL"] = "BSQ",
         dtype="auto",
     ):
@@ -81,11 +79,13 @@ class GeoDataFormatConverter:
         Parameters
         ----------
         binary_file : str or Path
-            The binary file to be loaded. the binary file should be with a profile file with the same name.
+            The binary file to be loaded. the binary file should be with a profile 
+            file with the same name.
         order : str, one of ['BSQ', 'BIP', 'BIL']
-            The order of the data array. 'BSQ' for band sequential, 'BIP' for band interleaved by pixel,
-            'BIL' for band interleaved by line. Default is 'BSQ'.
-            See: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
+            The order of the data array. 'BSQ' for band sequential, 'BIP' for 
+            band interleaved by pixel, 'BIL' for band interleaved by line. 
+            Default is 'BSQ'.
+            More details can be found at: https://desktop.arcgis.com/en/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
         """
         binary_profile_file = str(binary_file) + ".profile"
         if not Path(binary_profile_file).exists():
@@ -120,7 +120,7 @@ class GeoDataFormatConverter:
         self.arr = arr
         self.profile = profile
 
-    def load_raster(self, raster_file: Union[str, Path]):
+    def load_raster(self, raster_file: str | Path):
         """Load a raster file into the data array.
 
         Parameters
@@ -132,18 +132,20 @@ class GeoDataFormatConverter:
         self.arr, self.profile = self._load_raster(raster_file)
 
     def to_binary(
-        self, out_file: Union[str, Path], order: Literal["BSQ", "BIP", "BIL"] = "BSQ"
+        self, out_file: str | Path, order: Literal["BSQ", "BIP", "BIL"] = "BSQ"
     ):
         """Write the data array into a binary file.
 
         Parameters
         ----------
         out_file : str or Path
-            The binary file to be written. the binary file will be with a profile file with the same name.
+            The binary file to be written. the binary file will be with a profile 
+            file with the same name.
         order : str, one of ['BSQ', 'BIP', 'BIL']
-            The order of the data array. 'BSQ' for band sequential, 'BIP' for band interleaved by pixel,
-            'BIL' for band interleaved by line. Default is 'BSQ'.
-            See: https://desktop.arcgis.com/en/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
+            The order of the data array. 'BSQ' for band sequential, 'BIP' for 
+            band interleaved by pixel, 'BIL' for band interleaved by line. 
+            Default is 'BSQ'.
+            More details can be found at: https://desktop.arcgis.com/en/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
         """
         if order == "BSQ":
             arr = self.arr
@@ -160,7 +162,7 @@ class GeoDataFormatConverter:
         with open(out_profile_file, "w") as f:
             f.write(self._profile_str)
 
-    def to_raster(self, out_file: Union[str, Path], driver="GTiff"):
+    def to_raster(self, out_file: str | Path, driver="GTiff"):
         """Write the data array into a raster file.
 
         Parameters
@@ -168,7 +170,8 @@ class GeoDataFormatConverter:
         out_file : str or Path
             The raster file to be written.
         driver : str
-            The driver to be used to write the raster file. See: https://gdal.org/drivers/raster/index.html
+            The driver to be used to write the raster file. 
+            More details can be found at: https://gdal.org/drivers/raster/index.html
         """
         self.profile.update({"driver": driver})
         with rasterio.open(out_file, "w", **self.profile) as ds:
@@ -196,24 +199,26 @@ class GeoDataFormatConverter:
 
         self.update_arr(arr)
 
-    def add_band_from_raster(self, raster_file: Union[str, Path]):
+    def add_band_from_raster(self, raster_file: str | Path):
         """Add band to the data array from a raster file.
 
         Parameters
         ----------
         raster_file : str or Path
-            The raster file to be added. raster format should be supported by gdal. See: https://gdal.org/drivers/raster/index.html
+            The raster file to be added. raster format should be supported by gdal.
+            More details can be found at: https://gdal.org/drivers/raster/index.html
         """
         arr, profile = self._load_raster(raster_file)
         self.add_band(arr)
 
-    def add_band_from_binary(self, binary_file: Union[str, Path]):
+    def add_band_from_binary(self, binary_file: str | Path):
         """Add band to the data array from a binary file.
 
         Parameters
         ----------
         binary_file : str or Path
-            The binary file to be added. the binary file should be with a profile file with the same name.
+            The binary file to be added. the binary file should be with a profile 
+            file with the same name.
         """
         arr, profile = self._load_binary(binary_file)
         self.add_band(arr)
@@ -222,7 +227,7 @@ class GeoDataFormatConverter:
         self,
         arr: np.ndarray,
         dtype: str = "auto",
-        nodata: Union[int, float, None, str] = "auto",
+        nodata: Any | Literal["auto"] = "auto",
         error_if_nodata_invalid: bool = True,
     ):
         """update the data array.
@@ -232,9 +237,12 @@ class GeoDataFormatConverter:
         arr : numpy.ndarray
             The array to be updated. The profile will be updated accordingly.
         dtype : str or numpy.dtype
-            The dtype of the array. If 'auto', the minimum dtype will be used. Default is 'auto'.
-        nodata : int, float, None or 'auto'
-            The nodata value of the array. If 'auto', the nodata value will be set to the nodata value of the profile if valid, otherwise None. Default is 'auto'.
+            The dtype of the array. If 'auto', the minimum dtype will be used. 
+            Default is 'auto'.
+        nodata : Any | Literal["auto"] = "auto"
+            The nodata value of the array. If 'auto', the nodata value will be 
+            set to the nodata value of the profile if valid, otherwise None. 
+            Default is 'auto'.
         error_if_nodata_invalid : bool
             Whether to raise error if nodata is out of dtype range. Default is True.
         """
@@ -315,14 +323,14 @@ class Profile:
         return self.profile != other.profile
 
     @classmethod
-    def from_raster_file(cls, raster_file: Union[str, Path]):
+    def from_raster_file(cls, raster_file: str | Path):
         """Create a Profile object from a raster file."""
         with rasterio.open(raster_file) as ds:
             profile = ds.profile.copy()
         return cls(profile)
 
     @classmethod
-    def from_ascii_header_file(cls, ascii_file: Union[str, Path]):
+    def from_ascii_header_file(cls, ascii_file: str | Path):
         """Create a Profile object from an ascii header file.
         The ascii header file is the metadata of a binary.
         More information can be found at: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm
@@ -371,7 +379,7 @@ class Profile:
         return cls(profile)
 
     @classmethod
-    def from_profile_file(cls, profile_file: Union[str, Path]):
+    def from_profile_file(cls, profile_file: str | Path):
         """Create a Profile object from a profile file."""
         with open(profile_file, "r") as f:
             profile = eval(f.read())
@@ -381,7 +389,7 @@ class Profile:
     def from_bounds_res(
         cls,
         bounds: Tuple[float, float, float, float],
-        res: Union[float, Tuple[float, float]],
+        res: float | Tuple[float, float],
     ):
         """Create a Profile object from bounds and resolution.
 
@@ -408,7 +416,7 @@ class Profile:
         profile = {"width": width, "height": height, "transform": tf}
         return cls(profile)
 
-    def to_file(self, file: Union[str, Path]):
+    def to_file(self, file: str | Path):
         """Write the profile into a file."""
         file = Path(file)
         if file.suffix != ".profile":
@@ -483,9 +491,9 @@ def latlon_from_profile(profile: Profile) -> np.ndarray:
 
 
 def write_geoinfo_into_ds(
-    ds: Union[xr.DataArray, xr.Dataset],
-    vars: Optional[Union[str, Tuple, List]] = None,
-    crs: Union[str, int, Dict, CRS] = "EPSG:4326",
+    ds: xr.DataArray | xr.Dataset,
+    vars: Optional[str | Tuple | List] = None,
+    crs: Any = "EPSG:4326",
     x_dim: str = "lon",
     y_dim: str = "lat",
 ):
@@ -500,11 +508,7 @@ def write_geoinfo_into_ds(
         variables that need to be added geoinformation
     crs: str, int, dict or rasterio.crs.CRS object
         the coordinate reference system. Could be any type that
-        rasterio.crs.from_user_input accepts, such as:
-          - EPSG code/string
-          - proj4 string
-          - wkt string
-          - dict of PROJ parameters or PROJ JSON
+        :meth:`rasterio.crs.CRS.from_user_input` accepts.
     x_dim/y_dim: str
         the coordinate name that presents the x/y dimension
     """
@@ -527,9 +531,9 @@ def write_geoinfo_into_ds(
 
 
 def write_geoinfo_into_nc(
-    nc_file: Union[str, Path],
-    vars: Optional[Union[str, Tuple, List]] = None,
-    crs: Union[str, int, Dict, CRS] = "EPSG:4326",
+    nc_file: str | Path,
+    vars: Optional[str | Tuple | List] = None,
+    crs: Any = "EPSG:4326",
     x_dim: str = "lon",
     y_dim: str = "lat",
     encode_time: bool = False,
@@ -547,11 +551,7 @@ def write_geoinfo_into_nc(
         the coordinate name that presents the x/y dimension
     crs: str, int, dict or rasterio.crs.CRS object
         the coordinate reference system. Could be any type that
-        rasterio.crs.from_user_input accepts, such as:
-          - EPSG code/string
-          - proj4 string
-          - wkt string
-          - dict of PROJ parameters or PROJ JSON
+        :meth:`rasterio.crs.CRS.from_user_input` accepts.
     encode_time: bool
         whether to encode the time since "2000-01-01 00:00:00" if
         "time" coordinate is exists. Default is False.
@@ -671,7 +671,7 @@ class GeoDataFormatConverter:
     def __repr__(self) -> str:
         return str(self)
 
-    def _load_raster(self, raster_file: Union[str, Path]):
+    def _load_raster(self, raster_file: str | Path):
         """Load a raster file into the data array."""
         with rasterio.open(raster_file) as ds:
             arr = ds.read()
@@ -680,7 +680,7 @@ class GeoDataFormatConverter:
 
     def load_binary(
         self,
-        binary_file: Union[str, Path],
+        binary_file: str | Path,
         order: Literal["BSQ", "BIP", "BIL"] = "BSQ",
         dtype="auto",
     ):
@@ -728,7 +728,7 @@ class GeoDataFormatConverter:
         self.arr = arr
         self.profile = profile
 
-    def load_raster(self, raster_file: Union[str, Path]):
+    def load_raster(self, raster_file: str | Path):
         """Load a raster file into the data array.
 
         Parameters
@@ -740,7 +740,7 @@ class GeoDataFormatConverter:
         self.arr, self.profile = self._load_raster(raster_file)
 
     def to_binary(
-        self, out_file: Union[str, Path], order: Literal["BSQ", "BIP", "BIL"] = "BSQ"
+        self, out_file: str | Path, order: Literal["BSQ", "BIP", "BIL"] = "BSQ"
     ):
         """Write the data array into a binary file.
 
@@ -768,7 +768,7 @@ class GeoDataFormatConverter:
         with open(out_profile_file, "w") as f:
             f.write(self._profile_str)
 
-    def to_raster(self, out_file: Union[str, Path], driver="GTiff"):
+    def to_raster(self, out_file: str | Path, driver="GTiff"):
         """Write the data array into a raster file.
 
         Parameters
@@ -804,7 +804,7 @@ class GeoDataFormatConverter:
 
         self.update_arr(arr)
 
-    def add_band_from_raster(self, raster_file: Union[str, Path]):
+    def add_band_from_raster(self, raster_file: str | Path):
         """Add band to the data array from a raster file.
 
         Parameters
@@ -815,7 +815,7 @@ class GeoDataFormatConverter:
         arr, profile = self._load_raster(raster_file)
         self.add_band(arr)
 
-    def add_band_from_binary(self, binary_file: Union[str, Path]):
+    def add_band_from_binary(self, binary_file: str | Path):
         """Add band to the data array from a binary file.
 
         Parameters
@@ -830,7 +830,7 @@ class GeoDataFormatConverter:
         self,
         arr: np.ndarray,
         dtype: str = "auto",
-        nodata: Union[int, float, None, str] = "auto",
+        f: Any | Literal["auto"] = "auto",
         error_if_nodata_invalid: bool = True,
     ):
         """update the data array.
@@ -841,7 +841,7 @@ class GeoDataFormatConverter:
             The array to be updated. The profile will be updated accordingly.
         dtype : str or numpy.dtype
             The dtype of the array. If 'auto', the minimum dtype will be used. Default is 'auto'.
-        nodata : int, float, None or 'auto'
+        nodata : Any | Literal["auto"] = "auto"
             The nodata value of the array. If 'auto', the nodata value will be set to the nodata value of the profile if valid, otherwise None. Default is 'auto'.
         error_if_nodata_invalid : bool
             Whether to raise error if nodata is out of dtype range. Default is True.
@@ -935,14 +935,14 @@ class Profile:
         return self.profile.get(key, default)
 
     @classmethod
-    def from_raster_file(cls, raster_file: Union[str, Path]):
+    def from_raster_file(cls, raster_file: str | Path):
         """Create a Profile object from a raster file."""
         with rasterio.open(raster_file) as ds:
             profile = ds.profile.copy()
         return cls(profile)
 
     @classmethod
-    def from_ascii_header_file(cls, ascii_file: Union[str, Path]):
+    def from_ascii_header_file(cls, ascii_file: str | Path):
         """Create a Profile object from an ascii header file.
         The ascii header file is the metadata of a binary.
         More information can be found at: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm
@@ -991,7 +991,7 @@ class Profile:
         return cls(profile)
 
     @classmethod
-    def from_profile_file(cls, profile_file: Union[str, Path]):
+    def from_profile_file(cls, profile_file: str | Path):
         """Create a Profile object from a profile file."""
         with open(profile_file, "r") as f:
             profile = eval(f.read())
@@ -1001,7 +1001,7 @@ class Profile:
     def from_bounds_res(
         cls,
         bounds: Tuple[float, float, float, float],
-        res: Union[float, Tuple[float, float]],
+        res: float | Tuple[float, float],
     ):
         """Create a Profile object from bounds and resolution.
 
@@ -1028,7 +1028,7 @@ class Profile:
         profile = {"width": width, "height": height, "transform": tf}
         return cls(profile)
 
-    def to_file(self, file: Union[str, Path]):
+    def to_file(self, file: str | Path):
         """Write the profile into a file."""
         file = Path(file)
         if file.suffix != ".profile":

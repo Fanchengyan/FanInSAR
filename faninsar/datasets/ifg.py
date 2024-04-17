@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence, Union
+from typing import Any, Literal, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -50,12 +50,12 @@ class InterferogramDataset(PairDataset):
     def __init__(
         self,
         root_dir: str = "data",
-        paths_unw: Optional[Sequence[Union[str, Path]]] = None,
-        paths_coh: Optional[Sequence[Union[str, Path]]] = None,
+        paths_unw: Optional[Sequence[str | Path]] = None,
+        paths_coh: Optional[Sequence[str | Path]] = None,
         crs: Optional[CRS] = None,
-        res: Optional[Union[float, tuple[float, float]]] = None,
+        res: Optional[float | tuple[float, float]] = None,
         dtype: Optional[np.dtype] = None,
-        nodata: Optional[Union[float, int, Any]] = None,
+        nodata: Optional[Any] = None,
         roi: Optional[BoundingBox] = None,
         bands_unw: Optional[Sequence[str]] = None,
         bands_coh: Optional[Sequence[str]] = None,
@@ -435,7 +435,7 @@ class InterferogramDataset(PairDataset):
 
     def to_netcdf(
         self,
-        filename: Union[str, Path],
+        filename: str | Path,
         roi: Optional[BoundingBox] = None,
         ref_points: Optional[Points] = None,
     ) -> None:
@@ -488,7 +488,7 @@ class InterferogramDataset(PairDataset):
 
     def to_tiffs(
         self,
-        out_dir: Union[str, Path],
+        out_dir: str | Path,
         roi: Optional[BoundingBox] = None,
         ref_points: Optional[Points] = None,
         pairs: Optional[Pairs] = None,
