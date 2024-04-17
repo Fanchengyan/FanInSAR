@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator
-from typing import Iterable, Optional, Union
+from typing import Iterable, Optional
 
 from faninsar._core.logger import setup_logger
 from faninsar.datasets import GeoDataset
@@ -11,6 +11,7 @@ from faninsar.query import BoundingBox
 logger = setup_logger(
     log_name="FanInSAR.samplers.batch", log_format="%(levelname)s - %(message)s"
 )
+
 
 class RowSampler:
     """A sampler samples data from a dataset in a row-wise manner.
@@ -24,7 +25,7 @@ class RowSampler:
     def __init__(
         self,
         dataset: GeoDataset,
-        roi: Optional[Union[BoundingBox, Iterable[float]]] = None,
+        roi: Optional[BoundingBox | Iterable[float]] = None,
         patch_size: Optional[int] = None,
         patch_num: Optional[int] = None,
         verbose: bool = False,

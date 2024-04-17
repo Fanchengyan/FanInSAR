@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Iterable, Literal, Union
+from typing import Iterable, Literal
 
 import numpy as np
 import pandas as pd
@@ -23,7 +23,7 @@ class TimeSeriesModels:
 
     def __init__(
         self,
-        dates: Union[pd.DatetimeIndex, Iterable[datetime]],
+        dates: pd.DatetimeIndex | Iterable[datetime],
         unit: Literal["year", "day"] = "day",
     ):
         self._unit = None
@@ -106,7 +106,7 @@ class LinearModel(TimeSeriesModels):
 
     def __init__(
         self,
-        dates: Union[pd.DatetimeIndex, Iterable[datetime]],
+        dates: pd.DatetimeIndex | Iterable[datetime],
         unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
@@ -120,7 +120,7 @@ class QuadraticModel(TimeSeriesModels):
 
     def __init__(
         self,
-        dates: Union[pd.DatetimeIndex, Iterable[datetime]],
+        dates: pd.DatetimeIndex | Iterable[datetime],
         unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
@@ -135,7 +135,7 @@ class CubicModel(TimeSeriesModels):
 
     def __init__(
         self,
-        dates: Union[pd.DatetimeIndex, Iterable[datetime]],
+        dates: pd.DatetimeIndex | Iterable[datetime],
         unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
@@ -155,7 +155,7 @@ class AnnualSinusoidalModel(TimeSeriesModels):
 
     def __init__(
         self,
-        dates: Union[pd.DatetimeIndex, Iterable[datetime]],
+        dates: pd.DatetimeIndex | Iterable[datetime],
         unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
@@ -180,7 +180,7 @@ class AnnualSemiannualSinusoidal(TimeSeriesModels):
 
     def __init__(
         self,
-        dates: Union[pd.DatetimeIndex, Iterable[datetime]],
+        dates: pd.DatetimeIndex | Iterable[datetime],
         unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
@@ -220,7 +220,7 @@ class FreezeThawCycleModel(TimeSeriesModels):
         t3s,
         years,
         ftc,
-        dates: Union[pd.DatetimeIndex, Iterable[datetime]],
+        dates: pd.DatetimeIndex | Iterable[datetime],
         unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)
@@ -286,7 +286,7 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
         t3s,
         years,
         ftc,
-        dates: Union[pd.DatetimeIndex, Iterable[datetime]],
+        dates: pd.DatetimeIndex | Iterable[datetime],
         unit: Literal["year", "day"] = "day",
     ):
         super().__init__(dates, unit=unit)

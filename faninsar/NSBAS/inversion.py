@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import psutil
@@ -78,7 +78,7 @@ class NSBASMatrixFactory:
     def __init__(
         self,
         unw: np.ndarray,
-        pairs: Union[Pairs, Iterable[str]],
+        pairs: Pairs | Iterable[str],
         model: Optional[TimeSeriesModels] = None,
         gamma: float = 0.0001,
     ):
@@ -88,7 +88,7 @@ class NSBASMatrixFactory:
         ----------
         unw : np.ndarray (n_pairs, n_pixels)
             Unwrapped interferograms matrix
-        pairs : Union[Pairs, Iterable[str]]
+        pairs : Pairs | Iterable[str]
             Pairs or iterable of pair names
         model : Optional[TimeSeriesModels], optional
             Time series model. If None, generate SBAS matrix rather than NSBAS
@@ -239,7 +239,7 @@ class NSBASInversion:
     def __init__(
         self,
         matrix_factory: NSBASMatrixFactory,
-        device: Optional[Union[str, torch.device]] = None,
+        device: Optional[str | torch.device] = None,
         dtype: torch.dtype = torch.float64,
         verbose=True,
     ):
@@ -249,7 +249,7 @@ class NSBASInversion:
         ----------
         matrix_factory : NSBASMatrixFactory
             NSBASMatrixFactory instance
-        device : Optional[Union[str, torch.device]], optional
+        device : Optional[str | torch.device], optional
             device of torch.tensor used for computation. If None, use GPU if
             available, otherwise use CPU.
         dtype : torch.dtype
@@ -350,12 +350,12 @@ class PhaseDeformationConverter:
         return np.mod(phase, 2 * np.pi)
 
 
-def device_mem_size(device: Optional[Union[str, torch.device]]) -> int:
+def device_mem_size(device: Optional[str | torch.device]) -> int:
     """Get memory size (in MB) for GPU or CPU.
 
     Parameters
     ----------
-    device : Optional[Union[str, torch.device]]
+    device : Optional[str | torch.device]
         device of torch.tensor used for computation.
 
     Returns
@@ -418,10 +418,10 @@ def _get_patch_col(G, d, mem_size, dtype, safe_factor=2):
 
 
 def batch_lstsq(
-    G: Union[np.ndarray, torch.Tensor],
-    d: Union[np.ndarray, torch.Tensor],
+    G: np.ndarray | torch.Tensor,
+    d: np.ndarray | torch.Tensor,
     dtype: torch.dtype = torch.float64,
-    device: Optional[Union[str, torch.device]] = None,
+    device: Optional[str | torch.device] = None,
     verbose: bool = True,
     tqdm_args: dict = {},
 ):
@@ -430,14 +430,14 @@ def batch_lstsq(
 
     Parameters
     ----------
-    G : Union[np.ndarray, torch.Tensor]
+    G : np.ndarray | torch.Tensor
         model field matrix with shape of (n_im, n_param) or (n_pt, n_im, n_param).
         If G is 3D, the first dimension is the G matrix for every pixel.
-    d : Union[np.ndarray, torch.Tensor]
+    d : np.ndarray | torch.Tensor
         data field matrix with shape of (n_im, n_pt).
     dtype : torch.dtype, optional
         dtype of torch.tensor used for computation
-    device : Optional[Union[str, torch.device]], optional
+    device : Optional[str | torch.device], optional
         device of torch.tensor used for computation. If None, use GPU if
         available, otherwise use CPU.
     verbose : bool, optional
@@ -478,10 +478,10 @@ def batch_lstsq(
 
 
 def censored_lstsq(
-    G: Union[np.ndarray, torch.Tensor],
-    d: Union[np.ndarray, torch.Tensor],
+    G: np.ndarray | torch.Tensor,
+    d: np.ndarray | torch.Tensor,
     dtype: torch.dtype = torch.float64,
-    device: Optional[Union[str, torch.device]] = None,
+    device: Optional[str | torch.device] = None,
 ) -> torch.Tensor:
     """Solves least squares problem subject to missing data.
     Reference: http://alexhwilliams.info/itsneuronalblog/2018/02/26/censored-lstsq/
@@ -494,14 +494,14 @@ def censored_lstsq(
 
     Parameters
     ----------
-    G : Union[np.ndarray, torch.Tensor], (n_im, n_param) or (n_pt, n_im, n_param)
+    G : np.ndarray | torch.Tensor, (n_im, n_param) or (n_pt, n_im, n_param)
         model field matrix. If G is 3D, the first dimension is the G matrix for
         each pixel.
-    d : Union[np.ndarray, torch.Tensor], (n_im, n_pt) matrix
+    d : np.ndarray | torch.Tensor, (n_im, n_pt) matrix
         data field matrix.
     dtype : torch.dtype
         dtype of torch.tensor used for computation.
-    device : Optional[Union[str, torch.device]]
+    device : Optional[str | torch.device]
         device of torch.tensor used for computation. If None, use GPU if
             available, otherwise use CPU.
 
@@ -560,7 +560,7 @@ def calculate_U(
     pairs: Pairs,
     delta_phi: np.ndarray,
     interval_days: int,
-    device: Optional[Union[str, torch.device]] = None,
+    device: Optional[str | torch.device] = None,
     dtype: torch.dtype = torch.float64,
 ) -> np.ndarray:
     """Calculate correction matrix U by loop closure phase using least square.
@@ -579,7 +579,7 @@ def calculate_U(
         unwrapped interferograms phases with shape of (n_pair, n_pixel).
     interval_days : int, optional
         interval days of nearest-acquisition pairs.
-    device : Optional[Union[str, torch.device]], optional
+    device : Optional[str | torch.device], optional
         device of torch.tensor used for computation. If None, use GPU if
         available, otherwise use CPU.
     dtype : torch.dtype, optional

@@ -333,7 +333,8 @@ class Profile:
     def from_ascii_header_file(cls, ascii_file: str | Path):
         """Create a Profile object from an ascii header file.
         The ascii header file is the metadata of a binary.
-        More information can be found at: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm
+        More information can be found at: 
+        https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm
 
         Example of an ascii header file
         -------------------------------
@@ -502,7 +503,7 @@ def write_geoinfo_into_ds(
     Parameters:
     -----------
     ds: xarray DataArray or DataSet object
-        data to be written into geoinfo.If type of ds is DataSet,
+        data to be written into geoinfo.If type of ds is DataSet, 
         vars should be set
     vars: str, tuple or list
         variables that need to be added geoinformation
@@ -689,11 +690,14 @@ class GeoDataFormatConverter:
         Parameters
         ----------
         binary_file : str or Path
-            The binary file to be loaded. the binary file should be with a profile file with the same name.
+            The binary file to be loaded. the binary file should be with a profile
+            file with the same name.
         order : str, one of ['BSQ', 'BIP', 'BIL']
-            The order of the data array. 'BSQ' for band sequential, 'BIP' for band interleaved by pixel,
-            'BIL' for band interleaved by line. Default is 'BSQ'.
-            See: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
+            The order of the data array. 'BSQ' for band sequential, 'BIP' for band
+            interleaved by pixel, 'BIL' for band interleaved by line.
+            Default is 'BSQ'.
+            More details can be found at:
+            https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
         """
         binary_profile_file = str(binary_file) + ".profile"
         if not Path(binary_profile_file).exists():
@@ -735,7 +739,7 @@ class GeoDataFormatConverter:
         ----------
         raster_file : str or Path
             The raster file to be loaded. raster format should be supported by gdal.
-            See: https://gdal.org/drivers/raster/index.html
+            More details can be found at: https://gdal.org/drivers/raster/index.html
         """
         self.arr, self.profile = self._load_raster(raster_file)
 
@@ -747,11 +751,14 @@ class GeoDataFormatConverter:
         Parameters
         ----------
         out_file : str or Path
-            The binary file to be written. the binary file will be with a profile file with the same name.
+            The binary file to be written. the binary file will be with a profile
+            file with the same name.
         order : str, one of ['BSQ', 'BIP', 'BIL']
-            The order of the data array. 'BSQ' for band sequential, 'BIP' for band interleaved by pixel,
-            'BIL' for band interleaved by line. Default is 'BSQ'.
-            See: https://desktop.arcgis.com/en/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
+            The order of the data array. 'BSQ' for band sequential, 'BIP' for 
+            band interleaved by pixel, 'BIL' for band interleaved by line. 
+            Default is 'BSQ'.
+            More details can be found at: 
+            https://desktop.arcgis.com/en/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
         """
         if order == "BSQ":
             arr = self.arr
@@ -776,7 +783,8 @@ class GeoDataFormatConverter:
         out_file : str or Path
             The raster file to be written.
         driver : str
-            The driver to be used to write the raster file. See: https://gdal.org/drivers/raster/index.html
+            The driver to be used to write the raster file. 
+            More details can be found at: https://gdal.org/drivers/raster/index.html
         """
         self.profile.update({"driver": driver})
         with rasterio.open(out_file, "w", **self.profile) as ds:
@@ -789,7 +797,8 @@ class GeoDataFormatConverter:
         Parameters
         ----------
         arr : 2D or 3D numpy.ndarray
-            The array to be added. The shape of the array should be (height, width) or (band, height, width).
+            The array to be added. The shape of the array should be (height, width)
+            or (band, height, width).
         """
         if not isinstance(arr, np.ndarray):
             try:
@@ -810,7 +819,8 @@ class GeoDataFormatConverter:
         Parameters
         ----------
         raster_file : str or Path
-            The raster file to be added. raster format should be supported by gdal. See: https://gdal.org/drivers/raster/index.html
+            The raster file to be added. raster format should be supported by gdal. 
+            More details can be found at: https://gdal.org/drivers/raster/index.html
         """
         arr, profile = self._load_raster(raster_file)
         self.add_band(arr)
@@ -821,7 +831,8 @@ class GeoDataFormatConverter:
         Parameters
         ----------
         binary_file : str or Path
-            The binary file to be added. the binary file should be with a profile file with the same name.
+            The binary file to be added. the binary file should be with a profile 
+            file with the same name.
         """
         arr, profile = self._load_binary(binary_file)
         self.add_band(arr)
@@ -840,9 +851,12 @@ class GeoDataFormatConverter:
         arr : numpy.ndarray
             The array to be updated. The profile will be updated accordingly.
         dtype : str or numpy.dtype
-            The dtype of the array. If 'auto', the minimum dtype will be used. Default is 'auto'.
+            The dtype of the array. If 'auto', the minimum dtype will be used. 
+            Default is 'auto'.
         nodata : Any | Literal["auto"] = "auto"
-            The nodata value of the array. If 'auto', the nodata value will be set to the nodata value of the profile if valid, otherwise None. Default is 'auto'.
+            The nodata value of the array. If 'auto', the nodata value will be
+            set to the nodata value of the profile if valid, otherwise None. 
+            Default is 'auto'.
         error_if_nodata_invalid : bool
             Whether to raise error if nodata is out of dtype range. Default is True.
         """
@@ -885,9 +899,8 @@ class GeoDataFormatConverter:
 
 
 class Profile:
-    """a class to manage the profile of a raster file.
-    The profile is the metadata of the raster file and
-    can be recognized by rasterio package"""
+    """a class to manage the profile of a raster file. The profile is the metadata 
+    of the raster file and can be recognized by rasterio package"""
 
     def __init__(self, profile: dict = None) -> None:
         self.profile = profile
@@ -943,9 +956,9 @@ class Profile:
 
     @classmethod
     def from_ascii_header_file(cls, ascii_file: str | Path):
-        """Create a Profile object from an ascii header file.
-        The ascii header file is the metadata of a binary.
-        More information can be found at: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm
+        """Create a Profile object from an ascii header file. The ascii header 
+        file is the metadata of a binary. More information can be found at: 
+        https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm
 
         Example of an ascii header file
         -------------------------------

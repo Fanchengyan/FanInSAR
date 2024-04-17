@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import functools
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional, Union
+from typing import Any, Callable, Literal, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -215,7 +214,7 @@ class Pairs:
 
     def __init__(
         self,
-        pairs: Union[Iterable[Iterable[datetime, datetime]], Iterable[Pair]],
+        pairs: Iterable[Iterable[datetime, datetime]] | Iterable[Pair],
         sort: bool = True,
     ) -> None:
         """initialize the pairs class
@@ -265,7 +264,7 @@ class Pairs:
         if len(_pairs) > 0:
             return Pairs.from_names(_pairs)
 
-    def __getitem__(self, index: int) -> Union["Pair", "Pairs"]:
+    def __getitem__(self, index: int) -> "Pair" | "Pairs":
         if isinstance(index, slice):
             start, stop, step = index.start, index.stop, index.step
             if isinstance(start, (int, np.integer, type(None))) and isinstance(
@@ -359,7 +358,7 @@ class Pairs:
         return np.asarray(self._values, dtype=dtype)
 
     def _ensure_pairs(
-        self, pairs: Union[str, Pair, "Pairs", Iterable[str], Iterable[Pair]]
+        self, pairs: str | Pair | "Pairs" | Iterable[str] | Iterable[Pair]
     ) -> "Pairs":
         """ensure the pairs are in the Pairs object"""
         if isinstance(pairs, str):
@@ -475,7 +474,7 @@ class Pairs:
             pairs.append(pair.values)
         return cls(pairs, sort=False)
 
-    def where(self, pair: Union[str, Pair]) -> Optional[int]:
+    def where(self, pair: str, Pair) -> Optional[int]:
         """return the index of the pair
 
         Parameters
@@ -494,7 +493,7 @@ class Pairs:
 
     def where(
         self,
-        pairs: Union[list[str], list[Pair], "Pairs"],
+        pairs: list[str] | list[Pair] | "Pairs",
         return_type: Literal["index", "mask"] = "index",
     ) -> Optional[np.ndarray]:
         """return the index of the pairs
@@ -518,9 +517,7 @@ class Pairs:
                 f"return_type should be one of ['index', 'mask'], but got {return_type}."
             )
 
-    def intersect(
-        self, pairs: Union[list[str], list[Pair], "Pairs"]
-    ) -> Optional["Pairs"]:
+    def intersect(self, pairs: list[str] | list[Pair] | "Pairs") -> Optional["Pairs"]:
         """return the intersection of the pairs. The pairs both in self and
         input pairs.
 
@@ -532,7 +529,7 @@ class Pairs:
         pairs = self._ensure_pairs(pairs)
         return self[self.where(pairs)]
 
-    def union(self, pairs: Union[list[str], list[Pair], "Pairs"]) -> "Pairs":
+    def union(self, pairs: list[str] | list[Pair] | "Pairs") -> "Pairs":
         """return the union of the pairs. All pairs that in self and input pairs.
         A more robust operation than addition.
 
@@ -544,9 +541,7 @@ class Pairs:
         pairs = self._ensure_pairs(pairs)
         return self + pairs
 
-    def difference(
-        self, pairs: Union[list[str], list[Pair], "Pairs"]
-    ) -> Optional["Pairs"]:
+    def difference(self, pairs: list[str] | list[Pair] | "Pairs") -> Optional["Pairs"]:
         """return the difference of the pairs. The pairs in self but not in pairs.
         A more robust operation than subtraction.
 
@@ -564,7 +559,7 @@ class Pairs:
 
     def sort(
         self,
-        order: Union[str, list] = "pairs",
+        order: list | Literal["pairs", "primary", "secondary", "days"] = "pairs",
         ascending: bool = True,
         inplace: bool = True,
     ) -> Optional[tuple["Pairs", np.ndarray]]:
@@ -730,8 +725,7 @@ class Pairs:
 
 
 class TripletLoop:
-    """TripletLoop class containing three pairs/acquisitions.
-    """
+    """TripletLoop class containing three pairs/acquisitions."""
 
     _values: np.ndarray
     _name: str
@@ -880,9 +874,7 @@ class TripletLoops:
 
     def __init__(
         self,
-        loops: Union[
-            Iterable[Iterable[datetime, datetime, datetime]], Iterable[TripletLoop]
-        ],
+        loops: Iterable[Iterable[datetime, datetime, datetime]] | Iterable[TripletLoop],
         sort: bool = True,
     ) -> None:
         """initialize the loops class
@@ -927,7 +919,7 @@ class TripletLoops:
         if len(_loops) > 0:
             return TripletLoops.from_names(_loops)
 
-    def __getitem__(self, index: int) -> Union["TripletLoop", "TripletLoops"]:
+    def __getitem__(self, index: int) -> "TripletLoop" | "TripletLoops":
         if isinstance(index, slice):
             start, stop, step = index.start, index.stop, index.step
             if isinstance(start, (int, np.integer, type(None))) and isinstance(
@@ -1226,7 +1218,7 @@ class TripletLoops:
         matrix: np.ndarray
             TripletLoop matrix with the shape of (n_loop, n_pair). The values of each
             loop/row in matrix are:
-            
+
             - 1: pair12 and pair23
             - -1: pair13
             - 0: otherwise
@@ -1244,7 +1236,7 @@ class TripletLoops:
 
     def where(
         self,
-        loop: Union[str, TripletLoop],
+        loop: str | TripletLoop,
         return_type: Literal["index", "mask"] = "index",
     ) -> Optional[int]:
         """return the index of the loop
@@ -1265,7 +1257,7 @@ class TripletLoops:
 
     def sort(
         self,
-        order: Union[str, list] = "pairs",
+        order: str | list = "pairs",
         ascending: bool = True,
         inplace: bool = True,
     ) -> Optional[np.ndarray]:
@@ -1481,7 +1473,8 @@ class SBASNetwork:
 
     def __init__(
         self,
-        pairs: Union[Iterable[Iterable[datetime, datetime]], Iterable[Pair], Pairs],
+        pairs: Iterable[Iterable[datetime, datetime]] | Iterable[Pair],
+        Pairs,
         baseline: Optional[Iterable[float]] = None,
         sort: bool = True,
     ) -> None:
@@ -1608,7 +1601,7 @@ class SBASNetwork:
 
     def sort(
         self,
-        order: Union[str, list] = "pairs",
+        order: list | Literal["pairs", "primary", "secondary", "days"] = "pairs",
         ascending: bool = True,
         inplace: bool = True,
     ):
@@ -1644,7 +1637,7 @@ class SBASNetwork:
 
     def plot(
         self,
-        fname: Optional[Union[str, Path]] = None,
+        fname: Optional[str | Path] = None,
         ax: Optional[plt.Axes] = None,
         dpi: Optional[int] = None,
     ):
