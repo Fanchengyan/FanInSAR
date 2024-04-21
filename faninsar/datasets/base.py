@@ -171,6 +171,13 @@ class GeoDataset(abc.ABC):
         self._crs = new_crs
 
     @property
+    def same_crs(self) -> bool:
+        """True if all files in the dataset have the same CRS with the
+        desired CRS, False otherwise.
+        """
+        return self._same_crs
+
+    @property
     def res(self) -> tuple[float, float]:
         """Return the resolution of the dataset.
 
@@ -575,6 +582,7 @@ class RasterDataset(GeoDataset):
         # Populate the dataset index
         count = 0
         files_valid = []
+        self._same_crs = True
         for file_path in paths:
             try:
                 with rasterio.open(file_path) as src:
@@ -596,6 +604,9 @@ class RasterDataset(GeoDataset):
 
                     with WarpedVRT(src, crs=crs) as vrt:
                         coords = tuple(vrt.bounds)
+
+                    if crs != src.crs:
+                        self._same_crs = False
             except Exception as e:
                 # Skip files that rasterio is unable to read
                 warnings.warn(f"Unable to read {file_path}: \n--> : {e}", UserWarning)
@@ -709,7 +720,7 @@ class RasterDataset(GeoDataset):
             indexes=self.band_indexes,
             window=win,
             masked=True,
-            boundless=False,  # TODO: check this
+            boundless=self.same_crs,  # boundless=True if self.same_crs else False,
         )
 
         if data.mask.ndim == 0:
