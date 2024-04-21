@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 from rasterio.transform import Affine
@@ -111,6 +113,18 @@ class PolygonsResult(BBoxesResult):
         if self.result is None:
             return "Polygons(None)"
         return f"Polygons(n_boxes={len(self.data)}, n_files={self.data[0].shape[0]}, dims={self.dims})"
+
+    @property
+    def transforms(self) -> list[Affine] | None:
+        if self.result is None:
+            return None
+        return self.result["transforms"]
+    
+    @property
+    def masks(self) -> list[np.ndarray] | None:
+        if self.result is None:
+            return None
+        return self.result["masks"]
 
 
 class QueryResult:

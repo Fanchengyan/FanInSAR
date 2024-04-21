@@ -17,7 +17,8 @@ import rasterio
 import rasterio.merge
 import shapely
 import xarray as xr
-from rasterio import fill
+from rasterio import features, fill
+from rasterio import mask as rio_mask
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.io import DatasetReader
@@ -549,7 +550,8 @@ class RasterDataset(GeoDataset):
             :func:`rasterio.fill.fillnodata` function. Default: False.
 
             .. note::
-                This parameter is only used when querying bounding boxes!
+                This parameter is only used when sampling bounding boxes or polygons,
+                and not used when sampling points.
 
         verbose : bool, optional
             if True, print verbose output, default: True
@@ -733,36 +735,54 @@ class RasterDataset(GeoDataset):
         """Return the values of the dataset at the given polygons."""
         polygons = self._ensure_query_crs(polygons)
 
+        mask_params = {
+            "filled": False,
+            "pad": polygons.pad,
+            "all_touched": polygons.all_touched,
+            "invert": False,
+            "crop": True,
+        }
+        rasterize_params = {
+            "all_touched": polygons.all_touched,
+            "fill": 0,
+            "default_value": 1,
+        }
+
         shapes = polygons.frame.geometry.to_list()
         if len(polygons.desired) > 0:
             data_ls = []
             transform_ls = []
+            mask_ls = []
             for shp in shapes:
-                out_image, out_transform = rasterio.mask.mask(
-                    vrt_fh,
-                    [shp],
-                    filled=False,
-                    pad=polygons.pad,
-                    all_touched=polygons.all_touched,
-                    invert=False,
-                    crop=True,
+                data, out_transform = rio_mask.mask(vrt_fh, [shp], **mask_params)
+
+                rasterize_params.update(
+                    {"out_shape": data.shape[1:3], "transform": out_transform}
                 )
-                data_ls.append(out_image)
+                mask = features.rasterize([shp], **rasterize_params)
+
+                if self.fill_nodata:
+                    data = fill.fillnodata(data)
+                    data = np.ma.masked_array(data.data, ~mask.astype(bool))
+                data_ls.append(data)
                 transform_ls.append(out_transform)
+                mask_ls.append(mask)
         else:
-            data, out_transform = rasterio.mask.mask(
-                vrt_fh,
-                shapes,
-                filled=False,
-                pad=polygons.pad,
-                all_touched=polygons.all_touched,
-                invert=True,
-                crop=False,
+            mask_params.update({"invert": True, "crop": False})
+            data, out_transform = rio_mask.mask(vrt_fh, shapes, **mask_params)
+
+            rasterize_params.update(
+                {"out_shape": data.shape[1:3], "transform": out_transform}
             )
+            mask = features.rasterize(shapes, **rasterize_params)
+            if self.fill_nodata:
+                data = fill.fillnodata(data)
+                data = np.ma.masked_array(data.data, ~mask.astype(bool))
             data_ls = [data]
             transform_ls = [out_transform]
+            mask_ls = [mask]
 
-        return data_ls, transform_ls
+        return data_ls, transform_ls, mask_ls
 
     @overload
     def _ensure_query_crs(self, query: BoundingBox) -> BoundingBox: ...
@@ -857,8 +877,10 @@ class RasterDataset(GeoDataset):
                 files_bbox_list.append(np.ma.asarray(bbox_list))
             # Get the polygons values
             if query.polygons is not None:
-                data, transform_ls = self._polygons_query(query.polygons, vrt_fh)
-                files_polygons_list.append(data)
+                data_ls, transform_ls, mask_ls = self._polygons_query(
+                    query.polygons, vrt_fh
+                )
+                files_polygons_list.append(data_ls)
 
         # Stack the points values
         points_values = None
@@ -906,8 +928,9 @@ class RasterDataset(GeoDataset):
             if polygons_values is None
             else {
                 "data": polygons_values,
-                "transforms": transform_ls if polygons_values is not None else None,
                 "dims": "(n_polygons, (n_files, height, width))",
+                "transforms": transform_ls if polygons_values is not None else None,
+                "masks": mask_ls if polygons_values is not None else None,
             }
         )
         result = QueryResult(points_result, bbox_result, polygons_result)
@@ -1149,8 +1172,8 @@ class PairDataset(RasterDataset):
     _pairs: Optional[Pairs] = None
     _datetime: Optional[pd.DatetimeIndex] = None
 
-    @abc.abstractmethod
     @classmethod
+    @abc.abstractmethod
     def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Used to parse pairs from filenames. *Must be implemented in subclass*.
 
@@ -1178,8 +1201,8 @@ class PairDataset(RasterDataset):
         >>> pairs = Pairs.from_names(pair_names)
         """
 
-    @abc.abstractmethod
     @classmethod
+    @abc.abstractmethod
     def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Used to parse datetime from filenames. *Must be implemented in subclass*.
 
@@ -1283,8 +1306,8 @@ class ApsDataset(RasterDataset):
 
                 dst.write(dest_arr, 1)
 
-    @abc.abstractmethod
     @classmethod
+    @abc.abstractmethod
     def parse_dates(cls, paths: Optional[Sequence[str]] = None) -> pd.DatetimeIndex:
         """Used to parse acquisition dates from filenames. *Must be implemented
         in subclass*.
