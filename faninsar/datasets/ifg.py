@@ -61,7 +61,6 @@ class InterferogramDataset(PairDataset):
         bands_coh: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
-        masked: bool = True,
         fill_nodata: bool = False,
         verbose=True,
         keep_common: bool = True,
@@ -102,15 +101,15 @@ class InterferogramDataset(PairDataset):
         resampling: Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
-        masked : bool, optional
-            if True, the returned will be a masked array with a mask
-            for no data values. Default: True.
+        fill_nodata : bool, optional
+            Whether to fill holes in the queried data by interpolating them using
+            inverse distance weighting method provided by the
+            :func:`rasterio.fill.fillnodata`. Default: False.
 
             .. note::
-                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
-        fill_nodata : bool, optional
-            Whether to fill holes in raster data by interpolation using the
-            ``rasterio.fill.fillnodata`` function. Default: False.
+                This parameter is only used when sampling data using bounding
+                boxes or polygons queries, and will not work for points queries.
+                
         verbose: bool, optional, default: True
             if True, print verbose output.
         keep_common: bool, optional, default: True
@@ -163,7 +162,6 @@ class InterferogramDataset(PairDataset):
             bands=bands_unw,
             cache=cache,
             resampling=resampling,
-            masked=masked,
             fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name="Interferogram",
@@ -180,7 +178,6 @@ class InterferogramDataset(PairDataset):
             bands=bands_coh,
             cache=cache,
             resampling=resampling,
-            masked=masked,
             fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name="Coherence",

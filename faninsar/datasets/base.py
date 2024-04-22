@@ -514,7 +514,7 @@ class RasterDataset(GeoDataset):
         verbose: bool = True,
         ds_name: str = "",
     ) -> None:
-        f"""Initialize a new {self.__class__.__name__} instance.
+        """Initialize a new raster dataset instance.
 
         Parameters
         ----------
@@ -546,12 +546,13 @@ class RasterDataset(GeoDataset):
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
         fill_nodata : bool, optional
-            Whether to fill holes in raster data by interpolation using the
-            :func:`rasterio.fill.fillnodata` function. Default: False.
+            Whether to fill holes in the queried data by interpolating them using 
+            inverse distance weighting method provided by the 
+            :func:`rasterio.fill.fillnodata`. Default: False.
 
             .. note::
-                This parameter is only used when sampling bounding boxes or polygons,
-                and not used when sampling points.
+                This parameter is only used when sampling data using bounding
+                boxes or polygons queries, and will not work for points queries.
 
         verbose : bool, optional
             if True, print verbose output, default: True
@@ -1344,7 +1345,6 @@ class ApsPairs(PairDataset):
         bands: Optional[Sequence[str]] = None,
         cache: bool = True,
         resampling=Resampling.nearest,
-        masked: bool = True,
         fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
@@ -1380,15 +1380,15 @@ class ApsPairs(PairDataset):
         resampling : Resampling, optional
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
-        masked : bool, optional
-            if True, the returned will be a masked array with a mask
-            for no data values. Default: True.
+        fill_nodata : bool, optional
+            Whether to fill holes in the queried data by interpolating them using
+            inverse distance weighting method provided by the
+            :func:`rasterio.fill.fillnodata`. Default: False.
 
             .. note::
-                If parameter ``fill_nodata`` is True, the array will be interpolated and the returned array will always be a normal numpy array.
-        fill_nodata : bool, optional
-            Whether to fill holes in raster data by interpolation using the
-            ``rasterio.fill.fillnodata`` function. Default: False.
+                This parameter is only used when sampling data using bounding
+                boxes or polygons queries, and will not work for points queries.
+                
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
@@ -1409,7 +1409,6 @@ class ApsPairs(PairDataset):
             bands=bands,
             cache=cache,
             resampling=resampling,
-            masked=masked,
             fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name=ds_name,
