@@ -546,8 +546,8 @@ class RasterDataset(GeoDataset):
             Resampling algorithm used when reading input files.
             Default: `Resampling.nearest`.
         fill_nodata : bool, optional
-            Whether to fill holes in the queried data by interpolating them using 
-            inverse distance weighting method provided by the 
+            Whether to fill holes in the queried data by interpolating them using
+            inverse distance weighting method provided by the
             :func:`rasterio.fill.fillnodata`. Default: False.
 
             .. note::
@@ -760,11 +760,11 @@ class RasterDataset(GeoDataset):
                 rasterize_params.update(
                     {"out_shape": data.shape[1:3], "transform": out_transform}
                 )
-                mask = features.rasterize([shp], **rasterize_params)
+                mask = features.rasterize([shp], **rasterize_params).astype(bool)
 
                 if self.fill_nodata:
                     data = fill.fillnodata(data)
-                    data = np.ma.masked_array(data.data, ~mask.astype(bool))
+                    data = np.ma.masked_array(data.data, ~mask)
                 data_ls.append(data)
                 transform_ls.append(out_transform)
                 mask_ls.append(mask)
@@ -775,10 +775,10 @@ class RasterDataset(GeoDataset):
             rasterize_params.update(
                 {"out_shape": data.shape[1:3], "transform": out_transform}
             )
-            mask = features.rasterize(shapes, **rasterize_params)
+            mask = features.rasterize(shapes, **rasterize_params).astype(bool)
             if self.fill_nodata:
                 data = fill.fillnodata(data)
-                data = np.ma.masked_array(data.data, ~mask.astype(bool))
+                data = np.ma.masked_array(data.data, ~mask)
             data_ls = [data]
             transform_ls = [out_transform]
             mask_ls = [mask]
@@ -1388,7 +1388,7 @@ class ApsPairs(PairDataset):
             .. note::
                 This parameter is only used when sampling data using bounding
                 boxes or polygons queries, and will not work for points queries.
-                
+
         verbose : bool, optional
             if True, print verbose output, default: True
         ds_name : str, optional
