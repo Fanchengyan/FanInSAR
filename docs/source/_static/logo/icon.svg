@@ -27,9 +27,9 @@
      inkscape:pagecheckerboard="0"
      inkscape:deskcolor="#d1d1d1"
      inkscape:document-units="pt"
-     inkscape:zoom="1.1710069"
-     inkscape:cx="467.97333"
-     inkscape:cy="307.85472"
+     inkscape:zoom="1.6560538"
+     inkscape:cx="236.40536"
+     inkscape:cy="241.83996"
      inkscape:window-width="3840"
      inkscape:window-height="2054"
      inkscape:window-x="-11"
@@ -488,9 +488,16 @@
          id="rect11" />
     </clipPath>
   </defs>
+  <ellipse
+     style="fill:#cccccc;fill-opacity:0.2;stroke:#b2b2b2;stroke-width:3;stroke-linecap:round;stroke-linejoin:bevel;stroke-dasharray:none;stroke-dashoffset:25;stroke-opacity:0.2;paint-order:normal"
+     id="path12"
+     cx="215.77"
+     cy="216"
+     rx="215.02991"
+     ry="212.67488" />
   <g
      id="g1"
-     transform="translate(6.4047445,29.127674)">
+     transform="translate(7.7783261,29.127674)">
     <g
        id="patch_2"
        style="stroke-linecap:butt;stroke-linejoin:round;filter:url(#filter105-5)"
