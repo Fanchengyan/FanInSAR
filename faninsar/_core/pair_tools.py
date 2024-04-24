@@ -1396,7 +1396,7 @@ class Loop:
         """return the loop matrix"""
         matrix = np.isin(self.loops_pairs.to_names(), self.pairs.to_names()).astype(int)
         matrix[self.loops_pairs.where(self.pairs[-1])] = -1
-        return matrix
+        return np.array(matrix, dtype=dtype)
 
     @property
     def values(self) -> np.ndarray:
@@ -1446,8 +1446,23 @@ class Loop:
 class Loops:
     """Loops class to handle loops with multiple acquisitions."""
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, loops: list) -> None:
+        self._loops = np.unique(loops)
+
+    def __len__(self) -> int:
+        return len(self.loops)
+
+    def __getitem__(self, index: int) -> Loop:
+        return self.loops[index]
+
+    def __iter__(self):
+        return iter(self.loops)
+
+    def __contains__(self, item: Loop) -> bool:
+        return item in self.loops
+
+    def __add__(self, other: "Loops") -> "Loops":
+        return Loops(self._loops + other._loops)
 
 
 class SBASNetwork:
