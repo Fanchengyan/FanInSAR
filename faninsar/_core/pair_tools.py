@@ -681,18 +681,18 @@ class Pairs:
                 continue
             if not valid_diagonal_pair(i, self, edge_days):
                 continue
-            pair_start, pair_end = i.values[0], i.values[1]
-            mask_primaries = (self.primary == pair_start) & (self.secondary < pair_end)
+            start_date, end_date = i.values[0], i.values[1]
+            mask_primaries = (self.primary == start_date) & (self.secondary < end_date)
             if not mask_primaries.any():
                 continue
             pairs_primary = self[mask_primaries]
 
             # initialize a loop with the primary acquisition
-            loop = [pair_start]
+            loop = [start_date]
 
             # find loops with the primary acquisition
             find_loops(
-                self, loops, loop, pairs_primary, pair_end, edge_days, max_acquisition
+                self, loops, loop, pairs_primary, end_date, edge_days, max_acquisition
             )
 
         return loops
@@ -2041,14 +2041,16 @@ def find_loops(
     loops: list[Loop],
     loop: Loop,
     pairs_left: Pairs,
-    pair_end: datetime,
+    end_date: datetime,
     edge_days: Optional[int] = None,
     max_acquisition=5,
 ) -> None:
-    """recursively find all available loops within pairs_left and pair_end."""
+    """recursively find all available loops within pairs_left and end_date."""
     for pair_left in pairs_left:
+        if pair_left.days > edge_days:
+            continue
         m_candidate = (loops_pairs.primary == pair_left.secondary) & (
-            loops_pairs.secondary <= pair_end
+            loops_pairs.secondary <= end_date
         )
         if not m_candidate.any():
             continue
@@ -2058,7 +2060,9 @@ def find_loops(
                 continue
             loop_i = loop.copy()
             loop_i.append(pair_middle.primary)
-            if pair_middle.secondary == pair_end:
+            if pair_middle.secondary == end_date:
+                if pair_middle.days > edge_days:
+                    continue
                 loop_i.append(pair_middle.secondary)
                 loops.append(Loop(loop_i, loops_pairs))
             else:
@@ -2069,7 +2073,7 @@ def find_loops(
                         loops,
                         loop_i,
                         pairs_candidate,
-                        pair_end,
+                        end_date,
                         edge_days,
                         max_acquisition,
                     )
