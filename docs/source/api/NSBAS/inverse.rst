@@ -48,3 +48,8 @@ censored_lstsq
 ^^^^^^^^^^^^^^
 
 .. autofunction:: censored_lstsq
+
+calculate_u
+^^^^^^^^^^^
+
+.. autofunction:: calculate_u

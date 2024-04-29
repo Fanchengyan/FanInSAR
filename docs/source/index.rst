@@ -24,7 +24,7 @@ Highlight Features
 
    install
    User Guide <user_guide/index>
-   FanInSAR API Reference <api/index>
+   API Reference <api/index>
    terminology
 
 

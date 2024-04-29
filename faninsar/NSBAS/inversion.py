@@ -564,6 +564,12 @@ def calculate_u(
     """Calculate correction matrix u by loop closure phase using least square.
     More details see paper: TODO add paper link.
 
+    .. tip::
+        The pairs in the loops may be fewer than the input pairs. To make sure
+        the pairs in the loops are the same as the pairs in the unw_phases, you
+        You can use the :meth:`Pairs.where` method to get the index/mask of the
+        pairs in the loops from the input pairs.
+
     Parameters
     ----------
     loops : Loops
@@ -576,6 +582,19 @@ def calculate_u(
         available, otherwise use CPU.
     dtype : torch.dtype, optional
         dtype of torch.tensor used for computation.
+
+    Examples
+    --------
+    get the loops from the pairs:
+    
+    >>> loops = pairs.to_loops() 
+    >>> idx = pairs.where(loops.pairs) # get the index of the pairs in the loops from the input pairs
+    >>> unw_used = unw[idx]
+    
+    calculate u by loops and unwrapped interferometric phases:
+    
+    >>> u = np.zeros_like(unw, dtype=np.float32)
+    >>> u[idx] = NSBAS.calculate_u(loops, unw_used)
     """
     contain_nan = False
     if np.any(np.isnan(unw_phases)):

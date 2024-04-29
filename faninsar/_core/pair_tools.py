@@ -647,25 +647,36 @@ class Pairs:
         edge_days: Optional[int] = 12,
         max_days: Optional[int] = None,
     ) -> "Loops":
-        """return all possible loops from the pairs
+        """Return all possible loops from the pairs.
+
+        .. important::
+            The pairs in the loops may be fewer than the input pairs. You can use
+            the :meth:`Pairs.where` method to get the index/mask of the pairs
+            in the loops from the input pairs.
+
+            **Example**:
+
+            >>> loops = pairs.to_loops()
+            >>> mask = pairs.where(loops.pairs, return_type='mask')
+
 
         Parameters
         ----------
         max_acquisition: int
-            Maximum number of acquisition in the loops. It should be at least 3.
+            The maximum number of acquisitions in the loops. It should be at least 3.
 
             .. note::
-
-                the number of acquisition is equal to the number of intervals + 1
-                :math:`n_{edge pairs} = n_{intervals}  =  n_{acquisition} - 1`.
+                The number of acquisitions is equal to the number of intervals + 1
+                :math:`n (acquisition) = n (edge\ pairs) + 1 = n (intervals) + 1`.
 
         edge_days: int, optional
-            The maximum days of the edge pairs, used to identify the edge pairs
-            and exclude the not valid diagonal pairs that cannot form loops using
+            The maximum number of days for the edge pairs. It is used to identify the edge pairs
+            and exclude the invalid diagonal pairs that cannot form loops using
             the edge pairs. If None, all available diagonal pairs will be used to
             form loops. Default is 12.
+
         max_days: int, optional
-            Maximum days of the pairs in the loops. If None, all available pairs
+            The maximum number of days for the pairs in the loops. If None, all available pairs
             will be used. Default is None.
         """
         # a list containing all loops
@@ -1417,10 +1428,10 @@ class Loops:
         self._pairs, self._edge_pairs, self._diagonal_pairs = self._parse_pairs()
 
     def __str__(self) -> str:
-        return f"Loops({len(self)})"
+        return f"Loops(loops={len(self)}, pairs={len(self.pairs)}, edge_pairs={len(self.edge_pairs)}, diagonal_pairs={len(self.diagonal_pairs)})"
 
     def __repr__(self) -> str:
-        return f"Loops({len(self)})"
+        return f"Loops(loops={len(self)}, pairs={len(self.pairs)}, edge_pairs={len(self.edge_pairs)}, diagonal_pairs={len(self.diagonal_pairs)})"
 
     def __len__(self) -> int:
         return self._length
