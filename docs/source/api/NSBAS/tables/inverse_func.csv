@@ -1,0 +1,4 @@
+Function, Description
+:func:`.censored_lstsq`, Solves least squares problem subject to missing data.
+:func:`.batch_lstsq`, calculates the least-squares solution for a batch of linear equations using the given G matrix and the data in d.
+:func:`.calculate_u`, Calculate correction matrix u by loop closure phase using least square.

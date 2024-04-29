@@ -4,7 +4,15 @@ Inversion
 .. currentmodule:: faninsar.NSBAS.inversion
 
 
-Classes and functions for inverting the NSBAS problem.
+.. csv-table:: Classes
+   :file: tables/inverse_class.csv
+   :header-rows: 1
+
+
+.. csv-table:: Basis Functions
+   :file: tables/inverse_func.csv
+   :header-rows: 1
+
 
 Classes
 -------
