@@ -14,11 +14,11 @@ from faninsar.NSBAS.tsmodels import TimeSeriesModels
 
 
 class NSBASMatrixFactory:
-    """Factory class for NSBAS matrix. The NSBAS matrix is usually expressed as:
-    ``d = Gm``, where ``d`` is the unwrapped interferograms matrix, ``G`` is the
-    NSBAS matrix, and ``m`` is the model parameters, which is the combination of
-    the deformation increment and the model parameters. see paper: TODO for more
-    details.
+    """Factory class to generate/format NSBAS matrix  The NSBAS matrix is usually 
+    expressed as: ``d = Gm``, where ``d`` is the unwrapped interferograms matrix, 
+    ``G`` is the NSBAS matrix, and ``m`` is the model parameters, which is the 
+    combination of the deformation increment and the model parameters. 
+    see paper: TODO for more details.
 
     .. note::
 
@@ -226,11 +226,11 @@ class NSBASMatrixFactory:
 
 
 class NSBASInversion:
-    """NSBAS inversion class. The NSBAS inversion is usually expressed as:
-    ``d = Gm``, where ``d`` is the unwrapped interferograms matrix, ``G`` is the
-    NSBAS matrix, and ``m`` is the model parameters, which is the combination of
-    the deformation increment and the model parameters. see paper: TODO for more
-    details.
+    """a class used to operate NSBAS inversion. The NSBAS inversion is usually
+    expressed as: ``d = Gm``, where ``d`` is the unwrapped interferograms matrix,
+    ``G`` is the NSBAS matrix, and ``m`` is the model parameters, which is the
+    combination of the deformation increment and the model parameters.
+    see paper: TODO for more details.
 
     Examples
     --------
@@ -604,7 +604,7 @@ def calculate_u(
     calculate u by loops and unwrapped interferometric phases:
 
     >>> u = np.zeros_like(unw, dtype=np.float32)
-    >>> u[idx] = NSBAS.calculate_u(loops, unw_used)
+    >>> u[idx] = np.round(NSBAS.calculate_u(loops, unw_used))
     """
     contain_nan = False
     if np.any(np.isnan(unw_phases)):
