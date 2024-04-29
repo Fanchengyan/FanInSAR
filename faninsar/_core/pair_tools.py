@@ -8,6 +8,7 @@ from typing import Any, Callable, Literal, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
 
 
 class Pair:
@@ -50,31 +51,31 @@ class Pair:
         return np.asarray(self._values, dtype=dtype)
 
     @property
-    def values(self):
+    def values(self) -> NDArray[np.datetime64]:
         """the values of the pair with format of datetime."""
         return self._values
 
     @property
-    def name(self):
+    def name(self) -> str:
         """String of the pair with format of '%Y%m%d_%Y%m%d'."""
         return self._name
 
     @property
-    def days(self):
+    def days(self) -> int:
         """the time span of the pair in days."""
         return self._days
 
     @property
-    def primary(self) -> np.ndarray:
+    def primary(self) -> np.datetime64:
         """the primary dates of all pairs"""
         return self.values[0]
 
     @property
-    def secondary(self) -> np.ndarray:
+    def secondary(self) -> np.datetime64:
         """the secondary dates of all pairs"""
         return self.values[1]
 
-    def primary_string(self, date_format="%Y%m%d") -> np.ndarray:
+    def primary_string(self, date_format="%Y%m%d") -> str:
         """return the primary dates of all pairs in string format
 
         Parameters
@@ -83,9 +84,9 @@ class Pair:
             Format of the date string. Default is '%Y%m%d'. See more at
             `strftime Format Codes <https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes>`_.
         """
-        return pd.to_datetime(self.values[0]).strftime(date_format).values
+        return pd.to_datetime(self.values[0]).strftime(date_format)
 
-    def secondary_string(self, date_format="%Y%m%d") -> np.ndarray:
+    def secondary_string(self, date_format="%Y%m%d") -> str:
         """return the secondary dates of all pairs in string format
 
         Parameters
@@ -94,7 +95,7 @@ class Pair:
             Format of the date string. Default is '%Y%m%d'. See more at
             `strftime Format Codes <https://docs.python.org/3/library/datetime.html#strftime-and-strptime-format-codes>`_.
         """
-        return pd.to_datetime(self.values[1]).strftime(date_format).values
+        return pd.to_datetime(self.values[1]).strftime(date_format)
 
     @classmethod
     def from_name(
@@ -340,7 +341,7 @@ class Pairs:
 
         return np.any(np.all(item == self.values, axis=1))
 
-    def __array__(self, dtype=None) -> np.ndarray:
+    def __array__(self, dtype=None) -> NDArray[np.datetime64]:
         return np.asarray(self._values, dtype=dtype)
 
     def _ensure_pairs(
@@ -370,12 +371,12 @@ class Pairs:
         return pairs
 
     @property
-    def values(self) -> np.ndarray:
-        """return the pairs array in type of np.datetime64[D]"""
+    def values(self) -> NDArray[np.datetime64]:
+        """return the numpy array of the pairs"""
         return self._values
 
     @property
-    def names(self) -> np.ndarray:
+    def names(self) -> NDArray[np.str_]:
         """return the names (string format) of the pairs"""
         return self._names
 
@@ -385,7 +386,7 @@ class Pairs:
         return pd.to_datetime(self._dates)
 
     @property
-    def days(self) -> np.ndarray:
+    def days(self) -> NDArray[np.int64]:
         """return the time span of all pairs in days"""
         return (self._values[:, 1] - self._values[:, 0]).astype(int)
 
@@ -422,7 +423,7 @@ class Pairs:
         return self.secondary.strftime(date_format)
 
     @property
-    def edge_index(self) -> np.ndarray:
+    def edge_index(self) -> NDArray[np.int64]:
         """return the index of the pairs in the dates coordinate (edge index in
         graph theory)"""
         return self._edge_index
@@ -470,28 +471,11 @@ class Pairs:
             pairs.append(pair.values)
         return cls(pairs, sort=False)
 
-    def where(self, pair: str, Pair) -> Optional[int]:
-        """return the index of the pair
-
-        Parameters
-        ----------
-        pair: str or Pair
-            Pair name or Pair object.
-        """
-        if isinstance(pair, str):
-            pair = Pair.from_name(pair)
-        elif not isinstance(pair, Pair):
-            raise TypeError(f"pair should be str or Pair, but got {type(pair)}.")
-        if pair in self:
-            return np.where(np.all(self._values == pair.values, axis=1))[0][0]
-        else:
-            return None
-
     def where(
         self,
         pairs: list[str] | list[Pair] | "Pairs",
         return_type: Literal["index", "mask"] = "index",
-    ) -> Optional[np.ndarray]:
+    ) -> Optional[NDArray[np.int64 | np.bool_]]:
         """return the index of the pairs
 
         Parameters
@@ -558,7 +542,7 @@ class Pairs:
         order: list | Literal["pairs", "primary", "secondary", "days"] = "pairs",
         ascending: bool = True,
         inplace: bool = True,
-    ) -> Optional[tuple["Pairs", np.ndarray]]:
+    ) -> Optional[tuple["Pairs", NDArray[np.int64]]]:
         """sort the pairs
 
         Parameters
@@ -605,7 +589,7 @@ class Pairs:
         else:
             return Pairs(_values), _index
 
-    def to_names(self, prefix: Optional[str] = None) -> np.ndarray:
+    def to_names(self, prefix: Optional[str] = None) -> NDArray[np.str_]:
         """generate pairs names string with prefix
 
         Parameters
@@ -702,7 +686,7 @@ class Pairs:
 
         return Loops(loops)
 
-    def to_matrix(self) -> np.ndarray:
+    def to_matrix(self, dtype=None) -> NDArray[np.number]:
         """return the SBAS matrix
 
         Parameters
@@ -711,22 +695,12 @@ class Pairs:
             SBAS matrix in shape of (n_pairs, n_dates-1). The dates between
             pairs are set to 1, otherwise 0.
         """
-        matrix = np.zeros((len(self), len(self.dates) - 1))
+        matrix = np.zeros((len(self), len(self.dates) - 1), dtype=dtype)
         col_idxs = self.edge_index.copy()
         for row_idx, col_idx in enumerate(col_idxs):
             matrix[row_idx, col_idx[0] : col_idx[1]] = 1
 
         return matrix
-
-    def dates_string(self, format="%Y%m%d") -> list[str]:
-        """return the dates of the pairs with format of str
-
-        Parameters
-        ----------
-        format: str
-            Format of the date string. Default is '%Y%m%d'.
-        """
-        return [i.strftime(format) for i in self._dates.astype(datetime)]
 
 
 class TripletLoop:
@@ -772,25 +746,13 @@ class TripletLoop:
         return np.asarray(self._values, dtype=dtype)
 
     @property
-    def values(self) -> np.ndarray:
-        """return the values array of the loop.
-
-        Returns
-        -------
-        values: np.ndarray
-            Three dates of the loop with format of np.datetime64[D].
-        """
+    def values(self) -> NDArray[np.datetime64]:
+        """Three dates of the loop with format of np.datetime64[D]."""
         return self._values
 
     @property
     def pairs(self) -> list[Pair]:
-        """return all three pairs of the loop.
-
-        Returns
-        -------
-        pairs: list
-            list containing three pairs. Each pair is a Pair class.
-        """
+        """all three pairs of the loop."""
         return self._pairs
 
     @property
@@ -1016,11 +978,11 @@ class TripletLoops:
 
         return np.any(np.all(item == self.values, axis=1))
 
-    def __array__(self, dtype=None) -> np.ndarray:
+    def __array__(self, dtype=None) -> NDArray[np.datetime64]:
         return np.asarray(self._values, dtype=dtype)
 
     @property
-    def values(self) -> np.ndarray:
+    def values(self) -> NDArray[np.datetime64]:
         """return the values of the loops.
 
         Returns
@@ -1031,12 +993,12 @@ class TripletLoops:
         return self._values
 
     @property
-    def names(self) -> np.ndarray:
+    def names(self) -> NDArray[np.str_]:
         """the names (sting format) of the loops."""
         return self._names
 
     @property
-    def dates(self) -> np.ndarray:
+    def dates(self) -> NDArray[np.datetime64]:
         """Sorted dates of the loops with format of datetime."""
         return self._dates
 
@@ -1072,22 +1034,22 @@ class TripletLoops:
         return Pairs(self._values[:, [0, 2]], sort=False)
 
     @property
-    def days12(self) -> np.ndarray:
+    def days12(self) -> NDArray[np.int64]:
         """the time span of the first pair in days."""
         return (self._values[:, 1] - self._values[:, 0]).astype(int)
 
     @property
-    def days23(self) -> np.ndarray:
+    def days23(self) -> NDArray[np.int64]:
         """the time span of the second pair in days."""
         return (self._values[:, 2] - self._values[:, 1]).astype(int)
 
     @property
-    def days13(self) -> np.ndarray:
+    def days13(self) -> NDArray[np.int64]:
         """the time span of the third pair in days."""
         return (self._values[:, 2] - self._values[:, 0]).astype(int)
 
     @property
-    def index(self) -> np.ndarray:
+    def index(self) -> NDArray[np.int64]:
         """the index of the loops in dates coordinates."""
         return np.searchsorted(self._dates, self._values)
 
@@ -1124,7 +1086,7 @@ class TripletLoops:
             loops.append(loop.values)
         return cls(loops, sort=False)
 
-    def to_names(self, prefix: Optional[str] = None) -> np.ndarray:
+    def to_names(self, prefix: Optional[str] = None) -> NDArray[np.str_]:
         """return the string name of each loop.
 
         Parameters
@@ -1168,7 +1130,7 @@ class TripletLoops:
         else:
             raise ValueError(f"target should be 'pairs' or 'dates', but got {target}.")
 
-    def to_matrix(self) -> np.ndarray:
+    def to_matrix(self) -> NDArray[np.int8]:
         """
         return loop matrix (containing 1, -1, 0) from pairs.
 
@@ -1219,7 +1181,7 @@ class TripletLoops:
         order: str | list = "pairs",
         ascending: bool = True,
         inplace: bool = True,
-    ) -> Optional[np.ndarray]:
+    ) -> Optional[tuple["TripletLoops", NDArray[np.int64]]]:
         """sort the loops
 
         Parameters
@@ -1282,7 +1244,7 @@ class TripletLoops:
         else:
             return TripletLoops(self._values[_index]), _index
 
-    def to_seasons(self):
+    def to_seasons(self) -> NDArray[np.int8]:
         """return the season of each loop.
 
         Returns
@@ -1304,7 +1266,7 @@ class TripletLoops:
                 seasons.append(season1)
             else:
                 seasons.append(0)
-        return seasons
+        return np.asarray(seasons, dtype=np.int8)
 
 
 class Loop:
@@ -1347,7 +1309,7 @@ class Loop:
         return hash(self.name)
 
     @property
-    def values(self) -> np.ndarray:
+    def values(self) -> NDArray[np.datetime64]:
         """return the values array of the loop.
 
         Returns
@@ -1431,7 +1393,14 @@ class Loops:
         return f"Loops(loops={len(self)}, pairs={len(self.pairs)}, edge_pairs={len(self.edge_pairs)}, diagonal_pairs={len(self.diagonal_pairs)})"
 
     def __repr__(self) -> str:
-        return f"Loops(loops={len(self)}, pairs={len(self.pairs)}, edge_pairs={len(self.edge_pairs)}, diagonal_pairs={len(self.diagonal_pairs)})"
+        return (
+            "Loops("
+            f"\n    loops={len(self)},"
+            f"\n    pairs={len(self.pairs)},"
+            f"\n    edge_pairs={len(self.edge_pairs)},"
+            f"\n    diagonal_pairs={len(self.diagonal_pairs)}"
+            f"\n)"
+        )
 
     def __len__(self) -> int:
         return self._length
@@ -1466,11 +1435,11 @@ class Loops:
         )
 
     @property
-    def loops(self) -> np.ndarray:
+    def loops(self) -> NDArray[np.object_]:
         return self._loops
 
     @property
-    def names(self) -> np.ndarray:
+    def names(self) -> NDArray[np.str_]:
         """return the names (str format) of the loops."""
         return self._names
 
@@ -1509,7 +1478,7 @@ class Loops:
         else:
             return Loops(self._loops[_index])
 
-    def to_matrix(self, dtype=None) -> np.ndarray:
+    def to_matrix(self, dtype=None) -> NDArray[np.number]:
         """return a design matrix which rows and columns are loops and pairs
         respectively. The values of the matrix are 1 for the edge pairs, -1 for
         the diagonal pairs, and 0 otherwise.
@@ -1720,21 +1689,7 @@ class SBASNetwork:
 
 
 class PairsFactory:
-    """This class is used to generate interferometric pairs for InSAR
-    processing.
-
-    .. note::
-
-        Functions in this class only generate interferometric pairs and
-        do not check if the interferometric pairs are valid.
-
-        For example, if the interferometric pairs are generated by
-        ``from_period`` function, the interferometric pairs may not be
-        valid if the temporal baseline of the interferometric pairs
-        are too large. The users should check the temporal baseline
-        of the interferometric pairs and remove the invalid interferometric
-        pairs.
-    """
+    """This class is used to generate interferometric pairs for InSAR processing."""
 
     def __init__(self, dates: Iterable, **kwargs) -> None:
         """initialize the PairGenerator class
@@ -1743,9 +1698,9 @@ class PairsFactory:
         ----------
         dates: Iterable
             Iterable object that contains the dates. Can be any object that
-            can be passed to pd.to_datetime(). For example, ['20190101', '20190201'].
+            accepted by :func:`pd.to_datetime`
         date_args: dict, optional
-            Keyword arguments for pd.to_datetime().
+            Keyword arguments passed to :func:`pd.to_datetime`
         """
         self.dates = pd.to_datetime(dates, **kwargs).unique().sort_values()
 
@@ -2002,7 +1957,7 @@ class DateManager:
         pass
 
     @staticmethod
-    def season_of_month(month):
+    def season_of_month(month: int) -> int:
         """return the season of a given month
 
         Parameters
@@ -2068,7 +2023,7 @@ class DateManager:
             If None, the date string will be split by '_' and the
             last 2 items will be used. Default is None.
         date_args: dict, optional
-            Keyword arguments for pd.to_datetime() to convert the date strings
+            Keyword arguments for :func:`pd.to_datetime` to convert the date strings
             to datetime objects. For example, {'format': '%Y%m%d'}.
             Default is {}.
         """

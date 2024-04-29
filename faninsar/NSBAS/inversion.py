@@ -5,6 +5,7 @@ from typing import Iterable, Optional, Tuple
 import numpy as np
 import psutil
 import torch
+from numpy.typing import NDArray
 from tqdm.auto import tqdm
 
 from faninsar._core.device import parse_device
@@ -70,14 +71,14 @@ class NSBASMatrixFactory:
     _pairs: Pairs
     _model: Optional[TimeSeriesModels]
     _gamma: float
-    _G: np.ndarray
-    _d: np.ndarray
+    _G: NDArray[np.float32]
+    _d: NDArray[np.float32 | np.float64]
 
     slots = ["_pairs", "_model", "_gamma", "_G", "_d"]
 
     def __init__(
         self,
-        unw: np.ndarray,
+        unw: NDArray[np.floating],
         pairs: Pairs | Iterable[str],
         model: Optional[TimeSeriesModels] = None,
         gamma: float = 0.0001,
@@ -86,7 +87,7 @@ class NSBASMatrixFactory:
 
         Parameters
         ----------
-        unw : np.ndarray (n_pairs, n_pixels)
+        unw : NDArray (n_pairs, n_pixels)
             Unwrapped interferograms matrix
         pairs : Pairs | Iterable[str]
             Pairs or iterable of pair names
@@ -133,26 +134,26 @@ class NSBASMatrixFactory:
         return _str
 
     @property
-    def pairs(self):
+    def pairs(self) -> Pairs:
         """Return pairs"""
         return self._pairs
 
     @property
-    def model(self):
+    def model(self) -> Optional[TimeSeriesModels]:
         """Return model"""
         return self._model
 
-    def _check_model(self, model):
+    def _check_model(self, model) -> None:
         """Check model"""
         if not isinstance(model, TimeSeriesModels):
             raise TypeError("model must be a TimeSeriesModels instance")
 
     @property
-    def gamma(self):
+    def gamma(self) -> float:
         """Return gamma"""
         return self._gamma
 
-    def _check_gamma(self, gamma):
+    def _check_gamma(self, gamma) -> None:
         """Update gamma and G by input gamma"""
         if not isinstance(gamma, (float, int)):
             raise TypeError("gamma must be either float or int")
@@ -160,7 +161,7 @@ class NSBASMatrixFactory:
             raise ValueError("gamma must be positive")
 
     @property
-    def d(self):
+    def d(self) -> NDArray[np.float32 | np.float64]:
         """Return ``d`` matrix for NSBAS ``d = Gm``"""
         return self._d
 
@@ -180,7 +181,7 @@ class NSBASMatrixFactory:
             self._d = self._restructure_unw(unw)
 
     @property
-    def G(self):
+    def G(self) -> NDArray[np.float32]:
         """Return ``G`` matrix for NSBAS ``d = Gm``"""
         return self._G
 
@@ -199,8 +200,8 @@ class NSBASMatrixFactory:
 
         self._G = G
 
-    def _make_nsbas_matrix(self, G_br, gamma):
-        G_br = np.asarray(G_br)
+    def _make_nsbas_matrix(self, G_br, gamma) -> NDArray[np.float32]:
+        G_br = np.asarray(G_br, dtype=np.float32)
         G_tl = self.pairs.to_matrix()
 
         if len(G_br.shape) == 1:
@@ -218,7 +219,7 @@ class NSBASMatrixFactory:
     def _make_sbas_matrix(self):
         return self.pairs.to_matrix()
 
-    def _restructure_unw(self, unw):
+    def _restructure_unw(self, unw) -> NDArray[np.float32 | np.float64]:
         if self.model is not None:
             unw = np.vstack((unw, np.zeros((len(self.pairs.dates), unw.shape[1]))))
         return unw
@@ -268,7 +269,14 @@ class NSBASInversion:
     def __str__(self):
         return f"{self.__class__.__name__}()"
 
-    def inverse(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def inverse(
+        self,
+    ) -> Tuple[
+        NDArray[np.floating],
+        NDArray[np.floating],
+        NDArray[np.floating],
+        NDArray[np.floating],
+    ]:
         """Calculate increment displacement difference by NSBAS inversion.
 
         Returns
@@ -337,15 +345,17 @@ class PhaseDeformationConverter:
     def __repr__(self) -> str:
         return str(self)
 
-    def phase2deformation(self, phase: np.ndarray):
+    def phase2deformation(self, phase: NDArray[np.floating]) -> NDArray[np.floating]:
         """Convert phase to deformation (mm)"""
         return phase * self.coef_rd2mm
 
-    def deformation2phase(self, deformation: np.ndarray):
+    def deformation2phase(
+        self, deformation: NDArray[np.floating]
+    ) -> NDArray[np.floating]:
         """Convert deformation (mm) to phase (radian)"""
         return deformation / self.coef_rd2mm
 
-    def wrap_phase(self, phase: np.ndarray):
+    def wrap_phase(self, phase: NDArray[np.floating]) -> NDArray[np.floating]:
         """Wrap phase to [0, 2π]"""
         return np.mod(phase, 2 * np.pi)
 
@@ -424,7 +434,7 @@ def batch_lstsq(
     device: Optional[str | torch.device] = None,
     verbose: bool = True,
     tqdm_args: dict = {},
-):
+) -> NDArray[np.floating]:
     """This function calculates the least-squares solution for a batch of linear
     equations using the given G matrix and the data in d.
 
@@ -474,7 +484,7 @@ def batch_lstsq(
             )
         else:
             raise ValueError("Dimension of G must be 2 or 3")
-    return result
+    return result.numpy()
 
 
 def censored_lstsq(
@@ -482,7 +492,7 @@ def censored_lstsq(
     d: np.ndarray | torch.Tensor,
     dtype: torch.dtype = torch.float64,
     device: Optional[str | torch.device] = None,
-) -> torch.Tensor:
+) -> NDArray[np.floating]:
     """Solves least squares problem subject to missing data.
     Reference: http://alexhwilliams.info/itsneuronalblog/2018/02/26/censored-lstsq/
 
@@ -490,24 +500,24 @@ def censored_lstsq(
         This function is used for solving the least squares problem with **missing
         data**. The missing data is represented by nan values in the data matrix
         ``d``. If there are no nan values in d, you are recommended to use
-        ``torch.linalg.lstsq`` instead.
+        :func:`torch.linalg.lstsq` instead.
 
     Parameters
     ----------
-    G : np.ndarray | torch.Tensor, (n_im, n_param) or (n_pt, n_im, n_param)
-        model field matrix. If G is 3D, the first dimension is the G matrix for
-        each pixel.
+    G : np.ndarray | torch.Tensor,
+        model field matrix in shape of (n_im, n_param) or (n_pt, n_im, n_param).
+        If G is 3D, the first dimension is the G matrix for each pixel.
     d : np.ndarray | torch.Tensor, (n_im, n_pt) matrix
         data field matrix.
     dtype : torch.dtype
         dtype of torch.tensor used for computation.
     device : Optional[str | torch.device]
         device of torch.tensor used for computation. If None, use GPU if
-            available, otherwise use CPU.
+        available, otherwise use CPU.
 
     Returns
     -------
-    X : torch.Tensor
+    X : np.ndarray
         (n_im x n_pt) matrix that minimizes norm(M*(GX - d))
     """
     device = parse_device(device)
@@ -550,9 +560,9 @@ def censored_lstsq(
             torch.cuda.empty_cache()
         elif device_type == "mps":
             torch.mps.empty_cache()
-        return X_np
+        return X_np.numpy()
     else:
-        return X
+        return X.numpy()
 
 
 def calculate_u(
@@ -560,14 +570,14 @@ def calculate_u(
     unw_phases: np.ndarray,
     device: Optional[str | torch.device] = None,
     dtype: torch.dtype = torch.float64,
-) -> np.ndarray:
+) -> NDArray[np.floating]:
     """Calculate correction matrix u by loop closure phase using least square.
-    More details see paper: TODO add paper link.
+    More details see paper:
 
     .. tip::
         The pairs in the loops may be fewer than the input pairs. To make sure
         the pairs in the loops are the same as the pairs in the unw_phases, you
-        You can use the :meth:`Pairs.where` method to get the index/mask of the
+        can use the :meth:`.Pairs.where` method to get the index/mask of the
         pairs in the loops from the input pairs.
 
     Parameters
@@ -586,13 +596,13 @@ def calculate_u(
     Examples
     --------
     get the loops from the pairs:
-    
-    >>> loops = pairs.to_loops() 
+
+    >>> loops = pairs.to_loops()
     >>> idx = pairs.where(loops.pairs) # get the index of the pairs in the loops from the input pairs
     >>> unw_used = unw[idx]
-    
+
     calculate u by loops and unwrapped interferometric phases:
-    
+
     >>> u = np.zeros_like(unw, dtype=np.float32)
     >>> u[idx] = NSBAS.calculate_u(loops, unw_used)
     """
@@ -603,7 +613,7 @@ def calculate_u(
 
     # edge pairs are not contributing to the loop closure phase, remove them
     # from the matrix C to avoid being involved in the calculation of u
-    mask = np.in1d(loops.pairs.names, loops.edge_pairs.names)
+    mask = loops.pairs.where(loops.diagonal_pairs)
     Cc = C[:, mask]
 
     u = np.zeros_like(unw_phases)

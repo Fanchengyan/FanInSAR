@@ -1,6 +1,11 @@
 Pairs and Loops
 ===============
 
+.. autoclass:: faninsar.Pair
+   :members:
+   :undoc-members:
+   :member-order: bysource
+   :show-inheritance:
 
 .. autoclass:: faninsar.Pairs
    :members:
@@ -9,6 +14,12 @@ Pairs and Loops
    :show-inheritance:
 
 .. autoclass:: faninsar.Loop
+   :members:
+   :undoc-members:
+   :member-order: bysource
+   :show-inheritance:
+
+.. autoclass:: faninsar.Loops
    :members:
    :undoc-members:
    :member-order: bysource

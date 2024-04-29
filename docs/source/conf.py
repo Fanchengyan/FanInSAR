@@ -41,7 +41,7 @@ exclude_patterns = []
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = "pydata_sphinx_theme"
-html_static_path = ['_static']
+html_static_path = ["_static"]
 html_logo = "_static/logo/logo.png"
 
 html_theme_options = {
@@ -99,6 +99,10 @@ intersphinx_mapping = {
     "matplotlib": (
         "https://matplotlib.org/stable/",
         "https://matplotlib.org/stable/objects.inv",
+    ),
+    "numpy": (
+        "https://numpy.org/doc/stable/",
+        "https://numpy.org/doc/stable/objects.inv",
     ),
     "pandas": (
         "https://pandas.pydata.org/pandas-docs/stable/",
