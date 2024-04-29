@@ -3,7 +3,7 @@ from faninsar.NSBAS.inversion import (
     NSBASMatrixFactory,
     PhaseDeformationConverter,
     batch_lstsq,
-    calculate_U,
+    calculate_u,
     censored_lstsq,
 )
 from faninsar.NSBAS.tsmodels import (
