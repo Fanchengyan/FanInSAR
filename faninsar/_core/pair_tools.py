@@ -192,7 +192,7 @@ class Pairs:
     _dates: np.ndarray
     _length: int
 
-    __slots__ = ["_values", "_dates", "_length", "_edge_index"]
+    __slots__ = ["_values", "_dates", "_length", "_edge_index", "_names"]
 
     def __init__(
         self,
@@ -217,12 +217,16 @@ class Pairs:
         _values = np.array(pairs, dtype="M8[D]")
 
         self._values = _values
-        self._dates = np.unique(_values.flatten())
-        self._length = self._values.shape[0]
-        self._edge_index = np.searchsorted(self._dates, self._values)
+        self._parse_pair_meta()
 
         if sort:
             self.sort(inplace=True)
+
+    def _parse_pair_meta(self):
+        self._dates = np.unique(self._values.flatten())
+        self._length = self._values.shape[0]
+        self._edge_index = np.searchsorted(self._dates, self._values)
+        self._names = self.to_names()
 
     def __len__(self) -> int:
         return self._length
@@ -237,12 +241,12 @@ class Pairs:
         return np.array_equal(self.values, other.values)
 
     def __add__(self, other: "Pairs") -> "Pairs":
-        _pairs = np.union1d(self.to_names(), other.to_names())
+        _pairs = np.union1d(self.names, other.names)
         if len(_pairs) > 0:
             return Pairs.from_names(_pairs)
 
     def __sub__(self, other: "Pairs") -> "Pairs":
-        _pairs = np.setdiff1d(self.to_names(), other.to_names())
+        _pairs = np.setdiff1d(self.names, other.names)
         if len(_pairs) > 0:
             return Pairs.from_names(_pairs)
 
@@ -316,7 +320,7 @@ class Pairs:
             )
 
     def __hash__(self) -> int:
-        return hash("".join(self.to_names()))
+        return hash("".join(self.names))
 
     def __iter__(self):
         pairs_ls = [Pair(i) for i in self._values]
@@ -369,6 +373,11 @@ class Pairs:
     def values(self) -> np.ndarray:
         """return the pairs array in type of np.datetime64[D]"""
         return self._values
+
+    @property
+    def names(self) -> np.ndarray:
+        """return the names (string format) of the pairs"""
+        return self._names
 
     @property
     def dates(self) -> pd.DatetimeIndex:
@@ -433,8 +442,8 @@ class Pairs:
         """initialize the pair class from a pair name
 
         .. note::
-            The pairs will be in the order of the input names. If you want to 
-            sort the pairs, you can call the :meth:`Pairs.sort()` method to 
+            The pairs will be in the order of the input names. If you want to
+            sort the pairs, you can call the :meth:`Pairs.sort()` method to
             achieve it.
 
         Parameters
@@ -493,7 +502,7 @@ class Pairs:
             Whether to return the index or mask of the pairs. Default is 'index'.
         """
         pairs = self._ensure_pairs(pairs)
-        con = np.isin(self.to_names(), pairs.to_names())
+        con = np.isin(self.names, pairs.names)
         if return_type == "mask":
             return con
         elif return_type == "index":
@@ -592,9 +601,7 @@ class Pairs:
             _index = _index[::-1]
         if inplace:
             self._values = _values
-            self._dates = np.unique(self._values)
-            self._edge_index = np.searchsorted(self._dates, self._values)
-            self._length = self._values.shape[0]
+            self._parse_pair_meta()
         else:
             return Pairs(_values), _index
 
@@ -864,12 +871,12 @@ class TripletLoops:
         loops: Iterable[Iterable[datetime, datetime, datetime]] | Iterable[TripletLoop],
         sort: bool = True,
     ) -> None:
-        """initialize the loops class
+        """initialize the triplet loops class
 
         Parameters
         ----------
         loops: Iterable
-            Iterable object of loops. Each loop is an Iterable object
+            Iterable object of triplet loops. Each loop is an Iterable object
             of three dates with format of datetime or TripletLoop object.
             For example, [(date1, date2, date3), ...].
         """
@@ -877,13 +884,16 @@ class TripletLoops:
             raise ValueError("loops cannot be None.")
 
         _values = np.array(loops, dtype="M8[D]")
-
         self._values = _values
-        self._dates = np.unique(_values)
-        self._length = self._values.shape[0]
+        self._parse_loop_meta()
 
         if sort:
             self.sort(inplace=True)
+
+    def _parse_loop_meta(self):
+        self._dates = np.unique(self._values)
+        self._length = self._values.shape[0]
+        self._names = self.to_names()
 
     def __str__(self) -> str:
         return f"TripletLoops({self._length})"
@@ -898,11 +908,11 @@ class TripletLoops:
         return np.array_equal(self.values, other.values)
 
     def __add__(self, other: "TripletLoops") -> "TripletLoops":
-        _loops = np.union1d(self.to_names(), other.to_names())
+        _loops = np.union1d(self.names, other.names)
         return TripletLoops.from_names(_loops)
 
     def __sub__(self, other: "TripletLoops") -> Optional["TripletLoops"]:
-        _loops = np.setdiff1d(self.to_names(), other.to_names())
+        _loops = np.setdiff1d(self.names, other.names)
         if len(_loops) > 0:
             return TripletLoops.from_names(_loops)
 
@@ -976,7 +986,7 @@ class TripletLoops:
             )
 
     def __hash__(self) -> int:
-        return hash("".join(self.to_names()))
+        return hash("".join(self.names))
 
     def __iter__(self):
         return iter(self.values)
@@ -1010,30 +1020,23 @@ class TripletLoops:
         return self._values
 
     @property
-    def dates(self) -> np.ndarray:
-        """return the sorted dates of the loops.
+    def names(self) -> np.ndarray:
+        """the names (sting format) of the loops."""
+        return self._names
 
-        Returns
-        -------
-        dates: np.ndarray
-            Sorted dates of the loops with format of datetime.
-        """
+    @property
+    def dates(self) -> np.ndarray:
+        """Sorted dates of the loops with format of datetime."""
         return self._dates
 
     @property
     def shape(self) -> tuple[int, int]:
-        """return the shape of the loop array"""
+        """the shape of the loop array"""
         return self._values.shape
 
     @property
     def pairs(self) -> Pairs:
-        """return the sorted all pairs of the loops.
-
-        Returns
-        -------
-        pairs: Pairs
-            Pairs of the loops.
-        """
+        """all sorted pairs of the loops."""
         pairs = np.unique(
             np.vstack(
                 [self._values[:, :2], self._values[:, 1:], self._values[:, [0, 2]]]
@@ -1044,79 +1047,37 @@ class TripletLoops:
 
     @property
     def pairs12(self) -> Pairs:
-        """return the first pairs of the loops.
-
-        Returns
-        -------
-        pairs12: Pairs
-            First pairs of the loops.
-        """
+        """the first pairs of the loops."""
         return Pairs(self._values[:, :2], sort=False)
 
     @property
     def pairs23(self) -> Pairs:
-        """return the second pairs of the loops.
-
-        Returns
-        -------
-        pairs23: Pairs
-            Second pairs of the loops.
-        """
+        """the second pairs of the loops."""
         return Pairs(self._values[:, 1:], sort=False)
 
     @property
     def pairs13(self) -> Pairs:
-        """return the third pairs of the loops.
-
-        Returns
-        -------
-        pairs13: Pairs
-            Third pairs of the loops.
-        """
+        """the third pairs of the loops."""
         return Pairs(self._values[:, [0, 2]], sort=False)
 
     @property
     def days12(self) -> np.ndarray:
-        """return the time span of the first pair in days.
-
-        Returns
-        -------
-        days12: np.ndarray
-            Time span of the first pair in days.
-        """
+        """the time span of the first pair in days."""
         return (self._values[:, 1] - self._values[:, 0]).astype(int)
 
     @property
     def days23(self) -> np.ndarray:
-        """return the time span of the second pair in days.
-
-        Returns
-        -------
-        days23: np.ndarray
-            Time span of the second pair in days.
-        """
+        """the time span of the second pair in days."""
         return (self._values[:, 2] - self._values[:, 1]).astype(int)
 
     @property
     def days13(self) -> np.ndarray:
-        """return the time span of the third pair in days.
-
-        Returns
-        -------
-        days13: np.ndarray
-            Time span of the third pair in days.
-        """
+        """the time span of the third pair in days."""
         return (self._values[:, 2] - self._values[:, 0]).astype(int)
 
     @property
     def index(self) -> np.ndarray:
-        """return the index of the loops in dates coordinates.
-
-        Returns
-        -------
-        index: np.ndarray
-            Index of the loops in dates coordinates.
-        """
+        """the index of the loops in dates coordinates."""
         return np.searchsorted(self._dates, self._values)
 
     @classmethod
@@ -1306,8 +1267,7 @@ class TripletLoops:
             _index = _index[::-1]
         if inplace:
             self._values = self._values[_index]
-            self._dates = np.unique(self._values)
-            self._length = self._values.shape[0]
+            self._parse_loop_meta()
         else:
             return TripletLoops(self._values[_index]), _index
 
@@ -1446,11 +1406,15 @@ class Loops:
             Whether to sort the loops. Default is True.
         """
         self._loops = np.array(loops, dtype=object)
-        self._length = len(self._loops)
-        self._pairs, self._edge_pairs, self._diagonal_pairs = self._parse_pairs()
+        self._parse_loop_meta()
 
         if sort:
             self.sort()
+
+    def _parse_loop_meta(self) -> None:
+        self._length = len(self._loops)
+        self._names = np.array([i.name for i in self.loops])
+        self._pairs, self._edge_pairs, self._diagonal_pairs = self._parse_pairs()
 
     def __str__(self) -> str:
         return f"Loops({len(self)})"
@@ -1495,6 +1459,11 @@ class Loops:
         return self._loops
 
     @property
+    def names(self) -> np.ndarray:
+        """return the names (str format) of the loops."""
+        return self._names
+
+    @property
     def pairs(self) -> Pairs:
         """all pairs in the loops."""
         return self._pairs
@@ -1519,28 +1488,23 @@ class Loops:
         inplace: bool, optional
             Whether to sort the loops in place. if False, return the sorted loops. Default is True.
         """
-        names = self.to_names()
+        names = self.names
         _, _index = np.unique(names, return_index=True)
         if not ascending:
             _index = _index[::-1]
         if inplace:
             self._loops = self._loops[_index]
-            self._length = len(self._loops)
-            self._pairs, self._edge_pairs, self._diagonal_pairs = self._parse_pairs()
+            self._parse_loop_meta()
         else:
             return Loops(self._loops[_index])
-
-    def to_names(self) -> np.ndarray:
-        """return the names (str format) of the loops."""
-        return np.array([i.name for i in self.loops])
 
     def to_matrix(self, dtype=None) -> np.ndarray:
         """return a design matrix which rows and columns are loops and pairs
         respectively. The values of the matrix are 1 for the edge pairs, -1 for
         the diagonal pairs, and 0 otherwise.
         """
-        loop_pairs_ls = [i.pairs.to_names() for i in self.loops]
-        all_pairs = self.pairs.to_names()
+        loop_pairs_ls = [i.pairs.names for i in self.loops]
+        all_pairs = self.pairs.names
         matrix = np.zeros((len(self), len(self.pairs)), dtype=dtype)
         for i, loop_pairs in enumerate(loop_pairs_ls):
             matrix[i][np.in1d(all_pairs, loop_pairs[:-1])] = 1
