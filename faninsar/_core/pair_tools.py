@@ -51,45 +51,27 @@ class Pair:
 
     @property
     def values(self):
-        """return the values of the pair.
-
-        Returns
-        -------
-        values: np.ndarray
-            Values of the pair with format of datetime.
-        """
+        """the values of the pair with format of datetime."""
         return self._values
 
     @property
     def name(self):
-        """return the string of the pair.
-
-        Returns
-        -------
-        name: str
-            String of the pair with format of '%Y%m%d_%Y%m%d'.
-        """
+        """String of the pair with format of '%Y%m%d_%Y%m%d'."""
         return self._name
 
     @property
     def days(self):
-        """return the time span of the pair in days.
-
-        Returns
-        -------
-        days: int
-            Time span of the pair in days.
-        """
+        """the time span of the pair in days."""
         return self._days
 
     @property
     def primary(self) -> np.ndarray:
-        """return the primary dates of all pairs"""
+        """the primary dates of all pairs"""
         return self.values[0]
 
     @property
     def secondary(self) -> np.ndarray:
-        """return the secondary dates of all pairs"""
+        """the secondary dates of all pairs"""
         return self.values[1]
 
     def primary_string(self, date_format="%Y%m%d") -> np.ndarray:
@@ -119,7 +101,7 @@ class Pair:
         cls,
         name: str,
         parse_function: Optional[Callable] = None,
-        date_args: Optional[dict] = None,
+        date_args: dict = {},
     ) -> "Pair":
         """initialize the pair class from a pair name
 
@@ -134,7 +116,7 @@ class Pair:
         date_args: dict, optional
             Keyword arguments for pd.to_datetime() to convert the date strings
             to datetime objects. For example, {'format': '%Y%m%d'}.
-            Default is None.
+            Default is {}.
 
         Returns
         -------
@@ -446,9 +428,14 @@ class Pairs:
         cls,
         names: Iterable[str],
         parse_function: Optional[Callable] = None,
-        date_args: Optional[dict] = None,
+        date_args: dict = {},
     ) -> "Pairs":
         """initialize the pair class from a pair name
+
+        .. note::
+            The pairs will be in the order of the input names. If you want to 
+            sort the pairs, you can call the :meth:`Pairs.sort()` method to 
+            achieve it.
 
         Parameters
         ----------
@@ -461,7 +448,7 @@ class Pairs:
         date_args: dict, optional
             Keyword arguments for pd.to_datetime() to convert the date strings
             to datetime objects. For example, {'format': '%Y%m%d'}.
-            Default is None.
+            Default is {}.
 
         Returns
         -------
@@ -695,7 +682,7 @@ class Pairs:
                 self, loops, loop, pairs_primary, end_date, edge_days, max_acquisition
             )
 
-        return loops
+        return Loops(loops)
 
     def to_matrix(self) -> np.ndarray:
         """return the SBAS matrix
@@ -837,7 +824,7 @@ class TripletLoop:
         cls,
         name: str,
         parse_function: Optional[Callable] = None,
-        date_args: Optional[dict] = None,
+        date_args: dict = {},
     ) -> "TripletLoop":
         """initialize the loop class from a loop name
 
@@ -852,7 +839,7 @@ class TripletLoop:
         date_args: dict, optional
             Keyword arguments for pd.to_datetime() to convert the
             date strings to datetime objects. For example,
-            {'format': '%Y%m%d'}. Default is None.
+            {'format': '%Y%m%d'}. Default is {}.
 
         Returns
         -------
@@ -1137,7 +1124,7 @@ class TripletLoops:
         cls,
         names: list[str],
         parse_function: Optional[Callable] = None,
-        date_args: Optional[dict] = None,
+        date_args: dict = {},
     ) -> "TripletLoops":
         """initialize the loops class from a list of loop file names.
 
@@ -1152,7 +1139,7 @@ class TripletLoops:
         date_args: dict, optional
             Keyword arguments for pd.to_datetime() to convert the date strings
             to datetime objects. For example, {'format': '%Y%m%d'}.
-            Default is None.
+            Default is {}.
 
         Returns
         -------
@@ -1352,17 +1339,13 @@ class TripletLoops:
 class Loop:
     """Loop class containing multiple pairs/acquisitions."""
 
-    def __init__(self, loop: Iterable[datetime], loops_paris: Pairs) -> None:
+    def __init__(self, loop: Iterable[datetime]) -> None:
         """Initialize the Loop class
 
         loop: Iterable
             Iterable object of dates. Each date is a datetime object.
             For example, (date1, ..., date_n).
-        loops_paris: Pairs
-            all pairs of the loops. used to generate the loop matrix.
         """
-        self._loops_pairs = loops_paris
-
         self._values = np.asarray(loop).astype("M8[D]")
         loop_dt = self._values.astype(datetime)
         self._name = "_".join([i.strftime("%Y%m%d") for i in loop_dt])
@@ -1392,12 +1375,6 @@ class Loop:
     def __hash__(self) -> int:
         return hash(self.name)
 
-    def __array__(self, dtype=None) -> np.ndarray:
-        """return the loop matrix"""
-        matrix = np.isin(self.loops_pairs.to_names(), self.pairs.to_names()).astype(int)
-        matrix[self.loops_pairs.where(self.pairs[-1])] = -1
-        return np.array(matrix, dtype=dtype)
-
     @property
     def values(self) -> np.ndarray:
         """return the values array of the loop.
@@ -1411,18 +1388,12 @@ class Loop:
 
     @property
     def pairs(self) -> Pairs:
-        """return all pairs of the loop.
-
-        Returns
-        -------
-        pairs: Pairs
-            Pairs of the loop.
-        """
+        """all pairs of the loop."""
         return self._pairs
 
     @property
     def name(self) -> str:
-        """return the string format the loop.
+        """the string format the loop.
 
         Returns
         -------
@@ -1431,26 +1402,64 @@ class Loop:
         """
         return self._name
 
-    @property
-    def loops_pairs(self) -> str:
-        """return all pairs of the loop.
+    def from_name(
+        cls,
+        name: str,
+        parse_function: Optional[Callable] = None,
+        date_args: dict = {},
+    ) -> "Loop":
+        """initialize the loop class from a loop name
+
+        Parameters
+        ----------
+        name: str
+            Loop name.
+        parse_function: Callable, optional
+            Function to parse the date strings from the loop name.
+            If None, the loop name will be split by '_' and the
+            last 3 items will be used. Default is None.
+        date_args: dict, optional
+            Keyword arguments for pd.to_datetime() to convert the date strings
+            to datetime objects. For example, {'format': '%Y%m%d'}.
+            Default is None.
 
         Returns
         -------
-        pairs: Pairs
-            Pairs of the loop.
+        loop: Loop
+            Loop object.
         """
-        return self._loops_pairs
+        dates = DateManager.str_to_dates(name, 0, parse_function, date_args)
+        return cls(dates)
 
 
 class Loops:
     """Loops class to handle loops with multiple acquisitions."""
 
-    def __init__(self, loops: list) -> None:
-        self._loops = np.unique(loops)
+    def __init__(self, loops: list, sort=True) -> None:
+        """initialize the loops class
+
+        Parameters
+        ----------
+        loops: list
+            a list containing Loop objects.
+        sort: bool, optional
+            Whether to sort the loops. Default is True.
+        """
+        self._loops = np.array(loops, dtype=object)
+        self._length = len(self._loops)
+        self._pairs, self._edge_pairs, self._diagonal_pairs = self._parse_pairs()
+
+        if sort:
+            self.sort()
+
+    def __str__(self) -> str:
+        return f"Loops({len(self)})"
+
+    def __repr__(self) -> str:
+        return f"Loops({len(self)})"
 
     def __len__(self) -> int:
-        return len(self.loops)
+        return self._length
 
     def __getitem__(self, index: int) -> Loop:
         return self.loops[index]
@@ -1461,8 +1470,82 @@ class Loops:
     def __contains__(self, item: Loop) -> bool:
         return item in self.loops
 
-    def __add__(self, other: "Loops") -> "Loops":
-        return Loops(self._loops + other._loops)
+    def _parse_pairs(self) -> tuple[Pairs, Pairs, Pairs]:
+        """parse the pairs in the loops
+
+        Returns
+        -------
+        (Pairs, Pairs, Pairs) : all pairs, edge pairs, and diagonal pairs
+        """
+        pairs = []
+        edge_pairs = []
+        diagonal_pairs = []
+        for loop in self.loops:
+            pairs.extend(loop.pairs)
+            edge_pairs.extend(loop.pairs[:-1])
+            diagonal_pairs.extend(loop.pairs[-1:])
+        return (
+            Pairs(pairs, sort=True),
+            Pairs(edge_pairs, sort=True),
+            Pairs(diagonal_pairs, sort=True),
+        )
+
+    @property
+    def loops(self) -> np.ndarray:
+        return self._loops
+
+    @property
+    def pairs(self) -> Pairs:
+        """all pairs in the loops."""
+        return self._pairs
+
+    @property
+    def edge_pairs(self) -> Pairs:
+        """all edge pairs in the loops."""
+        return self._edge_pairs
+
+    @property
+    def diagonal_pairs(self) -> Pairs:
+        """all diagonal pairs in the loops."""
+        return self._diagonal_pairs
+
+    def sort(self, ascending: bool = True, inplace: bool = True) -> "Loops" | None:
+        """sort the loops
+
+        Parameters
+        ----------
+        ascending: bool, optional
+            Whether to sort the loops ascending. Default is True.
+        inplace: bool, optional
+            Whether to sort the loops in place. if False, return the sorted loops. Default is True.
+        """
+        names = self.to_names()
+        _, _index = np.unique(names, return_index=True)
+        if not ascending:
+            _index = _index[::-1]
+        if inplace:
+            self._loops = self._loops[_index]
+            self._length = len(self._loops)
+            self._pairs, self._edge_pairs, self._diagonal_pairs = self._parse_pairs()
+        else:
+            return Loops(self._loops[_index])
+
+    def to_names(self) -> np.ndarray:
+        """return the names (str format) of the loops."""
+        return np.array([i.name for i in self.loops])
+
+    def to_matrix(self, dtype=None) -> np.ndarray:
+        """return a design matrix which rows and columns are loops and pairs
+        respectively. The values of the matrix are 1 for the edge pairs, -1 for
+        the diagonal pairs, and 0 otherwise.
+        """
+        loop_pairs_ls = [i.pairs.to_names() for i in self.loops]
+        all_pairs = self.pairs.to_names()
+        matrix = np.zeros((len(self), len(self.pairs)), dtype=dtype)
+        for i, loop_pairs in enumerate(loop_pairs_ls):
+            matrix[i][np.in1d(all_pairs, loop_pairs[:-1])] = 1
+            matrix[i][np.in1d(all_pairs, loop_pairs[-1])] = -1
+        return matrix
 
 
 class SBASNetwork:
@@ -1589,7 +1672,7 @@ class SBASNetwork:
         cls,
         names: list[str],
         parse_function: Optional[Callable] = None,
-        date_args: Optional[dict] = None,
+        date_args: dict = None,
     ) -> "SBASNetwork":
         """initialize SBASNetwork class from a list of pair names
 
@@ -1992,9 +2075,9 @@ class DateManager:
     @staticmethod
     def str_to_dates(
         date_str: str,
-        length: int = 2,
+        length: Optional[int] = 2,
         parse_function: Optional[Callable] = None,
-        date_args: Optional[dict] = None,
+        date_args: dict = {},
     ):
         """convert date string to dates
 
@@ -2003,7 +2086,8 @@ class DateManager:
         date_str: str
             Date string containing dates.
         length: int, optional
-            Length/number of dates in the date string. Default is 2.
+            Length/number of dates in the date string. if 0, all dates in the
+            date string will be used. Default is 2.
         parse_function: Callable, optional
             Function to parse the date strings from the date string.
             If None, the date string will be split by '_' and the
@@ -2011,7 +2095,7 @@ class DateManager:
         date_args: dict, optional
             Keyword arguments for pd.to_datetime() to convert the date strings
             to datetime objects. For example, {'format': '%Y%m%d'}.
-            Default is None.
+            Default is {}.
         """
         if parse_function is not None:
             dates = parse_function(date_str)
@@ -2024,10 +2108,7 @@ class DateManager:
                     f"The number of dates in {date_str} is less than {length}."
                 )
 
-        if date_args is None:
-            date_args = {}
         date_args.update({"errors": "raise"})
-
         try:
             dates = [pd.to_datetime(i, **date_args) for i in dates_ls]
         except:
@@ -2064,7 +2145,7 @@ def find_loops(
                 if pair_middle.days > edge_days:
                     continue
                 loop_i.append(pair_middle.secondary)
-                loops.append(Loop(loop_i, loops_pairs))
+                loops.append(Loop(loop_i))
             else:
                 # +1 for end pair
                 if len(loop_i) + 1 < max_acquisition:
