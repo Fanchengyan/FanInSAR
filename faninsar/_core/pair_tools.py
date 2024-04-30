@@ -133,60 +133,58 @@ class Pairs:
 
     Examples
     --------
-    ::
+    prepare dates and pairs for examples:
 
-        prepare dates and pairs for examples:
+    >>> dates = pd.date_range('20130101', '20231231').values
+    >>> n = len(dates)
+    >>> pair_ls = []
+    >>> loop_ls = []
+    >>> for i in range(5):
+    ...    np.random.seed(i)
+    ...    pair_ls.append(dates[np.random.randint(0, n, 2)])
 
-        >>> dates = pd.date_range('20130101', '20231231').values
-        >>> n = len(dates)
-        >>> pair_ls = []
-        >>> loop_ls = []
-        >>> for i in range(5):
-        ...    np.random.seed(i)
-        ...    pair_ls.append(dates[np.random.randint(0, n, 2)])
+    initialize pairs from a list of pairs
 
-        initialize pairs from a list of pairs
+    >>> pairs = Pairs(pair_ls)
+    >>> print(pairs)
+        primary  secondary
+    0 2013-06-24 2016-02-21
+    1 2013-08-24 2015-11-28
+    2 2017-08-16 2018-03-14
+    3 2020-01-20 2021-11-15
+    4 2020-02-21 2020-06-25
 
-        >>> pairs = Pairs(pair_ls)
-        >>> print(pairs)
-            primary  secondary
-        0 2013-06-24 2016-02-21
-        1 2013-08-24 2015-11-28
-        2 2017-08-16 2018-03-14
-        3 2020-01-20 2021-11-15
-        4 2020-02-21 2020-06-25
+    select pairs by date slice
 
-        select pairs by date slice
+    >>> pairs1 = pairs['2018-03-09':]
+    >>> print(pairs1)
+        primary  secondary
+    0 2020-01-20 2021-11-15
+    1 2020-02-21 2020-06-25
 
-        >>> pairs1 = pairs['2018-03-09':]
-        >>> print(pairs1)
-            primary  secondary
-        0 2020-01-20 2021-11-15
-        1 2020-02-21 2020-06-25
+    pairs can be added (union)  and subtracted (difference)
 
-        pairs can be added (union)  and subtracted (difference)
+    >>> pairs2 = pairs - pairs1
+    >>> pairs3 = pairs1 + pairs2
+    >>> print(pairs2)
+        primary  secondary
+    0 2013-06-24 2016-02-21
+    1 2013-08-24 2015-11-28
+    2 2017-08-16 2018-03-14
+    >>> print(pairs3)
+        primary  secondary
+    0 2013-06-24 2016-02-21
+    1 2013-08-24 2015-11-28
+    2 2017-08-16 2018-03-14
+    3 2020-01-20 2021-11-15
+    4 2020-02-21 2020-06-25
 
-        >>> pairs2 = pairs - pairs1
-        >>> pairs3 = pairs1 + pairs2
-        >>> print(pairs2)
-            primary  secondary
-        0 2013-06-24 2016-02-21
-        1 2013-08-24 2015-11-28
-        2 2017-08-16 2018-03-14
-        >>> print(pairs3)
-            primary  secondary
-        0 2013-06-24 2016-02-21
-        1 2013-08-24 2015-11-28
-        2 2017-08-16 2018-03-14
-        3 2020-01-20 2021-11-15
-        4 2020-02-21 2020-06-25
+    pairs can be compared with `==`and `!=`
 
-        pairs can be compared with `==`and `!=`
-
-        >>> print(pairs3 == pairs)
-        >>> print(pairs3 != pairs)
-        True
-        False
+    >>> print(pairs3 == pairs)
+    >>> print(pairs3 != pairs)
+    True
+    False
     """
 
     _values: np.ndarray
@@ -1497,14 +1495,14 @@ class SBASNetwork:
 
     Examples
     --------
-    ::
-        initialize SBASNetwork class from Pairs object named pairs
 
-        >>> sbas = SBASNetwork(pairs)
+    initialize SBASNetwork class from Pairs object named pairs
 
-        get pairs that are not in the loops
+    >>> sbas = SBASNetwork(pairs)
 
-        >>> pairs_alone = sbas.pairs - sbas.loops.pairs
+    get pairs that are not in the loops
+
+    >>> pairs_alone = sbas.pairs - sbas.loops.pairs
     """
 
     _pairs: Pairs
