@@ -10,11 +10,11 @@ from rasterio.warp import transform_bounds
 
 class BoundingBox:
     """a class used for indexing datasets using a spatial bounding box.
-    
+
     Note:
         This class is a modified version of the BoundingBox class from the torchgeo package.
         The main modifications include:
-        
+
         - Removal of ``date bounds``
         - Change of the bounding box to (left, bottom, right, top), which aligns with the :class:`rasterio.coords.BoundingBox` class.
         - Addition of the CRS attribute to automatically convert the bounding box to the CRS of the dataset.
@@ -34,10 +34,10 @@ class BoundingBox:
         ----------
         left : float
             The western boundary.
-        right : float
-            The eastern boundary.
         bottom : float
             The southern boundary.
+        right : float
+            The eastern boundary.
         top : float
             The northern boundary.
         crs : CRS | str | None, optional
