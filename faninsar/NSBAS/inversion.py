@@ -434,7 +434,8 @@ def batch_lstsq(
     device: Optional[str | torch.device] = None,
     verbose: bool = True,
     tqdm_args: dict = {},
-) -> NDArray[np.floating]:
+    return_numpy: bool = True,
+) -> NDArray[np.floating] | torch.Tensor:
     """This function calculates the least-squares solution for a batch of linear
     equations using the given G matrix and the data in d.
 
@@ -455,11 +456,14 @@ def batch_lstsq(
     tqdm_args : dict, optional
         Arguments to be passed to `tqdm.tqdm <https://tqdm.github.io/docs/tqdm#tqdm-objects>`_
         Object for progress bar.
+    return_numpy : bool, optional
+        If True, return a numpy array, otherwise return a torch tensor.
 
     Returns
     -------
-    X : torch.Tensor
-        (n_im x n_pt) matrix that minimizes norm(M*(GX - d))
+    X : np.ndarray | torch.Tensor
+        (n_im x n_pt) matrix that minimizes norm(M*(GX - d)). If return_numpy is
+        True, return a numpy array, otherwise return a torch tensor.
     """
     tqdm_args.setdefault("desc", "Batch least-squares")
     tqdm_args.setdefault("unit", "Batch")
@@ -476,15 +480,18 @@ def batch_lstsq(
     for col in patch_col:
         if G.ndim == 2:
             result[:, col[0] : col[1]] = censored_lstsq(
-                G, d[:, col[0] : col[1]], dtype, device
+                G, d[:, col[0] : col[1]], dtype, device, return_numpy=False
             )
         elif G.ndim == 3:
             result[:, col[0] : col[1]] = censored_lstsq(
-                G[col[0] : col[1], :, :], d[:, col[0] : col[1]], dtype, device
+                G[col[0] : col[1], :, :], d[:, col[0] : col[1]], dtype, device,
+                return_numpy=False
             )
         else:
             raise ValueError("Dimension of G must be 2 or 3")
-    return result.numpy()
+    if return_numpy:
+        result = result.cpu().numpy()
+    return result
 
 
 def censored_lstsq(
@@ -492,7 +499,8 @@ def censored_lstsq(
     d: np.ndarray | torch.Tensor,
     dtype: torch.dtype = torch.float64,
     device: Optional[str | torch.device] = None,
-) -> NDArray[np.floating]:
+    return_numpy: bool = True,
+) -> NDArray[np.floating] | torch.Tensor:
     """Solves least squares problem subject to missing data.
     Reference: http://alexhwilliams.info/itsneuronalblog/2018/02/26/censored-lstsq/
 
@@ -517,8 +525,9 @@ def censored_lstsq(
 
     Returns
     -------
-    X : np.ndarray
-        (n_im x n_pt) matrix that minimizes norm(M*(GX - d))
+    X : np.ndarray | torch.Tensor
+        (n_im x n_pt) matrix that minimizes norm(M*(GX - d)). If return_numpy is
+        True, return a numpy array, otherwise return a torch tensor.
     """
     device = parse_device(device)
 
@@ -560,9 +569,13 @@ def censored_lstsq(
             torch.cuda.empty_cache()
         elif device_type == "mps":
             torch.mps.empty_cache()
-        return X_np.numpy()
+        if return_numpy:
+            X_np = X_np.numpy()
+        return X_np
     else:
-        return X.numpy()
+        if return_numpy:
+            return X.numpy()
+        return X
 
 
 def calculate_u(
