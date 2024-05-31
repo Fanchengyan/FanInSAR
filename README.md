@@ -2,7 +2,7 @@
 <img src="https://raw.githubusercontent.com/Fanchengyan/FanInSAR/main/docs/source/_static/logo/logo.svg" width="400">
 </h1><br>
 
-[![Documentation Status](https://readthedocs.org/projects/faninsar/badge/?version=latest)](https://faninsar.readthedocs.io/en/latest/?badge=latest)
+[![Documentation Status](https://readthedocs.org/projects/faninsar/badge/?version=latest)](https://faninsar.readthedocs.io/en/latest/?badge=latest) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.11398347.svg)](https://doi.org/10.5281/zenodo.11398347)
 
 FanInSAR is a fancy InSAR post-processing library written in Python. It is specifically designed to assist in the efficient processing of InSAR data, offering a Pythonic, fast, and flexible approach. If you are looking to implement your own InSAR algorithm, FanInSAR is highly recommended.
 
@@ -23,3 +23,23 @@ pip install git+https://github.com/Fanchengyan/FanInSAR.git
 ## Documentation
 
 The detailed documentation is available at: <https://faninsar.readthedocs.io/en/latest/>
+
+## Citation
+
+> Fan, C., & Liu, L. (2024). FanInSAR: A Fancy InSAR time series library, in a Pythonic, fast, and flexible way (0.0.1). Zenodo. https://doi.org/10.5281/zenodo.11398347
+
+```bib
+@software{fan_2024_11398347,
+  author       = {Fan, Chengyan and
+                  Liu, Lin},
+  title        = {{FanInSAR: A Fancy InSAR time series library, in a 
+                   Pythonic, fast, and flexible way}},
+  month        = may,
+  year         = 2024,
+  publisher    = {Zenodo},
+  version      = {0.0.1},
+  doi          = {10.5281/zenodo.11398347},
+  url          = {https://doi.org/10.5281/zenodo.11398347}
+}
+```
+
