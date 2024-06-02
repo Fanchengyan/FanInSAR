@@ -8,15 +8,16 @@ Welcome to FanInSAR's documentation!
 
 Introduction
 ------------
-FanInSAR is a fancy InSAR post-processing library written in Python. It is specifically designed to assist in the efficient processing of InSAR data, offering a Pythonic, fast, and flexible approach. If you are looking to implement your own InSAR algorithm, FanInSAR is highly recommended.
+
+FanInSAR is a Fancy Interferometric Synthetic Aperture Radar (InSAR) time series analysis library written in Python. It aims to provide a foundational library for the development of InSAR algorithms, facilitating efficient processing of InSAR time series data by offering a Pythonic, fast, and flexible approach. FanInSAR’s high-level API abstracts the complex processing pipeline and conceals the low-level programming details, enabling users to focus on algorithm development. For researchers and developers aiming to rapidly implement their own InSAR algorithms, FanInSAR offers a quick start for their projects.
+
 
 Highlight Features
 ------------------
 
+- **Pythonic**: FanInSAR is written in Python and provides a user-friendly API. The API is designed to be simple and intuitive, by abstracting the complex processing pipeline and concealing the low-level programming details, which allows users to focus on algorithm development. For example, loading data from ``HyP3`` or ``LiCSAR`` products is as simple as providing the corresponding home directory. Filtering interferometric pairs can be performed by a time slice, similar to the ``pandas`` package. 
 - **Fast**: The core computation in FanInSAR is implemented using ``PyTorch``, a high-performance deep learning library. This allows for efficient processing on both CPU and GPU, enabling faster execution.
-- **Pythonic**: FanInSAR is written in Python and provides a user-friendly API. The API is designed to be simple and intuitive, making it easy for InSAR users to work with. For example, loading data from ``HyP3`` or ``LiCSAR`` products is as simple as providing the corresponding home directory. Filtering interferometric pairs can be performed by a time slice, similar to the ``pandas`` package. The complex processing pipeline is abstracted away, allowing users to focus on algorithm development.
-- **Flexible**: FanInSAR is designed to be flexible, allowing for customization and extension. Users can easily inherit classes or customize the processing pipeline to suit their specific needs.
-
+- **Flexible**: FanInSAR is designed to be flexible, allowing for customization and extension. Users can easily inherit classes or customize the processing pipeline for their specific needs.
 
 .. toctree::
    :maxdepth: 3
