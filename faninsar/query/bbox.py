@@ -4,6 +4,7 @@ import warnings
 from collections.abc import Iterator
 from typing import overload
 
+import geopandas as gpd
 from rasterio.crs import CRS
 from rasterio.warp import transform_bounds
 
@@ -234,6 +235,21 @@ class BoundingBox:
             "right": self.right,
             "top": self.top,
         }
+
+    def to_GeoDataFrame(self) -> gpd.GeoDataFrame:
+        """Convert the bounding box to a GeoDataFrame.
+
+        Returns:
+            GeoDataFrame with the bounding box as a polygon
+        """
+        import geopandas as gpd
+        from shapely.geometry import box
+
+        gdf = gpd.GeoDataFrame(
+            geometry=[box(self.left, self.bottom, self.right, self.top)]
+        )
+        gdf.crs = self.crs
+        return gdf
 
     def intersects(self, other: "BoundingBox") -> bool:
         """Whether or not two bounding boxes intersect.

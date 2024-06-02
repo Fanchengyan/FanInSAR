@@ -11,6 +11,7 @@ from pyproj.crs import CRS
 from rasterio.errors import CRSError
 
 from .bbox import BoundingBox
+from .points import Points
 
 
 class Polygons:
@@ -194,17 +195,21 @@ class Polygons:
         return Polygons(df, types="desired")
 
     def to_bbox(self) -> list[BoundingBox]:
-        """Return a list of BoundingBox objects representing the bounding boxes 
+        """Return a list of BoundingBox objects representing the bounding boxes
         of the polygons.
-        
+
         .. Warning::
             This method will only return the bounding boxes of the desired polygons.
             If the Polygons object only contains "undesired" polygons, the returned
             list will be empty.
         """
         df = self.to_desired().frame
-        
-        
+
+    def to_GeoDataFrame(self) -> gpd.GeoDataFrame:
+        """Return a GeoDataFrame of the polygons. This method is an alias of 
+        :attr:`frame` for API consistency with :class:`Points` and :class:`BoundingBox`.
+        """
+        return self.frame
 
     @property
     def crs(self) -> CRS:
