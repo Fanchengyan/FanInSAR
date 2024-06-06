@@ -1809,15 +1809,15 @@ class PairsFactory:
 
     def from_period(
         self,
-        period_start: str = "1201",
+        period_start: str = "0101",
         period_end: str = "0331",
-        n_per_period: int = 3,
+        n_per_period: int | None = None,
         n_primary_period: Optional[str] = None,
         primary_years: Optional[list[int]] = None,
     ) -> Pairs:
         """generate interferometric pairs between periods for all years.
         period is defined by month and day for each year. For example,
-        period_start='1201', period_end='0331' means the period is from Dec 1
+        period_start='0101', period_end='0331' means the period is from Dec 1
         to Mar 31 for each year in the time series. This function will randomly
         select n_per_period dates in each period and generate interferometric
         pairs between those dates. This will be useful to mitigate the temporal
@@ -1828,9 +1828,10 @@ class PairsFactory:
         period_start, period_end:  str
             start and end date for the period which expressed as month and day
             with format '%m%d'
-        n_per_period: int
+        n_per_period: int | None
             how many dates will be used for each period. Those dates will be
-            selected randomly in each period. Default is 3
+            selected randomly in each period. If None, all dates in the period
+            will be used. Default is None.
         n_primary_period: int, optional
             how many periods/years used as primary date of ifg. For example, if
             n_primary_period=2, then the interferometric pairs will be generated
@@ -1861,7 +1862,7 @@ class PairsFactory:
                 end = pd.to_datetime(f"{year+1}{period_end}", format="%Y%m%d")
 
             dt_year = df_dates[start:end]
-            if len(dt_year) > 0:
+            if len(dt_year) > 0 and n_per_period is not None:
                 np.random.shuffle(dt_year)
                 date_years.append(dt_year[:n_per_period].to_list())
 
