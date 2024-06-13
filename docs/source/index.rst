@@ -19,6 +19,33 @@ Highlight Features
 - **Fast**: The core computation in FanInSAR is implemented using ``PyTorch``, a high-performance deep learning library. This allows for efficient processing on both CPU and GPU, enabling faster execution.
 - **Flexible**: FanInSAR is designed to be flexible, allowing for customization and extension. Users can easily inherit classes or customize the processing pipeline for their specific needs.
 
+.. note::
+
+    1. FanInSAR is under active development and is currently in the alpha stage. Its API may change in the future until it reaches a stable version.
+    2. If you have any questions, suggestions, or issues, please feel free to open an issue or discussion on our GitHub repository at `GitHub Issues <https://github.com/Fanchengyan/FanInSAR/issues>`_ or `GitHub Discussions <https://github.com/Fanchengyan/FanInSAR/discussions>`_.
+
+Citation
+--------
+
+.. code-block:: 
+
+    Fan, C., & Liu, L. (2024). FanInSAR: A Fancy InSAR time series library, in a Pythonic, fast, and flexible way (0.0.1). Zenodo. https://doi.org/10.5281/zenodo.11398347
+
+.. code-block:: bibtex
+
+    @software{fan2024FanInSAR,
+    author       = {Fan, Chengyan and
+                    Liu, Lin},
+    title        = {{FanInSAR: A Fancy InSAR time series library, in a Pythonic, fast, and flexible way}},
+    month        = may,
+    year         = 2024,
+    publisher    = {Zenodo},
+    version      = {0.0.1},
+    doi          = {10.5281/zenodo.11398347},
+    url          = {https://doi.org/10.5281/zenodo.11398347}
+    }
+
+
 .. toctree::
    :maxdepth: 3
    :caption: Contents:

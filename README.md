@@ -25,6 +25,10 @@ pip install git+https://github.com/Fanchengyan/FanInSAR.git
 
 The detailed documentation is available at: <https://faninsar.readthedocs.io/en/latest/>
 
+> :warning: **Note**
+> 
+>FanInSAR is under active development and is currently in the alpha stage. Its API may change in the future until it reaches a stable version.
+
 ## Citation
 
 > Fan, C., & Liu, L. (2024). FanInSAR: A Fancy InSAR time series library, in a Pythonic, fast, and flexible way (0.0.1). Zenodo. https://doi.org/10.5281/zenodo.11398347
