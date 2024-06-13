@@ -423,7 +423,7 @@ class InterferogramDataset(PairDataset):
             return None
 
         sample_theta = self.los_dataset[roi]
-        arr_theta = sample_theta["bbox"].squeeze((0, 1))
+        arr_theta = sample_theta.boxes.data.squeeze((0, 1))
         if angle_type == "incidence":
             los_ratio = np.cos(arr_theta)
         elif angle_type == "look":
@@ -455,21 +455,21 @@ class InterferogramDataset(PairDataset):
         profile = self.get_profile(roi)
         lat, lon = profile.to_latlon()
 
-        query = GeoQuery(bbox=roi, points=ref_points)
+        query = GeoQuery(boxes=roi, points=ref_points)
 
         sample_unw = self[query]
         sample_coh = self.coh_dataset[query]
 
         if ref_points is None:
-            unw = sample_unw["bbox"][0]
+            unw = sample_unw.boxes.data[0]
         else:
-            ref_mean = np.nanmean(sample_unw["points"], axis=1)
-            unw = sample_unw["bbox"][0] - ref_mean[:, None, None]
+            ref_mean = np.nanmean(sample_unw.points.data, axis=1)
+            unw = sample_unw.boxes.data[0] - ref_mean[:, None, None]
 
         ds = xr.Dataset(
             {
                 "unw": (["pair", "lat", "lon"], unw),
-                "coh": (["pair", "lat", "lon"], sample_coh["bbox"][0]),
+                "coh": (["pair", "lat", "lon"], sample_coh.boxes.data[0]),
             },
             coords={
                 "pair": self.pairs.to_names(),

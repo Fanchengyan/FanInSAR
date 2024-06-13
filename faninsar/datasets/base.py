@@ -435,7 +435,7 @@ class RasterDataset(GeoDataset):
         (491048, 4283411),
         (490317, 4284829)]
         )
-    >>> query = GeoQuery(points=points, bbox=[ds.bounds, ds.bounds])
+    >>> query = GeoQuery(points=points, boxes=[ds.bounds, ds.bounds])
 
     use the GeoQuery object to index the RasterDataset
 
@@ -443,11 +443,11 @@ class RasterDataset(GeoDataset):
 
     output the samples shapes:
 
-    >>> print('bbox shape:', sample['bbox'].shape)
-    bbox shape: (2, 7, 68, 80)
+    >>> print('boxes result shape:', sample.boxes.data.shape)
+    boxes result shape: (2, 7, 68, 80)
 
-    >>> print('points shape:', sample['points'].shape)
-    points shape: (7, 3)
+    >>> print('points result shape:', sample.points.data.shape)
+    points result shape: (7, 3)
 
     of course, you can also use the BoundingBox or Points directly to index the
     RasterDataset. Those two types will be automatically converted to GeoQuery
@@ -456,18 +456,18 @@ class RasterDataset(GeoDataset):
     >>> sample = ds[points]
     >>> sample
     {'query': GeoQuery(
-        bbox=None
+        boxes=None
         points=Points(count=3)
     ),
-    'bbox': None,
+    'boxes': None,
     'points': array([...], dtype=float32)}
 
     >>> sample = ds[ds.bounds]
     query': GeoQuery(
-        bbox=[1 BoundingBox]
+        boxes=[1 BoundingBox]
         points=None
     ),
-    'bbox': array([...], dtype=float32),
+    'boxes': array([...], dtype=float32),
     'points': None}
     """
 
@@ -658,8 +658,8 @@ class RasterDataset(GeoDataset):
 
     def __getitem__(
         self, query: GeoQuery | Points | BoundingBox | Polygons
-    ) -> dict[str, np.ndarray]:
-        """Retrieve image values for given query.
+    ) -> QueryResult:
+        """Retrieve images values for given query.
 
         Parameters
         ----------
@@ -670,36 +670,20 @@ class RasterDataset(GeoDataset):
 
         Returns
         -------
-        sample : dict
-            a dictionary containing the image values, corresponding query.
-            The keys of the dictionary are:
-
-            * ``query``: a GeoQuery object, the query used to index the dataset
-            * ``points``: a masked numpy array of shape (n_file, n_point)
-                containing the values of the points in the query. The points that
-                outside the dataset will be masked.
-            * ``bbox``: a numpy array of shape (n_bbox, n_file, height, width)
-                containing the values of the bounding boxes in the query.
-            * ``polygons``: a numpy array of shape (n_polygon, n_file, height, width)
-                containing the values of the polygons in the query.
-
-            .. Note::
-                ``bbox``, ``points``, and ``polygons`` will be None if the query
-                does not contain bounding boxes, points, or polygons.
+        result : QueryResult
+            a QueryResult instance containing the results of the various queries.
         """
         if isinstance(query, Points):
             query = GeoQuery(points=query)
         if isinstance(query, BoundingBox):
-            query = GeoQuery(bbox=query)
+            query = GeoQuery(boxes=query)
         if isinstance(query, Polygons):
             query = GeoQuery(polygons=query)
 
         paths = self.files[self.files.valid].paths
         result = self._sample_files(paths, query)
 
-        sample = {"query": query, "results": result}
-
-        return sample
+        return result
 
     def _points_query(self, points: Points, vrt_fh) -> np.ndarray:
         """Return the values of dataset at given points. Points that outside the dataset will be masked."""
@@ -825,34 +809,20 @@ class RasterDataset(GeoDataset):
             sequence = tqdm(sequence, desc=f"Saving {ds_name} Files", unit=unit)
         return sequence
 
-    def _sample_files(
-        self, paths: Sequence[str], query: GeoQuery
-    ) -> dict[Literal["bbox", "points", "polygons"], np.ndarray | None]:
-        """Stack files into a single 3D array.
+    def _sample_files(self, paths: Sequence[str], query: GeoQuery) -> QueryResult:
+        """Sample or retrieve values from the dataset for the given query.
 
         Parameters
         ----------
         paths : list of str
             list of paths for files to stack
         query : GeoQuery
-            a GeoQuery object containing the BoundingBox(es) and/or Points object
+            a GeoQuery instance containing the desired queries.
 
         Returns
         -------
-        dest : dict
-            a dictionary containing the stacked files. The keys of the dictionary
-            are:
-
-            * ``points``: a numpy array of shape (n_file, n_point) containing the
-                values of the points in the query.
-            * ``bbox``: a numpy array of shape (n_bbox, n_file, height, width)
-                containing the values of the bounding boxes in the query.
-            * ``polygons``: a numpy array of shape (n_polygon, n_file, height, width)
-                containing the values of the polygons in the query.
-
-            .. Note::
-                ``points``, ``bbox`` and ``polygons`` will be None if the query
-                does not contain bounding boxes, points or polygons.
+        result : QueryResult
+            a QueryResult instance containing the results of the various queries.
         """
         if self.cache:
             vrt_fhs = [self._cached_load_warp_file(fp) for fp in paths]
@@ -871,8 +841,8 @@ class RasterDataset(GeoDataset):
                 files_points_list.append(data)
             # Get the bounding boxes values
             bbox_list = []
-            if query.bbox is not None:
-                for bbox in query.bbox:
+            if query.boxes is not None:
+                for bbox in query.boxes:
                     data = self._bbox_query(bbox, vrt_fh)
                     bbox_list.append(data)
                 files_bbox_list.append(np.ma.asarray(bbox_list))
@@ -934,7 +904,7 @@ class RasterDataset(GeoDataset):
                 "masks": mask_ls if polygons_values is not None else None,
             }
         )
-        result = QueryResult(points_result, bbox_result, polygons_result)
+        result = QueryResult(points_result, bbox_result, polygons_result, query)
 
         return result
 
@@ -1114,7 +1084,7 @@ class RasterDataset(GeoDataset):
         sample = self[roi]
 
         ds = xr.Dataset(
-            {"image": (["band", "lat", "lon"], sample["bbox"])},
+            {"image": (["band", "lat", "lon"], sample.boxes.data)},
             coords={
                 "band": list(range(profile["count"])),
                 "lat": lat,

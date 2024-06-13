@@ -11,7 +11,6 @@ from pyproj.crs import CRS
 from rasterio.errors import CRSError
 
 from .bbox import BoundingBox
-from .points import Points
 
 
 class Polygons:
@@ -207,7 +206,7 @@ class Polygons:
 
     def to_GeoDataFrame(self) -> gpd.GeoDataFrame:
         """Return a GeoDataFrame of the polygons. This method is an alias of 
-        :attr:`frame` for API consistency with :class:`Points` and :class:`BoundingBox`.
+        :attr:`frame` for API consistency with :class:`~faninsar.query.Points` and :class:`BoundingBox`.
         """
         return self.frame
 

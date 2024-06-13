@@ -4,8 +4,12 @@ import numpy as np
 import pandas as pd
 from rasterio.transform import Affine
 
+from .query import GeoQuery
+
 
 class BaseResult:
+    """Base class for the result of the queries."""
+
     def __init__(self, result):
         self.result = result
 
@@ -53,14 +57,16 @@ class BaseResult:
 
 
 class PointsResult(BaseResult):
+    """A class to manage the result of :class:`~faninsar.query.Points` query."""
+
     def __getitem__(self, item):
         return self.result[item]
 
     def __repr__(self):
         if self.result is None:
-            return "Points(None)"
+            return "PointsResult(None)"
         return (
-            "Points("
+            "PointsResult("
             f"\n    n_files={self.data.shape[0]},"
             f"\n    n_points={self.data.shape[1]},"
             f"\n    dims={self.dims}"
@@ -69,17 +75,18 @@ class PointsResult(BaseResult):
 
     def __str__(self):
         if self.result is None:
-            return "Points(None)"
-        return f"Points(n_files={self.data.shape[0]}, n_points={self.data.shape[1]}, dims={self.dims})"
+            return "PointsResult(None)"
+        return f"PointsResult(n_files={self.data.shape[0]}, n_points={self.data.shape[1]}, dims={self.dims})"
 
 
 class BBoxesResult(BaseResult):
+    """A class to manage the result of :class:`~faninsar.query.BoundingBox` query."""
 
     def __repr__(self):
         if self.result is None:
-            return "BoundingBox(None)"
+            return "BBoxesResult(None)"
         return (
-            "BoundingBox("
+            "BBoxesResult("
             f"\n    n_boxes={len(self.data)},"
             f"\n    n_files={self.data[0].shape[0]},"
             f"\n    dims={self.dims}\n)"
@@ -87,8 +94,8 @@ class BBoxesResult(BaseResult):
 
     def __str__(self):
         if self.result is None:
-            return "BoundingBox(None)"
-        return f"BoundingBox(n_boxes={len(self.data)}, n_files={self.data[0].shape[0]}, dims={self.dims})"
+            return "BBoxesResult(None)"
+        return f"BBoxesResult(n_boxes={len(self.data)}, n_files={self.data[0].shape[0]}, dims={self.dims})"
 
     @property
     def transforms(self) -> list[Affine] | None:
@@ -98,12 +105,13 @@ class BBoxesResult(BaseResult):
 
 
 class PolygonsResult(BBoxesResult):
+    """A class to manage the result of :class:`~faninsar.query.Polygons` query."""
 
     def __repr__(self):
         if self.result is None:
-            return "Polygons(None)"
+            return "PolygonsResult(None)"
         return (
-            "Polygons("
+            "PolygonsResult("
             f"\n    n_polygons={len(self.data)},"
             f"\n    n_files={self.data[0].shape[0]},"
             f"\n    dims={self.dims}\n)"
@@ -111,15 +119,15 @@ class PolygonsResult(BBoxesResult):
 
     def __str__(self):
         if self.result is None:
-            return "Polygons(None)"
-        return f"Polygons(n_boxes={len(self.data)}, n_files={self.data[0].shape[0]}, dims={self.dims})"
+            return "PolygonsResult(None)"
+        return f"PolygonsResult(n_boxes={len(self.data)}, n_files={self.data[0].shape[0]}, dims={self.dims})"
 
     @property
     def transforms(self) -> list[Affine] | None:
         if self.result is None:
             return None
         return self.result["transforms"]
-    
+
     @property
     def masks(self) -> list[np.ndarray] | None:
         if self.result is None:
@@ -128,26 +136,37 @@ class PolygonsResult(BBoxesResult):
 
 
 class QueryResult:
-    _points = None
-    _boxes = None
-    _polygons = None
+    """A combined result of the :class:`PointsResult`, :class:`BBoxesResult`, and
+    :class:`PolygonsResult` queries. This class is the default return type of the
+    :ref:`query` results for the datasets.
+    """
+
+    _points: PointsResult | None
+    _boxes: BBoxesResult | None
+    _polygons: PolygonsResult | None
+    _query: GeoQuery | None
+
+    __slots__ = ["_points", "_boxes", "_polygons", "_query"]
 
     def __init__(
         self,
         points=None,
         boxes=None,
         polygons=None,
+        query=None,
     ):
         self._points = PointsResult(points)
         self._boxes = BBoxesResult(boxes)
         self._polygons = PolygonsResult(polygons)
+        self._query = query
 
     def __repr__(self):
         return (
             "QueryResult("
             f"\n    points={self.points},"
             f"\n    boxes={self.boxes},"
-            f"\n    polygons={self.polygons}"
+            f"\n    polygons={self.polygons},"
+            f"\n    query={self.query}"
             "\n)"
         )
 
@@ -156,12 +175,20 @@ class QueryResult:
 
     @property
     def points(self) -> PointsResult | None:
+        """Result of the :class:`~faninsar.query.Points` query."""
         return self._points
 
     @property
     def boxes(self) -> BBoxesResult | None:
+        """Result of the :class:`~faninsar.query.BoundingBox` query."""
         return self._boxes
 
     @property
     def polygons(self) -> PolygonsResult | None:
+        """Result of the :class:`~faninsar.query.Polygons` query."""
         return self._polygons
+
+    @property
+    def query(self) -> GeoQuery | None:
+        """The :class:`~faninsar.query.GeoQuery` instance used to generate results."""
+        return self._query
