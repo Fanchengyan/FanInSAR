@@ -1434,11 +1434,17 @@ class Loops:
 
     @property
     def loops(self) -> NDArray[np.object_]:
+        """the loops in the numpy array format."""
         return self._loops
 
     @property
+    def shape(self) -> tuple[int, int]:
+        """the shape of the loops array with format of (n_loops, n_pairs)."""
+        return (len(self), len(self.pairs))
+
+    @property
     def names(self) -> NDArray[np.str_]:
-        """return the names (str format) of the loops."""
+        """the names (str format) of the loops."""
         return self._names
 
     @property
