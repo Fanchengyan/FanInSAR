@@ -7,6 +7,8 @@ from typing import Iterable, Literal
 import numpy as np
 import pandas as pd
 
+from .freeze_thaw_process import FreezeThawCycle
+
 
 class TimeSeriesModels:
     """Base class for time series models"""
@@ -215,14 +217,16 @@ class FreezeThawCycleModel(TimeSeriesModels):
 
     def __init__(
         self,
-        t1s,
-        t2s,
-        t3s,
-        years,
-        ftc,
-        dates: pd.DatetimeIndex | Iterable[datetime],
+        ftc: FreezeThawCycle,
         unit: Literal["year", "day"] = "day",
+        dates: pd.DatetimeIndex | Iterable[datetime] = None,
+        years: Iterable[int] | None = None,
     ):
+        super().__init__(ftc.dates, unit=unit)
+        if dates is None:
+            dates = ftc.dates
+        if years is None:
+            years = ftc.dates.year.unique()
         super().__init__(dates, unit=unit)
 
         df_br = pd.DataFrame(
@@ -231,8 +235,8 @@ class FreezeThawCycleModel(TimeSeriesModels):
         bias = np.zeros((1, 2), dtype=np.float32)
 
         for year in years:
-            start = ftc.get_year_start(t1s, t2s, year)
-            end = ftc.get_year_end(t1s, year)
+            start = ftc.get_year_start(ftc.t1s, ftc.t2s, year)
+            end = ftc.get_year_end(ftc.t1s, year)
 
             if not start:
                 continue
@@ -250,7 +254,7 @@ class FreezeThawCycleModel(TimeSeriesModels):
             DDT = DDT.fillna(method="ffill")
             DDF = DDF.fillna(method="ffill")
 
-            t3 = t3s[year]
+            t3 = ftc.t3s[year]
             if not pd.isnull(t3):
                 if t3 in DDT.index:
                     DDT[t3:] = DDT[t3]
@@ -271,9 +275,9 @@ class FreezeThawCycleModel(TimeSeriesModels):
             DDF_A4_end = np.sqrt(DDF[-1])
 
             bias = bias + np.asarray([[DDT_A1_end, DDF_A4_end]])
-
+        df_br.loc[:, "constant"] = 1
         self._G_br = df_br.values
-        self._param_names = ["E_t", "E_f"]
+        self._param_names = ["E_t", "E_f", "constant"]
 
 
 class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
@@ -281,23 +285,25 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
 
     def __init__(
         self,
-        t1s,
-        t2s,
-        t3s,
-        years,
-        ftc,
-        dates: pd.DatetimeIndex | Iterable[datetime],
+        ftc: FreezeThawCycle,
+        dates: pd.DatetimeIndex | Iterable[datetime] | None = None,
         unit: Literal["year", "day"] = "day",
+        years: Iterable[int] | None = None,
     ):
+        if dates is None:
+            dates = ftc.dates
+        if years is None:
+            years = ftc.dates.year.unique()
         super().__init__(dates, unit=unit)
 
         df_br = pd.DataFrame(
             np.full((len(self.dates), 3), np.nan, dtype=np.float32), index=self.dates
         )
         bias = 0
+
         for year in years:
-            start = ftc.get_year_start(t1s, t2s, year)
-            end = ftc.get_year_end(t1s, year)
+            start = ftc.get_year_start(ftc.t1s, ftc.t2s, year)
+            end = ftc.get_year_end(ftc.t1s, year)
 
             m = np.logical_and(self.dates >= start, self.dates <= end)
             imdates = self.dates[m]
@@ -312,7 +318,7 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
             DDT = DDT.fillna(method="ffill")
             DDF = DDF.fillna(method="ffill")
 
-            t3 = t3s[year]
+            t3 = ftc.t3s[year]
             if not pd.isnull(t3):
                 if t3 in DDT.index:
                     DDT[t3:] = DDT[t3]
@@ -325,6 +331,6 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
             df_br[start:end] = np.array([DDT_A1, DDF_A4, np.full_like(DDF_A4, bias)]).T
 
             bias = bias + 1
-
+        df_br.loc[:, "constant"] = 1
         self._G_br = df_br.values
-        self._param_names = ["E_t", "E_f", "V"]
+        self._param_names = ["E_t", "E_f", "V", "constant"]

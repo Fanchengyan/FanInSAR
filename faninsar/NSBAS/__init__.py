@@ -17,6 +17,8 @@ from faninsar.NSBAS.tsmodels import (
     TimeSeriesModels,
 )
 
+from .freeze_thaw_process import FreezeThawCycle
+
 available_models = [
     "LinearModel",
     "QuadraticModel",
