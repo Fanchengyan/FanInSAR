@@ -1862,9 +1862,10 @@ class PairsFactory:
                 end = pd.to_datetime(f"{year+1}{period_end}", format="%Y%m%d")
 
             dt_year = df_dates[start:end]
-            if len(dt_year) > 0 and n_per_period is not None:
+            if (n_year := len(dt_year)) > 0:
+                n = n_year if n_per_period is None else n_per_period
                 np.random.shuffle(dt_year)
-                date_years.append(dt_year[:n_per_period].to_list())
+                date_years.append(dt_year[:n].to_list())
 
         # generate interferometric pairs between primary period and the rest periods
         _pairs = []
