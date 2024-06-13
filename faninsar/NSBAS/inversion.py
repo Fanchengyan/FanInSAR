@@ -646,7 +646,7 @@ def calculate_u(
             tqdm_args={"desc": "  Calculate u"},
         ).numpy()
     else:
-        _Uc = np.round(torch.linalg.lstsq(Cc, closure_phase).solution.numpy())
+        _Uc = torch.linalg.lstsq(Cc, closure_phase).solution.numpy()
 
     u[mask] = _Uc / (2 * np.pi)
     return u
