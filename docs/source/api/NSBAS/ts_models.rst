@@ -31,6 +31,7 @@ LinearModel
    :undoc-members:
    :member-order: bysource
    :show-inheritance:
+   :inherited-members:
 
 QuadraticModel
 --------------
@@ -40,6 +41,7 @@ QuadraticModel
    :undoc-members:
    :member-order: bysource
    :show-inheritance:
+   :inherited-members:
 
 
 CubicModel
@@ -50,6 +52,7 @@ CubicModel
    :undoc-members:
    :member-order: bysource
    :show-inheritance:
+   :inherited-members:
 
 AnnualSinusoidalModel
 ---------------------
@@ -59,6 +62,7 @@ AnnualSinusoidalModel
    :undoc-members:
    :member-order: bysource
    :show-inheritance:
+   :inherited-members:
 
 AnnualSemiannualSinusoidal
 ---------------------------
@@ -68,6 +72,7 @@ AnnualSemiannualSinusoidal
    :undoc-members:
    :member-order: bysource
    :show-inheritance:
+   :inherited-members:
 
 FreezeThawCycleModel
 --------------------
@@ -77,6 +82,7 @@ FreezeThawCycleModel
    :undoc-members:
    :member-order: bysource
    :show-inheritance:
+   :inherited-members:
 
 
 FreezeThawCycleModelWithVelocity
@@ -87,5 +93,6 @@ FreezeThawCycleModelWithVelocity
    :undoc-members:
    :member-order: bysource
    :show-inheritance:
+   :inherited-members:
 
 
