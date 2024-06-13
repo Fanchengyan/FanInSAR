@@ -1,9 +1,11 @@
+.. _query:
+
 geospatial Queries
 ==================
 
 .. currentmodule:: faninsar.query
 
-Geospatial Query in FanInSAR is used to sample values from GeoDataset. Query includes:
+Geospatial Query in FanInSAR is used to retrieve or sample values from GeoDataset. Query includes:
 
 .. csv-table::
    :header: "Query Type", "Description"

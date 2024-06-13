@@ -7,7 +7,7 @@ API Reference
    :caption: Contents:
 
    datasets/datasets
-   query/query
+   query/index
    samplers/index
    NSBAS/index
    insar_class/pairs
