@@ -626,8 +626,9 @@ class Pairs:
     def to_loops(
         self,
         max_acquisition: int = 5,
-        edge_days: Optional[int] = 12,
-        max_days: Optional[int] = None,
+        max_days: int | None = None,
+        edge_pairs: "Pairs" | None = None,
+        edge_days: int | None = None,
     ) -> "Loops":
         """Return all possible loops from the pairs.
 
@@ -641,7 +642,6 @@ class Pairs:
             >>> loops = pairs.to_loops()
             >>> mask = pairs.where(loops.pairs, return_type='mask')
 
-
         Parameters
         ----------
         max_acquisition: int
@@ -649,26 +649,34 @@ class Pairs:
 
             .. note::
                 The number of acquisitions is equal to the number of intervals + 1
-                :math:`n (acquisition) = n (edge\ pairs) + 1 = n (intervals) + 1`.
-
-        edge_days: int, optional
-            The maximum number of days for the edge pairs. It is used to identify the edge pairs
-            and exclude the invalid diagonal pairs that cannot form loops using
-            the edge pairs. If None, all available diagonal pairs will be used to
-            form loops. Default is 12.
-
+                :math:`n (acquisition) = n (edge\ pairs) + 1 (diagonal\ pair) = n (intervals) + 1`.
         max_days: int, optional
             The maximum number of days for the pairs in the loops. If None, all available pairs
             will be used. Default is None.
+        edge_pairs: Pairs, optional
+            The edge pairs to form loops. If None, ``edge_days`` must be provided.
+        edge_days: int, optional
+            The maximum number of days used to identify the edge pairs. If None,
+            ``edge_pairs`` must be provided. Default is None.
+
+            .. note::
+                This parameter will be ignored if ``edge_pairs`` is provided.
         """
         # a list containing all loops
         loops = []
-        for i in self:
+        if edge_pairs is None:
+            if edge_days is None:
+                raise ValueError("Either edge_days or edge_pairs should be provided.")
+            edge_pairs = self[self.days <= edge_days]
+        # find valid diagonal pairs
+        for i in self - edge_pairs:
             if max_days is not None and i.days > max_days:
                 continue
-            if not valid_diagonal_pair(i, self, edge_days):
+            if not valid_diagonal_pair(i, self, edge_pairs):
                 continue
             start_date, end_date = i.values[0], i.values[1]
+
+            # find valid primary pairs
             mask_primaries = (self.primary == start_date) & (self.secondary < end_date)
             if not mask_primaries.any():
                 continue
@@ -677,9 +685,9 @@ class Pairs:
             # initialize a loop with the primary acquisition
             loop = [start_date]
 
-            # find loops with the primary acquisition
+            # find all loops for all primary acquisitions
             find_loops(
-                self, loops, loop, pairs_primary, end_date, edge_days, max_acquisition
+                self, loops, loop, pairs_primary, end_date, edge_pairs, max_acquisition
             )
 
         return Loops(loops)
@@ -2059,31 +2067,29 @@ def find_loops(
     loop: Loop,
     pairs_left: Pairs,
     end_date: datetime,
-    edge_days: Optional[int] = None,
+    edge_pairs: Pairs,
     max_acquisition=5,
 ) -> None:
     """recursively find all available loops within pairs_left and end_date."""
     for pair_left in pairs_left:
-        if pair_left.days > edge_days:
+        if pair_left not in edge_pairs:
             continue
-        m_candidate = (loops_pairs.primary == pair_left.secondary) & (
-            loops_pairs.secondary <= end_date
+        m_candidate = (
+            (loops_pairs.primary == pair_left.secondary)
+            & (loops_pairs.secondary <= end_date)
+            & (loops_pairs.where(edge_pairs, return_type="mask"))
         )
         if not m_candidate.any():
             continue
         pairs_candidate = loops_pairs[m_candidate]
         for pair_middle in pairs_candidate:
-            if not valid_diagonal_pair(pair_middle, loops_pairs, edge_days):
-                continue
             loop_i = loop.copy()
             loop_i.append(pair_middle.primary)
             if pair_middle.secondary == end_date:
-                if pair_middle.days > edge_days:
-                    continue
                 loop_i.append(pair_middle.secondary)
                 loops.append(Loop(loop_i))
             else:
-                # +1 for end pair
+                # +1 for diagonal pair
                 if len(loop_i) + 1 < max_acquisition:
                     find_loops(
                         loops_pairs,
@@ -2091,16 +2097,17 @@ def find_loops(
                         loop_i,
                         pairs_candidate,
                         end_date,
-                        edge_days,
+                        edge_pairs,
                         max_acquisition,
                     )
 
 
 def valid_diagonal_pair(
-    pair: Pair, pairs: Pairs, edge_days: Optional[int] = None
+    pair: Pair, pairs: Pairs, edge_pairs: Optional[int] = None
 ) -> bool:
     """check if the pair is a valid diagonal pair that can be used to form a loop
-    using the edge pairs.
+    using the edge pairs. This function is just a simple check to see if days of
+    diagonal pair is less than the sum of edge pairs.
 
     Parameters
     ----------
@@ -2108,9 +2115,8 @@ def valid_diagonal_pair(
         Pair to be checked if it is a valid diagonal pair.
     pairs: Pairs
         All pairs of the loop.
-    edge_days: int, optional
-        Max days of the edge pairs, which is used to identify the edge pairs.
-        If None, any pair can be used as edge pair. Default is None.
+    edge_pairs: int, optional
+        The edge pairs to form loops.
 
     Returns
     -------
@@ -2119,15 +2125,17 @@ def valid_diagonal_pair(
     """
     valid = False
     start_date, end_date = pair.values
-    mask_edge = (pairs.primary >= start_date) & (pairs.secondary <= end_date)
-    if edge_days is not None:
-        mask_edge = mask_edge & (pairs.days <= edge_days)
+    mask_edge = (
+        (pairs.primary >= start_date)
+        & (pairs.secondary <= end_date)
+        & (pairs.where(edge_pairs, return_type="mask"))
+    )
 
     if not mask_edge.any():
         return False
 
-    edge_pairs = pairs[mask_edge]
-    if edge_pairs.days.sum() >= pair.days:
+    _edge_pairs = pairs[mask_edge]
+    if _edge_pairs.days.sum() >= pair.days:
         valid = True
     return valid
 
