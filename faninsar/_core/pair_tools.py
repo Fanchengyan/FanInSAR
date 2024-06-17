@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional
@@ -309,7 +309,7 @@ class Pairs:
                 return Pairs(pairs)
             else:
                 return None
-        elif isinstance(index, Sequence):
+        elif isinstance(index, Iterable):
             index = np.array(index)
             return Pairs(self._values[index])
         else:
@@ -955,7 +955,7 @@ class TripletLoops:
                 return TripletLoops(loops)
             else:
                 return None
-        elif isinstance(index, Sequence):
+        elif isinstance(index, Iterable):
             index = np.array(index)
             return TripletLoops(self._values[index])
         else:
