@@ -30,7 +30,7 @@ class FreezeThawCycle(object):
             dates corresponding to temperature. date can be any format that
             pd.to_datetime acceptable
         temperature: Sequence
-            air temperature or surface temperature. Must be the same length as dates
+            air/surface temperature. Must be the same length as dates
         date_args: dict, optional
             Keyword arguments for :func:`pandas.to_datetime` to convert the date
             strings to datetime objects. For example, {'format': '%Y%m%d'}.
@@ -42,14 +42,12 @@ class FreezeThawCycle(object):
         ER : float, optional
             E factor ratio, expressed numerically as A1/A4, used to calculate
             the onset of winter-stable period. Default is 1.
-        thaw_start : str, optional
-            thawing start date with format of "month-day". Default is '01-01'
-        thaw_end : str, optional
-            thawing end date with format of "month-day". Default is '12-31'
-        freeze_start : str, optional
-            freezing start date with format of "month-day". Default is '07-01'
-        freeze_end : str, optional
-            freezing end date with format of "month-day". Default is '06-30'
+        thaw_start, thaw_end : str, optional
+            the start and end date that cover whole thawing period with
+            format of "month-day". Default is '01-01' and '12-31'.
+        freeze_start, freeze_end : str, optional
+            the start and end date that cover whole freezing period with
+            format of "month-day". Default is '07-01' and '06-30'.
         """
         self._day_duration = day_duration
         self._ER = ER
@@ -152,13 +150,19 @@ class FreezeThawCycle(object):
         else:
             return False
 
+    def _same_year(self, start, end):
+        """check if the start and end date are in the same year"""
+        dt = pd.to_datetime([f"2000-{start}", f"2000-{end}"])
+        return dt[0] < dt[1]
+
     def _calculate_DDT(self):
         """calculate the DDT of every day"""
         list_DDTs = []
         list_thaw_complete = []
+        offset_year = 0 if self._same_year(self.thaw_start, self.thaw_end) else 1
         for year in self.years:
             date_start = f"{year}-{self.thaw_start}"
-            date_end = f"{year}-{self.thaw_end}"
+            date_end = f"{year+offset_year}-{self.thaw_end}"
 
             df_thawing = self.data[date_start:date_end].copy()
             df_thawing[df_thawing < 0] = np.nan
@@ -183,9 +187,10 @@ class FreezeThawCycle(object):
         """calculate the DDF of every day"""
         list_DDFs = []
         list_freeze_complete = []
+        offset_year = 0 if self._same_year(self.freeze_start, self.freeze_end) else 1
         for year in self.years:
             date_start = f"{year}-{self.freeze_start}"
-            date_end = f"{year+1}-{self.freeze_end}"
+            date_end = f"{year+offset_year}-{self.freeze_end}"
 
             df_freezing = -self.data[date_start:date_end].copy()
             df_freezing[df_freezing < 0] = np.nan
@@ -342,23 +347,19 @@ class FreezeThawCycle(object):
         self._t2s = self.get_t2s(day_duration=day_duration, years=years)
         self._t3s = self.get_t3s(ER, years=years)
 
-    def get_year_start(self, t1s, t2s, year):
-        t1, t2 = t1s[year], t2s[year]
-
-        if pd.isnull(t1) and pd.isnull(t2):
+    def get_year_start(self, year: int) -> pd.Timestamp | None:
+        """get the thawing onset for given year or None if not available"""
+        t1 = self.t1s[year]
+        if pd.isnull(t1):
             return None
+        return t1
 
-        if not pd.isnull(t1):
-            start = t1
-        else:
-            start = t2
-
-        return start
-
-    def get_year_end(self, t1s, year):
+    def get_year_end(self, year: int) -> pd.Timestamp:
+        """get the thawing onset for the next year or the last date of time series
+        if not available"""
         end = self.dates[-1]
-        if (year + 1) in t1s.index:
-            end_tmp = t1s[year + 1]
+        if (year + 1) in self.t1s.index:
+            end_tmp = self.t1s[year + 1]
             if not pd.isna(end_tmp):
                 end = end_tmp
         return end

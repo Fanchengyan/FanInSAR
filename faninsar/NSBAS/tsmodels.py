@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Iterable, Literal
+from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
@@ -25,9 +25,19 @@ class TimeSeriesModels:
 
     def __init__(
         self,
-        dates: pd.DatetimeIndex | Iterable[datetime],
+        dates: pd.DatetimeIndex | Sequence[datetime],
         unit: Literal["year", "day"] = "day",
     ):
+        """Initialize TimeSeriesModels
+
+        Parameters
+        ----------
+        dates : pd.DatetimeIndex | Sequence[datetime]
+            Dates of SAR acquisitions. This can be easily obtained by accessing
+            :attr:`Pairs.dates <faninsar.Pairs.dates>`.
+        unit : Literal["year", "day"], optional
+            Unit of day spans in time series model, by default "day".
+        """
         self._unit = None
         self._dates = None
         self._date_spans = None
@@ -51,7 +61,7 @@ class TimeSeriesModels:
 
     @property
     def unit(self) -> str:
-        """Return unit of datetime in time series model"""
+        """unit of date_spans in time series model"""
         return self._unit
 
     @unit.setter
@@ -68,7 +78,7 @@ class TimeSeriesModels:
 
     @property
     def dates(self) -> pd.DatetimeIndex:
-        """Return dates"""
+        """dates of SAR acquisitions"""
         return self._dates
 
     @dates.setter
@@ -89,17 +99,17 @@ class TimeSeriesModels:
 
     @property
     def date_spans(self) -> np.ndarray:
-        """Return date_spans"""
+        """date spans of SAR acquisitions in unit of year or day"""
         return self._date_spans
 
     @property
     def G_br(self) -> np.ndarray:
-        """Return G_br"""
+        """bottom right block of the design matrix G in NSBAS inversion"""
         return self._G_br
 
     @property
     def param_names(self) -> list[str]:
-        """Return param_names"""
+        """parameter names in time series model"""
         return self._param_names
 
 
@@ -108,9 +118,19 @@ class LinearModel(TimeSeriesModels):
 
     def __init__(
         self,
-        dates: pd.DatetimeIndex | Iterable[datetime],
+        dates: pd.DatetimeIndex | Sequence[datetime],
         unit: Literal["year", "day"] = "day",
     ):
+        """Initialize LinearModel
+
+        Parameters
+        ----------
+        dates : pd.DatetimeIndex | Sequence[datetime]
+            Dates of SAR acquisitions. This can be easily obtained by accessing
+            :attr:`Pairs.dates <faninsar.Pairs.dates>`.
+        unit : Literal["year", "day"], optional
+            Unit of day spans in time series model, by default "day".
+        """
         super().__init__(dates, unit=unit)
 
         self._G_br = np.array([self.date_spans, np.ones_like(self.date_spans)]).T
@@ -122,9 +142,19 @@ class QuadraticModel(TimeSeriesModels):
 
     def __init__(
         self,
-        dates: pd.DatetimeIndex | Iterable[datetime],
+        dates: pd.DatetimeIndex | Sequence[datetime],
         unit: Literal["year", "day"] = "day",
     ):
+        """Initialize QuadraticModel
+
+        Parameters
+        ----------
+        dates : pd.DatetimeIndex | Sequence[datetime]
+            Dates of SAR acquisitions. This can be easily obtained by accessing
+            :attr:`Pairs.dates <faninsar.Pairs.dates>`.
+        unit : Literal["year", "day"], optional
+            Unit of day spans in time series model, by default "day".
+        """
         super().__init__(dates, unit=unit)
         self._G_br = np.array(
             [self.date_spans**2, self.date_spans, np.ones_like(self.date_spans)]
@@ -137,9 +167,19 @@ class CubicModel(TimeSeriesModels):
 
     def __init__(
         self,
-        dates: pd.DatetimeIndex | Iterable[datetime],
+        dates: pd.DatetimeIndex | Sequence[datetime],
         unit: Literal["year", "day"] = "day",
     ):
+        """Initialize CubicModel
+
+        Parameters
+        ----------
+        dates : pd.DatetimeIndex | Sequence[datetime]
+            Dates of SAR acquisitions. This can be easily obtained by accessing
+            :attr:`Pairs.dates <faninsar.Pairs.dates>`.
+        unit : Literal["year", "day"], optional
+            Unit of day spans in time series model, by default "day".
+        """
         super().__init__(dates, unit=unit)
         self._G_br = np.array(
             [
@@ -157,9 +197,19 @@ class AnnualSinusoidalModel(TimeSeriesModels):
 
     def __init__(
         self,
-        dates: pd.DatetimeIndex | Iterable[datetime],
+        dates: pd.DatetimeIndex | Sequence[datetime],
         unit: Literal["year", "day"] = "day",
     ):
+        """Initialize AnnualSinusoidalModel
+
+        Parameters
+        ----------
+        dates : pd.DatetimeIndex | Sequence[datetime]
+            Dates of SAR acquisitions. This can be easily obtained by accessing
+            :attr:`Pairs.dates <faninsar.Pairs.dates>`.
+        unit : Literal["year", "day"], optional
+            Unit of day spans in time series model, by default "day".
+        """
         super().__init__(dates, unit=unit)
         if self.unit == "day":
             coeff = 2 * np.pi / 365.25
@@ -182,9 +232,19 @@ class AnnualSemiannualSinusoidal(TimeSeriesModels):
 
     def __init__(
         self,
-        dates: pd.DatetimeIndex | Iterable[datetime],
+        dates: pd.DatetimeIndex | Sequence[datetime],
         unit: Literal["year", "day"] = "day",
     ):
+        """Initialize AnnualSemiannualSinusoidal
+
+        Parameters
+        ----------
+        dates : pd.DatetimeIndex | Sequence[datetime]
+            Dates of SAR acquisitions. This can be easily obtained by accessing
+            :attr:`Pairs.dates <faninsar.Pairs.dates>`.
+        unit : Literal["year", "day"], optional
+            Unit of day spans in time series model, by default "day".
+        """
         super().__init__(dates, unit=unit)
 
         if self.unit == "day":
@@ -218,15 +278,26 @@ class FreezeThawCycleModel(TimeSeriesModels):
     def __init__(
         self,
         ftc: FreezeThawCycle,
+        dates: pd.DatetimeIndex | Sequence[datetime],
         unit: Literal["year", "day"] = "day",
-        dates: pd.DatetimeIndex | Iterable[datetime] = None,
-        years: Iterable[int] | None = None,
     ):
-        super().__init__(ftc.dates, unit=unit)
-        if dates is None:
-            dates = ftc.dates
-        if years is None:
-            years = ftc.dates.year.unique()
+        """Initialize FreezeThawCycleModel
+
+        Parameters
+        ----------
+        ftc : FreezeThawCycle
+            Freeze-thaw cycle instance. The dates in ftc should cover the dates
+            of SAR acquisitions.
+
+            .. warning::
+                The first date in ftc should be earlier than the thawing onset
+                of the first year in the time series model.
+        dates : pd.DatetimeIndex | Sequence[datetime]
+            Dates of SAR acquisitions. This can be easily obtained by accessing
+            :attr:`Pairs.dates <faninsar.Pairs.dates>`.
+        unit : Literal["year", "day"], optional
+            Unit of day spans in time series model, by default "day".
+        """
         super().__init__(dates, unit=unit)
 
         df_br = pd.DataFrame(
@@ -234,25 +305,37 @@ class FreezeThawCycleModel(TimeSeriesModels):
         )
         bias = np.zeros((1, 2), dtype=np.float32)
 
+        years = self.dates.year.unique()
         for year in years:
-            start = ftc.get_year_start(ftc.t1s, ftc.t2s, year)
-            end = ftc.get_year_end(ftc.t1s, year)
+            start = ftc.get_year_start(year)
+            end = ftc.get_year_end(year)
 
             if not start:
                 continue
 
             m = np.logical_and(self.dates >= start, self.dates <= end)
-            imdates = self.dates[m]
+            img_dates = self.dates[m]
 
-            DDT = ftc.DDT[start:end]
-            DDF = ftc.DDF[start:end]
+            DDT = ftc.DDT[start:end].copy()
+            DDF = ftc.DDF[start:end].copy()
+
+            if year == years[0]:
+                # add missing dates before 07-01 for DDF in the first year
+                if DDF.index[0] > start:
+                    dt_missing = pd.date_range(start, DDF.index[0], freq="1D")[:-1]
+                    DDF_missing = pd.Series(np.nan, index=dt_missing)
+                    DDF = pd.concat([DDF_missing, DDF])
+                # set coefficients to zero before the thawing onset for the first year
+                if start > self.dates[0]:
+                    df_br.loc[self.dates[0] : start, :] = 0
+                # set the DDF to 0 during the thawing onset
 
             if pd.isna(DDT[0]):
                 DDT[0] = 0
             DDF[:f"{year}-07-01"] = 0
 
-            DDT = DDT.fillna(method="ffill")
-            DDF = DDF.fillna(method="ffill")
+            DDT = DDT.ffill()
+            DDF = DDF.ffill()
 
             t3 = ftc.t3s[year]
             if not pd.isnull(t3):
@@ -261,8 +344,8 @@ class FreezeThawCycleModel(TimeSeriesModels):
                 if t3 in DDF.index:
                     DDF[t3:] = DDF[t3]
 
-            DDT_A1 = np.sqrt(DDT[imdates].values)
-            DDF_A4 = np.sqrt(DDF[imdates].values)
+            DDT_A1 = np.sqrt(DDT[img_dates].values)
+            DDF_A4 = np.sqrt(DDF[img_dates].values)
 
             try:
                 df_br[start:end] = np.array([DDT_A1, DDF_A4]).T + bias
@@ -286,14 +369,23 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
     def __init__(
         self,
         ftc: FreezeThawCycle,
-        dates: pd.DatetimeIndex | Iterable[datetime] | None = None,
+        dates: pd.DatetimeIndex | Sequence[datetime],
         unit: Literal["year", "day"] = "day",
-        years: Iterable[int] | None = None,
     ):
-        if dates is None:
-            dates = ftc.dates
-        if years is None:
-            years = ftc.dates.year.unique()
+        """Initialize FreezeThawCycleModelWithVelocity
+
+        Parameters
+        ----------
+        ftc : FreezeThawCycle
+            Freeze-thaw cycle instance. The dates in ftc should cover the dates
+            of SAR acquisitions.
+        dates : pd.DatetimeIndex | Sequence[datetime]
+            Dates of SAR acquisitions. This can be easily obtained by accessing
+            :attr:`Pairs.dates <faninsar.Pairs.dates>`.
+        unit : Literal["year", "day"], optional
+            Unit of day spans in time series model, by default "day".
+        """
+
         super().__init__(dates, unit=unit)
 
         df_br = pd.DataFrame(
@@ -301,15 +393,16 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
         )
         bias = 0
 
+        years = self.dates.year.unique()
         for year in years:
             start = ftc.get_year_start(ftc.t1s, ftc.t2s, year)
             end = ftc.get_year_end(ftc.t1s, year)
 
             m = np.logical_and(self.dates >= start, self.dates <= end)
-            imdates = self.dates[m]
+            img_dates = self.dates[m]
 
-            DDT = ftc.DDT[start:end]
-            DDF = ftc.DDF[start:end]
+            DDT = ftc.DDT[start:end].copy()
+            DDF = ftc.DDF[start:end].copy()
 
             if pd.isna(DDT[0]):
                 DDT[0] = 0
@@ -325,8 +418,8 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
                 if t3 in DDF.index:
                     DDF[t3:] = DDF[t3]
 
-            DDT_A1 = np.sqrt(DDT[imdates].values)
-            DDF_A4 = np.sqrt(DDF[imdates].values)
+            DDT_A1 = np.sqrt(DDT[img_dates].values)
+            DDF_A4 = np.sqrt(DDF[img_dates].values)
 
             df_br[start:end] = np.array([DDT_A1, DDF_A4, np.full_like(DDF_A4, bias)]).T
 
