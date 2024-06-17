@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional
@@ -22,13 +22,13 @@ class Pair:
 
     def __init__(
         self,
-        pair: Iterable[datetime, datetime],
+        pair: Sequence[datetime, datetime],
     ) -> None:
         """
         Parameters
         ----------
-        pair: Iterable
-            Iterable object of two dates. Each date is a datetime object.
+        pair: Sequence
+            Sequence object of two dates. Each date is a datetime object.
             For example, (date1, date2).
         """
         self._values = np.sort(pair).astype("M8[D]")
@@ -195,7 +195,7 @@ class Pairs:
 
     def __init__(
         self,
-        pairs: Iterable[Iterable[datetime, datetime]] | Iterable[Pair],
+        pairs: Sequence[Sequence[datetime, datetime]] | Sequence[Pair],
         sort: bool = True,
     ) -> None:
         """initialize the pairs class
@@ -203,8 +203,8 @@ class Pairs:
 
         Parameters
         ----------
-        pairs: Iterable
-            Iterable object of pairs. Each pair is an Iterable or Pair
+        pairs: Sequence
+            Sequence object of pairs. Each pair is an Sequence or Pair
             object of two dates with format of datetime. For example,
             [(date1, date2), ...].
         sort: bool, optional
@@ -309,7 +309,7 @@ class Pairs:
                 return Pairs(pairs)
             else:
                 return None
-        elif isinstance(index, Iterable):
+        elif isinstance(index, Sequence):
             index = np.array(index)
             return Pairs(self._values[index])
         else:
@@ -330,11 +330,11 @@ class Pairs:
             item = item.values
         elif isinstance(item, str):
             item = Pair.from_name(item).values
-        elif isinstance(item, Iterable):
+        elif isinstance(item, Sequence):
             item = np.sort(item)
         else:
             raise TypeError(
-                f"item should be Pair, str, or Iterable, but got {type(item)}."
+                f"item should be Pair, str, or Sequence, but got {type(item)}."
             )
 
         return np.any(np.all(item == self.values, axis=1))
@@ -343,7 +343,7 @@ class Pairs:
         return np.asarray(self._values, dtype=dtype)
 
     def _ensure_pairs(
-        self, pairs: str | Pair | "Pairs" | Iterable[str] | Iterable[Pair]
+        self, pairs: str | Pair | "Pairs" | Sequence[str] | Sequence[Pair]
     ) -> "Pairs":
         """ensure the pairs are in the Pairs object"""
         if isinstance(pairs, str):
@@ -352,7 +352,7 @@ class Pairs:
             pairs = Pairs([pairs])
         elif isinstance(pairs, Pairs):
             return pairs
-        elif isinstance(pairs, Iterable):
+        elif isinstance(pairs, Sequence):
             pairs = np.asarray(pairs)
             if pairs.ndim == 1 and pairs.dtype == "O":
                 pairs = Pairs.from_names(pairs)
@@ -434,7 +434,7 @@ class Pairs:
     @classmethod
     def from_names(
         cls,
-        names: Iterable[str],
+        names: Sequence[str],
         parse_function: Optional[Callable] = None,
         date_args: dict = {},
     ) -> "Pairs":
@@ -718,13 +718,13 @@ class TripletLoop:
 
     __slots__ = ["_values", "_pairs", "_name", "_days12", "_days23", "_days13"]
 
-    def __init__(self, loop: Iterable[datetime, datetime, datetime]) -> None:
+    def __init__(self, loop: Sequence[datetime, datetime, datetime]) -> None:
         """initialize the TripletLoop class
 
         Parameters
         ----------
-        loop: Iterable
-            Iterable object of three dates. Each date is a datetime object.
+        loop: Sequence
+            Sequence object of three dates. Each date is a datetime object.
             For example, (date1, date2, date3).
         """
         self._values = np.sort(loop).astype("M8[D]")
@@ -847,15 +847,15 @@ class TripletLoops:
 
     def __init__(
         self,
-        loops: Iterable[Iterable[datetime, datetime, datetime]] | Iterable[TripletLoop],
+        loops: Sequence[Sequence[datetime, datetime, datetime]] | Sequence[TripletLoop],
         sort: bool = True,
     ) -> None:
         """initialize the triplet loops class
 
         Parameters
         ----------
-        loops: Iterable
-            Iterable object of triplet loops. Each loop is an Iterable object
+        loops: Sequence
+            Sequence object of triplet loops. Each loop is an Sequence object
             of three dates with format of datetime or TripletLoop object.
             For example, [(date1, date2, date3), ...].
         """
@@ -955,7 +955,7 @@ class TripletLoops:
                 return TripletLoops(loops)
             else:
                 return None
-        elif isinstance(index, Iterable):
+        elif isinstance(index, Sequence):
             index = np.array(index)
             return TripletLoops(self._values[index])
         else:
@@ -975,11 +975,11 @@ class TripletLoops:
             item = item.values
         elif isinstance(item, str):
             item = TripletLoop.from_name(item).values
-        elif isinstance(item, Iterable):
+        elif isinstance(item, Sequence):
             item = np.sort(item)
         else:
             raise TypeError(
-                f"item should be TripletLoop, str, or Iterable, but got {type(item)}."
+                f"item should be TripletLoop, str, or Sequence, but got {type(item)}."
             )
 
         return np.any(np.all(item == self.values, axis=1))
@@ -1278,11 +1278,11 @@ class TripletLoops:
 class Loop:
     """Loop class containing multiple pairs/acquisitions."""
 
-    def __init__(self, loop: Iterable[datetime]) -> None:
+    def __init__(self, loop: Sequence[datetime]) -> None:
         """Initialize the Loop class
 
-        loop: Iterable
-            Iterable object of dates. Each date is a datetime object.
+        loop: Sequence
+            Sequence object of dates. Each date is a datetime object.
             For example, (date1, ..., date_n).
         """
         self._values = np.asarray(loop).astype("M8[D]")
@@ -1527,18 +1527,18 @@ class SBASNetwork:
 
     def __init__(
         self,
-        pairs: Iterable[Iterable[datetime, datetime]] | Iterable[Pair],
+        pairs: Sequence[Sequence[datetime, datetime]] | Sequence[Pair],
         Pairs,
-        baseline: Optional[Iterable[float]] = None,
+        baseline: Optional[Sequence[float]] = None,
         sort: bool = True,
     ) -> None:
         """
         Parameters
         ----------
-        pairs : Iterable or Pairs
-            Iterable object of pairs. Each pair is an Iterable object of two dates
+        pairs : Sequence or Pairs
+            Sequence object of pairs. Each pair is an Sequence object of two dates
             or a Pair object, or Pairs object.
-        baseline : Iterable, optional
+        baseline : Sequence, optional
             Baseline of each pair in meters. Default is None.
         sort : bool, optional
             Whether to sort the pairs and baseline. Default is True.
@@ -1551,11 +1551,11 @@ class SBASNetwork:
 
         if isinstance(pairs, Pairs):
             self._pairs = pairs
-        elif isinstance(pairs, Iterable):
+        elif isinstance(pairs, Sequence):
             self._pairs = Pairs(pairs, sort=False)
         else:
             raise TypeError(
-                f"pairs should be an Iterable or Pairs object, but got {type(pairs)}."
+                f"pairs should be an Sequence or Pairs object, but got {type(pairs)}."
             )
         self.baseline = baseline
         self._loops = self._pairs.to_loops()
@@ -1596,21 +1596,21 @@ class SBASNetwork:
         return self._baseline
 
     @baseline.setter
-    def baseline(self, value: Optional[Iterable]):
+    def baseline(self, value: Optional[Sequence]):
         """set the baseline of the network
 
         Parameters
         ----------
-        value: Iterable or None
+        value: Sequence or None
             Baseline of the network.
         """
         if value is None:
             self._baseline = None
             return
-        elif isinstance(value, Iterable):
+        elif isinstance(value, Sequence):
             value = np.asarray(value)
         else:
-            raise TypeError(f"baseline should be an Iterable, but got {type(value)}.")
+            raise TypeError(f"baseline should be an Sequence, but got {type(value)}.")
 
         if len(self._pairs) != len(value):
             raise ValueError(
@@ -1703,13 +1703,13 @@ class SBASNetwork:
 class PairsFactory:
     """This class is used to generate interferometric pairs for InSAR processing."""
 
-    def __init__(self, dates: Iterable, **kwargs) -> None:
+    def __init__(self, dates: Sequence, **kwargs) -> None:
         """initialize the PairGenerator class
 
         Parameters
         ----------
-        dates: Iterable
-            Iterable object that contains the dates. Can be any object that
+        dates: Sequence
+            Sequence object that contains the dates. Can be any object that
             accepted by :func:`pd.to_datetime`
         date_args: dict, optional
             Keyword arguments passed to :func:`pd.to_datetime`
@@ -2061,6 +2061,7 @@ class DateManager:
         return tuple(dates)
 
 
+# TODO: accelerate the process using numba or cython
 def find_loops(
     loops_pairs: Pairs,
     loops: list[Loop],

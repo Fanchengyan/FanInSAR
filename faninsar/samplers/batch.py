@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator
-from typing import Iterable, Optional
+from typing import Optional, Sequence
 
 from faninsar._core.logger import setup_logger
 from faninsar.datasets import GeoDataset
@@ -25,7 +25,7 @@ class RowSampler:
     def __init__(
         self,
         dataset: GeoDataset,
-        roi: Optional[BoundingBox | Iterable[float]] = None,
+        roi: Optional[BoundingBox | Sequence[float]] = None,
         patch_size: Optional[int] = None,
         patch_num: Optional[int] = None,
         verbose: bool = False,
@@ -36,7 +36,7 @@ class RowSampler:
         ----------
         dataset : GeoDataset
             The dataset needs to be sampled.
-        roi : BoundingBox or Iterable, optional
+        roi : BoundingBox or Sequence, optional
             The the region of interest bounding box. If not provided, the
             bounding box of the dataset will be used.
         patch_size : int, optional

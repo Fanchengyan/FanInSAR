@@ -6,7 +6,7 @@ import abc
 import functools
 import re
 import warnings
-from collections.abc import Iterable
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal, Optional, Sequence, overload
 
@@ -950,7 +950,7 @@ class RasterDataset(GeoDataset):
 
     def row_col(
         self,
-        xy: Iterable,
+        xy: Sequence,
         crs: Optional[CRS | str] = None,
         bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
     ) -> np.ndarray:
@@ -958,7 +958,7 @@ class RasterDataset(GeoDataset):
 
         Parameters
         ----------
-        xy: Iterable
+        xy: Sequence
             Pairs of x, y coordinates (floats)
         crs: CRS or str, optional
             The CRS of the points. If None, the CRS of the dataset will be used.
@@ -993,7 +993,7 @@ class RasterDataset(GeoDataset):
 
     def xy(
         self,
-        row_col: Iterable,
+        row_col: Sequence,
         crs: Optional[CRS | str] = None,
         bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
     ) -> np.ndarray:
@@ -1001,7 +1001,7 @@ class RasterDataset(GeoDataset):
 
         Parameters
         ----------
-        row_col: Iterable
+        row_col: Sequence
             Pairs of row, col in the dataset (floats)
         crs: CRS or str, optional
             The CRS of the points. If None, the CRS of the dataset will be used.

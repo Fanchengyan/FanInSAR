@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import psutil
@@ -14,10 +14,10 @@ from faninsar.NSBAS.tsmodels import TimeSeriesModels
 
 
 class NSBASMatrixFactory:
-    """Factory class to generate/format NSBAS matrix  The NSBAS matrix is usually 
-    expressed as: ``d = Gm``, where ``d`` is the unwrapped interferograms matrix, 
-    ``G`` is the NSBAS matrix, and ``m`` is the model parameters, which is the 
-    combination of the deformation increment and the model parameters. 
+    """Factory class to generate/format NSBAS matrix  The NSBAS matrix is usually
+    expressed as: ``d = Gm``, where ``d`` is the unwrapped interferograms matrix,
+    ``G`` is the NSBAS matrix, and ``m`` is the model parameters, which is the
+    combination of the deformation increment and the model parameters.
     see paper: TODO for more details.
 
     .. note::
@@ -79,7 +79,7 @@ class NSBASMatrixFactory:
     def __init__(
         self,
         unw: NDArray[np.floating],
-        pairs: Pairs | Iterable[str],
+        pairs: Pairs | Sequence[str],
         model: Optional[TimeSeriesModels] = None,
         gamma: float = 0.0001,
     ):
@@ -89,8 +89,8 @@ class NSBASMatrixFactory:
         ----------
         unw : NDArray (n_pairs, n_pixels)
             Unwrapped interferograms matrix
-        pairs : Pairs | Iterable[str]
-            Pairs or iterable of pair names
+        pairs : Pairs | Sequence[str]
+            Pairs or Sequence of pair names
         model : Optional[TimeSeriesModels], optional
             Time series model. If None, generate SBAS matrix rather than NSBAS
             matrix, by default None.
@@ -100,10 +100,13 @@ class NSBASMatrixFactory:
         """
         if isinstance(pairs, Pairs):
             self._pairs = pairs
-        elif isinstance(pairs, Iterable):
+        elif isinstance(pairs, Sequence):
             self._pairs = Pairs.from_names(pairs)
         else:
-            raise TypeError("pairs must be either Pairs or Iterable")
+            raise TypeError("pairs must be either Pairs or Sequence")
+
+        if isinstance(unw, np.ma.MaskedArray):
+            unw = unw.filled(np.nan)
 
         self._model = None
         self._gamma = None
@@ -484,8 +487,11 @@ def batch_lstsq(
             )
         elif G.ndim == 3:
             result[:, col[0] : col[1]] = censored_lstsq(
-                G[col[0] : col[1], :, :], d[:, col[0] : col[1]], dtype, device,
-                return_numpy=False
+                G[col[0] : col[1], :, :],
+                d[:, col[0] : col[1]],
+                dtype,
+                device,
+                return_numpy=False,
             )
         else:
             raise ValueError("Dimension of G must be 2 or 3")
