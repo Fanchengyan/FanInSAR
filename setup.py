@@ -3,14 +3,25 @@ from pathlib import Path
 
 import setuptools
 
-with open("README.md", "r", encoding='UTF-8') as fh:
+with open("README.md", "r", encoding="UTF-8") as fh:
     long_description = fh.read()
 
-install_requires = []
-with open("requirements.txt", "r", encoding='UTF-8') as fh:
-    reader = csv.reader(fh)
-    for row in reader:
-        install_requires.append(row[0])
+install_requires = [
+    "geopandas",
+    "pandas",
+    "numpy",
+    "torch",
+    "matplotlib",
+    "data_downloader",
+    "rasterio >= 1.0.26",
+    "xarray",
+    "psutil",
+    "rioxarray",
+    "netcdf4",
+    "h5netcdf",
+    "tqdm",
+    "rtree",
+]
 
 with open("faninsar/__init__.py") as f:
     for line in f:
@@ -20,15 +31,16 @@ with open("faninsar/__init__.py") as f:
             version = version.strip("'")
             continue
 
+
 def get_scm_files():
     """
     Returns a list of all files in the SCM directory and its subdirectories.
     """
-    scm_dir = Path('faninsar/cmaps')
+    scm_dir = Path("faninsar/cmaps")
     scm_files = []
-    for file_path in scm_dir.glob('**/*'):
+    for file_path in scm_dir.glob("**/*"):
         if file_path.is_file():
-            scm_files.append('/'.join(list(file_path.parts[1:])))
+            scm_files.append("/".join(list(file_path.parts[1:])))
     return scm_files
 
 
@@ -43,12 +55,12 @@ setuptools.setup(
     url="https://github.com/Fanchengyan/FanInSAR",
     packages=setuptools.find_packages(),
     install_requires=install_requires,
-    package_data={'faninsar': get_scm_files()},
+    package_data={"faninsar": get_scm_files()},
     include_package_data=True,
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-    python_requires='>=3.8',
+    python_requires=">=3.8",
 )
