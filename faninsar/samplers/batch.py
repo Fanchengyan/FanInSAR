@@ -12,7 +12,7 @@ logger = setup_logger(
     log_name="FanInSAR.samplers.batch", log_format="%(levelname)s - %(message)s"
 )
 
-
+# TODO: support sampling polygons query
 class RowSampler:
     """A sampler samples data from a dataset in a row-wise manner.
 
@@ -25,7 +25,7 @@ class RowSampler:
     def __init__(
         self,
         dataset: GeoDataset,
-        roi: Optional[BoundingBox | Sequence[float]] = None,
+        roi: Optional[BoundingBox] = None,
         patch_size: Optional[int] = None,
         patch_num: Optional[int] = None,
         verbose: bool = False,
@@ -44,7 +44,6 @@ class RowSampler:
             pixels. if not provided, the patch_num will be used.
 
             .. note::
-
                 patch_size is a tuple of (height, width) in pixels. But in this
                 class, only the height is used. The width is set to the width of
                 the roi.
@@ -56,6 +55,7 @@ class RowSampler:
         """
         self.dataset = dataset
         self.verbose = verbose
+        self.res = dataset.res[1]
 
         if roi is not None:
             self.dataset.roi = roi
@@ -89,14 +89,14 @@ class RowSampler:
 
         patch_bboxs = []
         for i in range(patch_num):
-            bottom = i * patch_size + roi.bottom
-            top = bottom + patch_size
+            bottom = (i * patch_size) * self.res + roi.bottom
+            top = patch_size * self.res + bottom 
             patch_bboxs.append([roi.left, bottom, roi.right, top])
         # make last patch top equal to roi top
         patch_bboxs[-1][3] = roi.top
 
         for patch_bbox in patch_bboxs:
-            yield BoundingBox(*patch_bbox)
+            yield BoundingBox(*patch_bbox, crs=self.dataset.crs)
 
     def __len__(self) -> int:
         return self.patch_num
