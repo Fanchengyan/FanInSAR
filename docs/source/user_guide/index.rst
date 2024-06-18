@@ -14,5 +14,6 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
    colormap
    data_structures
    Indexing_data
+   sampler
 
   
