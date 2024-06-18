@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from faninsar._core.pair_tools import Pairs
+
 from .bbox import BoundingBox
 from .points import Points
 from .polygons import Polygons
@@ -89,15 +91,15 @@ class GeoQuery:
 
     @property
     def points(self) -> Points | None:
-        """Return the points of the samples."""
+        """the points used to sample the dataset."""
         return self._points
 
     @property
     def boxes(self) -> list[BoundingBox] | None:
-        """Return the bounding boxes of the samples."""
+        """the bounding boxes used to sample the dataset."""
         return self._boxes
 
     @property
     def polygons(self) -> Points | None:
-        """Return the polygons of the samples."""
+        """the polygons used to sample the dataset."""
         return self._polygons

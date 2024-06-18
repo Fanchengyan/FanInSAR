@@ -109,7 +109,6 @@ class InterferogramDataset(PairDataset):
             .. note::
                 This parameter is only used when sampling data using bounding
                 boxes or polygons queries, and will not work for points queries.
-                
         verbose: bool, optional, default: True
             if True, print verbose output.
         keep_common: bool, optional, default: True
