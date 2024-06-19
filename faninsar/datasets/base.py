@@ -1102,6 +1102,7 @@ class RasterDataset(GeoDataset):
         filename: str | Path,
         roi: Optional[BoundingBox] = None,
         profile: Optional[Profile] = None,
+        band_names: Sequence[str] | None = None,
     ) -> None:
         """Save a numpy array to a tiff file using the geoinformation of the dataset.
 
@@ -1116,6 +1117,8 @@ class RasterDataset(GeoDataset):
             Region of interest to save. only used if profile is None.
         profile : Profile, optional
             profile of the tiff file. If None, the roi must be specified.
+        band_names : Sequence of str, optional
+            names of bands to save. Default is None, which will use the band indexes.
         """
         if arr.ndim == 2:
             indexes = [1]
@@ -1126,6 +1129,11 @@ class RasterDataset(GeoDataset):
             raise ValueError(
                 f"Expected arr to be an array of shape (n, m) or (n, m, k), got {arr.shape}"
             )
+        if band_names is not None:
+            if len(band_names) != arr.shape[0]:
+                raise ValueError(
+                    f"Expected band_names to be of length {arr.shape[0]}, got {len(band_names)}"
+                )
 
         if profile is None:
             if roi is None:
@@ -1135,6 +1143,9 @@ class RasterDataset(GeoDataset):
 
         with rasterio.open(filename, "w", **profile) as dst:
             dst.write(arr, indexes)
+            if band_names is not None:
+                for i, name in enumerate(band_names):
+                    dst.update_tags(i + 1, NAME=name)
 
 
 class PairDataset(RasterDataset):
@@ -1142,6 +1153,45 @@ class PairDataset(RasterDataset):
 
     _pairs: Optional[Pairs] = None
     _datetime: Optional[pd.DatetimeIndex] = None
+
+    def query(
+        self,
+        query: GeoQuery | Points | BoundingBox | Polygons,
+        pairs: Pairs | None = None,
+    ) -> QueryResult:
+        """Retrieve images values for given query. This method is an more
+        flexible implementation compared to :meth:`__getitem__`, which can
+        retrieve images only for the given pairs.
+
+        Parameters
+        ----------
+        query : GeoQuery | Points | BoundingBox | Polygons
+            query to index the dataset. It can be :class:`Points`,
+            :class:`BoundingBox`, :class:`Polygons`, or a composite
+            :class:`GeoQuery` (recommended) object.
+        pairs : Pairs, optional
+            pairs to use for the query. If None, all pairs will be used.
+
+        Returns
+        -------
+        result : QueryResult
+            a QueryResult instance containing the results of the various queries.
+        """
+        if isinstance(query, Points):
+            query = GeoQuery(points=query)
+        if isinstance(query, BoundingBox):
+            query = GeoQuery(boxes=query)
+        if isinstance(query, Polygons):
+            query = GeoQuery(polygons=query)
+
+        mask = self.files.valid
+        if pairs is not None:
+            mask = mask * self.pairs.where(pairs, return_type="mask")
+
+        paths = self.files[mask].paths
+        result = self._sample_files(paths, query)
+
+        return result
 
     @classmethod
     @abc.abstractmethod
