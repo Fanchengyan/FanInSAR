@@ -1,1 +1,1 @@
-from .frequency import *
+from .freq import *
