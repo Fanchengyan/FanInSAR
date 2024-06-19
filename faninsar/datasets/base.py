@@ -1194,7 +1194,6 @@ class PairDataset(RasterDataset):
         return result
 
     @classmethod
-    @abc.abstractmethod
     def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Used to parse pairs from filenames. *Must be implemented in subclass*.
 
@@ -1221,9 +1220,9 @@ class PairDataset(RasterDataset):
 
         >>> pairs = Pairs.from_names(pair_names)
         """
+        raise NotImplementedError("parse_pairs method must be implemented in subclass")
 
     @classmethod
-    @abc.abstractmethod
     def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Used to parse datetime from filenames. *Must be implemented in subclass*.
 
@@ -1237,6 +1236,7 @@ class PairDataset(RasterDataset):
         datetime : pd.DatetimeIndex
             datetime parsed from filenames
         """
+        raise NotImplementedError("parse_datetime method must be implemented in subclass")
 
     @property
     def pairs(self) -> Pairs:
