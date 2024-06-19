@@ -166,7 +166,7 @@ class InterferogramDataset(PairDataset):
             ds_name="Interferogram",
         )
 
-        self._ds_coh = RasterDataset(
+        self._ds_coh = PairDataset(
             root_dir=root_dir,
             paths=paths_coh,
             crs=self.crs,
@@ -192,8 +192,10 @@ class InterferogramDataset(PairDataset):
 
         # remove invalid pairs
         self._pairs = self.parse_pairs(self._files.paths)
+        self._ds_coh._pairs = self.parse_pairs(self._ds_coh._files.paths)
         # get the datetime from pairs
         self._datetime = self.parse_datetime(paths_unw[_valid])
+        self._ds_coh._datetime = self.parse_datetime(paths_coh[_valid])
 
     def _deduplicate_pairs(self, paths: list[Path], dataset_name: str) -> list[Path]:
         """Remove duplicate pairs from the list of paths."""
@@ -208,63 +210,6 @@ class InterferogramDataset(PairDataset):
                 f"\nDeduplicate pairs: {deduplicated}"
             )
         return paths[index], pairs
-
-    @classmethod
-    def parse_pairs(cls, paths: list[Path]) -> Pairs:
-        """Used to parse pairs from filenames. *Must be implemented in subclass*.
-
-        Parameters
-        ----------
-        paths : list of pathlib.Path
-            list of file paths to parse pairs
-
-        Returns
-        -------
-        pairs : Pairs object
-            pairs parsed from filenames
-
-        Example
-        -------
-        for the HyP3 dataset, pairs are parsed from the filenames as follows:
-
-        >>> names = [f.name for f in paths]]
-        >>> pair_names = ['_'.join(i.split("_")[1:3]) for i in names]
-
-        for the HyP3 dataset, the pair names are the second and third parts of the
-        filename, separated by an underscore. After parsing the pair names, the
-        :class:`Pairs` object can be created by using the ``from_names`` method.
-
-        >>> pairs = Pairs.from_names(pair_names)
-
-        .. Note::
-
-            * The ``parse_pairs`` method must be implemented in subclass. If you are
-              using :class:`InterferogramDataset` directly, you must implement the
-              `parse_pairs` method in your code.
-            * The ``parse_pairs`` method must return a :class:`Pairs` object.
-
-        Raises
-        ------
-        NotImplementedError: if not implemented in subclass or directly using
-            InterferogramDataset.
-        """
-        super().parse_pairs(paths)
-
-    @classmethod
-    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
-        """Used to parse datetime from filenames. *Must be implemented in subclass*.
-
-        Parameters
-        ----------
-        paths : list of pathlib.Path
-            list of file paths to parse datetime
-
-        Returns
-        -------
-        datetime : pd.DatetimeIndex
-            datetime parsed from filenames
-        """
-        super().parse_datetime(paths)
 
     @property
     def coh_dataset(self) -> RasterDataset:
