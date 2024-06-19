@@ -43,6 +43,9 @@ class FreezeThawCycle(object):
         ER : float, optional
             E factor ratio, expressed numerically as A1/A4, used to calculate
             the onset of winter-stable period. Default is 1.
+        no_gap : bool, optional
+            if True, the temperature data should not have any gap in time series.
+            Default is True.
         thaw_start, thaw_end : str, optional
             the start and end date that cover whole thawing period with
             format of "month-day". Default is '01-01' and '12-31'.
@@ -297,16 +300,21 @@ class FreezeThawCycle(object):
 
     def get_t3s(
         self,
-        ER: float = 1,
+        ER: float | None = None,
         years: list[str] | None = None,
     ):
         """get date t3 (onset of winter-stable period) for given years
 
         Parameters:
         -----------
-        ER : float
-            E factor ratio, expressed numerically as A1/A4. Default is 1
+        ER : float | None
+            E factor ratio, expressed numerically as A1/A4. Default is None,
+            which means using the ER of the class instance.
+        years : list[str] | None
+            years of t3. Default is None, which means all years will be returned.
         """
+        if ER is None:
+            ER = self.ER
         t3s = []
         for year in self.years:
             if year in self.FI.index:
@@ -343,7 +351,7 @@ class FreezeThawCycle(object):
             t3s = t3s[years]
         return t3s
 
-    def update_ts(self, day_duration=5, ER=1, years=None):
+    def update_ts(self, day_duration=5, ER=None, years=None):
         self._t1s = self.get_t1s(day_duration=day_duration, years=years)
         self._t2s = self.get_t2s(day_duration=day_duration, years=years)
         self._t3s = self.get_t3s(ER, years=years)
