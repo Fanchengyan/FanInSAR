@@ -708,6 +708,38 @@ class Pairs:
 
         return matrix
 
+    def parse_gaps(self, pairs_removed: "Pairs" | None= None) -> pd.DatetimeIndex:
+        """Parse network gaps where the acquisitions are not connected by pairs.
+        The gaps are detected by the dates that are not present in the secondary
+        acquisition of the pairs.
+        
+        .. note::
+            Theoretically, the gaps should be the temporal spans between the
+            consecutive acquisitions. For simplicity, the end dates of the gaps
+            are returned here.
+
+        Parameters
+        ----------
+        pairs_removed: Pairs, optional
+            Pairs that are removed from the original pairs. Default is None,
+            which means all pairs are used.
+
+        Returns
+        -------
+        gaps : pd.DatetimeIndex
+            Acquisition/date gaps that are not covered by any pairs.
+        """
+        dates = self.dates[1:]
+        if pairs_removed is not None:
+            pairs_valid = self - pairs_removed
+        else:
+            pairs_valid = self
+
+        dates_secondary = np.unique(pairs_valid.secondary)
+        gaps = np.setdiff1d(dates, dates_secondary)
+
+        return gaps
+
 
 class TripletLoop:
     """TripletLoop class containing three pairs/acquisitions."""
