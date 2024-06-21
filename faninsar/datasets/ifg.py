@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 from faninsar._core import geo_tools
 from faninsar._core.logger import setup_logger
 from faninsar._core.pair_tools import Pairs
+from faninsar._core.sar_tools import Baselines
 from faninsar.datasets.base import ApsPairs, PairDataset, RasterDataset
 from faninsar.NSBAS import PhaseDeformationConverter
 from faninsar.query import BoundingBox, GeoQuery, Points
@@ -210,6 +211,19 @@ class InterferogramDataset(PairDataset):
                 f"\nDeduplicate pairs: {deduplicated}"
             )
         return paths[index], pairs
+
+    def parse_baselines(self, pairs: Pairs | None) -> Baselines:
+        """Parse the baseline of the interferogram for given pairs.
+
+        Parameters
+        ----------
+        pairs : Pairs
+            The pairs which the baseline will be parsed. Default is None, which
+            means all pairs will be parsed.
+        """
+        raise NotImplementedError(
+            "parse_baseline method must be implemented in subclass"
+        )
 
     @property
     def coh_dataset(self) -> RasterDataset:

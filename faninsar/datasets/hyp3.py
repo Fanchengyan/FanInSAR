@@ -5,7 +5,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from faninsar._core.file_tools import retrieve_meta_value
 from faninsar._core.pair_tools import Pairs
+from faninsar._core.sar_tools import Baselines
 from faninsar.datasets.ifg import InterferogramDataset
 
 
@@ -37,6 +39,37 @@ class HyP3S1(InterferogramDataset):
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         date_names = np.unique([i.split("_") for i in pair_names])
         return pd.DatetimeIndex(date_names)
+
+    def parse_baselines(self, pairs: Pairs | None = None) -> Baselines:
+        """Parse the baseline of the interferogram for given pairs.
+
+        Parameters
+        ----------
+        pairs : Pairs
+            The pairs which the baseline will be parsed. Default is None, which
+            means all pairs will be parsed.
+
+        returns
+        -------
+        baselines : Baselines
+            The baseline of the interferogram for given pairs.
+        """
+        if pairs is None:
+            pairs = self.pairs
+
+        mask = self.pairs.where(pairs, return_type="mask")
+
+        files = self.files[self.valid][mask].paths
+        baselines = []
+        for f in files:
+            try:
+                meta_file = str(f).replace("_unw_phase.tif", ".txt")
+                value = float(retrieve_meta_value(meta_file, "Baseline"))
+                baselines.append(value)
+            except:
+                baselines.append(np.nan)
+        bs = Baselines.from_pair_wise(pairs, np.array(baselines))
+        return bs
 
 
 class HyP3S1Burst(InterferogramDataset):
