@@ -6,8 +6,10 @@ from typing import Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from faninsar.NSBAS import LinearModel, NSBASInversion, NSBASMatrixFactory
+from numpy.typing import NDArray
 
+from ..NSBAS.inversion import NSBASInversion, NSBASMatrixFactory
+from ..NSBAS.tsmodels import LinearModel
 from .pair_tools import Pairs
 
 
@@ -235,3 +237,54 @@ class Baselines:
             )
 
         return ax
+
+
+class PhaseDeformationConverter:
+    """A class to convert between phase and deformation (mm) for SAR interferometry."""
+
+    def __init__(self, frequency: float = None, wavelength: float = None) -> None:
+        """Initialize the converter. Either wavelength or frequency should be provided.
+        If both are provided, wavelength will be recalculated by frequency.
+
+        Parameters
+        ----------
+        frequency : float
+            The frequency of the radar signal. Unit: GHz.
+        wavelength : float
+            The wavelength of the radar signal. Unit: meter.
+            this parameter will be ignored if frequency is provided.
+        """
+        speed_of_light = 299792458
+
+        if frequency is not None:
+            frequency = frequency * 1e9  # GHz to Hz
+            self.wavelength = speed_of_light / frequency  # meter
+            self.frequency = frequency
+        elif wavelength is not None:
+            self.wavelength = wavelength
+            self.frequency = speed_of_light / wavelength
+        else:
+            raise ValueError("Either wavelength or frequency should be provided.")
+
+        # convert radian to mm
+        self.coef_rd2mm = -self.wavelength / 4 / np.pi * 1000
+
+    def __str__(self) -> str:
+        return f"PhaseDeformationConverter(wavelength={self.wavelength})"
+
+    def __repr__(self) -> str:
+        return str(self)
+
+    def phase2deformation(self, phase: NDArray[np.floating]) -> NDArray[np.floating]:
+        """Convert phase to deformation (mm)"""
+        return phase * self.coef_rd2mm
+
+    def deformation2phase(
+        self, deformation: NDArray[np.floating]
+    ) -> NDArray[np.floating]:
+        """Convert deformation (mm) to phase (radian)"""
+        return deformation / self.coef_rd2mm
+
+    def wrap_phase(self, phase: NDArray[np.floating]) -> NDArray[np.floating]:
+        """Wrap phase to [0, 2π]"""
+        return np.mod(phase, 2 * np.pi)

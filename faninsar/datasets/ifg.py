@@ -15,9 +15,8 @@ from tqdm.auto import tqdm
 from faninsar._core import geo_tools
 from faninsar._core.logger import setup_logger
 from faninsar._core.pair_tools import Pairs
-from faninsar._core.sar_tools import Baselines
+from faninsar._core.sar_tools import Baselines, PhaseDeformationConverter
 from faninsar.datasets.base import ApsPairs, PairDataset, RasterDataset
-from faninsar.NSBAS import PhaseDeformationConverter
 from faninsar.query import BoundingBox, GeoQuery, Points
 
 logger = setup_logger(

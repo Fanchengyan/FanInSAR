@@ -1,12 +1,11 @@
-from faninsar.NSBAS.inversion import (
+from .inversion import (
     NSBASInversion,
     NSBASMatrixFactory,
-    PhaseDeformationConverter,
     batch_lstsq,
     calculate_u,
     censored_lstsq,
 )
-from faninsar.NSBAS.tsmodels import (
+from .tsmodels import (
     AnnualSemiannualSinusoidal,
     AnnualSinusoidalModel,
     CubicModel,

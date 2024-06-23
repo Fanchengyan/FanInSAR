@@ -35,15 +35,6 @@ NSBASMatrixFactory
     :member-order: bysource
     :show-inheritance:
 
-PhaseDeformationConverter
-^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. autoclass:: PhaseDeformationConverter
-    :members:
-    :undoc-members:
-    :member-order: bysource
-    :show-inheritance:
-
 Basis Functions
 ---------------
 
