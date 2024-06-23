@@ -1,1 +1,1 @@
-from .batch import RowSampler
+from .patch import ColSampler, RowColSampler, RowSampler
