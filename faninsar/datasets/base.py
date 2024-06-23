@@ -17,6 +17,11 @@ import rasterio
 import rasterio.merge
 import shapely
 import xarray as xr
+from faninsar._core import geo_tools
+from faninsar._core.geo_tools import Profile
+from faninsar._core.logger import setup_logger
+from faninsar._core.pair_tools import Pairs
+from faninsar.query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
 from rasterio import features, fill
 from rasterio import mask as rio_mask
 from rasterio.crs import CRS
@@ -29,12 +34,6 @@ from rasterio.warp import transform as warp_transform
 from rtree.index import Index, Property
 from shapely import ops
 from tqdm.auto import tqdm
-
-from faninsar._core import geo_tools
-from faninsar._core.geo_tools import Profile
-from faninsar._core.logger import setup_logger
-from faninsar._core.pair_tools import Pairs
-from faninsar.query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
 
 __all__ = ("GeoDataset", "RasterDataset", "PairDataset", "ApsDataset")
 
@@ -1035,6 +1034,40 @@ class RasterDataset(GeoDataset):
 
         return xy
 
+    def parse_mask(
+        self,
+        percent: float,
+        bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
+        seed: int = 0,
+    ) -> np.ndarray:
+        """Parse the mask of the dataset. The mask is a boolean array where True
+        indicates valid data and False indicates invalid data, which keeps in
+        line with the GDAL/rasterio strategy
+
+        Parameters
+        ----------
+        percent : float
+            Percentage (0,1] of files to be used for parsing the mask. The files are
+            randomly selected.
+        bbox : str, one of ['bounds', 'roi'], optional
+            the bounding box used to calculate the ``width``, ``height`` 
+        seed : int, optional
+            Seed for the random number generator. Default is 0.
+        """
+        idx_all = np.arange(self.count)
+        np.random.seed(seed)
+        idx = np.random.choice(idx_all, int(percent * self.count), replace=False)
+        paths = self.files.paths[self.valid].values[idx]
+        profile = self.get_profile("roi")
+        width, height = profile["width"], profile["height"]
+        mask = np.ones((height, width), dtype=bool)
+        if self.verbose:
+            paths = tqdm(paths, desc="Parsing Mask", unit=" files")
+        for path in paths:
+            with rasterio.open(path) as src:
+                mask &= src.read(1, masked=True).mask
+        return mask
+
     def to_tiffs(
         self,
         out_dir: str | Path,
@@ -1236,7 +1269,9 @@ class PairDataset(RasterDataset):
         datetime : pd.DatetimeIndex
             datetime parsed from filenames
         """
-        raise NotImplementedError("parse_datetime method must be implemented in subclass")
+        raise NotImplementedError(
+            "parse_datetime method must be implemented in subclass"
+        )
 
     @property
     def pairs(self) -> Pairs:
