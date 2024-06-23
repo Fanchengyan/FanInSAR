@@ -15,7 +15,13 @@ FanInSAR is a Fancy Interferometric Synthetic Aperture Radar (InSAR) time series
 
 ## Installation 
 
-FanInSAR is a Python package, and requires ``Python >= 3.8``. You can install the latest release of FanInSAR using ``pip``:
+FanInSAR is a Python package, and requires ``Python >= 3.8``. You can install the latest release of FanInSAR using ``pip`` from the PyPI:
+
+```bash
+pip install FanInSAR
+```
+
+or from GitHub:
 
 ```bash
 pip install git+https://github.com/Fanchengyan/FanInSAR.git
