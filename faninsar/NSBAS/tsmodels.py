@@ -395,8 +395,11 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
 
         years = self.dates.year.unique()
         for year in years:
-            start = ftc.get_year_start(ftc.t1s, ftc.t2s, year)
-            end = ftc.get_year_end(ftc.t1s, year)
+            start = ftc.get_year_start(year)
+            end = ftc.get_year_end(year)
+
+            if not start:
+                continue
 
             m = np.logical_and(self.dates >= start, self.dates <= end)
             img_dates = self.dates[m]
@@ -404,12 +407,23 @@ class FreezeThawCycleModelWithVelocity(TimeSeriesModels):
             DDT = ftc.DDT[start:end].copy()
             DDF = ftc.DDF[start:end].copy()
 
+            if year == years[0]:
+                # add missing dates before 07-01 for DDF in the first year
+                if DDF.index[0] > start:
+                    dt_missing = pd.date_range(start, DDF.index[0], freq="1D")[:-1]
+                    DDF_missing = pd.Series(np.nan, index=dt_missing)
+                    DDF = pd.concat([DDF_missing, DDF])
+                # set coefficients to zero before the thawing onset for the first year
+                if start > self.dates[0]:
+                    df_br.loc[self.dates[0] : start, :] = 0
+                # set the DDF to 0 during the thawing onset
+
             if pd.isna(DDT[0]):
                 DDT[0] = 0
             DDF[:f"{year}-07-01"] = 0
 
-            DDT = DDT.fillna(method="ffill")
-            DDF = DDF.fillna(method="ffill")
+            DDT = DDT.ffill()
+            DDF = DDF.ffill()
 
             t3 = ftc.t3s[year]
             if not pd.isnull(t3):
