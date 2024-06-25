@@ -26,6 +26,13 @@ class PatchSampler(abc.ABC):
     def __len__(self) -> int:
         return self._length
 
+    def __str__(self) -> str:
+        string = f"{self.__class__.__name__}[boxes={self.shape}]"
+        return string
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
     def __getitem__(self, index: Any) -> BoundingBox | np.ndarray:
         """Get the bounding boxes/patches of at the given index.
 
@@ -98,7 +105,7 @@ class RowSampler(PatchSampler):
         else:
             if row_num is None:
                 raise ValueError("Either height or row_num must be provided.")
-            if row_num > height:
+            if row_num > ds_height:
                 logger.warning(
                     f"row_num ({row_num}) is larger than the height ({ds_height})\n"
                     "of the dataset. The row_num will be set to the height of the dataset.\n"
@@ -121,26 +128,18 @@ class RowSampler(PatchSampler):
         for i in range(self.row_num):
             bottom = (i * self.height) * self.res[1] + roi.bottom
             top = self.height * self.res[1] + bottom
-            patch_boxes.append([roi.left, bottom, roi.right, top])
-        # make last patch top equal to roi top
-        patch_boxes[-1][3] = roi.top
+            if i == self.row_num - 1:
+                top = roi.top
+            patch_boxes.append(
+                BoundingBox(roi.left, bottom, roi.right, top, crs=self.dataset.crs)
+            )
+
         patch_boxes = np.asarray(patch_boxes, dtype=np.object_)
+        return patch_boxes
 
     def __iter__(self) -> Iterator:
-        roi = self.dataset.roi
-        height = self.height
-        row_num = self.row_num
-
-        patch_boxes = []
-        for i in range(row_num):
-            bottom = (i * height) * self.res + roi.bottom
-            top = height * self.res + bottom
-            patch_boxes.append([roi.left, bottom, roi.right, top])
-        # make last patch top equal to roi top
-        patch_boxes[-1][3] = roi.top
-
-        for patch_bbox in patch_boxes:
-            yield BoundingBox(*patch_bbox, crs=self.dataset.crs)
+        for i in range(self.row_num):
+            yield self.boxes[i]
 
 
 class ColSampler(PatchSampler):
@@ -187,23 +186,23 @@ class ColSampler(PatchSampler):
             self.dataset.roi = roi
 
         profile = dataset.get_profile("roi")
-        width = profile["width"]
+        ds_width = profile["width"]
 
         if width is not None:
             width = int(width)
-            col_num = math.ceil(width / width)
+            col_num = math.ceil(ds_width / width)
         else:
             if col_num is None:
                 raise ValueError("Either width or col_num must be provided.")
-            if col_num > width:
+            if col_num > ds_width:
                 logger.warning(
-                    f"col_num ({col_num}) is larger than the width ({width })\n"
+                    f"col_num ({col_num}) is larger than the width ({ds_width})\n"
                     "of the dataset. The col_num will be set to the width of the dataset.\n"
                     "If this cannot meet your requirement, please try to choose other Sampler."
                 )
                 col_num = width
             col_num = int(col_num)
-            width = math.floor(width / col_num)
+            width = math.floor(ds_width / col_num)
 
         self.col_num = col_num
         self.width = width
