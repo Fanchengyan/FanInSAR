@@ -24,6 +24,94 @@ logger = setup_logger(
 )
 
 
+class CoherenceDataset(PairDataset):
+    """A base class for coherence datasets."""
+
+    _range: tuple[float, float]
+
+    @property
+    def range(self) -> tuple[float, float]:
+        """Return the range of the coherence."""
+        return self._range
+
+    def scale_range(self, arr: np.ndarray) -> np.ndarray:
+        """Scale the coherence array to the range of [0, 1]."""
+        if self.range[0] != 0 or self.range[1] != 1:
+            arr = (arr - self.range[0]) / (self.range[1] - self.range[0])
+        return arr
+
+    def trim_extreme(
+        self,
+        arr: np.ndarray,
+        val_range: tuple[float, float] | None = None,
+    ) -> np.ndarray:
+        """Trim the extreme values of the coherence array.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            coherence array to be trimmed.
+        val_range : tuple[float, float], optional
+            value range to clip the array. If None, the range of the dataset will
+            be used. Default is None.
+        """
+        if val_range is None:
+            val_range = self.range
+        arr = np.clip(arr, val_range[0], val_range[1])
+        return arr
+
+    def to_mean(
+        self,
+        pairs: Optional[Pairs] = None,
+        roi: Optional[BoundingBox] = None,
+    ) -> np.ndarray:
+        """Calculate the mean coherence for given region of interest.
+
+        Parameters
+        ----------
+        pairs : Pairs, optional
+            pairs to calculate the mean coherence. If None, will calculate the
+            mean coherence for all pairs.
+        roi : BoundingBox, optional
+            region of interest to calculate the mean coherence. If None, the roi
+            of the dataset will be used.
+
+        Returns
+        -------
+        mean_coh : np.ndarray
+            mean coherence array with value range in the interval of [0, 1].
+        """
+        if roi is None:
+            roi = self.roi
+        fill_nodata = self.fill_nodata
+        self.fill_nodata = False
+
+        # get files
+        m = self.valid
+        if pairs is not None:
+            m &= self.pairs.where(pairs, return_type="mask")
+        files = [self._load_warp_file(f) for f in self.files.paths[m]]
+
+        # load all coherence
+        coh = self._bbox_query(roi, files[0]).squeeze(0)
+        count = (~coh.mask).astype(int)
+        coh_sum = self.trim_extreme(coh.filled(0))
+        for f in tqdm(files[1:], desc="Calculating mean coherence", unit="file"):
+            coh = self._bbox_query(roi, f).squeeze(0)
+            count += (~coh.mask).astype(int)
+            coh_sum += self.trim_extreme(coh.filled(0))
+
+        # reset fill_nodata to original value
+        self.fill_nodata = fill_nodata
+
+        count = np.ma.array(count, mask=(count == 0))
+        coh_sum = np.ma.array(coh_sum, mask=(count == 0))
+        # calculate the mean coherence
+        mean_coh = coh_sum / count
+
+        return self.scale_range(mean_coh)
+
+
 class InterferogramDataset(PairDataset):
     """
     A base class for interferogram datasets.
@@ -41,6 +129,8 @@ class InterferogramDataset(PairDataset):
     pattern_unw = "*"
     #: pattern used to find coherence files.
     pattern_coh = "*"
+    #: value range of coherence.
+    coh_range: Optional[tuple[float, float]] = [0, 1]
 
     _ds_coh: RasterDataset
     _ds_dem: Optional[RasterDataset] = None
@@ -166,7 +256,7 @@ class InterferogramDataset(PairDataset):
             ds_name="Interferogram",
         )
 
-        self._ds_coh = PairDataset(
+        self._ds_coh = CoherenceDataset(
             root_dir=root_dir,
             paths=paths_coh,
             crs=self.crs,
@@ -181,6 +271,7 @@ class InterferogramDataset(PairDataset):
             verbose=verbose,
             ds_name="Coherence",
         )
+        self._ds_coh._range = self.coh_range
 
         _valid = self._valid & self._ds_coh.valid
 
@@ -386,6 +477,43 @@ class InterferogramDataset(PairDataset):
         elif angle_type == "look":
             los_ratio = np.sin(arr_theta)
         return los_ratio
+
+    def to_nan_count(
+        self,
+        pairs: Optional[Pairs] = None,
+        roi: Optional[BoundingBox] = None,
+    ) -> np.ndarray:
+        """Calculate the number of nan values for given region of interest.
+
+        Parameters
+        ----------
+        pairs : Pairs, optional
+            pairs to calculate the number of nan values. If None, will calculate
+            the number of nan values for all pairs.
+        roi : BoundingBox, optional
+            region of interest to calculate the mean coherence. If None, the roi
+            of the dataset will be used.
+        """
+        if roi is None:
+            roi = self.roi
+        fill_nodata = self.fill_nodata
+        self.fill_nodata = False
+
+        # get files
+        m = self.valid
+        if pairs is not None:
+            m &= self.pairs.where(pairs, return_type="mask")
+        files = [self._load_warp_file(f) for f in self.files.paths[m]]
+
+        # calculate the number of nan values
+        nan_count = (self._bbox_query(roi, files[0]).squeeze(0).mask).astype(int)
+        for f in tqdm(files[1:]):
+            nan_count += (self._bbox_query(roi, f).squeeze(0).mask).astype(int)
+
+        # reset fill_nodata to original value
+        self.fill_nodata = fill_nodata
+
+        return nan_count
 
     def to_netcdf(
         self,

@@ -21,6 +21,7 @@ class LiCSAR(InterferogramDataset):
 
     pattern_unw = "*geo.unw.tif"
     pattern_coh = "*geo.cc.tif"
+    coh_range = [0, 255]
 
     #: pattern used to find dem file
     pattern_dem = "*geo.hgt.tif"
