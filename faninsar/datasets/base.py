@@ -17,23 +17,26 @@ import rasterio
 import rasterio.merge
 import shapely
 import xarray as xr
-from faninsar._core import geo_tools
-from faninsar._core.geo_tools import Profile
-from faninsar._core.logger import setup_logger
-from faninsar._core.pair_tools import Pairs
-from faninsar.query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
 from rasterio import features, fill
 from rasterio import mask as rio_mask
 from rasterio.crs import CRS
+from rasterio.dtypes import dtype_ranges, get_minimum_dtype
 from rasterio.enums import Resampling
 from rasterio.io import DatasetReader
-from rasterio.transform import rowcol
+from rasterio.transform import rowcol as tf_rowcol
+from rasterio.transform import xy as tf_xy
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import calculate_default_transform
 from rasterio.warp import transform as warp_transform
 from rtree.index import Index, Property
 from shapely import ops
 from tqdm.auto import tqdm
+
+from faninsar._core import geo_tools
+from faninsar._core.geo_tools import Profile
+from faninsar._core.logger import setup_logger
+from faninsar._core.pair_tools import Pairs
+from faninsar.query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
 
 __all__ = ("GeoDataset", "RasterDataset", "PairDataset", "ApsDataset")
 
@@ -369,6 +372,34 @@ class GeoDataset(abc.ABC):
         """
         return BoundingBox(*self.index.bounds, crs=self.crs)
 
+    def _ensure_bbox(
+        self, bbox: BoundingBox | Literal["roi", "bounds"] = "roi"
+    ) -> BoundingBox | None:
+        """Return the bounds of the dataset for the given bounding box type.
+
+        Parameters
+        ----------
+        bbox : BoundingBox | Literal["roi", "bounds"], optional
+            the bounding box used to calculate the bounds of the dataset.
+            Default is 'roi'.
+
+        Returns
+        -------
+        bounds: BoundingBox | None
+            bounds of the dataset for the given bounding box type.
+        """
+        if bbox == "bounds":
+            return self.bounds
+        elif bbox == "roi":
+            return self.roi
+        elif isinstance(bbox, BoundingBox):
+            return self._check_roi(bbox)
+        else:
+            raise ValueError(
+                "bbox must be one of ['bounds', 'roi'] or a "
+                f"BoundingBox, but got {bbox}"
+            )
+
     def get_profile(
         self, bbox: BoundingBox | Literal["roi", "bounds"] = "roi"
     ) -> Profile | None:
@@ -388,25 +419,11 @@ class GeoDataset(abc.ABC):
         profile: Profile object or None
             profile of the dataset for the given bounding box type.
         """
-        if bbox == "bounds":
-            if self.bounds is None:
-                return None
-            else:
-                bounds = self.bounds
-        elif bbox == "roi":
-            if self.roi is None:
-                return None
-            else:
-                bounds = self.roi
-        elif isinstance(bbox, BoundingBox):
-            bounds = self._check_roi(bbox)
-        else:
-            raise ValueError(
-                "bbox must be one of ['bounds', 'roi'] or a "
-                f"BoundingBox, but got {bbox}"
-            )
+        bbox = self._ensure_bbox(bbox)
+        if bbox is None:
+            return None
 
-        profile = Profile.from_bounds_res(bounds, self.res)
+        profile = Profile.from_bounds_res(bbox, self.res)
         profile["count"] = self.count
         profile["dtype"] = self.dtype
         profile["nodata"] = self.nodata
@@ -986,7 +1003,7 @@ class RasterDataset(GeoDataset):
 
         profile = self.get_profile(bbox)
 
-        rows, cols = rowcol(profile["transform"], xy[:, 0], xy[:, 1])
+        rows, cols = tf_rowcol(profile["transform"], xy[:, 0], xy[:, 1])
         row_col = np.column_stack((rows, cols))
         return row_col
 
@@ -1003,8 +1020,8 @@ class RasterDataset(GeoDataset):
         row_col: Sequence
             Pairs of row, col in the dataset (floats)
         crs: CRS or str, optional
-            The CRS of the points. If None, the CRS of the dataset will be used.
-            allowed CRS formats are the same as those supported by rasterio.
+            The CRS of output points. If None, the CRS of the dataset will be used.
+            Can be any of the formats supported by :meth:`pyproj.CRS.from_user_input`.
         bbox : str, one of ['bounds', 'roi'], optional
             the bounding box used to calculate the ``width``, ``height``
             and ``transform`` of the dataset for the profile. Default is 'roi'.
@@ -1024,12 +1041,12 @@ class RasterDataset(GeoDataset):
 
         profile = self.get_profile(bbox)
 
-        xs, ys = xy(profile["transform"], row_col[:, 0], row_col[:, 1])
+        xs, ys = tf_xy(profile["transform"], row_col[:, 0], row_col[:, 1])
 
         if crs is not None:
             crs = CRS.from_user_input(crs)
             if crs != self.crs:
-                xs, ys = warp_transform(crs, self.crs, xy[:, 0], xy[:, 1])
+                xs, ys = warp_transform(self.crs, crs, xs, ys)
         xy = np.column_stack((xs, ys))
 
         return xy
@@ -1042,7 +1059,7 @@ class RasterDataset(GeoDataset):
     ) -> np.ndarray:
         """Parse the mask of the dataset. The mask is a boolean array where True
         indicates valid data and False indicates invalid data, which keeps in
-        line with the GDAL/rasterio strategy
+        line with the GDAL/rasterio strategy.
 
         Parameters
         ----------
@@ -1050,22 +1067,63 @@ class RasterDataset(GeoDataset):
             Percentage (0,1] of files to be used for parsing the mask. The files are
             randomly selected.
         bbox : str, one of ['bounds', 'roi'], optional
-            the bounding box used to calculate the ``width``, ``height`` 
+            the desired region of mask. Default is 'roi'.
         seed : int, optional
             Seed for the random number generator. Default is 0.
         """
+        # randomly select a subset of files
         idx_all = np.arange(self.count)
         np.random.seed(seed)
         idx = np.random.choice(idx_all, int(percent * self.count), replace=False)
         paths = self.files.paths[self.valid].values[idx]
-        profile = self.get_profile("roi")
+
+        # get the profile of the dataset
+        profile = self.get_profile(bbox)
         width, height = profile["width"], profile["height"]
         mask = np.ones((height, width), dtype=bool)
+
         if self.verbose:
             paths = tqdm(paths, desc="Parsing Mask", unit=" files")
         for path in paths:
             with rasterio.open(path) as src:
-                mask &= src.read(1, masked=True).mask
+                bbox = self._ensure_bbox(bbox)
+                if bbox is None:
+                    win = None
+                else:
+                    win = src.window(*bbox)
+                mask &= src.read(1, masked=True, window=win).mask
+        return ~mask
+
+    def load_mask(
+        self,
+        mask_path: str | Path,
+        bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
+    ) -> np.ndarray:
+        """Load a mask from a tiff mask file (.msk)
+
+        Parameters
+        ----------
+        mask_path : str or Path
+            path to the mask file of tiff format (.msk)
+        bbox : str, one of ['bounds', 'roi'], optional
+            the desired region of mask. Default is 'roi'.
+        """
+        bbox = self._ensure_bbox(bbox)
+        profile = self.get_profile(self.bounds)
+
+        with rasterio.open(mask_path) as src:
+            mask = src.read(1)
+
+        if profile["width"] != mask.shape[1] or profile["height"] != mask.shape[0]:
+            raise ValueError(
+                f"The shape of the mask {mask.shape} does not match the shape "
+                f"of the dataset {(profile['width'], profile['height'])}."
+            )
+        # crop the mask to the desired region
+        with rasterio.open(self.files.paths[self.valid].values[0]) as src:
+            win = src.window(*bbox)
+            mask = mask[win[0] : win[1], win[2] : win[3]]
+
         return mask
 
     def to_tiffs(
@@ -1129,30 +1187,37 @@ class RasterDataset(GeoDataset):
         )
         ds.to_netcdf(filename)
 
-    def save_arr_to_tiff(
+    def array2tiff(
         self,
         arr: np.ndarray,
         filename: str | Path,
-        roi: Optional[BoundingBox] = None,
-        profile: Optional[Profile] = None,
+        bbox: Optional[BoundingBox] = None,
         band_names: Sequence[str] | None = None,
+        arr_type: Literal["data", "mask"] = "data",
+        nodata: float | int | None = None,
     ) -> None:
-        """Save a numpy array to a tiff file using the geoinformation of the dataset.
+        """Save a numpy array to a tiff file using the geoinformation of dataset.
 
         Parameters
         ----------
         arr : numpy.ndarray
             numpy array to save. arr can be a 2D array or a 3D array. If arr is a
-            3D array, the first dimension is the band dimension.
+            3D array, the first dimension should be the band dimension.
         filename : str or Path
             path to the tiff file to save
-        roi : BoundingBox, optional
-            Region of interest to save. only used if profile is None.
-        profile : Profile, optional
-            profile of the tiff file. If None, the roi must be specified.
+        bbox : BoundingBox, optional
+            if specified, the input array will be saved to the given part/bbox of
+            dataset. Default is None, which means the array will be saved to the
+            entire dataset.
         band_names : Sequence of str, optional
             names of bands to save. Default is None, which will use the band indexes.
+        arr_type : str, one of ['data', 'mask'], optional
+            type of the array to save. Default is 'data'.
+        nodata : float or int, optional
+            no data value of the dataset. If None, will automatically parse the
+            a proper no data value for the array.
         """
+        # check arr dimension
         if arr.ndim == 2:
             indexes = [1]
             arr = arr[np.newaxis, :, :]
@@ -1160,25 +1225,57 @@ class RasterDataset(GeoDataset):
             indexes = [i + 1 for i in range(arr.shape[0])]
         else:
             raise ValueError(
-                f"Expected arr to be an array of shape (n, m) or (n, m, k), got {arr.shape}"
+                f"Expected arr to be an array with shape of (n_lat, n_lon) or "
+                f"(n_band, n_lat, n_lon), got {arr.shape}"
             )
+        # check length of band_names
         if band_names is not None:
             if len(band_names) != arr.shape[0]:
                 raise ValueError(
                     f"Expected band_names to be of length {arr.shape[0]}, got {len(band_names)}"
                 )
+        # parse profile
+        profile = self.get_profile(self.roi)
+        profile["count"] = arr.shape[0]
+        profile["driver"] = "GTiff"
+        profile["dtype"] = get_minimum_dtype(arr)
+        if nodata is None:
+            if np.issubdtype(arr.dtype, np.floating):
+                nodata = np.nan
+            else:
+                rng = dtype_ranges[profile["dtype"]]
+                if np.any(arr == rng[0]):
+                    nodata = rng[1]
+                else:
+                    nodata = rng[0] - 1
+        profile["nodata"] = nodata
+        mode = "w"
+        if Path(filename).exists():
+            mode = "r+"
 
-        if profile is None:
-            if roi is None:
-                raise ValueError("roi must be specified if profile is None")
-            profile = self.get_profile(roi)
-            profile["count"] = arr.shape[0]
+        dst = rasterio.open(filename, mode, **profile)
 
-        with rasterio.open(filename, "w", **profile) as dst:
-            dst.write(arr, indexes)
-            if band_names is not None:
+        # parse whether to update band names
+        desc = np.asarray(dst.descriptions, dtype="str")
+        update_tags = False
+        if band_names is not None and np.all(desc == "None"):
+            update_tags = True
+
+        # parse window
+        if bbox is None:
+            win = None
+        else:
+            win = dst.window(*bbox)
+
+        # write array to tiff
+        if arr_type == "mask":
+            dst.write_mask(arr)
+        elif arr_type == "data":
+            dst.write(arr, indexes, window=win)
+            if update_tags:
                 for i, name in enumerate(band_names):
                     dst.update_tags(i + 1, NAME=name)
+        dst.close()
 
 
 class PairDataset(RasterDataset):
