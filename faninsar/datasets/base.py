@@ -32,11 +32,11 @@ from rtree.index import Index, Property
 from shapely import ops
 from tqdm.auto import tqdm
 
-from faninsar._core import geo_tools
-from faninsar._core.geo_tools import Profile
-from faninsar._core.logger import setup_logger
-from faninsar._core.pair_tools import Pairs
-from faninsar.query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
+from .._core import geo_tools
+from .._core.geo_tools import Profile, geoinfo_from_latlon
+from .._core.logger import setup_logger
+from .._core.pair_tools import Pairs
+from ..query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
 
 __all__ = ("GeoDataset", "RasterDataset", "PairDataset", "ApsDataset")
 
@@ -331,34 +331,6 @@ class GeoDataset(abc.ABC):
             is valid and can be read by rasterio, False means the file is invalid.
         """
         return self._valid
-
-    @property
-    def count(self) -> int:
-        """Number of valid files in the dataset.
-
-        .. Note::
-
-            This is different from the length of the dataset ``len(GeoDataset)``,
-            which is the total number of files in the dataset, including invalid
-            files that cannot be read by rasterio.
-
-        Returns
-        -------
-        count: int
-            number of valid files in the dataset
-        """
-        return self._count
-
-    @count.setter
-    def count(self, new_count: int) -> None:
-        """Set the number of files in the dataset.
-
-        Parameters
-        ----------
-        new_count : int
-            number of files in the dataset
-        """
-        self._count = int(new_count)
 
     @property
     def bounds(self) -> BoundingBox:
@@ -956,6 +928,34 @@ class RasterDataset(GeoDataset):
             return src
 
     @property
+    def count(self) -> int:
+        """Number of valid files in the dataset.
+
+        .. Note::
+
+            This is different from the length of the dataset ``len(GeoDataset)``,
+            which is the total number of files in the dataset, including invalid
+            files that cannot be read by rasterio.
+
+        Returns
+        -------
+        count: int
+            number of valid files in the dataset
+        """
+        return self._count
+
+    @count.setter
+    def count(self, new_count: int) -> None:
+        """Set the number of files in the dataset.
+
+        Parameters
+        ----------
+        new_count : int
+            number of files in the dataset
+        """
+        self._count = int(new_count)
+
+    @property
     def files(self) -> pd.DataFrame:
         """Return a list of all files in the dataset.
 
@@ -1276,6 +1276,127 @@ class RasterDataset(GeoDataset):
                 for i, name in enumerate(band_names):
                     dst.update_tags(i + 1, NAME=name)
         dst.close()
+
+
+class HierarchicalDataset(GeoDataset):
+    """A base class for hierarchical dataset, like h5 and nc files.
+
+    .. note::
+        This class is used to load and sample data from a single file. If you
+        want to load and sample data from multiple files, you should use
+        :class:`MultiHierarchicalDataset`.
+    """
+
+    lat_name: str = "lat"
+    lon_name: str = "lon"
+
+    def __init__(
+        self,
+        path: str | Path,
+        group: str | None = None,
+        variable: str | None = None,
+        roi: BoundingBox | None = None,
+    ):
+        super().__init__()
+        self._path = Path(path)
+        self._group = group
+        self._variable = variable
+        
+        bound, res, shape, crs = self._parse_geoinfo(self._path)
+        self._bound = bound
+        self._res = res
+        self._crs = crs
+        self._shape = shape
+        self._roi = roi
+
+    def _parse_geoinfo(
+        self, path: str | Path
+    ) -> tuple[BoundingBox, tuple[float, float], tuple[int, int], CRS]:
+        """Parse the geoinformation of the dataset."""
+        with xr.open_dataset(path) as ds:
+            lat = ds[self.lat_name].values
+            lon = ds[self.lon_name].values
+            crs = ds.rio.crs
+
+        # parse geo-information
+        if crs is None:
+            if (
+                np.all(lat >= -90)
+                and np.all(lat <= 90)
+                and np.all(lon >= -180)
+                and np.all(lon <= 180)
+            ):
+                warnings.warn(
+                    "No CRS is specified for the dataset, assuming the lat/lon values "
+                    "are in the range of WGS84."
+                )
+                crs = CRS.from_epsg(4326)
+            else:
+                raise ValueError(
+                    "No CRS is specified for the dataset, and the lat/lon values are "
+                    "not in the range of WGS84. Please specify the CRS of the dataset"
+                    "using the :meth:`set_crs` method later."
+                )
+        else:
+            crs = CRS.from_user_input(ds.rio.crs)
+        # parse bound, resolution, shape
+        bound, res, shape = geoinfo_from_latlon(lat, lon)
+        bound.set_crs(crs)
+
+        return bound, res, shape, crs
+
+    def __getitem__(self, bbox: BoundingBox) -> np.ndarray:
+        """Retrieve the data of the dataset for the given bounding box."""
+        bbox = bbox.to_crs
+        slice_lat = slice(bbox.top, bbox.bottom)
+        slice_lon = slice(bbox.left, bbox.right)
+        with xr.open_dataset(self.path, group=self.group) as ds:
+            if self.variable is None:
+                data = ds.sel(lat=slice_lat, lon=slice_lon).values
+            else:
+                data = ds[self.variable].sel(lat=slice_lat, lon=slice_lon).values
+        return data
+
+    def set_crs(self, crs: CRS | str):
+        """Set the CRS of the dataset.
+
+        .. note::
+            This method is used to set the CRS of the dataset if it is not
+            specified in the dataset. If the CRS is already specified in the
+            dataset, this method will overwrite the CRS.
+        """
+        self._crs = CRS.from_user_input(crs)
+        self._bounds.set_crs(self._crs)
+
+    @property
+    def path(self) -> Path:
+        """the path of the dataset."""
+        return self._path
+
+    # @property
+    # def group(self) -> str:
+    #     """the group of the dataset."""
+    #     return self._group
+
+    # @property
+    # def dataset(self) -> str:
+    #     """the dataset of the dataset."""
+    #     return self._dataset
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """the shape of the dataset in (height, width)."""
+        return self._shape
+
+    @property
+    def bounds(self) -> BoundingBox:
+        """the bounds of the dataset."""
+        return self._bound
+
+
+class MultiHierarchicalDataset(GeoDataset):
+    def __init__(self, paths: Sequence[str | Path], **kwargs):
+        pass
 
 
 class PairDataset(RasterDataset):
