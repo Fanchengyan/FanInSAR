@@ -14,7 +14,8 @@ from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
 from tqdm.auto import tqdm
 
-from faninsar._core.logger import setup_logger
+from ..query.bbox import BoundingBox
+from .logger import setup_logger
 
 logger = setup_logger(
     log_name="FanInSAR.geo_tools", log_format="%(levelname)s - %(message)s"
@@ -435,19 +436,49 @@ class Profile:
         return lat, lon
 
 
-def geoinfo_from_latlon(lat, lon):
-    west, south, east, north, width, height = (
+def bound_from_latlon(
+    lat: np.ndarray, lon: np.ndarray
+) -> Tuple[float, float, float, float]:
+    """get the bounds from latitude and longitude."""
+    west, south, east, north = (
         np.nanmin(lon),
         np.nanmin(lat),
         np.nanmax(lon),
         np.nanmax(lat),
-        len(lon),
-        len(lat),
     )
+    return west, south, east, north
+
+
+def geoinfo_from_latlon(
+    lat: np.ndarray, lon: np.ndarray
+) -> tuple[BoundingBox, tuple, tuple]:
+    """get the geoinformation from latitude and longitude.
+
+    Parameters
+    ----------
+    lat, lon: numpy.ndarray or list
+        latitudes and longitudes
+
+    Returns
+    --------
+    bound: BoundingBox
+        the bounding box of the raster.
+
+        .. note:: the crs is not set yet.
+    res: tuple[xsize, ysize]
+        the resolution of the raster
+    shape: tuple[height, width]
+        the shape of the raster
+    """
+    west, south, east, north = bound_from_latlon(lat, lon)
+    width, height = len(lon), len(lat)
 
     xsize = (east - west) / (width - 1)
     ysize = (north - south) / (height - 1)
-    return (west, north, xsize, ysize, width, height)
+    bound = BoundingBox(west, south, east, north)
+    res = (xsize, ysize)
+    shape = (height, width)
+    return bound, res, shape
 
 
 def transform_from_latlon(lat, lon) -> Affine:
