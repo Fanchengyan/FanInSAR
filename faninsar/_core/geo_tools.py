@@ -606,15 +606,31 @@ def write_geoinfo_into_nc(
 
 def match_to_raster(
     src_arr,
-    src_crs,
-    src_tf,
-    dst_height,
-    dst_width,
-    dst_crs,
-    dst_tf,
-    nodata=np.nan,
+    src_profile,
+    dst_profile,
     resampleAlg=Resampling.nearest,
 ):
+    """match the source raster to the destination raster.
+    
+    Parameters
+    ----------
+    src_arr: numpy.ndarray
+        the source array to be matched.
+    src_profile: dict
+        the profile of the source raster.
+    dst_profile: dict
+        the profile of the destination raster.
+    resampleAlg: Resampling
+        the resampling algorithm. Default is Resampling.nearest.    
+    """
+    src_crs = src_profile["crs"]
+    src_tf = src_profile["transform"]
+    dst_height = dst_profile["height"]
+    dst_width = dst_profile["width"]
+    dst_crs = dst_profile["crs"]
+    dst_tf = dst_profile["transform"]
+    nodata = dst_profile["nodata"]
+
     if src_arr.ndim == 2:
         indexes = 1
         src_n_band = 1
