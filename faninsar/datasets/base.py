@@ -15,6 +15,7 @@ import pandas as pd
 import pyproj
 import rasterio
 import rasterio.merge
+import rioxarray
 import shapely
 import xarray as xr
 from rasterio import features, fill
@@ -43,6 +44,9 @@ __all__ = ("GeoDataset", "RasterDataset", "PairDataset", "ApsDataset")
 logger = setup_logger(
     log_name="FanInSAR.datasets.base", log_format="%(levelname)s - %(message)s"
 )
+
+lat_names = ["latitude", "lat", "y"]
+lon_names = ["longitude", "lon", "x", "long", "lng"]
 
 
 class GeoDataset(abc.ABC):
@@ -1226,6 +1230,9 @@ class RasterDataset(GeoDataset):
         nodata : float or int, optional
             no data value of the dataset. If None, will automatically parse the
             a proper no data value for the array.
+        overwrite : bool, optional
+            if True, overwrite the existing file. Default is False, which means
+            the array will be saved in append mode (r+ mode).
         """
         # check arr dimension
         if arr.ndim == 2:
@@ -1257,9 +1264,9 @@ class RasterDataset(GeoDataset):
             else:
                 rng = dtype_ranges[profile["dtype"]]
                 if np.any(arr == rng[0]):
-                    nodata = rng[1]
+                    nodata = rng[1] - 1
                 else:
-                    nodata = rng[0] - 1
+                    nodata = rng[0]
         profile["nodata"] = nodata
         mode = "w"
         if Path(filename).exists():
@@ -1312,18 +1319,43 @@ class HierarchicalDataset(GeoDataset):
         super().__init__()
         self._path = Path(path)
         self._group = group
+        self._roi = roi
+        self._update_geo_info()
 
-        bound, res, shape, crs, ds_info = self._parse_geoinfo(self._path)
+    def __repr__(self) -> str:
+        return self._repr_str
+
+    def _update_geo_info(self) -> None:
+        bound, res, shape, crs, ds_info = self._parse_geo_info(self._path)
         self._bound = bound
         self._res = res
         self._crs = crs
         self._shape = shape
-        self._roi = roi
         self._lat = ds_info[0]
         self._lon = ds_info[1]
         self._variables = ds_info[2]
+        self._repr_str = ds_info[3]
 
-    def _parse_geoinfo(self, path: str | Path) -> tuple[
+    def _parse_lat_lon_name(self, ds: xr.Dataset) -> tuple[str, str]:
+        """Parse the name of the latitude and longitude variables."""
+        lat_name = None
+        lon_name = None
+        if self.lat_name in ds.variables and self.lon_name in ds.variables:
+            return None
+
+        for name in ds.variables:
+            if name.lower() in lat_names:
+                lat_name = name
+            if name.lower() in lon_names:
+                lon_name = name
+        if lat_name is None or lon_name is None:
+            raise ValueError(
+                "The dataset does not contain latitude and longitude variables. "
+                "Please specify the names of the latitude and longitude variables."
+            )
+        return lat_name, lon_name
+
+    def _parse_geo_info(self, path: str | Path) -> tuple[
         BoundingBox,
         tuple[float, float],
         tuple[int, int],
@@ -1331,7 +1363,12 @@ class HierarchicalDataset(GeoDataset):
     ]:
         """Parse the geoinformation of the dataset."""
         with xr.open_dataset(path) as ds:
-            variables = ds.variables
+            coord_names = self._parse_lat_lon_name(ds)
+            if coord_names is not None:
+                self.lat_name, self.lon_name = coord_names
+
+            repr_str = ds.__repr__()
+            variables = [i for i in ds.variables]
             lat = ds[self.lat_name].values
             lon = ds[self.lon_name].values
             crs = ds.rio.crs
@@ -1361,15 +1398,26 @@ class HierarchicalDataset(GeoDataset):
         bound, res, shape = geoinfo_from_latlon(lat, lon)
         bound.set_crs(crs)
 
-        return bound, res, shape, crs, (lat, lon, variables)
+        return bound, res, shape, crs, (lat, lon, variables, repr_str)
 
-    def __getitem__(
-        self, query: GeoQuery | BoundingBox | Points | Polygons
-    ) -> np.ndarray:
-        """Retrieve the data of the dataset for the given bounding box."""
-        pass
+    def __getitem__(self, var: str) -> xr.DataArray | xr.Dataset:
+        """Get the variable from the dataset."""
+        with xr.open_dataset(self.path, group=self.group) as ds:
+            return ds[var]
 
-    def _bbox_query(self, bbox: BoundingBox, variable: str | None = None) -> np.ndarray:
+    def flush_geo_info(self) -> None:
+        """Flush the geoinformation of the dataset to the given file."""
+        with xr.open_dataset(self.path, group=self.group, mode="a") as ds:
+            ds.rio.write_crs(self.crs)
+            ds.rio.set_spatial_dims(x_dim=self.lon_name, y_dim=self.lat_name)
+        self._update_geo_info()
+
+    def _bbox_query(
+        self,
+        bbox: BoundingBox,
+        variable: str | None = None,
+        engine: Literal["rioxarray", "xarray"] = "rioxarray",
+    ) -> xr.DataArray | xr.Dataset:
         """Retrieve the data of the dataset for the given bounding box."""
         bbox = self._ensure_query_crs(bbox)
 
@@ -1381,11 +1429,17 @@ class HierarchicalDataset(GeoDataset):
         slice_lon = slice(bbox.left, bbox.right)
 
         # read data
+        if engine == "rioxarray":
+            with rasterio.open(self.path) as src:
+                win = src.window(*bbox)
+                data = rioxarray.open_rasterio(self.path, window=win)
+            
         with xr.open_dataset(self.path, group=self.group) as ds:
+            ds = ds.rename({self.lat_name: "lat", self.lon_name: "lon"})
             if variable is None:
-                data = ds.sel(lat=slice_lat, lon=slice_lon).values
+                data = ds.sel(lat=slice_lat, lon=slice_lon)
             else:
-                data = ds[variable].sel(lat=slice_lat, lon=slice_lon).values
+                data = ds[variable].sel(lat=slice_lat, lon=slice_lon)
         return data
 
     def query(
@@ -1415,6 +1469,50 @@ class HierarchicalDataset(GeoDataset):
         result = QueryResult(data, query)
 
         return result
+
+    def sel(
+        self,
+        variable: str | None = None,
+        **kwargs,
+    ) -> xr.DataArray | xr.Dataset:
+        """Select a variable from the dataset. This method is a wrapper of
+        :meth:`xarray.Dataset.sel` or :meth:`xarray.DataArray.sel`.
+
+        Parameters
+        ----------
+        variable : str, optional
+            name of the variable to select. If None, the entire dataset will be selected.
+        **kwargs : dict
+            keyword arguments to pass to :meth:`xarray.Dataset.sel` or :meth:`xarray.DataArray.sel`.
+        """
+        with xr.open_dataset(self.path, group=self.group) as ds:
+            if variable is None:
+                data = ds.sel(**kwargs)
+            else:
+                data = ds[variable].sel(**kwargs)
+        return data
+
+    def isel(
+        self,
+        variable: str | None = None,
+        **kwargs,
+    ) -> xr.DataArray | xr.Dataset:
+        """Index a variable from the dataset. This method is a wrapper of
+        :meth:`xarray.Dataset.isel` or :meth:`xarray.DataArray.isel`.
+
+        Parameters
+        ----------
+        variable : str, optional
+            name of the variable to index. If None, the entire dataset will be indexed.
+        **kwargs : dict
+            keyword arguments to pass to :meth:`xarray.Dataset.isel` or :meth:`xarray.DataArray.isel`.
+        """
+        with xr.open_dataset(self.path, group=self.group) as ds:
+            if variable is None:
+                data = ds.isel(**kwargs)
+            else:
+                data = ds[variable].isel(**kwargs)
+        return data
 
     def set_crs(self, crs: CRS | str):
         """Set the CRS of the dataset.
@@ -1457,6 +1555,11 @@ class HierarchicalDataset(GeoDataset):
         """the longitudes of the dataset."""
         return self._lon
 
+    @property
+    def variables(self) -> list[str]:
+        """the variables of the dataset."""
+        return self._variables
+
     def get_profile(
         self, bbox: BoundingBox | Literal["roi"] | Literal["bounds"] = "roi"
     ) -> Profile | None:
@@ -1476,6 +1579,7 @@ class HierarchicalDataset(GeoDataset):
         band_names: Sequence[str] | None = None,
         arr_type: Literal["data", "mask"] = "data",
         nodata: float | int | None = None,
+        overwrite: bool = False,
     ) -> None:
         """Save a numpy array to a tiff file using the geoinformation of dataset.
 
@@ -1500,6 +1604,9 @@ class HierarchicalDataset(GeoDataset):
         nodata : float or int, optional
             no data value of the dataset. If None, will automatically parse the
             a proper no data value for the array.
+        overwrite : bool, optional
+            if True, overwrite the existing file. Default is False, which means
+            the array will be saved in append mode (r+ mode).
         """
         # check arr dimension
         if arr.ndim == 2:
@@ -1531,13 +1638,14 @@ class HierarchicalDataset(GeoDataset):
             else:
                 rng = dtype_ranges[profile["dtype"]]
                 if np.any(arr == rng[0]):
-                    nodata = rng[1]
+                    nodata = rng[1] - 1
                 else:
-                    nodata = rng[0] - 1
+                    nodata = rng[0]
         profile["nodata"] = nodata
         mode = "w"
         if Path(filename).exists():
-            mode = "r+"
+            if not overwrite:
+                mode = "r+"
 
         dst = rasterio.open(filename, mode, **profile)
 
