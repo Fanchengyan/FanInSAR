@@ -8,7 +8,7 @@ import re
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence, overload
+from typing import Any, Literal, Sequence, overload
 
 import numpy as np
 import pandas as pd
@@ -33,7 +33,13 @@ from shapely import ops
 from tqdm.auto import tqdm
 
 from .._core import geo_tools
-from .._core.geo_tools import Profile, geoinfo_from_latlon
+from .._core.geo_tools import (
+    Profile,
+    array2kml,
+    array2kmz,
+    geoinfo_from_latlon,
+    save_colorbar,
+)
 from .._core.logger import setup_logger
 from .._core.pair_tools import Pairs
 from ..query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
@@ -53,11 +59,11 @@ class GeoDataset(abc.ABC):
     """
 
     # following attributes should be set by the subclass
-    _crs: Optional[CRS] = None
+    _crs: CRS | None = None
     _res: tuple[float, float] = (0.0, 0.0)
-    _dtype: Optional[np.dtype] = None
+    _dtype: np.dtype | None = None
     _count: int = 0
-    _roi: Optional[BoundingBox] = None
+    _roi: BoundingBox | None = None
     _nodata: Any = None
     _valid: np.ndarray
 
@@ -83,7 +89,7 @@ class GeoDataset(abc.ABC):
 
     def __getstate__(
         self,
-    ) -> tuple[dict[str, Any], list[tuple[Any, Any, Optional[Any]]]]:
+    ) -> tuple[dict[str, Any], list[tuple[Any, Any, Any]]]:
         """Define how instances are pickled.
 
         Returns:
@@ -253,7 +259,7 @@ class GeoDataset(abc.ABC):
             return self.bounds
 
     @roi.setter
-    def roi(self, new_roi: Optional[BoundingBox]):
+    def roi(self, new_roi: BoundingBox):
         """Set the region of interest of the dataset.
 
         Parameters
@@ -972,7 +978,7 @@ class RasterDataset(GeoDataset):
     def row_col(
         self,
         xy: Sequence,
-        crs: Optional[CRS | str] = None,
+        crs: CRS | str | None = None,
         bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
     ) -> np.ndarray:
         """Convert x, y coordinates to row, col in the dataset.
@@ -1015,7 +1021,7 @@ class RasterDataset(GeoDataset):
     def xy(
         self,
         row_col: Sequence,
-        crs: Optional[CRS | str] = None,
+        crs: CRS | str | None = None,
         bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
     ) -> np.ndarray:
         """Convert row, col in the dataset to x, y coordinates.
@@ -1134,7 +1140,7 @@ class RasterDataset(GeoDataset):
     def to_tiffs(
         self,
         out_dir: str | Path,
-        roi: Optional[BoundingBox] = None,
+        roi: BoundingBox | None = None,
     ):
         """Save the dataset to a directory of tiff files for given region of interest.
 
@@ -1160,7 +1166,7 @@ class RasterDataset(GeoDataset):
     def to_netcdf(
         self,
         filename: str | Path,
-        roi: Optional[BoundingBox] = None,
+        roi: BoundingBox | None = None,
     ) -> None:
         """Save the dataset to a netCDF file for given region of interest.
 
@@ -1196,8 +1202,8 @@ class RasterDataset(GeoDataset):
         self,
         arr: np.ndarray,
         filename: str | Path,
-        bounds: Optional[BoundingBox] = None,
-        bbox: Optional[BoundingBox] = None,
+        bounds: BoundingBox | None = None,
+        bbox: BoundingBox | None = None,
         band_names: Sequence[str] | None = None,
         arr_type: Literal["data", "mask"] = "data",
         nodata: float | int | None = None,
@@ -1213,8 +1219,8 @@ class RasterDataset(GeoDataset):
         filename : str or Path
             path to the tiff file to save
         bounds : BoundingBox, optional
-            the bounds of the output dataset. Default is None, which means the
-            roi of the dataset will be used.
+            the bounds of the arr. Default is None, which means the roi of the
+            dataset will be used.
         bbox : BoundingBox, optional
             if specified, the input array will be saved to the given part/bbox of
             dataset. Default is None, which means the array will be saved to the
@@ -1251,16 +1257,7 @@ class RasterDataset(GeoDataset):
         profile["count"] = arr.shape[0]
         profile["driver"] = "GTiff"
         profile["dtype"] = get_minimum_dtype(arr)
-        if nodata is None:
-            if np.issubdtype(arr.dtype, np.floating):
-                nodata = np.nan
-            else:
-                rng = dtype_ranges[profile["dtype"]]
-                if np.any(arr == rng[0]):
-                    nodata = rng[1]
-                else:
-                    nodata = rng[0] - 1
-        profile["nodata"] = nodata
+        profile["nodata"] = get_nodata(arr, nodata, profile["dtype"])
         mode = "w"
         if Path(filename).exists():
             if not overwrite:
@@ -1289,6 +1286,106 @@ class RasterDataset(GeoDataset):
                 for i, name in enumerate(band_names):
                     dst.update_tags(i + 1, NAME=name)
         dst.close()
+
+    def array2kml(
+        self,
+        arr: np.ndarray,
+        out_file: str | Path,
+        bounds: BoundingBox | None = None,
+        img_kwargs: dict = {},
+        cbar_kwargs: dict = {},
+        verbose: bool = True,
+    ):
+        """write a numpy array into a kml file.
+
+        Parameters
+        ----------
+        arr: numpy.ndarray
+            the numpy array to be written into kml file.
+        out_file: str or Path
+            the path of the kml file.
+        bounds : BoundingBox, optional
+            the bounds of the arr. Default is None, which means the roi of the
+            dataset will be used.
+        img_kwargs: dict
+            the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
+        cbar_kwargs: dict
+            the keyword arguments for :func:`save_colorbar` function, except for
+            the out_file and mappable argument.
+        verbose: bool
+            whether to print the information of the kml file. Default is verbose.
+        """
+        if bounds is None:
+            bounds = self.roi
+
+        wgs84 = CRS.from_epsg(4326)
+        if self.crs != wgs84:
+            profile = self.get_profile(bounds)
+            lat, lon = profile.to_latlon()
+            dtype = get_minimum_dtype(arr)
+            nodata = get_nodata(arr, None, dtype)
+
+            da = xr.DataArray(arr, coords=[lat, lon], dims=["y", "x"])
+            da.rio.set_spatial_dims("x", "y", inplace=True)
+            da.rio.write_crs(self.crs, inplace=True)
+            da = da.rio.reproject(wgs84, nodata=nodata)
+            # update arr and bounds
+            arr = da.values
+            bounds, *_ = geoinfo_from_latlon(da.y, da.x)
+            bounds.set_crs(wgs84)
+
+        array2kml(arr, out_file, bounds, img_kwargs, cbar_kwargs, verbose)
+
+    def array2kmz(
+        self,
+        arr: np.ndarray,
+        out_file: str | Path,
+        bounds: BoundingBox | None = None,
+        img_kwargs: dict = {},
+        cbar_kwargs: dict = {},
+        keep_kml: bool = False,
+        verbose: bool = True,
+    ):
+        """Write a numpy array into a kmz file.
+
+        Parameters
+        ----------
+        arr: numpy.ndarray
+            the numpy array to be written into kmz file.
+        out_file: str or Path
+            the path of the kmz file.
+        bounds : BoundingBox, optional
+            the bounds of the arr. Default is None, which means the roi of the
+            dataset will be used.
+        img_kwargs: dict
+            the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
+        cbar_kwargs: dict
+            the keyword arguments for :func:`save_colorbar` function, except for
+            the out_file and mappable argument.
+        keep_kml: bool
+            whether to keep the kml file. Default is False.
+        verbose: bool
+            whether to print the information of the kmz file. Default is verbose.
+        """
+        if bounds is None:
+            bounds = self.roi
+        wgs84 = CRS.from_epsg(4326)
+        if self.crs != wgs84:
+            profile = self.get_profile(bounds)
+            lat, lon = profile.to_latlon()
+            dtype = get_minimum_dtype(arr)
+            nodata = get_nodata(arr, None, dtype)
+
+            da = xr.DataArray(arr, coords=[lat, lon], dims=["y", "x"])
+            da.rio.set_spatial_dims("x", "y", inplace=True)
+            da.rio.write_crs(self.crs, inplace=True)
+            da = da.rio.reproject(wgs84, nodata=nodata)
+            # update arr and bounds
+            arr = da.values
+            bounds, *_ = geoinfo_from_latlon(da.y, da.x)
+            bounds.set_crs(wgs84)
+
+        array2kmz(arr, out_file, bounds, img_kwargs, cbar_kwargs, keep_kml, verbose)
 
 
 class HierarchicalDataset(GeoDataset):
@@ -1471,8 +1568,8 @@ class HierarchicalDataset(GeoDataset):
         self,
         arr: np.ndarray,
         filename: str | Path,
-        bounds: Optional[BoundingBox] = None,
-        bbox: Optional[BoundingBox] = None,
+        bounds: BoundingBox | None = None,
+        bbox: BoundingBox | None = None,
         band_names: Sequence[str] | None = None,
         arr_type: Literal["data", "mask"] = "data",
         nodata: float | int | None = None,
@@ -1572,8 +1669,8 @@ class MultiHierarchicalDataset(GeoDataset):
 class PairDataset(RasterDataset):
     """A base class for pair datasets."""
 
-    _pairs: Optional[Pairs] = None
-    _datetime: Optional[pd.DatetimeIndex] = None
+    _pairs: Pairs | None = None
+    _datetime: pd.DatetimeIndex | None = None
 
     def query(
         self,
@@ -1687,7 +1784,7 @@ class ApsDataset(RasterDataset):
         out_dir: str | Path,
         pairs: Pairs,
         ref_points: Points,
-        roi: Optional[BoundingBox] = None,
+        roi: BoundingBox | None = None,
         overwrite: bool = False,
         prefix: str = "APS",
     ):
@@ -1752,7 +1849,7 @@ class ApsDataset(RasterDataset):
 
     @classmethod
     @abc.abstractmethod
-    def parse_dates(cls, paths: Optional[Sequence[str]] = None) -> pd.DatetimeIndex:
+    def parse_dates(cls, paths: Sequence[str] | None = None) -> pd.DatetimeIndex:
         """Used to parse acquisition dates from filenames. *Must be implemented
         in subclass*.
 
@@ -1779,13 +1876,13 @@ class ApsPairs(PairDataset):
     def __init__(
         self,
         root_dir: str = "data",
-        paths: Optional[Sequence[str]] = None,
-        crs: Optional[CRS] = None,
-        res: Optional[float | tuple[float, float]] = None,
-        dtype: Optional[np.dtype] = None,
-        nodata: Optional[float | int | Any] = None,
-        roi: Optional[BoundingBox] = None,
-        bands: Optional[Sequence[str]] = None,
+        paths: Sequence[str] | None = None,
+        crs: CRS | None = None,
+        res: float | tuple[float, float] | None = None,
+        dtype: np.dtype | None = None,
+        nodata: float | int | Any = None,
+        roi: BoundingBox | None = None,
+        bands: Sequence[str] | None = None,
         cache: bool = True,
         resampling=Resampling.nearest,
         fill_nodata: bool = False,
@@ -1879,3 +1976,17 @@ class ApsPairs(PairDataset):
     def dates(self):
         """Return the dates of the dataset."""
         return self._datetime
+
+
+def get_nodata(arr, nodata, dtype):
+    """Get a proper no data value for the array."""
+    if nodata is None:
+        if np.issubdtype(arr.dtype, np.floating):
+            nodata = np.nan
+        else:
+            rng = dtype_ranges[dtype]
+            if np.any(arr == rng[0]):
+                nodata = rng[1]
+            else:
+                nodata = rng[0] - 1
+    return nodata
