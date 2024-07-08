@@ -298,3 +298,22 @@ class BoundingBox:
             bbox2 = BoundingBox(self.left, self.right, splity, self.top)
 
         return bbox1, bbox2
+
+    def buffer(self, distance: float) -> "BoundingBox":
+        """Buffer the bounding box.
+
+        Parameters
+        ----------
+        distance: float
+            the buffer distance in the units of the bounding box
+
+        Returns:
+            the buffered bounding box
+        """
+        return BoundingBox(
+            self.left - distance,
+            self.bottom - distance,
+            self.right + distance,
+            self.top + distance,
+            crs=self.crs,
+        )
