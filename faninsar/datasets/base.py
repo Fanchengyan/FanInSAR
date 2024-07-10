@@ -1433,7 +1433,7 @@ class HierarchicalDataset(GeoDataset):
             with rasterio.open(self.path) as src:
                 win = src.window(*bbox)
                 data = rioxarray.open_rasterio(self.path, window=win)
-            
+
         with xr.open_dataset(self.path, group=self.group) as ds:
             ds = ds.rename({self.lat_name: "lat", self.lon_name: "lon"})
             if variable is None:
@@ -1441,6 +1441,22 @@ class HierarchicalDataset(GeoDataset):
             else:
                 data = ds[variable].sel(lat=slice_lat, lon=slice_lon)
         return data
+
+    def _points_query(
+        self,
+        points: Points,
+        variable: str | None = None,
+    ) -> np.ndarray:
+        """Return the values of dataset at given points. Points that outside the dataset will be masked."""
+        pass
+
+    def _polygons_query(
+        self,
+        polygons: Polygons,
+        variable: str | None = None,
+    ) -> np.ndarray:
+        """Return the values of the dataset at the given polygons."""
+        pass
 
     def query(
         self,
@@ -1465,9 +1481,42 @@ class HierarchicalDataset(GeoDataset):
         if isinstance(query, Polygons):
             query = GeoQuery(polygons=query)
 
-        data = self[query]
-        result = QueryResult(data, query)
+        result = self._sample_data(query, variable)
 
+        return result
+
+    def _sample_data(
+        self,
+        query: GeoQuery,
+        variable: str | None = None,
+    ):
+        if query.points is not None:
+            points_values = self._points_query(query.points, variable)
+        if query.boxes is not None:
+            
+            bbox_values = self._bbox_query(query.boxes, variable)
+        if query.polygons is not None:
+            polygons_values = self._polygons_query(query.polygons, variable)
+
+        points_result = (
+            None
+            if points_values is None
+            else {"data": points_values, "dims": "(n_bands, n_point)"}
+        )
+        bbox_result = (
+            None
+            if bbox_values is None
+            else {"data": bbox_values, "dims": "(n_boxes, (n_bands, height, width))"}
+        )
+        polygons_result = (
+            None
+            if polygons_values is None
+            else {
+                "data": polygons_values,
+                "dims": "(n_polygons, (n_bands, height, width))",
+            }
+        )
+        result = QueryResult(points_result, bbox_result, polygons_result, query)
         return result
 
     def sel(
