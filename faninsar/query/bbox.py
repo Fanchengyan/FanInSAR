@@ -59,7 +59,7 @@ class BoundingBox:
         self.right = right
         self.bottom = bottom
         self.top = top
-        self.crs = crs
+        self._crs = crs
 
     def __str__(self) -> str:
         return f"BoundingBox(left={self.left}, bottom={self.bottom}, right={self.right}, top={self.top}, crs={self.crs})"
@@ -183,6 +183,11 @@ class BoundingBox:
         """
         return (self.right - self.left) * (self.top - self.bottom)
 
+    @property
+    def crs(self) -> CRS | None:
+        """The coordinate reference system of the bounding box."""
+        return self._crs
+
     def to_crs(self, crs: CRS | str) -> "BoundingBox":
         """Convert the bounding box to a new coordinate reference system.
 
@@ -216,12 +221,11 @@ class BoundingBox:
             passed to :meth:`pyproj.crs.CRS.from_user_input`.
 
             .. warning::
-
                 This method will only set the crs attribute without converting the
                 bounding box to a new coordinate reference system. If you want to convert
                 the bounding box values to a new coordinate, please use :meth:`to_crs`
         """
-        self.crs = CRS.from_user_input(crs)
+        self._crs = CRS.from_user_input(crs)
 
     def to_dict(self) -> dict[str, float]:
         """Convert the bounding box to a dictionary.
