@@ -34,13 +34,8 @@ from shapely import ops
 from tqdm.auto import tqdm
 
 from .._core import geo_tools
-from .._core.geo_tools import (
-    Profile,
-    array2kml,
-    array2kmz,
-    geoinfo_from_latlon,
-    save_colorbar,
-)
+from .._core.geo_tools import (Profile, array2kml, array2kmz,
+                               geoinfo_from_latlon, save_colorbar)
 from .._core.logger import setup_logger
 from .._core.pair_tools import Pairs
 from ..query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
@@ -864,17 +859,7 @@ class RasterDataset(GeoDataset):
         points_result = None
         if len(files_points_list) > 0:
             points_values = np.ma.asarray(files_points_list)
-            if points_values.ndim == 2:
-                n_files, n_points = points_values.shape
-                dims = f"(files:{n_files}, points:{n_points})"
-            elif points_values.ndim == 3:
-                n_files, n_points, n_bands = points_values.shape
-                points_values = points_values.transpose(0, 2, 1)
-                dims = f"(files:{n_files}, bands:{n_bands}, points:{n_points})"
-            else:
-                raise ValueError(
-                    f"points_values must be 2D or 3D, got {points_values.ndim}"
-                )
+            dims, points_values = parse_1D_dims(points_values)
             points_result = {"data": points_values, "dims": dims}
 
         # parse bounding boxes results
@@ -882,7 +867,7 @@ class RasterDataset(GeoDataset):
         if len(files_bbox_list) > 0:
             if len(query.boxes) == 1:
                 bbox_values = np.asarray(files_bbox_list)
-                dims = parse_dims(bbox_values)
+                dims = parse_2D_dims(bbox_values)
             else:
                 # stack the files for each box
                 boxes_ls = [[] for _ in range(len(query.boxes))]
@@ -892,7 +877,7 @@ class RasterDataset(GeoDataset):
                 boxes_values = [np.ma.asarray(arr) for arr in boxes_ls]
                 # get the dims
                 bbox0 = files_bbox_list[0]
-                dims = parse_dims(bbox0, details=False)
+                dims = parse_2D_dims(bbox0, details=False)
                 dims = f"boxes:{len(boxes_values)}, ({dims})"
             bbox_result = {"data": boxes_values, "dims": f"({dims})"}
 
@@ -909,7 +894,7 @@ class RasterDataset(GeoDataset):
             polygons_values = [np.ma.asarray(arr) for arr in poly_list]
             # get the dims
             polygon0 = polygons_values[0]
-            dims = parse_dims(polygon0, details=False)
+            dims = parse_2D_dims(polygon0, details=False)
 
             polygons_result = {
                 "data": polygons_values,
@@ -1553,8 +1538,8 @@ class HierarchicalDataset(GeoDataset):
         if variable is None:
             ds = xr.open_dataarray(self.path, group=self.group, **kwargs)
         else:
-            ds = xr.open_dataset(self.path, group=self.group, **kwargs)
-        if "y" not in ds.variables or "x" not in ds.variables:
+            ds = xr.open_dataset(self.path, group=self.group, **kwargs)[variable]
+        if "y" not in ds.coords or "x" not in ds.coords:
             ds = ds.rename({self.lat_name: "y", self.lon_name: "x"})
         data = ds.sel(y=slice_lat, x=slice_lon)
         # close dataset
@@ -1615,38 +1600,33 @@ class HierarchicalDataset(GeoDataset):
         variable: str | None = None,
         **kwargs,
     ):
+        # TODO: refine points and polygons query
+        # parse points result
+        points_result = None
         if query.points is not None:
             points_values = self._points_query(query.points, variable, **kwargs)
+            dims, points_result = parse_1D_dims(points_values, multi_files=False)
+            points_result = {"data": points_values, "dims": dims}
+        # parse bounding boxes result
+        boxes_result = None
         if query.boxes is not None:
-            if isinstance(query.boxes, BoundingBox):
-                bbox_values = self._bbox_query(query.boxes, variable, **kwargs)
+            if len(query.boxes) == 1:
+                bbox_values = self._bbox_query(query.boxes[0], variable, **kwargs)
+                dims = parse_2D_dims(bbox_values)
             else:
                 bbox_values = [
                     self._bbox_query(bbox, variable, **kwargs) for bbox in query.boxes
                 ]
-
+                dims = parse_2D_dims(bbox_values[0], details=False)
+                dims = f"boxes:{len(bbox_values)}, ({dims})"
+            boxes_result = {"data": bbox_values, "dims": f"({dims})"}
+        # parse polygons result
+        polygons_result = None
         if query.polygons is not None:
             polygons_values = self._polygons_query(query.polygons, variable)
+            pass
 
-        points_result = (
-            None
-            if points_values is None
-            else {"data": points_values, "dims": "(n_bands, n_point)"}
-        )
-        bbox_result = (
-            None
-            if bbox_values is None
-            else {"data": bbox_values, "dims": parse_boxes_dims(bbox_values)}
-        )
-        polygons_result = (
-            None
-            if polygons_values is None
-            else {
-                "data": polygons_values,
-                "dims": "(n_polygons, (n_bands, height, width))",
-            }
-        )
-        result = QueryResult(points_result, bbox_result, polygons_result, query)
+        result = QueryResult(points_result, boxes_result, polygons_result, query)
         return result
 
     def sel(
@@ -2182,17 +2162,58 @@ def get_nodata(arr, nodata, dtype):
     return nodata
 
 
-def parse_dims(bbox_values, details=True):
-    if bbox_values.ndim == 4:
-        n_files, n_bands, height, width = bbox_values.shape
-        dims = f"files:{n_files}, bands:{n_bands}, height, width"
-        if details:
-            dims = f"files:{n_files}, bands:{n_bands}, height:{height}, width:{width}"
-    elif bbox_values.ndim == 3:
-        n_files, height, width = bbox_values.shape
-        dims = f"files:{n_files}, height, width"
-        if details:
-            dims = f"files:{n_files}, height:{height}, width:{width}"
+def parse_1D_dims(values_1D, multi_files=True):
+    """Parse the dimensions of 1D array. (points)"""
+    if multi_files:
+        if values_1D.ndim == 2:
+            n_files, n_points = values_1D.shape
+            dims = f"(files:{n_files}, points:{n_points})"
+        elif values_1D.ndim == 3:
+            n_files, n_points, n_bands = values_1D.shape
+            values_1D = values_1D.transpose(0, 2, 1)
+            dims = f"(files:{n_files}, bands:{n_bands}, points:{n_points})"
+        else:
+            raise ValueError(f"values_1D must be 2D or 3D, got {values_1D.ndim}")
     else:
-        raise ValueError(f"bbox_values must be 3D or 4D, got {bbox_values.ndim}")
+        if values_1D.ndim == 1:
+            n_points = values_1D.shape[0]
+            dims = f"points:{n_points}"
+        elif values_1D.ndim == 2:
+            n_points, n_bands = values_1D.shape
+            values_1D = values_1D.T
+            dims = f"bands:{n_bands}, points:{n_points}"
+    return dims, values_1D
+
+
+def parse_2D_dims(values_2D, details=True, multi_files=True):
+    """Parse the dimensions of 2D array. (bbox, polygons)"""
+    if multi_files:
+        if values_2D.ndim == 4:
+            n_files, n_bands, height, width = values_2D.shape
+            dims = f"files:{n_files}, bands:{n_bands}, height, width"
+            if details:
+                dims = (
+                    f"files:{n_files}, bands:{n_bands}, height:{height}, width:{width}"
+                )
+        elif values_2D.ndim == 3:
+            n_files, height, width = values_2D.shape
+            dims = f"files:{n_files}, height, width"
+            if details:
+                dims = f"files:{n_files}, height:{height}, width:{width}"
+        else:
+            raise ValueError(f"values_2D must be 3D or 4D, got {values_2D.ndim}")
+    else:
+        if values_2D.ndim == 3:
+            n_bands, height, width = values_2D.shape
+            values_2D = values_2D.transpose(1, 2, 0)
+            dims = f"bands:{n_bands}, height, width"
+            if details:
+                dims = f"bands:{n_bands}, height:{height}, width:{width}"
+        elif values_2D.ndim == 2:
+            height, width = values_2D.shape
+            dims = f"height, width"
+            if details:
+                dims = f"height:{height}, width:{width}"
+        else:
+            raise ValueError(f"values_2D must be 2D or 3D, got {values_2D.ndim}")
     return dims

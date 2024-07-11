@@ -22,16 +22,14 @@ class BaseResult:
         ----------
         result : dict
             The result of the query.
-        ds_type : str, optional
-            The type of the dataset used to load the data. Default is 'rasterio'.
         """
         self.result = result
 
     def __repr__(self):
-        return f"{ self.__class__.__name__}({self.dims})"
+        return f"{ self.__class__.__name__}{self.dims}"
 
     def __str__(self):
-        return f"{ self.__class__.__name__}({self.dims})"
+        return f"{ self.__class__.__name__}{self.dims}"
 
     def __getitem__(self, item: int | slice) -> pd.Series | pd.DataFrame:
         return self.frame.iloc[item, :]
