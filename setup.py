@@ -21,6 +21,7 @@ install_requires = [
     "h5netcdf",
     "tqdm",
     "rtree",
+    "pykml",
 ]
 
 with open("faninsar/__init__.py") as f:
