@@ -842,12 +842,17 @@ class RasterDataset(GeoDataset):
                 data = self._points_query(query.points, vrt_fh)
                 files_points_list.append(data)
             # Get the bounding boxes values
-            bbox_list = []
             if query.boxes is not None:
-                for bbox in query.boxes:
-                    data = self._bbox_query(bbox, vrt_fh)
-                    bbox_list.append(data)
-                files_bbox_list.append(np.ma.asarray(bbox_list))
+                n_boxes = len(query.boxes)
+                if n_boxes == 1:
+                    data = self._bbox_query(query.boxes[0], vrt_fh)
+                    files_bbox_list.append(data)
+                else:
+                    bbox_list = []
+                    for bbox in query.boxes:
+                        data = self._bbox_query(bbox, vrt_fh)
+                        bbox_list.append(data)
+                    files_bbox_list.append(bbox_list)
             # Get the polygons values
             if query.polygons is not None:
                 data_ls, transform_ls, mask_ls = self._polygons_query(
@@ -855,57 +860,64 @@ class RasterDataset(GeoDataset):
                 )
                 files_polygons_list.append(data_ls)
 
-        # Stack the points values
-        points_values = None
+        # parse points results
+        points_result = None
         if len(files_points_list) > 0:
-            points_values = np.ma.asarray(files_points_list).squeeze()
-
-        # Stack the bounding boxes values
-        bbox_values = None
-        files_bbox_list = np.ma.asarray(files_bbox_list)
-        if len(files_bbox_list) > 0:
-            n_band = files_bbox_list.shape[2]
-            if n_band == 1:
-                bbox_values = files_bbox_list.squeeze(axis=2).transpose(1, 0, 2, 3)
+            points_values = np.ma.asarray(files_points_list)
+            if points_values.ndim == 2:
+                n_files, n_points = points_values.shape
+                dims = f"(files:{n_files}, points:{n_points})"
+            elif points_values.ndim == 3:
+                n_files, n_points, n_bands = points_values.shape
+                points_values = points_values.transpose(0, 2, 1)
+                dims = f"(files:{n_files}, bands:{n_bands}, points:{n_points})"
             else:
-                bbox_values = files_bbox_list.transpose(1, 0, 2, 3, 4)
+                raise ValueError(
+                    f"points_values must be 2D or 3D, got {points_values.ndim}"
+                )
+            points_result = {"data": points_values, "dims": dims}
 
-        # Stack the polygons values
-        polygons_values = None
+        # parse bounding boxes results
+        bbox_result = None
+        if len(files_bbox_list) > 0:
+            if len(query.boxes) == 1:
+                bbox_values = np.asarray(files_bbox_list)
+                dims = parse_dims(bbox_values)
+            else:
+                # stack the files for each box
+                boxes_ls = [[] for _ in range(len(query.boxes))]
+                for files_box in files_bbox_list:
+                    for i, box in enumerate(files_box):
+                        boxes_ls[i].append(box)
+                boxes_values = [np.ma.asarray(arr) for arr in boxes_ls]
+                # get the dims
+                bbox0 = files_bbox_list[0]
+                dims = parse_dims(bbox0, details=False)
+                dims = f"boxes:{len(boxes_values)}, ({dims})"
+            bbox_result = {"data": boxes_values, "dims": f"({dims})"}
+
+        # parse polygons results
+        polygons_result = None
         if len(files_polygons_list) > 0:
-            num_polygons = len(query.polygons)
-            arr_list = [[] for _ in range(num_polygons)]
-            for data in files_polygons_list:
-                for i, d in enumerate(data):
-                    arr_list[i].append(d)
-            polygons_values = [np.ma.asarray(arr).squeeze(1) for arr in arr_list]
+            n_polygons = len(query.polygons)
+            n_files = len(files_polygons_list)
+            # stack the files for each polygon
+            poly_list = [[] for _ in range(n_polygons)]
+            for file_data in files_polygons_list:
+                for i, poly_i in enumerate(file_data):
+                    poly_list[i].append(poly_i)
+            polygons_values = [np.ma.asarray(arr) for arr in poly_list]
+            # get the dims
+            polygon0 = polygons_values[0]
+            dims = parse_dims(polygon0, details=False)
 
-        points_result = (
-            None
-            if points_values is None
-            else {
-                "data": points_values,
-                "dims": "(n_files, n_point)",
-            }
-        )
-        bbox_result = (
-            None
-            if bbox_values is None
-            else {
-                "data": bbox_values,
-                "dims": "(n_boxes, (n_files, height, width))",
-            }
-        )
-        polygons_result = (
-            None
-            if polygons_values is None
-            else {
+            polygons_result = {
                 "data": polygons_values,
-                "dims": "(n_polygons, (n_files, height, width))",
-                "transforms": transform_ls if polygons_values is not None else None,
-                "masks": mask_ls if polygons_values is not None else None,
+                "dims": f"(n_polygons:{n_polygons}, ({dims}))",
+                "transforms": transform_ls,
+                "masks": mask_ls,
             }
-        )
+
         result = QueryResult(points_result, bbox_result, polygons_result, query)
 
         return result
@@ -1527,30 +1539,27 @@ class HierarchicalDataset(GeoDataset):
         self,
         bbox: BoundingBox,
         variable: str | None = None,
-        engine: Literal["rioxarray", "xarray"] = "rioxarray",
+        **kwargs,
     ) -> xr.DataArray | xr.Dataset:
         """Retrieve the data of the dataset for the given bounding box."""
         bbox = self._ensure_query_crs(bbox)
-
         # get slice for lat/lon values
         if self.lat[0] < self.lat[-1]:
             slice_lat = slice(bbox.bottom, bbox.top)
         else:
             slice_lat = slice(bbox.top, bbox.bottom)
         slice_lon = slice(bbox.left, bbox.right)
+        # open and read the dataset
+        if variable is None:
+            ds = xr.open_dataarray(self.path, group=self.group, **kwargs)
+        else:
+            ds = xr.open_dataset(self.path, group=self.group, **kwargs)
+        if "y" not in ds.variables or "x" not in ds.variables:
+            ds = ds.rename({self.lat_name: "y", self.lon_name: "x"})
+        data = ds.sel(y=slice_lat, x=slice_lon)
+        # close dataset
+        ds.close()
 
-        # read data
-        if engine == "rioxarray":
-            with rasterio.open(self.path) as src:
-                win = src.window(*bbox)
-                data = rioxarray.open_rasterio(self.path, window=win)
-
-        with xr.open_dataset(self.path, group=self.group) as ds:
-            ds = ds.rename({self.lat_name: "lat", self.lon_name: "lon"})
-            if variable is None:
-                data = ds.sel(lat=slice_lat, lon=slice_lon)
-            else:
-                data = ds[variable].sel(lat=slice_lat, lon=slice_lon)
         return data
 
     def _points_query(
@@ -1573,6 +1582,7 @@ class HierarchicalDataset(GeoDataset):
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         variable: str | None = None,
+        **kwargs,
     ) -> QueryResult:
         """Retrieve images values for given query.
 
@@ -1584,6 +1594,9 @@ class HierarchicalDataset(GeoDataset):
             or a composite :class:`GeoQuery` (recommended) object.
         variable : str, optional
             name of the variable to retrieve. If None, all variables will be retrieved.
+        **kwargs : dict
+            keyword arguments to pass to :meth:`xarray.open_dataarray` if
+            variable is None, otherwise to :meth:`xarray.open_dataset`.
         """
         if isinstance(query, Points):
             query = GeoQuery(points=query)
@@ -1592,7 +1605,7 @@ class HierarchicalDataset(GeoDataset):
         if isinstance(query, Polygons):
             query = GeoQuery(polygons=query)
 
-        result = self._sample_data(query, variable)
+        result = self._sample_data(query, variable, **kwargs)
 
         return result
 
@@ -1600,12 +1613,18 @@ class HierarchicalDataset(GeoDataset):
         self,
         query: GeoQuery,
         variable: str | None = None,
+        **kwargs,
     ):
         if query.points is not None:
-            points_values = self._points_query(query.points, variable)
+            points_values = self._points_query(query.points, variable, **kwargs)
         if query.boxes is not None:
+            if isinstance(query.boxes, BoundingBox):
+                bbox_values = self._bbox_query(query.boxes, variable, **kwargs)
+            else:
+                bbox_values = [
+                    self._bbox_query(bbox, variable, **kwargs) for bbox in query.boxes
+                ]
 
-            bbox_values = self._bbox_query(query.boxes, variable)
         if query.polygons is not None:
             polygons_values = self._polygons_query(query.polygons, variable)
 
@@ -1617,7 +1636,7 @@ class HierarchicalDataset(GeoDataset):
         bbox_result = (
             None
             if bbox_values is None
-            else {"data": bbox_values, "dims": "(n_boxes, (n_bands, height, width))"}
+            else {"data": bbox_values, "dims": parse_boxes_dims(bbox_values)}
         )
         polygons_result = (
             None
@@ -2161,3 +2180,19 @@ def get_nodata(arr, nodata, dtype):
             else:
                 nodata = rng[0] - 1
     return nodata
+
+
+def parse_dims(bbox_values, details=True):
+    if bbox_values.ndim == 4:
+        n_files, n_bands, height, width = bbox_values.shape
+        dims = f"files:{n_files}, bands:{n_bands}, height, width"
+        if details:
+            dims = f"files:{n_files}, bands:{n_bands}, height:{height}, width:{width}"
+    elif bbox_values.ndim == 3:
+        n_files, height, width = bbox_values.shape
+        dims = f"files:{n_files}, height, width"
+        if details:
+            dims = f"files:{n_files}, height:{height}, width:{width}"
+    else:
+        raise ValueError(f"bbox_values must be 3D or 4D, got {bbox_values.ndim}")
+    return dims
