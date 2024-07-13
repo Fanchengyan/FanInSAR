@@ -34,8 +34,13 @@ from shapely import ops
 from tqdm.auto import tqdm
 
 from .._core import geo_tools
-from .._core.geo_tools import (Profile, array2kml, array2kmz,
-                               geoinfo_from_latlon, save_colorbar)
+from .._core.geo_tools import (
+    Profile,
+    array2kml,
+    array2kmz,
+    geoinfo_from_latlon,
+    save_colorbar,
+)
 from .._core.logger import setup_logger
 from .._core.pair_tools import Pairs
 from ..query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
@@ -716,12 +721,15 @@ class RasterDataset(GeoDataset):
 
         win = vrt_fh.window(*bbox)
         bands_idx = self._ensure_bands_idx(vrt_fh)
+        out_shape = [
+            round((bbox.top - bbox.bottom) / self.res[1]),
+            round((bbox.right - bbox.left) / self.res[0]),
+        ]
+        if isinstance(bands_idx, list):
+            out_shape.insert(0, len(bands_idx))
+
         data = vrt_fh.read(
-            out_shape=(
-                len(bands_idx),
-                round((bbox.top - bbox.bottom) / self.res[1]),
-                round((bbox.right - bbox.left) / self.res[0]),
-            ),
+            out_shape=tuple(out_shape),
             resampling=self.resampling,
             indexes=bands_idx,
             window=win,
@@ -866,8 +874,8 @@ class RasterDataset(GeoDataset):
         bbox_result = None
         if len(files_bbox_list) > 0:
             if len(query.boxes) == 1:
-                bbox_values = np.asarray(files_bbox_list)
-                dims = parse_2D_dims(bbox_values)
+                boxes_values = np.asarray(files_bbox_list)
+                dims = parse_2D_dims(boxes_values)
             else:
                 # stack the files for each box
                 boxes_ls = [[] for _ in range(len(query.boxes))]
@@ -1611,15 +1619,15 @@ class HierarchicalDataset(GeoDataset):
         boxes_result = None
         if query.boxes is not None:
             if len(query.boxes) == 1:
-                bbox_values = self._bbox_query(query.boxes[0], variable, **kwargs)
-                dims = parse_2D_dims(bbox_values)
+                boxes_values = self._bbox_query(query.boxes[0], variable, **kwargs)
+                dims = parse_2D_dims(boxes_values)
             else:
-                bbox_values = [
+                boxes_values = [
                     self._bbox_query(bbox, variable, **kwargs) for bbox in query.boxes
                 ]
-                dims = parse_2D_dims(bbox_values[0], details=False)
-                dims = f"boxes:{len(bbox_values)}, ({dims})"
-            boxes_result = {"data": bbox_values, "dims": f"({dims})"}
+                dims = parse_2D_dims(boxes_values[0], details=False)
+                dims = f"boxes:{len(boxes_values)}, ({dims})"
+            boxes_result = {"data": boxes_values, "dims": f"({dims})"}
         # parse polygons result
         polygons_result = None
         if query.polygons is not None:
