@@ -3,5 +3,6 @@ from .uncertainty import (
     Uncertainty,
     UncertaintyPropagation,
     data2param,
+    data2param_cov,
     data2param_sequence,
 )

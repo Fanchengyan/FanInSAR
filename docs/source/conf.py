@@ -42,11 +42,13 @@ exclude_patterns = []
 
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
+html_css_files = ["custom.css"]
 html_logo = "_static/logo/logo.png"
 
 html_theme_options = {
     "show_toc_level": 2,
     "show_nav_level": 2,
+    "header_links_before_dropdown": 10,
     "use_edit_page_button": True,
     "icon_links": [
         {

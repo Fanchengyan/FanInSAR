@@ -1,9 +1,12 @@
+===========================
+Phase Deformation Converter
+===========================
 
 
 PhaseDeformationConverter
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-.. autoclass:: PhaseDeformationConverter
+.. autoclass:: faninsar.PhaseDeformationConverter
     :members:
     :undoc-members:
     :member-order: bysource

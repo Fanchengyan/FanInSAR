@@ -1,0 +1,10 @@
+.bd-content {
+  flex-grow: 1;
+  max-width: 100%;
+}
+.bd-page-width {
+  max-width: 100rem;
+}
+.bd-main .bd-article-container {
+  max-width: 100%;
+}

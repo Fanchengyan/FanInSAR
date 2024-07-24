@@ -540,9 +540,46 @@ def data2param(G, var_data, desc="  Data to model covariance"):
     return var_param
 
 
+def data2param_cov(G, cov_data, desc="  Data to model covariance"):
+    """This function is used to calculate the variance of model parameter
+    (var_param) from a given covariance of data (cov_d) for one pixel.
+
+    Parameters:
+    ------------
+    G: 2D array (n_im, n_param)
+        design matrix
+    cov_data: 2D array (n_pixel, n_im, n_im)
+        covariance matrix of data
+    desc: str
+        description of progress bar
+
+    Returns:
+    --------
+    var_param: np.ndarray (n_pixel, n_param)
+        variance of model parameters
+    """
+    n_im, n_param = G.shape
+    n_pixel = cov_data.shape[0]
+
+    M = np.linalg.inv(G.T @ G) @ (G.T)
+
+    # write empty variance into file to give a structure
+    var_param = np.full((n_pixel, n_param), np.nan, dtype=np.float32)
+
+    patch = get_var_patch(n_pixel, n_im, n_param, np.dtype(np.float64))
+    for col in tqdm(patch, desc=desc, unit="pixels"):
+        start, end = col[0], col[1]
+        cov_data_i = cov_data[start:end, :, :]
+        cov_model = M[None, :, :] @ cov_data_i @ M.T[None, :, :]
+        var_param[start:end, :] = np.diagonal(cov_model, axis1=1, axis2=2)
+
+    return var_param
+
+
 def data2param_sequence(
     Gs: list,
     var_data: np.ndarray,
+    verbose: bool = True,
     desc: str = "  Data to model covariance",
 ):
     """This function is used to calculate the variance of model parameter for a sequence of design matrices.
@@ -553,8 +590,10 @@ def data2param_sequence(
         A list of design matrices.
     var_data : np.ndarray
         The deformation variance matrix.
+    verbose : bool
+        If True, display the progress bar.
     desc : str
-        Description of progress bar.
+        Description of progress bar. Only used if verbose is True.
 
     Returns
     -------
@@ -564,6 +603,9 @@ def data2param_sequence(
     n_im = Gs[0].shape[0]
     n_param = Gs[-1].shape[1]
     n_pixel = var_data.shape[0]
+
+    if isinstance(var_data, np.ma.MaskedArray):
+        var_data = var_data.filled(np.nan)
 
     # remove all nan pixels in var_data
     m = (~np.isnan(var_data)).sum(axis=1) > 0
@@ -580,7 +622,9 @@ def data2param_sequence(
     var_param_m = var_param[m]
 
     patch = get_var_patch(n_pixel, n_im, n_param, np.dtype(np.float64))
-    for col in tqdm(patch, desc=desc, unit="pixels"):
+    if verbose:
+        patch = tqdm(patch, desc=desc, unit="patch")
+    for col in patch:
         start, end = col[0], col[1]
         var_data_i = var_data[start:end, :, None]
         cov_data = C[None, :, :].repeat((var_data_i.shape[0]), axis=0) * var_data_i
@@ -589,7 +633,7 @@ def data2param_sequence(
         for G in Gs[1:]:
             M_i = G2M(G)
             cov_model = M_i[None, :, :] @ cov_model @ M_i.T[None, :, :]
-            var_param_m[start:end, :] = np.diagonal(cov_model, axis1=1, axis2=2)
+        var_param_m[start:end, :] = np.diagonal(cov_model, axis1=1, axis2=2)
 
         var_param[m] = var_param_m
     return var_param
