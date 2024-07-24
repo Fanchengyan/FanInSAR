@@ -2,9 +2,16 @@
 Welcome to FanInSAR's documentation!
 ====================================
 
+.. image:: https://zenodo.org/badge/DOI/10.5281/zenodo.11398347.svg
+  :target: https://doi.org/10.5281/zenodo.11398347
+  :alt: DOI
+
 .. image:: https://readthedocs.org/projects/faninsar/badge/?version=latest
     :target: https://faninsar.readthedocs.io/en/latest/?badge=latest
     :alt: Documentation Status
+
+.. image:: https://img.shields.io/badge/code%20style-black-000000.svg
+    :target: https://github.com/psf/black
 
 Introduction
 ------------
@@ -15,7 +22,7 @@ FanInSAR is a Fancy Interferometric Synthetic Aperture Radar (InSAR) time series
 Highlight Features
 ------------------
 
-- **Pythonic**: FanInSAR is written in Python and provides a user-friendly API. The API is designed to be simple and intuitive, by abstracting the complex processing pipeline and concealing the low-level programming details, which allows users to focus on algorithm development. For example, loading data from ``HyP3`` or ``LiCSAR`` products is as simple as providing the corresponding home directory. Filtering interferometric pairs can be performed by a time slice, similar to the ``pandas`` package. 
+- **Pythonic**: FanInSAR is written in Python and provides a user-friendly API. The API is designed to be simple and intuitive, by abstracting the complex processing pipeline and concealing the low-level programming details, which allows users to focus on algorithm development. For example, loading data from ``HyP3`` or ``LiCSAR`` products is as simple as providing the corresponding home directory. Filtering interferometric pairs can be performed by a time slice, similar to the ``pandas`` package.
 - **Fast**: The core computation in FanInSAR is implemented using ``PyTorch``, a high-performance deep learning library. This allows for efficient processing on both CPU and GPU, enabling faster execution.
 - **Flexible**: FanInSAR is designed to be flexible, allowing for customization and extension. Users can easily inherit classes or customize the processing pipeline for their specific needs.
 
@@ -27,7 +34,7 @@ Highlight Features
 Citation
 --------
 
-.. code-block:: 
+.. code-block::
 
     Fan, C., & Liu, L. (2024). FanInSAR: A Fancy InSAR time series library, in a Pythonic, fast, and flexible way (0.0.1). Zenodo. https://doi.org/10.5281/zenodo.11398347
 
@@ -51,9 +58,6 @@ Citation
    :caption: Contents:
 
    install
-   User Guide <user_guide/index>
-   API Reference <api/index>
+   user_guide/index
+   api/index
    terminology
-
-
-

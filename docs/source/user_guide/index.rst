@@ -1,6 +1,6 @@
-###########
+==========
 User Guide
-###########
+==========
 
 In this user guide, you will find detailed descriptions and
 examples that describe many common tasks that you can accomplish with FanInSAR.
@@ -15,5 +15,3 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
    data_structures
    Indexing_data
    sampler
-
-  
