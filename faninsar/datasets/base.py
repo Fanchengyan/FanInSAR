@@ -77,7 +77,7 @@ class GeoDataset(abc.ABC):
     def __repr__(self):
         return f"""\
 {self.__class__.__name__} Dataset
-    bbox: {self.bounds} 
+    bbox: {self.bounds}
     file count: {len(self)}"""
 
     def __str__(self):
@@ -121,13 +121,16 @@ class GeoDataset(abc.ABC):
             self.index.insert(*item)
 
     @overload
-    def _ensure_query_crs(self, query: BoundingBox) -> BoundingBox: ...
+    def _ensure_query_crs(self, query: BoundingBox) -> BoundingBox:
+        ...
 
     @overload
-    def _ensure_query_crs(self, query: Points) -> Points: ...
+    def _ensure_query_crs(self, query: Points) -> Points:
+        ...
 
     @overload
-    def _ensure_query_crs(self, query: Polygons) -> Polygons: ...
+    def _ensure_query_crs(self, query: Polygons) -> Polygons:
+        ...
 
     def _ensure_query_crs(
         self, query: Points | BoundingBox | Polygons
@@ -165,7 +168,7 @@ class GeoDataset(abc.ABC):
             or a string, which will be parsed to a CRS object. The string can be
             in any format supported by :meth:`pyproj.crs.CRS.from_user_input`.
         """
-        if isinstance(new_crs, str):
+        if not isinstance(new_crs, CRS):
             new_crs = CRS.from_user_input(new_crs)
         if new_crs == self.crs:
             return
@@ -609,15 +612,15 @@ class RasterDataset(GeoDataset):
 
                     if crs is None:
                         crs = src.crs
-                    if res is None:
-                        res = src.res
                     if dtype is None:
                         dtype = src.dtypes[0]
                     if nodata is None:
                         nodata = src.nodata
 
                     with WarpedVRT(src, crs=crs) as vrt:
-                        coords = tuple(vrt.bounds)
+                        bounds = tuple(vrt.bounds)
+                        if res is None:
+                            res = vrt.res
 
                     if crs != src.crs:
                         self._same_crs = False
@@ -627,7 +630,7 @@ class RasterDataset(GeoDataset):
                 files_valid.append(False)
                 continue
             else:
-                self.index.insert(count, coords, file_path)
+                self.index.insert(count, bounds, file_path)
                 files_valid.append(True)
                 count += 1
 
@@ -734,7 +737,8 @@ class RasterDataset(GeoDataset):
             indexes=bands_idx,
             window=win,
             masked=True,
-            boundless=self.same_crs,  # boundless=True if self.same_crs else False,
+            boundless=self.same_crs,
+            # WarpedVRT not supports boundless: https://github.com/rasterio/rasterio/issues/2084
         )
 
         if data.mask.ndim == 0:
@@ -814,6 +818,12 @@ class RasterDataset(GeoDataset):
             sequence = tqdm(sequence, desc=f"Saving {ds_name} Files", unit=unit)
         return sequence
 
+    def _safe_close(self, vrt_fhs):
+        """Close the file handles if not caching."""
+        if not self.cache:
+            for vrt_fh in vrt_fhs:
+                vrt_fh.close()
+
     def _sample_files(self, paths: Sequence[str], query: GeoQuery) -> QueryResult:
         """Sample or retrieve values from the dataset for the given query.
 
@@ -863,6 +873,9 @@ class RasterDataset(GeoDataset):
                 )
                 files_polygons_list.append(data_ls)
 
+        # close the file handles
+        self._safe_close(vrt_fhs)
+
         # parse points results
         points_result = None
         if len(files_points_list) > 0:
@@ -874,7 +887,7 @@ class RasterDataset(GeoDataset):
         bbox_result = None
         if len(files_bbox_list) > 0:
             if len(query.boxes) == 1:
-                boxes_values = np.asarray(files_bbox_list)
+                boxes_values = np.ma.asarray(files_bbox_list)
                 dims = parse_2D_dims(boxes_values)
             else:
                 # stack the files for each box
@@ -1471,12 +1484,9 @@ class HierarchicalDataset(GeoDataset):
             )
         return lat_name, lon_name
 
-    def _parse_geo_info(self, path: str | Path) -> tuple[
-        BoundingBox,
-        tuple[float, float],
-        tuple[int, int],
-        CRS,
-    ]:
+    def _parse_geo_info(
+        self, path: str | Path
+    ) -> tuple[BoundingBox, tuple[float, float], tuple[int, int], CRS,]:
         """Parse the geoinformation of the dataset."""
         with xr.open_dataset(path) as ds:
             coord_names = self._parse_lat_lon_name(ds)
