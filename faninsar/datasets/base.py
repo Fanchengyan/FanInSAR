@@ -1287,7 +1287,522 @@ class RasterDataset(GeoDataset):
                     f"Expected band_names to be of length {arr.shape[0]}, got {len(band_names)}"
                 )
         # parse profile
-        profile = self.get_profile(self.roi)
+        if bounds is None:
+            bounds = self.roi
+        profile = self.get_profile(bounds)
+        profile["count"] = arr.shape[0]
+        profile["driver"] = "GTiff"
+        profile["dtype"] = get_minimum_dtype(arr)
+        profile["nodata"] = get_nodata(arr, nodata, profile["dtype"])
+        mode = "w"
+        if Path(filename).exists():
+            if not overwrite:
+                mode = "r+"
+
+        dst = rasterio.open(filename, mode, **profile)
+
+        # parse whether to update band names
+        desc = np.asarray(dst.descriptions, dtype="str")
+        update_tags = False
+        if band_names is not None and np.all(desc == "None"):
+            update_tags = True
+
+        # parse window
+        if bbox is None:
+            win = None
+        else:
+            win = dst.window(*bbox)
+
+        # write array to tiff
+        if arr_type == "mask":
+            dst.write_mask(arr)
+        elif arr_type == "data":
+            dst.write(arr, indexes, window=win)
+            if update_tags:
+                for i, name in enumerate(band_names):
+                    dst.update_tags(i + 1, NAME=name)
+        dst.close()
+
+    def array2kml(
+        self,
+        arr: np.ndarray,
+        out_file: str | Path,
+        bounds: BoundingBox | None = None,
+        img_kwargs: dict = {},
+        cbar_kwargs: dict = {},
+        verbose: bool = True,
+    ):
+        """write a numpy array into a kml file.
+
+        Parameters
+        ----------
+        arr: numpy.ndarray
+            the numpy array to be written into kml file.
+        out_file: str or Path
+            the path of the kml file.
+        bounds : BoundingBox, optional
+            the bounds of the arr. Default is None, which means the roi of the
+            dataset will be used.
+        img_kwargs: dict
+            the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
+        cbar_kwargs: dict
+            the keyword arguments for :func:`save_colorbar` function, except for
+            the out_file and mappable argument.
+        verbose: bool
+            whether to print the information of the kml file. Default is verbose.
+        """
+        if bounds is None:
+            bounds = self.roi
+
+        wgs84 = CRS.from_epsg(4326)
+        if self.crs != wgs84:
+            profile = self.get_profile(bounds)
+            lat, lon = profile.to_latlon()
+            dtype = get_minimum_dtype(arr)
+            nodata = get_nodata(arr, None, dtype)
+
+            da = xr.DataArray(arr, coords=[lat, lon], dims=["y", "x"])
+            da.rio.set_spatial_dims("x", "y", inplace=True)
+            da.rio.write_crs(self.crs, inplace=True)
+            da = da.rio.reproject(wgs84, nodata=nodata)
+            # update arr and bounds
+            arr = da.values
+            bounds, *_ = geoinfo_from_latlon(da.y, da.x)
+            bounds.set_crs(wgs84)
+
+        array2kml(arr, out_file, bounds, img_kwargs, cbar_kwargs, verbose)
+
+    def array2kmz(
+        self,
+        arr: np.ndarray,
+        out_file: str | Path,
+        bounds: BoundingBox | None = None,
+        img_kwargs: dict = {},
+        cbar_kwargs: dict = {},
+        keep_kml: bool = False,
+        verbose: bool = True,
+    ):
+        """Write a numpy array into a kmz file.
+
+        Parameters
+        ----------
+        arr: numpy.ndarray
+            the numpy array to be written into kmz file.
+        out_file: str or Path
+            the path of the kmz file.
+        bounds : BoundingBox, optional
+            the bounds of the arr. Default is None, which means the roi of the
+            dataset will be used.
+        img_kwargs: dict
+            the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
+        cbar_kwargs: dict
+            the keyword arguments for :func:`save_colorbar` function, except for
+            the out_file and mappable argument.
+        keep_kml: bool
+            whether to keep the kml file. Default is False.
+        verbose: bool
+            whether to print the information of the kmz file. Default is verbose.
+        """
+        if bounds is None:
+            bounds = self.roi
+        wgs84 = CRS.from_epsg(4326)
+        if self.crs != wgs84:
+            profile = self.get_profile(bounds)
+            lat, lon = profile.to_latlon()
+            dtype = get_minimum_dtype(arr)
+            nodata = get_nodata(arr, None, dtype)
+
+            da = xr.DataArray(arr, coords=[lat, lon], dims=["y", "x"])
+            da.rio.set_spatial_dims("x", "y", inplace=True)
+            da.rio.write_crs(self.crs, inplace=True)
+            da = da.rio.reproject(wgs84, nodata=nodata)
+            # update arr and bounds
+            arr = da.values
+            bounds, *_ = geoinfo_from_latlon(da.y, da.x)
+            bounds.set_crs(wgs84)
+
+        array2kmz(arr, out_file, bounds, img_kwargs, cbar_kwargs, keep_kml, verbose)
+
+
+class HierarchicalDataset(GeoDataset):
+    """A base class for hierarchical dataset, like h5 and nc files.
+
+    .. note::
+        This class is used to load and sample data from a single file. If you
+        want to load and sample data from multiple files, you should use
+        :class:`MultiHierarchicalDataset`.
+    """
+
+    lat_name: str = "lat"
+    lon_name: str = "lon"
+
+    def __init__(
+        self,
+        path: str | Path,
+        group: str | None = None,
+        roi: BoundingBox | None = None,
+    ):
+        super().__init__()
+        self._path = Path(path)
+        self._group = group
+        self._roi = roi
+        self._update_geo_info()
+
+    def __repr__(self) -> str:
+        return self._repr_str
+
+    def _update_geo_info(self) -> None:
+        bound, res, shape, crs, ds_info = self._parse_geo_info(self._path)
+        self._bound = bound
+        self._res = res
+        self._crs = crs
+        self._shape = shape
+        self._lat = ds_info[0]
+        self._lon = ds_info[1]
+        self._variables = ds_info[2]
+        self._repr_str = ds_info[3]
+
+    def _parse_lat_lon_name(self, ds: xr.Dataset) -> tuple[str, str]:
+        """Parse the name of the latitude and longitude variables."""
+        lat_name = None
+        lon_name = None
+        if self.lat_name in ds.variables and self.lon_name in ds.variables:
+            return None
+
+        for name in ds.variables:
+            if name.lower() in lat_names:
+                lat_name = name
+            if name.lower() in lon_names:
+                lon_name = name
+        if lat_name is None or lon_name is None:
+            raise ValueError(
+                "The dataset does not contain latitude and longitude variables. "
+                "Please specify the names of the latitude and longitude variables."
+            )
+        return lat_name, lon_name
+
+    def _parse_geo_info(
+        self, path: str | Path
+    ) -> tuple[BoundingBox, tuple[float, float], tuple[int, int], CRS,]:
+        """Parse the geoinformation of the dataset."""
+        with xr.open_dataset(path) as ds:
+            coord_names = self._parse_lat_lon_name(ds)
+            if coord_names is not None:
+                self.lat_name, self.lon_name = coord_names
+
+            repr_str = ds.__repr__()
+            variables = [i for i in ds.variables]
+            lat = ds[self.lat_name].values
+            lon = ds[self.lon_name].values
+            crs = ds.rio.crs
+
+        # parse geo-information
+        if crs is None:
+            if (
+                np.all(lat >= -90)
+                and np.all(lat <= 90)
+                and np.all(lon >= -180)
+                and np.all(lon <= 180)
+            ):
+                warnings.warn(
+                    "No CRS is specified for the dataset, assuming the lat/lon values "
+                    "are in the range of WGS84."
+                )
+                crs = CRS.from_epsg(4326)
+            else:
+                raise ValueError(
+                    "No CRS is specified for the dataset, and the lat/lon values are "
+                    "not in the range of WGS84. Please specify the CRS of the dataset"
+                    "using the :meth:`set_crs` method later."
+                )
+        else:
+            crs = CRS.from_user_input(ds.rio.crs)
+        # parse bound, resolution, shape
+        bound, res, shape = geoinfo_from_latlon(lat, lon)
+        bound.set_crs(crs)
+
+        return bound, res, shape, crs, (lat, lon, variables, repr_str)
+
+    def __getitem__(self, var: str) -> xr.DataArray | xr.Dataset:
+        """Get the variable from the dataset."""
+        with xr.open_dataset(self.path, group=self.group) as ds:
+            return ds[var]
+
+    def flush_geo_info(self) -> None:
+        """Flush the geoinformation of the dataset to the given file."""
+        with xr.open_dataset(self.path, group=self.group, mode="a") as ds:
+            ds.rio.write_crs(self.crs)
+            ds.rio.set_spatial_dims(x_dim=self.lon_name, y_dim=self.lat_name)
+        self._update_geo_info()
+
+    def _bbox_query(
+        self,
+        bbox: BoundingBox,
+        variable: str | None = None,
+        **kwargs,
+    ) -> xr.DataArray | xr.Dataset:
+        """Retrieve the data of the dataset for the given bounding box."""
+        bbox = self._ensure_query_crs(bbox)
+        # get slice for lat/lon values
+        if self.lat[0] < self.lat[-1]:
+            slice_lat = slice(bbox.bottom, bbox.top)
+        else:
+            slice_lat = slice(bbox.top, bbox.bottom)
+        slice_lon = slice(bbox.left, bbox.right)
+        # open and read the dataset
+        if variable is None:
+            ds = xr.open_dataarray(self.path, group=self.group, **kwargs)
+        else:
+            ds = xr.open_dataset(self.path, group=self.group, **kwargs)[variable]
+        if "y" not in ds.coords or "x" not in ds.coords:
+            ds = ds.rename({self.lat_name: "y", self.lon_name: "x"})
+        data = ds.sel(y=slice_lat, x=slice_lon)
+        # close dataset
+        ds.close()
+
+        return data
+
+    def _points_query(
+        self,
+        points: Points,
+        variable: str | None = None,
+    ) -> np.ndarray:
+        """Return the values of dataset at given points. Points that outside the dataset will be masked."""
+        pass
+
+    def _polygons_query(
+        self,
+        polygons: Polygons,
+        variable: str | None = None,
+    ) -> np.ndarray:
+        """Return the values of the dataset at the given polygons."""
+        pass
+
+    def query(
+        self,
+        query: GeoQuery | Points | BoundingBox | Polygons,
+        variable: str | None = None,
+        **kwargs,
+    ) -> QueryResult:
+        """Retrieve images values for given query.
+
+        Parameters
+        ----------
+        query : GeoQuery | Points | BoundingBox | Polygons
+            query to index the dataset. It can be :class:`Points`,
+            :class:`BoundingBox`, :class:`Polygons`,
+            or a composite :class:`GeoQuery` (recommended) object.
+        variable : str, optional
+            name of the variable to retrieve. If None, all variables will be retrieved.
+        **kwargs : dict
+            keyword arguments to pass to :meth:`xarray.open_dataarray` if
+            variable is None, otherwise to :meth:`xarray.open_dataset`.
+        """
+        if isinstance(query, Points):
+            query = GeoQuery(points=query)
+        if isinstance(query, BoundingBox):
+            query = GeoQuery(boxes=query)
+        if isinstance(query, Polygons):
+            query = GeoQuery(polygons=query)
+
+        result = self._sample_data(query, variable, **kwargs)
+
+        return result
+
+    def _sample_data(
+        self,
+        query: GeoQuery,
+        variable: str | None = None,
+        **kwargs,
+    ):
+        # TODO: refine points and polygons query
+        # parse points result
+        points_result = None
+        if query.points is not None:
+            points_values = self._points_query(query.points, variable, **kwargs)
+            dims, points_result = parse_1D_dims(points_values, multi_files=False)
+            points_result = {"data": points_values, "dims": dims}
+        # parse bounding boxes result
+        boxes_result = None
+        if query.boxes is not None:
+            if len(query.boxes) == 1:
+                boxes_values = self._bbox_query(query.boxes[0], variable, **kwargs)
+                dims = parse_2D_dims(boxes_values)
+            else:
+                boxes_values = [
+                    self._bbox_query(bbox, variable, **kwargs) for bbox in query.boxes
+                ]
+                dims = parse_2D_dims(boxes_values[0], details=False)
+                dims = f"boxes:{len(boxes_values)}, ({dims})"
+            boxes_result = {"data": boxes_values, "dims": f"({dims})"}
+        # parse polygons result
+        polygons_result = None
+        if query.polygons is not None:
+            polygons_values = self._polygons_query(query.polygons, variable)
+            pass
+
+        result = QueryResult(points_result, boxes_result, polygons_result, query)
+        return result
+
+    def sel(
+        self,
+        variable: str | None = None,
+        **kwargs,
+    ) -> xr.DataArray | xr.Dataset:
+        """Select a variable from the dataset. This method is a wrapper of
+        :meth:`xarray.Dataset.sel` or :meth:`xarray.DataArray.sel`.
+
+        Parameters
+        ----------
+        variable : str, optional
+            name of the variable to select. If None, the entire dataset will be selected.
+        **kwargs : dict
+            keyword arguments to pass to :meth:`xarray.Dataset.sel` or :meth:`xarray.DataArray.sel`.
+        """
+        with xr.open_dataset(self.path, group=self.group) as ds:
+            if variable is None:
+                data = ds.sel(**kwargs)
+            else:
+                data = ds[variable].sel(**kwargs)
+        return data
+
+    def isel(
+        self,
+        variable: str | None = None,
+        **kwargs,
+    ) -> xr.DataArray | xr.Dataset:
+        """Index a variable from the dataset. This method is a wrapper of
+        :meth:`xarray.Dataset.isel` or :meth:`xarray.DataArray.isel`.
+
+        Parameters
+        ----------
+        variable : str, optional
+            name of the variable to index. If None, the entire dataset will be indexed.
+        **kwargs : dict
+            keyword arguments to pass to :meth:`xarray.Dataset.isel` or :meth:`xarray.DataArray.isel`.
+        """
+        with xr.open_dataset(self.path, group=self.group) as ds:
+            if variable is None:
+                data = ds.isel(**kwargs)
+            else:
+                data = ds[variable].isel(**kwargs)
+        return data
+
+    def set_crs(self, crs: CRS | str):
+        """Set the CRS of the dataset.
+
+        .. note::
+            This method is used to set the CRS of the dataset if it is not
+            specified in the dataset. If the CRS is already specified in the
+            dataset, this method will overwrite the CRS.
+        """
+        self._crs = CRS.from_user_input(crs)
+        self._bounds.set_crs(self._crs)
+
+    @property
+    def path(self) -> Path:
+        """the path of the dataset."""
+        return self._path
+
+    @property
+    def group(self) -> str:
+        """the group of the dataset."""
+        return self._group
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """the shape of the dataset in (height, width)."""
+        return self._shape
+
+    @property
+    def bounds(self) -> BoundingBox:
+        """the bounds of the dataset."""
+        return self._bound
+
+    @property
+    def lat(self) -> np.ndarray:
+        """the latitudes of the dataset."""
+        return self._lat
+
+    @property
+    def lon(self) -> np.ndarray:
+        """the longitudes of the dataset."""
+        return self._lon
+
+    @property
+    def variables(self) -> list[str]:
+        """the variables of the dataset."""
+        return self._variables
+
+    def get_profile(
+        self, bbox: BoundingBox | Literal["roi"] | Literal["bounds"] = "roi"
+    ) -> Profile | None:
+        bbox = self._ensure_bbox(bbox)
+        if bbox is None:
+            return None
+        profile = Profile.from_bounds_res(bbox, self.res)
+        profile["crs"] = self.crs
+        return profile
+
+    def array2tiff(
+        self,
+        arr: np.ndarray,
+        filename: str | Path,
+        bounds: BoundingBox | None = None,
+        bbox: BoundingBox | None = None,
+        band_names: Sequence[str] | None = None,
+        arr_type: Literal["data", "mask"] = "data",
+        nodata: float | int | None = None,
+        overwrite: bool = False,
+    ) -> None:
+        """Save a numpy array to a tiff file using the geoinformation of dataset.
+
+        Parameters
+        ----------
+        arr : numpy.ndarray
+            numpy array to save. arr can be a 2D array or a 3D array. If arr is a
+            3D array, the first dimension should be the band dimension.
+        filename : str or Path
+            path to the tiff file to save
+        bounds : BoundingBox, optional
+            the bounds of the output dataset. Default is None, which means the
+            roi of the dataset will be used.
+        bbox : BoundingBox, optional
+            if specified, the input array will be saved to the given part/bbox of
+            dataset. Default is None, which means the array will be saved to the
+            entire dataset.
+        band_names : Sequence of str, optional
+            names of bands to save. Default is None, which will use the band indexes.
+        arr_type : str, one of ['data', 'mask'], optional
+            type of the array to save. Default is 'data'.
+        nodata : float or int, optional
+            no data value of the dataset. If None, will automatically parse the
+            a proper no data value for the array.
+        overwrite : bool, optional
+            if True, overwrite the existing file. Default is False, which means
+            the array will be saved in append mode (r+ mode).
+        """
+        # check arr dimension
+        if arr.ndim == 2:
+            indexes = [1]
+            arr = arr[np.newaxis, :, :]
+        elif arr.ndim == 3:
+            indexes = [i + 1 for i in range(arr.shape[0])]
+        else:
+            raise ValueError(
+                f"Expected arr to be an array with shape of (n_lat, n_lon) or "
+                f"(n_band, n_lat, n_lon), got {arr.shape}"
+            )
+        # check length of band_names
+        if band_names is not None:
+            if len(band_names) != arr.shape[0]:
+                raise ValueError(
+                    f"Expected band_names to be of length {arr.shape[0]}, got {len(band_names)}"
+                )
+        # parse profile
+        if bounds is None:
+            bounds = self.roi
+        profile = self.get_profile(bounds)
         profile["count"] = arr.shape[0]
         profile["driver"] = "GTiff"
         profile["dtype"] = get_minimum_dtype(arr)
