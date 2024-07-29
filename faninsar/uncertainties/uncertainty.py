@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import psutil
@@ -19,28 +20,28 @@ class Uncertainty:
 
     Examples:
     ---------
-    ::
-        import numpy as np
-        from uncertainty_lib import Uncertainty
 
-        # Create an instance of the Uncertainty class and Set the variance attribute
-        uncertainty1 = Uncertainty()
-        uncertainty1.variance = np.array([[1, 2, 3, 4]])
+    >>> import numpy as np
+    >>> from uncertainty_lib import Uncertainty
 
-        # Create another instance of the Uncertainty class Set the variance attribute
-        uncertainty2 = Uncertainty()
-        uncertainty2.variance = np.array([[5], [6], [7], [8]])
+    >>> # Create an instance of the Uncertainty class and Set the variance attribute
+    >>> uncertainty1 = Uncertainty()
+    >>> uncertainty1.variance = np.array([[1, 2, 3, 4]])
 
-        # Add the two instances of the Uncertainty class together
-        new_uncertainty = uncertainty1 + uncertainty2
+    >>> # Create another instance of the Uncertainty class Set the variance attribute
+    >>> uncertainty2 = Uncertainty()
+    >>> uncertainty2.variance = np.array([[5], [6], [7], [8]])
 
-        # Print the result
-        print(new_uncertainty)
-        Uncertainty(variance=
-         [[ 6  7  8  9]
-         [ 7  8  9 10]
-         [ 8  9 10 11]
-         [ 9 10 11 12]])
+    >>> # Add the two instances of the Uncertainty class together
+    >>> new_uncertainty = uncertainty1 + uncertainty2
+
+    >>> # Print the result
+    >>> print(new_uncertainty)
+    >>> Uncertainty(variance=
+    >>>  [[ 6  7  8  9]
+    >>>  [ 7  8  9 10]
+    >>>  [ 8  9 10 11]
+    >>>  [ 9 10 11 12]])
     """
 
     def __init__(
@@ -486,58 +487,74 @@ def get_var_patch(n_pixel, n_im, n_param, dtype):
     return patch
 
 
-def data2param(G, var_data, desc="  Data to model covariance"):
-    """This function is used to calculate the variance of model parameter
-    (var_param) from a given variance of data (var_d). if the var_d is derived
-    from weighted least squares method, then weight matrix W is required.
+def data2param(
+    G,
+    uc_data,
+    in_type: Literal["variance", "covariance"] = "variance",
+    out_type: Literal["variance", "covariance"] = "variance",
+    desc="  Uncertainty[Data -> Model]",
+):
+    """This function is used to derive the uncertainty of model domain from
+    the data domain for the least squares inversion solution.
 
     Parameters:
     ------------
-    G: 2D array (n_im, n_param)
+    G: 2D array (n_img, n_param)
         design matrix
-    var_data: 2D array (n_pixel, n_im)
-        deformation variance matrix
-    weighted: bool
-        if True, means that weighted least squares method was used to calculate parameters variance matrix. Default is False.
-    W: 1D array (n_im)
-        weight matrix. If weighted is True and W is None, then W is set by variance. Default is None.
+    uc_data: 2D array (n_pixel, n_img) or 3D array (n_pixel, n_img, n_img)
+        Uncertainty of data. If in_type is 'variance', then uc_data is 2D array.
+        If in_type is 'covariance', then uc_data is 3D array.
+    in_type: Literal["variance", "covariance"]
+        Type of uncertainty of data. Default is 'variance'.
+    out_type: Literal["variance", "covariance"]
+        Type of uncertainty of model. Default is 'variance'.
     desc: str
         description of progress bar
 
     Returns:
     --------
-    covar_param: np.ndarray (n_pixel, n_param)
-        variance of model parameters
+    uc_param: np.ndarray (n_pixel, n_param) or (n_pixel, n_param, n_param)
+        Uncertainty of model parameters
     """
     n_im, n_param = G.shape
-    n_pixel = var_data.shape[0]
+    n_pixel = uc_data.shape[0]
 
-    # remove all nan pixels in var_data
-    m = (~np.isnan(var_data)).sum(axis=1) > 0
-    var_data = var_data[m]
-
-    # set nan to zero to avoid all nan in var_param
-    var_data[np.isnan(var_data)] = 0
+    # remove pixels contains nan in uc_data
+    if in_type == "variance":
+        m = (np.isnan(uc_data)).sum(axis=1) == 0
+    elif in_type == "covariance":
+        m = (np.isnan(uc_data)).sum(axis=(1, 2)) == 0
+    else:
+        raise ValueError("in_type must be 'variance' or 'covariance'.")
+    uc_data = uc_data[m]
 
     C = np.eye(n_im, dtype=np.float32)
     M = np.linalg.inv(G.T @ G) @ (G.T)
 
-    # write empty variance into file to give a structure
-    var_param = np.full((n_pixel, n_param), np.nan, dtype=np.float32)
-    var_param_m = var_param[m]
+    #
+    if out_type == "variance":
+        uc_param = np.full((n_pixel, n_param), np.nan, dtype=np.float32)
+    elif out_type == "covariance":
+        uc_param = np.full((n_pixel, n_param, n_param), np.nan, dtype=np.float32)
+    uc_param_m = uc_param[m]
 
     patch = get_var_patch(n_pixel, n_im, n_param, np.dtype(np.float64))
     for col in tqdm(patch, desc=desc, unit="pixels"):
         start, end = col[0], col[1]
-        var_data_i = var_data[start:end, :, None]
-        cov_data = C[None, :, :].repeat((var_data_i.shape[0]), axis=0) * var_data_i
+        uc_data_i = uc_data[start:end, :, None]
+        if in_type == "variance":
+            cov_data = C[None, :, :].repeat((uc_data_i.shape[0]), axis=0) * uc_data_i
+        elif in_type == "covariance":
+            cov_data = uc_data_i
 
         cov_model = M[None, :, :] @ cov_data @ M.T[None, :, :]
+        if out_type == "variance":
+            uc_param_m[start:end, :] = np.diagonal(cov_model, axis1=1, axis2=2)
+        elif out_type == "covariance":
+            uc_param_m[start:end, :, :] = cov_model
 
-        var_param_m[start:end, :] = np.diagonal(cov_model, axis1=1, axis2=2)
-
-    var_param[m] = var_param_m
-    return var_param
+    uc_param[m] = uc_param_m
+    return uc_param
 
 
 def data2param_cov(G, cov_data, desc="  Data to model covariance"):
