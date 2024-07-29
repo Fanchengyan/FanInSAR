@@ -1447,6 +1447,10 @@ class HierarchicalDataset(GeoDataset):
         self._group = group
         self._roi = roi
         self._update_geo_info()
+        warnings.warn(
+            "HierarchicalDataset is still in development and may not work as expected.",
+            UserWarning,
+        )
 
     def __repr__(self) -> str:
         return self._repr_str
