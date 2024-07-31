@@ -548,7 +548,8 @@ class RasterDataset(GeoDataset):
             found will be used.
         nodata : float or int, optional
             no data value of the dataset. If None, the no data value of the first
-            file found will be used.
+            file found will be used. This parameter is useful when the no data value
+            is not stored in the file.
         roi : BoundingBox, optional
             region of interest to load from the dataset. If None, the union of all files
             bounds in the dataset will be used.
@@ -710,13 +711,19 @@ class RasterDataset(GeoDataset):
             bands = bands[0]
         return bands
 
+    def _ensure_dtype(self, data: np.ndarray) -> np.ndarray:
+        """Ensure that the data has the same dtype as the dataset."""
+        if data.dtype != self.dtype:
+            data = data.astype(self.dtype)
+        return data
+
     def _points_query(self, points: Points, vrt_fh) -> np.ndarray:
         """Return the values of dataset at given points. Points that outside the
         dataset will be masked."""
         points = self._ensure_query_crs(points)
         bands_idx = self._ensure_bands_idx(vrt_fh)
         data = np.ma.hstack(list(vrt_fh.sample(points.values, bands_idx, masked=True)))
-        return data
+        return self._ensure_dtype(data)
 
     def _bbox_query(self, bbox: BoundingBox, vrt_fh) -> np.ndarray:
         """Return the values of the dataset at the given bounding box."""
@@ -745,7 +752,7 @@ class RasterDataset(GeoDataset):
             data = np.ma.masked_array(data.data, data == self.nodata)
         if self.fill_nodata:
             data = fill.fillnodata(data)
-        return data
+        return self._ensure_dtype(data)
 
     def _polygons_query(self, polygons: Polygons, vrt_fh) -> np.ndarray:
         """Return the values of the dataset at the given polygons."""
@@ -781,7 +788,7 @@ class RasterDataset(GeoDataset):
                 if self.fill_nodata:
                     data = fill.fillnodata(data)
                     data = np.ma.masked_array(data.data, ~mask)
-                data_ls.append(data)
+                data_ls.append(self._ensure_dtype(data))
                 transform_ls.append(out_transform)
                 mask_ls.append(mask)
         else:
@@ -795,7 +802,7 @@ class RasterDataset(GeoDataset):
             if self.fill_nodata:
                 data = fill.fillnodata(data)
                 data = np.ma.masked_array(data.data, ~mask)
-            data_ls = [data]
+            data_ls = [self._ensure_dtype(data)]
             transform_ls = [out_transform]
             mask_ls = [mask]
 
@@ -2097,8 +2104,9 @@ class ApsPairs(PairDataset):
             data type of the output dataset. If None, the data type of the first file
             found will be used.
         nodata : float or int, optional
-            no data value of the output dataset. If None, the no data value of the first
-            file found will be used.
+            no data value of the output dataset. If None, the no data value of
+            the first file found will be used. This parameter is useful when the
+            no data value is not stored in the file.
         roi : BoundingBox, optional
             region of interest to load from the dataset. If None, the union of all files
             bounds in the dataset will be used.

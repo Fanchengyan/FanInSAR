@@ -178,7 +178,8 @@ class InterferogramDataset(PairDataset):
             file found will be used.
         nodata: float or int, optional
             no data value of the output dataset. If None, the no data value of the
-            first file found will be used.
+            first file found will be used. This parameter is useful when the no
+            data value is not stored in the file.
         roi: BoundingBox, optional
             region of interest to load from the dataset. If None, the union of all
             files bounds in the dataset will be used.
