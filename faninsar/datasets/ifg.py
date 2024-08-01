@@ -10,7 +10,7 @@ import rasterio
 import xarray as xr
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from faninsar._core import geo_tools
 from faninsar._core.logger import setup_logger

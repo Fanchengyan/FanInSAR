@@ -19,7 +19,7 @@ from rasterio import Affine, dtypes, transform
 from rasterio.io import MemoryFile
 from rasterio.transform import Affine
 from rasterio.warp import Resampling, reproject
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from ..query.bbox import BoundingBox
 from .logger import setup_logger
@@ -146,7 +146,12 @@ def array2kml(
             KML.href(img_file.name),
             KML.viewBoundScale(1),  # 设置 viewBoundScale 为 1
             KML.scale(1),  # 设置 scale 为 1),
-            KML.size(x=str(arr.shape[1]), y=str(arr.shape[0]), xunits="pixels", yunits="pixels"),
+            KML.size(
+                x=str(arr.shape[1]),
+                y=str(arr.shape[0]),
+                xunits="pixels",
+                yunits="pixels",
+            ),
         ),
         KML.LatLonBox(
             KML.north(bounds[3]),

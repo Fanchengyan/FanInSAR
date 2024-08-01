@@ -6,7 +6,7 @@ import numpy as np
 import psutil
 import torch
 from numpy.typing import NDArray
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from faninsar._core.device import parse_device
 from faninsar._core.pair_tools import Loops, Pairs
