@@ -3,6 +3,8 @@
 </h1><br>
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.11398347.svg)](https://doi.org/10.5281/zenodo.11398347) [![Documentation Status](https://readthedocs.org/projects/faninsar/badge/?version=latest)](https://faninsar.readthedocs.io/en/latest/?badge=latest)  [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+
+
 FanInSAR is a Fancy Interferometric Synthetic Aperture Radar (InSAR) time series analysis library written in Python. It aims to provide a foundational library for the development of InSAR algorithms, facilitating efficient processing of InSAR time series data by offering a Pythonic, fast, and flexible approach. FanInSAR’s high-level API abstracts the complex processing pipeline and conceals the low-level programming details, enabling users to focus on algorithm development. For researchers and developers aiming to rapidly implement their own InSAR algorithms, FanInSAR offers a quick start for their projects.
 
 
