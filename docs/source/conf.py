@@ -23,6 +23,7 @@ extensions = [
     "myst_nb",
     "sphinx_copybutton",
     "sphinx_design",
+    "sphinx_togglebutton",
 ]
 source_suffix = {
     ".rst": "restructuredtext",
@@ -76,7 +77,7 @@ autodoc_default_options = {
     ":show-inheritance:": True,
 }
 html_context = {
-    "github_url": "https://github.com",  # or your GitHub Enterprise site
+    "github_url": "https://github.com",
     "github_user": "Fanchengyan",
     "github_repo": "FanInSAR",
     "github_version": "main",

@@ -54,10 +54,11 @@ Citation
 
 
 .. toctree::
-   :maxdepth: 3
+   :maxdepth: 2
    :caption: Contents:
 
    install
    user_guide/index
+   examples/index
    api/index
    terminology

@@ -573,6 +573,10 @@ def calculate_u(
 
     >>> u = np.zeros_like(unw, dtype=np.float32)
     >>> u[idx] = np.round(NSBAS.calculate_u(loops, unw_used))
+
+    calculate the corrected interferometric phases
+
+    >>> unw_c = unw - 2 * np.pi * u
     """
     contain_nan = False
     if np.any(np.isnan(unw_phases)):

@@ -7,5 +7,10 @@
             "addWords": true,
             "scope": "workspace"
         }
-    }
+    },
+    "python.testing.pytestArgs": [
+        "tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true
 }

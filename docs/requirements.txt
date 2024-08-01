@@ -4,5 +4,6 @@ myst-nb
 sphinx-copybutton
 sphinx-design
 pydata_sphinx_theme
+sphinx-togglebutton
 Jinja2
 git+https://github.com/Fanchengyan/FanInSAR.git@main

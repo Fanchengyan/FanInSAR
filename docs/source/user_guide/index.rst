@@ -13,5 +13,6 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
    quick_start
    colormap
    data_structures
-   Indexing_data
+   indexing/index
    sampler
+   custom/index

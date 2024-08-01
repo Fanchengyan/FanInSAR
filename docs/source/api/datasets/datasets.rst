@@ -1,3 +1,6 @@
+.. _geo_datasets:
+
+===================
 geospatial Datasets
 ===================
 
@@ -13,7 +16,7 @@ The following datasets are available:
       * :class:`.GACOS`
    * :class:`.PairDataset` : base Datasets for all Pair-like productions. Child classes:
       * :class:`.InterferogramDataset`
-      * :class:`.GACOSPairs` 
+      * :class:`.GACOSPairs`
    * :class:`.InterferogramDataset` : base Datasets for all Interferogram productions. Child classes (well known productions):
       * :class:`.HyP3S1`, :class:`.HyP3S1Burst`,
       * :class:`.LiCSAR`
