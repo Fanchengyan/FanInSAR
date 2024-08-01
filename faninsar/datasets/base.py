@@ -31,7 +31,7 @@ from rasterio.warp import calculate_default_transform
 from rasterio.warp import transform as warp_transform
 from rtree.index import Index, Property
 from shapely import ops
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from .._core import geo_tools
 from .._core.geo_tools import (
@@ -889,13 +889,15 @@ class RasterDataset(GeoDataset):
 
         # parse bounding boxes results
         bbox_result = None
-        if len(files_bbox_list) > 0:
-            n_band = files_bbox_list.shape[2]
-            if n_band == 1:
-                bbox_values = files_bbox_list.squeeze(axis=2).transpose(1, 0, 2, 3)
+        n_files = len(files_bbox_list)
+        if n_files > 0:
+            n_boxes = len(query.boxes)
+            if n_boxes == 1:
+                boxes_values = np.ma.asarray(files_bbox_list)
+                dims = parse_2D_dims(boxes_values)
             else:
                 # stack the files for each box
-                boxes_ls = [[] for _ in range(len(query.boxes))]
+                boxes_ls = [[] for _ in range(n_boxes)]
                 for files_box in files_bbox_list:
                     for i, box in enumerate(files_box):
                         boxes_ls[i].append(box)
@@ -903,23 +905,27 @@ class RasterDataset(GeoDataset):
                 # get the dims
                 bbox0 = files_bbox_list[0]
                 dims = parse_2D_dims(bbox0, details=False)
-                dims = f"boxes:{len(boxes_values)}, ({dims})"
+                dims = f"boxes:{n_boxes}, ({dims})"
             bbox_result = {"data": boxes_values, "dims": f"({dims})"}
 
         # parse polygons results
         polygons_result = None
-        if len(files_polygons_list) > 0:
+        n_files = len(files_polygons_list)
+        if n_files > 0:
             n_polygons = len(query.polygons)
-            n_files = len(files_polygons_list)
-            # stack the files for each polygon
-            poly_list = [[] for _ in range(n_polygons)]
-            for file_data in files_polygons_list:
-                for i, poly_i in enumerate(file_data):
-                    poly_list[i].append(poly_i)
-            polygons_values = [np.ma.asarray(arr) for arr in poly_list]
-            # get the dims
-            polygon0 = polygons_values[0]
-            dims = parse_2D_dims(polygon0, details=False)
+            if n_polygons == 1:
+                polygons_values = np.ma.asarray(files_polygons_list)
+                dims = parse_2D_dims(polygons_values)
+            else:
+                # stack the files for each polygon
+                poly_list = [[] for _ in range(n_polygons)]
+                for file_data in files_polygons_list:
+                    for i, poly_i in enumerate(file_data):
+                        poly_list[i].append(poly_i)
+                polygons_values = [np.ma.asarray(arr) for arr in poly_list]
+                # get the dims
+                polygon0 = polygons_values[0]
+                dims = parse_2D_dims(polygon0, details=False)
 
             polygons_result = {
                 "data": polygons_values,
@@ -2190,7 +2196,7 @@ def get_nodata(arr, nodata, dtype):
 
 
 def parse_1D_dims(values_1D, multi_files=True):
-    """Parse the dimensions of 1D array. (points)"""
+    """Parse the dimensions of 1D array. (used by points)"""
     if multi_files:
         if values_1D.ndim == 2:
             n_files, n_points = values_1D.shape
@@ -2213,7 +2219,7 @@ def parse_1D_dims(values_1D, multi_files=True):
 
 
 def parse_2D_dims(values_2D, details=True, multi_files=True):
-    """Parse the dimensions of 2D array. (bbox, polygons)"""
+    """Parse the dimensions of 2D array. (used by bbox, polygons)"""
     if multi_files:
         if values_2D.ndim == 4:
             n_files, n_bands, height, width = values_2D.shape
