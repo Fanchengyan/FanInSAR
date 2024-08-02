@@ -1,3 +1,5 @@
+.. _tsmodels:
+
 Time-Series Models
 ==================
 
@@ -9,7 +11,7 @@ Table of Models
 .. csv-table:: Time-Series Models currently implemented in the package
    :file: tables/models.csv
    :header-rows: 1
-   
+
 Classes
 ~~~~~~~
 
@@ -94,5 +96,3 @@ FreezeThawCycleModelWithVelocity
    :member-order: bysource
    :show-inheritance:
    :inherited-members:
-
-

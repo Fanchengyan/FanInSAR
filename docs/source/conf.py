@@ -111,7 +111,6 @@ intersphinx_mapping = {
         "https://pandas.pydata.org/pandas-docs/stable/",
         "https://pandas.pydata.org/pandas-docs/stable/objects.inv",
     ),
-    "pyarrow": ("https://arrow.apache.org/docs/", None),
     "pyproj": (
         "https://pyproj4.github.io/pyproj/stable/",
         "https://pyproj4.github.io/pyproj/stable/objects.inv",
@@ -127,10 +126,6 @@ intersphinx_mapping = {
     "shapely": (
         "https://shapely.readthedocs.io/en/stable/",
         "https://shapely.readthedocs.io/en/stable/objects.inv",
-    ),
-    "pyproj": (
-        "https://pyproj4.github.io/pyproj/stable/",
-        "https://pyproj4.github.io/pyproj/stable/objects.inv",
     ),
     "torch": ("https://pytorch.org/docs/stable/", None),
     "torchgeo": (
