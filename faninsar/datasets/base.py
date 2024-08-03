@@ -1314,12 +1314,6 @@ class RasterDataset(GeoDataset):
 
         dst = rasterio.open(filename, mode, **profile)
 
-        # parse whether to update band names
-        desc = np.asarray(dst.descriptions, dtype="str")
-        update_tags = False
-        if band_names is not None and np.all(desc == "None"):
-            update_tags = True
-
         # parse window
         if bbox is None:
             win = None
@@ -1331,7 +1325,7 @@ class RasterDataset(GeoDataset):
             dst.write_mask(arr)
         elif arr_type == "data":
             dst.write(arr, indexes, window=win)
-            if update_tags:
+            if band_names is not None:
                 for i, name in enumerate(band_names):
                     dst.update_tags(i + 1, NAME=name)
         dst.close()

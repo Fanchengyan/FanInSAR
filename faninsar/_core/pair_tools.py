@@ -708,15 +708,15 @@ class Pairs:
 
         return matrix
 
-    def parse_gaps(self, pairs_removed: "Pairs" | None= None) -> pd.DatetimeIndex:
+    def parse_gaps(self, pairs_removed: "Pairs" | None = None) -> pd.DatetimeIndex:
         """Parse network gaps where the acquisitions are not connected by pairs.
         The gaps are detected by the dates that are not present in the secondary
         acquisition of the pairs.
-        
+
         .. note::
-            Theoretically, the gaps should be the temporal spans between the
-            consecutive acquisitions. For simplicity, the end dates of the gaps
-            are returned here.
+            Theoretically, the gaps should be the temporal spans  (or intervals)
+            between the consecutive acquisitions. For simplicity, the end dates
+            of the gaps are returned here.
 
         Parameters
         ----------
