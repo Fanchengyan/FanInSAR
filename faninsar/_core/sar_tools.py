@@ -98,7 +98,7 @@ class Baselines:
         """
         model_bs = LinearModel(pairs.dates)
         mf = NSBASMatrixFactory(values[:, None], pairs, model_bs)
-        incs, *_ = NSBASInversion(mf, verbose=False).inverse()
+        incs, *_ = NSBASInversion(mf, verbose=False, device="cpu").inverse()
 
         cum = np.cumsum(incs, axis=0)
         cum = np.insert(cum, 0, 0, axis=0)
@@ -132,7 +132,7 @@ class Baselines:
         plot_gaps: bool = True,
         ax: plt.Axes | None = None,
         xlabel: str = "Date",
-        ylabel: str = "Baseline [m]",
+        ylabel: str = "Perpendicular baseline (m)",
         legend: bool = True,
         legend_labels: list[str] = [
             "Remained pairs",
@@ -150,9 +150,9 @@ class Baselines:
         Parameters
         ----------
         pairs : Pairs
-            The pairs of the interferograms (temporal baseline).
-        pairs_removed : Pairs
-            The pairs of the interferograms which are removed.
+            All pairs used (temporal baseline).
+        pairs_removed : Pairs, optional
+            The pairs of the interferograms which are removed. Default is None.
         plot_gaps : bool
             Whether to plot the gaps between the acquisitions. Default is True.
         ax : plt.Axes
