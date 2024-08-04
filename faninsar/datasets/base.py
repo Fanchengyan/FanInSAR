@@ -1308,27 +1308,30 @@ class RasterDataset(GeoDataset):
         profile["dtype"] = get_minimum_dtype(arr)
         profile["nodata"] = get_nodata(arr, nodata, profile["dtype"])
         mode = "w"
-        if Path(filename).exists():
+        filename = Path(filename)
+        if filename.exists():
             if not overwrite:
                 mode = "r+"
 
-        dst = rasterio.open(filename, mode, **profile)
+        with rasterio.open(filename, mode, **profile) as dst:
+            # parse window
+            if bbox is None:
+                win = None
+            else:
+                win = dst.window(*bbox)
 
-        # parse window
-        if bbox is None:
-            win = None
-        else:
-            win = dst.window(*bbox)
-
-        # write array to tiff
-        if arr_type == "mask":
-            dst.write_mask(arr)
-        elif arr_type == "data":
-            dst.write(arr, indexes, window=win)
+            # write array to tiff
+            if arr_type == "mask":
+                dst.write_mask(arr)
+            elif arr_type == "data":
+                dst.write(arr, indexes, window=win)
+            # update band names
             if band_names is not None:
-                for i, name in enumerate(band_names):
-                    dst.update_tags(i + 1, NAME=name)
-        dst.close()
+                dst.descriptions = band_names
+                band_names_str = ";".join(band_names)
+                band_names_file = filename.with_suffix(".band_name.txt")
+                with open(band_names_file, "w") as f:
+                    f.write(band_names_str)
 
     def array2kml(
         self,
