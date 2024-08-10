@@ -26,39 +26,97 @@ Highlight Features
 - **Fast**: The core computation in FanInSAR is implemented using ``PyTorch``, a high-performance deep learning library. This allows for efficient processing on both CPU and GPU, enabling faster execution.
 - **Flexible**: FanInSAR is designed to be flexible, allowing for customization and extension. Users can easily inherit classes or customize the processing pipeline for their specific needs.
 
+
+.. grid:: 1 2 2 2
+    :gutter: 5
+    :class-container: sd-text-center
+    :padding: 4
+
+
+    .. grid-item-card:: Quick Overview
+        :img-top: /_static/doc_index/index_get_start.svg
+        :class-card: intro-card
+        :shadow: md
+
+        Learn how to use **FanInSAR** and discover its capabilities with a quick overview.
+
+        +++
+
+        .. button-ref:: quick_overview
+            :ref-type: ref
+            :click-parent:
+            :color: secondary
+            :expand:
+
+            To the Quick Start
+
+    .. grid-item-card:: Examples Gallery
+        :img-top: /_static/doc_index/index_example.svg
+        :class-card: intro-card
+        :shadow: md
+
+        Explore the examples to see how **FanInSAR** can be used in practice.
+
+        +++
+
+        .. button-ref:: gallery_header
+            :ref-type: ref
+            :click-parent:
+            :color: secondary
+            :expand:
+
+            To the Examples Gallery
+
+    .. grid-item-card:: API Reference
+        :img-top: /_static/doc_index/index_api.svg
+        :class-card: intro-card
+        :shadow: md
+
+        Dive into the **FanInSAR** API Reference to learn more about the available classes and methods.
+
+        +++
+
+        .. button-ref:: api
+            :ref-type: ref
+            :click-parent:
+            :color: secondary
+            :expand:
+
+            To the API Reference
+
+    .. grid-item-card::  Contributing Guide
+        :img-top: /_static/doc_index/index_contribute.svg
+        :class-card: intro-card
+        :shadow: md
+
+        Do you want to contribute to **FanInSAR**? Check out the contributing guide.
+
+        +++
+
+        .. button-ref:: contributing
+            :ref-type: ref
+            :click-parent:
+            :color: secondary
+            :expand:
+
+            To the Contributing Guide
+
+
 .. note::
 
     1. FanInSAR is under active development and is currently in the alpha stage. Its API may change in the future until it reaches a stable version.
     2. If you have any questions, suggestions, or issues, please feel free to open an issue or discussion on our GitHub repository at `GitHub Issues <https://github.com/Fanchengyan/FanInSAR/issues>`_ or `GitHub Discussions <https://github.com/Fanchengyan/FanInSAR/discussions>`_.
 
-Citation
---------
 
-.. code-block::
-
-    Fan, C., & Liu, L. (2024). FanInSAR: A Fancy InSAR time series library, in a Pythonic, fast, and flexible way (0.0.1). Zenodo. https://doi.org/10.5281/zenodo.11398347
-
-.. code-block:: bibtex
-
-    @software{fan2024FanInSAR,
-    author       = {Fan, Chengyan and
-                    Liu, Lin},
-    title        = {{FanInSAR: A Fancy InSAR time series library, in a Pythonic, fast, and flexible way}},
-    month        = may,
-    year         = 2024,
-    publisher    = {Zenodo},
-    version      = {0.0.1},
-    doi          = {10.5281/zenodo.11398347},
-    url          = {https://doi.org/10.5281/zenodo.11398347}
-    }
 
 
 .. toctree::
-   :maxdepth: 2
-   :caption: Contents:
+    :maxdepth: 2
+    :hidden:
 
-   install
-   user_guide/index
-   examples/index
-   api/index
-   terminology
+    install
+    user_guide/index
+    auto_examples/index
+    api/index
+    Contributing <contributing/index>
+    About <about/index>

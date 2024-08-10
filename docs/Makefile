@@ -14,6 +14,7 @@ help:
 
 clean:
 	rm -rf $(BUILDDIR)/*
+	rm -rf $(SOURCEDIR)/auto_examples*
 
 .PHONY: help Makefile
 

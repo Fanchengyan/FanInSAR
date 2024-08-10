@@ -11,6 +11,19 @@ copyright = "2024, Fan Chengyan (Fancy)"
 author = "Fan Chengyan (Fancy)"
 release = "v0.1"
 
+from pathlib import Path
+
+from myst_sphinx_gallery import GalleryConfig, __version__, generate_gallery
+
+myst_sphinx_gallery_config = GalleryConfig(
+    examples_dirs="../../examples",
+    gallery_dirs="auto_examples",
+    root_dir=Path(__file__).parent,
+    notebook_thumbnail_strategy="code",
+    thumbnail_strategy="last",
+)
+generate_gallery(myst_sphinx_gallery_config)
+
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
@@ -27,7 +40,8 @@ extensions = [
 ]
 source_suffix = {
     ".rst": "restructuredtext",
-    ".md": "markdown",
+    ".md": "myst-nb",
+    ".myst": "myst-nb",
 }
 myst_enable_extensions = ["colon_fence"]
 myst_url_schemes = ["http", "https", "mailto"]
@@ -45,6 +59,7 @@ html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
 html_css_files = ["custom.css"]
 html_logo = "_static/logo/logo.png"
+html_favicon = "_static/logo/icon.svg"
 
 html_theme_options = {
     "show_toc_level": 2,

@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="99.058548mm"
+   height="89.967583mm"
+   viewBox="0 0 99.058554 89.967582"
+   version="1.1"
+   id="svg1040"
+   inkscape:version="1.3 (0e150ed, 2023-07-21)"
+   sodipodi:docname="index_api.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg"
+   xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+   xmlns:cc="http://creativecommons.org/ns#"
+   xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <defs
+     id="defs1034" />
+  <sodipodi:namedview
+     id="base"
+     pagecolor="#ffffff"
+     bordercolor="#666666"
+     borderopacity="1.0"
+     inkscape:pageopacity="0.0"
+     inkscape:pageshadow="2"
+     inkscape:zoom="1.0011852"
+     inkscape:cx="801.55"
+     inkscape:cy="311.13125"
+     inkscape:document-units="mm"
+     inkscape:current-layer="layer1"
+     showgrid="false"
+     fit-margin-top="0"
+     fit-margin-left="0"
+     fit-margin-right="0"
+     fit-margin-bottom="0"
+     inkscape:window-width="2560"
+     inkscape:window-height="1332"
+     inkscape:window-x="0"
+     inkscape:window-y="25"
+     inkscape:window-maximized="1"
+     inkscape:showpageshadow="2"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1" />
+  <metadata
+     id="metadata1037">
+    <rdf:RDF>
+      <cc:Work
+         rdf:about="">
+        <dc:format>image/svg+xml</dc:format>
+        <dc:type
+           rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
+        <dc:title />
+      </cc:Work>
+    </rdf:RDF>
+  </metadata>
+  <g
+     inkscape:label="Layer 1"
+     inkscape:groupmode="layer"
+     id="layer1"
+     transform="translate(195.19933,-1.0492759)">
+    <path
+       inkscape:connector-curvature="0"
+       id="path899"
+       d="m -165.71968,6.5241609 h -24.00477 V 85.541972 h 24.83374"
+       style="fill:none;stroke:#f37726;stroke-width:10.9498;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1" />
+    <path
+       inkscape:connector-curvature="0"
+       id="path899-3"
+       d="m -125.62043,6.5241609 h 24.00476 V 85.541972 h -24.83374"
+       style="fill:none;stroke:#f37726;stroke-width:10.9498;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1" />
+    <circle
+       style="fill:#f37726;fill-opacity:1;stroke:#f37726;stroke-width:4.96797;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1"
+       id="path918"
+       cx="-158.60042"
+       cy="60.08046"
+       r="2.441102" />
+    <circle
+       style="fill:#f37726;fill-opacity:1;stroke:#f37726;stroke-width:4.96797;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1"
+       id="path918-5"
+       cx="-146.06061"
+       cy="60.08046"
+       r="2.441102" />
+    <circle
+       style="fill:#f37726;fill-opacity:1;stroke:#f37726;stroke-width:4.96797;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1"
+       id="path918-6"
+       cx="-133.5208"
+       cy="60.08046"
+       r="2.441102" />
+  </g>
+</svg>

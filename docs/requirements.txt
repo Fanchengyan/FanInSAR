@@ -6,4 +6,5 @@ sphinx-design
 pydata_sphinx_theme
 sphinx-togglebutton
 Jinja2
+myst-sphinx-gallery
 git+https://github.com/Fanchengyan/FanInSAR.git@main
