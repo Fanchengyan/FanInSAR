@@ -13,7 +13,15 @@ release = "v0.1"
 
 from pathlib import Path
 
-from myst_sphinx_gallery import GalleryConfig, __version__, generate_gallery
+from myst_sphinx_gallery import (
+    GalleryConfig,
+    GridItemCard,
+    generate_gallery,
+)
+
+myst_gallery_grid_item = GridItemCard()
+myst_gallery_grid_item.add_option("class-item", "myst-gallery-grid-item")
+
 
 myst_sphinx_gallery_config = GalleryConfig(
     examples_dirs="../../examples",
@@ -21,6 +29,7 @@ myst_sphinx_gallery_config = GalleryConfig(
     root_dir=Path(__file__).parent,
     notebook_thumbnail_strategy="code",
     thumbnail_strategy="last",
+    grid_item_card=myst_gallery_grid_item,
 )
 generate_gallery(myst_sphinx_gallery_config)
 
@@ -57,7 +66,7 @@ exclude_patterns = []
 
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
-html_css_files = ["custom.css"]
+html_css_files = ["css/custom.css", "css/gallery.css"]
 html_logo = "_static/logo/logo.png"
 html_favicon = "_static/logo/icon.svg"
 
