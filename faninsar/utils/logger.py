@@ -1,30 +1,25 @@
+"""Logger utility."""
+
 from __future__ import annotations
 
 import logging
-from typing import Literal
+from logging import _nameToLevel as NAME_TO_LEVEL
+from typing import TYPE_CHECKING
 
-LEVEL_MAP = {
-    "notset": logging.NOTSET,
-    "debug": logging.DEBUG,
-    "info": logging.INFO,
-    "warning": logging.WARNING,
-    "error": logging.ERROR,
-    "critical": logging.CRITICAL,
-}
+if TYPE_CHECKING:
+    from faninsar.typing import LogLevel, PathLike
 
 
 def setup_logger(
-    log_file=None,
-    log_level: Literal[
-        "notset", "debug", "info", "warning", "error", "critical"
-    ] = "info",
-    log_format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    log_name="FanInSAR",
-    capture_warnings=True,
-    keep_handlers=True,
-    return_handler=False,
+    log_file: PathLike | None = None,
+    log_level: LogLevel = "info",
+    log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    log_name: str = "FanInSAR",
+    capture_warnings: bool = True,
+    keep_handlers: bool = True,
+    return_handler: bool = False,
 ) -> logging.Logger:
-    """Setup logger.
+    """Setups a logger.
 
     Parameters
     ----------
@@ -43,8 +38,9 @@ def setup_logger(
         Keep existing handlers. Default is True.
     return_handler : bool, optional
         Return handler. Default is False.
+
     """
-    log_level = LEVEL_MAP[log_level.lower()]
+    log_level = NAME_TO_LEVEL[log_level.upper()]
 
     # create a logger
     logger = logging.getLogger(log_name)
@@ -53,7 +49,8 @@ def setup_logger(
     # create a formatter
     formatter = logging.Formatter(log_format)
 
-    def create_handler():
+    def create_handler() -> logging.Handler:
+        """Create a handler."""
         if log_file:
             handler = logging.FileHandler(log_file)
             handler.set_name(log_name)
@@ -86,5 +83,4 @@ def setup_logger(
 
     if return_handler:
         return logger, handler
-    else:
-        return logger
+    return logger

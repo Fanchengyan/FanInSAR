@@ -28,22 +28,24 @@ names = [
     "kr",
     "rainbow",
 ]
-__all__ = names.copy()
+_all = names.copy()
 
 
 cwd = Path(__file__).parent.absolute()
 
 for name in names:
     file = cwd / f"{name}.csv"
-    with open(file) as f:
+    with Path(file).open() as f:
         f_new = f.readlines()[0]
     file = cwd / f_new
     cm_data = np.loadtxt(file, delimiter=",")
 
-    __all__.append(f"{name}_r")
+    _all.append(f"{name}_r")
 
     vars()[name] = LinearSegmentedColormap.from_list(name, cm_data)
     vars()[f"{name}_r"] = LinearSegmentedColormap.from_list(f"{name}_r", cm_data[::-1])
+
+__all__ = tuple(_all)
 
 del name
 del file

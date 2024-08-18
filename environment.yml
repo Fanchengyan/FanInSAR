@@ -1,0 +1,46 @@
+# Local development dependencies for testing, docs building
+name: faninsar-dev
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+
+  # required dependencies
+  - geopandas
+  - pandas
+  - numpy
+  - matplotlib
+  - rasterio >= 1.0.26
+  - xarray
+  - psutil
+  - rioxarray
+  - netcdf4
+  - h5netcdf
+  - tqdm
+  - rtree
+  - pykml
+
+  # code checks
+  - pre-commit
+  - ruff
+
+  # tests
+  - coverage
+  - pytest
+  - pytest-cov
+
+  # docs
+  - recommonmark
+  - sphinx>=7
+  - myst-nb
+  - sphinx-copybutton
+  - sphinx-design
+  - sphinx-togglebutton
+  - Jinja2
+
+  - pip:
+      - myst-sphinx-gallery
+      - data_downloader
+      - pydata_sphinx_theme
+      - torch

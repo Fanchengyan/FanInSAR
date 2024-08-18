@@ -1,0 +1,307 @@
+[build-system]
+requires = [
+  "setuptools",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "FanInSAR"
+description = "A fancy InSAR time series library, in a Pythonic, fast, and flexible way."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Chengyan Fan (Fancy)", email = 'fanchengyan@outlook.com' },
+]
+
+urls.Documentation = "https://faninsar.readthedocs.io/en/latest/"
+urls.Source = "https://github.com/Fanchengyan/FanInSAR"
+
+requires-python = ">=3.8"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: InSAR",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent",
+  "License :: OSI Approved :: MIT License",
+  'Topic :: Scientific/Engineering',
+]
+keywords = [
+  "insar",
+  "time-series",
+  "sbas",
+  "nsbas",
+  "radar",
+  "sar",
+  "remote-sensing",
+  "geospatial",
+  "geoscience",
+  "deformation",
+  "sentinel-1",
+  "nisar",
+]
+dynamic = [
+  "version",
+]
+dependencies = [
+    "geopandas",
+    "pandas",
+    "numpy",
+    "torch",
+    "matplotlib",
+    "data_downloader",
+    "rasterio >= 1.0.26",
+    "xarray",
+    "psutil",
+    "rioxarray",
+    "netcdf4",
+    "h5netcdf",
+    "tqdm",
+    "rtree",
+    "pykml",
+]
+
+
+[project.optional-dependencies]
+
+code_style = ["pre-commit", "ruff"]
+test = [
+  "coverage",
+  "pytest",
+  "pytest-cov",
+  # "pytest-regressions",
+  # "pytest-param-files~=0.3.3",
+
+]
+docs = [
+  "recommonmark",
+  "sphinx>=7",
+  "myst-nb",
+  "sphinx-copybutton",
+  "sphinx-design",
+  "pydata_sphinx_theme",
+  "sphinx-togglebutton",
+  "Jinja2",
+  "myst-sphinx-gallery",
+]
+
+dev = [
+  "geopandas",
+  "pandas",
+  "numpy",
+  "torch",
+  "matplotlib",
+  "data_downloader",
+  "rasterio >= 1.0.26",
+  "xarray",
+  "psutil",
+  "rioxarray",
+  "netcdf4",
+  "h5netcdf",
+  "tqdm",
+  "rtree",
+  "pykml",
+  "pre-commit",
+  "ruff",
+  "coverage",
+  "pytest",
+  "pytest-cov",
+  "recommonmark",
+  "sphinx>=7",
+  "myst-nb",
+  "sphinx-copybutton",
+  "sphinx-design",
+  "pydata_sphinx_theme",
+  "sphinx-togglebutton",
+  "Jinja2",
+  "myst-sphinx-gallery",
+  ]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "faninsar.__version__" }
+
+[tool.setuptools.packages.find]
+where = [
+  ".",
+] # list of folders that contain the packages (["."] by default)
+include = [
+  "faninsar*",
+] # package names should match these glob patterns (["*"] by default)
+namespaces = true # allow scanning PEP 420 namespaces (true by default)
+
+[tool.pytest.ini_options]
+addopts = [
+  "--color=yes",
+  "--cov-report=",
+  "--cov=myst_sphinx_gallery",
+  "--durations=5",
+  "-r a",
+  "--tb=short",
+]
+testpaths = [
+    "tests",
+]
+norecursedirs = "build _build"
+filterwarnings = [
+  # "ignore:node class .* is already registered.*:",
+  # "ignore:node.Node.* is obsoleted by Node.*:",
+  "ignore:.* Unknown directive type \"toctree\".",
+]
+
+markers = [
+  "slow: marks tests as slow",
+]
+
+[tool.ruff]
+line-length = 88
+fix = true
+exclude=[
+  "build",
+  "dist",
+  "docs",
+  "notebooks",
+  "tests",
+  "examples",
+  "data",
+  "faninsar.egg-info",
+  "__init__.py",
+]
+
+[tool.ruff.lint]
+ignore-init-module-imports = true
+select = [
+  # pyflakes
+  "F",
+  # pycodestyle
+  "E", "W",
+  # isort
+  "I",
+  # flake8-simplify
+  "SIM",
+  # pyupgrade
+  "UP",
+  # pep8-naming
+  "N",
+  # pydocstyle
+  "D",
+  # flake8-2020
+  "YTT",
+  # flake8-annotations
+  "ANN",
+  # flake8-builtins
+  "A",
+  # flake8-commas
+  "COM",
+  # flake8-datetimez (DTZ)
+  "DTZ",
+  # flake8-errmsg (EM)
+  "EM",
+  # flake8-bugbear
+  "B",
+  # flake8-quotes
+  "Q",
+  # flake8-debugger
+  "T10",
+  # flake8-gettext
+  "INT",
+  # pylint
+  "PL",
+  # flake8-pytest-style
+  "PT",
+  # misc lints
+  "PIE",
+  # flake8-pyi
+  "PYI",
+  # tidy imports
+  "TID",
+  # implicit string concatenation
+  "ISC",
+  # type-checking imports
+  "TCH",
+  # flake8-import-conventions (ICN)
+  "ICN",
+  # lake8-logging (LOG)
+  "LOG",
+  # flake8-no-pep420 (INP)
+  "INP",
+  # flake8-print (T20)
+  "T20",
+  # comprehensions
+  "C4",
+  # pygrep-hooks
+  "PGH",
+  # Ruff-specific rules
+  "RUF",
+  # flake8-bandit: exec-builtin
+  "S102",
+  # numpy-legacy-random
+  "NPY002",
+  # Perflint
+  "PERF",
+  # flynt
+  "FLY",
+  # flake8-logging-format
+  "G",
+  # flake8-future-annotations
+  "FA",
+  # unconventional-import-alias
+  "ICN001",
+  # flake8-slots
+  "SLOT",
+  # flake8-raise
+  "RSE",
+  # flake8-return (RET)
+  "RET",
+  # flake8-self (SLF)
+  "SLF",
+  # flake8-unused-arguments (ARG)
+  "ARG",
+  # flake8-use-pathlib (PTH)
+  "PTH",
+  # pandas-vet (PD)
+  "PD",
+  # tryceratops (TRY)
+  "TRY",
+  # NumPy-specific rules (NPY)
+  "NPY",
+  # refurb (FURB)
+  "FURB",
+]
+ignore = [
+  # missing-type-self
+  "ANN101",
+  # missing-type-cls
+  "ANN102",
+  # magic-value-comparison
+  "PLR2004",
+  # undocumented-public-package
+  "D104",
+  # too-many-arguments
+  "PLR0913",
+  # missing-type-kwargs
+  "ANN003",
+  # pandas-use-of-dot-values
+  "PD011",
+]
+[tool.ruff.lint.pep8-naming]
+extend-ignore-names = [
+  "test_*",
+  "to_*"
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+
+[tool.doc8]
+ignore = ["D001"]
+allow-long-titles = true
