@@ -1,26 +1,31 @@
+"""Module for base classes of interferogram and coherence datasets."""
+
 from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence
 
 import numpy as np
-import pandas as pd
 import rasterio
 import xarray as xr
-from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from tqdm import tqdm
 
 from faninsar._core import geo_tools
-from faninsar._core.logger import setup_logger
-from faninsar._core.pair_tools import Pairs
-from faninsar._core.sar_tools import Baselines, PhaseDeformationConverter
 from faninsar.datasets.base import ApsPairs, PairDataset, RasterDataset
+from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points
 
+if TYPE_CHECKING:
+    from rasterio.crs import CRS
+
+    from faninsar._core.sar.pairs import Pairs
+    from faninsar._core.sar.sar_base import Baselines, PhaseDeformationConverter
+
 logger = setup_logger(
-    log_name="FanInSAR.datasets.ifg", log_format="%(levelname)s - %(message)s"
+    log_name="FanInSAR.datasets.ifg",
+    log_format="%(levelname)s - %(message)s",
 )
 
 
@@ -54,16 +59,16 @@ class CoherenceDataset(PairDataset):
         val_range : tuple[float, float], optional
             value range to clip the array. If None, the range of the dataset will
             be used. Default is None.
+
         """
         if val_range is None:
             val_range = self.range
-        arr = np.clip(arr, val_range[0], val_range[1])
-        return arr
+        return np.clip(arr, val_range[0], val_range[1])
 
     def to_mean(
         self,
-        pairs: Optional[Pairs] = None,
-        roi: Optional[BoundingBox] = None,
+        pairs: Pairs | None = None,
+        roi: BoundingBox | None = None,
     ) -> np.ndarray:
         """Calculate the mean coherence for given region of interest.
 
@@ -80,6 +85,7 @@ class CoherenceDataset(PairDataset):
         -------
         mean_coh : np.ndarray
             mean coherence array with value range in the interval of [0, 1].
+
         """
         if roi is None:
             roi = self.roi
@@ -113,8 +119,7 @@ class CoherenceDataset(PairDataset):
 
 
 class InterferogramDataset(PairDataset):
-    """
-    A base class for interferogram datasets.
+    """A base class for interferogram datasets.
 
     .. Note::
         1. Only the pairs that **both unwrapped interferograms and coherence files
@@ -130,29 +135,29 @@ class InterferogramDataset(PairDataset):
     #: pattern used to find coherence files.
     pattern_coh = "*"
     #: value range of coherence.
-    coh_range: Optional[tuple[float, float]] = [0, 1]
+    coh_range: tuple[float, float] | None = [0, 1]
 
     _ds_coh: RasterDataset
-    _ds_dem: Optional[RasterDataset] = None
-    _ds_mask: Optional[RasterDataset] = None
-    _ds_aps: Optional[RasterDataset] = None
+    _ds_dem: RasterDataset | None = None
+    _ds_mask: RasterDataset | None = None
+    _ds_aps: RasterDataset | None = None
 
     def __init__(
         self,
         root_dir: str = "data",
-        paths_unw: Optional[Sequence[str | Path]] = None,
-        paths_coh: Optional[Sequence[str | Path]] = None,
-        crs: Optional[CRS] = None,
-        res: Optional[float | tuple[float, float]] = None,
-        dtype: Optional[np.dtype] = None,
-        nodata: Optional[Any] = None,
-        roi: Optional[BoundingBox] = None,
-        bands_unw: Optional[Sequence[str]] = None,
-        bands_coh: Optional[Sequence[str]] = None,
+        paths_unw: Sequence[str | Path] | None = None,
+        paths_coh: Sequence[str | Path] | None = None,
+        crs: CRS | None = None,
+        res: float | tuple[float, float] | None = None,
+        dtype: np.dtype | None = None,
+        nodata: float | None = None,
+        roi: BoundingBox | None = None,
+        bands_unw: Sequence[str] | None = None,
+        bands_coh: Sequence[str] | None = None,
         cache: bool = True,
-        resampling=Resampling.nearest,
+        resampling: Resampling = Resampling.nearest,
         fill_nodata: bool = False,
-        verbose=True,
+        verbose: bool = True,
         keep_common: bool = True,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
@@ -163,7 +168,8 @@ class InterferogramDataset(PairDataset):
             root_dir directory where dataset can be found.
         paths_unw: list of str, optional
             list of unwrapped interferogram file paths to use instead of searching
-            for files in ``root_dir``. If None, files will be searched for in ``root_dir``.
+            for files in ``root_dir``. If None, files will be searched for in
+            ``root_dir``.
         paths_coh: list of str, optional
             list of coherence file paths to use instead of searching for files in
             ``root_dir``. If None, files will be searched for in ``root_dir``.
@@ -184,7 +190,8 @@ class InterferogramDataset(PairDataset):
             region of interest to load from the dataset. If None, the union of all
             files bounds in the dataset will be used.
         bands_unw: list of str, optional
-            names of bands to return (defaults to all bands) for unwrapped interferograms.
+            names of bands to return (defaults to all bands) for unwrapped
+            interferograms.
         bands_coh: list of str, optional
             names of bands to return (defaults to all bands) for coherence.
         cache: bool, optional
@@ -206,6 +213,7 @@ class InterferogramDataset(PairDataset):
             Only used when the number of interferograms and coherence files are
             not equal. If True, keep the common pairs of interferograms and
             coherence files and raise a warning. If False, raise an error.
+
         """
         root_dir = Path(root_dir)
         self.root_dir = root_dir
@@ -221,7 +229,8 @@ class InterferogramDataset(PairDataset):
         # Pairs: ensure there are no duplicate pairs
         # remove duplicate pairs
         paths_unw, pairs_unw = self._deduplicate_pairs(
-            paths_unw, "unwrapped interferograms"
+            paths_unw,
+            "unwrapped interferograms",
         )
         paths_coh, pairs_coh = self._deduplicate_pairs(paths_coh, "coherence files")
 
@@ -235,7 +244,7 @@ class InterferogramDataset(PairDataset):
                 raise ValueError(mismatch_info)
 
             mismatch_info += " Only common pairs will be used."
-            warnings.warn(mismatch_info)
+            warnings.warn(mismatch_info, stacklevel=2)
             # keep paths only with the common pairs
             pairs = pairs_unw.intersect(pairs_coh)
             paths_unw = paths_unw[pairs_unw.where(pairs)]
@@ -295,15 +304,17 @@ class InterferogramDataset(PairDataset):
         _, index = pairs.sort(inplace=False)
         if len(index) < len(paths):
             deduplicated = "".join(
-                [f"\n\t{i.parent.stem}" for i in set(paths) - set(paths[index])]
+                [f"\n\t{i.parent.stem}" for i in set(paths) - set(paths[index])],
             )
             warnings.warn(
-                f"Duplicate pairs found in dataset {dataset_name}, keeping only the first occurrence"
-                f"\nDeduplicate pairs: {deduplicated}"
+                f"Duplicate pairs found in dataset {dataset_name}, "
+                "keeping only the first occurrence"
+                f"\nDeduplicate pairs: {deduplicated}",
+                stacklevel=2,
             )
         return paths[index], pairs
 
-    def parse_baselines(self, pairs: Pairs | None) -> Baselines:
+    def parse_baselines(self, pairs: Pairs | None) -> Baselines:  # noqa: ARG002
         """Parse the baseline of the interferogram for given pairs.
 
         Parameters
@@ -311,10 +322,10 @@ class InterferogramDataset(PairDataset):
         pairs : Pairs
             The pairs which the baseline will be parsed. Default is None, which
             means all pairs will be parsed.
+
         """
-        raise NotImplementedError(
-            "parse_baseline method must be implemented in subclass"
-        )
+        msg = "parse_baseline method must be implemented in subclass"
+        raise NotImplementedError(msg)
 
     @property
     def coh_dataset(self) -> RasterDataset:
@@ -322,22 +333,25 @@ class InterferogramDataset(PairDataset):
         return self._ds_coh
 
     @property
-    def aps_dataset(self) -> Optional[RasterDataset]:
-        """Return the aps (Atmospheric Phase Screen) dataset. If None, no aps data is used."""
+    def aps_dataset(self) -> RasterDataset | None:
+        """Return the aps (Atmospheric Phase Screen) dataset.
+
+        If None, no aps data is used.
+        """
         return self._ds_aps
 
     @property
-    def los_dataset(self) -> Optional[RasterDataset]:
+    def los_dataset(self) -> RasterDataset | None:
         """Return the theta dataset. If None, no theta data is used."""
         return self._ds_los
 
     @property
-    def dem_dataset(self) -> Optional[RasterDataset]:
+    def dem_dataset(self) -> RasterDataset | None:
         """Return the DEM dataset. If None, no DEM data is used."""
         return self._ds_dem
 
     @property
-    def mask_dataset(self) -> Optional[RasterDataset]:
+    def mask_dataset(self) -> RasterDataset | None:
         """Return the mask dataset. If None, no Mask data is used."""
         return self._ds_mask
 
@@ -353,6 +367,7 @@ class InterferogramDataset(PairDataset):
         -------
         kwargs : dict
             Formatted keyword arguments.
+
         """
         kwargs.setdefault("crs", self.crs)
         kwargs.setdefault("res", self.res)
@@ -364,29 +379,34 @@ class InterferogramDataset(PairDataset):
 
     def _ensure_ds(
         self,
-        dataset: Optional[RasterDataset],
+        dataset: RasterDataset | None,
         ds_str: str,
         ds_class: RasterDataset = RasterDataset,
         **kwargs,
-    ):
-        """Ensure the dataset is an instance of ds_class. If dataset is None, a
-        new ``ds_class`` object will be created using the kwargs."""
+    ) -> RasterDataset:
+        """Ensure the dataset is an instance of ds_class.
+
+        If dataset is None, a new ``ds_class`` object will be created using
+        the kwargs.
+        """
         if dataset is None:
             kwargs = self._ensure_ds_kwargs(kwargs)
             dataset = ds_class(**kwargs)
         elif not isinstance(dataset, ds_class):
+            msg = f"{ds_str} must be an instance of {ds_class}, got {type(dataset)}"
             raise TypeError(
-                f"{ds_str} must be an instance of {ds_class}, got {type(dataset)}"
+                msg,
             )
         return dataset
 
     def set_aps_dataset(
         self,
-        aps_dataset: Optional[ApsPairs] = None,
-        **kwargs: Any,
+        aps_dataset: ApsPairs | None = None,
+        **kwargs: dict,
     ) -> None:
-        """Set the aps dataset. If aps_dataset is None, a new ApsPairs object will
-        be created using the kwargs.
+        """Set the aps dataset.
+
+        If aps_dataset is None, a new ApsPairs object will be created using the kwargs.
 
         Parameters
         ----------
@@ -397,19 +417,22 @@ class InterferogramDataset(PairDataset):
         **kwargs : dict, optional
             Keyword arguments used to create a new ApsPairs object if aps_dataset
             is None.
+
         """
         kwargs.setdefault("ds_name", "ApsPairs")
         self._ds_aps = self._ensure_ds(aps_dataset, "aps_dataset", ApsPairs, **kwargs)
 
     def set_los_dataset(
         self,
-        los_dataset: Optional[RasterDataset] = None,
-        **kwargs: Any,
+        los_dataset: RasterDataset | None = None,
+        **kwargs: dict,
     ) -> None:
-        """Set the los dataset. los file could be incidence angle (relative to
-        vertical) or look angle (relative to horizontal). This file is used to
-        convert differential atmospheric phase from vertical to line-of-sight (LOS)
-        direction or convert LOS deformation phase to vertical.
+        """Set the los dataset.
+
+        los file could be incidence angle (relative to vertical) or look angle
+        (relative to horizontal). This file is used to convert differential
+        atmospheric phase from vertical to line-of-sight (LOS) direction or
+        convert LOS deformation phase to vertical.
 
         Parameters
         ----------
@@ -418,14 +441,15 @@ class InterferogramDataset(PairDataset):
         **kwargs : dict, optional
             Keyword arguments used to create a new RasterDataset object if
             ``los_dataset`` is None.
+
         """
         kwargs.setdefault("ds_name", "LOS")
         self._ds_los = self._ensure_ds(los_dataset, "los_dataset", **kwargs)
 
     def set_dem_dataset(
         self,
-        dem_dataset: Optional[RasterDataset] = None,
-        **kwargs: Any,
+        dem_dataset: RasterDataset | None = None,
+        **kwargs: dict,
     ) -> None:
         """Set the dem dataset.
 
@@ -436,27 +460,30 @@ class InterferogramDataset(PairDataset):
         **kwargs : dict, optional
             Keyword arguments used to create a new RasterDataset object if
             ``dem_dataset`` is None.
+
         """
         kwargs.setdefault("ds_name", "DEM")
         self._ds_dem = self._ensure_ds(dem_dataset, "dem_dataset", **kwargs)
 
     def set_mask_dataset(
         self,
-        mask_dataset: Optional[RasterDataset] = None,
+        mask_dataset: RasterDataset | None = None,
         **kwargs,
     ) -> None:
+        """Set the mask dataset."""
         kwargs.setdefault("ds_name", "Mask")
         self._ds_mask = self._ensure_ds(mask_dataset, "mask_dataset", **kwargs)
 
     def load_los_ratio(
         self,
-        roi: Optional[BoundingBox] = None,
+        roi: BoundingBox | None = None,
         angle_type: Literal["incidence", "look"] = "look",
     ) -> np.ndarray:
-        """load and convert los angle map to ratio map for given region of
-        interest. The ratio map is used to convert differential atmospheric
-        phase from vertical to line-of-sight (LOS) direction or convert LOS
-        deformation phase to vertical
+        """Load and convert los angle map to ratio map for given region of interest.
+
+        The ratio map is used to convert differential atmospheric phase from
+        vertical to line-of-sight (LOS) direction or convert LOS deformation
+        phase to vertical.
 
         Parameters
         ----------
@@ -467,6 +494,7 @@ class InterferogramDataset(PairDataset):
             angle type, one of ['incidence', 'look']. 'incidence' means incidence
             angle (relative to vertical) and 'look' means look angle (relative to
             horizontal). Default is 'look'.
+
         """
         if self.los_dataset is None:
             return None
@@ -481,8 +509,8 @@ class InterferogramDataset(PairDataset):
 
     def to_nan_count(
         self,
-        pairs: Optional[Pairs] = None,
-        roi: Optional[BoundingBox] = None,
+        pairs: Pairs | None = None,
+        roi: BoundingBox | None = None,
     ) -> np.ndarray:
         """Calculate the number of nan values for given region of interest.
 
@@ -494,6 +522,7 @@ class InterferogramDataset(PairDataset):
         roi : BoundingBox, optional
             region of interest to calculate the mean coherence. If None, the roi
             of the dataset will be used.
+
         """
         if roi is None:
             roi = self.roi
@@ -519,8 +548,8 @@ class InterferogramDataset(PairDataset):
     def to_netcdf(
         self,
         filename: str | Path,
-        roi: Optional[BoundingBox] = None,
-        ref_points: Optional[Points] = None,
+        roi: BoundingBox | None = None,
+        ref_points: Points | None = None,
     ) -> None:
         """Save the dataset to a netCDF file for given region of interest.
 
@@ -533,6 +562,7 @@ class InterferogramDataset(PairDataset):
             used.
         ref_points : Points, optional, default: None
             reference points to save. If None, will keep the original values.
+
         """
         if roi is None:
             roi = self.roi
@@ -565,20 +595,24 @@ class InterferogramDataset(PairDataset):
         )
 
         ds = geo_tools.write_geoinfo_into_ds(
-            ds, ["unw", "coh"], crs=self.crs, x_dim="lon", y_dim="lat"
+            ds,
+            ["unw", "coh"],
+            crs=self.crs,
+            x_dim="lon",
+            y_dim="lat",
         )
         ds.to_netcdf(filename)
 
-    def to_tiffs(
+    def to_tiffs(  # noqa: PLR0912
         self,
         out_dir: str | Path,
-        roi: Optional[BoundingBox] = None,
-        ref_points: Optional[Points] = None,
-        pairs: Optional[Pairs] = None,
-        pdc: Optional[PhaseDeformationConverter] = None,
-        los_ratio: Optional[np.ndarray] = None,
-        names_unw: Optional[list[str]] = None,
-        names_coh: Optional[list[str]] = None,
+        roi: BoundingBox | None = None,
+        ref_points: Points | None = None,
+        pairs: Pairs | None = None,
+        pdc: PhaseDeformationConverter | None = None,
+        los_ratio: np.ndarray | None = None,
+        names_unw: list[str] | None = None,
+        names_coh: list[str] | None = None,
         overwrite: bool = True,
     ) -> None:
         """Save the dataset to files for given region of interest.
@@ -610,6 +644,7 @@ class InterferogramDataset(PairDataset):
             If pairs is not None, names should be with the same length as pairs.
         overwrite : bool, optional
             if True, overwrite the existing files. Default is True.
+
         """
         out_dir = Path(out_dir)
         if roi is None:
@@ -634,7 +669,8 @@ class InterferogramDataset(PairDataset):
                 out_file = out_dir / names_unw[i]
 
             if out_file.exists() and not overwrite:
-                logger.info(f"File {out_file} exists, skip")
+                msg = f"File {out_file} exists, skip"
+                logger.info(msg)
                 continue
 
             src = self._load_warp_file(f_unw)
@@ -660,7 +696,8 @@ class InterferogramDataset(PairDataset):
                 out_file = out_dir / names_coh[i]
 
             if out_file.exists() and not overwrite:
-                logger.info(f"File {out_file} exists, skip")
+                msg = f"File {out_file} exists, skip"
+                logger.info(msg)
                 continue
 
             src = self._load_warp_file(f_coh)

@@ -1,29 +1,41 @@
+"""Polygons class for storing desired and undesired regions."""
+
 from __future__ import annotations
 
 import warnings
-from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence
 
 import geopandas as gpd
 import pandas as pd
-from matplotlib.axes import Axes
 from pyproj.crs import CRS
 from rasterio.errors import CRSError
 
-from .bbox import BoundingBox
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from matplotlib.axes import Axes
+
+    from faninsar.typing import CrsLike
+
+    from .bbox import BoundingBox
 
 
 class Polygons:
-    """Polygons object is used to store the regions that need to be retrieved
-    ("desired") or removed ("undesired") from a dataset.
+    """Polygons object is used to store the desired and undesired regions.
 
-    Tip:
+    desired regions will be retrieved from the dataset, while undesired regions
+    will be removed from the dataset.
+
+    .. tip::
         When a mixed-types Polygons, where both "desired" and "undesired"
         polygons, are provided:
 
-        * the "undesired" polygons will only be useful when there are overlapping regions with the "desired" polygons. Otherwise, the "desired" polygons are enough.
+        * the "undesired" polygons will only be useful when there are overlapping
+          regions with the "desired" polygons. Otherwise, the "desired" polygons
+          are enough.
+        * you can use :meth:`to_desired` to get the desired polygons from a
+          mixed-types Polygons object.
 
-        * you can use :meth:`to_desired` to get the desired polygons from a mixed-types Polygons object.
     """
 
     def __init__(
@@ -32,8 +44,8 @@ class Polygons:
         types: (
             Literal["desired", "undesired"] | Sequence[Literal["desired", "undesired"]]
         ) = "desired",
-        crs: Any = None,
-        all_touched=True,
+        crs: CrsLike = None,
+        all_touched: bool = True,
         pad: bool = False,
     ) -> None:
         """Initialize a Polygons object.
@@ -56,17 +68,21 @@ class Polygons:
         pad : bool, optional
             If True, the features will be padded in each direction by
             one half of a pixel prior to cropping raster. Defaults to False.
+
         """
         self._gdf = self._format_geometry(gdf, types, crs).sort_values(
-            by="types", ascending=True
+            by="types",
+            ascending=True,
         )
         self.pad = pad
         self.all_touched = all_touched
 
     def __str__(self) -> str:
+        """Return a string representation of the Polygons object."""
         return f"Polygons(count={len(self)}, crs='{self.crs}')"
 
     def __repr__(self) -> str:
+        """Return a string representation of the Polygons object."""
         prefix = "Polygons:\n"
         middle = self._gdf.__repr__()
         suffix = f"\n[count={len(self)}, crs='{self.crs}']"
@@ -74,15 +90,21 @@ class Polygons:
         return f"{prefix}{middle}{suffix}"
 
     def __len__(self) -> int:
+        """Return the number of polygons."""
         return len(self._gdf)
 
-    def __add__(self, other: "Polygons") -> "Polygons":
+    def __add__(self, other: Polygons) -> Polygons:
+        """Add two Polygons objects."""
         if not isinstance(other, Polygons):
-            raise TypeError(f"other must be an instance of Polygon. Got {type(other)}")
+            msg = f"other must be an instance of Polygon. Got {type(other)}"
+            raise TypeError(msg)
 
         if self.crs != other.crs:
             if self.crs is None or other.crs is None:
-                warnings.warn("CRS is found lacking, adding polygons without CRS.")
+                warnings.warn(
+                    "CRS is found lacking, adding polygons without CRS.",
+                    stacklevel=2,
+                )
             else:
                 other = other.to_crs(self.crs)
 
@@ -91,33 +113,33 @@ class Polygons:
 
     def _format_geometry(
         self,
-        gdf: gpd.GeoDataFrame | gpd.GeoSeries | "Polygons",
+        gdf: gpd.GeoDataFrame | gpd.GeoSeries | Polygons,
         types: (
             Literal["desired", "undesired"] | Sequence[Literal["desired", "undesired"]]
         ),
-        crs: Any,
+        crs: CrsLike,
     ) -> gpd.GeoDataFrame:
         """Format the geometry column of the GeoDataFrame."""
         if isinstance(gdf, gpd.GeoDataFrame):
-            df = gpd.GeoDataFrame(gdf.geometry)
-            df["types"] = types
+            _df = gpd.GeoDataFrame(gdf.geometry)
+            _df["types"] = types
         elif isinstance(gdf, gpd.GeoSeries):
-            df = gpd.GeoDataFrame(gdf)
-            df["types"] = types
+            _df = gpd.GeoDataFrame(gdf)
+            _df["types"] = types
         elif isinstance(gdf, Polygons):
-            df = gdf.frame
+            _df = gdf.frame
         else:
-            raise TypeError(
-                f"gdf must be an instance of GeoDataFrame, GeoSeries. Got {type(gdf)}"
-            )
-        df = self._ensure_gdf_crs(df, crs)
-        return df
+            msg = f"gdf must be an instance of GeoDataFrame, GeoSeries. Got {type(gdf)}"
+            raise TypeError(msg)
+        return self._ensure_gdf_crs(_df, crs)
 
-    def _ensure_gdf_crs(self, gdf: gpd.GeoDataFrame, crs: Any) -> CRS:
+    def _ensure_gdf_crs(self, gdf: gpd.GeoDataFrame, crs: CrsLike) -> CRS:
         """Ensure the CRS of the GeoDataFrame."""
         if crs is None and gdf.crs is None:
             warnings.warn(
-                "CRS is not found both in input geometries and parameters. Set to None."
+                "CRS is not found both in input geometries and parameters."
+                " Set to None.",
+                stacklevel=2,
             )
         else:
             if crs is None:
@@ -132,34 +154,39 @@ class Polygons:
 
     @property
     def all_touched(self) -> bool:
-        """whether to include all pixels touched by the polygon."""
+        """Whether to include all pixels touched by the polygon."""
         return self._all_touched
 
     @all_touched.setter
     def all_touched(self, value: bool) -> None:
         if not isinstance(value, bool):
-            raise TypeError(f"all_touched must be a bool. Got {type(value)}")
+            msg = f"all_touched must be a bool. Got {type(value)}"
+            raise TypeError(msg)
         self._all_touched = value
 
     @property
     def pad(self) -> bool:
-        """whether to pad the features in each direction by one half of a pixel prior to cropping raster."""
+        """Whether to pad the features in each direction by one half of a pixel.
+
+        This is used prior to cropping raster. Defaults to False.
+        """
         return self._pad
 
     @pad.setter
     def pad(self, value: bool) -> None:
         if not isinstance(value, bool):
-            raise TypeError(f"pad must be a bool. Got {type(value)}")
+            msg = f"pad must be a bool. Got {type(value)}"
+            raise TypeError(msg)
         self._pad = value
 
     @property
     def geometry(self) -> gpd.GeoSeries:
-        """the geometry column of the polygons."""
+        """The geometry column of the polygons."""
         return self._gdf.geometry
 
     @property
     def types(self) -> pd.Series:
-        """the types of polygons."""
+        """The types of polygons."""
         return self._gdf["types"]
 
     @property
@@ -168,54 +195,55 @@ class Polygons:
         return self._gdf
 
     @property
-    def desired(self) -> "Polygons":
-        """desired part of polygons."""
+    def desired(self) -> Polygons:
+        """Desired part of polygons."""
         return Polygons(self._gdf[self.types == "desired"], types="desired")
 
     @property
-    def undesired(self) -> "Polygons":
-        """undesired part of polygons."""
+    def undesired(self) -> Polygons:
+        """Undesired part of polygons."""
         return Polygons(self._gdf[self.types == "undesired"], types="undesired")
 
     @property
     def is_mixed(self) -> bool:
-        """whether the polygons contain both desired and undesired polygons."""
+        """Whether the polygons contain both desired and undesired polygons."""
         return len(self.desired) > 0 and len(self.undesired) > 0
 
-    def to_desired(self) -> "Polygons":
-        """Return a desired polygons, with the regions of undesired polygons being removed.
+    def to_desired(self) -> Polygons:
+        """Return a desired polygons, with regions of undesired polygons being removed.
 
         .. Warning::
             This method should only be used when the Polygons object contains both
             "desired" and "undesired" polygons. If the Polygons object only contains
             "undesired" polygons, the returned Polygons object will be empty.
         """
-        df = gpd.overlay(self.desired.frame, self.undesired.frame, how="difference")
-        return Polygons(df, types="desired")
+        _df = gpd.overlay(self.desired.frame, self.undesired.frame, how="difference")
+        return Polygons(_df, types="desired")
 
     def to_bbox(self) -> list[BoundingBox]:
-        """Return a list of BoundingBox objects representing the bounding boxes
-        of the polygons.
+        """Return a list of BoundingBox representing bounding boxes of polygons.
 
         .. Warning::
             This method will only return the bounding boxes of the desired polygons.
             If the Polygons object only contains "undesired" polygons, the returned
             list will be empty.
         """
-        df = self.to_desired().frame
+        return self.to_desired().frame
 
     def to_GeoDataFrame(self) -> gpd.GeoDataFrame:
-        """Return a GeoDataFrame of the polygons. This method is an alias of 
-        :attr:`frame` for API consistency with :class:`~faninsar.query.Points` and :class:`BoundingBox`.
+        """Return a GeoDataFrame of the polygons.
+
+        This method is an alias of :attr:`frame` for API consistency with
+        :class:`~faninsar.query.Points` and :class:`BoundingBox`.
         """
         return self.frame
 
     @property
     def crs(self) -> CRS:
-        """the CRS of the polygons."""
+        """The CRS of the polygons."""
         return self._gdf.crs
 
-    def to_crs(self, crs: Any) -> "Polygons":
+    def to_crs(self, crs: CrsLike) -> Polygons:
         """Return a new Polygons object with new CRS.
 
         Parameters
@@ -228,6 +256,7 @@ class Polygons:
         -------
         Polygons
             The new Polygons object.
+
         """
         if not isinstance(crs, CRS):
             crs = CRS.from_user_input(crs)
@@ -238,7 +267,7 @@ class Polygons:
 
     def set_crs(
         self,
-        crs: Any,
+        crs: CrsLike,
         allow_override: bool = False,
     ) -> None:
         """Set the CRS of polygons.
@@ -261,6 +290,7 @@ class Polygons:
         ------
         CRSError
             If the CRS has already been set and allow_override is False.
+
         """
         if not isinstance(crs, CRS):
             crs = CRS.from_user_input(crs)
@@ -268,9 +298,10 @@ class Polygons:
             if self.crs is None or allow_override:
                 self._gdf.set_crs(crs, allow_override=True)
             else:
-                raise CRSError(
+                msg = (
                     "The CRS has already been set. Set allow_override=True to override."
                 )
+                raise CRSError(msg)
 
     @classmethod
     def from_file(
@@ -279,10 +310,10 @@ class Polygons:
         types: (
             Literal["desired", "undesired"] | Sequence[Literal["desired", "undesired"]]
         ) = "desired",
-        crs: Any = None,
+        crs: CrsLike = None,
         **kwargs,
-    ) -> "Polygons":
-        """initialize a Polygon object from a shapefile.
+    ) -> Polygons:
+        """Initialize a Polygon object from a shapefile.
 
         Parameters
         ----------
@@ -304,6 +335,7 @@ class Polygons:
         -------
         Polygons
             The Polygons object.
+
         """
         kwargs.update({"ignore_geometry": False})
         gdf = gpd.read_file(filename, **kwargs)
@@ -325,6 +357,7 @@ class Polygons:
         -------
         Axes
             The matplotlib axes.
+
         """
         kwargs.update({"column": "types", "kind": "geo"})
         kwargs.setdefault("legend", True)
@@ -336,7 +369,7 @@ class Polygons:
                     "bbox_to_anchor": (1.01, 0.5),
                 },
                 "cmap": cmap,
-            }
+            },
         )
 
         return self.frame.plot(**kwargs)

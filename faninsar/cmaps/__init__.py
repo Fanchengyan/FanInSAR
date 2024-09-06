@@ -1,5 +1,6 @@
 import matplotlib.colors as mcolors
 
+# TODO: Add cpt-city colormaps
 from . import GMT, SCM, cmocean, colorcet
 from .cmocean import (
     algae,

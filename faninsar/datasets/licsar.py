@@ -1,12 +1,15 @@
+"""A dataset manages the data of LiCSAR product."""
+
 from __future__ import annotations
 
 import warnings
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import pandas as pd
 
-from faninsar._core.pair_tools import Pairs
+from faninsar._core.sar.pairs import Pairs
 from faninsar.datasets.ifg import InterferogramDataset
 
 
@@ -21,18 +24,18 @@ class LiCSAR(InterferogramDataset):
 
     pattern_unw = "*geo.unw.tif"
     pattern_coh = "*geo.cc.tif"
-    coh_range = [0, 255]
+    coh_range: ClassVar[list[float]] = [0, 255]
 
     #: pattern used to find dem file
     pattern_dem = "*geo.hgt.tif"
 
     #: pattern used to find E files
-    pattern_E = "*geo.E.tif"
+    pattern_e = "*geo.E.tif"
 
     #: pattern used to find N files
-    pattern_N = "*geo.N.tif"
+    pattern_n = "*geo.N.tif"
     #: pattern used to find U files
-    pattern_U = "*geo.U.tif"
+    pattern_u = "*geo.U.tif"
     #: pattern used to find baselines file
     pattern_baselines = "baselines"
     #: pattern used to find polygon file
@@ -40,38 +43,35 @@ class LiCSAR(InterferogramDataset):
 
     @property
     def meta_files(self) -> pd.Series:
-        """return the paths of LiCSAR metadata files in a pandas Series.
+        """Return the paths of LiCSAR metadata files in a pandas Series.
+
         metadata files include: DEM, U, E, N, baselines, polygon.
         """
 
         def parse_file(pattern: str) -> Path:
             result = list(self.root_dir.rglob(pattern))
             if len(result) == 0:
-                warnings.warn(f"File not found: {pattern}")
+                warnings.warn(f"File not found: {pattern}", stacklevel=2)
                 return None
             return result[0]
 
         dem_file = parse_file(self.pattern_dem)
-        U_file = parse_file(self.pattern_U)
-        E_file = parse_file(self.pattern_E)
-        N_file = parse_file(self.pattern_N)
+        u_file = parse_file(self.pattern_u)
+        e_file = parse_file(self.pattern_e)
+        n_file = parse_file(self.pattern_n)
         baseline_file = parse_file(self.pattern_baselines)
         polygon_file = parse_file(self.pattern_polygon)
 
-        df = pd.Series(
-            [dem_file, U_file, E_file, N_file, baseline_file, polygon_file],
+        return pd.Series(
+            [dem_file, u_file, e_file, n_file, baseline_file, polygon_file],
             index=["DEM", "U", "E", "N", "baselines", "polygon"],
         )
-        return df
 
     @classmethod
     def parse_pairs(cls, paths: list[Path]) -> Pairs:
-        """Parse the primary and secondary date/acquisition of the interferogram
-        to generate Pairs object.
-        """
+        """Parse the Pairs from the paths of the interferogram."""
         pair_names = [Path(f).name.split(".")[0] for f in paths]
-        pairs = Pairs.from_names(pair_names)
-        return pairs
+        return Pairs.from_names(pair_names)
 
     @classmethod
     def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:

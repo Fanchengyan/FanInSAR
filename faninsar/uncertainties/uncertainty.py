@@ -1,3 +1,5 @@
+"""A module for representing uncertainty in a model."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,16 +13,14 @@ from tqdm import tqdm
 
 
 class Uncertainty:
-    """
-    A class for representing uncertainty in a model.
+    """A class for representing uncertainty in a model.
 
-    Attributes:
-    -----------
+    Attributes
+    ----------
         variance (numpy.ndarray): A 2D array of variances for each pixel and parameter.
 
-    Examples:
-    ---------
-
+    Examples
+    --------
     >>> import numpy as np
     >>> from uncertainty_lib import Uncertainty
 
@@ -42,45 +42,51 @@ class Uncertainty:
     >>>  [ 7  8  9 10]
     >>>  [ 8  9 10 11]
     >>>  [ 9 10 11 12]])
+
     """
 
     def __init__(
         self,
         variance: np.ndarray,
     ) -> None:
-        """Initializes the Uncertainty class.
+        """Initialize the Uncertainty class.
 
         Parameters
         ----------
         variance : numpy.ndarray (n_param, n_pixel)
             A 2D array of variances for each pixel and parameter.
+
         """
         if not isinstance(variance, np.ndarray):
-            raise TypeError("variance must be a numpy array.")
+            msg = "variance must be a numpy array."
+            raise TypeError(msg)
         if variance.ndim != 2:
-            raise ValueError("variance must be 2D array (n_param, n_pixel)")
+            msg = "variance must be 2D array (n_param, n_pixel)"
+            raise ValueError(msg)
 
         self._variance = variance
 
     @property
-    def variance(self):
-        """
-        Gets the variance attribute.
+    def variance(self) -> np.ndarray:
+        """Get the variance attribute.
 
-        Returns:
+        Returns
+        -------
             numpy.ndarray: The variance attribute.
+
         """
         return self._variance
 
     def __repr__(self) -> str:
+        """Return a string representation of the Uncertainty object."""
         return f"Uncertainty(variance=\n{self.variance.shape})"
 
     def __str__(self) -> str:
+        """Return a string representation of the Uncertainty object."""
         return self.__repr__()
 
-    def __add__(self, other: "Uncertainty") -> "Uncertainty":
-        """
-        Adds two Uncertainty objects together.
+    def __add__(self, other: Uncertainty) -> Uncertainty:
+        """Add two Uncertainty objects together.
 
         Parameters
         ----------
@@ -91,11 +97,14 @@ class Uncertainty:
         -------
         new_var : Uncertainty
             A new Uncertainty object with the sum of the variances.
+
         """
         if not isinstance(other, Uncertainty):
-            raise TypeError("other must be a Uncertainty object.")
+            msg = "other must be a Uncertainty object."
+            raise TypeError(msg)
         if self.variance is None or other.variance is None:
-            raise ValueError("Warning: variance is None. The result will be None.")
+            msg = "Warning: variance is None. The result will be None."
+            raise ValueError(msg)
 
         new_var = self.variance + other.variance
 
@@ -103,153 +112,159 @@ class Uncertainty:
 
     @property
     def shape(self) -> tuple[int, int]:
-        """
-        Gets the shape of the variance attribute.
+        """Get the shape of the variance attribute.
 
-        Returns:
+        Returns
+        -------
             tuple: The shape of the variance attribute.
+
         """
         return self.variance.shape
 
 
 class ReferencePointsUncertainty(Uncertainty):
-    """This class is used to compute the uncertainty (variance) of reference points."""
+    """A class used to compute the uncertainty (variance) of reference points."""
 
     def __init__(self, ref_dfm: np.ndarray) -> None:
-        """Initializes the ReferencePointsUncertainty class.
+        """Initialize the ReferencePointsUncertainty class.
 
         Parameters
         ----------
         ref_dfm : np.ndarray (n_img, n_ref)
             The deformation time series of reference points.
-        """
 
+        """
         self.dfm = ref_dfm
         variance, covariance = self._deformation2variance()
         self._covariance = covariance
 
         super().__init__(variance)
 
-    def _deformation2variance(self):
-        """derives the variance from the deformation of the reference points."""
+    def _deformation2variance(self) -> tuple[np.ndarray, np.ndarray]:
+        """Derive the variance from the deformation of the reference points."""
         covariance = np.cov(self.dfm)
         variance = np.diag(covariance)
 
-        covariance = covariance
         variance = variance[np.newaxis, :]
         return variance, covariance
 
     @property
-    def covariance(self):
-        """
-        Gets the covariance attribute.
+    def covariance(self) -> np.ndarray:
+        """Get the covariance attribute.
 
-        Returns:
+        Returns
+        -------
             numpy.ndarray: The covariance attribute.
+
         """
         return self._covariance
 
 
 class UncertaintyPropagation:
-    """This class is used to propagate the uncertainty from the data to the model parameters."""
+    """A class used to propagate the uncertainty from data to model parameters."""
 
     @staticmethod
-    def weight_from_variance(variance):
-        """This function calculates the weight from the variance of data (var_d).
+    def weight_from_variance(variance: np.ndarray) -> np.ndarray:
+        """Calculate the weight from the variance of data (var_d).
 
         Parameters
         ----------
         variance: array
             variance of data (sum of the squares of the residuals)
 
-        Returns:
-        --------
+        Returns
+        -------
         W: array
             weight from the variance of data
+
         """
-        W = 1 / np.sqrt(variance)
-        return W
+        return 1 / np.sqrt(variance)
 
     @staticmethod
-    def data2param_simplified(G, var_data):
-        """This function computes the variance of parameters (var_model)
-        from the variance of data (var_d) which is the sum of the
-        squares of the residuals and is a constant for each pixel.
+    def data2param_simplified(G: np.ndarray, var_data: np.ndarray) -> np.ndarray:  # noqa: N803
+        r"""Compute variance of parameters (var_model) from variance of data (var_d).
 
-        The var_param is calculated by the following equation:
+        var_d is the sum of the squares of the residuals and is a constant
+        for each pixel. The var_param is calculated by the following equation:
             $Cov(m) = \sigma^2 * (G^T * G)^{-1}$
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         G: 2D array (n_im, n_param)
             design matrix
         var_data: 1D array (n_pixel) or 2D array (n_pixel, 1)
             variance of data (sum of the squares of the residuals)
 
-        Returns:
-        --------
+        Returns
+        -------
         var_param: 2D array (n_pixel, n_param)
             variance of model parameters
+
         """
         if var_data.ndim == 1:
             var_data = var_data[:, None]
 
-        A = np.linalg.inv(G.T @ G)
-        var_param = var_data * np.diag(A)[None, :]
-
-        return var_param
+        A = np.linalg.inv(G.T @ G)  # noqa: N806
+        return var_data * np.diag(A)[None, :]
 
     @staticmethod
-    def data2param_weighted_simplified(G, W):
-        """This function calculates the variances of the model parameters
-        given a design matrix G and a vector of weights W. This only works
-        when the weight is expressed as 1/σ, where σ^2 is variance. The
-        var_param is calculated by the following equation:
-            Cov(m) =(G_w^T * G_w)^{-1}
+    def data2param_weighted_simplified(G: np.ndarray, W: np.ndarray) -> np.ndarray:  # noqa: N803
+        """Calculate variances of model parameters.
 
-        Parameters:
-        -----------
+        This only works when the weight is expressed as 1/delta, where delta^2
+        is variance. The var_param is calculated by the following equation:
+            $Cov(m) =(G_w^T * G_w)^{-1}$
+
+        Parameters
+        ----------
         G: 2D array (n_im, n_param)
             design matrix
         W: 1D array (n_pixel, n_im)
             weight matrix
 
-        Returns:
-        --------
+        Returns
+        -------
         var_param: np.ndarray (1, n_param)
             variance of model parameters
-        """
-        G_w = W[:, :, None] * G[None, :, :]
-        A = np.linalg.inv(G_w.transpose(0, 2, 1) @ G_w)
-        var_param = np.diagonal(A, axis1=1, axis2=2)
 
-        return var_param
+        """
+        G_w = W[:, :, None] * G[None, :, :]  # noqa: N806
+        A = np.linalg.inv(G_w.transpose(0, 2, 1) @ G_w)  # noqa: N806
+        return np.diagonal(A, axis1=1, axis2=2)
 
     @staticmethod
     def data2param(
-        G, var_data, weighted=False, W=None, desc="  Data to model variance"
-    ):
-        """This function is used to calculate the variance of model parameter
-        (var_param) from a given variance of data (var_d). if the var_d is derived
-        from weighted least squares method, then weight matrix W is required.
+        G: np.ndarray,  # noqa: N803
+        var_data: np.ndarray,
+        weighted: bool = False,
+        W: np.ndarray | None = None,  # noqa: N803
+        desc: str = "  Data to model variance",
+    ) -> np.ndarray:
+        """Calculate of model parameter variance (var_param) from data variance (var_d).
 
-        Parameters:
-        ------------
+        if the var_d is derived from weighted least squares method, then
+        weight matrix W is required.
+
+        Parameters
+        ----------
         G: 2D array (n_im, n_param)
             design matrix
         var_data: 2D array (n_pixel, n_im)
             deformation variance matrix
         weighted: bool
-            if True, means that weighted least squares method was used to calculate parameters variance matrix. Default is False.
+            if True, means that weighted least squares method was used to calculate
+            parameters variance matrix. Default is False.
         W: 1D array (n_im)
-            weight matrix. If weighted is True and W is None, then W is set by variance. Default is None.
+            weight matrix. If weighted is True and W is None, then W is set by
+            variance. Default is None.
         desc: str
             description of progress bar
 
-        Returns:
-        --------
+        Returns
+        -------
         var_param: np.ndarray (n_pixel, n_param)
             variance of model parameters
+
         """
         n_im, n_param = G.shape
         n_pixel = var_data.shape[0]
@@ -261,9 +276,9 @@ class UncertaintyPropagation:
         # set nan to zero to avoid all nan in var_param
         var_data[np.isnan(var_data)] = 0
 
-        C = np.eye(n_im, dtype=np.float32)
+        C = np.eye(n_im, dtype=np.float32)  # noqa: N806
         if not weighted:
-            M = np.linalg.inv(G.T @ G) @ (G.T)
+            M = np.linalg.inv(G.T @ G) @ (G.T)  # noqa: N806
 
         # write empty variance into file to give a structure
         var_param = np.full((n_pixel, n_param), np.nan, dtype=np.float32)
@@ -277,10 +292,10 @@ class UncertaintyPropagation:
 
             if weighted:
                 if W is None:
-                    C = np.linalg.inv(cov_data)
+                    C = np.linalg.inv(cov_data)  # noqa: N806
                 else:
-                    C = np.linalg.inv(np.diag((1 / W) ** 2))
-                M = np.linalg.inv(G.T @ C @ G) @ (G.T) @ C
+                    C = np.linalg.inv(np.diag((1 / W) ** 2))  # noqa: N806
+                M = np.linalg.inv(G.T @ C @ G) @ (G.T) @ C  # noqa: N806
 
             cov_model = M[None, :, :] @ cov_data @ M.T[None, :, :]
 
@@ -291,10 +306,10 @@ class UncertaintyPropagation:
 
     @classmethod
     def data2param_sequence(
-        Gs: list,
+        cls: list,
         var_data: np.ndarray,
-    ):
-        """This function is used to calculate the variance of model parameter for a sequence of design matrices.
+    ) -> None:
+        """Calculate variance of model parameter for a sequence of design matrices.
 
         Parameters
         ----------
@@ -306,26 +321,27 @@ class UncertaintyPropagation:
         Returns
         -------
         var_param : np.ndarray
-            The variance of model parameters for the last design matrix in the sequence.
+            The variance of model parameters for the last design matrix in the
+            sequence.
+
         """
-        pass
 
     @staticmethod
     def data2param_file(
-        G,
-        var_data,
-        var_param_file,
-        weighted=False,
-        W=None,
-        desc="  Computing model variance",
-    ):
-        """This function is used to calculate the variance of  model parameter
-        (var_param) from a given variance of data (var_d). if the var_d is derived
-        from weighted least squares method, then weight matrix W is required. The
-        var_param is written to a netCDF file.
+        G: np.ndarray,  # noqa: N803
+        var_data: np.ndarray,
+        var_param_file: Path,
+        weighted: bool = False,
+        W: np.ndarray | None = None,  # noqa: N803
+        desc: str = "  Computing model variance",
+    ) -> None:
+        """Calculate model parameter variance (var_param) from data variance (var_d).
 
-        Parameters:
-        ------------
+        if the var_d is derived from weighted least squares method, then weight
+        matrix W is required. The var_param is written to a netCDF file.
+
+        Parameters
+        ----------
         G: 2D array (n_im, n_param)
             design matrix
         var_data: 2D array (n_pixel, n_im)
@@ -333,16 +349,19 @@ class UncertaintyPropagation:
         var_param_file: pathlib.Path object
             path to output var_param file
         weighted: bool
-            if True, means that weighted least squares method was used to calculate parameters variance matrix. Default is False.
+            if True, means that weighted least squares method was used to
+            calculate parameters variance matrix. Default is False.
         W: 1D array (n_im)
-            weight matrix. If weighted is True and W is None, then W is set by variance. Default is None.
+            weight matrix. If weighted is True and W is None, then W is set by
+            variance. Default is None.
         desc: str
             description of progress bar
 
-        Returns:
-        --------
+        Returns
+        -------
         var_param: np.ndarray (n_pixel, n_param)
             variance of model parameters
+
         """
         n_im, n_param = G.shape
         n_pixel = var_data.shape[0]
@@ -353,9 +372,9 @@ class UncertaintyPropagation:
         # set nan to zero to avoid all nan in var_param
         var_data[np.isnan(var_data)] = 0
 
-        C = np.eye(n_im, dtype=np.float32)
+        C = np.eye(n_im, dtype=np.float32)  # noqa: N806
         if not weighted:
-            M = np.linalg.inv(G.T @ G) @ (G.T)
+            M = np.linalg.inv(G.T @ G) @ (G.T)  # noqa: N806
 
         # write empty variance into file to give a structure
         var_param = np.full((n_pixel, n_param), np.nan, dtype=np.float32)
@@ -363,7 +382,7 @@ class UncertaintyPropagation:
         safe_remove(var_param_file)
         (
             xr.Dataset({"variance": (["pixels", "n_param"], var_param)}).to_netcdf(
-                var_param_file
+                var_param_file,
             )
         )
 
@@ -379,27 +398,31 @@ class UncertaintyPropagation:
 
             if weighted:
                 if W is None:
-                    C = np.linalg.inv(cov_data)
+                    C = np.linalg.inv(cov_data)  # noqa: N806
                 else:
-                    C = np.linalg.inv(np.diag((1 / W) ** 2))
-                M = np.linalg.inv(G.T @ C @ G) @ (G.T) @ C
+                    C = np.linalg.inv(np.diag((1 / W) ** 2))  # noqa: N806
+                M = np.linalg.inv(G.T @ C @ G) @ (G.T) @ C  # noqa: N806
 
             cov_model = M[None, :, :] @ cov_data @ M.T[None, :, :]
 
             var_param[start:end, :] = np.diagonal(cov_model, axis1=1, axis2=2)
         var_param[m, :] = np.nan
         ds_var_param.close()
-        print(f"Saved model variance to {var_param_file}.")
 
     @staticmethod
-    def data_cov2param(G, cov_data, weighted=False, W=None):
-        """This function is used to calculate the variance of model parameter
-        (var_param) from a given covariance of data (cov_d) for one pixel.
+    def data_cov2param(
+        G: np.ndarray,  # noqa: N803
+        cov_data: np.ndarray,
+        weighted: bool = False,
+        W: np.ndarray | None = None,  # noqa: N803
+    ) -> np.ndarray:
+        """Calculate model parameter variance (var_param) from data covariance (cov_d).
+
         if the var_d is derived from weighted least squares method, then
         the weight matrix W is required.
 
-        Parameters:
-        ------------
+        Parameters
+        ----------
         G: 2D array (n_im, n_param)
             design matrix
         cov_data: 2D array (n_im, n_im)
@@ -411,42 +434,47 @@ class UncertaintyPropagation:
             weight matrix. If weighted is True and W is None, then W is set
             by variance. Default is None.
 
-        Returns:
-        --------
+        Returns
+        -------
         var_param: np.ndarray (n_pixel, n_param)
             variance of model parameters
+
         """
         if not weighted:
-            M = np.linalg.inv(G.T @ G) @ (G.T)
+            M = np.linalg.inv(G.T @ G) @ (G.T)  # noqa: N806
         else:
             if W is None:
-                C = np.linalg.inv(cov_data)
+                C = np.linalg.inv(cov_data)  # noqa: N806
             else:
-                C = np.linalg.inv(np.diag((1 / W) ** 2))
-            M = np.linalg.inv(G.T @ C @ G) @ (G.T) @ C
+                C = np.linalg.inv(np.diag((1 / W) ** 2))  # noqa: N806
+            M = np.linalg.inv(G.T @ C @ G) @ (G.T) @ C  # noqa: N806
 
         cov_model = M[:, :] @ cov_data @ M.T[:, :]
-        var_param = np.diag(cov_model)
-
-        return var_param
+        return np.diag(cov_model)
 
 
-def safe_remove(file):
-    """remove file if exists"""
+def safe_remove(file: Path) -> None:
+    """Remove file if exists."""
     file = Path(file)
     if file.exists():
         file.unlink()
 
 
-def get_var_patch(n_pixel, n_im, n_param, dtype):
-    """This function divides all pixels into the different patches (n_patch)
-    by takeing account of memory will be used and the memory free in the
+def get_var_patch(
+    n_pixel: int,
+    n_im: int,
+    n_param: int,
+    dtype: np.dtype,
+) -> list:
+    """Divide all pixels into the different patches (n_patch).
+
+    This function take account of memory will be used and the memory free in the
     system. The pixels of the patch are spaced by the result of dividing n_pixel
     by the number of patches. Lastly, the patch columns are appended to a list
     and returned.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     n_pixel: int
         number of pixels
     n_im: int
@@ -458,16 +486,18 @@ def get_var_patch(n_pixel, n_im, n_param, dtype):
     dtype: numpy.dtype
         dtype of ndarray
 
-    Returns:
+    Returns
+    -------
         patch : List of the number of rows for each patch.
                 ex) [[0, 1234], [1235, 2469],... ]
+
     """
     mem_free = psutil.virtual_memory().available
     mem_size = int(mem_free / 1024**2)
 
     # a rough number of patch
     n_patch = np.ceil(
-        (n_pixel * n_im**2 * n_param * dtype.itemsize) / 1024**2 / mem_size
+        (n_pixel * n_im**2 * n_param * dtype.itemsize) / 1024**2 / mem_size,
     )
 
     # number of pixels for each patch
@@ -488,17 +518,16 @@ def get_var_patch(n_pixel, n_im, n_param, dtype):
 
 
 def data2param(
-    G,
-    uc_data,
+    G: np.ndarray,  # noqa: N803
+    uc_data: np.ndarray,
     in_type: Literal["variance", "covariance"] = "variance",
     out_type: Literal["variance", "covariance"] = "variance",
-    desc="  Uncertainty[Data -> Model]",
-):
-    """This function is used to derive the uncertainty of model domain from
-    the data domain for the least squares inversion solution.
+    desc: str = "  Uncertainty[Data -> Model]",
+) -> np.ndarray:
+    """Derive uncertainty of model domain from data domain for least squares.
 
-    Parameters:
-    ------------
+    Parameters
+    ----------
     G: 2D array (n_img, n_param)
         design matrix
     uc_data: 2D array (n_pixel, n_img) or 3D array (n_pixel, n_img, n_img)
@@ -511,10 +540,11 @@ def data2param(
     desc: str
         description of progress bar
 
-    Returns:
-    --------
+    Returns
+    -------
     uc_param: np.ndarray (n_pixel, n_param) or (n_pixel, n_param, n_param)
         Uncertainty of model parameters
+
     """
     n_im, n_param = G.shape
     n_pixel = uc_data.shape[0]
@@ -525,13 +555,13 @@ def data2param(
     elif in_type == "covariance":
         m = (np.isnan(uc_data)).sum(axis=(1, 2)) == 0
     else:
-        raise ValueError("in_type must be 'variance' or 'covariance'.")
+        msg = "in_type must be 'variance' or 'covariance'."
+        raise ValueError(msg)
     uc_data = uc_data[m]
 
-    C = np.eye(n_im, dtype=np.float32)
-    M = np.linalg.inv(G.T @ G) @ (G.T)
+    C = np.eye(n_im, dtype=np.float32)  # noqa: N806
+    M = np.linalg.inv(G.T @ G) @ (G.T)  # noqa: N806
 
-    #
     if out_type == "variance":
         uc_param = np.full((n_pixel, n_param), np.nan, dtype=np.float32)
     elif out_type == "covariance":
@@ -557,12 +587,15 @@ def data2param(
     return uc_param
 
 
-def data2param_cov(G, cov_data, desc="  Data to model covariance"):
-    """This function is used to calculate the variance of model parameter
-    (var_param) from a given covariance of data (cov_d) for one pixel.
+def data2param_cov(
+    G: np.ndarray,  # noqa: N803
+    cov_data: np.ndarray,
+    desc: str = "  Data to model covariance",
+) -> np.ndarray:
+    """Calculate model parameter variance (var_param) from data covariance(cov_d).
 
-    Parameters:
-    ------------
+    Parameters
+    ----------
     G: 2D array (n_im, n_param)
         design matrix
     cov_data: 2D array (n_pixel, n_im, n_im)
@@ -570,15 +603,16 @@ def data2param_cov(G, cov_data, desc="  Data to model covariance"):
     desc: str
         description of progress bar
 
-    Returns:
-    --------
+    Returns
+    -------
     var_param: np.ndarray (n_pixel, n_param)
         variance of model parameters
+
     """
     n_im, n_param = G.shape
     n_pixel = cov_data.shape[0]
 
-    M = np.linalg.inv(G.T @ G) @ (G.T)
+    M = np.linalg.inv(G.T @ G) @ (G.T)  # noqa: N806
 
     # write empty variance into file to give a structure
     var_param = np.full((n_pixel, n_param), np.nan, dtype=np.float32)
@@ -594,12 +628,12 @@ def data2param_cov(G, cov_data, desc="  Data to model covariance"):
 
 
 def data2param_sequence(
-    Gs: list,
+    Gs: list,  # noqa: N803
     var_data: np.ndarray,
     verbose: bool = True,
     desc: str = "  Data to model covariance",
-):
-    """This function is used to calculate the variance of model parameter for a sequence of design matrices.
+) -> np.ndarray:
+    """Calculate the variance of model parameter for a sequence of design matrices.
 
     Parameters
     ----------
@@ -616,6 +650,7 @@ def data2param_sequence(
     -------
     var_param : np.ndarray
         The variance of model parameters for the last design matrix in the sequence.
+
     """
     n_im = Gs[0].shape[0]
     n_param = Gs[-1].shape[1]
@@ -631,8 +666,8 @@ def data2param_sequence(
     # set nan to zero to avoid all nan in var_param
     var_data[np.isnan(var_data)] = 0
 
-    C = np.eye(n_im, dtype=np.float32)
-    M = G2M(Gs[0])
+    C = np.eye(n_im, dtype=np.float32)  # noqa: N806
+    M = G2M(Gs[0])  # noqa: N806
 
     # write empty variance into file to give a structure
     var_param = np.full((n_pixel, n_param), np.nan, dtype=np.float32)
@@ -647,8 +682,8 @@ def data2param_sequence(
         cov_data = C[None, :, :].repeat((var_data_i.shape[0]), axis=0) * var_data_i
 
         cov_model = M[None, :, :] @ cov_data @ M.T[None, :, :]
-        for G in Gs[1:]:
-            M_i = G2M(G)
+        for G in Gs[1:]:  # noqa: N806
+            M_i = G2M(G)  # noqa: N806
             cov_model = M_i[None, :, :] @ cov_model @ M_i.T[None, :, :]
         var_param_m[start:end, :] = np.diagonal(cov_model, axis1=1, axis2=2)
 
@@ -656,6 +691,6 @@ def data2param_sequence(
     return var_param
 
 
-def G2M(G: np.ndarray):
-    M = np.linalg.inv(G.T @ G) @ (G.T)
-    return M
+def G2M(G: np.ndarray) -> np.ndarray:  # noqa: N802, N803
+    """Compute the Moore-Penrose pseudo-inverse of the design matrix G."""
+    return np.linalg.inv(G.T @ G) @ (G.T)

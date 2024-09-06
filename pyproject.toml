@@ -65,6 +65,7 @@ dependencies = [
     "tqdm",
     "rtree",
     "pykml",
+    "dominate",
 ]
 
 
@@ -268,7 +269,7 @@ select = [
   # flake8-use-pathlib (PTH)
   "PTH",
   # pandas-vet (PD)
-  "PD",
+  # "PD",
   # tryceratops (TRY)
   "TRY",
   # NumPy-specific rules (NPY)
@@ -279,6 +280,10 @@ select = [
 ignore = [
   # missing-type-self
   "ANN101",
+  # missing-type-args (ANN002): don't checks that function *args
+  "ANN002",
+  # missing-type-kwargs (ANN003): don't checks that function **kwargs
+  "ANN003",
   # missing-type-cls
   "ANN102",
   # magic-value-comparison
@@ -291,6 +296,14 @@ ignore = [
   "ANN003",
   # pandas-use-of-dot-values
   "PD011",
+  # super-call-with-parameters (UP008)
+  "UP008",
+  # missing-trailing-comma (COM812)
+  "COM812",
+  # private-member-access (SLF001)#
+  "SLF001",
+  # pandas-df-variable-name (PD901)
+  "PD901",
 ]
 [tool.ruff.lint.pep8-naming]
 extend-ignore-names = [
