@@ -2,10 +2,15 @@
 InSAR Tools
 ===========
 
-This section describes the classes and functions that are related to InSAR processing.
+This section describes the classes and functions that are related to InSAR
+processing.
+
+
 
 .. toctree::
    :maxdepth: 2
+   :hidden:
+
 
    pairs
    baselines

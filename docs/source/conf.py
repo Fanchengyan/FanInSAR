@@ -13,39 +13,32 @@ release = "v0.1"
 
 from pathlib import Path
 
-from myst_sphinx_gallery import (
-    GalleryConfig,
-    GridItemCard,
-    generate_gallery,
-)
-
-myst_gallery_grid_item = GridItemCard()
-myst_gallery_grid_item.add_option("class-item", "myst-gallery-grid-item")
-
+from myst_sphinx_gallery import GalleryConfig
 
 myst_sphinx_gallery_config = GalleryConfig(
-    examples_dirs="../../examples",
-    gallery_dirs="auto_examples",
-    root_dir=Path(__file__).parent,
     notebook_thumbnail_strategy="code",
     thumbnail_strategy="last",
-    grid_item_card=myst_gallery_grid_item,
 )
-generate_gallery(myst_sphinx_gallery_config)
+
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 extensions = [
     "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.inheritance_diagram",
+    "sphinx.ext.coverage",
     "sphinx.ext.doctest",
     "sphinx.ext.intersphinx",
     "sphinx.ext.napoleon",
     "sphinx.ext.todo",
+    "sphinx.ext.viewcode",
     "myst_nb",
     "sphinx_copybutton",
     "sphinx_design",
     "sphinx_togglebutton",
+    "myst_sphinx_gallery",
 ]
 source_suffix = {
     ".rst": "restructuredtext",
@@ -96,8 +89,7 @@ video_enforce_extra_source = True
 autodoc_default_options = {
     "members": True,
     "undoc-members": True,
-    "member-order": "bysource",
-    "special-members": "__init__",
+    "member-order": "groupwise",
     ":show-inheritance:": True,
 }
 html_context = {

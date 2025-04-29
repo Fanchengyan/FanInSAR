@@ -10,4 +10,4 @@ This section demonstrates how to index/select
    :maxdepth: 1
    :caption: Contents:
 
-   filter
+   pairs

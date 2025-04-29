@@ -2,38 +2,13 @@
 Pairs and Loops
 ===============
 
-.. autoclass:: faninsar.Pair
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
 
-.. autoclass:: faninsar.Pairs
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
+.. autosummary::
+   :toctree: generated/
 
-.. autoclass:: faninsar.Loop
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-.. autoclass:: faninsar.Loops
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-.. autoclass:: faninsar.TripletLoops
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-.. autoclass:: faninsar.PairsFactory
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
+   faninsar.Pair <faninsar._core.pairs.Pair>
+   faninsar.Pairs <faninsar._core.pairs.Pairs>
+   faninsar.Loop <faninsar._core.pairs.Loop>
+   faninsar.Loops <faninsar._core.pairs.Loops>
+   faninsar.TripletLoops <faninsar._core.pairs.TripletLoops>
+   faninsar.PairsFactory <faninsar._core.pairs.PairsFactory>

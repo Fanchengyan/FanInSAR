@@ -286,6 +286,8 @@ ignore = [
   "ANN003",
   # missing-type-cls
   "ANN102",
+  # any-type (ANN401)
+  "ANN401",
   # magic-value-comparison
   "PLR2004",
   # undocumented-public-package

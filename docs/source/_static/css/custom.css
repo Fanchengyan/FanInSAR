@@ -3,7 +3,7 @@
   max-width: 100rem;
 }
 html {
-    --pst-font-size-base: 18px;
+    --pst-font-size-base: 17px;
 }
 
 table {
@@ -23,7 +23,8 @@ table {
 }
 
 .intro-card .sd-card-title {
-  color: var(--pst-color-secondary);
+  /* color: var(--pst-color-info); */
+  color: #912483;
   font-size: var(--pst-font-size-h5);
   padding: 1rem 0rem 0.5rem 0rem;
 }
@@ -36,6 +37,12 @@ table {
   max-width: 220px;
   margin-left: auto;
   margin-right: auto;
+}
+
+:root {
+  --msg-box-min-width: 170px;
+  --msg-box-max-width: 1fr;
+
 }
 
 /* .intro-card .sd-btn-secondary {
