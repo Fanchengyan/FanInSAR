@@ -14,4 +14,5 @@ We provide a number of examples to help you get started with using the **FanInSA
     :tooltip:
 
     warp/index
-    ARPs/index
+    custom/index
+    miscellaneous/index

@@ -1,18 +1,24 @@
 .. _example_warp_header:
 
-.. _warp_example:
+.. _warping_upon_loading:
 
-============
-Warp Example
-============
+====================
+Warping upon loading
+====================
 
-This section demonstrates how to warp the raster datasets, such as reprojecting and resampling the raster datasets.
 
+In FanInSAR, datasets can be initialized with specific geospatial properties,
+and their rasters are automatically warped to uniform properties upon data
+loading. This feature allows for seamless resampling, reprojection,
+or alignment to a reference raster by simply specifying the desired
+coordinate reference system (CRS), resolution, extent, and resampling
+method during dataset initialization, without the need to consider the
+geospatial properties of the underlying original raster files.
 
 
 .. base-gallery::
     :tooltip:
 
-    match_raster
+    align
     reproject
     resample

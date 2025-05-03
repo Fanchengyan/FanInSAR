@@ -9,8 +9,8 @@ are powerful, you may want to customize them to better fit your own needs.
 
 In this section, we will discuss how to customize your own time series models and datasets.
 
-.. toctree::
-   :maxdepth: 1
+.. base-gallery::
+   :tooltip:
 
    datasets
    ts_models

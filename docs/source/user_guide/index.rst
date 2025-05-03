@@ -14,4 +14,3 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
    colormap
    indexing/index
    sampler
-   custom/index
