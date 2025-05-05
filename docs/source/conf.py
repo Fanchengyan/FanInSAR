@@ -88,7 +88,7 @@ video_enforce_extra_source = True
 autodoc_default_options = {
     "members": True,
     "undoc-members": True,
-    "special-members": "__init__",
+    # "special-members": "__init__",
     "member-order": "groupwise",
     "show-inheritance": True,
     "inherited-members": True,

@@ -22,95 +22,19 @@ The following datasets are available:
       * :class:`.LiCSAR`
 
 
-GeoDataset
-----------
+Dataset Classes
+~~~~~~~~~~~~~~~
 
-.. autoclass:: faninsar.datasets.GeoDataset
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
+.. autosummary::
+   :toctree: generated/
 
-
-RasterDataset
--------------
-
-.. autoclass:: faninsar.datasets.RasterDataset
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-PairDataset
------------
-
-.. autoclass:: faninsar.datasets.PairDataset
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-
-InterferogramDataset
---------------------
-
-.. autoclass:: faninsar.datasets.InterferogramDataset
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-
-HyP3S1
-------
-
-.. autoclass:: faninsar.datasets.HyP3S1
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-HyP3S1Burst
------------
-
-.. autoclass:: faninsar.datasets.HyP3S1Burst
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-LiCSAR
-------
-
-.. autoclass:: faninsar.datasets.LiCSAR
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-ApsDataset
-----------
-
-.. autoclass:: faninsar.datasets.ApsDataset
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-GACOS
------
-
-.. autoclass:: faninsar.datasets.GACOS
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
-
-GACOSPairs
-----------
-
-.. autoclass:: faninsar.datasets.GACOSPairs
-   :members:
-   :undoc-members:
-   :member-order: bysource
-   :show-inheritance:
+   faninsar.datasets.GeoDataset
+   faninsar.datasets.RasterDataset
+   faninsar.datasets.PairDataset
+   faninsar.datasets.InterferogramDataset
+   faninsar.datasets.HyP3S1
+   faninsar.datasets.HyP3S1Burst
+   faninsar.datasets.LiCSAR
+   faninsar.datasets.ApsDataset
+   faninsar.datasets.GACOS
+   faninsar.datasets.GACOSPairs

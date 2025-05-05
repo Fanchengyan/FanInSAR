@@ -456,8 +456,8 @@ class Points:
     def to_DataFrame(self) -> pd.DataFrame:
         """Convert the Points to a DataFrame.
 
-        Return:
-        ------
+        Returns
+        -------
         pd.DataFrame
             The DataFrame with columns ``x`` and ``y``.
 

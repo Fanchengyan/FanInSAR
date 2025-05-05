@@ -1,0 +1,25 @@
+name: docFanInSAR
+channels:
+  - conda-forge
+
+dependencies:
+
+  - python =3.12
+
+  # --------------for building the docs
+  - recommonmark
+  - sphinx>=7
+  - myst-nb
+  - sphinx-copybutton
+  - sphinx-design
+  - sphinx-togglebutton
+  - Jinja2
+  - myst-sphinx-gallery
+
+
+  # install minimal dependencies to import FanInSAR
+  - pip
+  - pip:
+    - ../.
+    - ipywidgets  # for widgets docs
+    - pydata_sphinx_theme
