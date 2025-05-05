@@ -15,5 +15,7 @@ repos:
         # Run the linter.
         - id: ruff
           args: [ --fix ]
+          exclude: ^(docs/|build/|dist/|notebooks/|tests/|examples/|data/|faninsar.egg-info/)
         # Run the formatter.
         - id: ruff-format
+          exclude: ^(docs/|build/|dist/|notebooks/|tests/|examples/|data/|faninsar.egg-info/)

@@ -66,6 +66,7 @@ dependencies = [
     "rtree",
     "pykml",
     "dominate",
+    "typing_extensions",
 ]
 
 
@@ -108,6 +109,8 @@ dev = [
   "tqdm",
   "rtree",
   "pykml",
+  "dominate",
+  "typing_extensions",
   "pre-commit",
   "ruff",
   "coverage",
@@ -166,6 +169,34 @@ markers = [
 line-length = 88
 fix = true
 exclude=[
+  # commonly ignored directories.
+  ".bzr",
+  ".direnv",
+  ".eggs",
+  ".git",
+  ".git-rewrite",
+  ".hg",
+  ".ipynb_checkpoints",
+  ".mypy_cache",
+  ".nox",
+  ".pants.d",
+  ".pyenv",
+  ".pytest_cache",
+  ".pytype",
+  ".ruff_cache",
+  ".svn",
+  ".tox",
+  ".venv",
+  ".vscode",
+  "__pypackages__",
+  "_build",
+  "buck-out",
+  "build",
+  "dist",
+  "node_modules",
+  "site-packages",
+  "venv",
+  # faninsar ignored directories.
   "build",
   "dist",
   "docs",
@@ -174,11 +205,9 @@ exclude=[
   "examples",
   "data",
   "faninsar.egg-info",
-  "__init__.py",
 ]
 
 [tool.ruff.lint]
-ignore-init-module-imports = true
 select = [
   # pyflakes
   "F",
@@ -278,14 +307,10 @@ select = [
   "FURB",
 ]
 ignore = [
-  # missing-type-self
-  "ANN101",
   # missing-type-args (ANN002): don't checks that function *args
   "ANN002",
   # missing-type-kwargs (ANN003): don't checks that function **kwargs
   "ANN003",
-  # missing-type-cls
-  "ANN102",
   # any-type (ANN401)
   "ANN401",
   # magic-value-comparison
@@ -306,7 +331,16 @@ ignore = [
   "SLF001",
   # pandas-df-variable-name (PD901)
   "PD901",
+  # incorrect-blank-line-before-class (D203)
+  "D203",
+  # multi-line-summary-second-line (D213)
+  "D213",
 ]
+# 4. Ignore `E402` (import violations) in all `__init__.py` files, and in selected subdirectories.
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402","F401"]
+"**/{tests,docs,tools}/*" = ["E402","F401"]
+
 [tool.ruff.lint.pep8-naming]
 extend-ignore-names = [
   "test_*",
