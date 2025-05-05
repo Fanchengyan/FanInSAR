@@ -37,24 +37,25 @@ class Acquisition(pd.DatetimeIndex):
 
     """
 
+    dims = ("dates",)
+    _in_memory = True
+
     def __new__(cls, *args, **kwargs) -> Self:
         """Create a new instance of Acquisition."""
         return super(Acquisition, cls).__new__(cls, *args, **kwargs)
 
-    def _repr_inline_(self, max_width: int | None = None) -> str:
-        """Return the inline representation of the class."""
-        from faninsar._core.render_html import repr_inline
+    def _repr_html_(self) -> str:
+        """Return the HTML representation of the class."""
+        from faninsar._core.render import array_repr
 
-        max_width = 80 if max_width is None else max_width
-        data = [i.strftime("%F") for i in self[:50]]
-        return repr_inline(self, data, len(self), max_width=max_width)
+        return array_repr(self)
 
     def to_xarray(self) -> pd.DatetimeIndex:
         """Convert the acquisition dates to xarray format."""
         return xr.Variable("Acquisition", self)
 
     @property
-    def attrs(self) -> dict:
+    def stats(self) -> dict:
         """Return the statistical attributes of the acquisition dates."""
         return {
             "start": self.min().strftime("%F"),
@@ -63,8 +64,13 @@ class Acquisition(pd.DatetimeIndex):
             "total": len(self),
         }
 
+    @property
+    def data(self) -> np.ndarray:
+        """Return the internal data of the index."""
+        return self._data
 
-class DaysSpan(pd.TimedeltaIndex):
+
+class DaySpan(pd.Index):
     """A class to handle day span between SAR acquisitions in FanInSAR.
 
     This class is a wrapper around :class:`pandas.Index` to add some additional
@@ -81,6 +87,9 @@ class DaysSpan(pd.TimedeltaIndex):
 
     """
 
+    dims = ("days",)
+    _in_memory = True
+
     def __new__(  # noqa: PLR0912
         cls,
         data: Sequence,
@@ -89,8 +98,8 @@ class DaysSpan(pd.TimedeltaIndex):
     ) -> Self:
         """Create a new instance of Index."""
         name = maybe_extract_name(None, data, cls)
-        if name is None:
-            name = "IntervalIndex"
+        # if name is None:
+        #     name = "DaySpan"
         if dtype is not None:
             dtype = pandas_dtype(dtype)
         data_dtype = getattr(data, "dtype", None)
@@ -111,6 +120,8 @@ class DaysSpan(pd.TimedeltaIndex):
                 data = com.asarray_tuplesafe(data, dtype=_dtype_obj)
         elif is_scalar(data):
             raise cls._raise_scalar_data_error(data)
+        elif hasattr(data, "__array__"):
+            return cls(np.asarray(data), dtype=dtype, copy=copy, name=name)
         elif not is_list_like(data) and not isinstance(data, memoryview):
             # 2022-11-16 the memoryview check is only necessary on some CI
             #  builds, not clear why
@@ -210,20 +221,18 @@ class DaysSpan(pd.TimedeltaIndex):
             data = data.copy()
         return data
 
-    def _repr_inline_(self, max_width: int | None = None) -> str:
-        """Return the inline representation of the class."""
-        from faninsar._core.render_html import repr_inline
+    def _repr_html_(self) -> str:
+        """Return the HTML representation of the class."""
+        from faninsar._core.render import array_repr
 
-        max_width = 80 if max_width is None else max_width
-        data = [i.strftime("%F") for i in self[:50]]
-        return repr_inline(self, data, len(self), max_width=max_width)
+        return array_repr(self)
 
     def to_xarray(self) -> pd.Index:
         """Convert the acquisition dates to xarray format."""
-        return xr.Variable("Index", self)
+        return xr.Variable("days", self)
 
     @property
-    def attrs(self) -> dict:
+    def stats(self) -> dict:
         """Return the statistical attributes of the acquisition dates."""
         return {
             "min": self.min(),
@@ -231,6 +240,11 @@ class DaysSpan(pd.TimedeltaIndex):
             "unique": len(self.unique()),
             "total": len(self),
         }
+
+    @property
+    def data(self) -> np.ndarray:
+        """Return the internal data of the index."""
+        return self._data
 
 
 class DateManager:

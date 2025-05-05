@@ -11,7 +11,6 @@ copyright = "2024, Chengyan (Fancy) Fan"
 author = "Chengyan (Fancy) Fan"
 release = "v0.1"
 
-from pathlib import Path
 
 from myst_sphinx_gallery import GalleryConfig
 

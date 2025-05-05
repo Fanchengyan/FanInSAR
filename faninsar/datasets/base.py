@@ -17,10 +17,9 @@ import numpy as np
 import pandas as pd
 import pyproj
 import rasterio
-import rasterio.merge
 import shapely
 import xarray as xr
-from rasterio import features, fill
+from rasterio import features, fill, plot
 from rasterio import mask as rio_mask
 from rasterio.crs import CRS
 from rasterio.dtypes import dtype_ranges, get_minimum_dtype
@@ -33,6 +32,7 @@ from rasterio.warp import transform as warp_transform
 from rtree.index import Index, Property
 from shapely import ops
 from tqdm import tqdm
+from typing_extensions import Self
 
 from faninsar._core import geo_tools
 from faninsar._core.geo_tools import Profile, array2kml, array2kmz, geoinfo_from_latlon
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
     from rasterio.io import DatasetReader
 
-__all__ = ("GeoDataset", "RasterDataset", "PairDataset", "ApsDataset")
+__all__ = ("ApsDataset", "GeoDataset", "PairDataset", "RasterDataset")
 
 logger = setup_logger(
     log_name="FanInSAR.datasets.base",
@@ -407,6 +407,19 @@ class GeoDataset(abc.ABC):
         """
         return BoundingBox(*self.index.bounds, crs=self.crs)
 
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Shape of the dataset.
+
+        Returns
+        -------
+        shape: tuple of ints
+            shape of the dataset in (height, width) format
+
+        """
+        profile = self.get_profile("bounds")
+        return profile["height"], profile["width"]
+
     def _ensure_bbox(
         self,
         bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
@@ -433,30 +446,6 @@ class GeoDataset(abc.ABC):
             return self._check_roi(bbox)
         msg = f"bbox must be one of ['bounds', 'roi'] or a BoundingBox, but got {bbox}"
         raise ValueError(msg)
-
-    def get_profile(
-        self,
-        bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
-    ) -> Profile | None:
-        """Get profile information of dataset for the given bounding box type.
-
-        The profile information includes the width, height, transform,
-        count, data type, no data value, and CRS of the dataset.
-
-        Parameters
-        ----------
-        bbox : BoundingBox | Literal["roi", "bounds"], optional
-            the bounding box used to calculate the ``width``, ``height``
-            and ``transform`` of the dataset for the profile. Default is
-            'roi'.
-
-        Returns
-        -------
-        profile: Profile object or None
-            profile of the dataset for the given bounding box type.
-
-        """
-        raise NotImplementedError
 
 
 class RasterDataset(GeoDataset):
@@ -816,7 +805,10 @@ class RasterDataset(GeoDataset):
                 data, out_transform = rio_mask.mask(vrt_fh, [shp], **mask_params)
 
                 rasterize_params.update(
-                    {"out_shape": data.shape[1:3], "transform": out_transform},
+                    {
+                        "out_shape": data.shape if data.ndim == 2 else data.shape[1:3],
+                        "transform": out_transform,
+                    },
                 )
                 mask = features.rasterize([shp], **rasterize_params).astype(bool)
 
@@ -920,7 +912,7 @@ class RasterDataset(GeoDataset):
                 files_polygons_list.append(data_ls)
 
         # Stack the points values
-        points_values = None
+        points_result = None
         if len(files_points_list) > 0:
             points_values = np.ma.asarray(files_points_list)
             dims, points_values = parse_1d_dims(points_values)
@@ -1112,7 +1104,7 @@ class RasterDataset(GeoDataset):
         profile = self.get_profile(bbox)
 
         rows, cols = tf_rowcol(profile["transform"], xy[:, 0], xy[:, 1])
-        return np.column_stack((rows, cols))
+        return np.column_stack((rows, cols)).astype(np.int64)
 
     def xy(
         self,
@@ -1236,6 +1228,126 @@ class RasterDataset(GeoDataset):
             win = src.window(*bbox)
             return mask[win[0] : win[1], win[2] : win[3]]
 
+    def reproject(
+        self,
+        new_crs: CRS | str,
+        resampling: Resampling = Resampling.nearest,
+        nodata: float | None = None,
+    ) -> Self:
+        """Reproject the dataset to a new CRS.
+
+        Parameters
+        ----------
+        new_crs : CRS or str
+            new coordinate reference system (:term:`CRS`) of the dataset.
+            It can be a CRS object or a string, which will be parsed to a
+            CRS object. The string can be in any format supported by
+            :meth:`pyproj.crs.CRS.from_user_input`.
+        resampling : Resampling, optional
+            resampling method to use when reprojecting the dataset.
+            Default is `Resampling.nearest`.
+        nodata : float or int, optional
+            no data value of the dataset. If None, the no data value of the
+            dataset will be used.
+
+        """
+        if not isinstance(new_crs, CRS):
+            new_crs = CRS.from_user_input(new_crs)
+        if new_crs == self.crs:
+            return self
+
+        if nodata is None:
+            nodata = self.nodata
+        new_bounds: BoundingBox = self.bounds.to_crs(new_crs)
+        new_res = (
+            abs(new_bounds.right - new_bounds.left) / self.shape[1],
+            abs(new_bounds.top - new_bounds.bottom) / self.shape[0],
+        )
+
+        return self.__class__(
+            root_dir=self.root_dir,
+            paths=self.files.paths,
+            crs=new_crs,
+            res=new_res,
+            dtype=self.dtype,
+            nodata=nodata,
+            roi=new_bounds,
+            bands=self.bands,
+            cache=self.cache,
+            resampling=resampling,
+            fill_nodata=self.fill_nodata,
+            verbose=self.verbose,
+            ds_name=self.ds_name,
+        )
+
+    def resample(
+        self,
+        new_res: float | tuple[float, float],
+        resampling: Resampling = Resampling.nearest,
+        nodata: float | None = None,
+    ) -> Self:
+        """Resample the dataset to a new resolution.
+
+        Parameters
+        ----------
+        new_res : float or tuple of float
+            new resolution of the dataset in units of CRS. If a single float is
+            provided, it will be used for both x and y dimensions.
+        resampling : Resampling, optional
+            resampling method to use when resampling the dataset.
+            Default is `Resampling.nearest`.
+        nodata : float or int, optional
+            no data value of the dataset. If None, the no data value of the
+            dataset will be used.
+
+        """
+        if nodata is None:
+            nodata = self.nodata
+
+        return self.__class__(
+            root_dir=self.root_dir,
+            paths=self.files.paths,
+            crs=self.crs,
+            res=new_res,
+            dtype=self.dtype,
+            nodata=nodata,
+            roi=self.bounds,
+            bands=self.bands,
+            cache=self.cache,
+            resampling=resampling,
+            fill_nodata=self.fill_nodata,
+            verbose=self.verbose,
+            ds_name=self.ds_name,
+        )
+
+    def show(
+        self,
+        arr: np.ndarray,
+        **kwargs,
+    ) -> Self:
+        """Show the array using the dataset's geo information.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            The array with same shape as the dataset to show. The geo information
+            of the dataset will be used to plot the array.
+        kwargs : key value pairs, optional
+            Additional keyword arguments to pass to the :func:`rasterio.plot.show`
+            function.
+
+        """
+        if kwargs is None:
+            kwargs = {}
+        if "transform" in kwargs:
+            msg = (
+                "show() function does not support `transform` argument, since "
+                "the `transform` of the dataset will be used to plot the array."
+            )
+            warnings.warn(msg, stacklevel=2)
+        kwargs["transform"] = self.get_profile().transform
+        plot.show(arr, **kwargs)
+
     def to_tiffs(
         self,
         out_dir: str | Path,
@@ -1353,9 +1465,7 @@ class RasterDataset(GeoDataset):
                 f"Expected arr to be an array with shape of (n_lat, n_lon) or "
                 f"(n_band, n_lat, n_lon), got {arr.shape}"
             )
-            raise ValueError(
-                msg,
-            )
+            raise ValueError(msg)
         # check length of band_names
         if band_names is not None and len(band_names) != arr.shape[0]:
             msg = (
@@ -1376,12 +1486,14 @@ class RasterDataset(GeoDataset):
         if filename.exists() and not overwrite:
             mode = "r+"
 
-        with rasterio.open(filename, mode, **profile) as dst:
+        with rasterio.open(filename, mode, **profile.to_dict()) as dst:
             # parse window
             win = None if bbox is None else dst.window(*bbox)
 
             # write array to tiff
             if arr_type == "mask":
+                if arr.shape[0] == 1:
+                    arr = arr[0]
                 dst.write_mask(arr)
             elif arr_type == "data":
                 dst.write(arr, indexes, window=win)
@@ -1990,7 +2102,7 @@ class PairDataset(RasterDataset):
         return self._sample_files(paths, query)
 
     @classmethod
-    def parse_pairs(cls, paths: list[Path]) -> Pairs:  # noqa: ARG003
+    def parse_pairs(cls, paths: list[Path]) -> Pairs:
         """Parse pairs from filenames. *Must be implemented in subclass*.
 
         Parameters
@@ -2021,7 +2133,7 @@ class PairDataset(RasterDataset):
         raise NotImplementedError(msg)
 
     @classmethod
-    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:  # noqa: ARG003
+    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse datetime from filenames. *Must be implemented in subclass*.
 
         Parameters
@@ -2036,9 +2148,7 @@ class PairDataset(RasterDataset):
 
         """
         msg = "parse_datetime method must be implemented in subclass"
-        raise NotImplementedError(
-            msg,
-        )
+        raise NotImplementedError(msg)
 
     @property
     def pairs(self) -> Pairs:

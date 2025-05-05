@@ -1,5 +1,5 @@
-
-from .component import (
+from .formatting_html import array_repr, repr_inline
+from .html_component import (
     HtmlDims,
     HtmlIndexes,
     HtmlProperties,
@@ -7,5 +7,4 @@ from .component import (
     add_svg,
     add_svg_string,
 )
-from .formatting_html import repr_inline
 from .svg_graph import PairsSVG

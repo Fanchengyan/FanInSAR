@@ -34,11 +34,11 @@ _all = names.copy()
 cwd = Path(__file__).parent.absolute()
 
 for name in names:
-    file = cwd / f"{name}.csv"
-    with Path(file).open() as f:
-        f_new = f.readlines()[0]
-    file = cwd / f_new
-    cm_data = np.loadtxt(file, delimiter=",")
+    cmap_file = cwd / f"{name}.csv"
+    with Path(cmap_file).open() as f:
+        f_new = f.readlines()[0].strip()
+    cmap_file = cwd / f_new
+    cm_data = np.loadtxt(cmap_file, delimiter=",")
 
     _all.append(f"{name}_r")
 
@@ -46,12 +46,3 @@ for name in names:
     vars()[f"{name}_r"] = LinearSegmentedColormap.from_list(f"{name}_r", cm_data[::-1])
 
 __all__ = tuple(_all)
-
-del name
-del file
-del f_new
-del cm_data
-del cwd
-del Path
-del LinearSegmentedColormap
-del np

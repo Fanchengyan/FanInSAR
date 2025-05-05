@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from numpy.typing import NDArray
+
+    from faninsar.constants import Frequency, Wavelength
 
     from .pairs import Pairs
 
@@ -78,7 +80,8 @@ class Baselines:
         dates : pd.DatetimeIndex | Sequence[datetime]
             The dates of the SAR acquisitions.
         values : np.ndarray
-            The cumulative values of the baselines relative to the first acquisition.
+            The cumulative values of the baselines relative to the first
+            acquisition.
 
         """
         dates = pd.to_datetime(dates)
@@ -294,43 +297,97 @@ class Baselines:
 
 
 class PhaseDeformationConverter:
-    """A class to convert between phase and deformation (mm) for SAR interferometry."""
+    """Convert between phase and deformation (mm) for SAR interferometry.
 
-    # TODO: rewrite using new frequency and wavelength classes
+    .. note::
+
+        In FanInSAR, deformation/displacement is referenced to Earth,
+        resulting in inverted signs when referring to radar measurements.
+        Specifically, negative values indicate movement away from the radar
+        (e.g., subsidence), while positive values signify movement towards
+        the radar (e.g., uplift).
+
+    """
+
     def __init__(
         self,
-        frequency: float | None = None,
-        wavelength: float | None = None,
+        freq_or_wl: Frequency | Wavelength,
     ) -> None:
         """Initialize the converter.
 
-        Either wavelength or frequency should be provided. If both are provided,
-        wavelength will be recalculated by frequency.
+        Parameters
+        ----------
+        freq_or_wl : Frequency or Wavelength
+            Either a Frequency or Wavelength object for the SAR mission.
+
+        """
+        from faninsar.constants.sar import SPEED_OF_LIGHT, Frequency, Wavelength
+
+        if isinstance(freq_or_wl, Frequency):
+            self.wavelength = SPEED_OF_LIGHT / freq_or_wl.to_Hz().data  # meter
+            self.frequency = freq_or_wl.to_Hz().data
+        elif isinstance(freq_or_wl, Wavelength):
+            self.wavelength = freq_or_wl.to_m().data
+            self.frequency = SPEED_OF_LIGHT / self.wavelength
+        else:
+            msg = "freq_or_wl must be a Frequency or Wavelength object, "
+            msg += f"got {type(freq_or_wl)}"
+            raise TypeError(msg)
+
+        # convert radian to mm
+        self.coef_rd2mm = -self.wavelength / 4 / np.pi * 1000
+
+    @classmethod
+    def from_frequency(
+        cls,
+        frequency: float,
+        unit: Literal["GHz", "MHz", "kHz", "Hz"] = "GHz",
+    ) -> PhaseDeformationConverter:
+        """Create a PhaseDeformationConverter from frequency value.
 
         Parameters
         ----------
         frequency : float
-            The frequency of the radar signal. Unit: GHz.
-        wavelength : float
-            The wavelength of the radar signal. Unit: meter.
-            this parameter will be ignored if frequency is provided.
+            The frequency value.
+        unit : Literal["GHz", "MHz", "kHz", "Hz"], optional
+            The unit of frequency, by default "GHz".
+
+        Returns
+        -------
+        PhaseDeformationConverter
+            The converter instance.
 
         """
-        speed_of_light = 299792458
+        from faninsar.constants.sar import Frequency
 
-        if frequency is not None:
-            frequency = frequency * 1e9  # GHz to Hz
-            self.wavelength = speed_of_light / frequency  # meter
-            self.frequency = frequency
-        elif wavelength is not None:
-            self.wavelength = wavelength
-            self.frequency = speed_of_light / wavelength
-        else:
-            msg = "Either wavelength or frequency should be provided."
-            raise ValueError(msg)
+        freq = Frequency(frequency, unit)
+        return cls(freq)
 
-        # convert radian to mm
-        self.coef_rd2mm = -self.wavelength / 4 / np.pi * 1000
+    @classmethod
+    def from_wavelength(
+        cls,
+        wavelength: float,
+        unit: Literal["m", "cm", "dm", "mm"] = "m",
+    ) -> PhaseDeformationConverter:
+        """Create a PhaseDeformationConverter from wavelength value.
+
+        Parameters
+        ----------
+        wavelength : float
+            The wavelength value.
+        unit : Literal["m", "cm", "dm", "mm"], optional
+            The unit of wavelength, by default "m".
+
+        Returns
+        -------
+        PhaseDeformationConverter
+            The converter instance.
+
+        """
+        from faninsar.constants.sar import Wavelength
+
+        wl = Wavelength(wavelength, unit)
+        return cls(wl)
 
     def __str__(self) -> str:
         """Return string representation of PhaseDeformationConverter object."""

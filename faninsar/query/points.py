@@ -89,7 +89,7 @@ class Points:
     _values: np.ndarray
     _crs: CRS | str | None
 
-    __slots__ = ["_values", "_crs"]
+    __slots__ = ["_crs", "_values"]
 
     def __init__(
         self,
@@ -376,7 +376,7 @@ class Points:
 
         """
         if "geometry" not in gdf.columns:
-            x_field, y_field = cls._ensure_fields(gdf, "auto", "auto")
+            x_field, y_field = cls._ensure_fields(gdf, x_field, y_field)
             return cls(gdf[[x_field, y_field]].values, crs=gdf.crs)
         points = list(zip(gdf.geometry.values.x, gdf.geometry.values.y))
         return cls(points, crs=gdf.crs)
@@ -385,8 +385,6 @@ class Points:
     def from_shapefile(
         cls,
         filename: str | Path,
-        x_field: str = "auto",
-        y_field: str = "auto",
         **kwargs,
     ) -> Points:
         """Initialize a Points object from a file.
@@ -396,13 +394,6 @@ class Points:
         filename : str | Path
             The path to the shapefile. file type can be any type that can be
             passed to :func:`geopandas.read_file`.
-        x_field, y_field : str, optional, default: "auto"
-            The field name of the x/y coordinates. If "auto", will try to
-            find the field name automatically from following fields (case insensitive):
-
-            * ``x`` : x, xs, lon, longitude
-            * ``y`` : y, ys, lat, latitude
-
         **kwargs : dict
             Other parameters passed to :func:`geopandas.read_file`.
 
@@ -413,8 +404,10 @@ class Points:
 
         """
         gdf = gpd.read_file(filename, **kwargs)
+        geometry = gdf.geometry.explode().values
 
-        return cls.from_geo_dataframe(gdf, x_field, y_field)
+        points = list(zip(geometry.x, geometry.y))
+        return cls(points, crs=gdf.crs)
 
     @classmethod
     def from_csv(

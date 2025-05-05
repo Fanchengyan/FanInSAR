@@ -16,9 +16,10 @@ from xarray.core.formatting import (
     format_array_flat,
     inline_index_repr,
     inline_variable_array_repr,
-    short_data_repr,
 )
 from xarray.core.options import _get_boolean_with_default
+
+from .formatting import short_data_repr
 
 STATIC_FILES = (
     ("xarray.static.html", "icons-svg-inline.html"),
@@ -78,25 +79,19 @@ def format_dims(
     return f"<ul class='xr-dim-list'>{dims_li}</ul>"
 
 
-def summarize_attrs(attrs: dict[Hashable, object]) -> str:
-    """Return a summary of the attributes as HTML."""
-    attrs_dl = "".join(
-        f"<dt><span>{escape(str(k))} :</span></dt><dd>{escape(str(v))}</dd>"
-        for k, v in attrs.items()
-    )
-
-    return f"<dl class='xr-attrs'>{attrs_dl}</dl>"
-
-
 def _icon(icon_name: str) -> str:
     """Return an SVG icon in HTML."""
     # icon_name should be defined in xarray/static/html/icon-svg-inline.html
     return (
-        f"<svg class='icon xr-{icon_name}'>"
-        f"<use xlink:href='#{icon_name}'>"
-        "</use>"
-        "</svg>"
+        f"<svg class='icon xr-{icon_name}'><use xlink:href='#{icon_name}'></use></svg>"
     )
+
+
+def summarize_attrs(attrs: dict[Hashable, object]) -> str:
+    """Return a summary of the attributes as HTML."""
+    from faninsar._core.render import HtmlProperties
+
+    return str(HtmlProperties(attrs, margin="0px 0px 0px 1em"))
 
 
 def summarize_variable(
@@ -203,20 +198,9 @@ def summarize_indexes(indexes: Indexes) -> str:
 
 def summarize_indexes_faninsar(indexes: Indexes) -> str:
     """Return a summary of the indexes as HTML for FanInSAR objects."""
-    from faninsar._core.render_html import HtmlIndexes
+    from faninsar._core.render import HtmlIndexes
 
     return str(HtmlIndexes(indexes, format_array_flat))
-
-
-def summarize_properties(properties: dict, column: int, **kwargs) -> str:
-    """Return a summary of the properties as HTML.
-
-    Detailed description can be found in
-    :class:`faninsar._core.render_html.HtmlProperties`.
-    """
-    from faninsar._core.render_html import HtmlProperties
-
-    return str(HtmlProperties(properties, column=column, **kwargs))
 
 
 def collapsible_section(
@@ -307,7 +291,7 @@ def array_section(obj: DataArray) -> str:
 def pairs_section(pairs: Pairs) -> str:
     """Format a Pairs object as HTML."""
     # "unique" id to expand/collapse the section
-    from faninsar._core.render_html import PairsSVG, add_svg_string
+    from faninsar._core.render import PairsSVG, add_svg_string
 
     data_id = "section-" + str(uuid.uuid4())
     preview = f"faninsar.Pairs<pairs={len(pairs)},dates={len(pairs.dates)}>"
@@ -361,6 +345,14 @@ index_section_faninsar = partial(
 attr_section = partial(
     _mapping_section,
     name="Attributes",
+    details_func=summarize_attrs,
+    max_items_collapse=10,
+    expand_option_name="display_expand_attrs",
+)
+
+stats_section = partial(
+    _mapping_section,
+    name="Statistic",
     details_func=summarize_attrs,
     max_items_collapse=10,
     expand_option_name="display_expand_attrs",
@@ -425,8 +417,10 @@ def array_repr(arr: DataArray) -> str:
     if hasattr(arr, "xindexes"):
         indexes = _get_indexes_dict(arr.xindexes)
         sections.append(index_section(indexes))
-
-    sections.append(attr_section(arr.attrs))
+    if hasattr(arr, "attrs"):
+        sections.append(attr_section(arr.attrs))
+    if hasattr(arr, "stats"):
+        sections.append(stats_section(arr.stats))
 
     return _obj_repr(arr, header_components, sections)
 
@@ -448,7 +442,7 @@ def dataset_repr(ds: Dataset) -> str:
 
 
 def pairs_repr(pairs: Pairs) -> str:
-    from faninsar._core.render_html import HtmlDims
+    from faninsar._core.render import HtmlDims
 
     obj_type = "faninsar.Pairs"
     dim = HtmlDims({"pairs": len(pairs), "dates": len(pairs.dates)}, sep="=")
@@ -646,7 +640,7 @@ def _parse_max_width(*args, **kwargs) -> int:
     """Parse the maximum width from the arguments."""
     if args and isinstance(args[0], int):
         return args[0]
-    max_width = kwargs.get("max_width", None)
+    max_width = kwargs.get("max_width")
     if max_width is not None:
         return max_width
     return 75

@@ -19,7 +19,7 @@ class GeoQuery:
     _boxes: BoundingBox | list[BoundingBox] | None
     _polygons: Polygons | None
 
-    __slots__ = ["_points", "_boxes", "_polygons"]
+    __slots__ = ["_boxes", "_points", "_polygons"]
 
     def __init__(
         self,
@@ -65,7 +65,7 @@ class GeoQuery:
                     boxes = list(boxes)
                 except TypeError as e:
                     msg = (
-                        "boxes must be a BoundingBox or a list of"
+                        "boxes must be a BoundingBox or a list of "
                         f"BoundingBox. Got {type(boxes)}"
                     )
                     raise TypeError(msg) from e

@@ -80,7 +80,7 @@ class NSBASMatrixFactory:
     _G: NDArray[np.float32]
     _d: NDArray[np.float32 | np.float64]
 
-    __slots__ = ["_pairs", "_model", "_gamma", "_G", "_d"]
+    __slots__ = ["_G", "_d", "_gamma", "_model", "_pairs"]
 
     def __init__(
         self,

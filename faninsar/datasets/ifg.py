@@ -137,7 +137,7 @@ class InterferogramDataset(PairDataset):
     #: value range of coherence.
     coh_range: tuple[float, float] | None = [0, 1]
 
-    _ds_coh: RasterDataset
+    _ds_coh: CoherenceDataset
     _ds_dem: RasterDataset | None = None
     _ds_mask: RasterDataset | None = None
     _ds_aps: RasterDataset | None = None
@@ -314,7 +314,7 @@ class InterferogramDataset(PairDataset):
             )
         return paths[index], pairs
 
-    def parse_baselines(self, pairs: Pairs | None) -> Baselines:  # noqa: ARG002
+    def parse_baselines(self, pairs: Pairs | None) -> Baselines:
         """Parse the baseline of the interferogram for given pairs.
 
         Parameters
@@ -328,7 +328,7 @@ class InterferogramDataset(PairDataset):
         raise NotImplementedError(msg)
 
     @property
-    def coh_dataset(self) -> RasterDataset:
+    def coh_dataset(self) -> CoherenceDataset:
         """Return the coherence dataset."""
         return self._ds_coh
 

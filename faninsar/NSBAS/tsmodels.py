@@ -24,7 +24,7 @@ class TimeSeriesModels:
     _G_br: np.ndarray
     _param_names: list[str]
 
-    __slots__ = ["_unit", "_dates", "_date_spans", "_G_br", "_param_names"]
+    __slots__ = ["_G_br", "_date_spans", "_dates", "_param_names", "_unit"]
 
     def __init__(
         self,

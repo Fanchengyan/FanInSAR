@@ -253,7 +253,7 @@ from .SCM import (
     vikO_r,
 )
 
-__all__ = ["GnBu_RdPl", "WtBuPl", "WtHeatRed", "RdGyBu"]
+__all__ = ["GnBu_RdPl", "RdGyBu", "WtBuPl", "WtHeatRed"]
 __all__ += SCM.__all__
 __all__ += GMT.__all__
 __all__ += cmocean.__all__

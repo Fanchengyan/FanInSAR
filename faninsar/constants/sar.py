@@ -10,8 +10,8 @@ SPEED_OF_LIGHT = 299792458
 class Wavelength:
     """Dataclass for wavelength."""
 
-    #: The value of the wavelength.
-    value: float
+    #: The data of the wavelength.
+    data: float
 
     #: The unit of the wavelength. Default: m.
     unit: Literal["m", "cm", "dm", "mm"] = "m"
@@ -30,46 +30,46 @@ class Wavelength:
     def to_mm(self) -> "Wavelength":
         """Convert wavelength to mm."""
         if self.unit == "m":
-            return Wavelength(self.value * 1000, "mm")
+            return Wavelength(self.data * 1000, "mm")
         if self.unit == "dm":
-            return Wavelength(self.value * 100, "mm")
+            return Wavelength(self.data * 100, "mm")
         if self.unit == "cm":
-            return Wavelength(self.value * 10, "mm")
+            return Wavelength(self.data * 10, "mm")
         if self.unit == "mm":  # noqa: RET503
             return self
 
     def to_cm(self) -> "Wavelength":
         """Convert wavelength to cm."""
         if self.unit == "m":
-            return Wavelength(self.value * 100, "cm")
+            return Wavelength(self.data * 100, "cm")
         if self.unit == "dm":
-            return Wavelength(self.value * 10, "cm")
+            return Wavelength(self.data * 10, "cm")
         if self.unit == "cm":
             return self
         if self.unit == "mm":  # noqa: RET503
-            return Wavelength(self.value / 10, "cm")
+            return Wavelength(self.data / 10, "cm")
 
     def to_dm(self) -> "Wavelength":
         """Convert wavelength to dm."""
         if self.unit == "m":
-            return Wavelength(self.value * 10, "dm")
+            return Wavelength(self.data * 10, "dm")
         if self.unit == "dm":
             return self
         if self.unit == "cm":
-            return Wavelength(self.value / 10, "dm")
+            return Wavelength(self.data / 10, "dm")
         if self.unit == "mm":  # noqa: RET503
-            return Wavelength(self.value / 100, "dm")
+            return Wavelength(self.data / 100, "dm")
 
     def to_m(self) -> "Wavelength":
         """Convert wavelength to m."""
         if self.unit == "m":
             return self
         if self.unit == "dm":
-            return Wavelength(self.value / 10, "m")
+            return Wavelength(self.data / 10, "m")
         if self.unit == "cm":
-            return Wavelength(self.value / 100, "m")
+            return Wavelength(self.data / 100, "m")
         if self.unit == "mm":  # noqa: RET503
-            return Wavelength(self.value / 1000, "m")
+            return Wavelength(self.data / 1000, "m")
 
     def to_frequency(
         self,
@@ -83,15 +83,15 @@ class Wavelength:
             The unit of the frequency. Default: GHz.
 
         """
-        return Frequency(SPEED_OF_LIGHT / self.to_m().value, "Hz").to_unit(unit)
+        return Frequency(SPEED_OF_LIGHT / self.to_m().data, "Hz").to_unit(unit)
 
 
 @dataclass
 class Frequency:
     """Dataclass for frequency."""
 
-    #: The value of the frequency.
-    value: float
+    #: The data of the frequency.
+    data: float
 
     #: The unit of the frequency. Default: GHz.
     unit: Literal["GHz", "MHz", "kHz", "Hz"] = "GHz"
@@ -110,46 +110,46 @@ class Frequency:
     def to_GHz(self) -> "Frequency":
         """Convert frequency to GHz."""
         if self.unit == "Hz":
-            return Frequency(self.value / 1e9, "GHz")
+            return Frequency(self.data / 1e9, "GHz")
         if self.unit == "kHz":
-            return Frequency(self.value / 1e6, "GHz")
+            return Frequency(self.data / 1e6, "GHz")
         if self.unit == "MHz":
-            return Frequency(self.value / 1e3, "GHz")
+            return Frequency(self.data / 1e3, "GHz")
         if self.unit == "GHz":  # noqa: RET503
             return self
 
     def to_MHz(self) -> "Frequency":
         """Convert frequency to MHz."""
         if self.unit == "Hz":
-            return Frequency(self.value / 1e6, "MHz")
+            return Frequency(self.data / 1e6, "MHz")
         if self.unit == "kHz":
-            return Frequency(self.value / 1e3, "MHz")
+            return Frequency(self.data / 1e3, "MHz")
         if self.unit == "MHz":
             return self
         if self.unit == "GHz":  # noqa: RET503
-            return Frequency(self.value * 1e3, "MHz")
+            return Frequency(self.data * 1e3, "MHz")
 
     def to_kHz(self) -> "Frequency":
         """Convert frequency to kHz."""
         if self.unit == "Hz":
-            return Frequency(self.value / 1e3, "kHz")
+            return Frequency(self.data / 1e3, "kHz")
         if self.unit == "kHz":
             return self
         if self.unit == "MHz":
-            return Frequency(self.value * 1e3, "kHz")
+            return Frequency(self.data * 1e3, "kHz")
         if self.unit == "GHz":  # noqa: RET503
-            return Frequency(self.value * 1e6, "kHz")
+            return Frequency(self.data * 1e6, "kHz")
 
     def to_Hz(self) -> "Frequency":
         """Convert frequency to Hz."""
         if self.unit == "Hz":
             return self
         if self.unit == "kHz":
-            return Frequency(self.value * 1e3, "Hz")
+            return Frequency(self.data * 1e3, "Hz")
         if self.unit == "MHz":
-            return Frequency(self.value * 1e6, "Hz")
+            return Frequency(self.data * 1e6, "Hz")
         if self.unit == "GHz":  # noqa: RET503
-            return Frequency(self.value * 1e9, "Hz")
+            return Frequency(self.data * 1e9, "Hz")
 
     def to_wavelength(
         self,
@@ -163,7 +163,7 @@ class Frequency:
             The unit of the wavelength. Default: m.
 
         """
-        return Wavelength(SPEED_OF_LIGHT / self.to_Hz().value).to_unit(unit)
+        return Wavelength(SPEED_OF_LIGHT / self.to_Hz().data).to_unit(unit)
 
 
 class SAR:
@@ -178,7 +178,7 @@ class SAR:
         return self._frequency
 
     @frequency.setter
-    def frequency(self, value: Frequency) -> None:  # noqa: ARG002
+    def frequency(self, data: Frequency) -> None:  # noqa: ARG002
         msg = "frequency for SAR mission is read-only."
         raise AttributeError(msg)
 
@@ -188,7 +188,7 @@ class SAR:
         return self.frequency.to_wavelength("mm")
 
     @wavelength.setter
-    def wavelength(self, value: Wavelength) -> None:  # noqa: ARG002
+    def wavelength(self, data: Wavelength) -> None:  # noqa: ARG002
         msg = "wavelength for SAR mission is read-only."
         raise AttributeError(msg)
 

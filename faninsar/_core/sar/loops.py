@@ -29,7 +29,7 @@ class TripletLoop:
     _name: str
     _pairs: list[Pair]
 
-    __slots__ = ["_values", "_pairs", "_name", "_days12", "_days23", "_days13"]
+    __slots__ = ["_days12", "_days13", "_days23", "_name", "_pairs", "_values"]
 
     def __init__(self, loop: Sequence[datetime, datetime, datetime]) -> None:
         """Initialize the TripletLoop class.
@@ -173,7 +173,7 @@ class TripletLoops:
     _dates: np.ndarray
     _length: int
 
-    __slots__ = ["_values", "_dates", "_length"]
+    __slots__ = ["_dates", "_length", "_values"]
 
     def __init__(
         self,

@@ -6,7 +6,7 @@ import rasterio
 from rasterio import Affine
 from rasterio.profiles import Profile as RasterioProfile
 
-from faninsar.utils.geo_tools import Profile
+from faninsar._core.geo_tools import Profile
 
 profile = Profile(200, 300, Affine(*list(range(6))))
 
@@ -73,8 +73,6 @@ class TestProfile:
         assert profile_center.nodata == -32768
         assert profile_center.transform == Affine(30.0, 0.0, 285.0,
        0.0, -30.0, 6415.0)
-
-
 
     def test_from_profile_file(self, ascii_file_corner, tmp_path:Path):
         profile_corner = Profile.from_ascii_header_file(ascii_file_corner)

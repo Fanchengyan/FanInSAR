@@ -32,11 +32,11 @@ class BaseResult:
 
     def __repr__(self) -> str:
         """Return the string representation of the instance."""
-        return f"{ self.__class__.__name__}{self.dims}"
+        return f"{self.__class__.__name__}{self.dims}"
 
     def __str__(self) -> str:
         """Return the string representation of the instance."""
-        return f"{ self.__class__.__name__}{self.dims}"
+        return f"{self.__class__.__name__}{self.dims}"
 
     def __getitem__(self, item: int | slice) -> pd.Series | pd.DataFrame:
         """Get the item from the result."""
@@ -133,7 +133,7 @@ class QueryResult:
     _polygons: PolygonsResult | None
     _query: GeoQuery | None
 
-    __slots__ = ["_points", "_boxes", "_polygons", "_query"]
+    __slots__ = ["_boxes", "_points", "_polygons", "_query"]
 
     def __init__(
         self,

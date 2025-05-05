@@ -52,8 +52,8 @@ _all = names.copy()
 cwd = Path(__file__).parent.absolute()
 
 for name in names:
-    file = cwd / name / f"{name}.txt"
-    cm_data = np.loadtxt(file)
+    cmap_file = cwd / name / f"{name}.txt"
+    cm_data = np.loadtxt(cmap_file)
 
     _all.append(f"{name}_r")
 
@@ -63,7 +63,7 @@ for name in names:
 __all__ = tuple(_all)
 
 del name
-del file
+del cmap_file
 del cm_data
 del cwd
 del Path

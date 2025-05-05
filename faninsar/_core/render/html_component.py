@@ -39,10 +39,7 @@ def _icon(icon_name: str) -> str:
     """Return an SVG icon in HTML."""
     # icon_name should be defined in xarray/static/html/icon-svg-inline.html
     return (
-        f"<svg class='icon xr-{icon_name}'>"
-        f"<use xlink:href='#{icon_name}'>"
-        "</use>"
-        "</svg>"
+        f"<svg class='icon xr-{icon_name}'><use xlink:href='#{icon_name}'></use></svg>"
     )
 
 
@@ -112,6 +109,8 @@ class HtmlProperties(BaseHTML):
         self,
         properties: dict,
         column: int = 1,
+        width: str = "100%",
+        margin: str = "0px",
         description: str | None = None,
         svg: html_tag | None = None,
     ) -> None:
@@ -123,6 +122,10 @@ class HtmlProperties(BaseHTML):
             The properties to be rendered as a html table.
         column: int, optional
             The column to be shown in the table. Default is 1.
+        width: str, optional
+            The width of the table. Default is "100%".
+        margin: str, optional
+            The margin of the table. Default is "0px".
         description: str
             The description of the property.
         svg: html_tag, optional
@@ -131,14 +134,21 @@ class HtmlProperties(BaseHTML):
         """
         self.properties = properties
         self.column = column
+        self.width = width
+        self.margin = margin
         self.description = description
         self.svg = svg
 
     def to_tag(self) -> html_tag:
         """Return a rendered dominate tag containing a table of properties."""
-        table_tag = table(style="margin-left: 2px; margin-right: 2px;")
+        div_tag = div(style=f"width: {self.width}; margin: {self.margin};")
+        table_tag = table(
+            style="margin: 5px 2.5%; width: 95%;",
+        )
         if self.description is not None:
-            table_tag += p(self.description, style="color: gray;")
+            table_tag += p(
+                f"{self.description}:", style="color: gray;margin-left: 1em;"
+            )
         body_tag = body()
         for i, (key, value) in enumerate(self.properties.items()):
             if i % self.column == 0:
@@ -154,7 +164,8 @@ class HtmlProperties(BaseHTML):
         if self.svg:
             table_tag = add_svg(table_tag, self.svg)
 
-        return table_tag
+        div_tag += table_tag
+        return div_tag
 
 
 class HtmlDims(BaseHTML):
@@ -218,10 +229,7 @@ class HtmlIndexes(BaseHTML):
 
     def to_tag(self) -> html_tag:
         """Return a rendered dominate tag containing a table of properties."""
-        from faninsar._core.render_html.formatting_html import (
-            short_index_repr_html,
-            summarize_attrs,
-        )
+        from faninsar._core.render.formatting_html import short_index_repr_html
 
         ul_tag = ul(cls="xr-var-list")
         for key, value in self.indexes.items():
@@ -242,7 +250,10 @@ class HtmlIndexes(BaseHTML):
 
             attrs_ul = div(dl(cls="xr-attrs"), cls="xr-var-attrs")
             if hasattr(value, "attrs") and len(value.attrs) > 0:
-                attrs_ul = raw(summarize_attrs(value.attrs))
+                # attrs_ul = raw(summarize_attrs(value.attrs))
+                attrs_ul = HtmlProperties(
+                    value.attrs, description="Attributes"
+                ).to_tag()
                 disabled = False
             data_repr = raw(short_index_repr_html(value))
 

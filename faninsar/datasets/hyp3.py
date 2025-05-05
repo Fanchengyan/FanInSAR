@@ -7,13 +7,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from faninsar._core.file_tools import retrieve_meta_value
+from faninsar._core.file_tools import load_meta_value
 from faninsar._core.sar.pairs import Pairs
 from faninsar._core.sar.sar_base import Baselines
+from faninsar.constants import Sentinel1
 from faninsar.datasets.ifg import InterferogramDataset
 
 
-class HyP3S1(InterferogramDataset):
+class HyP3S1(InterferogramDataset, Sentinel1):
     """A dataset manages the data of HyP3 Sentinel-1 product.
 
     `Hyp3 <https://hyp3-docs.asf.alaska.edu/>`_ is a service for processing
@@ -64,14 +65,14 @@ class HyP3S1(InterferogramDataset):
         for f in files:
             try:
                 meta_file = str(f).replace("_unw_phase.tif", ".txt")
-                value = float(retrieve_meta_value(meta_file, "Baseline"))
+                value = float(load_meta_value(meta_file, "Baseline"))
                 baselines.append(value)
             except Exception:  # noqa: PERF203
                 baselines.append(np.nan)
         return Baselines.from_pair_wise(pairs, np.array(baselines))
 
 
-class HyP3S1Burst(InterferogramDataset):
+class HyP3S1Burst(InterferogramDataset, Sentinel1):
     """A dataset manages the data of HyP3 Sentinel-1 Burst product.
 
     `Hyp3 <https://hyp3-docs.asf.alaska.edu/>`_ is a service for processing

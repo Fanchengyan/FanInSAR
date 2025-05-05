@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from faninsar.utils.file_tools import (
+from faninsar._core.file_tools import (
     ensure_int,
     load_meta_value,
     load_meta_values,

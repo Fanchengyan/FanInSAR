@@ -6,7 +6,7 @@ import pprint
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -874,6 +874,14 @@ class Profile:
         for key in self.kwargs:
             setattr(self, key, self.kwargs[key])
 
+    def __getitem__(self, key: str) -> Any:
+        """Get the value of the key."""
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Set the value of the key."""
+        setattr(self, key, value)
+
     def _parse_bounds(self) -> tuple[float, float, float, float]:
         """Parse the bounds from profile data."""
         tf = self.transform
@@ -890,11 +898,11 @@ class Profile:
         """Split the profile into default keys and other keys."""
         kwargs = {}
         profile_new = {}
-        for key in profile:
+        for key, value in profile.items():
             if key not in DEFAULT_KEYS_Profile:
-                kwargs[key] = profile[key]
+                kwargs[key] = value
             else:
-                profile_new[key] = profile[key]
+                profile_new[key] = value
         return profile_new, kwargs
 
     @property

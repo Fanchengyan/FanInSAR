@@ -1,10 +1,11 @@
 from ._core import (
+    Acquisition,
     Baselines,
     DateManager,
+    DaySpan,
     GeoDataFormatConverter,
     Loop,
     Loops,
-    Pair,
     Pairs,
     PairsFactory,
     PhaseDeformationConverter,

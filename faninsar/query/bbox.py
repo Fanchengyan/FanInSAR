@@ -307,11 +307,12 @@ class BoundingBox:
     def intersects(self, other: BoundingBox) -> bool:
         """Whether or not two bounding boxes intersect.
 
-        Args:
-        ----
-            other: another bounding box
+        Parameters
+        ----------
+        other: BoundingBox
+            another bounding box
 
-        Returns:
+        Returns
         -------
             True if bounding boxes intersect, else False
 
@@ -330,12 +331,14 @@ class BoundingBox:
     ) -> tuple[BoundingBox, BoundingBox]:
         """Split BoundingBox in two.
 
-        Args:
-        ----
-            proportion: split proportion in range (0,1)
-            horizontal: whether the split is horizontal or vertical
+        Parameters
+        ----------
+        proportion: float
+            split proportion in range (0,1)
+        horizontal: bool
+            whether the split is horizontal or vertical
 
-        Returns:
+        Returns
         -------
             A tuple with the resulting BoundingBoxes
 

@@ -11,10 +11,10 @@ import pandas as pd
 import xarray as xr
 from xarray.core.indexes import Indexes
 
-from faninsar._core.render_html import formatting_html
+from faninsar._core.render import formatting_html
 from faninsar.logging import setup_logger
 
-from .acquisition import Acquisition, DateManager, DaysSpan
+from .acquisition import Acquisition, DateManager, DaySpan
 
 if TYPE_CHECKING:
     from numpy.typing import DTypeLike, NDArray
@@ -32,7 +32,7 @@ class Pair:
     _name: str
     _days: int
 
-    __slots__ = ["_values", "_name", "_days"]
+    __slots__ = ["_days", "_name", "_values"]
 
     def __init__(
         self,
@@ -89,14 +89,14 @@ class Pair:
         return self._days
 
     @property
-    def primary(self) -> Acquisition:
+    def primary(self) -> pd.Timestamp:
         """The primary dates of all pairs."""
-        return Acquisition(self.values[0])
+        return pd.Timestamp(self.values[0])
 
     @property
-    def secondary(self) -> Acquisition:
+    def secondary(self) -> pd.Timestamp:
         """The secondary dates of all pairs."""
-        return Acquisition(self.values[1])
+        return pd.Timestamp(self.values[1])
 
     def primary_string(self, date_format: str = "%Y%m%d") -> str:
         """Return the primary dates of all pairs in string format.
@@ -233,7 +233,7 @@ class Pairs:
     _edge_index: np.ndarray
     _names: np.ndarray
 
-    __slots__ = ["_values", "_dates", "_length", "_edge_index", "_names"]
+    __slots__ = ["_dates", "_edge_index", "_length", "_names", "_values"]
 
     def __init__(
         self,
@@ -305,7 +305,7 @@ class Pairs:
         return np.array_equal(self.values, other.values)
 
     def __add__(self, other: Pairs) -> Pairs:
-        """Return the union of the pairs."""
+        """Return the unique, sorted union of the pairs."""
         _pairs = np.union1d(self.names, other.names)
         return Pairs.from_names(_pairs)
 
@@ -454,53 +454,53 @@ class Pairs:
 
     @property
     def values(self) -> NDArray[np.datetime64]:
-        """Return the numpy array of the pairs."""
+        """The numpy array of the pairs."""
         return self._values
 
     @property
     def names(self) -> NDArray[np.str_]:
-        """Return the names (string format) of the pairs."""
+        """The names (string format) of the pairs."""
         return self._names
 
     @property
     def dates(self) -> Acquisition:
-        """Return the sorted dates array of all pairs in type of np.datetime64[D]."""
+        """The sorted dates array of all pairs in type of np.datetime64[D]."""
         return Acquisition(pd.to_datetime(self._dates))
 
     @property
-    def days(self) -> DaysSpan:
-        """Return the time span of all pairs in days."""
+    def days(self) -> DaySpan:
+        """The time span of all pairs in days."""
         days = (self._values[:, 1] - self._values[:, 0]).astype(int)
-        return DaysSpan(days, dtype=np.int32)
+        return DaySpan(days, dtype=np.int32)
 
     @property
     def primary(self) -> Acquisition:
-        """Return the primary dates of all pairs."""
+        """The primary dates of all pairs."""
         if len(self._values) == 0:
             return Acquisition([])
         return Acquisition(pd.to_datetime(self._values[:, 0]))
 
     @property
     def secondary(self) -> Acquisition:
-        """Return the secondary dates of all pairs."""
+        """The secondary dates of all pairs."""
         if len(self._values) == 0:
             return Acquisition([])
         return Acquisition(pd.to_datetime(self._values[:, 1]))
 
     @property
     def xindexes(self) -> Indexes:
-        """Return the xarray indexes of the pairs."""
+        """The xarray indexes of the pairs."""
         indexes = {
-            "dates": self.dates,
             "primary": self.primary,
             "secondary": self.secondary,
             "days": self.days,
+            "dates": self.dates,
         }
         variables = {
-            "dates": self.dates.to_xarray(),
             "primary": self.primary.to_xarray(),
             "secondary": self.secondary.to_xarray(),
-            "days": xr.Variable(dims=["days"], data=self.days),
+            "days": self.days.to_xarray(),
+            "dates": self.dates.to_xarray(),
         }
         return Indexes(indexes=indexes, variables=variables, index_type=pd.Index)
 
@@ -530,7 +530,7 @@ class Pairs:
 
     @property
     def edge_index(self) -> NDArray[np.int64]:
-        """Return the index of the pairs in the dates coordinate.
+        """The index of the pairs in the dates coordinate.
 
         This is useful to construct the edge index in graph theory.
         """
@@ -538,7 +538,7 @@ class Pairs:
 
     @property
     def shape(self) -> tuple[int, int]:
-        """Return the shape of the pairs array."""
+        """The shape of the pairs array."""
         return self._values.shape
 
     @classmethod
@@ -629,7 +629,7 @@ class Pairs:
         return self[self.where(pairs)]
 
     def union(self, pairs: list[str] | list[Pair] | Pairs) -> Pairs:
-        """Return the union of the pairs.
+        """Return the unique, sorted union of the pairs.
 
         All pairs that in self and input pairs. Same as addition.
 
@@ -699,7 +699,7 @@ class Pairs:
             "pairs": self._values,
             "primary": self._values[:, 0],
             "secondary": self._values[:, 1],
-            "days": self.days,
+            "days": self.days.data,
         }
         if isinstance(order, str):
             order = [order]
@@ -1009,11 +1009,11 @@ class PairsFactory:
             if same_year:
                 end = pd.to_datetime(f"{year}{winter_end}", format="%Y%m%d")
             else:
-                end = pd.to_datetime(f"{year+1}{winter_end}", format="%Y%m%d")
+                end = pd.to_datetime(f"{year + 1}{winter_end}", format="%Y%m%d")
 
             dt_year = df_dates[start:end]
             if len(dt_year) > 0:
-                np.Generator.shuffle(dt_year)
+                np.random.default_rng().shuffle(dt_year)
                 date_years.append(dt_year[:n_per_winter].to_list())
 
         n_years = len(date_years)
@@ -1083,12 +1083,12 @@ class PairsFactory:
             if same_year:
                 end = pd.to_datetime(f"{year}{period_end}", format="%Y%m%d")
             else:
-                end = pd.to_datetime(f"{year+1}{period_end}", format="%Y%m%d")
+                end = pd.to_datetime(f"{year + 1}{period_end}", format="%Y%m%d")
 
             dt_year = df_dates[start:end]
             if (n_year := len(dt_year)) > 0:
                 n = n_year if n_per_period is None else n_per_period
-                np.Generator.shuffle(dt_year)
+                np.random.default_rng().shuffle(dt_year)
                 date_years.append(dt_year[:n].to_list())
 
         # generate interferometric pairs between primary period and the rest periods
@@ -1145,20 +1145,20 @@ class PairsFactory:
             s_end = pd.to_datetime(f"{year}{summer_end}", format="%Y%m%d")
 
             if int(winter_start) > int(summer_end):
-                w_start1 = pd.to_datetime(f"{year-1}{winter_start}", format="%Y%m%d")
+                w_start1 = pd.to_datetime(f"{year - 1}{winter_start}", format="%Y%m%d")
                 w_start2 = pd.to_datetime(f"{year}{winter_start}", format="%Y%m%d")
                 if int(winter_end) > int(summer_end):
-                    w_end1 = pd.to_datetime(f"{year-1}{winter_end}", format="%Y%m%d")
+                    w_end1 = pd.to_datetime(f"{year - 1}{winter_end}", format="%Y%m%d")
                     w_end2 = pd.to_datetime(f"{year}{winter_end}", format="%Y%m%d")
                 else:
                     w_end1 = pd.to_datetime(f"{year}{winter_end}", format="%Y%m%d")
-                    w_end2 = pd.to_datetime(f"{year+1}{winter_end}", format="%Y%m%d")
+                    w_end2 = pd.to_datetime(f"{year + 1}{winter_end}", format="%Y%m%d")
             else:
                 w_start1 = pd.to_datetime(f"{year}{winter_start}", format="%Y%m%d")
-                w_start2 = pd.to_datetime(f"{year+1}{winter_start}", format="%Y%m%d")
+                w_start2 = pd.to_datetime(f"{year + 1}{winter_start}", format="%Y%m%d")
 
                 w_end1 = pd.to_datetime(f"{year}{winter_end}", format="%Y%m%d")
-                w_end2 = pd.to_datetime(f"{year+1}{winter_end}", format="%Y%m%d")
+                w_end2 = pd.to_datetime(f"{year + 1}{winter_end}", format="%Y%m%d")
 
             dt_winter1 = df_dates[w_start1:w_end1].to_list()
             dt_summer = df_dates[s_start:s_end].to_list()
@@ -1260,7 +1260,7 @@ def valid_diagonal_pair(
         return False
 
     _edge_pairs = pairs[mask_edge]
-    if _edge_pairs.days.sum() >= pair.days:
+    if _edge_pairs.days.values.sum() >= pair.days:
         valid = True
     return valid
 

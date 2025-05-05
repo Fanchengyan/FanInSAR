@@ -14,11 +14,12 @@ from .geo_tools import (
     write_geoinfo_into_nc,
 )
 from .sar import (
+    Acquisition,
     Baselines,
     DateManager,
+    DaySpan,
     Loop,
     Loops,
-    Pair,
     Pairs,
     PairsFactory,
     PhaseDeformationConverter,
