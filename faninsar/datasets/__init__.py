@@ -32,7 +32,7 @@ MAPPING_PAIRS = {
 }
 
 
-def get_dataset(name):
+def get_dataset(name: str) -> RasterDataset:
     """Get a dataset object from a string name.
 
     Parameters
@@ -44,8 +44,9 @@ def get_dataset(name):
     -------
     dataset : Dataset
         Dataset class.
+
     """
-    if name.lower() in MAPPING_PAIRS.keys():
+    if name.lower() in MAPPING_PAIRS:
         return MAPPING_PAIRS[name.lower()]
-    else:
-        raise ValueError(f"Dataset {name} not found.")
+    msg = f"Dataset {name} not found. Available datasets are: {available}"
+    raise ValueError(msg)

@@ -1,12 +1,16 @@
+"""Result classes for the queries."""
+
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING
 
-import numpy as np
 import pandas as pd
-from rasterio.transform import Affine
 
-from .query import GeoQuery
+if TYPE_CHECKING:
+    import numpy as np
+    from rasterio.transform import Affine
+
+    from .query import GeoQuery
 
 
 class BaseResult:
@@ -14,7 +18,7 @@ class BaseResult:
 
     def __init__(
         self,
-        result,
+        result: dict,
     ) -> None:
         """Initialize the BaseResult instance.
 
@@ -22,22 +26,28 @@ class BaseResult:
         ----------
         result : dict
             The result of the query.
+
         """
         self.result = result
 
-    def __repr__(self):
-        return f"{ self.__class__.__name__}{self.dims}"
+    def __repr__(self) -> str:
+        """Return the string representation of the instance."""
+        return f"{self.__class__.__name__}{self.dims}"
 
-    def __str__(self):
-        return f"{ self.__class__.__name__}{self.dims}"
+    def __str__(self) -> str:
+        """Return the string representation of the instance."""
+        return f"{self.__class__.__name__}{self.dims}"
 
     def __getitem__(self, item: int | slice) -> pd.Series | pd.DataFrame:
+        """Get the item from the result."""
         return self.frame.iloc[item, :]
 
-    def __iter__(self):
+    def __iter__(self) -> iter:
+        """Iterate over the result."""
         return iter(self.frame.iterrows())
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the length of the result."""
         return len(self.data)
 
     @property
@@ -59,25 +69,25 @@ class BaseResult:
         """DataFrame of the result."""
         if self.result is None:
             return None
-        df = pd.DataFrame(
+        return pd.DataFrame(
             {
                 "data": self.data,
                 "transforms": self.transforms,
             },
             dtype="O",
         )
-        return df
 
     @property
     def is_empty(self) -> bool:
-        """if the result is empty."""
+        """If the result is empty."""
         return len(self.data) == 0
 
 
 class PointsResult(BaseResult):
     """A class to manage the result of :class:`~faninsar.query.Points` query."""
 
-    def __getitem__(self, item):
+    def __getitem__(self, item: int | slice) -> pd.Series:
+        """Get the item from the result."""
         return self.result[item]
 
 
@@ -86,6 +96,7 @@ class BBoxesResult(BaseResult):
 
     @property
     def transforms(self) -> list[Affine] | None:
+        """List of affine transforms."""
         if self.result is None:
             return None
         return self.result["transforms"]
@@ -96,19 +107,23 @@ class PolygonsResult(BBoxesResult):
 
     @property
     def transforms(self) -> list[Affine] | None:
+        """List of affine transforms."""
         if self.result is None:
             return None
         return self.result["transforms"]
 
     @property
     def masks(self) -> list[np.ndarray] | None:
+        """List of masks."""
         if self.result is None:
             return None
         return self.result["masks"]
 
 
 class QueryResult:
-    """A combined result of the :class:`PointsResult`, :class:`BBoxesResult`, and
+    """A combined result of Queries.
+
+    the :class:`PointsResult`, :class:`BBoxesResult`, and
     :class:`PolygonsResult` queries. This class is the default return type of the
     :ref:`query` results for the datasets.
     """
@@ -118,7 +133,7 @@ class QueryResult:
     _polygons: PolygonsResult | None
     _query: GeoQuery | None
 
-    __slots__ = ["_points", "_boxes", "_polygons", "_query"]
+    __slots__ = ["_boxes", "_points", "_polygons", "_query"]
 
     def __init__(
         self,
@@ -126,7 +141,7 @@ class QueryResult:
         boxes: BBoxesResult | dict | None = None,
         polygons: PolygonsResult | dict | None = None,
         query: GeoQuery = None,
-    ):
+    ) -> None:
         """Initialize the QueryResult instance.
 
         Parameters
@@ -139,6 +154,7 @@ class QueryResult:
             Result of the :class:`~faninsar.query.Polygons` query.
         query : GeoQuery, optional
             The :class:`~faninsar.query.GeoQuery` instance used to generate results.
+
         """
         if isinstance(points, dict):
             points = PointsResult(points)
@@ -152,7 +168,8 @@ class QueryResult:
         self._polygons = polygons
         self._query = query
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return the string representation of the instance."""
         return (
             "QueryResult("
             f"\n    points={self.points},"
@@ -162,8 +179,12 @@ class QueryResult:
             "\n)"
         )
 
-    def __str__(self):
-        return f"QueryResult(points={self.points}, boxes={self.boxes}, polygons={self.polygons})"
+    def __str__(self) -> str:
+        """Return the string representation of the instance."""
+        return (
+            f"QueryResult(points={self.points}, boxes={self.boxes}, "
+            f"polygons={self.polygons})"
+        )
 
     @property
     def points(self) -> PointsResult | None:

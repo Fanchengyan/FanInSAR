@@ -1,58 +1,69 @@
+"""A module to provide some useful tools for geospatial data processing."""
+
 from __future__ import annotations
 
 import pprint
 import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import rasterio
 import xarray as xr
+from affine import Affine
 from lxml import etree
 from matplotlib import ticker
-from matplotlib.cm import ScalarMappable
 from pykml.factory import KML_ElementMaker as KML
 from pyproj import CRS
-from rasterio import Affine, dtypes, transform
+from rasterio import dtypes, transform
 from rasterio.io import MemoryFile
-from rasterio.transform import Affine
+from rasterio.profiles import Profile as RasterioProfile
 from rasterio.warp import Resampling, reproject
 from tqdm import tqdm
 
-from ..query.bbox import BoundingBox
-from .logger import setup_logger
+from faninsar.logging import setup_logger
+from faninsar.query.bbox import BoundingBox
+
+from .file_tools import load_meta_values
+
+if TYPE_CHECKING:
+    from matplotlib.cm import ScalarMappable
+
+    from faninsar.typing import CrsLike, PathLike
 
 logger = setup_logger(
-    log_name="FanInSAR.geo_tools", log_format="%(levelname)s - %(message)s"
+    log_name=__name__,
+    log_format="%(levelname)s - %(message)s",
 )
 
 
 def _ensure_bounds_in_wgs84(
-    bounds: Tuple[float, float, float, float]
-) -> Tuple[float, float, float, float]:
-    """ensure the bounds are in WGS84 coordinate system."""
+    bounds: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Ensure the bounds are in WGS84 coordinate system."""
     west, south, east, north = bounds
     if west < -180 or east > 180 or south < -90 or north > 90:
-        raise ValueError(
+        msg = (
             "bounds should be in WGS84 coordinate system, "
-            "but got [{west}, {south}, {east}, {north}]".format(
-                west=west, south=south, east=east, north=north
-            )
+            f"but got [{west}, {south}, {east}, {north}]"
+        )
+        raise ValueError(
+            msg,
         )
 
 
 def save_colorbar(
-    out_file: str | Path,
+    out_file: PathLike,
     mappable: ScalarMappable,
-    figsize: Tuple[float, float] = (0.18, 3.6),
+    figsize: tuple[float, float] = (0.18, 3.6),
     label: str | None = None,
     nbins: int | None = None,
     alpha: float = 0.5,
     **kwargs,
-):
-    """save the colorbar to a file.
+) -> None:
+    """Save the colorbar to a file.
 
     Parameters
     ----------
@@ -70,6 +81,7 @@ def save_colorbar(
         the transparency of the colorbar figure. Default is 0.5.
     kwargs: dict
         the keyword arguments for :func:`matplotlib.pyplot.colorbar` function.
+
     """
     fig, ax = plt.subplots(figsize=figsize)
     ax.axis("off")
@@ -91,13 +103,13 @@ def save_colorbar(
 
 def array2kml(
     arr: np.ndarray,
-    out_file: str | Path,
-    bounds: Tuple[float, float, float, float] | BoundingBox,
-    img_kwargs: dict = {},
-    cbar_kwargs: dict = {},
+    out_file: PathLike,
+    bounds: tuple[float, float, float, float] | BoundingBox,
+    img_kwargs: dict | None = None,
+    cbar_kwargs: dict | None = None,
     verbose: bool = True,
-):
-    """write a numpy array into a kml file.
+) -> None:
+    """Write a numpy array into a kml file.
 
     Parameters
     ----------
@@ -114,13 +126,18 @@ def array2kml(
         the out_file and mappable argument.
     verbose: bool
         whether to print the information of the kml file. Default is verbose.
-    """
 
+    """
+    if cbar_kwargs is None:
+        cbar_kwargs = {}
+    if img_kwargs is None:
+        img_kwargs = {}
     if isinstance(bounds, tuple):
         _ensure_bounds_in_wgs84(bounds)
         bounds = BoundingBox(*bounds, crs="EPSG:4326")
     if bounds.crs != CRS.from_user_input("EPSG:4326"):
-        raise ValueError("bounds should be in WGS84 coordinate system")
+        msg = "bounds should be in WGS84 coordinate system"
+        raise ValueError(msg)
 
     out_file = Path(out_file)
     if out_file.suffix != ".kml":
@@ -173,22 +190,23 @@ def array2kml(
     kml_doc.append(cbar_overlay)
 
     kml = KML.kml(kml_doc)
-    with open(out_file, "w") as f:
+    with Path(out_file).open("w") as f:
         f.write(etree.tostring(kml, pretty_print=True).decode("utf8"))
     if verbose:
-        logger.info(f"write kml file to {out_file}")
+        info = f"write kml file to {out_file}"
+        logger.info(info)
 
 
 def array2kmz(
     arr: np.ndarray,
-    out_file: str | Path,
-    bounds: Tuple[float, float, float, float] | BoundingBox,
-    img_kwargs: dict = {},
-    cbar_kwargs: dict = {},
+    out_file: PathLike,
+    bounds: tuple[float, float, float, float] | BoundingBox,
+    img_kwargs: dict | None = None,
+    cbar_kwargs: dict | None = None,
     keep_kml: bool = False,
     verbose: bool = True,
-):
-    """write a numpy array into a kmz file.
+) -> None:
+    """Write a numpy array into a kmz file.
 
     Parameters
     ----------
@@ -207,7 +225,12 @@ def array2kmz(
         whether to keep the kml file. Default is False.
     verbose: bool
         whether to print the information of the kmz file. Default is verbose.
+
     """
+    if cbar_kwargs is None:
+        cbar_kwargs = {}
+    if img_kwargs is None:
+        img_kwargs = {}
     out_file = Path(out_file)
     if out_file.suffix != ".kmz":
         out_file = out_file.parent / (out_file.stem + ".kmz")
@@ -225,13 +248,15 @@ def array2kmz(
         cbar_file.unlink()
         kml_file.unlink()
     if verbose:
-        logger.info(f"write kmz file to {out_file}")
+        info = f"write kmz file to {out_file}"
+        logger.info(info)
 
 
 def bound_from_latlon(
-    lat: np.ndarray, lon: np.ndarray
-) -> Tuple[float, float, float, float]:
-    """get the bounds from latitude and longitude."""
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> tuple[float, float, float, float]:
+    """Get the bounds from latitude and longitude."""
     west, south, east, north = (
         np.nanmin(lon),
         np.nanmin(lat),
@@ -242,9 +267,10 @@ def bound_from_latlon(
 
 
 def geoinfo_from_latlon(
-    lat: np.ndarray, lon: np.ndarray
+    lat: np.ndarray,
+    lon: np.ndarray,
 ) -> tuple[BoundingBox, tuple, tuple]:
-    """get the geoinformation from latitude and longitude.
+    """Get the geoinformation from latitude and longitude.
 
     Parameters
     ----------
@@ -252,7 +278,7 @@ def geoinfo_from_latlon(
         latitudes and longitudes
 
     Returns
-    --------
+    -------
     bounds: BoundingBox
         the bounding box of the raster.
 
@@ -261,6 +287,7 @@ def geoinfo_from_latlon(
         the resolution of the raster
     shape: tuple[height, width]
         the shape of the raster
+
     """
     west, south, east, north = bound_from_latlon(lat, lon)
     width, height = len(lon), len(lat)
@@ -273,28 +300,33 @@ def geoinfo_from_latlon(
     return bounds, res, shape
 
 
-def transform_from_latlon(lat, lon) -> Affine:
-    """get the rasterio.transform from latitude and longitude.
-    the pixel location will shift from center to upper-left corner
+def transform_from_latlon(
+    lat: np.ndarray,
+    lon: np.ndarray,
+) -> Affine:
+    """Get the :class:`rasterio.Affine` from latitude and longitude.
+
+    .. note::
+        The pixel location will shift from center to upper-left corner.
 
     Parameters
     ----------
     lat, lon: numpy.ndarray or list
         latitudes and longitudes
+
     """
     west, north, xsize, ysize, _, _ = geoinfo_from_latlon(lat, lon)
 
-    tf = transform.from_origin(
+    return transform.from_origin(
         west - 0.5 * xsize,  # center to left
         north + 0.5 * ysize,  # center to top
         xsize,
         ysize,
     )
-    return tf
 
 
-def latlon_from_profile(profile: Profile) -> np.ndarray:
-    """get the latitude and longitude from rasterio profile data
+def latlon_from_profile(profile: RasterioProfile) -> np.ndarray:
+    """Get the latitude and longitude from rasterio profile data.
 
     Parameters
     ----------
@@ -303,8 +335,9 @@ def latlon_from_profile(profile: Profile) -> np.ndarray:
         rasterio.open().profile
 
     Returns
-    --------
+    -------
     lat, lon: numpy.ndarray
+
     """
     tf = profile["transform"]
     width = profile["width"]
@@ -316,104 +349,119 @@ def latlon_from_profile(profile: Profile) -> np.ndarray:
 
 def write_geoinfo_into_ds(
     ds: xr.DataArray | xr.Dataset,
-    vars: Optional[str | Tuple | List] = None,
-    crs: Any = "EPSG:4326",
+    var: str | tuple | list | None = None,
+    crs: CrsLike = "EPSG:4326",
     x_dim: str = "lon",
     y_dim: str = "lat",
-):
-    """write geoinformation in to the given xr DataArray or DataSet.
+) -> xr.DataArray | xr.Dataset:
+    """Write geoinformation in to the given xr DataArray or DataSet.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     ds: xarray DataArray or DataSet object
         data to be written into geoinfo.If type of ds is DataSet,
-        vars should be set
-    vars: str, tuple or list
+        var should be set
+    var: str, tuple or list
         variables that need to be added geoinformation
-    crs: str, int, dict or rasterio.crs.CRS object
+    crs: CrsLike
         the coordinate reference system. Could be any type that
         :meth:`rasterio.crs.CRS.from_user_input` accepts.
-    x_dim/y_dim: str
-        the coordinate name that presents the x/y dimension
+    x_dim: str
+        the coordinate name that presents the x dimension
+    y_dim: str
+        the coordinate name that presents the y dimension
+
     """
     if isinstance(ds, xr.DataArray):
         ds = ds.rio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim)
         ds = ds.rio.write_crs(crs)
+    elif isinstance(var, str):
+        ds[var] = ds[var].rio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim)
+        ds[var] = ds[var].rio.write_crs(crs)
+    elif isinstance(var, (tuple, list)):
+        for _var in var:
+            ds[_var] = ds[_var].rio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim)
+            ds[_var] = ds[_var].rio.write_crs(crs)
+    elif var is None:
+        msg = "Detected type of ds is a xr.Dataset. var must be set"
+        raise TypeError(msg)
     else:
-        if isinstance(vars, str):
-            ds[vars] = ds[vars].rio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim)
-            ds[vars] = ds[vars].rio.write_crs(crs)
-        elif isinstance(vars, (tuple, list)):
-            for var in vars:
-                ds[var] = ds[var].rio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim)
-                ds[var] = ds[var].rio.write_crs(crs)
-        elif vars is None:
-            raise TypeError("Detected type of ds is a xr.Dataset." " vars must be set")
-        else:
-            raise TypeError("vars type must be one of [str,tuple,list]")
+        msg = "var type must be one of [str,tuple,list]"
+        raise TypeError(msg)
     return ds
 
 
 def write_geoinfo_into_nc(
-    nc_file: str | Path,
-    vars: Optional[str | Tuple | List] = None,
-    crs: Any = "EPSG:4326",
+    nc_file: PathLike,
+    var: str | tuple | list | None = None,
+    crs: CrsLike = "EPSG:4326",
     x_dim: str = "lon",
     y_dim: str = "lat",
     encode_time: bool = False,
-):
-    """write geoinformation in to the given nc file and making it could be
-    opened with geoinformation in QGIS directly.
+) -> None:
+    """Write geoinformation in to the given nc file.
 
-    Parameters:
-    -----------
+    This make it could be opened with geoinformation in QGIS directly.
+
+    Parameters
+    ----------
     nc_file: str or pathlib.Path object
         the path of nc file
-    vars: str, tuple or list
+    var: str, tuple or list
         variables that need to be added geoinformation
-    x_dim/y_dim: str
-        the coordinate name that presents the x/y dimension
-    crs: str, int, dict or rasterio.crs.CRS object
+    crs: CrsLike
         the coordinate reference system. Could be any type that
         :meth:`rasterio.crs.CRS.from_user_input` accepts.
+    x_dim: str
+        the coordinate name that presents the x dimension
+    y_dim: str
+        the coordinate name that presents the y dimension
     encode_time: bool
         whether to encode the time since "2000-01-01 00:00:00" if
         "time" coordinate is exists. Default is False.
+
     """
     ds = xr.load_dataset(nc_file)
 
-    ds = write_geoinfo_into_ds(ds, vars, crs, x_dim, y_dim)
+    ds = write_geoinfo_into_ds(ds, var, crs, x_dim, y_dim)
 
     encode = {}
     if encode_time:
         if "time" in ds:
             encode.update({"time": {"units": "days since 2000-01-01 00:00:00"}})
         else:
-            logger.warning(
+            info = (
                 f'there is no "time" dimension in {nc_file}, '
-                "encoding process will be ignored"
+                "encoding process will be ignored",
             )
+            logger.warning(info)
     ds.to_netcdf(nc_file, encoding=encode)
 
 
 def match_to_raster(
-    src_arr,
-    src_profile,
-    dst_profile,
-    resampleAlg=Resampling.nearest,
-):
-    """match the source raster to the destination raster.
+    src_arr: np.ndarray,
+    src_profile: Profile,
+    dst_profile: Profile,
+    algorithm: Resampling = Resampling.nearest,
+) -> np.ndarray:
+    """Match the source raster to the destination raster.
 
     Parameters
     ----------
     src_arr: numpy.ndarray
         the source array to be matched.
-    src_profile: dict
+    src_profile: Profile
         the profile of the source raster.
-    dst_profile: dict
+    dst_profile: Profile
         the profile of the destination raster.
-    resampleAlg: Resampling
+    algorithm: Resampling
         the resampling algorithm. Default is Resampling.nearest.
+
+    Returns
+    -------
+    numpy.ndarray
+        the matched array.
+
     """
     src_crs = src_profile["crs"]
     src_tf = src_profile["transform"]
@@ -431,43 +479,42 @@ def match_to_raster(
         src_n_band, src_height, src_width = src_arr.shape
         indexes = np.arange(1, src_n_band + 1).tolist()
     else:
-        raise ValueError("dimension of src_arr must be 2 or 3")
-    with MemoryFile() as memfile:
-        with memfile.open(
+        msg = "dimension of src_arr must be 2 or 3"
+        raise ValueError(msg)
+    with MemoryFile() as memfile, memfile.open(
+        driver="GTiff",
+        count=src_n_band,
+        height=src_height,
+        width=src_width,
+        dtype="float32",
+        crs=src_crs,
+        transform=src_tf,
+    ) as src:
+        src.write(src_arr, indexes)
+
+        with MemoryFile() as memfile1, memfile1.open(
             driver="GTiff",
             count=src_n_band,
-            height=src_height,
-            width=src_width,
+            height=dst_height,
+            width=dst_width,
             dtype="float32",
-            crs=src_crs,
-            transform=src_tf,
-        ) as src:
-            src.write(src_arr, indexes)
-
-            with MemoryFile() as memfile1:
-                with memfile1.open(
-                    driver="GTiff",
-                    count=src_n_band,
-                    height=dst_height,
-                    width=dst_width,
-                    dtype="float32",
-                    crs=dst_crs,
-                    transform=dst_tf,
-                ) as dst:
-                    if indexes == 1:
-                        indexes = [1]
-                    for i in tqdm(indexes, desc="matching raster"):
-                        reproject(
-                            source=rasterio.band(src, i),
-                            destination=rasterio.band(dst, i),
-                            src_transform=src.transform,
-                            src_crs=src.crs,
-                            dst_transform=dst.transform,
-                            dst_crs=dst.crs,
-                            resampling=resampleAlg,
-                            dst_nodata=nodata,
-                        )
-                    arr_dst = dst.read(indexes)
+            crs=dst_crs,
+            transform=dst_tf,
+        ) as dst:
+            if indexes == 1:
+                indexes = [1]
+            for i in tqdm(indexes, desc="matching raster"):
+                reproject(
+                    source=rasterio.band(src, i),
+                    destination=rasterio.band(dst, i),
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=dst.transform,
+                    dst_crs=dst.crs,
+                    resampling=algorithm,
+                    dst_nodata=nodata,
+                )
+            arr_dst = dst.read(indexes)
     return arr_dst
 
 
@@ -495,23 +542,30 @@ class GeoDataFormatConverter:
 
         >>> gfc.load_binary(binary_file)
         >>> print(gfc.arr.shape)
+
     """
 
     def __init__(self) -> None:
+        """Initialize the GeoDataFormatConverter class."""
         self.arr: np.ndarray = None
-        self.profile: dict = None
+        self.profile: RasterioProfile = None
 
     @property
-    def _profile_str(self):
+    def _profile_str(self) -> str:
         return pprint.pformat(self.profile, sort_dicts=False)
 
     def __str__(self) -> str:
+        """Return the string representation of the class."""
         return f"DataConverter: \n{self._profile_str}"
 
     def __repr__(self) -> str:
+        """Return the string representation of the class."""
         return str(self)
 
-    def _load_raster(self, raster_file: str | Path):
+    def _load_raster(
+        self,
+        raster_file: PathLike,
+    ) -> tuple[np.ndarray, RasterioProfile]:
         """Load a raster file into the data array."""
         with rasterio.open(raster_file) as ds:
             arr = ds.read()
@@ -520,10 +574,10 @@ class GeoDataFormatConverter:
 
     def load_binary(
         self,
-        binary_file: str | Path,
+        binary_file: PathLike,
         order: Literal["BSQ", "BIP", "BIL"] = "BSQ",
-        dtype="auto",
-    ):
+        dtype: str | np.dtype = "auto",
+    ) -> None:
         """Load a binary file into the data array.
 
         Parameters
@@ -537,12 +591,17 @@ class GeoDataFormatConverter:
             Default is 'BSQ'.
             More details can be found at:
             https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
+        dtype : str or numpy.dtype
+            The dtype of the array. If 'auto', the minimum dtype will be used.
+            Default is 'auto'.
+
         """
         binary_profile_file = str(binary_file) + ".profile"
         if not Path(binary_profile_file).exists():
-            raise FileNotFoundError(f"{binary_profile_file} not found")
+            msg = f"{binary_profile_file} not found"
+            raise FileNotFoundError(msg)
 
-        with open(binary_profile_file, "r") as f:
+        with Path(binary_profile_file).open() as f:
             profile = eval(f.read())
 
         # todo: auto detect dtype by shape
@@ -554,16 +613,19 @@ class GeoDataFormatConverter:
             arr = arr.reshape(profile["count"], profile["height"], profile["width"])
         elif order == "BIP":
             arr = arr.reshape(
-                profile["height"], profile["width"], profile["count"]
+                profile["height"],
+                profile["width"],
+                profile["count"],
             ).transpose(2, 0, 1)
         elif order == "BIL":
             arr = arr.reshape(
-                profile["height"], profile["count"], profile["width"]
+                profile["height"],
+                profile["count"],
+                profile["width"],
             ).transpose(1, 0, 2)
         else:
-            raise ValueError(
-                "order should be one of ['BSQ', 'BIP', 'BIL']," f" but got {order}"
-            )
+            msg = f"order should be one of ['BSQ', 'BIP', 'BIL'], but got {order}"
+            raise ValueError(msg)
 
         if "dtype" not in profile:
             profile["dtype"] = dtypes.get_minimum_dtype(arr)
@@ -571,7 +633,7 @@ class GeoDataFormatConverter:
         self.arr = arr
         self.profile = profile
 
-    def load_raster(self, raster_file: str | Path):
+    def load_raster(self, raster_file: PathLike) -> None:
         """Load a raster file into the data array.
 
         Parameters
@@ -579,12 +641,15 @@ class GeoDataFormatConverter:
         raster_file : str or Path
             The raster file to be loaded. raster format should be supported by gdal.
             More details can be found at: https://gdal.org/drivers/raster/index.html
+
         """
         self.arr, self.profile = self._load_raster(raster_file)
 
     def to_binary(
-        self, out_file: str | Path, order: Literal["BSQ", "BIP", "BIL"] = "BSQ"
-    ):
+        self,
+        out_file: PathLike,
+        order: Literal["BSQ", "BIP", "BIL"] = "BSQ",
+    ) -> None:
         """Write the data array into a binary file.
 
         Parameters
@@ -598,6 +663,7 @@ class GeoDataFormatConverter:
             Default is 'BSQ'.
             More details can be found at:
             https://desktop.arcgis.com/en/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
+
         """
         if order == "BSQ":
             arr = self.arr
@@ -611,10 +677,10 @@ class GeoDataFormatConverter:
 
         # write profile into a file with the same name
         out_profile_file = str(out_file) + ".profile"
-        with open(out_profile_file, "w") as f:
+        with Path(out_profile_file).open("w") as f:
             f.write(self._profile_str)
 
-    def to_raster(self, out_file: str | Path, driver="GTiff"):
+    def to_raster(self, out_file: PathLike, driver: str = "GTiff") -> None:
         """Write the data array into a raster file.
 
         Parameters
@@ -624,13 +690,14 @@ class GeoDataFormatConverter:
         driver : str
             The driver to be used to write the raster file.
             More details can be found at: https://gdal.org/drivers/raster/index.html
+
         """
         self.profile.update({"driver": driver})
         with rasterio.open(out_file, "w", **self.profile) as ds:
             bands = range(1, self.profile["count"] + 1)
             ds.write(self.arr, bands)
 
-    def add_band(self, arr: np.ndarray):
+    def add_band(self, arr: np.ndarray) -> None:
         """Add a band to the data array.
 
         Parameters
@@ -638,12 +705,14 @@ class GeoDataFormatConverter:
         arr : 2D or 3D numpy.ndarray
             The array to be added. The shape of the array should be (height, width)
             or (band, height, width).
+
         """
         if not isinstance(arr, np.ndarray):
             try:
                 arr = np.array(arr)
-            except:
-                raise TypeError("arr can not be converted to numpy array")
+            except Exception as e:
+                msg = "arr can not be converted to numpy array"
+                raise TypeError(msg) from e
 
         if len(arr.shape) == 2:
             arr = np.concatenate((self.arr, arr[None, :, :]), axis=0)
@@ -652,7 +721,7 @@ class GeoDataFormatConverter:
 
         self.update_arr(arr)
 
-    def add_band_from_raster(self, raster_file: str | Path):
+    def add_band_from_raster(self, raster_file: PathLike) -> None:
         """Add band to the data array from a raster file.
 
         Parameters
@@ -660,11 +729,12 @@ class GeoDataFormatConverter:
         raster_file : str or Path
             The raster file to be added. raster format should be supported by gdal.
             More details can be found at: https://gdal.org/drivers/raster/index.html
+
         """
         arr, profile = self._load_raster(raster_file)
         self.add_band(arr)
 
-    def add_band_from_binary(self, binary_file: str | Path):
+    def add_band_from_binary(self, binary_file: PathLike) -> None:
         """Add band to the data array from a binary file.
 
         Parameters
@@ -672,6 +742,7 @@ class GeoDataFormatConverter:
         binary_file : str or Path
             The binary file to be added. the binary file should be with a profile
             file with the same name.
+
         """
         arr, profile = self._load_binary(binary_file)
         self.add_band(arr)
@@ -680,10 +751,10 @@ class GeoDataFormatConverter:
         self,
         arr: np.ndarray,
         dtype: str = "auto",
-        f: Any | Literal["auto"] = "auto",
+        nodata: float | Literal["auto"] = "auto",
         error_if_nodata_invalid: bool = True,
-    ):
-        """update the data array.
+    ) -> None:
+        """Update the data array.
 
         Parameters
         ----------
@@ -692,16 +763,18 @@ class GeoDataFormatConverter:
         dtype : str or numpy.dtype
             The dtype of the array. If 'auto', the minimum dtype will be used.
             Default is 'auto'.
-        nodata : Any | Literal["auto"] = "auto"
+        nodata : float | Literal["auto"] = "auto"
             The nodata value of the array. If 'auto', the nodata value will be
             set to the nodata value of the profile if valid, otherwise None.
             Default is 'auto'.
         error_if_nodata_invalid : bool
             Whether to raise error if nodata is out of dtype range. Default is True.
+
         """
         self.arr = arr
         if not hasattr(self, "profile"):
-            raise AttributeError("profile is not set yet")
+            msg = "profile is not set yet"
+            raise AttributeError(msg)
 
         # update profile info
         self.profile["count"] = arr.shape[0]
@@ -712,7 +785,8 @@ class GeoDataFormatConverter:
             self.profile["dtype"] = dtypes.get_minimum_dtype(arr)
         else:
             if not dtypes.check_dtype(dtype):
-                raise ValueError(f"dtype {dtype} is not supported")
+                msg = f"dtype {dtype} is not supported"
+                raise ValueError(msg)
             self.profile["dtype"] = dtype
 
         if nodata == "auto":
@@ -725,58 +799,91 @@ class GeoDataFormatConverter:
             dtype_ranges = dtypes.dtype_ranges[self.profile["dtype"]]
             if dtypes.in_dtype_range(nodata, self.profile["dtype"]):
                 self.profile["nodata"] = nodata
+            elif error_if_nodata_invalid:
+                msg = f"nodata {nodata} is out of dtype range {dtype_ranges}"
+                raise ValueError(
+                    msg,
+                )
             else:
-                if error_if_nodata_invalid:
-                    raise ValueError(
-                        f"nodata {nodata} is out of dtype range {dtype_ranges}"
-                    )
-                else:
-                    logger.warning(
-                        "nodata is out of dtype range, " "nodata will be set to None"
-                    )
-                    self.profile["nodata"] = None
+                logger.warning(
+                    "nodata is out of dtype range, nodata will be set to None",
+                )
+                self.profile["nodata"] = None
 
 
+DEFAULT_KEYS_Profile = [
+    "height",
+    "width",
+    "transform",
+    "crs",
+    "nodata",
+    "count",
+    "driver",
+    "dtype",
+]
+
+
+@dataclass
 class Profile:
-    """a class to manage the profile of a raster file. The profile is the metadata
-    of the raster file and can be recognized by rasterio package"""
+    """A class to manage the profile of a raster image.
 
-    def __init__(self, profile: dict = None) -> None:
-        self.profile = profile
+    .. note::
+        the :attr:`height`, :attr:`width`, :attr:`transform` and :attr:`crs`
+        are the basic parameters for a warp process.
+    """
+
+    #: The height (number of rows) of the raster image.
+    height: float
+
+    #: The width (number of columns) of the raster image.
+    width: float
+
+    #: The transform of the raster image. The transform is a instance of
+    #: :class:`rasterio.Affine` representing an affine transformation matrix.
+    #:
+    #: .. note::
+    #:      The Raster Space of transform is in "PixelIsPoint" Raster Space, which
+    #:      means the pixel location is at the upper-left corner of pixels.
+    #:      More details can be found at: `Raster Space <https://web.archive.org/web/20160326194152/http://remotesensing.org/geotiff/spec/geotiff2.5.html#2.5.2>`_
+    transform: Affine
+
+    #: The coordinate reference system of the raster image. If not set, it will be None.
+    crs: CrsLike | None = None
+
+    #: The nodata value of the raster image. If not set, it will be None.
+    nodata: float | None = None
+
+    #: The count of bands of the raster image. Default is 1.
+    count: int = 1
+
+    #: The driver of the raster image. Default is "GTiff".
+    driver: str = "GTiff"
+
+    #: The dtype of the raster image. Default is None.
+    dtype: str | np.dtype | None = None
+
+    #: Other keyword arguments for :class:`rasterio.profiles.Profile` class.
+    kwargs: dict | None = field(repr=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Post initialization."""
         self._bounds = self._parse_bounds()
+        self._res = (self.transform.a, self.transform.e)
+        if self.crs is not None:
+            self.crs = CRS.from_user_input(self.crs)
+        for key in self.kwargs:
+            setattr(self, key, self.kwargs[key])
 
-    def __str__(self) -> str:
-        return pprint.pformat(self.profile, sort_dicts=False)
+    def __getitem__(self, key: str) -> Any:
+        """Get the value of the key."""
+        return getattr(self, key)
 
-    def __repr__(self) -> str:
-        return str(self)
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Set the value of the key."""
+        setattr(self, key, value)
 
-    def __getitem__(self, key):
-        return self.profile[key]
-
-    def __setitem__(self, key, value):
-        self.profile[key] = value
-
-    def __contains__(self, key):
-        return key in self.profile
-
-    def __iter__(self):
-        return iter(self.profile)
-
-    def __len__(self):
-        return len(self.profile)
-
-    def __delitem__(self, key):
-        del self.profile[key]
-
-    def __eq__(self, other):
-        return self.profile == other.profile
-
-    def __ne__(self, other):
-        return self.profile != other.profile
-
-    def _parse_bounds(self) -> Tuple[float, float, float, float]:
-        """parse the bounds from profile data"""
+    def _parse_bounds(self) -> tuple[float, float, float, float]:
+        """Parse the bounds from profile data."""
         tf = self.transform
         width = self.width
         height = self.height
@@ -786,69 +893,44 @@ class Profile:
         bottom = top + height * tf.e
         return left, bottom, right, top
 
-    def keys(self) -> List[str]:
-        return self.profile.keys()
-
-    def values(self) -> List[Any]:
-        return self.profile.values()
-
-    def items(self) -> List[Tuple[str, Any]]:
-        return self.profile.items()
-
-    def get(self, key, default=None) -> Any:
-        return self.profile.get(key, default)
-
-    def update(self, other: dict) -> None:
-        self.profile.update(other)
+    @staticmethod
+    def _split_profile(profile: dict) -> tuple[dict, dict]:
+        """Split the profile into default keys and other keys."""
+        kwargs = {}
+        profile_new = {}
+        for key, value in profile.items():
+            if key not in DEFAULT_KEYS_Profile:
+                kwargs[key] = value
+            else:
+                profile_new[key] = value
+        return profile_new, kwargs
 
     @property
-    def height(self) -> int:
-        """the height (number of rows) of the raster file."""
-        return self.profile["height"]
-
-    @property
-    def width(self) -> int:
-        """the width (number of columns) of the raster file."""
-        return self.profile["width"]
-
-    @property
-    def transform(self) -> Affine:
-        """the transform of the raster file. It is an instance of
-        :class:`rasterio.transform.Affine`."""
-        return self.profile["transform"]
-
-    @property
-    def res(self) -> Tuple[float, float]:
-        """the resolution in x and y direction."""
-        return (self.transform.a, self.transform.e)
-
-    @property
-    def bounds(self) -> Tuple[float, float, float, float]:
-        """the bounds in [west, south, east, north] order."""
+    def bounds(self) -> tuple[float, float, float, float]:
+        """The bounds in [west, south, east, north] order."""
         return self._bounds
 
     @property
-    def crs(self) -> Any:
-        """the coordinate reference system. If not set, it will be None."""
-        return self.profile.get("crs", None)
-
-    @property
-    def nodata(self) -> Any:
-        """the nodata value. If not set, it will be None."""
-        return self.profile.get("nodata", None)
+    def res(self) -> tuple[float, float]:
+        """The resolution in x and y direction."""
+        return self._res
 
     @classmethod
-    def from_raster_file(cls, raster_file: str | Path) -> "Profile":
+    def from_raster_file(cls, raster_file: PathLike) -> Profile:
         """Create a Profile object from a raster file."""
         with rasterio.open(raster_file) as ds:
-            profile = ds.profile.copy()
-        return cls(profile)
+            profile = dict(ds.profile.copy())
+        # split the profile into default keys and other keys
+        profile, kwargs = cls._split_profile(profile)
+
+        return cls(**profile, kwargs=kwargs)
 
     @classmethod
-    def from_ascii_header_file(cls, ascii_file: str | Path) -> "Profile":
-        """Create a Profile object from an ascii header file. The ascii header
-        file is the metadata of a binary. More information can be found at:
-        https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm
+    def from_ascii_header_file(cls, ascii_file: PathLike) -> Profile:
+        """Create a Profile object from an ascii header file.
+
+        The ascii header file is the metadata of a binary. More information can
+        be found at: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm.
 
         Example of an ascii header file
         -------------------------------
@@ -859,53 +941,76 @@ class Profile:
             xllcorner     -180.000000
             yllcorner     -60.000000
             cellsize      0.008333
-            NODATA_value  -9999
+            nodata_value  -9999
         """
-        df = pd.read_csv(ascii_file, sep="\s+", header=None, index_col=0)
-        df.index = df.index.str.lower()
+        dict_common = load_meta_values(
+            ascii_file,
+            keys=["ncols", "nrows", "cellsize", "nodata_value"],
+            line_end=10,
+        )
+        if (
+            dict_common["ncols"] is None
+            or dict_common["nrows"] is None
+            or dict_common["cellsize"] is None
+        ):
+            msg = "ncols, nrows and cellsize must be set in the ascii file"
+            raise ValueError(msg)
+        # convert to rasterio profile format
+        width, height = int(dict_common["ncols"]), int(dict_common["nrows"])
+        cell_size = float(dict_common["cellsize"])
+        nodata = (
+            eval(dict_common["nodata_value"]) if dict_common["nodata_value"] else None
+        )
 
-        width = int(df.loc["ncols", 1])
-        height = int(df.loc["nrows", 1])
-        cell_size = float(df.loc["cellsize", 1])
-        try:
-            left = float(df.loc["xllcorner", 1])
-            bottom = float(df.loc["yllcorner", 1])
-        except:
-            left = float(df.loc["xllcenter", 1]) - cell_size / 2
-            bottom = float(df.loc["yllcenter", 1]) - cell_size / 2
+        # get the coordinates of left and bottom corner
+        dict_corner = load_meta_values(
+            ascii_file,
+            keys=["xllcorner", "yllcorner"],
+            line_end=10,
+        )
+        if (
+            dict_corner["xllcorner"] is not None
+            and dict_corner["yllcorner"] is not None
+        ):
+            left = float(dict_corner["xllcorner"])
+            bottom = float(dict_corner["yllcorner"])
+        else:
+            dict_center = load_meta_values(
+                ascii_file,
+                keys=["xllcenter", "yllcenter"],
+                line_end=10,
+            )
+            if dict_center["xllcenter"] is None or dict_center["yllcenter"] is None:
+                msg = (
+                    "xllcenter and yllcenter or xllcorner and yllcorner"
+                    "must be set in the ascii file"
+                )
+                raise ValueError(msg)
+
+            left = float(dict_center["xllcenter"]) - cell_size / 2
+            bottom = float(dict_center["yllcenter"]) - cell_size / 2
 
         # pixel left lower corner to pixel left upper corner (rasterio transform)
         top = bottom + (height + 1) * cell_size
-
+        # get affine transform
         tf = transform.from_origin(left, top, cell_size, cell_size)
 
-        nodata = None
-        if "nodata_value" in df.index:
-            nodata = float(df.loc["nodata_value", 1])
-
-        profile = {
-            "width": width,
-            "height": height,
-            "transform": tf,
-            "count": 1,
-            "nodata": nodata,
-        }
-
-        return cls(profile)
+        return cls(width=width, height=height, transform=tf, nodata=nodata)
 
     @classmethod
-    def from_profile_file(cls, profile_file: str | Path) -> "Profile":
+    def from_profile_file(cls, profile_file: PathLike) -> Profile:
         """Create a Profile object from a profile file."""
-        with open(profile_file, "r") as f:
+        with Path(profile_file).open() as f:
             profile = eval(f.read())
-        return cls(profile)
+        profile, kwargs = cls._split_profile(profile)
+        return cls(**profile, kwargs=kwargs)
 
     @classmethod
     def from_bounds_res(
         cls,
-        bounds: Tuple[float, float, float, float],
-        res: float | Tuple[float, float],
-    ) -> "Profile":
+        bounds: tuple[float, float, float, float],
+        res: float | tuple[float, float],
+    ) -> Profile:
         """Create a Profile object from bounds and resolution.
 
         Parameters
@@ -920,6 +1025,7 @@ class Profile:
         -------
         Profile : Profile
             A Profile object only with width, height and transform.
+
         """
         if isinstance(res, (int, float, np.integer, np.floating)):
             res = (float(res), float(res))
@@ -929,21 +1035,56 @@ class Profile:
         tf = Affine.translation(dst_w, dst_n) * Affine.scale(res[0], -res[1])
 
         profile = {"width": width, "height": height, "transform": tf}
-        return cls(profile)
+        return cls(**profile)
 
-    def to_file(self, file: str | Path):
-        """Write the profile into a file."""
-        file = Path(file)
-        if file.suffix != ".profile":
-            file = file.parent / (file.name + ".profile")
-        with open(file, "w") as f:
-            f.write(str(self))
+    def copy(self) -> Profile:
+        """Return a copy of the Profile object."""
+        profile, kwargs = self._split_profile(self.to_dict())
+        return Profile(**profile, kwargs=kwargs)
 
-    def to_latlon(self) -> Tuple[np.ndarray, np.ndarray]:
-        """get the latitude and longitude from profile data"""
-        tf = self.profile["transform"]
-        width = self.profile["width"]
-        height = self.profile["height"]
+    def to_dict(self) -> dict:
+        """Convert the Profile object to a python :class:`dict`."""
+        profile = {key: getattr(self, key) for key in DEFAULT_KEYS_Profile}
+        profile.update(self.kwargs)
+        return profile
+
+    def to_file(self, out_file: PathLike) -> None:
+        """Write the profile into a file.
+
+        .. tip::
+            - The profile will be written into a file with the same name and
+            suffix ".profile".
+            - You can load the profile by :meth:`Profile.from_profile_file`.
+
+        Parameters
+        ----------
+        out_file : str or Path
+            The file to be written. The profile will be written into a file with
+            the same name and suffix ".profile".
+
+        """
+        out_file = Path(out_file)
+        if out_file.suffix != ".profile":
+            out_file = out_file.parent / (out_file.name + ".profile")
+        with out_file.open("w") as f:
+            f.write(str(self.to_dict()))
+
+    def to_rasterio_profile(self) -> RasterioProfile:
+        """Convert the Profile object to a rasterio profile."""
+        return RasterioProfile(data=self.to_dict())
+
+    def to_latlon(self) -> tuple[np.ndarray, np.ndarray]:
+        """Get the latitude and longitude from profile data.
+
+        .. note::
+            The pixel location for the latitude and longitude is the
+            "PixelIsArea" Raster Space, which means the pixel location
+            is the center of the pixel. See `Raster Space <https://web.archive.org/web/20160326194152/http://remotesensing.org/geotiff/spec/geotiff2.5.html#2.5.2>`_
+            for more details.
+        """
+        tf = self.transform
+        width = self.width
+        height = self.height
         lon = tf.xoff + tf.a * np.arange(width) + tf.a * 0.5
         lat = tf.yoff + tf.e * np.arange(height) + tf.e * 0.5
         return lat, lon

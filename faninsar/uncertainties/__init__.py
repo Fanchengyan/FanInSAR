@@ -10,6 +10,11 @@ from .uncertainty import (
 )
 
 warnings.warn(
-    "The module 'uncertainties' is still under development and may change in the future.",
+    "The module 'uncertainties' is still under development and may change"
+    " in the future.",
     DeprecationWarning,
+    stacklevel=2,
+    category=UserWarning,
+    source=None,
+    module="faninsar.uncertainties",
 )

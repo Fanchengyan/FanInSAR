@@ -14,3 +14,4 @@ API Reference
    samplers/index
    NSBAS/index
    insar_class/index
+   constants/sar

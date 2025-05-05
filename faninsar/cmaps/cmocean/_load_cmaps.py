@@ -27,24 +27,18 @@ names = [
     "topo",
     "turbid",
 ]
-__all__ = names.copy()
+_all = names.copy()
 
 
 cwd = Path(__file__).parent.absolute()
 
 for name in names:
-    file = cwd / name / f"{name}.txt"
-    cm_data = np.loadtxt(file)
+    cmap_file = cwd / name / f"{name}.txt"
+    cm_data = np.loadtxt(cmap_file)
 
-    __all__.append(f"{name}_r")
+    _all.append(f"{name}_r")
 
     vars()[name] = LinearSegmentedColormap.from_list(name, cm_data)
     vars()[f"{name}_r"] = LinearSegmentedColormap.from_list(f"{name}_r", cm_data[::-1])
 
-del name
-del file
-del cm_data
-del cwd
-del Path
-del LinearSegmentedColormap
-del np
+__all__ = tuple(_all)

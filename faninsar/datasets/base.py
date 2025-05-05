@@ -1,29 +1,29 @@
-"""Base classes for all :mod:`faninsar` datasets. The base class RasterDataset in this script is modified from the torchgeo package."""
+"""Base classes for all :mod:`faninsar` datasets.
+
+The base class RasterDataset in this script is modified from the torchgeo package.
+"""
 
 from __future__ import annotations
 
 import abc
+import contextlib
 import functools
 import re
 import warnings
-from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Literal, Sequence, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, overload
 
 import numpy as np
 import pandas as pd
 import pyproj
 import rasterio
-import rasterio.merge
-import rioxarray
 import shapely
 import xarray as xr
-from rasterio import features, fill
+from rasterio import features, fill, plot
 from rasterio import mask as rio_mask
 from rasterio.crs import CRS
 from rasterio.dtypes import dtype_ranges, get_minimum_dtype
 from rasterio.enums import Resampling
-from rasterio.io import DatasetReader
 from rasterio.transform import rowcol as tf_rowcol
 from rasterio.transform import xy as tf_xy
 from rasterio.vrt import WarpedVRT
@@ -32,23 +32,24 @@ from rasterio.warp import transform as warp_transform
 from rtree.index import Index, Property
 from shapely import ops
 from tqdm import tqdm
+from typing_extensions import Self
 
-from .._core import geo_tools
-from .._core.geo_tools import (
-    Profile,
-    array2kml,
-    array2kmz,
-    geoinfo_from_latlon,
-    save_colorbar,
-)
-from .._core.logger import setup_logger
-from .._core.pair_tools import Pairs
-from ..query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
+from faninsar._core import geo_tools
+from faninsar._core.geo_tools import Profile, array2kml, array2kmz, geoinfo_from_latlon
+from faninsar._core.sar.pairs import Pairs
+from faninsar.logging import setup_logger
+from faninsar.query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
 
-__all__ = ("GeoDataset", "RasterDataset", "PairDataset", "ApsDataset")
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from rasterio.io import DatasetReader
+
+__all__ = ("ApsDataset", "GeoDataset", "PairDataset", "RasterDataset")
 
 logger = setup_logger(
-    log_name="FanInSAR.datasets.base", log_format="%(levelname)s - %(message)s"
+    log_name="FanInSAR.datasets.base",
+    log_format="%(levelname)s - %(message)s",
 )
 
 lat_names = ["latitude", "lat", "y"]
@@ -56,10 +57,11 @@ lon_names = ["longitude", "lon", "x", "long", "lng"]
 
 
 class GeoDataset(abc.ABC):
-    """Abstract base class for all :mod:`faninsar` datasets. This class is used
-    to represent a geospatial dataset and provides methods to index the dataset
-    and retrieve information about the dataset, such as CRS, resolution, data type,
-    no data value, and a bounds.
+    """Abstract base class for all :mod:`faninsar` datasets.
+
+    This class is used to represent a geospatial dataset and provides methods to
+    index the dataset and retrieve information about the dataset, such as CRS,
+    resolution, data type, no data value, and a bounds.
     """
 
     # following attributes should be set by the subclass
@@ -71,23 +73,28 @@ class GeoDataset(abc.ABC):
     _nodata: Any = None
     _valid: np.ndarray
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize a new GeoDataset instance."""
         self.index = Index(interleaved=True, properties=Property(dimension=2))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return a string representation of the dataset."""
         return f"""\
 {self.__class__.__name__} Dataset
     bbox: {self.bounds}
     file count: {len(self)}"""
 
-    def __str__(self):
+    def __str__(self) -> str:
+        """Return a string representation of the dataset."""
         return self.__repr__()
 
     def __len__(self) -> int:
         """Return the number of files in the dataset.
 
-        Returns:
+        Returns
+        -------
             length of the dataset
+
         """
         return len(self.index)
 
@@ -96,8 +103,10 @@ class GeoDataset(abc.ABC):
     ) -> tuple[dict[str, Any], list[tuple[Any, Any, Any]]]:
         """Define how instances are pickled.
 
-        Returns:
+        Returns
+        -------
             the state necessary to unpickle the instance
+
         """
         objects = self.index.intersection(self.index.bounds, objects=True)
         tuples = [(item.id, item.bounds, item.object) for item in objects]
@@ -113,7 +122,9 @@ class GeoDataset(abc.ABC):
         """Define how to unpickle an instance.
 
         Args:
+        ----
             state: the state of the instance when it was pickled
+
         """
         attrs, tuples = state
         self.__dict__.update(attrs)
@@ -121,37 +132,37 @@ class GeoDataset(abc.ABC):
             self.index.insert(*item)
 
     @overload
-    def _ensure_query_crs(self, query: BoundingBox) -> BoundingBox:
-        ...
+    def _ensure_query_crs(self, query: BoundingBox) -> BoundingBox: ...
 
     @overload
-    def _ensure_query_crs(self, query: Points) -> Points:
-        ...
+    def _ensure_query_crs(self, query: Points) -> Points: ...
 
     @overload
-    def _ensure_query_crs(self, query: Polygons) -> Polygons:
-        ...
+    def _ensure_query_crs(self, query: Polygons) -> Polygons: ...
 
     def _ensure_query_crs(
-        self, query: Points | BoundingBox | Polygons
+        self,
+        query: Points | BoundingBox | Polygons,
     ) -> Points | BoundingBox | Polygons:
         """Ensure that the query has the same CRS as the dataset."""
         if query.crs is None:
             warnings.warn(
                 f"No CRS is specified for the {query}, assuming they are in the"
-                f" same CRS as the dataset ({self.crs})."
+                f" same CRS as the dataset ({self.crs}).",
+                stacklevel=2,
             )
-        else:
-            if query.crs != self.crs:
-                query = query.to_crs(self.crs)
+        elif query.crs != self.crs:
+            query = query.to_crs(self.crs)
         return query
 
     @property
     def crs(self) -> CRS | None:
-        """coordinate reference system (:term:`CRS`) of the dataset.
+        """Coordinate reference system (:term:`CRS`) of the dataset.
 
-        Returns:
+        Returns
+        -------
             The coordinate reference system (:term:`CRS`).
+
         """
         return self._crs
 
@@ -167,6 +178,7 @@ class GeoDataset(abc.ABC):
             New coordinate reference system :term:`(CRS)`. It can be a CRS object
             or a string, which will be parsed to a CRS object. The string can be
             in any format supported by :meth:`pyproj.crs.CRS.from_user_input`.
+
         """
         if not isinstance(new_crs, CRS):
             new_crs = CRS.from_user_input(new_crs)
@@ -188,15 +200,19 @@ class GeoDataset(abc.ABC):
             )
             new_res = (abs(float(tf.a)), abs(float(tf.e)))
             if new_res[0] != self.res[0] or new_res[1] != self.res[1]:
-                logger.warning(
-                    f"the resolution of the dataset has been changed from {self.res} to {new_res}."
+                msg = (
+                    "the resolution of the dataset has been changed "
+                    f"from {self.res} to {new_res}."
                 )
+                logger.warning(msg)
                 self.res = new_res
 
             # reproject the index
             new_index = Index(interleaved=True, properties=Property(dimension=2))
             project = pyproj.Transformer.from_crs(
-                pyproj.CRS(str(self.crs)), pyproj.CRS(str(new_crs)), always_xy=True
+                pyproj.CRS(str(self.crs)),
+                pyproj.CRS(str(new_crs)),
+                always_xy=True,
             ).transform
             for hit in self.index.intersection(self.index.bounds, objects=True):
                 old_xmin, old_xmax, old_ymin, old_ymax = hit.bounds
@@ -211,9 +227,7 @@ class GeoDataset(abc.ABC):
 
     @property
     def same_crs(self) -> bool:
-        """True if all files in the dataset have the same CRS with the
-        desired CRS, False otherwise.
-        """
+        """Whether all files in the dataset have the same CRS with the desired CRS."""
         return self._same_crs
 
     @property
@@ -224,6 +238,7 @@ class GeoDataset(abc.ABC):
         -------
         res: tuple of floats
             resolution of the dataset in x and y directions.
+
         """
         return self._res
 
@@ -236,18 +251,21 @@ class GeoDataset(abc.ABC):
         new_res : float or tuple of floats (x_res, y_res)
             resolution of the dataset . If a float is given, the same resolution
             will be used in both x and y directions.
+
         """
         if isinstance(new_res, (int, float, np.integer, np.floating)):
             new_res = (float(new_res), float(new_res))
         if len(new_res) != 2:
+            msg = f"Resolution must be a float or a tuple of length 2, got {new_res}"
             raise ValueError(
-                f"Resolution must be a float or a tuple of length 2, got {new_res}"
+                msg,
             )
         if not all(isinstance(i, float) for i in new_res):
             try:
                 new_res = tuple(float(i) for i in new_res)
-            except ValueError:
-                raise ValueError("Resolution must be a float or a tuple of floats")
+            except TypeError as e:
+                msg = "Resolution must be a float or a tuple of floats"
+                raise TypeError(msg) from e
         self._res = new_res
 
     @property
@@ -259,14 +277,14 @@ class GeoDataset(abc.ABC):
         roi: BoundingBox object
             region of interest of the dataset. If None, the bounds of
             entire dataset will be used.
+
         """
         if self._roi:
             return self._roi
-        else:
-            return self.bounds
+        return self.bounds
 
     @roi.setter
-    def roi(self, new_roi: BoundingBox):
+    def roi(self, new_roi: BoundingBox) -> None:
         """Set the region of interest of the dataset.
 
         Parameters
@@ -276,6 +294,7 @@ class GeoDataset(abc.ABC):
             crs of the new_roi is different from the crs of the dataset, the new_roi
             will be reprojected to the crs of the dataset. If None, the crs of the
             dataset will be used.
+
         """
         new_roi = self._check_roi(new_roi)
 
@@ -297,20 +316,21 @@ class GeoDataset(abc.ABC):
         roi: BoundingBox object
             region of interest of the dataset. If None, the bounds of
             entire dataset will be used.
+
         """
         if roi is None:
             return self.roi
-        else:
-            if not isinstance(roi, BoundingBox):
-                raise TypeError(
-                    f"roi must be a BoundingBox object, got {type(roi)} instead."
-                )
-            if roi.crs != self.crs:
-                if roi.crs is None:
-                    roi = BoundingBox(*roi, crs=self.crs)
-                else:
-                    roi = roi.to_crs(self.crs)
-            return roi
+        if not isinstance(roi, BoundingBox):
+            msg = f"roi must be a BoundingBox object, got {type(roi)} instead."
+            raise TypeError(
+                msg,
+            )
+        if roi.crs != self.crs:
+            if roi.crs is None:
+                roi = BoundingBox(*roi, crs=self.crs)
+            else:
+                roi = roi.to_crs(self.crs)
+        return roi
 
     @property
     def dtype(self) -> np.dtype | None:
@@ -320,6 +340,7 @@ class GeoDataset(abc.ABC):
         -------
         dtype: numpy.dtype object or None
             data type of the dataset
+
         """
         return self._dtype
 
@@ -331,28 +352,31 @@ class GeoDataset(abc.ABC):
         ----------
         new_dtype : numpy.dtype
             data type of the dataset
+
         """
         self._dtype = new_dtype
 
     @property
-    def nodata(self) -> float | int | Any | None:
+    def nodata(self) -> float | None:
         """No data value of the dataset.
 
         Returns
         -------
         nodata: float or int
             no data value of the dataset
+
         """
         return self._nodata
 
     @nodata.setter
-    def nodata(self, new_nodata: float | int | Any) -> None:
+    def nodata(self, new_nodata: float) -> None:
         """Set the no data value of the dataset.
 
         Parameters
         ----------
         new_nodata : float or int
             no data value of the dataset
+
         """
         self._nodata = new_nodata
 
@@ -365,23 +389,40 @@ class GeoDataset(abc.ABC):
         valid: numpy.ndarray
             boolean array indicating which files are valid. True means the file
             is valid and can be read by rasterio, False means the file is invalid.
+
         """
         return self._valid
 
     @property
     def bounds(self) -> BoundingBox:
-        """Bounds of the overall dataset. It is the union of all the files in the
-        dataset.
+        """Bounds of the overall dataset.
+
+        It is the union of all the files in the dataset.
 
         Returns
         -------
         bounds: BoundingBox object
             (minx, right, bottom, top) of the dataset
+
         """
         return BoundingBox(*self.index.bounds, crs=self.crs)
 
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Shape of the dataset.
+
+        Returns
+        -------
+        shape: tuple of ints
+            shape of the dataset in (height, width) format
+
+        """
+        profile = self.get_profile("bounds")
+        return profile["height"], profile["width"]
+
     def _ensure_bbox(
-        self, bbox: BoundingBox | Literal["roi", "bounds"] = "roi"
+        self,
+        bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
     ) -> BoundingBox | None:
         """Return the bounds of the dataset for the given bounding box type.
 
@@ -395,39 +436,16 @@ class GeoDataset(abc.ABC):
         -------
         bounds: BoundingBox | None
             bounds of the dataset for the given bounding box type.
+
         """
         if bbox == "bounds":
             return self.bounds
-        elif bbox == "roi":
+        if bbox == "roi":
             return self.roi
-        elif isinstance(bbox, BoundingBox):
+        if isinstance(bbox, BoundingBox):
             return self._check_roi(bbox)
-        else:
-            raise ValueError(
-                "bbox must be one of ['bounds', 'roi'] or a "
-                f"BoundingBox, but got {bbox}"
-            )
-
-    def get_profile(
-        self, bbox: BoundingBox | Literal["roi", "bounds"] = "roi"
-    ) -> Profile | None:
-        """Return the profile information of the dataset for the given bounding
-        box type. The profile information includes the width, height, transform,
-        count, data type, no data value, and CRS of the dataset.
-
-        Parameters
-        ----------
-        bbox : BoundingBox | Literal["roi", "bounds"], optional
-            the bounding box used to calculate the ``width``, ``height``
-            and ``transform`` of the dataset for the profile. Default is
-            'roi'.
-
-        Returns
-        -------
-        profile: Profile object or None
-            profile of the dataset for the given bounding box type.
-        """
-        raise NotImplementedError
+        msg = f"bbox must be one of ['bounds', 'roi'] or a BoundingBox, but got {bbox}"
+        raise ValueError(msg)
 
 
 class RasterDataset(GeoDataset):
@@ -457,10 +475,10 @@ class RasterDataset(GeoDataset):
 
     output the samples shapes:
 
-    >>> print('boxes result shape:', sample.boxes.data.shape)
+    >>> print("boxes result shape:", sample.boxes.data.shape)
     boxes result shape: (2, 7, 68, 80)
 
-    >>> print('points result shape:', sample.points.data.shape)
+    >>> print("points result shape:", sample.points.data.shape)
     points result shape: (7, 3)
 
     of course, you can also use the BoundingBox or Points directly to index the
@@ -483,6 +501,7 @@ class RasterDataset(GeoDataset):
     ),
     'boxes': array([...], dtype=float32),
     'points': None}
+
     """
 
     #: Glob expression used to search for files.
@@ -504,26 +523,26 @@ class RasterDataset(GeoDataset):
     date_format = "%Y%m%d"
 
     #: Names of all available bands in the dataset
-    all_bands: list[str] = []
+    all_bands: ClassVar[list[str]] = []
 
     #: Names of RGB bands in the dataset, used for plotting
-    rgb_bands: list[str] = []
+    rgb_bands: ClassVar[list[str]] = []
 
     #: Color map for the dataset, used for plotting
-    cmap: dict[int, tuple[int, int, int, int]] = {}
+    cmap: ClassVar[dict[int, tuple[int, int, int, int]]] = {}
 
-    def __init__(
+    def __init__(  # noqa: PLR0912, PLR0915
         self,
         root_dir: str = "data",
         paths: Sequence[str] | None = None,
         crs: CRS | None = None,
         res: float | tuple[float, float] | None = None,
         dtype: np.dtype | None = None,
-        nodata: float | int | Any | None = None,
+        nodata: float | None = None,
         roi: BoundingBox | None = None,
         bands: Sequence[str] | None = None,
         cache: bool = True,
-        resampling=Resampling.nearest,
+        resampling: Resampling = Resampling.nearest,
         fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
@@ -577,6 +596,7 @@ class RasterDataset(GeoDataset):
         Raises
         ------
             FileNotFoundError: if no files are found in ``root_dir``
+
         """
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -606,10 +626,8 @@ class RasterDataset(GeoDataset):
                 with rasterio.open(file_path) as src:
                     # See if file has a color map
                     if len(self.cmap) == 0:
-                        try:
+                        with contextlib.suppress(ValueError):
                             self.cmap = src.colormap(1)
-                        except ValueError:
-                            pass
 
                     if crs is None:
                         crs = src.crs
@@ -625,9 +643,9 @@ class RasterDataset(GeoDataset):
 
                     if crs != src.crs:
                         self._same_crs = False
-            except Exception as e:
+            except Exception as e:  # noqa: PERF203
                 # Skip files that rasterio is unable to read
-                warnings.warn(f"Unable to read {file_path}: \n--> : {e}", UserWarning)
+                warnings.warn(f"Unable to read {file_path}: \n--> : {e}", stacklevel=2)
                 files_valid.append(False)
                 continue
             else:
@@ -636,7 +654,10 @@ class RasterDataset(GeoDataset):
                 count += 1
 
         if count == 0:
-            msg = f"No {self.__class__.__name__} data was found in `root_dir='{self.root_dir}'`"
+            msg = (
+                f"No {self.__class__.__name__} data was found in "
+                f"`root_dir='{self.root_dir}'`"
+            )
             if self.bands:
                 msg += f" with `bands={self.bands}`"
             raise FileNotFoundError(msg)
@@ -647,11 +668,11 @@ class RasterDataset(GeoDataset):
         if not self._files.valid.all():
             files_invalid = [str(i) for i in self._files.paths[~self._files.valid]]
             files_invalid_str = "\t" + "\n\t".join(files_invalid)
-            warnings.warn(
+            msg = (
                 f"Unable to read {len(files_invalid)} files in "
                 f"{self.__class__.__name__} dataset:\n{files_invalid_str}",
-                UserWarning,
             )
+            warnings.warn(msg, stacklevel=2)
 
         self.band_indexes = None
         if self.bands:
@@ -672,7 +693,8 @@ class RasterDataset(GeoDataset):
         self.roi = roi
 
     def __getitem__(
-        self, query: GeoQuery | Points | BoundingBox | Polygons
+        self,
+        query: GeoQuery | Points | BoundingBox | Polygons,
     ) -> QueryResult:
         """Retrieve images values for given query.
 
@@ -687,6 +709,7 @@ class RasterDataset(GeoDataset):
         -------
         result : QueryResult
             a QueryResult instance containing the results of the various queries.
+
         """
         if isinstance(query, Points):
             query = GeoQuery(points=query)
@@ -696,14 +719,13 @@ class RasterDataset(GeoDataset):
             query = GeoQuery(polygons=query)
 
         paths = self.files[self.files.valid].paths
-        result = self._sample_files(paths, query)
+        return self._sample_files(paths, query)
 
-        return result
+    def _ensure_bands_idx(self, vrt_fh: DatasetReader) -> list[int] | int:
+        """Return the proper band indexes to use for the dataset.
 
-    def _ensure_bands_idx(self, vrt_fh) -> list[int] | int:
-        """Return the proper band indexes to use for the dataset. The band indexes
-        is a list of integers if multiple bands are requested, otherwise it is an
-        integer.
+        The band indexes is a list of integers if multiple bands are requested,
+        otherwise it is an integer.
         """
         bands = self.band_indexes or vrt_fh.indexes
         # If only one band is requested, return a 2D array
@@ -717,15 +739,17 @@ class RasterDataset(GeoDataset):
             data = data.astype(self.dtype)
         return data
 
-    def _points_query(self, points: Points, vrt_fh) -> np.ndarray:
-        """Return the values of dataset at given points. Points that outside the
-        dataset will be masked."""
+    def _points_query(self, points: Points, vrt_fh: DatasetReader) -> np.ndarray:
+        """Return the values of dataset at given points.
+
+        Points that outside the dataset will be masked.
+        """
         points = self._ensure_query_crs(points)
         bands_idx = self._ensure_bands_idx(vrt_fh)
         data = np.ma.hstack(list(vrt_fh.sample(points.values, bands_idx, masked=True)))
         return self._ensure_dtype(data)
 
-    def _bbox_query(self, bbox: BoundingBox, vrt_fh) -> np.ndarray:
+    def _bbox_query(self, bbox: BoundingBox, vrt_fh: DatasetReader) -> np.ndarray:
         """Return the values of the dataset at the given bounding box."""
         bbox = self._ensure_query_crs(bbox)
 
@@ -754,7 +778,7 @@ class RasterDataset(GeoDataset):
             data = fill.fillnodata(data)
         return self._ensure_dtype(data)
 
-    def _polygons_query(self, polygons: Polygons, vrt_fh) -> np.ndarray:
+    def _polygons_query(self, polygons: Polygons, vrt_fh: DatasetReader) -> np.ndarray:
         """Return the values of the dataset at the given polygons."""
         polygons = self._ensure_query_crs(polygons)
         bands_idx = self._ensure_bands_idx(vrt_fh)
@@ -781,7 +805,10 @@ class RasterDataset(GeoDataset):
                 data, out_transform = rio_mask.mask(vrt_fh, [shp], **mask_params)
 
                 rasterize_params.update(
-                    {"out_shape": data.shape[1:3], "transform": out_transform}
+                    {
+                        "out_shape": data.shape if data.ndim == 2 else data.shape[1:3],
+                        "transform": out_transform,
+                    },
                 )
                 mask = features.rasterize([shp], **rasterize_params).astype(bool)
 
@@ -796,7 +823,7 @@ class RasterDataset(GeoDataset):
             data, out_transform = rio_mask.mask(vrt_fh, shapes, **mask_params)
 
             rasterize_params.update(
-                {"out_shape": data.shape[1:3], "transform": out_transform}
+                {"out_shape": data.shape[1:3], "transform": out_transform},
             )
             mask = features.rasterize(shapes, **rasterize_params).astype(bool)
             if self.fill_nodata:
@@ -811,7 +838,9 @@ class RasterDataset(GeoDataset):
     def _ensure_loading_verbose(self, sequence: Sequence) -> Sequence:
         if self.verbose:
             sequence = tqdm(
-                sequence, desc=f"Loading {self.ds_name} Files", unit=" files"
+                sequence,
+                desc=f"Loading {self.ds_name} Files",
+                unit=" files",
             )
         return sequence
 
@@ -825,13 +854,13 @@ class RasterDataset(GeoDataset):
             sequence = tqdm(sequence, desc=f"Saving {ds_name} Files", unit=unit)
         return sequence
 
-    def _safe_close(self, vrt_fhs):
+    def _safe_close(self, vrt_fhs: DatasetReader) -> None:
         """Close the file handles if not caching."""
         if not self.cache:
             for vrt_fh in vrt_fhs:
                 vrt_fh.close()
 
-    def _sample_files(self, paths: Sequence[str], query: GeoQuery) -> QueryResult:
+    def _sample_files(self, paths: Sequence[str], query: GeoQuery) -> QueryResult:  # noqa: PLR0912, PLR0915
         """Sample or retrieve values from the dataset for the given query.
 
         Parameters
@@ -845,6 +874,7 @@ class RasterDataset(GeoDataset):
         -------
         result : QueryResult
             a QueryResult instance containing the results of the various queries.
+
         """
         if self.cache:
             vrt_fhs = [self._cached_load_warp_file(fp) for fp in paths]
@@ -876,15 +906,16 @@ class RasterDataset(GeoDataset):
             # Get the polygons values
             if query.polygons is not None:
                 data_ls, transform_ls, mask_ls = self._polygons_query(
-                    query.polygons, vrt_fh
+                    query.polygons,
+                    vrt_fh,
                 )
                 files_polygons_list.append(data_ls)
 
         # Stack the points values
-        points_values = None
+        points_result = None
         if len(files_points_list) > 0:
             points_values = np.ma.asarray(files_points_list)
-            dims, points_values = parse_1D_dims(points_values)
+            dims, points_values = parse_1d_dims(points_values)
             points_result = {"data": points_values, "dims": dims}
 
         # parse bounding boxes results
@@ -894,7 +925,7 @@ class RasterDataset(GeoDataset):
             n_boxes = len(query.boxes)
             if n_boxes == 1:
                 boxes_values = np.ma.asarray(files_bbox_list)
-                dims = parse_2D_dims(boxes_values)
+                dims = parse_2d_dims(boxes_values)
             else:
                 # stack the files for each box
                 boxes_ls = [[] for _ in range(n_boxes)]
@@ -904,7 +935,7 @@ class RasterDataset(GeoDataset):
                 boxes_values = [np.ma.asarray(arr) for arr in boxes_ls]
                 # get the dims
                 bbox0 = files_bbox_list[0]
-                dims = parse_2D_dims(bbox0, details=False)
+                dims = parse_2d_dims(bbox0, details=False)
                 dims = f"boxes:{n_boxes}, ({dims})"
             bbox_result = {"data": boxes_values, "dims": f"({dims})"}
 
@@ -915,7 +946,7 @@ class RasterDataset(GeoDataset):
             n_polygons = len(query.polygons)
             if n_polygons == 1:
                 polygons_values = np.ma.asarray(files_polygons_list)
-                dims = parse_2D_dims(polygons_values)
+                dims = parse_2d_dims(polygons_values)
             else:
                 # stack the files for each polygon
                 poly_list = [[] for _ in range(n_polygons)]
@@ -925,7 +956,7 @@ class RasterDataset(GeoDataset):
                 polygons_values = [np.ma.asarray(arr) for arr in poly_list]
                 # get the dims
                 polygon0 = polygons_values[0]
-                dims = parse_2D_dims(polygon0, details=False)
+                dims = parse_2d_dims(polygon0, details=False)
 
             polygons_result = {
                 "data": polygons_values,
@@ -934,19 +965,21 @@ class RasterDataset(GeoDataset):
                 "masks": mask_ls,
             }
 
-        result = QueryResult(points_result, bbox_result, polygons_result, query)
+        return QueryResult(points_result, bbox_result, polygons_result, query)
 
-        return result
-
-    @functools.lru_cache(maxsize=128)
+    @functools.lru_cache(maxsize=128)  # noqa: B019
     def _cached_load_warp_file(self, file_path: str) -> DatasetReader:
-        """Cached version of :meth:`_load_warp_file`.
+        """Return cached version of :meth:`_load_warp_file`.
 
-        Args:
-            file_path: file to load and warp
+        Parameters
+        ----------
+        file_path: str
+            file to load and warp
 
-        Returns:
-            file handle of warped VRT
+        Returns
+        -------
+        file handle of warped VRT
+
         """
         return self._load_warp_file(file_path)
 
@@ -954,10 +987,13 @@ class RasterDataset(GeoDataset):
         """Load and warp a file to the correct CRS and resolution.
 
         Args:
+        ----
             file_path: file to load and warp
 
         Returns:
+        -------
             file handle of warped VRT
+
         """
         src = rasterio.open(file_path)
 
@@ -966,8 +1002,7 @@ class RasterDataset(GeoDataset):
             vrt = WarpedVRT(src, crs=self.crs)
             src.close()
             return vrt
-        else:
-            return src
+        return src
 
     @property
     def count(self) -> int:
@@ -983,6 +1018,7 @@ class RasterDataset(GeoDataset):
         -------
         count: int
             number of valid files in the dataset
+
         """
         return self._count
 
@@ -994,6 +1030,7 @@ class RasterDataset(GeoDataset):
         ----------
         new_count : int
             number of files in the dataset
+
         """
         self._count = int(new_count)
 
@@ -1001,14 +1038,18 @@ class RasterDataset(GeoDataset):
     def files(self) -> pd.DataFrame:
         """Return a list of all files in the dataset.
 
-        Returns:
+        Returns
+        -------
             list of all files in the dataset
+
         """
         return self._files
 
     def get_profile(
-        self, bbox: BoundingBox | Literal["roi", "bounds"] = "roi"
+        self,
+        bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
     ) -> Profile | None:
+        """Get profile information of dataset for the given bounding box type."""
         bbox = self._ensure_bbox(bbox)
         if bbox is None:
             return None
@@ -1044,13 +1085,15 @@ class RasterDataset(GeoDataset):
         -------
         row_col: np.ndarray
             row, col in the dataset for the given points(xy)
+
         """
         xy = np.asarray(xy)
         if xy.ndim == 1:
             xy = xy.reshape(1, -1)
         if xy.ndim != 2 or xy.shape[1] != 2:
+            msg = f"Expected xy to be an array of shape (n, 2), got {xy.shape}"
             raise ValueError(
-                f"Expected xy to be an array of shape (n, 2), got {xy.shape}"
+                msg,
             )
         if crs is not None:
             crs = CRS.from_user_input(crs)
@@ -1061,8 +1104,7 @@ class RasterDataset(GeoDataset):
         profile = self.get_profile(bbox)
 
         rows, cols = tf_rowcol(profile["transform"], xy[:, 0], xy[:, 1])
-        row_col = np.column_stack((rows, cols))
-        return row_col
+        return np.column_stack((rows, cols)).astype(np.int64)
 
     def xy(
         self,
@@ -1087,13 +1129,17 @@ class RasterDataset(GeoDataset):
         -------
         xy: np.ndarray
             x, y coordinates in the given CRS (default is the CRS of the dataset)
+
         """
         row_col = np.asarray(row_col)
         if row_col.ndim == 1:
             row_col = row_col.reshape(1, -1)
         if row_col.ndim != 2 or row_col.shape[1] != 2:
-            raise ValueError(
+            msg = (
                 f"Expected row_col to be an array of shape (n, 2), got {row_col.shape}"
+            )
+            raise ValueError(
+                msg,
             )
 
         profile = self.get_profile(bbox)
@@ -1104,9 +1150,7 @@ class RasterDataset(GeoDataset):
             crs = CRS.from_user_input(crs)
             if crs != self.crs:
                 xs, ys = warp_transform(self.crs, crs, xs, ys)
-        xy = np.column_stack((xs, ys))
-
-        return xy
+        return np.column_stack((xs, ys))
 
     def parse_mask(
         self,
@@ -1114,9 +1158,10 @@ class RasterDataset(GeoDataset):
         bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
         seed: int = 0,
     ) -> np.ndarray:
-        """Parse the mask of the dataset. The mask is a boolean array where True
-        indicates valid data and False indicates invalid data, which keeps in
-        line with the GDAL/rasterio strategy.
+        """Parse the mask of the dataset.
+
+        The mask is a boolean array where True indicates valid data and False
+        indicates invalid data, which keeps in line with the GDAL/rasterio strategy.
 
         Parameters
         ----------
@@ -1127,11 +1172,12 @@ class RasterDataset(GeoDataset):
             the desired region of mask. Default is 'roi'.
         seed : int, optional
             Seed for the random number generator. Default is 0.
+
         """
         # randomly select a subset of files
         idx_all = np.arange(self.count)
-        np.random.seed(seed)
-        idx = np.random.choice(idx_all, int(percent * self.count), replace=False)
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(idx_all, int(percent * self.count), replace=False)
         paths = self.files.paths[self.valid].values[idx]
 
         # get the profile of the dataset
@@ -1144,10 +1190,7 @@ class RasterDataset(GeoDataset):
         for path in paths:
             with rasterio.open(path) as src:
                 bbox = self._ensure_bbox(bbox)
-                if bbox is None:
-                    win = None
-                else:
-                    win = src.window(*bbox)
+                win = None if bbox is None else src.window(*bbox)
                 mask &= src.read(1, masked=True, window=win).mask
         return ~mask
 
@@ -1156,7 +1199,7 @@ class RasterDataset(GeoDataset):
         mask_path: str | Path,
         bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
     ) -> np.ndarray:
-        """Load a mask from a tiff mask file (.msk)
+        """Load a mask from a tiff mask file (.msk).
 
         Parameters
         ----------
@@ -1164,6 +1207,7 @@ class RasterDataset(GeoDataset):
             path to the mask file of tiff format (.msk)
         bbox : str, one of ['bounds', 'roi'], optional
             the desired region of mask. Default is 'roi'.
+
         """
         bbox = self._ensure_bbox(bbox)
         profile = self.get_profile(self.bounds)
@@ -1172,22 +1216,143 @@ class RasterDataset(GeoDataset):
             mask = src.read(1)
 
         if profile["width"] != mask.shape[1] or profile["height"] != mask.shape[0]:
-            raise ValueError(
+            msg = (
                 f"The shape of the mask {mask.shape} does not match the shape "
                 f"of the dataset {(profile['width'], profile['height'])}."
+            )
+            raise ValueError(
+                msg,
             )
         # crop the mask to the desired region
         with rasterio.open(self.files.paths[self.valid].values[0]) as src:
             win = src.window(*bbox)
-            mask = mask[win[0] : win[1], win[2] : win[3]]
+            return mask[win[0] : win[1], win[2] : win[3]]
 
-        return mask
+    def reproject(
+        self,
+        new_crs: CRS | str,
+        resampling: Resampling = Resampling.nearest,
+        nodata: float | None = None,
+    ) -> Self:
+        """Reproject the dataset to a new CRS.
+
+        Parameters
+        ----------
+        new_crs : CRS or str
+            new coordinate reference system (:term:`CRS`) of the dataset.
+            It can be a CRS object or a string, which will be parsed to a
+            CRS object. The string can be in any format supported by
+            :meth:`pyproj.crs.CRS.from_user_input`.
+        resampling : Resampling, optional
+            resampling method to use when reprojecting the dataset.
+            Default is `Resampling.nearest`.
+        nodata : float or int, optional
+            no data value of the dataset. If None, the no data value of the
+            dataset will be used.
+
+        """
+        if not isinstance(new_crs, CRS):
+            new_crs = CRS.from_user_input(new_crs)
+        if new_crs == self.crs:
+            return self
+
+        if nodata is None:
+            nodata = self.nodata
+        new_bounds: BoundingBox = self.bounds.to_crs(new_crs)
+        new_res = (
+            abs(new_bounds.right - new_bounds.left) / self.shape[1],
+            abs(new_bounds.top - new_bounds.bottom) / self.shape[0],
+        )
+
+        return self.__class__(
+            root_dir=self.root_dir,
+            paths=self.files.paths,
+            crs=new_crs,
+            res=new_res,
+            dtype=self.dtype,
+            nodata=nodata,
+            roi=new_bounds,
+            bands=self.bands,
+            cache=self.cache,
+            resampling=resampling,
+            fill_nodata=self.fill_nodata,
+            verbose=self.verbose,
+            ds_name=self.ds_name,
+        )
+
+    def resample(
+        self,
+        new_res: float | tuple[float, float],
+        resampling: Resampling = Resampling.nearest,
+        nodata: float | None = None,
+    ) -> Self:
+        """Resample the dataset to a new resolution.
+
+        Parameters
+        ----------
+        new_res : float or tuple of float
+            new resolution of the dataset in units of CRS. If a single float is
+            provided, it will be used for both x and y dimensions.
+        resampling : Resampling, optional
+            resampling method to use when resampling the dataset.
+            Default is `Resampling.nearest`.
+        nodata : float or int, optional
+            no data value of the dataset. If None, the no data value of the
+            dataset will be used.
+
+        """
+        if nodata is None:
+            nodata = self.nodata
+
+        return self.__class__(
+            root_dir=self.root_dir,
+            paths=self.files.paths,
+            crs=self.crs,
+            res=new_res,
+            dtype=self.dtype,
+            nodata=nodata,
+            roi=self.bounds,
+            bands=self.bands,
+            cache=self.cache,
+            resampling=resampling,
+            fill_nodata=self.fill_nodata,
+            verbose=self.verbose,
+            ds_name=self.ds_name,
+        )
+
+    def show(
+        self,
+        arr: np.ndarray,
+        **kwargs,
+    ) -> Self:
+        """Show the array using the dataset's geo information.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            The array with same shape as the dataset to show. The geo information
+            of the dataset will be used to plot the array.
+        kwargs : key value pairs, optional
+            Additional keyword arguments to pass to the :func:`rasterio.plot.show`
+            function.
+
+        """
+        if kwargs is None:
+            kwargs = {}
+        if "transform" in kwargs:
+            msg = (
+                "show() function does not support `transform` argument, since "
+                "the `transform` of the dataset will be used to plot the array."
+            )
+            warnings.warn(msg, stacklevel=2)
+        kwargs["transform"] = self.get_profile().transform
+        plot.show(arr, **kwargs)
 
     def to_tiffs(
         self,
         out_dir: str | Path,
         roi: BoundingBox | None = None,
-    ):
+    ) -> None:
         """Save the dataset to a directory of tiff files for given region of interest.
 
         Parameters
@@ -1196,6 +1361,7 @@ class RasterDataset(GeoDataset):
             path to the directory to save the tiff files
         roi : BoundingBox, optional
             region of interest to save. If None, the roi of the dataset will be used.
+
         """
         roi = self._check_roi(roi)
 
@@ -1222,6 +1388,7 @@ class RasterDataset(GeoDataset):
             path to the netCDF file to save
         roi : BoundingBox, optional
             region of interest to save. If None, the roi of the dataset will be used.
+
         """
         if roi is None:
             roi = self.roi
@@ -1240,7 +1407,11 @@ class RasterDataset(GeoDataset):
             },
         )
         ds = geo_tools.write_geoinfo_into_ds(
-            ds, "image", crs=self.crs, x_dim="lon", y_dim="lat"
+            ds,
+            "image",
+            crs=self.crs,
+            x_dim="lon",
+            y_dim="lat",
         )
         ds.to_netcdf(filename)
 
@@ -1252,7 +1423,7 @@ class RasterDataset(GeoDataset):
         bbox: BoundingBox | None = None,
         band_names: Sequence[str] | None = None,
         arr_type: Literal["data", "mask"] = "data",
-        nodata: float | int | None = None,
+        nodata: float | None = None,
         overwrite: bool = False,
     ) -> None:
         """Save a numpy array to a tiff file using the geoinformation of dataset.
@@ -1281,6 +1452,7 @@ class RasterDataset(GeoDataset):
         overwrite : bool, optional
             if True, overwrite the existing file. Default is False, which means
             the array will be saved in append mode (r+ mode).
+
         """
         # check arr dimension
         if arr.ndim == 2:
@@ -1289,16 +1461,18 @@ class RasterDataset(GeoDataset):
         elif arr.ndim == 3:
             indexes = [i + 1 for i in range(arr.shape[0])]
         else:
-            raise ValueError(
+            msg = (
                 f"Expected arr to be an array with shape of (n_lat, n_lon) or "
                 f"(n_band, n_lat, n_lon), got {arr.shape}"
             )
+            raise ValueError(msg)
         # check length of band_names
-        if band_names is not None:
-            if len(band_names) != arr.shape[0]:
-                raise ValueError(
-                    f"Expected band_names to be of length {arr.shape[0]}, got {len(band_names)}"
-                )
+        if band_names is not None and len(band_names) != arr.shape[0]:
+            msg = (
+                f"Expected band_names to be of length {arr.shape[0]}, "
+                f"got {len(band_names)}"
+            )
+            raise ValueError(msg)
         # parse profile
         if bounds is None:
             bounds = self.roi
@@ -1309,19 +1483,17 @@ class RasterDataset(GeoDataset):
         profile["nodata"] = get_nodata(arr, nodata, profile["dtype"])
         mode = "w"
         filename = Path(filename)
-        if filename.exists():
-            if not overwrite:
-                mode = "r+"
+        if filename.exists() and not overwrite:
+            mode = "r+"
 
-        with rasterio.open(filename, mode, **profile) as dst:
+        with rasterio.open(filename, mode, **profile.to_dict()) as dst:
             # parse window
-            if bbox is None:
-                win = None
-            else:
-                win = dst.window(*bbox)
+            win = None if bbox is None else dst.window(*bbox)
 
             # write array to tiff
             if arr_type == "mask":
+                if arr.shape[0] == 1:
+                    arr = arr[0]
                 dst.write_mask(arr)
             elif arr_type == "data":
                 dst.write(arr, indexes, window=win)
@@ -1330,7 +1502,7 @@ class RasterDataset(GeoDataset):
                 dst.descriptions = band_names
                 band_names_str = ";".join(band_names)
                 band_names_file = filename.with_suffix(".band_name.txt")
-                with open(band_names_file, "w") as f:
+                with band_names_file.open("w") as f:
                     f.write(band_names_str)
 
     def array2kml(
@@ -1338,11 +1510,11 @@ class RasterDataset(GeoDataset):
         arr: np.ndarray,
         out_file: str | Path,
         bounds: BoundingBox | None = None,
-        img_kwargs: dict = {},
-        cbar_kwargs: dict = {},
+        img_kwargs: dict | None = None,
+        cbar_kwargs: dict | None = None,
         verbose: bool = True,
-    ):
-        """write a numpy array into a kml file.
+    ) -> None:
+        """Write a numpy array into a kml file.
 
         Parameters
         ----------
@@ -1360,7 +1532,12 @@ class RasterDataset(GeoDataset):
             the out_file and mappable argument.
         verbose: bool
             whether to print the information of the kml file. Default is verbose.
+
         """
+        if cbar_kwargs is None:
+            cbar_kwargs = {}
+        if img_kwargs is None:
+            img_kwargs = {}
         if bounds is None:
             bounds = self.roi
 
@@ -1387,11 +1564,11 @@ class RasterDataset(GeoDataset):
         arr: np.ndarray,
         out_file: str | Path,
         bounds: BoundingBox | None = None,
-        img_kwargs: dict = {},
-        cbar_kwargs: dict = {},
+        img_kwargs: dict | None = None,
+        cbar_kwargs: dict | None = None,
         keep_kml: bool = False,
         verbose: bool = True,
-    ):
+    ) -> None:
         """Write a numpy array into a kmz file.
 
         Parameters
@@ -1412,7 +1589,12 @@ class RasterDataset(GeoDataset):
             whether to keep the kml file. Default is False.
         verbose: bool
             whether to print the information of the kmz file. Default is verbose.
+
         """
+        if cbar_kwargs is None:
+            cbar_kwargs = {}
+        if img_kwargs is None:
+            img_kwargs = {}
         if bounds is None:
             bounds = self.roi
         wgs84 = CRS.from_epsg(4326)
@@ -1451,7 +1633,7 @@ class HierarchicalDataset(GeoDataset):
         path: str | Path,
         group: str | None = None,
         roi: BoundingBox | None = None,
-    ):
+    ) -> None:
         super().__init__()
         self._path = Path(path)
         self._group = group
@@ -1459,7 +1641,7 @@ class HierarchicalDataset(GeoDataset):
         self._update_geo_info()
         warnings.warn(
             "HierarchicalDataset is still in development and may not work as expected.",
-            UserWarning,
+            stacklevel=2,
         )
 
     def __repr__(self) -> str:
@@ -1489,15 +1671,19 @@ class HierarchicalDataset(GeoDataset):
             if name.lower() in lon_names:
                 lon_name = name
         if lat_name is None or lon_name is None:
-            raise ValueError(
+            msg = (
                 "The dataset does not contain latitude and longitude variables. "
                 "Please specify the names of the latitude and longitude variables."
+            )
+            raise ValueError(
+                msg,
             )
         return lat_name, lon_name
 
     def _parse_geo_info(
-        self, path: str | Path
-    ) -> tuple[BoundingBox, tuple[float, float], tuple[int, int], CRS,]:
+        self,
+        path: str | Path,
+    ) -> tuple[BoundingBox, tuple[float, float], tuple[int, int], CRS]:
         """Parse the geoinformation of the dataset."""
         with xr.open_dataset(path) as ds:
             coord_names = self._parse_lat_lon_name(ds)
@@ -1505,7 +1691,7 @@ class HierarchicalDataset(GeoDataset):
                 self.lat_name, self.lon_name = coord_names
 
             repr_str = ds.__repr__()
-            variables = [i for i in ds.variables]
+            variables = list(ds.variables)
             lat = ds[self.lat_name].values
             lon = ds[self.lon_name].values
             crs = ds.rio.crs
@@ -1520,14 +1706,18 @@ class HierarchicalDataset(GeoDataset):
             ):
                 warnings.warn(
                     "No CRS is specified for the dataset, assuming the lat/lon values "
-                    "are in the range of WGS84."
+                    "are in the range of WGS84.",
+                    stacklevel=2,
                 )
                 crs = CRS.from_epsg(4326)
             else:
-                raise ValueError(
+                msg = (
                     "No CRS is specified for the dataset, and the lat/lon values are "
                     "not in the range of WGS84. Please specify the CRS of the dataset"
                     "using the :meth:`set_crs` method later."
+                )
+                raise ValueError(
+                    msg,
                 )
         else:
             crs = CRS.from_user_input(ds.rio.crs)
@@ -1581,8 +1771,10 @@ class HierarchicalDataset(GeoDataset):
         points: Points,
         variable: str | None = None,
     ) -> np.ndarray:
-        """Return the values of dataset at given points. Points that outside the dataset will be masked."""
-        pass
+        """Return the values of dataset at given points.
+
+        Points that outside the dataset will be masked.
+        """
 
     def _polygons_query(
         self,
@@ -1590,7 +1782,6 @@ class HierarchicalDataset(GeoDataset):
         variable: str | None = None,
     ) -> np.ndarray:
         """Return the values of the dataset at the given polygons."""
-        pass
 
     def query(
         self,
@@ -1611,6 +1802,7 @@ class HierarchicalDataset(GeoDataset):
         **kwargs : dict
             keyword arguments to pass to :meth:`xarray.open_dataarray` if
             variable is None, otherwise to :meth:`xarray.open_dataset`.
+
         """
         if isinstance(query, Points):
             query = GeoQuery(points=query)
@@ -1619,81 +1811,83 @@ class HierarchicalDataset(GeoDataset):
         if isinstance(query, Polygons):
             query = GeoQuery(polygons=query)
 
-        result = self._sample_data(query, variable, **kwargs)
-
-        return result
+        return self._sample_data(query, variable, **kwargs)
 
     def _sample_data(
         self,
         query: GeoQuery,
         variable: str | None = None,
         **kwargs,
-    ):
+    ) -> QueryResult:
+        """Sample data from the dataset for the given query."""
         # TODO: refine points and polygons query
         # parse points result
         points_result = None
         if query.points is not None:
             points_values = self._points_query(query.points, variable, **kwargs)
-            dims, points_result = parse_1D_dims(points_values, multi_files=False)
+            dims, points_result = parse_1d_dims(points_values, multi_files=False)
             points_result = {"data": points_values, "dims": dims}
         # parse bounding boxes result
         boxes_result = None
         if query.boxes is not None:
             if len(query.boxes) == 1:
                 boxes_values = self._bbox_query(query.boxes[0], variable, **kwargs)
-                dims = parse_2D_dims(boxes_values)
+                dims = parse_2d_dims(boxes_values)
             else:
                 boxes_values = [
                     self._bbox_query(bbox, variable, **kwargs) for bbox in query.boxes
                 ]
-                dims = parse_2D_dims(boxes_values[0], details=False)
+                dims = parse_2d_dims(boxes_values[0], details=False)
                 dims = f"boxes:{len(boxes_values)}, ({dims})"
             boxes_result = {"data": boxes_values, "dims": f"({dims})"}
         # parse polygons result
         polygons_result = None
         if query.polygons is not None:
-            polygons_values = self._polygons_query(query.polygons, variable)
-            pass
+            self._polygons_query(query.polygons, variable)
 
-        result = QueryResult(points_result, boxes_result, polygons_result, query)
-        return result
+        return QueryResult(points_result, boxes_result, polygons_result, query)
 
     def sel(
         self,
         variable: str | None = None,
         **kwargs,
     ) -> xr.DataArray | xr.Dataset:
-        """Select a variable from the dataset. This method is a wrapper of
-        :meth:`xarray.Dataset.sel` or :meth:`xarray.DataArray.sel`.
+        """Select a variable from the dataset.
+
+        This method is a wrapper of :meth:`xarray.Dataset.sel` or
+        :meth:`xarray.DataArray.sel`.
 
         Parameters
         ----------
         variable : str, optional
-            name of the variable to select. If None, the entire dataset will be selected.
+            name of the variable to select. If None, the entire dataset will
+            be selected.
         **kwargs : dict
-            keyword arguments to pass to :meth:`xarray.Dataset.sel` or :meth:`xarray.DataArray.sel`.
+            keyword arguments to pass to :meth:`xarray.Dataset.sel` or
+            :meth:`xarray.DataArray.sel`.
+
         """
         with xr.open_dataset(self.path, group=self.group) as ds:
-            if variable is None:
-                data = ds.sel(**kwargs)
-            else:
-                data = ds[variable].sel(**kwargs)
-        return data
+            return ds.sel(**kwargs) if variable is None else ds[variable].sel(**kwargs)
 
     def isel(
         self,
         variable: str | None = None,
         **kwargs,
     ) -> xr.DataArray | xr.Dataset:
-        """Index a variable from the dataset. This method is a wrapper of
-        :meth:`xarray.Dataset.isel` or :meth:`xarray.DataArray.isel`.
+        """Index a variable from the dataset.
+
+        This method is a wrapper of :meth:`xarray.Dataset.isel` or
+        :meth:`xarray.DataArray.isel`.
 
         Parameters
         ----------
         variable : str, optional
             name of the variable to index. If None, the entire dataset will be indexed.
         **kwargs : dict
-            keyword arguments to pass to :meth:`xarray.Dataset.isel` or :meth:`xarray.DataArray.isel`.
+            keyword arguments to pass to :meth:`xarray.Dataset.isel` or
+            :meth:`xarray.DataArray.isel`.
+
         """
         with xr.open_dataset(self.path, group=self.group) as ds:
             if variable is None:
@@ -1702,7 +1896,7 @@ class HierarchicalDataset(GeoDataset):
                 data = ds[variable].isel(**kwargs)
         return data
 
-    def set_crs(self, crs: CRS | str):
+    def set_crs(self, crs: CRS | str) -> None:
         """Set the CRS of the dataset.
 
         .. note::
@@ -1715,41 +1909,42 @@ class HierarchicalDataset(GeoDataset):
 
     @property
     def path(self) -> Path:
-        """the path of the dataset."""
+        """The path of the dataset."""
         return self._path
 
     @property
     def group(self) -> str:
-        """the group of the dataset."""
+        """The group of the dataset."""
         return self._group
 
     @property
     def shape(self) -> tuple[int, int]:
-        """the shape of the dataset in (height, width)."""
+        """The shape of the dataset in (height, width)."""
         return self._shape
 
     @property
     def bounds(self) -> BoundingBox:
-        """the bounds of the dataset."""
+        """The bounds of the dataset."""
         return self._bound
 
     @property
     def lat(self) -> np.ndarray:
-        """the latitudes of the dataset."""
+        """The latitudes of the dataset."""
         return self._lat
 
     @property
     def lon(self) -> np.ndarray:
-        """the longitudes of the dataset."""
+        """The longitudes of the dataset."""
         return self._lon
 
     @property
     def variables(self) -> list[str]:
-        """the variables of the dataset."""
+        """The variables of the dataset."""
         return self._variables
 
     def get_profile(
-        self, bbox: BoundingBox | Literal["roi"] | Literal["bounds"] = "roi"
+        self,
+        bbox: Literal["roi", "bounds"] | BoundingBox = "roi",
     ) -> Profile | None:
         bbox = self._ensure_bbox(bbox)
         if bbox is None:
@@ -1758,7 +1953,7 @@ class HierarchicalDataset(GeoDataset):
         profile["crs"] = self.crs
         return profile
 
-    def array2tiff(
+    def array2tiff(  # noqa: PLR0912
         self,
         arr: np.ndarray,
         filename: str | Path,
@@ -1766,7 +1961,7 @@ class HierarchicalDataset(GeoDataset):
         bbox: BoundingBox | None = None,
         band_names: Sequence[str] | None = None,
         arr_type: Literal["data", "mask"] = "data",
-        nodata: float | int | None = None,
+        nodata: float | None = None,
         overwrite: bool = False,
     ) -> None:
         """Save a numpy array to a tiff file using the geoinformation of dataset.
@@ -1795,6 +1990,7 @@ class HierarchicalDataset(GeoDataset):
         overwrite : bool, optional
             if True, overwrite the existing file. Default is False, which means
             the array will be saved in append mode (r+ mode).
+
         """
         # check arr dimension
         if arr.ndim == 2:
@@ -1803,16 +1999,18 @@ class HierarchicalDataset(GeoDataset):
         elif arr.ndim == 3:
             indexes = [i + 1 for i in range(arr.shape[0])]
         else:
-            raise ValueError(
+            msg = (
                 f"Expected arr to be an array with shape of (n_lat, n_lon) or "
                 f"(n_band, n_lat, n_lon), got {arr.shape}"
             )
+            raise ValueError(msg)
         # check length of band_names
-        if band_names is not None:
-            if len(band_names) != arr.shape[0]:
-                raise ValueError(
-                    f"Expected band_names to be of length {arr.shape[0]}, got {len(band_names)}"
-                )
+        if band_names is not None and len(band_names) != arr.shape[0]:
+            msg = (
+                "Expected band_names to be of length "
+                f"{arr.shape[0]}, got {len(band_names)}"
+            )
+            raise ValueError(msg)
         # parse profile
         if bounds is None:
             bounds = self.roi
@@ -1825,15 +2023,11 @@ class HierarchicalDataset(GeoDataset):
                 nodata = np.nan
             else:
                 rng = dtype_ranges[profile["dtype"]]
-                if np.any(arr == rng[0]):
-                    nodata = rng[1] - 1
-                else:
-                    nodata = rng[0]
+                nodata = rng[1] - 1 if np.any(arr == rng[0]) else rng[0]
         profile["nodata"] = nodata
         mode = "w"
-        if Path(filename).exists():
-            if not overwrite:
-                mode = "r+"
+        if Path(filename).exists() and not overwrite:
+            mode = "r+"
 
         dst = rasterio.open(filename, mode, **profile)
 
@@ -1844,10 +2038,7 @@ class HierarchicalDataset(GeoDataset):
             update_tags = True
 
         # parse window
-        if bbox is None:
-            win = None
-        else:
-            win = dst.window(*bbox)
+        win = None if bbox is None else dst.window(*bbox)
 
         # write array to tiff
         if arr_type == "mask":
@@ -1861,7 +2052,7 @@ class HierarchicalDataset(GeoDataset):
 
 
 class MultiHierarchicalDataset(GeoDataset):
-    def __init__(self, paths: Sequence[str | Path], **kwargs):
+    def __init__(self, paths: Sequence[str | Path], **kwargs) -> None:
         pass
 
 
@@ -1876,9 +2067,10 @@ class PairDataset(RasterDataset):
         query: GeoQuery | Points | BoundingBox | Polygons,
         pairs: Pairs | None = None,
     ) -> QueryResult:
-        """Retrieve images values for given query. This method is an more
-        flexible implementation compared to :meth:`__getitem__`, which can
-        retrieve images only for the given pairs.
+        """Retrieve images values for given query.
+
+        This method is an more flexible implementation compared to
+        :meth:`__getitem__`, which can retrieve images only for the given pairs.
 
         Parameters
         ----------
@@ -1893,6 +2085,7 @@ class PairDataset(RasterDataset):
         -------
         result : QueryResult
             a QueryResult instance containing the results of the various queries.
+
         """
         if isinstance(query, Points):
             query = GeoQuery(points=query)
@@ -1906,13 +2099,11 @@ class PairDataset(RasterDataset):
             mask = mask * self.pairs.where(pairs, return_type="mask")
 
         paths = self.files[mask].paths
-        result = self._sample_files(paths, query)
-
-        return result
+        return self._sample_files(paths, query)
 
     @classmethod
     def parse_pairs(cls, paths: list[Path]) -> Pairs:
-        """Used to parse pairs from filenames. *Must be implemented in subclass*.
+        """Parse pairs from filenames. *Must be implemented in subclass*.
 
         Parameters
         ----------
@@ -1929,19 +2120,21 @@ class PairDataset(RasterDataset):
         for the HyP3 dataset, pairs are parsed from the filenames as follows:
 
         >>> names = [f.name for f in paths]]
-        >>> pair_names = ['_'.join(i.split("_")[1:3]) for i in names]
+        >>> pair_names = ["_".join(i.split("_")[1:3]) for i in names]
 
         for the HyP3 dataset, the pair names are the second and third parts of the
         filename, separated by an underscore. After parsing the pair names, the
         :class:`Pairs` object can be created by using the ``from_names`` method.
 
         >>> pairs = Pairs.from_names(pair_names)
+
         """
-        raise NotImplementedError("parse_pairs method must be implemented in subclass")
+        msg = "parse_pairs method must be implemented in subclass"
+        raise NotImplementedError(msg)
 
     @classmethod
     def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
-        """Used to parse datetime from filenames. *Must be implemented in subclass*.
+        """Parse datetime from filenames. *Must be implemented in subclass*.
 
         Parameters
         ----------
@@ -1952,10 +2145,10 @@ class PairDataset(RasterDataset):
         -------
         datetime : pd.DatetimeIndex
             datetime parsed from filenames
+
         """
-        raise NotImplementedError(
-            "parse_datetime method must be implemented in subclass"
-        )
+        msg = "parse_datetime method must be implemented in subclass"
+        raise NotImplementedError(msg)
 
     @property
     def pairs(self) -> Pairs:
@@ -1969,9 +2162,7 @@ class PairDataset(RasterDataset):
 
 
 class ApsDataset(RasterDataset):
-    """
-    A base class for aps (atmospheric phase screen) datasets.
-    """
+    """A base class for aps (atmospheric phase screen) datasets."""
 
     #: This expression is used to find the APS files.
     pattern = "*"
@@ -1986,7 +2177,7 @@ class ApsDataset(RasterDataset):
         roi: BoundingBox | None = None,
         overwrite: bool = False,
         prefix: str = "APS",
-    ):
+    ) -> None:
         """Generate aps-pair files for given pairs and reference points.
 
         Parameters
@@ -2003,6 +2194,7 @@ class ApsDataset(RasterDataset):
             if True, overwrite existing files, default: False
         prefix : str, optional
             prefix of the aps-pair files, default: "APS"
+
         """
         if roi is None:
             roi = self.roi
@@ -2013,9 +2205,11 @@ class ApsDataset(RasterDataset):
 
         dates_missing = np.setdiff1d(pairs.dates, dates)
         if len(dates_missing) > 0:
-            warnings.warn(
-                f"Following dates are missing in the {self.ds_name} dataset. \n{dates_missing}"
+            msg = (
+                f"Following dates are missing in the {self.ds_name} "
+                f"dataset. \n{dates_missing}",
             )
+            warnings.warn(msg, stacklevel=2)
 
         df_paths = pd.Series(self.files.paths.values, index=dates)
 
@@ -2023,14 +2217,17 @@ class ApsDataset(RasterDataset):
         pairs = pairs[mask]
 
         pairs_names = self._ensure_saving_verbose(
-            pairs.to_names(), ds_name=f"{self.ds_name} Pair", unit=" pairs"
+            pairs.to_names(),
+            ds_name=f"{self.ds_name} Pair",
+            unit=" pairs",
         )
 
         for pair_name in pairs_names:
             primary, secondary = pair_name.split("_")
             out_file = Path(out_dir) / f"{prefix}_{pair_name}.tif"
             if out_file.exists() and not overwrite:
-                logger.info(f"{out_file.name} already exists, skipping")
+                msg = f"{out_file.name} already exists, skipping"
+                logger.info(msg)
                 continue
             with rasterio.open(out_file, "w", **profile.profile) as dst:
                 src_primary = self._load_warp_file(df_paths[primary])
@@ -2049,8 +2246,9 @@ class ApsDataset(RasterDataset):
     @classmethod
     @abc.abstractmethod
     def parse_dates(cls, paths: Sequence[str] | None = None) -> pd.DatetimeIndex:
-        """Used to parse acquisition dates from filenames. *Must be implemented
-        in subclass*.
+        """Parse acquisition dates from filenames.
+
+        *Must be implemented in subclass*.
 
         Parameters
         ----------
@@ -2061,13 +2259,12 @@ class ApsDataset(RasterDataset):
         -------
         datetime : pd.DatetimeIndex
             datetime parsed from filenames
+
         """
 
 
 class ApsPairs(PairDataset):
-    """
-    A dataset manages the data of APS pairs.
-    """
+    """A dataset manages the data of APS pairs."""
 
     #: This expression is used to find the GACOSPairs files.
     pattern = "*.tif"
@@ -2079,11 +2276,11 @@ class ApsPairs(PairDataset):
         crs: CRS | None = None,
         res: float | tuple[float, float] | None = None,
         dtype: np.dtype | None = None,
-        nodata: float | int | Any = None,
+        nodata: float | None = None,
         roi: BoundingBox | None = None,
         bands: Sequence[str] | None = None,
         cache: bool = True,
-        resampling=Resampling.nearest,
+        resampling: Resampling = Resampling.nearest,
         fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
@@ -2137,6 +2334,7 @@ class ApsPairs(PairDataset):
         Raises
         ------
             FileNotFoundError: if no files are found in ``root_dir``
+
         """
         super().__init__(
             root_dir=root_dir,
@@ -2161,89 +2359,97 @@ class ApsPairs(PairDataset):
         """Parse pairs from a list of APS-pair file paths."""
         names = [Path(f).stem for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
-        pairs = Pairs.from_names(pair_names)
-        return pairs
+        return Pairs.from_names(pair_names)
 
     @classmethod
     def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
-        f"""Parse datetime from a list of {cls.__class__.__name__} file paths."""
+        """Parse datetime from a list of file paths."""
         names = [Path(f).stem for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         date_names = np.unique([i.split("_") for i in pair_names])
         return pd.DatetimeIndex(date_names)
 
     @property
-    def dates(self):
+    def dates(self) -> pd.DatetimeIndex:
         """Return the dates of the dataset."""
         return self._datetime
 
 
-def get_nodata(arr, nodata, dtype):
+def get_nodata(
+    arr: np.ndarray,
+    nodata: float | None,
+    dtype: np.dtype,
+) -> float:
     """Get a proper no data value for the array."""
     if nodata is None:
         if np.issubdtype(arr.dtype, np.floating):
             nodata = np.nan
         else:
             rng = dtype_ranges[dtype]
-            if np.any(arr == rng[0]):
-                nodata = rng[1]
-            else:
-                nodata = rng[0] - 1
+            nodata = rng[1] if np.any(arr == rng[0]) else rng[0] - 1
     return nodata
 
 
-def parse_1D_dims(values_1D, multi_files=True):
-    """Parse the dimensions of 1D array. (used by points)"""
+def parse_1d_dims(
+    values_1d: np.ndarray,
+    multi_files: bool = True,
+) -> tuple[str, np.ndarray]:
+    """Parse the dimensions of 1D array. (used by points)."""
     if multi_files:
-        if values_1D.ndim == 2:
-            n_files, n_points = values_1D.shape
+        if values_1d.ndim == 2:
+            n_files, n_points = values_1d.shape
             dims = f"(files:{n_files}, points:{n_points})"
-        elif values_1D.ndim == 3:
-            n_files, n_points, n_bands = values_1D.shape
-            values_1D = values_1D.transpose(0, 2, 1)
+        elif values_1d.ndim == 3:
+            n_files, n_points, n_bands = values_1d.shape
+            values_1d = values_1d.transpose(0, 2, 1)
             dims = f"(files:{n_files}, bands:{n_bands}, points:{n_points})"
         else:
-            raise ValueError(f"values_1D must be 2D or 3D, got {values_1D.ndim}")
-    else:
-        if values_1D.ndim == 1:
-            n_points = values_1D.shape[0]
-            dims = f"points:{n_points}"
-        elif values_1D.ndim == 2:
-            n_points, n_bands = values_1D.shape
-            values_1D = values_1D.T
-            dims = f"bands:{n_bands}, points:{n_points}"
-    return dims, values_1D
+            msg = f"values_1d must be 2D or 3D, got {values_1d.ndim}"
+            raise ValueError(msg)
+    elif values_1d.ndim == 1:
+        n_points = values_1d.shape[0]
+        dims = f"points:{n_points}"
+    elif values_1d.ndim == 2:
+        n_points, n_bands = values_1d.shape
+        values_1d = values_1d.T
+        dims = f"bands:{n_bands}, points:{n_points}"
+    return dims, values_1d
 
 
-def parse_2D_dims(values_2D, details=True, multi_files=True):
-    """Parse the dimensions of 2D array. (used by bbox, polygons)"""
+def parse_2d_dims(
+    values_2d: np.ndarray,
+    details: bool = True,
+    multi_files: bool = True,
+) -> str:
+    """Parse the dimensions of 2D array. (used by bbox, polygons)."""
     if multi_files:
-        if values_2D.ndim == 4:
-            n_files, n_bands, height, width = values_2D.shape
+        if values_2d.ndim == 4:
+            n_files, n_bands, height, width = values_2d.shape
             dims = f"files:{n_files}, bands:{n_bands}, height, width"
             if details:
                 dims = (
                     f"files:{n_files}, bands:{n_bands}, height:{height}, width:{width}"
                 )
-        elif values_2D.ndim == 3:
-            n_files, height, width = values_2D.shape
+        elif values_2d.ndim == 3:
+            n_files, height, width = values_2d.shape
             dims = f"files:{n_files}, height, width"
             if details:
                 dims = f"files:{n_files}, height:{height}, width:{width}"
         else:
-            raise ValueError(f"values_2D must be 3D or 4D, got {values_2D.ndim}")
+            msg = f"values_2d must be 3D or 4D, got {values_2d.ndim}"
+            raise ValueError(msg)
+    elif values_2d.ndim == 3:
+        n_bands, height, width = values_2d.shape
+        values_2d = values_2d.transpose(1, 2, 0)
+        dims = f"bands:{n_bands}, height, width"
+        if details:
+            dims = f"bands:{n_bands}, height:{height}, width:{width}"
+    elif values_2d.ndim == 2:
+        height, width = values_2d.shape
+        dims = "height, width"
+        if details:
+            dims = f"height:{height}, width:{width}"
     else:
-        if values_2D.ndim == 3:
-            n_bands, height, width = values_2D.shape
-            values_2D = values_2D.transpose(1, 2, 0)
-            dims = f"bands:{n_bands}, height, width"
-            if details:
-                dims = f"bands:{n_bands}, height:{height}, width:{width}"
-        elif values_2D.ndim == 2:
-            height, width = values_2D.shape
-            dims = f"height, width"
-            if details:
-                dims = f"height:{height}, width:{width}"
-        else:
-            raise ValueError(f"values_2D must be 2D or 3D, got {values_2D.ndim}")
+        msg = f"values_2d must be 2D or 3D, got {values_2d.ndim}"
+        raise ValueError(msg)
     return dims

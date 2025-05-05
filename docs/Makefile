@@ -12,9 +12,26 @@ BUILDDIR      = build
 help:
 	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
+# clean generated files
+clean-gen:
+	@api_dirs=$$(find $(SOURCEDIR) -type d -name generated); \
+	for dir in $$api_dirs; do \
+		rm -rf $$dir; echo "Cleaned up $$dir"; \
+	done
+
+# clean all build files and generated files
 clean:
-	rm -rf $(BUILDDIR)/*
-	rm -rf $(SOURCEDIR)/auto_examples*
+	@rm -rf $(BUILDDIR)/*
+	@echo "Cleaned up $(BUILDDIR)"
+
+	@$(MAKE) clean-gen
+
+
+
+
+
+
+
 
 .PHONY: help Makefile
 

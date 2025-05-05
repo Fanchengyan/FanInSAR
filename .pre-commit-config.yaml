@@ -1,6 +1,6 @@
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+    rev: v5.0.0
     hooks:
     -   id: check-ast
     -   id: check-merge-conflict
@@ -8,7 +8,14 @@ repos:
     -   id: trailing-whitespace
         args: ["--markdown-linebreak-ext=md"]
     -   id: mixed-line-ending
--   repo: https://github.com/psf/black
-    rev: 22.3.0
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.11.8
     hooks:
-    -   id: black
+        # Run the linter.
+        - id: ruff
+          args: [ --fix ]
+          exclude: ^(docs/|build/|dist/|notebooks/|tests/|examples/|data/|faninsar.egg-info/)
+        # Run the formatter.
+        - id: ruff-format
+          exclude: ^(docs/|build/|dist/|notebooks/|tests/|examples/|data/|faninsar.egg-info/)

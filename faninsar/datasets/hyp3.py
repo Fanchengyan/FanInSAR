@@ -1,3 +1,5 @@
+"""A module for managing the data of HyP3 Sentinel-1 interferograms."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -5,13 +7,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from faninsar._core.file_tools import retrieve_meta_value
-from faninsar._core.pair_tools import Pairs
-from faninsar._core.sar_tools import Baselines
+from faninsar._core.file_tools import load_meta_value
+from faninsar._core.sar.pairs import Pairs
+from faninsar._core.sar.sar_base import Baselines
+from faninsar.constants import Sentinel1
 from faninsar.datasets.ifg import InterferogramDataset
 
 
-class HyP3S1(InterferogramDataset):
+class HyP3S1(InterferogramDataset, Sentinel1):
     """A dataset manages the data of HyP3 Sentinel-1 product.
 
     `Hyp3 <https://hyp3-docs.asf.alaska.edu/>`_ is a service for processing
@@ -24,13 +27,10 @@ class HyP3S1(InterferogramDataset):
 
     @classmethod
     def parse_pairs(cls, paths: list[Path]) -> Pairs:
-        """Parse the primary and secondary date/acquisition of the interferogram
-        to generate Pairs object.
-        """
+        """Parse the Pairs from the paths of the interferogram."""
         names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
-        pairs = Pairs.from_names(pair_names)
-        return pairs
+        return Pairs.from_names(pair_names)
 
     @classmethod
     def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
@@ -49,10 +49,11 @@ class HyP3S1(InterferogramDataset):
             The pairs which the baseline will be parsed. Default is None, which
             means all pairs will be parsed.
 
-        returns
+        Returns
         -------
         baselines : Baselines
             The baseline of the interferogram for given pairs.
+
         """
         if pairs is None:
             pairs = self.pairs
@@ -64,15 +65,14 @@ class HyP3S1(InterferogramDataset):
         for f in files:
             try:
                 meta_file = str(f).replace("_unw_phase.tif", ".txt")
-                value = float(retrieve_meta_value(meta_file, "Baseline"))
+                value = float(load_meta_value(meta_file, "Baseline"))
                 baselines.append(value)
-            except:
+            except Exception:  # noqa: PERF203
                 baselines.append(np.nan)
-        bs = Baselines.from_pair_wise(pairs, np.array(baselines))
-        return bs
+        return Baselines.from_pair_wise(pairs, np.array(baselines))
 
 
-class HyP3S1Burst(InterferogramDataset):
+class HyP3S1Burst(InterferogramDataset, Sentinel1):
     """A dataset manages the data of HyP3 Sentinel-1 Burst product.
 
     `Hyp3 <https://hyp3-docs.asf.alaska.edu/>`_ is a service for processing
@@ -85,16 +85,13 @@ class HyP3S1Burst(InterferogramDataset):
 
     @classmethod
     def parse_pairs(cls, paths: list[Path]) -> Pairs:
-        """Parse the primary and secondary date/acquisition of the interferogram
-        to generate Pairs object.
-        """
+        """Parse pairs from the paths of the interferogram."""
         names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[3:5]) for i in names]
-        pairs = Pairs.from_names(pair_names)
-        return pairs
+        return Pairs.from_names(pair_names)
 
     @classmethod
-    def parse_datetime(self, paths: list[Path]) -> pd.DatetimeIndex:
+    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
         """Parse the datetime of the interferogram to generate DatetimeIndex object."""
         names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[3:5]) for i in names]

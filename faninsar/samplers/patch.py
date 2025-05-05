@@ -1,18 +1,24 @@
+"""A module defines the patch samplers for sampling data from a dataset."""
+
 from __future__ import annotations
 
 import abc
 import math
-from collections.abc import Iterator
-from typing import Any, Optional, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar._core.logger import setup_logger
-from faninsar.datasets import GeoDataset
+from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from faninsar.datasets import GeoDataset
+
 logger = setup_logger(
-    log_name="FanInSAR.samplers.batch", log_format="%(levelname)s - %(message)s"
+    log_name="FanInSAR.samplers.batch",
+    log_format="%(levelname)s - %(message)s",
 )
 
 
@@ -24,16 +30,18 @@ class PatchSampler(abc.ABC):
     _shape: tuple[int]
 
     def __len__(self) -> int:
+        """Return the length of the patch sampler."""
         return self._length
 
     def __str__(self) -> str:
-        string = f"{self.__class__.__name__}[boxes={self.shape}]"
-        return string
+        """Return the string representation of the patch sampler."""
+        return f"{self.__class__.__name__}[boxes={self.shape}]"
 
     def __repr__(self) -> str:
+        """Return the string representation of the patch sampler."""
         return self.__str__()
 
-    def __getitem__(self, index: Any) -> BoundingBox | np.ndarray:
+    def __getitem__(self, index: int | slice) -> BoundingBox | np.ndarray:
         """Get the bounding boxes/patches of at the given index.
 
         Parameters
@@ -47,6 +55,7 @@ class PatchSampler(abc.ABC):
         -------
         BoundingBox | np.ndarray
             The bounding box of the patch at the given index.
+
         """
         return self._boxes[index]
 
@@ -62,6 +71,8 @@ class PatchSampler(abc.ABC):
 
 
 class RowSampler(PatchSampler):
+    """A sampler samples data from a dataset in a row-wise manner."""
+
     def __init__(
         self,
         dataset: GeoDataset,
@@ -88,6 +99,7 @@ class RowSampler(PatchSampler):
         verbose : bool, optional
             Whether to print verbose information. The verbose of the dataset will
             be set to this value. Default is True.
+
         """
         self.dataset = dataset
         self.res = dataset.res
@@ -104,13 +116,16 @@ class RowSampler(PatchSampler):
             row_num = math.ceil(ds_height / height)
         else:
             if row_num is None:
-                raise ValueError("Either height or row_num must be provided.")
+                msg = "Either height or row_num must be provided."
+                raise ValueError(msg)
             if row_num > ds_height:
-                logger.warning(
+                msg = (
                     f"row_num ({row_num}) is larger than the height ({ds_height})\n"
-                    "of the dataset. The row_num will be set to the height of the dataset.\n"
-                    "If this cannot meet your requirement, please try to choose other Sampler."
+                    "of the dataset. The row_num will be set to the height of the "
+                    "dataset.\n If this cannot meet your requirement, please "
+                    "try to choose other Sampler."
                 )
+                logger.warning(msg, stacklevel=2)
                 row_num = ds_height
             row_num = int(row_num)
             height = math.floor(ds_height / row_num)
@@ -131,13 +146,13 @@ class RowSampler(PatchSampler):
             if i == self.row_num - 1:
                 top = roi.top
             patch_boxes.append(
-                BoundingBox(roi.left, bottom, roi.right, top, crs=self.dataset.crs)
+                BoundingBox(roi.left, bottom, roi.right, top, crs=self.dataset.crs),
             )
 
-        patch_boxes = np.asarray(patch_boxes, dtype=np.object_)
-        return patch_boxes
+        return np.asarray(patch_boxes, dtype=np.object_)
 
     def __iter__(self) -> Iterator:
+        """Iterate over the bounding boxes of the patches."""
         for i in range(self.row_num):
             yield self.boxes[i]
 
@@ -177,6 +192,7 @@ class ColSampler(PatchSampler):
         verbose : bool, optional
             Whether to print verbose information. The verbose of the dataset will
             be set to this value. Default is True.
+
         """
         self.dataset = dataset
         self.res = dataset.res[1]
@@ -193,13 +209,16 @@ class ColSampler(PatchSampler):
             col_num = math.ceil(ds_width / width)
         else:
             if col_num is None:
-                raise ValueError("Either width or col_num must be provided.")
+                msg = "Either width or col_num must be provided."
+                raise ValueError(msg)
             if col_num > ds_width:
-                logger.warning(
+                msg = (
                     f"col_num ({col_num}) is larger than the width ({ds_width})\n"
-                    "of the dataset. The col_num will be set to the width of the dataset.\n"
-                    "If this cannot meet your requirement, please try to choose other Sampler."
+                    "of the dataset. The col_num will be set to the width of the "
+                    "dataset.\n If this cannot meet your requirement, please "
+                    "try to choose other Sampler."
                 )
+                logger.warning(msg)
                 col_num = width
             col_num = int(col_num)
             width = math.floor(ds_width / col_num)
@@ -208,6 +227,7 @@ class ColSampler(PatchSampler):
         self.width = width
 
     def __iter__(self) -> Iterator:
+        """Iterate over the bounding boxes of the patches."""
         roi = self.dataset.roi
         width = self.width
         col_num = self.col_num
@@ -224,6 +244,7 @@ class ColSampler(PatchSampler):
             yield BoundingBox(*patch_bbox, crs=self.dataset.crs)
 
     def __len__(self) -> int:
+        """Return the length of the patch sampler."""
         return self.col_num
 
 
@@ -270,6 +291,7 @@ class RowColSampler(PatchSampler):
         verbose : bool, optional
             Whether to print verbose information. The verbose of the dataset will
             be set to this value. Default is True.
+
         """
         self.dataset = dataset
         self.res = dataset.res
@@ -288,13 +310,16 @@ class RowColSampler(PatchSampler):
             row_num = math.ceil(ds_height / height)
         else:
             if row_num is None:
-                raise ValueError("Either height or row_num must be provided.")
+                msg = "Either height or row_num must be provided."
+                raise ValueError(msg)
             if row_num > ds_height:
-                logger.warning(
+                msg = (
                     f"row_num ({row_num}) is larger than the height ({ds_height})\n"
-                    "of the dataset. The row_num will be set to the height of the dataset.\n"
-                    "If this cannot meet your requirement, please try to choose other Sampler."
+                    "of the dataset. The row_num will be set to the height of the"
+                    " dataset.\n If this cannot meet your requirement, please try"
+                    " to choose other Sampler.",
                 )
+                logger.warning(msg)
                 row_num = ds_height
             row_num = int(row_num)
             height = math.floor(ds_height / row_num)
@@ -305,13 +330,16 @@ class RowColSampler(PatchSampler):
             col_num = math.ceil(ds_width / width)
         else:
             if col_num is None:
-                raise ValueError("Either width or col_num must be provided.")
+                msg = "Either width or col_num must be provided."
+                raise ValueError(msg)
             if col_num > ds_width:
-                logger.warning(
+                msg = (
                     f"col_num ({col_num}) is larger than the width ({ds_width})\n"
-                    "of the dataset. The col_num will be set to the width of the dataset.\n"
-                    "If this cannot meet your requirement, please try to choose other Sampler."
+                    "of the dataset. The col_num will be set to the width of the"
+                    " dataset.\n If this cannot meet your requirement, please try"
+                    " to choose other Sampler.",
                 )
+                logger.warning(msg)
                 col_num = width
             col_num = int(col_num)
             width = math.floor(ds_width / col_num)
@@ -343,10 +371,10 @@ class RowColSampler(PatchSampler):
                 bbox = BoundingBox(left, bottom, right, top, crs=self.dataset.crs)
                 patch_boxes_row.append(bbox)
             patch_boxes.append(patch_boxes_row)
-        patch_boxes = np.asarray(patch_boxes, dtype=np.object_)
-        return patch_boxes
+        return np.asarray(patch_boxes, dtype=np.object_)
 
     def __iter__(self) -> Iterator:
+        """Iterate over the bounding boxes of the patches."""
         for i in range(self.row_num):
             for j in range(self.col_num):
                 patch_bbox = self.boxes[i, j]

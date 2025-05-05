@@ -1,6 +1,6 @@
-from __future__ import annotations
+"""A combined query for geo-spatial data."""
 
-from faninsar._core.pair_tools import Pairs
+from __future__ import annotations
 
 from .bbox import BoundingBox
 from .points import Points
@@ -8,17 +8,18 @@ from .polygons import Polygons
 
 
 class GeoQuery:
-    """A combined query of the :class:`Points`, :class:`BoundingBox`, and
-    :class:`Polygons` queries. This class is used to sample data from a
-    GeoDataset using multiple points, bounding boxes, and polygons at the same
-    time.
+    """A combined query for geo-spatial data.
+
+    the :class:`Points`, :class:`BoundingBox`, and :class:`Polygons` queries.
+    This class is used to sample data from a GeoDataset using multiple points,
+    bounding boxes, and polygons at the same time.
     """
 
     _points: Points | None
     _boxes: BoundingBox | list[BoundingBox] | None
     _polygons: Polygons | None
 
-    __slots__ = ["_points", "_boxes", "_polygons"]
+    __slots__ = ["_boxes", "_points", "_polygons"]
 
     def __init__(
         self,
@@ -47,25 +48,31 @@ class GeoQuery:
         TypeError:
             If points is not a Points instance, boxes is not a BoundingBox or a
             list of BoundingBox instances, or polygons is not a Polygons instance.
+
         """
         if boxes is None and points is None and polygons is None:
-            raise ValueError("One of boxes, points or polygons must be provided.")
+            msg = "One of boxes, points or polygons must be provided."
+            raise ValueError(msg)
 
         if points is not None and not isinstance(points, Points):
-            raise TypeError(f"points must be a Points. Got {type(points)}")
+            msg = f"points must be a Points. Got {type(points)}"
+            raise TypeError(msg)
         if boxes is not None:
             if isinstance(boxes, BoundingBox):
                 boxes = [boxes]
             if not isinstance(boxes, list):
                 try:
                     boxes = list(boxes)
-                except TypeError:
-                    raise TypeError(
-                        f"boxes must be a BoundingBox or a list of BoundingBox. Got {type(boxes)}"
+                except TypeError as e:
+                    msg = (
+                        "boxes must be a BoundingBox or a list of "
+                        f"BoundingBox. Got {type(boxes)}"
                     )
+                    raise TypeError(msg) from e
         if polygons is not None:
             if not isinstance(polygons, Polygons):
-                raise TypeError(f"polygons must be a Polygons. Got {type(polygons)}")
+                msg = f"polygons must be a Polygons. Got {type(polygons)}"
+                raise TypeError(msg)
             if polygons.is_mixed:
                 polygons = polygons.to_desired()
 
@@ -74,11 +81,13 @@ class GeoQuery:
         self._polygons = polygons
 
     def __str__(self) -> str:
+        """Return the string representation of the GeoQuery instance."""
         boxes = f"[{len(self.boxes)} BoundingBox]" if self.boxes is not None else None
         points = self.points if self.points is not None else None
         return f"GeoQuery(points={points}, boxes={boxes}, polygons={self.polygons})"
 
     def __repr__(self) -> str:
+        """Return the string representation of the GeoQuery instance."""
         boxes = f"[{len(self.boxes)} BoundingBox]" if self.boxes is not None else None
         points = self.points if self.points is not None else None
         return (
@@ -91,15 +100,15 @@ class GeoQuery:
 
     @property
     def points(self) -> Points | None:
-        """the points used to sample the dataset."""
+        """The points used to sample the dataset."""
         return self._points
 
     @property
     def boxes(self) -> list[BoundingBox] | None:
-        """the bounding boxes used to sample the dataset."""
+        """The bounding boxes used to sample the dataset."""
         return self._boxes
 
     @property
     def polygons(self) -> Points | None:
-        """the polygons used to sample the dataset."""
+        """The polygons used to sample the dataset."""
         return self._polygons

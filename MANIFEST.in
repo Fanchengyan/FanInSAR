@@ -1,0 +1,2 @@
+include faninsar/cmaps/*
+exclude faninsar/cmaps/__pycache__/*

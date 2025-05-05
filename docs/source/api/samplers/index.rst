@@ -1,12 +1,9 @@
 Dataset Samplers
 ================
 
+.. autosummary::
+   :toctree: generated/
 
-RowSampler
-----------
-
-.. autoclass:: faninsar.samplers.RowSampler
-    :members:
-    :undoc-members:
-    :member-order: bysource
-    :show-inheritance:
+   faninsar.samplers.RowSampler
+   faninsar.samplers.ColSampler
+   faninsar.samplers.RowColSampler

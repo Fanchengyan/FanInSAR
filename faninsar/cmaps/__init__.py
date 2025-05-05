@@ -1,5 +1,6 @@
 import matplotlib.colors as mcolors
 
+# TODO: Add cpt-city colormaps
 from . import GMT, SCM, cmocean, colorcet
 from .cmocean import (
     algae,
@@ -18,8 +19,6 @@ from .cmocean import (
     dense_r,
     diff,
     diff_r,
-    gray,
-    gray_r,
     haline,
     haline_r,
     ice,
@@ -42,8 +41,6 @@ from .cmocean import (
     tempo_r,
     thermal,
     thermal_r,
-    topo,
-    topo_r,
     turbid,
     turbid_r,
 )
@@ -76,8 +73,6 @@ from .colorcet import (
     dimgray_r,
     fire,
     fire_r,
-    gray,
-    gray_r,
     gwv,
     gwv_r,
     isolum,
@@ -92,8 +87,6 @@ from .colorcet import (
     kgy_r,
     kr,
     kr_r,
-    rainbow,
-    rainbow_r,
 )
 from .GMT import (
     abyss,
@@ -260,7 +253,7 @@ from .SCM import (
     vikO_r,
 )
 
-__all__ = ["GnBu_RdPl", "WtBuPl", "WtHeatRed", "RdGyBu"]
+__all__ = ["GnBu_RdPl", "RdGyBu", "WtBuPl", "WtHeatRed"]
 __all__ += SCM.__all__
 __all__ += GMT.__all__
 __all__ += cmocean.__all__
@@ -287,7 +280,9 @@ RdGyBu = mcolors.LinearSegmentedColormap.from_list("RdGrBu", colors, N=100)
 colors = ["#8f07ff", "#d5734a", white, "#0571b0", "#01ef6c"]
 GnBu_RdPl = mcolors.LinearSegmentedColormap.from_list("GnBu_RdPl", colors, N=100)
 GnBu_RdPl_r = mcolors.LinearSegmentedColormap.from_list(
-    "GnBu_RdPl_r", colors[::-1], N=100
+    "GnBu_RdPl_r",
+    colors[::-1],
+    N=100,
 )
 
 colors = [white, "#0571b0", "#8f07ff", "#d5734a"]
@@ -305,7 +300,9 @@ WtRdPl_r = mcolors.LinearSegmentedColormap.from_list("WtRdPl_r", colors[::-1], N
 colors = [white, "#fff7b3", "#fb9d59", "#aa0526"]
 WtHeatRed = mcolors.LinearSegmentedColormap.from_list("WtHeatRed", colors, N=100)
 WtHeatRed_r = mcolors.LinearSegmentedColormap.from_list(
-    "WtHeatRed_r", colors[::-1], N=100
+    "WtHeatRed_r",
+    colors[::-1],
+    N=100,
 )
 
 

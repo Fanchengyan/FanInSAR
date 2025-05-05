@@ -1,3 +1,4 @@
+from .freeze_thaw_process import FreezeThawCycle
 from .inversion import (
     NSBASInversion,
     NSBASMatrixFactory,
@@ -15,8 +16,6 @@ from .tsmodels import (
     QuadraticModel,
     TimeSeriesModels,
 )
-
-from .freeze_thaw_process import FreezeThawCycle
 
 available_models = [
     "LinearModel",
@@ -39,7 +38,7 @@ MAP_MODEL = {
 }
 
 
-def get_model(name):
+def get_model(name: str) -> TimeSeriesModels:
     """Get a model object from a string name.
 
     Parameters
@@ -51,8 +50,9 @@ def get_model(name):
     -------
     model : Model
         Model class.
+
     """
-    if name in MAP_MODEL.keys():
+    if name in MAP_MODEL:
         return MAP_MODEL[name]
-    else:
-        raise ValueError(f"Model {name} not found.")
+    msg = f"Model {name} not found. Available models are: {available_models}"
+    raise ValueError(msg)

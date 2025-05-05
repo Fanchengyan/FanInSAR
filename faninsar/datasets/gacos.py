@@ -1,12 +1,17 @@
+"""A module for managing the data of GACOS product."""
+
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
-from faninsar._core.pair_tools import Pairs
 from faninsar.datasets.base import ApsDataset, ApsPairs
-from faninsar.query.query import BoundingBox, Points
+
+if TYPE_CHECKING:
+    from faninsar._core.sar.pairs import Pairs
+    from faninsar.query.query import BoundingBox, Points
 
 
 class GACOS(ApsDataset):
@@ -19,7 +24,6 @@ class GACOS(ApsDataset):
 
     Examples
     --------
-
     >>> from faninsar.datasets import GACOS
     >>> from faninsar.datasets import HyP3
     >>> from faninsar.query import BoundingBox, Points
@@ -45,16 +49,17 @@ class GACOS(ApsDataset):
     using reference points, roi and HyP3 pairs to generate gacos pair files
 
     >>> gacos.to_pair_files(out_dir, ds_hyp3.pairs, ref_points, roi)
+
     """
 
     #: This expression is used to find the GACOS files.
     pattern = "*.ztd.tif"
 
     @classmethod
-    def parse_dates(cls, paths: list[Path]):
+    def parse_dates(cls, paths: list[Path]) -> pd.DatetimeIndex:
+        """Parse dates from the paths of GACOS files."""
         dates_str = [Path(i).stem.split(".")[0] for i in paths]
-        dates = pd.to_datetime(dates_str, format="%Y%m%d")
-        return dates
+        return pd.to_datetime(dates_str, format="%Y%m%d")
 
     def to_pair_files(
         self,
@@ -64,7 +69,7 @@ class GACOS(ApsDataset):
         roi: BoundingBox | None = None,
         overwrite: bool = False,
         prefix: str = "GACOS",
-    ):
+    ) -> None:
         """Generate aps-pair files for given pairs and reference points.
 
         Parameters
@@ -81,14 +86,13 @@ class GACOS(ApsDataset):
             if True, overwrite existing files, default: False
         prefix : str, optional
             prefix of the aps-pair files, default: "GACOS"
+
         """
-        return super().to_pair_files(out_dir, pairs, ref_points, roi, overwrite, prefix)
+        super().to_pair_files(out_dir, pairs, ref_points, roi, overwrite, prefix)
 
 
 class GACOSPairs(ApsPairs):
-    """
-    A dataset manages the data of GACOS pairs.
-    """
+    """A dataset manages the data of GACOS pairs."""
 
     #: This expression is used to find the GACOSPairs files.
     pattern = "*.tif"

@@ -7,43 +7,44 @@
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = "FanInSAR"
-copyright = "2024, Fan Chengyan (Fancy)"
-author = "Fan Chengyan (Fancy)"
+copyright = "2024, Chengyan (Fancy) Fan"
+author = "Chengyan (Fancy) Fan"
 release = "v0.1"
 
-from pathlib import Path
 
-from myst_sphinx_gallery import GalleryConfig, __version__, generate_gallery
+from myst_sphinx_gallery import GalleryConfig
 
 myst_sphinx_gallery_config = GalleryConfig(
-    examples_dirs="../../examples",
-    gallery_dirs="auto_examples",
-    root_dir=Path(__file__).parent,
-    notebook_thumbnail_strategy="code",
+    # notebook_thumbnail_strategy="code",
     thumbnail_strategy="last",
 )
-generate_gallery(myst_sphinx_gallery_config)
+
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 extensions = [
     "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.inheritance_diagram",
+    "sphinx.ext.coverage",
     "sphinx.ext.doctest",
     "sphinx.ext.intersphinx",
     "sphinx.ext.napoleon",
     "sphinx.ext.todo",
+    "sphinx.ext.viewcode",
     "myst_nb",
     "sphinx_copybutton",
     "sphinx_design",
     "sphinx_togglebutton",
+    "myst_sphinx_gallery"
 ]
 source_suffix = {
     ".rst": "restructuredtext",
     ".md": "myst-nb",
     ".myst": "myst-nb",
 }
-myst_enable_extensions = ["colon_fence"]
+myst_enable_extensions = ["colon_fence", "dollarmath", "amsmath", "deflist"]
 myst_url_schemes = ["http", "https", "mailto"]
 suppress_warnings = ["mystnb.unknown_mime_type"]
 nb_execution_mode = "off"
@@ -57,7 +58,7 @@ exclude_patterns = []
 
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
-html_css_files = ["custom.css"]
+html_css_files = ["css/custom.css", "css/gallery.css"]
 html_logo = "_static/logo/logo.png"
 html_favicon = "_static/logo/icon.svg"
 
@@ -87,9 +88,10 @@ video_enforce_extra_source = True
 autodoc_default_options = {
     "members": True,
     "undoc-members": True,
-    "member-order": "bysource",
-    "special-members": "__init__",
-    ":show-inheritance:": True,
+    # "special-members": "__init__",
+    "member-order": "groupwise",
+    "show-inheritance": True,
+    "inherited-members": True,
 }
 html_context = {
     "github_url": "https://github.com",
