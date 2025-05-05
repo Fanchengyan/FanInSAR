@@ -20,6 +20,7 @@ from .sar import (
     DaySpan,
     Loop,
     Loops,
+    Pair,
     Pairs,
     PairsFactory,
     PhaseDeformationConverter,

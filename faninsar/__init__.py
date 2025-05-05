@@ -6,6 +6,7 @@ from ._core import (
     GeoDataFormatConverter,
     Loop,
     Loops,
+    Pair,
     Pairs,
     PairsFactory,
     PhaseDeformationConverter,
