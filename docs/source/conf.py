@@ -62,9 +62,16 @@ html_css_files = ["css/custom.css", "css/gallery.css"]
 html_logo = "_static/logo/logo.png"
 html_favicon = "_static/logo/icon.svg"
 
+# hide left sidebar for orphan pages
+html_sidebars = {
+    "install": [],
+    "contributing": [],
+}
+
+
 html_theme_options = {
     "show_toc_level": 2,
-    "show_nav_level": 2,
+    "show_nav_level": 1,
     "header_links_before_dropdown": 10,
     "use_edit_page_button": True,
     "icon_links": [
@@ -81,6 +88,9 @@ html_theme_options = {
             "type": "fontawesome",
         },
     ],
+    "switcher": {
+        "json_url": "https://eomaps.readthedocs.io/en/dev/_static/version_switcher.json",
+    }
 }
 
 video_enforce_extra_source = True

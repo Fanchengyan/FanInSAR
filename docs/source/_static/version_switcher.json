@@ -1,0 +1,15 @@
+[
+  {
+    "version": "latest",
+    "url": "https://faninsar.readthedocs.io/en/latest/",
+    "preferred": true
+  },
+  {
+    "version": "dev",
+    "url": "https://faninsar.readthedocs.io/en/dev/"
+  },
+  {
+    "version": "v0.0.1-rc",
+    "url": "https://faninsar.readthedocs.io/en/v0.0.1-rc/"
+  }
+]
