@@ -11,7 +11,7 @@ copyright = "2024, Chengyan (Fancy) Fan"
 author = "Chengyan (Fancy) Fan"
 release = "v0.1"
 
-
+import os
 from myst_sphinx_gallery import GalleryConfig
 
 myst_sphinx_gallery_config = GalleryConfig(
@@ -65,9 +65,12 @@ html_favicon = "_static/logo/icon.svg"
 # hide left sidebar for orphan pages
 html_sidebars = {
     "install": [],
-    "contributing": [],
+    "contributing/index": [],
 }
 
+version_match = os.environ.get("READTHEDOCS_VERSION")
+if not version_match:
+    version_match = "latest"
 
 html_theme_options = {
     "show_toc_level": 2,
@@ -89,8 +92,10 @@ html_theme_options = {
         },
     ],
     "switcher": {
-        "json_url": "https://eomaps.readthedocs.io/en/dev/_static/version_switcher.json",
-    }
+        "json_url": "https://faninsar.readthedocs.io/en/dev/_static/version_switcher.json",
+        "version_match": version_match,
+    },
+    "navbar_start": ["navbar-logo", "version-switcher"],
 }
 
 video_enforce_extra_source = True
