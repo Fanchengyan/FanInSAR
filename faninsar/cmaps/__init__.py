@@ -1,7 +1,7 @@
 import matplotlib.colors as mcolors
 
 # TODO: Add cpt-city colormaps
-from . import GMT, SCM, cmocean, colorcet
+from . import GMT, SCM, cmocean, colorcet, mintpy
 from .cmocean import (
     algae,
     algae_r,
@@ -172,6 +172,7 @@ from .GMT import (
     wysiwyg,
     wysiwyg_r,
 )
+from .mintpy import cmy, cmy_r, dismph, dismph_r, romanian, romanian_r
 from .SCM import (
     acton,
     acton_r,
@@ -258,7 +259,7 @@ __all__ += SCM.__all__
 __all__ += GMT.__all__
 __all__ += cmocean.__all__
 __all__ += colorcet.__all__
-
+__all__ += mintpy.__all__
 
 names = __all__.copy()[3:]
 
