@@ -68,6 +68,8 @@ html_sidebars = {
     "contributing/index": [],
 }
 
+# version-switcher details
+version_json = "https://faninsar.readthedocs.io/en/dev/_static/version_switcher.json"
 version_match = os.environ.get("READTHEDOCS_VERSION")
 if not version_match:
     version_match = "latest"
@@ -92,7 +94,7 @@ html_theme_options = {
         },
     ],
     "switcher": {
-        "json_url": "https://faninsar.readthedocs.io/en/dev/_static/version_switcher.json",
+        "json_url": version_json,
         "version_match": version_match,
     },
     "navbar_start": ["navbar-logo", "version-switcher"],
