@@ -57,18 +57,15 @@ class GeoQuery:
         if points is not None and not isinstance(points, Points):
             msg = f"points must be a Points. Got {type(points)}"
             raise TypeError(msg)
-        if boxes is not None:
-            if isinstance(boxes, BoundingBox):
-                boxes = [boxes]
-            if not isinstance(boxes, list):
-                try:
-                    boxes = list(boxes)
-                except TypeError as e:
-                    msg = (
-                        "boxes must be a BoundingBox or a list of "
-                        f"BoundingBox. Got {type(boxes)}"
-                    )
-                    raise TypeError(msg) from e
+        if boxes is not None and not isinstance(boxes, (list, BoundingBox)):
+            try:
+                boxes = list(boxes)
+            except TypeError as e:
+                msg = (
+                    "boxes must be a BoundingBox or a list of "
+                    f"BoundingBox. Got {type(boxes)}"
+                )
+                raise TypeError(msg) from e
         if polygons is not None:
             if not isinstance(polygons, Polygons):
                 msg = f"polygons must be a Polygons. Got {type(polygons)}"
@@ -82,13 +79,23 @@ class GeoQuery:
 
     def __str__(self) -> str:
         """Return the string representation of the GeoQuery instance."""
-        boxes = f"[{len(self.boxes)} BoundingBox]" if self.boxes is not None else None
+        boxes = None
+        if self.boxes is not None:
+            if isinstance(self.boxes, BoundingBox):
+                boxes = "1 BoundingBox"
+            else:
+                boxes = f"[{len(self.boxes)} BoundingBox]"
         points = self.points if self.points is not None else None
         return f"GeoQuery(points={points}, boxes={boxes}, polygons={self.polygons})"
 
     def __repr__(self) -> str:
         """Return the string representation of the GeoQuery instance."""
-        boxes = f"[{len(self.boxes)} BoundingBox]" if self.boxes is not None else None
+        boxes = None
+        if self.boxes is not None:
+            if isinstance(self.boxes, BoundingBox):
+                boxes = "1 BoundingBox"
+            else:
+                boxes = f"[{len(self.boxes)} BoundingBox]"
         points = self.points if self.points is not None else None
         return (
             "GeoQuery("
@@ -104,11 +111,11 @@ class GeoQuery:
         return self._points
 
     @property
-    def boxes(self) -> list[BoundingBox] | None:
+    def boxes(self) -> list[BoundingBox] | BoundingBox | None:
         """The bounding boxes used to sample the dataset."""
         return self._boxes
 
     @property
-    def polygons(self) -> Points | None:
+    def polygons(self) -> Polygons | None:
         """The polygons used to sample the dataset."""
         return self._polygons
