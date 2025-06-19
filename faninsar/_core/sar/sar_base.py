@@ -11,6 +11,7 @@ import pandas as pd
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from matplotlib.axes import Axes
     from numpy.typing import NDArray
 
     from faninsar.constants import Frequency, Wavelength
@@ -175,7 +176,7 @@ class Baselines:
         pairs: Pairs,
         pairs_removed: Pairs | None = None,
         plot_gaps: bool = True,
-        ax: plt.Axes | None = None,
+        ax: Axes | None = None,
         xlabel: str = "Acquisition date",
         ylabel: str = "Perpendicular baseline (m)",
         legend: bool = True,
@@ -184,7 +185,7 @@ class Baselines:
         pairs_removed_kwargs: dict | None = None,
         acq_kwargs: dict | None = None,
         gaps_kwargs: dict | None = None,
-    ) -> plt.Axes:
+    ) -> Axes:
         """Plot the baselines of the interferograms.
 
         Parameters
@@ -195,7 +196,7 @@ class Baselines:
             The pairs of the interferograms which are removed. Default is None.
         plot_gaps : bool
             Whether to plot the gaps between the acquisitions. Default is True.
-        ax : plt.Axes
+        ax : matplotlib.axis.Axes
             The axes of the plot. Default is None, which means a new plot will
             be created.
         xlabel : str
@@ -222,7 +223,7 @@ class Baselines:
 
         Returns
         -------
-        ax : plt.Axes
+        ax : matplotlib.axis.Axes
             The axes of the plot.
 
         """
@@ -250,6 +251,9 @@ class Baselines:
             pairs_valid = pairs - pairs_removed
 
         # plot valid pairs
+        line_valid = None
+        line_removed = None
+        line_gaps = None
         for pair in pairs_valid:
             start, end = pair.primary, pair.secondary
             line_valid = ax.plot(
@@ -288,10 +292,20 @@ class Baselines:
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         if legend:
-            ax.legend(
-                [line_valid, line_removed, acq, line_gaps],
-                legend_labels,
-            )
+            handles = []
+            labels = []
+            if line_valid is not None:
+                handles.append(line_valid)
+                labels.append(legend_labels[0])
+            if line_removed is not None:
+                handles.append(line_removed)
+                labels.append(legend_labels[1])
+            handles.append(acq)
+            labels.append(legend_labels[2])
+            if line_gaps is not None:
+                handles.append(line_gaps)
+                labels.append(legend_labels[3])
+            ax.legend(handles, labels)
 
         return ax
 
@@ -411,7 +425,25 @@ class PhaseDeformationConverter:
         """Convert deformation (mm) to phase (radian)."""
         return deformation / self.coef_rd2mm
 
-    def wrap_phase(self, phase: NDArray[np.floating]) -> NDArray[np.floating]:
-        """Wrap phase to [0, 2π]."""
-        # TODO: add user defined range
-        return np.mod(phase, 2 * np.pi)
+    @staticmethod
+    def wrap_phase(
+        phase: np.ndarray, min_val: float = 0, max_val: float = 2 * np.pi
+    ) -> np.ndarray:
+        """Wrap phase to [min_val, max_val], by default [0, 2π].
+
+        Parameters
+        ----------
+        phase : np.ndarray
+            The phase to be wrapped.
+        min_val : float, optional
+            The minimum value of the wrapped phase, by default 0.
+        max_val : float, optional
+            The maximum value of the wrapped phase, by default 2π.
+
+        Returns
+        -------
+        np.ndarray
+            The wrapped phase.
+
+        """
+        return np.mod(phase - min_val, max_val - min_val) + min_val
