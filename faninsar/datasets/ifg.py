@@ -18,15 +18,14 @@ from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points
 
 if TYPE_CHECKING:
+    from os import PathLike
+
     from rasterio.crs import CRS
 
     from faninsar._core.sar.pairs import Pairs
-    from faninsar._core.sar.sar_base import Baselines, PhaseDeformationConverter
+    from faninsar._core.sar.sar_tools import Baselines, PhaseDeformationConverter
 
-logger = setup_logger(
-    log_name="FanInSAR.datasets.ifg",
-    log_format="%(levelname)s - %(message)s",
-)
+logger = setup_logger(__name__)
 
 
 class CoherenceDataset(PairDataset):
@@ -65,7 +64,7 @@ class CoherenceDataset(PairDataset):
             val_range = self.range
         return np.clip(arr, val_range[0], val_range[1])
 
-    def to_mean(
+    def get_mean_coh(
         self,
         pairs: Pairs | None = None,
         roi: BoundingBox | None = None,
@@ -75,8 +74,7 @@ class CoherenceDataset(PairDataset):
         Parameters
         ----------
         pairs : Pairs, optional
-            pairs to calculate the mean coherence. If None, will calculate the
-            mean coherence for all pairs.
+            pairs to calculate the mean coherence. If None, all pairs will be used.
         roi : BoundingBox, optional
             region of interest to calculate the mean coherence. If None, the roi
             of the dataset will be used.
@@ -84,38 +82,32 @@ class CoherenceDataset(PairDataset):
         Returns
         -------
         mean_coh : np.ndarray
-            mean coherence array with value range in the interval of [0, 1].
+            mean coherence array with values in the interval of [0, 1].
 
         """
         if roi is None:
             roi = self.roi
-        fill_nodata = self.fill_nodata
-        self.fill_nodata = False
+
+        profile = self.get_profile(roi)
+        width, height = profile["width"], profile["height"]
 
         # get files
         m = self.valid
         if pairs is not None:
             m &= self.pairs.where(pairs, return_type="mask")
-        files = [self._load_warp_file(f) for f in self.files.paths[m]]
+        files_coh_used = self.files.paths[m]
 
-        # load all coherence
-        coh = self._bbox_query(roi, files[0]).squeeze(0)
-        count = (~coh.mask).astype(int)
-        coh_sum = self.trim_extreme(coh.filled(0))
-        for f in tqdm(files[1:], desc="Calculating mean coherence", unit="file"):
-            coh = self._bbox_query(roi, f).squeeze(0)
-            count += (~coh.mask).astype(int)
-            coh_sum += self.trim_extreme(coh.filled(0))
+        coh_sum = np.zeros((height, width))
+        count = np.zeros((height, width))
+        for index, _ in tqdm(files_coh_used.items(), total=len(files_coh_used)):
+            coh_data = self.bbox_query(roi, index).data
+            count += np.where(coh_data.mask, 0, 1)
+            coh_sum += np.where(coh_data.mask, 0, coh_data.data)
 
-        # reset fill_nodata to original value
-        self.fill_nodata = fill_nodata
+        coh_mean = coh_sum / count
+        coh_mean = np.where(count == 0, np.nan, coh_mean)  # mask the no-data
 
-        count = np.ma.array(count, mask=(count == 0))
-        coh_sum = np.ma.array(coh_sum, mask=(count == 0))
-        # calculate the mean coherence
-        mean_coh = coh_sum / count
-
-        return self.scale_range(mean_coh)
+        return self.scale_range(coh_mean)
 
 
 class InterferogramDataset(PairDataset):
@@ -135,7 +127,7 @@ class InterferogramDataset(PairDataset):
     #: pattern used to find coherence files.
     pattern_coh = "*"
     #: value range of coherence.
-    coh_range: tuple[float, float] | None = [0, 1]
+    coh_range: tuple[float, float] = (0, 1)
 
     _ds_coh: CoherenceDataset
     _ds_dem: RasterDataset | None = None
@@ -145,8 +137,8 @@ class InterferogramDataset(PairDataset):
     def __init__(
         self,
         root_dir: str = "data",
-        paths_unw: Sequence[str | Path] | None = None,
-        paths_coh: Sequence[str | Path] | None = None,
+        paths_unw: Sequence[PathLike] | None = None,
+        paths_coh: Sequence[PathLike] | None = None,
         crs: CRS | None = None,
         res: float | tuple[float, float] | None = None,
         dtype: np.dtype | None = None,
@@ -294,9 +286,6 @@ class InterferogramDataset(PairDataset):
         # remove invalid pairs
         self._pairs = self.parse_pairs(self._files.paths)
         self._ds_coh._pairs = self.parse_pairs(self._ds_coh._files.paths)
-        # get the datetime from pairs
-        self._datetime = self.parse_datetime(paths_unw[_valid])
-        self._ds_coh._datetime = self.parse_datetime(paths_coh[_valid])
 
     def _deduplicate_pairs(self, paths: list[Path], dataset_name: str) -> list[Path]:
         """Remove duplicate pairs from the list of paths."""
@@ -507,7 +496,7 @@ class InterferogramDataset(PairDataset):
             los_ratio = np.sin(arr_theta)
         return los_ratio
 
-    def to_nan_count(
+    def get_nan_count(
         self,
         pairs: Pairs | None = None,
         roi: BoundingBox | None = None,
@@ -536,9 +525,9 @@ class InterferogramDataset(PairDataset):
         files = [self._load_warp_file(f) for f in self.files.paths[m]]
 
         # calculate the number of nan values
-        nan_count = (self._bbox_query(roi, files[0]).squeeze(0).mask).astype(int)
+        nan_count = (self._file_query_bbox(roi, files[0]).squeeze(0).mask).astype(int)
         for f in tqdm(files[1:]):
-            nan_count += (self._bbox_query(roi, f).squeeze(0).mask).astype(int)
+            nan_count += (self._file_query_bbox(roi, f).squeeze(0).mask).astype(int)
 
         # reset fill_nodata to original value
         self.fill_nodata = fill_nodata
@@ -547,7 +536,7 @@ class InterferogramDataset(PairDataset):
 
     def to_netcdf(
         self,
-        filename: str | Path,
+        filename: PathLike,
         roi: BoundingBox | None = None,
         ref_points: Points | None = None,
     ) -> None:
@@ -605,7 +594,7 @@ class InterferogramDataset(PairDataset):
 
     def to_tiffs(
         self,
-        out_dir: str | Path,
+        out_dir: PathLike,
         roi: BoundingBox | None = None,
         ref_points: Points | None = None,
         pairs: Pairs | None = None,
@@ -674,7 +663,7 @@ class InterferogramDataset(PairDataset):
                 continue
 
             src = self._load_warp_file(f_unw)
-            dest_arr = self._bbox_query(roi, src).squeeze(0)
+            dest_arr = self._file_query_bbox(roi, src).squeeze(0)
 
             if ref_points is not None:
                 ref_val = (self._points_query(ref_points, src)).mean()
@@ -701,7 +690,143 @@ class InterferogramDataset(PairDataset):
                 continue
 
             src = self._load_warp_file(f_coh)
-            dest_arr = self._bbox_query(roi, src).squeeze(0)
+            dest_arr = self._file_query_bbox(roi, src).squeeze(0)
 
             with rasterio.open(out_file, "w", **profile) as dst:
                 dst.write(dest_arr, 1)
+
+
+class HierarchicalInterferogramDataset(InterferogramDataset):
+    """A base class for hierarchical interferogram datasets.
+
+    Hierarchical dataset is a dataset that contains multiple sub-datasets,
+    like h5 and nc files.
+    """
+
+    #: pattern used to find files containing sub-datasets in the root directory
+    pattern_files = "*"
+
+    #: file type of the dataset, one of ['nc', 'h5']
+    file_type: Literal["nc", "h5"] = "nc"
+
+    #: group name of the unwrapped interferogram
+    group_unw = "/science/grids/data/unwrappedPhase"
+    #: group name of the coherence
+    group_coh = "/science/grids/data/coherence"
+    #: value range of coherence.
+    coh_range: tuple[float, float] | None = [0, 1]
+
+    _ds_coh: CoherenceDataset
+    _ds_dem: RasterDataset | None = None
+    _ds_mask: RasterDataset | None = None
+    _ds_aps: RasterDataset | None = None
+
+    def __init__(
+        self,
+        root_dir: str = "data",
+        paths_unw: Sequence[PathLike] | None = None,
+        paths_coh: Sequence[PathLike] | None = None,
+        crs: CRS | None = None,
+        res: float | tuple[float, float] | None = None,
+        dtype: np.dtype | None = None,
+        nodata: float | None = None,
+        roi: BoundingBox | None = None,
+        bands_unw: Sequence[str] | None = None,
+        bands_coh: Sequence[str] | None = None,
+        cache: bool = True,
+        resampling: Resampling = Resampling.nearest,
+        fill_nodata: bool = False,
+        verbose: bool = True,
+        keep_common: bool = True,
+    ) -> None:
+        """Initialize a new InterferogramDataset instance.
+
+        Parameters
+        ----------
+        root_dir: str
+            root_dir directory where dataset can be found.
+        paths_unw: list of str, optional
+            list of unwrapped interferogram file paths to use instead of searching
+            for files in ``root_dir``. If None, files will be searched for in
+            ``root_dir``.
+        paths_coh: list of str, optional
+            list of coherence file paths to use instead of searching for files in
+            ``root_dir``. If None, files will be searched for in ``root_dir``.
+        crs: CRS, optional
+            the output coordinate reference system term:`(CRS)` of the dataset.
+            If None, the CRS of the first file found will be used.
+        res: float, optional
+            resolution of the output dataset in units of CRS. If None, the resolution
+            of the first file found will be used.
+        dtype: numpy.dtype, optional
+            data type of the output dataset. If None, the data type of the first
+            file found will be used.
+        nodata: float or int, optional
+            no data value of the output dataset. If None, the no data value of the
+            first file found will be used. This parameter is useful when the no
+            data value is not stored in the file.
+        roi: BoundingBox, optional
+            region of interest to load from the dataset. If None, the union of all
+            files bounds in the dataset will be used.
+        bands_unw: list of str, optional
+            names of bands to return (defaults to all bands) for unwrapped
+            interferograms.
+        bands_coh: list of str, optional
+            names of bands to return (defaults to all bands) for coherence.
+        cache: bool, optional
+            if True, cache file handle to speed up repeated sampling
+        resampling: Resampling, optional
+            Resampling algorithm used when reading input files.
+            Default: `Resampling.nearest`.
+        fill_nodata : bool, optional
+            Whether to fill holes in the queried data by interpolating them using
+            inverse distance weighting method provided by the
+            :func:`rasterio.fill.fillnodata`. Default: False.
+
+            .. note::
+                This parameter is only used when sampling data using bounding
+                boxes or polygons queries, and will not work for points queries.
+        verbose: bool, optional, default: True
+            if True, print verbose output.
+        keep_common: bool, optional, default: True
+            Only used when the number of interferograms and coherence files are
+            not equal. If True, keep the common pairs of interferograms and
+            coherence files and raise a warning. If False, raise an error.
+
+        """
+        root_dir = Path(root_dir)
+
+        if paths_unw is None and paths_coh is None:
+            files = np.unique(list(root_dir.rglob(self.pattern_files)))
+            paths_unw = self._get_sub_dataset_paths(files, self.group_unw)
+            paths_coh = self._get_sub_dataset_paths(files, self.group_coh)
+
+        super().__init__(
+            root_dir=root_dir,
+            paths_unw=paths_unw,
+            paths_coh=paths_coh,
+            crs=crs,
+            res=res,
+            dtype=dtype,
+            nodata=nodata,
+            roi=roi,
+            bands_unw=bands_unw,
+            bands_coh=bands_coh,
+            cache=cache,
+            resampling=resampling,
+            fill_nodata=fill_nodata,
+            verbose=verbose,
+            keep_common=keep_common,
+        )
+
+    def _get_sub_dataset_paths(self, file_paths: list[str], group: str) -> list[str]:
+        if self.file_type == "nc":
+            paths = [f"netcdf:{path}:{group}" for path in file_paths]
+        elif self.file_type == "h5":
+            paths = [f"hdf5:{path}:{group}" for path in file_paths]
+        else:
+            msg = f"Invalid file type: {self.file_type}"
+            logger.error(msg, stacklevel=2)
+            raise ValueError(msg)
+
+        return paths

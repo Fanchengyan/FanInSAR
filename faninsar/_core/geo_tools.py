@@ -6,7 +6,7 @@ import pprint
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,22 +26,21 @@ from tqdm import tqdm
 from faninsar.logging import setup_logger
 from faninsar.query.bbox import BoundingBox
 
-from .file_tools import load_meta_values
+from .file_tools import load_metas
 
 if TYPE_CHECKING:
+    from os import PathLike
+
     from matplotlib.cm import ScalarMappable
 
-    from faninsar.typing import CrsLike, PathLike
+    from faninsar.typing import CrsLike
 
-logger = setup_logger(
-    log_name=__name__,
-    log_format="%(levelname)s - %(message)s",
-)
+logger = setup_logger(__name__)
 
 
 def _ensure_bounds_in_wgs84(
     bounds: tuple[float, float, float, float],
-) -> tuple[float, float, float, float]:
+) -> None:
     """Ensure the bounds are in WGS84 coordinate system."""
     west, south, east, north = bounds
     if west < -180 or east > 180 or south < -90 or north > 90:
@@ -49,9 +48,7 @@ def _ensure_bounds_in_wgs84(
             "bounds should be in WGS84 coordinate system, "
             f"but got [{west}, {south}, {east}, {north}]"
         )
-        raise ValueError(
-            msg,
-        )
+        raise ValueError(msg)
 
 
 def save_colorbar(
@@ -190,7 +187,7 @@ def array2kml(
     kml_doc.append(cbar_overlay)
 
     kml = KML.kml(kml_doc)
-    with Path(out_file).open("w") as f:
+    with Path(out_file).open("w", encoding="utf-8") as f:
         f.write(etree.tostring(kml, pretty_print=True).decode("utf8"))
     if verbose:
         info = f"write kml file to {out_file}"
@@ -315,7 +312,7 @@ def transform_from_latlon(
         latitudes and longitudes
 
     """
-    west, north, xsize, ysize, _, _ = geoinfo_from_latlon(lat, lon)
+    (west, north), (xsize, ysize), _ = geoinfo_from_latlon(lat, lon)
 
     return transform.from_origin(
         west - 0.5 * xsize,  # center to left
@@ -325,7 +322,7 @@ def transform_from_latlon(
     )
 
 
-def latlon_from_profile(profile: RasterioProfile) -> np.ndarray:
+def latlon_from_profile(profile: RasterioProfile) -> tuple[np.ndarray, np.ndarray]:
     """Get the latitude and longitude from rasterio profile data.
 
     Parameters
@@ -547,8 +544,8 @@ class GeoDataFormatConverter:
 
     def __init__(self) -> None:
         """Initialize the GeoDataFormatConverter class."""
-        self.arr: np.ndarray = None
-        self.profile: RasterioProfile = None
+        self.arr: np.ndarray | None = None
+        self.profile: RasterioProfile | None = None
 
     @property
     def _profile_str(self) -> str:
@@ -601,12 +598,12 @@ class GeoDataFormatConverter:
             msg = f"{binary_profile_file} not found"
             raise FileNotFoundError(msg)
 
-        with Path(binary_profile_file).open() as f:
+        with Path(binary_profile_file).open(encoding="utf-8") as f:
             profile = eval(f.read())
 
         # todo: auto detect dtype by shape
         if dtype == "auto":
-            dtype = np.float32
+            dtype = "float32"
 
         arr = np.fromfile(binary_file, dtype=dtype)
         if order == "BSQ":
@@ -665,6 +662,10 @@ class GeoDataFormatConverter:
             https://desktop.arcgis.com/en/arcmap/latest/manage-data/raster-and-images/bil-bip-and-bsq-raster-files.htm
 
         """
+        if self.arr is None:
+            msg = "data array is not set yet"
+            raise AttributeError(msg)
+
         if order == "BSQ":
             arr = self.arr
         elif order == "BIL":
@@ -673,11 +674,11 @@ class GeoDataFormatConverter:
             arr = np.transpose(self.arr, (1, 0, 2))
 
         # write data into a binary file
-        (arr.astype(np.float32).tofile(out_file))
+        (arr.astype("float32").tofile(out_file))
 
         # write profile into a file with the same name
         out_profile_file = str(out_file) + ".profile"
-        with Path(out_profile_file).open("w") as f:
+        with Path(out_profile_file).open("w", encoding="utf-8") as f:
             f.write(self._profile_str)
 
     def to_raster(self, out_file: PathLike, driver: str = "GTiff") -> None:
@@ -692,6 +693,14 @@ class GeoDataFormatConverter:
             More details can be found at: https://gdal.org/drivers/raster/index.html
 
         """
+        if self.profile is None:
+            msg = "profile is not set yet"
+            raise AttributeError(msg)
+
+        if self.arr is None:
+            msg = "data array is not set yet"
+            raise AttributeError(msg)
+
         self.profile.update({"driver": driver})
         with rasterio.open(out_file, "w", **self.profile) as ds:
             bands = range(1, self.profile["count"] + 1)
@@ -707,6 +716,10 @@ class GeoDataFormatConverter:
             or (band, height, width).
 
         """
+        if self.arr is None:
+            msg = "data array is not set yet"
+            raise AttributeError(msg)
+
         if not isinstance(arr, np.ndarray):
             try:
                 arr = np.array(arr)
@@ -734,18 +747,18 @@ class GeoDataFormatConverter:
         arr, profile = self._load_raster(raster_file)
         self.add_band(arr)
 
-    def add_band_from_binary(self, binary_file: PathLike) -> None:
-        """Add band to the data array from a binary file.
+    # def add_band_from_binary(self, binary_file: PathLike) -> None:
+    #     """Add band to the data array from a binary file.
 
-        Parameters
-        ----------
-        binary_file : str or Path
-            The binary file to be added. the binary file should be with a profile
-            file with the same name.
+    #     Parameters
+    #     ----------
+    #     binary_file : str or Path
+    #         The binary file to be added. the binary file should be with a profile
+    #         file with the same name.
 
-        """
-        arr, profile = self._load_binary(binary_file)
-        self.add_band(arr)
+    #     """
+    #     arr, profile = self._load_binary(binary_file)
+    #     self.add_band(arr)
 
     def update_arr(
         self,
@@ -772,7 +785,8 @@ class GeoDataFormatConverter:
 
         """
         self.arr = arr
-        if not hasattr(self, "profile"):
+
+        if self.profile is None:
             msg = "profile is not set yet"
             raise AttributeError(msg)
 
@@ -863,7 +877,7 @@ class Profile:
     dtype: str | np.dtype | None = None
 
     #: Other keyword arguments for :class:`rasterio.profiles.Profile` class.
-    kwargs: dict | None = field(repr=False, default_factory=dict)
+    kwargs: dict = field(repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         """Post initialization."""
@@ -873,6 +887,7 @@ class Profile:
             self.crs = CRS.from_user_input(self.crs)
         for key in self.kwargs:
             setattr(self, key, self.kwargs[key])
+        self.crs = cast("CRS", self.crs)
 
     def __getitem__(self, key: str) -> Any:
         """Get the value of the key."""
@@ -943,7 +958,7 @@ class Profile:
             cellsize      0.008333
             nodata_value  -9999
         """
-        dict_common = load_meta_values(
+        dict_common = load_metas(
             ascii_file,
             keys=["ncols", "nrows", "cellsize", "nodata_value"],
             line_end=10,
@@ -963,7 +978,7 @@ class Profile:
         )
 
         # get the coordinates of left and bottom corner
-        dict_corner = load_meta_values(
+        dict_corner = load_metas(
             ascii_file,
             keys=["xllcorner", "yllcorner"],
             line_end=10,
@@ -975,7 +990,7 @@ class Profile:
             left = float(dict_corner["xllcorner"])
             bottom = float(dict_corner["yllcorner"])
         else:
-            dict_center = load_meta_values(
+            dict_center = load_metas(
                 ascii_file,
                 keys=["xllcenter", "yllcenter"],
                 line_end=10,
@@ -1000,7 +1015,7 @@ class Profile:
     @classmethod
     def from_profile_file(cls, profile_file: PathLike) -> Profile:
         """Create a Profile object from a profile file."""
-        with Path(profile_file).open() as f:
+        with Path(profile_file).open(encoding="utf-8") as f:
             profile = eval(f.read())
         profile, kwargs = cls._split_profile(profile)
         return cls(**profile, kwargs=kwargs)

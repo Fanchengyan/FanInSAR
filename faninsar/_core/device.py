@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-import warnings
 from typing import TYPE_CHECKING
 
 import torch
+
+from faninsar.logging import setup_logger
+
+logger = setup_logger(__name__)
 
 if TYPE_CHECKING:
     from faninsar.typing import DeviceLike
@@ -42,24 +45,24 @@ def parse_device(device: DeviceLike | None) -> torch.device:
         pass
     else:
         msg = "device must be a string or torch.device"
+        logger.error(msg, stack_level=2)
         raise TypeError(msg)
     return device
 
 
-def _parse_device_str(device: str) -> str:
+def _parse_device_str(device: str | None) -> str:
     if device is None or device.lower() == "gpu":
         if cuda_available():
             device = "cuda"
         elif mps_available():
             device = "mps"
         else:
-            if isinstance(device, str):
-                warnings.warn(
-                    "No GPU detected. Falling back to CPU. "
-                    "If you would like to use a GPU, please install PyTorch"
-                    " with CUDA support.",
-                    stacklevel=1,
-                )
+            msg = (
+                "No GPU detected. Falling back to CPU. "
+                "If you would like to use a GPU, please install PyTorch"
+                " with CUDA support.",
+            )
+            logger.warning(msg, stacklevel=2)
             device = "cpu"
     else:
         device = device.lower()

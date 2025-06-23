@@ -51,7 +51,7 @@ class BaseResult:
         return len(self.data)
 
     @property
-    def data(self) -> list[np.ndarray] | None:
+    def data(self) -> list[np.ndarray | None]:
         """List of numpy arrays."""
         if self.result is None:
             return []

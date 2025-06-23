@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from faninsar import Loop, Loops, TripletLoops
     from faninsar.typing import PairLike, PairsLike, PairsOrder
 
-logger = setup_logger(log_name=__name__)
+logger = setup_logger(__name__)
 
 
 class Pair:
@@ -751,7 +751,7 @@ class Pairs:
         """Return the pairs as a numpy array."""
         return np.asarray(self._values, dtype=dtype)
 
-    def to_frame(self) -> pd.DataFrame:
+    def to_dataframe(self) -> pd.DataFrame:
         """Return the pairs as a DataFrame."""
         frame = pd.DataFrame()
         frame["primary"] = self.primary
@@ -759,7 +759,7 @@ class Pairs:
         frame["days"] = self.days
         return frame
 
-    def to_xarray(self) -> pd.DataFrame:
+    def to_xarray(self) -> xr.Variable:
         """Return the pairs as a xarray DataArray."""
         return xr.Variable(dims=["pairs", "primary-secondary"], data=self._values)
 

@@ -13,8 +13,14 @@ import pandas as pd
 from rasterio.crs import CRS
 from rasterio.warp import transform as warp_transform
 
+from faninsar.logging import setup_logger
+
+logger = setup_logger(__name__)
+
 if TYPE_CHECKING:
-    from pathlib import Path
+    from os import PathLike
+
+    import numpy.typing as npt
 
     from faninsar.typing import CrsLike
 
@@ -78,7 +84,7 @@ class Points:
 
     convert to GeoDataFrame:
 
-    >>> pts.to_GeoDataFrame()
+    >>> pts.to_geodataframe()
         x	y	geometry
     0	1.0	2.0	POINT (1.00000 2.00000)
     1	2.0	3.0	POINT (2.00000 3.00000)
@@ -93,9 +99,9 @@ class Points:
 
     def __init__(
         self,
-        points: Sequence[float | Sequence[float]],
+        points: Sequence[float | Sequence[float]] | npt.ArrayLike,
         crs: CrsLike = None,
-        dtype: np.dtype = np.float32,
+        dtype: npt.DTypeLike = np.float32,
     ) -> None:
         """Initialize a Points object.
 
@@ -109,7 +115,7 @@ class Points:
         crs: Any, optional, default: None
             The coordinate reference system of the points. Can be any object
             that can be passed to :meth:`pyproj.crs.CRS.from_user_input`.
-        dtype : np.dtype, optional
+        dtype : npt.DTypeLike, optional
             The data type of the points. Default is np.float32.
 
         Raises
@@ -124,6 +130,7 @@ class Points:
             self._values = self._values.reshape(1, -1)
         if self._values.ndim != 2 or self._values.shape[1] != 2:
             msg = f"points must be a 2D array with 2 columns. Got {self._values}"
+            logger.error(msg, stacklevel=2)
             raise ValueError(msg)
 
     def __len__(self) -> int:
@@ -140,18 +147,21 @@ class Points:
 
     def __contains__(self, item: Points | Sequence[float]) -> bool:
         """Check if the item is in the points."""
+        item_val: np.ndarray
         if isinstance(item, Points):
-            item = item.values
-        elif isinstance(item, SequenceABC):
-            item = np.array(item, dtype=np.float64)
+            item_val = item.values
+        elif isinstance(item, (SequenceABC, np.ndarray)):
+            item_val = np.array(item, dtype=np.float64)
         else:
             msg = f"item must be an Points or Sequence. Got {type(item)}"
-            raise TypeError(msg)
-        if item.ndim > 2 or item.shape[1] != 2:
-            msg = f"item must be a 2D array with shape (n, 2). Got {item.shape()}"
+            logger.error(msg)
+            raise TypeError(msg, stacklevel=2)
+        if item_val.ndim > 2 or item_val.shape[1] != 2:
+            msg = f"item must be a 2D array with shape (n, 2). Got {item_val.shape()}"
+            logger.error(msg, stacklevel=2)
             raise ValueError(msg)
 
-        return np.any(np.all(self._values == item, axis=1))
+        return np.any(np.all(self._values == item_val, axis=1))
 
     def __str__(self) -> str:
         """Return the string representation of the Points."""
@@ -160,7 +170,7 @@ class Points:
     def __repr__(self) -> str:
         """Return the string representation of the Points."""
         prefix = "Points:\n"
-        middle = self.to_DataFrame().to_string(max_rows=10)
+        middle = self.to_dataframe().to_string(max_rows=10)
         suffix = f"\n[count={len(self)}, crs='{self.crs}']"
 
         return f"{prefix}{middle}{suffix}"
@@ -175,6 +185,7 @@ class Points:
         """Return the union of two Points."""
         if not isinstance(other, Points):
             msg = f"other must be an instance of Points. Got {type(other)}"
+            logger.error(msg, stacklevel=2)
             raise TypeError(msg)
 
         other, crs_new = self._ensure_points_crs(other)
@@ -184,6 +195,7 @@ class Points:
         """Return the set difference of two Points."""
         if not isinstance(other, Points):
             msg = f"other must be an instance of Points. Got {type(other)}"
+            logger.error(msg, stacklevel=2)
             raise TypeError(msg)
 
         other, crs_new = self._ensure_points_crs(other)
@@ -212,7 +224,9 @@ class Points:
         return other, crs_new
 
     @staticmethod
-    def _find_field(gdf: gpd.GeoDataFrame, field_names: list[str]) -> str | None:
+    def _find_field(
+        gdf: gpd.GeoDataFrame | pd.DataFrame, field_names: list[str]
+    ) -> str | None:
         """Find the field name in the GeoDataFrame.
 
         Parameters
@@ -236,15 +250,15 @@ class Points:
     @classmethod
     def _ensure_fields(
         cls,
-        gdf: gpd.GeoDataFrame,
-        x_field: str,
-        y_field: str,
-    ) -> np.ndarray | None:
+        gdf: gpd.GeoDataFrame | pd.DataFrame,
+        x_field: str | None,
+        y_field: str | None,
+    ) -> tuple[str, str]:
         """Parse the field from the GeoDataFrame.
 
         Parameters
         ----------
-        gdf : gpd.GeoDataFrame
+        gdf : gpd.GeoDataFrame | pd.DataFrame
             The GeoDataFrame to be parsed.
         x_field : str
             The field name of the x coordinate.
@@ -253,11 +267,16 @@ class Points:
 
         Returns
         -------
-        np.ndarray | None
-            The values of the field. If the field does not exist, return None.
+        tuple[str, str]
+            The field names of the x and y coordinates.
+
+        Raises
+        ------
+        ValueError
+            If the field does not specify and cannot be found automatically.
 
         """
-        if x_field == "auto":
+        if x_field is None:
             x_field = cls._find_field(
                 gdf,
                 ["x", "xs", "lon", "longitude", "long", "longs", "longitudes"],
@@ -267,8 +286,9 @@ class Points:
                     "Cannot find the field name of the x coordinate. "
                     "Please provide the field name manually."
                 )
+                logger.error(msg, stacklevel=2)
                 raise ValueError(msg)
-        if y_field == "auto":
+        if y_field is None:
             y_field = cls._find_field(
                 gdf,
                 ["y", "ys", "lat", "latitude", "lats", "latitudes"],
@@ -278,6 +298,7 @@ class Points:
                     "Cannot find the field name of the y coordinate. "
                     "Please provide the field name manually."
                 )
+                logger.error(msg, stacklevel=2)
                 raise ValueError(msg)
         return x_field, y_field
 
@@ -349,25 +370,30 @@ class Points:
         return Points(values, crs=crs)
 
     @classmethod
-    def from_geo_dataframe(
+    def from_dataframe(
         cls,
-        gdf: gpd.GeoDataFrame,
-        x_field: str = "auto",
-        y_field: str = "auto",
+        gdf: gpd.GeoDataFrame | pd.DataFrame,
+        x_field: str | None = None,
+        y_field: str | None = None,
+        crs: CrsLike = None,
     ) -> Points:
         """Initialize a Points object from a GeoDataFrame.
 
         Parameters
         ----------
-        gdf : gpd.GeoDataFrame
+        gdf : gpd.GeoDataFrame | pd.DataFrame
             The GeoDataFrame to be parsed.
-        x_field, y_field : str, optional, default: "auto"
-            The field name of the x/y coordinates if ``geometry`` not exists.
-            If ``auto``, will try to find the field name automatically from
+        x_field, y_field : str, optional, default: None
+            The field name of the x/y coordinates if geometry does not exist.
+            If None, will try to find the field name automatically from
             following fields (case insensitive):
 
-            * ``x``: x, xs, lon, longitude, long, longs, longitudes
-            * ``y``: y, ys, lat, latitude, lats, latitudes
+            - **x**: x, xs, lon, longitude, long, longs, longitudes
+            - **y**: y, ys, lat, latitude, lats, latitudes
+        crs : Any, optional, default: None
+            The coordinate reference system of the points. Can be any object
+            that can be passed to :meth:`pyproj.crs.CRS.from_user_input`. If
+            gdf has a valid crs, it will be ignored.
 
         Returns
         -------
@@ -375,23 +401,26 @@ class Points:
             The Points object.
 
         """
-        if "geometry" not in gdf.columns:
+        if isinstance(gdf, gpd.GeoDataFrame) and hasattr(gdf, "geometry"):
+            points = list(zip(gdf.geometry.x, gdf.geometry.y))
+            crs = gdf.crs if gdf.crs is not None else crs
+        else:
             x_field, y_field = cls._ensure_fields(gdf, x_field, y_field)
-            return cls(gdf[[x_field, y_field]].values, crs=gdf.crs)
-        points = list(zip(gdf.geometry.values.x, gdf.geometry.values.y))
-        return cls(points, crs=gdf.crs)
+            points = gdf[[x_field, y_field]].values.tolist()
+
+        return cls(points, crs=crs)
 
     @classmethod
-    def from_shapefile(
+    def from_file(
         cls,
-        filename: str | Path,
+        filename: PathLike,
         **kwargs,
     ) -> Points:
         """Initialize a Points object from a file.
 
         Parameters
         ----------
-        filename : str | Path
+        filename : PathLike
             The path to the shapefile. file type can be any type that can be
             passed to :func:`geopandas.read_file`.
         **kwargs : dict
@@ -412,9 +441,9 @@ class Points:
     @classmethod
     def from_csv(
         cls,
-        filename: str | Path,
-        x_field: str = "auto",
-        y_field: str = "auto",
+        filename: PathLike,
+        x_field: str | None = None,
+        y_field: str | None = None,
         crs: CrsLike = None,
         **kwargs,
     ) -> Points:
@@ -422,7 +451,7 @@ class Points:
 
         Parameters
         ----------
-        filename : str | Path
+        filename : PathLike
             The path to the csv/txt file.
         x_field, y_field : str, optional, default: "auto"
             The field name of the x/y coordinates. If "auto", will try to
@@ -443,17 +472,10 @@ class Points:
             The Points object.
 
         """
-        _df = pd.read_csv(filename, **kwargs)
-        gdf = gpd.GeoDataFrame(
-            _df,
-            geometry=gpd.points_from_xy(_df["x"], _df["y"]),
-            crs=crs,
-        )
-        x_field, y_field = cls._ensure_fields(_df, x_field, y_field)
+        df = pd.read_csv(filename, **kwargs)
+        return cls.from_dataframe(df, x_field, y_field, crs=crs)
 
-        return cls.from_geo_dataframe(gdf, x_field, y_field)
-
-    def to_DataFrame(self) -> pd.DataFrame:
+    def to_dataframe(self) -> pd.DataFrame:
         """Convert the Points to a DataFrame.
 
         Returns
@@ -464,7 +486,7 @@ class Points:
         """
         return pd.DataFrame(self._values, columns=["x", "y"])
 
-    def to_GeoDataFrame(self) -> gpd.GeoDataFrame:
+    def to_geodataframe(self) -> gpd.GeoDataFrame:
         """Convert the Points to a GeoDataFrame.
 
         Returns
@@ -473,23 +495,19 @@ class Points:
             The GeoDataFrame.
 
         """
-        _df = self.to_DataFrame()
-        return gpd.GeoDataFrame(
-            _df,
-            geometry=gpd.points_from_xy(_df["x"], _df["y"]),
-            crs=self.crs,
-        )
+        df = self.to_dataframe()
+        geometry = (gpd.points_from_xy(df["x"], df["y"]),)
+        return gpd.GeoDataFrame(df, geometry=geometry, crs=self.crs)
 
-    def to_shapefile(self, filename: str | Path, **kwargs) -> None:
-        """Save the Points to a shapefile.
+    def to_file(self, filename: PathLike, **kwargs) -> None:
+        """Save the Points to a file.
 
         Parameters
         ----------
-        filename : str | Path
-            The path to the shapefile.
+        filename : PathLike
+            The path to the file.
         **kwargs : dict
             Other parameters passed to :meth:`geopandas.GeoDataFrame.to_file`.
 
         """
-        gdf = self.to_GeoDataFrame()
-        gdf.to_file(filename, **kwargs)
+        self.to_geodataframe().to_file(filename, **kwargs)

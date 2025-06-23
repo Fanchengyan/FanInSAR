@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     from faninsar.typing import TripletLoopLike
 
-logger = setup_logger(log_name=__name__)
+logger = setup_logger(__name__)
 
 
 class TripletLoop:
@@ -214,7 +214,7 @@ class TripletLoops:
 
     def __repr__(self) -> str:
         """Return the representation of the loops."""
-        return self.to_frame("dates").__repr__()
+        return self.to_dataframe("dates").__repr__()
 
     def __len__(self) -> int:
         """Return the number of loops."""
@@ -483,7 +483,7 @@ class TripletLoops:
 
         return names.to_numpy(dtype="S")
 
-    def to_frame(self, target: Literal["pairs", "dates"] = "pairs") -> pd.DataFrame:
+    def to_dataframe(self, target: Literal["pairs", "dates"] = "pairs") -> pd.DataFrame:
         """Return the loops as a DataFrame.
 
         Parameters

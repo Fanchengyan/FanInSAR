@@ -296,7 +296,7 @@ def pairs_section(pairs: Pairs) -> str:
     # "unique" id to expand/collapse the section
     data_id = "section-" + str(uuid.uuid4())
     preview = f"faninsar.Pairs<pairs={len(pairs)},dates={len(pairs.dates)}>"
-    data_repr = pairs.to_frame().to_html(max_rows=5, justify="center")
+    data_repr = pairs.to_dataframe().to_html(max_rows=5, justify="center")
     data_repr = add_svg_string(data_repr, PairsSVG(len(pairs)).to_tag())
     data_icon = _icon("icon-database")
 

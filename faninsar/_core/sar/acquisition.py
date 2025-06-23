@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
     from pandas._typing import ArrayLike
 
-logger = setup_logger(log_name=__name__)
+logger = setup_logger(__name__)
 _dtype_obj = np.dtype("object")
 
 

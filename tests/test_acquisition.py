@@ -24,13 +24,13 @@ class TestAcquisition:
         assert xarray_var.dims == ("Acquisition",)
         assert len(xarray_var) == 10
 
-    def test_attrs(self):
-        # Test the attrs property
-        attrs = self.acquisition.attrs
-        assert attrs["start"] == "2023-01-01"
-        assert attrs["end"] == "2023-01-10"
-        assert attrs["unique"] == 10
-        assert attrs["total"] == 10
+    def test_stats(self):
+        # Test the stats property
+        stats = self.acquisition.stats
+        assert stats["start"] == "2023-01-01"
+        assert stats["end"] == "2023-01-10"
+        assert stats["unique"] == 10
+        assert stats["total"] == 10
 
 class TestCreateDaysSpanIndex:
     """Test the creation of DaySpan with different type inputs."""
@@ -108,13 +108,13 @@ class TestDaysSpanIndex:
     def test_to_xarray(self):
         # Test the to_xarray method
         xarray_var = self.days_span.to_xarray()
-        assert xarray_var.dims == ("DaySpan",)
+        assert xarray_var.dims == ("days",)
         assert len(xarray_var) == 10
 
-    def test_attrs(self):
-        # Test the attrs property
-        attrs = self.days_span.attrs
-        assert attrs["min"] == pd.Timedelta(0)
-        assert attrs["max"] == pd.Timedelta(9, unit="D")
-        assert attrs["unique"] == 10
-        assert attrs["total"] == 10
+    def test_stats(self):
+        # Test the stats property
+        stats = self.days_span.stats
+        assert stats["min"] == pd.Timedelta(0)
+        assert stats["max"] == pd.Timedelta(9, unit='D')
+        assert stats["unique"] == 10
+        assert stats["total"] == 10

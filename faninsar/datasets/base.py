@@ -3,7 +3,7 @@
 The base class RasterDataset in this script is modified from the torchgeo package.
 """
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import abc
 import contextlib
@@ -17,10 +17,12 @@ import numpy as np
 import pandas as pd
 import pyproj
 import rasterio
+import rioxarray  # noqa: F401
 import shapely
 import xarray as xr
-from rasterio import features, fill, plot
+from rasterio import features, fill
 from rasterio import mask as rio_mask
+from rasterio import plot
 from rasterio.crs import CRS
 from rasterio.dtypes import dtype_ranges, get_minimum_dtype
 from rasterio.enums import Resampling
@@ -38,19 +40,27 @@ from faninsar._core import geo_tools
 from faninsar._core.geo_tools import Profile, array2kml, array2kmz, geoinfo_from_latlon
 from faninsar._core.sar.pairs import Pairs
 from faninsar.logging import setup_logger
-from faninsar.query import BoundingBox, GeoQuery, Points, Polygons, QueryResult
+from faninsar.query import (
+    BBoxesResult,
+    BoundingBox,
+    GeoQuery,
+    Points,
+    PointsResult,
+    Polygons,
+    PolygonsResult,
+    QueryResult,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from os import PathLike
 
     from rasterio.io import DatasetReader
+    from rasterio.warp import Affine
 
 __all__ = ("ApsDataset", "GeoDataset", "PairDataset", "RasterDataset")
 
-logger = setup_logger(
-    log_name="FanInSAR.datasets.base",
-    log_format="%(levelname)s - %(message)s",
-)
+logger = setup_logger(__name__)
 
 lat_names = ["latitude", "lat", "y"]
 lon_names = ["longitude", "lon", "x", "long", "lng"]
@@ -262,14 +272,14 @@ class GeoDataset(abc.ABC):
             )
         if not all(isinstance(i, float) for i in new_res):
             try:
-                new_res = tuple(float(i) for i in new_res)
+                new_res = (float(new_res[0]), float(new_res[1]))
             except TypeError as e:
                 msg = "Resolution must be a float or a tuple of floats"
                 raise TypeError(msg) from e
         self._res = new_res
 
     @property
-    def roi(self) -> BoundingBox | None:
+    def roi(self) -> BoundingBox:
         """Return the region of interest of the dataset.
 
         Returns
@@ -322,9 +332,7 @@ class GeoDataset(abc.ABC):
             return self.roi
         if not isinstance(roi, BoundingBox):
             msg = f"roi must be a BoundingBox object, got {type(roi)} instead."
-            raise TypeError(
-                msg,
-            )
+            raise TypeError(msg)
         if roi.crs != self.crs:
             if roi.crs is None:
                 roi = BoundingBox(*roi, crs=self.crs)
@@ -381,6 +389,19 @@ class GeoDataset(abc.ABC):
         self._nodata = new_nodata
 
     @property
+    def shape(self) -> tuple[int, int]:
+        """Shape of the dataset.
+
+        Returns
+        -------
+        shape: tuple of ints
+            shape of the dataset in (height, width) format
+
+        """
+        profile = self.get_profile("bounds")
+        return profile["height"], profile["width"]
+
+    @property
     def valid(self) -> np.ndarray:
         """Return a boolean array indicating which files are valid.
 
@@ -406,19 +427,6 @@ class GeoDataset(abc.ABC):
 
         """
         return BoundingBox(*self.index.bounds, crs=self.crs)
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        """Shape of the dataset.
-
-        Returns
-        -------
-        shape: tuple of ints
-            shape of the dataset in (height, width) format
-
-        """
-        profile = self.get_profile("bounds")
-        return profile["height"], profile["width"]
 
     def _ensure_bbox(
         self,
@@ -446,6 +454,30 @@ class GeoDataset(abc.ABC):
             return self._check_roi(bbox)
         msg = f"bbox must be one of ['bounds', 'roi'] or a BoundingBox, but got {bbox}"
         raise ValueError(msg)
+
+    def get_profile(
+        self, bbox: BoundingBox | Literal["roi", "bounds"] = "roi"
+    ) -> Profile | None:
+        """Get profile information of the dataset for the given bounding box type.
+
+        The profile information includes the width, height, transform,
+        count, data type, no data value, and CRS of the dataset.
+
+        Parameters
+        ----------
+        bbox : BoundingBox | Literal["roi", "bounds"], optional
+            the bounding box used to calculate the ``width``, ``height``
+            and ``transform`` of the dataset for the profile. Default is
+            'roi'.
+
+        Returns
+        -------
+        profile: Profile object or None
+            profile of the dataset for the given bounding box type.
+
+        """
+        msg = "get_profile method must be implemented in subclass"
+        raise NotImplementedError(msg)
 
 
 class RasterDataset(GeoDataset):
@@ -597,6 +629,17 @@ class RasterDataset(GeoDataset):
         ------
             FileNotFoundError: if no files are found in ``root_dir``
 
+        Examples
+        --------
+        Following examples show how to use parameters to warp the dataset upon loading.
+
+        .. ref-gallery::
+            :tooltip:
+
+            examples/warp/align
+            examples/warp/reproject
+            examples/warp/resample
+
         """
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -645,7 +688,7 @@ class RasterDataset(GeoDataset):
                         self._same_crs = False
             except Exception as e:  # noqa: PERF203
                 # Skip files that rasterio is unable to read
-                warnings.warn(f"Unable to read {file_path}: \n--> : {e}", stacklevel=2)
+                warnings.warn(f"Unable to read {file_path}: \n{e}", stacklevel=2)
                 files_valid.append(False)
                 continue
             else:
@@ -670,7 +713,7 @@ class RasterDataset(GeoDataset):
             files_invalid_str = "\t" + "\n\t".join(files_invalid)
             msg = (
                 f"Unable to read {len(files_invalid)} files in "
-                f"{self.__class__.__name__} dataset:\n{files_invalid_str}",
+                f"{self.__class__.__name__} dataset:\n{files_invalid_str}"
             )
             warnings.warn(msg, stacklevel=2)
 
@@ -739,7 +782,7 @@ class RasterDataset(GeoDataset):
             data = data.astype(self.dtype)
         return data
 
-    def _points_query(self, points: Points, vrt_fh: DatasetReader) -> np.ndarray:
+    def _file_query_points(self, points: Points, vrt_fh: DatasetReader) -> np.ndarray:
         """Return the values of dataset at given points.
 
         Points that outside the dataset will be masked.
@@ -749,7 +792,7 @@ class RasterDataset(GeoDataset):
         data = np.ma.hstack(list(vrt_fh.sample(points.values, bands_idx, masked=True)))
         return self._ensure_dtype(data)
 
-    def _bbox_query(self, bbox: BoundingBox, vrt_fh: DatasetReader) -> np.ndarray:
+    def _file_query_bbox(self, bbox: BoundingBox, vrt_fh: DatasetReader) -> np.ndarray:
         """Return the values of the dataset at the given bounding box."""
         bbox = self._ensure_query_crs(bbox)
 
@@ -778,7 +821,9 @@ class RasterDataset(GeoDataset):
             data = fill.fillnodata(data)
         return self._ensure_dtype(data)
 
-    def _polygons_query(self, polygons: Polygons, vrt_fh: DatasetReader) -> np.ndarray:
+    def _file_query_polygons(
+        self, polygons: Polygons, vrt_fh: DatasetReader
+    ) -> np.ndarray:
         """Return the values of the dataset at the given polygons."""
         polygons = self._ensure_query_crs(polygons)
         bands_idx = self._ensure_bands_idx(vrt_fh)
@@ -835,12 +880,68 @@ class RasterDataset(GeoDataset):
 
         return data_ls, transform_ls, mask_ls
 
+    def _files_query_points(
+        self, points: Points, vrt_fhs: Sequence[DatasetReader]
+    ) -> np.ndarray:
+        """Return the values of the dataset at the given points."""
+        data_ls = []
+        for vrt_fh in vrt_fhs:
+            data = self._file_query_points(points, vrt_fh)
+            data_ls.append(data)
+        return np.ma.asarray(data_ls)
+        # points_values = np.ma.asarray(data_ls)
+        # dims, points_values = parse_1d_dims(points_values)
+        # return PointsResult({"data": points_values, "dims": dims})
+
+    def _files_query_bbox(
+        self, bbox: BoundingBox, vrt_fhs: Sequence[DatasetReader]
+    ) -> np.ndarray:
+        """Return the values of the dataset at the given bounding box."""
+        data_ls = []
+        for vrt_fh in vrt_fhs:
+            data = self._file_query_bbox(bbox, vrt_fh)
+            data_ls.append(data)
+        return np.ma.asarray(data_ls)
+
+    def _files_query_polygons(
+        self, polygons: Polygons, vrt_fhs: Sequence[DatasetReader]
+    ) -> tuple[list[np.ndarray], list[Affine], list[np.ndarray]]:
+        """Return the values of the dataset at the given polygons."""
+        data_ls_all = []
+        for vrt_fh in vrt_fhs:
+            data_ls, transform_ls, mask_ls = self._file_query_polygons(polygons, vrt_fh)
+            data_ls_all.append(data_ls)
+
+        # parse polygons results
+        n_polygons = len(polygons)
+        if n_polygons == 1:
+            polygons_values = np.ma.asarray(data_ls_all)
+            # dims = parse_2d_dims(polygons_values)
+        else:
+            # stack the files for each polygon
+            poly_list = [[] for _ in range(n_polygons)]
+            for file_data in data_ls_all:
+                for i, poly_i in enumerate(file_data):
+                    poly_list[i].append(poly_i)
+            polygons_values = [np.ma.asarray(arr) for arr in poly_list]
+            # get the dims
+            # polygon0 = polygons_values[0]
+            # dims = parse_2d_dims(polygon0, details=False)
+        return polygons_values, transform_ls, mask_ls
+
+        # return PolygonsResult(
+        #     {
+        #         "data": polygons_values,
+        #         "dims": f"(n_polygons:{n_polygons}, ({dims}))",
+        #         "transforms": transform_ls,
+        #         "masks": mask_ls,
+        #     }
+        # )
+
     def _ensure_loading_verbose(self, sequence: Sequence) -> Sequence:
         if self.verbose:
             sequence = tqdm(
-                sequence,
-                desc=f"Loading {self.ds_name} Files",
-                unit=" files",
+                sequence, desc=f"Loading {self.ds_name} Files", unit=" files"
             )
         return sequence
 
@@ -883,87 +984,52 @@ class RasterDataset(GeoDataset):
 
         vrt_fhs = self._ensure_loading_verbose(vrt_fhs)
 
-        files_points_list = []
-        files_bbox_list = []
-        files_polygons_list = []
-        for vrt_fh in vrt_fhs:
-            # Get the points values
-            if query.points is not None:
-                data = self._points_query(query.points, vrt_fh)
-                files_points_list.append(data)
-            # Get the bounding boxes values
-            if query.boxes is not None:
-                n_boxes = len(query.boxes)
-                if n_boxes == 1:
-                    data = self._bbox_query(query.boxes[0], vrt_fh)
-                    files_bbox_list.append(data)
-                else:
-                    bbox_list = []
-                    for bbox in query.boxes:
-                        data = self._bbox_query(bbox, vrt_fh)
-                        bbox_list.append(data)
-                    files_bbox_list.append(bbox_list)
-            # Get the polygons values
-            if query.polygons is not None:
-                data_ls, transform_ls, mask_ls = self._polygons_query(
-                    query.polygons,
-                    vrt_fh,
-                )
-                files_polygons_list.append(data_ls)
-
-        # Stack the points values
         points_result = None
-        if len(files_points_list) > 0:
-            points_values = np.ma.asarray(files_points_list)
-            dims, points_values = parse_1d_dims(points_values)
-            points_result = {"data": points_values, "dims": dims}
-
-        # parse bounding boxes results
         bbox_result = None
-        n_files = len(files_bbox_list)
-        if n_files > 0:
-            n_boxes = len(query.boxes)
-            if n_boxes == 1:
-                boxes_values = np.ma.asarray(files_bbox_list)
-                dims = parse_2d_dims(boxes_values)
-            else:
-                # stack the files for each box
-                boxes_ls = [[] for _ in range(n_boxes)]
-                for files_box in files_bbox_list:
-                    for i, box in enumerate(files_box):
-                        boxes_ls[i].append(box)
-                boxes_values = [np.ma.asarray(arr) for arr in boxes_ls]
-                # get the dims
-                bbox0 = files_bbox_list[0]
-                dims = parse_2d_dims(bbox0, details=False)
-                dims = f"boxes:{n_boxes}, ({dims})"
-            bbox_result = {"data": boxes_values, "dims": f"({dims})"}
-
-        # parse polygons results
         polygons_result = None
-        n_files = len(files_polygons_list)
-        if n_files > 0:
+
+        if query.points is not None:
+            points_data = self._files_query_points(query.points, vrt_fhs)
+            points_result = PointsResult(
+                {
+                    "data": points_data,
+                    "dims": parse_1d_dims(points_data),
+                }
+            )
+        if query.boxes is not None:
+            bbox_data = self._files_query_bbox(query.boxes, vrt_fhs)
+            bbox_result = BBoxesResult(
+                {
+                    "data": bbox_data,
+                    "dims": parse_2d_dims(bbox_data),
+                }
+            )
+        if query.polygons is not None:
+            polygons_data, transform_ls, mask_ls = self._files_query_polygons(
+                query.polygons, vrt_fhs
+            )
             n_polygons = len(query.polygons)
             if n_polygons == 1:
-                polygons_values = np.ma.asarray(files_polygons_list)
-                dims = parse_2d_dims(polygons_values)
+                polygons_data = np.ma.asarray(polygons_data)
+                dims = parse_2d_dims(polygons_data)
             else:
                 # stack the files for each polygon
                 poly_list = [[] for _ in range(n_polygons)]
-                for file_data in files_polygons_list:
+                for file_data in polygons_data:
                     for i, poly_i in enumerate(file_data):
                         poly_list[i].append(poly_i)
-                polygons_values = [np.ma.asarray(arr) for arr in poly_list]
+                polygons_data = [np.ma.asarray(arr) for arr in poly_list]
                 # get the dims
-                polygon0 = polygons_values[0]
-                dims = parse_2d_dims(polygon0, details=False)
+                dims = parse_2d_dims(polygons_data[0], details=False)
 
-            polygons_result = {
-                "data": polygons_values,
-                "dims": f"(n_polygons:{n_polygons}, ({dims}))",
-                "transforms": transform_ls,
-                "masks": mask_ls,
-            }
+            polygons_result = PolygonsResult(
+                {
+                    "data": polygons_data,
+                    "dims": f"(n_polygons:{len(query.polygons)}, ({dims}))",
+                    "transforms": transform_ls,
+                    "masks": mask_ls,
+                }
+            )
 
         return QueryResult(points_result, bbox_result, polygons_result, query)
 
@@ -978,7 +1044,8 @@ class RasterDataset(GeoDataset):
 
         Returns
         -------
-        file handle of warped VRT
+        vrt : DatasetReader
+            file handle of warped VRT or original file if no warping is needed
 
         """
         return self._load_warp_file(file_path)
@@ -986,13 +1053,15 @@ class RasterDataset(GeoDataset):
     def _load_warp_file(self, file_path: str) -> DatasetReader:
         """Load and warp a file to the correct CRS and resolution.
 
-        Args:
-        ----
-            file_path: file to load and warp
+        Parameters
+        ----------
+        file_path : str
+            file to load and warp
 
-        Returns:
+        Returns
         -------
-            file handle of warped VRT
+        vrt : DatasetReader
+            file handle of warped VRT or original file if no warping is needed
 
         """
         src = rasterio.open(file_path)
@@ -1003,6 +1072,76 @@ class RasterDataset(GeoDataset):
             src.close()
             return vrt
         return src
+
+    def _indexes2paths(self, indexes: int | list[int]) -> list[str]:
+        """Convert file indexes to file paths.
+
+        This method is used to convert the indexes of the files in the dataset
+        to the file paths. It checks if the indexes are valid and if the files
+        are valid. If the indexes are None, it returns all the file paths in
+        the dataset.
+
+        Parameters
+        ----------
+        indexes : int or list of int
+            indexes of the files to convert
+
+        Returns
+        -------
+        paths : list of str
+            list of file paths
+
+        Raises
+        ------
+        ValueError
+            if the indexes negative or out of range or if the files are invalid
+
+        """
+        if isinstance(indexes, int):
+            indexes = [indexes]
+        if indexes is None:
+            indexes = self.files[self.files.valid].index.values
+
+        indexes = np.asarray(indexes)
+        if len(indexes) == 0:
+            msg = f"No valid files to query. indexes: {indexes}"
+            raise ValueError(msg)
+        if np.any(indexes < 0):
+            msg = f"indexes must be positive integers, got {indexes}"
+            raise ValueError(msg)
+        if np.any(indexes >= len(self.files)):
+            msg = f"indexes must be less than {len(self.files)}, got {indexes}"
+            raise ValueError(msg)
+
+        files_used = self.files.iloc[indexes, :]
+        if not np.all(files_used.valid.values):
+            msg = f"Following files are invalid: {files_used[~files_used.valid]}"
+            raise ValueError(msg)
+
+        return files_used.paths.values.tolist()
+
+    def _paths2vrt_fhs(self, paths: Sequence[str]) -> list[DatasetReader]:
+        """Convert file paths to file handles.
+
+        Parameters
+        ----------
+        paths : list of str
+            list of file paths
+
+        Returns
+        -------
+        vrt_fhs : list of DatasetReader
+            list of file handles
+
+        """
+        if self.cache:
+            vrt_fhs = [self._cached_load_warp_file(fp) for fp in paths]
+        else:
+            # load the files without caching
+            # this is useful for testing and debugging
+            # to avoid caching issues
+            vrt_fhs = [self._load_warp_file(fp) for fp in paths]
+        return vrt_fhs
 
     @property
     def count(self) -> int:
@@ -1061,6 +1200,123 @@ class RasterDataset(GeoDataset):
         profile["nodata"] = self.nodata
         profile["crs"] = self.crs
         return profile
+
+    def points_query(
+        self, points: Points, indexes: int | list[int] | None = None
+    ) -> PointsResult:
+        """Query the dataset for the given file index and points.
+
+        Parameters
+        ----------
+        points : Points
+            desired points to query.
+        indexes : int or list of int or None, optional
+            indexes of the files to query. If None, all files in the dataset
+            will be used. Default is None.
+
+        Returns
+        -------
+        result : PointsResult
+            a result object containing the results of the query.
+
+        """
+        vrt_fhs = self._paths2vrt_fhs(self._indexes2paths(indexes))
+        data_ls = self._files_query_points(points, vrt_fhs)
+
+        multi_files = True
+        if isinstance(indexes, int):
+            data_ls = data_ls.squeeze(0)
+            multi_files = False
+        dims = parse_1d_dims(data_ls, multi_files)
+        return PointsResult({"data": data_ls, "dims": dims})
+
+    def bbox_query(
+        self, bbox: BoundingBox, indexes: int | list[int] | None = None
+    ) -> BBoxesResult:
+        """Query the dataset for the given file index and bounding box.
+
+        Parameters
+        ----------
+        bbox : BoundingBox
+            desired bounding box to query.
+        indexes : int or list of int or None, optional
+            indexes of the files to query. If None, all files in the dataset
+            will be used. Default is None.
+
+        Returns
+        -------
+        result : BBoxesResult
+            a result object containing the results of the query.
+
+        """
+        vrt_fhs = self._paths2vrt_fhs(self._indexes2paths(indexes))
+        data_ls = self._files_query_bbox(bbox, vrt_fhs)
+
+        multi_files = True
+        if isinstance(indexes, int):
+            data_ls = data_ls.squeeze(0)
+            multi_files = False
+        dims = parse_2d_dims(data_ls, multi_files)
+        return BBoxesResult({"data": data_ls, "dims": dims})
+
+    def polygons_query(
+        self, polygons: Polygons, indexes: int | list[int] | None = None
+    ) -> PolygonsResult:
+        """Query the dataset for the given file index and polygons.
+
+        Parameters
+        ----------
+        polygons : Polygons
+            desired polygons to query.
+        indexes : int or list of int, optional
+            indexes of the files to query. If None, all files in the dataset
+            will be used. Default is None.
+
+        Returns
+        -------
+        result : PolygonsResult
+            a result object containing the results of the query.
+
+        """
+        vrt_fhs = self._paths2vrt_fhs(self._indexes2paths(indexes))
+        polygons_data, transform_ls, mask_ls = self._files_query_polygons(
+            polygons, vrt_fhs
+        )
+
+        multi_files = True
+        if isinstance(indexes, int):
+            multi_files = False
+
+        n_polygons = len(polygons)
+        if n_polygons == 1:
+            polygons_data = np.ma.asarray(polygons_data)
+            if isinstance(indexes, int):
+                polygons_data = polygons_data.squeeze(0)
+            dims = parse_2d_dims(polygons_data, multi_files)
+        else:
+            # stack the files for each polygon
+            poly_list = [[] for _ in range(n_polygons)]
+            for file_data in polygons_data:
+                for i, poly_i in enumerate(file_data):
+                    poly_list[i].append(poly_i)
+            # polygons_data = [np.ma.asarray(arr) for arr in poly_list]
+            polygons_data = []
+            for arr in poly_list:
+                data = np.ma.asarray(arr)
+                if isinstance(indexes, int):
+                    data = data.squeeze(0)
+                polygons_data.append(data)
+            # get the dims
+            dims = parse_2d_dims(polygons_data[0], multi_files, details=False)
+
+        return PolygonsResult(
+            {
+                "data": polygons_data,
+                "dims": dims,
+                "transforms": transform_ls,
+                "masks": mask_ls,
+            },
+        )
 
     def row_col(
         self,
@@ -1196,7 +1452,7 @@ class RasterDataset(GeoDataset):
 
     def load_mask(
         self,
-        mask_path: str | Path,
+        mask_path: PathLike,
         bbox: BoundingBox | Literal["roi", "bounds"] = "roi",
     ) -> np.ndarray:
         """Load a mask from a tiff mask file (.msk).
@@ -1320,6 +1576,44 @@ class RasterDataset(GeoDataset):
             ds_name=self.ds_name,
         )
 
+    def align_to(
+        self,
+        other: Self,
+        resampling: Resampling = Resampling.nearest,
+        nodata: float | None = None,
+    ) -> Self:
+        """Align the dataset to another dataset.
+
+        Parameters
+        ----------
+        other : GeoDataset
+            dataset to align to
+        resampling : Resampling, optional
+            resampling method to use when resampling the dataset.
+            Default is `Resampling.nearest`.
+        nodata : float or int, optional
+            no data value of the dataset. If None, the no data value of the
+            dataset will be used.
+
+        """
+        if nodata is None:
+            nodata = self.nodata
+        return self.__class__(
+            root_dir=self.root_dir,
+            paths=self.files.paths,
+            crs=other.crs,
+            res=other.res,
+            dtype=self.dtype,
+            nodata=nodata,
+            roi=other.bounds,
+            bands=self.bands,
+            cache=self.cache,
+            resampling=resampling,
+            fill_nodata=self.fill_nodata,
+            verbose=self.verbose,
+            ds_name=self.ds_name,
+        )
+
     def show(
         self,
         arr: np.ndarray,
@@ -1350,7 +1644,7 @@ class RasterDataset(GeoDataset):
 
     def to_tiffs(
         self,
-        out_dir: str | Path,
+        out_dir: PathLike,
         roi: BoundingBox | None = None,
     ) -> None:
         """Save the dataset to a directory of tiff files for given region of interest.
@@ -1361,6 +1655,7 @@ class RasterDataset(GeoDataset):
             path to the directory to save the tiff files
         roi : BoundingBox, optional
             region of interest to save. If None, the roi of the dataset will be used.
+            Default is None.
 
         """
         roi = self._check_roi(roi)
@@ -1371,13 +1666,13 @@ class RasterDataset(GeoDataset):
         for f in self.files.paths[self.valid]:
             out_file = Path(out_dir) / f.name
             src = self._load_warp_file(f)
-            dest_arr = self._bbox_query(roi, src).squeeze(0)
+            dest_arr = self._file_query_bbox(roi, src).squeeze(0)
             with rasterio.open(out_file, "w", **profile.profile) as dst:
                 dst.write(dest_arr, 1)
 
     def to_netcdf(
         self,
-        filename: str | Path,
+        filename: PathLike,
         roi: BoundingBox | None = None,
     ) -> None:
         """Save the dataset to a netCDF file for given region of interest.
@@ -1418,7 +1713,7 @@ class RasterDataset(GeoDataset):
     def array2tiff(
         self,
         arr: np.ndarray,
-        filename: str | Path,
+        filename: PathLike,
         bounds: BoundingBox | None = None,
         bbox: BoundingBox | None = None,
         band_names: Sequence[str] | None = None,
@@ -1508,7 +1803,7 @@ class RasterDataset(GeoDataset):
     def array2kml(
         self,
         arr: np.ndarray,
-        out_file: str | Path,
+        out_file: PathLike,
         bounds: BoundingBox | None = None,
         img_kwargs: dict | None = None,
         cbar_kwargs: dict | None = None,
@@ -1562,7 +1857,7 @@ class RasterDataset(GeoDataset):
     def array2kmz(
         self,
         arr: np.ndarray,
-        out_file: str | Path,
+        out_file: PathLike,
         bounds: BoundingBox | None = None,
         img_kwargs: dict | None = None,
         cbar_kwargs: dict | None = None,
@@ -2132,24 +2427,6 @@ class PairDataset(RasterDataset):
         msg = "parse_pairs method must be implemented in subclass"
         raise NotImplementedError(msg)
 
-    @classmethod
-    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
-        """Parse datetime from filenames. *Must be implemented in subclass*.
-
-        Parameters
-        ----------
-        paths : list of pathlib.Path
-            list of file paths to parse datetime
-
-        Returns
-        -------
-        datetime : pd.DatetimeIndex
-            datetime parsed from filenames
-
-        """
-        msg = "parse_datetime method must be implemented in subclass"
-        raise NotImplementedError(msg)
-
     @property
     def pairs(self) -> Pairs:
         """Return Pairs parsed from filenames."""
@@ -2171,7 +2448,7 @@ class ApsDataset(RasterDataset):
 
     def to_pair_files(
         self,
-        out_dir: str | Path,
+        out_dir: PathLike,
         pairs: Pairs,
         ref_points: Points,
         roi: BoundingBox | None = None,
@@ -2233,11 +2510,11 @@ class ApsDataset(RasterDataset):
                 src_primary = self._load_warp_file(df_paths[primary])
                 src_secondary = self._load_warp_file(df_paths[secondary])
                 dest_arr = (
-                    self._bbox_query(roi, src_primary).squeeze(0)
-                    - self._bbox_query(roi, src_secondary).squeeze(0)
+                    self._file_query_bbox(roi, src_primary).squeeze(0)
+                    - self._file_query_bbox(roi, src_secondary).squeeze(0)
                     - (
-                        self._points_query(ref_points, src_primary)
-                        - self._points_query(ref_points, src_secondary)
+                        self._file_query_points(ref_points, src_primary)
+                        - self._file_query_points(ref_points, src_secondary)
                     ).mean()
                 )
 
@@ -2352,7 +2629,6 @@ class ApsPairs(PairDataset):
             ds_name=ds_name,
         )
         self._pairs = self.parse_pairs(self.files.paths[self.valid])
-        self._datetime = self.parse_datetime(self.files.paths[self.valid])
 
     @classmethod
     def parse_pairs(cls, paths: list[Path]) -> Pairs:
@@ -2360,19 +2636,6 @@ class ApsPairs(PairDataset):
         names = [Path(f).stem for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
         return Pairs.from_names(pair_names)
-
-    @classmethod
-    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
-        """Parse datetime from a list of file paths."""
-        names = [Path(f).stem for f in paths]
-        pair_names = ["_".join(i.split("_")[1:3]) for i in names]
-        date_names = np.unique([i.split("_") for i in pair_names])
-        return pd.DatetimeIndex(date_names)
-
-    @property
-    def dates(self) -> pd.DatetimeIndex:
-        """Return the dates of the dataset."""
-        return self._datetime
 
 
 def get_nodata(
@@ -2418,8 +2681,8 @@ def parse_1d_dims(
 
 def parse_2d_dims(
     values_2d: np.ndarray,
-    details: bool = True,
     multi_files: bool = True,
+    details: bool = True,
 ) -> str:
     """Parse the dimensions of 2D array. (used by bbox, polygons)."""
     if multi_files:

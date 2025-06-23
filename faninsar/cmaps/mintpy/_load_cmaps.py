@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 
+if TYPE_CHECKING:
+    from os import PathLike
+
 
 def cpt_to_colormap(
-    cpt_file: str | Path, name: str | None = None
+    cpt_file: PathLike, name: str | None = None
 ) -> LinearSegmentedColormap:
     """Convert a CPT file to a matplotlib colormap.
 

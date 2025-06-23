@@ -287,7 +287,7 @@ class BoundingBox:
             "top": self.top,
         }
 
-    def to_GeoDataFrame(self) -> gpd.GeoDataFrame:
+    def to_geodataframe(self) -> gpd.GeoDataFrame:
         """Convert the bounding box to a GeoDataFrame.
 
         Returns

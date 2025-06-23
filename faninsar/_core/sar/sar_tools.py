@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from faninsar.constants.sar import SPEED_OF_LIGHT, Frequency, Wavelength
+from .sar_property import Frequency, FrequencyUnit, Wavelength, WavelengthUnit
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -108,9 +108,9 @@ class Baselines:
         return len(self.values)
 
     @property
-    def frame(self) -> pd.Series:
+    def dataframe(self) -> pd.DataFrame:
         """Return the DataFrame of the baselines."""
-        return pd.Series(self.values, index=self.dates, name="baseline")
+        return pd.DataFrame({"dates": self.dates, "values": self.values})
 
     @property
     def values(self) -> np.ndarray:
@@ -168,7 +168,8 @@ class Baselines:
 
         """
         baselines = (
-            self.frame[pairs.secondary].values - self.frame[pairs.primary].values
+            self.dataframe[pairs.secondary].values
+            - self.dataframe[pairs.primary].values
         )
         bs = pd.Series(baselines, index=pairs.to_names())
         bs.index.name = "pairs"
@@ -244,11 +245,11 @@ class Baselines:
         if ax is None:
             ax = plt.gca()
 
-        _pairs_kwargs = {"c": "tab:blue", "alpha": 0.5, "ls": "-"}
-        _pairs_removed_kwargs = {"c": "r", "alpha": 0.3, "ls": "--"}
+        pairs_kwargs = {"c": "tab:blue", "alpha": 0.5, "ls": "-"}
+        pairs_removed_kwargs = {"c": "r", "alpha": 0.3, "ls": "--"}
 
-        _pairs_kwargs.update(pairs_kwargs)
-        _pairs_removed_kwargs.update(pairs_removed_kwargs)
+        pairs_kwargs.update(pairs_kwargs)
+        pairs_removed_kwargs.update(pairs_removed_kwargs)
 
         pairs_valid = pairs
         if pairs_removed is not None:
@@ -262,8 +263,8 @@ class Baselines:
             start, end = pair.primary, pair.secondary
             line_valid = ax.plot(
                 [start, end],
-                [self.frame[start], self.frame[end]],
-                **_pairs_kwargs,
+                [self.dataframe[start], self.dataframe[end]],
+                **pairs_kwargs,
             )[0]
         # plot removed pairs
         if pairs_removed is not None:
@@ -271,13 +272,13 @@ class Baselines:
                 start, end = pair.primary, pair.secondary
                 line_removed = ax.plot(
                     [start, end],
-                    [self.frame[start], self.frame[end]],
-                    **_pairs_removed_kwargs,
+                    [self.dataframe[start], self.dataframe[end]],
+                    **pairs_removed_kwargs,
                 )[0]
         # plot acquisitions
-        _pairs_kwargs = {"c": "tab:blue", "marker": "o", "ls": "", "alpha": 0.5}
-        _pairs_kwargs.update(acq_kwargs)
-        acq = ax.plot(self.dates, self.values, **_pairs_kwargs)[0]
+        pairs_kwargs = {"c": "tab:blue", "marker": "o", "ls": "", "alpha": 0.5}
+        pairs_kwargs.update(acq_kwargs)
+        acq = ax.plot(self.dates, self.values, **pairs_kwargs)[0]
 
         # plot gaps
         if plot_gaps:
@@ -286,7 +287,7 @@ class Baselines:
             gaps = gaps - pd.Timedelta(offset, "D")
 
             dates_valid = np.setdiff1d(pairs.dates, gaps)
-            vals = self.frame[dates_valid]
+            vals = self.dataframe[dates_valid]
             margin = vals.std() / 3
             ymin, ymax = vals.min() - margin, vals.max() + margin
             _gaps_kwargs = {"color": "k", "ls": "--", "alpha": 0.5}
@@ -340,24 +341,34 @@ class PhaseDeformationConverter:
 
         """
         if isinstance(freq_or_wl, Frequency):
-            self.wavelength = SPEED_OF_LIGHT / freq_or_wl.to_Hz().data  # meter
-            self.frequency = freq_or_wl.to_Hz().data
+            self._frequency = freq_or_wl.to_GHz()
+            self._wavelength = freq_or_wl.to_wavelength(unit="mm")
         elif isinstance(freq_or_wl, Wavelength):
-            self.wavelength = freq_or_wl.to_m().data
-            self.frequency = SPEED_OF_LIGHT / self.wavelength
+            self._wavelength = freq_or_wl.to_mm()
+            self._frequency = freq_or_wl.to_frequency(unit="GHz")
         else:
             msg = "freq_or_wl must be a Frequency or Wavelength object, "
             msg += f"got {type(freq_or_wl)}"
             raise TypeError(msg)
 
         # convert radian to mm
-        self.coef_rd2mm = -self.wavelength / 4 / np.pi * 1000
+        self.coef_rd2mm = -self.wavelength.data / 4 / np.pi
+
+    @property
+    def wavelength(self) -> Wavelength:
+        """Get the wavelength of the SAR mission."""
+        return self._wavelength
+
+    @property
+    def frequency(self) -> Frequency:
+        """Get the frequency of the SAR mission."""
+        return self._frequency
 
     @classmethod
     def from_frequency(
         cls,
         frequency: float,
-        unit: Literal["GHz", "MHz", "kHz", "Hz"] = "GHz",
+        unit: FrequencyUnit = "GHz",
     ) -> PhaseDeformationConverter:
         """Create a PhaseDeformationConverter from frequency value.
 
@@ -381,7 +392,7 @@ class PhaseDeformationConverter:
     def from_wavelength(
         cls,
         wavelength: float,
-        unit: Literal["m", "cm", "dm", "mm"] = "m",
+        unit: WavelengthUnit = "m",
     ) -> PhaseDeformationConverter:
         """Create a PhaseDeformationConverter from wavelength value.
 
