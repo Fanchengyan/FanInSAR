@@ -67,6 +67,7 @@ dependencies = [
     "pykml",
     "dominate",
     "typing_extensions",
+    "colorlog",
 ]
 
 
@@ -111,6 +112,7 @@ dev = [
   "pykml",
   "dominate",
   "typing_extensions",
+  "colorlog",
   "pre-commit",
   "ruff",
   "coverage",
