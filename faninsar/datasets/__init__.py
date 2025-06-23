@@ -2,14 +2,14 @@ from .base import (
     ApsDataset,
     ApsPairs,
     GeoDataset,
-    HierarchicalDataset,
-    MultiHierarchicalDataset,
+    # HierarchicalDataset,
+    # MultiHierarchicalDataset,
     PairDataset,
     RasterDataset,
 )
 from .gacos import GACOS, GACOSPairs
 from .hyp3 import HyP3S1, HyP3S1Burst
-from .ifg import InterferogramDataset
+from .ifg import CoherenceDataset, InterferogramDataset
 from .licsar import LiCSAR
 
 available = [

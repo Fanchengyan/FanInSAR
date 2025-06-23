@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from faninsar.typing import PathLike
+    from os import PathLike
 
 
-def load_meta_value(
+def load_meta(
     path: PathLike,
     key: str,
     sep: str | None = None,
@@ -21,7 +21,7 @@ def load_meta_value(
     .. note::
         - The key is case-insensitive.
         - If you need to retrieve multiple metadata records, use the
-            :func:`load_meta_values` function instead. It is more io-efficient
+            :func:`load_metas` function instead. It is more io-efficient
             to retrieve multiple records at once.
 
     Parameters
@@ -59,10 +59,10 @@ def load_meta_value(
     if line_start and line_end and line_start > line_end and line_end >= 0:
         msg = (
             "line_start must be less than or equal to line_end."
-            "line_start: {line_start}, line_end: {line_end}"
+            f"line_start: {line_start}, line_end: {line_end}"
         )
         raise ValueError(msg)
-    with Path(path).open() as f:
+    with Path(path).open(encoding="utf-8") as f:
         lines = f.readlines()[line_start:line_end]
         for line in lines:
             if key.lower() in line.lower():
@@ -70,13 +70,13 @@ def load_meta_value(
         return None
 
 
-def load_meta_values(
+def load_metas(
     path: PathLike,
     keys: list[str],
     sep: str | None = None,
     line_start: int | None = None,
     line_end: int | None = None,
-) -> dict[str | None]:
+) -> dict[str, str | None]:
     r"""Load multiple metadata records from a file at once.
 
     .. tip::
@@ -111,10 +111,10 @@ def load_meta_values(
     if line_start and line_end and line_start > line_end and line_end >= 0:
         msg = (
             "line_start must be less than or equal to line_end."
-            "line_start: {line_start}, line_end: {line_end}"
+            f"line_start: {line_start}, line_end: {line_end}"
         )
         raise ValueError(msg)
-    with Path(path).open() as f:
+    with Path(path).open(encoding="utf-8") as f:
         lines = f.readlines()[line_start:line_end]
         values = [None for _ in keys]
         for line in lines:
@@ -128,7 +128,7 @@ def load_meta_values(
         return dict(zip(keys, values))
 
 
-def ensure_int(value: str, name: str) -> int:
+def ensure_int(value: str | int, name: str) -> int:
     """Ensure a value is an integer.
 
     Parameters
@@ -153,7 +153,7 @@ def ensure_int(value: str, name: str) -> int:
         return int(value)
     except ValueError as e:
         msg = f"{name} must be an integer."
-        raise ValueError(msg) from e
+        raise TypeError(msg) from e
 
 
 def strip_str(string: str) -> str:

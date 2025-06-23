@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from faninsar import Pairs, PairsFactory, DaySpan
+from faninsar import DaySpan, Pairs, PairsFactory
 
 
 class TestPairs:
@@ -144,7 +144,7 @@ class TestPairs:
         assert names.shape == (5,)
 
     def test_to_frame(self, sample_pairs):
-        frame = sample_pairs.to_frame()
+        frame = sample_pairs.to_dataframe()
         assert isinstance(frame, pd.DataFrame)
         assert frame.shape == (5, 3)
 

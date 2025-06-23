@@ -10,6 +10,8 @@ import pandas as pd
 from faninsar.datasets.base import ApsDataset, ApsPairs
 
 if TYPE_CHECKING:
+    from os import PathLike
+
     from faninsar._core.sar.pairs import Pairs
     from faninsar.query.query import BoundingBox, Points
 
@@ -35,7 +37,7 @@ class GACOS(ApsDataset):
     prepare reference points and roi (region of interest)
 
     >>> ref_points_file = Path("/Volumes/Data/ARPs.geojson")
-    >>> ref_points = Points.from_shapefile(ref_points_file)
+    >>> ref_points = Points.from_file(ref_points_file)
     >>> roi = BoundingBox(98.57726618, 38.52546262, 99.41100273, 39.13802703, crs=4326)
 
     initialize HyP3
@@ -63,7 +65,7 @@ class GACOS(ApsDataset):
 
     def to_pair_files(
         self,
-        out_dir: str | Path,
+        out_dir: PathLike,
         pairs: Pairs,
         ref_points: Points,
         roi: BoundingBox | None = None,

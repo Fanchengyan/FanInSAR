@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Union
 
-from pyproj.crs import CRS as PyprojCRS  # noqa: N811
+from pyproj.crs.crs import CRS as PyprojCRS  # noqa: N811
 from rasterio.crs import CRS as RasterioCRS  # noqa: N811
 
 CrsLike = Union[

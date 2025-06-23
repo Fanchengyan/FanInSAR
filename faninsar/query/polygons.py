@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING, Literal, Sequence
 
 import geopandas as gpd
 import pandas as pd
-from pyproj.crs import CRS
+from pyproj.crs.crs import CRS
 from rasterio.errors import CRSError
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from os import PathLike
 
     from matplotlib.axes import Axes
 
@@ -108,7 +108,7 @@ class Polygons:
             else:
                 other = other.to_crs(self.crs)
 
-        gdf = pd.concat([self.frame, other.frame], ignore_index=True)
+        gdf = pd.concat([self.geodataframe, other.geodataframe], ignore_index=True)
         return Polygons(gdf, types=gdf.types)
 
     def _format_geometry(
@@ -127,7 +127,7 @@ class Polygons:
             _df = gpd.GeoDataFrame(gdf)
             _df["types"] = types
         elif isinstance(gdf, Polygons):
-            _df = gdf.frame
+            _df = gdf.geodataframe
         else:
             msg = f"gdf must be an instance of GeoDataFrame, GeoSeries. Got {type(gdf)}"
             raise TypeError(msg)
@@ -190,7 +190,7 @@ class Polygons:
         return self._gdf["types"]
 
     @property
-    def frame(self) -> gpd.GeoDataFrame:
+    def geodataframe(self) -> gpd.GeoDataFrame:
         """GeoDataFrame format of polygons."""
         return self._gdf
 
@@ -217,7 +217,9 @@ class Polygons:
             "desired" and "undesired" polygons. If the Polygons object only contains
             "undesired" polygons, the returned Polygons object will be empty.
         """
-        _df = gpd.overlay(self.desired.frame, self.undesired.frame, how="difference")
+        _df = gpd.overlay(
+            self.desired.geodataframe, self.undesired.geodataframe, how="difference"
+        )
         return Polygons(_df, types="desired")
 
     def to_bbox(self) -> list[BoundingBox]:
@@ -228,15 +230,15 @@ class Polygons:
             If the Polygons object only contains "undesired" polygons, the returned
             list will be empty.
         """
-        return self.to_desired().frame
+        return self.to_desired().geodataframe
 
-    def to_GeoDataFrame(self) -> gpd.GeoDataFrame:
+    def to_geodataframe(self) -> gpd.GeoDataFrame:
         """Return a GeoDataFrame of the polygons.
 
-        This method is an alias of :attr:`frame` for API consistency with
+        This method is an alias of :attr:`geodataframe` for API consistency with
         :class:`~faninsar.query.Points` and :class:`BoundingBox`.
         """
-        return self.frame
+        return self.geodataframe
 
     @property
     def crs(self) -> CRS:
@@ -306,7 +308,7 @@ class Polygons:
     @classmethod
     def from_file(
         cls,
-        filename: str | Path,
+        filename: PathLike,
         types: (
             Literal["desired", "undesired"] | Sequence[Literal["desired", "undesired"]]
         ) = "desired",
@@ -317,7 +319,7 @@ class Polygons:
 
         Parameters
         ----------
-        filename : str | Path
+        filename : PathLike
             The path to the shapefile. file type can be any type that can be
             passed to :func:`geopandas.read_file`.
         types : 'desired' | 'undesired' | Sequence['desired', 'undesired'], optional
@@ -372,4 +374,4 @@ class Polygons:
             },
         )
 
-        return self.frame.plot(**kwargs)
+        return self.geodataframe.plot(**kwargs)

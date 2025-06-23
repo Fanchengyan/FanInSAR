@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import ClassVar
 
-import numpy as np
 import pandas as pd
 
 from faninsar._core.sar.pairs import Pairs
+from faninsar._core.sar.sar_missions import Sentinel1
 from faninsar.datasets.ifg import InterferogramDataset
 
 
-class LiCSAR(InterferogramDataset):
+class LiCSAR(InterferogramDataset, Sentinel1):
     """A dataset manages the data of LiCSAR product.
 
     `LiCSAR <https://www.mdpi.com/2072-4292/12/15/2430>`_ is an open-source
@@ -24,7 +23,7 @@ class LiCSAR(InterferogramDataset):
 
     pattern_unw = "*geo.unw.tif"
     pattern_coh = "*geo.cc.tif"
-    coh_range: ClassVar[list[float]] = [0, 255]
+    coh_range: tuple[float, float] = (0, 255)
 
     #: pattern used to find dem file
     pattern_dem = "*geo.hgt.tif"
@@ -72,10 +71,3 @@ class LiCSAR(InterferogramDataset):
         """Parse the Pairs from the paths of the interferogram."""
         pair_names = [Path(f).name.split(".")[0] for f in paths]
         return Pairs.from_names(pair_names)
-
-    @classmethod
-    def parse_datetime(cls, paths: list[Path]) -> pd.DatetimeIndex:
-        """Parse the datetime of the interferogram to generate DatetimeIndex object."""
-        pair_names = [Path(f).name.split(".")[0] for f in paths]
-        date_names = np.unique([i.split("_") for i in pair_names])
-        return pd.DatetimeIndex(date_names)

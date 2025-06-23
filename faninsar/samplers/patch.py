@@ -16,10 +16,7 @@ if TYPE_CHECKING:
 
     from faninsar.datasets import GeoDataset
 
-logger = setup_logger(
-    log_name="FanInSAR.samplers.batch",
-    log_format="%(levelname)s - %(message)s",
-)
+logger = setup_logger(__name__)
 
 
 class PatchSampler(abc.ABC):
