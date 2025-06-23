@@ -272,17 +272,32 @@ class Pairs:
         This function is used to make sure the primary date is earlier than the
         secondary date.
         """
+        # Handle empty array case
+        if values.size == 0:
+            return values.reshape(0, 2)
+
         if values.ndim == 1:
             values = values.reshape(-1, 2)
-        idx = values[:, 0] > values[:, 1]
-        values[idx] = values[idx, ::-1]
+
+        # Handle case where we have pairs to process
+        if values.shape[0] > 0:
+            idx = values[:, 0] > values[:, 1]
+            values[idx] = values[idx, ::-1]
+
         return values
 
     def _parse_pair_meta(self) -> None:
-        self._dates = np.unique(self._values.flatten())
-        self._length = self._values.shape[0]
-        self._edge_index = np.searchsorted(self._dates, self._values)
-        self._names = self.to_names()
+        # Handle empty pairs case
+        if self._values.size == 0:
+            self._dates = np.array([], dtype="datetime64[D]")
+            self._length = 0
+            self._edge_index = np.array([], dtype=np.int64).reshape(0, 2)
+            self._names = np.array([], dtype=np.str_)
+        else:
+            self._dates = np.unique(self._values.flatten())
+            self._length = self._values.shape[0]
+            self._edge_index = np.searchsorted(self._dates, self._values)
+            self._names = self.to_names()
 
     def __len__(self) -> int:
         """Return the number of pairs."""
@@ -349,9 +364,17 @@ class Pairs:
                 if isinstance(stop, str):
                     stop = DateManager.ensure_datetime(stop)
                 if start is None:
-                    start = self._dates[0]
+                    start = (
+                        self._dates[0]
+                        if len(self._dates) > 0
+                        else np.datetime64("1970-01-01")
+                    )
                 if stop is None:
-                    stop = self._dates[-1]
+                    stop = (
+                        self._dates[-1]
+                        if len(self._dates) > 0
+                        else np.datetime64("1970-01-01")
+                    )
 
                 start, stop = (np.datetime64(start, "s"), np.datetime64(stop, "s"))
 
@@ -470,6 +493,8 @@ class Pairs:
     @property
     def days(self) -> DaySpan:
         """The time span of all pairs in days."""
+        if len(self._values) == 0:
+            return DaySpan(np.array([], dtype=np.int32))
         days = (self._values[:, 1] - self._values[:, 0]).astype(int)
         return DaySpan(days, dtype=np.int32)
 
@@ -737,6 +762,9 @@ class Pairs:
             Pairs names string with format of '%Y%m%d_%Y%m%d'.
 
         """
+        if len(self._values) == 0:
+            return np.array([], dtype=np.str_)
+
         names = (
             pd.DatetimeIndex(self.primary).strftime("%Y%m%d")
             + "_"
@@ -865,10 +893,15 @@ class Pairs:
             Data type of the matrix. Default is None.
 
         """
-        matrix = np.zeros((len(self), len(self.dates) - 1), dtype=dtype)
-        col_idxs = self.edge_index.copy()
-        for row_idx, col_idx in enumerate(col_idxs):
-            matrix[row_idx, col_idx[0] : col_idx[1]] = 1
+        n_dates = len(self.dates)
+        if n_dates == 0:
+            return np.zeros((0, 0), dtype=dtype)
+
+        matrix = np.zeros((len(self), n_dates - 1), dtype=dtype)
+        if len(self) > 0:
+            col_idxs = self.edge_index.copy()
+            for row_idx, col_idx in enumerate(col_idxs):
+                matrix[row_idx, col_idx[0] : col_idx[1]] = 1
 
         return matrix
 
@@ -895,8 +928,14 @@ class Pairs:
             Acquisition/date gaps that are not covered by any pairs.
 
         """
+        if len(self.dates) <= 1:
+            return np.array([], dtype="datetime64[D]")
+
         dates = self.dates[1:]
         pairs_valid = self - pairs_removed if pairs_removed is not None else self
+
+        if len(pairs_valid) == 0:
+            return dates
 
         dates_secondary = np.unique(pairs_valid.secondary)
         return np.setdiff1d(dates, dates_secondary)
