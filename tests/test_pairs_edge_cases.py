@@ -106,7 +106,7 @@ class TestPairsEdgeCases:
         assert len(empty_pairs) == 0
 
         # Test sort not inplace
-        sorted_pairs = empty_pairs.sort(inplace=False)
+        sorted_pairs,_ = empty_pairs.sort(inplace=False)
         assert len(sorted_pairs) == 0
 
     def test_empty_pairs_gaps(self):
