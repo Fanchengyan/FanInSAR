@@ -1,3 +1,5 @@
-from ._load_cmaps import __all__, cmy, cmy_r, dismph, dismph_r, romanian, romanian_r
+# Import the new mintpy colormap loader
+from .colormaps import __all__, __dir__, __getattr__, names
 
-names = __all__
+# For backward compatibility, expose all colormap names at module level
+# The __getattr__ function from colormaps.py will handle dynamic loading
