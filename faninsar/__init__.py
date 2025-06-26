@@ -35,6 +35,7 @@ from ._core import (
     write_geoinfo_into_ds,
     write_geoinfo_into_nc,
 )
+from .cmaps import cmaps
 
 # dev versions should have "dev" in them, stable should not.
 # doc/conf.py makes use of this to set the version drop-down.

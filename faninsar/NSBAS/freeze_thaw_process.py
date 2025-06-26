@@ -17,7 +17,7 @@ class FreezeThawCycle:
         temperature: Sequence,
         date_args: dict | None = None,
         day_duration: int = 5,
-        ER: float = 1,  # noqa: N803
+        ER: float = 1,
         no_gap: bool = True,
         thaw_start: str = "01-01",
         thaw_end: str = "12-31",
@@ -145,10 +145,7 @@ class FreezeThawCycle:
         df = df.resample("D").mean()
         dates_nan = df[pd.isna(df)].index.strftime("%F").to_list()
         if len(dates_nan) > 0:
-            msg = (
-                "Temperature data have a null value in "
-                f'dates: {", ".join(dates_nan)}'
-            )
+            msg = f"Temperature data have a null value in dates: {', '.join(dates_nan)}"
             raise ValueError(msg)
 
     def _dates_slice_is_complete(self, dates: list, start: str, end: str) -> bool:
@@ -170,7 +167,7 @@ class FreezeThawCycle:
         offset_year = 0 if self._same_year(self.thaw_start, self.thaw_end) else 1
         for year in self.years:
             date_start = f"{year}-{self.thaw_start}"
-            date_end = f"{year+offset_year}-{self.thaw_end}"
+            date_end = f"{year + offset_year}-{self.thaw_end}"
 
             df_thawing = self.data[date_start:date_end].copy()
             df_thawing[df_thawing < 0] = np.nan
@@ -198,7 +195,7 @@ class FreezeThawCycle:
         offset_year = 0 if self._same_year(self.freeze_start, self.freeze_end) else 1
         for year in self.years:
             date_start = f"{year}-{self.freeze_start}"
-            date_end = f"{year+offset_year}-{self.freeze_end}"
+            date_end = f"{year + offset_year}-{self.freeze_end}"
 
             df_freezing = -self.data[date_start:date_end].copy()
             df_freezing[df_freezing < 0] = np.nan
@@ -299,7 +296,7 @@ class FreezeThawCycle:
 
     def get_t3s(
         self,
-        ER: float | None = None,  # noqa: N803
+        ER: float | None = None,
         years: list[str] | None = None,
     ) -> pd.Series:
         """Get date t3 (onset of winter-stable period) for given years.
@@ -321,7 +318,7 @@ class FreezeThawCycle:
             TI_year = self.TI[year] if year in self.TI.index else np.nan  # noqa: N806
 
             date_start = f"{year}-{self.freeze_start}"
-            date_end = f"{year+1}-{self.freeze_end}"
+            date_end = f"{year + 1}-{self.freeze_end}"
             DDF_year = self.DDF[date_start:date_end]  # noqa: N806
 
             # FI_year may be nan in last year
@@ -348,7 +345,7 @@ class FreezeThawCycle:
     def update_ts(
         self,
         day_duration: int = 5,
-        ER: float | None = None,  # noqa: N803
+        ER: float | None = None,
         years: list[str] | None = None,
     ) -> None:
         """Update the onset of thawing, freezing, and winter-stable period."""

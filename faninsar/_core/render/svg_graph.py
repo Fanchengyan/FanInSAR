@@ -40,6 +40,8 @@ class PairsSVG:
                     / (max_pairs - max_direct_lines)
                 ),
             )
+        # avoid zero lines
+        lines_to_display = max(lines_to_display, 1)
 
         # Calculate the number of lines to display
         line_height = (height - 50) / lines_to_display

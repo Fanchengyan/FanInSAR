@@ -50,18 +50,19 @@ class Acquisition(pd.DatetimeIndex):
 
         return array_repr(self)
 
-    def to_xarray(self) -> pd.DatetimeIndex:
+    def to_xarray(self) -> xr.Variable:
         """Convert the acquisition dates to xarray format."""
         return xr.Variable("Acquisition", self)
 
     @property
     def stats(self) -> dict:
         """Return the statistical attributes of the acquisition dates."""
+        length = len(self)
         return {
-            "start": self.min().strftime("%F"),
-            "end": self.max().strftime("%F"),
-            "unique": len(self.unique()),
-            "total": len(self),
+            "start": self.min().strftime("%F") if length > 0 else None,
+            "end": self.max().strftime("%F") if length > 0 else None,
+            "unique": len(self.unique()) if length > 0 else 0,
+            "total": length,
         }
 
     @property
