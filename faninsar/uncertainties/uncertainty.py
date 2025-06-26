@@ -181,7 +181,7 @@ class UncertaintyPropagation:
         return 1 / np.sqrt(variance)
 
     @staticmethod
-    def data2param_simplified(G: np.ndarray, var_data: np.ndarray) -> np.ndarray:  # noqa: N803
+    def data2param_simplified(G: np.ndarray, var_data: np.ndarray) -> np.ndarray:
         r"""Compute variance of parameters (var_model) from variance of data (var_d).
 
         var_d is the sum of the squares of the residuals and is a constant
@@ -208,7 +208,7 @@ class UncertaintyPropagation:
         return var_data * np.diag(A)[None, :]
 
     @staticmethod
-    def data2param_weighted_simplified(G: np.ndarray, W: np.ndarray) -> np.ndarray:  # noqa: N803
+    def data2param_weighted_simplified(G: np.ndarray, W: np.ndarray) -> np.ndarray:
         """Calculate variances of model parameters.
 
         This only works when the weight is expressed as 1/delta, where delta^2
@@ -234,10 +234,10 @@ class UncertaintyPropagation:
 
     @staticmethod
     def data2param(
-        G: np.ndarray,  # noqa: N803
+        G: np.ndarray,
         var_data: np.ndarray,
         weighted: bool = False,
-        W: np.ndarray | None = None,  # noqa: N803
+        W: np.ndarray | None = None,
         desc: str = "  Data to model variance",
     ) -> np.ndarray:
         """Calculate of model parameter variance (var_param) from data variance (var_d).
@@ -328,11 +328,11 @@ class UncertaintyPropagation:
 
     @staticmethod
     def data2param_file(
-        G: np.ndarray,  # noqa: N803
+        G: np.ndarray,
         var_data: np.ndarray,
         var_param_file: Path,
         weighted: bool = False,
-        W: np.ndarray | None = None,  # noqa: N803
+        W: np.ndarray | None = None,
         desc: str = "  Computing model variance",
     ) -> None:
         """Calculate model parameter variance (var_param) from data variance (var_d).
@@ -411,10 +411,10 @@ class UncertaintyPropagation:
 
     @staticmethod
     def data_cov2param(
-        G: np.ndarray,  # noqa: N803
+        G: np.ndarray,
         cov_data: np.ndarray,
         weighted: bool = False,
-        W: np.ndarray | None = None,  # noqa: N803
+        W: np.ndarray | None = None,
     ) -> np.ndarray:
         """Calculate model parameter variance (var_param) from data covariance (cov_d).
 
@@ -518,7 +518,7 @@ def get_var_patch(
 
 
 def data2param(
-    G: np.ndarray,  # noqa: N803
+    G: np.ndarray,
     uc_data: np.ndarray,
     in_type: Literal["variance", "covariance"] = "variance",
     out_type: Literal["variance", "covariance"] = "variance",
@@ -588,7 +588,7 @@ def data2param(
 
 
 def data2param_cov(
-    G: np.ndarray,  # noqa: N803
+    G: np.ndarray,
     cov_data: np.ndarray,
     desc: str = "  Data to model covariance",
 ) -> np.ndarray:
@@ -628,7 +628,7 @@ def data2param_cov(
 
 
 def data2param_sequence(
-    Gs: list,  # noqa: N803
+    Gs: list,
     var_data: np.ndarray,
     verbose: bool = True,
     desc: str = "  Data to model covariance",
@@ -691,6 +691,6 @@ def data2param_sequence(
     return var_param
 
 
-def G2M(G: np.ndarray) -> np.ndarray:  # noqa: N802, N803
+def G2M(G: np.ndarray) -> np.ndarray:  # noqa: N802
     """Compute the Moore-Penrose pseudo-inverse of the design matrix G."""
     return np.linalg.inv(G.T @ G) @ (G.T)

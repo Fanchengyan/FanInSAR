@@ -108,9 +108,9 @@ class Baselines:
         return len(self.values)
 
     @property
-    def dataframe(self) -> pd.DataFrame:
-        """Return the DataFrame of the baselines."""
-        return pd.DataFrame({"dates": self.dates, "values": self.values})
+    def series(self) -> pd.Series:
+        """Return the Series of the baselines."""
+        return pd.Series(self.values, index=self.dates)
 
     @property
     def values(self) -> np.ndarray:
@@ -167,10 +167,7 @@ class Baselines:
             The values of the baselines.
 
         """
-        baselines = (
-            self.dataframe[pairs.secondary].values
-            - self.dataframe[pairs.primary].values
-        )
+        baselines = self.series[pairs.secondary] - self.series[pairs.primary]
         bs = pd.Series(baselines, index=pairs.to_names())
         bs.index.name = "pairs"
         bs.name = "baseline"
@@ -263,7 +260,7 @@ class Baselines:
             start, end = pair.primary, pair.secondary
             line_valid = ax.plot(
                 [start, end],
-                [self.dataframe[start], self.dataframe[end]],
+                [self.series[start], self.series[end]],
                 **pairs_kwargs,
             )[0]
         # plot removed pairs
@@ -272,7 +269,7 @@ class Baselines:
                 start, end = pair.primary, pair.secondary
                 line_removed = ax.plot(
                     [start, end],
-                    [self.dataframe[start], self.dataframe[end]],
+                    [self.series[start], self.series[end]],
                     **pairs_removed_kwargs,
                 )[0]
         # plot acquisitions
@@ -287,12 +284,12 @@ class Baselines:
             gaps = gaps - pd.Timedelta(offset, "D")
 
             dates_valid = np.setdiff1d(pairs.dates, gaps)
-            vals = self.dataframe[dates_valid]
+            vals = self.series[dates_valid]
             margin = vals.std() / 3
             ymin, ymax = vals.min() - margin, vals.max() + margin
-            _gaps_kwargs = {"color": "k", "ls": "--", "alpha": 0.5}
-            _gaps_kwargs.update(gaps_kwargs)
-            line_gaps = ax.vlines(gaps, ymin=ymin, ymax=ymax, **_gaps_kwargs)
+            gaps_kwargs_ = {"color": "k", "ls": "--", "alpha": 0.5}
+            gaps_kwargs_.update(gaps_kwargs)
+            line_gaps = ax.vlines(gaps, ymin=ymin, ymax=ymax, **gaps_kwargs_)
 
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)

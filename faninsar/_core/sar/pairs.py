@@ -17,9 +17,11 @@ from faninsar.logging import setup_logger
 from .acquisition import Acquisition, DateManager, DaySpan
 
 if TYPE_CHECKING:
+    from matplotlib.axes import Axes
     from numpy.typing import DTypeLike, NDArray
 
     from faninsar import Loop, Loops, TripletLoops
+    from faninsar._core.sar.sar_tools import Baselines
     from faninsar.typing import PairLike, PairsLike, PairsOrder
 
 logger = setup_logger(__name__)
@@ -255,9 +257,9 @@ class Pairs:
         if pairs is None:
             pairs = []
 
-        _values = np.array(pairs, dtype="M8[D]")
+        values = np.array(pairs, dtype="M8[D]")
 
-        self._values = self._format_pair_values(_values)
+        self._values = self._format_pair_values(values)
         self._parse_pair_meta()
 
         if sort:
@@ -321,14 +323,14 @@ class Pairs:
 
     def __add__(self, other: Pairs) -> Pairs:
         """Return the unique, sorted union of the pairs."""
-        _pairs = np.union1d(self.names, other.names)
-        return Pairs.from_names(_pairs)
+        pairs = np.union1d(self.names, other.names)
+        return Pairs.from_names(pairs)
 
     def __sub__(self, other: Pairs) -> Pairs:
         """Return the difference of the pairs."""
-        _pairs = np.setdiff1d(self.names, other.names)
+        pairs = np.setdiff1d(self.names, other.names)
 
-        return Pairs.from_names(_pairs)
+        return Pairs.from_names(pairs.tolist())
 
     @overload
     def __getitem__(self, index: int | np.integer) -> Pair: ...
@@ -351,7 +353,7 @@ class Pairs:
                     start = 0
                 if stop is None:
                     stop = self._length
-                return Pairs(self._values[start:stop:step])
+                return Pairs(self._values[start:stop:step].tolist())
             if isinstance(
                 start,
                 (datetime, np.datetime64, pd.Timestamp, str, type(None)),
@@ -383,13 +385,13 @@ class Pairs:
                         f"Index start {start} should be earlier than index stop {stop}."
                     )
                     raise ValueError(msg)
-                _pairs = []
+                pairs = []
                 for pair in self._values:
                     pair = pair.astype("M8[s]")  # noqa: PLW2901
                     if start <= pair[0] <= stop and start <= pair[1] <= stop:
-                        _pairs.append(pair)
-                if len(_pairs) > 0:
-                    return Pairs(_pairs)
+                        pairs.append(pair)
+                if len(pairs) > 0:
+                    return Pairs(pairs)
                 return None
             msg = f"Unsupported slice index {index} for Pairs."
             logger.warning(msg)
@@ -414,7 +416,7 @@ class Pairs:
             return None
         if isinstance(index, Iterable):
             index = np.array(index)
-            return Pairs(self._values[index])
+            return Pairs(self._values[index].tolist())
         msg = (
             "Index should be int, slice, datetime, str, or bool or int array"
             f" indexing, but got {type(index)}."
@@ -569,7 +571,7 @@ class Pairs:
     @classmethod
     def from_names(
         cls,
-        names: Sequence[str | None],
+        names: Sequence[str],
         parse_function: Callable | None = None,
         date_args: dict | None = None,
     ) -> Pairs:
@@ -602,9 +604,6 @@ class Pairs:
         if date_args is None:
             date_args = {}
         pairs = []
-        # No names in list
-        if len(names) == 0:
-            return cls(pairs)
         # Parse the names
         for name in names:
             pair = Pair.from_name(name, parse_function, date_args)
@@ -626,7 +625,7 @@ class Pairs:
             Whether to return the index or mask of the pairs. Default is 'index'.
 
         """
-        if return_type not in ["index", "mask"]:
+        if return_type not in {"index", "mask"}:
             msg = (
                 "return_type should be one of ['index', 'mask'], "
                 f"but got {return_type}."
@@ -683,7 +682,7 @@ class Pairs:
 
     def copy(self) -> Pairs:
         """Return a copy of the pairs."""
-        return Pairs(self._values.copy())
+        return Pairs(self._values.tolist())
 
     def sort(
         self,
@@ -717,7 +716,7 @@ class Pairs:
         if len(self) == 0:
             if inplace:
                 return None
-            return self
+            return self, np.arange(len(self))
 
         # for valid pairs
         item_map = {
@@ -728,7 +727,7 @@ class Pairs:
         }
         if isinstance(order, str):
             order = [order]
-        _values_ = []
+        values_ = []
         for i in order:
             if i not in item_map:
                 msg = (
@@ -737,16 +736,16 @@ class Pairs:
                 raise ValueError(
                     msg,
                 )
-            _values_.append(item_map[i].reshape(self._length, -1))
-        _values_ = np.hstack(_values_)
-        _values, _index = np.unique(_values_, axis=0, return_index=True)
+            values_.append(item_map[i].reshape(self._length, -1))
+        values_ = np.hstack(values_)
+        values, index = np.unique(values_, axis=0, return_index=True)
         if not ascending:
-            _index = _index[::-1]
+            index = index[::-1]
         if inplace:
-            self._values = _values
+            self._values = values
             self._parse_pair_meta()
             return None
-        return Pairs(_values), _index
+        return Pairs(values.tolist()), index
 
     def to_names(self, prefix: str | None = None) -> NDArray[np.str_]:
         """Generate pairs names string with prefix.
@@ -905,7 +904,7 @@ class Pairs:
 
         return matrix
 
-    def parse_gaps(self, pairs_removed: Pairs | None = None) -> pd.DatetimeIndex:
+    def parse_gaps(self, pairs_removed: Pairs | None = None) -> np.ndarray:
         """Parse network gaps where the acquisitions are not connected by pairs.
 
         The gaps are detected by the dates that are not present in the secondary
@@ -924,7 +923,7 @@ class Pairs:
 
         Returns
         -------
-        gaps : pd.DatetimeIndex
+        gaps : np.ndarray
             Acquisition/date gaps that are not covered by any pairs.
 
         """
@@ -935,10 +934,24 @@ class Pairs:
         pairs_valid = self - pairs_removed if pairs_removed is not None else self
 
         if len(pairs_valid) == 0:
-            return dates
+            return dates.to_numpy(dtype="datetime64[D]")
 
         dates_secondary = np.unique(pairs_valid.secondary)
         return np.setdiff1d(dates, dates_secondary)
+
+    def plot(
+        self,
+        baseline: Baselines | None = None,
+        ax: Axes | None = None,
+        **kwargs,
+    ) -> Axes:
+        """Plot the pairs."""
+        if baseline is None:
+            from faninsar._core.sar.sar_tools import Baselines
+
+            vals = np.random.randn(len(self)) * 1000  # noqa: NPY002
+            baseline = Baselines.from_pair_wise(self, vals)
+        return baseline.plot(self, ax=ax, **kwargs)
 
 
 class PairsFactory:
@@ -986,21 +999,21 @@ class PairsFactory:
 
         """
         num = len(self.dates)
-        _pairs = []
+        pairs = []
         for i, date in enumerate(self.dates):
             n_interval = 1
             while n_interval <= max_interval:
                 if i + n_interval < num:
                     if (self.dates[i + n_interval] - date).days < max_day:
                         pair = (date, self.dates[i + n_interval])
-                        _pairs.append(pair)
+                        pairs.append(pair)
                         n_interval += 1
                     else:
                         break
                 else:
                     break
 
-        return Pairs(_pairs)
+        return Pairs(pairs)
 
     def linking_winter(
         self,
@@ -1057,7 +1070,7 @@ class PairsFactory:
 
         n_years = len(date_years)
 
-        _pairs = []
+        pairs = []
         for i, date_year in enumerate(date_years):
             # primary/reference dates
             for date_primary in date_year:
@@ -1065,8 +1078,8 @@ class PairsFactory:
                 for j in range(1, max_winter_interval + 1):
                     if i + j < n_years:
                         for date_secondary in date_years[i + j]:
-                            _pairs.append((date_primary, date_secondary))  # noqa: PERF401
-        return Pairs(_pairs)
+                            pairs.append((date_primary, date_secondary))  # noqa: PERF401
+        return Pairs(pairs)
 
     def from_period(
         self,
@@ -1131,7 +1144,7 @@ class PairsFactory:
                 date_years.append(dt_year[:n].to_list())
 
         # generate interferometric pairs between primary period and the rest periods
-        _pairs = []
+        pairs = []
         for i, date_year in enumerate(date_years):
             # only generate pairs for n_primary_period
             if n_primary_period is not None and i + 1 > n_primary_period:
@@ -1143,9 +1156,9 @@ class PairsFactory:
                 for date_year1 in date_years[i + 1 :]:
                     for date_secondary in date_year1:
                         pair = (date_primary, date_secondary)
-                        _pairs.append(pair)
+                        pairs.append(pair)
 
-        return Pairs(_pairs)
+        return Pairs(pairs)
 
     def from_summer_winter(
         self,
@@ -1178,7 +1191,7 @@ class PairsFactory:
         years = sorted(set(self.dates.year))
         df_dates = pd.Series(self.dates.strftime("%Y%m%d"), index=self.dates)
 
-        _pairs = []
+        pairs = []
         for year in years:
             s_start = pd.to_datetime(f"{year}{summer_start}", format="%Y%m%d")
             s_end = pd.to_datetime(f"{year}{summer_end}", format="%Y%m%d")
@@ -1208,15 +1221,15 @@ class PairsFactory:
                 for dt_w1 in dt_winter1:
                     for dt_s in dt_summer:
                         pair = (dt_w1, dt_s)
-                        _pairs.append(pair)
+                        pairs.append(pair)
             # freezing process
             if len(dt_winter2) > 0 and len(dt_summer) > 0:
                 for dt_w2 in dt_winter2:
                     for dt_s in dt_summer:
                         pair = (dt_s, dt_w2)
-                        _pairs.append(pair)
+                        pairs.append(pair)
 
-        return Pairs(_pairs)
+        return Pairs(pairs)
 
 
 # TODO: accelerate the process using numba or cython
@@ -1298,26 +1311,7 @@ def valid_diagonal_pair(
     if not mask_edge.any():
         return False
 
-    _edge_pairs = pairs[mask_edge]
-    if _edge_pairs.days.values.sum() >= pair.days:
+    edge_pairs_ = pairs[mask_edge]
+    if edge_pairs_.days.values.sum() >= pair.days:
         valid = True
     return valid
-
-
-if __name__ == "__main__":
-    names = [
-        "20170111_20170204",
-        "20170111_20170222",
-        "20170111_20170318",
-        "20170204_20170222",
-        "20170204_20170318",
-        "20170204_20170330",
-        "20170222_20170318",
-        "20170222_20170330",
-        "20170222_20170411",
-        "20170318_20170330",
-    ]
-
-    pairs = Pairs.from_names(names)
-    loops = pairs.to_loops()
-    # pairs1 = loops.pairs

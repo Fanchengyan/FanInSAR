@@ -117,7 +117,7 @@ class NSBASMatrixFactory:
             unw = unw.filled(np.nan)
 
         self._model = None
-        self._gamma = None
+        self._gamma = 0.0001
 
         if model is not None:
             self._check_model(model)
@@ -207,7 +207,7 @@ class NSBASMatrixFactory:
         return self._G
 
     @G.setter
-    def G(self, G: np.ndarray) -> None:  # noqa: N802, N803
+    def G(self, G: np.ndarray) -> None:  # noqa: N802
         """Update G by input G."""
         if not isinstance(G, np.ndarray):
             msg = "G must be a numpy array"
@@ -227,9 +227,9 @@ class NSBASMatrixFactory:
 
     def _make_nsbas_matrix(
         self,
-        G_br: np.ndarray,  # noqa: N803
-        gamma: np.ndarray,
-    ) -> NDArray[np.float32]:
+        G_br: np.ndarray,
+        gamma: float,
+    ) -> np.ndarray:
         G_br = np.asarray(G_br, dtype=np.float32)  # noqa: N806
         G_tl = self.pairs.to_matrix()  # noqa: N806
 
@@ -243,13 +243,13 @@ class NSBASMatrixFactory:
         G_t = np.hstack((G_tl, np.zeros((len(self._pairs), n_param))))  # noqa: N806
         return np.vstack((G_t, G_b))
 
-    def _make_sbas_matrix(self) -> NDArray[np.float32]:
+    def _make_sbas_matrix(self) -> np.ndarray:
         return self.pairs.to_matrix()
 
     def _restructure_unw(
         self,
-        unw: NDArray[np.number],
-    ) -> NDArray[np.float32 | np.float64]:
+        unw: np.ndarray,
+    ) -> np.ndarray:
         if self.model is not None:
             unw = np.vstack((unw, np.zeros((len(self.pairs.dates), unw.shape[1]))))
         return unw
@@ -305,12 +305,10 @@ class NSBASInversion:
 
     def inverse(
         self,
-    ) -> tuple[
-        NDArray[np.floating],
-        NDArray[np.floating],
-        NDArray[np.floating],
-        NDArray[np.floating],
-    ]:
+    ) -> (
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         """Calculate increment displacement difference by NSBAS inversion.
 
         Returns
@@ -371,7 +369,7 @@ def device_mem_size(device: str | torch.device | None) -> int:
 
 
 def _get_patch_col(
-    G: np.ndarray | torch.Tensor,  # noqa: N803
+    G: np.ndarray | torch.Tensor,
     d: np.ndarray | torch.Tensor,
     mem_size: int,
     dtype: np.dtype,
@@ -429,7 +427,7 @@ def _get_patch_col(
 
 
 def batch_lstsq(
-    G: np.ndarray | torch.Tensor,  # noqa: N803
+    G: np.ndarray | torch.Tensor,
     d: np.ndarray | torch.Tensor,
     dtype: torch.dtype = torch.float64,
     device: str | torch.device | None = None,
@@ -506,7 +504,7 @@ def batch_lstsq(
 
 
 def censored_lstsq(
-    G: np.ndarray | torch.Tensor,  # noqa: N803
+    G: np.ndarray | torch.Tensor,
     d: np.ndarray | torch.Tensor,
     dtype: torch.dtype = torch.float64,
     device: str | torch.device | None = None,

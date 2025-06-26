@@ -56,11 +56,12 @@ class Acquisition(pd.DatetimeIndex):
     @property
     def stats(self) -> dict:
         """Return the statistical attributes of the acquisition dates."""
+        length = len(self)
         return {
-            "start": self.min().strftime("%F"),
-            "end": self.max().strftime("%F"),
-            "unique": len(self.unique()),
-            "total": len(self),
+            "start": self.min().strftime("%F") if length > 0 else None,
+            "end": self.max().strftime("%F") if length > 0 else None,
+            "unique": len(self.unique()) if length > 0 else 0,
+            "total": length,
         }
 
     @property
