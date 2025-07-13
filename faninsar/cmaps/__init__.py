@@ -59,8 +59,9 @@ class ColormapLoader(ABC):
 
         """
 
+    @staticmethod
     def _create_colormap(
-        self, name: str, data: np.ndarray
+        name: str, data: np.ndarray
     ) -> EnhancedLinearSegmentedColormap:
         """Create an EnhancedLinearSegmentedColormap from data.
 
@@ -99,7 +100,8 @@ class ColormapLoader(ABC):
 
         # Check if base colormap is available
         if base_name not in self.names:
-            msg = f"Colormap '{base_name}' not found"
+            msg = f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            logger.error(msg, stacklevel=2)
             raise AttributeError(msg)
 
         # Check cache first
@@ -338,6 +340,26 @@ def __dir__() -> list[str]:
     # Add all colormap names from the unified cmaps instance
     attrs.extend(cmaps.__all__)
 
+    # Ensure "cmaps" is included
+    attrs.append("cmaps")
+
+    # Explicitly add custom colormaps
+    custom_cmaps = [
+        "GnBu_RdPl",
+        "GnBu_RdPl_r",
+        "RdGyBu",
+        "RdGyBu_r",
+        "WtBuPl",
+        "WtBuPl_r",
+        "WtBuGn",
+        "WtBuGn_r",
+        "WtRdPl",
+        "WtRdPl_r",
+        "WtHeatRed",
+        "WtHeatRed_r",
+    ]
+    attrs.extend(custom_cmaps)
+
     # Remove private attributes and clean up
     attrs = [attr for attr in attrs if not attr.startswith("_")]
 
@@ -362,10 +384,10 @@ __all__ = [
 ]
 __all__ += cmaps.__all__
 
-names = cmaps.__all__.copy()
-
+# Define all custom colormaps immediately for guaranteed availability
 white = "0.95"
 
+# RdGyBu colormap
 colors = [
     "#68011f",
     "#bb2832",
@@ -380,33 +402,36 @@ colors = [
 RdGyBu = EnhancedLinearSegmentedColormap.from_list("RdGrBu", colors, N=100)
 RdGyBu_r = EnhancedLinearSegmentedColormap.from_list("RdGrBu_r", colors[::-1], N=100)
 
+# GnBu_RdPl colormap
 colors = ["#8f07ff", "#d5734a", white, "#0571b0", "#01ef6c"]
 GnBu_RdPl = EnhancedLinearSegmentedColormap.from_list("GnBu_RdPl", colors, N=100)
 GnBu_RdPl_r = EnhancedLinearSegmentedColormap.from_list(
-    "GnBu_RdPl_r",
-    colors[::-1],
-    N=100,
+    "GnBu_RdPl_r", colors[::-1], N=100
 )
 
+# WtBuPl colormap
 colors = [white, "#0571b0", "#8f07ff", "#d5734a"]
 WtBuPl = EnhancedLinearSegmentedColormap.from_list("WtBuPl", colors, N=100)
 WtBuPl_r = EnhancedLinearSegmentedColormap.from_list("WtBuPl_r", colors[::-1], N=100)
 
+# WtBuGn colormap
 colors = [white, "#0571b0", "#01ef6c"]
 WtBuGn = EnhancedLinearSegmentedColormap.from_list("WtBuGn", colors, N=100)
 WtBuGn_r = EnhancedLinearSegmentedColormap.from_list("WtBuGn_r", colors[::-1], N=100)
 
+# WtRdPl colormap
 colors = [white, "#d5734a", "#8f07ff"]
 WtRdPl = EnhancedLinearSegmentedColormap.from_list("WtRdPl", colors, N=100)
 WtRdPl_r = EnhancedLinearSegmentedColormap.from_list("WtRdPl_r", colors[::-1], N=100)
 
+# WtHeatRed colormap
 colors = [white, "#fff7b3", "#fb9d59", "#aa0526"]
 WtHeatRed = EnhancedLinearSegmentedColormap.from_list("WtHeatRed", colors, N=100)
 WtHeatRed_r = EnhancedLinearSegmentedColormap.from_list(
-    "WtHeatRed_r",
-    colors[::-1],
-    N=100,
+    "WtHeatRed_r", colors[::-1], N=100
 )
+
+names = cmaps.__all__.copy()
 
 
 del colors

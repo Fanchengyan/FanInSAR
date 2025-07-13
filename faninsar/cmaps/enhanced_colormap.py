@@ -30,7 +30,7 @@ class EnhancedLinearSegmentedColormap(mcolors.LinearSegmentedColormap):
 
     This class extends matplotlib's LinearSegmentedColormap to provide
     additional functionality for colormap manipulation, including cropping,
-    merging, lightening, RGB extraction, and saving to file.
+    merging, transparentizing, RGB extraction, and saving to file.
 
     All methods from the original LinearSegmentedColormap are preserved,
     with additional utility methods for advanced colormap operations.
@@ -173,7 +173,7 @@ class EnhancedLinearSegmentedColormap(mcolors.LinearSegmentedColormap):
         rgba_array = self(np.linspace(0, 1, self.N))
         rgba_array[:, 3] = alpha  # Set alpha channel
 
-        return self.from_list(f"{self.name}_lightened", rgba_array, N=self.N)
+        return self.from_list(f"{self.name}_transparentize", rgba_array, N=self.N)
 
     def crop(
         self,
