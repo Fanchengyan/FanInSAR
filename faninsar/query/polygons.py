@@ -10,6 +10,8 @@ import pandas as pd
 from pyproj.crs.crs import CRS
 from rasterio.errors import CRSError
 
+from faninsar.logging import setup_logger
+
 if TYPE_CHECKING:
     from os import PathLike
 
@@ -18,6 +20,8 @@ if TYPE_CHECKING:
     from faninsar.typing import CrsLike
 
     from .bbox import BoundingBox
+
+logger = setup_logger(__name__)
 
 
 class Polygons:
@@ -70,7 +74,9 @@ class Polygons:
             one half of a pixel prior to cropping raster. Defaults to False.
 
         """
-        self._gdf = self._format_geometry(gdf, types, crs).sort_values(
+        self._gdf: gpd.GeoDataFrame = self._format_geometry(
+            gdf, types, crs
+        ).sort_values(
             by="types",
             ascending=True,
         )
@@ -121,19 +127,24 @@ class Polygons:
     ) -> gpd.GeoDataFrame:
         """Format the geometry column of the GeoDataFrame."""
         if isinstance(gdf, gpd.GeoDataFrame):
-            _df = gpd.GeoDataFrame(gdf.geometry)
-            _df["types"] = types
+            df = gpd.GeoDataFrame(gdf.geometry)
+            df["types"] = types
         elif isinstance(gdf, gpd.GeoSeries):
-            _df = gpd.GeoDataFrame(gdf)
-            _df["types"] = types
+            df = gpd.GeoDataFrame(gdf)
+            df["types"] = types
         elif isinstance(gdf, Polygons):
-            _df = gdf.geodataframe
+            df = gdf.geodataframe
         else:
             msg = f"gdf must be an instance of GeoDataFrame, GeoSeries. Got {type(gdf)}"
+            logger.error(msg, stacklevel=2)
             raise TypeError(msg)
-        return self._ensure_gdf_crs(_df, crs)
+        return self._ensure_gdf_crs(df, crs)
 
-    def _ensure_gdf_crs(self, gdf: gpd.GeoDataFrame, crs: CrsLike) -> CRS:
+    @staticmethod
+    def _ensure_gdf_crs(
+        gdf: gpd.GeoDataFrame,
+        crs: CrsLike,
+    ) -> gpd.GeoDataFrame:
         """Ensure the CRS of the GeoDataFrame."""
         if crs is None and gdf.crs is None:
             warnings.warn(
@@ -147,7 +158,7 @@ class Polygons:
             if not isinstance(crs, CRS):
                 crs = CRS.from_user_input(crs)
             if gdf.crs is None:
-                gdf = gdf.set_crs(crs)
+                gdf = gdf.set_crs(crs, inplace=False)
             elif gdf.crs != crs:
                 gdf = gdf.to_crs(crs)
         return gdf

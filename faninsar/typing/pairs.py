@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, Sequence, Union
+from typing import Iterable, Literal
+
+from numpy.typing import NDArray
 
 from faninsar import Pair, Pairs, TripletLoop, TripletLoops
 
-PairLike = Union[Pair, str, Sequence[datetime, datetime]]
-PairsLike = Union[Pairs, Sequence[PairLike]]
+PairLike = Pair | str | Iterable[datetime] | NDArray
+PairsLike = Pairs | Iterable[PairLike] | NDArray
 
-TripletLoopLike = Union[TripletLoop, str, Sequence[datetime, datetime, datetime]]
-TripletLoopsLike = Union[TripletLoops, Sequence[TripletLoopLike]]
+TripletLoopLike = TripletLoop | str | Iterable[datetime]
+TripletLoopsLike = TripletLoops | Iterable[TripletLoopLike]
 
 _PairsOrder = Literal["pairs", "primary", "secondary", "days"]
-PairsOrder = Union[_PairsOrder, Sequence[_PairsOrder]]
+PairsOrder = _PairsOrder | Iterable[_PairsOrder]

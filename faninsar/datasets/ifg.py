@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Sequence
+from typing import TYPE_CHECKING, Iterable, Literal
 
 import numpy as np
 import rasterio
@@ -13,9 +13,11 @@ from rasterio.enums import Resampling
 from tqdm import tqdm
 
 from faninsar._core import geo_tools
-from faninsar.datasets.base import ApsPairs, PairDataset, RasterDataset
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points
+
+from .aps import ApsPairs
+from .base import PairDataset, RasterDataset
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -136,16 +138,16 @@ class InterferogramDataset(PairDataset):
 
     def __init__(
         self,
-        root_dir: str = "data",
-        paths_unw: Sequence[PathLike] | None = None,
-        paths_coh: Sequence[PathLike] | None = None,
+        root_dir: str | Path = "data",
+        paths_unw: Iterable[PathLike] | None = None,
+        paths_coh: Iterable[PathLike] | None = None,
         crs: CRS | None = None,
         res: float | tuple[float, float] | None = None,
         dtype: np.dtype | None = None,
         nodata: float | None = None,
         roi: BoundingBox | None = None,
-        bands_unw: Sequence[str] | None = None,
-        bands_coh: Sequence[str] | None = None,
+        bands_unw: Iterable[str] | None = None,
+        bands_coh: Iterable[str] | None = None,
         cache: bool = True,
         resampling: Resampling = Resampling.nearest,
         fill_nodata: bool = False,
@@ -214,9 +216,12 @@ class InterferogramDataset(PairDataset):
         self.verbose = verbose
 
         if paths_unw is None:
-            paths_unw = np.unique(list(root_dir.rglob(self.pattern_unw)))
+            paths_unw = sorted(set(root_dir.rglob(self.pattern_unw)))
         if paths_coh is None:
-            paths_coh = np.unique(list(root_dir.rglob(self.pattern_coh)))
+            paths_coh = sorted(set(root_dir.rglob(self.pattern_coh)))
+
+        paths_unw = np.array([Path(i) for i in paths_unw], dtype=object)
+        paths_coh = np.array([Path(i) for i in paths_coh], dtype=object)
 
         # Pairs: ensure there are no duplicate pairs
         # remove duplicate pairs
@@ -287,7 +292,9 @@ class InterferogramDataset(PairDataset):
         self._pairs = self.parse_pairs(self._files.paths)
         self._ds_coh._pairs = self.parse_pairs(self._ds_coh._files.paths)
 
-    def _deduplicate_pairs(self, paths: list[Path], dataset_name: str) -> list[Path]:
+    def _deduplicate_pairs(
+        self, paths: np.ndarray, dataset_name: str
+    ) -> tuple[np.ndarray, Pairs]:
         """Remove duplicate pairs from the list of paths."""
         pairs = self.parse_pairs(paths)
         _, index = pairs.sort(inplace=False)
@@ -724,15 +731,15 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
     def __init__(
         self,
         root_dir: str = "data",
-        paths_unw: Sequence[PathLike] | None = None,
-        paths_coh: Sequence[PathLike] | None = None,
+        paths_unw: Iterable[PathLike] | None = None,
+        paths_coh: Iterable[PathLike] | None = None,
         crs: CRS | None = None,
         res: float | tuple[float, float] | None = None,
         dtype: np.dtype | None = None,
         nodata: float | None = None,
         roi: BoundingBox | None = None,
-        bands_unw: Sequence[str] | None = None,
-        bands_coh: Sequence[str] | None = None,
+        bands_unw: Iterable[str] | None = None,
+        bands_coh: Iterable[str] | None = None,
         cache: bool = True,
         resampling: Resampling = Resampling.nearest,
         fill_nodata: bool = False,

@@ -239,7 +239,7 @@ class Pairs:
 
     def __init__(
         self,
-        pairs: Sequence[Sequence[datetime, datetime]] | Sequence[Pair],
+        pairs: PairsLike,
         sort: bool = True,
     ) -> None:
         """Initialize the pairs class.
@@ -446,9 +446,9 @@ class Pairs:
         )
         return pd.DataFrame(self._values, columns=columns)
 
+    @staticmethod
     def _ensure_pairs(
-        self,
-        pairs: str | Pair | Pairs | Sequence[str] | Sequence[Pair],
+        pairs: PairsLike,
     ) -> Pairs:
         """Ensure the pairs are in the Pairs object."""
         if isinstance(pairs, str):
@@ -612,7 +612,7 @@ class Pairs:
 
     def where(
         self,
-        pairs: list[str] | list[Pair] | Pairs,
+        pairs: PairsLike,
         return_type: Literal["index", "mask"] = "index",
     ) -> NDArray[np.int64 | np.bool_]:
         """Return the index of the pairs.
@@ -638,7 +638,7 @@ class Pairs:
             con = np.where(con)[0]
         return con
 
-    def intersect(self, pairs: PairLike) -> Pairs | None:
+    def intersect(self, pairs: PairsLike) -> Pairs:
         """Return the intersection of the pairs.
 
         The pairs both in self and input pairs.
@@ -652,7 +652,7 @@ class Pairs:
         pairs = self._ensure_pairs(pairs)
         return self[self.where(pairs)]
 
-    def union(self, pairs: list[str] | list[Pair] | Pairs) -> Pairs:
+    def union(self, pairs: PairsLike) -> Pairs:
         """Return the unique, sorted union of the pairs.
 
         All pairs that in self and input pairs. Same as addition.
@@ -666,7 +666,7 @@ class Pairs:
         pairs = self._ensure_pairs(pairs)
         return self + pairs
 
-    def difference(self, pairs: PairsLike) -> Pairs | None:
+    def difference(self, pairs: PairsLike) -> Pairs:
         """Return the difference of the pairs.
 
         The pairs in self but not in pairs. Same as subtraction.
@@ -683,6 +683,22 @@ class Pairs:
     def copy(self) -> Pairs:
         """Return a copy of the pairs."""
         return Pairs(self._values.tolist())
+
+    @overload
+    def sort(
+        self,
+        order: PairsOrder = ...,
+        ascending: bool = ...,
+        inplace: Literal[False] = ...,
+    ) -> tuple[Pairs, NDArray[np.int64]]: ...
+
+    @overload
+    def sort(
+        self,
+        order: PairsOrder = ...,
+        ascending: bool = ...,
+        inplace: Literal[True] = ...,
+    ) -> None: ...
 
     def sort(
         self,

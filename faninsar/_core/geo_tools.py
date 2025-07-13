@@ -1023,7 +1023,7 @@ class Profile:
     @classmethod
     def from_bounds_res(
         cls,
-        bounds: tuple[float, float, float, float],
+        bounds: tuple[float, float, float, float] | BoundingBox,
         res: float | tuple[float, float],
     ) -> Profile:
         """Create a Profile object from bounds and resolution.
