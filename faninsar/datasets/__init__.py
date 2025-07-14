@@ -1,12 +1,5 @@
-from .base import (
-    ApsDataset,
-    ApsPairs,
-    GeoDataset,
-    # HierarchicalDataset,
-    # MultiHierarchicalDataset,
-    PairDataset,
-    RasterDataset,
-)
+from .aps import ApsDataset, ApsPairs
+from .base import GeoDataset, PairDataset, RasterDataset
 from .gacos import GACOS, GACOSPairs
 from .hyp3 import HyP3S1, HyP3S1Burst
 from .ifg import CoherenceDataset, InterferogramDataset

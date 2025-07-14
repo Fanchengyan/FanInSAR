@@ -1,7 +1,5 @@
 [build-system]
-requires = [
-  "setuptools",
-]
+requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,9 +7,7 @@ name = "FanInSAR"
 description = "A fancy InSAR time series library, in a Pythonic, fast, and flexible way."
 readme = "README.md"
 license = { file = "LICENSE" }
-authors = [
-  { name = "Chengyan Fan (Fancy)", email = 'fanchengyan@outlook.com' },
-]
+authors = [{ name = "Chengyan Fan (Fancy)", email = 'fanchengyan@outlook.com' }]
 
 urls.Documentation = "https://faninsar.readthedocs.io/en/latest/"
 urls.Source = "https://github.com/Fanchengyan/FanInSAR"
@@ -46,28 +42,27 @@ keywords = [
   "sentinel-1",
   "nisar",
 ]
-dynamic = [
-  "version",
-]
+dynamic = ["version"]
 dependencies = [
-    "geopandas",
-    "pandas",
-    "numpy",
-    "torch",
-    "matplotlib",
-    "data_downloader",
-    "rasterio >= 1.0.26",
-    "xarray",
-    "psutil",
-    "rioxarray",
-    "netcdf4",
-    "h5netcdf",
-    "tqdm",
-    "rtree",
-    "pykml",
-    "dominate",
-    "typing_extensions",
-    "colorlog",
+  "geopandas",
+  "pandas",
+  "numpy",
+  "torch",
+  "matplotlib",
+  "data_downloader",
+  "rasterio >= 1.0.26",
+  "xarray",
+  "psutil",
+  "rioxarray",
+  "netcdf4",
+  "h5netcdf",
+  "tqdm",
+  "rtree",
+  "pykml",
+  "dominate",
+  "typing_extensions",
+  "colorlog",
+  "dask[array]",
 ]
 
 
@@ -127,7 +122,7 @@ dev = [
   "sphinx-togglebutton",
   "Jinja2",
   "myst-sphinx-gallery",
-  ]
+]
 
 [tool.setuptools]
 include-package-data = true
@@ -136,9 +131,7 @@ include-package-data = true
 version = { attr = "faninsar.__version__" }
 
 [tool.setuptools.packages.find]
-where = [
-  ".",
-] # list of folders that contain the packages (["."] by default)
+where = ["."] # list of folders that contain the packages (["."] by default)
 include = [
   "faninsar*",
 ] # package names should match these glob patterns (["*"] by default)
@@ -153,9 +146,7 @@ addopts = [
   "-r a",
   "--tb=short",
 ]
-testpaths = [
-    "tests",
-]
+testpaths = ["tests"]
 norecursedirs = "build _build"
 filterwarnings = [
   # "ignore:node class .* is already registered.*:",
@@ -163,14 +154,12 @@ filterwarnings = [
   "ignore:.* Unknown directive type \"toctree\".",
 ]
 
-markers = [
-  "slow: marks tests as slow",
-]
+markers = ["slow: marks tests as slow"]
 
 [tool.ruff]
 line-length = 88
 fix = true
-exclude=[
+exclude = [
   # commonly ignored directories.
   ".bzr",
   ".direnv",
@@ -214,7 +203,8 @@ select = [
   # pyflakes
   "F",
   # pycodestyle
-  "E", "W",
+  "E",
+  "W",
   # isort
   "I",
   # flake8-simplify
@@ -354,15 +344,12 @@ ignore = [
 ]
 # 4. Ignore `E402` (import violations) in all `__init__.py` files, and in selected subdirectories.
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["E402","F401"]
+"__init__.py" = ["E402", "F401"]
 "*.pyi" = ["N815"]
-"**/{tests,docs,tools}/*" = ["E402","F401"]
+"**/{tests,docs,tools}/*" = ["E402", "F401"]
 
 [tool.ruff.lint.pep8-naming]
-extend-ignore-names = [
-  "test_*",
-  "to_*"
-]
+extend-ignore-names = ["test_*", "to_*"]
 
 [tool.ruff.format]
 docstring-code-format = true

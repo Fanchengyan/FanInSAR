@@ -3,7 +3,7 @@
 The base class RasterDataset in this script is modified from the torchgeo package.
 """
 
-from __future__ import annotations  # noqa: I001
+from __future__ import annotations
 
 import contextlib
 import functools
@@ -20,9 +20,8 @@ import rasterio
 import rioxarray  # noqa: F401
 import shapely
 import xarray as xr
-from rasterio import features, fill
+from rasterio import features, fill, plot
 from rasterio import mask as rio_mask
-from rasterio import plot
 from rasterio.crs import CRS
 from rasterio.dtypes import dtype_ranges, get_minimum_dtype
 from rasterio.enums import Resampling
@@ -61,7 +60,40 @@ if TYPE_CHECKING:
     from faninsar._core.sar.acquisition import Acquisition
     from faninsar._core.sar.pairs import Pairs
 
-__all__ = ("GeoDataset", "PairDataset", "RasterDataset")
+
+logger = setup_logger(__name__)
+
+try:
+    import dask
+    from dask.delayed import delayed
+
+    HAS_DASK = True
+except ImportError:
+    HAS_DASK = False
+    msg = "dask is not installed"
+
+    # Create dummy functions for type checking
+    class _DummyDask:
+        @staticmethod
+        def compute(*args, **kwargs) -> None:  # noqa: ARG004
+            """Compute of dask is not installed dummy function for type checking."""
+            logger.error(msg)  # noqa: TRY400
+            raise ImportError(msg)
+
+    class _DummyDelayed:
+        def __call__(self, func) -> None:  # noqa: ANN001, ARG002
+            """Delayed of dask is not installed dummy function for type checking."""
+            raise ImportError(msg)
+
+    dask = _DummyDask()
+    delayed = _DummyDelayed()
+
+__all__ = (
+    "GeoDataset",
+    "PairDataset",
+    "RasterDataset",
+    "TimeSeriesDataset",
+)
 
 logger = setup_logger(__name__)
 
@@ -587,6 +619,7 @@ class RasterDataset(GeoDataset):
         fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
+        use_dask: bool = False,
     ) -> None:
         """Initialize a new raster dataset instance.
 
@@ -633,6 +666,8 @@ class RasterDataset(GeoDataset):
             if True, print verbose output, default: True
         ds_name : str, optional
             name of the dataset. used for printing verbose output, default: ""
+        use_dask : bool, optional
+            if True, use dask for lazy loading and parallel computation, default: False
 
         Raises
         ------
@@ -658,6 +693,7 @@ class RasterDataset(GeoDataset):
         self.fill_nodata = fill_nodata
         self.verbose = verbose
         self.ds_name = ds_name
+        self.use_dask = use_dask
 
         if paths is None:
             paths = []
@@ -743,6 +779,15 @@ class RasterDataset(GeoDataset):
         self.nodata = nodata
         self.count = count
         self.roi = roi
+
+    def _check_dask_available(self) -> None:
+        """Check if dask is available when use_dask is True."""
+        if self.use_dask and not HAS_DASK:
+            msg = (
+                "dask is required for lazy loading and parallel computation. "
+                "Please install dask with: pip install 'dask[array]'"
+            )
+            raise ImportError(msg)
 
     def __getitem__(
         self,
@@ -845,21 +890,33 @@ class RasterDataset(GeoDataset):
             "default_value": 1,
         }
 
-        shapes = polygons.frame.geometry.to_list()
+        shapes = polygons.geodataframe.geometry.to_list()
         if len(polygons.desired) > 0:
             data_ls = []
             transform_ls = []
             mask_ls = []
             for shp in shapes:
-                data, out_transform = rio_mask.mask(vrt_fh, [shp], **mask_params)
-
-                rasterize_params.update(
-                    {
-                        "out_shape": data.shape if data.ndim == 2 else data.shape[1:3],
-                        "transform": out_transform,
-                    },
-                )
-                mask = features.rasterize([shp], **rasterize_params).astype(bool)
+                try:
+                    data, out_transform = rio_mask.mask(vrt_fh, [shp], **mask_params)
+                    # Create mask for valid data
+                    rasterize_params.update(
+                        {
+                            "out_shape": data.shape
+                            if data.ndim == 2
+                            else data.shape[1:3],
+                            "transform": out_transform,
+                        },
+                    )
+                    mask = features.rasterize([shp], **rasterize_params).astype(bool)
+                except ValueError as e:
+                    if "Input shapes do not overlap raster" in str(e):
+                        # Create empty masked array when polygon doesn't overlap
+                        # with raster
+                        data = np.ma.array([], dtype=np.float32).reshape(0, 0)
+                        out_transform = vrt_fh.transform
+                        mask = np.array([], dtype=bool).reshape(0, 0)
+                    else:
+                        raise
 
                 if self.fill_nodata:
                     data = fill.fillnodata(data)
@@ -893,9 +950,6 @@ class RasterDataset(GeoDataset):
             data = self._file_query_points(points, vrt_fh)
             data_ls.append(data)
         return np.ma.asarray(data_ls)
-        # points_values = np.ma.asarray(data_ls)
-        # dims, points_values = parse_1d_dims(points_values)
-        # return PointsResult({"data": points_values, "dims": dims})
 
     def _files_query_bbox(
         self, bbox: BoundingBox, vrt_fhs: Iterable[DatasetReader]
@@ -909,38 +963,40 @@ class RasterDataset(GeoDataset):
 
     def _files_query_polygons(
         self, polygons: Polygons, vrt_fhs: Iterable[DatasetReader]
-    ) -> tuple[np.ndarray, list[Affine], list[np.ndarray]]:
+    ) -> tuple[list, list[Affine], list[np.ndarray]]:
         """Return the values of the dataset at the given polygons."""
         data_ls_all = []
+        transform_ls = []
+        mask_ls = []
+
         for vrt_fh in vrt_fhs:
-            data_ls, transform_ls, mask_ls = self._file_query_polygons(polygons, vrt_fh)
+            data_ls, transform_ls_file, mask_ls_file = self._file_query_polygons(
+                polygons, vrt_fh
+            )
             data_ls_all.append(data_ls)
+            if not transform_ls:  # Only set once, should be same for all files
+                transform_ls = transform_ls_file
+                mask_ls = mask_ls_file
 
-        # parse polygons results
+        # stack the files for each polygon
         n_polygons = len(polygons)
-        if n_polygons == 1:
-            polygons_values = np.ma.asarray(data_ls_all)
-            # dims = parse_2d_dims(polygons_values)
-        else:
-            # stack the files for each polygon
-            poly_list = [[] for _ in range(n_polygons)]
-            for file_data in data_ls_all:
-                for i, poly_i in enumerate(file_data):
-                    poly_list[i].append(poly_i)
-            polygons_values = [np.ma.asarray(arr) for arr in poly_list]
-            # get the dims
-            # polygon0 = polygons_values[0]
-            # dims = parse_2d_dims(polygon0, details=False)
-        return polygons_values, transform_ls, mask_ls
+        poly_list = [[] for _ in range(n_polygons)]
+        for file_data in data_ls_all:
+            for i, poly_i in enumerate(file_data):
+                poly_list[i].append(poly_i)
 
-        # return PolygonsResult(
-        #     {
-        #         "data": polygons_values,
-        #         "dims": f"(n_polygons:{n_polygons}, ({dims}))",
-        #         "transforms": transform_ls,
-        #         "masks": mask_ls,
-        #     }
-        # )
+        # Handle arrays with potentially different shapes
+        polygons_values = []
+        for arr in poly_list:
+            try:
+                data = np.ma.asarray(arr)
+                polygons_values.append(data)
+            except ValueError:  # noqa: PERF203
+                # If arrays have incompatible shapes, keep as list of individual arrays
+                # This happens when different files produce different sized crops for the same polygon  # noqa: E501
+                polygons_values.append(arr)
+
+        return polygons_values, transform_ls, mask_ls
 
     def _ensure_loading_verbose(self, sequence: Iterable) -> Iterable:
         if self.verbose:
@@ -981,58 +1037,28 @@ class RasterDataset(GeoDataset):
             a QueryResult instance containing the results of the various queries.
 
         """
-        if self.cache:
-            vrt_fhs = [self._cached_load_warp_file(fp) for fp in paths]
-        else:
-            vrt_fhs = [self._load_warp_file(fp) for fp in paths]
-
-        vrt_fhs = self._ensure_loading_verbose(vrt_fhs)
+        # Convert paths to indexes for use with query methods
+        paths_list = list(paths)
+        valid_paths = self.files[self.files.valid].paths.tolist()
+        indexes = [
+            valid_paths.index(path) for path in paths_list if path in valid_paths
+        ]
 
         points_result = None
         bbox_result = None
         polygons_result = None
 
         if query.points is not None:
-            points_data = self._files_query_points(query.points, vrt_fhs)
-            points_result = PointsResult(
-                {
-                    "data": points_data,
-                    "dims": parse_1d_dims(points_data),
-                }
+            points_result = self.points_query(
+                query.points, indexes=indexes, use_dask=self.use_dask
             )
         if query.boxes is not None:
-            bbox_data = self._files_query_bbox(query.boxes, vrt_fhs)
-            bbox_result = BBoxesResult(
-                {
-                    "data": bbox_data,
-                    "dims": parse_2d_dims(bbox_data),
-                }
+            bbox_result = self.bbox_query(
+                query.boxes, indexes=indexes, use_dask=self.use_dask
             )
         if query.polygons is not None:
-            polygons_data, transform_ls, mask_ls = self._files_query_polygons(
-                query.polygons, vrt_fhs
-            )
-            n_polygons = len(query.polygons)
-            if n_polygons == 1:
-                polygons_data = np.ma.asarray(polygons_data)
-                dims = parse_2d_dims(polygons_data)
-            else:
-                # stack the files for each polygon
-                poly_list = [[] for _ in range(n_polygons)]
-                for file_data in polygons_data:
-                    for i, poly_i in enumerate(file_data):
-                        poly_list[i].append(poly_i)
-                polygons_data = [np.ma.asarray(arr) for arr in poly_list]
-                # get the dims
-                dims = parse_2d_dims(polygons_data[0], details=False)
-
-            polygons_result = PolygonsResult(
-                {
-                    "data": polygons_data,
-                    "dims": f"(n_polygons:{len(query.polygons)}, ({dims}))",
-                    "transforms": transform_ls,
-                    "masks": mask_ls,
-                }
+            polygons_result = self.polygons_query(
+                query.polygons, indexes=indexes, use_dask=self.use_dask
             )
 
         return QueryResult(points_result, bbox_result, polygons_result, query)
@@ -1081,9 +1107,9 @@ class RasterDataset(GeoDataset):
         """Convert file indexes to file paths.
 
         This method is used to convert the indexes of the files in the dataset
-        to the file paths. It checks if the indexes are valid and if the files
-        are valid. If the indexes are None, it returns all the file paths in
-        the dataset.
+        to the file paths. It checks whether the indexes are valid and whether
+        the files are valid. If the indexes are None, it returns all the file
+        paths in the dataset.
 
         Parameters
         ----------
@@ -1121,10 +1147,13 @@ class RasterDataset(GeoDataset):
             raise ValueError(msg)
 
         files_used = self.files.iloc[indexes, :]
-        if not np.all(files_used.valid.values):
-            msg = f"Following files are invalid: {files_used[~files_used.valid]}"
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
+        if not files_used.valid.all():
+            msg = (
+                "Following files are invalid and will be ignored: "
+                f"{files_used[~files_used.valid]}"
+            )
+            logger.warning(msg, stacklevel=2)
+            files_used = files_used[files_used.valid]
 
         return files_used.paths.values.tolist()
 
@@ -1146,8 +1175,7 @@ class RasterDataset(GeoDataset):
             vrt_fhs = [self._cached_load_warp_file(fp) for fp in paths]
         else:
             # load the files without caching
-            # this is useful for testing and debugging
-            # to avoid caching issues
+            # this is useful for testing and debugging to avoid caching issues
             vrt_fhs = [self._load_warp_file(fp) for fp in paths]
         return vrt_fhs
 
@@ -1207,7 +1235,10 @@ class RasterDataset(GeoDataset):
         return profile
 
     def points_query(
-        self, points: Points, indexes: int | list[int] | None = None
+        self,
+        points: Points,
+        indexes: int | list[int] | None = None,
+        use_dask: bool | None = None,
     ) -> PointsResult:
         """Query the dataset for the given file index and points.
 
@@ -1218,6 +1249,9 @@ class RasterDataset(GeoDataset):
         indexes : int or list of int or None, optional
             indexes of the files to query. If None, all files in the dataset
             will be used. Default is None.
+        use_dask : bool or None, optional
+            if True, use dask for lazy loading and parallel computation. If None,
+            use the dataset's default use_dask setting. Default is None.
 
         Returns
         -------
@@ -1225,28 +1259,56 @@ class RasterDataset(GeoDataset):
             a result object containing the results of the query.
 
         """
-        vrt_fhs = self._paths2vrt_fhs(self._indexes2paths(indexes))
-        data_ls = self._files_query_points(points, vrt_fhs)
+        if use_dask is None:
+            use_dask = self.use_dask
+
+        paths = self._indexes2paths(indexes)
+
+        if use_dask:
+            self._check_dask_available()
+            # Create delayed tasks for file loading and points query
+            delayed_vrt_fhs = [delayed(self._load_warp_file)(fp) for fp in paths]
+            delayed_points_data = [
+                delayed(self._file_query_points)(points, vrt_fh)
+                for vrt_fh in delayed_vrt_fhs
+            ]
+            # Compute all delayed tasks in parallel
+            points_data_list = dask.compute(*delayed_points_data)
+            data_ls = np.ma.asarray(points_data_list)
+        else:
+            # Use original logic for non-dask case
+            vrt_fhs = self._paths2vrt_fhs(paths)
+            data_ls = self._files_query_points(points, vrt_fhs)
 
         multi_files = True
         if isinstance(indexes, int):
-            data_ls = data_ls.squeeze(0)
+            if data_ls is not None and hasattr(data_ls, "squeeze"):
+                data_ls = data_ls.squeeze(0)
             multi_files = False
         dims = parse_1d_dims(data_ls, multi_files)
         return PointsResult({"data": data_ls, "dims": dims})
 
     def bbox_query(
-        self, bbox: BoundingBox, indexes: int | list[int] | None = None
+        self,
+        bbox: BoundingBox | list[BoundingBox],
+        indexes: int | list[int] | None = None,
+        use_dask: bool | None = None,
     ) -> BBoxesResult:
-        """Query the dataset for the given file index and bounding box.
+        """Query the dataset for the given file index and bounding box(es).
 
         Parameters
         ----------
-        bbox : BoundingBox
-            desired bounding box to query.
+        bbox : BoundingBox or list[BoundingBox]
+            desired bounding box(es) to query. If a list is provided (even with one
+            bbox), the output will have a bbox dimension. If a single bbox (not in a
+            list) is provided, no bbox dimension will be added.
         indexes : int or list of int or None, optional
             indexes of the files to query. If None, all files in the dataset
-            will be used. Default is None.
+            will be used. Default is None. File dimension will never be automatically
+            removed even if it's 1.
+        use_dask : bool or None, optional
+            if True, use dask for lazy loading and parallel computation. If None,
+            use the dataset's default use_dask setting. Default is None.
 
         Returns
         -------
@@ -1254,28 +1316,74 @@ class RasterDataset(GeoDataset):
             a result object containing the results of the query.
 
         """
-        vrt_fhs = self._paths2vrt_fhs(self._indexes2paths(indexes))
-        data_ls = self._files_query_bbox(bbox, vrt_fhs)
+        if use_dask is None:
+            use_dask = self.use_dask
 
+        bbox_is_list = isinstance(bbox, list)
+        # If single bbox, convert to list for processing, but remember original format
+        bbox_list = bbox if bbox_is_list else [bbox]
+
+        paths = self._indexes2paths(indexes)
+
+        # Process each bbox separately
+        all_bbox_data = []
+        for single_bbox in bbox_list:
+            if use_dask:
+                self._check_dask_available()
+                # Create delayed tasks for file loading and bbox query
+                delayed_vrt_fhs = [delayed(self._load_warp_file)(fp) for fp in paths]
+                delayed_bbox_data = [
+                    delayed(self._file_query_bbox)(single_bbox, vrt_fh)
+                    for vrt_fh in delayed_vrt_fhs
+                ]
+                # Compute all delayed tasks in parallel
+                bbox_data_list = dask.compute(*delayed_bbox_data)
+                data_ls = np.ma.asarray(bbox_data_list)
+            else:
+                vrt_fhs = self._paths2vrt_fhs(paths)
+                data_ls = self._files_query_bbox(single_bbox, vrt_fhs)
+
+            all_bbox_data.append(data_ls)
+
+        # Stack results appropriately
+        if bbox_is_list:
+            # If input was a list, add bbox dimension
+            final_data = np.ma.asarray(all_bbox_data)
+            # Transpose to get (n_files, n_bboxes, height, width) or
+            # (n_files, n_bboxes, n_bands, height, width)
+            if final_data.ndim == 4:  # (n_bboxes, n_files, height, width)
+                final_data = final_data.transpose(1, 0, 2, 3)
+            elif final_data.ndim == 5:  # (n_bboxes, n_files, n_bands, height, width)
+                final_data = final_data.transpose(1, 0, 2, 3, 4)
+        else:
+            # If input was single bbox, no bbox dimension
+            final_data = all_bbox_data[0]
+
+        # Never squeeze file dimension, even if it's 1
         multi_files = True
-        if isinstance(indexes, int):
-            data_ls = data_ls.squeeze(0)
-            multi_files = False
-        dims = parse_2d_dims(data_ls, multi_files)
-        return BBoxesResult({"data": data_ls, "dims": dims})
+        dims = parse_2d_dims(final_data, multi_files)
+        return BBoxesResult({"data": final_data, "dims": dims})
 
     def polygons_query(
-        self, polygons: Polygons, indexes: int | list[int] | None = None
+        self,
+        polygons: Polygons,
+        indexes: int | list[int] | None = None,
+        use_dask: bool | None = None,
     ) -> PolygonsResult:
         """Query the dataset for the given file index and polygons.
 
         Parameters
         ----------
         polygons : Polygons
-            desired polygons to query.
+            desired polygons to query. Each polygon will always correspond to a result,
+            so there will always be a polygon dimension.
         indexes : int or list of int, optional
             indexes of the files to query. If None, all files in the dataset
-            will be used. Default is None.
+            will be used. Default is None. File dimension will never be automatically
+            removed even if it's 1.
+        use_dask : bool or None, optional
+            if True, use dask for lazy loading and parallel computation. If None,
+            use the dataset's default use_dask setting. Default is None.
 
         Returns
         -------
@@ -1283,41 +1391,108 @@ class RasterDataset(GeoDataset):
             a result object containing the results of the query.
 
         """
-        vrt_fhs = self._paths2vrt_fhs(self._indexes2paths(indexes))
+        if use_dask is None:
+            use_dask = self.use_dask
+
+        paths = self._indexes2paths(indexes)
+
+        if use_dask:
+            self._check_dask_available()
+            # Create delayed tasks for file loading and polygons query
+            delayed_vrt_fhs = [delayed(self._load_warp_file)(fp) for fp in paths]
+            delayed_polygons_data = [
+                delayed(self._file_query_polygons)(polygons, vrt_fh)
+                for vrt_fh in delayed_vrt_fhs
+            ]
+            # Compute all delayed tasks in parallel
+            polygons_results_list = dask.compute(*delayed_polygons_data)
+
+            # Process polygons results similar to the original method
+            data_ls_all = [result[0] for result in polygons_results_list]
+            # All should have same transforms
+            transform_ls = polygons_results_list[0][1]
+            # All should have same masks
+            mask_ls = polygons_results_list[0][2]
+
+            # Process the results similar to non-dask version
+            # stack the files for each polygon
+            n_polygons = len(polygons)
+            poly_list = [[] for _ in range(n_polygons)]
+            for file_data in data_ls_all:
+                for i, poly_i in enumerate(file_data):
+                    poly_list[i].append(poly_i)
+
+            # Handle arrays with potentially different shapes
+            polygons_values = []
+            for arr in poly_list:
+                try:
+                    data = np.ma.asarray(arr)
+                    polygons_values.append(data)
+                except ValueError:  # noqa: PERF203
+                    # If arrays have incompatible shapes, keep as list
+                    polygons_values.append(arr)
+
+            # Apply same logic as non-dask version
+            if n_polygons == 1:
+                # For single polygon, convert to numpy array if possible
+                try:
+                    polygons_data_array = np.ma.asarray(polygons_values[0])
+                    polygons_data = [
+                        polygons_data_array
+                    ]  # Wrap in list for polygon dimension
+                    dims = parse_2d_dims(polygons_data_array, True, details=False)
+                except ValueError:
+                    polygons_data = [polygons_values[0]]
+                    dims = "files:?, height:?, width:?"
+            else:
+                polygons_data = polygons_values
+                if len(polygons_data) > 0 and isinstance(
+                    polygons_data[0], (np.ma.MaskedArray, np.ndarray)
+                ):
+                    dims = parse_2d_dims(polygons_data[0], True, details=False)
+                else:
+                    dims = "files:?, height:?, width:?"
+
+            return PolygonsResult(
+                {
+                    "data": polygons_data,
+                    "dims": f"(n_polygons:{len(polygons)}, ({dims}))",
+                    "transforms": transform_ls,
+                    "masks": mask_ls,
+                }
+            )
+        vrt_fhs = self._paths2vrt_fhs(paths)
         polygons_data, transform_ls, mask_ls = self._files_query_polygons(
             polygons, vrt_fhs
         )
 
+        # Never squeeze file dimension, always keep multi_files=True
         multi_files = True
-        if isinstance(indexes, int):
-            multi_files = False
 
         n_polygons = len(polygons)
         if n_polygons == 1:
-            polygons_data = np.ma.asarray(polygons_data)
-            if isinstance(indexes, int):
-                polygons_data = polygons_data.squeeze(0)
-            dims = parse_2d_dims(polygons_data, multi_files)
-        else:
-            # stack the files for each polygon
-            poly_list = [[] for _ in range(n_polygons)]
-            for file_data in polygons_data:
-                for i, poly_i in enumerate(file_data):
-                    poly_list[i].append(poly_i)
-            # polygons_data = [np.ma.asarray(arr) for arr in poly_list]
-            polygons_data = []
-            for arr in poly_list:
-                data = np.ma.asarray(arr)
-                if isinstance(indexes, int):
-                    data = data.squeeze(0)
-                polygons_data.append(data)
-            # get the dims
+            # For single polygon, polygons_data is already a list with one element
+            # which is a numpy array with shape (n_files, height, width)
+            # We need to wrap it in another list to maintain polygon dimension
+            polygons_data = [polygons_data[0]]  # polygons_data[0] is the stacked array
+            if isinstance(polygons_data[0], (np.ma.MaskedArray, np.ndarray)):
+                dims = parse_2d_dims(polygons_data[0], multi_files, details=False)
+            else:
+                dims = "files:?, height:?, width:?"
+        # For multiple polygons, polygons_data is already structured correctly
+        # Each element in polygons_data corresponds to one polygon
+        # Never squeeze file dimension
+        elif len(polygons_data) > 0 and isinstance(
+            polygons_data[0], (np.ma.MaskedArray, np.ndarray)
+        ):
             dims = parse_2d_dims(polygons_data[0], multi_files, details=False)
+        else:
+            dims = "files:?, height:?, width:?"
 
         return PolygonsResult(
             {
                 "data": polygons_data,
-                "dims": dims,
+                "dims": f"(n_polygons:{n_polygons}, ({dims}))",
                 "transforms": transform_ls,
                 "masks": mask_ls,
             },
