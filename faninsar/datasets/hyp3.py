@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING, Iterable
 
 import numpy as np
 
@@ -11,6 +12,9 @@ from faninsar._core.sar.pairs import Pairs
 from faninsar._core.sar.sar_missions import Sentinel1
 from faninsar._core.sar.sar_tools import Baselines
 from faninsar.datasets.ifg import InterferogramDataset
+
+if TYPE_CHECKING:
+    from os import PathLike
 
 
 class HyP3S1(InterferogramDataset, Sentinel1):
@@ -25,7 +29,7 @@ class HyP3S1(InterferogramDataset, Sentinel1):
     pattern_coh = "*corr.tif"
 
     @classmethod
-    def parse_pairs(cls, paths: list[Path]) -> Pairs:
+    def _parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
         """Parse the Pairs from the paths of the interferogram."""
         names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
@@ -54,12 +58,11 @@ class HyP3S1(InterferogramDataset, Sentinel1):
         files = self.files[self.valid][mask].paths
         baselines = []
         for f in files:
-            try:
-                meta_file = str(f).replace("_unw_phase.tif", ".txt")
-                value = float(load_meta(meta_file, "Baseline"))
-                baselines.append(value)
-            except Exception:  # noqa: PERF203
-                baselines.append(np.nan)
+            meta_file = str(f).replace("_unw_phase.tif", ".txt")
+            value = load_meta(meta_file, "Baseline")
+            if value is None:
+                value = np.nan
+            baselines.append(value)
         return Baselines.from_pair_wise(pairs, np.array(baselines))
 
 
@@ -75,7 +78,7 @@ class HyP3S1Burst(InterferogramDataset, Sentinel1):
     pattern_coh = "*corr.tif"
 
     @classmethod
-    def parse_pairs(cls, paths: list[Path]) -> Pairs:
+    def _parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
         """Parse pairs from the paths of the interferogram."""
         names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[3:5]) for i in names]

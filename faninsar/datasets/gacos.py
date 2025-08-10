@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
-from faninsar.datasets.base import ApsDataset, ApsPairs
+from faninsar.datasets.aps import ApsDataset, ApsPairs
 
 if TYPE_CHECKING:
     from os import PathLike

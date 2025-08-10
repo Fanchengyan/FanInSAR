@@ -35,6 +35,16 @@ class CoherenceDataset(PairDataset):
 
     _range: tuple[float, float]
 
+    def __init__(self, *args, **kwargs) -> None:
+        """Initialize the CoherenceDataset."""
+        super().__init__(*args, **kwargs)
+
+    @classmethod
+    def _parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
+        """Parse pairs from filenames. Must be implemented in subclass."""
+        msg = "_parse_pairs method must be implemented in subclass"
+        raise NotImplementedError(msg)
+
     @property
     def range(self) -> tuple[float, float]:
         """Return the range of the coherence."""
@@ -138,7 +148,7 @@ class InterferogramDataset(PairDataset):
 
     def __init__(
         self,
-        root_dir: str | Path = "data",
+        root_dir: str | PathLike = "data",
         paths_unw: Iterable[PathLike] | None = None,
         paths_coh: Iterable[PathLike] | None = None,
         crs: CRS | None = None,
@@ -153,12 +163,13 @@ class InterferogramDataset(PairDataset):
         fill_nodata: bool = False,
         verbose: bool = True,
         keep_common: bool = True,
+        parallel_loading: bool = False,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
 
         Parameters
         ----------
-        root_dir: str
+        root_dir: str or PathLike
             root_dir directory where dataset can be found.
         paths_unw: list of str, optional
             list of unwrapped interferogram file paths to use instead of searching
@@ -207,6 +218,8 @@ class InterferogramDataset(PairDataset):
             Only used when the number of interferograms and coherence files are
             not equal. If True, keep the common pairs of interferograms and
             coherence files and raise a warning. If False, raise an error.
+        parallel_loading: bool, optional, default: False
+            if True, use dask for lazy loading and parallel computation. Default: False
 
         """
         root_dir = Path(root_dir)
@@ -261,6 +274,7 @@ class InterferogramDataset(PairDataset):
             fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name="Interferogram",
+            parallel_loading=parallel_loading,
         )
 
         self._ds_coh = CoherenceDataset(
@@ -277,6 +291,7 @@ class InterferogramDataset(PairDataset):
             fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name="Coherence",
+            parallel_loading=parallel_loading,
         )
         self._ds_coh._range = self.coh_range
 
@@ -377,7 +392,7 @@ class InterferogramDataset(PairDataset):
         self,
         dataset: RasterDataset | None,
         ds_str: str,
-        ds_class: RasterDataset = RasterDataset,
+        ds_class: type[RasterDataset] = RasterDataset,
         **kwargs,
     ) -> RasterDataset:
         """Ensure the dataset is an instance of ds_class.
