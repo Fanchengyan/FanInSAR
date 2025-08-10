@@ -135,7 +135,19 @@ class ColormapLoader(ABC):
         EnhancedLinearSegmentedColormap
             Enhanced LinearSegmentedColormap object with additional tools
 
+        Raises
+        ------
+        AttributeError
+            If the attribute name starts or ends with underscores (special attributes)
+            or if the colormap name is not found
+
         """
+        # Handle special attributes (those starting or ending with underscores)
+        # by raising AttributeError immediately to avoid treating them as colormap names
+        if name.startswith("_") or name.endswith("_"):
+            msg = f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            raise AttributeError(msg)
+
         return self._get_colormap(name)
 
     def __dir__(self) -> list[str]:
@@ -300,36 +312,35 @@ class Cmaps:
 cmaps = Cmaps()
 
 
-# Import modules for backward compatibility
-from . import GMT, SCM, cmocean, colorcet, mintpy
+# # Import modules for backward compatibility
+# from . import GMT, SCM, cmocean, colorcet, mintpy
 
 
-# Module-level attribute access for backward compatibility
-def __getattr__(name: str) -> EnhancedLinearSegmentedColormap:
-    """Module-level dynamic attribute access for colormaps."""
-    # First check if it's one of the custom colormaps defined in this module
-    if name in {
-        "GnBu_RdPl",
-        "GnBu_RdPl_r",
-        "RdGyBu",
-        "RdGyBu_r",
-        "WtBuPl",
-        "WtBuPl_r",
-        "WtBuGn",
-        "WtBuGn_r",
-        "WtRdPl",
-        "WtRdPl_r",
-        "WtHeatRed",
-        "WtHeatRed_r",
-    }:
-        return globals()[name]
+# # Module-level attribute access for backward compatibility
+# def __getattr__(name: str) -> EnhancedLinearSegmentedColormap:
+#     """Module-level dynamic attribute access for colormaps."""
+#     # First check if it's one of the custom colormaps defined in this module
+#     if name in {
+#         "GnBu_RdPl",
+#         "GnBu_RdPl_r",
+#         "RdGyBu",
+#         "RdGyBu_r",
+#         "WtBuPl",
+#         "WtBuPl_r",
+#         "WtBuGn",
+#         "WtBuGn_r",
+#         "WtRdPl",
+#         "WtRdPl_r",
+#         "WtHeatRed",
+#         "WtHeatRed_r",
+#     }:
+#         return globals()[name]
 
-    # Otherwise, try to get it from the unified cmaps instance
-    try:
-        return getattr(cmaps, name)
-    except AttributeError as e:
-        msg = f"module '{__name__}' has no attribute '{name}'\n{e}"
-        raise AttributeError(msg) from e
+#     # Otherwise, try to get it from the unified cmaps instance
+#     try:
+#         return getattr(cmaps, name)
+#     except AttributeError:
+#         pass
 
 
 def __dir__() -> list[str]:
