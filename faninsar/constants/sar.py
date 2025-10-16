@@ -24,8 +24,9 @@ class Wavelength:
             return self.to_cm()
         if unit == "dm":
             return self.to_dm()
-        if unit == "mm":  # noqa: RET503
+        if unit == "mm":
             return self.to_mm()
+        return None
 
     def to_mm(self) -> "Wavelength":
         """Convert wavelength to mm."""
@@ -35,8 +36,9 @@ class Wavelength:
             return Wavelength(self.data * 100, "mm")
         if self.unit == "cm":
             return Wavelength(self.data * 10, "mm")
-        if self.unit == "mm":  # noqa: RET503
+        if self.unit == "mm":
             return self
+        return None
 
     def to_cm(self) -> "Wavelength":
         """Convert wavelength to cm."""
@@ -46,8 +48,9 @@ class Wavelength:
             return Wavelength(self.data * 10, "cm")
         if self.unit == "cm":
             return self
-        if self.unit == "mm":  # noqa: RET503
+        if self.unit == "mm":
             return Wavelength(self.data / 10, "cm")
+        return None
 
     def to_dm(self) -> "Wavelength":
         """Convert wavelength to dm."""
@@ -57,8 +60,9 @@ class Wavelength:
             return self
         if self.unit == "cm":
             return Wavelength(self.data / 10, "dm")
-        if self.unit == "mm":  # noqa: RET503
+        if self.unit == "mm":
             return Wavelength(self.data / 100, "dm")
+        return None
 
     def to_m(self) -> "Wavelength":
         """Convert wavelength to m."""
@@ -68,8 +72,9 @@ class Wavelength:
             return Wavelength(self.data / 10, "m")
         if self.unit == "cm":
             return Wavelength(self.data / 100, "m")
-        if self.unit == "mm":  # noqa: RET503
+        if self.unit == "mm":
             return Wavelength(self.data / 1000, "m")
+        return None
 
     def to_frequency(
         self,
@@ -104,8 +109,9 @@ class Frequency:
             return self.to_MHz()
         if unit == "kHz":
             return self.to_kHz()
-        if unit == "Hz":  # noqa: RET503
+        if unit == "Hz":
             return self.to_Hz()
+        return None
 
     def to_GHz(self) -> "Frequency":
         """Convert frequency to GHz."""
@@ -115,8 +121,9 @@ class Frequency:
             return Frequency(self.data / 1e6, "GHz")
         if self.unit == "MHz":
             return Frequency(self.data / 1e3, "GHz")
-        if self.unit == "GHz":  # noqa: RET503
+        if self.unit == "GHz":
             return self
+        return None
 
     def to_MHz(self) -> "Frequency":
         """Convert frequency to MHz."""
@@ -126,8 +133,9 @@ class Frequency:
             return Frequency(self.data / 1e3, "MHz")
         if self.unit == "MHz":
             return self
-        if self.unit == "GHz":  # noqa: RET503
+        if self.unit == "GHz":
             return Frequency(self.data * 1e3, "MHz")
+        return None
 
     def to_kHz(self) -> "Frequency":
         """Convert frequency to kHz."""
@@ -137,8 +145,9 @@ class Frequency:
             return self
         if self.unit == "MHz":
             return Frequency(self.data * 1e3, "kHz")
-        if self.unit == "GHz":  # noqa: RET503
+        if self.unit == "GHz":
             return Frequency(self.data * 1e6, "kHz")
+        return None
 
     def to_Hz(self) -> "Frequency":
         """Convert frequency to Hz."""
@@ -148,8 +157,9 @@ class Frequency:
             return Frequency(self.data * 1e3, "Hz")
         if self.unit == "MHz":
             return Frequency(self.data * 1e6, "Hz")
-        if self.unit == "GHz":  # noqa: RET503
+        if self.unit == "GHz":
             return Frequency(self.data * 1e9, "Hz")
+        return None
 
     def to_wavelength(
         self,

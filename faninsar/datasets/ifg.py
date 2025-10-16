@@ -603,7 +603,7 @@ class InterferogramDataset(PairDataset):
         )
         ds.to_netcdf(filename)
 
-    def to_tiffs(  # noqa: PLR0912
+    def to_tiffs(
         self,
         out_dir: str | Path,
         roi: BoundingBox | None = None,

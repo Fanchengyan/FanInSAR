@@ -8,13 +8,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from faninsar.constants.sar import SPEED_OF_LIGHT, Frequency, Wavelength
+
 if TYPE_CHECKING:
     from datetime import datetime
 
     from matplotlib.axes import Axes
     from numpy.typing import NDArray
-
-    from faninsar.constants import Frequency, Wavelength
 
     from .pairs import Pairs
 
@@ -139,7 +139,11 @@ class Baselines:
             The Baselines object.
 
         """
-        from faninsar.NSBAS import LinearModel, NSBASInversion, NSBASMatrixFactory
+        from faninsar.NSBAS import (
+            LinearModel,
+            NSBASInversion,
+            NSBASMatrixFactory,
+        )
 
         model_bs = LinearModel(pairs.dates)
         mf = NSBASMatrixFactory(values[:, None], pairs, model_bs)
@@ -335,8 +339,6 @@ class PhaseDeformationConverter:
             Either a Frequency or Wavelength object for the SAR mission.
 
         """
-        from faninsar.constants.sar import SPEED_OF_LIGHT, Frequency, Wavelength
-
         if isinstance(freq_or_wl, Frequency):
             self.wavelength = SPEED_OF_LIGHT / freq_or_wl.to_Hz().data  # meter
             self.frequency = freq_or_wl.to_Hz().data
@@ -372,8 +374,6 @@ class PhaseDeformationConverter:
             The converter instance.
 
         """
-        from faninsar.constants.sar import Frequency
-
         freq = Frequency(frequency, unit)
         return cls(freq)
 
@@ -398,8 +398,6 @@ class PhaseDeformationConverter:
             The converter instance.
 
         """
-        from faninsar.constants.sar import Wavelength
-
         wl = Wavelength(wavelength, unit)
         return cls(wl)
 
