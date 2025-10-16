@@ -557,6 +557,19 @@ class TestColormapEdgeCases:
         with pytest.raises(AttributeError):
             _ = getattr(cmaps.GMT, long_name)
 
+    def test_special_attributes_raise_attribute_error(self) -> None:
+        """Test that special attributes like __path__ raise AttributeError immediately."""
+        # Test various special attributes that should not be treated as colormap names
+        # Note: We exclude __module__ because it's a real attribute that exists on classes
+        special_attrs = ["__path__", "__file__", "__name__", "_private", "attr_"]
+
+        loaders = [cmaps.GMT, cmaps.SCM, cmaps.cmocean, cmaps.colorcet, cmaps.mintpy]
+
+        for loader in loaders:
+            for attr in special_attrs:
+                with pytest.raises(AttributeError, match=f"'{loader.__class__.__name__}' object has no attribute '{attr}'"):
+                    getattr(loader, attr)
+
 
 class TestColormapMemoryManagement:
     """Test memory management and garbage collection for colormaps."""
