@@ -18,6 +18,7 @@ from ._core import (
     cuda_available,
     geoinfo_from_latlon,
     gpu_available,
+    gradient_magnitude,
     latlon_from_profile,
     load_meta_value,
     match_to_raster,
