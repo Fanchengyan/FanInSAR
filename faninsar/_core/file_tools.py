@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 def load_meta(
-    path: PathLike,
+    path: str | PathLike,
     key: str,
     sep: str | None = None,
     line_start: int | None = None,
@@ -26,7 +26,7 @@ def load_meta(
 
     Parameters
     ----------
-    path : PathLike
+    path : str or PathLike
         The path of metadata file to be parsed.
     key : str
         The key of the metadata to be retrieved.
