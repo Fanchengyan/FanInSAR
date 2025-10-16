@@ -321,13 +321,17 @@ class Pairs:
         """Compare the pairs with another pairs."""
         return np.array_equal(self.values, other.values)
 
-    def __add__(self, other: Pairs) -> Pairs:
+    def __add__(self, other: Pairs | Pair) -> Pairs:
         """Return the unique, sorted union of the pairs."""
+        if isinstance(other, Pair):
+            other = Pairs([other])
         pairs = np.union1d(self.names, other.names)
         return Pairs.from_names(pairs)
 
-    def __sub__(self, other: Pairs) -> Pairs:
+    def __sub__(self, other: Pairs | Pair) -> Pairs:
         """Return the difference of the pairs."""
+        if isinstance(other, Pair):
+            other = Pairs([other])
         pairs = np.setdiff1d(self.names, other.names)
 
         return Pairs.from_names(pairs.tolist())
