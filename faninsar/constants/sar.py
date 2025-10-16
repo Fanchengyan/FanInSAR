@@ -32,7 +32,7 @@ Wavelength(data=55.0, unit='mm')
 55.46 mm
 
 >>> # Use SAR mission class
->>> s1 = Sentinel1
+>>> s1 = Sentinel1()
 >>> print(s1.frequency)
 5.405 GHz
 >>> print(s1.wavelength)
@@ -785,7 +785,7 @@ class Sentinel1(SAR):
     5.405 GHz
 
     >>> # Or use with instantiation
-    >>> s1 = Sentinel1
+    >>> s1 = Sentinel1()
     >>> print(s1.frequency)
     5.405 GHz
     >>> print(s1.wavelength)
