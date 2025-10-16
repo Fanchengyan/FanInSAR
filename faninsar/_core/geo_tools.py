@@ -1013,6 +1013,13 @@ class Profile:
         return cls(width=width, height=height, transform=tf, nodata=nodata)
 
     @classmethod
+    def from_latlon(cls, lat: np.ndarray, lon: np.ndarray) -> Profile:
+        """Create a Profile object from latitude and longitude."""
+        bounds = bound_from_latlon(lat, lon)
+        res = (lon[1] - lon[0], lat[1] - lat[0])
+        return cls.from_bounds_res(bounds, res)
+
+    @classmethod
     def from_profile_file(cls, profile_file: PathLike) -> Profile:
         """Create a Profile object from a profile file."""
         with Path(profile_file).open(encoding="utf-8") as f:
