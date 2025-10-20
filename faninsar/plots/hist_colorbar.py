@@ -15,9 +15,8 @@ import matplotlib as mpl
 import matplotlib.colorbar as cbar
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib import colors
+from matplotlib import cm, colors
 from matplotlib.colorbar import Colorbar
-from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import (
     AutoLocator,
@@ -241,8 +240,13 @@ class HistColorbar:
 
         # parse colormap and normalization FIRST (before hist_bins)
         if mappable is not None:
-            self.cmap = mappable.get_cmap()
+            # Support both ScalarMappable and ContourSet-like objects
+            get_cmap = getattr(mappable, "get_cmap", None)
+            self.cmap = get_cmap() if callable(get_cmap) else mappable.cmap
             self.norm = mappable.norm
+            # Capture levels if available (e.g., contourf/contour)
+            self._levels = getattr(mappable, "levels", None)
+            self._mappable = mappable
         else:
             if cmap is None:
                 msg = "Either mappable or cmap must be provided"
@@ -257,6 +261,13 @@ class HistColorbar:
                 self.norm = colors.Normalize(vmin=vmin, vmax=vmax)
             else:
                 self.norm = norm
+            self._levels = None
+
+            # ScalarMappable for consistent RGBA mapping
+            self._mappable = cm.ScalarMappable(norm=self.norm, cmap=self.cmap)
+
+        # Resolve effective alpha: prefer explicit alpha, else artist's scalar alpha
+        self._effective_alpha = self._resolve_effective_alpha()
 
         # Auto-detect histogram bins from norm if 'auto' (AFTER norm is set)
         self.hist_bins = self._determine_hist_bins(hist_bins)
@@ -302,6 +313,53 @@ class HistColorbar:
         """Orientation of the histogram."""
         return "vertical" if self.orientation == "horizontal" else "horizontal"
 
+    def _resolve_effective_alpha(self) -> float | None:
+        """Resolve the alpha to use for both histogram patches and colorbar.
+
+        Preference order:
+        1) Explicit ``alpha`` passed to HistColorbar
+        2) Scalar alpha on the provided mappable/artist (e.g., imshow(alpha=0.5))
+        3) None (fall back to colormap's own alpha per color)
+
+        Array-like alpha on the artist is not supported and will be ignored.
+        """
+        # 1) explicit alpha
+        if self.alpha is not None:
+            try:
+                return float(np.clip(float(self.alpha), 0.0, 1.0))
+            except Exception:  # pragma: no cover - defensive
+                return self.alpha  # type: ignore[return-value]
+
+        # 2) artist alpha if available
+        artist_alpha: Any | None = None
+        get_alpha = getattr(self._mappable, "get_alpha", None)
+        if callable(get_alpha):
+            try:
+                artist_alpha = get_alpha()
+            except Exception:  # pragma: no cover - defensive
+                artist_alpha = None
+        if artist_alpha is None:
+            artist_alpha = getattr(self._mappable, "alpha", None)
+
+        if artist_alpha is None:
+            return None
+
+        # If array-like alpha, we cannot represent it uniformly; ignore
+        try:
+            if np.isscalar(artist_alpha):
+                return float(np.clip(float(artist_alpha), 0.0, 1.0))
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        warnings.warn(
+            (
+                "Array-like alpha on the mappable is not supported by HistColorbar; "
+                "using colormap alpha."
+            ),
+            stacklevel=2,
+        )
+        return None
+
     def _determine_hist_bins(
         self, hist_bins: int | NDArray | Literal["auto"]
     ) -> int | NDArray:
@@ -322,10 +380,14 @@ class HistColorbar:
 
         """
         if isinstance(hist_bins, str) and hist_bins == "auto":
+            # Prefer explicit contour levels if available
+            levels = getattr(self, "_levels", None)
+            if levels is not None:
+                return max(1, len(levels) - 1)
             # Check if norm is BoundaryNorm (discrete levels)
             if hasattr(self.norm, "boundaries"):
                 # BoundaryNorm has discrete levels
-                return len(self.norm.boundaries) - 1
+                return max(1, len(self.norm.boundaries) - 1)
             # Continuous colormap, use fine binning
             return 100
         return hist_bins
@@ -408,14 +470,13 @@ class HistColorbar:
         # create kwargs for HistColorbar axes
         kwargs = self.cbar_kwargs.copy()
         kwargs.update(
+            mappable=self._mappable,
             location=self.location,
             orientation=None,  # location is enough
-            cmap=self.cmap,
-            norm=self.norm,
             aspect=self.aspect,
             fraction=self.fraction,
             pad=self.pad,
-            alpha=self.alpha,
+            # Do NOT pass alpha to Colorbar; handle alpha explicitly on solids
             shrink=self.shrink,
             extend=self.extend,
             extendfrac=self.extendfrac,
@@ -500,7 +561,12 @@ class HistColorbar:
 
     def _draw_colorbar(self, **kwargs) -> None:
         """Draw the colorbar."""
+        # Ensure we don't accidentally forward unsupported args like 'alpha'
+        if "alpha" in kwargs:
+            kwargs.pop("alpha", None)
         self.cbar = Colorbar(self.ax_cbar, **kwargs)
+        if self._effective_alpha is not None and hasattr(self.cbar, "solids"):
+            self.cbar.solids.set_alpha(self._effective_alpha)
         hide_spines(self.ax_cbar)
 
     def _draw_histogram(self) -> None:
@@ -517,13 +583,23 @@ class HistColorbar:
             logger.warning(msg)
             return
 
-        # Trim histogram axes to remove extra space caused by extend triangles.
-        self._trim_hist_axes()
+        # Determine histogram range robustly across norm types
+        boundaries = getattr(self.norm, "boundaries", None)
+        levels = getattr(self, "_levels", None)
+        if levels is not None and len(levels) >= 2:
+            vmin, vmax = float(np.min(levels)), float(np.max(levels))
+        elif boundaries is not None and len(boundaries) >= 2:
+            vmin, vmax = float(boundaries[0]), float(boundaries[-1])
+        else:
+            vmin = getattr(self.norm, "vmin", None)
+            vmax = getattr(self.norm, "vmax", None)
+            if vmin is None or vmax is None:
+                vmin, vmax = float(np.min(data_finite)), float(np.max(data_finite))
 
         # Use matplotlib's hist to create histogram
         hist_kwargs = {
             "bins": self.hist_bins,
-            "range": (self.norm.vmin, self.norm.vmax),
+            "range": (vmin, vmax),
             "align": "mid",
         }
         self.hist_kwargs.update(hist_kwargs)
@@ -535,17 +611,24 @@ class HistColorbar:
             # Horizontal: histogram bars go vertical
             self.ax_hist.hist(data_finite, orientation="vertical", **self.hist_kwargs)
 
-        # Get color split positions from colormap
-        bins = getattr(self.norm, "boundaries", None)
-        if bins is None:
-            # For continuous colormaps
-            if isinstance(self.cmap, LinearSegmentedColormap):
-                splitpos = np.linspace(self.norm.vmin, self.norm.vmax, self.cmap.N)
-            else:
-                splitpos = np.linspace(self.norm.vmin, self.norm.vmax, self.cmap.N + 1)
+        # Compute color split positions
+        if levels is not None and len(levels) >= 2:
+            splitpos = np.asarray(levels, dtype=float)
+        elif boundaries is not None and len(boundaries) >= 2:
+            splitpos = np.asarray(boundaries, dtype=float)
         else:
-            # For discrete colormaps (BoundaryNorm)
-            splitpos = np.asanyarray(bins)
+            n = int(getattr(self.cmap, "N", 256))
+            t = np.linspace(0.0, 1.0, n + 1)
+            inv = getattr(self.norm, "inverse", None)
+            if callable(inv):
+                try:
+                    splitpos = np.asarray(inv(t), dtype=float)
+                except Exception:  # pragma: no cover - rare corner
+                    splitpos = np.linspace(vmin, vmax, n + 1)
+            else:
+                splitpos = np.linspace(vmin, vmax, n + 1)
+        # Trim histogram axes to remove extra space caused by extend triangles.
+        self._trim_hist_axes()
 
         # Recolor histogram patches to match colorbar
         self._recolor_histogram_patches(splitpos)
@@ -772,8 +855,7 @@ class HistColorbar:
                     # Use colormap color - sample at the center of the segment
                     # Normalize the value to [0, 1] range for colormap
                     center_val = (b0 + b1) / 2
-                    normalized_val = self.norm(center_val)
-                    color = self.cmap(normalized_val)
+                    color = self._mappable.to_rgba(center_val)
 
                     if self.orientation == "vertical":
                         # Horizontal bars
@@ -783,8 +865,7 @@ class HistColorbar:
                             (b1 - b0),
                             facecolor=color,
                             linewidth=0,
-                            alpha=self.alpha,
-                            # clip_on=False,
+                            alpha=self._effective_alpha,
                         )
                     else:
                         # Vertical bars
@@ -794,19 +875,17 @@ class HistColorbar:
                             height,
                             facecolor=color,
                             linewidth=0,
-                            alpha=self.alpha,
-                            # clip_on=False,
+                            alpha=self._effective_alpha,
                         )
 
                     self.ax_hist.add_patch(pi)
             else:  # Bar is within a single color
                 # Use colormap color - sample at the center of the bar
                 center_val = (minval + maxval) / 2
-                normalized_val = self.norm(center_val)
-                color = self.cmap(normalized_val)
+                color = self._mappable.to_rgba(center_val, alpha=self._effective_alpha)
 
                 patch.set_facecolor(color)
-                patch.set_alpha(self.alpha)
+                # patch.set_alpha(self.alpha)
                 patch.set_linewidth(0)
                 # patch.set_clip_on(False)
 
@@ -857,7 +936,8 @@ class HistColorbar:
             ]
 
             # Set container axes limits to match colorbar data range
-            self.ax.set_ylim(self.norm.vmin, self.norm.vmax)
+            ylim = self.ax_cbar.get_ylim()
+            self.ax.set_ylim(ylim[0], ylim[1])
             self.ax.set_xlim(0, 1)  # Dummy x-axis
 
             # Set ticks at same data values as ax_cbar
@@ -889,7 +969,8 @@ class HistColorbar:
             ]
 
             # Set container axes limits to match colorbar data range
-            self.ax.set_xlim(self.norm.vmin, self.norm.vmax)
+            xlim = self.ax_cbar.get_xlim()
+            self.ax.set_xlim(xlim[0], xlim[1])
             self.ax.set_ylim(0, 1)  # Dummy y-axis
 
             # Set ticks at same data values as ax_cbar
