@@ -247,6 +247,25 @@ class HistColorbar:
             # Capture levels if available (e.g., contourf/contour)
             self._levels = getattr(mappable, "levels", None)
             self._mappable = mappable
+
+            # If the mappable comes from contourf with explicit colors,
+            # capture per-level facecolors so we can exactly match them.
+            self._level_facecolors = None
+            try:
+                # QuadContourSet itself IS a Collection with get_facecolors()
+                # returning an (N, 4) array for N contour regions
+                if self._levels is not None and hasattr(mappable, "get_facecolors"):
+                    fcs_array = mappable.get_facecolors()
+                    if fcs_array is not None and len(fcs_array) > 0:
+                        # fcs_array should be shape (n_levels-1, 4) for RGBA
+                        expected_count = len(self._levels) - 1
+                        if len(fcs_array) >= expected_count:
+                            # Take the first expected_count colors
+                            fcs_array = fcs_array[:expected_count]
+                            self._level_facecolors = np.asarray(fcs_array, dtype=float)
+            except Exception:
+                # Best-effort only; fall back to colormap mapping
+                self._level_facecolors = None
         else:
             if cmap is None:
                 msg = "Either mappable or cmap must be provided"
@@ -824,6 +843,40 @@ class HistColorbar:
             Positions where colors change in the colorbar.
 
         """
+
+        # Helper to map a data value to an exact facecolor
+        def value_to_facecolor(val: float) -> tuple[float, float, float, float]:
+            # Prefer exact per-level facecolors from contourf if available
+            if (
+                getattr(self, "_level_facecolors", None) is not None
+                and getattr(self, "_levels", None) is not None
+            ):
+                levels = np.asarray(self._levels, dtype=float)
+                idx = int(
+                    np.clip(
+                        np.searchsorted(levels, val, side="right") - 1,
+                        0,
+                        len(levels) - 2,
+                    )
+                )
+                rgba = self._level_facecolors[idx]
+                # Apply effective alpha if provided
+                if self._effective_alpha is not None:
+                    return (
+                        float(rgba[0]),
+                        float(rgba[1]),
+                        float(rgba[2]),
+                        float(self._effective_alpha),
+                    )
+                return (
+                    float(rgba[0]),
+                    float(rgba[1]),
+                    float(rgba[2]),
+                    float(rgba[3] if len(rgba) == 4 else 1.0),
+                )
+            # Fallback: use the mappable's scalar mapping
+            return tuple(self._mappable.to_rgba(val, alpha=self._effective_alpha))  # type: ignore[return-value]
+
         # Iterate over all patches (histogram bars)
         for patch in list(self.ax_hist.patches):
             patch = cast("Rectangle", patch)
@@ -852,10 +905,8 @@ class HistColorbar:
                 patch.remove()
                 # Create sub-patches for each color segment
                 for b0, b1 in zip(splitbins[:-1], splitbins[1:]):
-                    # Use colormap color - sample at the center of the segment
-                    # Normalize the value to [0, 1] range for colormap
                     center_val = (b0 + b1) / 2
-                    color = self._mappable.to_rgba(center_val)
+                    color = value_to_facecolor(center_val)
 
                     if self.orientation == "vertical":
                         # Horizontal bars
@@ -865,7 +916,7 @@ class HistColorbar:
                             (b1 - b0),
                             facecolor=color,
                             linewidth=0,
-                            alpha=self._effective_alpha,
+                            alpha=None,  # alpha is baked into color above
                         )
                     else:
                         # Vertical bars
@@ -875,19 +926,16 @@ class HistColorbar:
                             height,
                             facecolor=color,
                             linewidth=0,
-                            alpha=self._effective_alpha,
+                            alpha=None,
                         )
 
                     self.ax_hist.add_patch(pi)
             else:  # Bar is within a single color
-                # Use colormap color - sample at the center of the bar
                 center_val = (minval + maxval) / 2
-                color = self._mappable.to_rgba(center_val, alpha=self._effective_alpha)
+                color = value_to_facecolor(center_val)
 
                 patch.set_facecolor(color)
-                # patch.set_alpha(self.alpha)
                 patch.set_linewidth(0)
-                # patch.set_clip_on(False)
 
     def _apply_default_customizations(self) -> None:
         """Apply default custom ticks, labels, and formatting."""

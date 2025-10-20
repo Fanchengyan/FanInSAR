@@ -16,15 +16,19 @@ from matplotlib.cm import ScalarMappable
 from faninsar.plots.hist_colorbar import HistColorbar
 
 
-def _expected_rgba(norm: colors.Normalize, cmap: colors.Colormap, value: float) -> tuple[float, float, float, float]:
+def _expected_rgba(
+    norm: colors.Normalize, cmap: colors.Colormap, value: float
+) -> tuple[float, float, float, float]:
     sm = ScalarMappable(norm=norm, cmap=cmap)
     return tuple(sm.to_rgba(value))
 
 
-def _pick_patch_color_for_value(hcb: HistColorbar, value: float) -> tuple[float, float, float, float] | None:
+def _pick_patch_color_for_value(
+    hcb: HistColorbar, value: float
+) -> tuple[float, float, float, float] | None:
     # Default orientation is vertical colorbar, horizontal histogram bars
     for patch in hcb.ax_hist.patches:
-        x, y = patch.get_x(), patch.get_y()
+        y = patch.get_y()
         w, h = patch.get_width(), patch.get_height()
         # Data axis aligns with y for vertical colorbar (horizontal bars)
         if y <= value <= (y + h) and w > 0 and h >= 0:
@@ -61,7 +65,9 @@ class TestHistColorbarBasic:
         data = rng.normal(size=1500)
         vmin, vmax = -2.5, 2.5
         norm = colors.Normalize(vmin=vmin, vmax=vmax)
-        cmap = colors.ListedColormap(["navy", "royalblue", "lightgray", "tomato", "darkred"])
+        cmap = colors.ListedColormap(
+            ["navy", "royalblue", "lightgray", "tomato", "darkred"]
+        )
 
         fig, ax = plt.subplots()
         hcb = fig.hist_colorbar(data=data, cmap=cmap, norm=norm, ax=ax)
@@ -80,9 +86,16 @@ class TestHistColorbarDiscrete:
         rng = np.random.default_rng(2)
         data = rng.uniform(-2, 2, size=3000)
         boundaries = np.linspace(-2.0, 2.0, 9)  # 8 bins
-        cmap = colors.ListedColormap(
-            ["#313695", "#4575b4", "#74add1", "#abd9e9", "#fee090", "#fdae61", "#f46d43", "#d73027"]
-        )
+        cmap = colors.ListedColormap([
+            "#313695",
+            "#4575b4",
+            "#74add1",
+            "#abd9e9",
+            "#fee090",
+            "#fdae61",
+            "#f46d43",
+            "#d73027",
+        ])
         norm = colors.BoundaryNorm(boundaries, ncolors=cmap.N)
 
         fig, ax = plt.subplots()
@@ -142,9 +155,15 @@ class TestHistColorbarContourf:
         X, Y = np.meshgrid(x, y)
         Z = np.hypot(X, Y)
         levels = np.linspace(0.0, 3.5, 8)
-        cmap = colors.ListedColormap(
-            ["#ffffcc", "#c2e699", "#78c679", "#31a354", "#006837", "#004529", "#002b13"]
-        )
+        cmap = colors.ListedColormap([
+            "#ffffcc",
+            "#c2e699",
+            "#78c679",
+            "#31a354",
+            "#006837",
+            "#004529",
+            "#002b13",
+        ])
 
         fig, ax = plt.subplots()
         cs = ax.contourf(X, Y, Z, levels=levels, cmap=cmap)
@@ -161,4 +180,85 @@ class TestHistColorbarContourf:
         edges = np.array(edges)
         for b in levels:
             assert np.any(np.isclose(edges, b, atol=1e-6))
+        plt.close(fig)
+
+    def test_contourf_explicit_colors(self) -> None:
+        """Test histogram matches contourf with explicit colors parameter."""
+        x = np.linspace(-2, 2, 100)
+        y = np.linspace(-2, 2, 80)
+        X, Y = np.meshgrid(x, y)
+        Z = 0.6 * X + 0.4 * Y
+
+        levels = [-1, -0.5, 0, 0.5, 1]
+        colors_list = ["blue", "cyan", "yellow", "red"]
+
+        fig, ax = plt.subplots()
+        cf = ax.contourf(X, Y, Z, levels=levels, colors=colors_list)
+        hcb = fig.hist_colorbar(data=Z.ravel(), mappable=cf, ax=ax)
+
+        # Get expected colors from contourf
+        expected_rgba = cf.get_facecolors()
+        assert expected_rgba is not None
+        assert len(expected_rgba) == len(levels) - 1
+
+        # Check that histogram patches have matching colors
+        # For each level interval, find a patch and verify its color
+        for i in range(len(levels) - 1):
+            v_mid = (levels[i] + levels[i + 1]) / 2
+            # Find patch containing this value
+            patch_found = False
+            for p in hcb.ax_hist.patches:
+                y = p.get_y()
+                h = p.get_height()
+                if y <= v_mid <= (y + h):
+                    patch_rgba = np.array(p.get_facecolor())
+                    expected = np.array(expected_rgba[i])
+                    # Allow small tolerance for color matching
+                    np.testing.assert_allclose(patch_rgba[:3], expected[:3], atol=0.01)
+                    patch_found = True
+                    break
+            assert patch_found, f"No patch found for level interval {i}"
+
+        plt.close(fig)
+
+    def test_tricontourf_explicit_colors(self) -> None:
+        """Test tricontourf with explicit colors parameter."""
+        from matplotlib.tri import Triangulation
+
+        # Create triangulated domain
+        np.random.seed(42)
+        x_tri = np.random.rand(100)
+        y_tri = np.random.rand(100)
+        z_tri = x_tri + y_tri
+        tri = Triangulation(x_tri, y_tri)
+
+        levels = [0.0, 0.5, 1.0, 1.5]
+        colors_tri = ["blue", "cyan", "yellow"]
+
+        fig, ax = plt.subplots()
+        tcf = ax.tricontourf(x_tri, y_tri, z_tri, levels=levels, colors=colors_tri)
+        hcb = fig.hist_colorbar(data=z_tri, mappable=tcf, ax=ax)
+
+        # Get expected colors from tricontourf
+        expected_rgba = tcf.get_facecolors()
+        assert expected_rgba is not None
+        assert len(expected_rgba) == len(levels) - 1
+
+        # Verify histogram patches match tricontourf colors
+        for i in range(len(levels) - 1):
+            v_mid = (levels[i] + levels[i + 1]) / 2
+            # Find patch containing this value
+            patch_found = False
+            for p in hcb.ax_hist.patches:
+                y = p.get_y()
+                h = p.get_height()
+                if y <= v_mid <= (y + h):
+                    patch_rgba = np.array(p.get_facecolor())
+                    expected = np.array(expected_rgba[i])
+                    # Allow small tolerance
+                    np.testing.assert_allclose(patch_rgba[:3], expected[:3], atol=0.01)
+                    patch_found = True
+                    break
+            assert patch_found, f"No patch found for level interval {i}"
+
         plt.close(fig)
