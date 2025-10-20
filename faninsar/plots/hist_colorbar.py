@@ -18,7 +18,6 @@ import numpy as np
 from matplotlib import colors
 from matplotlib.colorbar import Colorbar
 from matplotlib.colors import LinearSegmentedColormap
-from matplotlib.layout_engine import LayoutEngine
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import (
     AutoLocator,
@@ -30,7 +29,6 @@ from matplotlib.ticker import (
     NullLocator,
     ScalarFormatter,
 )
-from matplotlib.transforms import Bbox
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from typing_extensions import Literal
 
@@ -42,7 +40,6 @@ if TYPE_CHECKING:
     from matplotlib.axes import Axes
     from matplotlib.cm import ScalarMappable
     from matplotlib.figure import Figure, SubFigure
-    from matplotlib.transforms import Bbox
     from numpy.typing import ArrayLike, NDArray
 
 NON_COLORBAR_KEYS = [  # remove kws that cannot be passed to Colorbar
@@ -53,93 +50,6 @@ NON_COLORBAR_KEYS = [  # remove kws that cannot be passed to Colorbar
     "anchor",
     "panchor",
 ]
-
-
-class HistColorbarLayoutEngine(LayoutEngine):
-    """Custom layout engine for HistColorbar compatibility with constrained_layout.
-
-    This layout engine works in conjunction with matplotlib's constrained_layout
-    to properly position HistColorbar axes after the main layout has been computed.
-    It ensures that histogram and colorbar axes maintain correct positions even
-    when the parent figure uses constrained_layout.
-
-    The engine is automatically registered when a HistColorbar is created in a
-    figure with constrained_layout enabled.
-    """
-
-    def __init__(self) -> None:
-        """Initialize the layout engine."""
-        super().__init__()
-        # Track all HistColorbar instances in this figure
-        self._hist_colorbars: list[HistColorbar] = []
-
-    def execute(self, fig: Figure) -> None:
-        """Execute layout adjustments for all HistColorbar instances.
-
-        This method is called by matplotlib during the layout phase,
-        after constrained_layout has computed positions for regular axes.
-
-        Parameters
-        ----------
-        fig : Figure
-            The figure to layout.
-
-        """
-        # First, execute the underlying constrained layout if available
-        parent_engine = getattr(fig, "_original_layout_engine", None)
-        if parent_engine is not None:
-            parent_engine.execute(fig)
-
-        # Then adjust HistColorbar positions
-        for hcb in self._hist_colorbars:
-            if fig in {hcb.fig, hcb.fig.figure}:
-                hcb._update_positions()
-
-    def set(self, **kwargs) -> None:
-        """Set layout engine parameters."""
-        # Delegate to parent engine if available
-
-    @property
-    def colorbar_gridspec(self) -> bool:
-        """Whether to use gridspec for colorbars.
-
-        Returns False to force matplotlib to use make_axes instead of
-        make_axes_gridspec, which has better constrained_layout compatibility.
-        """
-        return False
-
-    @property
-    def adjust_compatible(self) -> bool:
-        """Whether this layout engine is compatible with layout adjustments.
-
-        Returns True to allow matplotlib to temporarily switch layout engines
-        during operations like savefig.
-        """
-        return True
-
-    def register_hist_colorbar(self, hcb: HistColorbar) -> None:
-        """Register a HistColorbar instance for layout management.
-
-        Parameters
-        ----------
-        hcb : HistColorbar
-            The HistColorbar instance to manage.
-
-        """
-        if hcb not in self._hist_colorbars:
-            self._hist_colorbars.append(hcb)
-
-    def unregister_hist_colorbar(self, hcb: HistColorbar) -> None:
-        """Unregister a HistColorbar instance.
-
-        Parameters
-        ----------
-        hcb : HistColorbar
-            The HistColorbar instance to remove.
-
-        """
-        if hcb in self._hist_colorbars:
-            self._hist_colorbars.remove(hcb)
 
 
 class HistColorbar:
@@ -174,11 +84,11 @@ class HistColorbar:
         (vertical colorbars on the right, horizontal ones at the bottom).
     orientation : {'vertical', 'horizontal'} or None, optional
         Orientation of the colorbar. If None, determined from location.
-    aspect : float, default 3
+    aspect : float, default 5
         Ratio of long to short dimensions of colorbar.
-    fraction : float, default 0.25
+    fraction : float, default 0.2
         Fraction of original Axes to use for colorbar.
-    hist_fraction : float, default 0.9
+    hist_fraction : float, default 0.85
         Fraction of the colorbar axes allocated to the histogram (0-1).
         The remaining fraction is allocated to the colorbar gradient.
     pad : float or None, optional
@@ -260,8 +170,6 @@ class HistColorbar:
     _scale: Literal["linear", "log"]
     _has_extend: bool
     _parent_ax: Axes | None
-    _draw_callback_id: int | None
-    _position_cache: dict[str, Any]
 
     def __init__(
         self,
@@ -272,9 +180,9 @@ class HistColorbar:
         use_gridspec: bool = True,
         location: Literal["left", "right", "top", "bottom"] | None = None,
         orientation: Literal["vertical", "horizontal"] | None = None,
-        aspect: float = 3,
-        fraction: float = 0.25,
-        hist_fraction: float = 0.9,
+        aspect: float = 5,
+        fraction: float = 0.2,
+        hist_fraction: float = 0.85,
         pad: float | None = None,
         alpha: float | None = None,
         shrink: float = 1.0,
@@ -298,8 +206,6 @@ class HistColorbar:
         # Initialize internal state variables
         self._has_extend = False
         self._parent_ax = None
-        self._draw_callback_id = None
-        self._position_cache = {}
 
         self.data = np.asanyarray(data).flatten()
         self.location, self.orientation = _determine_location_orientation(
@@ -384,8 +290,8 @@ class HistColorbar:
         # Apply customizations
         self._apply_default_customizations()
 
-        # Setup layout integration for constrained_layout compatibility
-        self._setup_layout_integration()
+        # Create ghost tick labels on container axes for constrained_layout
+        self._create_ghost_ticklabels()
 
         # Restore original current axes
         if current_ax is not None and current_ax in self.fig.axes:
@@ -572,16 +478,16 @@ class HistColorbar:
         if parent_subplotspec is not None:
             # Use SubplotSpec-based gridspec (for tight_layout)
             ax_cbar, ax_hist = _create_hcb_gridspec_axes(
-                parent_ax, self.shrink, self.hist_fraction, self.location, self.pad
+                parent_ax, self.hist_fraction, self.location
             )
         else:
             # Use inset_axes (for constrained_layout or no layout)
             ax_cbar, ax_hist = _create_hcb_inset_axes(
-                parent_ax, self.shrink, self.hist_fraction, self.location, self.pad
+                parent_ax, self.hist_fraction, self.location
             )
 
         ax_cbar.set_zorder(10)
-        ax_hist.set_zorder(11)  # set histogram on top of colorbar for line visibility
+        ax_hist.set_zorder(11)  # histogram above colorbar for line visibility
 
         # Join axes - histogram shares the data axis with colorbar
         # This ensures they stay aligned even when limits change
@@ -927,6 +833,123 @@ class HistColorbar:
         self.set_cbar_locator(AutoLocator())
         self.set_cbar_formatter(ScalarFormatter())
 
+    def _create_ghost_ticklabels(self) -> None:
+        """Create invisible 'ghost' tick labels on container axes.
+
+        This is the KEY solution for constrained_layout compatibility:
+        1. Configure container axes to have same tick locations as ax_cbar
+        2. Set tick label location (left/right/top/bottom) to match ax_cbar
+        3. Make ghost labels invisible after layout calculation
+        4. Constrained_layout sees and accounts for these labels
+        5. The actual visible labels remain on ax_cbar where they belong
+
+        This elegant approach lets constrained_layout calculate proper spacing
+        while keeping our actual rendering unchanged.
+        """
+        # Configure container axes to match ax_cbar's tick system
+        # This is about tick "location" not physical position
+
+        if self.orientation == "vertical":
+            # Get tick information from ax_cbar
+            tick_locs = self.ax_cbar.yaxis.get_ticklocs()
+            tick_labels = [
+                label.get_text() for label in self.ax_cbar.yaxis.get_ticklabels()
+            ]
+
+            # Set container axes limits to match colorbar data range
+            self.ax.set_ylim(self.norm.vmin, self.norm.vmax)
+            self.ax.set_xlim(0, 1)  # Dummy x-axis
+
+            # Set ticks at same data values as ax_cbar
+            self.ax.yaxis.set_ticks(tick_locs)
+            self.ax.yaxis.set_ticklabels(tick_labels)
+
+            # Configure tick location to match ax_cbar
+            if self.location == "left":
+                self.ax.yaxis.tick_left()
+                self.ax.yaxis.set_label_position("left")
+                # Re-enable tick labels after hide_tick_labels was called
+                # But hide the tick marks themselves (length=0)
+                self.ax.tick_params(axis="y", labelleft=True, left=False, length=0)
+            else:  # right
+                self.ax.yaxis.tick_right()
+                self.ax.yaxis.set_label_position("right")
+                # Re-enable tick labels after hide_tick_labels was called
+                # But hide the tick marks themselves (length=0)
+                self.ax.tick_params(axis="y", labelright=True, right=False, length=0)
+
+            # Hide x-axis completely
+            self.ax.xaxis.set_visible(False)
+
+        else:  # horizontal
+            # Get tick information from ax_cbar
+            tick_locs = self.ax_cbar.xaxis.get_ticklocs()
+            tick_labels = [
+                label.get_text() for label in self.ax_cbar.xaxis.get_ticklabels()
+            ]
+
+            # Set container axes limits to match colorbar data range
+            self.ax.set_xlim(self.norm.vmin, self.norm.vmax)
+            self.ax.set_ylim(0, 1)  # Dummy y-axis
+
+            # Set ticks at same data values as ax_cbar
+            self.ax.xaxis.set_ticks(tick_locs)
+            self.ax.xaxis.set_ticklabels(tick_labels)
+
+            # Configure tick location to match ax_cbar
+            if self.location == "bottom":
+                self.ax.xaxis.tick_bottom()
+                self.ax.xaxis.set_label_position("bottom")
+                # Re-enable tick labels after hide_tick_labels was called
+                # But hide the tick marks themselves (length=0)
+                self.ax.tick_params(axis="x", labelbottom=True, bottom=False, length=0)
+            else:  # top
+                self.ax.xaxis.tick_top()
+                self.ax.xaxis.set_label_position("top")
+                # Re-enable tick labels after hide_tick_labels was called
+                # But hide the tick marks themselves (length=0)
+                self.ax.tick_params(axis="x", labeltop=True, top=False, length=0)
+
+            # Hide y-axis completely
+            self.ax.yaxis.set_visible(False)
+
+        # Setup callback to hide ghost labels after layout
+        self._setup_ghost_label_hiding()
+
+    def _setup_ghost_label_hiding(self) -> None:
+        """Set up callback to hide ghost labels after layout calculation.
+
+        The ghost labels need to be visible during constrained_layout's calculation
+        phase, but must be hidden during actual rendering to avoid duplication.
+
+        Strategy: Use a draw_event callback that runs AFTER layout but BEFORE render.
+        The callback should only hide labels after the FIRST draw (when layout is done).
+        """
+        # Track if we've already hidden the labels
+        self._ghost_labels_hidden = False
+
+        def hide_ghost_labels(event) -> None:  # noqa: ANN001, ARG001
+            """Hide the ghost tick labels on container axes after first draw."""
+            # Only hide after the first draw (when constrained_layout has calculated)
+            if self._ghost_labels_hidden:
+                return
+
+            self._ghost_labels_hidden = True
+
+            # Hide tick labels on container axes
+            if self.orientation == "vertical":
+                # Hide y-axis tick labels
+                for label in self.ax.yaxis.get_ticklabels():
+                    label.set_alpha(0)
+            else:
+                # Hide x-axis tick labels
+                for label in self.ax.xaxis.get_ticklabels():
+                    label.set_alpha(0)
+
+        # Connect to draw event - this runs after layout but before render
+        if hasattr(self.fig.canvas, "mpl_connect"):
+            self.fig.canvas.mpl_connect("draw_event", hide_ghost_labels)
+
     def cbar_tick_params(
         self,
         axis: Literal["x", "y", "both"] = "both",
@@ -1100,6 +1123,38 @@ class HistColorbar:
             # Count is on y-axis
             self.ax_hist.set_ylabel(label, **kwargs)
 
+    def set_label(
+        self,
+        label: str,
+        which: Literal["cbar", "hist"] = "cbar",
+        **kwargs: Any,
+    ) -> None:
+        """Set label for the colorbar or histogram.
+
+        This method allows you to set labels for the colorbar and histogram
+        with different styling options. You can call it multiple times with
+        different parameters to apply different styles to each label.
+
+        Parameters
+        ----------
+        label : str
+            Label for the colorbar or histogram axis.
+        which : {'cbar', 'hist'}, default: 'cbar'
+            Which axis to set the label for.
+        **kwargs
+            Additional keyword arguments passed to the label setting methods.
+            Common options include: fontsize, color, fontweight, labelpad, etc.
+
+        """
+        if which == "cbar":
+            self.set_cbar_label(label, **kwargs)
+        elif which == "hist":
+            self.set_hist_label(label, **kwargs)
+        else:
+            msg = f"which must be 'cbar' or 'hist', got {which}"
+            logger.error(msg)
+            raise ValueError(msg)
+
     def set_cbar_ticks(
         self,
         ticks: ArrayLike,
@@ -1158,6 +1213,97 @@ class HistColorbar:
         else:
             self.ax_hist.set_yticks(ticks, labels, minor=minor, **kwargs)
 
+    def set_ticks(
+        self,
+        ticks: ArrayLike,
+        labels: Iterable[str] | None = None,
+        *,
+        which: Literal["cbar", "hist"] = "cbar",
+        minor: bool = False,
+        **kwargs,
+    ) -> None:
+        """Set tick locations for the colorbar and histogram axes.
+
+        Parameters
+        ----------
+        ticks : 1D array-like
+            List of tick locations.
+        labels : list of str, optional
+            List of tick labels. If not set, the labels show the data value.
+        which : {'cbar', 'hist'}, default: 'cbar'
+            Which axis to set the tick locations for.
+        minor : bool, default: False
+            If ``False``, set the major ticks; if ``True``, the minor ticks.
+        **kwargs
+            `.Text` properties for the labels. These take effect only if you
+            pass *labels*. In other cases, please use `~.Axes.tick_params`.
+
+        """
+        if which == "cbar":
+            self.set_cbar_ticks(ticks, labels, minor=minor, **kwargs)
+        elif which == "hist":
+            self.set_hist_ticks(ticks, labels, minor=minor, **kwargs)
+        else:
+            msg = f"which must be 'cbar' or 'hist', got {which}"
+            logger.error(msg)
+            raise ValueError(msg)
+
+    def set_cbar_ticklabels(self, labels: Iterable[str], **kwargs: Any) -> None:
+        """Set tick labels for the colorbar axis.
+
+        Parameters
+        ----------
+        labels : list of str
+            List of tick labels.
+        **kwargs
+            `.Text` properties for the labels.
+
+        """
+        self.cbar.set_ticklabels(labels, **kwargs)
+
+    def set_hist_ticklabels(self, labels: Iterable[str], **kwargs: Any) -> None:
+        """Set tick labels for the histogram axis.
+
+        Parameters
+        ----------
+        labels : list of str
+            List of tick labels.
+        **kwargs
+            `.Text` properties for the labels.
+
+        """
+        if self.orientation == "vertical":
+            self.ax_hist.set_xticklabels(labels, **kwargs)
+        else:
+            self.ax_hist.set_yticklabels(labels, **kwargs)
+
+    def set_ticklabels(
+        self,
+        labels: Iterable[str],
+        which: Literal["cbar", "hist"] = "cbar",
+        **kwargs: Any,
+    ) -> None:
+        """Set tick labels for the colorbar and histogram axes.
+
+        Parameters
+        ----------
+        labels : list of str
+            List of tick labels.
+        which : {'cbar', 'hist'}, default: 'cbar'
+            Which axis to set the tick labels for.
+        **kwargs
+            `.Text` properties for the labels.
+
+        """
+        if which == "cbar":
+            self.set_cbar_ticklabels(labels, **kwargs)
+        elif which == "hist":
+            self.set_hist_ticklabels(labels, **kwargs)
+        else:
+            msg = f"which must be 'cbar' or 'hist', got {which}"
+            logger.error(msg)
+            raise ValueError(msg)
+
     def minorticks_on(self) -> None:
         """Turn on colorbar minor ticks."""
         self.cbar.minorticks_on()
@@ -1166,247 +1312,19 @@ class HistColorbar:
         """Turn the minor ticks of the colorbar off."""
         self.cbar.minorticks_off()
 
-    def _update_positions(self) -> None:
-        """Update positions of colorbar and histogram axes.
-
-        This method is called during draw events when using constrained_layout
-        to ensure the histogram and colorbar maintain correct positions after
-        the layout engine has adjusted axes positions.
-        """
-        if not hasattr(self, "ax") or self.ax is None or not self.ax.get_visible():
-            return
-
-        # Get the container axes position (updated by constrained_layout)
-        pos = self.ax.get_position()
-
-        # Check if position has changed since last update (avoid unnecessary work)
-        cache_key = f"{pos.x0:.6f},{pos.y0:.6f},{pos.width:.6f},{pos.height:.6f}"
-        if self._position_cache.get("container_pos") == cache_key:
-            return
-        self._position_cache["container_pos"] = cache_key
-
-        # Calculate hcb position within container
-        if self.orientation == "vertical":
-            if self.location == "left":
-                pos_hcb, _ = pos.splitx(1 - self.pad)
-            else:
-                _, pos_hcb = pos.splitx(self.pad)
-        elif self.location == "bottom":
-            pos_hcb, _ = pos.splity(1 - self.pad)
-        else:
-            _, pos_hcb = pos.splity(self.pad)
-
-        # Recalculate and apply positions for colorbar and histogram
-        self._apply_hcb_positions(pos_hcb)
-
-        # Reapply extend adjustments if needed
-        if getattr(self, "_has_extend", False):
-            self._trim_hist_axes()
-
-    def _apply_hcb_positions(self, pos_hcb: Bbox) -> None:
-        """Apply calculated positions to colorbar and histogram axes.
-
-        Parameters
-        ----------
-        pos_hcb : Bbox
-            The bounding box for the histogram-colorbar container.
-
-        """
-        # Calculate space for shrink
-        space = max((1 - self.shrink) / 2, 1e-6)
-
-        if self.orientation == "vertical":
-            # Calculate vertical positions with shrink
-            total_height = pos_hcb.height
-            shrunk_height = total_height * self.shrink
-            y_start = pos_hcb.y0 + space * total_height
-
-            # Split width between histogram and colorbar
-            if self.location == "left":
-                # Colorbar on left, histogram on right
-                cbar_width = pos_hcb.width * (1 - self.hist_fraction)
-                hist_width = pos_hcb.width * self.hist_fraction
-                self.ax_cbar.set_position(
-                    (
-                        pos_hcb.x0,
-                        y_start,
-                        cbar_width,
-                        shrunk_height,
-                    )
-                )
-                self.ax_hist.set_position(
-                    (
-                        pos_hcb.x0 + cbar_width,
-                        y_start,
-                        hist_width,
-                        shrunk_height,
-                    )
-                )
-            else:
-                # Histogram on left, colorbar on right
-                hist_width = pos_hcb.width * self.hist_fraction
-                cbar_width = pos_hcb.width * (1 - self.hist_fraction)
-                self.ax_hist.set_position(
-                    (
-                        pos_hcb.x0,
-                        y_start,
-                        hist_width,
-                        shrunk_height,
-                    )
-                )
-                self.ax_cbar.set_position(
-                    (
-                        pos_hcb.x0 + hist_width,
-                        y_start,
-                        cbar_width,
-                        shrunk_height,
-                    )
-                )
-        else:
-            # Calculate horizontal positions with shrink
-            total_width = pos_hcb.width
-            shrunk_width = total_width * self.shrink
-            x_start = pos_hcb.x0 + space * total_width
-
-            # Split height between histogram and colorbar
-            if self.location == "bottom":
-                # Histogram on top, colorbar on bottom
-                hist_height = pos_hcb.height * self.hist_fraction
-                cbar_height = pos_hcb.height * (1 - self.hist_fraction)
-                self.ax_hist.set_position(
-                    (
-                        x_start,
-                        pos_hcb.y0 + cbar_height,
-                        shrunk_width,
-                        hist_height,
-                    )
-                )
-                self.ax_cbar.set_position(
-                    (
-                        x_start,
-                        pos_hcb.y0,
-                        shrunk_width,
-                        cbar_height,
-                    )
-                )
-            else:
-                # Colorbar on top, histogram on bottom
-                cbar_height = pos_hcb.height * (1 - self.hist_fraction)
-                hist_height = pos_hcb.height * self.hist_fraction
-                self.ax_cbar.set_position(
-                    (
-                        x_start,
-                        pos_hcb.y0 + hist_height,
-                        shrunk_width,
-                        cbar_height,
-                    )
-                )
-                self.ax_hist.set_position(
-                    (
-                        x_start,
-                        pos_hcb.y0,
-                        shrunk_width,
-                        hist_height,
-                    )
-                )
-
-    def _on_draw(self, event) -> None:  # noqa: ANN001
-        """Call back for draw events to update positions when needed.
-
-        Parameters
-        ----------
-        event : DrawEvent
-            The draw event from matplotlib.
-
-        """
-        # Disabled: Position updates on draw cause issues
-        # Let constrained_layout handle positioning naturally
-
-    def _setup_layout_integration(self) -> None:
-        """Configure integration with figure's layout engine.
-
-        This method configures the HistColorbar to work with constrained_layout
-        by either registering with a custom layout engine or setting up draw callbacks.
-        """
-        layout_engine = self.fig.get_layout_engine()
-
-        if layout_engine is None:
-            # No layout engine, nothing to do
-            logger.debug("No layout engine detected, using standard positioning.")
-            return
-
-        # Check if it's a constrained layout
-        engine_type = str(type(layout_engine))
-        if "constrained" not in engine_type.lower():
-            # Not constrained layout, nothing special needed
-            msg = f"Layout engine '{engine_type}' detected, no special handling needed."
-            logger.debug(msg)
-            return
-
-        # Constrained layout detected - setup compatibility
-        logger.info(
-            "Constrained layout detected. HistColorbar will automatically adjust "
-            "positions during rendering to maintain proper alignment."
-        )
-
-        # Setup for constrained layout compatibility
-        if isinstance(layout_engine, HistColorbarLayoutEngine):
-            # Already using our custom engine, just register
-            logger.debug("Registering with existing HistColorbarLayoutEngine.")
-            layout_engine.register_hist_colorbar(self)
-        else:
-            # Need to wrap the existing layout engine
-            logger.debug(
-                "Wrapping existing layout engine with HistColorbarLayoutEngine."
-            )
-            self._wrap_layout_engine()
-
-        # Register draw callback as fallback/supplement
-        if hasattr(self.fig.canvas, "mpl_connect"):
-            self._draw_callback_id = self.fig.canvas.mpl_connect(
-                "draw_event", self._on_draw
-            )
-            logger.debug("Draw event callback registered for position updates.")
-
-    def _wrap_layout_engine(self) -> None:
-        """Wrap the figure's existing layout engine with our custom one."""
-        current_engine = self.fig.get_layout_engine()
-
-        if not isinstance(current_engine, HistColorbarLayoutEngine):
-            # Store the original engine
-            self.fig._original_layout_engine = current_engine
-
-            # Create and install our custom engine
-            new_engine = HistColorbarLayoutEngine()
-            new_engine.register_hist_colorbar(self)
-            self.fig.set_layout_engine(new_engine)
-        else:
-            # Already wrapped, just register
-            current_engine.register_hist_colorbar(self)
-
     def remove(self) -> None:
         """Remove the HistColorbar and clean up.
 
         This method should be called when removing a HistColorbar to properly
-        unregister callbacks and layout engine references.
+        clean up resources.
         """
-        # Unregister from layout engine
-        layout_engine = self.fig.get_layout_engine()
-        if isinstance(layout_engine, HistColorbarLayoutEngine):
-            layout_engine.unregister_hist_colorbar(self)
-
-        # Disconnect draw callback
-        if self._draw_callback_id is not None and hasattr(
-            self.fig.canvas, "mpl_disconnect"
-        ):
-            self.fig.canvas.mpl_disconnect(self._draw_callback_id)
-            self._draw_callback_id = None
-
         # Remove axes
         if hasattr(self, "ax_cbar") and self.ax_cbar is not None:
             self.ax_cbar.remove()
         if hasattr(self, "ax_hist") and self.ax_hist is not None:
             self.ax_hist.remove()
+        if hasattr(self, "ax") and self.ax is not None:
+            self.ax.remove()
 
 
 def _hist_colorbar(  # noqa: D417
@@ -1418,9 +1336,9 @@ def _hist_colorbar(  # noqa: D417
     use_gridspec: bool = True,
     location: Literal["left", "right", "top", "bottom"] | None = None,
     orientation: Literal["vertical", "horizontal"] | None = None,
-    aspect: float = 3,
-    fraction: float = 0.25,
-    hist_fraction: float = 0.9,
+    aspect: float = 5,
+    fraction: float = 0.2,
+    hist_fraction: float = 0.85,
     pad: float | None = None,
     alpha: float | None = None,
     shrink: float = 1.0,
@@ -1467,11 +1385,11 @@ def _hist_colorbar(  # noqa: D417
         (vertical colorbars on the right, horizontal ones at the bottom).
     orientation : {'vertical', 'horizontal'} or None, optional
         Orientation of the colorbar. If None, determined from location.
-    aspect : float, default 3
+    aspect : float, default 5
         Ratio of long to short dimensions of colorbar.
-    fraction : float, default 0.25
+    fraction : float, default 0.2
         Fraction of original Axes to use for colorbar.
-    hist_fraction : float, default 0.9
+    hist_fraction : float, default 0.85
         Fraction of the colorbar axes allocated to the histogram (0-1).
         The remaining fraction is allocated to the colorbar gradient.
     pad : float or None, optional
@@ -1673,10 +1591,8 @@ def _determine_location_orientation(
 
 def _create_hcb_gridspec_axes(
     parent_ax: Axes,
-    shrink: float,
     hist_fraction: float,
     location: Literal["left", "right", "top", "bottom"],
-    pad: float,
 ) -> tuple[Axes, Axes]:
     """Create gridspec axes for the colorbar and histogram using SubplotSpec.
 
@@ -1687,14 +1603,10 @@ def _create_hcb_gridspec_axes(
     ----------
     parent_ax : Axes
         The container axes that will hold the colorbar and histogram.
-    shrink : float
-        Fraction by which to shrink the colorbar.
     hist_fraction : float
         Fraction of space allocated to histogram.
     location : str
         Location of the colorbar.
-    pad : float
-        Padding between colorbar sections.
 
     Returns
     -------
@@ -1703,10 +1615,6 @@ def _create_hcb_gridspec_axes(
 
     """
     location, orientation = _determine_location_orientation(location, None)
-
-    # Calculate space for shrink
-    space = max((1 - shrink) / 2, 1e-6)
-    shrink_ratio = [space, shrink, space]
 
     # Get the figure
     fig = parent_ax.get_figure()
@@ -1717,70 +1625,50 @@ def _create_hcb_gridspec_axes(
     # Use SubplotSpec.subgridspec for relative positioning
     # This ensures the child axes follow parent_ax automatically
     if orientation == "vertical":
-        # For vertical colorbar, create 3 rows (for shrink) and 2 columns
-        subgs = parent_subplotspec.subgridspec(
-            3,
-            2,
-            width_ratios=[1 - pad, pad] if location == "left" else [pad, 1 - pad],
-            height_ratios=shrink_ratio,
-            wspace=0,
-            hspace=0,
-        )
-
+        # For vertical colorbar, split horizontally based on hist_fraction
         if location == "left":
-            # Colorbar on left: subdivide left column
-            cbar_col = 0
+            # Colorbar on left, histogram on right
             axes_ratios = [1 - hist_fraction, hist_fraction]
-            cbar_hist_gs = subgs[1, cbar_col].subgridspec(
+            subgs = parent_subplotspec.subgridspec(
                 1, 2, width_ratios=axes_ratios, wspace=0
             )
-            ax_cbar = fig.add_subplot(cbar_hist_gs[0, 0])
-            ax_hist = fig.add_subplot(cbar_hist_gs[0, 1])
+            ax_cbar = fig.add_subplot(subgs[0, 0])
+            ax_hist = fig.add_subplot(subgs[0, 1])
             hide_axis_elements(ax_cbar)
             ax_cbar.tick_params(left=True, labelleft=True)
         else:  # right
-            # Colorbar on right: subdivide right column
-            cbar_col = 1
+            # Histogram on left, colorbar on right
             axes_ratios = [hist_fraction, 1 - hist_fraction]
-            cbar_hist_gs = subgs[1, cbar_col].subgridspec(
+            subgs = parent_subplotspec.subgridspec(
                 1, 2, width_ratios=axes_ratios, wspace=0
             )
-            ax_hist = fig.add_subplot(cbar_hist_gs[0, 0])
-            ax_cbar = fig.add_subplot(cbar_hist_gs[0, 1])
+            ax_hist = fig.add_subplot(subgs[0, 0])
+            ax_cbar = fig.add_subplot(subgs[0, 1])
             hide_axis_elements(ax_cbar)
             ax_cbar.tick_params(right=True, labelright=True)
 
         hide_axis_elements(ax_hist)
         ax_hist.tick_params(labelbottom=True)
     else:
-        # Horizontal colorbar: create 2 rows and 3 columns
-        subgs = parent_subplotspec.subgridspec(
-            2,
-            3,
-            width_ratios=shrink_ratio,
-            height_ratios=[1 - pad, pad] if location == "top" else [pad, 1 - pad],
-            wspace=0,
-            hspace=0,
-        )
-
+        # Horizontal colorbar: split vertically based on hist_fraction
         if location == "bottom":
-            cbar_row = 0
+            # Histogram on top, colorbar on bottom
             axes_ratios = [hist_fraction, 1 - hist_fraction]
-            cbar_hist_gs = subgs[cbar_row, 1].subgridspec(
+            subgs = parent_subplotspec.subgridspec(
                 2, 1, height_ratios=axes_ratios, hspace=0
             )
-            ax_hist = fig.add_subplot(cbar_hist_gs[0, 0])
-            ax_cbar = fig.add_subplot(cbar_hist_gs[1, 0])
+            ax_hist = fig.add_subplot(subgs[0, 0])
+            ax_cbar = fig.add_subplot(subgs[1, 0])
             hide_axis_elements(ax_cbar)
             ax_cbar.tick_params(bottom=True, labelbottom=True)
         else:  # top
-            cbar_row = 1
+            # Colorbar on top, histogram on bottom
             axes_ratios = [1 - hist_fraction, hist_fraction]
-            cbar_hist_gs = subgs[cbar_row, 1].subgridspec(
+            subgs = parent_subplotspec.subgridspec(
                 2, 1, height_ratios=axes_ratios, hspace=0
             )
-            ax_cbar = fig.add_subplot(cbar_hist_gs[0, 0])
-            ax_hist = fig.add_subplot(cbar_hist_gs[1, 0])
+            ax_cbar = fig.add_subplot(subgs[0, 0])
+            ax_hist = fig.add_subplot(subgs[1, 0])
             hide_axis_elements(ax_cbar)
             ax_cbar.tick_params(top=True, labeltop=True)
 
@@ -1792,10 +1680,8 @@ def _create_hcb_gridspec_axes(
 
 def _create_hcb_inset_axes(
     parent_ax: Axes,
-    shrink: float,
     hist_fraction: float,
     location: Literal["left", "right", "top", "bottom"],
-    pad: float,
 ) -> tuple[Axes, Axes]:
     """Create colorbar and histogram axes using inset_axes for relative positioning.
 
@@ -1807,14 +1693,10 @@ def _create_hcb_inset_axes(
     ----------
     parent_ax : Axes
         The container axes that will hold the colorbar and histogram.
-    shrink : float
-        Fraction by which to shrink the colorbar.
     hist_fraction : float
         Fraction of space allocated to histogram.
     location : str
         Location of the colorbar.
-    pad : float
-        Padding between colorbar and parent axes.
 
     Returns
     -------
@@ -1824,48 +1706,34 @@ def _create_hcb_inset_axes(
     """
     location, orientation = _determine_location_orientation(location, None)
 
-    # Fallback: parent_ax is not a subplot (e.g., under constrained_layout)
-    # Use inset_axes for relative positioning instead of absolute GridSpec
-    # This ensures axes follow parent_ax automatically
-
-    # Calculate bounds and width/height in axes coordinates (relative)
-    # Format: [x0, y0, width, height] in axes fraction
-
-    # Reserve extra space for tick labels
-    # This prevents overlap with adjacent subplots and ensures labels are visible
-    tick_label_space = 0.05  # 5% of parent_ax for tick labels
-
     if orientation == "vertical":
-        # Vertical colorbar
-        # Total available width after pad and tick label space
+        # Vertical colorbar: split horizontally
         if location == "left":
-            # Reserve space on the left for tick labels
-            available_width = 1 - pad - tick_label_space
-            cbar_x0 = tick_label_space  # Start after tick label space
-            cbar_width = available_width * (1 - hist_fraction)
-            hist_width = available_width * hist_fraction
-            hist_x0 = cbar_x0 + cbar_width  # Starts right after colorbar
+            # Colorbar on left, histogram on right
+            cbar_x0 = 0
+            cbar_width = 1 - hist_fraction
+            hist_x0 = cbar_width
+            hist_width = hist_fraction
         else:  # location == "right"
-            # Reserve space on the right for tick labels
-            available_width = 1 - pad - tick_label_space
-            hist_x0 = pad
-            hist_width = available_width * hist_fraction
-            cbar_width = available_width * (1 - hist_fraction)
-            cbar_x0 = hist_x0 + hist_width  # Starts right after histogram
+            # Histogram on left, colorbar on right
+            hist_x0 = 0
+            hist_width = hist_fraction
+            cbar_x0 = hist_width
+            cbar_width = 1 - hist_fraction
 
-        cbar_height = shrink
-        hist_height = shrink
-        cbar_y0 = (1 - shrink) / 2  # Center vertically
-        hist_y0 = cbar_y0
+        # Fill entire height
+        cbar_y0 = 0
+        cbar_height = 1
+        hist_y0 = 0
+        hist_height = 1
 
         # Create axes using inset_axes (relative to parent_ax)
         # Use width="100%", height="100%" to fill the bbox_to_anchor area
-        # loc=3 means lower left corner, which with 100% size fills the entire bbox
         ax_cbar = inset_axes(
             parent_ax,
             width="100%",
             height="100%",
-            loc="lower left",  # lower left
+            loc="lower left",
             bbox_to_anchor=(cbar_x0, cbar_y0, cbar_width, cbar_height),
             bbox_transform=parent_ax.transAxes,
             borderpad=0,
@@ -1874,7 +1742,7 @@ def _create_hcb_inset_axes(
             parent_ax,
             width="100%",
             height="100%",
-            loc="lower left",  # lower left
+            loc="lower left",
             bbox_to_anchor=(hist_x0, hist_y0, hist_width, hist_height),
             bbox_transform=parent_ax.transAxes,
             borderpad=0,
@@ -1891,27 +1759,25 @@ def _create_hcb_inset_axes(
         ax_hist.tick_params(labelbottom=True)
 
     else:
-        # Horizontal colorbar
-        # Total available height after pad and tick label space
+        # Horizontal colorbar: split vertically
         if location == "bottom":
-            # Reserve space on the bottom for tick labels
-            available_height = 1 - pad - tick_label_space
-            hist_y0 = tick_label_space  # Start after tick label space
-            hist_height = available_height * hist_fraction
-            cbar_height = available_height * (1 - hist_fraction)
-            cbar_y0 = hist_y0 + hist_height  # Starts right after histogram
+            # Colorbar on top, histogram on bottom
+            cbar_y0 = 0
+            cbar_height = 1 - hist_fraction
+            hist_y0 = cbar_height
+            hist_height = hist_fraction
         else:  # location == "top"
-            # Reserve space on the top for tick labels
-            available_height = 1 - pad - tick_label_space
-            hist_y0 = pad
-            hist_height = available_height * hist_fraction
-            cbar_height = available_height * (1 - hist_fraction)
-            cbar_y0 = hist_y0 + hist_height  # Starts right after histogram
+            # Histogram on top, colorbar on bottom
+            hist_y0 = 0
+            hist_height = hist_fraction
+            cbar_y0 = hist_height
+            cbar_height = 1 - hist_fraction
 
-        cbar_width = shrink
-        hist_width = shrink
-        cbar_x0 = (1 - shrink) / 2  # Center horizontally
-        hist_x0 = cbar_x0
+        # Fill entire width
+        cbar_x0 = 0
+        cbar_width = 1
+        hist_x0 = 0
+        hist_width = 1
 
         # Create axes using inset_axes
         # Use width="100%", height="100%" to fill the bbox_to_anchor area
@@ -1919,7 +1785,7 @@ def _create_hcb_inset_axes(
             parent_ax,
             width="100%",
             height="100%",
-            loc="lower left",  # lower left
+            loc="lower left",
             bbox_to_anchor=(cbar_x0, cbar_y0, cbar_width, cbar_height),
             bbox_transform=parent_ax.transAxes,
             borderpad=0,
@@ -1928,7 +1794,7 @@ def _create_hcb_inset_axes(
             parent_ax,
             width="100%",
             height="100%",
-            loc="lower left",  # lower left
+            loc="lower left",
             bbox_to_anchor=(hist_x0, hist_y0, hist_width, hist_height),
             bbox_transform=parent_ax.transAxes,
             borderpad=0,
