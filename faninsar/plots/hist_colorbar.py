@@ -51,6 +51,338 @@ NON_COLORBAR_KEYS = [  # remove kws that cannot be passed to Colorbar
 ]
 
 
+class _Histogram(Colorbar):
+    """Draw a histogram on axes with same positioning as colorbar.
+
+    This class inherits from Colorbar to leverage its extend triangle behavior,
+    ensuring perfect alignment with the main colorbar. Instead of drawing a
+    colorbar gradient, it draws a histogram.
+
+    Parameters
+    ----------
+    ax : Axes
+        The axes to draw the histogram in.
+    data : ArrayLike
+        The data values to create the histogram from.
+    mappable : ScalarMappable
+        The mappable object for norm and cmap.
+    orientation : str
+        The orientation of the histogram ('horizontal' or 'vertical').
+    hist_bins : int | NDArray
+        Number of histogram bins or bin edges.
+    hist_kwargs : dict
+        Additional kwargs for matplotlib's hist function.
+    min_count : float
+        Minimum count value for the histogram axis.
+    scale : str
+        Scale of the histogram axis ('linear' or 'log').
+    divider_style : dict
+        Style for the divider line.
+    location : str
+        Location of the histogram ('left', 'right', 'top', 'bottom').
+    **kwargs
+        Additional kwargs passed to Colorbar.__init__.
+
+    """
+
+    def __init__(
+        self,
+        ax: Axes,
+        data: ArrayLike,
+        mappable: ScalarMappable,
+        orientation: Literal["vertical", "horizontal"],
+        hist_bins: int | NDArray,
+        hist_kwargs: dict,
+        min_count: float,
+        scale: Literal["linear", "log"],
+        divider_style: dict[str, Any],
+        location: Literal["left", "right", "top", "bottom"],
+        **kwargs: Any,
+    ) -> None:
+        # Store histogram-specific parameters before calling super().__init__
+        self._data = np.asanyarray(data).flatten()
+        self._hist_bins = hist_bins
+        self._hist_kwargs = hist_kwargs
+        self._min_count = min_count
+        self._scale = scale
+        self._divider_style = divider_style
+        self._location = location
+        self._hist_orientation = (
+            "horizontal" if orientation == "vertical" else "vertical"
+        )
+
+        # Get levels and facecolors from parent HistColorbar for color matching
+        self._levels = kwargs.pop("_levels", None)
+        self._level_facecolors = kwargs.pop("_level_facecolors", None)
+        self._effective_alpha = kwargs.pop("_effective_alpha", None)
+
+        # Initialize Colorbar - this sets up extend triangles and axes locator
+        super().__init__(ax, mappable=mappable, orientation=orientation, **kwargs)
+
+    def _draw_all(self) -> None:
+        """Override Colorbar._draw_all to preserve histogram count axis.
+
+        This is a modified copy of matplotlib's Colorbar._draw_all() method.
+        The main change is that we DON'T call set_xlim(0,1) or set_ylim(0,1)
+        for the histogram count axis, preserving the actual histogram range.
+        """
+        # Set self._boundaries and self._values, including extensions
+        self._process_values()
+
+        # Set self.vmin and self.vmax to first and last boundary, excluding extensions
+        self.vmin, self.vmax = self._boundaries[self._inside][[0, -1]]
+
+        # Compute the X/Y mesh
+        self._mesh()
+
+        # Draw the extend triangles, and shrink the inner Axes to accommodate
+        self._do_extends()
+        self.hide_triangles()
+
+        lower, upper = self.vmin, self.vmax
+        if self.long_axis.get_inverted():
+            # If the axis is inverted, we need to swap the vmin/vmax
+            lower, upper = upper, lower
+
+        # CRITICAL CHANGE: Only set limits for the DATA axis (long_axis),
+        # NOT for the count axis (short_axis for histogram)
+        if self.orientation == "vertical":
+            self.ax.set_ylim(lower, upper)
+        else:
+            self.ax.set_xlim(lower, upper)
+
+        # Set up the tick locators and formatters
+        # self.update_ticks()
+
+        # Draw the histogram (instead of calling _add_solids with mesh)
+        self._add_solids()
+
+        # Apply histogram-specific styling
+        self._apply_histogram_styling()
+
+    def hide_triangles(self) -> None:
+        """Hide the extend triangles."""
+        for patch in self._extend_patches:
+            patch.set_fill(False)
+            patch.set_edgecolor("none")
+
+    def _add_solids(self) -> None:
+        """Override to draw histogram instead of colorbar gradient.
+
+        This method draws the histogram bars instead of the colorbar's
+        pcolormesh gradient. Since we control _draw_all(), we don't need
+        the X, Y, C parameters that the parent Colorbar passes.
+        """
+        # Clean up any previous histogram patches
+        if self.solids is not None:
+            self.solids.remove()
+            self.solids = None
+        for solid in self.solids_patches:
+            solid.remove()
+        self.solids_patches = []
+
+        # Draw the histogram
+        data_finite = self._data[np.isfinite(self._data)]
+
+        if len(data_finite) == 0:
+            msg = (
+                "No finite values in data. Unable to draw histogram. "
+                "Check your data for NaNs and infinities."
+            )
+            warnings.warn(msg, stacklevel=2)
+            logger.warning(msg)
+            return
+
+        # Determine histogram range from norm boundaries
+        boundaries = getattr(self.norm, "boundaries", None)
+        levels = self._levels
+        if levels is not None and len(levels) >= 2:
+            vmin, vmax = float(np.min(levels)), float(np.max(levels))
+        elif boundaries is not None and len(boundaries) >= 2:
+            vmin, vmax = float(boundaries[0]), float(boundaries[-1])
+        else:
+            vmin = getattr(self.norm, "vmin", None)
+            vmax = getattr(self.norm, "vmax", None)
+            if vmin is None or vmax is None:
+                vmin, vmax = float(np.min(data_finite)), float(np.max(data_finite))
+
+        # Create histogram using matplotlib's hist
+        hist_kwargs = {
+            "bins": self._hist_bins,
+            "range": (vmin, vmax),
+            "align": "mid",
+        }
+        hist_kwargs.update(self._hist_kwargs)
+
+        if self._hist_orientation == "horizontal":
+            self.ax.hist(data_finite, orientation="horizontal", **hist_kwargs)
+        else:
+            self.ax.hist(data_finite, orientation="vertical", **hist_kwargs)
+
+        # Compute color split positions for recoloring patches
+        if levels is not None and len(levels) >= 2:
+            splitpos = np.asarray(levels, dtype=float)
+        elif boundaries is not None and len(boundaries) >= 2:
+            splitpos = np.asarray(boundaries, dtype=float)
+        else:
+            n = int(getattr(self.cmap, "N", 256))
+            t = np.linspace(0.0, 1.0, n + 1)
+            inv = getattr(self.norm, "inverse", None)
+            if callable(inv):
+                try:
+                    splitpos = np.asarray(inv(t), dtype=float)
+                except Exception:
+                    splitpos = np.linspace(vmin, vmax, n + 1)
+            else:
+                splitpos = np.linspace(vmin, vmax, n + 1)
+
+        # Recolor histogram patches to match colorbar
+        self._recolor_histogram_patches(splitpos)
+
+    def _recolor_histogram_patches(self, splitpos: NDArray) -> None:
+        """Recolor histogram patches to match colorbar colors.
+
+        Parameters
+        ----------
+        splitpos : NDArray
+            Positions where colors change in the colorbar.
+
+        """
+
+        def value_to_facecolor(val: float) -> tuple[float, float, float, float]:
+            """Map a data value to a facecolor."""
+            # Prefer exact per-level facecolors from contourf if available
+            if self._level_facecolors is not None and self._levels is not None:
+                levels = np.asarray(self._levels, dtype=float)
+                idx = int(
+                    np.clip(
+                        np.searchsorted(levels, val, side="right") - 1,
+                        0,
+                        len(levels) - 2,
+                    )
+                )
+                rgba = self._level_facecolors[idx]
+                if self._effective_alpha is not None:
+                    return (
+                        float(rgba[0]),
+                        float(rgba[1]),
+                        float(rgba[2]),
+                        float(self._effective_alpha),
+                    )
+                return (
+                    float(rgba[0]),
+                    float(rgba[1]),
+                    float(rgba[2]),
+                    float(rgba[3] if len(rgba) == 4 else 1.0),
+                )
+            # Fallback: use the mappable's scalar mapping
+            return tuple(self.mappable.to_rgba(val, alpha=self._effective_alpha))  # type: ignore[return-value]
+
+        # Iterate over all patches (histogram bars)
+        for patch in list(self.ax.patches):
+            # Skip non-Rectangle patches (e.g., extend triangles)
+            if not isinstance(patch, Rectangle):
+                continue
+
+            patch = cast("Rectangle", patch)
+            if self.orientation == "vertical":
+                # For vertical colorbar, histogram bars are horizontal
+                minval = np.atleast_1d(patch.get_y())[0]
+                width = patch.get_width()
+                height = patch.get_height()
+                maxval = minval + height
+            else:
+                # For horizontal colorbar, histogram bars are vertical
+                minval = np.atleast_1d(patch.get_x())[0]
+                width = patch.get_width()
+                height = patch.get_height()
+                maxval = minval + width
+
+            # Find split positions within this bar
+            splitbins = [
+                minval,
+                *splitpos[(splitpos > minval) & (maxval > splitpos)],
+                maxval,
+            ]
+
+            # If bar spans multiple colors, split it
+            if len(splitbins) > 2:
+                patch.remove()
+                # Create sub-patches for each color segment
+                for b0, b1 in zip(splitbins[:-1], splitbins[1:]):
+                    center_val = (b0 + b1) / 2
+                    color = value_to_facecolor(center_val)
+
+                    if self.orientation == "vertical":
+                        # Horizontal bars
+                        pi = Rectangle(
+                            (0, b0),
+                            width,
+                            (b1 - b0),
+                            facecolor=color,
+                            linewidth=0,
+                            alpha=None,
+                        )
+                    else:
+                        # Vertical bars
+                        pi = Rectangle(
+                            (b0, 0),
+                            (b1 - b0),
+                            height,
+                            facecolor=color,
+                            linewidth=0,
+                            alpha=None,
+                        )
+
+                    self.ax.add_patch(pi)
+            else:  # Bar is within a single color
+                center_val = (minval + maxval) / 2
+                color = value_to_facecolor(center_val)
+                patch.set_facecolor(color)
+                patch.set_linewidth(0)
+
+    def _apply_histogram_styling(self) -> None:
+        """Apply histogram-specific styling."""
+        # Set histogram scale
+        if self._hist_orientation == "horizontal":
+            self.ax.set_xscale(self._scale)
+        else:
+            self.ax.set_yscale(self._scale)
+
+        hide_axis_elements(self.ax)
+        # Draw grid on histogram axis
+        if self._hist_orientation == "horizontal":
+            self.ax.grid(axis="x", which="major", **self._divider_style)
+            spine = (
+                self.ax.spines["left"]
+                if self._location == "left"
+                else self.ax.spines["right"]
+            )
+        else:
+            self.ax.grid(axis="y", which="major", **self._divider_style)
+            spine = (
+                self.ax.spines["bottom"]
+                if self._location == "bottom"
+                else self.ax.spines["top"]
+            )
+
+        # Make the spine visible and apply divider style
+        spine.set_visible(True)
+        plt.setp(spine, **self._divider_style)
+
+        # Apply min_count and axis inversion
+        if self._hist_orientation == "horizontal":
+            xlim = self.ax.get_xlim()
+            self.ax.set_xlim(xlim[1], self._min_count)
+            if self._location == "left":
+                self.ax.invert_xaxis()
+        else:
+            ylim = self.ax.get_ylim()
+            self.ax.set_ylim(ylim[1], self._min_count)
+            if self._location == "bottom":
+                self.ax.invert_yaxis()
+
+
 class HistColorbar:
     """A colorbar with an embedded histogram showing data distribution.
 
@@ -224,6 +556,11 @@ class HistColorbar:
         self.extendfrac = extendfrac
         self.log = log
         self._min_count_origin = min_count
+        # Initialize scale and min_count
+        self._scale: Literal["linear", "log"] = "log" if log else "linear"
+        self._min_count = 0.5 if log else 0
+        if min_count != "auto":
+            self._min_count = min_count
         self.label = label
         self.hist_label = hist_label
         self.divider_style = (
@@ -411,64 +748,6 @@ class HistColorbar:
             return 100
         return hist_bins
 
-    def _trim_hist_axes(self) -> None:
-        """Adjust histogram axes to account for extend triangles.
-
-        Instead of using AxesDivider (which conflicts with constrained_layout),
-        we adjust the histogram's position to leave space for extend triangles.
-        This is handled by reducing the histogram's data limits rather than
-        creating additional axes.
-        """
-        if self.extend == "neither":
-            return
-
-        # Store extend information for later position updates
-        self._has_extend = True
-
-        # Calculate extend fraction relative to the axis position
-        extend_frac = self.extendfrac
-
-        # Adjust histogram position by shrinking it to leave space for extends
-        # This will be applied in _update_positions() method
-        pos = self.ax_hist.get_position()
-
-        if self.orientation == "vertical":
-            # Vertical: extends at top/bottom
-            total_height = pos.height
-
-            if self.extend == "both":
-                # Shrink from both sides
-                new_height = total_height * (1 - 2 * extend_frac)
-                new_y0 = pos.y0 + total_height * extend_frac
-                self.ax_hist.set_position((pos.x0, new_y0, pos.width, new_height))
-            elif self.extend == "min":
-                # Shrink from bottom
-                new_height = total_height * (1 - extend_frac)
-                new_y0 = pos.y0 + total_height * extend_frac
-                self.ax_hist.set_position((pos.x0, new_y0, pos.width, new_height))
-            elif self.extend == "max":
-                # Shrink from top
-                new_height = total_height * (1 - extend_frac)
-                self.ax_hist.set_position((pos.x0, pos.y0, pos.width, new_height))
-        else:
-            # Horizontal: extends at left/right
-            total_width = pos.width
-
-            if self.extend == "both":
-                # Shrink from both sides
-                new_width = total_width * (1 - 2 * extend_frac)
-                new_x0 = pos.x0 + total_width * extend_frac
-                self.ax_hist.set_position((new_x0, pos.y0, new_width, pos.height))
-            elif self.extend == "min":
-                # Shrink from left
-                new_width = total_width * (1 - extend_frac)
-                new_x0 = pos.x0 + total_width * extend_frac
-                self.ax_hist.set_position((new_x0, pos.y0, new_width, pos.height))
-            elif self.extend == "max":
-                # Shrink from right
-                new_width = total_width * (1 - extend_frac)
-                self.ax_hist.set_position((pos.x0, pos.y0, new_width, pos.height))
-
     def _create_hcb_axes(
         self,
         cax: Axes | None,
@@ -589,105 +868,26 @@ class HistColorbar:
         hide_spines(self.ax_cbar)
 
     def _draw_histogram(self) -> None:
-        """Draw the histogram using matplotlib's hist and recolor patches."""
-        # Remove NaN and infinite values
-        data_finite = self.data[np.isfinite(self.data)]
-
-        if len(data_finite) == 0:
-            msg = (
-                "No finite values in data. Unable to draw histogram. "
-                "Check your data for NaNs and infinities."
-            )
-            warnings.warn(msg, stacklevel=2)
-            logger.warning(msg)
-            return
-
-        # Determine histogram range robustly across norm types
-        boundaries = getattr(self.norm, "boundaries", None)
-        levels = getattr(self, "_levels", None)
-        if levels is not None and len(levels) >= 2:
-            vmin, vmax = float(np.min(levels)), float(np.max(levels))
-        elif boundaries is not None and len(boundaries) >= 2:
-            vmin, vmax = float(boundaries[0]), float(boundaries[-1])
-        else:
-            vmin = getattr(self.norm, "vmin", None)
-            vmax = getattr(self.norm, "vmax", None)
-            if vmin is None or vmax is None:
-                vmin, vmax = float(np.min(data_finite)), float(np.max(data_finite))
-
-        # Use matplotlib's hist to create histogram
-        hist_kwargs = {
-            "bins": self.hist_bins,
-            "range": (vmin, vmax),
-            "align": "mid",
-        }
-        self.hist_kwargs.update(hist_kwargs)
-
-        if self.hist_orientation == "horizontal":
-            # Vertical: histogram bars go horizontal
-            self.ax_hist.hist(data_finite, orientation="horizontal", **self.hist_kwargs)
-        else:
-            # Horizontal: histogram bars go vertical
-            self.ax_hist.hist(data_finite, orientation="vertical", **self.hist_kwargs)
-
-        # Compute color split positions
-        if levels is not None and len(levels) >= 2:
-            splitpos = np.asarray(levels, dtype=float)
-        elif boundaries is not None and len(boundaries) >= 2:
-            splitpos = np.asarray(boundaries, dtype=float)
-        else:
-            n = int(getattr(self.cmap, "N", 256))
-            t = np.linspace(0.0, 1.0, n + 1)
-            inv = getattr(self.norm, "inverse", None)
-            if callable(inv):
-                try:
-                    splitpos = np.asarray(inv(t), dtype=float)
-                except Exception:  # pragma: no cover - rare corner
-                    splitpos = np.linspace(vmin, vmax, n + 1)
-            else:
-                splitpos = np.linspace(vmin, vmax, n + 1)
-        # Trim histogram axes to remove extra space caused by extend triangles.
-        self._trim_hist_axes()
-
-        # Recolor histogram patches to match colorbar
-        self._recolor_histogram_patches(splitpos)
-
-        self._draw_hist_grid()
-
-        self.set_scale("log" if self.log else "linear")
-
-        if self.hist_orientation == "horizontal":
-            # Invert x-axis for mirroring
-            xlim = self.ax_hist.get_xlim()
-            self.ax_hist.set_xlim(xlim[1], self.min_count)
-            if self.location == "left":
-                self.ax_hist.invert_xaxis()
-        else:
-            # Invert y-axis for mirroring
-            ylim = self.ax_hist.get_ylim()
-            self.ax_hist.set_ylim(ylim[1], self.min_count)
-            if self.location == "bottom":
-                self.ax_hist.invert_yaxis()
-
-    def _draw_hist_grid(self) -> None:
-        """Draw grid on histogram axis."""
-        if self.hist_orientation == "horizontal":
-            # remove 0 from ticks of grid
-            self.ax_hist.grid(axis="x", which="major", **self.divider_style)
-
-            if self.location == "left":
-                spine = self.ax_hist.spines["left"]
-            else:
-                spine = self.ax_hist.spines["right"]
-        else:
-            self.ax_hist.grid(axis="y", which="major", **self.divider_style)
-            if self.location == "bottom":
-                spine = self.ax_hist.spines["bottom"]
-            else:
-                spine = self.ax_hist.spines["top"]
-        # Make the spine visible and apply style in the intersection of the spines
-        spine.set_visible(True)
-        plt.setp(spine, **self.divider_style)
+        """Draw the histogram using _Histogram class."""
+        # Create _Histogram instance which inherits from Colorbar
+        # This automatically handles extend triangles and axes positioning
+        self.hist = _Histogram(
+            ax=self.ax_hist,
+            data=self.data,
+            mappable=self._mappable,
+            orientation=self.orientation,
+            hist_bins=self.hist_bins,
+            hist_kwargs=self.hist_kwargs,
+            min_count=self.min_count,
+            scale="log" if self.log else "linear",
+            divider_style=self.divider_style,
+            location=self.location,
+            extend=self.extend,
+            extendfrac=self.extendfrac,
+            _levels=self._levels,
+            _level_facecolors=self._level_facecolors,
+            _effective_alpha=self._effective_alpha,
+        )
 
     @property
     def scale(self) -> Literal["linear", "log"]:
@@ -831,112 +1031,6 @@ class HistColorbar:
             logger.error(msg)
             raise ValueError(msg)
 
-    def _recolor_histogram_patches(self, splitpos: NDArray) -> None:
-        """Recolor histogram patches to match colorbar colors.
-
-        This method splits histogram bars that span multiple colors in the colorbar
-        and assigns the correct color to each segment.
-
-        Parameters
-        ----------
-        splitpos : NDArray
-            Positions where colors change in the colorbar.
-
-        """
-
-        # Helper to map a data value to an exact facecolor
-        def value_to_facecolor(val: float) -> tuple[float, float, float, float]:
-            # Prefer exact per-level facecolors from contourf if available
-            if (
-                getattr(self, "_level_facecolors", None) is not None
-                and getattr(self, "_levels", None) is not None
-            ):
-                levels = np.asarray(self._levels, dtype=float)
-                idx = int(
-                    np.clip(
-                        np.searchsorted(levels, val, side="right") - 1,
-                        0,
-                        len(levels) - 2,
-                    )
-                )
-                rgba = self._level_facecolors[idx]
-                # Apply effective alpha if provided
-                if self._effective_alpha is not None:
-                    return (
-                        float(rgba[0]),
-                        float(rgba[1]),
-                        float(rgba[2]),
-                        float(self._effective_alpha),
-                    )
-                return (
-                    float(rgba[0]),
-                    float(rgba[1]),
-                    float(rgba[2]),
-                    float(rgba[3] if len(rgba) == 4 else 1.0),
-                )
-            # Fallback: use the mappable's scalar mapping
-            return tuple(self._mappable.to_rgba(val, alpha=self._effective_alpha))  # type: ignore[return-value]
-
-        # Iterate over all patches (histogram bars)
-        for patch in list(self.ax_hist.patches):
-            patch = cast("Rectangle", patch)
-            if self.orientation == "vertical":
-                # For vertical orientation, bars are horizontal
-                minval = np.atleast_1d(patch.get_y())[0]
-                width = patch.get_width()
-                height = patch.get_height()
-                maxval = minval + height
-            else:
-                # For horizontal orientation, bars are vertical
-                minval = np.atleast_1d(patch.get_x())[0]
-                width = patch.get_width()
-                height = patch.get_height()
-                maxval = minval + width
-
-            # Find split positions within this bar
-            splitbins = [
-                minval,
-                *splitpos[(splitpos > minval) & (maxval > splitpos)],
-                maxval,
-            ]
-
-            # If bar spans multiple colors, split it
-            if len(splitbins) > 2:
-                patch.remove()
-                # Create sub-patches for each color segment
-                for b0, b1 in zip(splitbins[:-1], splitbins[1:]):
-                    center_val = (b0 + b1) / 2
-                    color = value_to_facecolor(center_val)
-
-                    if self.orientation == "vertical":
-                        # Horizontal bars
-                        pi = Rectangle(
-                            (0, b0),
-                            width,
-                            (b1 - b0),
-                            facecolor=color,
-                            linewidth=0,
-                            alpha=None,  # alpha is baked into color above
-                        )
-                    else:
-                        # Vertical bars
-                        pi = Rectangle(
-                            (b0, 0),
-                            (b1 - b0),
-                            height,
-                            facecolor=color,
-                            linewidth=0,
-                            alpha=None,
-                        )
-
-                    self.ax_hist.add_patch(pi)
-            else:  # Bar is within a single color
-                center_val = (minval + maxval) / 2
-                color = value_to_facecolor(center_val)
-
-                patch.set_facecolor(color)
-                patch.set_linewidth(0)
-
     def _apply_default_customizations(self) -> None:
         """Apply default custom ticks, labels, and formatting."""
         # Set colorbar and histogram labels
@@ -956,9 +1050,7 @@ class HistColorbar:
         self.set_hist_locator(NullLocator(), "minor")
         self.set_hist_formatter(NullFormatter(), "minor")
 
-        # set tick formatting of colorbar axis
-        self.set_cbar_locator(AutoLocator())
-        self.set_cbar_formatter(ScalarFormatter())
+        # ticks of colorbar axis are handled by Colorbar
 
     def _create_ghost_ticklabels(self) -> None:
         """Create invisible 'ghost' tick labels on container axes.
@@ -989,8 +1081,7 @@ class HistColorbar:
             self.ax.set_xlim(0, 1)  # Dummy x-axis
 
             # Set ticks at same data values as ax_cbar
-            self.ax.yaxis.set_ticks(tick_locs)
-            self.ax.yaxis.set_ticklabels(tick_labels)
+            self.ax.yaxis.set_ticks(tick_locs, tick_labels)
 
             # Configure tick location to match ax_cbar
             if self.location == "left":
@@ -1007,7 +1098,7 @@ class HistColorbar:
                 self.ax.tick_params(axis="y", labelright=True, right=False, length=0)
 
             # Hide x-axis completely
-            self.ax.xaxis.set_visible(False)
+            self.ax.xaxis.set_label_position("bottom")
 
         else:  # horizontal
             # Get tick information from ax_cbar
@@ -1040,7 +1131,7 @@ class HistColorbar:
                 self.ax.tick_params(axis="x", labeltop=True, top=False, length=0)
 
             # Hide y-axis completely
-            self.ax.yaxis.set_visible(False)
+            self.ax.yaxis.set_label_position("left")
 
         # Setup callback to hide ghost labels after layout
         self._setup_ghost_label_hiding()
@@ -1066,14 +1157,10 @@ class HistColorbar:
             self._ghost_labels_hidden = True
 
             # Hide tick labels on container axes
-            if self.orientation == "vertical":
-                # Hide y-axis tick labels
-                for label in self.ax.yaxis.get_ticklabels():
-                    label.set_alpha(0)
-            else:
-                # Hide x-axis tick labels
-                for label in self.ax.xaxis.get_ticklabels():
-                    label.set_alpha(0)
+            for label in self.ax.yaxis.get_ticklabels():
+                label.set_alpha(0)
+            for label in self.ax.xaxis.get_ticklabels():
+                label.set_alpha(0)
 
         # Connect to draw event - this runs after layout but before render
         if hasattr(self.fig.canvas, "mpl_connect"):
