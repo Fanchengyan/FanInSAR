@@ -33,7 +33,7 @@ from typing_extensions import Literal
 
 from faninsar.logging import setup_logger
 
-logger = setup_logger(__name__)
+logger = setup_logger(log_name=__name__)
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -122,7 +122,6 @@ class _Histogram(Colorbar):
     def _draw_all(self) -> None:
         """Override Colorbar._draw_all to preserve histogram count axis.
 
-        This is a modified copy of matplotlib's Colorbar._draw_all() method.
         The main change is that we DON'T call set_xlim(0,1) or set_ylim(0,1)
         for the histogram count axis, preserving the actual histogram range.
         """
@@ -135,7 +134,7 @@ class _Histogram(Colorbar):
         # Compute the X/Y mesh
         self._mesh()
 
-        # Draw the extend triangles, and shrink the inner Axes to accommodate
+        # Draw the extend triangles, and hide them
         self._do_extends()
         self.hide_triangles()
 
@@ -151,10 +150,7 @@ class _Histogram(Colorbar):
         else:
             self.ax.set_xlim(lower, upper)
 
-        # Set up the tick locators and formatters
-        # self.update_ticks()
-
-        # Draw the histogram (instead of calling _add_solids with mesh)
+        # Draw the histogram
         self._add_solids()
 
         # Apply histogram-specific styling
@@ -830,8 +826,6 @@ class HistColorbar:
             The colorbar and histogram axes.
 
         """
-        hide_axis_elements(parent_ax)
-
         # Create axes using appropriate method based on parent_ax type
         parent_subplotspec = parent_ax.get_subplotspec()
         if parent_subplotspec is not None:
@@ -1049,8 +1043,7 @@ class HistColorbar:
         # Turn off minor ticks
         self.set_hist_locator(NullLocator(), "minor")
         self.set_hist_formatter(NullFormatter(), "minor")
-
-        # ticks of colorbar axis are handled by Colorbar
+        # ticks of colorbar axis are handled by Colorbar, no action needed
 
     def _create_ghost_ticklabels(self) -> None:
         """Create invisible 'ghost' tick labels on container axes.
@@ -1065,25 +1058,33 @@ class HistColorbar:
         This elegant approach lets constrained_layout calculate proper spacing
         while keeping our actual rendering unchanged.
         """
+        hide_axis_elements(self.ax)
         # Configure container axes to match ax_cbar's tick system
-        # This is about tick "location" not physical position
-
         if self.orientation == "vertical":
             # Get tick information from ax_cbar
-            tick_locs = self.ax_cbar.yaxis.get_ticklocs()
-            tick_labels = [
+            ytick_locs = self.ax_cbar.yaxis.get_ticklocs()
+            ytick_labels = [
                 label.get_text() for label in self.ax_cbar.yaxis.get_ticklabels()
+            ]
+            xtick_locs = self.ax_hist.xaxis.get_ticklocs()
+            xtick_labels = [
+                label.get_text() for label in self.ax_hist.xaxis.get_ticklabels()
             ]
 
             # Set container axes limits to match colorbar data range
             ylim = self.ax_cbar.get_ylim()
+            xlim = self.ax_hist.get_xlim()
             self.ax.set_ylim(ylim[0], ylim[1])
-            self.ax.set_xlim(0, 1)  # Dummy x-axis
+            self.ax.set_xlim(xlim[0], xlim[1])
 
-            # Set ticks at same data values as ax_cbar
-            self.ax.yaxis.set_ticks(tick_locs, tick_labels)
+            # Set ticks at same data values as ax_cbar and histogram
+            self.ax.yaxis.set_ticks(ytick_locs, ytick_labels)
+            self.ax.xaxis.set_ticks(xtick_locs, xtick_labels)
 
-            # Configure tick location to match ax_cbar
+            # Configure tick location to match ax_cbar and ax_hist
+            self.ax.xaxis.tick_bottom()
+            self.ax.xaxis.set_label_position("bottom")
+            self.ax.tick_params(axis="x", labelbottom=True, bottom=False, length=0)
             if self.location == "left":
                 self.ax.yaxis.tick_left()
                 self.ax.yaxis.set_label_position("left")
@@ -1096,27 +1097,31 @@ class HistColorbar:
                 # Re-enable tick labels after hide_tick_labels was called
                 # But hide the tick marks themselves (length=0)
                 self.ax.tick_params(axis="y", labelright=True, right=False, length=0)
-
-            # Hide x-axis completely
-            self.ax.xaxis.set_label_position("bottom")
-
         else:  # horizontal
             # Get tick information from ax_cbar
-            tick_locs = self.ax_cbar.xaxis.get_ticklocs()
-            tick_labels = [
+            xtick_locs = self.ax_cbar.xaxis.get_ticklocs()
+            xtick_labels = [
                 label.get_text() for label in self.ax_cbar.xaxis.get_ticklabels()
+            ]
+            ytick_locs = self.ax_hist.yaxis.get_ticklocs()
+            ytick_labels = [
+                label.get_text() for label in self.ax_hist.yaxis.get_ticklabels()
             ]
 
             # Set container axes limits to match colorbar data range
             xlim = self.ax_cbar.get_xlim()
+            ylim = self.ax_hist.get_ylim()
             self.ax.set_xlim(xlim[0], xlim[1])
-            self.ax.set_ylim(0, 1)  # Dummy y-axis
+            self.ax.set_ylim(ylim[0], ylim[1])
 
             # Set ticks at same data values as ax_cbar
-            self.ax.xaxis.set_ticks(tick_locs)
-            self.ax.xaxis.set_ticklabels(tick_labels)
+            self.ax.xaxis.set_ticks(xtick_locs, xtick_labels)
+            self.ax.yaxis.set_ticks(ytick_locs, ytick_labels)
 
             # Configure tick location to match ax_cbar
+            self.ax.yaxis.tick_left()
+            self.ax.yaxis.set_label_position("left")
+            self.ax.tick_params(axis="y", labelleft=True, left=False, length=0)
             if self.location == "bottom":
                 self.ax.xaxis.tick_bottom()
                 self.ax.xaxis.set_label_position("bottom")
@@ -1130,41 +1135,11 @@ class HistColorbar:
                 # But hide the tick marks themselves (length=0)
                 self.ax.tick_params(axis="x", labeltop=True, top=False, length=0)
 
-            # Hide y-axis completely
-            self.ax.yaxis.set_label_position("left")
-
-        # Setup callback to hide ghost labels after layout
-        self._setup_ghost_label_hiding()
-
-    def _setup_ghost_label_hiding(self) -> None:
-        """Set up callback to hide ghost labels after layout calculation.
-
-        The ghost labels need to be visible during constrained_layout's calculation
-        phase, but must be hidden during actual rendering to avoid duplication.
-
-        Strategy: Use a draw_event callback that runs AFTER layout but BEFORE render.
-        The callback should only hide labels after the FIRST draw (when layout is done).
-        """
-        # Track if we've already hidden the labels
-        self._ghost_labels_hidden = False
-
-        def hide_ghost_labels(event) -> None:  # noqa: ANN001, ARG001
-            """Hide the ghost tick labels on container axes after first draw."""
-            # Only hide after the first draw (when constrained_layout has calculated)
-            if self._ghost_labels_hidden:
-                return
-
-            self._ghost_labels_hidden = True
-
-            # Hide tick labels on container axes
-            for label in self.ax.yaxis.get_ticklabels():
-                label.set_alpha(0)
-            for label in self.ax.xaxis.get_ticklabels():
-                label.set_alpha(0)
-
-        # Connect to draw event - this runs after layout but before render
-        if hasattr(self.fig.canvas, "mpl_connect"):
-            self.fig.canvas.mpl_connect("draw_event", hide_ghost_labels)
+        # Hide tick labels on container axes
+        for label in self.ax.yaxis.get_ticklabels():
+            label.set_alpha(0)
+        for label in self.ax.xaxis.get_ticklabels():
+            label.set_alpha(0)
 
     def cbar_tick_params(
         self,
