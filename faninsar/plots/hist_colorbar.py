@@ -9,7 +9,7 @@ https://github.com/raphaelquast/EOmaps
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Any, Iterable, cast
+from typing import TYPE_CHECKING, Any, Iterable
 
 import matplotlib as mpl
 import matplotlib.colorbar as cbar
@@ -68,10 +68,6 @@ class _Histogram(Colorbar):
         The mappable object for norm and cmap.
     orientation : str
         The orientation of the histogram ('horizontal' or 'vertical').
-    hist_bins : int | NDArray
-        Number of histogram bins or bin edges.
-    hist_kwargs : dict
-        Additional kwargs for matplotlib's hist function.
     min_count : float
         Minimum count value for the histogram axis.
     scale : str
@@ -88,11 +84,9 @@ class _Histogram(Colorbar):
     def __init__(
         self,
         ax: Axes,
-        data: ArrayLike,
+        data: NDArray,
         mappable: ScalarMappable,
         orientation: Literal["vertical", "horizontal"],
-        hist_bins: int | NDArray,
-        hist_kwargs: dict,
         min_count: float,
         scale: Literal["linear", "log"],
         divider_style: dict[str, Any],
@@ -100,9 +94,7 @@ class _Histogram(Colorbar):
         **kwargs: Any,
     ) -> None:
         # Store histogram-specific parameters before calling super().__init__
-        self._data = np.asanyarray(data).flatten()
-        self._hist_bins = hist_bins
-        self._hist_kwargs = hist_kwargs
+        self._data = data
         self._min_count = min_count
         self._scale = scale
         self._divider_style = divider_style
@@ -110,11 +102,6 @@ class _Histogram(Colorbar):
         self._hist_orientation = (
             "horizontal" if orientation == "vertical" else "vertical"
         )
-
-        # Get levels and facecolors from parent HistColorbar for color matching
-        self._levels = kwargs.pop("_levels", None)
-        self._level_facecolors = kwargs.pop("_level_facecolors", None)
-        self._effective_alpha = kwargs.pop("_effective_alpha", None)
 
         # Initialize Colorbar - this sets up extend triangles and axes locator
         super().__init__(ax, mappable=mappable, orientation=orientation, **kwargs)
@@ -150,7 +137,6 @@ class _Histogram(Colorbar):
         else:
             self.ax.set_xlim(lower, upper)
 
-        # Draw the histogram
         self._add_solids()
 
         # Apply histogram-specific styling
@@ -167,7 +153,7 @@ class _Histogram(Colorbar):
 
         This method draws the histogram bars instead of the colorbar's
         pcolormesh gradient. Since we control _draw_all(), we don't need
-        the X, Y, C parameters that the parent Colorbar passes.
+        the X,Y,C parameters that the parent Colorbar passes.
         """
         # Clean up any previous histogram patches
         if self.solids is not None:
@@ -189,153 +175,31 @@ class _Histogram(Colorbar):
             logger.warning(msg)
             return
 
-        # Determine histogram range from norm boundaries
-        boundaries = getattr(self.norm, "boundaries", None)
-        levels = self._levels
-        if levels is not None and len(levels) >= 2:
-            vmin, vmax = float(np.min(levels)), float(np.max(levels))
-        elif boundaries is not None and len(boundaries) >= 2:
-            vmin, vmax = float(boundaries[0]), float(boundaries[-1])
-        else:
-            vmin = getattr(self.norm, "vmin", None)
-            vmax = getattr(self.norm, "vmax", None)
-            if vmin is None or vmax is None:
-                vmin, vmax = float(np.min(data_finite)), float(np.max(data_finite))
+        ind = np.arange(len(self._values))
+        if self._extend_lower():
+            ind = ind[1:]
+        if self._extend_upper():
+            ind = ind[:-1]
+        bin_centers = self._values[ind]
 
-        # Create histogram using matplotlib's hist
-        hist_kwargs = {
-            "bins": self._hist_bins,
-            "range": (vmin, vmax),
-            "align": "mid",
-        }
-        hist_kwargs.update(self._hist_kwargs)
+        hist, bin_edges = np.histogram(data_finite, bins=self._y)
 
-        if self._hist_orientation == "horizontal":
-            self.ax.hist(data_finite, orientation="horizontal", **hist_kwargs)
-        else:
-            self.ax.hist(data_finite, orientation="vertical", **hist_kwargs)
-
-        # Compute color split positions for recoloring patches
-        if levels is not None and len(levels) >= 2:
-            splitpos = np.asarray(levels, dtype=float)
-        elif boundaries is not None and len(boundaries) >= 2:
-            splitpos = np.asarray(boundaries, dtype=float)
-        else:
-            n = int(getattr(self.cmap, "N", 256))
-            t = np.linspace(0.0, 1.0, n + 1)
-            inv = getattr(self.norm, "inverse", None)
-            if callable(inv):
-                try:
-                    splitpos = np.asarray(inv(t), dtype=float)
-                except Exception:
-                    splitpos = np.linspace(vmin, vmax, n + 1)
-            else:
-                splitpos = np.linspace(vmin, vmax, n + 1)
-
-        # Recolor histogram patches to match colorbar
-        self._recolor_histogram_patches(splitpos)
-
-    def _recolor_histogram_patches(self, splitpos: NDArray) -> None:
-        """Recolor histogram patches to match colorbar colors.
-
-        Parameters
-        ----------
-        splitpos : NDArray
-            Positions where colors change in the colorbar.
-
-        """
-
-        def value_to_facecolor(val: float) -> tuple[float, float, float, float]:
-            """Map a data value to a facecolor."""
-            # Prefer exact per-level facecolors from contourf if available
-            if self._level_facecolors is not None and self._levels is not None:
-                levels = np.asarray(self._levels, dtype=float)
-                idx = int(
-                    np.clip(
-                        np.searchsorted(levels, val, side="right") - 1,
-                        0,
-                        len(levels) - 2,
-                    )
-                )
-                rgba = self._level_facecolors[idx]
-                if self._effective_alpha is not None:
-                    return (
-                        float(rgba[0]),
-                        float(rgba[1]),
-                        float(rgba[2]),
-                        float(self._effective_alpha),
-                    )
-                return (
-                    float(rgba[0]),
-                    float(rgba[1]),
-                    float(rgba[2]),
-                    float(rgba[3] if len(rgba) == 4 else 1.0),
-                )
-            # Fallback: use the mappable's scalar mapping
-            return tuple(self.mappable.to_rgba(val, alpha=self._effective_alpha))  # type: ignore[return-value]
-
-        # Iterate over all patches (histogram bars)
-        for patch in list(self.ax.patches):
-            # Skip non-Rectangle patches (e.g., extend triangles)
-            if not isinstance(patch, Rectangle):
-                continue
-
-            patch = cast("Rectangle", patch)
+        for i in range(len(hist)):
+            patch_kwargs = {
+                "facecolor": self.cmap(self.norm(bin_centers[i])),
+                "linewidth": 0,
+                "alpha": self.alpha,
+            }
             if self.orientation == "vertical":
-                # For vertical colorbar, histogram bars are horizontal
-                minval = np.atleast_1d(patch.get_y())[0]
-                width = patch.get_width()
-                height = patch.get_height()
-                maxval = minval + height
+                width = hist[i]
+                b0, b1 = bin_edges[i], bin_edges[i + 1]
+                pi = Rectangle((0, b0), width, (b1 - b0), **patch_kwargs)
             else:
-                # For horizontal colorbar, histogram bars are vertical
-                minval = np.atleast_1d(patch.get_x())[0]
-                width = patch.get_width()
-                height = patch.get_height()
-                maxval = minval + width
-
-            # Find split positions within this bar
-            splitbins = [
-                minval,
-                *splitpos[(splitpos > minval) & (maxval > splitpos)],
-                maxval,
-            ]
-
-            # If bar spans multiple colors, split it
-            if len(splitbins) > 2:
-                patch.remove()
-                # Create sub-patches for each color segment
-                for b0, b1 in zip(splitbins[:-1], splitbins[1:]):
-                    center_val = (b0 + b1) / 2
-                    color = value_to_facecolor(center_val)
-
-                    if self.orientation == "vertical":
-                        # Horizontal bars
-                        pi = Rectangle(
-                            (0, b0),
-                            width,
-                            (b1 - b0),
-                            facecolor=color,
-                            linewidth=0,
-                            alpha=None,
-                        )
-                    else:
-                        # Vertical bars
-                        pi = Rectangle(
-                            (b0, 0),
-                            (b1 - b0),
-                            height,
-                            facecolor=color,
-                            linewidth=0,
-                            alpha=None,
-                        )
-
-                    self.ax.add_patch(pi)
-            else:  # Bar is within a single color
-                center_val = (minval + maxval) / 2
-                color = value_to_facecolor(center_val)
-                patch.set_facecolor(color)
-                patch.set_linewidth(0)
+                height = hist[i]
+                b0, b1 = bin_edges[i], bin_edges[i + 1]
+                pi = Rectangle((b0, 0), (b1 - b0), height, **patch_kwargs)
+            # Add patch to axes
+            self.ax.add_patch(pi)
 
     def _apply_histogram_styling(self) -> None:
         """Apply histogram-specific styling."""
@@ -349,6 +213,7 @@ class _Histogram(Colorbar):
         # Draw grid on histogram axis
         if self._hist_orientation == "horizontal":
             self.ax.grid(axis="x", which="major", **self._divider_style)
+            self.ax.tick_params(labelbottom=True, bottom=False)
             spine = (
                 self.ax.spines["left"]
                 if self._location == "left"
@@ -356,6 +221,7 @@ class _Histogram(Colorbar):
             )
         else:
             self.ax.grid(axis="y", which="major", **self._divider_style)
+            self.ax.tick_params(labelleft=True, left=False)
             spine = (
                 self.ax.spines["bottom"]
                 if self._location == "bottom"
@@ -368,14 +234,16 @@ class _Histogram(Colorbar):
 
         # Apply min_count and axis inversion
         if self._hist_orientation == "horizontal":
-            xlim = self.ax.get_xlim()
-            self.ax.set_xlim(xlim[1], self._min_count)
-            if self._location == "left":
+            self.ax.autoscale(enable=True, axis="x")
+            lim = self._min_count, self.ax.get_xlim()[1]
+            self.ax.set_xlim(lim)
+            if self._location == "right":
                 self.ax.invert_xaxis()
         else:
-            ylim = self.ax.get_ylim()
-            self.ax.set_ylim(ylim[1], self._min_count)
-            if self._location == "bottom":
+            self.ax.autoscale(enable=True, axis="y")
+            lim = self._min_count, self.ax.get_ylim()[1]
+            self.ax.set_ylim(lim)
+            if self._location == "top":
                 self.ax.invert_yaxis()
 
 
@@ -411,8 +279,6 @@ class HistColorbar:
         (vertical colorbars on the right, horizontal ones at the bottom).
     orientation : {'vertical', 'horizontal'} or None, optional
         Orientation of the colorbar. If None, determined from location.
-    aspect : float, default 5
-        Ratio of long to short dimensions of colorbar.
     fraction : float, default 0.2
         Fraction of original Axes to use for colorbar.
     hist_fraction : float, default 0.85
@@ -421,8 +287,6 @@ class HistColorbar:
     pad : float or None, optional
         Fraction of original Axes between colorbar and new image Axes.
         If None, defaults to 0.05 for vertical, 0.15 for horizontal.
-    alpha : float or None, optional
-        Alpha transparency value for the histogram patches (0-1).
     shrink : float, default 1.0
         Fraction by which to multiply the size of the colorbar relative to the
         parent axes. Similar to matplotlib's colorbar shrink parameter.
@@ -432,6 +296,10 @@ class HistColorbar:
         methods.
     extendfrac : float, default 0.025
         Fraction of the colorbar length to use for the extension triangles.
+    ticks : array-like or Locator, optional
+        Tick locations. If None, use the default tick locations.
+    outline : bool, default False
+        If True, show the outline of the colorbar axes.
     cmap : str or Colormap or None, optional
         Colormap to use. Required if mappable is None.
     norm : Normalize or BoundaryNorm or None, optional
@@ -448,18 +316,12 @@ class HistColorbar:
         Label for the histogram axis. For vertical orientation, this appears
         on the x-axis (count axis). For horizontal orientation, this appears
         on the y-axis (count axis).
-    hist_bins : int or array-like or 'auto', default 'auto'
-        Number of histogram bins or bin edges. If 'auto', will match the number
-        of levels in the colorbar if using BoundaryNorm, otherwise uses 100 bins
-        for continuous colormaps.
     divider_style : dict or None, optional
         Style for the divider line between the colorbar and histogram. If None,
         uses a gray dashed line
         (e.g. `{"color": "0.35", "linestyle": (0, (5, 5)), "linewidth": 1}`).
     cbar_kwargs : dict or None, optional
         Additional keyword arguments to pass to :class:`matplotlib.colorbar.Colorbar`.
-    hist_kwargs : dict or None, optional
-        Additional keyword arguments to pass to :func:`matplotlib.pyplot.hist`.
 
     Notes
     -----
@@ -474,6 +336,8 @@ class HistColorbar:
 
     Attributes
     ----------
+    fig : Figure or SubFigure
+        The figure containing the HistColorbar.
     ax : Axes
         The parent axes containing the colorbar and histogram.
     ax_cbar : Axes
@@ -495,50 +359,47 @@ class HistColorbar:
     _hist_formatter: Formatter
     _min_count: float
     _scale: Literal["linear", "log"]
-    _has_extend: bool
     _parent_ax: Axes | None
 
     def __init__(
         self,
         data: ArrayLike,
         mappable: ScalarMappable | None = None,
+        *,
         cax: Axes | None = None,
         ax: Axes | NDArray | Iterable[Axes] | None = None,
         use_gridspec: bool = True,
         location: Literal["left", "right", "top", "bottom"] | None = None,
         orientation: Literal["vertical", "horizontal"] | None = None,
-        aspect: float = 5,
         fraction: float = 0.2,
         hist_fraction: float = 0.85,
         pad: float | None = None,
-        alpha: float | None = None,
         shrink: float = 1.0,
         extend: Literal["neither", "both", "min", "max"] = "neither",
         extendfrac: float = 0.025,
+        ticks: ArrayLike | Locator | None = None,
+        outline: bool = False,
         cmap: str | colors.Colormap | None = None,
         norm: colors.Normalize | colors.BoundaryNorm | None = None,
         log: bool = False,
         min_count: float | Literal["auto"] = "auto",
         label: str | None = None,
         hist_label: str | None = None,
-        hist_bins: int | NDArray | Literal["auto"] = "auto",
         divider_style: dict[str, Any] | None = None,
         cbar_kwargs: dict | None = None,
-        hist_kwargs: dict | None = None,
     ) -> None:
         """Initialize the HistColorbar object."""
         # Save current axes to restore later
         current_ax = plt.gca() if plt.get_fignums() else None
 
         # Initialize internal state variables
-        self._has_extend = False
         self._parent_ax = None
 
         self.data = np.asanyarray(data).flatten()
         self.location, self.orientation = _determine_location_orientation(
             location, orientation
         )
-        self.aspect = aspect
+        self.aspect = 1 / fraction
         self.fraction = fraction
         self.hist_fraction = hist_fraction
         # Set default pad based on orientation
@@ -546,10 +407,10 @@ class HistColorbar:
             self.pad = 0.15 if self.orientation == "horizontal" else 0.05
         else:
             self.pad = pad
-        self.alpha = alpha
         self.shrink = shrink
         self.extend = extend
         self.extendfrac = extendfrac
+        self.outline = outline
         self.log = log
         self._min_count_origin = min_count
         # Initialize scale and min_count
@@ -568,37 +429,15 @@ class HistColorbar:
                 "linewidth": 1,
             }
         )
-        self.hist_kwargs = hist_kwargs if hist_kwargs is not None else {}
         self.cbar_kwargs = cbar_kwargs if cbar_kwargs is not None else {}
 
-        # parse colormap and normalization FIRST (before hist_bins)
+        # parse colormap and normalization
         if mappable is not None:
             # Support both ScalarMappable and ContourSet-like objects
             get_cmap = getattr(mappable, "get_cmap", None)
             self.cmap = get_cmap() if callable(get_cmap) else mappable.cmap
             self.norm = mappable.norm
-            # Capture levels if available (e.g., contourf/contour)
-            self._levels = getattr(mappable, "levels", None)
-            self._mappable = mappable
-
-            # If the mappable comes from contourf with explicit colors,
-            # capture per-level facecolors so we can exactly match them.
-            self._level_facecolors = None
-            try:
-                # QuadContourSet itself IS a Collection with get_facecolors()
-                # returning an (N, 4) array for N contour regions
-                if self._levels is not None and hasattr(mappable, "get_facecolors"):
-                    fcs_array = mappable.get_facecolors()
-                    if fcs_array is not None and len(fcs_array) > 0:
-                        # fcs_array should be shape (n_levels-1, 4) for RGBA
-                        expected_count = len(self._levels) - 1
-                        if len(fcs_array) >= expected_count:
-                            # Take the first expected_count colors
-                            fcs_array = fcs_array[:expected_count]
-                            self._level_facecolors = np.asarray(fcs_array, dtype=float)
-            except Exception:
-                # Best-effort only; fall back to colormap mapping
-                self._level_facecolors = None
+            self.mappable = mappable
         else:
             if cmap is None:
                 msg = "Either mappable or cmap must be provided"
@@ -608,21 +447,12 @@ class HistColorbar:
 
             # Create normalization
             if norm is None:
-                data_finite = data[np.isfinite(data)]
+                data_finite = self.data[np.isfinite(self.data)]
                 vmin, vmax = data_finite.min(), data_finite.max()
                 self.norm = colors.Normalize(vmin=vmin, vmax=vmax)
             else:
                 self.norm = norm
-            self._levels = None
-
-            # ScalarMappable for consistent RGBA mapping
-            self._mappable = cm.ScalarMappable(norm=self.norm, cmap=self.cmap)
-
-        # Resolve effective alpha: prefer explicit alpha, else artist's scalar alpha
-        self._effective_alpha = self._resolve_effective_alpha()
-
-        # Auto-detect histogram bins from norm if 'auto' (AFTER norm is set)
-        self.hist_bins = self._determine_hist_bins(hist_bins)
+            self.mappable = cm.ScalarMappable(norm=self.norm, cmap=self.cmap)
 
         # parse cax and ax
         if ax is None:
@@ -651,10 +481,17 @@ class HistColorbar:
         self._draw_histogram()
 
         # Apply customizations
-        self._apply_default_customizations()
+        self._apply_default_ticks_and_labels()
 
         # Create ghost tick labels on container axes for constrained_layout
         self._create_ghost_ticklabels()
+
+        if ticks is not None:
+            if isinstance(ticks, Locator):
+                self.set_cbar_locator(ticks)
+            else:
+                ticks = np.asarray(ticks)
+                self.set_cbar_ticks(ticks)
 
         # Restore original current axes
         if current_ax is not None and current_ax in self.fig.axes:
@@ -664,85 +501,6 @@ class HistColorbar:
     def hist_orientation(self) -> Literal["vertical", "horizontal"]:
         """Orientation of the histogram."""
         return "vertical" if self.orientation == "horizontal" else "horizontal"
-
-    def _resolve_effective_alpha(self) -> float | None:
-        """Resolve the alpha to use for both histogram patches and colorbar.
-
-        Preference order:
-        1) Explicit ``alpha`` passed to HistColorbar
-        2) Scalar alpha on the provided mappable/artist (e.g., imshow(alpha=0.5))
-        3) None (fall back to colormap's own alpha per color)
-
-        Array-like alpha on the artist is not supported and will be ignored.
-        """
-        # 1) explicit alpha
-        if self.alpha is not None:
-            try:
-                return float(np.clip(float(self.alpha), 0.0, 1.0))
-            except Exception:  # pragma: no cover - defensive
-                return self.alpha  # type: ignore[return-value]
-
-        # 2) artist alpha if available
-        artist_alpha: Any | None = None
-        get_alpha = getattr(self._mappable, "get_alpha", None)
-        if callable(get_alpha):
-            try:
-                artist_alpha = get_alpha()
-            except Exception:  # pragma: no cover - defensive
-                artist_alpha = None
-        if artist_alpha is None:
-            artist_alpha = getattr(self._mappable, "alpha", None)
-
-        if artist_alpha is None:
-            return None
-
-        # If array-like alpha, we cannot represent it uniformly; ignore
-        try:
-            if np.isscalar(artist_alpha):
-                return float(np.clip(float(artist_alpha), 0.0, 1.0))
-        except Exception:  # pragma: no cover - defensive
-            pass
-
-        warnings.warn(
-            (
-                "Array-like alpha on the mappable is not supported by HistColorbar; "
-                "using colormap alpha."
-            ),
-            stacklevel=2,
-        )
-        return None
-
-    def _determine_hist_bins(
-        self, hist_bins: int | NDArray | Literal["auto"]
-    ) -> int | NDArray:
-        """Determine the number of histogram bins.
-
-        If hist_bins is 'auto', will match the number of levels in the colorbar
-        if using BoundaryNorm, otherwise uses 100 bins for continuous colormaps.
-
-        Parameters
-        ----------
-        hist_bins : BinsType
-            The histogram bins specification.
-
-        Returns
-        -------
-        int | NDArray
-            The determined number of bins or bin edges.
-
-        """
-        if isinstance(hist_bins, str) and hist_bins == "auto":
-            # Prefer explicit contour levels if available
-            levels = getattr(self, "_levels", None)
-            if levels is not None:
-                return max(1, len(levels) - 1)
-            # Check if norm is BoundaryNorm (discrete levels)
-            if hasattr(self.norm, "boundaries"):
-                # BoundaryNorm has discrete levels
-                return max(1, len(self.norm.boundaries) - 1)
-            # Continuous colormap, use fine binning
-            return 100
-        return hist_bins
 
     def _create_hcb_axes(
         self,
@@ -764,13 +522,12 @@ class HistColorbar:
         # create kwargs for HistColorbar axes
         kwargs = self.cbar_kwargs.copy()
         kwargs.update(
-            mappable=self._mappable,
+            mappable=self.mappable,
             location=self.location,
             orientation=None,  # location is enough
             aspect=self.aspect,
             fraction=self.fraction,
             pad=self.pad,
-            # Do NOT pass alpha to Colorbar; handle alpha explicitly on solids
             shrink=self.shrink,
             extend=self.extend,
             extendfrac=self.extendfrac,
@@ -853,35 +610,171 @@ class HistColorbar:
 
     def _draw_colorbar(self, **kwargs) -> None:
         """Draw the colorbar."""
-        # Ensure we don't accidentally forward unsupported args like 'alpha'
-        if "alpha" in kwargs:
-            kwargs.pop("alpha", None)
         self.cbar = Colorbar(self.ax_cbar, **kwargs)
-        if self._effective_alpha is not None and hasattr(self.cbar, "solids"):
-            self.cbar.solids.set_alpha(self._effective_alpha)
         hide_spines(self.ax_cbar)
+        if self.outline:
+            self._extend_cid1 = self.ax_cbar.callbacks.connect(
+                "xlim_changed", self._show_cbar_outline
+            )
+            self._extend_cid2 = self.ax_cbar.callbacks.connect(
+                "ylim_changed", self._show_cbar_outline
+            )
 
     def _draw_histogram(self) -> None:
         """Draw the histogram using _Histogram class."""
         # Create _Histogram instance which inherits from Colorbar
-        # This automatically handles extend triangles and axes positioning
+        # This automatically handles extend triangles and positioning
         self.hist = _Histogram(
             ax=self.ax_hist,
             data=self.data,
-            mappable=self._mappable,
+            mappable=self.mappable,
             orientation=self.orientation,
-            hist_bins=self.hist_bins,
-            hist_kwargs=self.hist_kwargs,
             min_count=self.min_count,
             scale="log" if self.log else "linear",
             divider_style=self.divider_style,
             location=self.location,
             extend=self.extend,
             extendfrac=self.extendfrac,
-            _levels=self._levels,
-            _level_facecolors=self._level_facecolors,
-            _effective_alpha=self._effective_alpha,
         )
+        if self.outline:
+            self._show_hist_outline()
+
+    def _show_cbar_outline(self, ax: Axes | None = None) -> None:
+        """Show the outline of the colorbar axes."""
+        if self.orientation == "horizontal":
+            loc_hide = "bottom" if self.location == "top" else "top"
+        else:
+            loc_hide = "left" if self.location == "right" else "right"
+        locs = {"left", "right", "top", "bottom"} - {loc_hide}
+        for loc in locs:
+            ax.spines[loc].set_visible(True)
+        # Make extend triangles outline visible
+        for patch in self.cbar._extend_patches:
+            patch.set_edgecolor(plt.rcParams["axes.edgecolor"])
+            patch.set_linewidth(plt.rcParams["axes.linewidth"])
+            patch.set_antialiased(True)
+
+    def _show_hist_outline(self) -> None:
+        """Show the outline of the histogram axes."""
+        locs = {"left", "right", "top", "bottom"}
+        for loc in locs:
+            self.ax_hist.spines[loc].set_visible(True)
+
+    def _apply_default_ticks_and_labels(self) -> None:
+        """Apply default custom ticks, labels, and formatting."""
+        # Set colorbar and histogram labels
+        if self.label is not None:
+            self.set_cbar_label(self.label)
+        if self.hist_label is not None:
+            self.set_hist_label(self.hist_label)
+
+        # Set tick formatting of histogram axis
+        if self.log:
+            self.set_hist_locator(LogLocator())
+            self.set_hist_formatter(LogFormatterSciNotation())
+        else:
+            self.set_hist_locator(AutoLocator())
+            self.set_hist_formatter(ScalarFormatter())
+        # Turn off minor ticks
+        self.set_hist_locator(NullLocator(), "minor")
+        self.set_hist_formatter(NullFormatter(), "minor")
+        # ticks of colorbar axis are handled by Colorbar, no action needed
+
+    def _create_ghost_ticklabels(self) -> None:
+        """Create invisible 'ghost' tick labels on container axes.
+
+        This is the KEY solution for layout compatibility:
+        1. Configure container axes to have same tick locations as ax_cbar/ax_hist
+        2. Set tick label location (left/right/top/bottom) to match ax_cbar/ax_hist
+        3. Make ghost labels invisible
+        4. The actual visible labels remain on ax_cbar/ax_hist where they belong
+
+        This elegant approach lets constrained_layout calculate proper spacing
+        while keeping our actual rendering unchanged.
+        """
+        hide_axis_elements(self.ax)
+        # Configure container axes to match tick/label system of hist and cbar
+        if self.orientation == "vertical":
+            # Get tick/label information from ax_cbar and ax_hist
+            ytick_locs = self.ax_cbar.yaxis.get_ticklocs()
+            ytick_labels = [
+                label.get_text() for label in self.ax_cbar.yaxis.get_ticklabels()
+            ]
+            xtick_locs = self.ax_hist.xaxis.get_ticklocs()
+            xtick_labels = [
+                label.get_text() for label in self.ax_hist.xaxis.get_ticklabels()
+            ]
+            # Set ticks/labels at same data values as ax_cbar and histogram
+            self.ax.yaxis.set_ticks(ytick_locs, ytick_labels)
+            self.ax.xaxis.set_ticks(xtick_locs, xtick_labels)
+
+            # Set label text to match ax_cbar and ax_hist
+            xlabel = self.ax_hist.get_xlabel()
+            ylabel = self.ax_cbar.get_ylabel()
+            self.ax.set_xlabel(xlabel, alpha=0)
+            self.ax.set_ylabel(ylabel, alpha=0)
+
+            # Set container axes limits to match colorbar data range
+            ylim = self.ax_cbar.get_ylim()
+            xlim = self.ax_hist.get_xlim()
+            self.ax.set_ylim(ylim[0], ylim[1])
+            self.ax.set_xlim(xlim[0], xlim[1])
+
+            # Configure tick location to match ax_cbar and ax_hist
+            self.ax.xaxis.tick_bottom()
+            self.ax.xaxis.set_label_position("bottom")
+            self.ax.tick_params(axis="x", labelbottom=True, bottom=False)
+            if self.location == "left":
+                self.ax.yaxis.tick_left()
+                self.ax.yaxis.set_label_position("left")
+                self.ax.tick_params(axis="y", labelleft=True, left=False)
+            else:  # right
+                self.ax.yaxis.tick_right()
+                self.ax.yaxis.set_label_position("right")
+                self.ax.tick_params(axis="y", labelright=True, right=False)
+        else:  # horizontal
+            # Get tick information from ax_cbar
+            xtick_locs = self.ax_cbar.xaxis.get_ticklocs()
+            xtick_labels = [
+                label.get_text() for label in self.ax_cbar.xaxis.get_ticklabels()
+            ]
+            ytick_locs = self.ax_hist.yaxis.get_ticklocs()
+            ytick_labels = [
+                label.get_text() for label in self.ax_hist.yaxis.get_ticklabels()
+            ]
+
+            # Set container axes limits to match colorbar data range
+            xlim = self.ax_cbar.get_xlim()
+            ylim = self.ax_hist.get_ylim()
+            self.ax.set_xlim(xlim[0], xlim[1])
+            self.ax.set_ylim(ylim[0], ylim[1])
+
+            # Set ticks at same data values as ax_cbar
+            self.ax.xaxis.set_ticks(xtick_locs, xtick_labels)
+            self.ax.yaxis.set_ticks(ytick_locs, ytick_labels)
+
+            # Configure tick location to match ax_cbar
+            self.ax.yaxis.tick_left()
+            self.ax.yaxis.set_label_position("left")
+            self.ax.tick_params(axis="y", labelleft=True, left=False)
+            if self.location == "bottom":
+                self.ax.xaxis.tick_bottom()
+                self.ax.xaxis.set_label_position("bottom")
+                # Re-enable tick labels after hide_tick_labels was called
+                # But hide the tick marks themselves (length=0)
+                self.ax.tick_params(axis="x", labelbottom=True, bottom=False)
+            else:  # top
+                self.ax.xaxis.tick_top()
+                self.ax.xaxis.set_label_position("top")
+                # Re-enable tick labels after hide_tick_labels was called
+                # But hide the tick marks themselves (length=0)
+                self.ax.tick_params(axis="x", labeltop=True, top=False)
+
+        # Hide tick labels on container axes
+        for label in self.ax.yaxis.get_ticklabels():
+            label.set_alpha(0)
+        for label in self.ax.xaxis.get_ticklabels():
+            label.set_alpha(0)
 
     @property
     def scale(self) -> Literal["linear", "log"]:
@@ -1024,122 +917,6 @@ class HistColorbar:
             msg = f"which must be 'major' or 'minor', got {which}"
             logger.error(msg)
             raise ValueError(msg)
-
-    def _apply_default_customizations(self) -> None:
-        """Apply default custom ticks, labels, and formatting."""
-        # Set colorbar and histogram labels
-        if self.label is not None:
-            self.set_cbar_label(self.label)
-        if self.hist_label is not None:
-            self.set_hist_label(self.hist_label)
-
-        # Set tick formatting of histogram axis
-        if self.log:
-            self.set_hist_locator(LogLocator())
-            self.set_hist_formatter(LogFormatterSciNotation())
-        else:
-            self.set_hist_locator(AutoLocator())
-            self.set_hist_formatter(ScalarFormatter())
-        # Turn off minor ticks
-        self.set_hist_locator(NullLocator(), "minor")
-        self.set_hist_formatter(NullFormatter(), "minor")
-        # ticks of colorbar axis are handled by Colorbar, no action needed
-
-    def _create_ghost_ticklabels(self) -> None:
-        """Create invisible 'ghost' tick labels on container axes.
-
-        This is the KEY solution for constrained_layout compatibility:
-        1. Configure container axes to have same tick locations as ax_cbar
-        2. Set tick label location (left/right/top/bottom) to match ax_cbar
-        3. Make ghost labels invisible after layout calculation
-        4. Constrained_layout sees and accounts for these labels
-        5. The actual visible labels remain on ax_cbar where they belong
-
-        This elegant approach lets constrained_layout calculate proper spacing
-        while keeping our actual rendering unchanged.
-        """
-        hide_axis_elements(self.ax)
-        # Configure container axes to match ax_cbar's tick system
-        if self.orientation == "vertical":
-            # Get tick information from ax_cbar
-            ytick_locs = self.ax_cbar.yaxis.get_ticklocs()
-            ytick_labels = [
-                label.get_text() for label in self.ax_cbar.yaxis.get_ticklabels()
-            ]
-            xtick_locs = self.ax_hist.xaxis.get_ticklocs()
-            xtick_labels = [
-                label.get_text() for label in self.ax_hist.xaxis.get_ticklabels()
-            ]
-
-            # Set container axes limits to match colorbar data range
-            ylim = self.ax_cbar.get_ylim()
-            xlim = self.ax_hist.get_xlim()
-            self.ax.set_ylim(ylim[0], ylim[1])
-            self.ax.set_xlim(xlim[0], xlim[1])
-
-            # Set ticks at same data values as ax_cbar and histogram
-            self.ax.yaxis.set_ticks(ytick_locs, ytick_labels)
-            self.ax.xaxis.set_ticks(xtick_locs, xtick_labels)
-
-            # Configure tick location to match ax_cbar and ax_hist
-            self.ax.xaxis.tick_bottom()
-            self.ax.xaxis.set_label_position("bottom")
-            self.ax.tick_params(axis="x", labelbottom=True, bottom=False, length=0)
-            if self.location == "left":
-                self.ax.yaxis.tick_left()
-                self.ax.yaxis.set_label_position("left")
-                # Re-enable tick labels after hide_tick_labels was called
-                # But hide the tick marks themselves (length=0)
-                self.ax.tick_params(axis="y", labelleft=True, left=False, length=0)
-            else:  # right
-                self.ax.yaxis.tick_right()
-                self.ax.yaxis.set_label_position("right")
-                # Re-enable tick labels after hide_tick_labels was called
-                # But hide the tick marks themselves (length=0)
-                self.ax.tick_params(axis="y", labelright=True, right=False, length=0)
-        else:  # horizontal
-            # Get tick information from ax_cbar
-            xtick_locs = self.ax_cbar.xaxis.get_ticklocs()
-            xtick_labels = [
-                label.get_text() for label in self.ax_cbar.xaxis.get_ticklabels()
-            ]
-            ytick_locs = self.ax_hist.yaxis.get_ticklocs()
-            ytick_labels = [
-                label.get_text() for label in self.ax_hist.yaxis.get_ticklabels()
-            ]
-
-            # Set container axes limits to match colorbar data range
-            xlim = self.ax_cbar.get_xlim()
-            ylim = self.ax_hist.get_ylim()
-            self.ax.set_xlim(xlim[0], xlim[1])
-            self.ax.set_ylim(ylim[0], ylim[1])
-
-            # Set ticks at same data values as ax_cbar
-            self.ax.xaxis.set_ticks(xtick_locs, xtick_labels)
-            self.ax.yaxis.set_ticks(ytick_locs, ytick_labels)
-
-            # Configure tick location to match ax_cbar
-            self.ax.yaxis.tick_left()
-            self.ax.yaxis.set_label_position("left")
-            self.ax.tick_params(axis="y", labelleft=True, left=False, length=0)
-            if self.location == "bottom":
-                self.ax.xaxis.tick_bottom()
-                self.ax.xaxis.set_label_position("bottom")
-                # Re-enable tick labels after hide_tick_labels was called
-                # But hide the tick marks themselves (length=0)
-                self.ax.tick_params(axis="x", labelbottom=True, bottom=False, length=0)
-            else:  # top
-                self.ax.xaxis.tick_top()
-                self.ax.xaxis.set_label_position("top")
-                # Re-enable tick labels after hide_tick_labels was called
-                # But hide the tick marks themselves (length=0)
-                self.ax.tick_params(axis="x", labeltop=True, top=False, length=0)
-
-        # Hide tick labels on container axes
-        for label in self.ax.yaxis.get_ticklabels():
-            label.set_alpha(0)
-        for label in self.ax.xaxis.get_ticklabels():
-            label.set_alpha(0)
 
     def cbar_tick_params(
         self,
@@ -1509,6 +1286,7 @@ class HistColorbar:
         This method should be called when removing a HistColorbar to properly
         clean up resources.
         """
+        self.ax_cbar.callbacks.disconnect(self._extend_cid1)
         # Remove axes
         if hasattr(self, "ax_cbar") and self.ax_cbar is not None:
             self.ax_cbar.remove()
@@ -1522,29 +1300,28 @@ def _hist_colorbar(  # noqa: D417
     self: Figure | SubFigure,  # noqa: ARG001
     data: ArrayLike,
     mappable: ScalarMappable | None = None,
+    *,
     cax: Axes | None = None,
     ax: Axes | NDArray | Iterable[Axes] | None = None,
     use_gridspec: bool = True,
     location: Literal["left", "right", "top", "bottom"] | None = None,
     orientation: Literal["vertical", "horizontal"] | None = None,
-    aspect: float = 5,
     fraction: float = 0.2,
     hist_fraction: float = 0.85,
     pad: float | None = None,
-    alpha: float | None = None,
     shrink: float = 1.0,
     extend: Literal["neither", "both", "min", "max"] = "neither",
     extendfrac: float = 0.025,
+    ticks: ArrayLike | Locator | None = None,
+    outline: bool = False,
     cmap: str | colors.Colormap | None = None,
     norm: colors.Normalize | colors.BoundaryNorm | None = None,
     log: bool = False,
     min_count: float | Literal["auto"] = "auto",
     label: str | None = None,
     hist_label: str | None = None,
-    hist_bins: int | NDArray | Literal["auto"] = "auto",
     divider_style: dict[str, Any] | None = None,
     cbar_kwargs: dict | None = None,
-    hist_kwargs: dict | None = None,
 ) -> HistColorbar:
     """Create a histogram-embedded colorbar.
 
@@ -1576,8 +1353,6 @@ def _hist_colorbar(  # noqa: D417
         (vertical colorbars on the right, horizontal ones at the bottom).
     orientation : {'vertical', 'horizontal'} or None, optional
         Orientation of the colorbar. If None, determined from location.
-    aspect : float, default 5
-        Ratio of long to short dimensions of colorbar.
     fraction : float, default 0.2
         Fraction of original Axes to use for colorbar.
     hist_fraction : float, default 0.85
@@ -1586,8 +1361,6 @@ def _hist_colorbar(  # noqa: D417
     pad : float or None, optional
         Fraction of original Axes between colorbar and new image Axes.
         If None, defaults to 0.05 for vertical, 0.15 for horizontal.
-    alpha : float or None, optional
-        Alpha transparency value for the histogram patches (0-1).
     shrink : float, default 1.0
         Fraction by which to multiply the size of the colorbar relative to the
         parent axes. Similar to matplotlib's colorbar shrink parameter.
@@ -1597,6 +1370,10 @@ def _hist_colorbar(  # noqa: D417
         methods.
     extendfrac : float, default 0.025
         Fraction of the colorbar length to use for the extension triangles.
+    ticks : array-like or Locator, optional
+        Tick locations. If None, use the default tick locations.
+    outline : bool, default False
+        If True, show the outline of the colorbar axes.
     cmap : str or Colormap or None, optional
         Colormap to use. Required if mappable is None.
     norm : Normalize or BoundaryNorm or None, optional
@@ -1613,18 +1390,12 @@ def _hist_colorbar(  # noqa: D417
         Label for the histogram axis. For vertical orientation, this appears
         on the x-axis (count axis). For horizontal orientation, this appears
         on the y-axis (count axis).
-    hist_bins : int or array-like or 'auto', default 'auto'
-        Number of histogram bins or bin edges. If 'auto', will match the number
-        of levels in the colorbar if using BoundaryNorm, otherwise uses 100 bins
-        for continuous colormaps.
     divider_style : dict or None, optional
         Style for the divider line between the colorbar and histogram. If None,
         uses a gray dashed line
         (e.g. `{"color": "0.35", "linestyle": (0, (5, 5)), "linewidth": 1}`).
     cbar_kwargs : dict or None, optional
         Additional keyword arguments to pass to :class:`matplotlib.colorbar.Colorbar`.
-    hist_kwargs : dict or None, optional
-        Additional keyword arguments to pass to :func:`matplotlib.pyplot.hist`.
 
     Returns
     -------
@@ -1676,7 +1447,7 @@ def _hist_colorbar(  # noqa: D417
     >>> data = np.random.randn(5000)
     >>> fig, ax = plt.subplots()
     >>> hcb = fig.hist_colorbar(
-    ...     data=data, cmap="plasma", orientation="horizontal", hist_bins=50, ax=ax
+    ...     data=data, cmap="plasma", orientation="horizontal", ax=ax
     ... )
     >>> plt.show()
 
@@ -1703,24 +1474,22 @@ def _hist_colorbar(  # noqa: D417
         use_gridspec=use_gridspec,
         location=location,
         orientation=orientation,
-        aspect=aspect,
         fraction=fraction,
         hist_fraction=hist_fraction,
         pad=pad,
-        alpha=alpha,
         shrink=shrink,
         extend=extend,
         extendfrac=extendfrac,
+        ticks=ticks,
+        outline=outline,
         cmap=cmap,
         norm=norm,
         log=log,
         min_count=min_count,
         label=label,
         hist_label=hist_label,
-        hist_bins=hist_bins,
         divider_style=divider_style,
         cbar_kwargs=cbar_kwargs,
-        hist_kwargs=hist_kwargs,
     )
 
 
