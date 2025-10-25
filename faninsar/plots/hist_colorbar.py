@@ -347,13 +347,30 @@ class HistColorbar:
     cbar : Colorbar
         The colorbar object.
 
+    See Also
+    --------
+    faninsar.plots.Figure.hist_colorbar : Convenience function to create HistColorbar.
+    matplotlib.pyplot.colorbar : The matplotlib colorbar function.
+
     """
 
     fig: Figure | SubFigure
+    """The figure containing the HistColorbar."""
+
     ax: Axes
+    """The parent axes containing the colorbar and histogram."""
+
     ax_cbar: Axes
+    """The axes containing the colorbar."""
+
     ax_hist: Axes
+    """The axes containing the histogram."""
+
     cbar: Colorbar
+    """The colorbar object."""
+
+    hist: _Histogram
+    """The histogram object."""
 
     _hist_locater: Locator
     _hist_formatter: Formatter
@@ -498,7 +515,7 @@ class HistColorbar:
             plt.sca(current_ax)
 
     @property
-    def hist_orientation(self) -> Literal["vertical", "horizontal"]:
+    def _hist_orientation(self) -> Literal["vertical", "horizontal"]:
         """Orientation of the histogram."""
         return "vertical" if self.orientation == "horizontal" else "horizontal"
 
@@ -778,17 +795,17 @@ class HistColorbar:
 
     @property
     def scale(self) -> Literal["linear", "log"]:
-        """Get the scale of the histogram axis."""
+        """The scale of the histogram axis."""
         return self._scale
 
     @property
     def min_count(self) -> float:
-        """Get the minimum count for the histogram."""
+        """The minimum count for the histogram."""
         return self._min_count
 
     def set_scale(self, scale: Literal["linear", "log"]) -> None:
         """Set the scale of the histogram axis."""
-        if self.hist_orientation == "horizontal":
+        if self._hist_orientation == "horizontal":
             self.ax_hist.set_xscale(scale)
         else:
             self.ax_hist.set_yscale(scale)
@@ -820,12 +837,12 @@ class HistColorbar:
 
         """
         if which == "major":
-            if self.hist_orientation == "horizontal":
+            if self._hist_orientation == "horizontal":
                 self.ax_hist.xaxis.set_major_locator(locator)
             else:
                 self.ax_hist.yaxis.set_major_locator(locator)
         elif which == "minor":
-            if self.hist_orientation == "horizontal":
+            if self._hist_orientation == "horizontal":
                 self.ax_hist.xaxis.set_minor_locator(locator)
             else:
                 self.ax_hist.yaxis.set_minor_locator(locator)
@@ -848,12 +865,12 @@ class HistColorbar:
 
         """
         if which == "major":
-            if self.hist_orientation == "horizontal":
+            if self._hist_orientation == "horizontal":
                 self.ax_hist.xaxis.set_major_formatter(formatter)
             else:
                 self.ax_hist.yaxis.set_major_formatter(formatter)
         elif which == "minor":
-            if self.hist_orientation == "horizontal":
+            if self._hist_orientation == "horizontal":
                 self.ax_hist.xaxis.set_minor_formatter(formatter)
             else:
                 self.ax_hist.yaxis.set_minor_formatter(formatter)

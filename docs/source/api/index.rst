@@ -14,4 +14,5 @@ API Reference
    query/index
    samplers/index
    NSBAS/index
+   plots/index
    constants/sar
