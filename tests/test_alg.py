@@ -1,4 +1,4 @@
-"""Tests for faninsar._core.alg module."""  # noqa: D100, INP001
+"""Tests for faninsar._core.alg module."""
 
 from __future__ import annotations
 

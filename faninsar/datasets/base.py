@@ -531,7 +531,7 @@ class RasterDataset(GeoDataset):
     #: Color map for the dataset, used for plotting
     cmap: ClassVar[dict[int, tuple[int, int, int, int]]] = {}
 
-    def __init__(  # noqa: PLR0912, PLR0915
+    def __init__(
         self,
         root_dir: str = "data",
         paths: Sequence[str] | None = None,
@@ -860,7 +860,7 @@ class RasterDataset(GeoDataset):
             for vrt_fh in vrt_fhs:
                 vrt_fh.close()
 
-    def _sample_files(self, paths: Sequence[str], query: GeoQuery) -> QueryResult:  # noqa: PLR0912, PLR0915
+    def _sample_files(self, paths: Sequence[str], query: GeoQuery) -> QueryResult:
         """Sample or retrieve values from the dataset for the given query.
 
         Parameters
@@ -1953,7 +1953,7 @@ class HierarchicalDataset(GeoDataset):
         profile["crs"] = self.crs
         return profile
 
-    def array2tiff(  # noqa: PLR0912
+    def array2tiff(
         self,
         arr: np.ndarray,
         filename: str | Path,

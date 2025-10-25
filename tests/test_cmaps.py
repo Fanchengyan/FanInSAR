@@ -1,4 +1,4 @@
-import matplotlib.colors as mcolors  # noqa: D100, INP001
+import matplotlib.colors as mcolors  # noqa: D100
 import pytest
 
 from faninsar.cmaps import (

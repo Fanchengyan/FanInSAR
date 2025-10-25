@@ -18,6 +18,7 @@ from pandas.core.dtypes.generic import ABCMultiIndex, ABCSeries
 from pandas.core.indexes.base import maybe_extract_name
 from typing_extensions import Self
 
+from faninsar._core.render import array_repr
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
@@ -46,11 +47,9 @@ class Acquisition(pd.DatetimeIndex):
 
     def _repr_html_(self) -> str:
         """Return the HTML representation of the class."""
-        from faninsar._core.render import array_repr
-
         return array_repr(self)
 
-    def to_xarray(self) -> pd.DatetimeIndex:
+    def to_xarray(self) -> xr.Variable:
         """Convert the acquisition dates to xarray format."""
         return xr.Variable("Acquisition", self)
 
@@ -90,7 +89,7 @@ class DaySpan(pd.Index):
     dims = ("days",)
     _in_memory = True
 
-    def __new__(  # noqa: PLR0912
+    def __new__(
         cls,
         data: Sequence,
         dtype: np.dtype = None,

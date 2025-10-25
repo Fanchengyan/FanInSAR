@@ -44,7 +44,7 @@ def setup_logger(
 
     # create a logger
     logger = logging.getLogger(log_name)
-    logger.setLevel(log_level)
+    # logger.setLevel(log_level)
 
     # create a formatter
     formatter = logging.Formatter(log_format)
@@ -54,12 +54,12 @@ def setup_logger(
         if log_file:
             handler = logging.FileHandler(log_file)
             handler.set_name(log_name)
-            handler.setLevel(log_level)
+            # handler.setLevel(log_level)
             handler.setFormatter(formatter)
         else:
             handler = logging.StreamHandler()
             handler.set_name(log_name)
-            handler.setLevel(log_level)
+            # handler.setLevel(log_level)
             handler.setFormatter(formatter)
         return handler
 

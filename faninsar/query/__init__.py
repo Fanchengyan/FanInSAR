@@ -2,4 +2,4 @@ from .bbox import BoundingBox
 from .points import Points
 from .polygons import Polygons
 from .query import GeoQuery
-from .result import QueryResult
+from .result import BBoxesResult, PointsResult, PolygonsResult, QueryResult

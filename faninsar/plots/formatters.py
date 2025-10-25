@@ -63,7 +63,7 @@ class PiFormatter(Formatter):
         else:
             self.symbol = "π" if use_unicode else "pi"
 
-    def __call__(self, x: float, pos: int | None = None) -> str:
+    def __call__(self, x: float, pos: int | None = None) -> str:  # noqa: ARG002
         """Format a tick value as a multiple of π.
 
         Parameters

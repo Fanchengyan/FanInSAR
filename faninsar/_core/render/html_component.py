@@ -24,6 +24,8 @@ from dominate.tags import (
 )
 from dominate.util import raw
 
+from faninsar._core.render.formatting_html import short_index_repr_html
+
 if TYPE_CHECKING:
     from collections.abc import Hashable
 
@@ -229,8 +231,6 @@ class HtmlIndexes(BaseHTML):
 
     def to_tag(self) -> html_tag:
         """Return a rendered dominate tag containing a table of properties."""
-        from faninsar._core.render.formatting_html import short_index_repr_html
-
         ul_tag = ul(cls="xr-var-list")
         for key, value in self.indexes.items():
             li_tag = li(cls="xr-var-item")

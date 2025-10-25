@@ -10,7 +10,7 @@ class TestAcquisition:
     @pytest.fixture(autouse=True)
     def setup(self):
         # Setup some sample data for testing
-        dates = pd.date_range(start="2023-01-01", periods=10, freq='D')
+        dates = pd.date_range(start="2023-01-01", periods=10, freq="D")
         self.acquisition = Acquisition(dates)
 
     def test_creation(self):
@@ -96,7 +96,7 @@ class TestDaysSpanIndex:
     @pytest.fixture(autouse=True)
     def setup(self):
         # Setup some sample data for testing
-        days = pd.to_timedelta(range(10), unit='D')
+        days = pd.to_timedelta(range(10), unit="D")
         self.days_span = DaySpan(days)
 
     def test_creation(self):
@@ -115,6 +115,6 @@ class TestDaysSpanIndex:
         # Test the attrs property
         attrs = self.days_span.attrs
         assert attrs["min"] == pd.Timedelta(0)
-        assert attrs["max"] == pd.Timedelta(9, unit='D')
+        assert attrs["max"] == pd.Timedelta(9, unit="D")
         assert attrs["unique"] == 10
         assert attrs["total"] == 10

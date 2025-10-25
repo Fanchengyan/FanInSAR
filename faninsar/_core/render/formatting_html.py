@@ -290,9 +290,10 @@ def array_section(obj: DataArray) -> str:
 
 def pairs_section(pairs: Pairs) -> str:
     """Format a Pairs object as HTML."""
-    # "unique" id to expand/collapse the section
+    # function import is delayed to avoid circular import
     from faninsar._core.render import PairsSVG, add_svg_string
 
+    # "unique" id to expand/collapse the section
     data_id = "section-" + str(uuid.uuid4())
     preview = f"faninsar.Pairs<pairs={len(pairs)},dates={len(pairs.dates)}>"
     data_repr = pairs.to_frame().to_html(max_rows=5, justify="center")
@@ -442,6 +443,7 @@ def dataset_repr(ds: Dataset) -> str:
 
 
 def pairs_repr(pairs: Pairs) -> str:
+    # function import is delayed to avoid circular import
     from faninsar._core.render import HtmlDims
 
     obj_type = "faninsar.Pairs"

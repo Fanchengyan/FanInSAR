@@ -5,13 +5,13 @@ from __future__ import annotations
 import warnings
 from typing import TYPE_CHECKING, overload
 
+import geopandas as gpd
 from rasterio.crs import CRS
 from rasterio.warp import transform_bounds
+from shapely.geometry import box
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-
-    import geopandas as gpd
 
 
 class BoundingBox:
@@ -295,9 +295,6 @@ class BoundingBox:
             GeoDataFrame with the bounding box as a polygon
 
         """
-        import geopandas as gpd
-        from shapely.geometry import box
-
         gdf = gpd.GeoDataFrame(
             geometry=[box(self.left, self.bottom, self.right, self.top)],
         )

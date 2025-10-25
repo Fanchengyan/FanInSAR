@@ -242,7 +242,7 @@ class TripletLoops:
     @overload
     def __getitem__(self, index: slice) -> TripletLoops: ...
 
-    def __getitem__(  # noqa: PLR0911, PLR0912
+    def __getitem__(  # noqa: PLR0911
         self,
         index: int | slice | datetime | Iterable[datetime],
     ) -> TripletLoop | TripletLoops:

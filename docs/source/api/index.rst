@@ -9,9 +9,10 @@ API Reference
    :maxdepth: 2
    :caption: Contents:
 
+   insar_class/index
    datasets/datasets
    query/index
    samplers/index
    NSBAS/index
-   insar_class/index
+   plots/index
    constants/sar
