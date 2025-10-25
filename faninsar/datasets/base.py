@@ -2816,7 +2816,7 @@ class HierarchicalDataset(GeoDataset):
         filename: str | Path,
         bounds: BoundingBox | None = None,
         bbox: BoundingBox | None = None,
-        band_names: Sequence[str] | None = None,
+        band_names: Iterable[str] | None = None,
         arr_type: Literal["data", "mask"] = "data",
         nodata: float | None = None,
         overwrite: bool = False,
@@ -2909,7 +2909,7 @@ class HierarchicalDataset(GeoDataset):
 
 
 class MultiHierarchicalDataset(GeoDataset):
-    def __init__(self, paths: Sequence[str | Path], **kwargs) -> None:
+    def __init__(self, paths: Iterable[str | Path], **kwargs) -> None:
         pass
 
 

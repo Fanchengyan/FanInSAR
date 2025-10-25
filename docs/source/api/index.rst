@@ -16,3 +16,4 @@ API Reference
    NSBAS/index
    plots/index
    constants/sar
+   logging/index

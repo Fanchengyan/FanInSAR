@@ -60,7 +60,7 @@ from typing_extensions import Literal
 
 from faninsar.logging import setup_logger
 
-logger = setup_logger(log_name=__name__)
+logger = setup_logger(__name__)
 
 
 #: Speed of light in vacuum (m/s)
@@ -81,6 +81,9 @@ UNIT_FREQUENCY = {
     "MHz": 1e6,
     "GHz": 1e9,
 }
+
+WavelengthUnit = Literal["m", "cm", "dm", "mm"]
+FrequencyUnit = Literal["Hz", "kHz", "MHz", "GHz"]
 
 
 @dataclass(frozen=True)

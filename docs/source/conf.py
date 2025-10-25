@@ -39,6 +39,8 @@ extensions = [
     "sphinx_togglebutton",
     "myst_sphinx_gallery"
 ]
+# Ensure stub pages are generated for autosummary
+autosummary_generate = True
 source_suffix = {
     ".rst": "restructuredtext",
     ".md": "myst-nb",

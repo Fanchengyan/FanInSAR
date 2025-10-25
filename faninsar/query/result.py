@@ -428,7 +428,7 @@ class PolygonsResult(xr.Dataset):
                 if masks and isinstance(masks[0], np.ndarray):
                     stacked_masks = np.stack(masks, axis=0)
                     # Skip file dimension for masks
-                    mask_dims = ["polygon"] + dims[2:]
+                    mask_dims = ["polygon", *dims[2:]]
                     data_vars["masks"] = (mask_dims, stacked_masks)
 
                 return xr.Dataset(data_vars=data_vars, coords=coords, attrs=attrs)

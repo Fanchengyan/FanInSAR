@@ -15,3 +15,4 @@ processing.
    pairs
    baselines
    phase_deformation_converter
+   sar

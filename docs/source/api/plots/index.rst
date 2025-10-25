@@ -2,19 +2,21 @@
 ``faninsar.plots``
 ==================
 
+.. currentmodule:: faninsar.plots
+
 HistColorbar
 ============
 
 .. autosummary::
    :toctree: generated/
 
-   faninsar.plots.HistColorbar
-   faninsar.plots.Figure.hist_colorbar
+   HistColorbar
+   Figure.hist_colorbar
 
 Formatters
 ==========
 
-.. currentmodule:: faninsar.plots.formatters
+
 
 .. autosummary::
    :toctree: generated/

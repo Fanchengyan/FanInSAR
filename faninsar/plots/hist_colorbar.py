@@ -33,7 +33,7 @@ from typing_extensions import Literal
 
 from faninsar.logging import setup_logger
 
-logger = setup_logger(log_name=__name__)
+logger = setup_logger(__name__)
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
