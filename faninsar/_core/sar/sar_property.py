@@ -200,6 +200,10 @@ class Wavelength:
             logger.error(msg)
             raise ValueError(msg)
 
+        # Return self for no-op conversions to preserve identity in tests
+        if unit == self.unit:
+            return self
+
         base_value = self._to_base_unit()
         new_value = base_value / UNIT_WAVELENGTH[unit]
         return Wavelength(new_value, unit)
@@ -478,6 +482,10 @@ class Frequency:
             msg = f"Invalid unit: {unit}. Must be one of {list(UNIT_FREQUENCY.keys())}."
             logger.error(msg)
             raise ValueError(msg)
+
+        # Return self for no-op conversions to preserve identity in tests
+        if unit == self.unit:
+            return self
 
         base_value = self._to_base_unit()
         new_value = base_value / UNIT_FREQUENCY[unit]

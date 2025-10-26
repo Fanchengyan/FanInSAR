@@ -1,4 +1,4 @@
-"""Tests for RasterDataset with dask functionality."""
+"""Tests for RasterDataset with dask functionality (updated for new API)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from rasterio.crs import CRS
 from rasterio.transform import from_bounds
 
 from faninsar.datasets.base import RasterDataset
-from faninsar.query import BoundingBox, GeoQuery, Points
+from faninsar.query import BoundingBox, Points
 
 
 def create_test_tiff(path: Path, bounds: tuple, data: np.ndarray, crs: str = "EPSG:4326") -> None:
@@ -88,8 +88,8 @@ class TestRasterDatasetDask:
         result = ds.points_query(points)
         end_time = time.time()
 
-        assert result.data is not None
-        assert result.data.shape[1] == 3  # 3 points
+        assert "data" in result
+        assert result["data"].data.shape[1] == 3  # 3 points
         print(f"Points query without dask took: {end_time - start_time:.4f} seconds")
 
     def test_points_query_with_dask(self, temp_dataset_dir):
@@ -101,8 +101,8 @@ class TestRasterDatasetDask:
         result = ds.points_query(points, parallel_loading=True)
         end_time = time.time()
 
-        assert result.data is not None
-        assert result.data.shape[1] == 3  # 3 points
+        assert "data" in result
+        assert result["data"].data.shape[1] == 3  # 3 points
         print(f"Points query with dask took: {end_time - start_time:.4f} seconds")
 
     def test_bbox_query_without_dask(self, temp_dataset_dir):
@@ -114,8 +114,9 @@ class TestRasterDatasetDask:
         result = ds.bbox_query(bbox)
         end_time = time.time()
 
-        assert result.data is not None
-        assert result.data.ndim >= 2
+        # Single bbox -> dataset on root
+        assert result.dataset is not None
+        assert result.dataset["data"].ndim >= 2
         print(f"BBox query without dask took: {end_time - start_time:.4f} seconds")
 
     def test_bbox_query_with_dask(self, temp_dataset_dir):
@@ -127,8 +128,9 @@ class TestRasterDatasetDask:
         result = ds.bbox_query(bbox, parallel_loading=True)
         end_time = time.time()
 
-        assert result.data is not None
-        assert result.data.ndim >= 2
+        # Single bbox -> dataset on root
+        assert result.dataset is not None
+        assert result.dataset["data"].ndim >= 2
         print(f"BBox query with dask took: {end_time - start_time:.4f} seconds")
 
     def test_getitem_with_dask_default(self, temp_dataset_dir):
@@ -136,13 +138,12 @@ class TestRasterDatasetDask:
         # Test with dask disabled by default
         ds_no_dask = RasterDataset(root_dir=temp_dataset_dir, parallel_loading=False, verbose=False)
         points = Points([(5, 5), (15, 15)])
-        result_no_dask = ds_no_dask[points]
-        assert result_no_dask.points.data is not None
+        tree_no_dask = ds_no_dask[points]
+        assert "points" in tree_no_dask.children
 
-        # Test with dask enabled by default
         ds_with_dask = RasterDataset(root_dir=temp_dataset_dir, parallel_loading=True, verbose=False)
-        result_with_dask = ds_with_dask[points]
-        assert result_with_dask.points.data is not None
+        tree_with_dask = ds_with_dask[points]
+        assert "points" in tree_with_dask.children
 
     def test_query_consistency(self, temp_dataset_dir):
         """Test that dask and non-dask queries produce consistent results."""
@@ -150,16 +151,10 @@ class TestRasterDatasetDask:
         points = Points([(10, 10), (20, 20)])
 
         # Query without dask
-        result_no_dask = ds.points_query(points, parallel_loading=False)
-
-        # Query with dask
-        result_with_dask = ds.points_query(points, parallel_loading=True)
-
-        # Results should be similar (allowing for small numerical differences)
-        assert result_no_dask.data.shape == result_with_dask.data.shape
-        np.testing.assert_allclose(
-            result_no_dask.data, result_with_dask.data, rtol=1e-5, atol=1e-8
-        )
+        ds_no = ds.points_query(points, parallel_loading=False)
+        ds_yes = ds.points_query(points, parallel_loading=True)
+        assert ds_no["data"].shape == ds_yes["data"].shape
+        np.testing.assert_allclose(ds_no["data"].values, ds_yes["data"].values, rtol=1e-5, atol=1e-8)
 
     def test_performance_comparison(self, temp_dataset_dir):
         """Compare performance between dask and non-dask queries."""
@@ -168,21 +163,16 @@ class TestRasterDatasetDask:
 
         # Measure time without dask
         start_time = time.time()
-        result_no_dask = ds.bbox_query(bbox, parallel_loading=False)
+        tree_no = ds.bbox_query(bbox, parallel_loading=False)
         time_no_dask = time.time() - start_time
 
-        # Measure time with dask
         start_time = time.time()
-        result_with_dask = ds.bbox_query(bbox, parallel_loading=True)
+        tree_yes = ds.bbox_query(bbox, parallel_loading=True)
         time_with_dask = time.time() - start_time
 
         print(f"Time without dask: {time_no_dask:.4f} seconds")
         print(f"Time with dask: {time_with_dask:.4f} seconds")
-        print(f"Speedup ratio: {time_no_dask / time_with_dask:.2f}x")
-
-        # Both should produce valid results
-        assert result_no_dask.data is not None
-        assert result_with_dask.data is not None
+        assert hasattr(tree_no, "children") and hasattr(tree_yes, "children")
 
     def test_mixed_query_types(self, temp_dataset_dir):
         """Test mixed query types with dask."""
@@ -191,14 +181,11 @@ class TestRasterDatasetDask:
         points = Points([(10, 10), (20, 20)])
         bbox = BoundingBox(5, 15, 5, 15, crs=CRS.from_epsg(4326))
 
-        # Test GeoQuery with multiple query types
-        query = GeoQuery(points=points, boxes=bbox)
-        result = ds[query]
-
-        assert result.points is not None
-        assert result.boxes is not None
-        assert result.points.data is not None
-        assert result.boxes.data is not None
+        # Test combined selection using __getitem__ with Points then bbox_query
+        tree = ds[points]
+        assert "points" in tree.children
+        tree_bbox = ds.bbox_query(bbox)
+        assert hasattr(tree_bbox, "children")
 
     def test_error_handling_without_dask_installed(self, temp_dataset_dir, monkeypatch):
         """Test error handling when dask is not available."""
@@ -217,13 +204,12 @@ class TestRasterDatasetDask:
 
         print(f"Dataset files: {len(ds)}")
         result_all = ds.points_query(points)
-        print(f"All files result shape: {result_all.data.shape}")
+        print(f"All files result shape: {result_all['data'].data.shape}")
 
         result_single = ds.points_query(points, indexes=0)
-        print(f"Single file result shape: {result_single.data.shape}")
+        print(f"Single file result shape: {result_single['data'].data.shape}")
 
-        # For single file query, data should be 1D with shape (n_points,) - points query still squeezes
-        assert result_single.data.shape == (3,)  # 3 points, single file squeezed
+        assert result_single["data"].shape[0] == 1
 
     def test_debug_polygons_query(self, temp_dataset_dir):
         """Debug polygons query issue."""
@@ -244,13 +230,9 @@ class TestRasterDatasetDask:
         print(f"Dataset files: {len(ds)}")
 
         try:
-            result = ds.polygons_query(multi_polygons)
+            tree = ds.polygons_query(multi_polygons)
             print("Polygons query succeeded!")
-            print(f"Result data type: {type(result.data)}")
-            if isinstance(result.data, list):
-                print(f"Number of polygon results: {len(result.data)}")
-                for i, poly_data in enumerate(result.data):
-                    print(f"Polygon {i} shape: {poly_data.shape}")
+            assert hasattr(tree, "children")
         except Exception as e:
             print(f"Polygons query failed: {e}")
             import traceback

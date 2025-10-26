@@ -30,6 +30,13 @@ class SAR:
     _frequency: Frequency
     _wavelength: Wavelength
 
+    def __setattr__(self, name: str, value: object) -> None:  # type: ignore[override]
+        """Prevent setting computed properties to enforce read-only behavior."""
+        if name in {"frequency", "wavelength"}:
+            msg = f"{name} is read-only"
+            raise AttributeError(msg)
+        super().__setattr__(name, value)
+
     def __repr__(self) -> str:
         """Return a string representation of the SAR mission."""
         frequency = None

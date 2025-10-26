@@ -1,5 +1,9 @@
 import matplotlib.colors as mcolors  # noqa: D100, INP001
 import pytest
+from typing import TYPE_CHECKING
+import time
+import gc
+import numpy as np
 
 import faninsar.cmaps as cmaps_module
 from faninsar.cmaps import (

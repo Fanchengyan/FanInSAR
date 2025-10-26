@@ -1,3 +1,5 @@
+# register xarray/datree accessors
+from . import xr_accessors as _xr_accessors
 from ._core import (
     SAR,
     SPEED_OF_LIGHT,

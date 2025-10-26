@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import json
 import re
 import warnings
 from abc import ABC, abstractmethod
@@ -39,14 +40,10 @@ from faninsar._core import geo_tools
 from faninsar._core.geo_tools import Profile, array2kml, array2kmz, geoinfo_from_latlon
 from faninsar.logging import setup_logger
 from faninsar.query import (
-    BBoxesResult,
     BoundingBox,
     GeoQuery,
     Points,
-    PointsResult,
     Polygons,
-    PolygonsResult,
-    QueryResult,
 )
 
 if TYPE_CHECKING:
@@ -1016,7 +1013,7 @@ class RasterDataset(GeoDataset):
     def __getitem__(
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
-    ) -> QueryResult:
+    ) -> xr.DataTree:
         """Retrieve images values for given query.
 
         Parameters
@@ -1032,7 +1029,13 @@ class RasterDataset(GeoDataset):
             a QueryResult instance containing the results of the various queries.
 
         """
-        query = ensure_geo_query(query)
+        # Normalize to GeoQuery
+        if isinstance(query, Points):
+            query = GeoQuery(points=query)
+        elif isinstance(query, BoundingBox):
+            query = GeoQuery(boxes=query)
+        elif isinstance(query, Polygons):
+            query = GeoQuery(polygons=query)
 
         paths = self.files[self.files.valid].paths.tolist()
         return self._sample_files(paths, query)
@@ -1250,7 +1253,7 @@ class RasterDataset(GeoDataset):
         paths: Iterable[str],
         query: GeoQuery,
         parallel_loading: bool | None = None,
-    ) -> QueryResult:
+    ) -> xr.DataTree:
         """Sample or retrieve values from the dataset for the given query.
 
         Parameters
@@ -1279,128 +1282,439 @@ class RasterDataset(GeoDataset):
         if parallel_loading is None:
             parallel_loading = self.parallel_loading
 
+        # Compute components
         if parallel_loading and HAS_DASK:
-            # Use deferred computation - build computation graph
-            delayed_results = []
-
+            tasks = []
             if query.points is not None:
-                delayed_results.append(
-                    delayed(self._compute_points_query)(query.points, indexes)
-                )
+                tasks.append(delayed(self._compute_points_ds)(query.points, indexes))
             else:
-                delayed_results.append(delayed(lambda: None)())
+                tasks.append(delayed(lambda: None)())
 
             if query.boxes is not None:
-                delayed_results.append(
-                    delayed(self._compute_bbox_query)(query.boxes, indexes)
-                )
+                tasks.append(delayed(self._compute_bboxes_tree)(query.boxes, indexes))
             else:
-                delayed_results.append(delayed(lambda: None)())
+                tasks.append(delayed(lambda: None)())
 
             if query.polygons is not None:
-                delayed_results.append(
-                    delayed(self._compute_polygons_query)(query.polygons, indexes)
+                tasks.append(
+                    delayed(self._compute_polygons_tree)(query.polygons, indexes)
                 )
             else:
-                delayed_results.append(delayed(lambda: None)())
+                tasks.append(delayed(lambda: None)())
 
-            # Single compute call for all queries
-            points_result, bbox_result, polygons_result = dask.compute(*delayed_results)
+            points_da, bboxes_tree, polygons_tree = dask.compute(*tasks)
         else:
-            # Use immediate computation (original behavior)
-            points_result = None
-            bbox_result = None
-            polygons_result = None
+            points_ds = (
+                self._compute_points_ds(query.points, indexes)
+                if query.points is not None
+                else None
+            )
+            bboxes_tree = (
+                self._compute_bboxes_tree(query.boxes, indexes)
+                if query.boxes is not None
+                else None
+            )
+            polygons_tree = (
+                self._compute_polygons_tree(query.polygons, indexes)
+                if query.polygons is not None
+                else None
+            )
 
-            if query.points is not None:
-                points_result = self._compute_points_query(query.points, indexes)
-            if query.boxes is not None:
-                bbox_result = self._compute_bbox_query(query.boxes, indexes)
-            if query.polygons is not None:
-                polygons_result = self._compute_polygons_query(query.polygons, indexes)
+        # Assemble DataTree
+        # Dual-track saving: store a full query_json on the root node
+        root_attrs = {
+            "crs": str(self.crs) if self.crs is not None else None,
+            "res": tuple(self.res) if self.res is not None else None,
+        }
+        try:
+            qroot = {}
+            if isinstance(query, GeoQuery):
+                if query.points is not None:
+                    qroot["points"] = self._serialize_points(query.points)
+                if query.boxes is not None:
+                    if isinstance(query.boxes, list):
+                        qroot["bboxes"] = [self._serialize_bbox(b) for b in query.boxes]
+                    else:
+                        qroot["bboxes"] = [self._serialize_bbox(query.boxes)]
+                if query.polygons is not None:
+                    qroot["polygons"] = self._serialize_polygons(query.polygons)
+            root_attrs.update(
+                {
+                    "query_json": json.dumps(qroot),
+                    "query_repr": (
+                        "GeoQuery("
+                        f"points={query.points is not None}, "
+                        f"bboxes={query.boxes is not None}, "
+                        f"polygons={query.polygons is not None}"
+                        ")"
+                    ),
+                }
+            )
+        except Exception:
+            pass
+        root_ds = xr.Dataset(attrs=root_attrs)
 
-        return QueryResult(points_result, bbox_result, polygons_result, query)
+        children: dict[str, xr.DataTree] = {}
 
-    def _compute_points_query(
+        # points
+        from xarray import DataTree  # local import to avoid hard dep if unused
+
+        if query.points is not None:
+            points_ds = self._compute_points_ds(query.points, indexes)
+            children["points"] = DataTree(dataset=points_ds, name="points")
+        else:
+            children["points"] = DataTree(name="points")
+
+        # bboxes
+        if bboxes_tree is not None:
+            children["bboxes"] = bboxes_tree
+        else:
+            children["bboxes"] = DataTree(name="bboxes")
+
+        # polygons
+        if polygons_tree is not None:
+            children["polygons"] = polygons_tree
+        else:
+            children["polygons"] = DataTree(name="polygons")
+
+        return DataTree(dataset=root_ds, name="query_result", children=children)
+
+    def _serialize_points(self, points: Points) -> dict:
+        crs_str = str(points.crs) if points.crs is not None else None
+        return {
+            "type": "Points",
+            "crs": crs_str,
+            "coords": points.values.tolist(),
+        }
+
+    def _serialize_bbox(self, bbox: BoundingBox) -> dict:
+        crs_str = str(bbox.crs) if bbox.crs is not None else None
+        return {
+            "type": "BoundingBox",
+            "crs": crs_str,
+            "left": float(bbox.left),
+            "bottom": float(bbox.bottom),
+            "right": float(bbox.right),
+            "top": float(bbox.top),
+        }
+
+    def _serialize_polygons(self, polygons: Polygons) -> dict:
+        crs_str = str(polygons.crs) if polygons.crs is not None else None
+        wkts = []
+        try:
+            wkts = [geom.wkt for geom in polygons.geodataframe.geometry]
+        except Exception:
+            wkts = [str(g) for g in polygons.geodataframe.geometry]
+        return {"type": "Polygons", "crs": crs_str, "wkt": wkts}
+
+    def _compute_points_ds(
         self, points: Points, indexes: int | list[int] | None = None
-    ) -> PointsResult:
-        """Compute points query without dask (used by deferred computation)."""
+    ) -> xr.Dataset:
+        """Compute points query and return Dataset.
+
+        Data variable:
+        - data with dims (file[, band], point)
+
+        Coordinates include:
+        - file: integer index 0..N-1
+        - file_path: ("file",) real file paths
+        - point: point indices
+        - x, y: actual point coordinates in dataset CRS
+        - band: band indices when applicable
+        """
         paths = self._indexes2paths(indexes)
         vrt_fhs = self._paths2vrt_fhs(paths)
-        data_ls = self._files_query_points(points, vrt_fhs)
+        data = self._files_query_points(points, vrt_fhs)
 
-        multi_files = True
-        if isinstance(indexes, int):
-            if data_ls is not None and hasattr(data_ls, "squeeze"):
-                data_ls = data_ls.squeeze(0)
-            multi_files = False
-        dims, data_ls = parse_1d_dims(data_ls, multi_files)
-        return PointsResult({"data": data_ls, "dims": dims})
+        # Determine dims
+        if data.ndim == 3:
+            dims = ("file", "band", "point")
+        elif data.ndim == 2:
+            dims = ("file", "point")
+        else:
+            data = np.atleast_2d(data)
+            dims = ("file", "point")
 
-    def _compute_bbox_query(
+        # Ensure points are in dataset CRS for coordinate reporting
+        pts = self._ensure_query_crs(points)
+        x_pts = np.asarray(pts.x, dtype=float)
+        y_pts = np.asarray(pts.y, dtype=float)
+
+        n_files = data.shape[0]
+        coords: dict[str, Any] = {
+            "file": np.arange(n_files),
+            "file_path": ("file", np.asarray(paths, dtype=object)),
+            "point": np.arange(data.shape[-1]),
+            "x": ("point", x_pts),
+            "y": ("point", y_pts),
+        }
+        if "band" in dims:
+            coords["band"] = np.arange(data.shape[1])
+
+        ds = xr.Dataset({"data": (dims, data)}, coords=coords)
+        # Dual-track saving: query_json + human-readable query_repr
+        qjson = json.dumps(self._serialize_points(points))
+        ds.attrs.update(
+            {
+                "crs": str(self.crs) if self.crs is not None else None,
+                "nodata": self.nodata,
+                "query_json": qjson,
+                "query_repr": f"Points(count={len(points)}, crs={points.crs})",
+            }
+        )
+        return ds
+
+    def _compute_bboxes_tree(
         self,
         bbox: BoundingBox | list[BoundingBox],
         indexes: int | list[int] | None = None,
-    ) -> BBoxesResult:
-        """Compute bbox query without dask (used by deferred computation)."""
-        bbox_is_list = isinstance(bbox, list)
-        bbox_list = bbox if bbox_is_list else [bbox]
+    ) -> xr.DataTree:
+        """Compute bbox query and return a DataTree.
+
+        - If a single BoundingBox is provided, return a DataTree whose dataset is
+          the result.
+        - If a list is provided (even length 1), return a DataTree with groups
+          named "0", "1", ...
+        Coordinates include file paths, and y/x as real-world coordinates
+        derived from the transform.
+        """
+        from xarray import DataTree
+
+        bbox_list = bbox if isinstance(bbox, list) else [bbox]
         paths = self._indexes2paths(indexes)
+        vrt_fhs_template = self._paths2vrt_fhs(paths)
 
-        all_bbox_data = []
-        for single_bbox in bbox_list:
-            vrt_fhs = self._paths2vrt_fhs(paths)
-            data_ls = self._files_query_bbox(single_bbox, vrt_fhs)
-            all_bbox_data.append(data_ls)
+        def _make_ds(single_bbox: BoundingBox, data: np.ndarray) -> xr.Dataset:
+            # dims: (file[, band], y, x)
+            profile = self.get_profile(single_bbox)
+            transform = profile["transform"] if profile is not None else None
+            height = data.shape[-2]
+            width = data.shape[-1]
+            # coordinate vectors from transform
+            if transform is not None:
+                lon = transform.c + transform.a * np.arange(width) + transform.a * 0.5
+                lat = transform.f + transform.e * np.arange(height) + transform.e * 0.5
+            else:
+                lon = np.arange(width)
+                lat = np.arange(height)
 
-        # Stack results appropriately
-        if bbox_is_list:
-            final_data = np.ma.asarray(all_bbox_data)
-            if final_data.ndim == 4:
-                final_data = final_data.transpose(1, 0, 2, 3)
-            elif final_data.ndim == 5:
-                final_data = final_data.transpose(1, 0, 2, 3, 4)
-        else:
-            final_data = all_bbox_data[0]
+            if data.ndim == 4:
+                dims = ("file", "band", "y", "x")
+                coords: dict[str, Any] = {
+                    "file": np.arange(data.shape[0]),
+                    "file_path": ("file", np.asarray(paths, dtype=object)),
+                    "band": np.arange(data.shape[1]),
+                    "y": lat,
+                    "x": lon,
+                }
+            else:
+                dims = ("file", "y", "x")
+                coords = {
+                    "file": np.arange(data.shape[0]),
+                    "file_path": ("file", np.asarray(paths, dtype=object)),
+                    "y": lat,
+                    "x": lon,
+                }
+            ds = xr.Dataset(
+                {"data": (dims, data)},
+                coords=coords,
+                attrs={
+                    "crs": str(self.crs) if self.crs is not None else None,
+                    "transform": tuple(transform.to_gdal())
+                    if transform is not None
+                    else None,
+                    "nodata": self.nodata,
+                },
+            )
+            # Save original query (with CRS) in attrs
+            ds.attrs.update(
+                {
+                    "query_json": json.dumps(self._serialize_bbox(single_bbox)),
+                    "query_repr": (
+                        "BBox("
+                        f"{single_bbox.left}, {single_bbox.bottom}, "
+                        f"{single_bbox.right}, {single_bbox.top}, "
+                        f"crs={single_bbox.crs}"
+                        ")"
+                    ),
+                }
+            )
+            return ds
 
-        multi_files = True
-        dims = parse_2d_dims(final_data, multi_files)
-        return BBoxesResult({"data": final_data, "dims": dims})
+        # Single bbox input -> dataset directly
+        if not isinstance(bbox, list):
+            vrt_fhs = vrt_fhs_template
+            data = self._files_query_bbox(bbox, vrt_fhs)
+            ds = _make_ds(bbox, data)
+            return DataTree(dataset=ds, name="bboxes")
 
-    def _compute_polygons_query(
+        # List input -> groups 0,1,...
+        children: dict[str, DataTree] = {}
+        for i, single_bbox in enumerate(bbox_list):
+            vrt_fhs = vrt_fhs_template
+            data = self._files_query_bbox(single_bbox, vrt_fhs)
+            ds = _make_ds(single_bbox, data)
+            children[str(i)] = DataTree(dataset=ds, name=str(i))
+        return DataTree(name="bboxes", children=children)
+
+    def _compute_polygons_tree(
         self, polygons: Polygons, indexes: int | list[int] | None = None
-    ) -> PolygonsResult:
-        """Compute polygons query without dask (used by deferred computation)."""
+    ) -> xr.DataTree:
+        """Compute polygons query and return a DataTree.
+
+        - For multiple polygons: groups named "0", "1", ... each holding the
+            polygon result.
+        - For a single polygon: return a DataTree whose dataset is the polygon
+            result directly.
+        Coordinates include file paths, y/x from transform, and a scalar
+        'polygon' WKT.
+        """
+        from xarray import DataTree
+
         paths = self._indexes2paths(indexes)
         vrt_fhs = self._paths2vrt_fhs(paths)
-        polygons_data, transform_ls, mask_ls = self._files_query_polygons(
+        polygons_values, transform_ls, mask_ls = self._files_query_polygons(
             polygons, vrt_fhs
         )
 
-        multi_files = True
         n_polygons = len(polygons)
 
-        if n_polygons == 1:
-            polygons_data = [polygons_data[0]]
-            if isinstance(polygons_data[0], (np.ma.MaskedArray, np.ndarray)):
-                dims = parse_2d_dims(polygons_data[0], multi_files)
-            else:
-                dims = [("files", "?"), ("height", "?"), ("width", "?")]
-        elif len(polygons_data) > 0 and isinstance(
-            polygons_data[0], (np.ma.MaskedArray, np.ndarray)
-        ):
-            dims = parse_2d_dims(polygons_data[0], multi_files)
-        else:
-            dims = [("files", "?"), ("height", "?"), ("width", "?")]
+        def _latlon_from_transform(
+            transform: Any, height: int, width: int
+        ) -> tuple[np.ndarray, np.ndarray]:
+            if transform is None:
+                return np.arange(height), np.arange(width)
+            lon = transform.c + transform.a * np.arange(width) + transform.a * 0.5
+            lat = transform.f + transform.e * np.arange(height) + transform.e * 0.5
+            return lat, lon
 
-        return PolygonsResult(
-            {
-                "data": polygons_data,
-                "dims": f"(n_polygons:{n_polygons}, ({format_dims_as_string(dims)}))",
-                "transforms": transform_ls,
-                "masks": mask_ls,
-            }
-        )
+        def _make_poly_dataset(
+            vals_i: Any, transform_i: Any, poly_geom: Any
+        ) -> tuple[xr.Dataset | None, dict[str, DataTree]]:
+            poly_children: dict[str, DataTree] = {}
+            polygon_dataset: xr.Dataset | None = None
+            if isinstance(vals_i, (np.ndarray, np.ma.MaskedArray)):
+                # shape: (file[, band], y, x)
+                height = vals_i.shape[-2]
+                width = vals_i.shape[-1]
+                lat, lon = _latlon_from_transform(transform_i, height, width)
+                if vals_i.ndim == 4:
+                    dims = ("file", "band", "y", "x")
+                    coords: dict[str, Any] = {
+                        "file": np.arange(vals_i.shape[0]),
+                        "file_path": ("file", np.asarray(paths, dtype=object)),
+                        "band": np.arange(vals_i.shape[1]),
+                        "y": lat,
+                        "x": lon,
+                    }
+                else:
+                    dims = ("file", "y", "x")
+                    coords = {
+                        "file": np.arange(vals_i.shape[0]),
+                        "file_path": ("file", np.asarray(paths, dtype=object)),
+                        "y": lat,
+                        "x": lon,
+                    }
+                ds = xr.Dataset(
+                    {"data": (dims, vals_i)},
+                    coords=coords,
+                    attrs={
+                        "crs": str(self.crs) if self.crs is not None else None,
+                        "transform": tuple(transform_i.to_gdal())
+                        if transform_i is not None
+                        else None,
+                        "nodata": self.nodata,
+                    },
+                )
+                try:
+                    wkt = poly_geom.wkt
+                except Exception:
+                    wkt = str(poly_geom)
+                ds.attrs.update(
+                    {
+                        "query_json": json.dumps(
+                            {
+                                "type": "Polygon",
+                                "crs": str(self.crs) if self.crs is not None else None,
+                                "wkt": wkt,
+                            }
+                        ),
+                        "query_repr": f"Polygon(crs={self.crs})",
+                    }
+                )
+                polygon_dataset = ds
+            else:
+                # create per-file children with their own coords
+                for fidx, arr in enumerate(vals_i):
+                    height = arr.shape[-2]
+                    width = arr.shape[-1]
+                    lat, lon = _latlon_from_transform(transform_i, height, width)
+                    if arr.ndim == 3:
+                        fdims = ("band", "y", "x")
+                        fcoords = {"band": np.arange(arr.shape[0]), "y": lat, "x": lon}
+                    else:
+                        fdims = ("y", "x")
+                        fcoords = {"y": lat, "x": lon}
+                    fds = xr.Dataset(
+                        {"data": (fdims, arr)},
+                        coords=fcoords,
+                        attrs={
+                            "crs": str(self.crs) if self.crs is not None else None,
+                            "transform": tuple(transform_i.to_gdal())
+                            if transform_i is not None
+                            else None,
+                            "nodata": self.nodata,
+                        },
+                    )
+                    fds = fds.assign_coords({"file": (), "file_path": ()})
+                    fds["file"] = xr.DataArray(fidx)
+                    fds["file_path"] = xr.DataArray(paths[fidx])
+                    poly_children[str(fidx)] = DataTree(dataset=fds, name=str(fidx))
+            return polygon_dataset, poly_children
+
+        # Build outputs depending on number of polygons
+        if n_polygons == 1:
+            vals_i = polygons_values[0]
+            mask_i = mask_ls[0] if len(mask_ls) > 0 else None
+            transform_i = transform_ls[0] if len(transform_ls) > 0 else None
+            poly_geom = polygons.geodataframe.geometry.iloc[0]
+            polygon_dataset, poly_children = _make_poly_dataset(
+                vals_i, transform_i, poly_geom
+            )
+            # attach mask if available
+            if mask_i is not None and mask_i.size > 0:
+                # ensure mask uses same y/x coords as dataset for alignment
+                h, w = mask_i.shape
+                lat, lon = _latlon_from_transform(transform_i, h, w)
+                mds = xr.Dataset(
+                    {"mask": (("y", "x"), mask_i)}, coords={"y": lat, "x": lon}
+                )
+                poly_children["mask"] = DataTree(dataset=mds, name="mask")
+            return DataTree(
+                name="polygons", dataset=polygon_dataset, children=poly_children
+            )
+
+        # Multiple polygons -> groups 0..N-1
+        children: dict[str, DataTree] = {}
+        for i in range(n_polygons):
+            vals_i = polygons_values[i]
+            mask_i = mask_ls[i] if i < len(mask_ls) else None
+            transform_i = transform_ls[i] if i < len(transform_ls) else None
+            poly_geom = polygons.geodataframe.geometry.iloc[i]
+            polygon_dataset, poly_children = _make_poly_dataset(
+                vals_i, transform_i, poly_geom
+            )
+            if mask_i is not None and mask_i.size > 0:
+                h, w = mask_i.shape
+                lat, lon = _latlon_from_transform(transform_i, h, w)
+                mds = xr.Dataset(
+                    {"mask": (("y", "x"), mask_i)}, coords={"y": lat, "x": lon}
+                )
+                poly_children["mask"] = DataTree(dataset=mds, name="mask")
+            children[str(i)] = DataTree(
+                name=str(i), dataset=polygon_dataset, children=poly_children
+            )
+        return DataTree(name="polygons", children=children)
 
     @functools.lru_cache(maxsize=128)  # noqa: B019
     def _cached_load_warp_file(self, file_path: str) -> DatasetReader:
@@ -1578,7 +1892,7 @@ class RasterDataset(GeoDataset):
         points: Points,
         indexes: int | list[int] | None = None,
         parallel_loading: bool | None = None,
-    ) -> PointsResult:
+    ) -> xr.Dataset:
         """Query the dataset for the given file index and points.
 
         Parameters
@@ -1601,38 +1915,17 @@ class RasterDataset(GeoDataset):
         if parallel_loading is None:
             parallel_loading = self.parallel_loading
 
-        paths = self._indexes2paths(indexes)
-
-        if parallel_loading:
+        if parallel_loading and HAS_DASK:
             self._check_dask_available()
-            # Create delayed tasks for file loading and points query
-            delayed_vrt_fhs = [delayed(self._load_warp_file)(fp) for fp in paths]
-            delayed_points_data = [
-                delayed(self._file_query_points)(points, vrt_fh)
-                for vrt_fh in delayed_vrt_fhs
-            ]
-            # Compute all delayed tasks in parallel
-            points_data_list = dask.compute(*delayed_points_data)
-            data_ls = np.ma.asarray(points_data_list)
-        else:
-            # Use original logic for non-dask case
-            vrt_fhs = self._paths2vrt_fhs(paths)
-            data_ls = self._files_query_points(points, vrt_fhs)
-
-        multi_files = True
-        if isinstance(indexes, int):
-            if data_ls is not None and hasattr(data_ls, "squeeze"):
-                data_ls = data_ls.squeeze(0)
-            multi_files = False
-        dims, data_ls = parse_1d_dims(data_ls, multi_files)
-        return PointsResult({"data": data_ls, "dims": dims})
+            return dask.compute(delayed(self._compute_points_ds)(points, indexes))[0]
+        return self._compute_points_ds(points, indexes)
 
     def bbox_query(
         self,
         bbox: BoundingBox | list[BoundingBox],
         indexes: int | list[int] | None = None,
         parallel_loading: bool | None = None,
-    ) -> BBoxesResult:
+    ) -> xr.DataTree:
         """Query the dataset for the given file index and bounding box(es).
 
         Parameters
@@ -1658,57 +1951,17 @@ class RasterDataset(GeoDataset):
         if parallel_loading is None:
             parallel_loading = self.parallel_loading
 
-        bbox_is_list = isinstance(bbox, list)
-        # If single bbox, convert to list for processing, but remember original format
-        bbox_list = bbox if bbox_is_list else [bbox]
-
-        paths = self._indexes2paths(indexes)
-
-        # Process each bbox separately
-        all_bbox_data = []
-        for single_bbox in bbox_list:
-            if parallel_loading:
-                self._check_dask_available()
-                # Create delayed tasks for file loading and bbox query
-                delayed_vrt_fhs = [delayed(self._load_warp_file)(fp) for fp in paths]
-                delayed_bbox_data = [
-                    delayed(self._file_query_bbox)(single_bbox, vrt_fh)
-                    for vrt_fh in delayed_vrt_fhs
-                ]
-                # Compute all delayed tasks in parallel
-                bbox_data_list = dask.compute(*delayed_bbox_data)
-                data_ls = np.ma.asarray(bbox_data_list)
-            else:
-                vrt_fhs = self._paths2vrt_fhs(paths)
-                data_ls = self._files_query_bbox(single_bbox, vrt_fhs)
-
-            all_bbox_data.append(data_ls)
-
-        # Stack results appropriately
-        if bbox_is_list:
-            # If input was a list, add bbox dimension
-            final_data = np.ma.asarray(all_bbox_data)
-            # Transpose to get (n_files, n_bboxes, height, width) or
-            # (n_files, n_bboxes, n_bands, height, width)
-            if final_data.ndim == 4:  # (n_bboxes, n_files, height, width)
-                final_data = final_data.transpose(1, 0, 2, 3)
-            elif final_data.ndim == 5:  # (n_bboxes, n_files, n_bands, height, width)
-                final_data = final_data.transpose(1, 0, 2, 3, 4)
-        else:
-            # If input was single bbox, no bbox dimension
-            final_data = all_bbox_data[0]
-
-        # Never squeeze file dimension, even if it's 1
-        multi_files = True
-        dims = parse_2d_dims(final_data, multi_files)
-        return BBoxesResult({"data": final_data, "dims": dims})
+        if parallel_loading and HAS_DASK:
+            self._check_dask_available()
+            return dask.compute(delayed(self._compute_bboxes_tree)(bbox, indexes))[0]
+        return self._compute_bboxes_tree(bbox, indexes)
 
     def polygons_query(
         self,
         polygons: Polygons,
         indexes: int | list[int] | None = None,
         parallel_loading: bool | None = None,
-    ) -> PolygonsResult:
+    ) -> xr.DataTree:
         """Query the dataset for the given file index and polygons.
 
         Parameters
@@ -1733,119 +1986,23 @@ class RasterDataset(GeoDataset):
         if parallel_loading is None:
             parallel_loading = self.parallel_loading
 
-        paths = self._indexes2paths(indexes)
-
-        if parallel_loading:
+        if parallel_loading and HAS_DASK:
             self._check_dask_available()
-            # Create delayed tasks for file loading and polygons query
-            delayed_vrt_fhs = [delayed(self._load_warp_file)(fp) for fp in paths]
-            delayed_polygons_data = [
-                delayed(self._file_query_polygons)(polygons, vrt_fh)
-                for vrt_fh in delayed_vrt_fhs
-            ]
-            # Compute all delayed tasks in parallel
-            polygons_results_list = dask.compute(*delayed_polygons_data)
+            return dask.compute(
+                delayed(self._compute_polygons_tree)(polygons, indexes)
+            )[0]
 
-            # Process polygons results similar to the original method
-            data_ls_all = [result[0] for result in polygons_results_list]
-            # All should have same transforms
-            transform_ls = polygons_results_list[0][1]
-            # All should have same masks
-            mask_ls = polygons_results_list[0][2]
-
-            # Process the results similar to non-dask version
-            # stack the files for each polygon
-            n_polygons = len(polygons)
-            poly_list = [[] for _ in range(n_polygons)]
-            for file_data in data_ls_all:
-                for i, poly_i in enumerate(file_data):
-                    poly_list[i].append(poly_i)
-
-            # Handle arrays with potentially different shapes
-            polygons_values = []
-            for arr in poly_list:
-                try:
-                    data = np.ma.asarray(arr)
-                    polygons_values.append(data)
-                except ValueError:  # noqa: PERF203
-                    # If arrays have incompatible shapes, keep as list
-                    polygons_values.append(arr)
-
-            # Apply same logic as non-dask version
-            if n_polygons == 1:
-                # For single polygon, convert to numpy array if possible
-                try:
-                    polygons_data_array = np.ma.asarray(polygons_values[0])
-                    polygons_data = [
-                        polygons_data_array
-                    ]  # Wrap in list for polygon dimension
-                    dims = parse_2d_dims(polygons_data_array, True)
-                except ValueError:
-                    polygons_data = [polygons_values[0]]
-                    dims = [("files", "?"), ("height", "?"), ("width", "?")]
-            else:
-                polygons_data = polygons_values
-                if len(polygons_data) > 0 and isinstance(
-                    polygons_data[0], (np.ma.MaskedArray, np.ndarray)
-                ):
-                    dims = parse_2d_dims(polygons_data[0], True)
-                else:
-                    dims = [("files", "?"), ("height", "?"), ("width", "?")]
-
-            return PolygonsResult(
-                {
-                    "data": polygons_data,
-                    "dims": f"(n_polygons:{len(polygons)}, ({format_dims_as_string(dims)}))",  # noqa: E501
-                    "transforms": transform_ls,
-                    "masks": mask_ls,
-                }
-            )
-        vrt_fhs = self._paths2vrt_fhs(paths)
-        polygons_data, transform_ls, mask_ls = self._files_query_polygons(
-            polygons, vrt_fhs
-        )
-
-        # Never squeeze file dimension, always keep multi_files=True
-        multi_files = True
-
-        n_polygons = len(polygons)
-        if n_polygons == 1:
-            # For single polygon, polygons_data is already a list with one element
-            # which is a numpy array with shape (n_files, height, width)
-            # We need to wrap it in another list to maintain polygon dimension
-            polygons_data = [polygons_data[0]]  # polygons_data[0] is the stacked array
-            if isinstance(polygons_data[0], (np.ma.MaskedArray, np.ndarray)):
-                dims = parse_2d_dims(polygons_data[0], multi_files)
-            else:
-                dims = [("files", "?"), ("height", "?"), ("width", "?")]
-        # For multiple polygons, polygons_data is already structured correctly
-        # Each element in polygons_data corresponds to one polygon
-        # Never squeeze file dimension
-        elif len(polygons_data) > 0 and isinstance(
-            polygons_data[0], (np.ma.MaskedArray, np.ndarray)
-        ):
-            dims = parse_2d_dims(polygons_data[0], multi_files)
-        else:
-            dims = [("files", "?"), ("height", "?"), ("width", "?")]
-
-        return PolygonsResult(
-            {
-                "data": polygons_data,
-                "dims": f"(n_polygons:{n_polygons}, ({format_dims_as_string(dims)}))",
-                "transforms": transform_ls,
-                "masks": mask_ls,
-            },
-        )
+        return self._compute_polygons_tree(polygons, indexes)
 
     def query(
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         indexes: int | list[int] | None = None,
         parallel_loading: bool | None = None,
-    ) -> QueryResult:
-        """Retrieve images values for given query.
+    ) -> xr.DataTree:
+        """Retrieve image values for given query.
 
-        This method is an more flexible implementation compared to
+        This method is a more flexible implementation compared to
         :meth:`__getitem__`, which can retrieve images only for the given pairs.
 
         Parameters
@@ -1863,8 +2020,8 @@ class RasterDataset(GeoDataset):
 
         Returns
         -------
-        result : QueryResult
-            a QueryResult instance containing the results of the various queries.
+        result : xarray.DataTree
+            A DataTree containing the results of the various queries.
 
         """
         if parallel_loading is None:
@@ -1872,9 +2029,9 @@ class RasterDataset(GeoDataset):
 
         if isinstance(query, Points):
             query = GeoQuery(points=query)
-        if isinstance(query, BoundingBox):
+        elif isinstance(query, BoundingBox):
             query = GeoQuery(boxes=query)
-        if isinstance(query, Polygons):
+        elif isinstance(query, Polygons):
             query = GeoQuery(polygons=query)
 
         paths = self._indexes2paths(indexes)
@@ -2473,444 +2630,449 @@ class RasterDataset(GeoDataset):
         array2kmz(arr, out_file, bounds, img_kwargs, cbar_kwargs, keep_kml, verbose)
 
 
-class HierarchicalDataset(GeoDataset):
-    """A base class for hierarchical dataset, like h5 and nc files.
+# class HierarchicalDataset(GeoDataset):
+#     """A base class for hierarchical dataset, like h5 and nc files.
 
-    .. note::
-        This class is used to load and sample data from a single file. If you
-        want to load and sample data from multiple files, you should use
-        :class:`MultiHierarchicalDataset`.
-    """
+#     .. note::
+#         This class is used to load and sample data from a single file. If you
+#         want to load and sample data from multiple files, you should use
+#         :class:`MultiHierarchicalDataset`.
+#     """
 
-    lat_name: str = "lat"
-    lon_name: str = "lon"
+#     lat_name: str = "lat"
+#     lon_name: str = "lon"
 
-    def __init__(
-        self,
-        path: str | Path,
-        group: str | None = None,
-        roi: BoundingBox | None = None,
-    ) -> None:
-        super().__init__()
-        self._path = Path(path)
-        self._group = group
-        self._roi = roi
-        self._update_geo_info()
-        warnings.warn(
-            "HierarchicalDataset is still in development and may not work as expected.",
-            stacklevel=2,
-        )
+#     def __init__(
+#         self,
+#         path: str | Path,
+#         group: str | None = None,
+#         roi: BoundingBox | None = None,
+#     ) -> None:
+#         super().__init__()
+#         self._path = Path(path)
+#         self._group = group
+#         self._roi = roi
+#         self._update_geo_info()
+#         warnings.warn(
+#             "HierarchicalDataset is still in development and may not work as
+# expected.",
+#             stacklevel=2,
+#         )
 
-    def __repr__(self) -> str:
-        return self._repr_str
+#     def __repr__(self) -> str:
+#         return self._repr_str
 
-    def _update_geo_info(self) -> None:
-        bound, res, shape, crs, ds_info = self._parse_geo_info(self._path)
-        self._bound = bound
-        self._res = res
-        self._crs = crs
-        self._shape = shape
-        self._lat = ds_info[0]
-        self._lon = ds_info[1]
-        self._variables = ds_info[2]
-        self._repr_str = ds_info[3]
+#     def _update_geo_info(self) -> None:
+#         bound, res, shape, crs, ds_info = self._parse_geo_info(self._path)
+#         self._bound = bound
+#         self._res = res
+#         self._crs = crs
+#         self._shape = shape
+#         self._lat = ds_info[0]
+#         self._lon = ds_info[1]
+#         self._variables = ds_info[2]
+#         self._repr_str = ds_info[3]
 
-    def _parse_lat_lon_name(self, ds: xr.Dataset) -> tuple[str, str]:
-        """Parse the name of the latitude and longitude variables."""
-        lat_name = None
-        lon_name = None
-        if self.lat_name in ds.variables and self.lon_name in ds.variables:
-            return None
+#     def _parse_lat_lon_name(self, ds: xr.Dataset) -> tuple[str, str]:
+#         """Parse the name of the latitude and longitude variables."""
+#         lat_name = None
+#         lon_name = None
+#         if self.lat_name in ds.variables and self.lon_name in ds.variables:
+#             return None
 
-        for name in ds.variables:
-            if name.lower() in lat_names:
-                lat_name = name
-            if name.lower() in lon_names:
-                lon_name = name
-        if lat_name is None or lon_name is None:
-            msg = (
-                "The dataset does not contain latitude and longitude variables. "
-                "Please specify the names of the latitude and longitude variables."
-            )
-            raise ValueError(
-                msg,
-            )
-        return lat_name, lon_name
+#         for name in ds.variables:
+#             if name.lower() in lat_names:
+#                 lat_name = name
+#             if name.lower() in lon_names:
+#                 lon_name = name
+#         if lat_name is None or lon_name is None:
+#             msg = (
+#                 "The dataset does not contain latitude and longitude variables. "
+#                 "Please specify the names of the latitude and longitude variables."
+#             )
+#             raise ValueError(
+#                 msg,
+#             )
+#         return lat_name, lon_name
 
-    def _parse_geo_info(
-        self,
-        path: str | Path,
-    ) -> tuple[BoundingBox, tuple[float, float], tuple[int, int], CRS]:
-        """Parse the geoinformation of the dataset."""
-        with xr.open_dataset(path) as ds:
-            coord_names = self._parse_lat_lon_name(ds)
-            if coord_names is not None:
-                self.lat_name, self.lon_name = coord_names
+#     def _parse_geo_info(
+#         self,
+#         path: str | Path,
+#     ) -> tuple[BoundingBox, tuple[float, float], tuple[int, int], CRS]:
+#         """Parse the geoinformation of the dataset."""
+#         with xr.open_dataset(path) as ds:
+#             coord_names = self._parse_lat_lon_name(ds)
+#             if coord_names is not None:
+#                 self.lat_name, self.lon_name = coord_names
 
-            repr_str = ds.__repr__()
-            variables = list(ds.variables)
-            lat = ds[self.lat_name].values
-            lon = ds[self.lon_name].values
-            crs = ds.rio.crs
+#             repr_str = ds.__repr__()
+#             variables = list(ds.variables)
+#             lat = ds[self.lat_name].values
+#             lon = ds[self.lon_name].values
+#             crs = ds.rio.crs
 
-        # parse geo-information
-        if crs is None:
-            if (
-                np.all(lat >= -90)
-                and np.all(lat <= 90)
-                and np.all(lon >= -180)
-                and np.all(lon <= 180)
-            ):
-                warnings.warn(
-                    "No CRS is specified for the dataset, assuming the lat/lon values "
-                    "are in the range of WGS84.",
-                    stacklevel=2,
-                )
-                crs = CRS.from_epsg(4326)
-            else:
-                msg = (
-                    "No CRS is specified for the dataset, and the lat/lon values are "
-                    "not in the range of WGS84. Please specify the CRS of the dataset"
-                    "using the :meth:`set_crs` method later."
-                )
-                raise ValueError(
-                    msg,
-                )
-        else:
-            crs = CRS.from_user_input(ds.rio.crs)
-        # parse bound, resolution, shape
-        bound, res, shape = geoinfo_from_latlon(lat, lon)
-        bound.set_crs(crs)
+#         # parse geo-information
+#         if crs is None:
+#             if (
+#                 np.all(lat >= -90)
+#                 and np.all(lat <= 90)
+#                 and np.all(lon >= -180)
+#                 and np.all(lon <= 180)
+#             ):
+#                 warnings.warn(
+#                     "No CRS is specified for the dataset, assuming the lat/lon
+# values "
+#                     "are in the range of WGS84.",
+#                     stacklevel=2,
+#                 )
+#                 crs = CRS.from_epsg(4326)
+#             else:
+#                 msg = (
+#                     "No CRS is specified for the dataset, and the lat/lon values are "
+#                     "not in the range of WGS84. Please specify the CRS of the dataset"
+#                     "using the :meth:`set_crs` method later."
+#                 )
+#                 raise ValueError(
+#                     msg,
+#                 )
+#         else:
+#             crs = CRS.from_user_input(ds.rio.crs)
+#         # parse bound, resolution, shape
+#         bound, res, shape = geoinfo_from_latlon(lat, lon)
+#         bound.set_crs(crs)
 
-        return bound, res, shape, crs, (lat, lon, variables, repr_str)
+#         return bound, res, shape, crs, (lat, lon, variables, repr_str)
 
-    def __getitem__(self, var: str) -> xr.DataArray | xr.Dataset:
-        """Get the variable from the dataset."""
-        with xr.open_dataset(self.path, group=self.group) as ds:
-            return ds[var]
+#     def __getitem__(self, var: str) -> xr.DataArray | xr.Dataset:
+#         """Get the variable from the dataset."""
+#         with xr.open_dataset(self.path, group=self.group) as ds:
+#             return ds[var]
 
-    def flush_geo_info(self) -> None:
-        """Flush the geoinformation of the dataset to the given file."""
-        with xr.open_dataset(self.path, group=self.group, mode="a") as ds:
-            ds.rio.write_crs(self.crs)
-            ds.rio.set_spatial_dims(x_dim=self.lon_name, y_dim=self.lat_name)
-        self._update_geo_info()
+#     def flush_geo_info(self) -> None:
+#         """Flush the geoinformation of the dataset to the given file."""
+#         with xr.open_dataset(self.path, group=self.group, mode="a") as ds:
+#             ds.rio.write_crs(self.crs)
+#             ds.rio.set_spatial_dims(x_dim=self.lon_name, y_dim=self.lat_name)
+#         self._update_geo_info()
 
-    def _bbox_query(
-        self,
-        bbox: BoundingBox,
-        variable: str | None = None,
-        **kwargs,
-    ) -> xr.DataArray | xr.Dataset:
-        """Retrieve the data of the dataset for the given bounding box."""
-        bbox = self._ensure_query_crs(bbox)
-        # get slice for lat/lon values
-        if self.lat[0] < self.lat[-1]:
-            slice_lat = slice(bbox.bottom, bbox.top)
-        else:
-            slice_lat = slice(bbox.top, bbox.bottom)
-        slice_lon = slice(bbox.left, bbox.right)
-        # open and read the dataset
-        if variable is None:
-            ds = xr.open_dataarray(self.path, group=self.group, **kwargs)
-        else:
-            ds = xr.open_dataset(self.path, group=self.group, **kwargs)[variable]
-        if "y" not in ds.coords or "x" not in ds.coords:
-            ds = ds.rename({self.lat_name: "y", self.lon_name: "x"})
-        data = ds.sel(y=slice_lat, x=slice_lon)
-        # close dataset
-        ds.close()
+#     def _bbox_query(
+#         self,
+#         bbox: BoundingBox,
+#         variable: str | None = None,
+#         **kwargs,
+#     ) -> xr.DataArray | xr.Dataset:
+#         """Retrieve the data of the dataset for the given bounding box."""
+#         bbox = self._ensure_query_crs(bbox)
+#         # get slice for lat/lon values
+#         if self.lat[0] < self.lat[-1]:
+#             slice_lat = slice(bbox.bottom, bbox.top)
+#         else:
+#             slice_lat = slice(bbox.top, bbox.bottom)
+#         slice_lon = slice(bbox.left, bbox.right)
+#         # open and read the dataset
+#         if variable is None:
+#             ds = xr.open_dataarray(self.path, group=self.group, **kwargs)
+#         else:
+#             ds = xr.open_dataset(self.path, group=self.group, **kwargs)[variable]
+#         if "y" not in ds.coords or "x" not in ds.coords:
+#             ds = ds.rename({self.lat_name: "y", self.lon_name: "x"})
+#         data = ds.sel(y=slice_lat, x=slice_lon)
+#         # close dataset
+#         ds.close()
 
-        return data
+#         return data
 
-    def _points_query(
-        self,
-        points: Points,
-        variable: str | None = None,
-    ) -> np.ndarray:
-        """Return the values of dataset at given points.
+#     def _points_query(
+#         self,
+#         points: Points,
+#         variable: str | None = None,
+#     ) -> np.ndarray:
+#         """Return the values of dataset at given points.
 
-        Points that outside the dataset will be masked.
-        """
+#         Points that outside the dataset will be masked.
+#         """
 
-    def _polygons_query(
-        self,
-        polygons: Polygons,
-        variable: str | None = None,
-    ) -> np.ndarray:
-        """Return the values of the dataset at the given polygons."""
+#     def _polygons_query(
+#         self,
+#         polygons: Polygons,
+#         variable: str | None = None,
+#     ) -> np.ndarray:
+#         """Return the values of the dataset at the given polygons."""
 
-    def query(
-        self,
-        query: GeoQuery | Points | BoundingBox | Polygons,
-        variable: str | None = None,
-        **kwargs,
-    ) -> QueryResult:
-        """Retrieve images values for given query.
+#     def query(
+#         self,
+#         query: GeoQuery | Points | BoundingBox | Polygons,
+#         variable: str | None = None,
+#         **kwargs,
+#     ) -> QueryResult:
+#         """Retrieve images values for given query.
 
-        Parameters
-        ----------
-        query : GeoQuery | Points | BoundingBox | Polygons
-            query to index the dataset. It can be :class:`Points`,
-            :class:`BoundingBox`, :class:`Polygons`,
-            or a composite :class:`GeoQuery` (recommended) object.
-        variable : str, optional
-            name of the variable to retrieve. If None, all variables will be retrieved.
-        **kwargs : dict
-            keyword arguments to pass to :meth:`xarray.open_dataarray` if
-            variable is None, otherwise to :meth:`xarray.open_dataset`.
+#         Parameters
+#         ----------
+#         query : GeoQuery | Points | BoundingBox | Polygons
+#             query to index the dataset. It can be :class:`Points`,
+#             :class:`BoundingBox`, :class:`Polygons`,
+#             or a composite :class:`GeoQuery` (recommended) object.
+#         variable : str, optional
+#             name of the variable to retrieve. If None, all variables will be
+#             retrieved.
+#         **kwargs : dict
+#             keyword arguments to pass to :meth:`xarray.open_dataarray` if
+#             variable is None, otherwise to :meth:`xarray.open_dataset`.
 
-        """
-        if isinstance(query, Points):
-            query = GeoQuery(points=query)
-        if isinstance(query, BoundingBox):
-            query = GeoQuery(boxes=query)
-        if isinstance(query, Polygons):
-            query = GeoQuery(polygons=query)
+#         """
+#         if isinstance(query, Points):
+#             query = GeoQuery(points=query)
+#         if isinstance(query, BoundingBox):
+#             query = GeoQuery(boxes=query)
+#         if isinstance(query, Polygons):
+#             query = GeoQuery(polygons=query)
 
-        return self._sample_data(query, variable, **kwargs)
+#         return self._sample_data(query, variable, **kwargs)
 
-    def _sample_data(
-        self,
-        query: GeoQuery,
-        variable: str | None = None,
-        **kwargs,
-    ) -> QueryResult:
-        """Sample data from the dataset for the given query."""
-        # TODO: refine points and polygons query
-        # parse points result
-        points_result = None
-        if query.points is not None:
-            points_values = self._points_query(query.points, variable, **kwargs)
-            dims, points_result = parse_1d_dims(points_values, multi_files=False)
-            points_result = {"data": points_values, "dims": dims}
-        # parse bounding boxes result
-        boxes_result = None
-        if query.boxes is not None:
-            if len(query.boxes) == 1:
-                boxes_values = self._bbox_query(query.boxes[0], variable, **kwargs)
-                dims = parse_2d_dims(boxes_values)
-            else:
-                boxes_values = [
-                    self._bbox_query(bbox, variable, **kwargs) for bbox in query.boxes
-                ]
-                dims = parse_2d_dims(boxes_values[0], details=False)
-                dims = f"boxes:{len(boxes_values)}, ({dims})"
-            boxes_result = {"data": boxes_values, "dims": f"({dims})"}
-        # parse polygons result
-        polygons_result = None
-        if query.polygons is not None:
-            self._polygons_query(query.polygons, variable)
+#     def _sample_data(
+#         self,
+#         query: GeoQuery,
+#         variable: str | None = None,
+#         **kwargs,
+#     ) -> QueryResult:
+#         """Sample data from the dataset for the given query."""
+#         # TODO: refine points and polygons query
+#         # parse points result
+#         points_result = None
+#         if query.points is not None:
+#             points_values = self._points_query(query.points, variable, **kwargs)
+#             dims, points_result = parse_1d_dims(points_values, multi_files=False)
+#             points_result = {"data": points_values, "dims": dims}
+#         # parse bounding boxes result
+#         boxes_result = None
+#         if query.boxes is not None:
+#             if len(query.boxes) == 1:
+#                 boxes_values = self._bbox_query(query.boxes[0], variable, **kwargs)
+#                 dims = parse_2d_dims(boxes_values)
+#             else:
+#                 boxes_values = [
+#                     self._bbox_query(bbox, variable, **kwargs) for bbox in query.boxes
+#                 ]
+#                 dims = parse_2d_dims(boxes_values[0], details=False)
+#                 dims = f"boxes:{len(boxes_values)}, ({dims})"
+#             boxes_result = {"data": boxes_values, "dims": f"({dims})"}
+#         # parse polygons result
+#         polygons_result = None
+#         if query.polygons is not None:
+#             self._polygons_query(query.polygons, variable)
 
-        return QueryResult(points_result, boxes_result, polygons_result, query)
+#         return QueryResult(points_result, boxes_result, polygons_result, query)
 
-    def sel(
-        self,
-        variable: str | None = None,
-        **kwargs,
-    ) -> xr.DataArray | xr.Dataset:
-        """Select a variable from the dataset.
+#     def sel(
+#         self,
+#         variable: str | None = None,
+#         **kwargs,
+#     ) -> xr.DataArray | xr.Dataset:
+#         """Select a variable from the dataset.
 
-        This method is a wrapper of :meth:`xarray.Dataset.sel` or
-        :meth:`xarray.DataArray.sel`.
+#         This method is a wrapper of :meth:`xarray.Dataset.sel` or
+#         :meth:`xarray.DataArray.sel`.
 
-        Parameters
-        ----------
-        variable : str, optional
-            name of the variable to select. If None, the entire dataset will
-            be selected.
-        **kwargs : dict
-            keyword arguments to pass to :meth:`xarray.Dataset.sel` or
-            :meth:`xarray.DataArray.sel`.
+#         Parameters
+#         ----------
+#         variable : str, optional
+#             name of the variable to select. If None, the entire dataset will
+#             be selected.
+#         **kwargs : dict
+#             keyword arguments to pass to :meth:`xarray.Dataset.sel` or
+#             :meth:`xarray.DataArray.sel`.
 
-        """
-        with xr.open_dataset(self.path, group=self.group) as ds:
-            return ds.sel(**kwargs) if variable is None else ds[variable].sel(**kwargs)
+#         """
+#         with xr.open_dataset(self.path, group=self.group) as ds:
+#             return ds.sel(**kwargs) if variable is None else ds[variable].sel
+# (**kwargs)
 
-    def isel(
-        self,
-        variable: str | None = None,
-        **kwargs,
-    ) -> xr.DataArray | xr.Dataset:
-        """Index a variable from the dataset.
+#     def isel(
+#         self,
+#         variable: str | None = None,
+#         **kwargs,
+#     ) -> xr.DataArray | xr.Dataset:
+#         """Index a variable from the dataset.
 
-        This method is a wrapper of :meth:`xarray.Dataset.isel` or
-        :meth:`xarray.DataArray.isel`.
+#         This method is a wrapper of :meth:`xarray.Dataset.isel` or
+#         :meth:`xarray.DataArray.isel`.
 
-        Parameters
-        ----------
-        variable : str, optional
-            name of the variable to index. If None, the entire dataset will be indexed.
-        **kwargs : dict
-            keyword arguments to pass to :meth:`xarray.Dataset.isel` or
-            :meth:`xarray.DataArray.isel`.
+#         Parameters
+#         ----------
+#         variable : str, optional
+#             name of the variable to index. If None, the entire dataset will be
+#             indexed.
+#         **kwargs : dict
+#             keyword arguments to pass to :meth:`xarray.Dataset.isel` or
+#             :meth:`xarray.DataArray.isel`.
 
-        """
-        with xr.open_dataset(self.path, group=self.group) as ds:
-            if variable is None:
-                data = ds.isel(**kwargs)
-            else:
-                data = ds[variable].isel(**kwargs)
-        return data
+#         """
+#         with xr.open_dataset(self.path, group=self.group) as ds:
+#             if variable is None:
+#                 data = ds.isel(**kwargs)
+#             else:
+#                 data = ds[variable].isel(**kwargs)
+#         return data
 
-    def set_crs(self, crs: CRS | str) -> None:
-        """Set the CRS of the dataset.
+#     def set_crs(self, crs: CRS | str) -> None:
+#         """Set the CRS of the dataset.
 
-        .. note::
-            This method is used to set the CRS of the dataset if it is not
-            specified in the dataset. If the CRS is already specified in the
-            dataset, this method will overwrite the CRS.
-        """
-        self._crs = CRS.from_user_input(crs)
-        self._bounds.set_crs(self._crs)
+#         .. note::
+#             This method is used to set the CRS of the dataset if it is not
+#             specified in the dataset. If the CRS is already specified in the
+#             dataset, this method will overwrite the CRS.
+#         """
+#         self._crs = CRS.from_user_input(crs)
+#         self._bounds.set_crs(self._crs)
 
-    @property
-    def path(self) -> Path:
-        """The path of the dataset."""
-        return self._path
+#     @property
+#     def path(self) -> Path:
+#         """The path of the dataset."""
+#         return self._path
 
-    @property
-    def group(self) -> str:
-        """The group of the dataset."""
-        return self._group
+#     @property
+#     def group(self) -> str:
+#         """The group of the dataset."""
+#         return self._group
 
-    @property
-    def shape(self) -> tuple[int, int]:
-        """The shape of the dataset in (height, width)."""
-        return self._shape
+#     @property
+#     def shape(self) -> tuple[int, int]:
+#         """The shape of the dataset in (height, width)."""
+#         return self._shape
 
-    @property
-    def bounds(self) -> BoundingBox:
-        """The bounds of the dataset."""
-        return self._bound
+#     @property
+#     def bounds(self) -> BoundingBox:
+#         """The bounds of the dataset."""
+#         return self._bound
 
-    @property
-    def lat(self) -> np.ndarray:
-        """The latitudes of the dataset."""
-        return self._lat
+#     @property
+#     def lat(self) -> np.ndarray:
+#         """The latitudes of the dataset."""
+#         return self._lat
 
-    @property
-    def lon(self) -> np.ndarray:
-        """The longitudes of the dataset."""
-        return self._lon
+#     @property
+#     def lon(self) -> np.ndarray:
+#         """The longitudes of the dataset."""
+#         return self._lon
 
-    @property
-    def variables(self) -> list[str]:
-        """The variables of the dataset."""
-        return self._variables
+#     @property
+#     def variables(self) -> list[str]:
+#         """The variables of the dataset."""
+#         return self._variables
 
-    def get_profile(
-        self,
-        bbox: Literal["roi", "bounds"] | BoundingBox = "roi",
-    ) -> Profile | None:
-        bbox = self._ensure_bbox(bbox)
-        if bbox is None:
-            return None
-        profile = Profile.from_bounds_res(bbox, self.res)
-        profile["crs"] = self.crs
-        return profile
+#     def get_profile(
+#         self,
+#         bbox: Literal["roi", "bounds"] | BoundingBox = "roi",
+#     ) -> Profile | None:
+#         bbox = self._ensure_bbox(bbox)
+#         if bbox is None:
+#             return None
+#         profile = Profile.from_bounds_res(bbox, self.res)
+#         profile["crs"] = self.crs
+#         return profile
 
-    def array2tiff(
-        self,
-        arr: np.ndarray,
-        filename: str | Path,
-        bounds: BoundingBox | None = None,
-        bbox: BoundingBox | None = None,
-        band_names: Iterable[str] | None = None,
-        arr_type: Literal["data", "mask"] = "data",
-        nodata: float | None = None,
-        overwrite: bool = False,
-    ) -> None:
-        """Save a numpy array to a tiff file using the geoinformation of dataset.
+#     def array2tiff(
+#         self,
+#         arr: np.ndarray,
+#         filename: str | Path,
+#         bounds: BoundingBox | None = None,
+#         bbox: BoundingBox | None = None,
+#         band_names: Iterable[str] | None = None,
+#         arr_type: Literal["data", "mask"] = "data",
+#         nodata: float | None = None,
+#         overwrite: bool = False,
+#     ) -> None:
+#         """Save a numpy array to a tiff file using the geoinformation of dataset.
 
-        Parameters
-        ----------
-        arr : numpy.ndarray
-            numpy array to save. arr can be a 2D array or a 3D array. If arr is a
-            3D array, the first dimension should be the band dimension.
-        filename : str or Path
-            path to the tiff file to save
-        bounds : BoundingBox, optional
-            the bounds of the output dataset. Default is None, which means the
-            roi of the dataset will be used.
-        bbox : BoundingBox, optional
-            if specified, the input array will be saved to the given part/bbox of
-            dataset. Default is None, which means the array will be saved to the
-            entire dataset.
-        band_names : Sequence of str, optional
-            names of bands to save. Default is None, which will use the band indexes.
-        arr_type : str, one of ['data', 'mask'], optional
-            type of the array to save. Default is 'data'.
-        nodata : float or int, optional
-            no data value of the dataset. If None, will automatically parse the
-            a proper no data value for the array.
-        overwrite : bool, optional
-            if True, overwrite the existing file. Default is False, which means
-            the array will be saved in append mode (r+ mode).
+#         Parameters
+#         ----------
+#         arr : numpy.ndarray
+#             numpy array to save. arr can be a 2D array or a 3D array. If arr is a
+#             3D array, the first dimension should be the band dimension.
+#         filename : str or Path
+#             path to the tiff file to save
+#         bounds : BoundingBox, optional
+#             the bounds of the output dataset. Default is None, which means the
+#             roi of the dataset will be used.
+#         bbox : BoundingBox, optional
+#             if specified, the input array will be saved to the given part/bbox of
+#             dataset. Default is None, which means the array will be saved to the
+#             entire dataset.
+#         band_names : Sequence of str, optional
+#             names of bands to save. Default is None, which will use the band indexes.
+#         arr_type : str, one of ['data', 'mask'], optional
+#             type of the array to save. Default is 'data'.
+#         nodata : float or int, optional
+#             no data value of the dataset. If None, will automatically parse the
+#             a proper no data value for the array.
+#         overwrite : bool, optional
+#             if True, overwrite the existing file. Default is False, which means
+#             the array will be saved in append mode (r+ mode).
 
-        """
-        # check arr dimension
-        if arr.ndim == 2:
-            indexes = [1]
-            arr = arr[np.newaxis, :, :]
-        elif arr.ndim == 3:
-            indexes = [i + 1 for i in range(arr.shape[0])]
-        else:
-            msg = (
-                f"Expected arr to be an array with shape of (n_lat, n_lon) or "
-                f"(n_band, n_lat, n_lon), got {arr.shape}"
-            )
-            raise ValueError(msg)
-        # check length of band_names
-        if band_names is not None and len(band_names) != arr.shape[0]:
-            msg = (
-                "Expected band_names to be of length "
-                f"{arr.shape[0]}, got {len(band_names)}"
-            )
-            raise ValueError(msg)
-        # parse profile
-        if bounds is None:
-            bounds = self.roi
-        profile = self.get_profile(bounds)
-        profile["count"] = arr.shape[0]
-        profile["driver"] = "GTiff"
-        profile["dtype"] = get_minimum_dtype(arr)
-        if nodata is None:
-            if np.issubdtype(arr.dtype, np.floating):
-                nodata = np.nan
-            else:
-                rng = dtype_ranges[profile["dtype"]]
-                nodata = rng[1] - 1 if np.any(arr == rng[0]) else rng[0]
-        profile["nodata"] = nodata
-        mode = "w"
-        if Path(filename).exists() and not overwrite:
-            mode = "r+"
+#         """
+#         # check arr dimension
+#         if arr.ndim == 2:
+#             indexes = [1]
+#             arr = arr[np.newaxis, :, :]
+#         elif arr.ndim == 3:
+#             indexes = [i + 1 for i in range(arr.shape[0])]
+#         else:
+#             msg = (
+#                 f"Expected arr to be an array with shape of (n_lat, n_lon) or "
+#                 f"(n_band, n_lat, n_lon), got {arr.shape}"
+#             )
+#             raise ValueError(msg)
+#         # check length of band_names
+#         if band_names is not None and len(band_names) != arr.shape[0]:
+#             msg = (
+#                 "Expected band_names to be of length "
+#                 f"{arr.shape[0]}, got {len(band_names)}"
+#             )
+#             raise ValueError(msg)
+#         # parse profile
+#         if bounds is None:
+#             bounds = self.roi
+#         profile = self.get_profile(bounds)
+#         profile["count"] = arr.shape[0]
+#         profile["driver"] = "GTiff"
+#         profile["dtype"] = get_minimum_dtype(arr)
+#         if nodata is None:
+#             if np.issubdtype(arr.dtype, np.floating):
+#                 nodata = np.nan
+#             else:
+#                 rng = dtype_ranges[profile["dtype"]]
+#                 nodata = rng[1] - 1 if np.any(arr == rng[0]) else rng[0]
+#         profile["nodata"] = nodata
+#         mode = "w"
+#         if Path(filename).exists() and not overwrite:
+#             mode = "r+"
 
-        dst = rasterio.open(filename, mode, **profile)
+#         dst = rasterio.open(filename, mode, **profile)
 
-        # parse whether to update band names
-        desc = np.asarray(dst.descriptions, dtype="str")
-        update_tags = False
-        if band_names is not None and np.all(desc == "None"):
-            update_tags = True
+#         # parse whether to update band names
+#         desc = np.asarray(dst.descriptions, dtype="str")
+#         update_tags = False
+#         if band_names is not None and np.all(desc == "None"):
+#             update_tags = True
 
-        # parse window
-        win = None if bbox is None else dst.window(*bbox)
+#         # parse window
+#         win = None if bbox is None else dst.window(*bbox)
 
-        # write array to tiff
-        if arr_type == "mask":
-            dst.write_mask(arr)
-        elif arr_type == "data":
-            dst.write(arr, indexes, window=win)
-            if update_tags:
-                for i, name in enumerate(band_names):
-                    dst.update_tags(i + 1, NAME=name)
-        dst.close()
+#         # write array to tiff
+#         if arr_type == "mask":
+#             dst.write_mask(arr)
+#         elif arr_type == "data":
+#             dst.write(arr, indexes, window=win)
+#             if update_tags:
+#                 for i, name in enumerate(band_names):
+#                     dst.update_tags(i + 1, NAME=name)
+#         dst.close()
 
 
-class MultiHierarchicalDataset(GeoDataset):
-    def __init__(self, paths: Iterable[str | Path], **kwargs) -> None:
-        pass
+# class MultiHierarchicalDataset(GeoDataset):
+#     def __init__(self, paths: Iterable[str | Path], **kwargs) -> None:
+#         pass
 
 
 class TimeSeriesDataset(RasterDataset, ABC):
@@ -2954,8 +3116,8 @@ class TimeSeriesDataset(RasterDataset, ABC):
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         dates: Acquisition | pd.DatetimeIndex | None = None,
-    ) -> QueryResult:
-        """Retrieve images values for given query.
+    ) -> xr.DataTree:
+        """Retrieve image values for given query.
 
         This method is an more flexible implementation compared to
         :meth:`__getitem__`, which can retrieve images only for the given pairs.
@@ -3032,8 +3194,8 @@ class PairDataset(RasterDataset):
         query: GeoQuery | Points | BoundingBox | Polygons,
         pairs: Pairs | None = None,
         parallel_loading: bool | None = None,
-    ) -> QueryResult:
-        """Retrieve images values for given query.
+    ) -> xr.DataTree:
+        """Retrieve image values for given query.
 
         This method is an more flexible implementation compared to
         :meth:`__getitem__`, which can retrieve images only for the given pairs.
