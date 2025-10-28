@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from abc import ABC
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
@@ -11,6 +12,7 @@ import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
 
+from faninsar._core.sar.pairs import Pairs
 from faninsar.datasets.base import PairDataset, TimeSeriesDataset
 from faninsar.logging import setup_logger
 
@@ -21,7 +23,6 @@ if TYPE_CHECKING:
 
     from pyproj.crs.crs import CRS
 
-    from faninsar._core.sar.pairs import Pairs
     from faninsar.query import BoundingBox, Points
 
 
@@ -196,4 +197,17 @@ class ApsPairs(PairDataset, ABC):
             verbose=verbose,
             ds_name=ds_name,
         )
-        self._pairs = self.parse_pairs(self.files.paths[self.valid].tolist())
+
+    @classmethod
+    def parse_pairs(cls, paths: Sequence[str] | Sequence[Path]) -> Pairs:
+        """Parse APS pair names from file paths."""
+        pair_names = []
+        for path in paths:
+            stem = Path(path).stem
+            matches = re.findall(r"\d{8}", stem)
+            if len(matches) >= 2:
+                pair_names.append("_".join(matches[:2]))
+            else:
+                msg = f"Unable to infer APS pair dates from '{stem}'."
+                raise ValueError(msg)
+        return Pairs.from_names(pair_names)

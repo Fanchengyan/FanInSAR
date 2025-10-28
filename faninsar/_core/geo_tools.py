@@ -322,6 +322,32 @@ def transform_from_latlon(
     )
 
 
+def latlon_from_transform(
+    tf: Affine | None,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Get the latitude and longitude from transform and shape.
+
+    Parameters
+    ----------
+    tf: Affine
+        the transform of the raster
+    width, height: int
+        the width and height of the raster
+
+    Returns
+    -------
+    lat, lon: numpy.ndarray
+
+    """
+    if tf is None:
+        return np.arange(height), np.arange(width)
+    lon = tf.xoff + tf.a * np.arange(width) + tf.a * 0.5
+    lat = tf.yoff + tf.e * np.arange(height) + tf.e * 0.5
+    return lat, lon
+
+
 def latlon_from_profile(profile: RasterioProfile) -> tuple[np.ndarray, np.ndarray]:
     """Get the latitude and longitude from rasterio profile data.
 
@@ -339,9 +365,7 @@ def latlon_from_profile(profile: RasterioProfile) -> tuple[np.ndarray, np.ndarra
     tf = profile["transform"]
     width = profile["width"]
     height = profile["height"]
-    lon = tf.xoff + tf.a * np.arange(width) + tf.a * 0.5
-    lat = tf.yoff + tf.e * np.arange(height) + tf.e * 0.5
-    return lat, lon
+    return latlon_from_transform(tf, width, height)
 
 
 def write_geoinfo_into_ds(

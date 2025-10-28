@@ -10,9 +10,19 @@ import functools
 import json
 import re
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC
+from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Literal, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Iterable,
+    Literal,
+    cast,
+    overload,
+)
 
 import numpy as np
 import pandas as pd
@@ -34,10 +44,17 @@ from rasterio.warp import transform as warp_transform
 from rtree.index import Index, Property
 from shapely import ops
 from tqdm import tqdm
-from typing_extensions import Self
+from typing_extensions import Self, TypeAlias
 
 from faninsar._core import geo_tools
-from faninsar._core.geo_tools import Profile, array2kml, array2kmz, geoinfo_from_latlon
+from faninsar._core.geo_tools import (
+    Profile,
+    array2kml,
+    array2kmz,
+    geoinfo_from_latlon,
+    latlon_from_transform,
+)
+from faninsar._core.sar.pairs import Pairs
 from faninsar.logging import setup_logger
 from faninsar.query import (
     BoundingBox,
@@ -47,15 +64,11 @@ from faninsar.query import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-    from os import PathLike
-
     from matplotlib.axes import Axes
     from rasterio.io import DatasetReader
     from rasterio.warp import Affine
 
     from faninsar._core.sar.acquisition import Acquisition
-    from faninsar._core.sar.pairs import Pairs
 
 
 logger = setup_logger(__name__)
@@ -96,6 +109,8 @@ logger = setup_logger(__name__)
 
 lat_names = ["latitude", "lat", "y"]
 lon_names = ["longitude", "lon", "x", "long", "lng"]
+
+PairParser: TypeAlias = Callable[[Iterable[str | PathLike]], Pairs]
 
 
 class GeoDataset(ABC):
@@ -601,6 +616,69 @@ class RasterDataset(GeoDataset):
 
     _same_crs: bool
 
+    @property
+    def file_dim_name(self) -> str:
+        """Dimension name used to represent stacked files in query outputs."""
+        return "file"
+
+    def _file_coords(
+        self,
+        indexes: np.ndarray,
+        paths: list[str],
+        files_df: pd.DataFrame,  # noqa: ARG002
+    ) -> dict[str, tuple[str, np.ndarray]]:
+        """Build coordinates describing the file dimension."""
+        dim = self.file_dim_name
+        n_files = len(paths)
+        coords: dict[str, tuple[str, np.ndarray]] = {
+            dim: (dim, np.arange(n_files, dtype=int)),
+            "file_path": (dim, np.asarray(paths, dtype=object)),
+            "file_index": (dim, indexes.astype(int)),
+        }
+        return coords
+
+    def _resolve_file_selection(
+        self,
+        indexes: int | Iterable[int] | None,
+    ) -> tuple[np.ndarray, list[str], pd.DataFrame]:
+        """Validate file indexes and return associated metadata."""
+        if isinstance(indexes, int):
+            indexes = [indexes]
+        if indexes is None:
+            indexes = self.files[self.files.valid].index.values
+
+        indexes_array = np.asarray(indexes, dtype=int)
+        if indexes_array.size == 0:
+            msg = f"No valid files to query. indexes: {indexes_array}"
+            logger.error(msg, stacklevel=2)
+            raise ValueError(msg)
+        if np.any(indexes_array < 0):
+            msg = f"indexes must be positive integers, got {indexes_array}"
+            logger.error(msg, stacklevel=2)
+            raise ValueError(msg)
+        if np.any(indexes_array >= len(self.files)):
+            msg = f"indexes must be less than {len(self.files)}, got {indexes_array}"
+            logger.error(msg, stacklevel=2)
+            raise ValueError(msg)
+
+        files_used = self.files.iloc[indexes_array, :]
+        valid_mask = files_used.valid.to_numpy(dtype=bool)
+        if not valid_mask.all():
+            invalid = files_used.loc[~valid_mask, "paths"].astype(str).tolist()
+            msg = f"Following files are invalid and will be ignored: {invalid}"
+            logger.warning(msg, stacklevel=2)
+            files_used = files_used.iloc[valid_mask]
+            indexes_array = indexes_array[valid_mask]
+
+        if files_used.empty:
+            msg = "No valid files remain after filtering invalid entries."
+            logger.error(msg, stacklevel=2)
+            raise ValueError(msg)
+
+        resolved_indexes = files_used.index.to_numpy(dtype=int)
+        paths = files_used.paths.astype(str).tolist()
+        return resolved_indexes, paths, files_used
+
     def __init__(
         self,
         root_dir: str | PathLike = "data",
@@ -1099,7 +1177,7 @@ class RasterDataset(GeoDataset):
 
     def _file_query_polygons(
         self, polygons: Polygons, vrt_fh: DatasetReader
-    ) -> np.ndarray:
+    ) -> tuple[list[np.ndarray], list[Affine], list[np.ndarray]]:
         """Return the values of the dataset at the given polygons."""
         polygons = self._ensure_query_crs(polygons)
         bands_idx = self._ensure_bands_idx(vrt_fh)
@@ -1320,7 +1398,7 @@ class RasterDataset(GeoDataset):
                 else None
             )
 
-        # Assemble DataTree
+        # Assemble xr.DataTree
         # Dual-track saving: store a full query_json on the root node
         root_attrs = {
             "crs": str(self.crs) if self.crs is not None else None,
@@ -1330,14 +1408,14 @@ class RasterDataset(GeoDataset):
             qroot = {}
             if isinstance(query, GeoQuery):
                 if query.points is not None:
-                    qroot["points"] = self._serialize_points(query.points)
+                    qroot["points"] = _serialize_points(query.points)
                 if query.boxes is not None:
                     if isinstance(query.boxes, list):
-                        qroot["bboxes"] = [self._serialize_bbox(b) for b in query.boxes]
+                        qroot["bboxes"] = [_serialize_bbox(b) for b in query.boxes]
                     else:
-                        qroot["bboxes"] = [self._serialize_bbox(query.boxes)]
+                        qroot["bboxes"] = [_serialize_bbox(query.boxes)]
                 if query.polygons is not None:
-                    qroot["polygons"] = self._serialize_polygons(query.polygons)
+                    qroot["polygons"] = _serialize_polygons(query.polygons)
             root_attrs.update(
                 {
                     "query_json": json.dumps(qroot),
@@ -1357,103 +1435,67 @@ class RasterDataset(GeoDataset):
         children: dict[str, xr.DataTree] = {}
 
         # points
-        from xarray import DataTree  # local import to avoid hard dep if unused
-
         if query.points is not None:
             points_ds = self._compute_points_ds(query.points, indexes)
-            children["points"] = DataTree(dataset=points_ds, name="points")
+            children["points"] = xr.DataTree(dataset=points_ds, name="points")
         else:
-            children["points"] = DataTree(name="points")
+            children["points"] = xr.DataTree(name="points")
 
         # bboxes
         if bboxes_tree is not None:
             children["bboxes"] = bboxes_tree
         else:
-            children["bboxes"] = DataTree(name="bboxes")
+            children["bboxes"] = xr.DataTree(name="bboxes")
 
         # polygons
         if polygons_tree is not None:
             children["polygons"] = polygons_tree
         else:
-            children["polygons"] = DataTree(name="polygons")
+            children["polygons"] = xr.DataTree(name="polygons")
 
-        return DataTree(dataset=root_ds, name="query_result", children=children)
-
-    def _serialize_points(self, points: Points) -> dict:
-        crs_str = str(points.crs) if points.crs is not None else None
-        return {
-            "type": "Points",
-            "crs": crs_str,
-            "coords": points.values.tolist(),
-        }
-
-    def _serialize_bbox(self, bbox: BoundingBox) -> dict:
-        crs_str = str(bbox.crs) if bbox.crs is not None else None
-        return {
-            "type": "BoundingBox",
-            "crs": crs_str,
-            "left": float(bbox.left),
-            "bottom": float(bbox.bottom),
-            "right": float(bbox.right),
-            "top": float(bbox.top),
-        }
-
-    def _serialize_polygons(self, polygons: Polygons) -> dict:
-        crs_str = str(polygons.crs) if polygons.crs is not None else None
-        wkts = []
-        try:
-            wkts = [geom.wkt for geom in polygons.geodataframe.geometry]
-        except Exception:
-            wkts = [str(g) for g in polygons.geodataframe.geometry]
-        return {"type": "Polygons", "crs": crs_str, "wkt": wkts}
+        return xr.DataTree(dataset=root_ds, name="query_result", children=children)
 
     def _compute_points_ds(
         self, points: Points, indexes: int | list[int] | None = None
     ) -> xr.Dataset:
         """Compute points query and return Dataset.
 
-        Data variable:
-        - data with dims (file[, band], point)
-
-        Coordinates include:
-        - file: integer index 0..N-1
-        - file_path: ("file",) real file paths
-        - point: point indices
-        - x, y: actual point coordinates in dataset CRS
-        - band: band indices when applicable
+        Data variable contains stacked file results with optional band axis.
+        Coordinates are provided via :meth:`_file_coords`.
         """
-        paths = self._indexes2paths(indexes)
+        resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
         vrt_fhs = self._paths2vrt_fhs(paths)
         data = self._files_query_points(points, vrt_fhs)
 
         # Determine dims
+        file_dim = self.file_dim_name
         if data.ndim == 3:
-            dims = ("file", "band", "point")
+            dims = (file_dim, "band", "point")
         elif data.ndim == 2:
-            dims = ("file", "point")
+            dims = (file_dim, "point")
         else:
             data = np.atleast_2d(data)
-            dims = ("file", "point")
+            dims = (file_dim, "point")
 
         # Ensure points are in dataset CRS for coordinate reporting
         pts = self._ensure_query_crs(points)
         x_pts = np.asarray(pts.x, dtype=float)
         y_pts = np.asarray(pts.y, dtype=float)
 
-        n_files = data.shape[0]
-        coords: dict[str, Any] = {
-            "file": np.arange(n_files),
-            "file_path": ("file", np.asarray(paths, dtype=object)),
-            "point": np.arange(data.shape[-1]),
-            "x": ("point", x_pts),
-            "y": ("point", y_pts),
-        }
-        if "band" in dims:
-            coords["band"] = np.arange(data.shape[1])
+        coords = self._file_coords(resolved_indexes, paths, files_df)
+        coords.update(
+            {
+                "point": ("point", np.arange(data.shape[-1])),
+                "x": ("point", x_pts),
+                "y": ("point", y_pts),
+            }
+        )
+        if data.ndim == 3:
+            coords["band"] = ("band", np.arange(data.shape[1]))
 
         ds = xr.Dataset({"data": (dims, data)}, coords=coords)
         # Dual-track saving: query_json + human-readable query_repr
-        qjson = json.dumps(self._serialize_points(points))
+        qjson = json.dumps(_serialize_points(points))
         ds.attrs.update(
             {
                 "crs": str(self.crs) if self.crs is not None else None,
@@ -1464,160 +1506,141 @@ class RasterDataset(GeoDataset):
         )
         return ds
 
-    def _compute_bboxes_tree(
+    def _make_bbox_ds(
         self,
-        bbox: BoundingBox | list[BoundingBox],
-        indexes: int | list[int] | None = None,
-    ) -> xr.DataTree:
-        """Compute bbox query and return a DataTree.
+        single_bbox: BoundingBox,
+        data: np.ndarray,
+        paths: list[str],
+        indexes: np.ndarray,
+        files_df: pd.DataFrame,
+    ) -> xr.Dataset:
+        """Make a Dataset for a single bbox query."""
+        profile = self.get_profile(single_bbox)
+        transform = profile["transform"] if profile is not None else None
+        height = data.shape[-2]
+        width = data.shape[-1]
 
-        - If a single BoundingBox is provided, return a DataTree whose dataset is
-          the result.
-        - If a list is provided (even length 1), return a DataTree with groups
-          named "0", "1", ...
-        Coordinates include file paths, and y/x as real-world coordinates
-        derived from the transform.
-        """
-        from xarray import DataTree
+        if transform is not None:
+            lat, lon = latlon_from_transform(transform, width, height)
+        else:
+            lat = np.arange(height)
+            lon = np.arange(width)
 
-        bbox_list = bbox if isinstance(bbox, list) else [bbox]
-        paths = self._indexes2paths(indexes)
-        vrt_fhs_template = self._paths2vrt_fhs(paths)
+        file_dim = self.file_dim_name
+        dims = (file_dim, "band", "y", "x") if data.ndim == 4 else (file_dim, "y", "x")
 
-        def _make_ds(single_bbox: BoundingBox, data: np.ndarray) -> xr.Dataset:
-            # dims: (file[, band], y, x)
-            profile = self.get_profile(single_bbox)
-            transform = profile["transform"] if profile is not None else None
-            height = data.shape[-2]
-            width = data.shape[-1]
-            # coordinate vectors from transform
-            if transform is not None:
-                lon = transform.c + transform.a * np.arange(width) + transform.a * 0.5
-                lat = transform.f + transform.e * np.arange(height) + transform.e * 0.5
+        coords = self._file_coords(indexes, paths, files_df)
+        coords.update(
+            {
+                "y": ("y", np.asarray(lat)),
+                "x": ("x", np.asarray(lon)),
+            }
+        )
+        if data.ndim == 4:
+            coords["band"] = ("band", np.arange(data.shape[1]))
+
+        ds = xr.Dataset(
+            {"data": (dims, data)},
+            coords=coords,
+            attrs={
+                "crs": str(self.crs) if self.crs is not None else None,
+                "transform": tuple(transform.to_gdal())
+                if transform is not None
+                else None,
+                "nodata": self.nodata,
+            },
+        )
+        ds.attrs.update(
+            {
+                "query_json": json.dumps(_serialize_bbox(single_bbox)),
+                "query_repr": (
+                    "BBox("
+                    f"{single_bbox.left}, {single_bbox.bottom}, "
+                    f"{single_bbox.right}, {single_bbox.top}, "
+                    f"crs={single_bbox.crs}"
+                    ")"
+                ),
+            }
+        )
+        return ds
+
+    def _make_poly_dataset(
+        self,
+        vals_i: Any,
+        transform_i: Any,
+        poly_geom: Any,
+        paths: list[str],
+        indexes: np.ndarray,
+        files_df: pd.DataFrame,
+    ) -> tuple[xr.Dataset | None, dict[str, xr.DataTree]]:
+        """Make a Dataset for a single polygon query."""
+        poly_children: dict[str, xr.DataTree] = {}
+        polygon_dataset: xr.Dataset | None = None
+        file_coords = self._file_coords(indexes, paths, files_df)
+        file_dim = self.file_dim_name
+        if isinstance(vals_i, (np.ndarray, np.ma.MaskedArray)):
+            # shape: (file[, band], y, x)
+            height = vals_i.shape[-2]
+            width = vals_i.shape[-1]
+            lat, lon = latlon_from_transform(transform_i, width, height)
+            if vals_i.ndim == 4:
+                dims = (file_dim, "band", "y", "x")
             else:
-                lon = np.arange(width)
-                lat = np.arange(height)
+                dims = (file_dim, "y", "x")
 
-            if data.ndim == 4:
-                dims = ("file", "band", "y", "x")
-                coords: dict[str, Any] = {
-                    "file": np.arange(data.shape[0]),
-                    "file_path": ("file", np.asarray(paths, dtype=object)),
-                    "band": np.arange(data.shape[1]),
-                    "y": lat,
-                    "x": lon,
+            coords = dict(file_coords)
+            coords.update(
+                {
+                    "y": ("y", np.asarray(lat)),
+                    "x": ("x", np.asarray(lon)),
                 }
-            else:
-                dims = ("file", "y", "x")
-                coords = {
-                    "file": np.arange(data.shape[0]),
-                    "file_path": ("file", np.asarray(paths, dtype=object)),
-                    "y": lat,
-                    "x": lon,
-                }
+            )
+            if vals_i.ndim == 4:
+                coords["band"] = ("band", np.arange(vals_i.shape[1]))
+
             ds = xr.Dataset(
-                {"data": (dims, data)},
+                {"data": (dims, vals_i)},
                 coords=coords,
                 attrs={
                     "crs": str(self.crs) if self.crs is not None else None,
-                    "transform": tuple(transform.to_gdal())
-                    if transform is not None
+                    "transform": tuple(transform_i.to_gdal())
+                    if transform_i is not None
                     else None,
                     "nodata": self.nodata,
                 },
             )
-            # Save original query (with CRS) in attrs
+            try:
+                wkt = poly_geom.wkt
+            except Exception:
+                wkt = str(poly_geom)
             ds.attrs.update(
                 {
-                    "query_json": json.dumps(self._serialize_bbox(single_bbox)),
-                    "query_repr": (
-                        "BBox("
-                        f"{single_bbox.left}, {single_bbox.bottom}, "
-                        f"{single_bbox.right}, {single_bbox.top}, "
-                        f"crs={single_bbox.crs}"
-                        ")"
+                    "query_json": json.dumps(
+                        {
+                            "type": "Polygon",
+                            "crs": str(self.crs) if self.crs is not None else None,
+                            "wkt": wkt,
+                        }
                     ),
+                    "query_repr": f"Polygon(crs={self.crs})",
                 }
             )
-            return ds
-
-        # Single bbox input -> dataset directly
-        if not isinstance(bbox, list):
-            vrt_fhs = vrt_fhs_template
-            data = self._files_query_bbox(bbox, vrt_fhs)
-            ds = _make_ds(bbox, data)
-            return DataTree(dataset=ds, name="bboxes")
-
-        # List input -> groups 0,1,...
-        children: dict[str, DataTree] = {}
-        for i, single_bbox in enumerate(bbox_list):
-            vrt_fhs = vrt_fhs_template
-            data = self._files_query_bbox(single_bbox, vrt_fhs)
-            ds = _make_ds(single_bbox, data)
-            children[str(i)] = DataTree(dataset=ds, name=str(i))
-        return DataTree(name="bboxes", children=children)
-
-    def _compute_polygons_tree(
-        self, polygons: Polygons, indexes: int | list[int] | None = None
-    ) -> xr.DataTree:
-        """Compute polygons query and return a DataTree.
-
-        - For multiple polygons: groups named "0", "1", ... each holding the
-            polygon result.
-        - For a single polygon: return a DataTree whose dataset is the polygon
-            result directly.
-        Coordinates include file paths, y/x from transform, and a scalar
-        'polygon' WKT.
-        """
-        from xarray import DataTree
-
-        paths = self._indexes2paths(indexes)
-        vrt_fhs = self._paths2vrt_fhs(paths)
-        polygons_values, transform_ls, mask_ls = self._files_query_polygons(
-            polygons, vrt_fhs
-        )
-
-        n_polygons = len(polygons)
-
-        def _latlon_from_transform(
-            transform: Any, height: int, width: int
-        ) -> tuple[np.ndarray, np.ndarray]:
-            if transform is None:
-                return np.arange(height), np.arange(width)
-            lon = transform.c + transform.a * np.arange(width) + transform.a * 0.5
-            lat = transform.f + transform.e * np.arange(height) + transform.e * 0.5
-            return lat, lon
-
-        def _make_poly_dataset(
-            vals_i: Any, transform_i: Any, poly_geom: Any
-        ) -> tuple[xr.Dataset | None, dict[str, DataTree]]:
-            poly_children: dict[str, DataTree] = {}
-            polygon_dataset: xr.Dataset | None = None
-            if isinstance(vals_i, (np.ndarray, np.ma.MaskedArray)):
-                # shape: (file[, band], y, x)
-                height = vals_i.shape[-2]
-                width = vals_i.shape[-1]
-                lat, lon = _latlon_from_transform(transform_i, height, width)
-                if vals_i.ndim == 4:
-                    dims = ("file", "band", "y", "x")
-                    coords: dict[str, Any] = {
-                        "file": np.arange(vals_i.shape[0]),
-                        "file_path": ("file", np.asarray(paths, dtype=object)),
-                        "band": np.arange(vals_i.shape[1]),
-                        "y": lat,
-                        "x": lon,
-                    }
+            polygon_dataset = ds
+        else:
+            # create per-file children with their own coords
+            for fidx, arr in enumerate(vals_i):
+                height = arr.shape[-2]
+                width = arr.shape[-1]
+                lat, lon = latlon_from_transform(transform_i, width, height)
+                if arr.ndim == 3:
+                    fdims = ("band", "y", "x")
+                    fcoords = {"band": np.arange(arr.shape[0]), "y": lat, "x": lon}
                 else:
-                    dims = ("file", "y", "x")
-                    coords = {
-                        "file": np.arange(vals_i.shape[0]),
-                        "file_path": ("file", np.asarray(paths, dtype=object)),
-                        "y": lat,
-                        "x": lon,
-                    }
-                ds = xr.Dataset(
-                    {"data": (dims, vals_i)},
-                    coords=coords,
+                    fdims = ("y", "x")
+                    fcoords = {"y": lat, "x": lon}
+                fds = xr.Dataset(
+                    {"data": (fdims, arr)},
+                    coords=fcoords,
                     attrs={
                         "crs": str(self.crs) if self.crs is not None else None,
                         "transform": tuple(transform_i.to_gdal())
@@ -1626,51 +1649,79 @@ class RasterDataset(GeoDataset):
                         "nodata": self.nodata,
                     },
                 )
-                try:
-                    wkt = poly_geom.wkt
-                except Exception:
-                    wkt = str(poly_geom)
-                ds.attrs.update(
-                    {
-                        "query_json": json.dumps(
-                            {
-                                "type": "Polygon",
-                                "crs": str(self.crs) if self.crs is not None else None,
-                                "wkt": wkt,
-                            }
-                        ),
-                        "query_repr": f"Polygon(crs={self.crs})",
-                    }
-                )
-                polygon_dataset = ds
-            else:
-                # create per-file children with their own coords
-                for fidx, arr in enumerate(vals_i):
-                    height = arr.shape[-2]
-                    width = arr.shape[-1]
-                    lat, lon = _latlon_from_transform(transform_i, height, width)
-                    if arr.ndim == 3:
-                        fdims = ("band", "y", "x")
-                        fcoords = {"band": np.arange(arr.shape[0]), "y": lat, "x": lon}
-                    else:
-                        fdims = ("y", "x")
-                        fcoords = {"y": lat, "x": lon}
-                    fds = xr.Dataset(
-                        {"data": (fdims, arr)},
-                        coords=fcoords,
-                        attrs={
-                            "crs": str(self.crs) if self.crs is not None else None,
-                            "transform": tuple(transform_i.to_gdal())
-                            if transform_i is not None
-                            else None,
-                            "nodata": self.nodata,
-                        },
-                    )
-                    fds = fds.assign_coords({"file": (), "file_path": ()})
-                    fds["file"] = xr.DataArray(fidx)
-                    fds["file_path"] = xr.DataArray(paths[fidx])
-                    poly_children[str(fidx)] = DataTree(dataset=fds, name=str(fidx))
-            return polygon_dataset, poly_children
+                scalar_coords: dict[str, Any] = {}
+                for key, (_, values) in file_coords.items():
+                    scalar_coords[key] = values[fidx]
+                fds = fds.assign_coords(scalar_coords)
+                poly_name = f"polygon_{fidx}"
+                poly_children[poly_name] = xr.DataTree(dataset=fds, name=poly_name)
+        return polygon_dataset, poly_children
+
+    def _compute_bboxes_tree(
+        self,
+        bbox: BoundingBox | list[BoundingBox],
+        indexes: int | list[int] | None = None,
+    ) -> xr.DataTree:
+        """Compute bbox query and return a xr.DataTree.
+
+        - If a single BoundingBox is provided, return a xr.DataTree whose dataset is
+          the result.
+        - If a list is provided (even length 1), return a xr.DataTree with groups
+          named "bbox_0", "bbox_1", ...
+        Coordinates include file paths, and y/x as real-world coordinates
+        derived from the transform.
+        """
+        bbox_list = bbox if isinstance(bbox, list) else [bbox]
+        resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
+        vrt_fhs_template = self._paths2vrt_fhs(paths)
+
+        # Single bbox input -> dataset directly
+        if not isinstance(bbox, list):
+            vrt_fhs = vrt_fhs_template
+            data = self._files_query_bbox(bbox, vrt_fhs)
+            ds = self._make_bbox_ds(
+                bbox,
+                data,
+                paths,
+                resolved_indexes,
+                files_df,
+            )
+            return xr.DataTree(dataset=ds, name="bboxes")
+
+        # List input -> groups bbox_0, bbox_1, ...
+        children: dict[str, xr.DataTree] = {}
+        for i, single_bbox in enumerate(bbox_list):
+            vrt_fhs = vrt_fhs_template
+            data = self._files_query_bbox(single_bbox, vrt_fhs)
+            ds = self._make_bbox_ds(
+                single_bbox,
+                data,
+                paths,
+                resolved_indexes,
+                files_df,
+            )
+            children_name = f"bbox_{i}"
+            children[children_name] = xr.DataTree(dataset=ds, name=children_name)
+        return xr.DataTree(name="bboxes", children=children)
+
+    def _compute_polygons_tree(
+        self, polygons: Polygons, indexes: int | list[int] | None = None
+    ) -> xr.DataTree:
+        """Compute polygons query and return a xr.DataTree.
+
+        - For multiple polygons: groups named "0", "1", ... each holding the
+            polygon result.
+        - For a single polygon: return a xr.DataTree whose dataset is the polygon
+            result directly.
+        Coordinates include file paths, y/x from transform, and a scalar
+        'polygon' WKT.
+        """
+        resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
+        vrt_fhs = self._paths2vrt_fhs(paths)
+        polygons_values, transform_ls, mask_ls = self._files_query_polygons(
+            polygons, vrt_fhs
+        )
+        n_polygons = len(polygons)
 
         # Build outputs depending on number of polygons
         if n_polygons == 1:
@@ -1678,43 +1729,53 @@ class RasterDataset(GeoDataset):
             mask_i = mask_ls[0] if len(mask_ls) > 0 else None
             transform_i = transform_ls[0] if len(transform_ls) > 0 else None
             poly_geom = polygons.geodataframe.geometry.iloc[0]
-            polygon_dataset, poly_children = _make_poly_dataset(
-                vals_i, transform_i, poly_geom
+            polygon_dataset, poly_children = self._make_poly_dataset(
+                vals_i,
+                transform_i,
+                poly_geom,
+                paths,
+                resolved_indexes,
+                files_df,
             )
             # attach mask if available
             if mask_i is not None and mask_i.size > 0:
                 # ensure mask uses same y/x coords as dataset for alignment
                 h, w = mask_i.shape
-                lat, lon = _latlon_from_transform(transform_i, h, w)
+                lat, lon = latlon_from_transform(transform_i, w, h)
                 mds = xr.Dataset(
                     {"mask": (("y", "x"), mask_i)}, coords={"y": lat, "x": lon}
                 )
-                poly_children["mask"] = DataTree(dataset=mds, name="mask")
-            return DataTree(
+                poly_children["mask"] = xr.DataTree(dataset=mds, name="mask")
+            return xr.DataTree(
                 name="polygons", dataset=polygon_dataset, children=poly_children
             )
 
         # Multiple polygons -> groups 0..N-1
-        children: dict[str, DataTree] = {}
+        children: dict[str, xr.DataTree] = {}
         for i in range(n_polygons):
             vals_i = polygons_values[i]
             mask_i = mask_ls[i] if i < len(mask_ls) else None
             transform_i = transform_ls[i] if i < len(transform_ls) else None
             poly_geom = polygons.geodataframe.geometry.iloc[i]
-            polygon_dataset, poly_children = _make_poly_dataset(
-                vals_i, transform_i, poly_geom
+            polygon_dataset, poly_children = self._make_poly_dataset(
+                vals_i,
+                transform_i,
+                poly_geom,
+                paths,
+                resolved_indexes,
+                files_df,
             )
             if mask_i is not None and mask_i.size > 0:
                 h, w = mask_i.shape
-                lat, lon = _latlon_from_transform(transform_i, h, w)
+                lat, lon = latlon_from_transform(transform_i, w, h)
                 mds = xr.Dataset(
                     {"mask": (("y", "x"), mask_i)}, coords={"y": lat, "x": lon}
                 )
-                poly_children["mask"] = DataTree(dataset=mds, name="mask")
-            children[str(i)] = DataTree(
+                poly_children["mask"] = xr.DataTree(dataset=mds, name="mask")
+            children[str(i)] = xr.DataTree(
                 name=str(i), dataset=polygon_dataset, children=poly_children
             )
-        return DataTree(name="polygons", children=children)
+        return xr.DataTree(name="polygons", children=children)
 
     @functools.lru_cache(maxsize=128)  # noqa: B019
     def _cached_load_warp_file(self, file_path: str) -> DatasetReader:
@@ -1780,35 +1841,8 @@ class RasterDataset(GeoDataset):
             if the indexes negative or out of range or if the files are invalid
 
         """
-        if isinstance(indexes, int):
-            indexes = [indexes]
-        if indexes is None:
-            indexes = self.files[self.files.valid].index.values
-
-        indexes = np.asarray(indexes)
-        if len(indexes) == 0:
-            msg = f"No valid files to query. indexes: {indexes}"
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
-        if np.any(indexes < 0):
-            msg = f"indexes must be positive integers, got {indexes}"
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
-        if np.any(indexes >= len(self.files)):
-            msg = f"indexes must be less than {len(self.files)}, got {indexes}"
-            logger.error(msg, stacklevel=2)
-            raise ValueError(msg)
-
-        files_used = self.files.iloc[indexes, :]
-        if not files_used.valid.all():
-            msg = (
-                "Following files are invalid and will be ignored: "
-                f"{files_used[~files_used.valid]}"
-            )
-            logger.warning(msg, stacklevel=2)
-            files_used = files_used[files_used.valid]
-
-        return files_used.paths.values.tolist()
+        _, paths, _ = self._resolve_file_selection(indexes)
+        return paths
 
     def _paths2vrt_fhs(self, paths: Iterable[str]) -> list[DatasetReader]:
         """Convert file paths to file handles.
@@ -2021,7 +2055,7 @@ class RasterDataset(GeoDataset):
         Returns
         -------
         result : xarray.DataTree
-            A DataTree containing the results of the various queries.
+            A xr.DataTree containing the results of the various queries.
 
         """
         if parallel_loading is None:
@@ -3080,20 +3114,48 @@ class TimeSeriesDataset(RasterDataset, ABC):
 
     _dates: Acquisition
 
+    def __init__(self, *args, **kwargs) -> None:
+        """Initialize the dataset and attach acquisition metadata."""
+        super().__init__(*args, **kwargs)
+        self._assign_dates_from_files()
+
     @property
     def dates(self) -> Acquisition:
         """Return the date for each acquisition in the dataset."""
         return self._dates
 
-    @abstractmethod
-    def __init__(self, *args, **kwargs) -> None:
-        """Initialize the dataset. *Must be implemented in subclass*."""
-        super().__init__(*args, **kwargs)
+    def _assign_dates_from_files(self) -> None:
+        """Parse acquisition dates from current file list."""
+        from faninsar._core.sar.acquisition import Acquisition
+
+        paths = self._files.paths.tolist()
+        if len(paths) == 0:
+            self._dates = Acquisition([])
+            self._files.loc[:, "date"] = pd.NaT
+            return
+
+        parsed = self.parse_dates(paths)
+        if not isinstance(parsed, Acquisition):
+            acquisitions = Acquisition(parsed)
+        else:
+            acquisitions = parsed
+
+        if len(acquisitions) != len(self._files):
+            msg = (
+                "Parsed acquisition dates do not align with scanned files: "
+                f"{len(acquisitions)} dates for {len(self._files)} files."
+            )
+            raise ValueError(msg)
+
+        self._dates = acquisitions
+        date_series = pd.Series(acquisitions.values, index=self._files.index)
+        self._files.loc[:, "date"] = pd.to_datetime(date_series)
 
     @classmethod
-    @abstractmethod
     def _parse_dates(cls, paths: Iterable[str | PathLike]) -> Acquisition:
-        """Parse dates from filenames. *Must be implemented in subclass*."""
+        """Parse dates from filenames. Override in subclass if needed."""
+        msg = "_parse_dates method must be implemented in subclass"
+        raise NotImplementedError(msg)
 
     @classmethod
     def parse_dates(cls, paths: Iterable[str | PathLike]) -> Acquisition:
@@ -3111,6 +3173,29 @@ class TimeSeriesDataset(RasterDataset, ABC):
 
         """
         return cls._parse_dates(paths)
+
+    @property
+    def file_dim_name(self) -> str:
+        """Dimension name for time-series stacking."""
+        return "date"
+
+    def _file_coords(
+        self,
+        indexes: np.ndarray,
+        paths: list[str],
+        files_df: pd.DataFrame,
+    ) -> dict[str, tuple[str, np.ndarray]]:
+        """Attach acquisition metadata to stacked coordinates."""
+        if "date" in files_df:
+            date_values = pd.to_datetime(files_df["date"].to_numpy())
+        else:
+            date_values = self.dates.take(indexes).to_numpy()
+        date_index = pd.DatetimeIndex(date_values)
+        coords: dict[str, tuple[str, np.ndarray]] = {
+            "date": ("date", date_index.to_numpy()),
+            "file_path": ("date", np.asarray(paths, dtype=object)),
+        }
+        return coords
 
     def query(
         self,
@@ -3144,11 +3229,13 @@ class TimeSeriesDataset(RasterDataset, ABC):
         if isinstance(query, Polygons):
             query = GeoQuery(polygons=query)
 
-        mask = self.files.valid
+        files_df = self.files
+        mask = files_df.valid.copy()
         if dates is not None:
-            mask = mask * np.isin(self.dates, dates)
+            target = pd.DatetimeIndex(dates)
+            mask = mask & files_df["date"].isin(target)
 
-        paths = self.files[mask].paths.tolist()
+        paths = files_df[mask].paths.tolist()
         return self._sample_files(paths, query)
 
 
@@ -3156,21 +3243,80 @@ class PairDataset(RasterDataset):
     """A base class for pair-like (contain two dates for one pair) datasets."""
 
     _pairs: Pairs
+    _pair_parser: PairParser | None
+
+    def __init__(
+        self,
+        *args,
+        pair_parser: PairParser | None = None,
+        **kwargs,
+    ) -> None:
+        """Initialize the dataset and attach pair metadata.
+
+        Parameters
+        ----------
+        *args :
+            Positional arguments forwarded to :class:`RasterDataset`.
+        pair_parser : PairParser or None, optional
+            Callable that parses file paths into :class:`Pairs`. When ``None``,
+            :meth:`parse_pairs` is used.
+        **kwargs :
+            Keyword arguments forwarded to :class:`RasterDataset`.
+
+        Returns
+        -------
+        None
+            This method returns ``None``.
+
+        Notes
+        -----
+        The provided ``pair_parser`` is stored and reused whenever the internal
+        file list changes, ensuring coherence datasets can share interferogram
+        parsing logic.
+
+        See Also
+        --------
+        RasterDataset : Base class handling core raster operations.
+
+        """
+        self._pair_parser = pair_parser
+        super().__init__(*args, **kwargs)
+        self._assign_pairs_from_files()
 
     @property
     def pairs(self) -> Pairs:
         """Return Pairs parsed from filenames."""
         return self._pairs
 
-    @abstractmethod
-    def __init__(self, *args, **kwargs) -> None:
-        """Initialize the dataset. *Must be implemented in subclass*."""
-        super().__init__(*args, **kwargs)
+    def _assign_pairs_from_files(self) -> None:
+        """Parse interferometric pairs from current files."""
+        paths = self._files.paths.tolist()
+        if len(paths) == 0:
+            self._pairs = Pairs([])
+            self._files.loc[:, "pair_name"] = ""
+            return
+
+        parser = self._pair_parser or self.parse_pairs
+        parsed = parser(paths)
+        pairs = parsed if isinstance(parsed, Pairs) else Pairs(parsed)
+
+        if len(pairs) != len(self._files):
+            msg = (
+                "Parsed interferometric pairs do not align with scanned files: "
+                f"{len(pairs)} pairs for {len(self._files)} files."
+            )
+            raise ValueError(msg)
+
+        self._pairs = pairs
+        self._files.loc[:, "pair_name"] = pd.Series(
+            pairs.to_names(), index=self._files.index
+        )
 
     @classmethod
-    @abstractmethod
     def _parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
-        """Parse pairs from filenames. *Must be implemented in subclass*."""
+        """Parse pairs from filenames. Override in subclass if needed."""
+        msg = "_parse_pairs method must be implemented in subclass"
+        raise NotImplementedError(msg)
 
     @classmethod
     def parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
@@ -3188,6 +3334,28 @@ class PairDataset(RasterDataset):
 
         """
         return cls._parse_pairs(paths)
+
+    @property
+    def file_dim_name(self) -> str:
+        """Dimension name for pair stacks."""
+        return "pair"
+
+    def _file_coords(
+        self,
+        indexes: np.ndarray,  # noqa: ARG002
+        paths: list[str],
+        files_df: pd.DataFrame,
+    ) -> dict[str, tuple[str, np.ndarray]]:
+        """Attach pair metadata to stacked coordinates."""
+        if "pair_name" in files_df:
+            pair_names = files_df["pair_name"].astype(str).to_numpy()
+        else:
+            pair_names = self.pairs.to_names()
+        coords: dict[str, tuple[str, np.ndarray]] = {
+            "pair": ("pair", pair_names),
+            "file_path": ("pair", np.asarray(paths, dtype=object)),
+        }
+        return coords
 
     def query(
         self,
@@ -3225,11 +3393,13 @@ class PairDataset(RasterDataset):
         if isinstance(query, Polygons):
             query = GeoQuery(polygons=query)
 
-        mask = self.files.valid
+        files_df = self.files
+        mask = files_df.valid.copy()
         if pairs is not None:
-            mask = mask * self.pairs.where(pairs, return_type="mask")
+            pair_mask = self.pairs.where(pairs, return_type="mask")
+            mask = mask & pd.Series(pair_mask, index=files_df.index)
 
-        paths = self.files[mask].paths.tolist()
+        paths = files_df[mask].paths.tolist()
         return self._sample_files(paths, query, parallel_loading)
 
 
@@ -3363,3 +3533,37 @@ def ensure_geo_query(query: GeoQuery | Points | BoundingBox | Polygons) -> GeoQu
     if isinstance(query, Polygons):
         query = GeoQuery(polygons=query)
     return query
+
+
+def _serialize_points(points: Points) -> dict:
+    """Serialize points to dict for saving in dataset attrs."""
+    crs_str = str(points.crs) if points.crs is not None else None
+    return {
+        "type": "Points",
+        "crs": crs_str,
+        "coords": points.values.tolist(),
+    }
+
+
+def _serialize_bbox(bbox: BoundingBox) -> dict:
+    """Serialize bbox to dict for saving in dataset attrs."""
+    crs_str = str(bbox.crs) if bbox.crs is not None else None
+    return {
+        "type": "BoundingBox",
+        "crs": crs_str,
+        "left": float(bbox.left),
+        "bottom": float(bbox.bottom),
+        "right": float(bbox.right),
+        "top": float(bbox.top),
+    }
+
+
+def _serialize_polygons(polygons: Polygons) -> dict:
+    """Serialize polygons to dict for saving in dataset attrs."""
+    crs_str = str(polygons.crs) if polygons.crs is not None else None
+    wkts = []
+    try:
+        wkts = [geom.wkt for geom in polygons.geodataframe.geometry]
+    except Exception:
+        wkts = [str(g) for g in polygons.geodataframe.geometry]
+    return {"type": "Polygons", "crs": crs_str, "wkt": wkts}
