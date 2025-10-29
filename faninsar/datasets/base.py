@@ -53,7 +53,9 @@ from faninsar._core.geo_tools import (
     array2kmz,
     geoinfo_from_latlon,
     latlon_from_transform,
+    write_geoinfo_into_ds,
 )
+from faninsar._core.sar.acquisition import Acquisition
 from faninsar._core.sar.pairs import Pairs
 from faninsar.backends import LazyMultiFileReader
 from faninsar.logging import setup_logger
@@ -68,8 +70,6 @@ if TYPE_CHECKING:
     from matplotlib.axes import Axes
     from rasterio.io import DatasetReader
     from rasterio.warp import Affine
-
-    from faninsar._core.sar.acquisition import Acquisition
 
 
 __all__ = (
@@ -1517,7 +1517,7 @@ class RasterDataset(GeoDataset):
                     ),
                 },
             )
-
+            ds = write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
             return xr.DataTree(dataset=ds, name="bboxes")
 
         # List input (even single element) -> groups "bbox_0", "bbox_1", ...
@@ -1670,8 +1670,9 @@ class RasterDataset(GeoDataset):
                     "query_repr": f"Polygon(crs={self.crs})",
                 },
             )
+            ds = write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
 
-            child_name = str(i) if n_polygons > 1 else "polygon"
+            child_name = f"polygon_{i}"
             children[child_name] = xr.DataTree(dataset=ds, name=child_name)
 
         return xr.DataTree(name="polygons", children=children)
@@ -1725,7 +1726,7 @@ class RasterDataset(GeoDataset):
                 "query_repr": f"Points(count={len(points)}, crs={points.crs})",
             }
         )
-        return ds
+        return write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
 
     def _make_bbox_ds(
         self,
@@ -1783,7 +1784,7 @@ class RasterDataset(GeoDataset):
                 ),
             }
         )
-        return ds
+        return write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
 
     def _make_bbox_da(
         self,
@@ -1901,6 +1902,7 @@ class RasterDataset(GeoDataset):
                     "query_repr": f"Polygon(crs={self.crs})",
                 }
             )
+            ds = write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
             polygon_dataset = ds
         else:
             # create per-file children with their own coords
@@ -1925,6 +1927,7 @@ class RasterDataset(GeoDataset):
                         "nodata": self.nodata,
                     },
                 )
+                fds = write_geoinfo_into_ds(fds, "data", self.crs, "x", "y")
                 scalar_coords: dict[str, Any] = {}
                 for key, (_, values) in file_coords.items():
                     scalar_coords[key] = values[fidx]
@@ -3445,8 +3448,6 @@ class TimeSeriesDataset(RasterDataset, ABC):
 
     def _assign_dates_from_files(self) -> None:
         """Parse acquisition dates from current file list."""
-        from faninsar._core.sar.acquisition import Acquisition
-
         paths = self._files.paths.tolist()
         if len(paths) == 0:
             self._dates = Acquisition([])
@@ -3501,7 +3502,7 @@ class TimeSeriesDataset(RasterDataset, ABC):
     def _file_coords(
         self,
         indexes: np.ndarray,
-        paths: list[str],
+        paths: list[str],  # noqa: ARG002
         files_df: pd.DataFrame,
     ) -> dict[str, tuple[str, np.ndarray]]:
         """Attach acquisition metadata to stacked coordinates."""
@@ -3511,8 +3512,7 @@ class TimeSeriesDataset(RasterDataset, ABC):
             date_values = self.dates.take(indexes).to_numpy()
         date_index = pd.DatetimeIndex(date_values)
         coords: dict[str, tuple[str, np.ndarray]] = {
-            "date": ("date", date_index.to_numpy()),
-            "file_path": ("date", np.asarray(paths, dtype=object)),
+            "date": ("date", date_index.to_numpy())
         }
         return coords
 
@@ -3696,7 +3696,7 @@ class PairDataset(RasterDataset):
     def _file_coords(
         self,
         indexes: np.ndarray,  # noqa: ARG002
-        paths: list[str],
+        paths: list[str],  # noqa: ARG002
         files_df: pd.DataFrame,
     ) -> dict[str, tuple[str, np.ndarray]]:
         """Attach pair metadata to stacked coordinates."""
@@ -3704,9 +3704,12 @@ class PairDataset(RasterDataset):
             pair_names = files_df["pair_name"].astype(str).to_numpy()
         else:
             pair_names = self.pairs.to_names()
+        pairs = Pairs.from_names(pair_names)
+
         coords: dict[str, tuple[str, np.ndarray]] = {
             "pair": ("pair", pair_names),
-            "file_path": ("pair", np.asarray(paths, dtype=object)),
+            "primary": ("pair", pairs.primary.values),
+            "secondary": ("pair", pairs.secondary.values),
         }
         return coords
 

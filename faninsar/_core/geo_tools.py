@@ -6,7 +6,7 @@ import pprint
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -366,6 +366,26 @@ def latlon_from_profile(profile: RasterioProfile) -> tuple[np.ndarray, np.ndarra
     width = profile["width"]
     height = profile["height"]
     return latlon_from_transform(tf, width, height)
+
+
+@overload
+def write_geoinfo_into_ds(
+    ds: xr.DataArray,
+    var: None = None,
+    crs: CrsLike = "EPSG:4326",
+    x_dim: str = "lon",
+    y_dim: str = "lat",
+) -> xr.DataArray: ...
+
+
+@overload
+def write_geoinfo_into_ds(
+    ds: xr.Dataset,
+    var: str | tuple | list,
+    crs: CrsLike = "EPSG:4326",
+    x_dim: str = "lon",
+    y_dim: str = "lat",
+) -> xr.Dataset: ...
 
 
 def write_geoinfo_into_ds(
