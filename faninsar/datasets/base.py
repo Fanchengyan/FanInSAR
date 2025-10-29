@@ -3516,31 +3516,65 @@ class TimeSeriesDataset(RasterDataset, ABC):
         }
         return coords
 
+    # New explicit per-shape query methods using dates instead of indexes
+    def points_query(
+        self,
+        points: Points,
+        dates: Acquisition | pd.DatetimeIndex | None = None,
+    ) -> xr.Dataset:
+        """Query points for the given dates subset (no indexes support)."""
+        files_df = self.files
+        mask = files_df.valid.copy()
+        if dates is not None:
+            target = pd.DatetimeIndex(dates)
+            mask = mask & files_df["date"].isin(target)
+        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        return self._compute_points_ds(points, resolved_indexes)
+
+    def bbox_query(
+        self,
+        bbox: BoundingBox | list[BoundingBox],
+        dates: Acquisition | pd.DatetimeIndex | None = None,
+        lazy_loading: bool | None = None,
+    ) -> xr.DataTree:
+        """Query bbox/bboxes for the given dates subset (no indexes support)."""
+        if lazy_loading is None:
+            lazy_loading = self.lazy_loading
+        files_df = self.files
+        mask = files_df.valid.copy()
+        if dates is not None:
+            target = pd.DatetimeIndex(dates)
+            mask = mask & files_df["date"].isin(target)
+        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        if lazy_loading:
+            return self._compute_bboxes_tree_lazy(bbox, resolved_indexes)
+        return self._compute_bboxes_tree(bbox, resolved_indexes)
+
+    def polygons_query(
+        self,
+        polygons: Polygons,
+        dates: Acquisition | pd.DatetimeIndex | None = None,
+        lazy_loading: bool | None = None,
+    ) -> xr.DataTree:
+        """Query polygons for the given dates subset (no indexes support)."""
+        if lazy_loading is None:
+            lazy_loading = self.lazy_loading
+        files_df = self.files
+        mask = files_df.valid.copy()
+        if dates is not None:
+            target = pd.DatetimeIndex(dates)
+            mask = mask & files_df["date"].isin(target)
+        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        if lazy_loading:
+            return self._compute_polygons_tree_lazy(polygons, resolved_indexes)
+        return self._compute_polygons_tree(polygons, resolved_indexes)
+
     def query(
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         dates: Acquisition | pd.DatetimeIndex | None = None,
     ) -> xr.DataTree:
-        """Retrieve image values for given query.
-
-        This method is an more flexible implementation compared to
-        :meth:`__getitem__`, which can retrieve images only for the given pairs.
-
-        Parameters
-        ----------
-        query : GeoQuery | Points | BoundingBox | Polygons
-            query to index the dataset. It can be :class:`Points`,
-            :class:`BoundingBox`, :class:`Polygons`, or a composite
-            :class:`GeoQuery` (recommended) object.
-        dates : Acquisition | pd.DatetimeIndex, optional
-            dates to use for the query. If None, all dates will be used.
-
-        Returns
-        -------
-        result : QueryResult
-            a QueryResult instance containing the results of the various queries.
-
-        """
+        """Retrieve image values for given query using dates subset only."""
         if isinstance(query, Points):
             query = GeoQuery(points=query)
         if isinstance(query, BoundingBox):
@@ -3676,35 +3710,66 @@ class PairDataset(RasterDataset):
         }
         return coords
 
+    # New explicit per-shape query methods using pairs instead of indexes
+    def points_query(
+        self,
+        points: Points,
+        pairs: Pairs | None = None,
+    ) -> xr.Dataset:
+        """Query points for the given pairs subset (no indexes support)."""
+        files_df = self.files
+        mask = files_df.valid.copy()
+        if pairs is not None:
+            pair_mask = self.pairs.where(pairs, return_type="mask")
+            mask = mask & pd.Series(pair_mask, index=files_df.index)
+        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        return self._compute_points_ds(points, resolved_indexes)
+
+    def bbox_query(
+        self,
+        bbox: BoundingBox | list[BoundingBox],
+        pairs: Pairs | None = None,
+        lazy_loading: bool | None = None,
+    ) -> xr.DataTree:
+        """Query bbox/bboxes for the given pairs subset (no indexes support)."""
+        if lazy_loading is None:
+            lazy_loading = self.lazy_loading
+        files_df = self.files
+        mask = files_df.valid.copy()
+        if pairs is not None:
+            pair_mask = self.pairs.where(pairs, return_type="mask")
+            mask = mask & pd.Series(pair_mask, index=files_df.index)
+        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        if lazy_loading:
+            return self._compute_bboxes_tree_lazy(bbox, resolved_indexes)
+        return self._compute_bboxes_tree(bbox, resolved_indexes)
+
+    def polygons_query(
+        self,
+        polygons: Polygons,
+        pairs: Pairs | None = None,
+        lazy_loading: bool | None = None,
+    ) -> xr.DataTree:
+        """Query polygons for the given pairs subset (no indexes support)."""
+        if lazy_loading is None:
+            lazy_loading = self.lazy_loading
+        files_df = self.files
+        mask = files_df.valid.copy()
+        if pairs is not None:
+            pair_mask = self.pairs.where(pairs, return_type="mask")
+            mask = mask & pd.Series(pair_mask, index=files_df.index)
+        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        if lazy_loading:
+            return self._compute_polygons_tree_lazy(polygons, resolved_indexes)
+        return self._compute_polygons_tree(polygons, resolved_indexes)
+
     def query(
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         pairs: Pairs | None = None,
         lazy_loading: bool | None = None,
     ) -> xr.DataTree:
-        """Retrieve image values for given query.
-
-        This method is an more flexible implementation compared to
-        :meth:`__getitem__`, which can retrieve images only for the given pairs.
-
-        Parameters
-        ----------
-        query : GeoQuery | Points | BoundingBox | Polygons
-            query to index the dataset. It can be :class:`Points`,
-            :class:`BoundingBox`, :class:`Polygons`, or a composite
-            :class:`GeoQuery` (recommended) object.
-        pairs : Pairs, optional
-            pairs to use for the query. If None, all pairs will be used.
-        lazy_loading : bool or None, optional
-            if True, use lazy loading with dask arrays. If None, use the dataset's
-            default lazy_loading setting. Default is None.
-
-        Returns
-        -------
-        result : QueryResult
-            a QueryResult instance containing the results of the various queries.
-
-        """
+        """Retrieve image values for given query using pairs subset only."""
         if lazy_loading is None:
             lazy_loading = self.lazy_loading
 
