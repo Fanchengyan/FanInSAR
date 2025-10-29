@@ -193,7 +193,8 @@ class InterferogramDataset(PairDataset):
         fill_nodata: bool = False,
         verbose: bool = True,
         keep_common: bool = True,
-        parallel_loading: bool = False,
+        lazy_loading: bool = False,
+        chunks: dict[str, int] | None = None,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
 
@@ -248,8 +249,12 @@ class InterferogramDataset(PairDataset):
             Only used when the number of interferograms and coherence files are
             not equal. If True, keep the common pairs of interferograms and
             coherence files and raise a warning. If False, raise an error.
-        parallel_loading: bool, optional, default: False
-            if True, use dask for lazy loading and parallel computation. Default: False
+        lazy_loading: bool, optional, default: False
+            Enable lazy loading using dask arrays. When True, data is not loaded
+            into memory until compute() is called. Default: False.
+        chunks: dict[str, int] | None, optional
+            Chunk sizes for dask arrays when lazy_loading is True.
+            Example: {'y': 512, 'x': 512}. Default is None, which uses 512x512 chunks.
 
         """
         root_dir = Path(root_dir)
@@ -304,7 +309,8 @@ class InterferogramDataset(PairDataset):
             fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name="Interferogram",
-            parallel_loading=parallel_loading,
+            lazy_loading=lazy_loading,
+            chunks=chunks,
         )
 
         self._ds_coh = CoherenceDataset(
@@ -321,7 +327,8 @@ class InterferogramDataset(PairDataset):
             fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name="Coherence",
-            parallel_loading=parallel_loading,
+            lazy_loading=lazy_loading,
+            chunks=chunks,
             pair_parser=self._parse_pairs,
         )
         self._ds_coh._range = self.coh_range
@@ -792,6 +799,8 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
         fill_nodata: bool = False,
         verbose: bool = True,
         keep_common: bool = True,
+        lazy_loading: bool = False,
+        chunks: dict[str, int] | None = None,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
 
@@ -846,6 +855,12 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
             Only used when the number of interferograms and coherence files are
             not equal. If True, keep the common pairs of interferograms and
             coherence files and raise a warning. If False, raise an error.
+        lazy_loading: bool, optional, default: False
+            Enable lazy loading using dask arrays. When True, data is not loaded
+            into memory until compute() is called. Default: False.
+        chunks: dict[str, int] | None, optional
+            Chunk sizes for dask arrays when lazy_loading is True.
+            Example: {'y': 512, 'x': 512}. Default is None, which uses 512x512 chunks.
 
         """
         root_dir = Path(root_dir)
@@ -871,6 +886,8 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
             fill_nodata=fill_nodata,
             verbose=verbose,
             keep_common=keep_common,
+            lazy_loading=lazy_loading,
+            chunks=chunks,
         )
 
     def _get_sub_dataset_paths(self, file_paths: list[str], group: str) -> list[str]:

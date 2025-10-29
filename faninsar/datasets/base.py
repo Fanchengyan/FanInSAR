@@ -55,6 +55,7 @@ from faninsar._core.geo_tools import (
     latlon_from_transform,
 )
 from faninsar._core.sar.pairs import Pairs
+from faninsar.backends import LazyMultiFileReader
 from faninsar.logging import setup_logger
 from faninsar.query import (
     BoundingBox,
@@ -71,33 +72,6 @@ if TYPE_CHECKING:
     from faninsar._core.sar.acquisition import Acquisition
 
 
-logger = setup_logger(__name__)
-
-try:
-    import dask
-    from dask.delayed import delayed
-
-    HAS_DASK = True
-except ImportError:
-    HAS_DASK = False
-    msg = "dask is not installed"
-
-    # Create dummy functions for type checking
-    class _DummyDask:
-        @staticmethod
-        def compute(*args, **kwargs) -> None:  # noqa: ARG004
-            """Compute of dask is not installed dummy function for type checking."""
-            logger.error(msg)  # noqa: TRY400
-            raise ImportError(msg)
-
-    class _DummyDelayed:
-        def __call__(self, func) -> None:  # noqa: ANN001, ARG002
-            """Delayed of dask is not installed dummy function for type checking."""
-            raise ImportError(msg)
-
-    dask = _DummyDask()
-    delayed = _DummyDelayed()
-
 __all__ = (
     "GeoDataset",
     "PairDataset",
@@ -107,8 +81,8 @@ __all__ = (
 
 logger = setup_logger(__name__)
 
-lat_names = ["latitude", "lat", "y"]
-lon_names = ["longitude", "lon", "x", "long", "lng"]
+lat_names = ["latitude", "lat", "latitudes", "y", "lats", "ny"]
+lon_names = ["longitude", "lon", "long", "lng", "longitudes", "longs", "nx", "x"]
 
 PairParser: TypeAlias = Callable[[Iterable[str | PathLike]], Pairs]
 
@@ -694,7 +668,8 @@ class RasterDataset(GeoDataset):
         fill_nodata: bool = False,
         verbose: bool = True,
         ds_name: str = "",
-        parallel_loading: bool = False,
+        lazy_loading: bool = False,
+        chunks: dict[str, int] | None = None,
     ) -> None:
         """Initialize a new raster dataset instance.
 
@@ -741,10 +716,13 @@ class RasterDataset(GeoDataset):
             if True, print verbose output, default: True
         ds_name : str, optional
             name of the dataset. used for printing verbose output, default: ""
-        parallel_loading : bool, optional
-            Enable parallelized operations (via `dask` when available) both during
-            dataset initialization (file discovery and metadata extraction) and
-            during queries (lazy/parallel computation). Default: False.
+        lazy_loading : bool, optional
+            Enable lazy loading using dask arrays. When True, data is not loaded
+            into memory until compute() is called. This is useful for large datasets
+            that don't fit in memory. Default: False.
+        chunks : dict[str, int] | None, optional
+            Chunk sizes for dask arrays when lazy_loading is True.
+            Example: {'y': 512, 'x': 512}. Default is None, which uses 512x512 chunks.
 
         Raises
         ------
@@ -770,7 +748,8 @@ class RasterDataset(GeoDataset):
         self.fill_nodata = fill_nodata
         self.verbose = verbose
         self.ds_name = ds_name
-        self.parallel_loading = bool(parallel_loading)
+        self.lazy_loading = bool(lazy_loading)
+        self.chunks = chunks or {"y": 512, "x": 512, "band": 1}
 
         if paths is None:
             paths = []
@@ -782,11 +761,8 @@ class RasterDataset(GeoDataset):
         else:
             paths = [str(p) for p in paths]
 
-        # Scan files and extract metadata
-        if self.parallel_loading and HAS_DASK:
-            files_df = self._scan_files_with_dask(paths, crs)
-        else:
-            files_df = self._scan_files_sequential(paths, crs)
+        # Scan files and extract metadata (always sequential, metadata is lightweight)
+        files_df = self._scan_files_sequential(paths, crs)
 
         # Store files information
         self._files = files_df
@@ -978,46 +954,6 @@ class RasterDataset(GeoDataset):
         # Process results and return DataFrame
         return self._process_scan_results(file_metadata_list)
 
-    def _scan_files_with_dask(
-        self, paths: list[str], target_crs: CRS | None = None
-    ) -> pd.DataFrame:
-        """Scan files with dask for parallel processing.
-
-        Parameters
-        ----------
-        paths : list[str]
-            List of file paths to scan
-        target_crs : CRS, optional
-            Target CRS for coordinate transformation
-
-        Returns
-        -------
-        pd.DataFrame
-            DataFrame containing file metadata
-
-        """
-        self._check_dask_available()
-
-        # Create delayed tasks for file processing
-        delayed_tasks = [
-            delayed(self._extract_single_file_metadata)(path, target_crs)
-            for path in paths
-        ]
-
-        # Add progress bar if verbose
-        if self.verbose:
-            sequence = tqdm(
-                delayed_tasks, desc=f"Scanning {self.ds_name} files", unit=" files"
-            )
-        else:
-            sequence = delayed_tasks
-
-        # Execute all tasks in parallel
-        file_metadata_list = list(dask.compute(*sequence))
-
-        # Process results and return DataFrame
-        return self._process_scan_results(file_metadata_list)
-
     def _determine_final_attributes(
         self,
         files_df: pd.DataFrame,
@@ -1077,17 +1013,6 @@ class RasterDataset(GeoDataset):
 
         return final_crs, final_res, final_dtype, final_nodata
 
-    @staticmethod
-    def _check_dask_available() -> None:
-        """Ensure dask is available when requested by a call-site."""
-        if not HAS_DASK:
-            msg = (
-                "dask is required for lazy loading and parallel computation. "
-                "Please install dask with: pip install 'dask[array]'"
-            )
-            logger.error(msg, stacklevel=2)
-            raise ImportError(msg)
-
     def __getitem__(
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
@@ -1116,6 +1041,10 @@ class RasterDataset(GeoDataset):
             query = GeoQuery(polygons=query)
 
         paths = self.files[self.files.valid].paths.tolist()
+
+        # Choose loading strategy based on lazy_loading setting
+        if self.lazy_loading:
+            return self._sample_files_lazy(paths, query)
         return self._sample_files(paths, query)
 
     def _ensure_bands_idx(self, vrt_fh: DatasetReader) -> list[int] | int:
@@ -1330,7 +1259,6 @@ class RasterDataset(GeoDataset):
         self,
         paths: Iterable[str],
         query: GeoQuery,
-        parallel_loading: bool | None = None,
     ) -> xr.DataTree:
         """Sample or retrieve values from the dataset for the given query.
 
@@ -1340,9 +1268,6 @@ class RasterDataset(GeoDataset):
             list of paths for files to stack
         query : GeoQuery
             a GeoQuery instance containing the desired queries.
-        parallel_loading : bool or None, optional
-            if True, use dask for lazy loading and parallel computation. If None,
-            use the dataset's default parallel_loading setting. Default is None.
 
         Returns
         -------
@@ -1357,46 +1282,22 @@ class RasterDataset(GeoDataset):
             valid_paths.index(path) for path in paths_list if path in valid_paths
         ]
 
-        if parallel_loading is None:
-            parallel_loading = self.parallel_loading
-
-        # Compute components
-        if parallel_loading and HAS_DASK:
-            tasks = []
-            if query.points is not None:
-                tasks.append(delayed(self._compute_points_ds)(query.points, indexes))
-            else:
-                tasks.append(delayed(lambda: None)())
-
-            if query.boxes is not None:
-                tasks.append(delayed(self._compute_bboxes_tree)(query.boxes, indexes))
-            else:
-                tasks.append(delayed(lambda: None)())
-
-            if query.polygons is not None:
-                tasks.append(
-                    delayed(self._compute_polygons_tree)(query.polygons, indexes)
-                )
-            else:
-                tasks.append(delayed(lambda: None)())
-
-            points_da, bboxes_tree, polygons_tree = dask.compute(*tasks)
-        else:
-            points_ds = (
-                self._compute_points_ds(query.points, indexes)
-                if query.points is not None
-                else None
-            )
-            bboxes_tree = (
-                self._compute_bboxes_tree(query.boxes, indexes)
-                if query.boxes is not None
-                else None
-            )
-            polygons_tree = (
-                self._compute_polygons_tree(query.polygons, indexes)
-                if query.polygons is not None
-                else None
-            )
+        # Compute components (eager loading)
+        points_ds = (
+            self._compute_points_ds(query.points, indexes)
+            if query.points is not None
+            else None
+        )
+        bboxes_tree = (
+            self._compute_bboxes_tree(query.boxes, indexes)
+            if query.boxes is not None
+            else None
+        )
+        polygons_tree = (
+            self._compute_polygons_tree(query.polygons, indexes)
+            if query.polygons is not None
+            else None
+        )
 
         # Assemble xr.DataTree
         # Dual-track saving: store a full query_json on the root node
@@ -1454,6 +1355,326 @@ class RasterDataset(GeoDataset):
             children["polygons"] = xr.DataTree(name="polygons")
 
         return xr.DataTree(dataset=root_ds, name="query_result", children=children)
+
+    def _sample_files_lazy(
+        self,
+        paths: Iterable[str],
+        query: GeoQuery,
+    ) -> xr.DataTree:
+        """Sample files using lazy loading with dask arrays.
+
+        Parameters
+        ----------
+        paths : list of str
+            list of paths for files to stack
+        query : GeoQuery
+            a GeoQuery instance containing the desired queries.
+
+        Returns
+        -------
+        result : xr.DataTree
+            a DataTree instance with dask arrays (data not yet loaded).
+
+        """
+        # Convert paths to indexes
+        paths_list = list(paths)
+        valid_paths = self.files[self.files.valid].paths.tolist()
+        indexes = [
+            valid_paths.index(path) for path in paths_list if path in valid_paths
+        ]
+
+        # Points query - keep eager (small data)
+        points_ds = (
+            self._compute_points_ds(query.points, indexes)
+            if query.points is not None
+            else None
+        )
+
+        # Bboxes query - use lazy loading
+        bboxes_tree = (
+            self._compute_bboxes_tree_lazy(query.boxes, indexes)
+            if query.boxes is not None
+            else None
+        )
+
+        # Polygons query - use lazy loading
+        polygons_tree = (
+            self._compute_polygons_tree_lazy(query.polygons, indexes)
+            if query.polygons is not None
+            else None
+        )
+
+        # Assemble DataTree
+        root_attrs = {
+            "crs": str(self.crs) if self.crs is not None else None,
+            "res": tuple(self.res) if self.res is not None else None,
+            "lazy": True,  # Mark as lazy loaded
+        }
+        root_ds = xr.Dataset(attrs=root_attrs)
+
+        children = {}
+        if points_ds is not None:
+            children["points"] = xr.DataTree(dataset=points_ds, name="points")
+        else:
+            children["points"] = xr.DataTree(name="points")
+
+        if bboxes_tree is not None:
+            children["bboxes"] = bboxes_tree
+        else:
+            children["bboxes"] = xr.DataTree(name="bboxes")
+
+        if polygons_tree is not None:
+            children["polygons"] = polygons_tree
+        else:
+            children["polygons"] = xr.DataTree(name="polygons")
+
+        return xr.DataTree(dataset=root_ds, name="query_result", children=children)
+
+    def _compute_bboxes_tree_lazy(
+        self,
+        bbox: BoundingBox | list[BoundingBox],
+        indexes: int | list[int] | None = None,
+    ) -> xr.DataTree:
+        """Compute bbox query with lazy loading using dask arrays.
+
+        The return structure depends on the input type:
+        - If bbox is a single BoundingBox (not in a list), the result Dataset
+          is returned at the root of the DataTree, accessible via tree.dataset
+          or tree["data"].
+        - If bbox is a list (even with just one element), results are organized
+          into groups named "bbox_0", "bbox_1", etc., accessible via tree["bbox_0"],
+          tree["bbox_1"], etc.
+
+        This design ensures consistency: the output structure mirrors the input type.
+
+        Parameters
+        ----------
+        bbox : BoundingBox or list[BoundingBox]
+            Bounding box(es) to query.
+        indexes : int or list of int or None, optional
+            Indexes of files to query.
+
+        Returns
+        -------
+        result : xr.DataTree
+            DataTree with dask arrays (data not yet loaded).
+
+        """
+        bbox_list = bbox if isinstance(bbox, list) else [bbox]
+        resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
+
+        # Create multi-file lazy reader
+        multi_reader = LazyMultiFileReader(paths, chunks=self.chunks)
+
+        # Single bbox input (not a list) -> DataArray at root
+        if not isinstance(bbox, list):
+            single_bbox = bbox_list[0]
+
+            # Calculate window using first file
+            with rasterio.open(paths[0]) as src:
+                if src.crs != self.crs:
+                    with WarpedVRT(src, crs=self.crs) as vrt:
+                        win = vrt.window(*single_bbox)
+                        transform = vrt.window_transform(win)
+                else:
+                    win = src.window(*single_bbox)
+                    transform = src.window_transform(win)
+
+            # Create lazy dask array (data NOT loaded)
+            dask_array = multi_reader.to_stacked_dask_array(band=1, window=win)
+
+            # Build coordinates
+            height, width = dask_array.shape[-2:]
+            lat, lon = latlon_from_transform(transform, width, height)
+
+            file_dim = self.file_dim_name
+            dims = (file_dim, "y", "x")
+
+            coords = self._file_coords(resolved_indexes, paths, files_df)
+            coords.update(
+                {
+                    "y": ("y", np.asarray(lat)),
+                    "x": ("x", np.asarray(lon)),
+                }
+            )
+
+            # Create Dataset with dask array (still lazy!)
+            ds = xr.Dataset(
+                {"data": (dims, dask_array)},
+                coords=coords,
+                attrs={
+                    "crs": str(self.crs),
+                    "transform": tuple(transform.to_gdal()),
+                    "nodata": self.nodata,
+                    "lazy": True,
+                    "query_json": json.dumps(_serialize_bbox(single_bbox)),
+                    "query_repr": (
+                        "BBox("
+                        f"{single_bbox.left}, {single_bbox.bottom}, "
+                        f"{single_bbox.right}, {single_bbox.top}, "
+                        f"crs={single_bbox.crs}"
+                        ")"
+                    ),
+                },
+            )
+
+            return xr.DataTree(dataset=ds, name="bboxes")
+
+        # List input (even single element) -> groups "bbox_0", "bbox_1", ...
+        children = {}
+        for i, single_bbox in enumerate(bbox_list):
+            # Calculate window using first file
+            with rasterio.open(paths[0]) as src:
+                if src.crs != self.crs:
+                    with WarpedVRT(src, crs=self.crs) as vrt:
+                        win = vrt.window(*single_bbox)
+                        transform = vrt.window_transform(win)
+                else:
+                    win = src.window(*single_bbox)
+                    transform = src.window_transform(win)
+
+            # Create lazy dask array (data NOT loaded)
+            dask_array = multi_reader.to_stacked_dask_array(band=1, window=win)
+
+            # Build coordinates
+            height, width = dask_array.shape[-2:]
+            lat, lon = latlon_from_transform(transform, width, height)
+
+            file_dim = self.file_dim_name
+            dims = (file_dim, "y", "x")
+
+            coords = self._file_coords(resolved_indexes, paths, files_df)
+            coords.update(
+                {
+                    "y": ("y", np.asarray(lat)),
+                    "x": ("x", np.asarray(lon)),
+                }
+            )
+
+            # Create Dataset with dask array (still lazy!)
+            ds = xr.Dataset(
+                {"data": (dims, dask_array)},
+                coords=coords,
+                attrs={
+                    "crs": str(self.crs),
+                    "transform": tuple(transform.to_gdal()),
+                    "nodata": self.nodata,
+                    "lazy": True,
+                    "query_json": json.dumps(_serialize_bbox(single_bbox)),
+                    "query_repr": (
+                        "BBox("
+                        f"{single_bbox.left}, {single_bbox.bottom}, "
+                        f"{single_bbox.right}, {single_bbox.top}, "
+                        f"crs={single_bbox.crs}"
+                        ")"
+                    ),
+                },
+            )
+
+            children_name = f"bbox_{i}"
+            children[children_name] = xr.DataTree(dataset=ds, name=children_name)
+
+        return xr.DataTree(name="bboxes", children=children)
+
+    def _compute_polygons_tree_lazy(
+        self,
+        polygons: Polygons,
+        indexes: int | list[int] | None = None,
+    ) -> xr.DataTree:
+        """Compute polygons query with lazy loading using dask arrays.
+
+        Parameters
+        ----------
+        polygons : Polygons
+            Polygons to query.
+        indexes : int or list of int or None, optional
+            Indexes of files to query.
+
+        Returns
+        -------
+        result : xr.DataTree
+            DataTree with dask arrays (data not yet loaded).
+
+        Notes
+        -----
+        Polygon queries with lazy loading are simplified: we load the bounding
+        box of each polygon lazily, and masking is applied during compute().
+
+        """
+        resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
+
+        multi_reader = LazyMultiFileReader(paths, chunks=self.chunks)
+
+        n_polygons = len(polygons)
+        children = {}
+
+        for i in range(n_polygons):
+            poly_geom = polygons.geodataframe.geometry.iloc[i]
+
+            # Get bounding box of polygon
+            minx, miny, maxx, maxy = poly_geom.bounds
+            poly_bbox = BoundingBox(minx, miny, maxx, maxy, crs=polygons.crs)
+
+            # Calculate window
+            with rasterio.open(paths[0]) as src:
+                if src.crs != self.crs:
+                    poly_bbox = poly_bbox.to_crs(self.crs)
+                    with WarpedVRT(src, crs=self.crs) as vrt:
+                        win = vrt.window(*poly_bbox)
+                        transform = vrt.window_transform(win)
+                else:
+                    poly_bbox = (
+                        poly_bbox.to_crs(self.crs)
+                        if poly_bbox.crs != self.crs
+                        else poly_bbox
+                    )
+                    win = src.window(*poly_bbox)
+                    transform = src.window_transform(win)
+
+            # Create lazy dask array for polygon bounding box
+            dask_array = multi_reader.to_stacked_dask_array(band=1, window=win)
+
+            # Build coordinates
+            height, width = dask_array.shape[-2:]
+            lat, lon = latlon_from_transform(transform, width, height)
+
+            file_dim = self.file_dim_name
+            dims = (file_dim, "y", "x")
+
+            coords = self._file_coords(resolved_indexes, paths, files_df)
+            coords.update(
+                {
+                    "y": ("y", np.asarray(lat)),
+                    "x": ("x", np.asarray(lon)),
+                }
+            )
+
+            # Create Dataset with lazy array
+            wkt = poly_geom.wkt if hasattr(poly_geom, "wkt") else str(poly_geom)
+            ds = xr.Dataset(
+                {"data": (dims, dask_array)},
+                coords=coords,
+                attrs={
+                    "crs": str(self.crs),
+                    "transform": tuple(transform.to_gdal()),
+                    "nodata": self.nodata,
+                    "lazy": True,
+                    "polygon_wkt": wkt,
+                    "query_json": json.dumps(
+                        {
+                            "type": "Polygon",
+                            "crs": str(self.crs) if self.crs is not None else None,
+                            "wkt": wkt,
+                        }
+                    ),
+                    "query_repr": f"Polygon(crs={self.crs})",
+                },
+            )
+
+            child_name = str(i) if n_polygons > 1 else "polygon"
+            children[child_name] = xr.DataTree(dataset=ds, name=child_name)
+
+        return xr.DataTree(name="polygons", children=children)
 
     def _compute_points_ds(
         self, points: Points, indexes: int | list[int] | None = None
@@ -1564,6 +1785,61 @@ class RasterDataset(GeoDataset):
         )
         return ds
 
+    def _make_bbox_da(
+        self,
+        single_bbox: BoundingBox,
+        data: np.ndarray,
+        paths: list[str],
+        indexes: np.ndarray,
+        files_df: pd.DataFrame,
+    ) -> xr.DataArray:
+        """Make a DataArray for a single bbox query."""
+        profile = self.get_profile(single_bbox)
+        transform = profile["transform"] if profile is not None else None
+        height = data.shape[-2]
+        width = data.shape[-1]
+
+        if transform is not None:
+            lat, lon = latlon_from_transform(transform, width, height)
+        else:
+            lat = np.arange(height)
+            lon = np.arange(width)
+
+        file_dim = self.file_dim_name
+        dims = (file_dim, "band", "y", "x") if data.ndim == 4 else (file_dim, "y", "x")
+
+        coords = self._file_coords(indexes, paths, files_df)
+        coords.update(
+            {
+                "y": ("y", np.asarray(lat)),
+                "x": ("x", np.asarray(lon)),
+            }
+        )
+        if data.ndim == 4:
+            coords["band"] = ("band", np.arange(data.shape[1]))
+
+        return xr.DataArray(
+            data,
+            dims=dims,
+            coords=coords,
+            name="data",
+            attrs={
+                "crs": str(self.crs) if self.crs is not None else None,
+                "transform": tuple(transform.to_gdal())
+                if transform is not None
+                else None,
+                "nodata": self.nodata,
+                "query_json": json.dumps(_serialize_bbox(single_bbox)),
+                "query_repr": (
+                    "BBox("
+                    f"{single_bbox.left}, {single_bbox.bottom}, "
+                    f"{single_bbox.right}, {single_bbox.top}, "
+                    f"crs={single_bbox.crs}"
+                    ")"
+                ),
+            },
+        )
+
     def _make_poly_dataset(
         self,
         vals_i: Any,
@@ -1664,18 +1940,34 @@ class RasterDataset(GeoDataset):
     ) -> xr.DataTree:
         """Compute bbox query and return a xr.DataTree.
 
-        - If a single BoundingBox is provided, return a xr.DataTree whose dataset is
-          the result.
-        - If a list is provided (even length 1), return a xr.DataTree with groups
-          named "bbox_0", "bbox_1", ...
-        Coordinates include file paths, and y/x as real-world coordinates
-        derived from the transform.
+        The return structure depends on the input type:
+        - If bbox is a single BoundingBox (not in a list), the result Dataset
+          is returned at the root of the DataTree, accessible via tree.dataset
+          or tree["data"].
+        - If bbox is a list (even with just one element), results are organized
+          into groups named "bbox_0", "bbox_1", etc., accessible via tree["bbox_0"],
+          tree["bbox_1"], etc.
+
+        This design ensures consistency: the output structure mirrors the input type.
+
+        Parameters
+        ----------
+        bbox : BoundingBox or list[BoundingBox]
+            Bounding box(es) to query.
+        indexes : int or list of int or None, optional
+            Indexes of files to query.
+
+        Returns
+        -------
+        result : xr.DataTree
+            DataTree with structure depending on bbox input type.
+
         """
         bbox_list = bbox if isinstance(bbox, list) else [bbox]
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
         vrt_fhs_template = self._paths2vrt_fhs(paths)
 
-        # Single bbox input -> dataset directly
+        # Single bbox input (not a list) -> dataset at root
         if not isinstance(bbox, list):
             vrt_fhs = vrt_fhs_template
             data = self._files_query_bbox(bbox, vrt_fhs)
@@ -1688,7 +1980,7 @@ class RasterDataset(GeoDataset):
             )
             return xr.DataTree(dataset=ds, name="bboxes")
 
-        # List input -> groups bbox_0, bbox_1, ...
+        # List input (even single element) -> groups "bbox_0", "bbox_1", ...
         children: dict[str, xr.DataTree] = {}
         for i, single_bbox in enumerate(bbox_list):
             vrt_fhs = vrt_fhs_template
@@ -1925,7 +2217,6 @@ class RasterDataset(GeoDataset):
         self,
         points: Points,
         indexes: int | list[int] | None = None,
-        parallel_loading: bool | None = None,
     ) -> xr.Dataset:
         """Query the dataset for the given file index and points.
 
@@ -1936,9 +2227,6 @@ class RasterDataset(GeoDataset):
         indexes : int or list of int or None, optional
             indexes of the files to query. If None, all files in the dataset
             will be used. Default is None.
-        parallel_loading : bool or None, optional
-            if True, use dask for lazy loading and parallel computation. If None,
-            use the dataset's default parallel_loading setting. Default is None.
 
         Returns
         -------
@@ -1946,55 +2234,87 @@ class RasterDataset(GeoDataset):
             a result object containing the results of the query.
 
         """
-        if parallel_loading is None:
-            parallel_loading = self.parallel_loading
-
-        if parallel_loading and HAS_DASK:
-            self._check_dask_available()
-            return dask.compute(delayed(self._compute_points_ds)(points, indexes))[0]
         return self._compute_points_ds(points, indexes)
 
     def bbox_query(
         self,
         bbox: BoundingBox | list[BoundingBox],
         indexes: int | list[int] | None = None,
-        parallel_loading: bool | None = None,
+        lazy_loading: bool | None = None,
     ) -> xr.DataTree:
         """Query the dataset for the given file index and bounding box(es).
+
+        The return structure depends on the input type to ensure consistency:
+
+        - **Single BoundingBox** (not in a list): The result Dataset is returned
+          at the root of the DataTree. Access data via:
+          - ``tree.dataset["data"]`` or ``tree["data"]``
+
+        - **List of BoundingBox** (even with just one element): Results are
+          organized into groups named "bbox_0", "bbox_1", etc. Access data via:
+          - ``tree["bbox_0"]["data"]`` for first bbox
+          - ``tree["bbox_1"]["data"]`` for second bbox, etc.
+
+        This design ensures the output structure mirrors the input type, providing
+        predictable behavior regardless of whether you query one or many bboxes.
 
         Parameters
         ----------
         bbox : BoundingBox or list[BoundingBox]
-            desired bounding box(es) to query. If a list is provided (even with one
-            bbox), the output will have a bbox dimension. If a single bbox (not in a
-            list) is provided, no bbox dimension will be added.
+            Desired bounding box(es) to query.
         indexes : int or list of int or None, optional
-            indexes of the files to query. If None, all files in the dataset
+            Indexes of the files to query. If None, all files in the dataset
             will be used. Default is None. File dimension will never be automatically
             removed even if it's 1.
-        parallel_loading : bool or None, optional
-            if True, use dask for lazy loading and parallel computation. If None,
-            use the dataset's default parallel_loading setting. Default is None.
+        lazy_loading : bool or None, optional
+            If True, use lazy loading with dask arrays (data loaded on .compute()).
+            If False, load data eagerly into memory immediately.
+            If None, use the dataset's default lazy_loading setting.
+            Default is None.
 
         Returns
         -------
-        result : BBoxesResult
-            a result object containing the results of the query.
+        result : xr.DataTree
+            DataTree containing the query results. Structure depends on input type:
+            - Single bbox: ``tree.dataset`` contains the result
+            - List of bboxes: ``tree["bbox_0"]``, ``tree["bbox_1"]``, etc. contain
+              results
+
+        Examples
+        --------
+        Single bounding box (not in list):
+
+        >>> bbox = BoundingBox(0, 10, 0, 10, crs=ds.crs)
+        >>> result = ds.bbox_query(bbox)
+        >>> data = result["data"]  # Access directly at root
+        >>> # or: data = result.dataset["data"]
+
+        List of bounding boxes (structured output):
+
+        >>> bbox1 = BoundingBox(0, 10, 0, 10, crs=ds.crs)
+        >>> bbox2 = BoundingBox(10, 20, 10, 20, crs=ds.crs)
+        >>> result = ds.bbox_query([bbox1, bbox2])
+        >>> data1 = result["bbox_0"]["data"]  # First bbox
+        >>> data2 = result["bbox_1"]["data"]  # Second bbox
+
+        Single bbox in list (also uses groups):
+
+        >>> result = ds.bbox_query([bbox])
+        >>> data = result["bbox_0"]["data"]  # Note: accessed via group "bbox_0"
 
         """
-        if parallel_loading is None:
-            parallel_loading = self.parallel_loading
+        if lazy_loading is None:
+            lazy_loading = self.lazy_loading
 
-        if parallel_loading and HAS_DASK:
-            self._check_dask_available()
-            return dask.compute(delayed(self._compute_bboxes_tree)(bbox, indexes))[0]
+        if lazy_loading:
+            return self._compute_bboxes_tree_lazy(bbox, indexes)
         return self._compute_bboxes_tree(bbox, indexes)
 
     def polygons_query(
         self,
         polygons: Polygons,
         indexes: int | list[int] | None = None,
-        parallel_loading: bool | None = None,
+        lazy_loading: bool | None = None,
     ) -> xr.DataTree:
         """Query the dataset for the given file index and polygons.
 
@@ -2007,9 +2327,9 @@ class RasterDataset(GeoDataset):
             indexes of the files to query. If None, all files in the dataset
             will be used. Default is None. File dimension will never be automatically
             removed even if it's 1.
-        parallel_loading : bool or None, optional
-            if True, use dask for lazy loading and parallel computation. If None,
-            use the dataset's default parallel_loading setting. Default is None.
+        lazy_loading : bool or None, optional
+            if True, use lazy loading with dask arrays. If None, use the dataset's
+            default lazy_loading setting. Default is None.
 
         Returns
         -------
@@ -2017,22 +2337,18 @@ class RasterDataset(GeoDataset):
             a result object containing the results of the query.
 
         """
-        if parallel_loading is None:
-            parallel_loading = self.parallel_loading
+        if lazy_loading is None:
+            lazy_loading = self.lazy_loading
 
-        if parallel_loading and HAS_DASK:
-            self._check_dask_available()
-            return dask.compute(
-                delayed(self._compute_polygons_tree)(polygons, indexes)
-            )[0]
-
+        if lazy_loading:
+            return self._compute_polygons_tree_lazy(polygons, indexes)
         return self._compute_polygons_tree(polygons, indexes)
 
     def query(
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         indexes: int | list[int] | None = None,
-        parallel_loading: bool | None = None,
+        lazy_loading: bool | None = None,
     ) -> xr.DataTree:
         """Retrieve image values for given query.
 
@@ -2048,9 +2364,9 @@ class RasterDataset(GeoDataset):
         indexes : int or list of int or None, optional
             indexes of the files to query. If None, all files in the dataset
             will be used. Default is None.
-        parallel_loading : bool or None, optional
-            if True, use dask for lazy loading and parallel computation. If None,
-            use the dataset's default parallel_loading setting. Default is None.
+        lazy_loading : bool or None, optional
+            if True, use lazy loading with dask arrays. If None, use the dataset's
+            default lazy_loading setting. Default is None.
 
         Returns
         -------
@@ -2058,8 +2374,8 @@ class RasterDataset(GeoDataset):
             A xr.DataTree containing the results of the various queries.
 
         """
-        if parallel_loading is None:
-            parallel_loading = self.parallel_loading
+        if lazy_loading is None:
+            lazy_loading = self.lazy_loading
 
         if isinstance(query, Points):
             query = GeoQuery(points=query)
@@ -2069,7 +2385,10 @@ class RasterDataset(GeoDataset):
             query = GeoQuery(polygons=query)
 
         paths = self._indexes2paths(indexes)
-        return self._sample_files(paths, query, parallel_loading=parallel_loading)
+
+        if lazy_loading:
+            return self._sample_files_lazy(paths, query)
+        return self._sample_files(paths, query)
 
     def row_col(
         self,
@@ -3361,7 +3680,7 @@ class PairDataset(RasterDataset):
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         pairs: Pairs | None = None,
-        parallel_loading: bool | None = None,
+        lazy_loading: bool | None = None,
     ) -> xr.DataTree:
         """Retrieve image values for given query.
 
@@ -3376,9 +3695,9 @@ class PairDataset(RasterDataset):
             :class:`GeoQuery` (recommended) object.
         pairs : Pairs, optional
             pairs to use for the query. If None, all pairs will be used.
-        parallel_loading : bool or None, optional
-            if True, use dask for lazy loading and parallel computation. If None,
-            use the dataset's default parallel_loading setting. Default is None.
+        lazy_loading : bool or None, optional
+            if True, use lazy loading with dask arrays. If None, use the dataset's
+            default lazy_loading setting. Default is None.
 
         Returns
         -------
@@ -3386,6 +3705,9 @@ class PairDataset(RasterDataset):
             a QueryResult instance containing the results of the various queries.
 
         """
+        if lazy_loading is None:
+            lazy_loading = self.lazy_loading
+
         if isinstance(query, Points):
             query = GeoQuery(points=query)
         if isinstance(query, BoundingBox):
@@ -3400,7 +3722,10 @@ class PairDataset(RasterDataset):
             mask = mask & pd.Series(pair_mask, index=files_df.index)
 
         paths = files_df[mask].paths.tolist()
-        return self._sample_files(paths, query, parallel_loading)
+
+        if lazy_loading:
+            return self._sample_files_lazy(paths, query)
+        return self._sample_files(paths, query)
 
 
 def get_nodata(
