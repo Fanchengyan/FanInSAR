@@ -1,9 +1,14 @@
+import odc.geo  # ensure odc is loaded when using datasets
+
 from .aps import ApsDataset, ApsPairs
 from .base import GeoDataset, PairDataset, RasterDataset
 from .gacos import GACOS, GACOSPairs
+from .geobox import GeoBox
+from .hierarchical import HierarchicalDataset
 from .hyp3 import HyP3S1, HyP3S1Burst
 from .ifg import CoherenceDataset, InterferogramDataset
 from .licsar import LiCSAR
+from .xarray_dataset import XarrayDataset
 
 available = [
     "ApsDataset",
@@ -16,6 +21,9 @@ available = [
     "HyP3",
     "InterferogramDataset",
     "LiCSAR",
+    "HierarchicalDataset",
+    "XarrayDataset",
+    "GeoBox",
 ]
 
 MAPPING_PAIRS = {

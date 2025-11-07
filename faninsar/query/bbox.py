@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from typing import TYPE_CHECKING, overload
 
 import geopandas as gpd
@@ -10,8 +9,12 @@ from rasterio.crs import CRS
 from rasterio.warp import transform_bounds
 from shapely.geometry import box
 
+from faninsar.logging import setup_logger
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+logger = setup_logger(__name__)
 
 
 class BoundingBox:
@@ -152,13 +155,13 @@ class BoundingBox:
         other, crs_new = self._ensure_points_crs(other)
         return BoundingBox(
             min(self.left, other.left),
-            max(self.right, other.right),
             min(self.bottom, other.bottom),
+            max(self.right, other.right),
             max(self.top, other.top),
             crs=crs_new,
         )
 
-    def __and__(self, other: BoundingBox) -> BoundingBox:
+    def __and__(self, other: BoundingBox) -> BoundingBox | None:
         """Intersection operator.
 
         Parameters
@@ -168,8 +171,9 @@ class BoundingBox:
 
         Returns
         -------
-        BoundingBox:
-            the intersection of self and other
+        BoundingBox | None:
+            the intersection of self and other. If self and other do not intersect,
+            return None.
 
         Raises
         ------
@@ -181,25 +185,26 @@ class BoundingBox:
             other, crs_new = self._ensure_points_crs(other)
             return BoundingBox(
                 max(self.left, other.left),
-                min(self.right, other.right),
                 max(self.bottom, other.bottom),
+                min(self.right, other.right),
                 min(self.top, other.top),
                 crs=crs_new,
             )
-        except ValueError as e:
+        except Exception:
             msg = f"Bounding boxes {self} and {other} do not overlap"
-            raise ValueError(msg) from e
+            logger.warning(msg, stacklevel=2)
+            return None
 
     def _ensure_points_crs(self, other: BoundingBox) -> tuple[BoundingBox, CRS]:
         """Ensure the coordinate reference system of the bbox are the same."""
         if self.crs != other.crs:
             if self.crs is None or other.crs is None:
                 crs_new = self.crs or other.crs
-                warnings.warn(
+                msg = (
                     "Cannot find the coordinate reference system of the bbox. "
                     "The crs of two bbox will assume to be the same. ",
-                    stacklevel=2,
                 )
+                logger.warning(msg, stacklevel=2)
             else:
                 other = other.to_crs(self.crs)
                 crs_new = self.crs
@@ -287,6 +292,16 @@ class BoundingBox:
             "top": self.top,
         }
 
+    def to_tuple(self) -> tuple[float, float, float, float]:
+        """Convert the bounding box to a tuple.
+
+        Returns
+        -------
+            tuple with elements (left, bottom, right, top)
+
+        """
+        return (self.left, self.bottom, self.right, self.top)
+
     def to_geodataframe(self) -> gpd.GeoDataFrame:
         """Convert the bounding box to a GeoDataFrame.
 
@@ -302,7 +317,7 @@ class BoundingBox:
         return gdf
 
     def intersects(self, other: BoundingBox) -> bool:
-        """Whether or not two bounding boxes intersect.
+        """Whether two bounding boxes intersect.
 
         Parameters
         ----------
@@ -314,11 +329,33 @@ class BoundingBox:
             True if bounding boxes intersect, else False
 
         """
+        other, _ = self._ensure_points_crs(other)
         return (
             self.left <= other.right
             and self.right >= other.left
             and self.bottom <= other.top
             and self.top >= other.bottom
+        )
+
+    def contains(self, other: BoundingBox) -> bool:
+        """Whether the bounding box completely contains another bounding box.
+
+        Parameters
+        ----------
+        other: BoundingBox
+            another bounding box
+
+        Returns
+        -------
+            True if bounding box contains another bounding box, else False
+
+        """
+        other, _ = self._ensure_points_crs(other)
+        return (
+            self.left <= other.left
+            and self.right >= other.right
+            and self.bottom <= other.bottom
+            and self.top >= other.top
         )
 
     def split(
@@ -347,13 +384,13 @@ class BoundingBox:
         if horizontal:
             w = self.right - self.left
             splitx = self.left + w * proportion
-            bbox1 = BoundingBox(self.left, splitx, self.bottom, self.top)
-            bbox2 = BoundingBox(splitx, self.right, self.bottom, self.top)
+            bbox1 = BoundingBox(self.left, self.bottom, splitx, self.top, self.crs)
+            bbox2 = BoundingBox(splitx, self.bottom, self.right, self.top, self.crs)
         else:
             h = self.top - self.bottom
             splity = self.bottom + h * proportion
-            bbox1 = BoundingBox(self.left, self.right, self.bottom, splity)
-            bbox2 = BoundingBox(self.left, self.right, splity, self.top)
+            bbox1 = BoundingBox(self.left, self.bottom, self.right, splity, self.crs)
+            bbox2 = BoundingBox(self.left, splity, self.right, self.top, self.crs)
 
         return bbox1, bbox2
 
