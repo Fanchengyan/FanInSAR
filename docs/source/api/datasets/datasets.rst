@@ -22,8 +22,8 @@ The following datasets are available:
       * :class:`.LiCSAR`
 
 
-Dataset Classes
-~~~~~~~~~~~~~~~
+Raster Based Datasets
+~~~~~~~~~~~~~~~~~~~~~
 
 .. autosummary::
    :toctree: generated/
@@ -39,3 +39,12 @@ Dataset Classes
    faninsar.datasets.ApsDataset
    faninsar.datasets.GACOS
    faninsar.datasets.GACOSPairs
+
+Hierarchical Datasets
+~~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+   :toctree: generated/
+
+   faninsar.datasets.XarrayDataset
+   faninsar.datasets.HierarchicalDataset
