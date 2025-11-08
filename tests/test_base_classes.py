@@ -1,0 +1,190 @@
+"""Unit tests targeting the refactored dataset base modules."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pytest
+import rasterio
+from rasterio.crs import CRS
+from rasterio.transform import from_bounds
+
+from faninsar._core.geo_tools import Profile
+from faninsar._core.sar.acquisition import Acquisition
+from faninsar._core.sar.pairs import Pairs
+from faninsar.datasets.base import (
+    GeoDataset,
+    PairDataset,
+    RasterDataset,
+    TimeSeriesDataset,
+)
+from faninsar.query import BoundingBox, Points
+
+
+def _write_tile(path: Path, bounds: tuple[float, float, float, float], value: float) -> None:
+    """Create a small GeoTIFF tile for testing."""
+    height = width = 4
+    transform = from_bounds(*bounds, width, height)
+    data = np.full((height, width), value, dtype=np.float32)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=height,
+        width=width,
+        count=1,
+        dtype=data.dtype,
+        crs=CRS.from_epsg(4326),
+        transform=transform,
+        nodata=0.0,
+    ) as dst:
+        dst.write(data, 1)
+
+
+class ToyGeoDataset(GeoDataset):
+    """Minimal GeoDataset implementation used to exercise mixins."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._crs = CRS.from_epsg(4326)
+        self._res = (1.0, 1.0)
+        self._dtype = np.dtype("float32")
+        self._count = 1
+        self._nodata = 0.0
+        bbox = BoundingBox(0.0, 10.0, 0.0, 10.0, crs=self._crs)
+        self._roi = bbox
+        self._valid = np.array([True])
+        self.index.insert(0, tuple(bbox), "toy")
+
+    def get_profile(
+        self,
+        bbox: BoundingBox | str = "roi",
+    ) -> Profile:
+        bbox_obj = self._ensure_bbox(bbox) if isinstance(bbox, BoundingBox) else self.roi
+        width = int(abs(bbox_obj.right - bbox_obj.left)) or 1
+        height = int(abs(bbox_obj.top - bbox_obj.bottom)) or 1
+        transform = from_bounds(
+            bbox_obj.left,
+            bbox_obj.bottom,
+            bbox_obj.right,
+            bbox_obj.top,
+            width,
+            height,
+        )
+        return Profile(
+            width=width,
+            height=height,
+            transform=transform,
+            crs=self._crs,
+            nodata=self._nodata,
+            count=self._count,
+            dtype=self._dtype,
+        )
+
+
+class SampleRasterDataset(RasterDataset):
+    """RasterDataset variant with permissive filename matching."""
+
+    pattern = "*.tif"
+
+
+class SampleTimeSeriesDataset(TimeSeriesDataset):
+    """Time-series dataset that parses dates from filenames."""
+
+    pattern = "*.tif"
+
+    @classmethod
+    def _parse_dates(cls, paths: list[str | Path]) -> Acquisition:
+        dates = [
+            np.datetime64(datetime.strptime(Path(path).stem.split("_")[0], "%Y%m%d"), "ns")
+            for path in paths
+        ]
+        return Acquisition(dates)
+
+
+class SamplePairDataset(PairDataset):
+    """Pair dataset that parses primary/secondary dates from filenames."""
+
+    pattern = "*.tif"
+
+    @classmethod
+    def _parse_pairs(cls, paths: list[str | Path]) -> Pairs:
+        parsed: list[tuple[np.datetime64, np.datetime64]] = []
+        for path in paths:
+            parts = Path(path).stem.split("_")
+            primary = np.datetime64(datetime.strptime(parts[0], "%Y%m%d"), "ns")
+            secondary = np.datetime64(datetime.strptime(parts[1], "%Y%m%d"), "ns")
+            parsed.append((primary, secondary))
+        return Pairs(parsed)
+
+
+@pytest.fixture
+def raster_root(tmp_path: Path) -> Path:
+    """Populate a temporary directory with basic tiles."""
+    bounds = (0.0, 0.0, 4.0, 4.0)
+    for idx in range(3):
+        _write_tile(tmp_path / f"tile_{idx:02d}.tif", bounds, value=idx)
+    return tmp_path
+
+
+@pytest.fixture
+def time_series_root(tmp_path: Path) -> Path:
+    """Create tiles with YYYYMMDD prefixes for time-series parsing."""
+    bounds = (0.0, 0.0, 4.0, 4.0)
+    for date, value in [("20210101", 1.0), ("20210113", 2.0)]:
+        _write_tile(tmp_path / f"{date}_scene.tif", bounds, value=value)
+    return tmp_path
+
+
+@pytest.fixture
+def pair_root(tmp_path: Path) -> Path:
+    """Create tiles encoding interferometric pair names."""
+    bounds = (0.0, 0.0, 4.0, 4.0)
+    stems = ["20210101_20210113_pair", "20210113_20210125_pair"]
+    for stem in stems:
+        _write_tile(tmp_path / f"{stem}.tif", bounds, value=1.0)
+    return tmp_path
+
+
+def test_geo_dataset_roi_and_query_crs() -> None:
+    """GeoDataset mixin logic should normalize ROI and query CRS."""
+    ds = ToyGeoDataset()
+    assert ds.bounds.left == 0.0
+    new_roi = BoundingBox(-1.0, 5.0, -1.0, 5.0, crs=CRS.from_epsg(4326))
+    ds.roi = new_roi
+    assert ds.roi.left == pytest.approx(-1.0)
+
+    mercator = CRS.from_epsg(3857)
+    points = Points([(0.0, 0.0)], crs=mercator)
+    converted = ds._ensure_query_crs(points)
+    assert converted.crs == ds.crs
+
+
+def test_raster_dataset_scans_files(raster_root: Path) -> None:
+    """RasterDataset should discover GeoTIFF tiles under the root directory."""
+    ds = SampleRasterDataset(root_dir=raster_root, verbose=False)
+    assert len(ds) == 3
+    assert ds.files.valid.sum() == 3
+
+
+def test_time_series_dataset_parses_dates(time_series_root: Path) -> None:
+    """TimeSeriesDataset attaches parsed Acquisition metadata."""
+    ds = SampleTimeSeriesDataset(root_dir=time_series_root, verbose=False)
+    expected = [
+        np.datetime64("2021-01-01T00:00:00"),
+        np.datetime64("2021-01-13T00:00:00"),
+    ]
+    assert list(ds.dates.values) == expected
+    assert ds.file_dim_name == "date"
+
+
+def test_pair_dataset_parses_pairs(pair_root: Path) -> None:
+    """PairDataset should store primary and secondary date metadata."""
+    ds = SamplePairDataset(root_dir=pair_root, verbose=False)
+    assert list(ds.pairs.to_names()) == [
+        "20210101_20210113",
+        "20210113_20210125",
+    ]
+    assert ds.file_dim_name == "pair"

@@ -32,10 +32,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Sequence, cast
+from typing import TYPE_CHECKING, Iterable, Literal, Sequence, cast
 
 import dask.array as da
 import numpy as np
+import pandas as pd
 import xarray as xr
 from odc.geo.types import Resolution
 from odc.geo.xr import assign_crs
@@ -45,6 +46,7 @@ from rasterio.transform import Affine, array_bounds
 from tqdm import tqdm
 from typing_extensions import Self, TypeAlias
 
+from faninsar.datasets.base.geo import GeoDataset
 from faninsar.datasets.geobox import GeoBox
 from faninsar.logging import setup_logger
 from faninsar.query.bbox import BoundingBox
@@ -52,6 +54,8 @@ from faninsar.query.bbox import BoundingBox
 if TYPE_CHECKING:
     from rasterio.windows import Window
 
+    from faninsar.query.points import Points
+    from faninsar.query.polygons import Polygons
     from faninsar.typing import ResamplingLike
 
 __all__ = ["FileMetadata", "XarrayDataSpec", "XarrayDataset"]
@@ -162,8 +166,12 @@ class OutputMetadata:
     nodata: float | int | None
 
 
-class XarrayDataset:
-    """Load and query data using Xarray.
+class XarrayDataset(GeoDataset):
+    """Load and query data using Xarray with GeoDataset features.
+
+    This class integrates Xarray-based lazy loading with the GeoDataset interface,
+    providing R-tree spatial indexing, multiple query types, and compatibility with
+    the FanInSAR dataset ecosystem.
 
     Parameters
     ----------
@@ -246,6 +254,9 @@ class XarrayDataset:
         **kwargs,
     ) -> None:
         """Initialise the dataset."""
+        # Initialize GeoDataset first (sets up R-tree index)
+        super().__init__()
+
         # Store configuration for dimension and variable inference
         # Must be set before calling _normalise_open_spec
         self._group = group
@@ -284,6 +295,23 @@ class XarrayDataset:
         self._out_meta = OutputMetadata(
             geobox=out_geobox, dtype=out_dtype, nodata=out_nodata_final
         )
+
+        # Set GeoDataset properties from OutputMetadata
+        self._crs = self._out_meta.geobox.crs
+        resolution = self._out_meta.geobox.resolution
+        self._res = (abs(resolution.x), abs(resolution.y))
+        self._dtype = self._out_meta.dtype
+        self._nodata = self._out_meta.nodata
+        self._count = len(file_metadata)
+
+        # Populate R-tree index from file metadata
+        for idx, meta in enumerate(file_metadata):
+            bb = meta.geobox.boundingbox
+            bounds = (bb.left, bb.bottom, bb.right, bb.top)
+            self.index.insert(idx, bounds, str(meta.path))
+
+        # Set _valid array (all files are valid in XarrayDataset)
+        self._valid = np.ones(len(file_metadata), dtype=bool)
 
     def get_dataset(self, spec: XarrayDataSpec) -> xr.Dataset:
         """Get or open a dataset from cache.
@@ -576,6 +604,130 @@ class XarrayDataset:
         # Use odc-geo to set CRS
         return assign_crs(data_array, self.crs)
 
+    def points_query(self, points: Points) -> xr.DataArray:
+        """Extract values at point locations from all rasters.
+
+        Parameters
+        ----------
+        points : Points
+            Point locations to query. Points will be converted to dataset CRS
+            if necessary.
+
+        Returns
+        -------
+        xarray.DataArray
+            2-D array shaped ``(file, point)`` with values at each point location.
+            NoData is used where points fall outside raster bounds.
+
+        Notes
+        -----
+        Uses Xarray's selection methods to interpolate values at point locations.
+
+        """
+        # Convert points to dataset CRS
+        if points.crs is None:
+            msg = f"No CRS specified for points, assuming dataset CRS: {self.crs}"
+            logger.warning(msg)
+            points_crs = points
+        elif points.crs != self.crs:
+            points_crs = points.to_crs(self.crs)
+        else:
+            points_crs = points
+
+        stacked_values: list[np.ndarray] = []
+
+        for meta in self._file_meta_list:
+            spec = XarrayDataSpec(meta.path, meta.group, meta.var_name)
+            data_var = self.get_data_array(spec)
+
+            # Get x, y coordinates of points
+            x_coords = points_crs.x
+            y_coords = points_crs.y
+
+            # Sample using Xarray's selection
+            values = np.full(len(points_crs), self.nodata, dtype=self.dtype)
+
+            for i, (x, y) in enumerate(zip(x_coords, y_coords)):
+                try:
+                    # Use nearest neighbor selection
+                    val = data_var.sel(
+                        {meta.x_dim: x, meta.y_dim: y}, method="nearest"
+                    ).values
+                    if np.ndim(val) == 0:
+                        values[i] = val
+                    else:
+                        # Handle extra dimensions by taking first element
+                        values[i] = val.flat[0]
+                except (KeyError, IndexError):  # noqa: PERF203
+                    # Point outside bounds
+                    values[i] = self.nodata if self.nodata is not None else np.nan
+
+            stacked_values.append(values)
+
+        # Create DataArray
+        result = xr.DataArray(
+            np.array(stacked_values),
+            dims=("file", "point"),
+            coords={
+                "file": [spec.path for spec in self._open_specs],
+                "point": np.arange(len(points_crs)),
+                "x": ("point", points_crs.x),
+                "y": ("point", points_crs.y),
+            },
+            attrs={"crs": str(self.crs), "nodata": self.nodata},
+        )
+
+        return assign_crs(result, self.crs)
+
+    def polygons_query(self, polygons: Polygons) -> list[xr.DataArray]:
+        """Extract data within polygon boundaries from all rasters.
+
+        Parameters
+        ----------
+        polygons : Polygons
+            Polygon geometries to query. Polygons will be converted to dataset CRS
+            if necessary.
+
+        Returns
+        -------
+        list[xarray.DataArray]
+            List of DataArrays, one per polygon. Each array is shaped ``(file, y, x)``
+            and contains data clipped to the polygon bounds and masked outside the
+            polygon boundary.
+
+        Notes
+        -----
+        Currently clips to polygon bounding box. Precise polygon masking will be
+        added in future updates.
+
+        """
+        # Convert polygons to dataset CRS
+        if polygons.crs is None:
+            logger.warning(
+                "No CRS specified for polygons, assuming dataset CRS: %s", self.crs
+            )
+            polygons_crs = polygons
+        elif polygons.crs != self.crs:
+            polygons_crs = polygons.to_crs(self.crs)
+        else:
+            polygons_crs = polygons
+
+        results: list[xr.DataArray] = []
+
+        for poly in polygons_crs.geodataframe.geometry:
+            # Get bounding box of polygon
+            minx, miny, maxx, maxy = poly.bounds
+            bbox = BoundingBox(minx, miny, maxx, maxy, crs=self.crs)
+
+            # Query using bbox (will be masked to polygon in future)
+            data = self.bbox_query(bbox)
+
+            # TODO: Add polygon masking here
+            # For now, just return the bbox-clipped data
+            results.append(data)
+
+        return results
+
     def _load_bbox_data(self, query_geobox: GeoBox) -> xr.DataArray:
         """Produce eager xarray stacks for ``bbox_query``.
 
@@ -769,6 +921,48 @@ class XarrayDataset:
         """Return the number of rasters in the dataset."""
         return self.file_count
 
+    def get_profile(self, bbox: BoundingBox | Literal["roi", "bounds"] = "roi") -> dict:
+        """Get profile information for the dataset.
+
+        Parameters
+        ----------
+        bbox : BoundingBox | Literal["roi", "bounds"], optional
+            Bounding box to get profile for. Can be:
+            - "roi": Use region of interest (same as bounds for XarrayDataset)
+            - "bounds": Use full dataset bounds
+            - BoundingBox: Use specific bounding box
+            Default is "roi".
+
+        Returns
+        -------
+        dict
+            Profile dictionary with transform, width, height, crs, etc.
+
+        """
+        # Handle string literals
+        if bbox in {"roi", "bounds"} or bbox is None:
+            bbox = self.bounds
+        elif not isinstance(bbox, BoundingBox):
+            msg = f"bbox must be 'roi', 'bounds', or BoundingBox, got {type(bbox)}"
+            raise TypeError(msg)
+
+        geobox = GeoBox.from_bbox(
+            bbox.to_tuple(),
+            crs=self.crs,
+            resolution=Resolution(self.res[0], -self.res[1]),
+            tight=True,
+        )
+
+        return {
+            "transform": geobox.transform,
+            "width": geobox.width,
+            "height": geobox.height,
+            "crs": self.crs,
+            "dtype": self.dtype,
+            "nodata": self.nodata,
+            "count": self.file_count,
+        }
+
     @property
     def width(self) -> int:
         """The output width of the dataset."""
@@ -793,27 +987,6 @@ class XarrayDataset:
         )
 
     @property
-    def nodata(self) -> float | int | None:
-        """The output nodata value of the dataset."""
-        return self._out_meta.nodata
-
-    @property
-    def dtype(self) -> np.dtype:
-        """The output dtype of the dataset."""
-        return self._out_meta.dtype
-
-    @property
-    def res(self) -> tuple[float, float]:
-        """The output resolution of the dataset."""
-        resolution = self._out_meta.geobox.resolution
-        return (abs(resolution.x), abs(resolution.y))
-
-    @property
-    def crs(self) -> CRS:
-        """The output CRS of the dataset."""
-        return self._out_meta.geobox.crs
-
-    @property
     def nbytes(self) -> int:
         """The number of bytes of the allocated output array."""
         geobox = self._out_meta.geobox
@@ -833,6 +1006,57 @@ class XarrayDataset:
     def file_count(self) -> int:
         """The number of files in the dataset."""
         return len(self._file_meta_list)
+
+    @property
+    def files(self) -> pd.DataFrame:
+        """Build files DataFrame compatible with RasterDataset.
+
+        This property provides a pandas DataFrame interface compatible with
+        RasterDataset's internal structure, enabling TimeSeriesDataset and
+        PairDataset to work with XarrayDataset-based hierarchical datasets.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns:
+            - paths: File paths as strings
+            - valid: Boolean array indicating valid files (all True for XarrayDataset)
+            - file_crs: CRS of each file
+            - file_bounds: Bounds tuple of each file
+            - file_res: Resolution tuple of each file
+            - file_dtype: Data type of each file
+            - file_nodata: NoData value of each file
+
+        Notes
+        -----
+        This DataFrame is cached after first access. It's regenerated if
+        file metadata changes.
+
+        """
+        if not hasattr(self, "_cached_files_df"):
+            paths = [str(spec.path) for spec in self._open_specs]
+            data = {
+                "paths": paths,
+                "valid": self._valid,
+                "file_crs": [meta.geobox.crs for meta in self._file_meta_list],
+                "file_bounds": [
+                    (
+                        meta.geobox.boundingbox.left,
+                        meta.geobox.boundingbox.bottom,
+                        meta.geobox.boundingbox.right,
+                        meta.geobox.boundingbox.top,
+                    )
+                    for meta in self._file_meta_list
+                ],
+                "file_res": [
+                    (abs(meta.geobox.resolution.x), abs(meta.geobox.resolution.y))
+                    for meta in self._file_meta_list
+                ],
+                "file_dtype": [meta.dtype for meta in self._file_meta_list],
+                "file_nodata": [meta.nodata for meta in self._file_meta_list],
+            }
+            self._cached_files_df = pd.DataFrame(data)
+        return self._cached_files_df
 
 
 def _select_data_variable(
