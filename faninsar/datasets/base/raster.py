@@ -870,9 +870,9 @@ class RasterDataset(GeoDataset):
                     qroot["points"] = _serialize_points(query.points)
                 if query.boxes is not None:
                     if isinstance(query.boxes, list):
-                        qroot["bboxes"] = [_serialize_bbox(b) for b in query.boxes]
+                        qroot["boxes"] = [_serialize_bbox(b) for b in query.boxes]
                     else:
-                        qroot["bboxes"] = [_serialize_bbox(query.boxes)]
+                        qroot["boxes"] = [_serialize_bbox(query.boxes)]
                 if query.polygons is not None:
                     qroot["polygons"] = _serialize_polygons(query.polygons)
             root_attrs.update({
@@ -880,7 +880,7 @@ class RasterDataset(GeoDataset):
                 "query_repr": (
                     "GeoQuery("
                     f"points={query.points is not None}, "
-                    f"bboxes={query.boxes is not None}, "
+                    f"boxes={query.boxes is not None}, "
                     f"polygons={query.polygons is not None}"
                     ")"
                 ),
@@ -898,11 +898,11 @@ class RasterDataset(GeoDataset):
         else:
             children["points"] = xr.DataTree(name="points")
 
-        # bboxes
+        # boxes
         if bboxes_tree is not None:
-            children["bboxes"] = bboxes_tree
+            children["boxes"] = bboxes_tree
         else:
-            children["bboxes"] = xr.DataTree(name="bboxes")
+            children["boxes"] = xr.DataTree(name="boxes")
 
         # polygons
         if polygons_tree is not None:
@@ -975,9 +975,9 @@ class RasterDataset(GeoDataset):
             children["points"] = xr.DataTree(name="points")
 
         if bboxes_tree is not None:
-            children["bboxes"] = bboxes_tree
+            children["boxes"] = bboxes_tree
         else:
-            children["bboxes"] = xr.DataTree(name="bboxes")
+            children["boxes"] = xr.DataTree(name="boxes")
 
         if polygons_tree is not None:
             children["polygons"] = polygons_tree
@@ -1072,7 +1072,7 @@ class RasterDataset(GeoDataset):
                 },
             )
             ds = write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
-            return xr.DataTree(dataset=ds, name="bboxes")
+            return xr.DataTree(dataset=ds, name="boxes")
 
         # List input (even single element) -> groups "bbox_0", "bbox_1", ...
         children = {}
@@ -1126,7 +1126,7 @@ class RasterDataset(GeoDataset):
             children_name = f"bbox_{i}"
             children[children_name] = xr.DataTree(dataset=ds, name=children_name)
 
-        return xr.DataTree(name="bboxes", children=children)
+        return xr.DataTree(name="boxes", children=children)
 
     def _compute_polygons_tree_lazy(
         self,
@@ -1513,7 +1513,7 @@ class RasterDataset(GeoDataset):
                 resolved_indexes,
                 files_df,
             )
-            return xr.DataTree(dataset=ds, name="bboxes")
+            return xr.DataTree(dataset=ds, name="boxes")
 
         # List input (even single element) -> groups "bbox_0", "bbox_1", ...
         children: dict[str, xr.DataTree] = {}
@@ -1529,7 +1529,7 @@ class RasterDataset(GeoDataset):
             )
             children_name = f"bbox_{i}"
             children[children_name] = xr.DataTree(dataset=ds, name=children_name)
-        return xr.DataTree(name="bboxes", children=children)
+        return xr.DataTree(name="boxes", children=children)
 
     def _compute_polygons_tree(
         self, polygons: Polygons, indexes: int | list[int] | None = None
@@ -1771,7 +1771,7 @@ class RasterDataset(GeoDataset):
         """
         return self._compute_points_ds(points, indexes)
 
-    def bbox_query(
+    def box_query(
         self,
         bbox: BoundingBox | list[BoundingBox],
         indexes: int | list[int] | None = None,
@@ -1791,7 +1791,7 @@ class RasterDataset(GeoDataset):
           - ``tree["bbox_1"]["data"]`` for second bbox, etc.
 
         This design ensures the output structure mirrors the input type, providing
-        predictable behavior regardless of whether you query one or many bboxes.
+        predictable behavior regardless of whether you query one or many boxes.
 
         Parameters
         ----------
@@ -1812,7 +1812,7 @@ class RasterDataset(GeoDataset):
         result : xr.DataTree
             DataTree containing the query results. Structure depends on input type:
             - Single bbox: ``tree.dataset`` contains the result
-            - List of bboxes: ``tree["bbox_0"]``, ``tree["bbox_1"]``, etc. contain
+            - List of boxes: ``tree["bbox_0"]``, ``tree["bbox_1"]``, etc. contain
               results
 
         Examples
@@ -1820,7 +1820,7 @@ class RasterDataset(GeoDataset):
         Single bounding box (not in list):
 
         >>> bbox = BoundingBox(0, 10, 0, 10, crs=ds.crs)
-        >>> result = ds.bbox_query(bbox)
+        >>> result = ds.box_query(bbox)
         >>> data = result["data"]  # Access directly at root
         >>> # or: data = result.dataset["data"]
 
@@ -1828,13 +1828,13 @@ class RasterDataset(GeoDataset):
 
         >>> bbox1 = BoundingBox(0, 10, 0, 10, crs=ds.crs)
         >>> bbox2 = BoundingBox(10, 20, 10, 20, crs=ds.crs)
-        >>> result = ds.bbox_query([bbox1, bbox2])
+        >>> result = ds.box_query([bbox1, bbox2])
         >>> data1 = result["bbox_0"]["data"]  # First bbox
         >>> data2 = result["bbox_1"]["data"]  # Second bbox
 
         Single bbox in list (also uses groups):
 
-        >>> result = ds.bbox_query([bbox])
+        >>> result = ds.box_query([bbox])
         >>> data = result["bbox_0"]["data"]  # Note: accessed via group "bbox_0"
 
         """

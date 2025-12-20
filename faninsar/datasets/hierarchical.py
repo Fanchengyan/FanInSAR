@@ -108,7 +108,7 @@ class HierarchicalDataset(XarrayDataset, HierarchicalMixin):
     ...     pattern_files = "*.nc"
     >>> dataset = MyNetCDFDataset(root_dir="data/")
     >>> bbox = BoundingBox(0, 0, 100, 100, crs=dataset.crs)
-    >>> data = dataset.bbox_query(bbox)
+    >>> data = dataset.box_query(bbox)
 
     With explicit paths:
 
@@ -244,7 +244,7 @@ class HierarchicalTimeSeriesDataset(HierarchicalDataset, TimeSeriesDataset):
     >>> dataset = MyTimeSeriesDataset(root_dir="data/")
     >>> # Query specific dates
     >>> dates = Acquisition(["2020-01-01", "2020-01-15"])
-    >>> data = dataset.bbox_query(bbox, dates=dates)
+    >>> data = dataset.box_query(bbox, dates=dates)
 
     See Also
     --------
@@ -334,7 +334,7 @@ class HierarchicalPairDataset(HierarchicalDataset, PairDataset):
     >>> dataset = MyInterferogramDataset(root_dir="data/")
     >>> # Query specific pairs
     >>> pairs = Pairs([("2020-01-01", "2020-01-13")])
-    >>> data = dataset.bbox_query(bbox, pairs=pairs)
+    >>> data = dataset.box_query(bbox, pairs=pairs)
 
     See Also
     --------

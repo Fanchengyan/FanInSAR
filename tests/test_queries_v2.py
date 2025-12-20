@@ -51,9 +51,9 @@ def test_points_query_returns_dataset(ds: RasterDataset) -> None:
     assert ds_points["data"].shape[0] == 3 and ds_points["data"].shape[-1] == 3
 
 
-def test_bbox_query_returns_datatree(ds: RasterDataset) -> None:
+def test_box_query_returns_datatree(ds: RasterDataset) -> None:
     bbox = BoundingBox(-9.5, 40.5, -9.0, 41.0, crs=ds.crs)
-    tree = ds.bbox_query(bbox)
+    tree = ds.box_query(bbox)
     # Single bbox -> dataset on root
     assert tree.dataset is not None
     ds_root = tree.dataset

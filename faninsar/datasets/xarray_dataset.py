@@ -5,7 +5,7 @@ Notes
 This module introduces a lightweight :class:`XarrayDataset` class that uses
 Xarray, :mod:`rasterio`, and Dask to read gridded rasters. It targets
 single-band GeoTIFF inputs with matching grid alignment, providing both eager
-and lazy ``bbox_query`` implementations backed by a custom Dask HighLevelGraph.
+and lazy ``box_query`` implementations backed by a custom Dask HighLevelGraph.
 
 Examples
 --------
@@ -17,13 +17,13 @@ Basic usage:
 >>> from faninsar.query.bbox import BoundingBox
 >>> dataset = XarrayDataset(paths=[Path("tile.tif")])
 >>> bbox = BoundingBox(0, 0, 100, 100, crs=CRS.from_epsg(4326))
->>> data = dataset.bbox_query(bbox)
+>>> data = dataset.box_query(bbox)
 >>> dataset.close()  # Manually close files
 
 Using context manager:
 
 >>> with XarrayDataset(paths=[Path("tile.tif")]) as dataset:
-...     data = dataset.bbox_query(bbox)
+...     data = dataset.box_query(bbox)
 # Files are automatically closed when exiting the context
 
 """
@@ -231,7 +231,7 @@ class XarrayDataset(GeoDataset):
     automatically using a context manager:
 
     >>> with XarrayDataset(paths=[path]) as ds:
-    ...     result = ds.bbox_query(bbox)
+    ...     result = ds.box_query(bbox)
     # Files are automatically closed when exiting the context
 
     Files are also automatically closed when the object is destroyed.
@@ -566,7 +566,7 @@ class XarrayDataset(GeoDataset):
         logger.warning(msg)
         return CRS.from_epsg(4326)
 
-    def bbox_query(
+    def box_query(
         self,
         bbox: BoundingBox,
     ) -> xr.DataArray:
@@ -720,7 +720,7 @@ class XarrayDataset(GeoDataset):
             bbox = BoundingBox(minx, miny, maxx, maxy, crs=self.crs)
 
             # Query using bbox (will be masked to polygon in future)
-            data = self.bbox_query(bbox)
+            data = self.box_query(bbox)
 
             # TODO: Add polygon masking here
             # For now, just return the bbox-clipped data
@@ -729,7 +729,7 @@ class XarrayDataset(GeoDataset):
         return results
 
     def _load_bbox_data(self, query_geobox: GeoBox) -> xr.DataArray:
-        """Produce eager xarray stacks for ``bbox_query``.
+        """Produce eager xarray stacks for ``box_query``.
 
         Parameters
         ----------

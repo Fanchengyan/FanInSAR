@@ -120,13 +120,13 @@ class TimeSeriesDataset(RasterDataset, ABC):
         resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
         return self._compute_points_ds(points, resolved_indexes)
 
-    def bbox_query(
+    def box_query(
         self,
         bbox: BoundingBox | list[BoundingBox],
         dates: Acquisition | pd.DatetimeIndex | None = None,
         lazy_loading: bool | None = None,
     ) -> xr.DataTree:
-        """Query bbox/bboxes for the given dates subset (no indexes support)."""
+        """Query bbox/boxes for the given dates subset (no indexes support)."""
         if lazy_loading is None:
             lazy_loading = self.lazy_loading
         files_df = self.files
