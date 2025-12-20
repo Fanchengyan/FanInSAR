@@ -17,7 +17,7 @@ from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points
 
 from .aps import ApsPairs
-from .base import PairDataset, PairParser, RasterDataset
+from .base import PairDataset, RasterDataset
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -34,46 +34,6 @@ class CoherenceDataset(PairDataset):
     """A base class for coherence datasets."""
 
     _range: tuple[float, float]
-
-    def __init__(
-        self,
-        *args,
-        pair_parser: PairParser | None = None,
-        **kwargs,
-    ) -> None:
-        """Initialize the coherence dataset.
-
-        Parameters
-        ----------
-        *args :
-            Positional arguments forwarded to :class:`PairDataset`.
-        pair_parser : PairParser or None, optional
-            Callable used to parse interferometric pairs from file paths. When
-            ``None``, :meth:`_parse_pairs` is used, and subclasses must implement
-            that method.
-        **kwargs :
-            Additional keyword arguments forwarded to :class:`PairDataset`.
-
-        Returns
-        -------
-        None
-            This method returns ``None``.
-
-        Notes
-        -----
-        Providing ``pair_parser`` allows a coherence dataset to reuse the parser
-        defined by a paired interferogram dataset, guaranteeing consistent pair
-        metadata between the two datasets.
-
-        """
-        parser = pair_parser or self._parse_pairs
-        super().__init__(*args, pair_parser=parser, **kwargs)
-
-    @classmethod
-    def _parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
-        """Parse pairs from filenames. Must be implemented in subclass."""
-        msg = "_parse_pairs method must be implemented in subclass"
-        raise NotImplementedError(msg)
 
     @property
     def range(self) -> tuple[float, float]:
@@ -329,7 +289,7 @@ class InterferogramDataset(PairDataset):
             ds_name="Coherence",
             lazy_loading=lazy_loading,
             chunks=chunks,
-            pair_parser=self._parse_pairs,
+            pair_parser=self.parse_pairs,
         )
         self._ds_coh._range = self.coh_range
 
@@ -342,9 +302,9 @@ class InterferogramDataset(PairDataset):
         self._ds_coh._valid = self._ds_coh._valid[_valid]
 
         # remove invalid pairs and refresh metadata
-        self._assign_pairs_from_files()
+        self._assign_pairs_from_paths()
 
-        self._ds_coh._assign_pairs_from_files()
+        self._ds_coh._assign_pairs_from_paths()
 
     def _deduplicate_pairs(
         self, paths: np.ndarray, dataset_name: str

@@ -29,7 +29,7 @@ class HyP3S1(InterferogramDataset, Sentinel1):
     pattern_coh = "*corr.tif"
 
     @classmethod
-    def _parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
+    def parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
         """Parse the Pairs from the paths of the interferogram."""
         names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[1:3]) for i in names]
@@ -78,7 +78,7 @@ class HyP3S1Burst(InterferogramDataset, Sentinel1):
     pattern_coh = "*corr.tif"
 
     @classmethod
-    def _parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
+    def parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
         """Parse pairs from the paths of the interferogram."""
         names = [Path(f).name for f in paths]
         pair_names = ["_".join(i.split("_")[3:5]) for i in names]

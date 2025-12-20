@@ -21,6 +21,7 @@ from faninsar.datasets.base import (
     TimeSeriesDataset,
 )
 from faninsar.query import BoundingBox, Points
+from typing import Iterable
 
 
 def _write_tile(path: Path, bounds: tuple[float, float, float, float], value: float) -> None:
@@ -110,7 +111,7 @@ class SamplePairDataset(PairDataset):
     pattern = "*.tif"
 
     @classmethod
-    def _parse_pairs(cls, paths: list[str | Path]) -> Pairs:
+    def parse_pairs(cls, paths: Iterable[str | Path]) -> Pairs:
         parsed: list[tuple[np.datetime64, np.datetime64]] = []
         for path in paths:
             parts = Path(path).stem.split("_")

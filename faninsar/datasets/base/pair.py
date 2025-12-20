@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
-from typing import Iterable
-
-from ._base_common import (
-    BoundingBox,
-    GeoQuery,
-    PairParser,
-    Pairs,
-    PathLike,
-    Points,
-    Polygons,
-    np,
-    pd,
-    xr,
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
 )
+
+import pandas as pd
+import rioxarray  # noqa: F401
+
+from faninsar._core.sar.pairs import Pairs
+from faninsar.logging import setup_logger
+from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
+
 from .raster import RasterDataset
+
+if TYPE_CHECKING:
+    from os import PathLike
+
+    from numpy.typing import NDArray
+    from xarray import Dataset, DataTree
+
+    from ._base_common import PairParser
+
+logger = setup_logger(__name__)
 
 
 class PairDataset(RasterDataset):
@@ -61,22 +69,24 @@ class PairDataset(RasterDataset):
         """
         self._pair_parser = pair_parser
         super().__init__(*args, **kwargs)
-        self._assign_pairs_from_files()
+        self._assign_pairs_from_paths()
 
     @property
     def pairs(self) -> Pairs:
         """Return Pairs parsed from filenames."""
         return self._pairs
 
-    def _assign_pairs_from_files(self) -> None:
-        """Parse interferometric pairs from current files."""
+    def _assign_pairs_from_paths(self) -> None:
+        """Parse interferometric pairs from current paths."""
         paths = self._files.paths.tolist()
         if len(paths) == 0:
             self._pairs = Pairs([])
             self._files.loc[:, "pair_name"] = ""
             return
 
-        parser = self._pair_parser or self.parse_pairs
+        parser = (
+            self._pair_parser if self._pair_parser is not None else self.parse_pairs
+        )
         parsed = parser(paths)
         pairs = parsed if isinstance(parsed, Pairs) else Pairs(parsed)
 
@@ -93,12 +103,6 @@ class PairDataset(RasterDataset):
         )
 
     @classmethod
-    def _parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
-        """Parse pairs from filenames. Override in subclass if needed."""
-        msg = "_parse_pairs method must be implemented in subclass"
-        raise NotImplementedError(msg)
-
-    @classmethod
     def parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
         """Parse pairs from filenames.
 
@@ -113,7 +117,11 @@ class PairDataset(RasterDataset):
             pairs parsed from filenames
 
         """
-        return cls._parse_pairs(paths)
+        msg = (
+            "parse_pairs method must be implemented in subclass"
+            " if no pair_parser is provided."
+        )
+        raise NotImplementedError(msg)
 
     @property
     def file_dim_name(self) -> str:
@@ -122,10 +130,10 @@ class PairDataset(RasterDataset):
 
     def _file_coords(
         self,
-        indexes: np.ndarray,  # noqa: ARG002
+        indexes: NDArray,  # noqa: ARG002
         paths: list[str],  # noqa: ARG002
         files_df: pd.DataFrame,
-    ) -> dict[str, tuple[str, np.ndarray]]:
+    ) -> dict[str, tuple[str, NDArray]]:
         """Attach pair metadata to stacked coordinates."""
         if "pair_name" in files_df:
             pair_names = files_df["pair_name"].astype(str).to_numpy()
@@ -133,7 +141,7 @@ class PairDataset(RasterDataset):
             pair_names = self.pairs.to_names()
         pairs = Pairs.from_names(pair_names)
 
-        coords: dict[str, tuple[str, np.ndarray]] = {
+        coords: dict[str, tuple[str, NDArray]] = {
             "pair": ("pair", pair_names),
             "primary": ("pair", pairs.primary.values),
             "secondary": ("pair", pairs.secondary.values),
@@ -145,7 +153,7 @@ class PairDataset(RasterDataset):
         self,
         points: Points,
         pairs: Pairs | None = None,
-    ) -> xr.Dataset:
+    ) -> Dataset:
         """Query points for the given pairs subset (no indexes support)."""
         files_df = self.files
         mask = files_df.valid.copy()
@@ -160,7 +168,7 @@ class PairDataset(RasterDataset):
         bbox: BoundingBox | list[BoundingBox],
         pairs: Pairs | None = None,
         lazy_loading: bool | None = None,
-    ) -> xr.DataTree:
+    ) -> DataTree:
         """Query bbox/bboxes for the given pairs subset (no indexes support)."""
         if lazy_loading is None:
             lazy_loading = self.lazy_loading
@@ -179,7 +187,7 @@ class PairDataset(RasterDataset):
         polygons: Polygons,
         pairs: Pairs | None = None,
         lazy_loading: bool | None = None,
-    ) -> xr.DataTree:
+    ) -> DataTree:
         """Query polygons for the given pairs subset (no indexes support)."""
         if lazy_loading is None:
             lazy_loading = self.lazy_loading
@@ -198,7 +206,7 @@ class PairDataset(RasterDataset):
         query: GeoQuery | Points | BoundingBox | Polygons,
         pairs: Pairs | None = None,
         lazy_loading: bool | None = None,
-    ) -> xr.DataTree:
+    ) -> DataTree:
         """Retrieve image values for given query using pairs subset only."""
         if lazy_loading is None:
             lazy_loading = self.lazy_loading

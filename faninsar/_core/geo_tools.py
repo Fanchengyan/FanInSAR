@@ -16,8 +16,8 @@ from affine import Affine
 from lxml import etree
 from matplotlib import ticker
 from pykml.factory import KML_ElementMaker as KML
-from pyproj import CRS
 from rasterio import dtypes, transform
+from rasterio.crs import CRS
 from rasterio.io import MemoryFile
 from rasterio.profiles import Profile as RasterioProfile
 from rasterio.warp import Resampling, reproject

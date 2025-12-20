@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from abc import ABC
+from typing import TYPE_CHECKING, Iterable
 
-from ._base_common import (
-    ABC,
-    Acquisition,
-    BoundingBox,
-    GeoQuery,
-    PathLike,
-    Points,
-    Polygons,
-    np,
-    pd,
-    xr,
-)
+import pandas as pd
+import rioxarray  # noqa: F401
+
+from faninsar import Acquisition
+from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
+
 from .raster import RasterDataset
+
+if TYPE_CHECKING:
+    from os import PathLike
+
+    import numpy as np
+    import xarray as xr
 
 
 class TimeSeriesDataset(RasterDataset, ABC):

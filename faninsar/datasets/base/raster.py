@@ -2,54 +2,65 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Iterable, Literal
+import contextlib
+import functools
+import json
+import re
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Iterable,
+    Literal,
+)
+
+import numpy as np
+import pandas as pd
+import rasterio
+import rioxarray  # noqa: F401
+import xarray as xr
+from rasterio import features, fill, plot
+from rasterio import mask as rio_mask
+from rasterio.crs import CRS
+from rasterio.dtypes import get_minimum_dtype
+from rasterio.transform import rowcol as tf_rowcol
+from rasterio.transform import xy as tf_xy
+from rasterio.vrt import WarpedVRT
+from rasterio.warp import Resampling
+from rasterio.warp import transform as warp_transform
+from tqdm import tqdm
+from typing_extensions import Self
+
+from faninsar._core import geo_tools
+from faninsar._core.geo_tools import (
+    Profile,
+    array2kml,
+    array2kmz,
+    geoinfo_from_latlon,
+    latlon_from_transform,
+    write_geoinfo_into_ds,
+)
+from faninsar.backends import LazyMultiFileReader
+from faninsar.logging import setup_logger
+from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 
 from ._base_common import (
-    CRS,
-    Affine,
-    Axes,
-    BoundingBox,
-    DatasetReader,
-    GeoQuery,
-    LazyMultiFileReader,
-    Path,
-    PathLike,
-    Points,
-    Polygons,
-    Profile,
-    Resampling,
-    Self,
-    WarpedVRT,
     _serialize_bbox,
     _serialize_points,
     _serialize_polygons,
-    array2kml,
-    array2kmz,
-    contextlib,
-    features,
-    fill,
-    functools,
-    geo_tools,
-    geoinfo_from_latlon,
-    get_minimum_dtype,
     get_nodata,
-    json,
-    latlon_from_transform,
-    logger,
-    np,
-    pd,
-    plot,
-    rasterio,
-    re,
-    rio_mask,
-    tf_rowcol,
-    tf_xy,
-    tqdm,
-    warp_transform,
-    write_geoinfo_into_ds,
-    xr,
 )
 from .geo import GeoDataset
+
+if TYPE_CHECKING:
+    from os import PathLike
+
+    from affine import Affine
+    from matplotlib.axes import Axes
+    from rasterio.io import DatasetReader
+
+logger = setup_logger(__name__)
 
 
 class RasterDataset(GeoDataset):
@@ -864,18 +875,16 @@ class RasterDataset(GeoDataset):
                         qroot["bboxes"] = [_serialize_bbox(query.boxes)]
                 if query.polygons is not None:
                     qroot["polygons"] = _serialize_polygons(query.polygons)
-            root_attrs.update(
-                {
-                    "query_json": json.dumps(qroot),
-                    "query_repr": (
-                        "GeoQuery("
-                        f"points={query.points is not None}, "
-                        f"bboxes={query.boxes is not None}, "
-                        f"polygons={query.polygons is not None}"
-                        ")"
-                    ),
-                }
-            )
+            root_attrs.update({
+                "query_json": json.dumps(qroot),
+                "query_repr": (
+                    "GeoQuery("
+                    f"points={query.points is not None}, "
+                    f"bboxes={query.boxes is not None}, "
+                    f"polygons={query.polygons is not None}"
+                    ")"
+                ),
+            })
         except Exception:
             pass
         root_ds = xr.Dataset(attrs=root_attrs)
@@ -1038,12 +1047,10 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update(
-                {
-                    "y": ("y", np.asarray(lat)),
-                    "x": ("x", np.asarray(lon)),
-                }
-            )
+            coords.update({
+                "y": ("y", np.asarray(lat)),
+                "x": ("x", np.asarray(lon)),
+            })
 
             # Create Dataset with dask array (still lazy!)
             ds = xr.Dataset(
@@ -1091,12 +1098,10 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update(
-                {
-                    "y": ("y", np.asarray(lat)),
-                    "x": ("x", np.asarray(lon)),
-                }
-            )
+            coords.update({
+                "y": ("y", np.asarray(lat)),
+                "x": ("x", np.asarray(lon)),
+            })
 
             # Create Dataset with dask array (still lazy!)
             ds = xr.Dataset(
@@ -1189,12 +1194,10 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update(
-                {
-                    "y": ("y", np.asarray(lat)),
-                    "x": ("x", np.asarray(lon)),
-                }
-            )
+            coords.update({
+                "y": ("y", np.asarray(lat)),
+                "x": ("x", np.asarray(lon)),
+            })
 
             # Create Dataset with lazy array
             wkt = poly_geom.wkt if hasattr(poly_geom, "wkt") else str(poly_geom)
@@ -1207,13 +1210,11 @@ class RasterDataset(GeoDataset):
                     "nodata": self.nodata,
                     "lazy": True,
                     "polygon_wkt": wkt,
-                    "query_json": json.dumps(
-                        {
-                            "type": "Polygon",
-                            "crs": str(self.crs) if self.crs is not None else None,
-                            "wkt": wkt,
-                        }
-                    ),
+                    "query_json": json.dumps({
+                        "type": "Polygon",
+                        "crs": str(self.crs) if self.crs is not None else None,
+                        "wkt": wkt,
+                    }),
                     "query_repr": f"Polygon(crs={self.crs})",
                 },
             )
@@ -1252,28 +1253,24 @@ class RasterDataset(GeoDataset):
         y_pts = np.asarray(pts.y, dtype=float)
 
         coords = self._file_coords(resolved_indexes, paths, files_df)
-        coords.update(
-            {
-                "point": ("point", np.arange(data.shape[-1])),
-                "x": ("point", x_pts),
-                "y": ("point", y_pts),
-            }
-        )
+        coords.update({
+            "point": ("point", np.arange(data.shape[-1])),
+            "x": ("point", x_pts),
+            "y": ("point", y_pts),
+        })
         if data.ndim == 3:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
         ds = xr.Dataset({"data": (dims, data)}, coords=coords)
         # Dual-track saving: query_json + human-readable query_repr
         qjson = json.dumps(_serialize_points(points))
-        ds.attrs.update(
-            {
-                "crs": str(self.crs) if self.crs is not None else None,
-                "nodata": self.nodata,
-                "query_json": qjson,
-                "query_repr": f"Points(count={len(points)}, crs={points.crs})",
-            }
-        )
-        return write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
+        ds.attrs.update({
+            "crs": str(self.crs) if self.crs is not None else None,
+            "nodata": self.nodata,
+            "query_json": qjson,
+            "query_repr": f"Points(count={len(points)}, crs={points.crs})",
+        })
+        return ds
 
     def _make_bbox_ds(
         self,
@@ -1299,12 +1296,10 @@ class RasterDataset(GeoDataset):
         dims = (file_dim, "band", "y", "x") if data.ndim == 4 else (file_dim, "y", "x")
 
         coords = self._file_coords(indexes, paths, files_df)
-        coords.update(
-            {
-                "y": ("y", np.asarray(lat)),
-                "x": ("x", np.asarray(lon)),
-            }
-        )
+        coords.update({
+            "y": ("y", np.asarray(lat)),
+            "x": ("x", np.asarray(lon)),
+        })
         if data.ndim == 4:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
@@ -1319,18 +1314,16 @@ class RasterDataset(GeoDataset):
                 "nodata": self.nodata,
             },
         )
-        ds.attrs.update(
-            {
-                "query_json": json.dumps(_serialize_bbox(single_bbox)),
-                "query_repr": (
-                    "BBox("
-                    f"{single_bbox.left}, {single_bbox.bottom}, "
-                    f"{single_bbox.right}, {single_bbox.top}, "
-                    f"crs={single_bbox.crs}"
-                    ")"
-                ),
-            }
-        )
+        ds.attrs.update({
+            "query_json": json.dumps(_serialize_bbox(single_bbox)),
+            "query_repr": (
+                "BBox("
+                f"{single_bbox.left}, {single_bbox.bottom}, "
+                f"{single_bbox.right}, {single_bbox.top}, "
+                f"crs={single_bbox.crs}"
+                ")"
+            ),
+        })
         return write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
 
     def _make_bbox_da(
@@ -1357,12 +1350,10 @@ class RasterDataset(GeoDataset):
         dims = (file_dim, "band", "y", "x") if data.ndim == 4 else (file_dim, "y", "x")
 
         coords = self._file_coords(indexes, paths, files_df)
-        coords.update(
-            {
-                "y": ("y", np.asarray(lat)),
-                "x": ("x", np.asarray(lon)),
-            }
-        )
+        coords.update({
+            "y": ("y", np.asarray(lat)),
+            "x": ("x", np.asarray(lon)),
+        })
         if data.ndim == 4:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
@@ -1413,12 +1404,10 @@ class RasterDataset(GeoDataset):
                 dims = (file_dim, "y", "x")
 
             coords = dict(file_coords)
-            coords.update(
-                {
-                    "y": ("y", np.asarray(lat)),
-                    "x": ("x", np.asarray(lon)),
-                }
-            )
+            coords.update({
+                "y": ("y", np.asarray(lat)),
+                "x": ("x", np.asarray(lon)),
+            })
             if vals_i.ndim == 4:
                 coords["band"] = ("band", np.arange(vals_i.shape[1]))
 
@@ -1437,18 +1426,14 @@ class RasterDataset(GeoDataset):
                 wkt = poly_geom.wkt
             except Exception:
                 wkt = str(poly_geom)
-            ds.attrs.update(
-                {
-                    "query_json": json.dumps(
-                        {
-                            "type": "Polygon",
-                            "crs": str(self.crs) if self.crs is not None else None,
-                            "wkt": wkt,
-                        }
-                    ),
-                    "query_repr": f"Polygon(crs={self.crs})",
-                }
-            )
+            ds.attrs.update({
+                "query_json": json.dumps({
+                    "type": "Polygon",
+                    "crs": str(self.crs) if self.crs is not None else None,
+                    "wkt": wkt,
+                }),
+                "query_repr": f"Polygon(crs={self.crs})",
+            })
             ds = write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
             polygon_dataset = ds
         else:

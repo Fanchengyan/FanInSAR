@@ -2,25 +2,25 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, overload
+import warnings
+from abc import ABC
+from typing import TYPE_CHECKING, Any, Literal, overload
 
-from ._base_common import (
-    ABC,
-    CRS,
-    BoundingBox,
-    Index,
-    Points,
-    Polygons,
-    Profile,
-    Property,
-    calculate_default_transform,
-    logger,
-    np,
-    ops,
-    pyproj,
-    shapely,
-    warnings,
-)
+import numpy as np
+import pyproj
+import shapely
+from rasterio.crs import CRS
+from rasterio.warp import calculate_default_transform
+from rtree.index import Index, Property
+from shapely import ops
+
+from faninsar.logging import setup_logger
+from faninsar.query import BoundingBox, Points, Polygons
+
+if TYPE_CHECKING:
+    from faninsar._core.geo_tools import Profile
+
+logger = setup_logger(__name__)
 
 
 class GeoDataset(ABC):

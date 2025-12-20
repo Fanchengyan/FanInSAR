@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from datetime import datetime
 from typing import TYPE_CHECKING, Callable, Literal, overload
 
@@ -38,14 +38,14 @@ class Pair:
 
     def __init__(
         self,
-        pair: Sequence[datetime, datetime],
+        pair: Iterable[datetime, datetime],
     ) -> None:
         """Initialize the Pair class.
 
         Parameters
         ----------
-        pair: Sequence[datetime, datetime]
-            Sequence object of two dates. Each date is a datetime object.
+        pair: Iterable[datetime, datetime]
+            Iterable object of two dates. Each date is a datetime object.
             For example, (date1, date2).
 
         """
@@ -246,8 +246,8 @@ class Pairs:
 
         Parameters
         ----------
-        pairs: Sequence
-            Sequence object of pairs. Each pair is an Sequence or Pair
+        pairs: Iterable
+            Iterable object of pairs. Each pair is an Iterable or Pair
             object of two dates with format of datetime. For example,
             [(date1, date2), ...].
         sort: bool, optional
@@ -461,7 +461,7 @@ class Pairs:
             pairs = Pairs([pairs])
         elif isinstance(pairs, Pairs):
             return pairs
-        elif isinstance(pairs, Sequence):
+        elif isinstance(pairs, Iterable):
             pairs = np.asarray(pairs)
             if pairs.ndim == 1:
                 pairs = Pairs.from_names(pairs)
@@ -575,7 +575,7 @@ class Pairs:
     @classmethod
     def from_names(
         cls,
-        names: Sequence[str],
+        names: Iterable[str],
         parse_function: Callable | None = None,
         date_args: dict | None = None,
     ) -> Pairs:
@@ -977,13 +977,13 @@ class Pairs:
 class PairsFactory:
     """A class used to generate interferometric pairs for InSAR processing."""
 
-    def __init__(self, dates: Sequence, **kwargs) -> None:
+    def __init__(self, dates: Iterable, **kwargs) -> None:
         """Initialize the PairGenerator class.
 
         Parameters
         ----------
-        dates: Sequence
-            Sequence object that contains the dates. Can be any object that
+        dates: Iterable
+            Iterable object that contains the dates. Can be any object that
             accepted by :func:`pd.to_datetime`
         kwargs: dict, optional
             Keyword arguments passed to :func:`pd.to_datetime`

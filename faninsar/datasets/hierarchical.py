@@ -294,7 +294,7 @@ class HierarchicalPairDataset(HierarchicalDataset, PairDataset):
     verbose : bool, optional
         Whether to log warnings.
     pair_parser : PairParser | None, optional
-        Callable that parses file paths into Pairs. When None, _parse_pairs is used.
+        Callable that parses file paths into Pairs. When None, parse_pairs is used.
     **kwargs
         Additional keyword arguments forwarded to xarray.open_dataset.
 
@@ -314,7 +314,7 @@ class HierarchicalPairDataset(HierarchicalDataset, PairDataset):
     Notes
     -----
     Files must contain parseable pair information in their filenames.
-    Implement the ``_parse_pairs`` classmethod to define custom pair parsing logic.
+    Implement the ``parse_pairs`` classmethod to define custom pair parsing logic.
 
     The file dimension is named "pair" instead of "file" for pair datasets.
 
@@ -326,7 +326,7 @@ class HierarchicalPairDataset(HierarchicalDataset, PairDataset):
     ...     pattern_files = "*.nc"
     ...
     ...     @classmethod
-    ...     def _parse_pairs(cls, paths):
+    ...     def parse_pairs(cls, paths):
     ...         # Parse pairs from filenames
     ...         pairs = [parse_pair_from_filename(p) for p in paths]
     ...         return Pairs(pairs)
@@ -351,8 +351,8 @@ class HierarchicalPairDataset(HierarchicalDataset, PairDataset):
         super().__init__(*args, **kwargs)
 
         # Assign pairs from files (from PairDataset)
-        # Note: This requires implementing _parse_pairs in subclass
-        self._assign_pairs_from_files()
+        # Note: This requires implementing parse_pairs in subclass
+        self._assign_pairs_from_paths()
 
     @property
     def file_dim_name(self) -> str:
