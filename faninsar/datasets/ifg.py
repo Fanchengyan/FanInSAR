@@ -223,8 +223,12 @@ class InterferogramDataset(PairDataset):
 
         if paths_unw is None:
             paths_unw = np.unique(list(root_dir.rglob(self.pattern_unw)))
+        else:
+            paths_unw = np.array([Path(p) for p in paths_unw])
         if paths_coh is None:
             paths_coh = np.unique(list(root_dir.rglob(self.pattern_coh)))
+        else:
+            paths_coh = np.array([Path(p) for p in paths_coh])
 
         # Pairs: ensure there are no duplicate pairs
         # remove duplicate pairs
@@ -293,10 +297,10 @@ class InterferogramDataset(PairDataset):
 
         # remove invalid pairs
         self._pairs = self.parse_pairs(self._files.paths)
-        self._ds_coh._pairs = self.parse_pairs(self._ds_coh._files.paths)
+        self._ds_coh._pairs = self.parse_pairs(self._files.paths)
         # get the datetime from pairs
-        self._datetime = self.parse_datetime(paths_unw[_valid])
-        self._ds_coh._datetime = self.parse_datetime(paths_coh[_valid])
+        # self._datetime = self.parse_datetime(paths_unw[_valid])
+        # self._ds_coh._datetime = self.parse_datetime(paths_coh[_valid])
 
     def _deduplicate_pairs(self, paths: list[Path], dataset_name: str) -> list[Path]:
         """Remove duplicate pairs from the list of paths."""
