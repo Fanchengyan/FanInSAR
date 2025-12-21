@@ -163,18 +163,15 @@ class PairDataset(RasterDataset):
         self,
         bbox: BoundingBox | list[BoundingBox],
         pairs: Pairs | None = None,
-        lazy_loading: bool | None = None,
     ) -> DataTree:
         """Query bbox/boxes for the given pairs subset (no indexes support)."""
-        if lazy_loading is None:
-            lazy_loading = self.lazy_loading
         files_df = self.files
         mask = files_df.valid.copy()
         if pairs is not None:
             pair_mask = self.pairs.where(pairs, return_type="mask")
             mask = mask & pd.Series(pair_mask, index=files_df.index)
         resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
-        if lazy_loading:
+        if self._chunks is not None:
             return self._compute_bboxes_tree_lazy(bbox, resolved_indexes)
         return self._compute_bboxes_tree(bbox, resolved_indexes)
 
@@ -182,18 +179,15 @@ class PairDataset(RasterDataset):
         self,
         polygons: Polygons,
         pairs: Pairs | None = None,
-        lazy_loading: bool | None = None,
     ) -> DataTree:
         """Query polygons for the given pairs subset (no indexes support)."""
-        if lazy_loading is None:
-            lazy_loading = self.lazy_loading
         files_df = self.files
         mask = files_df.valid.copy()
         if pairs is not None:
             pair_mask = self.pairs.where(pairs, return_type="mask")
             mask = mask & pd.Series(pair_mask, index=files_df.index)
         resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
-        if lazy_loading:
+        if self._chunks is not None:
             return self._compute_polygons_tree_lazy(polygons, resolved_indexes)
         return self._compute_polygons_tree(polygons, resolved_indexes)
 
@@ -201,12 +195,8 @@ class PairDataset(RasterDataset):
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         pairs: Pairs | None = None,
-        lazy_loading: bool | None = None,
     ) -> DataTree:
         """Retrieve image values for given query using pairs subset only."""
-        if lazy_loading is None:
-            lazy_loading = self.lazy_loading
-
         if isinstance(query, Points):
             query = GeoQuery(points=query)
         if isinstance(query, BoundingBox):
@@ -222,6 +212,6 @@ class PairDataset(RasterDataset):
 
         paths = files_df[mask].paths.tolist()
 
-        if lazy_loading:
+        if self._chunks is not None:
             return self._sample_files_lazy(paths, query)
         return self._sample_files(paths, query)

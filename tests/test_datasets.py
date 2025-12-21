@@ -61,28 +61,35 @@ def temp_dataset_dir():
 class TestRasterDatasetDask:
     """Test RasterDataset with dask functionality."""
 
-    def test_init_with_dask_false(self, temp_dataset_dir):
-        """Test RasterDataset initialization with lazy_loading=False."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=False, verbose=False)
-        assert ds.lazy_loading is False
+    def test_init_with_chunks_none(self, temp_dataset_dir):
+        """Test RasterDataset initialization with chunks=None (eager)."""
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks=None, verbose=False)
+        assert ds.is_lazy is False
         assert len(ds) == 5
 
-    def test_init_with_dask_true(self, temp_dataset_dir):
-        """Test RasterDataset initialization with lazy_loading=True."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=True, verbose=False)
-        assert ds.lazy_loading is True
+    def test_init_with_chunks_dict(self, temp_dataset_dir):
+        """Test RasterDataset initialization with chunks dict."""
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks={"y": 256, "x": 256}, verbose=False)
+        assert ds.is_lazy is True
         assert len(ds) == 5
 
-    def test_dask_availability_check(self, temp_dataset_dir):
-        """Test that dask availability is checked when lazy_loading=True."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=True, verbose=False)
-        # This should not raise an error if dask is available
-        # Note: _check_dask_available method may not exist anymore - checking is done in lazy methods
-        assert ds.lazy_loading is True
+    def test_init_with_chunks_auto(self, temp_dataset_dir):
+        """Test RasterDataset initialization with chunks='auto'."""
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks="auto", verbose=False)
+        assert ds.is_lazy is True
+        # Check if chunks are inferred (default 100x100 for these test tiffs since they are not tiled)
+        # Actually our mock files are 100x100. resolve_chunks returns default 512x512 for striped.
+        assert ds._chunks == "auto"
 
-    def test_points_query_without_dask(self, temp_dataset_dir):
-        """Test points query without dask."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=False, verbose=False)
+    def test_init_with_chunks_int(self, temp_dataset_dir):
+        """Test RasterDataset initialization with chunks as integer."""
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks=512, verbose=False)
+        assert ds.is_lazy is True
+        assert ds._chunks == {"y": 512, "x": 512}
+
+    def test_points_query_without_chunks(self, temp_dataset_dir):
+        """Test points query without chunks (eager)."""
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks=None, verbose=False)
         points = Points([(5, 5), (15, 15), (25, 25)])
 
         start_time = time.time()
@@ -93,9 +100,9 @@ class TestRasterDatasetDask:
         assert result["data"].data.shape[1] == 3  # 3 points
         print(f"Points query without dask took: {end_time - start_time:.4f} seconds")
 
-    def test_points_query_with_dask(self, temp_dataset_dir):
-        """Test points query (points are always eager; no lazy switch)."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=True, verbose=False)
+    def test_points_query_with_chunks(self, temp_dataset_dir):
+        """Test points query (points are always eager)."""
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks="auto", verbose=False)
         points = Points([(5, 5), (15, 15), (25, 25)])
 
         start_time = time.time()
@@ -106,9 +113,9 @@ class TestRasterDatasetDask:
         assert result["data"].data.shape[1] == 3  # 3 points
         print(f"Points query (eager) took: {end_time - start_time:.4f} seconds")
 
-    def test_box_query_without_dask(self, temp_dataset_dir):
-        """Test bbox query without dask."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=False, verbose=False)
+    def test_box_query_without_chunks(self, temp_dataset_dir):
+        """Test bbox query without chunks (eager)."""
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks=None, verbose=False)
         bbox = BoundingBox(5, 15, 5, 15, crs=CRS.from_epsg(4326))
 
         start_time = time.time()
@@ -120,13 +127,13 @@ class TestRasterDatasetDask:
         assert result.dataset["data"].ndim >= 2
         print(f"BBox query without dask took: {end_time - start_time:.4f} seconds")
 
-    def test_box_query_with_dask(self, temp_dataset_dir):
-        """Test bbox query with dask."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=True, verbose=False)
+    def test_box_query_with_chunks(self, temp_dataset_dir):
+        """Test bbox query with chunks."""
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks="auto", verbose=False)
         bbox = BoundingBox(5, 15, 5, 15, crs=CRS.from_epsg(4326))
 
         start_time = time.time()
-        result = ds.boxes_query(bbox, lazy_loading=True)
+        result = ds.boxes_query(bbox)
         end_time = time.time()
 
         # Single bbox -> dataset on root
@@ -134,44 +141,45 @@ class TestRasterDatasetDask:
         assert result.dataset["data"].ndim >= 2
         print(f"BBox query with dask took: {end_time - start_time:.4f} seconds")
 
-    def test_getitem_with_dask_default(self, temp_dataset_dir):
-        """Test __getitem__ with dataset's default dask setting."""
-        # Test with dask disabled by default
-        ds_no_dask = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=False, verbose=False)
+    def test_getitem_with_chunks_default(self, temp_dataset_dir):
+        """Test __getitem__ with dataset's default chunks setting."""
+        # Test with chunks=None by default (eager)
+        ds_no_dask = RasterDataset(root_dir=temp_dataset_dir, chunks=None, verbose=False)
         points = Points([(5, 5), (15, 15)])
         tree_no_dask = ds_no_dask[points]
         assert "points" in tree_no_dask.children
 
-        ds_with_dask = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=True, verbose=False)
+        ds_with_dask = RasterDataset(root_dir=temp_dataset_dir, chunks="auto", verbose=False)
         tree_with_dask = ds_with_dask[points]
         assert "points" in tree_with_dask.children
 
     def test_query_consistency(self, temp_dataset_dir):
-        """Test that dask and non-dask queries produce consistent results."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=False, verbose=False)
-        points = Points([(10, 10), (20, 20)])
-
-        # Compare bbox results with and without lazy loading
+        """Test that lazy and eager queries produce consistent results."""
+        ds_eager = RasterDataset(root_dir=temp_dataset_dir, chunks=None, verbose=False)
+        ds_lazy = RasterDataset(root_dir=temp_dataset_dir, chunks="auto", verbose=False)
+        
+        # Compare bbox results
         bbox = BoundingBox(0, 30, 0, 30, crs=CRS.from_epsg(4326))
-        ds_no = ds.boxes_query(bbox, lazy_loading=False).dataset["data"]
-        ds_yes = ds.boxes_query(bbox, lazy_loading=True).dataset["data"]
-        assert ds_no.shape == ds_yes.shape
-        np.testing.assert_allclose(ds_no.compute() if hasattr(ds_no, "compute") else ds_no.values,
-                                   ds_yes.compute() if hasattr(ds_yes, "compute") else ds_yes.values,
+        res_eager = ds_eager.boxes_query(bbox).dataset["data"]
+        res_lazy = ds_lazy.boxes_query(bbox).dataset["data"]
+        
+        assert res_eager.shape == res_lazy.shape
+        np.testing.assert_allclose(res_eager.values, res_lazy.compute().values,
                                    rtol=1e-5, atol=1e-8)
 
     def test_performance_comparison(self, temp_dataset_dir):
-        """Compare performance between dask and non-dask queries."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=False, verbose=False)
+        """Compare performance between lazy and eager queries."""
+        ds_eager = RasterDataset(root_dir=temp_dataset_dir, chunks=None, verbose=False)
+        ds_lazy = RasterDataset(root_dir=temp_dataset_dir, chunks="auto", verbose=False)
         bbox = BoundingBox(0, 30, 0, 30, crs=CRS.from_epsg(4326))
 
         # Measure time without dask
         start_time = time.time()
-        tree_no = ds.boxes_query(bbox, lazy_loading=False)
+        tree_no = ds_eager.boxes_query(bbox)
         time_no_dask = time.time() - start_time
 
         start_time = time.time()
-        tree_yes = ds.boxes_query(bbox, lazy_loading=True)
+        tree_yes = ds_lazy.boxes_query(bbox)
         time_with_dask = time.time() - start_time
 
         print(f"Time without dask: {time_no_dask:.4f} seconds")
@@ -179,8 +187,8 @@ class TestRasterDatasetDask:
         assert hasattr(tree_no, "children") and hasattr(tree_yes, "children")
 
     def test_mixed_query_types(self, temp_dataset_dir):
-        """Test mixed query types with dask."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=True, verbose=False)
+        """Test mixed query types with chunks."""
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks="auto", verbose=False)
 
         points = Points([(10, 10), (20, 20)])
         bbox = BoundingBox(5, 15, 5, 15, crs=CRS.from_epsg(4326))
@@ -197,18 +205,18 @@ class TestRasterDatasetDask:
         class _Dummy:
             def __init__(self, *a, **k):
                 raise ImportError("Lazy loading requires dask")
-        import faninsar.datasets.base as base_mod
-        monkeypatch.setattr(base_mod, "LazyMultiFileReader", _Dummy, raising=False)
+        import faninsar.datasets.base.raster as raster_mod
+        monkeypatch.setattr(raster_mod, "LazyMultiFileReader", _Dummy, raising=False)
 
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=True, verbose=False)
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks="auto", verbose=False)
 
         bbox = BoundingBox(5, 15, 5, 15, crs=CRS.from_epsg(4326))
         with pytest.raises(ImportError, match="Lazy loading requires dask"):
-            ds.boxes_query(bbox, lazy_loading=True)
+            ds.boxes_query(bbox)
 
     def test_debug_single_file_query(self, temp_dataset_dir):
         """Debug single file query issue."""
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=False, verbose=False)
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks=None, verbose=False)
         points = Points([(5, 5), (15, 15), (25, 25)])
 
         print(f"Dataset files: {len(ds)}")
@@ -217,7 +225,7 @@ class TestRasterDatasetDask:
 
         # Use boxes_query to validate single-file dim not squeezed (indexes not used here)
         bbox = BoundingBox(0, 10, 0, 10, crs=CRS.from_epsg(4326))
-        result_single = ds.boxes_query(bbox, lazy_loading=False)
+        result_single = ds.boxes_query(bbox)
         print(f"Single bbox result file-dim: {result_single.dataset['data'].shape[0]}")
         assert result_single.dataset["data"].shape[0] >= 1
 
@@ -228,7 +236,7 @@ class TestRasterDatasetDask:
 
         from faninsar.query import Polygons
 
-        ds = RasterDataset(root_dir=temp_dataset_dir, lazy_loading=False, verbose=False)
+        ds = RasterDataset(root_dir=temp_dataset_dir, chunks=None, verbose=False)
 
         # Create two polygons that should intersect with the dataset
         polygon1 = box(2, 2, 8, 8)  # Should intersect with first few files

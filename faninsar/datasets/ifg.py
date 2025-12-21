@@ -153,8 +153,7 @@ class InterferogramDataset(PairDataset):
         fill_nodata: bool = False,
         verbose: bool = True,
         keep_common: bool = True,
-        lazy_loading: bool = False,
-        chunks: dict[str, int] | None = None,
+        chunks: dict[str, int] | int | Literal["auto"] | None = None,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
 
@@ -209,12 +208,13 @@ class InterferogramDataset(PairDataset):
             Only used when the number of interferograms and coherence files are
             not equal. If True, keep the common pairs of interferograms and
             coherence files and raise a warning. If False, raise an error.
-        lazy_loading: bool, optional, default: False
-            Enable lazy loading using dask arrays. When True, data is not loaded
-            into memory until compute() is called. Default: False.
-        chunks: dict[str, int] | None, optional
-            Chunk sizes for dask arrays when lazy_loading is True.
-            Example: {'y': 512, 'x': 512}. Default is None, which uses 512x512 chunks.
+        chunks : dict[str, int] | int | Literal["auto"] | None, optional
+            Chunk sizes for dask arrays. Controls lazy vs eager loading:
+            - ``None`` (default): Load data eagerly into memory.
+            - ``"auto"`` or ``{}``: Lazy loading with auto-detected block size.
+            - ``int``: Lazy loading with same chunk size for y and x.
+            - ``dict``: Lazy loading with specified y and x chunk sizes.
+            Example: chunks={'y': 512, 'x': 512} or chunks=512 or chunks="auto".
 
         """
         root_dir = Path(root_dir)
@@ -269,7 +269,6 @@ class InterferogramDataset(PairDataset):
             fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name="Interferogram",
-            lazy_loading=lazy_loading,
             chunks=chunks,
         )
 
@@ -287,7 +286,6 @@ class InterferogramDataset(PairDataset):
             fill_nodata=fill_nodata,
             verbose=verbose,
             ds_name="Coherence",
-            lazy_loading=lazy_loading,
             chunks=chunks,
             pair_parser=self.parse_pairs,
         )
@@ -759,8 +757,7 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
         fill_nodata: bool = False,
         verbose: bool = True,
         keep_common: bool = True,
-        lazy_loading: bool = False,
-        chunks: dict[str, int] | None = None,
+        chunks: dict[str, int] | int | Literal["auto"] | None = None,
     ) -> None:
         """Initialize a new InterferogramDataset instance.
 
@@ -815,12 +812,13 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
             Only used when the number of interferograms and coherence files are
             not equal. If True, keep the common pairs of interferograms and
             coherence files and raise a warning. If False, raise an error.
-        lazy_loading: bool, optional, default: False
-            Enable lazy loading using dask arrays. When True, data is not loaded
-            into memory until compute() is called. Default: False.
-        chunks: dict[str, int] | None, optional
-            Chunk sizes for dask arrays when lazy_loading is True.
-            Example: {'y': 512, 'x': 512}. Default is None, which uses 512x512 chunks.
+        chunks : dict[str, int] | int | Literal["auto"] | None, optional
+            Chunk sizes for dask arrays. Controls lazy vs eager loading:
+            - ``None`` (default): Load data eagerly into memory.
+            - ``"auto"`` or ``{}``: Lazy loading with auto-detected block size.
+            - ``int``: Lazy loading with same chunk size for y and x.
+            - ``dict``: Lazy loading with specified y and x chunk sizes.
+            Example: chunks={'y': 512, 'x': 512} or chunks=512 or chunks="auto".
 
         """
         root_dir = Path(root_dir)
@@ -846,7 +844,6 @@ class HierarchicalInterferogramDataset(InterferogramDataset):
             fill_nodata=fill_nodata,
             verbose=verbose,
             keep_common=keep_common,
-            lazy_loading=lazy_loading,
             chunks=chunks,
         )
 

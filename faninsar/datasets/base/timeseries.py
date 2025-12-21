@@ -119,18 +119,15 @@ class TimeSeriesDataset(RasterDataset, ABC):
         self,
         bbox: BoundingBox | list[BoundingBox],
         dates: Acquisition | pd.DatetimeIndex | None = None,
-        lazy_loading: bool | None = None,
     ) -> xr.DataTree:
         """Query bbox/boxes for the given dates subset (no indexes support)."""
-        if lazy_loading is None:
-            lazy_loading = self.lazy_loading
         files_df = self.files
         mask = files_df.valid.copy()
         if dates is not None:
             target = pd.DatetimeIndex(dates)
             mask = mask & files_df["date"].isin(target)
         resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
-        if lazy_loading:
+        if self._chunks is not None:
             return self._compute_bboxes_tree_lazy(bbox, resolved_indexes)
         return self._compute_bboxes_tree(bbox, resolved_indexes)
 
@@ -138,18 +135,15 @@ class TimeSeriesDataset(RasterDataset, ABC):
         self,
         polygons: Polygons,
         dates: Acquisition | pd.DatetimeIndex | None = None,
-        lazy_loading: bool | None = None,
     ) -> xr.DataTree:
         """Query polygons for the given dates subset (no indexes support)."""
-        if lazy_loading is None:
-            lazy_loading = self.lazy_loading
         files_df = self.files
         mask = files_df.valid.copy()
         if dates is not None:
             target = pd.DatetimeIndex(dates)
             mask = mask & files_df["date"].isin(target)
         resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
-        if lazy_loading:
+        if self._chunks is not None:
             return self._compute_polygons_tree_lazy(polygons, resolved_indexes)
         return self._compute_polygons_tree(polygons, resolved_indexes)
 

@@ -148,6 +148,165 @@ class RasterDataset(GeoDataset):
 
     _same_crs: bool
 
+    def __init__(
+        self,
+        root_dir: str | PathLike = "data",
+        paths: Iterable[str | PathLike] | None = None,
+        crs: CRS | None = None,
+        res: float | tuple[float, float] | None = None,
+        dtype: np.dtype | None = None,
+        nodata: float | None = None,
+        roi: BoundingBox | None = None,
+        bands: Iterable[str] | None = None,
+        cache: bool = True,
+        resampling: Resampling = Resampling.nearest,
+        fill_nodata: bool = False,
+        verbose: bool = True,
+        ds_name: str = "",
+        chunks: dict[str, int] | int | Literal["auto"] | None = None,
+    ) -> None:
+        """Initialize a new raster dataset instance.
+
+        Parameters
+        ----------
+        root_dir : str or PathLike
+            root_dir directory where dataset can be found.
+        paths : list of str, optional
+            list of file paths to use instead of searching for files in ``root_dir``.
+            If None, files will be searched for in ``root_dir``.
+        crs : CRS, optional
+            the output term:`coordinate reference system (CRS)` of the dataset.
+            If None, the CRS of the first file found will be used.
+        res : float, optional
+            resolution of the output dataset in units of CRS. If None, the resolution
+            of the first file found will be used.
+        dtype : numpy.dtype, optional
+            data type of the output dataset. If None, the data type of the first file
+            found will be used.
+        nodata : float or int, optional
+            no data value of the dataset. If None, the no data value of the first
+            file found will be used. This parameter is useful when the no data value
+            is not stored in the file.
+        roi : BoundingBox, optional
+            region of interest to load from the dataset. If None, the union of all files
+            bounds in the dataset will be used.
+        bands : list of str, optional
+            names of bands to return (defaults to all bands)
+        cache : bool, optional
+            if True, cache file handle to speed up repeated sampling
+        resampling : Resampling, optional
+            Resampling algorithm used when reading input files.
+            Default: `Resampling.nearest`.
+        fill_nodata : bool, optional
+            Whether to fill holes in the queried data by interpolating them using
+            inverse distance weighting method provided by the
+            :func:`rasterio.fill.fillnodata`. Default: False.
+
+            .. note::
+                This parameter is only used when sampling data using bounding
+                boxes or polygons queries, and will not work for points queries.
+
+        verbose : bool, optional
+            if True, print verbose output, default: True
+        ds_name : str, optional
+            name of the dataset. used for printing verbose output, default: ""
+        chunks : dict[str, int] | int | Literal["auto"] | None, optional
+            Chunk sizes for dask arrays. Controls lazy vs eager loading:
+            - ``None`` (default): Load data eagerly into memory.
+            - ``"auto"`` or ``{}``: Lazy loading with auto-detected block size.
+            - ``int``: Lazy loading with same chunk size for y and x.
+            - ``dict``: Lazy loading with specified y and x chunk sizes.
+            Example: chunks={'y': 512, 'x': 512} or chunks=512 or chunks="auto".
+
+        Raises
+        ------
+            FileNotFoundError: if no files are found in ``root_dir``
+
+        Examples
+        --------
+        Following examples show how to use parameters to warp the dataset upon loading.
+
+        .. ref-gallery::
+            :tooltip:
+
+            examples/warp/align
+            examples/warp/reproject
+            examples/warp/resample
+
+        """
+        super().__init__()
+        self.root_dir = Path(root_dir)
+        self.bands = bands or self.all_bands
+        self.cache = cache
+        self.resampling = resampling
+        self.fill_nodata = fill_nodata
+        self.verbose = verbose
+        self.ds_name = ds_name
+        self._chunks = self._normalize_chunks(chunks)
+
+        if paths is None:
+            paths = []
+            filename_regex = re.compile(self.filename_regex, re.VERBOSE)
+            for file_path in sorted(self.root_dir.rglob(self.pattern)):
+                match = re.match(filename_regex, file_path.name)
+                if match is not None:
+                    paths.append(str(file_path))
+        else:
+            paths = [str(p) for p in paths]
+
+        # Scan files and extract metadata (always sequential, metadata is lightweight)
+        files_df = self._scan_files_sequential(paths, crs)
+
+        # Store files information
+        self._files = files_df
+
+        # Determine final attributes based on user parameters and file metadata
+        final_crs, final_res, final_dtype, final_nodata = (
+            self._determine_final_attributes(files_df, crs, res, dtype, nodata)
+        )
+
+        # Set final attributes
+        self.crs = final_crs
+        self.res = final_res
+        self.dtype = final_dtype
+        self.nodata = final_nodata
+        self.count = self._count
+        self.roi = roi
+
+    @staticmethod
+    def _normalize_chunks(
+        chunks: dict[str, int] | int | Literal["auto"] | None,
+    ) -> dict[str, int] | Literal["auto"] | None:
+        """Normalize chunks parameter to standard format.
+
+        Parameters
+        ----------
+        chunks : dict | int | Literal["auto"] | None
+            User-specified chunk configuration.
+
+        Returns
+        -------
+        dict[str, int] | Literal["auto"] | None
+            - None: eager loading
+            - "auto": auto-detect from file
+            - dict: normalized {"y": ..., "x": ...}
+
+        """
+        if chunks is None:
+            return None
+        if chunks == "auto" or chunks == {}:
+            return "auto"
+        if isinstance(chunks, int):
+            return {"y": chunks, "x": chunks}
+        if isinstance(chunks, dict):
+            return {"y": chunks.get("y", 512), "x": chunks.get("x", 512)}
+        return None
+
+    @property
+    def is_lazy(self) -> bool:
+        """Return True if dataset is configured for lazy loading."""
+        return self._chunks is not None
+
     @property
     def file_dim_name(self) -> str:
         """Dimension name used to represent stacked files in query outputs."""
@@ -211,132 +370,6 @@ class RasterDataset(GeoDataset):
         paths = files_used.paths.astype(str).tolist()
         return resolved_indexes, paths, files_used
 
-    def __init__(
-        self,
-        root_dir: str | PathLike = "data",
-        paths: Iterable[str | PathLike] | None = None,
-        crs: CRS | None = None,
-        res: float | tuple[float, float] | None = None,
-        dtype: np.dtype | None = None,
-        nodata: float | None = None,
-        roi: BoundingBox | None = None,
-        bands: Iterable[str] | None = None,
-        cache: bool = True,
-        resampling: Resampling = Resampling.nearest,
-        fill_nodata: bool = False,
-        verbose: bool = True,
-        ds_name: str = "",
-        lazy_loading: bool = False,
-        chunks: dict[str, int] | None = None,
-    ) -> None:
-        """Initialize a new raster dataset instance.
-
-        Parameters
-        ----------
-        root_dir : str or PathLike
-            root_dir directory where dataset can be found.
-        paths : list of str, optional
-            list of file paths to use instead of searching for files in ``root_dir``.
-            If None, files will be searched for in ``root_dir``.
-        crs : CRS, optional
-            the output term:`coordinate reference system (CRS)` of the dataset.
-            If None, the CRS of the first file found will be used.
-        res : float, optional
-            resolution of the output dataset in units of CRS. If None, the resolution
-            of the first file found will be used.
-        dtype : numpy.dtype, optional
-            data type of the output dataset. If None, the data type of the first file
-            found will be used.
-        nodata : float or int, optional
-            no data value of the dataset. If None, the no data value of the first
-            file found will be used. This parameter is useful when the no data value
-            is not stored in the file.
-        roi : BoundingBox, optional
-            region of interest to load from the dataset. If None, the union of all files
-            bounds in the dataset will be used.
-        bands : list of str, optional
-            names of bands to return (defaults to all bands)
-        cache : bool, optional
-            if True, cache file handle to speed up repeated sampling
-        resampling : Resampling, optional
-            Resampling algorithm used when reading input files.
-            Default: `Resampling.nearest`.
-        fill_nodata : bool, optional
-            Whether to fill holes in the queried data by interpolating them using
-            inverse distance weighting method provided by the
-            :func:`rasterio.fill.fillnodata`. Default: False.
-
-            .. note::
-                This parameter is only used when sampling data using bounding
-                boxes or polygons queries, and will not work for points queries.
-
-        verbose : bool, optional
-            if True, print verbose output, default: True
-        ds_name : str, optional
-            name of the dataset. used for printing verbose output, default: ""
-        lazy_loading : bool, optional
-            Enable lazy loading using dask arrays. When True, data is not loaded
-            into memory until compute() is called. This is useful for large datasets
-            that don't fit in memory. Default: False.
-        chunks : dict[str, int] | None, optional
-            Chunk sizes for dask arrays when lazy_loading is True.
-            Example: {'y': 512, 'x': 512}. Default is None, which uses 512x512 chunks.
-
-        Raises
-        ------
-            FileNotFoundError: if no files are found in ``root_dir``
-
-        Examples
-        --------
-        Following examples show how to use parameters to warp the dataset upon loading.
-
-        .. ref-gallery::
-            :tooltip:
-
-            examples/warp/align
-            examples/warp/reproject
-            examples/warp/resample
-
-        """
-        super().__init__()
-        self.root_dir = Path(root_dir)
-        self.bands = bands or self.all_bands
-        self.cache = cache
-        self.resampling = resampling
-        self.fill_nodata = fill_nodata
-        self.verbose = verbose
-        self.ds_name = ds_name
-        self.lazy_loading = bool(lazy_loading)
-        self.chunks = chunks or {"y": 512, "x": 512, "band": 1}
-
-        if paths is None:
-            paths = []
-            filename_regex = re.compile(self.filename_regex, re.VERBOSE)
-            for file_path in sorted(self.root_dir.rglob(self.pattern)):
-                match = re.match(filename_regex, file_path.name)
-                if match is not None:
-                    paths.append(str(file_path))
-        else:
-            paths = [str(p) for p in paths]
-
-        # Scan files and extract metadata (always sequential, metadata is lightweight)
-        files_df = self._scan_files_sequential(paths, crs)
-
-        # Store files information
-        self._files = files_df
-
-        # Determine final attributes based on user parameters and file metadata
-        final_crs, final_res, final_dtype, final_nodata = (
-            self._determine_final_attributes(files_df, crs, res, dtype, nodata)
-        )
-
-        # Set final attributes
-        self.crs = final_crs
-        self.res = final_res
-        self.dtype = final_dtype
-        self.nodata = final_nodata
-        self.count = self._count
-        self.roi = roi
 
     @staticmethod
     def _extract_single_file_metadata(
@@ -600,8 +633,8 @@ class RasterDataset(GeoDataset):
 
         paths = self.files[self.files.valid].paths.tolist()
 
-        # Choose loading strategy based on lazy_loading setting
-        if self.lazy_loading:
+        # Choose loading strategy based on chunks setting
+        if self._chunks is not None:
             return self._sample_files_lazy(paths, query)
         return self._sample_files(paths, query)
 
@@ -1020,7 +1053,7 @@ class RasterDataset(GeoDataset):
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
 
         # Create multi-file lazy reader
-        multi_reader = LazyMultiFileReader(paths, chunks=self.chunks)
+        multi_reader = LazyMultiFileReader(paths, chunks=self._chunks)
 
         # Single bbox input (not a list) -> DataArray at root
         if not isinstance(bbox, list):
@@ -1155,7 +1188,7 @@ class RasterDataset(GeoDataset):
         """
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
 
-        multi_reader = LazyMultiFileReader(paths, chunks=self.chunks)
+        multi_reader = LazyMultiFileReader(paths, chunks=self._chunks)
 
         n_polygons = len(polygons)
         children = {}
@@ -1775,7 +1808,6 @@ class RasterDataset(GeoDataset):
         self,
         bbox: BoundingBox | list[BoundingBox],
         indexes: int | list[int] | None = None,
-        lazy_loading: bool | None = None,
     ) -> xr.DataTree:
         """Query the dataset for the given file index and bounding box(es).
 
@@ -1801,11 +1833,6 @@ class RasterDataset(GeoDataset):
             Indexes of the files to query. If None, all files in the dataset
             will be used. Default is None. File dimension will never be automatically
             removed even if it's 1.
-        lazy_loading : bool or None, optional
-            If True, use lazy loading with dask arrays (data loaded on .compute()).
-            If False, load data eagerly into memory immediately.
-            If None, use the dataset's default lazy_loading setting.
-            Default is None.
 
         Returns
         -------
@@ -1838,10 +1865,7 @@ class RasterDataset(GeoDataset):
         >>> data = result["bbox_0"]["data"]  # Note: accessed via group "bbox_0"
 
         """
-        if lazy_loading is None:
-            lazy_loading = self.lazy_loading
-
-        if lazy_loading:
+        if self._chunks is not None:
             return self._compute_bboxes_tree_lazy(bbox, indexes)
         return self._compute_bboxes_tree(bbox, indexes)
 
@@ -1849,7 +1873,6 @@ class RasterDataset(GeoDataset):
         self,
         polygons: Polygons,
         indexes: int | list[int] | None = None,
-        lazy_loading: bool | None = None,
     ) -> xr.DataTree:
         """Query the dataset for the given file index and polygons.
 
@@ -1862,9 +1885,6 @@ class RasterDataset(GeoDataset):
             indexes of the files to query. If None, all files in the dataset
             will be used. Default is None. File dimension will never be automatically
             removed even if it's 1.
-        lazy_loading : bool or None, optional
-            if True, use lazy loading with dask arrays. If None, use the dataset's
-            default lazy_loading setting. Default is None.
 
         Returns
         -------
@@ -1872,10 +1892,7 @@ class RasterDataset(GeoDataset):
             a result object containing the results of the query.
 
         """
-        if lazy_loading is None:
-            lazy_loading = self.lazy_loading
-
-        if lazy_loading:
+        if self._chunks is not None:
             return self._compute_polygons_tree_lazy(polygons, indexes)
         return self._compute_polygons_tree(polygons, indexes)
 
@@ -1883,7 +1900,6 @@ class RasterDataset(GeoDataset):
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         indexes: int | list[int] | None = None,
-        lazy_loading: bool | None = None,
     ) -> xr.DataTree:
         """Retrieve image values for given query.
 
@@ -1899,9 +1915,6 @@ class RasterDataset(GeoDataset):
         indexes : int or list of int or None, optional
             indexes of the files to query. If None, all files in the dataset
             will be used. Default is None.
-        lazy_loading : bool or None, optional
-            if True, use lazy loading with dask arrays. If None, use the dataset's
-            default lazy_loading setting. Default is None.
 
         Returns
         -------
@@ -1909,9 +1922,6 @@ class RasterDataset(GeoDataset):
             A xr.DataTree containing the results of the various queries.
 
         """
-        if lazy_loading is None:
-            lazy_loading = self.lazy_loading
-
         if isinstance(query, Points):
             query = GeoQuery(points=query)
         elif isinstance(query, BoundingBox):
@@ -1921,7 +1931,7 @@ class RasterDataset(GeoDataset):
 
         paths = self._indexes2paths(indexes)
 
-        if lazy_loading:
+        if self._chunks is not None:
             return self._sample_files_lazy(paths, query)
         return self._sample_files(paths, query)
 

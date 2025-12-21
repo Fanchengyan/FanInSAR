@@ -6,7 +6,7 @@ into dask arrays for lazy loading and parallel computation.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Literal
 
 import dask
 import dask.array as da
@@ -215,15 +215,19 @@ class LazyMultiFileReader:
     ----------
     paths : list[str]
         List of file paths.
-    chunks : dict[str, int] | None, optional
-        Chunk sizes. Default is {'y': 512, 'x': 512}.
+    chunks : dict[str, int] | int | Literal["auto"] | None, optional
+        Chunk sizes for dask arrays. Accepts:
+        - ``None``: Uses default 512x512 chunks.
+        - ``"auto"`` or ``{}``: Auto-detect from first file's block size.
+        - ``int``: Use same size for both y and x dimensions.
+        - ``dict``: Specify 'y' and 'x' separately, e.g., ``{"y": 256, "x": 512}``.
 
     Attributes
     ----------
     paths : list[str]
         List of file paths.
     chunks : dict[str, int]
-        Chunk sizes.
+        Resolved chunk sizes.
     readers : list[LazyRasterioReader]
         List of readers for each file.
 
@@ -236,19 +240,85 @@ class LazyMultiFileReader:
     >>> print(stacked.shape)
     (2, height, width)
 
+    Using auto chunks (aligned to file block size):
+
+    >>> multi_reader = LazyMultiFileReader(paths=["cog.tif"], chunks="auto")
+    >>> print(multi_reader.chunks)  # e.g., {"y": 256, "x": 256} from file
+
     """
 
     def __init__(
         self,
         paths: list[str],
-        chunks: dict[str, int] | None = None,
+        chunks: dict[str, int] | int | Literal["auto"] | None = None,
     ) -> None:
         """Initialize LazyMultiFileReader."""
         self.paths = paths
-        self.chunks = chunks or {"y": 512, "x": 512}
+        self._chunks = self._resolve_chunks(chunks, paths[0] if paths else None)
 
         # Create reader for each file
-        self.readers = [LazyRasterioReader(path, chunks=self.chunks) for path in paths]
+        self.readers = [LazyRasterioReader(path, chunks=self._chunks) for path in paths]
+
+    @staticmethod
+    def _resolve_chunks(
+        chunks: dict[str, int] | int | Literal["auto"] | None,
+        reference_path: str | None,
+    ) -> dict[str, int]:
+        """Resolve chunks to a dict[str, int] format.
+
+        Parameters
+        ----------
+        chunks : dict | int | Literal["auto"] | None
+            User-specified chunk configuration.
+        reference_path : str | None
+            Path to a reference file for auto-detection.
+
+        Returns
+        -------
+        dict[str, int]
+            Resolved chunks as {"y": ..., "x": ...}.
+
+        """
+        # Default chunks
+        default_chunks = {"y": 512, "x": 512}
+
+        if chunks is None:
+            return default_chunks
+
+        # Auto-detect from file block size
+        if chunks == "auto" or chunks == {}:
+            if reference_path is None:
+                return default_chunks
+            try:
+                with rasterio.open(reference_path) as src:
+                    block_shapes = src.block_shapes
+                    if block_shapes and block_shapes[0] != (1, src.width):
+                        # Tiled file: use block size
+                        block_height, block_width = block_shapes[0]
+                        return {"y": block_height, "x": block_width}
+                    # Striped file: use default
+                    return default_chunks
+            except Exception:
+                return default_chunks
+
+        # Integer: use same size for both dimensions
+        if isinstance(chunks, int):
+            return {"y": chunks, "x": chunks}
+
+        # Dict: extract y and x, use defaults for missing
+        if isinstance(chunks, dict):
+            return {
+                "y": chunks.get("y", default_chunks["y"]),
+                "x": chunks.get("x", default_chunks["x"]),
+            }
+
+        # Fallback
+        return default_chunks
+
+    @property
+    def chunks(self) -> dict[str, int]:
+        """Return resolved chunk sizes."""
+        return self._chunks
 
     def to_stacked_dask_array(
         self, band: int = 1, window: Window | None = None
@@ -276,3 +346,4 @@ class LazyMultiFileReader:
 
         # Stack along new dimension (file dimension)
         return da.stack(lazy_arrays, axis=0)
+
