@@ -28,14 +28,14 @@ class TimeSeriesDataset(RasterDataset, ABC):
     def __init__(self, *args, **kwargs) -> None:
         """Initialize the dataset and attach acquisition metadata."""
         super().__init__(*args, **kwargs)
-        self._assign_dates_from_files()
+        self._assign_dates_from_paths()
 
     @property
     def dates(self) -> Acquisition:
         """Return the date for each acquisition in the dataset."""
         return self._dates
 
-    def _assign_dates_from_files(self) -> None:
+    def _assign_dates_from_paths(self) -> None:
         """Parse acquisition dates from current file list."""
         paths = self._files.paths.tolist()
         if len(paths) == 0:
@@ -61,12 +61,6 @@ class TimeSeriesDataset(RasterDataset, ABC):
         self._files.loc[:, "date"] = pd.to_datetime(date_series)
 
     @classmethod
-    def _parse_dates(cls, paths: Iterable[str | PathLike]) -> Acquisition:
-        """Parse dates from filenames. Override in subclass if needed."""
-        msg = "_parse_dates method must be implemented in subclass"
-        raise NotImplementedError(msg)
-
-    @classmethod
     def parse_dates(cls, paths: Iterable[str | PathLike]) -> Acquisition:
         """Parse dates from filenames.
 
@@ -81,7 +75,8 @@ class TimeSeriesDataset(RasterDataset, ABC):
             dates parsed from filenames
 
         """
-        return cls._parse_dates(paths)
+        msg = "parse_dates method must be implemented in subclass"
+        raise NotImplementedError(msg)
 
     @property
     def file_dim_name(self) -> str:
@@ -120,7 +115,7 @@ class TimeSeriesDataset(RasterDataset, ABC):
         resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
         return self._compute_points_ds(points, resolved_indexes)
 
-    def box_query(
+    def boxes_query(
         self,
         bbox: BoundingBox | list[BoundingBox],
         dates: Acquisition | pd.DatetimeIndex | None = None,

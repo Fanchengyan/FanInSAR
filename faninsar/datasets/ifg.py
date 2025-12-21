@@ -102,7 +102,7 @@ class CoherenceDataset(PairDataset):
         coh_sum = np.zeros((height, width))
         count = np.zeros((height, width))
         for index, _ in tqdm(files_coh_used.items(), total=len(files_coh_used)):
-            coh_data = self.box_query(roi, index).data
+            coh_data = self.boxes_query(roi, index).data
             count += np.where(coh_data.mask, 0, 1)
             coh_sum += np.where(coh_data.mask, 0, coh_data.data)
 

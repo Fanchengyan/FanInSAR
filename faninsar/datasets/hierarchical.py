@@ -108,7 +108,7 @@ class HierarchicalDataset(XarrayDataset, HierarchicalMixin):
     ...     pattern_files = "*.nc"
     >>> dataset = MyNetCDFDataset(root_dir="data/")
     >>> bbox = BoundingBox(0, 0, 100, 100, crs=dataset.crs)
-    >>> data = dataset.box_query(bbox)
+    >>> data = dataset.boxes_query(bbox)
 
     With explicit paths:
 
@@ -224,7 +224,7 @@ class HierarchicalTimeSeriesDataset(HierarchicalDataset, TimeSeriesDataset):
     Notes
     -----
     Files must contain parseable date information in their filenames.
-    Implement the ``_parse_dates`` classmethod to define custom date parsing logic.
+    Implement the ``parse_dates`` classmethod to define custom date parsing logic.
 
     The file dimension is named "date" instead of "file" for time-series datasets.
 
@@ -236,7 +236,7 @@ class HierarchicalTimeSeriesDataset(HierarchicalDataset, TimeSeriesDataset):
     ...     pattern_files = "*.nc"
     ...
     ...     @classmethod
-    ...     def _parse_dates(cls, paths):
+    ...     def parse_dates(cls, paths):
     ...         # Parse dates from filenames
     ...         dates = [parse_date_from_filename(p) for p in paths]
     ...         return Acquisition(dates)
@@ -244,7 +244,7 @@ class HierarchicalTimeSeriesDataset(HierarchicalDataset, TimeSeriesDataset):
     >>> dataset = MyTimeSeriesDataset(root_dir="data/")
     >>> # Query specific dates
     >>> dates = Acquisition(["2020-01-01", "2020-01-15"])
-    >>> data = dataset.box_query(bbox, dates=dates)
+    >>> data = dataset.boxes_query(bbox, dates=dates)
 
     See Also
     --------
@@ -261,8 +261,7 @@ class HierarchicalTimeSeriesDataset(HierarchicalDataset, TimeSeriesDataset):
         super().__init__(*args, **kwargs)
 
         # Assign dates from files (from TimeSeriesDataset)
-        # Note: This requires implementing _parse_dates in subclass
-        self._assign_dates_from_files()
+        self._assign_dates_from_paths()
 
     @property
     def file_dim_name(self) -> str:
@@ -334,7 +333,7 @@ class HierarchicalPairDataset(HierarchicalDataset, PairDataset):
     >>> dataset = MyInterferogramDataset(root_dir="data/")
     >>> # Query specific pairs
     >>> pairs = Pairs([("2020-01-01", "2020-01-13")])
-    >>> data = dataset.box_query(bbox, pairs=pairs)
+    >>> data = dataset.boxes_query(bbox, pairs=pairs)
 
     See Also
     --------

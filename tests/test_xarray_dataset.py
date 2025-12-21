@@ -62,7 +62,7 @@ def test_box_query_full_extent(temp_raster_dir: Path) -> None:
     """A bbox covering both tiles should return stacked data."""
     dataset = XarrayDataset(paths=[temp_raster_dir / "tile_a.tif", temp_raster_dir / "tile_b.tif"])
     bbox = BoundingBox(left=0, bottom=0, right=10, top=5, crs=CRS.from_epsg(4326))
-    result = dataset.box_query(bbox)
+    result = dataset.boxes_query(bbox)
     assert result.shape == (2, 5, 10)
     # First tile occupies first 5 columns
     np.testing.assert_array_equal(result.sel(file=0).values[:, :5], np.arange(25, dtype=np.float32).reshape(5, 5))
@@ -75,7 +75,7 @@ def test_box_query_partial_overlap(temp_raster_dir: Path) -> None:
     """Partial overlap should fill NoData outside the source extent."""
     dataset = XarrayDataset(paths=[temp_raster_dir / "tile_a.tif"])
     bbox = BoundingBox(left=2, bottom=0, right=4, top=2, crs=CRS.from_epsg(4326))
-    result = dataset.box_query(bbox)
+    result = dataset.boxes_query(bbox)
     assert result.shape == (1, 2, 2)
     expected = np.array([[17, 18], [22, 23]], dtype=np.float32)
     np.testing.assert_array_equal(result.values[0], expected)
@@ -85,7 +85,7 @@ def test_box_query_no_overlap(temp_raster_dir: Path) -> None:
     """When there is no spatial overlap, the array should be filled with nodata."""
     dataset = XarrayDataset(paths=[temp_raster_dir / "tile_a.tif"])
     bbox = BoundingBox(left=20, bottom=20, right=25, top=25, crs=CRS.from_epsg(4326))
-    result = dataset.box_query(bbox)
+    result = dataset.boxes_query(bbox)
     assert np.all(result.values == dataset.nodata)
 
 
@@ -98,8 +98,8 @@ def test_box_query_lazy_matches_eager(temp_raster_dir: Path) -> None:
         lazy_loading=True,
         chunks=(3, 3),
     )
-    eager = eager_dataset.box_query(bbox)
-    lazy = lazy_dataset.box_query(bbox)
+    eager = eager_dataset.boxes_query(bbox)
+    lazy = lazy_dataset.boxes_query(bbox)
     assert isinstance(lazy.data, da.Array)
     np.testing.assert_array_equal(lazy.data.compute(), eager.data)
 
@@ -112,7 +112,7 @@ def test_lazy_no_overlap_returns_nodata(temp_raster_dir: Path) -> None:
         chunks=(2, 2),
     )
     bbox = BoundingBox(left=50, bottom=50, right=60, top=60, crs=CRS.from_epsg(4326))
-    result = dataset.box_query(bbox)
+    result = dataset.boxes_query(bbox)
     assert isinstance(result.data, da.Array)
     computed = result.data.compute()
     expected_height = int(round((bbox.top - bbox.bottom) / dataset.res[1]))

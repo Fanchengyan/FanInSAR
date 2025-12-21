@@ -112,7 +112,7 @@ class TestRasterDatasetDask:
         bbox = BoundingBox(5, 15, 5, 15, crs=CRS.from_epsg(4326))
 
         start_time = time.time()
-        result = ds.box_query(bbox)
+        result = ds.boxes_query(bbox)
         end_time = time.time()
 
         # Single bbox -> dataset on root
@@ -126,7 +126,7 @@ class TestRasterDatasetDask:
         bbox = BoundingBox(5, 15, 5, 15, crs=CRS.from_epsg(4326))
 
         start_time = time.time()
-        result = ds.box_query(bbox, lazy_loading=True)
+        result = ds.boxes_query(bbox, lazy_loading=True)
         end_time = time.time()
 
         # Single bbox -> dataset on root
@@ -153,8 +153,8 @@ class TestRasterDatasetDask:
 
         # Compare bbox results with and without lazy loading
         bbox = BoundingBox(0, 30, 0, 30, crs=CRS.from_epsg(4326))
-        ds_no = ds.box_query(bbox, lazy_loading=False).dataset["data"]
-        ds_yes = ds.box_query(bbox, lazy_loading=True).dataset["data"]
+        ds_no = ds.boxes_query(bbox, lazy_loading=False).dataset["data"]
+        ds_yes = ds.boxes_query(bbox, lazy_loading=True).dataset["data"]
         assert ds_no.shape == ds_yes.shape
         np.testing.assert_allclose(ds_no.compute() if hasattr(ds_no, "compute") else ds_no.values,
                                    ds_yes.compute() if hasattr(ds_yes, "compute") else ds_yes.values,
@@ -167,11 +167,11 @@ class TestRasterDatasetDask:
 
         # Measure time without dask
         start_time = time.time()
-        tree_no = ds.box_query(bbox, lazy_loading=False)
+        tree_no = ds.boxes_query(bbox, lazy_loading=False)
         time_no_dask = time.time() - start_time
 
         start_time = time.time()
-        tree_yes = ds.box_query(bbox, lazy_loading=True)
+        tree_yes = ds.boxes_query(bbox, lazy_loading=True)
         time_with_dask = time.time() - start_time
 
         print(f"Time without dask: {time_no_dask:.4f} seconds")
@@ -185,10 +185,10 @@ class TestRasterDatasetDask:
         points = Points([(10, 10), (20, 20)])
         bbox = BoundingBox(5, 15, 5, 15, crs=CRS.from_epsg(4326))
 
-        # Test combined selection using __getitem__ with Points then box_query
+        # Test combined selection using __getitem__ with Points then boxes_query
         tree = ds[points]
         assert "points" in tree.children
-        tree_bbox = ds.box_query(bbox)
+        tree_bbox = ds.boxes_query(bbox)
         assert hasattr(tree_bbox, "children")
 
     def test_error_handling_without_dask_installed(self, temp_dataset_dir, monkeypatch):
@@ -204,7 +204,7 @@ class TestRasterDatasetDask:
 
         bbox = BoundingBox(5, 15, 5, 15, crs=CRS.from_epsg(4326))
         with pytest.raises(ImportError, match="Lazy loading requires dask"):
-            ds.box_query(bbox, lazy_loading=True)
+            ds.boxes_query(bbox, lazy_loading=True)
 
     def test_debug_single_file_query(self, temp_dataset_dir):
         """Debug single file query issue."""
@@ -215,9 +215,9 @@ class TestRasterDatasetDask:
         result_all = ds.points_query(points)
         print(f"All files result shape: {result_all['data'].data.shape}")
 
-        # Use box_query to validate single-file dim not squeezed (indexes not used here)
+        # Use boxes_query to validate single-file dim not squeezed (indexes not used here)
         bbox = BoundingBox(0, 10, 0, 10, crs=CRS.from_epsg(4326))
-        result_single = ds.box_query(bbox, lazy_loading=False)
+        result_single = ds.boxes_query(bbox, lazy_loading=False)
         print(f"Single bbox result file-dim: {result_single.dataset['data'].shape[0]}")
         assert result_single.dataset["data"].shape[0] >= 1
 

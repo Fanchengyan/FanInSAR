@@ -148,12 +148,12 @@ class TestRasterDatasetQueries:
         assert da_multi.shape[0] == 2
 
     def test_box_query(self, raster_dataset):
-        """Test the box_query method."""
+        """Test the boxes_query method."""
         # Create test bounding box with proper WGS84 coordinates
         bbox = BoundingBox(-9.5, 40.5, -9.0, 41.0, crs=raster_dataset.crs)
 
         # Test with default parameters (all files)
-        tree = raster_dataset.box_query(bbox)
+        tree = raster_dataset.boxes_query(bbox)
         assert hasattr(tree, "children")
         child_name = list(tree.children.keys())[0]
         ds = tree[child_name].dataset
@@ -161,7 +161,7 @@ class TestRasterDatasetQueries:
         assert "values" in ds
         assert ds["values"].dims[0] == "file"
 
-        tree_single = raster_dataset.box_query(bbox, indexes=1)
+        tree_single = raster_dataset.boxes_query(bbox, indexes=1)
         ds_single = tree_single[child_name].dataset
         assert ds_single["values"].shape[0] == 1
 
@@ -211,35 +211,35 @@ class TestRasterDatasetQueries:
 # =============================================================================
 
 class TestUpdatedBboxPolygonsQuery:
-    """Test updated box_query and polygons_query behavior."""
+    """Test updated boxes_query and polygons_query behavior."""
 
     def test_box_query_single_bbox_no_list(self, temp_dataset_dir):
-        """Test box_query with single bbox (not in list) - should not have bbox dimension."""
+        """Test boxes_query with single bbox (not in list) - should not have bbox dimension."""
         ds = RasterDataset(root_dir=temp_dataset_dir, parallel_loading=False)
         bbox = BoundingBox(2, 12, 2, 12, crs=CRS.from_epsg(4326))
 
         # Test with all files
-        result = ds.box_query(bbox)
+        result = ds.boxes_query(bbox)
         assert result.values is not None
         # Should have shape (n_files, height, width) - no bbox dimension
         assert result["values"].values.ndim == 3
         assert result["values"].values.shape[0] == 3  # 3 files
 
         # Test with single file - file dimension should NOT be squeezed
-        result_single = ds.box_query(bbox, indexes=0)
+        result_single = ds.boxes_query(bbox, indexes=0)
         assert result_single["values"] is not None
         # Should still have file dimension even though it's 1
         assert result_single["values"].values.ndim == 3
         assert result_single["values"].values.shape[0] == 1  # 1 file, not squeezed
 
     def test_box_query_single_bbox_in_list(self, temp_dataset_dir):
-        """Test box_query with single bbox in list - should have bbox dimension."""
+        """Test boxes_query with single bbox in list - should have bbox dimension."""
         ds = RasterDataset(root_dir=temp_dataset_dir, parallel_loading=False)
         bbox = BoundingBox(2, 12, 2, 12, crs=CRS.from_epsg(4326))
         bbox_list = [bbox]  # Single bbox in list
 
         # Test with all files
-        result = ds.box_query(bbox_list)
+        result = ds.boxes_query(bbox_list)
         assert result.values is not None
         # Should have shape (n_files, n_bboxes, height, width) - with bbox dimension
         assert result["values"].values.ndim == 4
@@ -247,7 +247,7 @@ class TestUpdatedBboxPolygonsQuery:
         assert result["values"].values.shape[1] == 1  # 1 bbox
 
         # Test with single file - file dimension should NOT be squeezed
-        result_single = ds.box_query(bbox_list, indexes=0)
+        result_single = ds.boxes_query(bbox_list, indexes=0)
         assert result_single["values"] is not None
         # Should still have file dimension even though it's 1
         assert result_single["values"].values.ndim == 4
@@ -255,14 +255,14 @@ class TestUpdatedBboxPolygonsQuery:
         assert result_single["values"].values.shape[1] == 1  # 1 bbox
 
     def test_box_query_multiple_bboxes(self, temp_dataset_dir):
-        """Test box_query with multiple boxes - should have bbox dimension."""
+        """Test boxes_query with multiple boxes - should have bbox dimension."""
         ds = RasterDataset(root_dir=temp_dataset_dir, parallel_loading=False)
         bbox1 = BoundingBox(2, 8, 2, 8, crs=CRS.from_epsg(4326))
         bbox2 = BoundingBox(12, 18, 12, 18, crs=CRS.from_epsg(4326))
         bbox_list = [bbox1, bbox2]
 
         # Test with all files
-        result = ds.box_query(bbox_list)
+        result = ds.boxes_query(bbox_list)
         assert result.values is not None
         # Should have shape (n_files, n_bboxes, height, width)
         assert result["values"].values.ndim == 4
@@ -270,7 +270,7 @@ class TestUpdatedBboxPolygonsQuery:
         assert result["values"].values.shape[1] == 2  # 2 boxes
 
         # Test with single file - file dimension should NOT be squeezed
-        result_single = ds.box_query(bbox_list, indexes=1)
+        result_single = ds.boxes_query(bbox_list, indexes=1)
         assert result_single["values"] is not None
         assert result_single["values"].values.ndim == 4
         assert result_single["values"].values.shape[0] == 1  # 1 file, not squeezed
@@ -381,18 +381,18 @@ class TestUpdatedBboxPolygonsQuery:
             assert result_single["values"].values.shape[1] == 1  # 1 file, not squeezed
 
     def test_box_query_with_dask(self, temp_dataset_dir):
-        """Test box_query with dask enabled."""
+        """Test boxes_query with dask enabled."""
         ds = RasterDataset(root_dir=temp_dataset_dir, parallel_loading=True)
         bbox = BoundingBox(2, 12, 2, 12, crs=CRS.from_epsg(4326))
 
         # Test single bbox (no list)
-        result_single = ds.box_query(bbox, parallel_loading=True)
+        result_single = ds.boxes_query(bbox, parallel_loading=True)
         assert result_single["values"] is not None
         assert result_single["values"].values.ndim == 3  # No bbox dimension
         assert result_single["values"].values.shape[0] == 3  # 3 files
 
         # Test bbox in list
-        result_list = ds.box_query([bbox], parallel_loading=True)
+        result_list = ds.boxes_query([bbox], parallel_loading=True)
         assert result_list["values"] is not None
         assert result_list["values"].values.ndim == 4  # With bbox dimension
         assert result_list["values"].values.shape[0] == 3  # 3 files
@@ -524,55 +524,55 @@ class TestPointsQueryBoundaryConditions:
 
 
 class TestBboxQueryBoundaryConditions:
-    """Test boundary conditions for box_query method."""
+    """Test boundary conditions for boxes_query method."""
 
     def test_bbox_outside_dataset_bounds(self, raster_dataset):
-        """Test box_query with bbox completely outside dataset bounds."""
+        """Test boxes_query with bbox completely outside dataset bounds."""
         bbox = BoundingBox(-20.0, 30.0, -15.0, 35.0, crs=raster_dataset.crs)
 
-        result = raster_dataset.box_query(bbox)
+        result = raster_dataset.boxes_query(bbox)
         assert isinstance(result, BBoxesResult)
         # Should handle out-of-bounds bbox gracefully
         # Result might be empty or contain NaN/masked values
 
     def test_bbox_partially_overlapping(self, raster_dataset):
-        """Test box_query with bbox partially overlapping dataset."""
+        """Test boxes_query with bbox partially overlapping dataset."""
         # Bbox that extends beyond dataset bounds
         bbox = BoundingBox(-11.0, 39.0, -7.0, 43.0, crs=raster_dataset.crs)
 
-        result = raster_dataset.box_query(bbox)
+        result = raster_dataset.boxes_query(bbox)
         assert isinstance(result, BBoxesResult)
         assert result.values is not None
         # Should return data for the overlapping region
 
     def test_bbox_exact_dataset_bounds(self, raster_dataset):
-        """Test box_query with bbox exactly matching dataset bounds."""
+        """Test boxes_query with bbox exactly matching dataset bounds."""
         # Get the exact bounds of the dataset
         bounds = raster_dataset.bounds
         bbox = BoundingBox(bounds.left, bounds.bottom, bounds.right, bounds.top, crs=raster_dataset.crs)
 
-        result = raster_dataset.box_query(bbox)
+        result = raster_dataset.boxes_query(bbox)
         assert isinstance(result, BBoxesResult)
         assert result.values is not None
         # Should return the entire dataset
 
     def test_bbox_very_small(self, raster_dataset):
-        """Test box_query with very small bbox."""
+        """Test boxes_query with very small bbox."""
         # Tiny bbox that might result in 1x1 pixel
         bbox = BoundingBox(-9.0, 41.0, -8.99, 41.01, crs=raster_dataset.crs)
 
-        result = raster_dataset.box_query(bbox)
+        result = raster_dataset.boxes_query(bbox)
         assert isinstance(result, BBoxesResult)
         assert result.values is not None
         # Should handle small boxes gracefully
 
     def test_bbox_zero_area(self, raster_dataset):
-        """Test box_query with zero-area bbox (point)."""
+        """Test boxes_query with zero-area bbox (point)."""
         # Bbox with same min/max coordinates
         bbox = BoundingBox(-9.0, 41.0, -9.0, 41.0, crs=raster_dataset.crs)
 
         try:
-            result = raster_dataset.box_query(bbox)
+            result = raster_dataset.boxes_query(bbox)
             # If it doesn't raise an error, check the result
             if "values" in result.data_vars:
                 assert isinstance(result, BBoxesResult)
@@ -581,31 +581,31 @@ class TestBboxQueryBoundaryConditions:
             pass
 
     def test_bbox_inverted_coordinates(self, raster_dataset):
-        """Test box_query with inverted coordinates (min > max)."""
+        """Test boxes_query with inverted coordinates (min > max)."""
         # Bbox with inverted coordinates should raise a ValueError
         with pytest.raises(ValueError, match="Bounding box is invalid"):
             bbox = BoundingBox(-8.0, 42.0, -10.0, 40.0, crs=raster_dataset.crs)
 
     def test_bbox_list_single_bbox(self, temp_dataset_dir):
-        """Test box_query with single bbox in list - should preserve bbox dimension."""
+        """Test boxes_query with single bbox in list - should preserve bbox dimension."""
         ds = BaseRasterDataset(root_dir=temp_dataset_dir, parallel_loading=False)
         bbox = BoundingBox(2, 12, 2, 12, crs=RasterioCRS.from_epsg(4326))
         bbox_list = [bbox]
 
-        result = ds.box_query(bbox_list)
+        result = ds.boxes_query(bbox_list)
         assert result["values"] is not None
         # Should have bbox dimension when bbox is in a list
         assert result["values"].values.ndim == 4  # (files, boxes, height, width)
         assert result["values"].values.shape[1] == 1  # 1 bbox
 
     def test_bbox_list_multiple_bboxes(self, temp_dataset_dir):
-        """Test box_query with multiple boxes in list."""
+        """Test boxes_query with multiple boxes in list."""
         ds = BaseRasterDataset(root_dir=temp_dataset_dir, parallel_loading=False)
         bbox1 = BoundingBox(2, 8, 2, 8, crs=RasterioCRS.from_epsg(4326))
         bbox2 = BoundingBox(12, 18, 12, 18, crs=RasterioCRS.from_epsg(4326))
         bbox_list = [bbox1, bbox2]
 
-        result = ds.box_query(bbox_list)
+        result = ds.boxes_query(bbox_list)
         assert result["values"] is not None
         assert result["values"].values.ndim == 4  # (files, boxes, height, width)
         assert result["values"].values.shape[1] == 2  # 2 boxes
@@ -813,7 +813,7 @@ class TestFileIndexBoundaryConditions:
         assert result_points.values.shape == (1,)  # Single point, single file squeezed
 
         # Bbox query with single file - file dimension should NOT be squeezed
-        result_bbox = raster_dataset.box_query(bbox, indexes=0)
+        result_bbox = raster_dataset.boxes_query(bbox, indexes=0)
         assert result_bbox["values"].values.shape[0] == 1  # File dimension not squeezed
 
         # Polygons query with single file - file dimension should NOT be squeezed
@@ -837,7 +837,7 @@ class TestFileIndexBoundaryConditions:
         assert result_points.values.shape[0] == 2  # 2 files
 
         # Bbox query
-        result_bbox = raster_dataset.box_query(bbox, indexes=indexes)
+        result_bbox = raster_dataset.boxes_query(bbox, indexes=indexes)
         assert result_bbox["values"].values.shape[0] == 2  # 2 files
 
         # Polygons query

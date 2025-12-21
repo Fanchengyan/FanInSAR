@@ -159,7 +159,7 @@ class PairDataset(RasterDataset):
         resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
         return self._compute_points_ds(points, resolved_indexes)
 
-    def box_query(
+    def boxes_query(
         self,
         bbox: BoundingBox | list[BoundingBox],
         pairs: Pairs | None = None,

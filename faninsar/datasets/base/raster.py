@@ -1771,7 +1771,7 @@ class RasterDataset(GeoDataset):
         """
         return self._compute_points_ds(points, indexes)
 
-    def box_query(
+    def boxes_query(
         self,
         bbox: BoundingBox | list[BoundingBox],
         indexes: int | list[int] | None = None,
@@ -1820,7 +1820,7 @@ class RasterDataset(GeoDataset):
         Single bounding box (not in list):
 
         >>> bbox = BoundingBox(0, 10, 0, 10, crs=ds.crs)
-        >>> result = ds.box_query(bbox)
+        >>> result = ds.boxes_query(bbox)
         >>> data = result["data"]  # Access directly at root
         >>> # or: data = result.dataset["data"]
 
@@ -1828,13 +1828,13 @@ class RasterDataset(GeoDataset):
 
         >>> bbox1 = BoundingBox(0, 10, 0, 10, crs=ds.crs)
         >>> bbox2 = BoundingBox(10, 20, 10, 20, crs=ds.crs)
-        >>> result = ds.box_query([bbox1, bbox2])
+        >>> result = ds.boxes_query([bbox1, bbox2])
         >>> data1 = result["bbox_0"]["data"]  # First bbox
         >>> data2 = result["bbox_1"]["data"]  # Second bbox
 
         Single bbox in list (also uses groups):
 
-        >>> result = ds.box_query([bbox])
+        >>> result = ds.boxes_query([bbox])
         >>> data = result["bbox_0"]["data"]  # Note: accessed via group "bbox_0"
 
         """

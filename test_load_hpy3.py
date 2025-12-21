@@ -32,6 +32,6 @@ pairs_used = pairs[mask_60]
 unw_sample2 = ds_unw.query(geo_query, pairs=pairs_used)
 coh_sample2 = ds_coh.query(geo_query, pairs=pairs_used)
 
-unw = ds_unw.box_query(roi)
+unw = ds_unw.boxes_query(roi)
 
 unw.data.sel(pair="20190419_20190501").plot()
