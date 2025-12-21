@@ -370,7 +370,6 @@ class RasterDataset(GeoDataset):
         paths = files_used.paths.astype(str).tolist()
         return resolved_indexes, paths, files_used
 
-
     @staticmethod
     def _extract_single_file_metadata(
         file_path: str, target_crs: CRS | None = None
@@ -595,8 +594,10 @@ class RasterDataset(GeoDataset):
             user_nodata if user_nodata is not None else first_valid.file_nodata
         )
 
-        # Check CRS consistency across files
-        self._same_crs = valid_files.file_crs.nunique() == 1
+        # Check CRS consistency across files and with final CRS
+        self._same_crs = (valid_files.file_crs.nunique() == 1) and (
+            first_valid.res == final_crs
+        )
 
         # Update colormap from first valid file if not already set
         if len(self.cmap) == 0 and first_valid.colormap:
