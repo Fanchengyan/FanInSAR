@@ -24,46 +24,48 @@ def multi_look(
     azimuth_looks: int,
     range_looks: int,
 ) -> np.ndarray:
-    """Multi_look array with alks and rlks.
+    """Multi-look an array by averaging blocks.
 
     Parameters
     ----------
-    arr_in: numpy.ndarray
-        input array to be multi-looked
-    azimuth_looks: int
-        number of looks in azimuth
-    range_looks: int
-        number of looks in range
+    arr_in : numpy.ndarray
+        Input array to be multi-looked. Can be 2D (rows, cols) or
+        nD (..., rows, cols).
+    azimuth_looks : int
+        Number of looks in azimuth (rows).
+    range_looks : int
+        Number of looks in range (cols).
 
     Returns
     -------
     numpy.ndarray
-        multi-looked array
+        Multi-looked array.
+
+    Notes
+    -----
+    The input array is cropped to the nearest multiple of `azimuth_looks`
+    and `range_looks` before multi-looking.
+
+    Examples
+    --------
+    >>> data = np.ones((4, 4))
+    >>> multi_look(data, 2, 2)
+    array([[1.]])
 
     """
-    # TODO: 1. make it work 2. support for complex data
-    # Get the shape of the input array
-    rows, cols = arr_in.shape
+    if azimuth_looks == 1 and range_looks == 1:
+        return arr_in.copy()
 
-    # Calculate the shape of the output array
+    rows, cols = arr_in.shape[-2:]
     out_rows = rows // azimuth_looks
     out_cols = cols // range_looks
 
-    # Initialize the output array
-    arr_out = np.zeros((out_rows, out_cols), dtype=arr_in.dtype)
+    # Slice to handle non-divisible dimensions
+    arr = arr_in[..., : out_rows * azimuth_looks, : out_cols * range_looks]
 
-    # Perform multi-looking
-    for i in range(out_rows):
-        for j in range(out_cols):
-            # Calculate the block to average
-            block = arr_in[
-                i * azimuth_looks : (i + 1) * azimuth_looks,
-                j * range_looks : (j + 1) * range_looks,
-            ]
-            # Compute the mean of the block
-            arr_out[i, j] = block.mean()
-
-    return arr_out
+    # Reshape and compute mean
+    new_shape = arr.shape[:-2] + (out_rows, azimuth_looks, out_cols, range_looks)
+    return arr.reshape(new_shape).mean(axis=(-3, -1))
 
 
 class Baselines:
