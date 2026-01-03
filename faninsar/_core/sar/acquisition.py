@@ -292,9 +292,8 @@ class DaySpan(pd.Index):
         ax.bar(range(len(unique_days)), counts, **bar_kwargs)
         ax.set_xticks(range(len(unique_days)))
         ax.set_xticklabels([str(d) for d in unique_days])
-        ax.set_xlabel("Day Span")
+        ax.set_xlabel("Days")
         ax.set_ylabel("Count")
-        ax.set_title("Day Span Count")
 
         return ax
 

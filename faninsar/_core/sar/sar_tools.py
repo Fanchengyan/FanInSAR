@@ -310,7 +310,7 @@ class Baselines:
         cmap: str | None = None,
         plot_gaps: bool = True,
         legend: bool = True,
-        figsize: tuple[float, float] = (10, 4),
+        figsize: tuple[float, float] = (12, 4),
     ) -> BaselinePlotResult:
         """Plot the baselines of the interferograms.
 

@@ -17,6 +17,7 @@ from faninsar.logging import setup_logger
 from .acquisition import Acquisition, DateManager, DaySpan
 
 if TYPE_CHECKING:
+    from numpy._typing import _ArrayLikeInt_co
     from numpy.typing import DTypeLike, NDArray
 
     from faninsar import Loop, Loops, TripletLoops
@@ -964,7 +965,9 @@ class Pairs:
 
     def plot(
         self,
+        *,
         baseline: Baselines | None = None,
+        seed: _ArrayLikeInt_co = 1,
         **kwargs,
     ) -> BaselinePlotResult:
         """Plot the pairs.
@@ -972,8 +975,11 @@ class Pairs:
         Parameters
         ----------
         baseline: Baselines, optional
-            Baselines object to plot. If None, a random baseline will be generated.
-            Default is None.
+            Baselines object to plot. If None, a random dummy baseline will be
+            generated. Default is None.
+        seed: {None, int, array_like[ints], SeedSequence, BitGenerator, Generator}, optional
+            Random seed used to generate a random dummy baseline if ``baseline``
+            is not provided. Default is 1.
         kwargs: dict, optional
             Keyword arguments passed to :meth:`Baselines.plot()`.
 
@@ -982,11 +988,11 @@ class Pairs:
         result: BaselinePlotResult
             The result of the baseline plot.
 
-        """
+        """  # noqa: E501
         if baseline is None:
             from faninsar._core.sar.sar_tools import Baselines
 
-            rng = np.random.default_rng(seed=1)
+            rng = np.random.default_rng(seed=seed)
             vals = rng.standard_normal(len(self.dates)) * 1000
             val_pairs = vals[self.edge_index[:, 1]] - vals[self.edge_index[:, 0]]
             baseline = Baselines.from_pair_wise(self, val_pairs)
