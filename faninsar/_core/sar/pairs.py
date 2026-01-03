@@ -959,7 +959,7 @@ class Pairs:
 
         if len(gap_indices) == 0:
             return np.array([], dtype="datetime64[D]")
-        
+
         return self.dates[gap_indices + 1].to_numpy(dtype="datetime64[D]")
 
     def plot(

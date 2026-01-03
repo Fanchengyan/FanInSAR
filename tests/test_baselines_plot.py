@@ -94,6 +94,29 @@ class TestBaselinesPlot:
         assert len(result.pairs_removed_lines) > 0
         plt.close(fig)
 
+    def test_plot_with_gaps(self, sample_baselines, sample_pairs):
+        """Test plotting with gaps."""
+        # Remove some pairs
+        date_gap = sample_pairs.dates[2]
+        idx_remove = (
+            (sample_pairs.primary <= date_gap)
+            & (sample_pairs.secondary >= date_gap)
+        )
+        pairs_removed = sample_pairs[idx_remove]
+
+        fig, ax = plt.subplots()
+        result = sample_baselines.plot(
+            sample_pairs,
+            pairs_removed=pairs_removed,
+            ax=ax,
+            cmap="coolwarm",
+        )
+
+        assert result is not None
+        assert len(result.pairs_removed_lines) > 0
+        assert len(result.gaps_lines.get_paths()) > 0
+        plt.close(fig)
+
     def test_plot_empty_pairs(self, sample_baselines):
         """Test plotting with empty pairs."""
         empty_pairs = Pairs([])

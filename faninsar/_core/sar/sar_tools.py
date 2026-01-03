@@ -228,9 +228,9 @@ class Baselines:
             return None
 
         gaps = pairs.parse_gaps(pairs_removed)
-        offset = pairs.days.min() / 2
-        gaps = gaps - pd.Timedelta(offset, "D")
-
+        if len(gaps) == 0:
+            return None
+        
         dates_valid = np.setdiff1d(pairs.dates.data, gaps)
         vals = self.series[dates_valid]
         margin = vals.std() / 3
@@ -395,7 +395,13 @@ class Baselines:
 
         # Plot acquisitions
         acq_collection = ax.scatter(
-            self.dates, self.values, c="tab:blue", marker="o", ls="", alpha=0.5
+            self.dates,
+            self.values,
+            c="tab:blue",
+            marker="o",
+            ls="",
+            alpha=0.5,
+            zorder=2,
         )
 
         # Plot gaps
