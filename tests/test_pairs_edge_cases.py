@@ -91,8 +91,8 @@ class TestPairsEdgeCases:
         assert isinstance(np_array, np.ndarray)
         assert np_array.shape == (0, 2)
 
-        # Test to_matrix
-        matrix = empty_pairs.to_matrix()
+        # Test sbas_matrix
+        matrix = empty_pairs.sbas_matrix()
         assert isinstance(matrix, np.ndarray)
         assert matrix.shape == (0, 0)
 
@@ -197,8 +197,8 @@ class TestPairsEdgeCases:
         assert isinstance(np_array, np.ndarray)
         assert np_array.shape == (1, 2)
 
-        # Test to_matrix
-        matrix = single_pair.to_matrix()
+        # Test sbas_matrix
+        matrix = single_pair.sbas_matrix()
         assert isinstance(matrix, np.ndarray)
         assert matrix.shape == (1, 1)  # 1 pair, 1 interval (2 dates - 1)
 

@@ -231,7 +231,7 @@ class NSBASMatrixFactory:
         gamma: float,
     ) -> np.ndarray:
         G_br = np.asarray(G_br, dtype=np.float32)  # noqa: N806
-        G_tl = self.pairs.to_matrix()  # noqa: N806
+        G_tl = self.pairs.sbas_matrix()  # noqa: N806
 
         if len(G_br.shape) == 1:
             G_br = G_br.reshape(-1, 1)  # noqa: N806
@@ -244,7 +244,7 @@ class NSBASMatrixFactory:
         return np.vstack((G_t, G_b))
 
     def _make_sbas_matrix(self) -> np.ndarray:
-        return self.pairs.to_matrix()
+        return self.pairs.sbas_matrix()
 
     def _restructure_unw(
         self,
@@ -626,7 +626,7 @@ def calculate_u(
     --------
     get the loops from the pairs:
 
-    >>> loops = pairs.to_loops()
+    >>> loops = pairs.build_loops()
     >>> idx = pairs.where(
     ...     loops.pairs
     ... )  # get the index of the pairs in the loops from the input pairs
@@ -645,7 +645,7 @@ def calculate_u(
     contain_nan = False
     if np.any(np.isnan(unw_phases)):
         contain_nan = True
-    C = loops.to_matrix()  # noqa: N806
+    C = loops.loop_matrix()  # noqa: N806
 
     # edge pairs are not contributing to the loop closure phase, remove them
     # from the matrix C to avoid being involved in the calculation of u

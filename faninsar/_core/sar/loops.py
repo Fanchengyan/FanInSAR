@@ -502,7 +502,7 @@ class TripletLoops:
         msg = f"target should be 'pairs' or 'dates', but got {target}."
         raise ValueError(msg)
 
-    def to_matrix(self) -> NDArray[np.int8]:
+    def loop_matrix(self, dtype: DTypeLike = None) -> NDArray[np.int8]:
         """Return loop matrix (containing 1, -1, 0) from pairs.
 
         Returns
@@ -518,7 +518,7 @@ class TripletLoops:
         """
         n_loop = len(self)
         n_pair = len(self.pairs)
-        matrix = np.zeros((n_loop, n_pair))
+        matrix = np.zeros((n_loop, n_pair), dtype=dtype)
         pairs_ls = self.pairs.values.tolist()
         for i, loop in enumerate(self.values):
             matrix[i, pairs_ls.index(loop[:2].tolist())] = 1
@@ -886,7 +886,7 @@ class Loops:
             return None
         return Loops(self._loops[_index])
 
-    def to_matrix(self, dtype: DTypeLike = None) -> NDArray[np.number]:
+    def loop_matrix(self, dtype: DTypeLike = None) -> NDArray[np.number]:
         """Return a design matrix describes the relationship between loops and pairs.
 
         The rows and columns of this matrix are loops and pairs respectively.

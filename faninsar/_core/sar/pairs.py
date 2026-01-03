@@ -17,11 +17,11 @@ from faninsar.logging import setup_logger
 from .acquisition import Acquisition, DateManager, DaySpan
 
 if TYPE_CHECKING:
-    from matplotlib.axes import Axes
     from numpy.typing import DTypeLike, NDArray
 
     from faninsar import Loop, Loops, TripletLoops
     from faninsar._core.sar.sar_tools import Baselines
+    from faninsar.plots.results import BaselinePlotResult
     from faninsar.typing import PairLike, PairsLike, PairsOrder
 
 logger = setup_logger(__name__)
@@ -810,7 +810,7 @@ class Pairs:
         """Return the pairs as a xarray DataArray."""
         return xr.Variable(dims=["pairs", "primary-secondary"], data=self._values)
 
-    def to_triplet_loops(self) -> TripletLoops:
+    def build_triplet_loops(self) -> TripletLoops:
         """Return all possible triplet loops from the pairs."""
         from faninsar import TripletLoops
 
@@ -821,7 +821,7 @@ class Pairs:
                     loops.append([pair12[0], pair12[1], pair23[1]])  # noqa: PERF401
         return TripletLoops(loops)
 
-    def to_loops(
+    def build_loops(
         self,
         max_acquisition: int = 5,
         max_days: int | None = None,
@@ -837,7 +837,7 @@ class Pairs:
 
             **Example**:
 
-            >>> loops = pairs.to_loops()
+            >>> loops = pairs.build_loops()
             >>> mask = pairs.where(loops.pairs, return_type="mask")
 
         Parameters
@@ -900,7 +900,7 @@ class Pairs:
 
         return Loops(loops)
 
-    def to_matrix(self, dtype: DTypeLike = None) -> NDArray[np.number]:
+    def sbas_matrix(self, dtype: DTypeLike = None) -> NDArray[np.number]:
         """Return the SBAS matrix.
 
         Parameters
@@ -925,13 +925,10 @@ class Pairs:
         return matrix
 
     def parse_gaps(self, pairs_removed: Pairs | None = None) -> np.ndarray:
-        """Parse network gaps where the acquisitions are not connected by pairs.
-
-        The gaps are detected by the dates that are not present in the secondary
-        acquisition of the pairs.
+        """Parse network gaps where the acquisitions are not covered by any pairs.
 
         .. note::
-            Theoretically, the gaps should be the temporal spans  (or intervals)
+            Theoretically, gaps should be represented as temporal spans/intervals
             between the consecutive acquisitions. For simplicity, the end dates
             of the gaps are returned here.
 
@@ -956,22 +953,44 @@ class Pairs:
         if len(pairs_valid) == 0:
             return dates.to_numpy(dtype="datetime64[D]")
 
-        dates_secondary = np.unique(pairs_valid.secondary)
-        return np.setdiff1d(dates, dates_secondary)
+        matrix = pairs_valid.sbas_matrix()
+        interval_coverage = matrix.sum(axis=0)
+        gap_indices = np.where(interval_coverage == 0)[0]
+
+        if len(gap_indices) == 0:
+            return np.array([], dtype="datetime64[D]")
+        
+        return self.dates[gap_indices + 1].to_numpy(dtype="datetime64[D]")
 
     def plot(
         self,
         baseline: Baselines | None = None,
-        ax: Axes | None = None,
         **kwargs,
-    ) -> Axes:
-        """Plot the pairs."""
+    ) -> BaselinePlotResult:
+        """Plot the pairs.
+
+        Parameters
+        ----------
+        baseline: Baselines, optional
+            Baselines object to plot. If None, a random baseline will be generated.
+            Default is None.
+        kwargs: dict, optional
+            Keyword arguments passed to :meth:`Baselines.plot()`.
+
+        Returns
+        -------
+        result: BaselinePlotResult
+            The result of the baseline plot.
+
+        """
         if baseline is None:
             from faninsar._core.sar.sar_tools import Baselines
 
-            vals = np.random.randn(len(self)) * 1000  # noqa: NPY002
-            baseline = Baselines.from_pair_wise(self, vals)
-        return baseline.plot(self, ax=ax, **kwargs)
+            rng = np.random.default_rng()
+            vals = rng.standard_normal(len(self.dates)) * 1000
+            val_pairs = vals[self.edge_index[:, 1]] - vals[self.edge_index[:, 0]]
+            baseline = Baselines.from_pair_wise(self, val_pairs)
+        return baseline.plot(self, **kwargs)
 
 
 class PairsFactory:

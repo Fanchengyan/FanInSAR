@@ -148,8 +148,8 @@ class TestPairs:
         assert isinstance(frame, pd.DataFrame)
         assert frame.shape == (5, 3)
 
-    def test_to_matrix(self, sample_pairs):
-        matrix = sample_pairs.to_matrix()
+    def test_sbas_matrix(self, sample_pairs):
+        matrix = sample_pairs.sbas_matrix()
         assert isinstance(matrix, np.ndarray)
         assert matrix.shape == (5, len(sample_pairs.dates) - 1)
 
