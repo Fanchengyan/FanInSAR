@@ -230,7 +230,7 @@ class Baselines:
         gaps = pairs.parse_gaps(pairs_removed)
         if len(gaps) == 0:
             return None
-        
+
         dates_valid = np.setdiff1d(pairs.dates.data, gaps)
         vals = self.series[dates_valid]
         margin = vals.std() / 3
@@ -310,6 +310,7 @@ class Baselines:
         cmap: str | None = None,
         plot_gaps: bool = True,
         legend: bool = True,
+        figsize: tuple[float, float] = (10, 4),
     ) -> BaselinePlotResult:
         """Plot the baselines of the interferograms.
 
@@ -328,6 +329,8 @@ class Baselines:
             Whether to plot the gaps between acquisitions. Default is True.
         legend : bool
             Whether to show the legend. Default is True.
+        figsize : tuple[float, float], optional
+            Figure size if a new figure is created. Default is (10, 4).
 
         Returns
         -------
@@ -368,7 +371,7 @@ class Baselines:
 
         """
         if ax is None:
-            ax = plt.gca()
+            _, ax = plt.subplots(figsize=figsize)
 
         # Compute valid pairs
         pairs_valid = pairs if pairs_removed is None else pairs - pairs_removed

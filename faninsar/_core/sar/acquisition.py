@@ -24,6 +24,7 @@ from faninsar.logging import setup_logger
 if TYPE_CHECKING:
     from collections.abc import Hashable
 
+    from matplotlib.axes import Axes
     from pandas._typing import ArrayLike
 
 logger = setup_logger(__name__)
@@ -248,10 +249,10 @@ class DaySpan(pd.Index):
 
     def plot(
         self,
-        ax: "plt.Axes | None" = None,
+        ax: Axes | None = None,
         figsize: tuple[float, float] = (10, 4),
         **kwargs,
-    ) -> "plt.Axes":
+    ) -> Axes:
         """Plot the count of each unique day span value.
 
         Parameters
