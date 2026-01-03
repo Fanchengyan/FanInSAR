@@ -986,7 +986,7 @@ class Pairs:
         if baseline is None:
             from faninsar._core.sar.sar_tools import Baselines
 
-            rng = np.random.default_rng()
+            rng = np.random.default_rng(seed=1)
             vals = rng.standard_normal(len(self.dates)) * 1000
             val_pairs = vals[self.edge_index[:, 1]] - vals[self.edge_index[:, 0]]
             baseline = Baselines.from_pair_wise(self, val_pairs)
