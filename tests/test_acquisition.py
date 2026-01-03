@@ -32,6 +32,46 @@ class TestAcquisition:
         assert stats["unique"] == 10
         assert stats["total"] == 10
 
+    def test_plot(self):
+        """Test the plot method."""
+        import matplotlib.pyplot as plt
+
+        # Create acquisition with duplicate dates to test counting
+        dates = ["2023-01-01", "2023-01-01", "2023-01-12", "2023-01-12", "2023-01-24"]
+        acquisition = Acquisition(dates)
+
+        # Test basic plot creation
+        ax = acquisition.plot()
+        assert ax is not None
+        assert isinstance(ax, plt.Axes)
+
+        # Verify the number of bars matches unique dates
+        bars = ax.patches
+        assert len(bars) == 3  # Three unique dates
+
+        # Verify bar heights (counts)
+        bar_heights = [bar.get_height() for bar in bars]
+        assert bar_heights == [2, 2, 1]  # Counts for each unique date
+
+        # Verify axis labels
+        assert ax.get_xlabel() == "Acquisition Date"
+        assert ax.get_ylabel() == "Count"
+        assert ax.get_title() == "Acquisition Count per Date"
+
+        plt.close()
+
+    def test_plot_with_custom_ax(self):
+        """Test the plot method with custom Axes."""
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots()
+        result_ax = self.acquisition.plot(ax=ax)
+
+        # Verify it returns the same axes
+        assert result_ax is ax
+
+        plt.close()
+
 class TestCreateDaysSpanIndex:
     """Test the creation of DaySpan with different type inputs."""
 

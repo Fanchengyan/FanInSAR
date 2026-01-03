@@ -69,6 +69,61 @@ class Acquisition(pd.DatetimeIndex):
         """Return the internal data of the index."""
         return self._data
 
+    def plot(
+        self,
+        ax: "plt.Axes | None" = None,
+        figsize: tuple[float, float] = (10, 4),
+        **kwargs,
+    ) -> "plt.Axes":
+        """Plot the count of each unique acquisition date.
+
+        Parameters
+        ----------
+        ax : plt.Axes | None, optional
+            Matplotlib Axes to plot on. If None, a new figure and axes
+            will be created. Default is None.
+        figsize : tuple[float, float], optional
+            Figure size (width, height) in inches. Only used when `ax`
+            is None. Default is (10, 4).
+        **kwargs
+            Additional keyword arguments passed to :meth:`plt.bar`.
+
+        Returns
+        -------
+        plt.Axes
+            The Axes object with the plot.
+
+        Examples
+        --------
+        >>> acq = Acquisition(["2020-01-01", "2020-01-01", "2020-01-12", "2020-01-24"])
+        >>> ax = acq.plot()
+
+        """
+        import matplotlib.pyplot as plt
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=figsize)
+
+        # Count occurrences of each unique date
+        unique_dates, counts = np.unique(self, return_counts=True)
+
+        # Set default bar kwargs
+        bar_kwargs = {"width": 0.8, "edgecolor": "black", "linewidth": 0.5}
+        bar_kwargs.update(kwargs)
+
+        ax.bar(range(len(unique_dates)), counts, **bar_kwargs)
+        ax.set_xticks(range(len(unique_dates)))
+        # ax.set_xticklabels(
+        #     [pd.Timestamp(d).strftime("%Y-%m-%d") for d in unique_dates],
+        #     rotation=45,
+        #     ha="right",
+        # )
+        ax.set_xlabel("Acquisition Date")
+        ax.set_ylabel("Count")
+        ax.set_title("Acquisition Count per Date")
+
+        return ax
+
 
 class DaySpan(pd.Index):
     """A class to handle day span between SAR acquisitions in FanInSAR.
