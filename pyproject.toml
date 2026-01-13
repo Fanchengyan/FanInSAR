@@ -54,6 +54,7 @@ dependencies = [
   "xarray",
   "psutil",
   "rioxarray",
+  "odc-geo",
   "netcdf4",
   "h5netcdf",
   "tqdm",
@@ -95,7 +96,9 @@ docs = [
   "myst-sphinx-gallery",
 ]
 
-dev = ["FanInSAR", "FanInSAR[docs]", "FanInSAR[test]", "FanInSAR[code_style]"]
+dev = [
+  "FanInSAR[code_style, test, docs]",
+]
 
 [tool.setuptools]
 include-package-data = true
