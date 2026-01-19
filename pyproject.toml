@@ -62,7 +62,11 @@ dependencies = [
   "dominate",
   "typing_extensions",
   "colorlog",
-  "dask[array]",
+  "dask[array,distributed]>=2023.1",
+  "odc-geo",
+  "scipy>=1.10",
+  "zarr>=3.0",
+  "lxml>=4.9",
 ]
 
 
@@ -70,6 +74,7 @@ dependencies = [
 
 code_style = ["pre-commit", "ruff"]
 test = [
+  "FanInSAR",
   "coverage",
   "pytest",
   "pytest-cov",
@@ -78,6 +83,7 @@ test = [
 
 ]
 docs = [
+  "FanInSAR",
   "recommonmark",
   "sphinx>=7",
   "myst-nb",
@@ -89,40 +95,7 @@ docs = [
   "myst-sphinx-gallery",
 ]
 
-dev = [
-  "geopandas",
-  "pandas",
-  "numpy",
-  "torch",
-  "matplotlib",
-  "data_downloader",
-  "rasterio >= 1.0.26",
-  "xarray",
-  "psutil",
-  "rioxarray",
-  "netcdf4",
-  "h5netcdf",
-  "tqdm",
-  "rtree",
-  "pykml",
-  "dominate",
-  "typing_extensions",
-  "colorlog",
-  "pre-commit",
-  "ruff",
-  "coverage",
-  "pytest",
-  "pytest-cov",
-  "recommonmark",
-  "sphinx>=7",
-  "myst-nb",
-  "sphinx-copybutton",
-  "sphinx-design",
-  "pydata_sphinx_theme",
-  "sphinx-togglebutton",
-  "Jinja2",
-  "myst-sphinx-gallery",
-]
+dev = ["FanInSAR", "FanInSAR[docs]", "FanInSAR[test]", "FanInSAR[code_style]"]
 
 [tool.setuptools]
 include-package-data = true
