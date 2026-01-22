@@ -58,7 +58,8 @@ class TestBaselinesPlot:
 
         # Check if colorbar was created
         # The colorbar is attached to the figure
-        assert len(fig.axes) == 2  # ax + colorbar ax
+        # HistColorbar adds multiple axes (container, cbar, hist), so count > 2
+        assert len(fig.axes) > 2
         plt.close(fig)
 
     def test_plot_with_custom_cmap(self, sample_baselines, sample_pairs):

@@ -9,7 +9,7 @@ https://github.com/raphaelquast/EOmaps
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any
 
 import matplotlib as mpl
 import matplotlib.colorbar as cbar
@@ -36,6 +36,8 @@ from faninsar.logging import setup_logger
 logger = setup_logger(__name__)
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from matplotlib.axes import Axes
     from matplotlib.cm import ScalarMappable
     from matplotlib.figure import Figure, SubFigure
@@ -492,9 +494,9 @@ class HistColorbar:
         self.ax_cbar, self.ax_hist = self._create_hist_and_cbar_axes(cax)
 
         # Draw colorbar and histogram
-        self._draw_colorbar(
-            **{k: v for k, v in kwargs.items() if k not in NON_COLORBAR_KEYS}
-        )
+        self._draw_colorbar(**{
+            k: v for k, v in kwargs.items() if k not in NON_COLORBAR_KEYS
+        })
         self._draw_histogram()
 
         # Apply customizations

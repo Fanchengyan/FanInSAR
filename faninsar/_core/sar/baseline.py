@@ -1,18 +1,26 @@
-
 from __future__ import annotations
 
-import numpy as np
-
-from typing import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.lines import Line2D
+
+from faninsar.plots.utils import create_discrete_colormap
+
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from datetime import datetime
+
     from matplotlib.axes import Axes
-    from matplotlib.collections import LineCollection, PathCollection
-    from matplotlib.colorbar import Colorbar
+    from matplotlib.collections import Collection, LineCollection, PathCollection
     from matplotlib.figure import Figure, SubFigure
-    from matplotlib.lines import Line2D
+    from matplotlib.legend import Legend
+
+    from faninsar._core.sar.pairs import Pairs
+    from faninsar.plots.hist_colorbar import HistColorbar
 
 
 class Baselines:
@@ -124,12 +132,10 @@ class Baselines:
 
     def _create_pairs_collection(
         self, pairs: Pairs, cmap: str | None, ax: Axes
-    ) -> tuple[LineCollection, Colorbar | None]:
+    ) -> tuple[LineCollection, HistColorbar | None]:
         """Create LineCollection for pairs and optional colorbar."""
         from matplotlib.collections import LineCollection
         from matplotlib.dates import date2num
-
-        from faninsar.plots.utils import create_discrete_colormap
 
         # Create line segments for pairs
         pair_segments = [
@@ -151,8 +157,14 @@ class Baselines:
             lc.set_array(days_array)
             pairs_collection = ax.add_collection(lc)
 
-            colorbar = plt.colorbar(
-                lc, ax=ax, label="Temporal baseline (days)", ticks=unique_days
+            from faninsar.plots.hist_colorbar import HistColorbar
+
+            colorbar = HistColorbar(
+                data=days_array,
+                mappable=lc,
+                ax=ax,
+                label="Temporal baseline (days)",
+                ticks=unique_days,
             )
         else:
             lc = LineCollection(pair_segments, colors="tab:blue", linestyles="-")
@@ -303,7 +315,8 @@ class Baselines:
         Or using chain:
 
         >>> result = (
-        ...     baselines.plot(pairs, cmap="plasma")
+        ...     baselines
+        ...     .plot(pairs, cmap="plasma")
         ...     .set_pairs_style(linewidths=2, alpha=0.8)
         ...     .set_acq_style(markersize=10, color="red")
         ...     .set_legend_labels(pairs="Valid", acquisitions="Acq")
@@ -381,7 +394,6 @@ class Baselines:
         )
 
 
-
 @dataclass
 class BaselinePlotResult:
     """Result object from Baselines.plot() containing all plot elements.
@@ -402,7 +414,7 @@ class BaselinePlotResult:
         The PathCollection object for acquisition points.
     gaps_lines : LineCollection | None
         The LineCollection for gap vertical lines.
-    colorbar : Colorbar | None
+    colorbar : HistColorbar | None
         The colorbar object (if cmap was used).
 
     Examples
@@ -438,7 +450,7 @@ class BaselinePlotResult:
     pairs_removed_lines: list[Line2D] = field(default_factory=list)
     acq_collection: PathCollection | None = None
     gaps_lines: object | None = None
-    colorbar: Colorbar | None = None
+    colorbar: HistColorbar | None = None
     _legend_order: list[str] = field(default_factory=list)
 
     @property

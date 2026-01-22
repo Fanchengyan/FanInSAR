@@ -2,26 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-from matplotlib.lines import Line2D
-
 
 from .sar_property import Frequency, FrequencyUnit, Wavelength, WavelengthUnit
 
 if TYPE_CHECKING:
-    from datetime import datetime
-
-    from matplotlib.axes import Axes
-    from matplotlib.collections import Collection, LineCollection, PathCollection
-    from matplotlib.colorbar import Colorbar
-    from matplotlib.legend import Legend
     from numpy.typing import NDArray
-
-    from .pairs import Pairs
 
 
 def multi_look(
