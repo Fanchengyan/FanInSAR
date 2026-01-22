@@ -63,7 +63,6 @@ dependencies = [
   "typing_extensions",
   "colorlog",
   "dask[array,distributed]>=2023.1",
-  "odc-geo",
   "scipy>=1.10",
   "zarr>=3.0",
   "lxml>=4.9",
@@ -95,9 +94,7 @@ docs = [
   "myst-sphinx-gallery",
 ]
 
-dev = [
-  "FanInSAR[code_style, test, docs]",
-]
+dev = ["FanInSAR[code_style, test, docs]"]
 
 [tool.setuptools]
 include-package-data = true
