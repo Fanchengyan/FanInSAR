@@ -12,14 +12,13 @@ authors = [{ name = "Chengyan Fan (Fancy)", email = 'fanchengyan@outlook.com' }]
 urls.Documentation = "https://faninsar.readthedocs.io/en/latest/"
 urls.Source = "https://github.com/Fanchengyan/FanInSAR"
 
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 classifiers = [
   "Development Status :: 4 - Beta",
   "Framework :: InSAR",
   "Intended Audience :: Science/Research",
   "Programming Language :: Python",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.8",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
