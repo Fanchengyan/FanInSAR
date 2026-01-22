@@ -5,8 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from faninsar._core.sar.pairs import Pairs
-from faninsar._core.sar.sar_tools import Baselines
+from faninsar._core.sar import Baselines, Pairs
 
 
 class TestBaselinesPlot:

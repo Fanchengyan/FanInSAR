@@ -24,8 +24,8 @@ if TYPE_CHECKING:
 
     from rasterio.crs import CRS
 
-    from faninsar._core.sar.pairs import Pairs
-    from faninsar._core.sar.sar_tools import Baselines, PhaseDeformationConverter
+    from faninsar._core.sar import Baselines, Pairs
+    from faninsar._core.sar.sar_tools import PhaseDeformationConverter
 
 logger = setup_logger(__name__)
 

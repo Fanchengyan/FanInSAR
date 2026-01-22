@@ -21,8 +21,7 @@ if TYPE_CHECKING:
     from numpy.typing import DTypeLike, NDArray
 
     from faninsar import Loop, Loops, TripletLoops
-    from faninsar._core.sar.sar_tools import Baselines
-    from faninsar.plots.results import BaselinePlotResult
+    from .baseline import Baselines, BaselinePlotResult
     from faninsar.typing import PairLike, PairsLike, PairsOrder
 
 logger = setup_logger(__name__)
@@ -990,7 +989,7 @@ class Pairs:
 
         """  # noqa: E501
         if baseline is None:
-            from faninsar._core.sar.sar_tools import Baselines
+            from .baseline import Baselines, BaselinePlotResult
 
             rng = np.random.default_rng(seed=seed)
             vals = rng.standard_normal(len(self.dates)) * 1000

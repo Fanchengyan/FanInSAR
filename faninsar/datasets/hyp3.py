@@ -8,9 +8,8 @@ from typing import TYPE_CHECKING, Iterable
 import numpy as np
 
 from faninsar._core.file_tools import load_meta
-from faninsar._core.sar.pairs import Pairs
+from faninsar._core.sar import Baselines, Pairs
 from faninsar._core.sar.sar_missions import Sentinel1
-from faninsar._core.sar.sar_tools import Baselines
 from faninsar.datasets.ifg import InterferogramDataset
 
 if TYPE_CHECKING:
