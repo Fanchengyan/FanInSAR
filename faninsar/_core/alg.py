@@ -6,6 +6,58 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from faninsar.logging import setup_logger
+
+logger = setup_logger(__name__)
+
+
+def split_group(
+    total: int,
+    *,
+    group_size: int | None = None,
+    group_num: int | None = None,
+) -> np.ndarray:
+    """Split `total` into groups of size `group_size` or number of groups `group_num`.
+
+    Parameters
+    ----------
+    total : int
+        Total number of items to split.
+    group_size : int, optional
+        Size of each group. Must be specified if :param:`group_num` is not
+        specified.
+    group_num : int, optional
+        Number of groups. Must be specified if :param:`group_size` is not
+        specified.
+
+    Returns
+    -------
+    groups : np.ndarray
+        Array of group indices for each item.
+
+    Raises
+    ------
+    ValueError
+        If neither :param:`group_size` nor :param:`group_num` is specified.
+
+    Examples
+    --------
+    >>> split_group(10, group_size=3)
+    array([0., 0., 0., 1., 1., 1., 2., 2., 2., 3.])
+
+    >>> split_group(10, group_num=3)
+    array([0, 0, 0, 0, 1, 1, 1, 1, 2, 2])
+
+    """
+    if group_size is None:
+        if group_num is None:
+            msg = "Must specify either group_size or group_num"
+            logger.error(msg)
+            raise ValueError(msg)
+        # use floor to automatically balance the group size
+        return np.arange(total) * group_num // total
+    return np.arange(total) // group_size
+
 
 @overload
 def gradient_magnitude(

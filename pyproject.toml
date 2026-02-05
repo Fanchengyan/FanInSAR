@@ -46,6 +46,7 @@ dependencies = [
   "geopandas",
   "pandas",
   "numpy",
+  "pint>=0.20",
   "torch",
   "matplotlib",
   "data_downloader",
