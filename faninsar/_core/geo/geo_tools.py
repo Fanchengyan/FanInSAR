@@ -26,7 +26,7 @@ from tqdm import tqdm
 from faninsar.logging import setup_logger
 from faninsar.query.bbox import BoundingBox
 
-from .file_tools import load_metas
+from ..file_tools import load_metas
 
 if TYPE_CHECKING:
     from os import PathLike

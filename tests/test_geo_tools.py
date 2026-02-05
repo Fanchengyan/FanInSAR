@@ -6,7 +6,7 @@ import rasterio
 from rasterio import Affine
 from rasterio.profiles import Profile as RasterioProfile
 
-from faninsar._core.geo_tools import Profile
+from faninsar._core.geo.geo_tools import Profile
 
 profile = Profile(200, 300, Affine(*list(range(6))))
 
