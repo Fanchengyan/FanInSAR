@@ -772,7 +772,7 @@ class RasterDataset(GeoDataset):
     ) -> np.ndarray:
         """Return the values of the dataset at the given points."""
         data_ls = []
-        for vrt_fh in tqdm(vrt_fhs, desc="Query points", unit=" files"):
+        for vrt_fh in tqdm(vrt_fhs, desc="Querying points", unit=" files"):
             data = self._file_query_points(points, vrt_fh)
             data_ls.append(data)
         return np.ma.asarray(data_ls)
@@ -782,7 +782,7 @@ class RasterDataset(GeoDataset):
     ) -> np.ndarray:
         """Return the values of the dataset at the given bounding box."""
         data_ls = []
-        for vrt_fh in tqdm(vrt_fhs, desc="Query bbox", unit=" files"):
+        for vrt_fh in tqdm(vrt_fhs, desc="Querying bounding box", unit=" files"):
             data = self._file_query_bbox(bbox, vrt_fh)
             data_ls.append(data)
         return np.ma.asarray(data_ls)
@@ -795,7 +795,7 @@ class RasterDataset(GeoDataset):
         transform_ls = []
         mask_ls = []
 
-        for vrt_fh in tqdm(vrt_fhs, desc="Query polygons", unit=" files"):
+        for vrt_fh in tqdm(vrt_fhs, desc="Querying polygons", unit=" files"):
             data_ls, transform_ls_file, mask_ls_file = self._file_query_polygons(
                 polygons, vrt_fh
             )

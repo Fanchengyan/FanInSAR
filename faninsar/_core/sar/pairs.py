@@ -996,6 +996,9 @@ class Pairs:
             vals = rng.standard_normal(len(self.dates)) * 1000
             val_pairs = vals[self.edge_index[:, 1]] - vals[self.edge_index[:, 0]]
             baseline = Baselines.from_pair_wise(self, val_pairs)
+            return baseline.plot(self, **kwargs).set_ylabel(
+                "Perpendicular baseline (dummy)"
+            )
         return baseline.plot(self, **kwargs)
 
 
