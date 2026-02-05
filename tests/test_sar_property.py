@@ -78,3 +78,35 @@ def test_invalid_frequency_unit():
     f = Frequency(1.0, "GHz")
     with pytest.raises(ValueError):
         f.to_unit("invalid")
+
+
+def test_extended_wavelength_units():
+    """Test extended wavelength units (nm, km, um)."""
+    # Test nanometer conversion
+    w1 = Wavelength(1.0, "nm")
+    assert pytest.approx(w1.to_um().data) == 0.001
+    assert pytest.approx(w1.to_mm().data) == 1e-6
+    assert pytest.approx(w1.to_m().data) == 1e-9
+
+    # Test kilometer conversion
+    w2 = Wavelength(1.0, "km")
+    assert w2.to_m().data == 1000.0
+    assert pytest.approx(w2.to_cm().data) == 100000.0
+
+    # Test micrometer conversion
+    w3 = Wavelength(1000.0, "nm")
+    assert pytest.approx(w3.to_um().data) == 1.0
+    assert pytest.approx(w3.to_mm().data) == 0.001
+
+
+def test_extended_frequency_units():
+    """Test extended frequency units (THz)."""
+    # Test terahertz conversion
+    f1 = Frequency(1.0, "THz")
+    assert pytest.approx(f1.to_GHz().data) == 1000.0
+    assert pytest.approx(f1.to_MHz().data) == 1e6
+    assert pytest.approx(f1.to_Hz().data) == 1e12
+
+    # Test conversion to THz
+    f2 = Frequency(1000.0, "GHz")
+    assert pytest.approx(f2.to_THz().data) == 1.0

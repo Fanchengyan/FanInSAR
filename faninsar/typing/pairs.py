@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
-from typing import Iterable, Literal
+from typing import Literal
 
 from numpy.typing import NDArray
 

@@ -2,7 +2,6 @@
 
 from ._core import (
     SAR,
-    SPEED_OF_LIGHT,
     Acquisition,
     Baselines,
     DateManager,

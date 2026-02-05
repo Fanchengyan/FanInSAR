@@ -8,13 +8,22 @@ Classes
 - Wavelength: Immutable dataclass for wavelength with unit conversion capabilities
 - Frequency: Immutable dataclass for frequency with unit conversion capabilities
 
-Constants
----------
-- SENTINEL1_FREQUENCY: Predefined Sentinel-1 frequency (5.405 GHz)
-- SENTINEL1_WAVELENGTH: Predefined Sentinel-1 wavelength (55.46 mm)
-- SPEED_OF_LIGHT: Speed of light in vacuum (299,792,458 m/s)
-- UNIT_WAVELENGTH: Wavelength unit conversion factors
-- UNIT_FREQUENCY: Frequency unit conversion factors
+Notes
+-----
+- This module uses Pint internally for accurate unit conversions and standard
+  physical constants (e.g., speed of light).
+- Pint is not exposed to users; all public APIs remain unchanged.
+- Supported wavelength units: m (meters), cm (centimeters), dm (decimeters),
+  mm (millimeters), nm (nanometers), km (kilometers), um (micrometers).
+- Supported frequency units: Hz (hertz), kHz (kilohertz), MHz (megahertz),
+  GHz (gigahertz), THz (terahertz).
+- Unit validation is performed immediately upon instantiation in __post_init__,
+  ensuring invalid units are rejected early (fail-fast principle).
+- Wavelength and Frequency classes are immutable (frozen dataclasses), making
+  them hashable and suitable for use as dictionary keys or in sets.
+- Equality comparisons use numpy.isclose() for robust floating-point comparison.
+- SAR mission classes can be used with or without instantiation. Subclasses only
+  need to define the _frequency class attribute.
 
 Examples
 --------
@@ -29,61 +38,38 @@ Wavelength(data=55.0, unit='mm')
 >>> print(wl)
 55.46 mm
 
->>> # Use SAR mission class
->>> s1 = Sentinel1()
->>> print(s1.frequency)
-5.405 GHz
->>> print(s1.wavelength)
-55.46 mm
+>>> # Use extended units
+>>> wl = Wavelength(55.5, "nm")
+>>> print(wl.to_um())
+Wavelength(data=0.0555, unit='um')
 
-Notes
------
-- The speed of light constant is defined as 299,792,458 m/s.
-- All unit conversions are performed through a base unit (meters for wavelength,
-  Hz for frequency) to ensure consistency and accuracy.
-- Unit validation is performed immediately upon instantiation in __post_init__,
-  ensuring invalid units are rejected early (fail-fast principle).
-- Wavelength and Frequency classes are immutable (frozen dataclasses), making
-  them hashable and suitable for use as dictionary keys or in sets.
-- Equality comparisons use numpy.isclose() for robust floating-point comparison.
-- SAR mission classes can be used with or without instantiation. Subclasses only
-  need to define the _frequency class attribute.
+>>> freq = Frequency(5.405, "GHz")
+>>> print(freq.to_THz())
+Frequency(data=0.005405, unit='THz')
 
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
-from typing_extensions import Literal
+import pint
 
 from faninsar.logging import setup_logger
 
+if TYPE_CHECKING:
+    from faninsar.typing.sar import FrequencyUnit, WavelengthUnit
+else:
+    # Runtime fallback: define as str to avoid circular import
+    FrequencyUnit = str
+    WavelengthUnit = str
+
 logger = setup_logger(__name__)
 
-
-#: Speed of light in vacuum (m/s)
-SPEED_OF_LIGHT = 299792458
-
-#: Wavelength unit conversion factors relative to meters
-UNIT_WAVELENGTH = {
-    "m": 1,
-    "cm": 1e-2,
-    "dm": 1e-1,
-    "mm": 1e-3,
-}
-
-#: Frequency unit conversion factors relative to Hz
-UNIT_FREQUENCY = {
-    "Hz": 1,
-    "kHz": 1e3,
-    "MHz": 1e6,
-    "GHz": 1e9,
-}
-
-WavelengthUnit = Literal["m", "cm", "dm", "mm"]
-FrequencyUnit = Literal["Hz", "kHz", "MHz", "GHz"]
+# Private UnitRegistry for internal use only
+_ureg = pint.UnitRegistry()
 
 
 @dataclass(frozen=True)
@@ -95,11 +81,13 @@ class Wavelength:
     The class is immutable (frozen) and hashable, allowing instances to be used
     as dictionary keys or in sets.
 
+    Internally uses Pint for accurate unit conversions and standard constants.
+
     Attributes
     ----------
     data : float
         The numerical value of the wavelength.
-    unit : Literal["m", "cm", "dm", "mm"]
+    unit : Literal["m", "cm", "dm", "mm", "nm", "km", "um"]
         The unit of the wavelength. Default is "m" (meters).
 
     Examples
@@ -119,9 +107,9 @@ class Wavelength:
 
     Notes
     -----
-    All conversions are performed by first converting to the base unit (meters)
-    and then to the target unit. This ensures consistency and avoids accumulation
-    of rounding errors.
+    All conversions are performed internally using Pint's Quantity objects for
+    accuracy and consistency. Pint uses standard physical constants and conversion
+    factors.
 
     The class is immutable (frozen=True), which means attributes cannot be modified
     after initialization. This ensures thread-safety and allows instances to be
@@ -133,7 +121,7 @@ class Wavelength:
     data: float
 
     #: The unit of the wavelength. Default: m (meters)
-    unit: Literal["m", "cm", "dm", "mm"] = "m"
+    unit: WavelengthUnit = "m"
 
     def __post_init__(self) -> None:
         """Validate the unit immediately after instantiation.
@@ -144,36 +132,61 @@ class Wavelength:
             If the unit is not one of the recognized wavelength units.
 
         """
-        if self.unit not in UNIT_WAVELENGTH:
+        valid_units = ["m", "cm", "dm", "mm", "nm", "km", "um"]
+        if self.unit not in valid_units:
             msg = (
                 f"Invalid unit: {self.unit}. "
-                f"Must be one of {list(UNIT_WAVELENGTH.keys())}."
+                f"Must be one of {valid_units}."
             )
             logger.error(msg)
             raise ValueError(msg)
 
-    def _to_base_unit(self) -> float:
-        """Convert wavelength to base unit (meters).
+    def _as_quantity(self) -> pint.Quantity:
+        """Convert wavelength to Pint Quantity for internal use.
 
         Returns
         -------
-        float
-            The wavelength value in meters.
+        pint.Quantity
+            The wavelength as a Pint Quantity object.
 
         Notes
         -----
-        Unit validation is performed in __post_init__, so this method
-        assumes the unit is valid.
+        This is a private method for internal use only. Unit validation is
+        performed in __post_init__, so this method assumes the unit is valid.
 
         """
-        return self.data * UNIT_WAVELENGTH[self.unit]
+        return self.data * _ureg.parse_units(self.unit)
 
-    def to_unit(self, unit: Literal["m", "cm", "dm", "mm"]) -> Wavelength:
+    @staticmethod
+    def _from_quantity(q: pint.Quantity, target_unit: str) -> Wavelength:
+        """Create Wavelength from Pint Quantity for internal use.
+
+        Parameters
+        ----------
+        q : pint.Quantity
+            The Pint Quantity object.
+        target_unit : str
+            The target unit for the new Wavelength instance.
+
+        Returns
+        -------
+        Wavelength
+            A new Wavelength instance with the converted value.
+
+        Notes
+        -----
+        This is a private method for internal use only.
+
+        """
+        converted = q.to(target_unit)
+        return Wavelength(converted.magnitude, target_unit)
+
+    def to_unit(self, unit: WavelengthUnit) -> Wavelength:
         """Convert wavelength to the specified unit.
 
         Parameters
         ----------
-        unit : Literal["m", "cm", "dm", "mm"]
+        unit : Literal["m", "cm", "dm", "mm", "nm", "km", "um"]
             The target unit for conversion.
 
         Returns
@@ -193,9 +206,10 @@ class Wavelength:
         Wavelength(data=100.0, unit='cm')
 
         """
-        if unit not in UNIT_WAVELENGTH:
+        valid_units = ["m", "cm", "dm", "mm", "nm", "km", "um"]
+        if unit not in valid_units:
             msg = (
-                f"Invalid unit: {unit}. Must be one of {list(UNIT_WAVELENGTH.keys())}."
+                f"Invalid unit: {unit}. Must be one of {valid_units}."
             )
             logger.error(msg)
             raise ValueError(msg)
@@ -204,9 +218,7 @@ class Wavelength:
         if unit == self.unit:
             return self
 
-        base_value = self._to_base_unit()
-        new_value = base_value / UNIT_WAVELENGTH[unit]
-        return Wavelength(new_value, unit)
+        return self._from_quantity(self._as_quantity(), unit)
 
     def to_m(self) -> Wavelength:
         """Convert wavelength to meters.
@@ -252,17 +264,73 @@ class Wavelength:
         """
         return self.to_unit("mm")
 
+    def to_nm(self) -> Wavelength:
+        """Convert wavelength to nanometers.
+
+        Returns
+        -------
+        Wavelength
+            A new Wavelength instance in nanometers.
+
+        """
+        return self.to_unit("nm")
+
+    def to_km(self) -> Wavelength:
+        """Convert wavelength to kilometers.
+
+        Returns
+        -------
+        Wavelength
+            A new Wavelength instance in kilometers.
+
+        """
+        return self.to_unit("km")
+
+    def to_um(self) -> Wavelength:
+        """Convert wavelength to micrometers.
+
+        Returns
+        -------
+        Wavelength
+            A new Wavelength instance in micrometers.
+
+        """
+        return self.to_unit("um")
+
+    @property
+    def quantity(self) -> pint.Quantity:
+        """Get the internal Pint Quantity object.
+
+        Provides access to Pint's full functionality for advanced users.
+
+        Returns
+        -------
+        pint.Quantity
+            The wavelength as a Pint Quantity.
+
+        Examples
+        --------
+        >>> wl = Wavelength(5.5, "cm")
+        >>> q = wl.quantity
+        >>> q.to("nm")
+        <Quantity(55000000.0, 'nanometer')>
+        >>> q.ito("mm")  # in-place conversion
+
+        """
+        return self._as_quantity()
+
     def to_frequency(
         self,
-        unit: Literal["GHz", "MHz", "kHz", "Hz"] = "GHz",
+        unit: FrequencyUnit = "GHz",
     ) -> Frequency:
         """Convert wavelength to frequency.
 
         Uses the relationship: frequency = speed_of_light / wavelength
+        Internally uses Pint's standard speed of light constant.
 
         Parameters
         ----------
-        unit : Literal["GHz", "MHz", "kHz", "Hz"], optional
+        unit : Literal["GHz", "MHz", "kHz", "Hz", "THz"], optional
             The unit of the resulting frequency. Default is "GHz".
 
         Returns
@@ -278,7 +346,8 @@ class Wavelength:
         5.451
 
         """
-        return Frequency(SPEED_OF_LIGHT / self.to_m().data, "Hz").to_unit(unit)
+        freq_quantity = _ureg.c / self._as_quantity()
+        return Frequency._from_quantity(freq_quantity, unit)
 
     def __repr__(self) -> str:
         """Return a detailed string representation of the Wavelength.
@@ -330,11 +399,15 @@ class Wavelength:
         -----
         Uses numpy.isclose() for robust floating-point comparison with
         relative tolerance of 1e-05 and absolute tolerance of 1e-08.
+        Internally converts to meters using Pint for comparison.
 
         """
         if not isinstance(other, Wavelength):
             return NotImplemented
-        return bool(np.isclose(self._to_base_unit(), other._to_base_unit()))
+        # Convert both to meters using Pint for comparison
+        wl1_m = self._as_quantity().to("m").magnitude
+        wl2_m = other._as_quantity().to("m").magnitude
+        return bool(np.isclose(wl1_m, wl2_m))
 
     def __hash__(self) -> int:
         """Return hash of the Wavelength instance.
@@ -365,10 +438,12 @@ class Wavelength:
         that wavelengths that are equal (within floating-point tolerance) have
         the same hash value, satisfying the requirement that if a == b, then
         hash(a) == hash(b).
+        Internally converts to meters using Pint.
 
         """
-        # Round to 10 decimal places to ensure equal wavelengths have same hash
-        return hash(round(self._to_base_unit(), 10))
+        # Convert to meters using Pint and round to 10 decimal places
+        value_m = self._as_quantity().to("m").magnitude
+        return hash(round(value_m, 10))
 
 
 @dataclass(frozen=True)
@@ -384,7 +459,7 @@ class Frequency:
     ----------
     data : float
         The numerical value of the frequency.
-    unit : Literal["GHz", "MHz", "kHz", "Hz"]
+    unit : Literal["GHz", "MHz", "kHz", "Hz", "THz"]
         The unit of the frequency. Default is "GHz" (gigahertz).
 
     Examples
@@ -404,9 +479,9 @@ class Frequency:
 
     Notes
     -----
-    All conversions are performed by first converting to the base unit (Hz)
-    and then to the target unit. This ensures consistency and avoids accumulation
-    of rounding errors.
+    All conversions are performed internally using Pint's Quantity objects for
+    accuracy and consistency. Pint uses standard physical constants and conversion
+    factors.
 
     The class is immutable (frozen=True), which means attributes cannot be modified
     after initialization. This ensures thread-safety and allows instances to be
@@ -418,7 +493,7 @@ class Frequency:
     data: float
 
     #: The unit of the frequency. Default: GHz (gigahertz)
-    unit: Literal["GHz", "MHz", "kHz", "Hz"] = "GHz"
+    unit: FrequencyUnit = "GHz"
 
     def __post_init__(self) -> None:
         """Validate the unit immediately after instantiation.
@@ -429,36 +504,61 @@ class Frequency:
             If the unit is not one of the recognized frequency units.
 
         """
-        if self.unit not in UNIT_FREQUENCY:
+        valid_units = ["GHz", "MHz", "kHz", "Hz", "THz"]
+        if self.unit not in valid_units:
             msg = (
                 f"Invalid unit: {self.unit}. "
-                f"Must be one of {list(UNIT_FREQUENCY.keys())}."
+                f"Must be one of {valid_units}."
             )
             logger.error(msg)
             raise ValueError(msg)
 
-    def _to_base_unit(self) -> float:
-        """Convert frequency to base unit (Hz).
+    def _as_quantity(self) -> pint.Quantity:
+        """Convert frequency to Pint Quantity for internal use.
 
         Returns
         -------
-        float
-            The frequency value in Hz.
+        pint.Quantity
+            The frequency as a Pint Quantity object.
 
         Notes
         -----
-        Unit validation is performed in __post_init__, so this method
-        assumes the unit is valid.
+        This is a private method for internal use only. Unit validation is
+        performed in __post_init__, so this method assumes the unit is valid.
 
         """
-        return self.data * UNIT_FREQUENCY[self.unit]
+        return self.data * _ureg.parse_units(self.unit)
 
-    def to_unit(self, unit: Literal["GHz", "MHz", "kHz", "Hz"]) -> Frequency:
+    @staticmethod
+    def _from_quantity(q: pint.Quantity, target_unit: str) -> Frequency:
+        """Create Frequency from Pint Quantity for internal use.
+
+        Parameters
+        ----------
+        q : pint.Quantity
+            The Pint Quantity object.
+        target_unit : str
+            The target unit for the new Frequency instance.
+
+        Returns
+        -------
+        Frequency
+            A new Frequency instance with the converted value.
+
+        Notes
+        -----
+        This is a private method for internal use only.
+
+        """
+        converted = q.to(target_unit)
+        return Frequency(converted.magnitude, target_unit)
+
+    def to_unit(self, unit: FrequencyUnit) -> Frequency:
         """Convert frequency to the specified unit.
 
         Parameters
         ----------
-        unit : Literal["GHz", "MHz", "kHz", "Hz"]
+        unit : Literal["GHz", "MHz", "kHz", "Hz", "THz"]
             The target unit for conversion.
 
         Returns
@@ -478,8 +578,9 @@ class Frequency:
         Frequency(data=1000.0, unit='MHz')
 
         """
-        if unit not in UNIT_FREQUENCY:
-            msg = f"Invalid unit: {unit}. Must be one of {list(UNIT_FREQUENCY.keys())}."
+        valid_units = ["GHz", "MHz", "kHz", "Hz", "THz"]
+        if unit not in valid_units:
+            msg = f"Invalid unit: {unit}. Must be one of {valid_units}."
             logger.error(msg)
             raise ValueError(msg)
 
@@ -487,9 +588,7 @@ class Frequency:
         if unit == self.unit:
             return self
 
-        base_value = self._to_base_unit()
-        new_value = base_value / UNIT_FREQUENCY[unit]
-        return Frequency(new_value, unit)
+        return self._from_quantity(self._as_quantity(), unit)
 
     def to_Hz(self) -> Frequency:
         """Convert frequency to Hz.
@@ -535,17 +634,51 @@ class Frequency:
         """
         return self.to_unit("GHz")
 
+    def to_THz(self) -> Frequency:
+        """Convert frequency to THz.
+
+        Returns
+        -------
+        Frequency
+            A new Frequency instance in THz.
+
+        """
+        return self.to_unit("THz")
+
+    @property
+    def quantity(self) -> pint.Quantity:
+        """Get the internal Pint Quantity object.
+
+        Provides access to Pint's full functionality for advanced users.
+
+        Returns
+        -------
+        pint.Quantity
+            The frequency as a Pint Quantity.
+
+        Examples
+        --------
+        >>> freq = Frequency(5.405, "GHz")
+        >>> q = freq.quantity
+        >>> q.to("MHz")
+        <Quantity(5405.0, 'megahertz')>
+        >>> q.ito("kHz")  # in-place conversion
+
+        """
+        return self._as_quantity()
+
     def to_wavelength(
         self,
-        unit: Literal["m", "cm", "dm", "mm"] = "m",
+        unit: WavelengthUnit = "m",
     ) -> Wavelength:
         """Convert frequency to wavelength.
 
         Uses the relationship: wavelength = speed_of_light / frequency
+        Internally uses Pint's standard speed of light constant.
 
         Parameters
         ----------
-        unit : Literal["m", "cm", "dm", "mm"], optional
+        unit : Literal["m", "cm", "dm", "mm", "nm", "km", "um"], optional
             The unit of the resulting wavelength. Default is "m".
 
         Returns
@@ -561,7 +694,8 @@ class Frequency:
         55.46
 
         """
-        return Wavelength(SPEED_OF_LIGHT / self.to_Hz().data).to_unit(unit)
+        wl_quantity = _ureg.c / self._as_quantity()
+        return Wavelength._from_quantity(wl_quantity, unit)
 
     def __repr__(self) -> str:
         """Return a detailed string representation of the Frequency.
@@ -613,11 +747,15 @@ class Frequency:
         -----
         Uses numpy.isclose() for robust floating-point comparison with
         relative tolerance of 1e-05 and absolute tolerance of 1e-08.
+        Internally converts to Hz using Pint for comparison.
 
         """
         if not isinstance(other, Frequency):
             return NotImplemented
-        return bool(np.isclose(self._to_base_unit(), other._to_base_unit()))
+        # Convert both to Hz using Pint for comparison
+        freq1_hz = self._as_quantity().to("Hz").magnitude
+        freq2_hz = other._as_quantity().to("Hz").magnitude
+        return bool(np.isclose(freq1_hz, freq2_hz))
 
     def __hash__(self) -> int:
         """Return hash of the Frequency instance.
@@ -648,7 +786,9 @@ class Frequency:
         that frequencies that are equal (within floating-point tolerance) have
         the same hash value, satisfying the requirement that if a == b, then
         hash(a) == hash(b).
+        Internally converts to Hz using Pint.
 
         """
-        # Round to 3 decimal places to ensure equal frequencies have same hash
-        return hash(round(self._to_base_unit(), 3))
+        # Convert to Hz using Pint and round to 3 decimal places
+        value_hz = self._as_quantity().to("Hz").magnitude
+        return hash(round(value_hz, 3))

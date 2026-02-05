@@ -100,16 +100,13 @@ class TestWavelength:
         """Test that invalid units are rejected immediately upon instantiation."""
         # Test various invalid units
         with pytest.raises(ValueError, match="Invalid unit"):
-            Wavelength(5.5, "km")  # type: ignore
-
-        with pytest.raises(ValueError, match="Invalid unit"):
             Wavelength(5.5, "inch")  # type: ignore
 
         with pytest.raises(ValueError, match="Invalid unit"):
-            Wavelength(5.5, "nm")  # type: ignore
+            Wavelength(5.5, "feet")  # type: ignore
 
         with pytest.raises(ValueError, match="Invalid unit"):
-            Wavelength(5.5, "um")  # type: ignore
+            Wavelength(5.5, "yard")  # type: ignore
 
     def test_str_representation(self) -> None:
         """Test the __str__ method."""
@@ -219,9 +216,6 @@ class TestFrequency:
     def test_invalid_unit(self) -> None:
         """Test that invalid units are rejected immediately upon instantiation."""
         # Test various invalid units
-        with pytest.raises(ValueError, match="Invalid unit"):
-            Frequency(5.405, "THz")  # type: ignore
-
         with pytest.raises(ValueError, match="Invalid unit"):
             Frequency(5.405, "mHz")  # type: ignore
 

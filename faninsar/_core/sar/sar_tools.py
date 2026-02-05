@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .sar_property import Frequency, FrequencyUnit, Wavelength, WavelengthUnit
+from .sar_property import Frequency, Wavelength
+
+if TYPE_CHECKING:
+    from faninsar.typing import FrequencyUnit, WavelengthUnit
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -57,7 +60,7 @@ def multi_look(
     arr = arr_in[..., : out_rows * azimuth_looks, : out_cols * range_looks]
 
     # Reshape and compute mean
-    new_shape = arr.shape[:-2] + (out_rows, azimuth_looks, out_cols, range_looks)
+    new_shape = (*arr.shape[:-2], out_rows, azimuth_looks, out_cols, range_looks)
     return arr.reshape(new_shape).mean(axis=(-3, -1))
 
 

@@ -16,7 +16,6 @@ from .geo_tools import (
 )
 from .sar import (
     SAR,
-    SPEED_OF_LIGHT,
     Acquisition,
     Baselines,
     DateManager,
