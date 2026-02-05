@@ -9,7 +9,7 @@ https://github.com/raphaelquast/EOmaps
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import matplotlib as mpl
 import matplotlib.colorbar as cbar
@@ -29,7 +29,6 @@ from matplotlib.ticker import (
     ScalarFormatter,
 )
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from typing_extensions import Literal
 
 from faninsar.logging import setup_logger
 
