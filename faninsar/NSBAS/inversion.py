@@ -667,7 +667,8 @@ def calculate_u(
             dtype=dtype,
             device=device,
             tqdm_args={"desc": "  Calculate u"},
-        ).numpy()
+            return_numpy=True,
+        )
     else:
         _Uc = torch.linalg.lstsq(Cc, closure_phase).solution.numpy()  # noqa: N806
 
