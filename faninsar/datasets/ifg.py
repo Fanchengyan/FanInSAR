@@ -12,7 +12,7 @@ import xarray as xr
 from rasterio.enums import Resampling
 from tqdm import tqdm
 
-from faninsar._core import geo_tools
+from faninsar._core.geo import geo_tools
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points
 
