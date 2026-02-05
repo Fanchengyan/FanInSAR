@@ -32,8 +32,8 @@ from rasterio.warp import transform as warp_transform
 from tqdm import tqdm
 from typing_extensions import Self
 
-from faninsar._core import geo_tools
-from faninsar._core.geo_tools import (
+from faninsar._core.geo import geo_tools
+from faninsar._core.geo.geo_tools import (
     Profile,
     array2kml,
     array2kmz,
@@ -772,7 +772,7 @@ class RasterDataset(GeoDataset):
     ) -> np.ndarray:
         """Return the values of the dataset at the given points."""
         data_ls = []
-        for vrt_fh in vrt_fhs:
+        for vrt_fh in tqdm(vrt_fhs, desc="Query points", unit=" files"):
             data = self._file_query_points(points, vrt_fh)
             data_ls.append(data)
         return np.ma.asarray(data_ls)
@@ -782,7 +782,7 @@ class RasterDataset(GeoDataset):
     ) -> np.ndarray:
         """Return the values of the dataset at the given bounding box."""
         data_ls = []
-        for vrt_fh in vrt_fhs:
+        for vrt_fh in tqdm(vrt_fhs, desc="Query bbox", unit=" files"):
             data = self._file_query_bbox(bbox, vrt_fh)
             data_ls.append(data)
         return np.ma.asarray(data_ls)
@@ -795,7 +795,7 @@ class RasterDataset(GeoDataset):
         transform_ls = []
         mask_ls = []
 
-        for vrt_fh in vrt_fhs:
+        for vrt_fh in tqdm(vrt_fhs, desc="Query polygons", unit=" files"):
             data_ls, transform_ls_file, mask_ls_file = self._file_query_polygons(
                 polygons, vrt_fh
             )
@@ -1534,11 +1534,10 @@ class RasterDataset(GeoDataset):
         """
         bbox_list = bbox if isinstance(bbox, list) else [bbox]
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
-        vrt_fhs_template = self._paths2vrt_fhs(paths)
+        vrt_fhs = self._paths2vrt_fhs(paths)
 
         # Single bbox input (not a list) -> dataset at root
         if not isinstance(bbox, list):
-            vrt_fhs = vrt_fhs_template
             data = self._files_query_bbox(bbox, vrt_fhs)
             ds = self._make_bbox_ds(
                 bbox,
@@ -1551,8 +1550,7 @@ class RasterDataset(GeoDataset):
 
         # List input (even single element) -> groups "bbox_0", "bbox_1", ...
         children: dict[str, xr.DataTree] = {}
-        for i, single_bbox in enumerate(bbox_list):
-            vrt_fhs = vrt_fhs_template
+        for i, single_bbox in enumerate(tqdm(bbox_list)):
             data = self._files_query_bbox(single_bbox, vrt_fhs)
             ds = self._make_bbox_ds(
                 single_bbox,

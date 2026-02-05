@@ -11,7 +11,7 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
 
-from faninsar._core.geo_tools import Profile
+from faninsar._core.geo.geo_tools import Profile
 from faninsar._core.sar.acquisition import Acquisition
 from faninsar._core.sar.pairs import Pairs
 from faninsar.datasets.base import (

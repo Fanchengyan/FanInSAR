@@ -999,6 +999,8 @@ class Pairs:
         return baseline.plot(self, **kwargs)
 
 
+# TODO: 1. keep only from_interval and from_period
+# TODO: 2. give more examples to get subset by primary/secondary/days from full_pairs
 class PairsFactory:
     """A class used to generate interferometric pairs for InSAR processing."""
 
@@ -1016,18 +1018,14 @@ class PairsFactory:
         """
         self.dates = pd.to_datetime(dates, **kwargs).unique().sort_values()
 
-    def from_interval(self, max_interval: int = 2, max_day: int = 180) -> Pairs:
-        """Generate interferometric pairs by SAR acquisition interval.
+    @property
+    def full_pairs(self) -> Pairs:
+        """Date pairs in full combination."""
+        i, j = np.triu_indices(len(self.dates), k=1)
+        return Pairs(np.column_stack((self.dates[i], self.dates[j])))
 
-        SAR acquisition interval is defined as the number of SAR acquisitions
-        between two SAR acquisitions.
-
-        .. admonition:: Example
-
-            If the SAR acquisition interval is 2, then the interferometric pairs
-            will be generated between SAR acquisitions with interval of 1 and 2.
-            This will be useful to generate interferometric pairs with different
-            temporal baselines.
+    def from_interval(self, max_interval: int = 2, max_days: int = 180) -> Pairs:
+        """Generate interferometric pairs by limiting maximum interval/day.
 
         Parameters
         ----------
@@ -1035,7 +1033,7 @@ class PairsFactory:
             max interval between two SAR acquisitions for interferometric pair.
             interval is defined as the number of SAR acquisitions between two SAR
             acquisitions.
-        max_day:int
+        max_days: int
             max day between two SAR acquisitions for interferometric pair
 
         Returns
@@ -1049,7 +1047,7 @@ class PairsFactory:
             n_interval = 1
             while n_interval <= max_interval:
                 if i + n_interval < num:
-                    if (self.dates[i + n_interval] - date).days < max_day:
+                    if (self.dates[i + n_interval] - date).days < max_days:
                         pair = (date, self.dates[i + n_interval])
                         pairs.append(pair)
                         n_interval += 1
@@ -1062,29 +1060,29 @@ class PairsFactory:
 
     def linking_winter(
         self,
-        winter_start: str = "0101",
-        winter_end: str = "0331",
+        start: str = "0101",
+        end: str = "0331",
         n_per_winter: int = 5,
-        max_winter_interval: int = 1,
+        max_interval: int = 1,
     ) -> Pairs:
         """Generate interferometric pairs linking winter in each year.
 
         winter is defined by month and day for each year. For instance,
-        winter_start='0101', winter_end='0331' means the winter is from Jan 1 to
+        start='0101', end='0331' means the winter is from Jan 1 to
         Mar 31 for each year in the time series. This will be useful to add pairs
         for completely frozen period across years in permafrost region.
 
         Parameters
         ----------
-        winter_start, winter_end:  str
+        start, end:  str
             start and end date for the winter which expressed as month and day
             with format '%m%d'
         n_per_winter: int
             how many dates will be used for each winter. Those dates will be
             selected randomly in each winter. Default is 5
-        max_winter_interval: int
+        max_interval: int
             max interval between winters for interferometric pair. If
-            max_winter_interval=1, hen the interferometric pairs will be generated
+            max_interval=1, hen the interferometric pairs will be generated
             between neighboring winters.
 
         Returns
@@ -1095,18 +1093,18 @@ class PairsFactory:
         years = sorted(set(self.dates.year))
         df_dates = pd.Series(self.dates, index=self.dates)
 
-        # check if period_start and period_end are in the same year. If not,
-        # the period_end should be in the next year
-        same_year = int(winter_start) < int(winter_end)
+        # check if start and end are in the same year. If not,
+        # the end should be in the next year
+        same_year = int(start) < int(end)
 
         # randomly select n_per_period dates in each period/year
         date_years = []
         for year in years:
-            start = pd.to_datetime(f"{year}{winter_start}", format="%Y%m%d")
+            start = pd.to_datetime(f"{year}{start}", format="%Y%m%d")
             if same_year:
-                end = pd.to_datetime(f"{year}{winter_end}", format="%Y%m%d")
+                end = pd.to_datetime(f"{year}{end}", format="%Y%m%d")
             else:
-                end = pd.to_datetime(f"{year + 1}{winter_end}", format="%Y%m%d")
+                end = pd.to_datetime(f"{year + 1}{end}", format="%Y%m%d")
 
             dt_year = df_dates[start:end]
             if len(dt_year) > 0:
@@ -1120,7 +1118,7 @@ class PairsFactory:
             # primary/reference dates
             for date_primary in date_year:
                 # secondary dates
-                for j in range(1, max_winter_interval + 1):
+                for j in range(1, max_interval + 1):
                     if i + j < n_years:
                         for date_secondary in date_years[i + j]:
                             pairs.append((date_primary, date_secondary))  # noqa: PERF401
@@ -1128,8 +1126,8 @@ class PairsFactory:
 
     def from_period(
         self,
-        period_start: str = "0101",
-        period_end: str = "0331",
+        start: str = "0101",
+        end: str = "0331",
         n_per_period: int | None = None,
         n_primary_period: str | None = None,
         primary_years: list[int] | None = None,
@@ -1137,7 +1135,7 @@ class PairsFactory:
         """Generate interferometric pairs between periods for all years.
 
         period is defined by month and day for each year. For example,
-        period_start='0101', period_end='0331' means the period is from Dec 1
+        start='0101', end='0331' means the period is from Dec 1
         to Mar 31 for each year in the time series. This function will randomly
         select n_per_period dates in each period and generate interferometric
         pairs between those dates. This will be useful to mitigate the temporal
@@ -1145,7 +1143,7 @@ class PairsFactory:
 
         Parameters
         ----------
-        period_start, period_end:  str
+        start, end:  str
             start and end date for the period which expressed as month and day
             with format '%m%d'
         n_per_period: int | None
@@ -1169,18 +1167,18 @@ class PairsFactory:
         years = sorted(set(self.dates.year))
         df_dates = pd.Series(self.dates, index=self.dates)
 
-        # check if period_start and period_end are in the same year. If not,
-        # the period_end should be in the next year
-        same_year = int(period_start) < int(period_end)
+        # check if start and end are in the same year. If not,
+        # the end should be in the next year
+        same_year = int(start) < int(end)
 
         # randomly select n_per_period dates in each period/year
         date_years = []
         for year in years:
-            start = pd.to_datetime(f"{year}{period_start}", format="%Y%m%d")
+            start = pd.to_datetime(f"{year}{start}", format="%Y%m%d")
             if same_year:
-                end = pd.to_datetime(f"{year}{period_end}", format="%Y%m%d")
+                end = pd.to_datetime(f"{year}{end}", format="%Y%m%d")
             else:
-                end = pd.to_datetime(f"{year + 1}{period_end}", format="%Y%m%d")
+                end = pd.to_datetime(f"{year + 1}{end}", format="%Y%m%d")
 
             dt_year = df_dates[start:end]
             if (n_year := len(dt_year)) > 0:
@@ -1209,8 +1207,8 @@ class PairsFactory:
         self,
         summer_start: str = "0801",
         summer_end: str = "1001",
-        winter_start: str = "1201",
-        winter_end: str = "0331",
+        start: str = "1201",
+        end: str = "0331",
     ) -> Pairs:
         """Generate interferometric pairs between summer and winter in each year.
 
@@ -1224,7 +1222,7 @@ class PairsFactory:
         summer_start, summer_end:  str
             start and end date for the summer which expressed as month and day
             with format '%m%d'
-        winter_start, winter_end:  str
+        start, end:  str
             start and end date for the winter which expressed as month and day
             with format '%m%d'
 
@@ -1241,21 +1239,21 @@ class PairsFactory:
             s_start = pd.to_datetime(f"{year}{summer_start}", format="%Y%m%d")
             s_end = pd.to_datetime(f"{year}{summer_end}", format="%Y%m%d")
 
-            if int(winter_start) > int(summer_end):
-                w_start1 = pd.to_datetime(f"{year - 1}{winter_start}", format="%Y%m%d")
-                w_start2 = pd.to_datetime(f"{year}{winter_start}", format="%Y%m%d")
-                if int(winter_end) > int(summer_end):
-                    w_end1 = pd.to_datetime(f"{year - 1}{winter_end}", format="%Y%m%d")
-                    w_end2 = pd.to_datetime(f"{year}{winter_end}", format="%Y%m%d")
+            if int(start) > int(summer_end):
+                w_start1 = pd.to_datetime(f"{year - 1}{start}", format="%Y%m%d")
+                w_start2 = pd.to_datetime(f"{year}{start}", format="%Y%m%d")
+                if int(end) > int(summer_end):
+                    w_end1 = pd.to_datetime(f"{year - 1}{end}", format="%Y%m%d")
+                    w_end2 = pd.to_datetime(f"{year}{end}", format="%Y%m%d")
                 else:
-                    w_end1 = pd.to_datetime(f"{year}{winter_end}", format="%Y%m%d")
-                    w_end2 = pd.to_datetime(f"{year + 1}{winter_end}", format="%Y%m%d")
+                    w_end1 = pd.to_datetime(f"{year}{end}", format="%Y%m%d")
+                    w_end2 = pd.to_datetime(f"{year + 1}{end}", format="%Y%m%d")
             else:
-                w_start1 = pd.to_datetime(f"{year}{winter_start}", format="%Y%m%d")
-                w_start2 = pd.to_datetime(f"{year + 1}{winter_start}", format="%Y%m%d")
+                w_start1 = pd.to_datetime(f"{year}{start}", format="%Y%m%d")
+                w_start2 = pd.to_datetime(f"{year + 1}{start}", format="%Y%m%d")
 
-                w_end1 = pd.to_datetime(f"{year}{winter_end}", format="%Y%m%d")
-                w_end2 = pd.to_datetime(f"{year + 1}{winter_end}", format="%Y%m%d")
+                w_end1 = pd.to_datetime(f"{year}{end}", format="%Y%m%d")
+                w_end2 = pd.to_datetime(f"{year + 1}{end}", format="%Y%m%d")
 
             dt_winter1 = df_dates[w_start1:w_end1].to_list()
             dt_summer = df_dates[s_start:s_end].to_list()
