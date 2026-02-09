@@ -12,12 +12,26 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import colorlog
-from tqdm import tqdm
 from typing_extensions import Literal
+
+# Optional imports with fallbacks
+try:
+    import colorlog
+
+    HAS_COLORLOG = True
+except ImportError:
+    HAS_COLORLOG = False
+
+try:
+    from tqdm import tqdm
+
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 if TYPE_CHECKING:
     from os import PathLike
+    from typing import Union
 
 __all__ = [
     "SUCCESS",
@@ -36,7 +50,8 @@ SUCCESS: Literal[25] = 25  # Between INFO and WARNING
 
 # Type aliases
 LogLevel = Literal["DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"]
-HandlerType = logging.Handler | list[logging.Handler]
+if TYPE_CHECKING:
+    HandlerType = Union[logging.Handler, list[logging.Handler]]
 
 # Register SUCCESS level name
 logging.addLevelName(SUCCESS, "SUCCESS")
@@ -75,58 +90,69 @@ formatter = logging.Formatter(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-color_formatter = colorlog.ColoredFormatter(
-    "%(log_color)s%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    log_colors={
-        "DEBUG": "cyan",
-        "INFO": "white",
-        "SUCCESS": "green",
-        "WARNING": "yellow",
-        "ERROR": "red",
-        "CRITICAL": "red,bg_white",
-    },
-)
+if HAS_COLORLOG:
+    import colorlog  # Import again for typing
+
+    color_formatter = colorlog.ColoredFormatter(
+        "%(log_color)s%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        log_colors={
+            "DEBUG": "cyan",
+            "INFO": "white",
+            "SUCCESS": "green",
+            "WARNING": "yellow",
+            "ERROR": "red",
+            "CRITICAL": "red,bg_white",
+        },
+    )
+else:
+    # Fallback to plain formatter if colorlog not available
+    color_formatter = formatter
 
 # Handlers
 stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.setFormatter(color_formatter)
 
 
-class TqdmLoggingHandler(logging.StreamHandler[Any]):
-    """A logging handler that works with tqdm progress bars.
+if HAS_TQDM:
+    from tqdm import tqdm  # Import again for typing
 
-    This handler ensures log messages don't interfere with tqdm
-    progress bar display by using tqdm.write().
-    """
+    class TqdmLoggingHandler(logging.StreamHandler):  # type: ignore[type-arg]
+        """A logging handler that works with tqdm progress bars.
 
-    def __init__(self, tqdm_class: type[tqdm] = tqdm) -> None:
-        """Initialize the tqdm logging handler.
-
-        Parameters
-        ----------
-        tqdm_class : type[tqdm], optional
-            The tqdm class to use for writing, by default tqdm.
-
+        This handler ensures log messages don't interfere with tqdm
+        progress bar display by using tqdm.write().
         """
-        super().__init__()
-        self.tqdm_class = tqdm_class
 
-    def emit(self, record: logging.LogRecord) -> None:
-        """Emit a log record using tqdm.write()."""
-        try:
-            msg = self.format(record)
-            self.tqdm_class.write(msg, file=self.stream)
-            self.flush()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception:  # pragma: no cover - logging safety net
-            self.handleError(record)
+        def __init__(self, tqdm_class: type[tqdm] = tqdm) -> None:  # type: ignore[assignment]
+            """Initialize the tqdm logging handler.
 
+            Parameters
+            ----------
+            tqdm_class : type[tqdm], optional
+                The tqdm class to use for writing, by default tqdm.
 
-tqdm_handler = TqdmLoggingHandler()
-tqdm_handler.setLevel(logging.INFO)
-tqdm_handler.setFormatter(color_formatter)
+            """
+            super().__init__()
+            self.tqdm_class = tqdm_class
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """Emit a log record using tqdm.write()."""
+            try:
+                msg = self.format(record)
+                self.tqdm_class.write(msg, file=self.stream)
+                self.flush()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:  # pragma: no cover - logging safety net
+                self.handleError(record)
+
+    tqdm_handler = TqdmLoggingHandler()
+    tqdm_handler.setLevel(logging.INFO)
+    tqdm_handler.setFormatter(color_formatter)
+else:
+    # Fallback to stream handler if tqdm not available
+    tqdm_handler = stream_handler
 
 
 def get_default_log_level() -> int:
@@ -166,12 +192,12 @@ def get_default_log_level() -> int:
 
 def setup_logger(
     name: str | None = None,
-    file: str | PathLike[str] | None = None,
+    file: str | PathLike[str] | None = None,  # type: ignore[name-defined]
     *,
     # Backward-compatible aliases
     log_name: str | None = None,
-    log_file: str | PathLike[str] | None = None,
-    handler: HandlerType = stream_handler,
+    log_file: str | PathLike[str] | None = None,  # type: ignore[name-defined]
+    handler: logging.Handler | list[logging.Handler] = stream_handler,  # type: ignore[assignment]
     level: int | None = None,
     propagate: bool = True,
     clear_existing: bool = False,
