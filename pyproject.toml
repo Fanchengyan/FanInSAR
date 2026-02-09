@@ -67,6 +67,7 @@ dependencies = [
   "scipy>=1.10",
   "zarr>=3.0",
   "lxml>=4.9",
+  "tomli-w>=1.2.0",
 ]
 
 
@@ -294,8 +295,6 @@ ignore = [
   "COM812",
   # private-member-access (SLF001)#
   "SLF001",
-  # pandas-df-variable-name (PD901)
-  "PD901",
   # incorrect-blank-line-before-class (D203)
   "D203",
   # multi-line-summary-second-line (D213)

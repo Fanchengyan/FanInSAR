@@ -9,6 +9,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING
 
 from faninsar.isce2.executors import execute_command
@@ -30,6 +31,8 @@ class Command:
         Name of the command (e.g., 'Sentinel1_TOPS', 'topo', 'geo2rdr', 'multilook').
     params : dict[str, object]
         Dictionary of command parameters.
+    suffix : str, optional
+        Optional suffix for config file naming (e.g., date string like '20211128').
 
     Attributes
     ----------
@@ -37,18 +40,22 @@ class Command:
         Name of the command.
     params : dict[str, object]
         Command parameters.
+    suffix : str
+        Suffix for config file naming.
 
     Examples
     --------
     >>> cmd = Command(
     ...     cmd_name="Sentinel1_TOPS",
     ...     params={"safe_file": "/data/S1A.safe"},
+    ...     suffix="20211128",
     ... )
 
     """
 
     cmd_name: str
     params: dict[str, object]
+    suffix: str = ""
 
 
 class TopsStackCommands:
@@ -121,6 +128,7 @@ class TopsStackCommands:
 
         self.command_queue: list[list[Command]] = []
         self.current_batch: list[Command] = []
+        self._config_sequence_by_cmd: dict[str, int] = {}
 
     def sentinel1_tops_cmd(
         self,
@@ -130,6 +138,8 @@ class TopsStackCommands:
         swaths: list[str],
         polarization: str = "vv",
         bbox: list[float] | None = None,
+        outdir: str | Path | None = None,
+        suffix: str = "",
         **kwargs: object,
     ) -> Command:
         """Build a Sentinel1_TOPS command.
@@ -151,6 +161,11 @@ class TopsStackCommands:
             Polarization to extract. Default is 'vv'.
         bbox : list[float] | None, optional
             Bounding box [west, south, east, north]. Default is None.
+        outdir : str | Path | None, optional
+            Output directory for unpacked products. If None, use
+            ``paths.reference_path()``. Default is None.
+        suffix : str, optional
+            Suffix for config file naming. Default is "".
         **kwargs : object
             Additional keyword arguments.
 
@@ -175,15 +190,97 @@ class TopsStackCommands:
                 "safe_file": Path(safe_file),
                 "orbit_file": Path(orbit_file),
                 "orbit_type": orbit_type,
-                "outdir": self.paths.reference_path(),
+                "outdir": Path(outdir) if outdir is not None else self.paths.reference_path(),
                 "swaths": swaths,
                 "polarization": polarization,
                 "bbox": bbox,
                 **kwargs,
             },
+            suffix=suffix,
         )
 
-    def topo_cmd(self, num_process: int | None = None) -> Command:
+    def pairs_misreg_cmd(
+        self,
+        reference_dir: str | Path,
+        secondary_dir: str | Path,
+        interferogram_dir: str | Path,
+        overlap_dir: str | Path,
+        out_azimuth: str | Path,
+        out_range: str | Path,
+        coh_threshold: float = 0.85,
+        snr_threshold: float = 10.0,
+        suffix: str = "",
+    ) -> Command:
+        """Build a compound misregistration command.
+
+        Parameters
+        ----------
+        reference_dir : str | Path
+            Path to reference burst directory.
+        secondary_dir : str | Path
+            Path to secondary burst directory.
+        interferogram_dir : str | Path
+            Output coarse interferogram directory.
+        overlap_dir : str | Path
+            Output overlap directory.
+        out_azimuth : str | Path
+            Output azimuth misregistration file.
+        out_range : str | Path
+            Output range misregistration file.
+        coh_threshold : float, optional
+            Coherence threshold for azimuth misregistration. Default is 0.85.
+        snr_threshold : float, optional
+            SNR threshold for range misregistration. Default is 10.0.
+        suffix : str, optional
+            Suffix for config file naming. Default is "".
+
+        Returns
+        -------
+        Command
+            Compound misregistration command object.
+
+        """
+        reference_path = Path(reference_dir)
+        secondary_path = Path(secondary_dir)
+        interferogram_path = Path(interferogram_dir)
+        return Command(
+            cmd_name="pairs_misreg",
+            params={
+                "reference": reference_path,
+                "secondary": secondary_path,
+                "interferogram_dir": interferogram_path,
+                "overlap_dir": Path(overlap_dir),
+                "out_azimuth": Path(out_azimuth),
+                "out_range": Path(out_range),
+                "coh_threshold": coh_threshold,
+                "snr_threshold": snr_threshold,
+            },
+            suffix=suffix,
+        )
+
+    def shell_cmd(self, command_line: str, suffix: str = "") -> Command:
+        """Build a shell command for direct run-file execution.
+
+        Parameters
+        ----------
+        command_line : str
+            Command line content to write directly into run file.
+        suffix : str, optional
+            Suffix for command identification. Default is "".
+
+        Returns
+        -------
+        Command
+            Shell command object.
+
+        """
+        return Command(
+            cmd_name="shell",
+            params={"command_line": command_line},
+            suffix=suffix,
+        )
+
+    def topo_cmd(self, num_process: int | None = None, suffix: str = "") -> Command:
         """Build a topo command.
 
         Paths are resolved using PathManager:
@@ -219,6 +316,7 @@ class TopsStackCommands:
                 "geom_dir": self.paths.geom_reference_path(),
                 "num_process": num_process or self.num_process,
             },
+            suffix=suffix,
         )
 
     def geo2rdr_cmd(
@@ -227,6 +325,7 @@ class TopsStackCommands:
         overlap: bool = False,
         misreg_az: str | None = None,
         misreg_rng: str | None = None,
+        suffix: str = "",
     ) -> Command:
         """Build a geo2rdr command.
 
@@ -269,6 +368,7 @@ class TopsStackCommands:
                 "misreg_rng": misreg_rng,
                 "use_gpu": self.use_gpu,
             },
+            suffix=suffix,
         )
 
     def multilook_cmd(
@@ -341,6 +441,7 @@ class TopsStackCommands:
         misreg_rng: str | Path | None = None,
         flatten: bool = True,
         overlap: bool = False,
+        suffix: str = "",
     ) -> Command:
         """Build a resamp_withCarrier command.
 
@@ -391,6 +492,7 @@ class TopsStackCommands:
                 "flatten": flatten,
                 "overlap": overlap,
             },
+            suffix=suffix,
         )
 
     def generate_igram_cmd(
@@ -399,6 +501,7 @@ class TopsStackCommands:
         secondary: str | Path,
         coreg_dir: str | Path,
         overlap: bool = False,
+        suffix: str = "",
     ) -> Command:
         """Build a generateIgram command for burst interferogram generation.
 
@@ -435,6 +538,7 @@ class TopsStackCommands:
                 "coreg_dir": Path(coreg_dir),
                 "overlap": overlap,
             },
+            suffix=suffix,
         )
 
     def filter_coherence_cmd(
@@ -443,6 +547,12 @@ class TopsStackCommands:
         coherence: str | Path,
         filtered_int: str | Path,
         filter_strength: float = 0.5,
+        slc1: str | Path | None = None,
+        slc2: str | Path | None = None,
+        complex_coh: str | Path | None = None,
+        azimuth_looks: int = 1,
+        range_looks: int = 1,
+        suffix: str = "",
     ) -> Command:
         """Build a FilterAndCoherence command.
 
@@ -456,6 +566,8 @@ class TopsStackCommands:
             Path to output filtered interferogram.
         filter_strength : float, optional
             Filter strength parameter (0.0-1.0). Default is 0.5.
+        suffix : str, optional
+            Suffix for config file naming (e.g., date string). Default is "".
 
         Returns
         -------
@@ -469,6 +581,7 @@ class TopsStackCommands:
         ...     coherence="burst.cor",
         ...     filtered_int="filt_burst.int",
         ...     filter_strength=0.5,
+        ...     suffix="20240101_20240113",
         ... )
 
         """
@@ -479,7 +592,13 @@ class TopsStackCommands:
                 "coherence": Path(coherence),
                 "filtered_int": Path(filtered_int),
                 "filter_strength": filter_strength,
+                "slc1": Path(slc1) if slc1 is not None else None,
+                "slc2": Path(slc2) if slc2 is not None else None,
+                "complex_coh": Path(complex_coh) if complex_coh is not None else None,
+                "azimuth_looks": azimuth_looks,
+                "range_looks": range_looks,
             },
+            suffix=suffix,
         )
 
     def merge_bursts_cmd(
@@ -489,8 +608,16 @@ class TopsStackCommands:
         outfile: str | Path,
         method: str = "avg",
         name_pattern: str = "fine*int",
+        stack: str | Path | None = None,
+        aligned: bool = True,
         valid_only: bool = True,
         use_virtual: bool = False,
+        multilook: bool = True,
+        azimuth_looks: int = 1,
+        range_looks: int = 1,
+        multilook_tool: str | None = None,
+        no_data_value: str | int | float | None = None,
+        suffix: str = "",
     ) -> Command:
         """Build a mergeBursts command.
 
@@ -511,6 +638,12 @@ class TopsStackCommands:
         use_virtual : bool, optional
             Whether to create virtual (VRT) files instead of real files.
             Default is False.
+        azimuth_looks : int, optional
+            Number of azimuth looks for multilooking. Default is 1.
+        range_looks : int, optional
+            Number of range looks for multilooking. Default is 1.
+        suffix : str, optional
+            Suffix for config file naming (e.g., date string). Default is "".
 
         Returns
         -------
@@ -524,20 +657,31 @@ class TopsStackCommands:
         ...     dirname="interferograms/20240101_20240113",
         ...     outfile="merged/interferogram.int",
         ...     method="avg",
+        ...     azimuth_looks=3,
+        ...     range_looks=9,
+        ...     suffix="20240101_20240113",
         ... )
 
         """
         return Command(
             cmd_name="merge_bursts",
             params={
+                "stack": Path(stack) if stack is not None else None,
                 "reference": Path(reference),
                 "dirname": Path(dirname),
                 "outfile": Path(outfile),
                 "method": method,
                 "name_pattern": name_pattern,
+                "aligned": aligned,
                 "valid_only": valid_only,
                 "use_virtual": use_virtual,
+                "multilook": multilook,
+                "azimuth_looks": azimuth_looks,
+                "range_looks": range_looks,
+                "multilook_tool": multilook_tool,
+                "no_data_value": no_data_value,
             },
+            suffix=suffix,
         )
 
     def geocode_cmd(
@@ -613,6 +757,7 @@ class TopsStackCommands:
         defo_max: float = 2.0,
         method: str = "snaphu",
         nomcf: bool = False,
+        suffix: str = "",
     ) -> Command:
         """Build an unwrap command.
 
@@ -636,6 +781,8 @@ class TopsStackCommands:
             Unwrapping method ('snaphu' or 'icu'). Default is 'snaphu'.
         nomcf : bool, optional
             Run full snaphu instead of MCF mode. Default is False.
+        suffix : str, optional
+            Suffix for config file naming (e.g., date string). Default is "".
 
         Returns
         -------
@@ -651,6 +798,7 @@ class TopsStackCommands:
         ...     reference=pm.reference_path(),
         ...     azimuth_looks=2,
         ...     range_looks=8,
+        ...     suffix="20240101_20240113",
         ... )
 
         """
@@ -667,6 +815,7 @@ class TopsStackCommands:
                 "method": method,
                 "nomcf": nomcf,
             },
+            suffix=suffix,
         )
 
     def baseline_cmd(
@@ -674,6 +823,7 @@ class TopsStackCommands:
         reference: str | Path,
         secondary: str | Path,
         baseline_file: str | Path,
+        suffix: str = "",
     ) -> Command:
         """Build a baseline computation command.
 
@@ -707,6 +857,7 @@ class TopsStackCommands:
                 "secondary": Path(secondary),
                 "baseline_file": Path(baseline_file),
             },
+            suffix=suffix,
         )
 
     def baseline_grid_cmd(
@@ -943,7 +1094,12 @@ class TopsStackCommands:
                 result,
             )
 
-    def generate_run_file(self, run_name: str, commands: list[Command]) -> None:
+    def generate_run_file(
+        self,
+        run_name: str,
+        commands: list[Command],
+        parallelize: bool = True,
+    ) -> None:
         """Generate a run file for backwards compatibility.
 
         Parameters
@@ -952,28 +1108,50 @@ class TopsStackCommands:
             Name of the run file.
         commands : list[Command]
             List of commands to include in the run file.
+        parallelize : bool, optional
+            Whether to emit background execution markers for command-level
+            parallelism. Default is True.
 
         Examples
         --------
         >>> cmd_mgr.generate_run_file("run_stack.txt", [cmd1, cmd2, cmd3])
 
         """
-        run_path = self.paths.run_file_path(run_name)
+        normalized_run_name = (
+            run_name if Path(run_name).suffix == ".sh" else f"{run_name}.sh"
+        )
+        run_path = self.paths.run_file_path(normalized_run_name)
 
         with run_path.open("w") as f:
-            # Add bash shebang
-            f.write("#!/bin/bash\n\n")
+            # Add POSIX sh shebang
+            f.write("#!/bin/sh\n\n")
 
             for i, cmd in enumerate(commands):
-                config_path = self._generate_config_file(cmd)
-                cmd_line = f"{self.text_cmd}SentinelWrapper.py -c {config_path}"
+                if cmd.cmd_name == "shell":
+                    command_line = cmd.params.get("command_line")
+                    if not isinstance(command_line, str):
+                        logger.error("Shell command line is invalid: %s", command_line)
+                        msg = "Shell command line must be a string"
+                        raise ValueError(msg)
+                    cmd_line = f"{self.text_cmd}{command_line}"
+                else:
+                    config_path = self._generate_config_file(cmd)
+                    cmd_line = f"{self.text_cmd}SentinelWrapper.py -c {config_path}"
+
+                if not parallelize:
+                    f.write(cmd_line + "\n")
+                    continue
 
                 # Parallel processing markers
-                if self.num_process > 1 and (i + 1) % self.num_process != 0:
+                is_last = i == len(commands) - 1
+                batch_boundary = (i + 1) % self.num_process == 0
+                should_background = self.num_process > 1 and not batch_boundary and not is_last
+
+                if should_background:
                     f.write(cmd_line + " &\n")
                 else:
                     f.write(cmd_line + "\n")
-                    if self.num_process > 1:
+                    if self.num_process > 1 and (batch_boundary or is_last):
                         f.write("wait\n\n")
 
         # Make the run file executable
@@ -997,8 +1175,15 @@ class TopsStackCommands:
         """
         from faninsar.isce2.config_writer import ConfigWriter
 
-        # Generate unique config name
-        config_name = f"config_{cmd.cmd_name}_{id(cmd)}"
+        # Generate deterministic config name with suffix if provided
+        suffix = self._sanitize_config_suffix(cmd.suffix)
+        base_name = self._config_base_name(cmd.cmd_name)
+        if suffix:
+            config_name = f"{base_name}_{suffix}"
+        else:
+            sequence = self._config_sequence_by_cmd.get(cmd.cmd_name, 0) + 1
+            self._config_sequence_by_cmd[cmd.cmd_name] = sequence
+            config_name = f"{base_name}_{sequence:04d}"
         config_path = self.paths.config_file_path(config_name).with_suffix(".ini")
 
         # Create ConfigWriter
@@ -1025,6 +1210,8 @@ class TopsStackCommands:
             config.write_azimuth_misreg(self._prepare_azimuth_misreg_params(cmd))
         elif cmd.cmd_name == "range_misreg":
             config.write_range_misreg(self._prepare_range_misreg_params(cmd))
+        elif cmd.cmd_name == "pairs_misreg":
+            self._write_pairs_misreg_config(config, cmd)
         elif cmd.cmd_name == "merge_bursts":
             config.write_merge_bursts(self._prepare_merge_bursts_params(cmd))
         elif cmd.cmd_name == "filter_coherence":
@@ -1036,6 +1223,102 @@ class TopsStackCommands:
 
         config.finalize()
         return str(config_path)
+
+    @staticmethod
+    def _sanitize_config_suffix(suffix: str) -> str:
+        """Sanitize config suffix to be filesystem-safe.
+
+        Parameters
+        ----------
+        suffix : str
+            Raw suffix string.
+
+        Returns
+        -------
+        str
+            Sanitized suffix string.
+
+        """
+        if not suffix:
+            return ""
+        sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", suffix).strip("_.")
+        return sanitized
+
+    def _write_pairs_misreg_config(self, config: ConfigWriter, cmd: Command) -> None:
+        """Write compound misregistration config sections.
+
+        Parameters
+        ----------
+        config : ConfigWriter
+            Configuration file writer instance.
+        cmd : Command
+            Compound misregistration command.
+
+        """
+        params = cmd.params
+        interferogram_dir = Path(params["interferogram_dir"])
+        config.write_generate_igram(
+            {
+                "reference": str(params["reference"]),
+                "secondary": str(params["secondary"]),
+                "interferogram": str(interferogram_dir),
+                "flatten": "False",
+                "prefix": "int",
+                "overlap": "True",
+            }
+        )
+        config.write_overlap_withdem(
+            {
+                "interferogram": str(interferogram_dir / "coarse_ifg"),
+                "reference_dir": str(params["reference"]),
+                "secondary_dir": str(params["secondary"]),
+                "overlap_dir": str(params["overlap_dir"]),
+            }
+        )
+        config.write_azimuth_misreg(
+            {
+                "overlap_dir": str(params["overlap_dir"]),
+                "out_azimuth": str(params["out_azimuth"]),
+                "coh_threshold": str(params["coh_threshold"]),
+                "plot": "False",
+            }
+        )
+        config.write_range_misreg(
+            {
+                "reference": str(params["reference"]),
+                "secondary": str(params["secondary"]),
+                "out_range": str(params["out_range"]),
+                "snr_threshold": str(params["snr_threshold"]),
+            }
+        )
+
+    @staticmethod
+    def _config_base_name(cmd_name: str) -> str:
+        """Map command names to legacy-compatible config prefixes.
+
+        Parameters
+        ----------
+        cmd_name : str
+            Internal command name.
+
+        Returns
+        -------
+        str
+            Config filename base prefix.
+
+        """
+        mapping = {
+            "merge_bursts": "config_merge",
+            "generate_igram": "config_generate_igram",
+            "filter_coherence": "config_igram_filt_coh",
+            "unwrap": "config_igram_unw",
+            "Sentinel1_TOPS": "config_unpack",
+            "pairs_misreg": "config_misreg",
+        }
+        mapped = mapping.get(cmd_name)
+        if mapped is not None:
+            return mapped
+        return f"config_{cmd_name}"
 
     def _prepare_sentinel1_params(self, cmd: Command) -> dict:
         """Prepare Sentinel1_TOPS configuration parameters."""
@@ -1060,7 +1343,13 @@ class TopsStackCommands:
         # Handle bbox
         bbox = params.get("bbox")
         if isinstance(bbox, (list, tuple)):
-            bbox_str = " ".join(map(str, bbox))
+            if len(bbox) == 4:
+                west, south, east, north = bbox
+                bbox_str = f"{south} {north} {west} {east}"
+            else:
+                logger.error("Invalid bbox length: %s", len(bbox))
+                msg = "bbox must have 4 elements: [west, south, east, north]"
+                raise ValueError(msg)
         elif bbox:
             bbox_str = str(bbox)
         else:
@@ -1200,14 +1489,17 @@ class TopsStackCommands:
     def _prepare_filter_coherence_params(self, cmd: Command) -> dict:
         """Prepare FilterAndCoherence configuration parameters."""
         params = cmd.params
+        slc1 = params.get("slc1")
+        slc2 = params.get("slc2")
+        complex_coh = params.get("complex_coh")
         return {
             "input": str(params["interferogram"]),
             "filt": str(params["filtered_int"]),
             "coh": str(params["coherence"]),
             "strength": str(params.get("filter_strength", 0.5)),
-            "slc1": str(params.get("slc1", "")),
-            "slc2": str(params.get("slc2", "")),
-            "complex_coh": str(params.get("complex_coh", "")),
+            "slc1": str(slc1) if slc1 else "",
+            "slc2": str(slc2) if slc2 else "",
+            "complex_coh": str(complex_coh) if complex_coh else "",
             "range_looks": str(params.get("range_looks", 9)),
             "azimuth_looks": str(params.get("azimuth_looks", 3)),
         }

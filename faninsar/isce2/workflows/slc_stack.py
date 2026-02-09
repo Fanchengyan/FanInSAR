@@ -206,19 +206,22 @@ class SLCStack(BaseWorkflow):
                 orbit_file=orbit_path,
                 orbit_type="precise",
                 swaths=["IW1", "IW2", "IW3"],
+                bbox=self._bbox_values(),
+                outdir=self.paths.reference_path(),
+                suffix="reference",
             )
             commands.append(cmd)
 
         # Topo command
         try:
-            cmd = self.cmd_mgr.topo_cmd()
+            cmd = self.cmd_mgr.topo_cmd(suffix="reference")
             commands.append(cmd)
         except ValueError as e:
             logger.warning("Could not create topo command: %s", e)
 
         # Generate run file
         run_name = f"run_{run_num:02d}_unpack_topo_reference"
-        self.cmd_mgr.generate_run_file(run_name, commands)
+        self.cmd_mgr.generate_run_file(run_name, commands, parallelize=False)
 
     def _generate_unpack_secondary_slc(self, run_num: int) -> None:
         """Generate run file for unpacking secondary SLCs.
@@ -242,6 +245,9 @@ class SLCStack(BaseWorkflow):
                     orbit_file=orbit_path,
                     orbit_type="precise",
                     swaths=["IW1", "IW2", "IW3"],
+                    bbox=self._bbox_values(),
+                    outdir=self.paths.secondary_path(date),
+                    suffix=f"secondary_{date}",
                 )
                 commands.append(cmd)
 
@@ -270,6 +276,7 @@ class SLCStack(BaseWorkflow):
                     / f"{self.reference_date}_{date}"
                     / f"{self.reference_date}_{date}.txt"
                 ),
+                suffix=date,
             )
             commands.append(cmd)
 
@@ -294,14 +301,26 @@ class SLCStack(BaseWorkflow):
 
         # Step 4: Extract burst overlaps
         run_name = f"run_{run_num:02d}_extract_burst_overlaps"
-        self.cmd_mgr.generate_run_file(run_name, [])
+        extract_overlap_cmd = self.cmd_mgr.shell_cmd(
+            command_line=(
+                "subsetReference.py "
+                f"-m {self.paths.reference_path()} "
+                f"-g {self.paths.geom_reference_path()}"
+            ),
+            suffix="extract_burst_overlaps",
+        )
+        self.cmd_mgr.generate_run_file(run_name, [extract_overlap_cmd])
         run_num += 1
 
         # Step 5: Overlap geo2rdr
         run_name = f"run_{run_num:02d}_overlap_geo2rdr"
         commands = []
         for date in self.secondary_dates:
-            cmd = self.cmd_mgr.geo2rdr_cmd(date=date, overlap=True)
+            cmd = self.cmd_mgr.geo2rdr_cmd(
+                date=date,
+                overlap=True,
+                suffix=f"overlap_{date}",
+            )
             commands.append(cmd)
         self.cmd_mgr.generate_run_file(run_name, commands)
         run_num += 1
@@ -315,6 +334,7 @@ class SLCStack(BaseWorkflow):
                 secondary=self.paths.secondary_path(date),
                 coreg_dir=self.paths.coreg_secondary_path(date),
                 overlap=True,
+                suffix=f"overlap_{date}",
             )
             commands.append(cmd)
         self.cmd_mgr.generate_run_file(run_name, commands)
@@ -322,19 +342,74 @@ class SLCStack(BaseWorkflow):
 
         # Step 7: Pairs misregistration
         run_name = f"run_{run_num:02d}_pairs_misreg"
-        self.cmd_mgr.generate_run_file(run_name, [])
+        commands = []
+        misreg_pairs = self._build_overlap_pairs()
+        for ref_date, sec_date in misreg_pairs:
+            cmd = self.cmd_mgr.pairs_misreg_cmd(
+                reference_dir=self._coreg_or_reference_path(ref_date),
+                secondary_dir=self.paths.coreg_secondary_path(sec_date),
+                interferogram_dir=(
+                    self.paths.work_dir
+                    / "coarse_interferograms"
+                    / f"{ref_date}_{sec_date}"
+                ),
+                overlap_dir=self.paths.work_dir / "ESD" / f"{ref_date}_{sec_date}",
+                out_azimuth=(
+                    self.paths.work_dir
+                    / "misreg"
+                    / "azimuth"
+                    / "pairs"
+                    / f"{ref_date}_{sec_date}"
+                    / f"{ref_date}_{sec_date}.txt"
+                ),
+                out_range=(
+                    self.paths.work_dir
+                    / "misreg"
+                    / "range"
+                    / "pairs"
+                    / f"{ref_date}_{sec_date}"
+                    / f"{ref_date}_{sec_date}.txt"
+                ),
+                coh_threshold=self.esd_coherence_threshold,
+                snr_threshold=self.snr_threshold,
+                suffix=f"{ref_date}_{sec_date}",
+            )
+            commands.append(cmd)
+        self.cmd_mgr.generate_run_file(run_name, commands)
         run_num += 1
 
         # Step 8: Timeseries misregistration
         run_name = f"run_{run_num:02d}_timeseries_misreg"
-        self.cmd_mgr.generate_run_file(run_name, [])
+        timeseries_commands = [
+            self.cmd_mgr.shell_cmd(
+                command_line=(
+                    "invertMisreg.py "
+                    f"-i {self.paths.work_dir / 'misreg' / 'azimuth' / 'pairs'} "
+                    f"-o {self.paths.work_dir / 'misreg' / 'azimuth' / 'dates'}"
+                ),
+                suffix="timeseries_misreg_azimuth",
+            ),
+            self.cmd_mgr.shell_cmd(
+                command_line=(
+                    "invertMisreg.py "
+                    f"-i {self.paths.work_dir / 'misreg' / 'range' / 'pairs'} "
+                    f"-o {self.paths.work_dir / 'misreg' / 'range' / 'dates'}"
+                ),
+                suffix="timeseries_misreg_range",
+            ),
+        ]
+        self.cmd_mgr.generate_run_file(run_name, timeseries_commands)
         run_num += 1
 
         # Step 9: Full burst geo2rdr
         run_name = f"run_{run_num:02d}_fullBurst_geo2rdr"
         commands = []
         for date in self.secondary_dates:
-            cmd = self.cmd_mgr.geo2rdr_cmd(date=date, overlap=False)
+            cmd = self.cmd_mgr.geo2rdr_cmd(
+                date=date,
+                overlap=False,
+                suffix=f"fullBurst_{date}",
+            )
             commands.append(cmd)
         self.cmd_mgr.generate_run_file(run_name, commands)
         run_num += 1
@@ -356,6 +431,7 @@ class SLCStack(BaseWorkflow):
                 overlap=False,
                 misreg_az=misreg_az,
                 misreg_rng=misreg_rng,
+                suffix=f"fullBurst_{date}",
             )
             commands.append(cmd)
         self.cmd_mgr.generate_run_file(run_name, commands)
@@ -384,7 +460,11 @@ class SLCStack(BaseWorkflow):
         run_name = f"run_{run_num:02d}_geo2rdr"
         commands = []
         for date in self.secondary_dates:
-            cmd = self.cmd_mgr.geo2rdr_cmd(date=date, overlap=False)
+            cmd = self.cmd_mgr.geo2rdr_cmd(
+                date=date,
+                overlap=False,
+                suffix=f"geometry_{date}",
+            )
             commands.append(cmd)
         self.cmd_mgr.generate_run_file(run_name, commands)
         run_num += 1
@@ -398,6 +478,7 @@ class SLCStack(BaseWorkflow):
                 secondary=self.paths.secondary_path(date),
                 coreg_dir=self.paths.coreg_secondary_path(date),
                 overlap=False,
+                suffix=f"geometry_{date}",
             )
             commands.append(cmd)
         self.cmd_mgr.generate_run_file(run_name, commands)
@@ -457,3 +538,54 @@ class SLCStack(BaseWorkflow):
 
         finder = OrbitFinder(self.paths.orbit_dir)
         return finder.find_orbit(safe_file, orbit_type="auto")
+
+    def _bbox_values(self) -> list[float] | None:
+        """Convert workflow bounding box to Sentinel1_TOPS bbox list.
+
+        Returns
+        -------
+        list[float] | None
+            Bounding box in ``[left, bottom, right, top]`` order,
+            or None if bbox is not configured.
+
+        """
+        if self.bbox is None:
+            return None
+        return [float(value) for value in self.bbox]
+
+    def _coreg_or_reference_path(self, date: str) -> Path:
+        """Get coregistered path for a date with reference fallback.
+
+        Parameters
+        ----------
+        date : str
+            Acquisition date in YYYYMMDD format.
+
+        Returns
+        -------
+        Path
+            Reference directory for stack reference date; otherwise coreg directory.
+
+        """
+        if date == self.reference_date:
+            return self.paths.reference_path()
+        return self.paths.coreg_secondary_path(date)
+
+    def _build_overlap_pairs(self) -> list[tuple[str, str]]:
+        """Build overlap pairs for NESD misregistration estimation.
+
+        Returns
+        -------
+        list[tuple[str, str]]
+            List of date pairs used by pair-wise misregistration.
+
+        """
+        if not self.reference_date:
+            return []
+        acquisition_dates = [self.reference_date, *self.secondary_dates]
+        max_interval = self.num_overlap_connections + 1
+        pairs: list[tuple[str, str]] = []
+        for i, ref_date in enumerate(acquisition_dates[:-1]):
+            for j in range(i + 1, min(len(acquisition_dates), i + max_interval)):
+                pairs.append((ref_date, acquisition_dates[j]))
+        return pairs

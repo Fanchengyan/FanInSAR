@@ -20,7 +20,7 @@ class TestMultilookNaming:
         """Test that multilook iteration uses 'looks' variable."""
         pm = PathManager(
             work_dir="/tmp/test",
-            multilooks=[(5, 15), (10, 30)],
+            multilook=[(5, 15), (10, 30)],
         )
         # This should not raise any errors
         pm.print_all_paths()
@@ -30,7 +30,7 @@ class TestMultilookNaming:
         with tempfile.TemporaryDirectory() as tmpdir:
             pm = PathManager(
                 work_dir=tmpdir,
-                multilooks=[(5, 15)],
+                multilook=[(5, 15)],
             )
             toml_str = pm.to_toml()
             # Check that 'looks' key is used in multilook section
@@ -82,7 +82,7 @@ version = "1.1"
         with tempfile.TemporaryDirectory() as tmpdir:
             pm = PathManager(
                 work_dir=tmpdir,
-                multilooks=[(5, 15)],
+                multilook=[(5, 15)],
             )
             # Should not raise
             pm.create_all_dirs(include_multilook=True)
@@ -106,7 +106,7 @@ class TestPathManagerBasics:
         """Test multilook property."""
         pm = PathManager(
             work_dir="/tmp/test",
-            multilooks=[(5, 15), (10, 30)],
+            multilook=[(5, 15), (10, 30)],
         )
         assert pm.has_multilook()
         assert len(pm.get_multilooks()) == 2
@@ -118,7 +118,7 @@ class TestPathManagerBasics:
                 work_dir=tmpdir,
                 slc_dir="/data/slc",
                 dem="/data/dem.tif",
-                multilooks=[(5, 15)],
+                multilook=[(5, 15)],
             )
 
             toml_path = Path(tmpdir) / "config.toml"

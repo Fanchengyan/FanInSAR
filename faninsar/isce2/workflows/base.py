@@ -6,6 +6,7 @@ This module provides the abstract base class for all ISCE2 processing workflows.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from faninsar._core.sar import Acquisition, Baselines, Pairs, PairsFactory
@@ -279,6 +280,57 @@ class BaseWorkflow(ABC):
     def create_directories(self) -> None:
         """Create all required directories for processing."""
         self.paths.create_all_dirs()
+
+    def _generate_workspace_run_all_script(self, script_name: str = "run_all.sh") -> Path:
+        """Generate a helper script to run all run-files sequentially.
+
+        Parameters
+        ----------
+        script_name : str, optional
+            Output script name in workspace root. Default is ``"run_all.sh"``.
+
+        Returns
+        -------
+        Path
+            Path to generated helper script.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no run-files are found in the run directory.
+
+        """
+        run_files = sorted(path for path in self.paths.run_dir.glob("run_*.sh") if path.is_file())
+        if not run_files:
+            run_files = sorted(path for path in self.paths.run_dir.glob("run_*") if path.is_file())
+
+        if not run_files:
+            logger.error("No run files found in %s", self.paths.run_dir)
+            msg = f"No run files found in {self.paths.run_dir}"
+            raise FileNotFoundError(msg)
+
+        script_path = self.paths.work_dir / script_name
+        lines = [
+            "#!/bin/sh",
+            "",
+            "set -eu",
+            "",
+            f'RUN_DIR="{self.paths.run_dir}"',
+            "",
+        ]
+
+        for run_file in run_files:
+            lines.append(f'echo "[RUN] {run_file.name}"')
+            lines.append(f'sh "$RUN_DIR/{run_file.name}"')
+            lines.append("")
+
+        lines.append('echo "All run scripts completed."')
+        lines.append("")
+
+        script_path.write_text("\n".join(lines), encoding="utf-8")
+        script_path.chmod(0o755)
+        logger.info("Writing %s", script_path)
+        return script_path
 
     def print_status(self) -> None:
         """Print current workflow status."""

@@ -10,9 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from itertools import starmap
 from pathlib import Path
-from typing import ClassVar
-
-from typing_extensions import Self
+from typing import ClassVar, Self
 
 import tomli_w
 
@@ -74,9 +72,10 @@ class PathManager:
         Directory containing auxiliary data. Default is None.
     dem : str | Path | None, optional
         Path to DEM file (GeoTIFF or NetCDF). Default is None.
-    multilooks : list[tuple[int, int]] | None, optional
+    multilook : list[tuple[int, int]] | None, optional
         List of (azimuth, range) tuples for multilook settings.
-        Default is None.
+        Default is None. Can be specified at initialization or added
+        later using add_multilook() method.
     dir_names : dict[str, str] | None, optional
         Custom directory names for internal directories. Default is None.
 
@@ -99,10 +98,16 @@ class PathManager:
     ...     work_dir="/data/processing",
     ...     slc_dir="/data/SLC",
     ...     dem="/data/dem.tif",
-    ...     multilook_configs=[(1, 4), (2, 8)],
+    ...     multilook=[(1, 4), (2, 8)],
     ... )
     >>> pm.create_all_dirs()
     >>> pm.save("config.toml")
+
+    Or add multilook settings later:
+
+    >>> pm = PathManager(work_dir="/data/processing", slc_dir="/data/SLC")
+    >>> pm.add_multilook(1, 4)
+    >>> pm.add_multilook(2, 8)
 
     Notes
     -----
@@ -136,7 +141,7 @@ class PathManager:
         orbit_dir: str | Path | None = None,
         aux_dir: str | Path | None = None,
         dem: str | Path | None = None,
-        multilooks: list[tuple[int, int]] | None = None,
+        multilook: list[tuple[int, int]] | None = None,
         dir_names: dict[str, str] | None = None,
     ) -> None:
         # Main working directory
@@ -152,8 +157,8 @@ class PathManager:
         self._dir_names = {**self.DEFAULT_DIR_NAMES, **(dir_names or {})}
 
         # Multilook settings
-        if multilooks:
-            self._multilooks = list(starmap(Multilook, multilooks))
+        if multilook:
+            self._multilooks = list(starmap(Multilook, multilook))
         else:
             self._multilooks: list[Multilook] = []
 
@@ -274,7 +279,7 @@ class PathManager:
 
         Examples
         --------
-        >>> pm = PathManager(work_dir="/data", multilooks=[(1, 4)])
+        >>> pm = PathManager(work_dir="/data", multilook=[(1, 4)])
         >>> pm.has_multilook()
         True
 
@@ -311,7 +316,7 @@ class PathManager:
 
         Examples
         --------
-        >>> pm = PathManager(work_dir="/data", multilooks=[(1, 4), (2, 8)])
+        >>> pm = PathManager(work_dir="/data", multilook=[(1, 4), (2, 8)])
         >>> looks = pm.get_multilooks()
         >>> len(looks)
         2
@@ -720,7 +725,7 @@ class PathManager:
             orbit_dir=ext.get("orbit_dir"),
             aux_dir=ext.get("aux_dir"),
             dem=ext.get("dem"),
-            multilooks=ml_configs,
+            multilook=ml_configs,
         )
 
         # Restore directory names
