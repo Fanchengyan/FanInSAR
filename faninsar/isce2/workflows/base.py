@@ -6,13 +6,14 @@ This module provides the abstract base class for all ISCE2 processing workflows.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from faninsar._core.sar import Acquisition, Baselines, Pairs, PairsFactory
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from faninsar.isce2 import PathManager, TopsStackCommands
     from faninsar.query import BoundingBox
 
@@ -35,10 +36,6 @@ class BaseWorkflow(ABC):
         Whether to enable GPU acceleration. Default is False.
     text_cmd : str, optional
         Command prefix for backward compatibility. Default is "".
-    acquisitions : Acquisition | None, optional
-        Specified acquisition date subset. If None, auto-discovers all dates.
-    pairs : Pairs | None, optional
-        Specified interferometric pair subset. If None, auto-generates pairs.
     bbox : BoundingBox | None, optional
         Spatial extent filter. If None, processes all data.
 
@@ -52,6 +49,10 @@ class BaseWorkflow(ABC):
         Acquisition date collection.
     pairs : Pairs
         Interferometric pair collection.
+    pairs_factory : PairsFactory
+        Factory for building interferometric pairs.
+    full_pairs : Pairs
+        All possible date pairs from acquisitions.
     baselines : Baselines
         Baseline data (lazy loaded).
     bbox : BoundingBox | None
@@ -87,8 +88,6 @@ class BaseWorkflow(ABC):
         num_process: int = 1,
         use_gpu: bool = False,
         text_cmd: str = "",
-        acquisitions: Acquisition | None = None,
-        pairs: Pairs | None = None,
         bbox: BoundingBox | None = None,
     ) -> None:
         """Initialize the BaseWorkflow."""
@@ -105,11 +104,10 @@ class BaseWorkflow(ABC):
             text_cmd=text_cmd,
         )
 
-        # Initialize acquisitions
-        self.acquisitions = acquisitions or self._discover_acquisitions()
-
-        # Initialize pairs
-        self.pairs = pairs or self._generate_pairs()
+        # Initialize acquisitions and pairs
+        self._acquisitions = self._discover_acquisitions()
+        self._pairs = Pairs([])
+        self._pairs_factory: PairsFactory | None = None
 
         # Baseline data (lazy loaded)
         self._baselines: Baselines | None = None
@@ -125,11 +123,45 @@ class BaseWorkflow(ABC):
         return self._cmd_mgr
 
     @property
+    def acquisitions(self) -> Acquisition:
+        """Get the acquisition date collection."""
+        return self._acquisitions
+
+    @property
     def baselines(self) -> Baselines:
         """Get baseline data (lazy loaded)."""
         if self._baselines is None:
             self._baselines = self._load_baselines()
         return self._baselines
+
+    @property
+    def pairs(self) -> Pairs:
+        """Get the interferometric pair collection."""
+        return self._pairs
+
+    def set_pairs(self, pairs: Pairs) -> None:
+        """Set the interferometric pair collection."""
+        pairs_valid = self.full_pairs.intersect(pairs)
+        if len(pairs_valid) != len(pairs):
+            pairs_invalid = pairs - pairs_valid
+            logger.warning(
+                "The following pairs are not valid and will be ignored: \n%s",
+                "\n".join(pairs_invalid.to_names()),
+            )
+
+        self._pairs = pairs_valid
+
+    @property
+    def pairs_factory(self) -> PairsFactory:
+        """Return a pairs factory built from current acquisitions."""
+        if self._pairs_factory is None:
+            self._pairs_factory = PairsFactory(self.acquisitions)
+        return self._pairs_factory
+
+    @property
+    def full_pairs(self) -> Pairs:
+        """Return all possible date pairs from acquisitions."""
+        return self.pairs_factory.full_pairs
 
     @abstractmethod
     def generate_run_files(self) -> None:
@@ -232,31 +264,84 @@ class BaseWorkflow(ABC):
             else Acquisition([])
         )
 
-    def _generate_pairs(
+    def _normalize_acquisitions(
         self,
-        max_interval: int = 1,
-        max_days: int = 180,
-    ) -> Pairs:
-        """Generate interferometric pairs using PairsFactory.
+        acquisitions: Acquisition | list[str] | tuple[str, ...] | None,
+    ) -> Acquisition:
+        """Normalize acquisition input to an Acquisition object.
 
         Parameters
         ----------
-        max_interval : int, optional
-            Maximum interval between acquisitions. Default is 1.
-        max_days : int, optional
-            Maximum days between acquisitions. Default is 180.
+        acquisitions : Acquisition | list[str] | tuple[str, ...] | None
+            Acquisition input.
 
         Returns
         -------
-        Pairs
-            Generated interferometric pairs.
+        Acquisition
+            Normalized acquisitions.
 
         """
-        if len(self.acquisitions) == 0:
-            return Pairs([])
+        if acquisitions is None:
+            return Acquisition([])
+        if isinstance(acquisitions, Acquisition):
+            return acquisitions
+        if isinstance(acquisitions, str):
+            acquisition_values: list[str] = [acquisitions]
+        else:
+            acquisition_values = list(acquisitions)
+        import pandas as pd
 
-        factory = PairsFactory(self.acquisitions)
-        return factory.from_interval(max_interval=max_interval, max_days=max_days)
+        return Acquisition(pd.to_datetime(acquisition_values))
+
+    def _validate_acquisitions(self, acquisitions: Acquisition) -> None:
+        """Validate acquisitions against available SLC dates.
+
+        Parameters
+        ----------
+        acquisitions : Acquisition
+            Acquisition dates to validate.
+
+        Raises
+        ------
+        ValueError
+            If acquisitions contain dates not found in the SLC directory.
+
+        """
+        available = self._discover_acquisitions()
+        if len(available) == 0:
+            logger.warning(
+                "No acquisitions discovered from SLC directory for validation"
+            )
+            return
+        available_dates = set(available.strftime("%Y%m%d"))
+        requested_dates = set(acquisitions.strftime("%Y%m%d"))
+        missing_dates = sorted(requested_dates - available_dates)
+        if missing_dates:
+            logger.error(
+                "Acquisition dates are missing from SLC directory: %s",
+                ", ".join(missing_dates),
+            )
+            msg = "Acquisition dates are missing from SLC directory"
+            raise ValueError(msg)
+
+    def _set_acquisitions(
+        self, acquisitions: Acquisition | list[str] | tuple[str, ...] | None
+    ) -> None:
+        """Set acquisitions and reset dependent cached properties.
+
+        Parameters
+        ----------
+        acquisitions : Acquisition | list[str] | tuple[str, ...] | None
+            Optional acquisitions override. If None, auto-discover from SLC.
+
+        """
+        if acquisitions is None:
+            self._acquisitions = self._discover_acquisitions()
+        else:
+            normalized = self._normalize_acquisitions(acquisitions)
+            self._validate_acquisitions(normalized)
+            self._acquisitions = normalized
+        self._pairs_factory = None
 
     def _load_baselines(self) -> Baselines:
         """Load baseline data from file.
@@ -281,7 +366,9 @@ class BaseWorkflow(ABC):
         """Create all required directories for processing."""
         self.paths.create_all_dirs()
 
-    def _generate_workspace_run_all_script(self, script_name: str = "run_all.sh") -> Path:
+    def _generate_workspace_run_all_script(
+        self, script_name: str = "run_all.sh"
+    ) -> Path:
         """Generate a helper script to run all run-files sequentially.
 
         Parameters
@@ -300,9 +387,13 @@ class BaseWorkflow(ABC):
             If no run-files are found in the run directory.
 
         """
-        run_files = sorted(path for path in self.paths.run_dir.glob("run_*.sh") if path.is_file())
+        run_files = sorted(
+            path for path in self.paths.run_dir.glob("run_*.sh") if path.is_file()
+        )
         if not run_files:
-            run_files = sorted(path for path in self.paths.run_dir.glob("run_*") if path.is_file())
+            run_files = sorted(
+                path for path in self.paths.run_dir.glob("run_*") if path.is_file()
+            )
 
         if not run_files:
             logger.error("No run files found in %s", self.paths.run_dir)
@@ -320,12 +411,13 @@ class BaseWorkflow(ABC):
         ]
 
         for run_file in run_files:
-            lines.append(f'echo "[RUN] {run_file.name}"')
-            lines.append(f'sh "$RUN_DIR/{run_file.name}"')
-            lines.append("")
+            lines.extend((
+                f'echo "[RUN] {run_file.name}"',
+                f'sh "$RUN_DIR/{run_file.name}"',
+                "",
+            ))
 
-        lines.append('echo "All run scripts completed."')
-        lines.append("")
+        lines.extend(('echo "All run scripts completed."', ""))
 
         script_path.write_text("\n".join(lines), encoding="utf-8")
         script_path.chmod(0o755)

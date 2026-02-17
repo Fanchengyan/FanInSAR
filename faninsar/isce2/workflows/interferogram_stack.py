@@ -6,18 +6,18 @@ for multiple multilook configurations.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
-from typing_extensions import Literal, TypeAlias
-
+from faninsar._core.sar import Pairs, PairsFactory
 from faninsar.isce2.command_manager import Command
 from faninsar.isce2.workflows.slc_stack import SLCStack
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
-    from faninsar._core.sar import Acquisition, Pairs
+    from collections.abc import Sequence
+    from pathlib import Path
+
+    from faninsar._core.sar import Acquisition
     from faninsar.isce2 import PathManager
     from faninsar.isce2.path_manager import Multilook
     from faninsar.query import BoundingBox
@@ -97,10 +97,6 @@ class InterferogramStack(SLCStack):
         Whether to enable GPU acceleration. Default is False.
     text_cmd : str, optional
         Command prefix for backward compatibility. Default is "".
-    acquisitions : Acquisition | None, optional
-        Specified acquisition date subset.
-    pairs : Pairs | None, optional
-        Specified interferometric pair subset.
     bbox : BoundingBox | None, optional
         Spatial extent filter.
     coreg_method : str, optional
@@ -177,17 +173,13 @@ class InterferogramStack(SLCStack):
         num_process: int = 1,
         use_gpu: bool = False,
         text_cmd: str = "",
-        acquisitions: Acquisition | None = None,
-        pairs: Pairs | None = None,
         bbox: BoundingBox | None = None,
         coreg_method: Literal["NESD", "geometry"] = "NESD",
         reference_date: str | None = None,
         filter_strength: float = 0.5,
         unw_method: Literal["snaphu", "icu"] = "snaphu",
         virtual_merge: bool = True,
-        geocode_targets: Sequence[
-            GeocodeTargetLiteral | GeocodeTargetAliasLiteral
-        ]
+        geocode_targets: Sequence[GeocodeTargetLiteral | GeocodeTargetAliasLiteral]
         | None = None,
     ) -> None:
         """Initialize the InterferogramStack workflow."""
@@ -196,8 +188,6 @@ class InterferogramStack(SLCStack):
             num_process=num_process,
             use_gpu=use_gpu,
             text_cmd=text_cmd,
-            acquisitions=acquisitions,
-            pairs=pairs,
             bbox=bbox,
             coreg_method=coreg_method,
             reference_date=reference_date,
@@ -220,7 +210,11 @@ class InterferogramStack(SLCStack):
             path_manager.add_multilook(3, 9)
             self.multilooks = path_manager.get_multilooks()
 
-    def generate_run_files(self) -> None:
+    def generate_run_files(
+        self,
+        pairs: Pairs | Sequence[str] | None = None,
+        acquisitions: Acquisition | list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         """Generate all run files and config files for interferogram stack.
 
         Generates the following run files:
@@ -235,9 +229,46 @@ class InterferogramStack(SLCStack):
             - run_15_{az}_{rg}: filter_coherence
             - run_16_{az}_{rg}: unwrap
 
+        Parameters
+        ----------
+        pairs : Pairs | Sequence[str] | None, optional
+            Optional interferometric pairs. If provided, acquisitions will be
+            derived from pair dates unless acquisitions is explicitly set.
+        acquisitions : Acquisition | list[str] | tuple[str, ...] | None, optional
+            Optional acquisition date subset passed to the SLC workflow.
+
         """
+        normalized_pairs, pairs_specified, pair_strategy = self._resolve_pairs(pairs)
+        resolved_acquisitions, acquisition_strategy = self._resolve_acquisitions(
+            acquisitions, normalized_pairs, pairs_specified
+        )
+
+        if not pairs_specified:
+            if len(resolved_acquisitions) == 0:
+                logger.warning("No acquisitions available to build pairs")
+                resolved_pairs = Pairs([])
+                pair_strategy = "pairs_empty"
+            else:
+                logger.warning(
+                    "Pairs not specified; generating interval=1 pairs. "
+                    "Use pairs or pairs_factory to customize the network."
+                )
+                resolved_pairs = PairsFactory(resolved_acquisitions).from_interval(
+                    max_interval=1, max_days=180
+                )
+                pair_strategy = "interval_1"
+        else:
+            resolved_pairs = normalized_pairs
+
+        self._log_pair_strategy(pair_strategy)
+        self._log_acquisition_strategy(acquisition_strategy)
+
+        reference_date, secondary_dates = self._resolve_reference_and_secondary_dates(
+            resolved_acquisitions
+        )
+
         # First generate SLC stack run files (run_01-10)
-        super().generate_run_files()
+        super().generate_run_files(acquisitions=resolved_acquisitions)
 
         logger.info("Generating interferogram stack run files")
         logger.info("Multilook configurations: %s", self.multilooks)
@@ -254,10 +285,12 @@ class InterferogramStack(SLCStack):
             )
 
             suffix = f"_{ml.azimuth}_{ml.range}"
-            self._generate_merge_slc(12, ml, suffix)
+            self._generate_merge_slc(
+                12, ml, suffix, reference_date, secondary_dates
+            )
 
         # Step 13: Generate burst interferograms (shared, no multilook)
-        self._generate_burst_igram(13)
+        self._generate_burst_igram(13, resolved_pairs, reference_date)
 
         # Generate run_14-16 for each multilook configuration
         for ml in self.multilooks:
@@ -266,36 +299,200 @@ class InterferogramStack(SLCStack):
                 ml.azimuth,
                 ml.range,
             )
-            self._generate_multilook_downstream_workflow(ml)
+            self._generate_multilook_downstream_workflow(ml, resolved_pairs)
 
         # Step 17: Geocode unwrapped phase and coherence for each multilook
         for ml in self.multilooks:
-            self._generate_geocode(17, ml)
+            self._generate_geocode(17, ml, resolved_pairs, reference_date)
 
         self._generate_workspace_run_all_script()
 
         logger.info("Generated all interferogram run files")
 
-    def _generate_multilook_downstream_workflow(self, ml: Multilook) -> None:
+    def set_pairs(self, pairs: Pairs | Sequence[str] | None) -> None:
+        """Set pairs for later run-file generation.
+
+        Parameters
+        ----------
+        pairs : Pairs | Sequence[str] | None
+            Optional interferometric pairs.
+
+        """
+        normalized_pairs = self._normalize_pairs(pairs)
+        super().set_pairs(normalized_pairs)
+        logger.debug("Pairs updated via set_pairs; count=%d", len(self._pairs))
+
+    def _resolve_pairs(
+        self, pairs: Pairs | Sequence[str] | None
+    ) -> tuple[Pairs, bool, str]:
+        """Resolve pairs input and selection strategy.
+
+        Parameters
+        ----------
+        pairs : Pairs | Sequence[str] | None
+            Optional pairs input for run-file generation.
+
+        Returns
+        -------
+        tuple[Pairs, bool, str]
+            Normalized pairs, whether pairs were specified, and strategy label.
+
+        """
+        if pairs is not None:
+            return self._normalize_pairs(pairs), True, "pairs_argument"
+
+        if len(self.pairs) > 0:
+            return self.pairs, True, "pairs_property"
+
+        return self._normalize_pairs(None), False, "interval_1"
+
+    def _resolve_acquisitions(
+        self,
+        acquisitions: Acquisition | list[str] | tuple[str, ...] | None,
+        pairs: Pairs,
+        pairs_specified: bool,
+    ) -> tuple[Acquisition, str]:
+        """Resolve acquisitions for SLC workflow generation.
+
+        Parameters
+        ----------
+        acquisitions : Acquisition | list[str] | tuple[str, ...] | None
+            Optional acquisitions override.
+        pairs : Pairs
+            Resolved pairs selection.
+        pairs_specified : bool
+            Whether pairs were specified via arguments or property.
+
+        Returns
+        -------
+        tuple[Acquisition, str]
+            Resolved acquisitions and strategy identifier.
+
+        Raises
+        ------
+        ValueError
+            If acquisitions do not include all pairs dates.
+
+        """
+        if acquisitions is not None:
+            normalized_acquisitions = self._normalize_acquisitions(acquisitions)
+            self._validate_acquisitions(normalized_acquisitions)
+            if len(pairs) > 0:
+                self._validate_pairs_against_acquisitions(
+                    pairs, normalized_acquisitions
+                )
+            return normalized_acquisitions, "acquisitions_argument"
+
+        if pairs_specified:
+            return pairs.dates, "acquisitions_from_pairs"
+
+        return self.acquisitions, "acquisitions_all"
+
+    def _log_pair_strategy(self, strategy: str) -> None:
+        """Log the resolved pairs strategy.
+
+        Parameters
+        ----------
+        strategy : str
+            Strategy identifier.
+
+        """
+        logger.debug("Resolved pairs strategy: %s", strategy)
+
+    def _log_acquisition_strategy(self, strategy: str) -> None:
+        """Log the resolved acquisitions strategy.
+
+        Parameters
+        ----------
+        strategy : str
+            Strategy identifier.
+
+        """
+        logger.debug("Resolved acquisitions strategy: %s", strategy)
+
+    def _normalize_pairs(self, pairs: Pairs | Sequence[str] | None) -> Pairs:
+        """Normalize pairs input to a Pairs object.
+
+        Parameters
+        ----------
+        pairs : Pairs | Sequence[str] | None
+            Pairs input.
+
+        Returns
+        -------
+        Pairs
+            Normalized pairs.
+
+        """
+        if pairs is None:
+            return Pairs([])
+        if isinstance(pairs, Pairs):
+            return pairs
+        if isinstance(pairs, str):
+            return Pairs.from_names([pairs])
+
+        pair_items = list(pairs)
+        if not pair_items:
+            return Pairs([])
+        if all(isinstance(item, str) for item in pair_items):
+            return Pairs.from_names(pair_items)
+        return Pairs(pair_items)
+
+    def _validate_pairs_against_acquisitions(
+        self, pairs: Pairs, acquisitions: Acquisition
+    ) -> None:
+        """Validate that pair dates are within acquisitions.
+
+        Parameters
+        ----------
+        pairs : Pairs
+            Interferometric pairs.
+        acquisitions : Acquisition
+            Acquisition dates.
+
+        Raises
+        ------
+        ValueError
+            If pair dates are not contained in acquisitions.
+
+        """
+        if len(pairs) == 0 or len(acquisitions) == 0:
+            return
+        acquisition_dates = set(acquisitions.strftime("%Y%m%d"))
+        pair_dates = set(pairs.dates.strftime("%Y%m%d"))
+        missing_dates = sorted(pair_dates - acquisition_dates)
+        if missing_dates:
+            logger.error(
+                "Pairs include dates missing from acquisitions: %s",
+                ", ".join(missing_dates),
+            )
+            msg = "Pairs include dates missing from acquisitions"
+            raise ValueError(msg)
+
+    def _generate_multilook_downstream_workflow(
+        self, ml: Multilook, pairs: Pairs
+    ) -> None:
         """Generate downstream run files for a specific multilook.
 
         Parameters
         ----------
         ml : Multilook
             Multilook configuration.
+        pairs : Pairs
+            Interferometric pairs to process.
 
         """
         az, rg = ml.azimuth, ml.range
         suffix = f"_{az}_{rg}"
 
         # Step 14: Merge burst interferograms
-        self._generate_merge_igram(14, ml, suffix)
+        self._generate_merge_igram(14, ml, suffix, pairs)
 
         # Step 15: Filter and coherence
-        self._generate_filter_coherence(15, ml, suffix)
+        self._generate_filter_coherence(15, ml, suffix, pairs)
 
         # Step 16: Phase unwrapping
-        self._generate_unwrap(16, ml, suffix)
+        self._generate_unwrap(16, ml, suffix, pairs)
 
     def _generate_extract_valid_region(self, run_num: int) -> None:
         """Generate run file for extracting valid stack region.
@@ -362,7 +559,14 @@ class InterferogramStack(SLCStack):
             / f"{ref_date}_{sec_date}"
         )
 
-    def _generate_merge_slc(self, run_num: int, ml: Multilook, suffix: str) -> None:
+    def _generate_merge_slc(
+        self,
+        run_num: int,
+        ml: Multilook,
+        suffix: str,
+        reference_date: str,
+        secondary_dates: list[str],
+    ) -> None:
         """Generate run file for merging SLCs with multilook.
 
         Parameters
@@ -373,6 +577,10 @@ class InterferogramStack(SLCStack):
             Multilook configuration.
         suffix : str
             Suffix for run file name.
+        reference_date : str
+            Reference acquisition date in YYYYMMDD format.
+        secondary_dates : list[str]
+            Secondary acquisition dates in YYYYMMDD format.
 
         """
         commands = []
@@ -383,7 +591,7 @@ class InterferogramStack(SLCStack):
             stack=self.paths.work_dir / "stack",
             reference=self.paths.reference_path(),
             dirname=self.paths.reference_path(),
-            outfile=merged_slc_dir / self.reference_date / f"{self.reference_date}.slc",
+            outfile=merged_slc_dir / reference_date / f"{reference_date}.slc",
             name_pattern="burst*slc",
             method="top",
             aligned=False,
@@ -392,12 +600,12 @@ class InterferogramStack(SLCStack):
             multilook=False,
             azimuth_looks=ml.azimuth,
             range_looks=ml.range,
-            suffix=f"{self.reference_date}_{ml.azimuth}_{ml.range}",
+            suffix=f"{reference_date}_{ml.azimuth}_{ml.range}",
         )
         commands.append(ref_cmd)
 
         # Merge secondary SLCs
-        for date in self.secondary_dates:
+        for date in secondary_dates:
             sec_cmd = self.cmd_mgr.merge_bursts_cmd(
                 stack=self.paths.work_dir / "stack",
                 reference=self.paths.coreg_secondary_path(date),
@@ -418,23 +626,30 @@ class InterferogramStack(SLCStack):
         run_name = f"run_{run_num:02d}_merge_reference_secondary_slc{suffix}"
         self.cmd_mgr.generate_run_file(run_name, commands)
 
-    def _generate_burst_igram(self, run_num: int) -> None:
+    def _generate_burst_igram(
+        self, run_num: int, pairs: Pairs, reference_date: str
+    ) -> None:
         """Generate run file for burst interferogram generation.
 
         Parameters
         ----------
         run_num : int
             Run file number.
+        pairs : Pairs
+            Interferometric pairs to process.
+        reference_date : str
+            Reference acquisition date in YYYYMMDD format.
+
         """
         commands = []
 
         # Generate interferogram for each pair
-        for pair in self.pairs:
+        for pair in pairs:
             ref_date = pair.primary_string()
             sec_date = pair.secondary_string()
 
             # Determine the reference and secondary paths
-            if ref_date == self.reference_date:
+            if ref_date == reference_date:
                 ref_path = self.paths.reference_path()
             else:
                 ref_path = self.paths.coreg_secondary_path(ref_date)
@@ -463,7 +678,9 @@ class InterferogramStack(SLCStack):
         run_name = f"run_{run_num:02d}_generate_burst_igram"
         self.cmd_mgr.generate_run_file(run_name, commands)
 
-    def _generate_merge_igram(self, run_num: int, ml: Multilook, suffix: str) -> None:
+    def _generate_merge_igram(
+        self, run_num: int, ml: Multilook, suffix: str, pairs: Pairs
+    ) -> None:
         """Generate run file for merging burst interferograms.
 
         Parameters
@@ -474,17 +691,21 @@ class InterferogramStack(SLCStack):
             Multilook configuration.
         suffix : str
             Suffix for run file name.
+        pairs : Pairs
+            Interferometric pairs to process.
 
         """
         commands = []
         self._append_merge_reference_geometry_commands(commands, ml)
 
         # Merge interferogram for each pair
-        for pair in self.pairs:
+        for pair in pairs:
             ref_date = pair.primary_string()
             sec_date = pair.secondary_string()
 
-            igram_dir = self.paths.work_dir / "interferograms" / f"{ref_date}_{sec_date}"
+            igram_dir = (
+                self.paths.work_dir / "interferograms" / f"{ref_date}_{sec_date}"
+            )
             merged_dir = self._get_merged_igram_dir(ml, ref_date, sec_date)
 
             cmd = self.cmd_mgr.merge_bursts_cmd(
@@ -508,7 +729,7 @@ class InterferogramStack(SLCStack):
         self.cmd_mgr.generate_run_file(run_name, commands)
 
     def _generate_filter_coherence(
-        self, run_num: int, ml: Multilook, suffix: str
+        self, run_num: int, ml: Multilook, suffix: str, pairs: Pairs
     ) -> None:
         """Generate run file for filtering and coherence calculation.
 
@@ -520,12 +741,14 @@ class InterferogramStack(SLCStack):
             Multilook configuration.
         suffix : str
             Suffix for run file name.
+        pairs : Pairs
+            Interferometric pairs to process.
 
         """
         commands = []
 
         # Filter and calculate coherence for each pair
-        for pair in self.pairs:
+        for pair in pairs:
             ref_date = pair.primary_string()
             sec_date = pair.secondary_string()
 
@@ -551,7 +774,9 @@ class InterferogramStack(SLCStack):
         run_name = f"run_{run_num:02d}_filter_coherence{suffix}"
         self.cmd_mgr.generate_run_file(run_name, commands)
 
-    def _generate_unwrap(self, run_num: int, ml: Multilook, suffix: str) -> None:
+    def _generate_unwrap(
+        self, run_num: int, ml: Multilook, suffix: str, pairs: Pairs
+    ) -> None:
         """Generate run file for phase unwrapping.
 
         Parameters
@@ -562,12 +787,14 @@ class InterferogramStack(SLCStack):
             Multilook configuration.
         suffix : str
             Suffix for run file name.
+        pairs : Pairs
+            Interferometric pairs to process.
 
         """
         commands = []
 
         # Unwrap each interferogram
-        for pair in self.pairs:
+        for pair in pairs:
             ref_date = pair.primary_string()
             sec_date = pair.secondary_string()
 
@@ -653,7 +880,13 @@ class InterferogramStack(SLCStack):
             )
             commands.append(cmd)
 
-    def _generate_geocode(self, run_num: int, ml: Multilook) -> None:
+    def _generate_geocode(
+        self,
+        run_num: int,
+        ml: Multilook,
+        pairs: Pairs,
+        reference_date: str,
+    ) -> None:
         """Generate geocode run file for a multilook configuration.
 
         Parameters
@@ -662,6 +895,10 @@ class InterferogramStack(SLCStack):
             Run file number.
         ml : Multilook
             Multilook configuration.
+        pairs : Pairs
+            Interferometric pairs to process.
+        reference_date : str
+            Reference acquisition date in YYYYMMDD format.
 
         """
         if self.paths.dem is None:
@@ -679,19 +916,21 @@ class InterferogramStack(SLCStack):
         ]
 
         if pair_targets:
-            for pair in self.pairs:
+            for pair in pairs:
                 ref_date = pair.primary_string()
                 sec_date = pair.secondary_string()
                 merged_dir = self._get_merged_igram_dir(ml, ref_date, sec_date)
-                file_list = " ".join(str(merged_dir / target) for target in pair_targets)
+                file_list = " ".join(
+                    str(merged_dir / target) for target in pair_targets
+                )
 
                 command_line = (
                     "geocodeIsce.py "
-                    f"-f \"{file_list}\" "
-                    f"-b \"{bbox_arg}\" "
+                    f'-f "{file_list}" '
+                    f'-b "{bbox_arg}" '
                     f"-d {self.paths.dem} "
-                    f"-m {self._coreg_or_reference_path(ref_date)} "
-                    f"-s {self._coreg_or_reference_path(sec_date)} "
+                    f"-m {self._coreg_or_reference_path(ref_date, reference_date)} "
+                    f"-s {self._coreg_or_reference_path(sec_date, reference_date)} "
                     f"-r {ml.range} "
                     f"-a {ml.azimuth}"
                 )
@@ -703,12 +942,17 @@ class InterferogramStack(SLCStack):
                 )
 
         if geom_targets:
-            geom_reference_dir = self.paths.multilook_merged_path(ml.azimuth, ml.range) / "geom_reference"
-            file_list = " ".join(str(geom_reference_dir / target) for target in geom_targets)
+            geom_reference_dir = (
+                self.paths.multilook_merged_path(ml.azimuth, ml.range)
+                / "geom_reference"
+            )
+            file_list = " ".join(
+                str(geom_reference_dir / target) for target in geom_targets
+            )
             command_line = (
                 "geocodeIsce.py "
-                f"-f \"{file_list}\" "
-                f"-b \"{bbox_arg}\" "
+                f'-f "{file_list}" '
+                f'-b "{bbox_arg}" '
                 f"-d {self.paths.dem} "
                 f"-m {self.paths.reference_path()} "
                 f"-s {self.paths.reference_path()} "
@@ -753,9 +997,7 @@ class InterferogramStack(SLCStack):
 
     @staticmethod
     def _normalize_geocode_targets(
-        geocode_targets: Sequence[
-            GeocodeTargetLiteral | GeocodeTargetAliasLiteral
-        ]
+        geocode_targets: Sequence[GeocodeTargetLiteral | GeocodeTargetAliasLiteral]
         | None,
     ) -> tuple[GeocodeTargetLiteral, ...]:
         """Normalize and validate geocode target list.

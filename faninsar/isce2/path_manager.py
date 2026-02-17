@@ -78,6 +78,10 @@ class PathManager:
         later using add_multilook() method.
     dir_names : dict[str, str] | None, optional
         Custom directory names for internal directories. Default is None.
+    script_dir : str | Path | None, optional
+        Separate directory for config and run files. When specified,
+        ``run_dir`` and ``config_dir`` will be placed under this directory
+        instead of ``work_dir``. Default is None (use ``work_dir``).
 
     Attributes
     ----------
@@ -143,9 +147,13 @@ class PathManager:
         dem: str | Path | None = None,
         multilook: list[tuple[int, int]] | None = None,
         dir_names: dict[str, str] | None = None,
+        script_dir: str | Path | None = None,
     ) -> None:
         # Main working directory
         self._work_dir = Path(work_dir).resolve()
+
+        # Script directory (config + run files root), defaults to work_dir
+        self._script_dir = Path(script_dir).resolve() if script_dir else None
 
         # External input paths
         self._slc_dir = Path(slc_dir).resolve() if slc_dir else None
@@ -166,6 +174,14 @@ class PathManager:
     def work_dir(self) -> Path:
         """Get the main working directory."""
         return self._work_dir
+
+    @property
+    def script_dir(self) -> Path | None:
+        """Get the script directory for config and run files.
+
+        Returns None if not set (defaults to work_dir).
+        """
+        return self._script_dir
 
     @property
     def slc_dir(self) -> Path | None:
@@ -409,12 +425,14 @@ class PathManager:
     @property
     def run_dir(self) -> Path:
         """Get the run files directory."""
-        return self._work_dir / self._dir_names["run"]
+        base = self._script_dir or self._work_dir
+        return base / self._dir_names["run"]
 
     @property
     def config_dir(self) -> Path:
         """Get the configuration files directory."""
-        return self._work_dir / self._dir_names["config"]
+        base = self._script_dir or self._work_dir
+        return base / self._dir_names["config"]
 
     def reference_path(self) -> Path:
         """Get the reference scene directory."""
@@ -560,6 +578,8 @@ class PathManager:
 
         """
         print(f"{prefix}📁 Working directory: {self._work_dir}")
+        if self._script_dir:
+            print(f"{prefix}📁 Script directory:  {self._script_dir}")
         print(f"{prefix}\n  External inputs:")
         print(
             f"{prefix}    SLC directory:    {self._fmt_path(self._slc_dir, show_exists)}"
@@ -646,6 +666,9 @@ class PathManager:
             },
         }
 
+        if self._script_dir:
+            data["work"]["script_dir"] = str(self._script_dir)
+
         # Only add external paths that are set (TOML can't serialize None)
         if self._slc_dir:
             data["external"]["slc_dir"] = str(self._slc_dir)
@@ -726,6 +749,7 @@ class PathManager:
             aux_dir=ext.get("aux_dir"),
             dem=ext.get("dem"),
             multilook=ml_configs,
+            script_dir=data["work"].get("script_dir"),
         )
 
         # Restore directory names
