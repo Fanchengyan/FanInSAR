@@ -613,7 +613,7 @@ class SLCStack(BaseWorkflow):
         # Find .zip files
         safe_files.extend(slc_dir.glob(f"S1*_IW_SLC_*{date}*.zip"))
 
-        logger.info("Found %d SAFE files for date %s", len(safe_files), date)
+        logger.debug("Found %d SAFE files for date %s", len(safe_files), date)
         return sorted(safe_files)
 
     def _get_orbit_file(self, safe_file: Path) -> Path | None:

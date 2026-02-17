@@ -6,10 +6,10 @@ allowing direct command execution without generating intermediate files.
 
 from __future__ import annotations
 
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import TYPE_CHECKING
 
 from faninsar.isce2.executors import execute_command
@@ -190,7 +190,9 @@ class TopsStackCommands:
                 "safe_file": Path(safe_file),
                 "orbit_file": Path(orbit_file),
                 "orbit_type": orbit_type,
-                "outdir": Path(outdir) if outdir is not None else self.paths.reference_path(),
+                "outdir": Path(outdir)
+                if outdir is not None
+                else self.paths.reference_path(),
                 "swaths": swaths,
                 "polarization": polarization,
                 "bbox": bbox,
@@ -616,7 +618,7 @@ class TopsStackCommands:
         azimuth_looks: int = 1,
         range_looks: int = 1,
         multilook_tool: str | None = None,
-        no_data_value: str | int | float | None = None,
+        no_data_value: str | float | None = None,
         suffix: str = "",
     ) -> Command:
         """Build a mergeBursts command.
@@ -1069,7 +1071,7 @@ class TopsStackCommands:
                 cmd = futures[future]
                 try:
                     result = future.result()
-                    logger.info(
+                    logger.debug(
                         "Command %s completed with result: %s",
                         cmd.cmd_name,
                         result,
@@ -1088,7 +1090,7 @@ class TopsStackCommands:
         """
         for cmd in batch:
             result = execute_command(cmd)
-            logger.info(
+            logger.debug(
                 "Command %s completed with result: %s",
                 cmd.cmd_name,
                 result,
@@ -1145,7 +1147,9 @@ class TopsStackCommands:
                 # Parallel processing markers
                 is_last = i == len(commands) - 1
                 batch_boundary = (i + 1) % self.num_process == 0
-                should_background = self.num_process > 1 and not batch_boundary and not is_last
+                should_background = (
+                    self.num_process > 1 and not batch_boundary and not is_last
+                )
 
                 if should_background:
                     f.write(cmd_line + " &\n")
@@ -1157,7 +1161,7 @@ class TopsStackCommands:
         # Make the run file executable
         run_path.chmod(0o755)
 
-        logger.info("Writing %s", run_path)
+        logger.debug("Writing %s", run_path)
 
     def _generate_config_file(self, cmd: Command) -> str:
         """Generate a config file for backwards compatibility.
@@ -1257,40 +1261,32 @@ class TopsStackCommands:
         """
         params = cmd.params
         interferogram_dir = Path(params["interferogram_dir"])
-        config.write_generate_igram(
-            {
-                "reference": str(params["reference"]),
-                "secondary": str(params["secondary"]),
-                "interferogram": str(interferogram_dir),
-                "flatten": "False",
-                "prefix": "int",
-                "overlap": "True",
-            }
-        )
-        config.write_overlap_withdem(
-            {
-                "interferogram": str(interferogram_dir / "coarse_ifg"),
-                "reference_dir": str(params["reference"]),
-                "secondary_dir": str(params["secondary"]),
-                "overlap_dir": str(params["overlap_dir"]),
-            }
-        )
-        config.write_azimuth_misreg(
-            {
-                "overlap_dir": str(params["overlap_dir"]),
-                "out_azimuth": str(params["out_azimuth"]),
-                "coh_threshold": str(params["coh_threshold"]),
-                "plot": "False",
-            }
-        )
-        config.write_range_misreg(
-            {
-                "reference": str(params["reference"]),
-                "secondary": str(params["secondary"]),
-                "out_range": str(params["out_range"]),
-                "snr_threshold": str(params["snr_threshold"]),
-            }
-        )
+        config.write_generate_igram({
+            "reference": str(params["reference"]),
+            "secondary": str(params["secondary"]),
+            "interferogram": str(interferogram_dir),
+            "flatten": "False",
+            "prefix": "int",
+            "overlap": "True",
+        })
+        config.write_overlap_withdem({
+            "interferogram": str(interferogram_dir / "coarse_ifg"),
+            "reference_dir": str(params["reference"]),
+            "secondary_dir": str(params["secondary"]),
+            "overlap_dir": str(params["overlap_dir"]),
+        })
+        config.write_azimuth_misreg({
+            "overlap_dir": str(params["overlap_dir"]),
+            "out_azimuth": str(params["out_azimuth"]),
+            "coh_threshold": str(params["coh_threshold"]),
+            "plot": "False",
+        })
+        config.write_range_misreg({
+            "reference": str(params["reference"]),
+            "secondary": str(params["secondary"]),
+            "out_range": str(params["out_range"]),
+            "snr_threshold": str(params["snr_threshold"]),
+        })
 
     @staticmethod
     def _config_base_name(cmd_name: str) -> str:

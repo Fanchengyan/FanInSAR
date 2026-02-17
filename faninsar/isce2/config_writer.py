@@ -26,24 +26,20 @@ class ConfigWriter:
     Examples
     --------
     >>> config = ConfigWriter(Path("configs/config_reference.ini"))
-    >>> config.write_sentinel1_tops(
-    ...     {
-    ...         "dirname": "/data/safe",
-    ...         "swaths": "1 2 3",
-    ...         "orbit_dir": "/data/orbits",
-    ...         "outdir": "/work/reference",
-    ...         "auxdir": "/data/aux",
-    ...         "pol": "vv",
-    ...     }
-    ... )
-    >>> config.write_topo(
-    ...     {
-    ...         "reference": "/work/reference",
-    ...         "dem": "/data/dem.wgs84",
-    ...         "geom_referenceDir": "/work/geom_reference",
-    ...         "numProcess": 4,
-    ...     }
-    ... )
+    >>> config.write_sentinel1_tops({
+    ...     "dirname": "/data/safe",
+    ...     "swaths": "1 2 3",
+    ...     "orbit_dir": "/data/orbits",
+    ...     "outdir": "/work/reference",
+    ...     "auxdir": "/data/aux",
+    ...     "pol": "vv",
+    ... })
+    >>> config.write_topo({
+    ...     "reference": "/work/reference",
+    ...     "dem": "/data/dem.wgs84",
+    ...     "geom_referenceDir": "/work/geom_reference",
+    ...     "numProcess": 4,
+    ... })
     >>> config.finalize()
 
     """
@@ -54,7 +50,7 @@ class ConfigWriter:
             filepath = filepath.with_suffix(".ini")
 
         self.filepath = filepath
-        self.f = open(filepath, "w")
+        self.f = Path(filepath).open("w")
         self.function_counter = 0
 
         # Write [Common] section
@@ -452,4 +448,4 @@ class ConfigWriter:
     def finalize(self) -> None:
         """Close the configuration file."""
         self.f.close()
-        logger.info("Config file written: %s", self.filepath)
+        logger.debug("Config file written: %s", self.filepath)
