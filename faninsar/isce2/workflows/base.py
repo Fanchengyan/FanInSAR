@@ -164,11 +164,17 @@ class BaseWorkflow(ABC):
         return self.pairs_factory.full_pairs
 
     @abstractmethod
-    def generate_run_files(self) -> None:
+    def generate_run_files(self, *, clean: bool = True) -> None:
         """Generate all run files and config files.
 
         This method must be implemented by subclasses to generate
         the appropriate run files for each workflow type.
+
+        Parameters
+        ----------
+        clean : bool, optional
+            Whether to remove existing run files and config files before
+            generating new ones. Default is True.
 
         """
         ...
@@ -365,6 +371,15 @@ class BaseWorkflow(ABC):
     def create_directories(self) -> None:
         """Create all required directories for processing."""
         self.paths.create_all_dirs()
+
+    def _clean_script_dirs(self) -> None:
+        """Remove all files in run_dir and config_dir."""
+        import shutil
+
+        for d in (self.paths.run_dir, self.paths.config_dir):
+            if d.exists():
+                shutil.rmtree(d)
+                logger.info("Cleaned directory: %s", d)
 
     def _generate_workspace_run_all_script(
         self, script_name: str = "run_all.sh"

@@ -214,6 +214,8 @@ class InterferogramStack(SLCStack):
         self,
         pairs: Pairs | Sequence[str] | None = None,
         acquisitions: Acquisition | list[str] | tuple[str, ...] | None = None,
+        *,
+        clean: bool = True,
     ) -> None:
         """Generate all run files and config files for interferogram stack.
 
@@ -224,10 +226,11 @@ class InterferogramStack(SLCStack):
             - run_12_{az}_{rg}: merge_reference_secondary_slc
         - run_13: Shared full-resolution burst interferograms
             - run_13_generate_burst_igram
-        - run_14-16: For each multilook configuration:
+        - run_14-17: For each multilook configuration:
             - run_14_{az}_{rg}: merge_burst_igram
             - run_15_{az}_{rg}: filter_coherence
             - run_16_{az}_{rg}: unwrap
+            - run_17_{az}_{rg}: geocode
 
         Parameters
         ----------
@@ -236,6 +239,9 @@ class InterferogramStack(SLCStack):
             derived from pair dates unless acquisitions is explicitly set.
         acquisitions : Acquisition | list[str] | tuple[str, ...] | None, optional
             Optional acquisition date subset passed to the SLC workflow.
+        clean : bool, optional
+            Whether to remove existing run files and config files before
+            generating new ones. Default is True.
 
         """
         normalized_pairs, pairs_specified, pair_strategy = self._resolve_pairs(pairs)
@@ -268,7 +274,7 @@ class InterferogramStack(SLCStack):
         )
 
         # First generate SLC stack run files (run_01-10)
-        super().generate_run_files(acquisitions=resolved_acquisitions)
+        super().generate_run_files(acquisitions=resolved_acquisitions, clean=clean)
 
         logger.info("Generating interferogram stack run files")
         logger.info("Multilook configurations: %s", self.multilooks)

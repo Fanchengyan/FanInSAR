@@ -182,6 +182,8 @@ class SLCStack(BaseWorkflow):
     def generate_run_files(
         self,
         acquisitions: Acquisition | list[str] | tuple[str, ...] | None = None,
+        *,
+        clean: bool = True,
     ) -> None:
         """Generate all run files and config files for SLC stack.
 
@@ -195,6 +197,9 @@ class SLCStack(BaseWorkflow):
         ----------
         acquisitions : Acquisition | list[str] | tuple[str, ...] | None, optional
             Optional acquisition date subset. If None, uses all discovered dates.
+        clean : bool, optional
+            Whether to remove existing run files and config files before
+            generating new ones. Default is True.
 
         """
         if acquisitions is None:
@@ -210,6 +215,10 @@ class SLCStack(BaseWorkflow):
         logger.info("Generating SLC stack run files")
         logger.info("Reference date: %s", reference_date)
         logger.info("Secondary dates: %d", len(secondary_dates))
+
+        # Clean existing script files if requested
+        if clean:
+            self._clean_script_dirs()
 
         # Create run directory
         self.paths.run_dir.mkdir(parents=True, exist_ok=True)
