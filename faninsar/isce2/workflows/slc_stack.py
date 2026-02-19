@@ -82,6 +82,7 @@ class SLCStack(BaseWorkflow):
         num_overlap_connections: int = 3,
         esd_coherence_threshold: float = 0.85,
         snr_threshold: float = 10.0,
+        omp_num_threads: int | None = None,
     ) -> None:
         """Initialize the SLCStack workflow."""
         super().__init__(
@@ -90,6 +91,7 @@ class SLCStack(BaseWorkflow):
             use_gpu=use_gpu,
             text_cmd=text_cmd,
             bbox=bbox,
+            omp_num_threads=omp_num_threads,
         )
 
         # Validate coregistration method

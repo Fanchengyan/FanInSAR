@@ -38,6 +38,9 @@ class BaseWorkflow(ABC):
         Command prefix for backward compatibility. Default is "".
     bbox : BoundingBox | None, optional
         Spatial extent filter. If None, processes all data.
+    omp_num_threads : int | None, optional
+        Number of OpenMP threads. If set, ``export OMP_NUM_THREADS=N``
+        is written to the top of ``run_all.sh``. Default is None.
 
     Attributes
     ----------
@@ -89,10 +92,12 @@ class BaseWorkflow(ABC):
         use_gpu: bool = False,
         text_cmd: str = "",
         bbox: BoundingBox | None = None,
+        omp_num_threads: int | None = None,
     ) -> None:
         """Initialize the BaseWorkflow."""
         self._paths = path_manager
         self.bbox = bbox
+        self.omp_num_threads = omp_num_threads
 
         # Create TopsStackCommands internally (composition pattern)
         from faninsar.isce2 import TopsStackCommands
@@ -415,15 +420,24 @@ class BaseWorkflow(ABC):
             msg = f"No run files found in {self.paths.run_dir}"
             raise FileNotFoundError(msg)
 
-        script_path = self.paths.work_dir / script_name
+        script_path = (self.paths.script_dir or self.paths.work_dir) / script_name
         lines = [
             "#!/bin/sh",
             "",
             "set -eu",
             "",
+        ]
+
+        if self.omp_num_threads is not None:
+            lines.extend((
+                f"export OMP_NUM_THREADS={self.omp_num_threads}",
+                "",
+            ))
+
+        lines.extend((
             f'RUN_DIR="{self.paths.run_dir}"',
             "",
-        ]
+        ))
 
         for run_file in run_files:
             lines.extend((

@@ -181,6 +181,7 @@ class InterferogramStack(SLCStack):
         virtual_merge: bool = True,
         geocode_targets: Sequence[GeocodeTargetLiteral | GeocodeTargetAliasLiteral]
         | None = None,
+        omp_num_threads: int | None = None,
     ) -> None:
         """Initialize the InterferogramStack workflow."""
         super().__init__(
@@ -191,6 +192,7 @@ class InterferogramStack(SLCStack):
             bbox=bbox,
             coreg_method=coreg_method,
             reference_date=reference_date,
+            omp_num_threads=omp_num_threads,
         )
 
         self.filter_strength = filter_strength
@@ -208,7 +210,7 @@ class InterferogramStack(SLCStack):
                 "Using default (3, 9). Consider adding multilook settings."
             )
             path_manager.add_multilook(3, 9)
-            self.multilooks = path_manager.get_multilooks()
+            self.multilooks = path_manager.  get_multilooks()
 
     def generate_run_files(
         self,
