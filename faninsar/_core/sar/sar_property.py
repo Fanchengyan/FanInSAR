@@ -61,12 +61,14 @@ from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
     from faninsar.typing.sar import FrequencyUnit, WavelengthUnit
-else:
-    # Runtime fallback: define as str to avoid circular import
-    FrequencyUnit = str
-    WavelengthUnit = str
 
 logger = setup_logger(__name__)
+
+# Valid unit tuples used for runtime validation. These mirror the Literal types
+# defined in faninsar.typing.sar (which is the canonical source for type checkers).
+# Direct import is avoided to prevent circular imports through faninsar.typing.
+_WAVELENGTH_UNITS: tuple[str, ...] = ("m", "cm", "dm", "mm", "nm", "km", "um")
+_FREQUENCY_UNITS: tuple[str, ...] = ("GHz", "MHz", "kHz", "Hz", "THz")
 
 # Private UnitRegistry for internal use only
 _ureg = pint.UnitRegistry()
@@ -132,12 +134,8 @@ class Wavelength:
             If the unit is not one of the recognized wavelength units.
 
         """
-        valid_units = ["m", "cm", "dm", "mm", "nm", "km", "um"]
-        if self.unit not in valid_units:
-            msg = (
-                f"Invalid unit: {self.unit}. "
-                f"Must be one of {valid_units}."
-            )
+        if self.unit not in _WAVELENGTH_UNITS:
+            msg = f"Invalid unit: {self.unit}. Must be one of {_WAVELENGTH_UNITS}."
             logger.error(msg)
             raise ValueError(msg)
 
@@ -206,11 +204,8 @@ class Wavelength:
         Wavelength(data=100.0, unit='cm')
 
         """
-        valid_units = ["m", "cm", "dm", "mm", "nm", "km", "um"]
-        if unit not in valid_units:
-            msg = (
-                f"Invalid unit: {unit}. Must be one of {valid_units}."
-            )
+        if unit not in _WAVELENGTH_UNITS:
+            msg = f"Invalid unit: {unit}. Must be one of {_WAVELENGTH_UNITS}."
             logger.error(msg)
             raise ValueError(msg)
 
@@ -504,12 +499,8 @@ class Frequency:
             If the unit is not one of the recognized frequency units.
 
         """
-        valid_units = ["GHz", "MHz", "kHz", "Hz", "THz"]
-        if self.unit not in valid_units:
-            msg = (
-                f"Invalid unit: {self.unit}. "
-                f"Must be one of {valid_units}."
-            )
+        if self.unit not in _FREQUENCY_UNITS:
+            msg = f"Invalid unit: {self.unit}. Must be one of {_FREQUENCY_UNITS}."
             logger.error(msg)
             raise ValueError(msg)
 
@@ -578,9 +569,8 @@ class Frequency:
         Frequency(data=1000.0, unit='MHz')
 
         """
-        valid_units = ["GHz", "MHz", "kHz", "Hz", "THz"]
-        if unit not in valid_units:
-            msg = f"Invalid unit: {unit}. Must be one of {valid_units}."
+        if unit not in _FREQUENCY_UNITS:
+            msg = f"Invalid unit: {unit}. Must be one of {_FREQUENCY_UNITS}."
             logger.error(msg)
             raise ValueError(msg)
 

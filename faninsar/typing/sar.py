@@ -7,10 +7,14 @@ and type checking for unit-related parameters.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, TypeAlias, get_args
 
 # Wavelength units
-WavelengthUnit = Literal["m", "cm", "dm", "mm", "nm", "km", "um"]
+WavelengthUnit: TypeAlias = Literal["m", "cm", "dm", "mm", "nm", "km", "um"]
 
 # Frequency units
-FrequencyUnit = Literal["GHz", "MHz", "kHz", "Hz", "THz"]
+FrequencyUnit: TypeAlias = Literal["GHz", "MHz", "kHz", "Hz", "THz"]
+
+# Runtime-accessible unit tuples (derived from the Literal types above)
+WAVELENGTH_UNITS: tuple[str, ...] = get_args(WavelengthUnit)
+FREQUENCY_UNITS: tuple[str, ...] = get_args(FrequencyUnit)
