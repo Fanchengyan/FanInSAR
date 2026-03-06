@@ -475,7 +475,7 @@ class RasterDataset(GeoDataset):
             self.index.insert(count, row.bounds, row.paths)
 
         # Check if any valid files were found
-        if count == 0:
+        if not files_df.valid.any():
             msg = (
                 f"No {self.__class__.__name__} data was found in "
                 f"`root_dir='{self.root_dir}'`"
@@ -494,7 +494,7 @@ class RasterDataset(GeoDataset):
             )
             logger.warning(msg)
         # Set internal attributes
-        self._count = count
+        self._count = files_df.valid.sum()
         self._valid = files_df.valid.values
 
         # Set band indexes
