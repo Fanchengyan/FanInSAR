@@ -47,7 +47,7 @@ class LiCSAR(InterferogramDataset, Sentinel1):
         metadata files include: DEM, U, E, N, baselines, polygon.
         """
 
-        def parse_file(pattern: str) -> Path:
+        def parse_file(pattern: str) -> Path | None:
             result = list(self.root_dir.rglob(pattern))
             if len(result) == 0:
                 warnings.warn(f"File not found: {pattern}", stacklevel=2)

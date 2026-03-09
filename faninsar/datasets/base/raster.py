@@ -596,7 +596,7 @@ class RasterDataset(GeoDataset):
 
         # Check CRS consistency across files and with final CRS
         self._same_crs = (valid_files.file_crs.nunique() == 1) and (
-            first_valid.res == final_crs
+            first_valid.crs == final_crs
         )
 
         # Update colormap from first valid file if not already set

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import rasterio
@@ -20,12 +21,12 @@ from .aps import ApsPairs
 from .base import PairDataset, RasterDataset
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from os import PathLike
 
     from rasterio.crs import CRS
 
-    from faninsar._core.sar import Baselines, Pairs
-    from faninsar._core.sar.sar_tools import PhaseDeformationConverter
+    from faninsar._core.sar import Baselines, Pairs, PhaseDeformationConverter
 
 logger = setup_logger(__name__)
 
@@ -334,6 +335,25 @@ class InterferogramDataset(PairDataset):
         """
         msg = "parse_baseline method must be implemented in subclass"
         raise NotImplementedError(msg)
+
+    @classmethod
+    def parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
+        """Parse pairs from the paths of the interferogram."""
+        names = [Path(f).name for f in paths]
+        pair_names = []
+        for name in names:
+            match = re.search(r"_(\d{8})_(\d{8})_", name)
+            if match:
+                pair_name = f"{match.group(1)}_{match.group(2)}"
+                pair_names.append(pair_name)
+            else:
+                msg = (
+                    f"Filename {name} does not contain *_YYYYMMDD_YYYYMMDD_* pattern."
+                    " Unable to parse pair name."
+                )
+                logger.error(msg)
+                raise ValueError(msg)
+        return Pairs.from_names(pair_names)
 
     @property
     def coh_dataset(self) -> CoherenceDataset:

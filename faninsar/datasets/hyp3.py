@@ -2,18 +2,12 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
-
 import numpy as np
 
 from faninsar._core.file_tools import load_meta
 from faninsar._core.sar import Baselines, Pairs
 from faninsar._core.sar.sar_missions import Sentinel1
 from faninsar.datasets.ifg import InterferogramDataset
-
-if TYPE_CHECKING:
-    from os import PathLike
 
 
 class HyP3S1(InterferogramDataset, Sentinel1):
@@ -26,13 +20,6 @@ class HyP3S1(InterferogramDataset, Sentinel1):
 
     pattern_unw = "*unw_phase.tif"
     pattern_coh = "*corr.tif"
-
-    @classmethod
-    def parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
-        """Parse the Pairs from the paths of the interferogram."""
-        names = [Path(f).name for f in paths]
-        pair_names = ["_".join(i.split("_")[1:3]) for i in names]
-        return Pairs.from_names(pair_names)
 
     def parse_baselines(self, pairs: Pairs | None = None) -> Baselines:
         """Parse the baseline of the interferogram for given pairs.
@@ -75,10 +62,3 @@ class HyP3S1Burst(InterferogramDataset, Sentinel1):
 
     pattern_unw = "*unw_phase.tif"
     pattern_coh = "*corr.tif"
-
-    @classmethod
-    def parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
-        """Parse pairs from the paths of the interferogram."""
-        names = [Path(f).name for f in paths]
-        pair_names = ["_".join(i.split("_")[3:5]) for i in names]
-        return Pairs.from_names(pair_names)
