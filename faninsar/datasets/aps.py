@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from abc import ABC
 from pathlib import Path
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -13,12 +13,13 @@ import rasterio
 from rasterio.enums import Resampling
 
 from faninsar._core.sar.pairs import Pairs
-from faninsar.datasets.base import PairDataset, TimeSeriesDataset
+from faninsar.datasets import PairDataset, TimeSeriesDataset
 from faninsar.logging import setup_logger
 
 logger = setup_logger(__name__)
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from os import PathLike
 
     from pyproj.crs.crs import CRS

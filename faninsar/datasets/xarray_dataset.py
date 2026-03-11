@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Literal, Sequence, cast
+from typing import TYPE_CHECKING, Literal, Self, TypeAlias, cast
 
 import dask.array as da
 import numpy as np
@@ -44,7 +44,6 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.transform import Affine, array_bounds
 from tqdm import tqdm
-from typing_extensions import Self, TypeAlias
 
 from faninsar.datasets.base.geo import GeoDataset
 from faninsar.datasets.geobox import GeoBox
@@ -52,6 +51,8 @@ from faninsar.logging import setup_logger
 from faninsar.query.bbox import BoundingBox
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
     from rasterio.windows import Window
 
     from faninsar.query.points import Points
@@ -658,7 +659,7 @@ class XarrayDataset(GeoDataset):
                     else:
                         # Handle extra dimensions by taking first element
                         values[i] = val.flat[0]
-                except (KeyError, IndexError):  # noqa: PERF203
+                except (KeyError, IndexError):
                     # Point outside bounds
                     values[i] = self.nodata if self.nodata is not None else np.nan
 

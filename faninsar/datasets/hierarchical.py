@@ -22,7 +22,7 @@ faninsar.datasets.base.hierarchical
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
 from rasterio.enums import Resampling
 
@@ -33,6 +33,8 @@ from faninsar.datasets.xarray_dataset import XarrayDataset, XarrayDataSpec
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from rasterio.crs import CRS
 
     from faninsar.typing import ResamplingLike

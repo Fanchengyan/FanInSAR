@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from os import PathLike
-from typing import (
-    Callable,
-    Iterable,
-    cast,
-)
+from typing import TypeAlias, cast
 
 import numpy as np
 import rioxarray  # noqa: F401
 from rasterio.dtypes import dtype_ranges
-from typing_extensions import TypeAlias
 
 from faninsar._core.sar.pairs import Pairs
 from faninsar.logging import setup_logger

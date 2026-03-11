@@ -12,7 +12,7 @@ from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
 
     from faninsar.datasets import GeoDataset
 
@@ -25,6 +25,7 @@ class PatchSampler(abc.ABC):
     _boxes: np.ndarray
     _length: int
     _shape: tuple[int]
+    _indexes: int | Iterable[int] | np.ndarray | None
 
     def __len__(self) -> int:
         """Return the length of the patch sampler."""
@@ -66,6 +67,19 @@ class PatchSampler(abc.ABC):
         """The shape of the patch sampler."""
         return self._shape
 
+    @property
+    def indexes(self) -> int | Iterable[int] | np.ndarray | None:
+        """File indexes to query. None means all valid files."""
+        return self._indexes
+
+    def _yield_box(
+        self, bbox: BoundingBox
+    ) -> BoundingBox | tuple[BoundingBox, int | Iterable[int] | np.ndarray]:
+        """Yield a bbox, or (bbox, indexes) when file indexes are set."""
+        if self._indexes is not None:
+            return bbox, self._indexes
+        return bbox
+
 
 class RowSampler(PatchSampler):
     """A sampler samples data from a dataset in a row-wise manner."""
@@ -76,6 +90,7 @@ class RowSampler(PatchSampler):
         roi: BoundingBox | None = None,
         row_num: int | None = None,
         height: int | None = None,
+        indexes: int | Iterable[int] | np.ndarray | None = None,
         verbose: bool = True,
     ) -> None:
         """Initialize a RowSampler.
@@ -93,6 +108,9 @@ class RowSampler(PatchSampler):
         height : int, optional
             The height (in pixels) of the patch to be sampled for row-wise sampling .
             if not provided, the row_num will be used.
+        indexes : int | Iterable[int] | np.ndarray | None, optional
+            Indexes of files to query. If None, all valid files are queried
+            when using with ``dataset[bbox]``. Default is None.
         verbose : bool, optional
             Whether to print verbose information. The verbose of the dataset will
             be set to this value. Default is True.
@@ -100,6 +118,7 @@ class RowSampler(PatchSampler):
         """
         self.dataset = dataset
         self.res = dataset.res
+        self._indexes = indexes
 
         self.dataset.verbose = verbose
         if roi is not None:
@@ -134,7 +153,7 @@ class RowSampler(PatchSampler):
         self._shape = (row_num,)
         self._boxes = self._gen_patch_boxes()
 
-    def _gen_patch_boxes(self) -> None:
+    def _gen_patch_boxes(self) -> np.ndarray:
         roi = self.dataset.roi
         patch_boxes = []
         for i in range(self.row_num):
@@ -151,7 +170,7 @@ class RowSampler(PatchSampler):
     def __iter__(self) -> Iterator:
         """Iterate over the bounding boxes of the patches."""
         for i in range(self.row_num):
-            yield self.boxes[i]
+            yield self._yield_box(self.boxes[i])
 
 
 class ColSampler(PatchSampler):
@@ -169,6 +188,7 @@ class ColSampler(PatchSampler):
         roi: BoundingBox | None = None,
         col_num: int | None = None,
         width: int | None = None,
+        indexes: int | Iterable[int] | np.ndarray | None = None,
         verbose: bool = True,
     ) -> None:
         """Initialize a ColSampler.
@@ -186,6 +206,9 @@ class ColSampler(PatchSampler):
         width : int, optional
             The width (in pixel) of the patch to be sampled for col-wise sampling.
             if not provided, the col_num will be used.
+        indexes : int | Iterable[int] | np.ndarray | None, optional
+            Indexes of files to query. If None, all valid files are queried
+            when using with ``dataset[bbox]``. Default is None.
         verbose : bool, optional
             Whether to print verbose information. The verbose of the dataset will
             be set to this value. Default is True.
@@ -193,6 +216,7 @@ class ColSampler(PatchSampler):
         """
         self.dataset = dataset
         self.res = dataset.res[1]
+        self._indexes = indexes
 
         self.dataset.verbose = verbose
         if roi is not None:
@@ -238,7 +262,7 @@ class ColSampler(PatchSampler):
         patch_boxes[-1][3] = roi.top
 
         for patch_bbox in patch_boxes:
-            yield BoundingBox(*patch_bbox, crs=self.dataset.crs)
+            yield self._yield_box(BoundingBox(*patch_bbox, crs=self.dataset.crs))
 
     def __len__(self) -> int:
         """Return the length of the patch sampler."""
@@ -262,6 +286,7 @@ class RowColSampler(PatchSampler):
         width: int | None = None,
         row_num: int | None = None,
         col_num: int | None = None,
+        indexes: int | Iterable[int] | np.ndarray | None = None,
         verbose: bool = True,
     ) -> None:
         """Initialize a RowColSampler.
@@ -285,6 +310,9 @@ class RowColSampler(PatchSampler):
         col_num : int, optional
             The number of columns to be sampled for row-col-wise sampling. If width
             is provided, this parameter will be ignored.
+        indexes : int | Iterable[int] | np.ndarray | None, optional
+            Indexes of files to query. If None, all valid files are queried
+            when using with ``dataset[bbox]``. Default is None.
         verbose : bool, optional
             Whether to print verbose information. The verbose of the dataset will
             be set to this value. Default is True.
@@ -292,6 +320,7 @@ class RowColSampler(PatchSampler):
         """
         self.dataset = dataset
         self.res = dataset.res
+        self._indexes = indexes
 
         self.dataset.verbose = verbose
         if roi is not None:
@@ -374,5 +403,4 @@ class RowColSampler(PatchSampler):
         """Iterate over the bounding boxes of the patches."""
         for i in range(self.row_num):
             for j in range(self.col_num):
-                patch_bbox = self.boxes[i, j]
-                yield patch_bbox
+                yield self._yield_box(self.boxes[i, j])

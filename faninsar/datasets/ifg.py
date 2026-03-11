@@ -17,8 +17,8 @@ from faninsar._core.geo import geo_tools
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points
 
+from . import PairDataset, RasterDataset
 from .aps import ApsPairs
-from .base import PairDataset, RasterDataset
 
 if TYPE_CHECKING:
     from collections.abc import Iterable

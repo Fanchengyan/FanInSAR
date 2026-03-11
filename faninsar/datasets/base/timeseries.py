@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import rioxarray  # noqa: F401
@@ -14,6 +14,7 @@ from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 from .raster import RasterDataset
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from os import PathLike
 
     import numpy as np
@@ -101,18 +102,37 @@ class TimeSeriesDataset(RasterDataset, ABC):
         return coords
 
     # New explicit per-shape query methods using dates instead of indexes
+    def get_indexes(
+        self,
+        dates: Acquisition | pd.DatetimeIndex | None = None,
+    ) -> np.ndarray:
+        """Return file indexes for the given dates.
+
+        Parameters
+        ----------
+        dates : Acquisition | pd.DatetimeIndex | None, optional
+            Dates to select. If None, returns indexes of all valid files.
+
+        Returns
+        -------
+        indexes : np.ndarray
+            Integer array of file indexes matching the given dates.
+
+        """
+        files_df = self.files
+        mask = files_df.valid.copy()
+        if dates is not None:
+            target = pd.DatetimeIndex(dates)
+            mask = mask & files_df["date"].isin(target)
+        return files_df[mask].index.to_numpy(dtype=int)
+
     def points_query(
         self,
         points: Points,
         dates: Acquisition | pd.DatetimeIndex | None = None,
     ) -> xr.Dataset:
         """Query points for the given dates subset (no indexes support)."""
-        files_df = self.files
-        mask = files_df.valid.copy()
-        if dates is not None:
-            target = pd.DatetimeIndex(dates)
-            mask = mask & files_df["date"].isin(target)
-        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        resolved_indexes = self.get_indexes(dates=dates)
         return self._compute_points_ds(points, resolved_indexes)
 
     def boxes_query(
@@ -121,12 +141,7 @@ class TimeSeriesDataset(RasterDataset, ABC):
         dates: Acquisition | pd.DatetimeIndex | None = None,
     ) -> xr.DataTree:
         """Query bbox/boxes for the given dates subset (no indexes support)."""
-        files_df = self.files
-        mask = files_df.valid.copy()
-        if dates is not None:
-            target = pd.DatetimeIndex(dates)
-            mask = mask & files_df["date"].isin(target)
-        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        resolved_indexes = self.get_indexes(dates=dates)
         if self._chunks is not None:
             return self._compute_bboxes_tree_lazy(bbox, resolved_indexes)
         return self._compute_bboxes_tree(bbox, resolved_indexes)
@@ -137,12 +152,7 @@ class TimeSeriesDataset(RasterDataset, ABC):
         dates: Acquisition | pd.DatetimeIndex | None = None,
     ) -> xr.DataTree:
         """Query polygons for the given dates subset (no indexes support)."""
-        files_df = self.files
-        mask = files_df.valid.copy()
-        if dates is not None:
-            target = pd.DatetimeIndex(dates)
-            mask = mask & files_df["date"].isin(target)
-        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        resolved_indexes = self.get_indexes(dates=dates)
         if self._chunks is not None:
             return self._compute_polygons_tree_lazy(polygons, resolved_indexes)
         return self._compute_polygons_tree(polygons, resolved_indexes)
@@ -160,11 +170,6 @@ class TimeSeriesDataset(RasterDataset, ABC):
         if isinstance(query, Polygons):
             query = GeoQuery(polygons=query)
 
-        files_df = self.files
-        mask = files_df.valid.copy()
-        if dates is not None:
-            target = pd.DatetimeIndex(dates)
-            mask = mask & files_df["date"].isin(target)
-
-        paths = files_df[mask].paths.tolist()
+        resolved_indexes = self.get_indexes(dates=dates)
+        paths = self.files.iloc[resolved_indexes].paths.tolist()
         return self._sample_files(paths, query)

@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from .bbox import BoundingBox
 from .points import Points
 from .polygons import Polygons
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    import numpy as np
 
 
 class GeoQuery:
@@ -18,14 +25,16 @@ class GeoQuery:
     _points: Points | None
     _boxes: BoundingBox | list[BoundingBox] | None
     _polygons: Polygons | None
+    _indexes: int | Iterable[int] | np.ndarray | None
 
-    __slots__ = ["_boxes", "_points", "_polygons"]
+    __slots__ = ["_boxes", "_indexes", "_points", "_polygons"]
 
     def __init__(
         self,
         points: Points | None = None,
         boxes: BoundingBox | list[BoundingBox] | None = None,
         polygons: Polygons | None = None,
+        indexes: int | Iterable[int] | np.ndarray | None = None,
     ) -> None:
         """Initialize a GeoQuery instance.
 
@@ -39,6 +48,9 @@ class GeoQuery:
             bounding box values from the dataset. Default is None.
         polygons: Polygons | None, optional
             The Polygons instance used to retrieve polygon values from the dataset.
+            Default is None.
+        indexes : int | Iterable[int] | np.ndarray | None, optional
+            Indexes of files to query. If None, all valid files are queried.
             Default is None.
 
         Raises
@@ -76,6 +88,7 @@ class GeoQuery:
         self._points = points
         self._boxes = boxes
         self._polygons = polygons
+        self._indexes = indexes
 
     def __str__(self) -> str:
         """Return the string representation of the GeoQuery instance."""
@@ -86,7 +99,10 @@ class GeoQuery:
             else:
                 boxes = f"[{len(self.boxes)} BoundingBox]"
         points = self.points if self.points is not None else None
-        return f"GeoQuery(points={points}, boxes={boxes}, polygons={self.polygons})"
+        return (
+            f"GeoQuery(points={points}, boxes={boxes}, "
+            f"polygons={self.polygons}, indexes={self.indexes})"
+        )
 
     def __repr__(self) -> str:
         """Return the string representation of the GeoQuery instance."""
@@ -102,6 +118,7 @@ class GeoQuery:
             f"\n    points={points}"
             f"\n    boxes={boxes}"
             f"\n    polygons={self.polygons}"
+            f"\n    indexes={self.indexes}"
             f"\n)"
         )
 
@@ -119,3 +136,8 @@ class GeoQuery:
     def polygons(self) -> Polygons | None:
         """The polygons used to sample the dataset."""
         return self._polygons
+
+    @property
+    def indexes(self) -> int | Iterable[int] | np.ndarray | None:
+        """Indexes of files to query. None means all valid files."""
+        return self._indexes

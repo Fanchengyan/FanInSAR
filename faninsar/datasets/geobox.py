@@ -14,7 +14,7 @@ faninsar.query.bbox : BoundingBox primitives
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 import numpy as np
 from odc.geo import GeoBox as OdcGeoBox
@@ -24,7 +24,6 @@ from odc.geo.math import is_almost_int
 from rasterio.transform import rowcol
 from rasterio.windows import Window
 from rasterio.windows import transform as _window_transform
-from typing_extensions import TypeAlias
 
 from faninsar.logging import setup_logger
 from faninsar.query.bbox import BoundingBox

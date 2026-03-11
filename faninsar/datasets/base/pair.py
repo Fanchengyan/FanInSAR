@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from typing import (
-    TYPE_CHECKING,
-    Iterable,
-)
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import rioxarray  # noqa: F401
@@ -17,6 +14,7 @@ from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 from .raster import RasterDataset
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from os import PathLike
 
     from numpy.typing import NDArray
@@ -145,18 +143,37 @@ class PairDataset(RasterDataset):
         return coords
 
     # New explicit per-shape query methods using pairs instead of indexes
+    def get_indexes(
+        self,
+        pairs: Pairs | None = None,
+    ) -> NDArray:
+        """Return file indexes for the given pairs.
+
+        Parameters
+        ----------
+        pairs : Pairs | None, optional
+            Pairs to select. If None, returns indexes of all valid files.
+
+        Returns
+        -------
+        indexes : np.ndarray
+            Integer array of file indexes matching the given pairs.
+
+        """
+        files_df = self.files
+        mask = files_df.valid.copy()
+        if pairs is not None:
+            pair_mask = self.pairs.where(pairs, return_type="mask")
+            mask = mask & pd.Series(pair_mask, index=files_df.index)
+        return files_df[mask].index.to_numpy(dtype=int)
+
     def points_query(
         self,
         points: Points,
         pairs: Pairs | None = None,
     ) -> Dataset:
         """Query points for the given pairs subset (no indexes support)."""
-        files_df = self.files
-        mask = files_df.valid.copy()
-        if pairs is not None:
-            pair_mask = self.pairs.where(pairs, return_type="mask")
-            mask = mask & pd.Series(pair_mask, index=files_df.index)
-        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        resolved_indexes = self.get_indexes(pairs=pairs)
         return self._compute_points_ds(points, resolved_indexes)
 
     def boxes_query(
@@ -165,12 +182,7 @@ class PairDataset(RasterDataset):
         pairs: Pairs | None = None,
     ) -> DataTree:
         """Query bbox/boxes for the given pairs subset (no indexes support)."""
-        files_df = self.files
-        mask = files_df.valid.copy()
-        if pairs is not None:
-            pair_mask = self.pairs.where(pairs, return_type="mask")
-            mask = mask & pd.Series(pair_mask, index=files_df.index)
-        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        resolved_indexes = self.get_indexes(pairs=pairs)
         if self._chunks is not None:
             return self._compute_bboxes_tree_lazy(bbox, resolved_indexes)
         return self._compute_bboxes_tree(bbox, resolved_indexes)
@@ -181,12 +193,7 @@ class PairDataset(RasterDataset):
         pairs: Pairs | None = None,
     ) -> DataTree:
         """Query polygons for the given pairs subset (no indexes support)."""
-        files_df = self.files
-        mask = files_df.valid.copy()
-        if pairs is not None:
-            pair_mask = self.pairs.where(pairs, return_type="mask")
-            mask = mask & pd.Series(pair_mask, index=files_df.index)
-        resolved_indexes = files_df[mask].index.to_numpy(dtype=int)
+        resolved_indexes = self.get_indexes(pairs=pairs)
         if self._chunks is not None:
             return self._compute_polygons_tree_lazy(polygons, resolved_indexes)
         return self._compute_polygons_tree(polygons, resolved_indexes)
@@ -204,13 +211,8 @@ class PairDataset(RasterDataset):
         if isinstance(query, Polygons):
             query = GeoQuery(polygons=query)
 
-        files_df = self.files
-        mask = files_df.valid.copy()
-        if pairs is not None:
-            pair_mask = self.pairs.where(pairs, return_type="mask")
-            mask = mask & pd.Series(pair_mask, index=files_df.index)
-
-        paths = files_df[mask].paths.tolist()
+        resolved_indexes = self.get_indexes(pairs=pairs)
+        paths = self.files.iloc[resolved_indexes].paths.tolist()
 
         if self._chunks is not None:
             return self._sample_files_lazy(paths, query)

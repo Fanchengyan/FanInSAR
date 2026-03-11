@@ -7,13 +7,7 @@ import functools
 import json
 import re
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    ClassVar,
-    Iterable,
-    Literal,
-)
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
 import numpy as np
 import pandas as pd
@@ -30,7 +24,6 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import Resampling
 from rasterio.warp import transform as warp_transform
 from tqdm import tqdm
-from typing_extensions import Self
 
 from faninsar._core.geo import geo_tools
 from faninsar._core.geo.geo_tools import (
@@ -54,6 +47,7 @@ from ._base_common import (
 from .geo import GeoDataset
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from os import PathLike
 
     from affine import Affine
@@ -607,37 +601,196 @@ class RasterDataset(GeoDataset):
 
     def __getitem__(
         self,
-        query: GeoQuery | Points | BoundingBox | Polygons,
-    ) -> xr.DataTree:
-        """Retrieve images values for given query.
+        query: (
+            GeoQuery
+            | Points
+            | BoundingBox
+            | Polygons
+            | tuple[
+                GeoQuery | Points | BoundingBox | Polygons,
+                int | Iterable[int] | np.ndarray,
+            ]
+        ),
+    ) -> dict[str, Any]:
+        """Retrieve image values for a given query.
 
         Parameters
         ----------
-        query : GeoQuery | Points | BoundingBox | Polygons
-            query to index the dataset. It can be :class:`Points`,
-            :class:`BoundingBox`, :class:`Polygons`, or a composite
-            :class:`GeoQuery` (recommended) object.
+        query : GeoQuery | Points | BoundingBox | Polygons | tuple
+            Query to index the dataset. Accepts:
+
+            - ``Points``, ``BoundingBox``, ``Polygons``: spatial query over all
+              valid files.
+            - ``GeoQuery``: composite query, optionally with ``indexes``.
+            - ``tuple[spatial_query, indexes]``: spatial query with file indexes,
+              e.g. ``ds[bbox, [0, 1, 2]]``.
 
         Returns
         -------
-        result : QueryResult
-            a QueryResult instance containing the results of the various queries.
+        result : dict[str, Any]
+            When the query contains a single query type, returns a flat dict:
+
+            - ``"query"``: the spatial query object (Points / BoundingBox /
+              Polygons).
+            - ``"data"``: ``np.ndarray`` with shape ``(file, ...)``.
+            - ``"crs"``: dataset CRS.
+            - ``"nodata"``: nodata value.
+            - ``"paths"``: list of file paths queried.
+            - ``"indexes"``: resolved file indexes (``np.ndarray``).
+            - ``"transform"``: ``Affine`` (only for BoundingBox / Polygons).
+            - ``"mask"``: ``np.ndarray`` (only for Polygons).
+
+            When the ``GeoQuery`` contains multiple query types, returns a
+            nested dict keyed by ``"points"``, ``"boxes"``, ``"polygons"``
+            (only present keys). Each value is a dict (or list of dicts for
+            list[BoundingBox] / multi-polygon) with the structure above.
 
         """
+        # Unpack tuple form: ds[query, indexes]
+        indexes: int | Iterable[int] | np.ndarray | None = None
+        spatial_query: GeoQuery | Points | BoundingBox | Polygons
+        if isinstance(query, tuple):
+            spatial_query, indexes = query[0], query[1]
+        else:
+            spatial_query = query
+
         # Normalize to GeoQuery
-        if isinstance(query, Points):
-            query = GeoQuery(points=query)
-        elif isinstance(query, BoundingBox):
-            query = GeoQuery(boxes=query)
-        elif isinstance(query, Polygons):
-            query = GeoQuery(polygons=query)
+        if isinstance(spatial_query, Points):
+            geo_query = GeoQuery(points=spatial_query, indexes=indexes)
+        elif isinstance(spatial_query, BoundingBox):
+            geo_query = GeoQuery(boxes=spatial_query, indexes=indexes)
+        elif isinstance(spatial_query, Polygons):
+            geo_query = GeoQuery(polygons=spatial_query, indexes=indexes)
+        elif isinstance(spatial_query, GeoQuery):
+            if indexes is not None:
+                geo_query = GeoQuery(
+                    points=spatial_query.points,
+                    boxes=spatial_query.boxes,
+                    polygons=spatial_query.polygons,
+                    indexes=indexes,
+                )
+            else:
+                geo_query = spatial_query
+        else:
+            msg = (
+                f"query must be GeoQuery, Points, BoundingBox, or Polygons. "
+                f"Got {type(spatial_query)}"
+            )
+            logger.error(msg, stacklevel=2)
+            raise TypeError(msg)
 
-        paths = self.files[self.files.valid].paths.tolist()
+        return self._sample_to_dict(geo_query)
 
-        # Choose loading strategy based on chunks setting
-        if self._chunks is not None:
-            return self._sample_files_lazy(paths, query)
-        return self._sample_files(paths, query)
+    def _sample_to_dict(self, query: GeoQuery) -> dict[str, Any]:
+        """Sample files and return results as a dict.
+
+        Parameters
+        ----------
+        query : GeoQuery
+            A GeoQuery instance containing the desired queries and optional
+            file indexes.
+
+        Returns
+        -------
+        result : dict[str, Any]
+            A flat dict when the query contains a single query type, or a
+            nested dict keyed by ``"points"``, ``"boxes"``, ``"polygons"``
+            when multiple query types are present.
+
+        """
+        resolved_indexes, paths, _ = self._resolve_file_selection(query.indexes)
+        vrt_fhs = self._paths2vrt_fhs(paths)
+
+        base_info: dict[str, Any] = {
+            "crs": self.crs,
+            "nodata": self.nodata,
+            "paths": paths,
+            "indexes": resolved_indexes,
+        }
+
+        results: dict[str, Any] = {}
+
+        if query.points is not None:
+            data = self._files_query_points(query.points, vrt_fhs)
+            results["points"] = {
+                "query": query.points,
+                "data": np.asarray(data),
+                **base_info,
+            }
+
+        if query.boxes is not None:
+            results["boxes"] = self._query_boxes_to_dict(
+                query.boxes, vrt_fhs, base_info
+            )
+
+        if query.polygons is not None:
+            results["polygons"] = self._query_polygons_to_dict(
+                query.polygons, vrt_fhs, base_info
+            )
+
+        self._safe_close(vrt_fhs)
+
+        # Flat dict if only one query type
+        if len(results) == 1:
+            return next(iter(results.values()))
+        return results
+
+    def _query_boxes_to_dict(
+        self,
+        bbox: BoundingBox | list[BoundingBox],
+        vrt_fhs: list[DatasetReader],
+        base_info: dict[str, Any],
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        """Build dict result(s) for bounding box query."""
+        if isinstance(bbox, list):
+            return [self._single_bbox_to_dict(b, vrt_fhs, base_info) for b in bbox]
+        return self._single_bbox_to_dict(bbox, vrt_fhs, base_info)
+
+    def _single_bbox_to_dict(
+        self,
+        bbox: BoundingBox,
+        vrt_fhs: list[DatasetReader],
+        base_info: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build dict result for a single bounding box query."""
+        box_data = self._files_query_bbox(bbox, vrt_fhs)
+        profile = self.get_profile(self._ensure_query_crs(bbox))
+        return {
+            "query": bbox,
+            "data": np.asarray(box_data),
+            "transform": profile["transform"],
+            **base_info,
+        }
+
+    def _query_polygons_to_dict(
+        self,
+        polygons: Polygons,
+        vrt_fhs: list[DatasetReader],
+        base_info: dict[str, Any],
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        """Build dict result(s) for polygon query."""
+        polygons_values, transform_ls, mask_ls = self._files_query_polygons(
+            polygons, vrt_fhs
+        )
+        n_polygons = len(polygons)
+        if n_polygons == 1:
+            return {
+                "query": polygons,
+                "data": np.asarray(polygons_values[0]),
+                "mask": mask_ls[0] if mask_ls else None,
+                "transform": transform_ls[0] if transform_ls else None,
+                **base_info,
+            }
+        return [
+            {
+                "query": polygons,
+                "data": np.asarray(polygons_values[i]),
+                "mask": mask_ls[i] if i < len(mask_ls) else None,
+                "transform": transform_ls[i] if i < len(transform_ls) else None,
+                **base_info,
+            }
+            for i in range(n_polygons)
+        ]
 
     def _ensure_bands_idx(self, vrt_fh: DatasetReader) -> list[int] | int:
         """Return the proper band indexes to use for the dataset.
@@ -817,7 +970,7 @@ class RasterDataset(GeoDataset):
             try:
                 data = np.ma.asarray(arr)
                 polygons_values.append(data)
-            except ValueError:  # noqa: PERF203
+            except ValueError:
                 # If arrays have incompatible shapes, keep as list of individual arrays
                 # This happens when different files produce different sized crops for the same polygon  # noqa: E501
                 polygons_values.append(arr)
@@ -841,7 +994,7 @@ class RasterDataset(GeoDataset):
             sequence = tqdm(sequence, desc=f"Saving {ds_name} files", unit=unit)
         return sequence
 
-    def _safe_close(self, vrt_fhs: DatasetReader) -> None:
+    def _safe_close(self, vrt_fhs: list[DatasetReader]) -> None:
         """Close the file handles if not caching."""
         if not self.cache:
             for vrt_fh in vrt_fhs:
@@ -1023,7 +1176,7 @@ class RasterDataset(GeoDataset):
     def _compute_bboxes_tree_lazy(
         self,
         bbox: BoundingBox | list[BoundingBox],
-        indexes: int | list[int] | None = None,
+        indexes: int | Iterable[int] | None = None,
     ) -> xr.DataTree:
         """Compute bbox query with lazy loading using dask arrays.
 
@@ -1041,7 +1194,7 @@ class RasterDataset(GeoDataset):
         ----------
         bbox : BoundingBox or list[BoundingBox]
             Bounding box(es) to query.
-        indexes : int or list of int or None, optional
+        indexes : int or Iterable[int] or None, optional
             Indexes of files to query.
 
         Returns
@@ -1165,7 +1318,7 @@ class RasterDataset(GeoDataset):
     def _compute_polygons_tree_lazy(
         self,
         polygons: Polygons,
-        indexes: int | list[int] | None = None,
+        indexes: int | Iterable[int] | None = None,
     ) -> xr.DataTree:
         """Compute polygons query with lazy loading using dask arrays.
 
@@ -1173,7 +1326,7 @@ class RasterDataset(GeoDataset):
         ----------
         polygons : Polygons
             Polygons to query.
-        indexes : int or list of int or None, optional
+        indexes : int or Iterable[int] or None, optional
             Indexes of files to query.
 
         Returns
@@ -1260,7 +1413,7 @@ class RasterDataset(GeoDataset):
         return xr.DataTree(name="polygons", children=children)
 
     def _compute_points_ds(
-        self, points: Points, indexes: int | list[int] | None = None
+        self, points: Points, indexes: int | Iterable[int] | None = None
     ) -> xr.Dataset:
         """Compute points query and return Dataset.
 
@@ -1505,7 +1658,7 @@ class RasterDataset(GeoDataset):
     def _compute_bboxes_tree(
         self,
         bbox: BoundingBox | list[BoundingBox],
-        indexes: int | list[int] | None = None,
+        indexes: int | Iterable[int] | None = None,
     ) -> xr.DataTree:
         """Compute bbox query and return a xr.DataTree.
 
@@ -1523,7 +1676,7 @@ class RasterDataset(GeoDataset):
         ----------
         bbox : BoundingBox or list[BoundingBox]
             Bounding box(es) to query.
-        indexes : int or list of int or None, optional
+        indexes : int or Iterable[int] or None, optional
             Indexes of files to query.
 
         Returns
@@ -1564,7 +1717,7 @@ class RasterDataset(GeoDataset):
         return xr.DataTree(name="boxes", children=children)
 
     def _compute_polygons_tree(
-        self, polygons: Polygons, indexes: int | list[int] | None = None
+        self, polygons: Polygons, indexes: int | Iterable[int] | None = None
     ) -> xr.DataTree:
         """Compute polygons query and return a xr.DataTree.
 
@@ -2310,7 +2463,7 @@ class RasterDataset(GeoDataset):
         sample = self[roi]
 
         ds = xr.Dataset(
-            {"image": (["band", "lat", "lon"], sample.boxes.data)},
+            {"image": (["band", "lat", "lon"], sample["data"])},
             coords={
                 "band": list(range(profile["count"])),
                 "lat": lat,
