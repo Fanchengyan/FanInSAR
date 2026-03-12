@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from collections.abc import Sequence as SequenceABC
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from rasterio.crs import CRS
+from pyproj.crs import CRS
 from rasterio.warp import transform as warp_transform
 
 from faninsar.logging import setup_logger

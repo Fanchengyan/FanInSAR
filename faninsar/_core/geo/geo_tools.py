@@ -16,17 +16,16 @@ from affine import Affine
 from lxml import etree
 from matplotlib import ticker
 from pykml.factory import KML_ElementMaker as KML
+from pyproj.crs import CRS
 from rasterio import dtypes, transform
-from rasterio.crs import CRS
 from rasterio.io import MemoryFile
 from rasterio.profiles import Profile as RasterioProfile
 from rasterio.warp import Resampling, reproject
 from tqdm import tqdm
 
+from faninsar._core.file_tools import load_metas
 from faninsar.logging import setup_logger
 from faninsar.query.bbox import BoundingBox
-
-from ..file_tools import load_metas
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -187,8 +186,9 @@ def array2kml(
     kml_doc.append(cbar_overlay)
 
     kml = KML.kml(kml_doc)
-    with Path(out_file).open("w", encoding="utf-8") as f:
-        f.write(etree.tostring(kml, pretty_print=True).decode("utf8"))
+    Path(out_file).write_text(
+        etree.tostring(kml, pretty_print=True).decode("utf8"), encoding="utf-8"
+    )
     if verbose:
         info = f"write kml file to {out_file}"
         logger.info(info)
@@ -522,26 +522,32 @@ def match_to_raster(
     else:
         msg = "dimension of src_arr must be 2 or 3"
         raise ValueError(msg)
-    with MemoryFile() as memfile, memfile.open(
-        driver="GTiff",
-        count=src_n_band,
-        height=src_height,
-        width=src_width,
-        dtype="float32",
-        crs=src_crs,
-        transform=src_tf,
-    ) as src:
-        src.write(src_arr, indexes)
-
-        with MemoryFile() as memfile1, memfile1.open(
+    with (
+        MemoryFile() as memfile,
+        memfile.open(
             driver="GTiff",
             count=src_n_band,
-            height=dst_height,
-            width=dst_width,
+            height=src_height,
+            width=src_width,
             dtype="float32",
-            crs=dst_crs,
-            transform=dst_tf,
-        ) as dst:
+            crs=src_crs,
+            transform=src_tf,
+        ) as src,
+    ):
+        src.write(src_arr, indexes)
+
+        with (
+            MemoryFile() as memfile1,
+            memfile1.open(
+                driver="GTiff",
+                count=src_n_band,
+                height=dst_height,
+                width=dst_width,
+                dtype="float32",
+                crs=dst_crs,
+                transform=dst_tf,
+            ) as dst,
+        ):
             if indexes == 1:
                 indexes = [1]
             for i in tqdm(indexes, desc="matching raster"):
@@ -722,8 +728,7 @@ class GeoDataFormatConverter:
 
         # write profile into a file with the same name
         out_profile_file = str(out_file) + ".profile"
-        with Path(out_profile_file).open("w", encoding="utf-8") as f:
-            f.write(self._profile_str)
+        Path(out_profile_file).write_text(self._profile_str, encoding="utf-8")
 
     def to_raster(self, out_file: PathLike, driver: str = "GTiff") -> None:
         """Write the data array into a raster file.

@@ -14,9 +14,9 @@ import pandas as pd
 import rasterio
 import rioxarray  # noqa: F401
 import xarray as xr
+from pyproj.crs import CRS
 from rasterio import features, fill, plot
 from rasterio import mask as rio_mask
-from rasterio.crs import CRS
 from rasterio.dtypes import get_minimum_dtype
 from rasterio.transform import rowcol as tf_rowcol
 from rasterio.transform import xy as tf_xy

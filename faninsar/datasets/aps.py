@@ -13,7 +13,7 @@ import rasterio
 from rasterio.enums import Resampling
 
 from faninsar._core.sar.pairs import Pairs
-from faninsar.datasets import PairDataset, TimeSeriesDataset
+from faninsar.datasets.base import PairDataset, TimeSeriesDataset
 from faninsar.logging import setup_logger
 
 logger = setup_logger(__name__)

@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import warnings
-from abc import ABC
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import numpy as np
 import pyproj
 import shapely
-from rasterio.crs import CRS
+from pyproj.crs import CRS
 from rasterio.warp import calculate_default_transform
 from rtree.index import Index, Property
 from shapely import ops
+from torch.utils.data import Dataset
 
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, Points, Polygons
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 
-class GeoDataset(ABC):
+class GeoDataset(Dataset):
     """Abstract base class for all :mod:`faninsar` datasets.
 
     This class is used to represent a geospatial dataset and provides methods to
@@ -39,6 +39,7 @@ class GeoDataset(ABC):
     _roi: BoundingBox | None = None
     _nodata: Any = None
     _valid: np.ndarray
+    _verbose: bool
 
     def __init__(self) -> None:
         """Initialize a new GeoDataset instance."""
@@ -76,7 +77,16 @@ class GeoDataset(ABC):
 
         """
         objects = self.index.intersection(self.index.bounds, objects=True)
-        tuples = [(item.id, item.bounds, item.object) for item in objects]
+        tuples = []
+        for item in objects:
+            bounds = tuple(item.bounds)
+            # rtree returns bounds in non-interleaved order:
+            # (minx, maxx, miny, maxy). Convert to interleaved order
+            # expected by Index(interleaved=True): (minx, miny, maxx, maxy).
+            if len(bounds) == 4:
+                minx, maxx, miny, maxy = bounds
+                bounds = (minx, miny, maxx, maxy)
+            tuples.append((item.id, bounds, item.object))
         return self.__dict__, tuples
 
     def __setstate__(
@@ -95,6 +105,10 @@ class GeoDataset(ABC):
         """
         attrs, tuples = state
         self.__dict__.update(attrs)
+
+        # Recreate the R-tree to preserve properties like interleaving and
+        # dimension. Unpickled Index may lose configuration on some platforms.
+        self.index = Index(interleaved=True, properties=Property(dimension=2))
         for item in tuples:
             self.index.insert(*item)
 
@@ -121,6 +135,20 @@ class GeoDataset(ABC):
         elif query.crs != self.crs:
             query = query.to_crs(self.crs)
         return query
+
+    @property
+    def verbose(self) -> bool:
+        """Whether to print verbose messages."""
+        return self._verbose
+
+    @verbose.setter
+    def verbose(self, value: bool) -> None:
+        """Set whether to print verbose messages."""
+        if not isinstance(value, bool):
+            msg = f"verbose must be a boolean value, got {value} instead."
+            logger.error(msg)
+            raise TypeError(msg)
+        self._verbose = value
 
     @property
     def crs(self) -> CRS | None:

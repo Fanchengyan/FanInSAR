@@ -35,7 +35,7 @@ from faninsar.logging import setup_logger
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from rasterio.crs import CRS
+    from pyproj.crs import CRS
 
     from faninsar.typing import ResamplingLike
 

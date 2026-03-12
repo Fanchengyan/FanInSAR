@@ -12,7 +12,7 @@ Examples
 Basic usage:
 
 >>> from pathlib import Path
->>> from rasterio.crs import CRS
+>>> from pyproj.crs import CRS
 >>> from faninsar.datasets.xarray_dataset import XarrayDataset
 >>> from faninsar.query.bbox import BoundingBox
 >>> dataset = XarrayDataset(paths=[Path("tile.tif")])
@@ -40,7 +40,7 @@ import pandas as pd
 import xarray as xr
 from odc.geo.types import Resolution
 from odc.geo.xr import assign_crs
-from rasterio.crs import CRS
+from pyproj.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.transform import Affine, array_bounds
 from tqdm import tqdm

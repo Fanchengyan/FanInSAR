@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, overload
 
 import geopandas as gpd
-from rasterio.crs import CRS
+from pyproj.crs import CRS
 from rasterio.warp import transform_bounds
 from shapely.geometry import box
 

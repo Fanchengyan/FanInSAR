@@ -14,6 +14,7 @@ from rasterio.enums import Resampling
 from tqdm import tqdm
 
 from faninsar._core.geo import geo_tools
+from faninsar._core.sar import Pairs
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points
 
@@ -24,9 +25,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from os import PathLike
 
-    from rasterio.crs import CRS
+    from pyproj.crs import CRS
 
-    from faninsar._core.sar import Baselines, Pairs, PhaseDeformationConverter
+    from faninsar._core.sar import Baselines, PhaseDeformationConverter
 
 logger = setup_logger(__name__)
 
