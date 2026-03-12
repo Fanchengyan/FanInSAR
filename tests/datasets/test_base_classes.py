@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import rasterio
-from rasterio.crs import CRS
+from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 
 from faninsar._core.geo.geo_tools import Profile

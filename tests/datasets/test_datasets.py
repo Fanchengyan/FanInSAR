@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import rasterio
-from rasterio.crs import CRS
+from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 
 from faninsar.datasets.base import RasterDataset
@@ -146,12 +146,14 @@ class TestRasterDatasetDask:
         # Test with chunks=None by default (eager)
         ds_no_dask = RasterDataset(root_dir=temp_dataset_dir, chunks=None, verbose=False)
         points = Points([(5, 5), (15, 15)])
-        tree_no_dask = ds_no_dask[points]
-        assert "points" in tree_no_dask.children
+        result_no_dask = ds_no_dask[points]
+        assert isinstance(result_no_dask, dict)
+        assert "data" in result_no_dask
 
         ds_with_dask = RasterDataset(root_dir=temp_dataset_dir, chunks="auto", verbose=False)
-        tree_with_dask = ds_with_dask[points]
-        assert "points" in tree_with_dask.children
+        result_with_dask = ds_with_dask[points]
+        assert isinstance(result_with_dask, dict)
+        assert "data" in result_with_dask
 
     def test_query_consistency(self, temp_dataset_dir):
         """Test that lazy and eager queries produce consistent results."""
@@ -193,9 +195,10 @@ class TestRasterDatasetDask:
         points = Points([(10, 10), (20, 20)])
         bbox = BoundingBox(5, 15, 5, 15, crs=CRS.from_epsg(4326))
 
-        # Test combined selection using __getitem__ with Points then boxes_query
-        tree = ds[points]
-        assert "points" in tree.children
+        # Test __getitem__ returns dict with data
+        result = ds[points]
+        assert isinstance(result, dict)
+        assert "data" in result
         tree_bbox = ds.boxes_query(bbox)
         assert hasattr(tree_bbox, "children")
 

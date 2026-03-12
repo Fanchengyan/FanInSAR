@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from rasterio.crs import CRS
+from pyproj.crs import CRS
 from rasterio.transform import Affine
 
 from faninsar.datasets.geobox import GeoBox, GeoBoxTileGrid
