@@ -48,4 +48,3 @@ from ._core import (
     write_geoinfo_into_ds,
     write_geoinfo_into_nc,
 )
-from .cmaps import cmaps

@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import math
 from functools import partial
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
-import torch
 from torch.utils.data import Sampler
 
-from faninsar._core.device import parse_device
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox
+from faninsar.samplers._collate import identity_collate, tensor_collate
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
@@ -20,123 +19,8 @@ if TYPE_CHECKING:
     from torch.utils.data import DataLoader
 
     from faninsar.datasets import GeoDataset
-    from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
-
-
-def _normalize_device(device: DeviceLike | None) -> torch.device | None:
-    """Normalize a device specifier into a torch.device instance.
-
-    Parameters
-    ----------
-    device : DeviceLike or None
-        Device specifier accepted by torch. If None, no device normalization
-        is performed and None is returned.
-
-    Returns
-    -------
-    torch.device or None
-        Normalized device when provided, otherwise None.
-
-    """
-    if device is None:
-        return None
-    return parse_device(device)
-
-
-@overload
-def _to_tensor(value: Any, device: None) -> Any: ...
-@overload
-def _to_tensor(
-    value: np.ndarray, device: torch.device
-) -> np.ndarray | torch.Tensor: ...
-@overload
-def _to_tensor(value: np.generic, device: torch.device) -> torch.Tensor: ...
-@overload
-def _to_tensor(value: dict[Any, Any], device: torch.device) -> dict[Any, Any]: ...
-@overload
-def _to_tensor(value: list[Any], device: torch.device) -> list[Any]: ...
-@overload
-def _to_tensor(value: tuple[Any, ...], device: torch.device) -> tuple[Any, ...]: ...
-
-
-def _to_tensor(  # noqa: PLR0911
-    value: np.ndarray | np.generic | dict[Any, Any] | list[Any] | tuple[Any, ...],
-    device: torch.device | None,
-) -> Any | np.ndarray | torch.Tensor | dict[Any, Any] | list[Any] | tuple[Any, ...]:
-    """Recursively convert numpy arrays to torch tensors.
-
-    Parameters
-    ----------
-    value : Any
-        Input value to be converted when it contains numpy arrays.
-    device : torch.device or None
-        Target torch device.
-
-    Returns
-    -------
-    Any
-        Converted structure with numpy arrays turned into torch tensors.
-
-    """
-    if isinstance(value, np.ndarray):
-        if value.dtype == np.object_:
-            return value
-        return torch.as_tensor(value, device=device)
-    if isinstance(value, np.generic):
-        return torch.as_tensor(value, device=device)
-    if isinstance(value, dict):
-        return {key: _to_tensor(item, device) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_to_tensor(item, device) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_to_tensor(item, device) for item in value)
-
-    return value
-
-
-def identity_collate(batch: list[Any]) -> Any | list[Any]:
-    """Return batch as-is; unbox single-item batches for convenience.
-
-    Parameters
-    ----------
-    batch : list[Any]
-        Samples returned by the dataset.
-
-    Returns
-    -------
-    Any
-        A single sample when batch size is 1, otherwise the original list.
-
-    """
-    if len(batch) == 1:
-        return batch[0]
-    return batch
-
-
-def tensor_collate(
-    batch: list[Any], device: torch.device | None = None
-) -> Any | list[Any]:
-    """Convert numpy arrays to torch tensors and unbox single-item batches.
-
-    Parameters
-    ----------
-    batch : list[Any]
-        Samples returned by the dataset.
-    device : torch.device or None, optional
-        Target device for torch tensors. If None, returns the input unchanged.
-
-    Returns
-    -------
-    Any | list[Any]
-        A single converted sample when batch size is 1, otherwise a list of
-        converted samples.
-
-    """
-    if len(batch) == 1:
-        return _to_tensor(batch[0], device)
-    return [_to_tensor(item, device) for item in batch]
 
 
 class GridSampler(Sampler):
@@ -147,7 +31,6 @@ class GridSampler(Sampler):
     _shape: tuple[int]
     _indexes: int | Iterable[int] | np.ndarray | None
     _dataset: GeoDataset
-    _device: torch.device | None
 
     def __len__(self) -> int:
         """Return the length of the grid sampler."""
@@ -199,11 +82,6 @@ class GridSampler(Sampler):
         """The dataset to be sampled."""
         return self._dataset
 
-    @property
-    def device(self) -> torch.device | None:
-        """Torch device for tensor conversion."""
-        return self._device
-
     def _yield_box(
         self, bbox: BoundingBox
     ) -> BoundingBox | tuple[BoundingBox, int | Iterable[int] | np.ndarray]:
@@ -217,6 +95,9 @@ class GridSampler(Sampler):
         *,
         num_workers: int = 1,
         prefetch_factor: int | None = None,
+        pin_memory: bool = False,
+        tensor: bool = True,
+        tensor_scope: Literal["data", "all"] = "data",
         collate_fn: Callable[[list[Any]], Any] | None = None,
         **kwargs: Any,
     ) -> DataLoader:
@@ -233,10 +114,17 @@ class GridSampler(Sampler):
         prefetch_factor : int or None, optional
             Number of samples to prefetch per worker. If None, uses PyTorch
             default behavior.
+        pin_memory : bool, optional
+            Whether to use pinned (page-locked) memory for faster host-to-device
+            transfers. Default is False.
+        tensor : bool, optional
+            Whether to convert numpy arrays to CPU torch tensors. Default is True.
+        tensor_scope : {"data", "all"}, optional
+            Conversion scope. ``"data"`` converts only ``data`` fields;
+            ``"all"`` converts every numpy array recursively. Default is ``"data"``.
         collate_fn : Callable, optional
-            Collate function used to merge samples. If None, uses
-            :func:`tensor_collate` when ``device`` is set on the sampler,
-            otherwise :func:`identity_collate` to avoid default tensor stacking.
+            Collate function used to merge samples. If provided, ``tensor`` and
+            ``tensor_scope`` are ignored.
         **kwargs : Any
             Additional keyword arguments forwarded to ``torch.utils.data.DataLoader``.
             The following keys are not allowed here because they are managed by
@@ -248,16 +136,22 @@ class GridSampler(Sampler):
         DataLoader
             A PyTorch DataLoader instance.
 
+        Notes
+        -----
+        ``tensor=True`` converts numpy arrays to CPU tensors. For GPU execution,
+        move the batch to the target device in your training loop.
+
         """
         from torch.utils.data import DataLoader
 
         if collate_fn is None:
-            if self.device is None:
-                collate_fn = identity_collate
+            if tensor:
+                collate_fn = partial(tensor_collate, tensor_scope=tensor_scope)
             else:
-                collate_fn = partial(tensor_collate, device=self.device)
+                collate_fn = identity_collate
 
         kwargs["prefetch_factor"] = prefetch_factor
+        kwargs["pin_memory"] = pin_memory
 
         forbidden_kwargs = {
             "dataset",
@@ -282,7 +176,6 @@ class GridSampler(Sampler):
             sampler=self,
             num_workers=num_workers,
             collate_fn=collate_fn,
-            prefetch_factor=prefetch_factor,
             **kwargs,
         )
 
@@ -297,7 +190,6 @@ class RowSampler(GridSampler):
         row_num: int | None = None,
         height: int | None = None,
         indexes: int | Iterable[int] | np.ndarray | None = None,
-        device: DeviceLike | None = None,
         verbose: bool = True,
     ) -> None:
         """Initialize a RowSampler.
@@ -318,8 +210,6 @@ class RowSampler(GridSampler):
         indexes : int | Iterable[int] | np.ndarray | None, optional
             Indexes of files to query. If None, all valid files are queried
             when using with ``dataset[bbox]``. Default is None.
-        device : DeviceLike or None, optional
-            Torch device for tensor conversion when using ``to_dataloader``.
         verbose : bool, optional
             Whether to print verbose information. The verbose of the dataset will
             be set to this value. Default is True.
@@ -328,7 +218,6 @@ class RowSampler(GridSampler):
         self._dataset = dataset
         self.res = dataset.res
         self._indexes = indexes
-        self._device = _normalize_device(device)
 
         self.dataset.verbose = verbose
         if roi is not None:
@@ -400,7 +289,6 @@ class ColSampler(GridSampler):
         col_num: int | None = None,
         width: int | None = None,
         indexes: int | Iterable[int] | np.ndarray | None = None,
-        device: DeviceLike | None = None,
         verbose: bool = True,
     ) -> None:
         """Initialize a ColSampler.
@@ -421,8 +309,6 @@ class ColSampler(GridSampler):
         indexes : int | Iterable[int] | np.ndarray | None, optional
             Indexes of files to query. If None, all valid files are queried
             when using with ``dataset[bbox]``. Default is None.
-        device : DeviceLike or None, optional
-            Torch device for tensor conversion when using ``to_dataloader``.
         verbose : bool, optional
             Whether to print verbose information. The verbose of the dataset will
             be set to this value. Default is True.
@@ -431,7 +317,6 @@ class ColSampler(GridSampler):
         self._dataset = dataset
         self.res = dataset.res[1]
         self._indexes = indexes
-        self._device = _normalize_device(device)
 
         self.dataset.verbose = verbose
         if roi is not None:
@@ -503,7 +388,6 @@ class RowColSampler(GridSampler):
         row_num: int | None = None,
         col_num: int | None = None,
         indexes: int | Iterable[int] | np.ndarray | None = None,
-        device: DeviceLike | None = None,
         verbose: bool = True,
     ) -> None:
         """Initialize a RowColSampler.
@@ -530,8 +414,6 @@ class RowColSampler(GridSampler):
         indexes : int | Iterable[int] | np.ndarray | None, optional
             Indexes of files to query. If None, all valid files are queried
             when using with ``dataset[bbox]``. Default is None.
-        device : DeviceLike or None, optional
-            Torch device for tensor conversion when using ``to_dataloader``.
         verbose : bool, optional
             Whether to print verbose information. The verbose of the dataset will
             be set to this value. Default is True.
@@ -540,7 +422,6 @@ class RowColSampler(GridSampler):
         self._dataset = dataset
         self.res = dataset.res
         self._indexes = indexes
-        self._device = _normalize_device(device)
 
         self.dataset.verbose = verbose
         if roi is not None:
