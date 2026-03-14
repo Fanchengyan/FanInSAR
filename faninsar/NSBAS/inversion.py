@@ -370,7 +370,7 @@ class NSBASSolver:
             return_numpy=return_numpy,
         )
         if return_numpy:
-            residual = self.d - np.dot(self.G, result)
+            residual = self.d.cpu().numpy() - np.dot(self.G.cpu().numpy(), result)
         else:
             residual = self.d - torch.matmul(self.G, result)
 
