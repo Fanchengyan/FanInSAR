@@ -96,15 +96,16 @@ class Baselines:
             The Baselines object.
 
         """
-        from faninsar.NSBAS import (
-            LinearModel,
-            NSBASInversion,
-            NSBASMatrixFactory,
-        )
+        from faninsar.NSBAS import LinearModel, NSBASSolver
 
-        model_bs = LinearModel(pairs.dates)
-        mf = NSBASMatrixFactory(values[:, None], pairs, model_bs)
-        incs, *_ = NSBASInversion(mf, verbose=False, device="cpu").inverse()
+        solver = NSBASSolver(
+            values[:, None],
+            pairs,
+            LinearModel(pairs.dates),
+            device="cpu",
+            verbose=False,
+        )
+        incs, *_ = solver.inverse()
 
         cum = np.cumsum(incs, axis=0)
         cum = np.insert(cum, 0, 0, axis=0)
@@ -191,7 +192,7 @@ class Baselines:
 
         return ax.vlines(gaps, ymin=ymin, ymax=ymax, color="k", ls="--", alpha=0.5)
 
-    def _create_legend(  # noqa: PLR6301
+    def _create_legend(
         self,
         ax: Axes,
         pairs_collection: Collection | None,

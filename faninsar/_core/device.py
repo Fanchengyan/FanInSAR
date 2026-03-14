@@ -1,4 +1,4 @@
-"""Device utilities for PyTtorch."""
+"""Device utilities for PyTorch."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def parse_device(device: DeviceLike | None) -> torch.device:
         pass
     else:
         msg = "device must be a string or torch.device"
-        logger.error(msg, stack_level=2)
+        logger.error(msg, stacklevel=2)
         raise TypeError(msg)
     return device
 
@@ -60,7 +60,7 @@ def _parse_device_str(device: str | None) -> str:
             msg = (
                 "No GPU detected. Falling back to CPU. "
                 "If you would like to use a GPU, please install PyTorch"
-                " with CUDA support.",
+                " with CUDA support."
             )
             logger.warning(msg, stacklevel=2)
             device = "cpu"
