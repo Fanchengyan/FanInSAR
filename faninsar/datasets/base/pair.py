@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pandas as pd
 import rioxarray  # noqa: F401
@@ -171,37 +171,46 @@ class PairDataset(RasterDataset):
         self,
         points: Points,
         pairs: Pairs | None = None,
+        verbose: bool | None = None,
     ) -> Dataset:
         """Query points for the given pairs subset (no indexes support)."""
         resolved_indexes = self.get_indexes(pairs=pairs)
-        return self._compute_points_ds(points, resolved_indexes)
+        return self._compute_points_ds(points, resolved_indexes, verbose)
 
     def boxes_query(
         self,
         bbox: BoundingBox | list[BoundingBox],
         pairs: Pairs | None = None,
+        verbose: bool | None = None,
+        chunks: dict[str, int] | int | Literal["auto", False] | None = None,
     ) -> DataTree:
         """Query bbox/boxes for the given pairs subset (no indexes support)."""
         resolved_indexes = self.get_indexes(pairs=pairs)
-        if self._chunks is not None:
-            return self._compute_bboxes_tree_lazy(bbox, resolved_indexes)
-        return self._compute_bboxes_tree(bbox, resolved_indexes)
+        c = self._resolve_chunks(chunks)
+        if c is not None:
+            return self._compute_bboxes_tree_lazy(bbox, resolved_indexes, c)
+        return self._compute_bboxes_tree(bbox, resolved_indexes, verbose)
 
     def polygons_query(
         self,
         polygons: Polygons,
         pairs: Pairs | None = None,
+        verbose: bool | None = None,
+        chunks: dict[str, int] | int | Literal["auto", False] | None = None,
     ) -> DataTree:
         """Query polygons for the given pairs subset (no indexes support)."""
         resolved_indexes = self.get_indexes(pairs=pairs)
-        if self._chunks is not None:
-            return self._compute_polygons_tree_lazy(polygons, resolved_indexes)
-        return self._compute_polygons_tree(polygons, resolved_indexes)
+        c = self._resolve_chunks(chunks)
+        if c is not None:
+            return self._compute_polygons_tree_lazy(polygons, resolved_indexes, c)
+        return self._compute_polygons_tree(polygons, resolved_indexes, verbose)
 
     def query(
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         pairs: Pairs | None = None,
+        verbose: bool | None = None,
+        chunks: dict[str, int] | int | Literal["auto", False] | None = None,
     ) -> DataTree:
         """Retrieve image values for given query using pairs subset only."""
         if isinstance(query, Points):
@@ -214,6 +223,7 @@ class PairDataset(RasterDataset):
         resolved_indexes = self.get_indexes(pairs=pairs)
         paths = self.files.iloc[resolved_indexes].paths.tolist()
 
-        if self._chunks is not None:
-            return self._sample_files_lazy(paths, query)
-        return self._sample_files(paths, query)
+        c = self._resolve_chunks(chunks)
+        if c is not None:
+            return self._sample_files_lazy(paths, query, verbose, c)
+        return self._sample_files(paths, query, verbose)

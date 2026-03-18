@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pandas as pd
 import rioxarray  # noqa: F401
@@ -130,37 +130,46 @@ class TimeSeriesDataset(RasterDataset, ABC):
         self,
         points: Points,
         dates: Acquisition | pd.DatetimeIndex | None = None,
+        verbose: bool | None = None,
     ) -> xr.Dataset:
         """Query points for the given dates subset (no indexes support)."""
         resolved_indexes = self.get_indexes(dates=dates)
-        return self._compute_points_ds(points, resolved_indexes)
+        return self._compute_points_ds(points, resolved_indexes, verbose)
 
     def boxes_query(
         self,
         bbox: BoundingBox | list[BoundingBox],
         dates: Acquisition | pd.DatetimeIndex | None = None,
+        verbose: bool | None = None,
+        chunks: dict[str, int] | int | Literal["auto", False] | None = None,
     ) -> xr.DataTree:
         """Query bbox/boxes for the given dates subset (no indexes support)."""
         resolved_indexes = self.get_indexes(dates=dates)
-        if self._chunks is not None:
-            return self._compute_bboxes_tree_lazy(bbox, resolved_indexes)
-        return self._compute_bboxes_tree(bbox, resolved_indexes)
+        c = self._resolve_chunks(chunks)
+        if c is not None:
+            return self._compute_bboxes_tree_lazy(bbox, resolved_indexes, c)
+        return self._compute_bboxes_tree(bbox, resolved_indexes, verbose)
 
     def polygons_query(
         self,
         polygons: Polygons,
         dates: Acquisition | pd.DatetimeIndex | None = None,
+        verbose: bool | None = None,
+        chunks: dict[str, int] | int | Literal["auto", False] | None = None,
     ) -> xr.DataTree:
         """Query polygons for the given dates subset (no indexes support)."""
         resolved_indexes = self.get_indexes(dates=dates)
-        if self._chunks is not None:
-            return self._compute_polygons_tree_lazy(polygons, resolved_indexes)
-        return self._compute_polygons_tree(polygons, resolved_indexes)
+        c = self._resolve_chunks(chunks)
+        if c is not None:
+            return self._compute_polygons_tree_lazy(polygons, resolved_indexes, c)
+        return self._compute_polygons_tree(polygons, resolved_indexes, verbose)
 
     def query(
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         dates: Acquisition | pd.DatetimeIndex | None = None,
+        verbose: bool | None = None,
+        chunks: dict[str, int] | int | Literal["auto", False] | None = None,
     ) -> xr.DataTree:
         """Retrieve image values for given query using dates subset only."""
         if isinstance(query, Points):
@@ -172,4 +181,8 @@ class TimeSeriesDataset(RasterDataset, ABC):
 
         resolved_indexes = self.get_indexes(dates=dates)
         paths = self.files.iloc[resolved_indexes].paths.tolist()
-        return self._sample_files(paths, query)
+
+        c = self._resolve_chunks(chunks)
+        if c is not None:
+            return self._sample_files_lazy(paths, query, verbose, c)
+        return self._sample_files(paths, query, verbose)

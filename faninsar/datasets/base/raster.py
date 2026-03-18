@@ -296,6 +296,30 @@ class RasterDataset(GeoDataset):
             return {"y": chunks.get("y", 512), "x": chunks.get("x", 512)}
         return None
 
+    def _resolve_verbose(self, verbose: bool | None) -> bool:
+        """Resolve verbose: None falls back to self.verbose."""
+        return self.verbose if verbose is None else verbose
+
+    def _resolve_chunks(
+        self,
+        chunks: dict[str, int] | int | Literal["auto", False] | None,
+    ) -> dict[str, int] | Literal["auto"] | None:
+        """Resolve chunks for per-query override.
+
+        Parameters
+        ----------
+        chunks : dict | int | Literal["auto"] | None | Literal[False]
+            - None: fall back to self._chunks (keep instance behavior)
+            - False: force eager (return None)
+            - other: normalize and use as override
+
+        """
+        if chunks is None:
+            return self._chunks
+        if chunks is False:
+            return None
+        return self._normalize_chunks(chunks)
+
     @property
     def is_lazy(self) -> bool:
         """Return True if dataset is configured for lazy loading."""
@@ -545,7 +569,9 @@ class RasterDataset(GeoDataset):
         user_res: float | tuple[float, float] | None,
         user_dtype: np.dtype | None,
         user_nodata: float | None,
-    ) -> tuple[CRS | None, tuple[float, float] | None, np.dtype | None, float | None]:
+    ) -> tuple[
+        CRS | None, float | tuple[float, float] | None, np.dtype | None, float | None
+    ]:
         """Determine dataset attributes based on user parameters and file metadata.
 
         Parameters
@@ -575,16 +601,20 @@ class RasterDataset(GeoDataset):
         first_valid = valid_files.iloc[0]
 
         # Determine final CRS
-        final_crs = user_crs if user_crs is not None else first_valid.crs
+        final_crs: CRS = user_crs if user_crs is not None else first_valid.crs
 
         # Determine final resolution
-        final_res = user_res if user_res is not None else first_valid.res
+        final_res: float | tuple[float, float] = (
+            user_res if user_res is not None else first_valid.res
+        )
 
         # Determine final data type
-        final_dtype = user_dtype if user_dtype is not None else first_valid.file_dtype
+        final_dtype: np.dtype = (
+            user_dtype if user_dtype is not None else first_valid.file_dtype
+        )
 
         # Determine final nodata value
-        final_nodata = (
+        final_nodata: float | None = (
             user_nodata if user_nodata is not None else first_valid.file_nodata
         )
 
@@ -711,7 +741,7 @@ class RasterDataset(GeoDataset):
         results: dict[str, Any] = {}
 
         if query.points is not None:
-            data = self._files_query_points(query.points, vrt_fhs)
+            data = self._files_query_points(query.points, vrt_fhs, self.verbose)
             results["points"] = {
                 "query": query.points,
                 "data": np.asarray(data),
@@ -753,7 +783,7 @@ class RasterDataset(GeoDataset):
         base_info: dict[str, Any],
     ) -> dict[str, Any]:
         """Build dict result for a single bounding box query."""
-        box_data = self._files_query_bbox(bbox, vrt_fhs)
+        box_data = self._files_query_bbox(bbox, vrt_fhs, self.verbose)
         profile = self.get_profile(self._ensure_query_crs(bbox))
         return {
             "query": bbox,
@@ -770,7 +800,7 @@ class RasterDataset(GeoDataset):
     ) -> dict[str, Any] | list[dict[str, Any]]:
         """Build dict result(s) for polygon query."""
         polygons_values, transform_ls, mask_ls = self._files_query_polygons(
-            polygons, vrt_fhs
+            polygons, vrt_fhs, self.verbose
         )
         n_polygons = len(polygons)
         if n_polygons == 1:
@@ -921,34 +951,50 @@ class RasterDataset(GeoDataset):
         return data_ls, transform_ls, mask_ls
 
     def _files_query_points(
-        self, points: Points, vrt_fhs: Iterable[DatasetReader]
+        self, points: Points, vrt_fhs: Iterable[DatasetReader], verbose: bool
     ) -> np.ndarray:
         """Return the values of the dataset at the given points."""
         data_ls = []
-        for vrt_fh in tqdm(vrt_fhs, desc="Querying points", unit=" files"):
+        iter_ = (
+            tqdm(vrt_fhs, desc="Querying points", unit=" files") if verbose else vrt_fhs
+        )
+        for vrt_fh in iter_:
             data = self._file_query_points(points, vrt_fh)
             data_ls.append(data)
         return np.ma.asarray(data_ls)
 
     def _files_query_bbox(
-        self, bbox: BoundingBox, vrt_fhs: Iterable[DatasetReader]
+        self, bbox: BoundingBox, vrt_fhs: Iterable[DatasetReader], verbose: bool
     ) -> np.ndarray:
         """Return the values of the dataset at the given bounding box."""
         data_ls = []
-        for vrt_fh in tqdm(vrt_fhs, desc="Querying bounding box", unit=" files"):
+        iter_ = (
+            tqdm(vrt_fhs, desc="Querying bounding box", unit=" files")
+            if verbose
+            else vrt_fhs
+        )
+        for vrt_fh in iter_:
             data = self._file_query_bbox(bbox, vrt_fh)
             data_ls.append(data)
         return np.ma.asarray(data_ls)
 
     def _files_query_polygons(
-        self, polygons: Polygons, vrt_fhs: Iterable[DatasetReader]
+        self,
+        polygons: Polygons,
+        vrt_fhs: Iterable[DatasetReader],
+        verbose: bool,
     ) -> tuple[list, list[Affine], list[np.ndarray]]:
         """Return the values of the dataset at the given polygons."""
         data_ls_all = []
         transform_ls = []
         mask_ls = []
 
-        for vrt_fh in tqdm(vrt_fhs, desc="Querying polygons", unit=" files"):
+        iter_ = (
+            tqdm(vrt_fhs, desc="Querying polygons", unit=" files")
+            if verbose
+            else vrt_fhs
+        )
+        for vrt_fh in iter_:
             data_ls, transform_ls_file, mask_ls_file = self._file_query_polygons(
                 polygons, vrt_fh
             )
@@ -1004,6 +1050,7 @@ class RasterDataset(GeoDataset):
         self,
         paths: Iterable[str],
         query: GeoQuery,
+        verbose: bool | None = None,
     ) -> xr.DataTree:
         """Sample or retrieve values from the dataset for the given query.
 
@@ -1013,6 +1060,8 @@ class RasterDataset(GeoDataset):
             list of paths for files to stack
         query : GeoQuery
             a GeoQuery instance containing the desired queries.
+        verbose : bool or None, optional
+            Override verbose setting for this query.
 
         Returns
         -------
@@ -1029,17 +1078,17 @@ class RasterDataset(GeoDataset):
 
         # Compute components (eager loading)
         points_ds = (
-            self._compute_points_ds(query.points, indexes)
+            self._compute_points_ds(query.points, indexes, verbose)
             if query.points is not None
             else None
         )
         bboxes_tree = (
-            self._compute_bboxes_tree(query.boxes, indexes)
+            self._compute_bboxes_tree(query.boxes, indexes, verbose)
             if query.boxes is not None
             else None
         )
         polygons_tree = (
-            self._compute_polygons_tree(query.polygons, indexes)
+            self._compute_polygons_tree(query.polygons, indexes, verbose)
             if query.polygons is not None
             else None
         )
@@ -1062,16 +1111,18 @@ class RasterDataset(GeoDataset):
                         qroot["boxes"] = [_serialize_bbox(query.boxes)]
                 if query.polygons is not None:
                     qroot["polygons"] = _serialize_polygons(query.polygons)
-            root_attrs.update({
-                "query_json": json.dumps(qroot),
-                "query_repr": (
-                    "GeoQuery("
-                    f"points={query.points is not None}, "
-                    f"boxes={query.boxes is not None}, "
-                    f"polygons={query.polygons is not None}"
-                    ")"
-                ),
-            })
+            root_attrs.update(
+                {
+                    "query_json": json.dumps(qroot),
+                    "query_repr": (
+                        "GeoQuery("
+                        f"points={query.points is not None}, "
+                        f"boxes={query.boxes is not None}, "
+                        f"polygons={query.polygons is not None}"
+                        ")"
+                    ),
+                }
+            )
         except Exception:
             pass
         root_ds = xr.Dataset(attrs=root_attrs)
@@ -1080,7 +1131,7 @@ class RasterDataset(GeoDataset):
 
         # points
         if query.points is not None:
-            points_ds = self._compute_points_ds(query.points, indexes)
+            points_ds = self._compute_points_ds(query.points, indexes, verbose)
             children["points"] = xr.DataTree(dataset=points_ds, name="points")
         else:
             children["points"] = xr.DataTree(name="points")
@@ -1103,6 +1154,8 @@ class RasterDataset(GeoDataset):
         self,
         paths: Iterable[str],
         query: GeoQuery,
+        verbose: bool | None = None,
+        chunks: dict[str, int] | Literal["auto"] | None = None,
     ) -> xr.DataTree:
         """Sample files using lazy loading with dask arrays.
 
@@ -1112,6 +1165,10 @@ class RasterDataset(GeoDataset):
             list of paths for files to stack
         query : GeoQuery
             a GeoQuery instance containing the desired queries.
+        verbose : bool or None, optional
+            Override verbose setting for this query.
+        chunks : dict or Literal["auto"] or None, optional
+            Resolved chunks configuration for lazy loading.
 
         Returns
         -------
@@ -1128,21 +1185,21 @@ class RasterDataset(GeoDataset):
 
         # Points query - keep eager (small data)
         points_ds = (
-            self._compute_points_ds(query.points, indexes)
+            self._compute_points_ds(query.points, indexes, verbose)
             if query.points is not None
             else None
         )
 
         # Bboxes query - use lazy loading
         bboxes_tree = (
-            self._compute_bboxes_tree_lazy(query.boxes, indexes)
+            self._compute_bboxes_tree_lazy(query.boxes, indexes, chunks)
             if query.boxes is not None
             else None
         )
 
         # Polygons query - use lazy loading
         polygons_tree = (
-            self._compute_polygons_tree_lazy(query.polygons, indexes)
+            self._compute_polygons_tree_lazy(query.polygons, indexes, chunks)
             if query.polygons is not None
             else None
         )
@@ -1177,6 +1234,7 @@ class RasterDataset(GeoDataset):
         self,
         bbox: BoundingBox | list[BoundingBox],
         indexes: int | Iterable[int] | None = None,
+        chunks: dict[str, int] | Literal["auto"] | None = None,
     ) -> xr.DataTree:
         """Compute bbox query with lazy loading using dask arrays.
 
@@ -1196,6 +1254,8 @@ class RasterDataset(GeoDataset):
             Bounding box(es) to query.
         indexes : int or Iterable[int] or None, optional
             Indexes of files to query.
+        chunks : dict or Literal["auto"] or None, optional
+            Resolved chunks configuration for lazy loading.
 
         Returns
         -------
@@ -1203,11 +1263,12 @@ class RasterDataset(GeoDataset):
             DataTree with dask arrays (data not yet loaded).
 
         """
+        resolved_chunks = chunks if chunks is not None else self._chunks
         bbox_list = bbox if isinstance(bbox, list) else [bbox]
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
 
         # Create multi-file lazy reader
-        multi_reader = LazyMultiFileReader(paths, chunks=self._chunks)
+        multi_reader = LazyMultiFileReader(paths, chunks=resolved_chunks)
 
         # Single bbox input (not a list) -> DataArray at root
         if not isinstance(bbox, list):
@@ -1234,10 +1295,12 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update({
-                "y": ("y", np.asarray(lat)),
-                "x": ("x", np.asarray(lon)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(lat)),
+                    "x": ("x", np.asarray(lon)),
+                }
+            )
 
             # Create Dataset with dask array (still lazy!)
             ds = xr.Dataset(
@@ -1285,10 +1348,12 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update({
-                "y": ("y", np.asarray(lat)),
-                "x": ("x", np.asarray(lon)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(lat)),
+                    "x": ("x", np.asarray(lon)),
+                }
+            )
 
             # Create Dataset with dask array (still lazy!)
             ds = xr.Dataset(
@@ -1319,6 +1384,7 @@ class RasterDataset(GeoDataset):
         self,
         polygons: Polygons,
         indexes: int | Iterable[int] | None = None,
+        chunks: dict[str, int] | Literal["auto"] | None = None,
     ) -> xr.DataTree:
         """Compute polygons query with lazy loading using dask arrays.
 
@@ -1328,6 +1394,8 @@ class RasterDataset(GeoDataset):
             Polygons to query.
         indexes : int or Iterable[int] or None, optional
             Indexes of files to query.
+        chunks : dict or Literal["auto"] or None, optional
+            Resolved chunks configuration for lazy loading.
 
         Returns
         -------
@@ -1340,9 +1408,10 @@ class RasterDataset(GeoDataset):
         box of each polygon lazily, and masking is applied during compute().
 
         """
+        resolved_chunks = chunks if chunks is not None else self._chunks
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
 
-        multi_reader = LazyMultiFileReader(paths, chunks=self._chunks)
+        multi_reader = LazyMultiFileReader(paths, chunks=resolved_chunks)
 
         n_polygons = len(polygons)
         children = {}
@@ -1381,10 +1450,12 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update({
-                "y": ("y", np.asarray(lat)),
-                "x": ("x", np.asarray(lon)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(lat)),
+                    "x": ("x", np.asarray(lon)),
+                }
+            )
 
             # Create Dataset with lazy array
             wkt = poly_geom.wkt if hasattr(poly_geom, "wkt") else str(poly_geom)
@@ -1397,11 +1468,13 @@ class RasterDataset(GeoDataset):
                     "nodata": self.nodata,
                     "lazy": True,
                     "polygon_wkt": wkt,
-                    "query_json": json.dumps({
-                        "type": "Polygon",
-                        "crs": str(self.crs) if self.crs is not None else None,
-                        "wkt": wkt,
-                    }),
+                    "query_json": json.dumps(
+                        {
+                            "type": "Polygon",
+                            "crs": str(self.crs) if self.crs is not None else None,
+                            "wkt": wkt,
+                        }
+                    ),
                     "query_repr": f"Polygon(crs={self.crs})",
                 },
             )
@@ -1413,16 +1486,20 @@ class RasterDataset(GeoDataset):
         return xr.DataTree(name="polygons", children=children)
 
     def _compute_points_ds(
-        self, points: Points, indexes: int | Iterable[int] | None = None
+        self,
+        points: Points,
+        indexes: int | Iterable[int] | None = None,
+        verbose: bool | None = None,
     ) -> xr.Dataset:
         """Compute points query and return Dataset.
 
         Data variable contains stacked file results with optional band axis.
         Coordinates are provided via :meth:`_file_coords`.
         """
+        v = self._resolve_verbose(verbose)
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
         vrt_fhs = self._paths2vrt_fhs(paths)
-        data = self._files_query_points(points, vrt_fhs)
+        data = self._files_query_points(points, vrt_fhs, v)
 
         # Determine dims
         file_dim = self.file_dim_name
@@ -1440,23 +1517,27 @@ class RasterDataset(GeoDataset):
         y_pts = np.asarray(pts.y, dtype=float)
 
         coords = self._file_coords(resolved_indexes, paths, files_df)
-        coords.update({
-            "point": ("point", np.arange(data.shape[-1])),
-            "x": ("point", x_pts),
-            "y": ("point", y_pts),
-        })
+        coords.update(
+            {
+                "point": ("point", np.arange(data.shape[-1])),
+                "x": ("point", x_pts),
+                "y": ("point", y_pts),
+            }
+        )
         if data.ndim == 3:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
         ds = xr.Dataset({"data": (dims, data)}, coords=coords)
         # Dual-track saving: query_json + human-readable query_repr
         qjson = json.dumps(_serialize_points(points))
-        ds.attrs.update({
-            "crs": str(self.crs) if self.crs is not None else None,
-            "nodata": self.nodata,
-            "query_json": qjson,
-            "query_repr": f"Points(count={len(points)}, crs={points.crs})",
-        })
+        ds.attrs.update(
+            {
+                "crs": str(self.crs) if self.crs is not None else None,
+                "nodata": self.nodata,
+                "query_json": qjson,
+                "query_repr": f"Points(count={len(points)}, crs={points.crs})",
+            }
+        )
         return ds
 
     def _make_bbox_ds(
@@ -1483,10 +1564,12 @@ class RasterDataset(GeoDataset):
         dims = (file_dim, "band", "y", "x") if data.ndim == 4 else (file_dim, "y", "x")
 
         coords = self._file_coords(indexes, paths, files_df)
-        coords.update({
-            "y": ("y", np.asarray(lat)),
-            "x": ("x", np.asarray(lon)),
-        })
+        coords.update(
+            {
+                "y": ("y", np.asarray(lat)),
+                "x": ("x", np.asarray(lon)),
+            }
+        )
         if data.ndim == 4:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
@@ -1501,16 +1584,18 @@ class RasterDataset(GeoDataset):
                 "nodata": self.nodata,
             },
         )
-        ds.attrs.update({
-            "query_json": json.dumps(_serialize_bbox(single_bbox)),
-            "query_repr": (
-                "BBox("
-                f"{single_bbox.left}, {single_bbox.bottom}, "
-                f"{single_bbox.right}, {single_bbox.top}, "
-                f"crs={single_bbox.crs}"
-                ")"
-            ),
-        })
+        ds.attrs.update(
+            {
+                "query_json": json.dumps(_serialize_bbox(single_bbox)),
+                "query_repr": (
+                    "BBox("
+                    f"{single_bbox.left}, {single_bbox.bottom}, "
+                    f"{single_bbox.right}, {single_bbox.top}, "
+                    f"crs={single_bbox.crs}"
+                    ")"
+                ),
+            }
+        )
         return write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
 
     def _make_bbox_da(
@@ -1537,10 +1622,12 @@ class RasterDataset(GeoDataset):
         dims = (file_dim, "band", "y", "x") if data.ndim == 4 else (file_dim, "y", "x")
 
         coords = self._file_coords(indexes, paths, files_df)
-        coords.update({
-            "y": ("y", np.asarray(lat)),
-            "x": ("x", np.asarray(lon)),
-        })
+        coords.update(
+            {
+                "y": ("y", np.asarray(lat)),
+                "x": ("x", np.asarray(lon)),
+            }
+        )
         if data.ndim == 4:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
@@ -1591,10 +1678,12 @@ class RasterDataset(GeoDataset):
                 dims = (file_dim, "y", "x")
 
             coords = dict(file_coords)
-            coords.update({
-                "y": ("y", np.asarray(lat)),
-                "x": ("x", np.asarray(lon)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(lat)),
+                    "x": ("x", np.asarray(lon)),
+                }
+            )
             if vals_i.ndim == 4:
                 coords["band"] = ("band", np.arange(vals_i.shape[1]))
 
@@ -1613,14 +1702,18 @@ class RasterDataset(GeoDataset):
                 wkt = poly_geom.wkt
             except Exception:
                 wkt = str(poly_geom)
-            ds.attrs.update({
-                "query_json": json.dumps({
-                    "type": "Polygon",
-                    "crs": str(self.crs) if self.crs is not None else None,
-                    "wkt": wkt,
-                }),
-                "query_repr": f"Polygon(crs={self.crs})",
-            })
+            ds.attrs.update(
+                {
+                    "query_json": json.dumps(
+                        {
+                            "type": "Polygon",
+                            "crs": str(self.crs) if self.crs is not None else None,
+                            "wkt": wkt,
+                        }
+                    ),
+                    "query_repr": f"Polygon(crs={self.crs})",
+                }
+            )
             ds = write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
             polygon_dataset = ds
         else:
@@ -1659,6 +1752,7 @@ class RasterDataset(GeoDataset):
         self,
         bbox: BoundingBox | list[BoundingBox],
         indexes: int | Iterable[int] | None = None,
+        verbose: bool | None = None,
     ) -> xr.DataTree:
         """Compute bbox query and return a xr.DataTree.
 
@@ -1678,6 +1772,8 @@ class RasterDataset(GeoDataset):
             Bounding box(es) to query.
         indexes : int or Iterable[int] or None, optional
             Indexes of files to query.
+        verbose : bool or None, optional
+            Override verbose setting for this query.
 
         Returns
         -------
@@ -1685,13 +1781,14 @@ class RasterDataset(GeoDataset):
             DataTree with structure depending on bbox input type.
 
         """
+        v = self._resolve_verbose(verbose)
         bbox_list = bbox if isinstance(bbox, list) else [bbox]
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
         vrt_fhs = self._paths2vrt_fhs(paths)
 
         # Single bbox input (not a list) -> dataset at root
         if not isinstance(bbox, list):
-            data = self._files_query_bbox(bbox, vrt_fhs)
+            data = self._files_query_bbox(bbox, vrt_fhs, v)
             ds = self._make_bbox_ds(
                 bbox,
                 data,
@@ -1703,8 +1800,9 @@ class RasterDataset(GeoDataset):
 
         # List input (even single element) -> groups "bbox_0", "bbox_1", ...
         children: dict[str, xr.DataTree] = {}
-        for i, single_bbox in enumerate(tqdm(bbox_list)):
-            data = self._files_query_bbox(single_bbox, vrt_fhs)
+        iter_ = tqdm(bbox_list) if v else bbox_list
+        for i, single_bbox in enumerate(iter_):
+            data = self._files_query_bbox(single_bbox, vrt_fhs, v)
             ds = self._make_bbox_ds(
                 single_bbox,
                 data,
@@ -1717,7 +1815,10 @@ class RasterDataset(GeoDataset):
         return xr.DataTree(name="boxes", children=children)
 
     def _compute_polygons_tree(
-        self, polygons: Polygons, indexes: int | Iterable[int] | None = None
+        self,
+        polygons: Polygons,
+        indexes: int | Iterable[int] | None = None,
+        verbose: bool | None = None,
     ) -> xr.DataTree:
         """Compute polygons query and return a xr.DataTree.
 
@@ -1728,10 +1829,11 @@ class RasterDataset(GeoDataset):
         Coordinates include file paths, y/x from transform, and a scalar
         'polygon' WKT.
         """
+        v = self._resolve_verbose(verbose)
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
         vrt_fhs = self._paths2vrt_fhs(paths)
         polygons_values, transform_ls, mask_ls = self._files_query_polygons(
-            polygons, vrt_fhs
+            polygons, vrt_fhs, v
         )
         n_polygons = len(polygons)
 
@@ -1937,6 +2039,7 @@ class RasterDataset(GeoDataset):
         self,
         points: Points,
         indexes: int | list[int] | None = None,
+        verbose: bool | None = None,
     ) -> xr.Dataset:
         """Query the dataset for the given file index and points.
 
@@ -1947,6 +2050,8 @@ class RasterDataset(GeoDataset):
         indexes : int or list of int or None, optional
             indexes of the files to query. If None, all files in the dataset
             will be used. Default is None.
+        verbose : bool or None, optional
+            Override verbose setting for this query. None uses self.verbose.
 
         Returns
         -------
@@ -1954,12 +2059,14 @@ class RasterDataset(GeoDataset):
             a result object containing the results of the query.
 
         """
-        return self._compute_points_ds(points, indexes)
+        return self._compute_points_ds(points, indexes, verbose)
 
     def boxes_query(
         self,
         bbox: BoundingBox | list[BoundingBox],
         indexes: int | list[int] | None = None,
+        verbose: bool | None = None,
+        chunks: dict[str, int] | int | Literal["auto", False] | None = None,
     ) -> xr.DataTree:
         """Query the dataset for the given file index and bounding box(es).
 
@@ -1985,6 +2092,11 @@ class RasterDataset(GeoDataset):
             Indexes of the files to query. If None, all files in the dataset
             will be used. Default is None. File dimension will never be automatically
             removed even if it's 1.
+        verbose : bool or None, optional
+            Override verbose setting for this query. None uses self.verbose.
+        chunks : dict or int or Literal["auto", False] or None, optional
+            Override chunks setting for this query. None uses self._chunks.
+            False forces eager loading. Other values enable lazy loading.
 
         Returns
         -------
@@ -2017,14 +2129,17 @@ class RasterDataset(GeoDataset):
         >>> data = result["bbox_0"]["data"]  # Note: accessed via group "bbox_0"
 
         """
-        if self._chunks is not None:
-            return self._compute_bboxes_tree_lazy(bbox, indexes)
-        return self._compute_bboxes_tree(bbox, indexes)
+        c = self._resolve_chunks(chunks)
+        if c is not None:
+            return self._compute_bboxes_tree_lazy(bbox, indexes, c)
+        return self._compute_bboxes_tree(bbox, indexes, verbose)
 
     def polygons_query(
         self,
         polygons: Polygons,
         indexes: int | list[int] | None = None,
+        verbose: bool | None = None,
+        chunks: dict[str, int] | int | Literal["auto", False] | None = None,
     ) -> xr.DataTree:
         """Query the dataset for the given file index and polygons.
 
@@ -2037,6 +2152,11 @@ class RasterDataset(GeoDataset):
             indexes of the files to query. If None, all files in the dataset
             will be used. Default is None. File dimension will never be automatically
             removed even if it's 1.
+        verbose : bool or None, optional
+            Override verbose setting for this query. None uses self.verbose.
+        chunks : dict or int or Literal["auto", False] or None, optional
+            Override chunks setting for this query. None uses self._chunks.
+            False forces eager loading. Other values enable lazy loading.
 
         Returns
         -------
@@ -2044,14 +2164,17 @@ class RasterDataset(GeoDataset):
             a result object containing the results of the query.
 
         """
-        if self._chunks is not None:
-            return self._compute_polygons_tree_lazy(polygons, indexes)
-        return self._compute_polygons_tree(polygons, indexes)
+        c = self._resolve_chunks(chunks)
+        if c is not None:
+            return self._compute_polygons_tree_lazy(polygons, indexes, c)
+        return self._compute_polygons_tree(polygons, indexes, verbose)
 
     def query(
         self,
         query: GeoQuery | Points | BoundingBox | Polygons,
         indexes: int | list[int] | None = None,
+        verbose: bool | None = None,
+        chunks: dict[str, int] | int | Literal["auto", False] | None = None,
     ) -> xr.DataTree:
         """Retrieve image values for given query.
 
@@ -2067,6 +2190,11 @@ class RasterDataset(GeoDataset):
         indexes : int or list of int or None, optional
             indexes of the files to query. If None, all files in the dataset
             will be used. Default is None.
+        verbose : bool or None, optional
+            Override verbose setting for this query. None uses self.verbose.
+        chunks : dict or int or Literal["auto", False] or None, optional
+            Override chunks setting for this query. None uses self._chunks.
+            False forces eager loading. Other values enable lazy loading.
 
         Returns
         -------
@@ -2083,9 +2211,10 @@ class RasterDataset(GeoDataset):
 
         paths = self._indexes2paths(indexes)
 
-        if self._chunks is not None:
-            return self._sample_files_lazy(paths, query)
-        return self._sample_files(paths, query)
+        c = self._resolve_chunks(chunks)
+        if c is not None:
+            return self._sample_files_lazy(paths, query, verbose, c)
+        return self._sample_files(paths, query, verbose)
 
     def row_col(
         self,

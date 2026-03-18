@@ -28,7 +28,7 @@ class GridSampler(Sampler):
 
     _boxes: np.ndarray
     _length: int
-    _shape: tuple[int]
+    _shape: tuple[int, ...]
     _indexes: int | Iterable[int] | np.ndarray | None
     _dataset: GeoDataset
 
@@ -68,7 +68,7 @@ class GridSampler(Sampler):
         return self._boxes
 
     @property
-    def shape(self) -> tuple[int]:
+    def shape(self) -> tuple[int, ...]:
         """The shape of the grid sampler."""
         return self._shape
 
@@ -96,7 +96,7 @@ class GridSampler(Sampler):
         num_workers: int = 1,
         prefetch_factor: int | None = None,
         pin_memory: bool = False,
-        tensor: bool = True,
+        tensor: bool = False,
         tensor_scope: Literal["data", "all"] = "data",
         collate_fn: Callable[[list[Any]], Any] | None = None,
         **kwargs: Any,
@@ -118,13 +118,14 @@ class GridSampler(Sampler):
             Whether to use pinned (page-locked) memory for faster host-to-device
             transfers. Default is False.
         tensor : bool, optional
-            Whether to convert numpy arrays to CPU torch tensors. Default is True.
+            Whether to convert numpy arrays to CPU torch tensors. Default is False.
         tensor_scope : {"data", "all"}, optional
             Conversion scope. ``"data"`` converts only ``data`` fields;
             ``"all"`` converts every numpy array recursively. Default is ``"data"``.
         collate_fn : Callable, optional
             Collate function used to merge samples. If provided, ``tensor`` and
-            ``tensor_scope`` are ignored.
+            ``tensor_scope`` are ignored. If None, :func:`tensor_collate` is used
+            when ``tensor=True``, otherwise :func:`identity_collate` is used.
         **kwargs : Any
             Additional keyword arguments forwarded to ``torch.utils.data.DataLoader``.
             The following keys are not allowed here because they are managed by
@@ -445,7 +446,7 @@ class RowColSampler(GridSampler):
                     f"row_num ({row_num}) is larger than the height ({ds_height})\n"
                     "of the dataset. The row_num will be set to the height of the"
                     " dataset.\n If this cannot meet your requirement, please try"
-                    " to choose other Sampler.",
+                    " to choose other Sampler."
                 )
                 logger.warning(msg)
                 row_num = ds_height
@@ -466,7 +467,7 @@ class RowColSampler(GridSampler):
                     f"col_num ({col_num}) is larger than the width ({ds_width})\n"
                     "of the dataset. The col_num will be set to the width of the"
                     " dataset.\n If this cannot meet your requirement, please try"
-                    " to choose other Sampler.",
+                    " to choose other Sampler."
                 )
                 logger.warning(msg)
                 col_num = width
@@ -482,7 +483,7 @@ class RowColSampler(GridSampler):
         self._length = row_num * col_num
         self._boxes = self._gen_patch_boxes()
 
-    def _gen_patch_boxes(self) -> None:
+    def _gen_patch_boxes(self) -> np.ndarray:
         roi = self.dataset.roi
         patch_boxes = []
         for i in range(self.row_num):
