@@ -73,7 +73,7 @@ class ApsDataset(TimeSeriesDataset, ABC):
         if len(dates_missing) > 0:
             msg = (
                 f"Following dates are missing in the {self.ds_name} "
-                f"dataset. \n{dates_missing}",
+                f"dataset. \n{dates_missing}"
             )
             logger.warning(msg, stacklevel=2)
 
@@ -95,7 +95,7 @@ class ApsDataset(TimeSeriesDataset, ABC):
                 msg = f"{out_file.name} already exists, skipping"
                 logger.info(msg)
                 continue
-            with rasterio.open(out_file, "w", **profile.profile) as dst:
+            with rasterio.open(out_file, "w", **profile) as dst:
                 src_primary = self._load_warp_file(df_paths[primary])
                 src_secondary = self._load_warp_file(df_paths[secondary])
                 dest_arr = (

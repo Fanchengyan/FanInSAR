@@ -4,23 +4,23 @@ from __future__ import annotations
 
 import pprint
 import zipfile
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Iterator, MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import xarray as xr
-from affine import Affine
 from lxml import etree
 from matplotlib import ticker
 from pykml.factory import KML_ElementMaker as KML
 from pyproj.crs import CRS
-from rasterio import dtypes, transform
+from rasterio import Affine, dtypes, transform
 from rasterio.io import MemoryFile
 from rasterio.profiles import Profile as RasterioProfile
-from rasterio.warp import Resampling, reproject
+from rasterio.transform import array_bounds, rowcol, xy
+from rasterio.warp import Resampling, calculate_default_transform, reproject
 from tqdm import tqdm
 
 from faninsar._core.file_tools import load_metas
@@ -29,18 +29,49 @@ from faninsar.query.bbox import BoundingBox
 
 if TYPE_CHECKING:
     from os import PathLike
+    from typing import Self
 
     from matplotlib.cm import ScalarMappable
+    from numpy.typing import ArrayLike
+    from odc.geo import GeoBox
 
     from faninsar.typing import CrsLike
 
 logger = setup_logger(__name__)
 
 
+OFFSET_LOCATIONS: dict[
+    Literal["center", "ul", "ur", "ll", "lr"], tuple[float, float]
+] = {
+    "center": (0.5, 0.5),
+    "ul": (0, 0),
+    "ur": (1, 0),
+    "ll": (0, 1),
+    "lr": (1, 1),
+}
+
+
+def _offset_from_loc(
+    loc: Literal["center", "ul", "ur", "ll", "lr"],
+) -> tuple[float, float]:
+    """Get the offset from pixel location."""
+    if loc not in OFFSET_LOCATIONS:
+        msg = f"loc should be one of {tuple(OFFSET_LOCATIONS.keys())}, but got {loc}"
+        logger.error(msg)
+        raise ValueError(msg)
+    return OFFSET_LOCATIONS[loc]
+
+
 def _ensure_bounds_in_wgs84(
-    bounds: tuple[float, float, float, float],
-) -> None:
+    bounds: tuple[float, ...],
+) -> tuple[float, float, float, float]:
     """Ensure the bounds are in WGS84 coordinate system."""
+    if len(bounds) != 4:
+        msg = (
+            f"bounds should be a tuple of (west, south, east, north), but got {bounds}"
+        )
+        logger.error(msg)
+        raise ValueError(msg)
     west, south, east, north = bounds
     if west < -180 or east > 180 or south < -90 or north > 90:
         msg = (
@@ -48,6 +79,7 @@ def _ensure_bounds_in_wgs84(
             f"but got [{west}, {south}, {east}, {north}]"
         )
         raise ValueError(msg)
+    return west, south, east, north
 
 
 def save_colorbar(
@@ -128,12 +160,12 @@ def array2kml(
         cbar_kwargs = {}
     if img_kwargs is None:
         img_kwargs = {}
-    if isinstance(bounds, tuple):
-        _ensure_bounds_in_wgs84(bounds)
-        bounds = BoundingBox(*bounds, crs="EPSG:4326")
-    if bounds.crs != CRS.from_user_input("EPSG:4326"):
-        msg = "bounds should be in WGS84 coordinate system"
-        raise ValueError(msg)
+    wgs84 = CRS.from_user_input("EPSG:4326")
+    if not isinstance(bounds, BoundingBox) and isinstance(bounds, Iterable):
+        bounds = _ensure_bounds_in_wgs84(tuple(bounds))
+        bounds = BoundingBox(*bounds, crs=wgs84)
+    if bounds.crs != CRS.from_user_input(wgs84):
+        bounds = bounds.to_crs(wgs84)
 
     out_file = Path(out_file)
     if out_file.suffix != ".kml":
@@ -249,107 +281,152 @@ def array2kmz(
         logger.info(info)
 
 
-def bound_from_latlon(
-    lat: np.ndarray,
-    lon: np.ndarray,
-) -> tuple[float, float, float, float]:
-    """Get the bounds from latitude and longitude."""
-    west, south, east, north = (
-        np.nanmin(lon),
-        np.nanmin(lat),
-        np.nanmax(lon),
-        np.nanmax(lat),
-    )
-    return west, south, east, north
-
-
-def geoinfo_from_latlon(
-    lat: np.ndarray,
-    lon: np.ndarray,
-) -> tuple[BoundingBox, tuple, tuple]:
-    """Get the geoinformation from latitude and longitude.
+def transform_from_xy(
+    x: ArrayLike,
+    y: ArrayLike,
+    *,
+    loc: Literal["center", "ul", "ur", "ll", "lr"] = "center",
+) -> Affine:
+    """Get the :class:`rasterio.Affine` from x and y coordinates.
 
     Parameters
     ----------
-    lat, lon: numpy.ndarray or list
-        latitudes and longitudes
+    x, y: ArrayLike
+        x and y coordinates
+    loc: Literal["center", "ul", "ur", "ll", "lr"], optional
+        The pixel location that the coordinates refer to. Supported values are
+        "center", "ul", "ur", "ll", and "lr". Default is "center".
+
+    """
+    west, south, east, north = (
+        np.nanmin(x),
+        np.nanmin(y),
+        np.nanmax(x),
+        np.nanmax(y),
+    )
+    width, height = len(x), len(y)
+
+    xsize = (east - west) / width
+    ysize = (north - south) / height
+
+    offset = _offset_from_loc(loc)
+
+    return transform.from_origin(
+        west - offset[0] * xsize,  # center to left
+        north + offset[1] * ysize,  # center to top
+        xsize,
+        ysize,
+    )
+
+
+def bound_from_xy(
+    x: ArrayLike,
+    y: ArrayLike,
+    *,
+    loc: Literal["center", "ul", "ur", "ll", "lr"] = "center",
+    crs: CrsLike = "WGS84",
+) -> BoundingBox:
+    """Get the bounds from x and y coordinates.
+
+    Parameters
+    ----------
+    x, y: ArrayLike
+        x and y coordinates
+    loc: Literal["center", "ul", "ur", "ll", "lr"], optional
+        The pixel location that the coordinates refer to. Supported values are
+        "center", "ul", "ur", "ll", and "lr". Default is "center".
+    crs: CrsLike, optional
+        the coordinate reference system. Could be any type that accepted by
+        :meth:`pyproj.CRS.from_user_input`. Default is "WGS84".
+
+    """
+    width, height = len(x), len(y)
+    tf = transform_from_xy(x, y, loc=loc)
+    left, top = tf * (0, 0)
+    right, bottom = tf * (width, height)
+    return BoundingBox(left, bottom, right, top, crs=crs)
+
+
+def geoinfo_from_xy(
+    x: ArrayLike,
+    y: ArrayLike,
+    *,
+    crs: CrsLike = "WGS84",
+    loc: Literal["center", "ul", "ur", "ll", "lr"] = "center",
+) -> tuple[BoundingBox, Affine, tuple, tuple]:
+    """Evaluate the geoinformation from x and y coordinates.
+
+    Parameters
+    ----------
+    x, y: numpy.ndarray or list
+        x and y coordinates
+    loc: Literal["center", "ul", "ur", "ll", "lr"], optional
+        The pixel location that the coordinates refer to. Supported values are
+        "center", "ul", "ur", "ll", and "lr". Default is "center".
+    crs: CrsLike, optional
+        the coordinate reference system. Could be any type that accepted by
+        :meth:`pyproj.CRS.from_user_input`. Default is "WGS84".
 
     Returns
     -------
     bounds: BoundingBox
         the bounding box of the raster.
-
-        .. note:: the crs is not set yet.
+    transform: Affine
+        the affine transform of the raster.
     res: tuple[xsize, ysize]
         the resolution of the raster
     shape: tuple[height, width]
         the shape of the raster
 
     """
-    west, south, east, north = bound_from_latlon(lat, lon)
-    width, height = len(lon), len(lat)
+    tf = transform_from_xy(x, y, loc=loc)
+    res = (abs(tf.a), abs(tf.e))
 
-    xsize = (east - west) / (width - 1)
-    ysize = (north - south) / (height - 1)
-    bounds = BoundingBox(west, south, east, north)
-    res = (xsize, ysize)
+    width, height = len(x), len(y)
     shape = (height, width)
-    return bounds, res, shape
+
+    left, top = tf * (0, 0)
+    right, bottom = tf * (width, height)
+    bounds = BoundingBox(left, bottom, right, top, crs=crs)
+
+    return bounds, tf, res, shape
 
 
-def transform_from_latlon(
-    lat: np.ndarray,
-    lon: np.ndarray,
-) -> Affine:
-    """Get the :class:`rasterio.Affine` from latitude and longitude.
-
-    .. note::
-        The pixel location will shift from center to upper-left corner.
-
-    Parameters
-    ----------
-    lat, lon: numpy.ndarray or list
-        latitudes and longitudes
-
-    """
-    (west, north), (xsize, ysize), _ = geoinfo_from_latlon(lat, lon)
-
-    return transform.from_origin(
-        west - 0.5 * xsize,  # center to left
-        north + 0.5 * ysize,  # center to top
-        xsize,
-        ysize,
-    )
-
-
-def latlon_from_transform(
+def xy_from_transform(
     tf: Affine | None,
     width: int,
     height: int,
+    *,
+    loc: Literal["center", "ul", "ur", "ll", "lr"] = "center",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Get the latitude and longitude from transform and shape.
+    """Get the x and y coordinates from transform and shape.
 
     Parameters
     ----------
-    tf: Affine
-        the transform of the raster
+    tf: Affine | None
+        the transform of the raster. If tf is None, the x and y coordinates will
+        be range(width) and range(height).
     width, height: int
         the width and height of the raster
+    loc: Literal["center", "ul", "ur", "ll", "lr"], optional
+        the pixel location that the coordinates refer to. Supported values are
+        "center", "ul", "ur", "ll", and "lr". Default is "center".
 
     Returns
     -------
-    lat, lon: numpy.ndarray
+    x, y: numpy.ndarray
 
     """
     if tf is None:
-        return np.arange(height), np.arange(width)
-    lon = tf.xoff + tf.a * np.arange(width) + tf.a * 0.5
-    lat = tf.yoff + tf.e * np.arange(height) + tf.e * 0.5
-    return lat, lon
+        return np.arange(width), np.arange(height)
+    offset = _offset_from_loc(loc)
+    x = tf.xoff + tf.a * (np.arange(width) + offset[0])
+    y = tf.yoff + tf.e * (np.arange(height) + offset[1])
+    return x, y
 
 
-def latlon_from_profile(profile: RasterioProfile) -> tuple[np.ndarray, np.ndarray]:
-    """Get the latitude and longitude from rasterio profile data.
+def xy_from_profile(profile: RasterioProfile) -> tuple[np.ndarray, np.ndarray]:
+    """Get the x and y coordinates from rasterio profile data.
 
     Parameters
     ----------
@@ -359,13 +436,13 @@ def latlon_from_profile(profile: RasterioProfile) -> tuple[np.ndarray, np.ndarra
 
     Returns
     -------
-    lat, lon: numpy.ndarray
+    x, y: numpy.ndarray
 
     """
     tf = profile["transform"]
     width = profile["width"]
     height = profile["height"]
-    return latlon_from_transform(tf, width, height)
+    return xy_from_transform(tf, width, height)
 
 
 @overload
@@ -376,8 +453,6 @@ def write_geoinfo_into_ds(
     x_dim: str = "lon",
     y_dim: str = "lat",
 ) -> xr.DataArray: ...
-
-
 @overload
 def write_geoinfo_into_ds(
     ds: xr.Dataset,
@@ -386,8 +461,6 @@ def write_geoinfo_into_ds(
     x_dim: str = "lon",
     y_dim: str = "lat",
 ) -> xr.Dataset: ...
-
-
 def write_geoinfo_into_ds(
     ds: xr.DataArray | xr.Dataset,
     var: str | tuple | list | None = None,
@@ -420,9 +493,9 @@ def write_geoinfo_into_ds(
         ds[var] = ds[var].rio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim)
         ds[var] = ds[var].rio.write_crs(crs)
     elif isinstance(var, (tuple, list)):
-        for _var in var:
-            ds[_var] = ds[_var].rio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim)
-            ds[_var] = ds[_var].rio.write_crs(crs)
+        for var_ in var:
+            ds[var_] = ds[var_].rio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim)
+            ds[var_] = ds[var_].rio.write_crs(crs)
     elif var is None:
         msg = "Detected type of ds is a xr.Dataset. var must be set"
         raise TypeError(msg)
@@ -473,7 +546,7 @@ def write_geoinfo_into_nc(
         else:
             info = (
                 f'there is no "time" dimension in {nc_file}, '
-                "encoding process will be ignored",
+                "encoding process will be ignored"
             )
             logger.warning(info)
     ds.to_netcdf(nc_file, encoding=encode)
@@ -563,6 +636,851 @@ def match_to_raster(
                 )
             arr_dst = dst.read(indexes)
     return arr_dst
+
+
+DEFAULT_KEYS_Profile = [
+    "height",
+    "width",
+    "transform",
+    "crs",
+    "nodata",
+    "count",
+    "driver",
+    "dtype",
+]
+
+
+class GeoGridMixin:
+    """A class to manage GeoGrid information of a raster image.
+
+    A GeoGrid is a fixed pixel grid reference system for geospatial data. It
+    represents a grid system with fixed pixel resolution, alignment, and coordinate
+    reference system (CRS). Different spatial extents can be derived from the
+    same grid, ensuring consistent pixel grid alignment across all views.
+    """
+
+    def _refresh_bounds(self) -> None:
+        """Refresh cached bounds after geometry updates."""
+        if (
+            hasattr(self, "_transform")
+            and hasattr(self, "_shape")
+            and hasattr(self, "_crs")
+        ):
+            self._bounds = self._parse_bounds()
+
+    def _parse_bounds(self) -> BoundingBox:
+        """Parse the bounds from geogrid data."""
+        west, south, east, north = array_bounds(self.height, self.width, self.transform)
+        return BoundingBox(west, south, east, north, crs=self.crs)
+
+    @property
+    def transform(self) -> Affine:
+        """The transform of raster image."""
+        return self._transform
+
+    @transform.setter
+    def transform(self, value: Affine) -> None:
+        """Set the transform of raster image."""
+        self._transform = value
+        self._refresh_bounds()
+
+    @property
+    def north_up(self) -> bool:
+        """Whether the raster image is north-up."""
+        return self.transform.e < 0
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """The shape of raster image in (height, width) order."""
+        return self._shape
+
+    @shape.setter
+    def shape(self, value: tuple[int, int]) -> None:
+        """Set the shape of raster image in (height, width) order."""
+        if len(value) != 2:
+            msg = "shape must be a tuple of (height, width)"
+            logger.error(msg)
+            raise ValueError(msg)
+        self._shape = (int(value[0]), int(value[1]))
+        self._refresh_bounds()
+
+    @property
+    def res(self) -> tuple[float, float]:
+        """The resolution of raster image in x and y direction."""
+        return (abs(self.transform.a), abs(self.transform.e))
+
+    @property
+    def width(self) -> int:
+        """The width of raster image."""
+        return self.shape[1]
+
+    @width.setter
+    def width(self, value: int) -> None:
+        """Set the width of raster image."""
+        self._shape = (self.shape[0], int(value))
+        self._refresh_bounds()
+
+    @property
+    def height(self) -> int:
+        """The height of raster image."""
+        return self.shape[0]
+
+    @height.setter
+    def height(self, value: int) -> None:
+        """Set the height of raster image."""
+        self._shape = (int(value), self.shape[1])
+        self._refresh_bounds()
+
+    @property
+    def crs(self) -> CRS | None:
+        """The coordinate reference system of raster image."""
+        return self._crs
+
+    @crs.setter
+    def crs(self, value: CrsLike | None) -> None:
+        """Set the coordinate reference system of raster image."""
+        self._crs = CRS.from_user_input(value) if value is not None else None
+        self._refresh_bounds()
+
+    @property
+    def bounds(self) -> BoundingBox:
+        """The bounds of the GeoGrid in (west, south, east, north) order."""
+        return self._bounds
+
+    @property
+    def extent(self) -> tuple[float, float, float, float]:
+        """The extent of the GeoGrid in (west, east, south, north) order."""
+        b = self.bounds
+        return (b.left, b.right, b.bottom, b.top)
+
+
+class GeoGrid(GeoGridMixin):
+    """A fixed pixel grid reference system for geospatial data.
+
+    GeoGrid represents a grid system with fixed resolution, pixel alignment,
+    and coordinate reference system (CRS). Different spatial extents can be
+    derived from the same grid, ensuring consistent pixel grid alignment
+    across all views.
+
+    Parameters
+    ----------
+    transform: Affine
+        Affine transformation matrix mapping pixel coordinates to map coordinates.
+    shape: tuple[int, int]
+        Grid dimensions as (height, width) in pixels.
+    crs: CrsLike, optional
+        Coordinate reference system. Accepts any type compatible with
+        :meth:`pyproj.CRS.from_user_input`. Default is None (unset).
+
+    """
+
+    def __init__(
+        self,
+        transform: Affine,
+        shape: tuple[int, int],
+        crs: CrsLike | None = None,
+    ) -> None:
+        """Initialize the GeoBox class."""
+        self._transform = transform
+        self.crs = crs
+        self.shape = shape
+
+    def __repr__(self) -> str:
+        """Get the string representation of the GeoGrid."""
+        info = {
+            "bounds": self.bounds.to_tuple(),
+            "transform": self.transform,
+            "shape": self.shape,
+            "crs": self.crs.to_string() if self.crs else None,
+        }
+        repr_str = f" {pprint.pformat(info, indent=2, sort_dicts=False).strip('{}')}"
+        return f"GeoGrid(\n{repr_str}\n)"
+
+    @classmethod
+    def from_bounds(
+        cls,
+        bounds: BoundingBox | tuple[float, float, float, float],
+        *,
+        res: float | tuple[float, float] | None = None,
+        shape: tuple[int, int] | None = None,
+        crs: CrsLike | None = None,
+    ) -> Self:
+        """Create a GeoGrid from bounds and shape.
+
+        Parameters
+        ----------
+        bounds: BoundingBox or tuple[float, float, float, float]
+            the bounds of the raster image in [west, south, east, north] order.
+            The bounds will be converted to the :param:`crs` if crs is not None,
+            otherwise the crs of bounds will be used.
+        res: float or tuple[float, float] | None, optional
+            the resolution of the raster image in x and y direction. If res is a
+            single float, it will be used for both x and y direction. If None,
+            the resolution will be calculated from bounds and shape.
+        shape: tuple[int, int] | None, optional
+            the shape of the raster image in (height, width) order, which will
+            be ignored if res is not None.
+        crs: CrsLike | None, optional
+            the coordinate reference system of the raster image. Could be any
+            type that :meth:`pyproj.CRS.from_user_input` accepts. If None, the
+            crs of bounds will be used.
+
+        Returns
+        -------
+        GeoGrid
+             the GeoGrid object created from bounds and shape.
+
+        Raises
+        ------
+        ValueError
+            if neither res nor shape is provided
+
+        """
+        bounds, crs = format_bounds_and_crs(bounds, crs)
+        left, bottom, right, top = bounds
+        if res is not None:
+            if isinstance(res, (int, float)):
+                res = (res, res)
+            xsize = abs(float(res[0]))
+            ysize = abs(float(res[1]))
+            width = int(np.ceil((right - left) / xsize))
+            height = int(np.ceil((top - bottom) / ysize))
+            shape = (height, width)
+        elif shape is not None:
+            width, height = shape[1], shape[0]
+            xsize = (right - left) / width
+            ysize = (top - bottom) / height
+        else:
+            msg = "either res or shape must be provided"
+            logger.error(msg)
+            raise ValueError(msg)
+        tf = transform.from_origin(left, top, xsize, ysize)
+
+        return cls(tf, shape, crs)
+
+    @classmethod
+    def from_xy(
+        cls,
+        x: ArrayLike,
+        y: ArrayLike,
+        crs: CrsLike = "WGS84",
+        loc: Literal["center", "ul", "ur", "ll", "lr"] = "center",
+    ) -> Self:
+        """Create a GeoGrid from x and y coordinates.
+
+        Parameters
+        ----------
+        x, y: ArrayLike
+            x and y coordinates of pixel centers in raster image.
+        crs: CrsLike, optional
+            the coordinate reference system of the input coordinates. Could be
+            any type that accepted by :meth:`pyproj.CRS.from_user_input`.
+            Default is "WGS84".
+        loc: str, optional
+            the location of the coordinates in pixel. It can be "center", "ul",
+            "ur", "ll" or "lr". Default is "center".
+
+        Returns
+        -------
+        GeoGrid
+            the GeoGrid object created from x and y coordinates.
+
+        """
+        bounds, tf, _, shape = geoinfo_from_xy(x, y, crs=crs, loc=loc)
+        return cls(tf, shape, bounds.crs)
+
+    def to_crs(
+        self,
+        crs: CrsLike,
+        *,
+        res: float | tuple[float, float] | None = None,
+        shape: tuple[int, int] | None = None,
+    ) -> GeoGrid:
+        """Get a new GeoGrid reprojected to the destination CRS.
+
+        Parameters
+        ----------
+        crs: CrsLike
+            the destination coordinate reference system. Could be any type that
+            :meth:`pyproj.CRS.from_user_input` accepts.
+        res: float | tuple[float, float] | None, optional
+            Target resolution, in units of target coordinate reference system.
+            Default is None.
+        shape: tuple[x resolution, y resolution] | None, optional
+            the shape of the new GeoGrid in (height, width) order. Cannot be set
+            if res is not None. Default is None.
+
+        Returns
+        -------
+        GeoGrid
+            New GeoGrid reprojected to the destination CRS with aligned pixel grid.
+
+        """
+        left, bottom, right, top = self.bounds
+        dst_width, dst_height = None, None
+        if shape is not None:
+            dst_width, dst_height = shape[1], shape[0]
+        tf, width, height = calculate_default_transform(
+            self.crs,
+            crs,
+            self.width,
+            self.height,
+            left,
+            bottom,
+            right,
+            top,
+            dst_width=dst_width,
+            dst_height=dst_height,
+            resolution=res,
+        )
+
+        # Create a new GeoGrid with the same resolution and shape but new bounds and CRS
+        return GeoGrid(tf, (height, width), crs)
+
+    def to_view(self, roi: BoundingBox) -> GeoGrid:
+        """Create a new GeoGrid with the view focused on the roi region.
+
+        The new GeoGrid shares the same pixel resolution and alignment as the
+        original, only view window (bounds) change.
+
+        Parameters
+        ----------
+        roi: BoundingBox
+            Region of interest in BoundingBox format. The bounds will be
+            converted to the GeoGrid's CRS if needed.
+
+        Returns
+        -------
+        GeoGrid
+            New GeoGrid windowed to the roi region with aligned pixel grid.
+
+        """
+        roi, _ = format_bounds_and_crs(roi, self.crs)
+        if roi == self.bounds:
+            return self
+        xsize = abs(float(self.res[0]))
+        ysize = abs(float(self.res[1]))
+
+        left, bottom, right, top = roi
+        rows, cols = rowcol(
+            self.transform,
+            [left, right, right, left],
+            [top, top, bottom, bottom],
+            op=float,
+        )
+        w, n = self.transform * (min(cols), min(rows))
+        tf = transform.from_origin(w, n, xsize, ysize)
+        shape = (max(rows) - min(rows), max(cols) - min(cols))
+
+        return GeoGrid(tf, shape, self.crs)
+
+    def get_xy(
+        self, loc: Literal["center", "ul", "ur", "ll", "lr"] = "center"
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Get the x and y coordinates of pixel centers of the raster image."""
+        return xy_from_transform(self.transform, self.width, self.height, loc=loc)
+
+    def to_geobox(self) -> GeoBox:
+        """Convert the GeoGrid to an odc.geo.GeoBox."""
+        from odc.geo import GeoBox
+
+        return GeoBox(self.shape, self.transform, self.crs)
+
+    def row_col(
+        self, x: ArrayLike, y: ArrayLike, op: Callable | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Get the row and column indices for the given x and y coordinates.
+
+        Parameters
+        ----------
+        x, y: ArrayLike
+            x and y coordinates to be converted to row and column indices.
+        op: Callable, optional
+            Function to convert fractional pixels to whole numbers (floor,
+            ceiling, round). If None, numpy.floor will be used. Default is None.
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            row and column indices corresponding to the input x and y coordinates.
+
+        """
+        return rowcol(self.transform, x, y, op=op)
+
+    def xy(
+        self,
+        row: ArrayLike,
+        col: ArrayLike,
+        offset: Literal["center", "ul", "ur", "ll", "lr"] = "center",
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Get the x and y coordinates for the given row and column indices.
+
+        Parameters
+        ----------
+        row, col: ArrayLike
+            row and column indices to be converted to x and y coordinates.
+        offset: str, optional
+            Determines if the returned coordinates are for the center of the
+            pixel or for a corner. It can be "center", "ul", "ll" or "lr".
+            Default is "center".
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            x and y coordinates corresponding to the input row and column indices.
+
+        """
+        return xy(self.transform, row, col, offset=offset)
+
+
+class Profile(GeoGridMixin, MutableMapping[str, Any]):
+    """A class to manage the profile of a raster image.
+
+    .. note::
+        the :attr:`height`, :attr:`width`, :attr:`transform` and :attr:`crs`
+        are the basic parameters for a warp process.
+
+    Parameters
+    ----------
+    height: int
+        The height of the raster image in pixels.
+    width: int
+        The width of the raster image in pixels.
+    transform: Affine
+        The affine transformation matrix that maps pixel coordinates to spatial
+        coordinates.
+    crs: CrsLike | None
+        The coordinate reference system of the raster image. Could be any type
+        that :meth:`pyproj.CRS.from_user_input` accepts. Default is None (unset).
+    nodata: float | None
+        The nodata value of the raster image. If not set, it will be None.
+    count: int
+        The count of bands of the raster image. Default is 1.
+    driver: str
+        The driver of the raster image. Default is "GTiff".
+    dtype: str | np.dtype | None
+        The dtype of the raster image. Default is None. If not set, it will be
+        determined by the data array when writing to raster file.
+    kwargs: dict[str, Any]
+        Other keyword arguments for :class:`rasterio.profiles.Profile` class.
+
+    """
+
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        transform: Affine,
+        crs: CrsLike | None = None,
+        nodata: float | None = None,
+        count: int = 1,
+        driver: str = "GTiff",
+        dtype: str | np.dtype | None = None,
+        **kwargs: dict[str, Any],
+    ) -> None:
+        """Initialize a raster profile."""
+        self.shape = (int(height), int(width))
+        self.transform = transform
+        self.crs = crs
+        self.nodata: float | None = None
+        self.nodata = nodata
+        self.count = count
+        self.driver = driver
+        self.dtype = dtype
+        self.kwargs = {} if kwargs is None else dict(kwargs)
+
+        for key, value in self.kwargs.items():
+            setattr(self, key, value)
+
+    def __getitem__(self, key: str) -> Any:
+        """Get the value of the key."""
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Set the value of the key."""
+        if key not in DEFAULT_KEYS_Profile:
+            self.kwargs[key] = value
+        setattr(self, key, value)
+
+    def __delitem__(self, key: str) -> None:
+        """Delete a non-default profile item."""
+        if key in DEFAULT_KEYS_Profile:
+            msg = f"Cannot delete required profile key: {key}"
+            logger.error(msg)
+            raise KeyError(msg)
+        if key not in self.kwargs:
+            msg = f"{key!r} is not a stored profile metadata key"
+            logger.error(msg)
+            raise KeyError(msg)
+        self.kwargs.pop(key)
+        if hasattr(self, key):
+            delattr(self, key)
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterate over profile keys."""
+        return iter(self.to_dict())
+
+    def __len__(self) -> int:
+        """Return the number of profile items."""
+        return len(self.to_dict())
+
+    def __repr__(self) -> str:
+        """Get the string representation of the Profile."""
+        info = self.to_dict()
+        info["crs"] = self.crs.to_string() if self.crs else None
+        repr_str = f" {pprint.pformat(info, indent=2, sort_dicts=False).strip('{}')}"
+        return f"Profile(\n{repr_str}\n)"
+
+    @property
+    def geogrid(self) -> GeoGrid:
+        """Get the GeoGrid object from the profile."""
+        return GeoGrid(self.transform, self.shape, self.crs)
+
+    @property
+    def nodata(self) -> float | None:
+        """The nodata value of the raster image."""
+        return self._nodata
+
+    @nodata.setter
+    def nodata(self, value: float | None) -> None:
+        """Set the nodata value of the raster image."""
+        if value is None:
+            self._nodata = None
+            return
+        if not isinstance(value, (int, float, np.integer, np.floating)):
+            msg = f"nodata must be a numeric value or None, but got {value!r}"
+            logger.error(msg)
+            raise TypeError(msg)
+        self._nodata = float(value)
+
+    @property
+    def count(self) -> int:
+        """The count of bands of the raster image."""
+        return self._count
+
+    @count.setter
+    def count(self, value: int) -> None:
+        """Set the count of bands of the raster image."""
+        try:
+            count = int(value)
+        except (TypeError, ValueError) as exc:
+            msg = f"count must be an integer, but got {value!r}"
+            logger.exception(msg)
+            raise TypeError(msg) from exc
+        if count < 1:
+            msg = f"count must be greater than 0, but got {count}"
+            logger.error(msg)
+            raise ValueError(msg)
+        self._count = count
+
+    @property
+    def driver(self) -> str:
+        """The driver of the raster image."""
+        return self._driver
+
+    @driver.setter
+    def driver(self, value: str) -> None:
+        """Set the driver of the raster image."""
+        if not isinstance(value, str):
+            msg = f"driver must be a string, but got {value!r}"
+            logger.error(msg)
+            raise TypeError(msg)
+        self._driver = value
+
+    @property
+    def dtype(self) -> str | np.dtype | None:
+        """The dtype of the raster image."""
+        return self._dtype
+
+    @dtype.setter
+    def dtype(self, value: str | np.dtype | None) -> None:
+        """Set the dtype of the raster image."""
+        if value is not None and not isinstance(value, (str, np.dtype)):
+            msg = f"dtype must be a string, numpy.dtype, or None, but got {value!r}"
+            logger.error(msg)
+            raise TypeError(msg)
+        self._dtype = value
+
+    @property
+    def kwargs(self) -> dict[str, Any]:
+        """Other keyword arguments for rasterio profile metadata."""
+        return self._kwargs
+
+    @kwargs.setter
+    def kwargs(self, value: dict[str, Any]) -> None:
+        """Set other keyword arguments for rasterio profile metadata."""
+        if not isinstance(value, dict):
+            msg = f"kwargs must be a dictionary, but got {value!r}"
+            logger.error(msg)
+            raise TypeError(msg)
+        self._kwargs = dict(value)
+
+    @staticmethod
+    def _split_profile(profile: dict) -> tuple[dict, dict]:
+        """Split the profile into default keys and other keys."""
+        kwargs = {}
+        profile_new = {}
+        for key, value in profile.items():
+            if key not in DEFAULT_KEYS_Profile:
+                kwargs[key] = value
+            else:
+                profile_new[key] = value
+        return profile_new, kwargs
+
+    @classmethod
+    def from_geogrid(cls, geogrid: GeoGrid, **kwargs: Any) -> Profile:
+        """Create a Profile object from a GeoGrid object.
+
+        Parameters
+        ----------
+        geogrid : GeoGrid
+            GeoGrid object providing the shared geometry information.
+        **kwargs : Any
+            Additional profile metadata such as ``nodata``, ``count``,
+            ``driver``, ``dtype``, or other rasterio profile options.
+
+        Returns
+        -------
+        Profile
+            Profile object created from the given GeoGrid and metadata.
+
+        """
+        profile = {
+            "height": geogrid.height,
+            "width": geogrid.width,
+            "transform": geogrid.transform,
+            "crs": geogrid.crs,
+        }
+        profile.update(kwargs)
+        profile, kwargs_extra = cls._split_profile(profile)
+        return cls(**profile, kwargs=kwargs_extra)
+
+    @classmethod
+    def from_raster_file(cls, raster_file: PathLike, **kwargs: Any) -> Profile:
+        """Create a Profile object from a raster file.
+
+        Parameters
+        ----------
+        raster_file : PathLike
+            Raster file used to initialize the profile.
+        **kwargs : Any
+            Additional profile metadata. Values in ``kwargs`` override metadata
+            loaded from the raster file.
+
+        """
+        with rasterio.open(raster_file) as ds:
+            profile = dict(ds.profile.copy())
+        profile.update(kwargs)
+        # split the profile into default keys and other keys
+        profile, kwargs = cls._split_profile(profile)
+        return cls(**profile, kwargs=kwargs)
+
+    @classmethod
+    def from_ascii_header_file(
+        cls,
+        ascii_file: PathLike,
+        **kwargs: Any,
+    ) -> Profile:
+        """Create a Profile object from an ascii header file.
+
+        The ascii header file is the metadata of a binary. More information can
+        be found at: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm.
+
+        Example of an ascii header file
+        -------------------------------
+        ::
+
+            ncols         43200
+            nrows         18000
+            xllcorner     -180.000000
+            yllcorner     -60.000000
+            cellsize      0.008333
+            nodata_value  -9999
+        """
+        dict_common = load_metas(
+            ascii_file,
+            keys=["ncols", "nrows", "cellsize", "nodata_value"],
+            line_end=10,
+        )
+        if (
+            dict_common["ncols"] is None
+            or dict_common["nrows"] is None
+            or dict_common["cellsize"] is None
+        ):
+            msg = "ncols, nrows and cellsize must be set in the ascii file"
+            raise ValueError(msg)
+        # convert to rasterio profile format
+        width, height = int(dict_common["ncols"]), int(dict_common["nrows"])
+        cell_size = float(dict_common["cellsize"])
+        nodata = (
+            eval(dict_common["nodata_value"]) if dict_common["nodata_value"] else None
+        )
+
+        # get the coordinates of left and bottom corner
+        dict_corner = load_metas(
+            ascii_file,
+            keys=["xllcorner", "yllcorner"],
+            line_end=10,
+        )
+        if (
+            dict_corner["xllcorner"] is not None
+            and dict_corner["yllcorner"] is not None
+        ):
+            left = float(dict_corner["xllcorner"])
+            bottom = float(dict_corner["yllcorner"])
+        else:
+            dict_center = load_metas(
+                ascii_file,
+                keys=["xllcenter", "yllcenter"],
+                line_end=10,
+            )
+            if dict_center["xllcenter"] is None or dict_center["yllcenter"] is None:
+                msg = (
+                    "xllcenter and yllcenter or xllcorner and yllcorner"
+                    "must be set in the ascii file"
+                )
+                raise ValueError(msg)
+
+            left = float(dict_center["xllcenter"]) - cell_size / 2
+            bottom = float(dict_center["yllcenter"]) - cell_size / 2
+
+        # pixel left lower corner to pixel left upper corner (rasterio transform)
+        top = bottom + (height + 1) * cell_size
+        # get affine transform
+        tf = transform.from_origin(left, top, cell_size, cell_size)
+        geogrid = GeoGrid(tf, (height, width))
+        profile_kwargs = {"nodata": nodata}
+        profile_kwargs.update(kwargs)
+        return cls.from_geogrid(geogrid, **profile_kwargs)
+
+    @classmethod
+    def from_xy(
+        cls,
+        x: ArrayLike,
+        y: ArrayLike,
+        crs: CrsLike = "WGS84",
+        **kwargs: Any,
+    ) -> Profile:
+        """Create a Profile object from x and y coordinates.
+
+        Parameters
+        ----------
+        x, y : ArrayLike
+            X and Y coordinates of pixel centers.
+        crs : CrsLike, optional
+            Coordinate reference system of the coordinates. Default is
+            ``"WGS84"``.
+        **kwargs : Any
+            Additional profile metadata such as ``nodata``, ``count``,
+            ``driver``, ``dtype``, or other rasterio profile options.
+
+        Returns
+        -------
+        Profile
+            Profile object created from x and y coordinates.
+
+        """
+        geogrid = GeoGrid.from_xy(x, y, crs=crs)
+        return cls.from_geogrid(geogrid, **kwargs)
+
+    @classmethod
+    def from_profile_file(cls, profile_file: PathLike, **kwargs: Any) -> Profile:
+        """Create a Profile object from a profile file.
+
+        Parameters
+        ----------
+        profile_file : PathLike
+            Profile file used to initialize the profile.
+        **kwargs : Any
+            Additional profile metadata. Values in ``kwargs`` override metadata
+            loaded from the profile file.
+
+        """
+        profile = eval(Path(profile_file).read_text(encoding="utf-8"))
+        profile.update(kwargs)
+        profile, kwargs = cls._split_profile(profile)
+        return cls(**profile, kwargs=kwargs)
+
+    @classmethod
+    def from_bounds(
+        cls,
+        bounds: tuple[float, float, float, float] | BoundingBox,
+        res: float | tuple[float, float],
+        crs: CrsLike | None = None,
+        **kwargs: Any,
+    ) -> Profile:
+        """Create a Profile object from bounds and resolution.
+
+        Parameters
+        ----------
+        bounds : tuple of float (left/W, bottom/S, right/E, top/N)
+            The bounds of the raster file.
+        res : float or tuple of float (x_res, y_res)
+            The resolution of the raster file. If a float is provided,
+            the x_res and y_res will be the same.
+        crs : CrsLike | None, optional
+            The coordinate reference system of the raster file.
+        **kwargs : Any
+            Additional profile metadata such as ``nodata``, ``count``,
+            ``driver``, ``dtype``, or other rasterio profile options.
+
+        Returns
+        -------
+        Profile : Profile
+            A Profile object only with width, height and transform.
+
+        """
+        if isinstance(res, (int, float, np.integer, np.floating)):
+            res = (float(res), float(res))
+        geogrid = GeoGrid.from_bounds(bounds, res=res, crs=crs)
+        return cls.from_geogrid(geogrid, **kwargs)
+
+    def copy(self) -> Profile:
+        """Return a copy of the Profile object."""
+        profile, kwargs = self._split_profile(self.to_dict())
+        return Profile(**profile, kwargs=kwargs)
+
+    def to_dict(self) -> dict:
+        """Convert the Profile object to a python :class:`dict`."""
+        profile = {key: getattr(self, key) for key in DEFAULT_KEYS_Profile}
+        profile.update(self.kwargs)
+        return profile
+
+    def to_file(self, out_file: PathLike) -> None:
+        """Write the profile into a file.
+
+        .. tip::
+            - The profile will be written into a file with the same name and
+            suffix ".profile".
+            - You can load the profile by :meth:`Profile.from_profile_file`.
+
+        Parameters
+        ----------
+        out_file : str or Path
+            The file to be written. The profile will be written into a file with
+            the same name and suffix ".profile".
+
+        """
+        out_file = Path(out_file)
+        if out_file.suffix != ".profile":
+            out_file = out_file.parent / (out_file.name + ".profile")
+        with out_file.open("w") as f:
+            f.write(str(self.to_dict()))
+
+    def to_rasterio_profile(self) -> RasterioProfile:
+        """Convert the Profile object to a rasterio profile."""
+        return RasterioProfile(data=self.to_dict())
+
+    def get_xy(self) -> tuple[np.ndarray, np.ndarray]:
+        """Get the x and y coordinates from profile data.
+
+        .. note::
+            The pixel location for the x and y coordinates is the
+            "PixelIsArea" Raster Space, which means the pixel location
+            is the center of the pixel. See `Raster Space <https://web.archive.org/web/20160326194152/http://remotesensing.org/geotiff/spec/geotiff2.5.html#2.5.2>`_
+            for more details.
+        """
+        return xy_from_transform(self.transform, self.width, self.height)
 
 
 class GeoDataFormatConverter:
@@ -793,7 +1711,7 @@ class GeoDataFormatConverter:
             More details can be found at: https://gdal.org/drivers/raster/index.html
 
         """
-        arr, profile = self._load_raster(raster_file)
+        arr, _profile = self._load_raster(raster_file)
         self.add_band(arr)
 
     # def add_band_from_binary(self, binary_file: PathLike) -> None:
@@ -874,288 +1792,18 @@ class GeoDataFormatConverter:
                 self.profile["nodata"] = None
 
 
-DEFAULT_KEYS_Profile = [
-    "height",
-    "width",
-    "transform",
-    "crs",
-    "nodata",
-    "count",
-    "driver",
-    "dtype",
-]
-
-
-@dataclass
-class Profile:
-    """A class to manage the profile of a raster image.
-
-    .. note::
-        the :attr:`height`, :attr:`width`, :attr:`transform` and :attr:`crs`
-        are the basic parameters for a warp process.
-    """
-
-    #: The height (number of rows) of the raster image.
-    height: float
-
-    #: The width (number of columns) of the raster image.
-    width: float
-
-    #: The transform of the raster image. The transform is a instance of
-    #: :class:`rasterio.Affine` representing an affine transformation matrix.
-    #:
-    #: .. note::
-    #:      The Raster Space of transform is in "PixelIsPoint" Raster Space, which
-    #:      means the pixel location is at the upper-left corner of pixels.
-    #:      More details can be found at: `Raster Space <https://web.archive.org/web/20160326194152/http://remotesensing.org/geotiff/spec/geotiff2.5.html#2.5.2>`_
-    transform: Affine
-
-    #: The coordinate reference system of the raster image. If not set, it will be None.
-    crs: CrsLike | None = None
-
-    #: The nodata value of the raster image. If not set, it will be None.
-    nodata: float | None = None
-
-    #: The count of bands of the raster image. Default is 1.
-    count: int = 1
-
-    #: The driver of the raster image. Default is "GTiff".
-    driver: str = "GTiff"
-
-    #: The dtype of the raster image. Default is None.
-    dtype: str | np.dtype | None = None
-
-    #: Other keyword arguments for :class:`rasterio.profiles.Profile` class.
-    kwargs: dict = field(repr=False, default_factory=dict)
-
-    def __post_init__(self) -> None:
-        """Post initialization."""
-        self._bounds = self._parse_bounds()
-        self._res = (self.transform.a, self.transform.e)
-        if self.crs is not None:
-            self.crs = CRS.from_user_input(self.crs)
-        for key in self.kwargs:
-            setattr(self, key, self.kwargs[key])
-        self.crs = cast("CRS", self.crs)
-
-    def __getitem__(self, key: str) -> Any:
-        """Get the value of the key."""
-        return getattr(self, key)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        """Set the value of the key."""
-        setattr(self, key, value)
-
-    def _parse_bounds(self) -> tuple[float, float, float, float]:
-        """Parse the bounds from profile data."""
-        tf = self.transform
-        width = self.width
-        height = self.height
-        left = tf.c
-        top = tf.f
-        right = left + width * tf.a
-        bottom = top + height * tf.e
-        return left, bottom, right, top
-
-    @staticmethod
-    def _split_profile(profile: dict) -> tuple[dict, dict]:
-        """Split the profile into default keys and other keys."""
-        kwargs = {}
-        profile_new = {}
-        for key, value in profile.items():
-            if key not in DEFAULT_KEYS_Profile:
-                kwargs[key] = value
-            else:
-                profile_new[key] = value
-        return profile_new, kwargs
-
-    @property
-    def bounds(self) -> tuple[float, float, float, float]:
-        """The bounds in [west, south, east, north] order."""
-        return self._bounds
-
-    @property
-    def res(self) -> tuple[float, float]:
-        """The resolution in x and y direction."""
-        return self._res
-
-    @classmethod
-    def from_raster_file(cls, raster_file: PathLike) -> Profile:
-        """Create a Profile object from a raster file."""
-        with rasterio.open(raster_file) as ds:
-            profile = dict(ds.profile.copy())
-        # split the profile into default keys and other keys
-        profile, kwargs = cls._split_profile(profile)
-
-        return cls(**profile, kwargs=kwargs)
-
-    @classmethod
-    def from_ascii_header_file(cls, ascii_file: PathLike) -> Profile:
-        """Create a Profile object from an ascii header file.
-
-        The ascii header file is the metadata of a binary. More information can
-        be found at: https://desktop.arcgis.com/zh-cn/arcmap/latest/manage-data/raster-and-images/esri-ascii-raster-format.htm.
-
-        Example of an ascii header file
-        -------------------------------
-        ::
-
-            ncols         43200
-            nrows         18000
-            xllcorner     -180.000000
-            yllcorner     -60.000000
-            cellsize      0.008333
-            nodata_value  -9999
-        """
-        dict_common = load_metas(
-            ascii_file,
-            keys=["ncols", "nrows", "cellsize", "nodata_value"],
-            line_end=10,
-        )
-        if (
-            dict_common["ncols"] is None
-            or dict_common["nrows"] is None
-            or dict_common["cellsize"] is None
-        ):
-            msg = "ncols, nrows and cellsize must be set in the ascii file"
-            raise ValueError(msg)
-        # convert to rasterio profile format
-        width, height = int(dict_common["ncols"]), int(dict_common["nrows"])
-        cell_size = float(dict_common["cellsize"])
-        nodata = (
-            eval(dict_common["nodata_value"]) if dict_common["nodata_value"] else None
-        )
-
-        # get the coordinates of left and bottom corner
-        dict_corner = load_metas(
-            ascii_file,
-            keys=["xllcorner", "yllcorner"],
-            line_end=10,
-        )
-        if (
-            dict_corner["xllcorner"] is not None
-            and dict_corner["yllcorner"] is not None
-        ):
-            left = float(dict_corner["xllcorner"])
-            bottom = float(dict_corner["yllcorner"])
-        else:
-            dict_center = load_metas(
-                ascii_file,
-                keys=["xllcenter", "yllcenter"],
-                line_end=10,
-            )
-            if dict_center["xllcenter"] is None or dict_center["yllcenter"] is None:
-                msg = (
-                    "xllcenter and yllcenter or xllcorner and yllcorner"
-                    "must be set in the ascii file"
-                )
-                raise ValueError(msg)
-
-            left = float(dict_center["xllcenter"]) - cell_size / 2
-            bottom = float(dict_center["yllcenter"]) - cell_size / 2
-
-        # pixel left lower corner to pixel left upper corner (rasterio transform)
-        top = bottom + (height + 1) * cell_size
-        # get affine transform
-        tf = transform.from_origin(left, top, cell_size, cell_size)
-
-        return cls(width=width, height=height, transform=tf, nodata=nodata)
-
-    @classmethod
-    def from_latlon(cls, lat: np.ndarray, lon: np.ndarray) -> Profile:
-        """Create a Profile object from latitude and longitude."""
-        bounds = bound_from_latlon(lat, lon)
-        res = (lon[1] - lon[0], lat[1] - lat[0])
-        return cls.from_bounds_res(bounds, res)
-
-    @classmethod
-    def from_profile_file(cls, profile_file: PathLike) -> Profile:
-        """Create a Profile object from a profile file."""
-        with Path(profile_file).open(encoding="utf-8") as f:
-            profile = eval(f.read())
-        profile, kwargs = cls._split_profile(profile)
-        return cls(**profile, kwargs=kwargs)
-
-    @classmethod
-    def from_bounds_res(
-        cls,
-        bounds: tuple[float, float, float, float] | BoundingBox,
-        res: float | tuple[float, float],
-    ) -> Profile:
-        """Create a Profile object from bounds and resolution.
-
-        Parameters
-        ----------
-        bounds : tuple of float (left/W, bottom/S, right/E, top/N)
-            The bounds of the raster file.
-        res : float or tuple of float (x_res, y_res)
-            The resolution of the raster file. If a float is provided,
-            the x_res and y_res will be the same.
-
-        Returns
-        -------
-        Profile : Profile
-            A Profile object only with width, height and transform.
-
-        """
-        if isinstance(res, (int, float, np.integer, np.floating)):
-            res = (float(res), float(res))
-        dst_w, dst_s, dst_e, dst_n = bounds
-        width = round((dst_e - dst_w) / res[0])
-        height = round((dst_n - dst_s) / res[1])
-        tf = Affine.translation(dst_w, dst_n) * Affine.scale(res[0], -res[1])
-
-        profile = {"width": width, "height": height, "transform": tf}
-        return cls(**profile)
-
-    def copy(self) -> Profile:
-        """Return a copy of the Profile object."""
-        profile, kwargs = self._split_profile(self.to_dict())
-        return Profile(**profile, kwargs=kwargs)
-
-    def to_dict(self) -> dict:
-        """Convert the Profile object to a python :class:`dict`."""
-        profile = {key: getattr(self, key) for key in DEFAULT_KEYS_Profile}
-        profile.update(self.kwargs)
-        return profile
-
-    def to_file(self, out_file: PathLike) -> None:
-        """Write the profile into a file.
-
-        .. tip::
-            - The profile will be written into a file with the same name and
-            suffix ".profile".
-            - You can load the profile by :meth:`Profile.from_profile_file`.
-
-        Parameters
-        ----------
-        out_file : str or Path
-            The file to be written. The profile will be written into a file with
-            the same name and suffix ".profile".
-
-        """
-        out_file = Path(out_file)
-        if out_file.suffix != ".profile":
-            out_file = out_file.parent / (out_file.name + ".profile")
-        with out_file.open("w") as f:
-            f.write(str(self.to_dict()))
-
-    def to_rasterio_profile(self) -> RasterioProfile:
-        """Convert the Profile object to a rasterio profile."""
-        return RasterioProfile(data=self.to_dict())
-
-    def to_latlon(self) -> tuple[np.ndarray, np.ndarray]:
-        """Get the latitude and longitude from profile data.
-
-        .. note::
-            The pixel location for the latitude and longitude is the
-            "PixelIsArea" Raster Space, which means the pixel location
-            is the center of the pixel. See `Raster Space <https://web.archive.org/web/20160326194152/http://remotesensing.org/geotiff/spec/geotiff2.5.html#2.5.2>`_
-            for more details.
-        """
-        tf = self.transform
-        width = self.width
-        height = self.height
-        lon = tf.xoff + tf.a * np.arange(width) + tf.a * 0.5
-        lat = tf.yoff + tf.e * np.arange(height) + tf.e * 0.5
-        return lat, lon
+def format_bounds_and_crs(
+    bounds: BoundingBox | tuple[float, float, float, float],
+    crs: CrsLike | None = None,
+) -> tuple[BoundingBox, CRS | None]:
+    """Get the formatted bounds and crs from the input."""
+    if not isinstance(bounds, BoundingBox):
+        left, bottom, right, top = bounds
+        bounds = BoundingBox(left, bottom, right, top, crs=crs)
+    if crs is not None:
+        crs = CRS.from_user_input(crs)
+        if bounds.crs is not None and bounds.crs != crs:
+            bounds = bounds.to_crs(crs)
+    else:
+        crs = bounds.crs
+    return bounds, crs

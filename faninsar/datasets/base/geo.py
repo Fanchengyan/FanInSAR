@@ -444,7 +444,7 @@ class GeoDataset(Dataset):
 
     def get_profile(
         self, bbox: BoundingBox | Literal["roi", "bounds"] = "roi"
-    ) -> Profile | None:
+    ) -> Profile:
         """Get profile information of the dataset for the given bounding box type.
 
         The profile information includes the width, height, transform,

@@ -598,7 +598,7 @@ class InterferogramDataset(PairDataset):
 
         # TODO: using netcdf4 to save the data to avoid the memory issue
         profile = self.get_profile(roi)
-        lat, lon = profile.to_latlon()
+        x, y = profile.geogrid.get_xy()
 
         query = GeoQuery(boxes=roi, points=ref_points)
 
@@ -613,13 +613,13 @@ class InterferogramDataset(PairDataset):
 
         ds = xr.Dataset(
             {
-                "unw": (["pair", "lat", "lon"], unw),
-                "coh": (["pair", "lat", "lon"], sample_coh.boxes.data[0]),
+                "unw": (["pair", "y", "x"], unw),
+                "coh": (["pair", "y", "x"], sample_coh.boxes.data[0]),
             },
             coords={
                 "pair": self.pairs.to_names(),
-                "lat": lat,
-                "lon": lon,
+                "y": y,
+                "x": x,
             },
         )
 
@@ -627,8 +627,8 @@ class InterferogramDataset(PairDataset):
             ds,
             ["unw", "coh"],
             crs=self.crs,
-            x_dim="lon",
-            y_dim="lat",
+            x_dim="x",
+            y_dim="y",
         )
         ds.to_netcdf(filename)
 
