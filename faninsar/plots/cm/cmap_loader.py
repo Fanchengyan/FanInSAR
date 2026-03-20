@@ -1,8 +1,11 @@
+"""Cmap loader module for dynamic colormap access."""
+
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import numpy as np
 
 from faninsar.logging import setup_logger
 
@@ -13,16 +16,17 @@ logger = setup_logger(__name__)
 if TYPE_CHECKING:
     from os import PathLike
 
-    import numpy as np
 
-# TODO: Add cpt-city colormaps
-
-
-class ColormapLoader(ABC):
-    """Abstract base class for dynamic colormap loading.
+class ColormapLoader:
+    """Base class for dynamic colormap loading.
 
     This class provides the core functionality for loading LinearSegmentedColormap
     objects on-demand from data files, with caching to avoid repeated file I/O.
+
+    By default, it auto-discovers colormaps by scanning ``data_dir`` for
+    subdirectories containing a ``.txt`` file whose stem matches the directory
+    name (e.g. ``dem1/dem1.txt``). Subclasses may override :pyattr:`names` and
+    :pyfunc:`_load_colormap_data` for different file layouts.
     """
 
     def __init__(self, data_dir: PathLike) -> None:
@@ -39,13 +43,27 @@ class ColormapLoader(ABC):
         self._names: list[str] | None = None
 
     @property
-    @abstractmethod
     def names(self) -> list[str]:
-        """Return list of available colormap names."""
+        """Return list of available colormap names.
 
-    @abstractmethod
+        The default implementation scans *data_dir* for subdirectories that
+        contain a ``.txt`` file matching the directory name.
+        """
+        if self._names is None:
+            self._names = sorted(
+                d.name
+                for d in self.data_dir.iterdir()
+                if d.is_dir()
+                and not d.name.startswith("_")
+                and (d / f"{d.name}.txt").exists()
+            )
+        return self._names
+
     def _load_colormap_data(self, name: str) -> np.ndarray:
         """Load colormap data from file.
+
+        The default implementation reads ``<data_dir>/<name>/<name>.txt``
+        via :pyfunc:`numpy.loadtxt`.
 
         Parameters
         ----------
@@ -58,6 +76,13 @@ class ColormapLoader(ABC):
             Numpy array containing colormap data
 
         """
+        cmap_file = self.data_dir / name / f"{name}.txt"
+        if not cmap_file.exists():
+            msg = f"Colormap file not found: {cmap_file}"
+            logger.error(msg, stacklevel=2)
+            raise FileNotFoundError(msg)
+
+        return np.loadtxt(cmap_file)
 
     @staticmethod
     def _create_colormap(
@@ -115,9 +140,7 @@ class ColormapLoader(ABC):
 
         # Create reversed version if needed
         if is_reversed and name not in self._cache:
-            # Get the original data and reverse it
-            data = self._load_colormap_data(base_name)
-            reversed_data = data[::-1]
+            reversed_data = self._cache[base_name].to_rgb_array()[::-1]
             self._cache[name] = self._create_colormap(name, reversed_data)
 
         return self._cache[name]
@@ -288,12 +311,19 @@ class Cmaps:
             Enhanced LinearSegmentedColormap object with additional tools
 
         """
+        if name.startswith("_") or name.endswith("_"):
+            msg = f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            raise AttributeError(msg)
+
         # Check if it's a reversed colormap
         is_reversed = name.endswith("_r")
         base_name = name[:-2] if is_reversed else name
 
         # Find the appropriate loader
-        loader = self._colormap_map[base_name]
+        loader = self._colormap_map.get(base_name)
+        if loader is None:
+            msg = f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            raise AttributeError(msg)
         return getattr(loader, name)
 
     def __dir__(self) -> list[str]:
@@ -311,89 +341,6 @@ class Cmaps:
 # Create a global instance for direct access
 cmaps = Cmaps()
 
-
-# # Import modules for backward compatibility
-# from . import GMT, SCM, cmocean, colorcet, mintpy
-
-
-# # Module-level attribute access for backward compatibility
-# def __getattr__(name: str) -> EnhancedLinearSegmentedColormap:
-#     """Module-level dynamic attribute access for colormaps."""
-#     # First check if it's one of the custom colormaps defined in this module
-#     if name in {
-#         "GnBu_RdPl",
-#         "GnBu_RdPl_r",
-#         "RdGyBu",
-#         "RdGyBu_r",
-#         "WtBuPl",
-#         "WtBuPl_r",
-#         "WtBuGn",
-#         "WtBuGn_r",
-#         "WtRdPl",
-#         "WtRdPl_r",
-#         "WtHeatRed",
-#         "WtHeatRed_r",
-#     }:
-#         return globals()[name]
-
-#     # Otherwise, try to get it from the unified cmaps instance
-#     try:
-#         return getattr(cmaps, name)
-#     except AttributeError:
-#         pass
-
-
-def __dir__() -> list[str]:
-    """Return list of available module attributes including all colormaps."""
-    # Get standard module attributes
-    attrs = list(globals().keys())
-
-    # Add all colormap names from the unified cmaps instance
-    attrs.extend(cmaps.__all__)
-
-    # Ensure "cmaps" is included
-    attrs.append("cmaps")
-
-    # Explicitly add custom colormaps
-    custom_cmaps = [
-        "GnBu_RdPl",
-        "GnBu_RdPl_r",
-        "RdGyBu",
-        "RdGyBu_r",
-        "WtBuPl",
-        "WtBuPl_r",
-        "WtBuGn",
-        "WtBuGn_r",
-        "WtRdPl",
-        "WtRdPl_r",
-        "WtHeatRed",
-        "WtHeatRed_r",
-    ]
-    attrs.extend(custom_cmaps)
-
-    # Remove private attributes and clean up
-    attrs = [attr for attr in attrs if not attr.startswith("_")]
-
-    return sorted(set(attrs))
-
-
-# Build __all__ dynamically from the cmaps instance and custom colormaps
-__all__ = [
-    "GnBu_RdPl",
-    "GnBu_RdPl_r",
-    "RdGyBu",
-    "RdGyBu_r",
-    "WtBuGn",
-    "WtBuGn_r",
-    "WtBuPl",
-    "WtBuPl_r",
-    "WtHeatRed",
-    "WtHeatRed_r",
-    "WtRdPl",
-    "WtRdPl_r",
-    "cmaps",
-]
-__all__ += cmaps.__all__
 
 # Define all custom colormaps immediately for guaranteed availability
 white = "0.95"
@@ -443,7 +390,3 @@ WtHeatRed_r = EnhancedLinearSegmentedColormap.from_list(
 )
 
 names = cmaps.__all__.copy()
-
-
-del colors
-del white

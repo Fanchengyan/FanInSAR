@@ -10,12 +10,11 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 
-from .. import ColormapLoader  # noqa: TID252
+from ..cmap_loader import ColormapLoader  # noqa: TID252
+from ..enhanced_colormap import EnhancedLinearSegmentedColormap  # noqa: TID252
 
 if TYPE_CHECKING:
     from os import PathLike
-
-    from ..enhanced_colormap import EnhancedLinearSegmentedColormap  # noqa: TID252
 
 
 logger = setup_logger(__name__)
@@ -52,45 +51,47 @@ def cpt_to_colormap(
     # Create the colormap
     cmap = mcolors.LinearSegmentedColormap.from_list(name, rgb_data, N=256)
 
-    # Process special lines (B, F, N) if they exist
-    with cpt_file.open() as f:
-        for _line in f:
-            line = _line.strip()
-            if not line or line.startswith("#"):
-                continue
+    # Read all lines once, then process special lines (B, F, N)
+    lines = cpt_file.read_text().splitlines()
+    has_nan_color = False
 
-            if line.startswith("B"):  # Background color (under)
-                parts = line.split()
-                if len(parts) >= 4:
-                    r, g, b = (
-                        int(parts[1]) / 255,
-                        int(parts[2]) / 255,
-                        int(parts[3]) / 255,
-                    )
-                    cmap.set_under((r, g, b))
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
 
-            elif line.startswith("F"):  # Foreground color (over)
-                parts = line.split()
-                if len(parts) >= 4:
-                    r, g, b = (
-                        int(parts[1]) / 255,
-                        int(parts[2]) / 255,
-                        int(parts[3]) / 255,
-                    )
-                    cmap.set_over((r, g, b))
+        if line.startswith("B"):  # Background color (under)
+            parts = line.split()
+            if len(parts) >= 4:
+                r, g, b = (
+                    int(parts[1]) / 255,
+                    int(parts[2]) / 255,
+                    int(parts[3]) / 255,
+                )
+                cmap.set_under((r, g, b))
 
-            elif line.startswith("N"):  # NaN color (bad)
-                parts = line.split()
-                if len(parts) >= 4:
-                    r, g, b = (
-                        int(parts[1]) / 255,
-                        int(parts[2]) / 255,
-                        int(parts[3]) / 255,
-                    )
-                    cmap.set_bad((r, g, b))
+        elif line.startswith("F"):  # Foreground color (over)
+            parts = line.split()
+            if len(parts) >= 4:
+                r, g, b = (
+                    int(parts[1]) / 255,
+                    int(parts[2]) / 255,
+                    int(parts[3]) / 255,
+                )
+                cmap.set_over((r, g, b))
 
-    # Default if N wasn't specified
-    if not any(line.startswith("N") for line in cpt_file.open()):
+        elif line.startswith("N"):  # NaN color (bad)
+            has_nan_color = True
+            parts = line.split()
+            if len(parts) >= 4:
+                r, g, b = (
+                    int(parts[1]) / 255,
+                    int(parts[2]) / 255,
+                    int(parts[3]) / 255,
+                )
+                cmap.set_bad((r, g, b))
+
+    if not has_nan_color:
         cmap.set_bad("w", 0.0)  # Set bad values to transparent white
 
     return cmap
@@ -106,8 +107,7 @@ class MintpyColormaps(ColormapLoader):
     def __init__(self) -> None:
         """Initialize mintpy colormap loader."""
         super().__init__(Path(__file__).parent.absolute())
-        self._colormap_names = ["romanian"]
-        self._custom_colormaps: dict[str, mcolors.LinearSegmentedColormap] = {}
+        self._custom_colormaps: dict[str, EnhancedLinearSegmentedColormap] = {}
         self._create_custom_colormaps()
 
     def _create_custom_colormaps(self) -> None:
@@ -179,10 +179,6 @@ class MintpyColormaps(ColormapLoader):
             "#ed6de2",
             "#f173d7",
         ]
-        # Import here to avoid circular imports
-        from faninsar.cmaps.enhanced_colormap import (
-            EnhancedLinearSegmentedColormap,
-        )
 
         dismph = EnhancedLinearSegmentedColormap.from_list("dismph", clist, N=256)
         dismph.set_bad("w", 0.0)
@@ -218,23 +214,38 @@ class MintpyColormaps(ColormapLoader):
 
     @property
     def names(self) -> list[str]:
-        """Return list of available mintpy colormap names."""
-        return self._colormap_names + list(self._custom_colormaps.keys())
+        """Return list of available mintpy colormap names.
+
+        Combines file-based colormaps (CPT files in subdirectories) with
+        programmatically defined custom colormaps.
+        """
+        if self._names is None:
+            # Discover CPT-file-based colormaps
+            file_based = sorted(
+                d.name
+                for d in self.data_dir.iterdir()
+                if d.is_dir()
+                and not d.name.startswith("_")
+                and (d / f"{d.name}.cpt").exists()
+            )
+            self._names = file_based + sorted(self._custom_colormaps.keys())
+        return self._names
 
     def _load_colormap_data(self, name: str) -> np.ndarray:
         """Load mintpy colormap data from file.
 
-        Args:
-            name: Name of the colormap
+        Parameters
+        ----------
+        name : str
+            Name of the colormap
 
-        Returns:
+        Returns
+        -------
+        np.ndarray
             Numpy array containing colormap data
 
         """
-        # Check if it's a custom colormap first
         if name in self._custom_colormaps:
-            # For custom colormaps, we return the colormap directly in _get_colormap
-            # This method shouldn't be called for custom colormaps
             msg = f"Custom colormap {name} should not use _load_colormap_data"
             logger.error(msg, stacklevel=2)
             raise ValueError(msg)
@@ -248,10 +259,11 @@ class MintpyColormaps(ColormapLoader):
 
         # Load CPT file and convert to colormap, then extract data
         cmap = cpt_to_colormap(cmap_file, name)
-        # Extract the colormap data as RGB values
         return np.array([cmap(i) for i in np.linspace(0, 1, 256)])[:, :3]
 
-    def _get_colormap(self, name: str) -> mcolors.LinearSegmentedColormap:
+    def _get_colormap(
+        self, name: str
+    ) -> EnhancedLinearSegmentedColormap:
         """Get a colormap, loading it if necessary.
 
         Override to handle custom colormaps.
@@ -275,11 +287,6 @@ class MintpyColormaps(ColormapLoader):
                 self._cache[base_name] = self._custom_colormaps[base_name]
 
             if is_reversed and name not in self._cache:
-                # Create reversed version of custom colormap
-                from ..enhanced_colormap import (  # noqa: TID252
-                    EnhancedLinearSegmentedColormap,
-                )
-
                 base_cmap = self._custom_colormaps[base_name]
                 colors = [base_cmap(i) for i in np.linspace(0, 1, 256)]
                 reversed_colors = colors[::-1]

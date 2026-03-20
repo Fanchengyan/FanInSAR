@@ -9,7 +9,7 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 
-from .. import ColormapLoader  # noqa: TID252
+from ..cmap_loader import ColormapLoader  # noqa: TID252
 
 if TYPE_CHECKING:
     from ..enhanced_colormap import EnhancedLinearSegmentedColormap  # noqa: TID252
@@ -27,36 +27,23 @@ class ColorcetColormaps(ColormapLoader):
     def __init__(self) -> None:
         """Initialize colorcet colormap loader."""
         super().__init__(Path(__file__).parent.absolute())
-        self._colormap_names = [
-            "bkr",
-            "bky",
-            "bwy",
-            "cwr",
-            "coolwarm",
-            "colorwheel",
-            "gwv",
-            "bjy",
-            "isolum",
-            "bgy",
-            "bgyw",
-            "kbc",
-            "blues",
-            "bmw",
-            "bmy",
-            "kgy",
-            "gray",
-            "dimgray",
-            "fire",
-            "kb",
-            "kg",
-            "kr",
-            "rainbow",
-        ]
 
     @property
     def names(self) -> list[str]:
-        """Return list of available colorcet colormap names."""
-        return self._colormap_names
+        """Return list of available colorcet colormap names.
+
+        Colorcet stores each colormap as a ``<name>.csv`` mapping file (whose
+        first line points to the actual data CSV). We discover names by
+        scanning for single-line ``.csv`` files whose stem is *not* a CET
+        data file name (those start with ``CET_``).
+        """
+        if self._names is None:
+            self._names = sorted(
+                f.stem
+                for f in self.data_dir.iterdir()
+                if f.suffix == ".csv" and not f.stem.startswith("CET_")
+            )
+        return self._names
 
     def _load_colormap_data(self, name: str) -> np.ndarray:
         """Load colorcet colormap data from file.
@@ -74,7 +61,6 @@ class ColorcetColormaps(ColormapLoader):
             Numpy array containing colormap data
 
         """
-        # First, read the mapping file to get the actual CSV filename
         mapping_file = self.data_dir / f"{name}.csv"
         if not mapping_file.exists():
             msg = f"Colorcet mapping file not found: {mapping_file}"
@@ -84,7 +70,6 @@ class ColorcetColormaps(ColormapLoader):
         with mapping_file.open() as f:
             actual_filename = f.readline().strip()
 
-        # Now load the actual colormap data
         actual_file = self.data_dir / actual_filename
         if not actual_file.exists():
             msg = f"Colorcet colormap file not found: {actual_file}"
