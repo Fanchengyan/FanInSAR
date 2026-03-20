@@ -5,10 +5,8 @@ import time
 import gc
 import numpy as np
 
-import faninsar.cmaps as cmaps_module
-from faninsar.cmaps import (
-    GMT,
-    SCM,
+import faninsar.plots.cmaps as cmaps_module
+from faninsar.plots.cmaps import (
     Cmaps,
     ColormapLoader,
     GnBu_RdPl,
@@ -16,22 +14,24 @@ from faninsar.cmaps import (
     WtBuPl,
     WtHeatRed,
     cmaps,
-    cmocean,
-    colorcet,
-    mintpy,
 )
+from faninsar.plots.cmaps.GMT.colormaps import _gmt_colormaps as GMT
+from faninsar.plots.cmaps.SCM.colormaps import _scm_colormaps as SCM
+from faninsar.plots.cmaps.cmocean.colormaps import _cmocean_colormaps as cmocean
+from faninsar.plots.cmaps.colorcet.colormaps import _colorcet_colormaps as colorcet
+from faninsar.plots.cmaps.mintpy.colormaps import _mintpy_colormaps as mintpy
 
 if TYPE_CHECKING:
-    from faninsar.cmaps import ColormapLoader
+    from faninsar.plots.cmaps import ColormapLoader
 
 
 class TestColormapLoader:
     """Test the base ColormapLoader class."""
 
-    def test_abstract_base_class(self) -> None:
-        """Test that ColormapLoader is an abstract base class."""
-        with pytest.raises(TypeError):
-            ColormapLoader("/some/path")  # type: ignore[abstract]
+    def test_base_class_instantiation(self) -> None:
+        """Test that ColormapLoader can be instantiated as a concrete base class."""
+        loader = ColormapLoader("/some/path")
+        assert loader.data_dir.name == "path"
 
     def test_colormap_loader_interface(self) -> None:
         """Test that all concrete loaders implement the required interface."""
@@ -283,7 +283,7 @@ class TestReversedColormaps:
         # Create the custom colormaps first to ensure they exist
         white = "0.95"
         colors = ["#8f07ff", "#d5734a", white, "#0571b0", "#01ef6c"]
-        from faninsar.cmaps.enhanced_colormap import EnhancedLinearSegmentedColormap
+        from faninsar.plots.cmaps.enhanced_colormap import EnhancedLinearSegmentedColormap
 
         GnBu_RdPl = EnhancedLinearSegmentedColormap.from_list("GnBu_RdPl", colors, N=100)
         GnBu_RdPl_r = EnhancedLinearSegmentedColormap.from_list("GnBu_RdPl_r", colors[::-1], N=100)
@@ -473,7 +473,7 @@ class TestPerformance:
         # This test mainly ensures that the module can be imported quickly
         # The actual timing would be unreliable in tests, but we can verify
         # that no exceptions are raised during import
-        import faninsar.cmaps  # noqa: F401
+        import faninsar.plots.cmaps  # noqa: F401
 
         # If we get here without timeout, import was reasonably fast
 
@@ -649,7 +649,7 @@ class TestColormapPerformance:
     def test_import_performance(self) -> None:
         """Benchmark import performance."""
         start_time = time.time()
-        import faninsar.cmaps  # noqa: F401
+        import faninsar.plots.cmaps  # noqa: F401
         import_time = time.time() - start_time
 
         # Import should be fast (less than 1 second)

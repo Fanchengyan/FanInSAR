@@ -1,4 +1,4 @@
-"""Tests for sampler device-aware tensor collation."""
+"""Tests for sampler tensor collation behavior."""
 
 from __future__ import annotations
 
@@ -50,15 +50,16 @@ def raster_dataset(raster_root: Path) -> RasterDataset:
     return RasterDataset(paths=paths, verbose=False)
 
 
-def test_tensor_collate_converts_numpy_to_torch() -> None:
-    """tensor_collate should convert numpy arrays into torch tensors."""
+def test_tensor_collate_converts_numpy_to_torch_all() -> None:
+    """tensor_collate with scope=all should convert numpy arrays into tensors."""
     sample = {
         "data": np.arange(6, dtype=np.float32).reshape(2, 3),
         "indexes": np.array([0, 1], dtype=np.int64),
+        "meta": {"data": np.arange(3, dtype=np.float32)},
         "paths": ["a.tif", "b.tif"],
     }
 
-    result = tensor_collate([sample], device=torch.device("cpu"))
+    result = tensor_collate([sample], tensor_scope="all")
 
     assert isinstance(result["data"], torch.Tensor)
     assert result["data"].device.type == "cpu"
@@ -66,26 +67,41 @@ def test_tensor_collate_converts_numpy_to_torch() -> None:
     assert result["paths"] == ["a.tif", "b.tif"]
 
 
-def test_to_dataloader_uses_identity_collate_when_device_is_none(
+def test_tensor_collate_converts_only_data_by_default() -> None:
+    """tensor_collate should convert only data entries by default."""
+    sample = {
+        "data": np.arange(6, dtype=np.float32).reshape(2, 3),
+        "indexes": np.array([0, 1], dtype=np.int64),
+        "paths": ["a.tif", "b.tif"],
+    }
+
+    result = tensor_collate([sample])
+
+    assert isinstance(result["data"], torch.Tensor)
+    assert isinstance(result["indexes"], np.ndarray)
+    assert isinstance(result["meta"]["data"], torch.Tensor)
+    assert result["paths"] == ["a.tif", "b.tif"]
+
+
+def test_to_dataloader_defaults_to_tensor(
     raster_dataset: RasterDataset,
 ) -> None:
-    """Samplers without a device should keep numpy arrays."""
-    sampler = RowSampler(raster_dataset, row_num=1, device=None, verbose=False)
-    loader = sampler.to_dataloader(num_workers=0)
-
-    sample = next(iter(loader))
-
-    assert isinstance(sample["data"], np.ndarray)
-
-
-def test_to_dataloader_uses_tensor_collate_when_device_set(
-    raster_dataset: RasterDataset,
-) -> None:
-    """Samplers with a device should return torch tensors."""
-    sampler = RowSampler(raster_dataset, row_num=1, device="cpu", verbose=False)
+    """Samplers should return tensors by default."""
+    sampler = RowSampler(raster_dataset, row_num=1, verbose=False)
     loader = sampler.to_dataloader(num_workers=0)
 
     sample = next(iter(loader))
 
     assert isinstance(sample["data"], torch.Tensor)
-    assert sample["data"].device.type == "cpu"
+
+
+def test_to_dataloader_tensor_false_returns_numpy(
+    raster_dataset: RasterDataset,
+) -> None:
+    """Samplers should keep numpy arrays when tensor=False."""
+    sampler = RowSampler(raster_dataset, row_num=1, verbose=False)
+    loader = sampler.to_dataloader(num_workers=0, tensor=False)
+
+    sample = next(iter(loader))
+
+    assert isinstance(sample["data"], np.ndarray)
