@@ -27,3 +27,9 @@ Formatters
 
 Colormaps
 ---------
+
+.. autosummary::
+   :toctree: generated/
+
+   faninsar.plots.cmaps
+   faninsar.plots.create_discrete_colormap

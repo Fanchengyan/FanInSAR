@@ -52,7 +52,7 @@ Classes
 ^^^^^^^
 
 .. autosummary::
-   :toctree: _autosummary
+   :toctree: generated/
    :nosignatures:
 
    FaninsarLogger
@@ -62,7 +62,7 @@ Functions
 ^^^^^^^^^
 
 .. autosummary::
-   :toctree: _autosummary
+   :toctree: generated/
    :nosignatures:
 
    setup_logger

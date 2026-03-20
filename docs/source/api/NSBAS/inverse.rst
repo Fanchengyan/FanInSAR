@@ -10,8 +10,7 @@ Classes
 .. autosummary::
    :toctree: generated/
 
-   NSBASInversion
-   NSBASMatrixFactory
+   NSBASSolver
 
 
 Basis Functions
