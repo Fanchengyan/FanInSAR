@@ -41,8 +41,9 @@ class NSBASSolver:
 
     Examples
     --------
-    >>> import faninsar as fis
     >>> import numpy as np
+    >>> import faninsar as fis
+    >>> from faninsar import NSBAS
 
     >>> names = ['20170111_20170204',
                 '20170111_20170222',
@@ -57,8 +58,8 @@ class NSBASSolver:
 
     >>> pairs = fis.Pairs.from_names(names)
     >>> unw = np.random.randint(0, 255, (len(pairs), 5))
-    >>> model = fis.AnnualSinusoidalModel(pairs.dates)
-    >>> solver = fis.NSBASSolver(unw, pairs, model)
+    >>> model = NSBAS.AnnualSinusoidalModel(pairs.dates)
+    >>> solver = NSBAS.NSBASSolver(unw, pairs, model)
     >>> solver
     NSBASSolver(
         pairs: Pairs(10)
@@ -79,6 +80,11 @@ class NSBASSolver:
         G shape: (16, 9)
         d shape: (16, 10)
     )
+
+    Now we can perform NSBAS inversion to get the incremental deformation,
+    model parameters, and residuals:
+
+    >>> incs, params, residual_pair, residual_tsm = solver.inverse(return_numpy=True)
 
     """
 
@@ -112,32 +118,7 @@ class NSBASSolver:
         dtype: torch.dtype = torch.float64,
         verbose: bool = True,
     ) -> None:
-        """Initialize NSBASSolver.
-
-        Parameters
-        ----------
-        unw : NDArray | torch.Tensor
-            Unwrapped interferograms matrix with shape of (n_pairs, n_pixels).
-            The order of the interferograms must be the same as the order of the
-            pairs. The unwrapped interferograms can be a masked array, and the
-            masked values will be treated as nan values.
-        pairs : Pairs | Sequence[str]
-            Pairs or Sequence of pair names
-        model : Optional[TimeSeriesModels], optional
-            Time series model. If None, generate SBAS matrix rather than NSBAS
-            matrix, by default None.
-        gamma : float, optional
-            weight for the model component, by default 0.0001. This parameter
-            will be ignored if model is None.
-        device : Optional[str | torch.device], optional
-            The compute device for torch.Tensor. If None, use GPU if available,
-            otherwise use CPU.
-        dtype : torch.dtype, optional
-            The compute dtype for torch.Tensor.
-        verbose : bool, optional
-            If True, show progress bar during inversion, by default True.
-
-        """
+        """Initialize NSBAS solver."""
         if isinstance(pairs, Pairs):
             self._pairs = pairs
         elif isinstance(pairs, Sequence):
