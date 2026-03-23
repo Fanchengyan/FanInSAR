@@ -101,6 +101,9 @@ dev = ["FanInSAR[code_style, test, docs]"]
 [tool.setuptools]
 include-package-data = true
 
+[tool.setuptools.package-data]
+faninsar = ["**/*.csv", "**/*.cpt", "**/*.pdf", "**/*.pyi", "**/*.txt"]
+
 [tool.setuptools.dynamic]
 version = { attr = "faninsar.__version__" }
 

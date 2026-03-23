@@ -69,6 +69,12 @@ class NSBASSolver:
         d shape: (16, 5)
     )
 
+
+    Now we can perform NSBAS inversion to get the incremental deformation,
+    model parameters, and residuals:
+
+    >>> incs, params, residual_pair, residual_tsm = solver.inverse(return_numpy=True)
+
     reset ``d`` by assigning a new unwrapped interferograms matrix with same pairs
 
     >>> solver.set_d(np.random.randint(0, 255, (len(pairs), 10)))
@@ -81,10 +87,6 @@ class NSBASSolver:
         d shape: (16, 10)
     )
 
-    Now we can perform NSBAS inversion to get the incremental deformation,
-    model parameters, and residuals:
-
-    >>> incs, params, residual_pair, residual_tsm = solver.inverse(return_numpy=True)
 
     """
 
