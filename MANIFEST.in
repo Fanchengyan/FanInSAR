@@ -1,2 +1,4 @@
-include faninsar/cmaps/*
-exclude faninsar/cmaps/__pycache__/*
+recursive-include faninsar/plots/cm *.csv *.cpt *.pdf *.pyi *.txt
+prune build
+prune dist
+prune FanInSAR.egg-info
