@@ -11,6 +11,8 @@ from .geo import (
     array2kml,
     array2kmz,
     bounds_from_xy,
+    dataarray2kml,
+    dataarray2kmz,
     format_bounds_and_crs,
     geoinfo_from_xy,
     match_to_raster,

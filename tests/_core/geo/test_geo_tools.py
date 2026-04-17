@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import rasterio
+import xarray as xr
 from lxml import etree
 from rasterio import Affine
 from rasterio.profiles import Profile as RasterioProfile
@@ -13,6 +14,9 @@ from faninsar._core.geo import (
     Profile,
     array2kml,
     array2kmz,
+    bounds_from_xy,
+    dataarray2kml,
+    dataarray2kmz,
 )
 
 profile = Profile(200, 300, Affine(*list(range(6))))
@@ -257,6 +261,21 @@ def _kml_text(element: etree._Element, tag_name: str) -> str:
     return element.xpath(f"string(.//*[local-name()='{tag_name}'][1])")
 
 
+def _spatial_dataarray(crs: str = "EPSG:4326") -> xr.DataArray:
+    """Create a small data array with rioxarray geospatial metadata."""
+    arr = np.arange(12, dtype=np.float32).reshape(3, 4)
+    data_array = xr.DataArray(
+        arr,
+        coords={"latitude": [2.5, 1.5, 0.5], "longitude": [10.5, 11.5, 12.5, 13.5]},
+        dims=("latitude", "longitude"),
+    )
+    data_array = data_array.rio.set_spatial_dims(
+        x_dim="longitude",
+        y_dim="latitude",
+    )
+    return data_array.rio.write_crs(crs)
+
+
 def test_array2kmz_tiled_writes_multilevel_kmz(tmp_path: Path) -> None:
     """Tiled KMZ export should produce a multilevel tile pyramid."""
     arr = np.arange(520 * 520, dtype=np.float32).reshape(520, 520)
@@ -329,6 +348,58 @@ def test_array2kmz_tiled_writes_single_level_kmz(tmp_path: Path) -> None:
 
     assert kml_members == {"doc.kml", "tiles/0/0/0.kml"}
     assert png_members == {"legend/colorbar.png", "tiles/0/0/0.png"}
+
+
+def test_dataarray2kml_uses_rioxarray_spatial_metadata(tmp_path: Path) -> None:
+    """DataArray KML export should derive bounds from configured xy dimensions."""
+    data_array = _spatial_dataarray()
+    out_file = tmp_path / "dataarray_overlay.kml"
+
+    dataarray2kml(data_array, out_file, verbose=False)
+
+    assert out_file.exists()
+    assert out_file.with_suffix(".png").exists()
+    assert out_file.with_name("dataarray_overlay_cbar.png").exists()
+
+    root = etree.fromstring(out_file.read_bytes())
+    expected_bounds = bounds_from_xy(data_array.longitude, data_array.latitude)
+    assert float(_kml_text(root, "west")) == pytest.approx(expected_bounds[0])
+    assert float(_kml_text(root, "south")) == pytest.approx(expected_bounds[1])
+    assert float(_kml_text(root, "east")) == pytest.approx(expected_bounds[2])
+    assert float(_kml_text(root, "north")) == pytest.approx(expected_bounds[3])
+
+
+def test_dataarray2kmz_reprojects_to_wgs84(tmp_path: Path) -> None:
+    """DataArray KMZ export should reproject non-WGS84 arrays before writing."""
+    data_array = _spatial_dataarray().rio.reproject("EPSG:3857")
+    out_file = tmp_path / "dataarray_overlay.kmz"
+
+    dataarray2kmz(data_array, out_file, verbose=False)
+
+    with zipfile.ZipFile(out_file) as kmz:
+        root = etree.fromstring(kmz.read("dataarray_overlay.kml"))
+
+    expected_bounds = bounds_from_xy(data_array.x, data_array.y, crs=data_array.rio.crs)
+    expected_bounds = expected_bounds.to_crs("EPSG:4326")
+    assert float(_kml_text(root, "west")) == pytest.approx(expected_bounds[0], abs=0.1)
+    assert float(_kml_text(root, "south")) == pytest.approx(expected_bounds[1], abs=0.1)
+    assert float(_kml_text(root, "east")) == pytest.approx(expected_bounds[2], abs=0.1)
+    assert float(_kml_text(root, "north")) == pytest.approx(expected_bounds[3], abs=0.1)
+
+
+def test_dataarray_fis_accessor_writes_kmz(tmp_path: Path) -> None:
+    """The fis DataArray accessor should expose KMZ export."""
+    data_array = _spatial_dataarray()
+    out_file = tmp_path / "accessor_overlay.kmz"
+
+    data_array.fis.to_kmz(out_file, verbose=False, tiled=True)
+
+    with zipfile.ZipFile(out_file) as kmz:
+        names = set(kmz.namelist())
+
+    assert "doc.kml" in names
+    assert "legend/colorbar.png" in names
+    assert "tiles/0/0/0.kml" in names
 
 
 def test_array2kml_and_array2kmz_regression(tmp_path: Path) -> None:

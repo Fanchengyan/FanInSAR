@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+import rioxarray  # noqa: F401
 from lxml import etree
 from matplotlib import ticker
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -20,11 +21,15 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.figure import Figure
 from pykml.factory import KML_ElementMaker as KML
 from pyproj.crs import CRS
+from rioxarray.exceptions import MissingSpatialDimensionError
 
+from faninsar._core.geo.coordinates import bounds_from_xy
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
     from os import PathLike
+
+    import xarray as xr
 
     from faninsar.query.bbox import BoundingBox
 
@@ -117,6 +122,91 @@ def _normalize_image_kwargs(
     img_kwargs_new = {} if img_kwargs is None else dict(img_kwargs)
     img_kwargs_new.setdefault("interpolation", interpolation)
     return img_kwargs_new
+
+
+def _get_dataarray_spatial_dimensions(data_array: xr.DataArray) -> tuple[str, str]:
+    """Get rioxarray spatial dimension names from a data array.
+
+    Parameters
+    ----------
+    data_array : xarray.DataArray
+        Data array with rioxarray spatial dimensions configured.
+
+    Returns
+    -------
+    tuple[str, str]
+        Spatial dimension names in ``(x_dim, y_dim)`` order.
+
+    Raises
+    ------
+    ValueError
+        If the data array has no rioxarray spatial dimension metadata.
+
+    """
+    try:
+        return data_array.rio.x_dim, data_array.rio.y_dim
+    except MissingSpatialDimensionError as exc:
+        msg = (
+            "data_array should have rioxarray spatial dimensions set with "
+            "data_array.rio.set_spatial_dims(x_dim=..., y_dim=...)."
+        )
+        logger.exception(msg)
+        raise ValueError(msg) from exc
+
+
+def _dataarray_to_wgs84_array_and_bounds(
+    data_array: xr.DataArray,
+) -> tuple[np.ndarray, BoundingBox]:
+    """Convert a data array to WGS84 image data and bounds.
+
+    Parameters
+    ----------
+    data_array : xarray.DataArray
+        Data array with rioxarray CRS and spatial dimension metadata.
+
+    Returns
+    -------
+    tuple[np.ndarray, BoundingBox]
+        Array values ordered as ``(y, x, ...)`` and WGS84 bounds.
+
+    Raises
+    ------
+    ValueError
+        If the data array has no CRS, no spatial dimension metadata, or fewer
+        than two dimensions.
+
+    """
+    wgs84 = CRS.from_epsg(4326)
+    x_dim, y_dim = _get_dataarray_spatial_dimensions(data_array)
+    crs = data_array.rio.crs
+    if crs is None:
+        msg = "data_array should have a CRS set with data_array.rio.write_crs(...)."
+        logger.error(msg)
+        raise ValueError(msg)
+    if data_array.ndim < 2:
+        msg = (
+            "data_array should have at least two spatial dimensions, "
+            f"but got shape {data_array.shape}."
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+
+    if CRS.from_user_input(crs) != wgs84:
+        reproject_kwargs: dict[str, Any] = {}
+        if data_array.rio.nodata is not None:
+            reproject_kwargs["nodata"] = data_array.rio.nodata
+        data_array = data_array.rio.reproject(wgs84, **reproject_kwargs)
+        x_dim, y_dim = _get_dataarray_spatial_dimensions(data_array)
+
+    spatial_dims = {x_dim, y_dim}
+    extra_dims = [dim for dim in data_array.dims if dim not in spatial_dims]
+    image_data = data_array.transpose(y_dim, x_dim, *extra_dims).values
+    bounds = bounds_from_xy(
+        data_array[x_dim].values,
+        data_array[y_dim].values,
+        crs=wgs84,
+    )
+    return np.asarray(image_data), bounds
 
 
 def _render_array_to_rgba(
@@ -1050,3 +1140,104 @@ def array2kmz(
         return
 
     _array2single_kmz(arr, out_file, bounds, img_kwargs, cbar_kwargs, keep_kml, verbose)
+
+
+def dataarray2kml(
+    data_array: xr.DataArray,
+    out_file: PathLike,
+    img_kwargs: dict | None = None,
+    cbar_kwargs: dict | None = None,
+    verbose: bool = True,
+) -> None:
+    """Write an xarray data array into a KML file.
+
+    Parameters
+    ----------
+    data_array : xarray.DataArray
+        Data array with rioxarray CRS and spatial dimension metadata. The array
+        is automatically reprojected to WGS84 before export when needed.
+    out_file : str or PathLike
+        Path of the KML file.
+    img_kwargs : dict | None, optional
+        Keyword arguments for :func:`matplotlib.pyplot.imshow`.
+    cbar_kwargs : dict | None, optional
+        Keyword arguments for :func:`save_colorbar`, excluding ``out_file`` and
+        ``mappable``.
+    verbose : bool, optional
+        Whether to log the output path.
+
+    Raises
+    ------
+    ValueError
+        If ``data_array`` does not have rioxarray CRS or spatial dimension
+        metadata.
+
+    """
+    arr, bounds = _dataarray_to_wgs84_array_and_bounds(data_array)
+    array2kml(arr, out_file, bounds, img_kwargs, cbar_kwargs, verbose)
+
+
+def dataarray2kmz(
+    data_array: xr.DataArray,
+    out_file: PathLike,
+    img_kwargs: dict | None = None,
+    cbar_kwargs: dict | None = None,
+    keep_kml: bool = False,
+    verbose: bool = True,
+    *,
+    tiled: bool = False,
+    tile_size: int = 256,
+    min_lod_pixels: int = 128,
+    render_scale: float = 1.0,
+) -> None:
+    """Write an xarray data array into a KMZ file.
+
+    Parameters
+    ----------
+    data_array : xarray.DataArray
+        Data array with rioxarray CRS and spatial dimension metadata. The array
+        is automatically reprojected to WGS84 before export when needed.
+    out_file : str or PathLike
+        Path of the KMZ file.
+    img_kwargs : dict | None, optional
+        Keyword arguments for :func:`matplotlib.pyplot.imshow`.
+    cbar_kwargs : dict | None, optional
+        Keyword arguments for :func:`save_colorbar`, excluding ``out_file`` and
+        ``mappable``.
+    keep_kml : bool, optional
+        Whether to keep the intermediate KML and PNG files. Only used when
+        ``tiled`` is False.
+    verbose : bool, optional
+        Whether to log the output path.
+    tiled : bool, optional
+        Whether to write a tiled KMZ SuperOverlay instead of a single overlay.
+    tile_size : int, optional
+        Maximum tile size in pixels. Only used when ``tiled`` is True.
+    min_lod_pixels : int, optional
+        Minimum screen-space threshold used by child ``NetworkLink`` regions.
+        Only used when ``tiled`` is True.
+    render_scale : float, optional
+        Scale factor applied to the rendered image size before tiling. Only
+        used when ``tiled`` is True.
+
+    Raises
+    ------
+    ValueError
+        If ``data_array`` does not have rioxarray CRS or spatial dimension
+        metadata, or if any tiling parameter is invalid.
+
+    """
+    arr, bounds = _dataarray_to_wgs84_array_and_bounds(data_array)
+    array2kmz(
+        arr,
+        out_file,
+        bounds,
+        img_kwargs,
+        cbar_kwargs,
+        keep_kml,
+        verbose,
+        tiled=tiled,
+        tile_size=tile_size,
+        min_lod_pixels=min_lod_pixels,
+        render_scale=render_scale,
+    )

@@ -34,6 +34,8 @@ from ._core import (
     array2kmz,
     bounds_from_xy,
     cuda_available,
+    dataarray2kml,
+    dataarray2kmz,
     geoinfo_from_xy,
     gpu_available,
     gradient_magnitude,
