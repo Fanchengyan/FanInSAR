@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime
-from typing import TYPE_CHECKING, Callable, Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 import numpy as np
 import pandas as pd
@@ -21,8 +21,9 @@ if TYPE_CHECKING:
     from numpy.typing import DTypeLike, NDArray
 
     from faninsar import Loop, Loops, TripletLoops
-    from .baseline import Baselines, BaselinePlotResult
     from faninsar.typing import PairLike, PairsLike, PairsOrder
+
+    from .baseline import BaselinePlotResult, Baselines
 
 logger = setup_logger(__name__)
 
@@ -989,7 +990,7 @@ class Pairs:
 
         """  # noqa: E501
         if baseline is None:
-            from .baseline import Baselines, BaselinePlotResult
+            from .baseline import Baselines
 
             rng = np.random.default_rng(seed=seed)
             vals = rng.standard_normal(len(self.dates)) * 1000

@@ -1,12 +1,20 @@
+import zipfile
 from pathlib import Path
 
 import numpy as np
 import pytest
 import rasterio
+from lxml import etree
 from rasterio import Affine
 from rasterio.profiles import Profile as RasterioProfile
 
-from faninsar._core.geo.geo_tools import GeoGrid, Profile
+from faninsar._core.geo import (
+    GeoGrid,
+    Profile,
+    array2kml,
+    array2kmz,
+    array2tiled_kmz,
+)
 
 profile = Profile(200, 300, Affine(*list(range(6))))
 
@@ -40,20 +48,26 @@ class TestProfile:
         profile = Profile(200, 300, Affine(*list(range(6))), crs="EPSG:4326")
         assert profile.crs.to_string() == "EPSG:4326"
 
-
     def test_bounds_property(self):
         profile = Profile(200, 300, Affine(*list(range(6))))
-        assert profile.bounds == (2.0, 805.0, 2.0, 5.0)
+        assert tuple(profile.bounds) == (2.0, 5.0, 202.0, 1705.0)
 
     def test_res_property(self):
         profile = Profile(200, 300, Affine(*list(range(6))))
         assert profile.res == (0, 4)
 
-
-    def test_from_raster_file(self, tmp_path:Path):
+    def test_from_raster_file(self, tmp_path: Path):
         tif_file = tmp_path / "dummy.tif"
-        with rasterio.open(tif_file, "w", driver="GTiff", height=200, width=300, count=1, dtype="float32") as dst:
-            dst.write(np.zeros((200, 300), dtype="float32"),1)
+        with rasterio.open(
+            tif_file,
+            "w",
+            driver="GTiff",
+            height=200,
+            width=300,
+            count=1,
+            dtype="float32",
+        ) as dst:
+            dst.write(np.zeros((200, 300), dtype="float32"), 1)
 
         profile = Profile.from_raster_file(tif_file)
         assert profile["height"] == 200
@@ -76,20 +90,17 @@ class TestProfile:
         assert profile.count == 3
         assert profile["tiled"] is True
 
-
     def test_from_ascii_header_file(self, ascii_file_corner, ascii_file_center):
         profile_corner = Profile.from_ascii_header_file(ascii_file_corner)
         assert profile_corner.height == 200
         assert profile_corner.width == 100
         assert profile_corner.nodata == -32768
-        assert profile_corner.transform == Affine(30.0, 0.0, 300.0,
-       0.0, -30.0, 6430.0)
+        assert profile_corner.transform == Affine(30.0, 0.0, 300.0, 0.0, -30.0, 6430.0)
         profile_center = Profile.from_ascii_header_file(ascii_file_center)
         assert profile_center.height == 200
         assert profile_center.width == 100
         assert profile_center.nodata == -32768
-        assert profile_center.transform == Affine(30.0, 0.0, 285.0,
-       0.0, -30.0, 6415.0)
+        assert profile_center.transform == Affine(30.0, 0.0, 285.0, 0.0, -30.0, 6415.0)
 
     def test_from_ascii_header_file_with_kwargs(self, ascii_file_corner):
         profile = Profile.from_ascii_header_file(
@@ -100,7 +111,7 @@ class TestProfile:
         assert profile.count == 2
         assert profile.dtype == "float32"
 
-    def test_from_profile_file(self, ascii_file_corner, tmp_path:Path):
+    def test_from_profile_file(self, ascii_file_corner, tmp_path: Path):
         profile_corner = Profile.from_ascii_header_file(ascii_file_corner)
         # save profile to tmp file
         profile_file = tmp_path / "dummy.profile"
@@ -168,7 +179,7 @@ class TestProfile:
 
         assert profile.width == 8
         assert profile.shape == (2, 8)
-        assert profile.bounds == (0.0, 0.0, 8.0, 2.0)
+        assert tuple(profile.bounds) == (0.0, 0.0, 8.0, 2.0)
         assert profile.crs.to_string() == "EPSG:4326"
 
     def test_metadata_properties(self):
@@ -207,7 +218,7 @@ class TestProfile:
         assert collected["tiled"] is True
         assert dict(profile)["count"] == 2
 
-    def test_to_file(self, tmp_path:Path):
+    def test_to_file(self, tmp_path: Path):
         profile_file = tmp_path / "dummy.profile"
         profile = Profile(200, 300, Affine(*list(range(6))))
         profile.to_file(profile_file)
@@ -225,7 +236,7 @@ class TestProfile:
         assert rasterio_profile["width"] == 300
         assert isinstance(rasterio_profile, RasterioProfile)
 
-    def test_get_xy(self,ascii_file_center):
+    def test_get_xy(self, ascii_file_center):
         profile = Profile.from_ascii_header_file(ascii_file_center)
         x, y = profile.get_xy()
         assert len(x) == 100
@@ -233,4 +244,111 @@ class TestProfile:
         assert y[-1] == 400 + 30
         assert y[0] == 400 + 30 * len(y)
         assert x[0] == 300
-        assert x[-1] == 300 + 30 * (len(x)-1)
+        assert x[-1] == 300 + 30 * (len(x) - 1)
+
+
+def _read_kmz_xml(kmz_path: Path, member: str) -> etree._Element:
+    """Read an XML member from a KMZ archive."""
+    with zipfile.ZipFile(kmz_path) as kmz:
+        return etree.fromstring(kmz.read(member))
+
+
+def _kml_text(element: etree._Element, tag_name: str) -> str:
+    """Extract the first text value for a KML tag."""
+    return element.xpath(f"string(.//*[local-name()='{tag_name}'][1])")
+
+
+def test_array2tiled_kmz_writes_multilevel_kmz(tmp_path: Path) -> None:
+    """Tiled KMZ export should produce a multilevel tile pyramid."""
+    arr = np.arange(520 * 520, dtype=np.float32).reshape(520, 520)
+    out_file = tmp_path / "multilevel_tiled_kmz.kmz"
+    bounds = (-10.0, 20.0, 10.0, 40.0)
+
+    array2tiled_kmz(
+        arr,
+        out_file,
+        bounds,
+        cbar_kwargs={"label": "Velocity"},
+        verbose=False,
+    )
+
+    with zipfile.ZipFile(out_file) as kmz:
+        names = set(kmz.namelist())
+
+    assert "doc.kml" in names
+    assert "legend/colorbar.png" in names
+    assert "tiles/0/0/0.kml" in names
+    assert "tiles/0/0/0.png" in names
+    assert "tiles/1/0/0.kml" in names
+    assert "tiles/1/0/0.png" in names
+    assert "tiles/2/0/0.kml" in names
+    assert "tiles/2/0/0.png" in names
+
+    root_doc = _read_kmz_xml(out_file, "doc.kml")
+    assert root_doc.xpath("//*[local-name()='NetworkLink']")
+    assert root_doc.xpath("//*[local-name()='ScreenOverlay']")
+
+    root_tile = _read_kmz_xml(out_file, "tiles/0/0/0.kml")
+    assert root_tile.xpath("//*[local-name()='GroundOverlay']")
+    assert root_tile.xpath("//*[local-name()='Region']")
+    assert root_tile.xpath("//*[local-name()='Lod']")
+    assert len(root_tile.xpath("//*[local-name()='NetworkLink']")) == 4
+
+    root_overlay = root_tile.xpath("//*[local-name()='GroundOverlay']")[0]
+    assert float(_kml_text(root_overlay, "west")) == pytest.approx(bounds[0])
+    assert float(_kml_text(root_overlay, "south")) == pytest.approx(bounds[1])
+    assert float(_kml_text(root_overlay, "east")) == pytest.approx(bounds[2])
+    assert float(_kml_text(root_overlay, "north")) == pytest.approx(bounds[3])
+
+    child_tile = _read_kmz_xml(out_file, "tiles/1/0/0.kml")
+    child_overlay = child_tile.xpath("//*[local-name()='GroundOverlay']")[0]
+    assert float(_kml_text(child_overlay, "west")) == pytest.approx(-10.0)
+    assert float(_kml_text(child_overlay, "south")) == pytest.approx(30.0)
+    assert float(_kml_text(child_overlay, "east")) == pytest.approx(0.0)
+    assert float(_kml_text(child_overlay, "north")) == pytest.approx(40.0)
+
+    leaf_tile = _read_kmz_xml(out_file, "tiles/2/0/0.kml")
+    assert leaf_tile.xpath("//*[local-name()='GroundOverlay']")
+    assert leaf_tile.xpath("//*[local-name()='Region']")
+    assert leaf_tile.xpath("//*[local-name()='Lod']")
+    assert not leaf_tile.xpath("//*[local-name()='NetworkLink']")
+
+
+def test_array2tiled_kmz_writes_single_level_kmz(tmp_path: Path) -> None:
+    """Small inputs should only emit a single tile level."""
+    arr = np.arange(80 * 64, dtype=np.float32).reshape(64, 80)
+    out_file = tmp_path / "single_level_tiled_kmz.kmz"
+
+    array2tiled_kmz(arr, out_file, (0.0, 0.0, 1.0, 1.0), verbose=False)
+
+    with zipfile.ZipFile(out_file) as kmz:
+        names = set(kmz.namelist())
+
+    kml_members = {name for name in names if name.endswith(".kml")}
+    png_members = {name for name in names if name.endswith(".png")}
+
+    assert kml_members == {"doc.kml", "tiles/0/0/0.kml"}
+    assert png_members == {"legend/colorbar.png", "tiles/0/0/0.png"}
+
+
+def test_array2kml_and_array2kmz_regression(tmp_path: Path) -> None:
+    """Existing single-overlay exporters should keep their asset layout."""
+    arr = np.arange(25, dtype=np.float32).reshape(5, 5)
+    bounds = (0.0, 0.0, 1.0, 1.0)
+
+    kml_file = tmp_path / "single_overlay.kml"
+    array2kml(arr, kml_file, bounds, verbose=False)
+    assert kml_file.exists()
+    assert kml_file.with_suffix(".png").exists()
+    assert kml_file.with_name("single_overlay_cbar.png").exists()
+
+    kmz_file = tmp_path / "single_overlay_archive.kmz"
+    array2kmz(arr, kmz_file, bounds, verbose=False)
+    with zipfile.ZipFile(kmz_file) as kmz:
+        names = set(kmz.namelist())
+
+    assert names == {
+        "single_overlay_archive.kml",
+        "single_overlay_archive.png",
+        "single_overlay_archive_cbar.png",
+    }

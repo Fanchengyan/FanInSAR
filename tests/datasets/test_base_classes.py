@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import zipfile
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pytest
 import rasterio
+from lxml import etree
 from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 
-from faninsar._core.geo.geo_tools import Profile
+from faninsar._core.geo import Profile
 from faninsar._core.sar.acquisition import Acquisition
 from faninsar._core.sar.pairs import Pairs
 from faninsar.datasets.base import (
@@ -21,14 +24,20 @@ from faninsar.datasets.base import (
     TimeSeriesDataset,
 )
 from faninsar.query import BoundingBox, Points
-from typing import Iterable
 
 
-def _write_tile(path: Path, bounds: tuple[float, float, float, float], value: float) -> None:
+def _write_tile(
+    path: Path,
+    bounds: tuple[float, float, float, float],
+    value: float,
+    *,
+    crs: CRS | None = None,
+) -> None:
     """Create a small GeoTIFF tile for testing."""
     height = width = 4
     transform = from_bounds(*bounds, width, height)
     data = np.full((height, width), value, dtype=np.float32)
+    crs = CRS.from_epsg(4326) if crs is None else crs
     with rasterio.open(
         path,
         "w",
@@ -37,7 +46,7 @@ def _write_tile(path: Path, bounds: tuple[float, float, float, float], value: fl
         width=width,
         count=1,
         dtype=data.dtype,
-        crs=CRS.from_epsg(4326),
+        crs=crs,
         transform=transform,
         nodata=0.0,
     ) as dst:
@@ -63,7 +72,9 @@ class ToyGeoDataset(GeoDataset):
         self,
         bbox: BoundingBox | str = "roi",
     ) -> Profile:
-        bbox_obj = self._ensure_bbox(bbox) if isinstance(bbox, BoundingBox) else self.roi
+        bbox_obj = (
+            self._ensure_bbox(bbox) if isinstance(bbox, BoundingBox) else self.roi
+        )
         width = int(abs(bbox_obj.right - bbox_obj.left)) or 1
         height = int(abs(bbox_obj.top - bbox_obj.bottom)) or 1
         transform = from_bounds(
@@ -97,9 +108,11 @@ class SampleTimeSeriesDataset(TimeSeriesDataset):
     pattern = "*.tif"
 
     @classmethod
-    def _parse_dates(cls, paths: list[str | Path]) -> Acquisition:
+    def parse_dates(cls, paths: list[str | Path]) -> Acquisition:
         dates = [
-            np.datetime64(datetime.strptime(Path(path).stem.split("_")[0], "%Y%m%d"), "ns")
+            np.datetime64(
+                datetime.strptime(Path(path).stem.split("_")[0], "%Y%m%d"), "ns"
+            )
             for path in paths
         ]
         return Acquisition(dates)
@@ -189,3 +202,39 @@ def test_pair_dataset_parses_pairs(pair_root: Path) -> None:
         "20210113_20210125",
     ]
     assert ds.file_dim_name == "pair"
+
+
+def test_raster_dataset_array2tiled_kmz_reprojects_to_wgs84(
+    tmp_path: Path,
+) -> None:
+    """RasterDataset tiled KMZ export should reproject to WGS84."""
+    mercator = CRS.from_epsg(3857)
+    bounds = (0.0, 0.0, 4000.0, 4000.0)
+    _write_tile(tmp_path / "mercator_tile.tif", bounds, value=1.0, crs=mercator)
+
+    dataset = SampleRasterDataset(root_dir=tmp_path, verbose=False)
+    arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+    out_file = tmp_path / "dataset_tiled_kmz.kmz"
+
+    dataset.array2tiled_kmz(arr, out_file, verbose=False)
+
+    with zipfile.ZipFile(out_file) as kmz:
+        names = set(kmz.namelist())
+        root_tile = etree.fromstring(kmz.read("tiles/0/0/0.kml"))
+
+    assert "doc.kml" in names
+    assert "legend/colorbar.png" in names
+    assert "tiles/0/0/0.kml" in names
+    assert "tiles/0/0/0.png" in names
+
+    west = float(root_tile.xpath("string(.//*[local-name()='west'][1])"))
+    south = float(root_tile.xpath("string(.//*[local-name()='south'][1])"))
+    east = float(root_tile.xpath("string(.//*[local-name()='east'][1])"))
+    north = float(root_tile.xpath("string(.//*[local-name()='north'][1])"))
+
+    assert west < east
+    assert south < north
+    assert -180.0 <= west <= 180.0
+    assert -180.0 <= east <= 180.0
+    assert -90.0 <= south <= 90.0
+    assert -90.0 <= north <= 90.0

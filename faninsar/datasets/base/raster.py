@@ -25,13 +25,13 @@ from rasterio.warp import Resampling
 from rasterio.warp import transform as warp_transform
 from tqdm import tqdm
 
-from faninsar._core.geo import geo_tools
-from faninsar._core.geo.geo_tools import (
+from faninsar._core.geo import (
     GeoGrid,
     Profile,
     array2kml,
     array2kmz,
-    bound_from_xy,
+    array2tiled_kmz,
+    bounds_from_xy,
     write_geoinfo_into_ds,
     xy_from_transform,
 )
@@ -2585,7 +2585,7 @@ class RasterDataset(GeoDataset):
                 "x": x,
             },
         )
-        ds = geo_tools.write_geoinfo_into_ds(
+        ds = write_geoinfo_into_ds(
             ds,
             "image",
             crs=self.crs,
@@ -2733,7 +2733,7 @@ class RasterDataset(GeoDataset):
             da = da.rio.reproject(wgs84, nodata=nodata)
             # update arr and bounds
             arr = da.values
-            bounds = bound_from_xy(da.x, da.y)
+            bounds = bounds_from_xy(da.x, da.y)
 
         array2kml(arr, out_file, bounds, img_kwargs, cbar_kwargs, verbose)
 
@@ -2788,6 +2788,76 @@ class RasterDataset(GeoDataset):
             da = da.rio.reproject(wgs84, nodata=nodata)
             # update arr and bounds
             arr = da.values
-            bounds = bound_from_xy(da.x, da.y)
+            bounds = bounds_from_xy(da.x, da.y)
 
         array2kmz(arr, out_file, bounds, img_kwargs, cbar_kwargs, keep_kml, verbose)
+
+    def array2tiled_kmz(
+        self,
+        arr: np.ndarray,
+        out_file: PathLike,
+        bounds: BoundingBox | None = None,
+        img_kwargs: dict | None = None,
+        cbar_kwargs: dict | None = None,
+        tile_size: int = 256,
+        min_lod_pixels: int = 128,
+        render_scale: float = 1.0,
+        verbose: bool = True,
+    ) -> None:
+        """Write a numpy array into a tiled KMZ file.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            Array to export as a tiled KMZ.
+        out_file : str or PathLike
+            Output KMZ path.
+        bounds : BoundingBox, optional
+            Bounds of ``arr``. If None, the dataset ROI will be used.
+        img_kwargs : dict, optional
+            Keyword arguments for :func:`matplotlib.pyplot.imshow`.
+        cbar_kwargs : dict, optional
+            Keyword arguments for :func:`faninsar._core.geo.save_colorbar`,
+            excluding ``out_file`` and ``mappable``.
+        tile_size : int, optional
+            Maximum tile size in pixels.
+        min_lod_pixels : int, optional
+            Minimum LOD threshold used by child regions.
+        render_scale : float, optional
+            Scale factor applied to the rendered overlay size before tiling.
+        verbose : bool, optional
+            Whether to log the output path.
+
+        """
+        if cbar_kwargs is None:
+            cbar_kwargs = {}
+        if img_kwargs is None:
+            img_kwargs = {}
+        if bounds is None:
+            bounds = self.roi
+
+        wgs84 = CRS.from_epsg(4326)
+        if self.crs != wgs84:
+            profile = self.get_profile(bounds)
+            x, y = profile.get_xy()
+            dtype = get_minimum_dtype(arr)
+            nodata = get_nodata(arr, None, dtype)
+
+            da = xr.DataArray(arr, coords=[y, x], dims=["y", "x"])
+            da.rio.set_spatial_dims("x", "y", inplace=True)
+            da.rio.write_crs(self.crs, inplace=True)
+            da = da.rio.reproject(wgs84, nodata=nodata)
+            arr = da.values
+            bounds = bounds_from_xy(da.x, da.y)
+
+        array2tiled_kmz(
+            arr,
+            out_file,
+            bounds,
+            img_kwargs,
+            cbar_kwargs,
+            tile_size,
+            min_lod_pixels,
+            render_scale,
+            verbose,
+        )

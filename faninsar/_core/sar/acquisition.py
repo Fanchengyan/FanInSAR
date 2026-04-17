@@ -4,25 +4,24 @@ from __future__ import annotations
 
 import warnings
 from datetime import datetime
-from typing import TYPE_CHECKING, Callable, Sequence
+from typing import TYPE_CHECKING, Self
 
 import numpy as np
 import pandas as pd
 import pandas.core.common as com
 import xarray as xr
-from pandas._libs.internals import BlockValuesRefs
+from pandas._libs.internals import BlockValuesRefs  # noqa: PLC2701
 from pandas.core.arrays import ExtensionArray
 from pandas.core.construction import ensure_wrapped_if_datetimelike, sanitize_array
 from pandas.core.dtypes.common import is_iterator, is_list_like, is_scalar, pandas_dtype
 from pandas.core.dtypes.generic import ABCMultiIndex, ABCSeries
 from pandas.core.indexes.base import maybe_extract_name
-from typing_extensions import Self
 
 from faninsar._core.render import array_repr
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable
+    from collections.abc import Callable, Hashable, Sequence
 
     from matplotlib.axes import Axes
     from pandas._typing import ArrayLike
