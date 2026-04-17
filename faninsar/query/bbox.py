@@ -73,9 +73,10 @@ class BoundingBox:
 
     def __str__(self) -> str:
         """Return a string representation of the bounding box."""
+        crs = self.crs.to_string() if self.crs else None
         return (
             f"BoundingBox(left={self.left}, bottom={self.bottom}, "
-            f"right={self.right}, top={self.top}, crs={self.crs})"
+            f"right={self.right}, top={self.top}, crs={crs})"
         )
 
     def __repr__(self) -> str:

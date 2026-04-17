@@ -165,17 +165,19 @@ class Points:
 
     def __str__(self) -> str:
         """Return the string representation of the Points."""
-        return f"Points(count={len(self)}, crs='{self.crs}')"
+        crs = self.crs.to_string() if self.crs else None
+        return f"Points(count={len(self)}, crs='{crs}')"
 
     def __repr__(self) -> str:
         """Return the string representation of the Points."""
         prefix = "Points:\n"
         middle = self.to_dataframe().to_string(max_rows=10)
-        suffix = f"\n[count={len(self)}, crs='{self.crs}']"
+        crs = self.crs.to_string() if self.crs else None
+        suffix = f"\n[count={len(self)}, crs='{crs}']"
 
         return f"{prefix}{middle}{suffix}"
 
-    def __array__(self, dtype: np.dtype | None = None) -> np.ndarray:
+    def __array__(self, dtype: np.dtype | None = None) -> np.ndarray:  # noqa: PLW3201
         """Return the values of the points as a numpy array."""
         if dtype is not None:
             return self._values.astype(dtype)
@@ -206,7 +208,7 @@ class Points:
             return None
         return Points(values, crs=crs_new)
 
-    def _ensure_points_crs(self, other: Points) -> tuple[Points, CRS]:
+    def _ensure_points_crs(self, other: Points) -> tuple[Points, CRS | None]:
         """Ensure the coordinate reference system of the points are the same."""
         if self.crs != other.crs:
             if self.crs is None or other.crs is None:
