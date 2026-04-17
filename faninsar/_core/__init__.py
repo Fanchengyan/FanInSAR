@@ -10,7 +10,6 @@ from .geo import (
     Profile,
     array2kml,
     array2kmz,
-    array2tiled_kmz,
     bounds_from_xy,
     format_bounds_and_crs,
     geoinfo_from_xy,

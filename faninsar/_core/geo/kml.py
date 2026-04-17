@@ -822,7 +822,7 @@ def array2kml(
         logger.info(info)
 
 
-def array2kmz(
+def _array2single_kmz(
     arr: np.ndarray,
     out_file: PathLike,
     bounds: tuple[float, float, float, float] | BoundingBox,
@@ -831,25 +831,25 @@ def array2kmz(
     keep_kml: bool = False,
     verbose: bool = True,
 ) -> None:
-    """Write a numpy array into a kmz file.
+    """Write an array into a single-overlay KMZ file.
 
     Parameters
     ----------
-    arr: numpy.ndarray
-        the numpy array to be written into kml file.
-    out_file: str or Path
-        the path of the kmz file.
-    bounds: tuple or BoundingBox
-        the bounds of image in [west, south, east, north] order in WGS84
-    img_kwargs: dict
-        the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
-    cbar_kwargs: dict
-        the keyword arguments for :func:`save_colorbar` function, except for
-        the out_file and mappable argument.
-    keep_kml: bool
-        whether to keep the kml file. Default is False.
-    verbose: bool
-        whether to print the information of the kmz file. Default is verbose.
+    arr : np.ndarray
+        Array to export as a single image overlay.
+    out_file : PathLike
+        Output KMZ path.
+    bounds : tuple[float, float, float, float] | BoundingBox
+        Bounds of image in ``(west, south, east, north)`` order in WGS84.
+    img_kwargs : dict | None, optional
+        Keyword arguments for :func:`matplotlib.pyplot.imshow`.
+    cbar_kwargs : dict | None, optional
+        Keyword arguments for :func:`save_colorbar`, excluding ``out_file`` and
+        ``mappable``.
+    keep_kml : bool, optional
+        Whether to keep the intermediate KML and PNG files.
+    verbose : bool, optional
+        Whether to log the output path.
 
     """
     if cbar_kwargs is None:
@@ -876,12 +876,13 @@ def array2kmz(
         logger.info(info)
 
 
-def array2tiled_kmz(
+def _array2tiled_kmz(
     arr: np.ndarray,
     out_file: PathLike,
     bounds: tuple[float, float, float, float] | BoundingBox,
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
+    *,
     tile_size: int = 256,
     min_lod_pixels: int = 128,
     render_scale: float = 1.0,
@@ -916,12 +917,6 @@ def array2tiled_kmz(
     ValueError
         If any tiling parameter is invalid.
 
-    Notes
-    -----
-    This exporter writes a self-contained KMZ that uses a KML SuperOverlay
-    structure internally. The source data are still limited by the resolution
-    of ``arr``.
-
     """
     if tile_size <= 0:
         msg = f"tile_size should be positive, but got {tile_size}"
@@ -932,7 +927,7 @@ def array2tiled_kmz(
         logger.error(msg)
         raise ValueError(msg)
 
-    bounds = _normalize_kml_bounds(bounds)
+    bounds_norm = _normalize_kml_bounds(bounds)
     img_kwargs_norm = _normalize_image_kwargs(img_kwargs, interpolation="nearest")
     cbar_kwargs_norm = {} if cbar_kwargs is None else dict(cbar_kwargs)
 
@@ -949,7 +944,7 @@ def array2tiled_kmz(
     root = _build_tiled_kmz_tree(
         image_width=rgba.shape[1],
         image_height=rgba.shape[0],
-        bounds=bounds,
+        bounds=bounds_norm,
         tile_size=tile_size,
     )
 
@@ -962,7 +957,7 @@ def array2tiled_kmz(
             "doc.kml",
             _tiled_kmz_root_kml(
                 root,
-                bounds,
+                bounds_norm,
                 colorbar_path="legend/colorbar.png",
             ),
         )
@@ -987,3 +982,71 @@ def array2tiled_kmz(
     if verbose:
         info = f"write tiled kmz file to {out_file}"
         logger.info(info)
+
+
+def array2kmz(
+    arr: np.ndarray,
+    out_file: PathLike,
+    bounds: tuple[float, float, float, float] | BoundingBox,
+    img_kwargs: dict | None = None,
+    cbar_kwargs: dict | None = None,
+    keep_kml: bool = False,
+    verbose: bool = True,
+    *,
+    tiled: bool = False,
+    tile_size: int = 256,
+    min_lod_pixels: int = 128,
+    render_scale: float = 1.0,
+) -> None:
+    """Write a numpy array into a kmz file.
+
+    Parameters
+    ----------
+    arr: numpy.ndarray
+        the numpy array to be written into kml file.
+    out_file: str or Path
+        the path of the kmz file.
+    bounds: tuple or BoundingBox
+        the bounds of image in [west, south, east, north] order in WGS84
+    img_kwargs: dict
+        the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
+    cbar_kwargs: dict
+        the keyword arguments for :func:`save_colorbar` function, except for
+        the out_file and mappable argument.
+    keep_kml: bool
+        whether to keep the kml file. Only used when ``tiled`` is False.
+        Default is False.
+    verbose: bool
+        whether to print the information of the kmz file. Default is verbose.
+    tiled : bool, optional
+        Whether to write a tiled KMZ SuperOverlay instead of a single overlay.
+    tile_size : int, optional
+        Maximum tile size in pixels. Only used when ``tiled`` is True.
+    min_lod_pixels : int, optional
+        Minimum screen-space threshold used by child ``NetworkLink`` regions.
+        Only used when ``tiled`` is True.
+    render_scale : float, optional
+        Scale factor applied to the rendered image size before tiling. Only
+        used when ``tiled`` is True.
+
+    Raises
+    ------
+    ValueError
+        If any tiling parameter is invalid.
+
+    """
+    if tiled:
+        _array2tiled_kmz(
+            arr,
+            out_file,
+            bounds,
+            img_kwargs,
+            cbar_kwargs,
+            tile_size=tile_size,
+            min_lod_pixels=min_lod_pixels,
+            render_scale=render_scale,
+            verbose=verbose,
+        )
+        return
+
+    _array2single_kmz(arr, out_file, bounds, img_kwargs, cbar_kwargs, keep_kml, verbose)

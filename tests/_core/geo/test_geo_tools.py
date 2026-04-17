@@ -13,7 +13,6 @@ from faninsar._core.geo import (
     Profile,
     array2kml,
     array2kmz,
-    array2tiled_kmz,
 )
 
 profile = Profile(200, 300, Affine(*list(range(6))))
@@ -258,18 +257,19 @@ def _kml_text(element: etree._Element, tag_name: str) -> str:
     return element.xpath(f"string(.//*[local-name()='{tag_name}'][1])")
 
 
-def test_array2tiled_kmz_writes_multilevel_kmz(tmp_path: Path) -> None:
+def test_array2kmz_tiled_writes_multilevel_kmz(tmp_path: Path) -> None:
     """Tiled KMZ export should produce a multilevel tile pyramid."""
     arr = np.arange(520 * 520, dtype=np.float32).reshape(520, 520)
     out_file = tmp_path / "multilevel_tiled_kmz.kmz"
     bounds = (-10.0, 20.0, 10.0, 40.0)
 
-    array2tiled_kmz(
+    array2kmz(
         arr,
         out_file,
         bounds,
         cbar_kwargs={"label": "Velocity"},
         verbose=False,
+        tiled=True,
     )
 
     with zipfile.ZipFile(out_file) as kmz:
@@ -314,12 +314,12 @@ def test_array2tiled_kmz_writes_multilevel_kmz(tmp_path: Path) -> None:
     assert not leaf_tile.xpath("//*[local-name()='NetworkLink']")
 
 
-def test_array2tiled_kmz_writes_single_level_kmz(tmp_path: Path) -> None:
+def test_array2kmz_tiled_writes_single_level_kmz(tmp_path: Path) -> None:
     """Small inputs should only emit a single tile level."""
     arr = np.arange(80 * 64, dtype=np.float32).reshape(64, 80)
     out_file = tmp_path / "single_level_tiled_kmz.kmz"
 
-    array2tiled_kmz(arr, out_file, (0.0, 0.0, 1.0, 1.0), verbose=False)
+    array2kmz(arr, out_file, (0.0, 0.0, 1.0, 1.0), verbose=False, tiled=True)
 
     with zipfile.ZipFile(out_file) as kmz:
         names = set(kmz.namelist())

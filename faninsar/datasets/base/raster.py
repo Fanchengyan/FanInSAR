@@ -30,7 +30,6 @@ from faninsar._core.geo import (
     Profile,
     array2kml,
     array2kmz,
-    array2tiled_kmz,
     bounds_from_xy,
     write_geoinfo_into_ds,
     xy_from_transform,
@@ -2746,6 +2745,11 @@ class RasterDataset(GeoDataset):
         cbar_kwargs: dict | None = None,
         keep_kml: bool = False,
         verbose: bool = True,
+        *,
+        tiled: bool = False,
+        tile_size: int = 256,
+        min_lod_pixels: int = 128,
+        render_scale: float = 1.0,
     ) -> None:
         """Write a numpy array into a kmz file.
 
@@ -2764,9 +2768,20 @@ class RasterDataset(GeoDataset):
             the keyword arguments for :func:`save_colorbar` function, except for
             the out_file and mappable argument.
         keep_kml: bool
-            whether to keep the kml file. Default is False.
+            whether to keep the kml file. Only used when ``tiled`` is False.
+            Default is False.
         verbose: bool
             whether to print the information of the kmz file. Default is verbose.
+        tiled : bool, optional
+            Whether to write a tiled KMZ SuperOverlay instead of a single overlay.
+        tile_size : int, optional
+            Maximum tile size in pixels. Only used when ``tiled`` is True.
+        min_lod_pixels : int, optional
+            Minimum LOD threshold used by child regions. Only used when
+            ``tiled`` is True.
+        render_scale : float, optional
+            Scale factor applied to the rendered overlay size before tiling.
+            Only used when ``tiled`` is True.
 
         """
         if cbar_kwargs is None:
@@ -2790,7 +2805,19 @@ class RasterDataset(GeoDataset):
             arr = da.values
             bounds = bounds_from_xy(da.x, da.y)
 
-        array2kmz(arr, out_file, bounds, img_kwargs, cbar_kwargs, keep_kml, verbose)
+        array2kmz(
+            arr,
+            out_file,
+            bounds,
+            img_kwargs,
+            cbar_kwargs,
+            keep_kml,
+            verbose,
+            tiled=tiled,
+            tile_size=tile_size,
+            min_lod_pixels=min_lod_pixels,
+            render_scale=render_scale,
+        )
 
     def array2tiled_kmz(
         self,
@@ -2829,35 +2856,18 @@ class RasterDataset(GeoDataset):
             Whether to log the output path.
 
         """
-        if cbar_kwargs is None:
-            cbar_kwargs = {}
-        if img_kwargs is None:
-            img_kwargs = {}
-        if bounds is None:
-            bounds = self.roi
-
-        wgs84 = CRS.from_epsg(4326)
-        if self.crs != wgs84:
-            profile = self.get_profile(bounds)
-            x, y = profile.get_xy()
-            dtype = get_minimum_dtype(arr)
-            nodata = get_nodata(arr, None, dtype)
-
-            da = xr.DataArray(arr, coords=[y, x], dims=["y", "x"])
-            da.rio.set_spatial_dims("x", "y", inplace=True)
-            da.rio.write_crs(self.crs, inplace=True)
-            da = da.rio.reproject(wgs84, nodata=nodata)
-            arr = da.values
-            bounds = bounds_from_xy(da.x, da.y)
-
-        array2tiled_kmz(
+        logger.warning(
+            "array2tiled_kmz is deprecated; use array2kmz(..., tiled=True) instead."
+        )
+        self.array2kmz(
             arr,
             out_file,
             bounds,
             img_kwargs,
             cbar_kwargs,
-            tile_size,
-            min_lod_pixels,
-            render_scale,
-            verbose,
+            verbose=verbose,
+            tiled=True,
+            tile_size=tile_size,
+            min_lod_pixels=min_lod_pixels,
+            render_scale=render_scale,
         )

@@ -204,7 +204,7 @@ def test_pair_dataset_parses_pairs(pair_root: Path) -> None:
     assert ds.file_dim_name == "pair"
 
 
-def test_raster_dataset_array2tiled_kmz_reprojects_to_wgs84(
+def test_raster_dataset_array2kmz_tiled_reprojects_to_wgs84(
     tmp_path: Path,
 ) -> None:
     """RasterDataset tiled KMZ export should reproject to WGS84."""
@@ -216,7 +216,7 @@ def test_raster_dataset_array2tiled_kmz_reprojects_to_wgs84(
     arr = np.arange(16, dtype=np.float32).reshape(4, 4)
     out_file = tmp_path / "dataset_tiled_kmz.kmz"
 
-    dataset.array2tiled_kmz(arr, out_file, verbose=False)
+    dataset.array2kmz(arr, out_file, verbose=False, tiled=True)
 
     with zipfile.ZipFile(out_file) as kmz:
         names = set(kmz.namelist())

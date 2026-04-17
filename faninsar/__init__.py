@@ -32,7 +32,6 @@ from ._core import (
     Wavelength,
     array2kml,
     array2kmz,
-    array2tiled_kmz,
     bounds_from_xy,
     cuda_available,
     geoinfo_from_xy,
