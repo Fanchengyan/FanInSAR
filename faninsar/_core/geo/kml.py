@@ -912,13 +912,72 @@ def array2kml(
         logger.info(info)
 
 
+def _single_overlay_kml_bytes(
+    *,
+    image_path: str,
+    colorbar_path: str,
+    image_shape: tuple[int, ...],
+    bounds: BoundingBox,
+) -> bytes:
+    """Build KML bytes for a single ground overlay.
+
+    Parameters
+    ----------
+    image_path : str
+        Relative image path stored in the KMZ archive.
+    colorbar_path : str
+        Relative colorbar image path stored in the KMZ archive.
+    image_shape : tuple[int, ...]
+        Shape of the rendered source array.
+    bounds : BoundingBox
+        WGS84 bounds for the ground overlay.
+
+    Returns
+    -------
+    bytes
+        Pretty-printed KML document bytes.
+
+    """
+    kml_doc = KML.Document()
+    img_overlay = KML.GroundOverlay(
+        KML.Icon(
+            KML.href(image_path),
+            KML.viewBoundScale(1),
+            KML.scale(1),
+            KML.size(
+                x=str(image_shape[1]),
+                y=str(image_shape[0]),
+                xunits="pixels",
+                yunits="pixels",
+            ),
+        ),
+        KML.LatLonBox(
+            KML.north(bounds[3]),
+            KML.south(bounds[1]),
+            KML.east(bounds[2]),
+            KML.west(bounds[0]),
+        ),
+    )
+    kml_doc.append(img_overlay)
+
+    cbar_overlay = KML.ScreenOverlay(
+        KML.name("Color bar"),
+        KML.Icon(KML.href(colorbar_path)),
+        KML.overlayXY(x="1", y="0", xunits="fraction", yunits="fraction"),
+        KML.screenXY(x="1", y="0", xunits="fraction", yunits="fraction"),
+        KML.size(x="0", y="500", xunits="pixel", yunits="pixel"),
+    )
+    kml_doc.append(cbar_overlay)
+
+    return etree.tostring(KML.kml(kml_doc), pretty_print=True)
+
+
 def _array2single_kmz(
     arr: np.ndarray,
     out_file: PathLike,
     bounds: tuple[float, float, float, float] | BoundingBox,
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
-    keep_kml: bool = False,
     verbose: bool = True,
 ) -> None:
     """Write an array into a single-overlay KMZ file.
@@ -936,31 +995,42 @@ def _array2single_kmz(
     cbar_kwargs : dict | None, optional
         Keyword arguments for :func:`save_colorbar`, excluding ``out_file`` and
         ``mappable``.
-    keep_kml : bool, optional
-        Whether to keep the intermediate KML and PNG files.
     verbose : bool, optional
         Whether to log the output path.
 
     """
-    if cbar_kwargs is None:
-        cbar_kwargs = {}
     img_kwargs = _normalize_image_kwargs(img_kwargs, interpolation="lanczos")
+    cbar_kwargs_norm = {} if cbar_kwargs is None else dict(cbar_kwargs)
+    bounds_norm = _normalize_kml_bounds(bounds)
+
     out_file = Path(out_file)
     if out_file.suffix != ".kmz":
         out_file = out_file.parent / (out_file.stem + ".kmz")
-    img_file = out_file.parent / (out_file.stem + ".png")
-    cbar_file = out_file.parent / (out_file.stem + "_cbar.png")
 
-    kml_file = out_file.parent / (out_file.stem + ".kml")
-    array2kml(arr, kml_file, bounds, img_kwargs, cbar_kwargs, verbose=False)
-    with zipfile.ZipFile(out_file, "w") as kmz:
-        kmz.write(kml_file, kml_file.name)
-        kmz.write(img_file, img_file.name)
-        kmz.write(cbar_file, cbar_file.name)
-    if not keep_kml:
-        img_file.unlink()
-        cbar_file.unlink()
-        kml_file.unlink()
+    image_path = f"{out_file.stem}.png"
+    colorbar_path = f"{out_file.stem}_cbar.png"
+    kml_path = f"{out_file.stem}.kml"
+
+    fig, mappable, rgba = _render_array_to_rgba(arr, img_kwargs=img_kwargs)
+    try:
+        image_png = _rgba_to_png_bytes(rgba)
+        colorbar_png = _render_colorbar_to_png_bytes(mappable, **cbar_kwargs_norm)
+    finally:
+        plt.close(fig)
+
+    with zipfile.ZipFile(out_file, "w", compression=zipfile.ZIP_DEFLATED) as kmz:
+        kmz.writestr(
+            kml_path,
+            _single_overlay_kml_bytes(
+                image_path=image_path,
+                colorbar_path=colorbar_path,
+                image_shape=arr.shape,
+                bounds=bounds_norm,
+            ),
+        )
+        kmz.writestr(image_path, image_png)
+        kmz.writestr(colorbar_path, colorbar_png)
+
     if verbose:
         info = f"write kmz file to {out_file}"
         logger.info(info)
@@ -1080,7 +1150,6 @@ def array2kmz(
     bounds: tuple[float, float, float, float] | BoundingBox,
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
-    keep_kml: bool = False,
     verbose: bool = True,
     *,
     tiled: bool = False,
@@ -1103,9 +1172,6 @@ def array2kmz(
     cbar_kwargs: dict
         the keyword arguments for :func:`save_colorbar` function, except for
         the out_file and mappable argument.
-    keep_kml: bool
-        whether to keep the kml file. Only used when ``tiled`` is False.
-        Default is False.
     verbose: bool
         whether to print the information of the kmz file. Default is verbose.
     tiled : bool, optional
@@ -1139,7 +1205,7 @@ def array2kmz(
         )
         return
 
-    _array2single_kmz(arr, out_file, bounds, img_kwargs, cbar_kwargs, keep_kml, verbose)
+    _array2single_kmz(arr, out_file, bounds, img_kwargs, cbar_kwargs, verbose)
 
 
 def dataarray2kml(
@@ -1149,7 +1215,7 @@ def dataarray2kml(
     cbar_kwargs: dict | None = None,
     verbose: bool = True,
 ) -> None:
-    """Write an xarray data array into a KML file.
+    """Write an xarray DataArray into a KML file.
 
     Parameters
     ----------
@@ -1182,7 +1248,6 @@ def dataarray2kmz(
     out_file: PathLike,
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
-    keep_kml: bool = False,
     verbose: bool = True,
     *,
     tiled: bool = False,
@@ -1190,7 +1255,7 @@ def dataarray2kmz(
     min_lod_pixels: int = 128,
     render_scale: float = 1.0,
 ) -> None:
-    """Write an xarray data array into a KMZ file.
+    """Write an xarray DataArray into a KMZ file.
 
     Parameters
     ----------
@@ -1204,9 +1269,6 @@ def dataarray2kmz(
     cbar_kwargs : dict | None, optional
         Keyword arguments for :func:`save_colorbar`, excluding ``out_file`` and
         ``mappable``.
-    keep_kml : bool, optional
-        Whether to keep the intermediate KML and PNG files. Only used when
-        ``tiled`` is False.
     verbose : bool, optional
         Whether to log the output path.
     tiled : bool, optional
@@ -1234,7 +1296,6 @@ def dataarray2kmz(
         bounds,
         img_kwargs,
         cbar_kwargs,
-        keep_kml,
         verbose,
         tiled=tiled,
         tile_size=tile_size,

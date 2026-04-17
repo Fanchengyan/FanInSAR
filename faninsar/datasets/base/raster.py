@@ -2743,7 +2743,6 @@ class RasterDataset(GeoDataset):
         bounds: BoundingBox | None = None,
         img_kwargs: dict | None = None,
         cbar_kwargs: dict | None = None,
-        keep_kml: bool = False,
         verbose: bool = True,
         *,
         tiled: bool = False,
@@ -2767,9 +2766,6 @@ class RasterDataset(GeoDataset):
         cbar_kwargs: dict
             the keyword arguments for :func:`save_colorbar` function, except for
             the out_file and mappable argument.
-        keep_kml: bool
-            whether to keep the kml file. Only used when ``tiled`` is False.
-            Default is False.
         verbose: bool
             whether to print the information of the kmz file. Default is verbose.
         tiled : bool, optional
@@ -2811,7 +2807,6 @@ class RasterDataset(GeoDataset):
             bounds,
             img_kwargs,
             cbar_kwargs,
-            keep_kml,
             verbose,
             tiled=tiled,
             tile_size=tile_size,

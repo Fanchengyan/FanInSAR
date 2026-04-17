@@ -72,7 +72,6 @@ class FanInSARDataArrayAccessor:
         out_file: PathLike,
         img_kwargs: dict[str, Any] | None = None,
         cbar_kwargs: dict[str, Any] | None = None,
-        keep_kml: bool = False,
         verbose: bool = True,
         *,
         tiled: bool = False,
@@ -91,9 +90,6 @@ class FanInSARDataArrayAccessor:
         cbar_kwargs : dict[str, Any] | None, optional
             Keyword arguments for :func:`faninsar._core.geo.save_colorbar`,
             excluding ``out_file`` and ``mappable``.
-        keep_kml : bool, optional
-            Whether to keep the intermediate KML and PNG files. Only used when
-            ``tiled`` is False.
         verbose : bool, optional
             Whether to log the output path.
         tiled : bool, optional
@@ -120,7 +116,6 @@ class FanInSARDataArrayAccessor:
             out_file,
             img_kwargs=img_kwargs,
             cbar_kwargs=cbar_kwargs,
-            keep_kml=keep_kml,
             verbose=verbose,
             tiled=tiled,
             tile_size=tile_size,

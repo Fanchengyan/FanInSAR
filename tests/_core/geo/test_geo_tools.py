@@ -423,3 +423,6 @@ def test_array2kml_and_array2kmz_regression(tmp_path: Path) -> None:
         "single_overlay_archive.png",
         "single_overlay_archive_cbar.png",
     }
+    assert not kmz_file.with_suffix(".kml").exists()
+    assert not kmz_file.with_suffix(".png").exists()
+    assert not kmz_file.with_name("single_overlay_archive_cbar.png").exists()
