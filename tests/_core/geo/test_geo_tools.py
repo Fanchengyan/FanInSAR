@@ -14,10 +14,8 @@ from rasterio.profiles import Profile as RasterioProfile
 from faninsar._core.geo import (
     GeoGrid,
     Profile,
-    array2kml,
     array2kmz,
     bounds_from_xy,
-    dataarray2kml,
     dataarray2kmz,
 )
 
@@ -291,7 +289,6 @@ def test_array2kmz_tiled_writes_multilevel_kmz(tmp_path: Path) -> None:
         cbar_kwargs={"label": "Velocity"},
         render_scale=1,
         verbose=False,
-        tiled=True,
     )
 
     with zipfile.ZipFile(out_file) as kmz:
@@ -347,7 +344,6 @@ def test_array2kmz_tiled_writes_single_level_kmz(tmp_path: Path) -> None:
         (0.0, 0.0, 1.0, 1.0),
         render_scale=1,
         verbose=False,
-        tiled=True,
     )
 
     with zipfile.ZipFile(out_file) as kmz:
@@ -360,18 +356,16 @@ def test_array2kmz_tiled_writes_single_level_kmz(tmp_path: Path) -> None:
     assert png_members == {"legend/colorbar.png", "tiles/0/0/0.png"}
 
 
-def test_dataarray2kml_uses_rioxarray_spatial_metadata(tmp_path: Path) -> None:
-    """DataArray KML export should derive bounds from configured xy dimensions."""
+def test_dataarray2kmz_uses_rioxarray_spatial_metadata(tmp_path: Path) -> None:
+    """DataArray KMZ export should derive bounds from configured xy dimensions."""
     data_array = _spatial_dataarray()
-    out_file = tmp_path / "dataarray_overlay.kml"
+    out_file = tmp_path / "dataarray_overlay.kmz"
 
-    dataarray2kml(data_array, out_file, verbose=False)
+    dataarray2kmz(data_array, out_file, render_scale=1, verbose=False)
 
     assert out_file.exists()
-    assert out_file.with_suffix(".png").exists()
-    assert out_file.with_name("dataarray_overlay_cbar.png").exists()
 
-    root = etree.fromstring(out_file.read_bytes())
+    root = _read_kmz_xml(out_file, "tiles/0/0/0.kml")
     expected_bounds = bounds_from_xy(data_array.longitude, data_array.latitude)
     assert float(_kml_text(root, "west")) == pytest.approx(expected_bounds[0])
     assert float(_kml_text(root, "south")) == pytest.approx(expected_bounds[1])
@@ -384,10 +378,9 @@ def test_dataarray2kmz_reprojects_to_wgs84(tmp_path: Path) -> None:
     data_array = _spatial_dataarray().rio.reproject("EPSG:3857")
     out_file = tmp_path / "dataarray_overlay.kmz"
 
-    dataarray2kmz(data_array, out_file, verbose=False)
+    dataarray2kmz(data_array, out_file, render_scale=1, verbose=False)
 
-    with zipfile.ZipFile(out_file) as kmz:
-        root = etree.fromstring(kmz.read("dataarray_overlay.kml"))
+    root = _read_kmz_xml(out_file, "tiles/0/0/0.kml")
 
     expected_bounds = bounds_from_xy(data_array.x, data_array.y, crs=data_array.rio.crs)
     expected_bounds = expected_bounds.to_crs("EPSG:4326")
@@ -402,7 +395,7 @@ def test_dataarray_fis_accessor_writes_kmz(tmp_path: Path) -> None:
     data_array = _spatial_dataarray()
     out_file = tmp_path / "accessor_overlay.kmz"
 
-    data_array.fis.to_kmz(out_file, render_scale=1, verbose=False, tiled=True)
+    data_array.fis.to_kmz(out_file, render_scale=1, verbose=False)
 
     with zipfile.ZipFile(out_file) as kmz:
         names = set(kmz.namelist())
@@ -412,42 +405,12 @@ def test_dataarray_fis_accessor_writes_kmz(tmp_path: Path) -> None:
     assert "tiles/0/0/0.kml" in names
 
 
-def test_array2kml_and_array2kmz_regression(tmp_path: Path) -> None:
-    """Existing single-overlay exporters should keep their asset layout."""
-    arr = np.arange(25, dtype=np.float32).reshape(5, 5)
-    bounds = (0.0, 0.0, 1.0, 1.0)
-
-    kml_file = tmp_path / "single_overlay.kml"
-    array2kml(arr, kml_file, bounds, verbose=False)
-    assert kml_file.exists()
-    assert kml_file.with_suffix(".png").exists()
-    assert kml_file.with_name("single_overlay_cbar.png").exists()
-    kml_image = mpimg.imread(kml_file.with_suffix(".png"))
-    assert kml_image.shape[:2] == (20, 20)
-
-    kmz_file = tmp_path / "single_overlay_archive.kmz"
-    array2kmz(arr, kmz_file, bounds, verbose=False)
-    with zipfile.ZipFile(kmz_file) as kmz:
-        names = set(kmz.namelist())
-        kmz_image = mpimg.imread(io.BytesIO(kmz.read("single_overlay_archive.png")))
-
-    assert names == {
-        "single_overlay_archive.kml",
-        "single_overlay_archive.png",
-        "single_overlay_archive_cbar.png",
-    }
-    assert kmz_image.shape[:2] == (20, 20)
-    assert not kmz_file.with_suffix(".kml").exists()
-    assert not kmz_file.with_suffix(".png").exists()
-    assert not kmz_file.with_name("single_overlay_archive_cbar.png").exists()
-
-
-def test_array2kml_render_scale_repeats_source_pixels(tmp_path: Path) -> None:
+def test_array2kmz_render_scale_repeats_source_pixels(tmp_path: Path) -> None:
     """Render scaling should repeat source pixels instead of interpolating them."""
     arr = np.arange(4, dtype=np.float32).reshape(2, 2)
-    out_file = tmp_path / "scaled_overlay.kml"
+    out_file = tmp_path / "scaled_overlay.kmz"
 
-    array2kml(
+    array2kmz(
         arr,
         out_file,
         (0.0, 0.0, 1.0, 1.0),
@@ -455,7 +418,8 @@ def test_array2kml_render_scale_repeats_source_pixels(tmp_path: Path) -> None:
         verbose=False,
     )
 
-    image = mpimg.imread(out_file.with_suffix(".png"))
+    with zipfile.ZipFile(out_file) as kmz:
+        image = mpimg.imread(io.BytesIO(kmz.read("tiles/0/0/0.png")))
 
     assert image.shape[:2] == (6, 6)
     for row_start in range(0, 6, 3):
@@ -464,14 +428,14 @@ def test_array2kml_render_scale_repeats_source_pixels(tmp_path: Path) -> None:
             assert np.all(pixel_block == pixel_block[0, 0])
 
 
-def test_array2kml_render_scale_rejects_non_integer_values(tmp_path: Path) -> None:
+def test_array2kmz_render_scale_rejects_non_integer_values(tmp_path: Path) -> None:
     """Render scaling should only accept integer pixel repeat values."""
     arr = np.arange(4, dtype=np.float32).reshape(2, 2)
 
     with pytest.raises(ValueError, match="positive integer"):
-        array2kml(
+        array2kmz(
             arr,
-            tmp_path / "scaled_overlay.kml",
+            tmp_path / "scaled_overlay.kmz",
             (0.0, 0.0, 1.0, 1.0),
             render_scale=1.5,
             verbose=False,
