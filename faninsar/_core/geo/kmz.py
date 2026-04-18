@@ -1,4 +1,4 @@
-"""KML and KMZ exporters for array-backed geospatial overlays."""
+"""KMZ exporters for array-backed geospatial overlays."""
 
 from __future__ import annotations
 
@@ -878,205 +878,7 @@ def save_colorbar(
     fig.savefig(out_file, bbox_inches="tight", dpi=300)
 
 
-def array2kml(
-    arr: np.ndarray,
-    out_file: PathLike,
-    bounds: tuple[float, float, float, float] | BoundingBox,
-    render_scale: int = 4,
-    img_kwargs: dict | None = None,
-    cbar_kwargs: dict | None = None,
-    verbose: bool = True,
-) -> None:
-    """Write a numpy array into a kml file.
-
-    Parameters
-    ----------
-    arr: numpy.ndarray
-        the numpy array to be written into kml file.
-    out_file: str or Path
-        the path of the kml file.
-    bounds: tuple or BoundingBox
-        the bounds of image in [west, south, east, north] order in WGS84.
-    render_scale : int, optional
-        Positive integer scale factor used to repeat source pixels before
-        rendering, improving pixel-level clarity in Google Earth.
-    img_kwargs: dict
-        the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
-    cbar_kwargs: dict
-        the keyword arguments for :func:`save_colorbar` function, except for
-        the out_file and mappable argument.
-    verbose: bool
-        whether to print the information of the kml file. Default is verbose.
-
-    """
-    if cbar_kwargs is None:
-        cbar_kwargs = {}
-    img_kwargs = _normalize_image_kwargs(img_kwargs, interpolation="nearest")
-    bounds = _normalize_kml_bounds(bounds)
-
-    out_file = Path(out_file)
-    if out_file.suffix != ".kml":
-        out_file = out_file.parent / (out_file.stem + ".kml")
-    img_file = out_file.parent / (out_file.stem + ".png")
-    cbar_file = out_file.parent / (out_file.stem + "_cbar.png")
-
-    fig, mappable, rgba = _render_array_to_rgba(
-        arr,
-        img_kwargs=img_kwargs,
-        render_scale=render_scale,
-    )
-    try:
-        img_file.write_bytes(_rgba_to_png_bytes(rgba))
-        cbar_file.write_bytes(_render_colorbar_to_png_bytes(mappable, **cbar_kwargs))
-    finally:
-        plt.close(fig)
-
-    out_file.write_bytes(
-        _single_overlay_kml_bytes(
-            image_path=img_file.name,
-            colorbar_path=cbar_file.name,
-            image_shape=rgba.shape,
-            bounds=bounds,
-        )
-    )
-    if verbose:
-        info = f"write kml file to {out_file}"
-        logger.info(info)
-
-
-def _single_overlay_kml_bytes(
-    *,
-    image_path: str,
-    colorbar_path: str,
-    image_shape: tuple[int, ...],
-    bounds: BoundingBox,
-) -> bytes:
-    """Build KML bytes for a single ground overlay.
-
-    Parameters
-    ----------
-    image_path : str
-        Relative image path stored in the KMZ archive.
-    colorbar_path : str
-        Relative colorbar image path stored in the KMZ archive.
-    image_shape : tuple[int, ...]
-        Shape of the rendered source array.
-    bounds : BoundingBox
-        WGS84 bounds for the ground overlay.
-
-    Returns
-    -------
-    bytes
-        Pretty-printed KML document bytes.
-
-    """
-    kml_doc = KML.Document()
-    img_overlay = KML.GroundOverlay(
-        KML.Icon(
-            KML.href(image_path),
-            KML.viewBoundScale(1),
-            KML.scale(1),
-            KML.size(
-                x=str(image_shape[1]),
-                y=str(image_shape[0]),
-                xunits="pixels",
-                yunits="pixels",
-            ),
-        ),
-        KML.LatLonBox(
-            KML.north(bounds[3]),
-            KML.south(bounds[1]),
-            KML.east(bounds[2]),
-            KML.west(bounds[0]),
-        ),
-    )
-    kml_doc.append(img_overlay)
-
-    cbar_overlay = KML.ScreenOverlay(
-        KML.name("Color bar"),
-        KML.Icon(KML.href(colorbar_path)),
-        KML.overlayXY(x="1", y="0", xunits="fraction", yunits="fraction"),
-        KML.screenXY(x="1", y="0", xunits="fraction", yunits="fraction"),
-        KML.size(x="0", y="500", xunits="pixel", yunits="pixel"),
-    )
-    kml_doc.append(cbar_overlay)
-
-    return etree.tostring(KML.kml(kml_doc), pretty_print=True)
-
-
-def _array2single_kmz(
-    arr: np.ndarray,
-    out_file: PathLike,
-    bounds: tuple[float, float, float, float] | BoundingBox,
-    render_scale: int = 4,
-    img_kwargs: dict | None = None,
-    cbar_kwargs: dict | None = None,
-    verbose: bool = True,
-) -> None:
-    """Write an array into a single-overlay KMZ file.
-
-    Parameters
-    ----------
-    arr : np.ndarray
-        Array to export as a single image overlay.
-    out_file : PathLike
-        Output KMZ path.
-    bounds : tuple[float, float, float, float] | BoundingBox
-        Bounds of image in ``(west, south, east, north)`` order in WGS84.
-    render_scale : int, optional
-        Positive integer scale factor used to repeat source pixels before
-        rendering, improving pixel-level clarity in Google Earth.
-    img_kwargs : dict | None, optional
-        Keyword arguments for :func:`matplotlib.pyplot.imshow`.
-    cbar_kwargs : dict | None, optional
-        Keyword arguments for :func:`save_colorbar`, excluding ``out_file`` and
-        ``mappable``.
-    verbose : bool, optional
-        Whether to log the output path.
-
-    """
-    img_kwargs = _normalize_image_kwargs(img_kwargs, interpolation="nearest")
-    cbar_kwargs_norm = {} if cbar_kwargs is None else dict(cbar_kwargs)
-    bounds_norm = _normalize_kml_bounds(bounds)
-
-    out_file = Path(out_file)
-    if out_file.suffix != ".kmz":
-        out_file = out_file.parent / (out_file.stem + ".kmz")
-
-    image_path = f"{out_file.stem}.png"
-    colorbar_path = f"{out_file.stem}_cbar.png"
-    kml_path = f"{out_file.stem}.kml"
-
-    fig, mappable, rgba = _render_array_to_rgba(
-        arr,
-        img_kwargs=img_kwargs,
-        render_scale=render_scale,
-    )
-    try:
-        image_png = _rgba_to_png_bytes(rgba)
-        colorbar_png = _render_colorbar_to_png_bytes(mappable, **cbar_kwargs_norm)
-    finally:
-        plt.close(fig)
-
-    with zipfile.ZipFile(out_file, "w", compression=zipfile.ZIP_DEFLATED) as kmz:
-        kmz.writestr(
-            kml_path,
-            _single_overlay_kml_bytes(
-                image_path=image_path,
-                colorbar_path=colorbar_path,
-                image_shape=rgba.shape,
-                bounds=bounds_norm,
-            ),
-        )
-        kmz.writestr(image_path, image_png)
-        kmz.writestr(colorbar_path, colorbar_png)
-
-    if verbose:
-        info = f"write kmz file to {out_file}"
-        logger.info(info)
-
-
-def _array2tiled_kmz(
+def array2kmz(
     arr: np.ndarray,
     out_file: PathLike,
     bounds: tuple[float, float, float, float] | BoundingBox,
@@ -1098,7 +900,7 @@ def _array2tiled_kmz(
         Output KMZ path.
     bounds : tuple[float, float, float, float] | BoundingBox
         Bounds of the image in ``(west, south, east, north)`` order in WGS84.
-    render_scale : float, optional
+    render_scale : int, optional
         Positive integer scale factor used to repeat source pixels before
         rendering, improving pixel-level clarity in Google Earth.
     img_kwargs : dict | None, optional
@@ -1186,117 +988,6 @@ def _array2tiled_kmz(
         logger.info(info)
 
 
-def array2kmz(
-    arr: np.ndarray,
-    out_file: PathLike,
-    bounds: tuple[float, float, float, float] | BoundingBox,
-    render_scale: int = 4,
-    img_kwargs: dict | None = None,
-    cbar_kwargs: dict | None = None,
-    verbose: bool = True,
-    *,
-    tiled: bool = False,
-    tile_size: int = 256,
-    min_lod_pixels: int = 128,
-) -> None:
-    """Write a numpy array into a kmz file.
-
-    Parameters
-    ----------
-    arr: numpy.ndarray
-        the numpy array to be written into kml file.
-    out_file: str or Path
-        the path of the kmz file.
-    bounds: tuple or BoundingBox
-        the bounds of image in [west, south, east, north] order in WGS84
-    render_scale : int, optional
-        Positive integer scale factor used to repeat source pixels before
-        rendering, improving pixel-level clarity in Google Earth.
-    img_kwargs: dict
-        the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
-    cbar_kwargs: dict
-        the keyword arguments for :func:`save_colorbar` function, except for
-        the out_file and mappable argument.
-    verbose: bool
-        whether to print the information of the kmz file. Default is verbose.
-    tiled : bool, optional
-        Whether to write a tiled KMZ SuperOverlay instead of a single overlay.
-    tile_size : int, optional
-        Maximum tile size in pixels. Only used when ``tiled`` is True.
-    min_lod_pixels : int, optional
-        Minimum screen-space threshold used by child ``NetworkLink`` regions.
-        Only used when ``tiled`` is True.
-
-    Raises
-    ------
-    ValueError
-        If any tiling parameter is invalid.
-
-    """
-    if tiled:
-        _array2tiled_kmz(
-            arr,
-            out_file,
-            bounds,
-            render_scale=render_scale,
-            img_kwargs=img_kwargs,
-            cbar_kwargs=cbar_kwargs,
-            tile_size=tile_size,
-            min_lod_pixels=min_lod_pixels,
-            verbose=verbose,
-        )
-        return
-
-    _array2single_kmz(
-        arr,
-        out_file,
-        bounds,
-        render_scale=render_scale,
-        img_kwargs=img_kwargs,
-        cbar_kwargs=cbar_kwargs,
-        verbose=verbose,
-    )
-
-
-def dataarray2kml(
-    data_array: xr.DataArray,
-    out_file: PathLike,
-    render_scale: int = 4,
-    img_kwargs: dict | None = None,
-    cbar_kwargs: dict | None = None,
-    verbose: bool = True,
-) -> None:
-    """Write an xarray DataArray into a KML file.
-
-    Parameters
-    ----------
-    data_array : xarray.DataArray
-        Data array with rioxarray CRS and spatial dimension metadata. The array
-        is automatically reprojected to WGS84 before export when needed.
-    out_file : str or PathLike
-        Path of the KML file.
-    render_scale : int, optional
-        Positive integer scale factor used to repeat source pixels before
-        rendering, improving pixel-level clarity in Google Earth.
-    img_kwargs : dict | None, optional
-        Keyword arguments for :func:`matplotlib.pyplot.imshow`.
-    cbar_kwargs : dict | None, optional
-        Keyword arguments for :func:`save_colorbar`, excluding ``out_file`` and
-        ``mappable``.
-    verbose : bool, optional
-        Whether to log the output path.
-
-    Raises
-    ------
-    ValueError
-        If ``data_array`` does not have rioxarray CRS or spatial dimension
-        metadata.
-
-    """
-    arr, bounds = _dataarray_to_wgs84_array_and_bounds(data_array)
-    array2kml(arr, out_file, bounds, render_scale, img_kwargs, cbar_kwargs, verbose)
-
-
 def dataarray2kmz(
     data_array: xr.DataArray,
     out_file: PathLike,
@@ -1304,8 +995,6 @@ def dataarray2kmz(
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
     verbose: bool = True,
-    *,
-    tiled: bool = False,
     tile_size: int = 256,
     min_lod_pixels: int = 128,
 ) -> None:
@@ -1328,13 +1017,10 @@ def dataarray2kmz(
         ``mappable``.
     verbose : bool, optional
         Whether to log the output path.
-    tiled : bool, optional
-        Whether to write a tiled KMZ SuperOverlay instead of a single overlay.
     tile_size : int, optional
-        Maximum tile size in pixels. Only used when ``tiled`` is True.
+        Maximum tile size in pixels.
     min_lod_pixels : int, optional
         Minimum screen-space threshold used by child ``NetworkLink`` regions.
-        Only used when ``tiled`` is True.
 
     Raises
     ------
@@ -1352,7 +1038,6 @@ def dataarray2kmz(
         img_kwargs=img_kwargs,
         cbar_kwargs=cbar_kwargs,
         verbose=verbose,
-        tiled=tiled,
         tile_size=tile_size,
         min_lod_pixels=min_lod_pixels,
     )

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import xarray as xr
 
-from faninsar._core.geo.kml import dataarray2kml, dataarray2kmz
+from faninsar._core.geo.kmz import dataarray2kmz
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -31,47 +31,6 @@ class FanInSARDataArrayAccessor:
     def __init__(self, data_array: xr.DataArray) -> None:
         self.data_array = data_array
 
-    def to_kml(
-        self,
-        out_file: PathLike,
-        render_scale: int = 4,
-        img_kwargs: dict[str, Any] | None = None,
-        cbar_kwargs: dict[str, Any] | None = None,
-        verbose: bool = True,
-    ) -> None:
-        """Write the data array into a KML file.
-
-        Parameters
-        ----------
-        out_file : str or PathLike
-            Path of the KML file.
-        render_scale : int, optional
-            Positive integer scale factor used to repeat source pixels before
-            rendering, improving pixel-level clarity in Google Earth.
-        img_kwargs : dict[str, Any] | None, optional
-            Keyword arguments for :func:`matplotlib.pyplot.imshow`.
-        cbar_kwargs : dict[str, Any] | None, optional
-            Keyword arguments for :func:`faninsar._core.geo.save_colorbar`,
-            excluding ``out_file`` and ``mappable``.
-        verbose : bool, optional
-            Whether to log the output path.
-
-        Raises
-        ------
-        ValueError
-            If the data array does not have rioxarray CRS or spatial dimension
-            metadata.
-
-        """
-        dataarray2kml(
-            self.data_array,
-            out_file,
-            render_scale=render_scale,
-            img_kwargs=img_kwargs,
-            cbar_kwargs=cbar_kwargs,
-            verbose=verbose,
-        )
-
     def to_kmz(
         self,
         out_file: PathLike,
@@ -80,7 +39,6 @@ class FanInSARDataArrayAccessor:
         cbar_kwargs: dict[str, Any] | None = None,
         verbose: bool = True,
         *,
-        tiled: bool = False,
         tile_size: int = 256,
         min_lod_pixels: int = 128,
     ) -> None:
@@ -100,14 +58,11 @@ class FanInSARDataArrayAccessor:
             excluding ``out_file`` and ``mappable``.
         verbose : bool, optional
             Whether to log the output path.
-        tiled : bool, optional
-            Whether to write a tiled KMZ SuperOverlay instead of a single
-            overlay.
         tile_size : int, optional
-            Maximum tile size in pixels. Only used when ``tiled`` is True.
+            Maximum tile size in pixels.
         min_lod_pixels : int, optional
             Minimum screen-space threshold used by child ``NetworkLink``
-            regions. Only used when ``tiled`` is True.
+            regions.
 
         Raises
         ------
@@ -123,7 +78,6 @@ class FanInSARDataArrayAccessor:
             img_kwargs=img_kwargs,
             cbar_kwargs=cbar_kwargs,
             verbose=verbose,
-            tiled=tiled,
             tile_size=tile_size,
             min_lod_pixels=min_lod_pixels,
         )

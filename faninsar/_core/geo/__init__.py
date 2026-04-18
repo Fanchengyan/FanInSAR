@@ -11,7 +11,7 @@ from .coordinates import (
     xy_from_transform,
 )
 from .grids import GeoGrid, GeoGridMixin, format_bounds_and_crs
-from .kml import array2kml, array2kmz, dataarray2kml, dataarray2kmz, save_colorbar
+from .kmz import array2kmz, dataarray2kmz, save_colorbar
 from .profiles import Profile
 from .raster_ops import match_to_raster
 from .xarray_io import write_geoinfo_into_ds, write_geoinfo_into_nc
@@ -21,10 +21,8 @@ __all__ = [
     "GeoGrid",
     "GeoGridMixin",
     "Profile",
-    "array2kml",
     "array2kmz",
     "bounds_from_xy",
-    "dataarray2kml",
     "dataarray2kmz",
     "format_bounds_and_crs",
     "geoinfo_from_xy",

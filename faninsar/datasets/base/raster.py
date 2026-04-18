@@ -28,7 +28,6 @@ from tqdm import tqdm
 from faninsar._core.geo import (
     GeoGrid,
     Profile,
-    array2kml,
     array2kmz,
     bounds_from_xy,
     write_geoinfo_into_ds,
@@ -2683,71 +2682,6 @@ class RasterDataset(GeoDataset):
                 with band_names_file.open("w") as f:
                     f.write(band_names_str)
 
-    def array2kml(
-        self,
-        arr: np.ndarray,
-        out_file: PathLike,
-        bounds: BoundingBox | None = None,
-        render_scale: int = 4,
-        img_kwargs: dict | None = None,
-        cbar_kwargs: dict | None = None,
-        verbose: bool = True,
-    ) -> None:
-        """Write a numpy array into a kml file.
-
-        Parameters
-        ----------
-        arr: numpy.ndarray
-            the numpy array to be written into kml file.
-        out_file: str or PathLike
-            the path of the kml file.
-        bounds : BoundingBox, optional
-            the bounds of the arr. Default is None, which means the roi of the
-            dataset will be used.
-        render_scale : int, optional
-            Positive integer scale factor used to repeat source pixels before
-            rendering, improving pixel-level clarity in Google Earth.
-        img_kwargs: dict
-            the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
-        cbar_kwargs: dict
-            the keyword arguments for :func:`save_colorbar` function, except for
-            the out_file and mappable argument.
-        verbose: bool
-            whether to print the information of the kml file. Default is verbose.
-
-        """
-        if cbar_kwargs is None:
-            cbar_kwargs = {}
-        if img_kwargs is None:
-            img_kwargs = {}
-        if bounds is None:
-            bounds = self.roi
-
-        wgs84 = CRS.from_epsg(4326)
-        if self.crs != wgs84:
-            profile = self.get_profile(bounds)
-            x, y = profile.get_xy()
-            dtype = get_minimum_dtype(arr)
-            nodata = get_nodata(arr, None, dtype)
-
-            da = xr.DataArray(arr, coords=[y, x], dims=["y", "x"])
-            da.rio.set_spatial_dims("x", "y", inplace=True)
-            da.rio.write_crs(self.crs, inplace=True)
-            da = da.rio.reproject(wgs84, nodata=nodata)
-            # update arr and bounds
-            arr = da.values
-            bounds = bounds_from_xy(da.x, da.y)
-
-        array2kml(
-            arr,
-            out_file,
-            bounds,
-            render_scale,
-            img_kwargs,
-            cbar_kwargs,
-            verbose,
-        )
-
     def array2kmz(
         self,
         arr: np.ndarray,
@@ -2758,7 +2692,6 @@ class RasterDataset(GeoDataset):
         cbar_kwargs: dict | None = None,
         verbose: bool = True,
         *,
-        tiled: bool = False,
         tile_size: int = 256,
         min_lod_pixels: int = 128,
     ) -> None:
@@ -2773,7 +2706,7 @@ class RasterDataset(GeoDataset):
         bounds : BoundingBox, optional
             the bounds of the arr. Default is None, which means the roi of the
             dataset will be used.
-        render_scale : float, optional
+        render_scale : int, optional
             Positive integer scale factor used to repeat source pixels before
             rendering, improving pixel-level clarity in Google Earth.
         img_kwargs: dict
@@ -2783,13 +2716,10 @@ class RasterDataset(GeoDataset):
             the out_file and mappable argument.
         verbose: bool
             whether to print the information of the kmz file. Default is verbose.
-        tiled : bool, optional
-            Whether to write a tiled KMZ SuperOverlay instead of a single overlay.
         tile_size : int, optional
-            Maximum tile size in pixels. Only used when ``tiled`` is True.
+            Maximum tile size in pixels.
         min_lod_pixels : int, optional
-            Minimum LOD threshold used by child regions. Only used when
-            ``tiled`` is True.
+            Minimum LOD threshold used by child regions.
 
         """
         if cbar_kwargs is None:
@@ -2821,7 +2751,6 @@ class RasterDataset(GeoDataset):
             img_kwargs=img_kwargs,
             cbar_kwargs=cbar_kwargs,
             verbose=verbose,
-            tiled=tiled,
             tile_size=tile_size,
             min_lod_pixels=min_lod_pixels,
         )
