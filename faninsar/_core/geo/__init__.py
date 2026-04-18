@@ -14,11 +14,9 @@ from .grids import GeoGrid, GeoGridMixin, format_bounds_and_crs
 from .kml import array2kml, array2kmz, dataarray2kml, dataarray2kmz, save_colorbar
 from .profiles import Profile
 from .raster_ops import match_to_raster
-from .xarray_accessors import FanInSARDataArrayAccessor
 from .xarray_io import write_geoinfo_into_ds, write_geoinfo_into_nc
 
 __all__ = [
-    "FanInSARDataArrayAccessor",
     "GeoDataFormatConverter",
     "GeoGrid",
     "GeoGridMixin",

@@ -440,3 +440,39 @@ def test_array2kml_and_array2kmz_regression(tmp_path: Path) -> None:
     assert not kmz_file.with_suffix(".kml").exists()
     assert not kmz_file.with_suffix(".png").exists()
     assert not kmz_file.with_name("single_overlay_archive_cbar.png").exists()
+
+
+def test_array2kml_render_scale_repeats_source_pixels(tmp_path: Path) -> None:
+    """Render scaling should repeat source pixels instead of interpolating them."""
+    arr = np.arange(4, dtype=np.float32).reshape(2, 2)
+    out_file = tmp_path / "scaled_overlay.kml"
+
+    array2kml(
+        arr,
+        out_file,
+        (0.0, 0.0, 1.0, 1.0),
+        render_scale=3,
+        verbose=False,
+    )
+
+    image = mpimg.imread(out_file.with_suffix(".png"))
+
+    assert image.shape[:2] == (6, 6)
+    for row_start in range(0, 6, 3):
+        for col_start in range(0, 6, 3):
+            pixel_block = image[row_start : row_start + 3, col_start : col_start + 3]
+            assert np.all(pixel_block == pixel_block[0, 0])
+
+
+def test_array2kml_render_scale_rejects_non_integer_values(tmp_path: Path) -> None:
+    """Render scaling should only accept integer pixel repeat values."""
+    arr = np.arange(4, dtype=np.float32).reshape(2, 2)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        array2kml(
+            arr,
+            tmp_path / "scaled_overlay.kml",
+            (0.0, 0.0, 1.0, 1.0),
+            render_scale=1.5,
+            verbose=False,
+        )

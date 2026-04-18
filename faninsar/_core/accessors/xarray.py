@@ -1,4 +1,4 @@
-"""Xarray accessors for geospatial export helpers."""
+"""Xarray accessor registrations."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import xarray as xr
 
-from .kml import dataarray2kml, dataarray2kmz
+from faninsar._core.geo.kml import dataarray2kml, dataarray2kmz
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -34,7 +34,7 @@ class FanInSARDataArrayAccessor:
     def to_kml(
         self,
         out_file: PathLike,
-        render_scale: float = 4.0,
+        render_scale: int = 4,
         img_kwargs: dict[str, Any] | None = None,
         cbar_kwargs: dict[str, Any] | None = None,
         verbose: bool = True,
@@ -45,9 +45,9 @@ class FanInSARDataArrayAccessor:
         ----------
         out_file : str or PathLike
             Path of the KML file.
-        render_scale : float, optional
-            Scale factor applied to the rendered image size. Increasing this
-            value helps reduce blurry pixel rendering in Google Earth.
+        render_scale : int, optional
+            Positive integer scale factor used to repeat source pixels before
+            rendering, improving pixel-level clarity in Google Earth.
         img_kwargs : dict[str, Any] | None, optional
             Keyword arguments for :func:`matplotlib.pyplot.imshow`.
         cbar_kwargs : dict[str, Any] | None, optional
@@ -75,7 +75,7 @@ class FanInSARDataArrayAccessor:
     def to_kmz(
         self,
         out_file: PathLike,
-        render_scale: float = 4.0,
+        render_scale: int = 4,
         img_kwargs: dict[str, Any] | None = None,
         cbar_kwargs: dict[str, Any] | None = None,
         verbose: bool = True,
@@ -90,9 +90,9 @@ class FanInSARDataArrayAccessor:
         ----------
         out_file : str or PathLike
             Path of the KMZ file.
-        render_scale : float, optional
-            Scale factor applied to the rendered image size. Increasing this
-            value helps reduce blurry pixel rendering in Google Earth.
+        render_scale : int, optional
+            Positive integer scale factor used to repeat source pixels before
+            rendering, improving pixel-level clarity in Google Earth.
         img_kwargs : dict[str, Any] | None, optional
             Keyword arguments for :func:`matplotlib.pyplot.imshow`.
         cbar_kwargs : dict[str, Any] | None, optional

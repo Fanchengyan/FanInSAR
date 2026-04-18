@@ -124,6 +124,67 @@ def _normalize_image_kwargs(
     return img_kwargs_new
 
 
+def _validate_render_scale(render_scale: int) -> int:
+    """Validate and normalize a render scale value.
+
+    Parameters
+    ----------
+    render_scale : int
+        Pixel repeat scale used before rendering.
+
+    Returns
+    -------
+    int
+        Render scale as a positive integer.
+
+    Raises
+    ------
+        If ``render_scale`` is not a positive integer value.
+
+    """
+    if render_scale <= 0:
+        msg = f"render_scale should be positive, but got {render_scale}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    if not float(render_scale).is_integer():
+        msg = (
+            "render_scale should be a positive integer value when source pixels "
+            f"are repeated, but got {render_scale}"
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+
+    return int(render_scale)
+
+
+def _repeat_source_pixels(arr: np.ndarray, render_scale: int) -> np.ndarray:
+    """Repeat source pixels before rendering.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Source array with spatial dimensions on the first two axes.
+    render_scale : int
+        Positive integer pixel repeat scale.
+
+    Returns
+    -------
+    np.ndarray
+        Array with repeated source pixels.
+
+    Raises
+    ------
+    ValueError
+        If ``render_scale`` is not a positive integer value.
+
+    """
+    scale = _validate_render_scale(render_scale)
+    if scale == 1:
+        return arr
+    return np.repeat(np.repeat(arr, scale, axis=0), scale, axis=1)
+
+
 def _get_dataarray_spatial_dimensions(data_array: xr.DataArray) -> tuple[str, str]:
     """Get rioxarray spatial dimension names from a data array.
 
@@ -213,7 +274,7 @@ def _render_array_to_rgba(
     arr: np.ndarray,
     *,
     img_kwargs: dict[str, Any] | None = None,
-    render_scale: float = 1.0,
+    render_scale: int = 4,
 ) -> tuple[Figure, ScalarMappable, np.ndarray]:
     """Render an array to an exact-pixel RGBA image.
 
@@ -223,9 +284,9 @@ def _render_array_to_rgba(
         Array to render with :func:`matplotlib.axes.Axes.imshow`.
     img_kwargs : dict[str, Any] | None, optional
         Keyword arguments for :func:`matplotlib.axes.Axes.imshow`.
-    render_scale : float, optional
-        Scale factor applied to the rendered image size. Increasing this value
-        helps reduce blurry pixel rendering in Google Earth.
+    render_scale : int, optional
+        Positive integer scale factor used to repeat source pixels before
+        rendering, improving pixel-level clarity in Google Earth.
 
     Returns
     -------
@@ -236,21 +297,16 @@ def _render_array_to_rgba(
     Raises
     ------
     ValueError
-        If ``render_scale`` is not positive.
+        If ``render_scale`` is not a positive integer value.
 
     """
-    if render_scale <= 0:
-        msg = f"render_scale should be positive, but got {render_scale}"
-        logger.error(msg)
-        raise ValueError(msg)
-
     if arr.ndim < 2:
         msg = f"arr should have at least 2 dimensions, but got shape {arr.shape}"
         logger.error(msg)
         raise ValueError(msg)
 
-    render_height = max(1, round(arr.shape[0] * render_scale))
-    render_width = max(1, round(arr.shape[1] * render_scale))
+    arr = _repeat_source_pixels(arr, render_scale)
+    render_height, render_width = arr.shape[:2]
     dpi = 100
 
     fig = Figure(
@@ -826,7 +882,7 @@ def array2kml(
     arr: np.ndarray,
     out_file: PathLike,
     bounds: tuple[float, float, float, float] | BoundingBox,
-    render_scale: float = 4.0,
+    render_scale: int = 4,
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
     verbose: bool = True,
@@ -841,9 +897,9 @@ def array2kml(
         the path of the kml file.
     bounds: tuple or BoundingBox
         the bounds of image in [west, south, east, north] order in WGS84.
-    render_scale : float, optional
-        Scale factor applied to the rendered image size. Increasing this value
-        helps reduce blurry pixel rendering in Google Earth.
+    render_scale : int, optional
+        Positive integer scale factor used to repeat source pixels before
+        rendering, improving pixel-level clarity in Google Earth.
     img_kwargs: dict
         the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
     cbar_kwargs: dict
@@ -855,7 +911,7 @@ def array2kml(
     """
     if cbar_kwargs is None:
         cbar_kwargs = {}
-    img_kwargs = _normalize_image_kwargs(img_kwargs, interpolation="lanczos")
+    img_kwargs = _normalize_image_kwargs(img_kwargs, interpolation="nearest")
     bounds = _normalize_kml_bounds(bounds)
 
     out_file = Path(out_file)
@@ -952,7 +1008,7 @@ def _array2single_kmz(
     arr: np.ndarray,
     out_file: PathLike,
     bounds: tuple[float, float, float, float] | BoundingBox,
-    render_scale: float = 4.0,
+    render_scale: int = 4,
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
     verbose: bool = True,
@@ -967,9 +1023,9 @@ def _array2single_kmz(
         Output KMZ path.
     bounds : tuple[float, float, float, float] | BoundingBox
         Bounds of image in ``(west, south, east, north)`` order in WGS84.
-    render_scale : float, optional
-        Scale factor applied to the rendered image size. Increasing this value
-        helps reduce blurry pixel rendering in Google Earth.
+    render_scale : int, optional
+        Positive integer scale factor used to repeat source pixels before
+        rendering, improving pixel-level clarity in Google Earth.
     img_kwargs : dict | None, optional
         Keyword arguments for :func:`matplotlib.pyplot.imshow`.
     cbar_kwargs : dict | None, optional
@@ -979,7 +1035,7 @@ def _array2single_kmz(
         Whether to log the output path.
 
     """
-    img_kwargs = _normalize_image_kwargs(img_kwargs, interpolation="lanczos")
+    img_kwargs = _normalize_image_kwargs(img_kwargs, interpolation="nearest")
     cbar_kwargs_norm = {} if cbar_kwargs is None else dict(cbar_kwargs)
     bounds_norm = _normalize_kml_bounds(bounds)
 
@@ -1024,7 +1080,7 @@ def _array2tiled_kmz(
     arr: np.ndarray,
     out_file: PathLike,
     bounds: tuple[float, float, float, float] | BoundingBox,
-    render_scale: float = 1.0,
+    render_scale: int = 4,
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
     *,
@@ -1043,8 +1099,8 @@ def _array2tiled_kmz(
     bounds : tuple[float, float, float, float] | BoundingBox
         Bounds of the image in ``(west, south, east, north)`` order in WGS84.
     render_scale : float, optional
-        Scale factor applied to the rendered image size. Increasing this value
-        helps reduce blurry pixel rendering in Google Earth.
+        Positive integer scale factor used to repeat source pixels before
+        rendering, improving pixel-level clarity in Google Earth.
     img_kwargs : dict | None, optional
         Keyword arguments forwarded to :func:`matplotlib.axes.Axes.imshow`.
     cbar_kwargs : dict | None, optional
@@ -1134,7 +1190,7 @@ def array2kmz(
     arr: np.ndarray,
     out_file: PathLike,
     bounds: tuple[float, float, float, float] | BoundingBox,
-    render_scale: float = 4.0,
+    render_scale: int = 4,
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
     verbose: bool = True,
@@ -1153,9 +1209,9 @@ def array2kmz(
         the path of the kmz file.
     bounds: tuple or BoundingBox
         the bounds of image in [west, south, east, north] order in WGS84
-    render_scale : float, optional
-        Scale factor applied to the rendered image size. Increasing this value
-        helps reduce blurry pixel rendering in Google Earth.
+    render_scale : int, optional
+        Positive integer scale factor used to repeat source pixels before
+        rendering, improving pixel-level clarity in Google Earth.
     img_kwargs: dict
         the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
     cbar_kwargs: dict
@@ -1205,7 +1261,7 @@ def array2kmz(
 def dataarray2kml(
     data_array: xr.DataArray,
     out_file: PathLike,
-    render_scale: float = 4.0,
+    render_scale: int = 4,
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
     verbose: bool = True,
@@ -1219,9 +1275,9 @@ def dataarray2kml(
         is automatically reprojected to WGS84 before export when needed.
     out_file : str or PathLike
         Path of the KML file.
-    render_scale : float, optional
-        Scale factor applied to the rendered image size. Increasing this value
-        helps reduce blurry pixel rendering in Google Earth.
+    render_scale : int, optional
+        Positive integer scale factor used to repeat source pixels before
+        rendering, improving pixel-level clarity in Google Earth.
     img_kwargs : dict | None, optional
         Keyword arguments for :func:`matplotlib.pyplot.imshow`.
     cbar_kwargs : dict | None, optional
@@ -1244,7 +1300,7 @@ def dataarray2kml(
 def dataarray2kmz(
     data_array: xr.DataArray,
     out_file: PathLike,
-    render_scale: float = 4.0,
+    render_scale: int = 4,
     img_kwargs: dict | None = None,
     cbar_kwargs: dict | None = None,
     verbose: bool = True,
@@ -1262,9 +1318,9 @@ def dataarray2kmz(
         is automatically reprojected to WGS84 before export when needed.
     out_file : str or PathLike
         Path of the KMZ file.
-    render_scale : float, optional
-        Scale factor applied to the rendered image size. Increasing this value
-        helps reduce blurry pixel rendering in Google Earth.
+    render_scale : int, optional
+        Positive integer scale factor used to repeat source pixels before
+        rendering, improving pixel-level clarity in Google Earth.
     img_kwargs : dict | None, optional
         Keyword arguments for :func:`matplotlib.pyplot.imshow`.
     cbar_kwargs : dict | None, optional
