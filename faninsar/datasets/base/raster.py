@@ -2688,6 +2688,7 @@ class RasterDataset(GeoDataset):
         arr: np.ndarray,
         out_file: PathLike,
         bounds: BoundingBox | None = None,
+        render_scale: float = 4.0,
         img_kwargs: dict | None = None,
         cbar_kwargs: dict | None = None,
         verbose: bool = True,
@@ -2703,6 +2704,9 @@ class RasterDataset(GeoDataset):
         bounds : BoundingBox, optional
             the bounds of the arr. Default is None, which means the roi of the
             dataset will be used.
+        render_scale : float, optional
+            Scale factor applied to the rendered image size. Increasing this
+            value helps reduce blurry pixel rendering in Google Earth.
         img_kwargs: dict
             the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
         cbar_kwargs: dict
@@ -2734,13 +2738,22 @@ class RasterDataset(GeoDataset):
             arr = da.values
             bounds = bounds_from_xy(da.x, da.y)
 
-        array2kml(arr, out_file, bounds, img_kwargs, cbar_kwargs, verbose)
+        array2kml(
+            arr,
+            out_file,
+            bounds,
+            render_scale,
+            img_kwargs,
+            cbar_kwargs,
+            verbose,
+        )
 
     def array2kmz(
         self,
         arr: np.ndarray,
         out_file: PathLike,
         bounds: BoundingBox | None = None,
+        render_scale: float = 4.0,
         img_kwargs: dict | None = None,
         cbar_kwargs: dict | None = None,
         verbose: bool = True,
@@ -2748,7 +2761,6 @@ class RasterDataset(GeoDataset):
         tiled: bool = False,
         tile_size: int = 256,
         min_lod_pixels: int = 128,
-        render_scale: float = 1.0,
     ) -> None:
         """Write a numpy array into a kmz file.
 
@@ -2761,6 +2773,9 @@ class RasterDataset(GeoDataset):
         bounds : BoundingBox, optional
             the bounds of the arr. Default is None, which means the roi of the
             dataset will be used.
+        render_scale : float, optional
+            Scale factor applied to the rendered image size. Increasing this
+            value helps reduce blurry pixel rendering in Google Earth.
         img_kwargs: dict
             the keyword arguments for :func:`matplotlib.pyplot.imshow` function.
         cbar_kwargs: dict
@@ -2775,10 +2790,6 @@ class RasterDataset(GeoDataset):
         min_lod_pixels : int, optional
             Minimum LOD threshold used by child regions. Only used when
             ``tiled`` is True.
-        render_scale : float, optional
-            Scale factor applied to the rendered overlay size before tiling.
-            Only used when ``tiled`` is True.
-
         """
         if cbar_kwargs is None:
             cbar_kwargs = {}
@@ -2805,13 +2816,13 @@ class RasterDataset(GeoDataset):
             arr,
             out_file,
             bounds,
-            img_kwargs,
-            cbar_kwargs,
-            verbose,
+            render_scale,
+            img_kwargs=img_kwargs,
+            cbar_kwargs=cbar_kwargs,
+            verbose=verbose,
             tiled=tiled,
             tile_size=tile_size,
             min_lod_pixels=min_lod_pixels,
-            render_scale=render_scale,
         )
 
     def array2tiled_kmz(
@@ -2846,7 +2857,8 @@ class RasterDataset(GeoDataset):
         min_lod_pixels : int, optional
             Minimum LOD threshold used by child regions.
         render_scale : float, optional
-            Scale factor applied to the rendered overlay size before tiling.
+            Scale factor applied to the rendered image size. Increasing this
+            value helps reduce blurry pixel rendering in Google Earth.
         verbose : bool, optional
             Whether to log the output path.
 
@@ -2857,12 +2869,12 @@ class RasterDataset(GeoDataset):
         self.array2kmz(
             arr,
             out_file,
-            bounds,
-            img_kwargs,
-            cbar_kwargs,
+            bounds=bounds,
+            render_scale=render_scale,
+            img_kwargs=img_kwargs,
+            cbar_kwargs=cbar_kwargs,
             verbose=verbose,
             tiled=True,
             tile_size=tile_size,
             min_lod_pixels=min_lod_pixels,
-            render_scale=render_scale,
         )

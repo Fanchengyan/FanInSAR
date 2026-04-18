@@ -1,6 +1,8 @@
+import io
 import zipfile
 from pathlib import Path
 
+import matplotlib.image as mpimg
 import numpy as np
 import pytest
 import rasterio
@@ -287,6 +289,7 @@ def test_array2kmz_tiled_writes_multilevel_kmz(tmp_path: Path) -> None:
         out_file,
         bounds,
         cbar_kwargs={"label": "Velocity"},
+        render_scale=1,
         verbose=False,
         tiled=True,
     )
@@ -338,7 +341,14 @@ def test_array2kmz_tiled_writes_single_level_kmz(tmp_path: Path) -> None:
     arr = np.arange(80 * 64, dtype=np.float32).reshape(64, 80)
     out_file = tmp_path / "single_level_tiled_kmz.kmz"
 
-    array2kmz(arr, out_file, (0.0, 0.0, 1.0, 1.0), verbose=False, tiled=True)
+    array2kmz(
+        arr,
+        out_file,
+        (0.0, 0.0, 1.0, 1.0),
+        render_scale=1,
+        verbose=False,
+        tiled=True,
+    )
 
     with zipfile.ZipFile(out_file) as kmz:
         names = set(kmz.namelist())
@@ -392,7 +402,7 @@ def test_dataarray_fis_accessor_writes_kmz(tmp_path: Path) -> None:
     data_array = _spatial_dataarray()
     out_file = tmp_path / "accessor_overlay.kmz"
 
-    data_array.fis.to_kmz(out_file, verbose=False, tiled=True)
+    data_array.fis.to_kmz(out_file, render_scale=1, verbose=False, tiled=True)
 
     with zipfile.ZipFile(out_file) as kmz:
         names = set(kmz.namelist())
@@ -412,17 +422,21 @@ def test_array2kml_and_array2kmz_regression(tmp_path: Path) -> None:
     assert kml_file.exists()
     assert kml_file.with_suffix(".png").exists()
     assert kml_file.with_name("single_overlay_cbar.png").exists()
+    kml_image = mpimg.imread(kml_file.with_suffix(".png"))
+    assert kml_image.shape[:2] == (20, 20)
 
     kmz_file = tmp_path / "single_overlay_archive.kmz"
     array2kmz(arr, kmz_file, bounds, verbose=False)
     with zipfile.ZipFile(kmz_file) as kmz:
         names = set(kmz.namelist())
+        kmz_image = mpimg.imread(io.BytesIO(kmz.read("single_overlay_archive.png")))
 
     assert names == {
         "single_overlay_archive.kml",
         "single_overlay_archive.png",
         "single_overlay_archive_cbar.png",
     }
+    assert kmz_image.shape[:2] == (20, 20)
     assert not kmz_file.with_suffix(".kml").exists()
     assert not kmz_file.with_suffix(".png").exists()
     assert not kmz_file.with_name("single_overlay_archive_cbar.png").exists()
