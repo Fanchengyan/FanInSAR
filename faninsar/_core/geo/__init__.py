@@ -14,7 +14,6 @@ from .grids import GeoGrid, GeoGridMixin, format_bounds_and_crs
 from .kmz import array2kmz, dataarray2kmz, save_colorbar
 from .profiles import Profile
 from .raster_ops import match_to_raster
-from .xarray_io import write_geoinfo_into_ds, write_geoinfo_into_nc
 
 __all__ = [
     "GeoDataFormatConverter",
@@ -29,8 +28,6 @@ __all__ = [
     "match_to_raster",
     "save_colorbar",
     "transform_from_xy",
-    "write_geoinfo_into_ds",
-    "write_geoinfo_into_nc",
     "xy_from_profile",
     "xy_from_transform",
 ]

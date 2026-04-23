@@ -17,8 +17,6 @@ from .geo import (
     match_to_raster,
     save_colorbar,
     transform_from_xy,
-    write_geoinfo_into_ds,
-    write_geoinfo_into_nc,
     xy_from_profile,
 )
 from .sar import (

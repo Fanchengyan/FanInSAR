@@ -13,7 +13,6 @@ import xarray as xr
 from rasterio.enums import Resampling
 from tqdm import tqdm
 
-from faninsar._core.geo import write_geoinfo_into_ds
 from faninsar._core.sar import Pairs
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points
@@ -623,9 +622,12 @@ class InterferogramDataset(PairDataset):
             },
         )
 
-        ds = write_geoinfo_into_ds(
-            ds,
-            ["unw", "coh"],
+        ds["unw"] = ds["unw"].fis.set_spatial_ref(
+            crs=self.crs,
+            x_dim="x",
+            y_dim="y",
+        )
+        ds["coh"] = ds["coh"].fis.set_spatial_ref(
             crs=self.crs,
             x_dim="x",
             y_dim="y",

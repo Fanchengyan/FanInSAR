@@ -30,7 +30,6 @@ from faninsar._core.geo import (
     Profile,
     array2kmz,
     bounds_from_xy,
-    write_geoinfo_into_ds,
     xy_from_transform,
 )
 from faninsar.backends import LazyMultiFileReader
@@ -1316,7 +1315,11 @@ class RasterDataset(GeoDataset):
                     ),
                 },
             )
-            ds = write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
+            ds["data"] = ds["data"].fis.set_spatial_ref(
+                crs=self.crs,
+                x_dim="x",
+                y_dim="y",
+            )
             return xr.DataTree(dataset=ds, name="boxes")
 
         # List input (even single element) -> groups "bbox_0", "bbox_1", ...
@@ -1467,7 +1470,11 @@ class RasterDataset(GeoDataset):
                     "query_repr": f"Polygon(crs={self.crs})",
                 },
             )
-            ds = write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
+            ds["data"] = ds["data"].fis.set_spatial_ref(
+                crs=self.crs,
+                x_dim="x",
+                y_dim="y",
+            )
 
             child_name = f"polygon_{i}"
             children[child_name] = xr.DataTree(dataset=ds, name=child_name)
@@ -1577,7 +1584,12 @@ class RasterDataset(GeoDataset):
                 ")"
             ),
         })
-        return write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
+        ds["data"] = ds["data"].fis.set_spatial_ref(
+            crs=self.crs,
+            x_dim="x",
+            y_dim="y",
+        )
+        return ds
 
     def _make_bbox_da(
         self,
@@ -1687,7 +1699,11 @@ class RasterDataset(GeoDataset):
                 }),
                 "query_repr": f"Polygon(crs={self.crs})",
             })
-            ds = write_geoinfo_into_ds(ds, "data", self.crs, "x", "y")
+            ds["data"] = ds["data"].fis.set_spatial_ref(
+                crs=self.crs,
+                x_dim="x",
+                y_dim="y",
+            )
             polygon_dataset = ds
         else:
             # create per-file children with their own coords
@@ -1712,7 +1728,11 @@ class RasterDataset(GeoDataset):
                         "nodata": self.nodata,
                     },
                 )
-                fds = write_geoinfo_into_ds(fds, "data", self.crs, "x", "y")
+                fds["data"] = fds["data"].fis.set_spatial_ref(
+                    crs=self.crs,
+                    x_dim="x",
+                    y_dim="y",
+                )
                 scalar_coords: dict[str, Any] = {}
                 for key, (_, values) in file_coords.items():
                     scalar_coords[key] = values[fidx]
@@ -2583,9 +2603,7 @@ class RasterDataset(GeoDataset):
                 "x": x,
             },
         )
-        ds = write_geoinfo_into_ds(
-            ds,
-            "image",
+        ds["image"] = ds["image"].fis.set_spatial_ref(
             crs=self.crs,
             x_dim="x",
             y_dim="y",
