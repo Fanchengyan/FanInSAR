@@ -1,8 +1,7 @@
-"""A module for handling points query."""
+"""Utilities for handling spatial point queries."""
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Iterator, Sequence
 from collections.abc import Sequence as SequenceABC
 from typing import TYPE_CHECKING
@@ -93,7 +92,7 @@ class Points:
     """
 
     _values: np.ndarray
-    _crs: CRS | str | None
+    _crs: CRS | None
 
     __slots__ = ["_crs", "_values"]
 
@@ -124,8 +123,10 @@ class Points:
             If the shape of the points is not (n, 2).
 
         """
+        self._crs = None
         self._values = np.asarray(points, dtype=dtype)
-        self._crs = crs
+        if crs is not None:
+            self.set_crs(crs)
         if self._values.ndim == 1:
             self._values = self._values.reshape(1, -1)
         if self._values.ndim != 2 or self._values.shape[1] != 2:
@@ -213,7 +214,7 @@ class Points:
         if self.crs != other.crs:
             if self.crs is None or other.crs is None:
                 crs_new = self.crs or other.crs
-                warnings.warn(
+                logger.warning(
                     "Cannot find the coordinate reference system of the points. "
                     "The crs of two points will assume to be the same. ",
                     stacklevel=2,
