@@ -70,10 +70,10 @@ open _build/html/index.html       # View docs (macOS)
 
 - **Python 3.11+** required
 - **`from __future__ import annotations`** in every file
-- **Type hints**: Use Python 3.11+ syntax (`str | None`, `dict[str, int]`). Use `Literal` for fixed value sets. 
+- **Type hints**: Use Python 3.11+ syntax (`str | None`, `dict[str, int]`). Use `Literal` for fixed value sets. Use `@overload` for functions with multiple calling patterns or polymorphic return types
 - **Docstrings**: Use NumPy-style docstrings for all public modules, classes, functions, and methods. Include Parameters, Returns, Raises, and Examples where applicable, and use Sphinx reStructuredText markup such as :func:..., :class:..., and directives like .. note::, .. tip::, and .. warning:: when needed.
 - **Logging**: Use `from faninsar.logging import setup_logger; logger = setup_logger(__name__)` — log before raising exceptions errors
-- **Paths**: Use `pathlib.Path` internally; convert to `str` only when passing to ISCE2/ISCE3 APIs
+- **Paths**: Use `pathlib.Path` internally; convert to `str` only when passing to C++ libraries or APIs that require strings
 - **Type-checking imports**: Put heavy/circular imports inside `if TYPE_CHECKING:` blocks
 - **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`)
 - **Linter**: ruff only (no black, no flake8). Line length 88. Ruff excludes `tests/`, `docs/`, `examples/` directories.
