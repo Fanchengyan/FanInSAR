@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Literal, TypeAlias, TypedDict, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Self,
+    TypeAlias,
+    TypedDict,
+    cast,
+    overload,
+)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -37,6 +46,7 @@ logger = setup_logger(__name__)
 _PanelName: TypeAlias = Literal["heatmap", "spatial", "temporal", "surface_3d"]
 _MosaicLayout: TypeAlias = list[list[_PanelName]]
 _ColorMapLike: TypeAlias = str | Colormap
+_UcmArrayDims: TypeAlias = Literal["st", "ts"]
 _LabelName: TypeAlias = Literal[
     "xlabel",
     "ylabel",
@@ -44,12 +54,10 @@ _LabelName: TypeAlias = Literal[
     "legend_title",
 ]
 _PanelText: TypeAlias = str | Mapping[_PanelName, str | None] | None
-
 DEFAULT_UCM_MOSAIC: _MosaicLayout = [
     ["heatmap", "spatial"],
     ["temporal", "surface_3d"],
 ]
-DEFAULT_UCM_VALUE_LABEL = "Velocity (mm/yr)"
 
 _UCM_PANEL_NAMES: frozenset[_PanelName] = frozenset({
     "heatmap",
@@ -65,7 +73,7 @@ def _resolve_ucm_axes(
     ax: Axes | None = None,
     *,
     projection: Literal["rectilinear"] = "rectilinear",
-    figure_kwargs: dict[str, object] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
 ) -> tuple[xr.DataArray, Axes]: ...
 
 
@@ -75,7 +83,7 @@ def _resolve_ucm_axes(
     ax: Axes3D | None = None,
     *,
     projection: Literal["3d"],
-    figure_kwargs: dict[str, object] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
 ) -> tuple[xr.DataArray, Axes3D]: ...
 
 
@@ -84,7 +92,7 @@ def _resolve_ucm_axes(
     ax: Axes | Axes3D | None = None,
     *,
     projection: Literal["rectilinear", "3d"] = "rectilinear",
-    figure_kwargs: dict[str, object] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
 ) -> tuple[xr.DataArray, Axes | Axes3D]:
     """Resolve UCM data and Matplotlib axes.
 
@@ -121,7 +129,7 @@ def _resolve_ucm_axes(
         return ds_ucm, created_ax
     if projection == "3d":
         subplot_kw = dict(
-            cast("Mapping[str, object]", subplot_kwargs.pop("subplot_kw", {}))
+            cast("Mapping[str, Any]", subplot_kwargs.pop("subplot_kw", {}))
         )
         subplot_kw["projection"] = "3d"
         _, created_ax = plt.subplots(subplot_kw=subplot_kw, **subplot_kwargs)
@@ -134,6 +142,9 @@ def _resolve_ucm_axes(
 
 def _default_ucm_labels(
     quantity_label: str,
+    spatial_label: str = "Resolution (m)",
+    temporal_label: str = "Maximum Temporal Baseline (days)",
+    spatial_legend_label: str = "Days",
 ) -> dict[_PanelName, dict[_LabelName, str | None]]:
     """Create default panel labels for a UCM summary plot.
 
@@ -141,6 +152,12 @@ def _default_ucm_labels(
     ----------
     quantity_label : str
         Value label used for velocity axes.
+    spatial_label : str, default "Resolution (m)"
+        Label used for spatial resolution axes and legends.
+    temporal_label : str, default "Maximum Temporal Baseline (days)"
+        Label used for temporal baseline axes and legends.
+    spatial_legend_label : str, default "Days"
+        Legend title used by the spatial profile panel.
 
     Returns
     -------
@@ -148,30 +165,28 @@ def _default_ucm_labels(
         Default labels keyed by panel name and label field.
 
     """
-    temporal_baseline_label = "Maximum Temporal Baseline (days)"
-    resolution_label = "Resolution (m)"
     return {
         "heatmap": {
-            "xlabel": temporal_baseline_label,
-            "ylabel": resolution_label,
+            "xlabel": temporal_label,
+            "ylabel": spatial_label,
             "zlabel": None,
             "legend_title": None,
         },
         "spatial": {
             "xlabel": quantity_label,
-            "ylabel": resolution_label,
+            "ylabel": spatial_label,
             "zlabel": None,
-            "legend_title": "Days",
+            "legend_title": spatial_legend_label,
         },
         "temporal": {
-            "xlabel": temporal_baseline_label,
+            "xlabel": temporal_label,
             "ylabel": quantity_label,
             "zlabel": None,
-            "legend_title": resolution_label,
+            "legend_title": spatial_label,
         },
         "surface_3d": {
-            "xlabel": temporal_baseline_label,
-            "ylabel": resolution_label,
+            "xlabel": temporal_label,
+            "ylabel": spatial_label,
             "zlabel": quantity_label,
             "legend_title": None,
         },
@@ -242,34 +257,115 @@ def _resolve_panel_bool(
     return default_value
 
 
-def _prepare_ucm_data(ds_ucm: xr.DataArray) -> xr.DataArray:
-    """Validate and transpose UCM data for plotting.
+def _prepare_ucm_data(
+    ds_ucm: xr.DataArray,
+    spatial_dim: str = "res",
+    temporal_dim: str = "day",
+) -> xr.DataArray:
+    """Validate and standardize UCM data for plotting.
 
     Parameters
     ----------
     ds_ucm : xarray.DataArray
-        UCM values with ``res`` and ``day`` dimensions.
+        Two-dimensional UCM values.
+    spatial_dim : str, default "res"
+        Name of the spatial resolution dimension in ``ds_ucm``.
+    temporal_dim : str, default "day"
+        Name of the temporal baseline dimension in ``ds_ucm``.
 
     Returns
     -------
     xarray.DataArray
-        Data transposed to ``("res", "day")``.
+        Data renamed and transposed to ``("res", "day")``.
 
     Raises
     ------
     ValueError
-        If the input data does not contain the required dimensions.
+        If dimensions are invalid, missing, or not two-dimensional.
 
     """
-    missing_dimensions = {"res", "day"}.difference(ds_ucm.dims)
+    if spatial_dim == temporal_dim:
+        logger.error(
+            "UCM spatial and temporal dimensions must differ: %s.",
+            spatial_dim,
+        )
+        msg = "spatial_dim and temporal_dim must be different."
+        raise ValueError(msg)
+
+    required_dimensions = {spatial_dim, temporal_dim}
+    missing_dimensions = required_dimensions.difference(ds_ucm.dims)
     if missing_dimensions:
         logger.error(
             "UCM data is missing required dimensions: %s.",
             sorted(missing_dimensions),
         )
-        msg = "ds_ucm must contain 'res' and 'day' dimensions."
+        msg = (
+            "ds_ucm must contain the spatial and temporal dimensions "
+            f"{spatial_dim!r} and {temporal_dim!r}."
+        )
         raise ValueError(msg)
-    return ds_ucm.transpose("res", "day")
+
+    if len(ds_ucm.dims) != 2:
+        logger.error(
+            "UCM data must be two-dimensional, got dimensions: %s.",
+            ds_ucm.dims,
+        )
+        msg = "ds_ucm must be two-dimensional."
+        raise ValueError(msg)
+
+    dimension_mapping = {
+        old_dimension: new_dimension
+        for old_dimension, new_dimension in (
+            (spatial_dim, "res"),
+            (temporal_dim, "day"),
+        )
+        if old_dimension != new_dimension
+    }
+    return ds_ucm.rename(dimension_mapping).transpose("res", "day")
+
+
+def _resolve_array_coords(
+    coords: Any | None,
+    length: int,
+    coord_name: str,
+) -> np.ndarray:
+    """Resolve user-provided or default coordinates for UCM array input.
+
+    Parameters
+    ----------
+    coords : object or None
+        Coordinate values provided by the caller. If None, integer index
+        coordinates are generated.
+    length : int
+        Expected coordinate length.
+    coord_name : str
+        Coordinate name used in validation messages.
+
+    Returns
+    -------
+    numpy.ndarray
+        Coordinate values with the expected length.
+
+    Raises
+    ------
+    ValueError
+        If provided coordinate values do not match ``length``.
+
+    """
+    if coords is None:
+        return np.arange(length)
+
+    resolved_coords = np.asarray(coords)
+    if resolved_coords.ndim == 0 or len(resolved_coords) != length:
+        logger.error(
+            "Invalid %s coordinate length for UCM array input: expected %s, got %s.",
+            coord_name,
+            length,
+            resolved_coords.shape,
+        )
+        msg = f"{coord_name}_coords must have length {length}."
+        raise ValueError(msg)
+    return resolved_coords
 
 
 def _resolve_color_limits(
@@ -363,23 +459,32 @@ def _validate_mosaic(mosaic: _MosaicLayout) -> None:
         raise ValueError(msg)
 
 
-def _profile_palette(color_count: int) -> list[tuple[float, float, float, float]]:
-    """Create profile line colors from the default UCM profile colormap.
+def _profile_palette(
+    color_count: int,
+    cmap: _ColorMapLike = "RdYlGn_r",
+) -> list[tuple[float, float, float, float]]:
+    """Create profile line colors from a UCM profile colormap.
 
     Parameters
     ----------
     color_count : int
         Number of colors to create.
+    cmap : str or matplotlib.colors.Colormap, default "RdYlGn_r"
+        Matplotlib colormap sampled for profile line colors.
 
     Returns
     -------
     list[tuple[float, float, float, float]]
-        RGBA colors sampled from ``RdYlGn_r``.
+        RGBA colors sampled from the selected colormap.
 
     """
     if color_count <= 0:
         return []
-    palette_cmap = plt.get_cmap("RdYlGn_r", color_count)
+    palette_cmap = (
+        cmap.resampled(color_count)
+        if isinstance(cmap, Colormap)
+        else plt.get_cmap(cmap, color_count)
+    )
     return [palette_cmap(index) for index in range(color_count)]
 
 
@@ -424,492 +529,715 @@ def create_ucm_mosaic(
     )
 
 
-def plot_ucm_heatmap(
-    ds_ucm: xr.DataArray,
-    ax: Axes | None = None,
-    cmap: _ColorMapLike = cmaps.bam,
-    vmin: float | None = None,
-    vmax: float | None = None,
-    show_hist_colorbar: bool = True,
-    colorbar_kwargs: dict[str, object] | None = None,
-    xlabel: str | None = "Maximum Temporal Baseline (days)",
-    ylabel: str | None = "Resolution (m)",
-    figure_kwargs: dict[str, object] | None = None,
-) -> AxesImage:
-    """Plot the two-dimensional UCM heatmap.
+class UCM:
+    """Stateful wrapper for UCM plotting utilities.
 
     Parameters
     ----------
     ds_ucm : xarray.DataArray
-        UCM values with ``res`` and ``day`` dimensions.
-    ax : matplotlib.axes.Axes or None, optional
-        Axis that receives the heatmap. If None, a new axis is created.
-    figure_kwargs : dict or None, optional
-        Keyword arguments passed to :func:`matplotlib.pyplot.subplots` when
-        ``ax`` is None. If ``dpi`` is not provided, it defaults to 300.
+        Two-dimensional UCM values.
+    quantity_label : str, default "Velocity (mm/yr)"
+        Label for the plotted UCM quantity.
+    spatial_label : str, default "Resolution (m)"
+        Label for spatial resolution axes and legends.
+    temporal_label : str, default "Maximum Temporal Baseline (days)"
+        Label for temporal baseline axes and legends.
+    spatial_dim : str, default "res"
+        Name of the spatial resolution dimension in ``ds_ucm``.
+    temporal_dim : str, default "day"
+        Name of the temporal baseline dimension in ``ds_ucm``.
     cmap : str or matplotlib.colors.Colormap, default cmaps.bam
-        Matplotlib colormap.
+        Matplotlib colormap used by heatmap and 3D surface plots.
     vmin : float or None, optional
-        Optional lower value limit.
+        Default lower value limit.
     vmax : float or None, optional
-        Optional upper value limit.
-    show_hist_colorbar : bool, default True
-        Whether to draw a histogram colorbar.
-    colorbar_kwargs : dict[str, object] or None, optional
-        Additional keyword arguments passed to :class:`HistColorbar`. Use
-        ``cax`` to provide a target colorbar axis. The default ``location`` is
-        ``"right"``.
-    xlabel : str or None, default "Maximum Temporal Baseline (days)"
-        Label for the x-axis. If None, the existing label is left unchanged.
-    ylabel : str or None, default "Resolution (m)"
-        Label for the y-axis. If None, the existing label is left unchanged.
+        Default upper value limit.
 
-    Returns
-    -------
-    AxesImage: matplotlib.image.AxesImage
-        Rendered heatmap image artist.
-
-    """
-    ds_ucm, ax = _resolve_ucm_axes(ds_ucm, ax, figure_kwargs=figure_kwargs)
-    prepared_ucm = _prepare_ucm_data(ds_ucm)
-    vmin, vmax = _resolve_color_limits(prepared_ucm, vmin=vmin, vmax=vmax)
-    days = prepared_ucm.day.values
-    resolutions = prepared_ucm.res.values
-
-    image = ax.imshow(
-        prepared_ucm,
-        cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
-        aspect="auto",
-    )
-    if show_hist_colorbar:
-        resolved_colorbar_kwargs = {"location": "right"}
-        if colorbar_kwargs is not None:
-            resolved_colorbar_kwargs.update(colorbar_kwargs)
-        HistColorbar(
-            prepared_ucm.values,
-            image,
-            **resolved_colorbar_kwargs,
-        )
-    ax.set_xticks(range(len(days)), days)
-    ax.set_yticks(range(len(resolutions)), resolutions)
-    if xlabel is not None:
-        ax.set_xlabel(xlabel)
-    if ylabel is not None:
-        ax.set_ylabel(ylabel)
-    return image
-
-
-def plot_ucm_spatial_profile(
-    ds_ucm: xr.DataArray,
-    ax: Axes | None = None,
-    vmin: float | None = None,
-    vmax: float | None = None,
-    xlabel: str | None = DEFAULT_UCM_VALUE_LABEL,
-    ylabel: str | None = "Resolution (m)",
-    legend_title: str | None = "Days",
-    legend_kwargs: dict[str, object] | None = None,
-    figure_kwargs: dict[str, object] | None = None,
-) -> list[list[Line2D]]:
-    """Plot UCM variation across spatial resolution for each temporal baseline.
-
-    Parameters
+    Attributes
     ----------
     ds_ucm : xarray.DataArray
-        UCM values with ``res`` and ``day`` dimensions.
-    ax : matplotlib.axes.Axes or None, optional
-        Axis that receives the spatial profile plot. If None, a new axis is
-        created.
-    figure_kwargs : dict or None, optional
-        Keyword arguments passed to :func:`matplotlib.pyplot.subplots` when
-        ``ax`` is None. If ``dpi`` is not provided, it defaults to 300.
-    vmin : float or None, optional
-        Optional lower x-axis limit.
-    vmax : float or None, optional
-        Optional upper x-axis limit.
-    xlabel : str or None, default "Velocity (mm/yr)"
-        Label for the x-axis. If None, the existing label is left unchanged.
-    ylabel : str or None, default "Resolution (m)"
-        Label for the y-axis. If None, the existing label is left unchanged.
-    legend_title : str or None, default "Days"
-        Legend title. If None, no title is set.
-    legend_kwargs : dict[str, object] or None, optional
-        Additional keyword arguments passed to :meth:`matplotlib.axes.Axes.legend`.
-
-    Returns
-    -------
-    list[list[Line2D]]
-        List of line objects for each hue in the plot.
-
-    """
-    ds_ucm, ax = _resolve_ucm_axes(ds_ucm, ax, figure_kwargs=figure_kwargs)
-    prepared_ucm = _prepare_ucm_data(ds_ucm)
-    vmin, vmax = _resolve_color_limits(prepared_ucm, vmin=vmin, vmax=vmax)
-    resolutions = prepared_ucm.res.values
-    dataframe = prepared_ucm.to_pandas().stack().reset_index(name="velocity")
-
-    hues = dataframe["day"].unique()
-    palette = _profile_palette(len(hues))
-    lines = []
-    for index, hue in enumerate(hues):
-        subset = dataframe[dataframe["day"] == hue]
-        lines.append(
-            ax.plot(
-                subset["velocity"],
-                subset["res"],
-                label=hue,
-                color=palette[index],
-                marker="o",
-                linewidth=2,
-            )
-        )
-    ax.invert_yaxis()
-    ax.set_yticks(resolutions, resolutions)
-    ax.legend(title=legend_title, **({} if legend_kwargs is None else legend_kwargs))
-    if xlabel is not None:
-        ax.set_xlabel(xlabel)
-    if ylabel is not None:
-        ax.set_ylabel(ylabel)
-    ax.set_xlim(vmin, vmax)
-    ax.axvline(0, color="k", lw=2, ls="-.")
-    return lines
-
-
-def plot_ucm_temporal_profile(
-    ds_ucm: xr.DataArray,
-    ax: Axes | None = None,
-    vmin: float | None = None,
-    vmax: float | None = None,
-    xlabel: str | None = "Maximum Temporal Baseline (day)",
-    ylabel: str | None = DEFAULT_UCM_VALUE_LABEL,
-    legend_title: str | None = "Resolution (m)",
-    legend_kwargs: dict[str, object] | None = None,
-    figure_kwargs: dict[str, object] | None = None,
-) -> list[list[Line2D]]:
-    """Plot UCM variation across temporal baseline for each resolution.
-
-    Parameters
-    ----------
-    ds_ucm : xarray.DataArray
-        UCM values with ``res`` and ``day`` dimensions.
-    ax : matplotlib.axes.Axes or None, optional
-        Axis that receives the temporal profile plot. If None, a new axis is
-        created.
-    figure_kwargs : dict or None, optional
-        Keyword arguments passed to :func:`matplotlib.pyplot.subplots` when
-        ``ax`` is None. If ``dpi`` is not provided, it defaults to 300.
-    vmin : float or None, optional
-        Optional lower y-axis limit.
-    vmax : float or None, optional
-        Optional upper y-axis limit.
-    xlabel : str or None, default "Maximum Temporal Baseline (day)"
-        Label for the x-axis. If None, the existing label is left unchanged.
-    ylabel : str or None, default "Velocity (mm/yr)"
-        Label for the y-axis. If None, the existing label is left unchanged.
-    legend_title : str or None, default "Resolution (m)"
-        Legend title. If None, no title is set.
-    legend_kwargs : dict[str, object] or None, optional
-        Additional keyword arguments passed to :meth:`matplotlib.axes.Axes.legend`.
-
-    Returns
-    -------
-    list[list[Line2D]]
-        List of line objects for each hue in the plot.
-
-    """
-    ds_ucm, ax = _resolve_ucm_axes(ds_ucm, ax, figure_kwargs=figure_kwargs)
-    prepared_ucm = _prepare_ucm_data(ds_ucm)
-    vmin, vmax = _resolve_color_limits(prepared_ucm, vmin=vmin, vmax=vmax)
-    dataframe = prepared_ucm.to_pandas().stack().reset_index(name="velocity")
-
-    hues = dataframe["res"].unique()
-    palette = _profile_palette(len(hues))
-    lines = []
-    for index, hue in enumerate(hues):
-        subset = dataframe[dataframe["res"] == hue]
-        lines.append(
-            ax.plot(
-                subset["day"],
-                subset["velocity"],
-                label=hue,
-                color=palette[index],
-                marker="o",
-                linewidth=2,
-            )
-        )
-    ax.axhline(0, color="k", lw=2, ls="-.")
-    ax.set_xticks(dataframe["day"].unique())
-    ax.legend(title=legend_title, **({} if legend_kwargs is None else legend_kwargs))
-    if xlabel is not None:
-        ax.set_xlabel(xlabel)
-    if ylabel is not None:
-        ax.set_ylabel(ylabel)
-    ax.set_ylim(vmin, vmax)
-    return lines
-
-
-def plot_ucm_surface_3d(
-    ds_ucm: xr.DataArray,
-    ax: Axes3D | None = None,
-    cmap: _ColorMapLike = cmaps.bam,
-    vmin: float | None = None,
-    vmax: float | None = None,
-    show_hist_colorbar: bool = True,
-    xlabel: str | None = "Maximum Temporal Baseline (days)",
-    ylabel: str | None = "Resolution (m)",
-    zlabel: str | None = DEFAULT_UCM_VALUE_LABEL,
-    colorbar_kwargs: dict[str, object] | None = None,
-    figure_kwargs: dict[str, object] | None = None,
-) -> Poly3DCollection:
-    """Plot the three-dimensional UCM surface.
-
-    Parameters
-    ----------
-    ds_ucm : xarray.DataArray
-        UCM values with ``res`` and ``day`` dimensions.
-    ax : mpl_toolkits.mplot3d.axes3d.Axes3D or None, optional
-        Three-dimensional axis that receives the surface plot. If None, a new
-        3D axis is created.
-    figure_kwargs : dict or None, optional
-        Keyword arguments passed to :func:`matplotlib.pyplot.subplots` when
-        ``ax`` is None. Any ``subplot_kw`` values are merged with the required
-        3D projection. If ``dpi`` is not provided, it defaults to 300.
-    cmap : str or matplotlib.colors.Colormap, default cmaps.bam
-        Matplotlib colormap.
-    vmin : float or None, optional
-        Optional lower value limit.
-    vmax : float or None, optional
-        Optional upper value limit.
-    show_hist_colorbar : bool, default True
-        Whether to add a histogram colorbar for the 3D surface.
-    xlabel : str or None, default "Maximum Temporal Baseline (days)"
-        Label for the x-axis. If None, the existing label is left unchanged.
-    ylabel : str or None, default "Resolution (m)"
-        Label for the y-axis. If None, the existing label is left unchanged.
-    zlabel : str or None, default "Velocity (mm/yr)"
-        Label for the z-axis. If None, the existing label is left unchanged.
-    colorbar_kwargs : dict[str, object] or None, optional
-        Additional keyword arguments passed to :class:`HistColorbar`. The
-        default ``location`` is ``"right"``.
-
-    Returns
-    -------
-    mpl_toolkits.mplot3d.art3d.Poly3DCollection
-        Rendered surface artist.
-
-    """
-    ds_ucm, ax = _resolve_ucm_axes(
-        ds_ucm,
-        ax,
-        projection="3d",
-        figure_kwargs=figure_kwargs,
-    )
-    prepared_ucm = _prepare_ucm_data(ds_ucm)
-    vmin, vmax = _resolve_color_limits(prepared_ucm, vmin=vmin, vmax=vmax)
-    days = prepared_ucm.day.values
-    resolutions = prepared_ucm.res.values
-    day_grid, resolution_grid = np.meshgrid(days, resolutions)
-
-    surface = ax.plot_surface(
-        day_grid,
-        resolution_grid,
-        prepared_ucm.values,
-        cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
-        linewidth=0,
-        antialiased=True,
-    )
-    if show_hist_colorbar:
-        resolved_colorbar_kwargs = {"ax": ax, "location": "right", "fraction": 0.15}
-        if colorbar_kwargs is not None:
-            resolved_colorbar_kwargs.update(colorbar_kwargs)
-        HistColorbar(
-            prepared_ucm.values,
-            surface,
-            **resolved_colorbar_kwargs,
-        )
-    ax.invert_yaxis()
-    ax.set_xticks(days)
-    ax.set_yticks(resolutions)
-    if xlabel is not None:
-        ax.set_xlabel(xlabel)
-    if ylabel is not None:
-        ax.set_ylabel(ylabel)
-    if zlabel is not None:
-        ax.set_zlabel(zlabel)
-    return surface
-
-
-def plot_ucm(
-    ds_ucm: xr.DataArray,
-    cmap: _ColorMapLike = cmaps.bam,
-    vmin: float | None = None,
-    vmax: float | None = None,
-    mosaic: _MosaicLayout | None = None,
-    figsize: tuple[float, float] = (10.0, 10.0),
-    dpi: int = 300,
-    constrained_layout: bool = True,
-    show_hist_colorbar: bool | Mapping[_PanelName, bool] | None = None,
-    quantity_label: str = DEFAULT_UCM_VALUE_LABEL,
-    xlabel: _PanelText = None,
-    ylabel: _PanelText = None,
-    zlabel: _PanelText = None,
-    legend_title: _PanelText = None,
-    legend_kwargs: Mapping[_PanelName, dict[str, object]] | None = None,
-    colorbar_kwargs: Mapping[_PanelName, dict[str, object]] | None = None,
-) -> tuple[Figure, _UcmAxes]:
-    """Plot a UCM summary figure from a named subplot mosaic.
-
-    Parameters
-    ----------
-    ds_ucm : xarray.DataArray
-        UCM values with ``res`` and ``day`` dimensions.
-    cmap : str or matplotlib.colors.Colormap, default cmaps.bam
-        Matplotlib colormap used by the heatmap and 3D surface.
-    quantity_label : str, optional
-        Quantity label describing the input data. Used for default value-axis
-        labels. Defaults to "Velocity (mm/yr)".
-    vmin : float or None, optional
-        Optional lower value limit shared by all panels.
-    vmax : float or None, optional
-        Optional upper value limit shared by all panels.
-    mosaic : list[list[str]] or None, optional
-        Named subplot mosaic. Supported labels are ``"heatmap"``, ``"spatial"``,
-        ``"temporal"``, and ``"surface_3d"``. Defaults to a two-by-two layout
-        with the 3D surface in the lower-right panel.
-    figsize : tuple[float, float], default (10.0, 10.0)
-        Figure size in inches.
-    dpi : int, default 300
-        Figure resolution.
-    constrained_layout : bool, default True
-        Whether to enable Matplotlib constrained layout.
-    show_hist_colorbar : bool, mapping, or None, optional
-        Histogram colorbar visibility. A boolean is applied to all supported
-        panels. A mapping can override individual panels, for example
-        ``{"heatmap": False, "surface_3d": True}``. Defaults to False for
-        ``"heatmap"`` and True for ``"surface_3d"``. Only ``"heatmap"`` and
-        ``"surface_3d"`` use this option.
-    xlabel, ylabel, zlabel, legend_title : str, mapping, or None
-        Label overrides. A string is applied to all panels that use the field.
-        A mapping can override labels by panel name. For example,
-        ``xlabel={"heatmap": "Temporal baseline", "spatial": "Velocity"}``
-        changes only the selected panels. None keeps defaults derived from
-        ``quantity_label``. ``zlabel`` is used only by ``"surface_3d"``, and
-        ``legend_title`` is used by ``"spatial"`` and ``"temporal"``.
-    legend_kwargs : mapping or None, optional
-        Additional legend keyword arguments keyed by panel name. Supported keys
-        are ``"spatial"`` and ``"temporal"``.
-    colorbar_kwargs : mapping or None, optional
-        Additional :class:`HistColorbar` keyword arguments keyed by panel name.
-        Supported keys are ``"heatmap"`` and ``"surface_3d"``. The default
-        ``"surface_3d"`` colorbar ``location`` is ``"bottom"``.
-
-    Returns
-    -------
-    tuple[matplotlib.figure.Figure, dict[str, matplotlib.axes.Axes]]
-        Figure and named axes.
-
-    Notes
-    -----
-    Panel-specific mappings use the same names as the subplot mosaic:
-    ``"heatmap"``, ``"spatial"``, ``"temporal"``, and ``"surface_3d"``. Missing
-    keys keep the default value for that panel.
+        Prepared UCM values transposed to ``("res", "day")``.
+    quantity_label : str
+        Label for value axes.
+    spatial_label : str
+        Label for spatial resolution axes and legends.
+    temporal_label : str
+        Label for temporal baseline axes and legends.
+    cmap : str or matplotlib.colors.Colormap
+        Default colormap.
+    vmin, vmax : float or None
+        Default value limits.
 
     Examples
     --------
-    Draw the default four-panel layout.
-
-    >>> fig, axes = plot_ucm(ds_ucm)
-
-    Draw a custom layout where the 3D surface spans the right column.
-
-    >>> fig, axes = plot_ucm(
-    ...     ds_ucm,
-    ...     mosaic=[["heatmap", "surface_3d"], ["temporal", "surface_3d"]],
-    ... )
-
-    Override selected labels by panel name.
-
-    >>> fig, axes = plot_ucm(
-    ...     ds_ucm,
-    ...     quantity_label="Velocity (cm/yr)",
-    ...     xlabel={"heatmap": "Temporal baseline", "surface_3d": "Days"},
-    ...     legend_title={"spatial": "Temporal baseline"},
-    ...     show_hist_colorbar={"heatmap": False, "surface_3d": True},
-    ... )
+    >>> ucm = UCM(ds_ucm, quantity_label="Velocity (cm/yr)")
+    >>> image = ucm.plot_heatmap(show_hist_colorbar=False)
+    >>> fig, axes = ucm.plot()
 
     """
-    labels = _default_ucm_labels(quantity_label)
-    figure, axes = create_ucm_mosaic(
-        mosaic=mosaic,
-        figsize=figsize,
-        dpi=dpi,
-        constrained_layout=constrained_layout,
-    )
-    if "heatmap" in axes:
-        plot_ucm_heatmap(
+
+    def __init__(
+        self,
+        ds_ucm: xr.DataArray,
+        *,
+        quantity_label: str = "Velocity (mm/yr)",
+        spatial_label: str = "Resolution (m)",
+        temporal_label: str = "Maximum Temporal Baseline (days)",
+        spatial_dim: str = "res",
+        temporal_dim: str = "day",
+        cmap: _ColorMapLike = cmaps.bam,
+        vmin: float | None = None,
+        vmax: float | None = None,
+    ) -> None:
+        """Initialize a UCM plot wrapper.
+
+        Parameters
+        ----------
+        ds_ucm : xarray.DataArray
+            Two-dimensional UCM values.
+        quantity_label : str, default "Velocity (mm/yr)"
+            Label for the plotted UCM quantity.
+        spatial_label : str, default "Resolution (m)"
+            Label for spatial resolution axes and legends.
+        temporal_label : str, default "Maximum Temporal Baseline (days)"
+            Label for temporal baseline axes and legends.
+        spatial_dim : str, default "res"
+            Name of the spatial resolution dimension in ``ds_ucm``.
+        temporal_dim : str, default "day"
+            Name of the temporal baseline dimension in ``ds_ucm``.
+        cmap : str or matplotlib.colors.Colormap, default cmaps.bam
+            Matplotlib colormap used by heatmap and 3D surface plots.
+        vmin : float or None, optional
+            Default lower value limit.
+        vmax : float or None, optional
+            Default upper value limit.
+
+        """
+        self.ds_ucm = _prepare_ucm_data(
             ds_ucm,
-            ax=axes["heatmap"],
+            spatial_dim=spatial_dim,
+            temporal_dim=temporal_dim,
+        )
+        self.quantity_label = quantity_label
+        self.spatial_label = spatial_label
+        self.temporal_label = temporal_label
+        self.cmap = cmap
+        self.vmin = vmin
+        self.vmax = vmax
+
+    @classmethod
+    def from_array(
+        cls,
+        array: np.ndarray,
+        *,
+        spatial_coords: Any | None = None,
+        temporal_coords: Any | None = None,
+        input_dims: _UcmArrayDims = "st",
+        name: str | None = None,
+        attrs: Mapping[str, Any] | None = None,
+        quantity_label: str = "Velocity (mm/yr)",
+        spatial_label: str = "Resolution (m)",
+        temporal_label: str = "Maximum Temporal Baseline (days)",
+        cmap: _ColorMapLike = cmaps.bam,
+        vmin: float | None = None,
+        vmax: float | None = None,
+    ) -> Self:
+        """Create a UCM plot wrapper from a NumPy array.
+
+        Parameters
+        ----------
+        array : numpy.ndarray
+            Two-dimensional UCM values.
+        spatial_coords : array-like or None, optional
+            Spatial resolution coordinate values. If None, integer coordinates
+            from 0 to ``n - 1`` are generated.
+        temporal_coords : array-like or None, optional
+            Temporal baseline coordinate values. If None, integer coordinates
+            from 0 to ``n - 1`` are generated.
+        input_dims : {"st", "ts"}, default "st"
+            Axis order of ``array``. ``"st"`` means spatial then temporal, so
+            ``array.shape == (len(spatial_coords), len(temporal_coords))``.
+            ``"ts"`` means temporal then spatial, so
+            ``array.shape == (len(temporal_coords), len(spatial_coords))``.
+            The created instance always stores data internally as
+            ``("res", "day")``.
+        name : str or None, optional
+            Name assigned to the intermediate :class:`xarray.DataArray`.
+        attrs : mapping or None, optional
+            Attributes assigned to the intermediate :class:`xarray.DataArray`.
+        quantity_label : str, default "Velocity (mm/yr)"
+            Label for the plotted UCM quantity.
+        spatial_label : str, default "Resolution (m)"
+            Label for spatial resolution axes and legends.
+        temporal_label : str, default "Maximum Temporal Baseline (days)"
+            Label for temporal baseline axes and legends.
+        cmap : str or matplotlib.colors.Colormap, default cmaps.bam
+            Matplotlib colormap used by heatmap and 3D surface plots.
+        vmin : float or None, optional
+            Default lower value limit.
+        vmax : float or None, optional
+            Default upper value limit.
+
+        Returns
+        -------
+        UCM
+            UCM plot wrapper initialized from ``array``.
+
+        Raises
+        ------
+        ValueError
+            If ``array`` is not two-dimensional, ``input_dims`` is invalid, or
+            coordinate lengths do not match the declared array axes.
+
+        Examples
+        --------
+        >>> ucm = UCM.from_array(
+        ...     values,
+        ...     spatial_coords=[30, 60],
+        ...     temporal_coords=[12, 24, 36],
+        ...     input_dims="st",
+        ... )
+
+        """
+        if array.ndim != 2:
+            logger.error(
+                "UCM array input must be two-dimensional, got shape: %s.",
+                array.shape,
+            )
+            msg = "array must be two-dimensional."
+            raise ValueError(msg)
+
+        if input_dims not in {"st", "ts"}:
+            logger.error("Invalid UCM array input_dims value: %s.", input_dims)
+            msg = "input_dims must be 'st' or 'ts'."
+            raise ValueError(msg)
+
+        if input_dims == "st":
+            dims = ("spatial", "temporal")
+            spatial_length, temporal_length = array.shape
+        else:
+            dims = ("temporal", "spatial")
+            temporal_length, spatial_length = array.shape
+
+        resolved_spatial_coords = _resolve_array_coords(
+            spatial_coords,
+            spatial_length,
+            "spatial",
+        )
+        resolved_temporal_coords = _resolve_array_coords(
+            temporal_coords,
+            temporal_length,
+            "temporal",
+        )
+        coords = {
+            "spatial": resolved_spatial_coords,
+            "temporal": resolved_temporal_coords,
+        }
+
+        import xarray as xr
+
+        data_array = xr.DataArray(
+            array,
+            dims=dims,
+            coords=coords,
+            name=name,
+            attrs={} if attrs is None else dict(attrs),
+        )
+        return cls(
+            data_array,
+            quantity_label=quantity_label,
+            spatial_label=spatial_label,
+            temporal_label=temporal_label,
+            spatial_dim="spatial",
+            temporal_dim="temporal",
             cmap=cmap,
             vmin=vmin,
             vmax=vmax,
-            show_hist_colorbar=_resolve_panel_bool(
-                "heatmap", False, show_hist_colorbar
-            ),
-            xlabel=_resolve_panel_text("heatmap", "xlabel", labels, xlabel),
-            ylabel=_resolve_panel_text("heatmap", "ylabel", labels, ylabel),
-            colorbar_kwargs=None
-            if colorbar_kwargs is None
-            else colorbar_kwargs.get("heatmap"),
         )
-    if "spatial" in axes:
-        plot_ucm_spatial_profile(
-            ds_ucm,
-            ax=axes["spatial"],
+
+    def plot_heatmap(
+        self,
+        ax: Axes | None = None,
+        cmap: _ColorMapLike | None = None,
+        vmin: float | None = None,
+        vmax: float | None = None,
+        show_hist_colorbar: bool = True,
+        colorbar_kwargs: dict[str, Any] | None = None,
+        xlabel: str | None = None,
+        ylabel: str | None = None,
+        figure_kwargs: dict[str, Any] | None = None,
+    ) -> AxesImage:
+        """Plot the two-dimensional UCM heatmap.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes or None, optional
+            Axis that receives the heatmap. If None, a new axis is created.
+        cmap : str, matplotlib.colors.Colormap, or None, optional
+            Colormap override. If None, the instance colormap is used.
+        vmin : float or None, optional
+            Lower value limit override. If None, the instance value is used.
+        vmax : float or None, optional
+            Upper value limit override. If None, the instance value is used.
+        show_hist_colorbar : bool, default True
+            Whether to draw a histogram colorbar.
+        colorbar_kwargs : dict[str, Any] or None, optional
+            Additional keyword arguments passed to :class:`HistColorbar`.
+        xlabel : str or None, optional
+            X-axis label override. If None, ``temporal_label`` is used.
+        ylabel : str or None, optional
+            Y-axis label override. If None, ``spatial_label`` is used.
+        figure_kwargs : dict[str, Any] or None, optional
+            Keyword arguments passed to :func:`matplotlib.pyplot.subplots` when
+            ``ax`` is None.
+
+        Returns
+        -------
+        matplotlib.image.AxesImage
+            Rendered heatmap image artist.
+
+        """
+        prepared_ucm, ax = _resolve_ucm_axes(
+            self.ds_ucm,
+            ax,
+            figure_kwargs=figure_kwargs,
+        )
+        vmin, vmax = _resolve_color_limits(
+            prepared_ucm,
+            vmin=self.vmin if vmin is None else vmin,
+            vmax=self.vmax if vmax is None else vmax,
+        )
+        days = prepared_ucm.day.values
+        resolutions = prepared_ucm.res.values
+
+        image = ax.imshow(
+            prepared_ucm,
+            cmap=self.cmap if cmap is None else cmap,
             vmin=vmin,
             vmax=vmax,
-            xlabel=_resolve_panel_text("spatial", "xlabel", labels, xlabel),
-            ylabel=_resolve_panel_text("spatial", "ylabel", labels, ylabel),
-            legend_title=_resolve_panel_text(
-                "spatial", "legend_title", labels, legend_title
-            ),
-            legend_kwargs={} if legend_kwargs is None else legend_kwargs.get("spatial"),
+            aspect="auto",
         )
-    if "temporal" in axes:
-        plot_ucm_temporal_profile(
-            ds_ucm,
-            ax=axes["temporal"],
+        if show_hist_colorbar:
+            resolved_colorbar_kwargs = {"location": "right"}
+            if colorbar_kwargs is not None:
+                resolved_colorbar_kwargs.update(colorbar_kwargs)
+            HistColorbar(
+                prepared_ucm.values,
+                image,
+                **resolved_colorbar_kwargs,
+            )
+        ax.set_xticks(range(len(days)), days)
+        ax.set_yticks(range(len(resolutions)), resolutions)
+        resolved_xlabel = self.temporal_label if xlabel is None else xlabel
+        resolved_ylabel = self.spatial_label if ylabel is None else ylabel
+        if resolved_xlabel is not None:
+            ax.set_xlabel(resolved_xlabel)
+        if resolved_ylabel is not None:
+            ax.set_ylabel(resolved_ylabel)
+        return image
+
+    def plot_sprofile(
+        self,
+        ax: Axes | None = None,
+        cmap: _ColorMapLike = "RdYlGn_r",
+        vmin: float | None = None,
+        vmax: float | None = None,
+        xlabel: str | None = None,
+        ylabel: str | None = None,
+        legend_title: str | None = None,
+        legend_kwargs: dict[str, Any] | None = None,
+        figure_kwargs: dict[str, Any] | None = None,
+    ) -> list[list[Line2D]]:
+        """Plot UCM spatial profiles.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes or None, optional
+            Axis that receives the spatial profile plot.
+        cmap : str or matplotlib.colors.Colormap, default "RdYlGn_r"
+            Colormap sampled for profile line colors.
+        vmin : float or None, optional
+            Lower x-axis limit override. If None, the instance value is used.
+        vmax : float or None, optional
+            Upper x-axis limit override. If None, the instance value is used.
+        xlabel : str or None, optional
+            X-axis label override. If None, ``quantity_label`` is used.
+        ylabel : str or None, optional
+            Y-axis label override. If None, ``spatial_label`` is used.
+        legend_title : str or None, optional
+            Legend title override. If None, ``temporal_label`` is used.
+        legend_kwargs : dict[str, Any] or None, optional
+            Additional keyword arguments passed to
+            :meth:`matplotlib.axes.Axes.legend`.
+        figure_kwargs : dict[str, Any] or None, optional
+            Keyword arguments passed to :func:`matplotlib.pyplot.subplots` when
+            ``ax`` is None.
+
+        Returns
+        -------
+        list[list[matplotlib.lines.Line2D]]
+            List of line objects for each hue in the plot.
+
+        """
+        prepared_ucm, ax = _resolve_ucm_axes(
+            self.ds_ucm,
+            ax,
+            figure_kwargs=figure_kwargs,
+        )
+        vmin, vmax = _resolve_color_limits(
+            prepared_ucm,
+            vmin=self.vmin if vmin is None else vmin,
+            vmax=self.vmax if vmax is None else vmax,
+        )
+        resolutions = prepared_ucm.res.values
+        dataframe = prepared_ucm.to_pandas().stack().reset_index(name="velocity")
+
+        hues = dataframe["day"].unique()
+        palette = _profile_palette(len(hues), cmap=cmap)
+        lines = []
+        for index, hue in enumerate(hues):
+            subset = dataframe[dataframe["day"] == hue]
+            lines.append(
+                ax.plot(
+                    subset["velocity"],
+                    subset["res"],
+                    label=hue,
+                    color=palette[index],
+                    marker="o",
+                    linewidth=2,
+                )
+            )
+        ax.invert_yaxis()
+        ax.set_yticks(resolutions, resolutions)
+        ax.legend(
+            title=self.temporal_label if legend_title is None else legend_title,
+            **({} if legend_kwargs is None else legend_kwargs),
+        )
+        resolved_xlabel = self.quantity_label if xlabel is None else xlabel
+        resolved_ylabel = self.spatial_label if ylabel is None else ylabel
+        if resolved_xlabel is not None:
+            ax.set_xlabel(resolved_xlabel)
+        if resolved_ylabel is not None:
+            ax.set_ylabel(resolved_ylabel)
+        ax.set_xlim(vmin, vmax)
+        ax.axvline(0, color="k", lw=2, ls="-.")
+        return lines
+
+    def plot_tprofile(
+        self,
+        ax: Axes | None = None,
+        cmap: _ColorMapLike = "RdYlGn_r",
+        vmin: float | None = None,
+        vmax: float | None = None,
+        xlabel: str | None = None,
+        ylabel: str | None = None,
+        legend_title: str | None = None,
+        legend_kwargs: dict[str, Any] | None = None,
+        figure_kwargs: dict[str, Any] | None = None,
+    ) -> list[list[Line2D]]:
+        """Plot UCM temporal profiles.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes or None, optional
+            Axis that receives the temporal profile plot.
+        cmap : str or matplotlib.colors.Colormap, default "RdYlGn_r"
+            Colormap sampled for profile line colors.
+        vmin : float or None, optional
+            Lower y-axis limit override. If None, the instance value is used.
+        vmax : float or None, optional
+            Upper y-axis limit override. If None, the instance value is used.
+        xlabel : str or None, optional
+            X-axis label override. If None, ``temporal_label`` is used.
+        ylabel : str or None, optional
+            Y-axis label override. If None, ``quantity_label`` is used.
+        legend_title : str or None, optional
+            Legend title override. If None, ``spatial_label`` is used.
+        legend_kwargs : dict[str, Any] or None, optional
+            Additional keyword arguments passed to
+            :meth:`matplotlib.axes.Axes.legend`.
+        figure_kwargs : dict[str, Any] or None, optional
+            Keyword arguments passed to :func:`matplotlib.pyplot.subplots` when
+            ``ax`` is None.
+
+        Returns
+        -------
+        list[list[matplotlib.lines.Line2D]]
+            List of line objects for each hue in the plot.
+
+        """
+        prepared_ucm, ax = _resolve_ucm_axes(
+            self.ds_ucm,
+            ax,
+            figure_kwargs=figure_kwargs,
+        )
+        vmin, vmax = _resolve_color_limits(
+            prepared_ucm,
+            vmin=self.vmin if vmin is None else vmin,
+            vmax=self.vmax if vmax is None else vmax,
+        )
+        dataframe = prepared_ucm.to_pandas().stack().reset_index(name="velocity")
+
+        hues = dataframe["res"].unique()
+        palette = _profile_palette(len(hues), cmap=cmap)
+        lines = []
+        for index, hue in enumerate(hues):
+            subset = dataframe[dataframe["res"] == hue]
+            lines.append(
+                ax.plot(
+                    subset["day"],
+                    subset["velocity"],
+                    label=hue,
+                    color=palette[index],
+                    marker="o",
+                    linewidth=2,
+                )
+            )
+        ax.axhline(0, color="k", lw=2, ls="-.")
+        ax.set_xticks(dataframe["day"].unique())
+        ax.legend(
+            title=self.spatial_label if legend_title is None else legend_title,
+            **({} if legend_kwargs is None else legend_kwargs),
+        )
+        resolved_xlabel = self.temporal_label if xlabel is None else xlabel
+        resolved_ylabel = self.quantity_label if ylabel is None else ylabel
+        if resolved_xlabel is not None:
+            ax.set_xlabel(resolved_xlabel)
+        if resolved_ylabel is not None:
+            ax.set_ylabel(resolved_ylabel)
+        ax.set_ylim(vmin, vmax)
+        return lines
+
+    def plot_3d_surface(
+        self,
+        ax: Axes3D | None = None,
+        cmap: _ColorMapLike | None = None,
+        vmin: float | None = None,
+        vmax: float | None = None,
+        show_hist_colorbar: bool = True,
+        xlabel: str | None = None,
+        ylabel: str | None = None,
+        zlabel: str | None = None,
+        colorbar_kwargs: dict[str, Any] | None = None,
+        figure_kwargs: dict[str, Any] | None = None,
+    ) -> Poly3DCollection:
+        """Plot the three-dimensional UCM surface.
+
+        Parameters
+        ----------
+        ax : mpl_toolkits.mplot3d.axes3d.Axes3D or None, optional
+            Three-dimensional axis that receives the surface plot.
+        cmap : str, matplotlib.colors.Colormap, or None, optional
+            Colormap override. If None, the instance colormap is used.
+        vmin : float or None, optional
+            Lower value limit override. If None, the instance value is used.
+        vmax : float or None, optional
+            Upper value limit override. If None, the instance value is used.
+        show_hist_colorbar : bool, default True
+            Whether to draw a histogram colorbar.
+        xlabel : str or None, optional
+            X-axis label override. If None, ``temporal_label`` is used.
+        ylabel : str or None, optional
+            Y-axis label override. If None, ``spatial_label`` is used.
+        zlabel : str or None, optional
+            Z-axis label override. If None, ``quantity_label`` is used.
+        colorbar_kwargs : dict[str, Any] or None, optional
+            Additional keyword arguments passed to :class:`HistColorbar`.
+        figure_kwargs : dict[str, Any] or None, optional
+            Keyword arguments passed to :func:`matplotlib.pyplot.subplots` when
+            ``ax`` is None.
+
+        Returns
+        -------
+        mpl_toolkits.mplot3d.art3d.Poly3DCollection
+            Rendered surface artist.
+
+        """
+        prepared_ucm, ax = _resolve_ucm_axes(
+            self.ds_ucm,
+            ax=ax,
+            projection="3d",
+            figure_kwargs=figure_kwargs,
+        )
+        vmin, vmax = _resolve_color_limits(
+            prepared_ucm,
+            vmin=self.vmin if vmin is None else vmin,
+            vmax=self.vmax if vmax is None else vmax,
+        )
+        days = prepared_ucm.day.values
+        resolutions = prepared_ucm.res.values
+        day_grid, resolution_grid = np.meshgrid(days, resolutions)
+
+        surface = ax.plot_surface(
+            day_grid,
+            resolution_grid,
+            prepared_ucm.values,
+            cmap=self.cmap if cmap is None else cmap,
             vmin=vmin,
             vmax=vmax,
-            xlabel=_resolve_panel_text("temporal", "xlabel", labels, xlabel),
-            ylabel=_resolve_panel_text("temporal", "ylabel", labels, ylabel),
-            legend_title=_resolve_panel_text(
-                "temporal", "legend_title", labels, legend_title
-            ),
-            legend_kwargs={}
-            if legend_kwargs is None
-            else legend_kwargs.get("temporal"),
+            linewidth=0,
+            antialiased=True,
         )
-    if "surface_3d" in axes:
-        surface_colorbar_kwargs: dict[str, object] = {"location": "bottom"}
-        if colorbar_kwargs is not None:
-            panel_colorbar_kwargs = colorbar_kwargs.get("surface_3d")
-            if panel_colorbar_kwargs is not None:
-                surface_colorbar_kwargs.update(panel_colorbar_kwargs)
-        plot_ucm_surface_3d(
-            ds_ucm,
-            ax=axes["surface_3d"],
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            show_hist_colorbar=_resolve_panel_bool(
-                "surface_3d", True, show_hist_colorbar
-            ),
-            xlabel=_resolve_panel_text("surface_3d", "xlabel", labels, xlabel),
-            ylabel=_resolve_panel_text("surface_3d", "ylabel", labels, ylabel),
-            zlabel=_resolve_panel_text("surface_3d", "zlabel", labels, zlabel),
-            colorbar_kwargs=surface_colorbar_kwargs,
+        if show_hist_colorbar:
+            resolved_colorbar_kwargs = {
+                "ax": ax,
+                "location": "right",
+                "fraction": 0.15,
+                "label": self.quantity_label,
+            }
+            if colorbar_kwargs is not None:
+                resolved_colorbar_kwargs.update(colorbar_kwargs)
+            HistColorbar(
+                prepared_ucm.values,
+                surface,
+                **resolved_colorbar_kwargs,
+            )
+        ax.invert_yaxis()
+        ax.set_xticks(days)
+        ax.set_yticks(resolutions)
+        resolved_xlabel = self.temporal_label if xlabel is None else xlabel
+        resolved_ylabel = self.spatial_label if ylabel is None else ylabel
+        resolved_zlabel = self.quantity_label if zlabel is None else zlabel
+        if resolved_xlabel is not None:
+            ax.set_xlabel(resolved_xlabel)
+        if resolved_ylabel is not None:
+            ax.set_ylabel(resolved_ylabel)
+        if resolved_zlabel is not None:
+            ax.set_zlabel(resolved_zlabel)
+        return surface
+
+    def plot(
+        self,
+        cmap: _ColorMapLike | None = None,
+        vmin: float | None = None,
+        vmax: float | None = None,
+        profile_cmap: _ColorMapLike = "RdYlGn_r",
+        mosaic: _MosaicLayout | None = None,
+        figsize: tuple[float, float] = (10.0, 10.0),
+        dpi: int = 300,
+        constrained_layout: bool = True,
+        show_hist_colorbar: bool | Mapping[_PanelName, bool] | None = None,
+        xlabel: _PanelText = None,
+        ylabel: _PanelText = None,
+        zlabel: _PanelText = None,
+        legend_title: _PanelText = None,
+        legend_kwargs: Mapping[_PanelName, dict[str, Any]] | None = None,
+        colorbar_kwargs: Mapping[_PanelName, dict[str, Any]] | None = None,
+    ) -> tuple[Figure, _UcmAxes]:
+        """Plot a UCM summary figure.
+
+        Parameters
+        ----------
+        cmap : str, matplotlib.colors.Colormap, or None, optional
+            Colormap override. If None, the instance colormap is used.
+        vmin : float or None, optional
+            Lower value limit override. If None, the instance value is used.
+        vmax : float or None, optional
+            Upper value limit override. If None, the instance value is used.
+        profile_cmap : str or matplotlib.colors.Colormap, default
+            "RdYlGn_r"
+            Colormap sampled for spatial and temporal profile line colors.
+        mosaic : list[list[str]] or None, optional
+            Named subplot mosaic.
+        figsize : tuple[float, float], default (10.0, 10.0)
+            Figure size in inches.
+        dpi : int, default 300
+            Figure resolution.
+        constrained_layout : bool, default True
+            Whether to enable Matplotlib constrained layout.
+        show_hist_colorbar : bool, mapping, or None, optional
+            Histogram colorbar visibility.
+        xlabel, ylabel, zlabel, legend_title : str, mapping, or None
+            Label overrides. Mappings are merged with instance label defaults.
+        legend_kwargs : mapping or None, optional
+            Additional legend keyword arguments keyed by panel name.
+        colorbar_kwargs : mapping or None, optional
+            Additional :class:`HistColorbar` keyword arguments keyed by panel
+            name.
+
+        Returns
+        -------
+        tuple[matplotlib.figure.Figure, dict[str, matplotlib.axes.Axes]]
+            Figure and named axes.
+
+        """
+        labels = _default_ucm_labels(
+            self.quantity_label,
+            spatial_label=self.spatial_label,
+            temporal_label=self.temporal_label,
+            spatial_legend_label=self.temporal_label,
         )
-    return figure, axes
+        figure, axes = create_ucm_mosaic(
+            mosaic=mosaic,
+            figsize=figsize,
+            dpi=dpi,
+            constrained_layout=constrained_layout,
+        )
+        if "heatmap" in axes:
+            self.plot_heatmap(
+                ax=axes["heatmap"],
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                show_hist_colorbar=_resolve_panel_bool(
+                    "heatmap", False, show_hist_colorbar
+                ),
+                xlabel=_resolve_panel_text("heatmap", "xlabel", labels, xlabel),
+                ylabel=_resolve_panel_text("heatmap", "ylabel", labels, ylabel),
+                colorbar_kwargs=None
+                if colorbar_kwargs is None
+                else colorbar_kwargs.get("heatmap"),
+            )
+        if "spatial" in axes:
+            self.plot_sprofile(
+                ax=axes["spatial"],
+                cmap=profile_cmap,
+                vmin=vmin,
+                vmax=vmax,
+                xlabel=_resolve_panel_text("spatial", "xlabel", labels, xlabel),
+                ylabel=_resolve_panel_text("spatial", "ylabel", labels, ylabel),
+                legend_title=_resolve_panel_text(
+                    "spatial", "legend_title", labels, legend_title
+                ),
+                legend_kwargs={}
+                if legend_kwargs is None
+                else legend_kwargs.get("spatial"),
+            )
+        if "temporal" in axes:
+            self.plot_tprofile(
+                ax=axes["temporal"],
+                cmap=profile_cmap,
+                vmin=vmin,
+                vmax=vmax,
+                xlabel=_resolve_panel_text("temporal", "xlabel", labels, xlabel),
+                ylabel=_resolve_panel_text("temporal", "ylabel", labels, ylabel),
+                legend_title=_resolve_panel_text(
+                    "temporal", "legend_title", labels, legend_title
+                ),
+                legend_kwargs={}
+                if legend_kwargs is None
+                else legend_kwargs.get("temporal"),
+            )
+        if "surface_3d" in axes:
+            surface_colorbar_kwargs: dict[str, Any] = {
+                "location": "bottom",
+                "label": self.quantity_label,
+            }
+            if colorbar_kwargs is not None:
+                panel_colorbar_kwargs = colorbar_kwargs.get("surface_3d")
+                if panel_colorbar_kwargs is not None:
+                    surface_colorbar_kwargs.update(panel_colorbar_kwargs)
+            self.plot_3d_surface(
+                ax=axes["surface_3d"],
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                show_hist_colorbar=_resolve_panel_bool(
+                    "surface_3d", True, show_hist_colorbar
+                ),
+                xlabel=_resolve_panel_text("surface_3d", "xlabel", labels, xlabel),
+                ylabel=_resolve_panel_text("surface_3d", "ylabel", labels, ylabel),
+                zlabel=_resolve_panel_text("surface_3d", "zlabel", labels, zlabel),
+                colorbar_kwargs=surface_colorbar_kwargs,
+            )
+        return figure, axes
