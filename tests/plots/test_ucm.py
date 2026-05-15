@@ -18,6 +18,14 @@ def _sample_ucm() -> xr.DataArray:
     )
 
 
+_CANONICAL_ORIGIN_EXPECTATIONS = [
+    ("upper_left", False, True),
+    ("upper_right", True, True),
+    ("lower_left", False, False),
+    ("lower_right", True, False),
+]
+
+
 def test_ucm_init_accepts_custom_dimension_names() -> None:
     """UCM initialization should standardize custom dimension names."""
     data_array = xr.DataArray(
@@ -159,6 +167,77 @@ def test_heatmap_creates_axis_and_sets_custom_labels() -> None:
     plt.close(image.figure)
 
 
+def test_heatmap_uses_lower_left_origin_by_default() -> None:
+    """Heatmap should default to a lower-left visual origin."""
+    image = UCM(_sample_ucm()).plot_heatmap(show_hist_colorbar=False)
+
+    assert bool(image.axes.xaxis_inverted()) is False
+    assert bool(image.axes.yaxis_inverted()) is False
+    plt.close(image.figure)
+
+
+@pytest.mark.parametrize(
+    ("origin", "invert_x", "invert_y"),
+    _CANONICAL_ORIGIN_EXPECTATIONS,
+)
+def test_heatmap_supports_all_canonical_origins(
+    origin: str,
+    invert_x: bool,
+    invert_y: bool,
+) -> None:
+    """Heatmap should support all canonical corner origin settings."""
+    image = UCM(_sample_ucm()).plot_heatmap(
+        origin=origin,
+        show_hist_colorbar=False,
+    )
+
+    assert bool(image.axes.xaxis_inverted()) is invert_x
+    assert bool(image.axes.yaxis_inverted()) is invert_y
+    plt.close(image.figure)
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("ul", "upper_left"),
+        ("ll", "lower_left"),
+        ("ur", "upper_right"),
+        ("lr", "lower_right"),
+    ],
+)
+def test_heatmap_origin_aliases_match_canonical_origins(
+    alias: str,
+    canonical: str,
+) -> None:
+    """Heatmap origin aliases should behave like their canonical values."""
+    alias_image = UCM(_sample_ucm()).plot_heatmap(
+        origin=alias,
+        show_hist_colorbar=False,
+    )
+    canonical_image = UCM(_sample_ucm()).plot_heatmap(
+        origin=canonical,
+        show_hist_colorbar=False,
+    )
+
+    assert bool(alias_image.axes.xaxis_inverted()) == bool(
+        canonical_image.axes.xaxis_inverted()
+    )
+    assert bool(alias_image.axes.yaxis_inverted()) == bool(
+        canonical_image.axes.yaxis_inverted()
+    )
+    plt.close(alias_image.figure)
+    plt.close(canonical_image.figure)
+
+
+@pytest.mark.parametrize("method_name", ["plot_heatmap", "plot_3d_surface"])
+def test_ucm_origin_rejects_invalid_values(method_name: str) -> None:
+    """Origin-aware UCM methods should reject unsupported origin values."""
+    ucm = UCM(_sample_ucm())
+
+    with pytest.raises(ValueError, match="origin must be one of"):
+        getattr(ucm, method_name)(origin="UL", show_hist_colorbar=False)
+
+
 def test_spatial_profile_accepts_ax_and_custom_legend_title() -> None:
     """Spatial profile should use the provided ax and custom labels."""
     fig, ax = plt.subplots()
@@ -208,6 +287,68 @@ def test_surface_3d_creates_axis_and_sets_custom_labels() -> None:
     plt.close(surface.figure)
 
 
+def test_surface_3d_uses_lower_left_origin_by_default() -> None:
+    """3D surface should default to a lower-left visual origin."""
+    surface = UCM(_sample_ucm()).plot_3d_surface(show_hist_colorbar=False)
+
+    assert bool(surface.axes.xaxis_inverted()) is False
+    assert bool(surface.axes.yaxis_inverted()) is False
+    plt.close(surface.figure)
+
+
+@pytest.mark.parametrize(
+    ("origin", "invert_x", "invert_y"),
+    _CANONICAL_ORIGIN_EXPECTATIONS,
+)
+def test_surface_3d_supports_all_canonical_origins(
+    origin: str,
+    invert_x: bool,
+    invert_y: bool,
+) -> None:
+    """3D surface should support all canonical corner origin settings."""
+    surface = UCM(_sample_ucm()).plot_3d_surface(
+        origin=origin,
+        show_hist_colorbar=False,
+    )
+
+    assert bool(surface.axes.xaxis_inverted()) is invert_x
+    assert bool(surface.axes.yaxis_inverted()) is invert_y
+    plt.close(surface.figure)
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("ul", "upper_left"),
+        ("ll", "lower_left"),
+        ("ur", "upper_right"),
+        ("lr", "lower_right"),
+    ],
+)
+def test_surface_3d_origin_aliases_match_canonical_origins(
+    alias: str,
+    canonical: str,
+) -> None:
+    """3D surface origin aliases should behave like their canonical values."""
+    alias_surface = UCM(_sample_ucm()).plot_3d_surface(
+        origin=alias,
+        show_hist_colorbar=False,
+    )
+    canonical_surface = UCM(_sample_ucm()).plot_3d_surface(
+        origin=canonical,
+        show_hist_colorbar=False,
+    )
+
+    assert bool(alias_surface.axes.xaxis_inverted()) == bool(
+        canonical_surface.axes.xaxis_inverted()
+    )
+    assert bool(alias_surface.axes.yaxis_inverted()) == bool(
+        canonical_surface.axes.yaxis_inverted()
+    )
+    plt.close(alias_surface.figure)
+    plt.close(canonical_surface.figure)
+
+
 def test_ucm_plot_forwards_custom_panel_labels() -> None:
     """Composite UCM plot should forward custom labels to panel methods."""
     fig, axes = UCM(_sample_ucm()).plot(
@@ -241,6 +382,20 @@ def test_ucm_plot_forwards_custom_panel_labels() -> None:
     assert axes["surface_3d"].get_xlabel() == "Surface days"
     assert axes["surface_3d"].get_ylabel() == "Surface resolution"
     assert axes["surface_3d"].get_zlabel() == "Surface velocity"
+    plt.close(fig)
+
+
+def test_ucm_plot_forwards_origin_to_heatmap_and_surface() -> None:
+    """Composite UCM plot should forward origin to heatmap and 3D surface."""
+    fig, axes = UCM(_sample_ucm()).plot(
+        origin="ur",
+        show_hist_colorbar=False,
+    )
+
+    assert bool(axes["heatmap"].xaxis_inverted()) is True
+    assert bool(axes["heatmap"].yaxis_inverted()) is True
+    assert bool(axes["surface_3d"].xaxis_inverted()) is True
+    assert bool(axes["surface_3d"].yaxis_inverted()) is True
     plt.close(fig)
 
 

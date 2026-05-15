@@ -47,6 +47,22 @@ _PanelName: TypeAlias = Literal["heatmap", "spatial", "temporal", "surface_3d"]
 _MosaicLayout: TypeAlias = list[list[_PanelName]]
 _ColorMapLike: TypeAlias = str | Colormap
 _UcmArrayDims: TypeAlias = Literal["st", "ts"]
+UcmOrigin: TypeAlias = Literal[
+    "upper_left",
+    "upper_right",
+    "lower_left",
+    "lower_right",
+    "ul",
+    "ur",
+    "ll",
+    "lr",
+]
+_CanonicalUcmOrigin: TypeAlias = Literal[
+    "upper_left",
+    "upper_right",
+    "lower_left",
+    "lower_right",
+]
 _ProfilePanelName: TypeAlias = Literal["spatial", "temporal"]
 _ProfileXAxis: TypeAlias = Literal["variable", "quantity"]
 _ProfileXAxisSetting: TypeAlias = (
@@ -70,6 +86,16 @@ _UCM_PANEL_NAMES: frozenset[_PanelName] = frozenset({
     "temporal",
     "surface_3d",
 })
+_UCM_ORIGIN_ALIASES: dict[UcmOrigin, _CanonicalUcmOrigin] = {
+    "upper_left": "upper_left",
+    "upper_right": "upper_right",
+    "lower_left": "lower_left",
+    "lower_right": "lower_right",
+    "ul": "upper_left",
+    "ur": "upper_right",
+    "ll": "lower_left",
+    "lr": "lower_right",
+}
 
 
 @overload
@@ -212,6 +238,67 @@ def _default_ucm_labels(
             "legend_title": None,
         },
     }
+
+
+def _resolve_ucm_origin(
+    origin: UcmOrigin,
+) -> tuple[_CanonicalUcmOrigin, bool, bool]:
+    """Resolve a UCM origin setting into canonical form and axis directions.
+
+    Parameters
+    ----------
+    origin : UcmOrigin
+        Corner treated as the visual origin. Accepted values are
+        ``"upper_left"``, ``"upper_right"``, ``"lower_left"``,
+        ``"lower_right"``, and their shorthand aliases ``"ul"``, ``"ur"``,
+        ``"ll"``, and ``"lr"``.
+
+    Returns
+    -------
+    tuple[{"upper_left", "upper_right", "lower_left", "lower_right"}, bool, bool]
+        Canonical origin value, whether the x-axis should be inverted, and
+        whether the y-axis should be inverted.
+
+    Raises
+    ------
+    ValueError
+        If ``origin`` is not supported.
+
+    """
+    canonical_origin = _UCM_ORIGIN_ALIASES.get(origin)
+    if canonical_origin is None:
+        logger.error("Unsupported UCM origin: %s.", origin)
+        accepted_origins = ", ".join(f"'{value}'" for value in _UCM_ORIGIN_ALIASES)
+        msg = f"origin must be one of {accepted_origins}, got {origin!r}."
+        raise ValueError(msg)
+
+    invert_x = canonical_origin in {"upper_right", "lower_right"}
+    invert_y = canonical_origin in {"upper_left", "upper_right"}
+    return canonical_origin, invert_x, invert_y
+
+
+def _apply_axis_inversion(
+    ax: Axes | Axes3D,
+    *,
+    invert_x: bool,
+    invert_y: bool,
+) -> None:
+    """Apply deterministic x- and y-axis inversion to a Matplotlib axis.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes or Axes3D
+        Axis whose direction is updated.
+    invert_x : bool
+        Whether the x-axis should be inverted.
+    invert_y : bool
+        Whether the y-axis should be inverted.
+
+    """
+    if ax.xaxis_inverted() != invert_x:
+        ax.invert_xaxis()
+    if ax.yaxis_inverted() != invert_y:
+        ax.invert_yaxis()
 
 
 def _resolve_panel_text(
@@ -830,6 +917,7 @@ class UCM:
         cmap: _ColorMapLike | None = None,
         vmin: float | None = None,
         vmax: float | None = None,
+        origin: UcmOrigin = "lower_left",
         show_hist_colorbar: bool = True,
         colorbar_kwargs: dict[str, Any] | None = None,
         xlabel: str | None = None,
@@ -848,6 +936,14 @@ class UCM:
             Lower value limit override. If None, the instance value is used.
         vmax : float or None, optional
             Upper value limit override. If None, the instance value is used.
+        origin : {"upper_left", "upper_right", "lower_left", "lower_right", \
+"ul", "ur", "ll", "lr"}, default "lower_left"
+            Corner treated as the visual origin. ``"upper_left"``/``"ul"``
+            means x increases rightward and y increases downward.
+            ``"upper_right"``/``"ur"`` means x increases leftward and y
+            increases downward. ``"lower_left"``/``"ll"`` means x increases
+            rightward and y increases upward. ``"lower_right"``/``"lr"``
+            means x increases leftward and y increases upward.
         show_hist_colorbar : bool, default True
             Whether to draw a histogram colorbar.
         colorbar_kwargs : dict[str, Any] or None, optional
@@ -876,6 +972,7 @@ class UCM:
             vmin=self.vmin if vmin is None else vmin,
             vmax=self.vmax if vmax is None else vmax,
         )
+        _, invert_x, invert_y = _resolve_ucm_origin(origin)
         days = prepared_ucm.day.values
         resolutions = prepared_ucm.res.values
 
@@ -885,6 +982,7 @@ class UCM:
             vmin=vmin,
             vmax=vmax,
             aspect="auto",
+            origin="lower",
         )
         if show_hist_colorbar:
             resolved_colorbar_kwargs = {"location": "right"}
@@ -895,6 +993,7 @@ class UCM:
                 image,
                 **resolved_colorbar_kwargs,
             )
+        _apply_axis_inversion(ax, invert_x=invert_x, invert_y=invert_y)
         ax.set_xticks(range(len(days)), days)
         ax.set_yticks(range(len(resolutions)), resolutions)
         resolved_xlabel = self.temporal_label if xlabel is None else xlabel
@@ -1152,6 +1251,7 @@ class UCM:
         cmap: _ColorMapLike | None = None,
         vmin: float | None = None,
         vmax: float | None = None,
+        origin: UcmOrigin = "lower_left",
         show_hist_colorbar: bool = True,
         xlabel: str | None = None,
         ylabel: str | None = None,
@@ -1171,6 +1271,14 @@ class UCM:
             Lower value limit override. If None, the instance value is used.
         vmax : float or None, optional
             Upper value limit override. If None, the instance value is used.
+        origin : {"upper_left", "upper_right", "lower_left", "lower_right", \
+"ul", "ur", "ll", "lr"}, default "lower_left"
+            Corner treated as the visual origin. ``"upper_left"``/``"ul"``
+            means x increases rightward and y increases downward.
+            ``"upper_right"``/``"ur"`` means x increases leftward and y
+            increases downward. ``"lower_left"``/``"ll"`` means x increases
+            rightward and y increases upward. ``"lower_right"``/``"lr"``
+            means x increases leftward and y increases upward.
         show_hist_colorbar : bool, default True
             Whether to draw a histogram colorbar.
         xlabel : str or None, optional
@@ -1202,6 +1310,7 @@ class UCM:
             vmin=self.vmin if vmin is None else vmin,
             vmax=self.vmax if vmax is None else vmax,
         )
+        _, invert_x, invert_y = _resolve_ucm_origin(origin)
         days = prepared_ucm.day.values
         resolutions = prepared_ucm.res.values
         day_grid, resolution_grid = np.meshgrid(days, resolutions)
@@ -1230,7 +1339,7 @@ class UCM:
                 surface,
                 **resolved_colorbar_kwargs,
             )
-        ax.invert_yaxis()
+        _apply_axis_inversion(ax, invert_x=invert_x, invert_y=invert_y)
         ax.set_xticks(days)
         ax.set_yticks(resolutions)
         resolved_xlabel = self.temporal_label if xlabel is None else xlabel
@@ -1249,6 +1358,7 @@ class UCM:
         cmap: _ColorMapLike | None = None,
         vmin: float | None = None,
         vmax: float | None = None,
+        origin: UcmOrigin = "lower_left",
         profile_cmap: _ColorMapLike = "RdYlGn_r",
         profile_x_axis: _ProfileXAxisSetting = "variable",
         mosaic: _MosaicLayout | None = None,
@@ -1272,6 +1382,15 @@ class UCM:
             Lower value limit override. If None, the instance value is used.
         vmax : float or None, optional
             Upper value limit override. If None, the instance value is used.
+        origin : {"upper_left", "upper_right", "lower_left", "lower_right", \
+"ul", "ur", "ll", "lr"}, default "lower_left"
+            Corner treated as the visual origin for heatmap and 3D surface
+            panels. ``"upper_left"``/``"ul"`` means x increases rightward and
+            y increases downward. ``"upper_right"``/``"ur"`` means x increases
+            leftward and y increases downward. ``"lower_left"``/``"ll"`` means
+            x increases rightward and y increases upward.
+            ``"lower_right"``/``"lr"`` means x increases leftward and y
+            increases upward.
         profile_cmap : str or matplotlib.colors.Colormap, default
             "RdYlGn_r"
             Colormap sampled for spatial and temporal profile line colors.
@@ -1322,6 +1441,7 @@ class UCM:
                 cmap=cmap,
                 vmin=vmin,
                 vmax=vmax,
+                origin=origin,
                 show_hist_colorbar=_resolve_panel_bool(
                     "heatmap", False, show_hist_colorbar
                 ),
@@ -1377,6 +1497,7 @@ class UCM:
                 cmap=cmap,
                 vmin=vmin,
                 vmax=vmax,
+                origin=origin,
                 show_hist_colorbar=_resolve_panel_bool(
                     "surface_3d", True, show_hist_colorbar
                 ),
