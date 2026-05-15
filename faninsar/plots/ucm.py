@@ -47,6 +47,11 @@ _PanelName: TypeAlias = Literal["heatmap", "spatial", "temporal", "surface_3d"]
 _MosaicLayout: TypeAlias = list[list[_PanelName]]
 _ColorMapLike: TypeAlias = str | Colormap
 _UcmArrayDims: TypeAlias = Literal["st", "ts"]
+_ProfilePanelName: TypeAlias = Literal["spatial", "temporal"]
+_ProfileXAxis: TypeAlias = Literal["variable", "quantity"]
+_ProfileXAxisSetting: TypeAlias = (
+    _ProfileXAxis | Mapping[_ProfilePanelName, _ProfileXAxis]
+)
 _LabelName: TypeAlias = Literal[
     "xlabel",
     "ylabel",
@@ -145,6 +150,8 @@ def _default_ucm_labels(
     spatial_label: str = "Resolution (m)",
     temporal_label: str = "Maximum Temporal Baseline (days)",
     spatial_legend_label: str = "Days",
+    spatial_profile_x_axis: _ProfileXAxis = "variable",
+    temporal_profile_x_axis: _ProfileXAxis = "variable",
 ) -> dict[_PanelName, dict[_LabelName, str | None]]:
     """Create default panel labels for a UCM summary plot.
 
@@ -158,6 +165,10 @@ def _default_ucm_labels(
         Label used for temporal baseline axes and legends.
     spatial_legend_label : str, default "Days"
         Legend title used by the spatial profile panel.
+    spatial_profile_x_axis : {"variable", "quantity"}, default "variable"
+        X-axis mode for the spatial profile panel.
+    temporal_profile_x_axis : {"variable", "quantity"}, default "variable"
+        X-axis mode for the temporal profile panel.
 
     Returns
     -------
@@ -165,6 +176,16 @@ def _default_ucm_labels(
         Default labels keyed by panel name and label field.
 
     """
+    spatial_profile_labels = (
+        {"xlabel": spatial_label, "ylabel": quantity_label}
+        if spatial_profile_x_axis == "variable"
+        else {"xlabel": quantity_label, "ylabel": spatial_label}
+    )
+    temporal_profile_labels = (
+        {"xlabel": temporal_label, "ylabel": quantity_label}
+        if temporal_profile_x_axis == "variable"
+        else {"xlabel": quantity_label, "ylabel": temporal_label}
+    )
     return {
         "heatmap": {
             "xlabel": temporal_label,
@@ -173,14 +194,14 @@ def _default_ucm_labels(
             "legend_title": None,
         },
         "spatial": {
-            "xlabel": quantity_label,
-            "ylabel": spatial_label,
+            "xlabel": spatial_profile_labels["xlabel"],
+            "ylabel": spatial_profile_labels["ylabel"],
             "zlabel": None,
             "legend_title": spatial_legend_label,
         },
         "temporal": {
-            "xlabel": temporal_label,
-            "ylabel": quantity_label,
+            "xlabel": temporal_profile_labels["xlabel"],
+            "ylabel": temporal_profile_labels["ylabel"],
             "zlabel": None,
             "legend_title": spatial_label,
         },
@@ -255,6 +276,58 @@ def _resolve_panel_bool(
     if override is not None:
         return override
     return default_value
+
+
+def _validate_profile_x_axis(x_axis: str) -> _ProfileXAxis:
+    """Validate a UCM profile x-axis mode.
+
+    Parameters
+    ----------
+    x_axis : str
+        Requested x-axis mode.
+
+    Returns
+    -------
+    {"variable", "quantity"}
+        Validated x-axis mode.
+
+    Raises
+    ------
+    ValueError
+        If ``x_axis`` is not supported.
+
+    """
+    if x_axis in {"variable", "quantity"}:
+        return cast("_ProfileXAxis", x_axis)
+
+    logger.error("Invalid UCM profile x_axis value: %s.", x_axis)
+    msg = "x_axis must be 'variable' or 'quantity'."
+    raise ValueError(msg)
+
+
+def _resolve_profile_x_axis(
+    panel_name: _ProfilePanelName,
+    profile_x_axis: _ProfileXAxisSetting,
+) -> _ProfileXAxis:
+    """Resolve a profile x-axis mode for a named panel.
+
+    Parameters
+    ----------
+    panel_name : {"spatial", "temporal"}
+        Profile panel whose x-axis mode is resolved.
+    profile_x_axis : str or mapping
+        X-axis mode applied to both profile panels, or a mapping keyed by panel
+        name.
+
+    Returns
+    -------
+    {"variable", "quantity"}
+        Resolved and validated x-axis mode.
+
+    """
+    if isinstance(profile_x_axis, Mapping):
+        return _validate_profile_x_axis(profile_x_axis.get(panel_name, "variable"))
+    return _validate_profile_x_axis(profile_x_axis)
 
 
 def _prepare_ucm_data(
@@ -492,7 +565,6 @@ def create_ucm_mosaic(
     mosaic: _MosaicLayout | None = None,
     figsize: tuple[float, float] = (10.0, 10.0),
     dpi: int = 300,
-    constrained_layout: bool = True,
 ) -> tuple[Figure, _UcmAxes]:
     """Create a named UCM subplot mosaic.
 
@@ -506,8 +578,6 @@ def create_ucm_mosaic(
         Figure size in inches.
     dpi : int, default 300
         Figure resolution.
-    constrained_layout : bool, default True
-        Whether to enable Matplotlib constrained layout.
 
     Returns
     -------
@@ -523,7 +593,6 @@ def create_ucm_mosaic(
             resolved_mosaic,
             figsize=figsize,
             dpi=dpi,
-            constrained_layout=constrained_layout,
             per_subplot_kw={"surface_3d": {"projection": "3d"}},
         ),
     )
@@ -840,6 +909,7 @@ class UCM:
         self,
         ax: Axes | None = None,
         cmap: _ColorMapLike = "RdYlGn_r",
+        x_axis: _ProfileXAxis = "variable",
         vmin: float | None = None,
         vmax: float | None = None,
         xlabel: str | None = None,
@@ -856,14 +926,21 @@ class UCM:
             Axis that receives the spatial profile plot.
         cmap : str or matplotlib.colors.Colormap, default "RdYlGn_r"
             Colormap sampled for profile line colors.
+        x_axis : {"variable", "quantity"}, default "variable"
+            Whether the x-axis shows spatial resolution values or UCM quantity
+            values.
         vmin : float or None, optional
-            Lower x-axis limit override. If None, the instance value is used.
+            Lower quantity-axis limit override. If None, the instance value is
+            used.
         vmax : float or None, optional
-            Upper x-axis limit override. If None, the instance value is used.
+            Upper quantity-axis limit override. If None, the instance value is
+            used.
         xlabel : str or None, optional
-            X-axis label override. If None, ``quantity_label`` is used.
+            X-axis label override. If None, a label is selected from
+            ``x_axis``.
         ylabel : str or None, optional
-            Y-axis label override. If None, ``spatial_label`` is used.
+            Y-axis label override. If None, a label is selected from
+            ``x_axis``.
         legend_title : str or None, optional
             Legend title override. If None, ``temporal_label`` is used.
         legend_kwargs : dict[str, Any] or None, optional
@@ -879,6 +956,7 @@ class UCM:
             List of line objects for each hue in the plot.
 
         """
+        resolved_x_axis = _validate_profile_x_axis(x_axis)
         prepared_ucm, ax = _resolve_ucm_axes(
             self.ds_ucm,
             ax,
@@ -897,36 +975,60 @@ class UCM:
         lines = []
         for index, hue in enumerate(hues):
             subset = dataframe[dataframe["day"] == hue]
-            lines.append(
-                ax.plot(
-                    subset["velocity"],
-                    subset["res"],
-                    label=hue,
-                    color=palette[index],
-                    marker="o",
-                    linewidth=2,
+            if resolved_x_axis == "variable":
+                lines.append(
+                    ax.plot(
+                        subset["res"],
+                        subset["velocity"],
+                        label=hue,
+                        color=palette[index],
+                        marker="o",
+                        linewidth=2,
+                    )
                 )
-            )
-        ax.invert_yaxis()
-        ax.set_yticks(resolutions, resolutions)
+            else:
+                lines.append(
+                    ax.plot(
+                        subset["velocity"],
+                        subset["res"],
+                        label=hue,
+                        color=palette[index],
+                        marker="o",
+                        linewidth=2,
+                    )
+                )
         ax.legend(
             title=self.temporal_label if legend_title is None else legend_title,
             **({} if legend_kwargs is None else legend_kwargs),
         )
-        resolved_xlabel = self.quantity_label if xlabel is None else xlabel
-        resolved_ylabel = self.spatial_label if ylabel is None else ylabel
+        default_xlabel = (
+            self.spatial_label if resolved_x_axis == "variable" else self.quantity_label
+        )
+        default_ylabel = (
+            self.quantity_label if resolved_x_axis == "variable" else self.spatial_label
+        )
+        resolved_xlabel = default_xlabel if xlabel is None else xlabel
+        resolved_ylabel = default_ylabel if ylabel is None else ylabel
         if resolved_xlabel is not None:
             ax.set_xlabel(resolved_xlabel)
         if resolved_ylabel is not None:
             ax.set_ylabel(resolved_ylabel)
-        ax.set_xlim(vmin, vmax)
-        ax.axvline(0, color="k", lw=2, ls="-.")
+        if resolved_x_axis == "variable":
+            ax.set_xticks(resolutions, resolutions)
+            ax.set_ylim(vmin, vmax)
+            ax.axhline(0, color="k", lw=2, ls="-.")
+        else:
+            ax.invert_yaxis()
+            ax.set_yticks(resolutions, resolutions)
+            ax.set_xlim(vmin, vmax)
+            ax.axvline(0, color="k", lw=2, ls="-.")
         return lines
 
     def plot_tprofile(
         self,
         ax: Axes | None = None,
         cmap: _ColorMapLike = "RdYlGn_r",
+        x_axis: _ProfileXAxis = "variable",
         vmin: float | None = None,
         vmax: float | None = None,
         xlabel: str | None = None,
@@ -943,14 +1045,21 @@ class UCM:
             Axis that receives the temporal profile plot.
         cmap : str or matplotlib.colors.Colormap, default "RdYlGn_r"
             Colormap sampled for profile line colors.
+        x_axis : {"variable", "quantity"}, default "variable"
+            Whether the x-axis shows temporal baseline values or UCM quantity
+            values.
         vmin : float or None, optional
-            Lower y-axis limit override. If None, the instance value is used.
+            Lower quantity-axis limit override. If None, the instance value is
+            used.
         vmax : float or None, optional
-            Upper y-axis limit override. If None, the instance value is used.
+            Upper quantity-axis limit override. If None, the instance value is
+            used.
         xlabel : str or None, optional
-            X-axis label override. If None, ``temporal_label`` is used.
+            X-axis label override. If None, a label is selected from
+            ``x_axis``.
         ylabel : str or None, optional
-            Y-axis label override. If None, ``quantity_label`` is used.
+            Y-axis label override. If None, a label is selected from
+            ``x_axis``.
         legend_title : str or None, optional
             Legend title override. If None, ``spatial_label`` is used.
         legend_kwargs : dict[str, Any] or None, optional
@@ -966,6 +1075,7 @@ class UCM:
             List of line objects for each hue in the plot.
 
         """
+        resolved_x_axis = _validate_profile_x_axis(x_axis)
         prepared_ucm, ax = _resolve_ucm_axes(
             self.ds_ucm,
             ax,
@@ -977,35 +1087,63 @@ class UCM:
             vmax=self.vmax if vmax is None else vmax,
         )
         dataframe = prepared_ucm.to_pandas().stack().reset_index(name="velocity")
+        days = prepared_ucm.day.values
 
         hues = dataframe["res"].unique()
         palette = _profile_palette(len(hues), cmap=cmap)
         lines = []
         for index, hue in enumerate(hues):
             subset = dataframe[dataframe["res"] == hue]
-            lines.append(
-                ax.plot(
-                    subset["day"],
-                    subset["velocity"],
-                    label=hue,
-                    color=palette[index],
-                    marker="o",
-                    linewidth=2,
+            if resolved_x_axis == "variable":
+                lines.append(
+                    ax.plot(
+                        subset["day"],
+                        subset["velocity"],
+                        label=hue,
+                        color=palette[index],
+                        marker="o",
+                        linewidth=2,
+                    )
                 )
-            )
-        ax.axhline(0, color="k", lw=2, ls="-.")
-        ax.set_xticks(dataframe["day"].unique())
+            else:
+                lines.append(
+                    ax.plot(
+                        subset["velocity"],
+                        subset["day"],
+                        label=hue,
+                        color=palette[index],
+                        marker="o",
+                        linewidth=2,
+                    )
+                )
         ax.legend(
             title=self.spatial_label if legend_title is None else legend_title,
             **({} if legend_kwargs is None else legend_kwargs),
         )
-        resolved_xlabel = self.temporal_label if xlabel is None else xlabel
-        resolved_ylabel = self.quantity_label if ylabel is None else ylabel
+        default_xlabel = (
+            self.temporal_label
+            if resolved_x_axis == "variable"
+            else self.quantity_label
+        )
+        default_ylabel = (
+            self.quantity_label
+            if resolved_x_axis == "variable"
+            else self.temporal_label
+        )
+        resolved_xlabel = default_xlabel if xlabel is None else xlabel
+        resolved_ylabel = default_ylabel if ylabel is None else ylabel
         if resolved_xlabel is not None:
             ax.set_xlabel(resolved_xlabel)
         if resolved_ylabel is not None:
             ax.set_ylabel(resolved_ylabel)
-        ax.set_ylim(vmin, vmax)
+        if resolved_x_axis == "variable":
+            ax.axhline(0, color="k", lw=2, ls="-.")
+            ax.set_xticks(days)
+            ax.set_ylim(vmin, vmax)
+        else:
+            ax.axvline(0, color="k", lw=2, ls="-.")
+            ax.set_yticks(days)
+            ax.set_xlim(vmin, vmax)
         return lines
 
     def plot_3d_surface(
@@ -1112,10 +1250,10 @@ class UCM:
         vmin: float | None = None,
         vmax: float | None = None,
         profile_cmap: _ColorMapLike = "RdYlGn_r",
+        profile_x_axis: _ProfileXAxisSetting = "variable",
         mosaic: _MosaicLayout | None = None,
         figsize: tuple[float, float] = (10.0, 10.0),
         dpi: int = 300,
-        constrained_layout: bool = True,
         show_hist_colorbar: bool | Mapping[_PanelName, bool] | None = None,
         xlabel: _PanelText = None,
         ylabel: _PanelText = None,
@@ -1137,14 +1275,16 @@ class UCM:
         profile_cmap : str or matplotlib.colors.Colormap, default
             "RdYlGn_r"
             Colormap sampled for spatial and temporal profile line colors.
+        profile_x_axis : {"variable", "quantity"} or mapping, default "variable"
+            X-axis mode for profile panels. A string applies to both profile
+            panels. A mapping can configure ``"spatial"`` and ``"temporal"``
+            separately.
         mosaic : list[list[str]] or None, optional
             Named subplot mosaic.
         figsize : tuple[float, float], default (10.0, 10.0)
             Figure size in inches.
         dpi : int, default 300
             Figure resolution.
-        constrained_layout : bool, default True
-            Whether to enable Matplotlib constrained layout.
         show_hist_colorbar : bool, mapping, or None, optional
             Histogram colorbar visibility.
         xlabel, ylabel, zlabel, legend_title : str, mapping, or None
@@ -1161,17 +1301,20 @@ class UCM:
             Figure and named axes.
 
         """
+        spatial_profile_x_axis = _resolve_profile_x_axis("spatial", profile_x_axis)
+        temporal_profile_x_axis = _resolve_profile_x_axis("temporal", profile_x_axis)
         labels = _default_ucm_labels(
             self.quantity_label,
             spatial_label=self.spatial_label,
             temporal_label=self.temporal_label,
             spatial_legend_label=self.temporal_label,
+            spatial_profile_x_axis=spatial_profile_x_axis,
+            temporal_profile_x_axis=temporal_profile_x_axis,
         )
         figure, axes = create_ucm_mosaic(
             mosaic=mosaic,
             figsize=figsize,
             dpi=dpi,
-            constrained_layout=constrained_layout,
         )
         if "heatmap" in axes:
             self.plot_heatmap(
@@ -1192,6 +1335,7 @@ class UCM:
             self.plot_sprofile(
                 ax=axes["spatial"],
                 cmap=profile_cmap,
+                x_axis=spatial_profile_x_axis,
                 vmin=vmin,
                 vmax=vmax,
                 xlabel=_resolve_panel_text("spatial", "xlabel", labels, xlabel),
@@ -1207,6 +1351,7 @@ class UCM:
             self.plot_tprofile(
                 ax=axes["temporal"],
                 cmap=profile_cmap,
+                x_axis=temporal_profile_x_axis,
                 vmin=vmin,
                 vmax=vmax,
                 xlabel=_resolve_panel_text("temporal", "xlabel", labels, xlabel),

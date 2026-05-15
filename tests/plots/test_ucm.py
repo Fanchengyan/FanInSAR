@@ -248,7 +248,8 @@ def test_ucm_plot_maps_quantity_label_to_value_labels() -> None:
     """Composite UCM plot should map quantity label to value-axis defaults."""
     fig, axes = UCM(_sample_ucm(), quantity_label="Custom velocity").plot()
 
-    assert axes["spatial"].get_xlabel() == "Custom velocity"
+    assert axes["spatial"].get_xlabel() == "Resolution (m)"
+    assert axes["spatial"].get_ylabel() == "Custom velocity"
     assert (
         axes["spatial"].get_legend().get_title().get_text()
         == "Maximum Temporal Baseline (days)"
@@ -287,8 +288,8 @@ def test_ucm_profile_methods_use_init_labels() -> None:
     temporal_lines = ucm.plot_tprofile(ax=axes[1])
 
     assert len(spatial_lines) == 3
-    assert axes[0].get_xlabel() == "Velocity"
-    assert axes[0].get_ylabel() == "Grid size"
+    assert axes[0].get_xlabel() == "Grid size"
+    assert axes[0].get_ylabel() == "Velocity"
     assert axes[0].get_legend().get_title().get_text() == "Days"
     assert len(temporal_lines) == 2
     assert axes[1].get_xlabel() == "Days"
@@ -314,6 +315,60 @@ def test_ucm_profile_methods_accept_custom_cmap() -> None:
         plt.get_cmap("plasma", 2)(0),
     )
     plt.close(fig)
+
+
+def test_ucm_spatial_profile_variable_x_axis_uses_resolution_data() -> None:
+    """Spatial profile should use resolution on x-axis in variable mode."""
+    fig, ax = plt.subplots()
+    lines = UCM(_sample_ucm()).plot_sprofile(ax=ax, x_axis="variable")
+
+    np.testing.assert_array_equal(lines[0][0].get_xdata(), [30, 60])
+    np.testing.assert_allclose(lines[0][0].get_ydata(), [1.0, 1.5])
+    assert ax.get_xlabel() == "Resolution (m)"
+    assert ax.get_ylabel() == "Velocity (mm/yr)"
+    plt.close(fig)
+
+
+def test_ucm_spatial_profile_quantity_x_axis_preserves_legacy_data() -> None:
+    """Spatial profile should use quantity on x-axis in quantity mode."""
+    fig, ax = plt.subplots()
+    lines = UCM(_sample_ucm()).plot_sprofile(ax=ax, x_axis="quantity")
+
+    np.testing.assert_allclose(lines[0][0].get_xdata(), [1.0, 1.5])
+    np.testing.assert_array_equal(lines[0][0].get_ydata(), [30, 60])
+    assert ax.get_xlabel() == "Velocity (mm/yr)"
+    assert ax.get_ylabel() == "Resolution (m)"
+    plt.close(fig)
+
+
+def test_ucm_temporal_profile_variable_x_axis_uses_day_data() -> None:
+    """Temporal profile should use day on x-axis in variable mode."""
+    fig, ax = plt.subplots()
+    lines = UCM(_sample_ucm()).plot_tprofile(ax=ax, x_axis="variable")
+
+    np.testing.assert_array_equal(lines[0][0].get_xdata(), [12, 24, 36])
+    np.testing.assert_allclose(lines[0][0].get_ydata(), [1.0, 2.0, 3.0])
+    assert ax.get_xlabel() == "Maximum Temporal Baseline (days)"
+    assert ax.get_ylabel() == "Velocity (mm/yr)"
+    plt.close(fig)
+
+
+def test_ucm_temporal_profile_quantity_x_axis_uses_quantity_data() -> None:
+    """Temporal profile should use quantity on x-axis in quantity mode."""
+    fig, ax = plt.subplots()
+    lines = UCM(_sample_ucm()).plot_tprofile(ax=ax, x_axis="quantity")
+
+    np.testing.assert_allclose(lines[0][0].get_xdata(), [1.0, 2.0, 3.0])
+    np.testing.assert_array_equal(lines[0][0].get_ydata(), [12, 24, 36])
+    assert ax.get_xlabel() == "Velocity (mm/yr)"
+    assert ax.get_ylabel() == "Maximum Temporal Baseline (days)"
+    plt.close(fig)
+
+
+def test_ucm_profile_methods_reject_invalid_x_axis() -> None:
+    """Profile methods should reject unsupported x-axis modes."""
+    with pytest.raises(ValueError, match="x_axis"):
+        UCM(_sample_ucm()).plot_sprofile(x_axis="invalid")
 
 
 def test_ucm_3d_surface_uses_init_labels() -> None:
@@ -367,8 +422,8 @@ def test_ucm_plot_uses_init_labels_and_mapping_overrides() -> None:
 
     assert axes["heatmap"].get_xlabel() == "Custom heatmap days"
     assert axes["heatmap"].get_ylabel() == "Grid size"
-    assert axes["spatial"].get_xlabel() == "Velocity"
-    assert axes["spatial"].get_ylabel() == "Grid size"
+    assert axes["spatial"].get_xlabel() == "Grid size"
+    assert axes["spatial"].get_ylabel() == "Velocity"
     assert axes["spatial"].get_legend().get_title().get_text() == "Days"
     assert axes["temporal"].get_xlabel() == "Days"
     assert axes["temporal"].get_ylabel() == "Velocity"
@@ -376,4 +431,21 @@ def test_ucm_plot_uses_init_labels_and_mapping_overrides() -> None:
     assert axes["surface_3d"].get_xlabel() == "Days"
     assert axes["surface_3d"].get_ylabel() == "Grid size"
     assert axes["surface_3d"].get_zlabel() == "Velocity"
+    plt.close(fig)
+
+
+def test_ucm_plot_forwards_profile_x_axis_mapping() -> None:
+    """Composite plot should forward per-panel profile x-axis modes."""
+    fig, axes = UCM(_sample_ucm()).plot(
+        profile_x_axis={"spatial": "quantity", "temporal": "quantity"}
+    )
+
+    assert axes["spatial"].get_xlabel() == "Velocity (mm/yr)"
+    assert axes["spatial"].get_ylabel() == "Resolution (m)"
+    np.testing.assert_allclose(axes["spatial"].lines[0].get_xdata(), [1.0, 1.5])
+    np.testing.assert_array_equal(axes["spatial"].lines[0].get_ydata(), [30, 60])
+    assert axes["temporal"].get_xlabel() == "Velocity (mm/yr)"
+    assert axes["temporal"].get_ylabel() == "Maximum Temporal Baseline (days)"
+    np.testing.assert_allclose(axes["temporal"].lines[0].get_xdata(), [1.0, 2.0, 3.0])
+    np.testing.assert_array_equal(axes["temporal"].lines[0].get_ydata(), [12, 24, 36])
     plt.close(fig)
