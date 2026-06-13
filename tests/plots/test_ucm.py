@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 import xarray as xr
+from matplotlib.ticker import NullFormatter
 
 from faninsar.plots.ucm import UCM
 
@@ -14,6 +15,19 @@ def _sample_ucm() -> xr.DataArray:
         np.array([[1.0, 2.0, 3.0], [1.5, 2.5, 3.5]]),
         dims=("res", "day"),
         coords={"res": [30, 60], "day": [12, 24, 36]},
+        name="velocity",
+    )
+
+
+def _dense_sample_ucm() -> xr.DataArray:
+    """Create dense UCM data for 3D surface tick tests."""
+    resolutions = np.arange(30, 331, 30)
+    days = np.arange(12, 253, 12)
+    values = resolutions[:, np.newaxis] * 0.02 + days[np.newaxis, :] * 0.005
+    return xr.DataArray(
+        values,
+        dims=("res", "day"),
+        coords={"res": resolutions, "day": days},
         name="velocity",
     )
 
@@ -296,6 +310,101 @@ def test_surface_3d_uses_lower_left_origin_by_default() -> None:
     plt.close(surface.figure)
 
 
+def test_surface_3d_uses_sparse_auto_major_ticks_for_dense_data() -> None:
+    """3D surface should use sparse major ticks and unlabeled minor ticks."""
+    dense_ucm = _dense_sample_ucm()
+    surface = UCM(dense_ucm).plot_3d_surface(show_hist_colorbar=False)
+
+    x_major_ticks = surface.axes.get_xticks()
+    y_major_ticks = surface.axes.get_yticks()
+    x_minor_ticks = surface.axes.xaxis.get_minorticklocs()
+    y_minor_ticks = surface.axes.yaxis.get_minorticklocs()
+
+    assert len(x_major_ticks) < len(dense_ucm.day.values)
+    assert len(y_major_ticks) < len(dense_ucm.res.values)
+    assert np.isin(x_major_ticks, dense_ucm.day.values).all()
+    assert np.isin(y_major_ticks, dense_ucm.res.values).all()
+    assert np.isin(x_minor_ticks, dense_ucm.day.values).all()
+    assert np.isin(y_minor_ticks, dense_ucm.res.values).all()
+    np.testing.assert_allclose([x_major_ticks[0], x_major_ticks[-1]], [12, 252])
+    np.testing.assert_allclose([y_major_ticks[0], y_major_ticks[-1]], [30, 330])
+    assert len(x_minor_ticks) == len(dense_ucm.day.values) - len(x_major_ticks)
+    assert len(y_minor_ticks) == len(dense_ucm.res.values) - len(y_major_ticks)
+    assert isinstance(surface.axes.xaxis.get_minor_formatter(), NullFormatter)
+    assert isinstance(surface.axes.yaxis.get_minor_formatter(), NullFormatter)
+    plt.close(surface.figure)
+
+
+def test_surface_3d_all_major_ticks_restore_previous_behavior() -> None:
+    """3D surface should support restoring all coordinates as major ticks."""
+    dense_ucm = _dense_sample_ucm()
+    surface = UCM(dense_ucm).plot_3d_surface(
+        show_hist_colorbar=False,
+        x_major_tick_count="all",
+        y_major_tick_count="all",
+    )
+
+    np.testing.assert_array_equal(surface.axes.get_xticks(), dense_ucm.day.values)
+    np.testing.assert_array_equal(surface.axes.get_yticks(), dense_ucm.res.values)
+    assert surface.axes.xaxis.get_minorticklocs().size == 0
+    assert surface.axes.yaxis.get_minorticklocs().size == 0
+    plt.close(surface.figure)
+
+
+def test_surface_3d_supports_explicit_major_tick_counts() -> None:
+    """3D surface should use the requested number of major ticks."""
+    dense_ucm = _dense_sample_ucm()
+    surface = UCM(dense_ucm).plot_3d_surface(
+        show_hist_colorbar=False,
+        x_major_tick_count=5,
+        y_major_tick_count=4,
+    )
+
+    x_major_ticks = surface.axes.get_xticks()
+    y_major_ticks = surface.axes.get_yticks()
+
+    assert len(x_major_ticks) == 5
+    assert len(y_major_ticks) == 4
+    np.testing.assert_allclose([x_major_ticks[0], x_major_ticks[-1]], [12, 252])
+    np.testing.assert_allclose([y_major_ticks[0], y_major_ticks[-1]], [30, 330])
+    assert len(surface.axes.xaxis.get_minorticklocs()) == len(dense_ucm.day.values) - 5
+    assert len(surface.axes.yaxis.get_minorticklocs()) == len(dense_ucm.res.values) - 4
+    assert isinstance(surface.axes.xaxis.get_minor_formatter(), NullFormatter)
+    assert isinstance(surface.axes.yaxis.get_minor_formatter(), NullFormatter)
+    plt.close(surface.figure)
+
+
+@pytest.mark.parametrize(
+    "tick_kwargs",
+    [
+        {"x_major_tick_count": 0},
+        {"y_major_tick_count": -1},
+        {"x_major_tick_count": "invalid"},
+    ],
+)
+def test_surface_3d_rejects_invalid_major_tick_counts(
+    tick_kwargs: dict[str, int | str],
+) -> None:
+    """3D surface should reject unsupported major tick count values."""
+    with pytest.raises(ValueError, match="major_tick_count"):
+        UCM(_dense_sample_ucm()).plot_3d_surface(
+            show_hist_colorbar=False,
+            **tick_kwargs,
+        )
+
+
+def test_surface_3d_small_axes_fall_back_to_all_major_ticks() -> None:
+    """Small UCM axes should not create minor ticks in auto mode."""
+    sample_ucm = _sample_ucm()
+    surface = UCM(sample_ucm).plot_3d_surface(show_hist_colorbar=False)
+
+    np.testing.assert_array_equal(surface.axes.get_xticks(), sample_ucm.day.values)
+    np.testing.assert_array_equal(surface.axes.get_yticks(), sample_ucm.res.values)
+    assert surface.axes.xaxis.get_minorticklocs().size == 0
+    assert surface.axes.yaxis.get_minorticklocs().size == 0
+    plt.close(surface.figure)
+
+
 @pytest.mark.parametrize(
     ("origin", "invert_x", "invert_y"),
     _CANONICAL_ORIGIN_EXPECTATIONS,
@@ -396,6 +505,21 @@ def test_ucm_plot_forwards_origin_to_heatmap_and_surface() -> None:
     assert bool(axes["heatmap"].yaxis_inverted()) is True
     assert bool(axes["surface_3d"].xaxis_inverted()) is True
     assert bool(axes["surface_3d"].yaxis_inverted()) is True
+    plt.close(fig)
+
+
+def test_ucm_plot_forwards_surface_major_tick_counts() -> None:
+    """Composite UCM plot should forward 3D surface tick settings."""
+    fig, axes = UCM(_dense_sample_ucm()).plot(
+        show_hist_colorbar=False,
+        surface_x_major_tick_count=4,
+        surface_y_major_tick_count=3,
+    )
+
+    assert len(axes["surface_3d"].get_xticks()) == 4
+    assert len(axes["surface_3d"].get_yticks()) == 3
+    assert len(axes["surface_3d"].xaxis.get_minorticklocs()) == 17
+    assert len(axes["surface_3d"].yaxis.get_minorticklocs()) == 8
     plt.close(fig)
 
 

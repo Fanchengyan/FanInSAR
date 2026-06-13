@@ -17,6 +17,7 @@ from typing import (
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import Colormap
+from matplotlib.ticker import MaxNLocator, NullFormatter
 
 from faninsar.logging import setup_logger
 
@@ -68,6 +69,7 @@ _ProfileXAxis: TypeAlias = Literal["variable", "quantity"]
 _ProfileXAxisSetting: TypeAlias = (
     _ProfileXAxis | Mapping[_ProfilePanelName, _ProfileXAxis]
 )
+_SurfaceMajorTickCount: TypeAlias = int | Literal["auto", "all"]
 _LabelName: TypeAlias = Literal[
     "xlabel",
     "ylabel",
@@ -417,6 +419,109 @@ def _resolve_profile_x_axis(
     return _validate_profile_x_axis(profile_x_axis)
 
 
+def _resolve_surface_axis_ticks(
+    coords: np.ndarray,
+    major_tick_count: _SurfaceMajorTickCount = "auto",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve major and minor tick locations for a 3D UCM surface axis.
+
+    Parameters
+    ----------
+    coords : numpy.ndarray
+        One-dimensional coordinate values plotted along a 3D surface axis.
+    major_tick_count : int or {"auto", "all"}, default "auto"
+        Major tick selection strategy. ``"auto"`` chooses a sparse subset of
+        the provided coordinates using :class:`matplotlib.ticker.MaxNLocator`
+        candidates mapped back onto real coordinate values. ``"all"`` uses
+        every coordinate as a major tick. An integer requests that many major
+        ticks, sampled uniformly from the real coordinates and always including
+        both endpoints.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, numpy.ndarray]
+        Major tick coordinates and minor tick coordinates. Minor ticks are the
+        remaining real coordinates not used as major ticks.
+
+    Raises
+    ------
+    ValueError
+        If ``major_tick_count`` is neither ``"auto"``, ``"all"``, nor an
+        integer greater than or equal to 2.
+
+    """
+    coord_values = np.asarray(coords)
+    if coord_values.ndim != 1:
+        logger.error(
+            "Surface axis coordinates must be one-dimensional, got shape %s.",
+            coord_values.shape,
+        )
+        msg = "Surface axis coordinates must be one-dimensional."
+        raise ValueError(msg)
+
+    if coord_values.size == 0:
+        return coord_values, np.array([], dtype=coord_values.dtype)
+
+    if major_tick_count == "all":
+        return coord_values, np.array([], dtype=coord_values.dtype)
+
+    if major_tick_count == "auto":
+        numeric_coords = np.asarray(coord_values, dtype=float)
+        locator = MaxNLocator(nbins="auto", min_n_ticks=2)
+        candidate_ticks = locator.tick_values(
+            float(np.nanmin(numeric_coords)),
+            float(np.nanmax(numeric_coords)),
+        )
+        selected_indices = {0, coord_values.size - 1}
+        for candidate_tick in candidate_ticks:
+            selected_indices.add(
+                int(np.abs(numeric_coords - float(candidate_tick)).argmin())
+            )
+    else:
+        if isinstance(major_tick_count, bool) or not isinstance(
+            major_tick_count,
+            (int, np.integer),
+        ):
+            logger.error(
+                "Invalid surface major tick count: %r.",
+                major_tick_count,
+            )
+            msg = "major_tick_count must be 'auto', 'all', or an integer >= 2."
+            raise ValueError(msg)
+
+        resolved_major_tick_count = int(major_tick_count)
+        if resolved_major_tick_count < 2:
+            logger.error(
+                "Surface major tick count must be at least 2, got %s.",
+                resolved_major_tick_count,
+            )
+            msg = "major_tick_count must be 'auto', 'all', or an integer >= 2."
+            raise ValueError(msg)
+
+        if coord_values.size <= resolved_major_tick_count:
+            return coord_values, np.array([], dtype=coord_values.dtype)
+
+        sampled_indices = np.rint(
+            np.linspace(
+                0,
+                coord_values.size - 1,
+                num=resolved_major_tick_count,
+            )
+        ).astype(int)
+        selected_indices = set(sampled_indices.tolist())
+        selected_indices.update({0, coord_values.size - 1})
+
+    major_indices = np.array(
+        [index for index in range(coord_values.size) if index in selected_indices],
+        dtype=int,
+    )
+    minor_indices = np.array(
+        [index for index in range(coord_values.size) if index not in selected_indices],
+        dtype=int,
+    )
+    return coord_values[major_indices], coord_values[minor_indices]
+
+
 def _prepare_ucm_data(
     ds_ucm: xr.DataArray,
     spatial_dim: str = "res",
@@ -587,7 +692,7 @@ def _resolve_color_limits(
     value_range = upper_limit - lower_limit
     if value_range == 0.0:
         value_range = abs(upper_limit) if upper_limit != 0.0 else 1.0
-    padding = value_range * padding_fraction
+    padding = abs(value_range * padding_fraction)
     return lower_limit - padding, upper_limit + padding
 
 
@@ -1114,12 +1219,12 @@ class UCM:
             ax.set_ylabel(resolved_ylabel)
         if resolved_x_axis == "variable":
             ax.set_xticks(resolutions, resolutions)
-            ax.set_ylim(vmin, vmax)
+            # ax.set_ylim(vmin, vmax)
             ax.axhline(0, color="k", lw=2, ls="-.")
         else:
             ax.invert_yaxis()
             ax.set_yticks(resolutions, resolutions)
-            ax.set_xlim(vmin, vmax)
+            # ax.set_xlim(vmin, vmax)
             ax.axvline(0, color="k", lw=2, ls="-.")
         return lines
 
@@ -1238,11 +1343,11 @@ class UCM:
         if resolved_x_axis == "variable":
             ax.axhline(0, color="k", lw=2, ls="-.")
             ax.set_xticks(days)
-            ax.set_ylim(vmin, vmax)
+            # ax.set_ylim(vmin, vmax)
         else:
             ax.axvline(0, color="k", lw=2, ls="-.")
             ax.set_yticks(days)
-            ax.set_xlim(vmin, vmax)
+            # ax.set_xlim(vmin, vmax)
         return lines
 
     def plot_3d_surface(
@@ -1252,6 +1357,8 @@ class UCM:
         vmin: float | None = None,
         vmax: float | None = None,
         origin: UcmOrigin = "lower_left",
+        x_major_tick_count: _SurfaceMajorTickCount = "auto",
+        y_major_tick_count: _SurfaceMajorTickCount = "auto",
         show_hist_colorbar: bool = True,
         xlabel: str | None = None,
         ylabel: str | None = None,
@@ -1279,6 +1386,18 @@ class UCM:
             increases downward. ``"lower_left"``/``"ll"`` means x increases
             rightward and y increases upward. ``"lower_right"``/``"lr"``
             means x increases leftward and y increases upward.
+        x_major_tick_count : int or {"auto", "all"}, default "auto"
+            X-axis major tick selection strategy. ``"auto"`` selects a sparse
+            subset of real temporal coordinates, ``"all"`` uses every
+            coordinate as a major tick, and an integer requests a uniformly
+            sampled number of major ticks. Remaining real coordinates are drawn
+            as minor ticks without labels.
+        y_major_tick_count : int or {"auto", "all"}, default "auto"
+            Y-axis major tick selection strategy. ``"auto"`` selects a sparse
+            subset of real spatial coordinates, ``"all"`` uses every
+            coordinate as a major tick, and an integer requests a uniformly
+            sampled number of major ticks. Remaining real coordinates are drawn
+            as minor ticks without labels.
         show_hist_colorbar : bool, default True
             Whether to draw a histogram colorbar.
         xlabel : str or None, optional
@@ -1313,6 +1432,14 @@ class UCM:
         _, invert_x, invert_y = _resolve_ucm_origin(origin)
         days = prepared_ucm.day.values
         resolutions = prepared_ucm.res.values
+        x_major_ticks, x_minor_ticks = _resolve_surface_axis_ticks(
+            days,
+            major_tick_count=x_major_tick_count,
+        )
+        y_major_ticks, y_minor_ticks = _resolve_surface_axis_ticks(
+            resolutions,
+            major_tick_count=y_major_tick_count,
+        )
         day_grid, resolution_grid = np.meshgrid(days, resolutions)
 
         surface = ax.plot_surface(
@@ -1340,8 +1467,12 @@ class UCM:
                 **resolved_colorbar_kwargs,
             )
         _apply_axis_inversion(ax, invert_x=invert_x, invert_y=invert_y)
-        ax.set_xticks(days)
-        ax.set_yticks(resolutions)
+        ax.set_xticks(x_major_ticks)
+        ax.set_yticks(y_major_ticks)
+        ax.set_xticks(x_minor_ticks, minor=True)
+        ax.set_yticks(y_minor_ticks, minor=True)
+        ax.xaxis.set_minor_formatter(NullFormatter())
+        ax.yaxis.set_minor_formatter(NullFormatter())
         resolved_xlabel = self.temporal_label if xlabel is None else xlabel
         resolved_ylabel = self.spatial_label if ylabel is None else ylabel
         resolved_zlabel = self.quantity_label if zlabel is None else zlabel
@@ -1365,6 +1496,8 @@ class UCM:
         figsize: tuple[float, float] = (10.0, 10.0),
         dpi: int = 300,
         show_hist_colorbar: bool | Mapping[_PanelName, bool] | None = None,
+        surface_x_major_tick_count: _SurfaceMajorTickCount = "auto",
+        surface_y_major_tick_count: _SurfaceMajorTickCount = "auto",
         xlabel: _PanelText = None,
         ylabel: _PanelText = None,
         zlabel: _PanelText = None,
@@ -1406,6 +1539,12 @@ class UCM:
             Figure resolution.
         show_hist_colorbar : bool, mapping, or None, optional
             Histogram colorbar visibility.
+        surface_x_major_tick_count : int or {"auto", "all"}, default "auto"
+            X-axis major tick selection strategy forwarded to the
+            three-dimensional surface panel.
+        surface_y_major_tick_count : int or {"auto", "all"}, default "auto"
+            Y-axis major tick selection strategy forwarded to the
+            three-dimensional surface panel.
         xlabel, ylabel, zlabel, legend_title : str, mapping, or None
             Label overrides. Mappings are merged with instance label defaults.
         legend_kwargs : mapping or None, optional
@@ -1498,6 +1637,8 @@ class UCM:
                 vmin=vmin,
                 vmax=vmax,
                 origin=origin,
+                x_major_tick_count=surface_x_major_tick_count,
+                y_major_tick_count=surface_y_major_tick_count,
                 show_hist_colorbar=_resolve_panel_bool(
                     "surface_3d", True, show_hist_colorbar
                 ),
