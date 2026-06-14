@@ -10,14 +10,14 @@ from collections import OrderedDict
 from functools import lru_cache, partial
 from html import escape
 from importlib.resources import files
-from typing import TYPE_CHECKING, Callable, Union
+from typing import TYPE_CHECKING
 
 from xarray.core.formatting import (
     format_array_flat,
     inline_index_repr,
     inline_variable_array_repr,
 )
-from xarray.core.options import _get_boolean_with_default
+from xarray.core.options import _get_boolean_with_default  # noqa: PLC2701
 
 from .formatting import short_data_repr
 
@@ -27,7 +27,7 @@ STATIC_FILES = (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable, Mapping
+    from collections.abc import Callable, Hashable, Mapping
 
     import numpy as np
     from xarray import DataArray, Dataset, Variable
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
     from faninsar import Pairs
 
-    T_Xarray = Union[DataArray, Variable, Dataset]
+    T_Xarray = DataArray | Variable | Dataset
 
 
 @lru_cache(None)

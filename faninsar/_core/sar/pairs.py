@@ -343,6 +343,9 @@ class Pairs:
     @overload
     def __getitem__(self, index: slice) -> Pairs | None: ...
 
+    @overload
+    def __getitem__(self, index: np.ndarray) -> Pairs: ...
+
     def __getitem__(  # noqa: PLR0911
         self,
         index: int | slice | datetime | str | PairLike | Iterable,

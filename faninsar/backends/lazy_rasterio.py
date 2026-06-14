@@ -6,7 +6,7 @@ into dask arrays for lazy loading and parallel computation.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Literal
 
 import dask
 import dask.array as da
@@ -14,6 +14,8 @@ import rasterio
 from rasterio.windows import Window
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import numpy as np
 
 
@@ -346,4 +348,3 @@ class LazyMultiFileReader:
 
         # Stack along new dimension (file dimension)
         return da.stack(lazy_arrays, axis=0)
-
