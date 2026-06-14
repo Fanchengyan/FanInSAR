@@ -1,4 +1,4 @@
-"""A module for managing the data of HyP3 Sentinel-1 interferograms."""
+"""HyP3 Sentinel-1 interferogram dataset."""
 
 from __future__ import annotations
 
@@ -11,29 +11,26 @@ from faninsar.datasets.ifg import InterferogramDataset
 
 
 class HyP3S1(InterferogramDataset, Sentinel1):
-    """A dataset manages the data of HyP3 Sentinel-1 product.
+    """HyP3 Sentinel-1 InSAR product dataset.
 
-    `Hyp3 <https://hyp3-docs.asf.alaska.edu/>`_ is a service for processing
-    Synthetic Aperture Radar (SAR) imagery. This class is used to manage the
-    data of Hyp3 product.
+    Supports both full-frame and burst products from the
+    `HyP3 <https://hyp3-docs.asf.alaska.edu/>`_ processing service.
     """
 
     pattern_unw = "*unw_phase.tif"
     pattern_coh = "*corr.tif"
 
     def parse_baselines(self, pairs: Pairs | None = None) -> Baselines:
-        """Parse the baseline of the interferogram for given pairs.
+        """Parse baselines from HyP3 metadata files.
 
         Parameters
         ----------
         pairs : Pairs
-            The pairs which the baseline will be parsed. Default is None, which
-            means all pairs will be parsed.
+            Pairs to parse baselines for. Default is None (all pairs).
 
         Returns
         -------
         baselines : Baselines
-            The baseline of the interferogram for given pairs.
 
         """
         if pairs is None:
@@ -50,15 +47,3 @@ class HyP3S1(InterferogramDataset, Sentinel1):
                 value = np.nan
             baselines.append(value)
         return Baselines.from_pair_wise(pairs, np.array(baselines))
-
-
-class HyP3S1Burst(InterferogramDataset, Sentinel1):
-    """A dataset manages the data of HyP3 Sentinel-1 Burst product.
-
-    `Hyp3 <https://hyp3-docs.asf.alaska.edu/>`_ is a service for processing
-    Synthetic Aperture Radar (SAR) imagery. This class is used to manage the
-    data of Hyp3 product.
-    """
-
-    pattern_unw = "*unw_phase.tif"
-    pattern_coh = "*corr.tif"

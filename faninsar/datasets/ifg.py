@@ -338,18 +338,40 @@ class InterferogramDataset(PairDataset):
 
     @classmethod
     def parse_pairs(cls, paths: Iterable[str | PathLike]) -> Pairs:
-        """Parse pairs from the paths of the interferogram."""
+        """Parse interferometric pair dates from filenames.
+
+        Automatically detects the following date pair formats:
+
+        - ``YYYYMMDD``:
+          e.g. ``S1A_IW_20200314_20200326_unw_phase.tif``
+        - ``YYYYMMDDTHHMMSS``:
+          e.g. ``S1A_IW_20200314T170000_20200326T170000_unw.tif``
+        - ``YYYY-MM-DD``:
+          e.g. ``S1A_IW_2020-03-14_2020-03-26_unw_phase.tif``
+        - ``YYYYMMDDTHHMMSS.sss``:
+          e.g. ``S1A_IW_20200314T170000.000_20200326T170000.000.tif``
+
+        Extracted dates are normalized to ``YYYYMMDD_YYYYMMDD`` pair names.
+        """
+        _date_pair_re = re.compile(
+            r"(\d{4})-?(\d{2})-?(\d{2})(?:T\d[\d.:]*)?"
+            r"[-_ ]"
+            r"(\d{4})-?(\d{2})-?(\d{2})(?:T\d[\d.:]*)?"
+        )
         names = [Path(f).name for f in paths]
         pair_names = []
         for name in names:
-            match = re.search(r"_(\d{8})_(\d{8})_", name)
+            match = _date_pair_re.search(name)
             if match:
-                pair_name = f"{match.group(1)}_{match.group(2)}"
-                pair_names.append(pair_name)
+                d1 = f"{match.group(1)}{match.group(2)}{match.group(3)}"
+                d2 = f"{match.group(4)}{match.group(5)}{match.group(6)}"
+                pair_names.append(f"{d1}_{d2}")
             else:
                 msg = (
-                    f"Filename {name} does not contain *_YYYYMMDD_YYYYMMDD_* pattern."
-                    " Unable to parse pair name."
+                    f"Cannot parse pair dates from filename: {name}. "
+                    "Expected a filename containing two dates in "
+                    "YYYYMMDD, YYYYMMDDTHHMMSS, YYYY-MM-DD, or "
+                    "YYYYMMDDTHHMMSS.sss format."
                 )
                 logger.error(msg)
                 raise ValueError(msg)
