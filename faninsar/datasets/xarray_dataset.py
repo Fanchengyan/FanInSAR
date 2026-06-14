@@ -46,7 +46,7 @@ from rasterio.transform import Affine, array_bounds
 from tqdm import tqdm
 
 from faninsar.datasets.base.geo import GeoDataset
-from faninsar.datasets.geobox import GeoBox
+from faninsar.datasets.geogrid import GeoGrid as GeoBox
 from faninsar.logging import setup_logger
 from faninsar.query.bbox import BoundingBox
 

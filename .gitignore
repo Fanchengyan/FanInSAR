@@ -25,6 +25,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+examples
+plans
 
 # mac
 .DS_Store

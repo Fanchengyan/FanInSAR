@@ -13,8 +13,8 @@ import matplotlib.colors as mcolors
 import numpy as np
 import pytest
 
-from faninsar.plots.cmaps import cmaps
-from faninsar.plots.cmaps.enhanced_colormap import EnhancedLinearSegmentedColormap
+from faninsar.plots.cm import cmaps
+from faninsar.plots.cm.enhanced_colormap import EnhancedLinearSegmentedColormap
 
 
 class TestEnhancedLinearSegmentedColormap:
@@ -375,7 +375,7 @@ class TestCodeCompletion:
         assert hasattr(cmap1, "to_rgb_array")
 
         # Test module-level access
-        import faninsar.plots.cmaps as cmaps_module
+        import faninsar.plots.cm as cmaps_module
         cmap2 = cmaps_module.abyss
         assert isinstance(cmap2, EnhancedLinearSegmentedColormap)
         assert hasattr(cmap2, "to_rgb_array")

@@ -12,7 +12,7 @@ from pathlib import Path as _Path
 
 import pytest
 
-_logging_path = _Path(__file__).resolve().parents[1] / "faninsar" / "logging.py"
+_logging_path = _Path(__file__).resolve().parents[2] / "faninsar" / "logging.py"
 _spec = importlib.util.spec_from_file_location("faninsar.logging", _logging_path)
 _filog = importlib.util.module_from_spec(_spec)
 assert _spec is not None

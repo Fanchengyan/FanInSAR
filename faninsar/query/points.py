@@ -178,7 +178,7 @@ class Points:
 
         return f"{prefix}{middle}{suffix}"
 
-    def __array__(self, dtype: np.dtype | None = None) -> np.ndarray:  # noqa: PLW3201
+    def __array__(self, dtype: np.dtype | None = None) -> np.ndarray:
         """Return the values of the points as a numpy array."""
         if dtype is not None:
             return self._values.astype(dtype)

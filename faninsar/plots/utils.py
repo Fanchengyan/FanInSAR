@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.collections import LineCollection
 from matplotlib.colors import BoundaryNorm, Colormap, ListedColormap
 from matplotlib.legend_handler import HandlerBase
-from matplotlib.collections import LineCollection
+
 
 class HandlerGradientLine(HandlerBase):
     """Custom handler for rendering gradient line in legend."""
@@ -23,10 +24,10 @@ class HandlerGradientLine(HandlerBase):
         n_segments = 50
         x = np.linspace(xdescent, xdescent + width, n_segments + 1)
         y_mid = ydescent + height / 2
-        
+
         points = np.array([x, np.full_like(x, y_mid)]).T.reshape(-1, 1, 2)
         segments = np.concatenate([points[:-1], points[1:]], axis=1)
-        
+
         lc = LineCollection(
             segments, cmap=self._cmap, norm=self._norm, linewidth=1.5
         )

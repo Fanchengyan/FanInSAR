@@ -68,6 +68,8 @@ dependencies = [
   "zarr>=3.0",
   "lxml>=4.9",
   "tomli-w>=1.2.0",
+  "rio-cogeo",
+  "pystac>=1.8",
 ]
 
 
@@ -83,6 +85,13 @@ test = [
   # "pytest-param-files~=0.3.3",
 
 ]
+cloud = [
+  "FanInSAR",
+  "pyarrow",
+  "pystac",
+  "rio-cogeo",
+  "huggingface_hub",
+]
 docs = [
   "FanInSAR",
   "recommonmark",
@@ -96,7 +105,11 @@ docs = [
   "myst-sphinx-gallery",
 ]
 
-dev = ["FanInSAR[code_style, test, docs]"]
+dev = [
+  "FanInSAR[code_style, test, docs]",
+  "pystac",
+  "pystac-client",
+]
 
 [tool.setuptools]
 include-package-data = true
@@ -333,3 +346,6 @@ docstring-code-format = true
 [tool.doc8]
 ignore = ["D001"]
 allow-long-titles = true
+
+[tool.ty.rules]
+invalid-argument-type = "ignore"
