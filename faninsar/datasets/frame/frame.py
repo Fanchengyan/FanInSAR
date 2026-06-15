@@ -10,12 +10,14 @@ from faninsar.logging import setup_logger
 from .discovery import discover_hyp3_geometry_product
 from .geometry import FrameGeometry
 from .interferogram import FrameInterferogramCollection
+from .timeseries import FrameTimeSeries
 
 if TYPE_CHECKING:
     from datetime import datetime
 
     import pystac
 
+    from faninsar.datasets.frame.remote import RemoteFrame
     from faninsar.datasets.geogrid import GeoGrid
 
 logger = setup_logger(__name__)
@@ -105,6 +107,11 @@ class Frame:
         if ifgs_dir.is_dir():
             self._interferograms = FrameInterferogramCollection(ifgs_dir)
 
+        self._timeseries: FrameTimeSeries | None = None
+        ts_dir = self._root / "timeseries"
+        if ts_dir.is_dir():
+            self._timeseries = FrameTimeSeries(ts_dir)
+
     @property
     def root(self) -> Path:
         """Root directory of the frame."""
@@ -119,6 +126,11 @@ class Frame:
     def interferograms(self) -> FrameInterferogramCollection | None:
         """Interferogram collection, or *None* if ``ifg/`` is absent."""
         return self._interferograms
+
+    @property
+    def timeseries(self) -> FrameTimeSeries | None:
+        """Time-series product, or *None* if ``timeseries/`` is absent."""
+        return self._timeseries
 
     @classmethod
     def from_hyp3(
@@ -318,36 +330,59 @@ class Frame:
         return frame
 
     @classmethod
-    def open_remote(cls, catalog_url: str, **kwargs: Any) -> Frame:
+    def open_remote(
+        cls,
+        catalog_url: str,
+        *,
+        cache_dir: str | Path | None = None,
+        anonymous: bool = True,
+        **kwargs: Any,
+    ) -> RemoteFrame:
         """Open a remote faninsar STAC catalog and lazily read assets over HTTP.
 
+        Reads the catalog metadata over HTTP (via :mod:`pystac`) and returns
+        a :class:`RemoteFrame` whose ``open()`` calls fetch COG windows on
+        demand via GDAL's ``/vsicurl/`` — no full-file downloads.
+
         .. note::
-            Reserved for M5. This stub raises :class:`NotImplementedError`.
-            The M5 implementation will use HTTP range requests via GDAL
-            ``/vsicurl/`` so COG windows are fetched on demand without
-            downloading whole files. It will reuse
-            :func:`faninsar.datasets.frame.stac._stac_to_frame_meta` for
-            catalog parsing.
+            Requires the ``pystac`` optional dependency for catalog parsing
+            and GDAL built with ``/vsicurl/`` support (standard in most
+            distributions). Hugging Face Hub URLs are supported directly.
 
         Parameters
         ----------
         catalog_url : str
             HTTP(S) URL to a ``catalog.json``.
+        cache_dir : str or Path, optional
+            Local cache dir for catalog metadata. COG range reads are not
+            cached by default.
+        anonymous : bool
+            If *True*, do not send credentials (public datasets). If *False*,
+            uses the locally configured token / ``.netrc``.
         **kwargs
-            Reserved for M5 (e.g. ``cache_dir``, ``anonymous``).
+            Forwarded to :class:`RemoteFrame` constructor.
+
+        Returns
+        -------
+        RemoteFrame
+            A lazy view of the remote frame. Its ``geometry`` /
+            ``interferograms`` sub-objects expose ``open()`` / ``open_stack()``
+            calls that read COG windows over HTTP.
 
         Raises
         ------
-        NotImplementedError
-            Always, until M5 is implemented.
+        ImportError
+            If ``pystac`` is not installed.
 
         """
-        msg = (
-            "Frame.open_remote() is reserved for M5 (remote STAC + Hugging "
-            "Face access) and is not implemented yet. For local catalogs, "
-            "use Frame.from_stac(catalog_path)."
+        from .remote import RemoteFrame
+
+        return RemoteFrame(
+            catalog_url,
+            cache_dir=cache_dir,
+            anonymous=anonymous,
+            **kwargs,
         )
-        raise NotImplementedError(msg)
 
     def validate(self) -> list[str]:
         """Cross-check frame-internal consistency.
@@ -438,6 +473,8 @@ class Frame:
             info["geometry"] = self._geometry.summary()
         if self._interferograms is not None:
             info["interferograms"] = self._interferograms.summary()
+        if self._timeseries is not None:
+            info["timeseries"] = self._timeseries.summary()
         return info
 
     def __repr__(self) -> str:

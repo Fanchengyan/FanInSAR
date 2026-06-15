@@ -26,6 +26,9 @@ from .metadata import (
     GeometryAssetName,
     InterferogramAssetName,
 )
+from .publish import build_upload_plan, iter_frame_assets, publish_to_huggingface
+from .remote import RemoteFrame
+from .timeseries import FrameTimeSeries
 
 __all__ = [
     "GEOMETRY_ASSETS",
@@ -37,6 +40,7 @@ __all__ = [
     "FrameInterferogramCollection",
     "FrameInterferogramError",
     "FrameProductError",
+    "FrameTimeSeries",
     "GeometryAssetName",
     "GridMismatchError",
     "InterferogramAssetName",
@@ -44,4 +48,8 @@ __all__ = [
     "MissingGeometryAssetError",
     "MissingInterferogramAssetError",
     "PairNotFoundError",
+    "RemoteFrame",
+    "build_upload_plan",
+    "iter_frame_assets",
+    "publish_to_huggingface",
 ]

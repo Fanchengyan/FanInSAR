@@ -117,7 +117,12 @@ def discover_geometry_product(name: str, root_dir: str | Path) -> Path:
 
 # --- Eager registration of built-in discoverers ---
 # Importing the submodule triggers its module-level register() call.
+from . import gamma as _gamma
+from . import gmtsar as _gmtsar
 from . import hyp3 as _hyp3
+from . import isce as _isce
+from . import mintpy as _mintpy
+from . import stamps as _stamps
 from .hyp3 import discover_hyp3_geometry_product
 
 __all__ = [

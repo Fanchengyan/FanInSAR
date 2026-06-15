@@ -444,9 +444,3 @@ class TestFrameFromStac:
         loaded = Frame.from_stac(out_dir / "catalog.json", frame_root=frame_dir)
         assert loaded.geometry is not None
         assert loaded.interferograms is None
-
-    def test_open_remote_raises_not_implemented(self) -> None:
-        from faninsar.datasets.frame import Frame
-
-        with pytest.raises(NotImplementedError, match="M5"):
-            Frame.open_remote("https://example.com/catalog.json")
