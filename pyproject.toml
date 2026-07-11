@@ -81,6 +81,7 @@ test = [
   "coverage",
   "pytest",
   "pytest-cov",
+  "h5py",
   # "pytest-regressions",
   # "pytest-param-files~=0.3.3",
 
