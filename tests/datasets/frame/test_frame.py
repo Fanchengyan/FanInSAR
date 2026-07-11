@@ -6,125 +6,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import rasterio
-from rasterio.transform import from_bounds
 
 from faninsar.datasets.frame import Frame, FrameGeometry, FrameInterferogramCollection
-from faninsar.datasets.frame.metadata import (
-    build_interferograms_index,
-    build_item_metadata,
-    save_json,
-)
+
+# The `frame_dir` fixture and `_write_tiff` helper are provided by
+# tests/datasets/frame/conftest.py.
+from tests.datasets.frame.conftest import _write_tiff
 
 pystac = pytest.importorskip("pystac")
-
-
-def _write_tiff(
-    path: Path,
-    bounds: tuple[float, float, float, float],
-    data: np.ndarray,
-    nodata: float = -9999.0,
-) -> None:
-    """Write a single-band GeoTIFF."""
-    height, width = data.shape
-    transform = from_bounds(*bounds, width, height)
-    crs = (
-        'GEOGCS["WGS 84",DATUM["WGS_1984",'
-        'SPHEROID["WGS 84",6378137,298.257223563]],'
-        'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]'
-    )
-    with rasterio.open(
-        path,
-        "w",
-        driver="GTiff",
-        height=height,
-        width=width,
-        count=1,
-        dtype=data.dtype,
-        crs=crs,
-        transform=transform,
-        nodata=nodata,
-    ) as dst:
-        dst.write(data, 1)
-
-
-@pytest.fixture
-def frame_dir(tmp_path: Path) -> Path:
-    """Create a geometry + interferogram frame from synthetic data."""
-    bounds = (10.0, 45.0, 11.0, 46.0)
-    shape = (10, 10)
-
-    # Geometry
-    inc = np.random.default_rng(42).uniform(20.0, 60.0, shape).astype(np.float32)
-    inc_path = tmp_path / "incidence.tif"
-    _write_tiff(inc_path, bounds, inc)
-
-    FrameGeometry.from_rasters(
-        out_dir=tmp_path / "frame",
-        incidence=inc_path,
-        overwrite=True,
-    )
-
-    # Interferograms
-    ifgs_dir = tmp_path / "frame" / "interferograms"
-    ifgs_dir.mkdir(parents=True, exist_ok=True)
-
-    pair_names = ["20191115_20200314", "20200314_20200708"]
-    for pname in pair_names:
-        pair_dir = ifgs_dir / pname
-        pair_dir.mkdir(parents=True, exist_ok=True)
-        unw = np.random.default_rng(42).uniform(-3.0, 3.0, shape).astype(np.float32)
-        coh = np.random.default_rng(42).uniform(0.0, 1.0, shape).astype(np.float32)
-        _write_tiff(pair_dir / "unw_phase.cog.tif", bounds, unw)
-        _write_tiff(pair_dir / "coherence.cog.tif", bounds, coh, nodata=0.0)
-
-    crs = (
-        'GEOGCS["WGS 84",DATUM["WGS_1984",'
-        'SPHEROID["WGS 84",6378137,298.257223563]],'
-        'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]'
-    )
-    for pname in pair_names:
-        pair_dir = ifgs_dir / pname
-        parts = pname.split("_")
-        item_meta = build_item_metadata(
-            pair_name=pname,
-            reference_date=parts[0],
-            secondary_date=parts[1],
-            grid={
-                "crs": crs,
-                "width": shape[1],
-                "height": shape[0],
-                "transform": [0.1, 0.0, 10.0, 0.0, -0.1, 46.0],
-                "bounds": list(bounds),
-                "resolution": [0.1, 0.1],
-            },
-            assets={
-                "unw_phase": {
-                    "href": "unw_phase.cog.tif",
-                    "dtype": "float32",
-                    "nodata": -9999.0,
-                },
-                "coherence": {
-                    "href": "coherence.cog.tif",
-                    "dtype": "float32",
-                    "nodata": 0.0,
-                },
-            },
-            geometry_href="../../geometry/geometry.json",
-            temporal_baseline_days=120,
-        )
-        save_json(item_meta, pair_dir / "item.json")
-
-    index_meta = build_interferograms_index(
-        pair_count=2,
-        pairs=pair_names,
-        assets_by_pair={pname: ["unw_phase", "coherence"] for pname in pair_names},
-        common_grid=True,
-        geometry_href="../../geometry/geometry.json",
-    )
-    save_json(index_meta, ifgs_dir / "interferograms_index.json")
-
-    return tmp_path / "frame"
 
 
 class TestFrameInit:
@@ -243,3 +132,63 @@ class TestFrameValidate:
         issues = frame.validate()
         # geometry_href in item.json/index points at a non-existent target.
         assert any("geometry_href" in i or "geometry" in i for i in issues)
+
+
+class TestFrameZarr:
+    """D1.3: Frame.to_zarr / from_zarr round-trip."""
+
+    def test_to_zarr_writes_store(self, frame_dir: Path, tmp_path: Path) -> None:
+        import xarray as xr
+
+        frame = Frame(frame_dir)
+        store = tmp_path / "frame.zarr"
+        frame.to_zarr(store, overwrite=True, assets=("unw_phase",))
+        assert store.exists()
+        # Top-level group carries frame metadata attrs.
+        root = xr.open_zarr(str(store), consolidated=False)
+        assert root.attrs.get("frame_type") == "Frame"
+        assert "geometry_metadata" in root.attrs
+
+    def test_from_zarr_roundtrip_summary(
+        self, frame_dir: Path, tmp_path: Path
+    ) -> None:
+        frame = Frame(frame_dir)
+        store = tmp_path / "frame.zarr"
+        frame.to_zarr(store, overwrite=True, assets=("unw_phase",))
+        loaded = Frame.from_zarr(store)
+        assert loaded.geometry is not None
+        assert loaded.geometry.metadata is not None
+        assert loaded.interferograms is not None
+        assert loaded.interferograms.summary()["pair_count"] == 2
+
+    def test_to_zarr_memory_filesystem(self, frame_dir: Path) -> None:
+        """D1.3: FSStore path for direct cloud writes (S3 mock)."""
+        import fsspec
+        import xarray as xr
+
+        frame = Frame(frame_dir)
+        # Use an in-memory fsspec filesystem as an S3 stand-in.
+        url = "memory://faninsar_test/frame.zarr"
+        frame.to_zarr(url, overwrite=True, assets=("unw_phase",))
+        # Verify the store is readable via fsspec.
+        fs, path = fsspec.url_to_fs(url)
+        assert fs.exists(path)
+        # Read the root group through the same FSStore mapping used for writes.
+        mapper = fs.get_mapper(path)
+        import zarr
+
+        grp = zarr.open_group(store=mapper, mode="r")
+        assert grp.attrs.get("frame_type") == "Frame"
+        assert "geometry_metadata" in dict(grp.attrs)
+
+    def test_from_zarr_geometry_metadata_preserved(
+        self, frame_dir: Path, tmp_path: Path
+    ) -> None:
+        frame = Frame(frame_dir)
+        store = tmp_path / "frame.zarr"
+        frame.to_zarr(store, overwrite=True, assets=("unw_phase",))
+        loaded = Frame.from_zarr(store)
+        assert loaded.geometry is not None
+        geom_meta = loaded.geometry.metadata
+        assert geom_meta is not None
+        assert geom_meta["type"] == "FrameGeometry"

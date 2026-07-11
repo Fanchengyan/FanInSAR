@@ -274,6 +274,17 @@ class FrameGeometry:
         if angle_unit == "radian":
             processing["angle_conversion"] = "radian_to_degree"
 
+        # Canonical value ranges for geometry assets (post-conversion units).
+        # Angles are normalized to degrees here; DEM is unbounded so it is left
+        # out. Recording these prevents unit confusion downstream.
+        geom_value_ranges: dict[str, tuple[float, float]] = {}
+        if "incidence" in assets_written:
+            geom_value_ranges["incidence"] = (0.0, 90.0)
+        if "azimuth" in assets_written:
+            geom_value_ranges["azimuth"] = (0.0, 360.0)
+        if "heading" in assets_written:
+            geom_value_ranges["heading"] = (0.0, 360.0)
+
         meta = build_geometry_metadata(
             crs=ref_grid.crs,
             width=ref_grid.width,
@@ -287,6 +298,7 @@ class FrameGeometry:
             assets=assets_written,
             source_assets=source_assets_info,
             processing=processing,
+            value_ranges=geom_value_ranges or None,
         )
         save_json(meta, geometry_dir / "geometry.json")
         logger.info("FrameGeometry created at %s", geometry_dir)

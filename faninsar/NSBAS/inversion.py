@@ -27,7 +27,7 @@ class NSBASSolver:
 
     The NSBAS inversion is expressed as: ``d = Gm``, where ``d`` is the
     unwrapped interferograms matrix, ``G`` is the NSBAS matrix, and ``m`` is
-    the model parameters, which is the combination of the deformation increment
+    the model parameters, which is the combination of the displacement increment
     and the model parameters.
     see following paper for more details: `https://ens.hal.science/hal-02185213`_ ,
     `https://www.sciencedirect.com/science/article/pii/S0924271625000772`_
@@ -71,7 +71,7 @@ class NSBASSolver:
     )
 
 
-    Now we can perform NSBAS inversion to get the incremental deformation,
+    Now we can perform NSBAS inversion to get the incremental displacement,
     model parameters, and residuals:
 
     >>> incs, params, residual_pair, residual_tsm = solver.inverse(return_numpy=True)
@@ -142,6 +142,10 @@ class NSBASSolver:
         self._gamma = 0.0001
 
         g_sbas = self._make_sbas_matrix()
+
+        # Default: use unw as-is. When coherence is provided, mask low-coherence
+        # pixels (and optionally weight) by reassigning d below.
+        d = unw
 
         if coh is not None:
             if isinstance(coh, np.ndarray):
@@ -290,7 +294,7 @@ class NSBASSolver:
             time-series model in NSBAS inversion.
         G_tl : np.ndarray
             The top left part of NSBAS matrix, which is the conventional SBAS
-            matrix mapping the incremental deformation to interferograms.
+            matrix mapping the incremental displacement to interferograms.
         gamma : float
             The weight for the bottom part of NSBAS matrix, which is used to
             balance the data term and the model term in NSBAS inversion.

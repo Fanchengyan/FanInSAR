@@ -111,6 +111,18 @@ class TestFrameGeometryFromRasters:
         assert "assets" in meta
         assert "created_at" in meta
 
+    def test_value_ranges_recorded(self, geometry_dir: Path) -> None:
+        # D0.2: geometry.json carries value_ranges for angle assets so
+        # downstream code knows the unit/encoding (e.g. degrees, 0-360).
+        geom = FrameGeometry(geometry_dir)
+        meta = geom.metadata
+        assert meta is not None
+        vr = meta.get("value_ranges", {})
+        assert "incidence" in vr
+        assert vr["incidence"] == [0.0, 90.0]
+        assert "azimuth" in vr
+        assert vr["azimuth"] == [0.0, 360.0]
+
     def test_relative_asset_hrefs(self, geometry_dir: Path) -> None:
         geom = FrameGeometry(geometry_dir)
         meta = geom.metadata

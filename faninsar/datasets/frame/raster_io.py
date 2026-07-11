@@ -100,6 +100,85 @@ def reproject_to_geogrid(
 reproject_to_geobox = reproject_to_geogrid
 
 
+def reproject_phase_to_geogrid(
+    src_path: str | PathLike,
+    dst_geogrid: GeoGrid,
+    *,
+    resampling: Resampling = Resampling.bilinear,
+    dst_nodata: float = -9999.0,
+) -> np.ndarray:
+    """Reproject a wrapped-phase raster using complex averaging.
+
+    Wrapped phase is a cyclic quantity on [-pi, pi]. Naive bilinear
+    resampling produces nonsensical values across 2*pi wrap boundaries: a
+    pixel at +3.1 rad next to one at -3.1 rad (both near pi) averages to ~0
+    instead of ~pi. This function resamples the *complex representation*
+    ``exp(i*phi)`` (bilinear on the real and imaginary parts independently),
+    then converts back via ``np.angle``, which correctly handles wraps.
+
+    Parameters
+    ----------
+    src_path : path-like
+        Path to the source wrapped-phase raster (radians).
+    dst_geogrid : GeoGrid
+        Target grid to reproject onto.
+    resampling : Resampling
+        Resampling algorithm applied to the complex field. Default bilinear.
+    dst_nodata : float
+        NoData value for the output.
+
+    Returns
+    -------
+    numpy.ndarray
+        Reprojected wrapped-phase array ``(height, width)`` in radians on
+        ``[-pi, pi]``.
+
+    """
+    dst_height, dst_width = dst_geogrid.shape
+    dst_transform = dst_geogrid.transform
+    dst_crs = dst_geogrid.crs
+
+    with rasterio.open(src_path) as src:
+        src_phi = src.read(1).astype(np.float32)
+        src_transform = src.transform
+        src_crs = src.crs
+        src_nodata = src.nodata
+
+    # Build the complex field, masking nodata / invalid phase values to zero
+    # magnitude so they contribute nothing to the average.
+    invalid = ~np.isfinite(src_phi)
+    if src_nodata is not None:
+        invalid |= src_phi == src_nodata
+    complex_src = np.where(
+        invalid, 0.0 + 0.0j, np.exp(1j * src_phi)
+    ).astype(np.complex64)
+
+    complex_dst = np.zeros((dst_height, dst_width), dtype=np.complex64)
+    reproject(
+        source=complex_src,
+        destination=complex_dst,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=resampling,
+        src_nodata=None,
+        dst_nodata=None,
+    )
+
+    out = np.full(
+        (dst_height, dst_width),
+        dst_nodata,
+        dtype=np.float32,
+    )
+    # Where the averaged complex vector has meaningful magnitude, take its
+    # angle; otherwise leave as nodata (low-coherence / empty regions).
+    magnitude = np.abs(complex_dst)
+    valid = magnitude > 1e-6
+    out[valid] = np.angle(complex_dst[valid]).astype(np.float32)
+    return out
+
+
 def write_cog(
     arr: np.ndarray,
     dst_path: str | PathLike,

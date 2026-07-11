@@ -6,6 +6,7 @@ from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 import xarray as xr
 
 from faninsar._core.sar import Pairs
@@ -20,6 +21,7 @@ from .exceptions import (
 from .metadata import (
     CATEGORICAL_ASSETS,
     INTERFEROGRAM_ASSETS,
+    PHASE_ASSETS,
     InterferogramAssetName,
     build_interferograms_index,
     build_item_metadata,
@@ -29,6 +31,7 @@ from .metadata import (
 )
 from .raster_io import (
     read_geogrid,
+    reproject_phase_to_geogrid,
     reproject_to_geogrid,
     write_cog,
 )
@@ -237,9 +240,17 @@ class FrameInterferogramCollection:
         return self._index
 
     def _discover_pair_dirs(self) -> list[Path]:
-        """Return sorted list of pair subdirectories under root."""
+        """Return sorted list of pair subdirectories under root.
+
+        Skips hidden directories and Zarr stores (``*.zarr``), which are
+        persistent data cubes rather than pair directories.
+        """
         return sorted(
-            p for p in self._root.iterdir() if p.is_dir() and not p.name.startswith(".")
+            p
+            for p in self._root.iterdir()
+            if p.is_dir()
+            and not p.name.startswith(".")
+            and not p.name.endswith(".zarr")
         )
 
     def pairs(self) -> Pairs:
@@ -401,6 +412,7 @@ class FrameInterferogramCollection:
         reference: str | Path | None = None,
         overwrite: bool = False,
         max_pairs: int | None = None,
+        value_ranges: dict[str, tuple[float, float]] | None = None,
     ) -> Self:
         """Standardize an existing InterferogramDataset into a frame layout.
 
@@ -425,6 +437,12 @@ class FrameInterferogramCollection:
             If *True*, overwrite existing outputs.
         max_pairs : int, optional
             Limit the number of pairs to process.
+        value_ranges : dict, optional
+            Mapping of asset name to ``(min, max)`` valid value range. This is
+            critical for coherence, which is 0-255 in LiCSAR but 0-1 in HyP3:
+            without it downstream consumers silently misinterpret values.
+            Caller-provided ranges override the canonical defaults. Written to
+            each ``item.json`` under the ``value_ranges`` key.
 
         Returns
         -------
@@ -438,6 +456,27 @@ class FrameInterferogramCollection:
             out_dir / "interferograms" if out_dir.name != "interferograms" else out_dir
         )
         ifgs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Resolve per-asset value ranges. Canonical defaults cover assets whose
+        # encoding is well-defined; caller-provided ranges win. Coherence is the
+        # motivating case — it is 0-255 in LiCSAR but 0-1 in HyP3, so the range
+        # must be recorded for correct downstream interpretation.
+        canonical_ranges: dict[str, tuple[float, float]] = {
+            "coherence": (0.0, 1.0),
+            "unw_phase": (-np.pi, np.pi),
+            "wrapped_phase": (-np.pi, np.pi),
+        }
+        resolved_ranges = dict(canonical_ranges)
+        if value_ranges is not None:
+            resolved_ranges.update(
+                {k: tuple(v) for k, v in value_ranges.items() if v is not None}
+            )
+        # Restrict to assets actually being written.
+        resolved_ranges = {
+            k: v
+            for k, v in resolved_ranges.items()
+            if k in assets or k == "wrapped_phase"
+        }
 
         ref_grid: GeoGrid | None = None
         if reference is not None:
@@ -564,6 +603,7 @@ class FrameInterferogramCollection:
                     continue
 
                 is_cat = asset_name in CATEGORICAL_ASSETS
+                is_phase = asset_name in PHASE_ASSETS
                 if is_cat:
                     resampling = rasterio.enums.Resampling.nearest
                     out_dtype = "uint8"
@@ -573,13 +613,24 @@ class FrameInterferogramCollection:
                     out_dtype = "float32"
                     out_nodata = -9999.0
 
-                arr = reproject_to_geogrid(
-                    src,
-                    pair_grid,
-                    resampling=resampling,
-                    dst_dtype=out_dtype,
-                    dst_nodata=out_nodata,
-                )
+                if is_phase:
+                    # Wrapped phase is cyclic: bilinear averaging across a 2*pi
+                    # wrap boundary is physically wrong. Resample the complex
+                    # representation exp(i*phi) instead, then take the angle.
+                    arr = reproject_phase_to_geogrid(
+                        src,
+                        pair_grid,
+                        resampling=rasterio.enums.Resampling.bilinear,
+                        dst_nodata=out_nodata,
+                    )
+                else:
+                    arr = reproject_to_geogrid(
+                        src,
+                        pair_grid,
+                        resampling=resampling,
+                        dst_dtype=out_dtype,
+                        dst_nodata=out_nodata,
+                    )
 
                 write_cog(
                     arr,
@@ -623,6 +674,7 @@ class FrameInterferogramCollection:
                 assets=asset_records,
                 geometry_href=resolve_geometry_href(ifgs_dir),
                 temporal_baseline_days=_compute_temporal_baseline(ref_date, sec_date),
+                value_ranges=resolved_ranges or None,
             )
             save_json(item_meta, pair_out / "item.json")
 
@@ -774,14 +826,22 @@ class FrameInterferogramCollection:
     ) -> xr.DataArray:
         """Stack a named asset across all pairs.
 
+        If a persistent Zarr cube exists at ``<root>/<name>.zarr`` (produced by
+        :meth:`to_zarr_stack`), read it lazily via :func:`xarray.open_zarr`.
+        Otherwise fall back to eager concatenation of per-pair COGs.
+
         Parameters
         ----------
         name : InterferogramAssetName
             Asset name to stack.
         pairs : Pairs, optional
-            Subset of pairs. If *None*, all pairs.
+            Subset of pairs. If *None*, all pairs. When a Zarr cube exists,
+            the subset is applied via ``.sel(pair=...)`` without reading the
+            whole cube.
         chunks : dict, int, ``"auto"``, or None
-            Chunk sizes for dask arrays.
+            Chunk sizes for dask arrays. With a Zarr cube, ``None`` defaults to
+            ``"auto"`` (lazy dask-backed). Without a cube, ``None`` returns an
+            eager array (existing behaviour).
 
         Returns
         -------
@@ -791,9 +851,26 @@ class FrameInterferogramCollection:
         Raises
         ------
         GridMismatchError
-            If the selected rasters do not share the same grid.
+            If the selected rasters do not share the same grid and no Zarr cube
+            exists.
 
         """
+        # Fast path: read from a persistent Zarr cube when present.
+        zarr_path = self.zarr_stack_path(name)
+        if zarr_path.exists():
+            ds = xr.open_zarr(str(zarr_path), consolidated=False)
+            da = ds[name]
+            if "band" in da.dims:
+                da = da.squeeze("band", drop=True)
+            if pairs is not None:
+                pair_names = pairs.to_names()
+                da = da.sel(pair=pair_names)
+            # Lazify if a chunk spec was given; Zarr reads are lazy by default.
+            if chunks is not None:
+                da = da.chunk(chunks)
+            return da
+
+        # Fallback: eager concat of per-pair COGs (existing behaviour).
         if pairs is None:
             pairs = self.pairs()
 
@@ -829,6 +906,153 @@ class FrameInterferogramCollection:
             raise ValueError(msg)
 
         return xr.concat(arrays, dim="pair")
+
+    def zarr_stack_path(self, name: InterferogramAssetName) -> Path:
+        """Return the canonical Zarr cube path for an asset.
+
+        ``<root>/<name>.zarr`` (e.g. ``interferograms/unw_phase.zarr``).
+        """
+        return self._root / f"{name}.zarr"
+
+    def to_zarr_stack(
+        self,
+        name: InterferogramAssetName = "unw_phase",
+        *,
+        zarr_path: str | Path | None = None,
+        chunks: tuple[int, int, int] = (1, 512, 512),
+        overwrite: bool = False,
+    ) -> Path:
+        """Write a persistent ``(pair, y, x)`` Zarr cube for lazy stacking.
+
+        Opens each pair's asset lazily via :meth:`open`, concatenates along a
+        ``pair`` dimension, and writes the result to a Zarr v3 store with
+        explicit chunking ``(pair_chunk, y_chunk, x_chunk)``. The default
+        ``(1, 512, 512)`` keeps one pair per chunk along the pair dimension and
+        tiles spatially — efficient for both local and cloud (S3/GCS) reads.
+
+        Parameters
+        ----------
+        name : InterferogramAssetName
+            Asset to stack. Default ``"unw_phase"``.
+        zarr_path : str or Path, optional
+            Output Zarr store path. Defaults to ``<root>/<name>.zarr``.
+        chunks : tuple of int
+            Chunk shape ``(pair, y, x)``. Default ``(1, 512, 512)``.
+        overwrite : bool
+            Overwrite an existing Zarr store.
+
+        Returns
+        -------
+        pathlib.Path
+            Path to the written Zarr store.
+
+        Raises
+        ------
+        FileExistsError
+            If the store exists and *overwrite* is False.
+        GridMismatchError
+            If per-pair grids differ.
+        ValueError
+            If no valid pairs are found for the asset.
+
+        """
+        out = Path(zarr_path) if zarr_path is not None else self.zarr_stack_path(name)
+        if out.exists() and not overwrite:
+            msg = f"Zarr store already exists: {out}"
+            logger.info(msg)
+            raise FileExistsError(msg)
+        if out.exists() and overwrite:
+            import shutil
+
+            shutil.rmtree(out)
+
+        pairs_obj = self.pairs()
+        pair_names = pairs_obj.to_names().tolist()
+
+        arrays: list[xr.DataArray] = []
+        ref_grid: GeoGrid | None = None
+        for pname in pair_names:
+            if not self.exists(pname, name):
+                logger.warning(
+                    "Asset '%s' missing for pair '%s', skipping.", name, pname
+                )
+                continue
+            da = self.open(pname, name, masked=True, chunks="auto")
+            asset_grid = read_geogrid(self.path(pname, name))
+            if ref_grid is None:
+                ref_grid = asset_grid
+            elif not asset_grid.is_aligned(ref_grid):
+                msg = (
+                    f"Pair '{pname}' asset '{name}' grid does not match the "
+                    f"first pair's grid. Cannot build a single Zarr cube."
+                )
+                raise GridMismatchError(msg)
+            da = da.expand_dims(pair=[pname])
+            arrays.append(da)
+
+        if not arrays:
+            msg = f"No valid assets found for '{name}'."
+            raise ValueError(msg)
+
+        stacked = xr.concat(arrays, dim="pair")
+        # Apply explicit chunking as a tuple along (pair, y, x).
+        stacked = stacked.chunk({"pair": chunks[0], "y": chunks[1], "x": chunks[2]})
+
+        # Record frame provenance as dataset attrs for self-describing stores.
+        bounds = ref_grid.bounds if ref_grid is not None else None
+        res = ref_grid.resolution if ref_grid is not None else None
+        stacked.attrs.update(
+            {
+                "long_name": name,
+                "frame_asset": name,
+                "crs": str(ref_grid.crs) if ref_grid is not None else "",
+                "transform": list(ref_grid.transform)[:6]
+                if ref_grid is not None
+                else [],
+                "bounds": [bounds.left, bounds.bottom, bounds.right, bounds.top]
+                if bounds is not None
+                else [],
+                "resolution": [abs(res.x), abs(res.y)] if res is not None else [],
+            }
+        )
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # mode="w" replaces the store; consolidated metadata disabled for
+        # Zarr v3 compatibility (consolidation is not part of the v3 spec).
+        stacked.to_dataset(name=name).to_zarr(
+            str(out), mode="w", consolidated=False
+        )
+        logger.info(
+            "Wrote Zarr cube for '%s' (%d pairs) to %s", name, len(arrays), out
+        )
+        return out
+
+    def plot_interferogram(
+        self,
+        pair: str,
+        *,
+        name: InterferogramAssetName = "unw_phase",
+        ax: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Plot the unwrapped phase for a pair (thin wrapper over plots.frame)."""
+        from faninsar.plots.frame import plot_interferogram
+
+        da = self.open(pair, name, masked=True)
+        return plot_interferogram(da, pair=pair, ax=ax, **kwargs)
+
+    def plot_coherence(
+        self,
+        pair: str,
+        *,
+        ax: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Plot the coherence map for a pair (thin wrapper over plots.frame)."""
+        from faninsar.plots.frame import plot_coherence
+
+        da = self.open(pair, "coherence", masked=True)
+        return plot_coherence(da, pair=pair, ax=ax, **kwargs)
 
     def as_interferogram_dataset(self) -> InterferogramDataset:
         """Return a FanInSAR InterferogramDataset backed by the frame layout.

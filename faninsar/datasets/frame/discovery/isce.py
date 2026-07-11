@@ -1,8 +1,17 @@
-"""ISCE2/topsStack product discovery (M4 stub).
+"""ISCE2 product discovery (M4).
 
-Recognises an ISCE2 product directory by the presence of an ``IW*.xml``
-or ``geometry`` sub-directory. Real implementation will land when ISCE2
-sample data is available for testing.
+Recognises three ISCE2 stack flavours per the MintPy directory convention
+(https://mintpy.readthedocs.io/en/latest/dir_structure/):
+
+- **topsStack** (Sentinel-1 TOPS):
+  ``merged/geom_reference/{lat,lon,hgt,los,shadowMask}.rdr`` +
+  ``merged/interferograms/<dates>/filt_*.unw``
+- **stripmapStack**:
+  ``geom_reference/{lat,lon,hgt,los}.rdr`` +
+  ``Igrams/<dates>/filt_*_snaphu.unw``
+- **alosStack** (ALOS PALSAR):
+  ``dates_res*/<ref_date>/insar/*.{hgt,lat,lon,los,wbd}`` +
+  ``pairs/*-*/insar/filt_*.unw``
 """
 
 from __future__ import annotations
@@ -16,38 +25,84 @@ from . import register
 logger = setup_logger(__name__)
 
 
+def _has(d: Path, pattern: str, *, rglob: bool = False) -> bool:
+    """Return True if *pattern* matches at least one file under *d*."""
+    it = d.rglob(pattern) if rglob else d.glob(pattern)
+    return next(it, None) is not None
+
+
 class ISCEDiscoverer:
-    """Discover ISCE2 topsStack geometry products and interferogram pairs."""
+    """Discover ISCE2 (topsStack / stripmapStack / alosStack) products."""
 
     name = "isce"
 
     def discover_geometry_product(self, root_dir: str | Path) -> Path:
-        """Return the first directory holding geometry rasters."""
+        """Return the directory holding ISCE2 geometry rasters."""
         root_dir = Path(root_dir)
-        # ISCE2 stores geometry under a "geom" or "geometry" subdirectory,
-        # with files like lat.rdr, lon.rdr, los.rdr.
-        for cand in (root_dir / "geometry", root_dir / "geom"):
-            if cand.is_dir() and next(cand.glob("*.rdr"), None) is not None:
-                logger.debug("Discovered ISCE geometry product: %s", cand)
-                return cand
+
+        # topsStack: merged/geom_reference/lat.rdr
+        cand = root_dir / "merged" / "geom_reference"
+        if cand.is_dir() and _has(cand, "lat.rdr"):
+            logger.debug("Discovered ISCE topsStack geometry: %s", cand)
+            return cand
+
+        # stripmapStack: geom_reference/lat.rdr
+        cand = root_dir / "geom_reference"
+        if cand.is_dir() and _has(cand, "lat.rdr"):
+            logger.debug("Discovered ISCE stripmapStack geometry: %s", cand)
+            return cand
+
+        # alosStack: dates_res*/<ref>/insar/*.los
+        for dr in sorted(root_dir.glob("dates_res*")):
+            if not dr.is_dir():
+                continue
+            for date_dir in sorted(dr.iterdir()):
+                insar = date_dir / "insar"
+                if insar.is_dir() and _has(insar, "*.los"):
+                    logger.debug("Discovered ISCE alosStack geometry: %s", insar)
+                    return insar
+
         msg = f"No ISCE geometry product found in {root_dir}"
         logger.error(msg)
         raise FileNotFoundError(msg)
 
     def discover_pairs(self, root_dir: str | Path) -> list[Path]:
-        """Return the list of valid pair product directories."""
+        """Return the list of ISCE2 interferogram pair directories."""
         root_dir = Path(root_dir)
         pairs: list[Path] = []
-        for d in sorted(root_dir.iterdir()):
-            if not d.is_dir() or d.name.startswith("."):
-                continue
-            # ISCE2 pair dirs contain "fine_interferogram"
-            # or "filt_topophase.unw".
-            if (
-                next(d.rglob("filt_topophase.unw"), None) is not None
-                or next(d.rglob("fine_interferogram.xml"), None) is not None
-            ):
-                pairs.append(d)
+
+        # topsStack: merged/interferograms/<dates>/filt_*.unw
+        ifgs_root = root_dir / "merged" / "interferograms"
+        if ifgs_root.is_dir():
+            pairs.extend(
+                d
+                for d in sorted(ifgs_root.iterdir())
+                if d.is_dir() and _has(d, "filt_*.unw")
+            )
+            if pairs:
+                return pairs
+
+        # stripmapStack: Igrams/<dates>/filt_*_snaphu.unw
+        igrams = root_dir / "Igrams"
+        if igrams.is_dir():
+            pairs.extend(
+                d
+                for d in sorted(igrams.iterdir())
+                if d.is_dir() and _has(d, "filt_*_snaphu.unw")
+            )
+            if pairs:
+                return pairs
+
+        # alosStack: pairs/*-*/insar/filt_*.unw
+        pairs_root = root_dir / "pairs"
+        if pairs_root.is_dir():
+            for d in sorted(pairs_root.iterdir()):
+                insar = d / "insar"
+                if insar.is_dir() and _has(insar, "filt_*.unw"):
+                    pairs.append(d)
+            if pairs:
+                return pairs
+
         return pairs
 
 

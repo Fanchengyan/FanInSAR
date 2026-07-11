@@ -173,6 +173,22 @@ def _build_ifg_item(
         if val is not None:
             properties[f"frame:{key}"] = val
 
+    # Standard InSAR extension fields (stac-extensions/insar v1.0.0).
+    # These map the existing frame:* metadata to the canonical extension keys
+    # so external STAC consumers can discover/query InSAR items uniformly.
+    # Values must be JSON-serialisable (ISO strings, not datetime objects).
+    insar_fields: dict[str, Any] = {
+        "insar:reference_datetime": _parse_date(ref_date).isoformat(),
+        "insar:secondary_datetime": sec_dt.isoformat() if sec_dt is not None else None,
+    }
+    tb = item_meta.get("temporal_baseline_days")
+    if tb is not None:
+        insar_fields["insar:temporal_baseline"] = int(tb)
+    pb = item_meta.get("baseline")
+    if pb is not None:
+        insar_fields["insar:perpendicular_baseline"] = float(pb)
+    properties.update({k: v for k, v in insar_fields.items() if v is not None})
+
     item = Item(
         id=pair_name,
         geometry=geom_shape.__geo_interface__,
@@ -204,6 +220,30 @@ def _build_ifg_item(
                 roles=["data"],
             ),
         )
+
+    # Zarr cube assets (stac-extensions/zarr v1.1.0). When a persistent
+    # (pair, y, x) Zarr cube exists for an asset, advertise it as an
+    # additional data asset with the zarr:* extension fields. This enables
+    # discovery of both COG (archive) and Zarr (compute) representations.
+    zarr_media_type = "application/vnd.zarr; version=3"
+    for asset_name in item_meta.get("assets", {}):
+        zarr_cube = ifgs.zarr_stack_path(asset_name)
+        if zarr_cube.exists():
+            # Relative href from the interferograms root.
+            item.add_asset(
+                key=f"{asset_name}_zarr",
+                asset=Asset(
+                    href=str(zarr_cube.name),
+                    media_type=zarr_media_type,
+                    title=f"{asset_name} Zarr cube",
+                    roles=["data", "timeseries"],
+                    extra_fields={
+                        "zarr:consolidated": False,
+                        "zarr:node_type": "array",
+                        "zarr:zarr_format": 3,
+                    },
+                ),
+            )
 
     return item
 

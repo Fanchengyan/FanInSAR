@@ -181,6 +181,52 @@ class TestFrameInterferogramCreation:
         assert item["temporal_baseline_days"] is not None
 
 
+class TestValueRangeMetadata:
+    """D0.2: value_ranges recorded in item.json for cross-processor coherence."""
+
+    def test_value_ranges_serialized(self) -> None:
+        from faninsar.datasets.frame.metadata import build_item_metadata
+
+        item = build_item_metadata(
+            pair_name="20200101_20200201",
+            reference_date="20200101",
+            secondary_date="20200201",
+            grid={"width": 10, "height": 10},
+            assets={"coherence": {"href": "coherence.cog.tif"}},
+            value_ranges={"coherence": (0.0, 255.0)},  # LiCSAR-style
+        )
+        assert "value_ranges" in item
+        assert item["value_ranges"]["coherence"] == [0.0, 255.0]
+
+    def test_value_ranges_omitted_when_none(self) -> None:
+        from faninsar.datasets.frame.metadata import build_item_metadata
+
+        item = build_item_metadata(
+            pair_name="20200101_20200201",
+            reference_date="20200101",
+            secondary_date="20200201",
+            grid={"width": 10, "height": 10},
+            assets={"coherence": {"href": "coherence.cog.tif"}},
+        )
+        assert "value_ranges" not in item
+
+    def test_hyp3_vs_licsar_coherence_ranges(self) -> None:
+        """HyP3 coherence is 0-1; LiCSAR is 0-255 — both must be recordable."""
+        from faninsar.datasets.frame.metadata import build_item_metadata
+
+        base = dict(
+            pair_name="20200101_20200201",
+            reference_date="20200101",
+            secondary_date="20200201",
+            grid={"width": 10, "height": 10},
+            assets={"coherence": {"href": "coherence.cog.tif"}},
+        )
+        hyp3 = build_item_metadata(**base, value_ranges={"coherence": (0.0, 1.0)})
+        licsar = build_item_metadata(**base, value_ranges={"coherence": (0.0, 255.0)})
+        assert hyp3["value_ranges"]["coherence"] == [0.0, 1.0]
+        assert licsar["value_ranges"]["coherence"] == [0.0, 255.0]
+
+
 class TestFrameInterferogramPairs:
     def test_pairs_returns_pairs_object(
         self, ifg_collection: FrameInterferogramCollection
@@ -224,6 +270,96 @@ class TestFrameInterferogramStack:
     def test_open_stack_subset(
         self, ifg_collection: FrameInterferogramCollection
     ) -> None:
+        pairs_obj = ifg_collection.pairs()
+        subset = pairs_obj[:1]
+        stack = ifg_collection.open_stack("unw_phase", pairs=subset)
+        assert stack.sizes["pair"] == 1
+
+
+class TestFrameInterferogramZarrStack:
+    """D1.1: to_zarr_stack writes a persistent (pair, y, x) Zarr cube."""
+
+    def test_to_zarr_stack_writes_cube(
+        self, ifg_collection: FrameInterferogramCollection
+    ) -> None:
+        import xarray as xr
+
+        out = ifg_collection.to_zarr_stack("unw_phase", overwrite=True)
+        assert out.exists()
+        # Read back lazily.
+        ds = xr.open_zarr(str(out), consolidated=False)
+        assert "unw_phase" in ds
+        da = ds["unw_phase"]
+        assert da.dims == ("pair", "y", "x") or da.dims == ("pair", "band", "y", "x")
+        assert da.sizes["pair"] == 2
+
+    def test_zarr_stack_is_dask_backed(
+        self, ifg_collection: FrameInterferogramCollection
+    ) -> None:
+        import xarray as xr
+
+        ifg_collection.to_zarr_stack("unw_phase", overwrite=True)
+        out = ifg_collection.zarr_stack_path("unw_phase")
+        da = xr.open_zarr(str(out), consolidated=False, chunks="auto")["unw_phase"]
+        # dask-backed when chunks requested
+        assert da.chunks is not None
+
+    def test_zarr_stack_overwrite_false_raises(
+        self, ifg_collection: FrameInterferogramCollection
+    ) -> None:
+        ifg_collection.to_zarr_stack("unw_phase", overwrite=True)
+        with pytest.raises(FileExistsError):
+            ifg_collection.to_zarr_stack("unw_phase", overwrite=False)
+
+    def test_zarr_stack_correct_values(
+        self, ifg_collection: FrameInterferogramCollection
+    ) -> None:
+        """Zarr cube values must match the per-pair COG reads."""
+        import xarray as xr
+
+        ifg_collection.to_zarr_stack("unw_phase", overwrite=True)
+        out = ifg_collection.zarr_stack_path("unw_phase")
+        cube = xr.open_zarr(str(out), consolidated=False)["unw_phase"].compute()
+
+        pairs_obj = ifg_collection.pairs()
+        for i, pname in enumerate(pairs_obj.to_names()):
+            direct = ifg_collection.open(pname, "unw_phase", masked=False)
+            # squeeze possible band dim
+            if direct.ndim == 3:
+                direct = direct.squeeze("band", drop=True)
+            np.testing.assert_allclose(
+                np.asarray(cube.isel(pair=i).values),
+                np.asarray(direct.values),
+                equal_nan=True,
+            )
+
+
+class TestFrameInterferogramOpenStackLazy:
+    """D1.2: open_stack reads lazily from Zarr cube when present."""
+
+    def test_open_stack_uses_zarr_when_present(
+        self, ifg_collection: FrameInterferogramCollection
+    ) -> None:
+        # No cube yet: eager path returns a non-dask-backed array by default.
+        eager = ifg_collection.open_stack("unw_phase")
+        # Write the cube; now open_stack must read from Zarr (dask-backed).
+        ifg_collection.to_zarr_stack("unw_phase", overwrite=True)
+        lazy = ifg_collection.open_stack("unw_phase", chunks="auto")
+        assert lazy.sizes["pair"] == eager.sizes["pair"]
+        assert lazy.chunks is not None  # dask-backed
+
+    def test_open_stack_eager_fallback_without_cube(
+        self, ifg_collection: FrameInterferogramCollection
+    ) -> None:
+        # No Zarr cube present -> eager concat of COGs.
+        assert not ifg_collection.zarr_stack_path("unw_phase").exists()
+        stack = ifg_collection.open_stack("unw_phase")
+        assert stack.sizes["pair"] == 2
+
+    def test_open_stack_subset_via_zarr(
+        self, ifg_collection: FrameInterferogramCollection
+    ) -> None:
+        ifg_collection.to_zarr_stack("unw_phase", overwrite=True)
         pairs_obj = ifg_collection.pairs()
         subset = pairs_obj[:1]
         stack = ifg_collection.open_stack("unw_phase", pairs=subset)

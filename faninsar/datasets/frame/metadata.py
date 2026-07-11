@@ -66,6 +66,17 @@ CONTINUOUS_ASSETS: frozenset[str] = frozenset(
 
 CATEGORICAL_ASSETS: frozenset[str] = frozenset({"water_mask", "conncomp"})
 
+# Assets whose values are cyclic (2*pi wrapped phase). Bilinear resampling is
+# physically wrong for these because averaging neighbours on opposite sides of a
+# wrap (e.g. +3.1 and -3.1 rad, both near pi) yields ~0 instead of ~pi. They
+# require complex-average resampling: convert to exp(i*phi), bilinear-resample
+# the complex field, then take the angle.
+#
+# NOTE: ``unw_phase`` (unwrapped phase) is a *continuous* field and correctly
+# stays in CONTINUOUS_ASSETS with bilinear resampling — only wrapped phase is
+# cyclic.
+PHASE_ASSETS: frozenset[str] = frozenset({"wrapped_phase"})
+
 METADATA_VERSION = "0.1.0"
 
 
@@ -87,8 +98,14 @@ def build_geometry_metadata(
     assets: dict[str, dict[str, Any]],
     source_assets: dict[str, dict[str, Any]] | None = None,
     processing: dict[str, Any] | None = None,
+    value_ranges: dict[str, tuple[float, float]] | None = None,
 ) -> dict[str, Any]:
-    """Build a geometry.json metadata dictionary."""
+    """Build a geometry.json metadata dictionary.
+
+    ``value_ranges`` maps asset name to ``(min, max)`` valid value range;
+    written to ``geometry.json`` so downstream consumers can interpret
+    values without guessing (e.g. incidence angle in degrees vs radians).
+    """
     meta: dict[str, Any] = {
         "type": "FrameGeometry",
         "version": METADATA_VERSION,
@@ -110,6 +127,10 @@ def build_geometry_metadata(
         meta["source_assets"] = source_assets
     if processing is not None:
         meta["processing"] = processing
+    if value_ranges is not None:
+        meta["value_ranges"] = {
+            k: list(v) for k, v in value_ranges.items() if v is not None
+        }
     return meta
 
 
@@ -132,8 +153,14 @@ def build_item_metadata(
     heading: float | None = None,
     looks: str | None = None,
     reference_point: dict[str, Any] | None = None,
+    value_ranges: dict[str, tuple[float, float]] | None = None,
 ) -> dict[str, Any]:
-    """Build an item.json metadata dictionary for a pair."""
+    """Build an item.json metadata dictionary for a pair.
+
+    ``value_ranges`` maps asset name to ``(min, max)`` valid value range.
+    Critical for coherence, which is 0-255 in LiCSAR but 0-1 in HyP3 —
+    without it downstream consumers silently misinterpret the values.
+    """
     item: dict[str, Any] = {
         "type": "FrameInterferogramItem",
         "version": METADATA_VERSION,
@@ -167,6 +194,10 @@ def build_item_metadata(
         item["looks"] = looks
     if reference_point is not None:
         item["reference_point"] = reference_point
+    if value_ranges is not None:
+        item["value_ranges"] = {
+            k: list(v) for k, v in value_ranges.items() if v is not None
+        }
     return item
 
 

@@ -48,3 +48,31 @@ Hierarchical Datasets
 
    faninsar.datasets.XarrayDataset
    faninsar.datasets.HierarchicalDataset
+
+Frame-Level Products
+~~~~~~~~~~~~~~~~~~~~
+
+Standardized geocoded raster InSAR frames: geometry + interferogram
+collections + time series, with COG/Zarr/STAC round-tripping and MintPy
+interoperability.
+
+.. autosummary::
+   :toctree: generated/
+
+   faninsar.datasets.frame.Frame
+   faninsar.datasets.frame.FrameGeometry
+   faninsar.datasets.frame.FrameInterferogramCollection
+   faninsar.datasets.frame.FrameTimeSeries
+   faninsar.datasets.frame.RemoteFrame
+   faninsar.datasets.frame.build_mintpy
+
+Inversion Pipeline
+~~~~~~~~~~~~~~~~~~
+
+NSBAS time-series inversion orchestrated via Dask spatial tiling and
+(optional) GPU acceleration.
+
+.. autosummary::
+   :toctree: generated/
+
+   faninsar.pipeline.InversionPipeline

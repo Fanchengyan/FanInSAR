@@ -444,3 +444,44 @@ class TestFrameFromStac:
         loaded = Frame.from_stac(out_dir / "catalog.json", frame_root=frame_dir)
         assert loaded.geometry is not None
         assert loaded.interferograms is None
+
+
+class TestStacZarrAndInsarExtensions:
+    """D1.4: STAC items carry zarr:* assets and insar:* extension fields."""
+
+    def test_insar_extension_fields_present(
+        self, frame_dir: Path, ifg_collection: FrameInterferogramCollection
+    ) -> None:
+        geom = FrameGeometry(frame_dir / "geometry")
+        catalog = geom.to_stac(ifgs=ifg_collection)
+        ifg_col = catalog.get_child("interferograms")
+        item = next(iter(ifg_col.get_items()))
+        props = item.properties
+        assert "insar:reference_datetime" in props
+        assert "insar:secondary_datetime" in props
+
+    def test_zarr_asset_added_when_cube_exists(
+        self, frame_dir: Path, ifg_collection: FrameInterferogramCollection
+    ) -> None:
+        # Build the Zarr cube first.
+        ifg_collection.to_zarr_stack("unw_phase", overwrite=True)
+        geom = FrameGeometry(frame_dir / "geometry")
+        catalog = geom.to_stac(ifgs=ifg_collection)
+        ifg_col = catalog.get_child("interferograms")
+        item = next(iter(ifg_col.get_items()))
+        assert "unw_phase_zarr" in item.assets
+        zarr_asset = item.assets["unw_phase_zarr"]
+        assert "zarr" in zarr_asset.media_type
+        assert zarr_asset.extra_fields.get("zarr:zarr_format") == 3
+        assert zarr_asset.extra_fields.get("zarr:node_type") == "array"
+
+    def test_no_zarr_asset_without_cube(
+        self, frame_dir: Path, ifg_collection: FrameInterferogramCollection
+    ) -> None:
+        # No Zarr cube present -> no zarr asset.
+        assert not ifg_collection.zarr_stack_path("unw_phase").exists()
+        geom = FrameGeometry(frame_dir / "geometry")
+        catalog = geom.to_stac(ifgs=ifg_collection)
+        ifg_col = catalog.get_child("interferograms")
+        item = next(iter(ifg_col.get_items()))
+        assert not any(k.endswith("_zarr") for k in item.assets)
