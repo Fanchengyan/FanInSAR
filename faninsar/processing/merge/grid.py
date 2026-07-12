@@ -50,12 +50,15 @@ class GeoGridSpec:
     def __post_init__(self) -> None:
         """Validate dimensions and fill a default bbox from the transform."""
         if self.width <= 0 or self.height <= 0:
-            raise ValueError("GeoGridSpec width and height must be positive")
+            msg = "GeoGridSpec width and height must be positive"
+            raise ValueError(msg)
         if not self.crs:
-            raise ValueError("GeoGridSpec crs must not be empty")
+            msg = "GeoGridSpec crs must not be empty"
+            raise ValueError(msg)
         x0, dx, _, y0, _, dy = self.transform
         if dx == 0.0 or dy == 0.0:
-            raise ValueError("GeoGridSpec pixel sizes must be non-zero")
+            msg = "GeoGridSpec pixel sizes must be non-zero"
+            raise ValueError(msg)
         if self.bbox is None:
             west = x0
             north = y0
@@ -142,7 +145,8 @@ def build_geo_grid(
 
     """
     if not footprints:
-        raise ValueError("build_geo_grid requires at least one footprint")
+        msg = "build_geo_grid requires at least one footprint"
+        raise ValueError(msg)
 
     wests = [min(fp[0][0], fp[1][0]) for fp in footprints]
     easts = [max(fp[0][0], fp[1][0]) for fp in footprints]

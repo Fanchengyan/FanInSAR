@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.merge.overlap import overlap_mask
 from faninsar.processing.merge.phase_network import (
     estimate_edges,
     solve_network,
@@ -74,23 +73,28 @@ def merge_burst_products(
 
     """
     if not products:
-        raise ValueError("merge_burst_products requires at least one product")
+        msg = "merge_burst_products requires at least one product"
+        raise ValueError(msg)
 
     if not allow_unwrapped_merge:
-        unwrapped = [p.burst_id for p in products if p.phase_domain == "unwrapped"]
+        unwrapped = [
+            p.burst_id for p in products if p.phase_domain == "unwrapped"
+        ]
         if unwrapped:
-            raise ValueError(
+            msg = (
                 "merge_burst_products received unwrapped-phase products "
                 f"({unwrapped}). The timing rule (plan §4.3) requires merge "
                 "in the complex domain before unwrapping. Pass "
                 "allow_unwrapped_merge=True to opt in (not recommended; "
                 "not part of the production DoD)."
             )
+            raise ValueError(msg)
 
     grid = products[0].grid
     for p in products[1:]:
         if p.grid.shape != grid.shape or p.grid.crs != grid.crs:
-            raise ValueError("all products must share the same GeoGridSpec")
+            msg = "all products must share the same GeoGridSpec"
+            raise ValueError(msg)
 
     shape = grid.shape
     n = len(products)

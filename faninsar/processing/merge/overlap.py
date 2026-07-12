@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
 from faninsar.logging import setup_logger
-
-if TYPE_CHECKING:
-    pass
 
 logger = setup_logger(__name__)
 
@@ -116,14 +111,14 @@ def compute_weight_stack(
     feather_width_px: float,
     extra: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Combine the weight components into a single per-pixel weight.
+    r"""Combine the weight components into a single per-pixel weight.
 
     The weight is
 
     .. math::
 
-        w(p) = m_{\\text{valid}}(p) \\cdot d_{\\text{feather}}(p)
-               \\cdot \\gamma(p)^{p_\\gamma} \\cdot w_{\\text{extra}}(p)
+        w(p) = m_{\text{valid}}(p) \cdot d_{\text{feather}}(p)
+               \cdot \gamma(p)^{p_\gamma} \cdot w_{\text{extra}}(p)
 
     Parameters
     ----------
@@ -155,7 +150,6 @@ def compute_weight_stack(
     extra_factor = (
         np.ones_like(feather) if extra is None else extra.astype(np.float32)
     )
-    weight = (
+    return (
         valid_mask.astype(np.float32) * feather * coh_factor * extra_factor
     ).astype(np.float32)
-    return weight

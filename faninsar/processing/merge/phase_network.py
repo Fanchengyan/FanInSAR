@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -43,7 +43,7 @@ class PhaseEdge:
 class MergeGraph:
     """Burst overlap phase network."""
 
-    nodes: tuple["BurstGeoProduct", ...]
+    nodes: tuple[BurstGeoProduct, ...]
     edges: tuple[PhaseEdge, ...]
 
 
@@ -76,13 +76,13 @@ def estimate_edge(
     min_edge_coherence: float,
     threshold: float = 0.0,
 ) -> PhaseEdge | None:
-    """Estimate the overlap phase offset between two burst products.
+    r"""Estimate the overlap phase offset between two burst products.
 
     Computes
 
     .. math::
 
-        \\Delta\\phi_{ij} = \\arg\\sum_{p\\in\\Omega} w_i w_j\\, z_i z_j^*
+        \Delta\phi_{ij} = \arg\sum_{p\in\Omega} w_i w_j\, z_i z_j^*
 
     and the corresponding coherence and edge weight.
 
@@ -236,13 +236,13 @@ def solve_network(
     *,
     reference_node: int = 0,
 ) -> NetworkSolution:
-    """Solve the weighted least-squares phase network adjustment.
+    r"""Solve the weighted least-squares phase network adjustment.
 
     Minimizes
 
     .. math::
 
-        \\sum_{(i,j)\\in E} W_{ij}(\\phi_i - \\phi_j - \\Delta\\phi_{ij})^2
+        \sum_{(i,j)\in E} W_{ij}(\phi_i - \phi_j - \Delta\phi_{ij})^2
 
     subject to ``phi[reference_node] = 0`` per connected component.
 
@@ -268,7 +268,8 @@ def solve_network(
     for k in range(n):
         c = int(component_id[k])
         if c not in comp_refs:
-            comp_refs[c] = reference_node if int(component_id[reference_node]) == c else k
+            ref = reference_node if int(component_id[reference_node]) == c else k
+            comp_refs[c] = ref
 
     # Build sparse normal equations per component.
     # Unknowns: phi_k for k != ref_of_comp. We assemble A x = b with
@@ -301,15 +302,23 @@ def solve_network(
         if ki is None and kj is None:
             continue
         if ki is not None and kj is not None:
-            rows.append(row); cols.append(ki); data.append(sqrt_w)
-            rows.append(row); cols.append(kj); data.append(-sqrt_w)
+            rows.append(row)
+            cols.append(ki)
+            data.append(sqrt_w)
+            rows.append(row)
+            cols.append(kj)
+            data.append(-sqrt_w)
             b.append(sqrt_w * e.dphi_rad)
         elif ki is not None:
             # j is the reference (phi_j = 0): phi_i = dphi
-            rows.append(row); cols.append(ki); data.append(sqrt_w)
+            rows.append(row)
+            cols.append(ki)
+            data.append(sqrt_w)
             b.append(sqrt_w * e.dphi_rad)
         else:  # kj is not None, i is the reference (phi_i = 0): -phi_j = dphi
-            rows.append(row); cols.append(kj); data.append(-sqrt_w)
+            rows.append(row)
+            cols.append(kj)
+            data.append(-sqrt_w)
             b.append(sqrt_w * e.dphi_rad)
 
     if n_unknowns > 0 and rows:

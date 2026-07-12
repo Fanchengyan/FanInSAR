@@ -117,12 +117,14 @@ def geocode_complex_to_grid(
     """
     radar_h, radar_w = complex_radar.shape
     if radar_h == 0 or radar_w == 0:
-        raise ValueError("complex_radar must be non-empty")
+        msg = "complex_radar must be non-empty"
+        raise ValueError(msg)
     if radar_shape is not None and complex_radar.shape != tuple(radar_shape):
-        raise ValueError(
+        msg = (
             f"complex_radar shape {complex_radar.shape} does not match "
             f"radar_shape {tuple(radar_shape)}"
         )
+        raise ValueError(msg)
 
     target_shape = grid.shape
     lat, lon = _grid_pixel_centers_lonlat(grid)

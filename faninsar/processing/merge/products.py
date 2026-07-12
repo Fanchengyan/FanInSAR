@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
@@ -11,6 +10,8 @@ import numpy as np
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
+    from datetime import date
+
     from faninsar.processing.merge.grid import GeoGridSpec
 
 logger = setup_logger(__name__)
@@ -41,7 +42,7 @@ class BurstGeoProduct:
     complex : numpy.ndarray
         Complex64 corrected SLC or wrapped interferogram.
     weight : numpy.ndarray
-        Float32 per-pixel weight (mask × feather × coh × …).
+        Float32 per-pixel weight (mask x feather x coh x ...).
     coherence : numpy.ndarray or None
         Coherence layer (ifg mode only).
     phase_domain : {"complex", "unwrapped"}
@@ -69,23 +70,23 @@ class BurstGeoProduct:
     def __post_init__(self) -> None:
         """Validate array shapes and phase-domain consistency."""
         if self.complex.dtype != np.complex64:
-            raise ValueError("BurstGeoProduct.complex must be complex64")
+            msg = "BurstGeoProduct.complex must be complex64"
+            raise ValueError(msg)
         if self.complex.shape != self.grid.shape:
-            raise ValueError(
-                "BurstGeoProduct.complex shape must match grid.shape"
-            )
+            msg = "BurstGeoProduct.complex shape must match grid.shape"
+            raise ValueError(msg)
         if self.weight.shape != self.grid.shape:
-            raise ValueError(
-                "BurstGeoProduct.weight shape must match grid.shape"
-            )
-        if self.coherence is not None and self.coherence.shape != self.grid.shape:
-            raise ValueError(
-                "BurstGeoProduct.coherence shape must match grid.shape"
-            )
+            msg = "BurstGeoProduct.weight shape must match grid.shape"
+            raise ValueError(msg)
+        if (
+            self.coherence is not None
+            and self.coherence.shape != self.grid.shape
+        ):
+            msg = "BurstGeoProduct.coherence shape must match grid.shape"
+            raise ValueError(msg)
         if self.phase_domain not in ("complex", "unwrapped"):
-            raise ValueError(
-                "phase_domain must be 'complex' or 'unwrapped'"
-            )
+            msg = "phase_domain must be 'complex' or 'unwrapped'"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,12 +123,13 @@ class MosaicProduct:
     def __post_init__(self) -> None:
         """Validate mosaic array shapes and dtypes."""
         if self.complex.dtype != np.complex64:
-            raise ValueError("MosaicProduct.complex must be complex64")
+            msg = "MosaicProduct.complex must be complex64"
+            raise ValueError(msg)
         if self.complex.shape != self.grid.shape:
-            raise ValueError("MosaicProduct.complex shape must match grid")
+            msg = "MosaicProduct.complex shape must match grid"
+            raise ValueError(msg)
         for arr_name in ("weight_sum", "n_bursts", "component_id"):
             arr = getattr(self, arr_name)
             if arr.shape != self.grid.shape:
-                raise ValueError(
-                    f"MosaicProduct.{arr_name} shape must match grid"
-                )
+                msg = f"MosaicProduct.{arr_name} shape must match grid"
+                raise ValueError(msg)
