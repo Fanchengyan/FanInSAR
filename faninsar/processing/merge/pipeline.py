@@ -20,6 +20,7 @@ __all__ = [
     "run_frame_merge",
     "run_multi_burst_pair_merge",
     "run_multi_path_pair_merge",
+    "write_mosaic_stac_item",
     "write_mosaic_zarr",
 ]
 
@@ -256,4 +257,108 @@ def write_mosaic_zarr(
         }
     )
     logger.info("Wrote mosaic Zarr product: %s", path)
+    return path
+
+
+def write_mosaic_stac_item(
+    mosaic: MosaicProduct,
+    zarr_path: Path,
+    stac_path: str | Path,
+    *,
+    pair_id: str,
+    source_burst_ids: list[str] | None = None,
+) -> Path:
+    """Write a minimal STAC item for a mosaic product (plan §10).
+
+    Parameters
+    ----------
+    mosaic : MosaicProduct
+        Mosaic to describe.
+    zarr_path : pathlib.Path
+        Path to the accompanying Zarr store.
+    stac_path : str or pathlib.Path
+        Destination JSON file.
+    pair_id : str
+        Pair identifier stored in item properties.
+    source_burst_ids : list of str, optional
+        Source burst identifiers linked from this item.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the written STAC item JSON.
+
+    """
+    import json
+
+    path = Path(stac_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Derive bbox in CRS units from weight_sum > 0 footprint.
+    valid = mosaic.weight_sum > 0
+    if valid.any():
+        rows, cols = np.where(valid)
+        x0, dx, _, y0, _, dy = mosaic.grid.transform
+        xs = x0 + dx * (cols + 0.5)
+        ys = y0 + dy * (rows + 0.5)
+        bbox = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
+    else:
+        bbox = list(mosaic.grid.bbox)
+
+    geometry = {
+        "type": "Polygon",
+        "coordinates": [[
+            [bbox[0], bbox[1]],
+            [bbox[2], bbox[1]],
+            [bbox[2], bbox[3]],
+            [bbox[0], bbox[3]],
+            [bbox[0], bbox[1]],
+        ]],
+    }
+
+    item = {
+        "type": "Feature",
+        "stac_version": "1.0",
+        "stac_extensions": [],
+        "id": pair_id,
+        "geometry": geometry,
+        "bbox": bbox,
+        "properties": {
+            "pair_id": pair_id,
+            "merge_domain": "complex",
+            "created_utc": datetime.now(UTC).isoformat(),
+            "faninsar:source_bursts": source_burst_ids or [],
+            "faninsar:crs": mosaic.grid.crs,
+            "faninsar:resolution_m": list(mosaic.grid.resolution_m),
+        },
+        "assets": {
+            "complex_ifg": {
+                "href": str(Path(zarr_path).name) + "/complex_ifg",
+                "type": "application/vnd.zarr",
+                "roles": ["data"],
+            },
+            "coherence": {
+                "href": str(Path(zarr_path).name) + "/coherence",
+                "type": "application/vnd.zarr",
+                "roles": ["data"],
+            },
+            "metadata": {
+                "href": str(Path(zarr_path).name),
+                "type": "application/vnd.zarr",
+                "roles": ["metadata"],
+            },
+        },
+        "links": [
+            {
+                "rel": "source",
+                "href": bid,
+                "type": "application/json",
+            }
+            for bid in (source_burst_ids or [])
+        ],
+    }
+
+    with path.open("w") as f:
+        json.dump(item, f, indent=2)
+    logger.info("Wrote mosaic STAC item: %s", path)
     return path
