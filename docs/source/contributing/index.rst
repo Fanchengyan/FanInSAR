@@ -32,61 +32,16 @@ You can get the latest development source code from our `Github repository
     git clone https://github.com/<your github user name>/FanInSAR
 
 
-Create a Dedicated Environment
-------------------------------
-
-We strongly recommend that you create a virtual environment for developing FanInSAR to isolate it from other Python installations on your system.
-
-Create a new virtual environment using `conda <https://docs.conda.io/en/latest/>`_:
-
-.. code-block:: bash
-
-    conda create -n faninsar python=3.10
-
-
-Activate the environment:
-
-.. code-block:: bash
-
-    conda activate faninsar
-
-
 Install Dependencies
 --------------------
 
-Most of the FanInSAR dependencies are listed in :file:`pyproject.toml` and can be
-installed from those files:
+FanInSAR uses `uv <https://docs.astral.sh/uv/>`_ to create and manage its
+development environment. From the repository root, install the project and its
+development dependencies with:
 
 .. code-block:: bash
 
-    python -m pip install ".[dev]"
-
-FanInSAR requires that `setuptools
-<https://setuptools.pypa.io/en/latest/setuptools.html>`_ is installed. It is
-usually packaged with python, but if necessary can be installed using ``pip``:
-
-.. code-block:: bash
-
-    python -m pip install setuptools
-
-
-
-Install for Development
------------------------
-
-Editable installs means that the environment Python will always use the most
-recently changed version of your code. To install Sphinx Gallery in editable
-mode, ensure you are in the sphinx-gallery directory
-
-.. code-block:: bash
-
-    cd FanInSAR
-
-Then install using the editable flag:
-
-.. code-block:: bash
-
-    python -m pip install -e .
+    uv sync --dev
 
 
 Run Tests
@@ -96,7 +51,21 @@ Check that you are all set by running the tests:
 
 .. code-block:: bash
 
-    python -m pytest
+    uv run pytest
+
+The test configuration measures coverage for :mod:`faninsar`. Run a focused
+test by passing its path after ``pytest``, for example
+``uv run pytest tests/_core/sar/test_pairs.py``.
+
+Some shells inherit ``PROJ_DATA`` or the legacy ``PROJ_LIB`` from a Conda or
+system installation. Those variables can point Rasterio and pyproj at an
+incompatible ``proj.db`` while tests run in the uv environment. The root test
+configuration checks each inherited override in an isolated Python process
+before test modules are imported. It preserves paths that let both pyproj and
+Rasterio resolve EPSG:4326, and removes only incompatible or unresponsive
+overrides so the geospatial wheels can use their matching bundled PROJ data.
+For non-test commands, unset the variables in the shell if PROJ reports a
+database layout-version mismatch.
 
 Install pre-commit hooks
 ------------------------
@@ -106,13 +75,13 @@ code and documentation. To set up pre-commit hooks:
 
 .. code-block:: bash
 
-    pre-commit install
+    uv run pre-commit install
 
 This will install the pre-commit hooks in your local repository. You can run the hooks manually with:
 
 .. code-block:: bash
 
-    pre-commit run --all-files
+    uv run pre-commit run --all-files
 
 Testing
 -------

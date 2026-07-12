@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pandas.core.common as com
 import xarray as xr
-from pandas._libs.internals import BlockValuesRefs  # noqa: PLC2701
+from pandas._libs.internals import BlockValuesRefs
 from pandas.core.arrays import ExtensionArray
 from pandas.core.construction import ensure_wrapped_if_datetimelike, sanitize_array
 from pandas.core.dtypes.common import is_iterator, is_list_like, is_scalar, pandas_dtype

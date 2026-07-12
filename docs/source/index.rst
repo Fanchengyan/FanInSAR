@@ -129,5 +129,6 @@ Highlight Features
     user_guide/index
     examples/index
     api/index
+    architecture/index
     Contributing <contributing/index>
     About <about/index>

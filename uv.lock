@@ -881,6 +881,9 @@ docs = [
     { name = "sphinx-design" },
     { name = "sphinx-togglebutton" },
 ]
+snaphu = [
+    { name = "snaphu" },
+]
 test = [
     { name = "coverage" },
     { name = "h5py" },
@@ -932,6 +935,7 @@ requires-dist = [
     { name = "rtree" },
     { name = "ruff", marker = "extra == 'code-style'" },
     { name = "scipy", specifier = ">=1.10" },
+    { name = "snaphu", marker = "extra == 'snaphu'", specifier = ">=0.4.1" },
     { name = "sphinx", marker = "extra == 'docs'", specifier = ">=7" },
     { name = "sphinx-copybutton", marker = "extra == 'docs'" },
     { name = "sphinx-design", marker = "extra == 'docs'" },
@@ -943,7 +947,7 @@ requires-dist = [
     { name = "xarray" },
     { name = "zarr", specifier = ">=3.0" },
 ]
-provides-extras = ["code-style", "test", "cloud", "docs", "dev"]
+provides-extras = ["snaphu", "code-style", "test", "cloud", "docs", "dev"]
 
 [[package]]
 name = "fastjsonschema"
@@ -3862,6 +3866,29 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+
+[[package]]
+name = "snaphu"
+version = "0.4.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3b/b9/50d7a530c3dc97f61d30fefb31aa50f4710954de12e0cebcae8c9fc8d301/snaphu-0.4.1.tar.gz", hash = "sha256:41a7f48e1b8809fa19e9fa5c7e90bfbd1502b1d5b437d2a302fc4938e64095b6", size = 551451, upload-time = "2024-09-16T23:18:15.419Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8c/19/8279587822a695b339afd985357f835858f6c20b3f05cc81f232b86895e5/snaphu-0.4.1-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:f3d069a7815834f0d72c6fdeac72c69a76069e14c03bca80fd5e78f0ea40bdb7", size = 152424, upload-time = "2024-09-16T23:17:44.53Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/7e/2a44545d63bfb87d42ec28fb748b75ce1c4dc5de22be7b72294c035c9079/snaphu-0.4.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:5888b15f68f55109b36c2784e6ac06143f3bb02a0eee2cb0171061ca116e7967", size = 143343, upload-time = "2024-09-16T23:17:45.991Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/44/8c6be346b217c805202b967b96ca04caa586c53f9427c948b7797ef15a36/snaphu-0.4.1-cp311-cp311-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d7a55e7be04891931d4020fe0055920d4944fb6c611f4566bfbe05c113c5d79e", size = 155096, upload-time = "2024-09-16T23:17:47.741Z" },
+    { url = "https://files.pythonhosted.org/packages/68/67/0295a8cfb1d88a5863dd1ff5e5a5514cd40513d6d604cbf9fd64977215ba/snaphu-0.4.1-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:34cf7111865e1a5d2451ff3d97421473edd8c4ffd99d692e02a6cc23f5629cf5", size = 163083, upload-time = "2024-09-16T23:17:49.425Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/a0/29a539efd9ae67a8c5d1c20d849fe9f468e0e0184475d501e5a1298dd6cb/snaphu-0.4.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:72c00be8d876cebf66b5874c35076f48ba4484dd94d176f21527763b03549a3a", size = 151706, upload-time = "2024-09-16T23:17:50.889Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/63/4ac4488f3999d8f0d5fcfce5ed8cbe9abc0d64daffd59c5411e15a7fdb40/snaphu-0.4.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:2ed89e57afce7ef3df748553e283b0ba606a14eb844147ce4e9a917fd87158e8", size = 143342, upload-time = "2024-09-16T23:17:51.947Z" },
+    { url = "https://files.pythonhosted.org/packages/56/f3/b594fe851ad520a07127a9680bbf9732c74f8d4e6b6dc5a2cdd196bf5974/snaphu-0.4.1-cp312-cp312-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d38d0b016718b0945cc1a6d3240ca0257d415b416e62a06964140ad0cd8c261d", size = 155094, upload-time = "2024-09-16T23:17:53.217Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/25/732c1b93de2e130af4afc9817022a168a1e96410d7d67a9ec4e69c14713d/snaphu-0.4.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:f7c9a9410560795da41048a586ecef7e1efa351027577a77e52baa6df77cd5f4", size = 163085, upload-time = "2024-09-16T23:17:54.22Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/d3/a9d496a9e5a5e2e0388fc49e2710f0103f53404c7ac17628e38728c4ae6c/snaphu-0.4.1-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:3e4f039807fa2cab1c372e3d5bf6cb72739fe8bdb78cab43234c4add09a3a896", size = 151705, upload-time = "2024-09-16T23:17:55.339Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/5c/7eca15911a45b63e60612e2047147149dfa5c5bad259c5c94dc6d55b38df/snaphu-0.4.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:0d81600c71d2fa533ef22b9fb9ca2271ec1cf5b19da4ee05ddd3a181e60bfd09", size = 143342, upload-time = "2024-09-16T23:17:56.913Z" },
+    { url = "https://files.pythonhosted.org/packages/27/79/4198fd39f660d5fc06ef999d78e4d3976ddf348d14c4d0aafabdeaa2de46/snaphu-0.4.1-cp313-cp313-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:5b1a2037dfab887d7837c10d125530b0fc67563e68240051c5e90077db4b92cb", size = 155096, upload-time = "2024-09-16T23:17:58.461Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/07/daaab9a5588fcf53b428ea0ff141aaa2f02234cb14de218ced8812a88e44/snaphu-0.4.1-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:0cf5e8252dd2ac52bd1003f51e5c0de3bb5e9323248aad1b4d8001fca883ff12", size = 163085, upload-time = "2024-09-16T23:17:59.946Z" },
 ]
 
 [[package]]

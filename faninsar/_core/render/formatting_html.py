@@ -17,7 +17,7 @@ from xarray.core.formatting import (
     inline_index_repr,
     inline_variable_array_repr,
 )
-from xarray.core.options import _get_boolean_with_default  # noqa: PLC2701
+from xarray.core.options import _get_boolean_with_default
 
 from .formatting import short_data_repr
 
