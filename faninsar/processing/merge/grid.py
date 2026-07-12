@@ -64,9 +64,7 @@ class GeoGridSpec:
             north = y0
             east = x0 + self.width * dx
             south = y0 + self.height * dy  # dy is negative for north-up
-            object.__setattr__(
-                self, "bbox", (west, south, east, north)
-            )
+            object.__setattr__(self, "bbox", (west, south, east, north))
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -160,13 +158,9 @@ def build_geo_grid(
     lon_c = 0.5 * (lon_w + lon_e)
     lat_c = 0.5 * (lat_s + lat_n)
 
-    target_crs = (
-        _utm_zone_for_lonlat(lon_c, lat_c) if crs == "auto_utm" else crs
-    )
+    target_crs = _utm_zone_for_lonlat(lon_c, lat_c) if crs == "auto_utm" else crs
 
-    x_min, y_min, x_max, y_max = _to_utm_bbox(
-        lon_w, lat_s, lon_e, lat_n, target_crs
-    )
+    x_min, y_min, x_max, y_max = _to_utm_bbox(lon_w, lat_s, lon_e, lat_n, target_crs)
     x_min -= margin_m
     y_min -= margin_m
     x_max += margin_m

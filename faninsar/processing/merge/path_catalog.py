@@ -59,11 +59,13 @@ class PathCatalog:
     def by_look_direction(self, look: str) -> list[BurstGeoProduct]:
         """Return all products with a given look direction."""
         return [
-            p for plist in self.paths.values() for p in plist
+            p
+            for plist in self.paths.values()
+            for p in plist
             if p.look_direction == look
         ]
 
     def cross_path_pairs(self) -> list[tuple[str, str]]:
         """Return path-id pairs that may share a footprint (all combinations)."""
         ids = list(self.paths)
-        return [(a, b) for i, a in enumerate(ids) for b in ids[i + 1:]]
+        return [(a, b) for i, a in enumerate(ids) for b in ids[i + 1 :]]

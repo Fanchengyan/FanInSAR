@@ -78,10 +78,7 @@ class BurstGeoProduct:
         if self.weight.shape != self.grid.shape:
             msg = "BurstGeoProduct.weight shape must match grid.shape"
             raise ValueError(msg)
-        if (
-            self.coherence is not None
-            and self.coherence.shape != self.grid.shape
-        ):
+        if self.coherence is not None and self.coherence.shape != self.grid.shape:
             msg = "BurstGeoProduct.coherence shape must match grid.shape"
             raise ValueError(msg)
         if self.phase_domain not in ("complex", "unwrapped"):

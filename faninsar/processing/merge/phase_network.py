@@ -173,10 +173,7 @@ def estimate_edges(
             pa, pb = nodes[a], nodes[b]
             if path_policy == "same_path_only" and pa.path_id != pb.path_id:
                 continue
-            if (
-                not allow_asc_desc_phase_link
-                and pa.look_direction != pb.look_direction
-            ):
+            if not allow_asc_desc_phase_link and pa.look_direction != pb.look_direction:
                 continue
             edge = estimate_edge(
                 pa,
@@ -197,9 +194,7 @@ def estimate_edges(
                     weight=edge.weight,
                 )
             )
-    logger.info(
-        "estimate_edges: %d nodes, %d edges", len(nodes), len(edges)
-    )
+    logger.info("estimate_edges: %d nodes, %d edges", len(nodes), len(edges))
     return MergeGraph(nodes=nodes, edges=tuple(edges))
 
 
@@ -322,9 +317,7 @@ def solve_network(
             b.append(sqrt_w * e.dphi_rad)
 
     if n_unknowns > 0 and rows:
-        a_mat = csr_matrix(
-            (data, (rows, cols)), shape=(len(b), n_unknowns)
-        )
+        a_mat = csr_matrix((data, (rows, cols)), shape=(len(b), n_unknowns))
         b_arr = np.asarray(b, dtype=np.float64)
         sol = lsqr(a_mat, b_arr)[0]
         for k in range(n):
@@ -348,13 +341,14 @@ def solve_network(
     )
     if residuals.size:
         weights = np.array(
-            [e.weight for e in graph.edges
-             if int(component_id[e.i]) == int(component_id[e.j])],
+            [
+                e.weight
+                for e in graph.edges
+                if int(component_id[e.i]) == int(component_id[e.j])
+            ],
             dtype=np.float64,
         )
-        rms = float(
-            np.sqrt(np.sum(weights * residuals**2) / np.sum(weights))
-        )
+        rms = float(np.sqrt(np.sum(weights * residuals**2) / np.sum(weights)))
     else:
         rms = 0.0
 
@@ -364,9 +358,7 @@ def solve_network(
         n_components=int(component_id.max()) + 1 if n > 0 else 0,
         rms_residual=rms,
     )
-    logger.info(
-        "solve_network: %d components, rms=%.3e rad", stats.n_components, rms
-    )
+    logger.info("solve_network: %d components, rms=%.3e rad", stats.n_components, rms)
     return NetworkSolution(
         phi_hat=phi_hat,
         component_id=component_id,

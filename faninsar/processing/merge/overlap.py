@@ -147,9 +147,7 @@ def compute_weight_stack(
             np.clip(coherence.astype(np.float32), 0.0, 1.0),
             float(coherence_exponent),
         )
-    extra_factor = (
-        np.ones_like(feather) if extra is None else extra.astype(np.float32)
+    extra_factor = np.ones_like(feather) if extra is None else extra.astype(np.float32)
+    return (valid_mask.astype(np.float32) * feather * coh_factor * extra_factor).astype(
+        np.float32
     )
-    return (
-        valid_mask.astype(np.float32) * feather * coh_factor * extra_factor
-    ).astype(np.float32)

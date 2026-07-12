@@ -41,7 +41,7 @@ def _build_synthetic_product(
     z = np.zeros((h, w), dtype=np.complex64)
     mask = np.zeros((h, w), dtype=bool)
     rows, cols = entry["valid_slice"]
-    mask[rows[0]:rows[1], cols[0]:cols[1]] = True
+    mask[rows[0] : rows[1], cols[0] : cols[1]] = True
     phase = float(entry["phase_offset_rad"])
     z[mask] = np.exp(1j * phase, dtype=np.complex64)
     weight = compute_feather(mask, feather_width_px=0.0)

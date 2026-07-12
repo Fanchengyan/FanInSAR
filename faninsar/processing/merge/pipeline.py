@@ -64,9 +64,7 @@ def run_multi_burst_pair_merge(
     MosaicProduct
 
     """
-    logger.info(
-        "run_multi_burst_pair_merge: %d bursts, mode=%s", len(products), mode
-    )
+    logger.info("run_multi_burst_pair_merge: %d bursts, mode=%s", len(products), mode)
     return merge_burst_products(
         products,
         mode=mode,
@@ -209,19 +207,13 @@ def write_mosaic_zarr(
     path.parent.mkdir(parents=True, exist_ok=True)
     root = zarr.open_group(str(path), mode="w")
 
-    root.create_array(
-        "complex_ifg", data=np.asarray(mosaic.complex), overwrite=True
-    )
+    root.create_array("complex_ifg", data=np.asarray(mosaic.complex), overwrite=True)
     if mosaic.coherence is not None:
         root.create_array(
             "coherence", data=np.asarray(mosaic.coherence), overwrite=True
         )
-    root.create_array(
-        "weight_sum", data=np.asarray(mosaic.weight_sum), overwrite=True
-    )
-    root.create_array(
-        "n_bursts", data=np.asarray(mosaic.n_bursts), overwrite=True
-    )
+    root.create_array("weight_sum", data=np.asarray(mosaic.weight_sum), overwrite=True)
+    root.create_array("n_bursts", data=np.asarray(mosaic.n_bursts), overwrite=True)
     root.create_array(
         "component_id", data=np.asarray(mosaic.component_id), overwrite=True
     )
@@ -307,13 +299,15 @@ def write_mosaic_stac_item(
 
     geometry = {
         "type": "Polygon",
-        "coordinates": [[
-            [bbox[0], bbox[1]],
-            [bbox[2], bbox[1]],
-            [bbox[2], bbox[3]],
-            [bbox[0], bbox[3]],
-            [bbox[0], bbox[1]],
-        ]],
+        "coordinates": [
+            [
+                [bbox[0], bbox[1]],
+                [bbox[2], bbox[1]],
+                [bbox[2], bbox[3]],
+                [bbox[0], bbox[3]],
+                [bbox[0], bbox[1]],
+            ]
+        ],
     }
 
     item = {

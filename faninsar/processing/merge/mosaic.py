@@ -77,9 +77,7 @@ def merge_burst_products(
         raise ValueError(msg)
 
     if not allow_unwrapped_merge:
-        unwrapped = [
-            p.burst_id for p in products if p.phase_domain == "unwrapped"
-        ]
+        unwrapped = [p.burst_id for p in products if p.phase_domain == "unwrapped"]
         if unwrapped:
             msg = (
                 "merge_burst_products received unwrapped-phase products "
@@ -147,9 +145,9 @@ def merge_burst_products(
     max_weight_per_pixel = np.zeros(shape, dtype=np.float32)
 
     for k, p in enumerate(products):
-        z_aligned = p.complex * np.exp(
-            -1j * phi_hat[k], dtype=np.complex64
-        ).astype(np.complex64)
+        z_aligned = p.complex * np.exp(-1j * phi_hat[k], dtype=np.complex64).astype(
+            np.complex64
+        )
         w = p.weight
         complex_acc += (w.astype(np.complex64) * z_aligned).astype(np.complex64)
         weight_sum += w

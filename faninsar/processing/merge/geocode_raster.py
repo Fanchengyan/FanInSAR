@@ -59,9 +59,7 @@ def _grid_pixel_centers_lonlat(
     from pyproj import Transformer
 
     transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-    lon, lat = transformer.transform(
-        xs.ravel(), ys.ravel(), direction="INVERSE"
-    )
+    lon, lat = transformer.transform(xs.ravel(), ys.ravel(), direction="INVERSE")
     return (
         np.asarray(lat, dtype=np.float64).reshape(xs.shape),
         np.asarray(lon, dtype=np.float64).reshape(xs.shape),
