@@ -73,7 +73,7 @@ def test_overlap_mask_and_of_two_valid_thresholds() -> None:
 
 
 def test_compute_weight_stack_combines_mask_coherence_feather() -> None:
-    """weight = valid_mask * coh^p * feather."""
+    """Weight = valid_mask * coh^p * feather."""
     valid = np.zeros((20, 20), dtype=bool)
     valid[5:15, 5:15] = True
     coh = np.full((20, 20), 0.5, dtype=np.float32)

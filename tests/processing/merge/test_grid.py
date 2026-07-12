@@ -109,7 +109,7 @@ def test_build_geo_grid_explicit_crs() -> None:
 
 
 def test_geo_grid_spec_bbox_property_matches_transform() -> None:
-    """bbox derived from transform + shape when not given explicitly."""
+    """Bbox derived from transform + shape when not given explicitly."""
     grid = GeoGridSpec(
         crs="EPSG:32633",
         transform=(300000.0, 15.0, 0.0, 5000000.0, 0.0, -5.0),
