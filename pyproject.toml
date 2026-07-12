@@ -73,8 +73,13 @@ dependencies = [
 ]
 
 
+[project.scripts]
+faninsar-merge-bursts = "faninsar.processing.merge.cli:main"
+
+
 [project.optional-dependencies]
 
+snaphu = ["snaphu>=0.4.1"]
 code_style = ["pre-commit", "ruff"]
 test = [
   "FanInSAR",
@@ -118,6 +123,10 @@ include-package-data = true
 [tool.setuptools.package-data]
 faninsar = ["**/*.csv", "**/*.cpt", "**/*.pdf", "**/*.pyi", "**/*.txt"]
 
+[tool.setuptools.data-files]
+"share/faninsar/LICENSES" = ["LICENSES/*"]
+"share/faninsar/docs" = ["docs/development/processing_provenance.md"]
+
 [tool.setuptools.dynamic]
 version = { attr = "faninsar.__version__" }
 
@@ -132,7 +141,7 @@ namespaces = true # allow scanning PEP 420 namespaces (true by default)
 addopts = [
   "--color=yes",
   "--cov-report=",
-  "--cov=myst_sphinx_gallery",
+  "--cov=faninsar",
   "--durations=5",
   "-r a",
   "--tb=short",

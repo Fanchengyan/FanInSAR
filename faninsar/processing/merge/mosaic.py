@@ -108,10 +108,31 @@ def merge_burst_products(
             path_policy=path_policy,
             allow_asc_desc_phase_link=allow_asc_desc_phase_link,
         )
+        # Failure-mode warnings (plan §12).
+        if len(graph.edges) == 0 and n > 1:
+            logger.warning(
+                "merge_burst_products: no phase edges formed — "
+                "all bursts are isolated (overlap < %d px or coherence < %.2f). "
+                "Each burst becomes its own component; phases are not aligned.",
+                min_overlap_px,
+                min_edge_coherence,
+            )
         solution = solve_network(graph, reference_node=reference_node)
         phi_hat = solution.phi_hat
         component_per_node = solution.component_id
         network_stats = solution.stats
+        if network_stats.n_components > 1:
+            logger.warning(
+                "merge_burst_products: %d disconnected components — "
+                "phases are aligned only within each component.",
+                network_stats.n_components,
+            )
+        if network_stats.rms_residual > 0.1:
+            logger.warning(
+                "merge_burst_products: high network residual RMS=%.3e rad — "
+                "overlap phase estimates may be inconsistent.",
+                network_stats.rms_residual,
+            )
     else:
         phi_hat = np.zeros(n, dtype=np.float64)
         component_per_node = np.zeros(n, dtype=np.int16)
