@@ -617,10 +617,12 @@ class FrameInterferogramCollection:
                     # Wrapped phase is cyclic: bilinear averaging across a 2*pi
                     # wrap boundary is physically wrong. Resample the complex
                     # representation exp(i*phi) instead, then take the angle.
+                    # Lanczos (windowed sinc) preserves phase statistics;
+                    # bilinear would smear fine phase texture.
                     arr = reproject_phase_to_geogrid(
                         src,
                         pair_grid,
-                        resampling=rasterio.enums.Resampling.bilinear,
+                        resampling=rasterio.enums.Resampling.lanczos,
                         dst_nodata=out_nodata,
                     )
                 else:

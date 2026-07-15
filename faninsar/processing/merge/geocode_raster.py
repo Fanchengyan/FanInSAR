@@ -10,6 +10,7 @@ from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
 from faninsar.processing.geometry import RadarGeometryModel, geo2rdr
+from faninsar.processing.resampling import lanczos_resample
 
 if TYPE_CHECKING:
     from faninsar.processing.merge.grid import GeoGridSpec
@@ -79,8 +80,13 @@ def geocode_complex_to_grid(
     """Resample a radar complex array onto a common geographic grid.
 
     The mapping uses :func:`geo2rdr` to obtain radar ``(az, rg)`` indices
-    for each target pixel center, then bilinearly resamples the real and
-    imaginary parts of ``complex_radar``.
+    for each target pixel center, then resamples the complex field with a
+    Lanczos (windowed-sinc) kernel. A sinc-family kernel is required for
+    complex SLC data: bilinear's ``sinc²`` response attenuates in-band
+    signal and leaks residual aliasing, producing a sub-pixel-offset
+    dependent phase bias that is invisible in amplitude but creates burst
+    seams and decorrelation downstream. Coherence (a real, smooth field)
+    is resampled bilinearly as before.
 
     Parameters
     ----------
@@ -94,7 +100,9 @@ def geocode_complex_to_grid(
     height_m : array or float, optional
         Terrain/ellipsoid height used by ``geo2rdr``. Defaults to 0.
     coherence : numpy.ndarray, optional
-        Optional coherence layer to resample alongside the complex field.
+        Optional coherence layer to resample alongside the complex field
+        (with bilinear interpolation, appropriate for a real-valued smooth
+        field).
     chunk_size : int, optional
         Row-chunk size for chunked geo2rdr evaluation. ``None`` processes
         the whole grid in one call.
@@ -164,14 +172,14 @@ def geocode_complex_to_grid(
             & (rg <= radar_w - 1.0)
         )
         coords = np.array([az[in_range], rg[in_range]])
-        re = map_coordinates(
-            complex_radar.real, coords, order=1, mode="constant", cval=0.0
-        )
-        im = map_coordinates(
-            complex_radar.imag, coords, order=1, mode="constant", cval=0.0
+        # Complex SLC: use a Lanczos (windowed-sinc) kernel to preserve phase.
+        # Bilinear-on-real/imag attenuates in-band signal and leaks aliasing,
+        # producing a sub-pixel-offset-dependent phase bias.
+        block_vals = lanczos_resample(
+            complex_radar, coords, a=4, mode="constant", cval=0.0
         )
         block = np.zeros(lat_c.shape, dtype=np.complex64)
-        block[in_range] = (re + 1j * im).astype(np.complex64)
+        block[in_range] = block_vals.astype(np.complex64)
         complex_out[chunk] = block
         valid[chunk] = in_range
         if coh_out is not None and coherence is not None:

@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://faninsar.dev/schemas/reference-metric-report.schema.json",
+  "title": "FanInSAR scientific reference metric report",
+  "type": "object",
+  "required": ["metric", "gates", "versions", "input_hashes", "command_log"],
+  "properties": {
+    "metric": {"$ref": "#/$defs/metric"},
+    "gates": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/gateEvaluation"}
+    },
+    "versions": {"$ref": "#/$defs/stringMap"},
+    "input_hashes": {"$ref": "#/$defs/stringMap"},
+    "command_log": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "gateEvaluation": {
+      "type": "object",
+      "required": ["field", "mode", "threshold", "observed", "passed"],
+      "properties": {
+        "field": {"type": "string", "minLength": 1},
+        "mode": {"enum": ["maximum", "minimum"]},
+        "threshold": {"type": "number"},
+        "observed": {"type": "number"},
+        "passed": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "metric": {
+      "type": "object",
+      "required": ["metric_family"],
+      "properties": {
+        "metric_family": {
+          "enum": ["geometry", "phase", "coherence", "offset", "closure", "geolocation", "displacement", "performance"]
+        },
+        "valid_count": {"type": "integer", "minimum": 1},
+        "loop_count": {"type": "integer", "minimum": 1},
+        "run_count": {"type": "integer", "minimum": 1},
+        "wrapped": {"type": "boolean"},
+        "p95_sample_error": {"type": "number", "minimum": 0},
+        "p99_sample_error": {"type": "number", "minimum": 0},
+        "maximum_sample_error": {"type": "number", "minimum": 0},
+        "circular_rmse_rad": {"type": "number", "minimum": 0},
+        "rmse_rad": {"type": "number", "minimum": 0},
+        "mean_bias_rad": {"type": "number"},
+        "mean_absolute_error": {"type": "number", "minimum": 0},
+        "maximum_absolute_error": {"type": "number", "minimum": 0},
+        "median_loss": {"type": "number"},
+        "range_rmse_pixel": {"type": "number", "minimum": 0},
+        "azimuth_rmse_pixel": {"type": "number", "minimum": 0},
+        "coverage_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+        "maximum_absolute_rad": {"type": "number", "minimum": 0},
+        "horizontal_rmse_m": {"type": "number", "minimum": 0},
+        "vertical_rmse_m": {"type": "number", "minimum": 0},
+        "three_dimensional_p95_m": {"type": "number", "minimum": 0},
+        "displacement_rmse_m": {"type": "number", "minimum": 0},
+        "displacement_bias_m": {"type": "number"},
+        "velocity_bias_m_per_year": {"type": "number"},
+        "uncertainty_95_coverage_fraction": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "runtime_median_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "runtime_p95_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "peak_memory_bytes": {"type": "integer", "minimum": 0},
+        "throughput_pixels_per_second": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "allOf": [
+        {"if": {"properties": {"metric_family": {"const": "geometry"}}, "required": ["metric_family"]}, "then": {"required": ["valid_count", "p95_sample_error", "p99_sample_error", "maximum_sample_error"]}},
+        {"if": {"properties": {"metric_family": {"const": "phase"}}, "required": ["metric_family"]}, "then": {"required": ["valid_count", "wrapped", "circular_rmse_rad", "rmse_rad", "mean_bias_rad"]}},
+        {"if": {"properties": {"metric_family": {"const": "coherence"}}, "required": ["metric_family"]}, "then": {"required": ["valid_count", "mean_absolute_error", "maximum_absolute_error", "median_loss"]}},
+        {"if": {"properties": {"metric_family": {"const": "offset"}}, "required": ["metric_family"]}, "then": {"required": ["valid_count", "range_rmse_pixel", "azimuth_rmse_pixel", "coverage_fraction"]}},
+        {"if": {"properties": {"metric_family": {"const": "closure"}}, "required": ["metric_family"]}, "then": {"required": ["loop_count", "valid_count", "circular_rmse_rad", "maximum_absolute_rad"]}},
+        {"if": {"properties": {"metric_family": {"const": "geolocation"}}, "required": ["metric_family"]}, "then": {"required": ["valid_count", "horizontal_rmse_m", "vertical_rmse_m", "three_dimensional_p95_m"]}},
+        {"if": {"properties": {"metric_family": {"const": "displacement"}}, "required": ["metric_family"]}, "then": {"required": ["valid_count", "displacement_rmse_m", "displacement_bias_m", "velocity_bias_m_per_year", "uncertainty_95_coverage_fraction"]}},
+        {"if": {"properties": {"metric_family": {"const": "performance"}}, "required": ["metric_family"]}, "then": {"required": ["run_count", "runtime_median_seconds", "runtime_p95_seconds", "peak_memory_bytes", "throughput_pixels_per_second"]}}
+      ],
+      "additionalProperties": false
+    }
+  }
+}

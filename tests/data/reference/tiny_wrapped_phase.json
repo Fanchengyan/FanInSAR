@@ -1,0 +1,7 @@
+{
+  "coordinate_system": "radar",
+  "shape": [2, 2],
+  "wrapped_phase_radians": [0.0, 1.5707963267948966, -1.5707963267948966, 3.141592653589793],
+  "coherence": [1.0, 0.75, 0.5, 0.25],
+  "valid_mask": [true, true, true, false]
+}

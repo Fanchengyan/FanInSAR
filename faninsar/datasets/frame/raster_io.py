@@ -104,7 +104,7 @@ def reproject_phase_to_geogrid(
     src_path: str | PathLike,
     dst_geogrid: GeoGrid,
     *,
-    resampling: Resampling = Resampling.bilinear,
+    resampling: Resampling = Resampling.lanczos,
     dst_nodata: float = -9999.0,
 ) -> np.ndarray:
     """Reproject a wrapped-phase raster using complex averaging.
@@ -113,8 +113,17 @@ def reproject_phase_to_geogrid(
     resampling produces nonsensical values across 2*pi wrap boundaries: a
     pixel at +3.1 rad next to one at -3.1 rad (both near pi) averages to ~0
     instead of ~pi. This function resamples the *complex representation*
-    ``exp(i*phi)`` (bilinear on the real and imaginary parts independently),
-    then converts back via ``np.angle``, which correctly handles wraps.
+    ``exp(i*phi)`` (the kernel is applied to the real and imaginary parts
+    independently), then converts back via ``np.angle``, which correctly
+    handles wraps.
+
+    The default kernel is Lanczos (windowed sinc), the production choice
+    for resampling complex / wrapped-phase SAR data: bilinear's ``sinc²``
+    response attenuates in-band signal and leaks residual aliasing, which
+    smears fine phase texture. A sinc-family kernel preserves phase
+    statistics. Callers may pass ``Resampling.bilinear`` for already
+    heavily multilooked phase screens whose bandwidth is well below the
+    output grid Nyquist, where bilinear is an acceptable approximation.
 
     Parameters
     ----------
@@ -123,7 +132,9 @@ def reproject_phase_to_geogrid(
     dst_geogrid : GeoGrid
         Target grid to reproject onto.
     resampling : Resampling
-        Resampling algorithm applied to the complex field. Default bilinear.
+        Resampling algorithm applied to the complex field. Default
+        ``Resampling.lanczos``; ``Resampling.bilinear`` is acceptable only
+        for already-multilooked phase screens.
     dst_nodata : float
         NoData value for the output.
 

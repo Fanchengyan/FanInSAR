@@ -1,0 +1,117 @@
+schema_version: 1
+frozen_at: "2026-07-11"
+
+committed_fixture:
+  identifier: tiny-wrapped-phase-v1
+  path: tests/data/reference/tiny_wrapped_phase.json
+  sha256: 7bffe7b0d1c96ed2a55178c3f1244927ce734c858be2e1907c500fccbc369b5d
+  size_bytes: 230
+
+downloadable_regimes:
+  - identifier: s1-flat-high-coherence-short-baseline
+    url: https://raw.githubusercontent.com/gmtsar/gmtsar/46143a94f222aaca9b42a3bf7ea5f48ba241ff9f/gmtsar/python/tests/recipes/README_S1A_SLC_TOPS_LA.txt
+    filename: README_S1A_SLC_TOPS_LA.txt
+    sha256: b957be1382304c1f76bf6b14dedba74bd2eecf6e2a9a35929e9630a626d70d57
+    size_bytes: 1187
+    terrain: flat
+    coherence: high
+    baseline: short
+    burst_boundary: false
+    deformation: smooth
+    source: GMTSAR commit-pinned Sentinel-1 LA oracle recipe
+    access_policy: public immutable GitHub raw content
+    processor: gmtsar
+    processor_version: 46143a94f222aaca9b42a3bf7ea5f48ba241ff9f
+    config_digest: b957be1382304c1f76bf6b14dedba74bd2eecf6e2a9a35929e9630a626d70d57
+    artifact_kind: oracle-recipe
+
+  - identifier: s1-steep-high-coherence-burst-boundary
+    url: https://raw.githubusercontent.com/gmtsar/gmtsar/46143a94f222aaca9b42a3bf7ea5f48ba241ff9f/gmtsar/python/tests/recipes/README_S1A_SLC_TOPS_Greece.txt
+    filename: README_S1A_SLC_TOPS_Greece.txt
+    sha256: a08736db7763901e5e85fb4da256bddac17dfb88b7cbf1302e809c1f904dc27d
+    size_bytes: 862
+    terrain: steep
+    coherence: high
+    baseline: short
+    burst_boundary: true
+    deformation: smooth
+    source: GMTSAR commit-pinned Sentinel-1 Greece oracle recipe
+    access_policy: public immutable GitHub raw content
+    processor: gmtsar
+    processor_version: 46143a94f222aaca9b42a3bf7ea5f48ba241ff9f
+    config_digest: a08736db7763901e5e85fb4da256bddac17dfb88b7cbf1302e809c1f904dc27d
+    artifact_kind: oracle-recipe
+
+  - identifier: s1-flat-low-coherence-long-baseline
+    url: https://raw.githubusercontent.com/gmtsar/gmtsar/46143a94f222aaca9b42a3bf7ea5f48ba241ff9f/gmtsar/python/tests/recipes/README_S1A_SLC_TOPS_COVE.txt
+    filename: README_S1A_SLC_TOPS_COVE.txt
+    sha256: 3c325b6cca7412161cb2a5038f474008e8e5a56eeb459ba3062027290b51fe0c
+    size_bytes: 608
+    terrain: flat
+    coherence: low
+    baseline: long
+    burst_boundary: false
+    deformation: smooth
+    source: GMTSAR commit-pinned Sentinel-1 COVE oracle recipe
+    access_policy: public immutable GitHub raw content
+    processor: gmtsar
+    processor_version: 46143a94f222aaca9b42a3bf7ea5f48ba241ff9f
+    config_digest: 3c325b6cca7412161cb2a5038f474008e8e5a56eeb459ba3062027290b51fe0c
+    artifact_kind: oracle-recipe
+
+  - identifier: s1-steep-low-coherence-deformation-discontinuity
+    url: https://raw.githubusercontent.com/gmtsar/gmtsar/46143a94f222aaca9b42a3bf7ea5f48ba241ff9f/gmtsar/python/tests/recipes/README_S1_Ridgecrest_EQ.txt
+    filename: README_S1_Ridgecrest_EQ.txt
+    sha256: 29276c752883f2dbee8334121350037464c534857414a0e15f4c19e6516c9356
+    size_bytes: 1461
+    terrain: steep
+    coherence: low
+    baseline: long
+    burst_boundary: true
+    deformation: discontinuity
+    source: GMTSAR commit-pinned Sentinel-1 Ridgecrest earthquake oracle recipe
+    access_policy: public immutable GitHub raw content
+    processor: gmtsar-snaphu
+    processor_version: 46143a94f222aaca9b42a3bf7ea5f48ba241ff9f
+    config_digest: 29276c752883f2dbee8334121350037464c534857414a0e15f4c19e6516c9356
+    artifact_kind: oracle-recipe
+
+local_execution:
+  root_hint: /Volumes/DATA2/TEST_sentinel-1/sentinel-slc
+  scenes:
+    - identifier: s1a-20161207
+      filename: S1A_IW_SLC__1SSV_20161207T111852_20161207T111919_014273_01716D_67BC.zip
+      sha256: a5bdf079edf55e656b3f0598887afc587138613d380f39d345bc72dc8854ccfb
+      size_bytes: 2311842192
+    - identifier: s1a-20161231
+      filename: S1A_IW_SLC__1SSV_20161231T111851_20161231T111918_014623_017C5B_9218.zip
+      sha256: 253c407d1a1f697d9c6da5fd1d3c91ce3eb15eb31f522d23f9d7166f3e4722c2
+      size_bytes: 2310593336
+    - identifier: s1a-20170124
+      filename: S1A_IW_SLC__1SSV_20170124T111849_20170124T111916_014973_018715_4CD9.zip
+      sha256: bc6b44bfe33a7aeffd243dd2b959a361b18bf1d990f6ea84b8a178ca73a5beec
+      size_bytes: 2322762192
+  pairs:
+    - identifier: s1a-20161207-20161231
+      reference: s1a-20161207
+      secondary: s1a-20161231
+    - identifier: s1a-20161231-20170124
+      reference: s1a-20161231
+      secondary: s1a-20170124
+    - identifier: s1a-20161207-20170124
+      reference: s1a-20161207
+      secondary: s1a-20170124
+
+metric_gates:
+  coordinate_residual_pixels_max: 0.1
+  wrapped_phase_circular_rmse_radians_max: 0.05
+  coherence_absolute_error_max: 0.03
+  range_offset_rmse_pixels_max: 0.1
+  azimuth_offset_rmse_pixels_max: 0.1
+  closure_phase_radians_max: 0.05
+  geolocation_rmse_meters_max: 5.0
+  displacement_rmse_millimeters_max: 2.0
+  performance_runtime_ratio_max: 2.0
+  performance_peak_memory_ratio_max: 2.0
+  velocity_bias_millimeters_per_year_max: 1.0
+  uncertainty_95_coverage_fraction_min: 0.9

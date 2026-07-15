@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<product>
+  <adsHeader>
+    <missionId>S1A</missionId>
+    <productType>SLC</productType>
+    <polarisation>VV</polarisation>
+    <mode>IW</mode>
+    <swath>IW1</swath>
+    <startTime>2016-12-07T11:18:53.426275</startTime>
+    <stopTime>2016-12-07T11:19:18.571896</stopTime>
+    <absoluteOrbitNumber>14273</absoluteOrbitNumber>
+    <missionDataTakeId>94573</missionDataTakeId>
+    <imageNumber>001</imageNumber>
+  </adsHeader>
+  <generalAnnotation>
+    <productInformation>
+      <rangeSamplingRate>64345238.12571428</rangeSamplingRate>
+      <radarFrequency>5405000454.33435</radarFrequency>
+    </productInformation>
+    <orbitList count="3">
+      <orbit>
+        <time>2016-12-07T11:17:45.950212</time>
+        <frame>Earth Fixed</frame>
+        <position><x>-572093.427236</x><y>5939124.411262</y><z>3795662.944065</z></position>
+        <velocity><x>2075.163912</x><y>-3800.203017</y><z>6239.732137</z></velocity>
+      </orbit>
+      <orbit>
+        <time>2016-12-07T11:17:55.950213</time>
+        <frame>Earth Fixed</frame>
+        <position><x>-551342.0</x><y>5901124.0</y><z>3858060.0</z></position>
+        <velocity><x>2075.0</x><y>-3800.0</y><z>6240.0</z></velocity>
+      </orbit>
+      <orbit>
+        <time>2016-12-07T11:18:05.950214</time>
+        <frame>Earth Fixed</frame>
+        <position><x>-530591.0</x><y>5863124.0</y><z>3920457.0</z></position>
+        <velocity><x>2075.0</x><y>-3800.0</y><z>6240.0</z></velocity>
+      </orbit>
+    </orbitList>
+    <azimuthFmRateList count="1">
+      <azimuthFmRate>
+        <azimuthTime>2016-12-07T11:18:52.178090</azimuthTime>
+        <t0>0.005331793607069369</t0>
+        <azimuthFmRatePolynomial>-2330.570588164277 451066.6805858936 -79121617.77766916</azimuthFmRatePolynomial>
+      </azimuthFmRate>
+    </azimuthFmRateList>
+  </generalAnnotation>
+  <imageAnnotation>
+    <imageInformation>
+      <slantRangeTime>0.005331793607069369</slantRangeTime>
+      <rangePixelSpacing>2.329562</rangePixelSpacing>
+      <azimuthPixelSpacing>13.96706</azimuthPixelSpacing>
+      <azimuthTimeInterval>0.0020555563</azimuthTimeInterval>
+      <numberOfSamples>100</numberOfSamples>
+      <numberOfLines>20</numberOfLines>
+      <productFirstLineUtcTime>2016-12-07T11:18:53.426275</productFirstLineUtcTime>
+      <productLastLineUtcTime>2016-12-07T11:19:18.571896</productLastLineUtcTime>
+    </imageInformation>
+  </imageAnnotation>
+  <dopplerCentroid>
+    <dcEstimateList count="1">
+      <dcEstimate>
+        <azimuthTime>2016-12-07T11:18:53.140830</azimuthTime>
+        <t0>0.005342208408174859</t0>
+        <geometryDcPolynomial>-3.992857 -287.3943 134566.6</geometryDcPolynomial>
+        <dataDcPolynomial>17.44464 56307.42 -43942960.0</dataDcPolynomial>
+      </dcEstimate>
+    </dcEstimateList>
+  </dopplerCentroid>
+  <swathTiming>
+    <linesPerBurst>10</linesPerBurst>
+    <samplesPerBurst>100</samplesPerBurst>
+    <burstList count="2">
+      <burst>
+        <azimuthTime>2016-12-07T11:18:53.426276</azimuthTime>
+        <azimuthAnxTime>607.4725115546</azimuthAnxTime>
+        <sensingTime>2016-12-07T11:18:54.543845</sensingTime>
+        <byteOffset>0</byteOffset>
+        <firstValidSample>0 0 0 0 0 0 0 0 0 0</firstValidSample>
+        <lastValidSample>99 99 99 99 99 99 99 99 99 99</lastValidSample>
+      </burst>
+      <burst>
+        <azimuthTime>2016-12-07T11:18:56.000000</azimuthTime>
+        <azimuthAnxTime>610.0</azimuthAnxTime>
+        <sensingTime>2016-12-07T11:18:57.000000</sensingTime>
+        <byteOffset>20000</byteOffset>
+        <firstValidSample>1 1 1 1 1 1 1 1 1 1</firstValidSample>
+        <lastValidSample>98 98 98 98 98 98 98 98 98 98</lastValidSample>
+      </burst>
+    </burstList>
+  </swathTiming>
+</product>
