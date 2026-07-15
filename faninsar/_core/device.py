@@ -51,20 +51,44 @@ def parse_device(device: DeviceLike | None) -> torch.device:
 
 
 def _parse_device_str(device: str | None) -> str:
-    if device is None or device.lower() == "gpu":
-        if cuda_available():
-            device = "cuda"
-        elif mps_available():
-            device = "mps"
-        else:
-            msg = (
-                "No GPU detected. Falling back to CPU. "
-                "If you would like to use a GPU, please install PyTorch"
-                " with CUDA support."
-            )
-            logger.warning(msg, stacklevel=2)
-            device = "cpu"
-    else:
-        device = device.lower()
+    """Resolve a device string to a canonical torch device name.
 
+    Policy (frozen by the GPU/CPU unwrap-stack architecture law):
+
+    - ``None`` / ``"auto"`` / ``"gpu"`` → ``"cuda"`` if available, **else
+      ``"cpu"``**. MPS is **never** auto-selected. This is deliberate: MPS
+      lacks many ops used by this stack (sparse CG, full fft.dct, some
+      linalg) and silently degrading onto it breaks the no-silent-fallback
+      contract (R0.3).
+    - ``"cuda"`` requested but unavailable → **hard error** (do not fall back
+      to CPU silently). Callers that want graceful degradation must pass
+      ``"auto"``.
+    - ``"cpu"`` → ``"cpu"``.
+    - ``"mps"`` → allowed only via **explicit** request (experimental; not a
+      production-supported device for this stack). Logged as a warning.
+    """
+    if device is None or device.lower() in ("auto", "gpu"):
+        if cuda_available():
+            return "cuda"
+        msg = (
+            "No CUDA GPU detected. Resolving device to CPU. "
+            "MPS is not auto-selected for this stack. "
+            "If you want MPS, pass device='mps' explicitly (experimental)."
+        )
+        logger.warning(msg, stacklevel=2)
+        return "cpu"
+    device = device.lower()
+    if device == "cuda" and not cuda_available():
+        msg = (
+            "device='cuda' requested but CUDA is not available. "
+            "Pass device='auto' for graceful CPU fallback."
+        )
+        logger.error(msg, stacklevel=2)
+        raise RuntimeError(msg)
+    if device == "mps":
+        logger.warning(
+            "device='mps' is experimental and not production-supported "
+            "for this stack (sparse CG / DCT / some linalg unsupported).",
+            stacklevel=2,
+        )
     return device
