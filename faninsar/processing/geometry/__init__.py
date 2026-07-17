@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .baseline import BaselineComponents, geometric_baseline, zero_doppler_residual_hz
-from .dem import ConstantHeightDEM, RasterDEM
+from .dem import ConstantHeightDEM, GeoidAdjustedDEM, NetCDFGeoid, RasterDEM
 from .ellipsoid import (
     WGS84_A_M,
     WGS84_E2,
@@ -34,6 +34,8 @@ __all__ = [
     "WGS84_F",
     "BaselineComponents",
     "ConstantHeightDEM",
+    "GeoidAdjustedDEM",
+    "NetCDFGeoid",
     "OrbitInterpolationError",
     "OrbitInterpolator",
     "OrbitState",

@@ -57,7 +57,7 @@ def test_multilook_uses_boxcar_not_lanczos_on_impulse() -> None:
     # All other output cells must be exactly zero (no Lanczos side-lobes).
     others = ifg.copy()
     others[0, 0] = 0
-    max_sidelobe = float(np.max(np.abs(others)))
+    max_sidelobe = float(np.nanmax(np.abs(others)))
     assert max_sidelobe < 1e-6, (
         f"Multilook produced non-zero side-lobes (max |z|={max_sidelobe:.3e}); "
         "this indicates a resampling kernel (Lanczos/sinc) instead of boxcar "

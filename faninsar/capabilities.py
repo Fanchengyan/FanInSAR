@@ -1,4 +1,4 @@
-"""Report availability and licensing of optional FanInSAR backends."""
+"""Report availability, versions, and licensing of FanInSAR backends."""
 
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ class _SnaphuVersionProvider(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class OptionalBackendCapability:
-    """Availability and licensing information for an optional backend.
+class BackendCapability:
+    """Availability and licensing information for a backend.
 
     Attributes
     ----------
@@ -33,8 +33,8 @@ class OptionalBackendCapability:
         Human-readable backend distribution name.
     available
         Whether the backend's import package is installed.
-    install_extra
-        FanInSAR extra that installs the backend.
+    install_requirement
+        Package requirement that installs the backend.
     wrapper_version
         Installed snaphu-py wrapper version, if available.
     bundled_snaphu_version
@@ -46,14 +46,14 @@ class OptionalBackendCapability:
 
     display_name: str
     available: bool
-    install_extra: str
+    install_requirement: str
     wrapper_version: str | None
     bundled_snaphu_version: str | None
     license_caveat: str
 
 
-def snaphu_capability() -> OptionalBackendCapability:
-    """Return the current optional snaphu-py backend capability."""
+def snaphu_capability() -> BackendCapability:
+    """Return the current snaphu-py backend capability."""
     available = find_spec("snaphu") is not None
     wrapper_version: str | None = None
     bundled_snaphu_version: str | None = None
@@ -63,25 +63,26 @@ def snaphu_capability() -> OptionalBackendCapability:
         wrapper_version = version("snaphu")
         bundled_snaphu_version = snaphu_module.get_snaphu_version()
 
-    return OptionalBackendCapability(
+    return BackendCapability(
         display_name="snaphu-py",
         available=available,
-        install_extra="faninsar[snaphu]",
+        install_requirement="faninsar",
         wrapper_version=wrapper_version,
         bundled_snaphu_version=bundled_snaphu_version,
         license_caveat=SNAPHU_LICENSE_CAVEAT,
     )
 
 
-def format_optional_backend_capabilities() -> str:
-    """Format optional backend availability and licensing for user output."""
+def format_backend_capabilities() -> str:
+    """Format backend availability and licensing for user output."""
     capability = snaphu_capability()
     wrapper_version = capability.wrapper_version or "unavailable"
     bundled_snaphu_version = capability.bundled_snaphu_version or "unavailable"
     return "\n".join(
         (
             f"{capability.display_name} available: {capability.available}",
-            f"{capability.display_name} install extra: {capability.install_extra}",
+            f"{capability.display_name} install requirement: "
+            f"{capability.install_requirement}",
             f"{capability.display_name} wrapper version: {wrapper_version}",
             f"bundled SNAPHU version: {bundled_snaphu_version}",
             f"{capability.display_name} license caveat: {capability.license_caveat}",

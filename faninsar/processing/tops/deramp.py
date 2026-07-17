@@ -27,6 +27,8 @@ class TOPSCarrierModel:
     fm_rate_hz_s: tuple[float, ...]
     fm_t0_s: float
     burst_sensing_time_s: float
+    burst_start_slant_range_time_s: float
+    azimuth_steering_rate_hz_s: float
 
     def __post_init__(self) -> None:
         """Validate carrier model parameters."""
@@ -36,6 +38,8 @@ class TOPSCarrierModel:
             reject_invalid_state("azimuth time interval must be > 0")
         if not self.doppler_centroid_hz or not self.fm_rate_hz_s:
             reject_invalid_state("Doppler and FM-rate polynomials are required")
+        if self.azimuth_steering_rate_hz_s == 0.0:
+            reject_invalid_state("TOPS azimuth steering rate must be non-zero")
 
 
 def _poly_eval(coefficients: tuple[float, ...], x: np.ndarray) -> np.ndarray:
@@ -76,12 +80,12 @@ def tops_carrier_phase(
 ) -> np.ndarray:
     """Compute the TOPS carrier phase (radians) on a burst window.
 
-    The phase model is:
+    The phase follows the Sentinel-1 TOPS steering model:
 
-    ``phi(t, tau) = 2π [ f_dc(tau) * t + 0.5 * K_a(tau) * t^2 ]``
+    ``phi = π K_t(tau) [eta - eta_ref(tau)]² + 2π f_dc(tau) eta``
 
-    where ``t`` is azimuth time relative to burst centre and ``tau`` is
-    range time. Polynomials use the annotation ``t0`` references.
+    where ``K_t = K_s / (1 - K_s / K_a)`` and ``eta_ref`` accounts for
+    range-dependent Doppler centroid.
 
     Parameters
     ----------
@@ -102,11 +106,15 @@ def tops_carrier_phase(
     """
     if n_lines <= 0 or n_samples <= 0:
         reject_invalid_state("burst window dimensions must be positive")
-    tau = range_time_axis(model, n_samples)
-    t_az = azimuth_time_axis(model, n_lines)[:, None]
-    f_dc = _poly_eval(model.doppler_centroid_hz, tau - model.doppler_t0_s)[None, :]
-    k_a = _poly_eval(model.fm_rate_hz_s, tau - model.fm_t0_s)[None, :]
-    phase = (2.0 * np.pi) * (f_dc * t_az + 0.5 * k_a * t_az**2)
+    cols = np.arange(n_samples, dtype=np.float64)[None, :]
+    rows = np.arange(n_lines, dtype=np.float64)[:, None]
+    phase = carrier_phase_at_points(
+        model,
+        np.broadcast_to(rows, (n_lines, n_samples)),
+        np.broadcast_to(cols, (n_lines, n_samples)),
+        centre_row=float(n_lines // 2),
+        dtype=dtype,
+    )
     return np.asarray(phase, dtype=dtype)
 
 
@@ -140,18 +148,22 @@ def _apply_carrier_phase(
 
 def _carrier_phase_rows(
     model: TOPSCarrierModel,
-    t_az_rows: np.ndarray,
+    row_indices: np.ndarray,
     n_samples: int,
     *,
+    centre_row: float,
     dtype: np.dtype | type = np.float32,
 ) -> np.ndarray:
-    """Carrier phase for a subset of azimuth times (relative to burst centre)."""
-    tau = range_time_axis(model, n_samples)
-    t_az = np.asarray(t_az_rows, dtype=np.float64)[:, None]
-    f_dc = _poly_eval(model.doppler_centroid_hz, tau - model.doppler_t0_s)[None, :]
-    k_a = _poly_eval(model.fm_rate_hz_s, tau - model.fm_t0_s)[None, :]
-    phase = (2.0 * np.pi) * (f_dc * t_az + 0.5 * k_a * t_az**2)
-    return np.asarray(phase, dtype=dtype)
+    """Carrier phase for a subset of absolute burst-local row indices."""
+    rows = np.asarray(row_indices, dtype=np.float64)[:, None]
+    cols = np.arange(n_samples, dtype=np.float64)[None, :]
+    return carrier_phase_at_points(
+        model,
+        np.broadcast_to(rows, (rows.shape[0], n_samples)),
+        np.broadcast_to(cols, (rows.shape[0], n_samples)),
+        centre_row=centre_row,
+        dtype=dtype,
+    )
 
 
 def _apply_carrier_tiled(
@@ -165,21 +177,20 @@ def _apply_carrier_tiled(
     """Shared tiled carrier multiply for deramp (sign=-1) and reramp (sign=+1)."""
     n_lines, n_samples = samples.shape
     if row_chunk is None or row_chunk <= 0 or n_lines <= row_chunk:
-        phase = tops_carrier_phase(
-            model, n_lines, n_samples, dtype=phase_dtype
-        )
+        phase = tops_carrier_phase(model, n_lines, n_samples, dtype=phase_dtype)
         return _apply_carrier_phase(samples, phase, sign=sign)
 
     out = np.empty_like(samples)
-    t_az = azimuth_time_axis(model, n_lines)
     for row0 in range(0, n_lines, row_chunk):
         row1 = min(row0 + row_chunk, n_lines)
         phase = _carrier_phase_rows(
-            model, t_az[row0:row1], n_samples, dtype=phase_dtype
+            model,
+            np.arange(row0, row1, dtype=np.float64),
+            n_samples,
+            centre_row=float(n_lines // 2),
+            dtype=phase_dtype,
         )
-        out[row0:row1] = _apply_carrier_phase(
-            samples[row0:row1], phase, sign=sign
-        )
+        out[row0:row1] = _apply_carrier_phase(samples[row0:row1], phase, sign=sign)
     return out
 
 
@@ -259,6 +270,122 @@ def reramp(
         phase_dtype=phase_dtype,
         row_chunk=row_chunk,
     )
+
+
+def restore_original_domain_secondary(
+    sec_resamp_deramped: np.ndarray,
+    secondary_carrier: TOPSCarrierModel,
+    range_offset_px: np.ndarray,
+    azimuth_offset_px: np.ndarray,
+) -> np.ndarray:
+    """Restore original-domain secondary after deramped-domain resampling.
+
+    Coregistration resamples the secondary in the TOPS-deramped domain.  The
+    interferogram must be formed in the original focused-SLC phase domain, so
+    the secondary carrier phase is reapplied at the **source** coordinates
+    (``output_index - offset``), matching the samples that were interpolated.
+
+    Reramping both scenes with the *reference* carrier is incorrect: it leaves
+    a residual secondary-carrier phase and destroys geometric fringes.
+
+    Parameters
+    ----------
+    sec_resamp_deramped : numpy.ndarray
+        Secondary samples after deramp and resample onto the reference grid.
+    secondary_carrier : TOPSCarrierModel
+        Carrier model of the secondary burst (native grid geometry).
+    range_offset_px, azimuth_offset_px : numpy.ndarray
+        Offset fields used for the resample (same convention as
+        ``resample_complex``: ``source = output - offset``).
+
+    Returns
+    -------
+    numpy.ndarray
+        Secondary on the reference grid with original-domain phase restored.
+
+    """
+    from scipy.ndimage import map_coordinates
+
+    if sec_resamp_deramped.ndim != 2 or not np.iscomplexobj(sec_resamp_deramped):
+        reject_invalid_state("restore requires a 2-D complex secondary array")
+    height, width = sec_resamp_deramped.shape
+    rg_off = np.asarray(range_offset_px, dtype=np.float64)
+    az_off = np.asarray(azimuth_offset_px, dtype=np.float64)
+    if rg_off.shape != (height, width) or az_off.shape != (height, width):
+        reject_invalid_state("offset fields must match secondary resample shape")
+
+    phi_sec = tops_carrier_phase(secondary_carrier, height, width, dtype=np.float64)
+    az_idx = np.arange(height, dtype=np.float64)[:, None]
+    rg_idx = np.arange(width, dtype=np.float64)[None, :]
+    src_az = az_idx - az_off
+    src_rg = rg_idx - rg_off
+    phi_src = map_coordinates(
+        phi_sec,
+        [src_az.ravel(), src_rg.ravel()],
+        order=1,
+        mode="constant",
+        cval=0.0,
+    ).reshape(height, width)
+    return _apply_carrier_phase(sec_resamp_deramped, phi_src, sign=+1.0)
+
+
+def carrier_phase_at_points(
+    model: TOPSCarrierModel,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    *,
+    centre_row: float,
+    dtype: np.dtype | type = np.float32,
+) -> np.ndarray:
+    """Analytical TOPS carrier phase at arbitrary fractional pixel coordinates.
+
+    Evaluates the Sentinel-1 steering carrier and range-dependent Doppler phase
+    directly at fractional row and column coordinates.
+
+    Parameters
+    ----------
+    model : TOPSCarrierModel
+        Burst carrier parameters (built for the burst window being reramped).
+    rows, cols : numpy.ndarray
+        Fractional pixel coordinates on the burst-local grid (row 0 = first
+        burst line, col 0 = first range sample). Same convention as
+        :func:`tops_carrier_phase`; must broadcast to a common shape.
+    centre_row : float
+        Integer azimuth centre ``n_lines // 2`` of the burst window used by
+        Sentinel-1 TOPS carrier evaluation.
+    dtype : numpy.dtype, optional
+        Output phase dtype. Default ``float32``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Real carrier phase in radians, broadcast shape of ``rows``/``cols``.
+
+    """
+    if rows.shape != cols.shape:
+        reject_invalid_state("rows and cols must have the same shape")
+    rows64 = np.asarray(rows, dtype=np.float64)
+    cols64 = np.asarray(cols, dtype=np.float64)
+    tau = model.slant_range_time0_s + cols64 / model.range_sampling_rate_hz
+    f_dc = _poly_eval(model.doppler_centroid_hz, tau - model.doppler_t0_s)
+    k_a = _poly_eval(model.fm_rate_hz_s, tau - model.fm_t0_s)
+    tau_start = model.burst_start_slant_range_time_s
+    f_dc_start = _poly_eval(
+        model.doppler_centroid_hz,
+        np.asarray(tau_start - model.doppler_t0_s),
+    )
+    k_a_start = _poly_eval(
+        model.fm_rate_hz_s,
+        np.asarray(tau_start - model.fm_t0_s),
+    )
+    eta_ref = (f_dc_start / k_a_start) - (f_dc / k_a)
+    k_s = model.azimuth_steering_rate_hz_s
+    k_t = k_s / (1.0 - k_s / k_a)
+    eta = (rows64 - float(centre_row)) * model.azimuth_time_interval_s
+    steering_phase = np.pi * k_t * (eta - eta_ref) ** 2
+    doppler_phase = 2.0 * np.pi * f_dc * eta
+    phase = steering_phase + doppler_phase
+    return np.asarray(phase, dtype=dtype)
 
 
 def deramp_reramp_roundtrip_error(

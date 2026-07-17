@@ -70,6 +70,7 @@ dependencies = [
   "tomli-w>=1.2.0",
   "rio-cogeo",
   "pystac>=1.8",
+  "snaphu>=0.4.1",
 ]
 
 
@@ -79,7 +80,6 @@ faninsar-merge-bursts = "faninsar.processing.merge.cli:main"
 
 [project.optional-dependencies]
 
-snaphu = ["snaphu>=0.4.1"]
 code_style = ["pre-commit", "ruff"]
 test = [
   "FanInSAR",

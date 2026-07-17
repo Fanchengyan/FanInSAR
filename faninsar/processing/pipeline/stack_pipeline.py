@@ -1,7 +1,8 @@
-"""General multi-scene stack pipeline using the explicit pair workflow."""
+"""General multi-scene stack pipeline via production pair stages."""
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
@@ -9,7 +10,11 @@ from typing import TYPE_CHECKING
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.pipeline.workflow import PairWorkflowState, run_pair_workflow
+from faninsar.processing.pipeline.production import (
+    CoregistrationGrid,
+    ProductionPairState,
+    run_production_pair,
+)
 from faninsar.processing.timeseries.inversion import (
     TimeSeriesResult,
     invert_unwrapped_pairs,
@@ -19,6 +24,10 @@ from faninsar.processing.timeseries.inversion import (
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
+    from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.unwrap import SnaphuConfig
+
 logger = setup_logger(__name__)
 
 
@@ -27,7 +36,7 @@ class StackPipelineResult:
     """Outputs of a multi-scene pair stack run."""
 
     scene_ids: tuple[str, ...]
-    pair_results: tuple[PairWorkflowState, ...]
+    pair_results: tuple[ProductionPairState, ...]
     timeseries: TimeSeriesResult | None
     timeseries_zarr: Path | None
 
@@ -63,10 +72,13 @@ def run_stack_pipeline(
     invert_timeseries: bool = True,
     executor: str = "serial",
     device: str = "auto",
-    unwrap_method: str = "irls",
+    snaphu_config: SnaphuConfig | None = None,
     invert_device: str = "cpu",
+    coregistration_grid: CoregistrationGrid = "radar",
+    geo_grid: GeoGridSpec | None = None,
+    dem: DEMSampler | None = None,
 ) -> StackPipelineResult:
-    """Process an arbitrary SAFE stack with the full pair workflow.
+    """Process an arbitrary SAFE stack with the production pair pipeline.
 
     Parameters
     ----------
@@ -76,28 +88,42 @@ def run_stack_pipeline(
         Output root for pairs/ and timeseries.zarr.
     pairs : sequence of (ref_id, sec_id), optional
         Optional explicit pairs using scene ids. Default: all combinations.
-    swath, burst_index, height, width : optional
-        Common burst-window selection for every scene.
+    swath, burst_index : optional
+        Common burst selection for every scene.
+    height, width : optional
+        Deprecated window size (ignored; production uses full burst).
     multilook, goldstein_alpha : optional
         Interferogram parameters.
     invert_timeseries : bool, optional
         Run SBAS after pairs complete.
     executor : {"serial", "dask-torch"}, optional
-        Coregistration Lanczos compute path. Default ``"serial"``.
+        Coregistration / LUT Lanczos path. Default ``"serial"``.
     device : {"auto","cpu","cuda"}, optional
-        Torch device for coregistration when ``executor="dask-torch"``.
-        ``"auto"`` = CUDA if available else CPU (never MPS). Default ``"auto"``.
-    unwrap_method : {"irls","dct_irls","snaphu"}, optional
-        2D spatial unwrap backend. Default ``"irls"``.
+        Torch device when ``executor="dask-torch"``.
+    snaphu_config : SnaphuConfig, optional
+        snaphu-py configuration for every pair.
     invert_device : str, optional
         Device for SBAS inversion. Default ``"cpu"``.
+    coregistration_grid : {"radar", "geo"}, optional
+        Pair coregistration grid passed to :func:`run_production_pair`.
+    geo_grid : GeoGridSpec, optional
+        Required when ``coregistration_grid="geo"``.
+    dem : DEMSampler, optional
+        DEM for coreg/flatten/geocode.
 
     Returns
     -------
     StackPipelineResult
-        Per-pair workflow states and optional timeseries product.
+        Per-pair production states and optional timeseries product.
 
     """
+    if height != 256 or width != 256:
+        warnings.warn(
+            "run_stack_pipeline height/width are deprecated no-ops; "
+            "production uses full burst",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     paths = [Path(p) for p in scene_paths]
     if len(paths) < 2:
         reject_invalid_state("stack pipeline requires at least two SAFE scenes")
@@ -109,24 +135,26 @@ def run_stack_pipeline(
     pair_list = list(pairs) if pairs is not None else default_pair_list(scene_ids)
 
     out = Path(output_dir)
-    pair_states: list[PairWorkflowState] = []
+    pair_states: list[ProductionPairState] = []
     pair_phases: dict[str, object] = {}
     for ref_id, sec_id in pair_list:
         if ref_id not in id_to_path or sec_id not in id_to_path:
             reject_invalid_state(f"unknown scene id in pair ({ref_id}, {sec_id})")
-        state = run_pair_workflow(
+        state = run_production_pair(
             id_to_path[ref_id],
             id_to_path[sec_id],
-            output_dir=out / "pairs",
+            output_dir=out / "pairs" / f"{ref_id}_{sec_id}",
             swath=swath,
+            scope="burst",
             burst_index=burst_index,
-            height=height,
-            width=width,
+            dem=dem,
             multilook=multilook,
             goldstein_alpha=goldstein_alpha,
             executor=executor,
             device=device,
-            unwrap_method=unwrap_method,
+            snaphu_config=snaphu_config,
+            coregistration_grid=coregistration_grid,
+            geo_grid=geo_grid,
         )
         pair_states.append(state)
         assert state.unwrapped_phase is not None
@@ -139,10 +167,11 @@ def run_stack_pipeline(
         timeseries_zarr = write_timeseries_zarr(timeseries, out / "timeseries.zarr")
 
     logger.info(
-        "Stack complete: %s scenes, %s pairs under %s",
+        "Stack complete: %s scenes, %s pairs under %s mode=%s",
         len(scene_ids),
         len(pair_states),
         out,
+        coregistration_grid,
     )
     return StackPipelineResult(
         scene_ids=scene_ids,
@@ -152,7 +181,6 @@ def run_stack_pipeline(
     )
 
 
-# Back-compat helper used by older tests: still expose load_safe_burst_windows
 def load_safe_burst_windows(
     scene_paths: Iterable[str | Path],
     *,

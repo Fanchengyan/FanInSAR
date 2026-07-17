@@ -209,6 +209,10 @@ def parse_annotation_xml(
         ),
         doppler_centroid=tuple(doppler),
         azimuth_fm_rate=tuple(fm_rates),
+        azimuth_steering_rate_rad_s=float(
+            _text(product_info, "azimuthSteeringRate")
+        )
+        * (3.141592653589793 / 180.0),
     )
 
 

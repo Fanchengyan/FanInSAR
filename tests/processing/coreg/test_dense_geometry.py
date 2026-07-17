@@ -128,6 +128,60 @@ def test_dense_geometry_stride_one_is_exact() -> None:
     assert np.nanmax(np.abs(result.azimuth_offset_px)) < 0.1
 
 
+def test_dense_geometry_offset_sign_matches_resample_complex() -> None:
+    """``offset = ref_index - sec_index`` aligns secondary via resample_complex.
+
+    :func:`resample_complex` samples ``source = output - offset``.  For the
+    same ground point at reference index ``i`` and secondary index ``j``,
+    we need ``source = j`` when ``output = i``, hence
+    ``offset = i - j = ref - sec``.
+
+    Synthetic check: feature at ref ``i`` is placed at sec ``i + Δ`` (content
+    shifted to larger indices by ``Δ``).  Then ``offset = -Δ`` recovers
+    coherence; ``offset = +Δ`` does not.
+
+    Regression: production used ``offset = sec - ref`` and destroyed S1
+    interferogram coherence (mean γ ≈ 0.07, lag-1 phase corr ≈ 0.1).
+    """
+    from scipy.ndimage import shift as nd_shift
+
+    from faninsar.processing.coreg.offsets import resample_complex
+    from faninsar.processing.interferometry.pair import form_interferogram
+
+    height, width = 64, 128
+    az = np.linspace(0, 4 * np.pi, height, dtype=np.float32)[:, None]
+    rg = np.linspace(0, 8 * np.pi, width, dtype=np.float32)[None, :]
+    ref = ((2.0 + np.cos(az) * np.cos(rg)) * np.exp(1j * (0.3 * az + 0.1 * rg))).astype(
+        np.complex64
+    )
+    delta_az, delta_rg = 2.0, 5.0
+    sec = (
+        nd_shift(ref.real, (delta_az, delta_rg), order=1)
+        + 1j * nd_shift(ref.imag, (delta_az, delta_rg), order=1)
+    ).astype(np.complex64)
+    sl = (slice(8, -8), slice(8, -8))
+    before = form_interferogram(ref[sl], sec[sl], multilook=(2, 4))
+    # Correct: offset = ref - sec = -delta
+    aligned_ok = resample_complex(
+        sec,
+        range_offset_px=-delta_rg,
+        azimuth_offset_px=-delta_az,
+        order=1,
+    )
+    after_ok = form_interferogram(ref[sl], aligned_ok[sl], multilook=(2, 4))
+    # Wrong (old production sign): offset = +delta
+    aligned_bad = resample_complex(
+        sec,
+        range_offset_px=delta_rg,
+        azimuth_offset_px=delta_az,
+        order=1,
+    )
+    after_bad = form_interferogram(ref[sl], aligned_bad[sl], multilook=(2, 4))
+    assert float(np.nanmean(after_ok.coherence)) > float(np.nanmean(before.coherence))
+    assert float(np.nanmean(after_ok.coherence)) > 0.5
+    assert float(np.nanmean(after_ok.coherence)) > float(np.nanmean(after_bad.coherence))
+
+
 def test_dense_geometry_invalid_shape_raises() -> None:
     """Non-positive shape or stride raises ValueError."""
     t0 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)

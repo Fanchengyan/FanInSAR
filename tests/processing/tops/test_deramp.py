@@ -24,6 +24,8 @@ def _model() -> TOPSCarrierModel:
         fm_rate_hz_s=(-2300.0, 4.5e5, -7.9e7),
         fm_t0_s=0.00533,
         burst_sensing_time_s=0.0,
+        burst_start_slant_range_time_s=0.00533,
+        azimuth_steering_rate_hz_s=6500.0,
     )
 
 

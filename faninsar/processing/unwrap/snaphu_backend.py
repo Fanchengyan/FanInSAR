@@ -1,4 +1,4 @@
-"""Optional snaphu-py unwrapping backend (lazy import, no silent fallback)."""
+"""snaphu-py unwrapping backend with lazy import and no silent fallback."""
 
 from __future__ import annotations
 
@@ -16,25 +16,25 @@ from faninsar.processing.unwrap.common import CommonUnwrapResult, build_common_r
 
 logger = setup_logger(__name__)
 
-SnaphuCostMode = Literal["defo", "topo", "smooth"]
+SnaphuCostMode = Literal["defo", "smooth"]
 
 
 class SnaphuNotAvailableError(ProcessingContractError):
-    """Raised when the optional snaphu extra is requested but not installed."""
+    """Raised when the required snaphu-py package is not installed."""
 
 
 @dataclass(frozen=True, slots=True)
 class SnaphuConfig:
-    """Typed configuration for the optional snaphu-py backend."""
+    """Typed configuration for the snaphu-py backend."""
 
     cost: SnaphuCostMode = "defo"
     nlooks: float = 1.0
-    tile: tuple[int, int] | None = None
+    ntiles: tuple[int, int] = (1, 1)
     nproc: int = 1
 
 
 def snaphu_available() -> bool:
-    """Return whether the optional snaphu package is importable."""
+    """Return whether the snaphu package is importable."""
     return find_spec("snaphu") is not None
 
 
@@ -49,13 +49,14 @@ def require_snaphu() -> Any:
     Raises
     ------
     SnaphuNotAvailableError
-        If ``faninsar[snaphu]`` is not installed.
+        If the required ``snaphu-py`` package is not installed.
 
     """
     capability = snaphu_capability()
     if not capability.available:
         message = (
-            "snaphu-py is not installed. Install with `pip install 'faninsar[snaphu]'` "
+            "snaphu-py is not installed. Reinstall FanInSAR with "
+            "`pip install faninsar` "
             f"and review the license caveat: {capability.license_caveat}"
         )
         logger.error(message)
@@ -69,7 +70,7 @@ def snaphu_unwrap(
     *,
     config: SnaphuConfig | None = None,
 ) -> CommonUnwrapResult:
-    r"""Unwrap a complex interferogram with the optional snaphu-py API.
+    r"""Unwrap a complex interferogram with the snaphu-py API.
 
     Parameters
     ----------
@@ -112,9 +113,15 @@ def snaphu_unwrap(
         "nlooks": float(cfg.nlooks),
         "cost": cfg.cost,
         "nproc": int(cfg.nproc),
+        "ntiles": (int(cfg.ntiles[0]), int(cfg.ntiles[1])),
     }
-    if cfg.tile is not None:
-        kwargs["ntile"] = (int(cfg.tile[0]), int(cfg.tile[1]))
+    valid = (
+        np.isfinite(complex_ifg.real)
+        & np.isfinite(complex_ifg.imag)
+        & np.isfinite(coherence)
+        & (coherence > 0.0)
+    )
+    kwargs["mask"] = valid.astype(np.uint8)
 
     logger.info(
         "Calling snaphu-py unwrap (wrapper=%s, bundled=%s, cost=%s)",
@@ -139,7 +146,7 @@ def snaphu_unwrap(
         configuration={
             "cost": cfg.cost,
             "nlooks": cfg.nlooks,
-            "tile": cfg.tile,
+            "ntiles": cfg.ntiles,
             "nproc": cfg.nproc,
             "wrapper_version": capability.wrapper_version,
             "bundled_snaphu_version": capability.bundled_snaphu_version,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from math import sqrt
 from typing import TYPE_CHECKING
 
 from faninsar.logging import setup_logger
@@ -10,6 +10,8 @@ from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.tops.deramp import SPEED_OF_LIGHT_M_S, TOPSCarrierModel
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from faninsar.sentinel1.types import S1Burst, S1Swath
 
 logger = setup_logger(__name__)
@@ -79,6 +81,20 @@ def carrier_from_swath(
     n_lines = max(int(burst.lines), 1)
     burst_centre_offset_s = 0.5 * (n_lines - 1) * swath.azimuth_time_interval_s
     burst_sensing_time_s = float(burst.azimuth_anx_time_s) + burst_centre_offset_s
+    nearest_orbit_vector = min(
+        swath.orbit.vectors,
+        key=lambda vector: abs((vector.time - burst_time).total_seconds()),
+    )
+    velocity_m_s = sqrt(
+        sum(float(component) ** 2 for component in nearest_orbit_vector.velocity_m_s)
+    )
+    wavelength_m = SPEED_OF_LIGHT_M_S / swath.radar_frequency_hz
+    steering_rate_hz_s = (
+        2.0
+        * velocity_m_s
+        * swath.azimuth_steering_rate_rad_s
+        / wavelength_m
+    )
 
     model = TOPSCarrierModel(
         radar_frequency_hz=swath.radar_frequency_hz,
@@ -90,6 +106,8 @@ def carrier_from_swath(
         fm_rate_hz_s=tuple(float(v) for v in fm_coeffs),
         fm_t0_s=float(fm_t0_s),
         burst_sensing_time_s=burst_sensing_time_s,
+        burst_start_slant_range_time_s=float(swath.slant_range_time_s),
+        azimuth_steering_rate_hz_s=float(steering_rate_hz_s),
     )
     logger.info(
         "Built TOPS carrier for %s burst %s (dc_idx=%s fm_idx=%s first_rg=%s "

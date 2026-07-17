@@ -16,6 +16,7 @@ from .offsets import (
     geometry_shift_offsets,
     refine_peak_subpixel,
     resample_complex,
+    resample_complex_deramped_reramp,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "refine_peak_subpixel",
     "refine_shift_with_correlation",
     "resample_complex",
+    "resample_complex_deramped_reramp",
 ]

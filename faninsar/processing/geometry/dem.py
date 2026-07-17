@@ -10,7 +10,10 @@ import numpy as np
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
+
+    from rasterio.io import DatasetReader
 
 logger = setup_logger(__name__)
 
@@ -45,13 +48,84 @@ class ConstantHeightDEM:
         return np.full(lat_b.shape, self.height_m, dtype=np.float64)
 
 
+@dataclass(frozen=True, slots=True)
+class GeoidAdjustedDEM:
+    """Convert orthometric DEM samples to ellipsoidal heights."""
+
+    orthometric_dem: DEMSampler
+    geoid: DEMSampler
+
+    def sample(
+        self,
+        latitude_deg: np.ndarray,
+        longitude_deg: np.ndarray,
+    ) -> np.ndarray:
+        """Return orthometric height plus geoid undulation."""
+        orthometric = self.orthometric_dem.sample(latitude_deg, longitude_deg)
+        undulation = self.geoid.sample(latitude_deg, longitude_deg)
+        return np.asarray(orthometric) + np.asarray(undulation)
+
+
+@dataclass(slots=True)
+class NetCDFGeoid:
+    """Sample geoid undulation from a regular NetCDF longitude/latitude grid."""
+
+    path: Path
+    _interpolator: Callable[[np.ndarray], np.ndarray] | None = None
+
+    def __post_init__(self) -> None:
+        """Validate that the geoid grid exists."""
+        if not self.path.exists():
+            message = f"geoid grid does not exist: {self.path}"
+            logger.error(message)
+            raise FileNotFoundError(message)
+
+    def _open(self) -> Callable[[np.ndarray], np.ndarray]:
+        if self._interpolator is None:
+            import xarray as xr
+            from scipy.interpolate import RegularGridInterpolator
+
+            grid = xr.open_dataarray(self.path)
+            latitude_name = "lat" if "lat" in grid.coords else "y"
+            longitude_name = "lon" if "lon" in grid.coords else "x"
+            latitude = np.asarray(grid[latitude_name], dtype=np.float64)
+            longitude = np.asarray(grid[longitude_name], dtype=np.float64)
+            values = np.asarray(grid, dtype=np.float64)
+            if latitude[0] > latitude[-1]:
+                latitude = latitude[::-1]
+                values = values[::-1]
+            self._interpolator = RegularGridInterpolator(
+                (latitude, longitude),
+                values,
+                method="linear",
+                bounds_error=False,
+                fill_value=np.nan,
+            )
+        return self._interpolator
+
+    def sample(
+        self,
+        latitude_deg: np.ndarray,
+        longitude_deg: np.ndarray,
+    ) -> np.ndarray:
+        """Bilinear-sample geoid undulation in metres."""
+        latitude, longitude = np.broadcast_arrays(
+            np.asarray(latitude_deg, dtype=np.float64),
+            np.asarray(longitude_deg, dtype=np.float64),
+        )
+        interpolator = self._open()
+        points = np.column_stack([latitude.ravel(), longitude.ravel()])
+        values = interpolator(points)
+        return np.asarray(values, dtype=np.float64).reshape(latitude.shape)
+
+
 @dataclass(slots=True)
 class RasterDEM:
     """Sample heights from a single-band georeferenced DEM raster."""
 
     path: Path
     nodata: float | None = None
-    _dataset: object | None = None
+    _dataset: DatasetReader | None = None
 
     def __post_init__(self) -> None:
         """Validate that the DEM path exists."""
@@ -60,14 +134,20 @@ class RasterDEM:
             logger.error(message)
             raise FileNotFoundError(message)
 
-    def _open(self) -> object:
+    def _open(self) -> DatasetReader:
         if self._dataset is None:
             import rasterio
 
-            self._dataset = rasterio.open(self.path)
+            dataset = rasterio.open(self.path)
+            self._dataset = dataset
             if self.nodata is None:
-                self.nodata = self._dataset.nodata
-        return self._dataset
+                self.nodata = dataset.nodata
+        dataset = self._dataset
+        if dataset is None:
+            message = f"failed to open DEM dataset: {self.path}"
+            logger.error(message)
+            raise RuntimeError(message)
+        return dataset
 
     def sample(
         self,

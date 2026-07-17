@@ -31,7 +31,46 @@ def _block_reduce(array: np.ndarray, az_looks: int, rg_looks: int) -> np.ndarray
     if array.ndim == 2:
         reshaped = cropped.reshape(h // az_looks, az_looks, w // rg_looks, rg_looks)
         return reshaped.mean(axis=(1, 3))
-    raise ValueError("block reduce expects 2-D array")
+    message = "block reduce expects a two-dimensional array"
+    logger.error(message)
+    raise ValueError(message)
+
+
+def mask_invalid_looks(
+    complex_ifg: np.ndarray,
+    coherence: np.ndarray | None = None,
+    *,
+    amp_eps: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+    """Replace zero-amplitude looks with NaN phase-safe complex values.
+
+    Parameters
+    ----------
+    complex_ifg : numpy.ndarray
+        Multilooked complex interferogram.
+    coherence : numpy.ndarray, optional
+        Matching coherence layer.
+    amp_eps : float, optional
+        Amplitude threshold below which a look is invalid.
+
+    Returns
+    -------
+    complex_ifg, coherence, wrapped_phase
+        Copies with invalid looks set to NaN.
+
+    """
+    ifg = np.asarray(complex_ifg, dtype=np.complex64).copy()
+    amp = np.abs(ifg)
+    invalid = ~np.isfinite(amp) | (amp <= amp_eps)
+    if np.any(invalid):
+        ifg[invalid] = np.nan + 1j * np.nan
+    phase = np.angle(ifg).astype(np.float32)
+    phase = np.where(invalid, np.nan, phase)
+    coh_out = None
+    if coherence is not None:
+        coh_out = np.asarray(coherence, dtype=np.float32).copy()
+        coh_out[invalid] = np.nan
+    return ifg, coh_out, phase
 
 
 def form_interferogram(
@@ -112,12 +151,23 @@ def form_interferogram(
     denom = np.sqrt(np.maximum(power_pri * power_sec, 1e-30))
     coherence = np.abs(ifg) / denom
     coherence = np.clip(coherence, 0.0, 1.0).astype(np.float32)
-    wrapped = np.angle(ifg).astype(np.float32)
     amplitude = np.abs(ifg).astype(np.float32)
+    # Looks with zero power on either input are not data — mark NaN so
+    # downstream plots/metrics do not paint phase=0 as a solid black edge.
+    invalid = (power_pri <= 0.0) | (power_sec <= 0.0) | ~np.isfinite(power_pri)
+    if np.any(invalid):
+        ifg = np.asarray(ifg, dtype=np.complex64).copy()
+        ifg[invalid] = np.nan + 1j * np.nan
+        coherence = coherence.copy()
+        coherence[invalid] = np.nan
+        amplitude = amplitude.copy()
+        amplitude[invalid] = np.nan
+    wrapped = np.angle(ifg).astype(np.float32)
+    wrapped = np.where(np.isfinite(ifg.real) & np.isfinite(ifg.imag), wrapped, np.nan)
     return InterferogramProduct(
         complex_ifg=ifg.astype(np.complex64, copy=False),
         coherence=coherence,
-        wrapped_phase=wrapped,
+        wrapped_phase=wrapped.astype(np.float32, copy=False),
         amplitude=amplitude,
     )
 

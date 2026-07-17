@@ -54,8 +54,9 @@ def read_full_burst(
     *,
     burst_index: int = 0,
     range_looks_crop: tuple[int, int] | None = None,
+    geocoding_layout: bool = False,
 ) -> BurstArray:
-    """Read an entire TOPS burst (all azimuth lines, valid range columns).
+    """Read a TOPS burst in radar or direct-geocoding layout.
 
     Parameters
     ----------
@@ -66,6 +67,9 @@ def read_full_burst(
     range_looks_crop : tuple[int, int], optional
         Optional ``(col0, col1)`` absolute range crop inside the burst.
         When omitted, uses the burst valid-sample envelope.
+    geocoding_layout : bool, optional
+        Use valid azimuth lines and the complete divisible range extent,
+        matching direct geographic SLC transform conventions.
 
     Returns
     -------
@@ -76,16 +80,31 @@ def read_full_burst(
     if burst_index < 0 or burst_index >= len(swath.bursts):
         reject_product(f"burst_index {burst_index} out of range for {swath.swath}")
     burst = swath.bursts[burst_index]
-    col0, col1 = _valid_column_bounds(burst)
+    local_row0 = 0
+    height = burst.lines
+    if geocoding_layout:
+        valid_lines = np.asarray(burst.first_valid_sample, dtype=np.int32) >= 0
+        if not np.any(valid_lines):
+            reject_product(f"burst {burst.index} has no valid azimuth lines")
+        valid_indices = np.flatnonzero(valid_lines)
+        local_row0 = int(valid_indices[0])
+        valid_height = int(valid_indices[-1] - local_row0)
+        height = valid_height - valid_height % 4
+        if height <= 0:
+            reject_product(f"burst {burst.index} has empty valid azimuth extent")
+        col0 = 0
+        col1 = int(burst.samples) - int(burst.samples) % 4
+    else:
+        col0, col1 = _valid_column_bounds(burst)
     if range_looks_crop is not None:
         c0, c1 = range_looks_crop
-        col0 = max(col0, int(c0))
-        col1 = min(col1, int(c1))
+        valid_col0, valid_col1 = _valid_column_bounds(burst)
+        col0 = max(valid_col0, int(c0))
+        col1 = min(valid_col1, int(c1))
         if col1 <= col0:
             reject_product("range_looks_crop is empty after intersecting valid bounds")
 
-    row0 = _burst_line_offset(swath, burst)
-    height = burst.lines
+    row0 = _burst_line_offset(swath, burst) + local_row0
     width = col1 - col0
     import rasterio
 
@@ -99,15 +118,25 @@ def read_full_burst(
         height * width * 8 / (1024**2),
     )
     with rasterio.open(swath.measurement_path) as dataset:
-        samples = dataset.read(1, window=Window(col0, row0, width, height))
+        window = Window.from_slices(
+            (row0, row0 + height),
+            (col0, col0 + width),
+        )
+        samples = dataset.read(1, window=window)
     samples = np.asarray(samples, dtype=np.complex64)
     if samples.shape != (height, width):
         reject_product(
             f"unexpected full-burst shape {samples.shape}, expected {(height, width)}"
         )
 
-    first = np.asarray(burst.first_valid_sample, dtype=np.int32)
-    last = np.asarray(burst.last_valid_sample, dtype=np.int32)
+    first = np.asarray(
+        burst.first_valid_sample[local_row0 : local_row0 + height],
+        dtype=np.int32,
+    )
+    last = np.asarray(
+        burst.last_valid_sample[local_row0 : local_row0 + height],
+        dtype=np.int32,
+    )
     cols = np.arange(col0, col1, dtype=np.int32)[None, :]
     valid_mask = (
         (first[:, None] >= 0) & (cols >= first[:, None]) & (cols <= last[:, None])

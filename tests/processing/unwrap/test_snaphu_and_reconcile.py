@@ -1,4 +1,4 @@
-"""Tests for optional snaphu backend gate and component reconciliation."""
+"""Tests for the snaphu backend gate and component reconciliation."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def test_snaphu_backend_raises_when_not_installed() -> None:
         pytest.skip("snaphu is installed in this environment")
     ifg = np.ones((8, 8), dtype=np.complex64)
     coh = np.ones((8, 8), dtype=np.float32)
-    with pytest.raises(SnaphuNotAvailableError, match="faninsar\\[snaphu\\]"):
+    with pytest.raises(SnaphuNotAvailableError, match="pip install faninsar"):
         snaphu_unwrap(ifg, coh)
     with pytest.raises(SnaphuNotAvailableError):
         unwrap(ifg, coh, method="snaphu")

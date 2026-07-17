@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -29,7 +30,7 @@ from faninsar.processing.pipeline.products import (
 )
 from faninsar.processing.tops.carrier import carrier_from_swath
 from faninsar.processing.tops.deramp import TOPSCarrierModel, deramp, reramp
-from faninsar.processing.unwrap.irls import irls_unwrap
+from faninsar.processing.unwrap import SnaphuConfig, snaphu_unwrap
 from faninsar.sentinel1 import open_safe_product, read_burst_window
 
 logger = setup_logger(__name__)
@@ -209,24 +210,24 @@ def stage_coregister(
         range_shift_px=rg,
         azimuth_shift_px=az,
     )
+    # Offsets from deramped domain; final resample of original-domain secondary
+    # (see production.stage_coregister).
+    sec_orig = reramp(state.secondary_deramped, state.secondary.carrier)
     sec_resamp = resample_complex(
-        state.secondary_deramped,
+        sec_orig,
         range_offset_px=offsets.range_offset_px,
         azimuth_offset_px=offsets.azimuth_offset_px,
         executor=executor,
         device=device,
     )
-    # Reramp both onto the reference carrier after resampling.
     ref_aligned = reramp(state.reference_deramped, state.reference.carrier)
-    sec_aligned = reramp(sec_resamp, state.reference.carrier)
     state.range_shift_px = rg
     state.azimuth_shift_px = az
-    state.secondary_aligned = sec_aligned
-    # keep reference in aligned (reramped) form for interferogram
+    state.secondary_aligned = sec_resamp
     state.reference_deramped = ref_aligned
     state._note(
         f"COREG geometry+correlation rg={rg:.3f} px az={az:.3f} px "
-        f"(prior rg={prior_rg:.3f} az={prior_az:.3f})"
+        f"(prior rg={prior_rg:.3f} az={prior_az:.3f}; resample original-domain)"
     )
     return state
 
@@ -245,12 +246,17 @@ def stage_interferogram(
         state.secondary_aligned,
         multilook=multilook,
     )
-    filtered = goldstein_filter(ifg.complex_ifg, alpha=goldstein_alpha)
-    state.complex_ifg = filtered.astype(np.complex64, copy=False)
+    if goldstein_alpha > 0.0:
+        complex_ifg = goldstein_filter(ifg.complex_ifg, alpha=goldstein_alpha)
+    else:
+        # alpha=0 is not a no-op in windowed Goldstein (Hann still smooths).
+        complex_ifg = ifg.complex_ifg
+    state.complex_ifg = complex_ifg.astype(np.complex64, copy=False)
     state.coherence = ifg.coherence
-    state.wrapped_phase = np.angle(filtered).astype(np.float32)
+    state.wrapped_phase = np.angle(state.complex_ifg).astype(np.float32)
     state._note(
-        f"IFG multilook={multilook} mean_coh={float(np.nanmean(ifg.coherence)):.3f}"
+        f"IFG multilook={multilook} goldstein={goldstein_alpha} "
+        f"mean_coh={float(np.nanmean(ifg.coherence)):.3f}"
     )
     return state
 
@@ -258,18 +264,16 @@ def stage_interferogram(
 def stage_unwrap(
     state: PairWorkflowState,
     *,
-    method: str = "irls",
+    config: SnaphuConfig | None = None,
 ) -> PairWorkflowState:
-    """Stage 5: unwrap with explicit backend selection.
+    """Stage 5: unwrap with snaphu-py.
 
     Parameters
     ----------
     state : PairWorkflowState
         Pair workflow state after interferogram formation.
-    method : {"irls", "dct_irls", "snaphu"}, optional
-        Unwrap backend. ``"irls"`` uses the local IRLS path; other values
-        go through :func:`faninsar.processing.unwrap.unwrap`. Default
-        ``"irls"``.
+    config : SnaphuConfig, optional
+        snaphu-py configuration.
 
     Returns
     -------
@@ -279,29 +283,16 @@ def stage_unwrap(
     """
     if state.wrapped_phase is None or state.coherence is None:
         reject_invalid_state("stage_unwrap requires stage_interferogram first")
-    if method == "irls":
-        result = irls_unwrap(state.wrapped_phase, state.coherence)
-        state.unwrapped_phase = result.unwrapped_phase
-        state.connected_components = result.connected_components
-        state._note(
-            f"UNWRAP irls iterations={result.iterations} "
-            f"converged={result.converged}"
-        )
-        return state
-
-    from faninsar.processing.unwrap import unwrap as unwrap_dispatch
-
     ifg = state.complex_ifg
     if ifg is None:
         ifg = np.exp(1j * np.asarray(state.wrapped_phase, dtype=np.float64)).astype(
             np.complex64
         )
-    dispatched = unwrap_dispatch(ifg, state.coherence, method=method)
+    dispatched = snaphu_unwrap(ifg, state.coherence, config=config)
     state.unwrapped_phase = dispatched.unwrapped_phase
     state.connected_components = dispatched.connected_components
     state._note(f"UNWRAP method={dispatched.method} metrics={dispatched.metrics}")
     return state
-
 
 
 def stage_geocode(
@@ -351,7 +342,7 @@ def stage_write(
         reject_invalid_state("stage_write requires completed interferogram/unwrap")
 
     meta: dict[str, Any] = {
-        "unwrap_method": "irls",
+        "unwrap_method": "snaphu",
         "range_shift_px": state.range_shift_px,
         "azimuth_shift_px": state.azimuth_shift_px,
         "reference_scene": state.reference.scene_id,
@@ -432,9 +423,13 @@ def run_pair_workflow(
     geocode_stride: int = 2,
     executor: str = "serial",
     device: str = "auto",
-    unwrap_method: str = "irls",
+    snaphu_config: SnaphuConfig | None = None,
 ) -> PairWorkflowState:
-    """Run the full production pair workflow as explicit stages.
+    """Run the windowed educational pair workflow (deprecated).
+
+    Prefer :func:`~faninsar.processing.pipeline.production.run_production_pair`
+    for production ``radar`` / ``geo`` coregistration grids.
+
 
     Stages
     ------
@@ -466,8 +461,8 @@ def run_pair_workflow(
         Lanczos path for coreg resampling. Default ``"serial"``.
     device : {"auto","cpu","cuda","mps"}, optional
         Torch device when ``executor="dask-torch"``. Default ``"auto"``.
-    unwrap_method : {"irls", "dct_irls", "snaphu"}, optional
-        Unwrap backend. Default ``"irls"``.
+    snaphu_config : SnaphuConfig, optional
+        snaphu-py configuration.
 
     Returns
     -------
@@ -475,6 +470,12 @@ def run_pair_workflow(
         Full intermediate state including paths and stage log.
 
     """
+    warnings.warn(
+        "run_pair_workflow is deprecated; use run_production_pair "
+        "(coregistration_grid='radar'|'geo') for production",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     reference = stage_read_scene(
         reference_path,
         swath=swath,
@@ -509,7 +510,9 @@ def run_pair_workflow(
         multilook=multilook,
         goldstein_alpha=goldstein_alpha,
     )
-    state = stage_unwrap(state, method=unwrap_method)
+    if snaphu_config is None:
+        snaphu_config = SnaphuConfig(nlooks=float(multilook[0] * multilook[1]))
+    state = stage_unwrap(state, config=snaphu_config)
     state = stage_geocode(state, dem=dem, stride=geocode_stride)
     state = stage_write(state, output_dir)
     state._note("DONE")

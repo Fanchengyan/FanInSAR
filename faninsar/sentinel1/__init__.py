@@ -10,6 +10,7 @@ from .io import (
     read_swath_bursts,
     stitch_bursts,
 )
+from .orbit import read_eof_orbit
 from .safe import open_safe_product
 from .types import S1Burst, S1Product, S1Swath
 
@@ -22,6 +23,7 @@ __all__ = [
     "UnsupportedPolarizationError",
     "open_safe_product",
     "read_burst_window",
+    "read_eof_orbit",
     "read_full_burst",
     "read_swath_bursts",
     "stitch_bursts",

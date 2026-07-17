@@ -83,20 +83,26 @@ def refine_shift_with_correlation(
     reference_samples, secondary_samples : numpy.ndarray
         Complex 2-D arrays on the same grid.
     prior_rg, prior_az : float
-        Geometry-predicted range/azimuth shifts in pixels.
+        Geometry-predicted range/azimuth shifts in the
+        :func:`~faninsar.processing.coreg.offsets.resample_complex`
+        convention (``source = output - offset``).
     search_radius : int, optional
         Maximum correlation search radius around the prior.
 
     Returns
     -------
     tuple[float, float]
-        Refined ``(range_shift_px, azimuth_shift_px)``.
+        Refined ``(range_shift_px, azimuth_shift_px)`` in the same
+        resample convention as ``prior_*``.
 
     """
     pre_rg = round(prior_rg)
     pre_az = round(prior_az)
-    shifted = np.roll(secondary_samples, shift=-pre_az, axis=0)
-    shifted = np.roll(shifted, shift=-pre_rg, axis=1)
+    # Pre-align secondary under the resample_complex convention:
+    # source = out - offset  ⇒  shifted[i] = secondary[i - prior].
+    # numpy.roll(a, +prior) implements shifted[i] = a[i - prior].
+    shifted = np.roll(secondary_samples, shift=pre_az, axis=0)
+    shifted = np.roll(shifted, shift=pre_rg, axis=1)
     d_rg, d_az = estimate_global_shift(
         reference_samples,
         shifted,

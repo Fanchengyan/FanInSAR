@@ -15,6 +15,7 @@ from faninsar.processing.geometry.orbit import OrbitInterpolator
 if TYPE_CHECKING:
     from faninsar.processing.contracts import OrbitMetadata
     from faninsar.processing.coordinates import RadarGrid
+    from faninsar.processing.geometry.dem import DEMSampler
 
 logger = setup_logger(__name__)
 
@@ -492,71 +493,86 @@ def geo2rdr(
     residual_range = np.full(shape, np.nan, dtype=np.float64)
     residual_doppler = np.full(shape, np.nan, dtype=np.float64)
 
-    t_mid = 0.5 * (model.orbit.t_min_s + model.orbit.t_max_s)
-    for flat_index, (lat_i, lon_i, h_i) in enumerate(
-        zip(lat_b.ravel(), lon_b.ravel(), h_b.ravel(), strict=True)
-    ):
-        tx, ty, tz = llh_to_ecef(lat_i, lon_i, h_i)
-        target = np.array([float(tx), float(ty), float(tz)], dtype=np.float64)
-        t_s = t_mid
-        success = False
-        range_res = np.nan
-        doppler_res = np.nan
-        for _ in range(max_iter):
-            time = model.orbit.epoch + timedelta(seconds=float(t_s))
-            try:
-                state = model.orbit.evaluate(time)
-            except Exception:
-                break
-            sat = np.asarray(state.position_m, dtype=np.float64)
-            vel = np.asarray(state.velocity_m_s, dtype=np.float64)
-            look = target - sat
-            range_m = float(np.linalg.norm(look))
-            if range_m <= 0:
-                break
-            unit = look / range_m
-            doppler_res = float(np.dot(vel, unit))
-            # d(doppler)/dt ~ acceleration projection; use finite difference
-            dt = 1e-3
-            try:
-                state2 = model.orbit.evaluate(
-                    model.orbit.epoch + timedelta(seconds=float(t_s + dt))
-                )
-            except Exception:
-                break
-            sat2 = np.asarray(state2.position_m, dtype=np.float64)
-            vel2 = np.asarray(state2.velocity_m_s, dtype=np.float64)
-            unit2 = (target - sat2) / np.linalg.norm(target - sat2)
-            d_dop_dt = (float(np.dot(vel2, unit2)) - doppler_res) / dt
-            if abs(d_dop_dt) < 1e-12:
-                break
-            step = -doppler_res / d_dop_dt
-            t_s += step
-            if abs(step) < time_tol_s:
-                success = True
-                range_res = range_m - model.starting_slant_range_m
-                # convert residual later via index
-                break
-        idx = np.unravel_index(flat_index, shape)
-        if success:
-            az_index = (t_s - 0.0) / model.azimuth_time_interval_s
-            # t_s is relative to orbit epoch, convert relative to sensing_start
-            sensing_offset = (model.sensing_start - model.orbit.epoch).total_seconds()
-            az_index = (t_s - sensing_offset) / model.azimuth_time_interval_s
-            # recompute range at converged time
-            time = model.orbit.epoch + timedelta(seconds=float(t_s))
-            state = model.orbit.evaluate(time)
-            sat = np.asarray(state.position_m, dtype=np.float64)
-            range_m = float(np.linalg.norm(target - sat))
-            rg_index = (range_m - model.starting_slant_range_m) / model.range_spacing_m
-            az[idx] = az_index
-            rg[idx] = rg_index
-            residual_range[idx] = 0.0
-            residual_doppler[idx] = doppler_res
-            converged[idx] = True
-        else:
-            residual_range[idx] = range_res
-            residual_doppler[idx] = doppler_res
+    target_x, target_y, target_z = llh_to_ecef(lat_b, lon_b, h_b)
+    targets = np.stack([target_x, target_y, target_z], axis=-1).reshape(-1, 3)
+    finite = np.isfinite(targets).all(axis=1)
+    sensing_start = model.sensing_start
+    if not isinstance(sensing_start, datetime):
+        message = "sensing_start must be a datetime"
+        logger.error(message)
+        raise TypeError(message)
+    sensing_offset = (sensing_start - model.orbit.epoch).total_seconds()
+    times_s = np.full(targets.shape[0], sensing_offset, dtype=np.float64)
+    active = finite.copy()
+    solved = np.zeros(targets.shape[0], dtype=bool)
+    doppler = np.full(targets.shape[0], np.nan, dtype=np.float64)
+    finite_difference_s = 1e-3
+    for _ in range(max_iter):
+        in_orbit = (
+            active
+            & (times_s >= model.orbit.t_min_s)
+            & (times_s + finite_difference_s <= model.orbit.t_max_s)
+        )
+        active &= in_orbit
+        if not np.any(active):
+            break
+        indices = np.flatnonzero(active)
+        current_times = times_s[indices]
+        satellite, velocity = model.orbit.evaluate_array(current_times)
+        look = targets[indices] - satellite
+        range_m = np.linalg.norm(look, axis=1)
+        usable = range_m > 0.0
+        unit_look = np.zeros_like(look)
+        unit_look[usable] = look[usable] / range_m[usable, None]
+        current_doppler = np.einsum("ij,ij->i", velocity, unit_look)
+
+        satellite_next, velocity_next = model.orbit.evaluate_array(
+            current_times + finite_difference_s
+        )
+        look_next = targets[indices] - satellite_next
+        range_next = np.linalg.norm(look_next, axis=1)
+        usable &= range_next > 0.0
+        unit_next = np.zeros_like(look_next)
+        unit_next[usable] = look_next[usable] / range_next[usable, None]
+        doppler_next = np.einsum("ij,ij->i", velocity_next, unit_next)
+        derivative = (doppler_next - current_doppler) / finite_difference_s
+        usable &= np.isfinite(derivative) & (np.abs(derivative) >= 1e-12)
+
+        step = np.full(indices.size, np.nan, dtype=np.float64)
+        step[usable] = -current_doppler[usable] / derivative[usable]
+        times_s[indices[usable]] += step[usable]
+        doppler[indices] = current_doppler
+        newly_solved = usable & (np.abs(step) < time_tol_s)
+        solved[indices[newly_solved]] = True
+        active[indices[~usable | newly_solved]] = False
+
+    solved &= (
+        (times_s >= model.orbit.t_min_s)
+        & (times_s <= model.orbit.t_max_s)
+    )
+    if np.any(solved):
+        solved_indices = np.flatnonzero(solved)
+        solved_times = times_s[solved_indices]
+        satellite, velocity = model.orbit.evaluate_array(solved_times)
+        look = targets[solved_indices] - satellite
+        range_m = np.linalg.norm(look, axis=1)
+        unit_look = look / range_m[:, None]
+        final_doppler = np.einsum("ij,ij->i", velocity, unit_look)
+        az_flat = az.ravel()
+        rg_flat = rg.ravel()
+        converged_flat = converged.ravel()
+        residual_range_flat = residual_range.ravel()
+        residual_doppler_flat = residual_doppler.ravel()
+        az_flat[solved_indices] = (
+            solved_times - sensing_offset
+        ) / model.azimuth_time_interval_s
+        rg_flat[solved_indices] = (
+            range_m - model.starting_slant_range_m
+        ) / model.range_spacing_m
+        converged_flat[solved_indices] = True
+        residual_range_flat[solved_indices] = 0.0
+        residual_doppler_flat[solved_indices] = final_doppler
+    residual_doppler.ravel()[~solved] = doppler[~solved]
 
     return TransformResult(
         latitude_deg=lat_b.copy(),
@@ -574,7 +590,7 @@ def rdr2geo_with_dem(
     model: RadarGeometryModel,
     azimuth_index: np.ndarray,
     range_index: np.ndarray,
-    dem: object,
+    dem: DEMSampler,
     *,
     height_seed_m: float = 0.0,
     max_iter: int = 20,
@@ -661,7 +677,7 @@ def rdr2geo_with_dem_chunked(
     model: RadarGeometryModel,
     azimuth_index: np.ndarray,
     range_index: np.ndarray,
-    dem: object,
+    dem: DEMSampler,
     *,
     chunk_size: tuple[int, int] = (512, 512),
     **kwargs,

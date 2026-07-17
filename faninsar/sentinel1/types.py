@@ -65,6 +65,7 @@ class S1Swath:
     orbit: OrbitMetadata
     doppler_centroid: tuple[DopplerCentroidPolynomial, ...]
     azimuth_fm_rate: tuple[tuple[datetime, float, tuple[float, ...]], ...]
+    azimuth_steering_rate_rad_s: float
 
 
 @dataclass(frozen=True, slots=True)

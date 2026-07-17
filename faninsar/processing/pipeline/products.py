@@ -114,7 +114,7 @@ def write_pair_stac_item(
             "datetime": datetime.now(UTC).isoformat(),
             "faninsar:pair_id": product.pair_id,
             "faninsar:shape": [height, width],
-            "faninsar:unwrap_method": product.metadata.get("unwrap_method", "irls"),
+            "faninsar:unwrap_method": product.metadata.get("unwrap_method", "snaphu"),
             **{f"faninsar:{k}": v for k, v in product.metadata.items()},
         },
         "assets": {

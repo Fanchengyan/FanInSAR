@@ -94,6 +94,47 @@ def test_geo2rdr_and_range_consistency_for_constructed_target() -> None:
     assert abs(result.range_index[0] - expected_rg) < 5.0
 
 
+def test_geo2rdr_uses_vectorized_orbit_interpolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Geo2rdr must not call scalar orbit interpolation for every pixel."""
+    from faninsar.processing.geometry.orbit import OrbitInterpolator
+
+    orbit, grid = _orbit_and_grid()
+    model = RadarGeometryModel.from_radar_grid(grid, orbit)
+    forward = rdr2geo_ellipsoid(
+        model,
+        np.arange(8, dtype=np.float64),
+        np.full(8, 10.0, dtype=np.float64),
+        height_m=0.0,
+    )
+
+    def reject_scalar_evaluation(*_args: object, **_kwargs: object) -> None:
+        message = "geo2rdr performed per-pixel orbit interpolation"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(OrbitInterpolator, "evaluate", reject_scalar_evaluation)
+    result = geo2rdr(
+        model,
+        forward.latitude_deg,
+        forward.longitude_deg,
+        forward.height_m,
+    )
+    assert np.any(result.converged)
+
+
+def test_geoid_adjusted_dem_adds_undulation() -> None:
+    """Orthometric and geoid samples combine into ellipsoidal height."""
+    from faninsar.processing.geometry import ConstantHeightDEM, GeoidAdjustedDEM
+
+    dem = GeoidAdjustedDEM(
+        orthometric_dem=ConstantHeightDEM(1000.0),
+        geoid=ConstantHeightDEM(-42.0),
+    )
+    height = dem.sample(np.array([30.0]), np.array([100.0]))
+    np.testing.assert_allclose(height, [958.0])
+
+
 def test_rdr2geo_ellipsoid_marks_out_of_orbit_as_not_converged() -> None:
     """Samples outside orbit coverage remain masked rather than invented."""
     orbit, grid = _orbit_and_grid()

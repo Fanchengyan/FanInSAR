@@ -26,6 +26,8 @@ from faninsar.sentinel1.annotation import parse_annotation_xml
 from faninsar.sentinel1.errors import Sentinel1ProductError
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from faninsar.sentinel1.types import S1Product, S1Swath
 
 FIXTURE_XML = (
@@ -104,6 +106,7 @@ def _make_synthetic_swath() -> tuple:
         orbit=swath.orbit,
         doppler_centroid=swath.doppler_centroid,
         azimuth_fm_rate=swath.azimuth_fm_rate,
+        azimuth_steering_rate_rad_s=swath.azimuth_steering_rate_rad_s,
     )
     return swath, memfile
 
@@ -112,7 +115,7 @@ class TestSyntheticFullBurst:
     """Fast unit tests against a 20x100 in-memory synthetic product."""
 
     @pytest.fixture(scope="class")
-    def swath(self) -> S1Swath:
+    def swath(self) -> Iterator[S1Swath]:
         """Yield a synthetic S1Swath backed by an in-memory TIFF."""
         swath, memfile = _make_synthetic_swath()
         yield swath
@@ -136,6 +139,16 @@ class TestSyntheticFullBurst:
         assert np.all(burst.valid_mask)
         assert burst.col0 == 0
         assert burst.samples.shape[1] == swath.samples
+
+    def test_read_full_burst_geocoding_layout_uses_divisible_valid_extent(
+        self, swath: S1Swath
+    ) -> None:
+        """Geocoding layout uses the InSAR.dev-compatible divisible extent."""
+        burst = read_full_burst(swath, burst_index=0, geocoding_layout=True)
+        assert burst.samples.shape == (8, 100)
+        assert burst.row0 == 0
+        assert burst.col0 == 0
+        assert np.all(burst.valid_mask)
 
     def test_read_full_burst_rejects_out_of_range_index(self, swath: S1Swath) -> None:
         """Negative or too-large burst indices raise Sentinel1ProductError."""

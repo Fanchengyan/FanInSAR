@@ -830,6 +830,7 @@ dependencies = [
     { name = "rioxarray", version = "0.20.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "rtree" },
     { name = "scipy" },
+    { name = "snaphu" },
     { name = "tomli-w" },
     { name = "torch" },
     { name = "tqdm" },
@@ -880,9 +881,6 @@ docs = [
     { name = "sphinx-copybutton" },
     { name = "sphinx-design" },
     { name = "sphinx-togglebutton" },
-]
-snaphu = [
-    { name = "snaphu" },
 ]
 test = [
     { name = "coverage" },
@@ -935,7 +933,7 @@ requires-dist = [
     { name = "rtree" },
     { name = "ruff", marker = "extra == 'code-style'" },
     { name = "scipy", specifier = ">=1.10" },
-    { name = "snaphu", marker = "extra == 'snaphu'", specifier = ">=0.4.1" },
+    { name = "snaphu", specifier = ">=0.4.1" },
     { name = "sphinx", marker = "extra == 'docs'", specifier = ">=7" },
     { name = "sphinx-copybutton", marker = "extra == 'docs'" },
     { name = "sphinx-design", marker = "extra == 'docs'" },
@@ -947,7 +945,7 @@ requires-dist = [
     { name = "xarray" },
     { name = "zarr", specifier = ">=3.0" },
 ]
-provides-extras = ["snaphu", "code-style", "test", "cloud", "docs", "dev"]
+provides-extras = ["code-style", "test", "cloud", "docs", "dev"]
 
 [[package]]
 name = "fastjsonschema"

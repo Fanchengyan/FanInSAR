@@ -16,6 +16,7 @@
     <productInformation>
       <rangeSamplingRate>64345238.12571428</rangeSamplingRate>
       <radarFrequency>5405000454.33435</radarFrequency>
+      <azimuthSteeringRate>1.397440</azimuthSteeringRate>
     </productInformation>
     <orbitList count="3">
       <orbit>

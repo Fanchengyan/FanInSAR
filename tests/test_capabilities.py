@@ -1,4 +1,4 @@
-"""Tests for optional backend capability reporting."""
+"""Tests for backend capability reporting."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 from subprocess import run
 
-from faninsar.capabilities import format_optional_backend_capabilities
+from faninsar.capabilities import format_backend_capabilities
 
 PROJECT_ROOT = Path(__file__).parents[1]
 
@@ -24,28 +24,27 @@ def test_base_import_does_not_load_snaphu() -> None:
 def test_capability_output_separates_availability_and_license_caveat() -> None:
     """Given capability output, then availability and licensing are distinct."""
     # Given / When
-    output = format_optional_backend_capabilities()
+    output = format_backend_capabilities()
 
     # Then
     assert "snaphu-py available:" in output
-    assert "snaphu-py wrapper version: unavailable" in output
-    assert "bundled SNAPHU version: unavailable" in output
+    assert "snaphu-py wrapper version: unavailable" not in output
+    assert "bundled SNAPHU version: unavailable" not in output
     assert "snaphu-py license caveat:" in output
-    assert "faninsar[snaphu]" in output
+    assert "snaphu-py install requirement: faninsar" in output
 
 
-def test_snaphu_is_an_optional_dependency_only() -> None:
-    """Given project metadata, then snaphu is present only in its extra."""
+def test_snaphu_is_a_runtime_dependency() -> None:
+    """Given project metadata, then production installs snaphu-py."""
     # Given
     metadata = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
 
     # When
     base_dependencies = metadata["project"]["dependencies"]
-    snaphu_dependencies = metadata["project"]["optional-dependencies"]["snaphu"]
 
     # Then
-    assert all(not dependency.startswith("snaphu") for dependency in base_dependencies)
-    assert snaphu_dependencies == ["snaphu>=0.4.1"]
+    assert "snaphu>=0.4.1" in base_dependencies
+    assert "snaphu" not in metadata["project"]["optional-dependencies"]
 
 
 def test_policy_artifacts_are_declared_for_wheel_installation() -> None:

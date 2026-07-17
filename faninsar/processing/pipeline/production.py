@@ -1,13 +1,9 @@
-"""Production S1 pair workflow.
-
-Stages: full-burst read → deramp → dense coreg+ESD → ifg → flatten →
-unwrap → geocode → write.
-"""
+"""Production Sentinel-1 pair workflows on radar or geographic grids."""
 
 from __future__ import annotations
 
 import gc
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -22,6 +18,7 @@ from faninsar.processing.coreg import (
     estimate_azimuth_shift_esd,
     refine_shift_with_correlation,
     resample_complex,
+    resample_complex_deramped_reramp,
 )
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import (
@@ -32,9 +29,15 @@ from faninsar.processing.geometry import (
 from faninsar.processing.geometry.baseline import BaselineComponents
 from faninsar.processing.interferometry.flatten import (
     compute_topographic_phase,
+    estimate_residual_azimuth_ramp,
+    remove_azimuth_phase_ramp,
     remove_topographic_phase,
 )
-from faninsar.processing.interferometry.pair import form_interferogram, goldstein_filter
+from faninsar.processing.interferometry.pair import (
+    form_interferogram,
+    goldstein_filter,
+    mask_invalid_looks,
+)
 from faninsar.processing.pipeline.products import (
     PairProductArrays,
     write_pair_stac_item,
@@ -42,9 +45,11 @@ from faninsar.processing.pipeline.products import (
 )
 from faninsar.processing.tops.carrier import carrier_from_swath
 from faninsar.processing.tops.deramp import TOPSCarrierModel, deramp, reramp
+from faninsar.processing.unwrap import SnaphuConfig
 from faninsar.processing.unwrap import unwrap as unwrap_dispatch
 from faninsar.sentinel1 import (
     open_safe_product,
+    read_eof_orbit,
     read_full_burst,
     read_swath_bursts,
     stitch_bursts,
@@ -52,6 +57,8 @@ from faninsar.sentinel1 import (
 
 if TYPE_CHECKING:
     from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
     from faninsar.processing.unwrap.common import CommonUnwrapResult
     from faninsar.sentinel1.io import BurstArray
     from faninsar.sentinel1.types import S1Burst, S1Product, S1Swath
@@ -60,6 +67,7 @@ logger = setup_logger(__name__)
 
 SPEED_OF_LIGHT_M_S = 299_792_458.0
 ScopeMode = Literal["burst", "swath"]
+CoregistrationGrid = Literal["radar", "geo"]
 
 
 def _scene_id(path: Path) -> str:
@@ -136,9 +144,23 @@ class ProductionPairState:
     connected_components: np.ndarray | None = None
     baseline: BaselineComponents | None = None
     geocoded: dict[str, np.ndarray] | None = None
+    geo2rdr_lut: Geo2RdrLUT | None = None
+    geo_height_field: np.ndarray | None = None
+    geo_grid: GeoGridSpec | None = None
+    reference_geocoded_slc: np.ndarray | None = None
+    secondary_geocoded_slc: np.ndarray | None = None
+    geocoded_slc_valid: np.ndarray | None = None
     zarr_path: Path | None = None
     stac_path: Path | None = None
     log: list[str] = field(default_factory=list)
+    coregistration_grid: CoregistrationGrid = "radar"
+    dem_id: str = ""
+    coreg_executor: str = "serial"
+    coreg_device: str = "auto"
+    multilook: tuple[int, int] = (4, 20)
+    goldstein_alpha: float = 0.5
+    unwrap_method: str = "snaphu"
+    geo_grid_meta: dict[str, Any] | None = None
 
     def note(self, message: str) -> None:
         """Append a stage log line."""
@@ -153,6 +175,8 @@ def load_production_scene(
     scope: ScopeMode = "burst",
     burst_index: int = 0,
     dem: DEMSampler | None = None,
+    orbit_path: str | Path | None = None,
+    coregistration_grid: CoregistrationGrid = "radar",
 ) -> ProductionScene:
     """Load a full burst or full stitched sub-swath for production processing.
 
@@ -168,6 +192,10 @@ def load_production_scene(
         Burst index when ``scope="burst"``.
     dem : DEMSampler, optional
         DEM used only to attach geometry context (not required for load).
+    orbit_path : path, optional
+        Precise ESA EOF orbit. Annotation orbit vectors are used when omitted.
+    coregistration_grid : {"radar", "geo"}, optional
+        Select the burst sample layout required by the coregistration grid.
 
     Returns
     -------
@@ -178,8 +206,14 @@ def load_production_scene(
     _ = dem
     product = open_safe_product(path)
     s1_swath = product.swath(swath)
+    if orbit_path is not None:
+        s1_swath = replace(s1_swath, orbit=read_eof_orbit(orbit_path))
     if scope == "burst":
-        array = read_full_burst(s1_swath, burst_index=burst_index)
+        array = read_full_burst(
+            s1_swath,
+            burst_index=burst_index,
+            geocoding_layout=coregistration_grid == "geo",
+        )
         burst = s1_swath.bursts[burst_index]
     elif scope == "swath":
         bursts = read_swath_bursts(s1_swath)
@@ -250,8 +284,12 @@ def stage_coregister(
     esd_enabled: bool = True,
     executor: str = "serial",
     device: str = "auto",
+    coregistration_grid: CoregistrationGrid = "radar",
+    geo_grid: GeoGridSpec | None = None,
+    geo_height_m: float = 0.0,
+    geo_chunk_size: int = 40,
 ) -> ProductionPairState:
-    """Dense geometry offsets + ESD az residual + amplitude residual + resample.
+    """Estimate dense offsets and coregister on a radar or geographic grid.
 
     Memory notes
     ------------
@@ -277,6 +315,14 @@ def stage_coregister(
     device : {"auto","cpu","cuda"}, optional
         Torch device when ``executor="dask-torch"``. ``"auto"`` resolves to
         CUDA if available else CPU (never MPS). Default ``"auto"``.
+    coregistration_grid : {"radar", "geo"}, optional
+        Grid on which both aligned SLCs are produced.
+    geo_grid : GeoGridSpec, optional
+        Native-resolution SLC grid required for geographic coregistration.
+    geo_height_m : float, optional
+        Fallback ellipsoidal height for geographic coregistration.
+    geo_chunk_size : int, optional
+        Geo2rdr row chunk size.
 
     """
     if state.reference_deramped is None or state.secondary_deramped is None:
@@ -304,25 +350,26 @@ def stage_coregister(
         stride=control_spacing,
     )
 
-    # Amplitude residual around geometry mean
     prior_rg = float(
         np.nanmedian(geometry_field.range_offset_px[geometry_field.coverage])
     )
     prior_az = float(
         np.nanmedian(geometry_field.azimuth_offset_px[geometry_field.coverage])
     )
-    amp_rg, amp_az = refine_shift_with_correlation(
-        ref,
-        sec,
-        prior_rg=prior_rg,
-        prior_az=prior_az,
-        search_radius=32,
-    )
-    amp_res_rg = amp_rg - prior_rg
-    amp_res_az = amp_az - prior_az
-
+    amp_res_rg = 0.0
+    amp_res_az = 0.0
     esd_az = 0.0
-    if esd_enabled:
+    if coregistration_grid == "radar":
+        amp_rg, amp_az = refine_shift_with_correlation(
+            ref,
+            sec,
+            prior_rg=prior_rg,
+            prior_az=prior_az,
+            search_radius=32,
+        )
+        amp_res_rg = amp_rg - prior_rg
+        amp_res_az = amp_az - prior_az
+    if coregistration_grid == "radar" and esd_enabled:
         # Bilinear pre-align is sufficient for ESD spectral estimation and
         # avoids a second full-burst Lanczos pass (~minutes and peak RSS).
         pre = resample_complex(
@@ -348,22 +395,6 @@ def stage_coregister(
     del geometry_field
     gc.collect()
 
-    sec_resamp = resample_complex(
-        sec,
-        range_offset_px=offsets.range_offset_px,
-        azimuth_offset_px=offsets.azimuth_offset_px,
-        executor=executor,
-        device=device,
-    )
-    # Secondary deramped no longer needed after final resample.
-    state.secondary_deramped = None
-    del sec
-    gc.collect()
-
-    # Reramp onto reference carrier
-    state.reference_deramped = reramp(ref, state.reference.carrier)
-    state.secondary_aligned = reramp(sec_resamp, state.reference.carrier)
-    del sec_resamp, ref
     state.range_shift_px = float(
         np.nanmedian(offsets.range_offset_px[offsets.coverage])
     )
@@ -371,12 +402,98 @@ def stage_coregister(
         np.nanmedian(offsets.azimuth_offset_px[offsets.coverage])
     )
     coverage = float(np.mean(offsets.coverage))
-    del offsets
+    if coregistration_grid == "geo":
+        if geo_grid is None:
+            reject_invalid_state("geo coregistration requires geo_grid")
+        from faninsar.processing.pipeline.geo_lut import build_geo2rdr_lut
+        from faninsar.processing.pipeline.geo_modes import (
+            coregister_geocoded_slcs,
+        )
+        from faninsar.processing.pipeline.geo_resample import (
+            compose_secondary_coordinates,
+        )
+
+        lut = build_geo2rdr_lut(
+            geometry=state.reference.geometry,
+            grid=geo_grid,
+            full_radar_shape=ref.shape,
+            height_m=geo_height_m,
+            dem=state.dem,
+            chunk_size=geo_chunk_size,
+        )
+        reference_geo, secondary_geo, valid = coregister_geocoded_slcs(
+            ref,
+            sec,
+            reference_carrier=state.reference.carrier,
+            secondary_carrier=state.secondary.carrier,
+            reference_lut=lut,
+            offsets=offsets,
+            executor=executor,
+            device=device,
+        )
+        secondary_azimuth, _secondary_range, coordinate_valid = (
+            compose_secondary_coordinates(lut, offsets)
+        )
+        topo_phase = np.full(lut.shape, np.nan, dtype=np.float64)
+        for row_start in range(0, lut.shape[0], geo_chunk_size):
+            row_stop = min(row_start + geo_chunk_size, lut.shape[0])
+            rows = slice(row_start, row_stop)
+            topo_phase[rows] = compute_topographic_phase(
+                state.reference.geometry,
+                state.secondary.geometry,
+                lut.az_full[rows],
+                lut.rg_full[rows],
+                state.dem,
+                secondary_azimuth_index=secondary_azimuth[rows],
+            )
+        valid &= coordinate_valid & np.isfinite(topo_phase)
+        secondary_geo *= np.exp(1j * topo_phase).astype(np.complex64)
+        invalid = np.complex64(np.nan + 1j * np.nan)
+        reference_geo = np.where(valid, reference_geo, invalid).astype(np.complex64)
+        secondary_geo = np.where(valid, secondary_geo, invalid).astype(np.complex64)
+        state.reference_geocoded_slc = reference_geo
+        state.secondary_geocoded_slc = secondary_geo
+        state.geocoded_slc_valid = valid
+        state.reference_deramped = reference_geo
+        state.secondary_deramped = None
+        state.secondary_aligned = secondary_geo
+        state.geo2rdr_lut = lut
+        state.geo_grid = geo_grid
+        state.topo_phase = topo_phase.astype(np.float32)
+        from faninsar.processing.pipeline.geo_lut import grid_lonlat
+
+        latitude, longitude = grid_lonlat(geo_grid)
+        state.geo_height_field = np.asarray(
+            state.dem.sample(latitude, longitude),
+            dtype=np.float64,
+        )
+        del ref, sec, offsets
+        gc.collect()
+        state.note(
+            f"COREG geo grid={geo_grid.shape} median_rg={state.range_shift_px:.3f} "
+            f"median_az={state.azimuth_shift_px:.3f} "
+            f"coverage={float(valid.mean()):.3f} "
+            "(two deramped single-remaps + fractional reramp + SLC flatten)"
+        )
+        return state
+
+    sec_resamp = resample_complex_deramped_reramp(
+        sec,
+        secondary_carrier=state.secondary.carrier,
+        range_offset_px=offsets.range_offset_px,
+        azimuth_offset_px=offsets.azimuth_offset_px,
+        executor=executor,
+        device=device,
+    )
+    state.secondary_deramped = None
+    state.reference_deramped = reramp(ref, state.reference.carrier)
+    state.secondary_aligned = sec_resamp
+    del sec_resamp, sec, ref, offsets
     gc.collect()
     state.note(
         f"COREG dense+ESD+amp median_rg={state.range_shift_px:.3f} "
         f"median_az={state.azimuth_shift_px:.3f} "
-        f"coverage={coverage:.3f}"
+        f"coverage={coverage:.3f} (deramped single-remap + fractional reramp)"
     )
     return state
 
@@ -387,7 +504,18 @@ def stage_interferogram(
     multilook: tuple[int, int] = (4, 20),
     goldstein_alpha: float = 0.5,
 ) -> ProductionPairState:
-    """Form multilooked interferogram and apply Goldstein filter."""
+    """Form multilooked interferogram and apply Goldstein filter.
+
+    Parameters
+    ----------
+    state : ProductionPairState
+        Pair state after coregistration.
+    multilook : tuple[int, int], optional
+        Non-overlapping azimuth and range look factors.
+    goldstein_alpha : float, optional
+        Goldstein filter exponent.
+
+    """
     if state.reference_deramped is None or state.secondary_aligned is None:
         reject_invalid_state("interferogram requires coregister")
     ifg = form_interferogram(
@@ -395,16 +523,25 @@ def stage_interferogram(
         state.secondary_aligned,
         multilook=multilook,
     )
-    # Full-res SLCs no longer needed once multilooked ifg/coherence exist.
     state.reference_deramped = None
     state.secondary_aligned = None
     gc.collect()
-    filtered = goldstein_filter(ifg.complex_ifg, alpha=goldstein_alpha)
-    state.complex_ifg = filtered.astype(np.complex64, copy=False)
-    state.coherence = ifg.coherence
-    state.wrapped_phase = np.angle(filtered).astype(np.float32)
+    # alpha=0 is not a no-op in the windowed Goldstein implementation (Hann
+    # taper still smooths). Skip the filter entirely so high-rate geometric
+    # fringes stay intact for flattening.
+    if goldstein_alpha > 0.0:
+        complex_ifg = goldstein_filter(ifg.complex_ifg, alpha=goldstein_alpha)
+    else:
+        complex_ifg = ifg.complex_ifg
+    complex_ifg, coherence, wrapped = mask_invalid_looks(complex_ifg, ifg.coherence)
+    state.complex_ifg = complex_ifg
+    state.coherence = coherence if coherence is not None else ifg.coherence
+    state.wrapped_phase = wrapped
+    n_invalid = int(np.isnan(state.wrapped_phase).sum())
     state.note(
-        f"IFG multilook={multilook} mean_coh={float(np.nanmean(ifg.coherence)):.3f}"
+        f"IFG multilook={multilook} goldstein={goldstein_alpha} "
+        f"mean_coh={float(np.nanmean(state.coherence)):.3f} "
+        f"invalid_looks={n_invalid}"
     )
     return state
 
@@ -414,16 +551,15 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
     if state.complex_ifg is None:
         reject_invalid_state("flatten requires interferogram")
     height, width = state.complex_ifg.shape
-    # Multilooked grid: approximate geometry by scaling indices
-    # Use reference geometry on the multilooked sampling lattice
-    az = np.arange(height, dtype=np.float64)
-    rg = np.arange(width, dtype=np.float64)
-    # Scale factors from full-res to multilooked (approximate uniform)
+    # Multilooked grid → full-res radar indices on the geometry model.
+    # Geometry (0,0) is the array origin (already cropped). Use look-window
+    # centres rather than leading edges so path-length phase matches the
+    # multilooked ifg sampling.
     full_h, full_w = state.reference.array.samples.shape
-    az_scale = full_h / max(height, 1)
-    rg_scale = full_w / max(width, 1)
-    az_full = az * az_scale
-    rg_full = rg * rg_scale
+    az_looks = max(full_h // max(height, 1), 1)
+    rg_looks = max(full_w // max(width, 1), 1)
+    az_full = (np.arange(height, dtype=np.float64) + 0.5) * az_looks - 0.5
+    rg_full = (np.arange(width, dtype=np.float64) + 0.5) * rg_looks - 0.5
     az_grid, rg_grid = np.meshgrid(az_full, rg_full, indexing="ij")
 
     topo = compute_topographic_phase(
@@ -433,10 +569,35 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
         rg_grid,
         state.dem,
     )
+    # Residual Doppler / differential TOPS carrier leaves a near-linear
+    # azimuth phase ramp on the original-domain ifg. Estimate it against the
+    # path-length geometric model and remove it from the unflattened product.
+    az_ramp = estimate_residual_azimuth_ramp(
+        state.complex_ifg,
+        topo,
+        coherence=state.coherence,
+    )
+    if abs(az_ramp) > 1e-6:
+        state.complex_ifg = remove_azimuth_phase_ramp(state.complex_ifg, az_ramp)
+        state.note(f"FLATTEN residual_az_ramp={az_ramp:.5f} rad/az_sample")
+
     flat = remove_topographic_phase(state.complex_ifg, topo)
     state.topo_phase = topo.astype(np.float32)
-    state.complex_ifg_flat = flat.astype(np.complex64, copy=False)
-    state.wrapped_phase = np.angle(flat).astype(np.float32)
+    # Keep invalid looks as NaN through ramp/topo multiply (0·e^{iφ}=0 would
+    # otherwise repaint a solid phase=0 black edge on the burst margin).
+    # Remask the ramp-corrected unflattened ifg for intermediate products.
+    state.complex_ifg, state.coherence, _ = mask_invalid_looks(
+        state.complex_ifg, state.coherence
+    )
+    # wrapped_phase must track the flattened product that stage_write archives
+    # as complex_ifg (complex_ifg_flat), not the unflattened angle.
+    flat_masked, coh_flat, wrapped_flat = mask_invalid_looks(
+        flat.astype(np.complex64, copy=False), state.coherence
+    )
+    state.complex_ifg_flat = flat_masked
+    if coh_flat is not None:
+        state.coherence = coh_flat
+    state.wrapped_phase = wrapped_flat
     topo_finite = topo[np.isfinite(topo)]
     if topo_finite.size:
         rms = float(np.std(topo_finite))
@@ -450,9 +611,9 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
 def stage_unwrap(
     state: ProductionPairState,
     *,
-    method: Literal["irls", "dct_irls", "snaphu"] = "irls",
+    config: SnaphuConfig | None = None,
 ) -> ProductionPairState:
-    """Unwrap flattened interferogram with explicit backend selection."""
+    """Unwrap the flattened interferogram with snaphu-py."""
     ifg = (
         state.complex_ifg_flat
         if state.complex_ifg_flat is not None
@@ -463,7 +624,8 @@ def stage_unwrap(
     result: CommonUnwrapResult = unwrap_dispatch(
         ifg,
         state.coherence,
-        method=method,
+        method="snaphu",
+        snaphu_config=config,
     )
     state.unwrapped_phase = result.unwrapped_phase
     state.connected_components = result.connected_components
@@ -559,7 +721,15 @@ def stage_write(
     except (TypeError, AttributeError):
         temporal_days = float("nan")
     meta: dict[str, Any] = {
-        "unwrap_method": "irls",
+        "unwrap_method": state.unwrap_method,
+        "coregistration_grid": state.coregistration_grid,
+        "dem_id": state.dem_id,
+        "multilook": list(state.multilook),
+        "goldstein_alpha": state.goldstein_alpha,
+        "coreg_executor": state.coreg_executor,
+        "coreg_device": state.coreg_device,
+        "lanczos_a": 4,
+        "geo_grid": state.geo_grid_meta,
         "range_shift_px": state.range_shift_px,
         "azimuth_shift_px": state.azimuth_shift_px,
         "esd_azimuth_shift_px": state.esd_azimuth_shift_px,
@@ -592,6 +762,58 @@ def stage_write(
     )
     out = Path(output_dir)
     zarr_path = write_pair_zarr(product, out / f"{state.pair_id}.zarr")
+    if (
+        state.reference_geocoded_slc is not None
+        and state.secondary_geocoded_slc is not None
+        and state.geo_grid is not None
+    ):
+        import zarr
+
+        root = zarr.open_group(str(zarr_path), mode="a")
+        slc = root.require_group("slc")
+        slc.create_array(
+            "reference",
+            data=state.reference_geocoded_slc,
+            overwrite=True,
+        )
+        slc.create_array(
+            "secondary",
+            data=state.secondary_geocoded_slc,
+            overwrite=True,
+        )
+        if state.geocoded_slc_valid is not None:
+            slc.create_array(
+                "valid",
+                data=state.geocoded_slc_valid.astype(np.uint8),
+                overwrite=True,
+            )
+        x, y = state.geo_grid.xy_pixel_centers()
+        slc.create_array("x", data=x[0].astype(np.float64), overwrite=True)
+        slc.create_array("y", data=y[:, 0].astype(np.float64), overwrite=True)
+        slc.attrs.update(
+            {
+                "crs": state.geo_grid.crs,
+                "transform": list(state.geo_grid.transform),
+                "phase_domain": "reramped_flattened",
+            }
+        )
+        if state.geo2rdr_lut is not None:
+            transform = root.require_group("transform")
+            transform.create_array(
+                "reference_azimuth_index",
+                data=state.geo2rdr_lut.az_full,
+                overwrite=True,
+            )
+            transform.create_array(
+                "reference_range_index",
+                data=state.geo2rdr_lut.rg_full,
+                overwrite=True,
+            )
+            transform.create_array(
+                "valid",
+                data=state.geo2rdr_lut.valid.astype(np.uint8),
+                overwrite=True,
+            )
     if state.geocoded is not None:
         import zarr
 
@@ -672,6 +894,71 @@ def stage_write(
     return state
 
 
+def _dem_id(dem: DEMSampler) -> str:
+    """Stable DEM identity string for product provenance."""
+    name = type(dem).__name__
+    path = getattr(dem, "path", None)
+    if path is not None:
+        return f"{name}:{Path(path)}"
+    height = getattr(dem, "height_m", None)
+    if height is not None:
+        return f"{name}:{float(height)}"
+    return name
+
+
+def _geo_grid_meta(geo_grid: GeoGridSpec | None) -> dict[str, Any] | None:
+    """Serialize GeoGridSpec fields for Zarr/STAC metadata."""
+    if geo_grid is None:
+        return None
+    return {
+        "crs": geo_grid.crs,
+        "transform": list(geo_grid.transform),
+        "width": geo_grid.width,
+        "height": geo_grid.height,
+        "resolution_m": list(geo_grid.resolution_m),
+    }
+
+
+def _multilooked_geo_grid(
+    grid: GeoGridSpec,
+    multilook: tuple[int, int],
+) -> GeoGridSpec:
+    """Return the pixel-centre-aligned product grid after block multilooking."""
+    from faninsar.processing.merge.grid import GeoGridSpec
+
+    azimuth_looks, range_looks = multilook
+    x0, dx, x_skew, y0, y_skew, dy = grid.transform
+    return GeoGridSpec(
+        crs=grid.crs,
+        transform=(x0, dx * range_looks, x_skew, y0, y_skew, dy * azimuth_looks),
+        width=grid.width // range_looks,
+        height=grid.height // azimuth_looks,
+        resolution_m=(
+            grid.resolution_m[0] * range_looks,
+            grid.resolution_m[1] * azimuth_looks,
+        ),
+    )
+
+
+def _multilook_real_field(
+    field: np.ndarray,
+    multilook: tuple[int, int],
+) -> np.ndarray:
+    """Average a real geographic field over the SLC multilook blocks."""
+    azimuth_looks, range_looks = multilook
+    height = field.shape[0] // azimuth_looks * azimuth_looks
+    width = field.shape[1] // range_looks * range_looks
+    return np.nanmean(
+        field[:height, :width].reshape(
+            height // azimuth_looks,
+            azimuth_looks,
+            width // range_looks,
+            range_looks,
+        ),
+        axis=(1, 3),
+    )
+
+
 def run_production_pair(
     reference_path: str | Path,
     secondary_path: str | Path,
@@ -683,25 +970,23 @@ def run_production_pair(
     dem: DEMSampler | None = None,
     multilook: tuple[int, int] = (4, 20),
     goldstein_alpha: float = 0.5,
-    unwrap_method: Literal["irls", "dct_irls", "snaphu"] = "irls",
+    snaphu_config: SnaphuConfig | None = None,
     esd_enabled: bool = True,
     control_spacing: int = 64,
     executor: str = "serial",
     device: str = "auto",
+    coregistration_grid: CoregistrationGrid = "radar",
+    geo_grid: GeoGridSpec | None = None,
+    geo_height_m: float = 0.0,
+    geo_chunk_size: int = 40,
+    reference_orbit_path: str | Path | None = None,
+    secondary_orbit_path: str | Path | None = None,
 ) -> ProductionPairState:
     """Run the full production pair chain on full burst or full swath.
 
-    Stages
-    ------
-    1. Load full burst/swath + carrier + geometry
-    2. Deramp
-    3. Dense geometry coreg + ESD + amplitude residual + resample + reramp
-    4. Interferogram + multilook + Goldstein
-    5. Topographic flattening (DEM)
-    6. Unwrap (IRLS or snaphu)
-    7. Baseline metadata
-    8. Chunked vectorized geocode
-    9. Write Zarr/STAC with bbox
+    ``coregistration_grid="radar"`` aligns the secondary SLC to the reference
+    radar grid and defers geocoding. ``coregistration_grid="geo"`` remaps both
+    deramped SLCs once onto ``geo_grid`` and analytically reramps them there.
 
     Parameters
     ----------
@@ -718,23 +1003,33 @@ def run_production_pair(
     dem : DEMSampler, optional
         DEM for coreg/flatten/geocode. Defaults to zero ellipsoid.
     multilook : tuple[int, int], optional
-        ``(az, rg)`` looks.
+        ``(az, rg)`` looks (radar path).
     goldstein_alpha : float, optional
         Goldstein filter exponent (default 0.5).
-    unwrap_method : {"irls", "dct_irls", "snaphu"}, optional
-        Explicit unwrap backend passed to :func:`stage_unwrap`. Default
-        ``"irls"``.
+    snaphu_config : SnaphuConfig, optional
+        snaphu-py configuration. By default, ``nlooks`` is the product of the
+        azimuth and range multilook factors.
     esd_enabled : bool, optional
         Enable spectral diversity azimuth residual.
     control_spacing : int, optional
         Geometry control-point spacing in pixels.
     executor : {"serial", "dask-torch"}, optional
-        Lanczos compute path for the final coreg resample
-        (:func:`stage_coregister`). Default ``"serial"`` preserves prior
-        behaviour.
+        Lanczos compute path for coregistration and geo-grid interpolation.
+        Default ``"serial"``.
     device : {"auto","cpu","cuda","mps"}, optional
         Torch device when ``executor="dask-torch"``. ``"auto"`` selects CUDA
         when available, otherwise CPU/NumPy fallback. Default ``"auto"``.
+    coregistration_grid : {"radar", "geo"}, optional
+        Coordinate grid on which the two SLCs are coregistered.
+    geo_grid : GeoGridSpec, optional
+        Native-resolution geocoded SLC grid required for ``"geo"``.
+    geo_height_m : float, optional
+        Fallback constant height (m) when DEM is unavailable for geo2rdr.
+        A real DEM should be supplied for production. Default 0.
+    geo_chunk_size : int, optional
+        Row chunk for geo2rdr. Default 40.
+    reference_orbit_path, secondary_orbit_path : path, optional
+        Precise ESA EOF orbits for the two acquisitions.
 
     Returns
     -------
@@ -742,13 +1037,24 @@ def run_production_pair(
         Full state with products and stage log.
 
     """
+    from faninsar.processing.pipeline.geo_lut import grid_lonlat
+
     dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    if coregistration_grid == "geo" and geo_grid is None:
+        reject_invalid_state("coregistration_grid='geo' requires geo_grid")
+    if coregistration_grid == "geo" and scope != "burst":
+        reject_invalid_state(
+            f"coregistration_grid='geo' requires scope='burst'; got scope={scope!r}"
+        )
+
     reference = load_production_scene(
         reference_path,
         swath=swath,
         scope=scope,
         burst_index=burst_index,
         dem=dem_sampler,
+        orbit_path=reference_orbit_path,
+        coregistration_grid=coregistration_grid,
     )
     secondary = load_production_scene(
         secondary_path,
@@ -756,14 +1062,24 @@ def run_production_pair(
         scope=scope,
         burst_index=burst_index,
         dem=dem_sampler,
+        orbit_path=secondary_orbit_path,
+        coregistration_grid=coregistration_grid,
     )
     state = ProductionPairState(
         pair_id=f"{reference.scene_id}_{secondary.scene_id}",
         reference=reference,
         secondary=secondary,
         dem=dem_sampler,
+        coregistration_grid=coregistration_grid,
+        dem_id=_dem_id(dem_sampler),
+        coreg_executor=str(executor),
+        coreg_device=str(device),
+        multilook=tuple(int(x) for x in multilook),
+        goldstein_alpha=float(goldstein_alpha),
+        unwrap_method="snaphu",
+        geo_grid_meta=_geo_grid_meta(geo_grid),
     )
-    state.note(f"START production pair scope={scope}")
+    state.note(f"START scope={scope} coregistration_grid={coregistration_grid}")
     state = stage_deramp(state)
     state = stage_coregister(
         state,
@@ -771,16 +1087,52 @@ def run_production_pair(
         esd_enabled=esd_enabled,
         executor=executor,
         device=device,
+        coregistration_grid=coregistration_grid,
+        geo_grid=geo_grid,
+        geo_height_m=geo_height_m,
+        geo_chunk_size=geo_chunk_size,
     )
     state = stage_interferogram(
         state,
         multilook=multilook,
         goldstein_alpha=goldstein_alpha,
     )
-    state = stage_flatten(state)
-    state = stage_unwrap(state, method=unwrap_method)
+    if coregistration_grid == "radar":
+        state = stage_flatten(state)
+    else:
+        state.complex_ifg_flat = state.complex_ifg
+        state.note("FLATTEN applied to secondary geocoded SLC before IFG formation")
+    if snaphu_config is None:
+        snaphu_config = SnaphuConfig(nlooks=float(multilook[0] * multilook[1]))
+    state = stage_unwrap(state, config=snaphu_config)
     state = stage_baseline(state)
-    state = stage_geocode(state)
+    if coregistration_grid == "geo":
+        assert geo_grid is not None
+        assert state.unwrapped_phase is not None
+        assert state.coherence is not None
+        assert state.wrapped_phase is not None
+        product_grid = _multilooked_geo_grid(geo_grid, multilook)
+        lat, lon = grid_lonlat(product_grid)
+        converged = np.isfinite(state.unwrapped_phase).astype(np.uint8)
+        height_field = state.geo_height_field
+        if height_field is None:
+            height_field = np.full(
+                product_grid.shape,
+                float(geo_height_m),
+                dtype=np.float64,
+            )
+        elif height_field.shape != product_grid.shape:
+            height_field = _multilook_real_field(height_field, multilook)
+        state.geocoded = {
+            "unwrapped_phase": np.asarray(state.unwrapped_phase, dtype=np.float32),
+            "coherence": np.asarray(state.coherence, dtype=np.float32),
+            "wrapped_phase": np.asarray(state.wrapped_phase, dtype=np.float32),
+            "latitude_deg": lat.astype(np.float64),
+            "longitude_deg": lon.astype(np.float64),
+            "height_m": np.asarray(height_field, dtype=np.float64),
+            "converged": converged,
+        }
+        state.note("GEO products complete on multilooked geographic grid")
     state = stage_write(state, output_dir)
     state.note("DONE")
     return state

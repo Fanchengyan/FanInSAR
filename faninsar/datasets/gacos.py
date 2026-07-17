@@ -30,13 +30,13 @@ class GACOS(ApsDataset):
     >>> from faninsar.datasets import HyP3
     >>> from faninsar.query import BoundingBox, Points
 
-    >>> hyp3_dir = Path("/Volumes/Data/Hyp3/descending_roi")
-    >>> home_dir = Path("/Volumes/Data/Hyp3/descending_gacos")
-    >>> out_dir = Path("/Volumes/Data/Hyp3/descending_gacos_pairs")
+    >>> hyp3_dir = Path("data/hyp3/descending_roi")
+    >>> home_dir = Path("data/hyp3/descending_gacos")
+    >>> out_dir = Path("data/hyp3/descending_gacos_pairs")
 
     prepare reference points and roi (region of interest)
 
-    >>> ref_points_file = Path("/Volumes/Data/ARPs.geojson")
+    >>> ref_points_file = Path("data/reference_points.geojson")
     >>> ref_points = Points.from_file(ref_points_file)
     >>> roi = BoundingBox(98.57726618, 38.52546262, 99.41100273, 39.13802703, crs=4326)
 

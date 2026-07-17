@@ -99,7 +99,7 @@ def _interpolate_field(
     )
     height, width = shape
     # Tile azimuth so the (N, 2) query buffer never holds a full S1 burst
-    # (~30M points × 16 B ≈ 0.5 GB) at once alongside other offset fields.
+    # (~30M points x 16 B is about 0.5 GB) beside other offset fields.
     out = np.empty(shape, dtype=np.float64)
     row_chunk = 128
     col_idx = np.arange(width, dtype=np.float64)
@@ -227,10 +227,17 @@ def dense_geometry_offsets(
     # Valid only where both transforms converged
     valid = geo_valid & sec_rdr.converged
 
-    # Compute offsets: secondary_index - reference_index
-    # Positive offset means secondary is at larger index => shift secondary backward
-    rg_offset_ctrl = sec_rdr.range_index - rg_grid
-    az_offset_ctrl = sec_rdr.azimuth_index - az_grid
+    # Offsets for :func:`resample_complex`, which samples
+    # ``source = output_index - offset`` on the secondary.
+    # Same ground point is at ``ref_index`` on the reference and
+    # ``sec_index`` on the secondary, so we need
+    # ``source = sec_index`` when ``output = ref_index``:
+    # ``offset = ref_index - sec_index``.
+    # (Previously the opposite sign was used, which mis-registered the
+    # secondary by about twice the geometric shift and destroyed interferogram
+    # coherence on real Sentinel-1 pairs.)
+    rg_offset_ctrl = rg_grid - sec_rdr.range_index
+    az_offset_ctrl = az_grid - sec_rdr.azimuth_index
 
     # Mask invalid control points before interpolation
     rg_offset_ctrl = np.where(valid, rg_offset_ctrl, np.nan)

@@ -10,6 +10,10 @@ from scipy.ndimage import map_coordinates
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.resampling import lanczos_resample
+from faninsar.processing.tops.deramp import (
+    TOPSCarrierModel,
+    carrier_phase_at_points,
+)
 
 logger = setup_logger(__name__)
 
@@ -299,14 +303,17 @@ def resample_complex(
 
         chunk_size = int(DEFAULT_LANCZOS_CHUNK)
         if not use_dask:
-            dev = _resolve_torch_device(device)
-            if dev is not None:
+            resolved_device = _resolve_torch_device(device)
+            if resolved_device is not None:
                 import torch
 
+                if not isinstance(resolved_device, torch.device):
+                    reject_invalid_state("resolved torch device has an invalid type")
+                dev = resolved_device
                 data_t = torch.from_numpy(np.ascontiguousarray(samples)).to(
-                    dev, non_blocking=True
+                    resolved_device, non_blocking=True
                 )
-                if getattr(dev, "type", None) == "cuda":
+                if resolved_device.type == "cuda":
                     torch.cuda.synchronize()
 
     out = np.empty((height, width), dtype=samples.dtype)
@@ -375,5 +382,128 @@ def resample_complex(
         if data_t is not None:
             del data_t
             _cleanup_gpu(dev)
+
+    return out
+
+
+def resample_complex_deramped_reramp(
+    sec_deramped: np.ndarray,
+    *,
+    secondary_carrier: TOPSCarrierModel,
+    range_offset_px: np.ndarray | float,
+    azimuth_offset_px: np.ndarray | float,
+    lanczos_a: int = 4,
+    row_chunk: int = 64,
+    executor: str = "serial",
+    device: str = "auto",
+    output_carrier: TOPSCarrierModel | None = None,
+) -> np.ndarray:
+    """Resample a deramped secondary onto the reference grid, then analytical reramp.
+
+    1. Resample the **deramped** secondary (carrier removed, signal stationary)
+       with the existing phase-preserving Lanczos kernel — no per-tap carrier
+       work, the kernel sees a band-limited stationary signal.
+    2. Apply the secondary carrier back at the **source** fractional
+       coordinates ``output_index - offset`` via
+       :func:`carrier_phase_at_points` (analytical polynomial), **not** by
+       interpolating an integer-grid carrier plane. The latter is what
+       collapsed to 65 rad in §6 because ``map_coordinates(order=1)``
+       bilinearly interpolates the ~0.17 rad/pixel azimuth carrier.
+
+    The output lives in the original focused-SLC phase domain, ready for
+    interferogram formation against the reramped reference.
+
+    Parameters
+    ----------
+    sec_deramped : numpy.ndarray
+        Secondary complex samples with the TOPS carrier already removed
+        (``deramp(sec, secondary_carrier)``).
+    secondary_carrier : TOPSCarrierModel
+        Carrier model of the secondary burst (native grid geometry).
+    range_offset_px, azimuth_offset_px : array or float
+        Offsets of the secondary relative to the reference grid
+        (``source = output_index - offset``), same convention as
+        :func:`resample_complex`.
+    lanczos_a : int, optional
+        Lanczos half-width. Default 4.
+    row_chunk : int, optional
+        Azimuth rows processed per tile. Default 64.
+    executor : {"serial", "dask-torch"}, optional
+        Complex interpolation executor.
+    device : {"auto", "cpu", "cuda"}, optional
+        Compute device for the dask-torch executor.
+    output_carrier : TOPSCarrierModel, optional
+        Carrier on the output reference grid. When omitted, the secondary
+        carrier is evaluated at source coordinates.
+
+    Returns
+    -------
+    numpy.ndarray
+        Complex secondary on the reference grid in the original phase domain.
+
+    """
+    if sec_deramped.ndim != 2 or not np.iscomplexobj(sec_deramped):
+        reject_invalid_state("deramped resample requires a 2-D complex array")
+    if row_chunk < 1:
+        reject_invalid_state("row_chunk must be >= 1")
+    height, width = sec_deramped.shape
+    az_off = np.asarray(azimuth_offset_px, dtype=np.float64)
+    rg_off = np.asarray(range_offset_px, dtype=np.float64)
+    scalar_az = az_off.ndim == 0
+    scalar_rg = rg_off.ndim == 0
+    if not scalar_az and az_off.shape != (height, width):
+        reject_invalid_state("azimuth_offset_px must be scalar or match samples shape")
+    if not scalar_rg and rg_off.shape != (height, width):
+        reject_invalid_state("range_offset_px must be scalar or match samples shape")
+
+    centre_row = float(height // 2)
+    out = np.empty((height, width), dtype=sec_deramped.dtype)
+    col_idx = np.arange(width, dtype=np.float64)
+    remapped_deramped = None
+    if executor != "serial":
+        remapped_deramped = resample_complex(
+            sec_deramped,
+            range_offset_px=range_offset_px,
+            azimuth_offset_px=azimuth_offset_px,
+            lanczos_a=lanczos_a,
+            row_chunk=row_chunk,
+            executor=executor,
+            device=device,
+        )
+
+    for row0 in range(0, height, row_chunk):
+        row1 = min(row0 + row_chunk, height)
+        n_rows = row1 - row0
+        row_idx = np.arange(row0, row1, dtype=np.float64)[:, None]
+        cols = np.broadcast_to(col_idx[None, :], (n_rows, width))
+        rows = np.broadcast_to(row_idx, (n_rows, width))
+        az_tile = az_off if scalar_az else az_off[row0:row1]
+        rg_tile = rg_off if scalar_rg else rg_off[row0:row1]
+        src_row = rows - az_tile
+        src_col = cols - rg_tile
+        if remapped_deramped is None:
+            coords = np.vstack([src_row.ravel(), src_col.ravel()])
+            tile = lanczos_resample(
+                sec_deramped, coords, a=lanczos_a, mode="constant", cval=0.0
+            ).reshape(n_rows, width)
+        else:
+            tile = remapped_deramped[row0:row1]
+        carrier_model = secondary_carrier if output_carrier is None else output_carrier
+        carrier_row = src_row if output_carrier is None else rows
+        carrier_col = src_col if output_carrier is None else cols
+        phi_src = carrier_phase_at_points(
+            carrier_model,
+            carrier_row,
+            carrier_col,
+            centre_row=centre_row,
+            dtype=np.float32,
+        )
+        cos_p = np.cos(phi_src.astype(np.float64)).astype(np.float32)
+        sin_p = np.sin(phi_src.astype(np.float64)).astype(np.float32)
+        re = tile.real.astype(np.float32, copy=False)
+        im = tile.imag.astype(np.float32, copy=False)
+        out_re = re * cos_p - im * sin_p
+        out_im = im * cos_p + re * sin_p
+        out[row0:row1] = (out_re + 1j * out_im).astype(sec_deramped.dtype, copy=False)
 
     return out

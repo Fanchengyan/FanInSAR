@@ -33,7 +33,7 @@ def unwrap(
     wrapped_or_complex: np.ndarray,
     coherence: np.ndarray | None = None,
     *,
-    method: UnwrapBackend = "irls",
+    method: UnwrapBackend = "snaphu",
     snaphu_config: SnaphuConfig | None = None,
     irls_kwargs: dict[str, Any] | None = None,
 ) -> CommonUnwrapResult:

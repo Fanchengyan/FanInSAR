@@ -9,7 +9,7 @@ from typing import Any
 
 from faninsar.backends.device_matrix import capability_matrix, probe_devices
 from faninsar.capabilities import (
-    format_optional_backend_capabilities,
+    format_backend_capabilities,
     snaphu_capability,
 )
 from faninsar.logging import setup_logger
@@ -80,7 +80,7 @@ def run_release_gates() -> ReleaseGateResult:
     }
     details: dict[str, Any] = {
         "devices": probe_devices(),
-        "snaphu": format_optional_backend_capabilities(),
+        "snaphu": format_backend_capabilities(),
         "kernels": [row.name for row in capability_matrix()],
         "forbidden_runtime_modules": list(FORBIDDEN_RUNTIME_MODULES),
     }

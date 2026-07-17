@@ -8,6 +8,7 @@ from .deramp import (
     deramp,
     deramp_reramp_roundtrip_error,
     reramp,
+    restore_original_domain_secondary,
     tops_carrier_phase,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "deramp",
     "deramp_reramp_roundtrip_error",
     "reramp",
+    "restore_original_domain_secondary",
     "tops_carrier_phase",
 ]
