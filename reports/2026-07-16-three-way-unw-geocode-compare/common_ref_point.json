@@ -1,0 +1,11 @@
+{
+  "row": 175,
+  "col": 2276,
+  "mean_coherence": 0.0,
+  "coherences": {},
+  "pair": "20161207_20161231",
+  "swath": "IW1",
+  "burst_index": 0,
+  "grid": "UTM EPSG:32647 ~20x80 m shared three-way geocode",
+  "note": "Frozen pin for residual panels. Do not auto-argmax; keep fixed across campaigns."
+}
