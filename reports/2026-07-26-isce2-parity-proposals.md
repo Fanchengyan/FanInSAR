@@ -89,8 +89,7 @@ Statuses below are the **draft matrix at note authoring**; live audit lives in i
 | P3 | Pinned common ref for residual panels | Required (fair metrics) | **done** | `common_ref_point.json` row=175 col=2276; `common_ref.py` |
 | P4 | Residual DEM topo after range-offset flatten | **Required** (science) | **done** | `stage_flatten` residual path + `estimate_residual_topographic_scale` + unit tests |
 | P5 | Carrier-aware secondary restore (deramp → Lanczos → analytical reramp) | **Required** (precision) | **done** | Production `stage_coregister` + integer/fractional phase tests |
-| P6 | True per-tap / neighborhood carrier-coupled SINC + Doppler (ISCE `Resamp_slc`-class) | **Next precision tier** (skill gap S2–S4,S8) | **not-started** | Dual-modes root cause; skill §5.2; optional after basic bar |
-| P6b | Fix / annotate `sar-resampling-kernels` skill (SK-1…SK-5) | Docs / agent hygiene | **not-started** | Note §5; skill over-claims Lanczos≡ISCE and under-specifies TOPS coupling |
+| P6 | Neighborhood carrier-coupled SINC + Doppler (ISCE `Resamp_slc`-class) | Next precision tier | **not-started** | Dual-modes root cause; experiment note outside repo (sidecar NOTE-0001) |
 | P7 | Merge method menu; default ≠ Hanning | Required for multi-burst seams | **done** | `merge/methods.py` default `insardev_ramp` |
 | P8 | Expand DEM to lon ~98–101.5 for IW3 | Required for **full-frame** parity only | **partial** | Campaign DEM partial; eastern IW3 still DEM-limited offline |
 | P9 | ESD before multi-burst merge (ISCE2 order) | Secondary for single-burst parity | **partial** | ESD in radar coreg; multi-burst merge not topsApp-order clone |
@@ -118,7 +117,7 @@ Mitigation shipped / in flight:
 
 Merge cosmetics (Hanning) do **not** close this gap; dual-modes A/B already ruled out ESD/stride/amp knobs as primary dual_std drivers on this scene.
 
-**Skill note:** Choosing Lanczos a=4 for complex is **aligned** with open-source sinc-family practice; the remaining gap is **how** TOPS carrier/Doppler enter the resampler (§5), not “should we use bilinear instead.”
+Experimental cross-tool / skill bake-offs live **outside this repo** (see §5).
 
 ---
 
@@ -132,69 +131,21 @@ Merge cosmetics (Hanning) do **not** close this gap; dual-modes A/B already rule
 
 ---
 
-## 5. Resampling / interpolation skill audit (vs open-source)
+## 5. Where experimental material lives (not in this repo)
 
-**Skill under review:** global agent skill `sar-resampling-kernels`
-(`~/.agents/skills/sar-resampling-kernels/SKILL.md` + `references/kernel_evidence.md`).
+Per Waymark `wm-workflow` / `PROCESS.md` and project `AGENTS.md`:
 
-**Verdict:** The skill’s **core rule is correct** — full-bandwidth complex SLC/ifg must use a **sinc-family** kernel; bilinear on raw complex is a production bug; multilook is boxcar complex average (SNAP `MultilookOp`); never average wrapped phase alone. That matches ISCE2, NISAR GSLC practice, SNAP multilook docs, GMTSAR “multilook then geocode,” and Hanssen & Bamler (1999).
+| Kind | Location |
+|------|----------|
+| Oracle / skill comparisons, session experiments | **Sidecar notes:** `/Users/fancy/Documents/GitHub/FanInSAR-stac-trail/waymark/notes/` |
+| Heavy campaign products | `/Volumes/DATA2/TEST_sentinel-1/<campaign>/` |
+| Agent throwaway logs | OS/agent scratch only |
 
-**However, several skill claims are incomplete or misleading relative to production open-source TOPS paths.** Agents that treat the skill as a complete ISCE2 clone will under-specify secondary SLC resampling. Problems below should be treated as **known skill gaps**, not as “FanInSAR is already ISCE-identical because it uses Lanczos a=4.”
+Resampling skill vs ISCE2/SNAP/GMTSAR/InSAR.dev audit (experimental):
 
-### 5.1 What the open-source stacks actually do
+`/Users/fancy/Documents/GitHub/FanInSAR-stac-trail/waymark/notes/NOTE-0001-sar-resampling-skill-vs-opensource.md`
 
-| System | Complex SLC / fine resamp | Geocode of complex | Multilook | Notes |
-|--------|---------------------------|--------------------|-----------|-------|
-| **ISCE2** `Resamp_slc` | **SINC** (default if complex); **local** deramp (range/az carrier poly) + **Doppler poly** + SINC + local reramp **inside** C resampler | `Geocodable`: `cpx`/`amp` → **sinc**; `cor`/`unw` → **nearest** | Radar looks then products | topsApp order: fine resamp **before** burst ifg / merge |
-| **ISCE2** geocode | — | sinc for complex; **nearest** for coh/unw by default | — | Nearest on unw/cor is pipeline caution, not “bilinear is wrong” |
-| **ISCE3 / NISAR GSLC** | Windowed sinc (raised-cosine ~8-tap) for phase-preserving geo | Complex path is sinc-family | Product-defined | Not a S1 TOPS burst-merge reference |
-| **GMTSAR** | Radar-domain processing; geocode often after looks | GMT `grdresample` often **bilinear** on **already multilooked** grids | Complex boxcar in radar | Bilinear OK only after bandwidth ≪ Nyquist |
-| **SNAP** | Coreg/resample tools use sinc-class options for complex | Varies by operator | **MultilookOp**: average I/Q, **never** phase band alone | Multilook ≠ interpolation |
-| **InSAR.dev Core** | Geo-domain stack; `align` + `dissolve` on geocoded bursts | Equal-weight circular mean in overlap (no Hanning) | Product-dependent | Closest analog to Fan **geo merge**, not to ISCE2 radar fine resamp |
-
-Sources: local ISCE2 `Resamp_slc.py` / `Geocodable.py`; campaign reports `2026-07-13-complex-resampling-kernel`, `2026-07-17-dual-modes-plan/root_cause_analysis.md`, `2026-07-23-burst-merge-strategies`.
-
-### 5.2 Skill problems (ranked)
-
-| # | Skill claim / omission | Open-source reality | Severity for Fan≈ISCE2 |
-|---|------------------------|---------------------|------------------------|
-| **S1** | Treats **Lanczos a=4** as interchangeable with “ISCE2/ISCE3/NISAR production standard” | ISCE2 keys **SINC** (truncated sinc), not the Lanczos window formula; NISAR cites **raised-cosine windowed sinc**. Same **family**, not bit-identical kernel | Medium — OK default, must not claim identity |
-| **S2** | Emphasizes kernel **family** (sinc vs bilinear) but under-specifies **TOPS carrier coupling** | ISCE2 `Resamp_slc` does **per-output-pixel neighborhood deramp → SINC → reramp** + Doppler poly **inside** the resampler. Dual-modes A/B showed offsets already match; residual dual_std gap tracked **resample/carrier coupling**, not kernel choice alone | **High** — primary remaining precision path (P6) |
-| **S3** | Pitfall A2: “prefer analytic carrier at fractional coords after deramped remap” | That is an improvement over interpolating a carrier **plane**, but still **not** ISCE’s local neighborhood deramp-inside-kernel. Whole-image deramp → Lanczos → analytic reramp is a **proxy**, not a clone | **High** |
-| **S4** | Recommends **FFT fractional shift** for “ISCE2 dense_offsets → affine fit → resample” | Global FFT shift is exact only for a **constant** (dx, dy). TOPS fine offsets are **spatially varying**; ISCE applies poly/dense offsets inside `Resamp_slc`, not one global FFT | **High** if followed literally for S1 |
-| **S5** | Calls **M1 (geocode-SLC → ifg)** the “gold standard” | **topsApp S1 production is radar-first** (coreg/resamp SLC → ifg → merge → optional geocode). Geocode-first is a product branch (e.g. GSLC), not the ISCE2 S1 default; campaigns showed bad geocode_first residuals when mis-specified | Medium — skill over-promotes M1 for S1 parity |
-| **S6** | Recommends **bilinear** for unwrapped phase / coherence | ISCE2 geocode defaults **nearest** for `unw`/`cor` (avoid side-lobe ringing into QC). Bilinear is defensible for smooth residual maps; it is a **deliberate divergence**, not “what ISCE does” | Low–medium |
-| **S7** | DEM → B-spline 4–5 (GAMMA) | ISCE2 DEM sampling in geometry is not the same as Fan’s geocode of products; fine for DEM *as smooth field*, but do not confuse with Resamp_slc | Low |
-| **S8** | Skill is silent on **Doppler poly** at fine resamp | ISCE2 sets Doppler poly on `Resamp_slc`; Fan’s Python Lanczos path has no equivalent | Medium for high-PRF / residual az |
-| **S9** | Skill correct that no reference merge uses Hanning | Confirmed ISCE2 `avg`/`top`, InSAR.dev equal-weight dissolve (`reports/2026-07-23-burst-merge-strategies`) | Skill OK here |
-
-### 5.3 FanInSAR code vs skill vs ISCE2 (current)
-
-| Path | Fan (HEAD) | Skill says | ISCE2-like? |
-|------|------------|------------|-------------|
-| Radar secondary fine resamp | `resample_complex_deramped_reramp` (deramp whole → Lanczos → analytic carrier) | Complex → Lanczos; analytic carrier preferred | **Partial** — sinc family yes; **not** neighborhood-coupled Resamp_slc |
-| ESD pre-align | bilinear (`order=1`) allowed | bilinear only if already band-limited | Acceptable as **coarse** pre-align only |
-| Geo complex geocode | `lanczos_resample` in `geocode.py` / `geocode_raster.py` | Lanczos a=4 | Good enough vs Geocodable sinc |
-| Geo real (coh) | bilinear | bilinear | OK (ISCE often nearest) |
-| Hard labels | nearest | nearest | Yes |
-| Some **campaign scripts** under `reports/2026-07-23-*` | still `Resampling.bilinear` for dump plots | should be Lanczos for complex | **Script debt** — do not treat plot dumps as production kernel |
-
-### 5.4 Implications for this Proposal note
-
-1. **Do not “fix” the skill by switching away from Lanczos to bilinear** — that would regress against every open-source complex path.
-2. **Do treat skill S2–S4 as open algorithm work** (aligns with P6: true per-tap / neighborhood carrier-coupled SINC + Doppler, or optional ISCE `Resamp_slc` backend). Until then, document residual Fan–ISCE phase gap as **resample coupling**, not “wrong kernel family.”
-3. **Prefer radar-first (ISCE2-like) for S1 parity campaigns**; use geocode-first only with full carrier-aware SLC geocode semantics (ULW synthesis), not generic Lanczos warp of focused SLC.
-4. **Update skill later** (out of minimal parity code path): (a) state Lanczos ≈ windowed-sinc family, not ISCE kernel identity; (b) add mandatory TOPS subsection “carrier+Doppler inside resampler”; (c) restrict FFT shift to constant offset only; (d) demote M1 gold-standard wording for S1 topsApp parity.
-
-### 5.5 Proposed skill-fix backlog (docs-only until code lands)
-
-| ID | Action |
-|----|--------|
-| SK-1 | Add TOPS / `Resamp_slc` subsection: neighborhood deramp → sinc → reramp + Doppler poly; cite dual-modes root cause |
-| SK-2 | Narrow FFT-shift “use when” to constant or affine-global shifts; forbid as drop-in for dense TOPS offsets |
-| SK-3 | Replace “M1 gold standard” with “M1 valid for GSLC-class products; S1 topsApp parity = radar-first M2-like” |
-| SK-4 | Document ISCE2 nearest-for-unw/cor as optional QC-preserving mode vs bilinear residual maps |
-| SK-5 | Note separable Lanczos a=4 is an engineering choice; production oracles may use non-separable truncated sinc / raised-cosine |
+Do not re-merge bake-off tables into `FanInSAR-stac` unless distilled and human-approved as product Knowledge.
 
 ---
 
@@ -241,4 +192,4 @@ Sources: local ISCE2 `Resamp_slc.py` / `Geocodable.py`; campaign reports `2026-0
 | 2026-07-26 | P3 pin restored; P4 residual topo landed + tests; P5 fractional phase gate; P7 merge menu default `insardev_ramp`. |
 | 2026-07-26 | P10 bar **met** on DATA2 `faninsar-radar-parity-20260718` radar ML(2,10): complex coh 0.928, wrap RMSE 0.113 rad, unw residual std 0.303 rad; peak RSS 6.2 GiB (P0). P6 deferred. P8 full-frame DEM still partial. |
 | 2026-07-26 | Fixed `stage_flatten` UnboundLocalError (`estimate_residual_azimuth_ramp` module-level import). **HEAD re-run** `run_production_pair` ML(2,10) → `/Volumes/DATA2/TEST_sentinel-1/head-parity-20260726/`: residual DEM topo applied (span 6.78 rad); complex coh **0.800**, wrap RMSE **0.567** rad, unw residual std **0.676** rad, peak RSS **3.96 GiB**, wall ~78 s. Production flatten tests green. |
-| 2026-07-26 | §5: audited `sar-resampling-kernels` skill vs ISCE2/SNAP/GMTSAR/InSAR.dev — core complex→sinc rule OK; **gaps** on TOPS carrier-coupled Resamp_slc, FFT-shift misuse, M1-vs-radar-first wording (SK-1…SK-5). |
+| 2026-07-26 | Moved experimental skill/open-source bake-off out of repo → sidecar `FanInSAR-stac-trail` NOTE-0001; in-repo note only points at location. |
