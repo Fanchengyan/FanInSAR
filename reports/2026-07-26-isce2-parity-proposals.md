@@ -170,3 +170,4 @@ Merge cosmetics (Hanning) do **not** close this gap; dual-modes A/B already rule
 | 2026-07-26 | Proposal note authored from reports + ulw-research + campaign handoffs. |
 | 2026-07-26 | P3 pin restored; P4 residual topo landed + tests; P5 fractional phase gate; P7 merge menu default `insardev_ramp`. |
 | 2026-07-26 | P10 bar **met** on DATA2 `faninsar-radar-parity-20260718` radar ML(2,10): complex coh 0.928, wrap RMSE 0.113 rad, unw residual std 0.303 rad; peak RSS 6.2 GiB (P0). P6 deferred. P8 full-frame DEM still partial. |
+| 2026-07-26 | Fixed `stage_flatten` UnboundLocalError (`estimate_residual_azimuth_ramp` module-level import). **HEAD re-run** `run_production_pair` ML(2,10) → `/Volumes/DATA2/TEST_sentinel-1/head-parity-20260726/`: residual DEM topo applied (span 6.78 rad); complex coh **0.800**, wrap RMSE **0.567** rad, unw residual std **0.676** rad, peak RSS **3.96 GiB**, wall ~78 s. Production flatten tests green. |
