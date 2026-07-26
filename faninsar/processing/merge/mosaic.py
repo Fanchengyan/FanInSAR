@@ -1,16 +1,19 @@
-"""Weighted mosaic of geocoded burst products."""
+"""Weighted mosaic of geocoded burst products.
+
+The primary entry point is now :func:`faninsar.processing.merge.methods.merge_bursts`,
+which exposes the seven reference-grounded merge strategies documented in
+``reports/2026-07-23-burst-merge-strategies/report.md`` and the global
+``sar-burst-merge`` skill. :func:`merge_burst_products` is retained as a
+backward-compatible wrapper that maps the legacy ``mode`` argument onto a
+:func:`merge_bursts` method.
+"""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-import numpy as np
-
 from faninsar.logging import setup_logger
-from faninsar.processing.merge.phase_network import (
-    estimate_edges,
-    solve_network,
-)
+from faninsar.processing.merge.methods import MergeMethod, merge_bursts
 
 if TYPE_CHECKING:
     from faninsar.processing.merge.products import BurstGeoProduct, MosaicProduct
@@ -18,6 +21,12 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 __all__ = ["merge_burst_products"]
+
+#: Legacy ``mode`` → new ``MergeMethod`` mapping (see ``methods.py``).
+_LEGACY_MODE_TO_METHOD: dict[str, MergeMethod] = {
+    "phase_network": "faninsar_network",
+    "complex_average": "complex_average",
+}
 
 
 def merge_burst_products(
@@ -81,10 +90,9 @@ def merge_burst_products(
         if unwrapped:
             msg = (
                 "merge_burst_products received unwrapped-phase products "
-                f"({unwrapped}). The timing rule (plan §4.3) requires merge "
-                "in the complex domain before unwrapping. Pass "
-                "allow_unwrapped_merge=True to opt in (not recommended; "
-                "not part of the production DoD)."
+                f"({unwrapped}). The timing rule requires merge in the "
+                "complex domain before unwrapping. Pass "
+                "allow_unwrapped_merge=True to opt in (not recommended)."
             )
             raise ValueError(msg)
 
@@ -94,94 +102,17 @@ def merge_burst_products(
             msg = "all products must share the same GeoGridSpec"
             raise ValueError(msg)
 
-    shape = grid.shape
-    n = len(products)
-
-    # Phase alignment
-    if mode == "phase_network":
-        graph = estimate_edges(
-            products,
-            min_overlap_px=min_overlap_px,
-            min_edge_coherence=min_edge_coherence,
-            path_policy=path_policy,
-            allow_asc_desc_phase_link=allow_asc_desc_phase_link,
+    method = _LEGACY_MODE_TO_METHOD.get(mode, "insardev_ramp")
+    if mode != "phase_network":
+        logger.info(
+            "merge_burst_products: legacy mode='%s' → method='%s'", mode, method
         )
-        # Failure-mode warnings (plan §12).
-        if len(graph.edges) == 0 and n > 1:
-            logger.warning(
-                "merge_burst_products: no phase edges formed — "
-                "all bursts are isolated (overlap < %d px or coherence < %.2f). "
-                "Each burst becomes its own component; phases are not aligned.",
-                min_overlap_px,
-                min_edge_coherence,
-            )
-        solution = solve_network(graph, reference_node=reference_node)
-        phi_hat = solution.phi_hat
-        component_per_node = solution.component_id
-        network_stats = solution.stats
-        if network_stats.n_components > 1:
-            logger.warning(
-                "merge_burst_products: %d disconnected components — "
-                "phases are aligned only within each component.",
-                network_stats.n_components,
-            )
-        if network_stats.rms_residual > 0.1:
-            logger.warning(
-                "merge_burst_products: high network residual RMS=%.3e rad — "
-                "overlap phase estimates may be inconsistent.",
-                network_stats.rms_residual,
-            )
-    else:
-        phi_hat = np.zeros(n, dtype=np.float64)
-        component_per_node = np.zeros(n, dtype=np.int16)
-        network_stats = None
-
-    # Build per-pixel component id (max weight wins)
-    complex_acc = np.zeros(shape, dtype=np.complex64)
-    weight_sum = np.zeros(shape, dtype=np.float32)
-    coh_acc = np.zeros(shape, dtype=np.float32)
-    n_bursts = np.zeros(shape, dtype=np.uint8)
-    component_id = np.zeros(shape, dtype=np.int16)
-    max_weight_per_pixel = np.zeros(shape, dtype=np.float32)
-
-    for k, p in enumerate(products):
-        z_aligned = p.complex * np.exp(-1j * phi_hat[k], dtype=np.complex64).astype(
-            np.complex64
-        )
-        w = p.weight
-        complex_acc += (w.astype(np.complex64) * z_aligned).astype(np.complex64)
-        weight_sum += w
-        if p.coherence is not None:
-            coh_acc += w * p.coherence
-        n_bursts += (w > 0).astype(np.uint8)
-        # component label: pick the component of the strongest contributor
-        stronger = w > max_weight_per_pixel
-        component_id[stronger] = component_per_node[k] + 1  # 0 reserved for nodata
-        max_weight_per_pixel[stronger] = w[stronger]
-
-    # Normalize
-    nodata = weight_sum <= 0.0
-    complex_out = np.zeros(shape, dtype=np.complex64)
-    coh_out = np.zeros(shape, dtype=np.float32)
-    complex_out[~nodata] = complex_acc[~nodata] / weight_sum[~nodata]
-    coh_out[~nodata] = coh_acc[~nodata] / weight_sum[~nodata]
-    complex_out[nodata] = 0.0
-    component_id[nodata] = 0
-
-    from faninsar.processing.merge.products import MosaicProduct
-
-    logger.info(
-        "merge_burst_products: mode=%s n_bursts=%d nodata_px=%d",
-        mode,
-        n,
-        int(nodata.sum()),
-    )
-    return MosaicProduct(
-        grid=grid,
-        complex=complex_out,
-        coherence=coh_out,
-        weight_sum=weight_sum,
-        n_bursts=n_bursts,
-        component_id=component_id,
-        network=network_stats,
+    return merge_bursts(
+        products,
+        method=method,
+        min_overlap_px=min_overlap_px,
+        min_edge_coherence=min_edge_coherence,
+        path_policy=path_policy,
+        allow_asc_desc_phase_link=allow_asc_desc_phase_link,
+        reference_node=reference_node,
     )
