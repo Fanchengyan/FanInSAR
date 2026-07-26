@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import gc
+import shutil
+import tempfile
+import time
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
@@ -11,6 +14,13 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 
 from faninsar.logging import setup_logger
+from faninsar.missions.sentinel1 import (
+    open_safe_product,
+    read_eof_orbit,
+    read_full_burst,
+    read_swath_bursts,
+    stitch_bursts,
+)
 from faninsar.processing.coordinates import RadarGrid
 from faninsar.processing.coreg import (
     combine_offset_fields,
@@ -28,8 +38,8 @@ from faninsar.processing.geometry import (
 )
 from faninsar.processing.geometry.baseline import BaselineComponents
 from faninsar.processing.interferometry.flatten import (
+    compute_geometric_phase_from_geo,
     compute_topographic_phase,
-    estimate_residual_azimuth_ramp,
     remove_azimuth_phase_ramp,
     remove_topographic_phase,
 )
@@ -38,6 +48,7 @@ from faninsar.processing.interferometry.pair import (
     goldstein_filter,
     mask_invalid_looks,
 )
+from faninsar.processing.memory import close_memmap, release_memmap_pages
 from faninsar.processing.pipeline.products import (
     PairProductArrays,
     write_pair_stac_item,
@@ -45,23 +56,18 @@ from faninsar.processing.pipeline.products import (
 )
 from faninsar.processing.tops.carrier import carrier_from_swath
 from faninsar.processing.tops.deramp import TOPSCarrierModel, deramp, reramp
-from faninsar.processing.unwrap import SnaphuConfig
+from faninsar.processing.unwrap import SnaphuConfig, UnwrapBackend
 from faninsar.processing.unwrap import unwrap as unwrap_dispatch
-from faninsar.sentinel1 import (
-    open_safe_product,
-    read_eof_orbit,
-    read_full_burst,
-    read_swath_bursts,
-    stitch_bursts,
-)
 
 if TYPE_CHECKING:
+    from faninsar.missions.sentinel1.io import BurstArray
+    from faninsar.missions.sentinel1.types import S1Burst, S1Product, S1Swath
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
     from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
     from faninsar.processing.unwrap.common import CommonUnwrapResult
-    from faninsar.sentinel1.io import BurstArray
-    from faninsar.sentinel1.types import S1Burst, S1Product, S1Swath
 
 logger = setup_logger(__name__)
 
@@ -135,6 +141,8 @@ class ProductionPairState:
     azimuth_shift_px: float | None = None
     esd_azimuth_shift_px: float | None = None
     secondary_aligned: np.ndarray | None = None
+    secondary_aligned_is_flattened: bool = False
+    range_offset_flatten_phase: np.ndarray | None = None
     complex_ifg: np.ndarray | None = None
     complex_ifg_flat: np.ndarray | None = None
     topo_phase: np.ndarray | None = None
@@ -153,14 +161,18 @@ class ProductionPairState:
     zarr_path: Path | None = None
     stac_path: Path | None = None
     log: list[str] = field(default_factory=list)
+    stage_timings_s: dict[str, float] = field(default_factory=dict)
+    coregistration_timings_s: dict[str, float] = field(default_factory=dict)
     coregistration_grid: CoregistrationGrid = "radar"
     dem_id: str = ""
-    coreg_executor: str = "serial"
+    coreg_executor: str = "torch"
     coreg_device: str = "auto"
     multilook: tuple[int, int] = (4, 20)
     goldstein_alpha: float = 0.5
     unwrap_method: str = "snaphu"
     geo_grid_meta: dict[str, Any] | None = None
+    geo_work_dir: Path | None = None
+    memory_watchdog: MemoryWatchdog | None = None
 
     def note(self, message: str) -> None:
         """Append a stage log line."""
@@ -277,17 +289,164 @@ def stage_deramp(state: ProductionPairState) -> ProductionPairState:
     return state
 
 
+def _apply_geo_topographic_phase_chunked(
+    state: ProductionPairState,
+    lut: Geo2RdrLUT,
+    offsets: OffsetFieldResult,
+    reference_geo: np.memmap,
+    secondary_geo: np.memmap,
+    valid: np.memmap,
+    *,
+    grid: GeoGridSpec,
+    output_dir: Path,
+    chunk_size: int,
+    watchdog: MemoryWatchdog | None,
+) -> tuple[np.memmap, np.ndarray]:
+    """Apply geometric phase to disk-backed geographic SLC row tiles.
+
+    Parameters
+    ----------
+    state : ProductionPairState
+        Pair geometry and DEM state.
+    lut : Geo2RdrLUT
+        Geographic-to-reference-radar coordinates.
+    offsets : OffsetFieldResult
+        Dense reference-to-secondary radar offsets.
+    reference_geo, secondary_geo, valid : numpy.memmap
+        Disk-backed geographic SLCs and validity mask, updated in place.
+    grid : GeoGridSpec
+        Geographic grid defining the shared ground targets.
+    output_dir : pathlib.Path
+        Directory for disk-backed phase and height fields.
+    chunk_size : int
+        Number of geographic rows per tile.
+    watchdog : MemoryWatchdog, optional
+        Memory guard sampled after every completed tile.
+
+    Returns
+    -------
+    topo_phase, height : tuple[numpy.memmap, numpy.ndarray]
+        Complete disk-backed geographic fields.
+
+    """
+    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT, grid_lonlat_rows
+    from faninsar.processing.pipeline.geo_resample import (
+        compose_secondary_coordinates,
+    )
+
+    topo_phase = np.memmap(
+        output_dir / "topographic_phase.float32",
+        mode="w+",
+        dtype=np.float32,
+        shape=grid.shape,
+    )
+    height_field = lut.height_full
+    if height_field is None:
+        height_field = np.memmap(
+            output_dir / "height.float64",
+            mode="w+",
+            dtype=np.float64,
+            shape=grid.shape,
+        )
+    invalid = np.complex64(np.nan + 1j * np.nan)
+    for row_start in range(0, grid.height, chunk_size):
+        row_stop = min(row_start + chunk_size, grid.height)
+        rows = slice(row_start, row_stop)
+        tile_lut = Geo2RdrLUT(
+            az_full=lut.az_full[rows],
+            rg_full=lut.rg_full[rows],
+            valid=lut.valid[rows],
+            full_radar_shape=lut.full_radar_shape,
+            height_m=lut.height_m,
+            height_full=(
+                None if lut.height_full is None else lut.height_full[rows]
+            ),
+        )
+        secondary_azimuth, _, coordinate_valid = compose_secondary_coordinates(
+            tile_lut,
+            offsets,
+        )
+        latitude, longitude = grid_lonlat_rows(grid, row_start, row_stop)
+        if tile_lut.height_full is None:
+            height = np.asarray(
+                state.dem.sample(latitude, longitude),
+                dtype=np.float64,
+            )
+        else:
+            height = np.asarray(tile_lut.height_full, dtype=np.float64)
+        phase = compute_geometric_phase_from_geo(
+            state.reference.geometry,
+            state.secondary.geometry,
+            latitude,
+            longitude,
+            height,
+            tile_lut.az_full,
+            secondary_azimuth,
+            reference_range_index=tile_lut.rg_full,
+        )
+        tile_valid = valid[rows] & coordinate_valid & np.isfinite(phase)
+        corrected_secondary = secondary_geo[rows] * np.exp(1j * phase).astype(
+            np.complex64
+        )
+        reference_geo[rows] = np.where(
+            tile_valid,
+            reference_geo[rows],
+            invalid,
+        ).astype(np.complex64)
+        secondary_geo[rows] = np.where(
+            tile_valid,
+            corrected_secondary,
+            invalid,
+        ).astype(np.complex64)
+        valid[rows] = tile_valid
+        topo_phase[rows] = phase.astype(np.float32)
+        if lut.height_full is None:
+            height_field[rows] = height
+        del (
+            corrected_secondary,
+            coordinate_valid,
+            height,
+            latitude,
+            longitude,
+            phase,
+            secondary_azimuth,
+            tile_valid,
+        )
+        for array in (
+            reference_geo,
+            secondary_geo,
+            valid,
+            topo_phase,
+        ):
+            release_memmap_pages(array)
+        for array in (height_field, lut.az_full, lut.rg_full, lut.valid):
+            if isinstance(array, np.memmap):
+                release_memmap_pages(array)
+        if watchdog is not None:
+            watchdog.sample(f"geo_topographic_phase:{row_start}:{row_stop}")
+    reference_geo.flush()
+    secondary_geo.flush()
+    valid.flush()
+    topo_phase.flush()
+    if isinstance(height_field, np.memmap):
+        height_field.flush()
+    return topo_phase, height_field
+
+
 def stage_coregister(
     state: ProductionPairState,
     *,
-    control_spacing: int = 64,
-    esd_enabled: bool = True,
-    executor: str = "serial",
+    control_spacing: int | None = None,
+    esd_enabled: bool = False,
+    amplitude_refinement_enabled: bool = False,
+    executor: str = "torch",
     device: str = "auto",
     coregistration_grid: CoregistrationGrid = "radar",
     geo_grid: GeoGridSpec | None = None,
     geo_height_m: float = 0.0,
-    geo_chunk_size: int = 40,
+    geo_chunk_size: int = 128,
+    geo_work_dir: str | Path | None = None,
+    memory_watchdog: MemoryWatchdog | None = None,
 ) -> ProductionPairState:
     """Estimate dense offsets and coregister on a radar or geographic grid.
 
@@ -304,17 +463,20 @@ def stage_coregister(
     state : ProductionPairState
         Mutable pair workflow state (requires deramp outputs).
     control_spacing : int, optional
-        Stride (pixels) between geometry control points. Default 64.
+        Stride between geometry control points. Defaults to 8 pixels on the
+        radar grid for phase-accurate flattening and 64 on the geographic
+        grid.
     esd_enabled : bool, optional
-        Run ESD azimuth residual estimation. Default True.
-    executor : {"serial", "dask-torch"}, optional
-        Lanczos compute path for the final resample. ``"dask-torch"`` runs the
-        dask + torch + numpy Lanczos block_fn
-        (:func:`lanczos_resample_dask_torch`); ``"serial"`` is the NumPy
-        reference. Ignored for the ESD bilinear pre-align. Default ``"serial"``.
+        Run ESD azimuth residual estimation. Default False.
+    amplitude_refinement_enabled : bool, optional
+        Refine the geometry offsets with a global amplitude-correlation shift.
+        Disabled by default because a single TOPS burst does not provide the
+        overlap constraints needed to distinguish a true residual from burst
+        envelope structure.
+    executor : {"torch"}, optional
+        Unified Torch Lanczos path for the final resample.
     device : {"auto","cpu","cuda"}, optional
-        Torch device when ``executor="dask-torch"``. ``"auto"`` resolves to
-        CUDA if available else CPU (never MPS). Default ``"auto"``.
+        Torch device. ``"auto"`` selects CUDA, then MPS, then CPU.
     coregistration_grid : {"radar", "geo"}, optional
         Grid on which both aligned SLCs are produced.
     geo_grid : GeoGridSpec, optional
@@ -323,6 +485,10 @@ def stage_coregister(
         Fallback ellipsoidal height for geographic coregistration.
     geo_chunk_size : int, optional
         Geo2rdr row chunk size.
+    geo_work_dir : str or pathlib.Path, optional
+        Directory for disk-backed Geo intermediate arrays.
+    memory_watchdog : MemoryWatchdog, optional
+        Memory guard sampled after each geographic tile.
 
     """
     if state.reference_deramped is None or state.secondary_deramped is None:
@@ -342,12 +508,25 @@ def stage_coregister(
         state.note(f"COREG cropped both scenes to common shape {(h, w)}")
 
     dem = state.dem
+    resolved_control_spacing = (
+        8
+        if control_spacing is None and coregistration_grid == "radar"
+        else 64
+        if control_spacing is None
+        else control_spacing
+    )
+    if resolved_control_spacing < 1:
+        reject_invalid_state("control_spacing must be >= 1")
+    substage_started = time.perf_counter()
     geometry_field = dense_geometry_offsets(
         shape=ref.shape,
         reference_model=state.reference.geometry,
         secondary_model=state.secondary.geometry,
         dem=dem,
-        stride=control_spacing,
+        stride=resolved_control_spacing,
+    )
+    state.coregistration_timings_s["dense_geometry_offsets"] = (
+        time.perf_counter() - substage_started
     )
 
     prior_rg = float(
@@ -359,7 +538,7 @@ def stage_coregister(
     amp_res_rg = 0.0
     amp_res_az = 0.0
     esd_az = 0.0
-    if coregistration_grid == "radar":
+    if coregistration_grid == "radar" and amplitude_refinement_enabled:
         amp_rg, amp_az = refine_shift_with_correlation(
             ref,
             sec,
@@ -407,12 +586,14 @@ def stage_coregister(
             reject_invalid_state("geo coregistration requires geo_grid")
         from faninsar.processing.pipeline.geo_lut import build_geo2rdr_lut
         from faninsar.processing.pipeline.geo_modes import (
-            coregister_geocoded_slcs,
-        )
-        from faninsar.processing.pipeline.geo_resample import (
-            compose_secondary_coordinates,
+            coregister_geocoded_slcs_chunked,
         )
 
+        if geo_work_dir is None:
+            reject_invalid_state("geo coregistration requires geo_work_dir")
+        work_directory = Path(geo_work_dir)
+        work_directory.mkdir(parents=True, exist_ok=True)
+        substage_started = time.perf_counter()
         lut = build_geo2rdr_lut(
             geometry=state.reference.geometry,
             grid=geo_grid,
@@ -420,37 +601,44 @@ def stage_coregister(
             height_m=geo_height_m,
             dem=state.dem,
             chunk_size=geo_chunk_size,
+            storage_dir=work_directory / "lut",
         )
-        reference_geo, secondary_geo, valid = coregister_geocoded_slcs(
+        state.coregistration_timings_s["geo2rdr_lut"] = (
+            time.perf_counter() - substage_started
+        )
+        substage_started = time.perf_counter()
+        reference_geo, secondary_geo, valid = coregister_geocoded_slcs_chunked(
             ref,
             sec,
             reference_carrier=state.reference.carrier,
             secondary_carrier=state.secondary.carrier,
             reference_lut=lut,
             offsets=offsets,
+            output_dir=work_directory / "slc",
+            row_chunk=geo_chunk_size,
             executor=executor,
             device=device,
+            watchdog=memory_watchdog,
         )
-        secondary_azimuth, _secondary_range, coordinate_valid = (
-            compose_secondary_coordinates(lut, offsets)
+        state.coregistration_timings_s["geo_slc_resample"] = (
+            time.perf_counter() - substage_started
         )
-        topo_phase = np.full(lut.shape, np.nan, dtype=np.float64)
-        for row_start in range(0, lut.shape[0], geo_chunk_size):
-            row_stop = min(row_start + geo_chunk_size, lut.shape[0])
-            rows = slice(row_start, row_stop)
-            topo_phase[rows] = compute_topographic_phase(
-                state.reference.geometry,
-                state.secondary.geometry,
-                lut.az_full[rows],
-                lut.rg_full[rows],
-                state.dem,
-                secondary_azimuth_index=secondary_azimuth[rows],
-            )
-        valid &= coordinate_valid & np.isfinite(topo_phase)
-        secondary_geo *= np.exp(1j * topo_phase).astype(np.complex64)
-        invalid = np.complex64(np.nan + 1j * np.nan)
-        reference_geo = np.where(valid, reference_geo, invalid).astype(np.complex64)
-        secondary_geo = np.where(valid, secondary_geo, invalid).astype(np.complex64)
+        substage_started = time.perf_counter()
+        topo_phase, height_field = _apply_geo_topographic_phase_chunked(
+            state,
+            lut,
+            offsets,
+            reference_geo,
+            secondary_geo,
+            valid,
+            grid=geo_grid,
+            output_dir=work_directory,
+            chunk_size=geo_chunk_size,
+            watchdog=memory_watchdog,
+        )
+        state.coregistration_timings_s["geo_topographic_phase"] = (
+            time.perf_counter() - substage_started
+        )
         state.reference_geocoded_slc = reference_geo
         state.secondary_geocoded_slc = secondary_geo
         state.geocoded_slc_valid = valid
@@ -459,14 +647,10 @@ def stage_coregister(
         state.secondary_aligned = secondary_geo
         state.geo2rdr_lut = lut
         state.geo_grid = geo_grid
-        state.topo_phase = topo_phase.astype(np.float32)
-        from faninsar.processing.pipeline.geo_lut import grid_lonlat
-
-        latitude, longitude = grid_lonlat(geo_grid)
-        state.geo_height_field = np.asarray(
-            state.dem.sample(latitude, longitude),
-            dtype=np.float64,
-        )
+        state.topo_phase = topo_phase
+        state.geo_height_field = height_field
+        state.geo_work_dir = work_directory
+        state.memory_watchdog = memory_watchdog
         del ref, sec, offsets
         gc.collect()
         state.note(
@@ -475,8 +659,10 @@ def stage_coregister(
             f"coverage={float(valid.mean()):.3f} "
             "(two deramped single-remaps + fractional reramp + SLC flatten)"
         )
+        state.note(f"COREG timings={state.coregistration_timings_s}")
         return state
 
+    substage_started = time.perf_counter()
     sec_resamp = resample_complex_deramped_reramp(
         sec,
         secondary_carrier=state.secondary.carrier,
@@ -485,16 +671,41 @@ def stage_coregister(
         executor=executor,
         device=device,
     )
+    secondary_geometry = state.secondary.geometry
+    phase_per_range_pixel = (
+        4.0
+        * np.pi
+        * secondary_geometry.range_spacing_m
+        / secondary_geometry.wavelength_m
+    )
+    for row_start in range(0, sec_resamp.shape[0], 64):
+        rows = slice(row_start, min(row_start + 64, sec_resamp.shape[0]))
+        range_carrier_phase = phase_per_range_pixel * offsets.range_offset_px[rows]
+        sec_resamp[rows] = remove_topographic_phase(
+            sec_resamp[rows],
+            range_carrier_phase,
+        ).astype(np.complex64, copy=False)
+    state.coregistration_timings_s["radar_resample_and_flatten"] = (
+        time.perf_counter() - substage_started
+    )
+    state.secondary_aligned_is_flattened = True
+    state.range_offset_flatten_phase = (
+        (phase_per_range_pixel * offsets.range_offset_px).astype(np.float32)
+    )
     state.secondary_deramped = None
     state.reference_deramped = reramp(ref, state.reference.carrier)
     state.secondary_aligned = sec_resamp
     del sec_resamp, sec, ref, offsets
     gc.collect()
     state.note(
-        f"COREG dense+ESD+amp median_rg={state.range_shift_px:.3f} "
+        f"COREG geometry median_rg={state.range_shift_px:.3f} "
         f"median_az={state.azimuth_shift_px:.3f} "
-        f"coverage={coverage:.3f} (deramped single-remap + fractional reramp)"
+        f"esd={esd_enabled} amplitude_refinement={amplitude_refinement_enabled} "
+        f"control_spacing={resolved_control_spacing} "
+        f"coverage={coverage:.3f} "
+        "(deramped single-remap + fractional reramp + range-offset flatten)"
     )
+    state.note(f"COREG timings={state.coregistration_timings_s}")
     return state
 
 
@@ -503,6 +714,7 @@ def stage_interferogram(
     *,
     multilook: tuple[int, int] = (4, 20),
     goldstein_alpha: float = 0.5,
+    dead_pixel_amp_threshold: float = 0.0,
 ) -> ProductionPairState:
     """Form multilooked interferogram and apply Goldstein filter.
 
@@ -514,6 +726,11 @@ def stage_interferogram(
         Non-overlapping azimuth and range look factors.
     goldstein_alpha : float, optional
         Goldstein filter exponent.
+    dead_pixel_amp_threshold : float, optional
+        SLC amplitude below which a pixel is excluded from the multilook
+        average (dead-pixel masking). Set to 0 to disable. The production
+        entry point :func:`run_production_pair` passes 3.0 for real S1
+        data; synthetic tests use the default 0.
 
     """
     if state.reference_deramped is None or state.secondary_aligned is None:
@@ -522,9 +739,33 @@ def stage_interferogram(
         state.reference_deramped,
         state.secondary_aligned,
         multilook=multilook,
+        dead_pixel_amp_threshold=dead_pixel_amp_threshold,
     )
     state.reference_deramped = None
     state.secondary_aligned = None
+    if state.coregistration_grid == "geo" and state.geo_work_dir is not None:
+        for array in (
+            state.reference_geocoded_slc,
+            state.secondary_geocoded_slc,
+            state.geocoded_slc_valid,
+        ):
+            if isinstance(array, np.memmap):
+                close_memmap(array)
+        state.reference_geocoded_slc = None
+        state.secondary_geocoded_slc = None
+        state.geocoded_slc_valid = None
+        if state.geo2rdr_lut is not None:
+            for array in (
+                state.geo2rdr_lut.az_full,
+                state.geo2rdr_lut.rg_full,
+                state.geo2rdr_lut.valid,
+            ):
+                if isinstance(array, np.memmap):
+                    close_memmap(array)
+            state.geo2rdr_lut = None
+        if isinstance(state.topo_phase, np.memmap):
+            close_memmap(state.topo_phase)
+            state.topo_phase = None
     gc.collect()
     # alpha=0 is not a no-op in the windowed Goldstein implementation (Hann
     # taper still smooths). Skip the filter entirely so high-rate geometric
@@ -547,7 +788,16 @@ def stage_interferogram(
 
 
 def stage_flatten(state: ProductionPairState) -> ProductionPairState:
-    """Remove topographic phase using DEM + dual-orbit geometry."""
+    """Remove topographic phase using DEM + dual-orbit geometry.
+
+    When radar coreg already applied a *range-offset* phase screen on the
+    secondary SLC (``secondary_aligned_is_flattened=True``), that screen is only
+    a first-order approximation of the path-length topographic phase.  Residual
+    DEM topography — especially where dense geometry offsets are incomplete
+    (DEM edge, outer subswath) — is still removed here with the full dual-orbit
+    geometric model.  If the range-offset screen already matched the DEM model,
+    the residual is near zero and this step is a no-op in practice.
+    """
     if state.complex_ifg is None:
         reject_invalid_state("flatten requires interferogram")
     height, width = state.complex_ifg.shape
@@ -569,6 +819,102 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
         rg_grid,
         state.dem,
     )
+    topo_finite = topo[np.isfinite(topo)]
+    topo_valid_frac = float(np.isfinite(topo).mean())
+    if topo_finite.size:
+        rms = float(np.std(topo_finite))
+        span = float(np.max(topo_finite) - np.min(topo_finite))
+    else:
+        rms, span = float("nan"), float("nan")
+
+    if state.secondary_aligned_is_flattened:
+        # The range-offset screen applied during coregistration is a linearised
+        # approximation of the full dual-orbit geometric topo phase.  The residual
+        # ``topo + range_offset_phase`` is small (~1 rad) but non-zero, and the
+        # scalar scale search used below fails when the absolute topo phase is
+        # large (thousands of radians) because the grid-step phase jump exceeds
+        # 2π.  Instead of estimating a scale, directly compute and remove the
+        # residual (matching ISCE2's full geometric flatten on the interferogram).
+        from faninsar.processing.interferometry.flatten import (
+            estimate_residual_azimuth_ramp,
+        )
+        from faninsar.processing.interferometry.pair import _block_reduce
+
+        if state.range_offset_flatten_phase is not None:
+            range_offset_ml = _block_reduce(
+                state.range_offset_flatten_phase.astype(np.float64),
+                az_looks,
+                rg_looks,
+            )[:height, :width]
+            residual_topo = (topo + range_offset_ml).astype(np.float64)
+            flat = remove_topographic_phase(state.complex_ifg, residual_topo)
+            residual_finite = residual_topo[np.isfinite(residual_topo)]
+            residual_span = (
+                float(np.max(residual_finite) - np.min(residual_finite))
+                if residual_finite.size
+                else 0.0
+            )
+            state.note(
+                f"FLATTEN residual DEM topo after range-offset "
+                f"model_rms={rms:.3f} residual_span={residual_span:.3f} rad "
+                f"topo_valid_frac={topo_valid_frac:.3f}"
+            )
+            state.topo_phase = np.asarray(
+                residual_topo, dtype=np.float32
+            )
+            # Do NOT remove a residual azimuth ramp here: ISCE2 does not apply
+            # one in its flatten step, and the estimated ramp was found to
+            # introduce ~2 rad of spurious phase on IW3_b0.
+        else:
+            # Fallback: no stored range-offset phase, use scale estimation
+            from faninsar.processing.interferometry.flatten import (
+                estimate_residual_topographic_scale,
+            )
+
+            scale, residual_rms = estimate_residual_topographic_scale(
+                state.complex_ifg,
+                topo,
+                coherence=state.coherence,
+            )
+            if abs(scale) > 1e-3 and topo_valid_frac > 0.05:
+                residual_topo = (scale * topo).astype(np.float64)
+                flat = remove_topographic_phase(state.complex_ifg, residual_topo)
+                state.note(
+                    f"FLATTEN residual DEM topo after range-offset "
+                    f"scale={scale:.3f} model_rms={rms:.3f} "
+                    f"residual_rms={residual_rms:.3f} "
+                    f"topo_valid_frac={topo_valid_frac:.3f}"
+                )
+            else:
+                flat = state.complex_ifg
+                state.note(
+                    f"FLATTEN range-offset only (no residual DEM; "
+                    f"scale={scale:.3f} residual_rms={residual_rms:.3f} "
+                    f"topo_valid_frac={topo_valid_frac:.3f})"
+                )
+            state.topo_phase = (
+                np.asarray(scale * topo, dtype=np.float32)
+                if abs(scale) > 1e-3
+                else np.zeros_like(topo, dtype=np.float32)
+            )
+            if topo_valid_frac > 0.05:
+                az_ramp = estimate_residual_azimuth_ramp(
+                    flat,
+                    topo,
+                    coherence=state.coherence,
+                )
+                if abs(az_ramp) > 1e-6:
+                    flat = remove_azimuth_phase_ramp(flat, az_ramp)
+                    state.note(f"FLATTEN residual_az_ramp={az_ramp:.5f} rad/az_sample")
+        flat_masked, coh_flat, wrapped_flat = mask_invalid_looks(
+            np.asarray(flat, dtype=np.complex64), state.coherence
+        )
+        state.complex_ifg_flat = flat_masked
+        if coh_flat is not None:
+            state.coherence = coh_flat
+        state.wrapped_phase = wrapped_flat
+        return state
+
     # Residual Doppler / differential TOPS carrier leaves a near-linear
     # azimuth phase ramp on the original-domain ifg. Estimate it against the
     # path-length geometric model and remove it from the unflattened product.
@@ -598,22 +944,39 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
     if coh_flat is not None:
         state.coherence = coh_flat
     state.wrapped_phase = wrapped_flat
-    topo_finite = topo[np.isfinite(topo)]
-    if topo_finite.size:
-        rms = float(np.std(topo_finite))
-        span = float(np.max(topo_finite) - np.min(topo_finite))
-    else:
-        rms, span = float("nan"), float("nan")
-    state.note(f"FLATTEN geometric_phase rms={rms:.3f} rad span={span:.1f} rad")
+    state.note(
+        f"FLATTEN geometric_phase rms={rms:.3f} rad span={span:.1f} rad "
+        f"topo_valid_frac={topo_valid_frac:.3f}"
+    )
     return state
 
 
 def stage_unwrap(
     state: ProductionPairState,
     *,
+    method: UnwrapBackend = "snaphu",
     config: SnaphuConfig | None = None,
+    irls_kwargs: dict[str, Any] | None = None,
 ) -> ProductionPairState:
-    """Unwrap the flattened interferogram with snaphu-py."""
+    """Unwrap the flattened interferogram with the selected backend.
+
+    Parameters
+    ----------
+    state : ProductionPairState
+        Pair state containing a flattened interferogram and coherence.
+    method : {"irls", "snaphu"}, optional
+        Spatial unwrapping backend.
+    config : SnaphuConfig, optional
+        SNAPHU configuration when ``method="snaphu"``.
+    irls_kwargs : dict, optional
+        Arguments forwarded to the IRLS backend.
+
+    Returns
+    -------
+    ProductionPairState
+        Updated state containing unwrapped phase and component labels.
+
+    """
     ifg = (
         state.complex_ifg_flat
         if state.complex_ifg_flat is not None
@@ -624,12 +987,51 @@ def stage_unwrap(
     result: CommonUnwrapResult = unwrap_dispatch(
         ifg,
         state.coherence,
-        method="snaphu",
+        method=method,
         snaphu_config=config,
+        irls_kwargs=irls_kwargs,
     )
     state.unwrapped_phase = result.unwrapped_phase
     state.connected_components = result.connected_components
+    state.unwrap_method = result.method
     state.note(f"UNWRAP method={result.method} metrics={result.metrics}")
+
+    # Non-DEM residual range/azimuth poly (orbit residual / APS / far-range).
+    # Non-DEM residual range/azimuth poly (orbit residual / APS / far-range).
+    # Fit on unwrapped phase (stable for multi-fringe), apply to both unwrap
+    # and the flattened complex product used by merge.
+    from faninsar.processing.interferometry.flatten import (
+        apply_residual_phase_screen_to_products,
+    )
+
+    flat_src = (
+        state.complex_ifg_flat
+        if state.complex_ifg_flat is not None
+        else state.complex_ifg
+    )
+    unw_corr, z_corr, _screen, span, applied = apply_residual_phase_screen_to_products(
+        unwrapped_phase=state.unwrapped_phase,
+        complex_ifg=flat_src,
+        coherence=state.coherence,
+        range_degree=2,
+        azimuth_degree=1,
+        min_span_rad=1.0,
+        max_span_rad=40.0,
+        connected_components=state.connected_components,
+    )
+    if applied:
+        state.unwrapped_phase = np.asarray(unw_corr, dtype=np.float32)
+        if z_corr is not None:
+            state.complex_ifg_flat = np.asarray(z_corr, dtype=np.complex64)
+            state.wrapped_phase = np.angle(state.complex_ifg_flat).astype(np.float32)
+        state.note(
+            f"UNWRAP residual phase screen span={span:.2f} rad "
+            f"rg_deg=2 az_deg=1"
+        )
+    elif span >= 1.0:
+        state.note(
+            f"UNWRAP residual phase screen skipped span={span:.2f} rad"
+        )
     return state
 
 
@@ -741,6 +1143,8 @@ def stage_write(
         "full_burst_shape": list(state.reference.array.samples.shape),
         "temporal_baseline_days": temporal_days,
         "stages": list(state.log),
+        "stage_timings_s": dict(state.stage_timings_s),
+        "coregistration_timings_s": dict(state.coregistration_timings_s),
     }
     if state.baseline is not None:
         meta["baseline_parallel_m"] = state.baseline.parallel_m
@@ -762,9 +1166,63 @@ def stage_write(
     )
     out = Path(output_dir)
     zarr_path = write_pair_zarr(product, out / f"{state.pair_id}.zarr")
+    reference_slc = state.reference_geocoded_slc
+    secondary_slc = state.secondary_geocoded_slc
+    slc_valid = state.geocoded_slc_valid
+    transform_azimuth = None if state.geo2rdr_lut is None else state.geo2rdr_lut.az_full
+    transform_range = None if state.geo2rdr_lut is None else state.geo2rdr_lut.rg_full
+    transform_valid = None if state.geo2rdr_lut is None else state.geo2rdr_lut.valid
+    topo_phase = state.topo_phase
+    reopened_from_work = state.geo_work_dir is not None and state.geo_grid is not None
+    if reopened_from_work:
+        assert state.geo_work_dir is not None
+        assert state.geo_grid is not None
+        shape = state.geo_grid.shape
+        reference_slc = np.memmap(
+            state.geo_work_dir / "slc" / "reference_geo.complex64",
+            mode="r",
+            dtype=np.complex64,
+            shape=shape,
+        )
+        secondary_slc = np.memmap(
+            state.geo_work_dir / "slc" / "secondary_geo.complex64",
+            mode="r",
+            dtype=np.complex64,
+            shape=shape,
+        )
+        slc_valid = np.memmap(
+            state.geo_work_dir / "slc" / "geo_valid.bool",
+            mode="r",
+            dtype=np.bool_,
+            shape=shape,
+        )
+        transform_azimuth = np.memmap(
+            state.geo_work_dir / "lut" / "reference_azimuth.float64",
+            mode="r",
+            dtype=np.float64,
+            shape=shape,
+        )
+        transform_range = np.memmap(
+            state.geo_work_dir / "lut" / "reference_range.float64",
+            mode="r",
+            dtype=np.float64,
+            shape=shape,
+        )
+        transform_valid = np.memmap(
+            state.geo_work_dir / "lut" / "reference_valid.bool",
+            mode="r",
+            dtype=np.bool_,
+            shape=shape,
+        )
+        topo_phase = np.memmap(
+            state.geo_work_dir / "topographic_phase.float32",
+            mode="r",
+            dtype=np.float32,
+            shape=shape,
+        )
     if (
-        state.reference_geocoded_slc is not None
-        and state.secondary_geocoded_slc is not None
+        reference_slc is not None
+        and secondary_slc is not None
         and state.geo_grid is not None
     ):
         import zarr
@@ -773,23 +1231,31 @@ def stage_write(
         slc = root.require_group("slc")
         slc.create_array(
             "reference",
-            data=state.reference_geocoded_slc,
+            data=reference_slc,
             overwrite=True,
         )
+        if reopened_from_work and isinstance(reference_slc, np.memmap):
+            close_memmap(reference_slc)
         slc.create_array(
             "secondary",
-            data=state.secondary_geocoded_slc,
+            data=secondary_slc,
             overwrite=True,
         )
-        if state.geocoded_slc_valid is not None:
+        if reopened_from_work and isinstance(secondary_slc, np.memmap):
+            close_memmap(secondary_slc)
+        if slc_valid is not None:
             slc.create_array(
                 "valid",
-                data=state.geocoded_slc_valid.astype(np.uint8),
+                data=slc_valid.astype(np.uint8),
                 overwrite=True,
             )
-        x, y = state.geo_grid.xy_pixel_centers()
-        slc.create_array("x", data=x[0].astype(np.float64), overwrite=True)
-        slc.create_array("y", data=y[:, 0].astype(np.float64), overwrite=True)
+            if reopened_from_work and isinstance(slc_valid, np.memmap):
+                close_memmap(slc_valid)
+        x0, dx, _, y0, _, dy = state.geo_grid.transform
+        x = x0 + dx * (0.5 + np.arange(state.geo_grid.width, dtype=np.float64))
+        y = y0 + dy * (0.5 + np.arange(state.geo_grid.height, dtype=np.float64))
+        slc.create_array("x", data=x, overwrite=True)
+        slc.create_array("y", data=y, overwrite=True)
         slc.attrs.update(
             {
                 "crs": state.geo_grid.crs,
@@ -797,23 +1263,33 @@ def stage_write(
                 "phase_domain": "reramped_flattened",
             }
         )
-        if state.geo2rdr_lut is not None:
+        if (
+            transform_azimuth is not None
+            and transform_range is not None
+            and transform_valid is not None
+        ):
             transform = root.require_group("transform")
             transform.create_array(
                 "reference_azimuth_index",
-                data=state.geo2rdr_lut.az_full,
+                data=transform_azimuth,
                 overwrite=True,
             )
+            if reopened_from_work and isinstance(transform_azimuth, np.memmap):
+                close_memmap(transform_azimuth)
             transform.create_array(
                 "reference_range_index",
-                data=state.geo2rdr_lut.rg_full,
+                data=transform_range,
                 overwrite=True,
             )
+            if reopened_from_work and isinstance(transform_range, np.memmap):
+                close_memmap(transform_range)
             transform.create_array(
                 "valid",
-                data=state.geo2rdr_lut.valid.astype(np.uint8),
+                data=transform_valid.astype(np.uint8),
                 overwrite=True,
             )
+            if reopened_from_work and isinstance(transform_valid, np.memmap):
+                close_memmap(transform_valid)
     if state.geocoded is not None:
         import zarr
 
@@ -821,8 +1297,10 @@ def stage_write(
         geo = root.require_group("geocoded")
         for name, array in state.geocoded.items():
             geo.create_array(name, data=array, overwrite=True)
-        if state.topo_phase is not None:
-            root.create_array("topo_phase", data=state.topo_phase, overwrite=True)
+        if topo_phase is not None:
+            root.create_array("topo_phase", data=topo_phase, overwrite=True)
+            if reopened_from_work and isinstance(topo_phase, np.memmap):
+                close_memmap(topo_phase)
 
     # STAC with bbox from geocoded lon/lat when available
     stac_path = out / f"{state.pair_id}.json"
@@ -890,6 +1368,19 @@ def stage_write(
 
     state.zarr_path = zarr_path
     state.stac_path = stac_path
+    if state.memory_watchdog is not None:
+        state.memory_watchdog.sample("write:complete")
+    if state.geo_work_dir is not None:
+        work_directory = state.geo_work_dir
+        state.reference_geocoded_slc = None
+        state.secondary_geocoded_slc = None
+        state.geocoded_slc_valid = None
+        state.geo2rdr_lut = None
+        state.geo_height_field = None
+        state.topo_phase = None
+        state.geo_work_dir = None
+        gc.collect()
+        shutil.rmtree(work_directory)
     state.note(f"WRITE {zarr_path}")
     return state
 
@@ -971,14 +1462,17 @@ def run_production_pair(
     multilook: tuple[int, int] = (4, 20),
     goldstein_alpha: float = 0.5,
     snaphu_config: SnaphuConfig | None = None,
-    esd_enabled: bool = True,
-    control_spacing: int = 64,
-    executor: str = "serial",
+    unwrap_method: UnwrapBackend | None = None,
+    irls_kwargs: dict[str, Any] | None = None,
+    esd_enabled: bool = False,
+    amplitude_refinement_enabled: bool = False,
+    control_spacing: int | None = None,
+    executor: str = "torch",
     device: str = "auto",
     coregistration_grid: CoregistrationGrid = "radar",
     geo_grid: GeoGridSpec | None = None,
     geo_height_m: float = 0.0,
-    geo_chunk_size: int = 40,
+    geo_chunk_size: int = 128,
     reference_orbit_path: str | Path | None = None,
     secondary_orbit_path: str | Path | None = None,
 ) -> ProductionPairState:
@@ -1009,16 +1503,23 @@ def run_production_pair(
     snaphu_config : SnaphuConfig, optional
         snaphu-py configuration. By default, ``nlooks`` is the product of the
         azimuth and range multilook factors.
+    unwrap_method : {"irls", "snaphu"}, optional
+        Spatial unwrap backend. Defaults to ``"irls"`` for geo coregistration
+        and ``"snaphu"`` for radar coregistration.
+    irls_kwargs : dict, optional
+        Arguments forwarded to IRLS. The pipeline device is used by default.
     esd_enabled : bool, optional
         Enable spectral diversity azimuth residual.
+    amplitude_refinement_enabled : bool, optional
+        Enable a global amplitude-correlation residual shift after geometric
+        coregistration. Disabled by default.
     control_spacing : int, optional
-        Geometry control-point spacing in pixels.
-    executor : {"serial", "dask-torch"}, optional
-        Lanczos compute path for coregistration and geo-grid interpolation.
-        Default ``"serial"``.
+        Geometry control-point spacing. Defaults to 8 pixels for radar mode
+        and 64 pixels for geo mode.
+    executor : {"torch"}, optional
+        Unified Torch Lanczos path for coregistration and geo-grid interpolation.
     device : {"auto","cpu","cuda","mps"}, optional
-        Torch device when ``executor="dask-torch"``. ``"auto"`` selects CUDA
-        when available, otherwise CPU/NumPy fallback. Default ``"auto"``.
+        Torch device. ``"auto"`` selects CUDA, then MPS, then CPU.
     coregistration_grid : {"radar", "geo"}, optional
         Coordinate grid on which the two SLCs are coregistered.
     geo_grid : GeoGridSpec, optional
@@ -1027,7 +1528,10 @@ def run_production_pair(
         Fallback constant height (m) when DEM is unavailable for geo2rdr.
         A real DEM should be supplied for production. Default 0.
     geo_chunk_size : int, optional
-        Row chunk for geo2rdr. Default 40.
+        Row chunk shared by geo2rdr, SLC remapping, and geographic flattening.
+        Default 128 to amortize Dask graph and disk-backed array overhead while
+        retaining bounded memory use. Larger values can improve throughput on
+        hosts with more available memory.
     reference_orbit_path, secondary_orbit_path : path, optional
         Precise ESA EOF orbits for the two acquisitions.
 
@@ -1047,6 +1551,8 @@ def run_production_pair(
             f"coregistration_grid='geo' requires scope='burst'; got scope={scope!r}"
         )
 
+    total_started = time.perf_counter()
+    stage_started = time.perf_counter()
     reference = load_production_scene(
         reference_path,
         swath=swath,
@@ -1056,6 +1562,8 @@ def run_production_pair(
         orbit_path=reference_orbit_path,
         coregistration_grid=coregistration_grid,
     )
+    load_reference_s = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
     secondary = load_production_scene(
         secondary_path,
         swath=swath,
@@ -1064,6 +1572,12 @@ def run_production_pair(
         dem=dem_sampler,
         orbit_path=secondary_orbit_path,
         coregistration_grid=coregistration_grid,
+    )
+    load_secondary_s = time.perf_counter() - stage_started
+    resolved_unwrap_method: UnwrapBackend = (
+        unwrap_method
+        if unwrap_method is not None
+        else ("irls" if coregistration_grid == "geo" else "snaphu")
     )
     state = ProductionPairState(
         pair_id=f"{reference.scene_id}_{secondary.scene_id}",
@@ -1076,36 +1590,103 @@ def run_production_pair(
         coreg_device=str(device),
         multilook=tuple(int(x) for x in multilook),
         goldstein_alpha=float(goldstein_alpha),
-        unwrap_method="snaphu",
+        unwrap_method=resolved_unwrap_method,
         geo_grid_meta=_geo_grid_meta(geo_grid),
+        stage_timings_s={
+            "load_reference": load_reference_s,
+            "load_secondary": load_secondary_s,
+        },
     )
+    _geo_temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+    geo_work_directory: Path | None = None
+    memory_watchdog: MemoryWatchdog | None = None
+    if coregistration_grid == "geo":
+        from faninsar.processing.memory import MemoryWatchdog
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        _geo_temporary_directory = tempfile.TemporaryDirectory(
+            prefix=f".{state.pair_id}-geo-",
+            dir=output_path,
+        )
+        geo_work_directory = Path(_geo_temporary_directory.name)
+        memory_watchdog = MemoryWatchdog.for_current_system(
+            record_path=output_path / f"{state.pair_id}.memory.jsonl"
+        )
+        state.geo_work_dir = geo_work_directory
+        state.memory_watchdog = memory_watchdog
+        memory_watchdog.sample("geo_pipeline:start")
     state.note(f"START scope={scope} coregistration_grid={coregistration_grid}")
+    stage_started = time.perf_counter()
     state = stage_deramp(state)
+    state.stage_timings_s["deramp"] = time.perf_counter() - stage_started
+    if memory_watchdog is not None:
+        memory_watchdog.sample(
+            "deramp:complete",
+            wall_s=state.stage_timings_s["deramp"],
+        )
+    stage_started = time.perf_counter()
     state = stage_coregister(
         state,
         control_spacing=control_spacing,
         esd_enabled=esd_enabled,
+        amplitude_refinement_enabled=amplitude_refinement_enabled,
         executor=executor,
         device=device,
         coregistration_grid=coregistration_grid,
         geo_grid=geo_grid,
         geo_height_m=geo_height_m,
         geo_chunk_size=geo_chunk_size,
+        geo_work_dir=geo_work_directory,
+        memory_watchdog=memory_watchdog,
     )
+    state.stage_timings_s["coregister"] = time.perf_counter() - stage_started
+    if memory_watchdog is not None:
+        memory_watchdog.sample(
+            "coregister:complete",
+            wall_s=state.stage_timings_s["coregister"],
+        )
+    stage_started = time.perf_counter()
     state = stage_interferogram(
         state,
         multilook=multilook,
         goldstein_alpha=goldstein_alpha,
+        dead_pixel_amp_threshold=3.0,
     )
+    state.stage_timings_s["interferogram"] = time.perf_counter() - stage_started
+    if memory_watchdog is not None:
+        memory_watchdog.sample(
+            "interferogram:complete",
+            wall_s=state.stage_timings_s["interferogram"],
+        )
+    stage_started = time.perf_counter()
     if coregistration_grid == "radar":
         state = stage_flatten(state)
     else:
         state.complex_ifg_flat = state.complex_ifg
         state.note("FLATTEN applied to secondary geocoded SLC before IFG formation")
-    if snaphu_config is None:
+    state.stage_timings_s["flatten"] = time.perf_counter() - stage_started
+    if resolved_unwrap_method == "snaphu" and snaphu_config is None:
         snaphu_config = SnaphuConfig(nlooks=float(multilook[0] * multilook[1]))
-    state = stage_unwrap(state, config=snaphu_config)
+    resolved_irls_kwargs = dict(irls_kwargs or {})
+    if resolved_unwrap_method == "irls":
+        resolved_irls_kwargs.setdefault("device", device)
+    stage_started = time.perf_counter()
+    state = stage_unwrap(
+        state,
+        method=resolved_unwrap_method,
+        config=snaphu_config,
+        irls_kwargs=resolved_irls_kwargs,
+    )
+    state.stage_timings_s["unwrap"] = time.perf_counter() - stage_started
+    if memory_watchdog is not None:
+        memory_watchdog.sample(
+            "unwrap:complete",
+            wall_s=state.stage_timings_s["unwrap"],
+        )
+    stage_started = time.perf_counter()
     state = stage_baseline(state)
+    state.stage_timings_s["baseline"] = time.perf_counter() - stage_started
     if coregistration_grid == "geo":
         assert geo_grid is not None
         assert state.unwrapped_phase is not None
@@ -1132,7 +1713,13 @@ def run_production_pair(
             "height_m": np.asarray(height_field, dtype=np.float64),
             "converged": converged,
         }
+        if isinstance(state.geo_height_field, np.memmap):
+            close_memmap(state.geo_height_field)
+            state.geo_height_field = None
         state.note("GEO products complete on multilooked geographic grid")
+    stage_started = time.perf_counter()
     state = stage_write(state, output_dir)
+    state.stage_timings_s["write"] = time.perf_counter() - stage_started
+    state.stage_timings_s["total"] = time.perf_counter() - total_started
     state.note("DONE")
     return state
