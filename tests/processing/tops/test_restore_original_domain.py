@@ -81,6 +81,71 @@ def test_deramped_single_remap_matches_integer_shifted_interferogram() -> None:
     assert float(np.sqrt(np.mean(dph_bad[mask] ** 2))) > 0.8
 
 
+def test_deramped_remap_fractional_shift_phase_error_bound() -> None:
+    """Fractional offsets keep residual phase error small on band-limited signals.
+
+    Dual-modes root-cause analysis showed ~1 rad dual_std gap is consistent with
+    O(0.002) px phase error after carrier mishandling. Analytical reramp at
+    fractional source coords must keep phase error well below that on a pure
+    geometric phase field.
+    """
+    height, width = 96, 160
+    az = np.arange(height, dtype=np.float64)[:, None]
+    rg = np.arange(width, dtype=np.float64)[None, :]
+    geo_phase = 0.03 * rg + 0.008 * az
+
+    carrier_ref = _carrier(fm0=-1800.0, dc0=40.0)
+    carrier_sec = _carrier(fm0=-3500.0, dc0=300.0)
+    phi_ref = tops_carrier_phase(carrier_ref, height, width, dtype=np.float64)
+    phi_sec = tops_carrier_phase(carrier_sec, height, width, dtype=np.float64)
+
+    ref_orig = np.exp(1j * (0.5 * geo_phase + phi_ref)).astype(np.complex64)
+    # Secondary is geometrically shifted by a known fractional offset on the
+    # deramped field; analytic phase without carrier is the truth reference.
+    off_rg, off_az = 2.35, 1.4
+    sec_geo = np.exp(1j * (-0.5 * geo_phase)).astype(np.complex64)
+    # Build secondary in original domain at unshifted grid, then deramp+resample.
+    sec_orig = (sec_geo * np.exp(1j * phi_sec)).astype(np.complex64)
+
+    ref_d = deramp(ref_orig, carrier_ref)
+    sec_d = deramp(sec_orig, carrier_sec)
+    sec_resamp = resample_complex_deramped_reramp(
+        sec_d,
+        secondary_carrier=carrier_sec,
+        range_offset_px=off_rg,
+        azimuth_offset_px=off_az,
+        output_carrier=carrier_ref,
+    )
+    ref_out = reramp(ref_d, carrier_ref)
+    ifg = form_interferogram(ref_out, sec_resamp, multilook=(1, 1))
+
+    # Expected geometric ifg phase after perfect coreg: geo_phase (ref 0.5 - sec -0.5).
+    # Because we apply offset on secondary (source = out - offset), the secondary
+    # geometric phase at output (r,c) comes from source (r-off_az, c-off_rg).
+    rows = az + 0.0
+    cols = rg + 0.0
+    src_r = rows - off_az
+    src_c = cols - off_rg
+    # Interior valid for fractional sampling
+    interior = (
+        (src_r > 4)
+        & (src_r < height - 5)
+        & (src_c > 4)
+        & (src_c < width - 5)
+    )
+    expected = 0.5 * geo_phase - (-0.5) * (
+        0.03 * src_c + 0.008 * src_r
+    )
+    # After form_interferogram (ref * conj(sec)) in original domain, carrier
+    # should cancel if reramp uses ref carrier on both — residual ≈ geo only.
+    dph = np.angle(ifg.complex_ifg * np.exp(-1j * expected))
+    mask = interior & (np.abs(ifg.complex_ifg) > 0.5)
+    assert mask.any()
+    rmse = float(np.sqrt(np.mean(dph[mask] ** 2)))
+    # Bound well below the historical ~1 rad formation gap.
+    assert rmse < 0.25
+
+
 def test_restore_original_domain_is_unit_magnitude() -> None:
     """Restore multiplies by a pure phase factor (amplitude preserved)."""
     height, width = 32, 48
