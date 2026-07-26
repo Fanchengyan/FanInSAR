@@ -15,7 +15,7 @@ from faninsar.processing.errors import reject_invalid_state
 
 logger = setup_logger(__name__)
 
-# Pinned ref for 20161207–20161231 IW1 burst0 three-way UTM compare.
+# Pinned ref for 20161207-20161231 IW1 burst0 three-way UTM compare.
 # Absolute path so scripts/tests work regardless of cwd. Do not auto-move.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_PINNED_REF_JSON = (
@@ -69,12 +69,12 @@ def select_common_ref_point(
     smooth_window : int, optional
         Odd window for median filter on the mean-coherence map before
         ``argmax``. Suppresses single-pixel speckles while still selecting by
-        mean-of-three γ (objective's definition). ``1`` disables smoothing.
+        mean-of-three coherence (objective's definition). ``1`` disables smoothing.
 
     Returns
     -------
     CommonRefPoint
-        Selected row/col and per-stack γ.
+        Selected row/col and per-stack coherence.
 
     Raises
     ------
@@ -123,7 +123,7 @@ def select_common_ref_point(
     per = {lab: float(stack[i, row, col]) for i, lab in enumerate(labels)}
     mean_v = float(np.mean(list(per.values())))
     logger.info(
-        "Common ref pixel row=%d col=%d mean_γ=%.4f (%s)",
+        "Common ref pixel row=%d col=%d mean_coh=%.4f (%s)",
         row,
         col,
         mean_v,
