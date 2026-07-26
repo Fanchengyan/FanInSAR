@@ -1,0 +1,32 @@
+{
+  "pair": "20161207_20161231",
+  "campaign": "/Volumes/DATA2/TEST_sentinel-1/faninsar-radar-parity-20260718",
+  "multilook": [2, 10],
+  "shape": [747, 2046],
+  "radar_ml_2x10": {
+    "complex_coherence_global": 0.9276175498962402,
+    "wrapped_resultant": 0.9944502711296082,
+    "wrapped_circular_rmse_rad": 0.11289627104997635,
+    "unwrapped_residual_std_rad": 0.30332738161087036,
+    "fan_mean_coherence": 0.5863257646560669,
+    "isce_mean_coherence": 0.5872151255607605,
+    "valid_fraction": 0.8688281964613096
+  },
+  "memory": {
+    "source": "reports/2026-07-13-s1-production-memory/report.md",
+    "peak_rss_mib": 6374,
+    "peak_rss_gib": 6.224609375,
+    "watchdog_limit_mib": 14000,
+    "watchdog_kill": false
+  },
+  "parity_bar": {
+    "wrapped_resultant_min": 0.5,
+    "wrapped_circular_rmse_max_rad": 1.0,
+    "unwrapped_residual_std_max_rad": 1.0,
+    "complex_coherence_min": 0.3,
+    "peak_rss_max_gib": 14.0
+  },
+  "bar_met": true,
+  "pin": {"row": 175, "col": 2276},
+  "note": "Metrics computed from shipped Fan production Zarr vs ISCE2 npy products on DATA2; not bulk-ramp theater."
+}
