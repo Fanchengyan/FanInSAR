@@ -40,10 +40,13 @@ from faninsar.processing.geometry.baseline import BaselineComponents
 from faninsar.processing.interferometry.flatten import (
     compute_geometric_phase_from_geo,
     compute_topographic_phase,
+    estimate_residual_azimuth_ramp,
+    estimate_residual_topographic_scale,
     remove_azimuth_phase_ramp,
     remove_topographic_phase,
 )
 from faninsar.processing.interferometry.pair import (
+    _block_reduce,
     form_interferogram,
     goldstein_filter,
     mask_invalid_looks,
@@ -835,11 +838,6 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
         # large (thousands of radians) because the grid-step phase jump exceeds
         # 2π.  Instead of estimating a scale, directly compute and remove the
         # residual (matching ISCE2's full geometric flatten on the interferogram).
-        from faninsar.processing.interferometry.flatten import (
-            estimate_residual_azimuth_ramp,
-        )
-        from faninsar.processing.interferometry.pair import _block_reduce
-
         if state.range_offset_flatten_phase is not None:
             range_offset_ml = _block_reduce(
                 state.range_offset_flatten_phase.astype(np.float64),
@@ -859,18 +857,12 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
                 f"model_rms={rms:.3f} residual_span={residual_span:.3f} rad "
                 f"topo_valid_frac={topo_valid_frac:.3f}"
             )
-            state.topo_phase = np.asarray(
-                residual_topo, dtype=np.float32
-            )
+            state.topo_phase = np.asarray(residual_topo, dtype=np.float32)
             # Do NOT remove a residual azimuth ramp here: ISCE2 does not apply
             # one in its flatten step, and the estimated ramp was found to
             # introduce ~2 rad of spurious phase on IW3_b0.
         else:
-            # Fallback: no stored range-offset phase, use scale estimation
-            from faninsar.processing.interferometry.flatten import (
-                estimate_residual_topographic_scale,
-            )
-
+            # Fallback: no stored range-offset phase, use scale estimation.
             scale, residual_rms = estimate_residual_topographic_scale(
                 state.complex_ifg,
                 topo,

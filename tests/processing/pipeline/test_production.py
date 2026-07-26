@@ -15,11 +15,15 @@ from faninsar.processing.pipeline import (
     ProductionPairState,
     load_production_scene,
     run_production_pair,
+    stage_coregister,
     stage_deramp,
     stage_flatten,
     stage_interferogram,
     stage_unwrap,
     stage_write,
+)
+from faninsar.processing.pipeline.production import (
+    _apply_geo_topographic_phase_chunked,
 )
 from faninsar.processing.tops.deramp import TOPSCarrierModel
 from faninsar.processing.unwrap import SnaphuConfig
@@ -92,6 +96,72 @@ def test_stage_deramp_with_synthetic() -> None:
     assert "DERAMP" in " ".join(result.log)
 
 
+def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Geometry-only radar coregistration must skip global shift refinement."""
+    from faninsar.processing.pipeline import production as production_mod
+
+    shape = (16, 32)
+    ref = _make_mock_scene(shape)
+    sec = _make_mock_scene(shape)
+    ref.geometry.range_spacing_m = 2.3
+    ref.geometry.wavelength_m = 0.056
+    sec.geometry.range_spacing_m = 2.3
+    sec.geometry.wavelength_m = 0.056
+    state = ProductionPairState(
+        pair_id="geometry_only_coregistration",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+        multilook=(2, 4),
+    )
+    state.reference_deramped = np.ones(shape, dtype=np.complex64)
+    state.secondary_deramped = np.ones(shape, dtype=np.complex64)
+    offsets = MagicMock()
+    offsets.range_offset_px = np.zeros(shape, dtype=np.float32)
+    offsets.azimuth_offset_px = np.full(shape, 0.25, dtype=np.float32)
+    offsets.coverage = np.ones(shape, dtype=bool)
+    geometry_call: dict[str, object] = {}
+
+    def fake_dense_geometry_offsets(**kwargs: object) -> MagicMock:
+        geometry_call.update(kwargs)
+        return offsets
+
+    monkeypatch.setattr(
+        production_mod,
+        "dense_geometry_offsets",
+        fake_dense_geometry_offsets,
+    )
+    monkeypatch.setattr(
+        production_mod,
+        "refine_shift_with_correlation",
+        lambda *_args, **_kwargs: pytest.fail("empirical shift refinement was called"),
+    )
+    monkeypatch.setattr(
+        production_mod,
+        "combine_offset_fields",
+        lambda geometry_field, **_kwargs: geometry_field,
+    )
+    monkeypatch.setattr(
+        production_mod,
+        "resample_complex_deramped_reramp",
+        lambda samples, **_kwargs: samples.copy(),
+    )
+
+    result = stage_coregister(
+        state,
+        esd_enabled=False,
+        amplitude_refinement_enabled=False,
+        executor="torch",
+        device="cpu",
+    )
+
+    assert result.range_shift_px == 0.0
+    assert result.azimuth_shift_px == 0.25
+    assert geometry_call["stride"] == 8
+
+
 def test_stage_interferogram_with_synthetic() -> None:
     """stage_interferogram forms a multilooked interferogram from aligned arrays."""
     ref = _make_mock_scene((16, 16))
@@ -109,6 +179,112 @@ def test_stage_interferogram_with_synthetic() -> None:
     assert result.coherence is not None
     assert result.wrapped_phase is not None
     assert "IFG" in " ".join(result.log)
+
+
+def test_geo_topographic_phase_preserves_row_order_when_chunked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disk-backed topographic phase tiles preserve geographic row order."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.pipeline import production
+    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+
+    state = MagicMock()
+    shape = (12, 5)
+    radar_shape = (64, 10)
+    azimuth = np.arange(60, dtype=np.float64).reshape(shape)
+    lut = Geo2RdrLUT(
+        az_full=azimuth,
+        rg_full=np.full(shape, 2.0),
+        valid=np.ones(shape, dtype=bool),
+        full_radar_shape=radar_shape,
+        height_m=0.0,
+    )
+    offsets = OffsetFieldResult(
+        range_offset_px=np.zeros(radar_shape, dtype=np.float32),
+        azimuth_offset_px=np.full(radar_shape, 0.25, dtype=np.float32),
+        coverage=np.ones(radar_shape, dtype=bool),
+        uncertainty_px=np.zeros(radar_shape, dtype=np.float32),
+    )
+    grid = GeoGridSpec(
+        crs="EPSG:4326",
+        transform=(0.0, 1.0, 0.0, 12.0, 0.0, -1.0),
+        width=shape[1],
+        height=shape[0],
+        resolution_m=(1.0, 1.0),
+    )
+    state.dem.sample.side_effect = lambda latitude, _longitude: np.full(
+        latitude.shape,
+        2.0,
+    )
+    reference = np.memmap(
+        tmp_path / "reference.complex64",
+        mode="w+",
+        dtype=np.complex64,
+        shape=shape,
+    )
+    secondary = np.memmap(
+        tmp_path / "secondary.complex64",
+        mode="w+",
+        dtype=np.complex64,
+        shape=shape,
+    )
+    valid = np.memmap(
+        tmp_path / "valid.bool",
+        mode="w+",
+        dtype=np.bool_,
+        shape=shape,
+    )
+    reference[:] = 1.0
+    secondary[:] = 1.0
+    valid[:] = True
+
+    def fake_geometric_phase(
+        _reference: object,
+        _secondary: object,
+        latitude: np.ndarray,
+        longitude: np.ndarray,
+        height: np.ndarray,
+        reference_azimuth: np.ndarray,
+        secondary_azimuth_values: np.ndarray,
+        *,
+        reference_range_index: np.ndarray | None = None,
+    ) -> np.ndarray:
+        assert reference_range_index is not None
+        return (
+            latitude + longitude + height + reference_azimuth + secondary_azimuth_values
+        )
+
+    monkeypatch.setattr(
+        production,
+        "compute_geometric_phase_from_geo",
+        fake_geometric_phase,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.pipeline.geo_lut.grid_lonlat_rows",
+        lambda _grid, row_start, row_stop: (
+            np.arange(60, dtype=np.float64).reshape(shape)[row_start:row_stop],
+            np.full(shape, 3.0)[row_start:row_stop],
+        ),
+    )
+    phase, height = _apply_geo_topographic_phase_chunked(
+        state,
+        lut,
+        offsets,
+        reference,
+        secondary,
+        valid,
+        grid=grid,
+        output_dir=tmp_path,
+        chunk_size=3,
+        watchdog=None,
+    )
+
+    expected = 2.0 * azimuth + np.arange(60).reshape(shape) + 4.75
+    np.testing.assert_allclose(phase, expected)
+    np.testing.assert_allclose(height, 2.0)
 
 
 def test_stage_interferogram_masks_zero_power_edge_as_nan() -> None:
@@ -190,6 +366,7 @@ def test_stage_flatten_wrapped_phase_matches_flat_not_unflat(
     result = stage_flatten(state)
     assert result.complex_ifg_flat is not None
     assert result.wrapped_phase is not None
+    assert result.complex_ifg is not None
     complex_ifg_flat = result.complex_ifg_flat
     wrapped_phase = result.wrapped_phase
     # Edge: invalid looks are NaN on both flat product and wrapped phase.
@@ -202,6 +379,55 @@ def test_stage_flatten_wrapped_phase_matches_flat_not_unflat(
     assert abs(float(wrapped_phase[0, 0]) - float(unflat_ph)) > 0.1
     # Topo removal shifts phase by ~0.3 rad relative to unflattened.
     assert np.isclose(float(unflat_ph - flat_ph), 0.3, atol=1e-4)
+
+
+def test_stage_flatten_does_not_repeat_slc_domain_flattening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Range-offset-flattened IFG only removes residual DEM topo, not full topo.
+
+    When ``secondary_aligned_is_flattened`` and the stored range-offset screen
+    already matches the dual-orbit model, residual is ~0 and the product phase
+    is preserved. Full topographic phase is not re-applied as if coreg never
+    flattened (that was the pre-fix double-flatten / skip-residual bug).
+    """
+    from faninsar.processing.pipeline import production as production_mod
+
+    shape = (8, 8)
+    ref = _make_mock_scene((16, 32))
+    sec = _make_mock_scene((16, 32))
+    state = ProductionPairState(
+        pair_id="preflattened_slc",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+    )
+    phase = np.linspace(-1.0, 1.0, 64, dtype=np.float32).reshape(shape)
+    state.complex_ifg = np.exp(1j * phase).astype(np.complex64)
+    state.coherence = np.ones(shape, dtype=np.float32)
+    state.secondary_aligned_is_flattened = True
+    # Full-res range-offset phase that cancels the dual-orbit topo after ML
+    # (az_looks=rg_looks=2 for 16x32 → 8x8). Residual topo = topo + range_ml ≈ 0.
+    topo_ml = np.full(shape, 0.4, dtype=np.float64)
+    range_full = -np.full((16, 32), 0.4, dtype=np.float32)
+    state.range_offset_flatten_phase = range_full
+    monkeypatch.setattr(
+        production_mod,
+        "compute_topographic_phase",
+        lambda *_args, **_kwargs: topo_ml,
+    )
+
+    result = stage_flatten(state)
+
+    assert result.complex_ifg_flat is not None
+    assert result.wrapped_phase is not None
+    # Residual removal with near-zero residual keeps phase (within float noise).
+    np.testing.assert_allclose(
+        np.angle(result.complex_ifg_flat), phase, atol=1e-5
+    )
+    np.testing.assert_allclose(result.wrapped_phase, phase, atol=1e-5)
+    notes = " ".join(result.log)
+    assert "residual DEM topo after range-offset" in notes
 
 
 def test_staged_ifg_only_never_enters_unwrap(tmp_path: Path) -> None:
@@ -289,6 +515,34 @@ def test_stage_unwrap_with_synthetic() -> None:
     assert "UNWRAP" in " ".join(result.log)
 
 
+def test_stage_unwrap_selects_irls_for_geo_products() -> None:
+    """The geo workflow can select the GPU-capable IRLS backend explicitly."""
+    ref = _make_mock_scene((16, 16))
+    sec = _make_mock_scene((16, 16))
+    state = ProductionPairState(
+        pair_id="GEO_IRLS",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+        coregistration_grid="geo",
+        unwrap_method="irls",
+    )
+    y, x = np.mgrid[0:16, 0:16]
+    phase = 0.35 * x + 0.15 * y
+    state.complex_ifg_flat = np.exp(1j * phase).astype(np.complex64)
+    state.coherence = np.ones((16, 16), dtype=np.float32)
+
+    result = stage_unwrap(
+        state,
+        method="irls",
+        irls_kwargs={"device": "cpu", "max_iter": 5},
+    )
+
+    assert result.unwrapped_phase is not None
+    assert result.unwrap_method == "irls"
+    assert "method=irls" in " ".join(result.log)
+
+
 def test_stage_write_with_synthetic(tmp_path: Path) -> None:
     """stage_write persists radar products and metadata to Zarr/STAC."""
     ref = _make_mock_scene((8, 8))
@@ -307,6 +561,7 @@ def test_stage_write_with_synthetic(tmp_path: Path) -> None:
     state.connected_components = np.zeros((8, 8), dtype=np.int32)
     state.range_shift_px = 1.0
     state.azimuth_shift_px = 2.0
+    state.coregistration_timings_s = {"dense_geometry_offsets": 0.25}
 
     result = stage_write(state, tmp_path)
     assert result.zarr_path is not None
@@ -319,6 +574,7 @@ def test_stage_write_with_synthetic(tmp_path: Path) -> None:
     assert "complex_ifg" in root
     assert "coherence" in root
     assert "unwrapped_phase" in root
+    assert "dense_geometry_offsets" in str(root.attrs["coregistration_timings_s"])
 
 
 def test_stage_write_persists_geocoded_slcs(tmp_path: Path) -> None:
