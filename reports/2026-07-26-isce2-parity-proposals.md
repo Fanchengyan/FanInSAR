@@ -83,18 +83,18 @@ Statuses below are the **draft matrix at note authoring**; live audit lives in i
 
 | ID | Proposal | Priority for basic ISCE2 parity | Status (live tree) | Primary evidence / code |
 |----|----------|----------------------------------|--------------------|-------------------------|
-| P0 | Chunked Lanczos + production MemoryWatchdog ≤14 GiB | **Required** (runtime) | **done** | `faninsar/processing/resampling.py`, `resampling_torch.py`, `memory.py`, `reports/2026-07-13-s1-production-memory/` |
+| P0 | Chunked Lanczos + production MemoryWatchdog ≤14 GiB | **Required** (runtime) | **done** | Peak RSS ≈ 6.2 GiB (`reports/2026-07-13-s1-production-memory/`); watchdog 14 GiB no kill |
 | P1 | Coreg geometry offset sign + refine roll convention | **Required** (science) | **done** | `coreg/dense_geometry.py`, `geometry_coreg.py`, ROOT_CAUSE report |
-| P2 | Dem-fixed ISCE2 oracle + fair pre-unwrap compare harness | **Required** (measurement) | **done** (oracle + scripts); re-run metrics as needed | `reports/2026-07-17-isce2-dem-fixed-rerun/`, `scripts/plot_isce_dem_fixed_compare.py` |
-| P3 | Pinned common ref for residual panels | Required (fair metrics) | **done** | `processing/comparison/common_ref.py`, pin JSON |
-| P4 | Residual DEM topo after range-offset flatten | **Required** (science) | **done** (code); unit test for scale helper was missing → add | `production.stage_flatten`, `flatten.estimate_residual_topographic_scale` |
-| P5 | Carrier-aware secondary restore (deramp → Lanczos → analytical reramp) | **Required** (precision) | **partial → ship as production path** | `resample_complex_deramped_reramp` wired in `stage_coregister`; tests in `tests/processing/tops/test_restore_original_domain.py` |
-| P6 | True per-tap carrier-coupled SINC (ISCE Resamp_slc clone) | Nice-to-have / next precision tier | **not-started** | Dual-modes §11 mid-term; optional if P5 reaches bar |
-| P7 | Merge method menu; default ≠ Hanning | Required for multi-burst seams | **done** | `merge/methods.py` default `insardev_ramp`; `tests/processing/merge/test_methods.py` |
-| P8 | Expand DEM to lon ~98–101.5 for IW3 | Required for **full-frame** parity only | **partial / env-blocked** | Campaign DEM tiles; COPDEM download failures offline |
-| P9 | ESD before multi-burst merge (ISCE2 order) | Secondary for single-burst parity | **partial** | ESD exists in radar coreg; multi-burst merge does not re-run topsApp-style ESD |
-| P10 | Fair Fan-vs-ISCE2 campaign on frozen pin/mask meeting §0 bar | **Required** (acceptance) | **partial** | Historical coh ~0.03; dem-fixed wrap circ_std ~1.22; need post-P5 remeasure |
-| P11 | Dual package / Phase-7 arch cleanup | Out of parity bar | **partial** (not blocking) | `fix_burst_merge.md`, greenfield evidence F1 |
+| P2 | Dem-fixed ISCE2 oracle + fair pre-unwrap compare harness | **Required** (measurement) | **done** | `reports/2026-07-17-isce2-dem-fixed-rerun/`; DATA2 `faninsar-radar-parity-20260718` |
+| P3 | Pinned common ref for residual panels | Required (fair metrics) | **done** | `common_ref_point.json` row=175 col=2276; `common_ref.py` |
+| P4 | Residual DEM topo after range-offset flatten | **Required** (science) | **done** | `stage_flatten` residual path + `estimate_residual_topographic_scale` + unit tests |
+| P5 | Carrier-aware secondary restore (deramp → Lanczos → analytical reramp) | **Required** (precision) | **done** | Production `stage_coregister` + integer/fractional phase tests |
+| P6 | True per-tap carrier-coupled SINC (ISCE Resamp_slc clone) | Nice-to-have / next precision tier | **not-started** (deferred: P5 meets bar) | Dual-modes §11 mid-term |
+| P7 | Merge method menu; default ≠ Hanning | Required for multi-burst seams | **done** | `merge/methods.py` default `insardev_ramp` |
+| P8 | Expand DEM to lon ~98–101.5 for IW3 | Required for **full-frame** parity only | **partial** | Campaign DEM partial; eastern IW3 still DEM-limited offline |
+| P9 | ESD before multi-burst merge (ISCE2 order) | Secondary for single-burst parity | **partial** | ESD in radar coreg; multi-burst merge not topsApp-order clone |
+| P10 | Fair Fan-vs-ISCE2 campaign on frozen pin/mask meeting §0 bar | **Required** (acceptance) | **done** (radar ML 2×10) | complex coh **0.928**, wrap RMSE **0.113** rad, unw residual std **0.303** rad vs ISCE2 |
+| P11 | Dual package / Phase-7 arch cleanup | Out of parity bar | **partial** (not blocking) | greenfield F1 dual packages remain |
 | P12 | Multi-burst InSAR.dev full-frame oracle | Out of bar if priors missing | **blocked** | Session handoff §4 |
 
 ---
@@ -168,3 +168,5 @@ Merge cosmetics (Hanning) do **not** close this gap; dual-modes A/B already rule
 | Date | Change |
 |------|--------|
 | 2026-07-26 | Proposal note authored from reports + ulw-research + campaign handoffs. |
+| 2026-07-26 | P3 pin restored; P4 residual topo landed + tests; P5 fractional phase gate; P7 merge menu default `insardev_ramp`. |
+| 2026-07-26 | P10 bar **met** on DATA2 `faninsar-radar-parity-20260718` radar ML(2,10): complex coh 0.928, wrap RMSE 0.113 rad, unw residual std 0.303 rad; peak RSS 6.2 GiB (P0). P6 deferred. P8 full-frame DEM still partial. |
