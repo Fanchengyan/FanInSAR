@@ -137,15 +137,12 @@ Per Waymark `wm-workflow` / `PROCESS.md` and project `AGENTS.md`:
 
 | Kind | Location |
 |------|----------|
-| Oracle / skill comparisons, session experiments | **Sidecar notes:** `/Users/fancy/Documents/GitHub/FanInSAR-stac-trail/waymark/notes/` |
+| Oracle compare scripts, former `processing.comparison`, campaign reports | **`/Volumes/DATA2/TEST_sentinel-1/faninsar-experiments/`** |
+| Sidecar notes (skill audit, layout) | `/Users/fancy/Documents/GitHub/FanInSAR-stac-trail/waymark/notes/` |
 | Heavy campaign products | `/Volumes/DATA2/TEST_sentinel-1/<campaign>/` |
 | Agent throwaway logs | OS/agent scratch only |
 
-Resampling skill vs ISCE2/SNAP/GMTSAR/InSAR.dev audit (experimental):
-
-`/Users/fancy/Documents/GitHub/FanInSAR-stac-trail/waymark/notes/NOTE-0001-sar-resampling-skill-vs-opensource.md`
-
-Do not re-merge bake-off tables into `FanInSAR-stac` unless distilled and human-approved as product Knowledge.
+Do **not** put compare/plot/oracle drivers under `faninsar/` or repo `scripts/`.
 
 ---
 
