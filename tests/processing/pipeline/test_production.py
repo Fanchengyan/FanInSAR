@@ -433,7 +433,7 @@ def test_stage_flatten_does_not_repeat_slc_domain_flattening(
 def test_staged_ifg_only_never_enters_unwrap(tmp_path: Path) -> None:
     """Composed deramp→ifg path yields finite wrapped products without unwrap.
 
-    Mirrors the production stop-gate used by ``scripts/run_three_slc_ifg_compare.py``:
+    Mirrors the external campaign stop-gate recorded by Waymark NOTE-0004:
     stages are composed explicitly so ``stage_unwrap`` is never called.
     Coregistration is stubbed by supplying already-aligned secondaries so the
     unit under test remains the staged ifg stop-gate (not the geometry engine).
