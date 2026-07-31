@@ -1,0 +1,303 @@
+schema_version: 1
+manifest_id: faninsar-radar-geo-pipeline-rebuild
+frozen_at: "2026-07-18"
+
+source_classes:
+  - clean-room input
+  - primary specification
+  - behavior oracle
+  - quarantined
+
+baseline:
+  git_head: e17ffc7d9c37c263c732bd14fd84e036eb8e3266
+  out_of_scope_file_count: 1025
+  retired_history:
+    waymark_note: NOTE-0007
+    inventory_sha256: 8a0908e8ec0897667b9966e6a024ad081dcbb9a966958b6e34bf58c4a1807fa2
+    archive_sha256: 4de07cef6f4247522110caffb45076989ece1e578b00c86c4e49bb0e823504ba
+    archived_entry_count: 584
+    source_paths:
+      - .omo/
+      - plans/
+      - reports/
+      - scripts/
+      - workflow.md
+
+environment:
+  source_classification: primary specification
+  project_python:
+    executable: .venv/bin/python
+    version: 3.12.11
+  uv:
+    executable: uv
+    version: 0.9.26
+  proj:
+    executable: /opt/miniconda3/bin/proj
+    version: 9.3.1
+    proj_data: /opt/miniconda3/share/proj
+    proj_lib: ""
+  gdal:
+    executable: /opt/miniconda3/bin/gdalinfo
+    version: 3.11.0
+    gdal_data: /opt/miniconda3/share/gdal
+  snaphu:
+    python_package: snaphu
+    python_version: 0.4.1
+    backend_version: 2.0.7
+    executable: .venv/lib/python3.12/site-packages/snaphu/snaphu
+  numerical_stack:
+    numpy: 2.4.1
+    rasterio: 1.5.0
+    pyproj: 3.7.2
+    xarray: 2025.12.0
+    zarr: 3.1.5
+
+specifications:
+  - id: rebuild-plan
+    classification: primary specification
+    waymark_note: NOTE-0007
+    source_sha256: 06e49be00c13420c1f3d062489400d46f935fe8e60e7fea37a95c2bb202f3171
+    source_size_bytes: 48811
+    retirement_inventory_sha256: 8a0908e8ec0897667b9966e6a024ad081dcbb9a966958b6e34bf58c4a1807fa2
+  - id: existing-reference-manifest
+    classification: primary specification
+    path: tests/reference/manifest.yaml
+    sha256: 65262f381821bacfd88d2f2dcd81cbf5afca6f04e0d101340674a48728c9b72a
+    size_bytes: 4984
+
+corpus:
+  source_classification: clean-room input
+  safe_root: /Volumes/DATA2/TEST_sentinel-1/sentinel-slc
+  scenes:
+    - id: s1a-20161207
+      acquisition_date: "2016-12-07"
+      path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/sentinel-slc/S1A_IW_SLC__1SSV_20161207T111852_20161207T111919_014273_01716D_67BC.zip
+      sha256: a5bdf079edf55e656b3f0598887afc587138613d380f39d345bc72dc8854ccfb
+      size_bytes: 2311842192
+    - id: s1a-20161231
+      acquisition_date: "2016-12-31"
+      path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/sentinel-slc/S1A_IW_SLC__1SSV_20161231T111851_20161231T111918_014623_017C5B_9218.zip
+      sha256: 253c407d1a1f697d9c6da5fd1d3c91ce3eb15eb31f522d23f9d7166f3e4722c2
+      size_bytes: 2310593336
+    - id: s1a-20170124
+      acquisition_date: "2017-01-24"
+      path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/sentinel-slc/S1A_IW_SLC__1SSV_20170124T111849_20170124T111916_014973_018715_4CD9.zip
+      sha256: bc6b44bfe33a7aeffd243dd2b959a361b18bf1d990f6ea84b8a178ca73a5beec
+      size_bytes: 2322762192
+  pairs:
+    - id: s1a-20161207-20161231
+      reference: s1a-20161207
+      secondary: s1a-20161231
+    - id: s1a-20161231-20170124
+      reference: s1a-20161231
+      secondary: s1a-20170124
+    - id: s1a-20161207-20170124
+      reference: s1a-20161207
+      secondary: s1a-20170124
+  orbit_root: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/esa-step/AUX_POEORB/CDSE-2021-reprocessed
+  orbits:
+    - id: poeorb-20161207
+      source_classification: clean-room input
+      path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/esa-step/AUX_POEORB/CDSE-2021-reprocessed/S1A_OPER_AUX_POEORB_OPOD_20210314T230109_V20161206T225943_20161208T005943.EOF
+      sha256: 5d2ea8195599a27182642fea436d17ecc0f55ee0921de97ff7d41c6f330ea3e6
+      size_bytes: 4410871
+    - id: poeorb-20161231
+      source_classification: clean-room input
+      path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/esa-step/AUX_POEORB/CDSE-2021-reprocessed/S1A_OPER_AUX_POEORB_OPOD_20210315T064735_V20161230T225943_20170101T005942.EOF
+      sha256: 29b5e08bfc3f3c8c46e8d4b86ef09e0b15a2b2a7be330178cac5a175f4a07915
+      size_bytes: 4409585
+    - id: poeorb-20170124
+      source_classification: clean-room input
+      path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/esa-step/AUX_POEORB/CDSE-2021-reprocessed/S1A_OPER_AUX_POEORB_OPOD_20210315T142724_V20170123T225942_20170125T005942.EOF
+      sha256: dfdaf563db3225e44dbe1274b92785b36aeb0e11c0fa896f24c08bece1b79313
+      size_bytes: 4409589
+  dem:
+    source_classification: clean-room input
+    provider: AWS Open Data / Sinergise
+    product: Copernicus DEM GLO-30 COG
+    edition: 2021
+    vertical_datum: EGM2008 orthometric height
+    geometry_datum: WGS 84 ellipsoidal height
+    geoid_model: EGM2008
+    root: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021
+    tiles:
+      - id: N37_E098
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N37_E098/Copernicus_DSM_COG_10_N37_00_E098_00_DEM.tif
+        sha256: b5299e9355c270b1ef1ea7944fe74416e1f322a0cbd4d62061819a42b4dda366
+        size_bytes: 38656771
+      - id: N37_E099
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N37_E099/Copernicus_DSM_COG_10_N37_00_E099_00_DEM.tif
+        sha256: 4dd1eebe5c43921b68ff1d5ae2d64919408c9b6711e8447a2474119d73923c70
+        size_bytes: 35909811
+      - id: N37_E100
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N37_E100/Copernicus_DSM_COG_10_N37_00_E100_00_DEM.tif
+        sha256: a4bab8b2c3cc44ef6699caebabb94533e82f0f10f6fddd8b76932825cdeb9c57
+        size_bytes: 35051308
+      - id: N37_E101
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N37_E101/Copernicus_DSM_COG_10_N37_00_E101_00_DEM.tif
+        sha256: a1e7e9a66653c34239b8f88793be7eebbceff417740b5c86b7d325f5fa44f52a
+        size_bytes: 39652058
+      - id: N38_E098
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N38_E098/Copernicus_DSM_COG_10_N38_00_E098_00_DEM.tif
+        sha256: 22f541581627cd1262dd0a5f7b407daa5a7f33dc911a9b5bdb90e9e2b4d354d0
+        size_bytes: 36813618
+      - id: N38_E099
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N38_E099/Copernicus_DSM_COG_10_N38_00_E099_00_DEM.tif
+        sha256: eaf17a19280339b2170f56a53a44b579029e7f4e01ce6cce6e4734776523ad45
+        size_bytes: 39184185
+      - id: N38_E100
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N38_E100/Copernicus_DSM_COG_10_N38_00_E100_00_DEM.tif
+        sha256: 08f2349f4f007be844dc594d3d2f42e8604102635d24362748ae4029e1384b73
+        size_bytes: 38727428
+      - id: N38_E101
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N38_E101/Copernicus_DSM_COG_10_N38_00_E101_00_DEM.tif
+        sha256: a1e5ec7fb1325df8ecefdba6da8803ca208a853477be25045cdfae13ca1f298b
+        size_bytes: 38168401
+      - id: N39_E098
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N39_E098/Copernicus_DSM_COG_10_N39_00_E098_00_DEM.tif
+        sha256: 7794fe3334f16215ba99627e2183fcc5fe79c4e63f81f0161d5272896493e0ec
+        size_bytes: 38011027
+      - id: N39_E099
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N39_E099/Copernicus_DSM_COG_10_N39_00_E099_00_DEM.tif
+        sha256: 41e31d8e2aa3eea1dbb973d8216fc6dbcda24e1190afed53e629259b2e8f8a0d
+        size_bytes: 37231956
+      - id: N39_E100
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N39_E100/Copernicus_DSM_COG_10_N39_00_E100_00_DEM.tif
+        sha256: 4e1604ff260eaa15e26f018d044b6a75ee94856273d3b50f9fadb597d0a43e3a
+        size_bytes: 36833476
+      - id: N39_E101
+        path: /Volumes/DATA2/TEST_sentinel-1/Raw Data/auxiliary/aws-sinergise/GLO-30-COG/2021/N39_E101/Copernicus_DSM_COG_10_N39_00_E101_00_DEM.tif
+        sha256: 0f761c3b6387d8d92fa13925156efb27dae86471f7a9b0743a0ab4a332d885e9
+        size_bytes: 37756023
+
+oracles:
+  source_classification: behavior oracle
+  primary:
+    - id: isce2-dem-fixed
+      processor: isce2
+      path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products
+      state: primary
+      artifacts:
+        - id: export-meta
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products/export_meta.json
+          sha256: fd76628cce47a984443c830f3e7a8c46151f95ca8fe1fe62741bd489bcca23d3
+          size_bytes: 500
+        - id: complex-ifg-unflat
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products/complex_ifg_unflat.npy
+          sha256: 384a2e252261fca5d25c8f86c60c44bb6687287f74f6e17ca0c527eceb9e1a61
+          size_bytes: 760496
+        - id: complex-ifg-demflat
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products/complex_ifg_demflat.npy
+          sha256: 0bebe32fc5fcfcba54f3ee1233910f2fe79aa297419f302f5fa5d11c16e17e5b
+          size_bytes: 760496
+        - id: coherence
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products/coherence.npy
+          sha256: 8807114b19e5fb654240c5b0ff56511571b82989b268d34f09fb1434608bf377
+          size_bytes: 380312
+        - id: wrapped-phase
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products/wrapped_phase.npy
+          sha256: ed1e014a2d6753a52479ceb182cb1aca9916a0fe5a5b192707aa0ccd03bd7b79
+          size_bytes: 380312
+        - id: unwrapped-demflat
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products/unwrapped_demflat.npy
+          sha256: b6ef2a6bbecb96b477fdf83e3459c92b3495871441170663d27344fb72cdb672
+          size_bytes: 380312
+        - id: height
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products/height_m.npy
+          sha256: bf3c3e7b2efb04aa5639a3e04869e0764cb5db37f78106c7251d9f320984cdf7
+          size_bytes: 380312
+        - id: latitude
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products/latitude_deg.npy
+          sha256: 7d8bb5235d66b25d4239294b886bb0c247be046e4ea1276086595cb5c8d4160a
+          size_bytes: 760496
+        - id: longitude
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products/longitude_deg.npy
+          sha256: c293decf4ac277bba1dfc3e117f0cd9ecf559aa40a593a6b82e8854caf97d488
+          size_bytes: 760496
+    - id: insardev-campaign
+      processor: insardev
+      path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products
+      state: primary
+      artifacts:
+        - id: run-meta
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/run_meta.json
+          sha256: 3d6312666cbee7640906a6f2066adb9c42543f925a3b7bd414669abf34fa1be4
+          size_bytes: 227
+        - id: grid-align-meta
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/grid_align_meta.json
+          sha256: 80d3e9f8bc2a6d5a438b0a4b43b1c4f964160df6f8f5f134594fbbbe06defc30
+          size_bytes: 304
+        - id: complex-ifg
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/complex_ifg.npy
+          sha256: 1bc0894faf1cee9b305643bf1a5b2a48c497bea006f19c66892b8b4ba2774845
+          size_bytes: 19698928
+        - id: complex-ifg-native
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/complex_ifg_native.npy
+          sha256: f56dfc4f4d1a5be7fd72a9b5886e295f9de2edea9c4956f0ddad1327b82143d4
+          size_bytes: 20416128
+        - id: coherence
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/coh.npy
+          sha256: 8af290a23ee93d302d437a20670d42b86d1a18d01717e80a25440794ff164170
+          size_bytes: 9849528
+        - id: coherence-native
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/coh_native.npy
+          sha256: 94db892d13a70f90f6efcfbbd3cde3fd6c80b83964bb3990c41ddf603b354928
+          size_bytes: 10208128
+        - id: coherence-shared
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/coh_on_shared.npy
+          sha256: 8af290a23ee93d302d437a20670d42b86d1a18d01717e80a25440794ff164170
+          size_bytes: 9849528
+        - id: unwrapped
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/unw.npy
+          sha256: 3e240207b7dad951bb6da77ccace19fb91dc5e37c9fabbd435bc6558b66fd381
+          size_bytes: 9849528
+        - id: unwrapped-native
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/unw_native.npy
+          sha256: 28ac8e73456df5115150d377e390d9457b0ce413a1c7d7799b3f48b77b7bd2df
+          size_bytes: 10208128
+        - id: unwrapped-shared
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/unw_on_shared.npy
+          sha256: 3e240207b7dad951bb6da77ccace19fb91dc5e37c9fabbd435bc6558b66fd381
+          size_bytes: 9849528
+        - id: wrapped
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/wrap.npy
+          sha256: 91575ecbb0a20f9e7ed97995bf87e39d6a4ff8e8d0b776eda696e6e2ce9ad61f
+          size_bytes: 9849528
+        - id: zarr-root
+          path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/insardev/products/20161207_20161231.zarr/zarr.json
+          sha256: 36615682d5be9646729635067a75185212eb0c48d708ef06ad34c1f58dd587d2
+          size_bytes: 66
+
+  forbidden:
+    - id: old-isce2-dem
+      processor: isce2
+      classification: behavior oracle
+      state: forbidden
+      path: out/oracle_isce2_from_slc/products
+      reason: old workdir was generated from a corrupt DEM VRT and has invalid heights
+    - id: historical-mixed-stage-flat-compare
+      processor: comparison
+      classification: quarantined
+      state: diagnostic
+      waymark_note: NOTE-0007
+      source_path_at_retirement: reports/2026-07-17-flat-wrapped-compare/metrics.json
+      source_sha256: 73e5a326c21d07f17c119402259466bf6a5a5f3c54db13fa2584cb24bea3abc6
+      source_size_bytes: 6590
+      retirement_inventory_sha256: 8a0908e8ec0897667b9966e6a024ad081dcbb9a966958b6e34bf58c4a1807fa2
+      reason: pre-unwrap products use mixed DEM flatten stages and are not a release oracle
+
+validation:
+  required_scene_count: 3
+  required_pair_count: 3
+  required_orbit_count: 3
+  required_dem_tile_count: 12
+  required_primary_processors:
+    - isce2
+    - insardev
+  fixed_isce2_primary_path: /Volumes/DATA2/TEST_sentinel-1/campaign/20161207_20161231_iw1_burst0/isce2/products
+  required_environment_fields:
+    - project_python
+    - uv
+    - proj
+    - gdal
+    - snaphu
