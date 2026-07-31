@@ -13,7 +13,7 @@ baseline:
   out_of_scope_file_count: 1025
   retired_history:
     waymark_note: NOTE-0007
-    inventory_sha256: 8a0908e8ec0897667b9966e6a024ad081dcbb9a966958b6e34bf58c4a1807fa2
+    inventory_sha256: f3c83d9b05b480f53ba47483a750c6d3c9e0cd8671cebcb41a2ec89665a997d4
     archive_sha256: 4de07cef6f4247522110caffb45076989ece1e578b00c86c4e49bb0e823504ba
     archived_entry_count: 584
     source_paths:
@@ -58,7 +58,7 @@ specifications:
     waymark_note: NOTE-0007
     source_sha256: 06e49be00c13420c1f3d062489400d46f935fe8e60e7fea37a95c2bb202f3171
     source_size_bytes: 48811
-    retirement_inventory_sha256: 8a0908e8ec0897667b9966e6a024ad081dcbb9a966958b6e34bf58c4a1807fa2
+    retirement_inventory_sha256: f3c83d9b05b480f53ba47483a750c6d3c9e0cd8671cebcb41a2ec89665a997d4
   - id: existing-reference-manifest
     classification: primary specification
     path: tests/reference/manifest.yaml

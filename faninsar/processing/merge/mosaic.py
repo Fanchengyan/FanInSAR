@@ -2,8 +2,8 @@
 
 The primary entry point is now :func:`faninsar.processing.merge.methods.merge_bursts`,
 which exposes the seven reference-grounded merge strategies documented in
-``reports/2026-07-23-burst-merge-strategies/report.md`` and the global
-``sar-burst-merge`` skill. :func:`merge_burst_products` is retained as a
+Waymark ``NOTE-0001`` and the global ``sar-burst-merge`` skill.
+:func:`merge_burst_products` is retained as a
 backward-compatible wrapper that maps the legacy ``mode`` argument onto a
 :func:`merge_bursts` method.
 """
