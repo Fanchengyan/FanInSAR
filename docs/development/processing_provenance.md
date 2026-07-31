@@ -166,8 +166,9 @@ Only the fixed campaign outputs are primary behavior oracles:
 
 The former `out/oracle_isce2_from_slc/products` work directory is explicitly
 forbidden because it was generated with a corrupt DEM VRT. The historical
-flat/wrapped comparison is retained only as a quarantined diagnostic and is not
-a release oracle. A rebuild must reproduce the primary oracle artifacts by
+flat/wrapped comparison identity is retained only as an unavailable quarantined
+diagnostic; its bytes were already absent before PROPOSAL-0010 and it is not a
+release oracle. A rebuild must reproduce the primary oracle artifacts by
 behavior; it must never import, copy, or use oracle source code at runtime.
 
 The baseline section preserves the starting Git identity and points at Waymark

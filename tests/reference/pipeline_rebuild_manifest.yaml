@@ -279,11 +279,11 @@ oracles:
       processor: comparison
       classification: quarantined
       state: diagnostic
-      waymark_note: NOTE-0007
-      source_path_at_retirement: reports/2026-07-17-flat-wrapped-compare/metrics.json
+      waymark_note: NOTE-0005
+      source_path_last_recorded: reports/2026-07-17-flat-wrapped-compare/metrics.json
       source_sha256: 73e5a326c21d07f17c119402259466bf6a5a5f3c54db13fa2584cb24bea3abc6
       source_size_bytes: 6590
-      retirement_inventory_sha256: 8a0908e8ec0897667b9966e6a024ad081dcbb9a966958b6e34bf58c4a1807fa2
+      availability: unavailable-before-PROPOSAL-0010
       reason: pre-unwrap products use mixed DEM flatten stages and are not a release oracle
 
 validation:

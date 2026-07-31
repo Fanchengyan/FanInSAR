@@ -170,9 +170,12 @@ def validate_oracles(
             note = _text(item, "waymark_note", manifest)
             if not note.startswith("NOTE-"):
                 _fail(manifest, "retired diagnostic must reference a Waymark Note")
-            _text(item, "source_path_at_retirement", manifest)
+            _text(item, "source_path_last_recorded", manifest)
             _digest(item, "source_sha256", manifest)
             _integer(item, "source_size_bytes", manifest)
-            _digest(item, "retirement_inventory_sha256", manifest)
+            if _text(item, "availability", manifest) != (
+                "unavailable-before-PROPOSAL-0010"
+            ):
+                _fail(manifest, "retired diagnostic availability differs")
             verified += 1
     return verified, tuple(processors)
