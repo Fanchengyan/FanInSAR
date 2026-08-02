@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import numpy as np
@@ -11,7 +12,6 @@ from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     from rasterio.io import DatasetReader
 
@@ -174,6 +174,7 @@ class RasterDEM:
 
     def __post_init__(self) -> None:
         """Validate that the DEM path exists."""
+        self.path = Path(self.path)
         if not self.path.exists():
             message = f"DEM path does not exist: {self.path}"
             logger.error(message)

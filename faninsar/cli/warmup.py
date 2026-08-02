@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import sys
 import time
 
 from faninsar.compute.cache import apply_compile_cache_env
 from faninsar.compute.compile import COMPILE_TARGETS, get_compile_manager
 from faninsar.compute.profiles import get_profile
+from faninsar.logging import setup_logger
+
+logger = setup_logger(__name__)
 
 
 def run_warmup(*, device: str = "cpu", profile: str = "sentinel1") -> int:
@@ -29,22 +31,21 @@ def run_warmup(*, device: str = "cpu", profile: str = "sentinel1") -> int:
     else:
         device = "cpu"
 
-    print("faninsar warmup")
-    print(f"  device:  {device}")
-    print(f"  profile: {prof.name}")
-    print(f"  cache:   {cache_dir}")
+    logger.info("faninsar warmup")
+    logger.info("device: %s | profile: %s | cache: %s", device, prof.name, cache_dir)
 
     try:
         import torch
     except ImportError:
-        print("torch not available; nothing to compile", file=sys.stderr)
+        logger.exception("torch not available; nothing to compile")
         return 1
 
     if device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available; falling back to cpu")
+        logger.warning("CUDA not available; falling back to cpu")
         device = "cpu"
-    if (device == "mps" and not getattr(torch.backends, "mps", None)) or (device == "mps" and not torch.backends.mps.is_available()):
-        print("MPS not available; falling back to cpu")
+    mps_missing = device == "mps" and not torch.backends.mps.is_available()
+    if mps_missing:
+        logger.warning("MPS not available; falling back to cpu")
         device = "cpu"
 
     manager = get_compile_manager()
@@ -52,9 +53,9 @@ def run_warmup(*, device: str = "cpu", profile: str = "sentinel1") -> int:
     t0 = time.perf_counter()
     for i, name in enumerate(targets, 1):
         if name not in COMPILE_TARGETS:
-            print(f"  [{i}/{len(targets)}] skip unknown {name}")
+            logger.warning("[%s/%s] skip unknown %s", i, len(targets), name)
             continue
-        print(f"  [{i}/{len(targets)}] compile {name} …", end=" ", flush=True)
+        logger.info("[%s/%s] compile %s", i, len(targets), name)
         started = time.perf_counter()
         fn = manager.get(name, device=device)
         # Tiny synthetic trigger so inductor may specialize
@@ -66,8 +67,8 @@ def run_warmup(*, device: str = "cpu", profile: str = "sentinel1") -> int:
         except Exception:
             # identity kernels accept any args; ignore runtime shape issues
             pass
-        print(f"{time.perf_counter() - started:.2f}s")
-    print(f"done in {time.perf_counter() - t0:.2f}s")
+        logger.info("%.2fs", time.perf_counter() - started)
+    logger.info("done in %.2fs", time.perf_counter() - t0)
     return 0
 
 
