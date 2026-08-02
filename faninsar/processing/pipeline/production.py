@@ -2009,3 +2009,178 @@ def run_production_swath(
     result.note("UNWRAP skipped: swath mode emits wrapped radar products only")
     stage_write(result, output_dir)
     return result
+
+
+def run_full_frame(
+    reference_path: str | Path,
+    secondary_path: str | Path,
+    *,
+    output_dir: str | Path,
+    dem: DEMSampler | None = None,
+    swaths: tuple[str, ...] = ("IW1", "IW2", "IW3"),
+    multilook: tuple[int, int] = (2, 10),
+    goldstein_alpha: float = 0.5,
+    dead_pixel_amp_threshold: float = 3.0,
+    executor: str = "torch",
+    device: str = "auto",
+    reference_orbit_path: str | Path | None = None,
+    secondary_orbit_path: str | Path | None = None,
+    geoid_correction: bool = True,
+    burst_indices: dict[str, list[int]] | None = None,
+) -> ProductionPairState:
+    """Process a full multi-swath frame and merge it into one radar product.
+
+    Convenience wrapper over :func:`run_production_swath`: derives the
+    per-swath range offset in the concatenated frame from the annotation
+    slant-range times, processes each sub-swath burst-by-burst, overlays the
+    swath canvases on the absolute frame grid (valid pixels win), applies the
+    Goldstein filter after the merge, and writes the merged Zarr/STAC.
+
+    Parameters
+    ----------
+    reference_path, secondary_path : path
+        SAFE products.
+    output_dir : path
+        Output directory; one subdirectory per swath plus the merged frame.
+    dem : DEMSampler, optional
+        DEM sampler.  Defaults to a zero ellipsoid.
+    swaths : list of str, optional
+        Sub-swaths to process, in range order.  Frame column 0 is the first
+        swath's range sample 0.
+    multilook : tuple[int, int], optional
+        ``(az, rg)`` looks applied after the full-res merge.
+    goldstein_alpha : float, optional
+        Goldstein filter exponent applied to the merged product.
+    dead_pixel_amp_threshold : float, optional
+        Dead-pixel amplitude mask threshold for the interferogram.
+    executor : {"torch"}, optional
+        Resample executor.
+    device : {"auto","cpu","cuda","mps"}, optional
+        Torch device.
+    reference_orbit_path, secondary_orbit_path : path, optional
+        Precise ESA EOF orbits.
+    geoid_correction : bool, optional
+        Convert orthometric raster DEM heights to ellipsoidal with EGM96.
+    burst_indices : dict of str to list of int, optional
+        Bursts to process per swath.  Defaults to all bursts of each swath.
+
+    Returns
+    -------
+    ProductionPairState
+        State with the merged frame (wrapped phase, coherence, filtered
+        complex interferogram) and per-swath stage timings.
+
+    """
+    import time
+
+    from faninsar.missions.sentinel1.safe import open_safe_product
+
+    if not swaths:
+        reject_invalid_state("swaths must not be empty")
+    product = open_safe_product(reference_path)
+    swath_map = {item.swath: item for item in product.swaths}
+    missing = [name for name in swaths if name not in swath_map]
+    if missing:
+        reject_invalid_state(
+            f"swaths {missing} not found in {Path(reference_path).name}; "
+            f"available={sorted(swath_map)}"
+        )
+
+    ref_swath = swath_map[swaths[0]]
+    rg_offsets: dict[str, int] = {}
+    for name in swaths:
+        item = swath_map[name]
+        if name == swaths[0]:
+            rg_offsets[name] = 0
+        else:
+            offset = round(
+                (item.slant_range_time_s - ref_swath.slant_range_time_s)
+                * item.range_sampling_rate_hz
+            )
+            if offset < 0:
+                reject_invalid_state(
+                    f"swath {name} starts before frame swath {swaths[0]}"
+                )
+            rg_offsets[name] = offset
+
+    total_started = time.perf_counter()
+    canvases: dict[str, np.ndarray] = {}
+    coherences: dict[str, np.ndarray] = {}
+    per_swath_timings: dict[str, float] = {}
+    first_state: ProductionPairState | None = None
+    for name in swaths:
+        state = run_production_swath(
+            reference_path,
+            secondary_path,
+            output_dir=Path(output_dir) / name,
+            swath=name,
+            dem=dem,
+            multilook=multilook,
+            goldstein_alpha=0.0,
+            dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            executor=executor,
+            device=device,
+            reference_orbit_path=reference_orbit_path,
+            secondary_orbit_path=secondary_orbit_path,
+            geoid_correction=geoid_correction,
+            burst_indices=None if burst_indices is None else burst_indices.get(name),
+            frame_range_offset_fullres=rg_offsets[name],
+        )
+        if first_state is None:
+            first_state = state
+        canvases[name] = np.asarray(state.complex_ifg)
+        coherences[name] = np.asarray(state.coherence)
+        per_swath_timings[name] = state.stage_timings_s["total"]
+        logger.info("Full-frame %s canvas %s", name, canvases[name].shape)
+
+    rows = max(canvas.shape[0] for canvas in canvases.values())
+    cols = max(canvas.shape[1] for canvas in canvases.values())
+    merged = np.zeros((rows, cols), dtype=np.complex64)
+    merged_coh = np.full((rows, cols), np.nan, dtype=np.float32)
+    for name in swaths:
+        canvas = canvases[name]
+        valid = np.abs(canvas) > 0
+        merged[: canvas.shape[0], : canvas.shape[1]][valid] = canvas[valid]
+        merged_coh[: canvas.shape[0], : canvas.shape[1]][valid] = (
+            coherences[name][valid]
+        )
+    invalid = np.abs(merged) <= 0
+    wrapped = np.where(invalid, np.nan, np.angle(merged).astype(np.float32))
+
+    filtered = merged
+    if goldstein_alpha > 0.0:
+        from faninsar.processing.interferometry.pair import goldstein_filter
+
+        filtered = goldstein_filter(merged, alpha=goldstein_alpha)
+
+    assert first_state is not None
+    result = ProductionPairState(
+        pair_id=f"{first_state.pair_id.split('_swath')[0]}_frame",
+        reference=first_state.reference,
+        secondary=first_state.secondary,
+        dem=first_state.dem,
+        coregistration_grid="radar",
+        dem_id=first_state.dem_id,
+        coreg_executor=str(executor),
+        coreg_device=str(device),
+        multilook=multilook,
+        goldstein_alpha=float(goldstein_alpha),
+        unwrap_method="snaphu",
+        complex_ifg=merged,
+        complex_ifg_flat=filtered,
+        coherence=merged_coh,
+        wrapped_phase=wrapped,
+        stage_timings_s={
+            "total": time.perf_counter() - total_started,
+            "per_swath": per_swath_timings,
+        },
+    )
+    result.note(
+        f"FULL FRAME swaths={swaths} merged={merged.shape} "
+        f"multilook={multilook} valid={float((~invalid).mean()):.3f}"
+    )
+    result.unwrapped_phase = np.zeros_like(wrapped, dtype=np.float32)
+    result.connected_components = np.zeros_like(wrapped, dtype=np.uint8)
+    result.note("UNWRAP skipped: full-frame mode emits wrapped radar products only")
+    stage_write(result, output_dir)
+    return result
