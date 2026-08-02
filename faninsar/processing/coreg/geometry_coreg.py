@@ -13,7 +13,7 @@ from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry.orbit import OrbitInterpolator
 
 if TYPE_CHECKING:
-    from faninsar.sentinel1.types import S1Burst, S1Swath
+    from faninsar.missions.sentinel1.types import S1Burst, S1Swath
 
 logger = setup_logger(__name__)
 

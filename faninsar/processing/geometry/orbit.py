@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicHermiteSpline
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import ProcessingContractError
@@ -34,11 +34,14 @@ class OrbitState:
 
 @dataclass(frozen=True, slots=True)
 class OrbitInterpolator:
-    """Cubic-spline interpolator over ordered ECEF orbit state vectors."""
+    """Velocity-constrained interpolator over ECEF orbit state vectors."""
 
     times_s: np.ndarray
-    position_splines: tuple[CubicSpline, CubicSpline, CubicSpline]
-    velocity_splines: tuple[CubicSpline, CubicSpline, CubicSpline]
+    trajectory_splines: tuple[
+        CubicHermiteSpline,
+        CubicHermiteSpline,
+        CubicHermiteSpline,
+    ]
     epoch: datetime
     t_min_s: float
     t_max_s: float
@@ -67,15 +70,17 @@ class OrbitInterpolator:
             [vector.velocity_m_s for vector in orbit.vectors],
             dtype=np.float64,
         )
-        pos_splines = tuple(CubicSpline(times, positions[:, axis]) for axis in range(3))
-        # Prefer analytic velocity from state vectors; spline as continuous model.
-        vel_splines = tuple(
-            CubicSpline(times, velocities[:, axis]) for axis in range(3)
+        trajectory_splines = tuple(
+            CubicHermiteSpline(
+                times,
+                positions[:, axis],
+                velocities[:, axis],
+            )
+            for axis in range(3)
         )
         return cls(
             times_s=times,
-            position_splines=pos_splines,  # type: ignore[arg-type]
-            velocity_splines=vel_splines,  # type: ignore[arg-type]
+            trajectory_splines=trajectory_splines,  # type: ignore[arg-type]
             epoch=epoch,
             t_min_s=float(times[0]),
             t_max_s=float(times[-1]),
@@ -112,8 +117,8 @@ class OrbitInterpolator:
             )
             logger.error(message)
             raise OrbitInterpolationError(message)
-        position = tuple(float(spline(t_s)) for spline in self.position_splines)
-        velocity = tuple(float(spline(t_s)) for spline in self.velocity_splines)
+        position = tuple(float(spline(t_s)) for spline in self.trajectory_splines)
+        velocity = tuple(float(spline(t_s, 1)) for spline in self.trajectory_splines)
         return OrbitState(time=time, position_m=position, velocity_m_s=velocity)  # type: ignore[arg-type]
 
     def evaluate_array(self, times_s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -145,14 +150,60 @@ class OrbitInterpolator:
             logger.error(message)
             raise OrbitInterpolationError(message)
         positions = np.stack(
-            [spline(times_s) for spline in self.position_splines],
+            [spline(times_s) for spline in self.trajectory_splines],
             axis=-1,
         )
         velocities = np.stack(
-            [spline(times_s) for spline in self.velocity_splines],
+            [spline(times_s, 1) for spline in self.trajectory_splines],
             axis=-1,
         )
         return positions, velocities
+
+    def evaluate_array_with_acceleration(
+        self,
+        times_s: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Interpolate position, velocity, and acceleration arrays.
+
+        Parameters
+        ----------
+        times_s : numpy.ndarray
+            Seconds from the orbit epoch.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            Position, velocity, and acceleration arrays with shape
+            ``(..., 3)`` in metres, metres per second, and metres per second
+            squared.
+
+        Raises
+        ------
+        OrbitInterpolationError
+            If any time is outside the orbit coverage.
+
+        """
+        times_s = np.asarray(times_s, dtype=np.float64)
+        if np.any(times_s < self.t_min_s) or np.any(times_s > self.t_max_s):
+            message = (
+                f"orbit times outside coverage "
+                f"[{self.t_min_s}, {self.t_max_s}] s from epoch"
+            )
+            logger.error(message)
+            raise OrbitInterpolationError(message)
+        positions = np.stack(
+            [spline(times_s) for spline in self.trajectory_splines],
+            axis=-1,
+        )
+        velocities = np.stack(
+            [spline(times_s, 1) for spline in self.trajectory_splines],
+            axis=-1,
+        )
+        accelerations = np.stack(
+            [spline(times_s, 2) for spline in self.trajectory_splines],
+            axis=-1,
+        )
+        return positions, velocities, accelerations
 
 
 def interpolate_orbit(orbit: OrbitMetadata, time: datetime) -> OrbitState:

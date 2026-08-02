@@ -73,11 +73,21 @@ def mask_invalid_looks(
     return ifg, coh_out, phase
 
 
+#: Default amplitude threshold for dead-pixel masking during multilook.
+#: SLC pixels with amplitude below this value on either input are excluded
+#: from the look-window average. The threshold is relative - typical S1 IW
+#: SLC amplitudes range from ~5 to ~100, so 3.0 catches digitisation
+#: artefacts (e.g. ``0+1j`` dead pixels) without affecting weak scatterers.
+#: Set to 0.0 to disable masking (unweighted boxcar average, original behavior).
+DEAD_PIXEL_AMP_THRESHOLD: float = 0.0
+
+
 def form_interferogram(
     primary: np.ndarray,
     secondary: np.ndarray,
     *,
     multilook: tuple[int, int] = (1, 1),
+    dead_pixel_amp_threshold: float = DEAD_PIXEL_AMP_THRESHOLD,
 ) -> InterferogramProduct:
     """Form a complex interferogram and coherence from two complex SLCs.
 
@@ -87,6 +97,15 @@ def form_interferogram(
     IW burst this avoids ~1 GB of temporary complex/float64 planes that
     would otherwise peak during ``primary * conj(secondary)``.
 
+    Low-amplitude (dead) SLC pixels — e.g. digitisation artefacts where
+    ``|slc| ~ 1`` while neighbours are ``|slc| ~ 10-50`` - are masked
+    before the look-window average so their noisy phase does not
+    contaminate the multilooked interferogram.  A pixel is masked when
+    **either** input amplitude falls below *dead_pixel_amp_threshold*.
+    The denominator becomes the count of valid (unmasked) pixels in
+    each look window, which is the standard *valid-pixel-weighted*
+    multilook used by most InSAR processors.
+
     Parameters
     ----------
     primary, secondary : numpy.ndarray
@@ -95,6 +114,10 @@ def form_interferogram(
         ``(azimuth_looks, range_looks)`` non-overlapping boxcar looks. The
         output is downsampled by these factors (true multilook), not merely
         smoothed.
+    dead_pixel_amp_threshold : float, optional
+        SLC amplitude below which a pixel is excluded from the multilook
+        average. Set to 0 to disable dead-pixel masking (revert to the
+        unweighted boxcar average).
 
     Returns
     -------
@@ -109,6 +132,8 @@ def form_interferogram(
     az_looks, rg_looks = multilook
     if az_looks < 1 or rg_looks < 1:
         reject_invalid_state("multilook factors must be >= 1")
+
+    use_dead_mask = dead_pixel_amp_threshold > 0.0 and (az_looks > 1 or rg_looks > 1)
 
     if az_looks == 1 and rg_looks == 1:
         ifg = primary * np.conjugate(secondary)
@@ -137,10 +162,33 @@ def form_interferogram(
             sr = s.real.reshape(az_looks, out_w, rg_looks)
             si = s.imag.reshape(az_looks, out_w, rg_looks)
             # ifg = p * conj(s)
-            ifg_real[i] = (pr * sr + pi * si).sum(axis=(0, 2)) * inv_looks
-            ifg_imag[i] = (pi * sr - pr * si).sum(axis=(0, 2)) * inv_looks
-            power_pri[i] = (pr * pr + pi * pi).sum(axis=(0, 2)) * inv_looks
-            power_sec[i] = (sr * sr + si * si).sum(axis=(0, 2)) * inv_looks
+            ir = pr * sr + pi * si
+            ii = pi * sr - pr * si
+            pp = pr * pr + pi * pi
+            ss = sr * sr + si * si
+            if use_dead_mask:
+                # Mask pixels where either SLC amplitude is below threshold.
+                # The dead-pixel weight is 0 (excluded); valid pixels get 1.
+                amp_p = np.sqrt(np.maximum(pp, 0.0))
+                amp_s = np.sqrt(np.maximum(ss, 0.0))
+                valid = (amp_p >= dead_pixel_amp_threshold) & (
+                    amp_s >= dead_pixel_amp_threshold
+                )
+                wgt = valid.astype(np.float64)
+                w_sum = wgt.sum(axis=(0, 2))
+                # Avoid division by zero: where no valid pixels, fall back
+                # to unweighted average (will be NaN-flagged later via
+                # power check).
+                safe_w = np.where(w_sum > 0, w_sum, 1.0)
+                ifg_real[i] = (ir * wgt).sum(axis=(0, 2)) / safe_w
+                ifg_imag[i] = (ii * wgt).sum(axis=(0, 2)) / safe_w
+                power_pri[i] = (pp * wgt).sum(axis=(0, 2)) / safe_w
+                power_sec[i] = (ss * wgt).sum(axis=(0, 2)) / safe_w
+            else:
+                ifg_real[i] = ir.sum(axis=(0, 2)) * inv_looks
+                ifg_imag[i] = ii.sum(axis=(0, 2)) * inv_looks
+                power_pri[i] = pp.sum(axis=(0, 2)) * inv_looks
+                power_sec[i] = ss.sum(axis=(0, 2)) * inv_looks
         ifg = ifg_real + 1j * ifg_imag
         logger.info(
             "Multilook %s -> output shape %s",
@@ -178,7 +226,7 @@ def goldstein_filter(
     alpha: float = 0.5,
     window: int = 32,
 ) -> np.ndarray:
-    """Apply a simplified Goldstein adaptive spectral filter.
+    """Apply the Goldstein-Werner adaptive spectral filter (ISCE2 psfilt).
 
     Parameters
     ----------
@@ -187,12 +235,20 @@ def goldstein_filter(
     alpha : float, optional
         Filter exponent in ``[0, 1]``.
     window : int, optional
-        Square FFT patch size (power of two recommended).
+        Square FFT patch size. Default 32 (ISCE2 ``NFFT``).
 
     Returns
     -------
     numpy.ndarray
-        Filtered complex interferogram.
+        Filtered complex interferogram with the original magnitude restored.
+
+    Notes
+    -----
+    Faithful port of ISCE2's ``mroipac.filter`` ``psfilt``: a triangular
+    window, ``|spectrum|**alpha`` spectral weighting, weighted overlap-add
+    without renormalisation, and a final magnitude rescale to the input.
+    This matches ISCE2's ``filt_topophase.flat`` so the filtered products
+    are directly comparable.
 
     """
     if complex_ifg.ndim != 2 or not np.iscomplexobj(complex_ifg):
@@ -203,31 +259,43 @@ def goldstein_filter(
         reject_invalid_state("Goldstein window must be an even integer >= 8")
 
     height, width = complex_ifg.shape
-    # Skip expensive filter on tiny arrays
     if height < window or width < window:
         return complex_ifg.astype(np.complex64, copy=False)
 
-    out = np.zeros_like(complex_ifg, dtype=np.complex64)
-    weight = np.zeros((height, width), dtype=np.float32)
+    smoothed = np.zeros((height, width), dtype=np.complex64)
     step = window // 2
-    taper = np.hanning(window)
-    window2d = np.outer(taper, taper).astype(np.float32)
+    half = window / 2
+    axis = np.arange(window, dtype=np.float64)
+    triangular = 1.0 - np.abs(2.0 * (axis - half) / (window + 1))
+    window2d = np.outer(triangular, triangular) / (window * window)
 
-    for row in range(0, max(height - window + 1, 1), step):
-        for col in range(0, max(width - window + 1, 1), step):
-            r1 = min(row + window, height)
+    for row in range(0, height, step):
+        r1 = min(row + window, height)
+        for col in range(0, width, step):
             c1 = min(col + window, width)
             patch = np.zeros((window, window), dtype=np.complex64)
-            pr = r1 - row
-            pc = c1 - col
-            patch[:pr, :pc] = complex_ifg[row:r1, col:c1]
-            spectrum = np.fft.fft2(patch * window2d)
-            magnitude = np.abs(spectrum)
-            scale = magnitude**alpha
-            filtered = np.fft.ifft2(spectrum * scale)
-            out[row:r1, col:c1] += filtered[:pr, :pc] * window2d[:pr, :pc]
-            weight[row:r1, col:c1] += window2d[:pr, :pc]
+            patch[: r1 - row, : c1 - col] = complex_ifg[row:r1, col:c1]
+            valid = patch != 0
+            spectrum = np.fft.fft2(patch)
+            power = spectrum.real**2 + spectrum.imag**2
+            spectrum = spectrum * power ** (alpha / 2.0)
+            filtered = np.fft.ifft2(spectrum) * (window * window)
+            weight_block = window2d * filtered
+            for i1 in range(window):
+                row_out = row + i1
+                if row_out >= height:
+                    break
+                for j1 in range(window):
+                    col_out = col + j1
+                    if col_out >= width:
+                        break
+                    if valid[i1, j1]:
+                        smoothed[row_out, col_out] += weight_block[i1, j1]
+                    else:
+                        smoothed[row_out, col_out] = 0
 
-    mask = weight > 0
-    out[mask] /= weight[mask]
-    return out
+    input_mag = np.abs(complex_ifg)
+    smoothed_mag = np.abs(smoothed)
+    mask = (smoothed_mag > 0) & (input_mag > 0)
+    smoothed[mask] *= input_mag[mask] / smoothed_mag[mask]
+    return smoothed

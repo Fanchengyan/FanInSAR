@@ -12,7 +12,7 @@ from faninsar.processing.tops.deramp import SPEED_OF_LIGHT_M_S, TOPSCarrierModel
 if TYPE_CHECKING:
     from datetime import datetime
 
-    from faninsar.sentinel1.types import S1Burst, S1Swath
+    from faninsar.missions.sentinel1.types import S1Burst, S1Swath
 
 logger = setup_logger(__name__)
 

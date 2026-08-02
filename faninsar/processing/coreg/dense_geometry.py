@@ -120,8 +120,8 @@ def dense_geometry_offsets(
     secondary_model: RadarGeometryModel,
     dem: DEMSampler | None = None,
     stride: int = 32,
-    max_iter: int = 20,
-    range_tol_m: float = 0.01,
+    max_iter: int = 30,
+    range_tol_m: float = 0.001,
     doppler_tol_hz: float = 0.1,
 ) -> OffsetFieldResult:
     """Estimate dense range/azimuth offsets from dual-orbit geometry + DEM.
@@ -258,9 +258,12 @@ def dense_geometry_offsets(
             shape_idx = [1] * filled.ndim
             shape_idx[axis] = filled.shape[axis]
             arange = np.arange(filled.shape[axis]).reshape(shape_idx)
-            # Forward fill: replace NaN with the index of the last valid element
-            idx = np.minimum.accumulate(
-                np.where(~mask, arange, filled.shape[axis] - 1),
+            # Forward fill: replace NaN with the index of the last valid
+            # element.  ``minimum`` was wrong here: over the valid indices
+            # (0, 1, 2, ...) the accumulated minimum stays 0, collapsing the
+            # whole axis to the first row/column whenever a NaN hole exists.
+            idx = np.maximum.accumulate(
+                np.where(~mask, arange, -1),
                 axis=axis,
             )
             filled = np.take_along_axis(filled, idx, axis=axis)

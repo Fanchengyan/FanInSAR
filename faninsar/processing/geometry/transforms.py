@@ -351,9 +351,8 @@ def rdr2geo_ellipsoid(
         residual_range[active_idx] = range_res
         residual_doppler[active_idx] = doppler_res
 
-        converged_mask = (
-            (np.abs(range_res) < range_tol_m)
-            & (np.abs(doppler_res) < doppler_tol_hz)
+        converged_mask = (np.abs(range_res) < range_tol_m) & (
+            np.abs(doppler_res) < doppler_tol_hz
         )
         conv_idx = active_idx[converged_mask]
         lat[conv_idx] = lat0[conv_idx]
@@ -503,39 +502,59 @@ def geo2rdr(
         raise TypeError(message)
     sensing_offset = (sensing_start - model.orbit.epoch).total_seconds()
     times_s = np.full(targets.shape[0], sensing_offset, dtype=np.float64)
+    if np.any(finite):
+        finite_indices = np.flatnonzero(finite)
+        seed_satellite, seed_velocity = model.orbit.evaluate_array(
+            np.full(finite_indices.size, sensing_offset, dtype=np.float64)
+        )
+        target_delta = targets[finite_indices] - seed_satellite
+        speed_squared = np.einsum("ij,ij->i", seed_velocity, seed_velocity)
+        usable_seed = np.isfinite(speed_squared) & (speed_squared > 0.0)
+        along_track_seconds = np.zeros(finite_indices.size, dtype=np.float64)
+        along_track_seconds[usable_seed] = (
+            np.einsum(
+                "ij,ij->i",
+                target_delta[usable_seed],
+                seed_velocity[usable_seed],
+            )
+            / speed_squared[usable_seed]
+        )
+        seeded_times = sensing_offset + along_track_seconds
+        times_s[finite_indices] = np.clip(
+            seeded_times,
+            model.orbit.t_min_s,
+            model.orbit.t_max_s,
+        )
     active = finite.copy()
     solved = np.zeros(targets.shape[0], dtype=bool)
     doppler = np.full(targets.shape[0], np.nan, dtype=np.float64)
-    finite_difference_s = 1e-3
     for _ in range(max_iter):
         in_orbit = (
-            active
-            & (times_s >= model.orbit.t_min_s)
-            & (times_s + finite_difference_s <= model.orbit.t_max_s)
+            active & (times_s >= model.orbit.t_min_s) & (times_s <= model.orbit.t_max_s)
         )
         active &= in_orbit
         if not np.any(active):
             break
         indices = np.flatnonzero(active)
         current_times = times_s[indices]
-        satellite, velocity = model.orbit.evaluate_array(current_times)
+        satellite, velocity, acceleration = (
+            model.orbit.evaluate_array_with_acceleration(current_times)
+        )
         look = targets[indices] - satellite
         range_m = np.linalg.norm(look, axis=1)
         usable = range_m > 0.0
         unit_look = np.zeros_like(look)
         unit_look[usable] = look[usable] / range_m[usable, None]
         current_doppler = np.einsum("ij,ij->i", velocity, unit_look)
-
-        satellite_next, velocity_next = model.orbit.evaluate_array(
-            current_times + finite_difference_s
+        velocity_squared = np.einsum("ij,ij->i", velocity, velocity)
+        acceleration_along_look = np.einsum(
+            "ij,ij->i",
+            acceleration,
+            unit_look,
         )
-        look_next = targets[indices] - satellite_next
-        range_next = np.linalg.norm(look_next, axis=1)
-        usable &= range_next > 0.0
-        unit_next = np.zeros_like(look_next)
-        unit_next[usable] = look_next[usable] / range_next[usable, None]
-        doppler_next = np.einsum("ij,ij->i", velocity_next, unit_next)
-        derivative = (doppler_next - current_doppler) / finite_difference_s
+        derivative = acceleration_along_look + (
+            current_doppler**2 - velocity_squared
+        ) / np.maximum(range_m, 1.0)
         usable &= np.isfinite(derivative) & (np.abs(derivative) >= 1e-12)
 
         step = np.full(indices.size, np.nan, dtype=np.float64)
@@ -546,10 +565,7 @@ def geo2rdr(
         solved[indices[newly_solved]] = True
         active[indices[~usable | newly_solved]] = False
 
-    solved &= (
-        (times_s >= model.orbit.t_min_s)
-        & (times_s <= model.orbit.t_max_s)
-    )
+    solved &= (times_s >= model.orbit.t_min_s) & (times_s <= model.orbit.t_max_s)
     if np.any(solved):
         solved_indices = np.flatnonzero(solved)
         solved_times = times_s[solved_indices]
@@ -593,10 +609,11 @@ def rdr2geo_with_dem(
     dem: DEMSampler,
     *,
     height_seed_m: float = 0.0,
-    max_iter: int = 20,
-    range_tol_m: float = 0.01,
+    max_iter: int = 30,
+    range_tol_m: float = 0.001,
     doppler_tol_hz: float = 0.1,
-    dem_iterations: int = 2,
+    dem_iterations: int = 50,
+    dem_height_tol_m: float = 0.001,
 ) -> TransformResult:
     """Map radar indices to geodetic coordinates using a DEM height sampler.
 
@@ -617,7 +634,10 @@ def rdr2geo_with_dem(
     max_iter, range_tol_m, doppler_tol_hz : optional
         Passed to the ellipsoid Newton solver.
     dem_iterations : int, optional
-        Number of DEM re-sample / re-solve cycles.
+        Maximum number of DEM re-sample / re-solve cycles.
+    dem_height_tol_m : float, optional
+        Stop when the maximum DEM fixed-point height update is below this
+        threshold.
 
     Returns
     -------
@@ -625,6 +645,15 @@ def rdr2geo_with_dem(
         Geodetic arrays with DEM heights where converged.
 
     """
+    if dem_iterations < 1:
+        message = "dem_iterations must be >= 1"
+        logger.error(message)
+        raise ValueError(message)
+    if dem_height_tol_m <= 0.0:
+        message = "dem_height_tol_m must be positive"
+        logger.error(message)
+        raise ValueError(message)
+
     result = rdr2geo_ellipsoid(
         model,
         azimuth_index,
@@ -643,6 +672,11 @@ def rdr2geo_with_dem(
             heights[mask] = dem.sample(
                 result.latitude_deg[mask], result.longitude_deg[mask]
             )
+        comparable = mask & np.isfinite(heights) & np.isfinite(result.height_m)
+        if np.any(comparable):
+            height_update = np.abs(heights[comparable] - result.height_m[comparable])
+            if float(np.max(height_update)) <= dem_height_tol_m:
+                break
         # Re-solve all pixels with their DEM heights.
         next_result = rdr2geo_ellipsoid(
             model,

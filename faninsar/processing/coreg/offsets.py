@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.resampling import lanczos_resample
 from faninsar.processing.tops.deramp import (
     TOPSCarrierModel,
     carrier_phase_at_points,
@@ -202,9 +202,8 @@ def resample_complex(
     order: int | None = None,
     lanczos_a: int = 4,
     row_chunk: int = 64,
-    executor: str = "serial",
+    executor: Literal["torch"] = "torch",
     device: str = "auto",
-    use_dask: bool = False,
 ) -> np.ndarray:
     """Resample complex samples with a phase-preserving kernel.
 
@@ -248,23 +247,14 @@ def resample_complex(
     row_chunk : int, optional
         Number of azimuth rows processed per tile when building source
         coordinates. Default 64 (~1.3 M samples on a full IW burst width).
-    executor : {"serial", "dask-torch"}, optional
-        Lanczos compute path. ``"serial"`` uses the NumPy reference
-        (:func:`lanczos_resample`). ``"dask-torch"`` uses the torch Lanczos
-        path (:func:`~faninsar.processing.resampling_torch.lanczos_resample_dask_torch`
-        / P7 resident source). When a torch device is available, the source
-        SLC is uploaded **once per call** and row tiles only move coordinates.
+    executor : {"torch"}, optional
+        Lanczos compute path. Torch runs the same kernel on CPU, CUDA, or MPS.
+        The source SLC is uploaded once per call and row tiles only move
+        coordinates.
         Ignored when ``order`` is set (the spline path is always NumPy/SciPy).
-        Default ``"serial"``.
+        Default ``"torch"``.
     device : {"auto","cpu","cuda","mps"}, optional
-        Torch device for the dask-torch executor. ``"auto"`` selects CUDA when
-        available, otherwise the NumPy fallback (no MPS). Ignored for the
-        serial executor. Default ``"auto"``.
-    use_dask : bool, optional
-        When ``executor="dask-torch"`` and this is True, the inner coordinate
-        chunks are scheduled via Dask delayed workers (per-tile source
-        residency is not shared across workers). When False (default), the
-        P7 path keeps the source resident on device across row tiles.
+        Torch device. ``"auto"`` selects CUDA, then MPS, then CPU.
 
     Returns
     -------
@@ -274,6 +264,8 @@ def resample_complex(
     """
     if samples.ndim != 2 or not np.iscomplexobj(samples):
         reject_invalid_state("complex resampling requires a 2-D complex array")
+    if executor != "torch":
+        reject_invalid_state(f"unsupported complex resampling executor: {executor}")
     if row_chunk < 1:
         reject_invalid_state("row_chunk must be >= 1")
     height, width = samples.shape
@@ -286,35 +278,29 @@ def resample_complex(
     if not scalar_rg and rg_off.shape != (height, width):
         reject_invalid_state("range_offset_px must be scalar or match samples shape")
 
-    use_dask_torch = executor == "dask-torch" and order is None
-    # P7: upload full SLC once when a torch device is resolved and we are not
-    # on the multi-worker delayed path (workers cannot share a device tensor).
-    data_t: object | None = None
-    dev: object | None = None
+    source_tensor: object | None = None
+    resolved_device: object | None = None
     chunk_size = 0
-    if use_dask_torch:
+    if order is None:
         from faninsar.processing.resampling_torch import (
             DEFAULT_LANCZOS_CHUNK,
-            _cleanup_gpu,
+            _cleanup_device,
             _lanczos_resample_device_persistent,
             _resolve_torch_device,
-            lanczos_resample_dask_torch,
         )
 
         chunk_size = int(DEFAULT_LANCZOS_CHUNK)
-        if not use_dask:
-            resolved_device = _resolve_torch_device(device)
-            if resolved_device is not None:
-                import torch
+        resolved_device = _resolve_torch_device(device)
+        import torch
 
-                if not isinstance(resolved_device, torch.device):
-                    reject_invalid_state("resolved torch device has an invalid type")
-                dev = resolved_device
-                data_t = torch.from_numpy(np.ascontiguousarray(samples)).to(
-                    resolved_device, non_blocking=True
-                )
-                if resolved_device.type == "cuda":
-                    torch.cuda.synchronize()
+        if not isinstance(resolved_device, torch.device):
+            reject_invalid_state("resolved torch device has an invalid type")
+        source_tensor = torch.from_numpy(np.ascontiguousarray(samples)).to(
+            resolved_device,
+            non_blocking=True,
+        )
+        if resolved_device.type == "cuda":
+            torch.cuda.synchronize()
 
     out = np.empty((height, width), dtype=samples.dtype)
     col_idx = np.arange(width, dtype=np.float64)
@@ -334,33 +320,17 @@ def resample_complex(
 
             if order is None:
                 coords = np.vstack([src_row.ravel(), src_col.ravel()])
-                if use_dask_torch:
-                    if data_t is not None:
-                        tile = _lanczos_resample_device_persistent(
-                            samples,
-                            coords[0],
-                            coords[1],
-                            a=lanczos_a,
-                            mode="constant",
-                            cval=0.0,
-                            dev=dev,
-                            chunk_size=chunk_size,
-                            data_t=data_t,
-                        )
-                    else:
-                        tile = lanczos_resample_dask_torch(
-                            samples,
-                            coords,
-                            a=lanczos_a,
-                            mode="constant",
-                            cval=0.0,
-                            device=device,
-                            use_dask=use_dask,
-                        )
-                else:
-                    tile = lanczos_resample(
-                        samples, coords, a=lanczos_a, mode="constant", cval=0.0
-                    )
+                tile = _lanczos_resample_device_persistent(
+                    samples,
+                    coords[0],
+                    coords[1],
+                    a=lanczos_a,
+                    mode="constant",
+                    cval=0.0,
+                    device=resolved_device,
+                    chunk_size=chunk_size,
+                    source_tensor=source_tensor,
+                )
                 out[row0:row1] = tile.reshape(n_rows, width)
             else:
                 real = map_coordinates(
@@ -379,9 +349,9 @@ def resample_complex(
                 )
                 out[row0:row1] = (real + 1j * imag).astype(samples.dtype, copy=False)
     finally:
-        if data_t is not None:
-            del data_t
-            _cleanup_gpu(dev)
+        if source_tensor is not None:
+            del source_tensor
+            _cleanup_device(resolved_device)
 
     return out
 
@@ -394,7 +364,7 @@ def resample_complex_deramped_reramp(
     azimuth_offset_px: np.ndarray | float,
     lanczos_a: int = 4,
     row_chunk: int = 64,
-    executor: str = "serial",
+    executor: Literal["torch"] = "torch",
     device: str = "auto",
     output_carrier: TOPSCarrierModel | None = None,
 ) -> np.ndarray:
@@ -428,10 +398,10 @@ def resample_complex_deramped_reramp(
         Lanczos half-width. Default 4.
     row_chunk : int, optional
         Azimuth rows processed per tile. Default 64.
-    executor : {"serial", "dask-torch"}, optional
+    executor : {"torch"}, optional
         Complex interpolation executor.
     device : {"auto", "cpu", "cuda"}, optional
-        Compute device for the dask-torch executor.
+        Torch compute device.
     output_carrier : TOPSCarrierModel, optional
         Carrier on the output reference grid. When omitted, the secondary
         carrier is evaluated at source coordinates.
@@ -459,17 +429,15 @@ def resample_complex_deramped_reramp(
     centre_row = float(height // 2)
     out = np.empty((height, width), dtype=sec_deramped.dtype)
     col_idx = np.arange(width, dtype=np.float64)
-    remapped_deramped = None
-    if executor != "serial":
-        remapped_deramped = resample_complex(
-            sec_deramped,
-            range_offset_px=range_offset_px,
-            azimuth_offset_px=azimuth_offset_px,
-            lanczos_a=lanczos_a,
-            row_chunk=row_chunk,
-            executor=executor,
-            device=device,
-        )
+    remapped_deramped = resample_complex(
+        sec_deramped,
+        range_offset_px=range_offset_px,
+        azimuth_offset_px=azimuth_offset_px,
+        lanczos_a=lanczos_a,
+        row_chunk=row_chunk,
+        executor=executor,
+        device=device,
+    )
 
     for row0 in range(0, height, row_chunk):
         row1 = min(row0 + row_chunk, height)
@@ -481,13 +449,7 @@ def resample_complex_deramped_reramp(
         rg_tile = rg_off if scalar_rg else rg_off[row0:row1]
         src_row = rows - az_tile
         src_col = cols - rg_tile
-        if remapped_deramped is None:
-            coords = np.vstack([src_row.ravel(), src_col.ravel()])
-            tile = lanczos_resample(
-                sec_deramped, coords, a=lanczos_a, mode="constant", cval=0.0
-            ).reshape(n_rows, width)
-        else:
-            tile = remapped_deramped[row0:row1]
+        tile = remapped_deramped[row0:row1]
         carrier_model = secondary_carrier if output_carrier is None else output_carrier
         carrier_row = src_row if output_carrier is None else rows
         carrier_col = src_col if output_carrier is None else cols
