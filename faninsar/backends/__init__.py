@@ -1,6 +1,13 @@
-"""Backends for lazy loading and parallel computation."""
+"""Backends for lazy loading and parallel computation.
+
+Greenfield target: collapse into ``faninsar.compute`` (Dask/Torch),
+``faninsar.ports`` (protocols), and ``faninsar.io`` (lazy readers).
+This package remains the implementation home until callers migrate.
+"""
 
 from __future__ import annotations
+
+from faninsar.io.lazy_rasterio import LazyMultiFileReader, LazyRasterioReader
 
 from .dask_exec import compute_with_profile, map_elementwise, map_finite_halo
 from .device_matrix import (
@@ -26,7 +33,6 @@ from .execution import (
     plan_chunks,
     validate_execution,
 )
-from .lazy_rasterio import LazyMultiFileReader, LazyRasterioReader
 
 __all__ = [
     "Backend",

@@ -294,6 +294,66 @@ class Frame:
         """Time-series product, or *None* if ``timeseries/`` is absent."""
         return self._timeseries
 
+    def to_ifg_stack(self, *, pairs: Any = None) -> Any:
+        """Build an :class:`~faninsar.processing.contracts.ifg.InterferogramStack`.
+
+        This is the processing ↔ timeseries seam producer for Frame products.
+        Unwrapped phase is stacked as ``(n_pair, n_pixel)`` from the
+        ``unw_phase`` (or equivalent) assets.
+
+        Parameters
+        ----------
+        pairs : Pairs, optional
+            Subset of pairs; defaults to all pairs in the collection.
+
+        Returns
+        -------
+        InterferogramStack
+            Seam product accepted by :class:`~faninsar.timeseries.NSBASSolver`.
+
+        """
+        from faninsar.processing.contracts.ifg import InterferogramStack
+
+        if self._interferograms is None:
+            msg = "Frame has no interferogram collection"
+            logger.error(msg)
+            raise ValueError(msg)
+
+        ifg = self._interferograms
+        pair_obj = pairs if pairs is not None else ifg.pairs()
+        names = list(pair_obj.names)
+
+        # Prefer open_stack when available for dense arrays
+        unw = None
+        coh = None
+        if hasattr(ifg, "open_stack"):
+            try:
+                unw_da = ifg.open_stack("unw_phase")
+                unw = np.asarray(unw_da.values, dtype=np.float64)
+                if unw.ndim == 3:
+                    unw = unw.reshape(unw.shape[0], -1)
+            except Exception:
+                unw = None
+            try:
+                coh_da = ifg.open_stack("coherence")
+                coh = np.asarray(coh_da.values, dtype=np.float64)
+                if coh.ndim == 3:
+                    coh = coh.reshape(coh.shape[0], -1)
+            except Exception:
+                coh = None
+
+        if unw is None:
+            msg = "could not load unwrapped phase stack from Frame"
+            logger.error(msg)
+            raise ValueError(msg)
+
+        return InterferogramStack.from_unwrapped(
+            stack_id=str(self._root),
+            pairs=pair_obj,
+            unwrapped=unw,
+            coherence=coh,
+        )
+
     @classmethod
     def from_hyp3(
         cls,

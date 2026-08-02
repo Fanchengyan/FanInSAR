@@ -25,7 +25,7 @@ _REQUIRED_CLASSES = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ManifestValidationError(RuntimeError):
     """Raised when a rebuild manifest does not satisfy its pinned contract."""
 
@@ -86,6 +86,13 @@ def _integer(mapping: Mapping[str, object], key: str, path: Path) -> int:
     value = mapping.get(key)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         _fail(path, f"{key} must be a non-negative integer")
+    return value
+
+
+def _digest(mapping: Mapping[str, object], key: str, path: Path) -> str:
+    value = _text(mapping, key, path)
+    if _SHA256.fullmatch(value) is None:
+        _fail(path, f"{key} must be 64 lowercase hex characters")
     return value
 
 
@@ -223,9 +230,18 @@ def validate_pipeline_rebuild_manifest(
         spec = _mapping(item, path, "specification")
         if _text(spec, "classification", path) != "primary specification":
             _fail(path, "specification classification is not primary specification")
-        specification_verified += _verify_pin(
-            spec, root, path, f"specification[{index}]"
-        )
+        if "path" in spec:
+            specification_verified += _verify_pin(
+                spec, root, path, f"specification[{index}]"
+            )
+            continue
+        note = _text(spec, "waymark_note", path)
+        if not note.startswith("NOTE-"):
+            _fail(path, "retired specification must reference a Waymark Note")
+        _digest(spec, "source_sha256", path)
+        _integer(spec, "source_size_bytes", path)
+        _digest(spec, "retirement_inventory_sha256", path)
+        specification_verified += 1
     corpus = _mapping(document.get("corpus"), path, "corpus")
     if _text(corpus, "source_classification", path) != "clean-room input":
         _fail(path, "corpus must be classified as clean-room input")

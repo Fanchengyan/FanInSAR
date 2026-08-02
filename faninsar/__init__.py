@@ -11,18 +11,14 @@ from __future__ import annotations
 # eg: "0.1.dev0", "0.1"
 __version__ = "0.1.dev0"
 
-from ._core import (
+# Compatibility exports still used by tests and internal modules that have not
+# yet migrated to the curated surface. These are **not** in ``__all__``.
+from faninsar._core import (
     SAR,
-    Acquisition,
-    Baselines,
     DateManager,
     DaySpan,
     Frequency,
     GeoDataFormatConverter,
-    Loop,
-    Loops,
-    Pair,
-    Pairs,
     PairsFactory,
     PhaseDeformationConverter,
     Profile,
@@ -47,3 +43,5 @@ from ._core import (
     transform_from_xy,
     xy_from_profile,
 )
+from faninsar._public import *  # noqa: F403
+from faninsar._public import __all__ as __all__

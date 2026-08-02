@@ -1,8 +1,8 @@
-"""Orchestration pipelines that consume Frame products.
+"""Thin re-export of time-series orchestration pipelines.
 
-Currently provides :class:`InversionPipeline`, which runs NSBAS time-series
-inversion on a :class:`~faninsar.datasets.frame.Frame` via Dask spatial
-tiling and (optionally) GPU acceleration.
+.. deprecated::
+    Prefer :mod:`faninsar.timeseries.pipeline`.  This package remains for
+    import stability during the greenfield dual-namespace collapse.
 """
 
 from __future__ import annotations

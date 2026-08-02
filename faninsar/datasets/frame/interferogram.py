@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import xarray as xr
 
-from faninsar._core.sar import Pairs
+from faninsar.core import Pairs
 from faninsar.datasets.geogrid import GeoGrid
 from faninsar.logging import setup_logger
 
@@ -760,7 +760,7 @@ class FrameInterferogramCollection:
         FrameInterferogramCollection
 
         """
-        from faninsar.datasets.hyp3 import HyP3S1
+        from faninsar.io.datasets.hyp3 import HyP3S1
 
         dataset = HyP3S1(root_dir=root_dir, **dataset_kwargs)
         return cls.from_dataset(
@@ -1079,8 +1079,8 @@ class FrameInterferogramCollection:
 
         return InterferogramDataset(
             root_dir=self._root,
-            paths_unw=paths_unw if paths_unw else None,
-            paths_coh=paths_coh if paths_coh else None,
+            paths_unw=paths_unw or None,
+            paths_coh=paths_coh or None,
             verbose=False,
         )
 

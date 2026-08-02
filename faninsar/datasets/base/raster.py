@@ -32,7 +32,7 @@ from faninsar._core.geo import (
     bounds_from_xy,
     xy_from_transform,
 )
-from faninsar.backends import LazyMultiFileReader
+from faninsar.io.lazy_rasterio import LazyMultiFileReader
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 

@@ -38,7 +38,7 @@ from .readers import (
     ValidSampleMask,
     require_critical_metadata,
 )
-from .resampling import lanczos_resample, lanczos_weights
+from .resampling import lanczos_resample
 from .storage import ChunkAccessLog, ChunkedZarrArrayStore, InMemoryArrayStore
 from .synthetic_slc import SyntheticSLCReader, SyntheticSLCSpec, write_synthetic_slc
 
@@ -81,7 +81,6 @@ __all__ = [
     "UnwrapResult",
     "ValidSampleMask",
     "lanczos_resample",
-    "lanczos_weights",
     "require_critical_metadata",
     "write_synthetic_slc",
 ]

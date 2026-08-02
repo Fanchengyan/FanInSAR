@@ -172,7 +172,7 @@ class FrameTimeSeries:
         ``displacement.zarr`` and (optionally) a ``velocity.cog.tif`` so a
         ``FrameTimeSeries`` can be exercised without running a real
         inversion. The real NSBAS-driven pipeline will live in
-        ``faninsar.NSBAS`` and call a lower-level writer.
+        ``faninsar.timeseries`` and call a lower-level writer.
 
         Parameters
         ----------

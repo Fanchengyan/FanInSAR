@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal
 import pandas as pd
 import rioxarray  # noqa: F401
 
-from faninsar._core.sar.pairs import Pairs
+from faninsar.core.pairs import Pairs
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 

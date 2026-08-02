@@ -2,7 +2,7 @@
 
 Consumes a :class:`~faninsar.datasets.frame.Frame` with interferograms,
 builds a Dask graph for spatial-chunk-parallel inversion via
-:func:`dask.array.map_blocks`, calls :class:`~faninsar.NSBAS.inversion.NSBASSolver`
+:func:`dask.array.map_blocks`, calls :class:`~faninsar.timeseries.inversion.NSBASSolver`
 per spatial chunk, and writes the output displacement time series to a Zarr
 store.
 
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     import xarray as xr
 
     from faninsar.datasets.frame import Frame
-    from faninsar.NSBAS.tsmodels import TimeSeriesModels
+    from faninsar.timeseries.models import TimeSeriesModels
 
 logger = setup_logger(__name__)
 
@@ -43,7 +43,7 @@ def _build_model(model: TimeSeriesModels | str, dates: Any) -> TimeSeriesModels:
     """Resolve a model name or instance into a TimeSeriesModels."""
     if not isinstance(model, str):
         return model
-    from faninsar.NSBAS import tsmodels
+    from faninsar.timeseries import models as tsmodels
 
     cls_name = _MODEL_REGISTRY.get(model)
     if cls_name is None:
@@ -129,7 +129,7 @@ class InversionPipeline:
 
         Follows the dask-torch-numpy pattern: numpy in/out, torch internal.
         """
-        from faninsar.NSBAS.inversion import NSBASSolver
+        from faninsar.timeseries.solver import NSBASSolver
 
         # unw_block: (n_pair, y, x). Reshape to (n_pair, n_pixel) for NSBAS.
         n_pair, ny, nx = unw_block.shape

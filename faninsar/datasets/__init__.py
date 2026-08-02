@@ -14,7 +14,23 @@ from .geogrid import GeoGrid
 # Backwards-compat alias — deprecated, use GeoGrid.
 from .geogrid import GeoGrid as GeoBox
 from .hierarchical import HierarchicalDataset
-from .hyp3 import HyP3S1
 from .ifg import CoherenceDataset, InterferogramDataset
-from .licsar import LiCSAR
 from .xarray_dataset import XarrayDataset
+
+
+def __getattr__(name: str):
+    """Lazy loaders rehomed under :mod:`faninsar.io.datasets`."""
+    if name == "HyP3S1":
+        from faninsar.io.datasets.hyp3 import HyP3S1
+
+        return HyP3S1
+    if name == "LiCSAR":
+        from faninsar.io.datasets.licsar import LiCSAR
+
+        return LiCSAR
+    if name == "ARIA":
+        from faninsar.io.datasets.aria import ARIA
+
+        return ARIA
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+

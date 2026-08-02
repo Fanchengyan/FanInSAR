@@ -13,7 +13,7 @@ import xarray as xr
 from rasterio.enums import Resampling
 from tqdm import tqdm
 
-from faninsar._core.sar import Pairs
+from faninsar.core import Pairs
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points
 
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
     from pyproj.crs import CRS
 
-    from faninsar._core.sar import Baselines, PhaseDeformationConverter
+    from faninsar.core import Baselines, PhaseDeformationConverter
 
 logger = setup_logger(__name__)
 

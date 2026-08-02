@@ -1,7 +1,47 @@
-from .acquisition import Acquisition, DateManager, DaySpan
-from .baseline import Baselines
-from .loops import Loop, Loops, TripletLoop, TripletLoops
-from .pairs import Pair, Pairs, PairsFactory
-from .sar_missions import SAR, Sentinel1
-from .sar_property import Frequency, Wavelength
-from .sar_tools import PhaseDeformationConverter, multi_look
+"""Deprecated path — import from :mod:`faninsar.core` instead.
+
+This module re-exports domain nouns during the greenfield rehome. Callers
+should migrate to ``faninsar.core``; this package will be removed.
+"""
+
+from __future__ import annotations
+
+from faninsar.core import (
+    SAR,
+    Acquisition,
+    Baselines,
+    DateManager,
+    DaySpan,
+    Frequency,
+    Loop,
+    Loops,
+    Pair,
+    Pairs,
+    PairsFactory,
+    PhaseDeformationConverter,
+    Sentinel1,
+    TripletLoop,
+    TripletLoops,
+    Wavelength,
+    multi_look,
+)
+
+__all__ = [
+    "SAR",
+    "Acquisition",
+    "Baselines",
+    "DateManager",
+    "DaySpan",
+    "Frequency",
+    "Loop",
+    "Loops",
+    "Pair",
+    "Pairs",
+    "PairsFactory",
+    "PhaseDeformationConverter",
+    "Sentinel1",
+    "TripletLoop",
+    "TripletLoops",
+    "Wavelength",
+    "multi_look",
+]

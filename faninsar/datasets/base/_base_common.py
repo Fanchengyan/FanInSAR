@@ -10,7 +10,7 @@ import numpy as np
 import rioxarray  # noqa: F401
 from rasterio.dtypes import dtype_ranges
 
-from faninsar._core.sar.pairs import Pairs
+from faninsar.core.pairs import Pairs
 from faninsar.logging import setup_logger
 from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 

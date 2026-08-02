@@ -6,7 +6,7 @@ user extensions. It provides a stable import path under faninsar.constants.
 
 from __future__ import annotations
 
-from faninsar._core.sar.sar_missions import SAR
-from faninsar._core.sar.sar_property import Frequency, Wavelength
+from faninsar.core.sar_missions import SAR
+from faninsar.core.sar_property import Frequency, Wavelength
 
 __all__ = ["SAR", "Frequency", "Wavelength"]

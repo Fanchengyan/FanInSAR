@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 from .provenance import (
+    _digest,
     _fail,
     _integer,
     _items,
@@ -63,6 +64,27 @@ def _current_hashes(root: Path, mutable_paths: tuple[str, ...]) -> bytes:
 
 
 def verify_baseline(root: Path, manifest: Path, baseline: Mapping[str, object]) -> None:
+    retired_value = baseline.get("retired_history")
+    if retired_value is not None:
+        retired = _mapping(retired_value, manifest, "baseline.retired_history")
+        note = _text(retired, "waymark_note", manifest)
+        if not note.startswith("NOTE-"):
+            _fail(manifest, "retired baseline must reference a Waymark Note")
+        _digest(retired, "inventory_sha256", manifest)
+        _digest(retired, "archive_sha256", manifest)
+        _integer(retired, "archived_entry_count", manifest)
+        source_paths = {
+            _text({"value": item}, "value", manifest)
+            for item in _items(
+                retired.get("source_paths"), manifest, "retired_history.source_paths"
+            )
+        }
+        expected_paths = {".omo/", "plans/", "reports/", "scripts/", "workflow.md"}
+        if source_paths != expected_paths:
+            _fail(manifest, "retired baseline source paths differ")
+        _text(baseline, "git_head", manifest)
+        _integer(baseline, "out_of_scope_file_count", manifest)
+        return
     mutable = tuple(
         _text({"value": item}, "value", manifest)
         for item in _items(baseline.get("mutable_paths"), manifest, "mutable_paths")
@@ -144,4 +166,16 @@ def validate_oracles(
             _fail(manifest, "forbidden or diagnostic oracle marked primary")
         if "sha256" in item:
             verified += _verify_pin(item, root, manifest, f"forbidden[{index}]")
+        elif "waymark_note" in item:
+            note = _text(item, "waymark_note", manifest)
+            if not note.startswith("NOTE-"):
+                _fail(manifest, "retired diagnostic must reference a Waymark Note")
+            _text(item, "source_path_last_recorded", manifest)
+            _digest(item, "source_sha256", manifest)
+            _integer(item, "source_size_bytes", manifest)
+            if _text(item, "availability", manifest) != (
+                "unavailable-before-PROPOSAL-0010"
+            ):
+                _fail(manifest, "retired diagnostic availability differs")
+            verified += 1
     return verified, tuple(processors)
