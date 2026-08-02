@@ -1,9 +1,8 @@
 """Unified burst-merge gateway with selectable, reference-grounded methods.
 
 Each method is a (alignment, weighting) pair backed by a verbatim algorithm
-from ISCE2, InSAR.dev Core, or GMTSAR. See
-``reports/2026-07-23-burst-merge-strategies/report.md`` for the full
-cross-system reference and the global ``sar-burst-merge`` skill.
+from ISCE2, InSAR.dev Core, or GMTSAR. See Waymark ``NOTE-0001`` for the
+distilled cross-system reference and the global ``sar-burst-merge`` skill.
 
 Method grounding (source file : line):
 

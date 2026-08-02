@@ -12,6 +12,7 @@ logger = setup_logger(__name__)
 __all__ = [
     "apply_feather",
     "compute_feather",
+    "compute_hanning_weight",
     "compute_weight_stack",
     "overlap_mask",
 ]
@@ -62,21 +63,88 @@ def apply_feather(
 
     Parameters
     ----------
-    weight : numpy.ndarray
+    weight : np.ndarray
         Per-pixel weight to be feathered.
-    valid_mask : numpy.ndarray
+    valid_mask : np.ndarray
         Boolean mask of valid pixels.
     feather_width_px : float
         Feather half-width in pixels.
 
     Returns
     -------
-    numpy.ndarray
+    np.ndarray
         Feathereight as a float32 array.
 
     """
     feather = compute_feather(valid_mask, feather_width_px=feather_width_px)
     return (weight.astype(np.float32) * feather).astype(np.float32)
+
+
+def compute_hanning_weight(
+    valid_mask: np.ndarray,
+    *,
+    min_weight: float = 0.05,
+    axis: int = 0,
+) -> np.ndarray:
+    """Compute a Hanning-window weight over the valid extent of a burst.
+
+    The weight peaks at the burst centre along *axis* and tapers to
+    ``min_weight`` at the edges, matching the blending strategy of
+    :func:`faninsar.missions.sentinel1.io.stitch_bursts`.  Compared to
+    :func:`compute_feather` (which only ramps over a narrow border), the
+    Hanning window covers the entire burst height so that two overlapping
+    bursts form complementary cos²/sin²-style transitions with no
+    "double-1" plateau in the overlap centre.
+
+    Parameters
+    ----------
+    valid_mask : numpy.ndarray
+        Boolean mask of valid pixels (2-D).
+    min_weight : float, optional
+        Floor value at the burst edges (default 0.05, same as
+        ``stitch_bursts``).
+    axis : int, optional
+        Axis along which the Hanning window is applied. ``0`` (default)
+        is azimuth (rows) — the typical burst-overlap direction for
+        Sentinel-1 TOPS.
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 weights of the same shape as *valid_mask*.  Invalid
+        pixels are exactly 0.
+
+    Notes
+    -----
+    The valid extent along *axis* is determined from ``valid_mask.any()``
+    on the complementary axis.  For a burst whose footprint is a slanted
+    parallelogram on the geo grid, each column may have a slightly
+    different valid-row range; this implementation uses the global row
+    extent, which is sufficient for the ~25 % azimuth overlap typical of
+    Sentinel-1 IW bursts.
+
+    """
+    if valid_mask.ndim != 2:
+        msg = "compute_hanning_weight expects a 2-D valid_mask"
+        raise ValueError(msg)
+    other = 1 - axis
+    valid_any = valid_mask.any(axis=other)
+    valid_idx = np.where(valid_any)[0]
+    if valid_idx.size == 0:
+        return np.zeros_like(valid_mask, dtype=np.float32)
+
+    r0, r1 = int(valid_idx[0]), int(valid_idx[-1])
+    extent = r1 - r0 + 1
+    w_1d = np.maximum(np.hanning(extent).astype(np.float32), float(min_weight))
+
+    w_full = np.zeros(valid_mask.shape[axis], dtype=np.float32)
+    w_full[r0 : r1 + 1] = w_1d
+
+    if axis == 0:
+        w_2d = w_full[:, None]
+    else:
+        w_2d = w_full[None, :]
+    return (w_2d * valid_mask.astype(np.float32)).astype(np.float32)
 
 
 def overlap_mask(

@@ -1,4 +1,4 @@
-"""Backend dispatcher for explicit IRLS / DCT-IRLS / snaphu unwrapping."""
+"""Backend dispatcher for explicit IRLS and snaphu unwrapping."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import numpy as np
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.unwrap.common import CommonUnwrapResult, build_common_result
-from faninsar.processing.unwrap.dct_irls import dct_irls_unwrap
 from faninsar.processing.unwrap.irls import irls_unwrap
 from faninsar.processing.unwrap.snaphu_backend import SnaphuConfig, snaphu_unwrap
 from faninsar.processing.unwrap.temporal_irls import (
@@ -19,7 +18,7 @@ from faninsar.processing.unwrap.temporal_irls import (
 
 logger = setup_logger(__name__)
 
-UnwrapBackend = Literal["irls", "dct_irls", "snaphu"]
+UnwrapBackend = Literal["irls", "snaphu"]
 
 __all__ = [
     "TemporalUnwrapResult",
@@ -42,16 +41,15 @@ def unwrap(
     Parameters
     ----------
     wrapped_or_complex : numpy.ndarray
-        Wrapped phase (IRLS / DCT-IRLS) or complex interferogram (snaphu).
+        Wrapped phase (IRLS) or complex interferogram (snaphu).
     coherence : numpy.ndarray, optional
         Coherence weights.
-    method : {"irls", "dct_irls", "snaphu"}
+    method : {"irls", "snaphu"}
         Backend selection. There is no silent fallback between backends.
     snaphu_config : SnaphuConfig, optional
         Configuration for the snaphu backend.
     irls_kwargs : dict, optional
-        Extra keyword arguments for :func:`irls_unwrap` or
-        :func:`dct_irls_unwrap`.
+        Extra keyword arguments for :func:`irls_unwrap`.
 
     Returns
     -------
@@ -69,22 +67,6 @@ def unwrap(
             unwrapped_phase=result.unwrapped_phase,
             connected_components=result.connected_components,
             method="irls",
-            metrics={
-                "iterations": float(result.iterations),
-                "converged": float(result.converged),
-            },
-            configuration=dict(irls_kwargs or {}),
-        )
-    if method == "dct_irls":
-        phase = np.asarray(wrapped_or_complex)
-        if np.iscomplexobj(phase):
-            phase = np.angle(phase)
-        result = dct_irls_unwrap(phase, coherence, **(irls_kwargs or {}))
-        return build_common_result(
-            wrapped_phase=phase,
-            unwrapped_phase=result.unwrapped_phase,
-            connected_components=result.connected_components,
-            method="dct_irls",
             metrics={
                 "iterations": float(result.iterations),
                 "converged": float(result.converged),

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
+from faninsar.processing.memory import release_memmap_pages
 from faninsar.processing.pipeline.geo_resample import (
     compose_secondary_coordinates,
     resample_complex_at_coordinates,
@@ -17,9 +19,10 @@ from faninsar.processing.tops.deramp import (
 
 if TYPE_CHECKING:
     from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
 
-__all__ = ["coregister_geocoded_slcs"]
+__all__ = ["coregister_geocoded_slcs", "coregister_geocoded_slcs_chunked"]
 
 
 def _apply_reramp(
@@ -51,7 +54,7 @@ def coregister_geocoded_slcs(
     secondary_carrier: TOPSCarrierModel,
     reference_lut: Geo2RdrLUT,
     offsets: OffsetFieldResult,
-    executor: str = "serial",
+    executor: Literal["torch"] = "torch",
     device: str = "auto",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Coregister two deramped SLCs directly on a geographic grid.
@@ -66,8 +69,8 @@ def coregister_geocoded_slcs(
         Reference radar coordinates at geographic pixel centres.
     offsets : OffsetFieldResult
         Dense reference-to-secondary radar offsets.
-    executor : {"serial", "dask-torch"}, optional
-        Lanczos implementation.
+    executor : {"torch"}, optional
+        Unified Torch Lanczos implementation.
     device : {"auto", "cpu", "cuda"}, optional
         Torch device for the accelerated implementation.
 
@@ -83,8 +86,8 @@ def coregister_geocoded_slcs(
     that interpolation.
 
     """
-    secondary_azimuth, secondary_range, secondary_valid = (
-        compose_secondary_coordinates(reference_lut, offsets)
+    secondary_azimuth, secondary_range, secondary_valid = compose_secondary_coordinates(
+        reference_lut, offsets
     )
     reference_geo, reference_valid = resample_complex_at_coordinates(
         reference_deramped,
@@ -128,3 +131,118 @@ def coregister_geocoded_slcs(
     reference_geo = np.where(valid, reference_geo, invalid_value).astype(np.complex64)
     secondary_geo = np.where(valid, secondary_geo, invalid_value).astype(np.complex64)
     return reference_geo, secondary_geo, valid
+
+
+def coregister_geocoded_slcs_chunked(
+    reference_deramped: np.ndarray,
+    secondary_deramped: np.ndarray,
+    *,
+    reference_carrier: TOPSCarrierModel,
+    secondary_carrier: TOPSCarrierModel,
+    reference_lut: Geo2RdrLUT,
+    offsets: OffsetFieldResult,
+    output_dir: str | Path,
+    row_chunk: int = 256,
+    executor: Literal["torch"] = "torch",
+    device: str = "auto",
+    watchdog: MemoryWatchdog | None = None,
+) -> tuple[np.memmap, np.memmap, np.memmap]:
+    """Coregister geographic SLCs into disk-backed row tiles.
+
+    Parameters
+    ----------
+    reference_deramped, secondary_deramped : numpy.ndarray
+        Native-resolution deramped SLCs.
+    reference_carrier, secondary_carrier : TOPSCarrierModel
+        Acquisition-specific TOPS carrier models.
+    reference_lut : Geo2RdrLUT
+        Reference radar coordinates on the geographic grid.
+    offsets : OffsetFieldResult
+        Dense reference-to-secondary offsets.
+    output_dir : str or pathlib.Path
+        Directory for disk-backed intermediate arrays.
+    row_chunk : int, optional
+        Geographic rows processed per tile.
+    executor : {"torch"}, optional
+        Unified Torch Lanczos implementation.
+    device : {"auto", "cpu", "cuda", "mps"}, optional
+        Torch device for accelerated Lanczos.
+    watchdog : MemoryWatchdog, optional
+        Memory guard sampled after every completed tile.
+
+    Returns
+    -------
+    reference, secondary, valid : tuple[numpy.memmap, ...]
+        Disk-backed complete geographic SLCs and shared validity mask.
+
+    """
+    from faninsar.processing.errors import reject_invalid_state
+    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+
+    if row_chunk < 1:
+        reject_invalid_state("row_chunk must be >= 1")
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    shape = reference_lut.shape
+    reference_output = np.memmap(
+        directory / "reference_geo.complex64",
+        mode="w+",
+        dtype=np.complex64,
+        shape=shape,
+    )
+    secondary_output = np.memmap(
+        directory / "secondary_geo.complex64",
+        mode="w+",
+        dtype=np.complex64,
+        shape=shape,
+    )
+    valid_output = np.memmap(
+        directory / "geo_valid.bool",
+        mode="w+",
+        dtype=np.bool_,
+        shape=shape,
+    )
+    for row_start in range(0, shape[0], row_chunk):
+        row_stop = min(row_start + row_chunk, shape[0])
+        rows = slice(row_start, row_stop)
+        tile_lut = Geo2RdrLUT(
+            az_full=reference_lut.az_full[rows],
+            rg_full=reference_lut.rg_full[rows],
+            valid=reference_lut.valid[rows],
+            full_radar_shape=reference_lut.full_radar_shape,
+            height_m=reference_lut.height_m,
+            height_full=(
+                None
+                if reference_lut.height_full is None
+                else reference_lut.height_full[rows]
+            ),
+        )
+        reference_tile, secondary_tile, valid_tile = coregister_geocoded_slcs(
+            reference_deramped,
+            secondary_deramped,
+            reference_carrier=reference_carrier,
+            secondary_carrier=secondary_carrier,
+            reference_lut=tile_lut,
+            offsets=offsets,
+            executor=executor,
+            device=device,
+        )
+        reference_output[rows] = reference_tile
+        secondary_output[rows] = secondary_tile
+        valid_output[rows] = valid_tile
+        del reference_tile, secondary_tile, valid_tile
+        for array in (reference_output, secondary_output, valid_output):
+            release_memmap_pages(array)
+        for array in (
+            reference_lut.az_full,
+            reference_lut.rg_full,
+            reference_lut.valid,
+        ):
+            if isinstance(array, np.memmap):
+                release_memmap_pages(array)
+        if watchdog is not None:
+            watchdog.sample(f"geo_coregister:{row_start}:{row_stop}")
+    reference_output.flush()
+    secondary_output.flush()
+    valid_output.flush()
+    return reference_output, secondary_output, valid_output

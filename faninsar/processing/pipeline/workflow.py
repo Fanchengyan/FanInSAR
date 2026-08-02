@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from faninsar.missions.sentinel1.types import S1Burst, S1Product, S1Swath
     from faninsar.processing.geometry.dem import DEMSampler
-    from faninsar.sentinel1.types import S1Burst, S1Product, S1Swath
 
 import numpy as np
 
 from faninsar.logging import setup_logger
+from faninsar.missions.sentinel1 import open_safe_product, read_burst_window
 from faninsar.processing.coreg.geometry_coreg import (
     build_offset_field,
     geometry_coarse_shift,
@@ -31,7 +32,6 @@ from faninsar.processing.pipeline.products import (
 from faninsar.processing.tops.carrier import carrier_from_swath
 from faninsar.processing.tops.deramp import TOPSCarrierModel, deramp, reramp
 from faninsar.processing.unwrap import SnaphuConfig, snaphu_unwrap
-from faninsar.sentinel1 import open_safe_product, read_burst_window
 
 logger = setup_logger(__name__)
 
@@ -172,7 +172,7 @@ def stage_coregister(
     state: PairWorkflowState,
     *,
     search_radius: int = 32,
-    executor: str = "serial",
+    executor: str = "torch",
     device: str = "auto",
 ) -> PairWorkflowState:
     """Stage 3: geometry coarse offsets + correlation refinement + resampling.
@@ -183,10 +183,10 @@ def stage_coregister(
         Pair workflow state after deramp.
     search_radius : int, optional
         Correlation search radius in pixels.
-    executor : {"serial", "dask-torch"}, optional
-        Lanczos path for :func:`resample_complex`. Default ``"serial"``.
+    executor : {"torch"}, optional
+        Unified Torch Lanczos path for :func:`resample_complex`.
     device : {"auto","cpu","cuda","mps"}, optional
-        Torch device when ``executor="dask-torch"``. Default ``"auto"``.
+        Torch compute device. Default ``"auto"``.
 
     """
     if state.reference_deramped is None or state.secondary_deramped is None:
@@ -421,7 +421,7 @@ def run_pair_workflow(
     goldstein_alpha: float = 0.5,
     dem: DEMSampler | None = None,
     geocode_stride: int = 2,
-    executor: str = "serial",
+    executor: str = "torch",
     device: str = "auto",
     snaphu_config: SnaphuConfig | None = None,
 ) -> PairWorkflowState:
@@ -457,10 +457,10 @@ def run_pair_workflow(
         DEM for geocoding. Defaults to zero-height ellipsoid.
     geocode_stride : int, optional
         Subsampling for geocode solve.
-    executor : {"serial", "dask-torch"}, optional
-        Lanczos path for coreg resampling. Default ``"serial"``.
+    executor : {"torch"}, optional
+        Unified Torch Lanczos path for coreg resampling.
     device : {"auto","cpu","cuda","mps"}, optional
-        Torch device when ``executor="dask-torch"``. Default ``"auto"``.
+        Torch compute device. Default ``"auto"``.
     snaphu_config : SnaphuConfig, optional
         snaphu-py configuration.
 

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from scipy.ndimage import map_coordinates
 
+from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.resampling import lanczos_resample
 
@@ -21,6 +22,48 @@ __all__ = [
     "resample_complex_at_coordinates",
 ]
 
+logger = setup_logger(__name__)
+
+
+def _resample_complex_opencv(
+    source: np.ndarray,
+    azimuth: np.ndarray,
+    range_index: np.ndarray,
+    valid: np.ndarray,
+) -> np.ndarray:
+    """Resample one dense coordinate tile with OpenCV Lanczos-4."""
+    try:
+        import cv2
+    except ImportError as error:
+        message = (
+            "the OpenCV geocode executor requires opencv-python; "
+            "install FanInSAR with the 'opencv' extra"
+        )
+        logger.exception(message)
+        raise ImportError(message) from error
+
+    azimuth_map = np.where(valid, azimuth, -1.0).astype(np.float32)
+    range_map = np.where(valid, range_index, -1.0).astype(np.float32)
+    real = cv2.remap(
+        source.real,
+        range_map,
+        azimuth_map,
+        interpolation=cv2.INTER_LANCZOS4,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    imaginary = cv2.remap(
+        source.imag,
+        range_map,
+        azimuth_map,
+        interpolation=cv2.INTER_LANCZOS4,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    output = (real + 1j * imaginary).astype(np.complex64)
+    output[~valid] = np.complex64(np.nan + 1j * np.nan)
+    return output
+
 
 def resample_complex_at_coordinates(
     complex_radar: np.ndarray,
@@ -28,7 +71,7 @@ def resample_complex_at_coordinates(
     range_index: np.ndarray,
     *,
     valid: np.ndarray | None = None,
-    executor: str = "serial",
+    executor: Literal["torch", "opencv"] = "torch",
     device: str = "auto",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Resample a complex radar image at arbitrary fractional coordinates.
@@ -41,7 +84,7 @@ def resample_complex_at_coordinates(
         Zero-based fractional source coordinates on the destination grid.
     valid : numpy.ndarray, optional
         Additional destination validity mask.
-    executor : {"serial", "dask-torch"}, optional
+    executor : {"torch", "opencv"}, optional
         Lanczos implementation.
     device : {"auto", "cpu", "cuda"}, optional
         Torch device for the accelerated implementation.
@@ -74,31 +117,28 @@ def resample_complex_at_coordinates(
     output = np.full(azimuth.shape, np.nan + 1j * np.nan, dtype=np.complex64)
     if not np.any(coordinate_valid):
         return output, coordinate_valid
+    if executor == "opencv":
+        return (
+            _resample_complex_opencv(
+                source,
+                azimuth,
+                range_index,
+                coordinate_valid,
+            ),
+            coordinate_valid,
+        )
     coordinates = np.array(
         [azimuth[coordinate_valid], range_index[coordinate_valid]],
         dtype=np.float64,
     )
-    if executor == "dask-torch":
-        from faninsar.processing.resampling_torch import (
-            lanczos_resample_dask_torch,
-        )
-
-        values = lanczos_resample_dask_torch(
-            source,
-            coordinates,
-            a=4,
-            mode="constant",
-            cval=0.0,
-            device=device,
-            use_dask=False,
-        )
-    elif executor == "serial":
+    if executor == "torch":
         values = lanczos_resample(
             source,
             coordinates,
             a=4,
             mode="constant",
             cval=0.0,
+            device=device,
         )
     else:
         reject_invalid_state(f"unknown geocode executor: {executor}")
@@ -192,7 +232,7 @@ def apply_lut_complex(
     lut: Geo2RdrLUT,
     *,
     full_radar_shape: tuple[int, int] | None = None,
-    executor: str = "serial",
+    executor: Literal["torch", "opencv"] = "torch",
     device: str = "auto",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Lanczos-resample a complex radar field through a shared LUT.
@@ -205,10 +245,10 @@ def apply_lut_complex(
         Geographic-to-radar lookup table.
     full_radar_shape : tuple[int, int], optional
         Full-resolution shape used to infer look factors.
-    executor : {"serial", "dask-torch"}, optional
+    executor : {"torch", "opencv"}, optional
         Resampling backend.
     device : {"auto", "cpu", "cuda"}, optional
-        Torch device for the ``dask-torch`` backend.
+        Torch device for the unified Torch backend.
 
     Returns
     -------

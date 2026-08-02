@@ -59,8 +59,10 @@ def _grid_pixel_centers_lonlat(
 
     from pyproj import Transformer
 
+    # FORWARD: projected (easting, northing) → (lon, lat).
+    # INVERSE would treat UTM metres as geographic degrees and yields ±inf.
     transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-    lon, lat = transformer.transform(xs.ravel(), ys.ravel(), direction="INVERSE")
+    lon, lat = transformer.transform(xs.ravel(), ys.ravel())
     return (
         np.asarray(lat, dtype=np.float64).reshape(xs.shape),
         np.asarray(lon, dtype=np.float64).reshape(xs.shape),

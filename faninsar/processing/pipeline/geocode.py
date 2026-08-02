@@ -1,4 +1,16 @@
-"""Geocode radar-coordinate layers with rdr2geo + DEM sampling."""
+"""Geocode radar-coordinate layers with rdr2geo + DEM sampling.
+
+This is **Path A** (forward geocode) in the terminology of the
+``sar-resampling-kernels`` skill: for each output pixel we invert the radar
+geometry with ``rdr2geo_with_dem`` to get fractional radar ``(az, rg)``
+coordinates, then resample the radar image at those coordinates.
+
+Resampling kernel is chosen from the array's physical type — **never** by
+nearest-gather. ``radar[round(az), round(rg)]`` is a bug for every continuous
+quantity (complex, real smooth, phase): it aliases and staircases edges and
+drops ~30% of the spatial information. Only hard integer-class labels may use
+nearest. See the skill's "Geocoding — the two implementation paths" section.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
+from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import RadarGrid
@@ -17,8 +30,8 @@ from faninsar.processing.geometry import (
 )
 
 if TYPE_CHECKING:
+    from faninsar.missions.sentinel1.types import S1Burst, S1Swath
     from faninsar.processing.geometry.dem import DEMSampler
-    from faninsar.sentinel1.types import S1Burst, S1Swath
 
 logger = setup_logger(__name__)
 
@@ -90,6 +103,98 @@ def radar_geometry_from_swath(
     return RadarGeometryModel.from_radar_grid(grid, swath.orbit)
 
 
+def _resample_at_radar_coords(
+    values: np.ndarray,
+    az_grid: np.ndarray,
+    rg_grid: np.ndarray,
+    converged: np.ndarray,
+) -> np.ndarray:
+    """Resample ``values`` at fractional radar coordinates from ``geo2rdr``.
+
+    Kernel is selected from the array's physical type so that the forward
+    geocode preserves phase / smoothness instead of nearest-gather aliasing:
+
+    * **complex** (SLC, wrapped ifg) → Lanczos a=4 (windowed sinc). Bilinear on
+      real/imag attenuates in-band signal and leaks aliasing, producing a
+      sub-pixel-offset-dependent phase bias.
+    * **real, smooth** (coherence, unwrapped phase, DEM, amplitude) →
+      ``scipy.map_coordinates(order=1)`` (bilinear). These are already smooth
+      or already-estimated fields; bilinear is appropriate and cheap.
+    * **integer / hard labels** (conncomp, layover, water masks) →
+      ``map_coordinates(order=0)`` (nearest). Integer classes must not be
+      interpolated — bilinear invents invalid classes.
+
+    Out-of-bounds and non-converged pixels are set to NaN (or 0 for integer
+    labels).
+
+    Parameters
+    ----------
+    values : numpy.ndarray
+        2-D radar-coordinate field.
+    az_grid, rg_grid : numpy.ndarray
+        Fractional radar coordinates on the output grid (same shape).
+    converged : numpy.ndarray
+        Bool mask of geo2rdr convergence, same shape as the grids.
+
+    Returns
+    -------
+    numpy.ndarray
+        Resampled values on the output grid, NaN where not converged
+        (0 for integer labels).
+
+    """
+    height, width = values.shape
+    out_shape = az_grid.shape
+    is_complex = np.iscomplexobj(values)
+    is_integer = np.issubdtype(values.dtype, np.integer)
+
+    # Clip to valid radar bounds so map_coordinates does not index outside.
+    az_clamped = np.clip(az_grid, 0.0, height - 1.0)
+    rg_clamped = np.clip(rg_grid, 0.0, width - 1.0)
+
+    if is_integer:
+        # Hard labels — nearest, never interpolate classes.
+        out = np.zeros(out_shape, dtype=values.dtype)
+        coords = np.array([az_clamped.ravel(), rg_clamped.ravel()])
+        sampled = map_coordinates(
+            values.astype(np.float32), coords, order=0,
+            mode="constant", cval=0.0,
+        ).reshape(out_shape).astype(values.dtype)
+        out[converged] = sampled[converged]
+        return out
+
+    if is_complex:
+        # Complex SLC / wrapped ifg → Lanczos a=4 to preserve phase.
+        # Import lazily to avoid a torch dependency for the real-field path.
+        from faninsar.processing.resampling import lanczos_resample
+
+        out = np.full(out_shape, np.nan + 1j * np.nan, dtype=np.complex64)
+        valid = converged & np.isfinite(az_clamped) & np.isfinite(rg_clamped)
+        if not np.any(valid):
+            return out
+        coords = np.array(
+            [az_clamped[valid], rg_clamped[valid]], dtype=np.float64
+        )
+        sampled = lanczos_resample(
+            values, coords, a=4, mode="constant", cval=0.0,
+        )
+        out[valid] = np.asarray(sampled, dtype=np.complex64)
+        return out
+
+    # Real, smooth field (coherence, unwrapped phase, DEM, amplitude) → bilinear.
+    out = np.full(out_shape, np.nan, dtype=np.float32)
+    valid = converged & np.isfinite(az_clamped) & np.isfinite(rg_clamped)
+    if not np.any(valid):
+        return out
+    coords = np.array([az_clamped[valid], rg_clamped[valid]], dtype=np.float64)
+    sampled = map_coordinates(
+        np.asarray(values, dtype=np.float32), coords, order=1,
+        mode="constant", cval=0.0,
+    )
+    out[valid] = sampled.astype(np.float32)
+    return out
+
+
 def geocode_layer(
     values: np.ndarray,
     *,
@@ -102,10 +207,17 @@ def geocode_layer(
 ) -> GeocodedLayer:
     """Geocode a radar-coordinate layer to lon/lat samples.
 
+    Forward geocode (Path A): for each output pixel, invert the radar geometry
+    with :func:`rdr2geo_with_dem` to get fractional radar ``(az, rg)``
+    coordinates, then resample ``values`` at those coordinates with a kernel
+    matched to the array's physical type — Lanczos a=4 for complex,
+    bilinear for real smooth, nearest for hard integer labels. Nearest-gather
+    is intentionally **not** used: it aliases every continuous quantity.
+
     Parameters
     ----------
     values : numpy.ndarray
-        2-D radar-coordinate field (phase, coherence, ...).
+        2-D radar-coordinate field (complex ifg, phase, coherence, ...).
     swath, burst : S1Swath, S1Burst
         Geometry metadata for the window.
     row0, col0 : int
@@ -140,11 +252,13 @@ def geocode_layer(
     dem_sampler = dem if dem is not None else ConstantHeightDEM(0.0)
     transform = rdr2geo_with_dem(model, az_grid, rg_grid, dem_sampler)
 
-    # Nearest-neighbour gather of values at solved samples.
-    src_az = np.clip(np.rint(az_grid).astype(np.int64), 0, height - 1)
-    src_rg = np.clip(np.rint(rg_grid).astype(np.int64), 0, width - 1)
-    sampled = values[src_az, src_rg].astype(np.float32, copy=False)
-    sampled = np.where(transform.converged, sampled, np.nan)
+    # Resample values at the fractional radar coordinates returned by geo2rdr.
+    # The kernel is chosen inside _resample_at_radar_coords by physical type:
+    # Lanczos for complex, bilinear for real smooth, nearest for hard labels.
+    # Never nearest-gather continuous fields — it aliases and staircases.
+    sampled = _resample_at_radar_coords(
+        values, az_grid, rg_grid, transform.converged,
+    )
 
     n_conv = int(np.count_nonzero(transform.converged))
     logger.info(

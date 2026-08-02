@@ -10,15 +10,18 @@ import numpy as np
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import geo2rdr
+from faninsar.processing.memory import release_memmap_pages
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from faninsar.processing.geometry import RadarGeometryModel
     from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.merge.grid import GeoGridSpec
 
 logger = setup_logger(__name__)
 
-__all__ = ["Geo2RdrLUT", "build_geo2rdr_lut"]
+__all__ = ["Geo2RdrLUT", "build_geo2rdr_lut", "grid_lonlat", "grid_lonlat_rows"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +38,8 @@ class Geo2RdrLUT:
         Shape of the full-resolution radar image.
     height_m : float
         Mean ellipsoidal height used to build the lookup table.
+    height_full : numpy.ndarray, optional
+        Per-pixel DEM samples reused by exact geometric flattening.
 
     """
 
@@ -43,6 +48,7 @@ class Geo2RdrLUT:
     valid: np.ndarray
     full_radar_shape: tuple[int, int]
     height_m: float
+    height_full: np.ndarray | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -52,9 +58,37 @@ class Geo2RdrLUT:
 
 def grid_lonlat(grid: GeoGridSpec) -> tuple[np.ndarray, np.ndarray]:
     """Return geographic coordinates at destination pixel centers."""
+    return grid_lonlat_rows(grid, 0, grid.height)
+
+
+def grid_lonlat_rows(
+    grid: GeoGridSpec,
+    row_start: int,
+    row_stop: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return geographic pixel-centre coordinates for selected grid rows.
+
+    Parameters
+    ----------
+    grid : GeoGridSpec
+        Destination geographic grid.
+    row_start, row_stop : int
+        Half-open destination row interval.
+
+    Returns
+    -------
+    latitude, longitude : tuple[numpy.ndarray, numpy.ndarray]
+        Coordinate arrays with shape ``(row_stop - row_start, grid.width)``.
+
+    """
     from pyproj import Transformer
 
-    x, y = grid.xy_pixel_centers()
+    if row_start < 0 or row_stop > grid.height or row_start >= row_stop:
+        reject_invalid_state("invalid geographic grid row interval")
+    x0, dx, _, y0, _, dy = grid.transform
+    x_coordinates = x0 + dx * (0.5 + np.arange(grid.width, dtype=np.float64))
+    y_coordinates = y0 + dy * (0.5 + np.arange(row_start, row_stop, dtype=np.float64))
+    x, y = np.meshgrid(x_coordinates, y_coordinates)
     transformer = Transformer.from_crs(grid.crs, "EPSG:4326", always_xy=True)
     longitude, latitude = transformer.transform(x.ravel(), y.ravel())
     return (
@@ -70,7 +104,8 @@ def build_geo2rdr_lut(
     full_radar_shape: tuple[int, int],
     height_m: float | np.ndarray = 0.0,
     dem: DEMSampler | None = None,
-    chunk_size: int = 40,
+    chunk_size: int = 128,
+    storage_dir: str | Path | None = None,
 ) -> Geo2RdrLUT:
     """Build a reusable geographic-to-radar lookup table.
 
@@ -88,6 +123,9 @@ def build_geo2rdr_lut(
         Per-pixel ellipsoidal height source.
     chunk_size : int, optional
         Destination rows processed per geometry call.
+    storage_dir : str or pathlib.Path, optional
+        Directory for disk-backed LUT arrays. In-memory arrays are used when
+        omitted.
 
     Returns
     -------
@@ -95,11 +133,41 @@ def build_geo2rdr_lut(
         Full-resolution radar coordinates on the destination grid.
 
     """
+    from pathlib import Path
+
     full_height, full_width = full_radar_shape
-    latitude, longitude = grid_lonlat(grid)
-    azimuth = np.full(grid.shape, np.nan, dtype=np.float64)
-    range_index = np.full(grid.shape, np.nan, dtype=np.float64)
-    valid = np.zeros(grid.shape, dtype=bool)
+    if storage_dir is None:
+        azimuth = np.full(grid.shape, np.nan, dtype=np.float64)
+        range_index = np.full(grid.shape, np.nan, dtype=np.float64)
+        valid = np.zeros(grid.shape, dtype=bool)
+        height_lookup = np.full(grid.shape, np.nan, dtype=np.float64)
+    else:
+        directory = Path(storage_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        azimuth = np.memmap(
+            directory / "reference_azimuth.float64",
+            mode="w+",
+            dtype=np.float64,
+            shape=grid.shape,
+        )
+        range_index = np.memmap(
+            directory / "reference_range.float64",
+            mode="w+",
+            dtype=np.float64,
+            shape=grid.shape,
+        )
+        valid = np.memmap(
+            directory / "reference_valid.bool",
+            mode="w+",
+            dtype=np.bool_,
+            shape=grid.shape,
+        )
+        height_lookup = np.memmap(
+            directory / "height.float64",
+            mode="w+",
+            dtype=np.float64,
+            shape=grid.shape,
+        )
 
     fallback_height = (
         float(height_m) if np.isscalar(height_m) else float(np.nanmean(height_m))
@@ -113,8 +181,11 @@ def build_geo2rdr_lut(
     mean_heights: list[float] = []
     for row_start in range(0, grid.height, chunk_size):
         row_stop = min(row_start + chunk_size, grid.height)
-        latitude_chunk = np.ascontiguousarray(latitude[row_start:row_stop])
-        longitude_chunk = np.ascontiguousarray(longitude[row_start:row_stop])
+        latitude_chunk, longitude_chunk = grid_lonlat_rows(
+            grid,
+            row_start,
+            row_stop,
+        )
         finite_geo = np.isfinite(latitude_chunk) & np.isfinite(longitude_chunk)
         safe_latitude = np.where(finite_geo, latitude_chunk, 0.0)
         safe_longitude = np.where(finite_geo, longitude_chunk, 0.0)
@@ -140,6 +211,7 @@ def build_geo2rdr_lut(
             )
         else:
             height_chunk = fallback_height
+        height_lookup[row_start:row_stop] = height_chunk
         if not np.isscalar(height_chunk):
             mean_heights.append(float(np.nanmean(height_chunk)))
 
@@ -170,7 +242,18 @@ def build_geo2rdr_lut(
             np.nan,
         )
         valid[row_start:row_stop] = chunk_valid
+        for array in (azimuth, range_index, valid, height_lookup):
+            if isinstance(array, np.memmap):
+                release_memmap_pages(array)
 
+    if isinstance(azimuth, np.memmap):
+        azimuth.flush()
+    if isinstance(range_index, np.memmap):
+        range_index.flush()
+    if isinstance(valid, np.memmap):
+        valid.flush()
+    if isinstance(height_lookup, np.memmap):
+        height_lookup.flush()
     mean_height = float(np.mean(mean_heights)) if mean_heights else fallback_height
     logger.info(
         "Built geo2rdr LUT: %d/%d valid, radar_shape=%s, mean_height=%.1f m",
@@ -185,4 +268,5 @@ def build_geo2rdr_lut(
         valid=valid,
         full_radar_shape=(int(full_height), int(full_width)),
         height_m=mean_height,
+        height_full=height_lookup,
     )

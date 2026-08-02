@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -37,6 +37,7 @@ from faninsar.processing.geometry import (
     rdr2geo_with_dem_chunked,
 )
 from faninsar.processing.geometry.baseline import BaselineComponents
+from faninsar.processing.geometry.dem import GeoidAdjustedDEM, RasterDEM
 from faninsar.processing.interferometry.flatten import (
     compute_geometric_phase_from_geo,
     compute_topographic_phase,
@@ -46,7 +47,6 @@ from faninsar.processing.interferometry.flatten import (
     remove_topographic_phase,
 )
 from faninsar.processing.interferometry.pair import (
-    _block_reduce,
     form_interferogram,
     goldstein_filter,
     mask_invalid_looks,
@@ -192,6 +192,7 @@ def load_production_scene(
     dem: DEMSampler | None = None,
     orbit_path: str | Path | None = None,
     coregistration_grid: CoregistrationGrid = "radar",
+    full_range: bool = False,
 ) -> ProductionScene:
     """Load a full burst or full stitched sub-swath for production processing.
 
@@ -211,6 +212,10 @@ def load_production_scene(
         Precise ESA EOF orbit. Annotation orbit vectors are used when omitted.
     coregistration_grid : {"radar", "geo"}, optional
         Select the burst sample layout required by the coregistration grid.
+    full_range : bool, optional
+        Read the full swath range extent (column 0 through the burst width)
+        instead of the valid-sample envelope, matching ISCE2's full-width
+        burst layout. Invalid samples are still zeroed via the valid mask.
 
     Returns
     -------
@@ -228,6 +233,7 @@ def load_production_scene(
             s1_swath,
             burst_index=burst_index,
             geocoding_layout=coregistration_grid == "geo",
+            full_range=full_range,
         )
         burst = s1_swath.bursts[burst_index]
     elif scope == "swath":
@@ -361,9 +367,7 @@ def _apply_geo_topographic_phase_chunked(
             valid=lut.valid[rows],
             full_radar_shape=lut.full_radar_shape,
             height_m=lut.height_m,
-            height_full=(
-                None if lut.height_full is None else lut.height_full[rows]
-            ),
+            height_full=(None if lut.height_full is None else lut.height_full[rows]),
         )
         secondary_azimuth, _, coordinate_valid = compose_secondary_coordinates(
             tile_lut,
@@ -693,8 +697,8 @@ def stage_coregister(
     )
     state.secondary_aligned_is_flattened = True
     state.range_offset_flatten_phase = (
-        (phase_per_range_pixel * offsets.range_offset_px).astype(np.float32)
-    )
+        phase_per_range_pixel * offsets.range_offset_px
+    ).astype(np.float32)
     state.secondary_deramped = None
     state.reference_deramped = reramp(ref, state.reference.carrier)
     state.secondary_aligned = sec_resamp
@@ -815,53 +819,49 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
     rg_full = (np.arange(width, dtype=np.float64) + 0.5) * rg_looks - 0.5
     az_grid, rg_grid = np.meshgrid(az_full, rg_full, indexing="ij")
 
-    topo = compute_topographic_phase(
-        state.reference.geometry,
-        state.secondary.geometry,
-        az_grid,
-        rg_grid,
-        state.dem,
-    )
-    topo_finite = topo[np.isfinite(topo)]
-    topo_valid_frac = float(np.isfinite(topo).mean())
-    if topo_finite.size:
-        rms = float(np.std(topo_finite))
-        span = float(np.max(topo_finite) - np.min(topo_finite))
-    else:
-        rms, span = float("nan"), float("nan")
+    def _topographic_phase() -> tuple[np.ndarray, float, float, float]:
+        """Compute the full DEM topo phase and its spread (lazy, costly)."""
+        topo = compute_topographic_phase(
+            state.reference.geometry,
+            state.secondary.geometry,
+            az_grid,
+            rg_grid,
+            state.dem,
+        )
+        topo_finite = topo[np.isfinite(topo)]
+        topo_valid_frac = float(np.isfinite(topo).mean())
+        if topo_finite.size:
+            rms = float(np.std(topo_finite))
+            span = float(np.max(topo_finite) - np.min(topo_finite))
+        else:
+            rms, span = float("nan"), float("nan")
+        return topo, topo_valid_frac, rms, span
 
     if state.secondary_aligned_is_flattened:
-        # The range-offset screen applied during coregistration is a linearised
-        # approximation of the full dual-orbit geometric topo phase.  The residual
-        # ``topo + range_offset_phase`` is small (~1 rad) but non-zero, and the
-        # scalar scale search used below fails when the absolute topo phase is
-        # large (thousands of radians) because the grid-step phase jump exceeds
-        # 2π.  Instead of estimating a scale, directly compute and remove the
-        # residual (matching ISCE2's full geometric flatten on the interferogram).
+        # ISCE2's burstifg flattens the interferogram with the full-resolution
+        # range-offset screen only (fact * range_offset); no second DEM phase
+        # removal is applied.  The residual ``topo + range_offset_phase``
+        # computed on the multilooked grid is nonzero only because the
+        # geometric topo model evaluates the secondary orbit at the reference
+        # azimuth, which does not match the resampled source azimuth; removing
+        # it corrupts the flattened phase (observed ~0.6 rad on real S1 pairs).
         if state.range_offset_flatten_phase is not None:
-            range_offset_ml = _block_reduce(
-                state.range_offset_flatten_phase.astype(np.float64),
-                az_looks,
-                rg_looks,
-            )[:height, :width]
-            residual_topo = (topo + range_offset_ml).astype(np.float64)
-            flat = remove_topographic_phase(state.complex_ifg, residual_topo)
-            residual_finite = residual_topo[np.isfinite(residual_topo)]
-            residual_span = (
-                float(np.max(residual_finite) - np.min(residual_finite))
-                if residual_finite.size
-                else 0.0
+            residual_span = 0.0
+            screen = state.range_offset_flatten_phase
+            screen_std = (
+                float(np.std(screen)) if np.isfinite(screen).all() else float("nan")
             )
             state.note(
-                f"FLATTEN residual DEM topo after range-offset "
-                f"model_rms={rms:.3f} residual_span={residual_span:.3f} rad "
-                f"topo_valid_frac={topo_valid_frac:.3f}"
+                f"FLATTEN range-offset screen only (ISCE2 parity); "
+                f"screen_std={screen_std:.3f} residual_span={residual_span:.3f} rad"
             )
-            state.topo_phase = np.asarray(residual_topo, dtype=np.float32)
+            flat = state.complex_ifg
+            state.topo_phase = np.zeros((height, width), dtype=np.float32)
             # Do NOT remove a residual azimuth ramp here: ISCE2 does not apply
             # one in its flatten step, and the estimated ramp was found to
             # introduce ~2 rad of spurious phase on IW3_b0.
         else:
+            topo, topo_valid_frac, rms, span = _topographic_phase()
             # Fallback: no stored range-offset phase, use scale estimation.
             scale, residual_rms = estimate_residual_topographic_scale(
                 state.complex_ifg,
@@ -910,6 +910,7 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
     # Residual Doppler / differential TOPS carrier leaves a near-linear
     # azimuth phase ramp on the original-domain ifg. Estimate it against the
     # path-length geometric model and remove it from the unflattened product.
+    topo, topo_valid_frac, rms, span = _topographic_phase()
     az_ramp = estimate_residual_azimuth_ramp(
         state.complex_ifg,
         topo,
@@ -1017,13 +1018,10 @@ def stage_unwrap(
             state.complex_ifg_flat = np.asarray(z_corr, dtype=np.complex64)
             state.wrapped_phase = np.angle(state.complex_ifg_flat).astype(np.float32)
         state.note(
-            f"UNWRAP residual phase screen span={span:.2f} rad "
-            f"rg_deg=2 az_deg=1"
+            f"UNWRAP residual phase screen span={span:.2f} rad rg_deg=2 az_deg=1"
         )
     elif span >= 1.0:
-        state.note(
-            f"UNWRAP residual phase screen skipped span={span:.2f} rad"
-        )
+        state.note(f"UNWRAP residual phase screen skipped span={span:.2f} rad")
     return state
 
 
@@ -1467,6 +1465,7 @@ def run_production_pair(
     geo_chunk_size: int = 128,
     reference_orbit_path: str | Path | None = None,
     secondary_orbit_path: str | Path | None = None,
+    geoid_correction: bool = True,
 ) -> ProductionPairState:
     """Run the full production pair chain on full burst or full swath.
 
@@ -1526,6 +1525,10 @@ def run_production_pair(
         hosts with more available memory.
     reference_orbit_path, secondary_orbit_path : path, optional
         Precise ESA EOF orbits for the two acquisitions.
+    geoid_correction : bool, optional
+        Convert orthometric raster DEM heights to ellipsoidal heights with
+        the EGM96 geoid (matching ISCE2) before geometry processing.
+        Default True. Ignored for constant-height or already-corrected DEMs.
 
     Returns
     -------
@@ -1536,6 +1539,10 @@ def run_production_pair(
     from faninsar.processing.pipeline.geo_lut import grid_lonlat
 
     dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    if geoid_correction and isinstance(dem_sampler, RasterDEM):
+        from faninsar.processing.geometry.egm96 import EGM96Geoid
+
+        dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
     if coregistration_grid == "geo" and geo_grid is None:
         reject_invalid_state("coregistration_grid='geo' requires geo_grid")
     if coregistration_grid == "geo" and scope != "burst":
@@ -1715,3 +1722,290 @@ def run_production_pair(
     state.stage_timings_s["total"] = time.perf_counter() - total_started
     state.note("DONE")
     return state
+
+
+def run_production_swath(
+    reference_path: str | Path,
+    secondary_path: str | Path,
+    *,
+    output_dir: str | Path,
+    swath: str = "IW1",
+    dem: DEMSampler | None = None,
+    multilook: tuple[int, int] = (2, 10),
+    goldstein_alpha: float = 0.5,
+    dead_pixel_amp_threshold: float = 3.0,
+    esd_enabled: bool = False,
+    amplitude_refinement_enabled: bool = False,
+    control_spacing: int | None = None,
+    executor: str = "torch",
+    device: str = "auto",
+    reference_orbit_path: str | Path | None = None,
+    secondary_orbit_path: str | Path | None = None,
+    geoid_correction: bool = True,
+    burst_indices: list[int] | None = None,
+    frame_azimuth_origin: datetime | None = None,
+    frame_range_offset_fullres: int = 0,
+) -> ProductionPairState:
+    """Process a full swath burst-by-burst and merge into one radar product.
+
+    Sentinel-1 TOPS bursts each carry their own Doppler/FM-rate carrier, so
+    a swath must be processed per burst (deramp -> coregister -> full-res
+    interferogram -> flatten) and the full-resolution interferograms merged
+    afterwards.  The merge places each burst on the absolute azimuth grid
+    (from its sensing time against the frame origin) and keeps the later
+    burst in the overlap zones, matching ISCE2's multi-swath VRT merge.
+
+    Parameters
+    ----------
+    reference_path, secondary_path : path
+        SAFE products.
+    output_dir : path
+        Output directory.
+    swath : str, optional
+        Sub-swath name.
+    dem : DEMSampler, optional
+        DEM sampler.  Defaults to a zero ellipsoid.
+    multilook : tuple[int, int], optional
+        ``(az, rg)`` looks applied after the full-res merge.
+    goldstein_alpha : float, optional
+        Goldstein filter exponent applied to the merged product.
+    dead_pixel_amp_threshold : float, optional
+        Dead-pixel amplitude mask threshold for the interferogram.
+    esd_enabled : bool, optional
+        Enable ESD azimuth residual.
+    amplitude_refinement_enabled : bool, optional
+        Enable amplitude-correlation residual refinement.
+    control_spacing : int, optional
+        Geometry control-point spacing.
+    executor : {"torch"}, optional
+        Resample executor.
+    device : {"auto","cpu","cuda","mps"}, optional
+        Torch device.
+    reference_orbit_path, secondary_orbit_path : path, optional
+        Precise ESA EOF orbits.
+    geoid_correction : bool, optional
+        Convert orthometric raster DEM heights to ellipsoidal with EGM96.
+    burst_indices : list of int, optional
+        Bursts to process. Defaults to all bursts of the swath.
+    frame_azimuth_origin : datetime, optional
+        Absolute azimuth time of frame row 0.  Defaults to the earliest
+        burst start across all sub-swaths of the reference product, so the
+        swath shares one absolute azimuth grid with the other swaths
+        (ISCE2 merged-frame convention).
+    frame_range_offset_fullres : int, optional
+        Full-resolution frame column of this swath's range sample 0 in the
+        concatenated multi-swath frame (0 for the near swath).  Matches
+        ISCE2's ``dst.xOff - src.xOff`` per-swath placement.
+
+    Returns
+    -------
+    ProductionPairState
+        State with the merged radar product (wrapped phase, coherence,
+        filtered complex interferogram) and stage timings.
+
+    """
+    import time
+
+    from faninsar.missions.sentinel1.io.read import read_full_burst
+    from faninsar.processing.tops.carrier import carrier_from_swath
+
+    dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    if geoid_correction and isinstance(dem_sampler, RasterDEM):
+        from faninsar.processing.geometry.egm96 import EGM96Geoid
+
+        dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
+
+    def load_burst(path: Path, orbit_path: Path | None, bi: int) -> ProductionScene:
+        product = open_safe_product(path)
+        s1_swath = product.swath(swath)
+        if orbit_path is not None:
+            s1_swath = replace(s1_swath, orbit=read_eof_orbit(orbit_path))
+        array = read_full_burst(s1_swath, burst_index=bi, full_range=True)
+        burst = s1_swath.bursts[bi]
+        carrier = carrier_from_swath(
+            s1_swath, burst, first_range_sample=array.col0
+        )
+        geometry = _radar_model(
+            s1_swath,
+            burst,
+            shape=array.samples.shape,
+            row0=array.row0,
+            col0=array.col0,
+        )
+        return ProductionScene(
+            scene_id=_scene_id(path),
+            path=path,
+            product=product,
+            swath=s1_swath,
+            burst=burst,
+            array=array,
+            carrier=carrier,
+            geometry=geometry,
+        )
+
+    total_started = time.perf_counter()
+    reference = load_burst(Path(reference_path), reference_orbit_path, 0)
+    swath_obj = reference.swath
+    dt = swath_obj.azimuth_time_interval_s
+    azimuth_origin = frame_azimuth_origin
+    if azimuth_origin is None:
+        product = open_safe_product(reference_path)
+        starts = [item.bursts[0].azimuth_time for item in product.swaths if item.bursts]
+        if not starts:
+            reject_invalid_state("reference product has no bursts")
+        azimuth_origin = min(starts)
+    all_bursts = list(range(len(swath_obj.bursts)))
+    bursts = burst_indices if burst_indices is not None else all_bursts
+    if not bursts:
+        reject_invalid_state("burst_indices must not be empty")
+    for bi in bursts:
+        if bi < 0 or bi >= len(all_bursts):
+            reject_invalid_state(f"burst index {bi} out of range")
+
+    az_looks, rg_looks = int(multilook[0]), int(multilook[1])
+    az_offsets = {}
+    for bi in bursts:
+        az_offsets[bi] = round(
+            (swath_obj.bursts[bi].azimuth_time - azimuth_origin).total_seconds() / dt
+        )
+    burst_width = reference.array.samples.shape[1]
+    burst_lines = reference.array.samples.shape[0]
+    frame_rows = az_offsets[bursts[-1]] + burst_lines
+    frame_cols = frame_range_offset_fullres + burst_width
+    out_rows = frame_rows // az_looks
+    out_cols = frame_cols // rg_looks
+    ifc_acc = np.zeros((out_rows, out_cols), dtype=np.complex128)
+    pri_pow_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
+    sec_pow_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
+    claimed = np.zeros((out_rows, out_cols), dtype=np.int32)
+    looks_per_window = az_looks * rg_looks
+
+    per_burst_timings: dict[str, dict[str, float]] = {}
+    for bi in reversed(bursts):
+        tag = f"{swath}_b{bi}"
+        ref = load_burst(Path(reference_path), reference_orbit_path, bi)
+        sec = load_burst(Path(secondary_path), secondary_orbit_path, bi)
+        state = ProductionPairState(
+            pair_id=f"{ref.scene_id}_{sec.scene_id}_{tag}",
+            reference=ref,
+            secondary=sec,
+            dem=dem_sampler,
+            coregistration_grid="radar",
+            multilook=multilook,
+            goldstein_alpha=goldstein_alpha,
+            unwrap_method="snaphu",
+        )
+        stage_times: dict[str, float] = {}
+        t0 = time.perf_counter()
+        state = stage_deramp(state)
+        stage_times["deramp"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        state = stage_coregister(
+            state,
+            control_spacing=control_spacing,
+            esd_enabled=esd_enabled,
+            amplitude_refinement_enabled=amplitude_refinement_enabled,
+            executor=executor,
+            device=device,
+        )
+        stage_times["coregister"] = time.perf_counter() - t0
+        # Accumulate full-res primary/secondary powers for the merged coherence.
+        assert state.reference_deramped is not None
+        assert state.secondary_aligned is not None
+        pri_power = state.reference_deramped.real**2 + state.reference_deramped.imag**2
+        sec_power = state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
+        t0 = time.perf_counter()
+        state = stage_interferogram(
+            state,
+            multilook=(1, 1),
+            goldstein_alpha=0.0,
+            dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+        )
+        stage_times["interferogram"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        state = stage_flatten(state)
+        stage_times["flatten"] = time.perf_counter() - t0
+        ifg_full = (
+            state.complex_ifg_flat
+            if state.complex_ifg_flat is not None
+            else state.complex_ifg
+        )
+        if ifg_full is None:
+            reject_invalid_state(f"{tag}: no interferogram produced")
+        per_burst_timings[tag] = stage_times
+
+        # Scatter into the multilooked frame in reverse order so the later
+        # burst claims overlap windows first (ISCE2 VRT last-writer-wins).
+        valid = np.abs(ifg_full) > 0
+        rows = az_offsets[bi] + np.arange(ifg_full.shape[0])
+        cols = frame_range_offset_fullres + np.arange(ifg_full.shape[1])
+        orow = rows[:, None] // az_looks
+        ocol = cols[None, :] // rg_looks
+        inb = (orow < out_rows) & (ocol < out_cols) & valid
+        r_i, c_i = np.broadcast_arrays(orow, ocol)
+        r_v, c_v = r_i[inb], c_i[inb]
+        free = claimed[r_v, c_v] < looks_per_window
+        r_f, c_f = r_v[free], c_v[free]
+        np.add.at(ifc_acc, (r_f, c_f), ifg_full[inb][free].astype(np.complex128))
+        np.add.at(pri_pow_acc, (r_f, c_f), pri_power[inb][free])
+        np.add.at(sec_pow_acc, (r_f, c_f), sec_power[inb][free])
+        np.add.at(claimed, (r_f, c_f), 1)
+        del pri_power, sec_power, ifg_full, state
+        logger.info("Merged %s into frame", tag)
+
+    has = claimed > 0
+    merged_ifg = np.where(
+        has, ifc_acc / np.where(has, claimed, 1), 0
+    ).astype(np.complex64)
+    pri_ml = pri_pow_acc / np.where(has, claimed, 1)
+    sec_ml = sec_pow_acc / np.where(has, claimed, 1)
+    denom = np.sqrt(np.maximum(pri_ml * sec_ml, 1e-30))
+    coherence = np.clip(np.abs(merged_ifg) / denom, 0.0, 1.0).astype(np.float32)
+    invalid = claimed == 0
+    merged_ifg = np.asarray(merged_ifg, dtype=np.complex64).copy()
+    merged_ifg[invalid] = np.nan + 1j * np.nan
+    coherence[invalid] = np.nan
+    wrapped = np.angle(merged_ifg).astype(np.float32)
+    wrapped = np.where(
+        np.isfinite(merged_ifg.real) & np.isfinite(merged_ifg.imag),
+        wrapped,
+        np.nan,
+    )
+
+    filtered = merged_ifg
+    if goldstein_alpha > 0.0:
+        from faninsar.processing.interferometry.pair import goldstein_filter
+
+        filtered = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
+
+    result = ProductionPairState(
+        pair_id=f"{reference.scene_id}_{_scene_id(Path(secondary_path))}_swath",
+        reference=reference,
+        secondary=load_burst(Path(secondary_path), secondary_orbit_path, 0),
+        dem=dem_sampler,
+        coregistration_grid="radar",
+        dem_id=_dem_id(dem_sampler),
+        coreg_executor=str(executor),
+        coreg_device=str(device),
+        multilook=multilook,
+        goldstein_alpha=float(goldstein_alpha),
+        unwrap_method="snaphu",
+        complex_ifg=merged_ifg,
+        complex_ifg_flat=filtered,
+        coherence=coherence,
+        wrapped_phase=wrapped,
+        stage_timings_s={
+            "total": time.perf_counter() - total_started,
+            "per_burst": per_burst_timings,
+        },
+    )
+    result.note(
+        f"SWATH {swath} bursts={bursts} merged={merged_ifg.shape} "
+        f"multilook={multilook} valid={float((~invalid).mean()):.3f} "
+        f"mean_coh={float(np.nanmean(coherence)):.3f}"
+    )
+    result.unwrapped_phase = np.zeros_like(wrapped, dtype=np.float32)
+    result.connected_components = np.zeros_like(wrapped, dtype=np.uint8)
+    result.note("UNWRAP skipped: swath mode emits wrapped radar products only")
+    stage_write(result, output_dir)
+    return result

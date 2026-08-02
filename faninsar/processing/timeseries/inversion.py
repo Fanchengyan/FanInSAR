@@ -40,7 +40,7 @@ def invert_unwrapped_pairs(
         Mapping of pair id ``YYYYMMDD_YYYYMMDD`` to unwrapped phase arrays on a
         common grid.
     device : str, optional
-        Torch device for :class:`~faninsar.NSBAS.inversion.NSBASSolver`.
+        Torch device for :class:`~faninsar.timeseries.inversion.NSBASSolver`.
     gamma : float, optional
         Unused for pure SBAS (model is ``None``); retained for API stability.
 
@@ -61,7 +61,7 @@ def invert_unwrapped_pairs(
     n_pixels = height * width
 
     from faninsar import Pairs
-    from faninsar.NSBAS.inversion import NSBASSolver
+    from faninsar.timeseries.solver import NSBASSolver
 
     pairs = Pairs.from_names(list(pair_ids))
     unw = np.stack(

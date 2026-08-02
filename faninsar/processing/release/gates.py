@@ -48,7 +48,7 @@ def assert_core_imports() -> bool:
     modules = (
         "faninsar.processing.pipeline",
         "faninsar.processing.unwrap",
-        "faninsar.sentinel1",
+        "faninsar.missions.sentinel1",
         "faninsar.backends.execution",
         "faninsar.backends.dask_exec",
         "faninsar.backends.device_matrix",

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
     from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.merge.grid import GeoGridSpec
-    from faninsar.processing.unwrap import SnaphuConfig
+    from faninsar.processing.unwrap import SnaphuConfig, UnwrapBackend
 
 logger = setup_logger(__name__)
 
@@ -70,9 +70,10 @@ def run_stack_pipeline(
     multilook: tuple[int, int] = (2, 8),
     goldstein_alpha: float = 0.5,
     invert_timeseries: bool = True,
-    executor: str = "serial",
+    executor: str = "torch",
     device: str = "auto",
     snaphu_config: SnaphuConfig | None = None,
+    unwrap_method: UnwrapBackend | None = None,
     invert_device: str = "cpu",
     coregistration_grid: CoregistrationGrid = "radar",
     geo_grid: GeoGridSpec | None = None,
@@ -96,12 +97,14 @@ def run_stack_pipeline(
         Interferogram parameters.
     invert_timeseries : bool, optional
         Run SBAS after pairs complete.
-    executor : {"serial", "dask-torch"}, optional
-        Coregistration / LUT Lanczos path. Default ``"serial"``.
+    executor : {"torch"}, optional
+        Unified Torch coregistration and LUT Lanczos path.
     device : {"auto","cpu","cuda"}, optional
-        Torch device when ``executor="dask-torch"``.
+        Torch compute device.
     snaphu_config : SnaphuConfig, optional
         snaphu-py configuration for every pair.
+    unwrap_method : {"irls", "snaphu"}, optional
+        Spatial unwrapping backend for every pair.
     invert_device : str, optional
         Device for SBAS inversion. Default ``"cpu"``.
     coregistration_grid : {"radar", "geo"}, optional
@@ -153,6 +156,7 @@ def run_stack_pipeline(
             executor=executor,
             device=device,
             snaphu_config=snaphu_config,
+            unwrap_method=unwrap_method,
             coregistration_grid=coregistration_grid,
             geo_grid=geo_grid,
         )

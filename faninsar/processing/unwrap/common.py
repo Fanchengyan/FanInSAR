@@ -13,7 +13,7 @@ from faninsar.processing.unwrap.irls import wrap_phase
 
 logger = setup_logger(__name__)
 
-UnwrapMethod = Literal["irls", "dct_irls", "snaphu", "temporal_irls"]
+UnwrapMethod = Literal["irls", "snaphu", "temporal_irls"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +50,7 @@ class CommonUnwrapResult:
             reject_invalid_state("unwrap phase and components must share a shape")
         if self.unwrapped_phase.shape != self.rewrap_residual.shape:
             reject_invalid_state("unwrap residual must match phase shape")
-        if self.method not in ("irls", "dct_irls", "snaphu", "temporal_irls"):
+        if self.method not in ("irls", "snaphu", "temporal_irls"):
             reject_invalid_state(f"unsupported unwrap method: {self.method}")
 
 
@@ -73,7 +73,7 @@ def build_common_result(
         Backend unwrapped phase.
     connected_components : numpy.ndarray
         Component labels.
-    method : {"irls", "dct_irls", "snaphu"}
+    method : {"irls", "snaphu"}
         Explicit backend name.
     metrics, configuration : dict, optional
         Diagnostics and provenance.

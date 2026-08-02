@@ -29,7 +29,18 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class PhaseEdge:
-    """One overlap edge between two burst products."""
+    """One overlap edge between two burst products.
+
+    Models the relative phase as a constant plus optional range slope::
+
+        φ_i(x) - φ_j(x) ≈ dphi_rad + range_slope_rad_per_px * (x - x_ref)
+
+    ``x_ref`` is the frame-centre column ``0.5 * (width - 1)``.  The constant
+    is converted from the overlap circular mean to this common reference so
+    the mosaic screen ``phi_hat + slope * (x - x_ref)`` is consistent.
+    The range slope captures residual cross-swath ramps that a pure constant
+    cannot absorb.
+    """
 
     i: int
     j: int
@@ -37,6 +48,7 @@ class PhaseEdge:
     coherence: float
     overlap_px: int
     weight: float
+    range_slope_rad_per_px: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,9 +71,28 @@ class MergeGraphStats:
 
 @dataclass(frozen=True, slots=True)
 class NetworkSolution:
-    """Result of weighted least-squares phase adjustment."""
+    """Result of weighted least-squares phase adjustment.
+
+    Attributes
+    ----------
+    phi_hat : numpy.ndarray
+        Per-node constant phase (rad), relative to the component reference.
+    range_slope_hat : numpy.ndarray
+        Per-node residual range slope (rad / column), relative to the
+        component reference (pinned to 0).
+    component_id : numpy.ndarray
+        Connected-component label per node.
+    edge_residuals : numpy.ndarray
+        Constant-term residuals on each intra-component edge.
+    rms_residual : float
+        Weighted RMS of constant-term residuals.
+    stats : MergeGraphStats
+        Summary counts.
+
+    """
 
     phi_hat: np.ndarray
+    range_slope_hat: np.ndarray
     component_id: np.ndarray
     edge_residuals: np.ndarray
     rms_residual: float
@@ -78,13 +109,13 @@ def estimate_edge(
 ) -> PhaseEdge | None:
     r"""Estimate the overlap phase offset between two burst products.
 
-    Computes
+    Computes a constant Δφ and a residual range slope from column-wise
+    circular means of the complex product field:
 
     .. math::
 
-        \Delta\phi_{ij} = \arg\sum_{p\in\Omega} w_i w_j\, z_i z_j^*
-
-    and the corresponding coherence and edge weight.
+        \Delta\phi_{ij}(x) \approx a + b\, x
+        = \arg\sum_{p\in\Omega_x} w_i w_j\, z_i z_j^*
 
     Parameters
     ----------
@@ -116,12 +147,65 @@ def estimate_edge(
     wj = w_j[overlap].astype(np.float64)
     contrib = wi * wj * z_i * np.conj(z_j)
     c_sum = contrib.sum()
-    dphi = float(np.angle(c_sum))
     denom = float((wi * wj * np.abs(z_i) * np.abs(z_j)).sum())
     coh = float(abs(c_sum) / denom) if denom > 0.0 else 0.0
     if coh < min_edge_coherence:
         return None
-    weight = coh * n_overlap
+
+    # Constant from global circular mean (robust; no 2π unwrap at x=0).
+    # This is the mean phase difference over the overlap footprint, i.e. the
+    # value of Δφ near the overlap column centroid x0 — not the intercept at
+    # the frame centre.  When a range slope is also estimated we convert the
+    # constant to the common frame reference x_ref so that the mosaic screen
+    #   Δφ(x) = dphi_ref + slope * (x - x_ref)
+    # is consistent (otherwise nonzero slopes leave multi-radian seam jumps).
+    dphi = float(np.angle(c_sum))
+    # Column-wise means → unwrap → slope; then lift dphi to x_ref.
+    _rows, cols = np.where(overlap)
+    range_slope = 0.0
+    flatness = 1.0
+    x0_overlap: float | None = None
+    if cols.size >= min_overlap_px:
+        unique_cols = np.unique(cols)
+        if unique_cols.size >= 4:
+            col_centers: list[float] = []
+            col_phases: list[float] = []
+            for c in unique_cols:
+                sel = cols == c
+                if int(sel.sum()) < 2:
+                    continue
+                cc = contrib[sel].sum()
+                if abs(cc) <= 0.0:
+                    continue
+                col_centers.append(float(c))
+                col_phases.append(float(np.angle(cc)))
+            if len(col_phases) >= 4:
+                x = np.asarray(col_centers, dtype=np.float64)
+                x0_overlap = float(np.mean(x))
+                ph = np.unwrap(np.asarray(col_phases, dtype=np.float64))
+                # ph ≈ slope * (x - x0) + c; circular mean ≈ c when centered.
+                coef = np.polyfit(x - x0_overlap, ph, 1)
+                range_slope = float(coef[0])
+                resid = ph - np.polyval(coef, x - x0_overlap)
+                resid_std = float(np.std(resid))
+                flatness = 1.0 / (1.0 + resid_std)
+                # Reject slopes that would integrate to multi-fringe across
+                # the overlap (non-linear residual mis-modeled as a ramp).
+                span_overlap = abs(range_slope) * float(np.ptp(x))
+                if span_overlap > np.pi or resid_std > 1.0:
+                    range_slope = 0.0
+                    flatness *= 0.5
+                    x0_overlap = None
+
+    if range_slope != 0.0 and x0_overlap is not None:
+        width = int(w_i.shape[1])
+        x_ref = 0.5 * (width - 1)
+        # Δφ(x) ≈ dphi + slope*(x - x0) → intercept at x_ref for mosaic apply.
+        dphi = float(dphi + range_slope * (x_ref - x0_overlap))
+        # Keep dphi in (-π, π] so LS constants stay well-conditioned.
+        dphi = float(np.angle(np.exp(1j * dphi)))
+
+    weight = coh * n_overlap * flatness
     return PhaseEdge(
         i=0,
         j=1,
@@ -129,6 +213,7 @@ def estimate_edge(
         coherence=coh,
         overlap_px=n_overlap,
         weight=weight,
+        range_slope_rad_per_px=range_slope,
     )
 
 
@@ -192,6 +277,7 @@ def estimate_edges(
                     coherence=edge.coherence,
                     overlap_px=edge.overlap_px,
                     weight=edge.weight,
+                    range_slope_rad_per_px=edge.range_slope_rad_per_px,
                 )
             )
     logger.info("estimate_edges: %d nodes, %d edges", len(nodes), len(edges))
@@ -199,7 +285,7 @@ def estimate_edges(
 
 
 def _connected_components(n_nodes: int, edges: tuple[PhaseEdge, ...]) -> np.ndarray:
-    """Return a component label (0-based) per node via union-find."""
+    """Union-find connected components over undirected edges."""
     parent = list(range(n_nodes))
 
     def find(x: int) -> int:
@@ -208,10 +294,10 @@ def _connected_components(n_nodes: int, edges: tuple[PhaseEdge, ...]) -> np.ndar
             x = parent[x]
         return x
 
-    def union(x: int, y: int) -> None:
-        rx, ry = find(x), find(y)
-        if rx != ry:
-            parent[rx] = ry
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
 
     for e in edges:
         union(e.i, e.j)
@@ -233,13 +319,16 @@ def solve_network(
 ) -> NetworkSolution:
     r"""Solve the weighted least-squares phase network adjustment.
 
-    Minimizes
+    Minimizes constant and range-slope residuals:
 
     .. math::
 
-        \sum_{(i,j)\in E} W_{ij}(\phi_i - \phi_j - \Delta\phi_{ij})^2
+        \sum_{(i,j)\in E} W_{ij}\Big[
+            (\phi_i - \phi_j - \Delta\phi_{ij})^2
+            + (s_i - s_j - b_{ij})^2
+        \Big]
 
-    subject to ``phi[reference_node] = 0`` per connected component.
+    subject to ``phi[ref] = 0`` and ``s[ref] = 0`` per connected component.
 
     Parameters
     ----------
@@ -251,12 +340,13 @@ def solve_network(
     Returns
     -------
     NetworkSolution
-        Per-node phase estimates, component labels, residuals, and RMS.
+        Per-node constant phase, range slope, component labels, residuals.
 
     """
     n = len(graph.nodes)
     component_id = _connected_components(n, graph.edges)
     phi_hat = np.zeros(n, dtype=np.float64)
+    range_slope_hat = np.zeros(n, dtype=np.float64)
 
     # Reference per component
     comp_refs: dict[int, int] = {}
@@ -266,15 +356,8 @@ def solve_network(
             ref = reference_node if int(component_id[reference_node]) == c else k
             comp_refs[c] = ref
 
-    # Build sparse normal equations per component.
-    # Unknowns: phi_k for k != ref_of_comp. We assemble A x = b with
-    # one row per edge, weighted by sqrt(W).
-    rows: list[int] = []
-    cols: list[int] = []
-    data: list[float] = []
-    b: list[float] = []
-
-    # Map node index -> column index (skip references)
+    # Unknowns: for each non-ref node, (phi, slope) → 2 columns each.
+    # Column layout: [phi_0, s_0, phi_1, s_1, ...] for non-ref nodes in order.
     col_index: dict[int, int] = {}
     col = 0
     for k in range(n):
@@ -282,8 +365,46 @@ def solve_network(
         if k == comp_refs[c]:
             continue
         col_index[k] = col
-        col += 1
+        col += 2
     n_unknowns = col
+
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    b: list[float] = []
+
+    def _add_diff_eq(
+        *,
+        i: int,
+        j: int,
+        observed: float,
+        sqrt_w: float,
+        offset: int,
+    ) -> None:
+        """Add weighted difference equation for one unknown block offset."""
+        row = len(b)
+        ki = col_index.get(i)
+        kj = col_index.get(j)
+        if ki is None and kj is None:
+            return
+        if ki is not None and kj is not None:
+            rows.append(row)
+            cols.append(ki + offset)
+            data.append(sqrt_w)
+            rows.append(row)
+            cols.append(kj + offset)
+            data.append(-sqrt_w)
+            b.append(sqrt_w * observed)
+        elif ki is not None:
+            rows.append(row)
+            cols.append(ki + offset)
+            data.append(sqrt_w)
+            b.append(sqrt_w * observed)
+        else:
+            rows.append(row)
+            cols.append(kj + offset)  # type: ignore[operator]
+            data.append(-sqrt_w)
+            b.append(sqrt_w * observed)
 
     for e in graph.edges:
         ci = int(component_id[e.i])
@@ -291,30 +412,16 @@ def solve_network(
         if ci != cj:
             continue
         sqrt_w = float(np.sqrt(max(e.weight, 1e-12)))
-        row = len(b)
-        ki = col_index.get(e.i)
-        kj = col_index.get(e.j)
-        if ki is None and kj is None:
-            continue
-        if ki is not None and kj is not None:
-            rows.append(row)
-            cols.append(ki)
-            data.append(sqrt_w)
-            rows.append(row)
-            cols.append(kj)
-            data.append(-sqrt_w)
-            b.append(sqrt_w * e.dphi_rad)
-        elif ki is not None:
-            # j is the reference (phi_j = 0): phi_i = dphi
-            rows.append(row)
-            cols.append(ki)
-            data.append(sqrt_w)
-            b.append(sqrt_w * e.dphi_rad)
-        else:  # kj is not None, i is the reference (phi_i = 0): -phi_j = dphi
-            rows.append(row)
-            cols.append(kj)
-            data.append(-sqrt_w)
-            b.append(sqrt_w * e.dphi_rad)
+        # Constant equation: phi_i - phi_j = dphi
+        _add_diff_eq(i=e.i, j=e.j, observed=e.dphi_rad, sqrt_w=sqrt_w, offset=0)
+        # Slope equation: s_i - s_j = range_slope
+        _add_diff_eq(
+            i=e.i,
+            j=e.j,
+            observed=e.range_slope_rad_per_px,
+            sqrt_w=sqrt_w,
+            offset=1,
+        )
 
     if n_unknowns > 0 and rows:
         a_mat = csr_matrix((data, (rows, cols)), shape=(len(b), n_unknowns))
@@ -324,13 +431,13 @@ def solve_network(
             c = int(component_id[k])
             if k == comp_refs[c]:
                 phi_hat[k] = 0.0
+                range_slope_hat[k] = 0.0
             else:
-                phi_hat[k] = float(sol[col_index[k]])
-    else:
-        # No edges or all references: phi_hat stays 0
-        pass
+                base = col_index[k]
+                phi_hat[k] = float(sol[base])
+                range_slope_hat[k] = float(sol[base + 1])
 
-    # Residuals
+    # Residuals on constant term (backward compatible reporting)
     residuals = np.array(
         [
             (phi_hat[e.i] - phi_hat[e.j] - e.dphi_rad)
@@ -358,9 +465,15 @@ def solve_network(
         n_components=int(component_id.max()) + 1 if n > 0 else 0,
         rms_residual=rms,
     )
-    logger.info("solve_network: %d components, rms=%.3e rad", stats.n_components, rms)
+    logger.info(
+        "solve_network: %d components, rms=%.3e rad, max|slope|=%.3e rad/px",
+        stats.n_components,
+        rms,
+        float(np.max(np.abs(range_slope_hat))) if n else 0.0,
+    )
     return NetworkSolution(
         phi_hat=phi_hat,
+        range_slope_hat=range_slope_hat,
         component_id=component_id,
         edge_residuals=residuals,
         rms_residual=rms,

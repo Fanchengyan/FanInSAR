@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from .api import UnwrapBackend, unwrap
 from .common import CommonUnwrapResult, UnwrapMethod, build_common_result
-from .dct_irls import dct_irls_unwrap
 from .irls import IRLSUnwrapResult, irls_unwrap, wrap_phase
 from .reconcile import (
     ComponentCorrection,
@@ -35,7 +34,6 @@ __all__ = [
     "UnwrapMethod",
     "align_components_to_reference",
     "build_common_result",
-    "dct_irls_unwrap",
     "irls_unwrap",
     "loop_closure_phase",
     "reconcile_components",

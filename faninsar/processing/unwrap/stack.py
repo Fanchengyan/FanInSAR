@@ -26,7 +26,8 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
-SpatialMethod = Literal["irls", "dct_irls"]
+SpatialMethod = Literal["irls"]
+SpatialExecutor = Literal["serial", "dask"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +91,7 @@ def unwrap_stack(
     do_temporal: bool = True,
     do_invert: bool = True,
     spatial_method: SpatialMethod = "irls",
+    spatial_executor: SpatialExecutor = "dask",
     spatial_device: str = "cpu",
     temporal_device: str = "cpu",
     lstsq_device: str = "cpu",
@@ -114,11 +116,13 @@ def unwrap_stack(
         time series via
         :func:`~faninsar.processing.timeseries.inversion.invert_unwrapped_pairs`
         (batch least-squares -- **not** a 1D unwrap stage).
-    spatial_method : {"irls", "dct_irls"}, optional
-        2D spatial backend. Both backends are CPU-only today; ``spatial_device``
-        is accepted for API stability but does not route GPU work.
+    spatial_method : {"irls"}, optional
+        2D spatial backend.
+    spatial_executor : {"serial", "dask"}, optional
+        Pair-level scheduler. Dask runs independent full-raster solves in
+        parallel without introducing spatial tile seams.
     spatial_device : str, optional
-        Reserved device hint for spatial backends (currently CPU-only).
+        Torch device for the IRLS numerical kernel.
     temporal_device : str, optional
         Device for :func:`unwrap_temporal_irls` (default ``"cpu"`` preferred).
     lstsq_device : str, optional
@@ -138,9 +142,9 @@ def unwrap_stack(
 
     Notes
     -----
-    No silent method/device downgrade. Stages are independent: any combination
-    of skip flags is valid. This orchestrator is sequential; dask parallelism
-    belongs at the outer pipeline level.
+    No silent method/device downgrade. Spatial IRLS remains global per pair;
+    Dask parallelizes pairs rather than cutting a phase field into independently
+    referenced tiles.
 
     """
     phase = np.asarray(phase_stack, dtype=np.float64)
@@ -158,26 +162,31 @@ def unwrap_stack(
 
     # --- Stage 1: 2D spatial unwrap (per pair) ---
     if do_spatial:
-        if spatial_method not in ("irls", "dct_irls"):
+        if spatial_method != "irls":
             reject_invalid_state(
-                f"spatial_method must be 'irls' or 'dct_irls', got {spatial_method!r}",
+                f"spatial_method must be 'irls', got {spatial_method!r}",
             )
-        if spatial_device not in ("cpu", "auto"):
-            # irls / dct_irls are CPU-only; refuse silent GPU claims
-            logger.warning(
-                "spatial backends are CPU-only today; spatial_device=%r is ignored",
-                spatial_device,
-            )
-        unwrapped_pairs: list[np.ndarray] = []
-        for i in range(n_pairs):
+        spatial_kw.setdefault("device", spatial_device)
+
+        def unwrap_pair(index: int) -> np.ndarray:
             result_2d = unwrap(
-                phase[i],
+                phase[index],
                 method=spatial_method,
                 irls_kwargs=spatial_kw,
             )
-            unwrapped_pairs.append(
-                np.asarray(result_2d.unwrapped_phase, dtype=np.float64),
+            return np.asarray(result_2d.unwrapped_phase, dtype=np.float64)
+
+        if spatial_executor == "dask" and n_pairs > 1:
+            import dask
+
+            tasks = [dask.delayed(unwrap_pair)(index) for index in range(n_pairs)]
+            gpu_device = spatial_device in ("cuda", "mps")
+            workers = 1 if gpu_device else min(n_pairs, 8)
+            unwrapped_pairs = list(
+                dask.compute(*tasks, scheduler="threads", num_workers=workers)
             )
+        else:
+            unwrapped_pairs = [unwrap_pair(index) for index in range(n_pairs)]
         phase_2d = np.stack(unwrapped_pairs, axis=0)
         logger.info(
             "Spatial unwrap (%s) finished for %s pairs on %sx%s",
