@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
+from faninsar.validation.provenance import validate_pipeline_rebuild_manifest
 from tests.reference.corpus import (
     Artifact,
     ChecksumMismatchError,
@@ -14,9 +15,6 @@ from tests.reference.corpus import (
     OfflineCacheMissError,
     resolve_artifact,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def _artifact(payload: bytes) -> Artifact:
@@ -133,3 +131,16 @@ def test_interrupted_fetch_removes_partial_bytes(tmp_path: Path) -> None:
         resolve_artifact(artifact, tmp_path, fetch=interrupted_fetch)
 
     assert not (tmp_path / f"{artifact.filename}.part").exists()
+
+
+def test_pipeline_rebuild_manifest_verifies_fixed_corpus() -> None:
+    summary = validate_pipeline_rebuild_manifest(
+        Path("tests/reference/pipeline_rebuild_manifest.yaml")
+    )
+
+    assert summary.scene_count == 3
+    assert summary.pair_count == 3
+    assert summary.orbit_count == 3
+    assert summary.dem_tile_count == 12
+    assert summary.primary_processors == ("isce2", "insardev")
+    assert summary.out_of_scope_hashes_match

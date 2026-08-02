@@ -3,21 +3,21 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from faninsar.processing.coreg.offsets import resample_complex
 from faninsar.processing.resampling import (
     DEFAULT_LANCZOS_CHUNK,
     lanczos_resample,
-    lanczos_weights,
 )
 
 
-def test_lanczos_weights_normalise_at_integer() -> None:
-    """Integer-aligned taps sum to one (DC preservation)."""
-    w = lanczos_weights(np.array([0.0]), a=4)
-    assert w.shape == (1, 8)
-    assert float(w.sum()) == pytest.approx(1.0, abs=1e-12)
+def test_lanczos_preserves_integer_aligned_samples() -> None:
+    """Integer-aligned coordinates reproduce the source samples."""
+    data = np.arange(64, dtype=np.float32).reshape(8, 8)
+    rows, columns = np.mgrid[:8, :8]
+    coordinates = np.vstack([rows.ravel(), columns.ravel()])
+    actual = lanczos_resample(data, coordinates, mode="nearest", device="cpu")
+    np.testing.assert_allclose(actual.reshape(data.shape), data, atol=1e-5)
 
 
 def test_lanczos_chunked_matches_monolithic() -> None:
@@ -29,8 +29,8 @@ def test_lanczos_chunked_matches_monolithic() -> None:
     rows, cols = np.mgrid[0:48:1.0, 0:64:1.0]
     # Fractional sub-pixel shift so the kernel is non-trivial
     coords = np.array([(rows + 0.35).ravel(), (cols - 0.2).ravel()])
-    mono = lanczos_resample(data, coords, a=4, chunk_size=None)
-    chunked = lanczos_resample(data, coords, a=4, chunk_size=257)
+    mono = lanczos_resample(data, coords, a=4, chunk_size=None, device="cpu")
+    chunked = lanczos_resample(data, coords, a=4, chunk_size=257, device="cpu")
     assert mono.shape == chunked.shape
     np.testing.assert_allclose(chunked.real, mono.real, rtol=0, atol=1e-5)
     np.testing.assert_allclose(chunked.imag, mono.imag, rtol=0, atol=1e-5)
@@ -72,8 +72,8 @@ def test_lanczos_large_coordinate_count_stays_bounded() -> None:
     rows = np.arange(n, dtype=np.float64) // w + 0.25
     cols = np.arange(n, dtype=np.float64) % w + 0.1
     coords = np.array([rows, cols])
-    out = lanczos_resample(data, coords, a=4, chunk_size=32_768)
+    out = lanczos_resample(data, coords, a=4, chunk_size=32_768, device="cpu")
     assert out.shape == (n,)
     assert out.dtype == np.complex64
     # Interior samples of a constant field should stay near 1+0j
-    assert float(np.mean(np.abs(out))) == pytest.approx(1.0, abs=0.05)
+    assert abs(float(np.mean(np.abs(out))) - 1.0) < 0.05

@@ -48,6 +48,7 @@ dependencies = [
   "numpy",
   "pint>=0.20",
   "torch",
+  "torch-dct>=0.1.6",
   "matplotlib",
   "data_downloader",
   "rasterio >= 1.0.26",
@@ -75,11 +76,13 @@ dependencies = [
 
 
 [project.scripts]
+faninsar = "faninsar.cli.main:main"
 faninsar-merge-bursts = "faninsar.processing.merge.cli:main"
 
 
 [project.optional-dependencies]
 
+opencv = ["opencv-python>=4.8"]
 code_style = ["pre-commit", "ruff"]
 test = [
   "FanInSAR",
@@ -154,7 +157,10 @@ filterwarnings = [
   "ignore:.* Unknown directive type \"toctree\".",
 ]
 
-markers = ["slow: marks tests as slow"]
+markers = [
+    "slow: marks tests as slow",
+    "network: marks tests that require network access",
+]
 
 [tool.ruff]
 line-length = 88
@@ -359,3 +365,17 @@ allow-long-titles = true
 
 [tool.ty.rules]
 invalid-argument-type = "ignore"
+
+[dependency-groups]
+dev = [
+    "aiohttp>=3.14.3",
+    "asf-search>=12.2.3",
+    "curl-cffi>=0.15.0",
+    "grequests>=0.7.0",
+    "h2>=4.4.0",
+    "pycurl>=7.47.0",
+    "remotezip>=0.12.3",
+    "tls-client>=1.0.1",
+    "truststore>=0.10.4",
+    "websocket-client>=1.9.0",
+]

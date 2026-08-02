@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from faninsar.missions.sentinel1 import open_safe_product, read_burst_window
 from faninsar.processing.pipeline import run_pair_workflow, run_stack_pipeline
-from faninsar.sentinel1 import open_safe_product, read_burst_window
 
 SLC_ROOT = Path("/Volumes/DATA2/TEST_sentinel-1/sentinel-slc")
 SCENES = sorted(SLC_ROOT.glob("S1A_IW_SLC*.zip")) if SLC_ROOT.exists() else []

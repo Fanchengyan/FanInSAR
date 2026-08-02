@@ -12,7 +12,7 @@ import rasterio
 from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 
-from faninsar._core.sar.pairs import Pairs
+from faninsar.core.pairs import Pairs
 from faninsar.datasets.base import PairDataset
 from faninsar.datasets.ifg import InterferogramDataset
 

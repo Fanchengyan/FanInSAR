@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from faninsar.sentinel1 import read_eof_orbit
+from faninsar.missions.sentinel1 import read_eof_orbit
 
 if TYPE_CHECKING:
     from pathlib import Path

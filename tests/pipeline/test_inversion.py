@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from faninsar._core.sar import Pairs
+from faninsar.core import Pairs
 from faninsar.datasets.frame import Frame, FrameGeometry
 from faninsar.pipeline import InversionPipeline
 

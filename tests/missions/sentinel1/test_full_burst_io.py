@@ -14,7 +14,7 @@ import pytest
 import rasterio
 from rasterio.io import MemoryFile
 
-from faninsar.sentinel1 import (
+from faninsar.missions.sentinel1 import (
     BurstArray,
     open_safe_product,
     read_burst_window,
@@ -22,16 +22,16 @@ from faninsar.sentinel1 import (
     read_swath_bursts,
     stitch_bursts,
 )
-from faninsar.sentinel1.annotation import parse_annotation_xml
-from faninsar.sentinel1.errors import Sentinel1ProductError
+from faninsar.missions.sentinel1.annotation import parse_annotation_xml
+from faninsar.missions.sentinel1.errors import Sentinel1ProductError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from faninsar.sentinel1.types import S1Product, S1Swath
+    from faninsar.missions.sentinel1.types import S1Product, S1Swath
 
 FIXTURE_XML = (
-    Path(__file__).resolve().parents[1]
+    Path(__file__).resolve().parents[2]
     / "data"
     / "sentinel1"
     / "minimal_annotation_iw1.xml"

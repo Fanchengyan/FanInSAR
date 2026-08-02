@@ -61,6 +61,24 @@ def _toy_grid(crs: str = "EPSG:32633") -> GeoGridSpec:
     )
 
 
+def test_projected_grid_pixel_centers_are_finite_lonlat() -> None:
+    """UTM GeoGridSpec centers convert to finite lon/lat (FORWARD, not INVERSE)."""
+    from faninsar.processing.merge.geocode_raster import _grid_pixel_centers_lonlat
+
+    grid = GeoGridSpec(
+        crs="EPSG:32647",
+        transform=(449375.0, 20.0, 0.0, 4177660.0, 0.0, -80.0),
+        width=8,
+        height=6,
+        resolution_m=(20.0, 80.0),
+    )
+    lat, lon = _grid_pixel_centers_lonlat(grid)
+    assert np.isfinite(lat).all()
+    assert np.isfinite(lon).all()
+    assert 37.0 < float(np.mean(lat)) < 38.5
+    assert 98.0 < float(np.mean(lon)) < 100.0
+
+
 def test_geocode_complex_to_grid_returns_geocoded_complex() -> None:
     """geocode_complex_to_grid returns a GeocodedComplex with right shape."""
     radar_shape = (32, 32)

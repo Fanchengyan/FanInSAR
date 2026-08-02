@@ -11,7 +11,7 @@ import rasterio
 from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 
-from faninsar._core.sar.acquisition import Acquisition
+from faninsar.core.acquisition import Acquisition
 from faninsar.datasets.base import TimeSeriesDataset
 
 

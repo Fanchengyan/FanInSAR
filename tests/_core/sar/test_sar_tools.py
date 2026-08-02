@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from faninsar._core.sar.sar_tools import multi_look
+from faninsar.core.sar_tools import multi_look
 
 class TestMultiLook:
     """Test class for multi_look function."""

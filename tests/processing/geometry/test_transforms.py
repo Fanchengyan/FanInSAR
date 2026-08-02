@@ -23,6 +23,7 @@ from faninsar.processing.geometry import (
     rdr2geo_with_dem,
 )
 from faninsar.processing.geometry.ellipsoid import ecef_to_llh
+from faninsar.processing.geometry.transforms import TransformResult
 
 
 def _orbit_and_grid() -> tuple[OrbitMetadata, RadarGrid]:
@@ -135,6 +136,61 @@ def test_geoid_adjusted_dem_adds_undulation() -> None:
     np.testing.assert_allclose(height, [958.0])
 
 
+def test_rdr2geo_dem_fixed_point_runs_beyond_two_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DEM intersection must converge instead of stopping after two updates."""
+    from faninsar.processing.geometry import transforms
+
+    calls = 0
+
+    def fake_rdr2geo(
+        _model: object,
+        azimuth_index: np.ndarray,
+        range_index: np.ndarray,
+        *,
+        height_m: np.ndarray | float,
+        **_kwargs: object,
+    ) -> TransformResult:
+        nonlocal calls
+        calls += 1
+        azimuth, range_values, height = np.broadcast_arrays(
+            np.asarray(azimuth_index, dtype=np.float64),
+            np.asarray(range_index, dtype=np.float64),
+            np.asarray(height_m, dtype=np.float64),
+        )
+        return TransformResult(
+            latitude_deg=height.copy(),
+            longitude_deg=np.zeros_like(height),
+            height_m=height.copy(),
+            range_index=range_values.copy(),
+            azimuth_index=azimuth.copy(),
+            converged=np.ones_like(height, dtype=bool),
+            residual_range_m=np.zeros_like(height),
+            residual_doppler_hz=np.zeros_like(height),
+        )
+
+    class ContractingDEM:
+        def sample(
+            self,
+            latitude_deg: np.ndarray,
+            longitude_deg: np.ndarray,
+        ) -> np.ndarray:
+            _ = longitude_deg
+            return 100.0 + 0.5 * latitude_deg
+
+    monkeypatch.setattr(transforms, "rdr2geo_ellipsoid", fake_rdr2geo)
+    result = transforms.rdr2geo_with_dem(
+        object(),
+        np.array([0.0]),
+        np.array([0.0]),
+        ContractingDEM(),
+    )
+
+    assert calls > 3
+    assert result.height_m[0] > 199.9
+
+
 def test_rdr2geo_ellipsoid_marks_out_of_orbit_as_not_converged() -> None:
     """Samples outside orbit coverage remain masked rather than invented."""
     orbit, grid = _orbit_and_grid()
@@ -180,6 +236,7 @@ def test_constant_dem_and_transform_cache_round_trip(tmp_path: Path) -> None:
     store = write_transform_cache(tmp_path, key, result)
     loaded_key, loaded = read_transform_cache(store)
     assert loaded_key.product_id == "synthetic"
+    assert isinstance(loaded, TransformResult)
     np.testing.assert_array_equal(loaded.converged, result.converged)
     np.testing.assert_allclose(loaded.latitude_deg, result.latitude_deg, equal_nan=True)
 

@@ -9,7 +9,7 @@ import pytest
 import rasterio
 from rasterio.transform import from_bounds
 
-from faninsar._core.sar import Pairs
+from faninsar.core import Pairs
 from faninsar.datasets.frame.exceptions import GridMismatchError, PairNotFoundError
 from faninsar.datasets.frame.geometry import FrameGeometry
 from faninsar.datasets.frame.interferogram import FrameInterferogramCollection

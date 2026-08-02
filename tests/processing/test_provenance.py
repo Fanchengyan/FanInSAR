@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
+import yaml
 
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.provenance import (
     ProcessingEvent,
     ProvenanceRecord,
     SoftwareIdentity,
+)
+from faninsar.validation.provenance import (
+    ManifestValidationError,
+    validate_pipeline_rebuild_manifest,
 )
 
 
@@ -72,3 +78,27 @@ def test_provenance_rejects_malformed_nested_parameters() -> None:
 
     with pytest.raises(InvalidProcessingStateError, match="valid provenance JSON"):
         ProvenanceRecord.from_json(malformed)
+
+
+def test_rebuild_manifest_rejects_mutated_checksum(tmp_path: Path) -> None:
+    source = Path("tests/reference/pipeline_rebuild_manifest.yaml")
+    payload = yaml.safe_load(source.read_text())
+    payload["corpus"]["scenes"][0]["sha256"] = "0" * 64
+    mutated = tmp_path / source.name
+    mutated.write_text(yaml.safe_dump(payload, sort_keys=False))
+
+    with pytest.raises(ManifestValidationError, match="sha256"):
+        validate_pipeline_rebuild_manifest(mutated)
+
+
+def test_rebuild_manifest_rejects_invalid_retirement_archive_digest(
+    tmp_path: Path,
+) -> None:
+    source = Path("tests/reference/pipeline_rebuild_manifest.yaml")
+    payload = yaml.safe_load(source.read_text())
+    payload["baseline"]["retired_history"]["archive_sha256"] = "0" * 63
+    mutated = tmp_path / source.name
+    mutated.write_text(yaml.safe_dump(payload, sort_keys=False))
+
+    with pytest.raises(ManifestValidationError, match="archive_sha256"):
+        validate_pipeline_rebuild_manifest(mutated)

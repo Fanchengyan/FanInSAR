@@ -384,12 +384,13 @@ def test_stage_flatten_wrapped_phase_matches_flat_not_unflat(
 def test_stage_flatten_does_not_repeat_slc_domain_flattening(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Range-offset-flattened IFG only removes residual DEM topo, not full topo.
+    """Range-offset-flattened IFG is kept unchanged by stage_flatten.
 
-    When ``secondary_aligned_is_flattened`` and the stored range-offset screen
-    already matches the dual-orbit model, residual is ~0 and the product phase
-    is preserved. Full topographic phase is not re-applied as if coreg never
-    flattened (that was the pre-fix double-flatten / skip-residual bug).
+    When ``secondary_aligned_is_flattened`` the range-offset screen applied
+    during coregistration is ISCE2's complete flatten (fact * range offset
+    with the DEM), so stage_flatten preserves the product phase instead of
+    removing a spurious residual. Full topographic phase is not re-applied
+    as if coreg never flattened.
     """
     from faninsar.processing.pipeline import production as production_mod
 
@@ -421,19 +422,19 @@ def test_stage_flatten_does_not_repeat_slc_domain_flattening(
 
     assert result.complex_ifg_flat is not None
     assert result.wrapped_phase is not None
-    # Residual removal with near-zero residual keeps phase (within float noise).
+    # ISCE2-parity: no residual removal; phase is preserved exactly.
     np.testing.assert_allclose(
         np.angle(result.complex_ifg_flat), phase, atol=1e-5
     )
     np.testing.assert_allclose(result.wrapped_phase, phase, atol=1e-5)
     notes = " ".join(result.log)
-    assert "residual DEM topo after range-offset" in notes
+    assert "range-offset screen only" in notes
 
 
 def test_staged_ifg_only_never_enters_unwrap(tmp_path: Path) -> None:
     """Composed deramp→ifg path yields finite wrapped products without unwrap.
 
-    Mirrors the production stop-gate used by ``scripts/run_three_slc_ifg_compare.py``:
+    Mirrors the external campaign stop-gate recorded by Waymark NOTE-0004:
     stages are composed explicitly so ``stage_unwrap`` is never called.
     Coregistration is stubbed by supplying already-aligned secondaries so the
     unit under test remains the staged ifg stop-gate (not the geometry engine).

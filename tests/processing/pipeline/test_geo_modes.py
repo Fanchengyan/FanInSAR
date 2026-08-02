@@ -15,13 +15,16 @@ from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.pipeline.geo_lut import (
     build_geo2rdr_lut,
     grid_lonlat,
+    grid_lonlat_rows,
 )
 from faninsar.processing.pipeline.geo_modes import (
     coregister_geocoded_slcs,
+    coregister_geocoded_slcs_chunked,
 )
 from faninsar.processing.pipeline.geo_resample import (
     apply_lut_complex,
     compose_secondary_coordinates,
+    resample_complex_at_coordinates,
 )
 from faninsar.processing.tops.deramp import TOPSCarrierModel
 
@@ -70,6 +73,31 @@ def test_grid_lonlat_projected_is_finite() -> None:
     assert np.isfinite(lon).all()
     assert -1.0 < float(np.mean(lat)) < 1.0
     assert 2.0 < float(np.mean(lon)) < 4.0
+
+
+def test_grid_lonlat_rows_matches_full_grid_slice() -> None:
+    """Row-only coordinates match the corresponding full-grid rows."""
+    grid = _projected_grid()
+    full_latitude, full_longitude = grid_lonlat(grid)
+
+    latitude, longitude = grid_lonlat_rows(grid, 1, 3)
+
+    np.testing.assert_allclose(latitude, full_latitude[1:3])
+    np.testing.assert_allclose(longitude, full_longitude[1:3])
+
+
+def test_geo2rdr_lut_retains_sampled_height() -> None:
+    """Reuse the exact DEM samples needed by later geometric flattening."""
+    grid = _projected_grid()
+    lut = build_geo2rdr_lut(
+        geometry=_toy_geometry(),
+        grid=grid,
+        full_radar_shape=(64, 128),
+        height_m=123.5,
+    )
+
+    assert lut.height_full is not None
+    np.testing.assert_array_equal(lut.height_full, np.full(grid.shape, 123.5))
 
 
 def _carrier() -> TOPSCarrierModel:
@@ -151,6 +179,85 @@ def test_coregister_geocoded_slcs_remaps_deramped_inputs_once() -> None:
     assert np.allclose(reference, secondary, atol=1e-6)
 
 
+def test_chunked_coregistration_matches_full_result(tmp_path: Path) -> None:
+    """Chunked Geo coregistration is numerically identical to the full path."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+
+    shape = (12, 14)
+    azimuth, range_index = np.meshgrid(
+        np.arange(1.0, 11.0),
+        np.arange(1.0, 13.0),
+        indexing="ij",
+    )
+    lut = Geo2RdrLUT(
+        az_full=azimuth,
+        rg_full=range_index,
+        valid=np.ones(azimuth.shape, dtype=bool),
+        full_radar_shape=shape,
+        height_m=0.0,
+    )
+    offsets = OffsetFieldResult(
+        range_offset_px=np.full(shape, -0.25, dtype=np.float32),
+        azimuth_offset_px=np.full(shape, 0.125, dtype=np.float32),
+        coverage=np.ones(shape, dtype=bool),
+        uncertainty_px=np.zeros(shape, dtype=np.float32),
+    )
+    rows, columns = np.indices(shape)
+    deramped = np.exp(1j * (0.05 * rows + 0.02 * columns)).astype(np.complex64)
+    expected_reference, expected_secondary, expected_valid = coregister_geocoded_slcs(
+        deramped,
+        deramped,
+        reference_carrier=_carrier(),
+        secondary_carrier=_carrier(),
+        reference_lut=lut,
+        offsets=offsets,
+    )
+
+    reference, secondary, valid = coregister_geocoded_slcs_chunked(
+        deramped,
+        deramped,
+        reference_carrier=_carrier(),
+        secondary_carrier=_carrier(),
+        reference_lut=lut,
+        offsets=offsets,
+        output_dir=tmp_path,
+        row_chunk=3,
+    )
+
+    assert isinstance(reference, np.memmap)
+    assert isinstance(secondary, np.memmap)
+    assert isinstance(valid, np.memmap)
+    np.testing.assert_allclose(reference, expected_reference, atol=1e-6)
+    np.testing.assert_allclose(secondary, expected_secondary, atol=1e-6)
+    np.testing.assert_array_equal(valid, expected_valid)
+
+
+def test_opencv_geo_resampling_preserves_smooth_complex_phase() -> None:
+    """Keep the compiled Lanczos path phase-close on a bandlimited field."""
+    pytest.importorskip("cv2")
+    rows, columns = np.indices((64, 96), dtype=np.float64)
+    source = np.exp(1j * (0.04 * rows + 0.015 * columns)).astype(np.complex64)
+    azimuth = rows[4:-4, 4:-4] + 0.37
+    range_index = columns[4:-4, 4:-4] + 0.61
+    serial, serial_valid = resample_complex_at_coordinates(
+        source,
+        azimuth,
+        range_index,
+        executor="torch",
+    )
+    accelerated, accelerated_valid = resample_complex_at_coordinates(
+        source,
+        azimuth,
+        range_index,
+        executor="opencv",
+    )
+
+    np.testing.assert_array_equal(accelerated_valid, serial_valid)
+    phase_delta = np.angle(accelerated * np.conj(serial))
+    assert float(np.max(np.abs(phase_delta))) < 1e-3
+
+
 def test_shared_lut_apply_twice_same_shape() -> None:
     """Verify one LUT can resample independent complex fields."""
     geom = _toy_geometry((32, 64))
@@ -200,6 +307,26 @@ def test_build_geo2rdr_lut_accepts_height_array() -> None:
     m = lut_arr.valid & lut_dem.valid
     if m.any():
         assert float(np.nanmax(np.abs(lut_arr.az_full[m] - lut_dem.az_full[m]))) < 1e-6
+
+
+def test_build_geo2rdr_lut_can_use_disk_backed_arrays(tmp_path: Path) -> None:
+    """A disk-backed LUT keeps complete coordinates without resident arrays."""
+    geom = _toy_geometry((32, 64))
+    grid = _projected_grid()
+
+    lut = build_geo2rdr_lut(
+        geometry=geom,
+        grid=grid,
+        full_radar_shape=(32, 64),
+        height_m=0.0,
+        chunk_size=2,
+        storage_dir=tmp_path,
+    )
+
+    assert isinstance(lut.az_full, np.memmap)
+    assert isinstance(lut.rg_full, np.memmap)
+    assert isinstance(lut.valid, np.memmap)
+    assert lut.shape == grid.shape
 
 
 def test_run_production_pair_requires_geo_grid_for_geo_mode(tmp_path: Path) -> None:

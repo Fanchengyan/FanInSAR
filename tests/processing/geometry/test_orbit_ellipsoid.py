@@ -10,6 +10,7 @@ import pytest
 from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
 from faninsar.processing.geometry import (
     OrbitInterpolationError,
+    OrbitInterpolator,
     ecef_to_llh,
     geometric_baseline,
     interpolate_orbit,
@@ -69,6 +70,36 @@ def test_orbit_interpolation_matches_nodes_and_rejects_out_of_range() -> None:
 
     with pytest.raises(OrbitInterpolationError, match="outside coverage"):
         interpolate_orbit(orbit, orbit.vectors[0].time - timedelta(seconds=1))
+
+
+def test_orbit_position_derivative_matches_interpolated_velocity() -> None:
+    """Keep interpolated position and velocity on one Hermite trajectory."""
+    epoch = datetime(2020, 1, 1, tzinfo=UTC)
+    positions = (0.0, 1.0, 0.0, -1.0)
+    velocities = (1.0, 0.0, -1.0, 0.0)
+    orbit = OrbitMetadata(
+        reference_frame="ITRF",
+        source="synthetic-hermite",
+        vectors=tuple(
+            OrbitStateVector(
+                time=epoch + timedelta(seconds=index),
+                position_m=(position, 0.0, 0.0),
+                velocity_m_s=(velocity, 0.0, 0.0),
+            )
+            for index, (position, velocity) in enumerate(
+                zip(positions, velocities, strict=True)
+            )
+        ),
+    )
+    interpolator = OrbitInterpolator.from_orbit(orbit)
+    evaluation_time = 1.0
+    step = 1e-5
+    before, _ = interpolator.evaluate_array(np.array([evaluation_time - step]))
+    after, velocity = interpolator.evaluate_array(
+        np.array([evaluation_time + step, evaluation_time])
+    )
+    numerical_velocity = (after[0] - before[0]) / (2.0 * step)
+    np.testing.assert_allclose(numerical_velocity, velocity[1], atol=1e-7)
 
 
 def test_zero_doppler_residual_and_baseline_are_finite() -> None:

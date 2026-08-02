@@ -8,7 +8,7 @@ from faninsar._core.file_tools import ensure_int, load_meta, load_metas, strip_s
 @pytest.fixture
 def data_dir() -> Path:
     """Fixture for the data directory."""
-    return Path(__file__).parent / "data" / "ascii"
+    return Path(__file__).parents[1] / "data" / "ascii"
 
 
 @pytest.fixture

@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from faninsar.sentinel1.annotation import parse_annotation_xml
-from faninsar.sentinel1.errors import UnsupportedPolarizationError
-from faninsar.sentinel1.safe import open_safe_product
+from faninsar.missions.sentinel1.annotation import parse_annotation_xml
+from faninsar.missions.sentinel1.errors import UnsupportedPolarizationError
+from faninsar.missions.sentinel1.safe import open_safe_product
 
 FIXTURE = (
-    Path(__file__).resolve().parents[1]
+    Path(__file__).resolve().parents[2]
     / "data"
     / "sentinel1"
     / "minimal_annotation_iw1.xml"
@@ -40,6 +40,9 @@ def test_parse_minimal_annotation_fixture() -> None:
     assert len(swath.orbit.vectors) == 3
     assert len(swath.doppler_centroid) == 1
     assert swath.radar_frequency_hz > 0
+    assert swath.range_pixel_spacing_m == pytest.approx(
+        299_792_458.0 / (2.0 * swath.range_sampling_rate_hz)
+    )
 
 
 def test_malformed_annotation_without_bursts_is_rejected() -> None:
