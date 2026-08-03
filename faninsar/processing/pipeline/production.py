@@ -1444,8 +1444,7 @@ def _multilook_real_field(
 
 
 BurstSelection = (
-    dict[str, list[int] | range | str]
-    | list[dict[str, list[int] | range | str]]
+    dict[str, list[int] | range | str] | list[dict[str, list[int] | range | str]]
 )
 
 
@@ -1473,8 +1472,12 @@ def _as_optional_frame_sequence(
         return [paths[0]] * frame_count
     if len(paths) != frame_count:
         reject_invalid_state(
-            name + " has " + str(len(paths)) + " entries for "
-            + str(frame_count) + " frames"
+            name
+            + " has "
+            + str(len(paths))
+            + " entries for "
+            + str(frame_count)
+            + " frames"
         )
     return list(paths)
 
@@ -1492,7 +1495,10 @@ def _burst_index_list(
             value = range(int(parts[0]), int(parts[1]))
         else:
             reject_invalid_state(
-                "invalid burst selection " + repr(value) + " for " + swath
+                "invalid burst selection "
+                + repr(value)
+                + " for "
+                + swath
                 + "; expected 'all' or 'start:stop'"
             )
     if isinstance(value, range):
@@ -1504,8 +1510,12 @@ def _burst_index_list(
     for index in indices:
         if index < 0 or index >= count:
             reject_invalid_state(
-                "burst index " + str(index) + " out of range 0.."
-                + str(count - 1) + " for " + swath
+                "burst index "
+                + str(index)
+                + " out of range 0.."
+                + str(count - 1)
+                + " for "
+                + swath
             )
     return sorted(set(indices))
 
@@ -1527,8 +1537,11 @@ def _normalize_burst_selection(
     if isinstance(bursts, list):
         if len(bursts) != frame_count:
             reject_invalid_state(
-                "per-frame burst selection has " + str(len(bursts))
-                + " entries for " + str(frame_count) + " frames"
+                "per-frame burst selection has "
+                + str(len(bursts))
+                + " entries for "
+                + str(frame_count)
+                + " frames"
             )
         per_frame: list[dict[str, list[int] | range | str] | None] = list(bursts)
     else:
@@ -1700,9 +1713,7 @@ def _common_burst_indices(
 ) -> list[int]:
     common: list[int] = []
     max_index = min(len(reference_swath.bursts), len(secondary_swath.bursts))
-    window_s = (
-        reference_swath.lines_per_burst * reference_swath.azimuth_time_interval_s
-    )
+    window_s = reference_swath.lines_per_burst * reference_swath.azimuth_time_interval_s
     for index in range(max_index):
         ref_burst = reference_swath.bursts[index]
         sec_burst = secondary_swath.bursts[index]
@@ -1833,7 +1844,9 @@ def run_pair(
     if len(ref_paths) != len(sec_paths):
         reject_invalid_state(
             "reference/secondary frame counts differ: "
-            + str(len(ref_paths)) + " vs " + str(len(sec_paths))
+            + str(len(ref_paths))
+            + " vs "
+            + str(len(sec_paths))
         )
     frame_count = len(ref_paths)
     ref_orbits = _as_optional_frame_sequence(
@@ -1860,24 +1873,32 @@ def run_pair(
         missing = [name for name in swath_tuple if name not in present]
         if missing:
             reject_invalid_state(
-                "reference frame " + str(frame_index) + " ("
-                + ref_paths[frame_index].name + ") missing swaths "
-                + str(missing) + "; available=" + str(sorted(present))
+                "reference frame "
+                + str(frame_index)
+                + " ("
+                + ref_paths[frame_index].name
+                + ") missing swaths "
+                + str(missing)
+                + "; available="
+                + str(sorted(present))
             )
     for frame_index, product in enumerate(secondary_products):
         present = {item.swath for item in product.swaths}
         missing = [name for name in swath_tuple if name not in present]
         if missing:
             reject_invalid_state(
-                "secondary frame " + str(frame_index) + " ("
-                + sec_paths[frame_index].name + ") missing swaths "
-                + str(missing) + "; available=" + str(sorted(present))
+                "secondary frame "
+                + str(frame_index)
+                + " ("
+                + sec_paths[frame_index].name
+                + ") missing swaths "
+                + str(missing)
+                + "; available="
+                + str(sorted(present))
             )
 
     if roi is not None:
-        logger.info(
-            "run_pair: ROI provided; explicit swaths/bursts selection ignored"
-        )
+        logger.info("run_pair: ROI provided; explicit swaths/bursts selection ignored")
         ordered = sorted(
             reference_products[0].swaths,
             key=lambda item: item.slant_range_time_s,
@@ -1903,14 +1924,14 @@ def run_pair(
             secondary_swath = secondary_products[frame_index].swath(swath)
             common = _common_burst_indices(reference_swath, secondary_swath)
             selected = [
-                index
-                for index in resolved[(frame_index, swath)]
-                if index in common
+                index for index in resolved[(frame_index, swath)] if index in common
             ]
             if not selected:
                 reject_invalid_state(
                     "no common bursts between reference/secondary frame "
-                    + str(frame_index) + " swath " + swath
+                    + str(frame_index)
+                    + " swath "
+                    + swath
                 )
             common_aligned[(frame_index, swath)] = selected
     resolved = common_aligned
@@ -1957,8 +1978,7 @@ def run_pair(
             for burst_index in indices:
                 azimuth_offset = round(
                     (
-                        swath_obj.bursts[burst_index].azimuth_time
-                        - azimuth_origin
+                        swath_obj.bursts[burst_index].azimuth_time - azimuth_origin
                     ).total_seconds()
                     / dt
                 )
@@ -1973,9 +1993,7 @@ def run_pair(
         for swath, units in units_by_swath.items()
         for _, _, azimuth_offset in units
     )
-    frame_cols = max(
-        range_offsets[swath] + burst_width[swath] for swath in swath_tuple
-    )
+    frame_cols = max(range_offsets[swath] + burst_width[swath] for swath in swath_tuple)
     az_looks, rg_looks = int(multilook[0]), int(multilook[1])
     out_rows = frame_rows // az_looks
     out_cols = frame_cols // rg_looks
@@ -2021,13 +2039,9 @@ def run_pair(
         s1_swath = product.swath(swath)
         if orbit_path is not None:
             s1_swath = replace(s1_swath, orbit=read_eof_orbit(orbit_path))
-        array = read_full_burst(
-            s1_swath, burst_index=burst_index, full_range=True
-        )
+        array = read_full_burst(s1_swath, burst_index=burst_index, full_range=True)
         burst = s1_swath.bursts[burst_index]
-        carrier = carrier_from_swath(
-            s1_swath, burst, first_range_sample=array.col0
-        )
+        carrier = carrier_from_swath(s1_swath, burst, first_range_sample=array.col0)
         geometry = _radar_model(
             s1_swath,
             burst,
@@ -2078,11 +2092,7 @@ def run_pair(
             )
             if first_state is None:
                 first_state = state
-            if (
-                frame_index == 0
-                and swath == swath_tuple[0]
-                and burst_index == 0
-            ):
+            if frame_index == 0 and swath == swath_tuple[0] and burst_index == 0:
                 origin_state = state
             stage_times: dict[str, float] = {}
             t0 = time.perf_counter()
@@ -2119,12 +2129,10 @@ def run_pair(
             assert state.reference_deramped is not None
             assert state.secondary_aligned is not None
             pri_power = (
-                state.reference_deramped.real ** 2
-                + state.reference_deramped.imag ** 2
+                state.reference_deramped.real**2 + state.reference_deramped.imag**2
             )
             sec_power = (
-                state.secondary_aligned.real ** 2
-                + state.secondary_aligned.imag ** 2
+                state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
             )
             t0 = time.perf_counter()
             state = stage_interferogram(
@@ -2148,9 +2156,7 @@ def run_pair(
 
             valid = np.abs(ifg_full) > 0
             rows = azimuth_offset + burst_row0 + np.arange(ifg_full.shape[0])
-            cols = range_offsets[swath] + burst_col0 + np.arange(
-                ifg_full.shape[1]
-            )
+            cols = range_offsets[swath] + burst_col0 + np.arange(ifg_full.shape[1])
             orow = rows[:, None] // az_looks
             ocol = cols[None, :] // rg_looks
             ocol_local = ocol - range_offsets[swath] // rg_looks
@@ -2188,9 +2194,7 @@ def run_pair(
         pri_ml = pri_pow_acc[swath] / np.where(has, claimed[swath], 1)
         sec_ml = sec_pow_acc[swath] / np.where(has, claimed[swath], 1)
         denom = np.sqrt(np.maximum(pri_ml * sec_ml, 1e-30))
-        swath_coh = np.clip(np.abs(swath_ifg) / denom, 0.0, 1.0).astype(
-            np.float32
-        )
+        swath_coh = np.clip(np.abs(swath_ifg) / denom, 0.0, 1.0).astype(np.float32)
         col0 = range_offsets[swath] // rg_looks
         rows = swath_ifg.shape[0]
         cols = swath_ifg.shape[1]
@@ -2239,10 +2243,19 @@ def run_pair(
         },
     )
     result.note(
-        "PAIR frames=" + str(frame_count) + " swaths=" + str(swath_tuple)
-        + " units=" + str(selected_unit_count) + " merged=" + str(merged_ifg.shape)
-        + " multilook=" + str(multilook) + " valid="
-        + format(float((~invalid).mean()), ".3f") + " mean_coh="
+        "PAIR frames="
+        + str(frame_count)
+        + " swaths="
+        + str(swath_tuple)
+        + " units="
+        + str(selected_unit_count)
+        + " merged="
+        + str(merged_ifg.shape)
+        + " multilook="
+        + str(multilook)
+        + " valid="
+        + format(float((~invalid).mean()), ".3f")
+        + " mean_coh="
         + format(float(np.nanmean(coherence)), ".3f")
     )
     if unwrap:

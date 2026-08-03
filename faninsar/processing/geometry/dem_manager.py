@@ -134,14 +134,16 @@ class DEMManager:
         target_dir = self.cache_dir / tile_dir
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / filename
-        url = f"{self.source_url.rstrip('/')}/{tile_dir}/{filename}"
+        remote_dir = Path(filename).stem
+        url = f"{self.source_url.rstrip('/')}/{remote_dir}/{filename}"
         temporary = target.with_suffix(target.suffix + ".part")
         last_error: Exception | None = None
         for attempt in range(_DOWNLOAD_ATTEMPTS):
             try:
-                with urllib.request.urlopen(url, timeout=180) as response, (
-                    temporary.open("wb")
-                ) as out:
+                with (
+                    urllib.request.urlopen(url, timeout=180) as response,
+                    temporary.open("wb") as out,
+                ):
                     shutil.copyfileobj(response, out, length=1 << 20)
             except Exception as exc:
                 last_error = exc
@@ -161,9 +163,7 @@ class DEMManager:
                 temporary.unlink(missing_ok=True)
                 continue
             temporary.replace(target)
-            logger.info(
-                "DEM tile fetched: %s (%d bytes)", url, target.stat().st_size
-            )
+            logger.info("DEM tile fetched: %s (%d bytes)", url, target.stat().st_size)
             return target
         message = (
             f"DEM tile download failed after {_DOWNLOAD_ATTEMPTS} attempts: "

@@ -147,7 +147,8 @@ def test_fetch_dem_downloads_missing_tile(
     manager.fetch_dem((100.2, 38.2, 100.8, 38.8), out)
 
     expected_url = (
-        "https://copernicus-dem-30m.s3.amazonaws.com/N38_E100/"
+        "https://copernicus-dem-30m.s3.amazonaws.com/"
+        "Copernicus_DSM_COG_10_N38_00_E100_00_DEM/"
         "Copernicus_DSM_COG_10_N38_00_E100_00_DEM.tif"
     )
     assert requests == [expected_url]
