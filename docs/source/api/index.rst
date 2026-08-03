@@ -15,5 +15,6 @@ API Reference
    samplers/index
    NSBAS/index
    plots/index
+   dem_manager
    constants/sar
    logging/index
