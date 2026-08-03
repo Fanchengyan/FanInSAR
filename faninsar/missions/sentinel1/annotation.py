@@ -65,6 +65,56 @@ def _ints(text: str) -> tuple[int, ...]:
     return tuple(int(part) for part in text.split())
 
 
+def _parse_burst_footprints(
+    root: ET.Element,
+    lines_per_burst: int,
+) -> list[tuple[tuple[float, float], ...]] | None:
+    grid = None
+    for child in root:
+        if _local(child.tag) == "geolocationGrid":
+            grid = child
+            break
+    if grid is None:
+        return None
+    points: list[tuple[int, float, float]] = []
+    for gp in grid.iter():
+        if _local(gp.tag) != "geolocationGridPoint":
+            continue
+        line = int(_text(gp, "line"))
+        lat = float(_text(gp, "latitude"))
+        lon = float(_text(gp, "longitude"))
+        points.append((line, lat, lon))
+    if not points:
+        return None
+    max_line = max(p[0] for p in points)
+    n_bursts = max_line // lines_per_burst + 1
+    footprints: list[tuple[tuple[float, float], ...]] = []
+    for index in range(n_bursts):
+        low = index * lines_per_burst
+        high = (
+            max_line + 1
+            if index == n_bursts - 1
+            else min((index + 1) * lines_per_burst, max_line + 1)
+        )
+        rows = [p for p in points if low <= p[0] < high]
+        if not rows:
+            mid = (low + high - 1) / 2.0
+            rows = [min(points, key=lambda p: abs(p[0] - mid))]
+        lats = [p[1] for p in rows]
+        lons = [p[2] for p in rows]
+        min_lon, max_lon = min(lons), max(lons)
+        min_lat, max_lat = min(lats), max(lats)
+        footprints.append(
+            (
+                (min_lon, min_lat),
+                (max_lon, min_lat),
+                (max_lon, max_lat),
+                (min_lon, max_lat),
+            )
+        )
+    return footprints
+
+
 def parse_annotation_xml(
     xml_text: str,
     *,
@@ -101,6 +151,7 @@ def parse_annotation_xml(
     lines_per_burst = int(_text(swath_timing, "linesPerBurst"))
     samples_per_burst = int(_text(swath_timing, "samplesPerBurst"))
 
+    footprints = _parse_burst_footprints(root, lines_per_burst)
     bursts: list[S1Burst] = []
     burst_list = _child(swath_timing, "burstList")
     for index, burst_el in enumerate(
@@ -123,6 +174,11 @@ def parse_annotation_xml(
                 samples=samples_per_burst,
                 first_valid_sample=first,
                 last_valid_sample=last,
+                footprint=(
+                    footprints[index]
+                    if footprints is not None and index < len(footprints)
+                    else None
+                ),
             )
         )
     if not bursts:

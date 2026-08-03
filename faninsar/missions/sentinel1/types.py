@@ -29,6 +29,7 @@ class S1Burst:
     samples: int
     first_valid_sample: tuple[int, ...]
     last_valid_sample: tuple[int, ...]
+    footprint: tuple[tuple[float, float], ...] | None = None
 
     @property
     def valid_samples(self) -> ValidSampleMask:
