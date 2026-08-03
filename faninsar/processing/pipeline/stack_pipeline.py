@@ -11,9 +11,8 @@ from typing import TYPE_CHECKING
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.pipeline.production import (
-    CoregistrationGrid,
     ProductionPairState,
-    run_production_pair,
+    run_pair,
 )
 from faninsar.processing.timeseries.inversion import (
     TimeSeriesResult,
@@ -25,8 +24,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
     from faninsar.processing.geometry.dem import DEMSampler
-    from faninsar.processing.merge.grid import GeoGridSpec
-    from faninsar.processing.unwrap import SnaphuConfig, UnwrapBackend
 
 logger = setup_logger(__name__)
 
@@ -72,11 +69,7 @@ def run_stack_pipeline(
     invert_timeseries: bool = True,
     executor: str = "torch",
     device: str = "auto",
-    snaphu_config: SnaphuConfig | None = None,
-    unwrap_method: UnwrapBackend | None = None,
     invert_device: str = "cpu",
-    coregistration_grid: CoregistrationGrid = "radar",
-    geo_grid: GeoGridSpec | None = None,
     dem: DEMSampler | None = None,
 ) -> StackPipelineResult:
     """Process an arbitrary SAFE stack with the production pair pipeline.
@@ -101,16 +94,8 @@ def run_stack_pipeline(
         Unified Torch coregistration and LUT Lanczos path.
     device : {"auto","cpu","cuda"}, optional
         Torch compute device.
-    snaphu_config : SnaphuConfig, optional
-        snaphu-py configuration for every pair.
-    unwrap_method : {"irls", "snaphu"}, optional
-        Spatial unwrapping backend for every pair.
     invert_device : str, optional
         Device for SBAS inversion. Default ``"cpu"``.
-    coregistration_grid : {"radar", "geo"}, optional
-        Pair coregistration grid passed to :func:`run_production_pair`.
-    geo_grid : GeoGridSpec, optional
-        Required when ``coregistration_grid="geo"``.
     dem : DEMSampler, optional
         DEM for coreg/flatten/geocode.
 
@@ -143,22 +128,18 @@ def run_stack_pipeline(
     for ref_id, sec_id in pair_list:
         if ref_id not in id_to_path or sec_id not in id_to_path:
             reject_invalid_state(f"unknown scene id in pair ({ref_id}, {sec_id})")
-        state = run_production_pair(
+        state = run_pair(
             id_to_path[ref_id],
             id_to_path[sec_id],
             output_dir=out / "pairs" / f"{ref_id}_{sec_id}",
-            swath=swath,
-            scope="burst",
-            burst_index=burst_index,
+            swaths=(swath,),
+            bursts={swath: [burst_index]},
             dem=dem,
             multilook=multilook,
             goldstein_alpha=goldstein_alpha,
             executor=executor,
             device=device,
-            snaphu_config=snaphu_config,
-            unwrap_method=unwrap_method,
-            coregistration_grid=coregistration_grid,
-            geo_grid=geo_grid,
+            unwrap=True,
         )
         pair_states.append(state)
         assert state.unwrapped_phase is not None
@@ -175,7 +156,7 @@ def run_stack_pipeline(
         len(scene_ids),
         len(pair_states),
         out,
-        coregistration_grid,
+        "radar",
     )
     return StackPipelineResult(
         scene_ids=scene_ids,

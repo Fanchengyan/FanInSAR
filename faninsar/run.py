@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from faninsar.compute.numpy_backend import NumpyBackend
-from faninsar.ports.compute import ComputeBackend
+
+if TYPE_CHECKING:
+    from faninsar.ports.compute import ComputeBackend
 
 
 def run(
@@ -26,7 +28,7 @@ def run(
 
         - ``reference`` / ``secondary``: SAFE URIs
         - ``output``: output URI/directory
-        - optional ``swath``, ``burst_index``, ``coregistration_grid``, …
+    - optional ``swaths``, ``bursts``, ``roi``, ``multilook``, …
 
     client : optional
         Injected Dask Client (never constructed here).
@@ -51,30 +53,46 @@ def run(
     secondary = cfg.get("secondary") or cfg.get("secondary_path")
     output = cfg.get("output") or cfg.get("output_dir")
     if not reference or not secondary or not output:
-        raise ValueError(
-            "run() pair config requires 'reference', 'secondary', and 'output' keys"
+        message = (
+            "run() pair config requires 'reference', 'secondary', "
+            "and 'output' keys"
         )
+        raise ValueError(message)
 
-    from faninsar.processing.pipeline import run_production_pair
+    from faninsar.processing.pipeline import run_pair
 
-    kwargs = {
-        k: cfg[k]
-        for k in (
-            "swath",
-            "scope",
-            "burst_index",
-            "multilook",
-            "unwrap_method",
-            "esd_enabled",
-            "coregistration_grid",
-            "device",
-            "executor",
-        )
-        if k in cfg
-    }
+    kwargs: dict[str, Any] = {}
+    if "swaths" in cfg:
+        kwargs["swaths"] = tuple(cfg["swaths"])
+    elif "swath" in cfg:
+        kwargs["swaths"] = (cfg["swath"],)
+    if "bursts" in cfg:
+        kwargs["bursts"] = cfg["bursts"]
+    elif "burst_index" in cfg:
+        swath = cfg.get("swath", "IW1")
+        kwargs["bursts"] = {swath: [cfg["burst_index"]]}
+    for key in (
+        "roi",
+        "dem",
+        "multilook",
+        "goldstein_alpha",
+        "dead_pixel_amp_threshold",
+        "esd_enabled",
+        "amplitude_refinement_enabled",
+        "control_spacing",
+        "executor",
+        "device",
+        "reference_orbit_path",
+        "secondary_orbit_path",
+        "geoid_correction",
+    ):
+        if key in cfg:
+            kwargs[key] = cfg[key]
+    if cfg.get("unwrap") or cfg.get("unwrap_method") is not None:
+        kwargs["unwrap"] = True
     # backend reserved for stage-level dispatch; production uses torch executor today
     del compute
-    return run_production_pair(reference, secondary, output_dir=output, **kwargs)
+    return run_pair(reference, secondary, output_dir=output, **kwargs)
 
 
 def _load_config(config: str | Path | dict[str, Any]) -> dict[str, Any]:
@@ -86,17 +104,20 @@ def _load_config(config: str | Path | dict[str, Any]) -> dict[str, Any]:
         try:
             import yaml
         except ImportError as exc:
-            raise ImportError("PyYAML required for YAML configs") from exc
+            message = "PyYAML required for YAML configs"
+            raise ImportError(message) from exc
         data = yaml.safe_load(text)
         if not isinstance(data, dict):
-            raise ValueError("YAML config must be a mapping")
+            message = "YAML config must be a mapping"
+            raise ValueError(message)
         return data
     # JSON
     import json
 
     data = json.loads(text)
     if not isinstance(data, dict):
-        raise ValueError("JSON config must be a mapping")
+        message = "JSON config must be a mapping"
+        raise TypeError(message)
     return data
 
 
@@ -108,7 +129,8 @@ def _resolve_backend(backend: str | ComputeBackend) -> ComputeBackend:
             from faninsar.compute.dask_torch import DaskTorchBackend
 
             return DaskTorchBackend()
-        raise ValueError(f"unknown backend {backend!r}")
+        message = f"unknown backend {backend!r}"
+        raise ValueError(message)
     return backend
 
 
