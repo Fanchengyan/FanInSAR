@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import shutil
 import time
 from dataclasses import dataclass, field, replace
@@ -1559,6 +1560,75 @@ def _roi_geometry(roi: BoundingBox | Polygons) -> Any:
     return series.unary_union
 
 
+def _auto_dem_bounds(
+    roi: BoundingBox | Polygons | None,
+    resolved: dict[tuple[int, str], list[int]],
+    reference_products: list,
+) -> tuple[float, float, float, float]:
+    """Return EPSG:4326 bounds covering the ROI or the selected bursts.
+
+    Parameters
+    ----------
+    roi : BoundingBox, Polygons, or None
+        ROI passed to run_pair.
+    resolved : dict
+        Selected burst indices per (frame_index, swath).
+    reference_products : list
+        Opened reference SAFE products, one per frame.
+
+    Returns
+    -------
+    tuple[float, float, float, float]
+        (min_lon, min_lat, max_lon, max_lat) with 0.01 deg padding when the
+        bounds come from burst footprints.
+
+    """
+    if isinstance(roi, BoundingBox):
+        return (
+            float(roi.left),
+            float(roi.bottom),
+            float(roi.right),
+            float(roi.top),
+        )
+    if isinstance(roi, Polygons):
+        total = roi.to_geodataframe().total_bounds
+        return (
+            float(total[0]),
+            float(total[1]),
+            float(total[2]),
+            float(total[3]),
+        )
+    lons: list[float] = []
+    lats: list[float] = []
+    for (frame_index, swath), indices in resolved.items():
+        swath_obj = reference_products[frame_index].swath(swath)
+        for burst_index in indices:
+            footprint = swath_obj.bursts[burst_index].footprint
+            if footprint is None:
+                continue
+            for lon, lat in footprint:
+                lons.append(float(lon))
+                lats.append(float(lat))
+    if not lons:
+        for product in reference_products:
+            for swath_item in product.swaths:
+                for burst in swath_item.bursts:
+                    if burst.footprint is None:
+                        continue
+                    for lon, lat in burst.footprint:
+                        lons.append(float(lon))
+                        lats.append(float(lat))
+    if not lons:
+        reject_invalid_state("cannot derive DEM bounds: no burst footprints available")
+    pad = 0.01
+    return (
+        min(lons) - pad,
+        min(lats) - pad,
+        max(lons) + pad,
+        max(lats) + pad,
+    )
+
+
 def _select_bursts_by_roi(
     roi: BoundingBox | Polygons,
     frame_paths: list[Path],
@@ -1844,6 +1914,21 @@ def run_pair(
                 )
             common_aligned[(frame_index, swath)] = selected
     resolved = common_aligned
+
+    if dem is None and os.environ.get("FANINSAR_DEM_CACHE_DIR"):
+        from faninsar.processing.geometry.dem_manager import (
+            default_dem_name,
+            get_dem_manager,
+        )
+
+        bounds = _auto_dem_bounds(roi, resolved, reference_products)
+        dem_path = get_dem_manager().fetch_dem(
+            bounds, Path(output_dir) / "dem" / default_dem_name()
+        )
+        logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
+        dem_sampler = RasterDEM(dem_path, interpolation="biquintic")
+        if geoid_correction:
+            dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
     range_offsets = _swath_range_offsets(swath_tuple, reference_products)
     reference_swath0 = reference_products[0].swath(swath_tuple[0])

@@ -89,6 +89,59 @@ def _parse_burst_selection(
     return result
 
 
+def _resolve_dem_path(value: str, output: Path) -> Path:
+    """Resolve a --dem argument to a path.
+
+    Absolute/relative paths pass through; a bare file name is placed under
+    <output>/dem/.
+    """
+    path = Path(value)
+    if path.is_absolute() or path.parent != Path():
+        return path
+    return output / "dem" / path
+
+
+def _cli_dem_bounds(
+    roi: BoundingBox | None,
+    reference: list[str],
+) -> tuple[float, float, float, float]:
+    """Return EPSG:4326 bounds for the CLI DEM build.
+
+    Uses ROI bounds or the union of every reference SAFE burst footprint
+    with 0.01 deg padding.
+    """
+    if roi is not None:
+        return (
+            float(roi.left),
+            float(roi.bottom),
+            float(roi.right),
+            float(roi.top),
+        )
+    from faninsar.missions.sentinel1.safe import open_safe_product
+
+    lons: list[float] = []
+    lats: list[float] = []
+    for path in reference:
+        product = open_safe_product(path)
+        for swath_item in product.swaths:
+            for burst in swath_item.bursts:
+                if burst.footprint is None:
+                    continue
+                for lon, lat in burst.footprint:
+                    lons.append(float(lon))
+                    lats.append(float(lat))
+    if not lons:
+        message = "cannot derive DEM bounds for --dem without --roi or footprints"
+        raise SystemExit(message)
+    pad = 0.01
+    return (
+        min(lons) - pad,
+        min(lats) - pad,
+        max(lons) + pad,
+        max(lats) + pad,
+    )
+
+
 def run_frame_cli(
     *,
     reference: str,
@@ -119,13 +172,19 @@ def run_frame_cli(
 
     """
     from faninsar.processing.geometry.dem import GeoidAdjustedDEM, RasterDEM
+    from faninsar.processing.geometry.dem_manager import get_dem_manager
     from faninsar.processing.geometry.egm96 import EGM96Geoid
     from faninsar.processing.pipeline import run_pair
 
+    roi_box = _parse_roi(roi)
     dem_sampler = None
     if dem is not None:
+        dem_path = _resolve_dem_path(dem, Path(output))
+        if not dem_path.exists():
+            bounds = _cli_dem_bounds(roi_box, _as_path_list(reference))
+            dem_path = get_dem_manager().fetch_dem(bounds, dem_path)
         dem_sampler = GeoidAdjustedDEM(
-            RasterDEM(path=dem, interpolation="biquintic"), EGM96Geoid()
+            RasterDEM(path=dem_path, interpolation="biquintic"), EGM96Geoid()
         )
 
     state = run_pair(
@@ -133,7 +192,7 @@ def run_frame_cli(
         _as_path_list(secondary),
         output_dir=Path(output),
         dem=dem_sampler,
-        roi=_parse_roi(roi),
+        roi=roi_box,
         swaths=tuple(name.strip() for name in swaths.split(",") if name.strip()),
         bursts=_parse_burst_selection(bursts),
         multilook=(az_looks, rg_looks),
