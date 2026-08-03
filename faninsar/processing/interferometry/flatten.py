@@ -1190,16 +1190,9 @@ def copernicus_glo30_dem(
 
     """
     base = Path(base_path)
-    lat_tile = int(np.floor(latitude_deg))
-    lon_tile = int(np.floor(longitude_deg))
-    ns = "N" if lat_tile >= 0 else "S"
-    ew = "E" if lon_tile >= 0 else "W"
-    lat_abs = abs(lat_tile)
-    lon_abs = abs(lon_tile)
-    filename = (
-        f"Copernicus_DSM_COG_10_{ns}{lat_abs:02d}_00_{ew}{lon_abs:03d}_00_DEM.tif"
-    )
-    tile_dir = f"{ns}{lat_abs:02d}_{ew}{lon_abs:03d}"
+    from faninsar.processing.geometry.dem_manager import copernicus_tile_name
+
+    tile_dir, filename = copernicus_tile_name(latitude_deg, longitude_deg)
     candidates = [
         base / filename,
         base / tile_dir / filename,

@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from .baseline import BaselineComponents, geometric_baseline, zero_doppler_residual_hz
 from .dem import ConstantHeightDEM, GeoidAdjustedDEM, NetCDFGeoid, RasterDEM
+from .dem_manager import (
+    DEMManager,
+    copernicus_tile_name,
+    default_dem_name,
+    get_dem_manager,
+)
 from .ellipsoid import (
     WGS84_A_M,
     WGS84_E2,
@@ -34,6 +40,7 @@ __all__ = [
     "WGS84_F",
     "BaselineComponents",
     "ConstantHeightDEM",
+    "DEMManager",
     "GeoidAdjustedDEM",
     "NetCDFGeoid",
     "OrbitInterpolationError",
@@ -43,9 +50,12 @@ __all__ = [
     "RasterDEM",
     "TransformCacheKey",
     "TransformResult",
+    "copernicus_tile_name",
+    "default_dem_name",
     "ecef_to_llh",
     "geo2rdr",
     "geometric_baseline",
+    "get_dem_manager",
     "interpolate_orbit",
     "llh_to_ecef",
     "local_earth_radius_m",
