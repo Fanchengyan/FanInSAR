@@ -58,9 +58,9 @@ for tile_dir, filename in tiles:
 
 Each entry is a `(tile_dir, filename)` pair following the COG convention, for
 example `("N38_E097", "Copernicus_DSM_COG_10_N38_00_E097_00_DEM.tif")`. Tiles
-are indexed by `floor(lat)` / `floor(lon)`, so a degree-sized extent maps to one
-tile per integer degree cell it touches. The exported `copernicus_tile_name(lat,
-lon)` helper returns the same pair for a single coordinate.
+follow the one-degree Copernicus GLO-30 grid. The exported
+`copernicus_tile_name(lat, lon)` helper returns the same pair for a single
+coordinate.
 
 ## Cache behavior
 
@@ -71,14 +71,12 @@ same time:
 - per-tile folders: `dem_cache/N38_E097/Copernicus_DSM_COG_10_N38_00_E097_00_DEM.tif`
 
 ```{note}
-A cache hit requires a file of at least 1 MiB. This guard rejects empty or
-partial stubs so a broken download can never mask a missing tile.
+Tiles smaller than 1 MiB are treated as missing and downloaded again.
 ```
 
 A tile already in the cache is never re-downloaded: `fetch_dem` logs a cache hit
 and moves on. Missing tiles are downloaded into `cache/<tile_dir>/<filename>`
-through a temporary `.part` file that is atomically renamed only after the
-transfer completes, with up to three attempts. Downloads come from
+with up to three attempts. Downloads come from
 `https://copernicus-dem-30m.s3.amazonaws.com` by default; pass `source_url=` to
 `DEMManager` or set `FANINSAR_DEM_SOURCE_URL` to use a mirror.
 
@@ -117,10 +115,9 @@ heights = dem.sample(latitudes, longitudes)
 ## Use it automatically in the pipeline
 
 With `FANINSAR_DEM_CACHE_DIR` set, `run_pair(..., dem=None)` resolves the DEM by
-itself: it computes the AOI from the ROI bounds, or from the union of the
-selected bursts' footprints plus 0.01 deg padding when no ROI is given, builds
-the mosaic at `<output_dir>/dem/<name>`, and wraps it in the EGM96 geoid
-correction automatically.
+itself: it determines the coverage from the ROI (or from the selected bursts
+when no ROI is given), builds the mosaic at `<output_dir>/dem/<name>`, and uses
+it for the pair.
 
 ```python
 from faninsar.processing.pipeline import run_pair
@@ -137,8 +134,7 @@ state = run_pair(
 
 ```{tip}
 Only the tile cache directory is required. When `FANINSAR_DEM_CACHE_DIR` is not
-set, `run_pair` keeps the historical zero/ellipsoid fallback, so automatic DEM
-resolution never breaks existing callers.
+set, `run_pair` keeps its previous behavior.
 ```
 
 The `faninsar frame` CLI exposes the same flow: pass `--dem name.tif` with a
