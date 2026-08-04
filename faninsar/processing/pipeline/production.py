@@ -5,7 +5,9 @@ from __future__ import annotations
 import gc
 import os
 import shutil
+import tempfile
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -80,6 +82,169 @@ logger = setup_logger(__name__)
 SPEED_OF_LIGHT_M_S = 299_792_458.0
 ScopeMode = Literal["burst", "swath"]
 CoregistrationGrid = Literal["radar", "geo"]
+
+
+def looks_dir(azimuth_looks: int, range_looks: int) -> str:
+    """Return the deterministic per-config output subtree name."""
+    return f"looks_{azimuth_looks}x{range_looks}"
+
+
+def _is_multilook_pair(value: object) -> bool:
+    """Return whether the multilook argument is one (az, rg) pair."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return False
+    return all(isinstance(part, int) and not isinstance(part, bool) for part in value)
+
+
+def normalize_multilook_sweep(value: object) -> list[tuple[int, int]]:
+    """Normalize a multilook sweep specification into validated configs."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        message = "multilook must be an iterable of [azimuth_looks, range_looks] pairs"
+        raise TypeError(message)
+    configs: list[tuple[int, int]] = []
+    for item in value:
+        if isinstance(item, (str, bytes)) or not isinstance(item, (list, tuple)):
+            message = f"each multilook config must be a [az, rg] pair; got {item!r}"
+            raise TypeError(message)
+        if len(item) != 2:
+            message = f"each multilook config must be a [az, rg] pair; got {item!r}"
+            raise ValueError(message)
+        azimuth_looks, range_looks = item
+        if (
+            isinstance(azimuth_looks, bool)
+            or isinstance(range_looks, bool)
+            or not isinstance(azimuth_looks, int)
+            or not isinstance(range_looks, int)
+        ):
+            message = f"multilook factors must be integers; got {item!r}"
+            raise TypeError(message)
+        if azimuth_looks < 1 or range_looks < 1:
+            message = f"multilook factors must be >= 1; got {item!r}"
+            raise ValueError(message)
+        configs.append((azimuth_looks, range_looks))
+    if not configs:
+        message = "multilook must contain at least one config"
+        raise ValueError(message)
+    deduplicated = list(dict.fromkeys(configs))
+    if len(deduplicated) != len(configs):
+        message = f"duplicate multilook configs are not allowed: {configs!r}"
+        raise ValueError(message)
+    return deduplicated
+
+
+@dataclass(frozen=True, slots=True)
+class PairSweepOutcome:
+    """Lightweight per-config outputs of a multilook pair sweep."""
+
+    config: tuple[int, int]
+    zarr_path: Path
+    stac_path: Path
+    shape: tuple[int, int]
+    metadata: dict[str, Any]
+    stage_timings_s: dict[str, float]
+    log: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionPairSweepResult:
+    """Outputs of a multilook sweep over one reference/secondary pair."""
+
+    pair_id: str
+    per_config: dict[tuple[int, int], PairSweepOutcome]
+
+
+@dataclass
+class SharedPairResources:
+    """Ownership bundle for the shared pair prefix used by sweeps."""
+
+    prefix_state: ProductionPairState | None = None
+    temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+    ifg_archive: dict[str, Any] | None = None
+
+    def cleanup(self) -> None:
+        """Release shared arrays and remove the geo work dir exactly once."""
+        candidates: list[np.ndarray | None] = []
+        state = self.prefix_state
+        if state is not None and state.geo2rdr_lut is not None:
+            candidates.extend(
+                (
+                    state.geo2rdr_lut.az_full,
+                    state.geo2rdr_lut.rg_full,
+                    state.geo2rdr_lut.valid,
+                    state.geo2rdr_lut.height_full,
+                )
+            )
+            state.geo2rdr_lut = None
+        if state is not None:
+            for name in (
+                "reference_geocoded_slc",
+                "secondary_geocoded_slc",
+                "geocoded_slc_valid",
+                "topo_phase",
+                "geo_height_field",
+                "reference_deramped",
+                "secondary_aligned",
+            ):
+                candidates.append(getattr(state, name))
+                setattr(state, name, None)
+        closed: set[int] = set()
+        for array in candidates:
+            if not isinstance(array, np.memmap) or id(array) in closed:
+                continue
+            mapping = getattr(array, "_mmap", None)
+            if mapping is None or mapping.closed:
+                continue
+            closed.add(id(array))
+            close_memmap(array)
+        temporary_directory = self.temporary_directory
+        self.temporary_directory = None
+        gc.collect()
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
+
+
+def _output_bytes(path: Path) -> int:
+    """Return total bytes of a Zarr store on disk."""
+    if path.is_file():
+        return path.stat().st_size
+    if not path.is_dir():
+        return 0
+    return sum(
+        item.stat().st_size
+        for item in path.rglob("*")
+        if item.is_file() and not item.is_symlink()
+    )
+
+
+def _write_run_manifest(
+    output_dir: str | Path,
+    *,
+    looks: tuple[int, int],
+    pair_id: str,
+    products: list[str],
+    grid: dict[str, object],
+) -> Path:
+    """Atomically write a run.json completion manifest for one config."""
+    import json
+    from datetime import UTC
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": "1",
+        "status": "complete",
+        "looks": [looks[0], looks[1]],
+        "pair_id": pair_id,
+        "products": products,
+        "product_bytes": {name: _output_bytes(out / name) for name in products},
+        "grid": grid,
+        "created_utc": datetime.now(UTC).isoformat(),
+    }
+    temporary = out / "run.json.tmp"
+    target = out / "run.json"
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
+    return target
 
 
 def _scene_id(path: Path) -> str:
@@ -1094,7 +1259,11 @@ def stage_geocode(
 
 
 def stage_write(
-    state: ProductionPairState, output_dir: str | Path
+    state: ProductionPairState,
+    output_dir: str | Path,
+    *,
+    preserve_geo_work_dir: bool = False,
+    stac_item_id: str | None = None,
 ) -> ProductionPairState:
     """Write radar products, geocoded layers, baselines, and STAC with bbox."""
     if (
@@ -1327,7 +1496,7 @@ def stage_write(
             item = {
                 "type": "Feature",
                 "stac_version": "1.0.0",
-                "id": state.pair_id,
+                "id": stac_item_id if stac_item_id is not None else state.pair_id,
                 "geometry": geometry,
                 "bbox": bbox,
                 "properties": {
@@ -1355,15 +1524,17 @@ def stage_write(
             }
             stac_path.write_text(json.dumps(item, indent=2) + "\n", encoding="utf-8")
         else:
-            write_pair_stac_item(product, zarr_path, stac_path)
+            write_pair_stac_item(
+                product, zarr_path, stac_path, stac_item_id=stac_item_id
+            )
     else:
-        write_pair_stac_item(product, zarr_path, stac_path)
+        write_pair_stac_item(product, zarr_path, stac_path, stac_item_id=stac_item_id)
 
     state.zarr_path = zarr_path
     state.stac_path = stac_path
     if state.memory_watchdog is not None:
         state.memory_watchdog.sample("write:complete")
-    if state.geo_work_dir is not None:
+    if state.geo_work_dir is not None and not preserve_geo_work_dir:
         work_directory = state.geo_work_dir
         state.reference_geocoded_slc = None
         state.secondary_geocoded_slc = None
@@ -1441,6 +1612,48 @@ def _multilook_real_field(
         ),
         axis=(1, 3),
     )
+
+
+def _finalize_geo_products(
+    state: ProductionPairState,
+    *,
+    geo_grid: GeoGridSpec,
+    multilook: tuple[int, int],
+    geo_height_m: float,
+) -> ProductionPairState:
+    """Assemble the multilooked geographic product grid from unwrapped phase."""
+    from faninsar.processing.pipeline.geo_lut import grid_lonlat
+
+    assert state.unwrapped_phase is not None
+    assert state.coherence is not None
+    assert state.wrapped_phase is not None
+    product_grid = _multilooked_geo_grid(geo_grid, multilook)
+    lat, lon = grid_lonlat(product_grid)
+    converged = np.isfinite(state.unwrapped_phase).astype(np.uint8)
+    height_field = state.geo_height_field
+    if height_field is None:
+        height_field = np.full(
+            product_grid.shape,
+            float(geo_height_m),
+            dtype=np.float64,
+        )
+    elif height_field.shape != product_grid.shape:
+        height_field = _multilook_real_field(height_field, multilook)
+    state.geocoded = {
+        "unwrapped_phase": np.asarray(state.unwrapped_phase, dtype=np.float32),
+        "coherence": np.asarray(state.coherence, dtype=np.float32),
+        "wrapped_phase": np.asarray(state.wrapped_phase, dtype=np.float32),
+        "latitude_deg": lat.astype(np.float64),
+        "longitude_deg": lon.astype(np.float64),
+        "height_m": np.asarray(height_field, dtype=np.float64),
+        "converged": converged,
+    }
+    if isinstance(state.geo_height_field, np.memmap):
+        close_memmap(state.geo_height_field)
+        state.geo_height_field = None
+    state.geo_grid_meta = _geo_grid_meta(product_grid)
+    state.note("GEO products complete on multilooked geographic grid")
+    return state
 
 
 BurstSelection = (
@@ -1763,7 +1976,8 @@ def run_pair(
     swaths: tuple[str, ...] | None = None,
     bursts: BurstSelection | None = None,
     dem: DEMSampler | None = None,
-    multilook: tuple[int, int] = (2, 10),
+    multilook: tuple[int, int] | Iterable[tuple[int, int]] = (2, 10),
+    overwrite: bool = False,
     goldstein_alpha: float = 0.5,
     dead_pixel_amp_threshold: float = 3.0,
     esd_enabled: bool = False,
@@ -1771,11 +1985,19 @@ def run_pair(
     control_spacing: int | None = None,
     executor: str = "torch",
     device: str = "auto",
+    coregistration_grid: CoregistrationGrid = "radar",
+    geo_grid: GeoGridSpec | None = None,
+    geo_height_m: float = 0.0,
+    geo_chunk_size: int = 128,
+    geo_work_dir: str | Path | None = None,
+    snaphu_config: SnaphuConfig | None = None,
+    unwrap_method: UnwrapBackend | None = None,
+    irls_kwargs: dict[str, Any] | None = None,
     reference_orbit_path: str | Path | Sequence[str | Path] | None = None,
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
-) -> ProductionPairState:
+) -> ProductionPairState | ProductionPairSweepResult:
     """Process any burst selection across frames and swaths into one product.
 
     Parameters
@@ -1801,8 +2023,11 @@ def run_pair(
     dem : DEMSampler, optional
         DEM for coregistration, flattening, and geometry. Defaults to a zero
         ellipsoid.
-    multilook : tuple[int, int], optional
-        (az, rg) looks applied while accumulating the merged frame.
+    multilook : tuple[int, int] or iterable of pairs, optional
+        One (az, rg) pair for a single product, or an iterable of pairs to
+        emit one product per configuration (sweep mode).
+    overwrite : bool, optional
+        Sweep mode only: replace existing looks_{az}x{rg} subtrees.
     goldstein_alpha : float, optional
         Goldstein filter exponent applied to the merged product.
     dead_pixel_amp_threshold : float, optional
@@ -1817,21 +2042,70 @@ def run_pair(
         Resample executor.
     device : {"auto","cpu","cuda","mps"}, optional
         Torch device.
+    coregistration_grid : {"radar", "geo"}, optional
+        Coordinate grid on which the pair is coregistered. Geo requires
+        geo_grid and is available for single-config runs.
+    geo_grid : GeoGridSpec, optional
+        Geographic product grid required for coregistration_grid="geo".
+    geo_height_m : float, optional
+        Fallback constant height (m) when the DEM is unavailable for geo2rdr.
+    geo_chunk_size : int, optional
+        Row chunk shared by geo2rdr and SLC remapping in geo mode.
+    geo_work_dir : path, optional
+        Working directory for geo memmaps; a temporary directory is used
+        when omitted.
+    snaphu_config : SnaphuConfig, optional
+        SNAPHU configuration; nlooks defaults to az * rg per config.
+    unwrap_method : {"irls", "snaphu"}, optional
+        Unwrapping backend when unwrap=True.
+    irls_kwargs : dict, optional
+        Arguments forwarded to the IRLS unwrap backend.
     reference_orbit_path, secondary_orbit_path : path or sequence, optional
         Precise ESA EOF orbits; one per frame or a single orbit reused for
         every frame.
     unwrap : bool, optional
-        Run SNAPHU unwrapping on the merged wrapped phase when True.
+        Run unwrapping on the merged wrapped phase when True.
     geoid_correction : bool, optional
         Convert orthometric raster DEM heights to ellipsoidal with EGM96.
         Default True.
 
     Returns
     -------
-    ProductionPairState
-        State with the merged wrapped/filtered product and stage timings.
+    ProductionPairState or ProductionPairSweepResult
+        Single-config state, or per-config outcomes for a sweep.
 
     """
+    if not _is_multilook_pair(multilook) or coregistration_grid == "geo":
+        return _run_pair_sweep(
+            reference_path,
+            secondary_path,
+            output_dir=output_dir,
+            roi=roi,
+            swaths=swaths,
+            bursts=bursts,
+            dem=dem,
+            multilook=multilook,
+            overwrite=overwrite,
+            goldstein_alpha=goldstein_alpha,
+            dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            esd_enabled=esd_enabled,
+            amplitude_refinement_enabled=amplitude_refinement_enabled,
+            control_spacing=control_spacing,
+            executor=executor,
+            device=device,
+            coregistration_grid=coregistration_grid,
+            geo_grid=geo_grid,
+            geo_height_m=geo_height_m,
+            geo_chunk_size=geo_chunk_size,
+            geo_work_dir=geo_work_dir,
+            snaphu_config=snaphu_config,
+            unwrap_method=unwrap_method,
+            irls_kwargs=irls_kwargs,
+            reference_orbit_path=reference_orbit_path,
+            secondary_orbit_path=secondary_orbit_path,
+            unwrap=unwrap,
+            geoid_correction=geoid_correction,
+        )
     from faninsar.missions.sentinel1.safe import open_safe_product
     from faninsar.processing.geometry.egm96 import EGM96Geoid
 
@@ -1994,6 +2268,8 @@ def run_pair(
         for _, _, azimuth_offset in units
     )
     frame_cols = max(range_offsets[swath] + burst_width[swath] for swath in swath_tuple)
+    if not _is_multilook_pair(multilook):
+        reject_invalid_state("internal error: single-config multilook must be a pair")
     az_looks, rg_looks = int(multilook[0]), int(multilook[1])
     out_rows = frame_rows // az_looks
     out_cols = frame_cols // rg_looks
@@ -2261,10 +2537,15 @@ def run_pair(
     if unwrap:
         from faninsar.processing.unwrap import SnaphuConfig
 
+        method: UnwrapBackend = unwrap_method if unwrap_method is not None else "snaphu"
+        config_for_unwrap = snaphu_config
+        if config_for_unwrap is None:
+            config_for_unwrap = SnaphuConfig(nlooks=float(az_looks * rg_looks))
         result = stage_unwrap(
             result,
-            method="snaphu",
-            config=SnaphuConfig(nlooks=float(az_looks * rg_looks)),
+            method=method,
+            config=config_for_unwrap,
+            irls_kwargs=irls_kwargs,
         )
         result.note("UNWRAP complete on merged product")
     else:
@@ -2273,3 +2554,1009 @@ def run_pair(
         result.note("UNWRAP skipped (unwrap=False)")
     stage_write(result, output_dir)
     return result
+
+
+def _run_pair_sweep(
+    reference_path: str | Path | Sequence[str | Path],
+    secondary_path: str | Path | Sequence[str | Path],
+    *,
+    output_dir: str | Path,
+    roi: BoundingBox | Polygons | None,
+    swaths: tuple[str, ...] | None,
+    bursts: BurstSelection | None,
+    dem: DEMSampler | None,
+    multilook: object,
+    overwrite: bool,
+    goldstein_alpha: float,
+    dead_pixel_amp_threshold: float,
+    esd_enabled: bool,
+    amplitude_refinement_enabled: bool,
+    control_spacing: int | None,
+    executor: str,
+    device: str,
+    coregistration_grid: CoregistrationGrid,
+    geo_grid: GeoGridSpec | None,
+    geo_height_m: float,
+    geo_chunk_size: int,
+    geo_work_dir: str | Path | None,
+    snaphu_config: SnaphuConfig | None,
+    unwrap_method: UnwrapBackend | None,
+    irls_kwargs: dict[str, Any] | None,
+    reference_orbit_path: str | Path | Sequence[str | Path] | None,
+    secondary_orbit_path: str | Path | Sequence[str | Path] | None,
+    unwrap: bool,
+    geoid_correction: bool,
+) -> ProductionPairSweepResult:
+    """Run one shared prefix and emit every look configuration."""
+    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.geometry.egm96 import EGM96Geoid
+
+    if _is_multilook_pair(multilook):
+        configs = [tuple(int(part) for part in multilook)]
+    else:
+        configs = normalize_multilook_sweep(multilook)
+    if coregistration_grid == "geo" and geo_grid is None:
+        reject_invalid_state("coregistration_grid='geo' requires geo_grid")
+    output_root = Path(output_dir)
+    existing = [
+        looks_dir(az, rg)
+        for az, rg in configs
+        if (output_root / looks_dir(az, rg)).exists()
+    ]
+    if existing and not overwrite:
+        reject_invalid_state(
+            "multilook sweep targets already exist; pass overwrite=True: "
+            + ", ".join(existing)
+        )
+
+    dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    if geoid_correction and isinstance(dem_sampler, RasterDEM):
+        dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
+
+    ref_paths = _as_frame_paths(reference_path, "reference_path")
+    sec_paths = _as_frame_paths(secondary_path, "secondary_path")
+    if len(ref_paths) != len(sec_paths):
+        reject_invalid_state(
+            "reference/secondary frame counts differ: "
+            + str(len(ref_paths))
+            + " vs "
+            + str(len(sec_paths))
+        )
+    frame_count = len(ref_paths)
+    ref_orbits = _as_optional_frame_sequence(
+        reference_orbit_path, frame_count, "reference_orbit_path"
+    )
+    sec_orbits = _as_optional_frame_sequence(
+        secondary_orbit_path, frame_count, "secondary_orbit_path"
+    )
+    reference_products = [open_safe_product(path) for path in ref_paths]
+    secondary_products = [open_safe_product(path) for path in sec_paths]
+    if swaths is None:
+        ordered = sorted(
+            reference_products[0].swaths,
+            key=lambda item: item.slant_range_time_s,
+        )
+        swath_tuple = tuple(item.swath for item in ordered)
+    else:
+        swath_tuple = tuple(swaths)
+    if not swath_tuple:
+        reject_invalid_state("swaths must not be empty")
+    for frame_index, product in enumerate(reference_products):
+        present = {item.swath for item in product.swaths}
+        missing = [name for name in swath_tuple if name not in present]
+        if missing:
+            reject_invalid_state(
+                "reference frame "
+                + str(frame_index)
+                + " ("
+                + ref_paths[frame_index].name
+                + ") missing swaths "
+                + str(missing)
+                + "; available="
+                + str(sorted(present))
+            )
+    for frame_index, product in enumerate(secondary_products):
+        present = {item.swath for item in product.swaths}
+        missing = [name for name in swath_tuple if name not in present]
+        if missing:
+            reject_invalid_state(
+                "secondary frame "
+                + str(frame_index)
+                + " ("
+                + sec_paths[frame_index].name
+                + ") missing swaths "
+                + str(missing)
+                + "; available="
+                + str(sorted(present))
+            )
+
+    if roi is not None:
+        logger.info("run_pair: ROI provided; explicit swaths/bursts selection ignored")
+        ordered = sorted(
+            reference_products[0].swaths,
+            key=lambda item: item.slant_range_time_s,
+        )
+        swath_tuple = tuple(item.swath for item in ordered)
+        resolved = _select_bursts_by_roi(roi, ref_paths, swath_tuple)
+    else:
+        burst_counts = {
+            (frame_index, swath): len(
+                reference_products[frame_index].swath(swath).bursts
+            )
+            for frame_index in range(frame_count)
+            for swath in swath_tuple
+        }
+        resolved = _normalize_burst_selection(
+            bursts, frame_count, swath_tuple, burst_counts
+        )
+
+    common_aligned: dict[tuple[int, str], list[int]] = {}
+    for frame_index in range(frame_count):
+        for swath in swath_tuple:
+            reference_swath = reference_products[frame_index].swath(swath)
+            secondary_swath = secondary_products[frame_index].swath(swath)
+            common = _common_burst_indices(reference_swath, secondary_swath)
+            selected = [
+                index for index in resolved[(frame_index, swath)] if index in common
+            ]
+            if not selected:
+                reject_invalid_state(
+                    "no common bursts between reference/secondary frame "
+                    + str(frame_index)
+                    + " swath "
+                    + swath
+                )
+            common_aligned[(frame_index, swath)] = selected
+    resolved = common_aligned
+
+    if dem is None and os.environ.get("FANINSAR_DEM_CACHE_DIR"):
+        from faninsar.processing.geometry.dem_manager import (
+            default_dem_name,
+            get_dem_manager,
+        )
+
+        bounds = _auto_dem_bounds(roi, resolved, reference_products)
+        dem_path = get_dem_manager().fetch_dem(
+            bounds, output_root / "dem" / default_dem_name()
+        )
+        logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
+        dem_sampler = RasterDEM(dem_path, interpolation="biquintic")
+        if geoid_correction:
+            dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
+
+    range_offsets = _swath_range_offsets(swath_tuple, reference_products)
+    reference_swath0 = reference_products[0].swath(swath_tuple[0])
+    dt = reference_swath0.azimuth_time_interval_s
+    burst_lines = {
+        swath: reference_products[0].swath(swath).lines_per_burst
+        for swath in swath_tuple
+    }
+    burst_width = {
+        swath: reference_products[0].swath(swath).samples_per_burst
+        for swath in swath_tuple
+    }
+    azimuth_origin = min(
+        reference_products[frame_index].swath(swath).bursts[burst_index].azimuth_time
+        for (frame_index, swath), indices in resolved.items()
+        for burst_index in indices
+    )
+    units_by_swath: dict[str, list[tuple[int, int, int]]] = {}
+    for swath in swath_tuple:
+        units: list[tuple[int, int, int]] = []
+        for (frame_index, swath_key), indices in resolved.items():
+            if swath_key != swath:
+                continue
+            swath_obj = reference_products[frame_index].swath(swath)
+            for burst_index in indices:
+                azimuth_offset = round(
+                    (
+                        swath_obj.bursts[burst_index].azimuth_time - azimuth_origin
+                    ).total_seconds()
+                    / dt
+                )
+                units.append((frame_index, burst_index, azimuth_offset))
+        units.sort(key=lambda unit: unit[2], reverse=True)
+        units_by_swath[swath] = units
+
+    frame_rows = max(
+        azimuth_offset + burst_lines[swath]
+        for swath, units in units_by_swath.items()
+        for _, _, azimuth_offset in units
+    )
+    frame_cols = max(range_offsets[swath] + burst_width[swath] for swath in swath_tuple)
+
+    temporary = tempfile.TemporaryDirectory(prefix="faninsar-sweep-")
+    resolved_geo_work_dir: Path | None = None
+    if coregistration_grid == "geo":
+        if geo_work_dir is None:
+            resolved_geo_work_dir = Path(temporary.name)
+        else:
+            resolved_geo_work_dir = Path(geo_work_dir)
+            resolved_geo_work_dir.mkdir(parents=True, exist_ok=True)
+    resources = SharedPairResources(temporary_directory=temporary)
+    try:
+        archive = _archive_burst_ifgs(
+            Path(temporary.name),
+            ref_paths=ref_paths,
+            sec_paths=sec_paths,
+            ref_orbits=ref_orbits,
+            sec_orbits=sec_orbits,
+            reference_products=reference_products,
+            secondary_products=secondary_products,
+            swath_tuple=swath_tuple,
+            units_by_swath=units_by_swath,
+            roi=roi,
+            dem_sampler=dem_sampler,
+            control_spacing=control_spacing,
+            esd_enabled=esd_enabled,
+            amplitude_refinement_enabled=amplitude_refinement_enabled,
+            executor=executor,
+            device=device,
+            dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            coregistration_grid=coregistration_grid,
+            geo_grid=geo_grid,
+            geo_height_m=geo_height_m,
+            geo_chunk_size=geo_chunk_size,
+            geo_work_dir=resolved_geo_work_dir,
+        )
+        resources.ifg_archive = archive
+        pair_id = _scene_id(ref_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair"
+        per_config: dict[tuple[int, int], PairSweepOutcome] = {}
+        for config in configs:
+            az_looks, rg_looks = config
+            merged = _merge_burst_ifgs(
+                archive,
+                swath_tuple=swath_tuple,
+                range_offsets=range_offsets,
+                burst_lines=burst_lines,
+                burst_width=burst_width,
+                frame_rows=frame_rows,
+                frame_cols=frame_cols,
+                az_looks=az_looks,
+                rg_looks=rg_looks,
+                geo_grid=geo_grid,
+            )
+            outcome = _finalize_sweep_config(
+                merged,
+                config=config,
+                pair_id=pair_id,
+                output_root=output_root,
+                goldstein_alpha=goldstein_alpha,
+                snaphu_config=snaphu_config,
+                unwrap_method=unwrap_method,
+                irls_kwargs=irls_kwargs,
+                unwrap=unwrap,
+                geo_height_m=geo_height_m,
+            )
+            per_config[config] = outcome
+        return ProductionPairSweepResult(pair_id=pair_id, per_config=per_config)
+    finally:
+        resources.cleanup()
+
+
+def _archive_burst_ifgs(
+    work_dir: Path,
+    *,
+    ref_paths: Sequence[str | Path],
+    sec_paths: Sequence[str | Path],
+    ref_orbits: Sequence[Path | None],
+    sec_orbits: Sequence[Path | None],
+    reference_products: Sequence[object],
+    secondary_products: Sequence[object],
+    swath_tuple: tuple[str, ...],
+    units_by_swath: dict[str, list[tuple[int, int, int]]],
+    roi: BoundingBox | Polygons | None,
+    dem_sampler: DEMSampler,
+    control_spacing: int | None,
+    esd_enabled: bool,
+    amplitude_refinement_enabled: bool,
+    executor: str,
+    device: str,
+    dead_pixel_amp_threshold: float,
+    coregistration_grid: CoregistrationGrid,
+    geo_grid: GeoGridSpec | None,
+    geo_height_m: float,
+    geo_chunk_size: int,
+    geo_work_dir: Path | None,
+) -> dict[str, Any]:
+    """Process every burst unit once and store flat IFGs on disk.
+
+    Radar units are archived in radar geometry with burst placement offsets.
+    Geographic units (``coregistration_grid="geo"``) are coregistered onto
+    the shared ``geo_grid`` and archived as valid-bounding-box crops of the
+    geocoded interferogram, per-unit power, and DEM height field.
+    """
+    from faninsar.missions.sentinel1 import read_eof_orbit, read_full_burst
+    from faninsar.processing.tops.carrier import carrier_from_swath
+
+    if coregistration_grid == "geo" and (geo_grid is None or geo_work_dir is None):
+        reject_invalid_state("geo coregistration requires geo_grid and geo_work_dir")
+
+    ifg_dir = work_dir / "ifgs"
+    ifg_dir.mkdir(parents=True, exist_ok=True)
+    units: list[dict[str, Any]] = []
+    per_burst_timings: dict[str, dict[str, float]] = {}
+    origin_state: ProductionPairState | None = None
+    prefix_started = time.perf_counter()
+
+    def load_burst(
+        swath: str,
+        burst_index: int,
+        path: Path,
+        orbit_path: Path | None,
+        product: object,
+    ) -> ProductionScene:
+        s1_swath = product.swath(swath)
+        if orbit_path is not None:
+            s1_swath = replace(s1_swath, orbit=read_eof_orbit(orbit_path))
+        array = read_full_burst(s1_swath, burst_index=burst_index, full_range=True)
+        burst = s1_swath.bursts[burst_index]
+        carrier = carrier_from_swath(s1_swath, burst, first_range_sample=array.col0)
+        geometry = _radar_model(
+            s1_swath,
+            burst,
+            shape=array.samples.shape,
+            row0=array.row0,
+            col0=array.col0,
+        )
+        return ProductionScene(
+            scene_id=_scene_id(path),
+            path=path,
+            product=product,
+            swath=s1_swath,
+            burst=burst,
+            array=array,
+            carrier=carrier,
+            geometry=geometry,
+        )
+
+    for swath in reversed(swath_tuple):
+        for frame_index, burst_index, azimuth_offset in units_by_swath[swath]:
+            tag = "f" + str(frame_index) + "_" + swath + "_b" + str(burst_index)
+            ref = load_burst(
+                swath,
+                burst_index,
+                ref_paths[frame_index],
+                ref_orbits[frame_index],
+                reference_products[frame_index],
+            )
+            sec = load_burst(
+                swath,
+                burst_index,
+                sec_paths[frame_index],
+                sec_orbits[frame_index],
+                secondary_products[frame_index],
+            )
+            state = ProductionPairState(
+                pair_id=ref.scene_id + "_" + sec.scene_id + "_" + tag,
+                reference=ref,
+                secondary=sec,
+                dem=dem_sampler,
+                coregistration_grid="radar",
+                multilook=(1, 1),
+                goldstein_alpha=0.0,
+                unwrap_method="snaphu",
+            )
+            if frame_index == 0 and swath == swath_tuple[0] and burst_index == 0:
+                origin_state = state
+            stage_times: dict[str, float] = {}
+            t0 = time.perf_counter()
+            state = stage_deramp(state)
+            stage_times["deramp"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            state = stage_coregister(
+                state,
+                control_spacing=control_spacing,
+                esd_enabled=esd_enabled,
+                amplitude_refinement_enabled=amplitude_refinement_enabled,
+                executor=executor,
+                device=device,
+                coregistration_grid=coregistration_grid,
+                geo_grid=geo_grid,
+                geo_height_m=geo_height_m,
+                geo_chunk_size=geo_chunk_size,
+                geo_work_dir=geo_work_dir,
+            )
+            stage_times["coregister"] = time.perf_counter() - t0
+            burst_row0 = 0
+            burst_col0 = 0
+            geo_valid_mask: np.ndarray | None = None
+            if coregistration_grid == "geo":
+                if state.geocoded_slc_valid is not None:
+                    geo_valid_mask = np.asarray(state.geocoded_slc_valid)
+            elif roi is not None:
+                assert state.reference_deramped is not None
+                window = _roi_burst_window(
+                    roi,
+                    ref.geometry,
+                    dem_sampler,
+                    state.reference_deramped.shape,
+                )
+                if window is not None:
+                    burst_row0, burst_row1, burst_col0, burst_col1 = window
+                    state.reference_deramped = state.reference_deramped[
+                        burst_row0:burst_row1, burst_col0:burst_col1
+                    ]
+                    state.secondary_aligned = state.secondary_aligned[
+                        burst_row0:burst_row1, burst_col0:burst_col1
+                    ]
+            assert state.reference_deramped is not None
+            assert state.secondary_aligned is not None
+            pri_power = (
+                state.reference_deramped.real**2 + state.reference_deramped.imag**2
+            )
+            sec_power = (
+                state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
+            )
+            t0 = time.perf_counter()
+            state = stage_interferogram(
+                state,
+                multilook=(1, 1),
+                goldstein_alpha=0.0,
+                dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            )
+            stage_times["interferogram"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            if coregistration_grid == "geo":
+                state.complex_ifg_flat = state.complex_ifg
+                state.note(
+                    "FLATTEN applied to secondary geocoded SLC before IFG formation"
+                )
+                stage_times["flatten"] = 0.0
+            else:
+                state = stage_flatten(state)
+                stage_times["flatten"] = time.perf_counter() - t0
+            ifg_full = (
+                state.complex_ifg_flat
+                if state.complex_ifg_flat is not None
+                else state.complex_ifg
+            )
+            if ifg_full is None:
+                reject_invalid_state(tag + ": no interferogram produced")
+            per_burst_timings[tag] = stage_times
+
+            base = ifg_dir / tag
+            ifg_path = str(base) + ".complex64"
+            pri_path = str(base) + ".pri.f64"
+            sec_path = str(base) + ".sec.f64"
+            if coregistration_grid == "geo":
+                geo_valid = np.zeros(ifg_full.shape, dtype=bool)
+                if geo_valid_mask is not None:
+                    geo_valid = geo_valid_mask
+                geo_valid &= np.abs(ifg_full) > 0
+                if not geo_valid.any():
+                    logger.warning("%s: no valid geocoded footprint; skipped", tag)
+                    del pri_power, sec_power, ifg_full, state
+                    continue
+                rows_any = geo_valid.any(axis=1)
+                cols_any = geo_valid.any(axis=0)
+                row0 = int(np.argmax(rows_any))
+                row1 = int(rows_any.size - np.argmax(rows_any[::-1]))
+                col0 = int(np.argmax(cols_any))
+                col1 = int(cols_any.size - np.argmax(cols_any[::-1]))
+                height_path = str(base) + ".height.f64"
+                height_full = state.geo_height_field
+                if height_full is None:
+                    height_full = np.full(
+                        ifg_full.shape, float(geo_height_m), dtype=np.float64
+                    )
+                else:
+                    height_full = np.asarray(height_full, dtype=np.float64)
+                bbox_ifg = ifg_full[row0:row1, col0:col1]
+                bbox_pri = pri_power[row0:row1, col0:col1]
+                bbox_sec = sec_power[row0:row1, col0:col1]
+                bbox_height = height_full[row0:row1, col0:col1]
+                bbox_ifg.astype(np.complex64, copy=False).tofile(ifg_path)
+                bbox_pri.astype(np.float64, copy=False).tofile(pri_path)
+                bbox_sec.astype(np.float64, copy=False).tofile(sec_path)
+                bbox_height.astype(np.float64, copy=False).tofile(height_path)
+                units.append(
+                    {
+                        "tag": tag,
+                        "swath": swath,
+                        "frame_index": frame_index,
+                        "ifg_path": ifg_path,
+                        "pri_path": pri_path,
+                        "sec_path": sec_path,
+                        "height_path": height_path,
+                        "rows": int(bbox_ifg.shape[0]),
+                        "cols": int(bbox_ifg.shape[1]),
+                        "row0": row0,
+                        "col0": col0,
+                        "mode": "geo",
+                    }
+                )
+                del bbox_ifg, bbox_pri, bbox_sec, bbox_height
+                del pri_power, sec_power, ifg_full, state
+                logger.info("Archived %s into sweep prefix", tag)
+                continue
+            ifg_full.astype(np.complex64, copy=False).tofile(ifg_path)
+            pri_power.astype(np.float64, copy=False).tofile(pri_path)
+            sec_power.astype(np.float64, copy=False).tofile(sec_path)
+            units.append(
+                {
+                    "tag": tag,
+                    "swath": swath,
+                    "frame_index": frame_index,
+                    "ifg_path": ifg_path,
+                    "pri_path": pri_path,
+                    "sec_path": sec_path,
+                    "rows": int(ifg_full.shape[0]),
+                    "cols": int(ifg_full.shape[1]),
+                    "azimuth_offset": azimuth_offset,
+                    "burst_row0": burst_row0,
+                    "burst_col0": burst_col0,
+                }
+            )
+            del pri_power, sec_power, ifg_full, state
+            logger.info("Archived %s into sweep prefix", tag)
+
+    if origin_state is None:
+        reject_invalid_state("no burst units selected for processing")
+    return {
+        "units": units,
+        "origin_state": origin_state,
+        "per_burst_timings": per_burst_timings,
+        "prefix_started": prefix_started,
+        "grid_mode": "geo" if coregistration_grid == "geo" else "radar",
+        "geo_grid": geo_grid,
+    }
+
+
+def _merge_burst_ifgs(
+    archive: dict[str, Any],
+    *,
+    swath_tuple: tuple[str, ...],
+    range_offsets: dict[str, int],
+    burst_lines: dict[str, int],
+    burst_width: dict[str, int],
+    frame_rows: int,
+    frame_cols: int,
+    az_looks: int,
+    rg_looks: int,
+    geo_grid: GeoGridSpec | None = None,
+) -> dict[str, Any]:
+    """Replay archived flat IFGs into one merged product for a look config."""
+    units = archive["units"]
+    if archive.get("grid_mode") == "geo":
+        if geo_grid is None:
+            reject_invalid_state("geo merge requires geo_grid")
+        return _merge_geo_ifgs(
+            archive,
+            geo_grid=geo_grid,
+            az_looks=az_looks,
+            rg_looks=rg_looks,
+        )
+    out_rows = frame_rows // az_looks
+    out_cols = frame_cols // rg_looks
+    swath_rows = {
+        swath: (
+            max(
+                unit["azimuth_offset"] + burst_lines[swath]
+                for unit in units
+                if unit["swath"] == swath
+            )
+            // az_looks
+        )
+        for swath in swath_tuple
+    }
+    swath_cols = {
+        swath: (range_offsets[swath] + burst_width[swath]) // rg_looks
+        for swath in swath_tuple
+    }
+    ifc_acc = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.complex128)
+        for swath in swath_tuple
+    }
+    pri_pow_acc = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.float64)
+        for swath in swath_tuple
+    }
+    sec_pow_acc = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.float64)
+        for swath in swath_tuple
+    }
+    claimed = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.int32)
+        for swath in swath_tuple
+    }
+    looks_per_window = az_looks * rg_looks
+    for unit in units:
+        swath = unit["swath"]
+        rows = unit["rows"]
+        cols = unit["cols"]
+        ifg_full = np.fromfile(unit["ifg_path"], dtype=np.complex64).reshape(rows, cols)
+        pri_power = np.fromfile(unit["pri_path"], dtype=np.float64).reshape(rows, cols)
+        sec_power = np.fromfile(unit["sec_path"], dtype=np.float64).reshape(rows, cols)
+        valid = np.abs(ifg_full) > 0
+        r0 = unit["azimuth_offset"] + unit["burst_row0"]
+        c0 = range_offsets[swath] + unit["burst_col0"]
+        orow = (r0 + np.arange(rows))[:, None] // az_looks
+        ocol = (c0 + np.arange(cols))[None, :] // rg_looks
+        ocol_local = ocol - range_offsets[swath] // rg_looks
+        inb = (
+            (orow < swath_rows[swath])
+            & (ocol_local >= 0)
+            & (ocol_local < swath_cols[swath])
+            & valid
+        )
+        r_i, c_i = np.broadcast_arrays(orow, ocol_local)
+        r_v, c_v = r_i[inb], c_i[inb]
+        free = claimed[swath][r_v, c_v] < looks_per_window
+        r_f, c_f = r_v[free], c_v[free]
+        np.add.at(
+            ifc_acc[swath],
+            (r_f, c_f),
+            ifg_full[inb][free].astype(np.complex128),
+        )
+        np.add.at(pri_pow_acc[swath], (r_f, c_f), pri_power[inb][free])
+        np.add.at(sec_pow_acc[swath], (r_f, c_f), sec_power[inb][free])
+        np.add.at(claimed[swath], (r_f, c_f), 1)
+        del ifg_full, pri_power, sec_power
+
+    merged_ifg = np.zeros((out_rows, out_cols), dtype=np.complex64)
+    coherence = np.full((out_rows, out_cols), np.nan, dtype=np.float32)
+    for swath in swath_tuple:
+        has = claimed[swath] > 0
+        swath_ifg = np.where(
+            has, ifc_acc[swath] / np.where(has, claimed[swath], 1), 0
+        ).astype(np.complex64)
+        pri_ml = pri_pow_acc[swath] / np.where(has, claimed[swath], 1)
+        sec_ml = sec_pow_acc[swath] / np.where(has, claimed[swath], 1)
+        denom = np.sqrt(np.maximum(pri_ml * sec_ml, 1e-30))
+        swath_coh = np.clip(np.abs(swath_ifg) / denom, 0.0, 1.0).astype(np.float32)
+        col0 = range_offsets[swath] // rg_looks
+        rows = swath_ifg.shape[0]
+        cols = swath_ifg.shape[1]
+        col1 = min(col0 + cols, out_cols)
+        cols = col1 - col0
+        band = np.abs(swath_ifg[:rows, :cols]) > 0
+        merged_ifg[:rows, col0:col1][band] = swath_ifg[:rows, :cols][band]
+        coherence[:rows, col0:col1][band] = swath_coh[:rows, :cols][band]
+        del swath_ifg, swath_coh
+    invalid = np.abs(merged_ifg) <= 0
+    wrapped = np.where(invalid, np.nan, np.angle(merged_ifg).astype(np.float32))
+    frame_indices = {unit["frame_index"] for unit in units}
+    return {
+        "merged_ifg": merged_ifg,
+        "coherence": coherence,
+        "wrapped": wrapped,
+        "invalid": invalid,
+        "out_rows": out_rows,
+        "out_cols": out_cols,
+        "origin_state": archive["origin_state"],
+        "per_burst_timings": archive["per_burst_timings"],
+        "units": units,
+        "frame_count": max(frame_indices) + 1 if frame_indices else 0,
+        "total_seconds": time.perf_counter() - archive["prefix_started"],
+    }
+
+
+def _finalize_sweep_config(
+    merged: dict[str, Any],
+    *,
+    config: tuple[int, int],
+    pair_id: str,
+    output_root: Path,
+    goldstein_alpha: float,
+    snaphu_config: SnaphuConfig | None,
+    unwrap_method: UnwrapBackend | None,
+    irls_kwargs: dict[str, Any] | None,
+    unwrap: bool,
+    geo_height_m: float = 0.0,
+) -> PairSweepOutcome:
+    """Build the config product, write it, and record the completion manifest."""
+    az_looks, rg_looks = config
+    merged_ifg = merged["merged_ifg"]
+    coherence = merged["coherence"]
+    wrapped = merged["wrapped"]
+    invalid = merged["invalid"]
+    filtered = merged_ifg
+    if goldstein_alpha > 0.0:
+        from faninsar.processing.interferometry.pair import goldstein_filter
+
+        filtered = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
+
+    origin = merged["origin_state"]
+    if merged.get("grid_mode") == "geo":
+        return _finalize_geo_config(
+            merged,
+            config=config,
+            pair_id=pair_id,
+            output_root=output_root,
+            goldstein_alpha=goldstein_alpha,
+            snaphu_config=snaphu_config,
+            unwrap_method=unwrap_method,
+            irls_kwargs=irls_kwargs,
+            unwrap=unwrap,
+            geo_height_m=geo_height_m,
+        )
+    result = ProductionPairState(
+        pair_id=pair_id,
+        reference=origin.reference,
+        secondary=origin.secondary,
+        dem=origin.dem,
+        coregistration_grid="radar",
+        dem_id=origin.dem_id,
+        coreg_executor=origin.coreg_executor,
+        coreg_device=origin.coreg_device,
+        multilook=config,
+        goldstein_alpha=float(goldstein_alpha),
+        unwrap_method="snaphu",
+        complex_ifg=merged_ifg,
+        complex_ifg_flat=filtered,
+        coherence=coherence,
+        wrapped_phase=wrapped,
+        stage_timings_s={
+            "total": merged["total_seconds"],
+            "per_burst": merged["per_burst_timings"],
+        },
+    )
+    result.note(
+        "PAIR frames="
+        + str(merged["frame_count"])
+        + " units="
+        + str(len(merged["units"]))
+        + " merged="
+        + str(merged_ifg.shape)
+        + " multilook="
+        + str(config)
+        + " valid="
+        + format(float((~invalid).mean()), ".3f")
+        + " mean_coh="
+        + format(float(np.nanmean(coherence)), ".3f")
+    )
+    if unwrap:
+        method: UnwrapBackend = unwrap_method if unwrap_method is not None else "snaphu"
+        config_for_unwrap = snaphu_config
+        if config_for_unwrap is None:
+            config_for_unwrap = SnaphuConfig(nlooks=float(az_looks * rg_looks))
+        result = stage_unwrap(
+            result,
+            method=method,
+            config=config_for_unwrap,
+            irls_kwargs=irls_kwargs,
+        )
+        result.note("UNWRAP complete on merged product")
+    else:
+        result.unwrapped_phase = np.zeros_like(wrapped, dtype=np.float32)
+        result.connected_components = np.zeros_like(wrapped, dtype=np.uint8)
+        result.note("UNWRAP skipped (unwrap=False)")
+
+    config_dir = output_root / looks_dir(az_looks, rg_looks)
+    stac_item_id = pair_id + "__l" + str(az_looks) + "x" + str(rg_looks)
+    result = stage_write(
+        result,
+        config_dir,
+        stac_item_id=stac_item_id,
+    )
+    assert result.zarr_path is not None
+    assert result.stac_path is not None
+    grid: dict[str, object] = {
+        "crs": None,
+        "transform": None,
+        "shape": [merged_ifg.shape[0], merged_ifg.shape[1]],
+        "looks": [az_looks, rg_looks],
+    }
+    _write_run_manifest(
+        config_dir,
+        looks=config,
+        pair_id=pair_id,
+        products=[result.zarr_path.name, result.stac_path.name],
+        grid=grid,
+    )
+    metadata = {
+        "multilook": [az_looks, rg_looks],
+        "pair_id": pair_id,
+        "product_grid": grid,
+    }
+    return PairSweepOutcome(
+        config=config,
+        zarr_path=result.zarr_path,
+        stac_path=result.stac_path,
+        shape=(merged_ifg.shape[0], merged_ifg.shape[1]),
+        metadata=metadata,
+        stage_timings_s=result.stage_timings_s,
+        log=tuple(result.log),
+    )
+
+
+def _merge_geo_ifgs(
+    archive: dict[str, Any],
+    *,
+    geo_grid: GeoGridSpec,
+    az_looks: int,
+    rg_looks: int,
+) -> dict[str, Any]:
+    """Accumulate archived geocoded IFGs onto the multilooked product grid."""
+    units = archive["units"]
+    out_rows = geo_grid.height // az_looks
+    out_cols = geo_grid.width // rg_looks
+    ifc_acc = np.zeros((out_rows, out_cols), dtype=np.complex128)
+    pri_pow_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
+    sec_pow_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
+    height_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
+    claimed = np.zeros((out_rows, out_cols), dtype=np.int32)
+    looks_per_window = az_looks * rg_looks
+    for unit in units:
+        rows = unit["rows"]
+        cols = unit["cols"]
+        ifg_full = np.fromfile(unit["ifg_path"], dtype=np.complex64).reshape(rows, cols)
+        pri_power = np.fromfile(unit["pri_path"], dtype=np.float64).reshape(rows, cols)
+        sec_power = np.fromfile(unit["sec_path"], dtype=np.float64).reshape(rows, cols)
+        height = np.fromfile(unit["height_path"], dtype=np.float64).reshape(rows, cols)
+        valid = np.abs(ifg_full) > 0
+        r0 = unit["row0"]
+        c0 = unit["col0"]
+        orow = (r0 + np.arange(rows))[:, None] // az_looks
+        ocol = (c0 + np.arange(cols))[None, :] // rg_looks
+        inb = (orow < out_rows) & (ocol >= 0) & (ocol < out_cols) & valid
+        r_i, c_i = np.broadcast_arrays(orow, ocol)
+        r_v, c_v = r_i[inb], c_i[inb]
+        free = claimed[r_v, c_v] < looks_per_window
+        r_f, c_f = r_v[free], c_v[free]
+        np.add.at(ifc_acc, (r_f, c_f), ifg_full[inb][free].astype(np.complex128))
+        np.add.at(pri_pow_acc, (r_f, c_f), pri_power[inb][free])
+        np.add.at(sec_pow_acc, (r_f, c_f), sec_power[inb][free])
+        np.add.at(height_acc, (r_f, c_f), height[inb][free])
+        np.add.at(claimed, (r_f, c_f), 1)
+        del ifg_full, pri_power, sec_power, height
+    has = claimed > 0
+    merged_ifg = np.where(has, ifc_acc / np.where(has, claimed, 1), 0).astype(
+        np.complex64
+    )
+    pri_ml = pri_pow_acc / np.where(has, claimed, 1)
+    sec_ml = sec_pow_acc / np.where(has, claimed, 1)
+    denom = np.sqrt(np.maximum(pri_ml * sec_ml, 1e-30))
+    coherence = np.clip(np.abs(merged_ifg) / denom, 0.0, 1.0).astype(np.float32)
+    coherence[~has] = np.nan
+    height_field = np.where(has, height_acc / np.where(has, claimed, 1), np.nan).astype(
+        np.float64
+    )
+    invalid = np.abs(merged_ifg) <= 0
+    wrapped = np.where(invalid, np.nan, np.angle(merged_ifg).astype(np.float32))
+    frame_indices = {unit["frame_index"] for unit in units}
+    return {
+        "merged_ifg": merged_ifg,
+        "coherence": coherence,
+        "wrapped": wrapped,
+        "invalid": invalid,
+        "out_rows": out_rows,
+        "out_cols": out_cols,
+        "origin_state": archive["origin_state"],
+        "per_burst_timings": archive["per_burst_timings"],
+        "units": units,
+        "frame_count": max(frame_indices) + 1 if frame_indices else 0,
+        "total_seconds": time.perf_counter() - archive["prefix_started"],
+        "grid_mode": "geo",
+        "geo_grid": geo_grid,
+        "height_field": height_field,
+    }
+
+
+def _finalize_geo_config(
+    merged: dict[str, Any],
+    *,
+    config: tuple[int, int],
+    pair_id: str,
+    output_root: Path,
+    goldstein_alpha: float,
+    snaphu_config: SnaphuConfig | None,
+    unwrap_method: UnwrapBackend | None,
+    irls_kwargs: dict[str, Any] | None,
+    unwrap: bool,
+    geo_height_m: float,
+) -> PairSweepOutcome:
+    """Build and write the geocoded product for one look configuration."""
+    az_looks, rg_looks = config
+    merged_ifg = merged["merged_ifg"]
+    coherence = merged["coherence"]
+    wrapped = merged["wrapped"]
+    invalid = merged["invalid"]
+    geo_grid: GeoGridSpec = merged["geo_grid"]
+    filtered = merged_ifg
+    if goldstein_alpha > 0.0:
+        from faninsar.processing.interferometry.pair import goldstein_filter
+
+        filtered = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
+    origin = merged["origin_state"]
+    resolved_method: UnwrapBackend = (
+        unwrap_method if unwrap_method is not None else "irls"
+    )
+    resolved_irls_kwargs = dict(irls_kwargs or {})
+    if resolved_method == "irls":
+        resolved_irls_kwargs.setdefault("device", origin.coreg_device)
+    result = ProductionPairState(
+        pair_id=pair_id,
+        reference=origin.reference,
+        secondary=origin.secondary,
+        dem=origin.dem,
+        coregistration_grid="geo",
+        dem_id=origin.dem_id,
+        coreg_executor=origin.coreg_executor,
+        coreg_device=origin.coreg_device,
+        multilook=config,
+        goldstein_alpha=float(goldstein_alpha),
+        unwrap_method=resolved_method,
+        complex_ifg=merged_ifg,
+        complex_ifg_flat=filtered,
+        coherence=coherence,
+        wrapped_phase=wrapped,
+        geo_height_field=merged["height_field"],
+        stage_timings_s={
+            "total": merged["total_seconds"],
+            "per_burst": merged["per_burst_timings"],
+        },
+    )
+    result.note(
+        "PAIR geo frames="
+        + str(merged["frame_count"])
+        + " units="
+        + str(len(merged["units"]))
+        + " merged="
+        + str(merged_ifg.shape)
+        + " multilook="
+        + str(config)
+        + " valid="
+        + format(float((~invalid).mean()), ".3f")
+        + " mean_coh="
+        + format(float(np.nanmean(coherence)), ".3f")
+    )
+    if unwrap:
+        config_for_unwrap = snaphu_config
+        if config_for_unwrap is None:
+            config_for_unwrap = SnaphuConfig(nlooks=float(az_looks * rg_looks))
+        result = stage_unwrap(
+            result,
+            method=resolved_method,
+            config=config_for_unwrap,
+            irls_kwargs=resolved_irls_kwargs,
+        )
+        result.note("UNWRAP complete on merged geo product")
+    else:
+        result.unwrapped_phase = np.zeros_like(wrapped, dtype=np.float32)
+        result.connected_components = np.zeros_like(wrapped, dtype=np.uint8)
+        result.note("UNWRAP skipped (unwrap=False)")
+    result = _finalize_geo_products(
+        result,
+        geo_grid=geo_grid,
+        multilook=config,
+        geo_height_m=geo_height_m,
+    )
+    config_dir = output_root / looks_dir(az_looks, rg_looks)
+    stac_item_id = pair_id + "__l" + str(az_looks) + "x" + str(rg_looks)
+    result = stage_write(
+        result,
+        config_dir,
+        stac_item_id=stac_item_id,
+    )
+    assert result.zarr_path is not None
+    assert result.stac_path is not None
+    grid_meta = result.geo_grid_meta
+    grid: dict[str, object] = {
+        "crs": None if grid_meta is None else grid_meta["crs"],
+        "transform": None if grid_meta is None else grid_meta["transform"],
+        "shape": [merged_ifg.shape[0], merged_ifg.shape[1]],
+        "looks": [az_looks, rg_looks],
+    }
+    _write_run_manifest(
+        config_dir,
+        looks=config,
+        pair_id=pair_id,
+        products=[result.zarr_path.name, result.stac_path.name],
+        grid=grid,
+    )
+    metadata = {
+        "multilook": [az_looks, rg_looks],
+        "pair_id": pair_id,
+        "product_grid": grid,
+    }
+    return PairSweepOutcome(
+        config=config,
+        zarr_path=result.zarr_path,
+        stac_path=result.stac_path,
+        shape=(merged_ifg.shape[0], merged_ifg.shape[1]),
+        metadata=metadata,
+        stage_timings_s=result.stage_timings_s,
+        log=tuple(result.log),
+    )

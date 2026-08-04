@@ -81,6 +81,7 @@ def write_pair_stac_item(
     product: PairProductArrays,
     zarr_path: str | Path,
     item_path: str | Path,
+    stac_item_id: str | None = None,
 ) -> Path:
     """Write a minimal STAC item describing the pair Zarr product.
 
@@ -92,6 +93,8 @@ def write_pair_stac_item(
         Path to the Zarr store asset.
     item_path : str or pathlib.Path
         Output STAC item JSON path.
+    stac_item_id : str, optional
+        Look-qualified item id override for sweep outputs.
 
     Returns
     -------
@@ -101,13 +104,14 @@ def write_pair_stac_item(
     """
     zarr_path = Path(zarr_path)
     item_path = Path(item_path)
-    if not product.pair_id:
+    item_id = stac_item_id if stac_item_id is not None else product.pair_id
+    if not item_id:
         reject_invalid_state("pair_id is required for STAC item identity")
     height, width = product.wrapped_phase.shape
     item = {
         "type": "Feature",
         "stac_version": "1.0.0",
-        "id": product.pair_id,
+        "id": item_id,
         "geometry": None,
         "bbox": None,
         "properties": {
