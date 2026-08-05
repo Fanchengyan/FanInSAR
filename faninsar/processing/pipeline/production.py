@@ -11,7 +11,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import numpy as np
 
@@ -87,6 +87,16 @@ CoregistrationGrid = Literal["radar", "geo"]
 def looks_dir(azimuth_looks: int, range_looks: int) -> str:
     """Return the deterministic per-config output subtree name."""
     return f"looks_{azimuth_looks}x{range_looks}"
+
+
+def _sweep_list_metadata(
+    all_configs: list[tuple[int, int]] | None,
+    config: tuple[int, int],
+) -> list[list[int]]:
+    """Serialize the full multilook sweep list for product metadata."""
+    return [
+        list(item) for item in (all_configs if all_configs is not None else [config])
+    ]
 
 
 def _is_multilook_pair(value: object) -> bool:
@@ -1967,6 +1977,28 @@ def _swath_range_offsets(
     return offsets
 
 
+@overload
+def run_pair(
+    reference_path: str | Path | Sequence[str | Path],
+    secondary_path: str | Path | Sequence[str | Path],
+    *,
+    output_dir: str | Path,
+    multilook: tuple[int, int],
+    **kwargs: Any,
+) -> ProductionPairState: ...
+
+
+@overload
+def run_pair(
+    reference_path: str | Path | Sequence[str | Path],
+    secondary_path: str | Path | Sequence[str | Path],
+    *,
+    output_dir: str | Path,
+    multilook: Iterable[tuple[int, int]],
+    **kwargs: Any,
+) -> ProductionPairSweepResult: ...
+
+
 def run_pair(
     reference_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
@@ -2586,12 +2618,13 @@ def _run_pair_sweep(
     secondary_orbit_path: str | Path | Sequence[str | Path] | None,
     unwrap: bool,
     geoid_correction: bool,
-) -> ProductionPairSweepResult:
+) -> ProductionPairState | ProductionPairSweepResult:
     """Run one shared prefix and emit every look configuration."""
     from faninsar.missions.sentinel1.safe import open_safe_product
     from faninsar.processing.geometry.egm96 import EGM96Geoid
 
-    if _is_multilook_pair(multilook):
+    single_config = _is_multilook_pair(multilook)
+    if single_config:
         configs = [tuple(int(part) for part in multilook)]
     else:
         configs = normalize_multilook_sweep(multilook)
@@ -2608,6 +2641,11 @@ def _run_pair_sweep(
             "multilook sweep targets already exist; pass overwrite=True: "
             + ", ".join(existing)
         )
+    if overwrite:
+        for az_looks, rg_looks in configs:
+            stale = output_root / looks_dir(az_looks, rg_looks)
+            if stale.exists():
+                shutil.rmtree(stale)
 
     dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
     if geoid_correction and isinstance(dem_sampler, RasterDEM):
@@ -2800,8 +2838,11 @@ def _run_pair_sweep(
             geo_work_dir=resolved_geo_work_dir,
         )
         resources.ifg_archive = archive
+        if coregistration_grid == "geo":
+            resources.prefix_state = archive.get("geo_prefix_state")
         pair_id = _scene_id(ref_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair"
         per_config: dict[tuple[int, int], PairSweepOutcome] = {}
+        single_state: ProductionPairState | None = None
         for config in configs:
             az_looks, rg_looks = config
             merged = _merge_burst_ifgs(
@@ -2816,7 +2857,7 @@ def _run_pair_sweep(
                 rg_looks=rg_looks,
                 geo_grid=geo_grid,
             )
-            outcome = _finalize_sweep_config(
+            outcome, state = _finalize_sweep_config(
                 merged,
                 config=config,
                 pair_id=pair_id,
@@ -2827,8 +2868,14 @@ def _run_pair_sweep(
                 irls_kwargs=irls_kwargs,
                 unwrap=unwrap,
                 geo_height_m=geo_height_m,
+                all_configs=configs,
             )
             per_config[config] = outcome
+            if single_config:
+                single_state = state
+        if single_config:
+            assert single_state is not None
+            return single_state
         return ProductionPairSweepResult(pair_id=pair_id, per_config=per_config)
     finally:
         resources.cleanup()
@@ -2877,6 +2924,7 @@ def _archive_burst_ifgs(
     units: list[dict[str, Any]] = []
     per_burst_timings: dict[str, dict[str, float]] = {}
     origin_state: ProductionPairState | None = None
+    geo_prefix_state: ProductionPairState | None = None
     prefix_started = time.perf_counter()
 
     def load_burst(
@@ -3026,6 +3074,7 @@ def _archive_burst_ifgs(
                 geo_valid &= np.abs(ifg_full) > 0
                 if not geo_valid.any():
                     logger.warning("%s: no valid geocoded footprint; skipped", tag)
+                    geo_prefix_state = state
                     del pri_power, sec_power, ifg_full, state
                     continue
                 rows_any = geo_valid.any(axis=1)
@@ -3066,6 +3115,7 @@ def _archive_burst_ifgs(
                         "mode": "geo",
                     }
                 )
+                geo_prefix_state = state
                 del bbox_ifg, bbox_pri, bbox_sec, bbox_height
                 del pri_power, sec_power, ifg_full, state
                 logger.info("Archived %s into sweep prefix", tag)
@@ -3100,6 +3150,7 @@ def _archive_burst_ifgs(
         "prefix_started": prefix_started,
         "grid_mode": "geo" if coregistration_grid == "geo" else "radar",
         "geo_grid": geo_grid,
+        "geo_prefix_state": geo_prefix_state,
     }
 
 
@@ -3244,7 +3295,8 @@ def _finalize_sweep_config(
     irls_kwargs: dict[str, Any] | None,
     unwrap: bool,
     geo_height_m: float = 0.0,
-) -> PairSweepOutcome:
+    all_configs: list[tuple[int, int]] | None = None,
+) -> tuple[PairSweepOutcome, ProductionPairState]:
     """Build the config product, write it, and record the completion manifest."""
     az_looks, rg_looks = config
     merged_ifg = merged["merged_ifg"]
@@ -3270,6 +3322,7 @@ def _finalize_sweep_config(
             irls_kwargs=irls_kwargs,
             unwrap=unwrap,
             geo_height_m=geo_height_m,
+            all_configs=all_configs,
         )
     result = ProductionPairState(
         pair_id=pair_id,
@@ -3311,6 +3364,10 @@ def _finalize_sweep_config(
         config_for_unwrap = snaphu_config
         if config_for_unwrap is None:
             config_for_unwrap = SnaphuConfig(nlooks=float(az_looks * rg_looks))
+        else:
+            config_for_unwrap = replace(
+                config_for_unwrap, nlooks=float(az_looks * rg_looks)
+            )
         result = stage_unwrap(
             result,
             method=method,
@@ -3347,6 +3404,8 @@ def _finalize_sweep_config(
     )
     metadata = {
         "multilook": [az_looks, rg_looks],
+        "multilook_sweep": _sweep_list_metadata(all_configs, config),
+        "wavelength_m": float(origin.reference.geometry.wavelength_m),
         "pair_id": pair_id,
         "product_grid": grid,
     }
@@ -3358,7 +3417,7 @@ def _finalize_sweep_config(
         metadata=metadata,
         stage_timings_s=result.stage_timings_s,
         log=tuple(result.log),
-    )
+    ), result
 
 
 def _merge_geo_ifgs(
@@ -3446,7 +3505,8 @@ def _finalize_geo_config(
     irls_kwargs: dict[str, Any] | None,
     unwrap: bool,
     geo_height_m: float,
-) -> PairSweepOutcome:
+    all_configs: list[tuple[int, int]] | None = None,
+) -> tuple[PairSweepOutcome, ProductionPairState]:
     """Build and write the geocoded product for one look configuration."""
     az_looks, rg_looks = config
     merged_ifg = merged["merged_ifg"]
@@ -3506,6 +3566,10 @@ def _finalize_geo_config(
         config_for_unwrap = snaphu_config
         if config_for_unwrap is None:
             config_for_unwrap = SnaphuConfig(nlooks=float(az_looks * rg_looks))
+        else:
+            config_for_unwrap = replace(
+                config_for_unwrap, nlooks=float(az_looks * rg_looks)
+            )
         result = stage_unwrap(
             result,
             method=resolved_method,
@@ -3548,6 +3612,8 @@ def _finalize_geo_config(
     )
     metadata = {
         "multilook": [az_looks, rg_looks],
+        "multilook_sweep": _sweep_list_metadata(all_configs, config),
+        "wavelength_m": float(origin.reference.geometry.wavelength_m),
         "pair_id": pair_id,
         "product_grid": grid,
     }
@@ -3559,4 +3625,4 @@ def _finalize_geo_config(
         metadata=metadata,
         stage_timings_s=result.stage_timings_s,
         log=tuple(result.log),
-    )
+    ), result

@@ -13,8 +13,9 @@ import numpy as np
 import pytest
 import zarr
 
-from faninsar.processing.geometry import ConstantHeightDEM
+from faninsar.missions.sentinel1.errors import Sentinel1ProductError
 from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.geometry import ConstantHeightDEM
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.pipeline import ProductionPairState, run_pair
 from faninsar.processing.pipeline import production as production_mod
@@ -98,7 +99,14 @@ def _write_unit(
         height_path = str(base) + ".height.f64"
         assert height is not None
         height.astype(np.float64, copy=False).tofile(height_path)
-        unit.update({"height_path": height_path, "row0": row0, "col0": col0, "mode": "geo"})
+        unit.update(
+            {
+                "height_path": height_path,
+                "row0": row0,
+                "col0": col0,
+                "mode": "geo",
+            }
+        )
     else:
         unit.update(
             {
@@ -144,12 +152,26 @@ def _geo_archive(work: Path) -> dict[str, object]:
     sec = np.full((8, 16), 25.0, dtype=np.float64)
     height = np.full((8, 16), 42.0, dtype=np.float64)
     unit_a = _write_unit(
-        ifg_dir, "f0_IW1_b0", ifg_a, pri, sec,
-        height=height, row0=0, col0=0, mode="geo",
+        ifg_dir,
+        "f0_IW1_b0",
+        ifg_a,
+        pri,
+        sec,
+        height=height,
+        row0=0,
+        col0=0,
+        mode="geo",
     )
     unit_b = _write_unit(
-        ifg_dir, "f0_IW1_b1", ifg_b, pri, sec,
-        height=height, row0=0, col0=16, mode="geo",
+        ifg_dir,
+        "f0_IW1_b1",
+        ifg_b,
+        pri,
+        sec,
+        height=height,
+        row0=0,
+        col0=16,
+        mode="geo",
     )
     return {
         "units": [unit_a, unit_b],
@@ -251,7 +273,7 @@ def test_finalize_sweep_config_writes_subtree_and_manifest(tmp_path: Path) -> No
         geo_grid=None,
     )
     out = tmp_path / "out"
-    outcome = production_mod._finalize_sweep_config(
+    outcome, state = production_mod._finalize_sweep_config(
         merged,
         config=(2, 4),
         pair_id="20161207_20161231_pair",
@@ -274,6 +296,10 @@ def test_finalize_sweep_config_writes_subtree_and_manifest(tmp_path: Path) -> No
     root = zarr.open_group(str(outcome.zarr_path), mode="r")
     assert tuple(np.asarray(root["wrapped_phase"]).shape) == (4, 4)
     assert outcome.metadata["multilook"] == [2, 4]
+    assert outcome.metadata["multilook_sweep"] == [[2, 4]]
+    assert outcome.metadata["wavelength_m"] == pytest.approx(WAVELENGTH_M)
+    assert state.zarr_path == outcome.zarr_path
+    assert state.stac_path == outcome.stac_path
     assert outcome.shape == (4, 4)
 
 
@@ -333,7 +359,7 @@ def test_geo_merge_and_finalize_produce_geocoded_product(tmp_path: Path) -> None
     assert merged["height_field"].shape == (4, 8)
     np.testing.assert_allclose(merged["height_field"], 42.0)
     out = tmp_path / "out"
-    outcome = production_mod._finalize_sweep_config(
+    outcome, state = production_mod._finalize_sweep_config(
         merged,
         config=(2, 4),
         pair_id="20161207_20161231_pair",
@@ -362,12 +388,18 @@ def test_geo_merge_and_finalize_produce_geocoded_product(tmp_path: Path) -> None
     item = json.loads(outcome.stac_path.read_text(encoding="utf-8"))
     assert item["geometry"] is not None
     assert item["bbox"] is not None
-    manifest = json.loads((out / looks_dir(2, 4) / "run.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (out / looks_dir(2, 4) / "run.json").read_text(encoding="utf-8")
+    )
     assert manifest["grid"]["crs"] == "EPSG:32647"
     assert manifest["grid"]["transform"] is not None
+    assert outcome.metadata["multilook_sweep"] == [[2, 4]]
+    assert outcome.metadata["wavelength_m"] == pytest.approx(WAVELENGTH_M)
+    assert state.zarr_path == outcome.zarr_path
+    assert state.stac_path == outcome.stac_path
 
 
-def test_finalize_geo_products_builds_multilooked_grid(tmp_path: Path) -> None:
+def test_finalize_geo_products_builds_multilooked_grid() -> None:
     """Geo products assemble on the pixel-centre-aligned multilooked grid."""
     grid = GeoGridSpec(
         crs="EPSG:32647",
@@ -422,7 +454,9 @@ def test_shared_resources_cleanup_is_idempotent(tmp_path: Path) -> None:
     (work / "lut").mkdir()
     shape = (4, 4)
 
-    def _memmap(relative: str, dtype: object, array_shape: tuple[int, int]) -> np.memmap:
+    def _memmap(
+        relative: str, dtype: object, array_shape: tuple[int, int]
+    ) -> np.memmap:
         path = work / relative
         array = np.memmap(path, mode="w+", dtype=dtype, shape=array_shape)
         array[:] = 0
@@ -518,3 +552,290 @@ def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None
             atol=0.0,
             equal_nan=True,
         )
+
+
+def test_snaphu_config_nlooks_overridden_per_config_radar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Explicit SnaphuConfig nlooks is replaced by az * rg in radar finalize."""
+    from faninsar.processing.unwrap import SnaphuConfig
+
+    archive = _radar_archive(tmp_path / "prefix")
+    merged = production_mod._merge_burst_ifgs(
+        archive,
+        swath_tuple=("IW1",),
+        range_offsets={"IW1": 0},
+        burst_lines={"IW1": SHAPE[0]},
+        burst_width={"IW1": SHAPE[1]},
+        frame_rows=SHAPE[0],
+        frame_cols=SHAPE[1],
+        az_looks=2,
+        rg_looks=4,
+        geo_grid=None,
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_stage_unwrap(
+        state: ProductionPairState,
+        *,
+        method: object,
+        config: SnaphuConfig,
+        irls_kwargs: object,
+    ) -> ProductionPairState:
+        del method, irls_kwargs
+        captured["nlooks"] = config.nlooks
+        state.unwrapped_phase = np.zeros_like(state.wrapped_phase, dtype=np.float32)
+        state.connected_components = np.zeros_like(state.wrapped_phase, dtype=np.uint8)
+        return state
+
+    monkeypatch.setattr(production_mod, "stage_unwrap", _fake_stage_unwrap)
+    production_mod._finalize_sweep_config(
+        merged,
+        config=(2, 4),
+        pair_id="20161207_20161231_pair",
+        output_root=tmp_path / "out",
+        goldstein_alpha=0.0,
+        snaphu_config=SnaphuConfig(nlooks=99.0),
+        unwrap_method="snaphu",
+        irls_kwargs=None,
+        unwrap=True,
+        geo_height_m=0.0,
+    )
+    assert captured["nlooks"] == 8.0
+
+
+def test_snaphu_config_nlooks_overridden_per_config_geo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Explicit SnaphuConfig nlooks is replaced by az * rg in geo finalize."""
+    from faninsar.processing.unwrap import SnaphuConfig
+
+    archive = _geo_archive(tmp_path / "prefix")
+    merged = production_mod._merge_burst_ifgs(
+        archive,
+        swath_tuple=("IW1",),
+        range_offsets={"IW1": 0},
+        burst_lines={"IW1": SHAPE[0]},
+        burst_width={"IW1": SHAPE[1]},
+        frame_rows=SHAPE[0],
+        frame_cols=SHAPE[1],
+        az_looks=2,
+        rg_looks=4,
+        geo_grid=archive["geo_grid"],
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_stage_unwrap(
+        state: ProductionPairState,
+        *,
+        method: object,
+        config: SnaphuConfig,
+        irls_kwargs: object,
+    ) -> ProductionPairState:
+        del method, irls_kwargs
+        captured["nlooks"] = config.nlooks
+        state.unwrapped_phase = np.zeros_like(state.wrapped_phase, dtype=np.float32)
+        state.connected_components = np.zeros_like(state.wrapped_phase, dtype=np.uint8)
+        return state
+
+    monkeypatch.setattr(production_mod, "stage_unwrap", _fake_stage_unwrap)
+    production_mod._finalize_sweep_config(
+        merged,
+        config=(2, 4),
+        pair_id="20161207_20161231_pair",
+        output_root=tmp_path / "out",
+        goldstein_alpha=0.0,
+        snaphu_config=SnaphuConfig(nlooks=99.0),
+        unwrap_method="snaphu",
+        irls_kwargs=None,
+        unwrap=True,
+        geo_height_m=42.0,
+    )
+    assert captured["nlooks"] == 8.0
+
+
+def test_overwrite_true_removes_stale_subtree(tmp_path: Path) -> None:
+    """overwrite=True deletes existing config subtrees before processing."""
+    subtree = tmp_path / looks_dir(2, 4)
+    subtree.mkdir()
+    (subtree / "stale.bin").write_bytes(b"stale")
+    with pytest.raises(Sentinel1ProductError):
+        production_mod._run_pair_sweep(
+            "reference.SAFE",
+            "secondary.SAFE",
+            output_dir=tmp_path,
+            roi=None,
+            swaths=("IW1",),
+            bursts=None,
+            dem=None,
+            multilook=[(2, 4)],
+            overwrite=True,
+            goldstein_alpha=0.0,
+            dead_pixel_amp_threshold=3.0,
+            esd_enabled=False,
+            amplitude_refinement_enabled=False,
+            control_spacing=None,
+            executor="torch",
+            device="cpu",
+            coregistration_grid="radar",
+            geo_grid=None,
+            geo_height_m=0.0,
+            geo_chunk_size=128,
+            geo_work_dir=None,
+            snaphu_config=None,
+            unwrap_method=None,
+            irls_kwargs=None,
+            reference_orbit_path=None,
+            secondary_orbit_path=None,
+            unwrap=False,
+            geoid_correction=True,
+        )
+    assert not subtree.exists()
+
+
+def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Geo sweeps hand the last unit state to SharedPairResources cleanup."""
+    from faninsar.missions.sentinel1 import safe as safe_module
+    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+
+    work = tmp_path / "geo-memmaps"
+    work.mkdir()
+    shape = (4, 4)
+
+    def _memmap(name: str, dtype: object) -> np.memmap:
+        array = np.memmap(work / name, mode="w+", dtype=dtype, shape=shape)
+        array[:] = 0
+        return array
+
+    lut = Geo2RdrLUT(
+        az_full=_memmap("az.f64", np.float64),
+        rg_full=_memmap("rg.f64", np.float64),
+        valid=_memmap("valid.bool", np.bool_),
+        full_radar_shape=shape,
+        height_m=0.0,
+        height_full=_memmap("height.f64", np.float64),
+    )
+    geo_state = ProductionPairState(
+        pair_id="GEO_WIRE",
+        reference=_make_scene(shape, "20161207"),
+        secondary=_make_scene(shape, "20161231"),
+        dem=ConstantHeightDEM(0.0),
+        coregistration_grid="geo",
+        reference_geocoded_slc=_memmap("ref.c64", np.complex64),
+        secondary_geocoded_slc=_memmap("sec.c64", np.complex64),
+        geocoded_slc_valid=_memmap("slc_valid.bool", np.bool_),
+        topo_phase=_memmap("topo.f32", np.float32),
+        geo_height_field=_memmap("geo_h.f64", np.float64),
+        reference_deramped=_memmap("deramp.c64", np.complex64),
+        secondary_aligned=_memmap("aligned.c64", np.complex64),
+        geo_work_dir=work,
+        geo2rdr_lut=lut,
+    )
+    geo_grid = GeoGridSpec(
+        crs="EPSG:32647",
+        transform=(446_120.0, 10.0, 0.0, 4_133_680.0, 0.0, 10.0),
+        width=16,
+        height=8,
+        resolution_m=(10.0, 10.0),
+    )
+    archive = {
+        "units": [],
+        "origin_state": _origin_state(),
+        "per_burst_timings": {},
+        "prefix_started": time.perf_counter(),
+        "grid_mode": "geo",
+        "geo_grid": geo_grid,
+        "geo_prefix_state": geo_state,
+    }
+    burst = MagicMock()
+    burst.azimuth_time = datetime(2016, 12, 7, tzinfo=UTC)
+    swath = MagicMock()
+    swath.swath = "IW1"
+    swath.bursts = [burst]
+    swath.lines_per_burst = SHAPE[0]
+    swath.samples_per_burst = SHAPE[1]
+    swath.azimuth_time_interval_s = 1.0
+    swath.slant_range_time_s = 0.0
+    swath.range_sampling_rate_hz = 1.0
+    product = MagicMock()
+    product.swaths = [swath]
+    product.swath.return_value = swath
+    monkeypatch.setattr(safe_module, "open_safe_product", lambda _path: product)
+    monkeypatch.setattr(
+        production_mod, "_archive_burst_ifgs", lambda *_args, **_kwargs: archive
+    )
+    result = production_mod._run_pair_sweep(
+        "reference.SAFE",
+        "secondary.SAFE",
+        output_dir=tmp_path / "out",
+        roi=None,
+        swaths=("IW1",),
+        bursts=None,
+        dem=ConstantHeightDEM(0.0),
+        multilook=[(1, 1)],
+        overwrite=False,
+        goldstein_alpha=0.0,
+        dead_pixel_amp_threshold=3.0,
+        esd_enabled=False,
+        amplitude_refinement_enabled=False,
+        control_spacing=None,
+        executor="torch",
+        device="cpu",
+        coregistration_grid="geo",
+        geo_grid=geo_grid,
+        geo_height_m=0.0,
+        geo_chunk_size=128,
+        geo_work_dir=None,
+        snaphu_config=None,
+        unwrap_method=None,
+        irls_kwargs=None,
+        reference_orbit_path=None,
+        secondary_orbit_path=None,
+        unwrap=False,
+        geoid_correction=True,
+    )
+    outcome = result.per_config[(1, 1)]
+    assert outcome.metadata["multilook_sweep"] == [[1, 1]]
+    assert outcome.metadata["wavelength_m"] == pytest.approx(WAVELENGTH_M)
+    assert geo_state.geo2rdr_lut is None
+    assert geo_state.reference_geocoded_slc is None
+    assert geo_state.geocoded_slc_valid is None
+    assert geo_state.geo_height_field is None
+    assert lut.az_full._mmap.closed
+    single = run_pair(
+        "reference.SAFE",
+        "secondary.SAFE",
+        output_dir=tmp_path / "single-out",
+        roi=None,
+        swaths=("IW1",),
+        bursts=None,
+        dem=ConstantHeightDEM(0.0),
+        multilook=(1, 1),
+        overwrite=False,
+        goldstein_alpha=0.0,
+        dead_pixel_amp_threshold=3.0,
+        esd_enabled=False,
+        amplitude_refinement_enabled=False,
+        control_spacing=None,
+        executor="torch",
+        device="cpu",
+        coregistration_grid="geo",
+        geo_grid=geo_grid,
+        geo_height_m=0.0,
+        geo_chunk_size=128,
+        geo_work_dir=None,
+        snaphu_config=None,
+        unwrap_method=None,
+        irls_kwargs=None,
+        reference_orbit_path=None,
+        secondary_orbit_path=None,
+        unwrap=False,
+        geoid_correction=True,
+    )
+    assert isinstance(single, ProductionPairState)
+    assert single.zarr_path is not None
+    assert single.stac_path is not None
+    assert single.coregistration_grid == "geo"
+    assert single.multilook == (1, 1)
