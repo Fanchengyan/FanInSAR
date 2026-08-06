@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from faninsar.query import BoundingBox
 
 logger = setup_logger(__name__)
@@ -108,7 +110,7 @@ def _cli_dem_bounds(
     """Return EPSG:4326 bounds for the CLI DEM build.
 
     Uses ROI bounds or the union of every reference SAFE burst radar quad
-    with 0.01 deg padding.
+    buffered by 2 km.
     """
     if roi is not None:
         return (
@@ -119,10 +121,13 @@ def _cli_dem_bounds(
         )
     from faninsar.missions.sentinel1.safe import open_safe_product
     from faninsar.processing.pipeline.geo_lut import burst_geo_quad_lonlat
-    from faninsar.processing.pipeline.production import _radar_model
+    from faninsar.processing.pipeline.production import (
+        DEM_BOUNDS_BUFFER_M,
+        _quad_bounds_with_buffer_m,
+        _radar_model,
+    )
 
-    lons: list[float] = []
-    lats: list[float] = []
+    quads: list[np.ndarray] = []
     for path in reference:
         product = open_safe_product(path)
         for swath_item in product.swaths:
@@ -141,18 +146,8 @@ def _cli_dem_bounds(
                     dem=None,
                 )
                 if quad is not None:
-                    lons.extend(float(point[0]) for point in quad)
-                    lats.extend(float(point[1]) for point in quad)
-    if not lons:
-        message = "cannot derive DEM bounds for --dem without --roi or burst quads"
-        raise SystemExit(message)
-    pad = 0.01
-    return (
-        min(lons) - pad,
-        min(lats) - pad,
-        max(lons) + pad,
-        max(lats) + pad,
-    )
+                    quads.append(quad)
+    return _quad_bounds_with_buffer_m(quads, DEM_BOUNDS_BUFFER_M)
 
 
 def run_frame_cli(

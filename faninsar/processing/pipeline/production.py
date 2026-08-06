@@ -79,6 +79,8 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+DEM_BOUNDS_BUFFER_M = 2000.0
+
 SPEED_OF_LIGHT_M_S = 299_792_458.0
 ScopeMode = Literal["burst", "swath"]
 CoregistrationGrid = Literal["radar", "geo"]
@@ -2153,8 +2155,8 @@ def _auto_dem_bounds(
     Returns
     -------
     tuple[float, float, float, float]
-        (min_lon, min_lat, max_lon, max_lat) with 0.01 deg padding when the
-        bounds come from burst quads.
+        (min_lon, min_lat, max_lon, max_lat) covering the ROI, or the burst
+        quads buffered by DEM_BOUNDS_BUFFER_M.
 
     """
     if isinstance(roi, BoundingBox):
@@ -2177,8 +2179,7 @@ def _auto_dem_bounds(
     from faninsar.missions.sentinel1 import read_eof_orbit
     from faninsar.processing.pipeline.geo_lut import burst_geo_quad_lonlat
 
-    lons: list[float] = []
-    lats: list[float] = []
+    quads: list[np.ndarray] = []
     for (frame_index, swath), indices in resolved.items():
         s1_swath = reference_products[frame_index].swath(swath)
         orbit_path = None if orbits is None else orbits[frame_index]
@@ -2200,17 +2201,39 @@ def _auto_dem_bounds(
                 dem=dem,
             )
             if quad is not None:
-                lons.extend(float(point[0]) for point in quad)
-                lats.extend(float(point[1]) for point in quad)
-    if not lons:
+                quads.append(quad)
+    return _quad_bounds_with_buffer_m(quads, DEM_BOUNDS_BUFFER_M)
+
+
+def _quad_bounds_with_buffer_m(
+    quads: list[np.ndarray],
+    buffer_m: float,
+) -> tuple[float, float, float, float]:
+    """Return the EPSG:4326 bounds of burst quads buffered by meters."""
+    from pyproj import Transformer
+    from shapely.geometry import Polygon as ShapelyPolygon
+
+    if not quads:
         reject_invalid_state("cannot derive DEM bounds: no burst geometry available")
-    pad = 0.01
-    return (
-        min(lons) - pad,
-        min(lats) - pad,
-        max(lons) + pad,
-        max(lats) + pad,
-    )
+    all_lon = np.concatenate([quad[:, 0] for quad in quads])
+    all_lat = np.concatenate([quad[:, 1] for quad in quads])
+    mean_lon = float(np.mean(all_lon))
+    mean_lat = float(np.mean(all_lat))
+    zone = int(np.floor((mean_lon + 180.0) / 6.0)) + 1
+    epsg = (32600 if mean_lat >= 0 else 32700) + zone
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+    inverse = Transformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True)
+    min_lon = min_lat = float("inf")
+    max_lon = max_lat = float("-inf")
+    for quad in quads:
+        xs, ys = transformer.transform(quad[:, 0], quad[:, 1])
+        buffered = ShapelyPolygon(np.column_stack([xs, ys])).buffer(buffer_m)
+        bx, by = inverse.transform(*buffered.exterior.xy)
+        min_lon = min(min_lon, float(np.min(bx)))
+        max_lon = max(max_lon, float(np.max(bx)))
+        min_lat = min(min_lat, float(np.min(by)))
+        max_lat = max(max_lat, float(np.max(by)))
+    return (min_lon, min_lat, max_lon, max_lat)
 
 
 def _select_bursts_by_roi(
@@ -2715,7 +2738,6 @@ def run_pair(
             resolved,
             reference_products,
             orbits=ref_orbits,
-            dem=dem_sampler,
         )
         dem_path = get_dem_manager().fetch_dem(
             bounds, Path(output_dir) / "dem" / default_dem_name()
@@ -3243,7 +3265,6 @@ def _run_pair_sweep(
             resolved,
             reference_products,
             orbits=ref_orbits,
-            dem=dem_sampler,
         )
         dem_path = get_dem_manager().fetch_dem(
             bounds, output_root / "dem" / default_dem_name()
