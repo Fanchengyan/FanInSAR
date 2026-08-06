@@ -24,6 +24,7 @@ logger = setup_logger(__name__)
 __all__ = [
     "Geo2RdrLUT",
     "build_geo2rdr_lut",
+    "burst_geo_quad_lonlat",
     "grid_lonlat",
     "grid_lonlat_rows",
     "polygon_parts",
@@ -215,6 +216,80 @@ def burst_geo_polygon_lonlat(
 
     hull = ConvexHull(np.column_stack([lon[ok], lat[ok]]))
     return np.column_stack([lon[ok], lat[ok]])[hull.vertices]
+
+
+def burst_geo_quad_lonlat(
+    geometry: RadarGeometryModel,
+    radar_shape: tuple[int, int],
+    dem: DEMSampler | None,
+) -> np.ndarray | None:
+    """Return the burst frame's 4-corner ground quad in (lon, lat).
+
+    The four radar-frame corners are mapped with rdr2geo (DEM-based when
+    available, ellipsoid fallback per corner). Corners that still fail are
+    dropped; at least three finite corners are required.
+
+    Parameters
+    ----------
+    geometry : RadarGeometryModel
+        Reference-scene radar geometry for the burst.
+    radar_shape : tuple[int, int]
+        Radar image shape ``(height, width)``.
+    dem : DEMSampler, optional
+        DEM for rdr2geo; when omitted an ellipsoid is used.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        ``(N, 2)`` ring of (lon, lat) corners (``N >= 3``) or None.
+
+    """
+    from faninsar.processing.geometry import rdr2geo_ellipsoid, rdr2geo_with_dem
+
+    height, width = radar_shape
+    points = np.array(
+        [
+            [0.0, 0.0],
+            [0.0, width - 1],
+            [height - 1, width - 1],
+            [height - 1, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    if dem is not None:
+        res = rdr2geo_with_dem(
+            geometry,
+            points[:, 0],
+            points[:, 1],
+            dem,
+            height_seed_m=0.0,
+        )
+        lat = np.asarray(res.latitude_deg, dtype=np.float64)
+        lon = np.asarray(res.longitude_deg, dtype=np.float64)
+        ok = np.isfinite(lat) & np.isfinite(lon)
+        if not np.all(ok):
+            fallback = rdr2geo_ellipsoid(
+                geometry,
+                points[~ok, 0],
+                points[~ok, 1],
+                height_m=0.0,
+            )
+            lat[~ok] = np.asarray(fallback.latitude_deg, dtype=np.float64)
+            lon[~ok] = np.asarray(fallback.longitude_deg, dtype=np.float64)
+            ok = np.isfinite(lat) & np.isfinite(lon)
+    else:
+        res = rdr2geo_ellipsoid(
+            geometry,
+            points[:, 0],
+            points[:, 1],
+            height_m=0.0,
+        )
+        lat = np.asarray(res.latitude_deg, dtype=np.float64)
+        lon = np.asarray(res.longitude_deg, dtype=np.float64)
+        ok = np.isfinite(lat) & np.isfinite(lon)
+    if int(ok.sum()) < 3:
+        return None
+    return np.column_stack([lon[ok], lat[ok]])
 
 
 def footprint_polygon_mask(

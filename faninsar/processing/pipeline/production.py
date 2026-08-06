@@ -266,7 +266,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     geo_grid = task["geo_grid"]
     geo_height_m = float(task["geo_height_m"])
     geo_chunk_size = int(task["geo_chunk_size"])
-    roi_buffer_px = int(task.get("roi_buffer_px", 64))
+    roi_buffer_m = float(task.get("roi_buffer_m", 320.0))
     ifg_dir = Path(task["ifg_dir"])
     dem = task["dem"]
     geo_work_dir = task["geo_work_dir"]
@@ -336,7 +336,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         geo_chunk_size=geo_chunk_size,
         geo_work_dir=burst_work_dir,
         roi=roi,
-        roi_buffer_px=roi_buffer_px,
+        roi_buffer_m=roi_buffer_m,
     )
     stage_times["coregister"] = time.perf_counter() - t0
     burst_row0 = 0
@@ -895,7 +895,7 @@ def stage_coregister(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     roi: BoundingBox | Polygons | None = None,
-    roi_buffer_px: int = 64,
+    roi_buffer_m: float = 320.0,
     memory_watchdog: MemoryWatchdog | None = None,
 ) -> ProductionPairState:
     """Estimate dense offsets and coregister on a radar or geographic grid.
@@ -938,11 +938,11 @@ def stage_coregister(
     geo_work_dir : str or pathlib.Path, optional
         Directory for disk-backed Geo intermediate arrays.
     roi : BoundingBox or Polygons, optional
-        Restricts geo processing to the ROI-burst footprint intersection
-        (dilated by ``roi_buffer_px``) instead of the full burst bbox.
-    roi_buffer_px : int, optional
-        Grid pixels of margin kept around the ROI in geo mode so edge pixels
-        survive footprint estimation error and downstream context windows.
+        Restricts geo processing to the ROI-burst quad intersection
+        (buffered by ``roi_buffer_m``) instead of the full burst bbox.
+    roi_buffer_m : float, optional
+        Physical margin in meters kept around the ROI in geo mode, applied in
+        the grid CRS so the extension is isotropic on the ground.
     memory_watchdog : MemoryWatchdog, optional
         Memory guard sampled after each geographic tile.
 
@@ -1042,7 +1042,7 @@ def stage_coregister(
             reject_invalid_state("geo coregistration requires geo_grid")
         from faninsar.processing.pipeline.geo_lut import (
             build_geo2rdr_lut,
-            burst_geo_polygon_lonlat,
+            burst_geo_quad_lonlat,
             derive_burst_geo_bbox,
             roi_geo_bbox,
         )
@@ -1068,14 +1068,14 @@ def stage_coregister(
 
             from faninsar.processing.pipeline.geo_lut import polygon_parts
 
-            burst_hull = burst_geo_polygon_lonlat(
+            burst_quad = burst_geo_quad_lonlat(
                 geometry=state.reference.geometry,
                 radar_shape=ref.shape,
                 dem=state.dem,
             )
-            if burst_hull is not None:
+            if burst_quad is not None:
                 intersection = _roi_geometry(roi).intersection(
-                    ShapelyPolygon(burst_hull)
+                    ShapelyPolygon(burst_quad).buffer(0)
                 )
                 parts = [
                     part
@@ -1083,13 +1083,18 @@ def stage_coregister(
                     if not part.is_empty
                 ]
                 if parts:
-                    roi_geometry = (
+                    roi_polygon = (
                         parts[0] if len(parts) == 1 else MultiPolygon(parts)
+                    )
+                    roi_geometry = _buffer_geometry_meters(
+                        roi_polygon,
+                        geo_grid.crs,
+                        roi_buffer_m,
                     )
                     burst_row0, burst_row1, burst_col0, burst_col1 = roi_geo_bbox(
                         roi_geometry,
                         geo_grid,
-                        margin_px=roi_buffer_px,
+                        margin_px=2,
                     )
         state.geo_bbox = (burst_row0, burst_row1, burst_col0, burst_col1)
         substage_started = time.perf_counter()
@@ -1105,7 +1110,7 @@ def stage_coregister(
             col_range=(burst_col0, burst_col1),
             footprint_lonlat=footprint_lonlat,
             roi_geometry=roi_geometry,
-            polygon_dilate_px=roi_buffer_px,
+            polygon_dilate_px=2,
         )
         state.coregistration_timings_s["geo2rdr_lut"] = (
             time.perf_counter() - substage_started
@@ -2196,32 +2201,77 @@ def _select_bursts_by_roi(
     roi: BoundingBox | Polygons,
     frame_paths: list[Path],
     swaths: tuple[str, ...],
+    orbits: Sequence[str | Path | None] | None = None,
+    dem: DEMSampler | None = None,
 ) -> dict[tuple[int, str], list[int]]:
-    from shapely.geometry import Polygon
+    """Select bursts whose radar-frame ground quad intersects the ROI."""
+    from dataclasses import replace as _replace
 
+    from shapely.geometry import Polygon as ShapelyPolygon
+
+    from faninsar.missions.sentinel1 import read_eof_orbit
     from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.pipeline.geo_lut import burst_geo_quad_lonlat
 
     region = _roi_geometry(roi)
     resolved: dict[tuple[int, str], list[int]] = {}
-    any_footprint = False
+    any_quad = False
     for frame_index, path in enumerate(frame_paths):
         product = open_safe_product(path)
+        orbit_path = None if orbits is None else orbits[frame_index]
         for swath in swaths:
             s1_swath = product.swath(swath)
+            if orbit_path is not None:
+                s1_swath = _replace(s1_swath, orbit=read_eof_orbit(orbit_path))
             indices: list[int] = []
+            shape = (s1_swath.lines_per_burst, s1_swath.samples_per_burst)
             for burst in s1_swath.bursts:
-                if burst.footprint is None:
+                geometry = _radar_model(
+                    s1_swath,
+                    burst,
+                    shape=shape,
+                    row0=burst.index * s1_swath.lines_per_burst,
+                    col0=0,
+                )
+                quad = burst_geo_quad_lonlat(
+                    geometry=geometry,
+                    radar_shape=shape,
+                    dem=dem,
+                )
+                if quad is None:
                     continue
-                any_footprint = True
-                if region.intersects(Polygon(burst.footprint)):
+                any_quad = True
+                if region.intersects(ShapelyPolygon(quad)):
                     indices.append(burst.index)
             resolved[(frame_index, swath)] = indices
-    if not any_footprint:
+    if not any_quad:
         reject_invalid_state(
-            "ROI selection requires burst footprints; annotation geolocation "
-            "grid is missing from the input products"
+            "ROI selection requires radar geometry; burst rdr2geo quads "
+            "could not be built for any burst"
         )
     return resolved
+
+
+def _buffer_geometry_meters(
+    geometry: object,
+    target_crs: object,
+    buffer_m: float,
+) -> object:
+    """Buffer a WGS84 shapely geometry by meters in a projected CRS."""
+    from pyproj import Transformer
+    from shapely.ops import transform as shp_transform
+
+    transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+    inverse = Transformer.from_crs(target_crs, "EPSG:4326", always_xy=True)
+    projected = shp_transform(
+        lambda x, y: transformer.transform(x, y),
+        geometry,
+    )
+    buffered = projected.buffer(buffer_m)
+    return shp_transform(
+        lambda x, y: inverse.transform(x, y),
+        buffered,
+    )
 
 
 def _roi_burst_window(
@@ -2329,7 +2379,7 @@ def run_pair(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     n_jobs: int = 1,
-    roi_buffer_px: int = 64,
+    roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
@@ -2365,7 +2415,7 @@ def run_pair(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     n_jobs: int = 1,
-    roi_buffer_px: int = 64,
+    roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
@@ -2400,7 +2450,7 @@ def run_pair(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     n_jobs: int = 1,
-    roi_buffer_px: int = 64,
+    roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
@@ -2467,8 +2517,9 @@ def run_pair(
         when omitted.
     n_jobs : int, optional
         Number of parallel burst workers in geo mode (default 1).
-    roi_buffer_px : int, optional
-        Grid pixels of margin kept around the ROI in geo mode (default 64).
+    roi_buffer_m : float, optional
+        Physical margin in meters kept around the ROI in geo mode
+        (default 320).
     snaphu_config : SnaphuConfig, optional
         SNAPHU configuration; nlooks defaults to az * rg per config.
     unwrap_method : {"irls", "snaphu"}, optional
@@ -2514,7 +2565,7 @@ def run_pair(
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=geo_work_dir,
             n_jobs=n_jobs,
-            roi_buffer_px=roi_buffer_px,
+            roi_buffer_m=roi_buffer_m,
             snaphu_config=snaphu_config,
             unwrap_method=unwrap_method,
             irls_kwargs=irls_kwargs,
@@ -2595,7 +2646,13 @@ def run_pair(
             key=lambda item: item.slant_range_time_s,
         )
         swath_tuple = tuple(item.swath for item in ordered)
-        resolved = _select_bursts_by_roi(roi, ref_paths, swath_tuple)
+        resolved = _select_bursts_by_roi(
+            roi,
+            ref_paths,
+            swath_tuple,
+            orbits=ref_orbits,
+            dem=dem_sampler,
+        )
     else:
         burst_counts = {
             (frame_index, swath): len(
@@ -3006,7 +3063,7 @@ def _run_pair_sweep(
     geo_chunk_size: int,
     geo_work_dir: str | Path | None,
     n_jobs: int = 1,
-    roi_buffer_px: int = 64,
+    roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None,
     unwrap_method: UnwrapBackend | None,
     irls_kwargs: dict[str, Any] | None,
@@ -3111,7 +3168,13 @@ def _run_pair_sweep(
             key=lambda item: item.slant_range_time_s,
         )
         swath_tuple = tuple(item.swath for item in ordered)
-        resolved = _select_bursts_by_roi(roi, ref_paths, swath_tuple)
+        resolved = _select_bursts_by_roi(
+            roi,
+            ref_paths,
+            swath_tuple,
+            orbits=ref_orbits,
+            dem=dem_sampler,
+        )
     else:
         burst_counts = {
             (frame_index, swath): len(
@@ -3237,7 +3300,7 @@ def _run_pair_sweep(
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=resolved_geo_work_dir,
             n_jobs=n_jobs,
-            roi_buffer_px=roi_buffer_px,
+            roi_buffer_m=roi_buffer_m,
         )
         resources.ifg_archive = archive
         if coregistration_grid == "geo":
@@ -3308,7 +3371,7 @@ def _archive_burst_ifgs(
     geo_chunk_size: int,
     geo_work_dir: Path | None,
     n_jobs: int = 1,
-    roi_buffer_px: int = 64,
+    roi_buffer_m: float = 320.0,
 ) -> dict[str, Any]:
     """Process every burst unit once and store flat IFGs on disk.
 
@@ -3432,7 +3495,7 @@ def _archive_burst_ifgs(
                     "geo_grid": geo_grid,
                     "geo_height_m": geo_height_m,
                     "geo_chunk_size": geo_chunk_size,
-                    "roi_buffer_px": roi_buffer_px,
+                    "roi_buffer_m": roi_buffer_m,
                     "ifg_dir": ifg_dir,
                     "dem": dem_sampler,
                     "geo_work_dir": geo_work_dir,
