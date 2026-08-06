@@ -226,6 +226,252 @@ def _output_bytes(path: Path) -> int:
     )
 
 
+def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
+    """Process one burst unit in a worker process.
+
+    Parameters
+    ----------
+    task : dict
+        Picklable task arguments produced by ``_archive_burst_ifgs``.
+
+    Returns
+    -------
+    dict
+        ``{"unit": unit_or_None, "stage_times": dict}``.
+
+    """
+    from dataclasses import replace as _replace
+
+    from faninsar.missions.sentinel1 import read_eof_orbit, read_full_burst
+    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.tops.carrier import carrier_from_swath
+
+    tag = str(task["tag"])
+    swath = str(task["swath"])
+    frame_index = int(task["frame_index"])
+    burst_index = int(task["burst_index"])
+    azimuth_offset = int(task["azimuth_offset"])
+    ref_path = Path(task["ref_path"])
+    sec_path = Path(task["sec_path"])
+    ref_orbit = task.get("ref_orbit")
+    sec_orbit = task.get("sec_orbit")
+    roi = task.get("roi")
+    control_spacing = task.get("control_spacing")
+    esd_enabled = bool(task["esd_enabled"])
+    amplitude_refinement_enabled = bool(task["amplitude_refinement_enabled"])
+    executor = str(task["executor"])
+    device = str(task["device"])
+    dead_pixel_amp_threshold = float(task["dead_pixel_amp_threshold"])
+    coregistration_grid = task["coregistration_grid"]
+    geo_grid = task["geo_grid"]
+    geo_height_m = float(task["geo_height_m"])
+    geo_chunk_size = int(task["geo_chunk_size"])
+    ifg_dir = Path(task["ifg_dir"])
+    dem = task["dem"]
+    geo_work_dir = task["geo_work_dir"]
+
+    ref_product = open_safe_product(ref_path)
+    sec_product = open_safe_product(sec_path)
+
+    def load_burst_worker(
+        path: Path,
+        orbit_path: Path | None,
+        product: object,
+    ) -> ProductionScene:
+        s1_swath = product.swath(swath)
+        if orbit_path is not None:
+            s1_swath = _replace(s1_swath, orbit=read_eof_orbit(orbit_path))
+        array = read_full_burst(s1_swath, burst_index=burst_index, full_range=True)
+        burst = s1_swath.bursts[burst_index]
+        carrier = carrier_from_swath(s1_swath, burst, first_range_sample=array.col0)
+        geometry = _radar_model(
+            s1_swath,
+            burst,
+            shape=array.samples.shape,
+            row0=array.row0,
+            col0=array.col0,
+        )
+        return ProductionScene(
+            scene_id=_scene_id(path),
+            path=path,
+            product=product,
+            swath=s1_swath,
+            burst=burst,
+            array=array,
+            carrier=carrier,
+            geometry=geometry,
+        )
+
+    ref = load_burst_worker(ref_path, ref_orbit, ref_product)
+    sec = load_burst_worker(sec_path, sec_orbit, sec_product)
+    state = ProductionPairState(
+        pair_id=ref.scene_id + "_" + sec.scene_id + "_" + tag,
+        reference=ref,
+        secondary=sec,
+        dem=dem,
+        coregistration_grid="radar",
+        multilook=(1, 1),
+        goldstein_alpha=0.0,
+        unwrap_method="snaphu",
+    )
+    stage_times: dict[str, float] = {}
+    t0 = time.perf_counter()
+    state = stage_deramp(state)
+    stage_times["deramp"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    burst_work_dir: Path | None = None
+    if coregistration_grid == "geo" and geo_work_dir is not None:
+        burst_work_dir = Path(geo_work_dir) / tag
+    state = stage_coregister(
+        state,
+        control_spacing=control_spacing,
+        esd_enabled=esd_enabled,
+        amplitude_refinement_enabled=amplitude_refinement_enabled,
+        executor=executor,
+        device=device,
+        coregistration_grid=coregistration_grid,
+        geo_grid=geo_grid,
+        geo_height_m=geo_height_m,
+        geo_chunk_size=geo_chunk_size,
+        geo_work_dir=burst_work_dir,
+    )
+    stage_times["coregister"] = time.perf_counter() - t0
+    burst_row0 = 0
+    burst_col0 = 0
+    geo_valid_mask: np.ndarray | None = None
+    if coregistration_grid == "geo":
+        if state.geocoded_slc_valid is not None:
+            geo_valid_mask = np.asarray(state.geocoded_slc_valid)
+    elif roi is not None:
+        assert state.reference_deramped is not None
+        window = _roi_burst_window(
+            roi,
+            ref.geometry,
+            dem,
+            state.reference_deramped.shape,
+        )
+        if window is not None:
+            burst_row0, burst_row1, burst_col0, burst_col1 = window
+            state.reference_deramped = state.reference_deramped[
+                burst_row0:burst_row1, burst_col0:burst_col1
+            ]
+            state.secondary_aligned = state.secondary_aligned[
+                burst_row0:burst_row1, burst_col0:burst_col1
+            ]
+    assert state.reference_deramped is not None
+    assert state.secondary_aligned is not None
+    pri_power = state.reference_deramped.real**2 + state.reference_deramped.imag**2
+    sec_power = state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
+    t0 = time.perf_counter()
+    state = stage_interferogram(
+        state,
+        multilook=(1, 1),
+        goldstein_alpha=0.0,
+        dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+    )
+    stage_times["interferogram"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    if coregistration_grid == "geo":
+        state.complex_ifg_flat = state.complex_ifg
+        state.note(
+            "FLATTEN applied to secondary geocoded SLC before IFG formation"
+        )
+        stage_times["flatten"] = 0.0
+    else:
+        state = stage_flatten(state)
+        stage_times["flatten"] = time.perf_counter() - t0
+    ifg_full = (
+        state.complex_ifg_flat
+        if state.complex_ifg_flat is not None
+        else state.complex_ifg
+    )
+    if ifg_full is None:
+        reject_invalid_state(tag + ": no interferogram produced")
+
+    base = ifg_dir / tag
+    ifg_path = str(base) + ".complex64"
+    pri_path = str(base) + ".pri.f64"
+    sec_path_out = str(base) + ".sec.f64"
+    if coregistration_grid == "geo":
+        geo_valid = np.zeros(ifg_full.shape, dtype=bool)
+        if geo_valid_mask is not None:
+            geo_valid = geo_valid_mask
+        geo_valid &= np.abs(ifg_full) > 0
+        if not geo_valid.any():
+            logger.warning("%s: no valid geocoded footprint; skipped", tag)
+            return {"unit": None, "stage_times": stage_times}
+        rows_any = geo_valid.any(axis=1)
+        cols_any = geo_valid.any(axis=0)
+        row0 = int(np.argmax(rows_any))
+        row1 = int(rows_any.size - np.argmax(rows_any[::-1]))
+        col0 = int(np.argmax(cols_any))
+        col1 = int(cols_any.size - np.argmax(cols_any[::-1]))
+        geo_bbox = state.geo_bbox
+        if geo_bbox is not None:
+            row0 += geo_bbox[0]
+            row1 += geo_bbox[0]
+            col0 += geo_bbox[2]
+            col1 += geo_bbox[2]
+            bbox_local = (
+                row0 - geo_bbox[0],
+                row1 - geo_bbox[0],
+                col0 - geo_bbox[2],
+                col1 - geo_bbox[2],
+            )
+        else:
+            bbox_local = (row0, row1, col0, col1)
+        height_path = str(base) + ".height.f64"
+        height_full = state.geo_height_field
+        if height_full is None:
+            height_full = np.full(
+                ifg_full.shape, float(geo_height_m), dtype=np.float64
+            )
+        else:
+            height_full = np.asarray(height_full, dtype=np.float64)
+        lr0, lr1, lc0, lc1 = bbox_local
+        bbox_ifg = ifg_full[lr0:lr1, lc0:lc1]
+        bbox_pri = pri_power[lr0:lr1, lc0:lc1]
+        bbox_sec = sec_power[lr0:lr1, lc0:lc1]
+        bbox_height = height_full[lr0:lr1, lc0:lc1]
+        bbox_ifg.astype(np.complex64, copy=False).tofile(ifg_path)
+        bbox_pri.astype(np.float64, copy=False).tofile(pri_path)
+        bbox_sec.astype(np.float64, copy=False).tofile(sec_path_out)
+        bbox_height.astype(np.float64, copy=False).tofile(height_path)
+        unit: dict[str, object] = {
+            "tag": tag,
+            "swath": swath,
+            "frame_index": frame_index,
+            "ifg_path": ifg_path,
+            "pri_path": pri_path,
+            "sec_path": sec_path_out,
+            "height_path": height_path,
+            "rows": int(bbox_ifg.shape[0]),
+            "cols": int(bbox_ifg.shape[1]),
+            "row0": row0,
+            "col0": col0,
+            "mode": "geo",
+        }
+    else:
+        ifg_full.astype(np.complex64, copy=False).tofile(ifg_path)
+        pri_power.astype(np.float64, copy=False).tofile(pri_path)
+        sec_power.astype(np.float64, copy=False).tofile(sec_path_out)
+        unit = {
+            "tag": tag,
+            "swath": swath,
+            "frame_index": frame_index,
+            "ifg_path": ifg_path,
+            "pri_path": pri_path,
+            "sec_path": sec_path_out,
+            "rows": int(ifg_full.shape[0]),
+            "cols": int(ifg_full.shape[1]),
+            "azimuth_offset": azimuth_offset,
+            "burst_row0": burst_row0,
+            "burst_col0": burst_col0,
+        }
+    logger.info("Archived %s into sweep prefix", tag)
+    return {"unit": unit, "stage_times": stage_times}
+
+
 def _write_run_manifest(
     output_dir: str | Path,
     *,
@@ -354,6 +600,7 @@ class ProductionPairState:
     geo_grid_meta: dict[str, Any] | None = None
     geo_work_dir: Path | None = None
     memory_watchdog: MemoryWatchdog | None = None
+    geo_bbox: tuple[int, int, int, int] | None = None
 
     def note(self, message: str) -> None:
         """Append a stage log line."""
@@ -488,6 +735,8 @@ def _apply_geo_topographic_phase_chunked(
     output_dir: Path,
     chunk_size: int,
     watchdog: MemoryWatchdog | None,
+    row0_offset: int = 0,
+    col0_offset: int = 0,
 ) -> tuple[np.memmap, np.ndarray]:
     """Apply geometric phase to disk-backed geographic SLC row tiles.
 
@@ -509,6 +758,9 @@ def _apply_geo_topographic_phase_chunked(
         Number of geographic rows per tile.
     watchdog : MemoryWatchdog, optional
         Memory guard sampled after every completed tile.
+    row0_offset, col0_offset : int
+        Offset of the cropped LUT inside the full geographic grid, used to
+        map cropped rows/cols back to global grid coordinates.
 
     Returns
     -------
@@ -525,7 +777,7 @@ def _apply_geo_topographic_phase_chunked(
         output_dir / "topographic_phase.float32",
         mode="w+",
         dtype=np.float32,
-        shape=grid.shape,
+        shape=lut.shape,
     )
     height_field = lut.height_full
     if height_field is None:
@@ -533,11 +785,11 @@ def _apply_geo_topographic_phase_chunked(
             output_dir / "height.float64",
             mode="w+",
             dtype=np.float64,
-            shape=grid.shape,
+            shape=lut.shape,
         )
     invalid = np.complex64(np.nan + 1j * np.nan)
-    for row_start in range(0, grid.height, chunk_size):
-        row_stop = min(row_start + chunk_size, grid.height)
+    for row_start in range(0, lut.shape[0], chunk_size):
+        row_stop = min(row_start + chunk_size, lut.shape[0])
         rows = slice(row_start, row_stop)
         tile_lut = Geo2RdrLUT(
             az_full=lut.az_full[rows],
@@ -551,7 +803,15 @@ def _apply_geo_topographic_phase_chunked(
             tile_lut,
             offsets,
         )
-        latitude, longitude = grid_lonlat_rows(grid, row_start, row_stop)
+        latitude, longitude = grid_lonlat_rows(
+            grid,
+            row_start + row0_offset,
+            row_stop + row0_offset,
+        )
+        col_stop = col0_offset + lut.shape[1]
+        if col0_offset > 0 or col_stop < grid.width:
+            latitude = latitude[:, col0_offset:col_stop]
+            longitude = longitude[:, col0_offset:col_stop]
         if tile_lut.height_full is None:
             height = np.asarray(
                 state.dem.sample(latitude, longitude),
@@ -769,7 +1029,11 @@ def stage_coregister(
     if coregistration_grid == "geo":
         if geo_grid is None:
             reject_invalid_state("geo coregistration requires geo_grid")
-        from faninsar.processing.pipeline.geo_lut import build_geo2rdr_lut
+        from faninsar.processing.pipeline.geo_lut import (
+            build_geo2rdr_lut,
+            burst_geo_polygon_lonlat,
+            derive_burst_geo_bbox,
+        )
         from faninsar.processing.pipeline.geo_modes import (
             coregister_geocoded_slcs_chunked,
         )
@@ -778,6 +1042,18 @@ def stage_coregister(
             reject_invalid_state("geo coregistration requires geo_work_dir")
         work_directory = Path(geo_work_dir)
         work_directory.mkdir(parents=True, exist_ok=True)
+        burst_row0, burst_row1, burst_col0, burst_col1 = derive_burst_geo_bbox(
+            geometry=state.reference.geometry,
+            radar_shape=ref.shape,
+            grid=geo_grid,
+            dem=state.dem,
+        )
+        state.geo_bbox = (burst_row0, burst_row1, burst_col0, burst_col1)
+        footprint_lonlat = burst_geo_polygon_lonlat(
+            geometry=state.reference.geometry,
+            radar_shape=ref.shape,
+            dem=state.dem,
+        )
         substage_started = time.perf_counter()
         lut = build_geo2rdr_lut(
             geometry=state.reference.geometry,
@@ -787,6 +1063,9 @@ def stage_coregister(
             dem=state.dem,
             chunk_size=geo_chunk_size,
             storage_dir=work_directory / "lut",
+            row_range=(burst_row0, burst_row1),
+            col_range=(burst_col0, burst_col1),
+            footprint_lonlat=footprint_lonlat,
         )
         state.coregistration_timings_s["geo2rdr_lut"] = (
             time.perf_counter() - substage_started
@@ -820,6 +1099,8 @@ def stage_coregister(
             output_dir=work_directory,
             chunk_size=geo_chunk_size,
             watchdog=memory_watchdog,
+            row0_offset=burst_row0,
+            col0_offset=burst_col0,
         )
         state.coregistration_timings_s["geo_topographic_phase"] = (
             time.perf_counter() - substage_started
@@ -2001,6 +2282,7 @@ def run_pair(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    n_jobs: int = 1,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
@@ -2035,6 +2317,7 @@ def run_pair(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    n_jobs: int = 1,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
@@ -2068,6 +2351,7 @@ def run_pair(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    n_jobs: int = 1,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
@@ -2132,6 +2416,8 @@ def run_pair(
     geo_work_dir : path, optional
         Working directory for geo memmaps; a temporary directory is used
         when omitted.
+    n_jobs : int, optional
+        Number of parallel burst workers in geo mode (default 1).
     snaphu_config : SnaphuConfig, optional
         SNAPHU configuration; nlooks defaults to az * rg per config.
     unwrap_method : {"irls", "snaphu"}, optional
@@ -2176,6 +2462,7 @@ def run_pair(
             geo_height_m=geo_height_m,
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=geo_work_dir,
+            n_jobs=n_jobs,
             snaphu_config=snaphu_config,
             unwrap_method=unwrap_method,
             irls_kwargs=irls_kwargs,
@@ -2446,7 +2733,7 @@ def run_pair(
             )
             if first_state is None:
                 first_state = state
-            if frame_index == 0 and swath == swath_tuple[0] and burst_index == 0:
+            if origin_state is None:
                 origin_state = state
             stage_times: dict[str, float] = {}
             t0 = time.perf_counter()
@@ -2657,6 +2944,7 @@ def _run_pair_sweep(
     geo_height_m: float,
     geo_chunk_size: int,
     geo_work_dir: str | Path | None,
+    n_jobs: int = 1,
     snaphu_config: SnaphuConfig | None,
     unwrap_method: UnwrapBackend | None,
     irls_kwargs: dict[str, Any] | None,
@@ -2882,6 +3170,7 @@ def _run_pair_sweep(
             geo_height_m=geo_height_m,
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=resolved_geo_work_dir,
+            n_jobs=n_jobs,
         )
         resources.ifg_archive = archive
         if coregistration_grid == "geo":
@@ -2951,6 +3240,7 @@ def _archive_burst_ifgs(
     geo_height_m: float,
     geo_chunk_size: int,
     geo_work_dir: Path | None,
+    n_jobs: int = 1,
 ) -> dict[str, Any]:
     """Process every burst unit once and store flat IFGs on disk.
 
@@ -3004,188 +3294,108 @@ def _archive_burst_ifgs(
             geometry=geometry,
         )
 
+    def scene_rebuild_args(
+        frame_index: int,
+        swath: str,
+        burst_index: int,
+    ) -> dict[str, object]:
+        return {
+            "ref_path": ref_paths[frame_index],
+            "sec_path": sec_paths[frame_index],
+            "ref_orbit": ref_orbits[frame_index],
+            "sec_orbit": sec_orbits[frame_index],
+            "swath": swath,
+            "burst_index": burst_index,
+            "frame_index": frame_index,
+        }
+
+    def rebuild_origin_state(
+        scene_args: dict[str, object],
+        dem: DEMSampler,
+    ) -> ProductionPairState:
+        ref = load_burst(
+            str(scene_args["swath"]),
+            int(scene_args["burst_index"]),
+            Path(scene_args["ref_path"]),
+            scene_args["ref_orbit"],
+            reference_products[int(scene_args["frame_index"])],
+        )
+        sec = load_burst(
+            str(scene_args["swath"]),
+            int(scene_args["burst_index"]),
+            Path(scene_args["sec_path"]),
+            scene_args["sec_orbit"],
+            secondary_products[int(scene_args["frame_index"])],
+        )
+        return ProductionPairState(
+            pair_id=ref.scene_id + "_" + sec.scene_id,
+            reference=ref,
+            secondary=sec,
+            dem=dem,
+            coregistration_grid=coregistration_grid,
+            multilook=(1, 1),
+            goldstein_alpha=0.0,
+            unwrap_method="snaphu",
+        )
+
+    task_args: list[dict[str, object]] = []
     for swath in reversed(swath_tuple):
         for frame_index, burst_index, azimuth_offset in units_by_swath[swath]:
             tag = "f" + str(frame_index) + "_" + swath + "_b" + str(burst_index)
-            ref = load_burst(
-                swath,
-                burst_index,
-                ref_paths[frame_index],
-                ref_orbits[frame_index],
-                reference_products[frame_index],
-            )
-            sec = load_burst(
-                swath,
-                burst_index,
-                sec_paths[frame_index],
-                sec_orbits[frame_index],
-                secondary_products[frame_index],
-            )
-            state = ProductionPairState(
-                pair_id=ref.scene_id + "_" + sec.scene_id + "_" + tag,
-                reference=ref,
-                secondary=sec,
-                dem=dem_sampler,
-                coregistration_grid="radar",
-                multilook=(1, 1),
-                goldstein_alpha=0.0,
-                unwrap_method="snaphu",
-            )
-            if frame_index == 0 and swath == swath_tuple[0] and burst_index == 0:
-                origin_state = state
-            stage_times: dict[str, float] = {}
-            t0 = time.perf_counter()
-            state = stage_deramp(state)
-            stage_times["deramp"] = time.perf_counter() - t0
-            t0 = time.perf_counter()
-            state = stage_coregister(
-                state,
-                control_spacing=control_spacing,
-                esd_enabled=esd_enabled,
-                amplitude_refinement_enabled=amplitude_refinement_enabled,
-                executor=executor,
-                device=device,
-                coregistration_grid=coregistration_grid,
-                geo_grid=geo_grid,
-                geo_height_m=geo_height_m,
-                geo_chunk_size=geo_chunk_size,
-                geo_work_dir=geo_work_dir,
-            )
-            stage_times["coregister"] = time.perf_counter() - t0
-            burst_row0 = 0
-            burst_col0 = 0
-            geo_valid_mask: np.ndarray | None = None
-            if coregistration_grid == "geo":
-                if state.geocoded_slc_valid is not None:
-                    geo_valid_mask = np.asarray(state.geocoded_slc_valid)
-            elif roi is not None:
-                assert state.reference_deramped is not None
-                window = _roi_burst_window(
-                    roi,
-                    ref.geometry,
-                    dem_sampler,
-                    state.reference_deramped.shape,
-                )
-                if window is not None:
-                    burst_row0, burst_row1, burst_col0, burst_col1 = window
-                    state.reference_deramped = state.reference_deramped[
-                        burst_row0:burst_row1, burst_col0:burst_col1
-                    ]
-                    state.secondary_aligned = state.secondary_aligned[
-                        burst_row0:burst_row1, burst_col0:burst_col1
-                    ]
-            assert state.reference_deramped is not None
-            assert state.secondary_aligned is not None
-            pri_power = (
-                state.reference_deramped.real**2 + state.reference_deramped.imag**2
-            )
-            sec_power = (
-                state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
-            )
-            t0 = time.perf_counter()
-            state = stage_interferogram(
-                state,
-                multilook=(1, 1),
-                goldstein_alpha=0.0,
-                dead_pixel_amp_threshold=dead_pixel_amp_threshold,
-            )
-            stage_times["interferogram"] = time.perf_counter() - t0
-            t0 = time.perf_counter()
-            if coregistration_grid == "geo":
-                state.complex_ifg_flat = state.complex_ifg
-                state.note(
-                    "FLATTEN applied to secondary geocoded SLC before IFG formation"
-                )
-                stage_times["flatten"] = 0.0
-            else:
-                state = stage_flatten(state)
-                stage_times["flatten"] = time.perf_counter() - t0
-            ifg_full = (
-                state.complex_ifg_flat
-                if state.complex_ifg_flat is not None
-                else state.complex_ifg
-            )
-            if ifg_full is None:
-                reject_invalid_state(tag + ": no interferogram produced")
-            per_burst_timings[tag] = stage_times
-
-            base = ifg_dir / tag
-            ifg_path = str(base) + ".complex64"
-            pri_path = str(base) + ".pri.f64"
-            sec_path = str(base) + ".sec.f64"
-            if coregistration_grid == "geo":
-                geo_valid = np.zeros(ifg_full.shape, dtype=bool)
-                if geo_valid_mask is not None:
-                    geo_valid = geo_valid_mask
-                geo_valid &= np.abs(ifg_full) > 0
-                if not geo_valid.any():
-                    logger.warning("%s: no valid geocoded footprint; skipped", tag)
-                    geo_prefix_state = state
-                    del pri_power, sec_power, ifg_full, state
-                    continue
-                rows_any = geo_valid.any(axis=1)
-                cols_any = geo_valid.any(axis=0)
-                row0 = int(np.argmax(rows_any))
-                row1 = int(rows_any.size - np.argmax(rows_any[::-1]))
-                col0 = int(np.argmax(cols_any))
-                col1 = int(cols_any.size - np.argmax(cols_any[::-1]))
-                height_path = str(base) + ".height.f64"
-                height_full = state.geo_height_field
-                if height_full is None:
-                    height_full = np.full(
-                        ifg_full.shape, float(geo_height_m), dtype=np.float64
-                    )
-                else:
-                    height_full = np.asarray(height_full, dtype=np.float64)
-                bbox_ifg = ifg_full[row0:row1, col0:col1]
-                bbox_pri = pri_power[row0:row1, col0:col1]
-                bbox_sec = sec_power[row0:row1, col0:col1]
-                bbox_height = height_full[row0:row1, col0:col1]
-                bbox_ifg.astype(np.complex64, copy=False).tofile(ifg_path)
-                bbox_pri.astype(np.float64, copy=False).tofile(pri_path)
-                bbox_sec.astype(np.float64, copy=False).tofile(sec_path)
-                bbox_height.astype(np.float64, copy=False).tofile(height_path)
-                units.append(
-                    {
-                        "tag": tag,
-                        "swath": swath,
-                        "frame_index": frame_index,
-                        "ifg_path": ifg_path,
-                        "pri_path": pri_path,
-                        "sec_path": sec_path,
-                        "height_path": height_path,
-                        "rows": int(bbox_ifg.shape[0]),
-                        "cols": int(bbox_ifg.shape[1]),
-                        "row0": row0,
-                        "col0": col0,
-                        "mode": "geo",
-                    }
-                )
-                geo_prefix_state = state
-                del bbox_ifg, bbox_pri, bbox_sec, bbox_height
-                del pri_power, sec_power, ifg_full, state
-                logger.info("Archived %s into sweep prefix", tag)
-                continue
-            ifg_full.astype(np.complex64, copy=False).tofile(ifg_path)
-            pri_power.astype(np.float64, copy=False).tofile(pri_path)
-            sec_power.astype(np.float64, copy=False).tofile(sec_path)
-            units.append(
+            task_args.append(
                 {
                     "tag": tag,
                     "swath": swath,
                     "frame_index": frame_index,
-                    "ifg_path": ifg_path,
-                    "pri_path": pri_path,
-                    "sec_path": sec_path,
-                    "rows": int(ifg_full.shape[0]),
-                    "cols": int(ifg_full.shape[1]),
+                    "burst_index": burst_index,
                     "azimuth_offset": azimuth_offset,
-                    "burst_row0": burst_row0,
-                    "burst_col0": burst_col0,
+                    "ref_path": ref_paths[frame_index],
+                    "sec_path": sec_paths[frame_index],
+                    "ref_orbit": ref_orbits[frame_index],
+                    "sec_orbit": sec_orbits[frame_index],
+                    "roi": roi,
+                    "control_spacing": control_spacing,
+                    "esd_enabled": esd_enabled,
+                    "amplitude_refinement_enabled": amplitude_refinement_enabled,
+                    "executor": executor,
+                    "device": device,
+                    "dead_pixel_amp_threshold": dead_pixel_amp_threshold,
+                    "coregistration_grid": coregistration_grid,
+                    "geo_grid": geo_grid,
+                    "geo_height_m": geo_height_m,
+                    "geo_chunk_size": geo_chunk_size,
+                    "ifg_dir": ifg_dir,
+                    "dem": dem_sampler,
+                    "geo_work_dir": geo_work_dir,
                 }
             )
-            del pri_power, sec_power, ifg_full, state
-            logger.info("Archived %s into sweep prefix", tag)
+
+    if n_jobs > 1 and len(task_args) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+            results = list(pool.map(_process_burst_worker, task_args))
+    else:
+        results = [_process_burst_worker(task) for task in task_args]
+
+    ordered_results: list[tuple[dict[str, object], dict[str, float]]] = []
+    origin_scene_args: dict[str, object] | None = None
+    for task, result in zip(task_args, results, strict=True):
+        unit = result["unit"]
+        if unit is None:
+            continue
+        ordered_results.append((unit, result["stage_times"]))
+        if origin_scene_args is None:
+            origin_scene_args = scene_rebuild_args(
+                int(task["frame_index"]),
+                str(task["swath"]),
+                int(task["burst_index"]),
+            )
+    for unit, stage_times in ordered_results:
+        units.append(unit)
+        per_burst_timings[unit["tag"]] = stage_times
+    if origin_scene_args is not None:
+        origin_state = rebuild_origin_state(origin_scene_args, dem_sampler)
 
     if origin_state is None:
         reject_invalid_state("no burst units selected for processing")
