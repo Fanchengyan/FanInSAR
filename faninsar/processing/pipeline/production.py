@@ -266,6 +266,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     geo_grid = task["geo_grid"]
     geo_height_m = float(task["geo_height_m"])
     geo_chunk_size = int(task["geo_chunk_size"])
+    roi_buffer_px = int(task.get("roi_buffer_px", 64))
     ifg_dir = Path(task["ifg_dir"])
     dem = task["dem"]
     geo_work_dir = task["geo_work_dir"]
@@ -334,6 +335,8 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         geo_height_m=geo_height_m,
         geo_chunk_size=geo_chunk_size,
         geo_work_dir=burst_work_dir,
+        roi=roi,
+        roi_buffer_px=roi_buffer_px,
     )
     stage_times["coregister"] = time.perf_counter() - t0
     burst_row0 = 0
@@ -891,6 +894,8 @@ def stage_coregister(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    roi: BoundingBox | Polygons | None = None,
+    roi_buffer_px: int = 64,
     memory_watchdog: MemoryWatchdog | None = None,
 ) -> ProductionPairState:
     """Estimate dense offsets and coregister on a radar or geographic grid.
@@ -932,6 +937,12 @@ def stage_coregister(
         Geo2rdr row chunk size.
     geo_work_dir : str or pathlib.Path, optional
         Directory for disk-backed Geo intermediate arrays.
+    roi : BoundingBox or Polygons, optional
+        Restricts geo processing to the ROI-burst footprint intersection
+        (dilated by ``roi_buffer_px``) instead of the full burst bbox.
+    roi_buffer_px : int, optional
+        Grid pixels of margin kept around the ROI in geo mode so edge pixels
+        survive footprint estimation error and downstream context windows.
     memory_watchdog : MemoryWatchdog, optional
         Memory guard sampled after each geographic tile.
 
@@ -1033,6 +1044,7 @@ def stage_coregister(
             build_geo2rdr_lut,
             burst_geo_polygon_lonlat,
             derive_burst_geo_bbox,
+            roi_geo_bbox,
         )
         from faninsar.processing.pipeline.geo_modes import (
             coregister_geocoded_slcs_chunked,
@@ -1048,12 +1060,38 @@ def stage_coregister(
             grid=geo_grid,
             dem=state.dem,
         )
+        footprint_lonlat: np.ndarray | None = None
+        roi_geometry: object | None = None
+        if roi is not None:
+            from shapely.geometry import MultiPolygon
+            from shapely.geometry import Polygon as ShapelyPolygon
+
+            from faninsar.processing.pipeline.geo_lut import polygon_parts
+
+            burst_hull = burst_geo_polygon_lonlat(
+                geometry=state.reference.geometry,
+                radar_shape=ref.shape,
+                dem=state.dem,
+            )
+            if burst_hull is not None:
+                intersection = _roi_geometry(roi).intersection(
+                    ShapelyPolygon(burst_hull)
+                )
+                parts = [
+                    part
+                    for part in polygon_parts(intersection)
+                    if not part.is_empty
+                ]
+                if parts:
+                    roi_geometry = (
+                        parts[0] if len(parts) == 1 else MultiPolygon(parts)
+                    )
+                    burst_row0, burst_row1, burst_col0, burst_col1 = roi_geo_bbox(
+                        roi_geometry,
+                        geo_grid,
+                        margin_px=roi_buffer_px,
+                    )
         state.geo_bbox = (burst_row0, burst_row1, burst_col0, burst_col1)
-        footprint_lonlat = burst_geo_polygon_lonlat(
-            geometry=state.reference.geometry,
-            radar_shape=ref.shape,
-            dem=state.dem,
-        )
         substage_started = time.perf_counter()
         lut = build_geo2rdr_lut(
             geometry=state.reference.geometry,
@@ -1066,6 +1104,8 @@ def stage_coregister(
             row_range=(burst_row0, burst_row1),
             col_range=(burst_col0, burst_col1),
             footprint_lonlat=footprint_lonlat,
+            roi_geometry=roi_geometry,
+            polygon_dilate_px=roi_buffer_px,
         )
         state.coregistration_timings_s["geo2rdr_lut"] = (
             time.perf_counter() - substage_started
@@ -2072,9 +2112,15 @@ def _roi_geometry(roi: BoundingBox | Polygons) -> Any:
     if isinstance(roi, BoundingBox):
         return box(roi.left, roi.bottom, roi.right, roi.top)
     series = roi.geometry
-    if hasattr(series, "union_all"):
-        return series.union_all()
-    return series.unary_union
+    union = (
+        series.union_all() if hasattr(series, "union_all") else series.unary_union
+    )
+    crs = getattr(roi, "crs", None)
+    if crs is not None and str(crs) != "EPSG:4326":
+        import geopandas as gpd
+
+        return gpd.GeoSeries([union], crs=crs).to_crs("EPSG:4326").iloc[0]
+    return union
 
 
 def _auto_dem_bounds(
@@ -2283,6 +2329,7 @@ def run_pair(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     n_jobs: int = 1,
+    roi_buffer_px: int = 64,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
@@ -2318,6 +2365,7 @@ def run_pair(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     n_jobs: int = 1,
+    roi_buffer_px: int = 64,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
@@ -2352,6 +2400,7 @@ def run_pair(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     n_jobs: int = 1,
+    roi_buffer_px: int = 64,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
@@ -2418,6 +2467,8 @@ def run_pair(
         when omitted.
     n_jobs : int, optional
         Number of parallel burst workers in geo mode (default 1).
+    roi_buffer_px : int, optional
+        Grid pixels of margin kept around the ROI in geo mode (default 64).
     snaphu_config : SnaphuConfig, optional
         SNAPHU configuration; nlooks defaults to az * rg per config.
     unwrap_method : {"irls", "snaphu"}, optional
@@ -2463,6 +2514,7 @@ def run_pair(
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=geo_work_dir,
             n_jobs=n_jobs,
+            roi_buffer_px=roi_buffer_px,
             snaphu_config=snaphu_config,
             unwrap_method=unwrap_method,
             irls_kwargs=irls_kwargs,
@@ -2566,6 +2618,8 @@ def run_pair(
                 index for index in resolved[(frame_index, swath)] if index in common
             ]
             if not selected:
+                if roi is not None:
+                    continue
                 reject_invalid_state(
                     "no common bursts between reference/secondary frame "
                     + str(frame_index)
@@ -2574,6 +2628,8 @@ def run_pair(
                 )
             common_aligned[(frame_index, swath)] = selected
     resolved = common_aligned
+    if not any(indices for indices in resolved.values()):
+        reject_invalid_state("selection contains no bursts")
 
     if dem is None and os.environ.get("FANINSAR_DEM_CACHE_DIR"):
         from faninsar.processing.geometry.dem_manager import (
@@ -2647,6 +2703,7 @@ def run_pair(
             // az_looks
         )
         for swath in swath_tuple
+        if units_by_swath[swath]
     }
     swath_cols = {
         swath: (range_offsets[swath] + burst_width[swath]) // rg_looks
@@ -2655,18 +2712,22 @@ def run_pair(
     ifc_acc = {
         swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.complex128)
         for swath in swath_tuple
+        if swath in swath_rows
     }
     pri_pow_acc = {
         swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.float64)
         for swath in swath_tuple
+        if swath in swath_rows
     }
     sec_pow_acc = {
         swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.float64)
         for swath in swath_tuple
+        if swath in swath_rows
     }
     claimed = {
         swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.int32)
         for swath in swath_tuple
+        if swath in swath_rows
     }
     looks_per_window = az_looks * rg_looks
 
@@ -2827,10 +2888,10 @@ def run_pair(
 
     merged_ifg = np.zeros((out_rows, out_cols), dtype=np.complex64)
     coherence = np.full((out_rows, out_cols), np.nan, dtype=np.float32)
-    for swath in swath_tuple:
+    for swath, swath_acc in ifc_acc.items():
         has = claimed[swath] > 0
         swath_ifg = np.where(
-            has, ifc_acc[swath] / np.where(has, claimed[swath], 1), 0
+            has, swath_acc / np.where(has, claimed[swath], 1), 0
         ).astype(np.complex64)
         pri_ml = pri_pow_acc[swath] / np.where(has, claimed[swath], 1)
         sec_ml = sec_pow_acc[swath] / np.where(has, claimed[swath], 1)
@@ -2945,6 +3006,7 @@ def _run_pair_sweep(
     geo_chunk_size: int,
     geo_work_dir: str | Path | None,
     n_jobs: int = 1,
+    roi_buffer_px: int = 64,
     snaphu_config: SnaphuConfig | None,
     unwrap_method: UnwrapBackend | None,
     irls_kwargs: dict[str, Any] | None,
@@ -3072,6 +3134,8 @@ def _run_pair_sweep(
                 index for index in resolved[(frame_index, swath)] if index in common
             ]
             if not selected:
+                if roi is not None:
+                    continue
                 reject_invalid_state(
                     "no common bursts between reference/secondary frame "
                     + str(frame_index)
@@ -3080,6 +3144,8 @@ def _run_pair_sweep(
                 )
             common_aligned[(frame_index, swath)] = selected
     resolved = common_aligned
+    if not any(indices for indices in resolved.values()):
+        reject_invalid_state("selection contains no bursts")
 
     if dem is None and os.environ.get("FANINSAR_DEM_CACHE_DIR"):
         from faninsar.processing.geometry.dem_manager import (
@@ -3171,6 +3237,7 @@ def _run_pair_sweep(
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=resolved_geo_work_dir,
             n_jobs=n_jobs,
+            roi_buffer_px=roi_buffer_px,
         )
         resources.ifg_archive = archive
         if coregistration_grid == "geo":
@@ -3241,6 +3308,7 @@ def _archive_burst_ifgs(
     geo_chunk_size: int,
     geo_work_dir: Path | None,
     n_jobs: int = 1,
+    roi_buffer_px: int = 64,
 ) -> dict[str, Any]:
     """Process every burst unit once and store flat IFGs on disk.
 
@@ -3364,6 +3432,7 @@ def _archive_burst_ifgs(
                     "geo_grid": geo_grid,
                     "geo_height_m": geo_height_m,
                     "geo_chunk_size": geo_chunk_size,
+                    "roi_buffer_px": roi_buffer_px,
                     "ifg_dir": ifg_dir,
                     "dem": dem_sampler,
                     "geo_work_dir": geo_work_dir,

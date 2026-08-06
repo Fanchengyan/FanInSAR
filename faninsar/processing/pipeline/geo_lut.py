@@ -21,7 +21,15 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
-__all__ = ["Geo2RdrLUT", "build_geo2rdr_lut", "grid_lonlat", "grid_lonlat_rows"]
+__all__ = [
+    "Geo2RdrLUT",
+    "build_geo2rdr_lut",
+    "grid_lonlat",
+    "grid_lonlat_rows",
+    "polygon_parts",
+    "roi_geo_bbox",
+    "roi_geo_mask",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +278,129 @@ def footprint_polygon_mask(
     return mask
 
 
+def _lonlat_ring_to_grid_px(
+    ring_coords: np.ndarray,
+    grid: GeoGridSpec,
+) -> np.ndarray:
+    """Convert an (N, 2) (lon, lat) ring to grid pixel coordinates."""
+    from pyproj import Transformer
+
+    transformer = Transformer.from_crs("EPSG:4326", grid.crs, always_xy=True)
+    xs, ys = transformer.transform(ring_coords[:, 0], ring_coords[:, 1])
+    x0, dx, _, y0, _, dy = grid.transform
+    return np.column_stack(
+        [
+            (np.asarray(xs) - x0) / dx - 0.5,
+            (y0 - np.asarray(ys)) / (-dy) - 0.5,
+        ]
+    )
+
+
+def polygon_parts(geometry: object) -> list[object]:
+    """Return the Polygon members of a shapely geometry as a list."""
+    geom_type = getattr(geometry, "geom_type", None)
+    if geom_type == "Polygon":
+        return [geometry]
+    if geom_type == "MultiPolygon":
+        return list(getattr(geometry, "geoms", []))
+    if geom_type == "GeometryCollection":
+        parts: list[object] = []
+        for part in getattr(geometry, "geoms", []):
+            parts.extend(polygon_parts(part))
+        return parts
+    return []
+
+
+def roi_geo_bbox(
+    roi_geometry: object,
+    grid: GeoGridSpec,
+    margin_px: int = 32,
+) -> tuple[int, int, int, int]:
+    """Return ``(row0, row1, col0, col1)`` bounding a shapely lon/lat ROI.
+
+    Parameters
+    ----------
+    roi_geometry : shapely Polygon or MultiPolygon
+        ROI polygon in (lon, lat) degrees.
+    grid : GeoGridSpec
+        Destination geographic grid.
+    margin_px : int, optional
+        Extra grid pixels added around the polygon bounds.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Half-open bounding box clipped to the grid.
+
+    """
+    rings = []
+    for polygon in polygon_parts(roi_geometry):
+        rings.append(np.asarray(polygon.exterior.coords))
+        rings.extend(np.asarray(interior.coords) for interior in polygon.interiors)
+    if not rings:
+        return (0, grid.height, 0, grid.width)
+    px = np.concatenate([_lonlat_ring_to_grid_px(ring, grid) for ring in rings])
+    col0 = max(0, int(np.floor(np.min(px[:, 0]))) - margin_px)
+    col1 = min(grid.width, int(np.ceil(np.max(px[:, 0]))) + 1 + margin_px)
+    row0 = max(0, int(np.floor(np.min(px[:, 1]))) - margin_px)
+    row1 = min(grid.height, int(np.ceil(np.max(px[:, 1]))) + 1 + margin_px)
+    return (row0, row1, col0, col1)
+
+
+def roi_geo_mask(
+    roi_geometry: object,
+    grid: GeoGridSpec,
+    row0: int,
+    row1: int,
+    col0: int,
+    col1: int,
+    dilate_px: int = 0,
+) -> np.ndarray:
+    """Return a bool mask of grid pixels inside a shapely lon/lat ROI.
+
+    Supports arbitrary polygons with holes and MultiPolygon geometries.
+
+    Parameters
+    ----------
+    roi_geometry : shapely Polygon or MultiPolygon
+        ROI polygon in (lon, lat) degrees.
+    grid : GeoGridSpec
+        Destination geographic grid.
+    row0, row1, col0, col1 : int
+        Bounding box to mask (half-open).
+    dilate_px : int, optional
+        Morphological dilation radius applied to the inside mask.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean mask with shape ``(row1-row0, col1-col0)``.
+
+    """
+    from matplotlib.path import Path
+
+    polygons = polygon_parts(roi_geometry)
+    rows = np.arange(row0, row1)
+    cols = np.arange(col0, col1)
+    rr, cc = np.meshgrid(rows, cols, indexing="ij")
+    pts = np.column_stack([cc.ravel(), rr.ravel()])
+    inside = np.zeros(pts.shape[0], dtype=bool)
+    for polygon in polygons:
+        outer = _lonlat_ring_to_grid_px(np.asarray(polygon.exterior.coords), grid)
+        poly_inside = Path(outer).contains_points(pts)
+        for interior in polygon.interiors:
+            hole = _lonlat_ring_to_grid_px(np.asarray(interior.coords), grid)
+            poly_inside &= ~Path(hole).contains_points(pts)
+        inside |= poly_inside
+    mask = inside.reshape(rr.shape)
+    if dilate_px > 0:
+        from scipy.ndimage import distance_transform_cdt
+
+        distance = distance_transform_cdt(~mask, metric="chessboard")
+        mask = distance <= float(dilate_px)
+    return mask
+
+
 def grid_lonlat(grid: GeoGridSpec) -> tuple[np.ndarray, np.ndarray]:
     """Return geographic coordinates at destination pixel centers."""
     return grid_lonlat_rows(grid, 0, grid.height)
@@ -323,6 +454,7 @@ def build_geo2rdr_lut(
     row_range: tuple[int, int] | None = None,
     col_range: tuple[int, int] | None = None,
     footprint_lonlat: np.ndarray | None = None,
+    roi_geometry: object | None = None,
     polygon_dilate_px: int = 64,
 ) -> Geo2RdrLUT:
     """Build a reusable geographic-to-radar lookup table.
@@ -354,6 +486,10 @@ def build_geo2rdr_lut(
         ``(N, 2)`` burst footprint polygon in (lon, lat). Pixels outside the
         polygon are skipped without calling geo2rdr, saving most of the
         wasted iterations in the bbox corners.
+    roi_geometry : shapely Polygon or MultiPolygon, optional
+        ROI polygon in (lon, lat). When given (and ``footprint_lonlat`` is
+        omitted) it replaces the footprint polygon as the prefilter mask,
+        allowing arbitrary polygons with holes and multi-part ROIs.
     polygon_dilate_px : int, optional
         Dilation radius applied to the footprint mask so edge pixels stay
         inside the crop and the optimization remains lossless.
@@ -436,6 +572,16 @@ def build_geo2rdr_lut(
             col0,
             col1,
             np.asarray(footprint_lonlat),
+            dilate_px=polygon_dilate_px,
+        )
+    elif roi_geometry is not None:
+        polygon_mask = roi_geo_mask(
+            roi_geometry,
+            grid,
+            row0,
+            row1,
+            col0,
+            col1,
             dilate_px=polygon_dilate_px,
         )
     for row_start in range(row0, row1, chunk_size):
