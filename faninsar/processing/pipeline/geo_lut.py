@@ -162,62 +162,6 @@ def derive_burst_geo_bbox(
     return (row0, row1, col0, col1)
 
 
-def burst_geo_polygon_lonlat(
-    geometry: RadarGeometryModel,
-    radar_shape: tuple[int, int],
-    dem: DEMSampler | None,
-) -> np.ndarray | None:
-    """Return the burst ground polygon in (lon, lat) via radar corner rdr2geo.
-
-    The polygon is built from the four radar-frame corners plus edge midpoints
-    mapped through rdr2geo. It is the true burst ground coverage and therefore
-    safe to use as a prefiltration mask (unlike the sparse XML footprint which
-    can be much smaller than the actual coverage).
-    """
-    from faninsar.processing.geometry import rdr2geo_ellipsoid, rdr2geo_with_dem
-
-    height, width = radar_shape
-    points = np.array(
-        [
-            [0.0, 0.0],
-            [0.0, width - 1],
-            [height - 1, 0.0],
-            [height - 1, width - 1],
-            [0.0, (width - 1) / 2],
-            [height - 1, (width - 1) / 2],
-            [(height - 1) / 2, 0.0],
-            [(height - 1) / 2, width - 1],
-        ],
-        dtype=np.float64,
-    )
-    if dem is not None:
-        res = rdr2geo_with_dem(
-            geometry,
-            points[:, 0],
-            points[:, 1],
-            dem,
-            height_seed_m=0.0,
-        )
-        lat = np.asarray(res.latitude_deg)
-        lon = np.asarray(res.longitude_deg)
-    else:
-        res = rdr2geo_ellipsoid(
-            geometry,
-            points[:, 0],
-            points[:, 1],
-            height_m=0.0,
-        )
-        lat = np.asarray(res.latitude_deg)
-        lon = np.asarray(res.longitude_deg)
-    ok = np.isfinite(lat) & np.isfinite(lon)
-    if not np.any(ok):
-        return None
-    from scipy.spatial import ConvexHull
-
-    hull = ConvexHull(np.column_stack([lon[ok], lat[ok]]))
-    return np.column_stack([lon[ok], lat[ok]])[hull.vertices]
-
-
 def burst_geo_quad_lonlat(
     geometry: RadarGeometryModel,
     radar_shape: tuple[int, int],

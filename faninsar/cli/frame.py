@@ -107,7 +107,7 @@ def _cli_dem_bounds(
 ) -> tuple[float, float, float, float]:
     """Return EPSG:4326 bounds for the CLI DEM build.
 
-    Uses ROI bounds or the union of every reference SAFE burst footprint
+    Uses ROI bounds or the union of every reference SAFE burst radar quad
     with 0.01 deg padding.
     """
     if roi is not None:
@@ -118,20 +118,33 @@ def _cli_dem_bounds(
             float(roi.top),
         )
     from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.pipeline.geo_lut import burst_geo_quad_lonlat
+    from faninsar.processing.pipeline.production import _radar_model
 
     lons: list[float] = []
     lats: list[float] = []
     for path in reference:
         product = open_safe_product(path)
         for swath_item in product.swaths:
+            shape = (swath_item.lines_per_burst, swath_item.samples_per_burst)
             for burst in swath_item.bursts:
-                if burst.footprint is None:
-                    continue
-                for lon, lat in burst.footprint:
-                    lons.append(float(lon))
-                    lats.append(float(lat))
+                geometry = _radar_model(
+                    swath_item,
+                    burst,
+                    shape=shape,
+                    row0=burst.index * swath_item.lines_per_burst,
+                    col0=0,
+                )
+                quad = burst_geo_quad_lonlat(
+                    geometry=geometry,
+                    radar_shape=shape,
+                    dem=None,
+                )
+                if quad is not None:
+                    lons.extend(float(point[0]) for point in quad)
+                    lats.extend(float(point[1]) for point in quad)
     if not lons:
-        message = "cannot derive DEM bounds for --dem without --roi or footprints"
+        message = "cannot derive DEM bounds for --dem without --roi or burst quads"
         raise SystemExit(message)
     pad = 0.01
     return (

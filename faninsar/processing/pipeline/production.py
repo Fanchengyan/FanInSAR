@@ -2132,6 +2132,8 @@ def _auto_dem_bounds(
     roi: BoundingBox | Polygons | None,
     resolved: dict[tuple[int, str], list[int]],
     reference_products: list,
+    orbits: Sequence[str | Path | None] | None = None,
+    dem: DEMSampler | None = None,
 ) -> tuple[float, float, float, float]:
     """Return EPSG:4326 bounds covering the ROI or the selected bursts.
 
@@ -2143,12 +2145,16 @@ def _auto_dem_bounds(
         Selected burst indices per (frame_index, swath).
     reference_products : list
         Opened reference SAFE products, one per frame.
+    orbits : sequence of path or None, optional
+        Per-frame precise orbit files used to build the burst quads.
+    dem : DEMSampler, optional
+        DEM used by the burst quad rdr2geo.
 
     Returns
     -------
     tuple[float, float, float, float]
         (min_lon, min_lat, max_lon, max_lat) with 0.01 deg padding when the
-        bounds come from burst footprints.
+        bounds come from burst quads.
 
     """
     if isinstance(roi, BoundingBox):
@@ -2166,28 +2172,38 @@ def _auto_dem_bounds(
             float(total[2]),
             float(total[3]),
         )
+    from dataclasses import replace as _replace
+
+    from faninsar.missions.sentinel1 import read_eof_orbit
+    from faninsar.processing.pipeline.geo_lut import burst_geo_quad_lonlat
+
     lons: list[float] = []
     lats: list[float] = []
     for (frame_index, swath), indices in resolved.items():
-        swath_obj = reference_products[frame_index].swath(swath)
+        s1_swath = reference_products[frame_index].swath(swath)
+        orbit_path = None if orbits is None else orbits[frame_index]
+        if orbit_path is not None:
+            s1_swath = _replace(s1_swath, orbit=read_eof_orbit(orbit_path))
+        shape = (s1_swath.lines_per_burst, s1_swath.samples_per_burst)
         for burst_index in indices:
-            footprint = swath_obj.bursts[burst_index].footprint
-            if footprint is None:
-                continue
-            for lon, lat in footprint:
-                lons.append(float(lon))
-                lats.append(float(lat))
+            burst = s1_swath.bursts[burst_index]
+            geometry = _radar_model(
+                s1_swath,
+                burst,
+                shape=shape,
+                row0=burst.index * s1_swath.lines_per_burst,
+                col0=0,
+            )
+            quad = burst_geo_quad_lonlat(
+                geometry=geometry,
+                radar_shape=shape,
+                dem=dem,
+            )
+            if quad is not None:
+                lons.extend(float(point[0]) for point in quad)
+                lats.extend(float(point[1]) for point in quad)
     if not lons:
-        for product in reference_products:
-            for swath_item in product.swaths:
-                for burst in swath_item.bursts:
-                    if burst.footprint is None:
-                        continue
-                    for lon, lat in burst.footprint:
-                        lons.append(float(lon))
-                        lats.append(float(lat))
-    if not lons:
-        reject_invalid_state("cannot derive DEM bounds: no burst footprints available")
+        reject_invalid_state("cannot derive DEM bounds: no burst geometry available")
     pad = 0.01
     return (
         min(lons) - pad,
@@ -2694,7 +2710,13 @@ def run_pair(
             get_dem_manager,
         )
 
-        bounds = _auto_dem_bounds(roi, resolved, reference_products)
+        bounds = _auto_dem_bounds(
+            roi,
+            resolved,
+            reference_products,
+            orbits=ref_orbits,
+            dem=dem_sampler,
+        )
         dem_path = get_dem_manager().fetch_dem(
             bounds, Path(output_dir) / "dem" / default_dem_name()
         )
@@ -3216,7 +3238,13 @@ def _run_pair_sweep(
             get_dem_manager,
         )
 
-        bounds = _auto_dem_bounds(roi, resolved, reference_products)
+        bounds = _auto_dem_bounds(
+            roi,
+            resolved,
+            reference_products,
+            orbits=ref_orbits,
+            dem=dem_sampler,
+        )
         dem_path = get_dem_manager().fetch_dem(
             bounds, output_root / "dem" / default_dem_name()
         )
