@@ -76,6 +76,9 @@ def tops_carrier_phase(
     n_lines: int,
     n_samples: int,
     *,
+    row0: int = 0,
+    col0: int = 0,
+    native_height: int | None = None,
     dtype: np.dtype | type = np.float64,
 ) -> np.ndarray:
     """Compute the TOPS carrier phase (radians) on a burst window.
@@ -93,6 +96,10 @@ def tops_carrier_phase(
         Burst carrier parameters.
     n_lines, n_samples : int
         Burst window shape.
+    row0, col0 : int, optional
+        Offset of the window inside the native burst for carrier coordinates.
+    native_height : int, optional
+        Native burst height used for the carrier centre row.
     dtype : numpy.dtype, optional
         Output phase dtype. ``float32`` halves peak memory for full bursts
         while remaining adequate for the subsequent complex multiply.
@@ -106,13 +113,14 @@ def tops_carrier_phase(
     """
     if n_lines <= 0 or n_samples <= 0:
         reject_invalid_state("burst window dimensions must be positive")
-    cols = np.arange(n_samples, dtype=np.float64)[None, :]
-    rows = np.arange(n_lines, dtype=np.float64)[:, None]
+    cols = (np.arange(n_samples, dtype=np.float64) + float(col0))[None, :]
+    rows = (np.arange(n_lines, dtype=np.float64) + float(row0))[:, None]
+    centre_row = float(n_lines // 2 if native_height is None else native_height // 2)
     phase = carrier_phase_at_points(
         model,
         np.broadcast_to(rows, (n_lines, n_samples)),
         np.broadcast_to(cols, (n_lines, n_samples)),
-        centre_row=float(n_lines // 2),
+        centre_row=centre_row,
         dtype=dtype,
     )
     return np.asarray(phase, dtype=dtype)
@@ -152,11 +160,12 @@ def _carrier_phase_rows(
     n_samples: int,
     *,
     centre_row: float,
+    col0: int = 0,
     dtype: np.dtype | type = np.float32,
 ) -> np.ndarray:
     """Carrier phase for a subset of absolute burst-local row indices."""
     rows = np.asarray(row_indices, dtype=np.float64)[:, None]
-    cols = np.arange(n_samples, dtype=np.float64)[None, :]
+    cols = (np.arange(n_samples, dtype=np.float64) + float(col0))[None, :]
     return carrier_phase_at_points(
         model,
         np.broadcast_to(rows, (rows.shape[0], n_samples)),
@@ -173,24 +182,43 @@ def _apply_carrier_tiled(
     sign: float,
     phase_dtype: np.dtype | type,
     row_chunk: int | None,
+    row0: int = 0,
+    col0: int = 0,
+    native_height: int | None = None,
 ) -> np.ndarray:
     """Shared tiled carrier multiply for deramp (sign=-1) and reramp (sign=+1)."""
     n_lines, n_samples = samples.shape
     if row_chunk is None or row_chunk <= 0 or n_lines <= row_chunk:
-        phase = tops_carrier_phase(model, n_lines, n_samples, dtype=phase_dtype)
+        phase = tops_carrier_phase(
+            model,
+            n_lines,
+            n_samples,
+            row0=row0,
+            col0=col0,
+            native_height=native_height,
+            dtype=phase_dtype,
+        )
         return _apply_carrier_phase(samples, phase, sign=sign)
 
     out = np.empty_like(samples)
-    for row0 in range(0, n_lines, row_chunk):
-        row1 = min(row0 + row_chunk, n_lines)
+    centre_row = float(
+        n_lines // 2 if native_height is None else native_height // 2
+    )
+    for row_start in range(0, n_lines, row_chunk):
+        row_stop = min(row_start + row_chunk, n_lines)
         phase = _carrier_phase_rows(
             model,
-            np.arange(row0, row1, dtype=np.float64),
+            np.arange(row_start, row_stop, dtype=np.float64) + float(row0),
             n_samples,
-            centre_row=float(n_lines // 2),
+            centre_row=centre_row,
+            col0=col0,
             dtype=phase_dtype,
         )
-        out[row0:row1] = _apply_carrier_phase(samples[row0:row1], phase, sign=sign)
+        out[row_start:row_stop] = _apply_carrier_phase(
+            samples[row_start:row_stop],
+            phase,
+            sign=sign,
+        )
     return out
 
 
@@ -241,6 +269,9 @@ def reramp(
     *,
     phase_dtype: np.dtype | type = np.float64,
     row_chunk: int | None = 256,
+    row0: int = 0,
+    col0: int = 0,
+    native_height: int | None = None,
 ) -> np.ndarray:
     """Restore the TOPS carrier phase to complex samples.
 
@@ -254,6 +285,10 @@ def reramp(
         Working dtype for the carrier phase plane. Default ``float64``.
     row_chunk : int or None, optional
         Azimuth tile height for the carrier multiply. Default 256.
+    row0, col0 : int, optional
+        Offset of the window inside the native burst for carrier coordinates.
+    native_height : int, optional
+        Native burst height used for the carrier centre row.
 
     Returns
     -------
@@ -269,6 +304,9 @@ def reramp(
         sign=1.0,
         phase_dtype=phase_dtype,
         row_chunk=row_chunk,
+        row0=row0,
+        col0=col0,
+        native_height=native_height,
     )
 
 

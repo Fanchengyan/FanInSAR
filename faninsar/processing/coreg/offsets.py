@@ -367,6 +367,9 @@ def resample_complex_deramped_reramp(
     executor: Literal["torch"] = "torch",
     device: str = "auto",
     output_carrier: TOPSCarrierModel | None = None,
+    row0: int = 0,
+    col0: int = 0,
+    native_height: int | None = None,
 ) -> np.ndarray:
     """Resample a deramped secondary onto the reference grid, then analytical reramp.
 
@@ -405,6 +408,10 @@ def resample_complex_deramped_reramp(
     output_carrier : TOPSCarrierModel, optional
         Carrier on the output reference grid. When omitted, the secondary
         carrier is evaluated at source coordinates.
+    row0, col0 : int, optional
+        Offset of the window inside the native burst for carrier coordinates.
+    native_height : int, optional
+        Native burst height used for the carrier centre row.
 
     Returns
     -------
@@ -426,7 +433,9 @@ def resample_complex_deramped_reramp(
     if not scalar_rg and rg_off.shape != (height, width):
         reject_invalid_state("range_offset_px must be scalar or match samples shape")
 
-    centre_row = float(height // 2)
+    centre_row = float(
+        height // 2 if native_height is None else native_height // 2
+    )
     out = np.empty((height, width), dtype=sec_deramped.dtype)
     col_idx = np.arange(width, dtype=np.float64)
     remapped_deramped = resample_complex(
@@ -439,20 +448,20 @@ def resample_complex_deramped_reramp(
         device=device,
     )
 
-    for row0 in range(0, height, row_chunk):
-        row1 = min(row0 + row_chunk, height)
-        n_rows = row1 - row0
-        row_idx = np.arange(row0, row1, dtype=np.float64)[:, None]
+    for row_start in range(0, height, row_chunk):
+        row_stop = min(row_start + row_chunk, height)
+        n_rows = row_stop - row_start
+        row_idx = np.arange(row_start, row_stop, dtype=np.float64)[:, None]
         cols = np.broadcast_to(col_idx[None, :], (n_rows, width))
         rows = np.broadcast_to(row_idx, (n_rows, width))
-        az_tile = az_off if scalar_az else az_off[row0:row1]
-        rg_tile = rg_off if scalar_rg else rg_off[row0:row1]
+        az_tile = az_off if scalar_az else az_off[row_start:row_stop]
+        rg_tile = rg_off if scalar_rg else rg_off[row_start:row_stop]
         src_row = rows - az_tile
         src_col = cols - rg_tile
-        tile = remapped_deramped[row0:row1]
+        tile = remapped_deramped[row_start:row_stop]
         carrier_model = secondary_carrier if output_carrier is None else output_carrier
-        carrier_row = src_row if output_carrier is None else rows
-        carrier_col = src_col if output_carrier is None else cols
+        carrier_row = (src_row if output_carrier is None else rows) + float(row0)
+        carrier_col = (src_col if output_carrier is None else cols) + float(col0)
         phi_src = carrier_phase_at_points(
             carrier_model,
             carrier_row,
@@ -466,6 +475,9 @@ def resample_complex_deramped_reramp(
         im = tile.imag.astype(np.float32, copy=False)
         out_re = re * cos_p - im * sin_p
         out_im = im * cos_p + re * sin_p
-        out[row0:row1] = (out_re + 1j * out_im).astype(sec_deramped.dtype, copy=False)
+        out[row_start:row_stop] = (out_re + 1j * out_im).astype(
+            sec_deramped.dtype,
+            copy=False,
+        )
 
     return out

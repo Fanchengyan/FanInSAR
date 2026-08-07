@@ -123,6 +123,8 @@ def dense_geometry_offsets(
     max_iter: int = 30,
     range_tol_m: float = 0.001,
     doppler_tol_hz: float = 0.1,
+    row0: int = 0,
+    col0: int = 0,
 ) -> OffsetFieldResult:
     """Estimate dense range/azimuth offsets from dual-orbit geometry + DEM.
 
@@ -147,6 +149,9 @@ def dense_geometry_offsets(
         faster but may miss rapid geometric variation.
     max_iter, range_tol_m, doppler_tol_hz : optional
         Newton-solver tolerances passed to the rdr2geo/geo2rdr transforms.
+    row0, col0 : int, optional
+        Offset of the window inside the native burst for control-point
+        coordinates.
 
     Returns
     -------
@@ -174,7 +179,8 @@ def dense_geometry_offsets(
         reject_invalid_state("stride must be >= 1")
 
     az_ctrl, rg_ctrl = _build_control_grid(shape, stride)
-    az_grid, rg_grid = np.meshgrid(az_ctrl, rg_ctrl, indexing="ij")
+    az_grid = az_ctrl[:, None] + float(row0)
+    rg_grid = rg_ctrl[None, :] + float(col0)
 
     # Reference: radar -> geo
     if dem is not None:

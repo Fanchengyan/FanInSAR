@@ -325,6 +325,16 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     burst_work_dir: Path | None = None
     if coregistration_grid == "geo" and geo_work_dir is not None:
         burst_work_dir = Path(geo_work_dir) / tag
+    roi_window: tuple[int, int, int, int] | None = None
+    if coregistration_grid == "radar" and roi is not None:
+        assert state.reference_deramped is not None
+        roi_window = _roi_burst_window(
+            roi,
+            ref.geometry,
+            dem,
+            state.reference_deramped.shape,
+            buffer_m=roi_buffer_m,
+        )
     state = stage_coregister(
         state,
         control_spacing=control_spacing,
@@ -339,6 +349,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         geo_work_dir=burst_work_dir,
         roi=roi,
         roi_buffer_m=roi_buffer_m,
+        roi_window=roi_window,
     )
     stage_times["coregister"] = time.perf_counter() - t0
     burst_row0 = 0
@@ -347,22 +358,8 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     if coregistration_grid == "geo":
         if state.geocoded_slc_valid is not None:
             geo_valid_mask = np.asarray(state.geocoded_slc_valid)
-    elif roi is not None:
-        assert state.reference_deramped is not None
-        window = _roi_burst_window(
-            roi,
-            ref.geometry,
-            dem,
-            state.reference_deramped.shape,
-        )
-        if window is not None:
-            burst_row0, burst_row1, burst_col0, burst_col1 = window
-            state.reference_deramped = state.reference_deramped[
-                burst_row0:burst_row1, burst_col0:burst_col1
-            ]
-            state.secondary_aligned = state.secondary_aligned[
-                burst_row0:burst_row1, burst_col0:burst_col1
-            ]
+    elif state.radar_roi_origin is not None:
+        burst_row0, burst_col0 = state.radar_roi_origin
     assert state.reference_deramped is not None
     assert state.secondary_aligned is not None
     pri_power = state.reference_deramped.real**2 + state.reference_deramped.imag**2
@@ -606,6 +603,7 @@ class ProductionPairState:
     geo_work_dir: Path | None = None
     memory_watchdog: MemoryWatchdog | None = None
     geo_bbox: tuple[int, int, int, int] | None = None
+    radar_roi_origin: tuple[int, int] | None = None
 
     def note(self, message: str) -> None:
         """Append a stage log line."""
@@ -898,6 +896,7 @@ def stage_coregister(
     geo_work_dir: str | Path | None = None,
     roi: BoundingBox | Polygons | None = None,
     roi_buffer_m: float = 320.0,
+    roi_window: tuple[int, int, int, int] | None = None,
     memory_watchdog: MemoryWatchdog | None = None,
 ) -> ProductionPairState:
     """Estimate dense offsets and coregister on a radar or geographic grid.
@@ -945,6 +944,9 @@ def stage_coregister(
     roi_buffer_m : float, optional
         Physical margin in meters kept around the ROI in geo mode, applied in
         the grid CRS so the extension is isotropic on the ground.
+    roi_window : tuple[int, int, int, int], optional
+        Radar window ``(row0, row1, col0, col1)`` to coregister instead of the
+        full burst (radar mode with an ROI).
     memory_watchdog : MemoryWatchdog, optional
         Memory guard sampled after each geographic tile.
 
@@ -975,6 +977,21 @@ def stage_coregister(
     )
     if resolved_control_spacing < 1:
         reject_invalid_state("control_spacing must be >= 1")
+    window_origin: tuple[int, int] | None = None
+    if coregistration_grid == "radar" and roi_window is not None:
+        wr0, wr1, wc0, wc1 = roi_window
+        halo = 64
+        stride = resolved_control_spacing
+        cr0 = max(0, (wr0 - halo) // stride * stride)
+        cr1 = min(ref.shape[0], wr1 + halo)
+        cc0 = max(0, (wc0 - halo) // stride * stride)
+        cc1 = min(ref.shape[1], wc1 + halo)
+        ref = ref[cr0:cr1, cc0:cc1]
+        sec = sec[cr0:cr1, cc0:cc1]
+        window_origin = (cr0, cc0)
+        state.reference_deramped = ref
+        state.secondary_deramped = sec
+        state.radar_roi_origin = window_origin
     substage_started = time.perf_counter()
     geometry_field = dense_geometry_offsets(
         shape=ref.shape,
@@ -982,6 +999,8 @@ def stage_coregister(
         secondary_model=state.secondary.geometry,
         dem=dem,
         stride=resolved_control_spacing,
+        row0=0 if window_origin is None else window_origin[0],
+        col0=0 if window_origin is None else window_origin[1],
     )
     state.coregistration_timings_s["dense_geometry_offsets"] = (
         time.perf_counter() - substage_started
@@ -1183,6 +1202,9 @@ def stage_coregister(
         azimuth_offset_px=offsets.azimuth_offset_px,
         executor=executor,
         device=device,
+        row0=0 if window_origin is None else window_origin[0],
+        col0=0 if window_origin is None else window_origin[1],
+        native_height=state.reference.array.samples.shape[0],
     )
     secondary_geometry = state.secondary.geometry
     phase_per_range_pixel = (
@@ -1206,7 +1228,13 @@ def stage_coregister(
         phase_per_range_pixel * offsets.range_offset_px
     ).astype(np.float32)
     state.secondary_deramped = None
-    state.reference_deramped = reramp(ref, state.reference.carrier)
+    state.reference_deramped = reramp(
+        ref,
+        state.reference.carrier,
+        row0=0 if window_origin is None else window_origin[0],
+        col0=0 if window_origin is None else window_origin[1],
+        native_height=state.reference.array.samples.shape[0],
+    )
     state.secondary_aligned = sec_resamp
     del sec_resamp, sec, ref, offsets
     gc.collect()
@@ -1323,6 +1351,9 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
     rg_looks = max(full_w // max(width, 1), 1)
     az_full = (np.arange(height, dtype=np.float64) + 0.5) * az_looks - 0.5
     rg_full = (np.arange(width, dtype=np.float64) + 0.5) * rg_looks - 0.5
+    roi_origin = state.radar_roi_origin or (0, 0)
+    az_full = az_full + float(roi_origin[0])
+    rg_full = rg_full + float(roi_origin[1])
     az_grid, rg_grid = np.meshgrid(az_full, rg_full, indexing="ij")
 
     def _topographic_phase() -> tuple[np.ndarray, float, float, float]:
@@ -2318,24 +2349,57 @@ def _roi_burst_window(
     geometry: RadarGeometryModel,
     dem: DEMSampler,
     shape: tuple[int, int],
+    buffer_m: float = 320.0,
 ) -> tuple[int, int, int, int] | None:
+    """Return the radar window covering the ROI-burst quad intersection."""
+    from shapely.geometry import Polygon as ShapelyPolygon
+
     from faninsar.processing.geometry import geo2rdr
+    from faninsar.processing.pipeline.geo_lut import (
+        burst_geo_quad_lonlat,
+        polygon_parts,
+    )
 
     region = _roi_geometry(roi)
-    min_lon, min_lat, max_lon, max_lat = region.bounds
-    lon = np.asarray([min_lon, max_lon, max_lon, min_lon], dtype=np.float64)
-    lat = np.asarray([max_lat, max_lat, min_lat, min_lat], dtype=np.float64)
-    height = float(np.mean(dem.sample(lat, lon)))
+    quad = burst_geo_quad_lonlat(geometry, shape, dem)
+    if quad is not None:
+        intersection = region.intersection(ShapelyPolygon(quad).buffer(0))
+        parts = [
+            part for part in polygon_parts(intersection) if not part.is_empty
+        ]
+    else:
+        parts = []
+    if parts:
+        rings: list[np.ndarray] = []
+        for polygon in parts:
+            rings.append(np.asarray(polygon.exterior.coords))
+            rings.extend(
+                np.asarray(interior.coords) for interior in polygon.interiors
+            )
+        points = np.concatenate(rings)
+        lon = points[:, 0]
+        lat = points[:, 1]
+    else:
+        min_lon, min_lat, max_lon, max_lat = region.bounds
+        lon = np.asarray([min_lon, max_lon, max_lon, min_lon], dtype=np.float64)
+        lat = np.asarray([max_lat, max_lat, min_lat, min_lat], dtype=np.float64)
+    height = np.asarray(dem.sample(lat, lon), dtype=np.float64)
     transform = geo2rdr(geometry, lat, lon, height)
-    azimuth = transform.azimuth_index
-    range_index = transform.range_index
-    ok = transform.converged & np.isfinite(azimuth) & np.isfinite(range_index)
+    azimuth = np.asarray(transform.azimuth_index, dtype=np.float64)
+    range_index = np.asarray(transform.range_index, dtype=np.float64)
+    ok = (
+        np.asarray(transform.converged, dtype=bool)
+        & np.isfinite(azimuth)
+        & np.isfinite(range_index)
+    )
     if not np.any(ok):
         return None
-    row0 = max(0, int(np.floor(np.min(azimuth[ok]))))
-    row1 = min(shape[0], int(np.ceil(np.max(azimuth[ok]))) + 1)
-    col0 = max(0, int(np.floor(np.min(range_index[ok]))))
-    col1 = min(shape[1], int(np.ceil(np.max(range_index[ok]))) + 1)
+    az_px = max(1, int(np.ceil(buffer_m / (7000.0 * geometry.azimuth_time_interval_s))))
+    rg_px = max(1, int(np.ceil(buffer_m / geometry.range_spacing_m)))
+    row0 = max(0, int(np.floor(np.min(azimuth[ok]))) - az_px)
+    row1 = min(shape[0], int(np.ceil(np.max(azimuth[ok]))) + 1 + az_px)
+    col0 = max(0, int(np.floor(np.min(range_index[ok]))) - rg_px)
+    col1 = min(shape[1], int(np.ceil(np.max(range_index[ok]))) + 1 + rg_px)
     if row1 <= row0 or col1 <= col0:
         return None
     return row0, row1, col0, col1
@@ -2902,6 +2966,16 @@ def run_pair(
             state = stage_deramp(state)
             stage_times["deramp"] = time.perf_counter() - t0
             t0 = time.perf_counter()
+            roi_window: tuple[int, int, int, int] | None = None
+            if roi is not None:
+                assert state.reference_deramped is not None
+                roi_window = _roi_burst_window(
+                    roi,
+                    ref.geometry,
+                    dem_sampler,
+                    state.reference_deramped.shape,
+                    buffer_m=roi_buffer_m,
+                )
             state = stage_coregister(
                 state,
                 control_spacing=control_spacing,
@@ -2909,26 +2983,13 @@ def run_pair(
                 amplitude_refinement_enabled=amplitude_refinement_enabled,
                 executor=executor,
                 device=device,
+                roi_window=roi_window,
             )
             stage_times["coregister"] = time.perf_counter() - t0
             burst_row0 = 0
             burst_col0 = 0
-            if roi is not None:
-                assert state.reference_deramped is not None
-                window = _roi_burst_window(
-                    roi,
-                    ref.geometry,
-                    dem_sampler,
-                    state.reference_deramped.shape,
-                )
-                if window is not None:
-                    burst_row0, burst_row1, burst_col0, burst_col1 = window
-                    state.reference_deramped = state.reference_deramped[
-                        burst_row0:burst_row1, burst_col0:burst_col1
-                    ]
-                    state.secondary_aligned = state.secondary_aligned[
-                        burst_row0:burst_row1, burst_col0:burst_col1
-                    ]
+            if state.radar_roi_origin is not None:
+                burst_row0, burst_col0 = state.radar_roi_origin
             assert state.reference_deramped is not None
             assert state.secondary_aligned is not None
             pri_power = (
