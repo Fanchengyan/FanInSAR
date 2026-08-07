@@ -181,6 +181,91 @@ def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
     assert geometry_call["stride"] == 8
 
 
+def test_stage_coregister_grows_roi_halo_for_large_offsets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A large geometric offset grows the ROI crop until the margin covers it."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.pipeline import production as production_mod
+
+    shape = (512, 1024)
+    window = (100, 200, 200, 400)
+    ref = _make_mock_scene(shape)
+    sec = _make_mock_scene(shape)
+    ref.geometry.range_spacing_m = 2.3
+    ref.geometry.wavelength_m = 0.056
+    sec.geometry.range_spacing_m = 2.3
+    sec.geometry.wavelength_m = 0.056
+    state = ProductionPairState(
+        pair_id="window_halo_growth",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+    )
+    state.reference_deramped = np.ones(shape, dtype=np.complex64)
+    state.secondary_deramped = np.ones(shape, dtype=np.complex64)
+
+    geometry_calls: list[tuple[tuple[int, int], int, int, int]] = []
+    resample_kwargs: dict[str, object] = {}
+
+    def fake_extent(*_args: object, **_kwargs: object) -> float:
+        return 0.0
+
+    def fake_dense_geometry_offsets(
+        *,
+        shape: tuple[int, int],
+        stride: int,
+        row0: int,
+        col0: int,
+        **_kwargs: object,
+    ) -> OffsetFieldResult:
+        geometry_calls.append((shape, stride, row0, col0))
+        return OffsetFieldResult(
+            range_offset_px=np.full(shape, 250.0, dtype=np.float32),
+            azimuth_offset_px=np.zeros(shape, dtype=np.float32),
+            coverage=np.ones(shape, dtype=bool),
+            uncertainty_px=np.zeros(shape, dtype=np.float32),
+        )
+
+    def fake_resample(
+        samples: np.ndarray, **kwargs: object
+    ) -> np.ndarray:
+        resample_kwargs.update(kwargs)
+        return samples.copy()
+
+    monkeypatch.setattr(
+        production_mod, "geometry_offset_window_extent", fake_extent
+    )
+    monkeypatch.setattr(
+        production_mod, "dense_geometry_offsets", fake_dense_geometry_offsets
+    )
+    monkeypatch.setattr(
+        production_mod, "resample_complex_deramped_reramp", fake_resample
+    )
+
+    result = stage_coregister(
+        state,
+        esd_enabled=False,
+        amplitude_refinement_enabled=False,
+        executor="torch",
+        device="cpu",
+        roi_window=window,
+    )
+
+    assert len(geometry_calls) == 2
+    first_shape, first_stride, _first_row0, _first_col0 = geometry_calls[0]
+    second_shape, _second_stride, second_row0, second_col0 = geometry_calls[1]
+    assert first_stride == 8
+    assert (first_shape[0] < second_shape[0] and first_shape[1] < second_shape[1]) or (
+        first_shape[0] == second_shape[0] and first_shape[1] == second_shape[1]
+    )
+    assert resample_kwargs["row0"] == second_row0
+    assert resample_kwargs["col0"] == second_col0
+    assert result.radar_roi_origin == (second_row0, second_col0)
+    assert result.secondary_aligned is not None
+    assert result.secondary_aligned.shape == second_shape
+
+
 def test_stage_interferogram_with_synthetic() -> None:
     """stage_interferogram forms a multilooked interferogram from aligned arrays."""
     ref = _make_mock_scene((16, 16))

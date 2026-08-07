@@ -433,9 +433,7 @@ def resample_complex_deramped_reramp(
     if not scalar_rg and rg_off.shape != (height, width):
         reject_invalid_state("range_offset_px must be scalar or match samples shape")
 
-    centre_row = float(
-        height // 2 if native_height is None else native_height // 2
-    )
+    centre_row = float(height // 2 if native_height is None else native_height // 2)
     out = np.empty((height, width), dtype=sec_deramped.dtype)
     col_idx = np.arange(width, dtype=np.float64)
     remapped_deramped = resample_complex(

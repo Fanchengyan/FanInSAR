@@ -201,9 +201,7 @@ def _apply_carrier_tiled(
         return _apply_carrier_phase(samples, phase, sign=sign)
 
     out = np.empty_like(samples)
-    centre_row = float(
-        n_lines // 2 if native_height is None else native_height // 2
-    )
+    centre_row = float(n_lines // 2 if native_height is None else native_height // 2)
     for row_start in range(0, n_lines, row_chunk):
         row_stop = min(row_start + row_chunk, n_lines)
         phase = _carrier_phase_rows(

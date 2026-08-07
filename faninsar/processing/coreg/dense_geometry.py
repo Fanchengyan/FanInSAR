@@ -113,6 +113,141 @@ def _interpolate_field(
     return out
 
 
+def _control_point_geometry_offsets(
+    shape: tuple[int, int],
+    *,
+    reference_model: RadarGeometryModel,
+    secondary_model: RadarGeometryModel,
+    dem: DEMSampler | None = None,
+    stride: int = 32,
+    max_iter: int = 30,
+    range_tol_m: float = 0.001,
+    doppler_tol_hz: float = 0.1,
+    row0: int = 0,
+    col0: int = 0,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Evaluate exact geometry offsets on the control-point grid.
+
+    Parameters
+    ----------
+    shape : tuple[int, int]
+        Control-grid array shape ``(azimuth, range)``.
+    reference_model, secondary_model : RadarGeometryModel
+        Geometry models for the reference and secondary images.
+    dem : DEMSampler | None, optional
+        DEM height sampler.  If ``None``, a constant zero-height ellipsoid
+        is used.
+    stride : int, optional
+        Control-point spacing in pixels (default 32).
+    max_iter, range_tol_m, doppler_tol_hz : optional
+        Newton-solver tolerances passed to the rdr2geo/geo2rdr transforms.
+    row0, col0 : int, optional
+        Offset of the window inside the native burst for control-point
+        coordinates.
+
+    Returns
+    -------
+    az_ctrl, rg_ctrl : numpy.ndarray
+        1-D control-point coordinates relative to ``(row0, col0)``.
+    rg_offset_ctrl, az_offset_ctrl : numpy.ndarray
+        Control-point range/azimuth offsets in pixels (NaN where invalid).
+    uncertainty_ctrl : numpy.ndarray
+        Heuristic control-point uncertainty in pixels (NaN where invalid).
+    valid : numpy.ndarray
+        Boolean mask of converged control points.
+
+    """
+    az_ctrl, rg_ctrl = _build_control_grid(shape, stride)
+    az_grid = az_ctrl[:, None] + float(row0)
+    rg_grid = rg_ctrl[None, :] + float(col0)
+
+    # Reference: radar -> geo
+    if dem is not None:
+        ref_geo = rdr2geo_with_dem(
+            reference_model,
+            az_grid,
+            rg_grid,
+            dem,
+            max_iter=max_iter,
+            range_tol_m=range_tol_m,
+            doppler_tol_hz=doppler_tol_hz,
+        )
+    else:
+        from faninsar.processing.geometry.transforms import rdr2geo_ellipsoid
+
+        ref_geo = rdr2geo_ellipsoid(
+            reference_model,
+            az_grid,
+            rg_grid,
+            height_m=0.0,
+            max_iter=max_iter,
+            range_tol_m=range_tol_m,
+            doppler_tol_hz=doppler_tol_hz,
+        )
+
+    # Secondary: geo -> radar
+    # Mask out non-finite geodetic coordinates to avoid NaN propagation in geo2rdr
+    geo_valid = (
+        ref_geo.converged
+        & np.isfinite(ref_geo.latitude_deg)
+        & np.isfinite(ref_geo.longitude_deg)
+        & np.isfinite(ref_geo.height_m)
+    )
+    if not np.any(geo_valid):
+        logger.warning("No valid geodetic coordinates for secondary geo2rdr")
+        invalid = np.full(shape, np.nan, dtype=np.float64)
+        return (
+            az_ctrl,
+            rg_ctrl,
+            invalid,
+            invalid,
+            invalid,
+            np.zeros(shape, dtype=bool),
+        )
+    sec_rdr = geo2rdr(
+        secondary_model,
+        np.where(geo_valid, ref_geo.latitude_deg, 0.0),
+        np.where(geo_valid, ref_geo.longitude_deg, 0.0),
+        np.where(geo_valid, ref_geo.height_m, 0.0),
+        max_iter=max_iter,
+    )
+
+    # Valid only where both transforms converged
+    valid = geo_valid & sec_rdr.converged
+
+    # Offsets for :func:`resample_complex`, which samples
+    # ``source = output_index - offset`` on the secondary.
+    # Same ground point is at ``ref_index`` on the reference and
+    # ``sec_index`` on the secondary, so we need
+    # ``source = sec_index`` when ``output = ref_index``:
+    # ``offset = ref_index - sec_index``.
+    # (Previously the opposite sign was used, which mis-registered the
+    # secondary by about twice the geometric shift and destroyed interferogram
+    # coherence on real Sentinel-1 pairs.)
+    rg_offset_ctrl = np.where(valid, rg_grid - sec_rdr.range_index, np.nan)
+    az_offset_ctrl = np.where(valid, az_grid - sec_rdr.azimuth_index, np.nan)
+
+    # Uncertainty heuristic: sum of absolute residuals scaled to pixels.
+    # Range residual -> range pixels; Doppler residual (Hz) -> azimuth pixels
+    # via a PRF-like factor (1 / azimuth_time_interval_s).
+    range_res_px = np.abs(ref_geo.residual_range_m) / max(
+        reference_model.range_spacing_m, 1e-6
+    ) + np.abs(sec_rdr.residual_range_m) / max(secondary_model.range_spacing_m, 1e-6)
+    prf_like = 1.0 / max(reference_model.azimuth_time_interval_s, 1e-6)
+    az_res_px = np.abs(ref_geo.residual_doppler_hz) / max(prf_like, 1e-6) + np.abs(
+        sec_rdr.residual_doppler_hz
+    ) / max(prf_like, 1e-6)
+    uncertainty_ctrl = np.where(valid, range_res_px + az_res_px, np.nan)
+    return az_ctrl, rg_ctrl, rg_offset_ctrl, az_offset_ctrl, uncertainty_ctrl, valid
+
+
 def dense_geometry_offsets(
     shape: tuple[int, int],
     *,
@@ -178,76 +313,33 @@ def dense_geometry_offsets(
     if stride < 1:
         reject_invalid_state("stride must be >= 1")
 
-    az_ctrl, rg_ctrl = _build_control_grid(shape, stride)
-    az_grid = az_ctrl[:, None] + float(row0)
-    rg_grid = rg_ctrl[None, :] + float(col0)
-
-    # Reference: radar -> geo
-    if dem is not None:
-        ref_geo = rdr2geo_with_dem(
-            reference_model,
-            az_grid,
-            rg_grid,
-            dem,
-            max_iter=max_iter,
-            range_tol_m=range_tol_m,
-            doppler_tol_hz=doppler_tol_hz,
-        )
-    else:
-        from faninsar.processing.geometry.transforms import rdr2geo_ellipsoid
-
-        ref_geo = rdr2geo_ellipsoid(
-            reference_model,
-            az_grid,
-            rg_grid,
-            height_m=0.0,
-            max_iter=max_iter,
-            range_tol_m=range_tol_m,
-            doppler_tol_hz=doppler_tol_hz,
-        )
-
-    # Secondary: geo -> radar
-    # Mask out non-finite geodetic coordinates to avoid NaN propagation in geo2rdr
-    geo_valid = (
-        ref_geo.converged
-        & np.isfinite(ref_geo.latitude_deg)
-        & np.isfinite(ref_geo.longitude_deg)
-        & np.isfinite(ref_geo.height_m)
+    (
+        az_ctrl,
+        rg_ctrl,
+        rg_offset_ctrl,
+        az_offset_ctrl,
+        uncertainty_ctrl,
+        valid,
+    ) = _control_point_geometry_offsets(
+        shape,
+        reference_model=reference_model,
+        secondary_model=secondary_model,
+        dem=dem,
+        stride=stride,
+        max_iter=max_iter,
+        range_tol_m=range_tol_m,
+        doppler_tol_hz=doppler_tol_hz,
+        row0=row0,
+        col0=col0,
     )
-    if not np.any(geo_valid):
-        logger.warning("No valid geodetic coordinates for secondary geo2rdr")
+    if not np.any(valid):
+        logger.warning("No valid control points; returning NaN offset field")
         return OffsetFieldResult(
             range_offset_px=np.full(shape, np.nan, dtype=np.float64),
             azimuth_offset_px=np.full(shape, np.nan, dtype=np.float64),
             coverage=np.zeros(shape, dtype=bool),
             uncertainty_px=np.full(shape, np.nan, dtype=np.float64),
         )
-    sec_rdr = geo2rdr(
-        secondary_model,
-        np.where(geo_valid, ref_geo.latitude_deg, 0.0),
-        np.where(geo_valid, ref_geo.longitude_deg, 0.0),
-        np.where(geo_valid, ref_geo.height_m, 0.0),
-        max_iter=max_iter,
-    )
-
-    # Valid only where both transforms converged
-    valid = geo_valid & sec_rdr.converged
-
-    # Offsets for :func:`resample_complex`, which samples
-    # ``source = output_index - offset`` on the secondary.
-    # Same ground point is at ``ref_index`` on the reference and
-    # ``sec_index`` on the secondary, so we need
-    # ``source = sec_index`` when ``output = ref_index``:
-    # ``offset = ref_index - sec_index``.
-    # (Previously the opposite sign was used, which mis-registered the
-    # secondary by about twice the geometric shift and destroyed interferogram
-    # coherence on real Sentinel-1 pairs.)
-    rg_offset_ctrl = rg_grid - sec_rdr.range_index
-    az_offset_ctrl = az_grid - sec_rdr.azimuth_index
-
-    # Mask invalid control points before interpolation
-    rg_offset_ctrl = np.where(valid, rg_offset_ctrl, np.nan)
-    az_offset_ctrl = np.where(valid, az_offset_ctrl, np.nan)
 
     # Simple nearest-neighbour fill for NaN holes so interpolation is stable
     # (small holes from occasional non-convergence)
@@ -295,25 +387,6 @@ def dense_geometry_offsets(
     )
     coverage = coverage > 0.5
 
-    # Uncertainty heuristic: sum of absolute residuals scaled to pixels
-    # Range residual -> range pixels; Doppler residual -> azimuth pixels
-    # Doppler residual (Hz) -> azimuth time -> azimuth pixels:
-    #   Δaz = Δf_doppler * λ / (2 * |acc|) ... complicated.
-    # Simpler heuristic: use the raw residual magnitudes, scaled by pixel spacing.
-    range_res_px = np.abs(ref_geo.residual_range_m) / max(
-        reference_model.range_spacing_m, 1e-6
-    ) + np.abs(sec_rdr.residual_range_m) / max(secondary_model.range_spacing_m, 1e-6)
-    # For azimuth, convert Doppler residual (Hz) to approximate pixels.
-    # Doppler = 2 v·u / λ  [Hz].  d(doppler)/dt ~ 2 a·u / λ.
-    # Approximate azimuth uncertainty from Doppler residual:
-    #   Δt ≈ Δf_doppler / (2 |a| / λ)   but we don't have acceleration easily.
-    # Fallback: scale by PRF-like factor = 1 / azimuth_time_interval_s
-    prf_like = 1.0 / max(reference_model.azimuth_time_interval_s, 1e-6)
-    az_res_px = np.abs(ref_geo.residual_doppler_hz) / max(prf_like, 1e-6) + np.abs(
-        sec_rdr.residual_doppler_hz
-    ) / max(prf_like, 1e-6)
-    uncertainty_ctrl = range_res_px + az_res_px
-    uncertainty_ctrl = np.where(valid, uncertainty_ctrl, np.nan)
     uncertainty_ctrl = _fill_nan_nearest(uncertainty_ctrl)
     uncertainty = _interpolate_field(
         az_ctrl, rg_ctrl, uncertainty_ctrl, shape, fill_value=0.0
@@ -337,3 +410,78 @@ def dense_geometry_offsets(
         coverage=coverage,
         uncertainty_px=uncertainty.astype(np.float32, copy=False),
     )
+
+
+def geometry_offset_window_extent(
+    window: tuple[int, int, int, int],
+    *,
+    burst_shape: tuple[int, int],
+    reference_model: RadarGeometryModel,
+    secondary_model: RadarGeometryModel,
+    dem: DEMSampler | None = None,
+    probe_stride: int = 64,
+    max_iter: int = 30,
+    range_tol_m: float = 0.001,
+    doppler_tol_hz: float = 0.1,
+) -> float:
+    """Return the largest geometric offset magnitude near a radar window.
+
+    The dense offset field is bilinear between control points, so its
+    maximum over the window is attained at a control point of the grid
+    covering the window.  This function evaluates the exact control-point
+    offsets on a coarse grid spanning the window plus one probe cell on
+    every side and returns the largest offset magnitude in pixels.  The
+    caller uses the value to size the resampling halo; the fine field is
+    re-checked after estimation and the crop is grown when the coarse
+    bound turns out too tight.
+
+    Parameters
+    ----------
+    window : tuple[int, int, int, int]
+        Radar window ``(row0, row1, col0, col1)`` inside the burst.
+    burst_shape : tuple[int, int]
+        Full burst shape ``(azimuth, range)``.
+    reference_model, secondary_model : RadarGeometryModel
+        Geometry models for the reference and secondary images.
+    dem : DEMSampler | None, optional
+        DEM height sampler.  If ``None``, a constant zero-height ellipsoid
+        is used.
+    probe_stride : int, optional
+        Control-point spacing of the coarse probe (default 64).
+    max_iter, range_tol_m, doppler_tol_hz : optional
+        Newton-solver tolerances passed to the rdr2geo/geo2rdr transforms.
+
+    Returns
+    -------
+    float
+        Maximum absolute offset magnitude (pixels), or 0.0 when no control
+        point converges.
+
+    """
+    if len(window) != 4:
+        reject_invalid_state("window must be a (row0, row1, col0, col1) tuple")
+    wr0, wr1, wc0, wc1 = window
+    height, width = burst_shape
+    probe_row0 = max(0, wr0 - probe_stride)
+    probe_row1 = min(height, wr1 + probe_stride)
+    probe_col0 = max(0, wc0 - probe_stride)
+    probe_col1 = min(width, wc1 + probe_stride)
+    if probe_row1 <= probe_row0 or probe_col1 <= probe_col0:
+        return 0.0
+    _, _, rg_offset, az_offset, _, valid = _control_point_geometry_offsets(
+        (probe_row1 - probe_row0, probe_col1 - probe_col0),
+        reference_model=reference_model,
+        secondary_model=secondary_model,
+        dem=dem,
+        stride=probe_stride,
+        max_iter=max_iter,
+        range_tol_m=range_tol_m,
+        doppler_tol_hz=doppler_tol_hz,
+        row0=probe_row0,
+        col0=probe_col0,
+    )
+    magnitude = np.hypot(rg_offset, az_offset)
+    ok = valid & np.isfinite(magnitude)
+    if not np.any(ok):
+        return 0.0
+    return float(np.nanmax(magnitude[ok]))

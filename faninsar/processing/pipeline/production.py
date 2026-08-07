@@ -28,6 +28,7 @@ from faninsar.processing.coreg import (
     combine_offset_fields,
     dense_geometry_offsets,
     estimate_azimuth_shift_esd,
+    geometry_offset_window_extent,
     refine_shift_with_correlation,
     resample_complex,
     resample_complex_deramped_reramp,
@@ -85,10 +86,104 @@ SPEED_OF_LIGHT_M_S = 299_792_458.0
 ScopeMode = Literal["burst", "swath"]
 CoregistrationGrid = Literal["radar", "geo"]
 
+#: Lanczos half-width of the radar resampler (``resample_complex`` default).
+_LANCZOS_RADIUS_PX = 4
+#: Extra crop margin beyond the measured offset extent (absorbs coarse-probe
+#: curvature and ESD/amplitude-residual drift between growth iterations).
+_WINDOW_HALO_MARGIN_PX = 16
+#: Floor for the ROI resampling halo when the pair geometry is near zero.
+_WINDOW_HALO_FLOOR_PX = 64
+#: Window-growth attempts before falling back to full-burst coregistration.
+_MAX_WINDOW_HALO_GROWTH = 3
+
 
 def looks_dir(azimuth_looks: int, range_looks: int) -> str:
     """Return the deterministic per-config output subtree name."""
     return f"looks_{azimuth_looks}x{range_looks}"
+
+
+def _align_crop_end(end: int, start: int, stride: int, limit: int) -> int:
+    """Extend a crop end so ``end - 1`` is a full-burst control coordinate."""
+    if end >= limit:
+        return limit
+    aligned = start + ((end - 1 - start) // stride + 1) * stride + 1
+    return min(aligned, limit)
+
+
+def _window_crop_bounds(
+    window: tuple[int, int, int, int],
+    shape: tuple[int, int],
+    stride: int,
+    halo: int,
+) -> tuple[int, int, int, int]:
+    """Return the stride-aligned crop around a radar window.
+
+    The leading edge is floored to a control-grid multiple and the trailing
+    edge is extended so the crop's appended edge control point (``row1 - 1``)
+    coincides with the full-burst control grid.  The windowed control grid is
+    then a subset of the full-burst grid, which keeps the windowed offset
+    field bitwise identical to the full-burst field inside the crop.
+    """
+    height, width = shape
+    wr0, wr1, wc0, wc1 = window
+    row0 = max(0, (wr0 - halo) // stride * stride)
+    col0 = max(0, (wc0 - halo) // stride * stride)
+    row1 = _align_crop_end(wr1 + halo, row0, stride, height)
+    col1 = _align_crop_end(wc1 + halo, col0, stride, width)
+    return row0, row1, col0, col1
+
+
+def _window_resample_halo_required(
+    offsets: OffsetFieldResult,
+    window: tuple[int, int, int, int],
+    origin: tuple[int, int],
+    lanczos_radius_px: int = _LANCZOS_RADIUS_PX,
+) -> int:
+    """Return the crop margin needed for lossless windowed resampling.
+
+    ``resample_complex`` samples ``source = output - offset`` with a Lanczos
+    kernel of half-width ``lanczos_radius_px``, so the crop must extend past
+    the window by at least ``max|offset| + kernel radius + 1`` on every side;
+    a smaller margin silently reads zero-filled pixels inside the ROI.
+    """
+    wr0, wr1, wc0, wc1 = window
+    row0, col0 = origin
+    az = offsets.azimuth_offset_px[wr0 - row0 : wr1 - row0, wc0 - col0 : wc1 - col0]
+    rg = offsets.range_offset_px[wr0 - row0 : wr1 - row0, wc0 - col0 : wc1 - col0]
+    if az.size == 0:
+        return lanczos_radius_px + 1
+    magnitude = np.hypot(rg, az)
+    finite = np.isfinite(magnitude)
+    extent = 0.0 if not np.any(finite) else float(np.nanmax(magnitude[finite]))
+    return int(np.ceil(extent)) + lanczos_radius_px + 1
+
+
+def _window_halo_sufficient(
+    offsets: OffsetFieldResult,
+    window: tuple[int, int, int, int],
+    origin: tuple[int, int],
+    crop: tuple[int, int, int, int],
+    burst_shape: tuple[int, int],
+    lanczos_radius_px: int = _LANCZOS_RADIUS_PX,
+) -> bool:
+    """Return whether the crop margin covers the windowed resample footprint.
+
+    Sides touching the burst edge are exempt: the full-burst run reads
+    zero-filled samples there as well, so both results stay identical.
+    """
+    required = _window_resample_halo_required(
+        offsets, window, origin, lanczos_radius_px
+    )
+    wr0, wr1, wc0, wc1 = window
+    cr0, cr1, cc0, cc1 = crop
+    height, width = burst_shape
+    if cr0 > 0 and wr0 - cr0 < required:
+        return False
+    if cr1 < height and cr1 - wr1 < required:
+        return False
+    if cc0 > 0 and wc0 - cc0 < required:
+        return False
+    return not (cc1 < width and cc1 - wc1 < required)
 
 
 def _sweep_list_metadata(
@@ -596,7 +691,7 @@ class ProductionPairState:
     dem_id: str = ""
     coreg_executor: str = "torch"
     coreg_device: str = "auto"
-    multilook: tuple[int, int] = (4, 20)
+    multilook: tuple[int, int] | None = None
     goldstein_alpha: float = 0.5
     unwrap_method: str = "snaphu"
     geo_grid_meta: dict[str, Any] | None = None
@@ -977,79 +1072,132 @@ def stage_coregister(
     )
     if resolved_control_spacing < 1:
         reject_invalid_state("control_spacing must be >= 1")
+    window: tuple[int, int, int, int] | None = (
+        roi_window if coregistration_grid == "radar" else None
+    )
     window_origin: tuple[int, int] | None = None
-    if coregistration_grid == "radar" and roi_window is not None:
-        wr0, wr1, wc0, wc1 = roi_window
-        halo = 64
-        stride = resolved_control_spacing
-        cr0 = max(0, (wr0 - halo) // stride * stride)
-        cr1 = min(ref.shape[0], wr1 + halo)
-        cc0 = max(0, (wc0 - halo) // stride * stride)
-        cc1 = min(ref.shape[1], wc1 + halo)
-        ref = ref[cr0:cr1, cc0:cc1]
-        sec = sec[cr0:cr1, cc0:cc1]
-        window_origin = (cr0, cc0)
-        state.reference_deramped = ref
-        state.secondary_deramped = sec
-        state.radar_roi_origin = window_origin
-    substage_started = time.perf_counter()
-    geometry_field = dense_geometry_offsets(
-        shape=ref.shape,
-        reference_model=state.reference.geometry,
-        secondary_model=state.secondary.geometry,
-        dem=dem,
-        stride=resolved_control_spacing,
-        row0=0 if window_origin is None else window_origin[0],
-        col0=0 if window_origin is None else window_origin[1],
-    )
-    state.coregistration_timings_s["dense_geometry_offsets"] = (
-        time.perf_counter() - substage_started
-    )
+    window_halo_px = 0
+    if window is not None:
+        wr0, wr1, wc0, wc1 = window
+        if not (0 <= wr0 < wr1 <= ref.shape[0] and 0 <= wc0 < wc1 <= ref.shape[1]):
+            reject_invalid_state("roi_window must lie inside the burst")
+        probe_extent = geometry_offset_window_extent(
+            window,
+            burst_shape=ref.shape,
+            reference_model=state.reference.geometry,
+            secondary_model=state.secondary.geometry,
+            dem=dem,
+            probe_stride=max(32, 8 * resolved_control_spacing),
+        )
+        window_halo_px = max(
+            _WINDOW_HALO_FLOOR_PX,
+            int(np.ceil(probe_extent)) + _LANCZOS_RADIUS_PX + _WINDOW_HALO_MARGIN_PX,
+        )
+    ref_full = ref
+    sec_full = sec
+    growth_attempts = 0
+    while True:
+        if window is not None:
+            crop_bounds = _window_crop_bounds(
+                window,
+                ref_full.shape,
+                resolved_control_spacing,
+                window_halo_px,
+            )
+            cr0, cr1, cc0, cc1 = crop_bounds
+            ref = ref_full[cr0:cr1, cc0:cc1]
+            sec = sec_full[cr0:cr1, cc0:cc1]
+            window_origin = (cr0, cc0)
+            state.reference_deramped = ref
+            state.secondary_deramped = sec
+            state.radar_roi_origin = window_origin
+        substage_started = time.perf_counter()
+        geometry_field = dense_geometry_offsets(
+            shape=ref.shape,
+            reference_model=state.reference.geometry,
+            secondary_model=state.secondary.geometry,
+            dem=dem,
+            stride=resolved_control_spacing,
+            row0=0 if window_origin is None else window_origin[0],
+            col0=0 if window_origin is None else window_origin[1],
+        )
+        state.coregistration_timings_s["dense_geometry_offsets"] = (
+            time.perf_counter() - substage_started
+        )
 
-    prior_rg = float(
-        np.nanmedian(geometry_field.range_offset_px[geometry_field.coverage])
-    )
-    prior_az = float(
-        np.nanmedian(geometry_field.azimuth_offset_px[geometry_field.coverage])
-    )
-    amp_res_rg = 0.0
-    amp_res_az = 0.0
-    esd_az = 0.0
-    if coregistration_grid == "radar" and amplitude_refinement_enabled:
-        amp_rg, amp_az = refine_shift_with_correlation(
-            ref,
-            sec,
-            prior_rg=prior_rg,
-            prior_az=prior_az,
-            search_radius=32,
+        prior_rg = float(
+            np.nanmedian(geometry_field.range_offset_px[geometry_field.coverage])
         )
-        amp_res_rg = amp_rg - prior_rg
-        amp_res_az = amp_az - prior_az
-    if coregistration_grid == "radar" and esd_enabled:
-        # Bilinear pre-align is sufficient for ESD spectral estimation and
-        # avoids a second full-burst Lanczos pass (~minutes and peak RSS).
-        pre = resample_complex(
-            sec,
-            range_offset_px=geometry_field.range_offset_px + amp_res_rg,
-            azimuth_offset_px=geometry_field.azimuth_offset_px + amp_res_az,
-            order=1,
+        prior_az = float(
+            np.nanmedian(geometry_field.azimuth_offset_px[geometry_field.coverage])
         )
-        esd = estimate_azimuth_shift_esd(ref, pre)
-        esd_az = float(esd.azimuth_shift_px)
-        state.esd_azimuth_shift_px = esd_az
-        state.note(f"ESD az={esd_az:.4f} px coherence={esd.coherence:.3f}")
-        del pre
+        amp_res_rg = 0.0
+        amp_res_az = 0.0
+        esd_az = 0.0
+        if coregistration_grid == "radar" and amplitude_refinement_enabled:
+            amp_rg, amp_az = refine_shift_with_correlation(
+                ref,
+                sec,
+                prior_rg=prior_rg,
+                prior_az=prior_az,
+                search_radius=32,
+            )
+            amp_res_rg = amp_rg - prior_rg
+            amp_res_az = amp_az - prior_az
+        if coregistration_grid == "radar" and esd_enabled:
+            # Bilinear pre-align is sufficient for ESD spectral estimation and
+            # avoids a second full-burst Lanczos pass (~minutes and peak RSS).
+            pre = resample_complex(
+                sec,
+                range_offset_px=geometry_field.range_offset_px + amp_res_rg,
+                azimuth_offset_px=geometry_field.azimuth_offset_px + amp_res_az,
+                order=1,
+            )
+            esd = estimate_azimuth_shift_esd(ref, pre)
+            esd_az = float(esd.azimuth_shift_px)
+            state.esd_azimuth_shift_px = esd_az
+            state.note(f"ESD az={esd_az:.4f} px coherence={esd.coherence:.3f}")
+            del pre
+            gc.collect()
+
+        offsets = combine_offset_fields(
+            geometry_field,
+            esd_azimuth_shift_px=esd_az,
+            amplitude_residual_rg=amp_res_rg,
+            amplitude_residual_az=amp_res_az,
+        )
+        # Drop geometry-only fields once combined; offsets retains the dense maps.
+        del geometry_field
         gc.collect()
-
-    offsets = combine_offset_fields(
-        geometry_field,
-        esd_azimuth_shift_px=esd_az,
-        amplitude_residual_rg=amp_res_rg,
-        amplitude_residual_az=amp_res_az,
-    )
-    # Drop geometry-only fields once combined; offsets retains the dense maps.
-    del geometry_field
-    gc.collect()
+        if window is None:
+            break
+        if _window_halo_sufficient(
+            offsets,
+            window,
+            window_origin,
+            crop_bounds,
+            ref_full.shape,
+        ):
+            break
+        growth_attempts += 1
+        if growth_attempts >= _MAX_WINDOW_HALO_GROWTH:
+            logger.warning(
+                "ROI window halo did not converge after %d growths; "
+                "falling back to full-burst coregistration",
+                growth_attempts,
+            )
+            window = None
+            window_origin = None
+            state.radar_roi_origin = None
+            ref = ref_full
+            sec = sec_full
+            state.reference_deramped = ref
+            state.secondary_deramped = sec
+            continue
+        window_halo_px = (
+            _window_resample_halo_required(offsets, window, window_origin)
+            + _WINDOW_HALO_MARGIN_PX
+        )
 
     state.range_shift_px = float(
         np.nanmedian(offsets.range_offset_px[offsets.coverage])
@@ -1276,6 +1424,7 @@ def stage_interferogram(
     """
     if state.reference_deramped is None or state.secondary_aligned is None:
         reject_invalid_state("interferogram requires coregister")
+    state.multilook = multilook
     ifg = form_interferogram(
         state.reference_deramped,
         state.secondary_aligned,
@@ -1346,9 +1495,12 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
     # Geometry (0,0) is the array origin (already cropped). Use look-window
     # centres rather than leading edges so path-length phase matches the
     # multilooked ifg sampling.
-    full_h, full_w = state.reference.array.samples.shape
-    az_looks = max(full_h // max(height, 1), 1)
-    rg_looks = max(full_w // max(width, 1), 1)
+    if state.multilook is not None:
+        az_looks, rg_looks = state.multilook
+    else:
+        full_h, full_w = state.reference.array.samples.shape
+        az_looks = max(full_h // max(height, 1), 1)
+        rg_looks = max(full_w // max(width, 1), 1)
     az_full = (np.arange(height, dtype=np.float64) + 0.5) * az_looks - 0.5
     rg_full = (np.arange(width, dtype=np.float64) + 0.5) * rg_looks - 0.5
     roi_origin = state.radar_roi_origin or (0, 0)
@@ -1657,7 +1809,7 @@ def stage_write(
         "unwrap_method": state.unwrap_method,
         "coregistration_grid": state.coregistration_grid,
         "dem_id": state.dem_id,
-        "multilook": list(state.multilook),
+        "multilook": list(state.multilook or (1, 1)),
         "goldstein_alpha": state.goldstein_alpha,
         "coreg_executor": state.coreg_executor,
         "coreg_device": state.coreg_device,
@@ -2394,6 +2546,8 @@ def _roi_burst_window(
     )
     if not np.any(ok):
         return None
+    # Sentinel-1 azimuth ground speed (~7.0 km/s); a fixed approximation is
+    # acceptable for a buffer margin (under- or over-sized by a few percent).
     az_px = max(1, int(np.ceil(buffer_m / (7000.0 * geometry.azimuth_time_interval_s))))
     rg_px = max(1, int(np.ceil(buffer_m / geometry.range_spacing_m)))
     row0 = max(0, int(np.floor(np.min(azimuth[ok]))) - az_px)
@@ -2619,10 +2773,12 @@ def run_pair(
         Working directory for geo memmaps; a temporary directory is used
         when omitted.
     n_jobs : int, optional
-        Number of parallel burst workers in geo mode (default 1).
+        Number of parallel burst workers (default 1; applies to radar mode
+        with an ROI and to geo mode).
     roi_buffer_m : float, optional
-        Physical margin in meters kept around the ROI in geo mode
-        (default 320).
+        Physical margin in meters kept around the ROI (default 320).  In geo
+        mode it is applied in the grid CRS; in radar mode it is converted to
+        radar pixels to expand the burst window.
     snaphu_config : SnaphuConfig, optional
         SNAPHU configuration; nlooks defaults to az * rg per config.
     unwrap_method : {"irls", "snaphu"}, optional
