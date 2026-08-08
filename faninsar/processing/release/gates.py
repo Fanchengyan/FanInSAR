@@ -52,7 +52,7 @@ def assert_core_imports() -> bool:
         "faninsar.backends.execution",
         "faninsar.backends.dask_exec",
         "faninsar.backends.device_matrix",
-        "faninsar.nisar",
+        "faninsar.missions.nisar",
     )
     for name in modules:
         try:
