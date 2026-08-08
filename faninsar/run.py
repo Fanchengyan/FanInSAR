@@ -54,8 +54,7 @@ def run(
     output = cfg.get("output") or cfg.get("output_dir")
     if not reference or not secondary or not output:
         message = (
-            "run() pair config requires 'reference', 'secondary', "
-            "and 'output' keys"
+            "run() pair config requires 'reference', 'secondary', and 'output' keys"
         )
         raise ValueError(message)
 

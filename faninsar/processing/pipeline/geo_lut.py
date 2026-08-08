@@ -527,9 +527,7 @@ def build_geo2rdr_lut(
         else (int(row_range[0]), int(row_range[1]))
     )
     col0, col1 = (
-        (0, grid.width)
-        if col_range is None
-        else (int(col_range[0]), int(col_range[1]))
+        (0, grid.width) if col_range is None else (int(col_range[0]), int(col_range[1]))
     )
     row0 = max(0, min(row0, grid.height))
     row1 = max(row0, min(row1, grid.height))
