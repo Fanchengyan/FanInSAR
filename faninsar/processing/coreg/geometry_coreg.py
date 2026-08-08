@@ -96,8 +96,16 @@ def refine_shift_with_correlation(
         resample convention as ``prior_*``.
 
     """
-    pre_rg = round(prior_rg)
-    pre_az = round(prior_az)
+    if not np.isfinite(prior_rg) or not np.isfinite(prior_az):
+        logger.warning(
+            "Correlation refinement skipped: non-finite prior offsets "
+            "prior_rg=%s prior_az=%s",
+            prior_rg,
+            prior_az,
+        )
+        return float("nan"), float("nan")
+    pre_rg = int(round(float(prior_rg)))
+    pre_az = int(round(float(prior_az)))
     # Pre-align secondary under the resample_complex convention:
     # source = out - offset  ⇒  shifted[i] = secondary[i - prior].
     # numpy.roll(a, +prior) implements shifted[i] = a[i - prior].

@@ -1142,7 +1142,9 @@ def stage_coregister(
         esd_az = 0.0
         # Residual measure is always on radar deramped samples (PROPOSAL-0017);
         # independent of final product grid (radar vs geo).
-        if amplitude_refinement_enabled:
+        if amplitude_refinement_enabled and np.isfinite(prior_rg) and np.isfinite(
+            prior_az
+        ):
             amp_rg, amp_az = refine_shift_with_correlation(
                 ref,
                 sec,
@@ -1150,9 +1152,14 @@ def stage_coregister(
                 prior_az=prior_az,
                 search_radius=32,
             )
-            amp_res_rg = amp_rg - prior_rg
-            amp_res_az = amp_az - prior_az
-        if esd_enabled:
+            if np.isfinite(amp_rg) and np.isfinite(amp_az):
+                amp_res_rg = amp_rg - prior_rg
+                amp_res_az = amp_az - prior_az
+            else:
+                state.note("amplitude refinement skipped (non-finite result)")
+        elif amplitude_refinement_enabled:
+            state.note("amplitude refinement skipped (non-finite geometry prior)")
+        if esd_enabled and np.isfinite(prior_rg) and np.isfinite(prior_az):
             # Bilinear pre-align is sufficient for ESD spectral estimation and
             # avoids a second full-burst Lanczos pass (~minutes and peak RSS).
             pre = resample_complex(
