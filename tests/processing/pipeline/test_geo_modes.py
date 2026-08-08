@@ -16,6 +16,8 @@ from faninsar.processing.pipeline.geo_lut import (
     build_geo2rdr_lut,
     grid_lonlat,
     grid_lonlat_rows,
+    roi_geo_bbox,
+    roi_geo_mask,
 )
 from faninsar.processing.pipeline.geo_modes import (
     coregister_geocoded_slcs,
@@ -84,6 +86,98 @@ def test_grid_lonlat_rows_matches_full_grid_slice() -> None:
 
     np.testing.assert_allclose(latitude, full_latitude[1:3])
     np.testing.assert_allclose(longitude, full_longitude[1:3])
+
+
+def test_roi_geo_bbox_and_mask_cover_polygon_with_hole() -> None:
+    """ROI helpers bound the polygon and exclude hole pixels."""
+    from shapely.geometry import Polygon, box
+
+    grid = _projected_grid()
+    lat, lon = grid_lonlat(grid)
+    outer = box(
+        float(np.min(lon)),
+        float(np.min(lat)),
+        float(np.max(lon)),
+        float(np.max(lat)),
+    )
+    hole = box(
+        float(np.mean(lon)) - 0.002,
+        float(np.mean(lat)) - 0.002,
+        float(np.mean(lon)) + 0.002,
+        float(np.mean(lat)) + 0.002,
+    )
+    polygon = Polygon(outer.exterior, holes=[hole.exterior])
+    row0, row1, col0, col1 = roi_geo_bbox(polygon, grid, margin_px=0)
+    assert (row0, row1, col0, col1) == (0, 4, 0, 5)
+    mask = roi_geo_mask(polygon, grid, row0, row1, col0, col1)
+    assert mask.shape == (4, 5)
+    assert int(mask.sum()) < 20
+    assert not mask[2, 2]
+    dilated = roi_geo_mask(polygon, grid, row0, row1, col0, col1, dilate_px=1)
+    assert dilated.sum() > mask.sum()
+
+
+def test_build_geo2rdr_lut_with_roi_geometry_masks_outside(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROI geometry prefilter keeps only converged pixels inside the ROI."""
+    from shapely.geometry import box
+
+    from faninsar.processing.pipeline import geo_lut
+
+    def _fake_geo2rdr(
+        _geometry: object,
+        latitude: np.ndarray,
+        _longitude: np.ndarray,
+        _height: object,
+    ) -> object:
+        class _FakeGeo2RdrResult:
+            converged = np.ones(latitude.shape, dtype=bool)
+            azimuth_index = np.full(latitude.shape, 10.0)
+            range_index = np.full(latitude.shape, 20.0)
+
+        return _FakeGeo2RdrResult()
+
+    monkeypatch.setattr(geo_lut, "geo2rdr", _fake_geo2rdr)
+    geom = _toy_geometry((32, 64))
+    grid = _projected_grid()
+    lat, lon = grid_lonlat(grid)
+    roi = box(
+        float(np.min(lon)),
+        float(np.min(lat)),
+        float(np.max(lon)),
+        float(np.max(lat)),
+    )
+    expected = roi_geo_mask(roi, grid, 0, grid.height, 0, grid.width)
+    lut = build_geo2rdr_lut(
+        geometry=geom,
+        grid=grid,
+        full_radar_shape=(32, 64),
+        height_m=0.0,
+        chunk_size=2,
+        roi_geometry=roi,
+        polygon_dilate_px=0,
+    )
+    assert lut.valid.shape == grid.shape
+    assert int(lut.valid.sum()) == int(expected.sum())
+    half = box(
+        float(np.min(lon)),
+        float(np.min(lat)),
+        float(np.max(lon)) - 0.002,
+        float(np.max(lat)),
+    )
+    lut_half = build_geo2rdr_lut(
+        geometry=geom,
+        grid=grid,
+        full_radar_shape=(32, 64),
+        height_m=0.0,
+        chunk_size=2,
+        roi_geometry=half,
+        polygon_dilate_px=0,
+    )
+    expected_half = roi_geo_mask(half, grid, 0, grid.height, 0, grid.width)
+    assert int(lut_half.valid.sum()) == int(expected_half.sum())
+    assert int(lut_half.valid.sum()) < int(expected.sum())
 
 
 def test_geo2rdr_lut_retains_sampled_height() -> None:
@@ -327,4 +421,3 @@ def test_build_geo2rdr_lut_can_use_disk_backed_arrays(tmp_path: Path) -> None:
     assert isinstance(lut.rg_full, np.memmap)
     assert isinstance(lut.valid, np.memmap)
     assert lut.shape == grid.shape
-

@@ -6,15 +6,20 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.pipeline.production import (
+    _align_crop_end,
     _burst_index_list,
     _common_burst_indices,
     _normalize_burst_selection,
     _roi_burst_window,
     _select_bursts_by_roi,
+    _window_crop_bounds,
+    _window_halo_sufficient,
+    _window_resample_halo_required,
 )
 
 SLC_ROOT = Path("/Volumes/DATA2/TEST_sentinel-1/sentinel-slc")
@@ -183,3 +188,79 @@ def test_roi_burst_window_projects_onto_real_geometry() -> None:
     row0, row1, col0, col1 = window
     assert 0 <= row0 < row1 <= shape[0]
     assert 0 <= col0 < col1 <= shape[1]
+
+
+def test_align_crop_end_matches_full_burst_control_grid() -> None:
+    """A cropped trailing edge keeps ``end - 1`` on the stride grid."""
+    assert _align_crop_end(40, 8, 8, 100) == 41
+    assert _align_crop_end(47, 8, 8, 100) == 49
+    assert _align_crop_end(48, 8, 8, 100) == 49
+    assert _align_crop_end(90, 8, 8, 100) == 97
+    assert _align_crop_end(100, 8, 8, 100) == 100
+
+
+def test_window_crop_bounds_are_stride_aligned_and_cover_window() -> None:
+    """The ROI crop is stride-aligned and keeps the window plus halo."""
+    crop = _window_crop_bounds((100, 200, 200, 400), (512, 1024), stride=8, halo=64)
+    cr0, cr1, cc0, cc1 = crop
+    assert cr0 % 8 == 0
+    assert cc0 % 8 == 0
+    assert (cr1 - 1 - cr0) % 8 == 0 or cr1 == 512
+    assert (cc1 - 1 - cc0) % 8 == 0 or cc1 == 1024
+    assert cr0 <= 100
+    assert cr1 >= 200
+    assert cc0 <= 200
+    assert cc1 >= 400
+    assert cr1 - 200 >= 64
+    assert cc1 - 400 >= 64
+    assert 100 - cr0 >= 64
+    assert 200 - cc0 >= 64
+
+
+def test_window_resample_halo_required_matches_offset_extent() -> None:
+    """The required halo covers the offset magnitude plus the Lanczos kernel."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+
+    shape = (64, 128)
+    offsets = OffsetFieldResult(
+        range_offset_px=np.full(shape, 250.0, dtype=np.float32),
+        azimuth_offset_px=np.zeros(shape, dtype=np.float32),
+        coverage=np.ones(shape, dtype=bool),
+        uncertainty_px=np.zeros(shape, dtype=np.float32),
+    )
+    required = _window_resample_halo_required(
+        offsets, (16, 48, 32, 96), (0, 0)
+    )
+    assert required == 255
+    nan_offsets = OffsetFieldResult(
+        range_offset_px=np.full(shape, np.nan, dtype=np.float32),
+        azimuth_offset_px=np.full(shape, np.nan, dtype=np.float32),
+        coverage=np.zeros(shape, dtype=bool),
+        uncertainty_px=np.zeros(shape, dtype=np.float32),
+    )
+    assert _window_resample_halo_required(
+        nan_offsets, (16, 48, 32, 96), (0, 0)
+    ) == 5
+
+
+def test_window_halo_sufficient_exempts_burst_edges() -> None:
+    """Burst-edge sides pass while interior shortfalls fail."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+
+    shape = (64, 128)
+    offsets = OffsetFieldResult(
+        range_offset_px=np.full(shape, 250.0, dtype=np.float32),
+        azimuth_offset_px=np.zeros(shape, dtype=np.float32),
+        coverage=np.ones(shape, dtype=bool),
+        uncertainty_px=np.zeros(shape, dtype=np.float32),
+    )
+    window = (16, 48, 32, 96)
+    # Interior crop with 16 px margins: far too small for a 250 px offset.
+    assert not _window_halo_sufficient(
+        offsets, window, (8, 16), (8, 64, 16, 112), shape
+    )
+    # Crop touching every burst edge: identity is preserved by the edge
+    # exemption (both runs read zero-filled samples past the burst).
+    assert _window_halo_sufficient(
+        offsets, window, (0, 0), (0, 64, 0, 128), shape
+    )

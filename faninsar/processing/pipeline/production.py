@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import gc
+import os
 import shutil
+import tempfile
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import numpy as np
 
@@ -25,6 +28,7 @@ from faninsar.processing.coreg import (
     combine_offset_fields,
     dense_geometry_offsets,
     estimate_azimuth_shift_esd,
+    geometry_offset_window_extent,
     refine_shift_with_correlation,
     resample_complex,
     resample_complex_deramped_reramp,
@@ -76,9 +80,524 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+DEM_BOUNDS_BUFFER_M = 2000.0
+
 SPEED_OF_LIGHT_M_S = 299_792_458.0
 ScopeMode = Literal["burst", "swath"]
 CoregistrationGrid = Literal["radar", "geo"]
+
+#: Lanczos half-width of the radar resampler (``resample_complex`` default).
+_LANCZOS_RADIUS_PX = 4
+#: Extra crop margin beyond the measured offset extent (absorbs coarse-probe
+#: curvature and ESD/amplitude-residual drift between growth iterations).
+_WINDOW_HALO_MARGIN_PX = 16
+#: Floor for the ROI resampling halo when the pair geometry is near zero.
+_WINDOW_HALO_FLOOR_PX = 64
+#: Window-growth attempts before falling back to full-burst coregistration.
+_MAX_WINDOW_HALO_GROWTH = 3
+
+
+def looks_dir(azimuth_looks: int, range_looks: int) -> str:
+    """Return the deterministic per-config output subtree name."""
+    return f"looks_{azimuth_looks}x{range_looks}"
+
+
+def _align_crop_end(end: int, start: int, stride: int, limit: int) -> int:
+    """Extend a crop end so ``end - 1`` is a full-burst control coordinate."""
+    if end >= limit:
+        return limit
+    aligned = start + ((end - 1 - start) // stride + 1) * stride + 1
+    return min(aligned, limit)
+
+
+def _window_crop_bounds(
+    window: tuple[int, int, int, int],
+    shape: tuple[int, int],
+    stride: int,
+    halo: int,
+) -> tuple[int, int, int, int]:
+    """Return the stride-aligned crop around a radar window.
+
+    The leading edge is floored to a control-grid multiple and the trailing
+    edge is extended so the crop's appended edge control point (``row1 - 1``)
+    coincides with the full-burst control grid.  The windowed control grid is
+    then a subset of the full-burst grid, which keeps the windowed offset
+    field bitwise identical to the full-burst field inside the crop.
+    """
+    height, width = shape
+    wr0, wr1, wc0, wc1 = window
+    row0 = max(0, (wr0 - halo) // stride * stride)
+    col0 = max(0, (wc0 - halo) // stride * stride)
+    row1 = _align_crop_end(wr1 + halo, row0, stride, height)
+    col1 = _align_crop_end(wc1 + halo, col0, stride, width)
+    return row0, row1, col0, col1
+
+
+def _window_resample_halo_required(
+    offsets: OffsetFieldResult,
+    window: tuple[int, int, int, int],
+    origin: tuple[int, int],
+    lanczos_radius_px: int = _LANCZOS_RADIUS_PX,
+) -> int:
+    """Return the crop margin needed for lossless windowed resampling.
+
+    ``resample_complex`` samples ``source = output - offset`` with a Lanczos
+    kernel of half-width ``lanczos_radius_px``, so the crop must extend past
+    the window by at least ``max|offset| + kernel radius + 1`` on every side;
+    a smaller margin silently reads zero-filled pixels inside the ROI.
+    """
+    wr0, wr1, wc0, wc1 = window
+    row0, col0 = origin
+    az = offsets.azimuth_offset_px[wr0 - row0 : wr1 - row0, wc0 - col0 : wc1 - col0]
+    rg = offsets.range_offset_px[wr0 - row0 : wr1 - row0, wc0 - col0 : wc1 - col0]
+    if az.size == 0:
+        return lanczos_radius_px + 1
+    magnitude = np.hypot(rg, az)
+    finite = np.isfinite(magnitude)
+    extent = 0.0 if not np.any(finite) else float(np.nanmax(magnitude[finite]))
+    return int(np.ceil(extent)) + lanczos_radius_px + 1
+
+
+def _window_halo_sufficient(
+    offsets: OffsetFieldResult,
+    window: tuple[int, int, int, int],
+    origin: tuple[int, int],
+    crop: tuple[int, int, int, int],
+    burst_shape: tuple[int, int],
+    lanczos_radius_px: int = _LANCZOS_RADIUS_PX,
+) -> bool:
+    """Return whether the crop margin covers the windowed resample footprint.
+
+    Sides touching the burst edge are exempt: the full-burst run reads
+    zero-filled samples there as well, so both results stay identical.
+    """
+    required = _window_resample_halo_required(
+        offsets, window, origin, lanczos_radius_px
+    )
+    wr0, wr1, wc0, wc1 = window
+    cr0, cr1, cc0, cc1 = crop
+    height, width = burst_shape
+    if cr0 > 0 and wr0 - cr0 < required:
+        return False
+    if cr1 < height and cr1 - wr1 < required:
+        return False
+    if cc0 > 0 and wc0 - cc0 < required:
+        return False
+    return not (cc1 < width and cc1 - wc1 < required)
+
+
+def _sweep_list_metadata(
+    all_configs: list[tuple[int, int]] | None,
+    config: tuple[int, int],
+) -> list[list[int]]:
+    """Serialize the full multilook sweep list for product metadata."""
+    return [
+        list(item) for item in (all_configs if all_configs is not None else [config])
+    ]
+
+
+def _is_multilook_pair(value: object) -> bool:
+    """Return whether the multilook argument is one (az, rg) pair."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return False
+    return all(isinstance(part, int) and not isinstance(part, bool) for part in value)
+
+
+def normalize_multilook_sweep(value: object) -> list[tuple[int, int]]:
+    """Normalize a multilook sweep specification into validated configs."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        message = "multilook must be an iterable of [azimuth_looks, range_looks] pairs"
+        raise TypeError(message)
+    configs: list[tuple[int, int]] = []
+    for item in value:
+        if isinstance(item, (str, bytes)) or not isinstance(item, (list, tuple)):
+            message = f"each multilook config must be a [az, rg] pair; got {item!r}"
+            raise TypeError(message)
+        if len(item) != 2:
+            message = f"each multilook config must be a [az, rg] pair; got {item!r}"
+            raise ValueError(message)
+        azimuth_looks, range_looks = item
+        if (
+            isinstance(azimuth_looks, bool)
+            or isinstance(range_looks, bool)
+            or not isinstance(azimuth_looks, int)
+            or not isinstance(range_looks, int)
+        ):
+            message = f"multilook factors must be integers; got {item!r}"
+            raise TypeError(message)
+        if azimuth_looks < 1 or range_looks < 1:
+            message = f"multilook factors must be >= 1; got {item!r}"
+            raise ValueError(message)
+        configs.append((azimuth_looks, range_looks))
+    if not configs:
+        message = "multilook must contain at least one config"
+        raise ValueError(message)
+    deduplicated = list(dict.fromkeys(configs))
+    if len(deduplicated) != len(configs):
+        message = f"duplicate multilook configs are not allowed: {configs!r}"
+        raise ValueError(message)
+    return deduplicated
+
+
+@dataclass(frozen=True, slots=True)
+class PairSweepOutcome:
+    """Lightweight per-config outputs of a multilook pair sweep."""
+
+    config: tuple[int, int]
+    zarr_path: Path
+    stac_path: Path
+    shape: tuple[int, int]
+    metadata: dict[str, Any]
+    stage_timings_s: dict[str, float]
+    log: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionPairSweepResult:
+    """Outputs of a multilook sweep over one reference/secondary pair."""
+
+    pair_id: str
+    per_config: dict[tuple[int, int], PairSweepOutcome]
+
+
+@dataclass
+class SharedPairResources:
+    """Ownership bundle for the shared pair prefix used by sweeps."""
+
+    prefix_state: ProductionPairState | None = None
+    temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+    ifg_archive: dict[str, Any] | None = None
+
+    def cleanup(self) -> None:
+        """Release shared arrays and remove the geo work dir exactly once."""
+        candidates: list[np.ndarray | None] = []
+        state = self.prefix_state
+        if state is not None and state.geo2rdr_lut is not None:
+            candidates.extend(
+                (
+                    state.geo2rdr_lut.az_full,
+                    state.geo2rdr_lut.rg_full,
+                    state.geo2rdr_lut.valid,
+                    state.geo2rdr_lut.height_full,
+                )
+            )
+            state.geo2rdr_lut = None
+        if state is not None:
+            for name in (
+                "reference_geocoded_slc",
+                "secondary_geocoded_slc",
+                "geocoded_slc_valid",
+                "topo_phase",
+                "geo_height_field",
+                "reference_deramped",
+                "secondary_aligned",
+            ):
+                candidates.append(getattr(state, name))
+                setattr(state, name, None)
+        closed: set[int] = set()
+        for array in candidates:
+            if not isinstance(array, np.memmap) or id(array) in closed:
+                continue
+            mapping = getattr(array, "_mmap", None)
+            if mapping is None or mapping.closed:
+                continue
+            closed.add(id(array))
+            close_memmap(array)
+        temporary_directory = self.temporary_directory
+        self.temporary_directory = None
+        gc.collect()
+        if temporary_directory is not None:
+            temporary_directory.cleanup()
+
+
+def _output_bytes(path: Path) -> int:
+    """Return total bytes of a Zarr store on disk."""
+    if path.is_file():
+        return path.stat().st_size
+    if not path.is_dir():
+        return 0
+    return sum(
+        item.stat().st_size
+        for item in path.rglob("*")
+        if item.is_file() and not item.is_symlink()
+    )
+
+
+def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
+    """Process one burst unit in a worker process.
+
+    Parameters
+    ----------
+    task : dict
+        Picklable task arguments produced by ``_archive_burst_ifgs``.
+
+    Returns
+    -------
+    dict
+        ``{"unit": unit_or_None, "stage_times": dict}``.
+
+    """
+    from dataclasses import replace as _replace
+
+    from faninsar.missions.sentinel1 import read_eof_orbit, read_full_burst
+    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.tops.carrier import carrier_from_swath
+
+    tag = str(task["tag"])
+    swath = str(task["swath"])
+    frame_index = int(task["frame_index"])
+    burst_index = int(task["burst_index"])
+    azimuth_offset = int(task["azimuth_offset"])
+    ref_path = Path(task["ref_path"])
+    sec_path = Path(task["sec_path"])
+    ref_orbit = task.get("ref_orbit")
+    sec_orbit = task.get("sec_orbit")
+    roi = task.get("roi")
+    control_spacing = task.get("control_spacing")
+    esd_enabled = bool(task["esd_enabled"])
+    amplitude_refinement_enabled = bool(task["amplitude_refinement_enabled"])
+    executor = str(task["executor"])
+    device = str(task["device"])
+    dead_pixel_amp_threshold = float(task["dead_pixel_amp_threshold"])
+    coregistration_grid = task["coregistration_grid"]
+    geo_grid = task["geo_grid"]
+    geo_height_m = float(task["geo_height_m"])
+    geo_chunk_size = int(task["geo_chunk_size"])
+    roi_buffer_m = float(task.get("roi_buffer_m", 320.0))
+    ifg_dir = Path(task["ifg_dir"])
+    dem = task["dem"]
+    geo_work_dir = task["geo_work_dir"]
+
+    ref_product = open_safe_product(ref_path)
+    sec_product = open_safe_product(sec_path)
+
+    def load_burst_worker(
+        path: Path,
+        orbit_path: Path | None,
+        product: object,
+    ) -> ProductionScene:
+        s1_swath = product.swath(swath)
+        if orbit_path is not None:
+            s1_swath = _replace(s1_swath, orbit=read_eof_orbit(orbit_path))
+        array = read_full_burst(s1_swath, burst_index=burst_index, full_range=True)
+        burst = s1_swath.bursts[burst_index]
+        carrier = carrier_from_swath(s1_swath, burst, first_range_sample=array.col0)
+        geometry = _radar_model(
+            s1_swath,
+            burst,
+            shape=array.samples.shape,
+            row0=array.row0,
+            col0=array.col0,
+        )
+        return ProductionScene(
+            scene_id=_scene_id(path),
+            path=path,
+            product=product,
+            swath=s1_swath,
+            burst=burst,
+            array=array,
+            carrier=carrier,
+            geometry=geometry,
+        )
+
+    ref = load_burst_worker(ref_path, ref_orbit, ref_product)
+    sec = load_burst_worker(sec_path, sec_orbit, sec_product)
+    state = ProductionPairState(
+        pair_id=ref.scene_id + "_" + sec.scene_id + "_" + tag,
+        reference=ref,
+        secondary=sec,
+        dem=dem,
+        coregistration_grid="radar",
+        multilook=(1, 1),
+        goldstein_alpha=0.0,
+        unwrap_method="snaphu",
+    )
+    stage_times: dict[str, float] = {}
+    t0 = time.perf_counter()
+    state = stage_deramp(state)
+    stage_times["deramp"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    burst_work_dir: Path | None = None
+    if coregistration_grid == "geo" and geo_work_dir is not None:
+        burst_work_dir = Path(geo_work_dir) / tag
+    roi_window: tuple[int, int, int, int] | None = None
+    if coregistration_grid == "radar" and roi is not None:
+        assert state.reference_deramped is not None
+        roi_window = _roi_burst_window(
+            roi,
+            ref.geometry,
+            dem,
+            state.reference_deramped.shape,
+            buffer_m=roi_buffer_m,
+        )
+    state = stage_coregister(
+        state,
+        control_spacing=control_spacing,
+        esd_enabled=esd_enabled,
+        amplitude_refinement_enabled=amplitude_refinement_enabled,
+        executor=executor,
+        device=device,
+        coregistration_grid=coregistration_grid,
+        geo_grid=geo_grid,
+        geo_height_m=geo_height_m,
+        geo_chunk_size=geo_chunk_size,
+        geo_work_dir=burst_work_dir,
+        roi=roi,
+        roi_buffer_m=roi_buffer_m,
+        roi_window=roi_window,
+    )
+    stage_times["coregister"] = time.perf_counter() - t0
+    burst_row0 = 0
+    burst_col0 = 0
+    geo_valid_mask: np.ndarray | None = None
+    if coregistration_grid == "geo":
+        if state.geocoded_slc_valid is not None:
+            geo_valid_mask = np.asarray(state.geocoded_slc_valid)
+    elif state.radar_roi_origin is not None:
+        burst_row0, burst_col0 = state.radar_roi_origin
+    assert state.reference_deramped is not None
+    assert state.secondary_aligned is not None
+    pri_power = state.reference_deramped.real**2 + state.reference_deramped.imag**2
+    sec_power = state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
+    t0 = time.perf_counter()
+    state = stage_interferogram(
+        state,
+        multilook=(1, 1),
+        goldstein_alpha=0.0,
+        dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+    )
+    stage_times["interferogram"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    if coregistration_grid == "geo":
+        state.complex_ifg_flat = state.complex_ifg
+        state.note(
+            "FLATTEN applied to secondary geocoded SLC before IFG formation"
+        )
+        stage_times["flatten"] = 0.0
+    else:
+        state = stage_flatten(state)
+        stage_times["flatten"] = time.perf_counter() - t0
+    ifg_full = (
+        state.complex_ifg_flat
+        if state.complex_ifg_flat is not None
+        else state.complex_ifg
+    )
+    if ifg_full is None:
+        reject_invalid_state(tag + ": no interferogram produced")
+
+    base = ifg_dir / tag
+    ifg_path = str(base) + ".complex64"
+    pri_path = str(base) + ".pri.f64"
+    sec_path_out = str(base) + ".sec.f64"
+    if coregistration_grid == "geo":
+        geo_valid = np.zeros(ifg_full.shape, dtype=bool)
+        if geo_valid_mask is not None:
+            geo_valid = geo_valid_mask
+        geo_valid &= np.abs(ifg_full) > 0
+        if not geo_valid.any():
+            logger.warning("%s: no valid geocoded footprint; skipped", tag)
+            return {"unit": None, "stage_times": stage_times}
+        rows_any = geo_valid.any(axis=1)
+        cols_any = geo_valid.any(axis=0)
+        row0 = int(np.argmax(rows_any))
+        row1 = int(rows_any.size - np.argmax(rows_any[::-1]))
+        col0 = int(np.argmax(cols_any))
+        col1 = int(cols_any.size - np.argmax(cols_any[::-1]))
+        geo_bbox = state.geo_bbox
+        if geo_bbox is not None:
+            row0 += geo_bbox[0]
+            row1 += geo_bbox[0]
+            col0 += geo_bbox[2]
+            col1 += geo_bbox[2]
+            bbox_local = (
+                row0 - geo_bbox[0],
+                row1 - geo_bbox[0],
+                col0 - geo_bbox[2],
+                col1 - geo_bbox[2],
+            )
+        else:
+            bbox_local = (row0, row1, col0, col1)
+        height_path = str(base) + ".height.f64"
+        height_full = state.geo_height_field
+        if height_full is None:
+            height_full = np.full(
+                ifg_full.shape, float(geo_height_m), dtype=np.float64
+            )
+        else:
+            height_full = np.asarray(height_full, dtype=np.float64)
+        lr0, lr1, lc0, lc1 = bbox_local
+        bbox_ifg = ifg_full[lr0:lr1, lc0:lc1]
+        bbox_pri = pri_power[lr0:lr1, lc0:lc1]
+        bbox_sec = sec_power[lr0:lr1, lc0:lc1]
+        bbox_height = height_full[lr0:lr1, lc0:lc1]
+        bbox_ifg.astype(np.complex64, copy=False).tofile(ifg_path)
+        bbox_pri.astype(np.float64, copy=False).tofile(pri_path)
+        bbox_sec.astype(np.float64, copy=False).tofile(sec_path_out)
+        bbox_height.astype(np.float64, copy=False).tofile(height_path)
+        unit: dict[str, object] = {
+            "tag": tag,
+            "swath": swath,
+            "frame_index": frame_index,
+            "ifg_path": ifg_path,
+            "pri_path": pri_path,
+            "sec_path": sec_path_out,
+            "height_path": height_path,
+            "rows": int(bbox_ifg.shape[0]),
+            "cols": int(bbox_ifg.shape[1]),
+            "row0": row0,
+            "col0": col0,
+            "mode": "geo",
+        }
+    else:
+        ifg_full.astype(np.complex64, copy=False).tofile(ifg_path)
+        pri_power.astype(np.float64, copy=False).tofile(pri_path)
+        sec_power.astype(np.float64, copy=False).tofile(sec_path_out)
+        unit = {
+            "tag": tag,
+            "swath": swath,
+            "frame_index": frame_index,
+            "ifg_path": ifg_path,
+            "pri_path": pri_path,
+            "sec_path": sec_path_out,
+            "rows": int(ifg_full.shape[0]),
+            "cols": int(ifg_full.shape[1]),
+            "azimuth_offset": azimuth_offset,
+            "burst_row0": burst_row0,
+            "burst_col0": burst_col0,
+        }
+    logger.info("Archived %s into sweep prefix", tag)
+    return {"unit": unit, "stage_times": stage_times}
+
+
+def _write_run_manifest(
+    output_dir: str | Path,
+    *,
+    looks: tuple[int, int],
+    pair_id: str,
+    products: list[str],
+    grid: dict[str, object],
+) -> Path:
+    """Atomically write a run.json completion manifest for one config."""
+    import json
+    from datetime import UTC
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": "1",
+        "status": "complete",
+        "looks": [looks[0], looks[1]],
+        "pair_id": pair_id,
+        "products": products,
+        "product_bytes": {name: _output_bytes(out / name) for name in products},
+        "grid": grid,
+        "created_utc": datetime.now(UTC).isoformat(),
+    }
+    temporary = out / "run.json.tmp"
+    target = out / "run.json"
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
+    return target
 
 
 def _scene_id(path: Path) -> str:
@@ -172,12 +691,14 @@ class ProductionPairState:
     dem_id: str = ""
     coreg_executor: str = "torch"
     coreg_device: str = "auto"
-    multilook: tuple[int, int] = (4, 20)
+    multilook: tuple[int, int] | None = None
     goldstein_alpha: float = 0.5
     unwrap_method: str = "snaphu"
     geo_grid_meta: dict[str, Any] | None = None
     geo_work_dir: Path | None = None
     memory_watchdog: MemoryWatchdog | None = None
+    geo_bbox: tuple[int, int, int, int] | None = None
+    radar_roi_origin: tuple[int, int] | None = None
 
     def note(self, message: str) -> None:
         """Append a stage log line."""
@@ -312,6 +833,8 @@ def _apply_geo_topographic_phase_chunked(
     output_dir: Path,
     chunk_size: int,
     watchdog: MemoryWatchdog | None,
+    row0_offset: int = 0,
+    col0_offset: int = 0,
 ) -> tuple[np.memmap, np.ndarray]:
     """Apply geometric phase to disk-backed geographic SLC row tiles.
 
@@ -333,6 +856,9 @@ def _apply_geo_topographic_phase_chunked(
         Number of geographic rows per tile.
     watchdog : MemoryWatchdog, optional
         Memory guard sampled after every completed tile.
+    row0_offset, col0_offset : int
+        Offset of the cropped LUT inside the full geographic grid, used to
+        map cropped rows/cols back to global grid coordinates.
 
     Returns
     -------
@@ -349,7 +875,7 @@ def _apply_geo_topographic_phase_chunked(
         output_dir / "topographic_phase.float32",
         mode="w+",
         dtype=np.float32,
-        shape=grid.shape,
+        shape=lut.shape,
     )
     height_field = lut.height_full
     if height_field is None:
@@ -357,11 +883,11 @@ def _apply_geo_topographic_phase_chunked(
             output_dir / "height.float64",
             mode="w+",
             dtype=np.float64,
-            shape=grid.shape,
+            shape=lut.shape,
         )
     invalid = np.complex64(np.nan + 1j * np.nan)
-    for row_start in range(0, grid.height, chunk_size):
-        row_stop = min(row_start + chunk_size, grid.height)
+    for row_start in range(0, lut.shape[0], chunk_size):
+        row_stop = min(row_start + chunk_size, lut.shape[0])
         rows = slice(row_start, row_stop)
         tile_lut = Geo2RdrLUT(
             az_full=lut.az_full[rows],
@@ -375,7 +901,15 @@ def _apply_geo_topographic_phase_chunked(
             tile_lut,
             offsets,
         )
-        latitude, longitude = grid_lonlat_rows(grid, row_start, row_stop)
+        latitude, longitude = grid_lonlat_rows(
+            grid,
+            row_start + row0_offset,
+            row_stop + row0_offset,
+        )
+        col_stop = col0_offset + lut.shape[1]
+        if col0_offset > 0 or col_stop < grid.width:
+            latitude = latitude[:, col0_offset:col_stop]
+            longitude = longitude[:, col0_offset:col_stop]
         if tile_lut.height_full is None:
             height = np.asarray(
                 state.dem.sample(latitude, longitude),
@@ -455,6 +989,9 @@ def stage_coregister(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    roi: BoundingBox | Polygons | None = None,
+    roi_buffer_m: float = 320.0,
+    roi_window: tuple[int, int, int, int] | None = None,
     memory_watchdog: MemoryWatchdog | None = None,
 ) -> ProductionPairState:
     """Estimate dense offsets and coregister on a radar or geographic grid.
@@ -496,6 +1033,15 @@ def stage_coregister(
         Geo2rdr row chunk size.
     geo_work_dir : str or pathlib.Path, optional
         Directory for disk-backed Geo intermediate arrays.
+    roi : BoundingBox or Polygons, optional
+        Restricts geo processing to the ROI-burst quad intersection
+        (buffered by ``roi_buffer_m``) instead of the full burst bbox.
+    roi_buffer_m : float, optional
+        Physical margin in meters kept around the ROI in geo mode, applied in
+        the grid CRS so the extension is isotropic on the ground.
+    roi_window : tuple[int, int, int, int], optional
+        Radar window ``(row0, row1, col0, col1)`` to coregister instead of the
+        full burst (radar mode with an ROI).
     memory_watchdog : MemoryWatchdog, optional
         Memory guard sampled after each geographic tile.
 
@@ -526,62 +1072,132 @@ def stage_coregister(
     )
     if resolved_control_spacing < 1:
         reject_invalid_state("control_spacing must be >= 1")
-    substage_started = time.perf_counter()
-    geometry_field = dense_geometry_offsets(
-        shape=ref.shape,
-        reference_model=state.reference.geometry,
-        secondary_model=state.secondary.geometry,
-        dem=dem,
-        stride=resolved_control_spacing,
+    window: tuple[int, int, int, int] | None = (
+        roi_window if coregistration_grid == "radar" else None
     )
-    state.coregistration_timings_s["dense_geometry_offsets"] = (
-        time.perf_counter() - substage_started
-    )
+    window_origin: tuple[int, int] | None = None
+    window_halo_px = 0
+    if window is not None:
+        wr0, wr1, wc0, wc1 = window
+        if not (0 <= wr0 < wr1 <= ref.shape[0] and 0 <= wc0 < wc1 <= ref.shape[1]):
+            reject_invalid_state("roi_window must lie inside the burst")
+        probe_extent = geometry_offset_window_extent(
+            window,
+            burst_shape=ref.shape,
+            reference_model=state.reference.geometry,
+            secondary_model=state.secondary.geometry,
+            dem=dem,
+            probe_stride=max(32, 8 * resolved_control_spacing),
+        )
+        window_halo_px = max(
+            _WINDOW_HALO_FLOOR_PX,
+            int(np.ceil(probe_extent)) + _LANCZOS_RADIUS_PX + _WINDOW_HALO_MARGIN_PX,
+        )
+    ref_full = ref
+    sec_full = sec
+    growth_attempts = 0
+    while True:
+        if window is not None:
+            crop_bounds = _window_crop_bounds(
+                window,
+                ref_full.shape,
+                resolved_control_spacing,
+                window_halo_px,
+            )
+            cr0, cr1, cc0, cc1 = crop_bounds
+            ref = ref_full[cr0:cr1, cc0:cc1]
+            sec = sec_full[cr0:cr1, cc0:cc1]
+            window_origin = (cr0, cc0)
+            state.reference_deramped = ref
+            state.secondary_deramped = sec
+            state.radar_roi_origin = window_origin
+        substage_started = time.perf_counter()
+        geometry_field = dense_geometry_offsets(
+            shape=ref.shape,
+            reference_model=state.reference.geometry,
+            secondary_model=state.secondary.geometry,
+            dem=dem,
+            stride=resolved_control_spacing,
+            row0=0 if window_origin is None else window_origin[0],
+            col0=0 if window_origin is None else window_origin[1],
+        )
+        state.coregistration_timings_s["dense_geometry_offsets"] = (
+            time.perf_counter() - substage_started
+        )
 
-    prior_rg = float(
-        np.nanmedian(geometry_field.range_offset_px[geometry_field.coverage])
-    )
-    prior_az = float(
-        np.nanmedian(geometry_field.azimuth_offset_px[geometry_field.coverage])
-    )
-    amp_res_rg = 0.0
-    amp_res_az = 0.0
-    esd_az = 0.0
-    if coregistration_grid == "radar" and amplitude_refinement_enabled:
-        amp_rg, amp_az = refine_shift_with_correlation(
-            ref,
-            sec,
-            prior_rg=prior_rg,
-            prior_az=prior_az,
-            search_radius=32,
+        prior_rg = float(
+            np.nanmedian(geometry_field.range_offset_px[geometry_field.coverage])
         )
-        amp_res_rg = amp_rg - prior_rg
-        amp_res_az = amp_az - prior_az
-    if coregistration_grid == "radar" and esd_enabled:
-        # Bilinear pre-align is sufficient for ESD spectral estimation and
-        # avoids a second full-burst Lanczos pass (~minutes and peak RSS).
-        pre = resample_complex(
-            sec,
-            range_offset_px=geometry_field.range_offset_px + amp_res_rg,
-            azimuth_offset_px=geometry_field.azimuth_offset_px + amp_res_az,
-            order=1,
+        prior_az = float(
+            np.nanmedian(geometry_field.azimuth_offset_px[geometry_field.coverage])
         )
-        esd = estimate_azimuth_shift_esd(ref, pre)
-        esd_az = float(esd.azimuth_shift_px)
-        state.esd_azimuth_shift_px = esd_az
-        state.note(f"ESD az={esd_az:.4f} px coherence={esd.coherence:.3f}")
-        del pre
+        amp_res_rg = 0.0
+        amp_res_az = 0.0
+        esd_az = 0.0
+        if coregistration_grid == "radar" and amplitude_refinement_enabled:
+            amp_rg, amp_az = refine_shift_with_correlation(
+                ref,
+                sec,
+                prior_rg=prior_rg,
+                prior_az=prior_az,
+                search_radius=32,
+            )
+            amp_res_rg = amp_rg - prior_rg
+            amp_res_az = amp_az - prior_az
+        if coregistration_grid == "radar" and esd_enabled:
+            # Bilinear pre-align is sufficient for ESD spectral estimation and
+            # avoids a second full-burst Lanczos pass (~minutes and peak RSS).
+            pre = resample_complex(
+                sec,
+                range_offset_px=geometry_field.range_offset_px + amp_res_rg,
+                azimuth_offset_px=geometry_field.azimuth_offset_px + amp_res_az,
+                order=1,
+            )
+            esd = estimate_azimuth_shift_esd(ref, pre)
+            esd_az = float(esd.azimuth_shift_px)
+            state.esd_azimuth_shift_px = esd_az
+            state.note(f"ESD az={esd_az:.4f} px coherence={esd.coherence:.3f}")
+            del pre
+            gc.collect()
+
+        offsets = combine_offset_fields(
+            geometry_field,
+            esd_azimuth_shift_px=esd_az,
+            amplitude_residual_rg=amp_res_rg,
+            amplitude_residual_az=amp_res_az,
+        )
+        # Drop geometry-only fields once combined; offsets retains the dense maps.
+        del geometry_field
         gc.collect()
-
-    offsets = combine_offset_fields(
-        geometry_field,
-        esd_azimuth_shift_px=esd_az,
-        amplitude_residual_rg=amp_res_rg,
-        amplitude_residual_az=amp_res_az,
-    )
-    # Drop geometry-only fields once combined; offsets retains the dense maps.
-    del geometry_field
-    gc.collect()
+        if window is None:
+            break
+        if _window_halo_sufficient(
+            offsets,
+            window,
+            window_origin,
+            crop_bounds,
+            ref_full.shape,
+        ):
+            break
+        growth_attempts += 1
+        if growth_attempts >= _MAX_WINDOW_HALO_GROWTH:
+            logger.warning(
+                "ROI window halo did not converge after %d growths; "
+                "falling back to full-burst coregistration",
+                growth_attempts,
+            )
+            window = None
+            window_origin = None
+            state.radar_roi_origin = None
+            ref = ref_full
+            sec = sec_full
+            state.reference_deramped = ref
+            state.secondary_deramped = sec
+            continue
+        window_halo_px = (
+            _window_resample_halo_required(offsets, window, window_origin)
+            + _WINDOW_HALO_MARGIN_PX
+        )
 
     state.range_shift_px = float(
         np.nanmedian(offsets.range_offset_px[offsets.coverage])
@@ -593,7 +1209,12 @@ def stage_coregister(
     if coregistration_grid == "geo":
         if geo_grid is None:
             reject_invalid_state("geo coregistration requires geo_grid")
-        from faninsar.processing.pipeline.geo_lut import build_geo2rdr_lut
+        from faninsar.processing.pipeline.geo_lut import (
+            build_geo2rdr_lut,
+            burst_geo_quad_lonlat,
+            derive_burst_geo_bbox,
+            roi_geo_bbox,
+        )
         from faninsar.processing.pipeline.geo_modes import (
             coregister_geocoded_slcs_chunked,
         )
@@ -602,6 +1223,49 @@ def stage_coregister(
             reject_invalid_state("geo coregistration requires geo_work_dir")
         work_directory = Path(geo_work_dir)
         work_directory.mkdir(parents=True, exist_ok=True)
+        burst_row0, burst_row1, burst_col0, burst_col1 = derive_burst_geo_bbox(
+            geometry=state.reference.geometry,
+            radar_shape=ref.shape,
+            grid=geo_grid,
+            dem=state.dem,
+        )
+        footprint_lonlat: np.ndarray | None = None
+        roi_geometry: object | None = None
+        if roi is not None:
+            from shapely.geometry import MultiPolygon
+            from shapely.geometry import Polygon as ShapelyPolygon
+
+            from faninsar.processing.pipeline.geo_lut import polygon_parts
+
+            burst_quad = burst_geo_quad_lonlat(
+                geometry=state.reference.geometry,
+                radar_shape=ref.shape,
+                dem=state.dem,
+            )
+            if burst_quad is not None:
+                intersection = _roi_geometry(roi).intersection(
+                    ShapelyPolygon(burst_quad).buffer(0)
+                )
+                parts = [
+                    part
+                    for part in polygon_parts(intersection)
+                    if not part.is_empty
+                ]
+                if parts:
+                    roi_polygon = (
+                        parts[0] if len(parts) == 1 else MultiPolygon(parts)
+                    )
+                    roi_geometry = _buffer_geometry_meters(
+                        roi_polygon,
+                        geo_grid.crs,
+                        roi_buffer_m,
+                    )
+                    burst_row0, burst_row1, burst_col0, burst_col1 = roi_geo_bbox(
+                        roi_geometry,
+                        geo_grid,
+                        margin_px=2,
+                    )
+        state.geo_bbox = (burst_row0, burst_row1, burst_col0, burst_col1)
         substage_started = time.perf_counter()
         lut = build_geo2rdr_lut(
             geometry=state.reference.geometry,
@@ -611,6 +1275,11 @@ def stage_coregister(
             dem=state.dem,
             chunk_size=geo_chunk_size,
             storage_dir=work_directory / "lut",
+            row_range=(burst_row0, burst_row1),
+            col_range=(burst_col0, burst_col1),
+            footprint_lonlat=footprint_lonlat,
+            roi_geometry=roi_geometry,
+            polygon_dilate_px=2,
         )
         state.coregistration_timings_s["geo2rdr_lut"] = (
             time.perf_counter() - substage_started
@@ -644,6 +1313,8 @@ def stage_coregister(
             output_dir=work_directory,
             chunk_size=geo_chunk_size,
             watchdog=memory_watchdog,
+            row0_offset=burst_row0,
+            col0_offset=burst_col0,
         )
         state.coregistration_timings_s["geo_topographic_phase"] = (
             time.perf_counter() - substage_started
@@ -679,6 +1350,9 @@ def stage_coregister(
         azimuth_offset_px=offsets.azimuth_offset_px,
         executor=executor,
         device=device,
+        row0=0 if window_origin is None else window_origin[0],
+        col0=0 if window_origin is None else window_origin[1],
+        native_height=state.reference.array.samples.shape[0],
     )
     secondary_geometry = state.secondary.geometry
     phase_per_range_pixel = (
@@ -702,7 +1376,13 @@ def stage_coregister(
         phase_per_range_pixel * offsets.range_offset_px
     ).astype(np.float32)
     state.secondary_deramped = None
-    state.reference_deramped = reramp(ref, state.reference.carrier)
+    state.reference_deramped = reramp(
+        ref,
+        state.reference.carrier,
+        row0=0 if window_origin is None else window_origin[0],
+        col0=0 if window_origin is None else window_origin[1],
+        native_height=state.reference.array.samples.shape[0],
+    )
     state.secondary_aligned = sec_resamp
     del sec_resamp, sec, ref, offsets
     gc.collect()
@@ -744,6 +1424,7 @@ def stage_interferogram(
     """
     if state.reference_deramped is None or state.secondary_aligned is None:
         reject_invalid_state("interferogram requires coregister")
+    state.multilook = multilook
     ifg = form_interferogram(
         state.reference_deramped,
         state.secondary_aligned,
@@ -814,11 +1495,17 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
     # Geometry (0,0) is the array origin (already cropped). Use look-window
     # centres rather than leading edges so path-length phase matches the
     # multilooked ifg sampling.
-    full_h, full_w = state.reference.array.samples.shape
-    az_looks = max(full_h // max(height, 1), 1)
-    rg_looks = max(full_w // max(width, 1), 1)
+    if state.multilook is not None:
+        az_looks, rg_looks = state.multilook
+    else:
+        full_h, full_w = state.reference.array.samples.shape
+        az_looks = max(full_h // max(height, 1), 1)
+        rg_looks = max(full_w // max(width, 1), 1)
     az_full = (np.arange(height, dtype=np.float64) + 0.5) * az_looks - 0.5
     rg_full = (np.arange(width, dtype=np.float64) + 0.5) * rg_looks - 0.5
+    roi_origin = state.radar_roi_origin or (0, 0)
+    az_full = az_full + float(roi_origin[0])
+    rg_full = rg_full + float(roi_origin[1])
     az_grid, rg_grid = np.meshgrid(az_full, rg_full, indexing="ij")
 
     def _topographic_phase() -> tuple[np.ndarray, float, float, float]:
@@ -1093,7 +1780,11 @@ def stage_geocode(
 
 
 def stage_write(
-    state: ProductionPairState, output_dir: str | Path
+    state: ProductionPairState,
+    output_dir: str | Path,
+    *,
+    preserve_geo_work_dir: bool = False,
+    stac_item_id: str | None = None,
 ) -> ProductionPairState:
     """Write radar products, geocoded layers, baselines, and STAC with bbox."""
     if (
@@ -1118,7 +1809,7 @@ def stage_write(
         "unwrap_method": state.unwrap_method,
         "coregistration_grid": state.coregistration_grid,
         "dem_id": state.dem_id,
-        "multilook": list(state.multilook),
+        "multilook": list(state.multilook or (1, 1)),
         "goldstein_alpha": state.goldstein_alpha,
         "coreg_executor": state.coreg_executor,
         "coreg_device": state.coreg_device,
@@ -1326,7 +2017,7 @@ def stage_write(
             item = {
                 "type": "Feature",
                 "stac_version": "1.0.0",
-                "id": state.pair_id,
+                "id": stac_item_id if stac_item_id is not None else state.pair_id,
                 "geometry": geometry,
                 "bbox": bbox,
                 "properties": {
@@ -1354,15 +2045,17 @@ def stage_write(
             }
             stac_path.write_text(json.dumps(item, indent=2) + "\n", encoding="utf-8")
         else:
-            write_pair_stac_item(product, zarr_path, stac_path)
+            write_pair_stac_item(
+                product, zarr_path, stac_path, stac_item_id=stac_item_id
+            )
     else:
-        write_pair_stac_item(product, zarr_path, stac_path)
+        write_pair_stac_item(product, zarr_path, stac_path, stac_item_id=stac_item_id)
 
     state.zarr_path = zarr_path
     state.stac_path = stac_path
     if state.memory_watchdog is not None:
         state.memory_watchdog.sample("write:complete")
-    if state.geo_work_dir is not None:
+    if state.geo_work_dir is not None and not preserve_geo_work_dir:
         work_directory = state.geo_work_dir
         state.reference_geocoded_slc = None
         state.secondary_geocoded_slc = None
@@ -1442,9 +2135,50 @@ def _multilook_real_field(
     )
 
 
+def _finalize_geo_products(
+    state: ProductionPairState,
+    *,
+    geo_grid: GeoGridSpec,
+    multilook: tuple[int, int],
+    geo_height_m: float,
+) -> ProductionPairState:
+    """Assemble the multilooked geographic product grid from unwrapped phase."""
+    from faninsar.processing.pipeline.geo_lut import grid_lonlat
+
+    assert state.unwrapped_phase is not None
+    assert state.coherence is not None
+    assert state.wrapped_phase is not None
+    product_grid = _multilooked_geo_grid(geo_grid, multilook)
+    lat, lon = grid_lonlat(product_grid)
+    converged = np.isfinite(state.unwrapped_phase).astype(np.uint8)
+    height_field = state.geo_height_field
+    if height_field is None:
+        height_field = np.full(
+            product_grid.shape,
+            float(geo_height_m),
+            dtype=np.float64,
+        )
+    elif height_field.shape != product_grid.shape:
+        height_field = _multilook_real_field(height_field, multilook)
+    state.geocoded = {
+        "unwrapped_phase": np.asarray(state.unwrapped_phase, dtype=np.float32),
+        "coherence": np.asarray(state.coherence, dtype=np.float32),
+        "wrapped_phase": np.asarray(state.wrapped_phase, dtype=np.float32),
+        "latitude_deg": lat.astype(np.float64),
+        "longitude_deg": lon.astype(np.float64),
+        "height_m": np.asarray(height_field, dtype=np.float64),
+        "converged": converged,
+    }
+    if isinstance(state.geo_height_field, np.memmap):
+        close_memmap(state.geo_height_field)
+        state.geo_height_field = None
+    state.geo_grid_meta = _geo_grid_meta(product_grid)
+    state.note("GEO products complete on multilooked geographic grid")
+    return state
+
+
 BurstSelection = (
-    dict[str, list[int] | range | str]
-    | list[dict[str, list[int] | range | str]]
+    dict[str, list[int] | range | str] | list[dict[str, list[int] | range | str]]
 )
 
 
@@ -1472,8 +2206,12 @@ def _as_optional_frame_sequence(
         return [paths[0]] * frame_count
     if len(paths) != frame_count:
         reject_invalid_state(
-            name + " has " + str(len(paths)) + " entries for "
-            + str(frame_count) + " frames"
+            name
+            + " has "
+            + str(len(paths))
+            + " entries for "
+            + str(frame_count)
+            + " frames"
         )
     return list(paths)
 
@@ -1491,7 +2229,10 @@ def _burst_index_list(
             value = range(int(parts[0]), int(parts[1]))
         else:
             reject_invalid_state(
-                "invalid burst selection " + repr(value) + " for " + swath
+                "invalid burst selection "
+                + repr(value)
+                + " for "
+                + swath
                 + "; expected 'all' or 'start:stop'"
             )
     if isinstance(value, range):
@@ -1503,8 +2244,12 @@ def _burst_index_list(
     for index in indices:
         if index < 0 or index >= count:
             reject_invalid_state(
-                "burst index " + str(index) + " out of range 0.."
-                + str(count - 1) + " for " + swath
+                "burst index "
+                + str(index)
+                + " out of range 0.."
+                + str(count - 1)
+                + " for "
+                + swath
             )
     return sorted(set(indices))
 
@@ -1526,8 +2271,11 @@ def _normalize_burst_selection(
     if isinstance(bursts, list):
         if len(bursts) != frame_count:
             reject_invalid_state(
-                "per-frame burst selection has " + str(len(bursts))
-                + " entries for " + str(frame_count) + " frames"
+                "per-frame burst selection has "
+                + str(len(bursts))
+                + " entries for "
+                + str(frame_count)
+                + " frames"
             )
         per_frame: list[dict[str, list[int] | range | str] | None] = list(bursts)
     else:
@@ -1554,41 +2302,198 @@ def _roi_geometry(roi: BoundingBox | Polygons) -> Any:
     if isinstance(roi, BoundingBox):
         return box(roi.left, roi.bottom, roi.right, roi.top)
     series = roi.geometry
-    if hasattr(series, "union_all"):
-        return series.union_all()
-    return series.unary_union
+    union = (
+        series.union_all() if hasattr(series, "union_all") else series.unary_union
+    )
+    crs = getattr(roi, "crs", None)
+    if crs is not None and str(crs) != "EPSG:4326":
+        import geopandas as gpd
+
+        return gpd.GeoSeries([union], crs=crs).to_crs("EPSG:4326").iloc[0]
+    return union
+
+
+def _auto_dem_bounds(
+    roi: BoundingBox | Polygons | None,
+    resolved: dict[tuple[int, str], list[int]],
+    reference_products: list,
+    orbits: Sequence[str | Path | None] | None = None,
+    dem: DEMSampler | None = None,
+) -> tuple[float, float, float, float]:
+    """Return EPSG:4326 bounds covering the ROI or the selected bursts.
+
+    Parameters
+    ----------
+    roi : BoundingBox, Polygons, or None
+        ROI passed to run_pair.
+    resolved : dict
+        Selected burst indices per (frame_index, swath).
+    reference_products : list
+        Opened reference SAFE products, one per frame.
+    orbits : sequence of path or None, optional
+        Per-frame precise orbit files used to build the burst quads.
+    dem : DEMSampler, optional
+        DEM used by the burst quad rdr2geo.
+
+    Returns
+    -------
+    tuple[float, float, float, float]
+        (min_lon, min_lat, max_lon, max_lat) covering the ROI, or the burst
+        quads buffered by DEM_BOUNDS_BUFFER_M.
+
+    """
+    if isinstance(roi, BoundingBox):
+        return (
+            float(roi.left),
+            float(roi.bottom),
+            float(roi.right),
+            float(roi.top),
+        )
+    if isinstance(roi, Polygons):
+        total = roi.to_geodataframe().total_bounds
+        return (
+            float(total[0]),
+            float(total[1]),
+            float(total[2]),
+            float(total[3]),
+        )
+    from dataclasses import replace as _replace
+
+    from faninsar.missions.sentinel1 import read_eof_orbit
+    from faninsar.processing.pipeline.geo_lut import burst_geo_quad_lonlat
+
+    quads: list[np.ndarray] = []
+    for (frame_index, swath), indices in resolved.items():
+        s1_swath = reference_products[frame_index].swath(swath)
+        orbit_path = None if orbits is None else orbits[frame_index]
+        if orbit_path is not None:
+            s1_swath = _replace(s1_swath, orbit=read_eof_orbit(orbit_path))
+        shape = (s1_swath.lines_per_burst, s1_swath.samples_per_burst)
+        for burst_index in indices:
+            burst = s1_swath.bursts[burst_index]
+            geometry = _radar_model(
+                s1_swath,
+                burst,
+                shape=shape,
+                row0=burst.index * s1_swath.lines_per_burst,
+                col0=0,
+            )
+            quad = burst_geo_quad_lonlat(
+                geometry=geometry,
+                radar_shape=shape,
+                dem=dem,
+            )
+            if quad is not None:
+                quads.append(quad)
+    return _quad_bounds_with_buffer_m(quads, DEM_BOUNDS_BUFFER_M)
+
+
+def _quad_bounds_with_buffer_m(
+    quads: list[np.ndarray],
+    buffer_m: float,
+) -> tuple[float, float, float, float]:
+    """Return the EPSG:4326 bounds of burst quads buffered by meters."""
+    from pyproj import Transformer
+    from shapely.geometry import Polygon as ShapelyPolygon
+
+    if not quads:
+        reject_invalid_state("cannot derive DEM bounds: no burst geometry available")
+    all_lon = np.concatenate([quad[:, 0] for quad in quads])
+    all_lat = np.concatenate([quad[:, 1] for quad in quads])
+    mean_lon = float(np.mean(all_lon))
+    mean_lat = float(np.mean(all_lat))
+    zone = int(np.floor((mean_lon + 180.0) / 6.0)) + 1
+    epsg = (32600 if mean_lat >= 0 else 32700) + zone
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+    inverse = Transformer.from_crs(f"EPSG:{epsg}", "EPSG:4326", always_xy=True)
+    min_lon = min_lat = float("inf")
+    max_lon = max_lat = float("-inf")
+    for quad in quads:
+        xs, ys = transformer.transform(quad[:, 0], quad[:, 1])
+        buffered = ShapelyPolygon(np.column_stack([xs, ys])).buffer(buffer_m)
+        bx, by = inverse.transform(*buffered.exterior.xy)
+        min_lon = min(min_lon, float(np.min(bx)))
+        max_lon = max(max_lon, float(np.max(bx)))
+        min_lat = min(min_lat, float(np.min(by)))
+        max_lat = max(max_lat, float(np.max(by)))
+    return (min_lon, min_lat, max_lon, max_lat)
 
 
 def _select_bursts_by_roi(
     roi: BoundingBox | Polygons,
     frame_paths: list[Path],
     swaths: tuple[str, ...],
+    orbits: Sequence[str | Path | None] | None = None,
+    dem: DEMSampler | None = None,
 ) -> dict[tuple[int, str], list[int]]:
-    from shapely.geometry import Polygon
+    """Select bursts whose radar-frame ground quad intersects the ROI."""
+    from dataclasses import replace as _replace
 
+    from shapely.geometry import Polygon as ShapelyPolygon
+
+    from faninsar.missions.sentinel1 import read_eof_orbit
     from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.pipeline.geo_lut import burst_geo_quad_lonlat
 
     region = _roi_geometry(roi)
     resolved: dict[tuple[int, str], list[int]] = {}
-    any_footprint = False
+    any_quad = False
     for frame_index, path in enumerate(frame_paths):
         product = open_safe_product(path)
+        orbit_path = None if orbits is None else orbits[frame_index]
         for swath in swaths:
             s1_swath = product.swath(swath)
+            if orbit_path is not None:
+                s1_swath = _replace(s1_swath, orbit=read_eof_orbit(orbit_path))
             indices: list[int] = []
+            shape = (s1_swath.lines_per_burst, s1_swath.samples_per_burst)
             for burst in s1_swath.bursts:
-                if burst.footprint is None:
+                geometry = _radar_model(
+                    s1_swath,
+                    burst,
+                    shape=shape,
+                    row0=burst.index * s1_swath.lines_per_burst,
+                    col0=0,
+                )
+                quad = burst_geo_quad_lonlat(
+                    geometry=geometry,
+                    radar_shape=shape,
+                    dem=dem,
+                )
+                if quad is None:
                     continue
-                any_footprint = True
-                if region.intersects(Polygon(burst.footprint)):
+                any_quad = True
+                if region.intersects(ShapelyPolygon(quad)):
                     indices.append(burst.index)
             resolved[(frame_index, swath)] = indices
-    if not any_footprint:
+    if not any_quad:
         reject_invalid_state(
-            "ROI selection requires burst footprints; annotation geolocation "
-            "grid is missing from the input products"
+            "ROI selection requires radar geometry; burst rdr2geo quads "
+            "could not be built for any burst"
         )
     return resolved
+
+
+def _buffer_geometry_meters(
+    geometry: object,
+    target_crs: object,
+    buffer_m: float,
+) -> object:
+    """Buffer a WGS84 shapely geometry by meters in a projected CRS."""
+    from pyproj import Transformer
+    from shapely.ops import transform as shp_transform
+
+    transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+    inverse = Transformer.from_crs(target_crs, "EPSG:4326", always_xy=True)
+    projected = shp_transform(
+        lambda x, y: transformer.transform(x, y),
+        geometry,
+    )
+    buffered = projected.buffer(buffer_m)
+    return shp_transform(
+        lambda x, y: inverse.transform(x, y),
+        buffered,
+    )
 
 
 def _roi_burst_window(
@@ -1596,24 +2501,59 @@ def _roi_burst_window(
     geometry: RadarGeometryModel,
     dem: DEMSampler,
     shape: tuple[int, int],
+    buffer_m: float = 320.0,
 ) -> tuple[int, int, int, int] | None:
+    """Return the radar window covering the ROI-burst quad intersection."""
+    from shapely.geometry import Polygon as ShapelyPolygon
+
     from faninsar.processing.geometry import geo2rdr
+    from faninsar.processing.pipeline.geo_lut import (
+        burst_geo_quad_lonlat,
+        polygon_parts,
+    )
 
     region = _roi_geometry(roi)
-    min_lon, min_lat, max_lon, max_lat = region.bounds
-    lon = np.asarray([min_lon, max_lon, max_lon, min_lon], dtype=np.float64)
-    lat = np.asarray([max_lat, max_lat, min_lat, min_lat], dtype=np.float64)
-    height = float(np.mean(dem.sample(lat, lon)))
+    quad = burst_geo_quad_lonlat(geometry, shape, dem)
+    if quad is not None:
+        intersection = region.intersection(ShapelyPolygon(quad).buffer(0))
+        parts = [
+            part for part in polygon_parts(intersection) if not part.is_empty
+        ]
+    else:
+        parts = []
+    if parts:
+        rings: list[np.ndarray] = []
+        for polygon in parts:
+            rings.append(np.asarray(polygon.exterior.coords))
+            rings.extend(
+                np.asarray(interior.coords) for interior in polygon.interiors
+            )
+        points = np.concatenate(rings)
+        lon = points[:, 0]
+        lat = points[:, 1]
+    else:
+        min_lon, min_lat, max_lon, max_lat = region.bounds
+        lon = np.asarray([min_lon, max_lon, max_lon, min_lon], dtype=np.float64)
+        lat = np.asarray([max_lat, max_lat, min_lat, min_lat], dtype=np.float64)
+    height = np.asarray(dem.sample(lat, lon), dtype=np.float64)
     transform = geo2rdr(geometry, lat, lon, height)
-    azimuth = transform.azimuth_index
-    range_index = transform.range_index
-    ok = transform.converged & np.isfinite(azimuth) & np.isfinite(range_index)
+    azimuth = np.asarray(transform.azimuth_index, dtype=np.float64)
+    range_index = np.asarray(transform.range_index, dtype=np.float64)
+    ok = (
+        np.asarray(transform.converged, dtype=bool)
+        & np.isfinite(azimuth)
+        & np.isfinite(range_index)
+    )
     if not np.any(ok):
         return None
-    row0 = max(0, int(np.floor(np.min(azimuth[ok]))))
-    row1 = min(shape[0], int(np.ceil(np.max(azimuth[ok]))) + 1)
-    col0 = max(0, int(np.floor(np.min(range_index[ok]))))
-    col1 = min(shape[1], int(np.ceil(np.max(range_index[ok]))) + 1)
+    # Sentinel-1 azimuth ground speed (~7.0 km/s); a fixed approximation is
+    # acceptable for a buffer margin (under- or over-sized by a few percent).
+    az_px = max(1, int(np.ceil(buffer_m / (7000.0 * geometry.azimuth_time_interval_s))))
+    rg_px = max(1, int(np.ceil(buffer_m / geometry.range_spacing_m)))
+    row0 = max(0, int(np.floor(np.min(azimuth[ok]))) - az_px)
+    row1 = min(shape[0], int(np.ceil(np.max(azimuth[ok]))) + 1 + az_px)
+    col0 = max(0, int(np.floor(np.min(range_index[ok]))) - rg_px)
+    col1 = min(shape[1], int(np.ceil(np.max(range_index[ok]))) + 1 + rg_px)
     if row1 <= row0 or col1 <= col0:
         return None
     return row0, row1, col0, col1
@@ -1630,9 +2570,7 @@ def _common_burst_indices(
 ) -> list[int]:
     common: list[int] = []
     max_index = min(len(reference_swath.bursts), len(secondary_swath.bursts))
-    window_s = (
-        reference_swath.lines_per_burst * reference_swath.azimuth_time_interval_s
-    )
+    window_s = reference_swath.lines_per_burst * reference_swath.azimuth_time_interval_s
     for index in range(max_index):
         ref_burst = reference_swath.bursts[index]
         sec_burst = secondary_swath.bursts[index]
@@ -1673,6 +2611,7 @@ def _swath_range_offsets(
     return offsets
 
 
+@overload
 def run_pair(
     reference_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
@@ -1682,7 +2621,8 @@ def run_pair(
     swaths: tuple[str, ...] | None = None,
     bursts: BurstSelection | None = None,
     dem: DEMSampler | None = None,
-    multilook: tuple[int, int] = (2, 10),
+    multilook: tuple[int, int] | list[int] = (2, 10),
+    overwrite: bool = False,
     goldstein_alpha: float = 0.5,
     dead_pixel_amp_threshold: float = 3.0,
     esd_enabled: bool = False,
@@ -1690,11 +2630,92 @@ def run_pair(
     control_spacing: int | None = None,
     executor: str = "torch",
     device: str = "auto",
+    coregistration_grid: CoregistrationGrid = "radar",
+    geo_grid: GeoGridSpec | None = None,
+    geo_height_m: float = 0.0,
+    geo_chunk_size: int = 128,
+    geo_work_dir: str | Path | None = None,
+    n_jobs: int = 1,
+    roi_buffer_m: float = 320.0,
+    snaphu_config: SnaphuConfig | None = None,
+    unwrap_method: UnwrapBackend | None = None,
+    irls_kwargs: dict[str, Any] | None = None,
     reference_orbit_path: str | Path | Sequence[str | Path] | None = None,
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
-) -> ProductionPairState:
+) -> ProductionPairState: ...
+
+
+@overload
+def run_pair(
+    reference_path: str | Path | Sequence[str | Path],
+    secondary_path: str | Path | Sequence[str | Path],
+    *,
+    output_dir: str | Path,
+    roi: BoundingBox | Polygons | None = None,
+    swaths: tuple[str, ...] | None = None,
+    bursts: BurstSelection | None = None,
+    dem: DEMSampler | None = None,
+    multilook: Iterable[tuple[int, int]],
+    overwrite: bool = False,
+    goldstein_alpha: float = 0.5,
+    dead_pixel_amp_threshold: float = 3.0,
+    esd_enabled: bool = False,
+    amplitude_refinement_enabled: bool = False,
+    control_spacing: int | None = None,
+    executor: str = "torch",
+    device: str = "auto",
+    coregistration_grid: CoregistrationGrid = "radar",
+    geo_grid: GeoGridSpec | None = None,
+    geo_height_m: float = 0.0,
+    geo_chunk_size: int = 128,
+    geo_work_dir: str | Path | None = None,
+    n_jobs: int = 1,
+    roi_buffer_m: float = 320.0,
+    snaphu_config: SnaphuConfig | None = None,
+    unwrap_method: UnwrapBackend | None = None,
+    irls_kwargs: dict[str, Any] | None = None,
+    reference_orbit_path: str | Path | Sequence[str | Path] | None = None,
+    secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
+    unwrap: bool = False,
+    geoid_correction: bool = True,
+) -> ProductionPairSweepResult: ...
+
+
+def run_pair(
+    reference_path: str | Path | Sequence[str | Path],
+    secondary_path: str | Path | Sequence[str | Path],
+    *,
+    output_dir: str | Path,
+    roi: BoundingBox | Polygons | None = None,
+    swaths: tuple[str, ...] | None = None,
+    bursts: BurstSelection | None = None,
+    dem: DEMSampler | None = None,
+    multilook: tuple[int, int] | list[int] | Iterable[tuple[int, int]] = (2, 10),
+    overwrite: bool = False,
+    goldstein_alpha: float = 0.5,
+    dead_pixel_amp_threshold: float = 3.0,
+    esd_enabled: bool = False,
+    amplitude_refinement_enabled: bool = False,
+    control_spacing: int | None = None,
+    executor: str = "torch",
+    device: str = "auto",
+    coregistration_grid: CoregistrationGrid = "radar",
+    geo_grid: GeoGridSpec | None = None,
+    geo_height_m: float = 0.0,
+    geo_chunk_size: int = 128,
+    geo_work_dir: str | Path | None = None,
+    n_jobs: int = 1,
+    roi_buffer_m: float = 320.0,
+    snaphu_config: SnaphuConfig | None = None,
+    unwrap_method: UnwrapBackend | None = None,
+    irls_kwargs: dict[str, Any] | None = None,
+    reference_orbit_path: str | Path | Sequence[str | Path] | None = None,
+    secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
+    unwrap: bool = False,
+    geoid_correction: bool = True,
+) -> ProductionPairState | ProductionPairSweepResult:
     """Process any burst selection across frames and swaths into one product.
 
     Parameters
@@ -1720,8 +2741,11 @@ def run_pair(
     dem : DEMSampler, optional
         DEM for coregistration, flattening, and geometry. Defaults to a zero
         ellipsoid.
-    multilook : tuple[int, int], optional
-        (az, rg) looks applied while accumulating the merged frame.
+    multilook : tuple[int, int] or iterable of pairs, optional
+        One (az, rg) pair for a single product, or an iterable of pairs to
+        emit one product per configuration (sweep mode).
+    overwrite : bool, optional
+        Sweep mode only: replace existing looks_{az}x{rg} subtrees.
     goldstein_alpha : float, optional
         Goldstein filter exponent applied to the merged product.
     dead_pixel_amp_threshold : float, optional
@@ -1736,21 +2760,79 @@ def run_pair(
         Resample executor.
     device : {"auto","cpu","cuda","mps"}, optional
         Torch device.
+    coregistration_grid : {"radar", "geo"}, optional
+        Coordinate grid on which the pair is coregistered. Geo requires
+        geo_grid and is available for single-config runs.
+    geo_grid : GeoGridSpec, optional
+        Geographic product grid required for coregistration_grid="geo".
+    geo_height_m : float, optional
+        Fallback constant height (m) when the DEM is unavailable for geo2rdr.
+    geo_chunk_size : int, optional
+        Row chunk shared by geo2rdr and SLC remapping in geo mode.
+    geo_work_dir : path, optional
+        Working directory for geo memmaps; a temporary directory is used
+        when omitted.
+    n_jobs : int, optional
+        Number of parallel burst workers (default 1; applies to radar mode
+        with an ROI and to geo mode).
+    roi_buffer_m : float, optional
+        Physical margin in meters kept around the ROI (default 320).  In geo
+        mode it is applied in the grid CRS; in radar mode it is converted to
+        radar pixels to expand the burst window.
+    snaphu_config : SnaphuConfig, optional
+        SNAPHU configuration; nlooks defaults to az * rg per config.
+    unwrap_method : {"irls", "snaphu"}, optional
+        Unwrapping backend when unwrap=True.
+    irls_kwargs : dict, optional
+        Arguments forwarded to the IRLS unwrap backend.
     reference_orbit_path, secondary_orbit_path : path or sequence, optional
         Precise ESA EOF orbits; one per frame or a single orbit reused for
         every frame.
     unwrap : bool, optional
-        Run SNAPHU unwrapping on the merged wrapped phase when True.
+        Run unwrapping on the merged wrapped phase when True.
     geoid_correction : bool, optional
         Convert orthometric raster DEM heights to ellipsoidal with EGM96.
         Default True.
 
     Returns
     -------
-    ProductionPairState
-        State with the merged wrapped/filtered product and stage timings.
+    ProductionPairState or ProductionPairSweepResult
+        Single-config state, or per-config outcomes for a sweep.
 
     """
+    if not _is_multilook_pair(multilook) or coregistration_grid == "geo":
+        return _run_pair_sweep(
+            reference_path,
+            secondary_path,
+            output_dir=output_dir,
+            roi=roi,
+            swaths=swaths,
+            bursts=bursts,
+            dem=dem,
+            multilook=multilook,
+            overwrite=overwrite,
+            goldstein_alpha=goldstein_alpha,
+            dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            esd_enabled=esd_enabled,
+            amplitude_refinement_enabled=amplitude_refinement_enabled,
+            control_spacing=control_spacing,
+            executor=executor,
+            device=device,
+            coregistration_grid=coregistration_grid,
+            geo_grid=geo_grid,
+            geo_height_m=geo_height_m,
+            geo_chunk_size=geo_chunk_size,
+            geo_work_dir=geo_work_dir,
+            n_jobs=n_jobs,
+            roi_buffer_m=roi_buffer_m,
+            snaphu_config=snaphu_config,
+            unwrap_method=unwrap_method,
+            irls_kwargs=irls_kwargs,
+            reference_orbit_path=reference_orbit_path,
+            secondary_orbit_path=secondary_orbit_path,
+            unwrap=unwrap,
+            geoid_correction=geoid_correction,
+        )
     from faninsar.missions.sentinel1.safe import open_safe_product
     from faninsar.processing.geometry.egm96 import EGM96Geoid
 
@@ -1763,7 +2845,9 @@ def run_pair(
     if len(ref_paths) != len(sec_paths):
         reject_invalid_state(
             "reference/secondary frame counts differ: "
-            + str(len(ref_paths)) + " vs " + str(len(sec_paths))
+            + str(len(ref_paths))
+            + " vs "
+            + str(len(sec_paths))
         )
     frame_count = len(ref_paths)
     ref_orbits = _as_optional_frame_sequence(
@@ -1790,30 +2874,44 @@ def run_pair(
         missing = [name for name in swath_tuple if name not in present]
         if missing:
             reject_invalid_state(
-                "reference frame " + str(frame_index) + " ("
-                + ref_paths[frame_index].name + ") missing swaths "
-                + str(missing) + "; available=" + str(sorted(present))
+                "reference frame "
+                + str(frame_index)
+                + " ("
+                + ref_paths[frame_index].name
+                + ") missing swaths "
+                + str(missing)
+                + "; available="
+                + str(sorted(present))
             )
     for frame_index, product in enumerate(secondary_products):
         present = {item.swath for item in product.swaths}
         missing = [name for name in swath_tuple if name not in present]
         if missing:
             reject_invalid_state(
-                "secondary frame " + str(frame_index) + " ("
-                + sec_paths[frame_index].name + ") missing swaths "
-                + str(missing) + "; available=" + str(sorted(present))
+                "secondary frame "
+                + str(frame_index)
+                + " ("
+                + sec_paths[frame_index].name
+                + ") missing swaths "
+                + str(missing)
+                + "; available="
+                + str(sorted(present))
             )
 
     if roi is not None:
-        logger.info(
-            "run_pair: ROI provided; explicit swaths/bursts selection ignored"
-        )
+        logger.info("run_pair: ROI provided; explicit swaths/bursts selection ignored")
         ordered = sorted(
             reference_products[0].swaths,
             key=lambda item: item.slant_range_time_s,
         )
         swath_tuple = tuple(item.swath for item in ordered)
-        resolved = _select_bursts_by_roi(roi, ref_paths, swath_tuple)
+        resolved = _select_bursts_by_roi(
+            roi,
+            ref_paths,
+            swath_tuple,
+            orbits=ref_orbits,
+            dem=dem_sampler,
+        )
     else:
         burst_counts = {
             (frame_index, swath): len(
@@ -1833,17 +2931,41 @@ def run_pair(
             secondary_swath = secondary_products[frame_index].swath(swath)
             common = _common_burst_indices(reference_swath, secondary_swath)
             selected = [
-                index
-                for index in resolved[(frame_index, swath)]
-                if index in common
+                index for index in resolved[(frame_index, swath)] if index in common
             ]
             if not selected:
+                if roi is not None:
+                    continue
                 reject_invalid_state(
                     "no common bursts between reference/secondary frame "
-                    + str(frame_index) + " swath " + swath
+                    + str(frame_index)
+                    + " swath "
+                    + swath
                 )
             common_aligned[(frame_index, swath)] = selected
     resolved = common_aligned
+    if not any(indices for indices in resolved.values()):
+        reject_invalid_state("selection contains no bursts")
+
+    if dem is None and os.environ.get("FANINSAR_DEM_CACHE_DIR"):
+        from faninsar.processing.geometry.dem_manager import (
+            default_dem_name,
+            get_dem_manager,
+        )
+
+        bounds = _auto_dem_bounds(
+            roi,
+            resolved,
+            reference_products,
+            orbits=ref_orbits,
+        )
+        dem_path = get_dem_manager().fetch_dem(
+            bounds, Path(output_dir) / "dem" / default_dem_name()
+        )
+        logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
+        dem_sampler = RasterDEM(dem_path, interpolation="biquintic")
+        if geoid_correction:
+            dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
     range_offsets = _swath_range_offsets(swath_tuple, reference_products)
     reference_swath0 = reference_products[0].swath(swath_tuple[0])
@@ -1872,8 +2994,7 @@ def run_pair(
             for burst_index in indices:
                 azimuth_offset = round(
                     (
-                        swath_obj.bursts[burst_index].azimuth_time
-                        - azimuth_origin
+                        swath_obj.bursts[burst_index].azimuth_time - azimuth_origin
                     ).total_seconds()
                     / dt
                 )
@@ -1888,9 +3009,9 @@ def run_pair(
         for swath, units in units_by_swath.items()
         for _, _, azimuth_offset in units
     )
-    frame_cols = max(
-        range_offsets[swath] + burst_width[swath] for swath in swath_tuple
-    )
+    frame_cols = max(range_offsets[swath] + burst_width[swath] for swath in swath_tuple)
+    if not _is_multilook_pair(multilook):
+        reject_invalid_state("internal error: single-config multilook must be a pair")
     az_looks, rg_looks = int(multilook[0]), int(multilook[1])
     out_rows = frame_rows // az_looks
     out_cols = frame_cols // rg_looks
@@ -1903,6 +3024,7 @@ def run_pair(
             // az_looks
         )
         for swath in swath_tuple
+        if units_by_swath[swath]
     }
     swath_cols = {
         swath: (range_offsets[swath] + burst_width[swath]) // rg_looks
@@ -1911,18 +3033,22 @@ def run_pair(
     ifc_acc = {
         swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.complex128)
         for swath in swath_tuple
+        if swath in swath_rows
     }
     pri_pow_acc = {
         swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.float64)
         for swath in swath_tuple
+        if swath in swath_rows
     }
     sec_pow_acc = {
         swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.float64)
         for swath in swath_tuple
+        if swath in swath_rows
     }
     claimed = {
         swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.int32)
         for swath in swath_tuple
+        if swath in swath_rows
     }
     looks_per_window = az_looks * rg_looks
 
@@ -1936,13 +3062,9 @@ def run_pair(
         s1_swath = product.swath(swath)
         if orbit_path is not None:
             s1_swath = replace(s1_swath, orbit=read_eof_orbit(orbit_path))
-        array = read_full_burst(
-            s1_swath, burst_index=burst_index, full_range=True
-        )
+        array = read_full_burst(s1_swath, burst_index=burst_index, full_range=True)
         burst = s1_swath.bursts[burst_index]
-        carrier = carrier_from_swath(
-            s1_swath, burst, first_range_sample=array.col0
-        )
+        carrier = carrier_from_swath(s1_swath, burst, first_range_sample=array.col0)
         geometry = _radar_model(
             s1_swath,
             burst,
@@ -1993,17 +3115,23 @@ def run_pair(
             )
             if first_state is None:
                 first_state = state
-            if (
-                frame_index == 0
-                and swath == swath_tuple[0]
-                and burst_index == 0
-            ):
+            if origin_state is None:
                 origin_state = state
             stage_times: dict[str, float] = {}
             t0 = time.perf_counter()
             state = stage_deramp(state)
             stage_times["deramp"] = time.perf_counter() - t0
             t0 = time.perf_counter()
+            roi_window: tuple[int, int, int, int] | None = None
+            if roi is not None:
+                assert state.reference_deramped is not None
+                roi_window = _roi_burst_window(
+                    roi,
+                    ref.geometry,
+                    dem_sampler,
+                    state.reference_deramped.shape,
+                    buffer_m=roi_buffer_m,
+                )
             state = stage_coregister(
                 state,
                 control_spacing=control_spacing,
@@ -2011,35 +3139,20 @@ def run_pair(
                 amplitude_refinement_enabled=amplitude_refinement_enabled,
                 executor=executor,
                 device=device,
+                roi_window=roi_window,
             )
             stage_times["coregister"] = time.perf_counter() - t0
             burst_row0 = 0
             burst_col0 = 0
-            if roi is not None:
-                assert state.reference_deramped is not None
-                window = _roi_burst_window(
-                    roi,
-                    ref.geometry,
-                    dem_sampler,
-                    state.reference_deramped.shape,
-                )
-                if window is not None:
-                    burst_row0, burst_row1, burst_col0, burst_col1 = window
-                    state.reference_deramped = state.reference_deramped[
-                        burst_row0:burst_row1, burst_col0:burst_col1
-                    ]
-                    state.secondary_aligned = state.secondary_aligned[
-                        burst_row0:burst_row1, burst_col0:burst_col1
-                    ]
+            if state.radar_roi_origin is not None:
+                burst_row0, burst_col0 = state.radar_roi_origin
             assert state.reference_deramped is not None
             assert state.secondary_aligned is not None
             pri_power = (
-                state.reference_deramped.real ** 2
-                + state.reference_deramped.imag ** 2
+                state.reference_deramped.real**2 + state.reference_deramped.imag**2
             )
             sec_power = (
-                state.secondary_aligned.real ** 2
-                + state.secondary_aligned.imag ** 2
+                state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
             )
             t0 = time.perf_counter()
             state = stage_interferogram(
@@ -2063,9 +3176,7 @@ def run_pair(
 
             valid = np.abs(ifg_full) > 0
             rows = azimuth_offset + burst_row0 + np.arange(ifg_full.shape[0])
-            cols = range_offsets[swath] + burst_col0 + np.arange(
-                ifg_full.shape[1]
-            )
+            cols = range_offsets[swath] + burst_col0 + np.arange(ifg_full.shape[1])
             orow = rows[:, None] // az_looks
             ocol = cols[None, :] // rg_looks
             ocol_local = ocol - range_offsets[swath] // rg_looks
@@ -2095,17 +3206,15 @@ def run_pair(
 
     merged_ifg = np.zeros((out_rows, out_cols), dtype=np.complex64)
     coherence = np.full((out_rows, out_cols), np.nan, dtype=np.float32)
-    for swath in swath_tuple:
+    for swath, swath_acc in ifc_acc.items():
         has = claimed[swath] > 0
         swath_ifg = np.where(
-            has, ifc_acc[swath] / np.where(has, claimed[swath], 1), 0
+            has, swath_acc / np.where(has, claimed[swath], 1), 0
         ).astype(np.complex64)
         pri_ml = pri_pow_acc[swath] / np.where(has, claimed[swath], 1)
         sec_ml = sec_pow_acc[swath] / np.where(has, claimed[swath], 1)
         denom = np.sqrt(np.maximum(pri_ml * sec_ml, 1e-30))
-        swath_coh = np.clip(np.abs(swath_ifg) / denom, 0.0, 1.0).astype(
-            np.float32
-        )
+        swath_coh = np.clip(np.abs(swath_ifg) / denom, 0.0, 1.0).astype(np.float32)
         col0 = range_offsets[swath] // rg_looks
         rows = swath_ifg.shape[0]
         cols = swath_ifg.shape[1]
@@ -2154,19 +3263,33 @@ def run_pair(
         },
     )
     result.note(
-        "PAIR frames=" + str(frame_count) + " swaths=" + str(swath_tuple)
-        + " units=" + str(selected_unit_count) + " merged=" + str(merged_ifg.shape)
-        + " multilook=" + str(multilook) + " valid="
-        + format(float((~invalid).mean()), ".3f") + " mean_coh="
+        "PAIR frames="
+        + str(frame_count)
+        + " swaths="
+        + str(swath_tuple)
+        + " units="
+        + str(selected_unit_count)
+        + " merged="
+        + str(merged_ifg.shape)
+        + " multilook="
+        + str(multilook)
+        + " valid="
+        + format(float((~invalid).mean()), ".3f")
+        + " mean_coh="
         + format(float(np.nanmean(coherence)), ".3f")
     )
     if unwrap:
         from faninsar.processing.unwrap import SnaphuConfig
 
+        method: UnwrapBackend = unwrap_method if unwrap_method is not None else "snaphu"
+        config_for_unwrap = snaphu_config
+        if config_for_unwrap is None:
+            config_for_unwrap = SnaphuConfig(nlooks=float(az_looks * rg_looks))
         result = stage_unwrap(
             result,
-            method="snaphu",
-            config=SnaphuConfig(nlooks=float(az_looks * rg_looks)),
+            method=method,
+            config=config_for_unwrap,
+            irls_kwargs=irls_kwargs,
         )
         result.note("UNWRAP complete on merged product")
     else:
@@ -2175,3 +3298,985 @@ def run_pair(
         result.note("UNWRAP skipped (unwrap=False)")
     stage_write(result, output_dir)
     return result
+
+
+def _run_pair_sweep(
+    reference_path: str | Path | Sequence[str | Path],
+    secondary_path: str | Path | Sequence[str | Path],
+    *,
+    output_dir: str | Path,
+    roi: BoundingBox | Polygons | None,
+    swaths: tuple[str, ...] | None,
+    bursts: BurstSelection | None,
+    dem: DEMSampler | None,
+    multilook: object,
+    overwrite: bool,
+    goldstein_alpha: float,
+    dead_pixel_amp_threshold: float,
+    esd_enabled: bool,
+    amplitude_refinement_enabled: bool,
+    control_spacing: int | None,
+    executor: str,
+    device: str,
+    coregistration_grid: CoregistrationGrid,
+    geo_grid: GeoGridSpec | None,
+    geo_height_m: float,
+    geo_chunk_size: int,
+    geo_work_dir: str | Path | None,
+    n_jobs: int = 1,
+    roi_buffer_m: float = 320.0,
+    snaphu_config: SnaphuConfig | None,
+    unwrap_method: UnwrapBackend | None,
+    irls_kwargs: dict[str, Any] | None,
+    reference_orbit_path: str | Path | Sequence[str | Path] | None,
+    secondary_orbit_path: str | Path | Sequence[str | Path] | None,
+    unwrap: bool,
+    geoid_correction: bool,
+) -> ProductionPairState | ProductionPairSweepResult:
+    """Run one shared prefix and emit every look configuration."""
+    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.geometry.egm96 import EGM96Geoid
+
+    single_config = _is_multilook_pair(multilook)
+    if single_config:
+        configs = [tuple(int(part) for part in multilook)]
+    else:
+        configs = normalize_multilook_sweep(multilook)
+    if coregistration_grid == "geo" and geo_grid is None:
+        reject_invalid_state("coregistration_grid='geo' requires geo_grid")
+    output_root = Path(output_dir)
+    existing = [
+        looks_dir(az, rg)
+        for az, rg in configs
+        if (output_root / looks_dir(az, rg)).exists()
+    ]
+    if existing and not overwrite:
+        reject_invalid_state(
+            "multilook sweep targets already exist; pass overwrite=True: "
+            + ", ".join(existing)
+        )
+    if overwrite:
+        for az_looks, rg_looks in configs:
+            stale = output_root / looks_dir(az_looks, rg_looks)
+            if stale.exists():
+                shutil.rmtree(stale)
+
+    dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    if geoid_correction and isinstance(dem_sampler, RasterDEM):
+        dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
+
+    ref_paths = _as_frame_paths(reference_path, "reference_path")
+    sec_paths = _as_frame_paths(secondary_path, "secondary_path")
+    if len(ref_paths) != len(sec_paths):
+        reject_invalid_state(
+            "reference/secondary frame counts differ: "
+            + str(len(ref_paths))
+            + " vs "
+            + str(len(sec_paths))
+        )
+    frame_count = len(ref_paths)
+    ref_orbits = _as_optional_frame_sequence(
+        reference_orbit_path, frame_count, "reference_orbit_path"
+    )
+    sec_orbits = _as_optional_frame_sequence(
+        secondary_orbit_path, frame_count, "secondary_orbit_path"
+    )
+    reference_products = [open_safe_product(path) for path in ref_paths]
+    secondary_products = [open_safe_product(path) for path in sec_paths]
+    if swaths is None:
+        ordered = sorted(
+            reference_products[0].swaths,
+            key=lambda item: item.slant_range_time_s,
+        )
+        swath_tuple = tuple(item.swath for item in ordered)
+    else:
+        swath_tuple = tuple(swaths)
+    if not swath_tuple:
+        reject_invalid_state("swaths must not be empty")
+    for frame_index, product in enumerate(reference_products):
+        present = {item.swath for item in product.swaths}
+        missing = [name for name in swath_tuple if name not in present]
+        if missing:
+            reject_invalid_state(
+                "reference frame "
+                + str(frame_index)
+                + " ("
+                + ref_paths[frame_index].name
+                + ") missing swaths "
+                + str(missing)
+                + "; available="
+                + str(sorted(present))
+            )
+    for frame_index, product in enumerate(secondary_products):
+        present = {item.swath for item in product.swaths}
+        missing = [name for name in swath_tuple if name not in present]
+        if missing:
+            reject_invalid_state(
+                "secondary frame "
+                + str(frame_index)
+                + " ("
+                + sec_paths[frame_index].name
+                + ") missing swaths "
+                + str(missing)
+                + "; available="
+                + str(sorted(present))
+            )
+
+    if roi is not None:
+        logger.info("run_pair: ROI provided; explicit swaths/bursts selection ignored")
+        ordered = sorted(
+            reference_products[0].swaths,
+            key=lambda item: item.slant_range_time_s,
+        )
+        swath_tuple = tuple(item.swath for item in ordered)
+        resolved = _select_bursts_by_roi(
+            roi,
+            ref_paths,
+            swath_tuple,
+            orbits=ref_orbits,
+            dem=dem_sampler,
+        )
+    else:
+        burst_counts = {
+            (frame_index, swath): len(
+                reference_products[frame_index].swath(swath).bursts
+            )
+            for frame_index in range(frame_count)
+            for swath in swath_tuple
+        }
+        resolved = _normalize_burst_selection(
+            bursts, frame_count, swath_tuple, burst_counts
+        )
+
+    common_aligned: dict[tuple[int, str], list[int]] = {}
+    for frame_index in range(frame_count):
+        for swath in swath_tuple:
+            reference_swath = reference_products[frame_index].swath(swath)
+            secondary_swath = secondary_products[frame_index].swath(swath)
+            common = _common_burst_indices(reference_swath, secondary_swath)
+            selected = [
+                index for index in resolved[(frame_index, swath)] if index in common
+            ]
+            if not selected:
+                if roi is not None:
+                    continue
+                reject_invalid_state(
+                    "no common bursts between reference/secondary frame "
+                    + str(frame_index)
+                    + " swath "
+                    + swath
+                )
+            common_aligned[(frame_index, swath)] = selected
+    resolved = common_aligned
+    if not any(indices for indices in resolved.values()):
+        reject_invalid_state("selection contains no bursts")
+
+    if dem is None and os.environ.get("FANINSAR_DEM_CACHE_DIR"):
+        from faninsar.processing.geometry.dem_manager import (
+            default_dem_name,
+            get_dem_manager,
+        )
+
+        bounds = _auto_dem_bounds(
+            roi,
+            resolved,
+            reference_products,
+            orbits=ref_orbits,
+        )
+        dem_path = get_dem_manager().fetch_dem(
+            bounds, output_root / "dem" / default_dem_name()
+        )
+        logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
+        dem_sampler = RasterDEM(dem_path, interpolation="biquintic")
+        if geoid_correction:
+            dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
+
+    range_offsets = _swath_range_offsets(swath_tuple, reference_products)
+    reference_swath0 = reference_products[0].swath(swath_tuple[0])
+    dt = reference_swath0.azimuth_time_interval_s
+    burst_lines = {
+        swath: reference_products[0].swath(swath).lines_per_burst
+        for swath in swath_tuple
+    }
+    burst_width = {
+        swath: reference_products[0].swath(swath).samples_per_burst
+        for swath in swath_tuple
+    }
+    azimuth_origin = min(
+        reference_products[frame_index].swath(swath).bursts[burst_index].azimuth_time
+        for (frame_index, swath), indices in resolved.items()
+        for burst_index in indices
+    )
+    units_by_swath: dict[str, list[tuple[int, int, int]]] = {}
+    for swath in swath_tuple:
+        units: list[tuple[int, int, int]] = []
+        for (frame_index, swath_key), indices in resolved.items():
+            if swath_key != swath:
+                continue
+            swath_obj = reference_products[frame_index].swath(swath)
+            for burst_index in indices:
+                azimuth_offset = round(
+                    (
+                        swath_obj.bursts[burst_index].azimuth_time - azimuth_origin
+                    ).total_seconds()
+                    / dt
+                )
+                units.append((frame_index, burst_index, azimuth_offset))
+        units.sort(key=lambda unit: unit[2], reverse=True)
+        units_by_swath[swath] = units
+
+    frame_rows = max(
+        azimuth_offset + burst_lines[swath]
+        for swath, units in units_by_swath.items()
+        for _, _, azimuth_offset in units
+    )
+    frame_cols = max(range_offsets[swath] + burst_width[swath] for swath in swath_tuple)
+
+    temporary = tempfile.TemporaryDirectory(prefix="faninsar-sweep-")
+    resolved_geo_work_dir: Path | None = None
+    if coregistration_grid == "geo":
+        if geo_work_dir is None:
+            resolved_geo_work_dir = Path(temporary.name)
+        else:
+            resolved_geo_work_dir = Path(geo_work_dir)
+            resolved_geo_work_dir.mkdir(parents=True, exist_ok=True)
+    resources = SharedPairResources(temporary_directory=temporary)
+    try:
+        archive = _archive_burst_ifgs(
+            Path(temporary.name),
+            ref_paths=ref_paths,
+            sec_paths=sec_paths,
+            ref_orbits=ref_orbits,
+            sec_orbits=sec_orbits,
+            reference_products=reference_products,
+            secondary_products=secondary_products,
+            swath_tuple=swath_tuple,
+            units_by_swath=units_by_swath,
+            roi=roi,
+            dem_sampler=dem_sampler,
+            control_spacing=control_spacing,
+            esd_enabled=esd_enabled,
+            amplitude_refinement_enabled=amplitude_refinement_enabled,
+            executor=executor,
+            device=device,
+            dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            coregistration_grid=coregistration_grid,
+            geo_grid=geo_grid,
+            geo_height_m=geo_height_m,
+            geo_chunk_size=geo_chunk_size,
+            geo_work_dir=resolved_geo_work_dir,
+            n_jobs=n_jobs,
+            roi_buffer_m=roi_buffer_m,
+        )
+        resources.ifg_archive = archive
+        if coregistration_grid == "geo":
+            resources.prefix_state = archive.get("geo_prefix_state")
+        pair_id = _scene_id(ref_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair"
+        per_config: dict[tuple[int, int], PairSweepOutcome] = {}
+        single_state: ProductionPairState | None = None
+        for config in configs:
+            az_looks, rg_looks = config
+            merged = _merge_burst_ifgs(
+                archive,
+                swath_tuple=swath_tuple,
+                range_offsets=range_offsets,
+                burst_lines=burst_lines,
+                burst_width=burst_width,
+                frame_rows=frame_rows,
+                frame_cols=frame_cols,
+                az_looks=az_looks,
+                rg_looks=rg_looks,
+                geo_grid=geo_grid,
+            )
+            outcome, state = _finalize_sweep_config(
+                merged,
+                config=config,
+                pair_id=pair_id,
+                output_root=output_root,
+                goldstein_alpha=goldstein_alpha,
+                snaphu_config=snaphu_config,
+                unwrap_method=unwrap_method,
+                irls_kwargs=irls_kwargs,
+                unwrap=unwrap,
+                geo_height_m=geo_height_m,
+                all_configs=configs,
+            )
+            per_config[config] = outcome
+            if single_config:
+                single_state = state
+        if single_config:
+            assert single_state is not None
+            return single_state
+        return ProductionPairSweepResult(pair_id=pair_id, per_config=per_config)
+    finally:
+        resources.cleanup()
+
+
+def _archive_burst_ifgs(
+    work_dir: Path,
+    *,
+    ref_paths: Sequence[str | Path],
+    sec_paths: Sequence[str | Path],
+    ref_orbits: Sequence[Path | None],
+    sec_orbits: Sequence[Path | None],
+    reference_products: Sequence[object],
+    secondary_products: Sequence[object],
+    swath_tuple: tuple[str, ...],
+    units_by_swath: dict[str, list[tuple[int, int, int]]],
+    roi: BoundingBox | Polygons | None,
+    dem_sampler: DEMSampler,
+    control_spacing: int | None,
+    esd_enabled: bool,
+    amplitude_refinement_enabled: bool,
+    executor: str,
+    device: str,
+    dead_pixel_amp_threshold: float,
+    coregistration_grid: CoregistrationGrid,
+    geo_grid: GeoGridSpec | None,
+    geo_height_m: float,
+    geo_chunk_size: int,
+    geo_work_dir: Path | None,
+    n_jobs: int = 1,
+    roi_buffer_m: float = 320.0,
+) -> dict[str, Any]:
+    """Process every burst unit once and store flat IFGs on disk.
+
+    Radar units are archived in radar geometry with burst placement offsets.
+    Geographic units (``coregistration_grid="geo"``) are coregistered onto
+    the shared ``geo_grid`` and archived as valid-bounding-box crops of the
+    geocoded interferogram, per-unit power, and DEM height field.
+    """
+    from faninsar.missions.sentinel1 import read_eof_orbit, read_full_burst
+    from faninsar.processing.tops.carrier import carrier_from_swath
+
+    if coregistration_grid == "geo" and (geo_grid is None or geo_work_dir is None):
+        reject_invalid_state("geo coregistration requires geo_grid and geo_work_dir")
+
+    ifg_dir = work_dir / "ifgs"
+    ifg_dir.mkdir(parents=True, exist_ok=True)
+    units: list[dict[str, Any]] = []
+    per_burst_timings: dict[str, dict[str, float]] = {}
+    origin_state: ProductionPairState | None = None
+    geo_prefix_state: ProductionPairState | None = None
+    prefix_started = time.perf_counter()
+
+    def load_burst(
+        swath: str,
+        burst_index: int,
+        path: Path,
+        orbit_path: Path | None,
+        product: object,
+    ) -> ProductionScene:
+        s1_swath = product.swath(swath)
+        if orbit_path is not None:
+            s1_swath = replace(s1_swath, orbit=read_eof_orbit(orbit_path))
+        array = read_full_burst(s1_swath, burst_index=burst_index, full_range=True)
+        burst = s1_swath.bursts[burst_index]
+        carrier = carrier_from_swath(s1_swath, burst, first_range_sample=array.col0)
+        geometry = _radar_model(
+            s1_swath,
+            burst,
+            shape=array.samples.shape,
+            row0=array.row0,
+            col0=array.col0,
+        )
+        return ProductionScene(
+            scene_id=_scene_id(path),
+            path=path,
+            product=product,
+            swath=s1_swath,
+            burst=burst,
+            array=array,
+            carrier=carrier,
+            geometry=geometry,
+        )
+
+    def scene_rebuild_args(
+        frame_index: int,
+        swath: str,
+        burst_index: int,
+    ) -> dict[str, object]:
+        return {
+            "ref_path": ref_paths[frame_index],
+            "sec_path": sec_paths[frame_index],
+            "ref_orbit": ref_orbits[frame_index],
+            "sec_orbit": sec_orbits[frame_index],
+            "swath": swath,
+            "burst_index": burst_index,
+            "frame_index": frame_index,
+        }
+
+    def rebuild_origin_state(
+        scene_args: dict[str, object],
+        dem: DEMSampler,
+    ) -> ProductionPairState:
+        ref = load_burst(
+            str(scene_args["swath"]),
+            int(scene_args["burst_index"]),
+            Path(scene_args["ref_path"]),
+            scene_args["ref_orbit"],
+            reference_products[int(scene_args["frame_index"])],
+        )
+        sec = load_burst(
+            str(scene_args["swath"]),
+            int(scene_args["burst_index"]),
+            Path(scene_args["sec_path"]),
+            scene_args["sec_orbit"],
+            secondary_products[int(scene_args["frame_index"])],
+        )
+        return ProductionPairState(
+            pair_id=ref.scene_id + "_" + sec.scene_id,
+            reference=ref,
+            secondary=sec,
+            dem=dem,
+            coregistration_grid=coregistration_grid,
+            multilook=(1, 1),
+            goldstein_alpha=0.0,
+            unwrap_method="snaphu",
+        )
+
+    task_args: list[dict[str, object]] = []
+    for swath in reversed(swath_tuple):
+        for frame_index, burst_index, azimuth_offset in units_by_swath[swath]:
+            tag = "f" + str(frame_index) + "_" + swath + "_b" + str(burst_index)
+            task_args.append(
+                {
+                    "tag": tag,
+                    "swath": swath,
+                    "frame_index": frame_index,
+                    "burst_index": burst_index,
+                    "azimuth_offset": azimuth_offset,
+                    "ref_path": ref_paths[frame_index],
+                    "sec_path": sec_paths[frame_index],
+                    "ref_orbit": ref_orbits[frame_index],
+                    "sec_orbit": sec_orbits[frame_index],
+                    "roi": roi,
+                    "control_spacing": control_spacing,
+                    "esd_enabled": esd_enabled,
+                    "amplitude_refinement_enabled": amplitude_refinement_enabled,
+                    "executor": executor,
+                    "device": device,
+                    "dead_pixel_amp_threshold": dead_pixel_amp_threshold,
+                    "coregistration_grid": coregistration_grid,
+                    "geo_grid": geo_grid,
+                    "geo_height_m": geo_height_m,
+                    "geo_chunk_size": geo_chunk_size,
+                    "roi_buffer_m": roi_buffer_m,
+                    "ifg_dir": ifg_dir,
+                    "dem": dem_sampler,
+                    "geo_work_dir": geo_work_dir,
+                }
+            )
+
+    if n_jobs > 1 and len(task_args) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+            results = list(pool.map(_process_burst_worker, task_args))
+    else:
+        results = [_process_burst_worker(task) for task in task_args]
+
+    ordered_results: list[tuple[dict[str, object], dict[str, float]]] = []
+    origin_scene_args: dict[str, object] | None = None
+    for task, result in zip(task_args, results, strict=True):
+        unit = result["unit"]
+        if unit is None:
+            continue
+        ordered_results.append((unit, result["stage_times"]))
+        if origin_scene_args is None:
+            origin_scene_args = scene_rebuild_args(
+                int(task["frame_index"]),
+                str(task["swath"]),
+                int(task["burst_index"]),
+            )
+    for unit, stage_times in ordered_results:
+        units.append(unit)
+        per_burst_timings[unit["tag"]] = stage_times
+    if origin_scene_args is not None:
+        origin_state = rebuild_origin_state(origin_scene_args, dem_sampler)
+
+    if origin_state is None:
+        reject_invalid_state("no burst units selected for processing")
+    return {
+        "units": units,
+        "origin_state": origin_state,
+        "per_burst_timings": per_burst_timings,
+        "prefix_started": prefix_started,
+        "grid_mode": "geo" if coregistration_grid == "geo" else "radar",
+        "geo_grid": geo_grid,
+        "geo_prefix_state": geo_prefix_state,
+    }
+
+
+def _merge_burst_ifgs(
+    archive: dict[str, Any],
+    *,
+    swath_tuple: tuple[str, ...],
+    range_offsets: dict[str, int],
+    burst_lines: dict[str, int],
+    burst_width: dict[str, int],
+    frame_rows: int,
+    frame_cols: int,
+    az_looks: int,
+    rg_looks: int,
+    geo_grid: GeoGridSpec | None = None,
+) -> dict[str, Any]:
+    """Replay archived flat IFGs into one merged product for a look config."""
+    units = archive["units"]
+    if archive.get("grid_mode") == "geo":
+        if geo_grid is None:
+            reject_invalid_state("geo merge requires geo_grid")
+        return _merge_geo_ifgs(
+            archive,
+            geo_grid=geo_grid,
+            az_looks=az_looks,
+            rg_looks=rg_looks,
+        )
+    out_rows = frame_rows // az_looks
+    out_cols = frame_cols // rg_looks
+    swath_rows = {
+        swath: (
+            max(
+                unit["azimuth_offset"] + burst_lines[swath]
+                for unit in units
+                if unit["swath"] == swath
+            )
+            // az_looks
+        )
+        for swath in swath_tuple
+    }
+    swath_cols = {
+        swath: (range_offsets[swath] + burst_width[swath]) // rg_looks
+        for swath in swath_tuple
+    }
+    ifc_acc = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.complex128)
+        for swath in swath_tuple
+    }
+    pri_pow_acc = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.float64)
+        for swath in swath_tuple
+    }
+    sec_pow_acc = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.float64)
+        for swath in swath_tuple
+    }
+    claimed = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.int32)
+        for swath in swath_tuple
+    }
+    looks_per_window = az_looks * rg_looks
+    for unit in units:
+        swath = unit["swath"]
+        rows = unit["rows"]
+        cols = unit["cols"]
+        ifg_full = np.fromfile(unit["ifg_path"], dtype=np.complex64).reshape(rows, cols)
+        pri_power = np.fromfile(unit["pri_path"], dtype=np.float64).reshape(rows, cols)
+        sec_power = np.fromfile(unit["sec_path"], dtype=np.float64).reshape(rows, cols)
+        valid = np.abs(ifg_full) > 0
+        r0 = unit["azimuth_offset"] + unit["burst_row0"]
+        c0 = range_offsets[swath] + unit["burst_col0"]
+        orow = (r0 + np.arange(rows))[:, None] // az_looks
+        ocol = (c0 + np.arange(cols))[None, :] // rg_looks
+        ocol_local = ocol - range_offsets[swath] // rg_looks
+        inb = (
+            (orow < swath_rows[swath])
+            & (ocol_local >= 0)
+            & (ocol_local < swath_cols[swath])
+            & valid
+        )
+        r_i, c_i = np.broadcast_arrays(orow, ocol_local)
+        r_v, c_v = r_i[inb], c_i[inb]
+        free = claimed[swath][r_v, c_v] < looks_per_window
+        r_f, c_f = r_v[free], c_v[free]
+        np.add.at(
+            ifc_acc[swath],
+            (r_f, c_f),
+            ifg_full[inb][free].astype(np.complex128),
+        )
+        np.add.at(pri_pow_acc[swath], (r_f, c_f), pri_power[inb][free])
+        np.add.at(sec_pow_acc[swath], (r_f, c_f), sec_power[inb][free])
+        np.add.at(claimed[swath], (r_f, c_f), 1)
+        del ifg_full, pri_power, sec_power
+
+    merged_ifg = np.zeros((out_rows, out_cols), dtype=np.complex64)
+    coherence = np.full((out_rows, out_cols), np.nan, dtype=np.float32)
+    for swath in swath_tuple:
+        has = claimed[swath] > 0
+        swath_ifg = np.where(
+            has, ifc_acc[swath] / np.where(has, claimed[swath], 1), 0
+        ).astype(np.complex64)
+        pri_ml = pri_pow_acc[swath] / np.where(has, claimed[swath], 1)
+        sec_ml = sec_pow_acc[swath] / np.where(has, claimed[swath], 1)
+        denom = np.sqrt(np.maximum(pri_ml * sec_ml, 1e-30))
+        swath_coh = np.clip(np.abs(swath_ifg) / denom, 0.0, 1.0).astype(np.float32)
+        col0 = range_offsets[swath] // rg_looks
+        rows = swath_ifg.shape[0]
+        cols = swath_ifg.shape[1]
+        col1 = min(col0 + cols, out_cols)
+        cols = col1 - col0
+        band = np.abs(swath_ifg[:rows, :cols]) > 0
+        merged_ifg[:rows, col0:col1][band] = swath_ifg[:rows, :cols][band]
+        coherence[:rows, col0:col1][band] = swath_coh[:rows, :cols][band]
+        del swath_ifg, swath_coh
+    invalid = np.abs(merged_ifg) <= 0
+    wrapped = np.where(invalid, np.nan, np.angle(merged_ifg).astype(np.float32))
+    frame_indices = {unit["frame_index"] for unit in units}
+    return {
+        "merged_ifg": merged_ifg,
+        "coherence": coherence,
+        "wrapped": wrapped,
+        "invalid": invalid,
+        "out_rows": out_rows,
+        "out_cols": out_cols,
+        "origin_state": archive["origin_state"],
+        "per_burst_timings": archive["per_burst_timings"],
+        "units": units,
+        "frame_count": max(frame_indices) + 1 if frame_indices else 0,
+        "total_seconds": time.perf_counter() - archive["prefix_started"],
+    }
+
+
+def _finalize_sweep_config(
+    merged: dict[str, Any],
+    *,
+    config: tuple[int, int],
+    pair_id: str,
+    output_root: Path,
+    goldstein_alpha: float,
+    snaphu_config: SnaphuConfig | None,
+    unwrap_method: UnwrapBackend | None,
+    irls_kwargs: dict[str, Any] | None,
+    unwrap: bool,
+    geo_height_m: float = 0.0,
+    all_configs: list[tuple[int, int]] | None = None,
+) -> tuple[PairSweepOutcome, ProductionPairState]:
+    """Build the config product, write it, and record the completion manifest."""
+    az_looks, rg_looks = config
+    merged_ifg = merged["merged_ifg"]
+    coherence = merged["coherence"]
+    wrapped = merged["wrapped"]
+    invalid = merged["invalid"]
+    filtered = merged_ifg
+    if goldstein_alpha > 0.0:
+        from faninsar.processing.interferometry.pair import goldstein_filter
+
+        filtered = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
+
+    origin = merged["origin_state"]
+    if merged.get("grid_mode") == "geo":
+        return _finalize_geo_config(
+            merged,
+            config=config,
+            pair_id=pair_id,
+            output_root=output_root,
+            goldstein_alpha=goldstein_alpha,
+            snaphu_config=snaphu_config,
+            unwrap_method=unwrap_method,
+            irls_kwargs=irls_kwargs,
+            unwrap=unwrap,
+            geo_height_m=geo_height_m,
+            all_configs=all_configs,
+        )
+    result = ProductionPairState(
+        pair_id=pair_id,
+        reference=origin.reference,
+        secondary=origin.secondary,
+        dem=origin.dem,
+        coregistration_grid="radar",
+        dem_id=origin.dem_id,
+        coreg_executor=origin.coreg_executor,
+        coreg_device=origin.coreg_device,
+        multilook=config,
+        goldstein_alpha=float(goldstein_alpha),
+        unwrap_method="snaphu",
+        complex_ifg=merged_ifg,
+        complex_ifg_flat=filtered,
+        coherence=coherence,
+        wrapped_phase=wrapped,
+        stage_timings_s={
+            "total": merged["total_seconds"],
+            "per_burst": merged["per_burst_timings"],
+        },
+    )
+    result.note(
+        "PAIR frames="
+        + str(merged["frame_count"])
+        + " units="
+        + str(len(merged["units"]))
+        + " merged="
+        + str(merged_ifg.shape)
+        + " multilook="
+        + str(config)
+        + " valid="
+        + format(float((~invalid).mean()), ".3f")
+        + " mean_coh="
+        + format(float(np.nanmean(coherence)), ".3f")
+    )
+    if unwrap:
+        method: UnwrapBackend = unwrap_method if unwrap_method is not None else "snaphu"
+        config_for_unwrap = snaphu_config
+        if config_for_unwrap is None:
+            config_for_unwrap = SnaphuConfig(nlooks=float(az_looks * rg_looks))
+        else:
+            config_for_unwrap = replace(
+                config_for_unwrap, nlooks=float(az_looks * rg_looks)
+            )
+        result = stage_unwrap(
+            result,
+            method=method,
+            config=config_for_unwrap,
+            irls_kwargs=irls_kwargs,
+        )
+        result.note("UNWRAP complete on merged product")
+    else:
+        result.unwrapped_phase = np.zeros_like(wrapped, dtype=np.float32)
+        result.connected_components = np.zeros_like(wrapped, dtype=np.uint8)
+        result.note("UNWRAP skipped (unwrap=False)")
+
+    config_dir = output_root / looks_dir(az_looks, rg_looks)
+    stac_item_id = pair_id + "__l" + str(az_looks) + "x" + str(rg_looks)
+    result = stage_write(
+        result,
+        config_dir,
+        stac_item_id=stac_item_id,
+    )
+    assert result.zarr_path is not None
+    assert result.stac_path is not None
+    grid: dict[str, object] = {
+        "crs": None,
+        "transform": None,
+        "shape": [merged_ifg.shape[0], merged_ifg.shape[1]],
+        "looks": [az_looks, rg_looks],
+    }
+    _write_run_manifest(
+        config_dir,
+        looks=config,
+        pair_id=pair_id,
+        products=[result.zarr_path.name, result.stac_path.name],
+        grid=grid,
+    )
+    metadata = {
+        "multilook": [az_looks, rg_looks],
+        "multilook_sweep": _sweep_list_metadata(all_configs, config),
+        "wavelength_m": float(origin.reference.geometry.wavelength_m),
+        "pair_id": pair_id,
+        "product_grid": grid,
+    }
+    return PairSweepOutcome(
+        config=config,
+        zarr_path=result.zarr_path,
+        stac_path=result.stac_path,
+        shape=(merged_ifg.shape[0], merged_ifg.shape[1]),
+        metadata=metadata,
+        stage_timings_s=result.stage_timings_s,
+        log=tuple(result.log),
+    ), result
+
+
+def _merge_geo_ifgs(
+    archive: dict[str, Any],
+    *,
+    geo_grid: GeoGridSpec,
+    az_looks: int,
+    rg_looks: int,
+) -> dict[str, Any]:
+    """Accumulate archived geocoded IFGs onto the multilooked product grid."""
+    units = archive["units"]
+    out_rows = geo_grid.height // az_looks
+    out_cols = geo_grid.width // rg_looks
+    ifc_acc = np.zeros((out_rows, out_cols), dtype=np.complex128)
+    pri_pow_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
+    sec_pow_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
+    height_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
+    claimed = np.zeros((out_rows, out_cols), dtype=np.int32)
+    looks_per_window = az_looks * rg_looks
+    for unit in units:
+        rows = unit["rows"]
+        cols = unit["cols"]
+        ifg_full = np.fromfile(unit["ifg_path"], dtype=np.complex64).reshape(rows, cols)
+        pri_power = np.fromfile(unit["pri_path"], dtype=np.float64).reshape(rows, cols)
+        sec_power = np.fromfile(unit["sec_path"], dtype=np.float64).reshape(rows, cols)
+        height = np.fromfile(unit["height_path"], dtype=np.float64).reshape(rows, cols)
+        valid = np.abs(ifg_full) > 0
+        r0 = unit["row0"]
+        c0 = unit["col0"]
+        orow = (r0 + np.arange(rows))[:, None] // az_looks
+        ocol = (c0 + np.arange(cols))[None, :] // rg_looks
+        inb = (orow < out_rows) & (ocol >= 0) & (ocol < out_cols) & valid
+        r_i, c_i = np.broadcast_arrays(orow, ocol)
+        r_v, c_v = r_i[inb], c_i[inb]
+        free = claimed[r_v, c_v] < looks_per_window
+        r_f, c_f = r_v[free], c_v[free]
+        np.add.at(ifc_acc, (r_f, c_f), ifg_full[inb][free].astype(np.complex128))
+        np.add.at(pri_pow_acc, (r_f, c_f), pri_power[inb][free])
+        np.add.at(sec_pow_acc, (r_f, c_f), sec_power[inb][free])
+        np.add.at(height_acc, (r_f, c_f), height[inb][free])
+        np.add.at(claimed, (r_f, c_f), 1)
+        del ifg_full, pri_power, sec_power, height
+    has = claimed > 0
+    merged_ifg = np.where(has, ifc_acc / np.where(has, claimed, 1), 0).astype(
+        np.complex64
+    )
+    pri_ml = pri_pow_acc / np.where(has, claimed, 1)
+    sec_ml = sec_pow_acc / np.where(has, claimed, 1)
+    denom = np.sqrt(np.maximum(pri_ml * sec_ml, 1e-30))
+    coherence = np.clip(np.abs(merged_ifg) / denom, 0.0, 1.0).astype(np.float32)
+    coherence[~has] = np.nan
+    height_field = np.where(has, height_acc / np.where(has, claimed, 1), np.nan).astype(
+        np.float64
+    )
+    invalid = np.abs(merged_ifg) <= 0
+    wrapped = np.where(invalid, np.nan, np.angle(merged_ifg).astype(np.float32))
+    frame_indices = {unit["frame_index"] for unit in units}
+    return {
+        "merged_ifg": merged_ifg,
+        "coherence": coherence,
+        "wrapped": wrapped,
+        "invalid": invalid,
+        "out_rows": out_rows,
+        "out_cols": out_cols,
+        "origin_state": archive["origin_state"],
+        "per_burst_timings": archive["per_burst_timings"],
+        "units": units,
+        "frame_count": max(frame_indices) + 1 if frame_indices else 0,
+        "total_seconds": time.perf_counter() - archive["prefix_started"],
+        "grid_mode": "geo",
+        "geo_grid": geo_grid,
+        "height_field": height_field,
+    }
+
+
+def _finalize_geo_config(
+    merged: dict[str, Any],
+    *,
+    config: tuple[int, int],
+    pair_id: str,
+    output_root: Path,
+    goldstein_alpha: float,
+    snaphu_config: SnaphuConfig | None,
+    unwrap_method: UnwrapBackend | None,
+    irls_kwargs: dict[str, Any] | None,
+    unwrap: bool,
+    geo_height_m: float,
+    all_configs: list[tuple[int, int]] | None = None,
+) -> tuple[PairSweepOutcome, ProductionPairState]:
+    """Build and write the geocoded product for one look configuration."""
+    az_looks, rg_looks = config
+    merged_ifg = merged["merged_ifg"]
+    coherence = merged["coherence"]
+    wrapped = merged["wrapped"]
+    invalid = merged["invalid"]
+    geo_grid: GeoGridSpec = merged["geo_grid"]
+    filtered = merged_ifg
+    if goldstein_alpha > 0.0:
+        from faninsar.processing.interferometry.pair import goldstein_filter
+
+        filtered = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
+    origin = merged["origin_state"]
+    resolved_method: UnwrapBackend = (
+        unwrap_method if unwrap_method is not None else "irls"
+    )
+    resolved_irls_kwargs = dict(irls_kwargs or {})
+    if resolved_method == "irls":
+        resolved_irls_kwargs.setdefault("device", origin.coreg_device)
+    result = ProductionPairState(
+        pair_id=pair_id,
+        reference=origin.reference,
+        secondary=origin.secondary,
+        dem=origin.dem,
+        coregistration_grid="geo",
+        dem_id=origin.dem_id,
+        coreg_executor=origin.coreg_executor,
+        coreg_device=origin.coreg_device,
+        multilook=config,
+        goldstein_alpha=float(goldstein_alpha),
+        unwrap_method=resolved_method,
+        complex_ifg=merged_ifg,
+        complex_ifg_flat=filtered,
+        coherence=coherence,
+        wrapped_phase=wrapped,
+        geo_height_field=merged["height_field"],
+        stage_timings_s={
+            "total": merged["total_seconds"],
+            "per_burst": merged["per_burst_timings"],
+        },
+    )
+    result.note(
+        "PAIR geo frames="
+        + str(merged["frame_count"])
+        + " units="
+        + str(len(merged["units"]))
+        + " merged="
+        + str(merged_ifg.shape)
+        + " multilook="
+        + str(config)
+        + " valid="
+        + format(float((~invalid).mean()), ".3f")
+        + " mean_coh="
+        + format(float(np.nanmean(coherence)), ".3f")
+    )
+    if unwrap:
+        config_for_unwrap = snaphu_config
+        if config_for_unwrap is None:
+            config_for_unwrap = SnaphuConfig(nlooks=float(az_looks * rg_looks))
+        else:
+            config_for_unwrap = replace(
+                config_for_unwrap, nlooks=float(az_looks * rg_looks)
+            )
+        result = stage_unwrap(
+            result,
+            method=resolved_method,
+            config=config_for_unwrap,
+            irls_kwargs=resolved_irls_kwargs,
+        )
+        result.note("UNWRAP complete on merged geo product")
+    else:
+        result.unwrapped_phase = np.zeros_like(wrapped, dtype=np.float32)
+        result.connected_components = np.zeros_like(wrapped, dtype=np.uint8)
+        result.note("UNWRAP skipped (unwrap=False)")
+    result = _finalize_geo_products(
+        result,
+        geo_grid=geo_grid,
+        multilook=config,
+        geo_height_m=geo_height_m,
+    )
+    config_dir = output_root / looks_dir(az_looks, rg_looks)
+    stac_item_id = pair_id + "__l" + str(az_looks) + "x" + str(rg_looks)
+    result = stage_write(
+        result,
+        config_dir,
+        stac_item_id=stac_item_id,
+    )
+    assert result.zarr_path is not None
+    assert result.stac_path is not None
+    grid_meta = result.geo_grid_meta
+    grid: dict[str, object] = {
+        "crs": None if grid_meta is None else grid_meta["crs"],
+        "transform": None if grid_meta is None else grid_meta["transform"],
+        "shape": [merged_ifg.shape[0], merged_ifg.shape[1]],
+        "looks": [az_looks, rg_looks],
+    }
+    _write_run_manifest(
+        config_dir,
+        looks=config,
+        pair_id=pair_id,
+        products=[result.zarr_path.name, result.stac_path.name],
+        grid=grid,
+    )
+    metadata = {
+        "multilook": [az_looks, rg_looks],
+        "multilook_sweep": _sweep_list_metadata(all_configs, config),
+        "wavelength_m": float(origin.reference.geometry.wavelength_m),
+        "pair_id": pair_id,
+        "product_grid": grid,
+    }
+    return PairSweepOutcome(
+        config=config,
+        zarr_path=result.zarr_path,
+        stac_path=result.stac_path,
+        shape=(merged_ifg.shape[0], merged_ifg.shape[1]),
+        metadata=metadata,
+        stage_timings_s=result.stage_timings_s,
+        log=tuple(result.log),
+    ), result

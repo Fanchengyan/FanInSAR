@@ -12,6 +12,7 @@ from faninsar.processing.coreg.dense_geometry import (
     _build_control_grid,
     _interpolate_field,
     dense_geometry_offsets,
+    geometry_offset_window_extent,
 )
 from faninsar.processing.geometry.orbit import OrbitInterpolator
 from faninsar.processing.geometry.transforms import RadarGeometryModel
@@ -203,3 +204,77 @@ def test_dense_geometry_invalid_shape_raises() -> None:
             secondary_model=model,
             stride=0,
         )
+
+
+def test_geometry_offset_window_extent_bounds_near_window() -> None:
+    """Window extent probe returns the largest offset magnitude near a window."""
+    t0 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    orbit = _make_simple_orbit(t0)
+    model = _make_radar_model(orbit, (24, 24))
+    extent = geometry_offset_window_extent(
+        (0, 8, 0, 24),
+        burst_shape=(24, 24),
+        reference_model=model,
+        secondary_model=model,
+        dem=None,
+        probe_stride=8,
+        max_iter=100,
+    )
+    assert 0.0 <= extent < 0.5
+
+
+def test_geometry_offset_window_extent_out_of_burst_returns_zero() -> None:
+    """A window outside the burst yields a zero extent instead of an error."""
+    t0 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    orbit = _make_simple_orbit(t0)
+    model = _make_radar_model(orbit, (24, 24))
+    extent = geometry_offset_window_extent(
+        (100, 110, 100, 110),
+        burst_shape=(24, 24),
+        reference_model=model,
+        secondary_model=model,
+        dem=None,
+    )
+    assert extent == 0.0
+
+
+def test_windowed_dense_offsets_identical_to_full_burst_slice() -> None:
+    """A stride-aligned windowed field matches the full-burst field exactly.
+
+    The windowed control grid is a subset of the full-burst control grid
+    (leading edge floored to a stride multiple, trailing edge extended so
+    ``crop_end - 1`` is a stride multiple), so bilinear interpolation over
+    the crop reproduces the full-burst field bit for bit.
+    """
+    t0 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    orbit = _make_simple_orbit(t0)
+    model = _make_radar_model(orbit, (24, 24))
+    full = dense_geometry_offsets(
+        (24, 24),
+        reference_model=model,
+        secondary_model=model,
+        dem=None,
+        stride=2,
+        max_iter=100,
+    )
+    # Crop rows [0, 9): control rows 0..8 are stride multiples, and the
+    # appended edge control row 8 is also a full-burst grid row.
+    windowed = dense_geometry_offsets(
+        (9, 24),
+        reference_model=model,
+        secondary_model=model,
+        dem=None,
+        stride=2,
+        max_iter=100,
+        row0=0,
+        col0=0,
+    )
+    np.testing.assert_array_equal(
+        windowed.range_offset_px,
+        full.range_offset_px[0:9],
+    )
+    np.testing.assert_array_equal(
+        windowed.azimuth_offset_px,
+        full.azimuth_offset_px[0:9],
+    )
+    np.testing.assert_array_equal(windowed.coverage, full.coverage[0:9])

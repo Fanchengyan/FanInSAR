@@ -184,6 +184,25 @@ class RasterDEM:
             logger.error(message)
             raise ValueError(message)
 
+    def __getstate__(self) -> dict[str, object]:
+        """Return a picklable state without the open rasterio handle."""
+        return {
+            "path": self.path,
+            "nodata": self.nodata,
+            "interpolation": self.interpolation,
+            "_height_array": self._height_array,
+            "_spline_coefficients": self._spline_coefficients,
+        }
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        """Restore the sampler state; the dataset reopens lazily."""
+        self.path = Path(state["path"])
+        self.nodata = state["nodata"]
+        self.interpolation = state["interpolation"]
+        self._height_array = state["_height_array"]
+        self._spline_coefficients = state["_spline_coefficients"]
+        self._dataset = None
+
     def _open(self) -> DatasetReader:
         if self._dataset is None:
             import rasterio

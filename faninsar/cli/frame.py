@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from faninsar.query import BoundingBox
 
 logger = setup_logger(__name__)
@@ -89,6 +91,65 @@ def _parse_burst_selection(
     return result
 
 
+def _resolve_dem_path(value: str, output: Path) -> Path:
+    """Resolve a --dem argument to a path.
+
+    Absolute/relative paths pass through; a bare file name is placed under
+    <output>/dem/.
+    """
+    path = Path(value)
+    if path.is_absolute() or path.parent != Path():
+        return path
+    return output / "dem" / path
+
+
+def _cli_dem_bounds(
+    roi: BoundingBox | None,
+    reference: list[str],
+) -> tuple[float, float, float, float]:
+    """Return EPSG:4326 bounds for the CLI DEM build.
+
+    Uses ROI bounds or the union of every reference SAFE burst radar quad
+    buffered by 2 km.
+    """
+    if roi is not None:
+        return (
+            float(roi.left),
+            float(roi.bottom),
+            float(roi.right),
+            float(roi.top),
+        )
+    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.pipeline.geo_lut import burst_geo_quad_lonlat
+    from faninsar.processing.pipeline.production import (
+        DEM_BOUNDS_BUFFER_M,
+        _quad_bounds_with_buffer_m,
+        _radar_model,
+    )
+
+    quads: list[np.ndarray] = []
+    for path in reference:
+        product = open_safe_product(path)
+        for swath_item in product.swaths:
+            shape = (swath_item.lines_per_burst, swath_item.samples_per_burst)
+            for burst in swath_item.bursts:
+                geometry = _radar_model(
+                    swath_item,
+                    burst,
+                    shape=shape,
+                    row0=burst.index * swath_item.lines_per_burst,
+                    col0=0,
+                )
+                quad = burst_geo_quad_lonlat(
+                    geometry=geometry,
+                    radar_shape=shape,
+                    dem=None,
+                )
+                if quad is not None:
+                    quads.append(quad)
+    return _quad_bounds_with_buffer_m(quads, DEM_BOUNDS_BUFFER_M)
+
+
 def run_frame_cli(
     *,
     reference: str,
@@ -119,13 +180,19 @@ def run_frame_cli(
 
     """
     from faninsar.processing.geometry.dem import GeoidAdjustedDEM, RasterDEM
+    from faninsar.processing.geometry.dem_manager import get_dem_manager
     from faninsar.processing.geometry.egm96 import EGM96Geoid
     from faninsar.processing.pipeline import run_pair
 
+    roi_box = _parse_roi(roi)
     dem_sampler = None
     if dem is not None:
+        dem_path = _resolve_dem_path(dem, Path(output))
+        if not dem_path.exists():
+            bounds = _cli_dem_bounds(roi_box, _as_path_list(reference))
+            dem_path = get_dem_manager().fetch_dem(bounds, dem_path)
         dem_sampler = GeoidAdjustedDEM(
-            RasterDEM(path=dem, interpolation="biquintic"), EGM96Geoid()
+            RasterDEM(path=dem_path, interpolation="biquintic"), EGM96Geoid()
         )
 
     state = run_pair(
@@ -133,7 +200,7 @@ def run_frame_cli(
         _as_path_list(secondary),
         output_dir=Path(output),
         dem=dem_sampler,
-        roi=_parse_roi(roi),
+        roi=roi_box,
         swaths=tuple(name.strip() for name in swaths.split(",") if name.strip()),
         bursts=_parse_burst_selection(bursts),
         multilook=(az_looks, rg_looks),

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .dense_geometry import dense_geometry_offsets
+from .dense_geometry import dense_geometry_offsets, geometry_offset_window_extent
 from .esd import ESDResult, estimate_azimuth_shift_esd
 from .geometry_coreg import (
     build_offset_field,
@@ -28,6 +28,7 @@ __all__ = [
     "estimate_azimuth_shift_esd",
     "estimate_global_shift",
     "geometry_coarse_shift",
+    "geometry_offset_window_extent",
     "geometry_shift_offsets",
     "refine_peak_subpixel",
     "refine_shift_with_correlation",
