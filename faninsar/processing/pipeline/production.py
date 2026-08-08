@@ -356,6 +356,8 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     control_spacing = task.get("control_spacing")
     esd_enabled = bool(task["esd_enabled"])
     amplitude_refinement_enabled = bool(task["amplitude_refinement_enabled"])
+    misreg_az_px = float(task.get("misreg_az_px", 0.0))
+    misreg_rg_px = float(task.get("misreg_rg_px", 0.0))
     executor = str(task["executor"])
     device = str(task["device"])
     dead_pixel_amp_threshold = float(task["dead_pixel_amp_threshold"])
@@ -435,6 +437,8 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         control_spacing=control_spacing,
         esd_enabled=esd_enabled,
         amplitude_refinement_enabled=amplitude_refinement_enabled,
+        misreg_az_px=misreg_az_px,
+        misreg_rg_px=misreg_rg_px,
         executor=executor,
         device=device,
         coregistration_grid=coregistration_grid,
@@ -982,6 +986,8 @@ def stage_coregister(
     control_spacing: int | None = None,
     esd_enabled: bool = False,
     amplitude_refinement_enabled: bool = False,
+    misreg_az_px: float = 0.0,
+    misreg_rg_px: float = 0.0,
     executor: str = "torch",
     device: str = "auto",
     coregistration_grid: CoregistrationGrid = "radar",
@@ -1134,7 +1140,9 @@ def stage_coregister(
         amp_res_rg = 0.0
         amp_res_az = 0.0
         esd_az = 0.0
-        if coregistration_grid == "radar" and amplitude_refinement_enabled:
+        # Residual measure is always on radar deramped samples (PROPOSAL-0017);
+        # independent of final product grid (radar vs geo).
+        if amplitude_refinement_enabled:
             amp_rg, amp_az = refine_shift_with_correlation(
                 ref,
                 sec,
@@ -1144,7 +1152,7 @@ def stage_coregister(
             )
             amp_res_rg = amp_rg - prior_rg
             amp_res_az = amp_az - prior_az
-        if coregistration_grid == "radar" and esd_enabled:
+        if esd_enabled:
             # Bilinear pre-align is sufficient for ESD spectral estimation and
             # avoids a second full-burst Lanczos pass (~minutes and peak RSS).
             pre = resample_complex(
@@ -1165,6 +1173,8 @@ def stage_coregister(
             esd_azimuth_shift_px=esd_az,
             amplitude_residual_rg=amp_res_rg,
             amplitude_residual_az=amp_res_az,
+            misreg_az_px=misreg_az_px,
+            misreg_rg_px=misreg_rg_px,
         )
         # Drop geometry-only fields once combined; offsets retains the dense maps.
         del geometry_field
@@ -2698,6 +2708,8 @@ def run_pair(
     dead_pixel_amp_threshold: float = 3.0,
     esd_enabled: bool = False,
     amplitude_refinement_enabled: bool = False,
+    misreg_az_px: float = 0.0,
+    misreg_rg_px: float = 0.0,
     control_spacing: int | None = None,
     executor: str = "torch",
     device: str = "auto",
@@ -2754,6 +2766,9 @@ def run_pair(
         Enable spectral-diversity azimuth residual estimation.
     amplitude_refinement_enabled : bool, optional
         Enable amplitude-correlation residual refinement.
+    misreg_az_px, misreg_rg_px : float, optional
+        Network (or external) rigid misregistration constants added to the
+        dense offset field (PROPOSAL-0017). Default 0.
     control_spacing : int, optional
         Geometry control-point spacing.
     executor : {"torch"}, optional
@@ -2815,6 +2830,8 @@ def run_pair(
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
             esd_enabled=esd_enabled,
             amplitude_refinement_enabled=amplitude_refinement_enabled,
+            misreg_az_px=misreg_az_px,
+            misreg_rg_px=misreg_rg_px,
             control_spacing=control_spacing,
             executor=executor,
             device=device,
@@ -3137,6 +3154,8 @@ def run_pair(
                 control_spacing=control_spacing,
                 esd_enabled=esd_enabled,
                 amplitude_refinement_enabled=amplitude_refinement_enabled,
+                misreg_az_px=misreg_az_px,
+                misreg_rg_px=misreg_rg_px,
                 executor=executor,
                 device=device,
                 roi_window=roi_window,
@@ -3323,8 +3342,6 @@ def _run_pair_sweep(
     geo_height_m: float,
     geo_chunk_size: int,
     geo_work_dir: str | Path | None,
-    n_jobs: int = 1,
-    roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None,
     unwrap_method: UnwrapBackend | None,
     irls_kwargs: dict[str, Any] | None,
@@ -3332,6 +3349,10 @@ def _run_pair_sweep(
     secondary_orbit_path: str | Path | Sequence[str | Path] | None,
     unwrap: bool,
     geoid_correction: bool,
+    n_jobs: int = 1,
+    roi_buffer_m: float = 320.0,
+    misreg_az_px: float = 0.0,
+    misreg_rg_px: float = 0.0,
 ) -> ProductionPairState | ProductionPairSweepResult:
     """Run one shared prefix and emit every look configuration."""
     from faninsar.missions.sentinel1.safe import open_safe_product
@@ -3557,6 +3578,8 @@ def _run_pair_sweep(
             control_spacing=control_spacing,
             esd_enabled=esd_enabled,
             amplitude_refinement_enabled=amplitude_refinement_enabled,
+            misreg_az_px=misreg_az_px,
+            misreg_rg_px=misreg_rg_px,
             executor=executor,
             device=device,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
@@ -3638,6 +3661,8 @@ def _archive_burst_ifgs(
     geo_work_dir: Path | None,
     n_jobs: int = 1,
     roi_buffer_m: float = 320.0,
+    misreg_az_px: float = 0.0,
+    misreg_rg_px: float = 0.0,
 ) -> dict[str, Any]:
     """Process every burst unit once and store flat IFGs on disk.
 
@@ -3754,6 +3779,8 @@ def _archive_burst_ifgs(
                     "control_spacing": control_spacing,
                     "esd_enabled": esd_enabled,
                     "amplitude_refinement_enabled": amplitude_refinement_enabled,
+                    "misreg_az_px": float(misreg_az_px),
+                    "misreg_rg_px": float(misreg_rg_px),
                     "executor": executor,
                     "device": device,
                     "dead_pixel_amp_threshold": dead_pixel_amp_threshold,

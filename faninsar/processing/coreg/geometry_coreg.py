@@ -127,13 +127,16 @@ def combine_offset_fields(
     esd_azimuth_shift_px: float = 0.0,
     amplitude_residual_rg: float = 0.0,
     amplitude_residual_az: float = 0.0,
+    misreg_az_px: float = 0.0,
+    misreg_rg_px: float = 0.0,
 ) -> OffsetFieldResult:
     """Combine a dense geometry offset field with ESD and amplitude residuals.
 
     The ESD azimuth residual is added uniformly to the geometry azimuth
     offsets.  Optional amplitude-correlation residuals are added to both
-    range and azimuth.  Coverage and uncertainty are propagated
-    conservatively (coverage is intersected, uncertainty is summed).
+    range and azimuth.  Stack network misreg constants (``misreg_*``) are
+    added the same way (PROPOSAL-0017). Coverage and uncertainty are
+    propagated conservatively.
 
     Parameters
     ----------
@@ -143,6 +146,8 @@ def combine_offset_fields(
         Residual azimuth shift from spectral diversity (default 0).
     amplitude_residual_rg, amplitude_residual_az : float, optional
         Global residual shifts from amplitude cross-correlation (default 0).
+    misreg_az_px, misreg_rg_px : float, optional
+        Per-date (or relative) network misregistration constants (default 0).
 
     Returns
     -------
@@ -153,25 +158,35 @@ def combine_offset_fields(
     combined_rg = (
         geometry_field.range_offset_px.astype(np.float32, copy=False)
         + np.float32(amplitude_residual_rg)
+        + np.float32(misreg_rg_px)
     )
     combined_az = (
         geometry_field.azimuth_offset_px.astype(np.float32, copy=False)
         + np.float32(esd_azimuth_shift_px)
         + np.float32(amplitude_residual_az)
+        + np.float32(misreg_az_px)
     )
     # Coverage is unchanged (geometry already determined valid area)
     # Uncertainty: add amplitude residual uncertainty heuristically
     combined_uncertainty = (
         geometry_field.uncertainty_px.astype(np.float32, copy=False)
         + np.float32(
-            0.1 * (abs(amplitude_residual_rg) + abs(amplitude_residual_az))
+            0.1
+            * (
+                abs(amplitude_residual_rg)
+                + abs(amplitude_residual_az)
+                + abs(misreg_rg_px)
+                + abs(misreg_az_px)
+            )
         )
     )
     logger.info(
-        "Combined offsets ESD_az=%.4f amp_rg=%.4f amp_az=%.4f",
+        "Combined offsets ESD_az=%.4f amp_rg=%.4f amp_az=%.4f misreg_az=%.4f misreg_rg=%.4f",
         esd_azimuth_shift_px,
         amplitude_residual_rg,
         amplitude_residual_az,
+        misreg_az_px,
+        misreg_rg_px,
     )
     return OffsetFieldResult(
         range_offset_px=np.asarray(combined_rg, dtype=np.float32),
