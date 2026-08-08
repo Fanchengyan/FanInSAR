@@ -65,9 +65,9 @@ When running ad-hoc Sentinel-1 / InSAR experiments (scratch scripts, campaign ru
 - **Put scripts and data under** `/Volumes/DATA2/TEST_sentinel-1` — not under the repository root.
 - **Oracle / multi-stack compare drivers and former `processing.comparison` harness** live only under  
   `/Volumes/DATA2/TEST_sentinel-1/faninsar-experiments/` (scripts, lib, campaign reports).  
-  Do **not** add compare/plot/ab_test/oracle scripts under repo `scripts/` or `faninsar/`.
-- Experimental notes (skill audits, session memory):  
-  `/Users/fancy/Documents/GitHub/FanInSAR-stac-trail/waymark/notes/` (sidecar; not the product tree).
+  Do **not** add compare/plot/ab_test/oracle drivers anywhere in the product tree.
+- Experimental notes and durable findings belong in the registered external Waymark
+  sidecar, not the product tree.
 - Do **not** write large intermediate products, `out/`, campaign trees, or one-off test scripts into the repo working tree.
 - Unit/integration tests that ship with the package stay in `tests/`; only heavy local data and throwaway experiment scripts go to DATA2.
 - Prefer a dated or named subfolder, e.g. `/Volumes/DATA2/TEST_sentinel-1/<campaign-or-run-id>/`.
