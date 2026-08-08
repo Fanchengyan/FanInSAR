@@ -427,8 +427,8 @@ def run_pair_workflow(
 ) -> PairWorkflowState:
     """Run the windowed educational pair workflow (deprecated).
 
-    Prefer :func:`~faninsar.processing.pipeline.production.run_production_pair`
-    for production ``radar`` / ``geo`` coregistration grids.
+    Prefer :func:`~faninsar.processing.pipeline.production.run_pair` for
+    production radar processing.
 
 
     Stages
@@ -471,8 +471,7 @@ def run_pair_workflow(
 
     """
     warnings.warn(
-        "run_pair_workflow is deprecated; use run_production_pair "
-        "(coregistration_grid='radar'|'geo') for production",
+        "run_pair_workflow is deprecated; use run_pair for production",
         DeprecationWarning,
         stacklevel=2,
     )

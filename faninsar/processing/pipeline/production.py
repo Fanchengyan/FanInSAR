@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 import shutil
-import tempfile
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -61,8 +60,11 @@ from faninsar.processing.tops.carrier import carrier_from_swath
 from faninsar.processing.tops.deramp import TOPSCarrierModel, deramp, reramp
 from faninsar.processing.unwrap import SnaphuConfig, UnwrapBackend
 from faninsar.processing.unwrap import unwrap as unwrap_dispatch
+from faninsar.query import BoundingBox, Polygons
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from faninsar.missions.sentinel1.io import BurstArray
     from faninsar.missions.sentinel1.types import S1Burst, S1Product, S1Swath
     from faninsar.processing.coreg.offsets import OffsetFieldResult
@@ -736,7 +738,7 @@ def stage_interferogram(
     dead_pixel_amp_threshold : float, optional
         SLC amplitude below which a pixel is excluded from the multilook
         average (dead-pixel masking). Set to 0 to disable. The production
-        entry point :func:`run_production_pair` passes 3.0 for real S1
+        entry point :func:`run_pair` passes 3.0 for real S1
         data; synthetic tests use the default 0.
 
     """
@@ -1440,296 +1442,245 @@ def _multilook_real_field(
     )
 
 
-def run_production_pair(
-    reference_path: str | Path,
-    secondary_path: str | Path,
-    *,
-    output_dir: str | Path,
-    swath: str = "IW1",
-    scope: ScopeMode = "burst",
-    burst_index: int = 0,
-    dem: DEMSampler | None = None,
-    multilook: tuple[int, int] = (4, 20),
-    goldstein_alpha: float = 0.5,
-    snaphu_config: SnaphuConfig | None = None,
-    unwrap_method: UnwrapBackend | None = None,
-    irls_kwargs: dict[str, Any] | None = None,
-    esd_enabled: bool = False,
-    amplitude_refinement_enabled: bool = False,
-    control_spacing: int | None = None,
-    executor: str = "torch",
-    device: str = "auto",
-    coregistration_grid: CoregistrationGrid = "radar",
-    geo_grid: GeoGridSpec | None = None,
-    geo_height_m: float = 0.0,
-    geo_chunk_size: int = 128,
-    reference_orbit_path: str | Path | None = None,
-    secondary_orbit_path: str | Path | None = None,
-    geoid_correction: bool = True,
-) -> ProductionPairState:
-    """Run the full production pair chain on full burst or full swath.
+BurstSelection = (
+    dict[str, list[int] | range | str]
+    | list[dict[str, list[int] | range | str]]
+)
 
-    ``coregistration_grid="radar"`` aligns the secondary SLC to the reference
-    radar grid and defers geocoding. ``coregistration_grid="geo"`` remaps both
-    deramped SLCs once onto ``geo_grid`` and analytically reramps them there.
 
-    Parameters
-    ----------
-    reference_path, secondary_path : path
-        SAFE products.
-    output_dir : path
-        Output directory.
-    swath : str, optional
-        Sub-swath.
-    scope : {"burst", "swath"}, optional
-        Process one full burst or stitch entire sub-swath.
-    burst_index : int, optional
-        Burst index when ``scope="burst"``.
-    dem : DEMSampler, optional
-        DEM for coreg/flatten/geocode. Defaults to zero ellipsoid.
-    multilook : tuple[int, int], optional
-        ``(az, rg)`` looks (radar path).
-    goldstein_alpha : float, optional
-        Goldstein filter exponent (default 0.5).
-    snaphu_config : SnaphuConfig, optional
-        snaphu-py configuration. By default, ``nlooks`` is the product of the
-        azimuth and range multilook factors.
-    unwrap_method : {"irls", "snaphu"}, optional
-        Spatial unwrap backend. Defaults to ``"irls"`` for geo coregistration
-        and ``"snaphu"`` for radar coregistration.
-    irls_kwargs : dict, optional
-        Arguments forwarded to IRLS. The pipeline device is used by default.
-    esd_enabled : bool, optional
-        Enable spectral diversity azimuth residual.
-    amplitude_refinement_enabled : bool, optional
-        Enable a global amplitude-correlation residual shift after geometric
-        coregistration. Disabled by default.
-    control_spacing : int, optional
-        Geometry control-point spacing. Defaults to 8 pixels for radar mode
-        and 64 pixels for geo mode.
-    executor : {"torch"}, optional
-        Unified Torch Lanczos path for coregistration and geo-grid interpolation.
-    device : {"auto","cpu","cuda","mps"}, optional
-        Torch device. ``"auto"`` selects CUDA, then MPS, then CPU.
-    coregistration_grid : {"radar", "geo"}, optional
-        Coordinate grid on which the two SLCs are coregistered.
-    geo_grid : GeoGridSpec, optional
-        Native-resolution geocoded SLC grid required for ``"geo"``.
-    geo_height_m : float, optional
-        Fallback constant height (m) when DEM is unavailable for geo2rdr.
-        A real DEM should be supplied for production. Default 0.
-    geo_chunk_size : int, optional
-        Row chunk shared by geo2rdr, SLC remapping, and geographic flattening.
-        Default 128 to amortize Dask graph and disk-backed array overhead while
-        retaining bounded memory use. Larger values can improve throughput on
-        hosts with more available memory.
-    reference_orbit_path, secondary_orbit_path : path, optional
-        Precise ESA EOF orbits for the two acquisitions.
-    geoid_correction : bool, optional
-        Convert orthometric raster DEM heights to ellipsoidal heights with
-        the EGM96 geoid (matching ISCE2) before geometry processing.
-        Default True. Ignored for constant-height or already-corrected DEMs.
+def _as_frame_paths(
+    value: str | Path | Sequence[str | Path],
+    name: str,
+) -> list[Path]:
+    if isinstance(value, (str, Path)):
+        return [Path(value)]
+    paths = [Path(item) for item in value]
+    if not paths:
+        reject_invalid_state(name + " must contain at least one SAFE product")
+    return paths
 
-    Returns
-    -------
-    ProductionPairState
-        Full state with products and stage log.
 
-    """
-    from faninsar.processing.pipeline.geo_lut import grid_lonlat
-
-    dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
-    if geoid_correction and isinstance(dem_sampler, RasterDEM):
-        from faninsar.processing.geometry.egm96 import EGM96Geoid
-
-        dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
-    if coregistration_grid == "geo" and geo_grid is None:
-        reject_invalid_state("coregistration_grid='geo' requires geo_grid")
-    if coregistration_grid == "geo" and scope != "burst":
+def _as_optional_frame_sequence(
+    value: str | Path | Sequence[str | Path] | None,
+    frame_count: int,
+    name: str,
+) -> list[Path | None]:
+    if value is None:
+        return [None] * frame_count
+    paths = _as_frame_paths(value, name)
+    if len(paths) == 1 and frame_count > 1:
+        return [paths[0]] * frame_count
+    if len(paths) != frame_count:
         reject_invalid_state(
-            f"coregistration_grid='geo' requires scope='burst'; got scope={scope!r}"
+            name + " has " + str(len(paths)) + " entries for "
+            + str(frame_count) + " frames"
         )
+    return list(paths)
 
-    total_started = time.perf_counter()
-    stage_started = time.perf_counter()
-    reference = load_production_scene(
-        reference_path,
-        swath=swath,
-        scope=scope,
-        burst_index=burst_index,
-        dem=dem_sampler,
-        orbit_path=reference_orbit_path,
-        coregistration_grid=coregistration_grid,
-    )
-    load_reference_s = time.perf_counter() - stage_started
-    stage_started = time.perf_counter()
-    secondary = load_production_scene(
-        secondary_path,
-        swath=swath,
-        scope=scope,
-        burst_index=burst_index,
-        dem=dem_sampler,
-        orbit_path=secondary_orbit_path,
-        coregistration_grid=coregistration_grid,
-    )
-    load_secondary_s = time.perf_counter() - stage_started
-    resolved_unwrap_method: UnwrapBackend = (
-        unwrap_method
-        if unwrap_method is not None
-        else ("irls" if coregistration_grid == "geo" else "snaphu")
-    )
-    state = ProductionPairState(
-        pair_id=f"{reference.scene_id}_{secondary.scene_id}",
-        reference=reference,
-        secondary=secondary,
-        dem=dem_sampler,
-        coregistration_grid=coregistration_grid,
-        dem_id=_dem_id(dem_sampler),
-        coreg_executor=str(executor),
-        coreg_device=str(device),
-        multilook=tuple(int(x) for x in multilook),
-        goldstein_alpha=float(goldstein_alpha),
-        unwrap_method=resolved_unwrap_method,
-        geo_grid_meta=_geo_grid_meta(geo_grid),
-        stage_timings_s={
-            "load_reference": load_reference_s,
-            "load_secondary": load_secondary_s,
-        },
-    )
-    _geo_temporary_directory: tempfile.TemporaryDirectory[str] | None = None
-    geo_work_directory: Path | None = None
-    memory_watchdog: MemoryWatchdog | None = None
-    if coregistration_grid == "geo":
-        from faninsar.processing.memory import MemoryWatchdog
 
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        _geo_temporary_directory = tempfile.TemporaryDirectory(
-            prefix=f".{state.pair_id}-geo-",
-            dir=output_path,
-        )
-        geo_work_directory = Path(_geo_temporary_directory.name)
-        memory_watchdog = MemoryWatchdog.for_current_system(
-            record_path=output_path / f"{state.pair_id}.memory.jsonl"
-        )
-        state.geo_work_dir = geo_work_directory
-        state.memory_watchdog = memory_watchdog
-        memory_watchdog.sample("geo_pipeline:start")
-    state.note(f"START scope={scope} coregistration_grid={coregistration_grid}")
-    stage_started = time.perf_counter()
-    state = stage_deramp(state)
-    state.stage_timings_s["deramp"] = time.perf_counter() - stage_started
-    if memory_watchdog is not None:
-        memory_watchdog.sample(
-            "deramp:complete",
-            wall_s=state.stage_timings_s["deramp"],
-        )
-    stage_started = time.perf_counter()
-    state = stage_coregister(
-        state,
-        control_spacing=control_spacing,
-        esd_enabled=esd_enabled,
-        amplitude_refinement_enabled=amplitude_refinement_enabled,
-        executor=executor,
-        device=device,
-        coregistration_grid=coregistration_grid,
-        geo_grid=geo_grid,
-        geo_height_m=geo_height_m,
-        geo_chunk_size=geo_chunk_size,
-        geo_work_dir=geo_work_directory,
-        memory_watchdog=memory_watchdog,
-    )
-    state.stage_timings_s["coregister"] = time.perf_counter() - stage_started
-    if memory_watchdog is not None:
-        memory_watchdog.sample(
-            "coregister:complete",
-            wall_s=state.stage_timings_s["coregister"],
-        )
-    stage_started = time.perf_counter()
-    state = stage_interferogram(
-        state,
-        multilook=multilook,
-        goldstein_alpha=goldstein_alpha,
-        dead_pixel_amp_threshold=3.0,
-    )
-    state.stage_timings_s["interferogram"] = time.perf_counter() - stage_started
-    if memory_watchdog is not None:
-        memory_watchdog.sample(
-            "interferogram:complete",
-            wall_s=state.stage_timings_s["interferogram"],
-        )
-    stage_started = time.perf_counter()
-    if coregistration_grid == "radar":
-        state = stage_flatten(state)
-    else:
-        state.complex_ifg_flat = state.complex_ifg
-        state.note("FLATTEN applied to secondary geocoded SLC before IFG formation")
-    state.stage_timings_s["flatten"] = time.perf_counter() - stage_started
-    if resolved_unwrap_method == "snaphu" and snaphu_config is None:
-        snaphu_config = SnaphuConfig(nlooks=float(multilook[0] * multilook[1]))
-    resolved_irls_kwargs = dict(irls_kwargs or {})
-    if resolved_unwrap_method == "irls":
-        resolved_irls_kwargs.setdefault("device", device)
-    stage_started = time.perf_counter()
-    state = stage_unwrap(
-        state,
-        method=resolved_unwrap_method,
-        config=snaphu_config,
-        irls_kwargs=resolved_irls_kwargs,
-    )
-    state.stage_timings_s["unwrap"] = time.perf_counter() - stage_started
-    if memory_watchdog is not None:
-        memory_watchdog.sample(
-            "unwrap:complete",
-            wall_s=state.stage_timings_s["unwrap"],
-        )
-    stage_started = time.perf_counter()
-    state = stage_baseline(state)
-    state.stage_timings_s["baseline"] = time.perf_counter() - stage_started
-    if coregistration_grid == "geo":
-        assert geo_grid is not None
-        assert state.unwrapped_phase is not None
-        assert state.coherence is not None
-        assert state.wrapped_phase is not None
-        product_grid = _multilooked_geo_grid(geo_grid, multilook)
-        lat, lon = grid_lonlat(product_grid)
-        converged = np.isfinite(state.unwrapped_phase).astype(np.uint8)
-        height_field = state.geo_height_field
-        if height_field is None:
-            height_field = np.full(
-                product_grid.shape,
-                float(geo_height_m),
-                dtype=np.float64,
+def _burst_index_list(
+    value: list[int] | range | str,
+    swath: str,
+    count: int,
+) -> list[int]:
+    if isinstance(value, str):
+        if value.strip() == "all":
+            return list(range(count))
+        parts = value.split(":")
+        if len(parts) == 2 and all(part.strip().isdigit() for part in parts):
+            value = range(int(parts[0]), int(parts[1]))
+        else:
+            reject_invalid_state(
+                "invalid burst selection " + repr(value) + " for " + swath
+                + "; expected 'all' or 'start:stop'"
             )
-        elif height_field.shape != product_grid.shape:
-            height_field = _multilook_real_field(height_field, multilook)
-        state.geocoded = {
-            "unwrapped_phase": np.asarray(state.unwrapped_phase, dtype=np.float32),
-            "coherence": np.asarray(state.coherence, dtype=np.float32),
-            "wrapped_phase": np.asarray(state.wrapped_phase, dtype=np.float32),
-            "latitude_deg": lat.astype(np.float64),
-            "longitude_deg": lon.astype(np.float64),
-            "height_m": np.asarray(height_field, dtype=np.float64),
-            "converged": converged,
-        }
-        if isinstance(state.geo_height_field, np.memmap):
-            close_memmap(state.geo_height_field)
-            state.geo_height_field = None
-        state.note("GEO products complete on multilooked geographic grid")
-    stage_started = time.perf_counter()
-    state = stage_write(state, output_dir)
-    state.stage_timings_s["write"] = time.perf_counter() - stage_started
-    state.stage_timings_s["total"] = time.perf_counter() - total_started
-    state.note("DONE")
-    return state
+    if isinstance(value, range):
+        indices = list(value)
+    else:
+        indices = [int(index) for index in value]
+    if not indices:
+        reject_invalid_state("empty burst selection for " + swath)
+    for index in indices:
+        if index < 0 or index >= count:
+            reject_invalid_state(
+                "burst index " + str(index) + " out of range 0.."
+                + str(count - 1) + " for " + swath
+            )
+    return sorted(set(indices))
 
 
-def run_production_swath(
-    reference_path: str | Path,
-    secondary_path: str | Path,
+def _normalize_burst_selection(
+    bursts: BurstSelection | None,
+    frame_count: int,
+    swaths: tuple[str, ...],
+    burst_counts: dict[tuple[int, str], int],
+) -> dict[tuple[int, str], list[int]]:
+    resolved: dict[tuple[int, str], list[int]] = {}
+    if bursts is None:
+        for frame_index in range(frame_count):
+            for swath in swaths:
+                resolved[(frame_index, swath)] = list(
+                    range(burst_counts[(frame_index, swath)])
+                )
+        return resolved
+    if isinstance(bursts, list):
+        if len(bursts) != frame_count:
+            reject_invalid_state(
+                "per-frame burst selection has " + str(len(bursts))
+                + " entries for " + str(frame_count) + " frames"
+            )
+        per_frame: list[dict[str, list[int] | range | str] | None] = list(bursts)
+    else:
+        per_frame = [bursts] * frame_count
+    for frame_index, selection in enumerate(per_frame):
+        if selection is None:
+            for swath in swaths:
+                resolved[(frame_index, swath)] = list(
+                    range(burst_counts[(frame_index, swath)])
+                )
+            continue
+        for swath in swaths:
+            resolved[(frame_index, swath)] = _burst_index_list(
+                selection.get(swath, "all"),
+                swath,
+                burst_counts[(frame_index, swath)],
+            )
+    return resolved
+
+
+def _roi_geometry(roi: BoundingBox | Polygons) -> Any:
+    from shapely.geometry import box
+
+    if isinstance(roi, BoundingBox):
+        return box(roi.left, roi.bottom, roi.right, roi.top)
+    series = roi.geometry
+    if hasattr(series, "union_all"):
+        return series.union_all()
+    return series.unary_union
+
+
+def _select_bursts_by_roi(
+    roi: BoundingBox | Polygons,
+    frame_paths: list[Path],
+    swaths: tuple[str, ...],
+) -> dict[tuple[int, str], list[int]]:
+    from shapely.geometry import Polygon
+
+    from faninsar.missions.sentinel1.safe import open_safe_product
+
+    region = _roi_geometry(roi)
+    resolved: dict[tuple[int, str], list[int]] = {}
+    any_footprint = False
+    for frame_index, path in enumerate(frame_paths):
+        product = open_safe_product(path)
+        for swath in swaths:
+            s1_swath = product.swath(swath)
+            indices: list[int] = []
+            for burst in s1_swath.bursts:
+                if burst.footprint is None:
+                    continue
+                any_footprint = True
+                if region.intersects(Polygon(burst.footprint)):
+                    indices.append(burst.index)
+            resolved[(frame_index, swath)] = indices
+    if not any_footprint:
+        reject_invalid_state(
+            "ROI selection requires burst footprints; annotation geolocation "
+            "grid is missing from the input products"
+        )
+    return resolved
+
+
+def _roi_burst_window(
+    roi: BoundingBox | Polygons,
+    geometry: RadarGeometryModel,
+    dem: DEMSampler,
+    shape: tuple[int, int],
+) -> tuple[int, int, int, int] | None:
+    from faninsar.processing.geometry import geo2rdr
+
+    region = _roi_geometry(roi)
+    min_lon, min_lat, max_lon, max_lat = region.bounds
+    lon = np.asarray([min_lon, max_lon, max_lon, min_lon], dtype=np.float64)
+    lat = np.asarray([max_lat, max_lat, min_lat, min_lat], dtype=np.float64)
+    height = float(np.mean(dem.sample(lat, lon)))
+    transform = geo2rdr(geometry, lat, lon, height)
+    azimuth = transform.azimuth_index
+    range_index = transform.range_index
+    ok = transform.converged & np.isfinite(azimuth) & np.isfinite(range_index)
+    if not np.any(ok):
+        return None
+    row0 = max(0, int(np.floor(np.min(azimuth[ok]))))
+    row1 = min(shape[0], int(np.ceil(np.max(azimuth[ok]))) + 1)
+    col0 = max(0, int(np.floor(np.min(range_index[ok]))))
+    col1 = min(shape[1], int(np.ceil(np.max(range_index[ok]))) + 1)
+    if row1 <= row0 or col1 <= col0:
+        return None
+    return row0, row1, col0, col1
+
+
+def _seconds_of_day(value: datetime) -> float:
+    midnight = value.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (value - midnight).total_seconds()
+
+
+def _common_burst_indices(
+    reference_swath: S1Swath,
+    secondary_swath: S1Swath,
+) -> list[int]:
+    common: list[int] = []
+    max_index = min(len(reference_swath.bursts), len(secondary_swath.bursts))
+    window_s = (
+        reference_swath.lines_per_burst * reference_swath.azimuth_time_interval_s
+    )
+    for index in range(max_index):
+        ref_burst = reference_swath.bursts[index]
+        sec_burst = secondary_swath.bursts[index]
+        if ref_burst.azimuth_time is None or sec_burst.azimuth_time is None:
+            common.append(index)
+            continue
+        gap = abs(
+            _seconds_of_day(ref_burst.azimuth_time)
+            - _seconds_of_day(sec_burst.azimuth_time)
+        )
+        if gap > 12 * 3600:
+            gap = 24 * 3600 - gap
+        if gap <= window_s:
+            common.append(index)
+    return common
+
+
+def _swath_range_offsets(
+    swaths: tuple[str, ...],
+    reference_products: Sequence[S1Product],
+) -> dict[str, int]:
+    first = reference_products[0].swath(swaths[0])
+    offsets: dict[str, int] = {}
+    for name in swaths:
+        item = reference_products[0].swath(name)
+        if name == swaths[0]:
+            offsets[name] = 0
+        else:
+            offset = round(
+                (item.slant_range_time_s - first.slant_range_time_s)
+                * item.range_sampling_rate_hz
+            )
+            if offset < 0:
+                reject_invalid_state(
+                    "swath " + name + " starts before frame swath " + swaths[0]
+                )
+            offsets[name] = offset
+    return offsets
+
+
+def run_pair(
+    reference_path: str | Path | Sequence[str | Path],
+    secondary_path: str | Path | Sequence[str | Path],
     *,
     output_dir: str | Path,
-    swath: str = "IW1",
+    roi: BoundingBox | Polygons | None = None,
+    swaths: tuple[str, ...] | None = None,
+    bursts: BurstSelection | None = None,
     dem: DEMSampler | None = None,
     multilook: tuple[int, int] = (2, 10),
     goldstein_alpha: float = 0.5,
@@ -1739,40 +1690,44 @@ def run_production_swath(
     control_spacing: int | None = None,
     executor: str = "torch",
     device: str = "auto",
-    reference_orbit_path: str | Path | None = None,
-    secondary_orbit_path: str | Path | None = None,
+    reference_orbit_path: str | Path | Sequence[str | Path] | None = None,
+    secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
+    unwrap: bool = False,
     geoid_correction: bool = True,
-    burst_indices: list[int] | None = None,
-    frame_azimuth_origin: datetime | None = None,
-    frame_range_offset_fullres: int = 0,
 ) -> ProductionPairState:
-    """Process a full swath burst-by-burst and merge into one radar product.
-
-    Sentinel-1 TOPS bursts each carry their own Doppler/FM-rate carrier, so
-    a swath must be processed per burst (deramp -> coregister -> full-res
-    interferogram -> flatten) and the full-resolution interferograms merged
-    afterwards.  The merge places each burst on the absolute azimuth grid
-    (from its sensing time against the frame origin) and keeps the later
-    burst in the overlap zones, matching ISCE2's multi-swath VRT merge.
+    """Process any burst selection across frames and swaths into one product.
 
     Parameters
     ----------
-    reference_path, secondary_path : path
-        SAFE products.
+    reference_path, secondary_path : str, Path, or sequence
+        One or more SAFE products per date. Sequences represent consecutive
+        frames along the same pass; all entries are placed on one shared
+        absolute azimuth/range grid.
     output_dir : path
-        Output directory.
-    swath : str, optional
-        Sub-swath name.
+        Output directory for the merged Zarr/STAC products.
+    roi : BoundingBox or Polygons, optional
+        Region of interest in EPSG:4326. When provided, swaths and bursts
+        are ignored and the burst set is derived from footprint intersection
+        (edge-aware; neighboring bursts are included when the ROI reaches a
+        burst boundary because footprints overlap).
+    swaths : tuple of str, optional
+        Sub-swaths to process in range order. Defaults to all sub-swaths of
+        the reference product ordered by slant-range time.
+    bursts : BurstSelection, optional
+        Explicit per-swath burst selection: {"IW1": [0, 2], "IW2": "1:4",
+        "IW3": "all"} applied to every frame, or a list with one such
+        mapping per frame. None selects every burst.
     dem : DEMSampler, optional
-        DEM sampler.  Defaults to a zero ellipsoid.
+        DEM for coregistration, flattening, and geometry. Defaults to a zero
+        ellipsoid.
     multilook : tuple[int, int], optional
-        ``(az, rg)`` looks applied after the full-res merge.
+        (az, rg) looks applied while accumulating the merged frame.
     goldstein_alpha : float, optional
         Goldstein filter exponent applied to the merged product.
     dead_pixel_amp_threshold : float, optional
         Dead-pixel amplitude mask threshold for the interferogram.
     esd_enabled : bool, optional
-        Enable ESD azimuth residual.
+        Enable spectral-diversity azimuth residual estimation.
     amplitude_refinement_enabled : bool, optional
         Enable amplitude-correlation residual refinement.
     control_spacing : int, optional
@@ -1781,47 +1736,210 @@ def run_production_swath(
         Resample executor.
     device : {"auto","cpu","cuda","mps"}, optional
         Torch device.
-    reference_orbit_path, secondary_orbit_path : path, optional
-        Precise ESA EOF orbits.
+    reference_orbit_path, secondary_orbit_path : path or sequence, optional
+        Precise ESA EOF orbits; one per frame or a single orbit reused for
+        every frame.
+    unwrap : bool, optional
+        Run SNAPHU unwrapping on the merged wrapped phase when True.
     geoid_correction : bool, optional
         Convert orthometric raster DEM heights to ellipsoidal with EGM96.
-    burst_indices : list of int, optional
-        Bursts to process. Defaults to all bursts of the swath.
-    frame_azimuth_origin : datetime, optional
-        Absolute azimuth time of frame row 0.  Defaults to the earliest
-        burst start across all sub-swaths of the reference product, so the
-        swath shares one absolute azimuth grid with the other swaths
-        (ISCE2 merged-frame convention).
-    frame_range_offset_fullres : int, optional
-        Full-resolution frame column of this swath's range sample 0 in the
-        concatenated multi-swath frame (0 for the near swath).  Matches
-        ISCE2's ``dst.xOff - src.xOff`` per-swath placement.
+        Default True.
 
     Returns
     -------
     ProductionPairState
-        State with the merged radar product (wrapped phase, coherence,
-        filtered complex interferogram) and stage timings.
+        State with the merged wrapped/filtered product and stage timings.
 
     """
-    import time
-
-    from faninsar.missions.sentinel1.io.read import read_full_burst
-    from faninsar.processing.tops.carrier import carrier_from_swath
+    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.geometry.egm96 import EGM96Geoid
 
     dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
     if geoid_correction and isinstance(dem_sampler, RasterDEM):
-        from faninsar.processing.geometry.egm96 import EGM96Geoid
-
         dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
-    def load_burst(path: Path, orbit_path: Path | None, bi: int) -> ProductionScene:
-        product = open_safe_product(path)
+    ref_paths = _as_frame_paths(reference_path, "reference_path")
+    sec_paths = _as_frame_paths(secondary_path, "secondary_path")
+    if len(ref_paths) != len(sec_paths):
+        reject_invalid_state(
+            "reference/secondary frame counts differ: "
+            + str(len(ref_paths)) + " vs " + str(len(sec_paths))
+        )
+    frame_count = len(ref_paths)
+    ref_orbits = _as_optional_frame_sequence(
+        reference_orbit_path, frame_count, "reference_orbit_path"
+    )
+    sec_orbits = _as_optional_frame_sequence(
+        secondary_orbit_path, frame_count, "secondary_orbit_path"
+    )
+
+    reference_products = [open_safe_product(path) for path in ref_paths]
+    secondary_products = [open_safe_product(path) for path in sec_paths]
+    if swaths is None:
+        ordered = sorted(
+            reference_products[0].swaths,
+            key=lambda item: item.slant_range_time_s,
+        )
+        swath_tuple = tuple(item.swath for item in ordered)
+    else:
+        swath_tuple = tuple(swaths)
+    if not swath_tuple:
+        reject_invalid_state("swaths must not be empty")
+    for frame_index, product in enumerate(reference_products):
+        present = {item.swath for item in product.swaths}
+        missing = [name for name in swath_tuple if name not in present]
+        if missing:
+            reject_invalid_state(
+                "reference frame " + str(frame_index) + " ("
+                + ref_paths[frame_index].name + ") missing swaths "
+                + str(missing) + "; available=" + str(sorted(present))
+            )
+    for frame_index, product in enumerate(secondary_products):
+        present = {item.swath for item in product.swaths}
+        missing = [name for name in swath_tuple if name not in present]
+        if missing:
+            reject_invalid_state(
+                "secondary frame " + str(frame_index) + " ("
+                + sec_paths[frame_index].name + ") missing swaths "
+                + str(missing) + "; available=" + str(sorted(present))
+            )
+
+    if roi is not None:
+        logger.info(
+            "run_pair: ROI provided; explicit swaths/bursts selection ignored"
+        )
+        ordered = sorted(
+            reference_products[0].swaths,
+            key=lambda item: item.slant_range_time_s,
+        )
+        swath_tuple = tuple(item.swath for item in ordered)
+        resolved = _select_bursts_by_roi(roi, ref_paths, swath_tuple)
+    else:
+        burst_counts = {
+            (frame_index, swath): len(
+                reference_products[frame_index].swath(swath).bursts
+            )
+            for frame_index in range(frame_count)
+            for swath in swath_tuple
+        }
+        resolved = _normalize_burst_selection(
+            bursts, frame_count, swath_tuple, burst_counts
+        )
+
+    common_aligned: dict[tuple[int, str], list[int]] = {}
+    for frame_index in range(frame_count):
+        for swath in swath_tuple:
+            reference_swath = reference_products[frame_index].swath(swath)
+            secondary_swath = secondary_products[frame_index].swath(swath)
+            common = _common_burst_indices(reference_swath, secondary_swath)
+            selected = [
+                index
+                for index in resolved[(frame_index, swath)]
+                if index in common
+            ]
+            if not selected:
+                reject_invalid_state(
+                    "no common bursts between reference/secondary frame "
+                    + str(frame_index) + " swath " + swath
+                )
+            common_aligned[(frame_index, swath)] = selected
+    resolved = common_aligned
+
+    range_offsets = _swath_range_offsets(swath_tuple, reference_products)
+    reference_swath0 = reference_products[0].swath(swath_tuple[0])
+    dt = reference_swath0.azimuth_time_interval_s
+    burst_lines = {
+        swath: reference_products[0].swath(swath).lines_per_burst
+        for swath in swath_tuple
+    }
+    burst_width = {
+        swath: reference_products[0].swath(swath).samples_per_burst
+        for swath in swath_tuple
+    }
+
+    azimuth_origin = min(
+        reference_products[frame_index].swath(swath).bursts[burst_index].azimuth_time
+        for (frame_index, swath), indices in resolved.items()
+        for burst_index in indices
+    )
+    units_by_swath: dict[str, list[tuple[int, int, int]]] = {}
+    for swath in swath_tuple:
+        units: list[tuple[int, int, int]] = []
+        for (frame_index, swath_key), indices in resolved.items():
+            if swath_key != swath:
+                continue
+            swath_obj = reference_products[frame_index].swath(swath)
+            for burst_index in indices:
+                azimuth_offset = round(
+                    (
+                        swath_obj.bursts[burst_index].azimuth_time
+                        - azimuth_origin
+                    ).total_seconds()
+                    / dt
+                )
+                units.append((frame_index, burst_index, azimuth_offset))
+        units.sort(key=lambda unit: unit[2], reverse=True)
+        units_by_swath[swath] = units
+
+    selected_unit_count = sum(len(units) for units in units_by_swath.values())
+    total_started = time.perf_counter()
+    frame_rows = max(
+        azimuth_offset + burst_lines[swath]
+        for swath, units in units_by_swath.items()
+        for _, _, azimuth_offset in units
+    )
+    frame_cols = max(
+        range_offsets[swath] + burst_width[swath] for swath in swath_tuple
+    )
+    az_looks, rg_looks = int(multilook[0]), int(multilook[1])
+    out_rows = frame_rows // az_looks
+    out_cols = frame_cols // rg_looks
+    swath_rows = {
+        swath: (
+            max(
+                azimuth_offset + burst_lines[swath]
+                for _, _, azimuth_offset in units_by_swath[swath]
+            )
+            // az_looks
+        )
+        for swath in swath_tuple
+    }
+    swath_cols = {
+        swath: (range_offsets[swath] + burst_width[swath]) // rg_looks
+        for swath in swath_tuple
+    }
+    ifc_acc = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.complex128)
+        for swath in swath_tuple
+    }
+    pri_pow_acc = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.float64)
+        for swath in swath_tuple
+    }
+    sec_pow_acc = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.float64)
+        for swath in swath_tuple
+    }
+    claimed = {
+        swath: np.zeros((swath_rows[swath], swath_cols[swath]), dtype=np.int32)
+        for swath in swath_tuple
+    }
+    looks_per_window = az_looks * rg_looks
+
+    def load_burst(
+        swath: str,
+        burst_index: int,
+        path: Path,
+        orbit_path: Path | None,
+        product: S1Product,
+    ) -> ProductionScene:
         s1_swath = product.swath(swath)
         if orbit_path is not None:
             s1_swath = replace(s1_swath, orbit=read_eof_orbit(orbit_path))
-        array = read_full_burst(s1_swath, burst_index=bi, full_range=True)
-        burst = s1_swath.bursts[bi]
+        array = read_full_burst(
+            s1_swath, burst_index=burst_index, full_range=True
+        )
+        burst = s1_swath.bursts[burst_index]
         carrier = carrier_from_swath(
             s1_swath, burst, first_range_sample=array.col0
         )
@@ -1843,134 +1961,162 @@ def run_production_swath(
             geometry=geometry,
         )
 
-    total_started = time.perf_counter()
-    reference = load_burst(Path(reference_path), reference_orbit_path, 0)
-    swath_obj = reference.swath
-    dt = swath_obj.azimuth_time_interval_s
-    azimuth_origin = frame_azimuth_origin
-    if azimuth_origin is None:
-        product = open_safe_product(reference_path)
-        starts = [item.bursts[0].azimuth_time for item in product.swaths if item.bursts]
-        if not starts:
-            reject_invalid_state("reference product has no bursts")
-        azimuth_origin = min(starts)
-    all_bursts = list(range(len(swath_obj.bursts)))
-    bursts = burst_indices if burst_indices is not None else all_bursts
-    if not bursts:
-        reject_invalid_state("burst_indices must not be empty")
-    for bi in bursts:
-        if bi < 0 or bi >= len(all_bursts):
-            reject_invalid_state(f"burst index {bi} out of range")
-
-    az_looks, rg_looks = int(multilook[0]), int(multilook[1])
-    az_offsets = {}
-    for bi in bursts:
-        az_offsets[bi] = round(
-            (swath_obj.bursts[bi].azimuth_time - azimuth_origin).total_seconds() / dt
-        )
-    burst_width = reference.array.samples.shape[1]
-    burst_lines = reference.array.samples.shape[0]
-    frame_rows = az_offsets[bursts[-1]] + burst_lines
-    frame_cols = frame_range_offset_fullres + burst_width
-    out_rows = frame_rows // az_looks
-    out_cols = frame_cols // rg_looks
-    ifc_acc = np.zeros((out_rows, out_cols), dtype=np.complex128)
-    pri_pow_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
-    sec_pow_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
-    claimed = np.zeros((out_rows, out_cols), dtype=np.int32)
-    looks_per_window = az_looks * rg_looks
-
     per_burst_timings: dict[str, dict[str, float]] = {}
-    for bi in reversed(bursts):
-        tag = f"{swath}_b{bi}"
-        ref = load_burst(Path(reference_path), reference_orbit_path, bi)
-        sec = load_burst(Path(secondary_path), secondary_orbit_path, bi)
-        state = ProductionPairState(
-            pair_id=f"{ref.scene_id}_{sec.scene_id}_{tag}",
-            reference=ref,
-            secondary=sec,
-            dem=dem_sampler,
-            coregistration_grid="radar",
-            multilook=multilook,
-            goldstein_alpha=goldstein_alpha,
-            unwrap_method="snaphu",
-        )
-        stage_times: dict[str, float] = {}
-        t0 = time.perf_counter()
-        state = stage_deramp(state)
-        stage_times["deramp"] = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        state = stage_coregister(
-            state,
-            control_spacing=control_spacing,
-            esd_enabled=esd_enabled,
-            amplitude_refinement_enabled=amplitude_refinement_enabled,
-            executor=executor,
-            device=device,
-        )
-        stage_times["coregister"] = time.perf_counter() - t0
-        # Accumulate full-res primary/secondary powers for the merged coherence.
-        assert state.reference_deramped is not None
-        assert state.secondary_aligned is not None
-        pri_power = state.reference_deramped.real**2 + state.reference_deramped.imag**2
-        sec_power = state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
-        t0 = time.perf_counter()
-        state = stage_interferogram(
-            state,
-            multilook=(1, 1),
-            goldstein_alpha=0.0,
-            dead_pixel_amp_threshold=dead_pixel_amp_threshold,
-        )
-        stage_times["interferogram"] = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        state = stage_flatten(state)
-        stage_times["flatten"] = time.perf_counter() - t0
-        ifg_full = (
-            state.complex_ifg_flat
-            if state.complex_ifg_flat is not None
-            else state.complex_ifg
-        )
-        if ifg_full is None:
-            reject_invalid_state(f"{tag}: no interferogram produced")
-        per_burst_timings[tag] = stage_times
+    first_state: ProductionPairState | None = None
+    origin_state: ProductionPairState | None = None
+    for swath in reversed(swath_tuple):
+        for frame_index, burst_index, azimuth_offset in units_by_swath[swath]:
+            tag = "f" + str(frame_index) + "_" + swath + "_b" + str(burst_index)
+            ref = load_burst(
+                swath,
+                burst_index,
+                ref_paths[frame_index],
+                ref_orbits[frame_index],
+                reference_products[frame_index],
+            )
+            sec = load_burst(
+                swath,
+                burst_index,
+                sec_paths[frame_index],
+                sec_orbits[frame_index],
+                secondary_products[frame_index],
+            )
+            state = ProductionPairState(
+                pair_id=ref.scene_id + "_" + sec.scene_id + "_" + tag,
+                reference=ref,
+                secondary=sec,
+                dem=dem_sampler,
+                coregistration_grid="radar",
+                multilook=multilook,
+                goldstein_alpha=0.0,
+                unwrap_method="snaphu",
+            )
+            if first_state is None:
+                first_state = state
+            if (
+                frame_index == 0
+                and swath == swath_tuple[0]
+                and burst_index == 0
+            ):
+                origin_state = state
+            stage_times: dict[str, float] = {}
+            t0 = time.perf_counter()
+            state = stage_deramp(state)
+            stage_times["deramp"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            state = stage_coregister(
+                state,
+                control_spacing=control_spacing,
+                esd_enabled=esd_enabled,
+                amplitude_refinement_enabled=amplitude_refinement_enabled,
+                executor=executor,
+                device=device,
+            )
+            stage_times["coregister"] = time.perf_counter() - t0
+            burst_row0 = 0
+            burst_col0 = 0
+            if roi is not None:
+                assert state.reference_deramped is not None
+                window = _roi_burst_window(
+                    roi,
+                    ref.geometry,
+                    dem_sampler,
+                    state.reference_deramped.shape,
+                )
+                if window is not None:
+                    burst_row0, burst_row1, burst_col0, burst_col1 = window
+                    state.reference_deramped = state.reference_deramped[
+                        burst_row0:burst_row1, burst_col0:burst_col1
+                    ]
+                    state.secondary_aligned = state.secondary_aligned[
+                        burst_row0:burst_row1, burst_col0:burst_col1
+                    ]
+            assert state.reference_deramped is not None
+            assert state.secondary_aligned is not None
+            pri_power = (
+                state.reference_deramped.real ** 2
+                + state.reference_deramped.imag ** 2
+            )
+            sec_power = (
+                state.secondary_aligned.real ** 2
+                + state.secondary_aligned.imag ** 2
+            )
+            t0 = time.perf_counter()
+            state = stage_interferogram(
+                state,
+                multilook=(1, 1),
+                goldstein_alpha=0.0,
+                dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            )
+            stage_times["interferogram"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            state = stage_flatten(state)
+            stage_times["flatten"] = time.perf_counter() - t0
+            ifg_full = (
+                state.complex_ifg_flat
+                if state.complex_ifg_flat is not None
+                else state.complex_ifg
+            )
+            if ifg_full is None:
+                reject_invalid_state(tag + ": no interferogram produced")
+            per_burst_timings[tag] = stage_times
 
-        # Scatter into the multilooked frame in reverse order so the later
-        # burst claims overlap windows first (ISCE2 VRT last-writer-wins).
-        valid = np.abs(ifg_full) > 0
-        rows = az_offsets[bi] + np.arange(ifg_full.shape[0])
-        cols = frame_range_offset_fullres + np.arange(ifg_full.shape[1])
-        orow = rows[:, None] // az_looks
-        ocol = cols[None, :] // rg_looks
-        inb = (orow < out_rows) & (ocol < out_cols) & valid
-        r_i, c_i = np.broadcast_arrays(orow, ocol)
-        r_v, c_v = r_i[inb], c_i[inb]
-        free = claimed[r_v, c_v] < looks_per_window
-        r_f, c_f = r_v[free], c_v[free]
-        np.add.at(ifc_acc, (r_f, c_f), ifg_full[inb][free].astype(np.complex128))
-        np.add.at(pri_pow_acc, (r_f, c_f), pri_power[inb][free])
-        np.add.at(sec_pow_acc, (r_f, c_f), sec_power[inb][free])
-        np.add.at(claimed, (r_f, c_f), 1)
-        del pri_power, sec_power, ifg_full, state
-        logger.info("Merged %s into frame", tag)
+            valid = np.abs(ifg_full) > 0
+            rows = azimuth_offset + burst_row0 + np.arange(ifg_full.shape[0])
+            cols = range_offsets[swath] + burst_col0 + np.arange(
+                ifg_full.shape[1]
+            )
+            orow = rows[:, None] // az_looks
+            ocol = cols[None, :] // rg_looks
+            ocol_local = ocol - range_offsets[swath] // rg_looks
+            inb = (
+                (orow < swath_rows[swath])
+                & (ocol_local >= 0)
+                & (ocol_local < swath_cols[swath])
+                & valid
+            )
+            r_i, c_i = np.broadcast_arrays(orow, ocol_local)
+            r_v, c_v = r_i[inb], c_i[inb]
+            free = claimed[swath][r_v, c_v] < looks_per_window
+            r_f, c_f = r_v[free], c_v[free]
+            np.add.at(
+                ifc_acc[swath],
+                (r_f, c_f),
+                ifg_full[inb][free].astype(np.complex128),
+            )
+            np.add.at(pri_pow_acc[swath], (r_f, c_f), pri_power[inb][free])
+            np.add.at(sec_pow_acc[swath], (r_f, c_f), sec_power[inb][free])
+            np.add.at(claimed[swath], (r_f, c_f), 1)
+            del pri_power, sec_power, ifg_full, state
+            logger.info("Merged %s into frame", tag)
 
-    has = claimed > 0
-    merged_ifg = np.where(
-        has, ifc_acc / np.where(has, claimed, 1), 0
-    ).astype(np.complex64)
-    pri_ml = pri_pow_acc / np.where(has, claimed, 1)
-    sec_ml = sec_pow_acc / np.where(has, claimed, 1)
-    denom = np.sqrt(np.maximum(pri_ml * sec_ml, 1e-30))
-    coherence = np.clip(np.abs(merged_ifg) / denom, 0.0, 1.0).astype(np.float32)
-    invalid = claimed == 0
-    merged_ifg = np.asarray(merged_ifg, dtype=np.complex64).copy()
-    merged_ifg[invalid] = np.nan + 1j * np.nan
-    coherence[invalid] = np.nan
-    wrapped = np.angle(merged_ifg).astype(np.float32)
-    wrapped = np.where(
-        np.isfinite(merged_ifg.real) & np.isfinite(merged_ifg.imag),
-        wrapped,
-        np.nan,
-    )
+    if first_state is None:
+        reject_invalid_state("no burst units selected for processing")
+
+    merged_ifg = np.zeros((out_rows, out_cols), dtype=np.complex64)
+    coherence = np.full((out_rows, out_cols), np.nan, dtype=np.float32)
+    for swath in swath_tuple:
+        has = claimed[swath] > 0
+        swath_ifg = np.where(
+            has, ifc_acc[swath] / np.where(has, claimed[swath], 1), 0
+        ).astype(np.complex64)
+        pri_ml = pri_pow_acc[swath] / np.where(has, claimed[swath], 1)
+        sec_ml = sec_pow_acc[swath] / np.where(has, claimed[swath], 1)
+        denom = np.sqrt(np.maximum(pri_ml * sec_ml, 1e-30))
+        swath_coh = np.clip(np.abs(swath_ifg) / denom, 0.0, 1.0).astype(
+            np.float32
+        )
+        col0 = range_offsets[swath] // rg_looks
+        rows = swath_ifg.shape[0]
+        cols = swath_ifg.shape[1]
+        col1 = min(col0 + cols, out_cols)
+        cols = col1 - col0
+        band = np.abs(swath_ifg[:rows, :cols]) > 0
+        merged_ifg[:rows, col0:col1][band] = swath_ifg[:rows, :cols][band]
+        coherence[:rows, col0:col1][band] = swath_coh[:rows, :cols][band]
+        del swath_ifg, swath_coh
+    invalid = np.abs(merged_ifg) <= 0
+    wrapped = np.where(invalid, np.nan, np.angle(merged_ifg).astype(np.float32))
 
     filtered = merged_ifg
     if goldstein_alpha > 0.0:
@@ -1979,9 +2125,17 @@ def run_production_swath(
         filtered = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
 
     result = ProductionPairState(
-        pair_id=f"{reference.scene_id}_{_scene_id(Path(secondary_path))}_swath",
-        reference=reference,
-        secondary=load_burst(Path(secondary_path), secondary_orbit_path, 0),
+        pair_id=_scene_id(ref_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair",
+        reference=(
+            origin_state.reference
+            if origin_state is not None
+            else first_state.reference
+        ),
+        secondary=(
+            origin_state.secondary
+            if origin_state is not None
+            else first_state.secondary
+        ),
         dem=dem_sampler,
         coregistration_grid="radar",
         dem_id=_dem_id(dem_sampler),
@@ -2000,187 +2154,24 @@ def run_production_swath(
         },
     )
     result.note(
-        f"SWATH {swath} bursts={bursts} merged={merged_ifg.shape} "
-        f"multilook={multilook} valid={float((~invalid).mean()):.3f} "
-        f"mean_coh={float(np.nanmean(coherence)):.3f}"
+        "PAIR frames=" + str(frame_count) + " swaths=" + str(swath_tuple)
+        + " units=" + str(selected_unit_count) + " merged=" + str(merged_ifg.shape)
+        + " multilook=" + str(multilook) + " valid="
+        + format(float((~invalid).mean()), ".3f") + " mean_coh="
+        + format(float(np.nanmean(coherence)), ".3f")
     )
-    result.unwrapped_phase = np.zeros_like(wrapped, dtype=np.float32)
-    result.connected_components = np.zeros_like(wrapped, dtype=np.uint8)
-    result.note("UNWRAP skipped: swath mode emits wrapped radar products only")
-    stage_write(result, output_dir)
-    return result
+    if unwrap:
+        from faninsar.processing.unwrap import SnaphuConfig
 
-
-def run_full_frame(
-    reference_path: str | Path,
-    secondary_path: str | Path,
-    *,
-    output_dir: str | Path,
-    dem: DEMSampler | None = None,
-    swaths: tuple[str, ...] = ("IW1", "IW2", "IW3"),
-    multilook: tuple[int, int] = (2, 10),
-    goldstein_alpha: float = 0.5,
-    dead_pixel_amp_threshold: float = 3.0,
-    executor: str = "torch",
-    device: str = "auto",
-    reference_orbit_path: str | Path | None = None,
-    secondary_orbit_path: str | Path | None = None,
-    geoid_correction: bool = True,
-    burst_indices: dict[str, list[int]] | None = None,
-) -> ProductionPairState:
-    """Process a full multi-swath frame and merge it into one radar product.
-
-    Convenience wrapper over :func:`run_production_swath`: derives the
-    per-swath range offset in the concatenated frame from the annotation
-    slant-range times, processes each sub-swath burst-by-burst, overlays the
-    swath canvases on the absolute frame grid (valid pixels win), applies the
-    Goldstein filter after the merge, and writes the merged Zarr/STAC.
-
-    Parameters
-    ----------
-    reference_path, secondary_path : path
-        SAFE products.
-    output_dir : path
-        Output directory; one subdirectory per swath plus the merged frame.
-    dem : DEMSampler, optional
-        DEM sampler.  Defaults to a zero ellipsoid.
-    swaths : list of str, optional
-        Sub-swaths to process, in range order.  Frame column 0 is the first
-        swath's range sample 0.
-    multilook : tuple[int, int], optional
-        ``(az, rg)`` looks applied after the full-res merge.
-    goldstein_alpha : float, optional
-        Goldstein filter exponent applied to the merged product.
-    dead_pixel_amp_threshold : float, optional
-        Dead-pixel amplitude mask threshold for the interferogram.
-    executor : {"torch"}, optional
-        Resample executor.
-    device : {"auto","cpu","cuda","mps"}, optional
-        Torch device.
-    reference_orbit_path, secondary_orbit_path : path, optional
-        Precise ESA EOF orbits.
-    geoid_correction : bool, optional
-        Convert orthometric raster DEM heights to ellipsoidal with EGM96.
-    burst_indices : dict of str to list of int, optional
-        Bursts to process per swath.  Defaults to all bursts of each swath.
-
-    Returns
-    -------
-    ProductionPairState
-        State with the merged frame (wrapped phase, coherence, filtered
-        complex interferogram) and per-swath stage timings.
-
-    """
-    import time
-
-    from faninsar.missions.sentinel1.safe import open_safe_product
-
-    if not swaths:
-        reject_invalid_state("swaths must not be empty")
-    product = open_safe_product(reference_path)
-    swath_map = {item.swath: item for item in product.swaths}
-    missing = [name for name in swaths if name not in swath_map]
-    if missing:
-        reject_invalid_state(
-            f"swaths {missing} not found in {Path(reference_path).name}; "
-            f"available={sorted(swath_map)}"
+        result = stage_unwrap(
+            result,
+            method="snaphu",
+            config=SnaphuConfig(nlooks=float(az_looks * rg_looks)),
         )
-
-    ref_swath = swath_map[swaths[0]]
-    rg_offsets: dict[str, int] = {}
-    for name in swaths:
-        item = swath_map[name]
-        if name == swaths[0]:
-            rg_offsets[name] = 0
-        else:
-            offset = round(
-                (item.slant_range_time_s - ref_swath.slant_range_time_s)
-                * item.range_sampling_rate_hz
-            )
-            if offset < 0:
-                reject_invalid_state(
-                    f"swath {name} starts before frame swath {swaths[0]}"
-                )
-            rg_offsets[name] = offset
-
-    total_started = time.perf_counter()
-    canvases: dict[str, np.ndarray] = {}
-    coherences: dict[str, np.ndarray] = {}
-    per_swath_timings: dict[str, float] = {}
-    first_state: ProductionPairState | None = None
-    for name in swaths:
-        state = run_production_swath(
-            reference_path,
-            secondary_path,
-            output_dir=Path(output_dir) / name,
-            swath=name,
-            dem=dem,
-            multilook=multilook,
-            goldstein_alpha=0.0,
-            dead_pixel_amp_threshold=dead_pixel_amp_threshold,
-            executor=executor,
-            device=device,
-            reference_orbit_path=reference_orbit_path,
-            secondary_orbit_path=secondary_orbit_path,
-            geoid_correction=geoid_correction,
-            burst_indices=None if burst_indices is None else burst_indices.get(name),
-            frame_range_offset_fullres=rg_offsets[name],
-        )
-        if first_state is None:
-            first_state = state
-        canvases[name] = np.asarray(state.complex_ifg)
-        coherences[name] = np.asarray(state.coherence)
-        per_swath_timings[name] = state.stage_timings_s["total"]
-        logger.info("Full-frame %s canvas %s", name, canvases[name].shape)
-
-    rows = max(canvas.shape[0] for canvas in canvases.values())
-    cols = max(canvas.shape[1] for canvas in canvases.values())
-    merged = np.zeros((rows, cols), dtype=np.complex64)
-    merged_coh = np.full((rows, cols), np.nan, dtype=np.float32)
-    for name in swaths:
-        canvas = canvases[name]
-        valid = np.abs(canvas) > 0
-        merged[: canvas.shape[0], : canvas.shape[1]][valid] = canvas[valid]
-        merged_coh[: canvas.shape[0], : canvas.shape[1]][valid] = (
-            coherences[name][valid]
-        )
-    invalid = np.abs(merged) <= 0
-    wrapped = np.where(invalid, np.nan, np.angle(merged).astype(np.float32))
-
-    filtered = merged
-    if goldstein_alpha > 0.0:
-        from faninsar.processing.interferometry.pair import goldstein_filter
-
-        filtered = goldstein_filter(merged, alpha=goldstein_alpha)
-
-    assert first_state is not None
-    result = ProductionPairState(
-        pair_id=f"{first_state.pair_id.split('_swath')[0]}_frame",
-        reference=first_state.reference,
-        secondary=first_state.secondary,
-        dem=first_state.dem,
-        coregistration_grid="radar",
-        dem_id=first_state.dem_id,
-        coreg_executor=str(executor),
-        coreg_device=str(device),
-        multilook=multilook,
-        goldstein_alpha=float(goldstein_alpha),
-        unwrap_method="snaphu",
-        complex_ifg=merged,
-        complex_ifg_flat=filtered,
-        coherence=merged_coh,
-        wrapped_phase=wrapped,
-        stage_timings_s={
-            "total": time.perf_counter() - total_started,
-            "per_swath": per_swath_timings,
-        },
-    )
-    result.note(
-        f"FULL FRAME swaths={swaths} merged={merged.shape} "
-        f"multilook={multilook} valid={float((~invalid).mean()):.3f}"
-    )
-    result.unwrapped_phase = np.zeros_like(wrapped, dtype=np.float32)
-    result.connected_components = np.zeros_like(wrapped, dtype=np.uint8)
-    result.note("UNWRAP skipped: full-frame mode emits wrapped radar products only")
+        result.note("UNWRAP complete on merged product")
+    else:
+        result.unwrapped_phase = np.zeros_like(wrapped, dtype=np.float32)
+        result.connected_components = np.zeros_like(wrapped, dtype=np.uint8)
+        result.note("UNWRAP skipped (unwrap=False)")
     stage_write(result, output_dir)
     return result

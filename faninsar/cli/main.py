@@ -39,9 +39,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Warmup profile name (e.g. sentinel1, sentinel1-cuda)",
     )
 
-    frame = sub.add_parser("frame", help="Process a full multi-swath frame")
-    frame.add_argument("--reference", required=True, help="Reference SAFE product")
-    frame.add_argument("--secondary", required=True, help="Secondary SAFE product")
+    frame = sub.add_parser(
+        "frame", help="Process one or more frames, sub-swaths, or an ROI"
+    )
+    frame.add_argument(
+        "--reference",
+        required=True,
+        help="Reference SAFE product(s), comma-separated for multiple frames",
+    )
+    frame.add_argument(
+        "--secondary",
+        required=True,
+        help="Secondary SAFE product(s), comma-separated for multiple frames",
+    )
     frame.add_argument("--output", required=True, help="Output directory")
     frame.add_argument("--dem", default=None, help="DEM GeoTIFF (optional)")
     frame.add_argument("--reference-orbit", default=None, help="Reference POEORB EOF")
@@ -54,11 +64,16 @@ def main(argv: list[str] | None = None) -> int:
     frame.add_argument(
         "--bursts",
         default=None,
-        help="Burst subset per swath, e.g. IW1:0,1,2,IW2:0",
+        help="Burst subset per swath, e.g. IW1:0,1,2,IW2:2:5,IW3:all",
     )
     frame.add_argument("--az-looks", type=int, default=2, help="Azimuth looks")
     frame.add_argument("--rg-looks", type=int, default=10, help="Range looks")
     frame.add_argument("--goldstein", type=float, default=0.5, help="Goldstein alpha")
+    frame.add_argument(
+        "--roi",
+        default=None,
+        help="lon_min,lat_min,lon_max,lat_max in EPSG:4326 (selects bursts)",
+    )
     frame.add_argument(
         "--device",
         default="cpu",
@@ -86,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
             secondary_orbit=args.secondary_orbit,
             swaths=args.swaths,
             bursts=args.bursts,
+            roi=args.roi,
             az_looks=args.az_looks,
             rg_looks=args.rg_looks,
             goldstein=args.goldstein,

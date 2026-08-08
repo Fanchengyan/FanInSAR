@@ -14,7 +14,7 @@ from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.pipeline import (
     ProductionPairState,
     load_production_scene,
-    run_production_pair,
+    run_pair,
     stage_coregister,
     stage_deramp,
     stage_flatten,
@@ -29,7 +29,26 @@ from faninsar.processing.tops.deramp import TOPSCarrierModel
 from faninsar.processing.unwrap import SnaphuConfig
 
 SLC_ROOT = Path("/Volumes/DATA2/TEST_sentinel-1/sentinel-slc")
+SLC_ROOT_RAW = Path("/Volumes/DATA2/TEST_sentinel-1/Raw Data/sentinel-slc")
 SCENES = sorted(SLC_ROOT.glob("S1A_IW_SLC*.zip")) if SLC_ROOT.exists() else []
+if not SCENES and SLC_ROOT_RAW.exists():
+    SCENES = sorted(SLC_ROOT_RAW.glob("S1A_IW_SLC*.zip"))
+
+
+def _first_common_pair() -> tuple[Path, Path] | None:
+    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.pipeline.production import _common_burst_indices
+
+    for index, reference in enumerate(SCENES):
+        for secondary in SCENES[index + 1 :]:
+            try:
+                ref_swath = open_safe_product(reference).swath("IW1")
+                sec_swath = open_safe_product(secondary).swath("IW1")
+            except Exception:
+                continue
+            if _common_burst_indices(ref_swath, sec_swath):
+                return reference, secondary
+    return None
 
 
 def _make_carrier() -> TOPSCarrierModel:
@@ -631,15 +650,17 @@ def test_load_production_scene_burst() -> None:
 
 @pytest.mark.slow
 @pytest.mark.skipif(len(SCENES) < 2, reason="need two local S1 ZIP scenes")
-def test_run_production_pair_full_burst(tmp_path: Path) -> None:
-    """Full-burst production pair workflow writes products and logs stages."""
-    state = run_production_pair(
-        SCENES[0],
-        SCENES[1],
+def test_run_pair_single_burst(tmp_path: Path) -> None:
+    """Unified pair workflow writes products for an explicit burst selection."""
+    pair = _first_common_pair()
+    assert pair is not None
+    reference, secondary = pair
+    state = run_pair(
+        reference,
+        secondary,
         output_dir=tmp_path / "pair",
-        swath="IW1",
-        scope="burst",
-        burst_index=0,
+        swaths=("IW1",),
+        bursts={"IW1": [0]},
         multilook=(4, 20),
         esd_enabled=True,
         control_spacing=64,
@@ -648,22 +669,17 @@ def test_run_production_pair_full_burst(tmp_path: Path) -> None:
     assert state.zarr_path.exists()
     assert state.stac_path is not None
     assert state.stac_path.exists()
-    assert state.range_shift_px is not None
-    assert state.azimuth_shift_px is not None
+    assert state.complex_ifg is not None
+    assert state.coherence is not None
+    assert state.wrapped_phase is not None
     assert state.unwrapped_phase is not None
     assert state.geocoded is None
     assert state.coregistration_grid == "radar"
 
     log_text = " ".join(state.log)
-    assert "DERAMP" in log_text
-    assert "COREG" in log_text
-    assert "IFG" in log_text
-    assert "FLATTEN" in log_text
+    assert "PAIR" in log_text
     assert "UNWRAP" in log_text
-    assert "BASELINE" in log_text
-    assert "GEO direct" not in log_text
     assert "WRITE" in log_text
-    assert "DONE" in log_text
 
     root = zarr.open_group(str(state.zarr_path), mode="r")
     assert "complex_ifg" in root
