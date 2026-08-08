@@ -3,7 +3,7 @@
 Time-Series Models
 ==================
 
-.. currentmodule:: faninsar.NSBAS.tsmodels
+.. currentmodule:: faninsar.timeseries.models
 
 
 .. autosummary::

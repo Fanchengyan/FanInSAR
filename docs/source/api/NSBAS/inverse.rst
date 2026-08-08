@@ -1,7 +1,7 @@
 Inversion
 =========
 
-.. currentmodule:: faninsar.NSBAS.inversion
+.. currentmodule:: faninsar.timeseries.solver
 
 
 Classes
