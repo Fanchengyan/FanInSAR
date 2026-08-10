@@ -8,7 +8,6 @@ and interferogram formation are separate stages: coreg caches per-date SLCs;
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
@@ -24,8 +23,15 @@ from faninsar.processing.coreg.misreg_network import (
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.config import CoregMode, EsdMethod, StackConfig
+from faninsar.processing.stack.scene_store import (
+    CoregisteredSceneStore,
+    copy_reference_units,
+    form_scene_interferograms,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
     from faninsar.core.acquisition import Acquisition
     from faninsar.core.pairs import Pairs
     from faninsar.processing.geometry.dem import DEMSampler
@@ -361,7 +367,10 @@ class Stack:
             out = self.config.work_dir / "coreg" / date_id
             marker = out / "coreg_done.json"
             if marker.is_file() and not overwrite:
+                CoregisteredSceneStore.open(out / "scenes")
                 self.coreg_paths[date_id] = out
+                if date_id == target_dates[0]:
+                    copy_reference_units(out / "scenes", master_dir / "scenes")
                 continue
             misreg_az = 0.0
             misreg_rg = 0.0
@@ -380,10 +389,13 @@ class Stack:
                 overwrite=overwrite,
                 misreg_az_px=misreg_az,
                 misreg_rg_px=misreg_rg,
+                scene_store_dir=out / "scenes",
                 **self._burst_kwargs(),
             )
             self.pair_states[f"{self.master}_{date_id}"] = state
             self.coreg_paths[date_id] = out
+            if date_id == target_dates[0]:
+                copy_reference_units(out / "scenes", master_dir / "scenes")
             marker.write_text(
                 json.dumps(
                     {
@@ -416,14 +428,13 @@ class Stack:
         output_dir: str | Path | None = None,
         overwrite: bool = False,
     ) -> Self:
-        """Form interferograms from master-aligned pair products.
+        """Form interferograms from persisted master-aligned scene artifacts.
 
-        Reads already-coregistered products by re-running the pair engine with
-        master as reference when needed. Does **not** recompute geometric phase
-        beyond what coreg already applied (InSAR.dev-like).
+        This method deliberately has no SAFE-path or ``run_pair`` fallback.
+        Missing, incomplete, mixed-domain, or multi-unit generations fail
+        closed until the provider supplies a complete scene manifest.
         """
         self._ensure_prepared()
-        from faninsar.processing.pipeline.production import run_pair
 
         use_pairs = pairs or self.pairs
         looks_list = _normalize_multilook(multilook or self.config.multilook)
@@ -436,9 +447,6 @@ class Stack:
             self.config.work_dir / "ifg"
         )
 
-        esd_on = self.config.coreg_mode == "pair"
-        amp_on = self.config.coreg_mode == "pair"
-
         for primary, secondary in _iter_pair_dates(use_pairs):
             if primary not in self.catalog.paths or secondary not in self.catalog.paths:
                 continue
@@ -448,36 +456,51 @@ class Stack:
                 if (sub / "pair.zarr").exists() and not overwrite:
                     self.ifg_dirs.append(sub)
                     continue
-                # Prefer master-centric when one leg is master; else run_pair.
-                ref_id, sec_id = primary, secondary
-                misreg_az = 0.0
-                misreg_rg = 0.0
-                if self.date_misreg is not None and self.config.coreg_mode == "network":
-                    # Relative date constants for non-master pair (approx).
-                    misreg_az = float(
-                        self.date_misreg.azimuth_px.get(sec_id, 0.0)
-                        - self.date_misreg.azimuth_px.get(ref_id, 0.0),
+                if primary not in self.coreg_paths or secondary not in self.coreg_paths:
+                    reject_invalid_state(
+                        "Stack scene generation missing; run coregister_scenes first"
                     )
-                    misreg_rg = float(
-                        self.date_misreg.range_px.get(sec_id, 0.0)
-                        - self.date_misreg.range_px.get(ref_id, 0.0),
-                    )
-                state = run_pair(
-                    self.catalog.path_for(ref_id),
-                    self.catalog.path_for(sec_id),
-                    output_dir=sub,
-                    multilook=looks,
-                    goldstein_alpha=alpha,
-                    esd_enabled=esd_on and self.config.coreg_mode != "network",
-                    amplitude_refinement_enabled=amp_on
-                    and self.config.coreg_mode != "network",
-                    unwrap=False,
-                    overwrite=overwrite,
-                    misreg_az_px=misreg_az,
-                    misreg_rg_px=misreg_rg,
-                    **self._burst_kwargs(),
+                reference_store = CoregisteredSceneStore.open(
+                    self.coreg_paths[primary] / "scenes"
                 )
-                self.pair_states[f"{ref_id}_{sec_id}"] = state
+                secondary_store = CoregisteredSceneStore.open(
+                    self.coreg_paths[secondary] / "scenes"
+                )
+                if len(reference_store.units) != 1:
+                    reject_invalid_state(
+                        "Stack V1 scene formation requires one complete burst unit"
+                    )
+                outputs = form_scene_interferograms(
+                    reference_store,
+                    secondary_store,
+                    reference_role=(
+                        "reference" if primary == self.master else "secondary"
+                    ),
+                    secondary_role=(
+                        "reference" if secondary == self.master else "secondary"
+                    ),
+                )
+                sub.mkdir(parents=True, exist_ok=True)
+                for tag, ifg in outputs.items():
+                    ifg.astype(np.complex64, copy=False).tofile(
+                        sub / f"{tag}.complex64"
+                    )
+                metadata = {
+                    "schema_version": "stack_ifg_v1",
+                    "primary": primary,
+                    "secondary": secondary,
+                    "master": self.master,
+                    "domain": self.config.coregistration_grid,
+                    "multilook": [az_l, rg_l],
+                    "goldstein_alpha": alpha,
+                    "source_scene_manifest_digests": [
+                        reference_store.manifest_digest,
+                        secondary_store.manifest_digest,
+                    ],
+                }
+                (sub / "result.json").write_text(
+                    json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+                )
                 self.ifg_dirs.append(sub)
         return self
 

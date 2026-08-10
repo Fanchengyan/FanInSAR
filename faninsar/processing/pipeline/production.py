@@ -1025,6 +1025,9 @@ def stage_coregister(
         Disabled by default because a single TOPS burst does not provide the
         overlap constraints needed to distinguish a true residual from burst
         envelope structure.
+    misreg_az_px, misreg_rg_px : float, optional
+        External azimuth and range residual corrections applied to the
+        prepared offset field.
     executor : {"torch"}, optional
         Unified Torch Lanczos path for the final resample.
     device : {"auto","cpu","cuda"}, optional
@@ -2652,6 +2655,7 @@ def run_pair(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
@@ -2688,6 +2692,7 @@ def run_pair(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
@@ -2725,6 +2730,7 @@ def run_pair(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
@@ -2794,6 +2800,9 @@ def run_pair(
     geo_work_dir : path, optional
         Working directory for geo memmaps; a temporary directory is used
         when omitted.
+    scene_store_dir : path, optional
+        Caller-owned directory for immutable master-aligned scene units. This
+        exact-reuse seam is supported by the direct radar Pair path only.
     n_jobs : int, optional
         Number of parallel burst workers (default 1; applies to radar mode
         with an ROI and to geo mode).
@@ -2823,6 +2832,10 @@ def run_pair(
 
     """
     if not _is_multilook_pair(multilook) or coregistration_grid == "geo":
+        if scene_store_dir is not None:
+            reject_invalid_state(
+                "scene_store_dir requires the direct radar Pair path in v1"
+            )
         return _run_pair_sweep(
             reference_path,
             secondary_path,
@@ -3174,6 +3187,20 @@ def run_pair(
                 burst_row0, burst_col0 = state.radar_roi_origin
             assert state.reference_deramped is not None
             assert state.secondary_aligned is not None
+            if scene_store_dir is not None:
+                from faninsar.processing.stack.scene_store import write_scene_unit
+
+                write_scene_unit(
+                    scene_store_dir,
+                    date_id=_scene_id(sec_paths[0]),
+                    master_id=_scene_id(ref_paths[0]),
+                    domain="radar",
+                    tag=tag,
+                    reference=np.asarray(state.reference_deramped, dtype=np.complex64),
+                    secondary=np.asarray(state.secondary_aligned, dtype=np.complex64),
+                    row_origin=burst_row0,
+                    col_origin=burst_col0,
+                )
             pri_power = (
                 state.reference_deramped.real**2 + state.reference_deramped.imag**2
             )
