@@ -4,15 +4,20 @@ from __future__ import annotations
 
 from faninsar.processing.contracts.ifg import Interferogram, InterferogramStack
 from faninsar.processing.contracts.prepared_geometry import (
+    ActivationToken,
     AppliedSolution,
     CoregistrationPolicy,
     GeometricPhase,
     PairResidualSolution,
     PhaseCarrier,
     PhaseState,
+    PreparedGeometryArrayPayload,
     PreparedGeometryProvider,
     PreparedIdentity,
+    PreparedLutArrayPayload,
+    PreparedLutHandle,
     ProviderLeaseToken,
+    ProviderQualificationReceipt,
     ResidualObservation,
     ResidualSolution,
     ResidualStatus,
@@ -20,6 +25,9 @@ from faninsar.processing.contracts.prepared_geometry import (
     SceneViewRequest,
     SourceDescriptor,
     SourceRole,
+    StackActivationBinding,
+    WorkerAttestation,
+    geo_grid_identity,
     get_neutral_identity_projector,
 )
 from faninsar.processing.contracts.products import (
@@ -41,6 +49,7 @@ from faninsar.processing.contracts.stage import Stage, StageNode
 from faninsar.processing.contracts.tokens import ArrayToken, assert_token
 
 __all__ = [
+    "ActivationToken",
     "AppliedSolution",
     "ArrayDescriptor",
     "ArrayRepresentation",
@@ -60,9 +69,13 @@ __all__ = [
     "PairResidualSolution",
     "PhaseCarrier",
     "PhaseState",
+    "PreparedGeometryArrayPayload",
     "PreparedGeometryProvider",
     "PreparedIdentity",
+    "PreparedLutArrayPayload",
+    "PreparedLutHandle",
     "ProviderLeaseToken",
+    "ProviderQualificationReceipt",
     "ResidualObservation",
     "ResidualSolution",
     "ResidualStatus",
@@ -71,10 +84,13 @@ __all__ = [
     "SceneViewRequest",
     "SourceDescriptor",
     "SourceRole",
+    "StackActivationBinding",
     "StackProduct",
     "Stage",
     "StageNode",
     "UnwrapResult",
+    "WorkerAttestation",
     "assert_token",
+    "geo_grid_identity",
     "get_neutral_identity_projector",
 ]

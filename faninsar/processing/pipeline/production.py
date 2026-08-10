@@ -7,7 +7,7 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -71,6 +71,11 @@ if TYPE_CHECKING:
 
     from faninsar.missions.sentinel1.io import BurstArray
     from faninsar.missions.sentinel1.types import S1Burst, S1Product, S1Swath
+    from faninsar.processing.contracts.prepared_geometry import (
+        PreparedLutHandle,
+        ProviderLeaseToken,
+        ResourceLimits,
+    )
     from faninsar.processing.coreg.offsets import OffsetFieldResult
     from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.memory import MemoryWatchdog
@@ -337,6 +342,14 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         ``{"unit": unit_or_None, "stage_times": dict}``.
 
     """
+    if bool(task.get("require_worker_bootstrap")) and os.environ.get(
+        "FANINSAR_WORKER_BOOTSTRAPPED"
+    ) != "1":
+        reject_invalid_state(
+            "resource-gated burst worker was started without numerical "
+            "runtime bootstrap"
+        )
+
     from dataclasses import replace as _replace
 
     from faninsar.missions.sentinel1 import read_eof_orbit, read_full_burst
@@ -358,6 +371,14 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     amplitude_refinement_enabled = bool(task["amplitude_refinement_enabled"])
     misreg_az_px = float(task.get("misreg_az_px", 0.0))
     misreg_rg_px = float(task.get("misreg_rg_px", 0.0))
+    force_amp_rg = task.get("force_amplitude_residual_rg")
+    force_esd_az = task.get("force_esd_azimuth_shift_px")
+    force_amplitude_residual_rg = (
+        float(force_amp_rg) if force_amp_rg is not None else None
+    )
+    force_esd_azimuth_shift_px = (
+        float(force_esd_az) if force_esd_az is not None else None
+    )
     executor = str(task["executor"])
     device = str(task["device"])
     dead_pixel_amp_threshold = float(task["dead_pixel_amp_threshold"])
@@ -369,6 +390,43 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     ifg_dir = Path(task["ifg_dir"])
     dem = task["dem"]
     geo_work_dir = task["geo_work_dir"]
+    scene_store_dir = task.get("scene_store_dir")
+    prepared_lut_handle = task.get("prepared_geo_lut_handle")
+    prepared_provider_token = task.get("prepared_provider_token")
+    prepared_provider_root = task.get("prepared_provider_root")
+    prepared_resource_limits = task.get("resource_limits")
+    prepared_values = (
+        prepared_lut_handle,
+        prepared_provider_token,
+        prepared_provider_root,
+    )
+    if any(value is not None for value in prepared_values) and not all(
+        value is not None for value in prepared_values
+    ):
+        reject_invalid_state(
+            "prepared Geo LUT worker inputs must include handle, lease token, "
+            "and provider root"
+        )
+    prepared_geo_lut: Geo2RdrLUT | None = None
+    if prepared_lut_handle is not None:
+        from faninsar.processing.contracts.prepared_geometry import (
+            ProviderLeaseToken as _ProviderLeaseToken,
+        )
+
+        if coregistration_grid != "geo":
+            reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
+        if not isinstance(prepared_provider_token, _ProviderLeaseToken):
+            reject_invalid_state("prepared Geo LUT worker lease token is invalid")
+        provider = _worker_prepared_provider(
+            prepared_provider_root,
+            prepared_provider_token,
+            prepared_resource_limits,
+        )
+        prepared_geo_lut = read_prepared_lut(
+            provider,
+            prepared_lut_handle,
+            prepared_provider_token,
+        )
 
     ref_product = open_safe_product(ref_path)
     sec_product = open_safe_product(sec_path)
@@ -409,7 +467,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         reference=ref,
         secondary=sec,
         dem=dem,
-        coregistration_grid="radar",
+        coregistration_grid=coregistration_grid,
         multilook=(1, 1),
         goldstein_alpha=0.0,
         unwrap_method="snaphu",
@@ -439,6 +497,8 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         amplitude_refinement_enabled=amplitude_refinement_enabled,
         misreg_az_px=misreg_az_px,
         misreg_rg_px=misreg_rg_px,
+        force_amplitude_residual_rg=force_amplitude_residual_rg,
+        force_esd_azimuth_shift_px=force_esd_azimuth_shift_px,
         executor=executor,
         device=device,
         coregistration_grid=coregistration_grid,
@@ -449,18 +509,42 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         roi=roi,
         roi_buffer_m=roi_buffer_m,
         roi_window=roi_window,
+        prepared_geo_lut=prepared_geo_lut,
     )
     stage_times["coregister"] = time.perf_counter() - t0
     burst_row0 = 0
     burst_col0 = 0
     geo_valid_mask: np.ndarray | None = None
     if coregistration_grid == "geo":
-        if state.geocoded_slc_valid is not None:
-            geo_valid_mask = np.asarray(state.geocoded_slc_valid)
+        # ``stage_interferogram`` releases the disk-backed geographic
+        # validity map after forming the IFG.  Keep an owning copy here;
+        # retaining a memmap view would leave this worker writing through an
+        # unmapped address during the archive crop.
+        geo_valid_mask = _own_geo_valid_mask(state.geocoded_slc_valid)
     elif state.radar_roi_origin is not None:
         burst_row0, burst_col0 = state.radar_roi_origin
     assert state.reference_deramped is not None
     assert state.secondary_aligned is not None
+    if scene_store_dir is not None:
+        from faninsar.processing.stack.scene_store import write_scene_unit
+
+        if coregistration_grid == "geo":
+            row_origin = state.geo_bbox[0] if state.geo_bbox is not None else 0
+            col_origin = state.geo_bbox[2] if state.geo_bbox is not None else 0
+        else:
+            row_origin = burst_row0
+            col_origin = burst_col0
+        write_scene_unit(
+            scene_store_dir,
+            date_id=_scene_id(sec_path),
+            master_id=_scene_id(ref_path),
+            domain=str(coregistration_grid),
+            tag=tag,
+            reference=np.asarray(state.reference_deramped, dtype=np.complex64),
+            secondary=np.asarray(state.secondary_aligned, dtype=np.complex64),
+            row_origin=row_origin,
+            col_origin=col_origin,
+        )
     pri_power = state.reference_deramped.real**2 + state.reference_deramped.imag**2
     sec_power = state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
     t0 = time.perf_counter()
@@ -569,6 +653,16 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
             "burst_row0": burst_row0,
             "burst_col0": burst_col0,
         }
+    # Carry the observation across the worker/archive boundary.  Geo sweep
+    # results are rebuilt from flat IFG units, so dropping these fields here
+    # would make network arcs appear to have zero Ampcor/ESD correction.
+    for name in (
+        "range_shift_px",
+        "azimuth_shift_px",
+        "esd_azimuth_shift_px",
+        "amplitude_residual_rg_px",
+    ):
+        unit[name] = getattr(state, name)
     logger.info("Archived %s into sweep prefix", tag)
     return {"unit": unit, "stage_times": stage_times}
 
@@ -655,6 +749,257 @@ class ProductionScene:
     geometry: RadarGeometryModel
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedGeometryField:
+    """Exact dense geometry result reusable by a later product pass.
+
+    The field is captured after the existing ``dense_geometry_offsets`` call
+    and carries the crop origin that was used for its geometry models.  Reuse
+    therefore bypasses only the repeated solver call; residual addition,
+    Lanczos resampling, phase handling, and all dtypes remain unchanged.
+    """
+
+    field: OffsetFieldResult
+    source_shape: tuple[int, int]
+    crop_bounds: tuple[int, int, int, int]
+    control_spacing: int
+
+    def __post_init__(self) -> None:
+        """Validate that the prepared field covers its declared crop."""
+        if len(self.source_shape) != 2 or any(size <= 0 for size in self.source_shape):
+            reject_invalid_state("prepared geometry source shape must be positive")
+        if len(self.crop_bounds) != 4 or any(value < 0 for value in self.crop_bounds):
+            reject_invalid_state("prepared geometry crop bounds are invalid")
+        row0, row1, col0, col1 = self.crop_bounds
+        if not (row0 < row1 <= self.source_shape[0]):
+            reject_invalid_state("prepared geometry row crop is outside the source")
+        if not (col0 < col1 <= self.source_shape[1]):
+            reject_invalid_state("prepared geometry column crop is outside the source")
+        expected_shape = (row1 - row0, col1 - col0)
+        if any(
+            array.shape != expected_shape
+            for array in (
+                self.field.range_offset_px,
+                self.field.azimuth_offset_px,
+                self.field.coverage,
+                self.field.uncertainty_px,
+            )
+        ):
+            reject_invalid_state(
+                "prepared geometry field shape does not match its crop"
+            )
+        if (
+            self.field.range_offset_px.dtype != np.float32
+            or self.field.azimuth_offset_px.dtype != np.float32
+            or self.field.uncertainty_px.dtype != np.float32
+            or self.field.coverage.dtype != bool
+        ):
+            reject_invalid_state("prepared geometry field dtypes are not canonical")
+        if self.control_spacing < 1:
+            reject_invalid_state("prepared geometry control spacing must be positive")
+
+
+def read_prepared_geometry_field(
+    provider: object,
+    geometry_handle: object,
+    token: object,
+) -> PreparedGeometryField:
+    """Read and validate one provider-bound geometry field for production.
+
+    The provider owns generation pinning, payload hashes, and NumPy decoding;
+    this adapter only maps its validated read-only arrays into the production
+    ``OffsetFieldResult`` consumed by :func:`stage_coregister`.  It deliberately
+    does not accept raw paths or caller-supplied shapes.
+
+    Parameters
+    ----------
+    provider : object
+        Provider implementing ``read_prepared_geometry(handle, token)``.
+    geometry_handle : object
+        Capability-bound geometry handle returned by the provider.
+    token : object
+        Live provider lease token.
+
+    Returns
+    -------
+    PreparedGeometryField
+        Validated, immutable dense geometry field for a later product pass.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the provider does not expose the read seam or returns an invalid
+        payload record.
+
+    """
+    reader = getattr(provider, "read_prepared_geometry", None)
+    if not callable(reader):
+        reject_invalid_state(
+            "prepared provider does not expose read_prepared_geometry"
+        )
+    from faninsar.processing.contracts.prepared_geometry import (
+        PreparedGeometryArrayPayload,
+    )
+
+    payload = reader(geometry_handle, token)
+    if not isinstance(payload, PreparedGeometryArrayPayload):
+        reject_invalid_state(
+            "prepared provider returned an invalid geometry payload record"
+        )
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+
+    return PreparedGeometryField(
+        field=OffsetFieldResult(
+            range_offset_px=payload.range_offset_px,
+            azimuth_offset_px=payload.azimuth_offset_px,
+            coverage=payload.coverage,
+            uncertainty_px=payload.uncertainty_px,
+        ),
+        source_shape=payload.source_shape,
+        crop_bounds=payload.crop_bounds,
+        control_spacing=payload.control_spacing,
+    )
+
+
+def read_prepared_lut(
+    provider: object,
+    lut_handle: object,
+    token: object,
+) -> Geo2RdrLUT:
+    """Read one provider-owned LUT without reopening a raw memmap path.
+
+    Parameters
+    ----------
+    provider : object
+        Provider implementing ``read_prepared_lut(handle, token)``.
+    lut_handle : object
+        Capability-bound LUT handle returned by the provider.
+    token : object
+        Live provider lease token.
+
+    Returns
+    -------
+    Geo2RdrLUT
+        Immutable-array LUT with the provider's explicit crop origin and
+        full radar shape.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the provider does not expose the read seam or returns an invalid
+        payload record.
+
+    """
+    reader = getattr(provider, "read_prepared_lut", None)
+    if not callable(reader):
+        reject_invalid_state("prepared provider does not expose read_prepared_lut")
+    from faninsar.processing.contracts.prepared_geometry import (
+        PreparedLutArrayPayload,
+    )
+
+    payload = reader(lut_handle, token)
+    if not isinstance(payload, PreparedLutArrayPayload):
+        reject_invalid_state("prepared provider returned an invalid LUT payload")
+    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+
+    row0, _, col0, _ = payload.crop_bounds
+    return Geo2RdrLUT(
+        az_full=payload.az_full,
+        rg_full=payload.rg_full,
+        valid=payload.valid,
+        full_radar_shape=payload.full_radar_shape,
+        height_m=payload.height_m,
+        height_full=payload.height_full,
+        row0=row0,
+        col0=col0,
+    )
+
+
+def _worker_prepared_provider(
+    root: str | Path,
+    token: ProviderLeaseToken,
+    resource_limits: ResourceLimits | None,
+) -> object:
+    """Attach a worker-local provider to an already pinned generation.
+
+    Prepared generations are owned and pinned by the parent process.  A
+    spawned worker therefore receives only the serializable store root and
+    lease capability, then asks the provider adapter to attach that lease to
+    its own read registry.  The compatibility fallback supports providers
+    exposing the instance-level ``attach_worker_lease`` seam while the
+    class-level ``from_worker_generation`` adapter is deployed.
+
+    Parameters
+    ----------
+    root : str or pathlib.Path
+        Provider-owned prepared-generation store root.
+    token : ProviderLeaseToken
+        Serialized capability for the pinned generation.
+    resource_limits : ResourceLimits or None
+        Authenticated limits bound to the token, when available.
+
+    Returns
+    -------
+    object
+        Provider adapter suitable for :func:`read_prepared_lut`.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If no worker attach seam is exposed by the provider.
+
+    """
+    from faninsar.processing.geometry.prepared_provider import (
+        LocalPreparedGeometryProvider,
+    )
+
+    factory = getattr(LocalPreparedGeometryProvider, "from_worker_generation", None)
+    if callable(factory):
+        if resource_limits is None:
+            reject_invalid_state(
+                "prepared LUT worker attachment requires resource_limits"
+            )
+        return factory(Path(root), token, resource_limits)
+
+    # This branch is intentionally narrow: it remains useful for a provider
+    # implementation that has landed the instance seam but not the factory.
+    def callback(**_kwargs: object) -> object:
+        """Reject accidental worker-side publication attempts."""
+        reject_invalid_state("worker prepared provider cannot publish generations")
+
+    provider = LocalPreparedGeometryProvider(Path(root), callback)
+    attach = getattr(provider, "attach_worker_lease", None)
+    if not callable(attach):
+        reject_invalid_state(
+            "prepared provider does not expose a worker generation attach seam"
+        )
+    if resource_limits is None:
+        reject_invalid_state(
+            "prepared LUT worker attachment requires resource_limits"
+        )
+    attach(token, resource_limits)
+    return provider
+
+
+def _own_geo_valid_mask(array: np.ndarray | None) -> np.ndarray | None:
+    """Copy a geographic validity map before its backing memmap is released.
+
+    Parameters
+    ----------
+    array : numpy.ndarray or None
+        Validity map that may be a disk-backed ``numpy.memmap``.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        Owning boolean array safe to use after the source mapping is closed.
+
+    """
+    if array is None:
+        return None
+    return np.array(array, dtype=bool, copy=True)
+
+
 @dataclass
 class ProductionPairState:
     """Mutable state for the production pair workflow with stage log."""
@@ -668,6 +1013,7 @@ class ProductionPairState:
     range_shift_px: float | None = None
     azimuth_shift_px: float | None = None
     esd_azimuth_shift_px: float | None = None
+    amplitude_residual_rg_px: float | None = None
     secondary_aligned: np.ndarray | None = None
     secondary_aligned_is_flattened: bool = False
     range_offset_flatten_phase: np.ndarray | None = None
@@ -703,6 +1049,7 @@ class ProductionPairState:
     memory_watchdog: MemoryWatchdog | None = None
     geo_bbox: tuple[int, int, int, int] | None = None
     radar_roi_origin: tuple[int, int] | None = None
+    prepared_geometry_field: PreparedGeometryField | None = None
 
     def note(self, message: str) -> None:
         """Append a stage log line."""
@@ -988,6 +1335,9 @@ def stage_coregister(
     amplitude_refinement_enabled: bool = False,
     misreg_az_px: float = 0.0,
     misreg_rg_px: float = 0.0,
+    force_amplitude_residual_rg: float | None = None,
+    force_esd_azimuth_shift_px: float | None = None,
+    residuals_only: bool = False,
     executor: str = "torch",
     device: str = "auto",
     coregistration_grid: CoregistrationGrid = "radar",
@@ -999,6 +1349,8 @@ def stage_coregister(
     roi_buffer_m: float = 320.0,
     roi_window: tuple[int, int, int, int] | None = None,
     memory_watchdog: MemoryWatchdog | None = None,
+    prepared_geometry_field: PreparedGeometryField | None = None,
+    prepared_geo_lut: Geo2RdrLUT | None = None,
 ) -> ProductionPairState:
     """Estimate dense offsets and coregister on a radar or geographic grid.
 
@@ -1015,16 +1367,26 @@ def stage_coregister(
     state : ProductionPairState
         Mutable pair workflow state (requires deramp outputs).
     control_spacing : int, optional
-        Stride between geometry control points. Defaults to 8 pixels on the
-        radar grid for phase-accurate flattening and 64 on the geographic
-        grid.
+        Stride between geometry control points on the **radar** deramped grid
+        (PROPOSAL-0017: residual / dense geometry is always measured in radar,
+        independent of ``coregistration_grid``). Default **8** for both radar
+        and geo product modes so the offset field density matches.
     esd_enabled : bool, optional
         Run ESD azimuth residual estimation. Default False.
     amplitude_refinement_enabled : bool, optional
-        Refine the geometry offsets with a global amplitude-correlation shift.
-        Disabled by default because a single TOPS burst does not provide the
-        overlap constraints needed to distinguish a true residual from burst
-        envelope structure.
+        Refine geometry offsets with multi-window magnitude Ampcor (ISCE2
+        topsApp ``runRangeCoreg`` style). On TOPS, only the **range** residual
+        is applied; azimuth residual comes from ESD (``runESD``), matching
+        ISCE2. Disabled by default; pair/network modes enable it.
+    force_amplitude_residual_rg : float or None, optional
+        When set, skip Ampcor measurement and apply this range residual
+        (ISCE2-style common residual shared across all bursts of a pair).
+    force_esd_azimuth_shift_px : float or None, optional
+        When set, skip ESD measurement and apply this azimuth residual
+        (common residual for multi-burst pairs).
+    residuals_only : bool, optional
+        When True, measure Ampcor/ESD residuals and return without final
+        SLC resampling (used for multi-burst residual consensus).
     misreg_az_px, misreg_rg_px : float, optional
         External azimuth and range residual corrections applied to the
         prepared offset field.
@@ -1053,6 +1415,16 @@ def stage_coregister(
         full burst (radar mode with an ROI).
     memory_watchdog : MemoryWatchdog, optional
         Memory guard sampled after each geographic tile.
+    prepared_geometry_field : PreparedGeometryField, optional
+        A field captured by a preceding residual-measurement pass.  When
+        supplied, the exact field/crop is reused and no geometry solve or
+        local hole-fill is performed.  Ampcor/ESD must be supplied through
+        the existing ``force_*`` arguments for exactly-once residual use.
+    prepared_geo_lut : Geo2RdrLUT, optional
+        A provider-owned, read-only LUT captured for the exact geographic
+        grid/view.  When supplied in geo mode, LUT construction and all
+        footprint/ROI recomputation are skipped; its explicit crop origin is
+        used for every downstream remap and topographic-phase tile.
 
     """
     if state.reference_deramped is None or state.secondary_deramped is None:
@@ -1071,14 +1443,33 @@ def stage_coregister(
         state.secondary_deramped = sec
         state.note(f"COREG cropped both scenes to common shape {(h, w)}")
 
+    if prepared_geometry_field is not None:
+        if coregistration_grid != "radar":
+            reject_invalid_state(
+                "prepared geometry reuse requires a provider-bound Geo LUT/view "
+                "for non-radar products"
+            )
+        if prepared_geometry_field.source_shape != ref.shape:
+            reject_invalid_state(
+                "prepared geometry source shape does not match the product pair"
+            )
+        if amplitude_refinement_enabled and force_amplitude_residual_rg is None:
+            reject_invalid_state(
+                "prepared geometry reuse requires a forced Ampcor range residual"
+            )
+        if esd_enabled and force_esd_azimuth_shift_px is None:
+            reject_invalid_state(
+                "prepared geometry reuse requires a forced ESD azimuth residual"
+            )
+    if prepared_geo_lut is not None and coregistration_grid != "geo":
+        reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
+
     dem = state.dem
-    resolved_control_spacing = (
-        8
-        if control_spacing is None and coregistration_grid == "radar"
-        else 64
-        if control_spacing is None
-        else control_spacing
-    )
+    # Dense geometry + Ampcor/ESD always run on radar deramped samples. Product
+    # grid (radar vs geo) only changes how those offsets are *applied*. Keep the
+    # same default stride for both so geo does not silently use an 8x coarser
+    # offset field than radar.
+    resolved_control_spacing = 8 if control_spacing is None else control_spacing
     if resolved_control_spacing < 1:
         reject_invalid_state("control_spacing must be >= 1")
     window: tuple[int, int, int, int] | None = (
@@ -1105,6 +1496,15 @@ def stage_coregister(
     ref_full = ref
     sec_full = sec
     growth_attempts = 0
+    if prepared_geometry_field is not None:
+        cr0, cr1, cc0, cc1 = prepared_geometry_field.crop_bounds
+        ref = ref_full[cr0:cr1, cc0:cc1]
+        sec = sec_full[cr0:cr1, cc0:cc1]
+        window = None
+        window_origin = (cr0, cc0)
+        state.reference_deramped = ref
+        state.secondary_deramped = sec
+        state.radar_roi_origin = window_origin
     while True:
         if window is not None:
             crop_bounds = _window_crop_bounds(
@@ -1121,18 +1521,22 @@ def stage_coregister(
             state.secondary_deramped = sec
             state.radar_roi_origin = window_origin
         substage_started = time.perf_counter()
-        geometry_field = dense_geometry_offsets(
-            shape=ref.shape,
-            reference_model=state.reference.geometry,
-            secondary_model=state.secondary.geometry,
-            dem=dem,
-            stride=resolved_control_spacing,
-            row0=0 if window_origin is None else window_origin[0],
-            col0=0 if window_origin is None else window_origin[1],
-        )
-        state.coregistration_timings_s["dense_geometry_offsets"] = (
-            time.perf_counter() - substage_started
-        )
+        if prepared_geometry_field is None:
+            geometry_field = dense_geometry_offsets(
+                shape=ref.shape,
+                reference_model=state.reference.geometry,
+                secondary_model=state.secondary.geometry,
+                dem=dem,
+                stride=resolved_control_spacing,
+                row0=0 if window_origin is None else window_origin[0],
+                col0=0 if window_origin is None else window_origin[1],
+            )
+            state.coregistration_timings_s["dense_geometry_offsets"] = (
+                time.perf_counter() - substage_started
+            )
+        else:
+            geometry_field = prepared_geometry_field.field
+            state.coregistration_timings_s["dense_geometry_offsets_reused"] = 0.0
 
         prior_rg = float(
             np.nanmedian(geometry_field.range_offset_px[geometry_field.coverage])
@@ -1142,10 +1546,20 @@ def stage_coregister(
         )
         amp_res_rg = 0.0
         amp_res_az = 0.0
+        amp_az_measured = 0.0
         esd_az = 0.0
         # Residual measure is always on radar deramped samples (PROPOSAL-0017);
         # independent of final product grid (radar vs geo).
-        if amplitude_refinement_enabled and np.isfinite(prior_rg) and np.isfinite(
+        # Multi-burst pairs pass force_* so every burst shares one residual
+        # (ISCE2 secondaryRangeCorrection / secondaryAzimuthCorrection style);
+        # per-burst residuals create constant phase jumps at burst seams.
+        if force_amplitude_residual_rg is not None:
+            amp_res_rg = float(force_amplitude_residual_rg)
+            amp_res_az = 0.0
+            state.note(
+                f"Ampcor residual rg={amp_res_rg:.4f} px (forced common residual)"
+            )
+        elif amplitude_refinement_enabled and np.isfinite(prior_rg) and np.isfinite(
             prior_az
         ):
             amp_rg, amp_az = refine_shift_with_correlation(
@@ -1153,18 +1567,32 @@ def stage_coregister(
                 sec,
                 prior_rg=prior_rg,
                 prior_az=prior_az,
-                search_radius=32,
+                search_radius=16,
             )
             if np.isfinite(amp_rg) and np.isfinite(amp_az):
                 amp_res_rg = amp_rg - prior_rg
-                amp_res_az = amp_az - prior_az
+                amp_az_measured = amp_az - prior_az
+                # TOPS (ISCE2 topsApp): Ampcor residual is applied in range only.
+                # Azimuth residual is estimated by ESD on burst spectral diversity;
+                # applying magnitude-match azimuth on a full burst injects envelope
+                # bias (~0.4 px) and N-S residual fringes.
+                amp_res_az = 0.0
+                state.note(
+                    f"Ampcor residual rg={amp_res_rg:.4f} px "
+                    f"(measured az={amp_az_measured:.4f} px not applied; ESD owns az)"
+                )
             else:
                 state.note("amplitude refinement skipped (non-finite result)")
         elif amplitude_refinement_enabled:
             state.note("amplitude refinement skipped (non-finite geometry prior)")
-        if esd_enabled and np.isfinite(prior_rg) and np.isfinite(prior_az):
+        if force_esd_azimuth_shift_px is not None:
+            esd_az = float(force_esd_azimuth_shift_px)
+            state.esd_azimuth_shift_px = esd_az
+            state.note(f"ESD az={esd_az:.4f} px (forced common residual)")
+        elif esd_enabled and np.isfinite(prior_rg) and np.isfinite(prior_az):
             # Bilinear pre-align is sufficient for ESD spectral estimation and
             # avoids a second full-burst Lanczos pass (~minutes and peak RSS).
+            # Pre-align uses geometry + range Ampcor only (azimuth residual is ESD).
             pre = resample_complex(
                 sec,
                 range_offset_px=geometry_field.range_offset_px + amp_res_rg,
@@ -1177,6 +1605,7 @@ def stage_coregister(
             state.note(f"ESD az={esd_az:.4f} px coherence={esd.coherence:.3f}")
             del pre
             gc.collect()
+        state.amplitude_residual_rg_px = float(amp_res_rg)
 
         offsets = combine_offset_fields(
             geometry_field,
@@ -1186,6 +1615,23 @@ def stage_coregister(
             misreg_az_px=misreg_az_px,
             misreg_rg_px=misreg_rg_px,
         )
+        if residuals_only:
+            crop_bounds_for_field = (
+                (0, ref_full.shape[0], 0, ref_full.shape[1])
+                if window_origin is None
+                else (
+                    window_origin[0],
+                    window_origin[0] + ref.shape[0],
+                    window_origin[1],
+                    window_origin[1] + ref.shape[1],
+                )
+            )
+            state.prepared_geometry_field = PreparedGeometryField(
+                field=geometry_field,
+                source_shape=ref_full.shape,
+                crop_bounds=crop_bounds_for_field,
+                control_spacing=resolved_control_spacing,
+            )
         # Drop geometry-only fields once combined; offsets retains the dense maps.
         del geometry_field
         gc.collect()
@@ -1226,6 +1672,17 @@ def stage_coregister(
         np.nanmedian(offsets.azimuth_offset_px[offsets.coverage])
     )
     coverage = float(np.mean(offsets.coverage))
+    if residuals_only:
+        # Multi-burst residual consensus pass: keep residual diagnostics only.
+        del offsets
+        gc.collect()
+        state.note(
+            f"COREG residuals_only amp_rg={state.amplitude_residual_rg_px} "
+            f"esd_az={state.esd_azimuth_shift_px} "
+            f"median_rg={state.range_shift_px:.3f} "
+            f"median_az={state.azimuth_shift_px:.3f}"
+        )
+        return state
     if coregistration_grid == "geo":
         if geo_grid is None:
             reject_invalid_state("geo coregistration requires geo_grid")
@@ -1243,67 +1700,88 @@ def stage_coregister(
             reject_invalid_state("geo coregistration requires geo_work_dir")
         work_directory = Path(geo_work_dir)
         work_directory.mkdir(parents=True, exist_ok=True)
-        burst_row0, burst_row1, burst_col0, burst_col1 = derive_burst_geo_bbox(
-            geometry=state.reference.geometry,
-            radar_shape=ref.shape,
-            grid=geo_grid,
-            dem=state.dem,
-        )
-        footprint_lonlat: np.ndarray | None = None
-        roi_geometry: object | None = None
-        if roi is not None:
-            from shapely.geometry import MultiPolygon
-            from shapely.geometry import Polygon as ShapelyPolygon
-
-            from faninsar.processing.pipeline.geo_lut import polygon_parts
-
-            burst_quad = burst_geo_quad_lonlat(
+        if prepared_geo_lut is not None:
+            if prepared_geo_lut.full_radar_shape != ref.shape:
+                reject_invalid_state(
+                    "prepared Geo LUT radar shape does not match the product pair"
+                )
+            burst_row0 = int(prepared_geo_lut.row0)
+            burst_col0 = int(prepared_geo_lut.col0)
+            burst_row1 = burst_row0 + prepared_geo_lut.shape[0]
+            burst_col1 = burst_col0 + prepared_geo_lut.shape[1]
+            if burst_row1 > geo_grid.height or burst_col1 > geo_grid.width:
+                reject_invalid_state(
+                    "prepared Geo LUT crop lies outside the requested geo grid"
+                )
+            footprint_lonlat = None
+            roi_geometry = None
+            state.note("COREG reused provider-owned Geo LUT/view")
+        else:
+            burst_row0, burst_row1, burst_col0, burst_col1 = derive_burst_geo_bbox(
                 geometry=state.reference.geometry,
                 radar_shape=ref.shape,
                 dem=state.dem,
+                grid=geo_grid,
             )
-            if burst_quad is not None:
-                intersection = _roi_geometry(roi).intersection(
-                    ShapelyPolygon(burst_quad).buffer(0)
+            footprint_lonlat = None
+            roi_geometry = None
+            if roi is not None:
+                from shapely.geometry import MultiPolygon
+                from shapely.geometry import Polygon as ShapelyPolygon
+
+                from faninsar.processing.pipeline.geo_lut import polygon_parts
+
+                burst_quad = burst_geo_quad_lonlat(
+                    geometry=state.reference.geometry,
+                    radar_shape=ref.shape,
+                    dem=state.dem,
                 )
-                parts = [
-                    part
-                    for part in polygon_parts(intersection)
-                    if not part.is_empty
-                ]
-                if parts:
-                    roi_polygon = (
-                        parts[0] if len(parts) == 1 else MultiPolygon(parts)
+                if burst_quad is not None:
+                    intersection = _roi_geometry(roi).intersection(
+                        ShapelyPolygon(burst_quad).buffer(0)
                     )
-                    roi_geometry = _buffer_geometry_meters(
-                        roi_polygon,
-                        geo_grid.crs,
-                        roi_buffer_m,
-                    )
-                    burst_row0, burst_row1, burst_col0, burst_col1 = roi_geo_bbox(
-                        roi_geometry,
-                        geo_grid,
-                        margin_px=2,
-                    )
+                    parts = [
+                        part
+                        for part in polygon_parts(intersection)
+                        if not part.is_empty
+                    ]
+                    if parts:
+                        roi_polygon = (
+                            parts[0] if len(parts) == 1 else MultiPolygon(parts)
+                        )
+                        roi_geometry = _buffer_geometry_meters(
+                            roi_polygon,
+                            geo_grid.crs,
+                            roi_buffer_m,
+                        )
+                        burst_row0, burst_row1, burst_col0, burst_col1 = roi_geo_bbox(
+                            roi_geometry,
+                            geo_grid,
+                            margin_px=2,
+                        )
         state.geo_bbox = (burst_row0, burst_row1, burst_col0, burst_col1)
-        substage_started = time.perf_counter()
-        lut = build_geo2rdr_lut(
-            geometry=state.reference.geometry,
-            grid=geo_grid,
-            full_radar_shape=ref.shape,
-            height_m=geo_height_m,
-            dem=state.dem,
-            chunk_size=geo_chunk_size,
-            storage_dir=work_directory / "lut",
-            row_range=(burst_row0, burst_row1),
-            col_range=(burst_col0, burst_col1),
-            footprint_lonlat=footprint_lonlat,
-            roi_geometry=roi_geometry,
-            polygon_dilate_px=2,
-        )
-        state.coregistration_timings_s["geo2rdr_lut"] = (
-            time.perf_counter() - substage_started
-        )
+        if prepared_geo_lut is None:
+            substage_started = time.perf_counter()
+            lut = build_geo2rdr_lut(
+                geometry=state.reference.geometry,
+                grid=geo_grid,
+                full_radar_shape=ref.shape,
+                height_m=geo_height_m,
+                dem=state.dem,
+                chunk_size=geo_chunk_size,
+                storage_dir=work_directory / "lut",
+                row_range=(burst_row0, burst_row1),
+                col_range=(burst_col0, burst_col1),
+                footprint_lonlat=footprint_lonlat,
+                roi_geometry=roi_geometry,
+                polygon_dilate_px=2,
+            )
+            state.coregistration_timings_s["geo2rdr_lut"] = (
+                time.perf_counter() - substage_started
+            )
+        else:
+            lut = prepared_geo_lut
+            state.coregistration_timings_s["geo2rdr_lut_reused"] = 0.0
         substage_started = time.perf_counter()
         reference_geo, secondary_geo, valid = coregister_geocoded_slcs_chunked(
             ref,
@@ -2236,6 +2714,38 @@ def _as_optional_frame_sequence(
     return list(paths)
 
 
+def _snapshot_paths(
+    paths: Sequence[Path],
+    snapshot_root: str | Path,
+) -> list[Path]:
+    """Copy local input paths into one immutable source snapshot root."""
+    from faninsar.processing.source_snapshots import snapshot_local_source
+
+    root = Path(snapshot_root)
+    cache: dict[str, Path] = {}
+    snapshots: list[Path] = []
+    for path in paths:
+        key = str(path.absolute())
+        snapshot = cache.get(key)
+        if snapshot is None:
+            snapshot = snapshot_local_source(path, root).path
+            cache[key] = snapshot
+        snapshots.append(snapshot)
+    return snapshots
+
+
+def _snapshot_optional_paths(
+    paths: Sequence[Path | None],
+    snapshot_root: str | Path,
+) -> list[Path | None]:
+    """Snapshot optional orbit paths while preserving frame cardinality."""
+    present = [path for path in paths if path is not None]
+    if not present:
+        return [None] * len(paths)
+    snapshots = iter(_snapshot_paths(present, snapshot_root))
+    return [next(snapshots) if path is not None else None for path in paths]
+
+
 def _burst_index_list(
     value: list[int] | range | str,
     swath: str,
@@ -2657,6 +3167,13 @@ def run_pair(
     geo_work_dir: str | Path | None = None,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
+    resource_limits: ResourceLimits | None = None,
+    prepared_geo_lut_handles: Mapping[
+        str, tuple[PreparedLutHandle, ProviderLeaseToken]
+    ]
+    | None = None,
+    prepared_provider_root: str | Path | None = None,
+    source_snapshot_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
@@ -2694,6 +3211,13 @@ def run_pair(
     geo_work_dir: str | Path | None = None,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
+    resource_limits: ResourceLimits | None = None,
+    prepared_geo_lut_handles: Mapping[
+        str, tuple[PreparedLutHandle, ProviderLeaseToken]
+    ]
+    | None = None,
+    prepared_provider_root: str | Path | None = None,
+    source_snapshot_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
@@ -2732,6 +3256,13 @@ def run_pair(
     geo_work_dir: str | Path | None = None,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
+    resource_limits: ResourceLimits | None = None,
+    prepared_geo_lut_handles: Mapping[
+        str, tuple[PreparedLutHandle, ProviderLeaseToken]
+    ]
+    | None = None,
+    prepared_provider_root: str | Path | None = None,
+    source_snapshot_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
@@ -2801,11 +3332,29 @@ def run_pair(
         Working directory for geo memmaps; a temporary directory is used
         when omitted.
     scene_store_dir : path, optional
-        Caller-owned directory for immutable master-aligned scene units. This
-        exact-reuse seam is supported by the direct radar Pair path only.
+        Caller-owned directory for immutable master-aligned scene units. Radar
+        and Geo sweep paths support this seam when ``n_jobs=1``; parallel
+        publication is rejected until generation-level locking is enabled.
     n_jobs : int, optional
         Number of parallel burst workers (default 1; applies to radar mode
         with an ROI and to geo mode).
+    resource_limits : ResourceLimits, optional
+        Authenticated finite resource profile.  When supplied, sweep/geo
+        burst execution reserves worker slots and output files before
+        submission and monitors the complete parent-plus-descendant RSS tree
+        at 100 ms.  A missing profile keeps compatibility but is not a
+        qualified resource-gate run.
+    prepared_geo_lut_handles : mapping, optional
+        Per-unit prepared LUT handles and lease tokens keyed by burst task
+        tag.  These are consumed by geographic workers without rebuilding
+        geo2rdr LUTs.
+    prepared_provider_root : path, optional
+        Provider-owned prepared-generation store root used by workers to
+        attach the lease token and read ``prepared_geo_lut_handles``.
+    source_snapshot_root : path, optional
+        Caller-owned private root for immutable local SAFE, orbit, and DEM
+        snapshots.  When supplied, all local source paths are copied and the
+        copied paths—not the original aliases—are used for parsing and reads.
     roi_buffer_m : float, optional
         Physical margin in meters kept around the ROI (default 320).  In geo
         mode it is applied in the grid CRS; in radar mode it is converted to
@@ -2831,11 +3380,14 @@ def run_pair(
         Single-config state, or per-config outcomes for a sweep.
 
     """
+    if (
+        (prepared_geo_lut_handles is not None or prepared_provider_root is not None)
+        and coregistration_grid != "geo"
+    ):
+        reject_invalid_state(
+            "prepared Geo LUT reuse requires geo coregistration"
+        )
     if not _is_multilook_pair(multilook) or coregistration_grid == "geo":
-        if scene_store_dir is not None:
-            reject_invalid_state(
-                "scene_store_dir requires the direct radar Pair path in v1"
-            )
         return _run_pair_sweep(
             reference_path,
             secondary_path,
@@ -2860,7 +3412,12 @@ def run_pair(
             geo_height_m=geo_height_m,
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=geo_work_dir,
+            scene_store_dir=scene_store_dir,
             n_jobs=n_jobs,
+            resource_limits=resource_limits,
+            prepared_geo_lut_handles=prepared_geo_lut_handles,
+            prepared_provider_root=prepared_provider_root,
+            source_snapshot_root=source_snapshot_root,
             roi_buffer_m=roi_buffer_m,
             snaphu_config=snaphu_config,
             unwrap_method=unwrap_method,
@@ -2874,6 +3431,19 @@ def run_pair(
     from faninsar.processing.geometry.egm96 import EGM96Geoid
 
     dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
+    if snapshot_root is not None and isinstance(dem_sampler, RasterDEM):
+        from faninsar.processing.source_snapshots import snapshot_local_source
+
+        dem_snapshot = snapshot_local_source(
+            dem_sampler.path,
+            snapshot_root / "dem",
+        )
+        dem_sampler = RasterDEM(
+            dem_snapshot.path,
+            nodata=dem_sampler.nodata,
+            interpolation=dem_sampler.interpolation,
+        )
     if geoid_correction and isinstance(dem_sampler, RasterDEM):
         dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
@@ -2893,6 +3463,17 @@ def run_pair(
     sec_orbits = _as_optional_frame_sequence(
         secondary_orbit_path, frame_count, "secondary_orbit_path"
     )
+    if snapshot_root is not None:
+        ref_paths = _snapshot_paths(ref_paths, snapshot_root / "safe")
+        sec_paths = _snapshot_paths(sec_paths, snapshot_root / "safe")
+        ref_orbits = _snapshot_optional_paths(
+            ref_orbits,
+            snapshot_root / "orbit",
+        )
+        sec_orbits = _snapshot_optional_paths(
+            sec_orbits,
+            snapshot_root / "orbit",
+        )
 
     reference_products = [open_safe_product(path) for path in ref_paths]
     secondary_products = [open_safe_product(path) for path in sec_paths]
@@ -3123,6 +3704,93 @@ def run_pair(
     per_burst_timings: dict[str, dict[str, float]] = {}
     first_state: ProductionPairState | None = None
     origin_state: ProductionPairState | None = None
+    # ISCE2 applies one secondary range correction and one ESD azimuth
+    # correction to the whole pair. Per-burst Ampcor/ESD residuals create
+    # constant phase jumps at burst seams (visible N-S boundaries).
+    force_amp_rg: float | None = None
+    force_esd_az: float | None = None
+    prepared_geometry_by_tag: dict[str, PreparedGeometryField] = {}
+    if selected_unit_count > 1 and (esd_enabled or amplitude_refinement_enabled):
+        measured_amp: list[float] = []
+        measured_esd: list[float] = []
+        for swath in reversed(swath_tuple):
+            for frame_index, burst_index, _azimuth_offset in units_by_swath[swath]:
+                tag = "f" + str(frame_index) + "_" + swath + "_b" + str(burst_index)
+                ref = load_burst(
+                    swath,
+                    burst_index,
+                    ref_paths[frame_index],
+                    ref_orbits[frame_index],
+                    reference_products[frame_index],
+                )
+                sec = load_burst(
+                    swath,
+                    burst_index,
+                    sec_paths[frame_index],
+                    sec_orbits[frame_index],
+                    secondary_products[frame_index],
+                )
+                measure_state = ProductionPairState(
+                    pair_id=ref.scene_id + "_" + sec.scene_id + "_" + tag,
+                    reference=ref,
+                    secondary=sec,
+                    dem=dem_sampler,
+                    coregistration_grid="radar",
+                    multilook=multilook,
+                    goldstein_alpha=0.0,
+                    unwrap_method="snaphu",
+                )
+                measure_state = stage_deramp(measure_state)
+                roi_window_m: tuple[int, int, int, int] | None = None
+                if roi is not None:
+                    assert measure_state.reference_deramped is not None
+                    roi_window_m = _roi_burst_window(
+                        roi,
+                        ref.geometry,
+                        dem_sampler,
+                        measure_state.reference_deramped.shape,
+                        buffer_m=roi_buffer_m,
+                    )
+                measure_state = stage_coregister(
+                    measure_state,
+                    control_spacing=control_spacing,
+                    esd_enabled=esd_enabled,
+                    amplitude_refinement_enabled=amplitude_refinement_enabled,
+                    misreg_az_px=misreg_az_px,
+                    misreg_rg_px=misreg_rg_px,
+                    residuals_only=True,
+                    executor=executor,
+                    device=device,
+                    roi_window=roi_window_m,
+                )
+                if measure_state.amplitude_residual_rg_px is not None:
+                    measured_amp.append(float(measure_state.amplitude_residual_rg_px))
+                if measure_state.esd_azimuth_shift_px is not None:
+                    measured_esd.append(float(measure_state.esd_azimuth_shift_px))
+                if measure_state.prepared_geometry_field is None:
+                    reject_invalid_state(
+                        f"missing prepared geometry field for measured burst {tag}"
+                    )
+                prepared_geometry_by_tag[tag] = measure_state.prepared_geometry_field
+                del measure_state, ref, sec
+                gc.collect()
+        if amplitude_refinement_enabled and measured_amp:
+            force_amp_rg = float(
+                np.nanmedian(np.asarray(measured_amp, dtype=np.float64))
+            )
+        if esd_enabled and measured_esd:
+            force_esd_az = float(
+                np.nanmedian(np.asarray(measured_esd, dtype=np.float64))
+            )
+        logger.info(
+            "Multi-burst common residual (ISCE2-style) amp_rg=%s esd_az=%s "
+            "from n_amp=%d n_esd=%d burst measures",
+            f"{force_amp_rg:.4f}" if force_amp_rg is not None else "None",
+            f"{force_esd_az:.4f}" if force_esd_az is not None else "None",
+            len(measured_amp),
+            len(measured_esd),
+        )
+
     for swath in reversed(swath_tuple):
         for frame_index, burst_index, azimuth_offset in units_by_swath[swath]:
             tag = "f" + str(frame_index) + "_" + swath + "_b" + str(burst_index)
@@ -3176,6 +3844,9 @@ def run_pair(
                 amplitude_refinement_enabled=amplitude_refinement_enabled,
                 misreg_az_px=misreg_az_px,
                 misreg_rg_px=misreg_rg_px,
+                force_amplitude_residual_rg=force_amp_rg,
+                force_esd_azimuth_shift_px=force_esd_az,
+                prepared_geometry_field=prepared_geometry_by_tag.get(tag),
                 executor=executor,
                 device=device,
                 roi_window=roi_window,
@@ -3315,6 +3986,8 @@ def run_pair(
             "per_burst": per_burst_timings,
         },
     )
+    if origin_state is not None:
+        _inherit_coregistration_residuals(result, origin_state)
     result.note(
         "PAIR frames="
         + str(frame_count)
@@ -3376,6 +4049,7 @@ def _run_pair_sweep(
     geo_height_m: float,
     geo_chunk_size: int,
     geo_work_dir: str | Path | None,
+    scene_store_dir: str | Path | None = None,
     snaphu_config: SnaphuConfig | None,
     unwrap_method: UnwrapBackend | None,
     irls_kwargs: dict[str, Any] | None,
@@ -3384,6 +4058,13 @@ def _run_pair_sweep(
     unwrap: bool,
     geoid_correction: bool,
     n_jobs: int = 1,
+    resource_limits: ResourceLimits | None = None,
+    prepared_geo_lut_handles: Mapping[
+        str, tuple[PreparedLutHandle, ProviderLeaseToken]
+    ]
+    | None = None,
+    prepared_provider_root: str | Path | None = None,
+    source_snapshot_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
     misreg_az_px: float = 0.0,
     misreg_rg_px: float = 0.0,
@@ -3391,6 +4072,17 @@ def _run_pair_sweep(
     """Run one shared prefix and emit every look configuration."""
     from faninsar.missions.sentinel1.safe import open_safe_product
     from faninsar.processing.geometry.egm96 import EGM96Geoid
+
+    if (prepared_geo_lut_handles is None) != (prepared_provider_root is None):
+        reject_invalid_state(
+            "prepared Geo LUT reuse requires both handles and provider root"
+        )
+    if prepared_geo_lut_handles is not None and coregistration_grid != "geo":
+        reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
+    if prepared_geo_lut_handles is not None and not isinstance(
+        prepared_geo_lut_handles, Mapping
+    ):
+        reject_invalid_state("prepared Geo LUT handles must be a mapping")
 
     single_config = _is_multilook_pair(multilook)
     if single_config:
@@ -3417,6 +4109,19 @@ def _run_pair_sweep(
                 shutil.rmtree(stale)
 
     dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
+    if snapshot_root is not None and isinstance(dem_sampler, RasterDEM):
+        from faninsar.processing.source_snapshots import snapshot_local_source
+
+        dem_snapshot = snapshot_local_source(
+            dem_sampler.path,
+            snapshot_root / "dem",
+        )
+        dem_sampler = RasterDEM(
+            dem_snapshot.path,
+            nodata=dem_sampler.nodata,
+            interpolation=dem_sampler.interpolation,
+        )
     if geoid_correction and isinstance(dem_sampler, RasterDEM):
         dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
@@ -3436,6 +4141,17 @@ def _run_pair_sweep(
     sec_orbits = _as_optional_frame_sequence(
         secondary_orbit_path, frame_count, "secondary_orbit_path"
     )
+    if snapshot_root is not None:
+        ref_paths = _snapshot_paths(ref_paths, snapshot_root / "safe")
+        sec_paths = _snapshot_paths(sec_paths, snapshot_root / "safe")
+        ref_orbits = _snapshot_optional_paths(
+            ref_orbits,
+            snapshot_root / "orbit",
+        )
+        sec_orbits = _snapshot_optional_paths(
+            sec_orbits,
+            snapshot_root / "orbit",
+        )
     reference_products = [open_safe_product(path) for path in ref_paths]
     secondary_products = [open_safe_product(path) for path in sec_paths]
     if swaths is None:
@@ -3587,6 +4303,12 @@ def _run_pair_sweep(
     )
     frame_cols = max(range_offsets[swath] + burst_width[swath] for swath in swath_tuple)
 
+    if scene_store_dir is not None and n_jobs > 1:
+        reject_invalid_state(
+            "scene_store_dir requires n_jobs=1 until generation publication "
+            "is coordinated across workers"
+        )
+
     temporary = tempfile.TemporaryDirectory(prefix="faninsar-sweep-")
     resolved_geo_work_dir: Path | None = None
     if coregistration_grid == "geo":
@@ -3622,7 +4344,11 @@ def _run_pair_sweep(
             geo_height_m=geo_height_m,
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=resolved_geo_work_dir,
+            scene_store_dir=scene_store_dir,
             n_jobs=n_jobs,
+            resource_limits=resource_limits,
+            prepared_geo_lut_handles=prepared_geo_lut_handles,
+            prepared_provider_root=prepared_provider_root,
             roi_buffer_m=roi_buffer_m,
         )
         resources.ifg_archive = archive
@@ -3693,7 +4419,14 @@ def _archive_burst_ifgs(
     geo_height_m: float,
     geo_chunk_size: int,
     geo_work_dir: Path | None,
+    scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
+    resource_limits: ResourceLimits | None = None,
+    prepared_geo_lut_handles: Mapping[
+        str, tuple[PreparedLutHandle, ProviderLeaseToken]
+    ]
+    | None = None,
+    prepared_provider_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
     misreg_az_px: float = 0.0,
     misreg_rg_px: float = 0.0,
@@ -3710,6 +4443,15 @@ def _archive_burst_ifgs(
 
     if coregistration_grid == "geo" and (geo_grid is None or geo_work_dir is None):
         reject_invalid_state("geo coregistration requires geo_grid and geo_work_dir")
+    if (prepared_geo_lut_handles is None) != (prepared_provider_root is None):
+        reject_invalid_state(
+            "prepared Geo LUT reuse requires both handles and provider root"
+        )
+    if prepared_geo_lut_handles is not None:
+        if coregistration_grid != "geo":
+            reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
+        if not isinstance(prepared_geo_lut_handles, Mapping):
+            reject_invalid_state("prepared Geo LUT handles must be a mapping")
 
     ifg_dir = work_dir / "ifgs"
     ifg_dir.mkdir(parents=True, exist_ok=True)
@@ -3798,6 +4540,19 @@ def _archive_burst_ifgs(
     for swath in reversed(swath_tuple):
         for frame_index, burst_index, azimuth_offset in units_by_swath[swath]:
             tag = "f" + str(frame_index) + "_" + swath + "_b" + str(burst_index)
+            prepared_lut_handle: object | None = None
+            prepared_provider_token: object | None = None
+            if prepared_geo_lut_handles is not None:
+                if tag not in prepared_geo_lut_handles:
+                    reject_invalid_state(
+                        "prepared Geo LUT handles are missing burst tag " + tag
+                    )
+                entry = prepared_geo_lut_handles[tag]
+                if not isinstance(entry, tuple) or len(entry) != 2:
+                    reject_invalid_state(
+                        "prepared Geo LUT handle entry must be a handle/token pair"
+                    )
+                prepared_lut_handle, prepared_provider_token = entry
             task_args.append(
                 {
                     "tag": tag,
@@ -3826,23 +4581,95 @@ def _archive_burst_ifgs(
                     "ifg_dir": ifg_dir,
                     "dem": dem_sampler,
                     "geo_work_dir": geo_work_dir,
+                    "scene_store_dir": scene_store_dir,
+                    "prepared_geo_lut_handle": prepared_lut_handle,
+                    "prepared_provider_token": prepared_provider_token,
+                    "prepared_provider_root": prepared_provider_root,
+                    "resource_limits": resource_limits,
+                    "require_worker_bootstrap": (
+                        resource_limits is not None and n_jobs > 1
+                    ),
                 }
             )
 
-    if n_jobs > 1 and len(task_args) > 1:
-        from concurrent.futures import ProcessPoolExecutor
+    expected_tags = tuple(str(task["tag"]) for task in task_args)
+    if len(expected_tags) != len(set(expected_tags)):
+        reject_invalid_state("burst selection contains duplicate unit tags")
+    if prepared_geo_lut_handles is not None and set(
+        prepared_geo_lut_handles
+    ) != set(expected_tags):
+        reject_invalid_state(
+            "prepared Geo LUT handles must cover exactly the selected burst tags"
+        )
 
-        with ProcessPoolExecutor(max_workers=n_jobs) as pool:
-            results = list(pool.map(_process_burst_worker, task_args))
+    from contextlib import nullcontext
+
+    from faninsar.processing.resources import ProcessTreeAdmission
+
+    worker_count = min(max(1, n_jobs), max(1, len(task_args)))
+    output_file_count = len(task_args) * (4 if coregistration_grid == "geo" else 3)
+    if resource_limits is None:
+        logger.info(
+            "burst archive running without an authenticated resource profile; "
+            "resource-gate evidence is not claimed"
+        )
+        admission_context = nullcontext()
     else:
-        results = [_process_burst_worker(task) for task in task_args]
+        admission_context = ProcessTreeAdmission.from_limits(
+            resource_limits,
+            work_dir,
+            workers=worker_count,
+            files=output_file_count,
+        )
+
+    with admission_context:
+        if n_jobs > 1 and len(task_args) > 1:
+            from concurrent.futures import ProcessPoolExecutor
+            pool_kwargs: dict[str, object] = {"max_workers": n_jobs}
+            if resource_limits is not None:
+                from multiprocessing import get_context
+
+                from faninsar.processing.resources import bootstrap_worker_runtime
+
+                pool_kwargs.update(
+                    {
+                        "mp_context": get_context("spawn"),
+                        "initializer": bootstrap_worker_runtime,
+                        "initargs": (1,),
+                    }
+                )
+            with ProcessPoolExecutor(**pool_kwargs) as pool:
+                results = list(pool.map(_process_burst_worker, task_args))
+        else:
+            results = [_process_burst_worker(task) for task in task_args]
+
+    resource_watchdog = getattr(admission_context, "watchdog", None)
+    resource_peak_rss_bytes = 0
+    resource_sample_count = 0
+    if resource_watchdog is not None:
+        resource_sample_count = len(resource_watchdog.samples)
+        resource_peak_rss_bytes = max(
+            (snapshot.rss_bytes for snapshot in resource_watchdog.samples),
+            default=0,
+        )
 
     ordered_results: list[tuple[dict[str, object], dict[str, float]]] = []
+    produced_tags: set[str] = set()
     origin_scene_args: dict[str, object] | None = None
     for task, result in zip(task_args, results, strict=True):
         unit = result["unit"]
         if unit is None:
-            continue
+            reject_invalid_state(
+                f"burst worker produced no unit for expected tag {task['tag']!r}"
+            )
+        if not isinstance(unit, dict):
+            reject_invalid_state("burst worker returned an invalid unit record")
+        tag = str(unit.get("tag", ""))
+        if tag not in expected_tags:
+            reject_invalid_state(f"burst worker produced unexpected unit tag {tag!r}")
+        if tag in produced_tags:
+            reject_invalid_state(f"burst worker produced duplicate unit tag {tag!r}")
+        produced_tags.add(tag)
         ordered_results.append((unit, result["stage_times"]))
         if origin_scene_args is None:
             origin_scene_args = scene_rebuild_args(
@@ -3850,11 +4677,34 @@ def _archive_burst_ifgs(
                 str(task["swath"]),
                 int(task["burst_index"]),
             )
+    if produced_tags != set(expected_tags):
+        reject_invalid_state(
+            "burst worker output manifest differs from the requested set: "
+            f"expected={sorted(expected_tags)} produced={sorted(produced_tags)}"
+        )
     for unit, stage_times in ordered_results:
         units.append(unit)
         per_burst_timings[unit["tag"]] = stage_times
     if origin_scene_args is not None:
         origin_state = rebuild_origin_state(origin_scene_args, dem_sampler)
+        for name in (
+            "range_shift_px",
+            "azimuth_shift_px",
+            "esd_azimuth_shift_px",
+            "amplitude_residual_rg_px",
+        ):
+            observations = [
+                float(unit[name])
+                for unit, _ in ordered_results
+                if unit.get(name) is not None
+                and np.isfinite(float(unit[name]))
+            ]
+            if observations:
+                setattr(
+                    origin_state,
+                    name,
+                    float(np.nanmedian(np.asarray(observations, dtype=np.float64))),
+                )
 
     if origin_state is None:
         reject_invalid_state("no burst units selected for processing")
@@ -3866,6 +4716,8 @@ def _archive_burst_ifgs(
         "grid_mode": "geo" if coregistration_grid == "geo" else "radar",
         "geo_grid": geo_grid,
         "geo_prefix_state": geo_prefix_state,
+        "resource_peak_rss_bytes": resource_peak_rss_bytes,
+        "resource_sample_count": resource_sample_count,
     }
 
 
@@ -3995,7 +4847,29 @@ def _merge_burst_ifgs(
         "units": units,
         "frame_count": max(frame_indices) + 1 if frame_indices else 0,
         "total_seconds": time.perf_counter() - archive["prefix_started"],
+        "resource_peak_rss_bytes": archive.get("resource_peak_rss_bytes", 0),
+        "resource_sample_count": archive.get("resource_sample_count", 0),
     }
+
+
+def _inherit_coregistration_residuals(
+    target: ProductionPairState,
+    source: ProductionPairState,
+) -> None:
+    """Carry measured residuals into the merged sweep result.
+
+    The archive owns the full-burst arrays, while the final multilook result
+    owns the merged product.  Residual metadata must cross that boundary so
+    Stack network arcs and activation manifests cannot silently turn a valid
+    Ampcor/ESD measurement into a zero correction.
+    """
+    for name in (
+        "range_shift_px",
+        "azimuth_shift_px",
+        "esd_azimuth_shift_px",
+        "amplitude_residual_rg_px",
+    ):
+        setattr(target, name, getattr(source, name))
 
 
 def _finalize_sweep_config(
@@ -4058,8 +4932,11 @@ def _finalize_sweep_config(
         stage_timings_s={
             "total": merged["total_seconds"],
             "per_burst": merged["per_burst_timings"],
+            "resource_peak_rss_bytes": merged.get("resource_peak_rss_bytes", 0),
+            "resource_sample_count": merged.get("resource_sample_count", 0),
         },
     )
+    _inherit_coregistration_residuals(result, origin)
     result.note(
         "PAIR frames="
         + str(merged["frame_count"])
@@ -4205,6 +5082,8 @@ def _merge_geo_ifgs(
         "grid_mode": "geo",
         "geo_grid": geo_grid,
         "height_field": height_field,
+        "resource_peak_rss_bytes": archive.get("resource_peak_rss_bytes", 0),
+        "resource_sample_count": archive.get("resource_sample_count", 0),
     }
 
 
@@ -4261,8 +5140,11 @@ def _finalize_geo_config(
         stage_timings_s={
             "total": merged["total_seconds"],
             "per_burst": merged["per_burst_timings"],
+            "resource_peak_rss_bytes": merged.get("resource_peak_rss_bytes", 0),
+            "resource_sample_count": merged.get("resource_sample_count", 0),
         },
     )
+    _inherit_coregistration_residuals(result, origin)
     result.note(
         "PAIR geo frames="
         + str(merged["frame_count"])

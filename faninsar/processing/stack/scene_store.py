@@ -15,6 +15,87 @@ from faninsar.processing.errors import reject_invalid_state
 SCENE_SCHEMA = "scene_artifact_v1"
 
 
+def _reject_symlink_components(path: Path) -> None:
+    """Reject a path whose existing components contain symbolic links.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Path to validate. Missing leaf components are allowed so callers can
+        create a new store or payload after validation.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If an existing path component is a symbolic link or cannot be
+        inspected safely.
+
+    """
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            if current.is_symlink():
+                reject_invalid_state(
+                    f"scene store path contains a symbolic link: {current}"
+                )
+        except OSError as error:
+            reject_invalid_state(f"scene store path cannot be inspected: {error}")
+
+
+def _validated_store_root(root: str | Path, *, create: bool) -> Path:
+    """Validate a caller-owned scene store root before reading or writing."""
+    path = Path(root)
+    _reject_symlink_components(path)
+    if path.exists():
+        if not path.is_dir():
+            reject_invalid_state(f"scene store root is not a directory: {path}")
+    elif create:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            reject_invalid_state(f"scene store root cannot be created: {error}")
+        _reject_symlink_components(path)
+        if not path.is_dir() or path.is_symlink():
+            reject_invalid_state(f"scene store root is unsafe: {path}")
+    else:
+        reject_invalid_state(f"scene store root is missing: {path}")
+    return path
+
+
+def _safe_payload_path(root: Path, value: object, field: str) -> Path:
+    """Resolve a manifest payload filename without allowing path traversal."""
+    if not isinstance(value, str):
+        reject_invalid_state(f"scene manifest {field} must be a filename")
+    candidate = Path(value)
+    if (
+        candidate.is_absolute()
+        or len(candidate.parts) != 1
+        or candidate.name != value
+        or value in {"", ".", ".."}
+    ):
+        reject_invalid_state(f"scene manifest {field} must be a basename")
+    path = root / candidate
+    _reject_symlink_components(path)
+    return path
+
+
+def _require_basename(value: object, field: str) -> str:
+    """Validate a generated filename component before joining it to a root."""
+    if not isinstance(value, str):
+        reject_invalid_state(f"scene {field} must be a filename component")
+    candidate = Path(value)
+    if (
+        candidate.is_absolute()
+        or len(candidate.parts) != 1
+        or candidate.name != value
+        or value in {"", ".", ".."}
+    ):
+        reject_invalid_state(f"scene {field} must be a basename")
+    return value
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -71,7 +152,7 @@ class CoregisteredSceneStore:
             Immutable read-only store metadata.
 
         """
-        path = Path(root)
+        path = _validated_store_root(root, create=False)
         manifest_path = path / "manifest.json"
         if not manifest_path.is_file() or manifest_path.is_symlink():
             reject_invalid_state(f"scene manifest missing or unsafe: {manifest_path}")
@@ -81,10 +162,19 @@ class CoregisteredSceneStore:
             reject_invalid_state(f"scene manifest cannot be read: {error}")
         if manifest.get("schema_version") != SCENE_SCHEMA:
             reject_invalid_state("unsupported scene artifact schema")
+        raw_units = manifest.get("units")
+        if not isinstance(raw_units, list):
+            reject_invalid_state("scene manifest units must be a list")
         units: list[SceneUnit] = []
-        for raw in manifest.get("units", []):
-            reference = path / str(raw["reference_file"])
-            secondary = path / str(raw["secondary_file"])
+        for raw in raw_units:
+            if not isinstance(raw, dict):
+                reject_invalid_state("scene manifest unit must be an object")
+            reference = _safe_payload_path(
+                path, raw.get("reference_file"), "reference_file"
+            )
+            secondary = _safe_payload_path(
+                path, raw.get("secondary_file"), "secondary_file"
+            )
             for payload in (reference, secondary):
                 if not payload.is_file() or payload.is_symlink():
                     reject_invalid_state(f"scene payload missing or unsafe: {payload}")
@@ -158,9 +248,16 @@ def write_scene_unit(
     col_origin: int,
 ) -> None:
     """Atomically add one aligned unit and publish a complete manifest."""
-    path = Path(root)
-    path.mkdir(parents=True, exist_ok=True)
-    if reference.shape != secondary.shape or reference.dtype != np.complex64:
+    path = _validated_store_root(root, create=True)
+    _require_basename(tag, "tag")
+    if (
+        reference.ndim != 2
+        or secondary.ndim != 2
+        or reference.shape != secondary.shape
+        or any(size <= 0 for size in reference.shape)
+        or reference.dtype != np.complex64
+        or secondary.dtype != np.complex64
+    ):
         reject_invalid_state("aligned scene arrays must be matching complex64 arrays")
     ref_path = path / f"{tag}.reference.npy"
     sec_path = path / f"{tag}.secondary.npy"

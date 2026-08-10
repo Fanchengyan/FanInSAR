@@ -141,7 +141,12 @@ def estimate_global_shift(
     max_shift: int = 32,
     subpixel: bool = True,
 ) -> tuple[float, float]:
-    """Estimate a global shift via amplitude cross-correlation peak.
+    """Estimate a global shift via full-image amplitude cross-correlation.
+
+    Prefer :func:`estimate_patch_amplitude_shift` for TOPS / production
+    coregistration. A single full-burst FFT peak is biased by the TOPS
+    amplitude envelope and invalid borders, and can inject a false azimuth
+    residual of several tenths of a pixel.
 
     Parameters
     ----------
@@ -192,6 +197,260 @@ def estimate_global_shift(
     # Correlation peak location of ref*conj(sec) corresponds to the shift of
     # secondary relative to reference with opposite sign convention for map.
     return -rg_shift, -az_shift
+
+
+@dataclass(frozen=True, slots=True)
+class PatchAmplitudeShiftResult:
+    """Robust multi-window amplitude-correlation residual."""
+
+    range_shift_px: float
+    azimuth_shift_px: float
+    n_valid: int
+    snr_median: float
+    n_attempted: int
+
+
+def _patch_ncc_shift(
+    ref_win: np.ndarray,
+    sec_search: np.ndarray,
+    *,
+    search_az: int,
+    search_rg: int,
+    subpixel: bool,
+) -> tuple[float, float, float] | None:
+    """Return the normalized cross-correlation peak for one Ampcor-style patch.
+
+    Parameters
+    ----------
+    ref_win : numpy.ndarray
+        Reference magnitude window ``(window_az, window_rg)``.
+    sec_search : numpy.ndarray
+        Secondary magnitude search chip of size
+        ``(window_az + 2*search_az, window_rg + 2*search_rg)``.
+    search_az, search_rg : int
+        Half-width of the integer search range.
+    subpixel : bool
+        Parabolic peak refinement.
+
+    Returns
+    -------
+    tuple[float, float, float] or None
+        ``(d_rg, d_az, snr)`` in the resample convention
+        (positive = secondary content at larger indices), or ``None`` if
+        the surface is degenerate.
+
+    """
+    waz, wrg = ref_win.shape
+    saz, srg = sec_search.shape
+    if saz != waz + 2 * search_az or srg != wrg + 2 * search_rg:
+        return None
+    ref = ref_win.astype(np.float64, copy=False)
+    sec = sec_search.astype(np.float64, copy=False)
+    ref = ref - float(ref.mean())
+    sec = sec - float(sec.mean())
+    ref_norm = float(np.linalg.norm(ref))
+    if ref_norm < 1e-12:
+        return None
+    ref = ref / ref_norm
+
+    # Full correlation of search chip against reference template via FFT.
+    # Pad to avoid circular wrap; peak of template at shift (0,0) in
+    # sec_search sits at index (search_az, search_rg) of the valid lag map.
+    fft_shape = (
+        int(2 ** int(np.ceil(np.log2(saz + waz - 1)))),
+        int(2 ** int(np.ceil(np.log2(srg + wrg - 1)))),
+    )
+    f_sec = np.fft.rfft2(sec, s=fft_shape)
+    f_ref = np.fft.rfft2(ref[::-1, ::-1], s=fft_shape)
+    corr_full = np.fft.irfft2(f_sec * f_ref, s=fft_shape).real
+    # Valid lags where template fully inside search chip: (2*search+1)^2
+    corr = corr_full[waz - 1 : waz - 1 + 2 * search_az + 1, wrg - 1 : wrg - 1 + 2 * search_rg + 1]
+    if corr.shape != (2 * search_az + 1, 2 * search_rg + 1):
+        return None
+    # Local energy of secondary under each lag for true NCC
+    ones = np.ones((waz, wrg), dtype=np.float64)
+    sec_sq = sec * sec
+    f_ones = np.fft.rfft2(ones[::-1, ::-1], s=fft_shape)
+    f_sec_sq = np.fft.rfft2(sec_sq, s=fft_shape)
+    energy = np.fft.irfft2(f_sec_sq * f_ones, s=fft_shape).real
+    energy = energy[waz - 1 : waz - 1 + 2 * search_az + 1, wrg - 1 : wrg - 1 + 2 * search_rg + 1]
+    energy = np.maximum(energy, 1e-12)
+    ncc = corr / np.sqrt(energy)
+    peak_flat = int(np.argmax(ncc))
+    peak_az, peak_rg = np.unravel_index(peak_flat, ncc.shape)
+    peak_val = float(ncc[peak_az, peak_rg])
+    # Peak-to-sidelobe SNR: zero a 3×3 neighbourhood around the peak and take
+    # peak / mean(|sidelobe|). Matches the practical cull used with ISCE Ampcor
+    # better than (peak−mean)/std, which collapses for band-limited texture.
+    sidelobe = ncc.copy()
+    a0 = max(int(peak_az) - 1, 0)
+    a1 = min(int(peak_az) + 2, ncc.shape[0])
+    r0 = max(int(peak_rg) - 1, 0)
+    r1 = min(int(peak_rg) + 2, ncc.shape[1])
+    sidelobe[a0:a1, r0:r1] = np.nan
+    side_mean = float(np.nanmean(np.abs(sidelobe)))
+    if not np.isfinite(side_mean) or side_mean < 1e-12:
+        return None
+    snr = peak_val / side_mean
+    az_shift = float(peak_az - search_az)
+    rg_shift = float(peak_rg - search_rg)
+    if subpixel and 0 < peak_az < ncc.shape[0] - 1 and 0 < peak_rg < ncc.shape[1] - 1:
+        az_sub, rg_sub = refine_peak_subpixel(ncc, (int(peak_az), int(peak_rg)))
+        az_shift += az_sub
+        rg_shift += rg_sub
+    # Peak lag: secondary feature is at ref + lag inside search chip that is
+    # already centred on the reference window → lag is secondary−reference.
+    # Resample convention source = out − offset needs offset = that lag.
+    return rg_shift, az_shift, snr
+
+
+def estimate_patch_amplitude_shift(
+    reference: np.ndarray,
+    secondary: np.ndarray,
+    *,
+    window_az: int = 32,
+    window_rg: int = 64,
+    search_az: int = 16,
+    search_rg: int = 16,
+    n_az: int = 20,
+    n_rg: int = 40,
+    snr_threshold: float = 5.0,
+    max_abs_residual: float = 1.2,
+    margin_rg: int = 1000,
+    margin_az: int | None = None,
+    subpixel: bool = True,
+) -> PatchAmplitudeShiftResult:
+    """Estimate residual shift with multi-window magnitude Ampcor (ISCE2-style).
+
+    Mirrors topsApp ``runRangeCoreg`` / ``runAmpcor`` defaults: magnitude-only
+    patches (``window_rg×window_az = 64×32``), search half-width 16, ~40×20
+    locations, SNR cull, and ``|residual| < 1.2`` px. Returns the **median**
+    residual over surviving patches.
+
+    Parameters
+    ----------
+    reference, secondary : numpy.ndarray
+        Complex or real 2-D arrays on the same grid. Callers should
+        integer-pre-align the secondary with the geometry prior so residuals
+        are sub-pixel.
+    window_az, window_rg : int, optional
+        Reference chip size (azimuth, range). Defaults match ISCE2 TOPS.
+    search_az, search_rg : int, optional
+        Integer search half-width in each axis.
+    n_az, n_rg : int, optional
+        Number of patch centres in azimuth and range.
+    snr_threshold : float, optional
+        Minimum correlation SNR to keep a patch (default 5.0).
+    max_abs_residual : float, optional
+        Reject patches whose residual exceeds this magnitude (default 1.2,
+        same cull as ISCE2 ``runRangeCoreg``).
+    margin_rg : int, optional
+        Range border excluded from patch centres (ISCE2 uses ~1000 samples).
+        Reduced automatically when the burst is narrower.
+    margin_az : int or None, optional
+        Azimuth border; default is half the window height.
+    subpixel : bool, optional
+        Parabolic peak refinement (default True).
+
+    Returns
+    -------
+    PatchAmplitudeShiftResult
+        Median residual shifts and diagnostic counts. When no patch survives,
+        shifts are 0.0 (keep geometry prior).
+
+    """
+    if reference.shape != secondary.shape or reference.ndim != 2:
+        reject_invalid_state("patch amplitude shift requires matching 2-D arrays")
+    if min(window_az, window_rg, search_az, search_rg, n_az, n_rg) < 1:
+        reject_invalid_state("patch amplitude parameters must be positive")
+    height, width = reference.shape
+    ref_mag = np.abs(np.asarray(reference, dtype=np.complex64)).astype(np.float32)
+    sec_mag = np.abs(np.asarray(secondary, dtype=np.complex64)).astype(np.float32)
+
+    half_az = window_az // 2
+    half_rg = window_rg // 2
+    m_az = half_az + search_az + 1 if margin_az is None else int(margin_az)
+    m_rg = int(margin_rg)
+    # Shrink margins on small chips so unit tests / cropped bursts still work.
+    if width < 2 * m_rg + window_rg + 2 * search_rg + 2:
+        m_rg = half_rg + search_rg + 1
+    if height < 2 * m_az + window_az + 2 * search_az + 2:
+        m_az = half_az + search_az + 1
+    az0, az1 = m_az, height - m_az
+    rg0, rg1 = m_rg, width - m_rg
+    if az1 <= az0 or rg1 <= rg0:
+        logger.warning(
+            "Patch Ampcor: image too small for margins (shape=%s); residual=0",
+            reference.shape,
+        )
+        return PatchAmplitudeShiftResult(0.0, 0.0, 0, 0.0, 0)
+
+    az_centres = np.linspace(az0, az1 - 1, num=n_az, dtype=np.int64)
+    rg_centres = np.linspace(rg0, rg1 - 1, num=n_rg, dtype=np.int64)
+    d_rg_list: list[float] = []
+    d_az_list: list[float] = []
+    snr_list: list[float] = []
+    n_attempted = 0
+    for az_c in az_centres:
+        for rg_c in rg_centres:
+            r0 = int(az_c) - half_az
+            r1 = r0 + window_az
+            c0 = int(rg_c) - half_rg
+            c1 = c0 + window_rg
+            sr0 = r0 - search_az
+            sr1 = r1 + search_az
+            sc0 = c0 - search_rg
+            sc1 = c1 + search_rg
+            if sr0 < 0 or sc0 < 0 or sr1 > height or sc1 > width:
+                continue
+            n_attempted += 1
+            result = _patch_ncc_shift(
+                ref_mag[r0:r1, c0:c1],
+                sec_mag[sr0:sr1, sc0:sc1],
+                search_az=search_az,
+                search_rg=search_rg,
+                subpixel=subpixel,
+            )
+            if result is None:
+                continue
+            d_rg, d_az, snr = result
+            if snr < snr_threshold:
+                continue
+            if abs(d_rg) > max_abs_residual or abs(d_az) > max_abs_residual:
+                continue
+            d_rg_list.append(d_rg)
+            d_az_list.append(d_az)
+            snr_list.append(snr)
+
+    if not d_rg_list:
+        logger.warning(
+            "Patch Ampcor: no patches survived cull "
+            "(attempted=%d snr>=%.1f |res|<%.2f); residual=0",
+            n_attempted,
+            snr_threshold,
+            max_abs_residual,
+        )
+        return PatchAmplitudeShiftResult(0.0, 0.0, 0, 0.0, n_attempted)
+
+    rg_med = float(np.median(np.asarray(d_rg_list, dtype=np.float64)))
+    az_med = float(np.median(np.asarray(d_az_list, dtype=np.float64)))
+    snr_med = float(np.median(np.asarray(snr_list, dtype=np.float64)))
+    logger.info(
+        "Patch Ampcor residual rg=%.4f az=%.4f n_valid=%d/%d snr_med=%.2f",
+        rg_med,
+        az_med,
+        len(d_rg_list),
+        n_attempted,
+        snr_med,
+    )
+    return PatchAmplitudeShiftResult(
+        range_shift_px=rg_med,
+        azimuth_shift_px=az_med,
+        n_valid=len(d_rg_list),
+        snr_median=snr_med,
+        n_attempted=n_attempted,
+    )
+
 
 
 def resample_complex(

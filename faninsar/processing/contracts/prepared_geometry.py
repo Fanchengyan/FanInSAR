@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
+import numpy as np
+
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
@@ -95,6 +97,33 @@ def _canonical_json(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def geo_grid_identity(grid: GeoGridSpec) -> str:
+    """Return the canonical identity of a geographic output grid.
+
+    Parameters
+    ----------
+    grid : GeoGridSpec
+        Fully resolved CRS, transform, shape, resolution, and bounding box.
+
+    Returns
+    -------
+    str
+        Lowercase SHA-256 identity used to bind a prepared LUT to one exact
+        geographic grid.
+
+    """
+    return _digest(
+        {
+            "crs": str(grid.crs),
+            "transform": [float(value) for value in grid.transform],
+            "width": int(grid.width),
+            "height": int(grid.height),
+            "resolution_m": [float(value) for value in grid.resolution_m],
+            "bbox": [float(value) for value in grid.bbox],
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +398,112 @@ class PreparedGeometryHandle:
     post_fill_payload_digest: str
     validity_mask_digest: str
     read_only_capability_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedGeometryArrayPayload:
+    """Validated read-only dense controls loaded from a provider generation."""
+
+    range_offset_px: np.ndarray
+    azimuth_offset_px: np.ndarray
+    coverage: np.ndarray
+    uncertainty_px: np.ndarray
+    source_shape: tuple[int, int]
+    crop_bounds: tuple[int, int, int, int]
+    control_spacing: int
+
+    def __post_init__(self) -> None:
+        """Validate the immutable field domain and canonical dtypes."""
+        if len(self.source_shape) != 2 or any(
+            not isinstance(value, int) or value <= 0 for value in self.source_shape
+        ):
+            reject_invalid_state("prepared geometry source shape is invalid")
+        if len(self.crop_bounds) != 4 or any(
+            not isinstance(value, int) or value < 0 for value in self.crop_bounds
+        ):
+            reject_invalid_state("prepared geometry crop bounds are invalid")
+        row0, row1, col0, col1 = self.crop_bounds
+        if not (row0 < row1 <= self.source_shape[0]):
+            reject_invalid_state("prepared geometry row crop is outside the source")
+        if not (col0 < col1 <= self.source_shape[1]):
+            reject_invalid_state("prepared geometry column crop is outside the source")
+        expected_shape = (row1 - row0, col1 - col0)
+        arrays = (
+            self.range_offset_px,
+            self.azimuth_offset_px,
+            self.coverage,
+            self.uncertainty_px,
+        )
+        if any(array.shape != expected_shape for array in arrays):
+            reject_invalid_state("prepared geometry payload shape does not match crop")
+        if (
+            self.range_offset_px.dtype != np.float32
+            or self.azimuth_offset_px.dtype != np.float32
+            or self.uncertainty_px.dtype != np.float32
+            or self.coverage.dtype != np.bool_
+        ):
+            reject_invalid_state("prepared geometry payload dtypes are not canonical")
+        if self.control_spacing < 1:
+            reject_invalid_state("prepared geometry control spacing must be positive")
+        for array in arrays:
+            array.setflags(write=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedLutArrayPayload:
+    """Validated read-only geo2rdr LUT arrays from one prepared view.
+
+    The arrays are a cropped view of the canonical geographic grid.  The
+    crop origin is carried explicitly so consumers cannot reopen a fixed-name
+    memmap with a guessed shape or silently shift the LUT.
+    """
+
+    az_full: np.ndarray
+    rg_full: np.ndarray
+    valid: np.ndarray
+    height_full: np.ndarray
+    full_radar_shape: tuple[int, int]
+    geo_grid_shape: tuple[int, int]
+    crop_bounds: tuple[int, int, int, int]
+    height_m: float
+
+    def __post_init__(self) -> None:
+        """Validate LUT dtypes, shape, and crop metadata."""
+        if len(self.full_radar_shape) != 2 or any(
+            not isinstance(value, int) or value <= 0 for value in self.full_radar_shape
+        ):
+            reject_invalid_state("prepared LUT radar shape is invalid")
+        if len(self.geo_grid_shape) != 2 or any(
+            not isinstance(value, int) or value <= 0 for value in self.geo_grid_shape
+        ):
+            reject_invalid_state("prepared LUT geographic grid shape is invalid")
+        if len(self.crop_bounds) != 4 or any(
+            not isinstance(value, int) or value < 0 for value in self.crop_bounds
+        ):
+            reject_invalid_state("prepared LUT crop bounds are invalid")
+        row0, row1, col0, col1 = self.crop_bounds
+        if not (
+            row0 < row1 <= self.geo_grid_shape[0]
+            and col0 < col1 <= self.geo_grid_shape[1]
+        ):
+            reject_invalid_state("prepared LUT crop is outside its geographic grid")
+        expected_shape = (row1 - row0, col1 - col0)
+        arrays = (self.az_full, self.rg_full, self.valid, self.height_full)
+        if any(array.shape != expected_shape for array in arrays):
+            reject_invalid_state("prepared LUT array shape does not match its crop")
+        if (
+            self.az_full.dtype != np.float64
+            or self.rg_full.dtype != np.float64
+            or self.height_full.dtype != np.float64
+            or self.valid.dtype != np.bool_
+        ):
+            reject_invalid_state("prepared LUT arrays do not use canonical dtypes")
+        if not isinstance(self.height_m, (float, int)) or not np.isfinite(
+            self.height_m
+        ):
+            reject_invalid_state("prepared LUT mean height must be finite")
+        for array in arrays:
+            array.setflags(write=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -707,6 +842,97 @@ class ProviderQualificationReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class ActivationToken:
+    """Post-publication capability for a P19 ``scene_artifact_v1`` run.
+
+    The coordinator-issued signature is represented by ``issuer_record_digest``
+    in this product layer.  Stack entry points still validate the complete
+    subject, parent, event, namespace, and fence tuple before reading any
+    scene artifact; a copied binding without the matching token is rejected.
+    """
+
+    intent_id: str
+    parent_id: str
+    parent_manifest_digest: str
+    root_device: int
+    root_inode: int
+    namespace: str
+    mode: Literal["qualified", "reference"]
+    domain: ArtifactDomain
+    policy_identity: str
+    code_identity: str
+    schema: str
+    provider_receipt_digest: str
+    threshold_configuration_hash: str
+    qualification_evidence_digest: str
+    p19_qualified_event_ids: tuple[str, ...]
+    p18_stack_gate_event_id: str | None
+    fence_epoch: int
+    issuer_record_digest: str
+
+    def __post_init__(self) -> None:
+        """Validate the immutable activation subject and event lineage."""
+        for name in (
+            "intent_id",
+            "parent_id",
+            "namespace",
+            "policy_identity",
+            "code_identity",
+            "schema",
+        ):
+            _require_text(getattr(self, name), name)
+        for name in (
+            "parent_manifest_digest",
+            "provider_receipt_digest",
+            "threshold_configuration_hash",
+            "qualification_evidence_digest",
+            "issuer_record_digest",
+        ):
+            _require_digest(getattr(self, name), name)
+        if self.mode not in ("qualified", "reference"):
+            reject_invalid_state("unsupported activation token mode")
+        if self.domain not in ("radar", "geo"):
+            reject_invalid_state("unsupported activation token domain")
+        if self.root_device < 0 or self.root_inode < 0:
+            reject_invalid_state("activation token root identity is invalid")
+        _require_nonnegative(self.fence_epoch, "fence_epoch")
+        if any(not event_id for event_id in self.p19_qualified_event_ids):
+            reject_invalid_state("activation event IDs must be non-empty")
+        if self.mode == "qualified":
+            if not self.p19_qualified_event_ids or not self.p18_stack_gate_event_id:
+                reject_invalid_state(
+                    "qualified activation requires P19 and P18 gate events"
+                )
+        elif self.p18_stack_gate_event_id is not None:
+            reject_invalid_state("reference activation cannot carry P18 Stack gate")
+
+    def digest(self) -> str:
+        """Return the canonical digest bound into the activation record."""
+        return _digest(
+            {
+                "intent_id": self.intent_id,
+                "parent_id": self.parent_id,
+                "parent_manifest_digest": self.parent_manifest_digest,
+                "root_device": self.root_device,
+                "root_inode": self.root_inode,
+                "namespace": self.namespace,
+                "mode": self.mode,
+                "domain": self.domain,
+                "policy_identity": self.policy_identity,
+                "code_identity": self.code_identity,
+                "schema": self.schema,
+                "provider_receipt_digest": self.provider_receipt_digest,
+                "threshold_configuration_hash": self.threshold_configuration_hash,
+                "qualification_evidence_digest": self.qualification_evidence_digest,
+                "p19_qualified_event_ids": self.p19_qualified_event_ids,
+                "p18_stack_gate_event_id": self.p18_stack_gate_event_id,
+                "fence_epoch": self.fence_epoch,
+                "issuer_record_digest": self.issuer_record_digest,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class StackActivationBinding:
     """Acyclic P18/P19 activation binding."""
 
@@ -717,6 +943,8 @@ class StackActivationBinding:
     p19_qualified_event_id: str | None
     p18_stack_gate_event_id: str | None
     stack_generation_id: str
+    p19_qualified_event_ids: tuple[str, ...] = ()
+    activation_token_digest: str | None = None
 
     def __post_init__(self) -> None:
         """Validate the acyclic P18/P19 activation binding."""
@@ -731,11 +959,17 @@ class StackActivationBinding:
         if self.activation_mode not in ("reference", "qualified"):
             reject_invalid_state("unsupported Stack activation mode")
         if self.activation_mode == "qualified" and (
-            not self.p19_qualified_event_id or not self.p18_stack_gate_event_id
+            not self.p19_qualified_event_id
+            or not self.p18_stack_gate_event_id
+            or not self.p19_qualified_event_ids
+            or self.p19_qualified_event_id not in self.p19_qualified_event_ids
+            or self.activation_token_digest is None
         ):
             reject_invalid_state(
-                "qualified Stack activation requires both qualification events"
+                "qualified Stack activation requires typed token and gate events"
             )
+        if self.activation_token_digest is not None:
+            _require_digest(self.activation_token_digest, "activation_token_digest")
 
 
 @runtime_checkable
@@ -771,6 +1005,14 @@ class PreparedGeometryProvider(Protocol):
         """Open read-only raw and post-fill control payloads."""
         ...
 
+    def read_prepared_geometry(
+        self,
+        geometry_handle: PreparedGeometryHandle,
+        token: ProviderLeaseToken,
+    ) -> PreparedGeometryArrayPayload:
+        """Read validated primitive dense controls from a pinned generation."""
+        ...
+
     def materialize_view(
         self,
         handle_id: str,
@@ -788,6 +1030,14 @@ class PreparedGeometryProvider(Protocol):
         token: ProviderLeaseToken,
     ) -> PreparedLutHandle:
         """Open one identity-matched read-only geo LUT view."""
+        ...
+
+    def read_prepared_lut(
+        self,
+        lut_handle: PreparedLutHandle,
+        token: ProviderLeaseToken,
+    ) -> PreparedLutArrayPayload:
+        """Read validated primitive arrays from one prepared geo LUT."""
         ...
 
     def identity(
@@ -943,6 +1193,7 @@ def get_neutral_identity_projector() -> NeutralIdentityProjector:
 
 __all__ = [
     "PROVIDER_SCHEMA",
+    "ActivationToken",
     "AppliedSolution",
     "ArtifactDomain",
     "CoregistrationPolicy",
@@ -952,9 +1203,11 @@ __all__ = [
     "PhaseCarrier",
     "PhaseState",
     "PhaseTransitionRecord",
+    "PreparedGeometryArrayPayload",
     "PreparedGeometryHandle",
     "PreparedGeometryProvider",
     "PreparedIdentity",
+    "PreparedLutArrayPayload",
     "PreparedLutHandle",
     "PreparedSceneHandle",
     "PreparedViewHandle",
@@ -971,5 +1224,6 @@ __all__ = [
     "ViewKind",
     "ViewState",
     "WorkerAttestation",
+    "geo_grid_identity",
     "get_neutral_identity_projector",
 ]

@@ -39,6 +39,24 @@ from .readers import (
     require_critical_metadata,
 )
 from .resampling import lanczos_resample
+from .resources import (
+    ProcessTreeAdmission,
+    ProcessTreeMemoryWatchdog,
+    ProcessTreeSampler,
+    ProcessTreeSamplingError,
+    ProcessTreeSnapshot,
+    ResourceAdmissionError,
+    ResourceAdmissionLedger,
+    ResourceBudget,
+    ResourceReservation,
+    ResourceUsage,
+    bootstrap_worker_runtime,
+)
+from .source_snapshots import (
+    ImmutableSourceSnapshot,
+    SourceSnapshotEntry,
+    snapshot_local_source,
+)
 from .storage import ChunkAccessLog, ChunkedZarrArrayStore, InMemoryArrayStore
 from .synthetic_slc import SyntheticSLCReader, SyntheticSLCSpec, write_synthetic_slc
 
@@ -58,6 +76,7 @@ __all__ = [
     "FlatteningState",
     "GeoGrid",
     "GridMismatchError",
+    "ImmutableSourceSnapshot",
     "InMemoryArrayStore",
     "InvalidProcessingStateError",
     "MissingCriticalMetadataError",
@@ -65,14 +84,25 @@ __all__ = [
     "OrbitMetadata",
     "OrbitStateVector",
     "PairProduct",
+    "ProcessTreeAdmission",
+    "ProcessTreeMemoryWatchdog",
+    "ProcessTreeSampler",
+    "ProcessTreeSamplingError",
+    "ProcessTreeSnapshot",
     "ProcessingContractError",
     "ProcessingEvent",
     "ProvenanceRecord",
     "RadarGrid",
+    "ResourceAdmissionError",
+    "ResourceAdmissionLedger",
+    "ResourceBudget",
+    "ResourceReservation",
+    "ResourceUsage",
     "SLCProduct",
     "SLCReadResult",
     "SLCReader",
     "SoftwareIdentity",
+    "SourceSnapshotEntry",
     "StackProduct",
     "SyntheticSLCReader",
     "SyntheticSLCSpec",
@@ -80,7 +110,9 @@ __all__ = [
     "TransformLUT",
     "UnwrapResult",
     "ValidSampleMask",
+    "bootstrap_worker_runtime",
     "lanczos_resample",
     "require_critical_metadata",
+    "snapshot_local_source",
     "write_synthetic_slc",
 ]

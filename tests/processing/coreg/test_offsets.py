@@ -8,6 +8,7 @@ import pytest
 from faninsar.processing.coreg import (
     combine_offset_fields,
     estimate_global_shift,
+    estimate_patch_amplitude_shift,
     geometry_shift_offsets,
     refine_peak_subpixel,
     resample_complex,
@@ -45,6 +46,68 @@ def test_estimate_global_shift_subpixel_recovers_fractional_shift() -> None:
     )
     assert rg_shift == pytest.approx(0.4, abs=0.05)
     assert az_shift == pytest.approx(0.0, abs=0.05)
+
+
+def _sar_like_amplitude(shape: tuple[int, int], seed: int) -> np.ndarray:
+    """Band-limited random amplitude with sparse bright scatterers (SAR-like)."""
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(seed)
+    field = gaussian_filter(rng.normal(size=shape), sigma=1.5)
+    # Sparse bright peaks improve local uniqueness for Ampcor
+    n_peaks = max(20, shape[0] * shape[1] // 2000)
+    for _ in range(n_peaks):
+        az = int(rng.integers(10, shape[0] - 10))
+        rg = int(rng.integers(10, shape[1] - 10))
+        field[az - 1 : az + 2, rg - 1 : rg + 2] += float(rng.uniform(3.0, 8.0))
+    return np.abs(field).astype(np.float32)
+
+
+def test_estimate_patch_amplitude_shift_recovers_injected_offset() -> None:
+    """Multi-window Ampcor recovers an injected integer residual."""
+    texture = _sar_like_amplitude((256, 512), seed=2)
+    reference = texture.astype(np.complex64)
+    secondary = np.roll(np.roll(reference, shift=2, axis=1), shift=-1, axis=0)
+    result = estimate_patch_amplitude_shift(
+        reference,
+        secondary,
+        window_az=32,
+        window_rg=64,
+        search_az=8,
+        search_rg=8,
+        n_az=8,
+        n_rg=12,
+        snr_threshold=3.0,
+        max_abs_residual=4.0,
+        margin_rg=40,
+        margin_az=40,
+    )
+    assert result.n_valid > 0
+    assert result.range_shift_px == pytest.approx(2.0, abs=0.15)
+    assert result.azimuth_shift_px == pytest.approx(-1.0, abs=0.15)
+
+
+def test_estimate_patch_amplitude_shift_zero_when_aligned() -> None:
+    """Aligned scenes yield near-zero residual after SNR cull."""
+    texture = _sar_like_amplitude((200, 400), seed=3)
+    reference = texture.astype(np.complex64)
+    result = estimate_patch_amplitude_shift(
+        reference,
+        reference.copy(),
+        window_az=32,
+        window_rg=48,
+        search_az=6,
+        search_rg=6,
+        n_az=6,
+        n_rg=8,
+        snr_threshold=3.0,
+        max_abs_residual=1.2,
+        margin_rg=40,
+        margin_az=40,
+    )
+    assert result.n_valid > 0
+    assert abs(result.range_shift_px) < 0.15
+    assert abs(result.azimuth_shift_px) < 0.15
 
 
 def test_refine_peak_subpixel_parabolic_recovery() -> None:

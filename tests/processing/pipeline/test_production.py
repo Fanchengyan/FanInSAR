@@ -9,11 +9,16 @@ import numpy as np
 import pytest
 import zarr
 
-from faninsar.processing.geometry import ConstantHeightDEM
+from faninsar.processing.geometry import (
+    ConstantHeightDEM,
+    PreparedGeometryArrayPayload,
+)
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.pipeline import (
+    PreparedGeometryField,
     ProductionPairState,
     load_production_scene,
+    read_prepared_geometry_field,
     run_pair,
     stage_coregister,
     stage_deramp,
@@ -24,6 +29,8 @@ from faninsar.processing.pipeline import (
 )
 from faninsar.processing.pipeline.production import (
     _apply_geo_topographic_phase_chunked,
+    _inherit_coregistration_residuals,
+    _own_geo_valid_mask,
 )
 from faninsar.processing.tops.deramp import TOPSCarrierModel
 from faninsar.processing.unwrap import SnaphuConfig
@@ -96,6 +103,105 @@ def test_production_pair_state_note() -> None:
     assert state.log == ["hello"]
     state.note("world")
     assert state.log == ["hello", "world"]
+
+
+def test_merged_pair_result_preserves_coregistration_residuals() -> None:
+    """Merged sweep states retain Ampcor and ESD values for Stack arcs."""
+    source = MagicMock(
+        range_shift_px=15.77,
+        azimuth_shift_px=0.458,
+        esd_azimuth_shift_px=-0.0044,
+        amplitude_residual_rg_px=0.1378,
+    )
+    target = MagicMock()
+
+    _inherit_coregistration_residuals(target, source)
+
+    assert target.range_shift_px == pytest.approx(15.77)
+    assert target.azimuth_shift_px == pytest.approx(0.458)
+    assert target.esd_azimuth_shift_px == pytest.approx(-0.0044)
+    assert target.amplitude_residual_rg_px == pytest.approx(0.1378)
+
+
+def test_geo_valid_mask_owns_data_before_memmap_cleanup(tmp_path: Path) -> None:
+    """Geo archive keeps validity bytes after IFG cleanup closes the memmap."""
+    path = tmp_path / "valid.bool"
+    mapped = np.memmap(path, mode="w+", dtype=np.bool_, shape=(3, 4))
+    mapped[:] = np.array(
+        [[True, False, True, False], [False, True, False, True], [True] * 4],
+        dtype=bool,
+    )
+    expected = np.asarray(mapped).copy()
+    copied = _own_geo_valid_mask(mapped)
+    mapped._mmap.close()
+
+    assert copied is not None
+    np.testing.assert_array_equal(copied, expected)
+    assert not isinstance(copied, np.memmap)
+
+
+def test_geo_run_pair_forwards_scene_store_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Geo mode forwards scene publication instead of rejecting the seam."""
+    from faninsar.processing.pipeline import production as production_mod
+
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def fake_sweep(*_args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(production_mod, "_run_pair_sweep", fake_sweep)
+    scene_store = tmp_path / "scenes"
+    snapshot_root = tmp_path / "snapshots"
+    result = run_pair(
+        "reference.SAFE",
+        "secondary.SAFE",
+        output_dir=tmp_path / "out",
+        multilook=(1, 1),
+        coregistration_grid="geo",
+        geo_grid=MagicMock(),
+        scene_store_dir=scene_store,
+        source_snapshot_root=snapshot_root,
+    )
+
+    assert result is sentinel
+    assert captured["scene_store_dir"] == scene_store
+    assert captured["source_snapshot_root"] == snapshot_root
+
+
+def test_geo_run_pair_forwards_prepared_lut_inputs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Geo runs preserve prepared LUT handles and provider roots for workers."""
+    from faninsar.processing.pipeline import production as production_mod
+
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def fake_sweep(*_args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(production_mod, "_run_pair_sweep", fake_sweep)
+    handles = {"f0_IW1_b0": (object(), object())}
+    provider_root = tmp_path / "prepared"
+    result = run_pair(
+        "reference.SAFE",
+        "secondary.SAFE",
+        output_dir=tmp_path / "out",
+        multilook=(1, 1),
+        coregistration_grid="geo",
+        geo_grid=MagicMock(),
+        prepared_geo_lut_handles=handles,
+        prepared_provider_root=provider_root,
+    )
+
+    assert result is sentinel
+    assert captured["prepared_geo_lut_handles"] is handles
+    assert captured["prepared_provider_root"] == provider_root
 
 
 def test_stage_deramp_with_synthetic() -> None:
@@ -179,6 +285,342 @@ def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
     assert result.range_shift_px == 0.0
     assert result.azimuth_shift_px == 0.25
     assert geometry_call["stride"] == 8
+
+
+def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A captured Stage-A field preserves the product pass without re-solving."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.pipeline import production as production_mod
+
+    shape = (16, 32)
+    ref = _make_mock_scene(shape)
+    sec = _make_mock_scene(shape)
+    ref.geometry.range_spacing_m = 2.3
+    ref.geometry.wavelength_m = 0.056
+    sec.geometry.range_spacing_m = 2.3
+    sec.geometry.wavelength_m = 0.056
+    offsets = OffsetFieldResult(
+        range_offset_px=np.full(shape, 0.25, dtype=np.float32),
+        azimuth_offset_px=np.full(shape, -0.125, dtype=np.float32),
+        coverage=np.ones(shape, dtype=bool),
+        uncertainty_px=np.zeros(shape, dtype=np.float32),
+    )
+    calls = 0
+
+    def fake_dense_geometry_offsets(**_: object) -> OffsetFieldResult:
+        nonlocal calls
+        calls += 1
+        return offsets
+
+    monkeypatch.setattr(
+        production_mod,
+        "dense_geometry_offsets",
+        fake_dense_geometry_offsets,
+    )
+    monkeypatch.setattr(
+        production_mod,
+        "resample_complex_deramped_reramp",
+        lambda samples, **_: samples.copy(),
+    )
+
+    measure = ProductionPairState(
+        pair_id="prepared-measure",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+    )
+    measure.reference_deramped = np.ones(shape, dtype=np.complex64)
+    measure.secondary_deramped = np.ones(shape, dtype=np.complex64)
+    measure = stage_coregister(measure, residuals_only=True, device="cpu")
+    prepared = measure.prepared_geometry_field
+    assert isinstance(prepared, PreparedGeometryField)
+    assert calls == 1
+
+    def unexpected_geometry_call(**_: object) -> OffsetFieldResult:
+        pytest.fail("prepared product pass called dense geometry again")
+
+    monkeypatch.setattr(
+        production_mod,
+        "dense_geometry_offsets",
+        unexpected_geometry_call,
+    )
+    product = ProductionPairState(
+        pair_id="prepared-product",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+    )
+    product.reference_deramped = np.ones(shape, dtype=np.complex64)
+    product.secondary_deramped = np.ones(shape, dtype=np.complex64)
+    product = stage_coregister(
+        product,
+        prepared_geometry_field=prepared,
+        device="cpu",
+    )
+    assert product.secondary_aligned is not None
+    assert product.range_shift_px == pytest.approx(0.25)
+    assert product.azimuth_shift_px == pytest.approx(-0.125)
+    assert product.coregistration_timings_s["dense_geometry_offsets_reused"] == 0.0
+
+
+def test_read_prepared_geometry_field_adapts_provider_payload() -> None:
+    """Production accepts only the provider's validated read-only payload."""
+    shape = (4, 4)
+    payload = PreparedGeometryArrayPayload(
+        range_offset_px=np.full(shape, 0.25, dtype=np.float32),
+        azimuth_offset_px=np.full(shape, -0.125, dtype=np.float32),
+        coverage=np.ones(shape, dtype=bool),
+        uncertainty_px=np.zeros(shape, dtype=np.float32),
+        source_shape=shape,
+        crop_bounds=(0, 4, 0, 4),
+        control_spacing=8,
+    )
+
+    class Provider:
+        def read_prepared_geometry(
+            self, _geometry_handle: object, _token: object
+        ) -> PreparedGeometryArrayPayload:
+            return payload
+
+    field = read_prepared_geometry_field(Provider(), object(), object())
+    assert isinstance(field, PreparedGeometryField)
+    assert field.field.range_offset_px is payload.range_offset_px
+    assert not field.field.range_offset_px.flags.writeable
+
+
+def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Geo stage consumes a provider LUT without rebuilding or shifting it."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.pipeline import production as production_mod
+    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+
+    radar_shape = (4, 4)
+    lut_shape = (2, 2)
+    ref = _make_mock_scene(radar_shape)
+    sec = _make_mock_scene(radar_shape)
+    state = ProductionPairState(
+        pair_id="prepared-geo-lut",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+    )
+    state.reference_deramped = np.ones(radar_shape, dtype=np.complex64)
+    state.secondary_deramped = np.ones(radar_shape, dtype=np.complex64)
+    offsets = OffsetFieldResult(
+        range_offset_px=np.zeros(radar_shape, dtype=np.float32),
+        azimuth_offset_px=np.zeros(radar_shape, dtype=np.float32),
+        coverage=np.ones(radar_shape, dtype=bool),
+        uncertainty_px=np.zeros(radar_shape, dtype=np.float32),
+    )
+    prepared_lut = Geo2RdrLUT(
+        az_full=np.ones(lut_shape, dtype=np.float64),
+        rg_full=np.ones(lut_shape, dtype=np.float64),
+        valid=np.ones(lut_shape, dtype=bool),
+        full_radar_shape=radar_shape,
+        height_m=0.0,
+        height_full=np.zeros(lut_shape, dtype=np.float64),
+        row0=1,
+        col0=1,
+    )
+    grid = GeoGridSpec(
+        crs="EPSG:32633",
+        transform=(0.0, 10.0, 0.0, 40.0, 0.0, -10.0),
+        width=4,
+        height=4,
+        resolution_m=(10.0, 10.0),
+    )
+
+    monkeypatch.setattr(
+        production_mod,
+        "dense_geometry_offsets",
+        lambda **_: offsets,
+    )
+    monkeypatch.setattr(
+        production_mod,
+        "combine_offset_fields",
+        lambda geometry_field, **_: geometry_field,
+    )
+    monkeypatch.setattr(
+        production_mod,
+        "build_geo2rdr_lut",
+        lambda **_: pytest.fail("prepared Geo LUT was rebuilt"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.pipeline.geo_modes.coregister_geocoded_slcs_chunked",
+        lambda *_args, **_kwargs: (
+            np.ones(lut_shape, dtype=np.complex64),
+            np.ones(lut_shape, dtype=np.complex64),
+            np.ones(lut_shape, dtype=bool),
+        ),
+    )
+    monkeypatch.setattr(
+        production_mod,
+        "_apply_geo_topographic_phase_chunked",
+        lambda *_args, **_kwargs: (
+            np.zeros(lut_shape, dtype=np.float64),
+            np.zeros(lut_shape, dtype=np.float64),
+        ),
+    )
+
+    result = stage_coregister(
+        state,
+        coregistration_grid="geo",
+        geo_grid=grid,
+        geo_work_dir=tmp_path / "geo",
+        prepared_geo_lut=prepared_lut,
+        device="cpu",
+    )
+
+    assert result.geo2rdr_lut is prepared_lut
+    assert result.geo_bbox == (1, 3, 1, 3)
+    assert result.coregistration_timings_s["geo2rdr_lut_reused"] == 0.0
+
+
+def test_prepared_geometry_field_rejects_shape_or_dtype_mismatch() -> None:
+    """A prepared field cannot silently change the materialized domain."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    shape = (4, 4)
+    field = OffsetFieldResult(
+        range_offset_px=np.zeros(shape, dtype=np.float64),
+        azimuth_offset_px=np.zeros(shape, dtype=np.float32),
+        coverage=np.ones(shape, dtype=bool),
+        uncertainty_px=np.zeros(shape, dtype=np.float32),
+    )
+    with pytest.raises(InvalidProcessingStateError):
+        PreparedGeometryField(
+            field=field,
+            source_shape=shape,
+            crop_bounds=(0, 4, 0, 4),
+            control_spacing=8,
+        )
+
+
+def test_prepared_geometry_field_rejects_unbound_geo_reuse() -> None:
+    """Radar-only prepared fields cannot silently enter the Geo2Rdr path."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    shape = (4, 4)
+    field = PreparedGeometryField(
+        field=OffsetFieldResult(
+            range_offset_px=np.zeros(shape, dtype=np.float32),
+            azimuth_offset_px=np.zeros(shape, dtype=np.float32),
+            coverage=np.ones(shape, dtype=bool),
+            uncertainty_px=np.zeros(shape, dtype=np.float32),
+        ),
+        source_shape=shape,
+        crop_bounds=(0, 4, 0, 4),
+        control_spacing=8,
+    )
+    ref = _make_mock_scene(shape)
+    sec = _make_mock_scene(shape)
+    state = ProductionPairState(
+        pair_id="prepared-geo",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+    )
+    state.reference_deramped = np.ones(shape, dtype=np.complex64)
+    state.secondary_deramped = np.ones(shape, dtype=np.complex64)
+    with pytest.raises(InvalidProcessingStateError):
+        stage_coregister(
+            state,
+            coregistration_grid="geo",
+            prepared_geometry_field=field,
+        )
+
+
+def test_prepared_geometry_field_freezes_final_roi_crop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stage B reuses the Stage-A ROI crop without probing or solving again."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.pipeline import production as production_mod
+
+    shape = (128, 256)
+    window = (24, 72, 64, 160)
+    ref = _make_mock_scene(shape)
+    sec = _make_mock_scene(shape)
+    ref.geometry.range_spacing_m = 2.3
+    ref.geometry.wavelength_m = 0.056
+    sec.geometry.range_spacing_m = 2.3
+    sec.geometry.wavelength_m = 0.056
+    calls = 0
+
+    def fake_extent(*_args: object, **_kwargs: object) -> float:
+        return 0.0
+
+    def fake_dense_geometry_offsets(
+        *, shape: tuple[int, int], **_kwargs: object
+    ) -> OffsetFieldResult:
+        nonlocal calls
+        calls += 1
+        return OffsetFieldResult(
+            range_offset_px=np.full(shape, 0.25, dtype=np.float32),
+            azimuth_offset_px=np.full(shape, -0.125, dtype=np.float32),
+            coverage=np.ones(shape, dtype=bool),
+            uncertainty_px=np.zeros(shape, dtype=np.float32),
+        )
+
+    monkeypatch.setattr(
+        production_mod, "geometry_offset_window_extent", fake_extent
+    )
+    monkeypatch.setattr(
+        production_mod, "dense_geometry_offsets", fake_dense_geometry_offsets
+    )
+    monkeypatch.setattr(
+        production_mod,
+        "resample_complex_deramped_reramp",
+        lambda samples, **_: samples.copy(),
+    )
+
+    measure = ProductionPairState(
+        pair_id="prepared-roi-measure",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+    )
+    measure.reference_deramped = np.ones(shape, dtype=np.complex64)
+    measure.secondary_deramped = np.ones(shape, dtype=np.complex64)
+    measure = stage_coregister(measure, roi_window=window, residuals_only=True)
+    prepared = measure.prepared_geometry_field
+    assert isinstance(prepared, PreparedGeometryField)
+    assert prepared.crop_bounds[0] <= window[0]
+    assert prepared.crop_bounds[1] >= window[1]
+    assert prepared.crop_bounds[2] <= window[2]
+    assert prepared.crop_bounds[3] >= window[3]
+    stage_a_calls = calls
+
+    def unexpected_geometry_call(**_: object) -> OffsetFieldResult:
+        pytest.fail("ROI product pass called dense geometry again")
+
+    monkeypatch.setattr(
+        production_mod, "dense_geometry_offsets", unexpected_geometry_call
+    )
+    product = ProductionPairState(
+        pair_id="prepared-roi-product",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+    )
+    product.reference_deramped = np.ones(shape, dtype=np.complex64)
+    product.secondary_deramped = np.ones(shape, dtype=np.complex64)
+    product = stage_coregister(product, prepared_geometry_field=prepared)
+    assert calls == stage_a_calls
+    assert product.radar_roi_origin == prepared.crop_bounds[::2]
+    assert product.secondary_aligned is not None
+    assert product.secondary_aligned.shape == (
+        prepared.crop_bounds[1] - prepared.crop_bounds[0],
+        prepared.crop_bounds[3] - prepared.crop_bounds[2],
+    )
 
 
 def test_stage_coregister_grows_roi_halo_for_large_offsets(

@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.coreg.offsets import OffsetFieldResult, estimate_global_shift
+from faninsar.processing.coreg.offsets import (
+    OffsetFieldResult,
+    estimate_patch_amplitude_shift,
+)
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry.orbit import OrbitInterpolator
 
@@ -70,13 +73,16 @@ def refine_shift_with_correlation(
     *,
     prior_rg: float,
     prior_az: float,
-    search_radius: int = 32,
+    search_radius: int = 16,
 ) -> tuple[float, float]:
-    """Refine a geometry prior with amplitude cross-correlation.
+    """Refine a geometry prior with multi-window magnitude Ampcor.
 
-    The secondary is integer-shifted by the rounded prior, then a
-    sub-pixel residual is estimated via FFT cross-correlation with
-    parabolic peak refinement.
+    The secondary is integer-shifted by the rounded prior, then a robust
+    residual is estimated with ISCE2-style patch Ampcor (64x32 windows,
+    SNR cull, median over ~40x20 locations). Full-image FFT correlation is
+    intentionally avoided: on TOPS bursts it locks onto the amplitude
+    envelope and injects a false azimuth residual of ~0.4 px that destroys
+    interferometric coherence.
 
     Parameters
     ----------
@@ -87,7 +93,8 @@ def refine_shift_with_correlation(
         :func:`~faninsar.processing.coreg.offsets.resample_complex`
         convention (``source = output - offset``).
     search_radius : int, optional
-        Maximum correlation search radius around the prior.
+        Correlation search half-width around the prior (default 16, matching
+        ISCE2 topsApp Ampcor).
 
     Returns
     -------
@@ -104,25 +111,31 @@ def refine_shift_with_correlation(
             prior_az,
         )
         return float("nan"), float("nan")
-    pre_rg = int(round(float(prior_rg)))
-    pre_az = int(round(float(prior_az)))
+    pre_rg = round(float(prior_rg))
+    pre_az = round(float(prior_az))
     # Pre-align secondary under the resample_complex convention:
     # source = out - offset  ⇒  shifted[i] = secondary[i - prior].
     # numpy.roll(a, +prior) implements shifted[i] = a[i - prior].
     shifted = np.roll(secondary_samples, shift=pre_az, axis=0)
     shifted = np.roll(shifted, shift=pre_rg, axis=1)
-    d_rg, d_az = estimate_global_shift(
+    patch = estimate_patch_amplitude_shift(
         reference_samples,
         shifted,
-        max_shift=search_radius,
+        search_az=search_radius,
+        search_rg=search_radius,
         subpixel=True,
     )
+    d_rg = float(patch.range_shift_px)
+    d_az = float(patch.azimuth_shift_px)
     total_rg = prior_rg + d_rg
     total_az = prior_az + d_az
     logger.info(
-        "Correlation refinement d_rg=%.3f d_az=%.3f -> total rg=%.3f az=%.3f",
+        "Correlation refinement (patch Ampcor) d_rg=%.4f d_az=%.4f "
+        "n_valid=%d snr_med=%.2f -> total rg=%.3f az=%.3f",
         d_rg,
         d_az,
+        patch.n_valid,
+        patch.snr_median,
         total_rg,
         total_az,
     )

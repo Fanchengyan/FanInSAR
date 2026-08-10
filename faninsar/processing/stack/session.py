@@ -8,7 +8,8 @@ and interferogram formation are separate stages: coreg caches per-date SLCs;
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import os
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -22,7 +23,12 @@ from faninsar.processing.coreg.misreg_network import (
 )
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.stack.catalog import SceneCatalog
-from faninsar.processing.stack.config import CoregMode, EsdMethod, StackConfig
+from faninsar.processing.stack.config import (
+    ActivationMode,
+    CoregMode,
+    EsdMethod,
+    StackConfig,
+)
 from faninsar.processing.stack.scene_store import (
     CoregisteredSceneStore,
     copy_reference_units,
@@ -34,7 +40,12 @@ if TYPE_CHECKING:
 
     from faninsar.core.acquisition import Acquisition
     from faninsar.core.pairs import Pairs
+    from faninsar.processing.contracts.prepared_geometry import (
+        ActivationToken,
+        StackActivationBinding,
+    )
     from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.production import (
         BurstSelection,
         CoregistrationGrid,
@@ -43,6 +54,32 @@ if TYPE_CHECKING:
     from faninsar.processing.timeseries.inversion import TimeSeriesResult
 
 logger = setup_logger(__name__)
+
+
+def _atomic_write_array(path: Path, array: np.ndarray) -> None:
+    """Publish one binary array only after its bytes are durable."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            np.asarray(array).tofile(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Publish one text manifest through a same-directory durable rename."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _date_to_yyyymmdd(value: object) -> str:
@@ -113,6 +150,7 @@ class Stack:
         misreg_pairs: Pairs | None = None,
         master: str | None = None,
         dem: DEMSampler | None = None,
+        geo_grid: GeoGridSpec | None = None,
         coreg_mode: CoregMode = "pair",
         coregistration_grid: CoregistrationGrid = "radar",
         multilook: tuple[int, int] = (2, 10),
@@ -127,6 +165,10 @@ class Stack:
         pair_max_days: int = 72,
         misreg_max_interval: int = 2,
         misreg_max_days: int = 36,
+        activation_mode: ActivationMode = "reference",
+        activation_binding: StackActivationBinding | None = None,
+        activation_token: ActivationToken | None = None,
+        retain_pair_states: bool = False,
     ) -> Stack:
         """Construct a Stack from SAFE paths and optional pair graphs."""
         catalog = SceneCatalog.from_paths(list(paths))
@@ -160,8 +202,13 @@ class Stack:
             device=device,
             invert_device=invert_device,
             dem=dem,
+            geo_grid=geo_grid,
             swaths=swaths,
             bursts=bursts,
+            activation_mode=activation_mode,
+            activation_binding=activation_binding,
+            activation_token=activation_token,
+            retain_pair_states=retain_pair_states,
         )
         return cls(
             catalog=catalog,
@@ -196,6 +243,72 @@ class Stack:
         if not self._prepared:
             self.prepare_scenes()
 
+    def _write_qualified_activation_record(self) -> None:
+        """Publish the typed P19 activation record after scene preparation."""
+        if self.config.activation_mode != "qualified":
+            return
+        binding = self.config.activation_binding
+        token = self.config.activation_token
+        if binding is None:
+            reject_invalid_state("qualified Stack activation binding is missing")
+        if token is None:
+            reject_invalid_state("qualified Stack activation token is missing")
+        if binding.activation_token_digest != token.digest():
+            reject_invalid_state("activation token does not match binding digest")
+        if token.parent_id != binding.stack_generation_id:
+            reject_invalid_state(
+                "activation token parent does not match Stack generation"
+            )
+        if token.provider_receipt_digest != binding.qualification_receipt_digest:
+            reject_invalid_state("activation token receipt does not match binding")
+        if token.p18_stack_gate_event_id != binding.p18_stack_gate_event_id:
+            reject_invalid_state("activation token Stack gate does not match binding")
+        if token.p19_qualified_event_ids != binding.p19_qualified_event_ids:
+            reject_invalid_state(
+                "activation token event collection does not match binding"
+            )
+        record = {
+            "schema_version": "scene_artifact_v1",
+            "activation_mode": "qualified",
+            "stack_generation_id": binding.stack_generation_id,
+            "binding": asdict(binding),
+            "activation_token": asdict(token),
+            "activation_token_digest": token.digest(),
+            "scene_dates": list(self.catalog.dates),
+            "master": self.master,
+        }
+        path = self.config.work_dir / "activation" / "scene_artifact_v1.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(path, json.dumps(record, sort_keys=True, indent=2) + "\n")
+
+    def _require_qualified_activation_record(self) -> None:
+        """Validate the immutable activation record before production IFGs."""
+        if self.config.activation_mode != "qualified":
+            return
+        binding = self.config.activation_binding
+        token = self.config.activation_token
+        path = self.config.work_dir / "activation" / "scene_artifact_v1.json"
+        if binding is None or token is None or not path.is_file():
+            reject_invalid_state("qualified Stack activation record is missing")
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            reject_invalid_state(
+                f"qualified Stack activation record is invalid: {error}"
+            )
+        if record.get("schema_version") != "scene_artifact_v1":
+            reject_invalid_state("unsupported Stack activation record schema")
+        expected_binding = json.loads(json.dumps(asdict(binding)))
+        expected_token = json.loads(json.dumps(asdict(token)))
+        if record.get("binding") != expected_binding:
+            reject_invalid_state("Stack activation binding does not match config")
+        if record.get("activation_token") != expected_token:
+            reject_invalid_state("Stack activation token does not match config")
+        if record.get("activation_token_digest") != token.digest():
+            reject_invalid_state("Stack activation token digest is invalid")
+        if record.get("scene_dates") != list(self.catalog.dates):
+            reject_invalid_state("Stack activation scene set does not match catalog")
+
     def _burst_kwargs(self) -> dict[str, Any]:
         cfg = self.config
         bursts = cfg.bursts
@@ -206,6 +319,7 @@ class Stack:
             "swaths": cfg.swaths,
             "bursts": bursts,
             "dem": cfg.dem,
+            "geo_grid": cfg.geo_grid,
             "executor": cfg.executor,
             "device": cfg.device,
             "coregistration_grid": cfg.coregistration_grid,
@@ -267,9 +381,11 @@ class Stack:
                 **self._burst_kwargs(),
             )
             az = float(state.esd_azimuth_shift_px or 0.0)
-            # Range residual is not yet exposed on ProductionPairState; record 0
-            # until amp residual is plumbed (network still solves rg when arcs set).
-            amp_rg = float(getattr(state, "amplitude_residual_rg", 0.0) or 0.0)
+            # Ampcor exposes the range residual in pixel units.  Keep the
+            # network arc on the same semantic field used by the production
+            # state; silently defaulting to zero would discard a measured
+            # range correction and make the later ESD/network solve diverge.
+            amp_rg = float(getattr(state, "amplitude_residual_rg_px", 0.0) or 0.0)
             arcs.append(
                 MisregArc(
                     primary=primary,
@@ -311,13 +427,11 @@ class Stack:
                 max_sigma_px=max_sigma_px,
             )
         except Exception:
-            if self.config.on_network_failure == "degrade_to_pair":
-                logger.warning(
-                    "misreg network invert failed; degrading coreg_mode to pair",
-                )
-                self.config.coreg_mode = "pair"
-                self.date_misreg = None
-                return self
+            # Qualified Stack execution never silently changes registration
+            # semantics after a failed network inversion.  The configured
+            # policy is validated as ``error`` at construction, so this path
+            # remains fail-closed for missing/invalid residual solutions.
+            logger.exception("misreg network inversion failed; aborting Stack")
             raise
         out = self.config.work_dir / "misreg" / "date_misreg.json"
         out.write_text(
@@ -392,7 +506,14 @@ class Stack:
                 scene_store_dir=out / "scenes",
                 **self._burst_kwargs(),
             )
-            self.pair_states[f"{self.master}_{date_id}"] = state
+            if self.config.retain_pair_states:
+                self.pair_states[f"{self.master}_{date_id}"] = state
+            else:
+                logger.info(
+                    "Released in-memory ProductionPairState for %s after scene "
+                    "publication",
+                    date_id,
+                )
             self.coreg_paths[date_id] = out
             if date_id == target_dates[0]:
                 copy_reference_units(out / "scenes", master_dir / "scenes")
@@ -415,6 +536,7 @@ class Stack:
                 encoding="utf-8",
             )
             logger.info("Coregistered %s → master %s", date_id, self.master)
+        self._write_qualified_activation_record()
         return self
 
     def form_interferograms(
@@ -435,6 +557,7 @@ class Stack:
         closed until the provider supplies a complete scene manifest.
         """
         self._ensure_prepared()
+        self._require_qualified_activation_record()
 
         use_pairs = pairs or self.pairs
         looks_list = _normalize_multilook(multilook or self.config.multilook)
@@ -466,10 +589,6 @@ class Stack:
                 secondary_store = CoregisteredSceneStore.open(
                     self.coreg_paths[secondary] / "scenes"
                 )
-                if len(reference_store.units) != 1:
-                    reject_invalid_state(
-                        "Stack V1 scene formation requires one complete burst unit"
-                    )
                 outputs = form_scene_interferograms(
                     reference_store,
                     secondary_store,
@@ -482,8 +601,9 @@ class Stack:
                 )
                 sub.mkdir(parents=True, exist_ok=True)
                 for tag, ifg in outputs.items():
-                    ifg.astype(np.complex64, copy=False).tofile(
-                        sub / f"{tag}.complex64"
+                    _atomic_write_array(
+                        sub / f"{tag}.complex64",
+                        ifg.astype(np.complex64, copy=False),
                     )
                 metadata = {
                     "schema_version": "stack_ifg_v1",
@@ -498,8 +618,9 @@ class Stack:
                         secondary_store.manifest_digest,
                     ],
                 }
-                (sub / "result.json").write_text(
-                    json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+                _atomic_write_text(
+                    sub / "result.json",
+                    json.dumps(metadata, indent=2) + "\n",
                 )
                 self.ifg_dirs.append(sub)
         return self

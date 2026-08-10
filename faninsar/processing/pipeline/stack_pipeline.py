@@ -126,6 +126,9 @@ def run_stack_pipeline(
         coreg_mode=coreg_mode,  # type: ignore[arg-type]
         swaths=(swath,),
         bursts={swath: [burst_index]},
+        # Retain heavy pair states only when the optional in-memory time-series
+        # path needs them; scene-artifact production stays bounded by default.
+        retain_pair_states=invert_timeseries,
     )
     if pairs is not None:
         names = [f"{a}_{b}" for a, b in pairs]
