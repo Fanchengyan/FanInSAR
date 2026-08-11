@@ -41,6 +41,8 @@ focused regression after the fix: `59 passed`; Linux focused regression:
 | Radar geometry, 3 dates, IW1 burst 0 | PASS | 262.5968 s | `/usr/bin/time` peak 4.35 GiB; first monitor wrapper did not persist cgroup peak |
 | Radar network, 3 dates, IW1 burst 0 | PASS | 480.9643 s | cgroup peak `8,511,827,968` B; `MemoryMax=15,032,385,536` B; no swap/OOM |
 | Geo geometry, 3 dates, IW1 burst 0 | FAIL-CLOSED | — | reached temporal SBAS gate; no converged pixels, no OOM; publication correctly rejected |
+| Radar network, 2 dates, IW1 burst 0 | PASS | 234.8048 s | direct cgroup peak `7,960,080,384` B; maximum sampler gap `54 ms` |
+| Geo geometry, 2 dates, IW1 burst 0 | PASS | 65.3000 s | direct cgroup peak `2,834,051,072` B; maximum sampler gap `63 ms` |
 
 The Radar network run produced the complete three-date chain and persisted
 three IFGs, three unwrap artifacts, a timeseries generation, and a Stack
@@ -48,12 +50,18 @@ parent generation. The Geo run did not publish a scientifically unqualified
 timeseries; its failure is the intended temporal quality gate, not a resource
 failure.
 
+The two-date direct-monitor runs demonstrate the same hard cap and sub-100-ms
+telemetry on both Radar and Geo while producing complete SBAS outputs. The
+three-date Geo case remains a real-data convergence issue rather than a
+resource issue: its two-date subset converges and publishes successfully, but
+the three-date temporal network has no pixels that satisfy the strict quality
+gate.
+
 The first shell monitor sampled cgroup state approximately every 40 ms but
 reported one 121-ms scheduling gap. The hard cgroup ceiling is authoritative;
 the monitor was subsequently changed to read `memory.current`/`memory.peak`
-directly instead of invoking `systemctl` for every sample. A future formal
-packet should rerun the long Radar case with that direct sampler if a strict
-sub-100-ms telemetry statistic is required.
+directly instead of invoking `systemctl` for every sample. The direct-monitor
+two-date Radar and Geo runs then measured 54 ms and 63 ms maximum gaps.
 
 ## Interpretation
 
