@@ -65,6 +65,23 @@ The raw two-date Geo run record is
 The current-code three-date Geo resume record is
 `/Volumes/DATA2/TEST_sentinel-1/faninsar-experiments/campaigns/PROPOSAL-0018/current-qualification-20260811/public-geo-network-n3-b0-1-2-auto-grid-warm-summary.json`.
 
+## ROI paths
+
+The current public wrapper was exercised with real geographic ROIs as well:
+
+- Radar ROI `98.5..99.5 E, 38.8..39.6 N` (two dates): 85,956 finite pixels,
+  output shape `(2, 261, 1707)`, complete IFG/unwrap/SBAS generation, peak RSS
+  6,901,923,840 bytes;
+- Geo ROI `98.4..98.9 E, 38.6..38.8 N` (two dates): 4,132 finite pixels,
+  output shape `(2, 117, 112)`, complete IFG/unwrap/SBAS generation, peak RSS
+  7,795,097,600 bytes.
+
+Both ROI runs used fresh output roots under
+`/Volumes/DATA2/TEST_sentinel-1/current-isce2-parity-20260812/`. A deliberate
+Geo run with a grid outside the selected burst footprint produced no valid LUT
+points and was rejected before scene publication; no partial scientific result
+was accepted.
+
 ## ISCE2 comparison
 
 The local ISCE2 reference is the benchmark under
@@ -91,8 +108,9 @@ precision verdict.
 
 ## Current conclusion
 
-The implemented Radar raw-SAFE → Stack → SBAS flow and the persisted Geo flow are
-operational, and the ISCE2 geometry-offset check passes. P18/P19 should remain
-`implementing` until the remaining governance packet is closed: an officially
-issued gate event, a same-crop ISCE2 product oracle, and the full dual-domain
-resource/performance qualification rather than this candidate run alone.
+The implemented Radar and Geo raw-SAFE → Stack → SBAS flows, ROI paths, and
+persisted-generation reopen are operational, and the ISCE2 geometry-offset check
+passes. P18/P19 should remain `implementing` until the remaining governance packet
+is closed: an officially issued gate event, a same-crop ISCE2 product oracle, the
+full dual-domain old/new resource-performance packet, and the complete real
+transaction fault matrix.
