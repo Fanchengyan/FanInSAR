@@ -12,9 +12,15 @@ pass. It is updated continuously; unchecked items are not claimed as complete.
 ## Functional product paths
 
 - [x] Run current raw SAFE → Radar Stack → IFG → unwrap → SBAS → Zarr.
+- [x] Re-run the raw Radar chain on a same-frame three-date corpus with three
+      bursts and verify the complete parent generation after process exit.
 - [x] Reopen and validate the complete Radar parent generation and child hashes.
 - [x] Run current raw SAFE → Geo pair path.
+- [x] Run a fresh same-frame three-date/three-burst raw Geo Stack → SBAS path
+      and verify its complete parent generation after process exit.
 - [x] Reopen current three-date/three-burst Geo network artifacts.
+- [x] Re-run the same Geo output in warm-resume mode and record the reduced
+      resume cost without recomputing coregistration.
 - [x] Run real Radar ROI path.
 - [x] Run real Geo ROI path with a footprint-compatible grid.
 - [x] Run focused regression, transaction, stack, unwrap, SBAS, and reference tests.
