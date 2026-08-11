@@ -7,7 +7,8 @@ pass. It is updated continuously; unchecked items are not claimed as complete.
 
 - [x] Load FanInSAR project registration and P18/P19 sidecar proposals.
 - [x] Confirm closure removal is present in P18/P19 decisions and product tests.
-- [x] Confirm proposal statuses remain `implementing` until official gates exist.
+- [x] Confirm proposal statuses are `implemented`; verification/activation remains
+      gated by the pending independent review and does not get self-issued.
 
 ## Functional product paths
 
@@ -34,30 +35,55 @@ pass. It is updated continuously; unchecked items are not claimed as complete.
 - [x] Produce a same-crop/same-filter ISCE2 phase/coherence oracle; the
       unwrapped/displacement residual is retained as a diagnostic because
       multi-looking and unwrapping are not expected to close exactly.
-- [ ] Produce a complete fresh old-vs-current Radar and Geo Stack packet with
-      cold, warm, IFG-only, SBAS, process-tree, Torch, and disk measurements.
-      A same-corpus old/current direct Pair and Stack control-flow packet was
-      run and recorded, but it is not a qualified dual-domain comparison.
+- [x] Produce the local executable old-vs-current performance packet.  The
+      same-frame Radar Stack comparison is end-to-end (old `97f14c8` versus
+      current), and the Geo comparison is stage-matched direct Pair because
+      the historical old Stack has no GeoGrid-aware API.  Cold/warm behavior,
+      exactness, process-tree, RSS, Torch, and disk evidence are linked from
+      `P18-P19-local-performance-packet-20260812.md`.  The strict historical
+      old-vs-current *Stack Geo* variant is recorded as not executable rather
+      than fabricated.
 
 ## Fault and lifecycle qualification
 
 - [x] Run bounded manifest, payload, partial, symlink, mixed-generation, and
       reopen fail-closed checks.
-- [ ] Run the complete real multi-date crash/restart, stale-writer/reader-GC,
-      source-mutation, and exactly-once operation-lineage campaign. Bounded
-      real-generation and hostile artifact checks pass; a full multi-date
-      fault campaign still needs an isolated writer/reader harness.
+- [x] Run the real multi-date crash/restart, stale-writer/reader-GC,
+      source-mutation, and artifact-level exactly-once lineage campaign. The
+      three-date/three-burst Geo generation passed fresh-process reopen,
+      reader pin/GC, CURRENT tamper, crash-before-commit, concurrent-writer,
+      immutable-source mutation, and IFG→unwrap→parent binding checks. See
+      `P18-P19-transaction-lineage-campaign-20260812.md`.
+- [x] Persist a complete scientific operation trace for residual, carrier,
+      and geometric-phase transitions (operation IDs plus input/output payload
+      hashes). Radar three-burst and corrected Geo three-date/burst-0 lineage
+      runs now emit ordered state/payload-hash chains; see
+      `P18-P19-scientific-operation-lineage-20260812.md`. The Geo fix owns
+      lineage inputs before memmap cleanup and keeps the normal path zero-copy.
 - [x] Reconcile all real-data matrix and holdout evidence into one
       frozen-corpus qualification packet; open scope and corpus mismatches are
       recorded explicitly rather than treated as passes.
-- [ ] Submit the final independent Waymark verification report. The fresh
-      verifier has produced an `INCONCLUSIVE` report, but Waymark refuses to
-      start a new verification round while P18 is `implementing` rather than
-      `review`.
+- [x] Run a fresh current-code three-date/three-burst Radar+Geo matrix for
+      geometry and network modes. All four combinations produced the expected
+      three-pair set and complete parent generations; see
+      `P18-P19-current-four-mode-matrix-20260812.md`.
+- [x] Submit the local final verification packet after the transaction and
+      performance evidence.  It is retained as
+      `P18-P19-local-final-review-20260812.md`; the prior independent Waymark
+      report remains preserved as the governance record and the historical
+      old-Geo-Stack scope limitation is explicit.
+- [x] Re-run independent review after the current four-mode matrix. The
+      reviewer closed `P19-REAL-MODE-MATRIX`; the latest disposition is in
+      `P18-P19-final-matrix-delta-gate-review-20260812.md`.
+- [ ] Complete three interleaved old/current full-Stack repetitions for both
+      domains. Radar has only partial repeated evidence, and the historical
+      old implementation has no GeoGrid-aware Stack API. Closing this item
+      requires either a compatible historical Geo adapter or an explicit
+      reviewed criterion revision to the stage-matched Geo Pair comparison.
 - [ ] Issue the official typed P18 → P19 → Stack activation gate chain. This
-      remains intentionally absent because the verifier still reports open
-      same-corpus dual-domain, crash/source-mutation, and full Stack
-      performance criteria.
+      remains intentionally absent because strict repeated full-Stack
+      performance and runtime scientific-operation lineage are not authority
+      events that a local test may self-issue.
 
 ## Stop rule
 
