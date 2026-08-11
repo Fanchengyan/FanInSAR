@@ -11,9 +11,42 @@ from faninsar.processing.pipeline.stack_pipeline import run_stack_pipeline
 from faninsar.processing.stack.ifg_store import write_ifg_artifact
 from faninsar.processing.stack.session import Stack
 from faninsar.processing.timeseries.inversion import TimeSeriesResult
+from faninsar.query import BoundingBox
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def test_stack_constructor_preserves_roi_in_resume_identity(tmp_path: Path) -> None:
+    """A Stack ROI reaches Pair calls and distinguishes resumable products."""
+    paths = []
+    for day in ("20160101", "20160113"):
+        path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000.SAFE"
+        path.mkdir()
+        paths.append(path)
+    western_roi = BoundingBox(80.0, 20.0, 81.0, 21.0, crs="EPSG:4326")
+    eastern_roi = BoundingBox(81.0, 20.0, 82.0, 21.0, crs="EPSG:4326")
+
+    western_stack = Stack.from_safes(
+        paths,
+        work_dir=tmp_path / "western",
+        activation_mode="reference",
+        roi=western_roi,
+    )
+    eastern_stack = Stack.from_safes(
+        paths,
+        work_dir=tmp_path / "eastern",
+        activation_mode="reference",
+        roi=eastern_roi,
+    )
+
+    assert western_stack.config.roi is western_roi
+    assert western_stack._burst_kwargs()["roi"] is western_roi
+    assert western_stack._coreg_resume_identity(
+        "20160113", misreg_az_px=0.0, misreg_rg_px=0.0
+    ) != eastern_stack._coreg_resume_identity(
+        "20160113", misreg_az_px=0.0, misreg_rg_px=0.0
+    )
 
 
 def test_stack_pipeline_runs_persisted_unwrap_then_sbas(
@@ -22,6 +55,7 @@ def test_stack_pipeline_runs_persisted_unwrap_then_sbas(
 ) -> None:
     """Requested inversion uses Stack artifacts and publishes time-series Zarr."""
     calls: list[str] = []
+    roi = BoundingBox(80.0, 20.0, 81.0, 21.0, crs="EPSG:4326")
 
     def prepare(stack: Stack) -> Stack:
         calls.append("prepare")
@@ -29,6 +63,7 @@ def test_stack_pipeline_runs_persisted_unwrap_then_sbas(
         assert stack.config.geo_grid is not None
         assert stack.config.swaths == ("IW1", "IW2")
         assert stack.config.bursts == {"IW1": [0, 1], "IW2": [2]}
+        assert stack.config.roi is roi
         stack._prepared = True
         return stack
 
@@ -105,6 +140,7 @@ def test_stack_pipeline_runs_persisted_unwrap_then_sbas(
         ),
         swaths=("IW1", "IW2"),
         bursts={"IW1": [0, 1], "IW2": [2]},
+        roi=roi,
     )
 
     assert calls == ["prepare", "coregister", "form", "unwrap", "invert:cpu"]

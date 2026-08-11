@@ -30,6 +30,7 @@ if TYPE_CHECKING:
         CoregistrationGrid,
     )
     from faninsar.processing.stack.config import ActivationMode
+    from faninsar.query import BoundingBox, Polygons
 
 logger = setup_logger(__name__)
 
@@ -85,6 +86,7 @@ def run_stack_pipeline(
     scene_paths: Iterable[str | Path],
     *,
     output_dir: str | Path,
+    roi: BoundingBox | Polygons | None = None,
     pairs: Sequence[tuple[str, str]] | None = None,
     swath: str = "IW1",
     burst_index: int = 0,
@@ -115,6 +117,8 @@ def run_stack_pipeline(
         SAFE ZIP/directory paths (N >= 2).
     output_dir : path
         Output root for pairs/ and timeseries.zarr.
+    roi : BoundingBox or Polygons, optional
+        Geographic region used to select and crop burst processing.
     pairs : sequence of (ref_id, sec_id), optional
         Optional explicit pairs using scene ids. Default: all combinations
         for legacy behavior of this helper (Stack defaults use short baseline
@@ -181,6 +185,7 @@ def run_stack_pipeline(
         paths,
         work_dir=output_dir,
         dem=dem,
+        roi=roi,
         multilook=multilook,
         goldstein_alpha=goldstein_alpha,
         executor=executor,

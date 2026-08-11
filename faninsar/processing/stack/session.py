@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from faninsar.processing.timeseries.inversion import TimeSeriesResult
     from faninsar.processing.unwrap.quality import StackQualityCriteria
     from faninsar.processing.unwrap.stack import SpatialExecutor, StackUnwrapResult
+    from faninsar.query import BoundingBox, Polygons
 
 logger = setup_logger(__name__)
 
@@ -160,6 +161,7 @@ class Stack:
         master: str | None = None,
         dem: DEMSampler | None = None,
         geo_grid: GeoGridSpec | None = None,
+        roi: BoundingBox | Polygons | None = None,
         coreg_mode: CoregMode = "pair",
         coregistration_grid: CoregistrationGrid = "radar",
         multilook: tuple[int, int] = (2, 10),
@@ -213,6 +215,7 @@ class Stack:
             invert_device=invert_device,
             dem=dem,
             geo_grid=geo_grid,
+            roi=roi,
             swaths=swaths,
             bursts=bursts,
             activation_mode=activation_mode,
