@@ -342,9 +342,10 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         ``{"unit": unit_or_None, "stage_times": dict}``.
 
     """
-    if bool(task.get("require_worker_bootstrap")) and os.environ.get(
-        "FANINSAR_WORKER_BOOTSTRAPPED"
-    ) != "1":
+    if (
+        bool(task.get("require_worker_bootstrap"))
+        and os.environ.get("FANINSAR_WORKER_BOOTSTRAPPED") != "1"
+    ):
         reject_invalid_state(
             "resource-gated burst worker was started without numerical "
             "runtime bootstrap"
@@ -361,6 +362,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     frame_index = int(task["frame_index"])
     burst_index = int(task["burst_index"])
     azimuth_offset = int(task["azimuth_offset"])
+    range_offset = int(task.get("range_offset", 0))
     ref_path = Path(task["ref_path"])
     sec_path = Path(task["sec_path"])
     ref_orbit = task.get("ref_orbit")
@@ -391,6 +393,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     dem = task["dem"]
     geo_work_dir = task["geo_work_dir"]
     scene_store_dir = task.get("scene_store_dir")
+    scene_grid_shape = task.get("scene_grid_shape")
     prepared_lut_handle = task.get("prepared_geo_lut_handle")
     prepared_provider_token = task.get("prepared_provider_token")
     prepared_provider_root = task.get("prepared_provider_root")
@@ -526,14 +529,33 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     assert state.reference_deramped is not None
     assert state.secondary_aligned is not None
     if scene_store_dir is not None:
-        from faninsar.processing.stack.scene_store import write_scene_unit
+        from faninsar.processing.stack.scene_store import (
+            scene_grid_identity,
+            write_scene_unit,
+        )
 
         if coregistration_grid == "geo":
             row_origin = state.geo_bbox[0] if state.geo_bbox is not None else 0
             col_origin = state.geo_bbox[2] if state.geo_bbox is not None else 0
         else:
-            row_origin = burst_row0
-            col_origin = burst_col0
+            row_origin = azimuth_offset + burst_row0
+            col_origin = range_offset + burst_col0
+        resolved_scene_grid_shape = (
+            (int(scene_grid_shape[0]), int(scene_grid_shape[1]))
+            if scene_grid_shape is not None
+            else None
+        )
+        grid_identity = None
+        if coregistration_grid == "geo" and geo_grid is not None:
+            grid_identity = scene_grid_identity(
+                "geo",
+                geo_grid.shape,
+                {
+                    "crs": geo_grid.crs,
+                    "transform": list(geo_grid.transform),
+                    "resolution_m": list(geo_grid.resolution_m),
+                },
+            )
         write_scene_unit(
             scene_store_dir,
             date_id=_scene_id(sec_path),
@@ -544,6 +566,9 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
             secondary=np.asarray(state.secondary_aligned, dtype=np.complex64),
             row_origin=row_origin,
             col_origin=col_origin,
+            grid_shape=resolved_scene_grid_shape,
+            wavelength_m=float(state.reference.geometry.wavelength_m),
+            grid_identity=grid_identity,
         )
     pri_power = state.reference_deramped.real**2 + state.reference_deramped.imag**2
     sec_power = state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
@@ -558,9 +583,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     t0 = time.perf_counter()
     if coregistration_grid == "geo":
         state.complex_ifg_flat = state.complex_ifg
-        state.note(
-            "FLATTEN applied to secondary geocoded SLC before IFG formation"
-        )
+        state.note("FLATTEN applied to secondary geocoded SLC before IFG formation")
         stage_times["flatten"] = 0.0
     else:
         state = stage_flatten(state)
@@ -608,9 +631,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         height_path = str(base) + ".height.f64"
         height_full = state.geo_height_field
         if height_full is None:
-            height_full = np.full(
-                ifg_full.shape, float(geo_height_m), dtype=np.float64
-            )
+            height_full = np.full(ifg_full.shape, float(geo_height_m), dtype=np.float64)
         else:
             height_full = np.asarray(height_full, dtype=np.float64)
         lr0, lr1, lc0, lc1 = bbox_local
@@ -834,9 +855,7 @@ def read_prepared_geometry_field(
     """
     reader = getattr(provider, "read_prepared_geometry", None)
     if not callable(reader):
-        reject_invalid_state(
-            "prepared provider does not expose read_prepared_geometry"
-        )
+        reject_invalid_state("prepared provider does not expose read_prepared_geometry")
     from faninsar.processing.contracts.prepared_geometry import (
         PreparedGeometryArrayPayload,
     )
@@ -974,9 +993,7 @@ def _worker_prepared_provider(
             "prepared provider does not expose a worker generation attach seam"
         )
     if resource_limits is None:
-        reject_invalid_state(
-            "prepared LUT worker attachment requires resource_limits"
-        )
+        reject_invalid_state("prepared LUT worker attachment requires resource_limits")
     attach(token, resource_limits)
     return provider
 
@@ -1559,8 +1576,10 @@ def stage_coregister(
             state.note(
                 f"Ampcor residual rg={amp_res_rg:.4f} px (forced common residual)"
             )
-        elif amplitude_refinement_enabled and np.isfinite(prior_rg) and np.isfinite(
-            prior_az
+        elif (
+            amplitude_refinement_enabled
+            and np.isfinite(prior_rg)
+            and np.isfinite(prior_az)
         ):
             amp_rg, amp_az = refine_shift_with_correlation(
                 ref,
@@ -2832,9 +2851,7 @@ def _roi_geometry(roi: BoundingBox | Polygons) -> Any:
     if isinstance(roi, BoundingBox):
         return box(roi.left, roi.bottom, roi.right, roi.top)
     series = roi.geometry
-    union = (
-        series.union_all() if hasattr(series, "union_all") else series.unary_union
-    )
+    union = series.union_all() if hasattr(series, "union_all") else series.unary_union
     crs = getattr(roi, "crs", None)
     if crs is not None and str(crs) != "EPSG:4326":
         import geopandas as gpd
@@ -3046,18 +3063,14 @@ def _roi_burst_window(
     quad = burst_geo_quad_lonlat(geometry, shape, dem)
     if quad is not None:
         intersection = region.intersection(ShapelyPolygon(quad).buffer(0))
-        parts = [
-            part for part in polygon_parts(intersection) if not part.is_empty
-        ]
+        parts = [part for part in polygon_parts(intersection) if not part.is_empty]
     else:
         parts = []
     if parts:
         rings: list[np.ndarray] = []
         for polygon in parts:
             rings.append(np.asarray(polygon.exterior.coords))
-            rings.extend(
-                np.asarray(interior.coords) for interior in polygon.interiors
-            )
+            rings.extend(np.asarray(interior.coords) for interior in polygon.interiors)
         points = np.concatenate(rings)
         lon = points[:, 0]
         lat = points[:, 1]
@@ -3168,9 +3181,7 @@ def run_pair(
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
-    prepared_geo_lut_handles: Mapping[
-        str, tuple[PreparedLutHandle, ProviderLeaseToken]
-    ]
+    prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
     | None = None,
     prepared_provider_root: str | Path | None = None,
     source_snapshot_root: str | Path | None = None,
@@ -3212,9 +3223,7 @@ def run_pair(
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
-    prepared_geo_lut_handles: Mapping[
-        str, tuple[PreparedLutHandle, ProviderLeaseToken]
-    ]
+    prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
     | None = None,
     prepared_provider_root: str | Path | None = None,
     source_snapshot_root: str | Path | None = None,
@@ -3257,9 +3266,7 @@ def run_pair(
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
-    prepared_geo_lut_handles: Mapping[
-        str, tuple[PreparedLutHandle, ProviderLeaseToken]
-    ]
+    prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
     | None = None,
     prepared_provider_root: str | Path | None = None,
     source_snapshot_root: str | Path | None = None,
@@ -3381,12 +3388,9 @@ def run_pair(
 
     """
     if (
-        (prepared_geo_lut_handles is not None or prepared_provider_root is not None)
-        and coregistration_grid != "geo"
-    ):
-        reject_invalid_state(
-            "prepared Geo LUT reuse requires geo coregistration"
-        )
+        prepared_geo_lut_handles is not None or prepared_provider_root is not None
+    ) and coregistration_grid != "geo":
+        reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
     if not _is_multilook_pair(multilook) or coregistration_grid == "geo":
         return _run_pair_sweep(
             reference_path,
@@ -3869,8 +3873,10 @@ def run_pair(
                     tag=tag,
                     reference=np.asarray(state.reference_deramped, dtype=np.complex64),
                     secondary=np.asarray(state.secondary_aligned, dtype=np.complex64),
-                    row_origin=burst_row0,
-                    col_origin=burst_col0,
+                    row_origin=azimuth_offset + burst_row0,
+                    col_origin=range_offsets[swath] + burst_col0,
+                    grid_shape=(frame_rows, frame_cols),
+                    wavelength_m=float(state.reference.geometry.wavelength_m),
                 )
             pri_power = (
                 state.reference_deramped.real**2 + state.reference_deramped.imag**2
@@ -4059,9 +4065,7 @@ def _run_pair_sweep(
     geoid_correction: bool,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
-    prepared_geo_lut_handles: Mapping[
-        str, tuple[PreparedLutHandle, ProviderLeaseToken]
-    ]
+    prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
     | None = None,
     prepared_provider_root: str | Path | None = None,
     source_snapshot_root: str | Path | None = None,
@@ -4329,6 +4333,8 @@ def _run_pair_sweep(
             secondary_products=secondary_products,
             swath_tuple=swath_tuple,
             units_by_swath=units_by_swath,
+            range_offsets=range_offsets,
+            frame_shape=(frame_rows, frame_cols),
             roi=roi,
             dem_sampler=dem_sampler,
             control_spacing=control_spacing,
@@ -4406,6 +4412,8 @@ def _archive_burst_ifgs(
     secondary_products: Sequence[object],
     swath_tuple: tuple[str, ...],
     units_by_swath: dict[str, list[tuple[int, int, int]]],
+    range_offsets: dict[str, int],
+    frame_shape: tuple[int, int],
     roi: BoundingBox | Polygons | None,
     dem_sampler: DEMSampler,
     control_spacing: int | None,
@@ -4422,9 +4430,7 @@ def _archive_burst_ifgs(
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
-    prepared_geo_lut_handles: Mapping[
-        str, tuple[PreparedLutHandle, ProviderLeaseToken]
-    ]
+    prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
     | None = None,
     prepared_provider_root: str | Path | None = None,
     roi_buffer_m: float = 320.0,
@@ -4560,6 +4566,7 @@ def _archive_burst_ifgs(
                     "frame_index": frame_index,
                     "burst_index": burst_index,
                     "azimuth_offset": azimuth_offset,
+                    "range_offset": range_offsets[swath],
                     "ref_path": ref_paths[frame_index],
                     "sec_path": sec_paths[frame_index],
                     "ref_orbit": ref_orbits[frame_index],
@@ -4582,6 +4589,11 @@ def _archive_burst_ifgs(
                     "dem": dem_sampler,
                     "geo_work_dir": geo_work_dir,
                     "scene_store_dir": scene_store_dir,
+                    "scene_grid_shape": (
+                        geo_grid.shape
+                        if coregistration_grid == "geo" and geo_grid is not None
+                        else frame_shape
+                    ),
                     "prepared_geo_lut_handle": prepared_lut_handle,
                     "prepared_provider_token": prepared_provider_token,
                     "prepared_provider_root": prepared_provider_root,
@@ -4595,9 +4607,9 @@ def _archive_burst_ifgs(
     expected_tags = tuple(str(task["tag"]) for task in task_args)
     if len(expected_tags) != len(set(expected_tags)):
         reject_invalid_state("burst selection contains duplicate unit tags")
-    if prepared_geo_lut_handles is not None and set(
-        prepared_geo_lut_handles
-    ) != set(expected_tags):
+    if prepared_geo_lut_handles is not None and set(prepared_geo_lut_handles) != set(
+        expected_tags
+    ):
         reject_invalid_state(
             "prepared Geo LUT handles must cover exactly the selected burst tags"
         )
@@ -4625,6 +4637,7 @@ def _archive_burst_ifgs(
     with admission_context:
         if n_jobs > 1 and len(task_args) > 1:
             from concurrent.futures import ProcessPoolExecutor
+
             pool_kwargs: dict[str, object] = {"max_workers": n_jobs}
             if resource_limits is not None:
                 from multiprocessing import get_context
@@ -4696,8 +4709,7 @@ def _archive_burst_ifgs(
             observations = [
                 float(unit[name])
                 for unit, _ in ordered_results
-                if unit.get(name) is not None
-                and np.isfinite(float(unit[name]))
+                if unit.get(name) is not None and np.isfinite(float(unit[name]))
             ]
             if observations:
                 setattr(

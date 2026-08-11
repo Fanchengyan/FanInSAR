@@ -6,14 +6,13 @@ import warnings
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.stack.catalog import scene_id_from_path
 from faninsar.processing.timeseries.inversion import (
     TimeSeriesResult,
-    invert_unwrapped_pairs,
     write_timeseries_zarr,
 )
 
@@ -25,18 +24,51 @@ if TYPE_CHECKING:
         StackActivationBinding,
     )
     from faninsar.processing.geometry.dem import DEMSampler
-    from faninsar.processing.pipeline.production import ProductionPairState
+    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.pipeline.production import (
+        BurstSelection,
+        CoregistrationGrid,
+    )
     from faninsar.processing.stack.config import ActivationMode
 
 logger = setup_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
+class StackInterferogramResult:
+    """Immutable public reference to one persisted Stack interferogram.
+
+    Attributes
+    ----------
+    pair_id : str
+        Canonical ``primary_secondary`` identifier.
+    artifact_root : pathlib.Path
+        Reopenable manifest-bound IFG artifact root.
+    manifest_digest : str
+        SHA-256 identity of the committed IFG manifest.
+    shape : tuple[int, int]
+        Common-grid product shape after multilooking.
+    multilook : tuple[int, int]
+        Azimuth and range look factors.
+    domain : {"radar", "geo"}
+        Artifact coordinate domain.
+
+    """
+
+    pair_id: str
+    artifact_root: Path
+    manifest_digest: str
+    shape: tuple[int, int]
+    multilook: tuple[int, int]
+    domain: Literal["radar", "geo"]
+
+
+@dataclass(frozen=True, slots=True)
 class StackPipelineResult:
-    """Outputs of a multi-scene pair stack run."""
+    """Public persisted outputs of a multi-scene Stack run."""
 
     scene_ids: tuple[str, ...]
-    pair_results: tuple[ProductionPairState, ...]
+    pair_results: tuple[StackInterferogramResult, ...]
     timeseries: TimeSeriesResult | None
     timeseries_zarr: Path | None
 
@@ -56,6 +88,10 @@ def run_stack_pipeline(
     pairs: Sequence[tuple[str, str]] | None = None,
     swath: str = "IW1",
     burst_index: int = 0,
+    swaths: tuple[str, ...] | None = None,
+    bursts: BurstSelection | None = None,
+    coregistration_grid: CoregistrationGrid = "radar",
+    geo_grid: GeoGridSpec | None = None,
     height: int = 256,
     width: int = 256,
     multilook: tuple[int, int] = (2, 8),
@@ -84,14 +120,21 @@ def run_stack_pipeline(
         for legacy behavior of this helper (Stack defaults use short baseline
         when constructed via :meth:`Stack.from_safes` without pairs).
     swath, burst_index : optional
-        Common burst selection for every scene.
+        Backwards-compatible single-burst selection.
+    swaths, bursts : optional
+        Explicit multi-swath and multi-burst selection. When supplied, these
+        override ``swath`` and ``burst_index``.
+    coregistration_grid : {"radar", "geo"}, optional
+        Common Stack artifact coordinate domain.
+    geo_grid : GeoGridSpec, optional
+        Required projected grid when ``coregistration_grid="geo"``.
     height, width : optional
         Deprecated window size (ignored; production uses full burst).
     multilook, goldstein_alpha : optional
         Interferogram parameters.
     invert_timeseries : bool, optional
-        Run SBAS after pairs complete (requires unwrapped phases; currently
-        only records None unless pair states carry unwrapped products).
+        Run spatial unwrap, temporal phase reconciliation, and SBAS after all
+        common-grid pair artifacts are complete.
     executor : {"torch"}, optional
         Unified Torch coregistration and LUT Lanczos path.
     device : {"auto","cpu","cuda"}, optional
@@ -129,6 +172,11 @@ def run_stack_pipeline(
     from faninsar.core.pairs import Pairs
     from faninsar.processing.stack.session import Stack
 
+    resolved_swaths = swaths or (swath,)
+    resolved_bursts = bursts or {name: [burst_index] for name in resolved_swaths}
+    if coregistration_grid == "geo" and geo_grid is None:
+        reject_invalid_state("Geo Stack pipeline requires geo_grid")
+
     stack = Stack.from_safes(
         paths,
         work_dir=output_dir,
@@ -139,15 +187,17 @@ def run_stack_pipeline(
         device=device,
         invert_device=invert_device,
         coreg_mode=coreg_mode,  # type: ignore[arg-type]
+        coregistration_grid=coregistration_grid,
+        geo_grid=geo_grid,
         activation_mode=activation_mode,
         activation_binding=activation_binding,
         activation_token=activation_token,
         activation_authority_root=activation_authority_root,
-        swaths=(swath,),
-        bursts={swath: [burst_index]},
-        # Retain heavy pair states only when the optional in-memory time-series
-        # path needs them; scene-artifact production stays bounded by default.
-        retain_pair_states=invert_timeseries,
+        swaths=resolved_swaths,
+        bursts=resolved_bursts,
+        # The persisted IFG/unwrap/SBAS path never consumes in-memory Pair
+        # states. Keeping them would scale RSS with acquisition count.
+        retain_pair_states=False,
     )
     if pairs is not None:
         names = [f"{a}_{b}" for a, b in pairs]
@@ -161,34 +211,39 @@ def run_stack_pipeline(
     stack.coregister_scenes()
     stack.form_interferograms()
 
-    pair_states = tuple(stack.pair_states.values())
+    from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
+
+    pair_results = tuple(
+        StackInterferogramResult(
+            pair_id=f"{store.pair[0]}_{store.pair[1]}",
+            artifact_root=store.root,
+            manifest_digest=store.manifest_digest,
+            shape=store.shape,
+            multilook=store.looks,
+            domain=store.domain,
+        )
+        for store in (InterferogramArtifactStore.open(path) for path in stack.ifg_dirs)
+    )
     timeseries = None
     timeseries_zarr = None
     if invert_timeseries:
-        pair_phases: dict[str, object] = {}
-        for pid, state in stack.pair_states.items():
-            if state.unwrapped_phase is not None:
-                pair_phases[pid] = state.unwrapped_phase
-        if pair_phases:
-            timeseries = invert_unwrapped_pairs(
-                pair_phases,  # type: ignore[arg-type]
-                device=invert_device,
-            )
-            timeseries_zarr = write_timeseries_zarr(
-                timeseries,
-                Path(output_dir) / "timeseries.zarr",
-            )
+        stack.unwrap()
+        timeseries = stack.invert_timeseries(device=invert_device)
+        timeseries_zarr = write_timeseries_zarr(
+            timeseries,
+            Path(output_dir) / "timeseries.zarr",
+        )
 
     logger.info(
         "Stack complete: %s scenes, %s pair states under %s mode=%s",
         len(stack.catalog),
-        len(pair_states),
+        len(pair_results),
         output_dir,
         stack.config.coreg_mode,
     )
     return StackPipelineResult(
         scene_ids=stack.catalog.dates,
-        pair_results=pair_states,
+        pair_results=pair_results,
         timeseries=timeseries,
         timeseries_zarr=timeseries_zarr,
     )

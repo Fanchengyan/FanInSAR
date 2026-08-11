@@ -34,6 +34,7 @@ from .production import (
 )
 from .products import PairProductArrays, write_pair_stac_item, write_pair_zarr
 from .stack_pipeline import (
+    StackInterferogramResult,
     StackPipelineResult,
     default_pair_list,
     load_safe_burst_windows,
@@ -60,6 +61,7 @@ __all__ = [
     "ProductionPairSweepResult",
     "ProductionScene",
     "SceneBurstData",
+    "StackInterferogramResult",
     "StackPipelineResult",
     "apply_lut_complex",
     "apply_lut_real",

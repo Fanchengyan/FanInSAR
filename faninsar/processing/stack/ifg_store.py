@@ -1,0 +1,691 @@
+"""Immutable manifest-bound storage for Stack interferogram artifacts."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Self
+
+import numpy as np
+
+from faninsar.logging import setup_logger
+from faninsar.processing.errors import reject_invalid_state
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+logger = setup_logger(__name__)
+
+IFG_ARTIFACT_SCHEMA = "stack_ifg_artifact_v1"
+UNWRAP_ARTIFACT_SCHEMA = "stack_unwrap_artifact_v1"
+_MAX_MANIFEST_BYTES = 1024 * 1024
+_IFG_FILENAMES = {
+    "complex_ifg": "complex_ifg.npy",
+    "coherence": "coherence.npy",
+    "wrapped_phase": "wrapped_phase.npy",
+    "amplitude": "amplitude.npy",
+}
+_UNWRAP_FILENAMES = {
+    "unwrapped_phase": "unwrapped_phase.npy",
+    "connected_components": "connected_components.npy",
+}
+
+
+def _canonical_json(value: Mapping[str, Any]) -> bytes:
+    """Serialize a manifest frame deterministically."""
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        reject_invalid_state(f"artifact metadata is not canonical JSON: {error}")
+
+
+def _digest_bytes(payload: bytes) -> str:
+    """Return the lowercase SHA-256 digest for bytes."""
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _digest_file(path: Path) -> str:
+    """Hash one artifact payload without loading it into memory."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        reject_invalid_state(f"artifact payload cannot be hashed: {error}")
+    return digest.hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    """Return whether a value is a canonical lowercase SHA-256 digest."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _reject_symlink_components(path: Path) -> None:
+    """Reject existing symbolic-link components in an artifact path."""
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            if current.is_symlink():
+                reject_invalid_state(
+                    f"artifact store path contains a symbolic link: {current}"
+                )
+        except OSError as error:
+            reject_invalid_state(f"artifact store path cannot be inspected: {error}")
+
+
+def _store_root(root: str | Path, *, create: bool) -> Path:
+    """Resolve and validate one caller-owned artifact directory."""
+    path = Path(root)
+    _reject_symlink_components(path)
+    if path.exists():
+        if not path.is_dir() or path.is_symlink():
+            reject_invalid_state(f"artifact store root is unsafe: {path}")
+    elif create:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            reject_invalid_state(f"artifact store root cannot be created: {error}")
+        _reject_symlink_components(path)
+    else:
+        reject_invalid_state(f"artifact store root is missing: {path}")
+    return path
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    """Read one bounded, regular, non-symlink JSON manifest."""
+    if not path.is_file() or path.is_symlink():
+        reject_invalid_state(f"artifact manifest missing or unsafe: {path}")
+    try:
+        if path.stat().st_size > _MAX_MANIFEST_BYTES:
+            reject_invalid_state(f"artifact manifest exceeds size limit: {path}")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as error:
+        reject_invalid_state(f"artifact manifest cannot be read: {error}")
+    if not isinstance(value, dict):
+        reject_invalid_state("artifact manifest must be a JSON object")
+    return value
+
+
+def _verified_manifest(path: Path, schema: str) -> dict[str, Any]:
+    """Read a complete manifest and verify its self-digest."""
+    manifest = _read_json(path)
+    if manifest.get("schema_version") != schema:
+        reject_invalid_state("unsupported artifact manifest schema")
+    if manifest.get("status") != "complete":
+        reject_invalid_state("artifact manifest is not complete")
+    expected = manifest.get("manifest_digest")
+    unsigned = dict(manifest)
+    unsigned.pop("manifest_digest", None)
+    actual = _digest_bytes(_canonical_json(unsigned))
+    if expected != actual:
+        reject_invalid_state("artifact manifest digest mismatch")
+    return manifest
+
+
+def _atomic_save(path: Path, array: np.ndarray) -> None:
+    """Durably publish one NumPy payload through a same-directory rename."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            np.save(stream, array, allow_pickle=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except OSError as error:
+        reject_invalid_state(f"artifact payload publication failed: {error}")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
+    """Publish a manifest last, after all referenced payloads are durable."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    text = json.dumps(manifest, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as error:
+        reject_invalid_state(f"artifact manifest publication failed: {error}")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _array_descriptor(path: Path, array: np.ndarray) -> dict[str, Any]:
+    """Build immutable metadata for one already-published array."""
+    return {
+        "file": path.name,
+        "shape": [int(size) for size in array.shape],
+        "dtype": array.dtype.str,
+        "sha256": _digest_file(path),
+    }
+
+
+def _validate_shape(value: object, field: str) -> tuple[int, int]:
+    """Decode a positive two-dimensional manifest shape."""
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(
+            not isinstance(size, int) or isinstance(size, bool) or size <= 0
+            for size in value
+        )
+    ):
+        reject_invalid_state(f"artifact {field} must be a positive 2-D shape")
+    return int(value[0]), int(value[1])
+
+
+def _validate_payload_table(
+    root: Path,
+    raw_payloads: object,
+    expected_filenames: Mapping[str, str],
+    expected_shape: tuple[int, int],
+) -> dict[str, dict[str, Any]]:
+    """Validate payload descriptors without trusting manifest paths."""
+    if not isinstance(raw_payloads, dict) or set(raw_payloads) != set(
+        expected_filenames
+    ):
+        reject_invalid_state("artifact payload table is incomplete")
+    payloads: dict[str, dict[str, Any]] = {}
+    for name, filename in expected_filenames.items():
+        raw = raw_payloads[name]
+        if not isinstance(raw, dict) or raw.get("file") != filename:
+            reject_invalid_state(f"artifact payload descriptor is invalid: {name}")
+        if _validate_shape(raw.get("shape"), f"{name} shape") != expected_shape:
+            reject_invalid_state(f"artifact payload shape mismatch: {name}")
+        try:
+            dtype = np.dtype(raw.get("dtype"))
+        except (TypeError, ValueError) as error:
+            reject_invalid_state(f"artifact payload dtype is invalid: {error}")
+        if dtype.hasobject or not _is_sha256(raw.get("sha256")):
+            reject_invalid_state(f"artifact payload metadata is unsafe: {name}")
+        path = root / filename
+        _reject_symlink_components(path)
+        if not path.is_file() or path.is_symlink():
+            reject_invalid_state(f"artifact payload missing or unsafe: {path}")
+        payloads[name] = dict(raw)
+    return payloads
+
+
+def _read_payloads(
+    root: Path,
+    descriptors: Mapping[str, Mapping[str, Any]],
+) -> dict[str, np.ndarray]:
+    """Hash, load, and revalidate every payload in a generation."""
+    arrays: dict[str, np.ndarray] = {}
+    for name, descriptor in descriptors.items():
+        path = root / str(descriptor["file"])
+        if _digest_file(path) != descriptor["sha256"]:
+            reject_invalid_state(f"artifact payload digest mismatch: {name}")
+        try:
+            array = np.load(path, allow_pickle=False)
+        except (OSError, ValueError, EOFError) as error:
+            reject_invalid_state(f"artifact payload cannot be loaded: {error}")
+        expected_shape = tuple(int(size) for size in descriptor["shape"])
+        if array.shape != expected_shape or array.dtype.str != descriptor["dtype"]:
+            reject_invalid_state(f"artifact payload shape or dtype mismatch: {name}")
+        arrays[name] = array
+    return arrays
+
+
+def _validate_json_mapping(value: object, field: str) -> dict[str, Any]:
+    """Validate string-keyed metadata by canonical JSON round-trip."""
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        reject_invalid_state(f"artifact {field} must be an object")
+    _canonical_json(value)
+    return dict(value)
+
+
+@dataclass(frozen=True, slots=True)
+class InterferogramArtifact:
+    """Validated arrays from one complete interferogram generation.
+
+    Attributes
+    ----------
+    complex_ifg, coherence, wrapped_phase, amplitude : numpy.ndarray
+        Hash-validated product layers sharing one grid.
+
+    """
+
+    complex_ifg: np.ndarray
+    coherence: np.ndarray
+    wrapped_phase: np.ndarray
+    amplitude: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class UnwrappedArtifact:
+    """Validated unwrapped arrays bound to one interferogram generation.
+
+    Attributes
+    ----------
+    unwrapped_phase, connected_components : numpy.ndarray
+        Hash-validated unwrap result layers.
+    method : str
+        Unwrapping method name recorded at publication.
+    method_parameters : dict[str, object]
+        Canonical JSON method configuration.
+    ifg_manifest_digest : str
+        Exact source IFG manifest digest.
+
+    """
+
+    unwrapped_phase: np.ndarray
+    connected_components: np.ndarray
+    method: str
+    method_parameters: dict[str, Any]
+    ifg_manifest_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class InterferogramArtifactStore:
+    """Read-only metadata and validated access for one Stack pair artifact.
+
+    Attributes
+    ----------
+    root : pathlib.Path
+        Validated artifact directory.
+    pair : tuple[str, str]
+        Reference and secondary acquisition identifiers.
+    looks : tuple[int, int]
+        Applied azimuth and range look factors.
+    filter_name : str
+        Applied filter name.
+    filter_parameters : dict[str, object]
+        Canonical JSON filter configuration.
+    source_manifest_digests : dict[str, str]
+        Named source scene manifest digests.
+    shape : tuple[int, int]
+        Shared output grid shape.
+    manifest_digest : str
+        SHA-256 digest of the canonical base manifest.
+
+    """
+
+    root: Path
+    pair: tuple[str, str]
+    domain: str
+    wavelength_m: float | None
+    grid_identity: str
+    looks: tuple[int, int]
+    filter_name: str
+    filter_parameters: dict[str, Any]
+    source_manifest_digests: dict[str, str]
+    shape: tuple[int, int]
+    manifest_digest: str
+    _payloads: dict[str, dict[str, Any]]
+
+    @classmethod
+    def open(cls, root: str | Path) -> Self:
+        """Open and validate a complete Stack interferogram generation.
+
+        Parameters
+        ----------
+        root : str or pathlib.Path
+            Artifact directory containing ``manifest.json``.
+
+        Returns
+        -------
+        InterferogramArtifactStore
+            Validated, read-only store metadata.
+
+        """
+        path = _store_root(root, create=False)
+        manifest = _verified_manifest(path / "manifest.json", IFG_ARTIFACT_SCHEMA)
+        raw_pair = manifest.get("pair")
+        if (
+            not isinstance(raw_pair, list)
+            or len(raw_pair) != 2
+            or any(not isinstance(value, str) or not value for value in raw_pair)
+        ):
+            reject_invalid_state("artifact pair must contain two non-empty ids")
+        raw_looks = manifest.get("looks")
+        if (
+            not isinstance(raw_looks, list)
+            or len(raw_looks) != 2
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 1
+                for value in raw_looks
+            )
+        ):
+            reject_invalid_state("artifact looks must contain two positive integers")
+        domain = manifest.get("domain", "radar")
+        if domain not in {"radar", "geo"}:
+            reject_invalid_state("artifact domain is invalid")
+        raw_wavelength = manifest.get("wavelength_m")
+        wavelength_m = None if raw_wavelength is None else float(raw_wavelength)
+        if wavelength_m is not None and (
+            not np.isfinite(wavelength_m) or wavelength_m <= 0.0
+        ):
+            reject_invalid_state("artifact wavelength_m is invalid")
+        grid_identity = manifest.get("grid_identity")
+        if not _is_sha256(grid_identity):
+            reject_invalid_state("artifact grid_identity is invalid")
+        raw_filter = manifest.get("filter")
+        if (
+            not isinstance(raw_filter, dict)
+            or not isinstance(raw_filter.get("name"), str)
+            or not raw_filter["name"]
+        ):
+            reject_invalid_state("artifact filter metadata is invalid")
+        filter_parameters = _validate_json_mapping(
+            raw_filter.get("parameters"), "filter parameters"
+        )
+        sources = manifest.get("source_manifest_digests")
+        if (
+            not isinstance(sources, dict)
+            or not sources
+            or any(
+                not isinstance(name, str) or not name or not _is_sha256(digest)
+                for name, digest in sources.items()
+            )
+        ):
+            reject_invalid_state("artifact source manifest digests are invalid")
+        shape = _validate_shape(manifest.get("shape"), "shape")
+        payloads = _validate_payload_table(
+            path, manifest.get("payloads"), _IFG_FILENAMES, shape
+        )
+        digest = str(manifest["manifest_digest"])
+        return cls(
+            root=path,
+            pair=(raw_pair[0], raw_pair[1]),
+            domain=str(domain),
+            wavelength_m=wavelength_m,
+            grid_identity=str(grid_identity),
+            looks=(raw_looks[0], raw_looks[1]),
+            filter_name=str(raw_filter["name"]),
+            filter_parameters=filter_parameters,
+            source_manifest_digests={str(k): str(v) for k, v in sources.items()},
+            shape=shape,
+            manifest_digest=digest,
+            _payloads=payloads,
+        )
+
+    def read(self) -> InterferogramArtifact:
+        """Read all IFG layers after validating hashes, shapes, and dtypes."""
+        arrays = _read_payloads(self.root, self._payloads)
+        if arrays["complex_ifg"].dtype.kind != "c" or any(
+            arrays[name].dtype.kind != "f"
+            for name in ("coherence", "wrapped_phase", "amplitude")
+        ):
+            reject_invalid_state("artifact IFG layer dtypes are incompatible")
+        return InterferogramArtifact(
+            complex_ifg=arrays["complex_ifg"],
+            coherence=arrays["coherence"],
+            wrapped_phase=arrays["wrapped_phase"],
+            amplitude=arrays["amplitude"],
+        )
+
+    def read_unwrapped(self) -> UnwrappedArtifact:
+        """Read the complete unwrap generation bound to this exact IFG."""
+        manifest = _verified_manifest(
+            self.root / "unwrap_manifest.json", UNWRAP_ARTIFACT_SCHEMA
+        )
+        if manifest.get("ifg_manifest_digest") != self.manifest_digest:
+            reject_invalid_state("unwrap artifact is bound to a different IFG")
+        if _validate_shape(manifest.get("shape"), "unwrap shape") != self.shape:
+            reject_invalid_state("unwrap artifact shape differs from its IFG")
+        raw_method = manifest.get("method")
+        if (
+            not isinstance(raw_method, dict)
+            or not isinstance(raw_method.get("name"), str)
+            or not raw_method["name"]
+        ):
+            reject_invalid_state("unwrap method metadata is invalid")
+        parameters = _validate_json_mapping(
+            raw_method.get("parameters"), "unwrap method parameters"
+        )
+        descriptors = _validate_payload_table(
+            self.root,
+            manifest.get("payloads"),
+            _UNWRAP_FILENAMES,
+            self.shape,
+        )
+        arrays = _read_payloads(self.root, descriptors)
+        if (
+            arrays["unwrapped_phase"].dtype.kind != "f"
+            or arrays["connected_components"].dtype.kind not in "iu"
+        ):
+            reject_invalid_state("unwrap artifact layer dtypes are incompatible")
+        return UnwrappedArtifact(
+            unwrapped_phase=arrays["unwrapped_phase"],
+            connected_components=arrays["connected_components"],
+            method=str(raw_method["name"]),
+            method_parameters=parameters,
+            ifg_manifest_digest=self.manifest_digest,
+        )
+
+
+def write_ifg_artifact(
+    root: str | Path,
+    *,
+    pair: tuple[str, str],
+    looks: tuple[int, int],
+    domain: str = "radar",
+    wavelength_m: float | None = None,
+    grid_identity: str | None = None,
+    filter_name: str,
+    filter_parameters: Mapping[str, Any],
+    source_manifest_digests: Mapping[str, str],
+    complex_ifg: np.ndarray,
+    coherence: np.ndarray,
+    wrapped_phase: np.ndarray,
+    amplitude: np.ndarray,
+) -> InterferogramArtifactStore:
+    """Atomically persist one complete derived interferogram generation.
+
+    Payloads are made durable first and ``manifest.json`` is published last.
+    A visible manifest therefore always names a complete generation.
+
+    Parameters
+    ----------
+    root : str or pathlib.Path
+        Destination artifact directory.
+    pair : tuple[str, str]
+        Reference and secondary acquisition identifiers.
+    looks : tuple[int, int]
+        Applied azimuth and range look factors.
+    domain : {"radar", "geo"}, optional
+        Common output coordinate domain.
+    wavelength_m : float, optional
+        Radar wavelength used for phase-to-displacement conversion.
+    grid_identity : str, optional
+        Canonical source scene coordinate-grid identity. When omitted, a
+        deterministic compatibility identity is derived from domain and shape.
+    filter_name : str
+        Applied filter name, or ``"none"``.
+    filter_parameters : mapping
+        Canonical JSON parameters for the filter.
+    source_manifest_digests : mapping[str, str]
+        Named SHA-256 digests of every source scene manifest.
+    complex_ifg, coherence, wrapped_phase, amplitude : numpy.ndarray
+        Matching two-dimensional IFG product layers.
+
+    Returns
+    -------
+    InterferogramArtifactStore
+        Reopened, validated artifact store.
+
+    """
+    arrays = {
+        "complex_ifg": np.asarray(complex_ifg),
+        "coherence": np.asarray(coherence),
+        "wrapped_phase": np.asarray(wrapped_phase),
+        "amplitude": np.asarray(amplitude),
+    }
+    shapes = {array.shape for array in arrays.values()}
+    if len(shapes) != 1:
+        reject_invalid_state("IFG artifact layers must share one shape")
+    shape = next(iter(shapes))
+    if len(shape) != 2 or any(size <= 0 for size in shape):
+        reject_invalid_state("IFG artifact layers must be non-empty 2-D arrays")
+    if arrays["complex_ifg"].dtype.kind != "c" or any(
+        arrays[name].dtype.kind != "f"
+        for name in ("coherence", "wrapped_phase", "amplitude")
+    ):
+        reject_invalid_state("IFG artifact layer dtypes are incompatible")
+    if (
+        len(pair) != 2
+        or any(not isinstance(value, str) or not value for value in pair)
+        or len(looks) != 2
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in looks
+        )
+        or not isinstance(filter_name, str)
+        or not filter_name
+        or domain not in {"radar", "geo"}
+    ):
+        reject_invalid_state("IFG artifact processing metadata is invalid")
+    if wavelength_m is not None and (
+        not np.isfinite(wavelength_m) or wavelength_m <= 0.0
+    ):
+        reject_invalid_state("IFG artifact wavelength_m is invalid")
+    if domain == "geo" and grid_identity is None:
+        reject_invalid_state("Geo IFG publication requires an explicit grid_identity")
+    resolved_grid_identity = grid_identity or _digest_bytes(
+        _canonical_json(
+            {
+                "domain": domain,
+                "shape": [int(shape[0]), int(shape[1])],
+            }
+        )
+    )
+    if not _is_sha256(resolved_grid_identity):
+        reject_invalid_state("IFG artifact grid_identity is invalid")
+    parameters = dict(filter_parameters)
+    _canonical_json(parameters)
+    sources = dict(source_manifest_digests)
+    if not sources or any(
+        not isinstance(name, str) or not name or not _is_sha256(digest)
+        for name, digest in sources.items()
+    ):
+        reject_invalid_state("IFG artifact source manifest digests are invalid")
+
+    path = _store_root(root, create=True)
+    manifest_path = path / "manifest.json"
+    if manifest_path.exists():
+        reject_invalid_state("IFG artifact generation is already published")
+    descriptors: dict[str, dict[str, Any]] = {}
+    for name, filename in _IFG_FILENAMES.items():
+        payload_path = path / filename
+        _atomic_save(payload_path, arrays[name])
+        descriptors[name] = _array_descriptor(payload_path, arrays[name])
+    unsigned: dict[str, Any] = {
+        "schema_version": IFG_ARTIFACT_SCHEMA,
+        "status": "complete",
+        "pair": list(pair),
+        "looks": list(looks),
+        "domain": domain,
+        "wavelength_m": wavelength_m,
+        "grid_identity": resolved_grid_identity,
+        "filter": {"name": filter_name, "parameters": parameters},
+        "source_manifest_digests": sources,
+        "shape": [int(shape[0]), int(shape[1])],
+        "payloads": descriptors,
+    }
+    manifest = {**unsigned, "manifest_digest": _digest_bytes(_canonical_json(unsigned))}
+    _atomic_manifest(manifest_path, manifest)
+    logger.info("Published IFG artifact %s for pair %s", path, pair)
+    return InterferogramArtifactStore.open(path)
+
+
+def write_unwrapped_artifact(
+    root: str | Path,
+    *,
+    unwrapped_phase: np.ndarray,
+    connected_components: np.ndarray,
+    method: str,
+    method_parameters: Mapping[str, Any],
+    ifg_manifest_digest: str,
+) -> None:
+    """Atomically persist unwrap layers bound to one exact IFG generation.
+
+    Parameters
+    ----------
+    root : str or pathlib.Path
+        Existing complete IFG artifact directory.
+    unwrapped_phase : numpy.ndarray
+        Floating-point unwrapped phase in radians.
+    connected_components : numpy.ndarray
+        Integer connected-component labels.
+    method : str
+        Unwrapping backend or method name.
+    method_parameters : mapping
+        Canonical JSON parameters for the unwrapping method.
+    ifg_manifest_digest : str
+        Digest returned by :class:`InterferogramArtifactStore`.
+
+    """
+    store = InterferogramArtifactStore.open(root)
+    if ifg_manifest_digest != store.manifest_digest:
+        reject_invalid_state("unwrap artifact IFG digest binding is invalid")
+    phase = np.asarray(unwrapped_phase)
+    components = np.asarray(connected_components)
+    if (
+        phase.shape != store.shape
+        or components.shape != store.shape
+        or phase.dtype.kind != "f"
+        or components.dtype.kind not in "iu"
+    ):
+        reject_invalid_state("unwrap layers must match the IFG shape and dtypes")
+    if not isinstance(method, str) or not method:
+        reject_invalid_state("unwrap method must not be empty")
+    parameters = dict(method_parameters)
+    _canonical_json(parameters)
+    manifest_path = store.root / "unwrap_manifest.json"
+    if manifest_path.exists():
+        reject_invalid_state("unwrap artifact generation is already published")
+    arrays = {
+        "unwrapped_phase": phase,
+        "connected_components": components,
+    }
+    descriptors: dict[str, dict[str, Any]] = {}
+    for name, filename in _UNWRAP_FILENAMES.items():
+        payload_path = store.root / filename
+        _atomic_save(payload_path, arrays[name])
+        descriptors[name] = _array_descriptor(payload_path, arrays[name])
+    unsigned: dict[str, Any] = {
+        "schema_version": UNWRAP_ARTIFACT_SCHEMA,
+        "status": "complete",
+        "ifg_manifest_digest": store.manifest_digest,
+        "shape": list(store.shape),
+        "method": {"name": method, "parameters": parameters},
+        "payloads": descriptors,
+    }
+    manifest = {**unsigned, "manifest_digest": _digest_bytes(_canonical_json(unsigned))}
+    _atomic_manifest(manifest_path, manifest)
+    logger.info("Published unwrap artifact %s with method %s", store.root, method)
+
+
+__all__ = [
+    "IFG_ARTIFACT_SCHEMA",
+    "UNWRAP_ARTIFACT_SCHEMA",
+    "InterferogramArtifact",
+    "InterferogramArtifactStore",
+    "UnwrappedArtifact",
+    "write_ifg_artifact",
+    "write_unwrapped_artifact",
+]

@@ -27,12 +27,38 @@ logger = setup_logger(__name__)
 _TWO_PI: float = 2.0 * np.pi
 _SINGULAR_COND: float = 1.0e12
 
+
 @dataclass(frozen=True, slots=True)
 class TemporalUnwrapResult:
-    """Unwrapped pair phases, integer 2π corrections, and IRLS diagnostics."""
+    """Unwrapped pair phases, integer 2π corrections, and IRLS diagnostics.
+
+    Attributes
+    ----------
+    phase_unw, corrections_k : numpy.ndarray
+        Temporal products. Pixels without convergence evidence are NaN.
+    converged_mask : numpy.ndarray
+        Spatial mask identifying published temporal solutions.
+    converged_pixels, unconverged_pixels : int
+        Counts over numerically solvable input pixels. Missing or singular
+        pixels are excluded from both counts.
+    converged_fraction : float
+        Fraction of solvable pixels that converged.
+    iterations : int
+        Maximum iteration count used by any pixel batch.
+    converged : bool
+        Whether every solvable pixel converged and at least one solution was
+        published.
+    method, device : str
+        Solver and resolved execution-device identities.
+
+    """
 
     phase_unw: np.ndarray
     corrections_k: np.ndarray
+    converged_mask: np.ndarray
+    converged_pixels: int
+    unconverged_pixels: int
+    converged_fraction: float
     iterations: int
     converged: bool
     method: str
@@ -210,8 +236,9 @@ def unwrap_temporal_irls(
 
     phase_unw_flat = np.full_like(phase_flat, np.nan, dtype=np.float64)
     corrections_flat = np.full_like(phase_flat, np.nan, dtype=np.float64)
-    last_iterations = 0
-    last_converged = False
+    converged_mask_flat = np.zeros(n_points, dtype=bool)
+    solvable_mask_flat = np.zeros(n_points, dtype=bool)
+    maximum_iterations = 0
 
     if batch_pixels < 1:
         reject_invalid_state("batch_pixels must be >= 1")
@@ -226,8 +253,20 @@ def unwrap_temporal_irls(
         prev_w = w_irls.clone()
         # Gauss-Newton IRLS: x <- x + dx, A dx ~ r
         x = torch.zeros((a_mat.shape[1], batch), dtype=dtype, device=torch_device)
-        converged = False
         iterations = 0
+        previous_corrections: torch.Tensor | None = None
+        stability_streak = torch.zeros(
+            batch,
+            dtype=torch.int16,
+            device=torch_device,
+        )
+        pixel_converged = torch.zeros(
+            batch,
+            dtype=torch.bool,
+            device=torch_device,
+        )
+        pixel_solvable = torch.zeros_like(pixel_converged)
+        accepted_corrections = torch.full_like(phi, float("nan"))
 
         for it in range(1, max_iter + 1):
             iterations = it
@@ -239,45 +278,98 @@ def unwrap_temporal_irls(
             x = x + dx
             w_irls = base_w / (res.abs() + epsilon)
 
-            delta_w = float(
-                (
-                    torch.linalg.vector_norm(w_irls - prev_w)
-                    / (torch.linalg.vector_norm(prev_w) + 1e-12)
-                ).item(),
+            delta_w = torch.linalg.vector_norm(w_irls - prev_w, dim=0) / (
+                torch.linalg.vector_norm(prev_w, dim=0) + 1e-12
             )
-            dx_finite = dx[:, torch.isfinite(dx).all(dim=0)]
-            delta_x = (
-                float(torch.linalg.vector_norm(dx_finite).item())
-                if dx_finite.numel() > 0
-                else 0.0
+            finite_solution = torch.isfinite(dx).all(dim=0) & torch.isfinite(x).all(
+                dim=0
             )
+            pixel_solvable |= finite_solution
+            delta_x = torch.linalg.vector_norm(
+                torch.nan_to_num(dx, nan=float("inf")),
+                dim=0,
+            )
+            current_corrections = torch.round(((a_t @ x) - phi) / _TWO_PI)
+            observed = base_w > 0
+            if previous_corrections is None:
+                corrections_stable = torch.zeros_like(pixel_converged)
+            else:
+                corrections_stable = (
+                    (current_corrections == previous_corrections) | ~observed
+                ).all(dim=0) & finite_solution
+            stability_streak = torch.where(
+                corrections_stable,
+                stability_streak + 1,
+                torch.zeros_like(stability_streak),
+            )
+            numerical_convergence = finite_solution & (
+                (delta_w < tol) | (delta_x < tol)
+            )
+            newly_converged = ~pixel_converged & (
+                numerical_convergence | (stability_streak >= 2)
+            )
+            if newly_converged.any():
+                accepted_corrections[:, newly_converged] = current_corrections[
+                    :, newly_converged
+                ]
+                pixel_converged |= newly_converged
+            previous_corrections = current_corrections
             prev_w = w_irls.clone()
-            if delta_w < tol or delta_x < tol:
-                converged = True
+            if pixel_solvable.any() and torch.all(pixel_converged[pixel_solvable]):
                 break
 
-        recon_final = a_t @ x
-        k = torch.round((recon_final - phi) / _TWO_PI)
+        k = accepted_corrections
         phi_unw = phi + _TWO_PI * k
-
-        bad = torch.isnan(x).any(dim=0)
-        if bad.any():
-            phi_unw[:, bad] = float("nan")
-            k[:, bad] = float("nan")
+        original_invalid = torch.as_tensor(
+            invalid[:, start:stop],
+            dtype=torch.bool,
+            device=torch_device,
+        )
+        phi_unw[original_invalid] = float("nan")
+        k[original_invalid] = float("nan")
 
         phase_unw_flat[:, start:stop] = _to_numpy(phi_unw)
         corrections_flat[:, start:stop] = _to_numpy(k)
-        last_iterations = iterations
-        last_converged = converged
+        converged_mask_flat[start:stop] = _to_numpy(pixel_converged)
+        solvable_mask_flat[start:stop] = _to_numpy(pixel_solvable)
+        maximum_iterations = max(maximum_iterations, iterations)
 
-        del phi, base_w, w_irls, prev_w, x, recon_final, k, phi_unw, dx
+        del (
+            phi,
+            base_w,
+            w_irls,
+            prev_w,
+            x,
+            k,
+            phi_unw,
+            dx,
+            previous_corrections,
+            stability_streak,
+            pixel_converged,
+            pixel_solvable,
+            accepted_corrections,
+            original_invalid,
+        )
         _cleanup_gpu(torch_device)
+
+    converged_pixels = int(converged_mask_flat.sum())
+    solvable_pixels = int(solvable_mask_flat.sum())
+    unconverged_pixels = int(
+        np.count_nonzero(solvable_mask_flat & ~converged_mask_flat)
+    )
+    converged_fraction = (
+        converged_pixels / solvable_pixels if solvable_pixels > 0 else 0.0
+    )
 
     return TemporalUnwrapResult(
         phase_unw=phase_unw_flat.reshape(n_pairs, *spatial_shape),
         corrections_k=corrections_flat.reshape(n_pairs, *spatial_shape),
-        iterations=last_iterations,
-        converged=last_converged,
+        converged_mask=converged_mask_flat.reshape(spatial_shape),
+        converged_pixels=converged_pixels,
+        unconverged_pixels=unconverged_pixels,
+        converged_fraction=converged_fraction,
+        iterations=maximum_iterations,
+        converged=converged_pixels > 0 and unconverged_pixels == 0,
         method="temporal_irls",
         device=str(torch_device),
     )

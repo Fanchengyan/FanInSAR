@@ -64,9 +64,9 @@ def test_stack_pipeline_uses_full_workflow(tmp_path: Path) -> None:
     )
     assert len(result.scene_ids) == 3
     assert len(result.pair_results) == 3
-    for state in result.pair_results:
-        assert state.zarr_path is not None
-        assert state.zarr_path.exists()
-        assert state.unwrapped_phase is not None
+    for pair_result in result.pair_results:
+        assert pair_result.artifact_root.exists()
+        assert (pair_result.artifact_root / "manifest.json").is_file()
+        assert len(pair_result.manifest_digest) == 64
     assert result.timeseries_zarr is not None
     assert result.timeseries_zarr.exists()

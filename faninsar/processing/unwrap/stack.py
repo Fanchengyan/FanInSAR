@@ -39,6 +39,9 @@ class StackUnwrapResult:
     phase_2d_unw : numpy.ndarray or None
         Pair phases after the 2D spatial stage (or the input when spatial is
         skipped), shape ``(n_pairs, H, W)``.
+    connected_components : numpy.ndarray or None
+        Spatial component labels aligned with ``phase_2d_unw``. Independent
+        islands remain available for per-pixel temporal rank validation.
     phase_1d_unw : numpy.ndarray or None
         Pair phases after the 1D temporal stage, or ``None`` when skipped.
     corrections_k : numpy.ndarray or None
@@ -53,12 +56,23 @@ class StackUnwrapResult:
         Spatial backend name requested (even if spatial was skipped).
     temporal_applied : bool
         Whether the 1D temporal stage ran.
+    temporal_iterations : int
+        Iterations reported by the temporal solver, or zero when skipped.
+    temporal_converged : bool
+        Whether every numerically solvable temporal pixel converged.
+    temporal_converged_mask : numpy.ndarray or None
+        Spatial mask of temporal solutions safe to publish.
+    temporal_converged_pixels, temporal_unconverged_pixels : int
+        Published and masked solvable-pixel counts.
+    temporal_converged_fraction : float
+        Fraction of solvable temporal pixels that converged.
     inverted : bool
         Whether the batch least-squares inversion stage ran.
 
     """
 
     phase_2d_unw: np.ndarray | None
+    connected_components: np.ndarray | None
     phase_1d_unw: np.ndarray | None
     corrections_k: np.ndarray | None
     timeseries: np.ndarray | None
@@ -66,6 +80,12 @@ class StackUnwrapResult:
     method: str
     spatial_method: str
     temporal_applied: bool
+    temporal_iterations: int
+    temporal_converged: bool
+    temporal_converged_mask: np.ndarray | None
+    temporal_converged_pixels: int
+    temporal_unconverged_pixels: int
+    temporal_converged_fraction: float
     inverted: bool
 
 
@@ -168,13 +188,16 @@ def unwrap_stack(
             )
         spatial_kw.setdefault("device", spatial_device)
 
-        def unwrap_pair(index: int) -> np.ndarray:
+        def unwrap_pair(index: int) -> tuple[np.ndarray, np.ndarray]:
             result_2d = unwrap(
                 phase[index],
                 method=spatial_method,
                 irls_kwargs=spatial_kw,
             )
-            return np.asarray(result_2d.unwrapped_phase, dtype=np.float64)
+            return (
+                np.asarray(result_2d.unwrapped_phase, dtype=np.float64),
+                np.asarray(result_2d.connected_components, dtype=np.int32),
+            )
 
         if spatial_executor == "dask" and n_pairs > 1:
             import dask
@@ -182,12 +205,16 @@ def unwrap_stack(
             tasks = [dask.delayed(unwrap_pair)(index) for index in range(n_pairs)]
             gpu_device = spatial_device in ("cuda", "mps")
             workers = 1 if gpu_device else min(n_pairs, 8)
-            unwrapped_pairs = list(
+            unwrapped_results = list(
                 dask.compute(*tasks, scheduler="threads", num_workers=workers)
             )
         else:
-            unwrapped_pairs = [unwrap_pair(index) for index in range(n_pairs)]
-        phase_2d = np.stack(unwrapped_pairs, axis=0)
+            unwrapped_results = [unwrap_pair(index) for index in range(n_pairs)]
+        phase_2d = np.stack([item[0] for item in unwrapped_results], axis=0)
+        component_stack = np.stack(
+            [item[1] for item in unwrapped_results],
+            axis=0,
+        )
         logger.info(
             "Spatial unwrap (%s) finished for %s pairs on %sx%s",
             spatial_method,
@@ -197,11 +224,18 @@ def unwrap_stack(
         )
     else:
         phase_2d = phase.copy()
+        component_stack = np.where(np.isfinite(phase_2d), 1, 0).astype(np.int32)
 
     # --- Stage 2: 1D temporal / network IRLS ---
     phase_1d: np.ndarray | None = None
     corrections_k: np.ndarray | None = None
     temporal_applied = False
+    temporal_iterations = 0
+    temporal_converged = False
+    temporal_converged_mask: np.ndarray | None = None
+    temporal_converged_pixels = 0
+    temporal_unconverged_pixels = 0
+    temporal_converged_fraction = 0.0
     if do_temporal:
         # After spatial (or when spatial is skipped), phases are treated as
         # already-unwrapped unless the caller overrides wrapped_input.
@@ -215,10 +249,17 @@ def unwrap_stack(
         phase_1d = temporal_result.phase_unw
         corrections_k = temporal_result.corrections_k
         temporal_applied = True
+        temporal_iterations = temporal_result.iterations
+        temporal_converged = temporal_result.converged
+        temporal_converged_mask = temporal_result.converged_mask
+        temporal_converged_pixels = temporal_result.converged_pixels
+        temporal_unconverged_pixels = temporal_result.unconverged_pixels
+        temporal_converged_fraction = temporal_result.converged_fraction
         logger.info(
-            "Temporal IRLS finished (iter=%s, converged=%s, device=%s)",
+            "Temporal IRLS finished (iter=%s, converged=%s, fraction=%.6f, device=%s)",
             temporal_result.iterations,
             temporal_result.converged,
+            temporal_result.converged_fraction,
             temporal_result.device,
         )
 
@@ -242,6 +283,7 @@ def unwrap_stack(
 
     return StackUnwrapResult(
         phase_2d_unw=phase_2d,
+        connected_components=component_stack,
         phase_1d_unw=phase_1d,
         corrections_k=corrections_k,
         timeseries=timeseries,
@@ -249,5 +291,11 @@ def unwrap_stack(
         method="stack",
         spatial_method=spatial_method,
         temporal_applied=temporal_applied,
+        temporal_iterations=temporal_iterations,
+        temporal_converged=temporal_converged,
+        temporal_converged_mask=temporal_converged_mask,
+        temporal_converged_pixels=temporal_converged_pixels,
+        temporal_unconverged_pixels=temporal_unconverged_pixels,
+        temporal_converged_fraction=temporal_converged_fraction,
         inverted=inverted,
     )

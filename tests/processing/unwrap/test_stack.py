@@ -63,6 +63,30 @@ def test_unwrap_stack_skip_temporal() -> None:
     assert result.corrections_k is None
 
 
+def test_unwrap_stack_retains_independent_spatial_islands() -> None:
+    """Disconnected valid islands remain available for temporal rank checks."""
+    pairs = _pair_dates()
+    y, x = np.mgrid[0:12, 0:12]
+    phase = wrap_phase(0.1 * x + 0.05 * y)
+    phase[:, 5:7] = np.nan
+    phase_stack = np.stack([phase, 0.5 * phase, 1.5 * phase], axis=0)
+
+    result = unwrap_stack(
+        phase_stack,
+        pairs,
+        do_spatial=True,
+        do_temporal=False,
+        do_invert=False,
+        spatial_kwargs={"max_iter": 15},
+    )
+
+    assert result.phase_2d_unw is not None
+    assert result.connected_components is not None
+    assert np.isfinite(result.phase_2d_unw[:, :, :5]).all()
+    assert np.isfinite(result.phase_2d_unw[:, :, 7:]).all()
+    assert np.nanmax(result.connected_components) >= 2
+
+
 def test_unwrap_stack_full_chain() -> None:
     """Full 2D→1D→invert chain returns consistent shapes on a small synthetic stack."""
     pairs = _pair_dates()

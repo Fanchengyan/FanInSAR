@@ -17,10 +17,59 @@ from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.stack import Stack, StackConfig
 from faninsar.processing.stack.activation import LocalActivationAuthority
 from faninsar.processing.stack.catalog import SceneCatalog
+from faninsar.processing.stack.ifg_store import (
+    InterferogramArtifactStore,
+    write_ifg_artifact,
+    write_unwrapped_artifact,
+)
 from faninsar.processing.stack.scene_store import write_scene_unit
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def _stack_with_three_date_network(tmp_path: Path) -> Stack:
+    """Create a prepared three-date Stack with an explicit triangle network."""
+    from faninsar import Pairs
+
+    dates = ("20240101", "20240113", "20240125")
+    paths = []
+    for date_id in dates:
+        path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000.SAFE"
+        path.mkdir()
+        paths.append(path)
+    stack = Stack.from_safes(
+        paths,
+        work_dir=tmp_path / "out",
+        activation_mode="reference",
+        pairs=Pairs.from_names(
+            ["20240101_20240113", "20240113_20240125", "20240101_20240125"]
+        ),
+        multilook=(1, 1),
+    )
+    return stack.prepare_scenes()
+
+
+def _write_pair_artifact(
+    stack: Stack,
+    pair_id: str,
+    phase: np.ndarray,
+) -> None:
+    """Publish one synthetic common-grid pair artifact for Stack tests."""
+    root = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
+    complex_ifg = np.exp(1j * phase).astype(np.complex64)
+    write_ifg_artifact(
+        root,
+        pair=tuple(pair_id.split("_")),  # type: ignore[arg-type]
+        looks=(1, 1),
+        filter_name="none",
+        filter_parameters={},
+        source_manifest_digests={"scenes": "a" * 64},
+        complex_ifg=complex_ifg,
+        coherence=np.ones(phase.shape, dtype=np.float32),
+        wrapped_phase=np.angle(complex_ifg).astype(np.float32),
+        amplitude=np.abs(complex_ifg).astype(np.float32),
+    )
 
 
 def test_scene_catalog_from_paths(tmp_path: Path) -> None:
@@ -183,10 +232,12 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
 
     stack.form_interferograms(multilook=(1, 1))
     output_root = stack.ifg_dirs[0]
-    assert {path.name for path in output_root.glob("*.complex64")} == {
-        "IW1_b0.complex64",
-        "IW1_b1.complex64",
-    }
+    from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
+
+    store = InterferogramArtifactStore.open(output_root)
+    assert store.pair == dates
+    assert store.shape == (2, 2)
+    np.testing.assert_array_equal(store.read().complex_ifg, np.conj(secondary))
 
 
 def test_stack_applies_multilook_before_publishing_ifg(tmp_path: Path) -> None:
@@ -207,9 +258,9 @@ def test_stack_applies_multilook_before_publishing_ifg(tmp_path: Path) -> None:
     reference = (
         np.arange(64 * 64, dtype=np.float32).reshape(64, 64) + 1.0 + 1.0j
     ).astype(np.complex64)
-    secondary = (
-        np.flip(reference, axis=1) + np.complex64(0.5 + 0.25j)
-    ).astype(np.complex64)
+    secondary = (np.flip(reference, axis=1) + np.complex64(0.5 + 0.25j)).astype(
+        np.complex64
+    )
     for date_id in dates:
         root = stack.config.work_dir / "coreg" / date_id / "scenes"
         write_scene_unit(
@@ -227,10 +278,9 @@ def test_stack_applies_multilook_before_publishing_ifg(tmp_path: Path) -> None:
 
     stack.form_interferograms(multilook=(2, 2), goldstein_alpha=0.5)
 
-    payload = np.fromfile(
-        stack.ifg_dirs[0] / "IW1_b0.complex64",
-        dtype=np.complex64,
-    ).reshape(32, 32)
+    from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
+
+    payload = InterferogramArtifactStore.open(stack.ifg_dirs[0]).read().complex_ifg
     expected = goldstein_filter(
         form_interferogram(
             reference,
@@ -355,3 +405,311 @@ def test_qualified_stack_form_requires_matching_activation_record(
 
     stack.form_interferograms(multilook=(1, 1))
     assert stack.ifg_dirs
+
+
+def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
+    tmp_path: Path,
+) -> None:
+    """Persisted common-grid IFGs flow through temporal unwrap and SBAS."""
+    stack = _stack_with_three_date_network(tmp_path)
+    first_increment = np.full((3, 4), 0.2, dtype=np.float32)
+    second_increment = np.full((3, 4), 0.35, dtype=np.float32)
+    phases = {
+        "20240101_20240113": first_increment,
+        "20240113_20240125": second_increment,
+        "20240101_20240125": first_increment + second_increment,
+    }
+    for pair_id, phase in phases.items():
+        _write_pair_artifact(stack, pair_id, phase)
+
+    stack.unwrap(do_spatial=False)
+    result = stack.invert_timeseries()
+
+    assert stack.unwrap_result is not None
+    assert stack.unwrap_result.temporal_applied
+    assert result.pair_ids == tuple(sorted(phases))
+    assert result.cumulative.shape == (3, 3, 4)
+    for pair_id in phases:
+        store = InterferogramArtifactStore.open(
+            stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
+        )
+        unwrapped = store.read_unwrapped()
+        assert unwrapped.method == "stack_irls"
+        assert unwrapped.method_parameters["pair_ids"] == list(
+            stack.unwrap_result.pair_ids
+        )
+
+    stack.unwrap_result = None
+    stack.unwrap(do_spatial=False)
+    assert stack.unwrap_result is not None
+    assert stack.unwrap_result.temporal_applied is True
+    assert stack.unwrap_result.temporal_converged_pixels == 12
+    assert stack.unwrap_result.temporal_converged_fraction == 1.0
+
+
+def test_scene_artifacts_flow_through_merge_unwrap_and_sbas(tmp_path: Path) -> None:
+    """Three dates and overlapping bursts complete the persisted Stack chain."""
+    stack = _stack_with_three_date_network(tmp_path)
+    scene_phase = {
+        "20240101": 0.0,
+        "20240113": -0.2,
+        "20240125": -0.55,
+    }
+    for date_id, phase in scene_phase.items():
+        root = stack.config.work_dir / "coreg" / date_id / "scenes"
+        aligned = np.full(
+            (2, 4),
+            np.exp(1j * phase),
+            dtype=np.complex64,
+        )
+        reference = np.ones((2, 4), dtype=np.complex64)
+        for tag, row_origin in (("f0_IW1_b0", 0), ("f0_IW1_b1", 2)):
+            write_scene_unit(
+                root,
+                date_id=date_id,
+                master_id="20240101",
+                domain="radar",
+                tag=tag,
+                reference=reference,
+                secondary=aligned,
+                row_origin=row_origin,
+                col_origin=0,
+                grid_shape=(4, 4),
+                wavelength_m=0.056,
+            )
+        stack.coreg_paths[date_id] = root.parent
+
+    stack.form_interferograms(multilook=(1, 1))
+    stack.unwrap(do_spatial=False)
+    result = stack.invert_timeseries()
+
+    np.testing.assert_allclose(result.phase_cumulative_rad[1], 0.2, atol=1e-6)
+    np.testing.assert_allclose(result.phase_cumulative_rad[2], 0.55, atol=1e-6)
+    assert result.displacement_cumulative_m is not None
+    np.testing.assert_allclose(
+        result.displacement_cumulative_m,
+        result.phase_cumulative_rad * (-0.056 / (4.0 * np.pi)),
+    )
+    assert all((directory / "manifest.json").is_file() for directory in stack.ifg_dirs)
+    assert stack.unwrap_result is not None
+    assert stack.unwrap_result.phase_2d_unw is None
+    assert stack.unwrap_result.phase_1d_unw is None
+    assert stack.unwrap_result.corrections_k is None
+
+
+def test_form_interferograms_rejects_stale_scene_lineage(tmp_path: Path) -> None:
+    """An existing IFG cannot be reused after a source scene generation changes."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    dates = ("20240101", "20240113")
+    paths = []
+    for date_id in dates:
+        path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000.SAFE"
+        path.mkdir()
+        paths.append(path)
+    stack = Stack.from_safes(
+        paths,
+        work_dir=tmp_path / "out",
+        activation_mode="reference",
+        multilook=(1, 1),
+    ).prepare_scenes()
+    data = np.ones((2, 2), dtype=np.complex64)
+    for date_id in dates:
+        root = stack.config.work_dir / "coreg" / date_id / "scenes"
+        write_scene_unit(
+            root,
+            date_id=date_id,
+            master_id=dates[0],
+            domain="radar",
+            tag="f0_IW1_b0",
+            reference=data,
+            secondary=data,
+            row_origin=0,
+            col_origin=0,
+            grid_shape=(2, 2),
+        )
+        stack.coreg_paths[date_id] = root.parent
+    stack.form_interferograms()
+    changed = np.full((2, 2), 2.0 + 0.0j, dtype=np.complex64)
+    write_scene_unit(
+        stack.coreg_paths[dates[1]] / "scenes",
+        date_id=dates[1],
+        master_id=dates[0],
+        domain="radar",
+        tag="f0_IW1_b0",
+        reference=data,
+        secondary=changed,
+        row_origin=0,
+        col_origin=0,
+        grid_shape=(2, 2),
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="lineage"):
+        stack.form_interferograms()
+
+
+def test_stack_unwrap_fails_closed_for_incomplete_pair_network(
+    tmp_path: Path,
+) -> None:
+    """A missing common pair view cannot silently shrink the SBAS network."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phase = np.zeros((2, 2), dtype=np.float32)
+    _write_pair_artifact(stack, "20240101_20240113", phase)
+    _write_pair_artifact(stack, "20240113_20240125", phase)
+
+    with pytest.raises(InvalidProcessingStateError, match="pair set"):
+        stack.unwrap(do_spatial=False)
+
+
+def test_stack_unwrap_fails_closed_for_mixed_common_grids(tmp_path: Path) -> None:
+    """Pair artifacts on different shapes cannot enter temporal processing."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    _write_pair_artifact(
+        stack,
+        "20240101_20240113",
+        np.zeros((2, 2), dtype=np.float32),
+    )
+    _write_pair_artifact(
+        stack,
+        "20240113_20240125",
+        np.zeros((2, 2), dtype=np.float32),
+    )
+    _write_pair_artifact(
+        stack,
+        "20240101_20240125",
+        np.zeros((3, 2), dtype=np.float32),
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="common grid"):
+        stack.unwrap(do_spatial=False)
+
+
+def test_stack_unwrap_rejects_when_no_temporal_pixel_converges(
+    tmp_path: Path,
+) -> None:
+    """A bounded temporal solve cannot publish an unqualified generation."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    for pair_id, value in (
+        ("20240101_20240113", 0.2),
+        ("20240113_20240125", 0.3),
+        ("20240101_20240125", 0.5),
+    ):
+        _write_pair_artifact(
+            stack,
+            pair_id,
+            np.full((2, 2), value, dtype=np.float32),
+        )
+
+    with pytest.raises(InvalidProcessingStateError, match="no converged pixels"):
+        stack.unwrap(
+            do_spatial=False,
+            temporal_kwargs={"max_iter": 1},
+        )
+
+
+def test_stack_invert_rejects_unqualified_unwrap_artifacts(tmp_path: Path) -> None:
+    """Direct SBAS invocation cannot bypass temporal qualification metadata."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phase = np.zeros((2, 2), dtype=np.float32)
+    for pair_id in (
+        "20240101_20240113",
+        "20240113_20240125",
+        "20240101_20240125",
+    ):
+        _write_pair_artifact(stack, pair_id, phase)
+        store = InterferogramArtifactStore.open(
+            stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
+        )
+        write_unwrapped_artifact(
+            store.root,
+            unwrapped_phase=phase,
+            connected_components=np.ones((2, 2), dtype=np.int32),
+            method="legacy",
+            method_parameters={},
+            ifg_manifest_digest=store.manifest_digest,
+        )
+
+    with pytest.raises(InvalidProcessingStateError, match="qualified"):
+        stack.invert_timeseries()
+
+
+def test_coregister_resume_rejects_scene_aligned_to_old_master(
+    tmp_path: Path,
+) -> None:
+    """A work directory cannot resume scene artifacts from another master."""
+    import json
+
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    date_id = "20240113"
+    out = stack.config.work_dir / "coreg" / date_id
+    data = np.ones((2, 2), dtype=np.complex64)
+    write_scene_unit(
+        out / "scenes",
+        date_id=date_id,
+        master_id="20231220",
+        domain="radar",
+        tag="f0_IW1_b0",
+        reference=data,
+        secondary=data,
+        row_origin=0,
+        col_origin=0,
+    )
+    (out / "coreg_done.json").write_text(
+        json.dumps({"master": "20231220", "date": date_id}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="master"):
+        stack.coregister_scenes(dates=[date_id])
+
+
+def test_coregister_resume_rejects_changed_burst_request(tmp_path: Path) -> None:
+    """A marker for burst zero cannot authorize reuse for burst one."""
+    import json
+
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    date_id = "20240113"
+    out = stack.config.work_dir / "coreg" / date_id
+    data = np.ones((2, 2), dtype=np.complex64)
+    write_scene_unit(
+        out / "scenes",
+        date_id=date_id,
+        master_id=stack.master,
+        domain="radar",
+        tag="f0_IW1_b0",
+        reference=data,
+        secondary=data,
+        row_origin=0,
+        col_origin=0,
+    )
+    initial_identity = stack._coreg_resume_identity(
+        date_id,
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    (out / "coreg_done.json").write_text(
+        json.dumps(
+            {
+                "master": stack.master,
+                "date": date_id,
+                "coreg_identity": initial_identity,
+            }
+        ),
+        encoding="utf-8",
+    )
+    stack.config.bursts = {"IW1": [1]}
+
+    with pytest.raises(InvalidProcessingStateError, match="coregistration scene"):
+        stack.coregister_scenes(dates=[date_id])

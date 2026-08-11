@@ -117,3 +117,49 @@ def test_temporal_irls_wrapped_input_false_passthrough() -> None:
 
     np.testing.assert_array_equal(result.corrections_k, 0)
     np.testing.assert_allclose(result.phase_unw, phase_stack, atol=1e-5)
+
+
+def test_temporal_irls_masks_pixels_that_do_not_converge() -> None:
+    """A bounded solve never publishes pixels without convergence evidence."""
+    pairs = _three_date_pairs()
+    phase_stack = np.full((3, 2, 2), 0.25, dtype=np.float64)
+
+    result = unwrap_temporal_irls(
+        phase_stack,
+        pairs,
+        wrapped_input=False,
+        max_iter=1,
+        device="cpu",
+    )
+
+    assert result.converged is False
+    assert result.converged_pixels == 0
+    assert result.unconverged_pixels == 4
+    assert result.converged_fraction == 0.0
+    assert not result.converged_mask.any()
+    assert np.isnan(result.phase_unw).all()
+    assert np.isnan(result.corrections_k).all()
+
+
+def test_temporal_irls_ignores_singular_pixels_in_convergence_fraction() -> None:
+    """Missing pixels are not misreported as failed temporal solutions."""
+    pairs = _three_date_pairs()
+    true_phi = np.array([0.25, -0.1, 0.15], dtype=np.float64)
+    phase_stack = np.broadcast_to(true_phi[:, None, None], (3, 1, 2)).copy()
+    phase_stack[:, 0, 1] = np.nan
+
+    result = unwrap_temporal_irls(
+        phase_stack,
+        pairs,
+        wrapped_input=False,
+        max_iter=10,
+        device="cpu",
+    )
+
+    assert result.converged is True
+    assert result.converged_pixels == 1
+    assert result.unconverged_pixels == 0
+    assert result.converged_fraction == 1.0
+    np.testing.assert_array_equal(result.converged_mask, [[True, False]])
+    assert np.isfinite(result.phase_unw[:, 0, 0]).all()
+    assert np.isnan(result.phase_unw[:, 0, 1]).all()

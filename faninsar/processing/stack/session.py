@@ -7,9 +7,11 @@ and interferogram formation are separate stages: coreg caches per-date SLCs;
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass, field
+import shutil
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -32,7 +34,7 @@ from faninsar.processing.stack.config import (
 from faninsar.processing.stack.scene_store import (
     CoregisteredSceneStore,
     copy_reference_units,
-    form_scene_interferograms,
+    form_merged_scene_interferogram,
 )
 
 if TYPE_CHECKING:
@@ -51,7 +53,12 @@ if TYPE_CHECKING:
         CoregistrationGrid,
         ProductionPairState,
     )
+    from faninsar.processing.stack.ifg_store import (
+        InterferogramArtifactStore,
+        UnwrappedArtifact,
+    )
     from faninsar.processing.timeseries.inversion import TimeSeriesResult
+    from faninsar.processing.unwrap.stack import SpatialExecutor, StackUnwrapResult
 
 logger = setup_logger(__name__)
 
@@ -138,6 +145,7 @@ class Stack:
     pair_states: dict[str, ProductionPairState] = field(default_factory=dict)
     ifg_dirs: list[Path] = field(default_factory=list)
     timeseries: TimeSeriesResult | None = None
+    unwrap_result: StackUnwrapResult | None = None
     _prepared: bool = False
 
     @classmethod
@@ -348,6 +356,99 @@ class Stack:
             "n_jobs": cfg.n_jobs,
         }
 
+    def _coreg_resume_identity(
+        self,
+        date_id: str,
+        *,
+        misreg_az_px: float,
+        misreg_rg_px: float,
+    ) -> str:
+        """Return the canonical identity of one coregistration request."""
+
+        def source_identity(path: Path) -> dict[str, object]:
+            resolved = path.resolve()
+            stat = resolved.stat()
+            return {
+                "path": str(resolved),
+                "device": int(stat.st_dev),
+                "inode": int(stat.st_ino),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+
+        def dem_identity(dem: object | None) -> dict[str, object] | None:
+            if dem is None:
+                return None
+            value: dict[str, object] = {"type": type(dem).__qualname__}
+            path = getattr(dem, "path", None)
+            if path is not None:
+                value["source"] = source_identity(Path(path))
+            height = getattr(dem, "height_m", None)
+            if height is not None:
+                value["height_m"] = float(height)
+            return value
+
+        def roi_identity(roi: object | None) -> object:
+            if roi is None:
+                return None
+            geo_interface = getattr(roi, "__geo_interface__", None)
+            if geo_interface is not None:
+                return geo_interface
+            bounds = getattr(roi, "bounds", None)
+            if bounds is not None:
+                return {"type": type(roi).__qualname__, "bounds": list(bounds)}
+            return {"type": type(roi).__qualname__, "value": str(roi)}
+
+        geo_grid = self.config.geo_grid
+        geo_grid_identity = (
+            None
+            if geo_grid is None
+            else {
+                "crs": geo_grid.crs,
+                "transform": list(geo_grid.transform),
+                "shape": list(geo_grid.shape),
+                "resolution_m": list(geo_grid.resolution_m),
+            }
+        )
+        bursts = self.config.bursts
+        if bursts is None and self.config.swaths:
+            bursts = {swath: [0] for swath in self.config.swaths}
+        payload = {
+            "schema": "stack_coreg_request_v1",
+            "master_id": self.master,
+            "date_id": date_id,
+            "master_source": source_identity(self.catalog.path_for(self.master)),
+            "secondary_source": source_identity(self.catalog.path_for(date_id)),
+            "coreg_mode": self.config.coreg_mode,
+            "coregistration_grid": self.config.coregistration_grid,
+            "esd_method": self.config.esd_method,
+            "swaths": list(self.config.swaths),
+            "bursts": {
+                str(swath): [int(index) for index in indices]
+                for swath, indices in sorted((bursts or {}).items())
+            },
+            "roi": roi_identity(self.config.roi),
+            "dem": dem_identity(self.config.dem),
+            "geo_grid": geo_grid_identity,
+            "control_spacing": self.config.control_spacing,
+            "executor": self.config.executor,
+            "device": self.config.device,
+            "misreg_az_px": float(misreg_az_px),
+            "misreg_rg_px": float(misreg_rg_px),
+        }
+        try:
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        except (TypeError, ValueError) as error:
+            reject_invalid_state(
+                f"coregistration request cannot be canonicalized: {error}"
+            )
+        return hashlib.sha256(encoded).hexdigest()
+
     def measure_misreg(
         self,
         *,
@@ -481,9 +582,11 @@ class Stack:
         self._ensure_prepared()
         from faninsar.processing.pipeline.production import run_pair
 
-        target_dates = list(dates) if dates is not None else [
-            d for d in self.catalog.dates if d != self.master
-        ]
+        target_dates = (
+            list(dates)
+            if dates is not None
+            else [d for d in self.catalog.dates if d != self.master]
+        )
         master_path = self.catalog.path_for(self.master)
         # Cache master identity product path (no self-coreg).
         master_dir = self.config.work_dir / "coreg" / self.master
@@ -500,17 +603,40 @@ class Stack:
         for date_id in target_dates:
             out = self.config.work_dir / "coreg" / date_id
             marker = out / "coreg_done.json"
-            if marker.is_file() and not overwrite:
-                CoregisteredSceneStore.open(out / "scenes")
-                self.coreg_paths[date_id] = out
-                if date_id == target_dates[0]:
-                    copy_reference_units(out / "scenes", master_dir / "scenes")
-                continue
             misreg_az = 0.0
             misreg_rg = 0.0
             if self.date_misreg is not None:
                 misreg_az = float(self.date_misreg.azimuth_px.get(date_id, 0.0))
                 misreg_rg = float(self.date_misreg.range_px.get(date_id, 0.0))
+            coreg_identity = self._coreg_resume_identity(
+                date_id,
+                misreg_az_px=misreg_az,
+                misreg_rg_px=misreg_rg,
+            )
+            if marker.is_file() and not overwrite:
+                try:
+                    marker_data = json.loads(marker.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as error:
+                    reject_invalid_state(
+                        f"coregistration marker cannot be validated: {error}"
+                    )
+                store = CoregisteredSceneStore.open(out / "scenes")
+                if (
+                    marker_data.get("master") != self.master
+                    or marker_data.get("date") != date_id
+                    or marker_data.get("coreg_identity") != coreg_identity
+                    or store.master_id != self.master
+                    or store.date_id != date_id
+                    or store.domain != self.config.coregistration_grid
+                ):
+                    reject_invalid_state(
+                        "persisted coregistration scene or marker does not match "
+                        "the current date, master, or coordinate domain"
+                    )
+                self.coreg_paths[date_id] = out
+                if date_id == target_dates[0]:
+                    copy_reference_units(out / "scenes", master_dir / "scenes")
+                continue
             state = run_pair(
                 master_path,
                 self.catalog.path_for(date_id),
@@ -542,6 +668,7 @@ class Stack:
                     {
                         "master": self.master,
                         "date": date_id,
+                        "coreg_identity": coreg_identity,
                         "misreg_az_px": misreg_az,
                         "misreg_rg_px": misreg_rg,
                         "geometric_phase_removed": (
@@ -563,9 +690,7 @@ class Stack:
         self,
         *,
         pairs: Pairs | None = None,
-        multilook: tuple[int, int]
-        | list[tuple[int, int]]
-        | None = None,
+        multilook: tuple[int, int] | list[tuple[int, int]] | None = None,
         goldstein_alpha: float | None = None,
         output_dir: str | Path | None = None,
         overwrite: bool = False,
@@ -586,8 +711,10 @@ class Stack:
             if goldstein_alpha is None
             else float(goldstein_alpha)
         )
-        base_out = Path(output_dir) if output_dir is not None else (
-            self.config.work_dir / "ifg"
+        base_out = (
+            Path(output_dir)
+            if output_dir is not None
+            else (self.config.work_dir / "ifg")
         )
 
         for primary, secondary in _iter_pair_dates(use_pairs):
@@ -596,9 +723,8 @@ class Stack:
             for looks in looks_list:
                 az_l, rg_l = looks
                 sub = base_out / f"ml_{az_l}x{rg_l}" / f"{primary}_{secondary}"
-                if (sub / "pair.zarr").exists() and not overwrite:
-                    self.ifg_dirs.append(sub)
-                    continue
+                if sub.exists() and overwrite:
+                    shutil.rmtree(sub)
                 if primary not in self.coreg_paths or secondary not in self.coreg_paths:
                     reject_invalid_state(
                         "Stack scene generation missing; run coregister_scenes first"
@@ -609,7 +735,43 @@ class Stack:
                 secondary_store = CoregisteredSceneStore.open(
                     self.coreg_paths[secondary] / "scenes"
                 )
-                outputs = form_scene_interferograms(
+                expected_sources = {
+                    "primary": reference_store.manifest_digest,
+                    "secondary": secondary_store.manifest_digest,
+                }
+                expected_filter_name = "goldstein" if alpha > 0.0 else "none"
+                expected_filter_parameters = (
+                    {"alpha": alpha, "window": 32} if alpha > 0.0 else {}
+                )
+                if (sub / "manifest.json").exists():
+                    from faninsar.processing.stack.ifg_store import (
+                        InterferogramArtifactStore,
+                    )
+
+                    existing_store = InterferogramArtifactStore.open(sub)
+                    if (
+                        existing_store.pair != (primary, secondary)
+                        or existing_store.looks != looks
+                        or existing_store.domain != reference_store.domain
+                        or existing_store.wavelength_m != reference_store.wavelength_m
+                        or existing_store.grid_identity != reference_store.grid_identity
+                        or existing_store.filter_name != expected_filter_name
+                        or existing_store.filter_parameters
+                        != expected_filter_parameters
+                        or existing_store.source_manifest_digests != expected_sources
+                    ):
+                        reject_invalid_state(
+                            "persisted IFG artifact does not match current scene "
+                            "lineage or processing parameters"
+                        )
+                    existing_store.read()
+                    self.ifg_dirs.append(sub)
+                    continue
+                if sub.exists():
+                    reject_invalid_state(
+                        "partial IFG artifact directory exists without a manifest"
+                    )
+                product = form_merged_scene_interferogram(
                     reference_store,
                     secondary_store,
                     reference_role=(
@@ -621,38 +783,165 @@ class Stack:
                     multilook=looks,
                     goldstein_alpha=alpha,
                 )
-                sub.mkdir(parents=True, exist_ok=True)
-                for tag, ifg in outputs.items():
-                    _atomic_write_array(
-                        sub / f"{tag}.complex64",
-                        ifg.astype(np.complex64, copy=False),
-                    )
-                metadata = {
-                    "schema_version": "stack_ifg_v1",
-                    "primary": primary,
-                    "secondary": secondary,
-                    "master": self.master,
-                    "domain": self.config.coregistration_grid,
-                    "multilook": [az_l, rg_l],
-                    "goldstein_alpha": alpha,
-                    "source_scene_manifest_digests": [
-                        reference_store.manifest_digest,
-                        secondary_store.manifest_digest,
-                    ],
-                }
-                _atomic_write_text(
-                    sub / "result.json",
-                    json.dumps(metadata, indent=2) + "\n",
+                from faninsar.processing.stack.ifg_store import write_ifg_artifact
+
+                write_ifg_artifact(
+                    sub,
+                    pair=(primary, secondary),
+                    looks=looks,
+                    domain=reference_store.domain,
+                    wavelength_m=reference_store.wavelength_m,
+                    grid_identity=reference_store.grid_identity,
+                    filter_name=expected_filter_name,
+                    filter_parameters=expected_filter_parameters,
+                    source_manifest_digests=expected_sources,
+                    complex_ifg=product.complex_ifg,
+                    coherence=product.coherence,
+                    wrapped_phase=product.wrapped_phase,
+                    amplitude=product.amplitude,
                 )
                 self.ifg_dirs.append(sub)
         return self
 
-    def unwrap(self, **kwargs: Any) -> Self:
-        """Reserved: unwrap pair products (thin wrap of production unwrap)."""
-        _ = kwargs
-        logger.warning(
-            "Stack.unwrap is reserved; use run_pair(..., unwrap=True) for now",
+    def unwrap(
+        self,
+        *,
+        multilook: tuple[int, int] | None = None,
+        ifg_root: str | Path | None = None,
+        do_spatial: bool = True,
+        spatial_executor: SpatialExecutor = "serial",
+        spatial_device: str | None = None,
+        temporal_device: str | None = None,
+        spatial_kwargs: dict[str, Any] | None = None,
+        temporal_kwargs: dict[str, Any] | None = None,
+    ) -> Self:
+        """Spatially unwrap and temporally reconcile persisted pair artifacts.
+
+        The method consumes one complete, common-grid IFG artifact for every
+        pair in :attr:`pairs`. It never reopens SAFE products or reruns
+        co-registration. Missing pairs, additional pairs, mixed look factors,
+        and mixed grid shapes fail closed before numerical processing begins.
+
+        Parameters
+        ----------
+        multilook : tuple[int, int], optional
+            Artifact view to consume. Defaults to the configured look factors.
+        ifg_root : path, optional
+            Root containing pair artifact directories. Defaults to
+            ``work_dir/ifg/ml_<az>x<rg>``.
+        do_spatial : bool, optional
+            Run spatial IRLS before temporal reconciliation. ``False`` is
+            intended for already spatially unwrapped test or import products.
+        spatial_executor : {"serial", "dask"}, optional
+            Pair-level spatial scheduling mode.
+        spatial_device, temporal_device : str, optional
+            Explicit numerical devices. Defaults to the Stack inversion device.
+        spatial_kwargs, temporal_kwargs : dict, optional
+            Numerical options forwarded to the existing Stack unwrap
+            orchestrator.
+
+        Returns
+        -------
+        Stack
+            This session with :attr:`unwrap_result` populated.
+
+        """
+        from faninsar.processing.stack.ifg_store import write_unwrapped_artifact
+        from faninsar.processing.unwrap.stack import unwrap_stack
+
+        looks = multilook or self.config.multilook
+        stores = self._pair_artifact_stores(looks=looks, ifg_root=ifg_root)
+        existing = [(store.root / "unwrap_manifest.json").exists() for store in stores]
+        if any(existing):
+            if not all(existing):
+                reject_invalid_state(
+                    "partial Stack unwrap generation detected; refusing to mix "
+                    "old and new temporal solutions"
+                )
+            unwrapped = self._qualified_unwrapped_artifacts(stores)
+            phase = np.stack(
+                [artifact.unwrapped_phase for artifact in unwrapped], axis=0
+            )
+            persisted_parameters = unwrapped[0].method_parameters
+            persisted_mask = np.all(np.isfinite(phase), axis=0)
+            base_result = unwrap_stack(
+                phase,
+                _iter_pair_dates(self.pairs),
+                do_spatial=False,
+                do_temporal=False,
+                do_invert=False,
+            )
+            self.unwrap_result = replace(
+                base_result,
+                temporal_applied=True,
+                temporal_iterations=int(persisted_parameters["temporal_iterations"]),
+                temporal_converged=bool(persisted_parameters["temporal_converged"]),
+                temporal_converged_mask=persisted_mask,
+                temporal_converged_pixels=int(
+                    persisted_parameters["temporal_converged_pixels"]
+                ),
+                temporal_unconverged_pixels=int(
+                    persisted_parameters["temporal_unconverged_pixels"]
+                ),
+                temporal_converged_fraction=float(
+                    persisted_parameters["temporal_converged_fraction"]
+                ),
+            )
+            return self
+
+        wrapped_phase = np.stack(
+            [store.read().wrapped_phase for store in stores], axis=0
         )
+        pair_dates = _iter_pair_dates(self.pairs)
+        result = unwrap_stack(
+            wrapped_phase,
+            pair_dates,
+            do_spatial=do_spatial,
+            do_temporal=True,
+            do_invert=False,
+            spatial_executor=spatial_executor,
+            spatial_device=spatial_device or self.config.invert_device,
+            temporal_device=temporal_device or self.config.invert_device,
+            spatial_kwargs=spatial_kwargs,
+            temporal_kwargs=temporal_kwargs,
+        )
+        if result.phase_1d_unw is None:
+            reject_invalid_state("temporal Stack reconciliation produced no phase")
+        if result.temporal_converged_pixels < 1:
+            reject_invalid_state(
+                "temporal Stack reconciliation produced no converged pixels; "
+                "no unwrap artifact was published"
+            )
+        if result.connected_components is None:
+            reject_invalid_state("spatial Stack unwrap produced no component labels")
+        method_parameters: dict[str, Any] = {
+            "pair_ids": list(result.pair_ids),
+            "spatial_method": result.spatial_method,
+            "spatial_applied": do_spatial,
+            "temporal_applied": result.temporal_applied,
+            "temporal_iterations": result.temporal_iterations,
+            "temporal_converged": result.temporal_converged,
+            "temporal_converged_pixels": result.temporal_converged_pixels,
+            "temporal_unconverged_pixels": result.temporal_unconverged_pixels,
+            "temporal_converged_fraction": result.temporal_converged_fraction,
+            "temporal_unconverged_masked": True,
+        }
+        for index, store in enumerate(stores):
+            phase = np.asarray(result.phase_1d_unw[index], dtype=np.float32)
+            connected_components = np.asarray(
+                result.connected_components[index],
+                dtype=np.int32,
+            ).copy()
+            connected_components[~np.isfinite(phase)] = 0
+            write_unwrapped_artifact(
+                store.root,
+                unwrapped_phase=phase,
+                connected_components=connected_components,
+                method="stack_irls",
+                method_parameters=method_parameters,
+                ifg_manifest_digest=store.manifest_digest,
+            )
+        self.unwrap_result = result
         return self
 
     def invert_timeseries(
@@ -660,20 +949,173 @@ class Stack:
         *,
         pair_phases: dict[str, np.ndarray] | None = None,
         device: str | None = None,
+        multilook: tuple[int, int] | None = None,
+        ifg_root: str | Path | None = None,
     ) -> TimeSeriesResult:
-        """Invert unwrapped pair phases when provided."""
+        """Invert persisted, temporally reconciled pair phases with SBAS.
+
+        ``pair_phases`` remains available for backwards compatibility. When it
+        is omitted, the exact configured pair network is loaded from immutable
+        unwrap artifacts without rerunning any upstream processing.
+        """
         from faninsar.processing.timeseries.inversion import invert_unwrapped_pairs
 
         if pair_phases is None:
-            reject_invalid_state(
-                "invert_timeseries requires pair_phases mapping in V1 "
-                "(load unwrapped products then pass them in)",
+            stores = self._pair_artifact_stores(
+                looks=multilook or self.config.multilook,
+                ifg_root=ifg_root,
             )
+            active_unwrap = self.unwrap_result
+            if active_unwrap is not None and active_unwrap.phase_1d_unw is not None:
+                expected_pair_ids = tuple(
+                    f"{store.pair[0]}_{store.pair[1]}" for store in stores
+                )
+                if active_unwrap.pair_ids != expected_pair_ids:
+                    reject_invalid_state(
+                        "in-memory temporal result does not match IFG pair order"
+                    )
+                pair_phases = {
+                    pair_id: np.asarray(active_unwrap.phase_1d_unw[index])
+                    for index, pair_id in enumerate(expected_pair_ids)
+                }
+            else:
+                unwrapped = self._qualified_unwrapped_artifacts(stores)
+                pair_phases = {
+                    f"{store.pair[0]}_{store.pair[1]}": artifact.unwrapped_phase
+                    for store, artifact in zip(stores, unwrapped, strict=True)
+                }
+            wavelengths = {store.wavelength_m for store in stores}
+            if len(wavelengths) != 1:
+                reject_invalid_state("Stack IFG artifacts use mixed wavelengths")
+            wavelength_m = next(iter(wavelengths))
+        else:
+            wavelength_m = None
         self.timeseries = invert_unwrapped_pairs(
             pair_phases,
             device=device or self.config.invert_device,
+            wavelength_m=wavelength_m,
         )
+        if self.unwrap_result is not None:
+            self.unwrap_result = replace(
+                self.unwrap_result,
+                phase_2d_unw=None,
+                connected_components=None,
+                phase_1d_unw=None,
+                corrections_k=None,
+                temporal_converged_mask=None,
+                timeseries=None,
+            )
         return self.timeseries
+
+    def _qualified_unwrapped_artifacts(
+        self,
+        stores: Sequence[InterferogramArtifactStore],
+    ) -> list[UnwrappedArtifact]:
+        """Load one exact, temporally qualified unwrap network."""
+        expected_pair_ids = tuple(
+            f"{primary}_{secondary}"
+            for primary, secondary in _iter_pair_dates(self.pairs)
+        )
+        artifacts = [store.read_unwrapped() for store in stores]
+        if not artifacts:
+            reject_invalid_state("qualified temporal artifact network is empty")
+        expected_parameters = artifacts[0].method_parameters
+        required_numeric = (
+            "temporal_iterations",
+            "temporal_converged_pixels",
+            "temporal_unconverged_pixels",
+            "temporal_converged_fraction",
+        )
+        for artifact in artifacts:
+            parameters = artifact.method_parameters
+            if (
+                artifact.method != "stack_irls"
+                or parameters != expected_parameters
+                or parameters.get("pair_ids") != list(expected_pair_ids)
+                or parameters.get("temporal_unconverged_masked") is not True
+                or parameters.get("temporal_applied") is not True
+                or any(
+                    not isinstance(parameters.get(name), (int, float))
+                    for name in required_numeric
+                )
+                or int(parameters["temporal_converged_pixels"]) < 1
+            ):
+                reject_invalid_state(
+                    "persisted unwrap artifact is not a qualified temporal network"
+                )
+        finite_pixels = int(
+            np.count_nonzero(
+                np.all(
+                    np.isfinite(
+                        np.stack(
+                            [artifact.unwrapped_phase for artifact in artifacts],
+                            axis=0,
+                        )
+                    ),
+                    axis=0,
+                )
+            )
+        )
+        if finite_pixels != int(expected_parameters["temporal_converged_pixels"]):
+            reject_invalid_state(
+                "persisted unwrap convergence count does not match payload bytes"
+            )
+        return artifacts
+
+    def _pair_artifact_stores(
+        self,
+        *,
+        looks: tuple[int, int],
+        ifg_root: str | Path | None,
+    ) -> list[InterferogramArtifactStore]:
+        """Open the exact ordered common-grid artifact set for this Stack."""
+        from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
+
+        azimuth_looks, range_looks = (int(looks[0]), int(looks[1]))
+        root = (
+            Path(ifg_root)
+            if ifg_root is not None
+            else self.config.work_dir / "ifg" / f"ml_{azimuth_looks}x{range_looks}"
+        )
+        expected_pairs = _iter_pair_dates(self.pairs)
+        expected_ids = [
+            f"{primary}_{secondary}" for primary, secondary in expected_pairs
+        ]
+        if not root.is_dir():
+            reject_invalid_state(f"Stack IFG artifact view is missing: {root}")
+        discovered_ids = sorted(
+            path.parent.name for path in root.glob("*/manifest.json")
+        )
+        if sorted(expected_ids) != discovered_ids:
+            reject_invalid_state(
+                "Stack IFG artifact pair set does not exactly match the configured "
+                f"network: expected={sorted(expected_ids)!r}, "
+                f"discovered={discovered_ids!r}"
+            )
+        stores = [
+            InterferogramArtifactStore.open(root / pair_id) for pair_id in expected_ids
+        ]
+        shapes = {store.shape for store in stores}
+        artifact_looks = {store.looks for store in stores}
+        artifact_domains = {store.domain for store in stores}
+        artifact_wavelengths = {store.wavelength_m for store in stores}
+        artifact_grid_identities = {store.grid_identity for store in stores}
+        if len(shapes) != 1:
+            reject_invalid_state("Stack IFG artifacts do not share one common grid")
+        if artifact_looks != {(azimuth_looks, range_looks)}:
+            reject_invalid_state("Stack IFG artifacts use mixed or unexpected looks")
+        if artifact_domains != {self.config.coregistration_grid}:
+            reject_invalid_state("Stack IFG artifacts use mixed or unexpected domains")
+        if len(artifact_wavelengths) != 1:
+            reject_invalid_state("Stack IFG artifacts use mixed radar wavelengths")
+        if len(artifact_grid_identities) != 1:
+            reject_invalid_state("Stack IFG artifacts use mixed coordinate grids")
+        for expected_pair, store in zip(expected_pairs, stores, strict=True):
+            if store.pair != expected_pair:
+                reject_invalid_state(
+                    "Stack IFG artifact pair order differs from the configured network"
+                )
+        return stores
 
 
 def _iter_pair_dates(pairs: Pairs) -> list[tuple[str, str]]:
