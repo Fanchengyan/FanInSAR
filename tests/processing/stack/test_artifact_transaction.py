@@ -1,0 +1,158 @@
+"""Security tests for immutable artifact transactions."""
+
+from __future__ import annotations
+
+import os
+from typing import TYPE_CHECKING
+
+import pytest
+
+from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.stack.artifact_transaction import (
+    commit_generation,
+    open_current_generation,
+    stage_generation,
+)
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+def test_staging_rejects_symlinked_namespace_directory(tmp_path: Path) -> None:
+    """A namespace component cannot redirect staging outside the root."""
+    root = tmp_path / "artifacts"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / ".ifg_generations").symlink_to(outside)
+
+    with (
+        pytest.raises(InvalidProcessingStateError, match="unsafe"),
+        stage_generation(
+            root,
+            "ifg",
+            final_bytes=0,
+            temporary_bytes=0,
+            file_count=0,
+        ),
+    ):
+        pass
+
+    assert list(outside.iterdir()) == []
+
+
+def test_commit_rejects_hardlinked_payload(tmp_path: Path) -> None:
+    """A staged payload with another name cannot enter a generation."""
+    root = tmp_path / "artifacts"
+
+    with stage_generation(
+        root,
+        "ifg",
+        final_bytes=7,
+        temporary_bytes=7,
+        file_count=1,
+    ) as (generation_id, staging):
+        payload = staging / "payload.bin"
+        payload.write_bytes(b"payload")
+        os.link(payload, tmp_path / "alias.bin")
+
+        with pytest.raises(InvalidProcessingStateError, match="hardlink"):
+            commit_generation(
+                root,
+                "ifg",
+                generation_id,
+                staging,
+                manifest_digest="a" * 64,
+            )
+
+    assert not (root / "CURRENT").exists()
+
+
+def _publish_minimal_generation(root: Path) -> None:
+    """Publish one regular payload for hostile-reader tests."""
+    with stage_generation(
+        root,
+        "ifg",
+        final_bytes=7,
+        temporary_bytes=7,
+        file_count=1,
+    ) as (generation_id, staging):
+        (staging / "payload.bin").write_bytes(b"payload")
+        commit_generation(
+            root,
+            "ifg",
+            generation_id,
+            staging,
+            manifest_digest="a" * 64,
+        )
+
+
+def test_open_rejects_hardlinked_current_control(tmp_path: Path) -> None:
+    """A multiply linked CURRENT record cannot select a generation."""
+    root = tmp_path / "artifacts"
+    _publish_minimal_generation(root)
+    os.link(root / "CURRENT", tmp_path / "current-alias")
+
+    with pytest.raises(InvalidProcessingStateError, match="control file is unsafe"):
+        open_current_generation(root, "ifg")
+
+
+def test_commit_remains_bound_to_root_descriptor_after_ancestor_replacement(
+    tmp_path: Path,
+) -> None:
+    """Replacing the root pathname cannot redirect an in-flight commit."""
+    root = tmp_path / "artifacts"
+    relocated = tmp_path / "relocated"
+
+    with stage_generation(
+        root,
+        "ifg",
+        final_bytes=7,
+        temporary_bytes=7,
+        file_count=1,
+    ) as (generation_id, staging):
+        (staging / "payload.bin").write_bytes(b"trusted")
+        root.rename(relocated)
+        (root / ".ifg_staging" / generation_id).mkdir(parents=True)
+        (root / ".ifg_generations").mkdir()
+        (root / ".ifg_leases").mkdir()
+        (root / ".ifg_staging" / generation_id / "payload.bin").write_bytes(
+            b"attacker"
+        )
+
+        commit_generation(
+            root,
+            "ifg",
+            generation_id,
+            staging,
+            manifest_digest="a" * 64,
+        )
+
+    assert (relocated / "CURRENT").is_file()
+    assert not (root / "CURRENT").exists()
+    assert (
+        root / ".ifg_staging" / generation_id / "payload.bin"
+    ).read_bytes() == b"attacker"
+    assert (
+        relocated / ".ifg_generations" / generation_id / "payload.bin"
+    ).read_bytes() == b"trusted"
+
+
+def test_open_generation_payload_remains_pinned_after_root_replacement(
+    tmp_path: Path,
+) -> None:
+    """An opened generation never re-resolves its payload through root paths."""
+    root = tmp_path / "artifacts"
+    relocated = tmp_path / "relocated"
+    _publish_minimal_generation(root)
+    opened = open_current_generation(root, "ifg")
+
+    root.rename(relocated)
+    attacker_generation = root / ".ifg_generations" / opened.generation_id
+    attacker_generation.mkdir(parents=True)
+    (attacker_generation / "payload.bin").write_bytes(b"attacker")
+
+    try:
+        assert (opened.path / "payload.bin").read_bytes() == b"payload"
+    finally:
+        opened.lease.close()
