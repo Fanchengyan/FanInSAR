@@ -914,7 +914,16 @@ class Stack:
                 [artifact.unwrapped_phase for artifact in unwrapped], axis=0
             )
             persisted_parameters = unwrapped[0].method_parameters
-            if persisted_parameters["quality_criteria"] != requested_quality_criteria:
+            persisted_quality_criteria = {
+                key: value
+                for key, value in persisted_parameters["quality_criteria"].items()
+                if key
+                not in {
+                    "max_modulo_closure_p95_rad",
+                    "max_sbas_residual_p95_rad",
+                }
+            }
+            if persisted_quality_criteria != requested_quality_criteria:
                 reject_invalid_state(
                     "persisted unwrap quality criteria do not match the requested "
                     "quality policy"
