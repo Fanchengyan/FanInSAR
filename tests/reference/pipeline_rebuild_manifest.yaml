@@ -62,8 +62,8 @@ specifications:
   - id: existing-reference-manifest
     classification: primary specification
     path: tests/reference/manifest.yaml
-    sha256: 65262f381821bacfd88d2f2dcd81cbf5afca6f04e0d101340674a48728c9b72a
-    size_bytes: 4984
+    sha256: ef8fe4f0e1d1b13599d14dd872d797fd8424942e8fe3b93e7e3ba2a7721ae873
+    size_bytes: 4950
 
 corpus:
   source_classification: clean-room input

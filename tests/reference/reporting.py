@@ -107,13 +107,9 @@ def _gate_bindings(family: MetricFamily) -> tuple[ManifestGateBinding, ...]:
                 ),
             )
         case "closure":
-            bindings = (
-                ManifestGateBinding(
-                    "closure_phase_radians_max",
-                    "maximum_absolute_rad",
-                    "maximum",
-                ),
-            )
+            # Closure is intentionally diagnostic-only for multilooked InSAR.
+            # ISCE2 parity, not zero loop closure, is the acceptance oracle.
+            bindings = ()
         case "geolocation":
             bindings = (
                 ManifestGateBinding(

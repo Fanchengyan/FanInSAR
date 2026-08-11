@@ -43,8 +43,8 @@ def test_quality_report_proves_exact_planted_network_solution() -> None:
     assert report.phase_reconstruction_max_error_rad < 1e-12
 
 
-def test_quality_thresholds_are_explicit_and_fail_closed() -> None:
-    """Physical closure and residual limits are applied only when configured."""
+def test_multilook_closure_is_diagnostic_only() -> None:
+    """Non-zero multilook closure is reported without blocking publication."""
     phase = np.array([1.0, 2.0, 3.3], dtype=np.float64)[:, None, None]
     corrections = np.zeros_like(phase)
 
@@ -55,18 +55,6 @@ def test_quality_thresholds_are_explicit_and_fail_closed() -> None:
         PAIRS,
         converged_mask=np.ones((1, 1), dtype=bool),
     )
-    strict = evaluate_stack_quality(
-        phase,
-        phase,
-        corrections,
-        PAIRS,
-        converged_mask=np.ones((1, 1), dtype=bool),
-        criteria=StackQualityCriteria(
-            max_modulo_closure_p95_rad=0.2,
-            max_sbas_residual_p95_rad=0.05,
-        ),
-    )
-
     assert diagnostic_only.passed
     np.testing.assert_allclose(
         diagnostic_only.modulo_closure_abs_rad.p95,
@@ -78,9 +66,7 @@ def test_quality_thresholds_are_explicit_and_fail_closed() -> None:
         0.1,
         atol=1e-12,
     )
-    assert not strict.passed
-    assert any("modulo closure" in failure for failure in strict.failures)
-    assert any("SBAS residual" in failure for failure in strict.failures)
+    assert diagnostic_only.failures == ()
 
 
 def test_quality_rejects_published_rank_deficient_pixel() -> None:

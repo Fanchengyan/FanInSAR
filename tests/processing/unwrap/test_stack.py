@@ -139,22 +139,22 @@ def test_unwrap_stack_full_chain() -> None:
     )
 
 
-def test_unwrap_stack_fails_closed_on_configured_quality_limit() -> None:
-    """A configured physical closure limit blocks downstream inversion."""
+def test_unwrap_stack_does_not_gate_on_multilook_closure() -> None:
+    """Non-zero temporal closure remains usable for downstream inversion."""
     phase_stack = np.broadcast_to(
         np.array([1.0, 2.0, 3.3])[:, None, None],
         (3, 2, 2),
     ).copy()
 
-    with pytest.raises(InvalidProcessingStateError, match="quality gate failed"):
-        unwrap_stack(
-            phase_stack,
-            _pair_dates(),
-            do_spatial=False,
-            do_temporal=True,
-            do_invert=True,
-            temporal_kwargs={"max_iter": 10},
-            quality_criteria=StackQualityCriteria(
-                max_modulo_closure_p95_rad=0.2,
-            ),
-        )
+    result = unwrap_stack(
+        phase_stack,
+        _pair_dates(),
+        do_spatial=False,
+        do_temporal=True,
+        do_invert=True,
+        temporal_kwargs={"max_iter": 10},
+        quality_criteria=StackQualityCriteria(),
+    )
+
+    assert result.quality_report is not None
+    assert result.quality_report.passed

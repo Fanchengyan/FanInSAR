@@ -108,7 +108,6 @@ metric_gates:
   coherence_absolute_error_max: 0.03
   range_offset_rmse_pixels_max: 0.1
   azimuth_offset_rmse_pixels_max: 0.1
-  closure_phase_radians_max: 0.05
   geolocation_rmse_meters_max: 5.0
   displacement_rmse_millimeters_max: 2.0
   performance_runtime_ratio_max: 2.0

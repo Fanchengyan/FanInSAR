@@ -123,3 +123,13 @@ def test_manifest_declares_velocity_bias_and_uncertainty_coverage_gates() -> Non
 
     assert gates["velocity_bias_millimeters_per_year_max"] >= 0.0
     assert 0.0 < gates["uncertainty_95_coverage_fraction_min"] <= 1.0
+
+
+def test_manifest_uses_isce2_parity_gates_without_closure_gate() -> None:
+    """Use ISCE2 product differences as gates, never a zero-closure rule."""
+    gates = load_manifest(MANIFEST_PATH).metric_gates
+
+    assert "closure_phase_radians_max" not in gates
+    assert gates["wrapped_phase_circular_rmse_radians_max"] > 0.0
+    assert gates["coherence_absolute_error_max"] > 0.0
+    assert gates["range_offset_rmse_pixels_max"] > 0.0

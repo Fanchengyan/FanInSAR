@@ -134,6 +134,7 @@ def test_interrupted_fetch_removes_partial_bytes(tmp_path: Path) -> None:
 
 
 def test_pipeline_rebuild_manifest_verifies_fixed_corpus() -> None:
+    """Verify the frozen ISCE2 and InSAR.dev oracle corpus metadata."""
     summary = validate_pipeline_rebuild_manifest(
         Path("tests/reference/pipeline_rebuild_manifest.yaml")
     )

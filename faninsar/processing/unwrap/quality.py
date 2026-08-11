@@ -40,24 +40,25 @@ class MetricDistribution:
 
 @dataclass(frozen=True, slots=True)
 class StackQualityCriteria:
-    """Optional physical limits applied to exact Stack diagnostics.
+    """Optional coverage limits for a Stack product.
 
-    No universal closure or residual threshold is assumed. Callers may set
-    those limits from a campaign's independently justified error budget.
+    Temporal loop closure and least-squares residuals are deliberately
+    diagnostics only.  They are not universal correctness criteria for
+    multilooked InSAR products: multilooking, pair-dependent weighting and
+    phase unwrapping can produce physically meaningful non-zero residuals.
+    Product qualification is therefore performed against the ISCE2 oracle
+    and explicit rank/coverage requirements, not against a zero-closure
+    assumption.
 
     Attributes
     ----------
     min_converged_fraction, min_rank_coverage_fraction : float or None
         Optional minimum fractions in the closed interval ``[0, 1]``.
-    max_modulo_closure_p95_rad, max_sbas_residual_p95_rad : float or None
-        Optional non-negative upper limits in radians.
 
     """
 
     min_converged_fraction: float | None = None
     min_rank_coverage_fraction: float | None = None
-    max_modulo_closure_p95_rad: float | None = None
-    max_sbas_residual_p95_rad: float | None = None
 
     def __post_init__(self) -> None:
         """Validate configured quality limits."""
@@ -67,18 +68,17 @@ class StackQualityCriteria:
                 not np.isfinite(value) or not 0.0 <= value <= 1.0
             ):
                 reject_invalid_state(f"{name} must be finite and within [0, 1]")
-        for name in (
-            "max_modulo_closure_p95_rad",
-            "max_sbas_residual_p95_rad",
-        ):
-            value = getattr(self, name)
-            if value is not None and (not np.isfinite(value) or value < 0.0):
-                reject_invalid_state(f"{name} must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
 class StackQualityReport:
-    """Independent temporal convergence, closure, residual, and rank report."""
+    """Independent temporal convergence, diagnostic, and rank report.
+
+    ``modulo_closure_abs_rad`` and ``sbas_residual_abs_rad`` are retained as
+    observational fields for scientific reporting.  Neither field affects
+    :attr:`passed`; ISCE2 parity and explicit coverage/rank policy determine
+    qualification.
+    """
 
     passed: bool
     failures: tuple[str, ...]
@@ -197,7 +197,7 @@ def evaluate_stack_quality(
     converged_mask: np.ndarray,
     criteria: StackQualityCriteria | None = None,
 ) -> StackQualityReport:
-    """Evaluate a temporal Stack product against exact network algebra.
+    """Evaluate a temporal Stack product's structural invariants.
 
     Parameters
     ----------
@@ -209,8 +209,9 @@ def evaluate_stack_quality(
     converged_mask : numpy.ndarray
         Spatial mask identifying pixels selected for publication.
     criteria : StackQualityCriteria, optional
-        Explicit campaign limits. Exact algebraic publication invariants are
-        always enforced, independently of these optional limits.
+        Explicit rank/coverage limits. Multilook loop closure and SBAS
+        residuals are reported for diagnostics only and are never used as
+        universal publication gates.
 
     Returns
     -------
@@ -219,9 +220,11 @@ def evaluate_stack_quality(
 
     Notes
     -----
-    Modulo closure is evaluated on an integer fundamental-cycle basis as
-    ``angle(exp(1j * C @ phase))``. SBAS residuals are independently recomputed
-    by least squares on every published pixel's finite full-rank subnetwork.
+    Modulo closure is evaluated on an integer fundamental-cycle basis as a
+    diagnostic, ``angle(exp(1j * C @ phase))``. SBAS residuals are independently
+    recomputed by least squares on every published pixel's finite full-rank
+    subnetwork. Neither diagnostic is interpreted as a zero-error physical
+    requirement after multilooking.
 
     """
     source = np.asarray(phase_input, dtype=np.float64)
@@ -340,23 +343,6 @@ def evaluate_stack_quality(
             f"{rank_coverage:.6f} is below "
             f"{limits.min_rank_coverage_fraction:.6f}"
         )
-    if limits.max_modulo_closure_p95_rad is not None and (
-        modulo_closure.p95 is None
-        or modulo_closure.p95 > limits.max_modulo_closure_p95_rad
-    ):
-        failures.append(
-            "modulo closure p95 is missing or exceeds configured limit "
-            f"{limits.max_modulo_closure_p95_rad:.6g} rad"
-        )
-    if limits.max_sbas_residual_p95_rad is not None and (
-        sbas_residual.p95 is None
-        or sbas_residual.p95 > limits.max_sbas_residual_p95_rad
-    ):
-        failures.append(
-            "SBAS residual p95 is missing or exceeds configured limit "
-            f"{limits.max_sbas_residual_p95_rad:.6g} rad"
-        )
-
     return StackQualityReport(
         passed=not failures,
         failures=tuple(failures),

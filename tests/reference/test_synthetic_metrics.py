@@ -230,6 +230,13 @@ def test_manifest_supplied_gates_drive_evaluation_and_evidence(tmp_path: Path) -
     assert artifacts.quicklook_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def test_closure_metric_is_diagnostic_only_in_manifest_reporting() -> None:
+    """Closure metrics remain reportable but cannot block an ISCE2 gate."""
+    manifest = load_manifest(Path(__file__).with_name("manifest.yaml"))
+
+    assert metric_gates_from_manifest(manifest.metric_gates, "closure") == ()
+
+
 def test_manifest_exposes_velocity_bias_and_uncertainty_coverage_gates() -> None:
     """Verify displacement gates include velocity bias and 95 percent coverage."""
     manifest = load_manifest(Path(__file__).with_name("manifest.yaml"))
