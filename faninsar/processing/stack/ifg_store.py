@@ -104,7 +104,10 @@ def _store_root(root: str | Path, *, create: bool) -> Path:
             reject_invalid_state(f"artifact store root is unsafe: {path}")
     elif create:
         try:
-            path.mkdir(parents=True, exist_ok=True)
+            # Keep the managed root private even when the caller's umask is
+            # permissive (for example, a shared Linux group umask of 0002).
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.chmod(0o700)
         except OSError as error:
             reject_invalid_state(f"artifact store root cannot be created: {error}")
         _reject_symlink_components(path)

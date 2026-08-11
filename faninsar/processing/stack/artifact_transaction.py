@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -110,9 +111,7 @@ class _PinnedGenerationPath(_ConcretePath):
         """Propagate descriptor state through pathlib-generated child paths."""
         display_path = Path(*pathsegments)
         try:
-            relative_parts = display_path.relative_to(
-                self._state.display_path
-            ).parts
+            relative_parts = display_path.relative_to(self._state.display_path).parts
         except ValueError:
             relative_parts = self._relative_parts
         return type(self)._create_child(
@@ -123,8 +122,14 @@ class _PinnedGenerationPath(_ConcretePath):
 
     def __fspath__(self) -> str:
         """Return a descriptor path for a securely opened regular payload."""
+        descriptor = self._open_payload_descriptor()
+        self._state.payload_descriptors.append(descriptor)
+        return f"/dev/fd/{descriptor}"
+
+    def _open_payload_descriptor(self) -> int:
+        """Open and validate one pinned directory entry."""
         if not self._relative_parts:
-            return os.fspath(self._display_path)
+            return os.dup(self._state.generation_descriptor)
         parent_descriptor = os.dup(self._state.generation_descriptor)
         try:
             for component in self._relative_parts[:-1]:
@@ -143,15 +148,13 @@ class _PinnedGenerationPath(_ConcretePath):
             )
             descriptor = os.open(
                 name,
-                os.O_RDONLY
-                | os.O_NONBLOCK
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=parent_descriptor,
             )
             opened = os.fstat(descriptor)
             if (
-                not stat.S_ISREG(metadata.st_mode)
-                or not stat.S_ISREG(opened.st_mode)
+                not (stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode))
+                or not (stat.S_ISREG(opened.st_mode) or stat.S_ISDIR(opened.st_mode))
                 or metadata.st_nlink != 1
                 or opened.st_nlink != 1
                 or metadata.st_uid != os.getuid()
@@ -162,15 +165,109 @@ class _PinnedGenerationPath(_ConcretePath):
                 reject_invalid_state(
                     f"artifact generation payload is unsafe: {self._display_path.name}"
                 )
-            self._state.payload_descriptors.append(descriptor)
-            descriptor_path = f"/dev/fd/{descriptor}"
         except OSError as error:
             reject_invalid_state(
                 f"artifact generation payload cannot be opened: {error}"
             )
+        else:
+            return descriptor
         finally:
             os.close(parent_descriptor)
-        return descriptor_path
+
+    def _stat_relative(self) -> os.stat_result:
+        """Stat a pinned path without exposing the ``/dev/fd`` symlink."""
+        if not self._relative_parts:
+            return os.fstat(self._state.generation_descriptor)
+        parent_descriptor = os.dup(self._state.generation_descriptor)
+        try:
+            for component in self._relative_parts[:-1]:
+                child = _open_directory_at(
+                    parent_descriptor,
+                    component,
+                    label=str(self._display_path),
+                )
+                os.close(parent_descriptor)
+                parent_descriptor = child
+            return os.stat(
+                self._relative_parts[-1],
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(parent_descriptor)
+
+    def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+        """Return metadata for the pinned generation or relative entry."""
+        del follow_symlinks
+        return self._stat_relative()
+
+    def is_file(self) -> bool:
+        """Report regular-file status without inspecting the ``/dev/fd`` link."""
+        try:
+            metadata = self._stat_relative()
+        except FileNotFoundError:
+            return False
+        return stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+
+    def is_dir(self) -> bool:
+        """Report directory status without resolving the descriptor link."""
+        try:
+            return stat.S_ISDIR(self._stat_relative().st_mode)
+        except FileNotFoundError:
+            return False
+
+    def is_symlink(self) -> bool:
+        """Report symlink status from the descriptor-relative entry metadata."""
+        try:
+            return stat.S_ISLNK(self._stat_relative().st_mode)
+        except FileNotFoundError:
+            return False
+
+    def rglob(self, pattern: str | os.PathLike[str]) -> Iterator[Self]:
+        """Recursively enumerate pinned entries without resolving display paths."""
+        pattern_text = os.fspath(pattern)
+        root_descriptor = os.dup(self._state.generation_descriptor)
+
+        def walk(
+            directory_descriptor: int,
+            display_path: Path,
+            relative_parts: tuple[str, ...],
+        ) -> Iterator[Self]:
+            try:
+                names = os.listdir(directory_descriptor)
+            except OSError as error:
+                reject_invalid_state(f"artifact generation cannot be listed: {error}")
+            for name in names:
+                metadata = os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1:
+                    reject_invalid_state(f"artifact generation entry is unsafe: {name}")
+                child_parts = (*relative_parts, name)
+                child = type(self)._create_child(
+                    self._state,
+                    display_path / name,
+                    child_parts,
+                )
+                if fnmatch.fnmatch(name, pattern_text):
+                    yield child
+                if stat.S_ISDIR(metadata.st_mode):
+                    child_descriptor = _open_directory_at(
+                        directory_descriptor,
+                        name,
+                        label=str(child),
+                    )
+                    try:
+                        yield from walk(child_descriptor, child, child_parts)
+                    finally:
+                        os.close(child_descriptor)
+
+        try:
+            yield from walk(root_descriptor, self._display_path, self._relative_parts)
+        finally:
+            os.close(root_descriptor)
 
     @property
     def parent(self) -> Path:
@@ -298,6 +395,13 @@ def _open_root_descriptor(root: Path, *, create: bool) -> int:
                     raise
                 os.mkdir(component, mode=0o700, dir_fd=descriptor)
                 child = os.open(component, flags, dir_fd=descriptor)
+            if is_root:
+                child_metadata = os.fstat(child)
+                if (
+                    stat.S_ISDIR(child_metadata.st_mode)
+                    and child_metadata.st_uid == os.getuid()
+                ):
+                    os.fchmod(child, 0o700)
             _validate_directory_descriptor(
                 child,
                 label=str(Path(*absolute.parts[: index + 1])),
@@ -420,17 +524,14 @@ def _validate_generation_tree(directory_descriptor: int) -> None:
             )
         if metadata.st_nlink != 1:
             reject_invalid_state(f"artifact generation contains a hardlink: {name}")
-        if (
-            metadata.st_uid != os.getuid()
-            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        if metadata.st_uid != os.getuid() or metadata.st_mode & (
+            stat.S_IWGRP | stat.S_IWOTH
         ):
             reject_invalid_state(f"artifact generation entry is unsafe: {name}")
         try:
             descriptor = os.open(
                 name,
-                os.O_RDONLY
-                | os.O_NONBLOCK
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=directory_descriptor,
             )
         except OSError as error:
@@ -733,47 +834,51 @@ def stage_generation(
     limits: ArtifactResourceLimits | None = None,
 ) -> Iterator[tuple[str, Path]]:
     """Reserve and stage one unique generation while holding the root lock."""
-    root = initialize_root(root)
-    with root_lock(root) as root_descriptor:
-        generations, staging_root, leases, _ = _namespace_paths(root, namespace)
-        namespace_descriptors = [
-            _open_directory_at(
-                root_descriptor,
-                path.name,
-                create=True,
-                label=str(path),
+    previous_umask = os.umask(0o077)
+    try:
+        root = initialize_root(root)
+        with root_lock(root) as root_descriptor:
+            generations, staging_root, leases, _ = _namespace_paths(root, namespace)
+            namespace_descriptors = [
+                _open_directory_at(
+                    root_descriptor,
+                    path.name,
+                    create=True,
+                    label=str(path),
+                )
+                for path in (generations, staging_root, leases)
+            ]
+            generations_descriptor, staging_root_descriptor, leases_descriptor = (
+                namespace_descriptors
             )
-            for path in (generations, staging_root, leases)
-        ]
-        generations_descriptor, staging_root_descriptor, leases_descriptor = (
-            namespace_descriptors
-        )
-        os.close(generations_descriptor)
-        os.close(leases_descriptor)
-        preflight_resources(
-            root,
-            final_bytes=final_bytes,
-            temporary_bytes=temporary_bytes,
-            file_count=file_count,
-            dimensions=dimensions,
-            limits=limits,
-        )
-        generation_id = uuid.uuid4().hex
-        staging_path = staging_root / generation_id
-        try:
-            os.mkdir(generation_id, mode=0o700, dir_fd=staging_root_descriptor)
-        except OSError as error:
-            os.close(staging_root_descriptor)
-            reject_invalid_state(
-                f"artifact staging directory cannot be created: {error}"
+            os.close(generations_descriptor)
+            os.close(leases_descriptor)
+            preflight_resources(
+                root,
+                final_bytes=final_bytes,
+                temporary_bytes=temporary_bytes,
+                file_count=file_count,
+                dimensions=dimensions,
+                limits=limits,
             )
-        try:
-            yield generation_id, staging_path
-        finally:
+            generation_id = uuid.uuid4().hex
+            staging_path = staging_root / generation_id
             try:
-                _remove_tree_at(staging_root_descriptor, generation_id)
-            finally:
+                os.mkdir(generation_id, mode=0o700, dir_fd=staging_root_descriptor)
+            except OSError as error:
                 os.close(staging_root_descriptor)
+                reject_invalid_state(
+                    f"artifact staging directory cannot be created: {error}"
+                )
+            try:
+                yield generation_id, staging_path
+            finally:
+                try:
+                    _remove_tree_at(staging_root_descriptor, generation_id)
+                finally:
+                    os.close(staging_root_descriptor)
+    finally:
+        os.umask(previous_umask)
 
 
 def commit_generation(
@@ -838,9 +943,7 @@ def commit_generation(
         os.fsync(generations_descriptor)
         if compatibility_manifest is not None:
             name = (
-                "manifest.json"
-                if namespace == "ifg"
-                else f"{namespace}_manifest.json"
+                "manifest.json" if namespace == "ifg" else f"{namespace}_manifest.json"
             )
             _atomic_control_at(root_descriptor, name, compatibility_manifest)
         unsigned = {

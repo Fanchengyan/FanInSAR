@@ -60,6 +60,34 @@ def test_staging_accepts_group_writable_mount_ancestor(tmp_path: Path) -> None:
     assert root.stat().st_mode & 0o777 == 0o700
 
 
+def test_staging_forces_private_payload_permissions_under_group_umask(
+    tmp_path: Path,
+) -> None:
+    """Staged payloads remain private when the process umask is permissive."""
+    root = tmp_path / "artifacts"
+    previous_umask = os.umask(0o002)
+    try:
+        with stage_generation(
+            root,
+            "ifg",
+            final_bytes=7,
+            temporary_bytes=7,
+            file_count=1,
+        ) as (generation_id, staging):
+            payload = staging / "payload.bin"
+            payload.write_bytes(b"payload")
+            assert payload.stat().st_mode & 0o077 == 0
+            commit_generation(
+                root,
+                "ifg",
+                generation_id,
+                staging,
+                manifest_digest="a" * 64,
+            )
+    finally:
+        os.umask(previous_umask)
+
+
 def test_commit_rejects_hardlinked_payload(tmp_path: Path) -> None:
     """A staged payload with another name cannot enter a generation."""
     root = tmp_path / "artifacts"
@@ -135,9 +163,7 @@ def test_commit_remains_bound_to_root_descriptor_after_ancestor_replacement(
         (root / ".ifg_staging" / generation_id).mkdir(parents=True)
         (root / ".ifg_generations").mkdir()
         (root / ".ifg_leases").mkdir()
-        (root / ".ifg_staging" / generation_id / "payload.bin").write_bytes(
-            b"attacker"
-        )
+        (root / ".ifg_staging" / generation_id / "payload.bin").write_bytes(b"attacker")
 
         commit_generation(
             root,
