@@ -13,6 +13,13 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.stack.artifact_transaction import (
+    ArtifactResourceLimits,
+    GenerationLease,
+    commit_generation,
+    open_current_generation,
+    stage_generation,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -325,6 +332,8 @@ class InterferogramArtifactStore:
     """
 
     root: Path
+    generation_id: str
+    generation_root: Path
     pair: tuple[str, str]
     domain: str
     wavelength_m: float | None
@@ -336,6 +345,7 @@ class InterferogramArtifactStore:
     shape: tuple[int, int]
     manifest_digest: str
     _payloads: dict[str, dict[str, Any]]
+    _lease: GenerationLease
 
     @classmethod
     def open(cls, root: str | Path) -> Self:
@@ -353,7 +363,28 @@ class InterferogramArtifactStore:
 
         """
         path = _store_root(root, create=False)
-        manifest = _verified_manifest(path / "manifest.json", IFG_ARTIFACT_SCHEMA)
+        direct_payloads = [path / filename for filename in _IFG_FILENAMES.values()]
+        if any(payload.exists() for payload in direct_payloads):
+            reject_invalid_state(
+                "legacy direct IFG payload layout is quarantined and cannot be read"
+            )
+        opened = open_current_generation(path, "ifg")
+        try:
+            manifest = _verified_manifest(
+                opened.path / "manifest.json", IFG_ARTIFACT_SCHEMA
+            )
+            if manifest.get("manifest_digest") != opened.manifest_digest:
+                reject_invalid_state("IFG CURRENT digest does not match its generation")
+            compatibility_manifest = _verified_manifest(
+                path / "manifest.json", IFG_ARTIFACT_SCHEMA
+            )
+            if compatibility_manifest != manifest:
+                reject_invalid_state(
+                    "IFG compatibility manifest does not match CURRENT"
+                )
+        except Exception:
+            opened.lease.close()
+            raise
         raw_pair = manifest.get("pair")
         if (
             not isinstance(raw_pair, list)
@@ -405,11 +436,13 @@ class InterferogramArtifactStore:
             reject_invalid_state("artifact source manifest digests are invalid")
         shape = _validate_shape(manifest.get("shape"), "shape")
         payloads = _validate_payload_table(
-            path, manifest.get("payloads"), _IFG_FILENAMES, shape
+            opened.path, manifest.get("payloads"), _IFG_FILENAMES, shape
         )
         digest = str(manifest["manifest_digest"])
         return cls(
             root=path,
+            generation_id=opened.generation_id,
+            generation_root=opened.path,
             pair=(raw_pair[0], raw_pair[1]),
             domain=str(domain),
             wavelength_m=wavelength_m,
@@ -421,11 +454,24 @@ class InterferogramArtifactStore:
             shape=shape,
             manifest_digest=digest,
             _payloads=payloads,
+            _lease=opened.lease,
         )
+
+    def close(self) -> None:
+        """Release this store's durable reader pin."""
+        self._lease.close()
+
+    def __enter__(self) -> Self:
+        """Return this pinned store as a context manager."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Release the generation pin on context-manager exit."""
+        self.close()
 
     def read(self) -> InterferogramArtifact:
         """Read all IFG layers after validating hashes, shapes, and dtypes."""
-        arrays = _read_payloads(self.root, self._payloads)
+        arrays = _read_payloads(self.generation_root, self._payloads)
         if arrays["complex_ifg"].dtype.kind != "c" or any(
             arrays[name].dtype.kind != "f"
             for name in ("coherence", "wrapped_phase", "amplitude")
@@ -440,9 +486,31 @@ class InterferogramArtifactStore:
 
     def read_unwrapped(self) -> UnwrappedArtifact:
         """Read the complete unwrap generation bound to this exact IFG."""
-        manifest = _verified_manifest(
-            self.root / "unwrap_manifest.json", UNWRAP_ARTIFACT_SCHEMA
-        )
+        if any(
+            (self.root / filename).exists() for filename in _UNWRAP_FILENAMES.values()
+        ):
+            reject_invalid_state(
+                "legacy direct unwrap payload layout is quarantined and cannot be read"
+            )
+        opened = open_current_generation(self.root, "unwrap")
+        try:
+            manifest = _verified_manifest(
+                opened.path / "unwrap_manifest.json", UNWRAP_ARTIFACT_SCHEMA
+            )
+            if manifest.get("manifest_digest") != opened.manifest_digest:
+                reject_invalid_state(
+                    "unwrap CURRENT digest does not match its generation"
+                )
+            compatibility_manifest = _verified_manifest(
+                self.root / "unwrap_manifest.json", UNWRAP_ARTIFACT_SCHEMA
+            )
+            if compatibility_manifest != manifest:
+                reject_invalid_state(
+                    "unwrap compatibility manifest does not match CURRENT"
+                )
+        except Exception:
+            opened.lease.close()
+            raise
         if manifest.get("ifg_manifest_digest") != self.manifest_digest:
             reject_invalid_state("unwrap artifact is bound to a different IFG")
         if _validate_shape(manifest.get("shape"), "unwrap shape") != self.shape:
@@ -458,12 +526,13 @@ class InterferogramArtifactStore:
             raw_method.get("parameters"), "unwrap method parameters"
         )
         descriptors = _validate_payload_table(
-            self.root,
+            opened.path,
             manifest.get("payloads"),
             _UNWRAP_FILENAMES,
             self.shape,
         )
-        arrays = _read_payloads(self.root, descriptors)
+        arrays = _read_payloads(opened.path, descriptors)
+        opened.lease.close()
         if (
             arrays["unwrapped_phase"].dtype.kind != "f"
             or arrays["connected_components"].dtype.kind not in "iu"
@@ -493,6 +562,8 @@ def write_ifg_artifact(
     coherence: np.ndarray,
     wrapped_phase: np.ndarray,
     amplitude: np.ndarray,
+    resource_limits: ArtifactResourceLimits | None = None,
+    replace_existing: bool = False,
 ) -> InterferogramArtifactStore:
     """Atomically persist one complete derived interferogram generation.
 
@@ -520,6 +591,10 @@ def write_ifg_artifact(
         Canonical JSON parameters for the filter.
     source_manifest_digests : mapping[str, str]
         Named SHA-256 digests of every source scene manifest.
+    resource_limits : ArtifactResourceLimits, optional
+        Hard publication size, file-count, and free-space limits.
+    replace_existing : bool, optional
+        Publish a new immutable generation and advance ``CURRENT`` when true.
     complex_ifg, coherence, wrapped_phase, amplitude : numpy.ndarray
         Matching two-dimensional IFG product layers.
 
@@ -585,29 +660,52 @@ def write_ifg_artifact(
         reject_invalid_state("IFG artifact source manifest digests are invalid")
 
     path = _store_root(root, create=True)
-    manifest_path = path / "manifest.json"
-    if manifest_path.exists():
-        reject_invalid_state("IFG artifact generation is already published")
-    descriptors: dict[str, dict[str, Any]] = {}
-    for name, filename in _IFG_FILENAMES.items():
-        payload_path = path / filename
-        _atomic_save(payload_path, arrays[name])
-        descriptors[name] = _array_descriptor(payload_path, arrays[name])
-    unsigned: dict[str, Any] = {
-        "schema_version": IFG_ARTIFACT_SCHEMA,
-        "status": "complete",
-        "pair": list(pair),
-        "looks": list(looks),
-        "domain": domain,
-        "wavelength_m": wavelength_m,
-        "grid_identity": resolved_grid_identity,
-        "filter": {"name": filter_name, "parameters": parameters},
-        "source_manifest_digests": sources,
-        "shape": [int(shape[0]), int(shape[1])],
-        "payloads": descriptors,
-    }
-    manifest = {**unsigned, "manifest_digest": _digest_bytes(_canonical_json(unsigned))}
-    _atomic_manifest(manifest_path, manifest)
+    estimated_bytes = sum(int(array.nbytes) + 1024 for array in arrays.values())
+    with stage_generation(
+        path,
+        "ifg",
+        final_bytes=estimated_bytes,
+        temporary_bytes=estimated_bytes,
+        file_count=len(arrays) + 1,
+        dimensions=(int(shape[0]), int(shape[1])),
+        limits=resource_limits,
+    ) as (generation_id, staging):
+        if not replace_existing and (
+            (path / "CURRENT").exists() or (path / "manifest.json").exists()
+        ):
+            reject_invalid_state("IFG artifact generation is already published")
+        descriptors: dict[str, dict[str, Any]] = {}
+        for name, filename in _IFG_FILENAMES.items():
+            payload_path = staging / filename
+            _atomic_save(payload_path, arrays[name])
+            descriptors[name] = _array_descriptor(payload_path, arrays[name])
+        unsigned: dict[str, Any] = {
+            "schema_version": IFG_ARTIFACT_SCHEMA,
+            "status": "complete",
+            "generation_id": generation_id,
+            "pair": list(pair),
+            "looks": list(looks),
+            "domain": domain,
+            "wavelength_m": wavelength_m,
+            "grid_identity": resolved_grid_identity,
+            "filter": {"name": filter_name, "parameters": parameters},
+            "source_manifest_digests": sources,
+            "shape": [int(shape[0]), int(shape[1])],
+            "payloads": descriptors,
+        }
+        manifest = {
+            **unsigned,
+            "manifest_digest": _digest_bytes(_canonical_json(unsigned)),
+        }
+        _atomic_manifest(staging / "manifest.json", manifest)
+        commit_generation(
+            path,
+            "ifg",
+            generation_id,
+            staging,
+            manifest_digest=str(manifest["manifest_digest"]),
+            compatibility_manifest=manifest,
+        )
     logger.info("Published IFG artifact %s for pair %s", path, pair)
     return InterferogramArtifactStore.open(path)
 
@@ -620,6 +718,8 @@ def write_unwrapped_artifact(
     method: str,
     method_parameters: Mapping[str, Any],
     ifg_manifest_digest: str,
+    resource_limits: ArtifactResourceLimits | None = None,
+    replace_existing: bool = False,
 ) -> None:
     """Atomically persist unwrap layers bound to one exact IFG generation.
 
@@ -637,6 +737,10 @@ def write_unwrapped_artifact(
         Canonical JSON parameters for the unwrapping method.
     ifg_manifest_digest : str
         Digest returned by :class:`InterferogramArtifactStore`.
+    resource_limits : ArtifactResourceLimits, optional
+        Hard publication size, file-count, and free-space limits.
+    replace_existing : bool, optional
+        Publish a new immutable unwrap generation when true.
 
     """
     store = InterferogramArtifactStore.open(root)
@@ -655,34 +759,61 @@ def write_unwrapped_artifact(
         reject_invalid_state("unwrap method must not be empty")
     parameters = dict(method_parameters)
     _canonical_json(parameters)
-    manifest_path = store.root / "unwrap_manifest.json"
-    if manifest_path.exists():
-        reject_invalid_state("unwrap artifact generation is already published")
     arrays = {
         "unwrapped_phase": phase,
         "connected_components": components,
     }
-    descriptors: dict[str, dict[str, Any]] = {}
-    for name, filename in _UNWRAP_FILENAMES.items():
-        payload_path = store.root / filename
-        _atomic_save(payload_path, arrays[name])
-        descriptors[name] = _array_descriptor(payload_path, arrays[name])
-    unsigned: dict[str, Any] = {
-        "schema_version": UNWRAP_ARTIFACT_SCHEMA,
-        "status": "complete",
-        "ifg_manifest_digest": store.manifest_digest,
-        "shape": list(store.shape),
-        "method": {"name": method, "parameters": parameters},
-        "payloads": descriptors,
-    }
-    manifest = {**unsigned, "manifest_digest": _digest_bytes(_canonical_json(unsigned))}
-    _atomic_manifest(manifest_path, manifest)
+    estimated_bytes = sum(int(array.nbytes) + 1024 for array in arrays.values())
+    with stage_generation(
+        store.root,
+        "unwrap",
+        final_bytes=estimated_bytes,
+        temporary_bytes=estimated_bytes,
+        file_count=len(arrays) + 1,
+        dimensions=store.shape,
+        limits=resource_limits,
+    ) as (generation_id, staging):
+        if not replace_existing and (
+            (store.root / "UNWRAP_CURRENT").exists()
+            or (store.root / "unwrap_manifest.json").exists()
+        ):
+            reject_invalid_state("unwrap artifact generation is already published")
+        descriptors: dict[str, dict[str, Any]] = {}
+        for name, filename in _UNWRAP_FILENAMES.items():
+            payload_path = staging / filename
+            _atomic_save(payload_path, arrays[name])
+            descriptors[name] = _array_descriptor(payload_path, arrays[name])
+        unsigned: dict[str, Any] = {
+            "schema_version": UNWRAP_ARTIFACT_SCHEMA,
+            "status": "complete",
+            "generation_id": generation_id,
+            "ifg_generation_id": store.generation_id,
+            "ifg_manifest_digest": store.manifest_digest,
+            "shape": list(store.shape),
+            "method": {"name": method, "parameters": parameters},
+            "payloads": descriptors,
+        }
+        manifest = {
+            **unsigned,
+            "manifest_digest": _digest_bytes(_canonical_json(unsigned)),
+        }
+        _atomic_manifest(staging / "unwrap_manifest.json", manifest)
+        commit_generation(
+            store.root,
+            "unwrap",
+            generation_id,
+            staging,
+            manifest_digest=str(manifest["manifest_digest"]),
+            compatibility_manifest=manifest,
+        )
+    store.close()
     logger.info("Published unwrap artifact %s with method %s", store.root, method)
 
 
 __all__ = [
     "IFG_ARTIFACT_SCHEMA",
     "UNWRAP_ARTIFACT_SCHEMA",
+    "ArtifactResourceLimits",
     "InterferogramArtifact",
     "InterferogramArtifactStore",
     "UnwrappedArtifact",
