@@ -1,0 +1,16 @@
+{
+  "lane": "architecture",
+  "reviewer": "codex",
+  "verdict": "recommend-revision",
+  "blocking_issues": [
+    "The persisted IFG, unwrap, and SBAS flow is implemented, but P19 cannot be marked verified until the provider receipt, Stack-generation binding, and qualified activation event are issued by the authoritative gate chain rather than represented by candidate evidence.",
+    "A complete current-versus-reference Stack performance/resource packet for Radar and Geo is still absent."
+  ],
+  "severity": "normal",
+  "evidence_refs": [
+    ".omo/evidence/P18-P19-stack-generation-20260811.md",
+    ".omo/evidence/P18-P19-final-sbas-gate-review.md",
+    ".omo/evidence/P18-P19-final-matrix-delta-gate-review-20260812.md",
+    "PROPOSAL-0019:1832-1840"
+  ]
+}

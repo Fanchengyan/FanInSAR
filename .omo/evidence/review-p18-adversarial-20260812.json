@@ -1,0 +1,16 @@
+{
+  "lane": "adversarial",
+  "reviewer": "codex",
+  "verdict": "recommend-revision",
+  "blocking_issues": [
+    "Bounded transaction, corruption, source-mutation, and duplicate-residual checks pass, but the complete real multi-date crash/restart plus stale writer/reader-GC and exactly-once operation campaign required by the proposal is not yet recorded.",
+    "The new typed PhaseState rejects repeated residual solutions and lineage records bind payload, state, offset, LUT, carrier, and phase identities; this must still be included in the full generation fault matrix before activation."
+  ],
+  "severity": "normal",
+  "evidence_refs": [
+    ".omo/evidence/P18-P19-derived-artifact-transactions-20260811.md",
+    ".omo/evidence/P18-P19-transaction-lineage-campaign-20260812.md",
+    ".omo/evidence/P18-P19-scientific-operation-lineage-20260812.md",
+    "faninsar/processing/pipeline/production.py:171-270"
+  ]
+}

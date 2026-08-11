@@ -1,0 +1,14 @@
+{
+  "lane": "security",
+  "reviewer": "codex",
+  "verdict": "recommend-accept",
+  "blocking_issues": [],
+  "severity": "normal",
+  "evidence_refs": [
+    ".omo/evidence/P18-P19-derived-artifact-transactions-20260811.md",
+    ".omo/evidence/P18-P19-descriptor-relative-transaction-20260811.md",
+    ".omo/evidence/P18-P19-linux-cgroup-qualification-20260811.md",
+    "PROPOSAL-0018:347-432",
+    "PROPOSAL-0019:1448-1467"
+  ]
+}
