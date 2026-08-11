@@ -7,8 +7,9 @@ pass. It is updated continuously; unchecked items are not claimed as complete.
 
 - [x] Load FanInSAR project registration and P18/P19 sidecar proposals.
 - [x] Confirm closure removal is present in P18/P19 decisions and product tests.
-- [x] Confirm proposal statuses are `implemented`; verification/activation remains
-      gated by the pending independent review and does not get self-issued.
+- [x] Enter the P18/P19 Waymark review round and submit all four lanes for both
+      proposals. The round is synthesized; verification/activation remains
+      gated by the review findings and is not self-issued.
 
 ## Functional product paths
 
@@ -48,11 +49,12 @@ pass. It is updated continuously; unchecked items are not claimed as complete.
 
 - [x] Run bounded manifest, payload, partial, symlink, mixed-generation, and
       reopen fail-closed checks.
-- [x] Run the real multi-date crash/restart, stale-writer/reader-GC,
-      source-mutation, and artifact-level exactly-once lineage campaign. The
-      three-date/three-burst Geo generation passed fresh-process reopen,
-      reader pin/GC, CURRENT tamper, crash-before-commit, concurrent-writer,
-      immutable-source mutation, and IFG→unwrap→parent binding checks. See
+- [x] Run the bounded manifest, payload, partial, symlink, reopen, and
+      generation-transaction checks. The bounded transaction campaign passed
+      fresh-process reopen, reader pin/GC, CURRENT tamper, crash-before-commit,
+      concurrent-writer, immutable-source mutation, and IFG→unwrap binding
+      checks. The full real multi-date fault matrix remains open and is not
+      claimed from the bounded campaign; see
       `P18-P19-transaction-lineage-campaign-20260812.md`.
 - [x] Persist a complete scientific operation trace for residual, carrier,
       and geometric-phase transitions (operation IDs plus input/output payload
@@ -75,6 +77,9 @@ pass. It is updated continuously; unchecked items are not claimed as complete.
 - [x] Re-run independent review after the current four-mode matrix. The
       reviewer closed `P19-REAL-MODE-MATRIX`; the latest disposition is in
       `P18-P19-final-matrix-delta-gate-review-20260812.md`.
+- [x] Submit and synthesize the local P18/P19 Review round. Security recommends
+      acceptance; architecture, feasibility, and adversarial lanes recommend
+      revision for the remaining strict full-Stack and fault-evidence scope.
 - [ ] Complete three interleaved old/current full-Stack repetitions for both
       domains. Radar has only partial repeated evidence, and the historical
       old implementation has no GeoGrid-aware Stack API. Closing this item
