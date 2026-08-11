@@ -5,6 +5,12 @@ from __future__ import annotations
 from .api import UnwrapBackend, unwrap
 from .common import CommonUnwrapResult, UnwrapMethod, build_common_result
 from .irls import IRLSUnwrapResult, irls_unwrap, wrap_phase
+from .quality import (
+    MetricDistribution,
+    StackQualityCriteria,
+    StackQualityReport,
+    evaluate_stack_quality,
+)
 from .reconcile import (
     ComponentCorrection,
     ReconciliationResult,
@@ -25,15 +31,19 @@ __all__ = [
     "CommonUnwrapResult",
     "ComponentCorrection",
     "IRLSUnwrapResult",
+    "MetricDistribution",
     "ReconciliationResult",
     "SnaphuConfig",
     "SnaphuNotAvailableError",
+    "StackQualityCriteria",
+    "StackQualityReport",
     "StackUnwrapResult",
     "TemporalUnwrapResult",
     "UnwrapBackend",
     "UnwrapMethod",
     "align_components_to_reference",
     "build_common_result",
+    "evaluate_stack_quality",
     "irls_unwrap",
     "loop_closure_phase",
     "reconcile_components",

@@ -17,6 +17,11 @@ from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.timeseries.inversion import invert_unwrapped_pairs
 from faninsar.processing.unwrap._incidence import build_incidence_matrix
 from faninsar.processing.unwrap.api import unwrap
+from faninsar.processing.unwrap.quality import (
+    StackQualityCriteria,
+    StackQualityReport,
+    evaluate_stack_quality,
+)
 from faninsar.processing.unwrap.temporal_irls import unwrap_temporal_irls
 
 if TYPE_CHECKING:
@@ -66,6 +71,8 @@ class StackUnwrapResult:
         Published and masked solvable-pixel counts.
     temporal_converged_fraction : float
         Fraction of solvable temporal pixels that converged.
+    quality_report : StackQualityReport or None
+        Independent algebraic quality diagnostics when temporal processing ran.
     inverted : bool
         Whether the batch least-squares inversion stage ran.
 
@@ -86,6 +93,7 @@ class StackUnwrapResult:
     temporal_converged_pixels: int
     temporal_unconverged_pixels: int
     temporal_converged_fraction: float
+    quality_report: StackQualityReport | None
     inverted: bool
 
 
@@ -117,6 +125,7 @@ def unwrap_stack(
     lstsq_device: str = "cpu",
     temporal_kwargs: dict[str, Any] | None = None,
     spatial_kwargs: dict[str, Any] | None = None,
+    quality_criteria: StackQualityCriteria | None = None,
 ) -> StackUnwrapResult:
     """Run the 2D → 1D → inversion unwrap chain on a pair-phase stack.
 
@@ -154,6 +163,9 @@ def unwrap_stack(
     spatial_kwargs : dict, optional
         Extra keyword arguments forwarded to the spatial backend via
         :func:`~faninsar.processing.unwrap.api.unwrap` ``irls_kwargs``.
+    quality_criteria : StackQualityCriteria, optional
+        Explicit campaign quality limits. Exact integer-cycle, finite-mask,
+        and published-rank invariants are always checked before inversion.
 
     Returns
     -------
@@ -236,6 +248,7 @@ def unwrap_stack(
     temporal_converged_pixels = 0
     temporal_unconverged_pixels = 0
     temporal_converged_fraction = 0.0
+    quality_report: StackQualityReport | None = None
     if do_temporal:
         # After spatial (or when spatial is skipped), phases are treated as
         # already-unwrapped unless the caller overrides wrapped_input.
@@ -262,6 +275,19 @@ def unwrap_stack(
             temporal_result.converged_fraction,
             temporal_result.device,
         )
+        quality_report = evaluate_stack_quality(
+            phase_2d,
+            temporal_result.phase_unw,
+            temporal_result.corrections_k,
+            pair_dates,
+            converged_mask=temporal_result.converged_mask,
+            criteria=quality_criteria,
+        )
+        if not quality_report.passed:
+            reject_invalid_state(
+                "temporal Stack quality gate failed: "
+                + "; ".join(quality_report.failures)
+            )
 
     # --- Stage 3: batch least-squares inversion (not 1D unwrap) ---
     timeseries: np.ndarray | None = None
@@ -297,5 +323,6 @@ def unwrap_stack(
         temporal_converged_pixels=temporal_converged_pixels,
         temporal_unconverged_pixels=temporal_unconverged_pixels,
         temporal_converged_fraction=temporal_converged_fraction,
+        quality_report=quality_report,
         inverted=inverted,
     )

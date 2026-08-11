@@ -438,6 +438,10 @@ def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
         assert unwrapped.method_parameters["pair_ids"] == list(
             stack.unwrap_result.pair_ids
         )
+        assert unwrapped.method_parameters["quality_report"]["passed"] is True
+        assert "modulo_closure_abs_rad" in unwrapped.method_parameters[
+            "quality_report"
+        ]
 
     stack.unwrap_result = None
     stack.unwrap(do_spatial=False)
@@ -445,6 +449,17 @@ def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
     assert stack.unwrap_result.temporal_applied is True
     assert stack.unwrap_result.temporal_converged_pixels == 12
     assert stack.unwrap_result.temporal_converged_fraction == 1.0
+    assert stack.unwrap_result.quality_report is not None
+    assert stack.unwrap_result.quality_report.passed
+
+    from faninsar.processing.errors import InvalidProcessingStateError
+    from faninsar.processing.unwrap.quality import StackQualityCriteria
+
+    with pytest.raises(InvalidProcessingStateError, match="quality criteria"):
+        stack.unwrap(
+            do_spatial=False,
+            quality_criteria=StackQualityCriteria(min_converged_fraction=1.0),
+        )
 
 
 def test_scene_artifacts_flow_through_merge_unwrap_and_sbas(

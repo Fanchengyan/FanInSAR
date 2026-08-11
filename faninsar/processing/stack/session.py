@@ -58,6 +58,7 @@ if TYPE_CHECKING:
         UnwrappedArtifact,
     )
     from faninsar.processing.timeseries.inversion import TimeSeriesResult
+    from faninsar.processing.unwrap.quality import StackQualityCriteria
     from faninsar.processing.unwrap.stack import SpatialExecutor, StackUnwrapResult
 
 logger = setup_logger(__name__)
@@ -842,6 +843,7 @@ class Stack:
         temporal_device: str | None = None,
         spatial_kwargs: dict[str, Any] | None = None,
         temporal_kwargs: dict[str, Any] | None = None,
+        quality_criteria: StackQualityCriteria | None = None,
     ) -> Self:
         """Spatially unwrap and temporally reconcile persisted pair artifacts.
 
@@ -867,6 +869,10 @@ class Stack:
         spatial_kwargs, temporal_kwargs : dict, optional
             Numerical options forwarded to the existing Stack unwrap
             orchestrator.
+        quality_criteria : StackQualityCriteria, optional
+            Explicit physical quality limits. Exact algebraic publication
+            invariants are always enforced. A resumed artifact must have been
+            produced under the identical criteria.
 
         Returns
         -------
@@ -875,8 +881,14 @@ class Stack:
 
         """
         from faninsar.processing.stack.ifg_store import write_unwrapped_artifact
+        from faninsar.processing.unwrap.quality import (
+            MetricDistribution,
+            StackQualityCriteria,
+            StackQualityReport,
+        )
         from faninsar.processing.unwrap.stack import unwrap_stack
 
+        requested_quality_criteria = asdict(quality_criteria or StackQualityCriteria())
         looks = multilook or self.config.multilook
         stores = self._pair_artifact_stores(looks=looks, ifg_root=ifg_root)
         existing = [(store.root / "unwrap_manifest.json").exists() for store in stores]
@@ -891,6 +903,41 @@ class Stack:
                 [artifact.unwrapped_phase for artifact in unwrapped], axis=0
             )
             persisted_parameters = unwrapped[0].method_parameters
+            if persisted_parameters["quality_criteria"] != requested_quality_criteria:
+                reject_invalid_state(
+                    "persisted unwrap quality criteria do not match the requested "
+                    "quality policy"
+                )
+            persisted_quality = persisted_parameters["quality_report"]
+            quality_report = StackQualityReport(
+                passed=bool(persisted_quality["passed"]),
+                failures=tuple(str(value) for value in persisted_quality["failures"]),
+                observed_pixels=int(persisted_quality["observed_pixels"]),
+                full_rank_pixels=int(persisted_quality["full_rank_pixels"]),
+                rank_coverage_fraction=float(
+                    persisted_quality["rank_coverage_fraction"]
+                ),
+                published_pixels=int(persisted_quality["published_pixels"]),
+                published_full_rank_fraction=float(
+                    persisted_quality["published_full_rank_fraction"]
+                ),
+                converged_fraction=float(persisted_quality["converged_fraction"]),
+                cycle_count=int(persisted_quality["cycle_count"]),
+                modulo_closure_abs_rad=MetricDistribution(
+                    **persisted_quality["modulo_closure_abs_rad"]
+                ),
+                sbas_residual_abs_rad=MetricDistribution(
+                    **persisted_quality["sbas_residual_abs_rad"]
+                ),
+                integer_correction_max_error=persisted_quality[
+                    "integer_correction_max_error"
+                ],
+                phase_reconstruction_max_error_rad=persisted_quality[
+                    "phase_reconstruction_max_error_rad"
+                ],
+            )
+            if not quality_report.passed:
+                reject_invalid_state("persisted unwrap quality report did not pass")
             persisted_mask = np.all(np.isfinite(phase), axis=0)
             base_result = unwrap_stack(
                 phase,
@@ -917,6 +964,7 @@ class Stack:
                 temporal_converged_fraction=float(
                     persisted_parameters["temporal_converged_fraction"]
                 ),
+                quality_report=quality_report,
             )
             return self
 
@@ -935,6 +983,7 @@ class Stack:
             temporal_device=temporal_device or self.config.invert_device,
             spatial_kwargs=spatial_kwargs,
             temporal_kwargs=temporal_kwargs,
+            quality_criteria=quality_criteria,
         )
         if result.phase_1d_unw is None:
             reject_invalid_state("temporal Stack reconciliation produced no phase")
@@ -945,6 +994,8 @@ class Stack:
             )
         if result.connected_components is None:
             reject_invalid_state("spatial Stack unwrap produced no component labels")
+        if result.quality_report is None or not result.quality_report.passed:
+            reject_invalid_state("temporal Stack produced no passing quality report")
         method_parameters: dict[str, Any] = {
             "pair_ids": list(result.pair_ids),
             "spatial_method": result.spatial_method,
@@ -956,6 +1007,8 @@ class Stack:
             "temporal_unconverged_pixels": result.temporal_unconverged_pixels,
             "temporal_converged_fraction": result.temporal_converged_fraction,
             "temporal_unconverged_masked": True,
+            "quality_criteria": requested_quality_criteria,
+            "quality_report": asdict(result.quality_report),
         }
         for index, store in enumerate(stores):
             phase = np.asarray(result.phase_1d_unw[index], dtype=np.float32)
@@ -1061,6 +1114,8 @@ class Stack:
         )
         for artifact in artifacts:
             parameters = artifact.method_parameters
+            quality_report = parameters.get("quality_report")
+            quality_criteria = parameters.get("quality_criteria")
             if (
                 artifact.method != "stack_irls"
                 or parameters != expected_parameters
@@ -1072,6 +1127,9 @@ class Stack:
                     for name in required_numeric
                 )
                 or int(parameters["temporal_converged_pixels"]) < 1
+                or not isinstance(quality_report, dict)
+                or quality_report.get("passed") is not True
+                or not isinstance(quality_criteria, dict)
             ):
                 reject_invalid_state(
                     "persisted unwrap artifact is not a qualified temporal network"

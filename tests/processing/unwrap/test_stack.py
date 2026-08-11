@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.unwrap.irls import wrap_phase
+from faninsar.processing.unwrap.quality import StackQualityCriteria
 from faninsar.processing.unwrap.stack import unwrap_stack
 
 
@@ -125,6 +128,8 @@ def test_unwrap_stack_full_chain() -> None:
     assert result.timeseries.shape == (3, *shape)
     assert result.temporal_applied is True
     assert result.inverted is True
+    assert result.quality_report is not None
+    assert result.quality_report.passed
     assert len(result.pair_ids) == 3
     # Temporal stage should remove the planted 2π jump
     np.testing.assert_allclose(
@@ -132,3 +137,24 @@ def test_unwrap_stack_full_chain() -> None:
         true_inc01,
         atol=0.05,
     )
+
+
+def test_unwrap_stack_fails_closed_on_configured_quality_limit() -> None:
+    """A configured physical closure limit blocks downstream inversion."""
+    phase_stack = np.broadcast_to(
+        np.array([1.0, 2.0, 3.3])[:, None, None],
+        (3, 2, 2),
+    ).copy()
+
+    with pytest.raises(InvalidProcessingStateError, match="quality gate failed"):
+        unwrap_stack(
+            phase_stack,
+            _pair_dates(),
+            do_spatial=False,
+            do_temporal=True,
+            do_invert=True,
+            temporal_kwargs={"max_iter": 10},
+            quality_criteria=StackQualityCriteria(
+                max_modulo_closure_p95_rad=0.2,
+            ),
+        )
