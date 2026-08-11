@@ -236,14 +236,14 @@ def _validate_directory_descriptor(
     descriptor: int,
     *,
     label: str,
-    require_owner: bool = True,
+    require_private: bool = True,
 ) -> os.stat_result:
     """Validate one already-open directory descriptor."""
     metadata = os.fstat(descriptor)
-    allowed_owners = {os.getuid()} if require_owner else {0, os.getuid()}
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid not in allowed_owners
+    if not stat.S_ISDIR(metadata.st_mode):
+        reject_invalid_state(f"artifact directory is unsafe: {label}")
+    if require_private and (
+        metadata.st_uid != os.getuid()
         or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
     ):
         reject_invalid_state(f"artifact directory is unsafe: {label}")
@@ -287,7 +287,7 @@ def _open_root_descriptor(root: Path, *, create: bool) -> int:
         _validate_directory_descriptor(
             descriptor,
             label=absolute.anchor,
-            require_owner=False,
+            require_private=False,
         )
         for index, component in enumerate(absolute.parts[1:], start=1):
             is_root = index == len(absolute.parts) - 1
@@ -301,7 +301,7 @@ def _open_root_descriptor(root: Path, *, create: bool) -> int:
             _validate_directory_descriptor(
                 child,
                 label=str(Path(*absolute.parts[: index + 1])),
-                require_owner=is_root,
+                require_private=is_root,
             )
             os.close(descriptor)
             descriptor = child

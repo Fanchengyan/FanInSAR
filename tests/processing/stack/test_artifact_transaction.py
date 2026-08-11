@@ -41,6 +41,25 @@ def test_staging_rejects_symlinked_namespace_directory(tmp_path: Path) -> None:
     assert list(outside.iterdir()) == []
 
 
+def test_staging_accepts_group_writable_mount_ancestor(tmp_path: Path) -> None:
+    """Only the managed root, not an ordinary mount ancestor, must be private."""
+    ancestor = tmp_path / "mount"
+    ancestor.mkdir(mode=0o770)
+    ancestor.chmod(0o770)
+    root = ancestor / "artifacts"
+
+    with stage_generation(
+        root,
+        "ifg",
+        final_bytes=0,
+        temporary_bytes=0,
+        file_count=0,
+    ):
+        pass
+
+    assert root.stat().st_mode & 0o777 == 0o700
+
+
 def test_commit_rejects_hardlinked_payload(tmp_path: Path) -> None:
     """A staged payload with another name cannot enter a generation."""
     root = tmp_path / "artifacts"
