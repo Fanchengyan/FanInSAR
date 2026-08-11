@@ -22,7 +22,7 @@ from faninsar.processing.interferometry.pair import (
 SCENE_SCHEMA = "scene_artifact_v1"
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 
 def scene_grid_identity(
@@ -164,6 +164,8 @@ class SceneUnit:
     row_origin: int
     col_origin: int
     payload_digest: str
+    scientific_lineage: tuple[dict[str, str], ...] = ()
+    phase_state: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         """Validate the unit's bounded shape and digest."""
@@ -242,6 +244,16 @@ class CoregisteredSceneStore:
                     row_origin=int(raw["row_origin"]),
                     col_origin=int(raw["col_origin"]),
                     payload_digest=str(raw["payload_digest"]),
+                    scientific_lineage=tuple(
+                        item
+                        for item in raw.get("scientific_lineage", [])
+                        if isinstance(item, dict)
+                    ),
+                    phase_state=(
+                        dict(raw["phase_state"])
+                        if isinstance(raw.get("phase_state"), dict)
+                        else None
+                    ),
                 )
             )
         if not units:
@@ -350,6 +362,8 @@ def write_scene_unit(
     grid_shape: tuple[int, int] | None = None,
     wavelength_m: float | None = None,
     grid_identity: str | None = None,
+    scientific_lineage: Sequence[Mapping[str, str]] | None = None,
+    phase_state: Mapping[str, object] | None = None,
 ) -> None:
     """Atomically add one aligned unit and publish a complete manifest."""
     path = _validated_store_root(root, create=True)
@@ -437,6 +451,8 @@ def write_scene_unit(
             "payload_digest": hashlib.sha256(
                 (_sha256(ref_path) + _sha256(sec_path)).encode()
             ).hexdigest(),
+            "scientific_lineage": [dict(item) for item in (scientific_lineage or ())],
+            "phase_state": dict(phase_state) if phase_state is not None else None,
         }
     )
     unsigned = {
@@ -482,6 +498,7 @@ def copy_reference_units(source: str | Path, target: str | Path) -> None:
             grid_shape=source_store.grid_shape,
             wavelength_m=source_store.wavelength_m,
             grid_identity=source_store.grid_identity,
+            scientific_lineage=unit.scientific_lineage,
         )
 
 

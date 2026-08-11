@@ -43,12 +43,26 @@ The corrected run completed without a crash.
 Focused local regression after the fix:
 
 ```text
-105 passed, 1 skipped, 6 warnings
+107 passed, 1 skipped, 6 warnings
 ```
 
 `git diff --check` is clean. The repository's existing Ruff invocation is not
 available in `.venv`; `uvx ruff` reports two pre-existing PLW0108 findings in
 the ROI transformer lambdas at `production.py:3272` and `production.py:3277`.
+
+After the review hardening, a fresh local Radar IW1 burst-0 Pair run completed
+at `.qualification-runs/p18-p19-phase-radar-b0-r5-20260812/` with
+`record_scientific_lineage=True`, CPU Torch, and no unwrap. It produced four
+ordered transitions (`deramp`, carrier/residual application, IFG formation,
+range-screen flattening), a non-null typed `PhaseState`, and a persisted
+operation/state/payload digest chain. The run exited 0 in 22.30 seconds with
+maximum RSS `6,295,633,920` bytes. A direct runtime regression also confirmed
+that repeating the residual application is rejected by the typed state machine.
+
+The lineage payload has since been changed to bounded 4 MiB C-order chunks;
+this keeps the digest stable for contiguous arrays while avoiding one full
+temporary copy for strided or memory-mapped inputs. The CUDA Goldstein path
+now supplies the required `window=32` argument.
 
 ## Remaining qualification boundary
 
