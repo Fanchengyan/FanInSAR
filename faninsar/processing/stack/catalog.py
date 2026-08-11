@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
@@ -29,7 +32,10 @@ class SceneCatalog:
     """Keys are ``YYYYMMDD`` scene ids."""
 
     @classmethod
-    def from_paths(cls, paths: list[str | Path] | tuple[str | Path, ...]) -> SceneCatalog:
+    def from_paths(
+        cls,
+        paths: list[str | Path] | tuple[str | Path, ...],
+    ) -> SceneCatalog:
         """Build a catalog from SAFE paths; reject duplicate date ids."""
         mapping: dict[str, Path] = {}
         for raw in paths:
@@ -55,5 +61,5 @@ class SceneCatalog:
         return self.paths[date_id]
 
     def __len__(self) -> int:
-        """Number of scenes."""
+        """Return the number of scenes."""
         return len(self.paths)

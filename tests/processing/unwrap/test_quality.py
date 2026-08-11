@@ -9,7 +9,6 @@ from faninsar.processing.unwrap.quality import (
     evaluate_stack_quality,
 )
 
-
 PAIRS = [
     ("20160101", "20160113"),
     ("20160113", "20160125"),

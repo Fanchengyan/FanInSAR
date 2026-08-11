@@ -202,7 +202,8 @@ def combine_offset_fields(
         )
     )
     logger.info(
-        "Combined offsets ESD_az=%.4f amp_rg=%.4f amp_az=%.4f misreg_az=%.4f misreg_rg=%.4f",
+        "Combined offsets ESD_az=%.4f amp_rg=%.4f amp_az=%.4f "
+        "misreg_az=%.4f misreg_rg=%.4f",
         esd_azimuth_shift_px,
         amplitude_residual_rg,
         amplitude_residual_az,

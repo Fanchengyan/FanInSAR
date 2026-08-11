@@ -264,7 +264,9 @@ def _patch_ncc_shift(
     f_ref = np.fft.rfft2(ref[::-1, ::-1], s=fft_shape)
     corr_full = np.fft.irfft2(f_sec * f_ref, s=fft_shape).real
     # Valid lags where template fully inside search chip: (2*search+1)^2
-    corr = corr_full[waz - 1 : waz - 1 + 2 * search_az + 1, wrg - 1 : wrg - 1 + 2 * search_rg + 1]
+    lag_rows = slice(waz - 1, waz - 1 + 2 * search_az + 1)
+    lag_columns = slice(wrg - 1, wrg - 1 + 2 * search_rg + 1)
+    corr = corr_full[lag_rows, lag_columns]
     if corr.shape != (2 * search_az + 1, 2 * search_rg + 1):
         return None
     # Local energy of secondary under each lag for true NCC
@@ -273,15 +275,15 @@ def _patch_ncc_shift(
     f_ones = np.fft.rfft2(ones[::-1, ::-1], s=fft_shape)
     f_sec_sq = np.fft.rfft2(sec_sq, s=fft_shape)
     energy = np.fft.irfft2(f_sec_sq * f_ones, s=fft_shape).real
-    energy = energy[waz - 1 : waz - 1 + 2 * search_az + 1, wrg - 1 : wrg - 1 + 2 * search_rg + 1]
+    energy = energy[lag_rows, lag_columns]
     energy = np.maximum(energy, 1e-12)
     ncc = corr / np.sqrt(energy)
     peak_flat = int(np.argmax(ncc))
     peak_az, peak_rg = np.unravel_index(peak_flat, ncc.shape)
     peak_val = float(ncc[peak_az, peak_rg])
-    # Peak-to-sidelobe SNR: zero a 3×3 neighbourhood around the peak and take
+    # Peak-to-sidelobe SNR: zero a 3x3 neighbourhood around the peak and take
     # peak / mean(|sidelobe|). Matches the practical cull used with ISCE Ampcor
-    # better than (peak−mean)/std, which collapses for band-limited texture.
+    # better than (peak-mean)/std, which collapses for band-limited texture.
     sidelobe = ncc.copy()
     a0 = max(int(peak_az) - 1, 0)
     a1 = min(int(peak_az) + 2, ncc.shape[0])
@@ -299,8 +301,8 @@ def _patch_ncc_shift(
         az_shift += az_sub
         rg_shift += rg_sub
     # Peak lag: secondary feature is at ref + lag inside search chip that is
-    # already centred on the reference window → lag is secondary−reference.
-    # Resample convention source = out − offset needs offset = that lag.
+    # already centred on the reference window, so lag is secondary-reference.
+    # Resample convention source = out - offset needs offset = that lag.
     return rg_shift, az_shift, snr
 
 
@@ -323,7 +325,7 @@ def estimate_patch_amplitude_shift(
     """Estimate residual shift with multi-window magnitude Ampcor (ISCE2-style).
 
     Mirrors topsApp ``runRangeCoreg`` / ``runAmpcor`` defaults: magnitude-only
-    patches (``window_rg×window_az = 64×32``), search half-width 16, ~40×20
+    patches (``window_rg x window_az = 64 x 32``), search half-width 16, ~40 x 20
     locations, SNR cull, and ``|residual| < 1.2`` px. Returns the **median**
     residual over surviving patches.
 
