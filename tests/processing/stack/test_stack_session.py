@@ -447,7 +447,10 @@ def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
     assert stack.unwrap_result.temporal_converged_fraction == 1.0
 
 
-def test_scene_artifacts_flow_through_merge_unwrap_and_sbas(tmp_path: Path) -> None:
+def test_scene_artifacts_flow_through_merge_unwrap_and_sbas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Three dates and overlapping bursts complete the persisted Stack chain."""
     stack = _stack_with_three_date_network(tmp_path)
     scene_phase = {
@@ -481,6 +484,23 @@ def test_scene_artifacts_flow_through_merge_unwrap_and_sbas(tmp_path: Path) -> N
 
     stack.form_interferograms(multilook=(1, 1))
     stack.unwrap(do_spatial=False)
+    from faninsar.processing.timeseries import inversion as inversion_module
+
+    original_invert = inversion_module.invert_unwrapped_pairs
+
+    def assert_released_before_sbas(*args: object, **kwargs: object) -> object:
+        assert stack.unwrap_result is not None
+        assert stack.unwrap_result.phase_2d_unw is None
+        assert stack.unwrap_result.phase_1d_unw is None
+        assert stack.unwrap_result.corrections_k is None
+        assert stack.unwrap_result.temporal_converged_mask is None
+        return original_invert(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        inversion_module,
+        "invert_unwrapped_pairs",
+        assert_released_before_sbas,
+    )
     result = stack.invert_timeseries()
 
     np.testing.assert_allclose(result.phase_cumulative_rad[1], 0.2, atol=1e-6)
@@ -713,3 +733,52 @@ def test_coregister_resume_rejects_changed_burst_request(tmp_path: Path) -> None
 
     with pytest.raises(InvalidProcessingStateError, match="coregistration scene"):
         stack.coregister_scenes(dates=[date_id])
+
+
+def test_coreg_resume_identity_captures_nested_dem_sampling_semantics(
+    tmp_path: Path,
+) -> None:
+    """Interpolation and nested geoid samplers must invalidate scene reuse."""
+    from faninsar.processing.geometry.dem import (
+        ConstantHeightDEM,
+        GeoidAdjustedDEM,
+        RasterDEM,
+    )
+
+    stack = _stack_with_three_date_network(tmp_path)
+    date_id = "20240113"
+    raster_path = tmp_path / "dem.tif"
+    raster_path.write_bytes(b"identity-only-fixture")
+    stack.config.dem = RasterDEM(raster_path, interpolation="bilinear", nodata=-9999)
+    bilinear_identity = stack._coreg_resume_identity(
+        date_id,
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    stack.config.dem = RasterDEM(raster_path, interpolation="bicubic", nodata=-9999)
+    bicubic_identity = stack._coreg_resume_identity(
+        date_id,
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    stack.config.dem = GeoidAdjustedDEM(
+        ConstantHeightDEM(10.0),
+        ConstantHeightDEM(2.0),
+    )
+    first_nested_identity = stack._coreg_resume_identity(
+        date_id,
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    stack.config.dem = GeoidAdjustedDEM(
+        ConstantHeightDEM(10.0),
+        ConstantHeightDEM(3.0),
+    )
+    second_nested_identity = stack._coreg_resume_identity(
+        date_id,
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+
+    assert bilinear_identity != bicubic_identity
+    assert first_nested_identity != second_nested_identity

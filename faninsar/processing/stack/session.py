@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 import shutil
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -376,17 +376,45 @@ class Stack:
                 "mtime_ns": int(stat.st_mtime_ns),
             }
 
-        def dem_identity(dem: object | None) -> dict[str, object] | None:
-            if dem is None:
-                return None
-            value: dict[str, object] = {"type": type(dem).__qualname__}
-            path = getattr(dem, "path", None)
-            if path is not None:
-                value["source"] = source_identity(Path(path))
-            height = getattr(dem, "height_m", None)
-            if height is not None:
-                value["height_m"] = float(height)
-            return value
+        def semantic_value(value: object) -> object:
+            if value is None or isinstance(value, (str, int, float, bool)):
+                result = value
+            elif isinstance(value, Path):
+                result = source_identity(value)
+            elif isinstance(value, np.generic):
+                result = value.item()
+            elif isinstance(value, dict):
+                result = {
+                    str(key): semantic_value(item)
+                    for key, item in sorted(
+                        value.items(), key=lambda item: str(item[0])
+                    )
+                }
+            elif isinstance(value, (tuple, list)):
+                result = [semantic_value(item) for item in value]
+            elif is_dataclass(value) and not isinstance(value, type):
+                result = {
+                    "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                    "fields": {
+                        item.name: semantic_value(getattr(value, item.name))
+                        for item in fields(value)
+                        if not item.name.startswith("_")
+                    },
+                }
+            else:
+                public_state = {
+                    name: semantic_value(item)
+                    for name, item in getattr(value, "__dict__", {}).items()
+                    if not name.startswith("_") and not callable(item)
+                }
+                result = {
+                    "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                    "state": public_state,
+                }
+            return result
+
+        def dem_identity(dem: object | None) -> object:
+            return None if dem is None else semantic_value(dem)
 
         def roi_identity(roi: object | None) -> object:
             if roi is None:
@@ -873,6 +901,9 @@ class Stack:
             )
             self.unwrap_result = replace(
                 base_result,
+                phase_2d_unw=None,
+                connected_components=None,
+                phase_1d_unw=phase,
                 temporal_applied=True,
                 temporal_iterations=int(persisted_parameters["temporal_iterations"]),
                 temporal_converged=bool(persisted_parameters["temporal_converged"]),
@@ -974,8 +1005,9 @@ class Stack:
                     reject_invalid_state(
                         "in-memory temporal result does not match IFG pair order"
                     )
+                qualified_phase_stack = active_unwrap.phase_1d_unw
                 pair_phases = {
-                    pair_id: np.asarray(active_unwrap.phase_1d_unw[index])
+                    pair_id: np.asarray(qualified_phase_stack[index])
                     for index, pair_id in enumerate(expected_pair_ids)
                 }
             else:
@@ -990,11 +1022,6 @@ class Stack:
             wavelength_m = next(iter(wavelengths))
         else:
             wavelength_m = None
-        self.timeseries = invert_unwrapped_pairs(
-            pair_phases,
-            device=device or self.config.invert_device,
-            wavelength_m=wavelength_m,
-        )
         if self.unwrap_result is not None:
             self.unwrap_result = replace(
                 self.unwrap_result,
@@ -1005,6 +1032,12 @@ class Stack:
                 temporal_converged_mask=None,
                 timeseries=None,
             )
+        active_unwrap = None
+        self.timeseries = invert_unwrapped_pairs(
+            pair_phases,
+            device=device or self.config.invert_device,
+            wavelength_m=wavelength_m,
+        )
         return self.timeseries
 
     def _qualified_unwrapped_artifacts(

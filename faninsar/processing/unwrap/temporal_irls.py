@@ -112,7 +112,7 @@ def _solve_weighted_batch(
 
     n_valid = int(valid.sum().item())
     if n_valid == 0:
-        logger.warning(
+        logger.debug(
             "temporal IRLS: all %s pixels in batch are singular / zero-weight",
             batch,
         )
@@ -135,7 +135,7 @@ def _solve_weighted_batch(
     x_out[:, valid] = x_v.T
     n_singular = batch - n_valid
     if n_singular > 0:
-        logger.warning(
+        logger.debug(
             "temporal IRLS: %s / %s pixels singular -> NaN",
             n_singular,
             batch,
