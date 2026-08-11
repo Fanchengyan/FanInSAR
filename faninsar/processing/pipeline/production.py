@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -100,6 +102,62 @@ _WINDOW_HALO_MARGIN_PX = 16
 _WINDOW_HALO_FLOOR_PX = 64
 #: Window-growth attempts before falling back to full-burst coregistration.
 _MAX_WINDOW_HALO_GROWTH = 3
+
+
+def _lineage_payload_digest(*arrays: np.ndarray | None) -> str:
+    """Hash array payloads with shape and dtype for scientific lineage."""
+    digest = hashlib.sha256()
+    for array in arrays:
+        if array is None:
+            digest.update(b"<none>")
+            continue
+        value = np.ascontiguousarray(array)
+        digest.update(value.dtype.str.encode("ascii"))
+        digest.update(json.dumps(list(value.shape), separators=(",", ":")).encode())
+        digest.update(value.view(np.uint8).tobytes())
+    return digest.hexdigest()
+
+
+def _record_scientific_transition(
+    state: ProductionPairState,
+    operation: str,
+    input_arrays: tuple[np.ndarray | None, ...],
+    output_arrays: tuple[np.ndarray | None, ...],
+    **metadata: object,
+) -> None:
+    """Append one ordered, hash-bound scientific operation when enabled."""
+    if not state.record_scientific_lineage:
+        return
+    input_payload_digest = _lineage_payload_digest(*input_arrays)
+    output_payload_digest = _lineage_payload_digest(*output_arrays)
+    previous_state_digest = (
+        state.scientific_lineage[-1]["output_state_digest"]
+        if state.scientific_lineage
+        else hashlib.sha256(state.pair_id.encode()).hexdigest()
+    )
+    operation_id = hashlib.sha256(
+        json.dumps(
+            [state.pair_id, operation, previous_state_digest, input_payload_digest],
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    output_state_digest = hashlib.sha256(
+        json.dumps(
+            [previous_state_digest, operation_id, output_payload_digest],
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    state.scientific_lineage.append(
+        {
+            "operation": operation,
+            "operation_id": operation_id,
+            "input_state_digest": previous_state_digest,
+            "output_state_digest": output_state_digest,
+            "input_payload_digest": input_payload_digest,
+            "output_payload_digest": output_payload_digest,
+            "metadata": json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+        }
+    )
 
 
 def looks_dir(azimuth_looks: int, range_looks: int) -> str:
@@ -389,6 +447,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     geo_height_m = float(task["geo_height_m"])
     geo_chunk_size = int(task["geo_chunk_size"])
     roi_buffer_m = float(task.get("roi_buffer_m", 320.0))
+    record_scientific_lineage = bool(task.get("record_scientific_lineage", False))
     ifg_dir = Path(task["ifg_dir"])
     dem = task["dem"]
     geo_work_dir = task["geo_work_dir"]
@@ -474,10 +533,11 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         multilook=(1, 1),
         goldstein_alpha=0.0,
         unwrap_method="snaphu",
+        record_scientific_lineage=record_scientific_lineage,
     )
     stage_times: dict[str, float] = {}
     t0 = time.perf_counter()
-    state = stage_deramp(state)
+    state = stage_deramp(state, device=device)
     stage_times["deramp"] = time.perf_counter() - t0
     t0 = time.perf_counter()
     burst_work_dir: Path | None = None
@@ -569,6 +629,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
             grid_shape=resolved_scene_grid_shape,
             wavelength_m=float(state.reference.geometry.wavelength_m),
             grid_identity=grid_identity,
+            scientific_lineage=state.scientific_lineage,
         )
     pri_power = state.reference_deramped.real**2 + state.reference_deramped.imag**2
     sec_power = state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
@@ -578,6 +639,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         multilook=(1, 1),
         goldstein_alpha=0.0,
         dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+        device=device,
     )
     stage_times["interferogram"] = time.perf_counter() - t0
     t0 = time.perf_counter()
@@ -586,7 +648,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         state.note("FLATTEN applied to secondary geocoded SLC before IFG formation")
         stage_times["flatten"] = 0.0
     else:
-        state = stage_flatten(state)
+        state = stage_flatten(state, device=device)
         stage_times["flatten"] = time.perf_counter() - t0
     ifg_full = (
         state.complex_ifg_flat
@@ -1063,6 +1125,8 @@ class ProductionPairState:
     unwrap_method: str = "snaphu"
     geo_grid_meta: dict[str, Any] | None = None
     geo_work_dir: Path | None = None
+    record_scientific_lineage: bool = False
+    scientific_lineage: list[dict[str, str]] = field(default_factory=list)
     memory_watchdog: MemoryWatchdog | None = None
     geo_bbox: tuple[int, int, int, int] | None = None
     radar_roi_origin: tuple[int, int] | None = None
@@ -1163,14 +1227,55 @@ def load_production_scene(
     )
 
 
-def stage_deramp(state: ProductionPairState) -> ProductionPairState:
-    """Deramp both full scenes with annotation carriers."""
-    state.reference_deramped = deramp(
-        state.reference.array.samples, state.reference.carrier
-    )
-    state.secondary_deramped = deramp(
-        state.secondary.array.samples, state.secondary.carrier
-    )
+def stage_deramp(
+    state: ProductionPairState,
+    *,
+    device: str = "auto",
+) -> ProductionPairState:
+    """Deramp both full scenes with annotation carriers.
+
+    Parameters
+    ----------
+    state : ProductionPairState
+        Pair state with loaded reference and secondary scenes.
+    device : {"auto", "cpu", "cuda", "mps"}, optional
+        Numerical device.  When resolved to an accelerator the TOPS carrier
+        multiply runs through the Torch kernels (Dask-scheduled when a GPU
+        cluster client is active); CPU keeps the reference NumPy path.
+
+    Returns
+    -------
+    ProductionPairState
+        Updated state with deramped scenes.
+
+    """
+    from faninsar.processing.torch_kernels import resolve_torch_device
+
+    reference_input = state.reference.array.samples
+    secondary_input = state.secondary.array.samples
+    resolved_device = resolve_torch_device(device)
+    if resolved_device.type == "cpu":
+        state.reference_deramped = deramp(
+            state.reference.array.samples, state.reference.carrier
+        )
+        state.secondary_deramped = deramp(
+            state.secondary.array.samples, state.secondary.carrier
+        )
+    else:
+        from faninsar.backends.dask_gpu import run_carrier_multiply
+
+        state.reference_deramped = run_carrier_multiply(
+            state.reference.array.samples,
+            state.reference.carrier,
+            sign=-1.0,
+            device=device,
+        )
+        state.secondary_deramped = run_carrier_multiply(
+            state.secondary.array.samples,
+            state.secondary.carrier,
+            sign=-1.0,
+            device=device,
+        )
     # mask invalid
     state.reference_deramped = np.where(
         state.reference.array.valid_mask,
@@ -1185,6 +1290,13 @@ def stage_deramp(state: ProductionPairState) -> ProductionPairState:
     state.note(
         f"DERAMP shape={state.reference_deramped.shape} "
         f"mean|z|={float(np.mean(np.abs(state.reference_deramped))):.3f}"
+    )
+    _record_scientific_transition(
+        state,
+        "deramp",
+        (reference_input, secondary_input),
+        (state.reference_deramped, state.secondary_deramped),
+        carrier="tops",
     )
     return state
 
@@ -1618,7 +1730,14 @@ def stage_coregister(
                 azimuth_offset_px=geometry_field.azimuth_offset_px + amp_res_az,
                 order=1,
             )
-            esd = estimate_azimuth_shift_esd(ref, pre)
+            from faninsar.processing.torch_kernels import resolve_torch_device
+
+            if resolve_torch_device(device).type == "cuda":
+                from faninsar.backends.dask_gpu import run_esd_azimuth_shift
+
+                esd = run_esd_azimuth_shift(ref, pre, device=device)
+            else:
+                esd = estimate_azimuth_shift_esd(ref, pre)
             esd_az = float(esd.azimuth_shift_px)
             state.esd_azimuth_shift_px = esd_az
             state.note(f"ESD az={esd_az:.4f} px coherence={esd.coherence:.3f}")
@@ -1839,6 +1958,8 @@ def stage_coregister(
         state.reference_geocoded_slc = reference_geo
         state.secondary_geocoded_slc = secondary_geo
         state.geocoded_slc_valid = valid
+        geo_input_reference = ref
+        geo_input_secondary = sec
         state.reference_deramped = reference_geo
         state.secondary_deramped = None
         state.secondary_aligned = secondary_geo
@@ -1857,9 +1978,19 @@ def stage_coregister(
             "(two deramped single-remaps + fractional reramp + SLC flatten)"
         )
         state.note(f"COREG timings={state.coregistration_timings_s}")
+        _record_scientific_transition(
+            state,
+            "apply_geo_carrier_residual_geometric_phase",
+            (geo_input_reference, geo_input_secondary),
+            (state.reference_geocoded_slc, state.secondary_aligned),
+            amplitude_residual_rg_px=state.amplitude_residual_rg_px,
+            esd_azimuth_shift_px=state.esd_azimuth_shift_px,
+            geometric_phase="topographic",
+        )
         return state
 
     substage_started = time.perf_counter()
+    secondary_input = state.secondary_deramped
     sec_resamp = resample_complex_deramped_reramp(
         sec,
         secondary_carrier=state.secondary.carrier,
@@ -1912,6 +2043,15 @@ def stage_coregister(
         "(deramped single-remap + fractional reramp + range-offset flatten)"
     )
     state.note(f"COREG timings={state.coregistration_timings_s}")
+    _record_scientific_transition(
+        state,
+        "apply_carrier_residual_range_phase",
+        (secondary_input,),
+        (state.secondary_aligned,),
+        amplitude_residual_rg_px=state.amplitude_residual_rg_px,
+        esd_azimuth_shift_px=state.esd_azimuth_shift_px,
+        geometric_phase="range_offset_screen",
+    )
     return state
 
 
@@ -1921,6 +2061,7 @@ def stage_interferogram(
     multilook: tuple[int, int] = (4, 20),
     goldstein_alpha: float = 0.5,
     dead_pixel_amp_threshold: float = 0.0,
+    device: str = "auto",
 ) -> ProductionPairState:
     """Form multilooked interferogram and apply Goldstein filter.
 
@@ -1937,17 +2078,48 @@ def stage_interferogram(
         average (dead-pixel masking). Set to 0 to disable. The production
         entry point :func:`run_pair` passes 3.0 for real S1
         data; synthetic tests use the default 0.
+    device : {"auto", "cpu", "cuda", "mps"}, optional
+        Numerical device.  Accelerator devices use the Torch multilook
+        interferogram kernel (and Torch Goldstein on CUDA); CPU keeps the
+        reference NumPy path.
 
     """
     if state.reference_deramped is None or state.secondary_aligned is None:
         reject_invalid_state("interferogram requires coregister")
     state.multilook = multilook
-    ifg = form_interferogram(
-        state.reference_deramped,
-        state.secondary_aligned,
-        multilook=multilook,
-        dead_pixel_amp_threshold=dead_pixel_amp_threshold,
-    )
+    reference_input = state.reference_deramped
+    secondary_input = state.secondary_aligned
+    # Geographic coregistration keeps the two aligned SLCs in memmaps that
+    # are released below.  Scientific lineage hashes are computed after the
+    # interferogram is materialized, so retain owning copies only when the
+    # opt-in lineage record is enabled; otherwise preserve the zero-copy
+    # production path.
+    if state.record_scientific_lineage:
+        reference_lineage_input = np.array(reference_input, copy=True)
+        secondary_lineage_input = np.array(secondary_input, copy=True)
+    else:
+        reference_lineage_input = reference_input
+        secondary_lineage_input = secondary_input
+    from faninsar.processing.torch_kernels import resolve_torch_device
+
+    resolved_device = resolve_torch_device(device)
+    if resolved_device.type == "cpu":
+        ifg = form_interferogram(
+            state.reference_deramped,
+            state.secondary_aligned,
+            multilook=multilook,
+            dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+        )
+    else:
+        from faninsar.backends.dask_gpu import run_multilook_interferogram
+
+        ifg = run_multilook_interferogram(
+            state.reference_deramped,
+            state.secondary_aligned,
+            multilook=multilook,
+            dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            device=device,
+        )
     state.reference_deramped = None
     state.secondary_aligned = None
     if state.coregistration_grid == "geo" and state.geo_work_dir is not None:
@@ -1978,7 +2150,16 @@ def stage_interferogram(
     # taper still smooths). Skip the filter entirely so high-rate geometric
     # fringes stay intact for flattening.
     if goldstein_alpha > 0.0:
-        complex_ifg = goldstein_filter(ifg.complex_ifg, alpha=goldstein_alpha)
+        if resolved_device.type == "cuda":
+            from faninsar.backends.dask_gpu import run_goldstein_filter
+
+            complex_ifg = run_goldstein_filter(
+                ifg.complex_ifg,
+                alpha=goldstein_alpha,
+                device=device,
+            )
+        else:
+            complex_ifg = goldstein_filter(ifg.complex_ifg, alpha=goldstein_alpha)
     else:
         complex_ifg = ifg.complex_ifg
     complex_ifg, coherence, wrapped = mask_invalid_looks(complex_ifg, ifg.coherence)
@@ -1991,11 +2172,51 @@ def stage_interferogram(
         f"mean_coh={float(np.nanmean(state.coherence)):.3f} "
         f"invalid_looks={n_invalid}"
     )
+    _record_scientific_transition(
+        state,
+        "form_interferogram",
+        (reference_lineage_input, secondary_lineage_input),
+        (state.complex_ifg, state.coherence, state.wrapped_phase),
+        multilook=multilook,
+        goldstein_alpha=goldstein_alpha,
+    )
     return state
 
 
-def stage_flatten(state: ProductionPairState) -> ProductionPairState:
+def _flatten_complex_ifg(
+    complex_ifg: np.ndarray,
+    topo_phase: np.ndarray,
+    device: str,
+) -> np.ndarray:
+    """Remove a phase screen with Torch on accelerators, NumPy on CPU."""
+    from faninsar.processing.torch_kernels import resolve_torch_device
+
+    if resolve_torch_device(device).type == "cpu":
+        return remove_topographic_phase(complex_ifg, topo_phase)
+    from faninsar.backends.dask_gpu import run_remove_topographic_phase
+
+    return run_remove_topographic_phase(complex_ifg, topo_phase, device=device)
+
+
+def stage_flatten(
+    state: ProductionPairState,
+    *,
+    device: str = "auto",
+) -> ProductionPairState:
     """Remove topographic phase using DEM + dual-orbit geometry.
+
+    Parameters
+    ----------
+    state : ProductionPairState
+        Pair state after interferogram formation.
+    device : {"auto", "cpu", "cuda", "mps"}, optional
+        Numerical device.  Accelerator devices remove the topographic phase
+        screen with the Torch complex multiply; CPU keeps the NumPy path.
+
+    Returns
+    -------
+    ProductionPairState
+        Updated state with flattened products.
 
     When radar coreg already applied a *range-offset* phase screen on the
     secondary SLC (``secondary_aligned_is_flattened=True``), that screen is only
@@ -2004,9 +2225,11 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
     (DEM edge, outer subswath) — is still removed here with the full dual-orbit
     geometric model.  If the range-offset screen already matched the DEM model,
     the residual is near zero and this step is a no-op in practice.
+
     """
     if state.complex_ifg is None:
         reject_invalid_state("flatten requires interferogram")
+    complex_input = state.complex_ifg
     height, width = state.complex_ifg.shape
     # Multilooked grid → full-res radar indices on the geometry model.
     # Geometry (0,0) is the array origin (already cropped). Use look-window
@@ -2076,7 +2299,7 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
             )
             if abs(scale) > 1e-3 and topo_valid_frac > 0.05:
                 residual_topo = (scale * topo).astype(np.float64)
-                flat = remove_topographic_phase(state.complex_ifg, residual_topo)
+                flat = _flatten_complex_ifg(state.complex_ifg, residual_topo, device)
                 state.note(
                     f"FLATTEN residual DEM topo after range-offset "
                     f"scale={scale:.3f} model_rms={rms:.3f} "
@@ -2111,6 +2334,13 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
         if coh_flat is not None:
             state.coherence = coh_flat
         state.wrapped_phase = wrapped_flat
+        _record_scientific_transition(
+            state,
+            "apply_geometric_phase_flatten",
+            (complex_input,),
+            (state.complex_ifg_flat, state.wrapped_phase),
+            phase_model="range_offset_screen_or_dem_residual",
+        )
         return state
 
     # Residual Doppler / differential TOPS carrier leaves a near-linear
@@ -2126,7 +2356,7 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
         state.complex_ifg = remove_azimuth_phase_ramp(state.complex_ifg, az_ramp)
         state.note(f"FLATTEN residual_az_ramp={az_ramp:.5f} rad/az_sample")
 
-    flat = remove_topographic_phase(state.complex_ifg, topo)
+    flat = _flatten_complex_ifg(state.complex_ifg, topo, device)
     state.topo_phase = topo.astype(np.float32)
     # Keep invalid looks as NaN through ramp/topo multiply (0·e^{iφ}=0 would
     # otherwise repaint a solid phase=0 black edge on the burst margin).
@@ -2146,6 +2376,13 @@ def stage_flatten(state: ProductionPairState) -> ProductionPairState:
     state.note(
         f"FLATTEN geometric_phase rms={rms:.3f} rad span={span:.1f} rad "
         f"topo_valid_frac={topo_valid_frac:.3f}"
+    )
+    _record_scientific_transition(
+        state,
+        "apply_geometric_phase_flatten",
+        (complex_input,),
+        (state.complex_ifg_flat, state.wrapped_phase),
+        phase_model="topographic",
     )
     return state
 
@@ -2183,6 +2420,7 @@ def stage_unwrap(
     )
     if ifg is None or state.coherence is None:
         reject_invalid_state("unwrap requires interferogram")
+    unwrap_input = ifg
     result: CommonUnwrapResult = unwrap_dispatch(
         ifg,
         state.coherence,
@@ -2228,6 +2466,14 @@ def stage_unwrap(
         )
     elif span >= 1.0:
         state.note(f"UNWRAP residual phase screen skipped span={span:.2f} rad")
+    _record_scientific_transition(
+        state,
+        "spatial_unwrap_and_residual_screen",
+        (unwrap_input,),
+        (state.unwrapped_phase, state.complex_ifg_flat),
+        method=result.method,
+        residual_screen_applied=applied,
+    )
     return state
 
 
@@ -2345,6 +2591,7 @@ def stage_write(
         "stages": list(state.log),
         "stage_timings_s": dict(state.stage_timings_s),
         "coregistration_timings_s": dict(state.coregistration_timings_s),
+        "scientific_lineage": list(state.scientific_lineage),
     }
     if state.baseline is not None:
         meta["baseline_parallel_m"] = state.baseline.parallel_m
@@ -3193,6 +3440,7 @@ def run_pair(
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
+    record_scientific_lineage: bool = False,
 ) -> ProductionPairState: ...
 
 
@@ -3235,6 +3483,7 @@ def run_pair(
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
+    record_scientific_lineage: bool = False,
 ) -> ProductionPairSweepResult: ...
 
 
@@ -3278,6 +3527,7 @@ def run_pair(
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
+    record_scientific_lineage: bool = False,
 ) -> ProductionPairState | ProductionPairSweepResult:
     """Process any burst selection across frames and swaths into one product.
 
@@ -3380,6 +3630,10 @@ def run_pair(
     geoid_correction : bool, optional
         Convert orthometric raster DEM heights to ellipsoidal with EGM96.
         Default True.
+    record_scientific_lineage : bool, optional
+        Persist ordered residual/carrier/phase operation records with payload
+        hashes. Disabled by default to keep the ordinary production path
+        free of hashing overhead.
 
     Returns
     -------
@@ -3430,6 +3684,7 @@ def run_pair(
             secondary_orbit_path=secondary_orbit_path,
             unwrap=unwrap,
             geoid_correction=geoid_correction,
+            record_scientific_lineage=record_scientific_lineage,
         )
     from faninsar.missions.sentinel1.safe import open_safe_product
     from faninsar.processing.geometry.egm96 import EGM96Geoid
@@ -3743,8 +3998,9 @@ def run_pair(
                     multilook=multilook,
                     goldstein_alpha=0.0,
                     unwrap_method="snaphu",
+                    record_scientific_lineage=record_scientific_lineage,
                 )
-                measure_state = stage_deramp(measure_state)
+                measure_state = stage_deramp(measure_state, device=device)
                 roi_window_m: tuple[int, int, int, int] | None = None
                 if roi is not None:
                     assert measure_state.reference_deramped is not None
@@ -3817,10 +4073,11 @@ def run_pair(
                 reference=ref,
                 secondary=sec,
                 dem=dem_sampler,
-                coregistration_grid="radar",
+                coregistration_grid=coregistration_grid,
                 multilook=multilook,
                 goldstein_alpha=0.0,
                 unwrap_method="snaphu",
+                record_scientific_lineage=record_scientific_lineage,
             )
             if first_state is None:
                 first_state = state
@@ -3828,7 +4085,7 @@ def run_pair(
                 origin_state = state
             stage_times: dict[str, float] = {}
             t0 = time.perf_counter()
-            state = stage_deramp(state)
+            state = stage_deramp(state, device=device)
             stage_times["deramp"] = time.perf_counter() - t0
             t0 = time.perf_counter()
             roi_window: tuple[int, int, int, int] | None = None
@@ -3877,6 +4134,7 @@ def run_pair(
                     col_origin=range_offsets[swath] + burst_col0,
                     grid_shape=(frame_rows, frame_cols),
                     wavelength_m=float(state.reference.geometry.wavelength_m),
+                    scientific_lineage=state.scientific_lineage,
                 )
             pri_power = (
                 state.reference_deramped.real**2 + state.reference_deramped.imag**2
@@ -3890,10 +4148,11 @@ def run_pair(
                 multilook=(1, 1),
                 goldstein_alpha=0.0,
                 dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+                device=device,
             )
             stage_times["interferogram"] = time.perf_counter() - t0
             t0 = time.perf_counter()
-            state = stage_flatten(state)
+            state = stage_flatten(state, device=device)
             stage_times["flatten"] = time.perf_counter() - t0
             ifg_full = (
                 state.complex_ifg_flat
@@ -3976,13 +4235,17 @@ def run_pair(
             else first_state.secondary
         ),
         dem=dem_sampler,
-        coregistration_grid="radar",
+        coregistration_grid=coregistration_grid,
         dem_id=_dem_id(dem_sampler),
         coreg_executor=str(executor),
         coreg_device=str(device),
         multilook=multilook,
         goldstein_alpha=float(goldstein_alpha),
         unwrap_method="snaphu",
+        record_scientific_lineage=record_scientific_lineage,
+        scientific_lineage=(
+            list(origin_state.scientific_lineage) if origin_state is not None else []
+        ),
         complex_ifg=merged_ifg,
         complex_ifg_flat=filtered,
         coherence=coherence,
@@ -4063,6 +4326,7 @@ def _run_pair_sweep(
     secondary_orbit_path: str | Path | Sequence[str | Path] | None,
     unwrap: bool,
     geoid_correction: bool,
+    record_scientific_lineage: bool = False,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
     prepared_geo_lut_handles: Mapping[str, tuple[PreparedLutHandle, ProviderLeaseToken]]
@@ -4356,6 +4620,7 @@ def _run_pair_sweep(
             prepared_geo_lut_handles=prepared_geo_lut_handles,
             prepared_provider_root=prepared_provider_root,
             roi_buffer_m=roi_buffer_m,
+            record_scientific_lineage=record_scientific_lineage,
         )
         resources.ifg_archive = archive
         if coregistration_grid == "geo":
@@ -4389,6 +4654,7 @@ def _run_pair_sweep(
                 unwrap=unwrap,
                 geo_height_m=geo_height_m,
                 all_configs=configs,
+                record_scientific_lineage=record_scientific_lineage,
             )
             per_config[config] = outcome
             if single_config:
@@ -4436,6 +4702,7 @@ def _archive_burst_ifgs(
     roi_buffer_m: float = 320.0,
     misreg_az_px: float = 0.0,
     misreg_rg_px: float = 0.0,
+    record_scientific_lineage: bool = False,
 ) -> dict[str, Any]:
     """Process every burst unit once and store flat IFGs on disk.
 
@@ -4598,6 +4865,7 @@ def _archive_burst_ifgs(
                     "prepared_provider_token": prepared_provider_token,
                     "prepared_provider_root": prepared_provider_root,
                     "resource_limits": resource_limits,
+                    "record_scientific_lineage": record_scientific_lineage,
                     "require_worker_bootstrap": (
                         resource_limits is not None and n_jobs > 1
                     ),
@@ -4897,6 +5165,7 @@ def _finalize_sweep_config(
     unwrap: bool,
     geo_height_m: float = 0.0,
     all_configs: list[tuple[int, int]] | None = None,
+    record_scientific_lineage: bool = False,
 ) -> tuple[PairSweepOutcome, ProductionPairState]:
     """Build the config product, write it, and record the completion manifest."""
     az_looks, rg_looks = config
@@ -4924,6 +5193,7 @@ def _finalize_sweep_config(
             unwrap=unwrap,
             geo_height_m=geo_height_m,
             all_configs=all_configs,
+            record_scientific_lineage=record_scientific_lineage,
         )
     result = ProductionPairState(
         pair_id=pair_id,
@@ -4937,6 +5207,8 @@ def _finalize_sweep_config(
         multilook=config,
         goldstein_alpha=float(goldstein_alpha),
         unwrap_method="snaphu",
+        record_scientific_lineage=origin.record_scientific_lineage,
+        scientific_lineage=list(origin.scientific_lineage),
         complex_ifg=merged_ifg,
         complex_ifg_flat=filtered,
         coherence=coherence,
@@ -5112,6 +5384,7 @@ def _finalize_geo_config(
     unwrap: bool,
     geo_height_m: float,
     all_configs: list[tuple[int, int]] | None = None,
+    record_scientific_lineage: bool = False,
 ) -> tuple[PairSweepOutcome, ProductionPairState]:
     """Build and write the geocoded product for one look configuration."""
     az_looks, rg_looks = config
@@ -5144,6 +5417,8 @@ def _finalize_geo_config(
         multilook=config,
         goldstein_alpha=float(goldstein_alpha),
         unwrap_method=resolved_method,
+        record_scientific_lineage=record_scientific_lineage,
+        scientific_lineage=list(origin.scientific_lineage),
         complex_ifg=merged_ifg,
         complex_ifg_flat=filtered,
         coherence=coherence,
