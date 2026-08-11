@@ -49,6 +49,22 @@ dates and three pairs on a common grid. It passed with 5,279 finite pixels, shap
 SBAS-residual distributions were retained as diagnostics only; they are not
 qualification gates after the policy update.
 
+The public raw-SAFE Geo wrapper was also exercised with the current checkout:
+
+- two dates, one burst, cold run: 6,907 finite pixels, `(2, 116, 112)` output,
+  48.31 s wall time, peak RSS 7,749,025,792 bytes;
+- three dates, three bursts, network mode: the existing cold artifact was reopened
+  and revalidated under the current checkout; 12,611 finite pixels, `(3, 232, 121)`
+  output, 22.93 s warm-resume wall time, peak RSS 1,438,154,752 bytes;
+- the three-date, three-burst Geo pair/IFG set contains all three expected pairs,
+  and the current run republished the complete Stack generation and time-series
+  bindings without recomputing coregistration.
+
+The raw two-date Geo run record is
+`/Volumes/DATA2/TEST_sentinel-1/faninsar-experiments/campaigns/PROPOSAL-0018/current-qualification-20260811/public-geo-pair-n2-b0-auto-grid-cold-summary.json`.
+The current-code three-date Geo resume record is
+`/Volumes/DATA2/TEST_sentinel-1/faninsar-experiments/campaigns/PROPOSAL-0018/current-qualification-20260811/public-geo-network-n3-b0-1-2-auto-grid-warm-summary.json`.
+
 ## ISCE2 comparison
 
 The local ISCE2 reference is the benchmark under
