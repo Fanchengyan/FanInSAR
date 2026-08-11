@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import weakref
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -106,6 +107,57 @@ def test_stack_from_safes_defaults(tmp_path: Path) -> None:
     stack.measure_misreg()
     stack.invert_misreg()
     assert stack.date_misreg is None
+
+
+def test_coregister_scenes_releases_prior_pair_before_next_date(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-retained Pair arrays die before the next date starts processing."""
+    stack = _stack_with_three_date_network(tmp_path)
+    first_payload_ref: weakref.ReferenceType[np.ndarray] | None = None
+    call_count = 0
+
+    def fake_run_pair(
+        _reference_path: Path,
+        secondary_path: Path,
+        *,
+        scene_store_dir: Path,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        nonlocal call_count, first_payload_ref
+        if call_count == 1:
+            assert first_payload_ref is not None
+            assert first_payload_ref() is None
+        call_count += 1
+        payload = np.ones((64, 64), dtype=np.complex64)
+        if first_payload_ref is None:
+            first_payload_ref = weakref.ref(payload)
+        date_id = secondary_path.name.split("_")[5][:8]
+        write_scene_unit(
+            scene_store_dir,
+            date_id=date_id,
+            master_id=stack.master,
+            domain="radar",
+            tag="f0_IW1_b0",
+            reference=np.ones((2, 2), dtype=np.complex64),
+            secondary=np.ones((2, 2), dtype=np.complex64),
+            row_origin=0,
+            col_origin=0,
+        )
+        return SimpleNamespace(
+            _payload=payload,
+            esd_azimuth_shift_px=0.0,
+            range_shift_px=0.0,
+            azimuth_shift_px=0.0,
+        )
+
+    monkeypatch.setattr(
+        "faninsar.processing.pipeline.production.run_pair", fake_run_pair
+    )
+
+    stack.coregister_scenes()
+
+    assert call_count == 2
 
 
 def test_stack_config_multilook_normalize(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ and interferogram formation are separate stages: coreg caches per-date SLCs;
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -715,6 +716,12 @@ class Stack:
                 encoding="utf-8",
             )
             logger.info("Coregistered %s → master %s", date_id, self.master)
+            if not self.config.retain_pair_states:
+                # Assignment evaluates the next ``run_pair`` call before
+                # replacing this local. Drop the completed state's full-burst
+                # arrays now so adjacent dates cannot overlap in memory.
+                del state
+                gc.collect()
         self._write_qualified_activation_record()
         return self
 
