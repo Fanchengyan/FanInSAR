@@ -9,6 +9,10 @@ import numpy as np
 import pytest
 
 from faninsar.processing.contracts import ActivationToken, StackActivationBinding
+from faninsar.processing.interferometry.pair import (
+    form_interferogram,
+    goldstein_filter,
+)
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.stack import Stack, StackConfig
 from faninsar.processing.stack.activation import LocalActivationAuthority
@@ -183,6 +187,59 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
         "IW1_b0.complex64",
         "IW1_b1.complex64",
     }
+
+
+def test_stack_applies_multilook_before_publishing_ifg(tmp_path: Path) -> None:
+    """Stack payload shape and bytes must match the declared multilook."""
+    dates = ("20160101", "20160113")
+    safe_paths = []
+    for date_id in dates:
+        path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000_{date_id}T000001.SAFE"
+        path.mkdir()
+        safe_paths.append(path)
+    stack = Stack.from_safes(
+        safe_paths,
+        work_dir=tmp_path / "out",
+        activation_mode="reference",
+    )
+    stack.prepare_scenes()
+
+    reference = (
+        np.arange(64 * 64, dtype=np.float32).reshape(64, 64) + 1.0 + 1.0j
+    ).astype(np.complex64)
+    secondary = (
+        np.flip(reference, axis=1) + np.complex64(0.5 + 0.25j)
+    ).astype(np.complex64)
+    for date_id in dates:
+        root = stack.config.work_dir / "coreg" / date_id / "scenes"
+        write_scene_unit(
+            root,
+            date_id=date_id,
+            master_id=dates[0],
+            domain="radar",
+            tag="IW1_b0",
+            reference=reference,
+            secondary=secondary,
+            row_origin=0,
+            col_origin=0,
+        )
+        stack.coreg_paths[date_id] = root.parent
+
+    stack.form_interferograms(multilook=(2, 2), goldstein_alpha=0.5)
+
+    payload = np.fromfile(
+        stack.ifg_dirs[0] / "IW1_b0.complex64",
+        dtype=np.complex64,
+    ).reshape(32, 32)
+    expected = goldstein_filter(
+        form_interferogram(
+            reference,
+            secondary,
+            multilook=(2, 2),
+        ).complex_ifg,
+        alpha=0.5,
+    )
+    np.testing.assert_array_equal(payload, expected)
 
 
 def test_qualified_stack_form_requires_matching_activation_record(

@@ -11,6 +11,10 @@ from pathlib import Path
 import numpy as np
 
 from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.interferometry.pair import (
+    form_interferogram,
+    goldstein_filter,
+)
 
 SCENE_SCHEMA = "scene_artifact_v1"
 
@@ -335,8 +339,28 @@ def form_scene_interferograms(
     *,
     reference_role: str = "reference",
     secondary_role: str = "secondary",
+    multilook: tuple[int, int] = (1, 1),
+    goldstein_alpha: float = 0.0,
 ) -> dict[str, np.ndarray]:
-    """Form IFGs from aligned scene payloads only, never from source SAFE paths."""
+    """Form derived IFGs from aligned scene payloads only.
+
+    Parameters
+    ----------
+    reference_store, secondary_store : CoregisteredSceneStore
+        Persisted master-aligned scene generations.
+    reference_role, secondary_role : str, optional
+        Payload role to consume from each generation.
+    multilook : tuple[int, int], optional
+        Azimuth and range looks applied through the Pair interferogram kernel.
+    goldstein_alpha : float, optional
+        Goldstein filter exponent. Zero disables filtering.
+
+    Returns
+    -------
+    dict[str, numpy.ndarray]
+        Multilooked and optionally filtered complex interferograms by burst tag.
+
+    """
     if reference_store.domain != secondary_store.domain:
         reject_invalid_state("scene artifact domains do not match")
     reference_units = reference_store.unit_map()
@@ -361,7 +385,14 @@ def form_scene_interferograms(
             secondary = secondary_sec
         else:
             reject_invalid_state("unsupported secondary scene role")
-        outputs[tag] = (reference * np.conj(secondary)).astype(np.complex64)
+        complex_ifg = form_interferogram(
+            reference,
+            secondary,
+            multilook=multilook,
+        ).complex_ifg
+        if goldstein_alpha > 0.0:
+            complex_ifg = goldstein_filter(complex_ifg, alpha=goldstein_alpha)
+        outputs[tag] = np.asarray(complex_ifg, dtype=np.complex64)
     return outputs
 
 

@@ -618,6 +618,8 @@ class Stack:
                     secondary_role=(
                         "reference" if secondary == self.master else "secondary"
                     ),
+                    multilook=looks,
+                    goldstein_alpha=alpha,
                 )
                 sub.mkdir(parents=True, exist_ok=True)
                 for tag, ifg in outputs.items():
