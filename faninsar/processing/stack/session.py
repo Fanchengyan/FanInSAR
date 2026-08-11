@@ -58,6 +58,7 @@ if TYPE_CHECKING:
         InterferogramArtifactStore,
         UnwrappedArtifact,
     )
+    from faninsar.processing.stack.stack_generation import StackResultGeneration
     from faninsar.processing.timeseries.inversion import TimeSeriesResult
     from faninsar.processing.unwrap.quality import StackQualityCriteria
     from faninsar.processing.unwrap.stack import SpatialExecutor, StackUnwrapResult
@@ -1102,6 +1103,80 @@ class Stack:
             wavelength_m=wavelength_m,
         )
         return self.timeseries
+
+    def publish_generation(
+        self,
+        timeseries_root: str | Path,
+        *,
+        multilook: tuple[int, int] | None = None,
+        ifg_root: str | Path | None = None,
+    ) -> StackResultGeneration:
+        """Atomically publish the complete IFG, unwrap, and SBAS result set.
+
+        Parameters
+        ----------
+        timeseries_root : str or pathlib.Path
+            Immutable time-series transaction root produced by
+            :func:`~faninsar.processing.timeseries.write_timeseries_zarr`.
+        multilook : tuple[int, int], optional
+            Artifact view to bind. Defaults to the configured look factors.
+        ifg_root : str or pathlib.Path, optional
+            Root containing the exact pair artifact set.
+
+        Returns
+        -------
+        StackResultGeneration
+            Pinned, hash-validated parent generation. Call :meth:`close` when
+            the generation is no longer needed.
+
+        """
+        from faninsar.processing.stack.stack_generation import (
+            publish_stack_generation,
+        )
+
+        stores = self._pair_artifact_stores(
+            looks=multilook or self.config.multilook,
+            ifg_root=ifg_root,
+        )
+        try:
+            self._qualified_unwrapped_artifacts(stores)
+            expected_pair_ids = tuple(
+                f"{primary}_{secondary}"
+                for primary, secondary in _iter_pair_dates(self.pairs)
+            )
+            if (
+                self.timeseries is None
+                or len(self.timeseries.pair_ids) != len(expected_pair_ids)
+                or set(self.timeseries.pair_ids) != set(expected_pair_ids)
+            ):
+                reject_invalid_state(
+                    "Stack time-series result does not match the exact pair network"
+                )
+            return publish_stack_generation(
+                self.config.work_dir,
+                expected_pair_ids=expected_pair_ids,
+                stores=stores,
+                timeseries_root=timeseries_root,
+            )
+        finally:
+            for store in stores:
+                store.close()
+
+    def open_generation(self) -> StackResultGeneration:
+        """Open the current complete derived-result generation for this Stack."""
+        from faninsar.processing.stack.stack_generation import open_stack_generation
+
+        generation = open_stack_generation(self.config.work_dir)
+        expected_pair_ids = tuple(
+            f"{primary}_{secondary}"
+            for primary, secondary in _iter_pair_dates(self.pairs)
+        )
+        if generation.pair_ids != expected_pair_ids:
+            generation.close()
+            reject_invalid_state(
+                "current Stack generation does not match the configured pair network"
+            )
+        return generation
 
     def _qualified_unwrapped_artifacts(
         self,

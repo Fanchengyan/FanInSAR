@@ -24,6 +24,7 @@ from faninsar.processing.stack.ifg_store import (
     write_unwrapped_artifact,
 )
 from faninsar.processing.stack.scene_store import write_scene_unit
+from faninsar.processing.timeseries import write_timeseries_zarr
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -491,9 +492,7 @@ def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
             stack.unwrap_result.pair_ids
         )
         assert unwrapped.method_parameters["quality_report"]["passed"] is True
-        assert "modulo_closure_abs_rad" in unwrapped.method_parameters[
-            "quality_report"
-        ]
+        assert "modulo_closure_abs_rad" in unwrapped.method_parameters["quality_report"]
 
     stack.unwrap_result = None
     stack.unwrap(do_spatial=False)
@@ -512,6 +511,90 @@ def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
             do_spatial=False,
             quality_criteria=StackQualityCriteria(min_converged_fraction=1.0),
         )
+
+
+def test_stack_generation_binds_complete_ifg_unwrap_and_timeseries_set(
+    tmp_path: Path,
+) -> None:
+    """One parent generation binds every immutable derived child generation."""
+    stack = _stack_with_three_date_network(tmp_path)
+    first_increment = np.full((3, 4), 0.2, dtype=np.float32)
+    second_increment = np.full((3, 4), 0.35, dtype=np.float32)
+    phases = {
+        "20240101_20240113": first_increment,
+        "20240113_20240125": second_increment,
+        "20240101_20240125": first_increment + second_increment,
+    }
+    for pair_id, phase in phases.items():
+        _write_pair_artifact(stack, pair_id, phase)
+    stack.unwrap(do_spatial=False)
+    timeseries_root = write_timeseries_zarr(
+        stack.invert_timeseries(),
+        stack.config.work_dir / "timeseries.zarr",
+    )
+
+    published = stack.publish_generation(timeseries_root)
+
+    assert published.pair_ids == tuple(phases)
+    assert {binding.pair_id for binding in published.pairs} == set(phases)
+    assert all(binding.ifg_generation_id for binding in published.pairs)
+    assert all(binding.unwrap_generation_id for binding in published.pairs)
+    assert published.timeseries_generation_id
+    published.close()
+
+    reopened = stack.open_generation()
+    assert reopened.generation_id
+    assert reopened.pair_ids == tuple(phases)
+    assert reopened.manifest_digest
+    reopened.close()
+
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    first_binding = published.pairs[0]
+    unwrap_payload = (
+        first_binding.artifact_root
+        / ".unwrap_generations"
+        / first_binding.unwrap_generation_id
+        / "unwrapped_phase.npy"
+    )
+    unwrap_payload.write_bytes(b"corrupted")
+    with pytest.raises(InvalidProcessingStateError, match="digest mismatch"):
+        stack.open_generation()
+
+
+def test_partial_unwrap_network_cannot_publish_stack_generation(tmp_path: Path) -> None:
+    """A crash-visible subset of unwrap children is never Stack-complete."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phases = {
+        "20240101_20240113": np.full((3, 4), 0.2, dtype=np.float32),
+        "20240113_20240125": np.full((3, 4), 0.35, dtype=np.float32),
+        "20240101_20240125": np.full((3, 4), 0.55, dtype=np.float32),
+    }
+    for pair_id, phase in phases.items():
+        _write_pair_artifact(stack, pair_id, phase)
+    first_store = InterferogramArtifactStore.open(
+        stack.config.work_dir / "ifg/ml_1x1/20240101_20240113"
+    )
+    write_unwrapped_artifact(
+        first_store.root,
+        unwrapped_phase=phases["20240101_20240113"],
+        connected_components=np.ones((3, 4), dtype=np.int32),
+        method="stack_irls",
+        method_parameters={"pair_ids": list(phases)},
+        ifg_manifest_digest=first_store.manifest_digest,
+    )
+    first_store.close()
+    timeseries_root = write_timeseries_zarr(
+        stack.invert_timeseries(pair_phases=phases),
+        stack.config.work_dir / "timeseries.zarr",
+    )
+
+    with pytest.raises(InvalidProcessingStateError):
+        stack.publish_generation(timeseries_root)
+
+    assert not (stack.config.work_dir / "STACK_CURRENT").exists()
 
 
 def test_scene_artifacts_flow_through_merge_unwrap_and_sbas(

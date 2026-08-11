@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -98,7 +99,7 @@ def test_stack_pipeline_runs_persisted_unwrap_then_sbas(
 
     def invert(_stack: Stack, *, device: str | None = None) -> TimeSeriesResult:
         calls.append(f"invert:{device}")
-        return TimeSeriesResult(
+        result = TimeSeriesResult(
             pair_ids=("20240101_20240113",),
             dates=("20240101", "20240113"),
             increments=np.ones((1, 2, 2), dtype=np.float32),
@@ -111,12 +112,23 @@ def test_stack_pipeline_runs_persisted_unwrap_then_sbas(
             ),
             metadata={"method": "sbas"},
         )
+        _stack.timeseries = result
+        return result
+
+    def publish(_stack: Stack, timeseries_root: Path) -> SimpleNamespace:
+        calls.append("publish")
+        assert timeseries_root == tmp_path / "out" / "timeseries.zarr"
+        return SimpleNamespace(
+            generation_id="stack-generation",
+            manifest_digest="a" * 64,
+        )
 
     monkeypatch.setattr(Stack, "prepare_scenes", prepare)  # type: ignore[attr-defined]
     monkeypatch.setattr(Stack, "coregister_scenes", coregister)  # type: ignore[attr-defined]
     monkeypatch.setattr(Stack, "form_interferograms", form)  # type: ignore[attr-defined]
     monkeypatch.setattr(Stack, "unwrap", unwrap)  # type: ignore[attr-defined]
     monkeypatch.setattr(Stack, "invert_timeseries", invert)  # type: ignore[attr-defined]
+    monkeypatch.setattr(Stack, "publish_generation", publish)  # type: ignore[attr-defined]
 
     paths = []
     for date_id in ("20240101", "20240113"):
@@ -143,7 +155,14 @@ def test_stack_pipeline_runs_persisted_unwrap_then_sbas(
         roi=roi,
     )
 
-    assert calls == ["prepare", "coregister", "form", "unwrap", "invert:cpu"]
+    assert calls == [
+        "prepare",
+        "coregister",
+        "form",
+        "unwrap",
+        "invert:cpu",
+        "publish",
+    ]
     assert result.timeseries is not None
     assert len(result.pair_results) == 1
     assert result.pair_results[0].multilook == (2, 8)
@@ -151,3 +170,5 @@ def test_stack_pipeline_runs_persisted_unwrap_then_sbas(
     assert result.pair_results[0].domain == "geo"
     assert result.timeseries_zarr == tmp_path / "out" / "timeseries.zarr"
     assert result.timeseries_zarr.exists()
+    assert result.stack_generation is not None
+    assert result.stack_generation.generation_id == "stack-generation"

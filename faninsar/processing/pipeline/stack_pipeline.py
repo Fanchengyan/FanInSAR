@@ -30,6 +30,7 @@ if TYPE_CHECKING:
         CoregistrationGrid,
     )
     from faninsar.processing.stack.config import ActivationMode
+    from faninsar.processing.stack.stack_generation import StackResultGeneration
     from faninsar.query import BoundingBox, Polygons
 
 logger = setup_logger(__name__)
@@ -72,6 +73,7 @@ class StackPipelineResult:
     pair_results: tuple[StackInterferogramResult, ...]
     timeseries: TimeSeriesResult | None
     timeseries_zarr: Path | None
+    stack_generation: StackResultGeneration | None
 
 
 def default_pair_list(scene_ids: Sequence[str]) -> list[tuple[str, str]]:
@@ -231,6 +233,7 @@ def run_stack_pipeline(
     )
     timeseries = None
     timeseries_zarr = None
+    stack_generation = None
     if invert_timeseries:
         stack.unwrap()
         timeseries = stack.invert_timeseries(device=invert_device)
@@ -238,6 +241,7 @@ def run_stack_pipeline(
             timeseries,
             Path(output_dir) / "timeseries.zarr",
         )
+        stack_generation = stack.publish_generation(timeseries_zarr)
 
     logger.info(
         "Stack complete: %s scenes, %s pair states under %s mode=%s",
@@ -251,6 +255,7 @@ def run_stack_pipeline(
         pair_results=pair_results,
         timeseries=timeseries,
         timeseries_zarr=timeseries_zarr,
+        stack_generation=stack_generation,
     )
 
 
