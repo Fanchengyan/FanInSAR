@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from faninsar.processing.stack.activation import (
+    ActivationIssuerRecord,
+    LocalActivationAuthority,
+    StackGateEvent,
+)
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.config import (
     ActivationMode,
@@ -12,10 +17,13 @@ from faninsar.processing.stack.config import (
 from faninsar.processing.stack.session import Stack
 
 __all__ = [
+    "ActivationIssuerRecord",
     "ActivationMode",
     "CoregMode",
     "EsdMethod",
+    "LocalActivationAuthority",
     "SceneCatalog",
     "Stack",
     "StackConfig",
+    "StackGateEvent",
 ]

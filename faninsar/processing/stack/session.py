@@ -165,9 +165,10 @@ class Stack:
         pair_max_days: int = 72,
         misreg_max_interval: int = 2,
         misreg_max_days: int = 36,
-        activation_mode: ActivationMode = "reference",
+        activation_mode: ActivationMode,
         activation_binding: StackActivationBinding | None = None,
         activation_token: ActivationToken | None = None,
+        activation_authority_root: str | Path | None = None,
         retain_pair_states: bool = False,
     ) -> Stack:
         """Construct a Stack from SAFE paths and optional pair graphs."""
@@ -208,6 +209,11 @@ class Stack:
             activation_mode=activation_mode,
             activation_binding=activation_binding,
             activation_token=activation_token,
+            activation_authority_root=(
+                Path(activation_authority_root)
+                if activation_authority_root is not None
+                else None
+            ),
             retain_pair_states=retain_pair_states,
         )
         return cls(
@@ -253,6 +259,13 @@ class Stack:
             reject_invalid_state("qualified Stack activation binding is missing")
         if token is None:
             reject_invalid_state("qualified Stack activation token is missing")
+        authority_root = self.config.activation_authority_root
+        if authority_root is None:
+            reject_invalid_state("qualified Stack activation authority is missing")
+        from faninsar.processing.stack.activation import LocalActivationAuthority
+
+        authority = LocalActivationAuthority.open(authority_root)
+        _ = authority.verify_token(token)
         if binding.activation_token_digest != token.digest():
             reject_invalid_state("activation token does not match binding digest")
         if token.parent_id != binding.stack_generation_id:
@@ -290,6 +303,13 @@ class Stack:
         path = self.config.work_dir / "activation" / "scene_artifact_v1.json"
         if binding is None or token is None or not path.is_file():
             reject_invalid_state("qualified Stack activation record is missing")
+        authority_root = self.config.activation_authority_root
+        if authority_root is None:
+            reject_invalid_state("qualified Stack activation authority is missing")
+        from faninsar.processing.stack.activation import LocalActivationAuthority
+
+        authority = LocalActivationAuthority.open(authority_root)
+        _ = authority.verify_token(token)
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:

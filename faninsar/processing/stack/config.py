@@ -37,6 +37,7 @@ class StackConfig:
     """
 
     work_dir: Path
+    activation_mode: ActivationMode
     coreg_mode: CoregMode = "pair"
     coregistration_grid: CoregistrationGrid = "radar"
     esd_method: EsdMethod = "auto"
@@ -51,9 +52,9 @@ class StackConfig:
     bursts: BurstSelection | None = None
     roi: object | None = None
     on_network_failure: OnNetworkFailure = "error"
-    activation_mode: ActivationMode = "reference"
     activation_binding: StackActivationBinding | None = None
     activation_token: ActivationToken | None = None
+    activation_authority_root: Path | None = None
     control_spacing: int | None = None
     n_jobs: int = 1
     retain_pair_states: bool = False
@@ -82,6 +83,10 @@ class StackConfig:
                 message = "qualified Stack mode requires an activation token"
                 logger.error(message)
                 raise ValueError(message)
+            if self.activation_authority_root is None:
+                message = "qualified Stack mode requires an activation authority root"
+                logger.error(message)
+                raise ValueError(message)
             if self.activation_binding.activation_mode != "qualified":
                 message = "qualified Stack mode requires a qualified binding"
                 logger.error(message)
@@ -102,5 +107,7 @@ class StackConfig:
             message = "reference Stack mode cannot use a qualified token"
             logger.error(message)
             raise ValueError(message)
+        if self.activation_authority_root is not None:
+            self.activation_authority_root = Path(self.activation_authority_root)
         ml = self.multilook
         self.multilook = (int(ml[0]), int(ml[1]))

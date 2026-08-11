@@ -56,6 +56,7 @@ def test_stack_pipeline_uses_full_workflow(tmp_path: Path) -> None:
     result = run_stack_pipeline(
         SCENES[:3],
         output_dir=tmp_path / "stack",
+        activation_mode="reference",
         height=64,
         width=64,
         multilook=(2, 2),

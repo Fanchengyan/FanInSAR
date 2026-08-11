@@ -20,8 +20,13 @@ from faninsar.processing.timeseries.inversion import (
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
+    from faninsar.processing.contracts.prepared_geometry import (
+        ActivationToken,
+        StackActivationBinding,
+    )
     from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.pipeline.production import ProductionPairState
+    from faninsar.processing.stack.config import ActivationMode
 
 logger = setup_logger(__name__)
 
@@ -61,6 +66,10 @@ def run_stack_pipeline(
     invert_device: str = "cpu",
     dem: DEMSampler | None = None,
     coreg_mode: str = "pair",
+    activation_mode: ActivationMode,
+    activation_binding: StackActivationBinding | None = None,
+    activation_token: ActivationToken | None = None,
+    activation_authority_root: str | Path | None = None,
 ) -> StackPipelineResult:
     """Process an arbitrary SAFE stack via :class:`~faninsar.processing.stack.Stack`.
 
@@ -93,6 +102,12 @@ def run_stack_pipeline(
         DEM for coreg/flatten/geocode.
     coreg_mode : {"geometry", "pair", "network"}, optional
         Stack coregistration mode (PROPOSAL-0017).
+    activation_mode : {"reference", "qualified"}
+        Explicit namespace selection.  ``reference`` is correctness-only;
+        ``qualified`` requires a signed activation token, binding, and local
+        authority root.
+    activation_binding, activation_token, activation_authority_root : optional
+        Required together for qualified production execution.
 
     Returns
     -------
@@ -124,6 +139,10 @@ def run_stack_pipeline(
         device=device,
         invert_device=invert_device,
         coreg_mode=coreg_mode,  # type: ignore[arg-type]
+        activation_mode=activation_mode,
+        activation_binding=activation_binding,
+        activation_token=activation_token,
+        activation_authority_root=activation_authority_root,
         swaths=(swath,),
         bursts={swath: [burst_index]},
         # Retain heavy pair states only when the optional in-memory time-series

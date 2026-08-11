@@ -11,6 +11,7 @@ import pytest
 from faninsar.processing.contracts import ActivationToken, StackActivationBinding
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.stack import Stack, StackConfig
+from faninsar.processing.stack.activation import LocalActivationAuthority
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.scene_store import write_scene_unit
 
@@ -39,6 +40,7 @@ def test_stack_from_safes_defaults(tmp_path: Path) -> None:
     stack = Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
+        activation_mode="reference",
         coreg_mode="geometry",
         pair_max_interval=2,
         pair_max_days=60,
@@ -55,8 +57,18 @@ def test_stack_from_safes_defaults(tmp_path: Path) -> None:
 
 def test_stack_config_multilook_normalize(tmp_path: Path) -> None:
     """StackConfig coerces multilook to int pair."""
-    cfg = StackConfig(work_dir=tmp_path, multilook=(2, 10))
+    cfg = StackConfig(
+        work_dir=tmp_path,
+        activation_mode="reference",
+        multilook=(2, 10),
+    )
     assert cfg.multilook == (2, 10)
+
+
+def test_stack_requires_explicit_activation_namespace(tmp_path: Path) -> None:
+    """Corrected Stack execution has no implicit reference activation path."""
+    with pytest.raises(TypeError, match="activation_mode"):
+        StackConfig(work_dir=tmp_path)  # type: ignore[call-arg]
 
 
 def test_stack_geo_grid_is_forwarded_to_pair_pipeline(tmp_path: Path) -> None:
@@ -76,6 +88,7 @@ def test_stack_geo_grid_is_forwarded_to_pair_pipeline(tmp_path: Path) -> None:
     stack = Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
+        activation_mode="reference",
         coregistration_grid="geo",
         geo_grid=grid,
     )
@@ -85,7 +98,11 @@ def test_stack_geo_grid_is_forwarded_to_pair_pipeline(tmp_path: Path) -> None:
 def test_stack_config_rejects_degrade_to_pair(tmp_path: Path) -> None:
     """Qualified Stack configuration cannot silently change coreg semantics."""
     with pytest.raises(ValueError, match="fail-closed"):
-        StackConfig(work_dir=tmp_path, on_network_failure="degrade_to_pair")  # type: ignore[arg-type]
+        StackConfig(  # type: ignore[arg-type]
+            work_dir=tmp_path,
+            activation_mode="reference",
+            on_network_failure="degrade_to_pair",
+        )
 
 
 def test_stack_config_rejects_qualified_mode_without_binding(tmp_path: Path) -> None:
@@ -106,6 +123,7 @@ def test_stack_measure_misreg_keeps_ampcor_range_residual(
     stack = Stack.from_safes(
         paths,
         work_dir=tmp_path / "out",
+        activation_mode="reference",
         coreg_mode="network",
         pair_max_interval=2,
         pair_max_days=60,
@@ -134,7 +152,11 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
         path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000_{date_id}T000001.SAFE"
         path.mkdir()
         safe_paths.append(path)
-    stack = Stack.from_safes(safe_paths, work_dir=tmp_path / "out")
+    stack = Stack.from_safes(
+        safe_paths,
+        work_dir=tmp_path / "out",
+        activation_mode="reference",
+    )
     stack.prepare_scenes()
 
     reference = np.ones((2, 2), dtype=np.complex64)
@@ -173,7 +195,49 @@ def test_qualified_stack_form_requires_matching_activation_record(
         path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000_{date_id}T000001.SAFE"
         path.mkdir()
         safe_paths.append(path)
-    token = ActivationToken(
+    authority_root = tmp_path / "authority"
+    authority = LocalActivationAuthority.initialize(authority_root)
+    _ = authority.issue_gate_event(
+        event_id="p18-provider",
+        gate_id="P18-provider-qualified",
+        producer_commit="p18-provider-commit",
+        predecessor_event_ids=(),
+        provider_receipt_digest="a" * 64,
+        parent_manifest_digest="b" * 64,
+        evidence_digest="1" * 64,
+        activation_mode="qualified",
+    )
+    _ = authority.issue_gate_event(
+        event_id="p19-correctness",
+        gate_id="P19-stack-correctness-verified",
+        producer_commit="p19-correctness-commit",
+        predecessor_event_ids=("p18-provider",),
+        provider_receipt_digest="a" * 64,
+        parent_manifest_digest="c" * 64,
+        evidence_digest="2" * 64,
+        activation_mode="reference",
+    )
+    _ = authority.issue_gate_event(
+        event_id="p18-stack",
+        gate_id="P18-stack-qualified",
+        producer_commit="p18-commit",
+        predecessor_event_ids=("p19-correctness",),
+        provider_receipt_digest="a" * 64,
+        parent_manifest_digest="c" * 64,
+        evidence_digest="e" * 64,
+        activation_mode="qualified",
+    )
+    _ = authority.issue_gate_event(
+        event_id="p19-qualified",
+        gate_id="P19-stack-qualified-activation",
+        producer_commit="p19-commit",
+        predecessor_event_ids=("p18-stack",),
+        provider_receipt_digest="a" * 64,
+        parent_manifest_digest="c" * 64,
+        evidence_digest="e" * 64,
+        activation_mode="qualified",
+    )
+    token_template = ActivationToken(
         intent_id="intent",
         parent_id="stack-generation",
         parent_manifest_digest="c" * 64,
@@ -191,8 +255,9 @@ def test_qualified_stack_form_requires_matching_activation_record(
         p19_qualified_event_ids=("p19-qualified",),
         p18_stack_gate_event_id="p18-stack",
         fence_epoch=1,
-        issuer_record_digest="f" * 64,
+        issuer_record_digest="0" * 64,
     )
+    token = authority.issue_token(token_template)
     binding = StackActivationBinding(
         provider_parent_generation_id="provider-parent",
         qualification_receipt_digest="a" * 64,
@@ -210,6 +275,7 @@ def test_qualified_stack_form_requires_matching_activation_record(
         activation_mode="qualified",
         activation_binding=binding,
         activation_token=token,
+        activation_authority_root=authority_root,
     )
     stack.prepare_scenes()
     reference = np.ones((2, 2), dtype=np.complex64)
