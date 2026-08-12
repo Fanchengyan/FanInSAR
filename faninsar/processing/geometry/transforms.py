@@ -10,12 +10,6 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.geometry.ellipsoid import ecef_to_llh, llh_to_ecef
-from faninsar.processing.geometry.geo2rdr_backends import (
-    BackendName,
-    cpp_geo2rdr,
-    resolve_backend,
-    torch_geo2rdr,
-)
 from faninsar.processing.geometry.orbit import OrbitInterpolator
 
 if TYPE_CHECKING:
@@ -457,7 +451,7 @@ def rdr2geo_ellipsoid(
     )
 
 
-def _geo2rdr_numpy(
+def geo2rdr(
     model: RadarGeometryModel,
     latitude_deg: np.ndarray,
     longitude_deg: np.ndarray,
@@ -605,91 +599,6 @@ def _geo2rdr_numpy(
         converged=converged,
         residual_range_m=residual_range,
         residual_doppler_hz=residual_doppler,
-    )
-
-
-def geo2rdr(
-    model: RadarGeometryModel,
-    latitude_deg: np.ndarray,
-    longitude_deg: np.ndarray,
-    height_m: np.ndarray | float,
-    *,
-    max_iter: int = 20,
-    time_tol_s: float = 1e-6,
-    backend: BackendName = "auto",
-    device: str | None = None,
-) -> TransformResult:
-    """Map geodetic coordinates to radar range/azimuth indices.
-
-    Parameters
-    ----------
-    model : RadarGeometryModel
-        Orbit and radar timing model.
-    latitude_deg, longitude_deg : numpy.ndarray
-        Geodetic coordinates in degrees.
-    height_m : array or float
-        Ellipsoidal heights in metres.
-    max_iter : int, optional
-        Newton iteration budget for the numpy backend (default 20).
-    time_tol_s : float, optional
-        Azimuth-time convergence tolerance in seconds.
-    backend : Literal["auto", "numpy", "torch", "cpp"], optional
-        Backend selector. ``auto`` prefers the C++ kernel when built, then the
-        Torch kernel, then the numpy reference.
-    device : str or None, optional
-        Torch device used by the Torch backend.
-
-    Returns
-    -------
-    TransformResult
-        Radar indices with residuals and convergence mask.
-
-    """
-    lat = np.asarray(latitude_deg, dtype=np.float64)
-    lon = np.asarray(longitude_deg, dtype=np.float64)
-    height = np.asarray(height_m, dtype=np.float64)
-    lat_b, lon_b, h_b = np.broadcast_arrays(lat, lon, height)
-
-    resolved = resolve_backend(backend)
-    if resolved == "torch":
-        accelerated_max_iter = min(max_iter, 4)
-        data = torch_geo2rdr(
-            model,
-            lat_b,
-            lon_b,
-            h_b,
-            max_iter=accelerated_max_iter,
-            time_tol_s=time_tol_s,
-            device=device,
-        )
-    elif resolved == "cpp":
-        data = cpp_geo2rdr(
-            model,
-            lat_b,
-            lon_b,
-            h_b,
-            max_iter=min(max_iter, 4),
-            time_tol_s=time_tol_s,
-        )
-    else:
-        return _geo2rdr_numpy(
-            model,
-            lat_b,
-            lon_b,
-            h_b,
-            max_iter=max_iter,
-            time_tol_s=time_tol_s,
-        )
-
-    return TransformResult(
-        latitude_deg=lat_b.copy(),
-        longitude_deg=lon_b.copy(),
-        height_m=h_b.copy(),
-        range_index=data["range_index"],
-        azimuth_index=data["azimuth_index"],
-        converged=data["converged"],
-        residual_range_m=data["residual_range_m"],
-        residual_doppler_hz=data["residual_doppler_hz"],
     )
 
 
