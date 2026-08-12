@@ -18,6 +18,13 @@ from .ellipsoid import (
     llh_to_ecef,
     local_earth_radius_m,
 )
+from .geo2rdr_backends import (
+    BackendName,
+    available_backends,
+    cpp_geo2rdr,
+    resolve_backend,
+    torch_geo2rdr,
+)
 from .lut_cache import TransformCacheKey, read_transform_cache, write_transform_cache
 from .orbit import (
     OrbitInterpolationError,
@@ -51,6 +58,7 @@ __all__ = [
     "WGS84_A_M",
     "WGS84_E2",
     "WGS84_F",
+    "BackendName",
     "BaselineComponents",
     "ConstantHeightDEM",
     "DEMManager",
@@ -72,7 +80,9 @@ __all__ = [
     "ScenePreparationCallback",
     "TransformCacheKey",
     "TransformResult",
+    "available_backends",
     "copernicus_tile_name",
+    "cpp_geo2rdr",
     "default_dem_name",
     "ecef_to_llh",
     "geo2rdr",
@@ -85,6 +95,8 @@ __all__ = [
     "rdr2geo_with_dem",
     "rdr2geo_with_dem_chunked",
     "read_transform_cache",
+    "resolve_backend",
+    "torch_geo2rdr",
     "write_transform_cache",
     "zero_doppler_residual_hz",
 ]
