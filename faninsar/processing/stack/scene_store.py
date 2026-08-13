@@ -520,6 +520,8 @@ def form_merged_scene_interferogram(
     secondary_role: str = "secondary",
     multilook: tuple[int, int] = (1, 1),
     goldstein_alpha: float = 0.0,
+    device: str = "auto",
+    dask_client: object | None = None,
 ) -> InterferogramProduct:
     """Form one common-grid complex IFG from all persisted scene units.
 
@@ -539,6 +541,10 @@ def form_merged_scene_interferogram(
         Azimuth and range boxcar look factors aligned to global origins.
     goldstein_alpha : float, optional
         Goldstein filter exponent. Zero disables filtering.
+    device : str, optional
+        Numerical device policy for the qualified Goldstein stage.
+    dask_client : object, optional
+        Explicitly trusted Dask client for qualified remote Goldstein work.
 
     Returns
     -------
@@ -595,10 +601,23 @@ def form_merged_scene_interferogram(
             )
             if goldstein_alpha <= 0.0:
                 return product
-            filtered = goldstein_filter(
-                product.complex_ifg,
-                alpha=goldstein_alpha,
-            )
+            from faninsar.backends.dask_gpu import should_accelerate
+
+            if (
+                (dask_client is not None or device.lower() == "cuda")
+                and should_accelerate(device, dask_client, kernel="goldstein_filter")
+            ):
+                from faninsar.backends.dask_gpu import run_goldstein_filter
+
+                filtered = run_goldstein_filter(
+                    product.complex_ifg,
+                    alpha=goldstein_alpha,
+                    window=32,
+                    device=device,
+                    client=dask_client,
+                )
+            else:
+                filtered = goldstein_filter(product.complex_ifg, alpha=goldstein_alpha)
             filtered, coherence, wrapped = mask_invalid_looks(
                 filtered,
                 product.coherence,
@@ -710,7 +729,23 @@ def form_merged_scene_interferogram(
         merged_ifg[valid] = group_ifg[valid]
         coherence[valid] = group_coherence[valid]
     if goldstein_alpha > 0.0:
-        merged_ifg = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
+        from faninsar.backends.dask_gpu import should_accelerate
+
+        if (
+            (dask_client is not None or device.lower() == "cuda")
+            and should_accelerate(device, dask_client, kernel="goldstein_filter")
+        ):
+            from faninsar.backends.dask_gpu import run_goldstein_filter
+
+            merged_ifg = run_goldstein_filter(
+                merged_ifg,
+                alpha=goldstein_alpha,
+                window=32,
+                device=device,
+                client=dask_client,
+            )
+        else:
+            merged_ifg = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
     merged_ifg, coherence_out, wrapped = mask_invalid_looks(merged_ifg, coherence)
     assert coherence_out is not None
     return InterferogramProduct(
@@ -729,6 +764,8 @@ def form_scene_interferograms(
     secondary_role: str = "secondary",
     multilook: tuple[int, int] = (1, 1),
     goldstein_alpha: float = 0.0,
+    device: str = "auto",
+    dask_client: object | None = None,
 ) -> dict[str, np.ndarray]:
     """Form derived IFGs from aligned scene payloads only.
 
@@ -742,6 +779,10 @@ def form_scene_interferograms(
         Azimuth and range looks applied through the Pair interferogram kernel.
     goldstein_alpha : float, optional
         Goldstein filter exponent. Zero disables filtering.
+    device : str, optional
+        Numerical device policy for the qualified Goldstein stage.
+    dask_client : object, optional
+        Explicitly trusted Dask client for qualified remote Goldstein work.
 
     Returns
     -------
@@ -779,7 +820,23 @@ def form_scene_interferograms(
             multilook=multilook,
         ).complex_ifg
         if goldstein_alpha > 0.0:
-            complex_ifg = goldstein_filter(complex_ifg, alpha=goldstein_alpha)
+            from faninsar.backends.dask_gpu import should_accelerate
+
+            if (
+                (dask_client is not None or device.lower() == "cuda")
+                and should_accelerate(device, dask_client, kernel="goldstein_filter")
+            ):
+                from faninsar.backends.dask_gpu import run_goldstein_filter
+
+                complex_ifg = run_goldstein_filter(
+                    complex_ifg,
+                    alpha=goldstein_alpha,
+                    window=32,
+                    device=device,
+                    client=dask_client,
+                )
+            else:
+                complex_ifg = goldstein_filter(complex_ifg, alpha=goldstein_alpha)
         outputs[tag] = np.asarray(complex_ifg, dtype=np.complex64)
     return outputs
 

@@ -58,6 +58,7 @@ class StackConfig:
     control_spacing: int | None = None
     n_jobs: int = 1
     retain_pair_states: bool = False
+    record_scientific_lineage: bool = False
     extra: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

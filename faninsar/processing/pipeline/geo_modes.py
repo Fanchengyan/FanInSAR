@@ -3,26 +3,26 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
+from faninsar.logging import setup_logger
 from faninsar.processing.memory import release_memmap_pages
 from faninsar.processing.pipeline.geo_resample import (
     compose_secondary_coordinates,
     resample_complex_at_coordinates,
-)
-from faninsar.processing.tops.deramp import (
-    TOPSCarrierModel,
-    carrier_phase_at_points,
 )
 
 if TYPE_CHECKING:
     from faninsar.processing.coreg.offsets import OffsetFieldResult
     from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.tops.deramp import TOPSCarrierModel
 
 __all__ = ["coregister_geocoded_slcs", "coregister_geocoded_slcs_chunked"]
+
+logger = setup_logger(__name__)
 
 
 def _apply_reramp(
@@ -32,18 +32,42 @@ def _apply_reramp(
     range_index: np.ndarray,
     *,
     native_height: int,
+    device: str,
+    dask_client: Any | None,
 ) -> np.ndarray:
-    phase = carrier_phase_at_points(
+    from faninsar.backends.dask_gpu import should_accelerate
+
+    if not should_accelerate(device, dask_client, kernel="carrier_multiply"):
+        logger.warning(
+            "Geographic reramp is not CUDA-qualified; using the NumPy CPU "
+            "reference path"
+        )
+        from faninsar.processing.tops.deramp import carrier_phase_at_points
+
+        phase = carrier_phase_at_points(
+            carrier,
+            azimuth,
+            range_index,
+            centre_row=float(native_height // 2),
+            dtype=np.float32,
+        )
+        output = np.asarray(deramped, dtype=np.complex64) * np.exp(
+            1j * np.asarray(phase, dtype=np.float64)
+        )
+        return output.astype(np.complex64, copy=False)
+
+    from faninsar.backends.dask_gpu import run_carrier_multiply_at_points
+
+    return run_carrier_multiply_at_points(
+        np.asarray(deramped, dtype=np.complex64),
         carrier,
         azimuth,
         range_index,
         centre_row=float(native_height // 2),
-        dtype=np.float32,
+        sign=1.0,
+        device=device,
+        client=dask_client,
     )
-    output = np.asarray(deramped, dtype=np.complex64) * np.exp(
-        1j * np.asarray(phase, dtype=np.float64)
-    )
-    return output.astype(np.complex64, copy=False)
 
 
 def coregister_geocoded_slcs(
@@ -56,6 +80,7 @@ def coregister_geocoded_slcs(
     offsets: OffsetFieldResult,
     executor: Literal["torch"] = "torch",
     device: str = "auto",
+    dask_client: Any | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Coregister two deramped SLCs directly on a geographic grid.
 
@@ -73,6 +98,8 @@ def coregister_geocoded_slcs(
         Unified Torch Lanczos implementation.
     device : {"auto", "cpu", "cuda"}, optional
         Torch device for the accelerated implementation.
+    dask_client : object or None, optional
+        Explicitly trusted Dask client for remote CUDA reramp tasks.
 
     Returns
     -------
@@ -119,6 +146,8 @@ def coregister_geocoded_slcs(
         reference_lut.az_full,
         reference_lut.rg_full,
         native_height=reference_deramped.shape[0],
+        device=device,
+        dask_client=dask_client,
     )
     secondary_geo = _apply_reramp(
         secondary_geo,
@@ -126,6 +155,8 @@ def coregister_geocoded_slcs(
         secondary_azimuth,
         secondary_range,
         native_height=secondary_deramped.shape[0],
+        device=device,
+        dask_client=dask_client,
     )
     invalid_value = np.complex64(np.nan + 1j * np.nan)
     reference_geo = np.where(valid, reference_geo, invalid_value).astype(np.complex64)
@@ -145,6 +176,7 @@ def coregister_geocoded_slcs_chunked(
     row_chunk: int = 256,
     executor: Literal["torch"] = "torch",
     device: str = "auto",
+    dask_client: Any | None = None,
     watchdog: MemoryWatchdog | None = None,
 ) -> tuple[np.memmap, np.memmap, np.memmap]:
     """Coregister geographic SLCs into disk-backed row tiles.
@@ -167,6 +199,8 @@ def coregister_geocoded_slcs_chunked(
         Unified Torch Lanczos implementation.
     device : {"auto", "cpu", "cuda", "mps"}, optional
         Torch device for accelerated Lanczos.
+    dask_client : object or None, optional
+        Explicitly trusted Dask client for remote CUDA reramp tasks.
     watchdog : MemoryWatchdog, optional
         Memory guard sampled after every completed tile.
 
@@ -226,6 +260,7 @@ def coregister_geocoded_slcs_chunked(
             offsets=offsets,
             executor=executor,
             device=device,
+            dask_client=dask_client,
         )
         reference_output[rows] = reference_tile
         secondary_output[rows] = secondary_tile

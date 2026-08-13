@@ -143,6 +143,7 @@ class Stack:
     misreg_pairs: Pairs
     master: str
     acquisitions: Acquisition | None = None
+    dask_client: Any | None = field(default=None, repr=False)
     arcs: list[MisregArc] = field(default_factory=list)
     date_misreg: DateMisreg | None = None
     coreg_paths: dict[str, Path] = field(default_factory=dict)
@@ -173,6 +174,7 @@ class Stack:
         bursts: BurstSelection | None = None,
         executor: str = "torch",
         device: str = "auto",
+        dask_client: Any | None = None,
         invert_device: str = "cpu",
         pair_max_interval: int = 3,
         pair_max_days: int = 72,
@@ -183,6 +185,7 @@ class Stack:
         activation_token: ActivationToken | None = None,
         activation_authority_root: str | Path | None = None,
         retain_pair_states: bool = False,
+        record_scientific_lineage: bool = False,
     ) -> Stack:
         """Construct a Stack from SAFE paths and optional pair graphs."""
         catalog = SceneCatalog.from_paths(list(paths))
@@ -229,6 +232,7 @@ class Stack:
                 else None
             ),
             retain_pair_states=retain_pair_states,
+            record_scientific_lineage=record_scientific_lineage,
         )
         return cls(
             catalog=catalog,
@@ -237,6 +241,7 @@ class Stack:
             misreg_pairs=m_pairs,
             master=master_id,
             acquisitions=acq,
+            dask_client=dask_client,
         )
 
     def prepare_scenes(self) -> Self:
@@ -356,6 +361,8 @@ class Stack:
             "geo_grid": cfg.geo_grid,
             "executor": cfg.executor,
             "device": cfg.device,
+            "dask_client": self.dask_client,
+            "record_scientific_lineage": cfg.record_scientific_lineage,
             "coregistration_grid": cfg.coregistration_grid,
             "roi": cfg.roi,
             "control_spacing": cfg.control_spacing,
@@ -822,6 +829,8 @@ class Stack:
                     ),
                     multilook=looks,
                     goldstein_alpha=alpha,
+                    device=self.config.device,
+                    dask_client=self.dask_client,
                 )
                 from faninsar.processing.stack.ifg_store import write_ifg_artifact
 

@@ -110,6 +110,7 @@ def run_stack_pipeline(
     activation_binding: StackActivationBinding | None = None,
     activation_token: ActivationToken | None = None,
     activation_authority_root: str | Path | None = None,
+    record_scientific_lineage: bool = False,
 ) -> StackPipelineResult:
     """Process an arbitrary SAFE stack via :class:`~faninsar.processing.stack.Stack`.
 
@@ -157,6 +158,10 @@ def run_stack_pipeline(
         authority root.
     activation_binding, activation_token, activation_authority_root : optional
         Required together for qualified production execution.
+    record_scientific_lineage : bool, optional
+        Persist ordered residual/carrier/phase operation records with payload
+        hashes during scene production. Disabled by default to avoid hashing
+        overhead in ordinary runs.
 
     Returns
     -------
@@ -205,6 +210,7 @@ def run_stack_pipeline(
         # The persisted IFG/unwrap/SBAS path never consumes in-memory Pair
         # states. Keeping them would scale RSS with acquisition count.
         retain_pair_states=False,
+        record_scientific_lineage=record_scientific_lineage,
     )
     if pairs is not None:
         names = [f"{a}_{b}" for a, b in pairs]

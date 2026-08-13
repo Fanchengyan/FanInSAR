@@ -20,6 +20,7 @@ from faninsar.processing.pipeline.geo_lut import (
     roi_geo_mask,
 )
 from faninsar.processing.pipeline.geo_modes import (
+    _apply_reramp,
     coregister_geocoded_slcs,
     coregister_geocoded_slcs_chunked,
 )
@@ -271,6 +272,42 @@ def test_coregister_geocoded_slcs_remaps_deramped_inputs_once() -> None:
     assert secondary.shape == lut.shape
     assert valid.all()
     assert np.allclose(reference, secondary, atol=1e-6)
+
+
+def test_geo_reramp_keeps_nonqualified_stage_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Geographic reramp does not bypass the CUDA qualification registry."""
+    from faninsar.backends import dask_gpu
+
+    client = object()
+    samples = np.ones((3, 4), dtype=np.complex64)
+
+    def fail_remote(*_args: object, **_kwargs: object) -> np.ndarray:
+        raise AssertionError
+
+    monkeypatch.setattr(dask_gpu, "should_accelerate", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(dask_gpu, "run_carrier_multiply_at_points", fail_remote)
+    result = _apply_reramp(
+        samples,
+        _carrier(),
+        np.zeros((3, 4)),
+        np.zeros((3, 4)),
+        native_height=8,
+        device="auto",
+        dask_client=client,
+    )
+    from faninsar.processing.tops.deramp import carrier_phase_at_points
+
+    phase = carrier_phase_at_points(
+        _carrier(),
+        np.zeros((3, 4)),
+        np.zeros((3, 4)),
+        centre_row=4.0,
+        dtype=np.float32,
+    )
+    expected = samples * np.exp(1j * np.asarray(phase, dtype=np.float64))
+    np.testing.assert_allclose(result, expected.astype(np.complex64))
 
 
 def test_chunked_coregistration_matches_full_result(tmp_path: Path) -> None:

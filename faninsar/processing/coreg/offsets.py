@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.tops.deramp import (
-    TOPSCarrierModel,
-    carrier_phase_at_points,
-)
+
+if TYPE_CHECKING:
+    from faninsar.processing.tops.deramp import TOPSCarrierModel
 
 logger = setup_logger(__name__)
 
@@ -454,7 +453,6 @@ def estimate_patch_amplitude_shift(
     )
 
 
-
 def resample_complex(
     samples: np.ndarray,
     *,
@@ -639,7 +637,8 @@ def resample_complex_deramped_reramp(
        work, the kernel sees a band-limited stationary signal.
     2. Apply the secondary carrier back at the **source** fractional
        coordinates ``output_index - offset`` via
-       :func:`carrier_phase_at_points` (analytical polynomial), **not** by
+       :func:`faninsar.processing.torch_kernels.carrier_phase_at_points_torch`
+       (analytical polynomial), **not** by
        interpolating an integer-grid carrier plane. The latter is what
        collapsed to 65 rad in §6 because ``map_coordinates(order=1)``
        bilinearly interpolates the ~0.17 rad/pixel azimuth carrier.
@@ -721,22 +720,24 @@ def resample_complex_deramped_reramp(
         carrier_model = secondary_carrier if output_carrier is None else output_carrier
         carrier_row = (src_row if output_carrier is None else rows) + float(row0)
         carrier_col = (src_col if output_carrier is None else cols) + float(col0)
-        phi_src = carrier_phase_at_points(
+        from faninsar.processing.torch_kernels import (
+            carrier_multiply_torch,
+            carrier_phase_at_points_torch,
+        )
+
+        phi_src = carrier_phase_at_points_torch(
             carrier_model,
             carrier_row,
             carrier_col,
             centre_row=centre_row,
-            dtype=np.float32,
+            dtype=np.float64,
+            device=device,
         )
-        cos_p = np.cos(phi_src.astype(np.float64)).astype(np.float32)
-        sin_p = np.sin(phi_src.astype(np.float64)).astype(np.float32)
-        re = tile.real.astype(np.float32, copy=False)
-        im = tile.imag.astype(np.float32, copy=False)
-        out_re = re * cos_p - im * sin_p
-        out_im = im * cos_p + re * sin_p
-        out[row_start:row_stop] = (out_re + 1j * out_im).astype(
-            sec_deramped.dtype,
-            copy=False,
+        out[row_start:row_stop] = carrier_multiply_torch(
+            tile,
+            phi_src,
+            sign=1.0,
+            device=device,
         )
 
     return out

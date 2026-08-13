@@ -106,6 +106,7 @@ class ScientificTransitionRecord(TypedDict):
     output_payload_digest: str
     metadata: str
 
+
 #: Lanczos half-width of the radar resampler (``resample_complex`` default).
 _LANCZOS_RADIUS_PX = 4
 #: Extra crop margin beyond the measured offset extent (absorbs coarse-probe
@@ -560,6 +561,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     )
     executor = str(task["executor"])
     device = str(task["device"])
+    dask_client = task.get("dask_client")
     dead_pixel_amp_threshold = float(task["dead_pixel_amp_threshold"])
     coregistration_grid = task["coregistration_grid"]
     geo_grid = task["geo_grid"]
@@ -656,7 +658,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     )
     stage_times: dict[str, float] = {}
     t0 = time.perf_counter()
-    state = stage_deramp(state, device=device)
+    state = stage_deramp(state, device=device, dask_client=dask_client)
     stage_times["deramp"] = time.perf_counter() - t0
     t0 = time.perf_counter()
     burst_work_dir: Path | None = None
@@ -683,6 +685,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         force_esd_azimuth_shift_px=force_esd_azimuth_shift_px,
         executor=executor,
         device=device,
+        dask_client=dask_client,
         coregistration_grid=coregistration_grid,
         geo_grid=geo_grid,
         geo_height_m=geo_height_m,
@@ -760,6 +763,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         goldstein_alpha=0.0,
         dead_pixel_amp_threshold=dead_pixel_amp_threshold,
         device=device,
+        dask_client=dask_client,
     )
     stage_times["interferogram"] = time.perf_counter() - t0
     t0 = time.perf_counter()
@@ -768,7 +772,11 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         state.note("FLATTEN applied to secondary geocoded SLC before IFG formation")
         stage_times["flatten"] = 0.0
     else:
-        state = stage_flatten(state, device=device)
+        state = stage_flatten(
+            state,
+            device=device,
+            dask_client=dask_client,
+        )
         stage_times["flatten"] = time.perf_counter() - t0
     ifg_full = (
         state.complex_ifg_flat
@@ -1352,6 +1360,7 @@ def stage_deramp(
     state: ProductionPairState,
     *,
     device: str = "auto",
+    dask_client: Any | None = None,
 ) -> ProductionPairState:
     """Deramp both full scenes with annotation carriers.
 
@@ -1360,9 +1369,10 @@ def stage_deramp(
     state : ProductionPairState
         Pair state with loaded reference and secondary scenes.
     device : {"auto", "cpu", "cuda", "mps"}, optional
-        Numerical device.  When resolved to an accelerator the TOPS carrier
-        multiply runs through the Torch kernels (Dask-scheduled when a GPU
-        cluster client is active); CPU keeps the reference NumPy path.
+        Numerical device. CPU and CUDA use the unified Torch carrier; MPS uses
+        the logged NumPy CPU fallback.
+    dask_client : object or None, optional
+        Explicitly trusted Dask client. Ambient clients are ignored.
 
     Returns
     -------
@@ -1370,12 +1380,11 @@ def stage_deramp(
         Updated state with deramped scenes.
 
     """
-    from faninsar.processing.torch_kernels import resolve_torch_device
+    from faninsar.backends.dask_gpu import should_accelerate
 
     reference_input = state.reference.array.samples
     secondary_input = state.secondary.array.samples
-    resolved_device = resolve_torch_device(device)
-    if resolved_device.type == "cpu":
+    if not should_accelerate(device, dask_client, kernel="carrier_multiply"):
         state.reference_deramped = deramp(
             state.reference.array.samples, state.reference.carrier
         )
@@ -1390,12 +1399,14 @@ def stage_deramp(
             state.reference.carrier,
             sign=-1.0,
             device=device,
+            client=dask_client,
         )
         state.secondary_deramped = run_carrier_multiply(
             state.secondary.array.samples,
             state.secondary.carrier,
             sign=-1.0,
             device=device,
+            client=dask_client,
         )
     # mask invalid
     state.reference_deramped = np.where(
@@ -1590,6 +1601,7 @@ def stage_coregister(
     residuals_only: bool = False,
     executor: str = "torch",
     device: str = "auto",
+    dask_client: Any | None = None,
     coregistration_grid: CoregistrationGrid = "radar",
     geo_grid: GeoGridSpec | None = None,
     geo_height_m: float = 0.0,
@@ -1642,8 +1654,11 @@ def stage_coregister(
         prepared offset field.
     executor : {"torch"}, optional
         Unified Torch Lanczos path for the final resample.
-    device : {"auto","cpu","cuda"}, optional
-        Torch device. ``"auto"`` selects CUDA, then MPS, then CPU.
+    device : {"auto","cpu","cuda","mps"}, optional
+        Numerical device. ``"auto"`` selects local CUDA or CPU; explicit MPS
+        uses the stage's logged NumPy CPU fallback where this proposal applies.
+    dask_client : object or None, optional
+        Explicitly trusted Dask client used for distributed Torch tasks.
     coregistration_grid : {"radar", "geo"}, optional
         Grid on which both aligned SLCs are produced.
     geo_grid : GeoGridSpec, optional
@@ -1851,12 +1866,17 @@ def stage_coregister(
                 azimuth_offset_px=geometry_field.azimuth_offset_px + amp_res_az,
                 order=1,
             )
-            from faninsar.processing.torch_kernels import resolve_torch_device
+            from faninsar.backends.dask_gpu import should_accelerate
 
-            if resolve_torch_device(device).type == "cuda":
+            if should_accelerate(device, dask_client, kernel="esd_azimuth_shift"):
                 from faninsar.backends.dask_gpu import run_esd_azimuth_shift
 
-                esd = run_esd_azimuth_shift(ref, pre, device=device)
+                esd = run_esd_azimuth_shift(
+                    ref,
+                    pre,
+                    device=device,
+                    client=dask_client,
+                )
             else:
                 esd = estimate_azimuth_shift_esd(ref, pre)
             esd_az = float(esd.azimuth_shift_px)
@@ -2067,6 +2087,7 @@ def stage_coregister(
             row_chunk=geo_chunk_size,
             executor=executor,
             device=device,
+            dask_client=dask_client,
             watchdog=memory_watchdog,
         )
         state.coregistration_timings_s["geo_slc_resample"] = (
@@ -2180,13 +2201,27 @@ def stage_coregister(
         phase_per_range_pixel * offsets.range_offset_px
     ).astype(np.float32)
     state.secondary_deramped = None
-    state.reference_deramped = reramp(
-        ref,
-        state.reference.carrier,
-        row0=0 if window_origin is None else window_origin[0],
-        col0=0 if window_origin is None else window_origin[1],
-        native_height=state.reference.array.samples.shape[0],
-    )
+    from faninsar.backends.dask_gpu import run_carrier_multiply, should_accelerate
+
+    if should_accelerate(device, dask_client, kernel="carrier_multiply"):
+        state.reference_deramped = run_carrier_multiply(
+            ref,
+            state.reference.carrier,
+            sign=1.0,
+            row0=0 if window_origin is None else window_origin[0],
+            col0=0 if window_origin is None else window_origin[1],
+            native_height=state.reference.array.samples.shape[0],
+            device=device,
+            client=dask_client,
+        )
+    else:
+        state.reference_deramped = reramp(
+            ref,
+            state.reference.carrier,
+            row0=0 if window_origin is None else window_origin[0],
+            col0=0 if window_origin is None else window_origin[1],
+            native_height=state.reference.array.samples.shape[0],
+        )
     state.secondary_aligned = sec_resamp
     radar_offset_digest: str | None = None
     radar_range_phase_digest: str | None = None
@@ -2234,6 +2269,7 @@ def stage_interferogram(
     goldstein_alpha: float = 0.5,
     dead_pixel_amp_threshold: float = 0.0,
     device: str = "auto",
+    dask_client: Any | None = None,
 ) -> ProductionPairState:
     """Form multilooked interferogram and apply Goldstein filter.
 
@@ -2251,9 +2287,10 @@ def stage_interferogram(
         entry point :func:`run_pair` passes 3.0 for real S1
         data; synthetic tests use the default 0.
     device : {"auto", "cpu", "cuda", "mps"}, optional
-        Numerical device.  Accelerator devices use the Torch multilook
-        interferogram kernel (and Torch Goldstein on CUDA); CPU keeps the
-        reference NumPy path.
+        Numerical device. CPU and CUDA use the unified Torch kernels; MPS uses
+        the logged NumPy CPU fallback.
+    dask_client : object or None, optional
+        Explicitly trusted Dask client used for distributed Torch tasks.
 
     """
     if state.reference_deramped is None or state.secondary_aligned is None:
@@ -2272,10 +2309,14 @@ def stage_interferogram(
     else:
         reference_lineage_input = reference_input
         secondary_lineage_input = secondary_input
-    from faninsar.processing.torch_kernels import resolve_torch_device
+    from faninsar.backends.dask_gpu import should_accelerate
 
-    resolved_device = resolve_torch_device(device)
-    if resolved_device.type == "cpu":
+    accelerated = should_accelerate(
+        device,
+        dask_client,
+        kernel="multilook_interferogram",
+    )
+    if not accelerated:
         ifg = form_interferogram(
             state.reference_deramped,
             state.secondary_aligned,
@@ -2291,6 +2332,7 @@ def stage_interferogram(
             multilook=multilook,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
             device=device,
+            client=dask_client,
         )
     state.reference_deramped = None
     state.secondary_aligned = None
@@ -2322,7 +2364,7 @@ def stage_interferogram(
     # taper still smooths). Skip the filter entirely so high-rate geometric
     # fringes stay intact for flattening.
     if goldstein_alpha > 0.0:
-        if resolved_device.type == "cuda":
+        if should_accelerate(device, dask_client, kernel="goldstein_filter"):
             from faninsar.backends.dask_gpu import run_goldstein_filter
 
             complex_ifg = run_goldstein_filter(
@@ -2330,6 +2372,7 @@ def stage_interferogram(
                 alpha=goldstein_alpha,
                 window=32,
                 device=device,
+                client=dask_client,
             )
         else:
             complex_ifg = goldstein_filter(ifg.complex_ifg, alpha=goldstein_alpha)
@@ -2360,21 +2403,32 @@ def _flatten_complex_ifg(
     complex_ifg: np.ndarray,
     topo_phase: np.ndarray,
     device: str,
+    dask_client: Any | None,
 ) -> np.ndarray:
-    """Remove a phase screen with Torch on accelerators, NumPy on CPU."""
-    from faninsar.processing.torch_kernels import resolve_torch_device
+    """Remove a phase screen with Torch on CPU/CUDA and NumPy on MPS."""
+    from faninsar.backends.dask_gpu import should_accelerate
 
-    if resolve_torch_device(device).type == "cpu":
+    if not should_accelerate(
+        device,
+        dask_client,
+        kernel="remove_topographic_phase",
+    ):
         return remove_topographic_phase(complex_ifg, topo_phase)
     from faninsar.backends.dask_gpu import run_remove_topographic_phase
 
-    return run_remove_topographic_phase(complex_ifg, topo_phase, device=device)
+    return run_remove_topographic_phase(
+        complex_ifg,
+        topo_phase,
+        device=device,
+        client=dask_client,
+    )
 
 
 def stage_flatten(
     state: ProductionPairState,
     *,
     device: str = "auto",
+    dask_client: Any | None = None,
 ) -> ProductionPairState:
     """Remove topographic phase using DEM + dual-orbit geometry.
 
@@ -2383,8 +2437,10 @@ def stage_flatten(
     state : ProductionPairState
         Pair state after interferogram formation.
     device : {"auto", "cpu", "cuda", "mps"}, optional
-        Numerical device.  Accelerator devices remove the topographic phase
-        screen with the Torch complex multiply; CPU keeps the NumPy path.
+        Numerical device. CPU and CUDA use the Torch complex multiply; MPS
+        uses the logged NumPy CPU fallback.
+    dask_client : object or None, optional
+        Explicitly trusted Dask client used for distributed Torch tasks.
 
     Returns
     -------
@@ -2472,7 +2528,12 @@ def stage_flatten(
             )
             if abs(scale) > 1e-3 and topo_valid_frac > 0.05:
                 residual_topo = (scale * topo).astype(np.float64)
-                flat = _flatten_complex_ifg(state.complex_ifg, residual_topo, device)
+                flat = _flatten_complex_ifg(
+                    state.complex_ifg,
+                    residual_topo,
+                    device,
+                    dask_client,
+                )
                 state.note(
                     f"FLATTEN residual DEM topo after range-offset "
                     f"scale={scale:.3f} model_rms={rms:.3f} "
@@ -2529,7 +2590,12 @@ def stage_flatten(
         state.complex_ifg = remove_azimuth_phase_ramp(state.complex_ifg, az_ramp)
         state.note(f"FLATTEN residual_az_ramp={az_ramp:.5f} rad/az_sample")
 
-    flat = _flatten_complex_ifg(state.complex_ifg, topo, device)
+    flat = _flatten_complex_ifg(
+        state.complex_ifg,
+        topo,
+        device,
+        dask_client,
+    )
     state.topo_phase = topo.astype(np.float32)
     # Keep invalid looks as NaN through ramp/topo multiply (0·e^{iφ}=0 would
     # otherwise repaint a solid phase=0 black edge on the burst margin).
@@ -3593,6 +3659,7 @@ def run_pair(
     control_spacing: int | None = None,
     executor: str = "torch",
     device: str = "auto",
+    dask_client: Any | None = None,
     coregistration_grid: CoregistrationGrid = "radar",
     geo_grid: GeoGridSpec | None = None,
     geo_height_m: float = 0.0,
@@ -3636,6 +3703,7 @@ def run_pair(
     control_spacing: int | None = None,
     executor: str = "torch",
     device: str = "auto",
+    dask_client: Any | None = None,
     coregistration_grid: CoregistrationGrid = "radar",
     geo_grid: GeoGridSpec | None = None,
     geo_height_m: float = 0.0,
@@ -3680,6 +3748,7 @@ def run_pair(
     control_spacing: int | None = None,
     executor: str = "torch",
     device: str = "auto",
+    dask_client: Any | None = None,
     coregistration_grid: CoregistrationGrid = "radar",
     geo_grid: GeoGridSpec | None = None,
     geo_height_m: float = 0.0,
@@ -3749,6 +3818,9 @@ def run_pair(
         Resample executor.
     device : {"auto","cpu","cuda","mps"}, optional
         Torch device.
+    dask_client : object or None, optional
+        Explicitly trusted Dask client. Distributed work is submitted only
+        through this client; ambient clients are ignored.
     coregistration_grid : {"radar", "geo"}, optional
         Coordinate grid on which the pair is coregistered. Geo requires
         geo_grid and is available for single-config runs.
@@ -3838,6 +3910,7 @@ def run_pair(
             control_spacing=control_spacing,
             executor=executor,
             device=device,
+            dask_client=dask_client,
             coregistration_grid=coregistration_grid,
             geo_grid=geo_grid,
             geo_height_m=geo_height_m,
@@ -4173,7 +4246,11 @@ def run_pair(
                     unwrap_method="snaphu",
                     record_scientific_lineage=record_scientific_lineage,
                 )
-                measure_state = stage_deramp(measure_state, device=device)
+                measure_state = stage_deramp(
+                    measure_state,
+                    device=device,
+                    dask_client=dask_client,
+                )
                 roi_window_m: tuple[int, int, int, int] | None = None
                 if roi is not None:
                     assert measure_state.reference_deramped is not None
@@ -4194,6 +4271,7 @@ def run_pair(
                     residuals_only=True,
                     executor=executor,
                     device=device,
+                    dask_client=dask_client,
                     roi_window=roi_window_m,
                 )
                 if measure_state.amplitude_residual_rg_px is not None:
@@ -4258,7 +4336,11 @@ def run_pair(
                 origin_state = state
             stage_times: dict[str, float] = {}
             t0 = time.perf_counter()
-            state = stage_deramp(state, device=device)
+            state = stage_deramp(
+                state,
+                device=device,
+                dask_client=dask_client,
+            )
             stage_times["deramp"] = time.perf_counter() - t0
             t0 = time.perf_counter()
             roi_window: tuple[int, int, int, int] | None = None
@@ -4283,6 +4365,7 @@ def run_pair(
                 prepared_geometry_field=prepared_geometry_by_tag.get(tag),
                 executor=executor,
                 device=device,
+                dask_client=dask_client,
                 roi_window=roi_window,
             )
             stage_times["coregister"] = time.perf_counter() - t0
@@ -4323,10 +4406,15 @@ def run_pair(
                 goldstein_alpha=0.0,
                 dead_pixel_amp_threshold=dead_pixel_amp_threshold,
                 device=device,
+                dask_client=dask_client,
             )
             stage_times["interferogram"] = time.perf_counter() - t0
             t0 = time.perf_counter()
-            state = stage_flatten(state, device=device)
+            state = stage_flatten(
+                state,
+                device=device,
+                dask_client=dask_client,
+            )
             stage_times["flatten"] = time.perf_counter() - t0
             ifg_full = (
                 state.complex_ifg_flat
@@ -4488,6 +4576,7 @@ def _run_pair_sweep(
     control_spacing: int | None,
     executor: str,
     device: str,
+    dask_client: Any | None,
     coregistration_grid: CoregistrationGrid,
     geo_grid: GeoGridSpec | None,
     geo_height_m: float,
@@ -4751,6 +4840,11 @@ def _run_pair_sweep(
             "scene_store_dir requires n_jobs=1 until generation publication "
             "is coordinated across workers"
         )
+    if dask_client is not None and n_jobs > 1:
+        reject_invalid_state(
+            "an explicit dask_client requires n_jobs=1; nested process workers "
+            "cannot safely share a distributed client"
+        )
 
     temporary = tempfile.TemporaryDirectory(prefix="faninsar-sweep-")
     resolved_geo_work_dir: Path | None = None
@@ -4783,6 +4877,7 @@ def _run_pair_sweep(
             misreg_rg_px=misreg_rg_px,
             executor=executor,
             device=device,
+            dask_client=dask_client,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
             coregistration_grid=coregistration_grid,
             geo_grid=geo_grid,
@@ -4862,6 +4957,7 @@ def _archive_burst_ifgs(
     amplitude_refinement_enabled: bool,
     executor: str,
     device: str,
+    dask_client: Any | None,
     dead_pixel_amp_threshold: float,
     coregistration_grid: CoregistrationGrid,
     geo_grid: GeoGridSpec | None,
@@ -5021,6 +5117,7 @@ def _archive_burst_ifgs(
                     "misreg_rg_px": float(misreg_rg_px),
                     "executor": executor,
                     "device": device,
+                    "dask_client": dask_client,
                     "dead_pixel_amp_threshold": dead_pixel_amp_threshold,
                     "coregistration_grid": coregistration_grid,
                     "geo_grid": geo_grid,

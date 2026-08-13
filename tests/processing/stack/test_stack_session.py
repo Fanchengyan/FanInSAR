@@ -293,7 +293,9 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
     np.testing.assert_array_equal(store.read().complex_ifg, np.conj(secondary))
 
 
-def test_stack_applies_multilook_before_publishing_ifg(tmp_path: Path) -> None:
+def test_stack_applies_multilook_before_publishing_ifg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Stack payload shape and bytes must match the declared multilook."""
     dates = ("20160101", "20160113")
     safe_paths = []
@@ -301,10 +303,23 @@ def test_stack_applies_multilook_before_publishing_ifg(tmp_path: Path) -> None:
         path = tmp_path / f"S1A_IW_SLC__1SDV_{date_id}T000000_{date_id}T000001.SAFE"
         path.mkdir()
         safe_paths.append(path)
+    client = object()
+    observed: dict[str, object] = {}
+    from faninsar.processing.stack import session as session_module
+
+    original_form = session_module.form_merged_scene_interferogram
+
+    def wrapped_form(*args: object, **kwargs: object) -> object:
+        observed.update(kwargs)
+        kwargs["dask_client"] = None
+        return original_form(*args, **kwargs)
+
+    monkeypatch.setattr(session_module, "form_merged_scene_interferogram", wrapped_form)
     stack = Stack.from_safes(
         safe_paths,
         work_dir=tmp_path / "out",
         activation_mode="reference",
+        dask_client=client,
     )
     stack.prepare_scenes()
 
@@ -330,6 +345,7 @@ def test_stack_applies_multilook_before_publishing_ifg(tmp_path: Path) -> None:
         stack.coreg_paths[date_id] = root.parent
 
     stack.form_interferograms(multilook=(2, 2), goldstein_alpha=0.5)
+    assert observed["dask_client"] is client
 
     from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
 
