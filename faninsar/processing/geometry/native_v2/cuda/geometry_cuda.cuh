@@ -157,7 +157,8 @@ __device__ inline double spline_six(const double* values, double fraction) {
 
 __device__ inline double sample_dem(const double* bucket, int64_t rows,
                                     int64_t columns, double row, double column,
-                                    double reference) {
+                                    double reference, bool* valid) {
+  *valid = false;
   if (!isfinite(row) || !isfinite(column)) return reference;
   const int64_t row_base = static_cast<int64_t>(floor(row));
   const int64_t column_base = static_cast<int64_t>(floor(column));
@@ -173,7 +174,9 @@ __device__ inline double sample_dem(const double* bucket, int64_t rows,
     along_columns[row_offset + 1] =
         spline_six(values, column - static_cast<double>(column_base));
   }
-  return spline_six(along_columns, row - static_cast<double>(row_base));
+  const double value = spline_six(along_columns, row - static_cast<double>(row_base));
+  *valid = isfinite(value);
+  return value;
 }
 
 inline void check_solver_scalars(int64_t max_iter, int64_t extra_iter,
@@ -195,24 +198,33 @@ std::vector<Tensor> geo2rdr_cuda_v2(
     const Tensor& height_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
     double sensing_offset_s, double azimuth_time_interval_s,
-    double starting_slant_range_m, double range_spacing_m, int64_t max_iter,
-    int64_t extra_iter, double time_tol_s, double doppler_tol_hz);
+    double starting_slant_range_m, double range_spacing_m,
+    double wavelength_m, int64_t max_iter, int64_t extra_iter,
+    double time_tol_s, double range_tolerance_m, double doppler_tolerance_hz);
 
 std::vector<Tensor> rdr2geo_tcn_cuda_v2(
-    const Tensor& target_range_m, const Tensor& height_seed_m,
-    const Tensor& satellite_position_m, const Tensor& satellite_velocity_m_s,
+    const Tensor& azimuth_index, const Tensor& range_index,
+    const Tensor& height_seed_m, const Tensor& orbit_times_s,
+    const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
+    double sensing_offset_s, double azimuth_time_interval_s,
+    double starting_slant_range_m, double range_spacing_m,
     const Tensor& dem_height_m, double dem_x_start_deg, double dem_y_start_deg,
     double dem_dx_deg, double dem_dy_deg, double reference_height_m,
-    double wavelength_m, double range_tolerance_m, double doppler_tolerance_hz,
-    int64_t max_iter, int64_t extra_iter, bool right_looking);
+    double min_height_m, double max_height_m, double wavelength_m,
+    double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
+    int64_t extra_iter, bool right_looking);
 
 /// Operation-level alias retained for the later native-v2 binding adapter.
 std::vector<Tensor> rdr2geo_cuda_v2(
-    const Tensor& target_range_m, const Tensor& height_seed_m,
-    const Tensor& satellite_position_m, const Tensor& satellite_velocity_m_s,
+    const Tensor& azimuth_index, const Tensor& range_index,
+    const Tensor& height_seed_m, const Tensor& orbit_times_s,
+    const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
+    double sensing_offset_s, double azimuth_time_interval_s,
+    double starting_slant_range_m, double range_spacing_m,
     const Tensor& dem_height_m, double dem_x_start_deg, double dem_y_start_deg,
     double dem_dx_deg, double dem_dy_deg, double reference_height_m,
-    double wavelength_m, double range_tolerance_m, double doppler_tolerance_hz,
-    int64_t max_iter, int64_t extra_iter, bool right_looking);
+    double min_height_m, double max_height_m, double wavelength_m,
+    double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
+    int64_t extra_iter, bool right_looking);
 
 }  // namespace faninsar::geometry::cuda_v2
