@@ -22,10 +22,6 @@ __global__ void geo2rdr_kernel(
   visit_counts[point] = 1;
   if (!isfinite(latitude[point]) || !isfinite(longitude[point]) ||
       !isfinite(height[point])) return;
-  iterations[point] = 0;
-  max_iter_exhausted[point] = true;
-  tolerance[point] = 1.0;
-
   double target[3];
   llh_to_ecef(latitude[point], longitude[point], height[point], target);
   const double orbit_start = orbit_times[0];
@@ -49,11 +45,14 @@ __global__ void geo2rdr_kernel(
   double residual_range = nan("");
   double decision = nan("");
   double final = nan("");
-  bool at_boundary = false;
   bool solved = false;
+  bool stopped_early = false;
   int32_t attempts = 0;
   for (int64_t iteration = 0; iteration < budget; ++iteration) {
-    if (time < orbit_start || time > orbit_end) break;
+    if (time < orbit_start || time > orbit_end) {
+      stopped_early = true;
+      break;
+    }
     hermite(orbit_times, positions, velocities, orbit_count, time, satellite,
             velocity, acceleration);
     double look[3];
@@ -66,7 +65,10 @@ __global__ void geo2rdr_kernel(
       range_squared += look[axis] * look[axis];
     }
     const double slant_range = sqrt(range_squared);
-    if (!(slant_range > 0.0) || !isfinite(slant_range)) break;
+    if (!(slant_range > 0.0) || !isfinite(slant_range)) {
+      stopped_early = true;
+      break;
+    }
     for (int axis = 0; axis < 3; ++axis) {
       const double unit_look = look[axis] / slant_range;
       doppler += velocity[axis] * unit_look;
@@ -77,7 +79,10 @@ __global__ void geo2rdr_kernel(
     const double derivative = acceleration_along_look +
         (doppler * doppler - velocity_squared) / fmax(slant_range, 1.0);
     ++attempts;
-    if (!isfinite(derivative) || fabs(derivative) < 1.0e-12) break;
+    if (!isfinite(derivative) || fabs(derivative) < 1.0e-12) {
+      stopped_early = true;
+      break;
+    }
     const double step = -doppler / derivative;
     time += step;
     if (isfinite(step) && fabs(step) < time_tolerance) {
@@ -96,45 +101,55 @@ __global__ void geo2rdr_kernel(
             final_doppler += velocity[axis] *
                 (target[axis] - satellite[axis]) / final_range;
           residual_doppler = 2.0 * final_doppler / wavelength;
-          const double rate = final_doppler;
-          // Geo2rdr has no independent range equation.  The Newton step
-          // converted through the range-rate is the final range-equivalent
-          // residual, while the Doppler residual is reported in Hz.
-          residual_range = step * rate;
+          const double final_range_index =
+              (final_range - starting_range) / range_spacing;
+          // Reconstruct the reported slant range from the final coordinates
+          // and radar model.  This is a signed metre residual, independent of
+          // the preceding Newton step.
+          residual_range = starting_range + final_range_index * range_spacing -
+                           final_range;
           decision = fmax(fabs(residual_range) / range_tolerance,
                           fabs(residual_doppler) / doppler_tolerance);
           solved = isfinite(final_doppler) && isfinite(residual_range) &&
                    fabs(residual_range) < range_tolerance &&
                    fabs(residual_doppler) < doppler_tolerance;
-          final = decision;
-          at_boundary = time <= orbit_start || time >= orbit_end;
+          final = residual_range;
         }
+      } else {
+        stopped_early = true;
       }
       if (solved) break;
     }
   }
   if (!solved) {
-    iterations[point] = attempts;
+    const bool budget_exhausted = !stopped_early && attempts >= budget;
+    if (!budget_exhausted) return;
+    iterations[point] = static_cast<int32_t>(budget);
+    max_iter_exhausted[point] = true;
+    tolerance[point] = range_tolerance;
     doppler_residual[point] = residual_doppler;
     range_residual[point] = residual_range;
-    decision_residual[point] = decision;
-    final_residual[point] = decision;
-    boundary_rechecked[point] = at_boundary;
+    decision_residual[point] = residual_range;
+    final_residual[point] = residual_range;
     return;
   }
   iterations[point] = attempts;
   max_iter_exhausted[point] = false;
+  tolerance[point] = range_tolerance;
   doppler_residual[point] = residual_doppler;
   range_residual[point] = residual_range;
-  decision_residual[point] = decision;
+  decision_residual[point] = residual_range;
   final_residual[point] = final;
-  boundary_rechecked[point] = at_boundary;
   double final_range_squared = 0.0;
   for (int axis = 0; axis < 3; ++axis) {
     const double look = target[axis] - satellite[axis];
     final_range_squared += look * look;
   }
   const double final_range = sqrt(final_range_squared);
+  const double final_range_index =
+      (final_range - starting_range) / range_spacing;
+  residual_range = starting_range + final_range_index * range_spacing -
+                   final_range;
   output_latitude[point] = latitude[point];
   output_longitude[point] = longitude[point];
   output_height[point] = height[point];
@@ -143,11 +158,13 @@ __global__ void geo2rdr_kernel(
   converged[point] = true;
   range_residual[point] = residual_range;
   doppler_residual[point] = residual_doppler;
+  decision_residual[point] = residual_range;
+  final_residual[point] = residual_range;
 }
 
 }  // namespace
 
-std::vector<Tensor> geo2rdr_cuda_v2(
+std::vector<Tensor> geo2rdr_cuda_v2_with_visit_counts(
     const Tensor& latitude_deg, const Tensor& longitude_deg,
     const Tensor& height_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -233,6 +250,41 @@ std::vector<Tensor> geo2rdr_cuda_v2(
           iterations, decision_residual, final_residual, tolerance,
           max_iter_exhausted, boundary_rechecked, range_residual,
           doppler_residual, visit_counts};
+}
+
+std::vector<Tensor> geo2rdr_cuda_v2(
+    const Tensor& latitude_deg, const Tensor& longitude_deg,
+    const Tensor& height_m, const Tensor& orbit_times_s,
+    const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
+    double sensing_offset_s, double azimuth_time_interval_s,
+    double starting_slant_range_m, double range_spacing_m, double wavelength_m,
+    int64_t max_iter, int64_t extra_iter, double time_tol_s,
+    double range_tolerance_m, double doppler_tolerance_hz) {
+  auto result = geo2rdr_cuda_v2_with_visit_counts(
+      latitude_deg, longitude_deg, height_m, orbit_times_s,
+      orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
+      azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
+      wavelength_m, max_iter, extra_iter, time_tol_s, range_tolerance_m,
+      doppler_tolerance_hz);
+  result.pop_back();
+  return result;
+}
+
+Tensor geo2rdr_cuda_v2_visit_counts(
+    const Tensor& latitude_deg, const Tensor& longitude_deg,
+    const Tensor& height_m, const Tensor& orbit_times_s,
+    const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
+    double sensing_offset_s, double azimuth_time_interval_s,
+    double starting_slant_range_m, double range_spacing_m, double wavelength_m,
+    int64_t max_iter, int64_t extra_iter, double time_tol_s,
+    double range_tolerance_m, double doppler_tolerance_hz) {
+  return geo2rdr_cuda_v2_with_visit_counts(
+             latitude_deg, longitude_deg, height_m, orbit_times_s,
+             orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
+             azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
+             wavelength_m, max_iter, extra_iter, time_tol_s, range_tolerance_m,
+             doppler_tolerance_hz)
+      .back();
 }
 
 }  // namespace faninsar::geometry::cuda_v2
