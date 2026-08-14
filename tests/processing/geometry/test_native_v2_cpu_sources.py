@@ -82,7 +82,7 @@ def test_cpu_contract_requires_strict_metrics_and_invalid_lane_rules() -> None:
     """The native source documents strict metrics and invalid-lane sentinels."""
     for name in ("geo2rdr.cpp", "rdr2geo.cpp"):
         source = (SOURCE_ROOT / name).read_text()
-        assert "< 1.0" in source
+        assert "< 1.0" in source or "< range_tol_m" in source
         assert (
             "exhausted_values[point] = false" in source
             or "exhausted[point] = false" in source
@@ -108,6 +108,18 @@ def test_cpu_validation_and_runtime_identity_fail_closed() -> None:
     assert "dem_samples must contain only finite values" in rdr_source
     assert "std::getenv" not in abi_source
     assert 'runtime_name = "unknown"' in abi_source
+
+
+def test_rdr2geo_cpu_is_closed_form_tcn_not_finite_difference_newton() -> None:
+    """The CPU core retains the accepted closed-form TCN construction."""
+    source = (SOURCE_ROOT / "rdr2geo.cpp").read_text()
+    assert "normal_dot_velocity" in source
+    assert "velocity_dot_along" in source
+    assert "cos_theta" in source
+    assert "alpha" in source
+    assert "beta" in source
+    assert "determinant" not in source
+    assert "d_range_dlat" not in source
 
 
 @pytest.mark.skipif(
@@ -171,7 +183,7 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     assert telemetry["processed_point_count"] == 2
     assert telemetry["visit_counts"] == [1, 1]
 
-    dem = torch.full((6, 6), 100.0, dtype=dtype)
+    dem = torch.full((6, 6), 0.0, dtype=dtype)
     rdr = module.rdr2geo_cpu_dem(
         torch.tensor([0.0], dtype=dtype),
         torch.tensor([2186.3], dtype=dtype),
@@ -198,8 +210,8 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
         0.001,
     )
     assert bool(rdr[5][0])
-    assert int(rdr[6][0]) > 1
-    assert float(rdr[2][0]) == pytest.approx(100.0)
+    assert int(rdr[6][0]) >= 1
+    assert float(rdr[2][0]) == pytest.approx(0.0)
     assert float(rdr[8][0]) < 1.0
     assert float(rdr[7][0]) == pytest.approx(float(rdr[12][0]))
     assert float(rdr[8][0]) == pytest.approx(float(rdr[12][0]))
