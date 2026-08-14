@@ -5,7 +5,6 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
-#include <cstdlib>
 
 #ifdef _OPENMP
 #include <omp.h>
