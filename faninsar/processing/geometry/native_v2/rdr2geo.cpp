@@ -12,6 +12,7 @@ namespace faninsar_native_v2 {
 namespace {
 
 constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
+constexpr double radians_to_degrees = 180.0 / 3.14159265358979323846;
 
 void validate_inputs(const Tensor& azimuth_index, const Tensor& range_index,
                      const Tensor& height_m, const Tensor& orbit_times_s,
@@ -269,16 +270,20 @@ std::vector<Tensor> rdr2geo_cpu(
     const double radius = eta * satellite_norm;
     const double ellipsoid_height = (1.0 - eta) * satellite_norm;
     double height = height_seed;
-    double latitude = kNan;
-    double longitude = kNan;
+    double latitude_rad = kNan;
+    double longitude_rad = kNan;
     double last_range_residual = kNan;
     double last_doppler = kNan;
     bool lane_solved = false;
-    int64_t used_iterations = 0;
+    bool early_failure = false;
+    int64_t attempts_evaluated = 0;
     for (int64_t iteration = 0; iteration < budget; ++iteration) {
-      ++used_iterations;
+      ++attempts_evaluated;
       const bool active = ellipsoid_height - height < target_range;
-      if (!active) break;
+      if (!active) {
+        early_failure = true;
+        break;
+      }
       const double semi_minor = radius + height;
       const double cos_theta = 0.5 *
           (satellite_norm / target_range + target_range / satellite_norm -
@@ -289,7 +294,10 @@ std::vector<Tensor> rdr2geo_cpu(
                            std::max(velocity_dot_along, 1.0e-12);
       const double beta_argument = (target_range * sin_theta) *
                                        (target_range * sin_theta) - alpha * alpha;
-      if (!std::isfinite(beta_argument) || beta_argument < -1.0e-6) break;
+      if (!std::isfinite(beta_argument) || beta_argument < -1.0e-6) {
+        early_failure = true;
+        break;
+      }
       const double beta = (right_looking ? 1.0 : -1.0) *
                           std::sqrt(std::max(0.0, beta_argument));
       const Vec3 target_xyz{
@@ -300,10 +308,15 @@ std::vector<Tensor> rdr2geo_cpu(
           state.position[2] + alpha * along_track[2] + beta * cross_track[2] +
               gamma * normal[2]};
       const Vec3 llh = ecef_to_llh_tcn(target_xyz);
-      if (!std::isfinite(llh[0]) || !std::isfinite(llh[1])) break;
-      latitude = llh[0];
-      longitude = llh[1];
-      const Vec3 dem_xyz = llh_to_ecef(latitude, longitude, height);
+      if (!std::isfinite(llh[0]) || !std::isfinite(llh[1])) {
+        early_failure = true;
+        break;
+      }
+      latitude_rad = llh[0];
+      longitude_rad = llh[1];
+      const double latitude_deg = latitude_rad * radians_to_degrees;
+      const double longitude_deg = longitude_rad * radians_to_degrees;
+      const Vec3 dem_xyz = llh_to_ecef(latitude_deg, longitude_deg, height);
       const double slant_range = norm(Vec3{state.position[0] - dem_xyz[0],
                                            state.position[1] - dem_xyz[1],
                                            state.position[2] - dem_xyz[2]});
@@ -323,7 +336,10 @@ std::vector<Tensor> rdr2geo_cpu(
       range_residuals[point] = last_range_residual;
       doppler_residuals[point] = last_doppler;
       const double next_height = norm(dem_xyz) - radius;
-      if (!std::isfinite(next_height)) break;
+      if (!std::isfinite(next_height)) {
+        early_failure = true;
+        break;
+      }
       height = next_height;
       if (std::abs(last_range_residual) < range_tol_m) {
         lane_solved = true;
@@ -331,7 +347,7 @@ std::vector<Tensor> rdr2geo_cpu(
       }
     }
     if (!lane_solved) {
-      if (used_iterations >= budget) {
+      if (!early_failure && attempts_evaluated >= budget) {
         exhausted_values[point] = true;
         iteration_values[point] = static_cast<int32_t>(budget);
       } else {
@@ -340,12 +356,42 @@ std::vector<Tensor> rdr2geo_cpu(
       }
       continue;
     }
-    latitudes[point] = latitude;
-    longitudes[point] = longitude;
+    const double final_latitude_deg = latitude_rad * radians_to_degrees;
+    const double final_longitude_deg = longitude_rad * radians_to_degrees;
+    const OrbitState final_state = interpolate_orbit(
+        times, positions, velocities, orbit_times_s.numel(), time_s);
+    const Vec3 final_xyz = llh_to_ecef(final_latitude_deg, final_longitude_deg, height);
+    const Vec3 final_look{final_xyz[0] - final_state.position[0],
+                          final_xyz[1] - final_state.position[1],
+                          final_xyz[2] - final_state.position[2]};
+    const double final_slant_range = norm(final_look);
+    if (!(final_slant_range > 0.0) || !std::isfinite(final_slant_range)) {
+      solved[point] = false;
+      iteration_values[point] = -1;
+      exhausted_values[point] = false;
+      continue;
+    }
+    const Vec3 final_unit{final_look[0] / final_slant_range,
+                          final_look[1] / final_slant_range,
+                          final_look[2] / final_slant_range};
+    const double final_range_residual = final_slant_range - target_range;
+    const double final_doppler =
+        2.0 * dot(final_state.velocity, final_unit) / wavelength_m;
+    range_residuals[point] = final_range_residual;
+    doppler_residuals[point] = final_doppler;
+    decisions[point] = final_range_residual;
+    finals[point] = final_range_residual;
+    if (!(std::abs(final_range_residual) < range_tol_m)) {
+      solved[point] = false;
+      iteration_values[point] = -1;
+      exhausted_values[point] = false;
+      continue;
+    }
+    latitudes[point] = final_latitude_deg;
+    longitudes[point] = final_longitude_deg;
     heights_out[point] = height;
     solved[point] = true;
-    iteration_values[point] = static_cast<int32_t>(used_iterations);
-    finals[point] = last_range_residual;
+    iteration_values[point] = static_cast<int32_t>(attempts_evaluated);
     exhausted_values[point] = false;
   }
   return {latitude, longitude, heights, ranges, azimuths, converged, iterations,

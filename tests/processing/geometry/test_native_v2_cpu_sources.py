@@ -122,6 +122,18 @@ def test_rdr2geo_cpu_is_closed_form_tcn_not_finite_difference_newton() -> None:
     assert "d_range_dlat" not in source
 
 
+def test_cpu_publishes_degree_coordinates_and_final_attempt_residuals() -> None:
+    """The native kernels publish degree coordinates and final-state metrics."""
+    rdr = (SOURCE_ROOT / "rdr2geo.cpp").read_text()
+    geo = (SOURCE_ROOT / "geo2rdr.cpp").read_text()
+    assert "radians_to_degrees" in rdr
+    assert "dem_latitude_start_deg" in rdr
+    assert "final_range_residual" in rdr
+    assert "final_doppler" in rdr
+    assert "final_metric" in geo
+    assert "attempts_evaluated >= budget" in geo
+
+
 @pytest.mark.skipif(
     os.environ.get("FANINSAR_TEST_NATIVE_V2_BUILD") != "1",
     reason="native extension build is explicitly enabled",

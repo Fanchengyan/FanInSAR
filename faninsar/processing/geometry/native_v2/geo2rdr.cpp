@@ -144,16 +144,23 @@ std::vector<Tensor> geo2rdr_cpu(
     double last_doppler = kNan;
     double last_range_residual = kNan;
     bool lane_solved = false;
-    int64_t used_iterations = 0;
+    bool early_failure = false;
+    int64_t attempts_evaluated = 0;
     for (int64_t iteration = 0; iteration < budget; ++iteration) {
-      ++used_iterations;
-      if (time_s < orbit_start || time_s > orbit_end) break;
+      if (time_s < orbit_start || time_s > orbit_end) {
+        early_failure = true;
+        break;
+      }
+      ++attempts_evaluated;
       const OrbitState state = interpolate_orbit(times, positions, velocities,
                                                  orbit_times_s.numel(), time_s);
       const Vec3 look{target[0] - state.position[0], target[1] - state.position[1],
                       target[2] - state.position[2]};
       const double range_m = norm(look);
-      if (!(range_m > 0.0) || !std::isfinite(range_m)) break;
+      if (!(range_m > 0.0) || !std::isfinite(range_m)) {
+        early_failure = true;
+        break;
+      }
       const Vec3 unit{look[0] / range_m, look[1] / range_m, look[2] / range_m};
       const double radial_velocity = dot(state.velocity, unit);
       const double doppler_hz = 2.0 * radial_velocity / wavelength_m;
@@ -163,17 +170,53 @@ std::vector<Tensor> geo2rdr_cpu(
                                 (radial_velocity * radial_velocity - velocity_squared) /
                                     std::max(range_m, 1.0);
       last_doppler = doppler_hz;
-      last_range_residual = 0.0;
+      const double current_range_index =
+          (range_m - starting_slant_range_m) / range_spacing_m;
+      last_range_residual =
+          range_m - (starting_slant_range_m + current_range_index * range_spacing_m);
       const double decision_metric = std::max(
           std::abs(last_range_residual) / range_tol_m,
           std::abs(doppler_hz) / doppler_tol_hz);
       decision[point] = decision_metric;
-      if (!std::isfinite(derivative) || std::abs(derivative) < 1.0e-12) break;
+      if (!std::isfinite(derivative) || std::abs(derivative) < 1.0e-12) {
+        early_failure = true;
+        break;
+      }
       const double step = -radial_velocity / derivative;
       time_s += step;
+      if (time_s < orbit_start || time_s > orbit_end) {
+        early_failure = true;
+        break;
+      }
       if (std::abs(step) <= time_tol_s) {
-        lane_solved = time_s >= orbit_start && time_s <= orbit_end &&
-                      decision_metric < 1.0;
+        const OrbitState final_state = interpolate_orbit(
+            times, positions, velocities, orbit_times_s.numel(), time_s);
+        const Vec3 final_look{target[0] - final_state.position[0],
+                              target[1] - final_state.position[1],
+                              target[2] - final_state.position[2]};
+        const double final_range_m = norm(final_look);
+        if (!(final_range_m > 0.0) || !std::isfinite(final_range_m)) {
+          early_failure = true;
+          break;
+        }
+        const Vec3 final_unit{final_look[0] / final_range_m,
+                              final_look[1] / final_range_m,
+                              final_look[2] / final_range_m};
+        const double final_doppler =
+            2.0 * dot(final_state.velocity, final_unit) / wavelength_m;
+        const double final_range_index =
+            (final_range_m - starting_slant_range_m) / range_spacing_m;
+        const double final_range_residual =
+            final_range_m -
+            (starting_slant_range_m + final_range_index * range_spacing_m);
+        const double final_metric = std::max(
+            std::abs(final_range_residual) / range_tol_m,
+            std::abs(final_doppler) / doppler_tol_hz);
+        last_doppler = final_doppler;
+        last_range_residual = final_range_residual;
+        decision[point] = final_metric;
+        lane_solved = final_metric < 1.0;
+        if (!lane_solved) early_failure = true;
         // Boundary ambiguity rechecks belong to the Python foundation seam;
         // this kernel performs no endpoint recheck.
         break;
@@ -181,9 +224,16 @@ std::vector<Tensor> geo2rdr_cpu(
     }
     residual_doppler[point] = last_doppler;
     residual_range[point] = last_range_residual;
-    iteration_values[point] = static_cast<int32_t>(lane_solved ? used_iterations : -1);
-    exhausted[point] = !lane_solved;
-    if (!lane_solved) continue;
+    if (!lane_solved) {
+      if (!early_failure && attempts_evaluated >= budget) {
+        iteration_values[point] = static_cast<int32_t>(budget);
+        exhausted[point] = true;
+      } else {
+        iteration_values[point] = -1;
+        exhausted[point] = false;
+      }
+      continue;
+    }
     const OrbitState state = interpolate_orbit(times, positions, velocities,
                                                orbit_times_s.numel(), time_s);
     const Vec3 look{target[0] - state.position[0], target[1] - state.position[1],
@@ -193,14 +243,23 @@ std::vector<Tensor> geo2rdr_cpu(
     const double final_doppler = 2.0 * dot(state.velocity, unit) / wavelength_m;
     ranges[point] = (range_m - starting_slant_range_m) / range_spacing_m;
     azimuths[point] = (time_s - sensing_offset_s) / azimuth_time_interval_s;
-    solved[point] = true;
     const double reconstructed_range = starting_slant_range_m +
                                        ranges[point] * range_spacing_m;
     residual_range[point] = range_m - reconstructed_range;
     residual_doppler[point] = final_doppler;
-    final[point] = std::max(
+    const double final_metric = std::max(
         std::abs(range_residuals[point]) / range_tol_m,
         std::abs(final_doppler) / doppler_tol_hz);
+    final[point] = final_metric;
+    decision[point] = final_metric;
+    if (!(final_metric < 1.0)) {
+      solved[point] = false;
+      iteration_values[point] = -1;
+      exhausted[point] = false;
+      continue;
+    }
+    solved[point] = true;
+    iteration_values[point] = static_cast<int32_t>(attempts_evaluated);
   }
   return {latitude, longitude, height, range_index, azimuth_index, converged,
           iterations, decision_residual, final_residual, tolerance,
