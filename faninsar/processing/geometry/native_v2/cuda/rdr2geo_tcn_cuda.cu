@@ -197,6 +197,9 @@ __global__ void rdr2geo_tcn_kernel(
                     target_xyz[1] * target_xyz[1] +
                     target_xyz[2] * target_xyz[2]) - radius;
     } else {
+      old_llh[0] = dem_llh[0];
+      old_llh[1] = dem_llh[1];
+      old_llh[2] = dem_llh[2];
       height = new_height;
     }
   }
