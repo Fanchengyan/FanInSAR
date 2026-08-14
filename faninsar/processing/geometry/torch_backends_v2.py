@@ -414,9 +414,14 @@ def prepare_torch_geometry(
     compiled_kernel: object | None = None
     if compile_kernel:
         try:
-            compiled_kernel = torch.compile(_probe_kernel, dynamic=False)
+            # The probe is deliberately shape-polymorphic.  The prepared
+            # adapter executes the fixed reference transform for the caller's
+            # real arrays, so a shape-specialized probe would compile again at
+            # first production use (and turn execution into a hidden prepare
+            # phase).
+            compiled_kernel = torch.compile(_probe_kernel, dynamic=True)
             sample = torch.zeros(
-                shape,
+                (1,),
                 dtype=getattr(torch, canonical_dtype.split(".")[-1]),
                 device=resolved_device,
             )
