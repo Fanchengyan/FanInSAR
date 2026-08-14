@@ -195,6 +195,30 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     assert telemetry["processed_point_count"] == 2
     assert telemetry["visit_counts"] == [1, 1]
 
+    finite_miss = module.geo2rdr_cpu(
+        torch.tensor([0.1], dtype=dtype),
+        torch.tensor([0.0], dtype=dtype),
+        torch.tensor([0.0], dtype=dtype),
+        times,
+        positions,
+        velocities,
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        0.0555,
+        2,
+        0,
+        1.0e9,
+        0.01,
+        1.0e-12,
+        True,
+    )
+    assert not bool(finite_miss[5][0])
+    assert int(finite_miss[6][0]) == 2
+    assert bool(finite_miss[10][0])
+    assert torch.isfinite(finite_miss[7][0])
+
     dem = torch.full((6, 6), 0.0, dtype=dtype)
     rdr = module.rdr2geo_cpu_dem(
         torch.tensor([0.0], dtype=dtype),

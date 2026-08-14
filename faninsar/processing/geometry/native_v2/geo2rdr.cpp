@@ -216,10 +216,10 @@ std::vector<Tensor> geo2rdr_cpu(
         last_range_residual = final_range_residual;
         decision[point] = final_metric;
         lane_solved = final_metric < 1.0;
-        if (!lane_solved) early_failure = true;
         // Boundary ambiguity rechecks belong to the Python foundation seam;
         // this kernel performs no endpoint recheck.
-        break;
+        if (lane_solved) break;
+        continue;
       }
     }
     residual_doppler[point] = last_doppler;
