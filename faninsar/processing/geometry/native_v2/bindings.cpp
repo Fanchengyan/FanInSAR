@@ -29,7 +29,27 @@ std::vector<torch::Tensor> geo2rdr_cuda_v2(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
     double, double, double, double, int64_t, int64_t, double, double, double);
+std::vector<torch::Tensor> geo2rdr_cuda_v2_with_visit_counts(
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
+    double, double, double, double, int64_t, int64_t, double, double, double);
+torch::Tensor geo2rdr_cuda_v2_visit_counts(
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
+    double, double, double, double, int64_t, int64_t, double, double, double);
 std::vector<torch::Tensor> rdr2geo_cuda_v2(
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
+    double, double, double, const torch::Tensor&, double, double, double,
+    double, double, double, double, double, double, double, int64_t, int64_t,
+    bool);
+std::vector<torch::Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
+    double, double, double, const torch::Tensor&, double, double, double,
+    double, double, double, double, double, double, double, int64_t, int64_t,
+    bool);
+torch::Tensor rdr2geo_tcn_cuda_v2_visit_counts(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
     double, double, double, const torch::Tensor&, double, double, double,
@@ -49,9 +69,8 @@ std::vector<torch::Tensor> geo2rdr_cuda_public(
       orbit_velocities, sensing_offset, azimuth_interval, starting_range,
       range_spacing, wavelength, max_iter, extra_iter, time_tolerance,
       range_tolerance, doppler_tolerance);
-  TORCH_CHECK(result.size() == 15,
-              "native CUDA geo2rdr diagnostic ABI must return 15 fields");
-  result.pop_back();
+  TORCH_CHECK(result.size() == 14,
+              "native CUDA geo2rdr public ABI must return 14 fields");
   return result;
 }
 
@@ -71,9 +90,8 @@ std::vector<torch::Tensor> rdr2geo_cuda_public(
       range_spacing, dem, dem_x_start, dem_y_start, dem_dx, dem_dy,
       reference_height, min_height, max_height, wavelength, range_tolerance,
       doppler_tolerance, max_iter, extra_iter, right_looking);
-  TORCH_CHECK(result.size() == 15,
-              "native CUDA rdr2geo diagnostic ABI must return 15 fields");
-  result.pop_back();
+  TORCH_CHECK(result.size() == 14,
+              "native CUDA rdr2geo public ABI must return 14 fields");
   return result;
 }
 
@@ -119,10 +137,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("rdr2geo_cuda", &faninsar::geometry::cuda_v2::rdr2geo_cuda_public,
              "Run the CUDA rdr2geo kernel");
   module.def("geo2rdr_cuda_diagnostic",
-             &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2,
+             &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2_with_visit_counts,
              "Run CUDA geo2rdr with qualification telemetry");
   module.def("rdr2geo_cuda_diagnostic",
-             &faninsar::geometry::cuda_v2::rdr2geo_cuda_v2,
+             &faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2_with_visit_counts,
              "Run CUDA rdr2geo with qualification telemetry");
+  module.def("geo2rdr_cuda_visit_counts",
+             &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2_visit_counts,
+             "Return CUDA geo2rdr qualification visit counts");
+  module.def("rdr2geo_cuda_visit_counts",
+             &faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2_visit_counts,
+             "Return CUDA rdr2geo qualification visit counts");
 #endif
 }
