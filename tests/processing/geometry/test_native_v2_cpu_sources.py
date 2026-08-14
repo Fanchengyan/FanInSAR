@@ -74,6 +74,8 @@ def test_native_result_binding_rejects_non_fourteen_field_abi() -> None:
     """The Python seam fails closed if an extension returns the wrong ABI."""
     with pytest.raises(ValueError, match="exactly fourteen"):
         result_from_native_outputs([np.zeros(1)] * 13, operation="rdr2geo")
+    with pytest.raises(ValueError, match="exactly fourteen"):
+        result_from_native_outputs([np.zeros(1)] * 15, operation="rdr2geo")
 
 
 def test_cpu_contract_requires_strict_metrics_and_invalid_lane_rules() -> None:
@@ -127,9 +129,7 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
         [[7_000_000.0, -10_000.0, 0.0], [7_000_000.0, 10_000.0, 0.0]],
         dtype=dtype,
     )
-    velocities = torch.tensor(
-        [[0.0, 1_000.0, 0.0], [0.0, 1_000.0, 0.0]], dtype=dtype
-    )
+    velocities = torch.tensor([[0.0, 1_000.0, 0.0], [0.0, 1_000.0, 0.0]], dtype=dtype)
     geo = module.geo2rdr_cpu(
         torch.tensor([0.0, float("nan")], dtype=dtype),
         torch.tensor([0.0, 0.0], dtype=dtype),

@@ -179,6 +179,7 @@ void begin_telemetry(int64_t point_count, const char* operation_symbol) {
 }
 
 void record_visit(int64_t index) {
+  std::lock_guard<std::mutex> lock(telemetry_mutex);
   int64_t thread_id = 0;
 #ifdef _OPENMP
   thread_id = omp_get_thread_num();
