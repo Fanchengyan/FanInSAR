@@ -451,6 +451,11 @@ def prepare_torch_geometry(
     )
     orbit_tensors = prepared_orbit_tensors(model, str(resolved_device))
     orbit_times, orbit_positions, orbit_velocities, sensing_offset_s = orbit_tensors
+    constant_dem_height = (
+        float(dem.height_m)
+        if dem is not None and type(dem).__name__ == "ConstantHeightDEM"
+        else None
+    )
 
     def kernel(*values: object) -> dict[str, object]:
         """Run the operation-specific device-resident solver."""
@@ -473,6 +478,7 @@ def prepare_torch_geometry(
                 range_tol_m=settings.range_tol_m,
                 doppler_tol_hz=settings.doppler_tol_hz,
                 dynamic_iterations=dynamic,
+                time_tol_s=settings.time_tol_s,
             )
         return rdr2geo_kernel(
             latitude_or_azimuth,
@@ -491,6 +497,7 @@ def prepare_torch_geometry(
             range_tol_m=settings.range_tol_m,
             doppler_tol_hz=settings.doppler_tol_hz,
             dynamic_iterations=dynamic,
+            dem_height_m=constant_dem_height,
         )
 
     compiled_kernel: object | None = None
