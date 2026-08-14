@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from .baseline import BaselineComponents, geometric_baseline, zero_doppler_residual_hz
+from .boundary import (
+    BoundaryDecision,
+    evaluate_canonical_boundary,
+    normalize_result_boundary,
+)
 from .dem import ConstantHeightDEM, GeoidAdjustedDEM, NetCDFGeoid, RasterDEM
 from .dem_manager import (
     DEMManager,
@@ -73,6 +78,7 @@ __all__ = [
     "WGS84_F",
     "ArraySpan",
     "BaselineComponents",
+    "BoundaryDecision",
     "CandidateKey",
     "ConstantHeightDEM",
     "DEMManager",
@@ -106,12 +112,14 @@ __all__ = [
     "copernicus_tile_name",
     "default_dem_name",
     "ecef_to_llh",
+    "evaluate_canonical_boundary",
     "geo2rdr",
     "geometric_baseline",
     "get_dem_manager",
     "interpolate_orbit",
     "llh_to_ecef",
     "local_earth_radius_m",
+    "normalize_result_boundary",
     "rdr2geo_ellipsoid",
     "rdr2geo_with_dem",
     "rdr2geo_with_dem_chunked",
