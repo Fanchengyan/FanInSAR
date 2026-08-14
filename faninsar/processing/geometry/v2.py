@@ -728,8 +728,6 @@ def validate_tensor_span(
     )
     if actual_strides != expected_strides:
         raise GeometryValidationError(f"{name} must use exact contiguous strides")
-    if require_finite and not bool(torch.isfinite(tensor).all().item()):
-        raise GeometryValidationError(f"{name} must contain only finite values")
     if tensor.device.type == "cpu":
         actual_device = DeviceKey.cpu()
     elif tensor.device.type == "cuda":
@@ -740,7 +738,7 @@ def validate_tensor_span(
             pass
         actual_device = DeviceKey.cuda(physical_uuid)
     else:
-        raise GeometryValidationError(f"{name} must use CPU or CUDA")
+        raise GeometryValidationError(f"{name} must use a CPU or CUDA device")
     if expected_device is not None:
         if actual_device.kind != expected_device.kind:
             raise GeometryValidationError(f"{name} is on the wrong device")
@@ -750,6 +748,8 @@ def validate_tensor_span(
             raise GeometryValidationError(f"{name} has the wrong physical CUDA device")
         if actual_device.mig_uuid != expected_device.mig_uuid:
             raise GeometryValidationError(f"{name} has the wrong MIG device")
+    if require_finite and not bool(torch.isfinite(tensor).all().item()):
+        raise GeometryValidationError(f"{name} must contain only finite values")
     storage = tensor.untyped_storage()
     address = int(tensor.data_ptr())
     byte_length = int(tensor.numel() * tensor.element_size())

@@ -12,7 +12,7 @@ through :class:`TransformResultV2` and the canonical boundary normalizer.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +40,7 @@ from faninsar.processing.geometry.torch_backends_v2 import (
 from faninsar.processing.geometry.v2 import (
     DeviceKey,
     ExecutionProfile,
+    GeometryValidationError,
     Operation,
     SolverSettings,
     TransformResultV2,
@@ -56,7 +57,124 @@ logger = setup_logger(__name__)
 
 BackendSelector: TypeAlias = Literal["native", "compile", "eager", "auto"]
 NativeExecutor: TypeAlias = Callable[..., object]
+NativeContextInputs: TypeAlias = Mapping[str, object]
 BoundaryCallback: TypeAlias = Callable[..., float | Sequence[float]]
+
+_COMMON_NATIVE_CONTEXT_FIELDS = (
+    "orbit_times",
+    "orbit_positions",
+    "orbit_velocities",
+    "model_parameters",
+    "look_right",
+)
+_RDR2GEO_NATIVE_CONTEXT_FIELDS = (
+    *_COMMON_NATIVE_CONTEXT_FIELDS,
+    "dem_values",
+    "dem_metadata",
+    "dem_height_bounds",
+)
+
+
+def _validate_native_context_inputs(
+    operation: Operation,
+    context: NativeContextInputs | None,
+    expected_device: DeviceKey,
+) -> tuple[object, ...]:
+    """Validate every closed-over array and return ABI argument order."""
+    if context is None:
+        raise DispatchError(
+            "native geometry requires explicit operation-specific context inputs"
+        )
+    required = (
+        _RDR2GEO_NATIVE_CONTEXT_FIELDS
+        if operation is Operation.RDR2GEO
+        else _COMMON_NATIVE_CONTEXT_FIELDS
+    )
+    missing = tuple(name for name in required if name not in context)
+    unknown = tuple(name for name in context if name not in required)
+    if missing:
+        raise DispatchError(
+            "native geometry context is missing required fields: "
+            + ", ".join(missing)
+        )
+    if unknown:
+        raise DispatchError(
+            "native geometry context contains unknown fields: "
+            + ", ".join(unknown)
+        )
+
+    expected_shapes: dict[str, tuple[int, ...] | None] = {
+        "orbit_times": None,
+        "orbit_positions": None,
+        "orbit_velocities": None,
+        "model_parameters": (5,),
+    }
+    if operation is Operation.RDR2GEO:
+        expected_shapes.update(
+            {
+                "dem_values": (6, 6),
+                "dem_metadata": (4,),
+                "dem_height_bounds": (2,),
+            }
+        )
+    validated: dict[str, object] = {}
+    torch_type = None
+    torch_module = None
+    with suppress(ImportError):
+        import torch
+
+        torch_type = torch.Tensor
+        torch_module = torch
+    for name in required:
+        value = context[name]
+        if name == "look_right":
+            if not isinstance(value, (bool, np.bool_)):
+                raise GeometryValidationError("look_right must be a boolean")
+            validated[name] = bool(value)
+            continue
+        shape = expected_shapes[name]
+        if torch_type is not None and isinstance(value, torch_type):
+            validate_tensor_span(
+                value,
+                expected_dtype=torch_module.float64,
+                expected_shape=shape,
+                expected_device=expected_device,
+                require_finite=True,
+                name=f"native context {name}",
+            )
+            validated[name] = value
+            continue
+        if not isinstance(value, np.ndarray):
+            raise GeometryValidationError(
+                f"native context {name} must be a NumPy array or Torch tensor"
+            )
+        validate_array_span(
+            value,
+            expected_dtype=np.dtype(np.float64),
+            expected_shape=shape,
+            expected_device=DeviceKey.cpu(),
+            require_finite=True,
+            name=f"native context {name}",
+        )
+        if expected_device.kind != "cpu":
+            raise GeometryValidationError(
+                f"native context {name} NumPy owner cannot prove CUDA allocation"
+            )
+        validated[name] = value
+    orbit_times = validated["orbit_times"]
+    orbit_positions = validated["orbit_positions"]
+    orbit_velocities = validated["orbit_velocities"]
+    orbit_length = int(orbit_times.shape[0])  # type: ignore[union-attr]
+    if orbit_length < 2:
+        raise GeometryValidationError("native context orbit requires two samples")
+    if (
+        tuple(orbit_positions.shape) != (orbit_length, 3)  # type: ignore[union-attr]
+        or tuple(orbit_velocities.shape) != (orbit_length, 3)  # type: ignore[union-attr]
+    ):
+        raise GeometryValidationError(
+            "native context orbit positions and velocities must have shape (N, 3)"
+        )
+    return tuple(validated[name] for name in required)
 
 
 def _device_key(
@@ -413,6 +531,7 @@ def prepare_geometry(
     settings: SolverSettings | None = None,
     native_executor: NativeExecutor | None = None,
     native_candidate: PreparedNativeCandidate | None = None,
+    native_context_inputs: NativeContextInputs | None = None,
     native_key: CandidateKey | None = None,
     native_correctness_qualified: bool = False,
     native_performance_eligible: bool = False,
@@ -529,16 +648,30 @@ def prepare_geometry(
             if native_key is not None
             else derived_key
         )
+        candidate_context = (
+            native_candidate.native_context_inputs
+            if native_candidate is not None
+            else None
+        )
+        if native_context_inputs is not None and candidate_context is not None:
+            raise DispatchError(
+                "native context must be supplied either by candidate or preparation"
+            )
+        context_inputs = native_context_inputs or candidate_context
+        _validate_native_context_inputs(op, context_inputs, profile.device)
 
         def execute_native(*args: object) -> TransformResultV2:
             """Execute and centrally validate the supplied native entry point."""
             native_inputs = _validate_public_inputs(
                 op, normalized_shape, args, profile.device
             )
+            context_values = _validate_native_context_inputs(
+                op, context_inputs, profile.device
+            )
             entry = native_executor
             if entry is None and native_candidate is not None:
                 return _native_public_result(
-                    native_candidate.dispatch(*native_inputs),
+                    native_candidate.dispatch(*native_inputs, *context_values),
                     operation=op,
                     boundary_callback=boundary_callback,
                     range_tolerance_m=solver.range_tolerance_m,
@@ -549,7 +682,7 @@ def prepare_geometry(
             if entry is None:
                 raise DispatchError("native geometry executor is missing")
             return _native_public_result(
-                entry(*native_inputs),
+                entry(*native_inputs, *context_values),
                 operation=op,
                 boundary_callback=boundary_callback,
                 range_tolerance_m=solver.range_tolerance_m,
@@ -591,6 +724,7 @@ execute_geometry_v2 = execute_geometry
 
 __all__ = [
     "BackendSelector",
+    "NativeContextInputs",
     "PreparedGeometry",
     "execute_geometry",
     "execute_geometry_v2",

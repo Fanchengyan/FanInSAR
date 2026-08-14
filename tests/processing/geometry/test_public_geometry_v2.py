@@ -49,6 +49,49 @@ def _model() -> RadarGeometryModel:
     return RadarGeometryModel.from_radar_grid(grid, orbit)
 
 
+def _native_context(
+    model: RadarGeometryModel,
+    operation: Operation,
+) -> dict[str, object]:
+    """Return explicit, owner-backed context for the native ABI fixture."""
+    times = np.asarray(model.orbit.times_s, dtype=np.float64).copy()
+    positions = np.ascontiguousarray(
+        np.stack([spline(times) for spline in model.orbit.trajectory_splines], axis=-1),
+        dtype=np.float64,
+    )
+    velocities = np.ascontiguousarray(
+        np.stack(
+            [spline(times, 1) for spline in model.orbit.trajectory_splines], axis=-1
+        ),
+        dtype=np.float64,
+    )
+    context: dict[str, object] = {
+        "orbit_times": times,
+        "orbit_positions": positions,
+        "orbit_velocities": velocities,
+        "model_parameters": np.array(
+            [
+                model.azimuth_time_interval_s,
+                model.starting_slant_range_m,
+                model.range_spacing_m,
+                model.wavelength_m,
+                (model.sensing_start - model.orbit.epoch).total_seconds(),
+            ],
+            dtype=np.float64,
+        ),
+        "look_right": model.look_direction == "right",
+    }
+    if operation is Operation.RDR2GEO:
+        context.update(
+            {
+                "dem_values": np.zeros((6, 6), dtype=np.float64),
+                "dem_metadata": np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float64),
+                "dem_height_bounds": np.array([-1000.0, 10000.0], dtype=np.float64),
+            }
+        )
+    return context
+
+
 def _native_outputs(
     model: RadarGeometryModel, values: tuple[np.ndarray, ...]
 ) -> list[np.ndarray]:
@@ -133,7 +176,8 @@ def test_public_selectors_execute_prepared_eager_and_native() -> None:
         Operation.GEO2RDR,
         model,
         shape=(1,),
-        native_executor=lambda *inputs: _native_outputs(model, inputs),
+        native_executor=lambda *inputs: _native_outputs(model, inputs[:3]),
+        native_context_inputs=_native_context(model, Operation.GEO2RDR),
         native_key=_native_key(model, (1,), Operation.GEO2RDR),
         native_correctness_qualified=True,
         native_performance_eligible=True,
@@ -156,8 +200,9 @@ def test_public_auto_requires_both_native_qualification_gates() -> None:
         model,
         shape=(1,),
         native_executor=lambda *inputs: (
-            calls.append("native") or _native_outputs(model, inputs)
+            calls.append("native") or _native_outputs(model, inputs[:3])
         ),
+        native_context_inputs=_native_context(model, Operation.GEO2RDR),
         native_key=_native_key(model, (1,), Operation.GEO2RDR),
         native_correctness_qualified=True,
         native_performance_eligible=False,

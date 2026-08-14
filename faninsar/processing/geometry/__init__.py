@@ -45,6 +45,7 @@ from .prepared_store import (
 )
 from .public import (
     BackendSelector,
+    NativeContextInputs,
     PreparedGeometry,
     execute_geometry,
     execute_geometry_v2,
@@ -97,6 +98,7 @@ __all__ = [
     "GeometryValidationError",
     "LocalPreparedGeometryProvider",
     "NativeSpan",
+    "NativeContextInputs",
     "NetCDFGeoid",
     "Operation",
     "OperationSettings",

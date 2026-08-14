@@ -11,6 +11,7 @@ from faninsar.processing.geometry import Operation, execute_geometry, prepare_ge
 from faninsar.processing.geometry.backend_dispatch import (
     CudaExecutionError,
     Dispatcher,
+    DispatchError,
 )
 from faninsar.processing.geometry.dem import ConstantHeightDEM
 from faninsar.processing.geometry.native_v2.bindings import result_from_native_outputs
@@ -33,7 +34,12 @@ from faninsar.processing.geometry.v2 import (
     validate_tensor_span,
 )
 
-from .test_public_geometry_v2 import _model, _native_key, _native_outputs
+from .test_public_geometry_v2 import (
+    _model,
+    _native_context,
+    _native_key,
+    _native_outputs,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -64,8 +70,9 @@ def test_native_callback_rejects_wrong_dtype_before_invocation() -> None:
         model,
         shape=(1,),
         native_executor=lambda *values: (
-            calls.append(1) or _native_outputs(model, values)
+            calls.append(1) or _native_outputs(model, values[:3])
         ),
+        native_context_inputs=_native_context(model, Operation.GEO2RDR),
         native_key=_native_key(model, (1,), Operation.GEO2RDR),
         native_correctness_qualified=True,
     )
@@ -204,7 +211,7 @@ def test_boundary_rejection_uses_remaining_attempt_budget() -> None:
         return (2.0, 0.0) if calls == 1 else (0.0, 0.0)
 
     def native_boundary_output(*values: np.ndarray) -> list[np.ndarray]:
-        output = _native_outputs(model, values)
+        output = _native_outputs(model, values[:3])
         output[7] = np.ones(1, dtype=np.float64)
         output[8] = np.ones(1, dtype=np.float64)
         output[9] = np.ones(1, dtype=np.float64)
@@ -219,6 +226,7 @@ def test_boundary_rejection_uses_remaining_attempt_budget() -> None:
             max_iter=3, range_tolerance_m=1.0, doppler_tolerance_hz=1.0
         ),
         native_executor=native_boundary_output,
+        native_context_inputs=_native_context(model, Operation.GEO2RDR),
         native_key=_native_key(
             model,
             (1,),
@@ -353,4 +361,105 @@ def test_native_manifest_rejects_executable_identity_difference(tmp_path: Path) 
             shape=(1,),
             native_candidate=candidate,
             native_key=_native_key(_model(), (1,), Operation.GEO2RDR),
+        )
+
+
+@pytest.mark.parametrize("operation", [Operation.GEO2RDR, Operation.RDR2GEO])
+def test_native_context_rejects_nonfinite_orbit_before_executor(
+    operation: Operation,
+) -> None:
+    """A nonfinite closed-over orbit span never reaches the native callback."""
+    model = _model()
+    context = _native_context(model, operation)
+    orbit_positions = np.asarray(context["orbit_positions"]).copy()
+    orbit_positions[0, 0] = np.nan
+    context["orbit_positions"] = orbit_positions
+    calls: list[int] = []
+    with pytest.raises(GeometryValidationError, match="finite"):
+        prepare_geometry(
+            operation,
+            model,
+            shape=(1,),
+            native_executor=lambda *_: calls.append(1),
+            native_context_inputs=context,
+            native_key=_native_key(model, (1,), operation),
+        )
+    assert calls == []
+
+
+def test_native_context_rejects_nonfinite_dem_before_executor() -> None:
+    """A nonfinite rdr2geo DEM span is rejected before callback invocation."""
+    model = _model()
+    context = _native_context(model, Operation.RDR2GEO)
+    dem_values = np.asarray(context["dem_values"]).copy()
+    dem_values[0, 0] = np.inf
+    context["dem_values"] = dem_values
+    calls: list[int] = []
+    with pytest.raises(GeometryValidationError, match="finite"):
+        prepare_geometry(
+            Operation.RDR2GEO,
+            model,
+            shape=(1,),
+            native_executor=lambda *_: calls.append(1),
+            native_context_inputs=context,
+            native_key=_native_key(model, (1,), Operation.RDR2GEO),
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("operation", [Operation.GEO2RDR, Operation.RDR2GEO])
+def test_native_context_rejects_noncontiguous_orbit_before_executor(
+    operation: Operation,
+) -> None:
+    """A strided orbit span is rejected before exposing a native pointer."""
+    model = _model()
+    context = _native_context(model, operation)
+    context["orbit_positions"] = np.asfortranarray(context["orbit_positions"])
+    calls: list[int] = []
+    with pytest.raises(GeometryValidationError, match="strides"):
+        prepare_geometry(
+            operation,
+            model,
+            shape=(1,),
+            native_executor=lambda *_: calls.append(1),
+            native_context_inputs=context,
+            native_key=_native_key(model, (1,), operation),
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("operation", [Operation.GEO2RDR, Operation.RDR2GEO])
+def test_native_context_rejects_wrong_device_before_executor(
+    operation: Operation,
+) -> None:
+    """A context tensor on an unsupported device cannot reach native code."""
+    torch = pytest.importorskip("torch")
+    model = _model()
+    context = _native_context(model, operation)
+    context["orbit_times"] = torch.empty(
+        len(context["orbit_times"]), dtype=torch.float64, device="meta"
+    )
+    calls: list[int] = []
+    with pytest.raises(GeometryValidationError, match="device"):
+        prepare_geometry(
+            operation,
+            model,
+            shape=(1,),
+            native_executor=lambda *_: calls.append(1),
+            native_context_inputs=context,
+            native_key=_native_key(model, (1,), operation),
+        )
+    assert calls == []
+
+
+def test_native_executor_requires_explicit_context_descriptors() -> None:
+    """Native callbacks cannot hide orbit/DEM ABI inputs in a closure."""
+    model = _model()
+    with pytest.raises(DispatchError, match="context"):
+        prepare_geometry(
+            Operation.GEO2RDR,
+            model,
+            shape=(1,),
+            native_executor=lambda *_: (),
+            native_key=_native_key(model, (1,), Operation.GEO2RDR),
         )

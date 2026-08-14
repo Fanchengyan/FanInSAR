@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol
 from .openmp import openmp_provider_for_platform
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 
 class NativePreparationError(RuntimeError):
@@ -102,6 +102,7 @@ class PreparedNativeCandidate:
     artifact: Path | None = None
     reason: str = ""
     _entry_point: Callable[..., object] | None = field(default=None, repr=False)
+    native_context_inputs: Mapping[str, object] | None = None
 
     def dispatch(self, *args: object, **kwargs: object) -> object:
         """Invoke the already prepared extension entry point.
