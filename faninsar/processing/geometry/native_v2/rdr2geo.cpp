@@ -50,6 +50,55 @@ Vec3 cross(const Vec3& left, const Vec3& right) {
           left[0] * right[1] - left[1] * right[0]};
 }
 
+double natural_spline_six(const double* values, double fraction) {
+  double second[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  double recurrence[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  for (int index = 1; index < 5; ++index) {
+    const double denominator = recurrence[index - 1] / 2.0 + 2.0;
+    recurrence[index] = -0.5 / denominator;
+    second[index] =
+        (3.0 * (values[index + 1] - 2.0 * values[index] + values[index - 1]) -
+         second[index - 1] / 2.0) /
+        denominator;
+  }
+  for (int index = 4; index > 0; --index) {
+    second[index] = recurrence[index] * second[index + 1] + second[index];
+  }
+  return values[1] + fraction *
+      (values[2] - values[1] - second[1] / 3.0 - second[2] / 6.0 + fraction *
+       (second[1] / 2.0 + fraction * (second[2] - second[1]) / 6.0));
+}
+
+double sample_dem_six(const Tensor& dem_samples, double latitude,
+                      double longitude, double latitude_start,
+                      double longitude_start, double latitude_spacing,
+                      double longitude_spacing) {
+  if (!std::isfinite(latitude) || !std::isfinite(longitude) ||
+      !(latitude_spacing > 0.0) || !(longitude_spacing > 0.0)) {
+    return kNan;
+  }
+  const double row = (latitude - latitude_start) / latitude_spacing;
+  const double column = (longitude - longitude_start) / longitude_spacing;
+  const int row_base = static_cast<int>(std::floor(row));
+  const int column_base = static_cast<int>(std::floor(column));
+  if (row_base < 1 || row_base > 3 || column_base < 1 || column_base > 3) {
+    return kNan;
+  }
+  const auto* samples = dem_samples.data_ptr<double>();
+  double along_rows[6]{};
+  double window[6]{};
+  const double column_fraction = column - column_base;
+  const double row_fraction = row - row_base;
+  for (int row_offset = -1; row_offset <= 4; ++row_offset) {
+    for (int column_offset = -1; column_offset <= 4; ++column_offset) {
+      window[column_offset + 1] =
+          samples[(row_base + row_offset) * 6 + column_base + column_offset];
+    }
+    along_rows[row_offset + 1] = natural_spline_six(window, column_fraction);
+  }
+  return natural_spline_six(along_rows, row_fraction);
+}
+
 }  // namespace
 
 std::vector<Tensor> rdr2geo_cpu(
@@ -96,12 +145,13 @@ std::vector<Tensor> rdr2geo_cpu(
   auto* decisions = decision_residual.data_ptr<double>();
   auto* finals = final_residual.data_ptr<double>();
   auto* exhausted_values = exhausted.data_ptr<bool>();
+  auto* boundary = boundary_rechecked.data_ptr<bool>();
   auto* range_residuals = residual_range.data_ptr<double>();
   auto* doppler_residuals = residual_doppler.data_ptr<double>();
   const int64_t budget = max_iter + extra_iter;
   const double orbit_start = times[0];
   const double orbit_end = times[orbit_times_s.numel() - 1];
-  begin_telemetry(count);
+  begin_telemetry(count, "rdr2geo_cpu");
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -112,12 +162,13 @@ std::vector<Tensor> rdr2geo_cpu(
     const double range = ranges_in[point];
     const double height = heights_in[point];
     if (!std::isfinite(azimuth) || !std::isfinite(range) || !std::isfinite(height)) {
-      exhausted_values[point] = true;
+      exhausted_values[point] = false;
       continue;
     }
     double time_s = sensing_offset_s + azimuth * azimuth_time_interval_s;
     if (time_s < orbit_start || time_s > orbit_end) {
-      exhausted_values[point] = true;
+      exhausted_values[point] = false;
+      boundary[point] = true;
       continue;
     }
     const OrbitState initial = interpolate_orbit(times, positions, velocities,
@@ -127,7 +178,7 @@ std::vector<Tensor> rdr2geo_cpu(
     const double satellite_norm = norm(initial.position);
     if (!(velocity_norm > 0.0) || !(satellite_norm > 0.0) ||
         !(target_range > 0.0)) {
-      exhausted_values[point] = true;
+      exhausted_values[point] = false;
       continue;
     }
     const Vec3 velocity_unit{initial.velocity[0] / velocity_norm,
@@ -140,7 +191,7 @@ std::vector<Tensor> rdr2geo_cpu(
                               : cross(radial, velocity_unit);
     const double look_norm = norm(look);
     if (!(look_norm > 0.0)) {
-      exhausted_values[point] = true;
+      exhausted_values[point] = false;
       continue;
     }
     look = {look[0] / look_norm, look[1] / look_norm, look[2] / look_norm};
@@ -172,8 +223,11 @@ std::vector<Tensor> rdr2geo_cpu(
       decisions[point] = last_range_residual;
       range_residuals[point] = last_range_residual;
       doppler_residuals[point] = last_doppler;
-      if (std::abs(last_range_residual) <= range_tol_m &&
-          std::abs(last_doppler) <= doppler_tol_hz) {
+      const double decision_metric = std::max(
+          std::abs(last_range_residual) / range_tol_m,
+          std::abs(last_doppler) / doppler_tol_hz);
+      decisions[point] = decision_metric;
+      if (decision_metric < 1.0) {
         lane_solved = true;
         break;
       }
@@ -221,7 +275,8 @@ std::vector<Tensor> rdr2geo_cpu(
     longitudes[point] = longitude;
     solved[point] = true;
     iteration_values[point] = static_cast<int32_t>(used_iterations);
-    finals[point] = std::max(std::abs(last_range_residual), std::abs(last_doppler));
+    finals[point] = std::max(std::abs(last_range_residual) / range_tol_m,
+                             std::abs(last_doppler) / doppler_tol_hz);
     exhausted_values[point] = false;
   }
   return {latitude, longitude, heights, ranges, azimuths, converged, iterations,
@@ -229,5 +284,61 @@ std::vector<Tensor> rdr2geo_cpu(
           boundary_rechecked, residual_range, residual_doppler};
 }
 
-}  // namespace faninsar_native_v2
+std::vector<Tensor> rdr2geo_cpu_dem(
+    const Tensor& azimuth_index, const Tensor& range_index,
+    const Tensor& height_seed_m, const Tensor& orbit_times_s,
+    const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
+    double sensing_offset_s, double azimuth_time_interval_s,
+    double starting_slant_range_m, double range_spacing_m, double wavelength_m,
+    int64_t max_iter, int64_t extra_iter, double range_tol_m,
+    double doppler_tol_hz, bool right_looking, const Tensor& dem_samples,
+    double dem_latitude_start_deg, double dem_longitude_start_deg,
+    double dem_latitude_spacing_deg, double dem_longitude_spacing_deg,
+    int64_t dem_iterations, double dem_height_tol_m) {
+  TORCH_CHECK(!dem_samples.is_cuda() &&
+                  dem_samples.scalar_type() == torch::kFloat64 &&
+                  dem_samples.is_contiguous() && dem_samples.dim() == 2 &&
+                  dem_samples.size(0) == 6 && dem_samples.size(1) == 6,
+              "dem_samples must be a contiguous CPU float64 (6, 6) array");
+  TORCH_CHECK(dem_iterations > 0 && std::isfinite(dem_height_tol_m) &&
+                  dem_height_tol_m > 0.0,
+              "DEM fixed-point settings are invalid");
+  auto heights = height_seed_m.clone();
+  std::vector<Tensor> result;
+  for (int64_t iteration = 0; iteration < dem_iterations; ++iteration) {
+    result = rdr2geo_cpu(
+        azimuth_index, range_index, heights, orbit_times_s, orbit_positions_m,
+        orbit_velocities_m_s, sensing_offset_s, azimuth_time_interval_s,
+        starting_slant_range_m, range_spacing_m, wavelength_m, max_iter,
+        extra_iter, range_tol_m, doppler_tol_hz, right_looking);
+    auto next_heights = torch::full_like(heights, kNan);
+    const auto* latitudes = result[0].data_ptr<double>();
+    const auto* longitudes = result[1].data_ptr<double>();
+    const auto* converged = result[5].data_ptr<bool>();
+    auto* next = next_heights.data_ptr<double>();
+    const int64_t count = heights.numel();
+    double maximum_update = 0.0;
+    for (int64_t index = 0; index < count; ++index) {
+      if (!converged[index]) continue;
+      next[index] = sample_dem_six(
+          dem_samples, latitudes[index], longitudes[index],
+          dem_latitude_start_deg, dem_longitude_start_deg,
+          dem_latitude_spacing_deg, dem_longitude_spacing_deg);
+      if (std::isfinite(next[index]) && std::isfinite(heights.data_ptr<double>()[index])) {
+        maximum_update = std::max(maximum_update, std::abs(next[index] -
+                                                            heights.data_ptr<double>()[index]));
+      }
+    }
+    heights = next_heights;
+    if (maximum_update < dem_height_tol_m) break;
+  }
+  result = rdr2geo_cpu(
+      azimuth_index, range_index, heights, orbit_times_s, orbit_positions_m,
+      orbit_velocities_m_s, sensing_offset_s, azimuth_time_interval_s,
+      starting_slant_range_m, range_spacing_m, wavelength_m, max_iter,
+      extra_iter, range_tol_m, doppler_tol_hz, right_looking);
+  result[2] = heights;
+  return result;
+}
 
+}  // namespace faninsar_native_v2

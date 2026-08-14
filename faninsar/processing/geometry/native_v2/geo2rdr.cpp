@@ -92,12 +92,13 @@ std::vector<Tensor> geo2rdr_cpu(
   auto* decision = decision_residual.data_ptr<double>();
   auto* final = final_residual.data_ptr<double>();
   auto* exhausted = max_iter_exhausted.data_ptr<bool>();
+  auto* boundary = boundary_rechecked.data_ptr<bool>();
   auto* range_residuals = residual_range.data_ptr<double>();
   auto* doppler_residuals = residual_doppler.data_ptr<double>();
   const int64_t budget = max_iter + extra_iter;
   const double orbit_start = times[0];
   const double orbit_end = times[orbit_times_s.numel() - 1];
-  begin_telemetry(count);
+  begin_telemetry(count, "geo2rdr_cpu");
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -106,7 +107,7 @@ std::vector<Tensor> geo2rdr_cpu(
     record_visit(point);
     if (!std::isfinite(latitudes[point]) || !std::isfinite(longitudes[point]) ||
         !std::isfinite(heights[point])) {
-      exhausted[point] = true;
+      exhausted[point] = false;
       continue;
     }
     const Vec3 target = llh_to_ecef(latitudes[point], longitudes[point], heights[point]);
@@ -137,9 +138,7 @@ std::vector<Tensor> geo2rdr_cpu(
       if (!(range_m > 0.0) || !std::isfinite(range_m)) break;
       const Vec3 unit{look[0] / range_m, look[1] / range_m, look[2] / range_m};
       const double radial_velocity = dot(state.velocity, unit);
-      // ``geo2rdr``'s eager reference publishes radial velocity here even
-      // though the field retains the historical ``*_hz`` name.
-      const double doppler_hz = radial_velocity;
+      const double doppler_hz = 2.0 * radial_velocity / wavelength_m;
       const double velocity_squared = dot(state.velocity, state.velocity);
       const double acceleration_along_look = dot(state.acceleration, unit);
       const double derivative = acceleration_along_look +
@@ -147,19 +146,24 @@ std::vector<Tensor> geo2rdr_cpu(
                                     std::max(range_m, 1.0);
       last_doppler = doppler_hz;
       last_range_residual = 0.0;
-      decision[point] = std::abs(doppler_hz);
+      const double decision_metric = std::max(
+          std::abs(last_range_residual) / range_tol_m,
+          std::abs(doppler_hz) / doppler_tol_hz);
+      decision[point] = decision_metric;
       if (!std::isfinite(derivative) || std::abs(derivative) < 1.0e-12) break;
       const double step = -radial_velocity / derivative;
       time_s += step;
       if (std::abs(step) <= time_tol_s) {
-        lane_solved = time_s >= orbit_start && time_s <= orbit_end;
+        lane_solved = time_s >= orbit_start && time_s <= orbit_end &&
+                      decision_metric < 1.0;
+        boundary[point] = !(time_s >= orbit_start && time_s <= orbit_end);
         break;
       }
     }
     residual_doppler[point] = last_doppler;
     residual_range[point] = last_range_residual;
     iteration_values[point] = static_cast<int32_t>(lane_solved ? used_iterations : -1);
-    exhausted[point] = !lane_solved;
+    exhausted[point] = !lane_solved && !boundary[point];
     if (!lane_solved) continue;
     const OrbitState state = interpolate_orbit(times, positions, velocities,
                                                orbit_times_s.numel(), time_s);
@@ -167,13 +171,13 @@ std::vector<Tensor> geo2rdr_cpu(
                     target[2] - state.position[2]};
     const double range_m = norm(look);
     const Vec3 unit{look[0] / range_m, look[1] / range_m, look[2] / range_m};
-    const double final_doppler = dot(state.velocity, unit);
+    const double final_doppler = 2.0 * dot(state.velocity, unit) / wavelength_m;
     ranges[point] = (range_m - starting_slant_range_m) / range_spacing_m;
     azimuths[point] = (time_s - sensing_offset_s) / azimuth_time_interval_s;
     solved[point] = true;
     residual_range[point] = 0.0;
     residual_doppler[point] = final_doppler;
-    final[point] = std::abs(final_doppler);
+    final[point] = std::max(0.0, std::abs(final_doppler) / doppler_tol_hz);
   }
   return {latitude, longitude, height, range_index, azimuth_index, converged,
           iterations, decision_residual, final_residual, tolerance,

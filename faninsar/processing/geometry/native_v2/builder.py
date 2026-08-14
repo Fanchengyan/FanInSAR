@@ -187,13 +187,16 @@ class NativeBuilder:
                 libomp_root=request.libomp_root,
             )
             flags = provider.flags
+            compile_flags = flags.compile_flags
+            if flags.runtime_name == "libomp":
+                compile_flags += ("-DFANINSAR_OPENMP_RUNTIME_LIBOMP",)
             return BuildPlan(
                 request.operation,
                 request.backend,
                 extension,
                 symbol,
                 sources,
-                flags.compile_flags,
+                compile_flags,
                 flags.link_flags,
                 flags.include_dirs,
                 flags.library_dirs,

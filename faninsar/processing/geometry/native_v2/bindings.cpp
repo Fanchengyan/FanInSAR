@@ -13,6 +13,11 @@ std::vector<Tensor> rdr2geo_cpu(
     const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
     const Tensor&, double, double, double, double, double, int64_t, int64_t,
     double, double, bool);
+std::vector<Tensor> rdr2geo_cpu_dem(
+    const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+    const Tensor&, double, double, double, double, double, int64_t, int64_t,
+    double, double, bool, const Tensor&, double, double, double, double,
+    int64_t, double);
 
 }  // namespace faninsar_native_v2
 #endif
@@ -42,8 +47,11 @@ pybind11::dict native_v2_telemetry() {
   pybind11::dict result;
   result["openmp_defined"] = snapshot.openmp_defined;
   result["runtime_name"] = snapshot.runtime_name;
+  result["operation_symbol"] = snapshot.operation_symbol;
+  result["processed_point_count"] = snapshot.processed_point_count;
   result["thread_ids"] = snapshot.thread_ids;
   result["visit_counts"] = snapshot.visit_counts;
+  result["observed_affinity"] = snapshot.observed_affinity;
   return result;
 }
 #endif
@@ -56,6 +64,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              "Run the OpenMP CPU geo2rdr kernel");
   module.def("rdr2geo_cpu", &faninsar_native_v2::rdr2geo_cpu,
              "Run the OpenMP CPU rdr2geo kernel");
+  module.def("rdr2geo_cpu_dem", &faninsar_native_v2::rdr2geo_cpu_dem,
+             "Run rdr2geo with a six-by-six DEM spline fixed point");
   module.def("native_v2_telemetry", &native_v2_telemetry,
              "Return exact geometry-loop OpenMP telemetry");
 #endif

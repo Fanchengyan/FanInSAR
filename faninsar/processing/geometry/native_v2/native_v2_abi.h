@@ -37,11 +37,14 @@ double norm(const Vec3& value);
 struct TelemetrySnapshot {
   bool openmp_defined;
   std::string runtime_name;
+  std::string operation_symbol;
+  int64_t processed_point_count;
   std::vector<int64_t> thread_ids;
   std::vector<int64_t> visit_counts;
+  std::vector<int64_t> observed_affinity;
 };
 
-void begin_telemetry(int64_t point_count);
+void begin_telemetry(int64_t point_count, const char* operation_symbol);
 void record_visit(int64_t index);
 TelemetrySnapshot telemetry_snapshot();
 
@@ -49,4 +52,3 @@ std::vector<Tensor> invalid_result(int64_t count, bool geo2rdr,
                                    double tolerance);
 
 }  // namespace faninsar_native_v2
-

@@ -5,9 +5,13 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <cstdlib>
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+#ifdef __linux__
+#include <sched.h>
 #endif
 
 namespace faninsar_native_v2 {
@@ -15,6 +19,8 @@ namespace {
 
 std::mutex telemetry_mutex;
 TelemetrySnapshot telemetry;
+std::vector<int64_t> thread_slots;
+std::vector<int64_t> affinity_slots;
 
 void check_float64_cpu(const Tensor& tensor, const char* name) {
   TORCH_CHECK(!tensor.is_cuda(), name, " must be a CPU tensor");
@@ -140,35 +146,68 @@ double dot(const Vec3& left, const Vec3& right) {
 
 double norm(const Vec3& value) { return std::sqrt(dot(value, value)); }
 
-void begin_telemetry(int64_t point_count) {
+void begin_telemetry(int64_t point_count, const char* operation_symbol) {
   std::lock_guard<std::mutex> lock(telemetry_mutex);
   telemetry.openmp_defined = false;
 #ifdef _OPENMP
   telemetry.openmp_defined = true;
+#if defined(FANINSAR_OPENMP_RUNTIME_LIBOMP)
+  telemetry.runtime_name = "libomp";
+#elif defined(FANINSAR_OPENMP_RUNTIME_LIBGOMP)
   telemetry.runtime_name = "libgomp";
+#else
+  telemetry.runtime_name = "openmp";
+#endif
 #else
   telemetry.runtime_name = "serial";
 #endif
+  if (const char* runtime = std::getenv("FANINSAR_OPENMP_RUNTIME");
+      runtime != nullptr && *runtime != '\0') {
+    telemetry.runtime_name = runtime;
+  }
+  telemetry.operation_symbol = operation_symbol;
+  telemetry.processed_point_count = 0;
   telemetry.thread_ids.clear();
   telemetry.visit_counts.assign(static_cast<size_t>(point_count), 0);
+#ifdef _OPENMP
+  const int64_t thread_capacity = std::max(1, omp_get_max_threads());
+#else
+  constexpr int64_t thread_capacity = 1;
+#endif
+  thread_slots.assign(static_cast<size_t>(thread_capacity), -1);
+  affinity_slots.assign(static_cast<size_t>(thread_capacity), -1);
 }
 
 void record_visit(int64_t index) {
-  std::lock_guard<std::mutex> lock(telemetry_mutex);
-  telemetry.visit_counts[static_cast<size_t>(index)] += 1;
   int64_t thread_id = 0;
 #ifdef _OPENMP
   thread_id = omp_get_thread_num();
 #endif
-  if (std::find(telemetry.thread_ids.begin(), telemetry.thread_ids.end(),
-                thread_id) == telemetry.thread_ids.end()) {
-    telemetry.thread_ids.push_back(thread_id);
-  }
+  telemetry.visit_counts[static_cast<size_t>(index)] += 1;
+  thread_slots[static_cast<size_t>(thread_id)] = thread_id;
+#ifdef __linux__
+  affinity_slots[static_cast<size_t>(thread_id)] = sched_getcpu();
+#else
+  // Apple does not expose a portable current-CPU query; retain the worker
+  // identity so qualification can still prove deterministic coverage.
+  affinity_slots[static_cast<size_t>(thread_id)] = thread_id;
+#endif
 }
 
 TelemetrySnapshot telemetry_snapshot() {
   std::lock_guard<std::mutex> lock(telemetry_mutex);
-  return telemetry;
+  TelemetrySnapshot snapshot = telemetry;
+  snapshot.processed_point_count = 0;
+  for (const int64_t count : telemetry.visit_counts) {
+    if (count > 0) ++snapshot.processed_point_count;
+  }
+  for (size_t index = 0; index < thread_slots.size(); ++index) {
+    if (thread_slots[index] >= 0) {
+      snapshot.thread_ids.push_back(thread_slots[index]);
+      snapshot.observed_affinity.push_back(affinity_slots[index]);
+    }
+  }
+  return snapshot;
 }
 
 std::vector<Tensor> invalid_result(int64_t count, bool geo2rdr,

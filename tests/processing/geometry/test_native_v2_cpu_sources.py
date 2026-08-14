@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -73,6 +74,123 @@ def test_native_result_binding_rejects_non_fourteen_field_abi() -> None:
     """The Python seam fails closed if an extension returns the wrong ABI."""
     with pytest.raises(ValueError, match="exactly fourteen"):
         result_from_native_outputs([np.zeros(1)] * 13, operation="rdr2geo")
+
+
+def test_cpu_contract_requires_strict_metrics_and_invalid_lane_rules() -> None:
+    """The native source documents strict metrics and invalid-lane sentinels."""
+    for name in ("geo2rdr.cpp", "rdr2geo.cpp"):
+        source = (SOURCE_ROOT / name).read_text()
+        assert "< 1.0" in source
+        assert (
+            "exhausted_values[point] = false" in source
+            or "exhausted[point] = false" in source
+        )
+        assert "std::numeric_limits<double>::quiet_NaN" in source
+
+
+def test_cpu_telemetry_contract_keeps_qualification_metadata_out_of_result() -> None:
+    """Operation and coverage metadata stay in telemetry, not result fields."""
+    binding = (SOURCE_ROOT / "bindings.cpp").read_text()
+    abi = (SOURCE_ROOT / "native_v2_abi.h").read_text()
+    assert "operation_symbol" in binding
+    assert "processed_point_count" in abi
+    assert "observed_affinity" in abi
+    assert "operation_symbol" not in NATIVE_RESULT_FIELDS
+
+
+@pytest.mark.skipif(
+    os.environ.get("FANINSAR_TEST_NATIVE_V2_BUILD") != "1",
+    reason="native extension build is explicitly enabled",
+)
+def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) -> None:
+    """An opt-in fixture covers invalid lanes, telemetry, and DEM fixed point."""
+    torch = pytest.importorskip("torch")
+    cpp_extension = pytest.importorskip("torch.utils.cpp_extension")
+    module = cpp_extension.load(
+        name="faninsar_native_v2_cpu_fixture",
+        sources=[
+            str(SOURCE_ROOT / name)
+            for name in (
+                "bindings.cpp",
+                "native_v2_abi.cpp",
+                "geo2rdr.cpp",
+                "rdr2geo.cpp",
+            )
+        ],
+        build_directory=str(tmp_path),
+        extra_cflags=["-O0"],
+        verbose=False,
+    )
+    dtype = torch.float64
+    times = torch.tensor([-10.0, 10.0], dtype=dtype)
+    positions = torch.tensor(
+        [[7_000_000.0, -10_000.0, 0.0], [7_000_000.0, 10_000.0, 0.0]],
+        dtype=dtype,
+    )
+    velocities = torch.tensor(
+        [[0.0, 1_000.0, 0.0], [0.0, 1_000.0, 0.0]], dtype=dtype
+    )
+    geo = module.geo2rdr_cpu(
+        torch.tensor([0.0, float("nan")], dtype=dtype),
+        torch.tensor([0.0, 0.0], dtype=dtype),
+        torch.tensor([0.0, 0.0], dtype=dtype),
+        times,
+        positions,
+        velocities,
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        0.0555,
+        20,
+        0,
+        1.0e-6,
+        0.01,
+        0.1,
+        True,
+    )
+    assert bool(geo[5][0])
+    assert int(geo[6][0]) > 0
+    assert not bool(geo[5][1])
+    assert int(geo[6][1]) == -1
+    assert not bool(geo[10][1])
+    assert float(geo[3][0]) == pytest.approx(2186.3, abs=1.0e-8)
+    assert float(geo[8][0]) < 1.0
+    telemetry = module.native_v2_telemetry()
+    assert telemetry["operation_symbol"] == "geo2rdr_cpu"
+    assert telemetry["processed_point_count"] == 2
+    assert telemetry["visit_counts"] == [1, 1]
+
+    dem = torch.full((6, 6), 100.0, dtype=dtype)
+    rdr = module.rdr2geo_cpu_dem(
+        torch.tensor([0.0], dtype=dtype),
+        torch.tensor([2186.3], dtype=dtype),
+        torch.tensor([0.0], dtype=dtype),
+        times,
+        positions,
+        velocities,
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        0.0555,
+        20,
+        0,
+        0.01,
+        0.1,
+        True,
+        dem,
+        -0.2,
+        -0.2,
+        0.1,
+        0.1,
+        4,
+        0.001,
+    )
+    assert bool(rdr[5][0])
+    assert int(rdr[6][0]) > 1
+    assert float(rdr[2][0]) == pytest.approx(100.0)
+    assert float(rdr[8][0]) < 1.0
 
 
 def test_serial_cpu_extension_returns_validated_fourteen_field_result(

@@ -41,6 +41,7 @@ class OpenMPTelemetry:
     processed_point_count: int
     visit_counts: tuple[int, ...]
     observed_affinity: tuple[int, ...] = ()
+    operation_symbol: str = ""
 
 
 @dataclass(frozen=True, slots=True)
