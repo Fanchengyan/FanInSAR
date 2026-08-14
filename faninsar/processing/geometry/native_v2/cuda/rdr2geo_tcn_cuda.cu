@@ -168,20 +168,16 @@ __global__ void rdr2geo_tcn_kernel(
     latest_range_residual = slant_range - target;
     latest_doppler_residual = 2.0 * dot / wavelength;
     ++attempts;
-    const double decision_metric =
-        fmax(fabs(latest_range_residual) / range_tolerance,
-             fabs(latest_doppler_residual) / doppler_tolerance);
     const bool now_converged =
-        isfinite(decision_metric) &&
-        fabs(latest_range_residual) < range_tolerance &&
-        fabs(latest_doppler_residual) < doppler_tolerance;
+        isfinite(latest_range_residual) &&
+        fabs(latest_range_residual) < range_tolerance;
     decision = latest_range_residual;
     if (now_converged) {
       solved = true;
       height = sampled_height;
       break;
     }
-    if (iteration >= primary_iter) {
+    if (iteration > primary_iter) {
       double old_xyz[3];
       llh_to_ecef(old_llh[1], old_llh[0], old_llh[2], old_xyz);
       for (int axis = 0; axis < 3; ++axis)
@@ -246,12 +242,9 @@ __global__ void rdr2geo_tcn_kernel(
     final_doppler += vel[axis] * final_look[axis] / final_slant_range;
   latest_range_residual = final_slant_range - target;
   latest_doppler_residual = 2.0 * final_doppler / wavelength;
-  const double final_metric =
-      fmax(fabs(latest_range_residual) / range_tolerance,
-           fabs(latest_doppler_residual) / doppler_tolerance);
   const bool final_converged =
-      isfinite(final_metric) && fabs(latest_range_residual) < range_tolerance &&
-      fabs(latest_doppler_residual) < doppler_tolerance;
+      isfinite(latest_range_residual) &&
+      fabs(latest_range_residual) < range_tolerance;
   if (!final_converged) return;
   iterations[point] = attempts;
   max_iter_exhausted[point] = false;
@@ -297,6 +290,9 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
                     orbit_times_s.numel(), device);
   check_cuda_matrix(orbit_velocities_m_s, "orbit_velocities_m_s",
                     orbit_times_s.numel(), device);
+  TORCH_CHECK(torch::isfinite(orbit_positions_m).all().item<bool>() &&
+              torch::isfinite(orbit_velocities_m_s).all().item<bool>(),
+              "orbit positions and velocities must be finite");
   TORCH_CHECK(std::isfinite(azimuth_time_interval_s) &&
               azimuth_time_interval_s > 0.0 &&
               std::isfinite(range_spacing_m) && range_spacing_m > 0.0 &&

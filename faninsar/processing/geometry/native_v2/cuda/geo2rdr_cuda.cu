@@ -113,7 +113,7 @@ __global__ void geo2rdr_kernel(
           solved = isfinite(final_doppler) && isfinite(residual_range) &&
                    fabs(residual_range) < range_tolerance &&
                    fabs(residual_doppler) < doppler_tolerance;
-          final = residual_range;
+          final = decision;
         }
       } else {
         stopped_early = true;
@@ -126,19 +126,19 @@ __global__ void geo2rdr_kernel(
     if (!budget_exhausted) return;
     iterations[point] = static_cast<int32_t>(budget);
     max_iter_exhausted[point] = true;
-    tolerance[point] = range_tolerance;
+    tolerance[point] = 1.0;
     doppler_residual[point] = residual_doppler;
     range_residual[point] = residual_range;
-    decision_residual[point] = residual_range;
-    final_residual[point] = residual_range;
+    decision_residual[point] = decision;
+    final_residual[point] = decision;
     return;
   }
   iterations[point] = attempts;
   max_iter_exhausted[point] = false;
-  tolerance[point] = range_tolerance;
+  tolerance[point] = 1.0;
   doppler_residual[point] = residual_doppler;
   range_residual[point] = residual_range;
-  decision_residual[point] = residual_range;
+  decision_residual[point] = decision;
   final_residual[point] = final;
   double final_range_squared = 0.0;
   for (int axis = 0; axis < 3; ++axis) {
@@ -150,6 +150,8 @@ __global__ void geo2rdr_kernel(
       (final_range - starting_range) / range_spacing;
   residual_range = starting_range + final_range_index * range_spacing -
                    final_range;
+  decision = fmax(fabs(residual_range) / range_tolerance,
+                  fabs(residual_doppler) / doppler_tolerance);
   output_latitude[point] = latitude[point];
   output_longitude[point] = longitude[point];
   output_height[point] = height[point];
@@ -158,8 +160,8 @@ __global__ void geo2rdr_kernel(
   converged[point] = true;
   range_residual[point] = residual_range;
   doppler_residual[point] = residual_doppler;
-  decision_residual[point] = residual_range;
-  final_residual[point] = residual_range;
+  decision_residual[point] = decision;
+  final_residual[point] = decision;
 }
 
 }  // namespace
@@ -188,6 +190,9 @@ std::vector<Tensor> geo2rdr_cuda_v2_with_visit_counts(
                     orbit_times_s.numel(), device);
   check_cuda_matrix(orbit_velocities_m_s, "orbit_velocities_m_s",
                     orbit_times_s.numel(), device);
+  TORCH_CHECK(torch::isfinite(orbit_positions_m).all().item<bool>() &&
+              torch::isfinite(orbit_velocities_m_s).all().item<bool>(),
+              "orbit positions and velocities must be finite");
   TORCH_CHECK(std::isfinite(azimuth_time_interval_s) &&
               std::isfinite(range_spacing_m) && azimuth_time_interval_s > 0.0 &&
               range_spacing_m > 0.0,

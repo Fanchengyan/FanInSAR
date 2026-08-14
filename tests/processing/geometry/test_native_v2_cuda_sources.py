@@ -43,6 +43,9 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
         assert "C10_CUDA_KERNEL_LAUNCH_CHECK" in source
     assert "wavelength_m" in geo2rdr
     assert "doppler_tolerance_hz" in geo2rdr
+    assert "orbit positions and velocities must be finite" in geo2rdr
+    assert "orbit positions and velocities must be finite" in rdr2geo
+    assert "iteration > primary_iter" in rdr2geo
     assert "pop_back" in geo2rdr
     assert "pop_back" in rdr2geo
     assert "sample_dem" in common
