@@ -57,7 +57,8 @@ __device__ inline int64_t orbit_segment(const double* times, int64_t count,
       high = middle;
     }
   }
-  return max(static_cast<int64_t>(0), min(low - 1, count - 2));
+  const int64_t upper = low - 1 < count - 2 ? low - 1 : count - 2;
+  return upper > 0 ? upper : 0;
 }
 
 __device__ inline void hermite(const double* times, const double* positions,
