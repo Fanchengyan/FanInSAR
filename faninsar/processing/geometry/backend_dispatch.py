@@ -495,6 +495,15 @@ class Dispatcher:
             logger.exception("prepared %s execution failed", candidate.key.backend)
             if getattr(candidate.key.device, "kind", None) == "cuda":
                 failure = classify_cuda_failure(error)
+                phase = getattr(error, "cuda_phase", None)
+                context_healthy = bool(getattr(error, "context_healthy", False))
+                if phase == "pre_launch" and context_healthy and failure.recoverable:
+                    raise CudaExecutionError(
+                        failure,
+                        str(error),
+                        phase="pre_launch",
+                        context_healthy=True,
+                    ) from error
                 raise CudaExecutionError(
                     failure,
                     str(error),

@@ -15,7 +15,14 @@ from faninsar.processing.geometry import (
     execute_geometry,
     prepare_geometry,
 )
+from faninsar.processing.geometry.torch_backends_v2 import prepare_torch_geometry
 from faninsar.processing.geometry.transforms import geo2rdr
+from faninsar.processing.geometry.v2 import (
+    CandidateKey,
+    DeviceKey,
+    ExecutionProfile,
+    SolverSettings,
+)
 
 
 def _model() -> RadarGeometryModel:
@@ -66,6 +73,54 @@ def _native_outputs(
     ]
 
 
+def _native_key(
+    model: RadarGeometryModel,
+    shape: tuple[int, ...],
+    operation: Operation,
+    solver: SolverSettings | None = None,
+) -> CandidateKey:
+    """Build a complete explicit native manifest for the test fixture."""
+    solver = solver or SolverSettings()
+    if (
+        operation is Operation.GEO2RDR
+        and solver.slant_range_tolerance_m != solver.range_tolerance_m
+    ):
+        solver = SolverSettings(
+            max_iter=solver.max_iter,
+            extra_iter=solver.extra_iter,
+            range_tolerance_m=solver.range_tolerance_m,
+            doppler_tolerance_hz=solver.doppler_tolerance_hz,
+            slant_range_tolerance_m=solver.range_tolerance_m,
+        )
+    prepared = prepare_torch_geometry(
+        operation,
+        model,
+        shape=shape,
+        max_iter=solver.max_iter,
+        extra_iter=solver.extra_iter,
+        range_tol_m=solver.range_tolerance_m,
+        doppler_tol_hz=solver.doppler_tolerance_hz,
+    )
+    return CandidateKey(
+        operation=operation,
+        backend="native",
+        device=DeviceKey.cpu(),
+        dtype=prepared.dtype,
+        shape=shape,
+        solver=solver,
+        orbit_digest=prepared.identity.orbit_digest,
+        dem_digest=prepared.identity.dem_digest,
+        model_digest=prepared.identity.model_digest,
+        source_digest="source-digest",
+        toolchain_digest="toolchain-digest",
+        runtime_digest="runtime-digest",
+        artifact_digest="artifact-digest",
+        abi_digest="abi-digest",
+        support_contract_digest=prepared.identity.settings_digest,
+        profile=ExecutionProfile.cpu(),
+    )
+
+
 def test_public_selectors_execute_prepared_eager_and_native() -> None:
     """Explicit selectors use prepared candidates and normalize native output."""
     model = _model()
@@ -79,6 +134,7 @@ def test_public_selectors_execute_prepared_eager_and_native() -> None:
         model,
         shape=(1,),
         native_executor=lambda *inputs: _native_outputs(model, inputs),
+        native_key=_native_key(model, (1,), Operation.GEO2RDR),
         native_correctness_qualified=True,
         native_performance_eligible=True,
     )
@@ -99,8 +155,10 @@ def test_public_auto_requires_both_native_qualification_gates() -> None:
         Operation.GEO2RDR,
         model,
         shape=(1,),
-        native_executor=lambda *inputs: calls.append("native")
-        or _native_outputs(model, inputs),
+        native_executor=lambda *inputs: (
+            calls.append("native") or _native_outputs(model, inputs)
+        ),
+        native_key=_native_key(model, (1,), Operation.GEO2RDR),
         native_correctness_qualified=True,
         native_performance_eligible=False,
     )

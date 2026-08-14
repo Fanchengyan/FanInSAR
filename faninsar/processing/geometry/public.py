@@ -44,6 +44,7 @@ from faninsar.processing.geometry.v2 import (
     SolverSettings,
     TransformResultV2,
     validate_array_span,
+    validate_tensor_span,
 )
 
 if TYPE_CHECKING:
@@ -63,22 +64,46 @@ def _device_key(
 ) -> DeviceKey:
     """Build a foundation device identity from a Torch device string."""
     if str(device).split(":", 1)[0] == "cuda":
-        return DeviceKey.cuda(physical_uuid or str(device), mig_uuid=mig_uuid)
+        if not physical_uuid:
+            raise DispatchError("CUDA geometry preparation requires a physical UUID")
+        return DeviceKey.cuda(physical_uuid, mig_uuid=mig_uuid)
     if str(device).split(":", 1)[0] != "cpu":
         raise DispatchError(f"geometry v2 only supports CPU and CUDA, got {device!r}")
     return DeviceKey.cpu()
 
 
 def _validate_public_inputs(
-    operation: Operation, shape: tuple[int, ...], inputs: tuple[object, ...]
-) -> tuple[np.ndarray, ...]:
+    operation: Operation,
+    shape: tuple[int, ...],
+    inputs: tuple[object, ...],
+    expected_device: DeviceKey,
+) -> tuple[object, ...]:
     """Validate host spans before handing arrays to a native callback."""
     if operation is Operation.RDR2GEO and len(inputs) == 2:
         inputs = (*inputs, np.zeros(shape, dtype=np.float64))
     if len(inputs) != 3:
         raise TypeError(f"{operation} expects three input arrays")
-    arrays: list[np.ndarray] = []
+    arrays: list[object] = []
+    torch_type = None
+    torch_module = None
+    try:
+        import torch
+
+        torch_type = torch.Tensor
+        torch_module = torch
+    except ImportError:
+        pass
     for index, value in enumerate(inputs):
+        if torch_type is not None and isinstance(value, torch_type):
+            validate_tensor_span(
+                value,
+                expected_dtype=torch_module.float64,
+                expected_shape=shape,
+                expected_device=expected_device,
+                name=f"geometry input {index}",
+            )
+            arrays.append(value)
+            continue
         if not isinstance(value, np.ndarray):
             raise TypeError("native geometry inputs must be NumPy arrays")
         validate_array_span(
@@ -100,6 +125,7 @@ def _native_public_result(
     range_tolerance_m: float = 0.01,
     doppler_tolerance_hz: float = 0.1,
     slant_range_tolerance_m: float = 0.01,
+    iteration_budget: int | None = None,
 ) -> TransformResultV2:
     """Convert and canonically normalize one backend result."""
     if isinstance(outputs, TransformResultV2):
@@ -116,11 +142,14 @@ def _native_public_result(
     valid = np.asarray(result.converged, dtype=bool)
     flat_valid = valid.reshape(-1)
     decisions: list[BoundaryDecision] = []
+    attempts: list[int] = []
     for index, is_valid in enumerate(flat_valid):
         if not is_valid:
             decisions.append(BoundaryDecision(False, False, float("nan"), float("nan")))
+            attempts.append(-1)
             continue
         index_tuple = np.unravel_index(index, valid.shape)
+        attempt = int(result.iterations[index_tuple])
         decision_residual = float(result.decision_residual[index_tuple])
         if operation is Operation.GEO2RDR:
             residual: float | tuple[float, float] = (
@@ -146,17 +175,31 @@ def _native_public_result(
                     np.asarray([getattr(result, name)[index_tuple]], dtype=np.float64)
                     for name in ("latitude_deg", "longitude_deg", "height_m")
                 )
-                decisions.append(
-                    evaluate_canonical_boundary(
+                decision = evaluate_canonical_boundary(
+                    operation,
+                    attempt,
+                    coords,
+                    boundary_callback,
+                    decision_residual=residual,
+                    range_tolerance_m=range_tolerance_m,
+                    doppler_tolerance_hz=doppler_tolerance_hz,
+                )
+                while (
+                    decision.boundary_rechecked
+                    and not decision.converged
+                    and attempt < (iteration_budget or attempt)
+                ):
+                    attempt += 1
+                    decision = evaluate_canonical_boundary(
                         operation,
-                        int(result.iterations[index_tuple]),
+                        attempt,
                         coords,
                         boundary_callback,
                         decision_residual=residual,
                         range_tolerance_m=range_tolerance_m,
                         doppler_tolerance_hz=doppler_tolerance_hz,
                     )
-                )
+                decisions.append(decision)
         elif boundary_callback is None:
             decisions.append(
                 BoundaryDecision(
@@ -172,17 +215,42 @@ def _native_public_result(
                 np.asarray([getattr(result, name)[index_tuple]], dtype=np.float64)
                 for name in ("latitude_deg", "longitude_deg", "height_m")
             )
-            decisions.append(
-                evaluate_canonical_boundary(
+            decision = evaluate_canonical_boundary(
+                operation,
+                attempt,
+                coords,
+                boundary_callback,
+                decision_residual=decision_residual,
+                slant_range_tolerance_m=slant_range_tolerance_m,
+            )
+            while (
+                decision.boundary_rechecked
+                and not decision.converged
+                and attempt < (iteration_budget or attempt)
+            ):
+                attempt += 1
+                decision = evaluate_canonical_boundary(
                     operation,
-                    int(result.iterations[index_tuple]),
+                    attempt,
                     coords,
                     boundary_callback,
                     decision_residual=decision_residual,
                     slant_range_tolerance_m=slant_range_tolerance_m,
                 )
-            )
-    return normalize_result_boundary(result, decisions, invalid_mask=~valid)
+            decisions.append(decision)
+        attempts.append(attempt)
+    normalized = normalize_result_boundary(result, decisions, invalid_mask=~valid)
+    if iteration_budget is None:
+        return normalized
+    fields = {name: getattr(normalized, name).copy() for name in normalized.fields}
+    flat_iterations = fields["iterations"].reshape(-1)
+    flat_exhausted = fields["max_iter_exhausted"].reshape(-1)
+    for index, decision in enumerate(decisions):
+        if attempts[index] > 0:
+            flat_iterations[index] = attempts[index]
+        if decision.boundary_rechecked and not decision.converged:
+            flat_exhausted[index] = True
+    return TransformResultV2(**dict(fields))
 
 
 _normalize_public_result = _native_public_result
@@ -203,6 +271,10 @@ def _key(
             raise DispatchError("native candidate operation does not match preparation")
         if plan.backend.value != expected_backend:
             raise DispatchError("native candidate device does not match preparation")
+        if native_candidate.artifact is None:
+            raise DispatchError(
+                "prepared native candidate requires an artifact manifest"
+            )
 
         def digest_paths(paths: Sequence[object]) -> str:
             digest = hashlib.sha256()
@@ -246,6 +318,31 @@ def _key(
         support_contract_digest=prepared.identity.settings_digest,
         profile=profile,
     )
+
+
+def _validate_native_manifest(
+    manifest: CandidateKey,
+    expected: CandidateKey,
+) -> CandidateKey:
+    """Validate an explicit native manifest against the prepared executable."""
+    if manifest.backend != "native":
+        raise DispatchError("native manifest must identify the native backend")
+    if (
+        manifest != expected
+        and manifest.scientific_identity != expected.scientific_identity
+    ):
+        raise DispatchError("native manifest does not match prepared geometry")
+    for name in (
+        "source_digest",
+        "toolchain_digest",
+        "runtime_digest",
+        "artifact_digest",
+        "abi_digest",
+        "support_contract_digest",
+    ):
+        if not getattr(manifest, name):
+            raise DispatchError(f"native manifest is missing {name}")
+    return manifest
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +405,7 @@ def prepare_geometry(
     settings: SolverSettings | None = None,
     native_executor: NativeExecutor | None = None,
     native_candidate: PreparedNativeCandidate | None = None,
+    native_key: CandidateKey | None = None,
     native_correctness_qualified: bool = False,
     native_performance_eligible: bool = False,
     compile: bool = False,
@@ -373,10 +471,11 @@ def prepare_geometry(
             range_tolerance_m=solver.range_tolerance_m,
             doppler_tolerance_hz=solver.doppler_tolerance_hz,
             slant_range_tolerance_m=solver.slant_range_tolerance_m,
+            iteration_budget=solver.budget,
         )
 
     dispatcher = Dispatcher(eager_execute)
-    native_key: CandidateKey | None = None
+    registered_native_key: CandidateKey | None = None
     compile_key: CandidateKey | None = None
     if compiled is not None:
         compile_key = _key(op, "compile", compiled, profile)
@@ -389,6 +488,7 @@ def prepare_geometry(
                 range_tolerance_m=solver.range_tolerance_m,
                 doppler_tolerance_hz=solver.doppler_tolerance_hz,
                 slant_range_tolerance_m=solver.slant_range_tolerance_m,
+                iteration_budget=solver.budget,
             ),
             correctness_qualified=compile_correctness_qualified,
             performance_eligible=compile_performance_eligible,
@@ -399,14 +499,30 @@ def prepare_geometry(
                 range_tolerance_m=solver.range_tolerance_m,
                 doppler_tolerance_hz=solver.doppler_tolerance_hz,
                 slant_range_tolerance_m=solver.slant_range_tolerance_m,
+                iteration_budget=solver.budget,
             ),
         )
     if native_executor is not None or native_candidate is not None:
-        native_key = _key(op, "native", eager, profile, native_candidate)
+        derived_key = _key(op, "native", eager, profile, native_candidate)
+        if (
+            native_executor is not None
+            and native_candidate is None
+            and native_key is None
+        ):
+            raise DispatchError(
+                "native_executor requires an explicit CandidateKey manifest"
+            )
+        registered_native_key = (
+            _validate_native_manifest(native_key, derived_key)
+            if native_key is not None
+            else derived_key
+        )
 
         def execute_native(*args: object) -> TransformResultV2:
             """Execute and centrally validate the supplied native entry point."""
-            native_inputs = _validate_public_inputs(op, normalized_shape, args)
+            native_inputs = _validate_public_inputs(
+                op, normalized_shape, args, profile.device
+            )
             entry = native_executor
             if entry is None and native_candidate is not None:
                 return _native_public_result(
@@ -416,6 +532,7 @@ def prepare_geometry(
                     range_tolerance_m=solver.range_tolerance_m,
                     doppler_tolerance_hz=solver.doppler_tolerance_hz,
                     slant_range_tolerance_m=solver.slant_range_tolerance_m,
+                    iteration_budget=solver.budget,
                 )
             if entry is None:
                 raise DispatchError("native geometry executor is missing")
@@ -426,10 +543,11 @@ def prepare_geometry(
                 range_tolerance_m=solver.range_tolerance_m,
                 doppler_tolerance_hz=solver.doppler_tolerance_hz,
                 slant_range_tolerance_m=solver.slant_range_tolerance_m,
+                iteration_budget=solver.budget,
             )
 
         dispatcher.register(
-            native_key,
+            registered_native_key,
             execute_native,
             correctness_qualified=native_correctness_qualified,
             performance_eligible=native_performance_eligible,
@@ -442,7 +560,7 @@ def prepare_geometry(
         dispatcher,
         eager.device,
         eager.dtype,
-        native_key,
+        registered_native_key,
         compile_key,
     )
 

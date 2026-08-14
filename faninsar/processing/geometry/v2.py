@@ -1,3 +1,5 @@
+# ruff: noqa: EM101, EM102, TRY003, SIM105
+
 """Public contracts for the v2 radar/geographic geometry backend.
 
 This module contains the value objects shared by preparation, native ABI
@@ -679,6 +681,93 @@ class RawSpan:
     device: DeviceKey
 
 
+@dataclass(frozen=True, slots=True)
+class RawTensorSpan:
+    """Owner-backed Torch tensor descriptor for a native call."""
+
+    owner: object
+    tensor: object
+    dtype: object
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    byte_length: int
+    address: int
+    device: DeviceKey
+
+
+def validate_tensor_span(
+    tensor: object,
+    *,
+    expected_dtype: object | None = None,
+    expected_shape: Sequence[int] | None = None,
+    expected_device: DeviceKey | None = None,
+    require_finite: bool = False,
+    name: str = "tensor",
+) -> RawTensorSpan:
+    """Validate an owner-backed Torch tensor before native pointer access."""
+    try:
+        import torch
+    except ImportError as error:  # pragma: no cover - optional dependency
+        raise GeometryValidationError("Torch is required for tensor spans") from error
+    if not isinstance(tensor, torch.Tensor):
+        raise GeometryValidationError(f"{name} must be a Torch tensor")
+    if expected_dtype is not None and tensor.dtype != expected_dtype:
+        raise GeometryValidationError(f"{name} must have dtype {expected_dtype}")
+    if expected_shape is not None and tuple(tensor.shape) != tuple(expected_shape):
+        raise GeometryValidationError(
+            f"{name} has shape {tuple(tensor.shape)}, expected {tuple(expected_shape)}"
+        )
+    if not tensor.is_contiguous():
+        raise GeometryValidationError(f"{name} must use exact contiguous strides")
+    expected_strides = tuple(
+        tensor.element_size() * int(np.prod(tensor.shape[index + 1 :]))
+        for index in range(tensor.ndim)
+    )
+    actual_strides = tuple(
+        int(value) * tensor.element_size() for value in tensor.stride()
+    )
+    if actual_strides != expected_strides:
+        raise GeometryValidationError(f"{name} must use exact contiguous strides")
+    if require_finite and not bool(torch.isfinite(tensor).all().item()):
+        raise GeometryValidationError(f"{name} must contain only finite values")
+    if tensor.device.type == "cpu":
+        actual_device = DeviceKey.cpu()
+    elif tensor.device.type == "cuda":
+        physical_uuid = str(tensor.device)
+        try:
+            physical_uuid = str(torch.cuda.get_device_properties(tensor.device).uuid)
+        except (AttributeError, RuntimeError):
+            pass
+        actual_device = DeviceKey.cuda(physical_uuid)
+    else:
+        raise GeometryValidationError(f"{name} must use CPU or CUDA")
+    if expected_device is not None:
+        if actual_device.kind != expected_device.kind:
+            raise GeometryValidationError(f"{name} is on the wrong device")
+        if expected_device.physical_uuid and (
+            actual_device.physical_uuid != expected_device.physical_uuid
+        ):
+            raise GeometryValidationError(f"{name} has the wrong physical CUDA device")
+    storage = tensor.untyped_storage()
+    address = int(tensor.data_ptr())
+    byte_length = int(tensor.numel() * tensor.element_size())
+    storage_address = int(storage.data_ptr())
+    if address < storage_address or address + byte_length > storage_address + int(
+        storage.nbytes()
+    ):
+        raise GeometryValidationError(f"{name} span is outside its owner storage")
+    return RawTensorSpan(
+        storage,
+        tensor,
+        tensor.dtype,
+        tuple(tensor.shape),
+        actual_strides,
+        byte_length,
+        address,
+        actual_device,
+    )
+
+
 def validate_array_span(
     array: np.ndarray,
     *,
@@ -863,6 +952,7 @@ __all__ = [
     "Operation",
     "OperationSettings",
     "RawSpan",
+    "RawTensorSpan",
     "SolverSettings",
     "TransformResultV2",
     "validate_array_span",
@@ -870,4 +960,5 @@ __all__ = [
     "validate_native_spans",
     "validate_span",
     "validate_spans",
+    "validate_tensor_span",
 ]

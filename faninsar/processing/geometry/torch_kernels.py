@@ -115,7 +115,8 @@ def geo2rdr_kernel(
     range_spacing_m: float,
     wavelength_m: float,
     max_iter: int,
-    time_tol_s: float,
+    range_tol_m: float,
+    doppler_tol_hz: float,
     dynamic_iterations: bool,
 ) -> dict[str, Any]:
     """Solve geo2rdr with a masked, per-lane Newton loop on Torch."""
@@ -138,7 +139,7 @@ def geo2rdr_kernel(
     solved = torch.zeros_like(finite)
     iterations = torch.zeros_like(latitude, dtype=torch.int32)
     doppler = torch.full_like(latitude, torch.nan)
-    slant = torch.full_like(latitude, torch.nan)
+    range_residual = torch.full_like(latitude, torch.nan)
     for attempt in range(1, max_iter + 1):
         sat, velocity = _orbit_state(
             times, orbit_times, orbit_positions, orbit_velocities
@@ -166,17 +167,41 @@ def geo2rdr_kernel(
         )
         active = finite & ~solved
         next_times = torch.where(active, times + step, times)
-        newly = active & (torch.abs(step) < time_tol_s)
+        final_sat, final_velocity = _orbit_state(
+            next_times, orbit_times, orbit_positions, orbit_velocities
+        )
+        final_look = target - final_sat
+        final_distance = torch.linalg.vector_norm(final_look, dim=-1)
+        final_unit = final_look / torch.clamp(final_distance, min=1.0e-12).unsqueeze(-1)
+        final_doppler = (
+            2.0 * torch.sum(final_velocity * final_unit, dim=-1) / wavelength_m
+        )
+        final_range_index = (final_distance - starting_range_m) / range_spacing_m
+        final_range = starting_range_m + final_range_index * range_spacing_m
+        final_range_residual = final_distance - final_range
+        metric = torch.maximum(
+            torch.abs(final_range_residual) / range_tol_m,
+            torch.abs(final_doppler) / doppler_tol_hz,
+        )
+        newly = active & torch.isfinite(metric) & (metric < 1.0)
         solved |= newly
         iterations = torch.where(
             active, torch.full_like(iterations, attempt), iterations
         )
         times = next_times
-        doppler = torch.where(active, current, doppler)
-        slant = torch.where(active, distance, slant)
+        doppler = torch.where(active, final_doppler, doppler)
+        range_residual = torch.where(active, final_range_residual, range_residual)
         if dynamic_iterations and bool(torch.all(solved | ~finite).item()):
             break
-    range_index = (slant - starting_range_m) / range_spacing_m
+    final_sat, final_velocity = _orbit_state(
+        times, orbit_times, orbit_positions, orbit_velocities
+    )
+    final_look = target - final_sat
+    final_distance = torch.linalg.vector_norm(final_look, dim=-1)
+    final_unit = final_look / torch.clamp(final_distance, min=1.0e-12).unsqueeze(-1)
+    doppler = 2.0 * torch.sum(final_velocity * final_unit, dim=-1) / wavelength_m
+    range_index = (final_distance - starting_range_m) / range_spacing_m
+    range_residual = final_distance - (starting_range_m + range_index * range_spacing_m)
     azimuth_index = (times - sensing_offset_s) / azimuth_interval_s
     output = {
         "latitude_deg": latitude,
@@ -186,7 +211,7 @@ def geo2rdr_kernel(
         "azimuth_index": azimuth_index,
         "converged": solved,
         "iterations": iterations,
-        "residual_range_m": torch.zeros_like(range_index),
+        "residual_range_m": range_residual,
         "residual_doppler_hz": doppler,
     }
     return _result_invalid(output, finite)
@@ -285,6 +310,16 @@ def rdr2geo_kernel(
         if dynamic_iterations and bool(torch.all(solved | ~finite).item()):
             break
     point = _llh_to_ecef(lat, lon, height)
+    final_look = point - sat
+    final_distance = torch.linalg.vector_norm(final_look, dim=-1)
+    final_unit = final_look / torch.clamp(final_distance, min=1.0e-12).unsqueeze(-1)
+    range_residual = final_distance - target_range
+    doppler_residual = 2.0 * torch.sum(velocity * final_unit, dim=-1) / wavelength_m
+    final_metric = torch.maximum(
+        torch.abs(range_residual) / range_tol_m,
+        torch.abs(doppler_residual) / doppler_tol_hz,
+    )
+    solved |= finite & torch.isfinite(final_metric) & (final_metric < 1.0)
     output = {
         "latitude_deg": lat,
         "longitude_deg": lon,

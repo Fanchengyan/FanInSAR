@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from datetime import datetime
 from typing import TYPE_CHECKING, TypeAlias
 
@@ -97,45 +98,50 @@ def _model_digests(model: RadarGeometryModel) -> tuple[str, str]:
     return model_digest, orbit_digest
 
 
-def _dem_digest(dem: object | None) -> str:
-    """Digest DEM metadata and materialized samples where available."""
-    if dem is None:
-        return _digest("none")
+def _dem_payload(dem: object, seen: set[int]) -> dict[str, object]:
+    """Return recursive DEM metadata and materialized values."""
+    if id(dem) in seen:
+        return {"cycle": f"{type(dem).__module__}.{type(dem).__qualname__}"}
+    seen.add(id(dem))
     values: dict[str, object] = {
         "type": f"{type(dem).__module__}.{type(dem).__qualname__}"
     }
-    for name in (
-        "height_m",
-        "values",
-        "data",
-        "x_start_deg",
-        "y_start_deg",
-        "dx_deg",
-        "dy_deg",
-        "bounds",
-        "extent",
-        "reference_height_m",
-        "nodata",
-        "interpolation",
-        "look_direction",
-    ):
-        if not hasattr(dem, name):
+    try:
+        names = {
+            field.name
+            for field in dataclass_fields(dem)
+            if not field.name.startswith("_")
+        }
+    except TypeError:
+        names = set()
+    names.update(
+        name
+        for name in (
+            "height_m",
+            "values",
+            "data",
+            "path",
+            "source",
+            "nodata",
+            "interpolation",
+        )
+        if hasattr(dem, name)
+    )
+    for name in sorted(names):
+        value = getattr(dem, name, None)
+        if value is dem:
             continue
-        value = getattr(dem, name)
-        if isinstance(value, (np.ndarray, list, tuple)) and name in {
+        if name in {"orthometric_dem", "geoid", "dem", "sampler", "inner"}:
+            if value is not None:
+                values[name] = _dem_payload(value, seen)
+        elif isinstance(value, (np.ndarray, list, tuple)) and name in {
             "height_m",
             "values",
             "data",
         }:
             values[name] = _array_digest(np.asarray(value))
-        else:
-            values[name] = str(value) if name == "path" else value
-    for name in ("path", "source"):
-        if hasattr(dem, name):
-            value = getattr(dem, name)
-            # A path is only a locator; digest materialized values when the
-            # sampler exposes them and retain the locator only as provenance.
-            values[name] = str(value)
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            values[name] = str(value) if name in {"path", "source"} else value
     materialized = getattr(dem, "_height_array", None)
     if materialized is None and hasattr(dem, "_open"):
         try:
@@ -144,13 +150,21 @@ def _dem_digest(dem: object | None) -> str:
             materialized = None
     if materialized is not None:
         values["materialized_height"] = _array_digest(np.asarray(materialized))
-    transform = getattr(getattr(dem, "_dataset", None), "transform", None)
-    bounds = getattr(getattr(dem, "_dataset", None), "bounds", None)
+    dataset = getattr(dem, "_dataset", None)
+    transform = getattr(dataset, "transform", None)
+    bounds = getattr(dataset, "bounds", None)
     if transform is not None:
         values["origin_spacing"] = tuple(float(value) for value in transform[:6])
     if bounds is not None:
         values["bounds"] = tuple(float(value) for value in bounds)
-    return _digest(values)
+    return values
+
+
+def _dem_digest(dem: object | None) -> str:
+    """Digest nested DEM metadata and materialized samples."""
+    if dem is None:
+        return _digest("none")
+    return _digest(_dem_payload(dem, set()))
 
 
 def _resolve_device(device: str | torch.device) -> torch.device:
@@ -453,7 +467,8 @@ def prepare_torch_geometry(
                 range_spacing_m=model.range_spacing_m,
                 wavelength_m=model.wavelength_m,
                 max_iter=settings.max_iter + settings.extra_iter,
-                time_tol_s=settings.time_tol_s,
+                range_tol_m=settings.range_tol_m,
+                doppler_tol_hz=settings.doppler_tol_hz,
                 dynamic_iterations=dynamic,
             )
         return rdr2geo_kernel(
