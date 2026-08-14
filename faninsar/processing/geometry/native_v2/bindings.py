@@ -66,19 +66,12 @@ def result_from_native_outputs(
         if callable(detach):
             candidate = detach().cpu().numpy()
         fields[name] = np.array(candidate, copy=True)
-    fields["iterations"] = np.asarray(fields["iterations"], dtype=np.int32)
-    for name in (
-        "converged",
-        "max_iter_exhausted",
-        "boundary_rechecked",
-    ):
-        fields[name] = np.asarray(fields[name], dtype=bool)
-    for name in NATIVE_RESULT_FIELDS:
-        if name not in {
-            "iterations",
-            "converged",
-            "max_iter_exhausted",
-            "boundary_rechecked",
-        }:
-            fields[name] = np.asarray(fields[name], dtype=np.float64)
-    return TransformResultV2.from_arrays(fields, operation=operation)
+    # Do not coerce ABI dtypes here.  The central result contract must reject
+    # an extension that silently changes its field types; native CPU/CUDA
+    # kernels are responsible for publishing float64/int32/bool fields.
+    invalid_mask = ~np.asarray(fields["converged"], dtype=bool)
+    return TransformResultV2.from_arrays(
+        fields,
+        operation=operation,
+        invalid_mask=invalid_mask,
+    )

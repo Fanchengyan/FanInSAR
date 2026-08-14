@@ -43,6 +43,14 @@ from .prepared_store import (
     PreparedGenerationRecord,
     PreparedGenerationStore,
 )
+from .public import (
+    BackendSelector,
+    PreparedGeometry,
+    execute_geometry,
+    execute_geometry_v2,
+    prepare_geometry,
+    prepare_geometry_v2,
+)
 from .transforms import (
     RadarGeometryModel,
     TransformResult,
@@ -77,6 +85,7 @@ __all__ = [
     "WGS84_E2",
     "WGS84_F",
     "ArraySpan",
+    "BackendSelector",
     "BaselineComponents",
     "BoundaryDecision",
     "CandidateKey",
@@ -98,6 +107,7 @@ __all__ = [
     "PreparedGenerationReader",
     "PreparedGenerationRecord",
     "PreparedGenerationStore",
+    "PreparedGeometry",
     "PreparedGeometryArrayPayload",
     "PreparedLutArrayPayload",
     "PreparedScenePayload",
@@ -113,6 +123,8 @@ __all__ = [
     "default_dem_name",
     "ecef_to_llh",
     "evaluate_canonical_boundary",
+    "execute_geometry",
+    "execute_geometry_v2",
     "geo2rdr",
     "geometric_baseline",
     "get_dem_manager",
@@ -120,6 +132,8 @@ __all__ = [
     "llh_to_ecef",
     "local_earth_radius_m",
     "normalize_result_boundary",
+    "prepare_geometry",
+    "prepare_geometry_v2",
     "rdr2geo_ellipsoid",
     "rdr2geo_with_dem",
     "rdr2geo_with_dem_chunked",

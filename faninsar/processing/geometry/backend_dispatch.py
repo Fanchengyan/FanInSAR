@@ -256,7 +256,9 @@ def _candidate_budget(key: CandidateKeyProtocol) -> int:
     return int(max_iter) + int(extra_iter)
 
 
-def _call_eager(executor: object, key: CandidateKeyProtocol) -> object:
+def _call_eager(
+    executor: object, key: CandidateKeyProtocol, *args: object, **kwargs: object
+) -> object:
     """Invoke a no-argument or key-aware eager callback without masking errors."""
     if not callable(executor):
         logger.error("no eager executor is available for device %r", key.device)
@@ -264,7 +266,7 @@ def _call_eager(executor: object, key: CandidateKeyProtocol) -> object:
     try:
         signature = inspect.signature(executor)
     except (TypeError, ValueError):
-        return executor()  # type: ignore[call-arg]
+        return executor(*args, **kwargs)  # type: ignore[call-arg]
     required = [
         parameter
         for parameter in signature.parameters.values()
@@ -272,6 +274,8 @@ def _call_eager(executor: object, key: CandidateKeyProtocol) -> object:
         and parameter.kind
         in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
     ]
+    if args or kwargs:
+        return executor(*args, **kwargs)  # type: ignore[call-arg]
     if required:
         return executor(key)  # type: ignore[call-arg]
     return executor()  # type: ignore[call-arg]
@@ -385,6 +389,8 @@ class Dispatcher:
         self,
         key: CandidateKeyProtocol,
         mode: DispatchMode = "auto",
+        *args: object,
+        **kwargs: object,
     ) -> object:
         """Execute an exact prepared candidate or same-device eager fallback.
 
@@ -398,7 +404,7 @@ class Dispatcher:
             logger.error("unknown dispatch mode %r", mode)
             raise DispatchError(f"unknown dispatch mode: {mode}")
         if mode == "eager":
-            result = self._execute_eager(key)
+            result = self._execute_eager(key, *args, **kwargs)
             self._validate_result(result, None, None)
             self.records.append(DispatchRecord("eager", None))
             return result
@@ -411,7 +417,7 @@ class Dispatcher:
             if not candidate.correctness_qualified or candidate.quarantined:
                 logger.error("exact prepared %s candidate is unavailable", mode)
                 raise DispatchError(f"prepared {mode} candidate is unavailable")
-            result = self._execute_candidate(candidate)
+            result = self._execute_candidate(candidate, *args, **kwargs)
             self.records.append(DispatchRecord(mode, candidate.key))
             return result
 
@@ -428,7 +434,7 @@ class Dispatcher:
         ]
         for candidate in candidates:
             try:
-                result = self._execute_candidate(candidate)
+                result = self._execute_candidate(candidate, *args, **kwargs)
             except CudaExecutionError as error:
                 if not error.recoverable:
                     raise
@@ -448,7 +454,7 @@ class Dispatcher:
             )
             return result
 
-        result = self._execute_eager(key)
+        result = self._execute_eager(key, *args, **kwargs)
         self._validate_result(result, None, None)
         self.records.append(
             DispatchRecord(
@@ -471,10 +477,12 @@ class Dispatcher:
             return None
         return candidate
 
-    def _execute_candidate(self, candidate: _RegisteredCandidate) -> object:
+    def _execute_candidate(
+        self, candidate: _RegisteredCandidate, *args: object, **kwargs: object
+    ) -> object:
         """Execute and validate one prepared candidate."""
         try:
-            result = candidate.executor()
+            result = candidate.executor(*args, **kwargs)
         except (
             CudaExecutionError,
             FatalExecutionError,
@@ -491,7 +499,9 @@ class Dispatcher:
         )
         return result
 
-    def _execute_eager(self, key: CandidateKeyProtocol) -> object:
+    def _execute_eager(
+        self, key: CandidateKeyProtocol, *args: object, **kwargs: object
+    ) -> object:
         """Execute the eager callback bound to the requested device."""
         executor: object = self._eager
         if isinstance(self._eager, Mapping):
@@ -502,7 +512,7 @@ class Dispatcher:
                 raise DispatchError(
                     "no same-device eager executor is available"
                 ) from error
-        return _call_eager(executor, key)
+        return _call_eager(executor, key, *args, **kwargs)
 
     @staticmethod
     def _validate_result(
