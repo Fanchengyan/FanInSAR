@@ -50,6 +50,35 @@ Vec3 cross(const Vec3& left, const Vec3& right) {
           left[0] * right[1] - left[1] * right[0]};
 }
 
+Vec3 ecef_to_llh_tcn(const Vec3& xyz) {
+  const double e4 = kWgs84EccentricitySquared * kWgs84EccentricitySquared;
+  const double a2 = kWgs84SemiMajorAxisM * kWgs84SemiMajorAxisM;
+  const double lateral = (xyz[0] * xyz[0] + xyz[1] * xyz[1]) / a2;
+  const double polar = (1.0 - kWgs84EccentricitySquared) * xyz[2] * xyz[2] / a2;
+  const double reduced = (lateral + polar - e4) / 6.0;
+  if (!(reduced > 0.0) || !std::isfinite(reduced)) {
+    return {kNan, kNan, kNan};
+  }
+  const double cubic = e4 * lateral * polar / (4.0 * reduced * reduced * reduced);
+  const double cubic_radical = cubic * (2.0 + cubic);
+  if (cubic_radical < 0.0 || !std::isfinite(cubic_radical)) {
+    return {kNan, kNan, kNan};
+  }
+  const double root = std::cbrt(1.0 + cubic + std::sqrt(cubic_radical));
+  if (!(std::abs(root) > 0.0) || !std::isfinite(root)) {
+    return {kNan, kNan, kNan};
+  }
+  const double u = reduced * (1.0 + root + 1.0 / root);
+  const double radial = std::sqrt(u * u + e4 * polar);
+  const double w = kWgs84EccentricitySquared * (u + radial - polar) /
+                   (2.0 * radial);
+  const double k = std::sqrt(u + radial + w * w) - w;
+  const double horizontal = std::hypot(xyz[0], xyz[1]);
+  const double d = k * horizontal / (k + kWgs84EccentricitySquared);
+  return {std::atan2(xyz[2], d), std::atan2(xyz[1], xyz[0]),
+          (k + kWgs84EccentricitySquared - 1.0) * std::hypot(d, xyz[2]) / k};
+}
+
 double natural_spline_six(const double* values, double fraction) {
   double second[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   double recurrence[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
@@ -178,8 +207,8 @@ std::vector<Tensor> rdr2geo_cpu(
     record_visit(point);
     const double azimuth = azimuths_in[point];
     const double range = ranges_in[point];
-    const double height = heights_in[point];
-    if (!std::isfinite(azimuth) || !std::isfinite(range) || !std::isfinite(height)) {
+    const double height_seed = heights_in[point];
+    if (!std::isfinite(azimuth) || !std::isfinite(range) || !std::isfinite(height_seed)) {
       invalidate_lane(point);
       continue;
     }
@@ -188,107 +217,132 @@ std::vector<Tensor> rdr2geo_cpu(
       invalidate_lane(point);
       continue;
     }
-    const OrbitState initial = interpolate_orbit(times, positions, velocities,
-                                                 orbit_times_s.numel(), time_s);
     const double target_range = starting_slant_range_m + range * range_spacing_m;
-    const double velocity_norm = norm(initial.velocity);
-    const double satellite_norm = norm(initial.position);
+    const OrbitState state = interpolate_orbit(times, positions, velocities,
+                                               orbit_times_s.numel(), time_s);
+    const double velocity_norm = norm(state.velocity);
+    const double satellite_norm = norm(state.position);
     if (!(velocity_norm > 0.0) || !(satellite_norm > 0.0) ||
-        !(target_range > 0.0)) {
+        !(target_range > 0.0) || !std::isfinite(target_range)) {
       invalidate_lane(point);
       continue;
     }
-    const Vec3 velocity_unit{initial.velocity[0] / velocity_norm,
-                             initial.velocity[1] / velocity_norm,
-                             initial.velocity[2] / velocity_norm};
-    const Vec3 radial{initial.position[0] / satellite_norm,
-                      initial.position[1] / satellite_norm,
-                      initial.position[2] / satellite_norm};
-    Vec3 look = right_looking ? cross(velocity_unit, radial)
-                              : cross(radial, velocity_unit);
-    const double look_norm = norm(look);
-    if (!(look_norm > 0.0)) {
+    const Vec3 velocity_unit{state.velocity[0] / velocity_norm,
+                             state.velocity[1] / velocity_norm,
+                             state.velocity[2] / velocity_norm};
+    const Vec3 normal{-state.position[0] / satellite_norm,
+                      -state.position[1] / satellite_norm,
+                      -state.position[2] / satellite_norm};
+    Vec3 cross_track = cross(normal, state.velocity);
+    const double cross_track_norm = norm(cross_track);
+    if (!(cross_track_norm > 0.0) || !std::isfinite(cross_track_norm)) {
       invalidate_lane(point);
       continue;
     }
-    look = {look[0] / look_norm, look[1] / look_norm, look[2] / look_norm};
-    const Vec3 approximate{initial.position[0] + look[0] * target_range,
-                           initial.position[1] + look[1] * target_range,
-                           initial.position[2] + look[2] * target_range};
-    const Vec3 initial_llh = ecef_to_llh(approximate);
-    double latitude = initial_llh[0];
-    double longitude = initial_llh[1];
+    cross_track = {cross_track[0] / cross_track_norm,
+                   cross_track[1] / cross_track_norm,
+                   cross_track[2] / cross_track_norm};
+    Vec3 along_track = cross(cross_track, normal);
+    const double along_track_norm = norm(along_track);
+    if (!(along_track_norm > 0.0) || !std::isfinite(along_track_norm)) {
+      invalidate_lane(point);
+      continue;
+    }
+    along_track = {along_track[0] / along_track_norm,
+                   along_track[1] / along_track_norm,
+                   along_track[2] / along_track_norm};
+    const double normal_dot_velocity = dot(normal, velocity_unit);
+    const double velocity_dot_along = dot(velocity_unit, along_track);
+    if (!std::isfinite(normal_dot_velocity) ||
+        !(velocity_dot_along > 1.0e-12)) {
+      invalidate_lane(point);
+      continue;
+    }
+    const double minor = kWgs84SemiMajorAxisM *
+                         std::sqrt(1.0 - kWgs84EccentricitySquared);
+    const double eta = 1.0 / std::sqrt(
+        (state.position[0] / kWgs84SemiMajorAxisM) *
+            (state.position[0] / kWgs84SemiMajorAxisM) +
+        (state.position[1] / kWgs84SemiMajorAxisM) *
+            (state.position[1] / kWgs84SemiMajorAxisM) +
+        (state.position[2] / minor) * (state.position[2] / minor));
+    const double radius = eta * satellite_norm;
+    const double ellipsoid_height = (1.0 - eta) * satellite_norm;
+    double height = height_seed;
+    double latitude = kNan;
+    double longitude = kNan;
     double last_range_residual = kNan;
     double last_doppler = kNan;
     bool lane_solved = false;
     int64_t used_iterations = 0;
     for (int64_t iteration = 0; iteration < budget; ++iteration) {
       ++used_iterations;
-      const OrbitState state = interpolate_orbit(times, positions, velocities,
-                                                 orbit_times_s.numel(), time_s);
-      const Vec3 target = llh_to_ecef(latitude, longitude, height);
-      const Vec3 look_vector{target[0] - state.position[0],
-                             target[1] - state.position[1],
-                             target[2] - state.position[2]};
-      const double slant_range = norm(look_vector);
-      if (!(slant_range > 0.0) || !std::isfinite(slant_range)) break;
-      const Vec3 unit{look_vector[0] / slant_range,
-                      look_vector[1] / slant_range,
-                      look_vector[2] / slant_range};
+      const bool active = ellipsoid_height - height < target_range;
+      if (!active) break;
+      const double semi_minor = radius + height;
+      const double cos_theta = 0.5 *
+          (satellite_norm / target_range + target_range / satellite_norm -
+           (semi_minor / satellite_norm) * (semi_minor / target_range));
+      const double sin_theta = std::sqrt(std::max(0.0, 1.0 - cos_theta * cos_theta));
+      const double gamma = target_range * cos_theta;
+      const double alpha = -gamma * normal_dot_velocity /
+                           std::max(velocity_dot_along, 1.0e-12);
+      const double beta_argument = (target_range * sin_theta) *
+                                       (target_range * sin_theta) - alpha * alpha;
+      if (!std::isfinite(beta_argument) || beta_argument < -1.0e-6) break;
+      const double beta = (right_looking ? 1.0 : -1.0) *
+                          std::sqrt(std::max(0.0, beta_argument));
+      const Vec3 target_xyz{
+          state.position[0] + alpha * along_track[0] + beta * cross_track[0] +
+              gamma * normal[0],
+          state.position[1] + alpha * along_track[1] + beta * cross_track[1] +
+              gamma * normal[1],
+          state.position[2] + alpha * along_track[2] + beta * cross_track[2] +
+              gamma * normal[2]};
+      const Vec3 llh = ecef_to_llh_tcn(target_xyz);
+      if (!std::isfinite(llh[0]) || !std::isfinite(llh[1])) break;
+      latitude = llh[0];
+      longitude = llh[1];
+      const Vec3 dem_xyz = llh_to_ecef(latitude, longitude, height);
+      const double slant_range = norm(Vec3{state.position[0] - dem_xyz[0],
+                                           state.position[1] - dem_xyz[1],
+                                           state.position[2] - dem_xyz[2]});
       last_range_residual = slant_range - target_range;
-      last_doppler = 2.0 * dot(state.velocity, unit) / wavelength_m;
+      const Vec3 look_vector{dem_xyz[0] - state.position[0],
+                             dem_xyz[1] - state.position[1],
+                             dem_xyz[2] - state.position[2]};
+      const double look_norm = norm(look_vector);
+      last_doppler = look_norm > 0.0
+                         ? 2.0 * dot(state.velocity,
+                                     Vec3{look_vector[0] / look_norm,
+                                          look_vector[1] / look_norm,
+                                          look_vector[2] / look_norm}) /
+                               wavelength_m
+                         : kNan;
       decisions[point] = last_range_residual;
       range_residuals[point] = last_range_residual;
       doppler_residuals[point] = last_doppler;
-      const double decision_metric = std::max(
-          std::abs(last_range_residual) / range_tol_m,
-          std::abs(last_doppler) / doppler_tol_hz);
-      if (decision_metric < 1.0) {
+      const double next_height = norm(dem_xyz) - radius;
+      if (!std::isfinite(next_height)) break;
+      height = next_height;
+      if (std::abs(last_range_residual) < range_tol_m) {
         lane_solved = true;
         break;
       }
-      constexpr double delta = 1.0e-5;
-      const Vec3 lat_target = llh_to_ecef(latitude + delta, longitude, height);
-      const Vec3 lon_target = llh_to_ecef(latitude, longitude + delta, height);
-      const Vec3 lat_look{lat_target[0] - state.position[0],
-                          lat_target[1] - state.position[1],
-                          lat_target[2] - state.position[2]};
-      const Vec3 lon_look{lon_target[0] - state.position[0],
-                          lon_target[1] - state.position[1],
-                          lon_target[2] - state.position[2]};
-      const double lat_range = norm(lat_look);
-      const double lon_range = norm(lon_look);
-      if (!(lat_range > 0.0) || !(lon_range > 0.0)) break;
-      const Vec3 lat_unit{lat_look[0] / lat_range, lat_look[1] / lat_range,
-                          lat_look[2] / lat_range};
-      const Vec3 lon_unit{lon_look[0] / lon_range, lon_look[1] / lon_range,
-                          lon_look[2] / lon_range};
-      const double range_lat = (lat_range - slant_range) / delta;
-      const double range_lon = (lon_range - slant_range) / delta;
-      const double doppler_lat =
-          (2.0 * dot(state.velocity, lat_unit) / wavelength_m - last_doppler) /
-          delta;
-      const double doppler_lon =
-          (2.0 * dot(state.velocity, lon_unit) / wavelength_m - last_doppler) /
-          delta;
-      const double determinant = range_lat * doppler_lon - range_lon * doppler_lat;
-      if (!(std::abs(determinant) > 1.0e-12) || !std::isfinite(determinant)) break;
-      const double step_lat =
-          (-last_range_residual * doppler_lon + range_lon * last_doppler) /
-          determinant;
-      const double step_lon =
-          (-range_lat * last_doppler + last_range_residual * doppler_lat) /
-          determinant;
-      latitude += step_lat;
-      longitude += step_lon;
-      if (!std::isfinite(latitude) || !std::isfinite(longitude)) break;
     }
     if (!lane_solved) {
-      exhausted_values[point] = true;
+      if (used_iterations >= budget) {
+        exhausted_values[point] = true;
+        iteration_values[point] = static_cast<int32_t>(budget);
+      } else {
+        exhausted_values[point] = false;
+        iteration_values[point] = -1;
+      }
       continue;
     }
     latitudes[point] = latitude;
     longitudes[point] = longitude;
+    heights_out[point] = height;
     solved[point] = true;
     iteration_values[point] = static_cast<int32_t>(used_iterations);
     finals[point] = last_range_residual;
@@ -320,6 +374,13 @@ std::vector<Tensor> rdr2geo_cpu_dem(
   TORCH_CHECK(dem_iterations > 0 && std::isfinite(dem_height_tol_m) &&
                   dem_height_tol_m > 0.0,
               "DEM fixed-point settings are invalid");
+  TORCH_CHECK(std::isfinite(dem_latitude_start_deg) &&
+                  std::isfinite(dem_longitude_start_deg) &&
+                  std::isfinite(dem_latitude_spacing_deg) &&
+                  std::isfinite(dem_longitude_spacing_deg) &&
+                  dem_latitude_spacing_deg != 0.0 &&
+                  dem_longitude_spacing_deg != 0.0,
+              "DEM origin and spacing must be finite and non-zero");
   auto heights = height_seed_m.clone();
   std::vector<Tensor> result;
   for (int64_t iteration = 0; iteration < dem_iterations; ++iteration) {

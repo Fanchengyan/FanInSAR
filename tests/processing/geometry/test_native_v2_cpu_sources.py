@@ -206,6 +206,28 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     geo_source = (SOURCE_ROOT / "geo2rdr.cpp").read_text()
     assert "residual_range[point] = 0.0" not in geo_source
 
+    exhausted = module.rdr2geo_cpu(
+        torch.tensor([0.0], dtype=dtype),
+        torch.tensor([2196.3], dtype=dtype),
+        torch.tensor([0.0], dtype=dtype),
+        times,
+        positions,
+        velocities,
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        0.0555,
+        1,
+        0,
+        0.01,
+        0.1,
+        True,
+    )
+    assert int(exhausted[6][0]) == 1
+    assert bool(exhausted[10][0])
+    assert not bool(exhausted[5][0])
+
 
 def test_serial_cpu_extension_returns_validated_fourteen_field_result(
     serial_native_extension: object,
