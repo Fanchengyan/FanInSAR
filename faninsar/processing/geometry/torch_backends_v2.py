@@ -2,12 +2,10 @@
 
 """Torch eager and explicitly prepared geometry adapters.
 
-The adapter deliberately keeps the public NumPy geometry transforms as the
-numerical reference.  Torch owns device placement and the preparation
-lifecycle, which gives callers a stable seam while a native Torch kernel is
-qualified independently.  A prepared compiled callable is constructed and
-warmed during :func:`prepare_torch_geometry`; execution never invokes
-``torch.compile``.
+The adapter keeps the public preparation lifecycle separate from execution.
+Torch owns the device-resident numerical loop and a prepared compiled callable
+is constructed and warmed during :func:`prepare_torch_geometry`; execution
+never invokes ``torch.compile``.
 """
 
 from __future__ import annotations
@@ -21,12 +19,10 @@ from typing import TYPE_CHECKING, TypeAlias
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.geometry.transforms import (
-    RadarGeometryModel,
-    TransformResult,
-    geo2rdr,
-    rdr2geo_ellipsoid,
-    rdr2geo_with_dem,
+from faninsar.processing.geometry.torch_kernels import (
+    geo2rdr_kernel,
+    prepared_orbit_tensors,
+    rdr2geo_kernel,
 )
 from faninsar.processing.geometry.v2 import (
     Operation,
@@ -39,6 +35,7 @@ if TYPE_CHECKING:
     import torch
 
     from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.geometry.transforms import RadarGeometryModel
 
 logger = setup_logger(__name__)
 
@@ -109,22 +106,50 @@ def _dem_digest(dem: object | None) -> str:
     }
     for name in (
         "height_m",
+        "values",
+        "data",
         "x_start_deg",
         "y_start_deg",
         "dx_deg",
         "dy_deg",
+        "bounds",
+        "extent",
         "reference_height_m",
-        "path",
         "nodata",
         "interpolation",
+        "look_direction",
     ):
         if not hasattr(dem, name):
             continue
         value = getattr(dem, name)
-        if isinstance(value, np.ndarray):
+        if isinstance(value, (np.ndarray, list, tuple)) and name in {
+            "height_m",
+            "values",
+            "data",
+        }:
             values[name] = _array_digest(np.asarray(value))
         else:
             values[name] = str(value) if name == "path" else value
+    for name in ("path", "source"):
+        if hasattr(dem, name):
+            value = getattr(dem, name)
+            # A path is only a locator; digest materialized values when the
+            # sampler exposes them and retain the locator only as provenance.
+            values[name] = str(value)
+    materialized = getattr(dem, "_height_array", None)
+    if materialized is None and hasattr(dem, "_open"):
+        try:
+            materialized = dem._open().read(1)  # type: ignore[attr-defined]
+        except (ImportError, OSError, RuntimeError, AttributeError):
+            materialized = None
+    if materialized is not None:
+        values["materialized_height"] = _array_digest(np.asarray(materialized))
+    transform = getattr(getattr(dem, "_dataset", None), "transform", None)
+    bounds = getattr(getattr(dem, "_dataset", None), "bounds", None)
+    if transform is not None:
+        values["origin_spacing"] = tuple(float(value) for value in transform[:6])
+    if bounds is not None:
+        values["bounds"] = tuple(float(value) for value in bounds)
     return _digest(values)
 
 
@@ -272,43 +297,44 @@ class TorchGeometryResult:
     @classmethod
     def from_transform(
         cls,
-        result: TransformResult,
+        result: dict[str, np.ndarray],
         *,
         operation: GeometryOperation,
         device: str,
         dtype: str,
         identity: str,
-        iterations: int,
         backend: str,
-        tolerance: float = 0.01,
+        range_tolerance: float = 0.01,
+        doppler_tolerance: float = 0.1,
+        slant_range_tolerance: float = 0.01,
     ) -> TorchGeometryResult:
-        """Adapt the reference transform to the foundation result contract."""
+        """Adapt device-kernel arrays to the foundation result contract."""
         operation = Operation(operation)
-        shape = result.latitude_deg.shape
-        converged = np.asarray(result.converged, dtype=bool)
-        iterations_array = np.where(
-            converged,
-            np.asarray(iterations, dtype=np.int32),
-            np.asarray(-1, dtype=np.int32),
-        )
-        residual_range = np.asarray(result.residual_range_m, dtype=np.float64)
-        residual_doppler = np.asarray(result.residual_doppler_hz, dtype=np.float64)
-        tolerance_array = np.full(
-            shape,
-            1.0 if operation is Operation.GEO2RDR else tolerance,
-            dtype=np.float64,
-        )
+        values = {name: np.asarray(value) for name, value in result.items()}
+        shape = values["latitude_deg"].shape
+        converged = np.asarray(values["converged"], dtype=bool)
+        residual_range = np.asarray(values["residual_range_m"], dtype=np.float64)
+        residual_doppler = np.asarray(values["residual_doppler_hz"], dtype=np.float64)
+        if operation is Operation.GEO2RDR:
+            decision = np.maximum(
+                np.abs(residual_range) / range_tolerance,
+                np.abs(residual_doppler) / doppler_tolerance,
+            )
+            tolerance_array = np.ones(shape, dtype=np.float64)
+        else:
+            decision = residual_range
+            tolerance_array = np.full(shape, slant_range_tolerance, dtype=np.float64)
         foundation = TransformResultV2.from_arrays(
             {
-                "latitude_deg": np.asarray(result.latitude_deg, dtype=np.float64),
-                "longitude_deg": np.asarray(result.longitude_deg, dtype=np.float64),
-                "height_m": np.asarray(result.height_m, dtype=np.float64),
-                "range_index": np.asarray(result.range_index, dtype=np.float64),
-                "azimuth_index": np.asarray(result.azimuth_index, dtype=np.float64),
+                "latitude_deg": np.asarray(values["latitude_deg"], dtype=np.float64),
+                "longitude_deg": np.asarray(values["longitude_deg"], dtype=np.float64),
+                "height_m": np.asarray(values["height_m"], dtype=np.float64),
+                "range_index": np.asarray(values["range_index"], dtype=np.float64),
+                "azimuth_index": np.asarray(values["azimuth_index"], dtype=np.float64),
                 "converged": converged,
-                "iterations": iterations_array,
-                "decision_residual": residual_range,
-                "final_residual": residual_range,
+                "iterations": np.asarray(values["iterations"], dtype=np.int32),
+                "decision_residual": decision,
+                "final_residual": decision,
                 "tolerance": tolerance_array,
                 "max_iter_exhausted": ~converged,
                 "boundary_rechecked": np.zeros(shape, dtype=bool),
@@ -316,6 +342,7 @@ class TorchGeometryResult:
                 "residual_doppler_hz": residual_doppler,
             },
             operation=operation,
+            invalid_mask=~converged,
         )
         return cls(
             foundation,
@@ -341,18 +368,12 @@ class PreparedTorchGeometry:
     device: str
     dtype: str
     compiled: bool = False
+    _kernel: object | None = field(default=None, repr=False, compare=False)
     _compiled_kernel: object | None = field(default=None, repr=False, compare=False)
 
     def execute(self, *inputs: object) -> TorchGeometryResult:
         """Execute this prepared adapter without compiling."""
         return execute_torch_geometry(self, *inputs)
-
-
-def _probe_kernel(value: torch.Tensor) -> torch.Tensor:
-    """Small shape-preserving kernel used to warm explicit preparation."""
-    import torch
-
-    return value + torch.zeros_like(value)
 
 
 def prepare_torch_geometry(
@@ -411,21 +432,59 @@ def prepare_torch_geometry(
             }
         ),
     )
+    orbit_tensors = prepared_orbit_tensors(model, str(resolved_device))
+    orbit_times, orbit_positions, orbit_velocities, sensing_offset_s = orbit_tensors
+
+    def kernel(*values: object) -> dict[str, object]:
+        """Run the operation-specific device-resident solver."""
+        latitude_or_azimuth, longitude_or_range, height = values
+        dynamic = not compile_kernel
+        if operation is Operation.GEO2RDR:
+            return geo2rdr_kernel(
+                latitude_or_azimuth,
+                longitude_or_range,
+                height,
+                orbit_times,
+                orbit_positions,
+                orbit_velocities,
+                sensing_offset_s=sensing_offset_s,
+                azimuth_interval_s=model.azimuth_time_interval_s,
+                starting_range_m=model.starting_slant_range_m,
+                range_spacing_m=model.range_spacing_m,
+                wavelength_m=model.wavelength_m,
+                max_iter=settings.max_iter + settings.extra_iter,
+                time_tol_s=settings.time_tol_s,
+                dynamic_iterations=dynamic,
+            )
+        return rdr2geo_kernel(
+            latitude_or_azimuth,
+            longitude_or_range,
+            height,
+            orbit_times,
+            orbit_positions,
+            orbit_velocities,
+            sensing_offset_s=sensing_offset_s,
+            azimuth_interval_s=model.azimuth_time_interval_s,
+            starting_range_m=model.starting_slant_range_m,
+            range_spacing_m=model.range_spacing_m,
+            wavelength_m=model.wavelength_m,
+            look_sign=1.0 if model.look_direction == "right" else -1.0,
+            max_iter=settings.max_iter + settings.extra_iter,
+            range_tol_m=settings.range_tol_m,
+            doppler_tol_hz=settings.doppler_tol_hz,
+            dynamic_iterations=dynamic,
+        )
+
     compiled_kernel: object | None = None
     if compile_kernel:
         try:
-            # The probe is deliberately shape-polymorphic.  The prepared
-            # adapter executes the fixed reference transform for the caller's
-            # real arrays, so a shape-specialized probe would compile again at
-            # first production use (and turn execution into a hidden prepare
-            # phase).
-            compiled_kernel = torch.compile(_probe_kernel, dynamic=True)
+            compiled_kernel = torch.compile(kernel, dynamic=False)
             sample = torch.zeros(
-                (1,),
+                tuple(shape),
                 dtype=getattr(torch, canonical_dtype.split(".")[-1]),
                 device=resolved_device,
             )
-            compiled_kernel(sample)
+            compiled_kernel(sample, sample, sample)
         except Exception as error:
             logger.exception("failed to prepare compiled Torch geometry adapter")
             raise RuntimeError(
@@ -442,27 +501,49 @@ def prepare_torch_geometry(
         device=str(resolved_device),
         dtype=canonical_dtype,
         compiled=compile_kernel,
+        _kernel=kernel,
         _compiled_kernel=compiled_kernel,
     )
 
 
 def _check_inputs(
     prepared: PreparedTorchGeometry, inputs: tuple[object, ...]
-) -> tuple[np.ndarray, ...]:
-    """Convert inputs to NumPy arrays and enforce the prepared shape."""
+) -> tuple[torch.Tensor, ...]:
+    """Validate input dtype/device and return broadcast device tensors."""
+    import torch
+
     if prepared.operation == "rdr2geo" and len(inputs) == 2:
         inputs = (*inputs, 0.0)
     expected = 3
     if len(inputs) != expected:
         raise TypeError(f"{prepared.operation} expects {expected} input arrays")
-    arrays = tuple(np.asarray(item, dtype=np.float64) for item in inputs)
-    broadcast = np.broadcast_arrays(*arrays)
-    if broadcast[0].shape != prepared.shape:
+    expected_dtype = getattr(torch, prepared.dtype.split(".")[-1])
+    tensors: list[torch.Tensor] = []
+    for item in inputs:
+        if isinstance(item, torch.Tensor):
+            if item.dtype != expected_dtype:
+                raise TypeError(f"Torch geometry inputs must use {prepared.dtype}")
+            if item.device != torch.device(prepared.device):
+                raise TypeError(
+                    f"Torch geometry inputs must use device {prepared.device}"
+                )
+            if not item.is_contiguous():
+                raise ValueError("Torch geometry inputs must be contiguous")
+            tensors.append(item)
+        else:
+            array = np.asarray(item)
+            if array.dtype != np.dtype(np.float64):
+                raise TypeError("NumPy geometry inputs must use float64")
+            tensors.append(
+                torch.as_tensor(array, dtype=expected_dtype, device=prepared.device)
+            )
+    broadcast = torch.broadcast_tensors(*tensors)
+    if tuple(broadcast[0].shape) != prepared.shape:
         raise ValueError(
             f"prepared shape {prepared.shape} does not match input shape "
-            f"{broadcast[0].shape}"
+            f"{tuple(broadcast[0].shape)}"
         )
-    return tuple(array.copy() for array in broadcast)
+    return tuple(broadcast)
 
 
 def execute_torch_geometry(
@@ -473,64 +554,27 @@ def execute_torch_geometry(
     import torch
 
     arrays = _check_inputs(prepared, inputs)
-    # Explicitly stage inputs on the requested device.  The current public
-    # transforms remain the reference numerical implementation and return
-    # NumPy arrays; this staging seam is where a qualified Torch kernel plugs in.
-    tensors = tuple(
-        torch.as_tensor(
-            array,
-            dtype=getattr(torch, prepared.dtype.split(".")[-1]),
-            device=prepared.device,
-        )
-        for array in arrays
-    )
-    if prepared.compiled and prepared._compiled_kernel is not None:
-        prepared._compiled_kernel(tensors[0])
-    host_inputs = tuple(tensor.detach().cpu().numpy() for tensor in tensors)
-    settings = prepared.settings
-    if prepared.operation == "geo2rdr":
-        transform = geo2rdr(
-            prepared.model,
-            host_inputs[0],
-            host_inputs[1],
-            host_inputs[2],
-            max_iter=settings.max_iter + settings.extra_iter,
-            time_tol_s=settings.time_tol_s,
-        )
-    elif prepared.dem is None:
-        transform = rdr2geo_ellipsoid(
-            prepared.model,
-            host_inputs[0],
-            host_inputs[1],
-            height_m=host_inputs[2],
-            max_iter=settings.max_iter + settings.extra_iter,
-            range_tol_m=settings.range_tol_m,
-            doppler_tol_hz=settings.doppler_tol_hz,
-        )
-    else:
-        transform = rdr2geo_with_dem(
-            prepared.model,
-            host_inputs[0],
-            host_inputs[1],
-            prepared.dem,
-            height_seed_m=float(np.nanmean(host_inputs[2]))
-            if np.isfinite(host_inputs[2]).any()
-            else 0.0,
-            max_iter=settings.max_iter + settings.extra_iter,
-            range_tol_m=settings.range_tol_m,
-            doppler_tol_hz=settings.doppler_tol_hz,
-            dem_iterations=settings.dem_iterations,
-            dem_height_tol_m=settings.dem_height_tol_m,
-        )
+    kernel = prepared._compiled_kernel if prepared.compiled else prepared._kernel
+    if kernel is None:
+        raise RuntimeError("prepared Torch geometry kernel is missing")
+    with torch.no_grad():
+        output = kernel(*arrays)
+    host_output = {
+        name: value.detach().cpu().numpy()
+        if isinstance(value, torch.Tensor)
+        else np.asarray(value)
+        for name, value in output.items()
+    }
     return TorchGeometryResult.from_transform(
-        transform,
+        host_output,
         operation=prepared.operation,
         backend="torch_compiled" if prepared.compiled else "torch_eager",
         device=prepared.device,
         dtype=prepared.dtype,
         identity=prepared.identity.digest,
-        iterations=settings.max_iter + settings.extra_iter,
-        tolerance=prepared.operation_settings.solver.slant_range_tolerance_m,
+        range_tolerance=prepared.settings.range_tol_m,
+        doppler_tolerance=prepared.settings.doppler_tol_hz,
+        slant_range_tolerance=prepared.settings.range_tol_m,
     )
 
 

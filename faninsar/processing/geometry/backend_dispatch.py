@@ -13,7 +13,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
-from enum import Enum
+from enum import StrEnum
 from numbers import Integral
 from typing import Literal, Protocol, TypeAlias, runtime_checkable
 
@@ -24,6 +24,7 @@ from faninsar.processing.geometry.v2 import (
     CandidateKey as FoundationCandidateKey,
 )
 from faninsar.processing.geometry.v2 import (
+    GeometryValidationError,
     TransformResultV2,
 )
 
@@ -33,7 +34,7 @@ Backend: TypeAlias = Literal["native", "compile", "eager"]
 PreparedBackend: TypeAlias = Literal["native", "compile"]
 DispatchMode: TypeAlias = Literal["auto", "native", "compile", "eager"]
 Executor: TypeAlias = Callable[[], object]
-ResultValidator: TypeAlias = Callable[[object], None]
+ResultValidator: TypeAlias = Callable[[object], object]
 
 PERFORMANCE_ELIGIBILITY_ORDER: tuple[Backend, ...] = (
     "eager",
@@ -72,7 +73,7 @@ class FatalExecutionError(DispatchError):
     """A failure that must never fall back to another backend."""
 
 
-class CudaFailure(str, Enum):
+class CudaFailure(StrEnum):
     """Small CUDA failure taxonomy used by automatic dispatch."""
 
     PRE_LAUNCH_INVALID_CONFIGURATION = "pre_launch_invalid_configuration"
@@ -405,7 +406,7 @@ class Dispatcher:
             raise DispatchError(f"unknown dispatch mode: {mode}")
         if mode == "eager":
             result = self._execute_eager(key, *args, **kwargs)
-            self._validate_result(result, None, None)
+            result = self._validate_result(result, None, None)
             self.records.append(DispatchRecord("eager", None))
             return result
 
@@ -455,7 +456,7 @@ class Dispatcher:
             return result
 
         result = self._execute_eager(key, *args, **kwargs)
-        self._validate_result(result, None, None)
+        result = self._validate_result(result, None, None)
         self.records.append(
             DispatchRecord(
                 "eager",
@@ -487,17 +488,21 @@ class Dispatcher:
             CudaExecutionError,
             FatalExecutionError,
             RecoverableExecutionError,
+            GeometryValidationError,
         ):
             raise
         except Exception as error:
             logger.exception("prepared %s execution failed", candidate.key.backend)
+            if getattr(candidate.key.device, "kind", None) == "cuda":
+                failure = classify_cuda_failure(error)
+                raise CudaExecutionError(
+                    failure,
+                    str(error),
+                    phase="synchronized",
+                    context_healthy=False,
+                ) from error
             raise RecoverableExecutionError(str(error)) from error
-        self._validate_result(
-            result,
-            candidate.result_validator,
-            candidate.key,
-        )
-        return result
+        return self._validate_result(result, candidate.result_validator, candidate.key)
 
     def _execute_eager(
         self, key: CandidateKeyProtocol, *args: object, **kwargs: object
@@ -519,7 +524,7 @@ class Dispatcher:
         result: object,
         validator: ResultValidator | None,
         key: CandidateKeyProtocol | None,
-    ) -> None:
+    ) -> object:
         """Apply an optional validator and common v2 result checks."""
         if result is None:
             logger.error("geometry executor returned no result")
@@ -542,7 +547,9 @@ class Dispatcher:
                     )
         if validator is not None:
             try:
-                validator(result)
+                validated = validator(result)
+                if validated is not None:
+                    result = validated
             except RecoverableExecutionError:
                 raise
             except Exception as error:
@@ -599,6 +606,7 @@ class Dispatcher:
                     raise IncorrectResultError(
                         "executor returned iterations outside {-1, 1..candidate budget}"
                     )
+        return result
 
 
 _PINNED_NATIVE_MODULES: list[object] = []
