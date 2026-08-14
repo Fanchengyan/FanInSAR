@@ -100,6 +100,16 @@ def test_cpu_telemetry_contract_keeps_qualification_metadata_out_of_result() -> 
     assert "operation_symbol" not in NATIVE_RESULT_FIELDS
 
 
+def test_cpu_validation_and_runtime_identity_fail_closed() -> None:
+    """Native validation rejects nonfinite geometry and unknown runtimes."""
+    abi_source = (SOURCE_ROOT / "native_v2_abi.cpp").read_text()
+    rdr_source = (SOURCE_ROOT / "rdr2geo.cpp").read_text()
+    assert "orbit position/velocity values must be finite" in abi_source
+    assert "dem_samples must contain only finite values" in rdr_source
+    assert "std::getenv" not in abi_source
+    assert 'runtime_name = "unknown"' in abi_source
+
+
 @pytest.mark.skipif(
     os.environ.get("FANINSAR_TEST_NATIVE_V2_BUILD") != "1",
     reason="native extension build is explicitly enabled",
@@ -191,6 +201,10 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     assert int(rdr[6][0]) > 1
     assert float(rdr[2][0]) == pytest.approx(100.0)
     assert float(rdr[8][0]) < 1.0
+    assert float(rdr[7][0]) == pytest.approx(float(rdr[12][0]))
+    assert float(rdr[8][0]) == pytest.approx(float(rdr[12][0]))
+    geo_source = (SOURCE_ROOT / "geo2rdr.cpp").read_text()
+    assert "residual_range[point] = 0.0" not in geo_source
 
 
 def test_serial_cpu_extension_returns_validated_fourteen_field_result(
@@ -230,5 +244,5 @@ def test_serial_cpu_extension_returns_validated_fourteen_field_result(
     assert result.iterations.tolist() == [1]
     telemetry = extension.native_v2_telemetry()
     assert telemetry["openmp_defined"] is False
-    assert telemetry["runtime_name"] == "serial"
+    assert telemetry["runtime_name"] == "unknown"
     assert telemetry["visit_counts"] == [1]

@@ -140,18 +140,36 @@ std::vector<Tensor> rdr2geo_cpu(
   const auto* velocities = orbit_velocities_m_s.data_ptr<double>();
   auto* latitudes = latitude.data_ptr<double>();
   auto* longitudes = longitude.data_ptr<double>();
+  auto* heights_out = heights.data_ptr<double>();
+  auto* ranges_out = ranges.data_ptr<double>();
+  auto* azimuths_out = azimuths.data_ptr<double>();
   auto* solved = converged.data_ptr<bool>();
   auto* iteration_values = iterations.data_ptr<int32_t>();
   auto* decisions = decision_residual.data_ptr<double>();
   auto* finals = final_residual.data_ptr<double>();
+  auto* tolerances = tolerance.data_ptr<double>();
   auto* exhausted_values = exhausted.data_ptr<bool>();
-  auto* boundary = boundary_rechecked.data_ptr<bool>();
   auto* range_residuals = residual_range.data_ptr<double>();
   auto* doppler_residuals = residual_doppler.data_ptr<double>();
   const int64_t budget = max_iter + extra_iter;
   const double orbit_start = times[0];
   const double orbit_end = times[orbit_times_s.numel() - 1];
   begin_telemetry(count, "rdr2geo_cpu");
+  auto invalidate_lane = [&](int64_t point) {
+    latitudes[point] = kNan;
+    longitudes[point] = kNan;
+    heights_out[point] = kNan;
+    ranges_out[point] = kNan;
+    azimuths_out[point] = kNan;
+    tolerances[point] = kNan;
+    solved[point] = false;
+    iteration_values[point] = -1;
+    decisions[point] = kNan;
+    finals[point] = kNan;
+    exhausted_values[point] = false;
+    range_residuals[point] = kNan;
+    doppler_residuals[point] = kNan;
+  };
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -162,13 +180,12 @@ std::vector<Tensor> rdr2geo_cpu(
     const double range = ranges_in[point];
     const double height = heights_in[point];
     if (!std::isfinite(azimuth) || !std::isfinite(range) || !std::isfinite(height)) {
-      exhausted_values[point] = false;
+      invalidate_lane(point);
       continue;
     }
     double time_s = sensing_offset_s + azimuth * azimuth_time_interval_s;
     if (time_s < orbit_start || time_s > orbit_end) {
-      exhausted_values[point] = false;
-      boundary[point] = true;
+      invalidate_lane(point);
       continue;
     }
     const OrbitState initial = interpolate_orbit(times, positions, velocities,
@@ -178,7 +195,7 @@ std::vector<Tensor> rdr2geo_cpu(
     const double satellite_norm = norm(initial.position);
     if (!(velocity_norm > 0.0) || !(satellite_norm > 0.0) ||
         !(target_range > 0.0)) {
-      exhausted_values[point] = false;
+      invalidate_lane(point);
       continue;
     }
     const Vec3 velocity_unit{initial.velocity[0] / velocity_norm,
@@ -191,7 +208,7 @@ std::vector<Tensor> rdr2geo_cpu(
                               : cross(radial, velocity_unit);
     const double look_norm = norm(look);
     if (!(look_norm > 0.0)) {
-      exhausted_values[point] = false;
+      invalidate_lane(point);
       continue;
     }
     look = {look[0] / look_norm, look[1] / look_norm, look[2] / look_norm};
@@ -226,7 +243,6 @@ std::vector<Tensor> rdr2geo_cpu(
       const double decision_metric = std::max(
           std::abs(last_range_residual) / range_tol_m,
           std::abs(last_doppler) / doppler_tol_hz);
-      decisions[point] = decision_metric;
       if (decision_metric < 1.0) {
         lane_solved = true;
         break;
@@ -275,8 +291,7 @@ std::vector<Tensor> rdr2geo_cpu(
     longitudes[point] = longitude;
     solved[point] = true;
     iteration_values[point] = static_cast<int32_t>(used_iterations);
-    finals[point] = std::max(std::abs(last_range_residual) / range_tol_m,
-                             std::abs(last_doppler) / doppler_tol_hz);
+    finals[point] = last_range_residual;
     exhausted_values[point] = false;
   }
   return {latitude, longitude, heights, ranges, azimuths, converged, iterations,
@@ -300,6 +315,8 @@ std::vector<Tensor> rdr2geo_cpu_dem(
                   dem_samples.is_contiguous() && dem_samples.dim() == 2 &&
                   dem_samples.size(0) == 6 && dem_samples.size(1) == 6,
               "dem_samples must be a contiguous CPU float64 (6, 6) array");
+  TORCH_CHECK(torch::isfinite(dem_samples).all().item<bool>(),
+              "dem_samples must contain only finite values");
   TORCH_CHECK(dem_iterations > 0 && std::isfinite(dem_height_tol_m) &&
                   dem_height_tol_m > 0.0,
               "DEM fixed-point settings are invalid");

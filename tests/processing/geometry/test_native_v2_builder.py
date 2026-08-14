@@ -85,7 +85,7 @@ def test_linux_cpu_plan_separates_openmp_flags_and_fails_closed() -> None:
 
     assert not plan.supported
     assert "not scientifically qualified" in plan.unsupported_reason
-    assert plan.compile_flags == ("-fopenmp",)
+    assert plan.compile_flags == ("-fopenmp", "-DFANINSAR_OPENMP_RUNTIME_LIBGOMP")
     assert plan.link_flags == ("-fopenmp",)
     assert plan.runtime_name == "libgomp"
 

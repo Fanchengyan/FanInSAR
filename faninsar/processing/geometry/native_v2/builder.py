@@ -190,6 +190,8 @@ class NativeBuilder:
             compile_flags = flags.compile_flags
             if flags.runtime_name == "libomp":
                 compile_flags += ("-DFANINSAR_OPENMP_RUNTIME_LIBOMP",)
+            elif flags.runtime_name == "libgomp":
+                compile_flags += ("-DFANINSAR_OPENMP_RUNTIME_LIBGOMP",)
             return BuildPlan(
                 request.operation,
                 request.backend,

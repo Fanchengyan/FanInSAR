@@ -40,6 +40,11 @@ void check_orbit(const Tensor& tensor, const char* name, int64_t count) {
   check_float64_cpu(tensor, name);
   TORCH_CHECK(tensor.dim() == 2 && tensor.size(0) == count && tensor.size(1) == 3,
               name, " must have shape (orbit_vector_count, 3)");
+  const auto* values = tensor.data_ptr<double>();
+  for (int64_t index = 0; index < tensor.numel(); ++index) {
+    TORCH_CHECK(std::isfinite(values[index]),
+                "orbit position/velocity values must be finite");
+  }
 }
 
 void check_orbit_times(const Tensor& times) {
@@ -159,12 +164,8 @@ void begin_telemetry(int64_t point_count, const char* operation_symbol) {
   telemetry.runtime_name = "openmp";
 #endif
 #else
-  telemetry.runtime_name = "serial";
+  telemetry.runtime_name = "unknown";
 #endif
-  if (const char* runtime = std::getenv("FANINSAR_OPENMP_RUNTIME");
-      runtime != nullptr && *runtime != '\0') {
-    telemetry.runtime_name = runtime;
-  }
   telemetry.operation_symbol = operation_symbol;
   telemetry.processed_point_count = 0;
   telemetry.thread_ids.clear();
@@ -213,11 +214,14 @@ TelemetrySnapshot telemetry_snapshot() {
 
 std::vector<Tensor> invalid_result(int64_t count, bool geo2rdr,
                                    double tolerance) {
+  (void)geo2rdr;
+  (void)tolerance;
   const auto options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
   auto nan = torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options);
   auto boolean = torch::zeros({count}, options.dtype(torch::kBool));
   auto iterations = torch::full({count}, -1, options.dtype(torch::kInt32));
-  auto tolerance_values = torch::full({count}, geo2rdr ? 1.0 : tolerance, options);
+  auto tolerance_values = torch::full(
+      {count}, std::numeric_limits<double>::quiet_NaN(), options);
   return {nan.clone(), nan.clone(), nan.clone(), nan.clone(), nan.clone(),
           boolean.clone(), iterations, nan.clone(), nan.clone(),
           tolerance_values, boolean.clone(), boolean.clone(), nan.clone(),
