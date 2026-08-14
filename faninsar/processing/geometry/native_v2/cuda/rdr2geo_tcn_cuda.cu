@@ -253,7 +253,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2(
   auto converged = torch::zeros({count}, options.dtype(torch::kBool));
   auto range_residual = torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options);
   auto doppler_residual = torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options);
-  auto iterations = torch::zeros({count}, options.dtype(torch::kInt32));
+  auto iterations = torch::full({count}, -1, options.dtype(torch::kInt32));
   if (count > 0) {
     constexpr int threads = 256;
     const int blocks = static_cast<int>((count + threads - 1) / threads);
@@ -275,8 +275,19 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2(
         iterations.data_ptr<int32_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  return {latitude, longitude, height, converged, range_residual,
-          doppler_residual, iterations};
+  auto range_index = torch::full(
+      {count}, std::numeric_limits<double>::quiet_NaN(), options);
+  auto azimuth_index = torch::full(
+      {count}, std::numeric_limits<double>::quiet_NaN(), options);
+  auto decision_residual = range_residual.clone();
+  auto final_residual = torch::abs(range_residual);
+  auto tolerance = torch::full({count}, range_tolerance_m, options);
+  auto max_iter_exhausted = converged.logical_not();
+  auto boundary_rechecked = torch::zeros({count}, options.dtype(torch::kBool));
+  return {latitude, longitude, height, range_index, azimuth_index, converged,
+          iterations, decision_residual, final_residual, tolerance,
+          max_iter_exhausted, boundary_rechecked, range_residual,
+          doppler_residual};
 }
 
 std::vector<Tensor> rdr2geo_cuda_v2(

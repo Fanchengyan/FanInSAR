@@ -152,7 +152,7 @@ std::vector<Tensor> geo2rdr_cuda_v2(
   auto converged = torch::zeros({count}, options.dtype(torch::kBool));
   auto range_residual = torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options);
   auto doppler_residual = torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options);
-  auto iterations = torch::zeros({count}, options.dtype(torch::kInt32));
+  auto iterations = torch::full({count}, -1, options.dtype(torch::kInt32));
   if (count > 0) {
     constexpr int threads = 256;
     const int blocks = static_cast<int>((count + threads - 1) / threads);
@@ -169,7 +169,15 @@ std::vector<Tensor> geo2rdr_cuda_v2(
         iterations.data_ptr<int32_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  return {azimuth, range, converged, range_residual, doppler_residual, iterations};
+  auto decision_residual = doppler_residual.clone();
+  auto final_residual = torch::abs(doppler_residual);
+  auto tolerance = torch::full({count}, 1.0, options);
+  auto max_iter_exhausted = converged.logical_not();
+  auto boundary_rechecked = torch::zeros({count}, options.dtype(torch::kBool));
+  return {latitude_deg.clone(), longitude_deg.clone(), height_m.clone(), range,
+          azimuth, converged, iterations, decision_residual, final_residual,
+          tolerance, max_iter_exhausted, boundary_rechecked, range_residual,
+          doppler_residual};
 }
 
 }  // namespace faninsar::geometry::cuda_v2

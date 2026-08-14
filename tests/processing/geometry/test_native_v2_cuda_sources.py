@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 CUDA_SOURCE_ROOT = (
     Path(__file__).parents[3]
     / "faninsar"
@@ -50,14 +49,14 @@ def test_cuda_direct_array_fixture_matches_constructed_geometry(tmp_path: Path) 
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     extension = pytest.importorskip("torch.utils.cpp_extension")
-    binding = r'''
+    binding = r"""
 #include "geometry_cuda.cuh"
 #include <vector>
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("geo2rdr", &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2);
   module.def("rdr2geo", &faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2);
 }
-'''
+"""
     module = extension.load_inline(
         name="faninsar_native_v2_cuda_fixture",
         cpp_sources=binding,
@@ -102,7 +101,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         1.0e-6,
         1.0e-4,
     )
-    assert bool(geo[2].item())
+    assert len(geo) == 14
+    assert bool(geo[5].item())
     assert abs(float(geo[0].item())) < 1.0e-8
     assert abs(float(geo[4].item())) < 1.0e-4
 
@@ -129,8 +129,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         5,
         True,
     )
-    assert bool(geo_from_radar[3].item())
+    assert len(geo_from_radar) == 14
+    assert bool(geo_from_radar[5].item())
     assert abs(float(geo_from_radar[0].item())) < 1.0e-6
     assert abs(float(geo_from_radar[1].item())) < 1.0e-6
-    assert abs(float(geo_from_radar[4].item())) < 0.1
-    assert abs(float(geo_from_radar[5].item())) < 1.0e-4
+    assert abs(float(geo_from_radar[12].item())) < 0.1
+    assert abs(float(geo_from_radar[13].item())) < 1.0e-4

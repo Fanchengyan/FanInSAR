@@ -13,12 +13,32 @@ from faninsar.processing.geometry.native_v2 import (
 )
 
 SOURCE_ROOT = (
-    Path(__file__).parents[3]
-    / "faninsar"
-    / "processing"
-    / "geometry"
-    / "native_v2"
+    Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native_v2"
 )
+
+
+@pytest.fixture(scope="module")
+def serial_native_extension(tmp_path_factory: pytest.TempPathFactory) -> object:
+    """Build the CPU sources without OpenMP for a diagnostic ABI check."""
+    pytest.importorskip("torch")
+    extension = pytest.importorskip("torch.utils.cpp_extension")
+    build_dir = tmp_path_factory.mktemp("native-v2-serial")
+    return extension.load(
+        name="faninsar_native_v2_serial_fixture",
+        sources=[
+            str(SOURCE_ROOT / name)
+            for name in (
+                "bindings.cpp",
+                "native_v2_abi.cpp",
+                "geo2rdr.cpp",
+                "rdr2geo.cpp",
+            )
+        ],
+        extra_cflags=["-O0"],
+        build_directory=str(build_dir),
+        with_cuda=False,
+        verbose=False,
+    )
 
 
 def test_cpu_sources_export_both_operation_symbols_and_openmp_loop() -> None:
@@ -54,3 +74,43 @@ def test_native_result_binding_rejects_non_fourteen_field_abi() -> None:
     with pytest.raises(ValueError, match="exactly fourteen"):
         result_from_native_outputs([np.zeros(1)] * 13, operation="rdr2geo")
 
+
+def test_serial_cpu_extension_returns_validated_fourteen_field_result(
+    serial_native_extension: object,
+) -> None:
+    """A serial diagnostic build publishes the shared v2 result contract."""
+    torch = pytest.importorskip("torch")
+    dtype = torch.float64
+    extension = serial_native_extension
+    outputs = extension.geo2rdr_cpu(
+        torch.tensor([0.0], dtype=dtype),
+        torch.tensor([0.0], dtype=dtype),
+        torch.tensor([0.0], dtype=dtype),
+        torch.tensor([-10.0, 10.0], dtype=dtype),
+        torch.tensor(
+            [[7_000_000.0, -10_000.0, 0.0], [7_000_000.0, 10_000.0, 0.0]],
+            dtype=dtype,
+        ),
+        torch.tensor([[0.0, 1_000.0, 0.0], [0.0, 1_000.0, 0.0]], dtype=dtype),
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        0.056,
+        20,
+        5,
+        1.0e-6,
+        1.0e-4,
+        1.0e-4,
+        True,
+    )
+    result = result_from_native_outputs(outputs, operation="geo2rdr")
+
+    assert len(outputs) == len(NATIVE_RESULT_FIELDS) == 14
+    assert result.fields == NATIVE_RESULT_FIELDS
+    assert result.converged.tolist() == [True]
+    assert result.iterations.tolist() == [1]
+    telemetry = extension.native_v2_telemetry()
+    assert telemetry["openmp_defined"] is False
+    assert telemetry["runtime_name"] == "serial"
+    assert telemetry["visit_counts"] == [1]

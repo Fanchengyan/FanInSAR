@@ -42,8 +42,38 @@ def test_operation_and_source_selection_is_exact(
     assert plan.sources[-1].suffix == expected_suffix
 
 
-def test_linux_cpu_plan_separates_openmp_compile_and_link_flags() -> None:
-    """Linux CPU plans carry OpenMP in both distinct build phases."""
+def test_native_plans_include_both_operation_sources_and_shared_binding() -> None:
+    """CPU and CUDA plans carry both operation units behind one binding module."""
+    source_root = (
+        Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native_v2"
+    )
+    for backend in (NativeBackend.CPU, NativeBackend.CUDA):
+        plan = NativeBuilder().plan(
+            NativeBuildRequest(
+                GeometryOperation.GEO2RDR,
+                backend,
+                source_root=source_root,
+                platform="linux",
+                compiler="g++",
+            )
+        )
+        assert plan.sources[0] == source_root / "bindings.cpp"
+        assert any("geo2rdr" in source.name for source in plan.sources)
+        assert any("rdr2geo" in source.name for source in plan.sources)
+        assert all(source.exists() for source in plan.sources)
+    cuda_plan = NativeBuilder().plan(
+        NativeBuildRequest(
+            GeometryOperation.RDR2GEO,
+            NativeBackend.CUDA,
+            source_root=source_root,
+            platform="linux",
+        )
+    )
+    assert "-DFANINSAR_NATIVE_V2_CUDA=1" in cuda_plan.compile_flags
+
+
+def test_linux_cpu_plan_separates_openmp_flags_and_fails_closed() -> None:
+    """CPU plans retain OpenMP metadata but remain unavailable until qualified."""
     plan = NativeBuilder().plan(
         NativeBuildRequest(
             GeometryOperation.GEO2RDR,
@@ -53,7 +83,8 @@ def test_linux_cpu_plan_separates_openmp_compile_and_link_flags() -> None:
         )
     )
 
-    assert plan.supported
+    assert not plan.supported
+    assert "not scientifically qualified" in plan.unsupported_reason
     assert plan.compile_flags == ("-fopenmp",)
     assert plan.link_flags == ("-fopenmp",)
     assert plan.runtime_name == "libgomp"
@@ -90,8 +121,8 @@ def test_macos_libomp_provider_has_absolute_runtime_flags(tmp_path: Path) -> Non
     assert f"-L{tmp_path / 'lib'}" in result.flags.link_flags
 
 
-def test_dispatch_cannot_compile_on_demand() -> None:
-    """Compilation occurs only in explicit preparation, never dispatch."""
+def test_unqualified_native_candidate_cannot_compile_or_dispatch() -> None:
+    """Unqualified native sources fail closed before any build callback."""
     calls: list[str] = []
 
     def build(_plan: object) -> Path:
@@ -108,9 +139,8 @@ def test_dispatch_cannot_compile_on_demand() -> None:
         entry_point=lambda value: value + 1,
     )
 
-    assert calls == ["build"]
-    assert NativeBuilder().dispatch(candidate, 4) == 5
-    assert calls == ["build"]
+    assert candidate.status is PreparationStatus.UNSUPPORTED
+    assert calls == []
 
 
 def test_qualification_binds_exact_extension_and_geometry_symbol() -> None:

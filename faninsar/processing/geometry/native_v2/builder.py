@@ -147,13 +147,18 @@ def select_native_sources(
     suffix = ".cu" if backend is NativeBackend.CUDA else ".cpp"
     root = Path(source_root)
     # Keep the binding translation unit first: torch's extension loader needs
-    # exactly one ``PYBIND11_MODULE`` unit in every build artifact.  The
-    # binding exports both operation symbols, so both operation units are
-    # linked into the artifact even though the request still selects one
-    # operation identity for dispatch and qualification.
+    # exactly one ``PYBIND11_MODULE`` unit in every build artifact.  CPU uses
+    # the shared ABI implementation and both operation translation units;
+    # CUDA has one common header and two operation CUDA translation units.
+    if backend is NativeBackend.CUDA:
+        return (
+            root / "bindings.cpp",
+            root / "cuda" / "geo2rdr_cuda.cu",
+            root / "cuda" / "rdr2geo_tcn_cuda.cu",
+        )
     return (
         root / "bindings.cpp",
-        root / f"native_v2_abi{suffix}",
+        root / "native_v2_abi.cpp",
         root / f"{GeometryOperation.GEO2RDR.value}{suffix}",
         root / f"{GeometryOperation.RDR2GEO.value}{suffix}",
     )
@@ -168,11 +173,6 @@ class NativeBuilder:
 
     def plan(self, request: NativeBuildRequest) -> BuildPlan:
         """Create a deterministic build plan without compiling anything."""
-        provider = openmp_provider_for_platform(
-            request.platform,
-            compiler=request.compiler,
-            libomp_root=request.libomp_root,
-        )
         extension = f"faninsar_{request.operation.value}_v2_{request.backend.value}"
         symbol = extension
         sources = select_native_sources(
@@ -181,6 +181,11 @@ class NativeBuilder:
             request.source_root,
         )
         if request.backend is NativeBackend.CPU:
+            provider = openmp_provider_for_platform(
+                request.platform,
+                compiler=request.compiler,
+                libomp_root=request.libomp_root,
+            )
             flags = provider.flags
             return BuildPlan(
                 request.operation,
@@ -193,8 +198,13 @@ class NativeBuilder:
                 flags.include_dirs,
                 flags.library_dirs,
                 flags.runtime_name or None,
-                flags.supported,
-                flags.reason,
+                False,
+                (
+                    "native-v2 CPU kernels are experimental and not scientifically "
+                    "qualified"
+                    if flags.supported
+                    else flags.reason
+                ),
             )
         return BuildPlan(
             request.operation,
@@ -202,9 +212,15 @@ class NativeBuilder:
             extension,
             symbol,
             sources,
-            ("-O3",),
+            ("-O3", "-DFANINSAR_NATIVE_V2_CUDA=1"),
             (),
+            (request.source_root / "cuda",),
             runtime_name=None,
+            supported=False,
+            unsupported_reason=(
+                "native-v2 CUDA kernels are experimental and not scientifically "
+                "qualified"
+            ),
         )
 
     def prepare(
