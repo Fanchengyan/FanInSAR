@@ -416,7 +416,7 @@ def prepare_torch_geometry(
         try:
             compiled_kernel = torch.compile(_probe_kernel, dynamic=False)
             sample = torch.zeros(
-                (1,),
+                shape,
                 dtype=getattr(torch, canonical_dtype.split(".")[-1]),
                 device=resolved_device,
             )
