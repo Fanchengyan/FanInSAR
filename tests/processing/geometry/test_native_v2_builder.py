@@ -121,6 +121,21 @@ def test_macos_libomp_provider_has_absolute_runtime_flags(tmp_path: Path) -> Non
     assert f"-L{tmp_path / 'lib'}" in result.flags.link_flags
 
 
+def test_macos_libomp_provider_discovers_pixi_environment_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Pixi environment prefix is a valid LLVM libomp installation root."""
+    (tmp_path / "include").mkdir()
+    (tmp_path / "lib").mkdir()
+    monkeypatch.setenv("CONDA_PREFIX", str(tmp_path))
+
+    result = openmp_provider_for_platform("macos")
+
+    assert result.supported
+    assert result.flags.runtime_path == tmp_path / "lib" / "libomp.dylib"
+    assert f"-Wl,-rpath,{tmp_path / 'lib'}" in result.flags.link_flags
+
+
 def test_unqualified_native_candidate_cannot_compile_or_dispatch() -> None:
     """Unqualified native sources fail closed before any build callback."""
     calls: list[str] = []

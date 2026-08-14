@@ -186,17 +186,18 @@ def _flags_for_platform(
             sys.prefix,
         )
         prefixes = tuple(Path(value) for value in prefix_values if value)
-        candidates = tuple(
-            candidate
-            for candidate in (
-                Path(root_value) if root_value else None,
+        if root_value:
+            # An explicit root is an authority boundary: do not silently use
+            # another runtime when the requested installation is unavailable.
+            candidates = (Path(root_value),)
+        else:
+            candidates = (
                 Path("/opt/homebrew/opt/libomp"),
                 Path("/usr/local/opt/libomp"),
+                *prefixes,
                 *(prefix / "opt" / "libomp" for prefix in prefixes),
                 *(prefix / "libomp" for prefix in prefixes),
             )
-            if candidate is not None
-        )
         root = next(
             (
                 candidate
