@@ -94,10 +94,11 @@ def _result_invalid(output: dict[str, Any], finite: Any) -> dict[str, Any]:
         )
     output["converged"] = output["converged"] & finite
     output["iterations"] = torch.where(
-        output["converged"],
+        finite,
         output["iterations"],
         torch.full_like(output["iterations"], -1),
     )
+    output["invalid"] = ~finite
     return output
 
 

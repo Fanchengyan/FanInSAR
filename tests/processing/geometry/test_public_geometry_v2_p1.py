@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pytest
 
@@ -11,6 +13,7 @@ from faninsar.processing.geometry.backend_dispatch import (
     Dispatcher,
 )
 from faninsar.processing.geometry.dem import ConstantHeightDEM
+from faninsar.processing.geometry.native_v2.bindings import result_from_native_outputs
 from faninsar.processing.geometry.native_v2.builder import (
     BuildPlan,
     GeometryOperation,
@@ -18,7 +21,10 @@ from faninsar.processing.geometry.native_v2.builder import (
     PreparationStatus,
     PreparedNativeCandidate,
 )
-from faninsar.processing.geometry.torch_backends_v2 import prepare_torch_geometry
+from faninsar.processing.geometry.torch_backends_v2 import (
+    TorchGeometryResult,
+    prepare_torch_geometry,
+)
 from faninsar.processing.geometry.v2 import (
     CandidateKey,
     DeviceKey,
@@ -28,6 +34,9 @@ from faninsar.processing.geometry.v2 import (
 )
 
 from .test_public_geometry_v2 import _model, _native_key, _native_outputs
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_torch_result_publishes_actual_iterations_and_invalid_tolerance() -> None:
@@ -265,3 +274,83 @@ def test_composed_dem_identity_changes_with_nested_sampler() -> None:
         dem=GeoidAdjustedDEM(ConstantHeightDEM(10.0), ConstantHeightDEM(2.0)),
     )
     assert first.identity.dem_digest != second.identity.dem_digest
+
+
+def test_finite_exhausted_lane_keeps_diagnostics_and_coordinates() -> None:
+    """Only explicitly invalid lanes receive NaN/-1 sentinels."""
+    fields = {
+        "latitude_deg": np.array([4.0]),
+        "longitude_deg": np.array([5.0]),
+        "height_m": np.array([6.0]),
+        "range_index": np.array([7.0]),
+        "azimuth_index": np.array([8.0]),
+        "converged": np.array([False]),
+        "iterations": np.array([3], dtype=np.int32),
+        "residual_range_m": np.array([0.5]),
+        "residual_doppler_hz": np.array([0.25]),
+    }
+    result = TorchGeometryResult.from_transform(
+        fields,
+        operation=Operation.RDR2GEO,
+        device="cpu",
+        dtype="torch.float64",
+        identity="identity",
+        backend="torch_eager",
+    ).transform
+    assert result.iterations[0] == 3
+    assert result.max_iter_exhausted[0]
+    assert np.isfinite(result.latitude_deg[0])
+    assert np.isfinite(result.tolerance[0])
+
+
+def test_native_binding_preserves_finite_exhaustion() -> None:
+    """Native ABI normalization does not confuse exhaustion with invalidity."""
+    values = [
+        np.array([1.0]),
+        np.array([2.0]),
+        np.array([3.0]),
+        np.array([4.0]),
+        np.array([5.0]),
+        np.array([False]),
+        np.array([4], dtype=np.int32),
+        np.array([0.5]),
+        np.array([0.5]),
+        np.array([0.01]),
+        np.array([True]),
+        np.array([False]),
+        np.array([0.5]),
+        np.array([0.25]),
+    ]
+    result = result_from_native_outputs(values, operation=Operation.RDR2GEO)
+    assert result.iterations[0] == 4
+    assert result.max_iter_exhausted[0]
+    assert np.isfinite(result.latitude_deg[0])
+
+
+def test_native_manifest_rejects_executable_identity_difference(tmp_path: Path) -> None:
+    """A candidate manifest must match every executable identity field."""
+    artifact = tmp_path / "native.so"
+    artifact.write_bytes(b"native")
+    plan = BuildPlan(
+        GeometryOperation.GEO2RDR,
+        NativeBackend.CPU,
+        "native",
+        "native",
+        (),
+        (),
+        (),
+    )
+    candidate = PreparedNativeCandidate(
+        plan,
+        PreparationStatus.PREPARED,
+        artifact=artifact,
+        _entry_point=lambda *_: (),
+    )
+    with pytest.raises(Exception, match="executable"):
+        prepare_geometry(
+            Operation.GEO2RDR,
+            _model(),
+            shape=(1,),
+            native_candidate=candidate,
+            native_key=_native_key(_model(), (1,), Operation.GEO2RDR),
+        )

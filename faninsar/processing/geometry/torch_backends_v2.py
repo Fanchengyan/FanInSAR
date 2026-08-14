@@ -327,6 +327,9 @@ class TorchGeometryResult:
         values = {name: np.asarray(value) for name, value in result.items()}
         shape = values["latitude_deg"].shape
         converged = np.asarray(values["converged"], dtype=bool)
+        invalid_mask = np.asarray(
+            values.get("invalid", ~np.isfinite(values["latitude_deg"])), dtype=bool
+        )
         residual_range = np.asarray(values["residual_range_m"], dtype=np.float64)
         residual_doppler = np.asarray(values["residual_doppler_hz"], dtype=np.float64)
         if operation is Operation.GEO2RDR:
@@ -350,13 +353,13 @@ class TorchGeometryResult:
                 "decision_residual": decision,
                 "final_residual": decision,
                 "tolerance": tolerance_array,
-                "max_iter_exhausted": ~converged,
+                "max_iter_exhausted": (~converged) & ~invalid_mask,
                 "boundary_rechecked": np.zeros(shape, dtype=bool),
                 "residual_range_m": residual_range,
                 "residual_doppler_hz": residual_doppler,
             },
             operation=operation,
-            invalid_mask=~converged,
+            invalid_mask=invalid_mask,
         )
         return cls(
             foundation,

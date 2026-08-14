@@ -69,7 +69,7 @@ def result_from_native_outputs(
     # Do not coerce ABI dtypes here.  The central result contract must reject
     # an extension that silently changes its field types; native CPU/CUDA
     # kernels are responsible for publishing float64/int32/bool fields.
-    invalid_mask = ~np.asarray(fields["converged"], dtype=bool)
+    invalid_mask = ~np.isfinite(np.asarray(fields["latitude_deg"], dtype=np.float64))
     return TransformResultV2.from_arrays(
         fields,
         operation=operation,

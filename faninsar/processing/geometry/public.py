@@ -132,7 +132,9 @@ def _native_public_result(
         result = TransformResultV2.from_arrays(
             {name: getattr(outputs, name) for name in outputs.fields},
             operation=operation,
-            invalid_mask=~np.asarray(outputs.converged, dtype=bool),
+            invalid_mask=~np.isfinite(
+                np.asarray(outputs.latitude_deg, dtype=np.float64)
+            ),
         )
     else:
         if not isinstance(outputs, Sequence):
@@ -239,7 +241,9 @@ def _native_public_result(
                 )
             decisions.append(decision)
         attempts.append(attempt)
-    normalized = normalize_result_boundary(result, decisions, invalid_mask=~valid)
+    invalid = ~np.isfinite(result.latitude_deg) | ~np.isfinite(result.longitude_deg)
+    invalid |= ~np.isfinite(result.height_m)
+    normalized = normalize_result_boundary(result, decisions, invalid_mask=invalid)
     if iteration_budget is None:
         return normalized
     fields = {name: getattr(normalized, name).copy() for name in normalized.fields}
@@ -323,12 +327,16 @@ def _key(
 def _validate_native_manifest(
     manifest: CandidateKey,
     expected: CandidateKey,
+    *,
+    exact_executable: bool,
 ) -> CandidateKey:
     """Validate an explicit native manifest against the prepared executable."""
     if manifest.backend != "native":
         raise DispatchError("native manifest must identify the native backend")
+    if exact_executable and manifest != expected:
+        raise DispatchError("native manifest does not match prepared executable")
     if (
-        manifest != expected
+        not exact_executable
         and manifest.scientific_identity != expected.scientific_identity
     ):
         raise DispatchError("native manifest does not match prepared geometry")
@@ -513,7 +521,11 @@ def prepare_geometry(
                 "native_executor requires an explicit CandidateKey manifest"
             )
         registered_native_key = (
-            _validate_native_manifest(native_key, derived_key)
+            _validate_native_manifest(
+                native_key,
+                derived_key,
+                exact_executable=native_candidate is not None,
+            )
             if native_key is not None
             else derived_key
         )

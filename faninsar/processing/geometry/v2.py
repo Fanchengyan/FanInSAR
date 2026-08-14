@@ -748,6 +748,8 @@ def validate_tensor_span(
             actual_device.physical_uuid != expected_device.physical_uuid
         ):
             raise GeometryValidationError(f"{name} has the wrong physical CUDA device")
+        if actual_device.mig_uuid != expected_device.mig_uuid:
+            raise GeometryValidationError(f"{name} has the wrong MIG device")
     storage = tensor.untyped_storage()
     address = int(tensor.data_ptr())
     byte_length = int(tensor.numel() * tensor.element_size())
