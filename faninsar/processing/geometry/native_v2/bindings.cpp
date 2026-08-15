@@ -114,6 +114,7 @@ std::vector<torch::Tensor> rdr2geo_cuda_public(
       dem_dy, reference_height, min_height, max_height, wavelength,
       range_tolerance, doppler_tolerance, max_iter, extra_iter, right_looking,
       row_width);
+  result.pop_back();
   TORCH_CHECK(result.size() == 14,
               "native CUDA rdr2geo public ABI must return 14 fields");
   if (azimuth.dim() == 2) {

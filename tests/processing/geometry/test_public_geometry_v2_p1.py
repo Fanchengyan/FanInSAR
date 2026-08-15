@@ -15,6 +15,7 @@ from faninsar.processing.geometry import (
     prepare_geometry,
     torch_kernels,
 )
+from faninsar.processing.geometry import public as geometry_public
 from faninsar.processing.geometry.backend_dispatch import (
     CudaExecutionError,
     Dispatcher,
@@ -38,6 +39,7 @@ from faninsar.processing.geometry.v2 import (
     DeviceKey,
     GeometryValidationError,
     SolverSettings,
+    TransformResultV2,
     validate_tensor_span,
 )
 
@@ -72,12 +74,13 @@ def test_geo2rdr_convergence_uses_physical_metric_not_newton_step() -> None:
     assert "newly = active & valid & in_bounds" in source
     assert "metric < 1.0" in source
     native_root = Path(torch_kernels.__file__).parent / "native_v2"
-    assert "fabs(step) < time_tolerance" not in (
-        native_root / "cuda" / "geo2rdr_cuda.cu"
-    ).read_text()
-    assert "std::abs(step) <= time_tol_s" not in (
-        native_root / "geo2rdr.cpp"
-    ).read_text()
+    assert (
+        "fabs(step) < time_tolerance"
+        not in (native_root / "cuda" / "geo2rdr_cuda.cu").read_text()
+    )
+    assert (
+        "std::abs(step) <= time_tol_s" not in (native_root / "geo2rdr.cpp").read_text()
+    )
 
 
 def test_constant_dem_bypasses_fixed_point_and_commits_sampled_height(
@@ -125,24 +128,32 @@ def test_constant_dem_eager_and_compiled_match_near_threshold_multilane() -> Non
         np.array([0.0, 1.0], dtype=np.float64),
         np.zeros(2, dtype=np.float64),
     )
-    eager = prepare_torch_geometry(
-        "rdr2geo",
-        model,
-        shape=(2,),
-        dem=ConstantHeightDEM(50.0),
-        max_iter=4,
-        range_tol_m=1.0,
-    ).execute(*values).transform
-    try:
-        compiled = prepare_torch_geometry(
+    eager = (
+        prepare_torch_geometry(
             "rdr2geo",
             model,
             shape=(2,),
             dem=ConstantHeightDEM(50.0),
             max_iter=4,
             range_tol_m=1.0,
-            compile_kernel=True,
-        ).execute(*values).transform
+        )
+        .execute(*values)
+        .transform
+    )
+    try:
+        compiled = (
+            prepare_torch_geometry(
+                "rdr2geo",
+                model,
+                shape=(2,),
+                dem=ConstantHeightDEM(50.0),
+                max_iter=4,
+                range_tol_m=1.0,
+                compile_kernel=True,
+            )
+            .execute(*values)
+            .transform
+        )
     except RuntimeError as error:
         message = "".join(traceback.format_exception(error))
         if "libc++.1.dylib" in message:
@@ -184,6 +195,62 @@ def test_native_callback_rejects_wrong_dtype_before_invocation() -> None:
             np.zeros(1, dtype=np.float32),
             np.zeros(1, dtype=np.float64),
             np.zeros(1, dtype=np.float64),
+            selector="native",
+        )
+    assert calls == []
+
+
+def test_native_cpu_flattens_and_restores_two_dimensional_public_shape() -> None:
+    """The CPU native seam adapts 2-D public arrays to the vector ABI."""
+    model = _model()
+    seen_shapes: list[tuple[tuple[int, ...], ...]] = []
+
+    def native_executor(*values: np.ndarray) -> list[np.ndarray]:
+        seen_shapes.append(tuple(tuple(value.shape) for value in values[:3]))
+        return _native_outputs(model, values[:3])
+
+    prepared = prepare_geometry(
+        Operation.GEO2RDR,
+        model,
+        shape=(2, 2),
+        native_executor=native_executor,
+        native_context_inputs=_native_context(model, Operation.GEO2RDR),
+        native_key=_native_key(model, (2, 2), Operation.GEO2RDR),
+        native_correctness_qualified=True,
+    )
+    result = execute_geometry(
+        prepared,
+        np.zeros((2, 2), dtype=np.float64),
+        np.zeros((2, 2), dtype=np.float64),
+        np.zeros((2, 2), dtype=np.float64),
+        selector="native",
+    )
+
+    assert seen_shapes == [((4,), (4,), (4,))]
+    assert result.latitude_deg.shape == (2, 2)
+    assert result.iterations.shape == (2, 2)
+
+
+def test_native_public_validation_rejects_three_dimensional_shape() -> None:
+    """Native public execution has one consistent rank limit across devices."""
+    calls: list[int] = []
+    model = _model()
+    prepared = prepare_geometry(
+        Operation.GEO2RDR,
+        model,
+        shape=(1, 1, 1),
+        native_executor=lambda *_: calls.append(1),
+        native_context_inputs=_native_context(model, Operation.GEO2RDR),
+        native_key=_native_key(model, (1, 1, 1), Operation.GEO2RDR),
+        native_correctness_qualified=True,
+    )
+
+    with pytest.raises(GeometryValidationError, match="one- or two-dimensional"):
+        execute_geometry(
+            prepared,
+            np.zeros((1, 1, 1), dtype=np.float64),
+            np.zeros((1, 1, 1), dtype=np.float64),
+            np.zeros((1, 1, 1), dtype=np.float64),
             selector="native",
         )
     assert calls == []
@@ -348,6 +415,86 @@ def test_boundary_rejection_uses_remaining_attempt_budget() -> None:
     assert calls == 2
     assert result.converged[0]
     assert result.iterations[0] == 2
+
+
+def test_native_public_no_callback_uses_array_normalization_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-callback publication must not allocate one decision per lane."""
+    shape = (2048,)
+    fields = {
+        "latitude_deg": np.ones(shape, dtype=np.float64),
+        "longitude_deg": np.ones(shape, dtype=np.float64),
+        "height_m": np.ones(shape, dtype=np.float64),
+        "range_index": np.ones(shape, dtype=np.float64),
+        "azimuth_index": np.ones(shape, dtype=np.float64),
+        "converged": np.ones(shape, dtype=bool),
+        "iterations": np.ones(shape, dtype=np.int32),
+        "decision_residual": np.full(shape, 0.25, dtype=np.float64),
+        "final_residual": np.full(shape, 0.25, dtype=np.float64),
+        "tolerance": np.ones(shape, dtype=np.float64),
+        "max_iter_exhausted": np.zeros(shape, dtype=bool),
+        "boundary_rechecked": np.zeros(shape, dtype=bool),
+        "residual_range_m": np.full(shape, 0.002, dtype=np.float64),
+        "residual_doppler_hz": np.full(shape, 0.002, dtype=np.float64),
+    }
+    result = TransformResultV2.from_arrays(fields, operation=Operation.GEO2RDR)
+
+    def unexpected_decision(*_: object, **__: object) -> None:
+        raise AssertionError
+
+    monkeypatch.setattr(geometry_public, "BoundaryDecision", unexpected_decision)
+    monkeypatch.setattr(
+        geometry_public,
+        "normalize_result_boundary",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("no-callback publication used scalar normalization")
+        ),
+    )
+
+    published = geometry_public._native_public_result(
+        result,
+        operation=Operation.GEO2RDR,
+    )
+
+    np.testing.assert_array_equal(published.latitude_deg, result.latitude_deg)
+    np.testing.assert_array_equal(published.decision_residual, result.decision_residual)
+
+
+def test_native_public_no_callback_preserves_scalar_status_semantics() -> None:
+    """Array normalization keeps finite failures and invalid sentinels exact."""
+    fields = {
+        "latitude_deg": np.array([1.0, 2.0, np.nan], dtype=np.float64),
+        "longitude_deg": np.array([1.0, 2.0, 3.0], dtype=np.float64),
+        "height_m": np.array([1.0, 2.0, 3.0], dtype=np.float64),
+        "range_index": np.ones(3, dtype=np.float64),
+        "azimuth_index": np.ones(3, dtype=np.float64),
+        "converged": np.array([True, False, False]),
+        "iterations": np.array([1, 4, 4], dtype=np.int32),
+        "decision_residual": np.array([0.1, 4.0, 4.0], dtype=np.float64),
+        "final_residual": np.array([0.1, 4.0, 4.0], dtype=np.float64),
+        "tolerance": np.ones(3, dtype=np.float64),
+        "max_iter_exhausted": np.array([False, True, True]),
+        "boundary_rechecked": np.array([False, True, True]),
+        "residual_range_m": np.ones(3, dtype=np.float64),
+        "residual_doppler_hz": np.ones(3, dtype=np.float64),
+    }
+    result = TransformResultV2.from_arrays(
+        fields,
+        operation=Operation.GEO2RDR,
+        invalid_mask=np.array([False, False, True]),
+    )
+
+    published = geometry_public._native_public_result(
+        result,
+        operation=Operation.GEO2RDR,
+    )
+
+    assert published.converged.tolist() == [True, False, False]
+    assert published.boundary_rechecked.tolist() == [False, False, False]
+    assert np.isnan(published.decision_residual[1])
+    assert published.iterations.tolist() == [1, 4, -1]
+    assert np.isnan(published.latitude_deg[2])
 
 
 def test_tensor_span_validates_owner_and_device() -> None:

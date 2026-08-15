@@ -45,7 +45,9 @@ def result_from_native_outputs(
     Returns
     -------
     TransformResultV2
-        Validated, owned NumPy arrays with the exact public result contract.
+        Validated NumPy arrays with the exact public result contract. CUDA
+        tensor fields retain the independent host allocation created by their
+        ``.cpu()`` transfer; CPU tensor and NumPy fields are copied.
 
     Raises
     ------
@@ -64,7 +66,13 @@ def result_from_native_outputs(
         candidate = value
         detach = getattr(candidate, "detach", None)
         if callable(detach):
-            candidate = detach().cpu().numpy()
+            tensor = detach()
+            candidate = tensor.cpu().numpy()
+            if getattr(getattr(tensor, "device", None), "type", None) == "cuda":
+                # Each CUDA ``.cpu()`` call creates a fresh host allocation;
+                # retaining its NumPy view avoids a second 14-field copy.
+                fields[name] = np.asarray(candidate)
+                continue
         fields[name] = np.array(candidate, copy=True)
     # Do not coerce ABI dtypes here.  The central result contract must reject
     # an extension that silently changes its field types; native CPU/CUDA

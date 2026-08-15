@@ -70,6 +70,30 @@ def test_native_plans_include_both_operation_sources_and_shared_binding() -> Non
         )
     )
     assert "-DFANINSAR_NATIVE_V2_CUDA=1" in cuda_plan.compile_flags
+    assert "-DFANINSAR_NATIVE_V2_BLOCKS_PER_SM=4" in cuda_plan.compile_flags
+
+
+def test_cuda_launch_profile_is_a_build_request_option() -> None:
+    """CUDA occupancy candidates are selected at preparation time."""
+    plan = NativeBuilder().plan(
+        NativeBuildRequest(
+            GeometryOperation.RDR2GEO,
+            NativeBackend.CUDA,
+            cuda_blocks_per_sm=10,
+        )
+    )
+
+    assert "-DFANINSAR_NATIVE_V2_BLOCKS_PER_SM=10" in plan.compile_flags
+
+
+def test_cuda_launch_profile_rejects_non_positive_values() -> None:
+    """A launch profile cannot create an empty worker grid."""
+    with pytest.raises(ValueError, match="cuda_blocks_per_sm must be positive"):
+        NativeBuildRequest(
+            GeometryOperation.RDR2GEO,
+            NativeBackend.CUDA,
+            cuda_blocks_per_sm=0,
+        )
 
 
 def test_linux_cpu_plan_separates_openmp_flags_and_fails_closed() -> None:

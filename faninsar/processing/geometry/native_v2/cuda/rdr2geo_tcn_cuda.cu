@@ -11,7 +11,11 @@ namespace {
 // uses row_width=1.  Keeping contexts reusable avoids repeating orbit
 // interpolation and local-frame construction in every persistent worker.
 constexpr int kContextStride = 21;
-constexpr int kBlocksPerSm = 2;
+#ifndef FANINSAR_NATIVE_V2_BLOCKS_PER_SM
+#define FANINSAR_NATIVE_V2_BLOCKS_PER_SM 4
+#endif
+constexpr int kBlocksPerSm = FANINSAR_NATIVE_V2_BLOCKS_PER_SM;
+static_assert(kBlocksPerSm > 0, "blocks_per_sm must be positive");
 
 __device__ inline double safe_denominator(double value) {
   if (fabs(value) >= 1.0e-12) return value;
@@ -231,12 +235,13 @@ __global__ void rdr2geo_tcn_kernel(
     decision = latest_range_residual;
     if (now_converged) {
       solved = true;
-      height = sampled_height;
+      height = new_height;
       break;
     }
-    if (iteration > primary_iter) {
+    if (iteration >= primary_iter) {
       double old_xyz[3];
-      llh_to_ecef(old_llh[1], old_llh[0], old_llh[2], old_xyz);
+      llh_to_ecef(old_llh[1] / kDegreesToRadians,
+                  old_llh[0] / kDegreesToRadians, old_llh[2], old_xyz);
       for (int axis = 0; axis < 3; ++axis)
         target_xyz[axis] = 0.5 * (old_xyz[axis] + dem_xyz[axis]);
       double average_latitude = 0.0, average_longitude = 0.0;
@@ -259,16 +264,6 @@ __global__ void rdr2geo_tcn_kernel(
 
   const bool budget_exhausted = !solved && !stopped_early && attempts >= budget;
   if (!solved && !budget_exhausted) continue;
-  if (budget_exhausted) {
-    iterations[point] = static_cast<int32_t>(budget);
-    max_iter_exhausted[point] = true;
-    tolerance[point] = range_tolerance;
-    range_residual[point] = latest_range_residual;
-    doppler_residual[point] = latest_doppler_residual;
-    decision_residual[point] = latest_range_residual;
-    final_residual[point] = latest_range_residual;
-    continue;
-  }
 
   const double semi_minor = radius + height;
   const double cos_theta = 0.5 *
@@ -302,9 +297,10 @@ __global__ void rdr2geo_tcn_kernel(
   const bool final_converged =
       isfinite(latest_range_residual) &&
       fabs(latest_range_residual) < range_tolerance;
-  if (!final_converged) continue;
-  iterations[point] = attempts;
-  max_iter_exhausted[point] = false;
+  const bool publish_converged = final_converged && !budget_exhausted;
+  if (!final_converged && !budget_exhausted) continue;
+  iterations[point] = budget_exhausted ? static_cast<int32_t>(budget) : attempts;
+  max_iter_exhausted[point] = budget_exhausted;
   tolerance[point] = range_tolerance;
   range_residual[point] = latest_range_residual;
   doppler_residual[point] = latest_doppler_residual;
@@ -315,7 +311,7 @@ __global__ void rdr2geo_tcn_kernel(
   output_height[point] = dem == nullptr ? height : final_height;
   output_range[point] = range;
   output_azimuth[point] = azimuth;
-  converged[point] = true;
+  converged[point] = publish_converged;
 }
 }
 

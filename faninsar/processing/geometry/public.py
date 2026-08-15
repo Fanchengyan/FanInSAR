@@ -6,7 +6,8 @@ The public boundary is intentionally small.  Preparation creates the eager
 Torch adapter and, when requested, the compiled adapter or a native candidate.
 Execution only selects an already prepared entry in the local dispatcher; it
 never calls a compiler.  All results, including native results, are converted
-through :class:`TransformResultV2` and the canonical boundary normalizer.
+through :class:`TransformResultV2`; callback-enabled results use the canonical
+boundary normalizer.
 """
 
 from __future__ import annotations
@@ -75,6 +76,81 @@ _RDR2GEO_NATIVE_CONTEXT_FIELDS = (
 )
 
 
+def _normalize_without_boundary_callback(
+    result: TransformResultV2,
+    *,
+    invalid_mask: np.ndarray,
+) -> TransformResultV2:
+    """Publish a result without constructing scalar boundary decisions.
+
+    Parameters
+    ----------
+    result : TransformResultV2
+        Validated backend result.
+    invalid_mask : numpy.ndarray
+        Final coordinate-validity mask used by the public contract.
+
+    Returns
+    -------
+    TransformResultV2
+        The original result when no status needs changing, otherwise a result
+        sharing untouched arrays and copying only fields that are normalized.
+
+    Notes
+    -----
+    With no callback, a non-converged finite lane receives the same canonical
+    status as the scalar path: ``decision_residual`` is NaN and
+    ``boundary_rechecked`` is false.  Invalid lanes receive the usual public
+    sentinels.  Both operations are expressed as array masks so large grids do
+    not allocate one ``BoundaryDecision`` object per point.
+
+    """
+    flat_invalid = np.asarray(invalid_mask, dtype=bool).reshape(-1)
+    flat_converged = np.asarray(result.converged, dtype=bool).reshape(-1)
+    needs_status = (~flat_converged) & ~flat_invalid
+    if not np.any(needs_status) and not np.any(flat_invalid):
+        return result
+
+    fields = {name: getattr(result, name) for name in result.fields}
+    if np.any(needs_status):
+        boundary_rechecked = np.array(result.boundary_rechecked, copy=True)
+        boundary_rechecked.reshape(-1)[needs_status] = False
+        decision_residual = np.array(result.decision_residual, copy=True)
+        decision_residual.reshape(-1)[needs_status] = np.nan
+        fields.update(
+            {
+                "boundary_rechecked": boundary_rechecked,
+                "decision_residual": decision_residual,
+            }
+        )
+
+    if np.any(flat_invalid):
+        for name in (
+            "latitude_deg",
+            "longitude_deg",
+            "height_m",
+            "range_index",
+            "azimuth_index",
+            "decision_residual",
+            "final_residual",
+            "tolerance",
+            "residual_range_m",
+            "residual_doppler_hz",
+        ):
+            value = np.array(fields[name], copy=True)
+            value.reshape(-1)[flat_invalid] = np.nan
+            fields[name] = value
+        value = np.array(fields["iterations"], copy=True)
+        value.reshape(-1)[flat_invalid] = -1
+        fields["iterations"] = value
+        for name in ("converged", "max_iter_exhausted", "boundary_rechecked"):
+            value = np.array(fields[name], copy=True)
+            value.reshape(-1)[flat_invalid] = False
+            fields[name] = value
+
+    return TransformResultV2(**fields)
+
+
 def _validate_native_context_inputs(
     operation: Operation,
     context: NativeContextInputs | None,
@@ -94,13 +170,11 @@ def _validate_native_context_inputs(
     unknown = tuple(name for name in context if name not in required)
     if missing:
         raise DispatchError(
-            "native geometry context is missing required fields: "
-            + ", ".join(missing)
+            "native geometry context is missing required fields: " + ", ".join(missing)
         )
     if unknown:
         raise DispatchError(
-            "native geometry context contains unknown fields: "
-            + ", ".join(unknown)
+            "native geometry context contains unknown fields: " + ", ".join(unknown)
         )
 
     expected_shapes: dict[str, tuple[int, ...] | None] = {
@@ -197,6 +271,10 @@ def _validate_public_inputs(
     expected_device: DeviceKey,
 ) -> tuple[object, ...]:
     """Validate host spans before handing arrays to a native callback."""
+    if len(shape) > 2:
+        raise GeometryValidationError(
+            "native geometry supports only one- or two-dimensional inputs"
+        )
     if operation is Operation.RDR2GEO and len(inputs) == 2:
         inputs = (*inputs, np.zeros(shape, dtype=np.float64))
     if len(inputs) != 3:
@@ -220,7 +298,7 @@ def _validate_public_inputs(
                 expected_device=expected_device,
                 name=f"geometry input {index}",
             )
-            arrays.append(value)
+            arrays.append(value.reshape(-1) if expected_device.kind == "cpu" else value)
             continue
         if not isinstance(value, np.ndarray):
             raise TypeError("native geometry inputs must be NumPy arrays")
@@ -231,7 +309,7 @@ def _validate_public_inputs(
             expected_device=DeviceKey.cpu(),
             name=f"geometry input {index}",
         )
-        arrays.append(value)
+        arrays.append(value.reshape(-1) if expected_device.kind == "cpu" else value)
     return tuple(arrays)
 
 
@@ -244,6 +322,7 @@ def _native_public_result(
     doppler_tolerance_hz: float = 0.1,
     slant_range_tolerance_m: float = 0.01,
     iteration_budget: int | None = None,
+    output_shape: tuple[int, ...] | None = None,
 ) -> TransformResultV2:
     """Convert and canonically normalize one backend result."""
     if isinstance(outputs, TransformResultV2):
@@ -258,6 +337,24 @@ def _native_public_result(
         if not isinstance(outputs, Sequence):
             raise DispatchError("native geometry executor did not return a sequence")
         result = result_from_native_outputs(outputs, operation=operation)
+
+    if output_shape is not None and result.latitude_deg.shape != output_shape:
+        fields = {
+            name: np.asarray(getattr(result, name)).reshape(output_shape)
+            for name in result.fields
+        }
+        result = TransformResultV2.from_arrays(
+            fields,
+            operation=operation,
+            invalid_mask=~np.isfinite(
+                np.asarray(fields["latitude_deg"], dtype=np.float64)
+            ),
+        )
+
+    invalid = ~np.isfinite(result.latitude_deg) | ~np.isfinite(result.longitude_deg)
+    invalid |= ~np.isfinite(result.height_m)
+    if boundary_callback is None:
+        return _normalize_without_boundary_callback(result, invalid_mask=invalid)
 
     valid = np.asarray(result.converged, dtype=bool)
     flat_valid = valid.reshape(-1)
@@ -359,8 +456,6 @@ def _native_public_result(
                 )
             decisions.append(decision)
         attempts.append(attempt)
-    invalid = ~np.isfinite(result.latitude_deg) | ~np.isfinite(result.longitude_deg)
-    invalid |= ~np.isfinite(result.height_m)
     normalized = normalize_result_boundary(result, decisions, invalid_mask=invalid)
     if iteration_budget is None:
         return normalized
@@ -678,6 +773,7 @@ def prepare_geometry(
                     doppler_tolerance_hz=solver.doppler_tolerance_hz,
                     slant_range_tolerance_m=solver.slant_range_tolerance_m,
                     iteration_budget=solver.budget,
+                    output_shape=normalized_shape,
                 )
             if entry is None:
                 raise DispatchError("native geometry executor is missing")
@@ -689,6 +785,7 @@ def prepare_geometry(
                 doppler_tolerance_hz=solver.doppler_tolerance_hz,
                 slant_range_tolerance_m=solver.slant_range_tolerance_m,
                 iteration_budget=solver.budget,
+                output_shape=normalized_shape,
             )
 
         dispatcher.register(

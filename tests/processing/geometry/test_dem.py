@@ -6,15 +6,14 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pytest
 from affine import Affine
 
-from faninsar.processing.geometry import RasterDEM
+from faninsar.processing.geometry import RasterDEM, torch_kernels
 from faninsar.processing.geometry.dem import _natural_spline_six
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 def test_raster_dem_reuses_loaded_height_array(
@@ -90,3 +89,40 @@ def test_isce_six_sample_spline_preserves_linear_surfaces() -> None:
     interpolated = _natural_spline_six(tiled, fractions)
 
     np.testing.assert_allclose(interpolated, 23.0 + 3.0 * fractions)
+
+
+def test_torch_spline_weights_match_recursive_float64_reference() -> None:
+    """Closed-form six-point weights preserve the recursive spline values."""
+    torch = pytest.importorskip("torch")
+    values = torch.tensor(
+        [
+            [0.5, 1.25, -2.0, 4.0, 3.5, -1.0],
+            [10.0, -4.0, 2.0, 8.0, 0.25, 5.0],
+            [-3.0, 7.0, 11.0, -2.5, 6.0, 1.0],
+        ],
+        dtype=torch.float64,
+    )
+    fractions = torch.tensor([0.0, 0.37, 1.0], dtype=torch.float64)
+
+    second = [torch.zeros_like(fractions) for _ in range(6)]
+    recurrence = [torch.zeros_like(fractions) for _ in range(6)]
+    for index in range(1, 5):
+        denominator = recurrence[index - 1] / 2.0 + 2.0
+        recurrence[index] = -0.5 / denominator
+        second[index] = (
+            3.0 * (values[:, index + 1] - 2.0 * values[:, index] + values[:, index - 1])
+            - second[index - 1] / 2.0
+        ) / denominator
+    for index in range(4, 0, -1):
+        second[index] = recurrence[index] * second[index + 1] + second[index]
+    recursive = values[:, 1] + fractions * (
+        values[:, 2]
+        - values[:, 1]
+        - second[1] / 3.0
+        - second[2] / 6.0
+        + fractions * (second[1] / 2.0 + fractions * (second[2] - second[1]) / 6.0)
+    )
+    weights = torch_kernels._spline_six_weights(fractions)
+    weighted = torch.sum(values * weights, dim=-1)
+
+    torch.testing.assert_close(weighted, recursive, rtol=1.0e-12, atol=1.0e-12)

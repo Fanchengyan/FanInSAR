@@ -53,6 +53,7 @@ class NativeBuildRequest:
     platform: str | None = None
     compiler: str | None = None
     libomp_root: Path | None = None
+    cuda_blocks_per_sm: int = 4
 
     def __post_init__(self) -> None:
         """Normalize string enum inputs and source paths."""
@@ -61,6 +62,9 @@ class NativeBuildRequest:
         object.__setattr__(self, "source_root", Path(self.source_root))
         if self.libomp_root is not None:
             object.__setattr__(self, "libomp_root", Path(self.libomp_root))
+        if self.cuda_blocks_per_sm <= 0:
+            message = "cuda_blocks_per_sm must be positive"
+            raise ValueError(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +222,11 @@ class NativeBuilder:
             extension,
             symbol,
             sources,
-            ("-O3", "-DFANINSAR_NATIVE_V2_CUDA=1"),
+            (
+                "-O3",
+                "-DFANINSAR_NATIVE_V2_CUDA=1",
+                f"-DFANINSAR_NATIVE_V2_BLOCKS_PER_SM={request.cuda_blocks_per_sm}",
+            ),
             (),
             (request.source_root / "cuda",),
             runtime_name=None,

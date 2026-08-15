@@ -451,6 +451,7 @@ def prepare_torch_geometry(
     )
     orbit_tensors = prepared_orbit_tensors(model, str(resolved_device))
     orbit_times, orbit_positions, orbit_velocities, sensing_offset_s = orbit_tensors
+
     def raster_payload(value: object) -> tuple[object, ...]:
         """Materialize one RasterDEM and its affine metadata."""
         try:
@@ -569,7 +570,8 @@ def prepare_torch_geometry(
             range_spacing_m=model.range_spacing_m,
             wavelength_m=model.wavelength_m,
             look_sign=1.0 if model.look_direction == "right" else -1.0,
-            max_iter=settings.max_iter + settings.extra_iter,
+            max_iter=settings.max_iter,
+            extra_iter=settings.extra_iter,
             range_tol_m=settings.range_tol_m,
             doppler_tol_hz=settings.doppler_tol_hz,
             dynamic_iterations=dynamic,

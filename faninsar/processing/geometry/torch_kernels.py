@@ -113,9 +113,11 @@ def _orbit_state(
     d2h10 = (6.0 * u - 4.0) / duration
     d2h01 = (-12.0 * u + 6.0) / duration.square()
     d2h11 = (6.0 * u - 2.0) / duration
+
     def expand(value: Any) -> Any:
         """Add a vector axis to a per-lane scalar."""
         return value.unsqueeze(-1)
+
     p0 = positions[segment]
     p1 = positions[segment + 1]
     v0 = velocities[segment]
@@ -129,33 +131,44 @@ def _orbit_state(
     return position, velocity, acceleration
 
 
+def _spline_six_weights(fraction: Any) -> Any:
+    """Return closed-form natural-spline weights for six samples."""
+    import torch
+
+    second_one = (
+        1.6076555023923444,
+        -3.6459330143540667,
+        2.5837320574162677,
+        -0.6889952153110048,
+        0.1722488038277512,
+        -0.0287081339712919,
+    )
+    second_two = (
+        -0.4306220095693780,
+        2.5837320574162677,
+        -4.3349282296650715,
+        2.7559808612440193,
+        -0.6889952153110048,
+        0.1148325358851674,
+    )
+    fraction2 = fraction * fraction
+    fraction3 = fraction2 * fraction
+    weights = [
+        fraction * (-one / 3.0 - two / 6.0)
+        + fraction2 * (one / 2.0)
+        + fraction3 * (two - one) / 6.0
+        for one, two in zip(second_one, second_two, strict=True)
+    ]
+    weights[1] = weights[1] + 1.0 - fraction
+    weights[2] = weights[2] + fraction
+    return torch.stack(weights, dim=-1)
+
+
 def _natural_spline_six(values: Any, fraction: Any) -> Any:
     """Evaluate the local six-sample natural spline on Torch tensors."""
     import torch
 
-    second = [torch.zeros_like(fraction) for _ in range(6)]
-    recurrence = [torch.zeros_like(fraction) for _ in range(6)]
-    for index in range(1, 5):
-        denominator = recurrence[index - 1] / 2.0 + 2.0
-        recurrence[index] = -0.5 / denominator
-        second[index] = (
-            3.0
-            * (
-                values[..., index + 1]
-                - 2.0 * values[..., index]
-                + values[..., index - 1]
-            )
-            - second[index - 1] / 2.0
-        ) / denominator
-    for index in range(4, 0, -1):
-        second[index] = recurrence[index] * second[index + 1] + second[index]
-    return values[..., 1] + fraction * (
-        values[..., 2]
-        - values[..., 1]
-        - second[1] / 3.0
-        - second[2] / 6.0
-        + fraction * (second[1] / 2.0 + fraction * (second[2] - second[1]) / 6.0)
-    )
+    return torch.sum(values * _spline_six_weights(fraction), dim=-1)
 
 
 def _sample_dem_six(
@@ -185,9 +198,10 @@ def _sample_dem_six(
     )
     safe_row = row_base.clamp(1, rows - 5)
     safe_column = column_base.clamp(1, columns - 5)
-    row_values = []
     column_fraction = column - safe_column
     row_fraction = row - safe_row
+    column_weights = _spline_six_weights(column_fraction)
+    row_values = []
     for row_offset in range(-1, 5):
         window = torch.stack(
             [
@@ -196,8 +210,9 @@ def _sample_dem_six(
             ],
             dim=-1,
         )
-        row_values.append(_natural_spline_six(window, column_fraction))
-    sampled = _natural_spline_six(torch.stack(row_values, dim=-1), row_fraction)
+        row_values.append(torch.sum(window * column_weights, dim=-1))
+    row_weights = _spline_six_weights(row_fraction)
+    sampled = torch.sum(torch.stack(row_values, dim=-1) * row_weights, dim=-1)
     return torch.where(
         valid & torch.isfinite(sampled), sampled, torch.full_like(sampled, torch.nan)
     )
@@ -322,9 +337,9 @@ def geo2rdr_kernel(
         final_look = target - final_sat
         final_distance = torch.linalg.vector_norm(final_look, dim=-1)
         final_unit = final_look / torch.clamp(final_distance, min=1.0e-12).unsqueeze(-1)
-        final_doppler = 2.0 * torch.sum(
-            final_velocity * final_unit, dim=-1
-        ) / wavelength_m
+        final_doppler = (
+            2.0 * torch.sum(final_velocity * final_unit, dim=-1) / wavelength_m
+        )
         final_range_index = (final_distance - starting_range_m) / range_spacing_m
         final_range = starting_range_m + final_range_index * range_spacing_m
         final_range_residual = final_distance - final_range
@@ -579,6 +594,7 @@ def _rdr2geo_once(
     wavelength_m: float,
     look_sign: float,
     max_iter: int,
+    extra_iter: int = 0,
     range_tol_m: float,
     doppler_tol_hz: float,
     dynamic_iterations: bool,
@@ -637,21 +653,26 @@ def _rdr2geo_once(
     longitude = torch.full_like(azimuth, torch.nan)
     solved = torch.zeros_like(finite)
     failed = ~finite
+    dem_invalid = torch.zeros_like(finite)
     attempts = torch.zeros_like(azimuth, dtype=torch.int32)
     range_residual = torch.full_like(azimuth, torch.nan)
     doppler_residual = torch.full_like(azimuth, torch.nan)
-    for attempt in range(1, max_iter + 1):
+    old_latitude = torch.full_like(azimuth, torch.nan)
+    old_longitude = torch.full_like(azimuth, torch.nan)
+    old_height = torch.full_like(azimuth, torch.nan)
+    for attempt in range(1, max_iter + extra_iter + 1):
         active = finite & ~solved & ~failed & (ellipsoid_height - height < target_range)
         failed |= finite & ~solved & ~active
         semi_minor = radius + height
         cos_theta = 0.5 * (
-            satellite_norm / target_range + target_range / satellite_norm
+            satellite_norm / target_range
+            + target_range / satellite_norm
             - (semi_minor / satellite_norm) * (semi_minor / target_range)
         )
         sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta.square(), min=0.0))
         gamma = target_range * cos_theta
-        alpha = -gamma * normal_dot_velocity / torch.clamp(
-            velocity_dot_along, min=1.0e-12
+        alpha = (
+            -gamma * normal_dot_velocity / torch.clamp(velocity_dot_along, min=1.0e-12)
         )
         beta_argument = (target_range * sin_theta).square() - alpha.square()
         valid = torch.isfinite(beta_argument) & (beta_argument >= -1.0e-6)
@@ -676,21 +697,16 @@ def _rdr2geo_once(
                 if dem_height_m is not None
                 else height_seed
             )
-        commit_height = (
-            dem_height
-            if dem_samples is not None or dem_height_m is not None
-            else height_seed
-        )
         dem_xyz = _llh_to_ecef(latitude_candidate, longitude_candidate, dem_height)
         look = dem_xyz - sat
         slant_range = torch.linalg.vector_norm(look, dim=-1)
         unit = look / torch.clamp(slant_range, min=1.0e-12).unsqueeze(-1)
         rr = slant_range - target_range
         dd = 2.0 * torch.sum(velocity * unit, dim=-1) / wavelength_m
-        next_height = torch.linalg.vector_norm(dem_xyz, dim=-1) - radius
-        valid &= (
-            torch.isfinite(latitude_candidate)
-            & torch.isfinite(longitude_candidate)
+        new_height = torch.linalg.vector_norm(dem_xyz, dim=-1) - radius
+        next_height = new_height
+        valid &= torch.isfinite(latitude_candidate) & torch.isfinite(
+            longitude_candidate
         )
         valid &= (
             torch.isfinite(slant_range)
@@ -698,26 +714,67 @@ def _rdr2geo_once(
             & torch.isfinite(next_height)
             & torch.isfinite(dem_height)
         )
+        if dem_samples is not None:
+            dem_invalid |= active & ~torch.isfinite(dem_height)
         attempts = torch.where(active, torch.full_like(attempts, attempt), attempts)
         range_residual = torch.where(active, rr, range_residual)
         doppler_residual = torch.where(active, dd, doppler_residual)
-        latitude = torch.where(active, latitude_candidate, latitude)
-        longitude = torch.where(active, longitude_candidate, longitude)
         failed |= active & ~valid
         newly_solved = (
             active & valid & torch.isfinite(rr) & (torch.abs(rr) < range_tol_m)
         )
         solved |= newly_solved
-        height = torch.where(
+        next_latitude = latitude_candidate
+        next_longitude = longitude_candidate
+        next_llh_height = dem_height
+        converged_height = new_height if dem_samples is not None else dem_height
+        if attempt - 1 >= max_iter:
+            old_xyz = _llh_to_ecef(old_latitude, old_longitude, old_height)
+            average_xyz = 0.5 * (old_xyz + dem_xyz)
+            (
+                average_latitude,
+                average_longitude,
+                average_llh_height,
+            ) = _ecef_to_llh(average_xyz)
+            average_height = torch.linalg.vector_norm(average_xyz, dim=-1) - radius
+            damping_valid = (
+                active
+                & valid
+                & ~newly_solved
+                & torch.isfinite(average_latitude)
+                & torch.isfinite(average_longitude)
+                & torch.isfinite(average_llh_height)
+                & torch.isfinite(average_height)
+            )
+            next_latitude = torch.where(damping_valid, average_latitude, next_latitude)
+            next_longitude = torch.where(
+                damping_valid, average_longitude, next_longitude
+            )
+            next_llh_height = torch.where(
+                damping_valid, average_llh_height, next_llh_height
+            )
+            next_height = torch.where(damping_valid, average_height, next_height)
+        state_height = torch.where(
             newly_solved,
-            commit_height,
+            converged_height,
             torch.where(active & valid, next_height, height),
+        )
+        old_latitude = torch.where(active & valid, next_latitude, old_latitude)
+        old_longitude = torch.where(active & valid, next_longitude, old_longitude)
+        old_height = torch.where(active & valid, next_llh_height, old_height)
+        latitude = torch.where(active, next_latitude, latitude)
+        longitude = torch.where(active, next_longitude, longitude)
+        height = torch.where(
+            active & valid,
+            state_height,
+            height,
         )
         if dynamic_iterations and bool(torch.all(solved | failed | ~finite).item()):
             break
     semi_minor = radius + height
     cos_theta = 0.5 * (
-        satellite_norm / target_range + target_range / satellite_norm
+        satellite_norm / target_range
+        + target_range / satellite_norm
         - (semi_minor / satellite_norm) * (semi_minor / target_range)
     )
     sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta.square(), min=0.0))
@@ -728,7 +785,7 @@ def _rdr2geo_once(
     final_xyz = sat + alpha.unsqueeze(-1) * along_track
     final_xyz = final_xyz + beta.unsqueeze(-1) * cross_track
     final_xyz = final_xyz + gamma.unsqueeze(-1) * normal
-    final_latitude, final_longitude, _ = _ecef_to_llh(final_xyz)
+    final_latitude, final_longitude, final_height = _ecef_to_llh(final_xyz)
     final_look = final_xyz - sat
     final_distance = torch.linalg.vector_norm(final_look, dim=-1)
     final_unit = final_look / torch.clamp(final_distance, min=1.0e-12).unsqueeze(-1)
@@ -737,16 +794,23 @@ def _rdr2geo_once(
     final_valid = (
         finite
         & ~failed
+        & torch.isfinite(final_latitude)
+        & torch.isfinite(final_longitude)
+        & torch.isfinite(final_height)
         & torch.isfinite(final_range_residual)
         & (final_distance > 0.0)
     )
     solved &= final_valid & (torch.abs(final_range_residual) < range_tol_m)
-    range_residual = torch.where(finite, final_range_residual, range_residual)
-    doppler_residual = torch.where(finite, final_doppler, doppler_residual)
+    result_finite = finite & ~dem_invalid & ~failed
+    range_residual = torch.where(result_finite, final_range_residual, range_residual)
+    doppler_residual = torch.where(result_finite, final_doppler, doppler_residual)
     output = {
-        "latitude_deg": torch.where(solved, final_latitude, latitude),
-        "longitude_deg": torch.where(solved, final_longitude, longitude),
-        "height_m": height,
+        # Publish one final TCN state for both converged and exhausted valid
+        # lanes.  Publishing the last DEM iterate for lat/lon together with
+        # this final ellipsoid height creates a mixed coordinate triple.
+        "latitude_deg": final_latitude,
+        "longitude_deg": final_longitude,
+        "height_m": final_height if dem_samples is not None else height,
         "range_index": range_index,
         "azimuth_index": azimuth,
         "converged": solved,
@@ -756,7 +820,7 @@ def _rdr2geo_once(
         "residual_range_m": range_residual,
         "residual_doppler_hz": doppler_residual,
     }
-    return _result_invalid(output, finite)
+    return _result_invalid(output, result_finite)
 
 
 def rdr2geo_kernel(
@@ -774,6 +838,7 @@ def rdr2geo_kernel(
     wavelength_m: float,
     look_sign: float,
     max_iter: int,
+    extra_iter: int = 0,
     range_tol_m: float,
     doppler_tol_hz: float,
     dynamic_iterations: bool,
@@ -786,7 +851,15 @@ def rdr2geo_kernel(
     dem_height_tol_m: float = 1.0e-3,
     dem_height_m: float | None = None,
 ) -> dict[str, Any]:
-    """Solve rdr2geo with native primary-solve/DEM fixed-point semantics."""
+    """Solve rdr2geo with one TCN loop that samples the DEM per iteration.
+
+    The DEM belongs inside the TCN fixed-point loop.  Calling the complete
+    solver once per DEM update creates a nested ``dem_iterations * max_iter``
+    graph and prevents the prepared compile path from being useful.  The
+    legacy arguments remain part of this private call surface for compatibility
+    with prepared adapters, but DEM convergence is now governed by the single
+    solver loop and its strict range residual predicate.
+    """
     import torch
 
     geometry_state = _rdr2geo_geometry_state(
@@ -800,69 +873,42 @@ def rdr2geo_kernel(
         starting_range_m=starting_range_m,
         range_spacing_m=range_spacing_m,
     )
-    if dem_samples is None:
-        fixed_height = (
-            torch.full_like(height_seed, dem_height_m)
-            if dem_height_m is not None
-            else height_seed
-        )
-        return _rdr2geo_once(
-            azimuth, range_index, fixed_height, orbit_times, orbit_positions,
-            orbit_velocities, sensing_offset_s=sensing_offset_s,
-            azimuth_interval_s=azimuth_interval_s, starting_range_m=starting_range_m,
-            range_spacing_m=range_spacing_m, wavelength_m=wavelength_m,
-            look_sign=look_sign, max_iter=max_iter, range_tol_m=range_tol_m,
-            doppler_tol_hz=doppler_tol_hz, dynamic_iterations=dynamic_iterations,
-            dem_height_m=dem_height_m,
-            geometry_state=geometry_state,
-        )
-
-    heights = height_seed
-    result: dict[str, Any] = {}
-    frozen = torch.zeros((), dtype=torch.bool, device=heights.device)
-    for _ in range(dem_iterations):
-        result = _rdr2geo_once(
-            azimuth, range_index, heights, orbit_times, orbit_positions,
-            orbit_velocities, sensing_offset_s=sensing_offset_s,
-            azimuth_interval_s=azimuth_interval_s, starting_range_m=starting_range_m,
-            range_spacing_m=range_spacing_m, wavelength_m=wavelength_m,
-            look_sign=look_sign, max_iter=max_iter, range_tol_m=range_tol_m,
-            doppler_tol_hz=doppler_tol_hz, dynamic_iterations=dynamic_iterations,
-            geometry_state=geometry_state,
-        )
-        if dem_samples is not None:
-            next_heights = _sample_dem_six(
-                dem_samples, result["latitude_deg"], result["longitude_deg"],
-                dem_latitude_start_deg, dem_longitude_start_deg,
-                dem_latitude_spacing_deg, dem_longitude_spacing_deg,
-            )
-        else:
-            next_heights = torch.full_like(heights, dem_height_m)
-        valid = result["converged"] & torch.isfinite(next_heights)
-        next_heights = torch.where(
-            valid, next_heights, torch.full_like(next_heights, torch.nan)
-        )
-        update = torch.abs(next_heights - heights)
-        heights = torch.where(frozen, heights, next_heights)
-        global_done = torch.all(
-            (~result["converged"]) | (update < dem_height_tol_m)
-        )
-        frozen = frozen | global_done
-        if dynamic_iterations and bool(
-            global_done.item()
-        ):
-            break
-    result = _rdr2geo_once(
-        azimuth, range_index, heights, orbit_times, orbit_positions,
-        orbit_velocities, sensing_offset_s=sensing_offset_s,
-        azimuth_interval_s=azimuth_interval_s, starting_range_m=starting_range_m,
-        range_spacing_m=range_spacing_m, wavelength_m=wavelength_m,
-        look_sign=look_sign, max_iter=max_iter, range_tol_m=range_tol_m,
-        doppler_tol_hz=doppler_tol_hz, dynamic_iterations=dynamic_iterations,
+    # Keep the constant-height preparation behavior: a constant DEM starts the
+    # fixed-point loop on that surface, while a raster starts from the caller's
+    # seed and samples the raster inside each TCN iteration.
+    initial_height = (
+        torch.full_like(height_seed, dem_height_m)
+        if dem_samples is None and dem_height_m is not None
+        else height_seed
+    )
+    return _rdr2geo_once(
+        azimuth,
+        range_index,
+        initial_height,
+        orbit_times,
+        orbit_positions,
+        orbit_velocities,
+        sensing_offset_s=sensing_offset_s,
+        azimuth_interval_s=azimuth_interval_s,
+        starting_range_m=starting_range_m,
+        range_spacing_m=range_spacing_m,
+        wavelength_m=wavelength_m,
+        look_sign=look_sign,
+        max_iter=max_iter,
+        extra_iter=extra_iter,
+        range_tol_m=range_tol_m,
+        doppler_tol_hz=doppler_tol_hz,
+        dynamic_iterations=dynamic_iterations,
+        dem_samples=dem_samples,
+        dem_latitude_start_deg=dem_latitude_start_deg,
+        dem_longitude_start_deg=dem_longitude_start_deg,
+        dem_latitude_spacing_deg=dem_latitude_spacing_deg,
+        dem_longitude_spacing_deg=dem_longitude_spacing_deg,
+        dem_iterations=dem_iterations,
+        dem_height_tol_m=dem_height_tol_m,
+        dem_height_m=dem_height_m,
         geometry_state=geometry_state,
     )
-    result["height_m"] = heights
-    return result
 
 
 def prepared_orbit_tensors(model: Any, device: str) -> tuple[Any, Any, Any, float]:

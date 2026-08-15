@@ -45,7 +45,10 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
     assert "doppler_tolerance_hz" in geo2rdr
     assert "orbit positions and velocities must be finite" in geo2rdr
     assert "orbit positions and velocities must be finite" in rdr2geo
-    assert "iteration > primary_iter" in rdr2geo
+    assert "iteration >= primary_iter" in rdr2geo
+    assert "old_llh[1] / kDegreesToRadians" in rdr2geo
+    assert "old_llh[0] / kDegreesToRadians" in rdr2geo
+    assert "height = new_height" in rdr2geo
     assert "pop_back" in geo2rdr
     assert "pop_back" in rdr2geo
     assert "prepare_rdr2geo_contexts_kernel" in rdr2geo
@@ -55,6 +58,7 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
     assert "atomicAdd" in rdr2geo
     assert "work_index" in rdr2geo
     assert "kBlocksPerSm" in rdr2geo
+    assert "FANINSAR_NATIVE_V2_BLOCKS_PER_SM" in rdr2geo
     assert "multiProcessorCount" in rdr2geo
     assert "point_blocks" in rdr2geo
     assert "worker_blocks" in rdr2geo
@@ -68,12 +72,35 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
     assert "sample_dem" in common
     assert "bool* valid" in common
     assert "spline_six" in common
+    assert "spline_six_weights" in common
+    assert "recurrence" not in common
+    # CUDA and Torch/CPU TCN paths must use the same closed-form ECEF -> LLH
+    # conversion; an iterative latitude update introduces millimetre-scale
+    # coordinate drift that is visible to the public parity contract.
+    assert "const double e4 = kWgs84E2 * kWgs84E2" in common
+    assert "const double cubic = e4 * lateral * polar" in common
+    assert "latitude_estimate" not in common
     assert "is_contiguous()" in common
     assert "geo2rdr_cuda_public" in binding
     assert "rdr2geo_cuda_public" in binding
     assert "geo2rdr_cuda_visit_counts" in binding
     assert "rdr2geo_cuda_visit_counts" in binding
     assert '"native CUDA geo2rdr public ABI must return 14 fields"' in binding
+
+
+def test_cuda_rdr2geo_exhaustion_uses_common_final_publication() -> None:
+    """Budget exhaustion publishes the final state without marking it solved."""
+    source = (CUDA_SOURCE_ROOT / "rdr2geo_tcn_cuda.cu").read_text()
+
+    assert (
+        "const bool publish_converged = final_converged && !budget_exhausted;" in source
+    )
+    assert (
+        "iterations[point] = budget_exhausted ? "
+        "static_cast<int32_t>(budget) : attempts;" in source
+    )
+    assert "max_iter_exhausted[point] = budget_exhausted;" in source
+    assert "converged[point] = publish_converged;" in source
 
 
 @pytest.mark.skipif(
@@ -198,6 +225,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     assert not bool(radar[5][1])
     assert int(radar[6][1]) == -1
     assert all(torch.isnan(radar[index][1]) for index in RESULT_FLOAT_FIELDS)
+
+    variable_dem = 100.0 + 0.01 * torch.arange(64, dtype=dtype, device=device).reshape(
+        8, 8
+    )
+    exhausted = module.rdr2geo(
+        torch.tensor([0.0], dtype=dtype, device=device),
+        torch.tensor([2186.3], dtype=dtype, device=device),
+        torch.zeros(1, dtype=dtype, device=device),
+        times,
+        positions,
+        velocities,
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        variable_dem,
+        -0.6,
+        -0.6,
+        0.2,
+        0.2,
+        100.0,
+        -1_000.0,
+        1_000.0,
+        0.056,
+        1.0e-12,
+        0.1,
+        1,
+        0,
+        True,
+    )
+    assert not bool(exhausted[5][0])
+    assert int(exhausted[6][0]) == 1
+    assert bool(exhausted[10][0])
+    for index in (0, 1, 2, 7, 8, 12, 13):
+        assert bool(torch.isfinite(exhausted[index][0]))
 
     dem = torch.full((8, 8), 100.0, dtype=dtype, device=device)
     out_of_bounds = module.rdr2geo(

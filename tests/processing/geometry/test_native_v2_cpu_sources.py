@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -69,6 +70,94 @@ def test_native_result_binding_centralizes_fourteen_field_validation() -> None:
     assert result.fields == NATIVE_RESULT_FIELDS
     assert result.iterations.dtype == np.dtype(np.int32)
     assert result.converged.dtype == np.dtype(bool)
+
+
+class _FakeCpuTransfer:
+    """Expose one independent host transfer from a fake CUDA tensor."""
+
+    def __init__(self, values: np.ndarray) -> None:
+        self.values = values
+
+    def numpy(self) -> np.ndarray:
+        """Return the host allocation represented by this transfer."""
+        return self.values
+
+
+class _FakeCudaTensor:
+    """Model CUDA ``.cpu()`` transfers with fresh host allocations."""
+
+    device = SimpleNamespace(type="cuda")
+
+    def __init__(self, values: np.ndarray) -> None:
+        self.values = values
+        self.transfers: list[np.ndarray] = []
+
+    def detach(self) -> _FakeCudaTensor:
+        """Return the detached tensor view."""
+        return self
+
+    def cpu(self) -> _FakeCpuTransfer:
+        """Return a fresh host copy, matching a CUDA-to-CPU transfer."""
+        transfer = np.array(self.values, copy=True)
+        self.transfers.append(transfer)
+        return _FakeCpuTransfer(transfer)
+
+
+class _FakeCpuTensor:
+    """Model a CPU tensor whose host buffer may be reused by the caller."""
+
+    device = SimpleNamespace(type="cpu")
+
+    def __init__(self, values: np.ndarray) -> None:
+        self.values = values
+
+    def detach(self) -> _FakeCpuTensor:
+        """Return the detached tensor view."""
+        return self
+
+    def cpu(self) -> _FakeCpuTransfer:
+        """Return a view of the potentially reused CPU buffer."""
+        return _FakeCpuTransfer(self.values)
+
+
+def _valid_native_arrays(value: float) -> list[np.ndarray]:
+    """Create valid two-lane arrays for the fourteen-field result ABI."""
+    arrays = [np.full(2, value, dtype=np.float64) for _ in NATIVE_RESULT_FIELDS]
+    arrays[5] = np.ones(2, dtype=bool)
+    arrays[6] = np.ones(2, dtype=np.int32)
+    arrays[9] = np.ones(2, dtype=np.float64)
+    arrays[10] = np.zeros(2, dtype=bool)
+    arrays[11] = np.zeros(2, dtype=bool)
+    return arrays
+
+
+def test_cuda_native_result_is_snapshot_without_second_host_copy() -> None:
+    """A later CUDA transfer cannot overwrite an earlier public result."""
+    tensors = [_FakeCudaTensor(values) for values in _valid_native_arrays(1.0)]
+
+    first = result_from_native_outputs(tensors, operation="geo2rdr")
+    second_values = _valid_native_arrays(2.0)
+    for tensor, values in zip(tensors, second_values, strict=True):
+        tensor.values[...] = values
+    second = result_from_native_outputs(tensors, operation="geo2rdr")
+
+    assert np.shares_memory(first.latitude_deg, tensors[0].transfers[0])
+    assert not np.shares_memory(first.latitude_deg, second.latitude_deg)
+    np.testing.assert_array_equal(first.latitude_deg, 1.0)
+    np.testing.assert_array_equal(second.latitude_deg, 2.0)
+
+
+def test_cpu_native_result_keeps_copy_for_reused_tensor_buffers() -> None:
+    """CPU tensor buffers remain isolated from later native calls."""
+    tensors = [_FakeCpuTensor(values) for values in _valid_native_arrays(1.0)]
+
+    first = result_from_native_outputs(tensors, operation="geo2rdr")
+    for tensor, values in zip(tensors, _valid_native_arrays(2.0), strict=True):
+        tensor.values[...] = values
+    second = result_from_native_outputs(tensors, operation="geo2rdr")
+
+    np.testing.assert_array_equal(first.latitude_deg, 1.0)
+    np.testing.assert_array_equal(second.latitude_deg, 2.0)
 
 
 def test_native_result_binding_rejects_non_fourteen_field_abi() -> None:

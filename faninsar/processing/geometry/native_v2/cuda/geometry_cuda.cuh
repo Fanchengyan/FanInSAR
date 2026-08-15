@@ -113,46 +113,84 @@ __device__ inline void ecef_to_llh(const double* ecef, double* latitude,
   const double x = ecef[0];
   const double y = ecef[1];
   const double z = ecef[2];
+  *latitude = nan("");
+  *longitude = nan("");
+  *height = nan("");
+  // Keep the device conversion identical to the Torch and CPU TCN paths.
+  // Iterating latitude here produces millimetre-scale coordinate drift after
+  // the DEM fixed-point loop, even though the underlying ECEF point matches.
+  const double e4 = kWgs84E2 * kWgs84E2;
+  const double a2 = kWgs84A * kWgs84A;
+  const double lateral = (x * x + y * y) / a2;
+  const double polar = (1.0 - kWgs84E2) * z * z / a2;
+  const double reduced = (lateral + polar - e4) / 6.0;
+  if (!(reduced > 0.0) || !isfinite(reduced)) {
+    return;
+  }
+  const double cubic = e4 * lateral * polar /
+                       (4.0 * reduced * reduced * reduced);
+  const double cubic_radical = cubic * (2.0 + cubic);
+  if (!(cubic_radical >= 0.0) || !isfinite(cubic_radical)) {
+    return;
+  }
+  const double root_argument = 1.0 + cubic + sqrt(cubic_radical);
+  if (!(root_argument > 0.0) || !isfinite(root_argument)) {
+    return;
+  }
+  const double root = pow(root_argument, 1.0 / 3.0);
+  if (!(root > 0.0) || !isfinite(root)) {
+    return;
+  }
+  const double u = reduced * (1.0 + root + 1.0 / root);
+  const double radial = sqrt(u * u + e4 * polar);
+  if (!(radial > 0.0) || !isfinite(radial)) {
+    return;
+  }
+  const double w = kWgs84E2 * (u + radial - polar) / (2.0 * radial);
+  const double k_argument = u + radial + w * w;
+  if (!(k_argument >= 0.0) || !isfinite(k_argument)) {
+    return;
+  }
+  const double k = sqrt(k_argument) - w;
+  if (!(k != 0.0) || !isfinite(k)) {
+    return;
+  }
   const double horizontal = hypot(x, y);
   *longitude = atan2(y, x);
-  double latitude_estimate = atan2(z, horizontal * (1.0 - kWgs84E2));
-  for (int iteration = 0; iteration < 8; ++iteration) {
-    const double sine = sin(latitude_estimate);
-    const double radius = kWgs84A /
-        sqrt(1.0 - kWgs84E2 * sine * sine);
-    const double next = atan2(z + kWgs84E2 * radius * sine, horizontal);
-    if (fabs(next - latitude_estimate) < 1.0e-14) {
-      latitude_estimate = next;
-      break;
-    }
-    latitude_estimate = next;
+  const double d = k * horizontal / (k + kWgs84E2);
+  *latitude = atan2(z, d);
+  *height = (k + kWgs84E2 - 1.0) * hypot(d, z) / k;
+}
+
+__device__ inline void spline_six_weights(double fraction, double* weights) {
+  constexpr double second_one[6] = {
+      1.6076555023923444, -3.6459330143540667, 2.5837320574162677,
+      -0.6889952153110048, 0.1722488038277512, -0.0287081339712919};
+  constexpr double second_two[6] = {
+      -0.4306220095693780, 2.5837320574162677, -4.3349282296650715,
+      2.7559808612440193, -0.6889952153110048, 0.1148325358851674};
+  const double fraction2 = fraction * fraction;
+  const double fraction3 = fraction2 * fraction;
+#pragma unroll
+  for (int index = 0; index < 6; ++index) {
+    weights[index] = fraction * (-second_one[index] / 3.0 -
+                                 second_two[index] / 6.0) +
+                     fraction2 * (second_one[index] / 2.0) +
+                     fraction3 * (second_two[index] - second_one[index]) / 6.0;
   }
-  const double sine = sin(latitude_estimate);
-  const double cosine = cos(latitude_estimate);
-  const double radius = kWgs84A /
-      sqrt(1.0 - kWgs84E2 * sine * sine);
-  *latitude = latitude_estimate;
-  *height = (fabs(cosine) > 1.0e-12) ? horizontal / cosine - radius
-                                     : fabs(z) - radius * (1.0 - kWgs84E2);
+  weights[1] += 1.0 - fraction;
+  weights[2] += fraction;
 }
 
 __device__ inline double spline_six(const double* values, double fraction) {
-  double second[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-  double recurrence[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-  for (int index = 1; index < 5; ++index) {
-    const double denominator = recurrence[index - 1] / 2.0 + 2.0;
-    recurrence[index] = -0.5 / denominator;
-    second[index] = (3.0 * (values[index + 1] - 2.0 * values[index] +
-                            values[index - 1]) - second[index - 1] / 2.0) /
-                    denominator;
+  double weights[6];
+  spline_six_weights(fraction, weights);
+  double result = 0.0;
+#pragma unroll
+  for (int index = 0; index < 6; ++index) {
+    result += weights[index] * values[index];
   }
-  for (int index = 4; index > 0; --index) {
-    second[index] = recurrence[index] * second[index + 1] + second[index];
-  }
-  return values[1] + fraction *
-      (values[2] - values[1] - second[1] / 3.0 - second[2] / 6.0 +
-       fraction * (second[1] / 2.0 + fraction *
-                   (second[2] - second[1]) / 6.0));
+  return result;
 }
 
 __device__ inline double sample_dem(const double* bucket, int64_t rows,
@@ -164,17 +202,26 @@ __device__ inline double sample_dem(const double* bucket, int64_t rows,
   const int64_t column_base = static_cast<int64_t>(floor(column));
   if (row_base < 1 || row_base > rows - 5 || column_base < 1 ||
       column_base > columns - 5) return reference;
+  double row_weights[6];
+  double column_weights[6];
+  spline_six_weights(row - row_base, row_weights);
+  spline_six_weights(column - column_base, column_weights);
   double along_columns[6];
   for (int row_offset = -1; row_offset <= 4; ++row_offset) {
-    double values[6];
+    double row_result = 0.0;
+#pragma unroll
     for (int column_offset = -1; column_offset <= 4; ++column_offset) {
-      values[column_offset + 1] = bucket[(row_base + row_offset) * columns +
-                                         column_base + column_offset];
+      row_result += column_weights[column_offset + 1] *
+                    bucket[(row_base + row_offset) * columns +
+                           column_base + column_offset];
     }
-    along_columns[row_offset + 1] =
-        spline_six(values, column - static_cast<double>(column_base));
+    along_columns[row_offset + 1] = row_result;
   }
-  const double value = spline_six(along_columns, row - static_cast<double>(row_base));
+  double value = 0.0;
+#pragma unroll
+  for (int row_offset = 0; row_offset < 6; ++row_offset) {
+    value += row_weights[row_offset] * along_columns[row_offset];
+  }
   *valid = isfinite(value);
   return value;
 }
