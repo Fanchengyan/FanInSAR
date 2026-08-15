@@ -485,6 +485,11 @@ def _rdr2geo_once(
                 if dem_height_m is not None
                 else height
             )
+        commit_height = (
+            dem_height
+            if dem_samples is not None or dem_height_m is not None
+            else height_seed
+        )
         dem_xyz = _llh_to_ecef(latitude_candidate, longitude_candidate, dem_height)
         look = dem_xyz - sat
         slant_range = torch.linalg.vector_norm(look, dim=-1)
@@ -514,7 +519,7 @@ def _rdr2geo_once(
         solved |= newly_solved
         height = torch.where(
             newly_solved,
-            dem_height,
+            commit_height,
             torch.where(active & valid, next_height, height),
         )
         if dynamic_iterations and bool(torch.all(solved | failed | ~finite).item()):
