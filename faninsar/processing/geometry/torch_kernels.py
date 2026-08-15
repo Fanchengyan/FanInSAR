@@ -372,7 +372,7 @@ def geo2rdr_kernel(
     return _result_invalid(output, finite)
 
 
-def _rdr2geo_geometry_state(
+def _rdr2geo_geometry_state_for_context(
     azimuth: Any,
     range_index: Any,
     orbit_times: Any,
@@ -383,33 +383,31 @@ def _rdr2geo_geometry_state(
     azimuth_interval_s: float,
     starting_range_m: float,
     range_spacing_m: float,
+    context_azimuth: Any,
 ) -> tuple[Any, ...]:
-    """Build the immutable device state shared by all TCN/DEM iterations.
+    """Build geometry state from point inputs and a reusable azimuth context.
 
-    The old high-throughput Torch solver accepted satellite and velocity as
-    device-resident inputs.  The prepared public API accepts radar indices
-    instead, so this equivalent state is materialized once per invocation and
-    then reused by every fixed-point iteration.  Keeping this work outside
-    :func:`_rdr2geo_once` avoids rebuilding the TCN basis for each DEM update.
+    ``context_azimuth`` may contain one value per row for a regular two
+    dimensional radar grid.  The resulting context tensors are expanded to
+    the point shape, so the numerical solver keeps its existing elementwise
+    contract.
     """
     import torch
 
     target_range = starting_range_m + range_index * range_spacing_m
     times = sensing_offset_s + azimuth * azimuth_interval_s
+    context_times = sensing_offset_s + context_azimuth * azimuth_interval_s
     orbit_start, orbit_end = orbit_times[0], orbit_times[-1]
     sat, velocity, _ = _orbit_state(
-        times, orbit_times, orbit_positions, orbit_velocities
+        context_times, orbit_times, orbit_positions, orbit_velocities
     )
     speed = torch.linalg.vector_norm(velocity, dim=-1)
     satellite_norm = torch.linalg.vector_norm(sat, dim=-1)
-    finite = (
-        torch.isfinite(target_range)
-        & (target_range > 0.0)
-        & torch.isfinite(azimuth)
-        & torch.isfinite(range_index)
-        & torch.isfinite(times)
-        & (times >= orbit_start)
-        & (times <= orbit_end)
+    context_finite = (
+        torch.isfinite(context_azimuth)
+        & torch.isfinite(context_times)
+        & (context_times >= orbit_start)
+        & (context_times <= orbit_end)
         & (speed > 0.0)
         & (satellite_norm > 0.0)
     )
@@ -425,7 +423,9 @@ def _rdr2geo_geometry_state(
     ).unsqueeze(-1)
     normal_dot_velocity = torch.sum(normal * velocity_unit, dim=-1)
     velocity_dot_along = torch.sum(velocity_unit * along_track, dim=-1)
-    finite &= torch.isfinite(normal_dot_velocity) & (velocity_dot_along > 1.0e-12)
+    context_finite &= torch.isfinite(normal_dot_velocity) & (
+        velocity_dot_along > 1.0e-12
+    )
     minor = _A * torch.sqrt(
         torch.as_tensor(1.0 - _E2, dtype=sat.dtype, device=sat.device)
     )
@@ -436,6 +436,40 @@ def _rdr2geo_geometry_state(
     )
     radius = eta * satellite_norm
     ellipsoid_height = (1.0 - eta) * satellite_norm
+
+    if context_azimuth.shape != azimuth.shape:
+        expand_shape = (*azimuth.shape,)
+
+        def expand(value: Any) -> Any:
+            """Expand a row context to the point grid."""
+            # ``torch.cond`` requires both branches to publish matching
+            # strides.  Materialize only after the cheaper row-wise orbit and
+            # frame evaluation; this preserves the fixed point-shaped state
+            # contract without a host roundtrip.
+            return value.expand(*expand_shape, *value.shape[2:]).contiguous()
+
+        sat = expand(sat)
+        velocity = expand(velocity)
+        satellite_norm = expand(satellite_norm)
+        normal = expand(normal)
+        cross_track = expand(cross_track)
+        along_track = expand(along_track)
+        normal_dot_velocity = expand(normal_dot_velocity)
+        velocity_dot_along = expand(velocity_dot_along)
+        radius = expand(radius)
+        ellipsoid_height = expand(ellipsoid_height)
+        context_finite = expand(context_finite)
+
+    finite = (
+        torch.isfinite(target_range)
+        & (target_range > 0.0)
+        & torch.isfinite(azimuth)
+        & torch.isfinite(range_index)
+        & torch.isfinite(times)
+        & (times >= orbit_start)
+        & (times <= orbit_end)
+        & context_finite
+    )
     return (
         target_range,
         sat,
@@ -450,6 +484,84 @@ def _rdr2geo_geometry_state(
         ellipsoid_height,
         finite,
     )
+
+
+def _rdr2geo_geometry_state(
+    azimuth: Any,
+    range_index: Any,
+    orbit_times: Any,
+    orbit_positions: Any,
+    orbit_velocities: Any,
+    *,
+    sensing_offset_s: float,
+    azimuth_interval_s: float,
+    starting_range_m: float,
+    range_spacing_m: float,
+) -> tuple[Any, ...]:
+    """Build immutable device state shared by all TCN/DEM iterations.
+
+    The old high-throughput Torch solver accepted satellite and velocity as
+    device-resident inputs.  The prepared public API accepts radar indices
+    instead, so this equivalent state is materialized once per invocation and
+    then reused by every fixed-point iteration.  Keeping this work outside
+    :func:`_rdr2geo_once` avoids rebuilding the TCN basis for each DEM update.
+    """
+    import torch
+
+    if azimuth.ndim != 2 or azimuth.shape[1] <= 1:
+        return _rdr2geo_geometry_state_for_context(
+            azimuth,
+            range_index,
+            orbit_times,
+            orbit_positions,
+            orbit_velocities,
+            sensing_offset_s=sensing_offset_s,
+            azimuth_interval_s=azimuth_interval_s,
+            starting_range_m=starting_range_m,
+            range_spacing_m=range_spacing_m,
+            context_azimuth=azimuth,
+        )
+
+    row_azimuth = azimuth[:, :1]
+    regular_rows = torch.all(azimuth == row_azimuth)
+
+    def row_context(azimuth_value: Any, range_value: Any) -> tuple[Any, ...]:
+        """Evaluate orbit/TCN context once per regular-grid row."""
+        return _rdr2geo_geometry_state_for_context(
+            azimuth_value,
+            range_value,
+            orbit_times,
+            orbit_positions,
+            orbit_velocities,
+            sensing_offset_s=sensing_offset_s,
+            azimuth_interval_s=azimuth_interval_s,
+            starting_range_m=starting_range_m,
+            range_spacing_m=range_spacing_m,
+            context_azimuth=azimuth_value[:, :1],
+        )
+
+    def point_context(azimuth_value: Any, range_value: Any) -> tuple[Any, ...]:
+        """Evaluate the exact point-wise context for irregular rows."""
+        return _rdr2geo_geometry_state_for_context(
+            azimuth_value,
+            range_value,
+            orbit_times,
+            orbit_positions,
+            orbit_velocities,
+            sensing_offset_s=sensing_offset_s,
+            azimuth_interval_s=azimuth_interval_s,
+            starting_range_m=starting_range_m,
+            range_spacing_m=range_spacing_m,
+            context_azimuth=azimuth_value,
+        )
+
+    if torch.compiler.is_compiling():
+        return torch.cond(
+            regular_rows, row_context, point_context, (azimuth, range_index)
+        )
+    if bool(regular_rows.item()):
+        return row_context(azimuth, range_index)
+    return point_context(azimuth, range_index)
 
 
 def _rdr2geo_once(
