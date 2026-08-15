@@ -483,7 +483,7 @@ def _rdr2geo_once(
             dem_height = (
                 torch.full_like(height, dem_height_m)
                 if dem_height_m is not None
-                else height
+                else height_seed
             )
         commit_height = (
             dem_height

@@ -418,7 +418,6 @@ def test_rdr2geo_cpu_rebuilds_final_tcn_state_like_torch(
         range_tol_m=0.01,
         doppler_tol_hz=0.1,
         dynamic_iterations=True,
-        dem_height_m=0.0,
     )
     common = native[5] & torch_result["converged"]
 
