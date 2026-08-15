@@ -454,6 +454,11 @@ def prepare_torch_geometry(
     def raster_payload(value: object) -> tuple[object, ...]:
         """Materialize one RasterDEM and its affine metadata."""
         try:
+            interpolation = value.interpolation  # type: ignore[attr-defined]
+            if interpolation != "biquintic":
+                raise ValueError(
+                    "Torch RasterDEM supports only biquintic interpolation"
+                )
             dataset = value._open()  # type: ignore[attr-defined]
             samples = value._height_array  # type: ignore[attr-defined]
             if samples is None:
