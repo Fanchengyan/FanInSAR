@@ -40,6 +40,8 @@ __global__ void geo2rdr_kernel(
   if (isfinite(speed_squared) && speed_squared > 0.0)
     time += along_track_dot / speed_squared;
   time = fmin(fmax(time, orbit_start), orbit_end);
+  hermite(orbit_times, positions, velocities, orbit_count, time, satellite,
+          velocity, acceleration);
 
   double residual_doppler = nan("");
   double residual_range = nan("");
@@ -48,13 +50,12 @@ __global__ void geo2rdr_kernel(
   bool solved = false;
   bool stopped_early = false;
   int32_t attempts = 0;
+  double accepted_range = nan("");
   for (int64_t iteration = 0; iteration < budget; ++iteration) {
     if (time < orbit_start || time > orbit_end) {
       stopped_early = true;
       break;
     }
-    hermite(orbit_times, positions, velocities, orbit_count, time, satellite,
-            velocity, acceleration);
     double look[3];
     double range_squared = 0.0;
     double velocity_squared = 0.0;
@@ -113,6 +114,10 @@ __global__ void geo2rdr_kernel(
                            final_range;
           decision = fmax(fabs(residual_range) / range_tolerance,
                           fabs(residual_doppler) / doppler_tolerance);
+          // The final orbit state is already in ``satellite`` and
+          // ``velocity``. Keep its range for publication to avoid repeating
+          // the same interpolation and residual evaluation.
+          accepted_range = final_range;
           solved = isfinite(final_doppler) && isfinite(residual_range) &&
                    isfinite(decision) && decision < 1.0;
           final = decision;
@@ -141,23 +146,11 @@ __global__ void geo2rdr_kernel(
   range_residual[point] = residual_range;
   decision_residual[point] = decision;
   final_residual[point] = final;
-  double final_range_squared = 0.0;
-  for (int axis = 0; axis < 3; ++axis) {
-    const double look = target[axis] - satellite[axis];
-    final_range_squared += look * look;
-  }
-  const double final_range = sqrt(final_range_squared);
-  const double final_range_index =
-      (final_range - starting_range) / range_spacing;
-  residual_range = starting_range + final_range_index * range_spacing -
-                   final_range;
-  decision = fmax(fabs(residual_range) / range_tolerance,
-                  fabs(residual_doppler) / doppler_tolerance);
   output_latitude[point] = latitude[point];
   output_longitude[point] = longitude[point];
   output_height[point] = height[point];
   azimuth[point] = (time - sensing_offset) / azimuth_interval;
-  range[point] = (final_range - starting_range) / range_spacing;
+  range[point] = (accepted_range - starting_range) / range_spacing;
   converged[point] = true;
   range_residual[point] = residual_range;
   doppler_residual[point] = residual_doppler;

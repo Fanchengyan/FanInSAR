@@ -141,19 +141,20 @@ std::vector<Tensor> geo2rdr_cpu(
       time_s += dot(target_delta, seed.velocity) / speed_squared;
     }
     time_s = std::clamp(time_s, orbit_start, orbit_end);
+    OrbitState state = interpolate_orbit(times, positions, velocities,
+                                         orbit_times_s.numel(), time_s);
     double last_doppler = kNan;
     double last_range_residual = kNan;
     bool lane_solved = false;
     bool early_failure = false;
     int64_t attempts_evaluated = 0;
+    double accepted_range_m = kNan;
     for (int64_t iteration = 0; iteration < budget; ++iteration) {
       if (time_s < orbit_start || time_s > orbit_end) {
         early_failure = true;
         break;
       }
       ++attempts_evaluated;
-      const OrbitState state = interpolate_orbit(times, positions, velocities,
-                                                 orbit_times_s.numel(), time_s);
       const Vec3 look{target[0] - state.position[0], target[1] - state.position[1],
                       target[2] - state.position[2]};
       const double range_m = norm(look);
@@ -216,6 +217,10 @@ std::vector<Tensor> geo2rdr_cpu(
         const double final_metric = std::max(
             std::abs(final_range_residual) / range_tol_m,
             std::abs(final_doppler) / doppler_tol_hz);
+        // Retain the state used for the residual decision so the publication
+        // path does not repeat the same orbit interpolation and evaluation.
+        accepted_range_m = final_range_m;
+        state = final_state;
         last_doppler = final_doppler;
         last_range_residual = final_range_residual;
         decision[point] = final_metric;
@@ -238,22 +243,14 @@ std::vector<Tensor> geo2rdr_cpu(
       }
       continue;
     }
-    const OrbitState state = interpolate_orbit(times, positions, velocities,
-                                               orbit_times_s.numel(), time_s);
-    const Vec3 look{target[0] - state.position[0], target[1] - state.position[1],
-                    target[2] - state.position[2]};
-    const double range_m = norm(look);
-    const Vec3 unit{look[0] / range_m, look[1] / range_m, look[2] / range_m};
-    const double final_doppler = 2.0 * dot(state.velocity, unit) / wavelength_m;
-    ranges[point] = (range_m - starting_slant_range_m) / range_spacing_m;
+    ranges[point] =
+        (accepted_range_m - starting_slant_range_m) / range_spacing_m;
     azimuths[point] = (time_s - sensing_offset_s) / azimuth_time_interval_s;
-    const double reconstructed_range = starting_slant_range_m +
-                                       ranges[point] * range_spacing_m;
-    residual_range[point] = range_m - reconstructed_range;
-    residual_doppler[point] = final_doppler;
+    residual_range[point] = last_range_residual;
+    residual_doppler[point] = last_doppler;
     const double final_metric = std::max(
-        std::abs(range_residuals[point]) / range_tol_m,
-        std::abs(final_doppler) / doppler_tol_hz);
+        std::abs(last_range_residual) / range_tol_m,
+        std::abs(last_doppler) / doppler_tol_hz);
     final[point] = final_metric;
     decision[point] = final_metric;
     if (!(final_metric < 1.0)) {

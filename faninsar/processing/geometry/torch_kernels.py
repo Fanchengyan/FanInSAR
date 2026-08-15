@@ -284,17 +284,18 @@ def geo2rdr_kernel(
         seed.clamp(min=orbit_start, max=orbit_end),
         torch.full_like(seed, sensing_offset_s),
     )
+    sat, velocity, acceleration = _orbit_state(
+        times, orbit_times, orbit_positions, orbit_velocities
+    )
     solved = torch.zeros_like(finite)
     failed = ~finite
     attempts = torch.zeros_like(latitude, dtype=torch.int32)
     doppler = torch.full_like(latitude, torch.nan)
     range_residual = torch.full_like(latitude, torch.nan)
+    evaluated_distance = torch.full_like(latitude, torch.nan)
     budget = max_iter
     for attempt in range(1, budget + 1):
         active = finite & ~solved & ~failed
-        sat, velocity, acceleration = _orbit_state(
-            times, orbit_times, orbit_positions, orbit_velocities
-        )
         look = target - sat
         distance = torch.linalg.vector_norm(look, dim=-1)
         unit = look / torch.clamp(distance, min=1.0e-12).unsqueeze(-1)
@@ -315,7 +316,7 @@ def geo2rdr_kernel(
         next_times = torch.where(active & valid, times + step, times)
         in_bounds = (next_times >= orbit_start) & (next_times <= orbit_end)
         failed |= active & (~valid | ~torch.isfinite(step) | ~in_bounds)
-        final_sat, final_velocity, _ = _orbit_state(
+        final_sat, final_velocity, final_acceleration = _orbit_state(
             next_times, orbit_times, orbit_positions, orbit_velocities
         )
         final_look = target - final_sat
@@ -331,6 +332,14 @@ def geo2rdr_kernel(
             torch.abs(final_range_residual) / range_tol_m,
             torch.abs(final_doppler) / doppler_tol_hz,
         )
+        # Keep the state used for the residual decision so publication does
+        # not repeat the same orbit interpolation and physical evaluation.
+        evaluated_distance = final_distance
+        sat, velocity, acceleration = (
+            final_sat,
+            final_velocity,
+            final_acceleration,
+        )
         # The canonical geo2rdr decision is the strict physical residual
         # metric.  A backend-specific Newton-step predicate is diagnostic
         # only: retaining it here makes eager and compiled Torch disagree
@@ -342,17 +351,9 @@ def geo2rdr_kernel(
         times = next_times
         if dynamic_iterations and bool(torch.all(solved | failed | ~finite).item()):
             break
-    final_sat, final_velocity, _ = _orbit_state(
-        times, orbit_times, orbit_positions, orbit_velocities
-    )
-    final_look = target - final_sat
-    final_distance = torch.linalg.vector_norm(final_look, dim=-1)
-    final_unit = final_look / torch.clamp(final_distance, min=1.0e-12).unsqueeze(-1)
-    doppler = 2.0 * torch.sum(final_velocity * final_unit, dim=-1) / wavelength_m
-    computed_range_index = (final_distance - starting_range_m) / range_spacing_m
-    range_residual = final_distance - (
-        starting_range_m + computed_range_index * range_spacing_m
-    )
+    # ``evaluated_distance`` comes from the last
+    # post-update evaluation, which is also the state used above for stopping.
+    computed_range_index = (evaluated_distance - starting_range_m) / range_spacing_m
     computed_azimuth_index = (times - sensing_offset_s) / azimuth_interval_s
     nan = torch.full_like(computed_range_index, torch.nan)
     output = {
