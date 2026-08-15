@@ -1,47 +1,44 @@
 #include "geometry_cuda.cuh"
 
+#include <algorithm>
+
 namespace faninsar::geometry::cuda_v2 {
 
 namespace {
+
+// One context is generated per input row.  The public wrapper preserves a
+// two-dimensional input's row width while the private one-dimensional ABI
+// uses row_width=1.  Keeping contexts reusable avoids repeating orbit
+// interpolation and local-frame construction in every persistent worker.
+constexpr int kContextStride = 21;
+constexpr int kBlocksPerSm = 2;
 
 __device__ inline double safe_denominator(double value) {
   if (fabs(value) >= 1.0e-12) return value;
   return copysign(1.0e-12, value == 0.0 ? 1.0 : value);
 }
 
-__global__ void rdr2geo_tcn_kernel(
+__global__ void prepare_rdr2geo_contexts_kernel(
     const double* azimuth_index, const double* range_index,
     const double* height_seed, int64_t count, const double* orbit_times,
     const double* orbit_positions, const double* orbit_velocities,
     int64_t orbit_count, double sensing_offset, double azimuth_interval,
-    double starting_range, double range_spacing, const double* dem,
-    int64_t dem_rows, int64_t dem_columns, double dem_x_start_deg,
-    double dem_y_start_deg, double dem_dx_deg, double dem_dy_deg,
-    double reference_height, double min_height, double max_height,
-    double wavelength, double range_tolerance, double doppler_tolerance,
-    int64_t primary_iter, int64_t budget, double look_sign,
-    double* latitude_deg, double* longitude_deg, double* output_height,
-    double* output_range, double* output_azimuth,
-    bool* converged, int32_t* iterations, double* decision_residual,
-    double* final_residual, double* tolerance, bool* max_iter_exhausted,
-    bool* boundary_rechecked, double* range_residual,
-    double* doppler_residual, int32_t* visit_counts) {
-  const int64_t point = static_cast<int64_t>(blockIdx.x) * blockDim.x +
-                        threadIdx.x;
-  if (point >= count) return;
-  visit_counts[point] = 1;
+    double min_height, double max_height, int64_t row_width,
+    double* contexts) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+  const int64_t row_count = (count + row_width - 1) / row_width;
+  if (row >= row_count) return;
+  const int64_t point = row * row_width;
+  double* context = contexts + row * kContextStride;
+#pragma unroll
+  for (int index = 0; index < kContextStride; ++index) context[index] = nan("");
 
   const double azimuth = azimuth_index[point];
-  const double range = range_index[point];
-  const double seed = height_seed[point];
   const double time = sensing_offset + azimuth * azimuth_interval;
-  const double orbit_start = orbit_times[0];
-  const double orbit_end = orbit_times[orbit_count - 1];
-  if (!isfinite(azimuth) || !isfinite(range) || !isfinite(seed) ||
-      !isfinite(time) || time < orbit_start || time > orbit_end) return;
-
-  const double target = starting_range + range * range_spacing;
-  if (!(target > 0.0) || !isfinite(target)) return;
+  if (!isfinite(azimuth) ||
+      !isfinite(time) || time < orbit_times[0] ||
+      time > orbit_times[orbit_count - 1]) return;
 
   double sat[3], vel[3], acceleration[3];
   hermite(orbit_times, orbit_positions, orbit_velocities, orbit_count, time,
@@ -81,15 +78,75 @@ __global__ void rdr2geo_tcn_kernel(
     normal_dot_velocity += normal[axis] * velocity_unit[axis];
     velocity_dot_along += velocity_unit[axis] * along_track[axis];
   }
-
   const double minor = kWgs84A * sqrt(1.0 - kWgs84E2);
   const double eta = 1.0 / sqrt((sat[0] / kWgs84A) * (sat[0] / kWgs84A) +
       (sat[1] / kWgs84A) * (sat[1] / kWgs84A) +
       (sat[2] / minor) * (sat[2] / minor));
   const double radius = eta * satellite_norm;
   const double ellipsoid_height = (1.0 - eta) * satellite_norm;
+  if (!isfinite(eta) || !isfinite(radius) || !isfinite(ellipsoid_height)) return;
+
+#pragma unroll
+  for (int axis = 0; axis < 3; ++axis) {
+    context[axis] = sat[axis];
+    context[3 + axis] = vel[axis];
+    context[6 + axis] = normal[axis];
+    context[9 + axis] = cross_track[axis];
+    context[12 + axis] = along_track[axis];
+  }
+  context[15] = satellite_norm;
+  context[16] = normal_dot_velocity;
+  context[17] = velocity_dot_along;
+  context[18] = radius;
+  context[19] = ellipsoid_height;
+  context[20] = 1.0;
+}
+
+__global__ void rdr2geo_tcn_kernel(
+    const double* azimuth_index, const double* range_index,
+    const double* height_seed, int64_t count, const double* orbit_times,
+    const double* orbit_positions, const double* orbit_velocities,
+    int64_t orbit_count, double sensing_offset, double azimuth_interval,
+    const double* contexts, int64_t row_width,
+    double starting_range, double range_spacing, const double* dem,
+    int64_t dem_rows, int64_t dem_columns, double dem_x_start_deg,
+    double dem_y_start_deg, double dem_dx_deg, double dem_dy_deg,
+    double reference_height, double min_height, double max_height,
+    double wavelength, double range_tolerance, double doppler_tolerance,
+    int64_t primary_iter, int64_t budget, double look_sign,
+    double* latitude_deg, double* longitude_deg, double* output_height,
+    double* output_range, double* output_azimuth,
+    bool* converged, int32_t* iterations, double* decision_residual,
+    double* final_residual, double* tolerance, bool* max_iter_exhausted,
+    bool* boundary_rechecked, double* range_residual,
+    double* doppler_residual, int32_t* visit_counts, int64_t* work_index) {
+  int64_t point;
+  while (true) {
+    point = static_cast<int64_t>(atomicAdd(
+        reinterpret_cast<unsigned long long*>(work_index), 1ULL));
+    if (point >= count) return;
+    visit_counts[point] = 1;
+    const double* context = contexts + (point / row_width) * kContextStride;
+    if (!isfinite(context[20])) continue;
+
+  const double azimuth = azimuth_index[point];
+  const double range = range_index[point];
+  const double seed = height_seed[point];
+  const double* sat = context;
+  const double* vel = context + 3;
+  const double* normal = context + 6;
+  const double* cross_track = context + 9;
+  const double* along_track = context + 12;
+  const double satellite_norm = context[15];
+  const double normal_dot_velocity = context[16];
+  const double velocity_dot_along = context[17];
+  const double radius = context[18];
+  const double ellipsoid_height = context[19];
+  const double target = starting_range + range * range_spacing;
+  if (!(target > 0.0) || !isfinite(target)) continue;
   double height = seed;
-  if (height < min_height || height > max_height) return;
+  if (!isfinite(azimuth) || !isfinite(range) || !isfinite(seed) ||
+      height < min_height || height > max_height) continue;
 
   double old_llh[3] = {0.0, 0.0, height};
   double latest_range_residual = nan("");
@@ -201,7 +258,7 @@ __global__ void rdr2geo_tcn_kernel(
   }
 
   const bool budget_exhausted = !solved && !stopped_early && attempts >= budget;
-  if (!solved && !budget_exhausted) return;
+  if (!solved && !budget_exhausted) continue;
   if (budget_exhausted) {
     iterations[point] = static_cast<int32_t>(budget);
     max_iter_exhausted[point] = true;
@@ -210,7 +267,7 @@ __global__ void rdr2geo_tcn_kernel(
     doppler_residual[point] = latest_doppler_residual;
     decision_residual[point] = latest_range_residual;
     final_residual[point] = latest_range_residual;
-    return;
+    continue;
   }
 
   const double semi_minor = radius + height;
@@ -223,7 +280,7 @@ __global__ void rdr2geo_tcn_kernel(
                        safe_denominator(velocity_dot_along);
   const double radicand =
       target * sin_theta * target * sin_theta - alpha * alpha;
-  if (!isfinite(radicand) || radicand < -1.0e-6) return;
+  if (!isfinite(radicand) || radicand < -1.0e-6) continue;
   const double beta = look_sign * sqrt(fmax(0.0, radicand));
   double final_xyz[3];
   for (int axis = 0; axis < 3; ++axis)
@@ -237,7 +294,7 @@ __global__ void rdr2geo_tcn_kernel(
       final_look[0] * final_look[0] + final_look[1] * final_look[1] +
       final_look[2] * final_look[2]);
   double final_doppler = 0.0;
-  if (!(final_slant_range > 0.0) || !isfinite(final_slant_range)) return;
+  if (!(final_slant_range > 0.0) || !isfinite(final_slant_range)) continue;
   for (int axis = 0; axis < 3; ++axis)
     final_doppler += vel[axis] * final_look[axis] / final_slant_range;
   latest_range_residual = final_slant_range - target;
@@ -245,7 +302,7 @@ __global__ void rdr2geo_tcn_kernel(
   const bool final_converged =
       isfinite(latest_range_residual) &&
       fabs(latest_range_residual) < range_tolerance;
-  if (!final_converged) return;
+  if (!final_converged) continue;
   iterations[point] = attempts;
   max_iter_exhausted[point] = false;
   tolerance[point] = range_tolerance;
@@ -260,10 +317,11 @@ __global__ void rdr2geo_tcn_kernel(
   output_azimuth[point] = azimuth;
   converged[point] = true;
 }
+}
 
 }  // namespace
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
+std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -273,7 +331,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
     double dem_dx_deg, double dem_dy_deg, double reference_height_m,
     double min_height_m, double max_height_m, double wavelength_m,
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
-    int64_t extra_iter, bool right_looking) {
+    int64_t extra_iter, bool right_looking, int64_t row_width) {
   check_cuda_vector(azimuth_index, "azimuth_index");
   check_cuda_vector(range_index, "range_index");
   check_cuda_vector(height_seed_m, "height_seed_m");
@@ -317,6 +375,7 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
               "height limits/reference and wavelength must be finite");
   check_solver_scalars(max_iter, extra_iter, range_tolerance_m,
                        "range_tolerance_m");
+  TORCH_CHECK(row_width > 0, "row_width must be positive");
   TORCH_CHECK(std::isfinite(doppler_tolerance_hz) &&
               doppler_tolerance_hz > 0.0,
               "doppler_tolerance_hz must be finite and positive");
@@ -352,21 +411,39 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
   auto range_residual = torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options);
   auto doppler_residual = torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options);
   auto visit_counts = torch::zeros({count}, options.dtype(torch::kInt32));
+  const int64_t row_count = (count + row_width - 1) / row_width;
+  auto contexts = torch::empty({row_count, kContextStride}, options);
+  auto work_index = torch::zeros({1}, options.dtype(torch::kInt64));
   if (count > 0) {
-    constexpr int threads = 256;
-    const int blocks = static_cast<int>((count + threads - 1) / threads);
+    constexpr int threads = 128;
+    const int input_blocks = static_cast<int>((row_count + threads - 1) / threads);
+    const int point_blocks = static_cast<int>((count + threads - 1) / threads);
+    const auto* properties = at::cuda::getCurrentDeviceProperties();
+    const int worker_limit = properties->multiProcessorCount * kBlocksPerSm;
+    const int worker_blocks = std::max(1, std::min(point_blocks, worker_limit));
     auto stream = at::cuda::getCurrentCUDAStream(device);
     const double* dem_ptr = dem_height_m.dim() == 2
         ? dem_height_m.data_ptr<double>() : nullptr;
     const int64_t dem_rows = dem_height_m.dim() == 2 ? dem_height_m.size(0) : 0;
     const int64_t dem_columns = dem_height_m.dim() == 2 ? dem_height_m.size(1) : 0;
-    rdr2geo_tcn_kernel<<<blocks, threads, 0, stream.stream()>>>(
+    prepare_rdr2geo_contexts_kernel<<<input_blocks, threads, 0, stream.stream()>>>(
         azimuth_index.data_ptr<double>(), range_index.data_ptr<double>(),
         height_seed_m.data_ptr<double>(), count,
         orbit_times_s.data_ptr<double>(), orbit_positions_m.data_ptr<double>(),
         orbit_velocities_m_s.data_ptr<double>(), orbit_times_s.numel(),
-        sensing_offset_s, azimuth_time_interval_s, starting_slant_range_m,
-        range_spacing_m, dem_ptr, dem_rows, dem_columns, dem_x_start_deg,
+        sensing_offset_s, azimuth_time_interval_s, min_height_m, max_height_m,
+        row_width,
+        contexts.data_ptr<double>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    rdr2geo_tcn_kernel<<<worker_blocks, threads, 0, stream.stream()>>>(
+        azimuth_index.data_ptr<double>(), range_index.data_ptr<double>(),
+        height_seed_m.data_ptr<double>(), count,
+        orbit_times_s.data_ptr<double>(), orbit_positions_m.data_ptr<double>(),
+        orbit_velocities_m_s.data_ptr<double>(), orbit_times_s.numel(),
+        sensing_offset_s, azimuth_time_interval_s, contexts.data_ptr<double>(),
+        row_width,
+        starting_slant_range_m, range_spacing_m, dem_ptr, dem_rows, dem_columns,
+        dem_x_start_deg,
         dem_y_start_deg, dem_dx_deg, dem_dy_deg, reference_height_m,
         min_height_m, max_height_m, wavelength_m, range_tolerance_m,
         doppler_tolerance_hz, max_iter, max_iter + extra_iter,
@@ -377,13 +454,35 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
         decision_residual.data_ptr<double>(), final_residual.data_ptr<double>(),
         tolerance.data_ptr<double>(), max_iter_exhausted.data_ptr<bool>(),
         boundary_rechecked.data_ptr<bool>(), range_residual.data_ptr<double>(),
-        doppler_residual.data_ptr<double>(), visit_counts.data_ptr<int32_t>());
+        doppler_residual.data_ptr<double>(), visit_counts.data_ptr<int32_t>(),
+        work_index.data_ptr<int64_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return {latitude, longitude, output_height, output_range, output_azimuth,
           converged, iterations, decision_residual, final_residual, tolerance,
           max_iter_exhausted, boundary_rechecked, range_residual,
           doppler_residual, visit_counts};
+}
+
+std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
+    const Tensor& azimuth_index, const Tensor& range_index,
+    const Tensor& height_seed_m, const Tensor& orbit_times_s,
+    const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
+    double sensing_offset_s, double azimuth_time_interval_s,
+    double starting_slant_range_m, double range_spacing_m,
+    const Tensor& dem_height_m, double dem_x_start_deg, double dem_y_start_deg,
+    double dem_dx_deg, double dem_dy_deg, double reference_height_m,
+    double min_height_m, double max_height_m, double wavelength_m,
+    double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
+    int64_t extra_iter, bool right_looking) {
+  return rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+      azimuth_index, range_index, height_seed_m, orbit_times_s,
+      orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
+      azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
+      dem_height_m, dem_x_start_deg, dem_y_start_deg, dem_dx_deg, dem_dy_deg,
+      reference_height_m, min_height_m, max_height_m, wavelength_m,
+      range_tolerance_m, doppler_tolerance_hz, max_iter, extra_iter,
+      right_looking, 1);
 }
 
 std::vector<Tensor> rdr2geo_tcn_cuda_v2(

@@ -49,6 +49,12 @@ std::vector<torch::Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
     double, double, double, const torch::Tensor&, double, double, double,
     double, double, double, double, double, double, double, int64_t, int64_t,
     bool);
+std::vector<torch::Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
+    double, double, double, const torch::Tensor&, double, double, double,
+    double, double, double, double, double, double, double, int64_t, int64_t,
+    bool, int64_t);
 torch::Tensor rdr2geo_tcn_cuda_v2_visit_counts(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
@@ -84,14 +90,35 @@ std::vector<torch::Tensor> rdr2geo_cuda_public(
     double min_height, double max_height, double wavelength,
     double range_tolerance, double doppler_tolerance, int64_t max_iter,
     int64_t extra_iter, bool right_looking) {
-  auto result = rdr2geo_cuda_v2(
-      azimuth, range, height_seed, orbit_times, orbit_positions,
-      orbit_velocities, sensing_offset, azimuth_interval, starting_range,
-      range_spacing, dem, dem_x_start, dem_y_start, dem_dx, dem_dy,
-      reference_height, min_height, max_height, wavelength, range_tolerance,
-      doppler_tolerance, max_iter, extra_iter, right_looking);
+  TORCH_CHECK(azimuth.dim() == range.dim() && azimuth.dim() == height_seed.dim(),
+              "rdr2geo input arrays must have matching dimensions");
+  TORCH_CHECK(azimuth.dim() == 1 || azimuth.dim() == 2,
+              "rdr2geo input arrays must be one- or two-dimensional");
+  int64_t row_width = azimuth.dim() == 2 ? azimuth.size(1) : 1;
+  TORCH_CHECK(row_width > 0, "rdr2geo row width must be positive");
+  if (azimuth.dim() == 2 && row_width > 1) {
+    const auto row_delta = azimuth.narrow(1, 1, row_width - 1) -
+                           azimuth.narrow(1, 0, row_width - 1);
+    if (!torch::isfinite(row_delta).all().item<bool>() ||
+        !row_delta.eq(0).all().item<bool>()) {
+      row_width = 1;
+    }
+  }
+  const auto flat_shape = std::vector<int64_t>{azimuth.numel()};
+  auto result = rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+      azimuth.contiguous().reshape(flat_shape),
+      range.contiguous().reshape(flat_shape),
+      height_seed.contiguous().reshape(flat_shape), orbit_times,
+      orbit_positions, orbit_velocities, sensing_offset, azimuth_interval,
+      starting_range, range_spacing, dem, dem_x_start, dem_y_start, dem_dx,
+      dem_dy, reference_height, min_height, max_height, wavelength,
+      range_tolerance, doppler_tolerance, max_iter, extra_iter, right_looking,
+      row_width);
   TORCH_CHECK(result.size() == 14,
               "native CUDA rdr2geo public ABI must return 14 fields");
+  if (azimuth.dim() == 2) {
+    for (auto& field : result) field = field.reshape(azimuth.sizes());
+  }
   return result;
 }
 

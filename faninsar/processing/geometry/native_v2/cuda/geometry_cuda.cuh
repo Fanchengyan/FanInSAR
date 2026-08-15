@@ -232,6 +232,18 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking);
 
+std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+    const Tensor& azimuth_index, const Tensor& range_index,
+    const Tensor& height_seed_m, const Tensor& orbit_times_s,
+    const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
+    double sensing_offset_s, double azimuth_time_interval_s,
+    double starting_slant_range_m, double range_spacing_m,
+    const Tensor& dem_height_m, double dem_x_start_deg, double dem_y_start_deg,
+    double dem_dx_deg, double dem_dy_deg, double reference_height_m,
+    double min_height_m, double max_height_m, double wavelength_m,
+    double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
+    int64_t extra_iter, bool right_looking, int64_t row_width);
+
 std::vector<Tensor> rdr2geo_tcn_cuda_v2(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,

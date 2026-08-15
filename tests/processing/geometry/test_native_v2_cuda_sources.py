@@ -48,6 +48,23 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
     assert "iteration > primary_iter" in rdr2geo
     assert "pop_back" in geo2rdr
     assert "pop_back" in rdr2geo
+    assert "prepare_rdr2geo_contexts_kernel" in rdr2geo
+    assert "kContextStride" in rdr2geo
+    assert "row_width" in rdr2geo
+    assert "row_count" in rdr2geo
+    assert "atomicAdd" in rdr2geo
+    assert "work_index" in rdr2geo
+    assert "kBlocksPerSm" in rdr2geo
+    assert "multiProcessorCount" in rdr2geo
+    assert "point_blocks" in rdr2geo
+    assert "worker_blocks" in rdr2geo
+    assert "prepare_rdr2geo_contexts_kernel<<<input_blocks" in rdr2geo
+    assert "rdr2geo_tcn_kernel<<<worker_blocks" in rdr2geo
+    assert "rdr2geo_tcn_cuda_v2_with_visit_counts_row_width" in rdr2geo
+    assert "rdr2geo_tcn_cuda_v2_with_visit_counts_row_width" in common
+    assert "row_width" in binding
+    assert "azimuth.narrow" in binding
+    assert "row_width = 1" in binding
     assert "sample_dem" in common
     assert "bool* valid" in common
     assert "spline_six" in common
