@@ -472,9 +472,15 @@ def prepare_torch_geometry(
         try:
             dataset = dem._open()  # type: ignore[attr-defined]
             values = dem._height_array  # type: ignore[attr-defined]
-            transform = dataset.transform
             if values is None:
-                raise RuntimeError("RasterDEM did not materialize its height array")
+                values = dataset.read(1).astype(np.float32, copy=False)
+                nodata = dem.nodata  # type: ignore[attr-defined]
+                if nodata is None:
+                    nodata = dataset.nodata
+                if nodata is not None:
+                    values = np.where(np.isclose(values, nodata), np.nan, values)
+                dem._height_array = values  # type: ignore[attr-defined]
+            transform = dataset.transform
             dem_samples = torch.as_tensor(
                 np.asarray(values, dtype=np.float64),
                 dtype=torch.float64,
@@ -542,7 +548,6 @@ def prepare_torch_geometry(
             dem_longitude_spacing_deg=dem_longitude_spacing,
             dem_iterations=settings.dem_iterations,
             dem_height_tol_m=settings.dem_height_tol_m,
-            dem_primary_iter=settings.max_iter,
         )
 
     compiled_kernel: object | None = None

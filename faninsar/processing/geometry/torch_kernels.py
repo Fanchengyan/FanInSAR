@@ -364,7 +364,7 @@ def geo2rdr_kernel(
     return _result_invalid(output, finite)
 
 
-def rdr2geo_kernel(
+def _rdr2geo_once(
     azimuth: Any,
     range_index: Any,
     height_seed: Any,
@@ -390,7 +390,6 @@ def rdr2geo_kernel(
     dem_iterations: int = 1,
     dem_height_tol_m: float = 1.0e-3,
     dem_height_m: float | None = None,
-    dem_primary_iter: int = 20,
 ) -> dict[str, Any]:
     """Solve rdr2geo with the native closed-form TCN construction."""
     import torch
@@ -403,7 +402,6 @@ def rdr2geo_kernel(
         dem_iterations,
         dem_height_tol_m,
         dem_height_m,
-        dem_primary_iter,
     )
 
     target_range = starting_range_m + range_index * range_spacing_m
@@ -488,13 +486,6 @@ def rdr2geo_kernel(
                 else height
             )
         dem_xyz = _llh_to_ecef(latitude_candidate, longitude_candidate, dem_height)
-        if dem_samples is not None and attempt > dem_primary_iter:
-            old_xyz = _llh_to_ecef(latitude, longitude, height)
-            relaxed_xyz = 0.5 * (old_xyz + dem_xyz)
-            relaxed_lat, relaxed_lon, _ = _ecef_to_llh(relaxed_xyz)
-            latitude_candidate = torch.where(active, relaxed_lat, latitude_candidate)
-            longitude_candidate = torch.where(active, relaxed_lon, longitude_candidate)
-            dem_xyz = relaxed_xyz
         look = dem_xyz - sat
         slant_range = torch.linalg.vector_norm(look, dim=-1)
         unit = look / torch.clamp(slant_range, min=1.0e-12).unsqueeze(-1)
@@ -568,6 +559,87 @@ def rdr2geo_kernel(
         "residual_doppler_hz": doppler_residual,
     }
     return _result_invalid(output, finite)
+
+
+def rdr2geo_kernel(
+    azimuth: Any,
+    range_index: Any,
+    height_seed: Any,
+    orbit_times: Any,
+    orbit_positions: Any,
+    orbit_velocities: Any,
+    *,
+    sensing_offset_s: float,
+    azimuth_interval_s: float,
+    starting_range_m: float,
+    range_spacing_m: float,
+    wavelength_m: float,
+    look_sign: float,
+    max_iter: int,
+    range_tol_m: float,
+    doppler_tol_hz: float,
+    dynamic_iterations: bool,
+    dem_samples: Any | None = None,
+    dem_latitude_start_deg: float = 0.0,
+    dem_longitude_start_deg: float = 0.0,
+    dem_latitude_spacing_deg: float = 1.0,
+    dem_longitude_spacing_deg: float = 1.0,
+    dem_iterations: int = 1,
+    dem_height_tol_m: float = 1.0e-3,
+    dem_height_m: float | None = None,
+) -> dict[str, Any]:
+    """Solve rdr2geo with native primary-solve/DEM fixed-point semantics."""
+    import torch
+
+    if dem_samples is None and dem_height_m is None:
+        return _rdr2geo_once(
+            azimuth, range_index, height_seed, orbit_times, orbit_positions,
+            orbit_velocities, sensing_offset_s=sensing_offset_s,
+            azimuth_interval_s=azimuth_interval_s, starting_range_m=starting_range_m,
+            range_spacing_m=range_spacing_m, wavelength_m=wavelength_m,
+            look_sign=look_sign, max_iter=max_iter, range_tol_m=range_tol_m,
+            doppler_tol_hz=doppler_tol_hz, dynamic_iterations=dynamic_iterations,
+        )
+
+    heights = height_seed
+    result: dict[str, Any] = {}
+    for _ in range(dem_iterations):
+        result = _rdr2geo_once(
+            azimuth, range_index, heights, orbit_times, orbit_positions,
+            orbit_velocities, sensing_offset_s=sensing_offset_s,
+            azimuth_interval_s=azimuth_interval_s, starting_range_m=starting_range_m,
+            range_spacing_m=range_spacing_m, wavelength_m=wavelength_m,
+            look_sign=look_sign, max_iter=max_iter, range_tol_m=range_tol_m,
+            doppler_tol_hz=doppler_tol_hz, dynamic_iterations=dynamic_iterations,
+        )
+        if dem_samples is not None:
+            next_heights = _sample_dem_six(
+                dem_samples, result["latitude_deg"], result["longitude_deg"],
+                dem_latitude_start_deg, dem_longitude_start_deg,
+                dem_latitude_spacing_deg, dem_longitude_spacing_deg,
+            )
+        else:
+            next_heights = torch.full_like(heights, dem_height_m)
+        valid = result["converged"] & torch.isfinite(next_heights)
+        next_heights = torch.where(
+            valid, next_heights, torch.full_like(next_heights, torch.nan)
+        )
+        update = torch.abs(next_heights - heights)
+        heights = next_heights
+        if dynamic_iterations and bool(
+            torch.all((~result["converged"]) | (update < dem_height_tol_m)).item()
+        ):
+            break
+    result = _rdr2geo_once(
+        azimuth, range_index, heights, orbit_times, orbit_positions,
+        orbit_velocities, sensing_offset_s=sensing_offset_s,
+        azimuth_interval_s=azimuth_interval_s, starting_range_m=starting_range_m,
+        range_spacing_m=range_spacing_m, wavelength_m=wavelength_m,
+        look_sign=look_sign, max_iter=max_iter, range_tol_m=range_tol_m,
+        doppler_tol_hz=doppler_tol_hz, dynamic_iterations=dynamic_iterations,
+    )
+    result["height_m"] = heights
+    return result
 
 
 def prepared_orbit_tensors(model: Any, device: str) -> tuple[Any, Any, Any, float]:
