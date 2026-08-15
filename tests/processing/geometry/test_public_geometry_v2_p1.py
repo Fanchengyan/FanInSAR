@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -48,9 +47,6 @@ from .test_public_geometry_v2 import (
     _native_key,
     _native_outputs,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def test_torch_result_publishes_actual_iterations_and_invalid_tolerance() -> None:
