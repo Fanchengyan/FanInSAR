@@ -481,6 +481,10 @@ def prepare_torch_geometry(
                     values = np.where(np.isclose(values, nodata), np.nan, values)
                 dem._height_array = values  # type: ignore[attr-defined]
             transform = dataset.transform
+            if abs(float(transform.b)) > 1.0e-12 or abs(float(transform.d)) > 1.0e-12:
+                raise ValueError(
+                    "Torch RasterDEM requires an unrotated geographic affine transform"
+                )
             dem_samples = torch.as_tensor(
                 np.asarray(values, dtype=np.float64),
                 dtype=torch.float64,
@@ -494,6 +498,8 @@ def prepare_torch_geometry(
                 raise ValueError("RasterDEM contains nonfinite heights")
             if dem_samples.ndim != 2 or min(dem_samples.shape) < 6:
                 raise ValueError("RasterDEM must provide at least a 6x6 grid")
+        except ValueError:
+            raise
         except Exception as error:
             logger.exception("failed to prepare RasterDEM for Torch geometry")
             raise TypeError(
