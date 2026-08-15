@@ -508,13 +508,15 @@ def _rdr2geo_once(
         latitude = torch.where(active, latitude_candidate, latitude)
         longitude = torch.where(active, longitude_candidate, longitude)
         failed |= active & ~valid
-        solved |= active & valid & torch.isfinite(rr) & (torch.abs(rr) < range_tol_m)
-        update_height = dem_height if dem_samples is not None else (
-            torch.full_like(height, dem_height_m)
-            if dem_height_m is not None
-            else next_height
+        newly_solved = (
+            active & valid & torch.isfinite(rr) & (torch.abs(rr) < range_tol_m)
         )
-        height = torch.where(active & valid, update_height, height)
+        solved |= newly_solved
+        height = torch.where(
+            newly_solved,
+            dem_height,
+            torch.where(active & valid, next_height, height),
+        )
         if dynamic_iterations and bool(torch.all(solved | failed | ~finite).item()):
             break
     semi_minor = radius + height
@@ -591,14 +593,20 @@ def rdr2geo_kernel(
     """Solve rdr2geo with native primary-solve/DEM fixed-point semantics."""
     import torch
 
-    if dem_samples is None and dem_height_m is None:
+    if dem_samples is None:
+        fixed_height = (
+            torch.full_like(height_seed, dem_height_m)
+            if dem_height_m is not None
+            else height_seed
+        )
         return _rdr2geo_once(
-            azimuth, range_index, height_seed, orbit_times, orbit_positions,
+            azimuth, range_index, fixed_height, orbit_times, orbit_positions,
             orbit_velocities, sensing_offset_s=sensing_offset_s,
             azimuth_interval_s=azimuth_interval_s, starting_range_m=starting_range_m,
             range_spacing_m=range_spacing_m, wavelength_m=wavelength_m,
             look_sign=look_sign, max_iter=max_iter, range_tol_m=range_tol_m,
             doppler_tol_hz=doppler_tol_hz, dynamic_iterations=dynamic_iterations,
+            dem_height_m=dem_height_m,
         )
 
     heights = height_seed

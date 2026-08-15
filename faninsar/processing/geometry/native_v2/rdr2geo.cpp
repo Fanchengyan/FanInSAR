@@ -340,11 +340,12 @@ std::vector<Tensor> rdr2geo_cpu(
         early_failure = true;
         break;
       }
-      height = next_height;
       if (std::abs(last_range_residual) < range_tol_m) {
         lane_solved = true;
+        height = height_seed;
         break;
       }
+      height = next_height;
     }
     if (!lane_solved) {
       if (!early_failure && attempts_evaluated >= budget) {

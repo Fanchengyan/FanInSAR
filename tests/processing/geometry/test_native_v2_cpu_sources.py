@@ -316,3 +316,39 @@ def test_serial_cpu_extension_returns_validated_fourteen_field_result(
     assert telemetry["openmp_defined"] is False
     assert telemetry["runtime_name"] == "unknown"
     assert telemetry["visit_counts"] == [1]
+
+
+def test_rdr2geo_cpu_commits_the_input_height_on_convergence(
+    serial_native_extension: object,
+) -> None:
+    """Near-threshold native CPU lanes retain the height used for their solve."""
+    torch = pytest.importorskip("torch")
+    dtype = torch.float64
+    extension = serial_native_extension
+    heights = torch.full((2,), 10.0, dtype=dtype)
+    outputs = extension.rdr2geo_cpu(
+        torch.zeros(2, dtype=dtype),
+        torch.tensor([2186.3, 2186.4], dtype=dtype),
+        heights,
+        torch.tensor([-10.0, 10.0], dtype=dtype),
+        torch.tensor(
+            [[7_000_000.0, -10_000.0, 0.0], [7_000_000.0, 10_000.0, 0.0]],
+            dtype=dtype,
+        ),
+        torch.tensor([[0.0, 1_000.0, 0.0], [0.0, 1_000.0, 0.0]], dtype=dtype),
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        0.0555,
+        20,
+        0,
+        0.01,
+        0.1,
+        True,
+    )
+
+    assert outputs[5].tolist() == [True, True]
+    assert outputs[6].tolist() == [1, 1]
+    assert torch.allclose(outputs[2], heights)
+    assert torch.all(torch.abs(outputs[12]) < 0.01)

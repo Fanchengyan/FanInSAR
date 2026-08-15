@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import traceback
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
-from faninsar.processing.geometry import Operation, execute_geometry, prepare_geometry
+from faninsar.processing.geometry import (
+    Operation,
+    execute_geometry,
+    prepare_geometry,
+    torch_kernels,
+)
 from faninsar.processing.geometry.backend_dispatch import (
     CudaExecutionError,
     Dispatcher,
@@ -59,6 +65,89 @@ def test_torch_result_publishes_actual_iterations_and_invalid_tolerance() -> Non
     assert bool(result.converged[0])
     assert not bool(result.converged[1])
     assert np.isnan(result.tolerance[1])
+
+
+def test_constant_dem_bypasses_fixed_point_and_commits_sampled_height(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A constant DEM uses one solve and retains its height on convergence."""
+    calls = 0
+    original = torch_kernels._rdr2geo_once
+
+    def count_solves(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch_kernels, "_rdr2geo_once", count_solves)
+    prepared = prepare_torch_geometry(
+        "rdr2geo",
+        _model(),
+        shape=(2,),
+        dem=ConstantHeightDEM(50.0),
+        max_iter=4,
+        range_tol_m=1.0,
+        dem_iterations=50,
+    )
+    result = prepared.execute(
+        np.array([0.0, 0.004], dtype=np.float64),
+        np.array([0.0, 1.0], dtype=np.float64),
+        np.zeros(2, dtype=np.float64),
+    ).transform
+
+    assert calls == 1
+    assert result.converged.tolist() == [True, True]
+    assert result.iterations.tolist() == [2, 2]
+    np.testing.assert_allclose(result.height_m, 50.0)
+
+
+def test_constant_dem_eager_and_compiled_match_near_threshold_multilane() -> None:
+    """Constant DEM completion is identical for eager and compiled Torch paths."""
+    torch = pytest.importorskip("torch")
+    if not hasattr(torch, "compile"):
+        pytest.skip("torch.compile is unavailable")
+    model = _model()
+    values = (
+        np.array([0.0, 0.004], dtype=np.float64),
+        np.array([0.0, 1.0], dtype=np.float64),
+        np.zeros(2, dtype=np.float64),
+    )
+    eager = prepare_torch_geometry(
+        "rdr2geo",
+        model,
+        shape=(2,),
+        dem=ConstantHeightDEM(50.0),
+        max_iter=4,
+        range_tol_m=1.0,
+    ).execute(*values).transform
+    try:
+        compiled = prepare_torch_geometry(
+            "rdr2geo",
+            model,
+            shape=(2,),
+            dem=ConstantHeightDEM(50.0),
+            max_iter=4,
+            range_tol_m=1.0,
+            compile_kernel=True,
+        ).execute(*values).transform
+    except RuntimeError as error:
+        message = "".join(traceback.format_exception(error))
+        if "libc++.1.dylib" in message:
+            pytest.skip("the local Torch Inductor runtime cannot load libc++")
+        raise
+
+    for field in (
+        "latitude_deg",
+        "longitude_deg",
+        "height_m",
+        "residual_range_m",
+        "residual_doppler_hz",
+    ):
+        np.testing.assert_allclose(
+            getattr(eager, field), getattr(compiled, field), atol=1.0e-8
+        )
+    assert eager.converged.tolist() == compiled.converged.tolist() == [True, True]
+    assert eager.iterations.tolist() == compiled.iterations.tolist() == [2, 2]
 
 
 def test_native_callback_rejects_wrong_dtype_before_invocation() -> None:
