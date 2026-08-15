@@ -451,53 +451,40 @@ def prepare_torch_geometry(
     )
     orbit_tensors = prepared_orbit_tensors(model, str(resolved_device))
     orbit_times, orbit_positions, orbit_velocities, sensing_offset_s = orbit_tensors
-    constant_dem_height = (
-        float(dem.height_m)
-        if dem is not None and type(dem).__name__ == "ConstantHeightDEM"
-        else None
-    )
-    dem_samples = None
-    dem_latitude_start = 0.0
-    dem_longitude_start = 0.0
-    dem_latitude_spacing = 1.0
-    dem_longitude_spacing = 1.0
-    if dem is not None and constant_dem_height is None:
-        if type(dem).__name__ != "RasterDEM":
-            message = (
-                "Torch rdr2geo supports ConstantHeightDEM and RasterDEM; "
-                f"unsupported DEM type: {type(dem).__name__}"
-            )
-            logger.error(message)
-            raise TypeError(message)
+    def raster_payload(value: object) -> tuple[object, ...]:
+        """Materialize one RasterDEM and its affine metadata."""
         try:
-            dataset = dem._open()  # type: ignore[attr-defined]
-            values = dem._height_array  # type: ignore[attr-defined]
-            if values is None:
-                values = dataset.read(1).astype(np.float32, copy=False)
-                nodata = dem.nodata  # type: ignore[attr-defined]
+            dataset = value._open()  # type: ignore[attr-defined]
+            samples = value._height_array  # type: ignore[attr-defined]
+            if samples is None:
+                samples = dataset.read(1).astype(np.float32, copy=False)
+                nodata = value.nodata  # type: ignore[attr-defined]
                 if nodata is None:
                     nodata = dataset.nodata
                 if nodata is not None:
-                    values = np.where(np.isclose(values, nodata), np.nan, values)
-                dem._height_array = values  # type: ignore[attr-defined]
+                    samples = np.where(np.isclose(samples, nodata), np.nan, samples)
+                value._height_array = samples  # type: ignore[attr-defined]
             transform = dataset.transform
             if abs(float(transform.b)) > 1.0e-12 or abs(float(transform.d)) > 1.0e-12:
                 raise ValueError(
                     "Torch RasterDEM requires an unrotated geographic affine transform"
                 )
-            dem_samples = torch.as_tensor(
-                np.asarray(values, dtype=np.float64),
+            samples = torch.as_tensor(
+                np.asarray(samples, dtype=np.float64),
                 dtype=torch.float64,
                 device=resolved_device,
             ).contiguous()
-            dem_longitude_start = float(transform.c)
-            dem_latitude_start = float(transform.f)
-            dem_longitude_spacing = float(transform.a)
-            dem_latitude_spacing = float(transform.e)
-            if not bool(torch.isfinite(dem_samples).all().item()):
+            if not bool(torch.isfinite(samples).all().item()):
                 raise ValueError("RasterDEM contains nonfinite heights")
-            if dem_samples.ndim != 2 or min(dem_samples.shape) < 6:
+            if samples.ndim != 2 or min(samples.shape) < 6:
                 raise ValueError("RasterDEM must provide at least a 6x6 grid")
+            return (
+                samples,
+                float(transform.f),
+                float(transform.c),
+                float(transform.e),
+                float(transform.a),
+            )
         except ValueError:
             raise
         except Exception as error:
@@ -505,6 +492,41 @@ def prepare_torch_geometry(
             raise TypeError(
                 "RasterDEM could not be prepared for Torch geometry"
             ) from error
+
+    def dem_payload(value: object) -> tuple[object, ...]:
+        """Materialize supported DEM compositions into one device payload."""
+        kind = type(value).__name__
+        if kind == "ConstantHeightDEM":
+            return ("constant", float(value.height_m))  # type: ignore[attr-defined]
+        if kind == "RasterDEM":
+            return ("raster", *raster_payload(value))
+        if kind == "GeoidAdjustedDEM":
+            left = dem_payload(value.orthometric_dem)  # type: ignore[attr-defined]
+            right = dem_payload(value.geoid)  # type: ignore[attr-defined]
+            if left[0] == right[0] == "constant":
+                return ("constant", left[1] + right[1])
+            if left[0] == "constant":
+                left, right = right, left
+            if right[0] == "constant":
+                return ("raster", left[1] + right[1], *left[2:])
+            if left[0] != right[0] or left[2:] != right[2:]:
+                raise ValueError("composed RasterDEM grids must share affine metadata")
+            return ("raster", left[1] + right[1], *left[2:])
+        message = f"unsupported DEM type: {kind}"
+        logger.error(message)
+        raise TypeError(message)
+
+    payload = dem_payload(dem) if dem is not None else ("none",)
+    constant_dem_height = payload[1] if payload[0] == "constant" else None
+    dem_samples = None
+    dem_latitude_start = 0.0
+    dem_longitude_start = 0.0
+    dem_latitude_spacing = 1.0
+    dem_longitude_spacing = 1.0
+    if payload[0] == "raster":
+        dem_samples = payload[1]
+        dem_latitude_start, dem_longitude_start = payload[2], payload[3]
+        dem_latitude_spacing, dem_longitude_spacing = payload[4], payload[5]
 
     def kernel(*values: object) -> dict[str, object]:
         """Run the operation-specific device-resident solver."""
