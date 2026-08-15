@@ -1,4 +1,4 @@
-# ruff: noqa: EM101, EM102, TRY003, TRY004
+# ruff: noqa: EM101, EM102, TRY003, TRY004, TRY301
 
 """Torch eager and explicitly prepared geometry adapters.
 
@@ -456,6 +456,43 @@ def prepare_torch_geometry(
         if dem is not None and type(dem).__name__ == "ConstantHeightDEM"
         else None
     )
+    dem_samples = None
+    dem_latitude_start = 0.0
+    dem_longitude_start = 0.0
+    dem_latitude_spacing = 1.0
+    dem_longitude_spacing = 1.0
+    if dem is not None and constant_dem_height is None:
+        if type(dem).__name__ != "RasterDEM":
+            message = (
+                "Torch rdr2geo supports ConstantHeightDEM and RasterDEM; "
+                f"unsupported DEM type: {type(dem).__name__}"
+            )
+            logger.error(message)
+            raise TypeError(message)
+        try:
+            dataset = dem._open()  # type: ignore[attr-defined]
+            values = dem._height_array  # type: ignore[attr-defined]
+            transform = dataset.transform
+            if values is None:
+                raise RuntimeError("RasterDEM did not materialize its height array")
+            dem_samples = torch.as_tensor(
+                np.asarray(values, dtype=np.float64),
+                dtype=torch.float64,
+                device=resolved_device,
+            ).contiguous()
+            dem_longitude_start = float(transform.c)
+            dem_latitude_start = float(transform.f)
+            dem_longitude_spacing = float(transform.a)
+            dem_latitude_spacing = float(transform.e)
+            if not bool(torch.isfinite(dem_samples).all().item()):
+                raise ValueError("RasterDEM contains nonfinite heights")
+            if dem_samples.ndim != 2 or min(dem_samples.shape) < 6:
+                raise ValueError("RasterDEM must provide at least a 6x6 grid")
+        except Exception as error:
+            logger.exception("failed to prepare RasterDEM for Torch geometry")
+            raise TypeError(
+                "RasterDEM could not be prepared for Torch geometry"
+            ) from error
 
     def kernel(*values: object) -> dict[str, object]:
         """Run the operation-specific device-resident solver."""
@@ -498,6 +535,13 @@ def prepare_torch_geometry(
             doppler_tol_hz=settings.doppler_tol_hz,
             dynamic_iterations=dynamic,
             dem_height_m=constant_dem_height,
+            dem_samples=dem_samples,
+            dem_latitude_start_deg=dem_latitude_start,
+            dem_longitude_start_deg=dem_longitude_start,
+            dem_latitude_spacing_deg=dem_latitude_spacing,
+            dem_longitude_spacing_deg=dem_longitude_spacing,
+            dem_iterations=settings.dem_iterations,
+            dem_height_tol_m=settings.dem_height_tol_m,
         )
 
     compiled_kernel: object | None = None

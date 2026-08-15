@@ -129,6 +129,80 @@ def _orbit_state(
     return position, velocity, acceleration
 
 
+def _natural_spline_six(values: Any, fraction: Any) -> Any:
+    """Evaluate the local six-sample natural spline on Torch tensors."""
+    import torch
+
+    second = [torch.zeros_like(fraction) for _ in range(6)]
+    recurrence = [torch.zeros_like(fraction) for _ in range(6)]
+    for index in range(1, 5):
+        denominator = recurrence[index - 1] / 2.0 + 2.0
+        recurrence[index] = -0.5 / denominator
+        second[index] = (
+            3.0
+            * (
+                values[..., index + 1]
+                - 2.0 * values[..., index]
+                + values[..., index - 1]
+            )
+            - second[index - 1] / 2.0
+        ) / denominator
+    for index in range(4, 0, -1):
+        second[index] = recurrence[index] * second[index + 1] + second[index]
+    return values[..., 1] + fraction * (
+        values[..., 2]
+        - values[..., 1]
+        - second[1] / 3.0
+        - second[2] / 6.0
+        + fraction * (second[1] / 2.0 + fraction * (second[2] - second[1]) / 6.0)
+    )
+
+
+def _sample_dem_six(
+    dem_samples: Any,
+    latitude: Any,
+    longitude: Any,
+    latitude_start_deg: float,
+    longitude_start_deg: float,
+    latitude_spacing_deg: float,
+    longitude_spacing_deg: float,
+) -> Any:
+    """Sample a device-resident DEM with the native six-point spline."""
+    import torch
+
+    row = (latitude - latitude_start_deg) / latitude_spacing_deg
+    column = (longitude - longitude_start_deg) / longitude_spacing_deg
+    row_base = torch.floor(row).to(torch.int64)
+    column_base = torch.floor(column).to(torch.int64)
+    rows, columns = dem_samples.shape[-2:]
+    valid = (
+        torch.isfinite(row)
+        & torch.isfinite(column)
+        & (row_base >= 1)
+        & (row_base <= rows - 5)
+        & (column_base >= 1)
+        & (column_base <= columns - 5)
+    )
+    safe_row = row_base.clamp(1, rows - 5)
+    safe_column = column_base.clamp(1, columns - 5)
+    row_values = []
+    column_fraction = column - safe_column
+    row_fraction = row - safe_row
+    for row_offset in range(-1, 5):
+        window = torch.stack(
+            [
+                dem_samples[safe_row + row_offset, safe_column + column_offset]
+                for column_offset in range(-1, 5)
+            ],
+            dim=-1,
+        )
+        row_values.append(_natural_spline_six(window, column_fraction))
+    sampled = _natural_spline_six(torch.stack(row_values, dim=-1), row_fraction)
+    return torch.where(
+        valid & torch.isfinite(sampled), sampled, torch.full_like(sampled, torch.nan)
+    )
+
+
 def _result_invalid(output: dict[str, Any], finite: Any) -> dict[str, Any]:
     """Apply v2 invalid-lane sentinels to a tensor result."""
     import torch
@@ -325,10 +399,6 @@ def rdr2geo_kernel(
     _ = (
         doppler_tol_hz,
         dem_samples,
-        dem_latitude_start_deg,
-        dem_longitude_start_deg,
-        dem_latitude_spacing_deg,
-        dem_longitude_spacing_deg,
         dem_iterations,
         dem_height_tol_m,
         dem_height_m,
@@ -399,11 +469,22 @@ def rdr2geo_kernel(
         target_xyz = target_xyz + beta.unsqueeze(-1) * cross_track
         target_xyz = target_xyz + gamma.unsqueeze(-1) * normal
         latitude_candidate, longitude_candidate, _ = _ecef_to_llh(target_xyz)
-        dem_height = (
-            torch.full_like(height, dem_height_m)
-            if dem_height_m is not None
-            else height
-        )
+        if dem_samples is not None:
+            dem_height = _sample_dem_six(
+                dem_samples,
+                latitude_candidate,
+                longitude_candidate,
+                dem_latitude_start_deg,
+                dem_longitude_start_deg,
+                dem_latitude_spacing_deg,
+                dem_longitude_spacing_deg,
+            )
+        else:
+            dem_height = (
+                torch.full_like(height, dem_height_m)
+                if dem_height_m is not None
+                else height
+            )
         dem_xyz = _llh_to_ecef(latitude_candidate, longitude_candidate, dem_height)
         look = dem_xyz - sat
         slant_range = torch.linalg.vector_norm(look, dim=-1)
@@ -419,6 +500,7 @@ def rdr2geo_kernel(
             torch.isfinite(slant_range)
             & (slant_range > 0.0)
             & torch.isfinite(next_height)
+            & torch.isfinite(dem_height)
         )
         attempts = torch.where(active, torch.full_like(attempts, attempt), attempts)
         range_residual = torch.where(active, rr, range_residual)
@@ -427,7 +509,7 @@ def rdr2geo_kernel(
         longitude = torch.where(active, longitude_candidate, longitude)
         failed |= active & ~valid
         solved |= active & valid & torch.isfinite(rr) & (torch.abs(rr) < range_tol_m)
-        update_height = (
+        update_height = dem_height if dem_samples is not None else (
             torch.full_like(height, dem_height_m)
             if dem_height_m is not None
             else next_height
