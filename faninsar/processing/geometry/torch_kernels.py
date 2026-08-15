@@ -603,7 +603,7 @@ def rdr2geo_kernel(
 
     heights = height_seed
     result: dict[str, Any] = {}
-    frozen = torch.zeros_like(heights, dtype=torch.bool)
+    frozen = torch.zeros((), dtype=torch.bool, device=heights.device)
     for _ in range(dem_iterations):
         result = _rdr2geo_once(
             azimuth, range_index, heights, orbit_times, orbit_positions,
@@ -626,11 +626,13 @@ def rdr2geo_kernel(
             valid, next_heights, torch.full_like(next_heights, torch.nan)
         )
         update = torch.abs(next_heights - heights)
-        newly_frozen = valid & (update < dem_height_tol_m)
         heights = torch.where(frozen, heights, next_heights)
-        frozen |= newly_frozen
+        global_done = torch.all(
+            (~result["converged"]) | (update < dem_height_tol_m)
+        )
+        frozen = frozen | global_done
         if dynamic_iterations and bool(
-            torch.all((~result["converged"]) | (update < dem_height_tol_m)).item()
+            global_done.item()
         ):
             break
     result = _rdr2geo_once(
