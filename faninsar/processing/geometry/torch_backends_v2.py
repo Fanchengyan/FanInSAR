@@ -542,6 +542,7 @@ def prepare_torch_geometry(
             dem_longitude_spacing_deg=dem_longitude_spacing,
             dem_iterations=settings.dem_iterations,
             dem_height_tol_m=settings.dem_height_tol_m,
+            dem_primary_iter=settings.max_iter,
         )
 
     compiled_kernel: object | None = None

@@ -390,6 +390,7 @@ def rdr2geo_kernel(
     dem_iterations: int = 1,
     dem_height_tol_m: float = 1.0e-3,
     dem_height_m: float | None = None,
+    dem_primary_iter: int = 20,
 ) -> dict[str, Any]:
     """Solve rdr2geo with the native closed-form TCN construction."""
     import torch
@@ -402,6 +403,7 @@ def rdr2geo_kernel(
         dem_iterations,
         dem_height_tol_m,
         dem_height_m,
+        dem_primary_iter,
     )
 
     target_range = starting_range_m + range_index * range_spacing_m
@@ -486,6 +488,13 @@ def rdr2geo_kernel(
                 else height
             )
         dem_xyz = _llh_to_ecef(latitude_candidate, longitude_candidate, dem_height)
+        if dem_samples is not None and attempt > dem_primary_iter:
+            old_xyz = _llh_to_ecef(latitude, longitude, height)
+            relaxed_xyz = 0.5 * (old_xyz + dem_xyz)
+            relaxed_lat, relaxed_lon, _ = _ecef_to_llh(relaxed_xyz)
+            latitude_candidate = torch.where(active, relaxed_lat, latitude_candidate)
+            longitude_candidate = torch.where(active, relaxed_lon, longitude_candidate)
+            dem_xyz = relaxed_xyz
         look = dem_xyz - sat
         slant_range = torch.linalg.vector_norm(look, dim=-1)
         unit = look / torch.clamp(slant_range, min=1.0e-12).unsqueeze(-1)
