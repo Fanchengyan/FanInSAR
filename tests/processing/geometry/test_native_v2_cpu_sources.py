@@ -12,6 +12,7 @@ from faninsar.processing.geometry.native_v2 import (
     NATIVE_RESULT_FIELDS,
     result_from_native_outputs,
 )
+from faninsar.processing.geometry.torch_kernels import _rdr2geo_once
 
 SOURCE_ROOT = (
     Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native_v2"
@@ -352,3 +353,76 @@ def test_rdr2geo_cpu_commits_the_input_height_on_convergence(
     assert outputs[6].tolist() == [1, 1]
     assert torch.allclose(outputs[2], heights)
     assert torch.all(torch.abs(outputs[12]) < 0.01)
+
+
+def test_rdr2geo_cpu_rebuilds_final_tcn_state_like_torch(
+    serial_native_extension: object,
+) -> None:
+    """Native CPU recomputes committed-height coordinates before final metrics."""
+    torch = pytest.importorskip("torch")
+    dtype = torch.float64
+    count = 64
+    phase = torch.linspace(-1.0, 1.0, count, dtype=dtype)
+    azimuth = 2.0 * torch.sin(phase)
+    range_index = 2186.3 + 2.0 * torch.cos(phase)
+    height = torch.zeros(count, dtype=dtype)
+    times = torch.arange(9, dtype=dtype) * 10.0
+    positions = torch.stack(
+        (
+            torch.full_like(times, 7_000_000.0),
+            -10_000.0 + 2_500.0 * torch.arange(9, dtype=dtype),
+            100.0 * torch.arange(9, dtype=dtype),
+        ),
+        dim=-1,
+    )
+    velocities = torch.stack(
+        (
+            torch.zeros_like(times),
+            torch.full_like(times, 1_000.0),
+            torch.full_like(times, 7.5),
+        ),
+        dim=-1,
+    )
+    native = serial_native_extension.rdr2geo_cpu(
+        azimuth,
+        range_index,
+        height,
+        times,
+        positions,
+        velocities,
+        40.0,
+        0.002,
+        600_000.0,
+        10.0,
+        0.0555,
+        4,
+        0,
+        0.01,
+        0.1,
+        True,
+    )
+    torch_result = _rdr2geo_once(
+        azimuth,
+        range_index,
+        height,
+        times,
+        positions,
+        velocities,
+        sensing_offset_s=40.0,
+        azimuth_interval_s=0.002,
+        starting_range_m=600_000.0,
+        range_spacing_m=10.0,
+        wavelength_m=0.0555,
+        look_sign=1.0,
+        max_iter=4,
+        range_tol_m=0.01,
+        doppler_tol_hz=0.1,
+        dynamic_iterations=True,
+        dem_height_m=0.0,
+    )
+    common = native[5] & torch_result["converged"]
+
+    assert bool(common.any())
+    assert torch.allclose(native[0][common], torch_result["latitude_deg"][common])
+    assert torch.allclose(native[1][common], torch_result["longitude_deg"][common])
+    assert torch.allclose(native[12][common], torch_result["residual_range_m"][common])

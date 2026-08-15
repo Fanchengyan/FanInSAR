@@ -316,7 +316,7 @@ std::vector<Tensor> rdr2geo_cpu(
       longitude_rad = llh[1];
       const double latitude_deg = latitude_rad * radians_to_degrees;
       const double longitude_deg = longitude_rad * radians_to_degrees;
-      const Vec3 dem_xyz = llh_to_ecef(latitude_deg, longitude_deg, height);
+      const Vec3 dem_xyz = llh_to_ecef(latitude_deg, longitude_deg, height_seed);
       const double slant_range = norm(Vec3{state.position[0] - dem_xyz[0],
                                            state.position[1] - dem_xyz[1],
                                            state.position[2] - dem_xyz[2]});
@@ -357,14 +357,46 @@ std::vector<Tensor> rdr2geo_cpu(
       }
       continue;
     }
-    const double final_latitude_deg = latitude_rad * radians_to_degrees;
-    const double final_longitude_deg = longitude_rad * radians_to_degrees;
-    const OrbitState final_state = interpolate_orbit(
-        times, positions, velocities, orbit_times_s.numel(), time_s);
-    const Vec3 final_xyz = llh_to_ecef(final_latitude_deg, final_longitude_deg, height);
-    const Vec3 final_look{final_xyz[0] - final_state.position[0],
-                          final_xyz[1] - final_state.position[1],
-                          final_xyz[2] - final_state.position[2]};
+    const double final_semi_minor = radius + height;
+    const double final_cos_theta = 0.5 *
+        (satellite_norm / target_range + target_range / satellite_norm -
+         (final_semi_minor / satellite_norm) *
+             (final_semi_minor / target_range));
+    const double final_sin_theta =
+        std::sqrt(std::max(0.0, 1.0 - final_cos_theta * final_cos_theta));
+    const double final_gamma = target_range * final_cos_theta;
+    const double final_alpha = -final_gamma * normal_dot_velocity /
+                               std::max(velocity_dot_along, 1.0e-12);
+    const double final_beta_argument =
+        (target_range * final_sin_theta) * (target_range * final_sin_theta) -
+        final_alpha * final_alpha;
+    if (!std::isfinite(final_beta_argument) || final_beta_argument < -1.0e-6) {
+      solved[point] = false;
+      iteration_values[point] = -1;
+      exhausted_values[point] = false;
+      continue;
+    }
+    const double final_beta = (right_looking ? 1.0 : -1.0) *
+                              std::sqrt(std::max(0.0, final_beta_argument));
+    const Vec3 final_xyz{
+        state.position[0] + final_alpha * along_track[0] +
+            final_beta * cross_track[0] + final_gamma * normal[0],
+        state.position[1] + final_alpha * along_track[1] +
+            final_beta * cross_track[1] + final_gamma * normal[1],
+        state.position[2] + final_alpha * along_track[2] +
+            final_beta * cross_track[2] + final_gamma * normal[2]};
+    const Vec3 final_llh = ecef_to_llh_tcn(final_xyz);
+    if (!std::isfinite(final_llh[0]) || !std::isfinite(final_llh[1])) {
+      solved[point] = false;
+      iteration_values[point] = -1;
+      exhausted_values[point] = false;
+      continue;
+    }
+    const double final_latitude_deg = final_llh[0] * radians_to_degrees;
+    const double final_longitude_deg = final_llh[1] * radians_to_degrees;
+    const Vec3 final_look{final_xyz[0] - state.position[0],
+                          final_xyz[1] - state.position[1],
+                          final_xyz[2] - state.position[2]};
     const double final_slant_range = norm(final_look);
     if (!(final_slant_range > 0.0) || !std::isfinite(final_slant_range)) {
       solved[point] = false;
@@ -377,7 +409,7 @@ std::vector<Tensor> rdr2geo_cpu(
                           final_look[2] / final_slant_range};
     const double final_range_residual = final_slant_range - target_range;
     const double final_doppler =
-        2.0 * dot(final_state.velocity, final_unit) / wavelength_m;
+        2.0 * dot(state.velocity, final_unit) / wavelength_m;
     range_residuals[point] = final_range_residual;
     doppler_residuals[point] = final_doppler;
     decisions[point] = final_range_residual;
