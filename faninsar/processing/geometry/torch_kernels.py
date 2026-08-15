@@ -372,6 +372,86 @@ def geo2rdr_kernel(
     return _result_invalid(output, finite)
 
 
+def _rdr2geo_geometry_state(
+    azimuth: Any,
+    range_index: Any,
+    orbit_times: Any,
+    orbit_positions: Any,
+    orbit_velocities: Any,
+    *,
+    sensing_offset_s: float,
+    azimuth_interval_s: float,
+    starting_range_m: float,
+    range_spacing_m: float,
+) -> tuple[Any, ...]:
+    """Build the immutable device state shared by all TCN/DEM iterations.
+
+    The old high-throughput Torch solver accepted satellite and velocity as
+    device-resident inputs.  The prepared public API accepts radar indices
+    instead, so this equivalent state is materialized once per invocation and
+    then reused by every fixed-point iteration.  Keeping this work outside
+    :func:`_rdr2geo_once` avoids rebuilding the TCN basis for each DEM update.
+    """
+    import torch
+
+    target_range = starting_range_m + range_index * range_spacing_m
+    times = sensing_offset_s + azimuth * azimuth_interval_s
+    orbit_start, orbit_end = orbit_times[0], orbit_times[-1]
+    sat, velocity, _ = _orbit_state(
+        times, orbit_times, orbit_positions, orbit_velocities
+    )
+    speed = torch.linalg.vector_norm(velocity, dim=-1)
+    satellite_norm = torch.linalg.vector_norm(sat, dim=-1)
+    finite = (
+        torch.isfinite(target_range)
+        & (target_range > 0.0)
+        & torch.isfinite(azimuth)
+        & torch.isfinite(range_index)
+        & torch.isfinite(times)
+        & (times >= orbit_start)
+        & (times <= orbit_end)
+        & (speed > 0.0)
+        & (satellite_norm > 0.0)
+    )
+    velocity_unit = velocity / torch.clamp(speed, min=1.0e-12).unsqueeze(-1)
+    normal = -sat / torch.clamp(satellite_norm, min=1.0e-12).unsqueeze(-1)
+    cross_track = torch.linalg.cross(normal, velocity, dim=-1)
+    cross_track = cross_track / torch.clamp(
+        torch.linalg.vector_norm(cross_track, dim=-1), min=1.0e-12
+    ).unsqueeze(-1)
+    along_track = torch.linalg.cross(cross_track, normal, dim=-1)
+    along_track = along_track / torch.clamp(
+        torch.linalg.vector_norm(along_track, dim=-1), min=1.0e-12
+    ).unsqueeze(-1)
+    normal_dot_velocity = torch.sum(normal * velocity_unit, dim=-1)
+    velocity_dot_along = torch.sum(velocity_unit * along_track, dim=-1)
+    finite &= torch.isfinite(normal_dot_velocity) & (velocity_dot_along > 1.0e-12)
+    minor = _A * torch.sqrt(
+        torch.as_tensor(1.0 - _E2, dtype=sat.dtype, device=sat.device)
+    )
+    eta = 1.0 / torch.sqrt(
+        (sat[..., 0] / _A).square()
+        + (sat[..., 1] / _A).square()
+        + (sat[..., 2] / minor).square()
+    )
+    radius = eta * satellite_norm
+    ellipsoid_height = (1.0 - eta) * satellite_norm
+    return (
+        target_range,
+        sat,
+        velocity,
+        satellite_norm,
+        normal,
+        cross_track,
+        along_track,
+        normal_dot_velocity,
+        velocity_dot_along,
+        radius,
+        ellipsoid_height,
+        finite,
+    )
+
+
 def _rdr2geo_once(
     azimuth: Any,
     range_index: Any,
@@ -398,6 +478,7 @@ def _rdr2geo_once(
     dem_iterations: int = 1,
     dem_height_tol_m: float = 1.0e-3,
     dem_height_m: float | None = None,
+    geometry_state: tuple[Any, ...] | None = None,
 ) -> dict[str, Any]:
     """Solve rdr2geo with the native closed-form TCN construction."""
     import torch
@@ -412,43 +493,33 @@ def _rdr2geo_once(
         dem_height_m,
     )
 
-    target_range = starting_range_m + range_index * range_spacing_m
-    times = sensing_offset_s + azimuth * azimuth_interval_s
-    orbit_start, orbit_end = orbit_times[0], orbit_times[-1]
-    sat, velocity, _ = _orbit_state(
-        times, orbit_times, orbit_positions, orbit_velocities
-    )
-    speed = torch.linalg.vector_norm(velocity, dim=-1)
-    satellite_norm = torch.linalg.vector_norm(sat, dim=-1)
-    finite = (
-        torch.isfinite(target_range) & (target_range > 0.0)
-        & torch.isfinite(azimuth) & torch.isfinite(range_index)
-        & torch.isfinite(height_seed) & torch.isfinite(times)
-        & (times >= orbit_start) & (times <= orbit_end)
-        & (speed > 0.0) & (satellite_norm > 0.0)
-    )
-    velocity_unit = velocity / torch.clamp(speed, min=1.0e-12).unsqueeze(-1)
-    normal = -sat / torch.clamp(satellite_norm, min=1.0e-12).unsqueeze(-1)
-    cross_track = torch.linalg.cross(normal, velocity, dim=-1)
-    cross_track = cross_track / torch.clamp(
-        torch.linalg.vector_norm(cross_track, dim=-1), min=1.0e-12
-    ).unsqueeze(-1)
-    along_track = torch.linalg.cross(cross_track, normal, dim=-1)
-    along_track = along_track / torch.clamp(
-        torch.linalg.vector_norm(along_track, dim=-1), min=1.0e-12
-    ).unsqueeze(-1)
-    normal_dot_velocity = torch.sum(normal * velocity_unit, dim=-1)
-    velocity_dot_along = torch.sum(velocity_unit * along_track, dim=-1)
-    finite &= torch.isfinite(normal_dot_velocity) & (velocity_dot_along > 1.0e-12)
-    minor = _A * torch.sqrt(
-        torch.as_tensor(1.0 - _E2, dtype=sat.dtype, device=sat.device)
-    )
-    eta = 1.0 / torch.sqrt(
-        (sat[..., 0] / _A).square() + (sat[..., 1] / _A).square()
-        + (sat[..., 2] / minor).square()
-    )
-    radius = eta * satellite_norm
-    ellipsoid_height = (1.0 - eta) * satellite_norm
+    if geometry_state is None:
+        geometry_state = _rdr2geo_geometry_state(
+            azimuth,
+            range_index,
+            orbit_times,
+            orbit_positions,
+            orbit_velocities,
+            sensing_offset_s=sensing_offset_s,
+            azimuth_interval_s=azimuth_interval_s,
+            starting_range_m=starting_range_m,
+            range_spacing_m=range_spacing_m,
+        )
+    (
+        target_range,
+        sat,
+        velocity,
+        satellite_norm,
+        normal,
+        cross_track,
+        along_track,
+        normal_dot_velocity,
+        velocity_dot_along,
+        radius,
+        ellipsoid_height,
+        finite,
+    ) = geometry_state
+    finite = finite & torch.isfinite(height_seed)
     height = height_seed
     latitude = torch.full_like(azimuth, torch.nan)
     longitude = torch.full_like(azimuth, torch.nan)
@@ -606,6 +677,17 @@ def rdr2geo_kernel(
     """Solve rdr2geo with native primary-solve/DEM fixed-point semantics."""
     import torch
 
+    geometry_state = _rdr2geo_geometry_state(
+        azimuth,
+        range_index,
+        orbit_times,
+        orbit_positions,
+        orbit_velocities,
+        sensing_offset_s=sensing_offset_s,
+        azimuth_interval_s=azimuth_interval_s,
+        starting_range_m=starting_range_m,
+        range_spacing_m=range_spacing_m,
+    )
     if dem_samples is None:
         fixed_height = (
             torch.full_like(height_seed, dem_height_m)
@@ -620,6 +702,7 @@ def rdr2geo_kernel(
             look_sign=look_sign, max_iter=max_iter, range_tol_m=range_tol_m,
             doppler_tol_hz=doppler_tol_hz, dynamic_iterations=dynamic_iterations,
             dem_height_m=dem_height_m,
+            geometry_state=geometry_state,
         )
 
     heights = height_seed
@@ -633,6 +716,7 @@ def rdr2geo_kernel(
             range_spacing_m=range_spacing_m, wavelength_m=wavelength_m,
             look_sign=look_sign, max_iter=max_iter, range_tol_m=range_tol_m,
             doppler_tol_hz=doppler_tol_hz, dynamic_iterations=dynamic_iterations,
+            geometry_state=geometry_state,
         )
         if dem_samples is not None:
             next_heights = _sample_dem_six(
@@ -663,6 +747,7 @@ def rdr2geo_kernel(
         range_spacing_m=range_spacing_m, wavelength_m=wavelength_m,
         look_sign=look_sign, max_iter=max_iter, range_tol_m=range_tol_m,
         doppler_tol_hz=doppler_tol_hz, dynamic_iterations=dynamic_iterations,
+        geometry_state=geometry_state,
     )
     result["height_m"] = heights
     return result

@@ -586,7 +586,12 @@ def prepare_torch_geometry(
     compiled_kernel: object | None = None
     if compile_kernel:
         try:
-            compiled_kernel = torch.compile(kernel, dynamic=False)
+            compiled_kernel = torch.compile(
+                kernel,
+                mode="reduce-overhead",
+                fullgraph=True,
+                dynamic=False,
+            )
             sample = torch.zeros(
                 tuple(shape),
                 dtype=getattr(torch, canonical_dtype.split(".")[-1]),
@@ -651,7 +656,9 @@ def _check_inputs(
             f"prepared shape {prepared.shape} does not match input shape "
             f"{tuple(broadcast[0].shape)}"
         )
-    return tuple(broadcast)
+    # Expanded broadcast views have unstable strides for a shape-specialized
+    # compiled graph.  Materialize one contiguous device buffer per argument.
+    return tuple(value.contiguous() for value in broadcast)
 
 
 def execute_torch_geometry(
