@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import traceback
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -65,6 +67,21 @@ def test_torch_result_publishes_actual_iterations_and_invalid_tolerance() -> Non
     assert bool(result.converged[0])
     assert not bool(result.converged[1])
     assert np.isnan(result.tolerance[1])
+
+
+def test_geo2rdr_convergence_uses_physical_metric_not_newton_step() -> None:
+    """Keep last-step roundoff from changing the public convergence vote."""
+    source = inspect.getsource(torch_kernels._geo2rdr_once)
+    assert "step_small" not in source
+    assert "newly = active & valid & in_bounds" in source
+    assert "metric < 1.0" in source
+    native_root = Path(torch_kernels.__file__).parent / "native_v2"
+    assert "fabs(step) < time_tolerance" not in (
+        native_root / "cuda" / "geo2rdr_cuda.cu"
+    ).read_text()
+    assert "std::abs(step) <= time_tol_s" not in (
+        native_root / "geo2rdr.cpp"
+    ).read_text()
 
 
 def test_constant_dem_bypasses_fixed_point_and_commits_sampled_height(

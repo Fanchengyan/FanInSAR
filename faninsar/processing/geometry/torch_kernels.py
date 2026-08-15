@@ -311,7 +311,6 @@ def geo2rdr_kernel(
         next_times = torch.where(active & valid, times + step, times)
         in_bounds = (next_times >= orbit_start) & (next_times <= orbit_end)
         failed |= active & (~valid | ~torch.isfinite(step) | ~in_bounds)
-        step_small = active & valid & in_bounds & (torch.abs(step) <= time_tol_s)
         final_sat, final_velocity, _ = _orbit_state(
             next_times, orbit_times, orbit_positions, orbit_velocities
         )
@@ -328,7 +327,11 @@ def geo2rdr_kernel(
             torch.abs(final_range_residual) / range_tol_m,
             torch.abs(final_doppler) / doppler_tol_hz,
         )
-        newly = step_small & torch.isfinite(metric) & (metric < 1.0)
+        # The canonical geo2rdr decision is the strict physical residual
+        # metric.  A backend-specific Newton-step predicate is diagnostic
+        # only: retaining it here makes eager and compiled Torch disagree
+        # when their last-step roundoff differs despite identical residuals.
+        newly = active & valid & in_bounds & torch.isfinite(metric) & (metric < 1.0)
         solved |= newly
         doppler = torch.where(active, final_doppler, doppler)
         range_residual = torch.where(active, final_range_residual, range_residual)

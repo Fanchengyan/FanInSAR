@@ -188,7 +188,11 @@ std::vector<Tensor> geo2rdr_cpu(
         early_failure = true;
         break;
       }
-      if (std::abs(step) <= time_tol_s) {
+      // Convergence is owned by the strict physical residual metric.  The
+      // Newton step is an update diagnostic, not an additional acceptance
+      // gate; using it as a gate makes CPU/CUDA and Torch backends disagree
+      // when their last-step roundoff differs despite identical residuals.
+      {
         const OrbitState final_state = interpolate_orbit(
             times, positions, velocities, orbit_times_s.numel(), time_s);
         const Vec3 final_look{target[0] - final_state.position[0],

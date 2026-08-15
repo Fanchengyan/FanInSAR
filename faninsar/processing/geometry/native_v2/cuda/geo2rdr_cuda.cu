@@ -85,8 +85,11 @@ __global__ void geo2rdr_kernel(
     }
     const double step = -doppler / derivative;
     time += step;
-    if (isfinite(step) && fabs(step) < time_tolerance) {
-      if (time >= orbit_start && time <= orbit_end) {
+    // Convergence is owned by the strict physical residual metric.  The
+    // Newton step is an update diagnostic, not an additional acceptance
+    // gate; using it as a gate makes CPU/CUDA and Torch backends disagree
+    // when their last-step roundoff differs despite identical residuals.
+    if (time >= orbit_start && time <= orbit_end) {
         hermite(orbit_times, positions, velocities, orbit_count, time,
                 satellite, velocity, acceleration);
         double final_range_squared = 0.0;
@@ -111,14 +114,12 @@ __global__ void geo2rdr_kernel(
           decision = fmax(fabs(residual_range) / range_tolerance,
                           fabs(residual_doppler) / doppler_tolerance);
           solved = isfinite(final_doppler) && isfinite(residual_range) &&
-                   fabs(residual_range) < range_tolerance &&
-                   fabs(residual_doppler) < doppler_tolerance;
+                   isfinite(decision) && decision < 1.0;
           final = decision;
         }
-      } else {
-        stopped_early = true;
-      }
       if (solved) break;
+    } else {
+      stopped_early = true;
     }
   }
   if (!solved) {
