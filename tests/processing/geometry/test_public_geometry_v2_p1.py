@@ -71,7 +71,7 @@ def test_torch_result_publishes_actual_iterations_and_invalid_tolerance() -> Non
 
 def test_geo2rdr_convergence_uses_physical_metric_not_newton_step() -> None:
     """Keep last-step roundoff from changing the public convergence vote."""
-    source = inspect.getsource(torch_kernels._geo2rdr_once)
+    source = inspect.getsource(torch_kernels.geo2rdr_kernel)
     assert "step_small" not in source
     assert "newly = active & valid & in_bounds" in source
     assert "metric < 1.0" in source

@@ -257,6 +257,10 @@ def geo2rdr_kernel(
     """
     import torch
 
+    # Retained for public-call compatibility; convergence is decided by the
+    # physical residual metric, while Newton time-step size is update-only.
+    del time_tol_s
+
     target = _llh_to_ecef(latitude, longitude, height)
     finite = torch.isfinite(target).all(dim=-1)
     orbit_start = orbit_times[0]
