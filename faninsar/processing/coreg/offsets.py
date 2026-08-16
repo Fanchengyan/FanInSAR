@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import re
+import stat
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
+from numbers import Real
+from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -12,9 +20,548 @@ from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from faninsar.processing.tops.deramp import TOPSCarrierModel
 
 logger = setup_logger(__name__)
+
+_TORCH_AMPCOR_WORKSPACE_CAP_BYTES = 256 * 1024**2
+_TORCH_AMPCOR_MAX_PATCHES = 4096
+_TORCH_AMPCOR_MAX_INPUT_DIM = 32768
+_TORCH_AMPCOR_MAX_INPUT_BYTES = 512 * 1024**2
+_TORCH_AMPCOR_MAX_PATCH_DIM = 4096
+_TORCH_AMPCOR_RESERVED_BYTES: dict[str, int] = {}
+_TORCH_AMPCOR_QUALIFIED_TORCH = "2.8.0"
+_TORCH_AMPCOR_QUALIFIED_CUDA = "12.8"
+_TORCH_AMPCOR_QUALIFIED_DEVICE = "A100"
+# The strict boundary-oracle drift window is qualified for these FFT shapes.
+# CUDA requests outside this set fail closed before input-derived device work.
+_TORCH_AMPCOR_QUALIFIED_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
+    {
+        (32, 64, 8, 8),
+        (32, 64, 16, 16),
+    }
+)
+# Backend FFT paths differed by at most eight binary64 ULPs in the boundary
+# qualification fixture; the next power-of-two bucket keeps that drift stable.
+_AMPCOR_CULL_ULPS = 16
+_TORCH_AMPCOR_ADMISSION_LOCK = Lock()
+_TORCH_AMPCOR_LOCK_ROOT = Path(tempfile.gettempdir()) / (
+    f"faninsar-ampcor-{getattr(os, 'getuid', lambda: 0)()}"
+)
+
+
+def _canonical_torch_device(device: object) -> object:
+    """Return a stable Torch device, including a concrete CUDA index."""
+    import torch as torch_module
+
+    if isinstance(device, torch_module.device):
+        resolved = device
+    else:
+        name = str(device).strip().lower()
+        if name in {"gpu", "cuda", "cuda:default"}:
+            name = "cuda"
+        resolved = torch_module.device(name)
+    if resolved.type == "cuda":
+        index = resolved.index
+        if index is None:
+            index = (
+                int(torch_module.cuda.current_device())
+                if torch_module.cuda.is_available()
+                else 0
+            )
+        return torch_module.device("cuda", index)
+    return resolved
+
+
+def _validate_torch_ampcor_runtime(device: object, torch_module: object) -> None:
+    """Fail closed unless the runtime matches the qualified CUDA lane.
+
+    The Torch executor has only been qualified for an A100 with Torch
+    ``2.8.0+cu128`` and CUDA ``12.8``.  Capability checks are deliberately
+    exact: allocator and FFT behavior on another driver, GPU family, or Torch
+    build is not inferred from the A100 qualification record.
+
+    Parameters
+    ----------
+    device : object
+        Resolved Torch device.
+    torch_module : object
+        Imported Torch module, accepted as an object to keep the optional
+        dependency lazy.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the requested CUDA runtime is outside the qualified lane.
+    RuntimeError
+        If CUDA is unavailable.
+
+    """
+    resolved = device
+    if not isinstance(resolved, torch_module.device):
+        resolved = torch_module.device(str(device))
+    if resolved.type != "cuda":
+        return
+    if not torch_module.cuda.is_available():
+        message = "CUDA requested for Torch Ampcor but is unavailable"
+        logger.error(message)
+        raise RuntimeError(message)
+    torch_version = str(getattr(torch_module, "__version__", "")).split("+", 1)[0]
+    cuda_version = str(getattr(getattr(torch_module, "version", None), "cuda", ""))
+    try:
+        properties = torch_module.cuda.get_device_properties(resolved)
+        device_name = str(properties.name)
+        capability = (int(properties.major), int(properties.minor))
+    except Exception as error:
+        message = "unable to inspect the CUDA runtime for Torch Ampcor"
+        logger.exception(message)
+        raise RuntimeError(message) from error
+    if (
+        torch_version != _TORCH_AMPCOR_QUALIFIED_TORCH
+        or cuda_version != _TORCH_AMPCOR_QUALIFIED_CUDA
+        or _TORCH_AMPCOR_QUALIFIED_DEVICE not in device_name
+        or capability != (8, 0)
+    ):
+        message = (
+            "Torch Ampcor CUDA runtime is outside the qualified lane: "
+            f"requires {_TORCH_AMPCOR_QUALIFIED_DEVICE}/"
+            f"compute-8.0, torch {_TORCH_AMPCOR_QUALIFIED_TORCH}+cu128, "
+            f"CUDA {_TORCH_AMPCOR_QUALIFIED_CUDA}; got "
+            f"{device_name!r}/compute-{capability[0]}.{capability[1]}, "
+            f"torch {torch_version or '<unknown>'}, CUDA {cuda_version or '<unknown>'}"
+        )
+        logger.error(message)
+        reject_invalid_state(message)
+
+
+def _validate_torch_ampcor_shape(
+    *,
+    window_az: int,
+    window_rg: int,
+    search_az: int,
+    search_rg: int,
+    device_type: str,
+) -> None:
+    """Reject CUDA FFT shapes outside the measured boundary-oracle lane.
+
+    Parameters
+    ----------
+    window_az, window_rg : int
+        Ampcor reference-window dimensions.
+    search_az, search_rg : int
+        Ampcor search half-widths.
+    device_type : str
+        Resolved Torch device type.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If CUDA is requested for an unqualified FFT shape.
+
+    Notes
+    -----
+    CPU Torch remains a diagnostic path and is intentionally not restricted by
+    the A100 boundary qualification. NumPy is unaffected.
+
+    """
+    if device_type != "cuda":
+        return
+    shape = (window_az, window_rg, search_az, search_rg)
+    if shape not in _TORCH_AMPCOR_QUALIFIED_SHAPES:
+        message = (
+            "Torch Ampcor CUDA FFT shape is outside the qualified "
+            f"boundary-oracle lane: got {shape}, allowed "
+            f"{sorted(_TORCH_AMPCOR_QUALIFIED_SHAPES)}"
+        )
+        logger.error(message)
+        reject_invalid_state(message)
+
+
+def _synchronize_torch_device(device: object) -> None:
+    """Synchronize an accelerator before releasing its admitted workspace."""
+    import torch as torch_module
+
+    resolved = device
+    if not isinstance(resolved, torch_module.device):
+        resolved = torch_module.device(str(resolved))
+    if resolved.type == "cuda":
+        torch_module.cuda.synchronize(resolved)
+    elif resolved.type == "mps" and hasattr(torch_module, "mps"):
+        torch_module.mps.synchronize()
+
+
+def _release_torch_device_cache(device: object) -> None:
+    """Request best-effort allocator cache release before a lease ends.
+
+    Torch drivers may retain allocations after this request; callers must
+    release Python references and rely on the admission ledger independently.
+    """
+    import torch as torch_module
+
+    resolved = device
+    if not isinstance(resolved, torch_module.device):
+        resolved = torch_module.device(str(resolved))
+    if resolved.type == "cuda":
+        torch_module.cuda.empty_cache()
+    elif resolved.type == "mps" and hasattr(torch_module, "mps"):
+        empty_cache = getattr(torch_module.mps, "empty_cache", None)
+        if empty_cache is not None:
+            empty_cache()
+
+
+def _torch_ampcor_admission_key(device: object, torch_module: object) -> str:
+    """Return a physical-device admission key for a Torch device."""
+    resolved = device
+    if not hasattr(torch_module, "device") or not isinstance(
+        resolved, torch_module.device
+    ):
+        resolved = torch_module.device(str(device))
+    if resolved.type != "cuda":
+        return str(resolved)
+    try:
+        uuid = str(torch_module.cuda.get_device_properties(resolved).uuid)
+    except Exception as error:
+        message = "unable to identify the physical CUDA device for admission"
+        logger.exception(message)
+        raise RuntimeError(message) from error
+    if not uuid or uuid == "None":
+        message = "Torch did not expose a physical CUDA device UUID"
+        logger.error(message)
+        raise RuntimeError(message)
+    return f"cuda-uuid:{uuid}"
+
+
+@contextmanager
+def _admit_torch_ampcor_process(device_key: str) -> Iterator[None]:
+    """Serialize explicit accelerator work across processes on one device.
+
+    ``threading.Lock`` cannot protect direct production calls made by separate
+    workers.  A POSIX advisory lock gives each physical CUDA ordinal one
+    process-wide admission domain and releases automatically if a worker dies.
+
+    The admission domain is a cooperative contract for workers sharing the
+    same UID and ``TMPDIR`` namespace.  A hostile process with the same UID
+    can rename entries in an owner-writable temporary directory; isolation
+    from that threat requires an OS- or service-managed lock outside this
+    helper.
+    """
+    try:
+        import fcntl
+    except ImportError as error:  # pragma: no cover - supported hosts are POSIX
+        message = "cross-process CUDA admission requires POSIX file locking"
+        logger.exception(message)
+        raise RuntimeError(message) from error
+    required_flags = ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC")
+    if any(not hasattr(os, flag) for flag in required_flags):
+        message = "secure CUDA admission requires POSIX no-follow directory opens"
+        logger.error(message)
+        raise RuntimeError(message)
+    directory_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
+    file_flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        _TORCH_AMPCOR_LOCK_ROOT.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        logger.exception("Unable to create the Ampcor admission directory")
+        raise
+    try:
+        root_descriptor = os.open(os.fspath(_TORCH_AMPCOR_LOCK_ROOT), directory_flags)
+    except OSError:
+        logger.exception("Unable to open the Ampcor admission directory securely")
+        raise
+    lock_descriptor: int | None = None
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", device_key)
+    try:
+        root_stat = os.fstat(root_descriptor)
+        root_path_stat = _TORCH_AMPCOR_LOCK_ROOT.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid != os.geteuid()
+            or root_stat.st_mode & 0o077
+            or (root_stat.st_dev, root_stat.st_ino)
+            != (root_path_stat.st_dev, root_path_stat.st_ino)
+        ):
+            message = "Ampcor admission directory failed ownership or inode checks"
+            logger.error(message)
+            raise RuntimeError(message)
+        lock_name = f"{safe_key}.lock"
+        try:
+            lock_descriptor = os.open(
+                lock_name,
+                file_flags,
+                0o600,
+                dir_fd=root_descriptor,
+            )
+        except OSError:
+            logger.exception("Unable to open the Ampcor admission lock securely")
+            raise
+
+        def validate_lock_entry() -> None:
+            """Verify the lock descriptor still names its private directory entry."""
+            assert lock_descriptor is not None
+            descriptor_stat = os.fstat(lock_descriptor)
+            path_stat = os.stat(
+                lock_name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(descriptor_stat.st_mode)
+                or descriptor_stat.st_uid != os.geteuid()
+                or descriptor_stat.st_mode & 0o077
+                or not stat.S_ISREG(path_stat.st_mode)
+                or path_stat.st_uid != os.geteuid()
+                or path_stat.st_mode & 0o077
+                or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                != (path_stat.st_dev, path_stat.st_ino)
+            ):
+                message = "Ampcor admission lock failed ownership or inode checks"
+                logger.error(message)
+                raise RuntimeError(message)
+
+        validate_lock_entry()
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            message = f"Ampcor device admission is busy for {device_key}"
+            logger.exception(message)
+            raise ValueError(message) from error
+        validate_lock_entry()
+        yield
+    finally:
+        try:
+            if lock_descriptor is not None:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            if lock_descriptor is not None:
+                os.close(lock_descriptor)
+            os.close(root_descriptor)
+
+
+def _validate_real_scalar(name: str, value: object, *, nonnegative: bool) -> float:
+    """Validate a finite real scalar used by Ampcor culling."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        reject_invalid_state(f"Ampcor {name} must be a finite real scalar")
+    resolved = float(value)
+    if not np.isfinite(resolved):
+        reject_invalid_state(f"Ampcor {name} must be a finite real scalar")
+    if nonnegative and resolved < 0:
+        reject_invalid_state(f"Ampcor {name} must be non-negative")
+    return resolved
+
+
+def _is_cpu_ampcor_device(device: object) -> bool:
+    """Return whether a device value is the portable CPU lane."""
+    normalized = str(device).strip().lower()
+    return normalized in {"auto", "cpu"} or normalized.startswith("cpu:")
+
+
+def resolve_ampcor_policy(
+    executor: object,
+    device: object,
+) -> tuple[Literal["numpy", "torch"], str]:
+    """Resolve the public Ampcor executor/device contract.
+
+    ``numpy`` with ``auto`` or ``cpu`` selects the portable CPU lane.  The
+    explicit ``torch``/``cpu`` request selects the bounded Torch CPU lane,
+    while ``torch``/``auto`` deliberately selects portable NumPy.  This
+    distinction is intentional: ``auto`` must not silently turn a production
+    default into an unqualified Torch path.  Explicit CUDA always selects
+    Torch and is canonicalized to a decimal device ordinal (so ``cuda:00``
+    and ``cuda:0`` have identical dispatch and admission identity).
+
+    Parameters
+    ----------
+    executor : object
+        Requested implementation, ``"numpy"`` or ``"torch"``.
+    device : object
+        Requested runtime device value.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If NumPy is paired with any explicit non-CPU or unknown device.
+
+    """
+    if not isinstance(executor, str) or executor not in {"numpy", "torch"}:
+        message = f"unsupported Ampcor executor: {executor!r}"
+        logger.error(message)
+        reject_invalid_state(message)
+    if not isinstance(device, str):
+        message = f"unsupported Ampcor device: {device!r}"
+        logger.error(message)
+        reject_invalid_state(message)
+    canonical = device.strip().lower()
+    if canonical in {"auto", "cpu"}:
+        if executor == "torch" and canonical == "cpu":
+            return "torch", "cpu"
+        return "numpy", "cpu"
+    if canonical in {"gpu", "cuda", "cuda:default"}:
+        canonical = "cuda"
+    elif canonical.startswith("cuda:"):
+        suffix = canonical.removeprefix("cuda:")
+        if not suffix.isdigit():
+            message = f"unsupported Ampcor device: {device!r}"
+            logger.error(message)
+            reject_invalid_state(message)
+        canonical = f"cuda:{int(suffix)}"
+    elif canonical in {"mps", "metal"}:
+        message = "MPS is not a qualified Ampcor device; use CPU or CUDA"
+        logger.error(message)
+        reject_invalid_state(message)
+    else:
+        message = f"unsupported Ampcor device: {device!r}"
+        logger.error(message)
+        reject_invalid_state(message)
+    if executor == "numpy":
+        message = "explicit accelerator Ampcor devices require executor='torch'"
+        logger.error(message)
+        reject_invalid_state(message)
+    return "torch", canonical
+
+
+def _validate_ampcor_device_contract(executor: str, device: object) -> None:
+    """Validate executor/device requests through the canonical resolver."""
+    resolve_ampcor_policy(executor, device)
+
+
+def _validate_ampcor_accelerator(device: str) -> None:
+    """Validate an explicit accelerator before reading caller-owned arrays."""
+    if not device.startswith("cuda"):
+        return
+    try:
+        import torch
+    except ImportError as error:
+        message = "explicit CUDA Ampcor requires torch"
+        logger.exception(message)
+        raise ImportError(message) from error
+    resolved = _canonical_torch_device(device)
+    _validate_torch_ampcor_runtime(resolved, torch)
+    _torch_ampcor_admission_key(resolved, torch)
+
+
+_AMPCOR_TORCH_INPUT_DTYPES = frozenset(
+    {
+        np.dtype(np.complex64),
+        np.dtype(np.float32),
+    }
+)
+
+
+def _validate_ampcor_inputs(
+    reference: object,
+    secondary: object,
+    *,
+    torch_contract: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Admit only supported, directly indexable Ampcor input arrays.
+
+    Ampcor materializes bounded tiles directly from the caller-owned arrays.
+    The Torch admission contract therefore rejects implicit object/integer
+    casts, negative strides, non-C-contiguous layouts, and non-owning views
+    before any tile or device allocation. Explicit Torch inputs are limited to
+    ``complex64`` and
+    ``float32`` and are converted tile-by-tile to ``complex64``, reduced to
+    ``float32`` magnitudes, and stacked as a contiguous ``float32`` batch (the
+    NCC kernel promotes that batch to ``float64`` for its arithmetic). The
+    default NumPy lane intentionally retains its historical dtype/stride
+    conversions, including ``complex128``, ``float64``, integer, and
+    non-contiguous inputs.
+
+    Parameters
+    ----------
+    reference, secondary : object
+        Candidate two-dimensional NumPy arrays on the same grid.
+    torch_contract : bool, optional
+        Apply the stricter Torch dtype, stride, ownership, and C-contiguity
+        contract. The default keeps the portable NumPy compatibility behavior.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, numpy.ndarray]
+        The validated input arrays.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If either input violates the shape contract, or the stricter Torch
+        dtype/stride contract when requested.
+
+    """
+    if not isinstance(reference, np.ndarray) or not isinstance(secondary, np.ndarray):
+        message = "patch amplitude shift requires NumPy arrays"
+        logger.error(message)
+        reject_invalid_state(message)
+    if reference.ndim != 2 or secondary.ndim != 2 or reference.shape != secondary.shape:
+        message = "patch amplitude shift requires matching 2-D arrays"
+        logger.error(message)
+        reject_invalid_state(message)
+    for name, samples in (("reference", reference), ("secondary", secondary)):
+        if torch_contract and samples.dtype not in _AMPCOR_TORCH_INPUT_DTYPES:
+            message = (
+                f"Ampcor {name} dtype {samples.dtype} is unsupported; "
+                "explicit Torch execution accepts only float32 or complex64"
+            )
+            logger.error(message)
+            reject_invalid_state(message)
+        if torch_contract and any(stride < 0 for stride in samples.strides):
+            message = f"Ampcor {name} must not use negative strides"
+            logger.error(message)
+            reject_invalid_state(message)
+        if torch_contract and not samples.flags.c_contiguous:
+            message = (
+                f"Ampcor {name} must be C-contiguous for explicit Torch/CUDA execution"
+            )
+            logger.error(message)
+            reject_invalid_state(message)
+        if torch_contract and not samples.flags.owndata:
+            message = (
+                f"Ampcor {name} must own its storage for explicit Torch/CUDA execution"
+            )
+            logger.error(message)
+            reject_invalid_state(message)
+    return reference, secondary
+
+
+@contextmanager
+def _admit_torch_ampcor_workspace(
+    device_key: str,
+    planned_bytes: int,
+    limit_bytes: int,
+) -> Iterator[None]:
+    """Reserve an estimated Ampcor workspace ledger entry.
+
+    The estimate is intentionally conservative and process-local. It is a
+    cooperative admission ledger, not a measurement or guarantee of total
+    device memory consumed by a Torch driver or allocator.
+    """
+    with _TORCH_AMPCOR_ADMISSION_LOCK:
+        reserved = _TORCH_AMPCOR_RESERVED_BYTES.get(device_key, 0)
+        if reserved + planned_bytes > limit_bytes:
+            message = (
+                "Ampcor estimated workspace admission rejected for "
+                f"{device_key}: reserved={reserved} planned={planned_bytes} "
+                f"limit={limit_bytes}"
+            )
+            logger.error(message)
+            raise ValueError(message)
+        _TORCH_AMPCOR_RESERVED_BYTES[device_key] = reserved + planned_bytes
+    try:
+        if device_key.startswith(("cuda", "mps")):
+            with _admit_torch_ampcor_process(device_key):
+                yield
+        else:
+            yield
+    finally:
+        with _TORCH_AMPCOR_ADMISSION_LOCK:
+            remaining = _TORCH_AMPCOR_RESERVED_BYTES.get(device_key, 0) - planned_bytes
+            if remaining > 0:
+                _TORCH_AMPCOR_RESERVED_BYTES[device_key] = remaining
+            else:
+                _TORCH_AMPCOR_RESERVED_BYTES.pop(device_key, None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +756,82 @@ class PatchAmplitudeShiftResult:
     n_attempted: int
 
 
+def _ampcor_magnitude_tile(
+    samples: np.ndarray,
+    row_start: int,
+    row_stop: int,
+    column_start: int,
+    column_stop: int,
+    *,
+    cyclic_shift: tuple[int, int] = (0, 0),
+) -> np.ndarray:
+    """Materialize one float32 magnitude tile from a complex input.
+
+    Parameters
+    ----------
+    samples : numpy.ndarray
+        Complex or real two-dimensional input array.
+    row_start, row_stop, column_start, column_stop : int
+        Bounds of the tile to materialize.
+    cyclic_shift : tuple[int, int], optional
+        Integer ``(azimuth, range)`` shift applied lazily with cyclic source
+        indexing. This avoids a full-image ``numpy.roll`` allocation during
+        production pre-alignment.
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 magnitude tile.
+
+    """
+    if cyclic_shift == (0, 0):
+        tile_source = samples[row_start:row_stop, column_start:column_stop]
+    else:
+        shift_az, shift_rg = cyclic_shift
+        rows = (np.arange(row_start, row_stop) - shift_az) % samples.shape[0]
+        columns = (np.arange(column_start, column_stop) - shift_rg) % samples.shape[1]
+        tile_source = samples[np.ix_(rows, columns)]
+    tile = np.asarray(tile_source, dtype=np.complex64)
+    return np.abs(tile).astype(np.float32, copy=False)
+
+
+def _ampcor_input_budget_bytes(
+    reference: np.ndarray,
+    secondary: np.ndarray,
+    *,
+    patch_elements: int,
+    batch_capacity: int,
+) -> int:
+    """Estimate retained sources plus bounded magnitude tile memory.
+
+    A materialized tile can transiently hold a complex64 conversion, a
+    float32 magnitude, and one float32 batch stack. Charging 16 bytes per
+    sample is conservative while avoiding a full-burst magnitude allocation.
+
+    Parameters
+    ----------
+    reference, secondary : numpy.ndarray
+        Source arrays retained for the duration of Ampcor.
+    patch_elements : int
+        Combined reference-window and secondary-search elements per patch.
+    batch_capacity : int
+        Maximum number of patches materialized at once.
+
+    Returns
+    -------
+    int
+        Conservative input-memory estimate in bytes.
+
+    """
+    source_bytes = int(reference.nbytes) + int(secondary.nbytes)
+    tile_bytes = (
+        int(patch_elements)
+        * int(batch_capacity)
+        * (np.dtype(np.complex64).itemsize + 2 * np.dtype(np.float32).itemsize)
+    )
+    return source_bytes + tile_bytes
+
+
 def _patch_ncc_shift(
     ref_win: np.ndarray,
     sec_search: np.ndarray,
@@ -305,6 +928,535 @@ def _patch_ncc_shift(
     return rg_shift, az_shift, snr
 
 
+def _ampcor_cull_mask_numpy(
+    snr: object,
+    d_rg: object,
+    d_az: object,
+    *,
+    snr_threshold: float,
+    max_abs_residual: float,
+) -> np.ndarray:
+    """Apply the strict inclusive Ampcor cull to NumPy values."""
+    snr_values = np.asarray(snr, dtype=np.float64)
+    range_values = np.asarray(d_rg, dtype=np.float64)
+    azimuth_values = np.asarray(d_az, dtype=np.float64)
+    threshold = np.float64(snr_threshold)
+    limit = np.float64(max_abs_residual)
+    return (
+        np.isfinite(snr_values)
+        & np.isfinite(range_values)
+        & np.isfinite(azimuth_values)
+        & (snr_values >= threshold)
+        & (np.abs(range_values) <= limit)
+        & (np.abs(azimuth_values) <= limit)
+    )
+
+
+def _ampcor_cull_mask_torch(
+    snr: object,
+    d_rg: object,
+    d_az: object,
+    *,
+    snr_threshold: float,
+    max_abs_residual: float,
+    torch_module: object,
+) -> object:
+    """Apply the same strict inclusive Ampcor cull to Torch tensors."""
+    snr_values = snr.to(dtype=torch_module.float64)
+    range_values = d_rg.to(dtype=torch_module.float64)
+    azimuth_values = d_az.to(dtype=torch_module.float64)
+    threshold = torch_module.tensor(
+        np.float64(snr_threshold),
+        dtype=torch_module.float64,
+        device=snr.device,
+    )
+    limit = torch_module.tensor(
+        np.float64(max_abs_residual),
+        dtype=torch_module.float64,
+        device=snr.device,
+    )
+    return (
+        torch_module.isfinite(snr_values)
+        & torch_module.isfinite(range_values)
+        & torch_module.isfinite(azimuth_values)
+        & (snr_values >= threshold)
+        & (range_values.abs() <= limit)
+        & (azimuth_values.abs() <= limit)
+    )
+
+
+def _ampcor_boundary_mask_torch(
+    snr: object,
+    d_rg: object,
+    d_az: object,
+    *,
+    snr_threshold: float,
+    max_abs_residual: float,
+    torch_module: object,
+) -> object:
+    """Find Torch results requiring the rare NumPy boundary oracle."""
+    snr_values = snr.to(dtype=torch_module.float64)
+    range_values = d_rg.to(dtype=torch_module.float64).abs()
+    azimuth_values = d_az.to(dtype=torch_module.float64).abs()
+    snr_quantum = _ampcor_boundary_quantum(snr_threshold)
+    residual_quantum = _ampcor_boundary_quantum(max_abs_residual)
+    snr_boundary = torch_module.tensor(
+        np.float64(snr_threshold), dtype=torch_module.float64, device=snr.device
+    )
+    residual_boundary = torch_module.tensor(
+        np.float64(max_abs_residual),
+        dtype=torch_module.float64,
+        device=snr.device,
+    )
+    return (
+        (
+            torch_module.isfinite(snr_values)
+            & ((snr_values - snr_boundary).abs() <= snr_quantum)
+        )
+        | (
+            torch_module.isfinite(range_values)
+            & ((range_values - residual_boundary).abs() <= residual_quantum)
+        )
+        | (
+            torch_module.isfinite(azimuth_values)
+            & ((azimuth_values - residual_boundary).abs() <= residual_quantum)
+        )
+    )
+
+
+def _ampcor_boundary_quantum(boundary: float) -> float:
+    """Return the canonical ULP quantization quantum for a boundary."""
+    boundary_value = np.float64(boundary)
+    spacing = np.spacing(abs(boundary_value))
+    if boundary_value == 0.0 or spacing == 0.0 or not np.isfinite(spacing):
+        spacing = np.finfo(np.float64).eps
+    return float(_AMPCOR_CULL_ULPS * spacing)
+
+
+def _torch_patch_ncc_batch(
+    ref_windows: object,
+    sec_searches: object,
+    *,
+    search_az: int,
+    search_rg: int,
+    subpixel: bool,
+) -> tuple[object, object, object]:
+    """Evaluate a batch of Ampcor NCC surfaces with Torch float64 math."""
+    import torch
+
+    count, window_az, window_rg = ref_windows.shape
+    search_height, search_width = sec_searches.shape[-2:]
+    fft_height = 2 ** int(np.ceil(np.log2(search_height + window_az - 1)))
+    fft_width = 2 ** int(np.ceil(np.log2(search_width + window_rg - 1)))
+    ref = ref_windows.to(dtype=torch.float64)
+    sec = sec_searches.to(dtype=torch.float64)
+    ref = ref - ref.mean(dim=(-2, -1), keepdim=True)
+    sec = sec - sec.mean(dim=(-2, -1), keepdim=True)
+    ref_norm = torch.linalg.vector_norm(ref, dim=(-2, -1), keepdim=True)
+    ref = ref / torch.where(ref_norm < 1e-12, torch.ones_like(ref_norm), ref_norm)
+
+    f_sec = torch.fft.rfft2(sec, s=(fft_height, fft_width))
+    f_ref = torch.fft.rfft2(torch.flip(ref, dims=(-2, -1)), s=(fft_height, fft_width))
+    corr_full = torch.fft.irfft2(f_sec * f_ref, s=(fft_height, fft_width))
+    row_start = window_az - 1
+    col_start = window_rg - 1
+    corr = corr_full[
+        :,
+        row_start : row_start + 2 * search_az + 1,
+        col_start : col_start + 2 * search_rg + 1,
+    ]
+    ones = torch.ones_like(ref)
+    f_ones = torch.fft.rfft2(torch.flip(ones, dims=(-2, -1)), s=(fft_height, fft_width))
+    f_sec_sq = torch.fft.rfft2(sec * sec, s=(fft_height, fft_width))
+    energy_full = torch.fft.irfft2(f_sec_sq * f_ones, s=(fft_height, fft_width))
+    energy = energy_full[
+        :,
+        row_start : row_start + 2 * search_az + 1,
+        col_start : col_start + 2 * search_rg + 1,
+    ]
+    ncc = corr / torch.sqrt(torch.clamp(energy, min=1e-12))
+    surface_width = 2 * search_rg + 1
+    peak_flat = torch.argmax(ncc.reshape(count, -1), dim=1)
+    peak_az = torch.div(peak_flat, surface_width, rounding_mode="floor")
+    peak_rg = peak_flat.remainder(surface_width)
+    peak_value = ncc.reshape(count, -1).gather(1, peak_flat[:, None]).squeeze(1)
+    rows = torch.arange(2 * search_az + 1, device=ncc.device)[None, :, None]
+    columns = torch.arange(2 * search_rg + 1, device=ncc.device)[None, None, :]
+    near_peak = (
+        (rows >= peak_az[:, None, None] - 1)
+        & (rows <= peak_az[:, None, None] + 1)
+        & (columns >= peak_rg[:, None, None] - 1)
+        & (columns <= peak_rg[:, None, None] + 1)
+    )
+    sidelobe = torch.where(near_peak, torch.full_like(ncc, torch.nan), ncc.abs())
+    sidelobe_mean = torch.nanmean(sidelobe, dim=(-2, -1))
+    snr = torch.where(
+        torch.isfinite(sidelobe_mean) & (sidelobe_mean > 0),
+        peak_value / sidelobe_mean,
+        torch.full_like(peak_value, torch.nan),
+    )
+    az_shift = peak_az.to(torch.float64) - search_az
+    rg_shift = peak_rg.to(torch.float64) - search_rg
+    if subpixel:
+        interior = (
+            (peak_az > 0)
+            & (peak_az < 2 * search_az)
+            & (peak_rg > 0)
+            & (peak_rg < 2 * search_rg)
+        )
+        safe_az = peak_az.clamp(1, 2 * search_az - 1)
+        safe_rg = peak_rg.clamp(1, 2 * search_rg - 1)
+        indices = torch.arange(count, device=ncc.device)
+        az_left = ncc[indices, safe_az - 1, safe_rg]
+        az_center = ncc[indices, safe_az, safe_rg]
+        az_right = ncc[indices, safe_az + 1, safe_rg]
+        rg_left = ncc[indices, safe_az, safe_rg - 1]
+        rg_right = ncc[indices, safe_az, safe_rg + 1]
+        az_denom = az_left - 2 * az_center + az_right
+        rg_denom = rg_left - 2 * az_center + rg_right
+        az_sub = torch.where(
+            az_denom.abs() < 1e-12,
+            torch.zeros_like(az_denom),
+            0.5 * (az_left - az_right) / az_denom,
+        )
+        rg_sub = torch.where(
+            rg_denom.abs() < 1e-12,
+            torch.zeros_like(rg_denom),
+            0.5 * (rg_left - rg_right) / rg_denom,
+        )
+        az_shift += torch.where(interior, az_sub, torch.zeros_like(az_sub))
+        rg_shift += torch.where(interior, rg_sub, torch.zeros_like(rg_sub))
+    return rg_shift, az_shift, snr
+
+
+def _torch_cpu_median(chunks: list[object], torch_module: object) -> float:
+    """Return a NumPy-compatible median from CPU Torch tensor chunks.
+
+    Parameters
+    ----------
+    chunks : list[object]
+        Non-empty one-dimensional CPU Torch tensors containing finite values.
+    torch_module : object
+        Imported Torch module, accepted as an object to keep the dependency
+        lazy at module import time.
+
+    Returns
+    -------
+    float
+        Scalar Python median. Even-sized inputs use the linear average of the
+        two middle sorted values, matching :func:`numpy.median`.
+
+    Raises
+    ------
+    ValueError
+        If ``chunks`` is empty.
+
+    """
+    if not chunks:
+        message = "Torch median requires at least one value"
+        logger.error(message)
+        raise ValueError(message)
+    values = torch_module.cat(chunks).to(dtype=torch_module.float64)
+    ordered = torch_module.sort(values).values
+    count = int(ordered.numel())
+    middle = count // 2
+    if count % 2:
+        median = ordered[middle]
+    else:
+        median = (ordered[middle - 1] + ordered[middle]) / 2.0
+    return float(median.item())
+
+
+def _ampcor_apply_boundary_oracle(
+    ref_windows: list[np.ndarray],
+    sec_searches: list[np.ndarray],
+    d_rg: object,
+    d_az: object,
+    snr: object,
+    *,
+    search_az: int,
+    search_rg: int,
+    subpixel: bool,
+    snr_threshold: float,
+    max_abs_residual: float,
+    torch_module: object,
+) -> tuple[object, object, object]:
+    """Recompute only boundary-near Torch patches with the NumPy oracle.
+
+    The ordinary Torch batch remains the fast path. A patch close to a cull
+    boundary is recomputed from the same materialized magnitude windows by
+    :func:`_patch_ncc_shift`; strict inclusive comparisons then decide its
+    membership and the oracle values feed the final medians.
+    """
+    boundary = _ampcor_boundary_mask_torch(
+        snr,
+        d_rg,
+        d_az,
+        snr_threshold=snr_threshold,
+        max_abs_residual=max_abs_residual,
+        torch_module=torch_module,
+    )
+    indices = torch_module.nonzero(boundary, as_tuple=False).flatten().tolist()
+    if not indices:
+        return d_rg, d_az, snr
+    d_rg = d_rg.clone()
+    d_az = d_az.clone()
+    snr = snr.clone()
+    nan = float("nan")
+    for index in indices:
+        result = _patch_ncc_shift(
+            ref_windows[index],
+            sec_searches[index],
+            search_az=search_az,
+            search_rg=search_rg,
+            subpixel=subpixel,
+        )
+        if result is None:
+            d_rg[index] = nan
+            d_az[index] = nan
+            snr[index] = nan
+        else:
+            range_shift, azimuth_shift, score = result
+            d_rg[index] = range_shift
+            d_az[index] = azimuth_shift
+            snr[index] = score
+    return d_rg, d_az, snr
+
+
+def _estimate_patch_amplitude_shift_torch(
+    reference: np.ndarray,
+    secondary: np.ndarray,
+    *,
+    window_az: int,
+    window_rg: int,
+    search_az: int,
+    search_rg: int,
+    n_az: int,
+    n_rg: int,
+    snr_threshold: float,
+    max_abs_residual: float,
+    margin_rg: int,
+    margin_az: int | None,
+    subpixel: bool,
+    batch_size: int,
+    max_workspace_bytes: int,
+    device: Literal["auto", "cpu", "cuda"],
+    secondary_shift: tuple[int, int],
+) -> PatchAmplitudeShiftResult:
+    """Run bounded Torch batches for the opt-in Ampcor executor.
+
+    Surviving batch outputs are copied to CPU Torch tensors before device
+    cleanup. Final medians are reduced in Torch with NumPy-compatible
+    odd/even semantics, and only scalar Python values are published.
+    """
+    try:
+        import torch
+    except ImportError as error:
+        message = "Torch Ampcor execution requires torch"
+        logger.exception(message)
+        raise ImportError(message) from error
+    resolved_device = _canonical_torch_device("cpu" if device == "auto" else device)
+    _validate_torch_ampcor_runtime(resolved_device, torch)
+    if resolved_device.type == "mps":
+        message = "MPS is not a qualified Ampcor device; use CPU or CUDA"
+        logger.error(message)
+        reject_invalid_state(message)
+
+    height, width = reference.shape
+    if height > _TORCH_AMPCOR_MAX_INPUT_DIM or width > _TORCH_AMPCOR_MAX_INPUT_DIM:
+        reject_invalid_state(
+            "Ampcor input dimensions exceed the admitted limit "
+            f"({_TORCH_AMPCOR_MAX_INPUT_DIM})"
+        )
+    search_height = window_az + 2 * search_az
+    search_width = window_rg + 2 * search_rg
+    _validate_torch_ampcor_shape(
+        window_az=window_az,
+        window_rg=window_rg,
+        search_az=search_az,
+        search_rg=search_rg,
+        device_type=resolved_device.type,
+    )
+    if (
+        window_az > height
+        or window_rg > width
+        or search_height > _TORCH_AMPCOR_MAX_PATCH_DIM
+        or search_width > _TORCH_AMPCOR_MAX_PATCH_DIM
+    ):
+        reject_invalid_state(
+            "Ampcor window/search dimensions exceed the admitted bounds"
+        )
+    fft_height = 2 ** int(np.ceil(np.log2(search_height + window_az - 1)))
+    fft_width = 2 ** int(np.ceil(np.log2(search_width + window_rg - 1)))
+    # Account for input windows, FFT spectra, and real correlation/energy
+    # buffers with a conservative two-times allocator margin.
+    per_patch_bytes = 2 * (
+        (window_az * window_rg + search_height * search_width) * 8
+        + 4 * fft_height * (fft_width // 2 + 1) * 16
+    )
+    planned_workspace = batch_size * per_patch_bytes
+    if planned_workspace > max_workspace_bytes:
+        message = (
+            f"Ampcor batch workspace {planned_workspace} bytes exceeds the "
+            f"cooperative estimate limit {max_workspace_bytes} bytes"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    half_az = window_az // 2
+    half_rg = window_rg // 2
+    margin_a = half_az + search_az + 1 if margin_az is None else int(margin_az)
+    margin_r = int(margin_rg)
+    if width < 2 * margin_r + window_rg + 2 * search_rg + 2:
+        margin_r = half_rg + search_rg + 1
+    if height < 2 * margin_a + window_az + 2 * search_az + 2:
+        margin_a = half_az + search_az + 1
+    az0, az1 = margin_a, height - margin_a
+    rg0, rg1 = margin_r, width - margin_r
+    if az1 <= az0 or rg1 <= rg0:
+        return PatchAmplitudeShiftResult(0.0, 0.0, 0, 0.0, 0)
+
+    az_centres = np.linspace(az0, az1 - 1, num=n_az, dtype=np.int64)
+    rg_centres = np.linspace(rg0, rg1 - 1, num=n_rg, dtype=np.int64)
+    ref_windows: list[np.ndarray] = []
+    sec_searches: list[np.ndarray] = []
+    n_attempted = 0
+    # Keep surviving values on CPU as Torch tensors so device allocations stay
+    # bounded by each batch and the final reduction does not re-enter NumPy.
+    range_shifts: list[object] = []
+    azimuth_shifts: list[object] = []
+    snr_values: list[object] = []
+    n_valid = 0
+    device_key = _torch_ampcor_admission_key(resolved_device, torch)
+
+    def consume_batch() -> None:
+        """Score and cull one materialized batch."""
+        nonlocal n_valid, ref_windows, sec_searches
+        if not ref_windows:
+            return
+        with _admit_torch_ampcor_workspace(
+            device_key,
+            planned_workspace,
+            max_workspace_bytes,
+        ):
+            ref_tensor: object | None = None
+            sec_tensor: object | None = None
+            d_rg: object | None = None
+            d_az: object | None = None
+            snr: object | None = None
+            valid: object | None = None
+            primary_error: BaseException | None = None
+            primary_traceback = None
+            try:
+                ref_tensor = torch.from_numpy(np.stack(ref_windows)).to(resolved_device)
+                sec_tensor = torch.from_numpy(np.stack(sec_searches)).to(
+                    resolved_device
+                )
+                d_rg, d_az, snr = _torch_patch_ncc_batch(
+                    ref_tensor,
+                    sec_tensor,
+                    search_az=search_az,
+                    search_rg=search_rg,
+                    subpixel=subpixel,
+                )
+                d_rg, d_az, snr = _ampcor_apply_boundary_oracle(
+                    ref_windows,
+                    sec_searches,
+                    d_rg,
+                    d_az,
+                    snr,
+                    search_az=search_az,
+                    search_rg=search_rg,
+                    subpixel=subpixel,
+                    snr_threshold=snr_threshold,
+                    max_abs_residual=max_abs_residual,
+                    torch_module=torch,
+                )
+                valid = _ampcor_cull_mask_torch(
+                    snr,
+                    d_rg,
+                    d_az,
+                    snr_threshold=snr_threshold,
+                    max_abs_residual=max_abs_residual,
+                    torch_module=torch,
+                )
+                valid_count = int(valid.sum().item())
+                if valid_count:
+                    n_valid += valid_count
+                    range_shifts.append(d_rg[valid].detach().to(device="cpu"))
+                    azimuth_shifts.append(d_az[valid].detach().to(device="cpu"))
+                    snr_values.append(snr[valid].detach().to(device="cpu"))
+            except BaseException as error:
+                primary_error = error
+                primary_traceback = error.__traceback__
+            finally:
+                # Drop all device tensor references before synchronization and
+                # allocator cleanup, while the admission lease is still held.
+                ref_tensor = None
+                sec_tensor = None
+                d_rg = None
+                d_az = None
+                snr = None
+                valid = None
+                # Keep admission held until asynchronous work has completed.
+                # Driver synchronization/cache calls are best effort: neither
+                # can guarantee allocator release across all Torch drivers.
+                try:
+                    _synchronize_torch_device(resolved_device)
+                except BaseException as error:
+                    if primary_error is None:
+                        primary_error = error
+                        primary_traceback = error.__traceback__
+                    logger.exception("Ampcor device synchronization failed")
+                try:
+                    _release_torch_device_cache(resolved_device)
+                except BaseException:
+                    logger.exception(
+                        "Ampcor allocator cache release failed; references were "
+                        "still dropped"
+                    )
+                ref_windows = []
+                sec_searches = []
+            if primary_error is not None:
+                raise primary_error.with_traceback(primary_traceback)
+
+    for az_c in az_centres:
+        for rg_c in rg_centres:
+            r0 = int(az_c) - half_az
+            r1 = r0 + window_az
+            c0 = int(rg_c) - half_rg
+            c1 = c0 + window_rg
+            sr0 = r0 - search_az
+            sr1 = r1 + search_az
+            sc0 = c0 - search_rg
+            sc1 = c1 + search_rg
+            if sr0 < 0 or sc0 < 0 or sr1 > height or sc1 > width:
+                continue
+            n_attempted += 1
+            ref_windows.append(_ampcor_magnitude_tile(reference, r0, r1, c0, c1))
+            sec_searches.append(
+                _ampcor_magnitude_tile(
+                    secondary,
+                    sr0,
+                    sr1,
+                    sc0,
+                    sc1,
+                    cyclic_shift=secondary_shift,
+                )
+            )
+            if len(ref_windows) >= batch_size:
+                consume_batch()
+    consume_batch()
+    if not range_shifts:
+        return PatchAmplitudeShiftResult(0.0, 0.0, 0, 0.0, n_attempted)
+    return PatchAmplitudeShiftResult(
+        range_shift_px=_torch_cpu_median(range_shifts, torch),
+        azimuth_shift_px=_torch_cpu_median(azimuth_shifts, torch),
+        n_valid=n_valid,
+        snr_median=_torch_cpu_median(snr_values, torch),
+        n_attempted=n_attempted,
+    )
+
+
 def estimate_patch_amplitude_shift(
     reference: np.ndarray,
     secondary: np.ndarray,
@@ -320,6 +1472,11 @@ def estimate_patch_amplitude_shift(
     margin_rg: int = 1000,
     margin_az: int | None = None,
     subpixel: bool = True,
+    executor: Literal["numpy", "torch"] = "numpy",
+    batch_size: int = 32,
+    device: Literal["auto", "cpu", "cuda"] = "auto",
+    max_workspace_bytes: int = _TORCH_AMPCOR_WORKSPACE_CAP_BYTES,
+    secondary_shift: tuple[int, int] = (0, 0),
 ) -> PatchAmplitudeShiftResult:
     """Estimate residual shift with multi-window magnitude Ampcor (ISCE2-style).
 
@@ -352,6 +1509,35 @@ def estimate_patch_amplitude_shift(
         Azimuth border; default is half the window height.
     subpixel : bool, optional
         Parabolic peak refinement (default True).
+    executor : {"numpy", "torch"}, optional
+        Correlation implementation. ``"numpy"`` (default) retains the scalar
+        reference loop. Explicit ``executor="torch", device="cpu"``
+        evaluates bounded eager CPU batches. ``device="auto"`` deliberately
+        resolves to the production NumPy/CPU policy, so it never silently
+        selects Torch. Explicit CUDA remains Torch. Torch
+        admission accepts only ``complex64`` and ``float32`` source arrays;
+        ``complex128`` and ``float64`` remain on the NumPy lane. Each bounded
+        tile is converted to ``complex64`` magnitude and then a contiguous
+        ``float32`` batch before
+        the Torch kernel promotes it to ``float64`` for correlation math.
+        Explicit Torch inputs must be owning, C-contiguous arrays; the NumPy
+        lane remains permissive about layout and casting.
+    batch_size : int, optional
+        Number of patches materialized in one Torch batch. Default 32.
+    device : {"auto", "cpu", "cuda"}, optional
+        Requested device. ``"auto"`` resolves to NumPy/CPU for either
+        executor, while explicit ``"cpu"`` selects the requested executor.
+        CUDA requires explicit availability and never silently falls back.
+        MPS is outside the qualified Ampcor contract and is rejected. With
+        ``executor="numpy"``, explicit CUDA values fail closed before input
+        tiling.
+    max_workspace_bytes : int, optional
+        Cooperative estimated limit for one Torch batch workspace lease. This
+        is not a physical device-memory guarantee. Default 256 MiB.
+    secondary_shift : tuple[int, int], optional
+        Integer production pre-alignment ``(azimuth, range)`` shift. The
+        shift is applied while materializing bounded tiles, so no full-image
+        secondary copy is allocated. Defaults to ``(0, 0)``.
 
     Returns
     -------
@@ -360,14 +1546,124 @@ def estimate_patch_amplitude_shift(
         shifts are 0.0 (keep geometry prior).
 
     """
-    if reference.shape != secondary.shape or reference.ndim != 2:
-        reject_invalid_state("patch amplitude shift requires matching 2-D arrays")
-    if min(window_az, window_rg, search_az, search_rg, n_az, n_rg) < 1:
-        reject_invalid_state("patch amplitude parameters must be positive")
+    integer_parameters = {
+        "window_az": window_az,
+        "window_rg": window_rg,
+        "search_az": search_az,
+        "search_rg": search_rg,
+        "n_az": n_az,
+        "n_rg": n_rg,
+    }
+    for name, value in integer_parameters.items():
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            reject_invalid_state(f"Ampcor {name} must be a finite integer")
+        if int(value) < 1:
+            reject_invalid_state(f"Ampcor {name} must be positive")
+    for name, value in {
+        "snr_threshold": snr_threshold,
+        "max_abs_residual": max_abs_residual,
+    }.items():
+        _validate_real_scalar(name, value, nonnegative=True)
+    if isinstance(margin_rg, bool) or not isinstance(margin_rg, (int, np.integer)):
+        reject_invalid_state("Ampcor margin_rg must be a finite integer")
+    if margin_rg < 0:
+        reject_invalid_state("Ampcor margin_rg must be non-negative")
+    if margin_az is not None:
+        if isinstance(margin_az, bool) or not isinstance(margin_az, (int, np.integer)):
+            reject_invalid_state("Ampcor margin_az must be a finite integer")
+        if margin_az < 0:
+            reject_invalid_state("Ampcor margin_az must be non-negative")
+    executor, device = resolve_ampcor_policy(executor, device)
+    if executor == "torch" and device.startswith("cuda"):
+        _validate_ampcor_accelerator(device)
+    planned_patches = int(n_az) * int(n_rg)
+    if planned_patches > _TORCH_AMPCOR_MAX_PATCHES:
+        reject_invalid_state(
+            "Ampcor patch grid exceeds the admitted total-work limit "
+            f"({_TORCH_AMPCOR_MAX_PATCHES} patches)"
+        )
+    if executor == "torch":
+        if isinstance(batch_size, bool) or not isinstance(
+            batch_size, (int, np.integer)
+        ):
+            reject_invalid_state("Ampcor batch_size must be a finite integer")
+        if batch_size < 1:
+            reject_invalid_state("Ampcor batch_size must be positive")
+        if isinstance(max_workspace_bytes, bool) or not isinstance(
+            max_workspace_bytes, (int, np.integer)
+        ):
+            reject_invalid_state("Ampcor max_workspace_bytes must be a finite integer")
+        if max_workspace_bytes < 1 or (
+            max_workspace_bytes > _TORCH_AMPCOR_WORKSPACE_CAP_BYTES
+        ):
+            reject_invalid_state("Ampcor max_workspace_bytes must be in [1, 256 MiB]")
+    if (
+        not isinstance(secondary_shift, tuple)
+        or len(secondary_shift) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, (int, np.integer))
+            for value in secondary_shift
+        )
+    ):
+        reject_invalid_state("Ampcor secondary_shift must be a pair of integers")
+    secondary_shift = (int(secondary_shift[0]), int(secondary_shift[1]))
+    reference, secondary = _validate_ampcor_inputs(
+        reference,
+        secondary,
+        torch_contract=executor == "torch",
+    )
     height, width = reference.shape
-    ref_mag = np.abs(np.asarray(reference, dtype=np.complex64)).astype(np.float32)
-    sec_mag = np.abs(np.asarray(secondary, dtype=np.complex64)).astype(np.float32)
-
+    if height < 1 or width < 1:
+        reject_invalid_state("Ampcor input dimensions must be positive")
+    if executor == "torch":
+        if height > _TORCH_AMPCOR_MAX_INPUT_DIM or width > _TORCH_AMPCOR_MAX_INPUT_DIM:
+            reject_invalid_state(
+                "Ampcor input dimensions exceed the admitted limit "
+                f"({_TORCH_AMPCOR_MAX_INPUT_DIM})"
+            )
+        search_height = int(window_az) + 2 * int(search_az)
+        search_width = int(window_rg) + 2 * int(search_rg)
+        if (
+            window_az > height
+            or window_rg > width
+            or search_height > _TORCH_AMPCOR_MAX_PATCH_DIM
+            or search_width > _TORCH_AMPCOR_MAX_PATCH_DIM
+        ):
+            reject_invalid_state(
+                "Ampcor window/search dimensions exceed the admitted bounds"
+            )
+        patch_elements = int(window_az) * int(window_rg) + search_height * search_width
+        expected_input_bytes = _ampcor_input_budget_bytes(
+            reference,
+            secondary,
+            patch_elements=patch_elements,
+            batch_capacity=int(batch_size),
+        )
+        if expected_input_bytes > _TORCH_AMPCOR_MAX_INPUT_BYTES:
+            reject_invalid_state(
+                "Ampcor input and magnitude-tile workspace exceeds the admitted limit "
+                f"({_TORCH_AMPCOR_MAX_INPUT_BYTES} bytes)"
+            )
+        return _estimate_patch_amplitude_shift_torch(
+            reference,
+            secondary,
+            window_az=window_az,
+            window_rg=window_rg,
+            search_az=search_az,
+            search_rg=search_rg,
+            n_az=n_az,
+            n_rg=n_rg,
+            snr_threshold=snr_threshold,
+            max_abs_residual=max_abs_residual,
+            margin_rg=margin_rg,
+            margin_az=margin_az,
+            subpixel=subpixel,
+            batch_size=int(batch_size),
+            max_workspace_bytes=int(max_workspace_bytes),
+            device=device,
+            secondary_shift=secondary_shift,
+        )
+    height, width = reference.shape
     half_az = window_az // 2
     half_rg = window_rg // 2
     m_az = half_az + search_az + 1 if margin_az is None else int(margin_az)
@@ -406,8 +1702,15 @@ def estimate_patch_amplitude_shift(
                 continue
             n_attempted += 1
             result = _patch_ncc_shift(
-                ref_mag[r0:r1, c0:c1],
-                sec_mag[sr0:sr1, sc0:sc1],
+                _ampcor_magnitude_tile(reference, r0, r1, c0, c1),
+                _ampcor_magnitude_tile(
+                    secondary,
+                    sr0,
+                    sr1,
+                    sc0,
+                    sc1,
+                    cyclic_shift=secondary_shift,
+                ),
                 search_az=search_az,
                 search_rg=search_rg,
                 subpixel=subpixel,
@@ -415,9 +1718,15 @@ def estimate_patch_amplitude_shift(
             if result is None:
                 continue
             d_rg, d_az, snr = result
-            if snr < snr_threshold:
-                continue
-            if abs(d_rg) > max_abs_residual or abs(d_az) > max_abs_residual:
+            if not bool(
+                _ampcor_cull_mask_numpy(
+                    snr,
+                    d_rg,
+                    d_az,
+                    snr_threshold=snr_threshold,
+                    max_abs_residual=max_abs_residual,
+                )
+            ):
                 continue
             d_rg_list.append(d_rg)
             d_az_list.append(d_az)

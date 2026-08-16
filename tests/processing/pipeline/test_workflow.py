@@ -85,3 +85,60 @@ def test_step_by_step_workflow(tmp_path: Path) -> None:
     assert state.geocoded_unwrapped is not None
     state = stage_write(state, tmp_path / "steps")
     assert state.zarr_path is not None
+
+
+def test_deprecated_workflow_keeps_numpy_ampcor_rollback_with_torch_resampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The portable Ampcor rollback does not disable phase-preserving remapping."""
+    from faninsar.processing.pipeline import workflow as workflow_mod
+
+    shape = (8, 12)
+    reference = type("Scene", (), {})()
+    secondary = type("Scene", (), {})()
+    reference.swath = object()
+    secondary.swath = object()
+    reference.burst = object()
+    secondary.burst = object()
+    reference.carrier = object()
+    secondary.carrier = object()
+    state = workflow_mod.PairWorkflowState(
+        pair_id="rollback",
+        reference=reference,
+        secondary=secondary,
+    )
+    state.reference_deramped = np.ones(shape, dtype=np.complex64)
+    state.secondary_deramped = np.ones(shape, dtype=np.complex64)
+    ampcor_kwargs: dict[str, object] = {}
+    resample_kwargs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        workflow_mod,
+        "geometry_coarse_shift",
+        lambda *_args, **_kwargs: (0.0, 0.0),
+    )
+
+    def fake_refine(*_args: object, **kwargs: object) -> tuple[float, float]:
+        ampcor_kwargs.update(kwargs)
+        return 0.0, 0.0
+
+    monkeypatch.setattr(workflow_mod, "refine_shift_with_correlation", fake_refine)
+    monkeypatch.setattr(workflow_mod, "reramp", lambda samples, *_args: samples)
+
+    def fake_resample(samples: np.ndarray, **kwargs: object) -> np.ndarray:
+        resample_kwargs.update(kwargs)
+        return samples.copy()
+
+    monkeypatch.setattr(workflow_mod, "resample_complex", fake_resample)
+
+    result = workflow_mod.stage_coregister(
+        state,
+        executor="numpy",
+        device="auto",
+    )
+
+    assert result.secondary_aligned is not None
+    assert ampcor_kwargs["executor"] == "numpy"
+    assert ampcor_kwargs["device"] == "cpu"
+    assert resample_kwargs["executor"] == "torch"
+    assert resample_kwargs["device"] == "auto"

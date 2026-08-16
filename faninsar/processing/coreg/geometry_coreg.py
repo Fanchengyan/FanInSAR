@@ -10,7 +10,11 @@ import numpy as np
 from faninsar.logging import setup_logger
 from faninsar.processing.coreg.offsets import (
     OffsetFieldResult,
+    _torch_ampcor_admission_key,
+    _validate_ampcor_inputs,
+    _validate_torch_ampcor_runtime,
     estimate_patch_amplitude_shift,
+    resolve_ampcor_policy,
 )
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry.orbit import OrbitInterpolator
@@ -19,6 +23,23 @@ if TYPE_CHECKING:
     from faninsar.missions.sentinel1.types import S1Burst, S1Swath
 
 logger = setup_logger(__name__)
+
+
+def _validate_ampcor_accelerator(device: str) -> None:
+    """Validate explicit accelerator availability before input copies."""
+    if device == "mps":
+        message = "MPS is not a qualified Ampcor device; use CPU or CUDA"
+        logger.error(message)
+        reject_invalid_state(message)
+    if device.startswith("cuda"):
+        try:
+            import torch
+        except ImportError as error:
+            message = "explicit CUDA Ampcor requires torch"
+            logger.exception(message)
+            raise ImportError(message) from error
+        _validate_torch_ampcor_runtime(torch.device(device), torch)
+        _torch_ampcor_admission_key(torch.device(device), torch)
 
 
 def geometry_coarse_shift(
@@ -74,6 +95,8 @@ def refine_shift_with_correlation(
     prior_rg: float,
     prior_az: float,
     search_radius: int = 16,
+    executor: str = "numpy",
+    device: str = "auto",
 ) -> tuple[float, float]:
     """Refine a geometry prior with multi-window magnitude Ampcor.
 
@@ -95,6 +118,14 @@ def refine_shift_with_correlation(
     search_radius : int, optional
         Correlation search half-width around the prior (default 16, matching
         ISCE2 topsApp Ampcor).
+    executor : {"numpy", "torch"}, optional
+        Requested Ampcor implementation. Automatic operation resolves to
+        portable NumPy; explicit ``executor="torch", device="cpu"`` uses
+        bounded Torch CPU batches and explicit CUDA uses Torch.
+    device : {"auto", "cpu", "cuda"}, optional
+        Requested execution device. Explicit CUDA is fail-closed when it is
+        unavailable; automatic operation remains portable CPU NumPy. MPS is
+        outside the qualified Ampcor contract and is rejected.
 
     Returns
     -------
@@ -103,6 +134,20 @@ def refine_shift_with_correlation(
         resample convention as ``prior_*``.
 
     """
+    ampcor_executor, ampcor_device = resolve_ampcor_policy(executor, device)
+    if ampcor_executor == "torch":
+        _validate_ampcor_accelerator(ampcor_device)
+    if (
+        not isinstance(search_radius, (int, np.integer))
+        or isinstance(search_radius, (bool, np.bool_))
+        or int(search_radius) < 1
+    ):
+        reject_invalid_state("search_radius must be a positive integer")
+    reference_samples, secondary_samples = _validate_ampcor_inputs(
+        reference_samples,
+        secondary_samples,
+        torch_contract=ampcor_executor == "torch",
+    )
     if not np.isfinite(prior_rg) or not np.isfinite(prior_az):
         logger.warning(
             "Correlation refinement skipped: non-finite prior offsets "
@@ -113,17 +158,18 @@ def refine_shift_with_correlation(
         return float("nan"), float("nan")
     pre_rg = round(float(prior_rg))
     pre_az = round(float(prior_az))
-    # Pre-align secondary under the resample_complex convention:
-    # source = out - offset  ⇒  shifted[i] = secondary[i - prior].
-    # numpy.roll(a, +prior) implements shifted[i] = a[i - prior].
-    shifted = np.roll(secondary_samples, shift=pre_az, axis=0)
-    shifted = np.roll(shifted, shift=pre_rg, axis=1)
+    # Pre-align secondary under the resample_complex convention. Ampcor applies
+    # the equivalent cyclic source shift per bounded tile, avoiding full-image
+    # ``numpy.roll`` allocations on production bursts.
     patch = estimate_patch_amplitude_shift(
         reference_samples,
-        shifted,
+        secondary_samples,
         search_az=search_radius,
         search_rg=search_radius,
         subpixel=True,
+        executor=ampcor_executor,
+        device=ampcor_device,
+        secondary_shift=(pre_az, pre_rg),
     )
     d_rg = float(patch.range_shift_px)
     d_az = float(patch.azimuth_shift_px)
@@ -189,16 +235,15 @@ def combine_offset_fields(
     )
     # Coverage is unchanged (geometry already determined valid area)
     # Uncertainty: add amplitude residual uncertainty heuristically
-    combined_uncertainty = (
-        geometry_field.uncertainty_px.astype(np.float32, copy=False)
-        + np.float32(
-            0.1
-            * (
-                abs(amplitude_residual_rg)
-                + abs(amplitude_residual_az)
-                + abs(misreg_rg_px)
-                + abs(misreg_az_px)
-            )
+    combined_uncertainty = geometry_field.uncertainty_px.astype(
+        np.float32, copy=False
+    ) + np.float32(
+        0.1
+        * (
+            abs(amplitude_residual_rg)
+            + abs(amplitude_residual_az)
+            + abs(misreg_rg_px)
+            + abs(misreg_az_px)
         )
     )
     logger.info(

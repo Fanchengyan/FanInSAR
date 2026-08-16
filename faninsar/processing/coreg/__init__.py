@@ -15,6 +15,7 @@ from .geometry_coreg import (
     combine_offset_fields,
     geometry_coarse_shift,
     refine_shift_with_correlation,
+    resolve_ampcor_policy,
 )
 from .misreg_network import DateMisreg, MisregArc, invert_pair_misregistration
 from .offsets import (
@@ -51,5 +52,6 @@ __all__ = [
     "refine_shift_with_correlation",
     "resample_complex",
     "resample_complex_deramped_reramp",
+    "resolve_ampcor_policy",
     "stage_topo",
 ]

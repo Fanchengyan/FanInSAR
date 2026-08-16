@@ -34,6 +34,7 @@ from faninsar.processing.coreg import (
     refine_shift_with_correlation,
     resample_complex,
     resample_complex_deramped_reramp,
+    resolve_ampcor_policy,
 )
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import (
@@ -1652,8 +1653,10 @@ def stage_coregister(
     misreg_az_px, misreg_rg_px : float, optional
         External azimuth and range residual corrections applied to the
         prepared offset field.
-    executor : {"torch"}, optional
-        Unified Torch Lanczos path for the final resample.
+    executor : {"numpy", "torch"}, optional
+        Ampcor executor. ``"numpy"`` with ``device="cpu"`` or
+        ``device="auto"`` selects the portable Ampcor path; the final
+        phase-preserving resample remains Torch-owned.
     device : {"auto","cpu","cuda","mps"}, optional
         Numerical device. ``"auto"`` selects local CUDA or CPU; explicit MPS
         uses the stage's logged NumPy CPU fallback where this proposal applies.
@@ -1728,6 +1731,15 @@ def stage_coregister(
             )
     if prepared_geo_lut is not None and coregistration_grid != "geo":
         reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
+
+    resolved_ampcor_executor, resolved_ampcor_device = resolve_ampcor_policy(
+        executor, device
+    )
+    # Ampcor's qualified CPU fallback for ``auto`` must not disable the
+    # phase-preserving Torch resampler's own automatic device selection.
+    resolved_torch_device = (
+        "auto" if device.strip().lower() == "auto" else resolved_ampcor_device
+    )
 
     dem = state.dem
     # Dense geometry + Ampcor/ESD always run on radar deramped samples. Product
@@ -1835,6 +1847,8 @@ def stage_coregister(
                 prior_rg=prior_rg,
                 prior_az=prior_az,
                 search_radius=16,
+                executor=resolved_ampcor_executor,
+                device=resolved_ampcor_device,
             )
             if np.isfinite(amp_rg) and np.isfinite(amp_az):
                 amp_res_rg = amp_rg - prior_rg
@@ -1865,16 +1879,22 @@ def stage_coregister(
                 range_offset_px=geometry_field.range_offset_px + amp_res_rg,
                 azimuth_offset_px=geometry_field.azimuth_offset_px + amp_res_az,
                 order=1,
+                executor="torch",
+                device=resolved_torch_device,
             )
             from faninsar.backends.dask_gpu import should_accelerate
 
-            if should_accelerate(device, dask_client, kernel="esd_azimuth_shift"):
+            if should_accelerate(
+                resolved_torch_device,
+                dask_client,
+                kernel="esd_azimuth_shift",
+            ):
                 from faninsar.backends.dask_gpu import run_esd_azimuth_shift
 
                 esd = run_esd_azimuth_shift(
                     ref,
                     pre,
-                    device=device,
+                    device=resolved_torch_device,
                     client=dask_client,
                 )
             else:
@@ -2085,8 +2105,8 @@ def stage_coregister(
             offsets=offsets,
             output_dir=work_directory / "slc",
             row_chunk=geo_chunk_size,
-            executor=executor,
-            device=device,
+            executor="torch",
+            device=resolved_torch_device,
             dask_client=dask_client,
             watchdog=memory_watchdog,
         )
@@ -2173,8 +2193,8 @@ def stage_coregister(
         secondary_carrier=state.secondary.carrier,
         range_offset_px=offsets.range_offset_px,
         azimuth_offset_px=offsets.azimuth_offset_px,
-        executor=executor,
-        device=device,
+        executor="torch",
+        device=resolved_torch_device,
         row0=0 if window_origin is None else window_origin[0],
         col0=0 if window_origin is None else window_origin[1],
         native_height=state.reference.array.samples.shape[0],
@@ -2203,7 +2223,11 @@ def stage_coregister(
     state.secondary_deramped = None
     from faninsar.backends.dask_gpu import run_carrier_multiply, should_accelerate
 
-    if should_accelerate(device, dask_client, kernel="carrier_multiply"):
+    if should_accelerate(
+        resolved_torch_device,
+        dask_client,
+        kernel="carrier_multiply",
+    ):
         state.reference_deramped = run_carrier_multiply(
             ref,
             state.reference.carrier,
@@ -2211,7 +2235,7 @@ def stage_coregister(
             row0=0 if window_origin is None else window_origin[0],
             col0=0 if window_origin is None else window_origin[1],
             native_height=state.reference.array.samples.shape[0],
-            device=device,
+            device=resolved_torch_device,
             client=dask_client,
         )
     else:
@@ -3890,6 +3914,14 @@ def run_pair(
         prepared_geo_lut_handles is not None or prepared_provider_root is not None
     ) and coregistration_grid != "geo":
         reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")
+    if isinstance(n_jobs, bool) or not isinstance(n_jobs, int) or n_jobs < 1:
+        reject_invalid_state("n_jobs must be a positive integer")
+    _, resolved_ampcor_device = resolve_ampcor_policy(executor, device)
+    if n_jobs > 1 and resolved_ampcor_device.startswith("cuda"):
+        reject_invalid_state(
+            "explicit CUDA Ampcor is incompatible with ProcessPoolExecutor "
+            "n_jobs > 1; use n_jobs=1 for device-local admission"
+        )
     if not _is_multilook_pair(multilook) or coregistration_grid == "geo":
         return _run_pair_sweep(
             reference_path,
@@ -4608,6 +4640,14 @@ def _run_pair_sweep(
     if (prepared_geo_lut_handles is None) != (prepared_provider_root is None):
         reject_invalid_state(
             "prepared Geo LUT reuse requires both handles and provider root"
+        )
+    if isinstance(n_jobs, bool) or not isinstance(n_jobs, int) or n_jobs < 1:
+        reject_invalid_state("n_jobs must be a positive integer")
+    _, resolved_ampcor_device = resolve_ampcor_policy(executor, device)
+    if n_jobs > 1 and resolved_ampcor_device.startswith("cuda"):
+        reject_invalid_state(
+            "explicit CUDA Ampcor is incompatible with ProcessPoolExecutor "
+            "n_jobs > 1; use n_jobs=1 for device-local admission"
         )
     if prepared_geo_lut_handles is not None and coregistration_grid != "geo":
         reject_invalid_state("prepared Geo LUT reuse requires geo coregistration")

@@ -19,6 +19,7 @@ from faninsar.processing.coreg.geometry_coreg import (
     build_offset_field,
     geometry_coarse_shift,
     refine_shift_with_correlation,
+    resolve_ampcor_policy,
 )
 from faninsar.processing.coreg.offsets import resample_complex
 from faninsar.processing.errors import reject_invalid_state
@@ -183,14 +184,24 @@ def stage_coregister(
         Pair workflow state after deramp.
     search_radius : int, optional
         Correlation search radius in pixels.
-    executor : {"torch"}, optional
-        Unified Torch Lanczos path for :func:`resample_complex`.
+    executor : {"numpy", "torch"}, optional
+        Ampcor executor. ``"numpy"`` with ``device="cpu"`` or
+        ``device="auto"`` selects the documented portable Ampcor rollback;
+        phase-preserving resampling remains Torch-owned. Explicit CUDA is
+        qualified only for the Ampcor search radii 8 and 16; the historical
+        default ``search_radius=32`` therefore fails closed for CUDA on this
+        deprecated route.
     device : {"auto","cpu","cuda","mps"}, optional
         Torch compute device. Default ``"auto"``.
 
     """
     if state.reference_deramped is None or state.secondary_deramped is None:
         reject_invalid_state("stage_coregister requires stage_deramp first")
+
+    resolved_executor, resolved_ampcor_device = resolve_ampcor_policy(executor, device)
+    resolved_torch_device = (
+        "auto" if device.strip().lower() == "auto" else resolved_ampcor_device
+    )
 
     prior_rg, prior_az = geometry_coarse_shift(
         state.reference.swath,
@@ -204,6 +215,8 @@ def stage_coregister(
         prior_rg=prior_rg,
         prior_az=prior_az,
         search_radius=search_radius,
+        executor=resolved_executor,
+        device=resolved_ampcor_device,
     )
     offsets = build_offset_field(
         state.reference_deramped.shape,
@@ -217,8 +230,8 @@ def stage_coregister(
         sec_orig,
         range_offset_px=offsets.range_offset_px,
         azimuth_offset_px=offsets.azimuth_offset_px,
-        executor=executor,
-        device=device,
+        executor="torch",
+        device=resolved_torch_device,
     )
     ref_aligned = reramp(state.reference_deramped, state.reference.carrier)
     state.range_shift_px = rg

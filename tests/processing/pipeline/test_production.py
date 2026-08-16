@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import zarr
 
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import (
     ConstantHeightDEM,
     PreparedGeometryArrayPayload,
@@ -103,6 +104,21 @@ def test_production_pair_state_note() -> None:
     assert state.log == ["hello"]
     state.note("world")
     assert state.log == ["hello", "world"]
+
+
+def test_run_pair_rejects_cuda_process_parallelism_before_opening_inputs(
+    tmp_path: Path,
+) -> None:
+    """CUDA Ampcor cannot enter a multi-process sweep without a cross-process gate."""
+    with pytest.raises(InvalidProcessingStateError, match="ProcessPoolExecutor"):
+        run_pair(
+            "missing-reference.SAFE",
+            "missing-secondary.SAFE",
+            output_dir=tmp_path / "out",
+            n_jobs=2,
+            executor="torch",
+            device="cuda:0",
+        )
 
 
 def test_merged_pair_result_preserves_coregistration_residuals() -> None:
@@ -285,6 +301,79 @@ def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
     assert result.range_shift_px == 0.0
     assert result.azimuth_shift_px == 0.25
     assert geometry_call["stride"] == 8
+
+
+@pytest.mark.parametrize(
+    (
+        "requested_device",
+        "expected_ampcor_executor",
+        "expected_ampcor_device",
+        "expected_resample_device",
+    ),
+    [("gpu", "torch", "cuda", "cuda"), ("auto", "numpy", "cpu", "auto")],
+)
+def test_stage_coregister_forwards_ampcor_executor_and_device(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_device: str,
+    expected_ampcor_executor: str,
+    expected_ampcor_device: str,
+    expected_resample_device: str,
+) -> None:
+    """Production separates Ampcor policy from Torch remapping policy."""
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.pipeline import production as production_mod
+
+    shape = (64, 96)
+    ref = _make_mock_scene(shape)
+    sec = _make_mock_scene(shape)
+    ref.geometry.range_spacing_m = 2.3
+    ref.geometry.wavelength_m = 0.056
+    sec.geometry.range_spacing_m = 2.3
+    sec.geometry.wavelength_m = 0.056
+    state = ProductionPairState(
+        pair_id="ampcor-dispatch",
+        reference=ref,
+        secondary=sec,
+        dem=ConstantHeightDEM(0.0),
+    )
+    state.reference_deramped = np.ones(shape, dtype=np.complex64)
+    state.secondary_deramped = np.ones(shape, dtype=np.complex64)
+    offsets = OffsetFieldResult(
+        range_offset_px=np.full(shape, 0.25, dtype=np.float32),
+        azimuth_offset_px=np.full(shape, -0.125, dtype=np.float32),
+        coverage=np.ones(shape, dtype=bool),
+        uncertainty_px=np.zeros(shape, dtype=np.float32),
+    )
+    captured: dict[str, object] = {}
+    resample_kwargs: dict[str, object] = {}
+
+    monkeypatch.setattr(production_mod, "dense_geometry_offsets", lambda **_: offsets)
+    monkeypatch.setattr(
+        production_mod,
+        "refine_shift_with_correlation",
+        lambda *_args, **kwargs: (captured.update(kwargs) or (0.25, -0.125)),
+    )
+    monkeypatch.setattr(
+        production_mod,
+        "resample_complex_deramped_reramp",
+        lambda samples, **kwargs: (resample_kwargs.update(kwargs) or samples.copy()),
+    )
+    monkeypatch.setattr(
+        "faninsar.backends.dask_gpu.should_accelerate",
+        lambda *_args, **_kwargs: False,
+    )
+    result = stage_coregister(
+        state,
+        amplitude_refinement_enabled=True,
+        executor="torch",
+        device=requested_device,
+    )
+
+    assert result.amplitude_residual_rg_px == pytest.approx(0.0)
+    assert captured["executor"] == expected_ampcor_executor
+    assert captured["device"] == expected_ampcor_device
+    assert resample_kwargs["executor"] == "torch"
+    assert resample_kwargs["device"] == expected_resample_device
 
 
 def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
@@ -570,9 +659,7 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
             uncertainty_px=np.zeros(shape, dtype=np.float32),
         )
 
-    monkeypatch.setattr(
-        production_mod, "geometry_offset_window_extent", fake_extent
-    )
+    monkeypatch.setattr(production_mod, "geometry_offset_window_extent", fake_extent)
     monkeypatch.setattr(
         production_mod, "dense_geometry_offsets", fake_dense_geometry_offsets
     )
@@ -669,15 +756,11 @@ def test_stage_coregister_grows_roi_halo_for_large_offsets(
             uncertainty_px=np.zeros(shape, dtype=np.float32),
         )
 
-    def fake_resample(
-        samples: np.ndarray, **kwargs: object
-    ) -> np.ndarray:
+    def fake_resample(samples: np.ndarray, **kwargs: object) -> np.ndarray:
         resample_kwargs.update(kwargs)
         return samples.copy()
 
-    monkeypatch.setattr(
-        production_mod, "geometry_offset_window_extent", fake_extent
-    )
+    monkeypatch.setattr(production_mod, "geometry_offset_window_extent", fake_extent)
     monkeypatch.setattr(
         production_mod, "dense_geometry_offsets", fake_dense_geometry_offsets
     )
@@ -969,9 +1052,7 @@ def test_stage_flatten_does_not_repeat_slc_domain_flattening(
     assert result.complex_ifg_flat is not None
     assert result.wrapped_phase is not None
     # ISCE2-parity: no residual removal; phase is preserved exactly.
-    np.testing.assert_allclose(
-        np.angle(result.complex_ifg_flat), phase, atol=1e-5
-    )
+    np.testing.assert_allclose(np.angle(result.complex_ifg_flat), phase, atol=1e-5)
     np.testing.assert_allclose(result.wrapped_phase, phase, atol=1e-5)
     notes = " ".join(result.log)
     assert "range-offset screen only" in notes
