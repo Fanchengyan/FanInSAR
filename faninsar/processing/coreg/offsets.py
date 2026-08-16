@@ -362,43 +362,44 @@ def _is_cpu_ampcor_device(device: object) -> bool:
 def resolve_ampcor_policy(
     executor: object,
     device: object,
-) -> tuple[Literal["numpy", "torch"], str]:
+) -> tuple[Literal["torch"], str]:
     """Resolve the public Ampcor executor/device contract.
 
-    ``numpy`` with ``auto`` or ``cpu`` selects the portable CPU lane.  The
-    explicit ``torch``/``cpu`` request selects the bounded Torch CPU lane,
-    while ``torch``/``auto`` deliberately selects portable NumPy.  This
-    distinction is intentional: ``auto`` must not silently turn a production
-    default into an unqualified Torch path.  Explicit CUDA always selects
-    Torch and is canonicalized to a decimal device ordinal (so ``cuda:00``
-    and ``cuda:0`` have identical dispatch and admission identity).
+    ``numpy`` is retained as a compatibility spelling and is always routed
+    to the bounded Torch implementation. ``auto`` and ``cpu`` select the
+    portable Torch CPU lane. Explicit CUDA selects Torch and is canonicalized
+    to a decimal device ordinal (so ``cuda:00`` and ``cuda:0`` have identical
+    dispatch and admission identity).
 
     Parameters
     ----------
     executor : object
-        Requested implementation, ``"numpy"`` or ``"torch"``.
+        Requested implementation, ``"auto"``, ``"numpy"`` or ``"torch"``.
     device : object
         Requested runtime device value.
 
     Raises
     ------
     InvalidProcessingStateError
-        If NumPy is paired with any explicit non-CPU or unknown device.
+        If the executor or device spelling is unsupported, or the device is
+        outside the qualified Ampcor contract.
 
     """
-    if not isinstance(executor, str) or executor not in {"numpy", "torch"}:
+    if not isinstance(executor, str) or executor not in {"auto", "numpy", "torch"}:
         message = f"unsupported Ampcor executor: {executor!r}"
         logger.error(message)
         reject_invalid_state(message)
+    if executor == "numpy":
+        logger.warning(
+            "Ampcor executor='numpy' is deprecated; routing through Torch compatibility"
+        )
     if not isinstance(device, str):
         message = f"unsupported Ampcor device: {device!r}"
         logger.error(message)
         reject_invalid_state(message)
     canonical = device.strip().lower()
     if canonical in {"auto", "cpu"}:
-        if executor == "torch" and canonical == "cpu":
-            return "torch", "cpu"
-        return "numpy", "cpu"
+        return "torch", "cpu"
     if canonical in {"gpu", "cuda", "cuda:default"}:
         canonical = "cuda"
     elif canonical.startswith("cuda:"):
@@ -414,10 +415,6 @@ def resolve_ampcor_policy(
         reject_invalid_state(message)
     else:
         message = f"unsupported Ampcor device: {device!r}"
-        logger.error(message)
-        reject_invalid_state(message)
-    if executor == "numpy":
-        message = "explicit accelerator Ampcor devices require executor='torch'"
         logger.error(message)
         reject_invalid_state(message)
     return "torch", canonical
@@ -443,14 +440,6 @@ def _validate_ampcor_accelerator(device: str) -> None:
     _torch_ampcor_admission_key(resolved, torch)
 
 
-_AMPCOR_TORCH_INPUT_DTYPES = frozenset(
-    {
-        np.dtype(np.complex64),
-        np.dtype(np.float32),
-    }
-)
-
-
 def _validate_ampcor_inputs(
     reference: object,
     secondary: object,
@@ -460,24 +449,19 @@ def _validate_ampcor_inputs(
     """Admit only supported, directly indexable Ampcor input arrays.
 
     Ampcor materializes bounded tiles directly from the caller-owned arrays.
-    The Torch admission contract therefore rejects implicit object/integer
-    casts, negative strides, non-C-contiguous layouts, and non-owning views
-    before any tile or device allocation. Explicit Torch inputs are limited to
-    ``complex64`` and
-    ``float32`` and are converted tile-by-tile to ``complex64``, reduced to
-    ``float32`` magnitudes, and stacked as a contiguous ``float32`` batch (the
-    NCC kernel promotes that batch to ``float64`` for its arithmetic). The
-    default NumPy lane intentionally retains its historical dtype/stride
-    conversions, including ``complex128``, ``float64``, integer, and
-    non-contiguous inputs.
+    Torch compatibility inputs are therefore checked for a bounded,
+    non-overlapping layout and copied once when a safe contiguous copy is
+    required. Numeric real inputs are narrowed to ``float32`` and complex
+    inputs to ``complex64`` before tile materialization; object arrays and
+    malformed layouts fail closed.
 
     Parameters
     ----------
     reference, secondary : object
         Candidate two-dimensional NumPy arrays on the same grid.
     torch_contract : bool, optional
-        Apply the stricter Torch dtype, stride, ownership, and C-contiguity
-        contract. The default keeps the portable NumPy compatibility behavior.
+        Apply the Torch compatibility normalization. The default is retained
+        for callers of the private validator and keeps the input arrays as-is.
 
     Returns
     -------
@@ -499,31 +483,85 @@ def _validate_ampcor_inputs(
         message = "patch amplitude shift requires matching 2-D arrays"
         logger.error(message)
         reject_invalid_state(message)
+    if not torch_contract:
+        return reference, secondary
+
+    normalized: list[np.ndarray] = []
     for name, samples in (("reference", reference), ("secondary", secondary)):
-        if torch_contract and samples.dtype not in _AMPCOR_TORCH_INPUT_DTYPES:
-            message = (
-                f"Ampcor {name} dtype {samples.dtype} is unsupported; "
-                "explicit Torch execution accepts only float32 or complex64"
-            )
+        if samples.dtype.kind not in "biufc":
+            message = f"Ampcor {name} dtype {samples.dtype} is unsupported"
             logger.error(message)
             reject_invalid_state(message)
-        if torch_contract and any(stride < 0 for stride in samples.strides):
-            message = f"Ampcor {name} must not use negative strides"
+        if samples.nbytes > _TORCH_AMPCOR_MAX_INPUT_BYTES:
+            message = f"Ampcor {name} input exceeds the admitted memory limit"
             logger.error(message)
             reject_invalid_state(message)
-        if torch_contract and not samples.flags.c_contiguous:
-            message = (
-                f"Ampcor {name} must be C-contiguous for explicit Torch/CUDA execution"
-            )
+        if not _ampcor_layout_is_safe(samples):
+            message = f"Ampcor {name} has an overlapping or out-of-bounds layout"
             logger.error(message)
             reject_invalid_state(message)
-        if torch_contract and not samples.flags.owndata:
-            message = (
-                f"Ampcor {name} must own its storage for explicit Torch/CUDA execution"
-            )
-            logger.error(message)
-            reject_invalid_state(message)
-    return reference, secondary
+        target_dtype = (
+            np.dtype(np.complex64)
+            if samples.dtype.kind == "c"
+            else np.dtype(np.float32)
+        )
+        if (
+            samples.flags.c_contiguous
+            and samples.flags.owndata
+            and samples.dtype == target_dtype
+        ):
+            normalized.append(samples)
+        else:
+            with np.errstate(over="ignore", invalid="ignore"):
+                copied = np.array(samples, dtype=target_dtype, order="C", copy=True)
+            if not np.all(np.isfinite(copied)):
+                message = f"Ampcor {name} contains values outside the Torch range"
+                logger.error(message)
+                reject_invalid_state(message)
+            normalized.append(copied)
+    return normalized[0], normalized[1]
+
+
+def _ampcor_layout_is_safe(samples: np.ndarray) -> bool:
+    """Return whether a two-dimensional array can be copied safely.
+
+    Positive and negative strides are accepted when dimensions do not overlap
+    and every addressed byte lies within the owning allocation. This rejects
+    zero-stride ``as_strided`` views and fabricated out-of-bounds layouts
+    before ``np.array(..., copy=True)`` can dereference them.
+    """
+    itemsize = int(samples.dtype.itemsize)
+    if itemsize < 1 or samples.ndim != 2:
+        return False
+    dimensions = sorted(
+        (
+            (abs(int(stride)), int(size))
+            for size, stride in zip(samples.shape, samples.strides, strict=True)
+        ),
+        key=lambda value: value[0],
+    )
+    footprint = itemsize
+    for stride, size in dimensions:
+        if size > 1 and stride < footprint:
+            return False
+        footprint *= max(size, 1)
+    offsets = [
+        int(size - 1) * int(stride)
+        for size, stride in zip(samples.shape, samples.strides, strict=True)
+    ]
+    minimum = min(0, sum(offset for offset in offsets if offset < 0))
+    maximum = max(0, sum(offset for offset in offsets if offset > 0)) + itemsize
+    owner = samples
+    while isinstance(getattr(owner, "base", None), np.ndarray):
+        owner = owner.base
+    try:
+        sample_pointer = int(samples.__array_interface__["data"][0])
+        owner_pointer = int(owner.__array_interface__["data"][0])
+    except (KeyError, TypeError, ValueError):
+        return False
+    start = sample_pointer - owner_pointer + minimum
+    end = sample_pointer - owner_pointer + maximum
+    return 0 <= start <= end <= int(owner.nbytes)
 
 
 @contextmanager
@@ -1162,6 +1200,7 @@ def _torch_patch_ncc_batch(
     search_az: int,
     search_rg: int,
     subpixel: bool,
+    force_fft_energy: bool = False,
 ) -> tuple[object, object, object]:
     """Evaluate a batch of Ampcor NCC surfaces with Torch float64 math."""
     import torch
@@ -1187,7 +1226,7 @@ def _torch_patch_ncc_batch(
         row_start : row_start + 2 * search_az + 1,
         col_start : col_start + 2 * search_rg + 1,
     ]
-    precheck = _torch_integral_energy_is_safe(sec, torch)
+    precheck = None if force_fft_energy else _torch_integral_energy_is_safe(sec, torch)
     if precheck is not None:
         tile_error, global_max_abs = precheck
         # Each valid lag selects one rectangular window from ``sec``.  A
@@ -1370,12 +1409,13 @@ def _ampcor_apply_boundary_oracle(
     max_abs_residual: float,
     torch_module: object,
 ) -> tuple[object, object, object]:
-    """Recompute only boundary-near Torch patches with the NumPy oracle.
+    """Recompute only boundary-near patches with the Torch FFT reference.
 
     The ordinary Torch batch remains the fast path. A patch close to a cull
-    boundary is recomputed from the same materialized magnitude windows by
-    :func:`_patch_ncc_shift`; strict inclusive comparisons then decide its
-    membership and the oracle values feed the final medians.
+    boundary is recomputed from the same materialized magnitude windows on
+    the batch device with the reference FFT energy path. Strict inclusive
+    comparisons then decide its membership and the reference values feed the
+    final medians.
     """
     boundary = _ampcor_boundary_mask_torch(
         snr,
@@ -1391,24 +1431,24 @@ def _ampcor_apply_boundary_oracle(
     d_rg = d_rg.clone()
     d_az = d_az.clone()
     snr = snr.clone()
-    nan = float("nan")
-    for index in indices:
-        result = _patch_ncc_shift(
-            ref_windows[index],
-            sec_searches[index],
-            search_az=search_az,
-            search_rg=search_rg,
-            subpixel=subpixel,
-        )
-        if result is None:
-            d_rg[index] = nan
-            d_az[index] = nan
-            snr[index] = nan
-        else:
-            range_shift, azimuth_shift, score = result
-            d_rg[index] = range_shift
-            d_az[index] = azimuth_shift
-            snr[index] = score
+    selected_refs = torch_module.from_numpy(
+        np.stack([ref_windows[index] for index in indices])
+    ).to(device=d_rg.device)
+    selected_secs = torch_module.from_numpy(
+        np.stack([sec_searches[index] for index in indices])
+    ).to(device=d_rg.device)
+    oracle_rg, oracle_az, oracle_snr = _torch_patch_ncc_batch(
+        selected_refs,
+        selected_secs,
+        search_az=search_az,
+        search_rg=search_rg,
+        subpixel=subpixel,
+        force_fft_energy=True,
+    )
+    for position, index in enumerate(indices):
+        d_rg[index] = oracle_rg[position]
+        d_az[index] = oracle_az[position]
+        snr[index] = oracle_snr[position]
     return d_rg, d_az, snr
 
 
@@ -1659,7 +1699,7 @@ def estimate_patch_amplitude_shift(
     margin_rg: int = 1000,
     margin_az: int | None = None,
     subpixel: bool = True,
-    executor: Literal["numpy", "torch"] = "numpy",
+    executor: Literal["auto", "numpy", "torch"] = "numpy",
     batch_size: int = 32,
     device: Literal["auto", "cpu", "cuda"] = "auto",
     max_workspace_bytes: int = _TORCH_AMPCOR_WORKSPACE_CAP_BYTES,
@@ -1696,28 +1736,18 @@ def estimate_patch_amplitude_shift(
         Azimuth border; default is half the window height.
     subpixel : bool, optional
         Parabolic peak refinement (default True).
-    executor : {"numpy", "torch"}, optional
-        Correlation implementation. ``"numpy"`` (default) retains the scalar
-        reference loop. Explicit ``executor="torch", device="cpu"``
-        evaluates bounded eager CPU batches. ``device="auto"`` deliberately
-        resolves to the production NumPy/CPU policy, so it never silently
-        selects Torch. Explicit CUDA remains Torch. Torch
-        admission accepts only ``complex64`` and ``float32`` source arrays;
-        ``complex128`` and ``float64`` remain on the NumPy lane. Each bounded
-        tile is converted to ``complex64`` magnitude and then a contiguous
-        ``float32`` batch before
-        the Torch kernel promotes it to ``float64`` for correlation math.
-        Explicit Torch inputs must be owning, C-contiguous arrays; the NumPy
-        lane remains permissive about layout and casting.
+    executor : {"auto", "numpy", "torch"}, optional
+        Correlation implementation. ``"numpy"`` is a deprecated compatibility
+        spelling; ``"auto"`` and all other values route through bounded Torch
+        batches. Each bounded tile is converted to ``complex64`` magnitude and
+        then a contiguous ``float32`` batch before the Torch kernel promotes it
+        to ``float64`` for correlation math.
     batch_size : int, optional
         Number of patches materialized in one Torch batch. Default 32.
     device : {"auto", "cpu", "cuda"}, optional
-        Requested device. ``"auto"`` resolves to NumPy/CPU for either
-        executor, while explicit ``"cpu"`` selects the requested executor.
-        CUDA requires explicit availability and never silently falls back.
-        MPS is outside the qualified Ampcor contract and is rejected. With
-        ``executor="numpy"``, explicit CUDA values fail closed before input
-        tiling.
+        Requested device. ``"auto"`` selects the bounded Torch CPU lane.
+        Explicit CUDA requires availability and never silently falls back.
+        MPS is outside the qualified Ampcor contract and is rejected.
     max_workspace_bytes : int, optional
         Cooperative estimated limit for one Torch batch workspace lease. This
         is not a physical device-memory guarantee. Default 256 MiB.
