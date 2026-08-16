@@ -266,13 +266,13 @@ def test_torch_ampcor_even_median_stays_in_torch(
         (np.dtype(np.float32), 3.0, 3.0),
     ],
 )
-def test_torch_ampcor_allowed_dtypes_convert_to_float32_magnitude(
+def test_torch_ampcor_allowed_dtypes_convert_to_float64_magnitude(
     monkeypatch: pytest.MonkeyPatch,
     dtype: np.dtype,
     value: complex,
     expected_magnitude: float,
 ) -> None:
-    """Allowed Torch inputs become contiguous float32 magnitude batches."""
+    """Allowed Torch inputs become contiguous float64 magnitude batches."""
     torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets as offsets_mod
 
@@ -311,7 +311,7 @@ def test_torch_ampcor_allowed_dtypes_convert_to_float32_magnitude(
 
     assert result.n_valid == 1
     reference_batch = captured["reference"]
-    assert reference_batch.dtype == torch.float32
+    assert reference_batch.dtype == torch.float64
     assert reference_batch.is_contiguous()
     torch.testing.assert_close(
         reference_batch,
@@ -881,7 +881,7 @@ def test_ampcor_compatibility_casts_numeric_input_dtype(samples: np.ndarray) -> 
         "executor": "torch",
         "device": "cpu",
     }
-    if samples.dtype.kind == "O":
+    if samples.dtype.kind == "O" or samples.dtype == np.dtype(np.float16):
         with pytest.raises(InvalidProcessingStateError, match=r"dtype .* unsupported"):
             estimate_patch_amplitude_shift(samples, samples, **kwargs)
         return
@@ -889,43 +889,56 @@ def test_ampcor_compatibility_casts_numeric_input_dtype(samples: np.ndarray) -> 
     assert result.n_attempted == 1
 
 
-@pytest.mark.parametrize(
-    ("dtype", "value"),
-    [
-        (np.float64, np.finfo(np.float64).max),
-        (np.complex128, complex(np.finfo(np.float64).max, 1.0)),
-    ],
-)
-def test_torch_rejects_extreme_high_precision_inputs_after_safe_narrowing(
+def test_ampcor_complex128_magnitude_keeps_float64_precision(
     monkeypatch: pytest.MonkeyPatch,
-    dtype: type[np.generic],
-    value: complex,
 ) -> None:
-    """Torch rejects values that overflow compatibility narrowing."""
-    pytest.importorskip("torch")
+    """Torch preserves a complex128 magnitude below float32 resolution."""
+    torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets as offsets_mod
 
-    samples = np.full((64, 96), value, dtype=dtype)
+    tiny = 2.0**-25
+    samples = np.ones((64, 96), dtype=np.complex128)
+    samples[16, 12] = 1.0 + 1j * tiny
+    captured: dict[str, object] = {}
+
+    def fake_ncc(
+        ref_windows: object,
+        _sec_searches: object,
+        **_kwargs: object,
+    ) -> tuple[object, object, object]:
+        captured["reference"] = ref_windows.detach().cpu()
+        count = ref_windows.shape[0]
+        return (
+            torch.zeros(count, dtype=torch.float64),
+            torch.zeros(count, dtype=torch.float64),
+            torch.full((count,), 10.0, dtype=torch.float64),
+        )
+
     monkeypatch.setattr(
         offsets_mod,
-        "_ampcor_magnitude_tile",
-        lambda *_args, **_kwargs: pytest.fail("Torch dtype gate ran after tile work"),
+        "_torch_patch_ncc_batch",
+        fake_ncc,
     )
-    with pytest.raises(InvalidProcessingStateError, match="outside the Torch range"):
-        estimate_patch_amplitude_shift(
-            samples,
-            samples,
-            window_az=8,
-            window_rg=16,
-            search_az=2,
-            search_rg=2,
-            n_az=1,
-            n_rg=1,
-            margin_rg=16,
-            margin_az=8,
-            executor="torch",
-            device="cpu",
-        )
+    result = estimate_patch_amplitude_shift(
+        samples,
+        samples,
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=1,
+        margin_rg=20,
+        margin_az=20,
+        executor="torch",
+        device="cpu",
+    )
+    reference_batch = captured["reference"]
+    oracle = np.hypot(1.0, tiny)
+    assert result.n_valid == 1
+    assert reference_batch.dtype == torch.float64
+    assert float(reference_batch[0, 0, 0]) == pytest.approx(oracle, abs=0.0)
+    assert float(reference_batch[0, 0, 0]) > 1.0
 
 
 def test_ampcor_copies_negative_stride_inputs() -> None:

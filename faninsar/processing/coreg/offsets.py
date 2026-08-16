@@ -454,8 +454,8 @@ def _validate_ampcor_inputs(
     Ampcor materializes bounded tiles directly from the caller-owned arrays.
     Torch compatibility inputs are therefore checked for a bounded,
     non-overlapping layout and copied once when a safe contiguous copy is
-    required. Numeric real inputs are narrowed to ``float32`` and complex
-    inputs to ``complex64`` before tile materialization; object arrays and
+    required. Float32/64 and complex64/128 inputs retain their dtype, while
+    integer and boolean inputs are converted to float64; object arrays and
     malformed layouts fail closed.
 
     Parameters
@@ -506,11 +506,19 @@ def _validate_ampcor_inputs(
             message = f"Ampcor {name} has an overlapping or out-of-bounds layout"
             logger.error(message)
             reject_invalid_state(message)
-        target_dtype = (
-            np.dtype(np.complex64)
-            if samples.dtype.kind == "c"
-            else np.dtype(np.float32)
-        )
+        if samples.dtype in {
+            np.dtype(np.float32),
+            np.dtype(np.float64),
+            np.dtype(np.complex64),
+            np.dtype(np.complex128),
+        }:
+            target_dtype = samples.dtype
+        elif samples.dtype.kind in "biu":
+            target_dtype = np.dtype(np.float64)
+        else:
+            message = f"Ampcor {name} dtype {samples.dtype} is unsupported"
+            logger.error(message)
+            reject_invalid_state(message)
         candidates.append((name, samples, target_dtype))
 
     conversion_bytes = sum(
@@ -833,7 +841,7 @@ def _ampcor_magnitude_tile(
     *,
     cyclic_shift: tuple[int, int] = (0, 0),
 ) -> np.ndarray:
-    """Materialize one float32 magnitude tile from a complex input.
+    """Materialize one float64 magnitude tile from a complex input.
 
     Parameters
     ----------
@@ -849,7 +857,9 @@ def _ampcor_magnitude_tile(
     Returns
     -------
     numpy.ndarray
-        Float32 magnitude tile.
+        Float64 magnitude tile. Complex64 inputs are magnituded at their
+        native precision before promotion to float64; complex128 inputs retain
+        full float64 magnitude precision.
 
     """
     if cyclic_shift == (0, 0):
@@ -859,8 +869,8 @@ def _ampcor_magnitude_tile(
         rows = (np.arange(row_start, row_stop) - shift_az) % samples.shape[0]
         columns = (np.arange(column_start, column_stop) - shift_rg) % samples.shape[1]
         tile_source = samples[np.ix_(rows, columns)]
-    tile = np.asarray(tile_source, dtype=np.complex64)
-    return np.abs(tile).astype(np.float32, copy=False)
+    tile = np.asarray(tile_source)
+    return np.abs(tile).astype(np.float64, copy=False)
 
 
 def _ampcor_input_budget_bytes(
@@ -872,9 +882,10 @@ def _ampcor_input_budget_bytes(
 ) -> int:
     """Estimate retained sources plus bounded magnitude tile memory.
 
-    A materialized tile can transiently hold a complex64 conversion, a
-    float32 magnitude, and one float32 batch stack. Charging 16 bytes per
-    sample is conservative while avoiding a full-burst magnitude allocation.
+    A materialized tile can transiently hold a complex128 source conversion,
+    a float64 magnitude, and one float64 batch stack. Charging 32 bytes per
+    sample covers the highest-precision compatibility path while avoiding a
+    full-burst magnitude allocation.
 
     Parameters
     ----------
@@ -895,7 +906,7 @@ def _ampcor_input_budget_bytes(
     tile_bytes = (
         int(patch_elements)
         * int(batch_capacity)
-        * (np.dtype(np.complex64).itemsize + 2 * np.dtype(np.float32).itemsize)
+        * (np.dtype(np.complex128).itemsize + 2 * np.dtype(np.float64).itemsize)
     )
     return source_bytes + tile_bytes
 
@@ -1759,9 +1770,9 @@ def estimate_patch_amplitude_shift(
     executor : {"auto", "numpy", "torch"}, optional
         Correlation implementation. ``"numpy"`` is a deprecated compatibility
         spelling; ``"auto"`` and all other values route through bounded Torch
-        batches. Each bounded tile is converted to ``complex64`` magnitude and
-        then a contiguous ``float32`` batch before the Torch kernel promotes it
-        to ``float64`` for correlation math.
+        batches. Public float32/64 and complex64/128 input precision is
+        retained through magnitude materialization; tiles and Torch batches
+        are float64 for correlation math.
     batch_size : int, optional
         Number of patches materialized in one Torch batch. Default 32.
     device : {"auto", "cpu", "cuda"}, optional
