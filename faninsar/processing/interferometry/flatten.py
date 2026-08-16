@@ -300,13 +300,14 @@ def _estimate_residual_azimuth_ramp_numpy(
 def azimuth_ramp_device_kwargs(device: str) -> dict[str, str]:
     """Translate a Stack ``device=`` into azimuth-ramp executor options.
 
-    CPU and CUDA score with Torch after :func:`resolve_torch_device`. MPS
-    stays on the portable NumPy path used by the rest of flatten.
+    The Stack device is forwarded to the Torch executor. Unpublished
+    backends fail closed in :func:`resolve_torch_device`; they do not
+    silently select NumPy.
 
     Parameters
     ----------
     device : str
-        Stack device name (``auto``, ``cpu``, ``cuda``, or ``mps``).
+        Stack device string admitted by :func:`~faninsar._core.device.parse_device`.
 
     Returns
     -------
@@ -314,12 +315,8 @@ def azimuth_ramp_device_kwargs(device: str) -> dict[str, str]:
         Keyword arguments for :func:`estimate_residual_azimuth_ramp`.
 
     """
-    requested = str(device).strip().lower()
-    if requested == "mps":
-        return {"executor": "numpy"}
-    if requested in {"cpu", "cuda"}:
-        return {"executor": "torch", "device": requested}
-    return {"executor": "torch", "device": "auto"}
+    requested = str(device).strip()
+    return {"executor": "torch", "device": requested or "auto"}
 
 
 def _estimate_residual_azimuth_ramp_torch(
@@ -456,13 +453,8 @@ def estimate_residual_azimuth_ramp(
         If ``device="cuda"`` is requested and CUDA is unavailable.
 
     """
-    requested_device = str(device).strip().lower()
     if executor not in {"numpy", "torch"}:
         message = f"unsupported azimuth-ramp executor: {executor!r}"
-        logger.error(message)
-        raise ValueError(message)
-    if requested_device not in {"auto", "cpu", "cuda", "mps"}:
-        message = f"unsupported azimuth-ramp device: {device!r}"
         logger.error(message)
         raise ValueError(message)
     if int(candidate_chunk) < 1:
@@ -485,7 +477,7 @@ def estimate_residual_azimuth_ramp(
         residual,
         weights,
         candidates,
-        device=requested_device,
+        device=str(device),
         candidate_chunk=int(candidate_chunk),
     )
 

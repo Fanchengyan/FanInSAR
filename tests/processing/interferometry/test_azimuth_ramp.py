@@ -221,7 +221,7 @@ def test_torch_ramp_uses_shared_device_resolver(
 
 
 def test_azimuth_ramp_device_kwargs_forward_stack_device() -> None:
-    """A Stack device selects Torch on CPU/CUDA and NumPy on MPS."""
+    """A Stack device is forwarded to the Torch executor."""
     assert azimuth_ramp_device_kwargs("cuda") == {
         "executor": "torch",
         "device": "cuda",
@@ -234,7 +234,10 @@ def test_azimuth_ramp_device_kwargs_forward_stack_device() -> None:
         "executor": "torch",
         "device": "auto",
     }
-    assert azimuth_ramp_device_kwargs("mps") == {"executor": "numpy"}
+    assert azimuth_ramp_device_kwargs("mps") == {
+        "executor": "torch",
+        "device": "mps",
+    }
 
 
 def test_stage_flatten_forwards_device_into_ramp() -> None:
