@@ -45,6 +45,7 @@ from faninsar.processing.geometry import (
 from faninsar.processing.geometry.baseline import BaselineComponents
 from faninsar.processing.geometry.dem import GeoidAdjustedDEM, RasterDEM
 from faninsar.processing.interferometry.flatten import (
+    azimuth_ramp_device_kwargs,
     compute_geometric_phase_from_geo,
     compute_topographic_phase,
     estimate_residual_azimuth_ramp,
@@ -2581,6 +2582,7 @@ def stage_flatten(
                     flat,
                     topo,
                     coherence=state.coherence,
+                    **azimuth_ramp_device_kwargs(device),
                 )
                 if abs(az_ramp) > 1e-6:
                     flat = remove_azimuth_phase_ramp(flat, az_ramp)
@@ -2609,6 +2611,7 @@ def stage_flatten(
         state.complex_ifg,
         topo,
         coherence=state.coherence,
+        **azimuth_ramp_device_kwargs(device),
     )
     if abs(az_ramp) > 1e-6:
         state.complex_ifg = remove_azimuth_phase_ramp(state.complex_ifg, az_ramp)
