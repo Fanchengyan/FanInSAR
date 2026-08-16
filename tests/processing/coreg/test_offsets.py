@@ -1113,6 +1113,83 @@ def test_torch_ncc_tie_uses_first_flattened_peak() -> None:
     assert np.isnan(float(snr[0]))
 
 
+def test_torch_ncc_integral_energy_matches_direct_oracle() -> None:
+    """Torch NCC uses direct float64 rectangular local-energy sums."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    reference = torch.tensor(
+        [[[1.0, -2.0, 0.5], [3.0, 4.0, -1.5]]], dtype=torch.float32
+    )
+    secondary = torch.tensor(
+        [
+            [0.5, -1.0, 2.0, 1.5, -0.25],
+            [3.0, 0.25, -2.0, 4.0, 1.0],
+            [-1.5, 2.5, 0.0, -0.5, 3.5],
+            [2.0, -3.0, 1.25, 0.75, -2.5],
+        ],
+        dtype=torch.float32,
+    )[None]
+    search_az = 1
+    search_rg = 1
+    d_rg, d_az, snr = offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=search_az,
+        search_rg=search_rg,
+        subpixel=False,
+    )
+
+    ref = reference.to(dtype=torch.float64)
+    sec = secondary.to(dtype=torch.float64)
+    ref = ref - ref.mean(dim=(-2, -1), keepdim=True)
+    sec = sec - sec.mean(dim=(-2, -1), keepdim=True)
+    ref = ref / torch.linalg.vector_norm(ref, dim=(-2, -1), keepdim=True)
+    expected_ncc = torch.empty((3, 3), dtype=torch.float64)
+    for az in range(3):
+        for rg in range(3):
+            window = sec[0, az : az + 2, rg : rg + 3]
+            expected_ncc[az, rg] = (ref[0] * window).sum() / torch.sqrt(
+                (window * window).sum()
+            )
+    peak = torch.argmax(expected_ncc.reshape(-1))
+    peak_az, peak_rg = np.unravel_index(int(peak), expected_ncc.shape)
+    sidelobe = expected_ncc.clone()
+    sidelobe[
+        max(peak_az - 1, 0) : min(peak_az + 2, 3),
+        max(peak_rg - 1, 0) : min(peak_rg + 2, 3),
+    ] = torch.nan
+    expected_snr = expected_ncc[peak_az, peak_rg] / torch.nanmean(sidelobe.abs())
+
+    assert float(d_rg[0]) == peak_rg - search_rg
+    assert float(d_az[0]) == peak_az - search_az
+    assert float(snr[0]) == pytest.approx(float(expected_snr), abs=1e-12)
+
+
+def test_torch_ncc_keeps_only_correlation_fft(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Local energy does not invoke an additional Torch FFT pair."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    calls = 0
+    original_rfft2 = torch.fft.rfft2
+
+    def count_rfft2(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original_rfft2(*args, **kwargs)
+
+    monkeypatch.setattr(torch.fft, "rfft2", count_rfft2)
+    offsets_mod._torch_patch_ncc_batch(
+        torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),
+        torch.arange(20, dtype=torch.float32).reshape(1, 4, 5),
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+    )
+    assert calls == 2
+
+
 def test_ampcor_policy_canonicalizes_aliases_and_rejects_contradictions() -> None:
     """The shared resolver gives aliases one admission key and rejects misuse."""
     from faninsar.processing.coreg import resolve_ampcor_policy

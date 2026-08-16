@@ -1065,15 +1065,37 @@ def _torch_patch_ncc_batch(
         row_start : row_start + 2 * search_az + 1,
         col_start : col_start + 2 * search_rg + 1,
     ]
-    ones = torch.ones_like(ref)
-    f_ones = torch.fft.rfft2(torch.flip(ones, dims=(-2, -1)), s=(fft_height, fft_width))
-    f_sec_sq = torch.fft.rfft2(sec * sec, s=(fft_height, fft_width))
-    energy_full = torch.fft.irfft2(f_sec_sq * f_ones, s=(fft_height, fft_width))
-    energy = energy_full[
+    # Each valid lag selects one rectangular window from ``sec``.  A padded
+    # float64 integral image gives all of those local energies directly and
+    # avoids the redundant FFT pair used for this purely real sum.
+    sec_sq = sec * sec
+    row_cumulative = torch.cumsum(sec_sq, dim=-1)
+    leading_column = torch.zeros(
+        (count, search_height, 1), dtype=torch.float64, device=sec.device
+    )
+    row_cumulative = torch.cat((leading_column, row_cumulative), dim=-1)
+    integral = torch.cumsum(row_cumulative, dim=-2)
+    leading_row = torch.zeros(
+        (count, 1, search_width + 1), dtype=torch.float64, device=sec.device
+    )
+    integral = torch.cat((leading_row, integral), dim=-2)
+    bottom_right = integral[
         :,
-        row_start : row_start + 2 * search_az + 1,
-        col_start : col_start + 2 * search_rg + 1,
+        window_az : window_az + 2 * search_az + 1,
+        window_rg : window_rg + 2 * search_rg + 1,
     ]
+    top_right = integral[
+        :,
+        : 2 * search_az + 1,
+        window_rg : window_rg + 2 * search_rg + 1,
+    ]
+    bottom_left = integral[
+        :,
+        window_az : window_az + 2 * search_az + 1,
+        : 2 * search_rg + 1,
+    ]
+    top_left = integral[:, : 2 * search_az + 1, : 2 * search_rg + 1]
+    energy = bottom_right - top_right - bottom_left + top_left
     ncc = corr / torch.sqrt(torch.clamp(energy, min=1e-12))
     surface_width = 2 * search_rg + 1
     peak_flat = torch.argmax(ncc.reshape(count, -1), dim=1)
