@@ -1231,7 +1231,60 @@ def test_torch_ncc_risky_energy_uses_fft_fallback_for_whole_batch(
 
     # Compare against the same-device FFT-energy oracle explicitly.  This
     # also verifies that the batch-level decision does not mix energy paths.
-    monkeypatch.setattr(offsets_mod, "_torch_integral_energy_is_safe", lambda *_: False)
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_integral_energy_is_safe",
+        lambda *_: None,
+    )
+    expected = offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+    )
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_value, expected_value, equal_nan=True)
+
+
+def test_torch_ncc_integral_output_guard_handles_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tiny local energy remains stable when large values cancel nearby."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    reference = torch.tensor(
+        [[[1.0, -2.0, 0.5], [3.0, 4.0, -1.5]]], dtype=torch.float32
+    )
+    secondary = torch.full((1, 4, 5), 1.0e-3, dtype=torch.float32)
+    secondary[0, 0, 4] = 5.0e5
+    secondary[0, 3, 0] = -5.0e5
+
+    calls = 0
+    original_rfft2 = torch.fft.rfft2
+
+    def count_rfft2(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original_rfft2(*args, **kwargs)
+
+    monkeypatch.setattr(torch.fft, "rfft2", count_rfft2)
+    actual = offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+    )
+    assert calls == 4
+    assert all(torch.isfinite(value).all() for value in actual[:2])
+
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_integral_energy_is_safe",
+        lambda *_: None,
+    )
     expected = offsets_mod._torch_patch_ncc_batch(
         reference,
         secondary,

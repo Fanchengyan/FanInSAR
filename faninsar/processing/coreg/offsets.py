@@ -1033,12 +1033,13 @@ def _ampcor_boundary_quantum(boundary: float) -> float:
     return float(_AMPCOR_CULL_ULPS * spacing)
 
 
-def _torch_integral_energy_is_safe(sec: object, torch_module: object) -> bool:
+def _torch_integral_energy_is_safe(sec: object, torch_module: object) -> object | None:
     """Check whether float64 integral prefixes stay within numeric bounds.
 
     The check is performed independently for every bounded search chip. A
     failed or unavailable reduction deliberately selects the FFT fallback for
-    the complete batch.
+    the complete batch.  On success, the per-lane absolute error bound is
+    returned for validation of the resulting local-energy surface.
     """
     try:
         _, height, width = sec.shape
@@ -1058,9 +1059,9 @@ def _torch_integral_energy_is_safe(sec: object, torch_module: object) -> bool:
             & torch_module.isfinite(tile_error)
             & (tile_error <= tolerance)
         )
-        return bool(torch_module.all(safe).item())
+        return tile_error if bool(torch_module.all(safe).item()) else None
     except Exception:
-        return False
+        return None
 
 
 def _torch_local_energy_fft(
@@ -1183,7 +1184,8 @@ def _torch_patch_ncc_batch(
         row_start : row_start + 2 * search_az + 1,
         col_start : col_start + 2 * search_rg + 1,
     ]
-    if _torch_integral_energy_is_safe(sec, torch):
+    tile_error = _torch_integral_energy_is_safe(sec, torch)
+    if tile_error is not None:
         # Each valid lag selects one rectangular window from ``sec``.  A
         # padded float64 integral image gives all local energies directly.
         sec_sq = sec * sec
@@ -1214,6 +1216,28 @@ def _torch_patch_ncc_batch(
         ]
         top_left = integral[:, : 2 * search_az + 1, : 2 * search_rg + 1]
         energy = bottom_right - top_right - bottom_left + top_left
+        try:
+            lower_bound = torch.clamp(energy - tile_error[:, None, None], min=0.0)
+            output_safe = (
+                torch.isfinite(energy)
+                & (energy >= 0.0)
+                & (tile_error[:, None, None] <= 1e-10 + 1e-12 * lower_bound)
+            )
+            integral_safe = bool(torch.all(output_safe).item())
+        except Exception:
+            integral_safe = False
+        if not integral_safe:
+            energy = _torch_local_energy_fft(
+                sec,
+                ref,
+                fft_height=fft_height,
+                fft_width=fft_width,
+                window_az=window_az,
+                window_rg=window_rg,
+                search_az=search_az,
+                search_rg=search_rg,
+                torch_module=torch,
+            )
     else:
         # A failed or unavailable lane reduction is batch-fatal for the
         # integral path; use the previous same-device FFT energy for all lanes.
