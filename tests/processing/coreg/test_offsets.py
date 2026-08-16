@@ -377,6 +377,36 @@ def test_ampcor_copies_safe_noncontiguous_torch_view() -> None:
     assert result.n_attempted == 1
 
 
+def test_ampcor_conversion_preflight_rejects_before_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized compatibility copies fail before ``np.array`` allocation."""
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    samples = np.ones((16, 32), dtype=np.complex64)[:, ::2]
+    monkeypatch.setattr(offsets_mod, "_TORCH_AMPCOR_CONVERSION_CAP_BYTES", 1)
+    monkeypatch.setattr(
+        offsets_mod.np,
+        "array",
+        lambda *_args, **_kwargs: pytest.fail("conversion preflight allocated"),
+    )
+    with pytest.raises(InvalidProcessingStateError, match="conversion"):
+        estimate_patch_amplitude_shift(
+            samples,
+            samples,
+            executor="torch",
+            device="cpu",
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=1,
+            margin_rg=16,
+            margin_az=8,
+        )
+
+
 def test_estimate_patch_amplitude_shift_rejects_invalid_torch_batch() -> None:
     """Torch Ampcor rejects non-positive batch sizes before execution."""
     with pytest.raises(InvalidProcessingStateError, match="batch_size"):

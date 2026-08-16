@@ -30,6 +30,8 @@ _TORCH_AMPCOR_WORKSPACE_CAP_BYTES = 256 * 1024**2
 _TORCH_AMPCOR_MAX_PATCHES = 4096
 _TORCH_AMPCOR_MAX_INPUT_DIM = 32768
 _TORCH_AMPCOR_MAX_INPUT_BYTES = 512 * 1024**2
+# Independent cap for compatibility copies, charged before any allocation.
+_TORCH_AMPCOR_CONVERSION_CAP_BYTES = _TORCH_AMPCOR_MAX_INPUT_BYTES
 _TORCH_AMPCOR_MAX_PATCH_DIM = 4096
 _TORCH_AMPCOR_RESERVED_BYTES: dict[str, int] = {}
 _TORCH_AMPCOR_QUALIFIED_TORCH = "2.8.0"
@@ -486,7 +488,7 @@ def _validate_ampcor_inputs(
     if not torch_contract:
         return reference, secondary
 
-    normalized: list[np.ndarray] = []
+    candidates: list[tuple[str, np.ndarray, np.dtype]] = []
     for name, samples in (("reference", reference), ("secondary", secondary)):
         if samples.dtype.kind not in "biufc":
             message = f"Ampcor {name} dtype {samples.dtype} is unsupported"
@@ -505,6 +507,27 @@ def _validate_ampcor_inputs(
             if samples.dtype.kind == "c"
             else np.dtype(np.float32)
         )
+        candidates.append((name, samples, target_dtype))
+
+    conversion_bytes = sum(
+        int(samples.size) * target_dtype.itemsize
+        for _name, samples, target_dtype in candidates
+        if not (
+            samples.flags.c_contiguous
+            and samples.flags.owndata
+            and samples.dtype == target_dtype
+        )
+    )
+    if conversion_bytes > _TORCH_AMPCOR_CONVERSION_CAP_BYTES:
+        message = (
+            "Ampcor compatibility conversion exceeds the admitted memory limit "
+            f"({_TORCH_AMPCOR_CONVERSION_CAP_BYTES} bytes)"
+        )
+        logger.error(message)
+        reject_invalid_state(message)
+
+    normalized: list[np.ndarray] = []
+    for name, samples, target_dtype in candidates:
         if (
             samples.flags.c_contiguous
             and samples.flags.owndata
@@ -1180,16 +1203,14 @@ def _torch_ampcor_workspace_bytes(
         + energy_ncc_bytes
     )
 
-    # The guarded fallback can retain the correlation input plus the legacy
-    # FFT-energy packet.  Admission must cover either energy implementation.
-    fft_energy_bytes = (
+    # The boundary reference reruns the complete existing device batch with
+    # FFT energy while the original batch inputs/outputs remain live. Admission
+    # must cover the sequential integral packet and this full FFT packet.
+    fft_reference_energy_bytes = (
         sec_sq_bytes + 3 * spectrum_bytes + fft_real_bytes + surface_bytes
     )
-    per_batch_bytes = (
-        input_bytes
-        + correlation_fft_bytes
-        + max(integral_energy_bytes, fft_energy_bytes)
-    )
+    energy_packet_bytes = max(integral_energy_bytes, fft_reference_energy_bytes)
+    per_batch_bytes = input_bytes + correlation_fft_bytes + energy_packet_bytes
     return 2 * batch_size * per_batch_bytes
 
 
@@ -1396,8 +1417,8 @@ def _torch_cpu_median(chunks: list[object], torch_module: object) -> float:
 
 
 def _ampcor_apply_boundary_oracle(
-    ref_windows: list[np.ndarray],
-    sec_searches: list[np.ndarray],
+    ref_tensor: object,
+    sec_tensor: object,
     d_rg: object,
     d_az: object,
     snr: object,
@@ -1425,30 +1446,22 @@ def _ampcor_apply_boundary_oracle(
         max_abs_residual=max_abs_residual,
         torch_module=torch_module,
     )
-    indices = torch_module.nonzero(boundary, as_tuple=False).flatten().tolist()
-    if not indices:
+    if not bool(torch_module.any(boundary).item()):
         return d_rg, d_az, snr
     d_rg = d_rg.clone()
     d_az = d_az.clone()
     snr = snr.clone()
-    selected_refs = torch_module.from_numpy(
-        np.stack([ref_windows[index] for index in indices])
-    ).to(device=d_rg.device)
-    selected_secs = torch_module.from_numpy(
-        np.stack([sec_searches[index] for index in indices])
-    ).to(device=d_rg.device)
     oracle_rg, oracle_az, oracle_snr = _torch_patch_ncc_batch(
-        selected_refs,
-        selected_secs,
+        ref_tensor,
+        sec_tensor,
         search_az=search_az,
         search_rg=search_rg,
         subpixel=subpixel,
         force_fft_energy=True,
     )
-    for position, index in enumerate(indices):
-        d_rg[index] = oracle_rg[position]
-        d_az[index] = oracle_az[position]
-        snr[index] = oracle_snr[position]
+    d_rg[boundary] = oracle_rg[boundary]
+    d_az[boundary] = oracle_az[boundary]
+    snr[boundary] = oracle_snr[boundary]
     return d_rg, d_az, snr
 
 
@@ -1586,8 +1599,8 @@ def _estimate_patch_amplitude_shift_torch(
                     subpixel=subpixel,
                 )
                 d_rg, d_az, snr = _ampcor_apply_boundary_oracle(
-                    ref_windows,
-                    sec_searches,
+                    ref_tensor,
+                    sec_tensor,
                     d_rg,
                     d_az,
                     snr,
