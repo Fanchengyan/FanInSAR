@@ -77,6 +77,7 @@ def test_schedule_builders_are_internal_only() -> None:
 @pytest.mark.parametrize("value", [True, float("inf"), float("nan"), "1"])
 def test_malformed_gpu_resource_is_rejected(value: object) -> None:
     """Non-finite, boolean, and non-numeric GPU resources fail closed."""
+
     class MalformedClient:
         def scheduler_info(self) -> dict[str, object]:
             return {"workers": {"worker-0": {"resources": {"gpu": value}}}}
@@ -126,6 +127,7 @@ def test_gpu_annotation_depends_only_on_cluster_resources() -> None:
 
 def test_cuda_worker_binding_requires_one_visible_device() -> None:
     """GPU resource labels require an explicit one-device worker binding."""
+
     class BoundClient(_FakeClient):
         def run(self, _function: Any) -> dict[str, str]:
             return {"worker-0": "0"}
@@ -136,6 +138,7 @@ def test_cuda_worker_binding_requires_one_visible_device() -> None:
 
     assert validate_cuda_worker_binding(BoundClient(gpu_workers=True)) is True
     assert validate_cuda_worker_binding(UnboundClient(gpu_workers=True)) is False
+
     class NoBindingClient:
         def scheduler_info(self) -> dict[str, object]:
             return {"workers": {"worker-0": {"resources": {"gpu": 1}}}}
@@ -145,6 +148,7 @@ def test_cuda_worker_binding_requires_one_visible_device() -> None:
 
 def test_cuda_worker_binding_rejects_capacity_above_one() -> None:
     """A worker capacity above one cannot prove one-process/one-device binding."""
+
     class CapacityClient(_FakeClient):
         def scheduler_info(self) -> dict[str, object]:
             return {"workers": {"worker-0": {"resources": {"gpu": 2}}}}
@@ -154,6 +158,7 @@ def test_cuda_worker_binding_rejects_capacity_above_one() -> None:
 
 def test_cuda_worker_binding_rejects_shared_physical_identity() -> None:
     """Two workers cannot claim the same physical CUDA device."""
+
     class SharedClient:
         def scheduler_info(self) -> dict[str, object]:
             return {
@@ -179,30 +184,35 @@ def test_explicit_cpu_never_uses_remote_gpu() -> None:
 
 
 def test_cuda_dispatch_uses_stage_qualification_registry() -> None:
-    """Only measured CUDA stages are promoted automatically."""
+    """CUDA admission keeps Torch for unqualified stages as well as qualified ones."""
     client = _FakeClient(gpu_workers=True)
     assert {
         "goldstein_filter",
         "esd_azimuth_shift",
     } == CUDA_PERFORMANCE_QUALIFIED
     assert should_accelerate("auto", client, kernel="goldstein_filter") is True
-    assert should_accelerate("auto", client, kernel="multilook_interferogram") is False
+    assert should_accelerate("auto", client, kernel="multilook_interferogram") is True
+    assert should_accelerate("auto", client, kernel="carrier_multiply") is True
+    assert should_accelerate("auto", client, kernel="remove_topographic_phase") is True
 
 
 def test_local_cuda_dispatch_uses_stage_qualification_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A local CUDA host also keeps non-qualified stages on the CPU path."""
+    """A local CUDA host runs the Torch kernel even for unqualified stages."""
     import torch
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    assert should_accelerate("auto", None, kernel="multilook_interferogram") is False
+    assert should_accelerate("auto", None, kernel="multilook_interferogram") is True
     assert should_accelerate("auto", None, kernel="goldstein_filter") is True
+    assert should_accelerate("auto", None, kernel="carrier_multiply") is True
 
 
-def test_explicit_mps_uses_numpy_stage_fallback() -> None:
-    """MPS remains outside the Stack Torch acceleration contract."""
-    assert should_accelerate("mps", _FakeClient(gpu_workers=True)) is False
+@pytest.mark.parametrize("device", ["mps", "tpu", "npu"])
+def test_explicit_unpublished_backend_fails_closed(device: str) -> None:
+    """Unpublished backends fail closed instead of succeeding on host NumPy."""
+    with pytest.raises(RuntimeError, match="published"):
+        should_accelerate(device, _FakeClient(gpu_workers=True))
 
 
 def test_scheduled_carrier_forwards_explicit_device(
@@ -289,6 +299,42 @@ def test_gpu_worker_graph_forwards_fail_closed_cuda(
     graph.compute()
     assert observed_devices
     assert set(observed_devices) == {"cuda"}
+
+
+def test_gpu_worker_graph_preserves_cuda_ordinal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ``cuda:N`` is forwarded unchanged when CUDA-N parsing is incomplete."""
+    import faninsar.processing.torch_kernels as kernels
+
+    observed_devices: list[str] = []
+
+    def phase_wrapper(
+        _model: object,
+        rows: np.ndarray,
+        columns: np.ndarray,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        observed_devices.append(kwargs["device"])
+        return np.zeros(np.broadcast_shapes(rows.shape, columns.shape))
+
+    def multiply_wrapper(samples: np.ndarray, *_args: Any, **kwargs: Any) -> np.ndarray:
+        observed_devices.append(kwargs["device"])
+        return np.asarray(samples)
+
+    monkeypatch.setattr(kernels, "carrier_phase_at_points_torch", phase_wrapper)
+    monkeypatch.setattr(kernels, "carrier_multiply_torch", multiply_wrapper)
+    graph = _schedule_carrier_multiply(
+        _random_slc((8, 12), seed=86),
+        _carrier_model(),
+        sign=-1.0,
+        device="cuda:1",
+        chunk_rows=4,
+        client=_FakeClient(gpu_workers=True),
+    )
+    graph.compute()
+    assert observed_devices
+    assert set(observed_devices) == {"cuda:1"}
 
 
 def test_gpu_less_client_falls_back_without_building_graph(
@@ -433,34 +479,40 @@ def test_esd_is_submitted_as_one_gpu_task(monkeypatch: pytest.MonkeyPatch) -> No
     assert submitted_kwargs["resources"] == {"gpu": 1}
 
 
-def test_mps_esd_uses_numpy_reference(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An explicit MPS request does not enter the Torch FFT kernel."""
+def test_unpublished_esd_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit MPS request must not succeed on the NumPy ESD path."""
     from faninsar.processing.coreg import esd
-    from faninsar.processing.coreg.esd import ESDResult
 
-    expected = ESDResult(azimuth_shift_px=0.25, coherence=0.9, phase_rad=0.1)
-    monkeypatch.setattr(esd, "estimate_azimuth_shift_esd", lambda *_args: expected)
-    result = run_esd_azimuth_shift(
-        _random_slc((16, 16), seed=84),
-        _random_slc((16, 16), seed=85),
-        device="mps",
-        client=_FakeClient(gpu_workers=True),
-    )
-    assert result is expected
+    def reject_numpy(*_args: object) -> None:
+        message = "unpublished device used NumPy ESD"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(esd, "estimate_azimuth_shift_esd", reject_numpy)
+    with pytest.raises(RuntimeError, match="published"):
+        run_esd_azimuth_shift(
+            _random_slc((16, 16), seed=84),
+            _random_slc((16, 16), seed=85),
+            device="mps",
+            client=_FakeClient(gpu_workers=True),
+        )
 
 
 def test_geo_carrier_unqualified_stage_stays_local(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Arbitrary-coordinate reramp does not bypass CUDA qualification."""
+    """Unqualified reramp stays on the admitted device instead of hopping to CPU."""
     from faninsar.backends import dask_gpu
 
     sentinel = np.ones((4, 5), dtype=np.complex64)
-    monkeypatch.setattr(
-        dask_gpu,
-        "_carrier_multiply_at_points",
-        lambda *_args, **_kwargs: sentinel,
-    )
+    observed: dict[str, str] = {}
+
+    def capture(*_args: object, **kwargs: object) -> np.ndarray:
+        device = kwargs.get("device")
+        if isinstance(device, str):
+            observed["device"] = device
+        return sentinel
+
+    monkeypatch.setattr(dask_gpu, "_carrier_multiply_at_points", capture)
     client = _FakeClient(gpu_workers=True)
     result = run_carrier_multiply_at_points(
         sentinel,
@@ -474,6 +526,7 @@ def test_geo_carrier_unqualified_stage_stays_local(
     )
     np.testing.assert_array_equal(result, sentinel)
     assert not hasattr(client, "submitted")
+    assert observed["device"] == "auto"
 
 
 def test_invalid_chunk_rows_are_rejected() -> None:

@@ -43,11 +43,13 @@ __all__ = [
     "validate_cuda_worker_binding",
 ]
 
-# CryoGPU HK qualification: only these stages meet the 1.5x CUDA speed gate.
-# Other stages retain their NumPy/CPU path for automatic production dispatch.
+# CryoGPU HK qualification: these stages met the 1.5x CUDA speed gate.
+# After CUDA admission the set may only log or choose among same-device
+# identities. It must not hop deramp/multilook/flatten back to host NumPy.
 CUDA_PERFORMANCE_QUALIFIED: frozenset[str] = frozenset(
     {"goldstein_filter", "esd_azimuth_shift"}
 )
+_PUBLISHED_BACKENDS: frozenset[str] = frozenset({"auto", "cpu", "cuda", "gpu"})
 
 
 def has_gpu_workers(client: Any | None) -> bool:
@@ -159,6 +161,38 @@ def validate_cuda_worker_binding(client: Any | None) -> bool:
     return True
 
 
+def _device_backend(device: str) -> str:
+    """Return the backend token without stripping a ``cuda:N`` ordinal."""
+    return device.strip().lower().split(":", 1)[0]
+
+
+def _reject_unpublished_device(device: str) -> None:
+    """Fail closed for backends that are not published production devices."""
+    backend = _device_backend(device)
+    if backend in _PUBLISHED_BACKENDS:
+        return
+    message = (
+        f"device {device!r} is not a published production backend; "
+        "refusing host NumPy fallback"
+    )
+    logger.error(message)
+    raise RuntimeError(message)
+
+
+def _cuda_is_admitted(device: str, client: Any | None) -> bool:
+    """Return whether CUDA is the requested or auto-resolved published device."""
+    backend = _device_backend(device)
+    if backend == "cpu":
+        return False
+    if has_gpu_workers(client) or backend == "cuda":
+        return True
+    if backend in {"auto", "gpu"}:
+        from faninsar._core.device import parse_device
+
+        return parse_device(device).type == "cuda"
+    return False
+
+
 def _allow_remote_kernel(
     device: str,
     client: Any | None,
@@ -177,13 +211,17 @@ def _local_device_after_remote_rejection(
     client: Any | None,
     kernel: str,
 ) -> str:
-    """Keep unqualified GPU-client calls on the CPU reference device."""
+    """Keep local execution on the admitted device; do not hop to host NumPy."""
     if (
         client is not None
         and has_gpu_workers(client)
         and kernel not in CUDA_PERFORMANCE_QUALIFIED
     ):
-        return "cpu"
+        logger.info(
+            "%s is not CUDA-performance-qualified; running the Torch kernel "
+            "on the admitted device",
+            kernel,
+        )
     return device
 
 
@@ -214,39 +252,31 @@ def should_accelerate(
     client: Any | None = None,
     kernel: str | None = None,
 ) -> bool:
-    """Return whether a stage should use its unified Torch kernel."""
-    if device.lower() == "mps":
-        logger.warning(
-            "MPS acceleration is outside the Stack Torch contract; using the "
-            "NumPy CPU reference path"
-        )
-        return False
-    from faninsar.processing.torch_kernels import resolve_torch_device
+    """Return whether a stage should use its unified Torch kernel.
 
-    resolved = resolve_torch_device(device)
-    if kernel is not None and kernel not in CUDA_PERFORMANCE_QUALIFIED and (
-        has_gpu_workers(client) or resolved.type == "cuda"
+    Published CPU and CUDA devices (including ``auto`` that resolves to
+    either) keep the NumPy-in/NumPy-out Torch path. ``CUDA_PERFORMANCE_QUALIFIED``
+    may only log or choose among same-device identities after CUDA admission.
+    Explicit unpublished backends such as MPS, TPU, or NPU fail closed.
+    """
+    _reject_unpublished_device(device)
+    if (
+        kernel is not None
+        and kernel not in CUDA_PERFORMANCE_QUALIFIED
+        and _cuda_is_admitted(device, client)
     ):
         logger.info(
-            "%s is not CUDA-performance-qualified; retaining the CPU "
-            "reference path",
+            "%s is not CUDA-performance-qualified; keeping the admitted "
+            "CUDA Torch path",
             kernel,
         )
-        return False
-    if has_gpu_workers(client):
-        return True
     return True
 
 
 def should_use_cuda(device: str, client: Any | None = None) -> bool:
     """Return whether a CUDA-capable local or distributed path is available."""
-    if device.lower() in {"cpu", "mps"}:
-        return False
-    if has_gpu_workers(client):
-        return True
-    from faninsar.processing.torch_kernels import resolve_torch_device
-
-    return resolve_torch_device(device).type == "cuda"
+    _reject_unpublished_device(device)
+    return _cuda_is_admitted(device, client)
 
 
 def _annotate(use_gpu: bool) -> Any:
@@ -264,7 +294,12 @@ def _scheduled_device(device: str, client: Any | None) -> str:
         message = "GPU worker-to-CUDA binding preflight failed"
         logger.error(message)
         raise RuntimeError(message)
-    return "cuda" if use_gpu_resources(device, client) else device
+    if use_gpu_resources(device, client):
+        lowered = device.strip().lower()
+        if lowered.startswith("cuda:"):
+            return lowered
+        return "cuda"
+    return device
 
 
 def _validate_chunk_rows(chunk_rows: int) -> None:
@@ -376,9 +411,7 @@ def _schedule_carrier_multiply(
             dtype=np.float64,
             device=worker_device,
         )
-        return carrier_multiply_torch(
-            s_block, phase, sign=sign, device=worker_device
-        )
+        return carrier_multiply_torch(s_block, phase, sign=sign, device=worker_device)
 
     dask_array = _to_row_chunked(samples, chunk_rows)
     with _annotate(use_gpu_resources(device, client)):
@@ -411,9 +444,7 @@ def _schedule_remove_topographic_phase(
         topo_block: np.ndarray,
     ) -> np.ndarray:
         return np.asarray(
-            remove_topographic_phase_torch(
-                ifg_block, topo_block, device=worker_device
-            ),
+            remove_topographic_phase_torch(ifg_block, topo_block, device=worker_device),
             dtype=complex_ifg.dtype,
         )
 
@@ -660,6 +691,7 @@ def run_carrier_multiply(
     """Carrier-multiply via Dask scheduling, or eager Torch on the device."""
     from faninsar.processing.torch_kernels import tops_carrier_multiply_torch
 
+    _reject_unpublished_device(device)
     resolved_client = client
     if _allow_remote_kernel(device, resolved_client, "carrier_multiply"):
         graph = _schedule_carrier_multiply(
@@ -727,6 +759,7 @@ def run_carrier_multiply_at_points(
     client: Any | None = None,
 ) -> np.ndarray:
     """Apply a carrier locally or as one task on an explicit GPU client."""
+    _reject_unpublished_device(device)
     if _allow_remote_kernel(device, client, "carrier_multiply"):
         if not validate_cuda_worker_binding(client):
             message = "GPU worker-to-CUDA binding preflight failed"
@@ -770,6 +803,7 @@ def run_multilook_interferogram(
     from faninsar.processing.interferometry.pair import InterferogramProduct
     from faninsar.processing.torch_kernels import multilook_interferogram_torch
 
+    _reject_unpublished_device(device)
     resolved_client = client
     if _allow_remote_kernel(device, resolved_client, "multilook_interferogram"):
         graphs = _schedule_multilook_interferogram(
@@ -812,6 +846,7 @@ def run_goldstein_filter(
     """Apply the Goldstein filter via Dask, or eager Torch."""
     from faninsar.processing.torch_kernels import goldstein_filter_torch
 
+    _reject_unpublished_device(device)
     resolved_client = client
     if _allow_remote_kernel(device, resolved_client, "goldstein_filter"):
         graph = _schedule_goldstein_filter(
@@ -841,6 +876,7 @@ def run_remove_topographic_phase(
     client: Any | None = None,
 ) -> np.ndarray:
     """Flatten via Dask scheduling, or eager Torch."""
+    _reject_unpublished_device(device)
     resolved_client = client
     if _allow_remote_kernel(device, resolved_client, "remove_topographic_phase"):
         graph = _schedule_remove_topographic_phase(
@@ -873,6 +909,7 @@ def run_multilook_real(
     client: Any | None = None,
 ) -> np.ndarray:
     """Multilook a real field via Dask scheduling, or eager Torch."""
+    _reject_unpublished_device(device)
     resolved_client = client
     if _allow_remote_kernel(device, resolved_client, "multilook_real"):
         graph = _schedule_multilook_real(
@@ -908,14 +945,7 @@ def run_esd_azimuth_shift(
     """Estimate ESD locally or as one chunked task on a trusted client."""
     from faninsar.processing.torch_kernels import esd_azimuth_shift_torch
 
-    if device.lower() == "mps":
-        logger.warning(
-            "MPS ESD is outside the Stack Torch contract; using the NumPy CPU "
-            "reference path"
-        )
-        from faninsar.processing.coreg.esd import estimate_azimuth_shift_esd
-
-        return estimate_azimuth_shift_esd(reference, secondary)
+    _reject_unpublished_device(device)
     if client is not None and use_gpu_resources(device, client):
         if not validate_cuda_worker_binding(client):
             message = "GPU worker-to-CUDA binding preflight failed"
