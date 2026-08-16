@@ -167,15 +167,13 @@ def _dem_digest(dem: object | None) -> str:
     return _digest(_dem_payload(dem, set()))
 
 
-def _resolve_device(device: str | torch.device) -> torch.device:
-    """Resolve and validate an explicit Torch device."""
+def _resolve_device(device: str | torch.device | None) -> torch.device:
+    """Resolve a public device request through the shared parser."""
     import torch
 
-    resolved = torch.device(device)
-    if resolved.type == "cuda" and not torch.cuda.is_available():
-        message = "CUDA geometry adapter requested but CUDA is unavailable"
-        logger.error(message)
-        raise RuntimeError(message)
+    from faninsar._core.device import parse_device
+
+    resolved = parse_device(device)
     if resolved.type == "mps" and not torch.backends.mps.is_available():
         message = "MPS geometry adapter requested but MPS is unavailable"
         logger.error(message)

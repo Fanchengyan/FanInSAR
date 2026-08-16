@@ -15,10 +15,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from enum import StrEnum
 from numbers import Integral
-from typing import Literal, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, runtime_checkable
 
 import numpy as np
 
+from faninsar._core.device import parse_device
 from faninsar.logging import setup_logger
 from faninsar.processing.geometry.v2 import (
     CandidateKey as FoundationCandidateKey,
@@ -27,6 +28,11 @@ from faninsar.processing.geometry.v2 import (
     GeometryValidationError,
     TransformResultV2,
 )
+
+if TYPE_CHECKING:
+    import torch
+
+    from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
 
@@ -47,6 +53,25 @@ CandidateKeyProtocol: TypeAlias = FoundationCandidateKey
 # Short aliases preserve the dispatcher vocabulary while using the foundation
 # object as the sole concrete candidate-key contract.
 CandidateKey: TypeAlias = FoundationCandidateKey
+
+
+def resolve_geometry_device(device: DeviceLike | None = None) -> torch.device:
+    """Resolve a public geometry device request.
+
+    Parameters
+    ----------
+    device : str or torch.device or None, optional
+        The same request strings as :func:`~faninsar._core.device.parse_device`.
+        ``auto`` / ``gpu`` / omitted select the first published device.
+
+    Returns
+    -------
+    torch.device
+        The admitted device identity used to choose native, compile, or
+        eager on that same device.
+
+    """
+    return parse_device(device)
 
 
 @runtime_checkable
@@ -657,4 +682,5 @@ __all__ = [
     "classify_cuda_failure",
     "pin_native_module",
     "pinned_native_modules",
+    "resolve_geometry_device",
 ]
