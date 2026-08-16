@@ -26,6 +26,7 @@ from faninsar.processing.geometry.backend_dispatch import (
     CandidateKey,
     Dispatcher,
     DispatchError,
+    resolve_geometry_device,
 )
 from faninsar.processing.geometry.boundary import (
     BoundaryDecision,
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
     from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.geometry.native_v2.builder import PreparedNativeCandidate
     from faninsar.processing.geometry.transforms import RadarGeometryModel
+    from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
 
@@ -252,14 +254,17 @@ def _validate_native_context_inputs(
 
 
 def _device_key(
-    device: str, physical_uuid: str | None, mig_uuid: str | None = None
+    device: DeviceLike | None,
+    physical_uuid: str | None,
+    mig_uuid: str | None = None,
 ) -> DeviceKey:
-    """Build a foundation device identity from a Torch device string."""
-    if str(device).split(":", 1)[0] == "cuda":
+    """Build a foundation device identity from a public device request."""
+    resolved = resolve_geometry_device(device)
+    if resolved.type == "cuda":
         if not physical_uuid:
             raise DispatchError("CUDA geometry preparation requires a physical UUID")
         return DeviceKey.cuda(physical_uuid, mig_uuid=mig_uuid)
-    if str(device).split(":", 1)[0] != "cpu":
+    if resolved.type != "cpu":
         raise DispatchError(f"geometry v2 only supports CPU and CUDA, got {device!r}")
     return DeviceKey.cpu()
 
@@ -579,6 +584,7 @@ class PreparedGeometry:
     dtype: str
     native_key: CandidateKey | None = None
     compile_key: CandidateKey | None = None
+    profile: ExecutionProfile | None = None
 
     def execute(
         self,
@@ -609,7 +615,7 @@ class PreparedGeometry:
                     self.operation,
                     "compile",
                     self.eager,
-                    ExecutionProfile.cpu(),
+                    self.profile or ExecutionProfile.cpu(),
                 )
             )
         raise DispatchError(f"no exact prepared {selector} candidate")
@@ -620,7 +626,7 @@ def prepare_geometry(
     model: RadarGeometryModel,
     *,
     shape: Sequence[int],
-    device: str = "cpu",
+    device: DeviceLike | None = "cpu",
     dtype: str | None = None,
     dem: DEMSampler | None = None,
     settings: SolverSettings | None = None,
@@ -649,8 +655,9 @@ def prepare_geometry(
     if not normalized_shape or any(value <= 0 for value in normalized_shape):
         raise ValueError("shape must contain positive dimensions")
     solver = settings or SolverSettings()
+    resolved_device = resolve_geometry_device(device)
     profile = ExecutionProfile(
-        _device_key(device, physical_uuid, mig_uuid),
+        _device_key(resolved_device, physical_uuid, mig_uuid),
         thread_count=None,
     )
     eager = prepare_torch_geometry(
@@ -658,7 +665,7 @@ def prepare_geometry(
         model,
         shape=normalized_shape,
         dem=dem,
-        device=device,
+        device=resolved_device,
         dtype=dtype,
         max_iter=solver.max_iter,
         extra_iter=solver.extra_iter,
@@ -672,7 +679,7 @@ def prepare_geometry(
             model,
             shape=normalized_shape,
             dem=dem,
-            device=device,
+            device=resolved_device,
             dtype=dtype,
             max_iter=solver.max_iter,
             extra_iter=solver.extra_iter,
@@ -804,6 +811,7 @@ def prepare_geometry(
         eager.dtype,
         registered_native_key,
         compile_key,
+        profile,
     )
 
 

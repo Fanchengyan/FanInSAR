@@ -22,28 +22,14 @@ __all__ = ["lanczos_resample_torch"]
 
 
 def _resolve_torch_device(device: DeviceName) -> torch.device:
-    """Resolve an available Torch execution device."""
+    """Resolve an available Torch execution device via ``parse_device``."""
     try:
-        import torch
+        from faninsar._core.device import parse_device
     except ImportError as error:
         message = "Lanczos resampling requires torch; install FanInSAR dependencies"
         logger.exception(message)
         raise ImportError(message) from error
-
-    if device == "auto":
-        return torch.device("cpu")
-    resolved = torch.device(device)
-    if resolved.type == "cuda" and not torch.cuda.is_available():
-        message = "CUDA requested but torch.cuda is unavailable"
-        logger.error(message)
-        raise RuntimeError(message)
-    if resolved.type == "mps" and not (
-        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-    ):
-        message = "MPS requested but torch.backends.mps is unavailable"
-        logger.error(message)
-        raise RuntimeError(message)
-    return resolved
+    return parse_device(device)
 
 
 def _cleanup_device(device: torch.device) -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
@@ -254,6 +254,135 @@ def remove_topographic_phase(
     return ifg * np.exp(-1j * topo)
 
 
+def _azimuth_ramp_weights(
+    ifg: np.ndarray,
+    reference_phase: np.ndarray,
+    coherence: np.ndarray | None,
+    coh_thr: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build residual phase, weights, and validity mask for ramp scoring."""
+    phase = np.angle(ifg)
+    mask = np.isfinite(phase) & np.isfinite(reference_phase) & (np.abs(ifg) > 0)
+    if coherence is not None:
+        coherence_array = np.asarray(coherence)
+        mask = mask & np.isfinite(coherence_array) & (coherence_array >= coh_thr)
+        weights = np.where(mask, coherence_array.astype(np.float64, copy=False), 0.0)
+    else:
+        weights = mask.astype(np.float64)
+    residual = np.where(mask, phase - reference_phase, 0.0)
+    return residual, weights, mask
+
+
+def _score_azimuth_ramp_candidates(
+    row_sums: np.ndarray,
+    candidates: np.ndarray,
+) -> np.ndarray:
+    """Score candidate coefficients against azimuth-row circular sums."""
+    azimuth = np.arange(row_sums.shape[0], dtype=np.float64)
+    return np.abs(
+        (np.exp(-1j * candidates[:, None] * azimuth[None, :]) * row_sums[None, :]).sum(
+            axis=1
+        )
+    )
+
+
+def _estimate_residual_azimuth_ramp_numpy(
+    residual: np.ndarray,
+    weights: np.ndarray,
+    candidates: np.ndarray,
+) -> float:
+    """Vectorized NumPy scorer using one azimuth-row reduction."""
+    row_sums = np.sum(weights * np.exp(1j * residual), axis=1)
+    scores = _score_azimuth_ramp_candidates(row_sums, candidates)
+    return float(candidates[int(np.argmax(scores))])
+
+
+def azimuth_ramp_device_kwargs(device: str) -> dict[str, str]:
+    """Translate a Stack ``device=`` into azimuth-ramp executor options.
+
+    CPU and CUDA score with Torch after :func:`resolve_torch_device`. MPS
+    stays on the portable NumPy path used by the rest of flatten.
+
+    Parameters
+    ----------
+    device : str
+        Stack device name (``auto``, ``cpu``, ``cuda``, or ``mps``).
+
+    Returns
+    -------
+    dict of str
+        Keyword arguments for :func:`estimate_residual_azimuth_ramp`.
+
+    """
+    requested = str(device).strip().lower()
+    if requested == "mps":
+        return {"executor": "numpy"}
+    if requested in {"cpu", "cuda"}:
+        return {"executor": "torch", "device": requested}
+    return {"executor": "torch", "device": "auto"}
+
+
+def _estimate_residual_azimuth_ramp_torch(
+    residual: np.ndarray,
+    weights: np.ndarray,
+    candidates: np.ndarray,
+    *,
+    device: str,
+    candidate_chunk: int,
+) -> float:
+    """Eager Torch CPU/CUDA scorer using the same row-reduction contract.
+
+    Parameters
+    ----------
+    residual : numpy.ndarray
+        Masked residual phase in radians.
+    weights : numpy.ndarray
+        Finite pixel weights; invalid pixels are already zero.
+    candidates : numpy.ndarray
+        Ordered candidate coefficients.
+    device : {"auto", "cpu", "cuda", "mps"}
+        Torch execution device resolved by :func:`resolve_torch_device`.
+    candidate_chunk : int
+        Number of candidates scored in one workspace.
+
+    Returns
+    -------
+    float
+        Selected ramp coefficient.
+
+    """
+    import torch
+
+    from faninsar.processing.torch_kernels import resolve_torch_device
+
+    resolved = resolve_torch_device(device)
+    residual_tensor = torch.as_tensor(residual, dtype=torch.float64, device=resolved)
+    weights_tensor = torch.as_tensor(weights, dtype=torch.float64, device=resolved)
+    row_sums = torch.sum(
+        weights_tensor * torch.exp(1j * residual_tensor),
+        dim=1,
+        dtype=torch.complex128,
+    )
+    azimuth = torch.arange(row_sums.shape[0], dtype=torch.float64, device=resolved)
+    candidate_tensor = torch.as_tensor(candidates, dtype=torch.float64, device=resolved)
+    best_score = torch.tensor(-1.0, dtype=torch.float64, device=resolved)
+    best_index = torch.tensor(0, dtype=torch.int64, device=resolved)
+    for start in range(0, int(candidate_tensor.shape[0]), candidate_chunk):
+        chunk = candidate_tensor[start : start + candidate_chunk]
+        scores = torch.abs(
+            (
+                row_sums[None, :] * torch.exp(-1j * chunk[:, None] * azimuth[None, :])
+            ).sum(dim=1, dtype=torch.complex128)
+        )
+        chunk_score, chunk_index = torch.max(scores, dim=0)
+        if bool((chunk_score > best_score).item()):
+            best_score = chunk_score
+            best_index = start + chunk_index
+    if resolved.type == "cuda":
+        torch.cuda.synchronize()
+    return float(candidates[int(best_index.item())])
+
+
 def estimate_residual_azimuth_ramp(
     complex_ifg: np.ndarray,
     reference_phase: np.ndarray,
@@ -262,6 +391,9 @@ def estimate_residual_azimuth_ramp(
     coh_thr: float = 0.2,
     search: tuple[float, float] = (-0.5, 0.5),
     n_grid: int = 201,
+    executor: Literal["numpy", "torch"] = "numpy",
+    device: Literal["auto", "cpu", "cuda", "mps"] = "auto",
+    candidate_chunk: int = 41,
 ) -> float:
     r"""Estimate residual linear azimuth phase ramp (rad per azimuth sample).
 
@@ -278,6 +410,12 @@ def estimate_residual_azimuth_ramp(
         e^{i\\bigl(\\phi_{\\mathrm{ifg}}(p)
         - \\phi_{\\mathrm{ref}}(p) - c\\, i_{az}\\bigr)} \\right|
 
+    Both executors reduce candidate-independent terms to one complex sum per
+    azimuth row, then score the ordered candidate grid. The first (lowest-index)
+    candidate wins an exact score tie. The default path is portable NumPy
+    in/out. ``executor="torch"`` scores on the device admitted by
+    :func:`resolve_torch_device` (CPU or CUDA).
+
     Parameters
     ----------
     complex_ifg : numpy.ndarray
@@ -293,41 +431,63 @@ def estimate_residual_azimuth_ramp(
         Inclusive range of ``c`` to search (rad / azimuth sample).
     n_grid : int, optional
         Number of grid points in the search. Default 201.
+    executor : {"numpy", "torch"}, optional
+        Scoring backend. ``"numpy"`` (default) is the portable CPU path.
+        ``"torch"`` runs the same algorithm on the admitted device.
+    device : {"auto", "cpu", "cuda", "mps"}, optional
+        Device for the Torch executor, resolved by
+        :func:`resolve_torch_device`. ``"auto"`` selects CUDA when available
+        and CPU otherwise. Ignored by NumPy.
+    candidate_chunk : int, optional
+        Number of candidates scored together by the Torch executor. Default 41.
 
     Returns
     -------
     float
         Estimated ramp coefficient ``c`` in rad per azimuth sample.
 
+    Raises
+    ------
+    ValueError
+        If the inputs have mismatched shapes or the executor/device is invalid.
+    ImportError
+        If ``executor="torch"`` is requested and Torch is not installed.
+    RuntimeError
+        If ``device="cuda"`` is requested and CUDA is unavailable.
+
     """
+    requested_device = str(device).strip().lower()
+    if executor not in {"numpy", "torch"}:
+        message = f"unsupported azimuth-ramp executor: {executor!r}"
+        logger.error(message)
+        raise ValueError(message)
+    if requested_device not in {"auto", "cpu", "cuda", "mps"}:
+        message = f"unsupported azimuth-ramp device: {device!r}"
+        logger.error(message)
+        raise ValueError(message)
+    if int(candidate_chunk) < 1:
+        message = "candidate_chunk must be a positive integer"
+        logger.error(message)
+        raise ValueError(message)
     ifg = np.asarray(complex_ifg)
     ref = np.asarray(reference_phase, dtype=np.float64)
     if ifg.shape != ref.shape:
         message = f"reference_phase shape {ref.shape} must match ifg shape {ifg.shape}"
         logger.error(message)
         raise ValueError(message)
-    ph = np.angle(ifg)
-    mask = np.isfinite(ph) & np.isfinite(ref) & (np.abs(ifg) > 0)
-    if coherence is not None:
-        coh = np.asarray(coherence)
-        mask = mask & np.isfinite(coh) & (coh >= coh_thr)
-        weights = np.where(mask, coh, 0.0)
-    else:
-        weights = mask.astype(np.float64)
+    residual, weights, mask = _azimuth_ramp_weights(ifg, ref, coherence, coh_thr)
     if not np.any(mask):
         return 0.0
-
-    height = ph.shape[0]
-    az = np.arange(height, dtype=np.float64)[:, None]
-    residual = ph - ref
-    best_c = 0.0
-    best_score = -1.0
-    for c in np.linspace(search[0], search[1], int(n_grid)):
-        score = float(np.abs(np.nansum(weights * np.exp(1j * (residual - c * az)))))
-        if score > best_score:
-            best_score = score
-            best_c = float(c)
-    return best_c
+    candidates = np.linspace(search[0], search[1], int(n_grid), dtype=np.float64)
+    if executor == "numpy":
+        return _estimate_residual_azimuth_ramp_numpy(residual, weights, candidates)
+    return _estimate_residual_azimuth_ramp_torch(
+        residual,
+        weights,
+        candidates,
+        device=requested_device,
+        candidate_chunk=int(candidate_chunk),
+    )
 
 
 def remove_azimuth_phase_ramp(
@@ -982,29 +1142,21 @@ def estimate_tiled_residual_height_screen(
             if pr > 0 and cr0 > 0:
                 t = np.linspace(0.0, 1.0, cr0, endpoint=False)
                 ramp = 0.5 - 0.5 * np.cos(np.pi * t)
-                wt[:cr0, cc0:cc1] = np.maximum(
-                    wt[:cr0, cc0:cc1], ramp[:, None]
-                )
+                wt[:cr0, cc0:cc1] = np.maximum(wt[:cr0, cc0:cc1], ramp[:, None])
             if pr > 0 and cr1 < th:
                 n = th - cr1
                 t = np.linspace(0.0, 1.0, n, endpoint=False)
                 ramp = 0.5 - 0.5 * np.cos(np.pi * t)
-                wt[cr1:, cc0:cc1] = np.maximum(
-                    wt[cr1:, cc0:cc1], ramp[::-1, None]
-                )
+                wt[cr1:, cc0:cc1] = np.maximum(wt[cr1:, cc0:cc1], ramp[::-1, None])
             if pc > 0 and cc0 > 0:
                 t = np.linspace(0.0, 1.0, cc0, endpoint=False)
                 ramp = 0.5 - 0.5 * np.cos(np.pi * t)
-                wt[cr0:cr1, :cc0] = np.maximum(
-                    wt[cr0:cr1, :cc0], ramp[None, :]
-                )
+                wt[cr0:cr1, :cc0] = np.maximum(wt[cr0:cr1, :cc0], ramp[None, :])
             if pc > 0 and cc1 < tw:
                 n = tw - cc1
                 t = np.linspace(0.0, 1.0, n, endpoint=False)
                 ramp = 0.5 - 0.5 * np.cos(np.pi * t)
-                wt[cr0:cr1, cc1:] = np.maximum(
-                    wt[cr0:cr1, cc1:], ramp[None, ::-1]
-                )
+                wt[cr0:cr1, cc1:] = np.maximum(wt[cr0:cr1, cc1:], ramp[None, ::-1])
             finite_h = np.isfinite(hgt[r0e:r1e, c0e:c1e])
             wt = np.where(finite_h, wt, 0.0)
             screen_acc[r0e:r1e, c0e:c1e] += tile_screen * wt
