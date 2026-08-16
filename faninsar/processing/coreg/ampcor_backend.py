@@ -23,6 +23,32 @@ logger = setup_logger(__name__)
 
 AmpcorBackend = Literal["eager", "compile", "native"]
 EnergyExecutor = Callable[[object], object]
+_NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
+
+
+def canonical_torch_device(device: str) -> str:
+    """Return a concrete device identity, including the CUDA ordinal."""
+    import torch
+
+    resolved = torch.device(device)
+    if resolved.type == "cuda":
+        index = resolved.index
+        if index is None:
+            index = int(torch.cuda.current_device()) if torch.cuda.is_available() else 0
+        resolved = torch.device("cuda", index)
+    return str(resolved)
+
+
+def _centered_sample(input_shape: tuple[int, int, int], device: str) -> object:
+    """Create a deterministic centered float64 qualification sample."""
+    import torch
+
+    sample = torch.arange(
+        int(input_shape[0] * input_shape[1] * input_shape[2]),
+        dtype=torch.float64,
+        device=device,
+    ).reshape(input_shape)
+    return sample - sample.mean(dim=(-2, -1), keepdim=True)
 
 
 class AmpcorCandidateError(RuntimeError):
@@ -105,6 +131,8 @@ class AmpcorEnergyCandidate:
     runtime_profile: str = ""
     source_digest: str = ""
     abi_version: str = "faninsar.ampcor_prefix_energy.v1"
+    input_contract: str = "centered-f64"
+    allow_partial_batch: bool = False
     prepared: bool = True
     correctness_qualified: bool = True
     performance_eligible: bool = True
@@ -119,6 +147,7 @@ class AmpcorEnergyCandidate:
             raise ValueError("Ampcor window_shape must contain positive dimensions")
         if isinstance(self.workspace_bytes, bool) or self.workspace_bytes < 0:
             raise ValueError("Ampcor workspace_bytes must be non-negative")
+        object.__setattr__(self, "device", canonical_torch_device(self.device))
 
     def execute(self, secondary_centered: object) -> object:
         """Execute this already-prepared candidate without compilation."""
@@ -141,13 +170,19 @@ class AmpcorEnergyCandidate:
                 raise AmpcorCandidateError(
                     "Ampcor candidate requires contiguous rank-3 input"
                 )
-            if (
-                self.input_shape is not None
-                and tuple(secondary_centered.shape) != self.input_shape
-            ):
-                raise AmpcorCandidateError(
-                    "Ampcor candidate input shape does not match"
+            if self.input_shape is not None:
+                actual_shape = tuple(secondary_centered.shape)
+                expected_shape = self.input_shape
+                spatial_match = actual_shape[1:] == expected_shape[1:]
+                batch_match = (
+                    actual_shape[0] <= expected_shape[0]
+                    if self.allow_partial_batch
+                    else actual_shape[0] == expected_shape[0]
                 )
+                if not spatial_match or not batch_match:
+                    raise AmpcorCandidateError(
+                        "Ampcor candidate input shape does not match"
+                    )
             centered_mean = secondary_centered.mean(dim=(-2, -1)).abs().max()
             input_valid = torch.isfinite(secondary_centered).all() & (
                 centered_mean <= 1e-10
@@ -198,6 +233,8 @@ class AmpcorBackendRegistry:
             candidate.runtime_profile,
             candidate.source_digest,
             candidate.abi_version,
+            candidate.input_contract,
+            candidate.allow_partial_batch,
         )
 
     def register(self, candidate: AmpcorEnergyCandidate) -> None:
@@ -215,8 +252,11 @@ class AmpcorBackendRegistry:
         runtime_profile: str = "",
         source_digest: str = "",
         abi_version: str = "faninsar.ampcor_prefix_energy.v1",
+        input_contract: str = "centered-f64",
+        allow_partial_batch: bool = False,
     ) -> AmpcorEnergyCandidate | None:
         """Return an eligible exact candidate, or ``None`` for eager fallback."""
+        device = canonical_torch_device(device)
         candidate = self._candidates.get(
             (
                 device,
@@ -226,6 +266,8 @@ class AmpcorBackendRegistry:
                 runtime_profile,
                 source_digest,
                 abi_version,
+                input_contract,
+                allow_partial_batch,
             )
         )
         if candidate is None or not candidate.correctness_qualified:
@@ -240,14 +282,16 @@ def eager_ampcor_candidate(
     window_az, window_rg = window_shape
     return AmpcorEnergyCandidate(
         backend="eager",
-        device=device,
+        device=canonical_torch_device(device),
         window_shape=window_shape,
         executor=lambda secondary: torch_integral_energy(
             secondary, window_az, window_rg
         ),
         workspace_bytes=workspace_bytes,
         runtime_profile="torch-eager",
-        abi_version="faninsar.ampcor_prefix_energy.v1.centered-f64",
+        abi_version=_NATIVE_ABI,
+        input_contract="centered-f64",
+        allow_partial_batch=True,
     )
 
 
@@ -266,7 +310,7 @@ def prepare_ampcor_compile(
 
     if len(input_shape) != 3 or any(value < 1 for value in input_shape):
         raise ValueError("input_shape must contain three positive dimensions")
-    resolved = torch.device(device)
+    resolved = torch.device(canonical_torch_device(device))
     window_az, window_rg = window_shape
     if window_az > input_shape[1] or window_rg > input_shape[2]:
         raise ValueError("Ampcor window does not fit input_shape")
@@ -274,8 +318,15 @@ def prepare_ampcor_compile(
         lambda secondary: torch_integral_energy(secondary, window_az, window_rg),
         dynamic=False,
     )
-    sample = torch.zeros(input_shape, dtype=torch.float64, device=resolved)
-    compiled(sample)
+    sample = _centered_sample(input_shape, str(resolved))
+    compiled_result = compiled(sample)
+    eager_result = torch_integral_energy(sample, window_az, window_rg)
+    try:
+        torch.testing.assert_close(
+            compiled_result, eager_result, rtol=1e-10, atol=1e-12
+        )
+    except Exception as error:
+        raise RuntimeError("Ampcor compile candidate failed eager parity") from error
     if resolved.type == "cuda":
         torch.cuda.synchronize(resolved)
     return AmpcorEnergyCandidate(
@@ -286,7 +337,9 @@ def prepare_ampcor_compile(
         input_shape=input_shape,
         runtime_profile=f"torch-{torch.__version__}-{resolved}",
         source_digest=sha256(b"torch_integral_energy.v1").hexdigest(),
-        abi_version="faninsar.ampcor_prefix_energy.v1.centered-f64",
+        abi_version=_NATIVE_ABI,
+        input_contract="centered-f64",
+        allow_partial_batch=False,
     )
 
 
@@ -348,6 +401,9 @@ def prepare_ampcor_native(
     if prepared.status is not PreparationStatus.PREPARED:
         raise RuntimeError(prepared.reason or "Ampcor native preparation failed")
     module = module_holder["module"]
+    source_abi = getattr(module, "native_source_abi", None)
+    if source_abi is None or source_abi() != _NATIVE_ABI:
+        raise RuntimeError("Ampcor native source ABI mismatch")
     symbol = (
         "ampcor_prefix_energy_cuda"
         if backend is NativeBackend.CUDA
@@ -361,15 +417,28 @@ def prepare_ampcor_native(
         prepared,
         _entry_point=lambda secondary: entry(secondary, *window_shape),
     )
+    sample = _centered_sample(input_shape, canonical_torch_device(device))
+    native_result = prepared.dispatch(sample)
+    eager_result = torch_integral_energy(sample, *window_shape)
+    try:
+        torch.testing.assert_close(native_result, eager_result, rtol=1e-10, atol=1e-12)
+    except Exception as error:
+        raise RuntimeError("Ampcor native candidate failed eager parity") from error
     return AmpcorEnergyCandidate(
         backend="native",
-        device=str(torch.device(device)),
+        device=canonical_torch_device(device),
         window_shape=window_shape,
         executor=lambda secondary: prepared.dispatch(secondary),
         workspace_bytes=required_workspace,
         input_shape=input_shape,
-        runtime_profile=f"native-{device}",
-        abi_version="faninsar.ampcor_prefix_energy.v1.centered-f64",
+        runtime_profile=(
+            f"native-{canonical_torch_device(device)}-torch-{torch.__version__}"
+            f"-cuda-{torch.version.cuda or 'none'}-runtime-"
+            f"{plan.runtime_name or 'cuda'}"
+        ),
+        abi_version=_NATIVE_ABI,
+        input_contract="centered-f64",
+        allow_partial_batch=True,
         source_digest=sha256(
             b"".join(path.read_bytes() for path in plan.sources)
         ).hexdigest(),
@@ -382,6 +451,7 @@ __all__ = [
     "AmpcorBackendRegistry",
     "AmpcorCandidateError",
     "AmpcorEnergyCandidate",
+    "canonical_torch_device",
     "eager_ampcor_candidate",
     "native_workspace_bytes",
     "prepare_ampcor_compile",

@@ -15,6 +15,8 @@ from faninsar.processing.coreg.ampcor_backend import (
     torch_integral_energy,
 )
 
+_NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
+
 
 def test_torch_integral_energy_matches_reference() -> None:
     """The pure Tensor operation matches an unfold/square reference."""
@@ -38,12 +40,25 @@ def test_registry_requires_prepared_exact_candidates() -> None:
             "eager",
             (2, 3),
             runtime_profile="torch-eager",
-            abi_version="faninsar.ampcor_prefix_energy.v1.centered-f64",
+            abi_version=_NATIVE_ABI,
+            allow_partial_batch=True,
         )
         is candidate
     )
     assert registry.get("cpu", "native", (2, 3)) is None
-    assert registry.get("cuda:0", "eager", (2, 3)) is None
+    cuda_candidate = eager_ampcor_candidate(device="cuda:0", window_shape=(2, 3))
+    registry.register(cuda_candidate)
+    assert (
+        registry.get(
+            "cuda",
+            "eager",
+            (2, 3),
+            runtime_profile="torch-eager",
+            abi_version=_NATIVE_ABI,
+            allow_partial_batch=True,
+        )
+        is cuda_candidate
+    )
 
 
 def test_native_workspace_packet_is_shape_derived() -> None:
@@ -65,7 +80,7 @@ def test_candidate_executes_only_its_prepared_callable() -> None:
         executor=lambda value: calls.append("native")
         or torch_integral_energy(value, 2, 2),
         input_shape=(1, 4, 4),
-        abi_version="faninsar.ampcor_prefix_energy.v1.centered-f64",
+        abi_version=_NATIVE_ABI,
     )
     values = torch.tensor(
         [
@@ -91,6 +106,56 @@ def test_candidate_rejects_non_centered_input() -> None:
         candidate.execute(torch.ones((1, 3, 3), dtype=torch.float64))
 
 
+def test_candidate_allows_partial_batch_when_capacity_is_declared() -> None:
+    """Native/eager candidates may consume a final batch below capacity."""
+    torch = pytest.importorskip("torch")
+    candidate = AmpcorEnergyCandidate(
+        backend="native",
+        device="cpu",
+        window_shape=(2, 2),
+        executor=lambda value: torch_integral_energy(value, 2, 2),
+        input_shape=(4, 4, 4),
+        allow_partial_batch=True,
+    )
+    result = candidate.execute(torch.zeros((2, 4, 4), dtype=torch.float64))
+    assert tuple(result.shape) == (2, 3, 3)
+
+
+def test_candidate_rejects_partial_batch_for_fixed_shape_compile() -> None:
+    """A fixed-shape compile candidate rejects a partial batch before execute."""
+    torch = pytest.importorskip("torch")
+    calls: list[str] = []
+    candidate = AmpcorEnergyCandidate(
+        backend="compile",
+        device="cpu",
+        window_shape=(2, 2),
+        executor=lambda value: calls.append("compile")
+        or torch_integral_energy(value, 2, 2),
+        input_shape=(4, 4, 4),
+    )
+    with pytest.raises(AmpcorCandidateError, match="shape"):
+        candidate.execute(torch.zeros((2, 4, 4), dtype=torch.float64))
+    assert calls == []
+
+
+def test_candidate_rejects_spatial_shape_mismatch_before_execute() -> None:
+    """Prepared candidates reject an input with the wrong spatial shape."""
+    torch = pytest.importorskip("torch")
+    calls: list[str] = []
+    candidate = AmpcorEnergyCandidate(
+        backend="native",
+        device="cpu",
+        window_shape=(2, 2),
+        executor=lambda value: calls.append("native")
+        or torch_integral_energy(value, 2, 2),
+        input_shape=(4, 4, 4),
+        allow_partial_batch=True,
+    )
+    with pytest.raises(AmpcorCandidateError, match="shape"):
+        candidate.execute(torch.zeros((2, 5, 4), dtype=torch.float64))
+    assert calls == []
+
+
 def test_compile_preparation_compiles_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -111,6 +176,127 @@ def test_compile_preparation_compiles_before_dispatch(
     result = candidate.execute(torch.zeros((1, 4, 4), dtype=torch.float64))
     assert tuple(result.shape) == (1, 3, 3)
     assert len(compile_calls) == 1
+
+
+def test_compile_preparation_rejects_parity_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compiled candidate is not published when eager parity fails."""
+    torch = pytest.importorskip("torch")
+
+    def bad_compile(function: object, **_kwargs: object) -> object:
+        return lambda sample: function(sample) + 1.0
+
+    monkeypatch.setattr(torch, "compile", bad_compile)
+    with pytest.raises(RuntimeError, match="eager parity"):
+        prepare_ampcor_compile(device="cpu", window_shape=(2, 2), input_shape=(1, 4, 4))
+
+
+def _patch_fake_native_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
+    *,
+    source_abi: str,
+    add_one: bool = False,
+) -> None:
+    """Install a deterministic fake native preparation boundary for tests."""
+    import torch
+
+    from faninsar.processing.coreg import ampcor_backend
+    from faninsar.processing.geometry.native_v2.builder import (
+        BuildPlan,
+        NativeBackend,
+        NativeOperation,
+        PreparationStatus,
+        PreparedNativeCandidate,
+    )
+
+    source = tmp_path / "ampcor.cpp"
+    source.write_text("fake source", encoding="utf-8")
+    plan = BuildPlan(
+        NativeOperation.AMPCOR_PREFIX_ENERGY,
+        NativeBackend.CPU,
+        "fake_ampcor",
+        "fake_ampcor",
+        (source,),
+        (),
+        (),
+        runtime_name="libomp",
+    )
+
+    def fake_plan(_builder: object, _request: object) -> object:
+        return plan
+
+    def fake_prepare(
+        _builder: object, _request: object, *, build: object
+    ) -> PreparedNativeCandidate:
+        artifact = build(plan)
+        return PreparedNativeCandidate(
+            plan=plan,
+            status=PreparationStatus.PREPARED,
+            artifact=artifact,
+        )
+
+    monkeypatch.setattr(ampcor_backend.NativeBuilder, "plan", fake_plan)
+    monkeypatch.setattr(ampcor_backend.NativeBuilder, "prepare", fake_prepare)
+
+    def native_energy(value: object, window_az: int, window_rg: int) -> object:
+        result = ampcor_backend.torch_integral_energy(value, window_az, window_rg)
+        return result + 1.0 if add_one else result
+
+    module = type(
+        "FakeNativeModule",
+        (),
+        {
+            "__file__": str(source),
+            "native_source_abi": staticmethod(lambda: source_abi),
+            "ampcor_prefix_energy_cpu": staticmethod(native_energy),
+        },
+    )()
+    from torch.utils import cpp_extension
+
+    monkeypatch.setattr(cpp_extension, "load", lambda **_kwargs: module)
+
+
+def test_native_preparation_rejects_source_abi_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+) -> None:
+    """Native preparation fails closed when the module ABI is not exact."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg.ampcor_backend import prepare_ampcor_native
+
+    _patch_fake_native_loader(monkeypatch, tmp_path, source_abi="wrong.abi")
+    with pytest.raises(RuntimeError, match="source ABI mismatch"):
+        prepare_ampcor_native(
+            device="cpu",
+            window_shape=(2, 2),
+            source_root=tmp_path,
+            build_dir=tmp_path / "build",
+            input_shape=(1, 4, 4),
+        )
+
+
+def test_native_preparation_rejects_eager_parity_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+) -> None:
+    """Native preparation does not publish a numerically divergent module."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg.ampcor_backend import prepare_ampcor_native
+
+    _patch_fake_native_loader(
+        monkeypatch,
+        tmp_path,
+        source_abi="faninsar.ampcor_prefix_energy.v1",
+        add_one=True,
+    )
+    with pytest.raises(RuntimeError, match="eager parity"):
+        prepare_ampcor_native(
+            device="cpu",
+            window_shape=(2, 2),
+            source_root=tmp_path,
+            build_dir=tmp_path / "build",
+            input_shape=(1, 4, 4),
+        )
 
 
 def test_explicit_native_without_candidate_fails_closed() -> None:

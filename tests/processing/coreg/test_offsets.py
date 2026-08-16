@@ -202,6 +202,50 @@ def test_estimate_patch_amplitude_shift_torch_matches_numpy() -> None:
     )
 
 
+def test_explicit_compile_rejects_partial_final_batch_before_dispatch() -> None:
+    """Fixed-shape compile candidates fail before a partial batch executes."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg.ampcor_backend import (
+        AmpcorCandidateError,
+        AmpcorEnergyCandidate,
+        torch_integral_energy,
+    )
+
+    calls: list[str] = []
+
+    def compile_executor(value: object) -> object:
+        calls.append("compile")
+        return torch_integral_energy(value, 4, 4)
+
+    candidate = AmpcorEnergyCandidate(
+        backend="compile",
+        device="cpu",
+        window_shape=(4, 4),
+        executor=compile_executor,
+        input_shape=(4, 6, 6),
+    )
+    reference = np.ones((40, 40), dtype=np.complex64)
+    with pytest.raises(AmpcorCandidateError, match="full final batch"):
+        estimate_patch_amplitude_shift(
+            reference,
+            reference.copy(),
+            window_az=4,
+            window_rg=4,
+            search_az=1,
+            search_rg=1,
+            n_az=3,
+            n_rg=3,
+            margin_az=3,
+            margin_rg=3,
+            executor="torch",
+            device="cpu",
+            backend="compile",
+            ampcor_candidate=candidate,
+            batch_size=4,
+        )
+    assert calls == []
+
+
 def test_torch_ampcor_even_median_stays_in_torch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

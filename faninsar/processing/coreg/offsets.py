@@ -1610,6 +1610,19 @@ def _estimate_patch_amplitude_shift_torch(
 
     az_centres = np.linspace(az0, az1 - 1, num=n_az, dtype=np.int64)
     rg_centres = np.linspace(rg0, rg1 - 1, num=n_rg, dtype=np.int64)
+    total_patches = int(az_centres.size) * int(rg_centres.size)
+    if energy_candidate.backend == "compile" and total_patches % batch_size:
+        if fallback_candidate is None:
+            message = (
+                "Ampcor compile candidate requires a full final batch; "
+                "choose a batch_size that divides the patch grid"
+            )
+            raise AmpcorCandidateError(message)
+        # TorchInductor was prepared with a fixed shape.  Auto mode may use
+        # the already-prepared same-device eager candidate for this workload;
+        # it must not trigger a new compile from the dispatch path.
+        energy_candidate = fallback_candidate
+        fallback_candidate = None
     ref_windows: list[np.ndarray] = []
     sec_searches: list[np.ndarray] = []
     n_attempted = 0
@@ -1750,6 +1763,23 @@ def _estimate_patch_amplitude_shift_torch(
         snr_median=_torch_cpu_median(snr_values, torch),
         n_attempted=n_attempted,
     )
+
+
+def _ampcor_candidate_shape_matches(
+    candidate: AmpcorEnergyCandidate,
+    *,
+    spatial_shape: tuple[int, int],
+    batch_size: int,
+) -> bool:
+    """Check a prepared candidate's shape contract before dispatch."""
+    if candidate.input_shape is None:
+        return True
+    expected_batch, expected_height, expected_width = candidate.input_shape
+    if (expected_height, expected_width) != spatial_shape:
+        return False
+    if candidate.allow_partial_batch:
+        return 0 < batch_size <= expected_batch
+    return batch_size == expected_batch
 
 
 def estimate_patch_amplitude_shift(
@@ -1954,6 +1984,11 @@ def estimate_patch_amplitude_shift(
             and backend in ("auto", ampcor_candidate.backend)
             and ampcor_candidate.window_shape == (window_az, window_rg)
             and ampcor_candidate.device == resolved_torch_device
+            and _ampcor_candidate_shape_matches(
+                ampcor_candidate,
+                spatial_shape=(search_height, search_width),
+                batch_size=int(batch_size),
+            )
         )
         if backend in ("compile", "native") and not candidate_matches:
             reject_invalid_state(
