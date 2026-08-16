@@ -1299,6 +1299,7 @@ def test_ampcor_direct_torch_auto_uses_torch_cpu_policy(
 ) -> None:
     """Direct ``torch/auto`` never selects the host NumPy solver."""
     from faninsar.processing.coreg import offsets as offsets_mod
+
     torch = pytest.importorskip("torch")
 
     monkeypatch.setattr(
