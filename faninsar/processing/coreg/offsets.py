@@ -1033,13 +1033,16 @@ def _ampcor_boundary_quantum(boundary: float) -> float:
     return float(_AMPCOR_CULL_ULPS * spacing)
 
 
-def _torch_integral_energy_is_safe(sec: object, torch_module: object) -> object | None:
+def _torch_integral_energy_is_safe(
+    sec: object, torch_module: object
+) -> tuple[object, object] | None:
     """Check whether float64 integral prefixes stay within numeric bounds.
 
     The check is performed independently for every bounded search chip. A
     failed or unavailable reduction deliberately selects the FFT fallback for
     the complete batch.  On success, the per-lane absolute error bound is
-    returned for validation of the resulting local-energy surface.
+    returned with the centered-chip maximum for validation of the resulting
+    local-energy surface.
     """
     try:
         _, height, width = sec.shape
@@ -1059,7 +1062,7 @@ def _torch_integral_energy_is_safe(sec: object, torch_module: object) -> object 
             & torch_module.isfinite(tile_error)
             & (tile_error <= tolerance)
         )
-        return tile_error if bool(torch_module.all(safe).item()) else None
+        return (tile_error, max_abs) if bool(torch_module.all(safe).item()) else None
     except Exception:
         return None
 
@@ -1184,8 +1187,9 @@ def _torch_patch_ncc_batch(
         row_start : row_start + 2 * search_az + 1,
         col_start : col_start + 2 * search_rg + 1,
     ]
-    tile_error = _torch_integral_energy_is_safe(sec, torch)
-    if tile_error is not None:
+    precheck = _torch_integral_energy_is_safe(sec, torch)
+    if precheck is not None:
+        tile_error, global_max_abs = precheck
         # Each valid lag selects one rectangular window from ``sec``.  A
         # padded float64 integral image gives all local energies directly.
         sec_sq = sec * sec
@@ -1218,10 +1222,17 @@ def _torch_patch_ncc_batch(
         energy = bottom_right - top_right - bottom_left + top_left
         try:
             lower_bound = torch.clamp(energy - tile_error[:, None, None], min=0.0)
+            risk_upper = (
+                window_az
+                * window_rg
+                * global_max_abs[:, None, None].square()
+                / torch.clamp(lower_bound, min=torch.finfo(torch.float64).tiny)
+            )
             output_safe = (
                 torch.isfinite(energy)
+                & torch.isfinite(lower_bound)
                 & (energy >= 0.0)
-                & (tile_error[:, None, None] <= 1e-10 + 1e-12 * lower_bound)
+                & (risk_upper <= 1e12)
             )
             integral_safe = bool(torch.all(output_safe).item())
         except Exception:
