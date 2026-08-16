@@ -106,6 +106,7 @@ def test_estimate_patch_amplitude_shift_recovers_injected_offset() -> None:
         max_abs_residual=4.0,
         margin_rg=40,
         margin_az=40,
+        device="cpu",
     )
     assert result.n_valid > 0
     assert result.range_shift_px == pytest.approx(2.0, abs=0.15)
@@ -128,6 +129,7 @@ def test_estimate_patch_lazy_prealignment_matches_full_roll() -> None:
         "max_abs_residual": 4.0,
         "margin_rg": 30,
         "margin_az": 30,
+        "device": "cpu",
     }
     rolled = estimate_patch_amplitude_shift(reference, source, **kwargs)
     lazy = estimate_patch_amplitude_shift(
@@ -159,6 +161,7 @@ def test_estimate_patch_amplitude_shift_zero_when_aligned() -> None:
         max_abs_residual=1.2,
         margin_rg=40,
         margin_az=40,
+        device="cpu",
     )
     assert result.n_valid > 0
     assert abs(result.range_shift_px) < 0.15
@@ -183,6 +186,7 @@ def test_estimate_patch_amplitude_shift_torch_matches_numpy() -> None:
         "margin_rg": 32,
         "margin_az": 32,
         "subpixel": True,
+        "device": "cpu",
     }
     expected = estimate_patch_amplitude_shift(reference, secondary, **kwargs)
     actual = estimate_patch_amplitude_shift(
@@ -190,7 +194,6 @@ def test_estimate_patch_amplitude_shift_torch_matches_numpy() -> None:
         secondary,
         executor="torch",
         batch_size=3,
-        device="cpu",
         **kwargs,
     )
     assert actual.n_attempted == expected.n_attempted
@@ -345,6 +348,7 @@ def test_full_iw1_shape_numpy_accepts_view_torch_rejects_it(
         "max_abs_residual": 1.2,
         "margin_rg": 1000,
         "margin_az": None,
+        "device": "cpu",
     }
 
     numpy_result = estimate_patch_amplitude_shift(samples, samples, **kwargs)
@@ -356,7 +360,6 @@ def test_full_iw1_shape_numpy_accepts_view_torch_rejects_it(
             samples,
             executor="torch",
             batch_size=1,
-            device="cpu",
             **kwargs,
         )
 
@@ -394,7 +397,6 @@ def test_full_iw1_shape_numpy_accepts_view_torch_rejects_it(
             oversized,
             oversized,
             executor="torch",
-            device="cpu",
             **kwargs,
         )
 
@@ -936,19 +938,50 @@ def test_ampcor_numpy_path_does_not_apply_torch_admission_limits() -> None:
         margin_az=8,
         batch_size=0,
         max_workspace_bytes=0,
+        device="cpu",
     )
     assert result.n_attempted == 1
 
 
-@pytest.mark.parametrize(
-    "device",
-    ["cuda", "cuda:0", "cuda:00", "gpu", "mps", "metal", "tpu", "unknown"],
-)
-def test_ampcor_numpy_rejects_explicit_cuda_before_tiling(
+@pytest.mark.parametrize("device", ["cuda", "cuda:0", "cuda:00"])
+def test_ampcor_numpy_cuda_does_not_run_host_numpy(
     monkeypatch: pytest.MonkeyPatch,
     device: str,
 ) -> None:
-    """The public NumPy lane rejects explicit CUDA aliases before tile work."""
+    """CUDA admission cannot silently execute the host NumPy Ampcor lane."""
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    monkeypatch.setattr(
+        offsets_mod,
+        "_patch_ncc_shift",
+        lambda *_args, **_kwargs: pytest.fail("host NumPy ran after CUDA admission"),
+    )
+    samples = np.ones((64, 96), dtype=np.complex64)
+    try:
+        estimate_patch_amplitude_shift(
+            samples,
+            samples,
+            executor="numpy",
+            device=device,
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=1,
+            margin_rg=16,
+            margin_az=8,
+        )
+    except (InvalidProcessingStateError, RuntimeError, ImportError):
+        return
+
+
+@pytest.mark.parametrize("device", ["mps", "metal", "tpu", "unknown"])
+def test_ampcor_rejects_unqualified_devices_before_tiling(
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+) -> None:
+    """Unqualified Ampcor devices fail before tile work."""
     from faninsar.processing.coreg import offsets as offsets_mod
 
     monkeypatch.setattr(
@@ -959,7 +992,7 @@ def test_ampcor_numpy_rejects_explicit_cuda_before_tiling(
     samples = np.ones((64, 96), dtype=np.complex64)
     with pytest.raises(
         InvalidProcessingStateError,
-        match=r"require executor='torch'|unsupported Ampcor device|qualified Ampcor",
+        match=r"unsupported Ampcor device|qualified Ampcor",
     ):
         estimate_patch_amplitude_shift(
             samples,
@@ -1001,6 +1034,7 @@ def test_ampcor_numpy_retains_dtype_and_stride_compatibility(
         n_rg=1,
         margin_rg=16,
         margin_az=8,
+        device="cpu",
     )
     assert result.n_attempted == 1
 
@@ -1113,18 +1147,56 @@ def test_torch_ncc_tie_uses_first_flattened_peak() -> None:
     assert np.isnan(float(snr[0]))
 
 
-def test_ampcor_policy_canonicalizes_aliases_and_rejects_contradictions() -> None:
-    """The shared resolver gives aliases one admission key and rejects misuse."""
+def test_ampcor_policy_explicit_cpu_stays_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit CPU keeps the requested executor even when CUDA is visible."""
+    pytest.importorskip("torch")
     from faninsar.processing.coreg import resolve_ampcor_policy
 
-    assert resolve_ampcor_policy("torch", "gpu") == ("torch", "cuda")
-    assert resolve_ampcor_policy("torch", "cuda:00") == ("torch", "cuda:0")
-    assert resolve_ampcor_policy("torch", "auto") == ("numpy", "cpu")
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
     assert resolve_ampcor_policy("torch", "cpu") == ("torch", "cpu")
     assert resolve_ampcor_policy("numpy", "cpu") == ("numpy", "cpu")
+
+
+def test_ampcor_policy_auto_without_cuda_keeps_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without CUDA, ``auto`` stays on CPU and ``torch`` is no longer NumPy."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg import resolve_ampcor_policy
+
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
+    assert resolve_ampcor_policy("torch", "auto") == ("torch", "cpu")
     assert resolve_ampcor_policy("numpy", "auto") == ("numpy", "cpu")
-    with pytest.raises(InvalidProcessingStateError, match="require executor='torch'"):
-        resolve_ampcor_policy("numpy", "cuda")
+    assert resolve_ampcor_policy("torch", "gpu") == ("torch", "cpu")
+    assert resolve_ampcor_policy("numpy", "gpu") == ("numpy", "cpu")
+
+
+def test_ampcor_policy_auto_cuda_overrides_numpy_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Device admission overrides executor after ``auto`` resolves to CUDA."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg import resolve_ampcor_policy
+
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    assert resolve_ampcor_policy("torch", "auto") == ("torch", "cuda")
+    assert resolve_ampcor_policy("numpy", "auto") == ("torch", "cuda")
+    assert resolve_ampcor_policy("numpy", "gpu") == ("torch", "cuda")
+    assert resolve_ampcor_policy("torch", "gpu") == ("torch", "cuda")
+
+
+def test_ampcor_policy_canonicalizes_cuda_aliases_and_rejects_mps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA ordinals share one admission key; MPS stays unqualified."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg import resolve_ampcor_policy
+
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    assert resolve_ampcor_policy("torch", "cuda:00") == ("torch", "cuda:0")
+    assert resolve_ampcor_policy("numpy", "cuda") == ("torch", "cuda")
     with pytest.raises(InvalidProcessingStateError, match="not a qualified Ampcor"):
         resolve_ampcor_policy("torch", "mps")
 
@@ -1143,21 +1215,27 @@ def test_ampcor_direct_api_rejects_malformed_executor(executor: object) -> None:
         )
 
 
-def test_ampcor_direct_torch_auto_uses_production_numpy_policy(
+def test_ampcor_direct_torch_auto_is_not_a_numpy_synonym(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Direct ``torch/auto`` follows production's portable NumPy policy."""
+    """Direct ``torch/auto`` follows ``parse_device`` instead of host NumPy."""
+    torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets as offsets_mod
 
-    monkeypatch.setattr(
-        offsets_mod,
-        "_torch_patch_ncc_batch",
-        lambda *_args, **_kwargs: pytest.fail("torch/auto bypassed production policy"),
-    )
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
     monkeypatch.setattr(
         offsets_mod,
         "_patch_ncc_shift",
-        lambda *_args, **_kwargs: (0.0, 0.0, 10.0),
+        lambda *_args, **_kwargs: pytest.fail("torch/auto selected host NumPy"),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_patch_ncc_batch",
+        lambda *_args, **_kwargs: (
+            torch.tensor([0.0], dtype=torch.float64),
+            torch.tensor([0.0], dtype=torch.float64),
+            torch.tensor([10.0], dtype=torch.float64),
+        ),
     )
     result = estimate_patch_amplitude_shift(
         np.ones((64, 96), dtype=np.complex64),
@@ -1174,6 +1252,39 @@ def test_ampcor_direct_torch_auto_uses_production_numpy_policy(
         margin_az=8,
     )
     assert result.n_valid == 1
+
+
+def test_ampcor_auto_cuda_does_not_run_host_numpy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After ``auto`` admits CUDA, executor=numpy cannot succeed on host NumPy."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr(
+        offsets_mod,
+        "_patch_ncc_shift",
+        lambda *_args, **_kwargs: pytest.fail("host NumPy ran after CUDA admission"),
+    )
+    samples = np.ones((64, 96), dtype=np.complex64)
+    try:
+        estimate_patch_amplitude_shift(
+            samples,
+            samples,
+            executor="numpy",
+            device="auto",
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=1,
+            margin_rg=16,
+            margin_az=8,
+        )
+    except (InvalidProcessingStateError, RuntimeError, ImportError):
+        return
 
 
 def test_ampcor_seed_123_boundary_is_parity_stable(
@@ -1212,6 +1323,7 @@ def test_ampcor_seed_123_boundary_is_parity_stable(
         "margin_az": 8,
         "snr_threshold": float(snr_threshold),
         "max_abs_residual": 1.2,
+        "device": "cpu",
     }
     numpy_result = estimate_patch_amplitude_shift(samples, samples, **kwargs)
 
@@ -1234,7 +1346,6 @@ def test_ampcor_seed_123_boundary_is_parity_stable(
         samples,
         samples,
         executor="torch",
-        device="cpu",
         batch_size=2,
         **kwargs,
     )
@@ -1271,6 +1382,7 @@ def test_ampcor_boundary_oracle_stabilizes_backend_drift(
         "margin_az": 8,
         "snr_threshold": float(threshold),
         "max_abs_residual": 1.2,
+        "device": "cpu",
     }
     numpy_result = estimate_patch_amplitude_shift(samples, samples, **kwargs)
     monkeypatch.setattr(
@@ -1286,7 +1398,6 @@ def test_ampcor_boundary_oracle_stabilizes_backend_drift(
         samples,
         samples,
         executor="torch",
-        device="cpu",
         **kwargs,
     )
     assert torch_result == numpy_result
@@ -1356,6 +1467,7 @@ def test_ampcor_zero_boundaries_do_not_widen_cull(
         "margin_az": 8,
         "snr_threshold": snr_threshold,
         "max_abs_residual": max_abs_residual,
+        "device": "cpu",
     }
     numpy_values = iter(values)
     monkeypatch.setattr(
@@ -1378,7 +1490,6 @@ def test_ampcor_zero_boundaries_do_not_widen_cull(
         samples,
         samples,
         executor="torch",
-        device="cpu",
         batch_size=2,
         **kwargs,
     )
@@ -1420,7 +1531,7 @@ def test_refine_shift_rejects_dispatch_before_secondary_roll(
         lambda *_args, **_kwargs: pytest.fail("np.roll ran before policy validation"),
     )
     samples = np.ones((32, 64), dtype=np.complex64)
-    with pytest.raises(InvalidProcessingStateError, match="require executor='torch'"):
+    with pytest.raises((InvalidProcessingStateError, RuntimeError, ImportError)):
         geometry_coreg.refine_shift_with_correlation(
             samples,
             samples,
@@ -1446,7 +1557,7 @@ def test_refine_shift_rejects_unavailable_cuda_before_secondary_roll(
         lambda *_args, **_kwargs: pytest.fail("np.roll ran before CUDA validation"),
     )
     samples = np.ones((32, 64), dtype=np.complex64)
-    with pytest.raises(RuntimeError, match="CUDA requested"):
+    with pytest.raises(RuntimeError, match=r"cuda.*requested|CUDA requested"):
         geometry_coreg.refine_shift_with_correlation(
             samples,
             samples,
@@ -1512,6 +1623,7 @@ def test_refine_shift_with_correlation_resolves_cuda_to_torch(
     monkeypatch.setattr(
         geometry_coreg, "_validate_ampcor_accelerator", lambda _device: None
     )
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
     result = geometry_coreg.refine_shift_with_correlation(
         np.ones((32, 64), dtype=np.complex64),
         np.ones((32, 64), dtype=np.complex64),
@@ -1524,6 +1636,7 @@ def test_refine_shift_with_correlation_resolves_cuda_to_torch(
     assert captured["executor"] == "torch"
     assert captured["device"] == "cuda"
     captured.clear()
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
     geometry_coreg.refine_shift_with_correlation(
         np.ones((32, 64), dtype=np.complex64),
         np.ones((32, 64), dtype=np.complex64),
@@ -1532,7 +1645,7 @@ def test_refine_shift_with_correlation_resolves_cuda_to_torch(
         executor="torch",
         device="auto",
     )
-    assert captured["executor"] == "numpy"
+    assert captured["executor"] == "torch"
     assert captured["device"] == "cpu"
 
 

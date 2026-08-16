@@ -354,9 +354,53 @@ def _validate_real_scalar(name: str, value: object, *, nonnegative: bool) -> flo
 
 
 def _is_cpu_ampcor_device(device: object) -> bool:
-    """Return whether a device value is the portable CPU lane."""
+    """Return whether a resolved device value is the portable CPU lane."""
     normalized = str(device).strip().lower()
-    return normalized in {"auto", "cpu"} or normalized.startswith("cpu:")
+    return normalized == "cpu" or normalized.startswith("cpu:")
+
+
+def _admit_ampcor_device(device: str) -> str:
+    """Admit an Ampcor device through :func:`faninsar._core.device.parse_device`.
+
+    ``auto`` and ``gpu`` follow the shared contract: CUDA when it is visible
+    to this process, otherwise CPU. MPS is never auto-selected. Explicit
+    CUDA requests keep their decimal ordinal so ``cuda:00`` and ``cuda:0``
+    share one dispatch identity.
+
+    Parameters
+    ----------
+    device : str
+        Canonical Ampcor device token already stripped and lower-cased.
+
+    Returns
+    -------
+    str
+        ``"cpu"``, ``"cuda"``, or ``"cuda:<index>"``.
+
+    Raises
+    ------
+    RuntimeError
+        If an explicit CUDA request is unavailable.
+    ImportError
+        If Torch is required for an explicit CUDA request but is missing.
+
+    """
+    try:
+        from faninsar._core.device import parse_device
+    except ImportError as error:
+        if device in {"auto", "gpu", "cpu"} or device.startswith("cpu:"):
+            return "cpu"
+        message = "explicit CUDA Ampcor requires torch"
+        logger.exception(message)
+        raise ImportError(message) from error
+    resolved = parse_device(device)
+    if resolved.type == "cpu":
+        return "cpu"
+    if resolved.type == "cuda":
+        if resolved.index is None:
+            return "cuda"
+        return f"cuda:{int(resolved.index)}"
+    return resolved.type
 
 
 def resolve_ampcor_policy(
@@ -365,13 +409,13 @@ def resolve_ampcor_policy(
 ) -> tuple[Literal["numpy", "torch"], str]:
     """Resolve the public Ampcor executor/device contract.
 
-    ``numpy`` with ``auto`` or ``cpu`` selects the portable CPU lane.  The
-    explicit ``torch``/``cpu`` request selects the bounded Torch CPU lane,
-    while ``torch``/``auto`` deliberately selects portable NumPy.  This
-    distinction is intentional: ``auto`` must not silently turn a production
-    default into an unqualified Torch path.  Explicit CUDA always selects
-    Torch and is canonicalized to a decimal device ordinal (so ``cuda:00``
-    and ``cuda:0`` have identical dispatch and admission identity).
+    Device admission is authoritative. After
+    :func:`faninsar._core.device.parse_device` resolves ``auto`` or
+    ``gpu`` to CUDA, the request is the existing explicit-CUDA Torch
+    path even when ``executor="numpy"``. ``torch`` plus ``auto`` is no
+    longer a NumPy synonym: it becomes Torch CUDA when CUDA is admitted
+    and Torch CPU otherwise. Explicit ``cpu`` keeps the requested
+    executor on the host.
 
     Parameters
     ----------
@@ -383,7 +427,10 @@ def resolve_ampcor_policy(
     Raises
     ------
     InvalidProcessingStateError
-        If NumPy is paired with any explicit non-CPU or unknown device.
+        If the device is unknown or MPS, which is not a qualified Ampcor
+        device.
+    RuntimeError
+        If an explicit CUDA request is unavailable.
 
     """
     if not isinstance(executor, str) or executor not in {"numpy", "torch"}:
@@ -395,32 +442,35 @@ def resolve_ampcor_policy(
         logger.error(message)
         reject_invalid_state(message)
     canonical = device.strip().lower()
-    if canonical in {"auto", "cpu"}:
-        if executor == "torch" and canonical == "cpu":
-            return "torch", "cpu"
-        return "numpy", "cpu"
-    if canonical in {"gpu", "cuda", "cuda:default"}:
-        canonical = "cuda"
+    if canonical in {"mps", "metal"} or canonical.startswith("mps:"):
+        message = "MPS is not a qualified Ampcor device; use CPU or CUDA"
+        logger.error(message)
+        reject_invalid_state(message)
+    if canonical in {"auto", "cpu", "gpu"}:
+        request = canonical
+    elif canonical in {"cuda", "cuda:default"}:
+        request = "cuda"
     elif canonical.startswith("cuda:"):
         suffix = canonical.removeprefix("cuda:")
         if not suffix.isdigit():
             message = f"unsupported Ampcor device: {device!r}"
             logger.error(message)
             reject_invalid_state(message)
-        canonical = f"cuda:{int(suffix)}"
-    elif canonical in {"mps", "metal"}:
-        message = "MPS is not a qualified Ampcor device; use CPU or CUDA"
-        logger.error(message)
-        reject_invalid_state(message)
+        request = f"cuda:{int(suffix)}"
     else:
         message = f"unsupported Ampcor device: {device!r}"
         logger.error(message)
         reject_invalid_state(message)
-    if executor == "numpy":
-        message = "explicit accelerator Ampcor devices require executor='torch'"
-        logger.error(message)
-        reject_invalid_state(message)
-    return "torch", canonical
+    admitted = _admit_ampcor_device(request)
+    if admitted.startswith("cuda"):
+        return "torch", admitted
+    if admitted == "cpu":
+        if executor == "torch":
+            return "torch", "cpu"
+        return "numpy", "cpu"
+    message = f"unsupported Ampcor device: {device!r}"
+    logger.error(message)
+    return reject_invalid_state(message)
 
 
 def _validate_ampcor_device_contract(executor: str, device: object) -> None:
@@ -1255,7 +1305,9 @@ def _estimate_patch_amplitude_shift_torch(
         message = "Torch Ampcor execution requires torch"
         logger.exception(message)
         raise ImportError(message) from error
-    resolved_device = _canonical_torch_device("cpu" if device == "auto" else device)
+    resolved_device = _canonical_torch_device(
+        _admit_ampcor_device(device) if device == "auto" else device
+    )
     _validate_torch_ampcor_runtime(resolved_device, torch)
     if resolved_device.type == "mps":
         message = "MPS is not a qualified Ampcor device; use CPU or CUDA"
@@ -1511,26 +1563,27 @@ def estimate_patch_amplitude_shift(
         Parabolic peak refinement (default True).
     executor : {"numpy", "torch"}, optional
         Correlation implementation. ``"numpy"`` (default) retains the scalar
-        reference loop. Explicit ``executor="torch", device="cpu"``
-        evaluates bounded eager CPU batches. ``device="auto"`` deliberately
-        resolves to the production NumPy/CPU policy, so it never silently
-        selects Torch. Explicit CUDA remains Torch. Torch
-        admission accepts only ``complex64`` and ``float32`` source arrays;
-        ``complex128`` and ``float64`` remain on the NumPy lane. Each bounded
-        tile is converted to ``complex64`` magnitude and then a contiguous
-        ``float32`` batch before
-        the Torch kernel promotes it to ``float64`` for correlation math.
-        Explicit Torch inputs must be owning, C-contiguous arrays; the NumPy
-        lane remains permissive about layout and casting.
+        reference loop on explicit CPU. After ``device="auto"`` admits CUDA,
+        device policy overrides this value onto the existing Torch CUDA
+        path (or fails closed if that path cannot run). Explicit
+        ``executor="torch", device="cpu"`` evaluates bounded eager CPU
+        batches. Torch admission accepts only ``complex64`` and ``float32``
+        source arrays; ``complex128`` and ``float64`` remain on the NumPy
+        lane. Each bounded tile is converted to ``complex64`` magnitude and
+        then a contiguous ``float32`` batch before the Torch kernel
+        promotes it to ``float64`` for correlation math. Explicit Torch
+        inputs must be owning, C-contiguous arrays; the NumPy lane remains
+        permissive about layout and casting.
     batch_size : int, optional
         Number of patches materialized in one Torch batch. Default 32.
     device : {"auto", "cpu", "cuda"}, optional
-        Requested device. ``"auto"`` resolves to NumPy/CPU for either
-        executor, while explicit ``"cpu"`` selects the requested executor.
-        CUDA requires explicit availability and never silently falls back.
-        MPS is outside the qualified Ampcor contract and is rejected. With
-        ``executor="numpy"``, explicit CUDA values fail closed before input
-        tiling.
+        Requested device. Resolved through
+        :func:`faninsar._core.device.parse_device`. ``"auto"`` admits CUDA
+        when it is visible, otherwise CPU. ``torch`` plus ``auto`` is not a
+        NumPy synonym. Explicit ``"cpu"`` keeps the requested executor.
+        After CUDA admission, ``executor="numpy"`` cannot succeed on host
+        NumPy. Explicit CUDA never silently falls back. MPS is outside the
+        qualified Ampcor contract and is rejected.
     max_workspace_bytes : int, optional
         Cooperative estimated limit for one Torch batch workspace lease. This
         is not a physical device-memory guarantee. Default 256 MiB.
