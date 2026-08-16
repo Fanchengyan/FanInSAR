@@ -1191,10 +1191,10 @@ def test_ampcor_policy_canonicalizes_cuda_aliases_and_rejects_mps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """CUDA ordinals share one admission key; MPS stays unqualified."""
-    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import resolve_ampcor_policy
-
     monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     assert resolve_ampcor_policy("torch", "cuda:00") == ("torch", "cuda:0")
     assert resolve_ampcor_policy("numpy", "cuda") == ("torch", "cuda")
     with pytest.raises(InvalidProcessingStateError, match="not a qualified Ampcor"):
@@ -1588,6 +1588,7 @@ def test_estimate_patch_amplitude_shift_rejects_unqualified_cuda_runtime(
     """CUDA Ampcor fails closed outside the exact qualified runtime lane."""
     torch = pytest.importorskip("torch")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",

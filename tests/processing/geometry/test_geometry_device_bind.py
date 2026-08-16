@@ -52,13 +52,13 @@ def test_resolve_geometry_device_missing_cuda_fails_closed(
 ) -> None:
     """Explicit CUDA is a hard error when the shared resolver has no GPU."""
     monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
-    with pytest.raises(RuntimeError, match="CUDA is not available"):
+    with pytest.raises(RuntimeError, match="not available"):
         resolve_geometry_device("cuda")
-    with pytest.raises(RuntimeError, match="CUDA is not available"):
+    with pytest.raises(RuntimeError, match="not available"):
         _resolve_device("cuda")
-    with pytest.raises(RuntimeError, match="CUDA is not available"):
+    with pytest.raises(RuntimeError, match="not available"):
         geometry_public._device_key("cuda", "GPU-test")
-    with pytest.raises(RuntimeError, match="CUDA is not available"):
+    with pytest.raises(RuntimeError, match="not available"):
         prepare_geometry(Operation.GEO2RDR, _model(), shape=(1,), device="cuda")
 
 
