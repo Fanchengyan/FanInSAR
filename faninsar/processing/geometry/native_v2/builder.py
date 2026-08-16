@@ -157,6 +157,11 @@ def select_native_sources(
     backend = NativeBackend(backend)
     root = Path(source_root)
     if operation is NativeOperation.AMPCOR_PREFIX_ENERGY:
+        if backend is NativeBackend.CUDA:
+            return (
+                root / "ampcor_cuda_bindings.cpp",
+                root / "ampcor_prefix_energy_cuda.cu",
+            )
         return (
             root / "ampcor_bindings.cpp",
             root / "ampcor_prefix_energy.cpp",
@@ -207,12 +212,9 @@ class NativeBuilder:
                     extension,
                     symbol,
                     sources,
+                    ("-O3", "-DFANINSAR_NATIVE_AMPCOR_CUDA=1"),
                     (),
-                    (),
-                    supported=False,
-                    unsupported_reason=(
-                        "Ampcor prefix energy has no native CUDA implementation"
-                    ),
+                    supported=True,
                 )
             provider = openmp_provider_for_platform(
                 request.platform,
