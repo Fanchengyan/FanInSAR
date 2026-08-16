@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+from .ampcor_backend import (
+    AmpcorBackendRegistry,
+    AmpcorCandidateError,
+    AmpcorEnergyCandidate,
+    eager_ampcor_candidate,
+    native_workspace_bytes,
+    prepare_ampcor_compile,
+    prepare_ampcor_native,
+    torch_integral_energy,
+)
 from .dense_geometry import dense_geometry_offsets, geometry_offset_window_extent
 from .esd import ESDResult, estimate_azimuth_shift_esd
 from .geometric_phase import (
@@ -30,6 +40,9 @@ from .offsets import (
 )
 
 __all__ = [
+    "AmpcorBackendRegistry",
+    "AmpcorCandidateError",
+    "AmpcorEnergyCandidate",
     "DateMisreg",
     "ESDResult",
     "MisregArc",
@@ -39,6 +52,7 @@ __all__ = [
     "build_offset_field",
     "combine_offset_fields",
     "dense_geometry_offsets",
+    "eager_ampcor_candidate",
     "estimate_azimuth_shift_esd",
     "estimate_global_shift",
     "estimate_patch_amplitude_shift",
@@ -47,11 +61,15 @@ __all__ = [
     "geometry_offset_window_extent",
     "geometry_shift_offsets",
     "invert_pair_misregistration",
+    "native_workspace_bytes",
     "phase_per_range_pixel",
+    "prepare_ampcor_compile",
+    "prepare_ampcor_native",
     "refine_peak_subpixel",
     "refine_shift_with_correlation",
     "resample_complex",
     "resample_complex_deramped_reramp",
     "resolve_ampcor_policy",
     "stage_topo",
+    "torch_integral_energy",
 ]

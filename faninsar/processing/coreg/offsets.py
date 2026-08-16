@@ -17,6 +17,13 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
+from faninsar.processing.coreg.ampcor_backend import (
+    AmpcorBackend,
+    AmpcorCandidateError,
+    AmpcorEnergyCandidate,
+    eager_ampcor_candidate,
+    native_workspace_bytes,
+)
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
@@ -1240,6 +1247,8 @@ def _torch_patch_ncc_batch(
     search_rg: int,
     subpixel: bool,
     force_fft_energy: bool = False,
+    energy_candidate: AmpcorEnergyCandidate | None = None,
+    fallback_candidate: AmpcorEnergyCandidate | None = None,
 ) -> tuple[object, object, object]:
     """Evaluate a batch of Ampcor NCC surfaces with Torch float64 math."""
     import torch
@@ -1266,7 +1275,22 @@ def _torch_patch_ncc_batch(
         col_start : col_start + 2 * search_rg + 1,
     ]
     precheck = None if force_fft_energy else _torch_integral_energy_is_safe(sec, torch)
-    if precheck is not None:
+    candidate_energy: object | None = None
+    if (
+        precheck is not None
+        and energy_candidate is not None
+        and energy_candidate.window_shape == (window_az, window_rg)
+        and energy_candidate.device == str(sec.device)
+    ):
+        try:
+            candidate_energy = energy_candidate.execute(sec)
+        except AmpcorCandidateError:
+            if fallback_candidate is None:
+                raise
+            candidate_energy = fallback_candidate.execute(sec)
+    if candidate_energy is not None:
+        energy = candidate_energy
+    elif precheck is not None:
         tile_error, global_max_abs = precheck
         # Each valid lag selects one rectangular window from ``sec``.  A
         # padded float64 integral image gives all local energies directly.
@@ -1502,6 +1526,8 @@ def _estimate_patch_amplitude_shift_torch(
     max_workspace_bytes: int,
     device: Literal["auto", "cpu", "cuda"],
     secondary_shift: tuple[int, int],
+    energy_candidate: AmpcorEnergyCandidate,
+    fallback_candidate: AmpcorEnergyCandidate | None = None,
 ) -> PatchAmplitudeShiftResult:
     """Run bounded Torch batches for the opt-in Ampcor executor.
 
@@ -1553,6 +1579,15 @@ def _estimate_patch_amplitude_shift_torch(
         search_rg=search_rg,
         batch_size=batch_size,
     )
+    if energy_candidate.backend == "native":
+        planned_workspace = max(
+            planned_workspace,
+            native_workspace_bytes(
+                (batch_size, search_height, search_width),
+                (window_az, window_rg),
+            ),
+        )
+    planned_workspace = max(planned_workspace, energy_candidate.workspace_bytes)
     if planned_workspace > max_workspace_bytes:
         message = (
             f"Ampcor batch workspace {planned_workspace} bytes exceeds the "
@@ -1615,6 +1650,8 @@ def _estimate_patch_amplitude_shift_torch(
                     search_az=search_az,
                     search_rg=search_rg,
                     subpixel=subpixel,
+                    energy_candidate=energy_candidate,
+                    fallback_candidate=fallback_candidate,
                 )
                 d_rg, d_az, snr = _ampcor_apply_boundary_oracle(
                     ref_tensor,
@@ -1731,6 +1768,8 @@ def estimate_patch_amplitude_shift(
     margin_az: int | None = None,
     subpixel: bool = True,
     executor: Literal["auto", "numpy", "torch"] = "numpy",
+    backend: AmpcorBackend | Literal["auto"] = "auto",
+    ampcor_candidate: AmpcorEnergyCandidate | None = None,
     batch_size: int = 32,
     device: Literal["auto", "cpu", "cuda"] = "auto",
     max_workspace_bytes: int = _TORCH_AMPCOR_WORKSPACE_CAP_BYTES,
@@ -1773,6 +1812,12 @@ def estimate_patch_amplitude_shift(
         batches. Public float32/64 and complex64/128 input precision is
         retained through magnitude materialization; tiles and Torch batches
         are float64 for correlation math.
+    backend : {"auto", "eager", "compile", "native"}, optional
+        Prepared energy backend. In ``"auto"`` mode, missing or failed
+        compile/native candidates use same-device Torch eager. Explicit
+        compile/native mode fails closed unless its candidate is prepared.
+    ampcor_candidate : AmpcorEnergyCandidate, optional
+        Candidate prepared explicitly by the Ampcor backend preparation API.
     batch_size : int, optional
         Number of patches materialized in one Torch batch. Default 32.
     device : {"auto", "cpu", "cuda"}, optional
@@ -1822,6 +1867,8 @@ def estimate_patch_amplitude_shift(
         if margin_az < 0:
             reject_invalid_state("Ampcor margin_az must be non-negative")
     executor, device = resolve_ampcor_policy(executor, device)
+    if backend not in ("auto", "eager", "compile", "native"):
+        reject_invalid_state(f"unsupported Ampcor backend: {backend!r}")
     if executor == "torch" and device.startswith("cuda"):
         _validate_ampcor_accelerator(device)
     planned_patches = int(n_az) * int(n_rg)
@@ -1895,6 +1942,24 @@ def estimate_patch_amplitude_shift(
                 "Ampcor input and magnitude-tile workspace exceeds the admitted limit "
                 f"({_TORCH_AMPCOR_MAX_INPUT_BYTES} bytes)"
             )
+        resolved_torch_device = (
+            "cpu" if device == "cpu" else str(_canonical_torch_device(device))
+        )
+        eager_candidate = eager_ampcor_candidate(
+            device=resolved_torch_device,
+            window_shape=(window_az, window_rg),
+        )
+        candidate_matches = (
+            ampcor_candidate is not None
+            and backend in ("auto", ampcor_candidate.backend)
+            and ampcor_candidate.window_shape == (window_az, window_rg)
+            and ampcor_candidate.device == resolved_torch_device
+        )
+        if backend in ("compile", "native") and not candidate_matches:
+            reject_invalid_state(
+                f"Ampcor backend={backend!r} requires a prepared same-device candidate"
+            )
+        selected_candidate = ampcor_candidate if candidate_matches else eager_candidate
         return _estimate_patch_amplitude_shift_torch(
             reference,
             secondary,
@@ -1913,6 +1978,12 @@ def estimate_patch_amplitude_shift(
             max_workspace_bytes=int(max_workspace_bytes),
             device=device,
             secondary_shift=secondary_shift,
+            energy_candidate=selected_candidate,
+            fallback_candidate=(
+                eager_candidate
+                if backend == "auto" and selected_candidate.backend != "eager"
+                else None
+            ),
         )
     height, width = reference.shape
     half_az = window_az // 2
