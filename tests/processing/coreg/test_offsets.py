@@ -1167,7 +1167,7 @@ def test_torch_ncc_integral_energy_matches_direct_oracle() -> None:
 
 
 def test_torch_ncc_keeps_only_correlation_fft(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Local energy does not invoke an additional Torch FFT pair."""
+    """Safe local energy uses only the two correlation FFT transforms."""
     torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets as offsets_mod
 
@@ -1188,6 +1188,59 @@ def test_torch_ncc_keeps_only_correlation_fft(monkeypatch: pytest.MonkeyPatch) -
         subpixel=False,
     )
     assert calls == 2
+
+
+def test_torch_ncc_risky_energy_uses_fft_fallback_for_whole_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A high-dynamic-range chip uses the legacy FFT energy for every lane."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    reference = torch.tensor(
+        [[[1.0, -2.0, 0.5], [3.0, 4.0, -1.5]]], dtype=torch.float32
+    )
+    secondary = torch.tensor(
+        [
+            [1.0e8, -1.0e8, 2.0e8, 1.5e8, -2.5e7],
+            [3.0e8, 2.5e7, -2.0e8, 4.0e8, 1.0e8],
+            [-1.5e8, 2.5e8, 0.0, -5.0e7, 3.5e8],
+            [2.0e8, -3.0e8, 1.25e8, 7.5e7, -2.5e8],
+        ],
+        dtype=torch.float32,
+    )[None]
+
+    calls = 0
+    original_rfft2 = torch.fft.rfft2
+
+    def count_rfft2(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original_rfft2(*args, **kwargs)
+
+    monkeypatch.setattr(torch.fft, "rfft2", count_rfft2)
+    actual = offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+    )
+    assert calls == 4
+    assert all(torch.isfinite(value).all() for value in actual[:2])
+
+    # Compare against the same-device FFT-energy oracle explicitly.  This
+    # also verifies that the batch-level decision does not mix energy paths.
+    monkeypatch.setattr(offsets_mod, "_torch_integral_energy_is_safe", lambda *_: False)
+    expected = offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+    )
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_value, expected_value, equal_nan=True)
 
 
 def test_ampcor_policy_canonicalizes_aliases_and_rejects_contradictions() -> None:

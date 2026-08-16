@@ -1033,6 +1033,124 @@ def _ampcor_boundary_quantum(boundary: float) -> float:
     return float(_AMPCOR_CULL_ULPS * spacing)
 
 
+def _torch_integral_energy_is_safe(sec: object, torch_module: object) -> bool:
+    """Check whether float64 integral prefixes stay within numeric bounds.
+
+    The check is performed independently for every bounded search chip. A
+    failed or unavailable reduction deliberately selects the FFT fallback for
+    the complete batch.
+    """
+    try:
+        _, height, width = sec.shape
+        max_abs = torch_module.amax(torch_module.abs(sec), dim=(-2, -1))
+        prefix_energy = max_abs.square() * (height * width)
+        tile_error = (
+            8.0
+            * torch_module.finfo(sec.dtype).eps
+            * (height + width + 2)
+            * prefix_energy
+        )
+        tolerance = 1e-10 + 1e-12 * prefix_energy
+        safe = (
+            torch_module.isfinite(max_abs)
+            & torch_module.isfinite(prefix_energy)
+            & (prefix_energy <= 2**44)
+            & torch_module.isfinite(tile_error)
+            & (tile_error <= tolerance)
+        )
+        return bool(torch_module.all(safe).item())
+    except Exception:
+        return False
+
+
+def _torch_local_energy_fft(
+    sec: object,
+    ref: object,
+    *,
+    fft_height: int,
+    fft_width: int,
+    window_az: int,
+    window_rg: int,
+    search_az: int,
+    search_rg: int,
+    torch_module: object,
+) -> object:
+    """Compute local secondary energy with the legacy same-device FFT path."""
+    ones = torch_module.ones_like(ref)
+    f_ones = torch_module.fft.rfft2(
+        torch_module.flip(ones, dims=(-2, -1)), s=(fft_height, fft_width)
+    )
+    f_sec_sq = torch_module.fft.rfft2(sec * sec, s=(fft_height, fft_width))
+    energy_full = torch_module.fft.irfft2(f_sec_sq * f_ones, s=(fft_height, fft_width))
+    row_start = window_az - 1
+    col_start = window_rg - 1
+    return energy_full[
+        :,
+        row_start : row_start + 2 * search_az + 1,
+        col_start : col_start + 2 * search_rg + 1,
+    ]
+
+
+def _torch_ampcor_workspace_bytes(
+    *,
+    window_az: int,
+    window_rg: int,
+    search_az: int,
+    search_rg: int,
+    batch_size: int,
+) -> int:
+    """Estimate the conservative Torch NCC packet with a two-times margin.
+
+    The packet includes float64 inputs, correlation FFT tensors, the
+    integral-image temporaries, the legacy FFT-energy fallback packet, and
+    retained energy/NCC surfaces.
+    """
+    search_height = window_az + 2 * search_az
+    search_width = window_rg + 2 * search_rg
+    fft_height = 2 ** int(np.ceil(np.log2(search_height + window_az - 1)))
+    fft_width = 2 ** int(np.ceil(np.log2(search_width + window_rg - 1)))
+    fft_pixels = fft_height * fft_width
+    spectrum_bytes = fft_height * (fft_width // 2 + 1) * 16
+    fft_real_bytes = fft_pixels * 8
+    reference_bytes = window_az * window_rg * 8
+    search_bytes = search_height * search_width * 8
+    surface_bytes = (2 * search_az + 1) * (2 * search_rg + 1) * 8
+
+    # Keep the major live allocations explicit.  The correlation transform
+    # retains both input spectra, their product, and the inverse real surface.
+    input_bytes = reference_bytes + search_bytes
+    correlation_fft_bytes = 3 * spectrum_bytes + fft_real_bytes
+
+    # Integral energy constructs sec_sq, both cumsum results, and both padded
+    # cat results before the energy/NCC surfaces are reduced.
+    sec_sq_bytes = search_bytes
+    row_cumsum_bytes = search_bytes
+    row_cat_bytes = search_height * (search_width + 1) * 8
+    integral_cumsum_bytes = row_cat_bytes
+    integral_cat_bytes = (search_height + 1) * (search_width + 1) * 8
+    energy_ncc_bytes = 2 * surface_bytes
+    integral_energy_bytes = (
+        sec_sq_bytes
+        + row_cumsum_bytes
+        + row_cat_bytes
+        + integral_cumsum_bytes
+        + integral_cat_bytes
+        + energy_ncc_bytes
+    )
+
+    # The guarded fallback can retain the correlation input plus the legacy
+    # FFT-energy packet.  Admission must cover either energy implementation.
+    fft_energy_bytes = (
+        sec_sq_bytes + 3 * spectrum_bytes + fft_real_bytes + surface_bytes
+    )
+    per_batch_bytes = (
+        input_bytes
+        + correlation_fft_bytes
+        + max(integral_energy_bytes, fft_energy_bytes)
+    )
+    return 2 * batch_size * per_batch_bytes
+
+
 def _torch_patch_ncc_batch(
     ref_windows: object,
     sec_searches: object,
@@ -1065,37 +1183,51 @@ def _torch_patch_ncc_batch(
         row_start : row_start + 2 * search_az + 1,
         col_start : col_start + 2 * search_rg + 1,
     ]
-    # Each valid lag selects one rectangular window from ``sec``.  A padded
-    # float64 integral image gives all of those local energies directly and
-    # avoids the redundant FFT pair used for this purely real sum.
-    sec_sq = sec * sec
-    row_cumulative = torch.cumsum(sec_sq, dim=-1)
-    leading_column = torch.zeros(
-        (count, search_height, 1), dtype=torch.float64, device=sec.device
-    )
-    row_cumulative = torch.cat((leading_column, row_cumulative), dim=-1)
-    integral = torch.cumsum(row_cumulative, dim=-2)
-    leading_row = torch.zeros(
-        (count, 1, search_width + 1), dtype=torch.float64, device=sec.device
-    )
-    integral = torch.cat((leading_row, integral), dim=-2)
-    bottom_right = integral[
-        :,
-        window_az : window_az + 2 * search_az + 1,
-        window_rg : window_rg + 2 * search_rg + 1,
-    ]
-    top_right = integral[
-        :,
-        : 2 * search_az + 1,
-        window_rg : window_rg + 2 * search_rg + 1,
-    ]
-    bottom_left = integral[
-        :,
-        window_az : window_az + 2 * search_az + 1,
-        : 2 * search_rg + 1,
-    ]
-    top_left = integral[:, : 2 * search_az + 1, : 2 * search_rg + 1]
-    energy = bottom_right - top_right - bottom_left + top_left
+    if _torch_integral_energy_is_safe(sec, torch):
+        # Each valid lag selects one rectangular window from ``sec``.  A
+        # padded float64 integral image gives all local energies directly.
+        sec_sq = sec * sec
+        row_cumulative = torch.cumsum(sec_sq, dim=-1)
+        leading_column = torch.zeros(
+            (count, search_height, 1), dtype=torch.float64, device=sec.device
+        )
+        row_cumulative = torch.cat((leading_column, row_cumulative), dim=-1)
+        integral = torch.cumsum(row_cumulative, dim=-2)
+        leading_row = torch.zeros(
+            (count, 1, search_width + 1), dtype=torch.float64, device=sec.device
+        )
+        integral = torch.cat((leading_row, integral), dim=-2)
+        bottom_right = integral[
+            :,
+            window_az : window_az + 2 * search_az + 1,
+            window_rg : window_rg + 2 * search_rg + 1,
+        ]
+        top_right = integral[
+            :,
+            : 2 * search_az + 1,
+            window_rg : window_rg + 2 * search_rg + 1,
+        ]
+        bottom_left = integral[
+            :,
+            window_az : window_az + 2 * search_az + 1,
+            : 2 * search_rg + 1,
+        ]
+        top_left = integral[:, : 2 * search_az + 1, : 2 * search_rg + 1]
+        energy = bottom_right - top_right - bottom_left + top_left
+    else:
+        # A failed or unavailable lane reduction is batch-fatal for the
+        # integral path; use the previous same-device FFT energy for all lanes.
+        energy = _torch_local_energy_fft(
+            sec,
+            ref,
+            fft_height=fft_height,
+            fft_width=fft_width,
+            window_az=window_az,
+            window_rg=window_rg,
+            search_az=search_az,
+            search_rg=search_rg,
+            torch_module=torch,
+        )
     ncc = corr / torch.sqrt(torch.clamp(energy, min=1e-12))
     surface_width = 2 * search_rg + 1
     peak_flat = torch.argmax(ncc.reshape(count, -1), dim=1)
@@ -1308,15 +1440,13 @@ def _estimate_patch_amplitude_shift_torch(
         reject_invalid_state(
             "Ampcor window/search dimensions exceed the admitted bounds"
         )
-    fft_height = 2 ** int(np.ceil(np.log2(search_height + window_az - 1)))
-    fft_width = 2 ** int(np.ceil(np.log2(search_width + window_rg - 1)))
-    # Account for input windows, FFT spectra, and real correlation/energy
-    # buffers with a conservative two-times allocator margin.
-    per_patch_bytes = 2 * (
-        (window_az * window_rg + search_height * search_width) * 8
-        + 4 * fft_height * (fft_width // 2 + 1) * 16
+    planned_workspace = _torch_ampcor_workspace_bytes(
+        window_az=window_az,
+        window_rg=window_rg,
+        search_az=search_az,
+        search_rg=search_rg,
+        batch_size=batch_size,
     )
-    planned_workspace = batch_size * per_patch_bytes
     if planned_workspace > max_workspace_bytes:
         message = (
             f"Ampcor batch workspace {planned_workspace} bytes exceeds the "
