@@ -447,6 +447,7 @@ def _validate_ampcor_inputs(
     secondary: object,
     *,
     torch_contract: bool = False,
+    conversion_limit_bytes: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Admit only supported, directly indexable Ampcor input arrays.
 
@@ -464,6 +465,9 @@ def _validate_ampcor_inputs(
     torch_contract : bool, optional
         Apply the Torch compatibility normalization. The default is retained
         for callers of the private validator and keeps the input arrays as-is.
+    conversion_limit_bytes : int or None, optional
+        Additional public workspace limit for compatibility copies. ``None``
+        uses only the independent conversion cap.
 
     Returns
     -------
@@ -518,10 +522,13 @@ def _validate_ampcor_inputs(
             and samples.dtype == target_dtype
         )
     )
-    if conversion_bytes > _TORCH_AMPCOR_CONVERSION_CAP_BYTES:
+    conversion_limit = _TORCH_AMPCOR_CONVERSION_CAP_BYTES
+    if conversion_limit_bytes is not None:
+        conversion_limit = min(conversion_limit, int(conversion_limit_bytes))
+    if conversion_bytes > conversion_limit:
         message = (
             "Ampcor compatibility conversion exceeds the admitted memory limit "
-            f"({_TORCH_AMPCOR_CONVERSION_CAP_BYTES} bytes)"
+            f"({conversion_limit} bytes)"
         )
         logger.error(message)
         reject_invalid_state(message)
@@ -1841,6 +1848,9 @@ def estimate_patch_amplitude_shift(
         reference,
         secondary,
         torch_contract=executor == "torch",
+        conversion_limit_bytes=(
+            int(max_workspace_bytes) if executor == "torch" else None
+        ),
     )
     height, width = reference.shape
     if height < 1 or width < 1:

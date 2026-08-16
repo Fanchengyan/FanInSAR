@@ -407,6 +407,37 @@ def test_ampcor_conversion_preflight_rejects_before_copy(
         )
 
 
+def test_ampcor_public_workspace_limits_conversion_before_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Public workspace limits apply before compatibility copy allocation."""
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    samples = np.ones((16, 32), dtype=np.complex64)[:, ::2]
+    monkeypatch.setattr(
+        offsets_mod.np,
+        "array",
+        lambda *_args, **_kwargs: pytest.fail("conversion preflight allocated"),
+    )
+    with pytest.raises(InvalidProcessingStateError, match="conversion"):
+        estimate_patch_amplitude_shift(
+            samples,
+            samples,
+            executor="torch",
+            device="cpu",
+            batch_size=1,
+            max_workspace_bytes=1,
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=1,
+            margin_rg=16,
+            margin_az=8,
+        )
+
+
 def test_estimate_patch_amplitude_shift_rejects_invalid_torch_batch() -> None:
     """Torch Ampcor rejects non-positive batch sizes before execution."""
     with pytest.raises(InvalidProcessingStateError, match="batch_size"):
