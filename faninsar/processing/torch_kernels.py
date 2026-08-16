@@ -88,64 +88,34 @@ def resolve_torch_device(
 ) -> torch.device:
     """Resolve a Torch execution device following the Stack device policy.
 
-    ``"auto"`` inspects only hardware visible to the current process. CUDA is
-    preferred, MPS is never auto-selected, and an explicit accelerator request
-    that is unavailable raises instead of silently degrading. Distributed
-    scheduling resolves cluster resources outside this function and forwards
-    ``"cuda"`` to the selected worker so a false GPU advertisement fails closed.
+    Thin wrapper around :func:`faninsar._core.device.parse_device`.
+    ``"auto"`` inspects only hardware visible to the current process.
+    CUDA is preferred among published devices, unpublished backends are
+    never auto-selected, and an explicit request stays on that device.
+    A missing backend or out-of-range ``cuda:N`` fails closed.
 
     Parameters
     ----------
     device : {"auto", "cpu", "cuda", "mps"} or torch.device, optional
-        Requested execution device.
+        Requested execution device. Any value ``torch.device`` can
+        construct is also admitted.
 
     Returns
     -------
     torch.device
-        Resolved device.
+        Admitted device identity.
 
     Raises
     ------
     RuntimeError
-        If an explicit CUDA/MPS device is requested but unavailable.
+        If an explicit device is requested but unavailable or unusable.
 
     """
-    torch = _import_torch()
-    if isinstance(device, torch.device):
-        resolved = device
-    elif device is None or str(device).lower() in ("auto", "gpu"):
-        if torch.cuda.is_available():
-            resolved = torch.device("cuda")
-        else:
-            resolved = torch.device("cpu")
-    else:
-        requested = str(device).lower()
-        if requested == "cuda":
-            if not torch.cuda.is_available():
-                message = "CUDA requested but torch.cuda is unavailable"
-                logger.error(message, stacklevel=2)
-                raise RuntimeError(message)
-            resolved = torch.device("cuda")
-        elif requested == "mps":
-            if not (
-                hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-            ):
-                message = "MPS requested but torch.backends.mps is unavailable"
-                logger.error(message, stacklevel=2)
-                raise RuntimeError(message)
-            logger.warning(
-                "Direct MPS kernel execution is experimental; production Stack "
-                "stages use their NumPy CPU fallback instead.",
-                stacklevel=2,
-            )
-            resolved = torch.device("mps")
-        elif requested == "cpu":
-            resolved = torch.device("cpu")
-        else:
-            message = f"unknown torch device: {device!r}"
-            logger.error(message, stacklevel=2)
-            raise RuntimeError(message)
-    return resolved
+    from faninsar._core.device import parse_device
+
+    return parse_device(device)
+
+
 def cleanup_device(device: torch.device) -> None:
     """Release allocator caches after accelerator kernel execution.
 
