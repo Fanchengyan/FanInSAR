@@ -21,11 +21,18 @@ class NativePreparationError(RuntimeError):
         super().__init__("prepared native candidate has no entry point")
 
 
-class GeometryOperation(StrEnum):
-    """The two exact operation identities supported by native v2."""
+class NativeOperation(StrEnum):
+    """Exact operation identities supported by the native v2 builder."""
 
     GEO2RDR = "geo2rdr"
     RDR2GEO = "rdr2geo"
+    AMPCOR_PREFIX_ENERGY = "ampcor_prefix_energy.v1"
+    AMPCOR_NCC_POSTPROCESS = "ampcor_ncc_postprocess.v1"
+
+
+# Keep the P25 public name valid for geometry callers while the builder grows
+# a neutral operation namespace for non-geometry native primitives.
+GeometryOperation = NativeOperation
 
 
 class NativeBackend(StrEnum):
@@ -47,7 +54,7 @@ class PreparationStatus(StrEnum):
 class NativeBuildRequest:
     """Inputs needed to make one operation/device build plan."""
 
-    operation: GeometryOperation
+    operation: NativeOperation
     backend: NativeBackend
     source_root: Path = Path()
     platform: str | None = None
@@ -57,7 +64,7 @@ class NativeBuildRequest:
 
     def __post_init__(self) -> None:
         """Normalize string enum inputs and source paths."""
-        object.__setattr__(self, "operation", GeometryOperation(self.operation))
+        object.__setattr__(self, "operation", NativeOperation(self.operation))
         object.__setattr__(self, "backend", NativeBackend(self.backend))
         object.__setattr__(self, "source_root", Path(self.source_root))
         if self.libomp_root is not None:
@@ -71,7 +78,7 @@ class NativeBuildRequest:
 class BuildPlan:
     """Deterministic native build plan with compile/link separation."""
 
-    operation: GeometryOperation
+    operation: NativeOperation
     backend: NativeBackend
     extension_name: str
     geometry_symbol: str
@@ -125,7 +132,7 @@ class PreparedNativeCandidate:
 
 
 def select_native_sources(
-    operation: GeometryOperation | str,
+    operation: NativeOperation | str,
     backend: NativeBackend | str,
     source_root: str | Path = ".",
 ) -> tuple[Path, ...]:
@@ -147,10 +154,30 @@ def select_native_sources(
         CUDA uses ``.cu`` files while CPU uses ``.cpp`` files.
 
     """
-    operation = GeometryOperation(operation)
+    operation = NativeOperation(operation)
     backend = NativeBackend(backend)
-    suffix = ".cu" if backend is NativeBackend.CUDA else ".cpp"
     root = Path(source_root)
+    if operation is NativeOperation.AMPCOR_PREFIX_ENERGY:
+        if backend is NativeBackend.CUDA:
+            return (
+                root / "ampcor_cuda_bindings.cpp",
+                root / "ampcor_prefix_energy_cuda.cu",
+            )
+        return (
+            root / "ampcor_bindings.cpp",
+            root / "ampcor_prefix_energy.cpp",
+        )
+    if operation is NativeOperation.AMPCOR_NCC_POSTPROCESS:
+        if backend is not NativeBackend.CUDA:
+            return (
+                root / "ampcor_ncc_bindings.cpp",
+                root / "ampcor_ncc_postprocess.cpp",
+            )
+        return (
+            root / "ampcor_ncc_cuda_bindings.cpp",
+            root / "ampcor_ncc_postprocess_cuda.cu",
+        )
+    suffix = ".cu" if backend is NativeBackend.CUDA else ".cpp"
     # Keep the binding translation unit first: torch's extension loader needs
     # exactly one ``PYBIND11_MODULE`` unit in every build artifact.  CPU uses
     # the shared ABI implementation and both operation translation units;
@@ -178,13 +205,79 @@ class NativeBuilder:
 
     def plan(self, request: NativeBuildRequest) -> BuildPlan:
         """Create a deterministic build plan without compiling anything."""
-        extension = f"faninsar_{request.operation.value}_v2_{request.backend.value}"
+        operation_name = request.operation.value.replace(".", "_")
+        extension = f"faninsar_{operation_name}_v2_{request.backend.value}"
+        if request.operation in (
+            NativeOperation.AMPCOR_PREFIX_ENERGY,
+            NativeOperation.AMPCOR_NCC_POSTPROCESS,
+        ):
+            extension = f"faninsar_{operation_name}_{request.backend.value}"
         symbol = extension
         sources = select_native_sources(
             request.operation,
             request.backend,
             request.source_root,
         )
+        if request.operation is NativeOperation.AMPCOR_PREFIX_ENERGY:
+            if request.backend is NativeBackend.CUDA:
+                return BuildPlan(
+                    request.operation,
+                    request.backend,
+                    extension,
+                    symbol,
+                    sources,
+                    ("-O3", "-DFANINSAR_NATIVE_AMPCOR_CUDA=1"),
+                    (),
+                    supported=True,
+                )
+            provider = openmp_provider_for_platform(
+                request.platform,
+                compiler=request.compiler,
+                libomp_root=request.libomp_root,
+            )
+            flags = provider.flags
+            compile_flags = flags.compile_flags
+            if flags.runtime_name == "libomp":
+                compile_flags += ("-DFANINSAR_OPENMP_RUNTIME_LIBOMP",)
+            elif flags.runtime_name == "libgomp":
+                compile_flags += ("-DFANINSAR_OPENMP_RUNTIME_LIBGOMP",)
+            return BuildPlan(
+                request.operation,
+                request.backend,
+                extension,
+                symbol,
+                sources,
+                compile_flags,
+                flags.link_flags,
+                flags.include_dirs,
+                flags.library_dirs,
+                flags.runtime_name or None,
+                supported=flags.supported,
+                unsupported_reason=flags.reason,
+            )
+        if request.operation is NativeOperation.AMPCOR_NCC_POSTPROCESS:
+            if request.backend is not NativeBackend.CUDA:
+                return BuildPlan(
+                    request.operation,
+                    request.backend,
+                    extension,
+                    symbol,
+                    sources,
+                    (),
+                    (),
+                    supported=False,
+                    unsupported_reason="NCC postprocess prototype is CUDA-only",
+                )
+            return BuildPlan(
+                request.operation,
+                request.backend,
+                extension,
+                symbol,
+                sources,
+                ("-O3", "-DFANINSAR_NATIVE_AMPCOR_NCC_CUDA=1"),
+                (),
+                supported=True,
+            )
         if request.backend is NativeBackend.CPU:
             provider = openmp_provider_for_platform(
                 request.platform,
