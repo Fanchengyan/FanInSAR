@@ -46,6 +46,12 @@ jobs:
         with:
           version: "latest"
 
+      - name: Initialize MSVC developer command environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install project and CPU test dependencies
         run: |
           uv sync --dev --python 3.11
