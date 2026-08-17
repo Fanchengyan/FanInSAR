@@ -1556,6 +1556,57 @@ def test_ampcor_boundary_oracle_stabilizes_backend_drift(
     assert result.azimuth_shift_px == -0.25
 
 
+@pytest.mark.parametrize("backend", ["eager", "compile", "native"])
+@pytest.mark.parametrize("profile", ["near_uniform", "high_dynamic"])
+def test_ampcor_candidate_energy_guard_uses_fft_fallback(
+    monkeypatch: pytest.MonkeyPatch, backend: str, profile: str
+) -> None:
+    """Unsafe candidate energy is replaced by the same-device FFT result."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+    from faninsar.processing.coreg.ampcor_backend import AmpcorEnergyCandidate
+
+    if profile == "near_uniform":
+        secondary = torch.ones((1, 8, 8), dtype=torch.float64)
+        secondary[0, 0, 0] += 1e-3
+    else:
+        secondary = torch.zeros((1, 8, 8), dtype=torch.float64)
+        secondary[0, 0, 0] = 1e5
+    reference = torch.arange(16, dtype=torch.float64).reshape(1, 4, 4)
+    fft_calls: list[int] = []
+
+    def zero_energy(value: object) -> object:
+        fft_calls.append(-1)
+        return torch.zeros(
+            (value.shape[0], value.shape[1] - 4 + 1, value.shape[2] - 4 + 1),
+            dtype=torch.float64,
+            device=value.device,
+        )
+
+    candidate = AmpcorEnergyCandidate(
+        backend=backend,  # type: ignore[arg-type]
+        device="cpu",
+        window_shape=(4, 4),
+        executor=zero_energy,
+        input_shape=(1, 8, 8),
+    )
+
+    def fake_fft(sec: object, _ref: object, **_kwargs: object) -> object:
+        fft_calls.append(1)
+        return torch.ones((sec.shape[0], 5, 5), dtype=torch.float64, device=sec.device)
+
+    monkeypatch.setattr(offsets_mod, "_torch_local_energy_fft", fake_fft)
+    offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=2,
+        search_rg=2,
+        subpixel=False,
+        energy_candidate=candidate,
+    )
+    assert fft_calls == [-1, 1]
+
+
 def test_ampcor_cuda_rejects_unqualified_fft_shape_before_kernel() -> None:
     """An out-of-window FFT shape cannot bypass the qualified CUDA lane."""
     from faninsar.processing.coreg import offsets as offsets_mod

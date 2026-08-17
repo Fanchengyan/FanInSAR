@@ -1181,6 +1181,37 @@ def _torch_local_energy_fft(
     ]
 
 
+def _torch_integral_energy_output_is_safe(
+    energy: object,
+    precheck: tuple[object, object] | None,
+    *,
+    window_az: int,
+    window_rg: int,
+    torch_module: object,
+) -> bool:
+    """Validate a local-energy surface against the integral error bound."""
+    if precheck is None:
+        return False
+    tile_error, global_max_abs = precheck
+    try:
+        lower_bound = torch_module.clamp(energy - tile_error[:, None, None], min=0.0)
+        risk_upper = (
+            window_az
+            * window_rg
+            * global_max_abs[:, None, None].square()
+            / torch_module.clamp(lower_bound, min=torch_module.finfo(energy.dtype).tiny)
+        )
+        output_safe = (
+            torch_module.isfinite(energy)
+            & torch_module.isfinite(lower_bound)
+            & (energy >= 0.0)
+            & (risk_upper <= 1e12)
+        )
+        return bool(torch_module.all(output_safe).item())
+    except Exception:
+        return False
+
+
 def _torch_ampcor_workspace_bytes(
     *,
     window_az: int,
@@ -1289,9 +1320,27 @@ def _torch_patch_ncc_batch(
                 raise
             candidate_energy = fallback_candidate.execute(sec)
     if candidate_energy is not None:
-        energy = candidate_energy
+        if _torch_integral_energy_output_is_safe(
+            candidate_energy,
+            precheck,
+            window_az=window_az,
+            window_rg=window_rg,
+            torch_module=torch,
+        ):
+            energy = candidate_energy
+        else:
+            energy = _torch_local_energy_fft(
+                sec,
+                ref,
+                fft_height=fft_height,
+                fft_width=fft_width,
+                window_az=window_az,
+                window_rg=window_rg,
+                search_az=search_az,
+                search_rg=search_rg,
+                torch_module=torch,
+            )
     elif precheck is not None:
-        tile_error, global_max_abs = precheck
         # Each valid lag selects one rectangular window from ``sec``.  A
         # padded float64 integral image gives all local energies directly.
         sec_sq = sec * sec
@@ -1322,24 +1371,13 @@ def _torch_patch_ncc_batch(
         ]
         top_left = integral[:, : 2 * search_az + 1, : 2 * search_rg + 1]
         energy = bottom_right - top_right - bottom_left + top_left
-        try:
-            lower_bound = torch.clamp(energy - tile_error[:, None, None], min=0.0)
-            risk_upper = (
-                window_az
-                * window_rg
-                * global_max_abs[:, None, None].square()
-                / torch.clamp(lower_bound, min=torch.finfo(torch.float64).tiny)
-            )
-            output_safe = (
-                torch.isfinite(energy)
-                & torch.isfinite(lower_bound)
-                & (energy >= 0.0)
-                & (risk_upper <= 1e12)
-            )
-            integral_safe = bool(torch.all(output_safe).item())
-        except Exception:
-            integral_safe = False
-        if not integral_safe:
+        if not _torch_integral_energy_output_is_safe(
+            energy,
+            precheck,
+            window_az=window_az,
+            window_rg=window_rg,
+            torch_module=torch,
+        ):
             energy = _torch_local_energy_fft(
                 sec,
                 ref,
