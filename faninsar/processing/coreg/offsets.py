@@ -6,7 +6,7 @@ import os
 import re
 import stat
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
@@ -614,6 +614,8 @@ def _admit_torch_ampcor_workspace(
     device_key: str,
     planned_bytes: int,
     limit_bytes: int,
+    *,
+    process_admitted: bool = False,
 ) -> Iterator[None]:
     """Reserve an estimated Ampcor workspace ledger entry.
 
@@ -633,7 +635,7 @@ def _admit_torch_ampcor_workspace(
             raise ValueError(message)
         _TORCH_AMPCOR_RESERVED_BYTES[device_key] = reserved + planned_bytes
     try:
-        if device_key.startswith(("cuda", "mps")):
+        if device_key.startswith(("cuda", "mps")) and not process_admitted:
             with _admit_torch_ampcor_process(device_key):
                 yield
         else:
@@ -1531,17 +1533,18 @@ def _ampcor_apply_boundary_oracle(
     d_rg = d_rg.clone()
     d_az = d_az.clone()
     snr = snr.clone()
+    boundary_indices = torch_module.nonzero(boundary, as_tuple=True)[0]
     oracle_rg, oracle_az, oracle_snr = _torch_patch_ncc_batch(
-        ref_tensor,
-        sec_tensor,
+        ref_tensor[boundary_indices],
+        sec_tensor[boundary_indices],
         search_az=search_az,
         search_rg=search_rg,
         subpixel=subpixel,
         force_fft_energy=True,
     )
-    d_rg[boundary] = oracle_rg[boundary]
-    d_az[boundary] = oracle_az[boundary]
-    snr[boundary] = oracle_snr[boundary]
+    d_rg[boundary_indices] = oracle_rg
+    d_az[boundary_indices] = oracle_az
+    snr[boundary_indices] = oracle_snr
     return d_rg, d_az, snr
 
 
@@ -1685,6 +1688,7 @@ def _estimate_patch_amplitude_shift_torch(
             device_key,
             planned_workspace,
             max_workspace_bytes,
+            process_admitted=device_key.startswith(("cuda", "mps")),
         ):
             ref_tensor: object | None = None
             sec_tensor: object | None = None
@@ -1747,64 +1751,75 @@ def _estimate_patch_amplitude_shift_torch(
                 d_az = None
                 snr = None
                 valid = None
-                # Keep admission held until asynchronous work has completed.
-                # Driver synchronization/cache calls are best effort: neither
-                # can guarantee allocator release across all Torch drivers.
-                try:
-                    _synchronize_torch_device(resolved_device)
-                except BaseException as error:
-                    if primary_error is None:
-                        primary_error = error
-                        primary_traceback = error.__traceback__
-                    logger.exception("Ampcor device synchronization failed")
-                try:
-                    _release_torch_device_cache(resolved_device)
-                except BaseException:
-                    logger.exception(
-                        "Ampcor allocator cache release failed; references were "
-                        "still dropped"
-                    )
                 ref_windows = []
                 sec_searches = []
             if primary_error is not None:
                 raise primary_error.with_traceback(primary_traceback)
 
-    for az_c in az_centres:
-        for rg_c in rg_centres:
-            r0 = int(az_c) - half_az
-            r1 = r0 + window_az
-            c0 = int(rg_c) - half_rg
-            c1 = c0 + window_rg
-            sr0 = r0 - search_az
-            sr1 = r1 + search_az
-            sc0 = c0 - search_rg
-            sc1 = c1 + search_rg
-            if sr0 < 0 or sc0 < 0 or sr1 > height or sc1 > width:
-                continue
-            n_attempted += 1
-            ref_windows.append(_ampcor_magnitude_tile(reference, r0, r1, c0, c1))
-            sec_searches.append(
-                _ampcor_magnitude_tile(
-                    secondary,
-                    sr0,
-                    sr1,
-                    sc0,
-                    sc1,
-                    cyclic_shift=secondary_shift,
+    def run_batches() -> PatchAmplitudeShiftResult:
+        """Materialize, score, and reduce all bounded Torch batches."""
+        nonlocal n_attempted
+        for az_c in az_centres:
+            for rg_c in rg_centres:
+                r0 = int(az_c) - half_az
+                r1 = r0 + window_az
+                c0 = int(rg_c) - half_rg
+                c1 = c0 + window_rg
+                sr0 = r0 - search_az
+                sr1 = r1 + search_az
+                sc0 = c0 - search_rg
+                sc1 = c1 + search_rg
+                if sr0 < 0 or sc0 < 0 or sr1 > height or sc1 > width:
+                    continue
+                n_attempted += 1
+                ref_windows.append(_ampcor_magnitude_tile(reference, r0, r1, c0, c1))
+                sec_searches.append(
+                    _ampcor_magnitude_tile(
+                        secondary,
+                        sr0,
+                        sr1,
+                        sc0,
+                        sc1,
+                        cyclic_shift=secondary_shift,
+                    )
                 )
-            )
-            if len(ref_windows) >= batch_size:
-                consume_batch()
-    consume_batch()
-    if not range_shifts:
-        return PatchAmplitudeShiftResult(0.0, 0.0, 0, 0.0, n_attempted)
-    return PatchAmplitudeShiftResult(
-        range_shift_px=_torch_cpu_median(range_shifts, torch),
-        azimuth_shift_px=_torch_cpu_median(azimuth_shifts, torch),
-        n_valid=n_valid,
-        snr_median=_torch_cpu_median(snr_values, torch),
-        n_attempted=n_attempted,
+                if len(ref_windows) >= batch_size:
+                    consume_batch()
+        consume_batch()
+        if not range_shifts:
+            return PatchAmplitudeShiftResult(0.0, 0.0, 0, 0.0, n_attempted)
+        return PatchAmplitudeShiftResult(
+            range_shift_px=_torch_cpu_median(range_shifts, torch),
+            azimuth_shift_px=_torch_cpu_median(azimuth_shifts, torch),
+            n_valid=n_valid,
+            snr_median=_torch_cpu_median(snr_values, torch),
+            n_attempted=n_attempted,
+        )
+
+    process_admitted = device_key.startswith(("cuda", "mps"))
+    call_admission = (
+        _admit_torch_ampcor_process(device_key) if process_admitted else nullcontext()
     )
+    with call_admission:
+        try:
+            return run_batches()
+        finally:
+            # Complete all device work before releasing the call-scoped lease.
+            synchronization_error: BaseException | None = None
+            try:
+                _synchronize_torch_device(resolved_device)
+            except BaseException as error:
+                synchronization_error = error
+                logger.exception("Ampcor device synchronization failed")
+            try:
+                _release_torch_device_cache(resolved_device)
+            except BaseException:
+                logger.exception(
+                    "Ampcor allocator cache release failed; references were "
+                    "still dropped"
+                )
+            if synchronization_error is not None:
+                raise synchronization_error
 
 
 def _ampcor_candidate_shape_matches(

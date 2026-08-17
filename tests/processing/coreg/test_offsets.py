@@ -1556,10 +1556,12 @@ def test_ampcor_seed_123_boundary_is_parity_stable(
     monkeypatch.setattr(
         offsets_mod,
         "_torch_patch_ncc_batch",
-        lambda *_args, **_kwargs: (
-            torch.tensor([0.25, 0.5], dtype=torch.float64),
-            torch.tensor([-0.25, -0.5], dtype=torch.float64),
-            torch.tensor([snr_threshold, snr_below], dtype=torch.float64),
+        lambda ref, *_args, **_kwargs: (
+            torch.tensor([0.25, 0.5], dtype=torch.float64)[: ref.shape[0]],
+            torch.tensor([-0.25, -0.5], dtype=torch.float64)[: ref.shape[0]],
+            torch.tensor([snr_threshold, snr_below], dtype=torch.float64)[
+                : ref.shape[0]
+            ],
         ),
     )
     monkeypatch.setattr(
@@ -1631,6 +1633,162 @@ def test_ampcor_boundary_oracle_stabilizes_backend_drift(
     assert result.n_valid == 1
     assert result.range_shift_px == 0.25
     assert result.azimuth_shift_px == -0.25
+
+
+def test_ampcor_boundary_oracle_recomputes_only_boundary_lanes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary reference work is limited to lanes near a cull threshold."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    threshold = np.float64(5.0)
+    near_threshold = threshold
+    for _ in range(8):
+        near_threshold = np.nextafter(near_threshold, np.inf)
+    far_threshold = threshold
+    for _ in range(100):
+        far_threshold = np.nextafter(far_threshold, np.inf)
+    calls: list[tuple[int, bool]] = []
+
+    def fake_ncc(ref: object, *_args: object, **kwargs: object) -> tuple[object, ...]:
+        count = int(ref.shape[0])
+        force_fft = bool(kwargs.get("force_fft_energy", False))
+        calls.append((count, force_fft))
+        if force_fft:
+            # The oracle changes only the first lane.  A full-batch rerun would
+            # incorrectly change the non-boundary lane as well.
+            return (
+                torch.full((count,), 0.75, dtype=torch.float64),
+                torch.full((count,), -0.25, dtype=torch.float64),
+                torch.full((count,), threshold, dtype=torch.float64),
+            )
+        return (
+            torch.tensor([0.25, 0.5], dtype=torch.float64),
+            torch.tensor([-0.25, -0.5], dtype=torch.float64),
+            torch.tensor([near_threshold, far_threshold], dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", fake_ncc)
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 96), dtype=np.complex64),
+        np.ones((64, 96), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=2,
+        margin_rg=16,
+        margin_az=8,
+        snr_threshold=float(threshold),
+        max_abs_residual=1.2,
+        executor="torch",
+        device="cpu",
+        batch_size=2,
+    )
+
+    assert calls == [(2, False), (1, True)]
+    assert result.n_valid == 2
+    assert result.range_shift_px == pytest.approx(0.625)
+    assert result.azimuth_shift_px == pytest.approx(-0.375)
+
+
+def test_ampcor_cache_cleanup_is_call_scoped_across_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Synchronization and allocator cleanup happen once after all batches."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    sync_devices: list[object] = []
+    cleanup_devices: list[object] = []
+
+    def record_sync(device: object) -> None:
+        sync_devices.append(device)
+
+    def record_cleanup(device: object) -> None:
+        cleanup_devices.append(device)
+
+    def valid_ncc(ref: object, *_args: object, **_kwargs: object) -> tuple[object, ...]:
+        count = int(ref.shape[0])
+        return (
+            torch.zeros(count, dtype=torch.float64),
+            torch.zeros(count, dtype=torch.float64),
+            torch.full((count,), 10.0, dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_synchronize_torch_device", record_sync)
+    monkeypatch.setattr(offsets_mod, "_release_torch_device_cache", record_cleanup)
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", valid_ncc)
+
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 128), dtype=np.complex64),
+        np.ones((64, 128), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=3,
+        margin_rg=16,
+        margin_az=8,
+        executor="torch",
+        device="cpu",
+        batch_size=1,
+    )
+
+    assert result.n_valid == 3
+    assert sync_devices == [torch.device("cpu")]
+    assert cleanup_devices == [torch.device("cpu")]
+    assert offsets_mod._TORCH_AMPCOR_RESERVED_BYTES == {}
+
+
+def test_ampcor_cache_cleanup_is_call_scoped_on_batch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing batch still releases the call-scoped cleanup resources once."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    sync_devices: list[object] = []
+    cleanup_devices: list[object] = []
+    monkeypatch.setattr(
+        offsets_mod,
+        "_synchronize_torch_device",
+        lambda device: sync_devices.append(device),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_release_torch_device_cache",
+        lambda device: cleanup_devices.append(device),
+    )
+
+    def failing_ncc(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        message = "synthetic NCC failure"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", failing_ncc)
+    with pytest.raises(RuntimeError, match="synthetic NCC failure"):
+        estimate_patch_amplitude_shift(
+            np.ones((64, 128), dtype=np.complex64),
+            np.ones((64, 128), dtype=np.complex64),
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=3,
+            margin_rg=16,
+            margin_az=8,
+            executor="torch",
+            device="cpu",
+            batch_size=1,
+        )
+
+    assert sync_devices == [torch.device("cpu")]
+    assert cleanup_devices == [torch.device("cpu")]
+    assert offsets_mod._TORCH_AMPCOR_RESERVED_BYTES == {}
 
 
 @pytest.mark.parametrize("backend", ["eager", "compile", "native"])
