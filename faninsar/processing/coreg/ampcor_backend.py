@@ -419,6 +419,47 @@ def native_workspace_bytes(
     return 8 * (input_values + prefix + output)
 
 
+def native_ncc_workspace_bytes(
+    search_shape: tuple[int, int], batch_size: int
+) -> int:
+    """Return the native NCC postprocess output packet size in bytes.
+
+    Parameters
+    ----------
+    search_shape : tuple[int, int]
+        Correlation surface dimensions ``(height, width)``.
+    batch_size : int
+        Prepared batch capacity.
+
+    Returns
+    -------
+    int
+        Conservative bytes for three float64 outputs and two boolean masks.
+
+    Raises
+    ------
+    ValueError
+        If the surface or batch dimensions are invalid.
+
+    """
+    if (
+        len(search_shape) != 2
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in search_shape
+        )
+        or any(value < 1 for value in search_shape)
+    ):
+        raise ValueError("native NCC search_shape must contain positive integers")
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size < 1
+    ):
+        raise ValueError("native NCC batch_size must be a positive integer")
+    return batch_size * (3 * 8 + 2)
+
+
 def torch_integral_energy(
     secondary_centered: object, window_az: int, window_rg: int
 ) -> object:
@@ -675,9 +716,9 @@ class AmpcorBackendRegistry:
                 abi_version=candidate.abi_version,
             ):
                 continue
-            if source_digest != candidate.source_digest:
+            if source_digest not in ("", candidate.source_digest):
                 continue
-            if abi_version != candidate.abi_version:
+            if abi_version not in ("", candidate.abi_version):
                 continue
             if runtime_profile not in ("", candidate.runtime_profile):
                 continue
@@ -1054,6 +1095,7 @@ __all__ = [
     "ampcor_ncc_postprocess_reference",
     "canonical_torch_device",
     "eager_ampcor_candidate",
+    "native_ncc_workspace_bytes",
     "native_workspace_bytes",
     "prepare_ampcor_compile",
     "prepare_ampcor_native",

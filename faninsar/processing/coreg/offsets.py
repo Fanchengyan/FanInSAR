@@ -19,9 +19,13 @@ from scipy.ndimage import map_coordinates
 from faninsar.logging import setup_logger
 from faninsar.processing.coreg.ampcor_backend import (
     AmpcorBackend,
+    AmpcorBackendRegistry,
     AmpcorCandidateError,
     AmpcorEnergyCandidate,
+    AmpcorNccCandidate,
+    AmpcorNccCandidateError,
     eager_ampcor_candidate,
+    native_ncc_workspace_bytes,
     native_workspace_bytes,
 )
 from faninsar.processing.errors import reject_invalid_state
@@ -1350,9 +1354,13 @@ def _torch_patch_ncc_batch(
     search_az: int,
     search_rg: int,
     subpixel: bool,
+    snr_threshold: float = 5.0,
+    max_abs_residual: float = 1.2,
     force_fft_energy: bool = False,
     energy_candidate: AmpcorEnergyCandidate | None = None,
     fallback_candidate: AmpcorEnergyCandidate | None = None,
+    ncc_candidate: AmpcorNccCandidate | None = None,
+    ncc_quarantine: set[int] | None = None,
 ) -> tuple[object, object, object]:
     """Evaluate a batch of Ampcor NCC surfaces with Torch float64 math."""
     import torch
@@ -1476,6 +1484,33 @@ def _torch_patch_ncc_batch(
             search_rg=search_rg,
             torch_module=torch,
         )
+    # The native postprocess is an optional fixed-shape accelerator.  The
+    # public boundary still owns threshold culling and the two-phase boundary
+    # oracle, so native ``surface_edge`` and ``valid`` outputs are ignored.
+    # A candidate failure is quarantined for the remainder of this call and
+    # falls through to the same-device Torch implementation.
+    if (
+        not force_fft_energy
+        and ncc_candidate is not None
+        and count == ncc_candidate.batch_size
+        and (ncc_quarantine is None or id(ncc_candidate) not in ncc_quarantine)
+    ):
+        try:
+            native_result = ncc_candidate.execute(
+                corr.contiguous(),
+                energy.contiguous(),
+                subpixel=subpixel,
+                snr_threshold=snr_threshold,
+                max_abs_residual=max_abs_residual,
+            )
+            return native_result[0], native_result[1], native_result[2]
+        except AmpcorNccCandidateError:
+            if ncc_quarantine is not None:
+                ncc_quarantine.add(id(ncc_candidate))
+            logger.exception(
+                "Ampcor native NCC candidate failed; quarantining it for this call"
+            )
+
     ncc = corr / torch.sqrt(torch.clamp(energy, min=1e-12))
     surface_width = 2 * search_rg + 1
     peak_flat = torch.argmax(ncc.reshape(count, -1), dim=1)
@@ -1590,6 +1625,7 @@ def _estimate_patch_amplitude_shift_torch(
     secondary_shift: tuple[int, int],
     energy_candidate: AmpcorEnergyCandidate,
     fallback_candidate: AmpcorEnergyCandidate | None = None,
+    ncc_candidate: AmpcorNccCandidate | None = None,
 ) -> PatchAmplitudeShiftResult:
     """Run bounded Torch batches for the opt-in Ampcor executor.
 
@@ -1650,6 +1686,10 @@ def _estimate_patch_amplitude_shift_torch(
             ),
         )
     planned_workspace = max(planned_workspace, energy_candidate.workspace_bytes)
+    if ncc_candidate is not None:
+        planned_workspace += native_ncc_workspace_bytes(
+            ncc_candidate.search_shape, ncc_candidate.batch_size
+        )
     if planned_workspace > max_workspace_bytes:
         message = (
             f"Ampcor batch workspace {planned_workspace} bytes exceeds the "
@@ -1698,6 +1738,7 @@ def _estimate_patch_amplitude_shift_torch(
     azimuth_shifts: list[object] = []
     snr_values: list[object] = []
     n_valid = 0
+    ncc_quarantine: set[int] = set()
     device_key = _torch_ampcor_admission_key(resolved_device, torch)
 
     def publish_outputs(d_rg: object, d_az: object, snr: object) -> None:
@@ -1749,8 +1790,12 @@ def _estimate_patch_amplitude_shift_torch(
                     search_az=search_az,
                     search_rg=search_rg,
                     subpixel=subpixel,
+                    snr_threshold=snr_threshold,
+                    max_abs_residual=max_abs_residual,
                     energy_candidate=energy_candidate,
                     fallback_candidate=fallback_candidate,
+                    ncc_candidate=ncc_candidate,
+                    ncc_quarantine=ncc_quarantine,
                 )
                 boundary = _ampcor_boundary_mask_torch(
                     snr,
@@ -1945,6 +1990,8 @@ def estimate_patch_amplitude_shift(
     executor: Literal["auto", "numpy", "torch"] = "numpy",
     backend: AmpcorBackend | Literal["auto"] = "auto",
     ampcor_candidate: AmpcorEnergyCandidate | None = None,
+    ampcor_ncc_candidate: AmpcorNccCandidate | None = None,
+    ampcor_ncc_registry: AmpcorBackendRegistry | None = None,
     batch_size: int = 32,
     device: Literal["auto", "cpu", "cuda"] = "auto",
     max_workspace_bytes: int = _TORCH_AMPCOR_WORKSPACE_CAP_BYTES,
@@ -1993,6 +2040,13 @@ def estimate_patch_amplitude_shift(
         compile/native mode fails closed unless its candidate is prepared.
     ampcor_candidate : AmpcorEnergyCandidate, optional
         Candidate prepared explicitly by the Ampcor backend preparation API.
+    ampcor_ncc_candidate : AmpcorNccCandidate, optional
+        Prepared native CUDA NCC candidate. It is accepted only after an exact
+        registry lookup and current runtime/source/ABI revalidation; all
+        other calls use the same-device Torch postprocess.
+    ampcor_ncc_registry : AmpcorBackendRegistry, optional
+        Registry containing prepared native NCC candidates. If omitted, a
+        supplied candidate is checked through a temporary exact registry.
     batch_size : int, optional
         Number of patches materialized in one Torch batch. Default 32.
     device : {"auto", "cpu", "cuda"}, optional
@@ -2140,6 +2194,37 @@ def estimate_patch_amplitude_shift(
                 f"Ampcor backend={backend!r} requires a prepared same-device candidate"
             )
         selected_candidate = ampcor_candidate if candidate_matches else eager_candidate
+        selected_ncc_candidate: AmpcorNccCandidate | None = None
+        if (
+            (ampcor_ncc_candidate is not None or ampcor_ncc_registry is not None)
+            and resolved_torch_device.startswith("cuda:")
+        ):
+            ncc_registry = ampcor_ncc_registry
+            if ncc_registry is None:
+                ncc_registry = AmpcorBackendRegistry()
+                ncc_registry.register_ncc(ampcor_ncc_candidate)
+            source_digest = (
+                ampcor_ncc_candidate.source_digest
+                if ampcor_ncc_candidate is not None
+                else ""
+            )
+            abi_version = (
+                ampcor_ncc_candidate.abi_version
+                if ampcor_ncc_candidate is not None
+                else "faninsar.ampcor_ncc_postprocess.v1"
+            )
+            selected_ncc_candidate = ncc_registry.get_ncc(
+                resolved_torch_device,
+                (2 * int(search_az) + 1, 2 * int(search_rg) + 1),
+                batch_size=int(batch_size),
+                runtime_profile=(
+                    ampcor_ncc_candidate.runtime_profile
+                    if ampcor_ncc_candidate is not None
+                    else ""
+                ),
+                source_digest=source_digest,
+                abi_version=abi_version,
+            )
         return _estimate_patch_amplitude_shift_torch(
             reference,
             secondary,
@@ -2164,6 +2249,7 @@ def estimate_patch_amplitude_shift(
                 if backend == "auto" and selected_candidate.backend != "eager"
                 else None
             ),
+            ncc_candidate=selected_ncc_candidate,
         )
     height, width = reference.shape
     half_az = window_az // 2

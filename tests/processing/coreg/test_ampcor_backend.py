@@ -714,3 +714,158 @@ def test_product_passes_centered_secondary_to_energy_candidate() -> None:
         energy_candidate=candidate,
     )
     assert observed == [0.0]
+
+
+def test_torch_ncc_batch_uses_prepared_native_candidate() -> None:
+    """A full qualified-shape batch dispatches the prepared NCC callable."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets
+
+    calls: list[int] = []
+
+    def execute(
+        correlation: object,
+        energy: object,
+        subpixel: bool,
+        snr_threshold: float,
+        max_abs_residual: float,
+    ) -> tuple[object, ...]:
+        calls.append(int(correlation.shape[0]))
+        return ampcor_ncc_postprocess_reference(
+            correlation,
+            energy,
+            search_az=1,
+            search_rg=1,
+            subpixel=subpixel,
+            snr_threshold=snr_threshold,
+            max_abs_residual=max_abs_residual,
+        )
+
+    candidate = AmpcorNccCandidate(
+        device="cpu",
+        search_shape=(3, 3),
+        executor=execute,
+        batch_size=2,
+    )
+    correlation = torch.ones((2, 3, 3), dtype=torch.float64)
+    result = offsets._torch_patch_ncc_batch(
+        correlation,
+        correlation,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+        ncc_candidate=candidate,
+        ncc_quarantine=set(),
+    )
+    assert all(value.shape == (2,) for value in result)
+    assert calls == [2]
+
+
+def test_torch_ncc_batch_falls_back_for_partial_final_batch() -> None:
+    """A fixed prepared NCC capacity never receives a partial final batch."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets
+
+    calls: list[str] = []
+
+    def execute(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        calls.append("native")
+        raise AssertionError
+
+    candidate = AmpcorNccCandidate(
+        device="cpu",
+        search_shape=(3, 3),
+        executor=execute,
+        batch_size=2,
+    )
+    values = torch.ones((1, 3, 3), dtype=torch.float64)
+    result = offsets._torch_patch_ncc_batch(
+        values,
+        values,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+        ncc_candidate=candidate,
+        ncc_quarantine=set(),
+    )
+    assert all(value.shape == (1,) for value in result)
+    assert calls == []
+
+
+def test_torch_ncc_batch_quarantines_native_exception() -> None:
+    """A native NCC error falls back and is not retried in the same call."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets
+
+    calls: list[str] = []
+
+    def execute(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        calls.append("native")
+        raise RuntimeError
+
+    candidate = AmpcorNccCandidate(
+        device="cpu",
+        search_shape=(3, 3),
+        executor=execute,
+        batch_size=1,
+    )
+    values = torch.ones((1, 3, 3), dtype=torch.float64)
+    quarantine: set[int] = set()
+    for _ in range(2):
+        result = offsets._torch_patch_ncc_batch(
+            values,
+            values,
+            search_az=1,
+            search_rg=1,
+            subpixel=False,
+            ncc_candidate=candidate,
+            ncc_quarantine=quarantine,
+        )
+        assert all(value.shape == (1,) for value in result)
+    assert calls == ["native"]
+    assert id(candidate) in quarantine
+
+
+def test_native_ncc_workspace_packet_is_admitted() -> None:
+    """The NCC result packet has a checked batch-derived workspace size."""
+    from faninsar.processing.coreg.ampcor_backend import native_ncc_workspace_bytes
+
+    assert native_ncc_workspace_bytes((17, 17), 16) == 16 * (3 * 8 + 2)
+
+
+def test_public_ampcor_keeps_ncc_native_disabled_on_cpu() -> None:
+    """The public path never dispatches a CUDA NCC candidate on CPU."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg import estimate_patch_amplitude_shift
+
+    calls: list[str] = []
+
+    def execute(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        calls.append("native")
+        raise AssertionError
+
+    candidate = AmpcorNccCandidate(
+        device="cpu",
+        search_shape=(3, 3),
+        executor=execute,
+        batch_size=1,
+    )
+    values = np.arange(64, dtype=np.float64).reshape(8, 8)
+    result = estimate_patch_amplitude_shift(
+        values,
+        values,
+        window_az=2,
+        window_rg=2,
+        search_az=1,
+        search_rg=1,
+        n_az=1,
+        n_rg=1,
+        margin_az=2,
+        margin_rg=2,
+        executor="torch",
+        device="cpu",
+        ampcor_ncc_candidate=candidate,
+        batch_size=1,
+    )
+    assert result.n_attempted == 1
+    assert calls == []
