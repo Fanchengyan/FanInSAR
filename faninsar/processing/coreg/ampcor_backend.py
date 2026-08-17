@@ -205,7 +205,7 @@ _NCC_QUALIFIED_RECORDS = (
         cuda_runtime=_NCC_QUALIFIED_CUDA,
         minimum_memory_bytes=_NCC_QUALIFIED_MEMORY_BYTES,
         source_digest=(
-            "c9ab63fc3e1904ecd3ccee1121e349d05de908ac05fd59c4bb6b837641f987d5"
+            "f88a7b883ada00b63677b60cb20965c3a875900596c5642bc4c22226f05dab62"
         ),
         abi_version=_NCC_NATIVE_ABI,
     ),
