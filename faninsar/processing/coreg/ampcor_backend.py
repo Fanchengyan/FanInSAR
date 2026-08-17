@@ -98,7 +98,7 @@ class AmpcorNccRuntimeProfile:
 class _AmpcorNccQualifiedRecord:
     """One append-only native NCC qualification record."""
 
-    search_shapes: frozenset[tuple[int, int]]
+    qualified_combinations: frozenset[tuple[tuple[int, int], int]]
     device_name: str
     compute_capability: tuple[int, int]
     torch_version: str
@@ -110,7 +110,12 @@ class _AmpcorNccQualifiedRecord:
 
 _NCC_QUALIFIED_RECORDS = (
     _AmpcorNccQualifiedRecord(
-        search_shapes=frozenset({(17, 17), (33, 33)}),
+        qualified_combinations=frozenset(
+            {
+                ((17, 17), 16),
+                ((33, 33), 32),
+            }
+        ),
         device_name="NVIDIA A100 80GB PCIe",
         compute_capability=_NCC_QUALIFIED_COMPUTE_CAPABILITY,
         torch_version=_NCC_QUALIFIED_TORCH,
@@ -122,8 +127,10 @@ _NCC_QUALIFIED_RECORDS = (
         abi_version=_NCC_NATIVE_ABI,
     ),
 )
-_NCC_PERFORMANCE_SHAPES = frozenset(
-    shape for record in _NCC_QUALIFIED_RECORDS for shape in record.search_shapes
+_NCC_PERFORMANCE_COMBINATIONS = frozenset(
+    combination
+    for record in _NCC_QUALIFIED_RECORDS
+    for combination in record.qualified_combinations
 )
 
 
@@ -154,6 +161,7 @@ def _is_qualified_ncc_profile(
     profile: AmpcorNccRuntimeProfile | None,
     *,
     search_shape: tuple[int, int],
+    batch_size: int,
     source_digest: str,
     abi_version: str,
 ) -> bool:
@@ -161,7 +169,7 @@ def _is_qualified_ncc_profile(
     if profile is None:
         return False
     return any(
-        search_shape in record.search_shapes
+        (search_shape, batch_size) in record.qualified_combinations
         and profile.device_name == record.device_name
         and profile.compute_capability == record.compute_capability
         and profile.torch_version == record.torch_version
@@ -318,12 +326,17 @@ class AmpcorNccCandidate:
     correctness_qualified: bool = True
     performance_eligible: bool = False
     native_module: object | None = None
+    batch_size: int = 1
 
     def __post_init__(self) -> None:
         """Normalize the device identity before registry publication."""
         object.__setattr__(self, "device", canonical_torch_device(self.device))
         if len(self.search_shape) != 2 or any(value < 1 for value in self.search_shape):
             raise ValueError("NCC search_shape must contain positive dimensions")
+        if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int):
+            raise TypeError("NCC batch_size must be a positive integer")
+        if self.batch_size < 1:
+            raise ValueError("NCC batch_size must be a positive integer")
 
     def execute(
         self,
@@ -348,7 +361,12 @@ class AmpcorNccCandidate:
             or correlation.device != energy.device
         ):
             raise AmpcorNccCandidateError("NCC candidate device does not match input")
-        expected = (correlation.shape[0], *self.search_shape)
+        actual_batch = int(correlation.shape[0])
+        if actual_batch < 1 or actual_batch > self.batch_size:
+            raise AmpcorNccCandidateError(
+                "NCC candidate batch_size exceeds prepared batch capacity"
+            )
+        expected = (actual_batch, *self.search_shape)
         if tuple(correlation.shape) != expected or tuple(energy.shape) != expected:
             raise AmpcorNccCandidateError("NCC candidate input shape does not match")
         if correlation.dtype is not torch.float64 or energy.dtype is not torch.float64:
@@ -595,11 +613,15 @@ class AmpcorBackendRegistry:
         """
         if not candidate.prepared or not candidate.correctness_qualified:
             return
-        if candidate.search_shape not in _NCC_PERFORMANCE_SHAPES:
+        if (
+            candidate.search_shape,
+            candidate.batch_size,
+        ) not in _NCC_PERFORMANCE_COMBINATIONS:
             return
         if not _is_qualified_ncc_profile(
             candidate.profile,
             search_shape=candidate.search_shape,
+            batch_size=candidate.batch_size,
             source_digest=candidate.source_digest,
             abi_version=candidate.abi_version,
         ):
@@ -610,6 +632,7 @@ class AmpcorBackendRegistry:
             (
                 candidate.device,
                 candidate.search_shape,
+                candidate.batch_size,
                 candidate.runtime_profile,
                 candidate.source_digest,
                 candidate.abi_version,
@@ -621,23 +644,33 @@ class AmpcorBackendRegistry:
         device: str,
         search_shape: tuple[int, int],
         *,
+        batch_size: int = 1,
         runtime_profile: str = "",
         source_digest: str = "",
         abi_version: str = _NCC_NATIVE_ABI,
     ) -> AmpcorNccCandidate | None:
         """Return an independently qualified NCC candidate, if available."""
-        if search_shape not in _NCC_PERFORMANCE_SHAPES:
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or (search_shape, batch_size) not in _NCC_PERFORMANCE_COMBINATIONS
+        ):
             return None
         resolved = canonical_torch_device(device)
         candidates = tuple(
             candidate
             for key, candidate in self._ncc_candidates.items()
-            if key[0] == resolved and key[1] == search_shape
+            if (
+                key[0] == resolved
+                and key[1] == search_shape
+                and key[2] == batch_size
+            )
         )
         for candidate in candidates:
             if not _is_qualified_ncc_profile(
                 candidate.profile,
                 search_shape=candidate.search_shape,
+                batch_size=candidate.batch_size,
                 source_digest=candidate.source_digest,
                 abi_version=candidate.abi_version,
             ):
@@ -865,6 +898,7 @@ def prepare_ampcor_ncc_native(
     *,
     device: Literal["cuda"],
     search_shape: tuple[int, int],
+    batch_size: int,
     source_root: str | Path,
     build_dir: str | Path,
     compiler: str | None = None,
@@ -882,6 +916,10 @@ def prepare_ampcor_ncc_native(
         raise ValueError("search_shape must contain positive dimensions")
     if search_shape[0] < 3 or search_shape[1] < 3:
         raise ValueError("NCC postprocess requires a 3x3 or larger surface")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError("batch_size must be a positive integer")
+    if batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
     resolved_device = canonical_torch_device(device)
     if not resolved_device.startswith("cuda:"):
         raise ValueError("NCC postprocess native candidate requires CUDA")
@@ -927,7 +965,7 @@ def prepare_ampcor_ncc_native(
         raise RuntimeError("NCC native module has no postprocess entry point")
 
     height, width = search_shape
-    sample_corr = _centered_sample((1, height, width), resolved_device)
+    sample_corr = _centered_sample((batch_size, height, width), resolved_device)
     sample_energy = torch.ones_like(sample_corr)
     native_result = entry(
         sample_corr,
@@ -988,13 +1026,16 @@ def prepare_ampcor_ncc_native(
         device=resolved_device,
         search_shape=search_shape,
         executor=execute_native,
+        batch_size=batch_size,
         runtime_profile=profile.canonical() if profile is not None else "",
         source_digest=source_digest,
         profile=profile,
-        performance_eligible=search_shape in _NCC_PERFORMANCE_SHAPES
+        performance_eligible=(search_shape, batch_size)
+        in _NCC_PERFORMANCE_COMBINATIONS
         and _is_qualified_ncc_profile(
             profile,
             search_shape=search_shape,
+            batch_size=batch_size,
             source_digest=source_digest,
             abi_version=_NCC_NATIVE_ABI,
         ),

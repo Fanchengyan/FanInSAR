@@ -141,6 +141,7 @@ def test_ncc_registry_requires_exact_abi_and_shape(
         device="cuda:0",
         search_shape=(17, 17),
         executor=lambda *_args: (),
+        batch_size=16,
         runtime_profile=profile.canonical(),
         source_digest=_NCC_SOURCE,
         abi_version=_NCC_ABI,
@@ -151,18 +152,21 @@ def test_ncc_registry_requires_exact_abi_and_shape(
     assert registry.get_ncc(
         "cuda",
         (17, 17),
+        batch_size=16,
         runtime_profile=profile.canonical(),
         source_digest=_NCC_SOURCE,
     ) is candidate
     assert registry.get_ncc(
         "cuda",
         (9, 9),
+        batch_size=16,
         runtime_profile=profile.canonical(),
         source_digest=_NCC_SOURCE,
     ) is None
     assert registry.get_ncc(
         "cuda",
         (17, 17),
+        batch_size=16,
         runtime_profile=profile.canonical(),
         source_digest=_NCC_SOURCE,
         abi_version="wrong.abi",
@@ -176,6 +180,7 @@ def test_ncc_candidate_rank_zero_fails_with_candidate_error() -> None:
         device="cpu",
         search_shape=(3, 3),
         executor=lambda *_args: (),
+        batch_size=1,
     )
     scalar = torch.tensor(1.0, dtype=torch.float64)
     with pytest.raises(AmpcorNccCandidateError, match="rank-3"):
@@ -188,9 +193,51 @@ def test_ncc_candidate_rank_zero_fails_with_candidate_error() -> None:
         )
 
 
-@pytest.mark.parametrize("search_shape", [(17, 17), (33, 33)])
+def test_ncc_candidate_accepts_only_prepared_batch_capacity() -> None:
+    """A prepared batch accepts a final partial batch but never a larger one."""
+    torch = pytest.importorskip("torch")
+    candidate = AmpcorNccCandidate(
+        device="cpu",
+        search_shape=(3, 3),
+        executor=lambda correlation, energy, subpixel, threshold, residual: (
+            ampcor_ncc_postprocess_reference(
+                correlation,
+                energy,
+                search_az=1,
+                search_rg=1,
+                subpixel=subpixel,
+                snr_threshold=threshold,
+                max_abs_residual=residual,
+            )
+        ),
+        batch_size=4,
+    )
+    correlation = torch.ones((2, 3, 3), dtype=torch.float64)
+    energy = torch.ones_like(correlation)
+    result = candidate.execute(
+        correlation,
+        energy,
+        subpixel=False,
+        snr_threshold=0.0,
+        max_abs_residual=1.0,
+    )
+    assert all(value.shape == (2,) for value in result)
+    with pytest.raises(AmpcorNccCandidateError, match="batch_size"):
+        candidate.execute(
+            torch.ones((5, 3, 3), dtype=torch.float64),
+            torch.ones((5, 3, 3), dtype=torch.float64),
+            subpixel=False,
+            snr_threshold=0.0,
+            max_abs_residual=1.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("search_shape", "batch_size"), [((17, 17), 16), ((33, 33), 32)]
+)
 def test_ncc_registry_dispatches_qualified_shape(
     search_shape: tuple[int, int],
+    batch_size: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Both measured A100 surfaces are eligible for registry dispatch."""
@@ -206,14 +253,22 @@ def test_ncc_registry_dispatches_qualified_shape(
         device="cuda:0",
         search_shape=search_shape,
         executor=lambda *_args: (),
+        batch_size=batch_size,
         source_digest=_NCC_SOURCE,
         profile=profile,
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
     assert registry.get_ncc(
-        "cuda", search_shape, source_digest=_NCC_SOURCE
+        "cuda", search_shape, batch_size=batch_size, source_digest=_NCC_SOURCE
     ) is candidate
+    other_batch = 32 if batch_size == 16 else 16
+    assert (
+        registry.get_ncc(
+            "cuda", search_shape, batch_size=other_batch, source_digest=_NCC_SOURCE
+        )
+        is None
+    )
 
 
 def test_ncc_registry_does_not_dispatch_unknown_shape() -> None:
@@ -222,11 +277,12 @@ def test_ncc_registry_does_not_dispatch_unknown_shape() -> None:
         device="cuda:0",
         search_shape=(9, 9),
         executor=lambda *_args: (),
+        batch_size=16,
         performance_eligible=False,
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
-    assert registry.get_ncc("cuda", (9, 9)) is None
+    assert registry.get_ncc("cuda", (9, 9), batch_size=16) is None
 
 
 def test_ncc_registry_ignores_manual_performance_flag() -> None:
@@ -235,11 +291,18 @@ def test_ncc_registry_ignores_manual_performance_flag() -> None:
         device="cuda:0",
         search_shape=(17, 17),
         executor=lambda *_args: (),
+        batch_size=8,
         source_digest=_NCC_SOURCE,
         performance_eligible=True,
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
+    assert (
+        registry.get_ncc(
+            "cuda", (17, 17), batch_size=8, source_digest=_NCC_SOURCE
+        )
+        is None
+    )
     assert registry.get_ncc("cuda", (17, 17), source_digest=_NCC_SOURCE) is None
 
 
@@ -274,13 +337,19 @@ def test_ncc_registry_rejects_unqualified_runtime(
         device="cuda:0",
         search_shape=(17, 17),
         executor=lambda *_args: (),
+        batch_size=16,
         source_digest=_NCC_SOURCE,
         profile=candidate_profile,
         performance_eligible=True,
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
-    assert registry.get_ncc("cuda", (17, 17), source_digest=_NCC_SOURCE) is None
+    assert (
+        registry.get_ncc(
+            "cuda", (17, 17), batch_size=16, source_digest=_NCC_SOURCE
+        )
+        is None
+    )
 
 
 def test_ncc_registry_rejects_source_digest_mismatch(
@@ -299,13 +368,17 @@ def test_ncc_registry_rejects_source_digest_mismatch(
         device="cuda:0",
         search_shape=(17, 17),
         executor=lambda *_args: (),
+        batch_size=16,
         source_digest=_NCC_SOURCE,
         profile=profile,
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
     assert (
-        registry.get_ncc("cuda", (17, 17), source_digest="b" * 64) is None
+        registry.get_ncc(
+            "cuda", (17, 17), batch_size=16, source_digest="b" * 64
+        )
+        is None
     )
 
 
