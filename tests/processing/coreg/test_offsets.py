@@ -1482,24 +1482,36 @@ def test_ampcor_copies_negative_stride_inputs() -> None:
     assert result.n_attempted == 1
 
 
-def test_ampcor_numpy_compatibility_spelling_uses_torch_limits() -> None:
-    """The NumPy spelling remains a usable explicit CPU compatibility lane."""
+def test_ampcor_numpy_compatibility_spelling_uses_torch_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA auto admission routes the NumPy spelling through Torch limits."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr(offsets_mod, "_validate_torch_ampcor_runtime", lambda *_: None)
+    monkeypatch.setattr(offsets_mod, "_torch_ampcor_admission_key", lambda *_: "cuda:0")
     samples = np.ones((64, 96), dtype=np.complex64)
-    result = estimate_patch_amplitude_shift(
-        samples,
-        samples,
-        window_az=8,
-        window_rg=16,
-        search_az=2,
-        search_rg=2,
-        n_az=1,
-        n_rg=1,
-        margin_rg=16,
-        margin_az=8,
-        batch_size=1,
-        max_workspace_bytes=0,
-    )
-    assert result.n_attempted == 1
+    with pytest.raises(InvalidProcessingStateError, match="max_workspace_bytes"):
+        estimate_patch_amplitude_shift(
+            samples,
+            samples,
+            executor="numpy",
+            device="auto",
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=1,
+            margin_rg=16,
+            margin_az=8,
+            batch_size=1,
+            max_workspace_bytes=0,
+        )
+
+
 def test_ampcor_numpy_path_does_not_apply_torch_admission_limits() -> None:
     """Torch batch/workspace controls do not change the NumPy compatibility lane."""
     samples = np.ones((64, 96), dtype=np.complex64)
@@ -1514,6 +1526,7 @@ def test_ampcor_numpy_path_does_not_apply_torch_admission_limits() -> None:
         n_rg=1,
         margin_rg=16,
         margin_az=8,
+        executor="numpy",
         batch_size=0,
         max_workspace_bytes=0,
         device="cpu",
