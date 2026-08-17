@@ -641,6 +641,66 @@ def test_ampcor_workspace_admission_charges_boundary_subset_copies() -> None:
         )
 
 
+def test_ampcor_boundary_second_budget_rejects_old_and_accepts_full_packet() -> None:
+    """Boundary admission charges CPU, device, and centered input overlap."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    kwargs = {
+        "window_az": 8,
+        "window_rg": 16,
+        "search_az": 2,
+        "search_rg": 2,
+        "batch_size": 2,
+        "boundary_count": 1,
+    }
+    full_packet = offsets_mod._torch_ampcor_boundary_workspace_bytes(**kwargs)
+
+    window_az = kwargs["window_az"]
+    window_rg = kwargs["window_rg"]
+    search_az = kwargs["search_az"]
+    search_rg = kwargs["search_rg"]
+    batch_size = kwargs["batch_size"]
+    boundary_count = kwargs["boundary_count"]
+    search_height = window_az + 2 * search_az
+    search_width = window_rg + 2 * search_rg
+    fft_height = 2 ** int(np.ceil(np.log2(search_height + window_az - 1)))
+    fft_width = 2 ** int(np.ceil(np.log2(search_width + window_rg - 1)))
+    input_bytes = window_az * window_rg * 8 + search_height * search_width * 8
+    spectrum_bytes = fft_height * (fft_width // 2 + 1) * 16
+    fft_real_bytes = fft_height * fft_width * 8
+    surface_bytes = (2 * search_az + 1) * (2 * search_rg + 1) * 8
+    correlation_bytes = 3 * spectrum_bytes + fft_real_bytes
+    fft_energy_bytes = (
+        search_height * search_width * 8
+        + 3 * spectrum_bytes
+        + fft_real_bytes
+        + surface_bytes
+    )
+    public_intermediate_bytes = batch_size * (3 * 8 + 8)
+    old_incomplete_budget = public_intermediate_bytes + boundary_count * (
+        input_bytes + correlation_bytes + fft_energy_bytes + 3 * 8
+    )
+    assert full_packet > old_incomplete_budget
+
+    with (
+        pytest.raises(ValueError, match="workspace admission"),
+        offsets_mod._admit_torch_ampcor_workspace(
+            "cpu-boundary-budget-test",
+            full_packet,
+            old_incomplete_budget,
+        ),
+    ):
+        pass
+    with offsets_mod._admit_torch_ampcor_workspace(
+        "cpu-boundary-budget-test",
+        full_packet,
+        full_packet,
+    ):
+        pass
+    assert offsets_mod._TORCH_AMPCOR_RESERVED_BYTES == {}
+
+
 def test_estimate_patch_amplitude_shift_rejects_total_work_overcommit() -> None:
     """Ampcor rejects an oversized patch grid before coordinate allocation."""
     with pytest.raises(InvalidProcessingStateError, match="total-work"):

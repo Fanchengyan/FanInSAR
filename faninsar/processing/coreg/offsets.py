@@ -1333,8 +1333,12 @@ def _torch_ampcor_boundary_workspace_bytes(
         search_bytes + 3 * spectrum_bytes + fft_real_bytes + surface_bytes
     )
     public_intermediate_bytes = batch_size * (3 * 8 + 8)
+    # Keep all simultaneously live representations explicit: the CPU compact
+    # payload retained across transactions, the device input tensors, and the
+    # centered ref/sec tensors materialized by the NCC implementation.
+    compact_input_bytes = 3 * input_bytes
     compact_oracle_bytes = boundary_count * (
-        input_bytes + correlation_bytes + fft_energy_bytes + 3 * 8
+        compact_input_bytes + correlation_bytes + fft_energy_bytes + 3 * 8
     )
     return public_intermediate_bytes + compact_oracle_bytes
 
