@@ -585,6 +585,62 @@ def test_estimate_patch_amplitude_shift_rejects_workspace_overcommit() -> None:
         )
 
 
+def test_ampcor_workspace_admission_charges_boundary_subset_copies() -> None:
+    """Worst-case boundary ref/sec advanced-index copies are admitted."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    window_az, window_rg = 8, 16
+    search_az, search_rg = 2, 2
+    batch_size = 2
+    search_height = window_az + 2 * search_az
+    search_width = window_rg + 2 * search_rg
+    fft_height = 2 ** int(np.ceil(np.log2(search_height + window_az - 1)))
+    fft_width = 2 ** int(np.ceil(np.log2(search_width + window_rg - 1)))
+    reference_bytes = window_az * window_rg * 8
+    search_bytes = search_height * search_width * 8
+    input_bytes = reference_bytes + search_bytes
+    spectrum_bytes = fft_height * (fft_width // 2 + 1) * 16
+    fft_real_bytes = fft_height * fft_width * 8
+    surface_bytes = (2 * search_az + 1) * (2 * search_rg + 1) * 8
+    correlation_bytes = 3 * spectrum_bytes + fft_real_bytes
+    row_cat_bytes = search_height * (search_width + 1) * 8
+    integral_bytes = (
+        search_bytes
+        + search_bytes
+        + row_cat_bytes
+        + row_cat_bytes
+        + (search_height + 1) * (search_width + 1) * 8
+        + 2 * surface_bytes
+    )
+    fft_energy_bytes = (
+        search_bytes + 3 * spectrum_bytes + fft_real_bytes + surface_bytes
+    )
+    legacy_full_batch_budget = (
+        2
+        * batch_size
+        * (input_bytes + correlation_bytes + max(integral_bytes, fft_energy_bytes))
+    )
+
+    with pytest.raises(ValueError, match="workspace"):
+        estimate_patch_amplitude_shift(
+            np.ones((64, 128), dtype=np.complex64),
+            np.ones((64, 128), dtype=np.complex64),
+            window_az=window_az,
+            window_rg=window_rg,
+            search_az=search_az,
+            search_rg=search_rg,
+            n_az=1,
+            n_rg=2,
+            margin_rg=16,
+            margin_az=8,
+            executor="torch",
+            device="cpu",
+            batch_size=batch_size,
+            max_workspace_bytes=legacy_full_batch_budget,
+        )
+
+
 def test_estimate_patch_amplitude_shift_rejects_total_work_overcommit() -> None:
     """Ampcor rejects an oversized patch grid before coordinate allocation."""
     with pytest.raises(InvalidProcessingStateError, match="total-work"):
@@ -798,6 +854,197 @@ def test_ampcor_process_admission_rejects_busy_cuda_process() -> None:
         child.wait(timeout=5)
 
 
+def test_ampcor_mock_cuda_admission_spans_the_public_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mock CUDA admission stays held across every batch and outer cleanup."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    events: list[object] = []
+    active = False
+
+    class MockAdmission:
+        def __enter__(self) -> None:
+            nonlocal active
+            assert not active
+            active = True
+            events.append("enter")
+
+        def __exit__(self, *_args: object) -> bool:
+            nonlocal active
+            events.append(("exit", active))
+            active = False
+            return False
+
+    monkeypatch.setattr(
+        offsets_mod,
+        "_validate_ampcor_accelerator",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_canonical_torch_device",
+        lambda _device: torch.device("cpu"),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_ampcor_admission_key",
+        lambda *_args: "cuda-uuid:mock",
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_admit_torch_ampcor_process",
+        lambda _key: MockAdmission(),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_synchronize_torch_device",
+        lambda device: events.append(("sync", active, device)),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_release_torch_device_cache",
+        lambda device: events.append(("cache", active, device)),
+    )
+
+    def valid_ncc(ref: object, *_args: object, **_kwargs: object) -> tuple[object, ...]:
+        assert active
+        events.append(("ncc", active, int(ref.shape[0])))
+        count = int(ref.shape[0])
+        return (
+            torch.zeros(count, dtype=torch.float64),
+            torch.zeros(count, dtype=torch.float64),
+            torch.full((count,), 10.0, dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", valid_ncc)
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 128), dtype=np.complex64),
+        np.ones((64, 128), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=3,
+        margin_rg=16,
+        margin_az=8,
+        executor="torch",
+        device="cuda",
+        batch_size=1,
+    )
+
+    assert result.n_valid == 3
+    assert events.count("enter") == 1
+    assert sum(event[0] == "ncc" for event in events if isinstance(event, tuple)) == 3
+    assert all(
+        event[1] for event in events if isinstance(event, tuple) and event[0] == "ncc"
+    )
+    assert [event[0] for event in events if isinstance(event, tuple)] == [
+        "ncc",
+        "ncc",
+        "ncc",
+        "sync",
+        "cache",
+        "exit",
+    ]
+    assert events[-1] == ("exit", True)
+
+
+def test_ampcor_mock_cuda_admission_releases_on_batch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mock CUDA admission and outer cleanup release after a batch failure."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    events: list[object] = []
+    active = False
+
+    class MockAdmission:
+        def __enter__(self) -> None:
+            nonlocal active
+            active = True
+            events.append("enter")
+
+        def __exit__(self, *_args: object) -> bool:
+            nonlocal active
+            events.append(("exit", active))
+            active = False
+            return False
+
+    monkeypatch.setattr(offsets_mod, "_validate_ampcor_accelerator", lambda _: None)
+    monkeypatch.setattr(
+        offsets_mod, "_canonical_torch_device", lambda _: torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_ampcor_admission_key",
+        lambda *_args: "cuda-uuid:mock",
+    )
+    monkeypatch.setattr(
+        offsets_mod, "_admit_torch_ampcor_process", lambda _: MockAdmission()
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_synchronize_torch_device",
+        lambda device: events.append(("sync", active, device)),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_release_torch_device_cache",
+        lambda device: events.append(("cache", active, device)),
+    )
+    calls = 0
+
+    def failing_ncc(
+        ref: object, *_args: object, **_kwargs: object
+    ) -> tuple[object, ...]:
+        nonlocal calls
+        calls += 1
+        assert active
+        if calls == 2:
+            message = "mock CUDA NCC failure"
+            raise RuntimeError(message)
+        count = int(ref.shape[0])
+        return (
+            torch.zeros(count, dtype=torch.float64),
+            torch.zeros(count, dtype=torch.float64),
+            torch.full((count,), 10.0, dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", failing_ncc)
+    with pytest.raises(RuntimeError, match="mock CUDA NCC failure"):
+        estimate_patch_amplitude_shift(
+            np.ones((64, 128), dtype=np.complex64),
+            np.ones((64, 128), dtype=np.complex64),
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=3,
+            margin_rg=16,
+            margin_az=8,
+            executor="torch",
+            device="cuda",
+            batch_size=1,
+        )
+
+    assert calls == 2
+    assert events.count("enter") == 1
+    assert [event[0] for event in events if isinstance(event, tuple)] == [
+        "sync",
+        "cache",
+        "exit",
+    ]
+    assert all(
+        event[1] for event in events if isinstance(event, tuple) and event[0] != "exit"
+    )
+    assert events[-1] == ("exit", True)
+
+
 def test_ampcor_process_admission_rejects_replaced_lock_entry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: object,
@@ -918,6 +1165,51 @@ def test_ampcor_synchronization_error_is_not_hidden_by_cleanup(
             executor="torch",
             device="cpu",
         )
+    assert offsets_mod._TORCH_AMPCOR_RESERVED_BYTES == {}
+
+
+def test_ampcor_business_error_survives_outer_synchronization_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch failure remains primary when outer synchronization also fails."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    cleanup_devices: list[object] = []
+    monkeypatch.setattr(
+        offsets_mod,
+        "_synchronize_torch_device",
+        lambda _device: (_ for _ in ()).throw(RuntimeError("sync failure")),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_release_torch_device_cache",
+        lambda device: cleanup_devices.append(device),
+    )
+
+    def failing_ncc(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        message = "business NCC failure"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", failing_ncc)
+    with pytest.raises(RuntimeError, match="business NCC failure"):
+        estimate_patch_amplitude_shift(
+            np.ones((64, 96), dtype=np.complex64),
+            np.ones((64, 96), dtype=np.complex64),
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=2,
+            margin_rg=16,
+            margin_az=8,
+            executor="torch",
+            device="cpu",
+            batch_size=2,
+        )
+
+    assert cleanup_devices == [torch.device("cpu")]
     assert offsets_mod._TORCH_AMPCOR_RESERVED_BYTES == {}
 
 

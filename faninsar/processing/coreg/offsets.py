@@ -1225,8 +1225,8 @@ def _torch_ampcor_workspace_bytes(
     """Estimate the conservative Torch NCC packet with a two-times margin.
 
     The packet includes float64 inputs, correlation FFT tensors, the
-    integral-image temporaries, the legacy FFT-energy fallback packet, and
-    retained energy/NCC surfaces.
+    integral-image temporaries, the legacy FFT-energy fallback packet, retained
+    energy/NCC surfaces, and worst-case boundary-oracle subset copies.
     """
     search_height = window_az + 2 * search_az
     search_width = window_rg + 2 * search_rg
@@ -1269,7 +1269,11 @@ def _torch_ampcor_workspace_bytes(
     )
     energy_packet_bytes = max(integral_energy_bytes, fft_reference_energy_bytes)
     per_batch_bytes = input_bytes + correlation_fft_bytes + energy_packet_bytes
-    return 2 * batch_size * per_batch_bytes
+    # Advanced indexing materializes compact ref/sec tensors for every lane
+    # selected by the boundary mask. The worst case selects the full batch,
+    # while the original tensors and FFT reference outputs remain live.
+    boundary_subset_bytes = input_bytes
+    return 2 * batch_size * per_batch_bytes + batch_size * boundary_subset_bytes
 
 
 def _torch_patch_ncc_batch(
@@ -1801,8 +1805,12 @@ def _estimate_patch_amplitude_shift_torch(
         _admit_torch_ampcor_process(device_key) if process_admitted else nullcontext()
     )
     with call_admission:
+        primary_error: BaseException | None = None
         try:
             return run_batches()
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
             # Complete all device work before releasing the call-scoped lease.
             synchronization_error: BaseException | None = None
@@ -1818,7 +1826,7 @@ def _estimate_patch_amplitude_shift_torch(
                     "Ampcor allocator cache release failed; references were "
                     "still dropped"
                 )
-            if synchronization_error is not None:
+            if synchronization_error is not None and primary_error is None:
                 raise synchronization_error
 
 
