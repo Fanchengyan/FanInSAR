@@ -203,7 +203,7 @@ def test_estimate_patch_amplitude_shift_torch_matches_numpy() -> None:
 
 
 def test_explicit_compile_rejects_partial_final_batch_before_dispatch() -> None:
-    """Fixed-shape compile candidates fail before a partial batch executes."""
+    """Candidates without partial support fail before a partial batch executes."""
     pytest.importorskip("torch")
     from faninsar.processing.coreg.ampcor_backend import (
         AmpcorCandidateError,
@@ -244,6 +244,83 @@ def test_explicit_compile_rejects_partial_final_batch_before_dispatch() -> None:
             batch_size=4,
         )
     assert calls == []
+
+
+def test_public_compile_candidate_pads_partial_batch_without_recompile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prepared compile candidates pad a final batch and preserve eager output."""
+    torch = pytest.importorskip("torch")
+    from dataclasses import replace
+
+    from faninsar.processing.coreg.ampcor_backend import prepare_ampcor_compile
+
+    compile_calls: list[object] = []
+
+    def recording_compile(function: object, **kwargs: object) -> object:
+        compile_calls.append(kwargs)
+        return function
+
+    monkeypatch.setattr(torch, "compile", recording_compile)
+    candidate = prepare_ampcor_compile(
+        device="cpu", window_shape=(4, 4), input_shape=(4, 6, 6)
+    )
+    candidate_calls: list[tuple[int, ...]] = []
+    original_executor = candidate.executor
+
+    def recording_executor(value: object) -> object:
+        candidate_calls.append(tuple(value.shape))
+        return original_executor(value)
+
+    candidate = replace(candidate, executor=recording_executor)
+    reference = _sar_like_amplitude((40, 40), seed=31).astype(np.complex64)
+    kwargs = {
+        "window_az": 4,
+        "window_rg": 4,
+        "search_az": 1,
+        "search_rg": 1,
+        "n_az": 3,
+        "n_rg": 3,
+        "margin_az": 3,
+        "margin_rg": 3,
+        "batch_size": 4,
+        "snr_threshold": 0.0,
+        "max_abs_residual": 4.0,
+    }
+    compiled_result = estimate_patch_amplitude_shift(
+        reference,
+        reference.copy(),
+        executor="torch",
+        device="cpu",
+        backend="compile",
+        ampcor_candidate=candidate,
+        **kwargs,
+    )
+    eager_result = estimate_patch_amplitude_shift(
+        reference,
+        reference.copy(),
+        executor="torch",
+        device="cpu",
+        backend="eager",
+        **kwargs,
+    )
+    assert len(compile_calls) == 1
+    assert candidate_calls == [(4, 6, 6), (4, 6, 6), (4, 6, 6)]
+    assert compiled_result.n_attempted == eager_result.n_attempted
+    assert compiled_result.n_valid == eager_result.n_valid
+    np.testing.assert_allclose(
+        (
+            compiled_result.range_shift_px,
+            compiled_result.azimuth_shift_px,
+            compiled_result.snr_median,
+        ),
+        (
+            eager_result.range_shift_px,
+            eager_result.azimuth_shift_px,
+            eager_result.snr_median,
+        ),
+        atol=1e-12,
+    )
 
 
 def test_torch_ampcor_even_median_stays_in_torch(

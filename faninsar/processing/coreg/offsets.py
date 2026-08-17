@@ -1649,7 +1649,11 @@ def _estimate_patch_amplitude_shift_torch(
     az_centres = np.linspace(az0, az1 - 1, num=n_az, dtype=np.int64)
     rg_centres = np.linspace(rg0, rg1 - 1, num=n_rg, dtype=np.int64)
     total_patches = int(az_centres.size) * int(rg_centres.size)
-    if energy_candidate.backend == "compile" and total_patches % batch_size:
+    if (
+        energy_candidate.backend == "compile"
+        and total_patches % batch_size
+        and not energy_candidate.allow_partial_batch
+    ):
         if fallback_candidate is None:
             message = (
                 "Ampcor compile candidate requires a full final batch; "
