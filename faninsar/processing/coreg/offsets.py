@@ -1276,6 +1276,69 @@ def _torch_ampcor_workspace_bytes(
     return 2 * batch_size * per_batch_bytes + batch_size * boundary_subset_bytes
 
 
+def _torch_ampcor_boundary_workspace_bytes(
+    *,
+    window_az: int,
+    window_rg: int,
+    search_az: int,
+    search_rg: int,
+    batch_size: int,
+    boundary_count: int,
+) -> int:
+    """Estimate the second transaction for a compact boundary FFT oracle.
+
+    The first transaction publishes a compact CPU intermediate containing the
+    full public vectors and boundary indices. The second transaction admits
+    that intermediate together with only the boundary ref/sec chips and the
+    force-FFT packet. ``boundary_count`` is bounded by ``batch_size``.
+
+    Parameters
+    ----------
+    window_az, window_rg : int
+        Reference-window dimensions.
+    search_az, search_rg : int
+        Search half-widths.
+    batch_size : int
+        Number of public lanes retained for scatter.
+    boundary_count : int
+        Number of compact boundary lanes sent to the oracle.
+
+    Returns
+    -------
+    int
+        Conservative second-transaction workspace estimate in bytes.
+
+    Raises
+    ------
+    ValueError
+        If ``boundary_count`` is outside the public batch.
+
+    """
+    if boundary_count < 1 or boundary_count > batch_size:
+        message = "Ampcor boundary count must be within the admitted batch"
+        logger.error(message)
+        raise ValueError(message)
+    search_height = window_az + 2 * search_az
+    search_width = window_rg + 2 * search_rg
+    fft_height = 2 ** int(np.ceil(np.log2(search_height + window_az - 1)))
+    fft_width = 2 ** int(np.ceil(np.log2(search_width + window_rg - 1)))
+    spectrum_bytes = fft_height * (fft_width // 2 + 1) * 16
+    fft_real_bytes = fft_height * fft_width * 8
+    reference_bytes = window_az * window_rg * 8
+    search_bytes = search_height * search_width * 8
+    input_bytes = reference_bytes + search_bytes
+    surface_bytes = (2 * search_az + 1) * (2 * search_rg + 1) * 8
+    correlation_bytes = 3 * spectrum_bytes + fft_real_bytes
+    fft_energy_bytes = (
+        search_bytes + 3 * spectrum_bytes + fft_real_bytes + surface_bytes
+    )
+    public_intermediate_bytes = batch_size * (3 * 8 + 8)
+    compact_oracle_bytes = boundary_count * (
+        input_bytes + correlation_bytes + fft_energy_bytes + 3 * 8
+    )
+    return public_intermediate_bytes + compact_oracle_bytes
+
+
 def _torch_patch_ncc_batch(
     ref_windows: object,
     sec_searches: object,
@@ -1502,56 +1565,6 @@ def _torch_cpu_median(chunks: list[object], torch_module: object) -> float:
     return float(median.item())
 
 
-def _ampcor_apply_boundary_oracle(
-    ref_tensor: object,
-    sec_tensor: object,
-    d_rg: object,
-    d_az: object,
-    snr: object,
-    *,
-    search_az: int,
-    search_rg: int,
-    subpixel: bool,
-    snr_threshold: float,
-    max_abs_residual: float,
-    torch_module: object,
-) -> tuple[object, object, object]:
-    """Recompute only boundary-near patches with the Torch FFT reference.
-
-    The ordinary Torch batch remains the fast path. A patch close to a cull
-    boundary is recomputed from the same materialized magnitude windows on
-    the batch device with the reference FFT energy path. Strict inclusive
-    comparisons then decide its membership and the reference values feed the
-    final medians.
-    """
-    boundary = _ampcor_boundary_mask_torch(
-        snr,
-        d_rg,
-        d_az,
-        snr_threshold=snr_threshold,
-        max_abs_residual=max_abs_residual,
-        torch_module=torch_module,
-    )
-    if not bool(torch_module.any(boundary).item()):
-        return d_rg, d_az, snr
-    d_rg = d_rg.clone()
-    d_az = d_az.clone()
-    snr = snr.clone()
-    boundary_indices = torch_module.nonzero(boundary, as_tuple=True)[0]
-    oracle_rg, oracle_az, oracle_snr = _torch_patch_ncc_batch(
-        ref_tensor[boundary_indices],
-        sec_tensor[boundary_indices],
-        search_az=search_az,
-        search_rg=search_rg,
-        subpixel=subpixel,
-        force_fft_energy=True,
-    )
-    d_rg[boundary_indices] = oracle_rg
-    d_az[boundary_indices] = oracle_az
-    snr[boundary_indices] = oracle_snr
-    return d_rg, d_az, snr
-
-
 def _estimate_patch_amplitude_shift_torch(
     reference: np.ndarray,
     secondary: np.ndarray,
@@ -1683,11 +1696,31 @@ def _estimate_patch_amplitude_shift_torch(
     n_valid = 0
     device_key = _torch_ampcor_admission_key(resolved_device, torch)
 
+    def publish_outputs(d_rg: object, d_az: object, snr: object) -> None:
+        """Cull one completed public batch and retain surviving CPU values."""
+        nonlocal n_valid
+        valid = _ampcor_cull_mask_torch(
+            snr,
+            d_rg,
+            d_az,
+            snr_threshold=snr_threshold,
+            max_abs_residual=max_abs_residual,
+            torch_module=torch,
+        )
+        valid_count = int(valid.sum().item())
+        if valid_count:
+            n_valid += valid_count
+            range_shifts.append(d_rg[valid].detach().to(device="cpu"))
+            azimuth_shifts.append(d_az[valid].detach().to(device="cpu"))
+            snr_values.append(snr[valid].detach().to(device="cpu"))
+
     def consume_batch() -> None:
-        """Score and cull one materialized batch."""
-        nonlocal n_valid, ref_windows, sec_searches
+        """Run the prefix transaction and an optional boundary transaction."""
+        nonlocal ref_windows, sec_searches
         if not ref_windows:
             return
+        batch_count = len(ref_windows)
+        boundary_payload: tuple[object, ...] | None = None
         with _admit_torch_ampcor_workspace(
             device_key,
             planned_workspace,
@@ -1699,7 +1732,6 @@ def _estimate_patch_amplitude_shift_torch(
             d_rg: object | None = None
             d_az: object | None = None
             snr: object | None = None
-            valid: object | None = None
             primary_error: BaseException | None = None
             primary_traceback = None
             try:
@@ -1716,20 +1748,7 @@ def _estimate_patch_amplitude_shift_torch(
                     energy_candidate=energy_candidate,
                     fallback_candidate=fallback_candidate,
                 )
-                d_rg, d_az, snr = _ampcor_apply_boundary_oracle(
-                    ref_tensor,
-                    sec_tensor,
-                    d_rg,
-                    d_az,
-                    snr,
-                    search_az=search_az,
-                    search_rg=search_rg,
-                    subpixel=subpixel,
-                    snr_threshold=snr_threshold,
-                    max_abs_residual=max_abs_residual,
-                    torch_module=torch,
-                )
-                valid = _ampcor_cull_mask_torch(
+                boundary = _ampcor_boundary_mask_torch(
                     snr,
                     d_rg,
                     d_az,
@@ -1737,28 +1756,85 @@ def _estimate_patch_amplitude_shift_torch(
                     max_abs_residual=max_abs_residual,
                     torch_module=torch,
                 )
-                valid_count = int(valid.sum().item())
-                if valid_count:
-                    n_valid += valid_count
-                    range_shifts.append(d_rg[valid].detach().to(device="cpu"))
-                    azimuth_shifts.append(d_az[valid].detach().to(device="cpu"))
-                    snr_values.append(snr[valid].detach().to(device="cpu"))
+                if bool(torch.any(boundary).item()):
+                    boundary_indices = torch.nonzero(boundary, as_tuple=True)[0]
+                    # Transfer only compact boundary inputs and public vectors
+                    # before releasing the full prefix workspace lease.
+                    boundary_payload = (
+                        d_rg.detach().to(device="cpu"),
+                        d_az.detach().to(device="cpu"),
+                        snr.detach().to(device="cpu"),
+                        boundary_indices.detach().to(device="cpu"),
+                        ref_tensor[boundary_indices].detach().to(device="cpu"),
+                        sec_tensor[boundary_indices].detach().to(device="cpu"),
+                    )
+                else:
+                    publish_outputs(d_rg, d_az, snr)
             except BaseException as error:
                 primary_error = error
                 primary_traceback = error.__traceback__
             finally:
-                # Drop all device tensor references before synchronization and
-                # allocator cleanup, while the admission lease is still held.
                 ref_tensor = None
                 sec_tensor = None
                 d_rg = None
                 d_az = None
                 snr = None
-                valid = None
                 ref_windows = []
                 sec_searches = []
             if primary_error is not None:
                 raise primary_error.with_traceback(primary_traceback)
+
+        if boundary_payload is None:
+            return
+        (
+            public_rg,
+            public_az,
+            public_snr,
+            boundary_indices,
+            boundary_ref,
+            boundary_sec,
+        ) = boundary_payload
+        boundary_count = int(boundary_indices.numel())
+        boundary_workspace = _torch_ampcor_boundary_workspace_bytes(
+            window_az=window_az,
+            window_rg=window_rg,
+            search_az=search_az,
+            search_rg=search_rg,
+            batch_size=batch_count,
+            boundary_count=boundary_count,
+        )
+        with _admit_torch_ampcor_workspace(
+            device_key,
+            boundary_workspace,
+            max_workspace_bytes,
+            process_admitted=device_key.startswith(("cuda", "mps")),
+        ):
+            oracle_ref: object | None = None
+            oracle_sec: object | None = None
+            oracle_rg: object | None = None
+            oracle_az: object | None = None
+            oracle_snr: object | None = None
+            try:
+                oracle_ref = boundary_ref.to(resolved_device)
+                oracle_sec = boundary_sec.to(resolved_device)
+                oracle_rg, oracle_az, oracle_snr = _torch_patch_ncc_batch(
+                    oracle_ref,
+                    oracle_sec,
+                    search_az=search_az,
+                    search_rg=search_rg,
+                    subpixel=subpixel,
+                    force_fft_energy=True,
+                )
+                public_rg[boundary_indices] = oracle_rg.detach().to(device="cpu")
+                public_az[boundary_indices] = oracle_az.detach().to(device="cpu")
+                public_snr[boundary_indices] = oracle_snr.detach().to(device="cpu")
+                publish_outputs(public_rg, public_az, public_snr)
+            finally:
+                oracle_ref = None
+                oracle_sec = None
+                oracle_rg = None
+                oracle_az = None
+                oracle_snr = None
 
     def run_batches() -> PatchAmplitudeShiftResult:
         """Materialize, score, and reduce all bounded Torch batches."""

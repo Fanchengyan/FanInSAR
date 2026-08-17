@@ -1986,6 +1986,273 @@ def test_ampcor_boundary_oracle_recomputes_only_boundary_lanes(
     assert result.azimuth_shift_px == pytest.approx(-0.375)
 
 
+def test_ampcor_boundary_oracle_uses_two_workspace_transactions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary reference work starts after the full-batch lease is released."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    threshold = np.float64(5.0)
+    near_threshold = np.nextafter(threshold, np.inf)
+    workspace_plans: list[int] = []
+    events: list[tuple[str, int]] = []
+
+    class WorkspaceLease:
+        def __init__(self, ordinal: int) -> None:
+            self.ordinal = ordinal
+
+        def __enter__(self) -> None:
+            events.append(("enter", self.ordinal))
+
+        def __exit__(self, *_args: object) -> bool:
+            events.append(("exit", self.ordinal))
+            return False
+
+    def fake_workspace(
+        _key: str,
+        planned_bytes: int,
+        _limit_bytes: int,
+        **_kwargs: object,
+    ) -> WorkspaceLease:
+        workspace_plans.append(planned_bytes)
+        return WorkspaceLease(len(workspace_plans))
+
+    monkeypatch.setattr(offsets_mod, "_admit_torch_ampcor_workspace", fake_workspace)
+
+    def fake_ncc(ref: object, *_args: object, **kwargs: object) -> tuple[object, ...]:
+        force_fft = bool(kwargs.get("force_fft_energy", False))
+        events.append(("force" if force_fft else "main", int(ref.shape[0])))
+        if force_fft:
+            return (
+                torch.tensor([0.75], dtype=torch.float64),
+                torch.tensor([-0.25], dtype=torch.float64),
+                torch.tensor([threshold], dtype=torch.float64),
+            )
+        return (
+            torch.tensor([0.25, 0.5], dtype=torch.float64),
+            torch.tensor([-0.25, -0.5], dtype=torch.float64),
+            torch.tensor([near_threshold, 8.0], dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", fake_ncc)
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 96), dtype=np.complex64),
+        np.ones((64, 96), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=2,
+        margin_rg=16,
+        margin_az=8,
+        snr_threshold=float(threshold),
+        max_abs_residual=1.2,
+        executor="torch",
+        device="cpu",
+        batch_size=2,
+    )
+
+    assert result.n_valid == 2
+    assert len(workspace_plans) == 2
+    assert workspace_plans[1] < workspace_plans[0]
+    assert events == [
+        ("enter", 1),
+        ("main", 2),
+        ("exit", 1),
+        ("enter", 2),
+        ("force", 1),
+        ("exit", 2),
+    ]
+
+
+def test_ampcor_no_boundary_uses_only_one_workspace_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-boundary batch does not open a reference transaction."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    workspace_calls: list[int] = []
+
+    class WorkspaceLease:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        offsets_mod,
+        "_admit_torch_ampcor_workspace",
+        lambda _key, planned, _limit, **_kwargs: (
+            workspace_calls.append(planned) or WorkspaceLease()
+        ),
+    )
+    force_calls: list[int] = []
+
+    def no_boundary_ncc(
+        ref: object, *_args: object, **kwargs: object
+    ) -> tuple[object, ...]:
+        if kwargs.get("force_fft_energy"):
+            force_calls.append(int(ref.shape[0]))
+        count = int(ref.shape[0])
+        return (
+            torch.zeros(count, dtype=torch.float64),
+            torch.zeros(count, dtype=torch.float64),
+            torch.full((count,), 10.0, dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", no_boundary_ncc)
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 96), dtype=np.complex64),
+        np.ones((64, 96), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=2,
+        margin_rg=16,
+        margin_az=8,
+        executor="torch",
+        device="cpu",
+        batch_size=2,
+    )
+
+    assert result.n_valid == 2
+    assert len(workspace_calls) == 1
+    assert force_calls == []
+
+
+def test_ampcor_boundary_second_transaction_rejects_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure to admit the boundary packet cannot publish prefix results."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    threshold = np.float64(5.0)
+    near_threshold = np.nextafter(threshold, np.inf)
+    workspace_calls = 0
+
+    class WorkspaceLease:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+    def reject_second_workspace(
+        _key: str,
+        _planned: int,
+        _limit: int,
+        **_kwargs: object,
+    ) -> WorkspaceLease:
+        nonlocal workspace_calls
+        workspace_calls += 1
+        if workspace_calls == 2:
+            message = "boundary workspace admission rejected"
+            raise ValueError(message)
+        return WorkspaceLease()
+
+    monkeypatch.setattr(
+        offsets_mod, "_admit_torch_ampcor_workspace", reject_second_workspace
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_patch_ncc_batch",
+        lambda ref, *_args, **kwargs: (
+            torch.full((ref.shape[0],), 0.25, dtype=torch.float64),
+            torch.full((ref.shape[0],), -0.25, dtype=torch.float64),
+            torch.full(
+                (ref.shape[0],),
+                threshold if kwargs.get("force_fft_energy") else near_threshold,
+                dtype=torch.float64,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="boundary workspace admission rejected"):
+        estimate_patch_amplitude_shift(
+            np.ones((64, 96), dtype=np.complex64),
+            np.ones((64, 96), dtype=np.complex64),
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=2,
+            margin_rg=16,
+            margin_az=8,
+            snr_threshold=float(threshold),
+            max_abs_residual=1.2,
+            executor="torch",
+            device="cpu",
+            batch_size=2,
+        )
+    assert workspace_calls == 2
+
+
+def test_ampcor_boundary_scatter_preserves_original_lane_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oracle values are scattered by original indices before final culling."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    threshold = np.float64(5.0)
+    near_threshold = np.nextafter(threshold, np.inf)
+    observed: list[object] = []
+
+    def fake_ncc(ref: object, *_args: object, **kwargs: object) -> tuple[object, ...]:
+        if kwargs.get("force_fft_energy"):
+            count = int(ref.shape[0])
+            return (
+                torch.arange(10.0, 10.0 + count, dtype=torch.float64),
+                torch.zeros(count, dtype=torch.float64),
+                torch.full((count,), threshold, dtype=torch.float64),
+            )
+        return (
+            torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64),
+            torch.zeros(3, dtype=torch.float64),
+            torch.tensor([near_threshold, 8.0, near_threshold], dtype=torch.float64),
+        )
+
+    def observe_cull(
+        snr: object,
+        d_rg: object,
+        _d_az: object,
+        **_kwargs: object,
+    ) -> object:
+        observed.append(d_rg.detach().cpu().tolist())
+        return torch.ones_like(snr, dtype=torch.bool)
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", fake_ncc)
+    monkeypatch.setattr(offsets_mod, "_ampcor_cull_mask_torch", observe_cull)
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 128), dtype=np.complex64),
+        np.ones((64, 128), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=3,
+        margin_rg=16,
+        margin_az=8,
+        snr_threshold=float(threshold),
+        max_abs_residual=20.0,
+        executor="torch",
+        device="cpu",
+        batch_size=3,
+    )
+
+    assert observed == [[10.0, 0.2, 11.0]]
+    assert result.n_valid == 3
+
+
 def test_ampcor_cache_cleanup_is_call_scoped_across_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
