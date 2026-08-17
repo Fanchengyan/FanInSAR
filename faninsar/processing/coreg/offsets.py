@@ -23,9 +23,9 @@ from faninsar.processing.coreg.ampcor_backend import (
     AmpcorCandidateError,
     AmpcorEnergyCandidate,
     AmpcorNccCandidate,
-    AmpcorNccCandidateError,
+    AmpcorNccExecutionError,
+    AmpcorNccPreDispatchError,
     eager_ampcor_candidate,
-    native_ncc_workspace_bytes,
     native_workspace_bytes,
 )
 from faninsar.processing.errors import reject_invalid_state
@@ -1504,12 +1504,15 @@ def _torch_patch_ncc_batch(
                 max_abs_residual=max_abs_residual,
             )
             return native_result[0], native_result[1], native_result[2]
-        except AmpcorNccCandidateError:
+        except AmpcorNccPreDispatchError:
+            # Eligibility failures are expected for an unqualified lane and
+            # must remain on the same-device Torch implementation.
+            logger.info("Ampcor native NCC candidate was ineligible before dispatch")
+        except AmpcorNccExecutionError:
+            ncc_candidate.quarantine()
             if ncc_quarantine is not None:
                 ncc_quarantine.add(id(ncc_candidate))
-            logger.exception(
-                "Ampcor native NCC candidate failed; quarantining it for this call"
-            )
+            raise
 
     ncc = corr / torch.sqrt(torch.clamp(energy, min=1e-12))
     surface_width = 2 * search_rg + 1
@@ -1687,9 +1690,12 @@ def _estimate_patch_amplitude_shift_torch(
         )
     planned_workspace = max(planned_workspace, energy_candidate.workspace_bytes)
     if ncc_candidate is not None:
-        planned_workspace += native_ncc_workspace_bytes(
-            ncc_candidate.search_shape, ncc_candidate.batch_size
-        )
+        measurement = ncc_candidate.workspace_measurement
+        if measurement is None:
+            message = "Ampcor native NCC workspace measurement is unavailable"
+            logger.error(message)
+            raise AmpcorCandidateError(message)
+        planned_workspace += measurement.admitted_bytes
     if planned_workspace > max_workspace_bytes:
         message = (
             f"Ampcor batch workspace {planned_workspace} bytes exceeds the "
@@ -2196,9 +2202,8 @@ def estimate_patch_amplitude_shift(
         selected_candidate = ampcor_candidate if candidate_matches else eager_candidate
         selected_ncc_candidate: AmpcorNccCandidate | None = None
         if (
-            (ampcor_ncc_candidate is not None or ampcor_ncc_registry is not None)
-            and resolved_torch_device.startswith("cuda:")
-        ):
+            ampcor_ncc_candidate is not None or ampcor_ncc_registry is not None
+        ) and resolved_torch_device.startswith("cuda:"):
             ncc_registry = ampcor_ncc_registry
             if ncc_registry is None:
                 ncc_registry = AmpcorBackendRegistry()

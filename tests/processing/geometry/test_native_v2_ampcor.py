@@ -87,22 +87,17 @@ def test_ampcor_ncc_cuda_plan_is_experimental_and_separate() -> None:
 
 
 def test_ampcor_ncc_cuda_source_preserves_peak_and_cull_contract() -> None:
-    """The prototype source carries the strict numerical boundary markers."""
+    """The NCC plan exposes the exact ABI and dedicated CUDA sources."""
     binding = (SOURCE_ROOT / "ampcor_ncc_cuda_bindings.cpp").read_text()
-    source = (SOURCE_ROOT / "ampcor_ncc_postprocess_cuda.cu").read_text()
     assert '"faninsar.ampcor_ncc_postprocess.v1"' in binding
     assert '"ampcor_ncc_postprocess_cuda"' in binding
-    assert "torch::kFloat64" in source
-    assert "is_contiguous()" in source
-    assert "CUDAGuard" in source
-    assert "getCurrentCUDAStream" in source
-    assert "C10_CUDA_KERNEL_LAUNCH_CHECK" in source
-    assert "checked_twice_plus_one" in source
-    assert "blockIdx.x" in source
-    assert "__shared__" in source
-    assert "llabs(row - peak_az) <= 1" in source
-    assert "fabs(az_denom) < 1e-12" in source
-    assert "snr >= snr_threshold" in source
+
+
+def test_ampcor_ncc_cuda_checks_surface_products_before_launch() -> None:
+    """The CUDA boundary checks each product without pre-multiplication."""
+    source = (SOURCE_ROOT / "ampcor_ncc_postprocess_cuda.cu").read_text()
+    assert 'checked_product(height, width, "NCC surface")' in source
+    assert 'checked_product(batch, surface_size, "NCC batch")' in source
 
 
 def test_geometry_operation_remains_a_compatible_native_operation_alias() -> None:
@@ -110,6 +105,110 @@ def test_geometry_operation_remains_a_compatible_native_operation_alias() -> Non
     assert GeometryOperation is NativeOperation
     assert GeometryOperation.GEO2RDR.value == "geo2rdr"
     assert GeometryOperation.RDR2GEO.value == "rdr2geo"
+
+
+@pytest.mark.skipif(
+    os.environ.get("FANINSAR_TEST_NATIVE_V2_CUDA_BUILD") != "1",
+    reason="native CUDA extension build is explicitly enabled",
+)
+def test_ampcor_native_ncc_cuda_product_contract(tmp_path: Path) -> None:
+    """Build and exercise the opt-in native NCC product candidate."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    from faninsar.processing.coreg import (
+        AmpcorNccPreDispatchError,
+        ampcor_ncc_postprocess_reference,
+        prepare_ampcor_ncc_native,
+    )
+
+    candidate = prepare_ampcor_ncc_native(
+        device="cuda",
+        search_shape=(17, 17),
+        batch_size=16,
+        source_root=SOURCE_ROOT,
+        build_dir=tmp_path,
+    )
+    assert candidate.workspace_measurement is not None
+    assert candidate.workspace_measurement.shared_memory_bytes > 0
+    assert candidate.workspace_measurement.threads_per_block == 256
+    device = torch.device("cuda", torch.cuda.current_device())
+    energy = torch.ones((16, 17, 17), dtype=torch.float64, device=device)
+
+    tie = torch.zeros_like(energy)
+    tie[:, 8, 8] = 2.0
+    tie[:, 8, 9] = 2.0
+    result = candidate.execute(
+        tie,
+        energy,
+        subpixel=False,
+        snr_threshold=0.0,
+        max_abs_residual=9.0,
+    )
+    reference = ampcor_ncc_postprocess_reference(
+        tie,
+        energy,
+        search_az=8,
+        search_rg=8,
+        subpixel=False,
+        snr_threshold=0.0,
+        max_abs_residual=9.0,
+    )
+    for actual, expected in zip(result, reference, strict=True):
+        torch.testing.assert_close(actual, expected, equal_nan=True)
+    assert torch.all(result[0] == 0.0)
+
+    all_nan = torch.full_like(energy, torch.nan)
+    nan_result = candidate.execute(
+        all_nan,
+        energy,
+        subpixel=False,
+        snr_threshold=0.0,
+        max_abs_residual=9.0,
+    )
+    assert torch.all(~nan_result[4])
+    assert torch.all(torch.isnan(nan_result[2]))
+
+    edge = torch.ones_like(energy)
+    edge[:, 0, 0] = 3.0
+    edge_result = candidate.execute(
+        edge,
+        energy,
+        subpixel=True,
+        snr_threshold=2.0,
+        max_abs_residual=9.0,
+    )
+    assert torch.all(edge_result[3])
+    assert torch.all(edge_result[4])
+
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        stream_result = candidate.execute(
+            tie,
+            energy,
+            subpixel=False,
+            snr_threshold=0.0,
+            max_abs_residual=9.0,
+        )
+    stream.synchronize()
+    torch.testing.assert_close(stream_result[0], result[0])
+
+    partial = candidate.execute(
+        tie[:1],
+        energy[:1],
+        subpixel=False,
+        snr_threshold=0.0,
+        max_abs_residual=9.0,
+    )
+    assert tuple(partial[0].shape) == (1,)
+    with pytest.raises(AmpcorNccPreDispatchError, match="contiguous"):
+        candidate.execute(
+            tie.transpose(1, 2),
+            energy,
+            subpixel=False,
+            snr_threshold=0.0,
+            max_abs_residual=9.0,
+        )
 
 
 def test_ampcor_sources_define_a_validated_static_openmp_boundary() -> None:

@@ -67,6 +67,61 @@ class AmpcorNccCandidateError(RuntimeError):
     """Raised when the experimental native NCC candidate rejects a call."""
 
 
+class AmpcorNccPreDispatchError(AmpcorNccCandidateError):
+    """Raised when a native NCC input is ineligible before dispatch."""
+
+
+class AmpcorNccExecutionError(AmpcorNccCandidateError):
+    """Raised when native NCC entry or output validation fails."""
+
+
+@dataclass(frozen=True, slots=True)
+class AmpcorNccWorkspaceMeasurement:
+    """Measured native NCC allocation and launch metadata.
+
+    The measured packet is produced during explicit candidate preparation. It
+    is intentionally immutable so public workspace admission cannot silently
+    replace a measured native allocation with a shape-only estimate.
+    """
+
+    peak_allocated_bytes: int
+    output_bytes: int
+    global_scratch_bytes: int
+    shared_memory_bytes: int
+    launch_blocks: int
+    threads_per_block: int
+
+    def __post_init__(self) -> None:
+        """Validate all measured packet fields."""
+        fields = (
+            self.peak_allocated_bytes,
+            self.output_bytes,
+            self.global_scratch_bytes,
+            self.shared_memory_bytes,
+            self.launch_blocks,
+            self.threads_per_block,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in fields
+        ):
+            message = "Ampcor NCC workspace measurements must be integers"
+            logger.error(message)
+            raise TypeError(message)
+        if any(value < 0 for value in fields) or self.launch_blocks < 1:
+            message = "Ampcor NCC workspace measurements are invalid"
+            logger.error(message)
+            raise ValueError(message)
+
+    @property
+    def admitted_bytes(self) -> int:
+        """Return the measured packet charged to workspace admission."""
+        return (
+            max(self.peak_allocated_bytes, self.output_bytes)
+            + self.global_scratch_bytes
+            + self.shared_memory_bytes
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class AmpcorNccRuntimeProfile:
     """Runtime identity attested when an NCC candidate is prepared.
@@ -122,7 +177,7 @@ _NCC_QUALIFIED_RECORDS = (
         cuda_runtime=_NCC_QUALIFIED_CUDA,
         minimum_memory_bytes=_NCC_QUALIFIED_MEMORY_BYTES,
         source_digest=(
-            "c9ab63fc3e1904ecd3ccee1121e349d05de908ac05fd59c4bb6b837641f987d5"
+            "f88a7b883ada00b63677b60cb20965c3a875900596c5642bc4c22226f05dab62"
         ),
         abi_version=_NCC_NATIVE_ABI,
     ),
@@ -222,9 +277,13 @@ def ampcor_ncc_postprocess_reference(
     import torch
 
     if not torch.is_tensor(correlation) or not torch.is_tensor(energy):
-        raise ValueError("NCC postprocess requires Torch tensors")
+        message = "NCC postprocess requires Torch tensors"
+        logger.error(message)
+        raise ValueError(message)
     if correlation.dtype is not torch.float64 or energy.dtype is not torch.float64:
-        raise ValueError("NCC postprocess requires float64 tensors")
+        message = "NCC postprocess requires float64 tensors"
+        logger.error(message)
+        raise ValueError(message)
     if (
         correlation.dim() != 3
         or energy.dim() != 3
@@ -232,16 +291,26 @@ def ampcor_ncc_postprocess_reference(
         or not energy.is_contiguous()
         or tuple(correlation.shape) != tuple(energy.shape)
     ):
-        raise ValueError("NCC postprocess requires matching contiguous rank-3 tensors")
+        message = "NCC postprocess requires matching contiguous rank-3 tensors"
+        logger.error(message)
+        raise ValueError(message)
     if correlation.device != energy.device:
-        raise ValueError("NCC postprocess tensors must share a device")
+        message = "NCC postprocess tensors must share a device"
+        logger.error(message)
+        raise ValueError(message)
     batch, height, width = (int(value) for value in correlation.shape)
     if batch < 1 or height < 1 or width < 1:
-        raise ValueError("NCC postprocess dimensions must be positive")
+        message = "NCC postprocess dimensions must be positive"
+        logger.error(message)
+        raise ValueError(message)
     if search_az < 0 or search_rg < 0:
-        raise ValueError("NCC search half-widths must be non-negative")
+        message = "NCC search half-widths must be non-negative"
+        logger.error(message)
+        raise ValueError(message)
     if 2 * search_az + 1 != height or 2 * search_rg + 1 != width:
-        raise ValueError("NCC surface shape does not match search half-widths")
+        message = "NCC surface shape does not match search half-widths"
+        logger.error(message)
+        raise ValueError(message)
 
     ncc = correlation / torch.sqrt(torch.clamp(energy, min=1e-12))
     peak_flat = torch.argmax(ncc.reshape(batch, -1), dim=1)
@@ -311,7 +380,7 @@ def ampcor_ncc_postprocess_reference(
     return rg_shift, az_shift, snr, surface_edge, valid
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class AmpcorNccCandidate:
     """Prepared experimental native CUDA NCC/peak candidate."""
 
@@ -327,16 +396,119 @@ class AmpcorNccCandidate:
     performance_eligible: bool = False
     native_module: object | None = None
     batch_size: int = 1
+    workspace_measurement: AmpcorNccWorkspaceMeasurement | None = None
+    quarantined: bool = False
 
     def __post_init__(self) -> None:
         """Normalize the device identity before registry publication."""
         object.__setattr__(self, "device", canonical_torch_device(self.device))
         if len(self.search_shape) != 2 or any(value < 1 for value in self.search_shape):
-            raise ValueError("NCC search_shape must contain positive dimensions")
+            message = "NCC search_shape must contain positive dimensions"
+            logger.error(message)
+            raise ValueError(message)
         if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int):
-            raise TypeError("NCC batch_size must be a positive integer")
+            message = "NCC batch_size must be a positive integer"
+            logger.error(message)
+            raise TypeError(message)
         if self.batch_size < 1:
-            raise ValueError("NCC batch_size must be a positive integer")
+            message = "NCC batch_size must be a positive integer"
+            logger.error(message)
+            raise ValueError(message)
+
+    def quarantine(self) -> None:
+        """Quarantine this candidate after a native failure."""
+        if not self.quarantined:
+            logger.error("Quarantining native NCC candidate after execution failure")
+            self.quarantined = True
+
+    def validate_inputs(self, correlation: object, energy: object) -> None:
+        """Validate the native ABI before entering the prepared callable."""
+        import torch
+
+        if not self.prepared or not self.correctness_qualified or self.quarantined:
+            message = "NCC candidate is not eligible for dispatch"
+            logger.error(message)
+            raise AmpcorNccPreDispatchError(message)
+        if not torch.is_tensor(correlation) or not torch.is_tensor(energy):
+            message = "NCC candidate requires Torch tensors"
+            logger.error(message)
+            raise AmpcorNccPreDispatchError(message)
+        if correlation.dim() != 3 or energy.dim() != 3:
+            message = "NCC candidate requires rank-3 input"
+            logger.error(message)
+            raise AmpcorNccPreDispatchError(message)
+        if (
+            str(correlation.device) != self.device
+            or correlation.device != energy.device
+        ):
+            message = "NCC candidate device does not match input"
+            logger.error(message)
+            raise AmpcorNccPreDispatchError(message)
+        actual_batch = int(correlation.shape[0])
+        if actual_batch < 1 or actual_batch > self.batch_size:
+            message = "NCC candidate batch_size exceeds prepared batch capacity"
+            logger.error(message)
+            raise AmpcorNccPreDispatchError(message)
+        expected = (actual_batch, *self.search_shape)
+        if tuple(correlation.shape) != expected or tuple(energy.shape) != expected:
+            message = "NCC candidate input shape does not match"
+            logger.error(message)
+            raise AmpcorNccPreDispatchError(message)
+        if correlation.dtype is not torch.float64 or energy.dtype is not torch.float64:
+            message = "NCC candidate requires float64 input"
+            logger.error(message)
+            raise AmpcorNccPreDispatchError(message)
+        if not correlation.is_contiguous() or not energy.is_contiguous():
+            message = "NCC candidate requires contiguous input"
+            logger.error(message)
+            raise AmpcorNccPreDispatchError(message)
+
+    def _validate_outputs(
+        self,
+        result: object,
+        *,
+        batch_size: int,
+        snr_threshold: float,
+        max_abs_residual: float,
+        torch_module: object,
+    ) -> tuple[object, object, object, object, object]:
+        """Validate native outputs before publishing them to public code."""
+        if not isinstance(result, tuple) or len(result) != 5:
+            message = "NCC candidate returned invalid outputs"
+            logger.error(message)
+            raise AmpcorNccExecutionError(message)
+        for index, value in enumerate(result):
+            if not torch_module.is_tensor(value) or value.shape != (batch_size,):
+                message = "NCC candidate returned invalid shape"
+                logger.error(message)
+                raise AmpcorNccExecutionError(message)
+            expected_dtype = torch_module.bool if index >= 3 else torch_module.float64
+            if value.dtype is not expected_dtype or value.device != torch_module.device(
+                self.device
+            ):
+                message = "NCC candidate returned invalid dtype/device"
+                logger.error(message)
+                raise AmpcorNccExecutionError(message)
+        d_rg, d_az, snr, surface_edge, valid = result
+        max_shift = max(self.search_shape) // 2 + 1
+        shifts_finite = torch_module.isfinite(d_rg) & torch_module.isfinite(d_az)
+        shifts_in_domain = (d_rg.abs() <= max_shift) & (d_az.abs() <= max_shift)
+        if not bool(torch_module.all(shifts_finite & shifts_in_domain).item()):
+            message = "NCC candidate returned shifts outside its search domain"
+            logger.error(message)
+            raise AmpcorNccExecutionError(message)
+        expected_valid = (
+            torch_module.isfinite(snr)
+            & shifts_finite
+            & (snr >= snr_threshold)
+            & (d_rg.abs() <= max_abs_residual)
+            & (d_az.abs() <= max_abs_residual)
+        )
+        if not bool(torch_module.equal(valid, expected_valid)):
+            message = "NCC candidate valid output violates cull invariants"
+            logger.error(message)
+            raise AmpcorNccExecutionError(message)
+        return d_rg, d_az, snr, surface_edge, valid
 
     def execute(
         self,
@@ -350,29 +522,7 @@ class AmpcorNccCandidate:
         """Execute the prepared native candidate without compilation."""
         import torch
 
-        if not self.prepared or not self.correctness_qualified:
-            raise AmpcorNccCandidateError("NCC candidate is not prepared")
-        if not torch.is_tensor(correlation) or not torch.is_tensor(energy):
-            raise AmpcorNccCandidateError("NCC candidate requires Torch tensors")
-        if correlation.dim() != 3 or energy.dim() != 3:
-            raise AmpcorNccCandidateError("NCC candidate requires rank-3 input")
-        if (
-            str(correlation.device) != self.device
-            or correlation.device != energy.device
-        ):
-            raise AmpcorNccCandidateError("NCC candidate device does not match input")
-        actual_batch = int(correlation.shape[0])
-        if actual_batch < 1 or actual_batch > self.batch_size:
-            raise AmpcorNccCandidateError(
-                "NCC candidate batch_size exceeds prepared batch capacity"
-            )
-        expected = (actual_batch, *self.search_shape)
-        if tuple(correlation.shape) != expected or tuple(energy.shape) != expected:
-            raise AmpcorNccCandidateError("NCC candidate input shape does not match")
-        if correlation.dtype is not torch.float64 or energy.dtype is not torch.float64:
-            raise AmpcorNccCandidateError("NCC candidate requires float64 input")
-        if not correlation.is_contiguous() or not energy.is_contiguous():
-            raise AmpcorNccCandidateError("NCC candidate requires contiguous input")
+        self.validate_inputs(correlation, energy)
         try:
             result = self.executor(
                 correlation,
@@ -381,21 +531,22 @@ class AmpcorNccCandidate:
                 float(snr_threshold),
                 float(max_abs_residual),
             )
-        except AmpcorNccCandidateError:
-            raise
         except Exception as error:
-            raise AmpcorNccCandidateError("NCC candidate execution failed") from error
-        if not isinstance(result, tuple) or len(result) != 5:
-            raise AmpcorNccCandidateError("NCC candidate returned invalid outputs")
-        for index, value in enumerate(result):
-            if not torch.is_tensor(value) or value.shape != (correlation.shape[0],):
-                raise AmpcorNccCandidateError("NCC candidate returned invalid shape")
-            expected_dtype = torch.bool if index >= 3 else torch.float64
-            if value.dtype is not expected_dtype or value.device != correlation.device:
-                raise AmpcorNccCandidateError(
-                    "NCC candidate returned invalid dtype/device"
-                )
-        return result
+            message = "NCC candidate execution failed"
+            logger.exception(message)
+            self.quarantine()
+            raise AmpcorNccExecutionError(message) from error
+        try:
+            return self._validate_outputs(
+                result,
+                batch_size=int(correlation.shape[0]),
+                snr_threshold=snr_threshold,
+                max_abs_residual=max_abs_residual,
+                torch_module=torch,
+            )
+        except AmpcorNccExecutionError:
+            self.quarantine()
+            raise
 
 
 def native_workspace_bytes(
@@ -412,52 +563,13 @@ def native_workspace_bytes(
         or window_az > height
         or window_rg > width
     ):
-        raise ValueError("native Ampcor shapes are invalid")
+        message = "native Ampcor shapes are invalid"
+        logger.error(message)
+        raise ValueError(message)
     output = batch * (height - window_az + 1) * (width - window_rg + 1)
     prefix = batch * (height + 1) * (width + 1)
     input_values = batch * height * width
     return 8 * (input_values + prefix + output)
-
-
-def native_ncc_workspace_bytes(
-    search_shape: tuple[int, int], batch_size: int
-) -> int:
-    """Return the native NCC postprocess output packet size in bytes.
-
-    Parameters
-    ----------
-    search_shape : tuple[int, int]
-        Correlation surface dimensions ``(height, width)``.
-    batch_size : int
-        Prepared batch capacity.
-
-    Returns
-    -------
-    int
-        Conservative bytes for three float64 outputs and two boolean masks.
-
-    Raises
-    ------
-    ValueError
-        If the surface or batch dimensions are invalid.
-
-    """
-    if (
-        len(search_shape) != 2
-        or any(
-            isinstance(value, bool) or not isinstance(value, int)
-            for value in search_shape
-        )
-        or any(value < 1 for value in search_shape)
-    ):
-        raise ValueError("native NCC search_shape must contain positive integers")
-    if (
-        isinstance(batch_size, bool)
-        or not isinstance(batch_size, int)
-        or batch_size < 1
-    ):
-        raise ValueError("native NCC batch_size must be a positive integer")
-    return batch_size * (3 * 8 + 2)
 
 
 def torch_integral_energy(
@@ -652,7 +764,12 @@ class AmpcorBackendRegistry:
         ignored.  Invalid or unqualified candidates are left unpublished so a
         correctness-only implementation can remain available to the caller.
         """
-        if not candidate.prepared or not candidate.correctness_qualified:
+        if (
+            not candidate.prepared
+            or not candidate.correctness_qualified
+            or candidate.quarantined
+            or candidate.workspace_measurement is None
+        ):
             return
         if (
             candidate.search_shape,
@@ -701,13 +818,11 @@ class AmpcorBackendRegistry:
         candidates = tuple(
             candidate
             for key, candidate in self._ncc_candidates.items()
-            if (
-                key[0] == resolved
-                and key[1] == search_shape
-                and key[2] == batch_size
-            )
+            if (key[0] == resolved and key[1] == search_shape and key[2] == batch_size)
         )
         for candidate in candidates:
+            if candidate.quarantined or candidate.workspace_measurement is None:
+                continue
             if not _is_qualified_ncc_profile(
                 candidate.profile,
                 search_shape=candidate.search_shape,
@@ -954,16 +1069,26 @@ def prepare_ampcor_ncc_native(
     from torch.utils import cpp_extension
 
     if len(search_shape) != 2 or any(value < 1 for value in search_shape):
-        raise ValueError("search_shape must contain positive dimensions")
+        message = "search_shape must contain positive dimensions"
+        logger.error(message)
+        raise ValueError(message)
     if search_shape[0] < 3 or search_shape[1] < 3:
-        raise ValueError("NCC postprocess requires a 3x3 or larger surface")
+        message = "NCC postprocess requires a 3x3 or larger surface"
+        logger.error(message)
+        raise ValueError(message)
     if isinstance(batch_size, bool) or not isinstance(batch_size, int):
-        raise TypeError("batch_size must be a positive integer")
+        message = "batch_size must be a positive integer"
+        logger.error(message)
+        raise TypeError(message)
     if batch_size < 1:
-        raise ValueError("batch_size must be a positive integer")
+        message = "batch_size must be a positive integer"
+        logger.error(message)
+        raise ValueError(message)
     resolved_device = canonical_torch_device(device)
     if not resolved_device.startswith("cuda:"):
-        raise ValueError("NCC postprocess native candidate requires CUDA")
+        message = "NCC postprocess native candidate requires CUDA"
+        logger.error(message)
+        raise ValueError(message)
     Path(build_dir).mkdir(parents=True, exist_ok=True)
     request = NativeBuildRequest(
         NativeOperation.AMPCOR_NCC_POSTPROCESS,
@@ -974,7 +1099,9 @@ def prepare_ampcor_ncc_native(
     builder = NativeBuilder()
     plan = builder.plan(request)
     if not plan.supported:
-        raise RuntimeError(plan.unsupported_reason or "NCC native backend unsupported")
+        message = plan.unsupported_reason or "NCC native backend unsupported"
+        logger.error(message)
+        raise RuntimeError(message)
     module_holder: dict[str, object] = {}
 
     def build(plan_to_build: object) -> Path:
@@ -996,18 +1123,27 @@ def prepare_ampcor_ncc_native(
 
     prepared = builder.prepare(request, build=build)
     if prepared.status is not PreparationStatus.PREPARED:
-        raise RuntimeError(prepared.reason or "NCC native preparation failed")
+        message = prepared.reason or "NCC native preparation failed"
+        logger.error(message)
+        raise RuntimeError(message)
     module = module_holder["module"]
     source_abi = getattr(module, "native_source_abi", None)
     if source_abi is None or source_abi() != _NCC_NATIVE_ABI:
-        raise RuntimeError("NCC native source ABI mismatch")
+        message = "NCC native source ABI mismatch"
+        logger.error(message)
+        raise RuntimeError(message)
     entry = getattr(module, "ampcor_ncc_postprocess_cuda", None)
     if entry is None:
-        raise RuntimeError("NCC native module has no postprocess entry point")
+        message = "NCC native module has no postprocess entry point"
+        logger.error(message)
+        raise RuntimeError(message)
 
     height, width = search_shape
     sample_corr = _centered_sample((batch_size, height, width), resolved_device)
     sample_energy = torch.ones_like(sample_corr)
+    torch.cuda.synchronize(torch.device(resolved_device))
+    torch.cuda.reset_peak_memory_stats(torch.device(resolved_device))
+    allocation_before = int(torch.cuda.memory_allocated(torch.device(resolved_device)))
     native_result = entry(
         sample_corr,
         sample_energy,
@@ -1016,6 +1152,25 @@ def prepare_ampcor_ncc_native(
         True,
         0.0,
         1e9,
+    )
+    torch.cuda.synchronize(torch.device(resolved_device))
+    peak_allocated = max(
+        0,
+        int(torch.cuda.max_memory_allocated(torch.device(resolved_device)))
+        - allocation_before,
+    )
+    output_bytes = sum(
+        int(value.numel()) * int(value.element_size()) for value in native_result
+    )
+    properties = torch.cuda.get_device_properties(torch.device(resolved_device))
+    max_grid = int(getattr(properties, "max_grid_size", (batch_size,))[0])
+    workspace_measurement = AmpcorNccWorkspaceMeasurement(
+        peak_allocated_bytes=peak_allocated,
+        output_bytes=output_bytes,
+        global_scratch_bytes=0,
+        shared_memory_bytes=3 * 256 * 8,
+        launch_blocks=min(batch_size, max_grid),
+        threads_per_block=256,
     )
     reference_result = ampcor_ncc_postprocess_reference(
         sample_corr,
@@ -1071,8 +1226,7 @@ def prepare_ampcor_ncc_native(
         runtime_profile=profile.canonical() if profile is not None else "",
         source_digest=source_digest,
         profile=profile,
-        performance_eligible=(search_shape, batch_size)
-        in _NCC_PERFORMANCE_COMBINATIONS
+        performance_eligible=(search_shape, batch_size) in _NCC_PERFORMANCE_COMBINATIONS
         and _is_qualified_ncc_profile(
             profile,
             search_shape=search_shape,
@@ -1081,6 +1235,7 @@ def prepare_ampcor_ncc_native(
             abi_version=_NCC_NATIVE_ABI,
         ),
         native_module=module,
+        workspace_measurement=workspace_measurement,
     )
 
 
@@ -1091,11 +1246,13 @@ __all__ = [
     "AmpcorEnergyCandidate",
     "AmpcorNccCandidate",
     "AmpcorNccCandidateError",
+    "AmpcorNccExecutionError",
+    "AmpcorNccPreDispatchError",
     "AmpcorNccRuntimeProfile",
+    "AmpcorNccWorkspaceMeasurement",
     "ampcor_ncc_postprocess_reference",
     "canonical_torch_device",
     "eager_ampcor_candidate",
-    "native_ncc_workspace_bytes",
     "native_workspace_bytes",
     "prepare_ampcor_compile",
     "prepare_ampcor_native",

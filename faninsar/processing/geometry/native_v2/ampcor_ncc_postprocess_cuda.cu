@@ -60,6 +60,7 @@ __global__ void ampcor_ncc_postprocess_kernel(
   __shared__ double shared_values[threads_per_block];
   __shared__ int64_t shared_indices[threads_per_block];
   __shared__ int64_t shared_counts[threads_per_block];
+  // The host boundary checks this product before launch.
   const int64_t surface_size = height * width;
   for (int64_t batch_index = blockIdx.x; batch_index < batch;
        batch_index += gridDim.x) {
@@ -207,8 +208,8 @@ ampcor_ncc_postprocess_cuda(const torch::Tensor& correlation,
               "NCC surface shape does not match search half-widths");
   TORCH_CHECK(!subpixel || (height >= 3 && width >= 3),
               "subpixel NCC postprocess requires a 3x3 or larger surface");
-  checked_product(height, width, "NCC surface");
-  checked_product(batch, height * width, "NCC batch");
+  const int64_t surface_size = checked_product(height, width, "NCC surface");
+  checked_product(batch, surface_size, "NCC batch");
 
   auto options = correlation.options();
   auto d_rg = torch::empty({batch}, options);

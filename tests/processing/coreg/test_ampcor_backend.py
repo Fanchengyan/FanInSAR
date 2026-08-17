@@ -11,7 +11,9 @@ from faninsar.processing.coreg.ampcor_backend import (
     AmpcorEnergyCandidate,
     AmpcorNccCandidate,
     AmpcorNccCandidateError,
+    AmpcorNccExecutionError,
     AmpcorNccRuntimeProfile,
+    AmpcorNccWorkspaceMeasurement,
     ampcor_ncc_postprocess_reference,
     eager_ampcor_candidate,
     native_workspace_bytes,
@@ -21,7 +23,7 @@ from faninsar.processing.coreg.ampcor_backend import (
 
 _NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
 _NCC_ABI = "faninsar.ampcor_ncc_postprocess.v1"
-_NCC_SOURCE = "c9ab63fc3e1904ecd3ccee1121e349d05de908ac05fd59c4bb6b837641f987d5"
+_NCC_SOURCE = "f88a7b883ada00b63677b60cb20965c3a875900596c5642bc4c22226f05dab62"
 
 
 def _ncc_profile(
@@ -40,6 +42,18 @@ def _ncc_profile(
         memory_bytes=80 * 1024**3,
         source_digest=source_digest,
         abi_version=_NCC_ABI,
+    )
+
+
+def _ncc_measurement(batch_size: int = 16) -> AmpcorNccWorkspaceMeasurement:
+    """Build a measured NCC packet for registry-only unit tests."""
+    return AmpcorNccWorkspaceMeasurement(
+        peak_allocated_bytes=batch_size * 26,
+        output_bytes=batch_size * 26,
+        global_scratch_bytes=0,
+        shared_memory_bytes=6144,
+        launch_blocks=batch_size,
+        threads_per_block=256,
     )
 
 
@@ -146,31 +160,41 @@ def test_ncc_registry_requires_exact_abi_and_shape(
         source_digest=_NCC_SOURCE,
         abi_version=_NCC_ABI,
         profile=profile,
+        workspace_measurement=_ncc_measurement(),
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
-    assert registry.get_ncc(
-        "cuda",
-        (17, 17),
-        batch_size=16,
-        runtime_profile=profile.canonical(),
-        source_digest=_NCC_SOURCE,
-    ) is candidate
-    assert registry.get_ncc(
-        "cuda",
-        (9, 9),
-        batch_size=16,
-        runtime_profile=profile.canonical(),
-        source_digest=_NCC_SOURCE,
-    ) is None
-    assert registry.get_ncc(
-        "cuda",
-        (17, 17),
-        batch_size=16,
-        runtime_profile=profile.canonical(),
-        source_digest=_NCC_SOURCE,
-        abi_version="wrong.abi",
-    ) is None
+    assert (
+        registry.get_ncc(
+            "cuda",
+            (17, 17),
+            batch_size=16,
+            runtime_profile=profile.canonical(),
+            source_digest=_NCC_SOURCE,
+        )
+        is candidate
+    )
+    assert (
+        registry.get_ncc(
+            "cuda",
+            (9, 9),
+            batch_size=16,
+            runtime_profile=profile.canonical(),
+            source_digest=_NCC_SOURCE,
+        )
+        is None
+    )
+    assert (
+        registry.get_ncc(
+            "cuda",
+            (17, 17),
+            batch_size=16,
+            runtime_profile=profile.canonical(),
+            source_digest=_NCC_SOURCE,
+            abi_version="wrong.abi",
+        )
+        is None
+    )
 
 
 def test_ncc_candidate_rank_zero_fails_with_candidate_error() -> None:
@@ -256,12 +280,16 @@ def test_ncc_registry_dispatches_qualified_shape(
         batch_size=batch_size,
         source_digest=_NCC_SOURCE,
         profile=profile,
+        workspace_measurement=_ncc_measurement(batch_size),
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
-    assert registry.get_ncc(
-        "cuda", search_shape, batch_size=batch_size, source_digest=_NCC_SOURCE
-    ) is candidate
+    assert (
+        registry.get_ncc(
+            "cuda", search_shape, batch_size=batch_size, source_digest=_NCC_SOURCE
+        )
+        is candidate
+    )
     other_batch = 32 if batch_size == 16 else 16
     assert (
         registry.get_ncc(
@@ -269,6 +297,34 @@ def test_ncc_registry_dispatches_qualified_shape(
         )
         is None
     )
+
+
+def test_ncc_registry_persistent_quarantine_survives_next_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native execution quarantine disables later public-call lookup."""
+    from faninsar.processing.coreg import ampcor_backend
+
+    profile = _ncc_profile()
+    monkeypatch.setattr(
+        ampcor_backend,
+        "_current_ncc_runtime_profile",
+        lambda *_args, **_kwargs: profile,
+    )
+    candidate = AmpcorNccCandidate(
+        device="cuda:0",
+        search_shape=(17, 17),
+        executor=lambda *_args: (),
+        batch_size=16,
+        source_digest=_NCC_SOURCE,
+        profile=profile,
+        workspace_measurement=_ncc_measurement(),
+    )
+    registry = AmpcorBackendRegistry()
+    registry.register_ncc(candidate)
+    assert registry.get_ncc("cuda", (17, 17), batch_size=16) is candidate
+    candidate.quarantine()
+    assert registry.get_ncc("cuda", (17, 17), batch_size=16) is None
 
 
 def test_ncc_registry_does_not_dispatch_unknown_shape() -> None:
@@ -298,12 +354,26 @@ def test_ncc_registry_ignores_manual_performance_flag() -> None:
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
     assert (
-        registry.get_ncc(
-            "cuda", (17, 17), batch_size=8, source_digest=_NCC_SOURCE
-        )
+        registry.get_ncc("cuda", (17, 17), batch_size=8, source_digest=_NCC_SOURCE)
         is None
     )
     assert registry.get_ncc("cuda", (17, 17), source_digest=_NCC_SOURCE) is None
+
+
+def test_ncc_registry_rejects_unmeasured_workspace() -> None:
+    """A qualified native candidate without a smoke measurement is unusable."""
+    profile = _ncc_profile()
+    candidate = AmpcorNccCandidate(
+        device="cuda:0",
+        search_shape=(17, 17),
+        executor=lambda *_args: (),
+        batch_size=16,
+        source_digest=_NCC_SOURCE,
+        profile=profile,
+    )
+    registry = AmpcorBackendRegistry()
+    registry.register_ncc(candidate)
+    assert registry.get_ncc("cuda", (17, 17), batch_size=16) is None
 
 
 @pytest.mark.parametrize(
@@ -341,13 +411,12 @@ def test_ncc_registry_rejects_unqualified_runtime(
         source_digest=_NCC_SOURCE,
         profile=candidate_profile,
         performance_eligible=True,
+        workspace_measurement=_ncc_measurement(),
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
     assert (
-        registry.get_ncc(
-            "cuda", (17, 17), batch_size=16, source_digest=_NCC_SOURCE
-        )
+        registry.get_ncc("cuda", (17, 17), batch_size=16, source_digest=_NCC_SOURCE)
         is None
     )
 
@@ -371,13 +440,12 @@ def test_ncc_registry_rejects_source_digest_mismatch(
         batch_size=16,
         source_digest=_NCC_SOURCE,
         profile=profile,
+        workspace_measurement=_ncc_measurement(),
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
     assert (
-        registry.get_ncc(
-            "cuda", (17, 17), batch_size=16, source_digest="b" * 64
-        )
+        registry.get_ncc("cuda", (17, 17), batch_size=16, source_digest="b" * 64)
         is None
     )
 
@@ -792,8 +860,40 @@ def test_torch_ncc_batch_falls_back_for_partial_final_batch() -> None:
     assert calls == []
 
 
-def test_torch_ncc_batch_quarantines_native_exception() -> None:
-    """A native NCC error falls back and is not retried in the same call."""
+def test_torch_ncc_batch_pre_dispatch_failure_falls_back_without_quarantine() -> None:
+    """An input eligibility error selects Torch and leaves candidate healthy."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets
+
+    calls: list[str] = []
+
+    def execute(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        calls.append("native")
+        raise AssertionError
+
+    candidate = AmpcorNccCandidate(
+        device="cpu",
+        search_shape=(5, 5),
+        executor=execute,
+        batch_size=1,
+    )
+    values = torch.ones((1, 3, 3), dtype=torch.float64)
+    result = offsets._torch_patch_ncc_batch(
+        values,
+        values,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+        ncc_candidate=candidate,
+        ncc_quarantine=set(),
+    )
+    assert all(value.shape == (1,) for value in result)
+    assert calls == []
+    assert not candidate.quarantined
+
+
+def test_torch_ncc_batch_propagates_and_quarantines_native_exception() -> None:
+    """A native NCC error propagates and later calls fail closed."""
     torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets
 
@@ -811,8 +911,8 @@ def test_torch_ncc_batch_quarantines_native_exception() -> None:
     )
     values = torch.ones((1, 3, 3), dtype=torch.float64)
     quarantine: set[int] = set()
-    for _ in range(2):
-        result = offsets._torch_patch_ncc_batch(
+    with pytest.raises(AmpcorNccExecutionError):
+        offsets._torch_patch_ncc_batch(
             values,
             values,
             search_az=1,
@@ -821,16 +921,59 @@ def test_torch_ncc_batch_quarantines_native_exception() -> None:
             ncc_candidate=candidate,
             ncc_quarantine=quarantine,
         )
-        assert all(value.shape == (1,) for value in result)
+    assert candidate.quarantined
+    result = offsets._torch_patch_ncc_batch(
+        values,
+        values,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+        ncc_candidate=candidate,
+        ncc_quarantine=quarantine,
+    )
+    assert all(value.shape == (1,) for value in result)
     assert calls == ["native"]
     assert id(candidate) in quarantine
 
 
-def test_native_ncc_workspace_packet_is_admitted() -> None:
-    """The NCC result packet has a checked batch-derived workspace size."""
-    from faninsar.processing.coreg.ampcor_backend import native_ncc_workspace_bytes
+def test_ncc_output_invariant_failure_is_execution_error() -> None:
+    """An inconsistent native valid mask is persistent execution failure."""
+    torch = pytest.importorskip("torch")
 
-    assert native_ncc_workspace_bytes((17, 17), 16) == 16 * (3 * 8 + 2)
+    def invalid_output(
+        correlation: object,
+        energy: object,
+        subpixel: bool,
+        snr_threshold: float,
+        max_abs_residual: float,
+    ) -> tuple[object, ...]:
+        result = ampcor_ncc_postprocess_reference(
+            correlation,
+            energy,
+            search_az=1,
+            search_rg=1,
+            subpixel=subpixel,
+            snr_threshold=snr_threshold,
+            max_abs_residual=max_abs_residual,
+        )
+        return (*result[:4], torch.logical_not(result[4]))
+
+    candidate = AmpcorNccCandidate(
+        device="cpu",
+        search_shape=(3, 3),
+        executor=invalid_output,
+        batch_size=1,
+    )
+    values = torch.ones((1, 3, 3), dtype=torch.float64)
+    with pytest.raises(AmpcorNccExecutionError, match="valid output"):
+        candidate.execute(
+            values,
+            values,
+            subpixel=False,
+            snr_threshold=0.0,
+            max_abs_residual=1.0,
+        )
+    assert candidate.quarantined
 
 
 def test_public_ampcor_keeps_ncc_native_disabled_on_cpu() -> None:
