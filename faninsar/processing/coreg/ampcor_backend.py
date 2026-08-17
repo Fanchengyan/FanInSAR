@@ -24,6 +24,7 @@ logger = setup_logger(__name__)
 AmpcorBackend = Literal["eager", "compile", "native"]
 EnergyExecutor = Callable[[object], object]
 _NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
+_NCC_NATIVE_ABI = "faninsar.ampcor_ncc_postprocess.v1"
 
 
 def canonical_torch_device(device: str) -> str:
@@ -53,6 +54,205 @@ def _centered_sample(input_shape: tuple[int, int, int], device: str) -> object:
 
 class AmpcorCandidateError(RuntimeError):
     """Raised when a prepared candidate violates its execution contract."""
+
+
+class AmpcorNccCandidateError(RuntimeError):
+    """Raised when the experimental native NCC candidate rejects a call."""
+
+
+def ampcor_ncc_postprocess_reference(
+    correlation: object,
+    energy: object,
+    *,
+    search_az: int,
+    search_rg: int,
+    subpixel: bool,
+    snr_threshold: float,
+    max_abs_residual: float,
+) -> tuple[object, object, object, object, object]:
+    """Evaluate the native NCC postprocess contract with Torch float64.
+
+    Parameters
+    ----------
+    correlation, energy : torch.Tensor
+        Contiguous float64 CUDA or CPU tensors with shape ``[batch, height,
+        width]``. ``energy`` is the non-negative local-search energy surface.
+    search_az, search_rg : int
+        Half-widths used to convert the peak index into an offset.
+    subpixel : bool
+        Apply the same three-point parabolic refinement as the Torch path.
+    snr_threshold, max_abs_residual : float
+        Inclusive validity thresholds.
+
+    Returns
+    -------
+    tuple[torch.Tensor, ...]
+        ``(d_rg, d_az, snr, boundary, valid)`` vectors. ``boundary`` marks a
+        peak on the outer surface edge; ``valid`` applies the inclusive cull.
+
+    Raises
+    ------
+    ValueError
+        If the tensors or scalar parameters violate the ABI.
+
+    """
+    import torch
+
+    if not torch.is_tensor(correlation) or not torch.is_tensor(energy):
+        raise ValueError("NCC postprocess requires Torch tensors")
+    if correlation.dtype is not torch.float64 or energy.dtype is not torch.float64:
+        raise ValueError("NCC postprocess requires float64 tensors")
+    if (
+        correlation.dim() != 3
+        or energy.dim() != 3
+        or not correlation.is_contiguous()
+        or not energy.is_contiguous()
+        or tuple(correlation.shape) != tuple(energy.shape)
+    ):
+        raise ValueError("NCC postprocess requires matching contiguous rank-3 tensors")
+    if correlation.device != energy.device:
+        raise ValueError("NCC postprocess tensors must share a device")
+    batch, height, width = (int(value) for value in correlation.shape)
+    if batch < 1 or height < 1 or width < 1:
+        raise ValueError("NCC postprocess dimensions must be positive")
+    if search_az < 0 or search_rg < 0:
+        raise ValueError("NCC search half-widths must be non-negative")
+    if 2 * search_az + 1 != height or 2 * search_rg + 1 != width:
+        raise ValueError("NCC surface shape does not match search half-widths")
+
+    ncc = correlation / torch.sqrt(torch.clamp(energy, min=1e-12))
+    peak_flat = torch.argmax(ncc.reshape(batch, -1), dim=1)
+    peak_az = torch.div(peak_flat, width, rounding_mode="floor")
+    peak_rg = peak_flat.remainder(width)
+    peak_value = ncc.reshape(batch, -1).gather(1, peak_flat[:, None]).squeeze(1)
+    rows = torch.arange(height, device=ncc.device)[None, :, None]
+    columns = torch.arange(width, device=ncc.device)[None, None, :]
+    near_peak = (
+        (rows >= peak_az[:, None, None] - 1)
+        & (rows <= peak_az[:, None, None] + 1)
+        & (columns >= peak_rg[:, None, None] - 1)
+        & (columns <= peak_rg[:, None, None] + 1)
+    )
+    sidelobe = torch.where(near_peak, torch.full_like(ncc, torch.nan), ncc.abs())
+    sidelobe_mean = torch.nanmean(sidelobe, dim=(-2, -1))
+    snr = torch.where(
+        torch.isfinite(sidelobe_mean) & (sidelobe_mean > 0),
+        peak_value / sidelobe_mean,
+        torch.full_like(peak_value, torch.nan),
+    )
+    az_shift = peak_az.to(torch.float64) - search_az
+    rg_shift = peak_rg.to(torch.float64) - search_rg
+    if subpixel:
+        interior = (
+            (peak_az > 0)
+            & (peak_az < height - 1)
+            & (peak_rg > 0)
+            & (peak_rg < width - 1)
+        )
+        safe_az = peak_az.clamp(1, height - 2)
+        safe_rg = peak_rg.clamp(1, width - 2)
+        indices = torch.arange(batch, device=ncc.device)
+        az_left = ncc[indices, safe_az - 1, safe_rg]
+        az_center = ncc[indices, safe_az, safe_rg]
+        az_right = ncc[indices, safe_az + 1, safe_rg]
+        rg_left = ncc[indices, safe_az, safe_rg - 1]
+        rg_right = ncc[indices, safe_az, safe_rg + 1]
+        az_denom = az_left - 2 * az_center + az_right
+        rg_denom = rg_left - 2 * az_center + rg_right
+        az_sub = torch.where(
+            az_denom.abs() < 1e-12,
+            torch.zeros_like(az_denom),
+            0.5 * (az_left - az_right) / az_denom,
+        )
+        rg_sub = torch.where(
+            rg_denom.abs() < 1e-12,
+            torch.zeros_like(rg_denom),
+            0.5 * (rg_left - rg_right) / rg_denom,
+        )
+        az_shift += torch.where(interior, az_sub, torch.zeros_like(az_sub))
+        rg_shift += torch.where(interior, rg_sub, torch.zeros_like(rg_sub))
+    boundary = (
+        (peak_az == 0)
+        | (peak_az == height - 1)
+        | (peak_rg == 0)
+        | (peak_rg == width - 1)
+    )
+    valid = (
+        torch.isfinite(snr)
+        & torch.isfinite(rg_shift)
+        & torch.isfinite(az_shift)
+        & (snr >= snr_threshold)
+        & (rg_shift.abs() <= max_abs_residual)
+        & (az_shift.abs() <= max_abs_residual)
+    )
+    return rg_shift, az_shift, snr, boundary, valid
+
+
+@dataclass(frozen=True, slots=True)
+class AmpcorNccCandidate:
+    """Prepared experimental native CUDA NCC/peak candidate."""
+
+    device: str
+    search_shape: tuple[int, int]
+    executor: Callable[..., tuple[object, object, object, object, object]]
+    runtime_profile: str = ""
+    source_digest: str = ""
+    abi_version: str = _NCC_NATIVE_ABI
+    prepared: bool = True
+    correctness_qualified: bool = True
+    native_module: object | None = None
+
+    def execute(
+        self,
+        correlation: object,
+        energy: object,
+        *,
+        subpixel: bool,
+        snr_threshold: float,
+        max_abs_residual: float,
+    ) -> tuple[object, object, object, object, object]:
+        """Execute the prepared native candidate without compilation."""
+        import torch
+
+        if not self.prepared or not self.correctness_qualified:
+            raise AmpcorNccCandidateError("NCC candidate is not prepared")
+        if not torch.is_tensor(correlation) or not torch.is_tensor(energy):
+            raise AmpcorNccCandidateError("NCC candidate requires Torch tensors")
+        if (
+            str(correlation.device) != self.device
+            or correlation.device != energy.device
+        ):
+            raise AmpcorNccCandidateError("NCC candidate device does not match input")
+        expected = (correlation.shape[0], *self.search_shape)
+        if tuple(correlation.shape) != expected or tuple(energy.shape) != expected:
+            raise AmpcorNccCandidateError("NCC candidate input shape does not match")
+        if correlation.dtype is not torch.float64 or energy.dtype is not torch.float64:
+            raise AmpcorNccCandidateError("NCC candidate requires float64 input")
+        if not correlation.is_contiguous() or not energy.is_contiguous():
+            raise AmpcorNccCandidateError("NCC candidate requires contiguous input")
+        try:
+            result = self.executor(
+                correlation,
+                energy,
+                bool(subpixel),
+                float(snr_threshold),
+                float(max_abs_residual),
+            )
+        except AmpcorNccCandidateError:
+            raise
+        except Exception as error:
+            raise AmpcorNccCandidateError("NCC candidate execution failed") from error
+        if not isinstance(result, tuple) or len(result) != 5:
+            raise AmpcorNccCandidateError("NCC candidate returned invalid outputs")
+        for index, value in enumerate(result):
+            if not torch.is_tensor(value) or value.shape != (correlation.shape[0],):
+                raise AmpcorNccCandidateError("NCC candidate returned invalid shape")
+            expected_dtype = torch.bool if index >= 3 else torch.float64
+            if value.dtype is not expected_dtype or value.device != correlation.device:
+                raise AmpcorNccCandidateError(
+                    "NCC candidate returned invalid dtype/device"
+                )
+        return result
 
 
 def native_workspace_bytes(
@@ -238,6 +438,7 @@ class AmpcorBackendRegistry:
     def __init__(self) -> None:
         """Create an empty process-local registry."""
         self._candidates: dict[tuple[object, ...], AmpcorEnergyCandidate] = {}
+        self._ncc_candidates: dict[tuple[object, ...], AmpcorNccCandidate] = {}
 
     @staticmethod
     def _key(candidate: AmpcorEnergyCandidate) -> tuple[object, ...]:
@@ -259,6 +460,45 @@ class AmpcorBackendRegistry:
         if not candidate.prepared:
             raise ValueError("Ampcor registry accepts prepared candidates only")
         self._candidates[self._key(candidate)] = candidate
+
+    def register_ncc(self, candidate: AmpcorNccCandidate) -> None:
+        """Atomically publish an experimental prepared NCC candidate."""
+        if not candidate.prepared:
+            raise ValueError("Ampcor registry accepts prepared candidates only")
+        self._ncc_candidates[
+            (
+                candidate.device,
+                candidate.search_shape,
+                candidate.runtime_profile,
+                candidate.source_digest,
+                candidate.abi_version,
+            )
+        ] = candidate
+
+    def get_ncc(
+        self,
+        device: str,
+        search_shape: tuple[int, int],
+        *,
+        runtime_profile: str = "",
+        source_digest: str = "",
+        abi_version: str = _NCC_NATIVE_ABI,
+    ) -> AmpcorNccCandidate | None:
+        """Return an exact experimental NCC candidate, if qualified."""
+        candidate = self._ncc_candidates.get(
+            (
+                canonical_torch_device(device),
+                search_shape,
+                runtime_profile,
+                source_digest,
+                abi_version,
+            )
+        )
+        return (
+            candidate
+            if candidate is not None and candidate.correctness_qualified
+            else None
+        )
 
     def get(
         self,
@@ -463,15 +703,150 @@ def prepare_ampcor_native(
     )
 
 
+def prepare_ampcor_ncc_native(
+    *,
+    device: Literal["cuda"],
+    search_shape: tuple[int, int],
+    source_root: str | Path,
+    build_dir: str | Path,
+    compiler: str | None = None,
+) -> AmpcorNccCandidate:
+    """Build and qualify the experimental CUDA NCC postprocess candidate.
+
+    The candidate is intentionally separate from :mod:`offsets`; callers must
+    explicitly prepare and execute it. Compilation and module loading happen
+    only here, never from a public Ampcor dispatch path.
+    """
+    import torch
+    from torch.utils import cpp_extension
+
+    if len(search_shape) != 2 or any(value < 1 for value in search_shape):
+        raise ValueError("search_shape must contain positive dimensions")
+    if search_shape[0] < 3 or search_shape[1] < 3:
+        raise ValueError("NCC postprocess requires a 3x3 or larger surface")
+    resolved_device = canonical_torch_device(device)
+    if not resolved_device.startswith("cuda:"):
+        raise ValueError("NCC postprocess native candidate requires CUDA")
+    Path(build_dir).mkdir(parents=True, exist_ok=True)
+    request = NativeBuildRequest(
+        NativeOperation.AMPCOR_NCC_POSTPROCESS,
+        NativeBackend.CUDA,
+        source_root=Path(source_root),
+        compiler=compiler,
+    )
+    builder = NativeBuilder()
+    plan = builder.plan(request)
+    if not plan.supported:
+        raise RuntimeError(plan.unsupported_reason or "NCC native backend unsupported")
+    module_holder: dict[str, object] = {}
+
+    def build(plan_to_build: object) -> Path:
+        """Build the CUDA extension during explicit candidate preparation."""
+        plan_value = plan_to_build
+        module = cpp_extension.load(
+            name=plan_value.extension_name,
+            sources=[str(source) for source in plan_value.sources],
+            extra_cflags=list(plan_value.compile_flags),
+            extra_cuda_cflags=list(plan_value.compile_flags),
+            extra_ldflags=list(plan_value.link_flags),
+            extra_include_paths=[str(path) for path in plan_value.include_dirs],
+            build_directory=str(Path(build_dir)),
+            with_cuda=True,
+            verbose=False,
+        )
+        module_holder["module"] = module
+        return Path(getattr(module, "__file__", build_dir))
+
+    prepared = builder.prepare(request, build=build)
+    if prepared.status is not PreparationStatus.PREPARED:
+        raise RuntimeError(prepared.reason or "NCC native preparation failed")
+    module = module_holder["module"]
+    source_abi = getattr(module, "native_source_abi", None)
+    if source_abi is None or source_abi() != _NCC_NATIVE_ABI:
+        raise RuntimeError("NCC native source ABI mismatch")
+    entry = getattr(module, "ampcor_ncc_postprocess_cuda", None)
+    if entry is None:
+        raise RuntimeError("NCC native module has no postprocess entry point")
+
+    height, width = search_shape
+    sample_corr = _centered_sample((1, height, width), resolved_device)
+    sample_energy = torch.ones_like(sample_corr)
+    native_result = entry(
+        sample_corr,
+        sample_energy,
+        height // 2,
+        width // 2,
+        True,
+        0.0,
+        1e9,
+    )
+    reference_result = ampcor_ncc_postprocess_reference(
+        sample_corr,
+        sample_energy,
+        search_az=height // 2,
+        search_rg=width // 2,
+        subpixel=True,
+        snr_threshold=0.0,
+        max_abs_residual=1e9,
+    )
+    for native_value, reference_value in zip(
+        native_result, reference_result, strict=True
+    ):
+        if native_value.dtype is torch.bool:
+            torch.testing.assert_close(native_value, reference_value)
+        else:
+            torch.testing.assert_close(
+                native_value, reference_value, rtol=1e-10, atol=1e-12
+            )
+    torch.cuda.synchronize(torch.device(resolved_device))
+    source_digest = sha256(
+        b"".join(path.read_bytes() for path in plan.sources)
+    ).hexdigest()
+
+    def execute_native(
+        correlation: object,
+        energy: object,
+        subpixel: bool,
+        snr_threshold: float,
+        max_abs_residual: float,
+    ) -> tuple[object, object, object, object, object]:
+        """Call the fixed-shape native entry point."""
+        return entry(
+            correlation,
+            energy,
+            height // 2,
+            width // 2,
+            subpixel,
+            snr_threshold,
+            max_abs_residual,
+        )
+
+    return AmpcorNccCandidate(
+        device=resolved_device,
+        search_shape=search_shape,
+        executor=execute_native,
+        runtime_profile=(
+            f"native-ncc-{resolved_device}-torch-{torch.__version__}-cuda-"
+            f"{torch.version.cuda or 'none'}"
+        ),
+        source_digest=source_digest,
+        native_module=module,
+    )
+
+
 __all__ = [
     "AmpcorBackend",
     "AmpcorBackendRegistry",
     "AmpcorCandidateError",
     "AmpcorEnergyCandidate",
+    "AmpcorNccCandidate",
+    "AmpcorNccCandidateError",
+    "ampcor_ncc_postprocess_reference",
     "canonical_torch_device",
     "eager_ampcor_candidate",
     "native_workspace_bytes",
     "prepare_ampcor_compile",
     "prepare_ampcor_native",
+    "prepare_ampcor_ncc_native",
     "torch_integral_energy",
 ]

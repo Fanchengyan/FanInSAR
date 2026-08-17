@@ -69,6 +69,39 @@ def test_ampcor_cuda_plan_uses_a_dedicated_binding_and_kernel() -> None:
     assert plan.unsupported_reason == ""
 
 
+def test_ampcor_ncc_cuda_plan_is_experimental_and_separate() -> None:
+    """NCC postprocess uses its own CUDA binding and ABI operation."""
+    plan = NativeBuilder().plan(
+        NativeBuildRequest(
+            NativeOperation.AMPCOR_NCC_POSTPROCESS,
+            NativeBackend.CUDA,
+            source_root=SOURCE_ROOT,
+        )
+    )
+    assert plan.extension_name == "faninsar_ampcor_ncc_postprocess_v1_cuda"
+    assert plan.sources == (
+        SOURCE_ROOT / "ampcor_ncc_cuda_bindings.cpp",
+        SOURCE_ROOT / "ampcor_ncc_postprocess_cuda.cu",
+    )
+    assert plan.supported
+
+
+def test_ampcor_ncc_cuda_source_preserves_peak_and_cull_contract() -> None:
+    """The prototype source carries the strict numerical boundary markers."""
+    binding = (SOURCE_ROOT / "ampcor_ncc_cuda_bindings.cpp").read_text()
+    source = (SOURCE_ROOT / "ampcor_ncc_postprocess_cuda.cu").read_text()
+    assert '"faninsar.ampcor_ncc_postprocess.v1"' in binding
+    assert '"ampcor_ncc_postprocess_cuda"' in binding
+    assert "torch::kFloat64" in source
+    assert "is_contiguous()" in source
+    assert "CUDAGuard" in source
+    assert "getCurrentCUDAStream" in source
+    assert "C10_CUDA_KERNEL_LAUNCH_CHECK" in source
+    assert "llabs(row - peak_az) <= 1" in source
+    assert "fabs(az_denom) < 1e-12" in source
+    assert "snr >= snr_threshold" in source
+
+
 def test_geometry_operation_remains_a_compatible_native_operation_alias() -> None:
     """Existing geometry callers retain their enum members and values."""
     assert GeometryOperation is NativeOperation

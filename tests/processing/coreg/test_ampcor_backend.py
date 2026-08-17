@@ -9,6 +9,8 @@ from faninsar.processing.coreg.ampcor_backend import (
     AmpcorBackendRegistry,
     AmpcorCandidateError,
     AmpcorEnergyCandidate,
+    AmpcorNccCandidate,
+    ampcor_ncc_postprocess_reference,
     eager_ampcor_candidate,
     native_workspace_bytes,
     prepare_ampcor_compile,
@@ -16,6 +18,122 @@ from faninsar.processing.coreg.ampcor_backend import (
 )
 
 _NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
+_NCC_ABI = "faninsar.ampcor_ncc_postprocess.v1"
+
+
+def test_ncc_reference_uses_first_flat_peak_and_excludes_three_by_three() -> None:
+    """The reference preserves Torch argmax tie order and sidelobe masking."""
+    torch = pytest.importorskip("torch")
+    corr = torch.zeros((1, 3, 5), dtype=torch.float64)
+    energy = torch.ones_like(corr)
+    corr[0, 1, 1] = 2.0
+    corr[0, 1, 3] = 2.0
+    d_rg, d_az, snr, boundary, valid = ampcor_ncc_postprocess_reference(
+        corr,
+        energy,
+        search_az=1,
+        search_rg=2,
+        subpixel=False,
+        snr_threshold=1.0,
+        max_abs_residual=3.0,
+    )
+    assert d_rg.item() == -1.0
+    assert d_az.item() == 0.0
+    assert boundary.item() is False
+    assert valid.item() is True
+    # The second tied peak is in the excluded 3x3 neighborhood of the first.
+    assert snr.item() == pytest.approx(6.0)
+
+
+def test_ncc_reference_nan_sidelobe_and_inclusive_cull() -> None:
+    """All-NaN sidelobes are invalid and cull thresholds are inclusive."""
+    torch = pytest.importorskip("torch")
+    corr = torch.ones((1, 3, 3), dtype=torch.float64)
+    corr[0, 1, 1] = 2.0
+    energy = torch.ones_like(corr)
+    d_rg, d_az, snr, boundary, valid = ampcor_ncc_postprocess_reference(
+        corr,
+        energy,
+        search_az=1,
+        search_rg=1,
+        subpixel=True,
+        snr_threshold=2.0,
+        max_abs_residual=0.0,
+    )
+    assert d_rg.item() == 0.0
+    assert d_az.item() == 0.0
+    assert torch.isnan(snr).item()
+    assert boundary.item() is False
+    assert valid.item() is False
+
+
+def test_ncc_reference_boundary_and_subpixel_guard() -> None:
+    """Edge peaks are marked and tiny quadratic denominators do not divide."""
+    torch = pytest.importorskip("torch")
+    corr = torch.ones((1, 3, 3), dtype=torch.float64)
+    corr[0, 0, 0] = 3.0
+    energy = torch.ones_like(corr)
+    _, _, snr, boundary, valid = ampcor_ncc_postprocess_reference(
+        corr,
+        energy,
+        search_az=1,
+        search_rg=1,
+        subpixel=True,
+        snr_threshold=0.0,
+        max_abs_residual=2.0,
+    )
+    assert boundary.item() is True
+    assert torch.isfinite(snr).item()
+    assert valid.item() is True
+
+
+def test_ncc_reference_rejects_invalid_abi_shape_and_dtype() -> None:
+    """The prototype reference enforces its float64 contiguous ABI."""
+    torch = pytest.importorskip("torch")
+    corr = torch.ones((1, 3, 3), dtype=torch.float32)
+    with pytest.raises(ValueError, match="float64"):
+        ampcor_ncc_postprocess_reference(
+            corr,
+            corr,
+            search_az=1,
+            search_rg=1,
+            subpixel=False,
+            snr_threshold=0.0,
+            max_abs_residual=1.0,
+        )
+
+
+def test_ncc_registry_requires_exact_abi_and_shape() -> None:
+    """The experimental candidate registry never widens an ABI lookup."""
+    candidate = AmpcorNccCandidate(
+        device="cuda:0",
+        search_shape=(3, 3),
+        executor=lambda *_args: (),
+        runtime_profile="test-runtime",
+        source_digest="digest",
+        abi_version=_NCC_ABI,
+    )
+    registry = AmpcorBackendRegistry()
+    registry.register_ncc(candidate)
+    assert registry.get_ncc(
+        "cuda",
+        (3, 3),
+        runtime_profile="test-runtime",
+        source_digest="digest",
+    ) is candidate
+    assert registry.get_ncc(
+        "cuda",
+        (5, 5),
+        runtime_profile="test-runtime",
+        source_digest="digest",
+    ) is None
+    assert registry.get_ncc(
+        "cuda",
+        (3, 3),
+        runtime_profile="test-runtime",
+        source_digest="digest",
+        abi_version="wrong.abi",
+    ) is None
 
 
 def test_torch_integral_energy_matches_reference() -> None:
