@@ -1484,11 +1484,12 @@ def _torch_patch_ncc_batch(
             search_rg=search_rg,
             torch_module=torch,
         )
-    # The native postprocess is an optional fixed-shape accelerator.  The
-    # public boundary still owns threshold culling and the two-phase boundary
-    # oracle, so native ``surface_edge`` and ``valid`` outputs are ignored.
-    # A candidate failure is quarantined for the remainder of this call and
-    # falls through to the same-device Torch implementation.
+    # The native postprocess is an optional fixed-shape accelerator.  Only
+    # pre-dispatch eligibility failures fall back to same-device Torch. Native
+    # entry/output failures quarantine the candidate and propagate; silently
+    # retrying them in the same call would hide a broken native implementation.
+    # The public boundary still owns threshold culling and the two-phase
+    # boundary oracle, so native ``surface_edge`` and ``valid`` are ignored.
     if (
         not force_fft_energy
         and ncc_candidate is not None

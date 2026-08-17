@@ -23,7 +23,8 @@ from faninsar.processing.coreg.ampcor_backend import (
 
 _NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
 _NCC_ABI = "faninsar.ampcor_ncc_postprocess.v1"
-_NCC_SOURCE = "f88a7b883ada00b63677b60cb20965c3a875900596c5642bc4c22226f05dab62"
+_NCC_OPERATION = "ampcor_ncc_postprocess.v1"
+_NCC_SOURCE = "c9ab63fc3e1904ecd3ccee1121e349d05de908ac05fd59c4bb6b837641f987d5"
 
 
 def _ncc_profile(
@@ -45,9 +46,24 @@ def _ncc_profile(
     )
 
 
-def _ncc_measurement(batch_size: int = 16) -> AmpcorNccWorkspaceMeasurement:
+def _ncc_measurement(
+    *,
+    search_shape: tuple[int, int] = (17, 17),
+    batch_size: int = 16,
+    runtime_profile: str,
+    candidate_generation: str | None = None,
+) -> AmpcorNccWorkspaceMeasurement:
     """Build a measured NCC packet for registry-only unit tests."""
+    if candidate_generation is None:
+        candidate_generation = runtime_profile
     return AmpcorNccWorkspaceMeasurement(
+        operation=_NCC_OPERATION,
+        search_shape=search_shape,
+        batch_size=batch_size,
+        runtime_profile=runtime_profile,
+        source_digest=_NCC_SOURCE,
+        abi_version=_NCC_ABI,
+        candidate_generation=candidate_generation,
         peak_allocated_bytes=batch_size * 26,
         output_bytes=batch_size * 26,
         global_scratch_bytes=0,
@@ -103,6 +119,25 @@ def test_ncc_reference_nan_sidelobe_and_inclusive_cull() -> None:
     assert valid.item() is False
 
 
+@pytest.mark.parametrize("value", [np.inf, -np.inf, np.nan])
+def test_ncc_reference_nonfinite_snr_is_invalid(value: float) -> None:
+    """Positive, negative, and NaN SNR values never pass the valid mask."""
+    torch = pytest.importorskip("torch")
+    corr = torch.full((1, 3, 3), value, dtype=torch.float64)
+    energy = torch.ones_like(corr)
+    _, _, snr, _, valid = ampcor_ncc_postprocess_reference(
+        corr,
+        energy,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+        snr_threshold=0.0,
+        max_abs_residual=1.0,
+    )
+    assert not bool(valid.item())
+    assert not bool(torch.isfinite(snr).item())
+
+
 def test_ncc_reference_boundary_and_subpixel_guard() -> None:
     """Edge peaks are marked and tiny quadratic denominators do not divide."""
     torch = pytest.importorskip("torch")
@@ -151,6 +186,9 @@ def test_ncc_registry_requires_exact_abi_and_shape(
         "_current_ncc_runtime_profile",
         lambda *_args, **_kwargs: profile,
     )
+    monkeypatch.setattr(
+        ampcor_backend, "_current_ncc_source_digest", lambda: _NCC_SOURCE
+    )
     candidate = AmpcorNccCandidate(
         device="cuda:0",
         search_shape=(17, 17),
@@ -160,7 +198,8 @@ def test_ncc_registry_requires_exact_abi_and_shape(
         source_digest=_NCC_SOURCE,
         abi_version=_NCC_ABI,
         profile=profile,
-        workspace_measurement=_ncc_measurement(),
+        candidate_generation=profile.canonical(),
+        workspace_measurement=_ncc_measurement(runtime_profile=profile.canonical()),
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
@@ -273,14 +312,24 @@ def test_ncc_registry_dispatches_qualified_shape(
         "_current_ncc_runtime_profile",
         lambda *_args, **_kwargs: profile,
     )
+    monkeypatch.setattr(
+        ampcor_backend, "_current_ncc_source_digest", lambda: _NCC_SOURCE
+    )
     candidate = AmpcorNccCandidate(
         device="cuda:0",
         search_shape=search_shape,
         executor=lambda *_args: (),
         batch_size=batch_size,
+        runtime_profile=profile.canonical(),
         source_digest=_NCC_SOURCE,
         profile=profile,
-        workspace_measurement=_ncc_measurement(batch_size),
+        candidate_generation=profile.canonical(),
+        workspace_measurement=_ncc_measurement(
+            search_shape=search_shape,
+            batch_size=batch_size,
+            runtime_profile=profile.canonical(),
+            candidate_generation=profile.canonical(),
+        ),
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
@@ -311,20 +360,63 @@ def test_ncc_registry_persistent_quarantine_survives_next_lookup(
         "_current_ncc_runtime_profile",
         lambda *_args, **_kwargs: profile,
     )
+    monkeypatch.setattr(
+        ampcor_backend, "_current_ncc_source_digest", lambda: _NCC_SOURCE
+    )
     candidate = AmpcorNccCandidate(
         device="cuda:0",
         search_shape=(17, 17),
         executor=lambda *_args: (),
         batch_size=16,
+        runtime_profile=profile.canonical(),
         source_digest=_NCC_SOURCE,
         profile=profile,
-        workspace_measurement=_ncc_measurement(),
+        candidate_generation=profile.canonical(),
+        workspace_measurement=_ncc_measurement(runtime_profile=profile.canonical()),
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
     assert registry.get_ncc("cuda", (17, 17), batch_size=16) is candidate
     candidate.quarantine()
     assert registry.get_ncc("cuda", (17, 17), batch_size=16) is None
+
+
+def test_ncc_registry_quarantines_candidate_after_source_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current source mutation invalidates a previously prepared candidate."""
+    from faninsar.processing.coreg import ampcor_backend
+
+    profile = _ncc_profile()
+    monkeypatch.setattr(
+        ampcor_backend,
+        "_current_ncc_runtime_profile",
+        lambda *_args, **_kwargs: profile,
+    )
+    current_digest = [_NCC_SOURCE]
+    monkeypatch.setattr(
+        ampcor_backend,
+        "_current_ncc_source_digest",
+        lambda: current_digest[0],
+    )
+    generation = profile.canonical()
+    candidate = AmpcorNccCandidate(
+        device="cuda:0",
+        search_shape=(17, 17),
+        executor=lambda *_args: (),
+        batch_size=16,
+        runtime_profile=generation,
+        source_digest=_NCC_SOURCE,
+        profile=profile,
+        candidate_generation=generation,
+        workspace_measurement=_ncc_measurement(runtime_profile=generation),
+    )
+    registry = AmpcorBackendRegistry()
+    registry.register_ncc(candidate)
+    assert registry.get_ncc("cuda", (17, 17), batch_size=16) is candidate
+    current_digest[0] = "f" * 64
+    assert registry.get_ncc("cuda", (17, 17), batch_size=16) is None
+    assert candidate.quarantined
 
 
 def test_ncc_registry_does_not_dispatch_unknown_shape() -> None:
@@ -368,8 +460,61 @@ def test_ncc_registry_rejects_unmeasured_workspace() -> None:
         search_shape=(17, 17),
         executor=lambda *_args: (),
         batch_size=16,
+        runtime_profile=profile.canonical(),
         source_digest=_NCC_SOURCE,
         profile=profile,
+        candidate_generation=profile.canonical(),
+        workspace_measurement=_ncc_measurement(runtime_profile=profile.canonical()),
+    )
+    registry = AmpcorBackendRegistry()
+    registry.register_ncc(candidate)
+    assert registry.get_ncc("cuda", (17, 17), batch_size=16) is None
+
+
+def test_ncc_workspace_identity_and_zero_packet_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workspace packets must bind to candidate identity and have bytes."""
+    from dataclasses import replace
+
+    from faninsar.processing.coreg import ampcor_backend
+
+    profile = _ncc_profile()
+    generation = profile.canonical()
+    measurement = _ncc_measurement(runtime_profile=generation)
+    with pytest.raises(ValueError, match="workspace measurement"):
+        AmpcorNccCandidate(
+            device="cuda:0",
+            search_shape=(17, 17),
+            executor=lambda *_args: (),
+            batch_size=16,
+            runtime_profile=generation,
+            source_digest=_NCC_SOURCE,
+            profile=profile,
+            candidate_generation="different-generation",
+            workspace_measurement=measurement,
+        )
+    monkeypatch.setattr(
+        ampcor_backend,
+        "_current_ncc_runtime_profile",
+        lambda *_args, **_kwargs: profile,
+    )
+    monkeypatch.setattr(
+        ampcor_backend, "_current_ncc_source_digest", lambda: _NCC_SOURCE
+    )
+    zero = replace(
+        measurement, peak_allocated_bytes=0, output_bytes=0, shared_memory_bytes=0
+    )
+    candidate = AmpcorNccCandidate(
+        device="cuda:0",
+        search_shape=(17, 17),
+        executor=lambda *_args: (),
+        batch_size=16,
+        runtime_profile=generation,
+        source_digest=_NCC_SOURCE,
+        profile=profile,
+        candidate_generation=generation,
+        workspace_measurement=zero,
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
@@ -403,15 +548,22 @@ def test_ncc_registry_rejects_unqualified_runtime(
         "_current_ncc_runtime_profile",
         lambda *_args, **_kwargs: actual_profile,
     )
+    monkeypatch.setattr(
+        ampcor_backend, "_current_ncc_source_digest", lambda: _NCC_SOURCE
+    )
     candidate = AmpcorNccCandidate(
         device="cuda:0",
         search_shape=(17, 17),
         executor=lambda *_args: (),
         batch_size=16,
+        runtime_profile=candidate_profile.canonical(),
         source_digest=_NCC_SOURCE,
         profile=candidate_profile,
         performance_eligible=True,
-        workspace_measurement=_ncc_measurement(),
+        candidate_generation=candidate_profile.canonical(),
+        workspace_measurement=_ncc_measurement(
+            runtime_profile=candidate_profile.canonical(),
+        ),
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
@@ -433,14 +585,19 @@ def test_ncc_registry_rejects_source_digest_mismatch(
         "_current_ncc_runtime_profile",
         lambda *_args, **_kwargs: profile,
     )
+    monkeypatch.setattr(
+        ampcor_backend, "_current_ncc_source_digest", lambda: _NCC_SOURCE
+    )
     candidate = AmpcorNccCandidate(
         device="cuda:0",
         search_shape=(17, 17),
         executor=lambda *_args: (),
         batch_size=16,
+        runtime_profile=profile.canonical(),
         source_digest=_NCC_SOURCE,
         profile=profile,
-        workspace_measurement=_ncc_measurement(),
+        candidate_generation=profile.canonical(),
+        workspace_measurement=_ncc_measurement(runtime_profile=profile.canonical()),
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)

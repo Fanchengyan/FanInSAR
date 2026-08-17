@@ -25,6 +25,7 @@ AmpcorBackend = Literal["eager", "compile", "native"]
 EnergyExecutor = Callable[[object], object]
 _NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
 _NCC_NATIVE_ABI = "faninsar.ampcor_ncc_postprocess.v1"
+_NCC_OPERATION = NativeOperation.AMPCOR_NCC_POSTPROCESS.value
 _NCC_QUALIFIED_COMPUTE_CAPABILITY = (8, 0)
 _NCC_QUALIFIED_TORCH = "2.8.0+cu128"
 _NCC_QUALIFIED_CUDA = "12.8"
@@ -84,6 +85,13 @@ class AmpcorNccWorkspaceMeasurement:
     replace a measured native allocation with a shape-only estimate.
     """
 
+    operation: str
+    search_shape: tuple[int, int]
+    batch_size: int
+    runtime_profile: str
+    source_digest: str
+    abi_version: str
+    candidate_generation: str
     peak_allocated_bytes: int
     output_bytes: int
     global_scratch_bytes: int
@@ -93,6 +101,26 @@ class AmpcorNccWorkspaceMeasurement:
 
     def __post_init__(self) -> None:
         """Validate all measured packet fields."""
+        if (
+            not self.operation
+            or len(self.search_shape) != 2
+            or any(value < 1 for value in self.search_shape)
+        ):
+            message = "Ampcor NCC workspace identity is invalid"
+            logger.error(message)
+            raise ValueError(message)
+        if (
+            isinstance(self.batch_size, bool)
+            or not isinstance(self.batch_size, int)
+            or self.batch_size < 1
+            or not self.runtime_profile
+            or not self.source_digest
+            or not self.abi_version
+            or not self.candidate_generation
+        ):
+            message = "Ampcor NCC workspace identity is incomplete"
+            logger.error(message)
+            raise ValueError(message)
         fields = (
             self.peak_allocated_bytes,
             self.output_bytes,
@@ -177,7 +205,7 @@ _NCC_QUALIFIED_RECORDS = (
         cuda_runtime=_NCC_QUALIFIED_CUDA,
         minimum_memory_bytes=_NCC_QUALIFIED_MEMORY_BYTES,
         source_digest=(
-            "f88a7b883ada00b63677b60cb20965c3a875900596c5642bc4c22226f05dab62"
+            "c9ab63fc3e1904ecd3ccee1121e349d05de908ac05fd59c4bb6b837641f987d5"
         ),
         abi_version=_NCC_NATIVE_ABI,
     ),
@@ -210,6 +238,21 @@ def _current_ncc_runtime_profile(
         source_digest=source_digest,
         abi_version=abi_version,
     )
+
+
+def _current_ncc_source_digest() -> str:
+    """Hash the current NCC source set once for one registry acquisition."""
+    source_root = Path(__file__).resolve().parents[1] / "geometry" / "native_v2"
+    sources = (
+        source_root / "ampcor_ncc_cuda_bindings.cpp",
+        source_root / "ampcor_ncc_postprocess_cuda.cu",
+    )
+    try:
+        return sha256(b"".join(source.read_bytes() for source in sources)).hexdigest()
+    except OSError:
+        message = "unable to hash the current native NCC source set"
+        logger.exception(message)
+        return ""
 
 
 def _is_qualified_ncc_profile(
@@ -398,6 +441,7 @@ class AmpcorNccCandidate:
     batch_size: int = 1
     workspace_measurement: AmpcorNccWorkspaceMeasurement | None = None
     quarantined: bool = False
+    candidate_generation: str = ""
 
     def __post_init__(self) -> None:
         """Normalize the device identity before registry publication."""
@@ -414,11 +458,25 @@ class AmpcorNccCandidate:
             message = "NCC batch_size must be a positive integer"
             logger.error(message)
             raise ValueError(message)
+        if self.workspace_measurement is not None:
+            measurement = self.workspace_measurement
+            if (
+                measurement.operation != _NCC_OPERATION
+                or measurement.search_shape != self.search_shape
+                or measurement.batch_size != self.batch_size
+                or measurement.runtime_profile != self.runtime_profile
+                or measurement.source_digest != self.source_digest
+                or measurement.abi_version != self.abi_version
+                or measurement.candidate_generation != self.candidate_generation
+            ):
+                message = "NCC workspace measurement does not match candidate"
+                logger.error(message)
+                raise ValueError(message)
 
-    def quarantine(self) -> None:
+    def quarantine(self, reason: str = "native execution failure") -> None:
         """Quarantine this candidate after a native failure."""
         if not self.quarantined:
-            logger.error("Quarantining native NCC candidate after execution failure")
+            logger.error("Quarantining native NCC candidate: %s", reason)
             self.quarantined = True
 
     def validate_inputs(self, correlation: object, energy: object) -> None:
@@ -769,6 +827,7 @@ class AmpcorBackendRegistry:
             or not candidate.correctness_qualified
             or candidate.quarantined
             or candidate.workspace_measurement is None
+            or candidate.workspace_measurement.admitted_bytes <= 0
         ):
             return
         if (
@@ -820,8 +879,27 @@ class AmpcorBackendRegistry:
             for key, candidate in self._ncc_candidates.items()
             if (key[0] == resolved and key[1] == search_shape and key[2] == batch_size)
         )
+        current_source_digest = _current_ncc_source_digest() if candidates else ""
+        if not current_source_digest:
+            return None
         for candidate in candidates:
-            if candidate.quarantined or candidate.workspace_measurement is None:
+            measurement = candidate.workspace_measurement
+            if candidate.quarantined or measurement is None:
+                continue
+            if candidate.source_digest != current_source_digest:
+                candidate.quarantine("native NCC source digest is stale")
+                continue
+            if (
+                measurement.operation != _NCC_OPERATION
+                or measurement.search_shape != candidate.search_shape
+                or measurement.batch_size != candidate.batch_size
+                or measurement.runtime_profile != candidate.runtime_profile
+                or measurement.source_digest != candidate.source_digest
+                or measurement.abi_version != candidate.abi_version
+                or measurement.candidate_generation != candidate.candidate_generation
+                or measurement.admitted_bytes <= 0
+            ):
+                candidate.quarantine("native NCC workspace identity is invalid")
                 continue
             if not _is_qualified_ncc_profile(
                 candidate.profile,
@@ -839,7 +917,7 @@ class AmpcorBackendRegistry:
                 continue
             current_profile = _current_ncc_runtime_profile(
                 resolved,
-                source_digest=candidate.source_digest,
+                source_digest=current_source_digest,
                 abi_version=candidate.abi_version,
             )
             if current_profile != candidate.profile:
@@ -1139,6 +1217,18 @@ def prepare_ampcor_ncc_native(
         raise RuntimeError(message)
 
     height, width = search_shape
+    source_digest = sha256(
+        b"".join(path.read_bytes() for path in plan.sources)
+    ).hexdigest()
+    profile = _current_ncc_runtime_profile(
+        resolved_device,
+        source_digest=source_digest,
+        abi_version=_NCC_NATIVE_ABI,
+    )
+    runtime_profile = profile.canonical() if profile is not None else ""
+    candidate_generation = sha256(
+        f"{plan.extension_name}:{source_digest}:{_NCC_NATIVE_ABI}".encode()
+    ).hexdigest()
     sample_corr = _centered_sample((batch_size, height, width), resolved_device)
     sample_energy = torch.ones_like(sample_corr)
     torch.cuda.synchronize(torch.device(resolved_device))
@@ -1165,6 +1255,13 @@ def prepare_ampcor_ncc_native(
     properties = torch.cuda.get_device_properties(torch.device(resolved_device))
     max_grid = int(getattr(properties, "max_grid_size", (batch_size,))[0])
     workspace_measurement = AmpcorNccWorkspaceMeasurement(
+        operation=_NCC_OPERATION,
+        search_shape=search_shape,
+        batch_size=batch_size,
+        runtime_profile=runtime_profile,
+        source_digest=source_digest,
+        abi_version=_NCC_NATIVE_ABI,
+        candidate_generation=candidate_generation,
         peak_allocated_bytes=peak_allocated,
         output_bytes=output_bytes,
         global_scratch_bytes=0,
@@ -1191,14 +1288,6 @@ def prepare_ampcor_ncc_native(
                 native_value, reference_value, rtol=1e-10, atol=1e-12
             )
     torch.cuda.synchronize(torch.device(resolved_device))
-    source_digest = sha256(
-        b"".join(path.read_bytes() for path in plan.sources)
-    ).hexdigest()
-    profile = _current_ncc_runtime_profile(
-        resolved_device,
-        source_digest=source_digest,
-        abi_version=_NCC_NATIVE_ABI,
-    )
 
     def execute_native(
         correlation: object,
@@ -1223,7 +1312,7 @@ def prepare_ampcor_ncc_native(
         search_shape=search_shape,
         executor=execute_native,
         batch_size=batch_size,
-        runtime_profile=profile.canonical() if profile is not None else "",
+        runtime_profile=runtime_profile,
         source_digest=source_digest,
         profile=profile,
         performance_eligible=(search_shape, batch_size) in _NCC_PERFORMANCE_COMBINATIONS
@@ -1236,6 +1325,7 @@ def prepare_ampcor_ncc_native(
         ),
         native_module=module,
         workspace_measurement=workspace_measurement,
+        candidate_generation=candidate_generation,
     )
 
 
