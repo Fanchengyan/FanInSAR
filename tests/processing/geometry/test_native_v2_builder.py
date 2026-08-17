@@ -42,6 +42,30 @@ def test_operation_and_source_selection_is_exact(
     assert plan.sources[-1].suffix == expected_suffix
 
 
+def test_default_source_root_is_package_local_after_cwd_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default CPU and CUDA plans resolve sources independently of cwd."""
+    monkeypatch.chdir(tmp_path)
+    expected_root = (
+        Path(__file__).parents[3] / "faninsar" / "processing" / "geometry" / "native_v2"
+    )
+
+    for backend in (NativeBackend.CPU, NativeBackend.CUDA):
+        plan = NativeBuilder().plan(
+            NativeBuildRequest(
+                GeometryOperation.GEO2RDR,
+                backend,
+                platform="windows",
+            )
+        )
+
+        assert plan.sources
+        assert all(source.is_absolute() for source in plan.sources)
+        assert all(source.is_relative_to(expected_root) for source in plan.sources)
+        assert all(source.exists() for source in plan.sources)
+
+
 def test_native_plans_include_both_operation_sources_and_shared_binding() -> None:
     """CPU and CUDA plans carry both operation units behind one binding module."""
     source_root = (

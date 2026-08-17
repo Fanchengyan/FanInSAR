@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
 
+_DEFAULT_NATIVE_SOURCE_ROOT = Path(__file__).resolve().parent
+
+
 class NativePreparationError(RuntimeError):
     """Raised when a candidate cannot be dispatched."""
 
@@ -49,7 +52,7 @@ class NativeBuildRequest:
 
     operation: GeometryOperation
     backend: NativeBackend
-    source_root: Path = Path()
+    source_root: Path = _DEFAULT_NATIVE_SOURCE_ROOT
     platform: str | None = None
     compiler: str | None = None
     libomp_root: Path | None = None
@@ -127,7 +130,7 @@ class PreparedNativeCandidate:
 def select_native_sources(
     operation: GeometryOperation | str,
     backend: NativeBackend | str,
-    source_root: str | Path = ".",
+    source_root: str | Path = _DEFAULT_NATIVE_SOURCE_ROOT,
 ) -> tuple[Path, ...]:
     """Select operation/device-specific source names deterministically.
 

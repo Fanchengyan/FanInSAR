@@ -124,7 +124,17 @@ dev = [
 include-package-data = true
 
 [tool.setuptools.package-data]
-faninsar = ["**/*.csv", "**/*.cpt", "**/*.pdf", "**/*.pyi", "**/*.txt"]
+faninsar = [
+  "processing/geometry/native_v2/**/*.cpp",
+  "processing/geometry/native_v2/**/*.h",
+  "processing/geometry/native_v2/**/*.cu",
+  "processing/geometry/native_v2/**/*.cuh",
+  "**/*.csv",
+  "**/*.cpt",
+  "**/*.pdf",
+  "**/*.pyi",
+  "**/*.txt",
+]
 
 [tool.setuptools.data-files]
 "share/faninsar/LICENSES" = ["LICENSES/*"]

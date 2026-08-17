@@ -1,0 +1,63 @@
+name: Geometry Native CPU
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/geometry-native.yml"
+      - "faninsar/processing/geometry/**"
+      - "pyproject.toml"
+      - "tests/packaging/**"
+      - "tests/processing/geometry/test_native_v2_cpu_sources.py"
+      - "tests/processing/geometry/test_public_geometry_v2.py"
+      - "tests/processing/geometry/test_public_geometry_v2_p1.py"
+  push:
+    paths:
+      - ".github/workflows/geometry-native.yml"
+      - "faninsar/processing/geometry/**"
+      - "pyproject.toml"
+      - "tests/packaging/**"
+      - "tests/processing/geometry/test_native_v2_cpu_sources.py"
+      - "tests/processing/geometry/test_public_geometry_v2.py"
+      - "tests/processing/geometry/test_public_geometry_v2_p1.py"
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
+
+      - name: Install project and CPU test dependencies
+        run: |
+          uv sync --dev --python 3.11
+          uv pip install --python .venv ninja build pytest pytest-cov
+
+      - name: Check wheel native source contents
+        run: uv run pytest -q --no-cov tests/packaging/test_native_v2_wheel.py
+
+      - name: Run serial native ABI and public dispatch tests
+        run: >-
+          uv run pytest -q --no-cov
+          tests/processing/geometry/test_native_v2_cpu_sources.py::test_serial_cpu_extension_returns_validated_fourteen_field_result
+          tests/processing/geometry/test_public_geometry_v2.py::test_public_selectors_execute_prepared_eager_and_native
+          tests/processing/geometry/test_public_geometry_v2.py::test_public_auto_requires_both_native_qualification_gates
+          tests/processing/geometry/test_public_geometry_v2_p1.py::test_auto_eager_fallback_preserves_cuda_device_identity
