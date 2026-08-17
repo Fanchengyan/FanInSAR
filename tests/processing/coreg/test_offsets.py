@@ -498,6 +498,8 @@ def test_full_iw1_shape_rejects_overlapping_view(
         samples,
         prior_rg=0.0,
         prior_az=0.0,
+        executor="numpy",
+        device="cpu",
     ) == (0.0, 0.0)
 
 def test_ampcor_copies_safe_noncontiguous_torch_view() -> None:
@@ -1945,6 +1947,10 @@ def test_ampcor_direct_torch_auto_uses_torch_cpu_policy(
 
     torch = pytest.importorskip("torch")
 
+    # Keep this unit test on the portable auto/CPU branch when it runs on a
+    # qualified CUDA host; the CUDA override is covered separately below.
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
+
     monkeypatch.setattr(
         offsets_mod,
         "_torch_patch_ncc_batch",
@@ -2702,10 +2708,11 @@ def test_refine_shift_rejects_unqualified_mps_before_secondary_roll(
         )
 
 
-def test_refine_shift_rejects_dispatch_before_secondary_roll(
+def test_refine_shift_cuda_overrides_numpy_before_secondary_roll(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Contradictory requests fail before input-derived workspace allocation."""
+    """CUDA admission selects Torch even when NumPy was requested."""
+    torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import geometry_coreg
 
     monkeypatch.setattr(
@@ -2713,16 +2720,36 @@ def test_refine_shift_rejects_dispatch_before_secondary_roll(
         "roll",
         lambda *_args, **_kwargs: pytest.fail("np.roll ran before policy validation"),
     )
-    samples = np.ones((32, 64), dtype=np.complex64)
-    with pytest.raises((InvalidProcessingStateError, RuntimeError, ImportError)):
-        geometry_coreg.refine_shift_with_correlation(
-            samples,
-            samples,
-            prior_rg=0.0,
-            prior_az=0.0,
-            executor="numpy",
-            device="cuda:0",
+    monkeypatch.setattr(
+        geometry_coreg,
+        "_validate_ampcor_accelerator",
+        lambda _device: None,
+    )
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    captured: dict[str, object] = {}
+
+    def fake_estimate(*_args: object, **kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            range_shift_px=0.0,
+            azimuth_shift_px=0.0,
+            n_valid=0,
+            snr_median=0.0,
         )
+
+    monkeypatch.setattr(geometry_coreg, "estimate_patch_amplitude_shift", fake_estimate)
+    samples = np.ones((32, 64), dtype=np.complex64)
+    assert geometry_coreg.refine_shift_with_correlation(
+        samples,
+        samples,
+        prior_rg=0.0,
+        prior_az=0.0,
+        executor="numpy",
+        device="cuda:0",
+    ) == (0.0, 0.0)
+    assert captured["executor"] == "torch"
+    assert captured["device"] == "cuda:0"
 
 
 def test_refine_shift_rejects_unavailable_cuda_before_secondary_roll(
