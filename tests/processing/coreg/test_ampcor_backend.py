@@ -11,6 +11,7 @@ from faninsar.processing.coreg.ampcor_backend import (
     AmpcorEnergyCandidate,
     AmpcorNccCandidate,
     AmpcorNccCandidateError,
+    AmpcorNccRuntimeProfile,
     ampcor_ncc_postprocess_reference,
     eager_ampcor_candidate,
     native_workspace_bytes,
@@ -20,6 +21,26 @@ from faninsar.processing.coreg.ampcor_backend import (
 
 _NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
 _NCC_ABI = "faninsar.ampcor_ncc_postprocess.v1"
+_NCC_SOURCE = "c9ab63fc3e1904ecd3ccee1121e349d05de908ac05fd59c4bb6b837641f987d5"
+
+
+def _ncc_profile(
+    *,
+    source_digest: str = _NCC_SOURCE,
+    device_name: str = "NVIDIA A100 80GB PCIe",
+    torch_version: str = "2.8.0+cu128",
+    cuda_runtime: str = "12.8",
+) -> AmpcorNccRuntimeProfile:
+    """Build a deterministic NCC qualification profile for registry tests."""
+    return AmpcorNccRuntimeProfile(
+        device_name=device_name,
+        compute_capability=(8, 0),
+        torch_version=torch_version,
+        cuda_runtime=cuda_runtime,
+        memory_bytes=80 * 1024**3,
+        source_digest=source_digest,
+        abi_version=_NCC_ABI,
+    )
 
 
 def test_ncc_reference_uses_first_flat_peak_and_excludes_three_by_three() -> None:
@@ -104,35 +125,46 @@ def test_ncc_reference_rejects_invalid_abi_shape_and_dtype() -> None:
         )
 
 
-def test_ncc_registry_requires_exact_abi_and_shape() -> None:
-    """The experimental candidate registry never widens an ABI lookup."""
+def test_ncc_registry_requires_exact_abi_and_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The NCC registry never widens a qualified ABI or shape lookup."""
+    from faninsar.processing.coreg import ampcor_backend
+
+    profile = _ncc_profile()
+    monkeypatch.setattr(
+        ampcor_backend,
+        "_current_ncc_runtime_profile",
+        lambda *_args, **_kwargs: profile,
+    )
     candidate = AmpcorNccCandidate(
         device="cuda:0",
-        search_shape=(3, 3),
+        search_shape=(17, 17),
         executor=lambda *_args: (),
-        runtime_profile="test-runtime",
-        source_digest="digest",
+        runtime_profile=profile.canonical(),
+        source_digest=_NCC_SOURCE,
         abi_version=_NCC_ABI,
+        profile=profile,
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
     assert registry.get_ncc(
         "cuda",
-        (3, 3),
-        runtime_profile="test-runtime",
-        source_digest="digest",
+        (17, 17),
+        runtime_profile=profile.canonical(),
+        source_digest=_NCC_SOURCE,
     ) is candidate
     assert registry.get_ncc(
         "cuda",
-        (5, 5),
-        runtime_profile="test-runtime",
-        source_digest="digest",
+        (9, 9),
+        runtime_profile=profile.canonical(),
+        source_digest=_NCC_SOURCE,
     ) is None
     assert registry.get_ncc(
         "cuda",
-        (3, 3),
-        runtime_profile="test-runtime",
-        source_digest="digest",
+        (17, 17),
+        runtime_profile=profile.canonical(),
+        source_digest=_NCC_SOURCE,
         abi_version="wrong.abi",
     ) is None
 
@@ -157,18 +189,31 @@ def test_ncc_candidate_rank_zero_fails_with_candidate_error() -> None:
 
 
 @pytest.mark.parametrize("search_shape", [(17, 17), (33, 33)])
-def test_ncc_registry_dispatches_qualified_shapes(
+def test_ncc_registry_dispatches_qualified_shape(
     search_shape: tuple[int, int],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both A100-qualified search surfaces are eligible for registry lookup."""
+    """Both measured A100 surfaces are eligible for registry dispatch."""
+    from faninsar.processing.coreg import ampcor_backend
+
+    profile = _ncc_profile()
+    monkeypatch.setattr(
+        ampcor_backend,
+        "_current_ncc_runtime_profile",
+        lambda *_args, **_kwargs: profile,
+    )
     candidate = AmpcorNccCandidate(
         device="cuda:0",
         search_shape=search_shape,
         executor=lambda *_args: (),
+        source_digest=_NCC_SOURCE,
+        profile=profile,
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
-    assert registry.get_ncc("cuda", search_shape) is candidate
+    assert registry.get_ncc(
+        "cuda", search_shape, source_digest=_NCC_SOURCE
+    ) is candidate
 
 
 def test_ncc_registry_does_not_dispatch_unknown_shape() -> None:
@@ -182,6 +227,86 @@ def test_ncc_registry_does_not_dispatch_unknown_shape() -> None:
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
     assert registry.get_ncc("cuda", (9, 9)) is None
+
+
+def test_ncc_registry_ignores_manual_performance_flag() -> None:
+    """A caller cannot enable an unprofiled candidate by setting a flag."""
+    candidate = AmpcorNccCandidate(
+        device="cuda:0",
+        search_shape=(17, 17),
+        executor=lambda *_args: (),
+        source_digest=_NCC_SOURCE,
+        performance_eligible=True,
+    )
+    registry = AmpcorBackendRegistry()
+    registry.register_ncc(candidate)
+    assert registry.get_ncc("cuda", (17, 17), source_digest=_NCC_SOURCE) is None
+
+
+@pytest.mark.parametrize(
+    ("device_name", "torch_version", "cuda_runtime"),
+    [
+        ("NVIDIA H100 80GB", "2.8.0+cu128", "12.8"),
+        ("NVIDIA A100-SXM4-80GB", "2.7.1+cu118", "11.8"),
+    ],
+)
+def test_ncc_registry_rejects_unqualified_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    device_name: str,
+    torch_version: str,
+    cuda_runtime: str,
+) -> None:
+    """A same-shape candidate is rejected outside the qualified runtime."""
+    from faninsar.processing.coreg import ampcor_backend
+
+    candidate_profile = _ncc_profile()
+    actual_profile = _ncc_profile(
+        device_name=device_name,
+        torch_version=torch_version,
+        cuda_runtime=cuda_runtime,
+    )
+    monkeypatch.setattr(
+        ampcor_backend,
+        "_current_ncc_runtime_profile",
+        lambda *_args, **_kwargs: actual_profile,
+    )
+    candidate = AmpcorNccCandidate(
+        device="cuda:0",
+        search_shape=(17, 17),
+        executor=lambda *_args: (),
+        source_digest=_NCC_SOURCE,
+        profile=candidate_profile,
+        performance_eligible=True,
+    )
+    registry = AmpcorBackendRegistry()
+    registry.register_ncc(candidate)
+    assert registry.get_ncc("cuda", (17, 17), source_digest=_NCC_SOURCE) is None
+
+
+def test_ncc_registry_rejects_source_digest_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source digest mismatch cannot select the native candidate."""
+    from faninsar.processing.coreg import ampcor_backend
+
+    profile = _ncc_profile(source_digest=_NCC_SOURCE)
+    monkeypatch.setattr(
+        ampcor_backend,
+        "_current_ncc_runtime_profile",
+        lambda *_args, **_kwargs: profile,
+    )
+    candidate = AmpcorNccCandidate(
+        device="cuda:0",
+        search_shape=(17, 17),
+        executor=lambda *_args: (),
+        source_digest=_NCC_SOURCE,
+        profile=profile,
+    )
+    registry = AmpcorBackendRegistry()
+    registry.register_ncc(candidate)
+    assert (
+        registry.get_ncc("cuda", (17, 17), source_digest="b" * 64) is None
+    )
 
 
 def test_torch_integral_energy_matches_reference() -> None:

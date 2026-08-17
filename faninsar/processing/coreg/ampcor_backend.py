@@ -25,7 +25,10 @@ AmpcorBackend = Literal["eager", "compile", "native"]
 EnergyExecutor = Callable[[object], object]
 _NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
 _NCC_NATIVE_ABI = "faninsar.ampcor_ncc_postprocess.v1"
-_NCC_PERFORMANCE_SHAPES = frozenset({(17, 17), (33, 33)})
+_NCC_QUALIFIED_COMPUTE_CAPABILITY = (8, 0)
+_NCC_QUALIFIED_TORCH = "2.8.0+cu128"
+_NCC_QUALIFIED_CUDA = "12.8"
+_NCC_QUALIFIED_MEMORY_BYTES = 80 * 1024**3
 
 
 def canonical_torch_device(device: str) -> str:
@@ -59,6 +62,112 @@ class AmpcorCandidateError(RuntimeError):
 
 class AmpcorNccCandidateError(RuntimeError):
     """Raised when the experimental native NCC candidate rejects a call."""
+
+
+@dataclass(frozen=True, slots=True)
+class AmpcorNccRuntimeProfile:
+    """Runtime identity attested when an NCC candidate is prepared.
+
+    The profile deliberately contains no hostname or process identity.  A
+    future qualified accelerator can be added as another explicit profile
+    predicate without widening the current A100 lane.
+    """
+
+    device_name: str
+    compute_capability: tuple[int, int]
+    torch_version: str
+    cuda_runtime: str
+    memory_bytes: int
+    source_digest: str
+    abi_version: str
+
+    def canonical(self) -> str:
+        """Return a stable, human-readable profile identity."""
+        capability = ".".join(str(part) for part in self.compute_capability)
+        return (
+            f"{self.device_name}|sm_{capability}|torch-{self.torch_version}|"
+            f"cuda-{self.cuda_runtime}|memory-{self.memory_bytes}|"
+            f"source-{self.source_digest}|abi-{self.abi_version}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _AmpcorNccQualifiedRecord:
+    """One append-only native NCC qualification record."""
+
+    search_shapes: frozenset[tuple[int, int]]
+    device_name: str
+    compute_capability: tuple[int, int]
+    torch_version: str
+    cuda_runtime: str
+    minimum_memory_bytes: int
+    source_digest: str
+    abi_version: str
+
+
+_NCC_QUALIFIED_RECORDS = (
+    _AmpcorNccQualifiedRecord(
+        search_shapes=frozenset({(17, 17), (33, 33)}),
+        device_name="NVIDIA A100 80GB PCIe",
+        compute_capability=_NCC_QUALIFIED_COMPUTE_CAPABILITY,
+        torch_version=_NCC_QUALIFIED_TORCH,
+        cuda_runtime=_NCC_QUALIFIED_CUDA,
+        minimum_memory_bytes=_NCC_QUALIFIED_MEMORY_BYTES,
+        source_digest=(
+            "c9ab63fc3e1904ecd3ccee1121e349d05de908ac05fd59c4bb6b837641f987d5"
+        ),
+        abi_version=_NCC_NATIVE_ABI,
+    ),
+)
+_NCC_PERFORMANCE_SHAPES = frozenset(
+    shape for record in _NCC_QUALIFIED_RECORDS for shape in record.search_shapes
+)
+
+
+def _current_ncc_runtime_profile(
+    device: str, *, source_digest: str, abi_version: str
+) -> AmpcorNccRuntimeProfile | None:
+    """Probe the current CUDA device without relying on host naming."""
+    import torch
+
+    resolved = torch.device(canonical_torch_device(device))
+    if resolved.type != "cuda" or not torch.cuda.is_available():
+        return None
+    properties = torch.cuda.get_device_properties(resolved)
+    return AmpcorNccRuntimeProfile(
+        device_name=str(properties.name),
+        compute_capability=tuple(
+            int(part) for part in torch.cuda.get_device_capability(resolved)
+        ),
+        torch_version=str(torch.__version__),
+        cuda_runtime=str(torch.version.cuda or ""),
+        memory_bytes=int(properties.total_memory),
+        source_digest=source_digest,
+        abi_version=abi_version,
+    )
+
+
+def _is_qualified_ncc_profile(
+    profile: AmpcorNccRuntimeProfile | None,
+    *,
+    search_shape: tuple[int, int],
+    source_digest: str,
+    abi_version: str,
+) -> bool:
+    """Return whether a profile belongs to the sole qualified NCC lane."""
+    if profile is None:
+        return False
+    return any(
+        search_shape in record.search_shapes
+        and profile.device_name == record.device_name
+        and profile.compute_capability == record.compute_capability
+        and profile.torch_version == record.torch_version
+        and profile.cuda_runtime == record.cuda_runtime
+        and profile.memory_bytes >= record.minimum_memory_bytes
+        and profile.source_digest == source_digest == record.source_digest
+        and profile.abi_version == abi_version == record.abi_version
+        for record in _NCC_QUALIFIED_RECORDS
+    )
 
 
 def ampcor_ncc_postprocess_reference(
@@ -201,10 +310,17 @@ class AmpcorNccCandidate:
     runtime_profile: str = ""
     source_digest: str = ""
     abi_version: str = _NCC_NATIVE_ABI
+    profile: AmpcorNccRuntimeProfile | None = None
     prepared: bool = True
     correctness_qualified: bool = True
-    performance_eligible: bool = True
+    performance_eligible: bool = False
     native_module: object | None = None
+
+    def __post_init__(self) -> None:
+        """Normalize the device identity before registry publication."""
+        object.__setattr__(self, "device", canonical_torch_device(self.device))
+        if len(self.search_shape) != 2 or any(value < 1 for value in self.search_shape):
+            raise ValueError("NCC search_shape must contain positive dimensions")
 
     def execute(
         self,
@@ -468,9 +584,25 @@ class AmpcorBackendRegistry:
         self._candidates[self._key(candidate)] = candidate
 
     def register_ncc(self, candidate: AmpcorNccCandidate) -> None:
-        """Atomically publish an experimental prepared NCC candidate."""
-        if not candidate.prepared:
-            raise ValueError("Ampcor registry accepts prepared candidates only")
+        """Atomically publish an eligible experimental NCC candidate.
+
+        The caller-supplied ``performance_eligible`` flag is intentionally
+        ignored.  Invalid or unqualified candidates are left unpublished so a
+        correctness-only implementation can remain available to the caller.
+        """
+        if not candidate.prepared or not candidate.correctness_qualified:
+            return
+        if candidate.search_shape not in _NCC_PERFORMANCE_SHAPES:
+            return
+        if not _is_qualified_ncc_profile(
+            candidate.profile,
+            search_shape=candidate.search_shape,
+            source_digest=candidate.source_digest,
+            abi_version=candidate.abi_version,
+        ):
+            return
+        if candidate.profile is None:
+            return
         self._ncc_candidates[
             (
                 candidate.device,
@@ -490,25 +622,38 @@ class AmpcorBackendRegistry:
         source_digest: str = "",
         abi_version: str = _NCC_NATIVE_ABI,
     ) -> AmpcorNccCandidate | None:
-        """Return an exact experimental NCC candidate, if qualified."""
-        candidate = self._ncc_candidates.get(
-            (
-                canonical_torch_device(device),
-                search_shape,
-                runtime_profile,
-                source_digest,
-                abi_version,
-            )
-        )
-        return (
+        """Return an independently qualified NCC candidate, if available."""
+        if search_shape not in _NCC_PERFORMANCE_SHAPES:
+            return None
+        resolved = canonical_torch_device(device)
+        candidates = tuple(
             candidate
-            if (
-                candidate is not None
-                and candidate.correctness_qualified
-                and candidate.performance_eligible
-            )
-            else None
+            for key, candidate in self._ncc_candidates.items()
+            if key[0] == resolved and key[1] == search_shape
         )
+        for candidate in candidates:
+            if not _is_qualified_ncc_profile(
+                candidate.profile,
+                search_shape=candidate.search_shape,
+                source_digest=candidate.source_digest,
+                abi_version=candidate.abi_version,
+            ):
+                continue
+            if source_digest != candidate.source_digest:
+                continue
+            if abi_version != candidate.abi_version:
+                continue
+            if runtime_profile not in ("", candidate.runtime_profile):
+                continue
+            current_profile = _current_ncc_runtime_profile(
+                resolved,
+                source_digest=candidate.source_digest,
+                abi_version=candidate.abi_version,
+            )
+            if current_profile != candidate.profile:
+                continue
+            return candidate
+        return None
 
     def get(
         self,
@@ -812,6 +957,11 @@ def prepare_ampcor_ncc_native(
     source_digest = sha256(
         b"".join(path.read_bytes() for path in plan.sources)
     ).hexdigest()
+    profile = _current_ncc_runtime_profile(
+        resolved_device,
+        source_digest=source_digest,
+        abi_version=_NCC_NATIVE_ABI,
+    )
 
     def execute_native(
         correlation: object,
@@ -835,12 +985,16 @@ def prepare_ampcor_ncc_native(
         device=resolved_device,
         search_shape=search_shape,
         executor=execute_native,
-        runtime_profile=(
-            f"native-ncc-{resolved_device}-torch-{torch.__version__}-cuda-"
-            f"{torch.version.cuda or 'none'}"
-        ),
+        runtime_profile=profile.canonical() if profile is not None else "",
         source_digest=source_digest,
-        performance_eligible=search_shape in _NCC_PERFORMANCE_SHAPES,
+        profile=profile,
+        performance_eligible=search_shape in _NCC_PERFORMANCE_SHAPES
+        and _is_qualified_ncc_profile(
+            profile,
+            search_shape=search_shape,
+            source_digest=source_digest,
+            abi_version=_NCC_NATIVE_ABI,
+        ),
         native_module=module,
     )
 
@@ -852,6 +1006,7 @@ __all__ = [
     "AmpcorEnergyCandidate",
     "AmpcorNccCandidate",
     "AmpcorNccCandidateError",
+    "AmpcorNccRuntimeProfile",
     "ampcor_ncc_postprocess_reference",
     "canonical_torch_device",
     "eager_ampcor_candidate",
