@@ -1496,7 +1496,7 @@ def test_ampcor_numpy_compatibility_spelling_uses_torch_limits() -> None:
         n_rg=1,
         margin_rg=16,
         margin_az=8,
-        batch_size=0,
+        batch_size=1,
         max_workspace_bytes=0,
     )
     assert result.n_attempted == 1
