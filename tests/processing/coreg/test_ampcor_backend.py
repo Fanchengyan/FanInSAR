@@ -156,17 +156,32 @@ def test_ncc_candidate_rank_zero_fails_with_candidate_error() -> None:
         )
 
 
-def test_ncc_registry_does_not_dispatch_ineligible_profile() -> None:
-    """A correctness-qualified but slower profile remains undispatched."""
+@pytest.mark.parametrize("search_shape", [(17, 17), (33, 33)])
+def test_ncc_registry_dispatches_qualified_shapes(
+    search_shape: tuple[int, int],
+) -> None:
+    """Both A100-qualified search surfaces are eligible for registry lookup."""
     candidate = AmpcorNccCandidate(
         device="cuda:0",
-        search_shape=(33, 33),
+        search_shape=search_shape,
+        executor=lambda *_args: (),
+    )
+    registry = AmpcorBackendRegistry()
+    registry.register_ncc(candidate)
+    assert registry.get_ncc("cuda", search_shape) is candidate
+
+
+def test_ncc_registry_does_not_dispatch_unknown_shape() -> None:
+    """Correctness qualification alone does not enable an unbenchmarked shape."""
+    candidate = AmpcorNccCandidate(
+        device="cuda:0",
+        search_shape=(9, 9),
         executor=lambda *_args: (),
         performance_eligible=False,
     )
     registry = AmpcorBackendRegistry()
     registry.register_ncc(candidate)
-    assert registry.get_ncc("cuda", (33, 33)) is None
+    assert registry.get_ncc("cuda", (9, 9)) is None
 
 
 def test_torch_integral_energy_matches_reference() -> None:

@@ -25,6 +25,7 @@ AmpcorBackend = Literal["eager", "compile", "native"]
 EnergyExecutor = Callable[[object], object]
 _NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
 _NCC_NATIVE_ABI = "faninsar.ampcor_ncc_postprocess.v1"
+_NCC_PERFORMANCE_SHAPES = frozenset({(17, 17), (33, 33)})
 
 
 def canonical_torch_device(device: str) -> str:
@@ -839,7 +840,7 @@ def prepare_ampcor_ncc_native(
             f"{torch.version.cuda or 'none'}"
         ),
         source_digest=source_digest,
-        performance_eligible=search_shape == (17, 17),
+        performance_eligible=search_shape in _NCC_PERFORMANCE_SHAPES,
         native_module=module,
     )
 
