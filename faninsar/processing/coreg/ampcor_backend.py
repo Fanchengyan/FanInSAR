@@ -87,8 +87,10 @@ def ampcor_ncc_postprocess_reference(
     Returns
     -------
     tuple[torch.Tensor, ...]
-        ``(d_rg, d_az, snr, boundary, valid)`` vectors. ``boundary`` marks a
-        peak on the outer surface edge; ``valid`` applies the inclusive cull.
+        ``(d_rg, d_az, snr, surface_edge, valid)`` vectors. ``surface_edge``
+        marks a peak on the outer correlation-surface edge; it is distinct
+        from the public threshold-near boundary oracle mask. ``valid`` applies
+        the inclusive cull.
 
     Raises
     ------
@@ -171,7 +173,7 @@ def ampcor_ncc_postprocess_reference(
         )
         az_shift += torch.where(interior, az_sub, torch.zeros_like(az_sub))
         rg_shift += torch.where(interior, rg_sub, torch.zeros_like(rg_sub))
-    boundary = (
+    surface_edge = (
         (peak_az == 0)
         | (peak_az == height - 1)
         | (peak_rg == 0)
@@ -185,7 +187,7 @@ def ampcor_ncc_postprocess_reference(
         & (rg_shift.abs() <= max_abs_residual)
         & (az_shift.abs() <= max_abs_residual)
     )
-    return rg_shift, az_shift, snr, boundary, valid
+    return rg_shift, az_shift, snr, surface_edge, valid
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +202,7 @@ class AmpcorNccCandidate:
     abi_version: str = _NCC_NATIVE_ABI
     prepared: bool = True
     correctness_qualified: bool = True
+    performance_eligible: bool = True
     native_module: object | None = None
 
     def execute(
@@ -218,6 +221,8 @@ class AmpcorNccCandidate:
             raise AmpcorNccCandidateError("NCC candidate is not prepared")
         if not torch.is_tensor(correlation) or not torch.is_tensor(energy):
             raise AmpcorNccCandidateError("NCC candidate requires Torch tensors")
+        if correlation.dim() != 3 or energy.dim() != 3:
+            raise AmpcorNccCandidateError("NCC candidate requires rank-3 input")
         if (
             str(correlation.device) != self.device
             or correlation.device != energy.device
@@ -496,7 +501,11 @@ class AmpcorBackendRegistry:
         )
         return (
             candidate
-            if candidate is not None and candidate.correctness_qualified
+            if (
+                candidate is not None
+                and candidate.correctness_qualified
+                and candidate.performance_eligible
+            )
             else None
         )
 
@@ -830,6 +839,7 @@ def prepare_ampcor_ncc_native(
             f"{torch.version.cuda or 'none'}"
         ),
         source_digest=source_digest,
+        performance_eligible=search_shape == (17, 17),
         native_module=module,
     )
 

@@ -10,6 +10,7 @@ from faninsar.processing.coreg.ampcor_backend import (
     AmpcorCandidateError,
     AmpcorEnergyCandidate,
     AmpcorNccCandidate,
+    AmpcorNccCandidateError,
     ampcor_ncc_postprocess_reference,
     eager_ampcor_candidate,
     native_workspace_bytes,
@@ -134,6 +135,38 @@ def test_ncc_registry_requires_exact_abi_and_shape() -> None:
         source_digest="digest",
         abi_version="wrong.abi",
     ) is None
+
+
+def test_ncc_candidate_rank_zero_fails_with_candidate_error() -> None:
+    """Rank validation precedes every shape index and uses the public error."""
+    torch = pytest.importorskip("torch")
+    candidate = AmpcorNccCandidate(
+        device="cpu",
+        search_shape=(3, 3),
+        executor=lambda *_args: (),
+    )
+    scalar = torch.tensor(1.0, dtype=torch.float64)
+    with pytest.raises(AmpcorNccCandidateError, match="rank-3"):
+        candidate.execute(
+            scalar,
+            scalar,
+            subpixel=True,
+            snr_threshold=1.0,
+            max_abs_residual=1.0,
+        )
+
+
+def test_ncc_registry_does_not_dispatch_ineligible_profile() -> None:
+    """A correctness-qualified but slower profile remains undispatched."""
+    candidate = AmpcorNccCandidate(
+        device="cuda:0",
+        search_shape=(33, 33),
+        executor=lambda *_args: (),
+        performance_eligible=False,
+    )
+    registry = AmpcorBackendRegistry()
+    registry.register_ncc(candidate)
+    assert registry.get_ncc("cuda", (33, 33)) is None
 
 
 def test_torch_integral_energy_matches_reference() -> None:

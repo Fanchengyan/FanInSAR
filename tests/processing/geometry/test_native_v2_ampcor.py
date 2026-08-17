@@ -97,6 +97,9 @@ def test_ampcor_ncc_cuda_source_preserves_peak_and_cull_contract() -> None:
     assert "CUDAGuard" in source
     assert "getCurrentCUDAStream" in source
     assert "C10_CUDA_KERNEL_LAUNCH_CHECK" in source
+    assert "checked_twice_plus_one" in source
+    assert "blockIdx.x" in source
+    assert "__shared__" in source
     assert "llabs(row - peak_az) <= 1" in source
     assert "fabs(az_denom) < 1e-12" in source
     assert "snr >= snr_threshold" in source
