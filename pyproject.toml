@@ -71,7 +71,7 @@ dependencies = [
   "tomli-w>=1.2.0",
   "rio-cogeo",
   "pystac>=1.8",
-  "snaphu>=0.4.1",
+  "snaphu>=0.4.1; sys_platform != 'win32'",
 ]
 
 
