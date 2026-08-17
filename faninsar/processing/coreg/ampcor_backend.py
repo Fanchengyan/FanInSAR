@@ -28,7 +28,10 @@ _NCC_NATIVE_ABI = "faninsar.ampcor_ncc_postprocess.v1"
 _NCC_QUALIFIED_COMPUTE_CAPABILITY = (8, 0)
 _NCC_QUALIFIED_TORCH = "2.8.0+cu128"
 _NCC_QUALIFIED_CUDA = "12.8"
-_NCC_QUALIFIED_MEMORY_BYTES = 80 * 1024**3
+# NVIDIA advertises this PCIe SKU as 80 GB; CUDA reports its usable capacity
+# in binary bytes (about 79.2 GiB), so the qualification floor uses the vendor
+# decimal capacity rather than rejecting the exact qualified card.
+_NCC_QUALIFIED_MEMORY_BYTES = 80_000_000_000
 
 
 def canonical_torch_device(device: str) -> str:
