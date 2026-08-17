@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import traceback
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -13,6 +14,7 @@ from faninsar.processing.geometry import (
     Operation,
     execute_geometry,
     prepare_geometry,
+    torch_backends_v2,
     torch_kernels,
 )
 from faninsar.processing.geometry import public as geometry_public
@@ -20,9 +22,14 @@ from faninsar.processing.geometry.backend_dispatch import (
     CudaExecutionError,
     Dispatcher,
     DispatchError,
+    FatalExecutionError,
+    RecoverableExecutionError,
 )
 from faninsar.processing.geometry.dem import ConstantHeightDEM
-from faninsar.processing.geometry.native_v2.bindings import result_from_native_outputs
+from faninsar.processing.geometry.native_v2.bindings import (
+    ecef_from_native_outputs,
+    result_from_native_outputs,
+)
 from faninsar.processing.geometry.native_v2.builder import (
     BuildPlan,
     GeometryOperation,
@@ -37,6 +44,7 @@ from faninsar.processing.geometry.torch_backends_v2 import (
 from faninsar.processing.geometry.v2 import (
     CandidateKey,
     DeviceKey,
+    ExecutionProfile,
     GeometryValidationError,
     SolverSettings,
     TransformResultV2,
@@ -49,6 +57,788 @@ from .test_public_geometry_v2 import (
     _native_key,
     _native_outputs,
 )
+
+
+def _native_ecef_outputs(shape: tuple[int, ...] = (2,)) -> list[np.ndarray]:
+    """Build a valid seventeen-field native ECEF result for boundary tests."""
+    values: list[np.ndarray] = [
+        np.full(shape, float(index), dtype=np.float64) for index in range(5)
+    ]
+    values.extend(
+        [
+            np.ones(shape, dtype=bool),
+            np.zeros(shape, dtype=np.int32),
+            np.zeros(shape, dtype=np.float64),
+            np.zeros(shape, dtype=np.float64),
+            np.zeros(shape, dtype=np.float64),
+            np.zeros(shape, dtype=bool),
+            np.zeros(shape, dtype=bool),
+            np.zeros(shape, dtype=np.float64),
+            np.zeros(shape, dtype=np.float64),
+        ]
+    )
+    values.extend(
+        np.full(shape, float(index), dtype=np.float64) for index in (100, 200, 300)
+    )
+    return values
+
+
+def test_ecef_native_output_validator_accepts_only_typed_seventeen_fields() -> None:
+    """The ECEF ABI validates the untouched canonical fields before transfer."""
+    x, y, z = ecef_from_native_outputs(_native_ecef_outputs())
+    np.testing.assert_array_equal(x, 100.0)
+    np.testing.assert_array_equal(y, 200.0)
+    np.testing.assert_array_equal(z, 300.0)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda values: values.pop(), id="field_count"),
+        pytest.param(
+            lambda values: values.__setitem__(0, np.zeros(3, dtype=np.float64)),
+            id="canonical_shape",
+        ),
+        pytest.param(
+            lambda values: values.__setitem__(0, np.zeros(2, dtype=np.float32)),
+            id="canonical_dtype",
+        ),
+        pytest.param(
+            lambda values: values.__setitem__(14, np.zeros(2, dtype=np.float32)),
+            id="ecef_dtype",
+        ),
+        pytest.param(
+            lambda values: values.__setitem__(16, np.zeros(3, dtype=np.float64)),
+            id="ecef_shape",
+        ),
+    ],
+)
+def test_ecef_native_output_validator_rejects_malformed_fields(mutate: object) -> None:
+    """Malformed ECEF fields cannot bypass the typed native boundary."""
+    outputs = _native_ecef_outputs()
+    mutate(outputs)  # type: ignore[operator]
+    with pytest.raises(ValueError, match=r"native geometry|native field"):
+        ecef_from_native_outputs(outputs)
+
+
+def test_public_ecef_selectors_use_dispatch_gates_and_quarantine() -> None:
+    """ECEF selectors share explicit qualification and automatic quarantine."""
+    from types import SimpleNamespace
+
+    native_key = CandidateKey(
+        Operation.RDR2GEO,
+        "native",
+        DeviceKey.cpu(),
+        shape=(1,),
+        source_digest="native-source",
+        toolchain_digest="native-toolchain",
+        runtime_digest="native-runtime",
+        artifact_digest="native-artifact",
+        abi_digest="native-abi",
+        support_contract_digest="native-support",
+        profile=ExecutionProfile.cpu(),
+    )
+    compile_key = CandidateKey(
+        Operation.RDR2GEO,
+        "compile",
+        DeviceKey.cpu(),
+        shape=(1,),
+        source_digest="compile-source",
+        toolchain_digest="compile-toolchain",
+        runtime_digest="compile-runtime",
+        artifact_digest="compile-artifact",
+        abi_digest="compile-abi",
+        support_contract_digest="native-support",
+        profile=ExecutionProfile.cpu(),
+    )
+    value = (np.ones(1, dtype=np.float64),) * 3
+    eager = SimpleNamespace(execute_ecef=lambda *_: value)
+    dispatcher = Dispatcher(eager.execute_ecef)
+    dispatcher.register(native_key, lambda *_: value, correctness_qualified=False)
+    dispatcher.register(compile_key, lambda *_: value, correctness_qualified=False)
+    prepared = geometry_public.PreparedGeometry(
+        Operation.RDR2GEO,
+        None,  # type: ignore[arg-type]
+        (1,),
+        eager,  # type: ignore[arg-type]
+        dispatcher,
+        "cpu",
+        "float64",
+        native_key,
+        compile_key,
+        compile_key,
+        lambda *_: value,
+        SimpleNamespace(execute_ecef=lambda *_: value),
+    )
+
+    with pytest.raises(DispatchError, match="native candidate is unavailable"):
+        prepared.execute_ecef(np.zeros(1), selector="native")
+
+    with pytest.raises(DispatchError, match="compile candidate is unavailable"):
+        prepared.execute_ecef(np.zeros(1), selector="compile")
+    np.testing.assert_array_equal(
+        prepared.execute_ecef(np.zeros(1), selector="eager")[0], 1.0
+    )
+    assert dispatcher.records[-1].backend == "eager"
+
+    # A malformed alternate result must quarantine the native candidate just
+    # like an execution failure, allowing the next qualified backend to run.
+    dispatcher = Dispatcher(eager.execute_ecef)
+    dispatcher.register(
+        native_key,
+        lambda *_: (np.ones(1),),
+        correctness_qualified=True,
+        performance_eligible=True,
+        ecef_correctness_qualified=True,
+    )
+    dispatcher.register(compile_key, lambda *_: value)
+    prepared = geometry_public.PreparedGeometry(
+        Operation.RDR2GEO,
+        None,  # type: ignore[arg-type]
+        (1,),
+        eager,  # type: ignore[arg-type]
+        dispatcher,
+        "cpu",
+        "float64",
+        native_key,
+        compile_key,
+        compile_key,
+        lambda *_: (np.ones(1),),
+        SimpleNamespace(execute_ecef=lambda *_: value),
+    )
+    np.testing.assert_array_equal(
+        prepared.execute_ecef(np.zeros(1), selector="auto")[0], 1.0
+    )
+    assert dispatcher.records[-1].backend == "compile"
+    with pytest.raises(DispatchError, match="native candidate is unavailable"):
+        prepared.execute_ecef(np.zeros(1), selector="native")
+
+    dispatcher = Dispatcher(eager.execute_ecef)
+    dispatcher.register(
+        native_key,
+        lambda *_: value,
+        correctness_qualified=True,
+        performance_eligible=True,
+        ecef_correctness_qualified=True,
+    )
+    dispatcher.register(compile_key, lambda *_: value)
+
+    def failing_native(*_: object) -> object:
+        message = "typed ECEF probe failed"
+        raise RecoverableExecutionError(message)
+
+    prepared = geometry_public.PreparedGeometry(
+        Operation.RDR2GEO,
+        None,  # type: ignore[arg-type]
+        (1,),
+        eager,  # type: ignore[arg-type]
+        dispatcher,
+        "cpu",
+        "float64",
+        native_key,
+        compile_key,
+        compile_key,
+        failing_native,
+        SimpleNamespace(execute_ecef=lambda *_: value),
+    )
+    np.testing.assert_array_equal(
+        prepared.execute_ecef(np.zeros(1), selector="auto")[0], 1.0
+    )
+    assert dispatcher.records[-1].backend == "compile"
+    with pytest.raises(DispatchError, match="native candidate is unavailable"):
+        prepared.execute_ecef(np.zeros(1), selector="native")
+
+
+def test_public_ecef_quarantines_seventeen_field_shape_mismatch() -> None:
+    """A valid native ABI payload with the wrong public shape is quarantined."""
+    native_key = CandidateKey(
+        Operation.RDR2GEO,
+        "native",
+        DeviceKey.cpu(),
+        shape=(1,),
+        source_digest="native-source",
+        toolchain_digest="native-toolchain",
+        runtime_digest="native-runtime",
+        artifact_digest="native-artifact",
+        abi_digest="native-abi",
+        support_contract_digest="native-support",
+        profile=ExecutionProfile.cpu(),
+    )
+    compile_key = CandidateKey(
+        Operation.RDR2GEO,
+        "compile",
+        DeviceKey.cpu(),
+        shape=(1,),
+        source_digest="compile-source",
+        toolchain_digest="compile-toolchain",
+        runtime_digest="compile-runtime",
+        artifact_digest="compile-artifact",
+        abi_digest="compile-abi",
+        support_contract_digest="native-support",
+        profile=ExecutionProfile.cpu(),
+    )
+    value = (np.ones(1, dtype=np.float64),) * 3
+    malformed_native = _native_ecef_outputs((2,))
+    dispatcher = Dispatcher(lambda *_: value)
+    dispatcher.register(
+        native_key,
+        lambda *_: malformed_native,
+        correctness_qualified=True,
+        performance_eligible=True,
+        ecef_correctness_qualified=True,
+    )
+    dispatcher.register(compile_key, lambda *_: value)
+    prepared = geometry_public.PreparedGeometry(
+        Operation.RDR2GEO,
+        None,  # type: ignore[arg-type]
+        (1,),
+        SimpleNamespace(execute_ecef=lambda *_: value),  # type: ignore[arg-type]
+        dispatcher,
+        "cpu",
+        "float64",
+        native_key,
+        compile_key,
+        compile_key,
+        lambda *_: malformed_native,
+        SimpleNamespace(execute_ecef=lambda *_: value),
+    )
+
+    np.testing.assert_array_equal(
+        prepared.execute_ecef(np.zeros(1), selector="auto")[0], 1.0
+    )
+    assert dispatcher.records[-1].backend == "compile"
+    with pytest.raises(DispatchError, match="native candidate is unavailable"):
+        prepared.execute_ecef(np.zeros(1), selector="native")
+
+
+def test_native_ecef_requires_its_own_qualification_gate() -> None:
+    """Ordinary native qualification cannot authorize the ECEF alternate."""
+    native_key = CandidateKey(
+        Operation.RDR2GEO,
+        "native",
+        DeviceKey.cpu(),
+        shape=(1,),
+        solver=SolverSettings(),
+    )
+    value = (np.ones(1, dtype=np.float64),) * 3
+    eager_calls: list[str] = []
+    dispatcher = Dispatcher(lambda *_: eager_calls.append("eager") or value)
+    dispatcher.register(
+        native_key,
+        lambda *_: value,
+        correctness_qualified=True,
+        performance_eligible=True,
+    )
+
+    with pytest.raises(DispatchError, match="native ECEF candidate is unavailable"):
+        dispatcher.dispatch_alternate(
+            native_key,
+            "native",
+            {"native": lambda *_: value},
+            lambda *_: eager_calls.append("eager") or value,
+            lambda result: result,
+        )
+    assert eager_calls == []
+    assert (
+        dispatcher.dispatch_alternate(
+            native_key,
+            "auto",
+            {"native": lambda *_: value},
+            lambda *_: eager_calls.append("eager") or value,
+            lambda result: result,
+        )
+        == value
+    )
+    assert eager_calls == ["eager"]
+
+
+def test_alternate_dispatch_does_not_quarantine_fatal_execution_errors() -> None:
+    """Fatal typed execution failures remain visible instead of falling back."""
+    native_key = CandidateKey(
+        Operation.RDR2GEO,
+        "native",
+        DeviceKey.cpu(),
+        shape=(1,),
+        solver=SolverSettings(),
+    )
+    eager_calls: list[str] = []
+    dispatcher = Dispatcher(lambda *_: eager_calls.append("eager"))
+    dispatcher.register(
+        native_key,
+        lambda *_: object(),
+        correctness_qualified=True,
+        performance_eligible=True,
+        ecef_correctness_qualified=True,
+    )
+
+    def fatal_native(*_: object) -> object:
+        message = "native ABI is incompatible"
+        raise FatalExecutionError(message)
+
+    with pytest.raises(FatalExecutionError, match="incompatible"):
+        dispatcher.dispatch_alternate(
+            native_key,
+            "auto",
+            {"native": fatal_native},
+            lambda *_: object(),
+            lambda result: result,
+        )
+    assert eager_calls == []
+
+
+def _fake_raster_dem(values: np.ndarray) -> object:
+    """Build a minimal RasterDEM-shaped test double for Torch preparation."""
+
+    class Transform:
+        """Minimal rasterio affine-compatible transform."""
+
+        values = (1.0, 0.0, 0.0, 0.0, -1.0, 0.0)
+        a, b, c, d, e, f = values
+
+        def __getitem__(self, index: int) -> float:
+            return self.values[index]
+
+    class RasterDEM:
+        interpolation = "biquintic"
+        nodata = None
+
+        def __init__(self) -> None:
+            self._height_array = values
+            self._dataset = SimpleNamespace(transform=Transform())
+
+        def _open(self) -> object:
+            return self._dataset
+
+    return RasterDEM()
+
+
+def _capture_rdr2geo_height_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[np.ndarray]:
+    """Capture the third argument passed to the Torch rdr2geo kernel."""
+    captured: list[np.ndarray] = []
+
+    def fake_kernel(*args: object, **_: object) -> dict[str, object]:
+        import torch
+
+        captured.append(np.asarray(args[2].detach().cpu()))
+        shape = args[0].shape
+        zeros = torch.zeros(shape, dtype=torch.float64)
+        return {
+            "latitude_deg": zeros,
+            "longitude_deg": zeros,
+            "height_m": args[2],
+            "range_index": zeros,
+            "azimuth_index": zeros,
+            "converged": torch.ones(shape, dtype=torch.bool),
+            "iterations": torch.ones(shape, dtype=torch.int32),
+            "residual_range_m": zeros,
+            "residual_doppler_hz": zeros,
+        }
+
+    monkeypatch.setattr(torch_backends_v2, "rdr2geo_kernel", fake_kernel)
+    return captured
+
+
+def test_rdr2geo_default_height_seed_comes_from_prepared_dem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prepared Torch execution derives defaults and preserves explicit height."""
+    captured = _capture_rdr2geo_height_seed(monkeypatch)
+    prepared = prepare_torch_geometry(
+        "rdr2geo",
+        _model(),
+        shape=(2,),
+        dem=ConstantHeightDEM(42.0),
+    )
+
+    prepared.execute(np.zeros(2, dtype=np.float64), np.zeros(2, dtype=np.float64))
+    prepared.execute(
+        np.zeros(2, dtype=np.float64),
+        np.zeros(2, dtype=np.float64),
+        np.full(2, 7.0, dtype=np.float64),
+    )
+
+    np.testing.assert_array_equal(captured[0], 42.0)
+    np.testing.assert_array_equal(captured[1], 7.0)
+
+
+def test_torch_rdr2geo_wrapper_reuses_prepared_default_height_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The convenience wrapper leaves omitted height for prepared validation."""
+    captured = _capture_rdr2geo_height_seed(monkeypatch)
+
+    torch_backends_v2.torch_rdr2geo(
+        _model(),
+        np.zeros(2, dtype=np.float64),
+        np.zeros(2, dtype=np.float64),
+        dem=ConstantHeightDEM(42.0),
+    )
+
+    np.testing.assert_array_equal(captured[0], 42.0)
+
+
+def test_rdr2geo_raster_seed_uses_finite_mean_and_composition_offset() -> None:
+    """Raster and raster-plus-constant DEMs derive one finite scalar seed."""
+    raster = _fake_raster_dem(
+        np.tile(
+            np.array([[1.0, np.nan], [3.0, 5.0]], dtype=np.float64),
+            (3, 3),
+        )
+    )
+    prepared = prepare_torch_geometry("rdr2geo", _model(), shape=(1,), dem=raster)
+    assert prepared.height_seed_m == 3.0
+
+    class GeoidAdjustedDEM:
+        def __init__(self) -> None:
+            self.orthometric_dem = raster
+            self.geoid = ConstantHeightDEM(10.0)
+
+    composed = prepare_torch_geometry(
+        "rdr2geo", _model(), shape=(1,), dem=GeoidAdjustedDEM()
+    )
+    assert composed.height_seed_m == 13.0
+
+
+def test_rdr2geo_all_nan_raster_seed_warns_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raster with no finite samples uses zero and emits a warning."""
+    warnings: list[str] = []
+    monkeypatch.setattr(torch_backends_v2.logger, "warning", warnings.append)
+    raster = _fake_raster_dem(np.full((6, 6), np.nan, dtype=np.float64))
+
+    prepared = prepare_torch_geometry("rdr2geo", _model(), shape=(1,), dem=raster)
+
+    assert prepared.height_seed_m == 0.0
+    assert warnings
+    assert "finite" in warnings[0]
+
+
+def test_native_default_height_uses_prepared_eager_seed() -> None:
+    """The public Native seam receives the same prepared DEM seed as Eager."""
+    captured: list[np.ndarray] = []
+
+    class NativeModule:
+        """Extension-shaped test double for the DEM-aware CPU ABI."""
+
+        def rdr2geo_cpu_dem(self, *values: object) -> list[np.ndarray]:
+            captured.append(np.asarray(values[2]).copy())
+            return _native_outputs(_model(), values[:3])  # type: ignore[arg-type]
+
+    model = _model()
+    prepared = prepare_geometry(
+        Operation.RDR2GEO,
+        model,
+        shape=(1,),
+        dem=ConstantHeightDEM(37.0),
+        native_executor=NativeModule(),
+        native_context_inputs=_native_context(model, Operation.RDR2GEO),
+        native_key=_native_key(
+            model,
+            (1,),
+            Operation.RDR2GEO,
+            dem=ConstantHeightDEM(37.0),
+        ),
+        native_correctness_qualified=True,
+    )
+
+    execute_geometry(
+        prepared,
+        np.zeros(1, dtype=np.float64),
+        np.zeros(1, dtype=np.float64),
+        selector="native",
+    )
+
+    np.testing.assert_array_equal(captured[0], 37.0)
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_tolerance"),
+    [
+        (Operation.RDR2GEO, 3.0),
+        (Operation.GEO2RDR, 7.0),
+    ],
+)
+def test_public_preparation_uses_operation_specific_range_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: Operation,
+    expected_tolerance: float,
+) -> None:
+    """Eager and Compile receive the tolerance for their physical operation."""
+    calls: list[float] = []
+    original = geometry_public.prepare_torch_geometry
+
+    def spy(*args: object, **kwargs: object) -> object:
+        calls.append(float(kwargs["range_tol_m"]))
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(geometry_public, "prepare_torch_geometry", spy)
+    settings = SolverSettings(
+        range_tolerance_m=expected_tolerance if operation is Operation.GEO2RDR else 7.0,
+        slant_range_tolerance_m=(
+            expected_tolerance if operation is Operation.RDR2GEO else 3.0
+        ),
+    )
+    prepare_geometry(
+        operation,
+        _model(),
+        shape=(1,),
+        dem=ConstantHeightDEM(0.0),
+        settings=settings,
+        compile=True,
+    )
+
+    assert calls == [expected_tolerance, expected_tolerance]
+
+
+def test_native_rdr2geo_rejects_callable_no_dem_abi() -> None:
+    """A callable cannot bypass the public DEM-aware ABI selection."""
+    model = _model()
+    dem = ConstantHeightDEM(37.0)
+    with pytest.raises(DispatchError, match=r"extension module.*rdr2geo_cpu_dem"):
+        prepare_geometry(
+            Operation.RDR2GEO,
+            model,
+            shape=(1,),
+            dem=dem,
+            native_executor=lambda *_: (),
+            native_context_inputs=_native_context(model, Operation.RDR2GEO),
+            native_key=_native_key(model, (1,), Operation.RDR2GEO, dem=dem),
+        )
+
+
+def test_native_rdr2geo_raster_uses_dem_entrypoint_and_full_context() -> None:
+    """Raster ``rdr2geo`` dispatch selects the DEM-aware native ABI."""
+    model = _model()
+    context = _native_context(model, Operation.RDR2GEO)
+    dem = _fake_raster_dem(np.full((6, 6), 42.0, dtype=np.float64))
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class NativeModule:
+        """Minimal extension-shaped object exposing both CPU ABIs."""
+
+        def rdr2geo_cpu(self, *values: object) -> list[np.ndarray]:
+            calls.append(("rdr2geo_cpu", values))
+            return _native_outputs(model, values[:3])  # type: ignore[arg-type]
+
+        def rdr2geo_cpu_dem(self, *values: object) -> list[np.ndarray]:
+            calls.append(("rdr2geo_cpu_dem", values))
+            return _native_outputs(model, values[:3])  # type: ignore[arg-type]
+
+    prepared = prepare_geometry(
+        Operation.RDR2GEO,
+        model,
+        shape=(1,),
+        dem=dem,
+        native_executor=NativeModule(),
+        native_context_inputs=context,
+        native_key=_native_key(model, (1,), Operation.RDR2GEO, dem=dem),
+        native_correctness_qualified=True,
+    )
+
+    execute_geometry(
+        prepared,
+        np.zeros(1, dtype=np.float64),
+        np.zeros(1, dtype=np.float64),
+        selector="native",
+    )
+
+    assert [name for name, _ in calls] == ["rdr2geo_cpu_dem"]
+    passed_context = calls[0][1][3:]
+    assert len(passed_context) == 8
+    np.testing.assert_array_equal(passed_context[5], context["dem_values"])
+    np.testing.assert_array_equal(passed_context[6], context["dem_metadata"])
+    np.testing.assert_array_equal(passed_context[7], context["dem_height_bounds"])
+
+
+def test_real_module_native_adapter_uses_contiguous_torch_and_canonical_scalars() -> (
+    None
+):
+    """A pybind-shaped module receives tensors and canonical scalar arguments."""
+    import torch
+
+    model = _model()
+    context = _native_context(model, Operation.GEO2RDR)
+    captured: list[tuple[object, ...]] = []
+    module = ModuleType("faninsar_native_test")
+
+    def geo2rdr_cpu(*values: object) -> list[np.ndarray]:
+        captured.append(values)
+        direct = tuple(np.asarray(value.detach().cpu()) for value in values[:3])
+        return _native_outputs(model, direct)  # type: ignore[arg-type]
+
+    module.geo2rdr_cpu = geo2rdr_cpu  # type: ignore[attr-defined]
+    prepared = prepare_geometry(
+        Operation.GEO2RDR,
+        model,
+        shape=(2, 2),
+        native_executor=module,
+        native_context_inputs=context,
+        native_key=_native_key(model, (2, 2), Operation.GEO2RDR),
+        native_correctness_qualified=True,
+    )
+
+    execute_geometry(
+        prepared,
+        np.zeros((2, 2), dtype=np.float64),
+        np.zeros((2, 2), dtype=np.float64),
+        np.zeros((2, 2), dtype=np.float64),
+        selector="native",
+    )
+
+    assert len(captured) == 1
+    values = captured[0]
+    for value in values[:6]:
+        assert isinstance(value, torch.Tensor)
+        assert value.dtype is torch.float64
+        assert value.device.type == "cpu"
+        assert value.is_contiguous()
+    assert tuple(float(value) for value in values[6:11]) == (
+        (model.sensing_start - model.orbit.epoch).total_seconds(),
+        model.azimuth_time_interval_s,
+        model.starting_slant_range_m,
+        model.range_spacing_m,
+        model.wavelength_m,
+    )
+
+
+def test_real_module_rdr2geo_adapter_uses_contiguous_torch_and_dem_abi() -> None:
+    """CPU RDR2GEO ModuleType adapters receive the complete native ABI order."""
+    import torch
+
+    model = _model()
+    context = _native_context(model, Operation.RDR2GEO)
+    context["dem_metadata"] = np.array([10.0, 20.0, 0.1, 0.2], dtype=np.float64)
+    context["dem_height_bounds"] = np.array([-100.0, 100.0], dtype=np.float64)
+    captured: list[tuple[object, ...]] = []
+    module = ModuleType("faninsar_native_rdr2geo_test")
+
+    def rdr2geo_cpu_dem(*values: object) -> list[np.ndarray]:
+        captured.append(values)
+        direct = tuple(np.asarray(value.detach().cpu()) for value in values[:3])
+        return _native_outputs(model, direct)  # type: ignore[arg-type]
+
+    module.rdr2geo_cpu_dem = rdr2geo_cpu_dem  # type: ignore[attr-defined]
+    dem = ConstantHeightDEM(37.0)
+    prepared = prepare_geometry(
+        Operation.RDR2GEO,
+        model,
+        shape=(2, 2),
+        dem=dem,
+        native_executor=module,
+        native_context_inputs=context,
+        native_key=_native_key(model, (2, 2), Operation.RDR2GEO, dem=dem),
+        native_correctness_qualified=True,
+    )
+
+    execute_geometry(
+        prepared,
+        np.zeros((2, 2), dtype=np.float64),
+        np.zeros((2, 2), dtype=np.float64),
+        np.full((2, 2), 37.0, dtype=np.float64),
+        selector="native",
+    )
+
+    assert len(captured) == 1
+    values = captured[0]
+    for index in (*range(6), 16):
+        value = values[index]
+        assert isinstance(value, torch.Tensor)
+        assert value.dtype is torch.float64
+        assert value.device.type == "cpu"
+        assert value.is_contiguous()
+    assert tuple(float(value) for value in values[6:11]) == (
+        (model.sensing_start - model.orbit.epoch).total_seconds(),
+        model.azimuth_time_interval_s,
+        model.starting_slant_range_m,
+        model.range_spacing_m,
+        model.wavelength_m,
+    )
+    assert values[11:16] == (20, 0, 0.01, 0.1, True)
+    assert tuple(float(value) for value in values[17:21]) == (10.0, 20.0, 0.1, 0.2)
+    assert values[21:] == (50, 1.0e-3)
+
+
+def test_cuda_dem_metadata_helper_uses_cuda_abi_order() -> None:
+    """The CUDA metadata reorder is independently testable on CPU."""
+    assert geometry_public._cuda_dem_metadata_abi_order([10.0, 20.0, 0.1, 0.2]) == (
+        20.0,
+        10.0,
+        0.2,
+        0.1,
+    )
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="CUDA is unavailable"
+)
+def test_cuda_omitted_height_is_created_on_target_device() -> None:
+    """Omitted radar height uses a contiguous float64 tensor on CUDA."""
+    import torch
+
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    device_key = DeviceKey.cuda(str(properties.uuid))
+    values = geometry_public._validate_public_inputs(
+        Operation.RDR2GEO,
+        (2,),
+        (torch.zeros(2, device="cuda", dtype=torch.float64),) * 2,
+        device_key,
+        default_height_m=37.0,
+        target_device="cuda",
+    )
+
+    height = values[2]
+    assert isinstance(height, torch.Tensor)
+    assert height.device.type == "cuda"
+    assert height.dtype is torch.float64
+    assert height.is_contiguous()
+    torch.testing.assert_close(height, torch.full((2,), 37.0, device="cuda"))
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="CUDA is unavailable"
+)
+def test_cuda_module_adapter_reorders_canonical_dem_metadata() -> None:
+    """CUDA pybind calls receive DEM metadata in x/y ABI order."""
+    import torch
+
+    captured: list[tuple[object, ...]] = []
+    module = ModuleType("faninsar_native_cuda_test")
+
+    def rdr2geo_cuda(*values: object) -> list[object]:
+        captured.append(values)
+        return []
+
+    module.rdr2geo_cuda = rdr2geo_cuda  # type: ignore[attr-defined]
+    entry = geometry_public._resolve_native_entrypoint(
+        module,
+        Operation.RDR2GEO,
+        DeviceKey.cuda("test-device"),
+        SolverSettings(),
+    )
+
+    def gpu(values: object) -> torch.Tensor:
+        """Materialize one CUDA fixture tensor."""
+        return torch.tensor(values, dtype=torch.float64, device="cuda")
+
+    entry(
+        gpu([0.0]),
+        gpu([0.0]),
+        gpu([11.0]),
+        gpu([0.0, 1.0]),
+        gpu([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        gpu([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]),
+        gpu([10.0, 0.002, 800000.0, 2.3, 0.0555]),
+        True,
+        gpu(np.zeros((6, 6))),
+        gpu([10.0, 20.0, 0.1, 0.2]),
+        gpu([-100.0, 100.0]),
+    )
+
+    assert len(captured) == 1
+    assert [float(value) for value in captured[0][11:15]] == [20.0, 10.0, 0.2, 0.1]
 
 
 def test_torch_result_publishes_actual_iterations_and_invalid_tolerance() -> None:
@@ -67,9 +857,34 @@ def test_torch_result_publishes_actual_iterations_and_invalid_tolerance() -> Non
     assert np.isnan(result.tolerance[1])
 
 
+def test_cuda_aliases_canonicalize_to_the_current_ordinal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unqualified CUDA and the current explicit ordinal compare equally."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    assert torch_backends_v2._canonical_torch_device("cuda") == torch.device("cuda:0")
+    assert torch_backends_v2._canonical_torch_device("cuda:0") == torch.device("cuda:0")
+
+
+def test_cuda_unsupported_ordinal_fails_during_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit CUDA ordinal outside the visible device set is rejected."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+    with pytest.raises(RuntimeError, match="unsupported device ordinal 1"):
+        torch_backends_v2._resolve_device("cuda:1")
+
+
 def test_geo2rdr_convergence_uses_physical_metric_not_newton_step() -> None:
     """Keep last-step roundoff from changing the public convergence vote."""
-    source = inspect.getsource(torch_kernels.geo2rdr_kernel)
+    source = inspect.getsource(torch_kernels._geo2rdr_step)
     assert "step_small" not in source
     assert "newly = active & valid & in_bounds" in source
     assert "metric < 1.0" in source
@@ -277,6 +1092,35 @@ def test_native_candidate_operation_is_bound_to_public_key() -> None:
         )
 
 
+def test_native_rdr2geo_candidate_path_is_rejected() -> None:
+    """RDR2GEO native dispatch requires the module adapter's DEM ABI."""
+    model = _model()
+    plan = BuildPlan(
+        GeometryOperation.RDR2GEO,
+        NativeBackend.CPU,
+        "faninsar_rdr2geo_v2_cpu",
+        "faninsar_rdr2geo_v2_cpu",
+        (),
+        (),
+        (),
+    )
+    candidate = PreparedNativeCandidate(
+        plan,
+        PreparationStatus.PREPARED,
+        _entry_point=lambda *_: (),
+    )
+    with pytest.raises(
+        DispatchError, match="rdr2geo native candidates are unsupported"
+    ):
+        prepare_geometry(
+            Operation.RDR2GEO,
+            model,
+            shape=(1,),
+            native_candidate=candidate,
+            native_key=_native_key(model, (1,), Operation.RDR2GEO),
+        )
+
+
 def test_compile_is_not_performance_eligible_by_default() -> None:
     """Compilation remains correctness-only until benchmark evidence promotes it."""
     prepared = prepare_geometry(
@@ -295,6 +1139,35 @@ def test_compile_is_not_performance_eligible_by_default() -> None:
     )
     assert result.fields
     assert prepared.dispatcher.records[-1].backend == "eager"
+
+
+def test_auto_eager_fallback_preserves_cuda_device_identity() -> None:
+    """A CUDA preparation without candidates keeps its same-device key."""
+    eager = prepare_torch_geometry("geo2rdr", _model(), shape=(1,))
+    cuda_profile = ExecutionProfile.cuda("GPU-test")
+    fallback_key = geometry_public._key(
+        Operation.GEO2RDR,
+        "compile",
+        eager,
+        cuda_profile,
+    )
+    prepared = geometry_public.PreparedGeometry(
+        Operation.GEO2RDR,
+        _model(),
+        (1,),
+        eager,
+        Dispatcher(lambda: object()),
+        eager.device,
+        eager.dtype,
+        fallback_key=fallback_key,
+    )
+
+    key = prepared._key_for_selector("auto")
+
+    assert key.backend == "compile"
+    assert key.device == DeviceKey.cuda("GPU-test")
+    assert key.profile is not None
+    assert key.profile.device == DeviceKey.cuda("GPU-test")
 
 
 def test_cuda_unknown_failure_is_fatal_to_auto_dispatch() -> None:

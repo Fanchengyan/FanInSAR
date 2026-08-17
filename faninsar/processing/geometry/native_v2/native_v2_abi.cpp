@@ -58,10 +58,8 @@ void check_orbit_times(const Tensor& times) {
 }
 
 int64_t orbit_segment(const double* times, int64_t count, double time_s) {
-  int64_t segment = 0;
-  while (segment + 1 < count && times[segment + 1] <= time_s) {
-    ++segment;
-  }
+  const auto* upper = std::upper_bound(times, times + count, time_s);
+  const int64_t segment = static_cast<int64_t>(upper - times) - 1;
   return std::clamp<int64_t>(segment, 0, count - 2);
 }
 
@@ -179,20 +177,26 @@ void begin_telemetry(int64_t point_count, const char* operation_symbol) {
 }
 
 void record_visit(int64_t index) {
-  std::lock_guard<std::mutex> lock(telemetry_mutex);
   int64_t thread_id = 0;
 #ifdef _OPENMP
   thread_id = omp_get_thread_num();
 #endif
+  // Each parallel loop invokes this once for a unique output index.  The
+  // per-index and per-worker slots therefore have disjoint writers after
+  // begin_telemetry has initialized their storage; snapshotting occurs after
+  // the operation and remains mutex-protected.
   telemetry.visit_counts[static_cast<size_t>(index)] += 1;
-  thread_slots[static_cast<size_t>(thread_id)] = thread_id;
+  auto& worker_slot = thread_slots[static_cast<size_t>(thread_id)];
+  if (worker_slot < 0) {
+    worker_slot = thread_id;
 #ifdef __linux__
-  affinity_slots[static_cast<size_t>(thread_id)] = sched_getcpu();
+    affinity_slots[static_cast<size_t>(thread_id)] = sched_getcpu();
 #else
-  // Apple does not expose a portable current-CPU query; retain the worker
-  // identity so qualification can still prove deterministic coverage.
-  affinity_slots[static_cast<size_t>(thread_id)] = thread_id;
+    // Apple does not expose a portable current-CPU query; retain the worker
+    // identity so qualification can still prove deterministic coverage.
+    affinity_slots[static_cast<size_t>(thread_id)] = thread_id;
 #endif
+  }
 }
 
 TelemetrySnapshot telemetry_snapshot() {

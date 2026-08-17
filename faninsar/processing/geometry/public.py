@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import numpy as np
@@ -32,7 +33,10 @@ from faninsar.processing.geometry.boundary import (
     evaluate_canonical_boundary,
     normalize_result_boundary,
 )
-from faninsar.processing.geometry.native_v2.bindings import result_from_native_outputs
+from faninsar.processing.geometry.native_v2.bindings import (
+    ecef_from_native_outputs,
+    result_from_native_outputs,
+)
 from faninsar.processing.geometry.torch_backends_v2 import (
     PreparedTorchGeometry,
     TorchGeometryResult,
@@ -57,7 +61,8 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 BackendSelector: TypeAlias = Literal["native", "compile", "eager", "auto"]
-NativeExecutor: TypeAlias = Callable[..., object]
+NativeExecutor: TypeAlias = Callable[..., object] | ModuleType
+NativeECEFExecutor: TypeAlias = Callable[..., object]
 NativeContextInputs: TypeAlias = Mapping[str, object]
 BoundaryCallback: TypeAlias = Callable[..., float | Sequence[float]]
 
@@ -74,6 +79,214 @@ _RDR2GEO_NATIVE_CONTEXT_FIELDS = (
     "dem_metadata",
     "dem_height_bounds",
 )
+_CANONICAL_MODEL_PARAMETER_FIELDS = (
+    "sensing_offset_s",
+    "azimuth_interval_s",
+    "starting_range_m",
+    "range_spacing_m",
+    "wavelength_m",
+)
+
+
+def _cuda_dem_metadata_abi_order(metadata: Sequence[float]) -> tuple[float, ...]:
+    """Convert canonical latitude/longitude metadata to CUDA ABI order.
+
+    Parameters
+    ----------
+    metadata : collections.abc.Sequence of float
+        Canonical ``[latitude, longitude, latitude_spacing, longitude_spacing]``
+        values.
+
+    Returns
+    -------
+    tuple of float
+        CUDA ABI order ``[longitude, latitude, longitude_spacing,
+        latitude_spacing]``.
+
+    """
+    if len(metadata) != 4:
+        message = "DEM metadata must contain exactly four values"
+        logger.error(message)
+        raise DispatchError(message)
+    return (metadata[1], metadata[0], metadata[3], metadata[2])
+
+
+def _resolve_native_entrypoint(
+    executor: object,
+    operation: Operation,
+    device: DeviceKey,
+    solver: SolverSettings,
+    *,
+    ecef: bool = False,
+) -> Callable[..., object]:
+    """Resolve a callable or loaded extension module to one native entrypoint.
+
+    Parameters
+    ----------
+    executor : object
+        A callable adapter, or a loaded native extension exposing operation
+        entrypoints.
+    operation : Operation
+        Geometry operation being prepared.
+    device : DeviceKey
+        Target execution device.
+    solver : SolverSettings
+        Solver limits and tolerances used to complete the native scalar ABI.
+    ecef : bool, optional
+        Select the explicit CUDA ECEF entry point when true.
+
+    Returns
+    -------
+    collections.abc.Callable
+        The operation/device-specific native entrypoint.
+
+    Raises
+    ------
+    DispatchError
+        If an extension module does not expose the required entrypoint.
+
+    Notes
+    -----
+    ``rdr2geo_cpu_dem`` is deliberately selected for every CPU radar-to-geo
+    module call.  Its DEM context is part of the public native contract; using
+    ``rdr2geo_cpu`` here silently changes the physical problem to an
+    ellipsoid-only solve.
+
+    """
+    if callable(executor):
+        if operation is Operation.RDR2GEO:
+            message = (
+                "rdr2geo native execution requires an extension module; "
+                "pass the module so public dispatch can select rdr2geo_cpu_dem"
+            )
+            logger.error(message)
+            raise DispatchError(message)
+        return executor
+    device_name = "cuda" if device.kind == "cuda" else "cpu"
+    if operation is Operation.RDR2GEO:
+        if ecef and device_name != "cuda":
+            message = "native ECEF execution is currently CUDA-only"
+            logger.error(message)
+            raise DispatchError(message)
+        symbol = (
+            "rdr2geo_cuda_ecef"
+            if ecef
+            else ("rdr2geo_cuda" if device_name == "cuda" else "rdr2geo_cpu_dem")
+        )
+    else:
+        symbol = "geo2rdr_cuda" if device_name == "cuda" else "geo2rdr_cpu"
+    entry = getattr(executor, symbol, None)
+    if not callable(entry):
+        message = f"native geometry module is missing required entrypoint {symbol}"
+        logger.error(message)
+        raise DispatchError(message)
+    if not isinstance(executor, ModuleType):
+        return entry
+
+    def invoke(*values: object) -> object:
+        """Adapt public context fields to the extension's scalar ABI."""
+        direct_inputs = values[:3]
+        context = values[3:]
+        orbit_times, orbit_positions, orbit_velocities, model_parameters, look_right = (
+            context[:5]
+        )
+
+        def module_tensor(value: object) -> object:
+            """Build an owner-backed contiguous float64 tensor for pybind."""
+            import torch
+
+            if isinstance(value, torch.Tensor):
+                return value.to(dtype=torch.float64).contiguous()
+            return torch.from_numpy(np.ascontiguousarray(value, dtype=np.float64))
+
+        if device.kind == "cpu":
+            direct_inputs = tuple(module_tensor(value) for value in direct_inputs)
+            orbit_times = module_tensor(orbit_times)
+            orbit_positions = module_tensor(orbit_positions)
+            orbit_velocities = module_tensor(orbit_velocities)
+        if hasattr(model_parameters, "detach"):
+            parameters = model_parameters.detach().cpu().tolist()
+        else:
+            parameters = np.asarray(model_parameters, dtype=np.float64).tolist()
+        if len(parameters) != len(_CANONICAL_MODEL_PARAMETER_FIELDS):
+            message = (
+                "native model_parameters must follow the canonical five-field order"
+            )
+            logger.error(message)
+            raise DispatchError(message)
+        sensing, interval, starting_range, spacing, wavelength = map(float, parameters)
+        if operation is Operation.RDR2GEO:
+            dem_values, dem_metadata, dem_bounds = context[5:]
+            if device.kind == "cpu":
+                dem_values = module_tensor(dem_values)
+            if hasattr(dem_metadata, "detach"):
+                metadata = dem_metadata.detach().cpu().tolist()
+            else:
+                metadata = np.asarray(dem_metadata, dtype=np.float64).tolist()
+            if hasattr(dem_bounds, "detach"):
+                bounds = dem_bounds.detach().cpu().tolist()
+            else:
+                bounds = np.asarray(dem_bounds, dtype=np.float64).tolist()
+            if device.kind == "cuda":
+                metadata = list(_cuda_dem_metadata_abi_order(metadata))
+                return entry(
+                    *direct_inputs,
+                    orbit_times,
+                    orbit_positions,
+                    orbit_velocities,
+                    sensing,
+                    interval,
+                    starting_range,
+                    spacing,
+                    dem_values,
+                    *metadata,
+                    float(np.mean(direct_inputs[2].detach().cpu().numpy())),
+                    *bounds,
+                    wavelength,
+                    solver.slant_range_tolerance_m,
+                    solver.doppler_tolerance_hz,
+                    solver.max_iter,
+                    solver.extra_iter,
+                    bool(look_right),
+                )
+            return entry(
+                *direct_inputs,
+                orbit_times,
+                orbit_positions,
+                orbit_velocities,
+                sensing,
+                interval,
+                starting_range,
+                spacing,
+                wavelength,
+                solver.max_iter,
+                solver.extra_iter,
+                solver.slant_range_tolerance_m,
+                solver.doppler_tolerance_hz,
+                bool(look_right),
+                dem_values,
+                *metadata,
+                50,
+                1.0e-3,
+            )
+        return entry(
+            *direct_inputs,
+            orbit_times,
+            orbit_positions,
+            orbit_velocities,
+            sensing,
+            interval,
+            starting_range,
+            spacing,
+            wavelength,
+            solver.max_iter,
+            solver.extra_iter,
+            solver.range_tolerance_m,
+            solver.doppler_tolerance_hz,
+            bool(look_right),
+        )
+
+    return invoke
 
 
 def _normalize_without_boundary_callback(
@@ -186,7 +399,10 @@ def _validate_native_context_inputs(
     if operation is Operation.RDR2GEO:
         expected_shapes.update(
             {
-                "dem_values": (6, 6),
+                # The native sampler consumes a six-point stencil from any
+                # contiguous 2-D raster.  Keeping the full raster resident
+                # avoids forcing callers to manufacture one tile per call.
+                "dem_values": None,
                 "dem_metadata": (4,),
                 "dem_height_bounds": (2,),
             }
@@ -216,6 +432,11 @@ def _validate_native_context_inputs(
                 require_finite=True,
                 name=f"native context {name}",
             )
+            if name == "dem_values" and (value.ndim != 2 or min(value.shape) < 6):
+                raise GeometryValidationError(
+                    "native context dem_values must be a 2-D raster with both "
+                    "dimensions at least 6"
+                )
             validated[name] = value
             continue
         if not isinstance(value, np.ndarray):
@@ -230,6 +451,11 @@ def _validate_native_context_inputs(
             require_finite=True,
             name=f"native context {name}",
         )
+        if name == "dem_values" and (value.ndim != 2 or min(value.shape) < 6):
+            raise GeometryValidationError(
+                "native context dem_values must be a 2-D raster with both "
+                "dimensions at least 6"
+            )
         if expected_device.kind != "cpu":
             raise GeometryValidationError(
                 f"native context {name} NumPy owner cannot prove CUDA allocation"
@@ -269,6 +495,9 @@ def _validate_public_inputs(
     shape: tuple[int, ...],
     inputs: tuple[object, ...],
     expected_device: DeviceKey,
+    *,
+    default_height_m: float = 0.0,
+    target_device: str = "cpu",
 ) -> tuple[object, ...]:
     """Validate host spans before handing arrays to a native callback."""
     if len(shape) > 2:
@@ -276,7 +505,20 @@ def _validate_public_inputs(
             "native geometry supports only one- or two-dimensional inputs"
         )
     if operation is Operation.RDR2GEO and len(inputs) == 2:
-        inputs = (*inputs, np.zeros(shape, dtype=np.float64))
+        if expected_device.kind == "cuda":
+            import torch
+
+            inputs = (
+                *inputs,
+                torch.full(
+                    shape,
+                    default_height_m,
+                    dtype=torch.float64,
+                    device=target_device,
+                ),
+            )
+        else:
+            inputs = (*inputs, np.full(shape, default_height_m, dtype=np.float64))
     if len(inputs) != 3:
         raise TypeError(f"{operation} expects three input arrays")
     arrays: list[object] = []
@@ -566,6 +808,29 @@ def _validate_native_manifest(
     return manifest
 
 
+def _normalize_ecef_result(
+    result: object, shape: tuple[int, ...]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Validate a raw native or already-materialized ECEF result."""
+    if isinstance(result, Sequence) and len(result) == 17:
+        values = ecef_from_native_outputs(result)
+    elif isinstance(result, Sequence) and len(result) == 3:
+        values = tuple(np.asarray(value) for value in result)
+        if any(value.dtype != np.dtype(np.float64) for value in values):
+            message = "ECEF result arrays must have float64 dtype"
+            logger.error(message)
+            raise DispatchError(message)
+    else:
+        message = "ECEF executor returned neither a 17-field nor 3-array result"
+        logger.error(message)
+        raise DispatchError(message)
+    if any(value.shape != shape for value in values):
+        message = "ECEF result arrays have an incompatible shape"
+        logger.error(message)
+        raise DispatchError(message)
+    return values
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedGeometry:
     """Prepared public geometry operation with deterministic backend dispatch."""
@@ -579,6 +844,9 @@ class PreparedGeometry:
     dtype: str
     native_key: CandidateKey | None = None
     compile_key: CandidateKey | None = None
+    fallback_key: CandidateKey | None = None
+    _native_ecef_execute: NativeECEFExecutor | None = None
+    _compiled_torch: PreparedTorchGeometry | None = None
 
     def execute(
         self,
@@ -602,17 +870,56 @@ class PreparedGeometry:
         if selector == "compile" and self.compile_key is not None:
             return self.compile_key
         if selector in ("eager", "auto"):
-            return (
-                self.native_key
-                or self.compile_key
-                or _key(
-                    self.operation,
-                    "compile",
-                    self.eager,
-                    ExecutionProfile.cpu(),
-                )
-            )
+            return self.native_key or self.compile_key or self.fallback_key
         raise DispatchError(f"no exact prepared {selector} candidate")
+
+    def execute_ecef(
+        self,
+        *inputs: object,
+        selector: BackendSelector = "auto",
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Execute Rdr2Geo and transfer only typed ECEF outputs.
+
+        Parameters
+        ----------
+        *inputs : object
+            Operation inputs in the same order as :meth:`execute`.
+        selector : {"native", "compile", "eager", "auto"}, optional
+            Backend to use.  Native CUDA uses the direct seventeen-field ECEF
+            ABI; Torch backends use their device-resident ECEF path.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            Host ECEF ``(x, y, z)`` arrays.
+
+        Raises
+        ------
+        DispatchError
+            If the selected backend has no typed ECEF route.
+
+        """
+        if self.operation is not Operation.RDR2GEO:
+            message = "execute_ecef is only available for rdr2geo"
+            logger.error(message)
+            raise DispatchError(message)
+        if selector not in ("native", "compile", "eager", "auto"):
+            message = f"unknown ECEF selector: {selector}"
+            logger.error(message)
+            raise DispatchError(message)
+        alternate: dict[str, Callable[..., object]] = {}
+        if self._native_ecef_execute is not None:
+            alternate["native"] = self._native_ecef_execute
+        if self._compiled_torch is not None:
+            alternate["compile"] = self._compiled_torch.execute_ecef
+        return self.dispatcher.dispatch_alternate(
+            self._key_for_selector(selector),
+            selector,
+            alternate,
+            self.eager.execute_ecef,
+            lambda value: _normalize_ecef_result(value, self.shape),
+            *inputs,
+        )
 
 
 def prepare_geometry(
@@ -630,6 +937,7 @@ def prepare_geometry(
     native_key: CandidateKey | None = None,
     native_correctness_qualified: bool = False,
     native_performance_eligible: bool = False,
+    native_ecef_correctness_qualified: bool = False,
     compile: bool = False,
     compile_correctness_qualified: bool = True,
     compile_performance_eligible: bool = False,
@@ -649,6 +957,11 @@ def prepare_geometry(
     if not normalized_shape or any(value <= 0 for value in normalized_shape):
         raise ValueError("shape must contain positive dimensions")
     solver = settings or SolverSettings()
+    torch_range_tolerance = (
+        solver.slant_range_tolerance_m
+        if op is Operation.RDR2GEO
+        else solver.range_tolerance_m
+    )
     profile = ExecutionProfile(
         _device_key(device, physical_uuid, mig_uuid),
         thread_count=None,
@@ -662,7 +975,7 @@ def prepare_geometry(
         dtype=dtype,
         max_iter=solver.max_iter,
         extra_iter=solver.extra_iter,
-        range_tol_m=solver.range_tolerance_m,
+        range_tol_m=torch_range_tolerance,
         doppler_tol_hz=solver.doppler_tolerance_hz,
         compile_kernel=False,
     )
@@ -676,7 +989,7 @@ def prepare_geometry(
             dtype=dtype,
             max_iter=solver.max_iter,
             extra_iter=solver.extra_iter,
-            range_tol_m=solver.range_tolerance_m,
+            range_tol_m=torch_range_tolerance,
             doppler_tol_hz=solver.doppler_tolerance_hz,
             compile_kernel=True,
         )
@@ -699,6 +1012,8 @@ def prepare_geometry(
     dispatcher = Dispatcher(eager_execute)
     registered_native_key: CandidateKey | None = None
     compile_key: CandidateKey | None = None
+    native_ecef_execute: NativeECEFExecutor | None = None
+    fallback_key = _key(op, "compile", eager, profile)
     if compiled is not None:
         compile_key = _key(op, "compile", compiled, profile)
         dispatcher.register(
@@ -725,6 +1040,14 @@ def prepare_geometry(
             ),
         )
     if native_executor is not None or native_candidate is not None:
+        if op is Operation.RDR2GEO and native_candidate is not None:
+            message = (
+                "rdr2geo native candidates are unsupported; pass a loaded "
+                "extension module as native_executor so public dispatch selects "
+                "rdr2geo_cpu_dem"
+            )
+            logger.error(message)
+            raise DispatchError(message)
         derived_key = _key(op, "native", eager, profile, native_candidate)
         if (
             native_executor is not None
@@ -754,16 +1077,35 @@ def prepare_geometry(
             )
         context_inputs = native_context_inputs or candidate_context
         _validate_native_context_inputs(op, context_inputs, profile.device)
+        native_entry = (
+            _resolve_native_entrypoint(native_executor, op, profile.device, solver)
+            if native_executor is not None
+            else None
+        )
+        native_ecef_entry = None
+        if (
+            native_executor is not None
+            and op is Operation.RDR2GEO
+            and profile.device.kind == "cuda"
+        ):
+            native_ecef_entry = _resolve_native_entrypoint(
+                native_executor, op, profile.device, solver, ecef=True
+            )
 
         def execute_native(*args: object) -> TransformResultV2:
             """Execute and centrally validate the supplied native entry point."""
             native_inputs = _validate_public_inputs(
-                op, normalized_shape, args, profile.device
+                op,
+                normalized_shape,
+                args,
+                profile.device,
+                default_height_m=eager.height_seed_m,
+                target_device=device,
             )
             context_values = _validate_native_context_inputs(
                 op, context_inputs, profile.device
             )
-            entry = native_executor
+            entry = native_entry
             if entry is None and native_candidate is not None:
                 return _native_public_result(
                     native_candidate.dispatch(*native_inputs, *context_values),
@@ -788,11 +1130,33 @@ def prepare_geometry(
                 output_shape=normalized_shape,
             )
 
+        def execute_native_ecef(*args: object) -> object:
+            """Execute the typed seventeen-field native ECEF entry point."""
+            if native_ecef_entry is None:
+                logger.error("native CUDA ECEF executor is missing")
+                raise DispatchError("native CUDA ECEF executor is missing")
+            native_inputs = _validate_public_inputs(
+                op,
+                normalized_shape,
+                args,
+                profile.device,
+                default_height_m=eager.height_seed_m,
+                target_device=device,
+            )
+            context_values = _validate_native_context_inputs(
+                op, context_inputs, profile.device
+            )
+            return native_ecef_entry(*native_inputs, *context_values)
+
+        if native_ecef_entry is not None:
+            native_ecef_execute = execute_native_ecef
+
         dispatcher.register(
             registered_native_key,
             execute_native,
             correctness_qualified=native_correctness_qualified,
             performance_eligible=native_performance_eligible,
+            ecef_correctness_qualified=native_ecef_correctness_qualified,
         )
     return PreparedGeometry(
         op,
@@ -804,6 +1168,9 @@ def prepare_geometry(
         eager.dtype,
         registered_native_key,
         compile_key,
+        fallback_key,
+        native_ecef_execute,
+        compiled,
     )
 
 

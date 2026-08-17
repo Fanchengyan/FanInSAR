@@ -71,11 +71,11 @@ def _native_context(
         "orbit_velocities": velocities,
         "model_parameters": np.array(
             [
+                (model.sensing_start - model.orbit.epoch).total_seconds(),
                 model.azimuth_time_interval_s,
                 model.starting_slant_range_m,
                 model.range_spacing_m,
                 model.wavelength_m,
-                (model.sensing_start - model.orbit.epoch).total_seconds(),
             ],
             dtype=np.float64,
         ),
@@ -121,6 +121,7 @@ def _native_key(
     shape: tuple[int, ...],
     operation: Operation,
     solver: SolverSettings | None = None,
+    dem: object | None = None,
 ) -> CandidateKey:
     """Build a complete explicit native manifest for the test fixture."""
     solver = solver or SolverSettings()
@@ -139,6 +140,7 @@ def _native_key(
         operation,
         model,
         shape=shape,
+        dem=dem,
         max_iter=solver.max_iter,
         extra_iter=solver.extra_iter,
         range_tol_m=solver.range_tolerance_m,

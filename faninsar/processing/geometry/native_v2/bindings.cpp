@@ -55,6 +55,12 @@ std::vector<torch::Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
     double, double, double, const torch::Tensor&, double, double, double,
     double, double, double, double, double, double, double, int64_t, int64_t,
     bool, int64_t);
+std::vector<torch::Tensor> rdr2geo_tcn_cuda_v2_with_ecef_row_width(
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
+    double, double, double, const torch::Tensor&, double, double, double,
+    double, double, double, double, double, double, double, int64_t, int64_t,
+    bool, int64_t);
 torch::Tensor rdr2geo_tcn_cuda_v2_visit_counts(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, double,
@@ -123,6 +129,49 @@ std::vector<torch::Tensor> rdr2geo_cuda_public(
   return result;
 }
 
+std::vector<torch::Tensor> rdr2geo_cuda_ecef_public(
+    const torch::Tensor& azimuth, const torch::Tensor& range,
+    const torch::Tensor& height_seed, const torch::Tensor& orbit_times,
+    const torch::Tensor& orbit_positions, const torch::Tensor& orbit_velocities,
+    double sensing_offset, double azimuth_interval, double starting_range,
+    double range_spacing, const torch::Tensor& dem, double dem_x_start,
+    double dem_y_start, double dem_dx, double dem_dy, double reference_height,
+    double min_height, double max_height, double wavelength,
+    double range_tolerance, double doppler_tolerance, int64_t max_iter,
+    int64_t extra_iter, bool right_looking) {
+  TORCH_CHECK(azimuth.dim() == range.dim() && azimuth.dim() == height_seed.dim(),
+              "rdr2geo input arrays must have matching dimensions");
+  TORCH_CHECK(azimuth.dim() == 1 || azimuth.dim() == 2,
+              "rdr2geo input arrays must be one- or two-dimensional");
+  int64_t row_width = azimuth.dim() == 2 ? azimuth.size(1) : 1;
+  TORCH_CHECK(row_width > 0, "rdr2geo row width must be positive");
+  if (azimuth.dim() == 2 && row_width > 1) {
+    const auto row_delta = azimuth.narrow(1, 1, row_width - 1) -
+                           azimuth.narrow(1, 0, row_width - 1);
+    if (!torch::isfinite(row_delta).all().item<bool>() ||
+        !row_delta.eq(0).all().item<bool>()) {
+      row_width = 1;
+    }
+  }
+  const auto flat_shape = std::vector<int64_t>{azimuth.numel()};
+  auto result = rdr2geo_tcn_cuda_v2_with_ecef_row_width(
+      azimuth.contiguous().reshape(flat_shape),
+      range.contiguous().reshape(flat_shape),
+      height_seed.contiguous().reshape(flat_shape), orbit_times,
+      orbit_positions, orbit_velocities, sensing_offset, azimuth_interval,
+      starting_range, range_spacing, dem, dem_x_start, dem_y_start, dem_dx,
+      dem_dy, reference_height, min_height, max_height, wavelength,
+      range_tolerance, doppler_tolerance, max_iter, extra_iter, right_looking,
+      row_width);
+  result.pop_back();
+  TORCH_CHECK(result.size() == 17,
+              "native CUDA rdr2geo ECEF ABI must return 17 fields");
+  if (azimuth.dim() == 2) {
+    for (auto& field : result) field = field.reshape(azimuth.sizes());
+  }
+  return result;
+}
+
 }  // namespace faninsar::geometry::cuda_v2
 #endif
 
@@ -164,6 +213,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              "Run the CUDA geo2rdr kernel");
   module.def("rdr2geo_cuda", &faninsar::geometry::cuda_v2::rdr2geo_cuda_public,
              "Run the CUDA rdr2geo kernel");
+  module.def("rdr2geo_cuda_ecef",
+             &faninsar::geometry::cuda_v2::rdr2geo_cuda_ecef_public,
+             "Run CUDA rdr2geo and publish device-resident ECEF outputs");
   module.def("geo2rdr_cuda_diagnostic",
              &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2_with_visit_counts,
              "Run CUDA geo2rdr with qualification telemetry");

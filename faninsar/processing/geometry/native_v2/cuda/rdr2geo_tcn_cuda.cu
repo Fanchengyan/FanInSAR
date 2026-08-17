@@ -123,7 +123,8 @@ __global__ void rdr2geo_tcn_kernel(
     bool* converged, int32_t* iterations, double* decision_residual,
     double* final_residual, double* tolerance, bool* max_iter_exhausted,
     bool* boundary_rechecked, double* range_residual,
-    double* doppler_residual, int32_t* visit_counts, int64_t* work_index) {
+    double* doppler_residual, double* ecef_x, double* ecef_y, double* ecef_z,
+    int32_t* visit_counts, int64_t* work_index) {
   int64_t point;
   while (true) {
     point = static_cast<int64_t>(atomicAdd(
@@ -149,20 +150,20 @@ __global__ void rdr2geo_tcn_kernel(
   const double target = starting_range + range * range_spacing;
   if (!(target > 0.0) || !isfinite(target)) continue;
   double height = seed;
-  if (!isfinite(azimuth) || !isfinite(range) || !isfinite(seed) ||
-      height < min_height || height > max_height) continue;
+  if (!isfinite(azimuth) || !isfinite(range) || !isfinite(seed)) continue;
 
   double old_llh[3] = {0.0, 0.0, height};
   double latest_range_residual = nan("");
   double latest_doppler_residual = nan("");
-  double decision = nan("");
   bool solved = false;
   bool stopped_early = false;
   int32_t attempts = 0;
+  double previous_height = nan("");
+  double previous_fixed_height = nan("");
+  bool aitken_restart = false;
 
   for (int64_t iteration = 0; iteration < budget; ++iteration) {
-    if (!isfinite(height) || height < min_height || height > max_height ||
-        !(ellipsoid_height - height <= target)) {
+    if (!isfinite(height) || !(ellipsoid_height - height < target)) {
       stopped_early = true;
       break;
     }
@@ -201,8 +202,7 @@ __global__ void rdr2geo_tcn_kernel(
                      (row - dem_y_start_deg) / dem_dy_deg,
                      (column - dem_x_start_deg) / dem_dx_deg,
                      reference_height, &dem_valid);
-    if (!dem_valid || !isfinite(sampled_height) ||
-        sampled_height < min_height || sampled_height > max_height) {
+    if (!dem_valid || !isfinite(sampled_height)) {
       stopped_early = true;
       break;
     }
@@ -218,8 +218,7 @@ __global__ void rdr2geo_tcn_kernel(
     const double slant_range = sqrt(look[0] * look[0] + look[1] * look[1] +
                                     look[2] * look[2]);
     if (!(slant_range > 0.0) || !isfinite(slant_range) ||
-        !isfinite(new_height) || new_height < min_height ||
-        new_height > max_height) {
+        !isfinite(new_height)) {
       stopped_early = true;
       break;
     }
@@ -229,15 +228,19 @@ __global__ void rdr2geo_tcn_kernel(
     latest_range_residual = slant_range - target;
     latest_doppler_residual = 2.0 * dot / wavelength;
     ++attempts;
+    const bool dem_height_converged =
+        dem == nullptr || fabs(new_height - height) <= 1.0e-3;
     const bool now_converged =
         isfinite(latest_range_residual) &&
-        fabs(latest_range_residual) < range_tolerance;
-    decision = latest_range_residual;
+        fabs(latest_range_residual) < range_tolerance && dem_height_converged;
     if (now_converged) {
       solved = true;
       height = new_height;
       break;
     }
+    double selected_height = new_height;
+    double next_old_llh[3] = {dem_llh[0], dem_llh[1], sampled_height};
+    bool restart_after_damping = false;
     if (iteration >= primary_iter) {
       double old_xyz[3];
       llh_to_ecef(old_llh[1] / kDegreesToRadians,
@@ -248,18 +251,66 @@ __global__ void rdr2geo_tcn_kernel(
       double average_height = 0.0;
       ecef_to_llh(target_xyz, &average_latitude, &average_longitude,
                   &average_height);
-      old_llh[0] = average_longitude;
-      old_llh[1] = average_latitude;
-      old_llh[2] = average_height;
-      height = sqrt(target_xyz[0] * target_xyz[0] +
-                    target_xyz[1] * target_xyz[1] +
-                    target_xyz[2] * target_xyz[2]) - radius;
-    } else {
-      old_llh[0] = dem_llh[0];
-      old_llh[1] = dem_llh[1];
-      old_llh[2] = dem_llh[2];
-      height = new_height;
+      const bool damping_valid =
+          isfinite(average_latitude) && isfinite(average_longitude) &&
+          isfinite(average_height);
+      if (damping_valid) {
+        next_old_llh[0] = average_longitude;
+        next_old_llh[1] = average_latitude;
+        next_old_llh[2] = average_height;
+        selected_height = sqrt(target_xyz[0] * target_xyz[0] +
+                               target_xyz[1] * target_xyz[1] +
+                               target_xyz[2] * target_xyz[2]) - radius;
+        restart_after_damping = true;
+      }
     }
+
+    bool aitken_enabled = false;
+    if (iteration >= 2) {
+      const double denominator =
+          new_height - 2.0 * height + previous_height;
+      const double step = new_height - height;
+      const double previous_step = height - previous_height;
+      const double slope = step / previous_step;
+      const double candidate =
+          previous_height - previous_step * previous_step / denominator;
+      const bool finite_history =
+          isfinite(previous_height) && isfinite(height) &&
+          isfinite(new_height) && isfinite(slope) && isfinite(candidate) &&
+          isfinite(min_height) && isfinite(max_height);
+      const bool denominator_safe = fabs(denominator) > 1.0e-6;
+      const bool previous_step_safe = fabs(previous_step) > 1.0e-12;
+      aitken_enabled =
+          finite_history && denominator_safe && previous_step_safe &&
+          slope > -0.95 && slope < 0.95 && min_height <= max_height &&
+          fabs(candidate - height) <= fmax(fabs(step), 1.0e-3) &&
+          (candidate - height) * step >= 0.0 && candidate >= min_height &&
+          candidate <= max_height;
+      if (aitken_enabled) {
+        const double prior_residual =
+            previous_fixed_height - previous_height;
+        const double current_residual = new_height - height;
+        const bool sign_change = prior_residual * current_residual <= 0.0;
+        const bool between = (candidate - previous_height) *
+                             (candidate - height) <= 0.0;
+        aitken_enabled = isfinite(previous_fixed_height) &&
+                         ((!sign_change) || between);
+      }
+      aitken_enabled = aitken_enabled && !aitken_restart &&
+                       !restart_after_damping;
+      if (aitken_enabled) selected_height = candidate;
+    }
+    for (int axis = 0; axis < 3; ++axis) old_llh[axis] = next_old_llh[axis];
+    if (restart_after_damping) {
+      previous_height = nan("");
+      previous_fixed_height = nan("");
+      aitken_restart = true;
+    } else {
+      previous_height = height;
+      previous_fixed_height = new_height;
+      aitken_restart = false;
+    }
+    height = selected_height;
   }
 
   const bool budget_exhausted = !solved && !stopped_early && attempts >= budget;
@@ -283,6 +334,17 @@ __global__ void rdr2geo_tcn_kernel(
                       beta * cross_track[axis] + gamma * normal[axis];
   double final_latitude = 0.0, final_longitude = 0.0, final_height = 0.0;
   ecef_to_llh(final_xyz, &final_latitude, &final_longitude, &final_height);
+  bool final_dem_converged = dem == nullptr;
+  if (dem != nullptr) {
+    bool final_dem_valid = false;
+    const double final_dem_height = sample_dem(
+        dem, dem_rows, dem_columns,
+        (final_latitude / kDegreesToRadians - dem_y_start_deg) / dem_dy_deg,
+        (final_longitude / kDegreesToRadians - dem_x_start_deg) / dem_dx_deg,
+        reference_height, &final_dem_valid);
+    final_dem_converged = final_dem_valid && isfinite(final_dem_height) &&
+                          fabs(final_height - final_dem_height) <= 1.0e-3;
+  }
   const double final_look[3] = {final_xyz[0] - sat[0], final_xyz[1] - sat[1],
                                 final_xyz[2] - sat[2]};
   const double final_slant_range = sqrt(
@@ -296,9 +358,14 @@ __global__ void rdr2geo_tcn_kernel(
   latest_doppler_residual = 2.0 * final_doppler / wavelength;
   const bool final_converged =
       isfinite(latest_range_residual) &&
-      fabs(latest_range_residual) < range_tolerance;
-  const bool publish_converged = final_converged && !budget_exhausted;
-  if (!final_converged && !budget_exhausted) continue;
+      fabs(latest_range_residual) < range_tolerance && final_dem_converged;
+  // The final TCN publication is authoritative even when the iteration
+  // budget was exhausted.  A final residual inside tolerance is converged;
+  // the exhaustion flag remains telemetry for callers that need it.
+  const bool publish_converged = final_converged;
+  // Preserve finite coordinates for lanes solved inside the loop even when
+  // the authoritative final DEM recheck changes their convergence vote.
+  if (!final_converged && !budget_exhausted && !solved) continue;
   iterations[point] = budget_exhausted ? static_cast<int32_t>(budget) : attempts;
   max_iter_exhausted[point] = budget_exhausted;
   tolerance[point] = range_tolerance;
@@ -309,6 +376,11 @@ __global__ void rdr2geo_tcn_kernel(
   latitude_deg[point] = final_latitude / kDegreesToRadians;
   longitude_deg[point] = final_longitude / kDegreesToRadians;
   output_height[point] = dem == nullptr ? height : final_height;
+  if (ecef_x != nullptr) {
+    ecef_x[point] = final_xyz[0];
+    ecef_y[point] = final_xyz[1];
+    ecef_z[point] = final_xyz[2];
+  }
   output_range[point] = range;
   output_azimuth[point] = azimuth;
   converged[point] = publish_converged;
@@ -317,7 +389,7 @@ __global__ void rdr2geo_tcn_kernel(
 
 }  // namespace
 
-std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width_impl(
     const Tensor& azimuth_index, const Tensor& range_index,
     const Tensor& height_seed_m, const Tensor& orbit_times_s,
     const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
@@ -327,7 +399,8 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
     double dem_dx_deg, double dem_dy_deg, double reference_height_m,
     double min_height_m, double max_height_m, double wavelength_m,
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
-    int64_t extra_iter, bool right_looking, int64_t row_width) {
+    int64_t extra_iter, bool right_looking, int64_t row_width,
+    bool publish_ecef) {
   check_cuda_vector(azimuth_index, "azimuth_index");
   check_cuda_vector(range_index, "range_index");
   check_cuda_vector(height_seed_m, "height_seed_m");
@@ -406,6 +479,15 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
   auto boundary_rechecked = torch::zeros({count}, options.dtype(torch::kBool));
   auto range_residual = torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options);
   auto doppler_residual = torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options);
+  auto ecef_x = publish_ecef
+      ? torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options)
+      : torch::Tensor();
+  auto ecef_y = publish_ecef
+      ? torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options)
+      : torch::Tensor();
+  auto ecef_z = publish_ecef
+      ? torch::full({count}, std::numeric_limits<double>::quiet_NaN(), options)
+      : torch::Tensor();
   auto visit_counts = torch::zeros({count}, options.dtype(torch::kInt32));
   const int64_t row_count = (count + row_width - 1) / row_width;
   auto contexts = torch::empty({row_count, kContextStride}, options);
@@ -450,14 +532,67 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
         decision_residual.data_ptr<double>(), final_residual.data_ptr<double>(),
         tolerance.data_ptr<double>(), max_iter_exhausted.data_ptr<bool>(),
         boundary_rechecked.data_ptr<bool>(), range_residual.data_ptr<double>(),
-        doppler_residual.data_ptr<double>(), visit_counts.data_ptr<int32_t>(),
+        doppler_residual.data_ptr<double>(),
+        publish_ecef ? ecef_x.data_ptr<double>() : nullptr,
+        publish_ecef ? ecef_y.data_ptr<double>() : nullptr,
+        publish_ecef ? ecef_z.data_ptr<double>() : nullptr,
+        visit_counts.data_ptr<int32_t>(),
         work_index.data_ptr<int64_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  return {latitude, longitude, output_height, output_range, output_azimuth,
-          converged, iterations, decision_residual, final_residual, tolerance,
-          max_iter_exhausted, boundary_rechecked, range_residual,
-          doppler_residual, visit_counts};
+  std::vector<Tensor> result = {
+      latitude, longitude, output_height, output_range, output_azimuth,
+      converged, iterations, decision_residual, final_residual, tolerance,
+      max_iter_exhausted, boundary_rechecked, range_residual, doppler_residual};
+  if (publish_ecef) {
+    result.push_back(ecef_x);
+    result.push_back(ecef_y);
+    result.push_back(ecef_z);
+  }
+  result.push_back(visit_counts);
+  return result;
+}
+
+std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+    const Tensor& azimuth_index, const Tensor& range_index,
+    const Tensor& height_seed_m, const Tensor& orbit_times_s,
+    const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
+    double sensing_offset_s, double azimuth_time_interval_s,
+    double starting_slant_range_m, double range_spacing_m,
+    const Tensor& dem_height_m, double dem_x_start_deg, double dem_y_start_deg,
+    double dem_dx_deg, double dem_dy_deg, double reference_height_m,
+    double min_height_m, double max_height_m, double wavelength_m,
+    double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
+    int64_t extra_iter, bool right_looking, int64_t row_width) {
+  return rdr2geo_tcn_cuda_v2_with_visit_counts_row_width_impl(
+      azimuth_index, range_index, height_seed_m, orbit_times_s,
+      orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
+      azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
+      dem_height_m, dem_x_start_deg, dem_y_start_deg, dem_dx_deg, dem_dy_deg,
+      reference_height_m, min_height_m, max_height_m, wavelength_m,
+      range_tolerance_m, doppler_tolerance_hz, max_iter, extra_iter,
+      right_looking, row_width, false);
+}
+
+std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_ecef_row_width(
+    const Tensor& azimuth_index, const Tensor& range_index,
+    const Tensor& height_seed_m, const Tensor& orbit_times_s,
+    const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
+    double sensing_offset_s, double azimuth_time_interval_s,
+    double starting_slant_range_m, double range_spacing_m,
+    const Tensor& dem_height_m, double dem_x_start_deg, double dem_y_start_deg,
+    double dem_dx_deg, double dem_dy_deg, double reference_height_m,
+    double min_height_m, double max_height_m, double wavelength_m,
+    double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
+    int64_t extra_iter, bool right_looking, int64_t row_width) {
+  return rdr2geo_tcn_cuda_v2_with_visit_counts_row_width_impl(
+      azimuth_index, range_index, height_seed_m, orbit_times_s,
+      orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
+      azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
+      dem_height_m, dem_x_start_deg, dem_y_start_deg, dem_dx_deg, dem_dy_deg,
+      reference_height_m, min_height_m, max_height_m, wavelength_m,
+      range_tolerance_m, doppler_tolerance_hz, max_iter, extra_iter,
+      right_looking, row_width, true);
 }
 
 std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
@@ -472,6 +607,27 @@ std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_visit_counts(
     double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
     int64_t extra_iter, bool right_looking) {
   return rdr2geo_tcn_cuda_v2_with_visit_counts_row_width(
+      azimuth_index, range_index, height_seed_m, orbit_times_s,
+      orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
+      azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,
+      dem_height_m, dem_x_start_deg, dem_y_start_deg, dem_dx_deg, dem_dy_deg,
+      reference_height_m, min_height_m, max_height_m, wavelength_m,
+      range_tolerance_m, doppler_tolerance_hz, max_iter, extra_iter,
+      right_looking, 1);
+}
+
+std::vector<Tensor> rdr2geo_tcn_cuda_v2_with_ecef(
+    const Tensor& azimuth_index, const Tensor& range_index,
+    const Tensor& height_seed_m, const Tensor& orbit_times_s,
+    const Tensor& orbit_positions_m, const Tensor& orbit_velocities_m_s,
+    double sensing_offset_s, double azimuth_time_interval_s,
+    double starting_slant_range_m, double range_spacing_m,
+    const Tensor& dem_height_m, double dem_x_start_deg, double dem_y_start_deg,
+    double dem_dx_deg, double dem_dy_deg, double reference_height_m,
+    double min_height_m, double max_height_m, double wavelength_m,
+    double range_tolerance_m, double doppler_tolerance_hz, int64_t max_iter,
+    int64_t extra_iter, bool right_looking) {
+  return rdr2geo_tcn_cuda_v2_with_ecef_row_width(
       azimuth_index, range_index, height_seed_m, orbit_times_s,
       orbit_positions_m, orbit_velocities_m_s, sensing_offset_s,
       azimuth_time_interval_s, starting_slant_range_m, range_spacing_m,

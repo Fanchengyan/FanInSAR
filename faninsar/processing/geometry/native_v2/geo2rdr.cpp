@@ -1,7 +1,9 @@
 #include "native_v2_abi.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
+#include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -11,6 +13,20 @@ namespace faninsar_native_v2 {
 namespace {
 
 constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
+
+struct PackedHermiteInterval {
+  Vec3 position_c0{};
+  Vec3 position_c1{};
+  Vec3 position_c2{};
+  Vec3 position_c3{};
+};
+
+struct SceneOrbit {
+  bool uniform = false;
+  double start_s = 0.0;
+  double spacing_s = 0.0;
+  std::vector<PackedHermiteInterval> intervals;
+};
 
 void validate_inputs(const Tensor& latitude_deg, const Tensor& longitude_deg,
                      const Tensor& height_m, const Tensor& orbit_times_s,
@@ -37,12 +53,75 @@ void validate_inputs(const Tensor& latitude_deg, const Tensor& longitude_deg,
   TORCH_CHECK(std::isfinite(wavelength_m) && wavelength_m > 0.0,
               "wavelength_m must be finite and positive");
   TORCH_CHECK(max_iter > 0 && extra_iter >= 0, "iteration settings are invalid");
-  TORCH_CHECK(max_iter + extra_iter <= std::numeric_limits<int32_t>::max(),
+  constexpr int64_t max_budget = std::numeric_limits<int32_t>::max();
+  TORCH_CHECK(max_iter <= max_budget && extra_iter <= max_budget - max_iter,
               "iteration budget exceeds int32 capacity");
   TORCH_CHECK(std::isfinite(time_tol_s) && time_tol_s > 0.0 &&
                   std::isfinite(range_tol_m) && range_tol_m > 0.0 &&
                   std::isfinite(doppler_tol_hz) && doppler_tol_hz > 0.0,
               "solver tolerances must be finite and positive");
+}
+
+SceneOrbit pack_uniform_orbit(const double* times, const double* positions,
+                              const double* velocities, int64_t count) {
+  SceneOrbit scene;
+  scene.start_s = times[0];
+  scene.spacing_s = times[1] - times[0];
+  scene.uniform = scene.spacing_s > 0.0;
+  for (int64_t index = 2; scene.uniform && index < count; ++index) {
+    scene.uniform = times[index] - times[index - 1] == scene.spacing_s;
+  }
+  if (!scene.uniform) return scene;
+
+  scene.intervals.resize(static_cast<size_t>(count - 1));
+  const double inverse_spacing = 1.0 / scene.spacing_s;
+  const double inverse_spacing_squared = inverse_spacing * inverse_spacing;
+  for (int64_t index = 0; index + 1 < count; ++index) {
+    auto& interval = scene.intervals[static_cast<size_t>(index)];
+    for (int axis = 0; axis < 3; ++axis) {
+      const double position_0 = positions[index * 3 + axis];
+      const double position_1 = positions[(index + 1) * 3 + axis];
+      const double velocity_0 = velocities[index * 3 + axis];
+      const double velocity_1 = velocities[(index + 1) * 3 + axis];
+      const double slope = (position_1 - position_0) * inverse_spacing;
+      interval.position_c0[axis] =
+          (velocity_0 + velocity_1 - 2.0 * slope) * inverse_spacing_squared;
+      interval.position_c1[axis] =
+          (3.0 * slope - 2.0 * velocity_0 - velocity_1) * inverse_spacing;
+      interval.position_c2[axis] = velocity_0;
+      interval.position_c3[axis] = position_0;
+    }
+  }
+  return scene;
+}
+
+OrbitState interpolate_scene_orbit(
+    const SceneOrbit& scene, const double* times, const double* positions,
+    const double* velocities, int64_t count, double time_s) {
+  if (!scene.uniform) {
+    return interpolate_orbit(times, positions, velocities, count, time_s);
+  }
+  const auto raw_segment = static_cast<int64_t>(
+      std::floor((time_s - scene.start_s) / scene.spacing_s));
+  int64_t segment = std::clamp<int64_t>(raw_segment, 0, count - 2);
+  while (segment > 0 && time_s < times[segment]) --segment;
+  while (segment < count - 2 && time_s >= times[segment + 1]) ++segment;
+  const double local_time = time_s - times[segment];
+  const auto& interval = scene.intervals[static_cast<size_t>(segment)];
+  OrbitState state;
+  for (int axis = 0; axis < 3; ++axis) {
+    const double c0 = interval.position_c0[axis];
+    const double c1 = interval.position_c1[axis];
+    const double c2 = interval.position_c2[axis];
+    const double c3 = interval.position_c3[axis];
+    state.position[axis] = ((c0 * local_time + c1) * local_time + c2) *
+                               local_time +
+                           c3;
+    state.velocity[axis] =
+        (3.0 * c0 * local_time + 2.0 * c1) * local_time + c2;
+    state.acceleration[axis] = 6.0 * c0 * local_time + 2.0 * c1;
+  }
+  return state;
 }
 
 }  // namespace
@@ -101,6 +180,15 @@ std::vector<Tensor> geo2rdr_cpu(
   const int64_t budget = max_iter + extra_iter;
   const double orbit_start = times[0];
   const double orbit_end = times[orbit_times_s.numel() - 1];
+  const SceneOrbit scene_orbit = pack_uniform_orbit(
+      times, positions, velocities, orbit_times_s.numel());
+  const double reference_time =
+      std::clamp(sensing_offset_s, orbit_start, orbit_end);
+  const OrbitState reference_seed = interpolate_scene_orbit(
+      scene_orbit, times, positions, velocities, orbit_times_s.numel(),
+      reference_time);
+  const double reference_speed_squared =
+      dot(reference_seed.velocity, reference_seed.velocity);
   begin_telemetry(count, "geo2rdr_cpu");
   auto invalidate_lane = [&](int64_t point) {
     latitudes_out[point] = kNan;
@@ -128,21 +216,19 @@ std::vector<Tensor> geo2rdr_cpu(
       invalidate_lane(point);
       continue;
     }
-    const Vec3 target = llh_to_ecef(latitudes[point], longitudes[point], heights[point]);
-    const OrbitState seed = interpolate_orbit(times, positions, velocities,
-                                               orbit_times_s.numel(),
-                                               std::clamp(sensing_offset_s,
-                                                          orbit_start, orbit_end));
+    const Vec3 target =
+        llh_to_ecef(latitudes[point], longitudes[point], heights[point]);
+    const OrbitState seed = reference_seed;
     const Vec3 target_delta{target[0] - seed.position[0], target[1] - seed.position[1],
                             target[2] - seed.position[2]};
-    const double speed_squared = dot(seed.velocity, seed.velocity);
+    const double speed_squared = reference_speed_squared;
     double time_s = sensing_offset_s;
     if (std::isfinite(speed_squared) && speed_squared > 0.0) {
       time_s += dot(target_delta, seed.velocity) / speed_squared;
     }
     time_s = std::clamp(time_s, orbit_start, orbit_end);
-    OrbitState state = interpolate_orbit(times, positions, velocities,
-                                         orbit_times_s.numel(), time_s);
+    OrbitState state = interpolate_scene_orbit(
+        scene_orbit, times, positions, velocities, orbit_times_s.numel(), time_s);
     double last_doppler = kNan;
     double last_range_residual = kNan;
     bool lane_solved = false;
@@ -194,8 +280,8 @@ std::vector<Tensor> geo2rdr_cpu(
       // gate; using it as a gate makes CPU/CUDA and Torch backends disagree
       // when their last-step roundoff differs despite identical residuals.
       {
-        const OrbitState final_state = interpolate_orbit(
-            times, positions, velocities, orbit_times_s.numel(), time_s);
+        const OrbitState final_state = interpolate_scene_orbit(
+            scene_orbit, times, positions, velocities, orbit_times_s.numel(), time_s);
         const Vec3 final_look{target[0] - final_state.position[0],
                               target[1] - final_state.position[1],
                               target[2] - final_state.position[2]};
@@ -231,8 +317,8 @@ std::vector<Tensor> geo2rdr_cpu(
         continue;
       }
     }
-    residual_doppler[point] = last_doppler;
-    residual_range[point] = last_range_residual;
+    doppler_residuals[point] = last_doppler;
+    range_residuals[point] = last_range_residual;
     if (!lane_solved) {
       if (!early_failure && attempts_evaluated >= budget) {
         iteration_values[point] = static_cast<int32_t>(budget);
@@ -246,8 +332,8 @@ std::vector<Tensor> geo2rdr_cpu(
     ranges[point] =
         (accepted_range_m - starting_slant_range_m) / range_spacing_m;
     azimuths[point] = (time_s - sensing_offset_s) / azimuth_time_interval_s;
-    residual_range[point] = last_range_residual;
-    residual_doppler[point] = last_doppler;
+    range_residuals[point] = last_range_residual;
+    doppler_residuals[point] = last_doppler;
     const double final_metric = std::max(
         std::abs(last_range_residual) / range_tol_m,
         std::abs(last_doppler) / doppler_tol_hz);

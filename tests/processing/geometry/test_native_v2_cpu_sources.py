@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from faninsar.processing.geometry import ecef_to_llh
 from faninsar.processing.geometry.native_v2 import (
     NATIVE_RESULT_FIELDS,
     result_from_native_outputs,
@@ -212,6 +213,39 @@ def test_rdr2geo_cpu_is_closed_form_tcn_not_finite_difference_newton() -> None:
     assert "d_range_dlat" not in source
 
 
+def test_native_dem_spline_uses_validated_closed_form_weights() -> None:
+    """Lock the validated spline kernel while allowing iteration diagnostics to vary.
+
+    The closed-form weights preserve the convergence mask and physical outputs
+    within the qualification tolerances.  Floating-point evaluation order can
+    legitimately change per-point iteration counters and residual diagnostics.
+    """
+    source = (SOURCE_ROOT / "rdr2geo.cpp").read_text()
+    spline = source.split("double natural_spline_six", maxsplit=1)[1].split(
+        "double sample_dem_six", maxsplit=1
+    )[0]
+
+    assert "constexpr double second_one[6]" in spline
+    assert "constexpr double second_two[6]" in spline
+    for coefficient in (
+        "1.6076555023923444",
+        "-3.6459330143540667",
+        "2.5837320574162677",
+        "-0.6889952153110048",
+        "0.1722488038277512",
+        "-0.0287081339712919",
+        "-0.4306220095693780",
+        "-4.3349282296650715",
+        "2.7559808612440193",
+        "0.1148325358851674",
+    ):
+        assert coefficient in spline
+    assert "fraction_cubed" in spline
+    assert "double weights[6]" in spline
+    assert "result += values[index] * weights[index]" in spline
+    assert "recurrence" not in spline
+
+
 def test_cpu_publishes_degree_coordinates_and_final_attempt_residuals() -> None:
     """The native kernels publish degree coordinates and final-state metrics."""
     rdr = (SOURCE_ROOT / "rdr2geo.cpp").read_text()
@@ -222,6 +256,160 @@ def test_cpu_publishes_degree_coordinates_and_final_attempt_residuals() -> None:
     assert "final_doppler" in rdr
     assert "final_metric" in geo
     assert "attempts_evaluated >= budget" in geo
+    assert "row_base > rows - 5" in rdr
+    assert "column_base > columns - 5" in rdr
+    assert "latitude_spacing == 0.0" in rdr
+    assert "previous_fixed_height" in rdr
+    assert "slope > -0.95 && slope < 0.95" in rdr
+    assert "candidate >= dem_min" in rdr
+    assert "candidate <= dem_max" in rdr
+
+
+def test_geo2rdr_writes_residuals_through_raw_output_pointers() -> None:
+    """Keep the per-point residual stores outside the Tensor API hot path."""
+    source = (SOURCE_ROOT / "geo2rdr.cpp").read_text()
+
+    assert "doppler_residuals[point] = last_doppler;" in source
+    assert "range_residuals[point] = last_range_residual;" in source
+    assert "residual_doppler[point] = last_doppler;" not in source
+    assert "residual_range[point] = last_range_residual;" not in source
+
+
+def test_native_dem_matches_torch_post_budget_ecef_transition() -> None:
+    """The DEM loop carries Torch's post-budget ECEF damping state."""
+    source = (SOURCE_ROOT / "rdr2geo.cpp").read_text()
+
+    assert "iteration >= primary_budget" in source
+    assert "old_latitude_rad" in source
+    assert "old_longitude_rad" in source
+    assert "0.5 * (old_xyz[0] + dem_xyz[0])" in source
+    assert "average_llh = ecef_to_llh_tcn(average_xyz)" in source
+    assert "next_old_height = average_llh[2]" in source
+    assert "old_height = next_old_height" in source
+    assert "aitken_enabled = false" in source
+    assert "restart_after_damping" in source
+    assert "previous_fixed_height = kNan" in source
+
+
+def test_native_orbit_lookup_and_telemetry_visit_are_hot_loop_safe() -> None:
+    """Orbit lookup is logarithmic and per-point telemetry has no lock."""
+    abi = (SOURCE_ROOT / "native_v2_abi.cpp").read_text()
+    record_visit = abi.split("void record_visit", maxsplit=1)[1].split(
+        "TelemetrySnapshot telemetry_snapshot", maxsplit=1
+    )[0]
+
+    assert "std::upper_bound" in abi
+    assert "std::lock_guard<std::mutex>" not in record_visit
+
+
+def test_geo2rdr_cpu_packs_uniform_scene_orbit_and_hoists_seed() -> None:
+    """The CPU fast path packs uniform Hermite knots and reuses its seed."""
+    source = (SOURCE_ROOT / "geo2rdr.cpp").read_text()
+
+    assert "pack_uniform_orbit" in source
+    assert "interpolate_scene_orbit" in source
+    assert "std::floor" in source
+    assert "time_s < times[segment]" in source
+    assert "time_s >= times[segment + 1]" in source
+    assert "const double local_time = time_s - times[segment];" in source
+    assert "const OrbitState reference_seed" in source
+    assert "const double reference_speed_squared" in source
+    assert "const OrbitState seed = reference_seed" in source
+    assert "const double speed_squared = reference_speed_squared" in source
+
+
+def test_geo2rdr_uniform_packed_orbit_matches_nonuniform_fallback(
+    serial_native_extension: object,
+) -> None:
+    """Uniform packing preserves a nonlinear Hermite trajectory at boundaries."""
+    torch = pytest.importorskip("torch")
+    dtype = torch.float64
+    extension = serial_native_extension
+    time_origin = 1.0e9
+    uniform_times = time_origin + np.array([-20.0, -10.0, 0.0, 10.0, 20.0])
+    irregular_times = time_origin + np.array([-20.0, -9.0, 0.0, 11.0, 20.0])
+    internal_knots = uniform_times[1:-1]
+    knot_probes = np.column_stack(
+        (
+            np.nextafter(internal_knots, -np.inf),
+            internal_knots,
+            np.nextafter(internal_knots, np.inf),
+        )
+    ).reshape(-1)
+    probe_times = np.concatenate(([uniform_times[0]], knot_probes, [uniform_times[-1]]))
+
+    def trajectory(times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return one cubic ECEF trajectory and its analytic velocity."""
+        relative_time = times - time_origin
+        position = np.column_stack(
+            (
+                7_000_000.0 + 0.01 * relative_time**3,
+                7_500.0 * relative_time + 0.1 * relative_time**3,
+                0.02 * relative_time**3,
+            )
+        )
+        velocity = np.column_stack(
+            (
+                0.03 * relative_time**2,
+                7_500.0 + 0.3 * relative_time**2,
+                0.06 * relative_time**2,
+            )
+        )
+        return position, velocity
+
+    uniform_positions, uniform_velocities = trajectory(uniform_times)
+    irregular_positions, irregular_velocities = trajectory(irregular_times)
+    target_positions, target_velocities = trajectory(probe_times)
+    targets = []
+    for position, velocity in zip(target_positions, target_velocities, strict=True):
+        radial = position / np.linalg.norm(position)
+        look = np.cross(velocity, radial)
+        look /= np.linalg.norm(look)
+        targets.append(position + 650_000.0 * look)
+    targets_array = np.asarray(targets)
+    latitude, longitude, height = ecef_to_llh(
+        targets_array[:, 0], targets_array[:, 1], targets_array[:, 2]
+    )
+    latitude = torch.as_tensor(np.asarray(latitude), dtype=dtype)
+    longitude = torch.as_tensor(np.asarray(longitude), dtype=dtype)
+    height = torch.as_tensor(np.asarray(height), dtype=dtype)
+
+    def solve(
+        times: np.ndarray, positions: np.ndarray, velocities: np.ndarray
+    ) -> list[object]:
+        return extension.geo2rdr_cpu(
+            latitude,
+            longitude,
+            height,
+            torch.as_tensor(times, dtype=dtype),
+            torch.as_tensor(positions, dtype=dtype),
+            torch.as_tensor(velocities, dtype=dtype),
+            time_origin,
+            1.0,
+            600_000.0,
+            10.0,
+            0.056,
+            40,
+            5,
+            1.0e-6,
+            1.0e-4,
+            1.0e-4,
+            True,
+        )
+
+    packed = solve(uniform_times, uniform_positions, uniform_velocities)
+    fallback = solve(irregular_times, irregular_positions, irregular_velocities)
+    assert packed[5].tolist() == fallback[5].tolist()
+    assert packed[6].tolist() == fallback[6].tolist()
+    assert bool(packed[5][1:-1].all())
+    for index in (3, 4, 7, 8, 12, 13):
+        np.testing.assert_allclose(
+            packed[index].detach().cpu().numpy(),
+            fallback[index].detach().cpu().numpy(),
+            rtol=0.0,
+            atol=1.0e-5,
+            equal_nan=True,
+        )
 
 
 @pytest.mark.skipif(
@@ -285,27 +473,76 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     assert telemetry["processed_point_count"] == 2
     assert telemetry["visit_counts"] == [1, 1]
 
+    # Use a nonlinear, physically valid orbit so one Newton update is
+    # insufficient under ordinary tolerances.  The target is constructed at
+    # an in-range time with a perpendicular look vector, making the exhausted
+    # lane stable for both packed uniform and generic Hermite interpolation.
+    finite_miss_times = 1.0e9 + torch.tensor(
+        [-20.0, -10.0, 0.0, 10.0, 20.0], dtype=dtype
+    )
+    finite_miss_relative_time = finite_miss_times - 1.0e9
+    finite_miss_positions = torch.stack(
+        (
+            7_000_000.0 + 0.01 * finite_miss_relative_time**3,
+            7_500.0 * finite_miss_relative_time + 0.1 * finite_miss_relative_time**3,
+            0.02 * finite_miss_relative_time**3,
+        ),
+        dim=1,
+    )
+    finite_miss_velocities = torch.stack(
+        (
+            0.03 * finite_miss_relative_time**2,
+            7_500.0 + 0.3 * finite_miss_relative_time**2,
+            0.06 * finite_miss_relative_time**2,
+        ),
+        dim=1,
+    )
+    finite_miss_position = torch.stack(
+        (
+            torch.tensor(7_000_000.0, dtype=dtype) + 0.01 * 15.0**3,
+            torch.tensor(7_500.0 * 15.0 + 0.1 * 15.0**3, dtype=dtype),
+            torch.tensor(0.02 * 15.0**3, dtype=dtype),
+        )
+    )
+    finite_miss_velocity = torch.stack(
+        (
+            torch.tensor(0.03 * 15.0**2, dtype=dtype),
+            torch.tensor(7_500.0 + 0.3 * 15.0**2, dtype=dtype),
+            torch.tensor(0.06 * 15.0**2, dtype=dtype),
+        )
+    )
+    finite_miss_radial = finite_miss_position / torch.linalg.vector_norm(
+        finite_miss_position
+    )
+    finite_miss_look = torch.linalg.cross(
+        finite_miss_velocity, finite_miss_radial, dim=0
+    )
+    finite_miss_look /= torch.linalg.vector_norm(finite_miss_look)
+    finite_miss_target = finite_miss_position + 650_000.0 * finite_miss_look
+    finite_miss_latitude, finite_miss_longitude, finite_miss_height = ecef_to_llh(
+        *(finite_miss_target.detach().cpu().numpy())
+    )
     finite_miss = module.geo2rdr_cpu(
-        torch.tensor([0.1], dtype=dtype),
-        torch.tensor([0.0], dtype=dtype),
-        torch.tensor([0.0], dtype=dtype),
-        times,
-        positions,
-        velocities,
+        torch.tensor([float(finite_miss_latitude)], dtype=dtype),
+        torch.tensor([float(finite_miss_longitude)], dtype=dtype),
+        torch.tensor([float(finite_miss_height)], dtype=dtype),
+        finite_miss_times,
+        finite_miss_positions,
+        finite_miss_velocities,
         0.0,
         1.0,
         600_000.0,
         10.0,
-        0.0555,
-        2,
+        0.056,
+        1,
         0,
-        1.0e9,
-        0.01,
-        1.0e-12,
+        1.0e-6,
+        1.0e-4,
+        1.0e-4,
         True,
     )
     assert not bool(finite_miss[5][0])
-    assert int(finite_miss[6][0]) == 2
+    assert int(finite_miss[6][0]) == 1
     assert bool(finite_miss[10][0])
     assert torch.isfinite(finite_miss[7][0])
 
@@ -328,8 +565,8 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
         0.1,
         True,
         dem,
-        -0.2,
-        -0.2,
+        -0.100001,
+        -0.100001,
         0.1,
         0.1,
         4,
@@ -341,6 +578,10 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     assert float(rdr[8][0]) < 1.0
     assert float(rdr[7][0]) == pytest.approx(float(rdr[12][0]))
     assert float(rdr[8][0]) == pytest.approx(float(rdr[12][0]))
+    dem_telemetry = module.native_v2_telemetry()
+    assert dem_telemetry["operation_symbol"] == "rdr2geo_cpu_dem"
+    assert dem_telemetry["processed_point_count"] == 1
+    assert dem_telemetry["visit_counts"] == [1]
     geo_source = (SOURCE_ROOT / "geo2rdr.cpp").read_text()
     assert "residual_range[point] = 0.0" not in geo_source
 
@@ -365,6 +606,7 @@ def test_serial_native_fixture_covers_invalid_lane_and_dem_path(tmp_path: Path) 
     assert int(exhausted[6][0]) == 1
     assert bool(exhausted[10][0])
     assert not bool(exhausted[5][0])
+    assert module.native_v2_telemetry()["operation_symbol"] == "rdr2geo_cpu"
 
 
 def test_serial_cpu_extension_returns_validated_fourteen_field_result(
@@ -406,6 +648,210 @@ def test_serial_cpu_extension_returns_validated_fourteen_field_result(
     assert telemetry["openmp_defined"] is False
     assert telemetry["runtime_name"] == "unknown"
     assert telemetry["visit_counts"] == [1]
+
+
+def test_rdr2geo_cpu_dem_accepts_full_2d_windows_and_negative_spacing(
+    serial_native_extension: object,
+) -> None:
+    """The native DEM sampler bounds a full 2-D stencil in either direction."""
+    torch = pytest.importorskip("torch")
+    dtype = torch.float64
+    extension = serial_native_extension
+    outputs = extension.rdr2geo_cpu_dem(
+        torch.tensor([0.0], dtype=dtype),
+        torch.tensor([2186.3], dtype=dtype),
+        torch.tensor([0.0], dtype=dtype),
+        torch.tensor([-10.0, 10.0], dtype=dtype),
+        torch.tensor(
+            [[7_000_000.0, -10_000.0, 0.0], [7_000_000.0, 10_000.0, 0.0]],
+            dtype=dtype,
+        ),
+        torch.tensor([[0.0, 1_000.0, 0.0], [0.0, 1_000.0, 0.0]], dtype=dtype),
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        0.0555,
+        20,
+        0,
+        0.01,
+        0.1,
+        True,
+        torch.arange(100.0, dtype=dtype).reshape(10, 10) + 100.0,
+        0.3,
+        0.3,
+        -0.1,
+        -0.1,
+        2,
+        0.001,
+    )
+
+    assert bool(outputs[5][0])
+    assert torch.isfinite(outputs[2][0])
+
+
+def test_rdr2geo_cpu_dem_invalid_context_uses_invalid_lane_sentinels(
+    serial_native_extension: object,
+) -> None:
+    """The fused DEM path matches legacy NaN sentinels for invalid points."""
+    torch = pytest.importorskip("torch")
+    dtype = torch.float64
+    extension = serial_native_extension
+    outputs = extension.rdr2geo_cpu_dem(
+        torch.tensor([0.0, float("nan")], dtype=dtype),
+        torch.tensor([2186.3, 2186.3], dtype=dtype),
+        torch.tensor([0.0, 25.0], dtype=dtype),
+        torch.tensor([-10.0, 10.0], dtype=dtype),
+        torch.tensor(
+            [[7_000_000.0, -10_000.0, 0.0], [7_000_000.0, 10_000.0, 0.0]],
+            dtype=dtype,
+        ),
+        torch.tensor([[0.0, 1_000.0, 0.0], [0.0, 1_000.0, 0.0]], dtype=dtype),
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        0.0555,
+        20,
+        0,
+        0.01,
+        0.1,
+        True,
+        torch.full((10, 10), 25.0, dtype=dtype),
+        0.3,
+        0.3,
+        -0.1,
+        -0.1,
+        3,
+        0.001,
+    )
+
+    assert not bool(outputs[5][1])
+    assert torch.isnan(outputs[0][1])
+    assert torch.isnan(outputs[1][1])
+    assert torch.isnan(outputs[2][1])
+    assert torch.isnan(outputs[3][1])
+    assert torch.isnan(outputs[4][1])
+    assert torch.isnan(outputs[8][1])
+    assert torch.isnan(outputs[12][1])
+    assert torch.isnan(outputs[13][1])
+
+
+def test_rdr2geo_cpu_dem_matches_final_constant_height_solve_for_2d_dem(
+    serial_native_extension: object,
+) -> None:
+    """Fused DEM passes preserve the final solve for a real two-dimensional DEM."""
+    torch = pytest.importorskip("torch")
+    dtype = torch.float64
+    extension = serial_native_extension
+    azimuth = torch.tensor([0.0, 0.1], dtype=dtype)
+    range_index = torch.tensor([2186.3, 2186.4], dtype=dtype)
+    seed = torch.zeros(2, dtype=dtype)
+    times = torch.tensor([-10.0, 10.0], dtype=dtype)
+    positions = torch.tensor(
+        [[7_000_000.0, -10_000.0, 0.0], [7_000_000.0, 10_000.0, 0.0]],
+        dtype=dtype,
+    )
+    velocities = torch.tensor([[0.0, 1_000.0, 0.0], [0.0, 1_000.0, 0.0]], dtype=dtype)
+    common = (
+        azimuth,
+        range_index,
+        times,
+        positions,
+        velocities,
+    )
+    dem = torch.full((10, 10), 25.0, dtype=dtype)
+    fused = extension.rdr2geo_cpu_dem(
+        common[0],
+        common[1],
+        seed,
+        common[2],
+        common[3],
+        common[4],
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        0.0555,
+        20,
+        0,
+        0.01,
+        0.1,
+        True,
+        dem,
+        0.3,
+        0.3,
+        -0.1,
+        -0.1,
+        3,
+        0.001,
+    )
+    assert bool(torch.all(fused[5]))
+    assert torch.all(fused[6] > 0)
+    assert torch.all(fused[6] <= 20)
+    assert torch.max(torch.abs(fused[12])) < 0.01
+    assert torch.max(torch.abs(fused[13])) < 1.0e-12
+    assert torch.allclose(fused[2], torch.full_like(seed, 25.0), atol=1.0e-6)
+
+
+def test_rdr2geo_cpu_dem_closes_variable_2d_dem_fixed_point(
+    serial_native_extension: object,
+) -> None:
+    """The fused path closes a variable two-dimensional DEM fixed point."""
+    torch = pytest.importorskip("torch")
+    dtype = torch.float64
+    extension = serial_native_extension
+    azimuth = torch.tensor([0.0, 0.1], dtype=dtype)
+    range_index = torch.tensor([2186.3, 2186.4], dtype=dtype)
+    seed = torch.zeros(2, dtype=dtype)
+    times = torch.tensor([-10.0, 10.0], dtype=dtype)
+    positions = torch.tensor(
+        [[7_000_000.0, -10_000.0, 0.0], [7_000_000.0, 10_000.0, 0.0]],
+        dtype=dtype,
+    )
+    velocities = torch.tensor([[0.0, 1_000.0, 0.0], [0.0, 1_000.0, 0.0]], dtype=dtype)
+    dem_start = 0.3
+    dem_spacing = -0.1
+    latitude = dem_start + dem_spacing * torch.arange(20, dtype=dtype)
+    longitude = dem_start + dem_spacing * torch.arange(20, dtype=dtype)
+    dem = 1_000.0 + 100.0 * latitude[:, None] + 50.0 * longitude[None, :]
+
+    args = (azimuth, range_index, times, positions, velocities)
+    fused = extension.rdr2geo_cpu_dem(
+        *args[:2],
+        seed,
+        *args[2:],
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        0.0555,
+        20,
+        0,
+        0.01,
+        0.1,
+        True,
+        dem,
+        dem_start,
+        dem_start,
+        dem_spacing,
+        dem_spacing,
+        4,
+        0.001,
+    )
+
+    assert bool(torch.all(fused[5]))
+    assert torch.all(fused[6] > 0)
+    assert torch.all(fused[6] <= 20)
+    dem_values = torch.stack(
+        [
+            1_000.0 + 100.0 * fused[0],
+            50.0 * fused[1],
+        ]
+    ).sum(dim=0)
+    assert torch.max(torch.abs(fused[2] - dem_values)) <= 1.0e-3
+    assert torch.max(torch.abs(fused[12])) < 0.01
+    assert torch.max(torch.abs(fused[13])) < 1.0e-12
 
 
 def test_rdr2geo_cpu_commits_the_input_height_on_convergence(
