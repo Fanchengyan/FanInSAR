@@ -211,6 +211,7 @@ class _RegisteredCandidate:
     correctness_qualified: bool
     performance_eligible: bool
     result_validator: ResultValidator | None
+    ecef_correctness_qualified: bool = False
     quarantined: bool = False
 
 
@@ -355,6 +356,7 @@ class Dispatcher:
         prepared: bool = True,
         result_validator: ResultValidator | None = None,
         native_module: object | None = None,
+        ecef_correctness_qualified: bool = False,
     ) -> None:
         """Publish one prepared candidate, atomically superseding its slot.
 
@@ -377,6 +379,10 @@ class Dispatcher:
             recoverable in ``auto`` and quarantine the candidate.
         native_module : object or None, optional
             Strongly retained module handle for native artifact lifetime.
+        ecef_correctness_qualified : bool, optional
+            Independent correctness gate for an alternate ECEF result route.
+            It defaults to false so native ECEF cannot inherit qualification
+            from the ordinary fourteen-field result route.
 
         """
         _require_prepared_key(key)
@@ -395,6 +401,7 @@ class Dispatcher:
             correctness_qualified=bool(correctness_qualified),
             performance_eligible=bool(performance_eligible),
             result_validator=result_validator,
+            ecef_correctness_qualified=bool(ecef_correctness_qualified),
         )
         if native_module is not None:
             pin_native_module(native_module)
@@ -493,6 +500,140 @@ class Dispatcher:
         )
         return result
 
+    def dispatch_alternate(
+        self,
+        key: CandidateKeyProtocol,
+        mode: DispatchMode,
+        alternate_executors: Mapping[Backend, Callable[..., object]],
+        eager_executor: Callable[..., object],
+        result_validator: Callable[[object], object],
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        """Dispatch an alternate typed result through the same candidate policy.
+
+        The candidate eligibility, quarantine, CUDA failure classification, and
+        fallback order are identical to :meth:`dispatch`; only the callable
+        associated with each selected backend differs.  The alternate result is
+        validated by its own typed boundary after this method returns.
+        """
+        if mode not in ("auto", "native", "compile", "eager"):
+            logger.error("unknown alternate dispatch mode %r", mode)
+            raise DispatchError(f"unknown dispatch mode: {mode}")
+
+        def validate_alternate(value: object) -> object:
+            """Convert malformed typed alternate payloads into recoverable errors."""
+            try:
+                return result_validator(value)
+            except (
+                CudaExecutionError,
+                FatalExecutionError,
+                RecoverableExecutionError,
+            ):
+                raise
+            except Exception as error:
+                logger.exception("alternate geometry result validation failed")
+                raise IncorrectResultError(
+                    "alternate geometry executor returned a malformed result"
+                ) from error
+
+        if mode == "eager":
+            result = validate_alternate(eager_executor(*args, **kwargs))
+            self.records.append(DispatchRecord("eager", None))
+            return result
+        if mode in ("native", "compile"):
+            candidate = self._exact_candidate(key)
+            if candidate is None or candidate.key.backend != mode:
+                logger.error("no exact prepared %s alternate candidate", mode)
+                raise DispatchError(f"no exact prepared {mode} candidate for key")
+            unavailable_ecef = (
+                mode == "native" and not candidate.ecef_correctness_qualified
+            )
+            if (
+                not candidate.correctness_qualified
+                or unavailable_ecef
+                or candidate.quarantined
+            ):
+                logger.error(
+                    "exact prepared %s alternate candidate is unavailable", mode
+                )
+                if unavailable_ecef and candidate.correctness_qualified:
+                    raise DispatchError("native ECEF candidate is unavailable")
+                raise DispatchError(f"prepared {mode} candidate is unavailable")
+            executor = alternate_executors.get(mode)
+            if executor is None:
+                logger.error("no alternate executor is available for %s", mode)
+                raise DispatchError(f"no alternate {mode} executor is available")
+            result = self._execute_candidate(
+                candidate,
+                *args,
+                executor_override=executor,
+                validate=False,
+                wrap_untyped_cpu_errors=False,
+                **kwargs,
+            )
+            result = validate_alternate(result)
+            self.records.append(DispatchRecord(mode, candidate.key))
+            return result
+
+        identity = _scientific_profile_key(key)
+        candidates = [
+            candidate
+            for backend in ("native", "compile")
+            for candidate in self._candidates.values()
+            if _scientific_profile_key(candidate.key) == identity
+            and candidate.key.backend == backend
+            and candidate.correctness_qualified
+            and (
+                candidate.key.backend != "native"
+                or candidate.ecef_correctness_qualified
+            )
+            and candidate.performance_eligible
+            and not candidate.quarantined
+        ]
+        for candidate in candidates:
+            executor = alternate_executors.get(candidate.key.backend)
+            if executor is None:
+                continue
+            try:
+                result = self._execute_candidate(
+                    candidate,
+                    *args,
+                    executor_override=executor,
+                    validate=False,
+                    wrap_untyped_cpu_errors=True,
+                    **kwargs,
+                )
+                result = validate_alternate(result)
+            except CudaExecutionError as error:
+                if not error.recoverable:
+                    raise
+                candidate.quarantined = True
+            except RecoverableExecutionError:
+                candidate.quarantined = True
+            else:
+                self.records.append(
+                    DispatchRecord(
+                        candidate.key.backend,
+                        candidate.key,
+                        "recoverable quarantine"
+                        if candidate is not candidates[0]
+                        else None,
+                    )
+                )
+                return result
+        result = validate_alternate(eager_executor(*args, **kwargs))
+        self.records.append(
+            DispatchRecord(
+                "eager",
+                None,
+                "no eligible prepared candidate"
+                if not candidates
+                else "quarantined prepared candidates",
+            )
+        )
+        return result
+
     def _exact_candidate(
         self, key: CandidateKeyProtocol
     ) -> _RegisteredCandidate | None:
@@ -504,11 +645,18 @@ class Dispatcher:
         return candidate
 
     def _execute_candidate(
-        self, candidate: _RegisteredCandidate, *args: object, **kwargs: object
+        self,
+        candidate: _RegisteredCandidate,
+        *args: object,
+        executor_override: Callable[..., object] | None = None,
+        validate: bool = True,
+        wrap_untyped_cpu_errors: bool = True,
+        **kwargs: object,
     ) -> object:
         """Execute and validate one prepared candidate."""
         try:
-            result = candidate.executor(*args, **kwargs)
+            executor = executor_override or candidate.executor
+            result = executor(*args, **kwargs)
         except (
             CudaExecutionError,
             FatalExecutionError,
@@ -535,7 +683,11 @@ class Dispatcher:
                     phase="synchronized",
                     context_healthy=False,
                 ) from error
+            if not wrap_untyped_cpu_errors:
+                raise
             raise RecoverableExecutionError(str(error)) from error
+        if not validate:
+            return result
         return self._validate_result(result, candidate.result_validator, candidate.key)
 
     def _execute_eager(

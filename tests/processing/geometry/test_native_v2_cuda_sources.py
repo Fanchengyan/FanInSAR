@@ -49,6 +49,10 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
     assert "old_llh[1] / kDegreesToRadians" in rdr2geo
     assert "old_llh[0] / kDegreesToRadians" in rdr2geo
     assert "height = new_height" in rdr2geo
+    assert "previous_fixed_height" in rdr2geo
+    assert "aitken_enabled" in rdr2geo
+    assert "final_dem_converged" in rdr2geo
+    assert "!(ellipsoid_height - height < target)" in rdr2geo
     assert "pop_back" in geo2rdr
     assert "pop_back" in rdr2geo
     assert "prepare_rdr2geo_contexts_kernel" in rdr2geo
@@ -66,6 +70,7 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
     assert "rdr2geo_tcn_kernel<<<worker_blocks" in rdr2geo
     assert "rdr2geo_tcn_cuda_v2_with_visit_counts_row_width" in rdr2geo
     assert "rdr2geo_tcn_cuda_v2_with_visit_counts_row_width" in common
+    assert "rdr2geo_tcn_cuda_v2_with_ecef" in common
     assert "row_width" in binding
     assert "azimuth.narrow" in binding
     assert "row_width = 1" in binding
@@ -89,12 +94,11 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
 
 
 def test_cuda_rdr2geo_exhaustion_uses_common_final_publication() -> None:
-    """Budget exhaustion publishes the final state without marking it solved."""
+    """Budget exhaustion publishes a solved final state when its residual passes."""
     source = (CUDA_SOURCE_ROOT / "rdr2geo_tcn_cuda.cu").read_text()
 
-    assert (
-        "const bool publish_converged = final_converged && !budget_exhausted;" in source
-    )
+    assert "const bool publish_converged = final_converged;" in source
+    assert "!final_converged && !budget_exhausted && !solved" in source
     assert (
         "iterations[point] = budget_exhausted ? "
         "static_cast<int32_t>(budget) : attempts;" in source
@@ -117,7 +121,26 @@ def test_cuda_direct_array_fixture_matches_result_contract(tmp_path: Path) -> No
 #include "geometry_cuda.cuh"
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("geo2rdr", &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2);
-  module.def("rdr2geo", &faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2);
+    module.def("rdr2geo", &faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2);
+    module.def("rdr2geo_ecef", [](py::args args) {
+          TORCH_CHECK(args.size() == 24, "rdr2geo_ecef expects 24 arguments");
+          auto tensor = [&](size_t index) { return args[index].cast<torch::Tensor>(); };
+          auto point = [&](size_t index) { return tensor(index).reshape({-1}); };
+      auto scalar = [&](size_t index) { return args[index].cast<double>(); };
+      auto integer = [&](size_t index) { return args[index].cast<int64_t>(); };
+      auto result = faninsar::geometry::cuda_v2::rdr2geo_tcn_cuda_v2_with_ecef(
+              point(0), point(1), point(2), tensor(3), tensor(4), tensor(5),
+          scalar(6), scalar(7), scalar(8), scalar(9), tensor(10), scalar(11),
+          scalar(12), scalar(13), scalar(14), scalar(15), scalar(16),
+          scalar(17), scalar(18), scalar(19), scalar(20), integer(21),
+          integer(22), args[23].cast<bool>());
+          result.pop_back();
+          TORCH_CHECK(result.size() == 17, "ECEF fixture ABI must return 17 fields");
+          if (tensor(0).dim() == 2) {
+            for (auto& field : result) field = field.reshape(tensor(0).sizes());
+          }
+          return result;
+    });
   module.def("geo2rdr_visit_counts",
              &faninsar::geometry::cuda_v2::geo2rdr_cuda_v2_visit_counts);
   module.def("rdr2geo_visit_counts",
@@ -226,6 +249,150 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     assert int(radar[6][1]) == -1
     assert all(torch.isnan(radar[index][1]) for index in RESULT_FLOAT_FIELDS)
 
+    ecef = module.rdr2geo_ecef(
+        torch.tensor([0.0, 20.0, float("nan")], dtype=dtype, device=device),
+        torch.tensor([2186.3, 2186.3, 2186.3], dtype=dtype, device=device),
+        torch.zeros(3, dtype=dtype, device=device),
+        times,
+        positions,
+        velocities,
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        torch.empty((), dtype=dtype, device=device),
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        100.0,
+        -1_000.0,
+        1_000.0,
+        0.056,
+        0.1,
+        1.0e-4,
+        20,
+        5,
+        True,
+    )
+    assert len(ecef) == 17
+    for index in range(14):
+        torch.testing.assert_close(ecef[index], radar[index], equal_nan=True)
+    assert all(torch.isnan(ecef[index][2]) for index in (14, 15, 16))
+    latitude = radar[0][0] * torch.pi / 180.0
+    longitude = radar[1][0] * torch.pi / 180.0
+    height = radar[2][0]
+    sine = torch.sin(latitude)
+    radius = 6_378_137.0 / torch.sqrt(1.0 - 6.6943799901413165e-3 * sine * sine)
+    expected = torch.stack(
+        (
+            (radius + height) * torch.cos(latitude) * torch.cos(longitude),
+            (radius + height) * torch.cos(latitude) * torch.sin(longitude),
+            (radius * (1.0 - 6.6943799901413165e-3) + height) * sine,
+        )
+    )
+    torch.testing.assert_close(
+        torch.stack((ecef[14][0], ecef[15][0], ecef[16][0])),
+        expected,
+        # The closed-form ECEF -> LLH publication is not bitwise invertible;
+        # ECEF remains authoritative and is checked against the published LLH
+        # within the observed sub-decimetre conversion round trip.
+        atol=0.1,
+        rtol=1.0e-12,
+    )
+
+    two_d = module.rdr2geo_ecef(
+        torch.tensor([[0.0, 20.0], [0.0, 20.0]], dtype=dtype, device=device),
+        torch.full((2, 2), 2186.3, dtype=dtype, device=device),
+        torch.zeros((2, 2), dtype=dtype, device=device),
+        times,
+        positions,
+        velocities,
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        torch.empty((), dtype=dtype, device=device),
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        100.0,
+        -1_000.0,
+        1_000.0,
+        0.056,
+        0.1,
+        1.0e-4,
+        20,
+        5,
+        True,
+    )
+    assert all(value.shape == (2, 2) for value in two_d)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        streamed = module.rdr2geo_ecef(
+            torch.zeros((2, 2), dtype=dtype, device=device),
+            torch.full((2, 2), 2186.3, dtype=dtype, device=device),
+            torch.zeros((2, 2), dtype=dtype, device=device),
+            times,
+            positions,
+            velocities,
+            0.0,
+            1.0,
+            600_000.0,
+            10.0,
+            torch.empty((), dtype=dtype, device=device),
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            100.0,
+            -1_000.0,
+            1_000.0,
+            0.056,
+            0.1,
+            1.0e-4,
+            20,
+            5,
+            True,
+        )
+    stream.synchronize()
+    assert all(torch.isfinite(value).all() for value in streamed[14:17])
+
+    # The target boundary is strict: an ellipsoid-height seed exactly on the
+    # target must be rejected before attempting a TCN construction.
+    eta = 1.0 / ((7_000_000.0 / 6378137.0) ** 2) ** 0.5
+    ellipsoid_height = (1.0 - eta) * 7_000_000.0
+    exact_boundary = module.rdr2geo(
+        torch.tensor([0.0], dtype=dtype, device=device),
+        torch.tensor([0.0], dtype=dtype, device=device),
+        torch.zeros(1, dtype=dtype, device=device),
+        times,
+        positions,
+        velocities,
+        0.0,
+        1.0,
+        ellipsoid_height,
+        10.0,
+        torch.empty((), dtype=dtype, device=device),
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        0.0,
+        -1_000.0,
+        1_000.0,
+        0.056,
+        0.1,
+        1.0e-4,
+        20,
+        5,
+        True,
+    )
+    assert not bool(exact_boundary[5][0])
+    assert int(exact_boundary[6][0]) == -1
+    assert all(torch.isnan(exact_boundary[index][0]) for index in RESULT_FLOAT_FIELDS)
+
     variable_dem = 100.0 + 0.01 * torch.arange(64, dtype=dtype, device=device).reshape(
         8, 8
     )
@@ -290,4 +457,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     )
     assert not bool(out_of_bounds[5][0])
     assert torch.isnan(out_of_bounds[0][0])
-    assert int(out_of_bounds[6][0]) == 0
+    assert int(out_of_bounds[6][0]) == -1
+
+    # A sharp local DEM fixture makes the first fixed-point result finite but
+    # causes the authoritative final DEM recheck to fail.  The lane must stay
+    # published with diagnostics instead of being dropped as NaN.
+    final_recheck_dem = torch.full((64, 64), 142.0, dtype=dtype, device=device)
+    final_recheck_dem[5, 5] = 100.0
+    final_recheck = module.rdr2geo(
+        torch.tensor([0.0], dtype=dtype, device=device),
+        torch.tensor([2186.3], dtype=dtype, device=device),
+        torch.tensor([99.999], dtype=dtype, device=device),
+        times,
+        positions,
+        velocities,
+        0.0,
+        1.0,
+        600_000.0,
+        10.0,
+        final_recheck_dem,
+        -0.005000000000108518,
+        -0.10123992237526709,
+        0.001,
+        0.001,
+        100.0,
+        -1.0e12,
+        1.0e12,
+        0.056,
+        1.0e9,
+        0.1,
+        25,
+        15,
+        True,
+    )
+    assert not bool(final_recheck[5][0])
+    assert 0 < int(final_recheck[6][0]) < 40
+    assert not bool(final_recheck[10][0])
+    assert all(torch.isfinite(final_recheck[index][0]) for index in RESULT_FLOAT_FIELDS)

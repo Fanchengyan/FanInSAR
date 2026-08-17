@@ -269,13 +269,13 @@ def test_torch_ampcor_even_median_stays_in_torch(
         (np.dtype(np.float32), 3.0, 3.0),
     ],
 )
-def test_torch_ampcor_allowed_dtypes_convert_to_float32_magnitude(
+def test_torch_ampcor_allowed_dtypes_convert_to_float64_magnitude(
     monkeypatch: pytest.MonkeyPatch,
     dtype: np.dtype,
     value: complex,
     expected_magnitude: float,
 ) -> None:
-    """Allowed Torch inputs become contiguous float32 magnitude batches."""
+    """Allowed Torch inputs become contiguous float64 magnitude batches."""
     torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets as offsets_mod
 
@@ -314,7 +314,7 @@ def test_torch_ampcor_allowed_dtypes_convert_to_float32_magnitude(
 
     assert result.n_valid == 1
     reference_batch = captured["reference"]
-    assert reference_batch.dtype == torch.float32
+    assert reference_batch.dtype == torch.float64
     assert reference_batch.is_contiguous()
     torch.testing.assert_close(
         reference_batch,
@@ -322,10 +322,10 @@ def test_torch_ampcor_allowed_dtypes_convert_to_float32_magnitude(
     )
 
 
-def test_full_iw1_shape_numpy_accepts_view_torch_rejects_it(
+def test_full_iw1_shape_rejects_overlapping_view(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """NumPy accepts a large strided view while Torch rejects it before work."""
+    """Malformed overlapping views fail closed before Torch copies them."""
     pytest.importorskip("torch")
     from faninsar.processing.coreg import geometry_coreg
 
@@ -351,10 +351,7 @@ def test_full_iw1_shape_numpy_accepts_view_torch_rejects_it(
         "device": "cpu",
     }
 
-    numpy_result = estimate_patch_amplitude_shift(samples, samples, **kwargs)
-    assert numpy_result.n_attempted == 1
-
-    with pytest.raises(InvalidProcessingStateError, match="C-contiguous"):
+    with pytest.raises(InvalidProcessingStateError, match="overlapping"):
         estimate_patch_amplitude_shift(
             samples,
             samples,
@@ -391,7 +388,7 @@ def test_full_iw1_shape_numpy_accepts_view_torch_rejects_it(
     )
     with pytest.raises(
         InvalidProcessingStateError,
-        match="only float32 or complex64",
+        match=r"overlapping|out-of-bounds|only float32 or complex64",
     ):
         estimate_patch_amplitude_shift(
             oversized,
@@ -401,27 +398,88 @@ def test_full_iw1_shape_numpy_accepts_view_torch_rejects_it(
         )
 
 
-def test_ampcor_rejects_large_backing_noncontiguous_torch_view() -> None:
-    """Torch admission rejects a large positive-stride view before tiling."""
+def test_ampcor_copies_safe_noncontiguous_torch_view() -> None:
+    """Torch admission copies a bounded, non-overlapping positive-stride view."""
     backing = np.ones((256, 2048), dtype=np.complex64)
     view = backing[:, ::2]
     assert view.nbytes > 1_000_000
     assert not view.flags.c_contiguous
 
-    with pytest.raises(InvalidProcessingStateError, match="C-contiguous"):
+    result = estimate_patch_amplitude_shift(
+        view,
+        view,
+        executor="torch",
+        device="cpu",
+        window_az=16,
+        window_rg=32,
+        search_az=4,
+        search_rg=4,
+        n_az=1,
+        n_rg=1,
+        margin_rg=32,
+        margin_az=32,
+    )
+    assert result.n_attempted == 1
+
+
+def test_ampcor_conversion_preflight_rejects_before_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized compatibility copies fail before ``np.array`` allocation."""
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    samples = np.ones((16, 32), dtype=np.complex64)[:, ::2]
+    monkeypatch.setattr(offsets_mod, "_TORCH_AMPCOR_CONVERSION_CAP_BYTES", 1)
+    monkeypatch.setattr(
+        offsets_mod.np,
+        "array",
+        lambda *_args, **_kwargs: pytest.fail("conversion preflight allocated"),
+    )
+    with pytest.raises(InvalidProcessingStateError, match="conversion"):
         estimate_patch_amplitude_shift(
-            view,
-            view,
+            samples,
+            samples,
             executor="torch",
             device="cpu",
-            window_az=16,
-            window_rg=32,
-            search_az=4,
-            search_rg=4,
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
             n_az=1,
             n_rg=1,
             margin_rg=16,
-            margin_az=16,
+            margin_az=8,
+        )
+
+
+def test_ampcor_public_workspace_limits_conversion_before_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Public workspace limits apply before compatibility copy allocation."""
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    samples = np.ones((16, 32), dtype=np.complex64)[:, ::2]
+    monkeypatch.setattr(
+        offsets_mod.np,
+        "array",
+        lambda *_args, **_kwargs: pytest.fail("conversion preflight allocated"),
+    )
+    with pytest.raises(InvalidProcessingStateError, match="conversion"):
+        estimate_patch_amplitude_shift(
+            samples,
+            samples,
+            executor="torch",
+            device="cpu",
+            batch_size=1,
+            max_workspace_bytes=1,
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=1,
+            margin_rg=16,
+            margin_az=8,
         )
 
 
@@ -854,72 +912,119 @@ def test_ampcor_rejects_non_array_inputs_before_shape_access() -> None:
         np.ones((32, 48), dtype=object),
     ],
 )
-def test_ampcor_rejects_unsupported_input_dtype(samples: np.ndarray) -> None:
-    """Ampcor does not silently cast integer or object input arrays."""
-    with pytest.raises(InvalidProcessingStateError, match=r"dtype .* unsupported"):
-        estimate_patch_amplitude_shift(
-            samples,
-            samples,
-            executor="torch",
-            device="cpu",
-        )
+def test_ampcor_compatibility_casts_numeric_input_dtype(samples: np.ndarray) -> None:
+    """The compatibility spelling narrows supported numeric inputs for Torch."""
+    kwargs = {
+        "window_az": 8,
+        "window_rg": 16,
+        "search_az": 2,
+        "search_rg": 2,
+        "n_az": 1,
+        "n_rg": 1,
+        "margin_rg": 16,
+        "margin_az": 8,
+        "executor": "torch",
+        "device": "cpu",
+    }
+    if samples.dtype.kind == "O" or samples.dtype == np.dtype(np.float16):
+        with pytest.raises(InvalidProcessingStateError, match=r"dtype .* unsupported"):
+            estimate_patch_amplitude_shift(samples, samples, **kwargs)
+        return
+    result = estimate_patch_amplitude_shift(samples, samples, **kwargs)
+    assert result.n_attempted == 1
 
 
-@pytest.mark.parametrize(
-    ("dtype", "value"),
-    [
-        (np.float64, np.finfo(np.float64).max),
-        (np.complex128, complex(np.finfo(np.float64).max, 1.0)),
-    ],
-)
-def test_torch_rejects_extreme_high_precision_inputs_before_tile_or_device_work(
+def test_ampcor_complex128_magnitude_keeps_float64_precision(
     monkeypatch: pytest.MonkeyPatch,
-    dtype: type[np.generic],
-    value: complex,
 ) -> None:
-    """Torch rejects float64/complex128 before tiles or device setup."""
-    pytest.importorskip("torch")
+    """Torch preserves a complex128 magnitude below float32 resolution."""
+    torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets as offsets_mod
 
-    samples = np.full((64, 96), value, dtype=dtype)
-    monkeypatch.setattr(
-        offsets_mod,
-        "_ampcor_magnitude_tile",
-        lambda *_args, **_kwargs: pytest.fail("Torch dtype gate ran after tile work"),
-    )
-    monkeypatch.setattr(
-        offsets_mod,
-        "_canonical_torch_device",
-        lambda *_args, **_kwargs: pytest.fail("Torch dtype gate ran after device work"),
-    )
-    with pytest.raises(InvalidProcessingStateError, match="only float32 or complex64"):
-        estimate_patch_amplitude_shift(
-            samples,
-            samples,
-            window_az=8,
-            window_rg=16,
-            search_az=2,
-            search_rg=2,
-            n_az=1,
-            n_rg=1,
-            margin_rg=16,
-            margin_az=8,
-            executor="torch",
-            device="cpu",
+    tiny = 2.0**-25
+    samples = np.ones((64, 96), dtype=np.complex128)
+    samples[16, 12] = 1.0 + 1j * tiny
+    captured: dict[str, object] = {}
+
+    def fake_ncc(
+        ref_windows: object,
+        _sec_searches: object,
+        **_kwargs: object,
+    ) -> tuple[object, object, object]:
+        captured["reference"] = ref_windows.detach().cpu()
+        count = ref_windows.shape[0]
+        return (
+            torch.zeros(count, dtype=torch.float64),
+            torch.zeros(count, dtype=torch.float64),
+            torch.full((count,), 10.0, dtype=torch.float64),
         )
 
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_patch_ncc_batch",
+        fake_ncc,
+    )
+    result = estimate_patch_amplitude_shift(
+        samples,
+        samples,
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=1,
+        margin_rg=20,
+        margin_az=20,
+        executor="torch",
+        device="cpu",
+    )
+    reference_batch = captured["reference"]
+    oracle = np.hypot(1.0, tiny)
+    assert result.n_valid == 1
+    assert reference_batch.dtype == torch.float64
+    assert float(reference_batch[0, 0, 0]) == pytest.approx(oracle, abs=0.0)
+    assert float(reference_batch[0, 0, 0]) > 1.0
 
-def test_ampcor_rejects_negative_stride_inputs() -> None:
-    """Ampcor rejects reversed views before materializing any tiles."""
+
+def test_ampcor_copies_negative_stride_inputs() -> None:
+    """Ampcor copies a safe reversed view before materializing tiles."""
     samples = np.ones((32, 48), dtype=np.complex64)
     reversed_samples = samples[:, ::-1]
-    with pytest.raises(InvalidProcessingStateError, match="negative strides"):
-        estimate_patch_amplitude_shift(
-            reversed_samples,
-            reversed_samples,
-            executor="torch",
-            device="cpu",
-        )
+    result = estimate_patch_amplitude_shift(
+        reversed_samples,
+        reversed_samples,
+        executor="torch",
+        device="cpu",
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=1,
+        margin_rg=16,
+        margin_az=8,
+    )
+    assert result.n_attempted == 1
+
+
+def test_ampcor_numpy_compatibility_spelling_uses_torch_limits() -> None:
+    """The NumPy spelling remains a usable explicit CPU compatibility lane."""
+    samples = np.ones((64, 96), dtype=np.complex64)
+    result = estimate_patch_amplitude_shift(
+        samples,
+        samples,
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=1,
+        margin_rg=16,
+        margin_az=8,
+        batch_size=0,
+        max_workspace_bytes=0,
+    )
+    assert result.n_attempted == 1
 
 
 def test_ampcor_numpy_path_does_not_apply_torch_admission_limits() -> None:
@@ -1039,28 +1144,28 @@ def test_ampcor_numpy_retains_dtype_and_stride_compatibility(
     assert result.n_attempted == 1
 
 
-def test_ampcor_torch_rejects_non_owning_c_contiguous_view() -> None:
-    """Torch admission rejects views whose backing allocation outlives the view."""
+def test_ampcor_torch_copies_non_owning_c_contiguous_view() -> None:
+    """Torch admission copies a safe C-contiguous view once."""
     samples = np.ones((64, 96), dtype=np.complex64)
     view = samples.view()
     assert view.flags.c_contiguous
     assert not view.flags.owndata
 
-    with pytest.raises(InvalidProcessingStateError, match="own its storage"):
-        estimate_patch_amplitude_shift(
-            view,
-            view,
-            executor="torch",
-            device="cpu",
-            window_az=8,
-            window_rg=16,
-            search_az=2,
-            search_rg=2,
-            n_az=1,
-            n_rg=1,
-            margin_rg=16,
-            margin_az=8,
-        )
+    result = estimate_patch_amplitude_shift(
+        view,
+        view,
+        executor="torch",
+        device="cpu",
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=1,
+        margin_rg=16,
+        margin_az=8,
+    )
+    assert result.n_attempted == 1
 
 
 def test_ampcor_repeated_shape_calls_release_cache_and_admission(
@@ -1167,6 +1272,7 @@ def test_ampcor_policy_auto_without_cuda_keeps_executor(
     from faninsar.processing.coreg import resolve_ampcor_policy
 
     monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
+    assert resolve_ampcor_policy("auto", "cpu") == ("numpy", "cpu")
     assert resolve_ampcor_policy("torch", "auto") == ("torch", "cpu")
     assert resolve_ampcor_policy("numpy", "auto") == ("numpy", "cpu")
     assert resolve_ampcor_policy("torch", "gpu") == ("torch", "cpu")
@@ -1196,9 +1302,191 @@ def test_ampcor_policy_canonicalizes_cuda_aliases_and_rejects_mps(
     monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     assert resolve_ampcor_policy("torch", "cuda:00") == ("torch", "cuda:0")
-    assert resolve_ampcor_policy("numpy", "cuda") == ("torch", "cuda")
     with pytest.raises(InvalidProcessingStateError, match="not a qualified Ampcor"):
         resolve_ampcor_policy("torch", "mps")
+
+
+def test_torch_ncc_integral_energy_matches_direct_oracle() -> None:
+    """Torch NCC uses direct float64 rectangular local-energy sums."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    reference = torch.tensor(
+        [[[1.0, -2.0, 0.5], [3.0, 4.0, -1.5]]], dtype=torch.float32
+    )
+    secondary = torch.tensor(
+        [
+            [0.5, -1.0, 2.0, 1.5, -0.25],
+            [3.0, 0.25, -2.0, 4.0, 1.0],
+            [-1.5, 2.5, 0.0, -0.5, 3.5],
+            [2.0, -3.0, 1.25, 0.75, -2.5],
+        ],
+        dtype=torch.float32,
+    )[None]
+    search_az = 1
+    search_rg = 1
+    d_rg, d_az, snr = offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=search_az,
+        search_rg=search_rg,
+        subpixel=False,
+    )
+
+    ref = reference.to(dtype=torch.float64)
+    sec = secondary.to(dtype=torch.float64)
+    ref = ref - ref.mean(dim=(-2, -1), keepdim=True)
+    sec = sec - sec.mean(dim=(-2, -1), keepdim=True)
+    ref = ref / torch.linalg.vector_norm(ref, dim=(-2, -1), keepdim=True)
+    expected_ncc = torch.empty((3, 3), dtype=torch.float64)
+    for az in range(3):
+        for rg in range(3):
+            window = sec[0, az : az + 2, rg : rg + 3]
+            expected_ncc[az, rg] = (ref[0] * window).sum() / torch.sqrt(
+                (window * window).sum()
+            )
+    peak = torch.argmax(expected_ncc.reshape(-1))
+    peak_az, peak_rg = np.unravel_index(int(peak), expected_ncc.shape)
+    sidelobe = expected_ncc.clone()
+    sidelobe[
+        max(peak_az - 1, 0) : min(peak_az + 2, 3),
+        max(peak_rg - 1, 0) : min(peak_rg + 2, 3),
+    ] = torch.nan
+    expected_snr = expected_ncc[peak_az, peak_rg] / torch.nanmean(sidelobe.abs())
+
+    assert float(d_rg[0]) == peak_rg - search_rg
+    assert float(d_az[0]) == peak_az - search_az
+    assert float(snr[0]) == pytest.approx(float(expected_snr), abs=1e-12)
+
+
+def test_torch_ncc_keeps_only_correlation_fft(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Safe local energy uses only the two correlation FFT transforms."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    calls = 0
+    original_rfft2 = torch.fft.rfft2
+
+    def count_rfft2(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original_rfft2(*args, **kwargs)
+
+    monkeypatch.setattr(torch.fft, "rfft2", count_rfft2)
+    offsets_mod._torch_patch_ncc_batch(
+        torch.arange(6, dtype=torch.float32).reshape(1, 2, 3),
+        torch.arange(20, dtype=torch.float32).reshape(1, 4, 5),
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+    )
+    assert calls == 2
+
+
+def test_torch_ncc_risky_energy_uses_fft_fallback_for_whole_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A high-dynamic-range chip uses the legacy FFT energy for every lane."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    reference = torch.tensor(
+        [[[1.0, -2.0, 0.5], [3.0, 4.0, -1.5]]], dtype=torch.float32
+    )
+    secondary = torch.tensor(
+        [
+            [1.0e8, -1.0e8, 2.0e8, 1.5e8, -2.5e7],
+            [3.0e8, 2.5e7, -2.0e8, 4.0e8, 1.0e8],
+            [-1.5e8, 2.5e8, 0.0, -5.0e7, 3.5e8],
+            [2.0e8, -3.0e8, 1.25e8, 7.5e7, -2.5e8],
+        ],
+        dtype=torch.float32,
+    )[None]
+
+    calls = 0
+    original_rfft2 = torch.fft.rfft2
+
+    def count_rfft2(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original_rfft2(*args, **kwargs)
+
+    monkeypatch.setattr(torch.fft, "rfft2", count_rfft2)
+    actual = offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+    )
+    assert calls == 4
+    assert all(torch.isfinite(value).all() for value in actual[:2])
+
+    # Compare against the same-device FFT-energy oracle explicitly.  This
+    # also verifies that the batch-level decision does not mix energy paths.
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_integral_energy_is_safe",
+        lambda *_: None,
+    )
+    expected = offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+    )
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_value, expected_value, equal_nan=True)
+
+
+def test_torch_ncc_integral_output_guard_handles_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tiny local energy remains stable when large values cancel nearby."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    reference = torch.tensor(
+        [[[1.0, -2.0, 0.5], [3.0, 4.0, -1.5]]], dtype=torch.float32
+    )
+    secondary = torch.full((1, 4, 5), 1.0e-3, dtype=torch.float32)
+    secondary[0, 0, 4] = 5.0e5
+    secondary[0, 3, 0] = -5.0e5
+
+    calls = 0
+    original_rfft2 = torch.fft.rfft2
+
+    def count_rfft2(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original_rfft2(*args, **kwargs)
+
+    monkeypatch.setattr(torch.fft, "rfft2", count_rfft2)
+    actual = offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+    )
+    assert calls == 4
+    assert all(torch.isfinite(value).all() for value in actual[:2])
+
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_integral_energy_is_safe",
+        lambda *_: None,
+    )
+    expected = offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=1,
+        search_rg=1,
+        subpixel=False,
+    )
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_value, expected_value, equal_nan=True)
 
 
 @pytest.mark.parametrize("executor", [None, [], "jax"])
@@ -1290,7 +1578,7 @@ def test_ampcor_auto_cuda_does_not_run_host_numpy(
 def test_ampcor_seed_123_boundary_is_parity_stable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Seed-123 boundary values use the same strict oracle in both executors."""
+    """Seed-123 boundary values keep strict Torch culling semantics."""
     torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets as offsets_mod
 
@@ -1299,18 +1587,6 @@ def test_ampcor_seed_123_boundary_is_parity_stable(
     snr_below = snr_threshold
     for _ in range(32):
         snr_below = np.nextafter(snr_below, 0.0)
-    numpy_values = iter(
-        [
-            (0.25, -0.25, float(snr_threshold)),
-            (0.5, -0.5, float(snr_below)),
-        ]
-    )
-
-    monkeypatch.setattr(
-        offsets_mod,
-        "_patch_ncc_shift",
-        lambda *_args, **_kwargs: next(numpy_values),
-    )
     samples = np.ones((64, 96), dtype=np.complex64)
     kwargs = {
         "window_az": 8,
@@ -1325,14 +1601,6 @@ def test_ampcor_seed_123_boundary_is_parity_stable(
         "max_abs_residual": 1.2,
         "device": "cpu",
     }
-    numpy_result = estimate_patch_amplitude_shift(samples, samples, **kwargs)
-
-    numpy_values = iter(
-        [
-            (0.25, -0.25, float(snr_threshold)),
-            (0.5, -0.5, float(snr_below)),
-        ]
-    )
     monkeypatch.setattr(
         offsets_mod,
         "_torch_patch_ncc_batch",
@@ -1342,22 +1610,27 @@ def test_ampcor_seed_123_boundary_is_parity_stable(
             torch.tensor([snr_threshold, snr_below], dtype=torch.float64),
         ),
     )
-    torch_result = estimate_patch_amplitude_shift(
+    monkeypatch.setattr(
+        offsets_mod,
+        "_patch_ncc_shift",
+        lambda *_args, **_kwargs: pytest.fail("Torch boundary path used NumPy"),
+    )
+    result = estimate_patch_amplitude_shift(
         samples,
         samples,
         executor="torch",
         batch_size=2,
         **kwargs,
     )
-    assert numpy_result.n_valid == torch_result.n_valid == 1
-    assert numpy_result.range_shift_px == torch_result.range_shift_px == 0.25
-    assert numpy_result.azimuth_shift_px == torch_result.azimuth_shift_px == -0.25
+    assert result.n_valid == 1
+    assert result.range_shift_px == 0.25
+    assert result.azimuth_shift_px == -0.25
 
 
 def test_ampcor_boundary_oracle_stabilizes_backend_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A near-boundary Torch drift is replaced by the NumPy oracle result."""
+    """A near-boundary Torch drift is recomputed by the Torch FFT reference."""
     torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets as offsets_mod
 
@@ -1365,11 +1638,6 @@ def test_ampcor_boundary_oracle_stabilizes_backend_drift(
     snr_drift = threshold
     for _ in range(8):
         snr_drift = np.nextafter(snr_drift, np.inf)
-    monkeypatch.setattr(
-        offsets_mod,
-        "_patch_ncc_shift",
-        lambda *_args, **_kwargs: (0.25, -0.25, float(threshold)),
-    )
     samples = np.ones((64, 96), dtype=np.complex64)
     kwargs = {
         "window_az": 8,
@@ -1384,23 +1652,32 @@ def test_ampcor_boundary_oracle_stabilizes_backend_drift(
         "max_abs_residual": 1.2,
         "device": "cpu",
     }
-    numpy_result = estimate_patch_amplitude_shift(samples, samples, **kwargs)
     monkeypatch.setattr(
         offsets_mod,
         "_torch_patch_ncc_batch",
-        lambda *_args, **_kwargs: (
+        lambda *_args, **kwargs: (
             torch.tensor([0.25], dtype=torch.float64),
             torch.tensor([-0.25], dtype=torch.float64),
-            torch.tensor([snr_drift], dtype=torch.float64),
+            torch.tensor(
+                [threshold if kwargs.get("force_fft_energy") else snr_drift],
+                dtype=torch.float64,
+            ),
         ),
     )
-    torch_result = estimate_patch_amplitude_shift(
+    monkeypatch.setattr(
+        offsets_mod,
+        "_patch_ncc_shift",
+        lambda *_args, **_kwargs: pytest.fail("Torch boundary path used NumPy"),
+    )
+    result = estimate_patch_amplitude_shift(
         samples,
         samples,
         executor="torch",
         **kwargs,
     )
-    assert torch_result == numpy_result
+    assert result.n_valid == 1
+    assert result.range_shift_px == 0.25
+    assert result.azimuth_shift_px == -0.25
 
 
 def test_ampcor_cuda_rejects_unqualified_fft_shape_before_kernel() -> None:
@@ -1469,15 +1746,6 @@ def test_ampcor_zero_boundaries_do_not_widen_cull(
         "max_abs_residual": max_abs_residual,
         "device": "cpu",
     }
-    numpy_values = iter(values)
-    monkeypatch.setattr(
-        offsets_mod,
-        "_patch_ncc_shift",
-        lambda *_args, **_kwargs: next(numpy_values),
-    )
-    numpy_result = estimate_patch_amplitude_shift(samples, samples, **kwargs)
-
-    numpy_values = iter(values)
     monkeypatch.setattr(
         offsets_mod,
         "_torch_patch_ncc_batch",
@@ -1486,6 +1754,11 @@ def test_ampcor_zero_boundaries_do_not_widen_cull(
             for index in range(3)
         ),
     )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_patch_ncc_shift",
+        lambda *_args, **_kwargs: pytest.fail("Torch boundary path used NumPy"),
+    )
     torch_result = estimate_patch_amplitude_shift(
         samples,
         samples,
@@ -1493,7 +1766,7 @@ def test_ampcor_zero_boundaries_do_not_widen_cull(
         batch_size=2,
         **kwargs,
     )
-    assert numpy_result.n_valid == torch_result.n_valid == 1
+    assert torch_result.n_valid == 1
 
 
 def test_refine_shift_rejects_unqualified_mps_before_secondary_roll(

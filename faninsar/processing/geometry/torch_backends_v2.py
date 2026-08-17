@@ -3,9 +3,10 @@
 """Torch eager and explicitly prepared geometry adapters.
 
 The adapter keeps the public preparation lifecycle separate from execution.
-Torch owns the device-resident numerical loop and a prepared compiled callable
-is constructed and warmed during :func:`prepare_torch_geometry`; execution
-never invokes ``torch.compile``.
+Torch owns the device-resident numerical loop.  CPU GEO2RDR constructs its two
+compiled callables during :func:`prepare_torch_geometry`, while execution
+provides the first real tensors that trigger specialization; execution never
+invokes ``torch.compile``.
 """
 
 from __future__ import annotations
@@ -21,6 +22,10 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.geometry.torch_kernels import (
+    _geo2rdr_active,
+    _geo2rdr_finalize,
+    _geo2rdr_initialize,
+    _geo2rdr_step,
     geo2rdr_kernel,
     prepared_orbit_tensors,
     rdr2geo_kernel,
@@ -173,11 +178,46 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
 
     from faninsar._core.device import parse_device
 
-    resolved = parse_device(device)
+    try:
+        resolved = parse_device(device)
+    except RuntimeError as error:
+        requested = str(device).strip().lower()
+        if requested.startswith("cuda:") and requested.removeprefix("cuda:").isdigit():
+            message = (
+                "unsupported device ordinal "
+                f"{int(requested.removeprefix('cuda:'))}"
+            )
+            logger.exception(message)
+            raise RuntimeError(message) from error
+        raise
     if resolved.type == "mps" and not torch.backends.mps.is_available():
         message = "MPS geometry adapter requested but MPS is unavailable"
         logger.error(message)
         raise RuntimeError(message)
+    return resolved
+
+
+def _canonical_torch_device(device: str | torch.device) -> torch.device:
+    """Return a Torch device with implicit CUDA ordinals made explicit.
+
+    Parameters
+    ----------
+    device : str or torch.device
+        Device identifier to canonicalize.
+
+    Returns
+    -------
+    torch.device
+        Canonical device.  An unqualified CUDA device uses the current CUDA
+        ordinal, so ``cuda`` and ``cuda:0`` compare equal when device zero is
+        current while distinct explicit ordinals remain distinct.
+
+    """
+    import torch
+
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
     return resolved
 
 
@@ -288,6 +328,9 @@ class TorchGeometryResult:
     device: str
     dtype: str
     identity: str
+    ecef_x_m: np.ndarray | None = None
+    ecef_y_m: np.ndarray | None = None
+    ecef_z_m: np.ndarray | None = None
 
     def __getattr__(self, name: str) -> object:
         """Expose foundation result fields for adapter compatibility."""
@@ -300,6 +343,13 @@ class TorchGeometryResult:
     def identity_digest(self) -> str:
         """Return the prepared identity digest under an explicit name."""
         return self.identity
+
+    @property
+    def ecef_xyz_m(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Return device-computed ECEF outputs when the kernel provided them."""
+        if self.ecef_x_m is None or self.ecef_y_m is None or self.ecef_z_m is None:
+            return None
+        return self.ecef_x_m, self.ecef_y_m, self.ecef_z_m
 
     @property
     def iterations(self) -> np.ndarray:
@@ -330,6 +380,10 @@ class TorchGeometryResult:
         )
         residual_range = np.asarray(values["residual_range_m"], dtype=np.float64)
         residual_doppler = np.asarray(values["residual_doppler_hz"], dtype=np.float64)
+        max_iter_exhausted = np.asarray(
+            values.get("max_iter_exhausted", (~converged) & ~invalid_mask),
+            dtype=bool,
+        )
         if operation is Operation.GEO2RDR:
             decision = np.maximum(
                 np.abs(residual_range) / range_tolerance,
@@ -351,7 +405,7 @@ class TorchGeometryResult:
                 "decision_residual": decision,
                 "final_residual": decision,
                 "tolerance": tolerance_array,
-                "max_iter_exhausted": (~converged) & ~invalid_mask,
+                "max_iter_exhausted": max_iter_exhausted,
                 "boundary_rechecked": np.zeros(shape, dtype=bool),
                 "residual_range_m": residual_range,
                 "residual_doppler_hz": residual_doppler,
@@ -366,6 +420,21 @@ class TorchGeometryResult:
             device,
             dtype,
             identity,
+            ecef_x_m=(
+                np.asarray(values["ecef_x_m"], dtype=np.float64)
+                if "ecef_x_m" in values
+                else None
+            ),
+            ecef_y_m=(
+                np.asarray(values["ecef_y_m"], dtype=np.float64)
+                if "ecef_y_m" in values
+                else None
+            ),
+            ecef_z_m=(
+                np.asarray(values["ecef_z_m"], dtype=np.float64)
+                if "ecef_z_m" in values
+                else None
+            ),
         )
 
 
@@ -382,13 +451,67 @@ class PreparedTorchGeometry:
     identity: TorchGeometryIdentity
     device: str
     dtype: str
+    height_seed_m: float = 0.0
     compiled: bool = False
     _kernel: object | None = field(default=None, repr=False, compare=False)
     _compiled_kernel: object | None = field(default=None, repr=False, compare=False)
+    _compiled_first_stage: object | None = field(
+        default=None, repr=False, compare=False
+    )
+    _state_finalizer: object | None = field(default=None, repr=False, compare=False)
 
     def execute(self, *inputs: object) -> TorchGeometryResult:
         """Execute this prepared adapter without compiling."""
         return execute_torch_geometry(self, *inputs)
+
+    def execute_ecef(
+        self, *inputs: object
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Execute Rdr2Geo and transfer only device-computed ECEF arrays.
+
+        Parameters
+        ----------
+        *inputs : object
+            Prepared Rdr2Geo input arrays in azimuth, range, and height-seed
+            order.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            Host ``(x, y, z)`` ECEF arrays.  The LLH and telemetry fields stay
+            device-resident and are not copied across the device boundary.
+
+        Raises
+        ------
+        ValueError
+            If this prepared operation is not Rdr2Geo.
+
+        """
+        import torch
+
+        if self.operation is not Operation.RDR2GEO:
+            logger.error("execute_ecef is only available for rdr2geo")
+            raise ValueError("execute_ecef is only available for rdr2geo")
+        arrays = _check_inputs(self, inputs)
+        kernel = self._compiled_kernel if self.compiled else self._kernel
+        if kernel is None:
+            logger.error("prepared Torch geometry kernel is missing")
+            raise RuntimeError("prepared Torch geometry kernel is missing")
+        with torch.no_grad():
+            output = kernel(*arrays)
+        try:
+            ecef_fields = tuple(
+                output[name] for name in ("ecef_x_m", "ecef_y_m", "ecef_z_m")
+            )
+        except (AttributeError, KeyError) as error:
+            logger.exception("prepared Rdr2Geo kernel did not publish ECEF outputs")
+            raise RuntimeError(
+                "prepared Rdr2Geo kernel did not publish ECEF outputs"
+            ) from error
+        # Keep the three published fields separate.  Stacking first creates a
+        # transient device allocation and then copies it back as one larger
+        # buffer, even though the public ECEF ABI is already three arrays.
+        return tuple(field.detach().cpu().numpy() for field in ecef_fields)  # type: ignore[return-value]
 
 
 def prepare_torch_geometry(
@@ -410,9 +533,9 @@ def prepare_torch_geometry(
 ) -> PreparedTorchGeometry:
     """Prepare an eager or compiled Torch geometry adapter.
 
-    Compilation is explicit and occurs entirely in this function, including
-    one warm-up invocation.  A compiled adapter therefore has no lazy compile
-    transition during :func:`execute_torch_geometry`.
+    Compilation is explicit.  CPU GEO2RDR creates its two graph wrappers during
+    preparation but defers their first invocation until execution, so the
+    compiler sees the caller's real tensors and strides.
     """
     import torch
 
@@ -478,8 +601,8 @@ def prepare_torch_geometry(
                 dtype=torch.float64,
                 device=resolved_device,
             ).contiguous()
-            if not bool(torch.isfinite(samples).all().item()):
-                raise ValueError("RasterDEM contains nonfinite heights")
+            if bool(torch.isinf(samples).any().item()):
+                raise ValueError("RasterDEM contains infinite heights")
             if samples.ndim != 2 or min(samples.shape) < 6:
                 raise ValueError("RasterDEM must provide at least a 6x6 grid")
             return (
@@ -522,6 +645,20 @@ def prepare_torch_geometry(
 
     payload = dem_payload(dem) if dem is not None else ("none",)
     constant_dem_height = payload[1] if payload[0] == "constant" else None
+    if payload[0] == "constant":
+        height_seed_m = float(payload[1])
+    elif payload[0] == "raster":
+        raster_values = payload[1]
+        finite = torch.isfinite(raster_values)
+        if bool(finite.any().item()):
+            height_seed_m = float(raster_values[finite].mean().item())
+        else:
+            logger.warning(
+                "RasterDEM contains no finite heights; using 0 m height seed"
+            )
+            height_seed_m = 0.0
+    else:
+        height_seed_m = 0.0
     dem_samples = None
     dem_latitude_start = 0.0
     dem_longitude_start = 0.0
@@ -532,10 +669,13 @@ def prepare_torch_geometry(
         dem_latitude_start, dem_longitude_start = payload[2], payload[3]
         dem_latitude_spacing, dem_longitude_spacing = payload[4], payload[5]
 
-    def kernel(*values: object) -> dict[str, object]:
+    def run_kernel(
+        *values: object,
+        geo2rdr_iterations: int,
+        dynamic_iterations: bool,
+    ) -> dict[str, object]:
         """Run the operation-specific device-resident solver."""
         latitude_or_azimuth, longitude_or_range, height = values
-        dynamic = not compile_kernel
         if operation is Operation.GEO2RDR:
             return geo2rdr_kernel(
                 latitude_or_azimuth,
@@ -549,10 +689,10 @@ def prepare_torch_geometry(
                 starting_range_m=model.starting_slant_range_m,
                 range_spacing_m=model.range_spacing_m,
                 wavelength_m=model.wavelength_m,
-                max_iter=settings.max_iter + settings.extra_iter,
+                max_iter=geo2rdr_iterations,
                 range_tol_m=settings.range_tol_m,
                 doppler_tol_hz=settings.doppler_tol_hz,
-                dynamic_iterations=dynamic,
+                dynamic_iterations=dynamic_iterations,
                 time_tol_s=settings.time_tol_s,
             )
         return rdr2geo_kernel(
@@ -572,7 +712,7 @@ def prepare_torch_geometry(
             extra_iter=settings.extra_iter,
             range_tol_m=settings.range_tol_m,
             doppler_tol_hz=settings.doppler_tol_hz,
-            dynamic_iterations=dynamic,
+            dynamic_iterations=dynamic_iterations,
             dem_height_m=constant_dem_height,
             dem_samples=dem_samples,
             dem_latitude_start_deg=dem_latitude_start,
@@ -583,26 +723,127 @@ def prepare_torch_geometry(
             dem_height_tol_m=settings.dem_height_tol_m,
         )
 
+    total_geo2rdr_iterations = settings.max_iter + settings.extra_iter
+
+    def kernel(*values: object) -> dict[str, object]:
+        """Run the full-budget eager or fixed-shape solver."""
+        # Dynamic masks are useful on CPU, where compacting lanes is cheap.
+        # On CUDA they introduce host synchronizations and device indexing;
+        # the fixed-shape loop keeps the entire prepared call asynchronous.
+        staged_cpu_geo2rdr = (
+            compile_kernel
+            and operation is Operation.GEO2RDR
+            and resolved_device.type == "cpu"
+        )
+        dynamic = resolved_device.type == "cpu" and (
+            not compile_kernel or staged_cpu_geo2rdr
+        )
+        return run_kernel(
+            *values,
+            geo2rdr_iterations=total_geo2rdr_iterations,
+            dynamic_iterations=dynamic,
+        )
+
+    def initialize_geo2rdr_state(*values: object) -> tuple[object, ...]:
+        """Build the persistent CPU Geo2Rdr Newton state."""
+        latitude, longitude, height = values
+        return _geo2rdr_initialize(
+            latitude,
+            longitude,
+            height,
+            orbit_times,
+            orbit_positions,
+            orbit_velocities,
+            sensing_offset_s=sensing_offset_s,
+        )
+
+    def finalize_geo2rdr_state(
+        state: tuple[object, ...], *values: object
+    ) -> dict[str, object]:
+        """Publish the persistent CPU Geo2Rdr Newton state."""
+        latitude, longitude, height = values
+        return _geo2rdr_finalize(
+            state,
+            latitude,
+            longitude,
+            height,
+            sensing_offset_s=sensing_offset_s,
+            azimuth_interval_s=model.azimuth_time_interval_s,
+            starting_range_m=model.starting_slant_range_m,
+            range_spacing_m=model.range_spacing_m,
+        )
+
     compiled_kernel: object | None = None
+    compiled_first_stage: object | None = None
+    state_finalizer: object | None = None
     if compile_kernel:
-        try:
-            compiled_kernel = torch.compile(
-                kernel,
-                mode="reduce-overhead",
-                fullgraph=True,
-                dynamic=False,
-            )
-            sample = torch.zeros(
-                tuple(shape),
-                dtype=getattr(torch, canonical_dtype.split(".")[-1]),
-                device=resolved_device,
-            )
-            compiled_kernel(sample, sample, sample)
-        except Exception as error:
-            logger.exception("failed to prepare compiled Torch geometry adapter")
-            raise RuntimeError(
-                "Torch geometry compilation failed during preparation"
-            ) from error
+        if operation is Operation.GEO2RDR and resolved_device.type == "cpu":
+            state_finalizer = finalize_geo2rdr_state
+
+            def state_first_stage(*values: object) -> tuple[object, ...]:
+                """Initialize and perform the first CPU Geo2Rdr transition."""
+                return _geo2rdr_step(
+                    initialize_geo2rdr_state(*values),
+                    orbit_times,
+                    orbit_positions,
+                    orbit_velocities,
+                    starting_range_m=model.starting_slant_range_m,
+                    range_spacing_m=model.range_spacing_m,
+                    wavelength_m=model.wavelength_m,
+                    range_tol_m=settings.range_tol_m,
+                    doppler_tol_hz=settings.doppler_tol_hz,
+                )
+
+            def state_step(*state_values: object) -> tuple[object, ...]:
+                """Advance one persistent CPU Geo2Rdr Newton state."""
+                return _geo2rdr_step(
+                    tuple(state_values),
+                    orbit_times,
+                    orbit_positions,
+                    orbit_velocities,
+                    starting_range_m=model.starting_slant_range_m,
+                    range_spacing_m=model.range_spacing_m,
+                    wavelength_m=model.wavelength_m,
+                    range_tol_m=settings.range_tol_m,
+                    doppler_tol_hz=settings.doppler_tol_hz,
+                )
+
+            try:
+                compile_kwargs = {
+                    "mode": "reduce-overhead",
+                    "fullgraph": True,
+                    "dynamic": False,
+                }
+                compiled_first_stage = torch.compile(
+                    state_first_stage, **compile_kwargs
+                )
+                compiled_kernel = torch.compile(state_step, **compile_kwargs)
+            except Exception as error:
+                logger.exception("failed to prepare compiled Torch geometry adapter")
+                raise RuntimeError(
+                    "Torch geometry compilation failed during preparation"
+                ) from error
+
+        else:
+            try:
+                compile_target = kernel
+                compiled_kernel = torch.compile(
+                    compile_target,
+                    mode="reduce-overhead",
+                    fullgraph=True,
+                    dynamic=False,
+                )
+                sample = torch.zeros(
+                    tuple(shape),
+                    dtype=getattr(torch, canonical_dtype.split(".")[-1]),
+                    device=resolved_device,
+                )
+                compiled_kernel(sample, sample, sample)
+            except Exception as error:
+                logger.exception("failed to prepare compiled Torch geometry adapter")
+                raise RuntimeError(
+                    "Torch geometry compilation failed during preparation"
+                ) from error
     return PreparedTorchGeometry(
         operation=operation,
         model=model,
@@ -613,9 +854,12 @@ def prepare_torch_geometry(
         identity=identity,
         device=str(resolved_device),
         dtype=canonical_dtype,
+        height_seed_m=height_seed_m,
         compiled=compile_kernel,
         _kernel=kernel,
         _compiled_kernel=compiled_kernel,
+        _compiled_first_stage=compiled_first_stage,
+        _state_finalizer=state_finalizer,
     )
 
 
@@ -626,7 +870,7 @@ def _check_inputs(
     import torch
 
     if prepared.operation == "rdr2geo" and len(inputs) == 2:
-        inputs = (*inputs, 0.0)
+        inputs = (*inputs, prepared.height_seed_m)
     expected = 3
     if len(inputs) != expected:
         raise TypeError(f"{prepared.operation} expects {expected} input arrays")
@@ -636,7 +880,9 @@ def _check_inputs(
         if isinstance(item, torch.Tensor):
             if item.dtype != expected_dtype:
                 raise TypeError(f"Torch geometry inputs must use {prepared.dtype}")
-            if item.device != torch.device(prepared.device):
+            if _canonical_torch_device(item.device) != _canonical_torch_device(
+                prepared.device
+            ):
                 raise TypeError(
                     f"Torch geometry inputs must use device {prepared.device}"
                 )
@@ -670,10 +916,33 @@ def execute_torch_geometry(
 
     arrays = _check_inputs(prepared, inputs)
     kernel = prepared._compiled_kernel if prepared.compiled else prepared._kernel
+    total_iterations = prepared.settings.max_iter + prepared.settings.extra_iter
+    uses_cpu_geo2rdr_state = (
+        prepared.compiled
+        and prepared.operation is Operation.GEO2RDR
+        and _canonical_torch_device(prepared.device).type == "cpu"
+    )
     if kernel is None:
         raise RuntimeError("prepared Torch geometry kernel is missing")
     with torch.no_grad():
-        output = kernel(*arrays)
+        if uses_cpu_geo2rdr_state:
+            finalizer = prepared._state_finalizer
+            if finalizer is None:
+                raise RuntimeError("prepared compiled Geo2Rdr finalizer is missing")
+
+            compiled_first_stage = prepared._compiled_first_stage
+            continuation = prepared._compiled_kernel
+            if compiled_first_stage is None or continuation is None:
+                raise RuntimeError("prepared compiled Geo2Rdr callables are missing")
+
+            state = compiled_first_stage(*arrays)
+            for _ in range(max(total_iterations - 1, 0)):
+                if not bool(torch.any(_geo2rdr_active(state)).item()):
+                    break
+                state = continuation(*state)
+            output = finalizer(state, *arrays)
+        else:
+            output = kernel(*arrays)
     host_output = {
         name: value.detach().cpu().numpy()
         if isinstance(value, torch.Tensor)
@@ -718,10 +987,14 @@ def torch_rdr2geo(
     **kwargs: object,
 ) -> TorchGeometryResult:
     """Run the eager Torch rdr2geo adapter."""
-    height = 0.0 if height_m is None else height_m
-    arrays = np.broadcast_arrays(
-        np.asarray(azimuth_index), np.asarray(range_index), np.asarray(height)
-    )
+    if height_m is None:
+        arrays = np.broadcast_arrays(np.asarray(azimuth_index), np.asarray(range_index))
+    else:
+        arrays = np.broadcast_arrays(
+            np.asarray(azimuth_index),
+            np.asarray(range_index),
+            np.asarray(height_m),
+        )
     prepared = prepare_torch_geometry(
         "rdr2geo", model, shape=arrays[0].shape, dem=dem, **kwargs
     )

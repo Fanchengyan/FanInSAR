@@ -1036,7 +1036,7 @@ dependencies = [
     { name = "rioxarray", version = "0.20.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "rtree" },
     { name = "scipy" },
-    { name = "snaphu" },
+    { name = "snaphu", marker = "sys_platform != 'win32'" },
     { name = "tomli-w" },
     { name = "torch" },
     { name = "torch-dct" },
@@ -1158,7 +1158,7 @@ requires-dist = [
     { name = "rtree" },
     { name = "ruff", marker = "extra == 'code-style'" },
     { name = "scipy", specifier = ">=1.10" },
-    { name = "snaphu", specifier = ">=0.4.1" },
+    { name = "snaphu", marker = "sys_platform != 'win32'", specifier = ">=0.4.1" },
     { name = "sphinx", marker = "extra == 'docs'", specifier = ">=7" },
     { name = "sphinx-copybutton", marker = "extra == 'docs'" },
     { name = "sphinx-design", marker = "extra == 'docs'" },
@@ -4731,7 +4731,7 @@ name = "snaphu"
 version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
+    { name = "numpy", marker = "sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/3b/b9/50d7a530c3dc97f61d30fefb31aa50f4710954de12e0cebcae8c9fc8d301/snaphu-0.4.1.tar.gz", hash = "sha256:41a7f48e1b8809fa19e9fa5c7e90bfbd1502b1d5b437d2a302fc4938e64095b6", size = 551451, upload-time = "2024-09-16T23:18:15.419Z" }
 wheels = [

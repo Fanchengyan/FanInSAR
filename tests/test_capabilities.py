@@ -8,6 +8,8 @@ import zipfile
 from pathlib import Path
 from subprocess import run
 
+from packaging.requirements import Requirement
+
 from faninsar.capabilities import format_backend_capabilities
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -43,7 +45,16 @@ def test_snaphu_is_a_runtime_dependency() -> None:
     base_dependencies = metadata["project"]["dependencies"]
 
     # Then
-    assert "snaphu>=0.4.1" in base_dependencies
+    snaphu_requirement = next(
+        Requirement(dependency)
+        for dependency in base_dependencies
+        if Requirement(dependency).name == "snaphu"
+    )
+    assert str(snaphu_requirement.specifier) == ">=0.4.1"
+    assert str(snaphu_requirement.marker) == 'sys_platform != "win32"'
+    assert snaphu_requirement.marker is not None
+    assert not snaphu_requirement.marker.evaluate({"sys_platform": "win32"})
+    assert snaphu_requirement.marker.evaluate({"sys_platform": "linux"})
     assert "snaphu" not in metadata["project"]["optional-dependencies"]
 
 
