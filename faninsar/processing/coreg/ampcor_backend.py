@@ -170,10 +170,14 @@ class AmpcorEnergyCandidate:
                 raise AmpcorCandidateError(
                     "Ampcor candidate requires contiguous rank-3 input"
                 )
+            partial_batch = False
             if self.input_shape is not None:
                 actual_shape = tuple(secondary_centered.shape)
                 expected_shape = self.input_shape
                 spatial_match = actual_shape[1:] == expected_shape[1:]
+                partial_batch = (
+                    actual_shape[0] < expected_shape[0] and self.allow_partial_batch
+                )
                 batch_match = (
                     actual_shape[0] <= expected_shape[0]
                     if self.allow_partial_batch
@@ -189,7 +193,20 @@ class AmpcorEnergyCandidate:
             )
             if not bool(input_valid.item()):
                 raise AmpcorCandidateError("Ampcor native ABI requires centered input")
-            result = self.executor(secondary_centered)
+            dispatch_input = secondary_centered
+            if partial_batch and self.backend == "compile":
+                padding = torch.zeros(
+                    (
+                        self.input_shape[0] - secondary_centered.shape[0],
+                        *secondary_centered.shape[1:],
+                    ),
+                    dtype=secondary_centered.dtype,
+                    device=secondary_centered.device,
+                )
+                dispatch_input = torch.cat((secondary_centered, padding), dim=0)
+            result = self.executor(dispatch_input)
+            if partial_batch:
+                result = result[: secondary_centered.shape[0]]
             if not torch.is_tensor(result):
                 raise AmpcorCandidateError(
                     "Ampcor candidate returned a non-Tensor result"
@@ -339,7 +356,7 @@ def prepare_ampcor_compile(
         source_digest=sha256(b"torch_integral_energy.v1").hexdigest(),
         abi_version=_NATIVE_ABI,
         input_contract="centered-f64",
-        allow_partial_batch=False,
+        allow_partial_batch=True,
     )
 
 
