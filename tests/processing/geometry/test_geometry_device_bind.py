@@ -57,6 +57,8 @@ def test_resolve_geometry_device_missing_cuda_fails_closed(
     with pytest.raises(RuntimeError, match="not available"):
         _resolve_device("cuda")
     with pytest.raises(RuntimeError, match="not available"):
+        _resolve_device("cuda:1")
+    with pytest.raises(RuntimeError, match="not available"):
         geometry_public._device_key("cuda", "GPU-test")
     with pytest.raises(RuntimeError, match="not available"):
         prepare_geometry(Operation.GEO2RDR, _model(), shape=(1,), device="cuda")

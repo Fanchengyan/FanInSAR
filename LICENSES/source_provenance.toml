@@ -1,0 +1,45 @@
+schema_version = 1
+
+[[sources]]
+name = "GMTSAR-marked insardev_pygmtsar orbit, Doppler, burst, geometry, baseline, tide, and phase bodies"
+source = "core/insardev_pygmtsar GMTSAR-derived sections"
+license = "BSD-3-Clause distribution with unresolved GPL-derived provenance markers"
+implementation_method = "oracle_only"
+status = "quarantined"
+attribution = "GMTSAR and insardev_pygmtsar identified in oracle metadata."
+test_oracle = "Black-box numeric outputs only."
+source_files = [
+  "core/insardev_pygmtsar/insardev_pygmtsar/utils_s1.py:11-12",
+  "core/insardev_pygmtsar/insardev_pygmtsar/utils_satellite.py:1115",
+  "core/insardev_pygmtsar/insardev_pygmtsar/utils_tidal.py:11-15",
+]
+
+[[sources]]
+name = "InSAR.dev source-available processing algorithms"
+source = "core/insardev"
+license = "InSAR.dev Source-Available License 1.0"
+implementation_method = "oracle_only"
+status = "prohibited"
+attribution = "InSAR.dev recorded only in isolated oracle metadata."
+test_oracle = "Black-box outputs in a separate environment only."
+source_files = ["core/insardev/insardev/utils_unwrap2d.py"]
+
+[[sources]]
+name = "snaphu-py optional unwrapping backend"
+source = "isce-framework/snaphu-py"
+license = "Separate mixed terms including non-commercial restrictions"
+implementation_method = "external_optional_dependency"
+status = "quarantined"
+attribution = "Show the separate-license caveat."
+test_oracle = "Optional clean-environment backend tests."
+source_files = ["snaphu-py/ext/snaphu/README"]
+
+[[sources]]
+name = "GMTSAR executable and source oracle"
+source = "GMTSAR"
+license = "GPL-3.0"
+implementation_method = "oracle_only"
+status = "quarantined"
+attribution = "Record GMTSAR version and license with oracle artifacts."
+test_oracle = "Isolated development-only outputs."
+source_files = ["gmtsar/LICENSE.TXT"]

@@ -23,6 +23,12 @@ REQUIRED_NATIVE_V2_SOURCES = frozenset(
         NATIVE_PACKAGE_PATH / "cuda" / "geo2rdr_cuda.cu",
         NATIVE_PACKAGE_PATH / "cuda" / "rdr2geo_tcn_cuda.cu",
         NATIVE_PACKAGE_PATH / "cuda" / "geometry_cuda.cuh",
+        NATIVE_PACKAGE_PATH / "ampcor_bindings.cpp",
+        NATIVE_PACKAGE_PATH / "ampcor_cuda_bindings.cpp",
+        NATIVE_PACKAGE_PATH / "ampcor_ncc_cuda_bindings.cpp",
+        NATIVE_PACKAGE_PATH / "ampcor_ncc_postprocess_cuda.cu",
+        NATIVE_PACKAGE_PATH / "ampcor_prefix_energy.cpp",
+        NATIVE_PACKAGE_PATH / "ampcor_prefix_energy_cuda.cu",
     }
 )
 

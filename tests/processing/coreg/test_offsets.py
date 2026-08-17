@@ -205,6 +205,127 @@ def test_estimate_patch_amplitude_shift_torch_matches_numpy() -> None:
     )
 
 
+def test_explicit_compile_rejects_partial_final_batch_before_dispatch() -> None:
+    """Candidates without partial support fail before a partial batch executes."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg.ampcor_backend import (
+        AmpcorCandidateError,
+        AmpcorEnergyCandidate,
+        torch_integral_energy,
+    )
+
+    calls: list[str] = []
+
+    def compile_executor(value: object) -> object:
+        calls.append("compile")
+        return torch_integral_energy(value, 4, 4)
+
+    candidate = AmpcorEnergyCandidate(
+        backend="compile",
+        device="cpu",
+        window_shape=(4, 4),
+        executor=compile_executor,
+        input_shape=(4, 6, 6),
+    )
+    reference = np.ones((40, 40), dtype=np.complex64)
+    with pytest.raises(AmpcorCandidateError, match="full final batch"):
+        estimate_patch_amplitude_shift(
+            reference,
+            reference.copy(),
+            window_az=4,
+            window_rg=4,
+            search_az=1,
+            search_rg=1,
+            n_az=3,
+            n_rg=3,
+            margin_az=3,
+            margin_rg=3,
+            executor="torch",
+            device="cpu",
+            backend="compile",
+            ampcor_candidate=candidate,
+            batch_size=4,
+        )
+    assert calls == []
+
+
+def test_public_compile_candidate_pads_partial_batch_without_recompile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prepared compile candidates pad a final batch and preserve eager output."""
+    torch = pytest.importorskip("torch")
+    from dataclasses import replace
+
+    from faninsar.processing.coreg.ampcor_backend import prepare_ampcor_compile
+
+    compile_calls: list[object] = []
+
+    def recording_compile(function: object, **kwargs: object) -> object:
+        compile_calls.append(kwargs)
+        return function
+
+    monkeypatch.setattr(torch, "compile", recording_compile)
+    candidate = prepare_ampcor_compile(
+        device="cpu", window_shape=(4, 4), input_shape=(4, 6, 6)
+    )
+    candidate_calls: list[tuple[int, ...]] = []
+    original_executor = candidate.executor
+
+    def recording_executor(value: object) -> object:
+        candidate_calls.append(tuple(value.shape))
+        return original_executor(value)
+
+    candidate = replace(candidate, executor=recording_executor)
+    reference = _sar_like_amplitude((40, 40), seed=31).astype(np.complex64)
+    kwargs = {
+        "window_az": 4,
+        "window_rg": 4,
+        "search_az": 1,
+        "search_rg": 1,
+        "n_az": 3,
+        "n_rg": 3,
+        "margin_az": 3,
+        "margin_rg": 3,
+        "batch_size": 4,
+        "snr_threshold": 0.0,
+        "max_abs_residual": 4.0,
+    }
+    compiled_result = estimate_patch_amplitude_shift(
+        reference,
+        reference.copy(),
+        executor="torch",
+        device="cpu",
+        backend="compile",
+        ampcor_candidate=candidate,
+        **kwargs,
+    )
+    eager_result = estimate_patch_amplitude_shift(
+        reference,
+        reference.copy(),
+        executor="torch",
+        device="cpu",
+        backend="eager",
+        **kwargs,
+    )
+    assert len(compile_calls) == 1
+    assert candidate_calls == [(4, 6, 6), (4, 6, 6), (4, 6, 6)]
+    assert compiled_result.n_attempted == eager_result.n_attempted
+    assert compiled_result.n_valid == eager_result.n_valid
+    np.testing.assert_allclose(
+        (
+            compiled_result.range_shift_px,
+            compiled_result.azimuth_shift_px,
+            compiled_result.snr_median,
+        ),
+        (
+            eager_result.range_shift_px,
+            eager_result.azimuth_shift_px,
+            eager_result.snr_median,
+        ),
+        atol=1e-12,
+    )
+
+
 def test_torch_ampcor_even_median_stays_in_torch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -377,6 +498,8 @@ def test_full_iw1_shape_rejects_overlapping_view(
         samples,
         prior_rg=0.0,
         prior_az=0.0,
+        executor="numpy",
+        device="cpu",
     ) == (0.0, 0.0)
 
     oversized_backing = np.ones(1, dtype=np.complex128)
@@ -396,8 +519,6 @@ def test_full_iw1_shape_rejects_overlapping_view(
             executor="torch",
             **kwargs,
         )
-
-
 def test_ampcor_copies_safe_noncontiguous_torch_view() -> None:
     """Torch admission copies a bounded, non-overlapping positive-stride view."""
     backing = np.ones((256, 2048), dtype=np.complex64)
@@ -507,6 +628,122 @@ def test_estimate_patch_amplitude_shift_rejects_workspace_overcommit() -> None:
             batch_size=32,
             max_workspace_bytes=1,
         )
+
+
+def test_ampcor_workspace_admission_charges_boundary_subset_copies() -> None:
+    """Worst-case boundary ref/sec advanced-index copies are admitted."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    window_az, window_rg = 8, 16
+    search_az, search_rg = 2, 2
+    batch_size = 2
+    search_height = window_az + 2 * search_az
+    search_width = window_rg + 2 * search_rg
+    fft_height = 2 ** int(np.ceil(np.log2(search_height + window_az - 1)))
+    fft_width = 2 ** int(np.ceil(np.log2(search_width + window_rg - 1)))
+    reference_bytes = window_az * window_rg * 8
+    search_bytes = search_height * search_width * 8
+    input_bytes = reference_bytes + search_bytes
+    spectrum_bytes = fft_height * (fft_width // 2 + 1) * 16
+    fft_real_bytes = fft_height * fft_width * 8
+    surface_bytes = (2 * search_az + 1) * (2 * search_rg + 1) * 8
+    correlation_bytes = 3 * spectrum_bytes + fft_real_bytes
+    row_cat_bytes = search_height * (search_width + 1) * 8
+    integral_bytes = (
+        search_bytes
+        + search_bytes
+        + row_cat_bytes
+        + row_cat_bytes
+        + (search_height + 1) * (search_width + 1) * 8
+        + 2 * surface_bytes
+    )
+    fft_energy_bytes = (
+        search_bytes + 3 * spectrum_bytes + fft_real_bytes + surface_bytes
+    )
+    legacy_full_batch_budget = (
+        2
+        * batch_size
+        * (input_bytes + correlation_bytes + max(integral_bytes, fft_energy_bytes))
+    )
+
+    with pytest.raises(ValueError, match="workspace"):
+        estimate_patch_amplitude_shift(
+            np.ones((64, 128), dtype=np.complex64),
+            np.ones((64, 128), dtype=np.complex64),
+            window_az=window_az,
+            window_rg=window_rg,
+            search_az=search_az,
+            search_rg=search_rg,
+            n_az=1,
+            n_rg=2,
+            margin_rg=16,
+            margin_az=8,
+            executor="torch",
+            device="cpu",
+            batch_size=batch_size,
+            max_workspace_bytes=legacy_full_batch_budget,
+        )
+
+
+def test_ampcor_boundary_second_budget_rejects_old_and_accepts_full_packet() -> None:
+    """Boundary admission charges CPU, device, and centered input overlap."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    kwargs = {
+        "window_az": 8,
+        "window_rg": 16,
+        "search_az": 2,
+        "search_rg": 2,
+        "batch_size": 2,
+        "boundary_count": 1,
+    }
+    full_packet = offsets_mod._torch_ampcor_boundary_workspace_bytes(**kwargs)
+
+    window_az = kwargs["window_az"]
+    window_rg = kwargs["window_rg"]
+    search_az = kwargs["search_az"]
+    search_rg = kwargs["search_rg"]
+    batch_size = kwargs["batch_size"]
+    boundary_count = kwargs["boundary_count"]
+    search_height = window_az + 2 * search_az
+    search_width = window_rg + 2 * search_rg
+    fft_height = 2 ** int(np.ceil(np.log2(search_height + window_az - 1)))
+    fft_width = 2 ** int(np.ceil(np.log2(search_width + window_rg - 1)))
+    input_bytes = window_az * window_rg * 8 + search_height * search_width * 8
+    spectrum_bytes = fft_height * (fft_width // 2 + 1) * 16
+    fft_real_bytes = fft_height * fft_width * 8
+    surface_bytes = (2 * search_az + 1) * (2 * search_rg + 1) * 8
+    correlation_bytes = 3 * spectrum_bytes + fft_real_bytes
+    fft_energy_bytes = (
+        search_height * search_width * 8
+        + 3 * spectrum_bytes
+        + fft_real_bytes
+        + surface_bytes
+    )
+    public_intermediate_bytes = batch_size * (3 * 8 + 8)
+    old_incomplete_budget = public_intermediate_bytes + boundary_count * (
+        input_bytes + correlation_bytes + fft_energy_bytes + 3 * 8
+    )
+    assert full_packet > old_incomplete_budget
+
+    with (
+        pytest.raises(ValueError, match="workspace admission"),
+        offsets_mod._admit_torch_ampcor_workspace(
+            "cpu-boundary-budget-test",
+            full_packet,
+            old_incomplete_budget,
+        ),
+    ):
+        pass
+    with offsets_mod._admit_torch_ampcor_workspace(
+        "cpu-boundary-budget-test",
+        full_packet,
+        full_packet,
+    ):
+        pass
+    assert offsets_mod._TORCH_AMPCOR_RESERVED_BYTES == {}
 
 
 def test_estimate_patch_amplitude_shift_rejects_total_work_overcommit() -> None:
@@ -722,6 +959,199 @@ def test_ampcor_process_admission_rejects_busy_cuda_process() -> None:
         child.wait(timeout=5)
 
 
+def test_ampcor_mock_cuda_admission_spans_the_public_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mock CUDA admission stays held across every batch and outer cleanup."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    events: list[object] = []
+    active = False
+
+    class MockAdmission:
+        def __enter__(self) -> None:
+            nonlocal active
+            assert not active
+            active = True
+            events.append("enter")
+
+        def __exit__(self, *_args: object) -> bool:
+            nonlocal active
+            events.append(("exit", active))
+            active = False
+            return False
+
+    monkeypatch.setattr(
+        offsets_mod,
+        "_validate_ampcor_accelerator",
+        lambda _device: None,
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_canonical_torch_device",
+        lambda _device: torch.device("cpu"),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_ampcor_admission_key",
+        lambda *_args: "cuda-uuid:mock",
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_admit_torch_ampcor_process",
+        lambda _key: MockAdmission(),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_synchronize_torch_device",
+        lambda device: events.append(("sync", active, device)),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_release_torch_device_cache",
+        lambda device: events.append(("cache", active, device)),
+    )
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+
+    def valid_ncc(ref: object, *_args: object, **_kwargs: object) -> tuple[object, ...]:
+        assert active
+        events.append(("ncc", active, int(ref.shape[0])))
+        count = int(ref.shape[0])
+        return (
+            torch.zeros(count, dtype=torch.float64),
+            torch.zeros(count, dtype=torch.float64),
+            torch.full((count,), 10.0, dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", valid_ncc)
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 128), dtype=np.complex64),
+        np.ones((64, 128), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=3,
+        margin_rg=16,
+        margin_az=8,
+        executor="torch",
+        device="cuda",
+        batch_size=1,
+    )
+
+    assert result.n_valid == 3
+    assert events.count("enter") == 1
+    assert sum(event[0] == "ncc" for event in events if isinstance(event, tuple)) == 3
+    assert all(
+        event[1] for event in events if isinstance(event, tuple) and event[0] == "ncc"
+    )
+    assert [event[0] for event in events if isinstance(event, tuple)] == [
+        "ncc",
+        "ncc",
+        "ncc",
+        "sync",
+        "cache",
+        "exit",
+    ]
+    assert events[-1] == ("exit", True)
+
+
+def test_ampcor_mock_cuda_admission_releases_on_batch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mock CUDA admission and outer cleanup release after a batch failure."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    events: list[object] = []
+    active = False
+
+    class MockAdmission:
+        def __enter__(self) -> None:
+            nonlocal active
+            active = True
+            events.append("enter")
+
+        def __exit__(self, *_args: object) -> bool:
+            nonlocal active
+            events.append(("exit", active))
+            active = False
+            return False
+
+    monkeypatch.setattr(offsets_mod, "_validate_ampcor_accelerator", lambda _: None)
+    monkeypatch.setattr(
+        offsets_mod, "_canonical_torch_device", lambda _: torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_ampcor_admission_key",
+        lambda *_args: "cuda-uuid:mock",
+    )
+    monkeypatch.setattr(
+        offsets_mod, "_admit_torch_ampcor_process", lambda _: MockAdmission()
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_synchronize_torch_device",
+        lambda device: events.append(("sync", active, device)),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_release_torch_device_cache",
+        lambda device: events.append(("cache", active, device)),
+    )
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    calls = 0
+
+    def failing_ncc(
+        ref: object, *_args: object, **_kwargs: object
+    ) -> tuple[object, ...]:
+        nonlocal calls
+        calls += 1
+        assert active
+        if calls == 2:
+            message = "mock CUDA NCC failure"
+            raise RuntimeError(message)
+        count = int(ref.shape[0])
+        return (
+            torch.zeros(count, dtype=torch.float64),
+            torch.zeros(count, dtype=torch.float64),
+            torch.full((count,), 10.0, dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", failing_ncc)
+    with pytest.raises(RuntimeError, match="mock CUDA NCC failure"):
+        estimate_patch_amplitude_shift(
+            np.ones((64, 128), dtype=np.complex64),
+            np.ones((64, 128), dtype=np.complex64),
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=3,
+            margin_rg=16,
+            margin_az=8,
+            executor="torch",
+            device="cuda",
+            batch_size=1,
+        )
+
+    assert calls == 2
+    assert events.count("enter") == 1
+    assert [event[0] for event in events if isinstance(event, tuple)] == [
+        "sync",
+        "cache",
+        "exit",
+    ]
+    assert all(
+        event[1] for event in events if isinstance(event, tuple) and event[0] != "exit"
+    )
+    assert events[-1] == ("exit", True)
+
+
 def test_ampcor_process_admission_rejects_replaced_lock_entry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: object,
@@ -842,6 +1272,51 @@ def test_ampcor_synchronization_error_is_not_hidden_by_cleanup(
             executor="torch",
             device="cpu",
         )
+    assert offsets_mod._TORCH_AMPCOR_RESERVED_BYTES == {}
+
+
+def test_ampcor_business_error_survives_outer_synchronization_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch failure remains primary when outer synchronization also fails."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    cleanup_devices: list[object] = []
+    monkeypatch.setattr(
+        offsets_mod,
+        "_synchronize_torch_device",
+        lambda _device: (_ for _ in ()).throw(RuntimeError("sync failure")),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_release_torch_device_cache",
+        lambda device: cleanup_devices.append(device),
+    )
+
+    def failing_ncc(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        message = "business NCC failure"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", failing_ncc)
+    with pytest.raises(RuntimeError, match="business NCC failure"):
+        estimate_patch_amplitude_shift(
+            np.ones((64, 96), dtype=np.complex64),
+            np.ones((64, 96), dtype=np.complex64),
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=2,
+            margin_rg=16,
+            margin_az=8,
+            executor="torch",
+            device="cpu",
+            batch_size=2,
+        )
+
+    assert cleanup_devices == [torch.device("cpu")]
     assert offsets_mod._TORCH_AMPCOR_RESERVED_BYTES == {}
 
 
@@ -1025,8 +1500,6 @@ def test_ampcor_numpy_compatibility_spelling_uses_torch_limits() -> None:
         max_workspace_bytes=0,
     )
     assert result.n_attempted == 1
-
-
 def test_ampcor_numpy_path_does_not_apply_torch_admission_limits() -> None:
     """Torch batch/workspace controls do not change the NumPy compatibility lane."""
     samples = np.ones((64, 96), dtype=np.complex64)
@@ -1096,8 +1569,8 @@ def test_ampcor_rejects_unqualified_devices_before_tiling(
     )
     samples = np.ones((64, 96), dtype=np.complex64)
     with pytest.raises(
-        InvalidProcessingStateError,
-        match=r"unsupported Ampcor device|qualified Ampcor",
+        (InvalidProcessingStateError, RuntimeError, ImportError),
+        match=r"unsupported Ampcor device|qualified Ampcor|CUDA requested|Torch",
     ):
         estimate_patch_amplitude_shift(
             samples,
@@ -1302,10 +1775,9 @@ def test_ampcor_policy_canonicalizes_cuda_aliases_and_rejects_mps(
     monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     assert resolve_ampcor_policy("torch", "cuda:00") == ("torch", "cuda:0")
+    assert resolve_ampcor_policy("numpy", "cuda") == ("torch", "cuda")
     with pytest.raises(InvalidProcessingStateError, match="not a qualified Ampcor"):
         resolve_ampcor_policy("torch", "mps")
-
-
 def test_torch_ncc_integral_energy_matches_direct_oracle() -> None:
     """Torch NCC uses direct float64 rectangular local-energy sums."""
     torch = pytest.importorskip("torch")
@@ -1503,27 +1975,31 @@ def test_ampcor_direct_api_rejects_malformed_executor(executor: object) -> None:
         )
 
 
-def test_ampcor_direct_torch_auto_is_not_a_numpy_synonym(
+def test_ampcor_direct_torch_auto_uses_torch_cpu_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Direct ``torch/auto`` follows ``parse_device`` instead of host NumPy."""
-    torch = pytest.importorskip("torch")
+    """Direct ``torch/auto`` never selects the host NumPy solver."""
     from faninsar.processing.coreg import offsets as offsets_mod
 
+    torch = pytest.importorskip("torch")
+
+    # Keep this unit test on the portable auto/CPU branch when it runs on a
+    # qualified CUDA host; the CUDA override is covered separately below.
     monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
-    monkeypatch.setattr(
-        offsets_mod,
-        "_patch_ncc_shift",
-        lambda *_args, **_kwargs: pytest.fail("torch/auto selected host NumPy"),
-    )
+
     monkeypatch.setattr(
         offsets_mod,
         "_torch_patch_ncc_batch",
-        lambda *_args, **_kwargs: (
-            torch.tensor([0.0], dtype=torch.float64),
-            torch.tensor([0.0], dtype=torch.float64),
-            torch.tensor([10.0], dtype=torch.float64),
+        lambda ref, *_args, **_kwargs: (
+            torch.zeros(ref.shape[0], dtype=torch.float64),
+            torch.zeros(ref.shape[0], dtype=torch.float64),
+            torch.full((ref.shape[0],), 10.0, dtype=torch.float64),
         ),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_patch_ncc_shift",
+        lambda *_args, **_kwargs: pytest.fail("Torch auto selected host NumPy"),
     )
     result = estimate_patch_amplitude_shift(
         np.ones((64, 96), dtype=np.complex64),
@@ -1604,10 +2080,12 @@ def test_ampcor_seed_123_boundary_is_parity_stable(
     monkeypatch.setattr(
         offsets_mod,
         "_torch_patch_ncc_batch",
-        lambda *_args, **_kwargs: (
-            torch.tensor([0.25, 0.5], dtype=torch.float64),
-            torch.tensor([-0.25, -0.5], dtype=torch.float64),
-            torch.tensor([snr_threshold, snr_below], dtype=torch.float64),
+        lambda ref, *_args, **_kwargs: (
+            torch.tensor([0.25, 0.5], dtype=torch.float64)[: ref.shape[0]],
+            torch.tensor([-0.25, -0.5], dtype=torch.float64)[: ref.shape[0]],
+            torch.tensor([snr_threshold, snr_below], dtype=torch.float64)[
+                : ref.shape[0]
+            ],
         ),
     )
     monkeypatch.setattr(
@@ -1678,6 +2156,480 @@ def test_ampcor_boundary_oracle_stabilizes_backend_drift(
     assert result.n_valid == 1
     assert result.range_shift_px == 0.25
     assert result.azimuth_shift_px == -0.25
+
+
+def test_ampcor_boundary_oracle_recomputes_only_boundary_lanes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary reference work is limited to lanes near a cull threshold."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    threshold = np.float64(5.0)
+    near_threshold = threshold
+    for _ in range(8):
+        near_threshold = np.nextafter(near_threshold, np.inf)
+    far_threshold = threshold
+    for _ in range(100):
+        far_threshold = np.nextafter(far_threshold, np.inf)
+    calls: list[tuple[int, bool]] = []
+
+    def fake_ncc(ref: object, *_args: object, **kwargs: object) -> tuple[object, ...]:
+        count = int(ref.shape[0])
+        force_fft = bool(kwargs.get("force_fft_energy", False))
+        calls.append((count, force_fft))
+        if force_fft:
+            # The oracle changes only the first lane.  A full-batch rerun would
+            # incorrectly change the non-boundary lane as well.
+            return (
+                torch.full((count,), 0.75, dtype=torch.float64),
+                torch.full((count,), -0.25, dtype=torch.float64),
+                torch.full((count,), threshold, dtype=torch.float64),
+            )
+        return (
+            torch.tensor([0.25, 0.5], dtype=torch.float64),
+            torch.tensor([-0.25, -0.5], dtype=torch.float64),
+            torch.tensor([near_threshold, far_threshold], dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", fake_ncc)
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 96), dtype=np.complex64),
+        np.ones((64, 96), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=2,
+        margin_rg=16,
+        margin_az=8,
+        snr_threshold=float(threshold),
+        max_abs_residual=1.2,
+        executor="torch",
+        device="cpu",
+        batch_size=2,
+    )
+
+    assert calls == [(2, False), (1, True)]
+    assert result.n_valid == 2
+    assert result.range_shift_px == pytest.approx(0.625)
+    assert result.azimuth_shift_px == pytest.approx(-0.375)
+
+
+def test_ampcor_boundary_oracle_uses_two_workspace_transactions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary reference work starts after the full-batch lease is released."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    threshold = np.float64(5.0)
+    near_threshold = np.nextafter(threshold, np.inf)
+    workspace_plans: list[int] = []
+    events: list[tuple[str, int]] = []
+
+    class WorkspaceLease:
+        def __init__(self, ordinal: int) -> None:
+            self.ordinal = ordinal
+
+        def __enter__(self) -> None:
+            events.append(("enter", self.ordinal))
+
+        def __exit__(self, *_args: object) -> bool:
+            events.append(("exit", self.ordinal))
+            return False
+
+    def fake_workspace(
+        _key: str,
+        planned_bytes: int,
+        _limit_bytes: int,
+        **_kwargs: object,
+    ) -> WorkspaceLease:
+        workspace_plans.append(planned_bytes)
+        return WorkspaceLease(len(workspace_plans))
+
+    monkeypatch.setattr(offsets_mod, "_admit_torch_ampcor_workspace", fake_workspace)
+
+    def fake_ncc(ref: object, *_args: object, **kwargs: object) -> tuple[object, ...]:
+        force_fft = bool(kwargs.get("force_fft_energy", False))
+        events.append(("force" if force_fft else "main", int(ref.shape[0])))
+        if force_fft:
+            return (
+                torch.tensor([0.75], dtype=torch.float64),
+                torch.tensor([-0.25], dtype=torch.float64),
+                torch.tensor([threshold], dtype=torch.float64),
+            )
+        return (
+            torch.tensor([0.25, 0.5], dtype=torch.float64),
+            torch.tensor([-0.25, -0.5], dtype=torch.float64),
+            torch.tensor([near_threshold, 8.0], dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", fake_ncc)
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 96), dtype=np.complex64),
+        np.ones((64, 96), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=2,
+        margin_rg=16,
+        margin_az=8,
+        snr_threshold=float(threshold),
+        max_abs_residual=1.2,
+        executor="torch",
+        device="cpu",
+        batch_size=2,
+    )
+
+    assert result.n_valid == 2
+    assert len(workspace_plans) == 2
+    assert workspace_plans[1] < workspace_plans[0]
+    assert events == [
+        ("enter", 1),
+        ("main", 2),
+        ("exit", 1),
+        ("enter", 2),
+        ("force", 1),
+        ("exit", 2),
+    ]
+
+
+def test_ampcor_no_boundary_uses_only_one_workspace_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-boundary batch does not open a reference transaction."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    workspace_calls: list[int] = []
+
+    class WorkspaceLease:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        offsets_mod,
+        "_admit_torch_ampcor_workspace",
+        lambda _key, planned, _limit, **_kwargs: (
+            workspace_calls.append(planned) or WorkspaceLease()
+        ),
+    )
+    force_calls: list[int] = []
+
+    def no_boundary_ncc(
+        ref: object, *_args: object, **kwargs: object
+    ) -> tuple[object, ...]:
+        if kwargs.get("force_fft_energy"):
+            force_calls.append(int(ref.shape[0]))
+        count = int(ref.shape[0])
+        return (
+            torch.zeros(count, dtype=torch.float64),
+            torch.zeros(count, dtype=torch.float64),
+            torch.full((count,), 10.0, dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", no_boundary_ncc)
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 96), dtype=np.complex64),
+        np.ones((64, 96), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=2,
+        margin_rg=16,
+        margin_az=8,
+        executor="torch",
+        device="cpu",
+        batch_size=2,
+    )
+
+    assert result.n_valid == 2
+    assert len(workspace_calls) == 1
+    assert force_calls == []
+
+
+def test_ampcor_boundary_second_transaction_rejects_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure to admit the boundary packet cannot publish prefix results."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    threshold = np.float64(5.0)
+    near_threshold = np.nextafter(threshold, np.inf)
+    workspace_calls = 0
+
+    class WorkspaceLease:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+    def reject_second_workspace(
+        _key: str,
+        _planned: int,
+        _limit: int,
+        **_kwargs: object,
+    ) -> WorkspaceLease:
+        nonlocal workspace_calls
+        workspace_calls += 1
+        if workspace_calls == 2:
+            message = "boundary workspace admission rejected"
+            raise ValueError(message)
+        return WorkspaceLease()
+
+    monkeypatch.setattr(
+        offsets_mod, "_admit_torch_ampcor_workspace", reject_second_workspace
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_torch_patch_ncc_batch",
+        lambda ref, *_args, **kwargs: (
+            torch.full((ref.shape[0],), 0.25, dtype=torch.float64),
+            torch.full((ref.shape[0],), -0.25, dtype=torch.float64),
+            torch.full(
+                (ref.shape[0],),
+                threshold if kwargs.get("force_fft_energy") else near_threshold,
+                dtype=torch.float64,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="boundary workspace admission rejected"):
+        estimate_patch_amplitude_shift(
+            np.ones((64, 96), dtype=np.complex64),
+            np.ones((64, 96), dtype=np.complex64),
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=2,
+            margin_rg=16,
+            margin_az=8,
+            snr_threshold=float(threshold),
+            max_abs_residual=1.2,
+            executor="torch",
+            device="cpu",
+            batch_size=2,
+        )
+    assert workspace_calls == 2
+
+
+def test_ampcor_boundary_scatter_preserves_original_lane_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oracle values are scattered by original indices before final culling."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    threshold = np.float64(5.0)
+    near_threshold = np.nextafter(threshold, np.inf)
+    observed: list[object] = []
+
+    def fake_ncc(ref: object, *_args: object, **kwargs: object) -> tuple[object, ...]:
+        if kwargs.get("force_fft_energy"):
+            count = int(ref.shape[0])
+            return (
+                torch.arange(10.0, 10.0 + count, dtype=torch.float64),
+                torch.zeros(count, dtype=torch.float64),
+                torch.full((count,), threshold, dtype=torch.float64),
+            )
+        return (
+            torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64),
+            torch.zeros(3, dtype=torch.float64),
+            torch.tensor([near_threshold, 8.0, near_threshold], dtype=torch.float64),
+        )
+
+    def observe_cull(
+        snr: object,
+        d_rg: object,
+        _d_az: object,
+        **_kwargs: object,
+    ) -> object:
+        observed.append(d_rg.detach().cpu().tolist())
+        return torch.ones_like(snr, dtype=torch.bool)
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", fake_ncc)
+    monkeypatch.setattr(offsets_mod, "_ampcor_cull_mask_torch", observe_cull)
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 128), dtype=np.complex64),
+        np.ones((64, 128), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=3,
+        margin_rg=16,
+        margin_az=8,
+        snr_threshold=float(threshold),
+        max_abs_residual=20.0,
+        executor="torch",
+        device="cpu",
+        batch_size=3,
+    )
+
+    assert observed == [[10.0, 0.2, 11.0]]
+    assert result.n_valid == 3
+
+
+def test_ampcor_cache_cleanup_is_call_scoped_across_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Synchronization and allocator cleanup happen once after all batches."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    sync_devices: list[object] = []
+    cleanup_devices: list[object] = []
+
+    def record_sync(device: object) -> None:
+        sync_devices.append(device)
+
+    def record_cleanup(device: object) -> None:
+        cleanup_devices.append(device)
+
+    def valid_ncc(ref: object, *_args: object, **_kwargs: object) -> tuple[object, ...]:
+        count = int(ref.shape[0])
+        return (
+            torch.zeros(count, dtype=torch.float64),
+            torch.zeros(count, dtype=torch.float64),
+            torch.full((count,), 10.0, dtype=torch.float64),
+        )
+
+    monkeypatch.setattr(offsets_mod, "_synchronize_torch_device", record_sync)
+    monkeypatch.setattr(offsets_mod, "_release_torch_device_cache", record_cleanup)
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", valid_ncc)
+
+    result = estimate_patch_amplitude_shift(
+        np.ones((64, 128), dtype=np.complex64),
+        np.ones((64, 128), dtype=np.complex64),
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=3,
+        margin_rg=16,
+        margin_az=8,
+        executor="torch",
+        device="cpu",
+        batch_size=1,
+    )
+
+    assert result.n_valid == 3
+    assert sync_devices == [torch.device("cpu")]
+    assert cleanup_devices == [torch.device("cpu")]
+    assert offsets_mod._TORCH_AMPCOR_RESERVED_BYTES == {}
+
+
+def test_ampcor_cache_cleanup_is_call_scoped_on_batch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing batch still releases the call-scoped cleanup resources once."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    sync_devices: list[object] = []
+    cleanup_devices: list[object] = []
+    monkeypatch.setattr(
+        offsets_mod,
+        "_synchronize_torch_device",
+        lambda device: sync_devices.append(device),
+    )
+    monkeypatch.setattr(
+        offsets_mod,
+        "_release_torch_device_cache",
+        lambda device: cleanup_devices.append(device),
+    )
+
+    def failing_ncc(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        message = "synthetic NCC failure"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(offsets_mod, "_torch_patch_ncc_batch", failing_ncc)
+    with pytest.raises(RuntimeError, match="synthetic NCC failure"):
+        estimate_patch_amplitude_shift(
+            np.ones((64, 128), dtype=np.complex64),
+            np.ones((64, 128), dtype=np.complex64),
+            window_az=8,
+            window_rg=16,
+            search_az=2,
+            search_rg=2,
+            n_az=1,
+            n_rg=3,
+            margin_rg=16,
+            margin_az=8,
+            executor="torch",
+            device="cpu",
+            batch_size=1,
+        )
+
+    assert sync_devices == [torch.device("cpu")]
+    assert cleanup_devices == [torch.device("cpu")]
+    assert offsets_mod._TORCH_AMPCOR_RESERVED_BYTES == {}
+
+
+@pytest.mark.parametrize("backend", ["eager", "compile", "native"])
+@pytest.mark.parametrize("profile", ["near_uniform", "high_dynamic"])
+def test_ampcor_candidate_energy_guard_uses_fft_fallback(
+    monkeypatch: pytest.MonkeyPatch, backend: str, profile: str
+) -> None:
+    """Unsafe candidate energy is replaced by the same-device FFT result."""
+    torch = pytest.importorskip("torch")
+    from faninsar.processing.coreg import offsets as offsets_mod
+    from faninsar.processing.coreg.ampcor_backend import AmpcorEnergyCandidate
+
+    if profile == "near_uniform":
+        secondary = torch.ones((1, 8, 8), dtype=torch.float64)
+        secondary[0, 0, 0] += 1e-3
+    else:
+        secondary = torch.zeros((1, 8, 8), dtype=torch.float64)
+        secondary[0, 0, 0] = 1e5
+    reference = torch.arange(16, dtype=torch.float64).reshape(1, 4, 4)
+    fft_calls: list[int] = []
+
+    def zero_energy(value: object) -> object:
+        fft_calls.append(-1)
+        return torch.zeros(
+            (value.shape[0], value.shape[1] - 4 + 1, value.shape[2] - 4 + 1),
+            dtype=torch.float64,
+            device=value.device,
+        )
+
+    candidate = AmpcorEnergyCandidate(
+        backend=backend,  # type: ignore[arg-type]
+        device="cpu",
+        window_shape=(4, 4),
+        executor=zero_energy,
+        input_shape=(1, 8, 8),
+    )
+
+    def fake_fft(sec: object, _ref: object, **_kwargs: object) -> object:
+        fft_calls.append(1)
+        return torch.ones((sec.shape[0], 5, 5), dtype=torch.float64, device=sec.device)
+
+    monkeypatch.setattr(offsets_mod, "_torch_local_energy_fft", fake_fft)
+    offsets_mod._torch_patch_ncc_batch(
+        reference,
+        secondary,
+        search_az=2,
+        search_rg=2,
+        subpixel=False,
+        energy_candidate=candidate,
+    )
+    assert fft_calls == [-1, 1]
 
 
 def test_ampcor_cuda_rejects_unqualified_fft_shape_before_kernel() -> None:
@@ -1792,10 +2744,11 @@ def test_refine_shift_rejects_unqualified_mps_before_secondary_roll(
         )
 
 
-def test_refine_shift_rejects_dispatch_before_secondary_roll(
+def test_refine_shift_cuda_overrides_numpy_before_secondary_roll(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Contradictory requests fail before input-derived workspace allocation."""
+    """CUDA admission selects Torch even when NumPy was requested."""
+    torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import geometry_coreg
 
     monkeypatch.setattr(
@@ -1803,16 +2756,36 @@ def test_refine_shift_rejects_dispatch_before_secondary_roll(
         "roll",
         lambda *_args, **_kwargs: pytest.fail("np.roll ran before policy validation"),
     )
-    samples = np.ones((32, 64), dtype=np.complex64)
-    with pytest.raises((InvalidProcessingStateError, RuntimeError, ImportError)):
-        geometry_coreg.refine_shift_with_correlation(
-            samples,
-            samples,
-            prior_rg=0.0,
-            prior_az=0.0,
-            executor="numpy",
-            device="cuda:0",
+    monkeypatch.setattr(
+        geometry_coreg,
+        "_validate_ampcor_accelerator",
+        lambda _device: None,
+    )
+    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    captured: dict[str, object] = {}
+
+    def fake_estimate(*_args: object, **kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            range_shift_px=0.0,
+            azimuth_shift_px=0.0,
+            n_valid=0,
+            snr_median=0.0,
         )
+
+    monkeypatch.setattr(geometry_coreg, "estimate_patch_amplitude_shift", fake_estimate)
+    samples = np.ones((32, 64), dtype=np.complex64)
+    assert geometry_coreg.refine_shift_with_correlation(
+        samples,
+        samples,
+        prior_rg=0.0,
+        prior_az=0.0,
+        executor="numpy",
+        device="cuda:0",
+    ) == (0.0, 0.0)
+    assert captured["executor"] == "torch"
+    assert captured["device"] == "cuda:0"
 
 
 def test_refine_shift_rejects_unavailable_cuda_before_secondary_roll(

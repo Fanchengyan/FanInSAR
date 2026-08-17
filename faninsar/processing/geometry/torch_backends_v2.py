@@ -182,7 +182,13 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
         resolved = parse_device(device)
     except RuntimeError as error:
         requested = str(device).strip().lower()
-        if requested.startswith("cuda:") and requested.removeprefix("cuda:").isdigit():
+        error_text = str(error)
+        if (
+            requested.startswith("cuda:")
+            and requested.removeprefix("cuda:").isdigit()
+            and "CUDA ordinal" in error_text
+            and "not in range" in error_text
+        ):
             message = (
                 "unsupported device ordinal "
                 f"{int(requested.removeprefix('cuda:'))}"
