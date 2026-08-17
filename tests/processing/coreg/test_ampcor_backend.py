@@ -24,7 +24,7 @@ from faninsar.processing.coreg.ampcor_backend import (
 _NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
 _NCC_ABI = "faninsar.ampcor_ncc_postprocess.v1"
 _NCC_OPERATION = "ampcor_ncc_postprocess.v1"
-_NCC_SOURCE = "c9ab63fc3e1904ecd3ccee1121e349d05de908ac05fd59c4bb6b837641f987d5"
+_NCC_SOURCE = "f88a7b883ada00b63677b60cb20965c3a875900596c5642bc4c22226f05dab62"
 
 
 def _ncc_profile(
