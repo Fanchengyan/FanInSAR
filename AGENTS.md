@@ -2,6 +2,36 @@
 
 This file provides guidance to agents when working with code in this repository.
 
+## Governing Proposals
+
+The following registered Waymarks are the normative design baseline for geometry,
+native acceleration, packaging, and their CI. The registered sidecar is the
+source of truth for the full designs; this section records only the rules that
+must hold for day-to-day development.
+
+- **PROPOSAL-0020** — one NumPy-in/NumPy-out geometry contract with Native,
+  prepared Compile, and Eager identities. Dispatch is native-first, then
+  Compile, then same-device Eager; an admitted execution never silently
+  switches backend. The retired finite-difference Newton path is forbidden.
+- **PROPOSAL-0025** — `auto` is the prepared native/Compile/Eager production
+  order. Native artifacts come from the packaged FanInSAR sources and the
+  explicit preparation API; unqualified artifacts fail closed, and CPU serial
+  packaging/dispatch smoke must remain green on Ubuntu, macOS, and Windows CI.
+  A Native/OpenMP performance claim requires evidence from the actual geometry
+  loop, not a separate probe; this CI is only serial/public-dispatch coverage.
+- **PROPOSAL-0026** — `geo2rdr` and `rdr2geo` share the fourteen-field result,
+  strict convergence and invalid-lane rules, variable-DEM semantics, and the
+  integrated device-resident execution contract. All native inputs and results
+  pass one centralized validator before ABI access. Native, Compile, and Eager
+  benchmarks use identical fixture, DEM, iteration budget, and I/O boundaries;
+  compute-only timings cannot replace the full public-call promotion boundary.
+
+When a change would intentionally violate one of these rules, do not patch
+around the Proposal. Amend the relevant Proposal or create a new accepted
+Proposal before formal implementation. Every change touching
+`faninsar/processing/geometry`, native sources, packaging, or the related CI
+must cite the governing Proposal IDs and run the relevant regression tests.
+
 ## Build, Lint, and Test Commands
 
 ```bash
