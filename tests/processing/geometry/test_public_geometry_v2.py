@@ -15,8 +15,8 @@ from faninsar.processing.geometry import (
     execute_geometry,
     prepare_geometry,
 )
+from faninsar.processing.geometry.prepare_production import run_geo2rdr
 from faninsar.processing.geometry.torch_backends_v2 import prepare_torch_geometry
-from faninsar.processing.geometry.transforms import geo2rdr
 from faninsar.processing.geometry.v2 import (
     CandidateKey,
     DeviceKey,
@@ -96,7 +96,7 @@ def _native_outputs(
     model: RadarGeometryModel, values: tuple[np.ndarray, ...]
 ) -> list[np.ndarray]:
     """Build a fourteen-field native-like output from the reference result."""
-    result = geo2rdr(model, *values)
+    result = run_geo2rdr(model, *values, device="cpu", max_iter=20)
     shape = result.latitude_deg.shape
     return [
         np.asarray(result.latitude_deg, dtype=np.float64),

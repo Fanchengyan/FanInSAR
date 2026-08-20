@@ -131,6 +131,7 @@ def test_build_geo2rdr_lut_with_roi_geometry_masks_outside(
         latitude: np.ndarray,
         _longitude: np.ndarray,
         _height: object,
+        **_kwargs: object,
     ) -> object:
         class _FakeGeo2RdrResult:
             converged = np.ones(latitude.shape, dtype=bool)
@@ -139,7 +140,7 @@ def test_build_geo2rdr_lut_with_roi_geometry_masks_outside(
 
         return _FakeGeo2RdrResult()
 
-    monkeypatch.setattr(geo_lut, "geo2rdr", _fake_geo2rdr)
+    monkeypatch.setattr(geo_lut, "run_geo2rdr", _fake_geo2rdr)
     geom = _toy_geometry((32, 64))
     grid = _projected_grid()
     lat, lon = grid_lonlat(grid)
@@ -155,6 +156,7 @@ def test_build_geo2rdr_lut_with_roi_geometry_masks_outside(
         grid=grid,
         full_radar_shape=(32, 64),
         height_m=0.0,
+        device="cpu",
         chunk_size=2,
         roi_geometry=roi,
         polygon_dilate_px=0,
@@ -172,6 +174,7 @@ def test_build_geo2rdr_lut_with_roi_geometry_masks_outside(
         grid=grid,
         full_radar_shape=(32, 64),
         height_m=0.0,
+        device="cpu",
         chunk_size=2,
         roi_geometry=half,
         polygon_dilate_px=0,
@@ -189,6 +192,7 @@ def test_geo2rdr_lut_retains_sampled_height() -> None:
         grid=grid,
         full_radar_shape=(64, 128),
         height_m=123.5,
+        device="cpu",
     )
 
     assert lut.height_full is not None
@@ -398,6 +402,7 @@ def test_shared_lut_apply_twice_same_shape() -> None:
         grid=grid,
         full_radar_shape=(32, 64),
         height_m=0.0,
+        device="cpu",
         chunk_size=2,
     )
     a = np.ones((32, 64), dtype=np.complex64)
@@ -422,6 +427,7 @@ def test_build_geo2rdr_lut_accepts_height_array() -> None:
         grid=grid,
         full_radar_shape=(32, 64),
         height_m=h,
+        device="cpu",
         chunk_size=2,
     )
     lut_dem = build_geo2rdr_lut(
@@ -430,6 +436,7 @@ def test_build_geo2rdr_lut_accepts_height_array() -> None:
         full_radar_shape=(32, 64),
         height_m=1000.0,
         dem=ConstantHeightDEM(1000.0),
+        device="cpu",
         chunk_size=2,
     )
     assert lut_arr.az_full.shape == grid.shape
@@ -450,6 +457,7 @@ def test_build_geo2rdr_lut_can_use_disk_backed_arrays(tmp_path: Path) -> None:
         grid=grid,
         full_radar_shape=(32, 64),
         height_m=0.0,
+        device="cpu",
         chunk_size=2,
         storage_dir=tmp_path,
     )

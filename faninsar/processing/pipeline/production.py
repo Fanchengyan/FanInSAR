@@ -40,10 +40,13 @@ from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import (
     ConstantHeightDEM,
     RadarGeometryModel,
-    rdr2geo_with_dem_chunked,
 )
 from faninsar.processing.geometry.baseline import BaselineComponents
 from faninsar.processing.geometry.dem import GeoidAdjustedDEM, RasterDEM
+from faninsar.processing.geometry.prepare_production import (
+    run_geo2rdr,
+    run_rdr2geo_chunked,
+)
 from faninsar.processing.interferometry.flatten import (
     azimuth_ramp_device_kwargs,
     compute_geometric_phase_from_geo,
@@ -674,6 +677,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
             ref.geometry,
             dem,
             state.reference_deramped.shape,
+            device=device,
             buffer_m=roi_buffer_m,
         )
     state = stage_coregister(
@@ -1764,6 +1768,7 @@ def stage_coregister(
             burst_shape=ref.shape,
             reference_model=state.reference.geometry,
             secondary_model=state.secondary.geometry,
+            device=device,
             dem=dem,
             probe_stride=max(32, 8 * resolved_control_spacing),
         )
@@ -1804,6 +1809,7 @@ def stage_coregister(
                 shape=ref.shape,
                 reference_model=state.reference.geometry,
                 secondary_model=state.secondary.geometry,
+                device=device,
                 dem=dem,
                 stride=resolved_control_spacing,
                 row0=0 if window_origin is None else window_origin[0],
@@ -2036,6 +2042,7 @@ def stage_coregister(
                 radar_shape=ref.shape,
                 dem=state.dem,
                 grid=geo_grid,
+                device=device,
             )
             footprint_lonlat = None
             roi_geometry = None
@@ -2049,6 +2056,7 @@ def stage_coregister(
                     geometry=state.reference.geometry,
                     radar_shape=ref.shape,
                     dem=state.dem,
+                    device=device,
                 )
                 if burst_quad is not None:
                     intersection = _roi_geometry(roi).intersection(
@@ -2082,6 +2090,7 @@ def stage_coregister(
                 full_radar_shape=ref.shape,
                 height_m=geo_height_m,
                 dem=state.dem,
+                device=device,
                 chunk_size=geo_chunk_size,
                 storage_dir=work_directory / "lut",
                 row_range=(burst_row0, burst_row1),
@@ -2207,13 +2216,13 @@ def stage_coregister(
         * secondary_geometry.range_spacing_m
         / secondary_geometry.wavelength_m
     )
-    for row_start in range(0, sec_resamp.shape[0], 64):
-        rows = slice(row_start, min(row_start + 64, sec_resamp.shape[0]))
-        range_carrier_phase = phase_per_range_pixel * offsets.range_offset_px[rows]
-        sec_resamp[rows] = remove_topographic_phase(
-            sec_resamp[rows],
-            range_carrier_phase,
-        ).astype(np.complex64, copy=False)
+    range_carrier_phase = phase_per_range_pixel * offsets.range_offset_px
+    sec_resamp = _flatten_complex_ifg(
+        sec_resamp,
+        range_carrier_phase,
+        resolved_torch_device,
+        dask_client,
+    ).astype(np.complex64, copy=False)
     state.coregistration_timings_s["radar_resample_and_flatten"] = (
         time.perf_counter() - substage_started
     )
@@ -2510,6 +2519,7 @@ def stage_flatten(
             az_grid,
             rg_grid,
             state.dem,
+            device=device,
         )
         topo_finite = topo[np.isfinite(topo)]
         topo_valid_frac = float(np.isfinite(topo).mean())
@@ -2774,6 +2784,7 @@ def stage_baseline(state: ProductionPairState) -> ProductionPairState:
 def stage_geocode(
     state: ProductionPairState,
     *,
+    device: str,
     chunk_size: tuple[int, int] = (256, 256),
 ) -> ProductionPairState:
     """Geocode unwrapped phase and coherence with chunked vectorized rdr2geo."""
@@ -2786,11 +2797,12 @@ def stage_geocode(
     az = np.arange(height, dtype=np.float64) * az_scale
     rg = np.arange(width, dtype=np.float64) * rg_scale
     az_grid, rg_grid = np.meshgrid(az, rg, indexing="ij")
-    transform = rdr2geo_with_dem_chunked(
+    transform = run_rdr2geo_chunked(
         state.reference.geometry,
         az_grid,
         rg_grid,
         state.dem,
+        device=device,
         chunk_size=chunk_size,
     )
     unw = np.where(transform.converged, state.unwrapped_phase, np.nan)
@@ -3442,6 +3454,7 @@ def _auto_dem_bounds(
                 geometry=geometry,
                 radar_shape=shape,
                 dem=dem,
+                device="cpu",
             )
             if quad is not None:
                 quads.append(quad)
@@ -3519,6 +3532,7 @@ def _select_bursts_by_roi(
                     geometry=geometry,
                     radar_shape=shape,
                     dem=dem,
+                    device="cpu",
                 )
                 if quad is None:
                     continue
@@ -3561,19 +3575,20 @@ def _roi_burst_window(
     geometry: RadarGeometryModel,
     dem: DEMSampler,
     shape: tuple[int, int],
+    *,
+    device: str,
     buffer_m: float = 320.0,
 ) -> tuple[int, int, int, int] | None:
     """Return the radar window covering the ROI-burst quad intersection."""
     from shapely.geometry import Polygon as ShapelyPolygon
 
-    from faninsar.processing.geometry import geo2rdr
     from faninsar.processing.pipeline.geo_lut import (
         burst_geo_quad_lonlat,
         polygon_parts,
     )
 
     region = _roi_geometry(roi)
-    quad = burst_geo_quad_lonlat(geometry, shape, dem)
+    quad = burst_geo_quad_lonlat(geometry, shape, dem, device=device)
     if quad is not None:
         intersection = region.intersection(ShapelyPolygon(quad).buffer(0))
         parts = [part for part in polygon_parts(intersection) if not part.is_empty]
@@ -3592,7 +3607,7 @@ def _roi_burst_window(
         lon = np.asarray([min_lon, max_lon, max_lon, min_lon], dtype=np.float64)
         lat = np.asarray([max_lat, max_lat, min_lat, min_lat], dtype=np.float64)
     height = np.asarray(dem.sample(lat, lon), dtype=np.float64)
-    transform = geo2rdr(geometry, lat, lon, height)
+    transform = run_geo2rdr(geometry, lat, lon, height, device=device)
     azimuth = np.asarray(transform.azimuth_index, dtype=np.float64)
     range_index = np.asarray(transform.range_index, dtype=np.float64)
     ok = (
@@ -4294,6 +4309,7 @@ def run_pair(
                         ref.geometry,
                         dem_sampler,
                         measure_state.reference_deramped.shape,
+                        device=device,
                         buffer_m=roi_buffer_m,
                     )
                 measure_state = stage_coregister(
@@ -4386,6 +4402,7 @@ def run_pair(
                     ref.geometry,
                     dem_sampler,
                     state.reference_deramped.shape,
+                    device=device,
                     buffer_m=roi_buffer_m,
                 )
             state = stage_coregister(

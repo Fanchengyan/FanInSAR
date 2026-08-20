@@ -90,6 +90,7 @@ def test_geocode_complex_to_grid_returns_geocoded_complex() -> None:
         geometry=model,
         grid=grid,
         height_m=0.0,
+        device="cpu",
     )
     assert isinstance(result, GeocodedComplex)
     assert result.complex.shape == grid.shape
@@ -109,6 +110,7 @@ def test_geocode_complex_to_grid_marks_out_of_range_invalid() -> None:
         geometry=model,
         grid=grid,
         height_m=0.0,
+        device="cpu",
     )
     # The toy geometry won't overlap much of this arbitrary UTM grid, so
     # most pixels should be invalid. At minimum, valid_mask must be a
@@ -129,6 +131,7 @@ def test_geocode_complex_to_grid_preserves_constant_amplitude() -> None:
         geometry=model,
         grid=grid,
         height_m=0.0,
+        device="cpu",
     )
     if result.valid_mask.any():
         amps = np.abs(result.complex[result.valid_mask])
@@ -146,6 +149,7 @@ def test_geocode_complex_to_grid_rejects_shape_mismatch() -> None:
             geometry=model,
             grid=grid,
             height_m=0.0,
+        device="cpu",
             radar_shape=(32, 32),
         )
 
@@ -161,6 +165,7 @@ def test_geocoded_complex_carries_weight_field() -> None:
         geometry=model,
         grid=grid,
         height_m=0.0,
+        device="cpu",
     )
     assert result.weight.shape == grid.shape
     assert result.weight.dtype == np.float32

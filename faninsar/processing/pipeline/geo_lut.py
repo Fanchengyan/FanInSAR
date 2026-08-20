@@ -9,7 +9,7 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.geometry import geo2rdr
+from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr2geo
 from faninsar.processing.memory import release_memmap_pages
 
 if TYPE_CHECKING:
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from faninsar.processing.geometry import RadarGeometryModel
     from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
 
@@ -78,6 +79,7 @@ def derive_burst_geo_bbox(
     *,
     margin_px: int = 32,
     dem: DEMSampler | None = None,
+    device: DeviceLike,
 ) -> tuple[int, int, int, int]:
     """Return ``(row0, row1, col0, col1)`` bounding the burst footprint.
 
@@ -100,6 +102,8 @@ def derive_burst_geo_bbox(
         Extra rows/cols added around the footprint bbox.
     dem : DEMSampler, optional
         DEM used by rdr2geo. When omitted an ellipsoid is used.
+    device : DeviceLike
+        Required production device (``auto`` resolves to cpu or cuda).
 
     Returns
     -------
@@ -107,8 +111,6 @@ def derive_burst_geo_bbox(
         ``(row0, row1, col0, col1)`` half-open bounding box.
 
     """
-    from faninsar.processing.geometry import rdr2geo_ellipsoid, rdr2geo_with_dem
-
     height, width = radar_shape
     # corners + edge midpoints
     points = np.array(
@@ -124,27 +126,16 @@ def derive_burst_geo_bbox(
         ],
         dtype=np.float64,
     )
-    if dem is not None:
-        res = rdr2geo_with_dem(
-            geometry,
-            points[:, 0],
-            points[:, 1],
-            dem,
-            height_seed_m=0.0,
-        )
-        lat = np.asarray(res.latitude_deg)
-        lon = np.asarray(res.longitude_deg)
-        ok = np.isfinite(lat) & np.isfinite(lon)
-    else:
-        res = rdr2geo_ellipsoid(
-            geometry,
-            points[:, 0],
-            points[:, 1],
-            height_m=0.0,
-        )
-        lat = np.asarray(res.latitude_deg)
-        lon = np.asarray(res.longitude_deg)
-        ok = np.isfinite(lat) & np.isfinite(lon)
+    res = run_rdr2geo(
+        geometry,
+        points[:, 0],
+        points[:, 1],
+        dem,
+        device=device,
+    )
+    lat = np.asarray(res.latitude_deg)
+    lon = np.asarray(res.longitude_deg)
+    ok = np.isfinite(lat) & np.isfinite(lon)
     if not np.any(ok):
         return (0, grid.height, 0, grid.width)
 
@@ -166,6 +157,8 @@ def burst_geo_quad_lonlat(
     geometry: RadarGeometryModel,
     radar_shape: tuple[int, int],
     dem: DEMSampler | None,
+    *,
+    device: DeviceLike,
 ) -> np.ndarray | None:
     """Return the burst frame's 4-corner ground quad in (lon, lat).
 
@@ -181,6 +174,8 @@ def burst_geo_quad_lonlat(
         Radar image shape ``(height, width)``.
     dem : DEMSampler, optional
         DEM for rdr2geo; when omitted an ellipsoid is used.
+    device : DeviceLike
+        Required production device (``auto`` resolves to cpu or cuda).
 
     Returns
     -------
@@ -188,8 +183,6 @@ def burst_geo_quad_lonlat(
         ``(N, 2)`` ring of (lon, lat) corners (``N >= 3``) or None.
 
     """
-    from faninsar.processing.geometry import rdr2geo_ellipsoid, rdr2geo_with_dem
-
     height, width = radar_shape
     points = np.array(
         [
@@ -200,37 +193,16 @@ def burst_geo_quad_lonlat(
         ],
         dtype=np.float64,
     )
-    if dem is not None:
-        res = rdr2geo_with_dem(
-            geometry,
-            points[:, 0],
-            points[:, 1],
-            dem,
-            height_seed_m=0.0,
-        )
-        lat = np.asarray(res.latitude_deg, dtype=np.float64)
-        lon = np.asarray(res.longitude_deg, dtype=np.float64)
-        ok = np.isfinite(lat) & np.isfinite(lon)
-        if not np.all(ok):
-            fallback = rdr2geo_ellipsoid(
-                geometry,
-                points[~ok, 0],
-                points[~ok, 1],
-                height_m=0.0,
-            )
-            lat[~ok] = np.asarray(fallback.latitude_deg, dtype=np.float64)
-            lon[~ok] = np.asarray(fallback.longitude_deg, dtype=np.float64)
-            ok = np.isfinite(lat) & np.isfinite(lon)
-    else:
-        res = rdr2geo_ellipsoid(
-            geometry,
-            points[:, 0],
-            points[:, 1],
-            height_m=0.0,
-        )
-        lat = np.asarray(res.latitude_deg, dtype=np.float64)
-        lon = np.asarray(res.longitude_deg, dtype=np.float64)
-        ok = np.isfinite(lat) & np.isfinite(lon)
+    res = run_rdr2geo(
+        geometry,
+        points[:, 0],
+        points[:, 1],
+        dem,
+        device=device,
+    )
+    lat = np.asarray(res.latitude_deg, dtype=np.float64)
+    lon = np.asarray(res.longitude_deg, dtype=np.float64)
+    ok = np.isfinite(lat) & np.isfinite(lon)
     if int(ok.sum()) < 3:
         return None
     return np.column_stack([lon[ok], lat[ok]])
@@ -475,6 +447,7 @@ def build_geo2rdr_lut(
     footprint_lonlat: np.ndarray | None = None,
     roi_geometry: object | None = None,
     polygon_dilate_px: int = 64,
+    device: DeviceLike,
 ) -> Geo2RdrLUT:
     """Build a reusable geographic-to-radar lookup table.
 
@@ -490,6 +463,8 @@ def build_geo2rdr_lut(
         Fallback ellipsoidal height.
     dem : DEMSampler, optional
         Per-pixel ellipsoidal height source.
+    device : DeviceLike
+        Required production device (``auto`` resolves to cpu or cuda).
     chunk_size : int, optional
         Destination rows processed per geometry call.
     storage_dir : str or pathlib.Path, optional
@@ -651,11 +626,12 @@ def build_geo2rdr_lut(
         if not np.isscalar(height_chunk):
             mean_heights.append(float(np.nanmean(height_chunk)))
 
-        result = geo2rdr(
+        result = run_geo2rdr(
             geometry,
             safe_latitude,
             safe_longitude,
             height_chunk,
+            device=device,
         )
         chunk_valid = (
             finite_geo

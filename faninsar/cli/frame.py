@@ -144,6 +144,7 @@ def _cli_dem_bounds(
                     geometry=geometry,
                     radar_shape=shape,
                     dem=None,
+                    device="cpu",
                 )
                 if quad is not None:
                     quads.append(quad)

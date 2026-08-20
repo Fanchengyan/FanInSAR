@@ -11,19 +11,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 
 from faninsar.logging import setup_logger
 from faninsar.processing.coreg.offsets import OffsetFieldResult
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.geometry.transforms import (
-    RadarGeometryModel,
-    geo2rdr,
-    rdr2geo_with_dem,
+from faninsar.processing.geometry.prepare_production import (
+    interpolate_control_field,
+    run_geo2rdr,
+    run_rdr2geo,
 )
 
 if TYPE_CHECKING:
     from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.geometry.transforms import RadarGeometryModel
+    from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
 
@@ -66,11 +67,12 @@ def _interpolate_field(
     values_ctrl: np.ndarray,
     shape: tuple[int, int],
     *,
+    device: DeviceLike,
     fill_value: float = 0.0,
 ) -> np.ndarray:
     """Interpolate a scalar field from a control grid to full resolution.
 
-    Uses bilinear interpolation via ``RegularGridInterpolator``.
+    Uses device-resident bilinear interpolation (PROPOSAL-0031).
 
     Parameters
     ----------
@@ -80,6 +82,8 @@ def _interpolate_field(
         2-D array of shape ``(len(az_ctrl), len(rg_ctrl))``.
     shape : tuple[int, int]
         Target full-resolution shape.
+    device : DeviceLike
+        Required production device (cpu or cuda after resolution).
     fill_value : float, optional
         Value for out-of-bounds samples (should not occur for control grids
         that span the array).
@@ -90,27 +94,14 @@ def _interpolate_field(
         Interpolated full-resolution array.
 
     """
-    interpolator = RegularGridInterpolator(
-        (az_ctrl, rg_ctrl),
+    return interpolate_control_field(
+        az_ctrl,
+        rg_ctrl,
         values_ctrl,
-        method="linear",
-        bounds_error=False,
+        shape,
+        device=device,
         fill_value=fill_value,
     )
-    height, width = shape
-    # Tile azimuth so the (N, 2) query buffer never holds a full S1 burst
-    # (~30M points x 16 B is about 0.5 GB) beside other offset fields.
-    out = np.empty(shape, dtype=np.float64)
-    row_chunk = 128
-    col_idx = np.arange(width, dtype=np.float64)
-    for row0 in range(0, height, row_chunk):
-        row1 = min(row0 + row_chunk, height)
-        n_rows = row1 - row0
-        az = np.arange(row0, row1, dtype=np.float64)
-        az_grid, rg_grid = np.meshgrid(az, col_idx, indexing="ij")
-        points = np.column_stack([az_grid.ravel(), rg_grid.ravel()])
-        out[row0:row1] = interpolator(points).reshape(n_rows, width)
-    return out
 
 
 def _control_point_geometry_offsets(
@@ -118,6 +109,7 @@ def _control_point_geometry_offsets(
     *,
     reference_model: RadarGeometryModel,
     secondary_model: RadarGeometryModel,
+    device: DeviceLike,
     dem: DEMSampler | None = None,
     stride: int = 32,
     max_iter: int = 30,
@@ -141,6 +133,8 @@ def _control_point_geometry_offsets(
         Control-grid array shape ``(azimuth, range)``.
     reference_model, secondary_model : RadarGeometryModel
         Geometry models for the reference and secondary images.
+    device : DeviceLike
+        Required production device (``auto`` resolves to cpu or cuda).
     dem : DEMSampler | None, optional
         DEM height sampler.  If ``None``, a constant zero-height ellipsoid
         is used.
@@ -168,29 +162,16 @@ def _control_point_geometry_offsets(
     az_grid = az_ctrl[:, None] + float(row0)
     rg_grid = rg_ctrl[None, :] + float(col0)
 
-    # Reference: radar -> geo
-    if dem is not None:
-        ref_geo = rdr2geo_with_dem(
-            reference_model,
-            az_grid,
-            rg_grid,
-            dem,
-            max_iter=max_iter,
-            range_tol_m=range_tol_m,
-            doppler_tol_hz=doppler_tol_hz,
-        )
-    else:
-        from faninsar.processing.geometry.transforms import rdr2geo_ellipsoid
-
-        ref_geo = rdr2geo_ellipsoid(
-            reference_model,
-            az_grid,
-            rg_grid,
-            height_m=0.0,
-            max_iter=max_iter,
-            range_tol_m=range_tol_m,
-            doppler_tol_hz=doppler_tol_hz,
-        )
+    ref_geo = run_rdr2geo(
+        reference_model,
+        az_grid,
+        rg_grid,
+        dem,
+        device=device,
+        max_iter=max_iter,
+        range_tol_m=range_tol_m,
+        doppler_tol_hz=doppler_tol_hz,
+    )
 
     # Secondary: geo -> radar
     # Mask out non-finite geodetic coordinates to avoid NaN propagation in geo2rdr
@@ -211,12 +192,15 @@ def _control_point_geometry_offsets(
             invalid,
             np.zeros(shape, dtype=bool),
         )
-    sec_rdr = geo2rdr(
+    sec_rdr = run_geo2rdr(
         secondary_model,
         np.where(geo_valid, ref_geo.latitude_deg, 0.0),
         np.where(geo_valid, ref_geo.longitude_deg, 0.0),
         np.where(geo_valid, ref_geo.height_m, 0.0),
+        device=device,
         max_iter=max_iter,
+        range_tol_m=range_tol_m,
+        doppler_tol_hz=doppler_tol_hz,
     )
 
     # Valid only where both transforms converged
@@ -253,6 +237,7 @@ def dense_geometry_offsets(
     *,
     reference_model: RadarGeometryModel,
     secondary_model: RadarGeometryModel,
+    device: DeviceLike,
     dem: DEMSampler | None = None,
     stride: int = 32,
     max_iter: int = 30,
@@ -276,6 +261,8 @@ def dense_geometry_offsets(
         Output offset-field shape ``(azimuth, range)``.
     reference_model, secondary_model : RadarGeometryModel
         Geometry models for the reference and secondary images.
+    device : DeviceLike
+        Required production device (``auto`` resolves to cpu or cuda).
     dem : DEMSampler | None, optional
         DEM height sampler.  If ``None``, a constant zero-height ellipsoid
         is used.
@@ -324,6 +311,7 @@ def dense_geometry_offsets(
         shape,
         reference_model=reference_model,
         secondary_model=secondary_model,
+        device=device,
         dem=dem,
         stride=stride,
         max_iter=max_iter,
@@ -378,18 +366,32 @@ def dense_geometry_offsets(
     az_offset_ctrl = _fill_nan_nearest(az_offset_ctrl)
 
     # Interpolate to full resolution
-    rg_offset = _interpolate_field(az_ctrl, rg_ctrl, rg_offset_ctrl, shape)
-    az_offset = _interpolate_field(az_ctrl, rg_ctrl, az_offset_ctrl, shape)
+    rg_offset = _interpolate_field(
+        az_ctrl, rg_ctrl, rg_offset_ctrl, shape, device=device
+    )
+    az_offset = _interpolate_field(
+        az_ctrl, rg_ctrl, az_offset_ctrl, shape, device=device
+    )
 
     # Coverage: interpolate the valid mask as float then threshold
     coverage = _interpolate_field(
-        az_ctrl, rg_ctrl, valid.astype(np.float64), shape, fill_value=0.0
+        az_ctrl,
+        rg_ctrl,
+        valid.astype(np.float64),
+        shape,
+        device=device,
+        fill_value=0.0,
     )
     coverage = coverage > 0.5
 
     uncertainty_ctrl = _fill_nan_nearest(uncertainty_ctrl)
     uncertainty = _interpolate_field(
-        az_ctrl, rg_ctrl, uncertainty_ctrl, shape, fill_value=0.0
+        az_ctrl,
+        rg_ctrl,
+        uncertainty_ctrl,
+        shape,
+        device=device,
+        fill_value=0.0,
     )
     # Cap uncertainty at a reasonable maximum for display / weighting
     uncertainty = np.clip(uncertainty, 0.0, 10.0)
@@ -418,6 +420,7 @@ def geometry_offset_window_extent(
     burst_shape: tuple[int, int],
     reference_model: RadarGeometryModel,
     secondary_model: RadarGeometryModel,
+    device: DeviceLike,
     dem: DEMSampler | None = None,
     probe_stride: int = 64,
     max_iter: int = 30,
@@ -443,6 +446,8 @@ def geometry_offset_window_extent(
         Full burst shape ``(azimuth, range)``.
     reference_model, secondary_model : RadarGeometryModel
         Geometry models for the reference and secondary images.
+    device : DeviceLike
+        Required production device (``auto`` resolves to cpu or cuda).
     dem : DEMSampler | None, optional
         DEM height sampler.  If ``None``, a constant zero-height ellipsoid
         is used.
@@ -472,6 +477,7 @@ def geometry_offset_window_extent(
         (probe_row1 - probe_row0, probe_col1 - probe_col0),
         reference_model=reference_model,
         secondary_model=secondary_model,
+        device=device,
         dem=dem,
         stride=probe_stride,
         max_iter=max_iter,

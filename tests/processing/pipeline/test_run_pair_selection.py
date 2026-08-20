@@ -175,7 +175,9 @@ def test_roi_burst_window_projects_onto_real_geometry() -> None:
     shape = (swath.lines_per_burst, swath.samples_per_burst)
     geometry = _radar_model(swath, burst, shape=shape, row0=0, col0=0)
     roi = BoundingBox(80.0, 20.0, 81.0, 21.0)
-    window = _roi_burst_window(roi, geometry, ConstantHeightDEM(0.0), shape)
+    window = _roi_burst_window(
+        roi, geometry, ConstantHeightDEM(0.0), shape, device="cpu"
+    )
     assert window is None
     assert burst.footprint is not None
     lon = [point[0] for point in burst.footprint]
@@ -183,7 +185,9 @@ def test_roi_burst_window_projects_onto_real_geometry() -> None:
     roi = BoundingBox(
         min(lon) - 0.1, min(lat) - 0.1, max(lon) + 0.1, max(lat) + 0.1
     )
-    window = _roi_burst_window(roi, geometry, ConstantHeightDEM(0.0), shape)
+    window = _roi_burst_window(
+        roi, geometry, ConstantHeightDEM(0.0), shape, device="cpu"
+    )
     assert window is not None
     row0, row1, col0, col1 = window
     assert 0 <= row0 < row1 <= shape[0]

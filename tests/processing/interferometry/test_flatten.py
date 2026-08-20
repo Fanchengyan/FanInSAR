@@ -9,11 +9,7 @@ import pytest
 
 from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
 from faninsar.processing.coordinates import RadarGrid
-from faninsar.processing.geometry import (
-    ConstantHeightDEM,
-    RadarGeometryModel,
-    rdr2geo_ellipsoid,
-)
+from faninsar.processing.geometry import ConstantHeightDEM, RadarGeometryModel
 from faninsar.processing.interferometry.flatten import (
     compute_topographic_phase,
     estimate_residual_topographic_scale,
@@ -99,6 +95,7 @@ def test_remove_topographic_phase_on_synthetic_dem() -> None:
         az_idx,
         rg_idx,
         dem=dem,
+        device="cpu",
     )
 
     # Create a synthetic interferogram where the phase equals the topographic phase
@@ -144,10 +141,14 @@ def test_remove_topographic_phase_changes_phase_when_dem_varies() -> None:
 
     # Varying DEM heights
     dem = ConstantHeightDEM(height_m=0.0)
-    topo_flat = compute_topographic_phase(model_ref, model_sec, az_idx, rg_idx, dem=dem)
+    topo_flat = compute_topographic_phase(
+        model_ref, model_sec, az_idx, rg_idx, dem=dem, device="cpu"
+    )
 
     dem = ConstantHeightDEM(height_m=100.0)
-    topo_hill = compute_topographic_phase(model_ref, model_sec, az_idx, rg_idx, dem=dem)
+    topo_hill = compute_topographic_phase(
+        model_ref, model_sec, az_idx, rg_idx, dem=dem, device="cpu"
+    )
 
     conv_flat = np.isfinite(topo_flat)
     conv_hill = np.isfinite(topo_hill)
@@ -177,6 +178,7 @@ def test_compute_topographic_phase_non_converged_are_nan() -> None:
         az_idx,
         rg_idx,
         dem=dem,
+        device="cpu",
     )
 
     assert np.all(np.isnan(topo_phase))

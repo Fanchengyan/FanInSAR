@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from faninsar.missions.sentinel1.types import S1Burst, S1Product, S1Swath
     from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.typing import DeviceLike
 
 import numpy as np
 
@@ -312,6 +313,7 @@ def stage_geocode(
     state: PairWorkflowState,
     *,
     dem: DEMSampler | None = None,
+    device: DeviceLike,
     stride: int = 1,
 ) -> PairWorkflowState:
     """Stage 6: geocode unwrapped phase and coherence to lon/lat."""
@@ -324,6 +326,7 @@ def stage_geocode(
         row0=state.reference.row0,
         col0=state.reference.col0,
         dem=dem,
+        device=device,
         stride=stride,
     )
     state.geocoded_coherence = geocode_layer(
@@ -333,6 +336,7 @@ def stage_geocode(
         row0=state.reference.row0,
         col0=state.reference.col0,
         dem=dem,
+        device=device,
         stride=stride,
     )
     n_ok = int(np.count_nonzero(state.geocoded_unwrapped.converged))
@@ -525,7 +529,7 @@ def run_pair_workflow(
     if snaphu_config is None:
         snaphu_config = SnaphuConfig(nlooks=float(multilook[0] * multilook[1]))
     state = stage_unwrap(state, config=snaphu_config)
-    state = stage_geocode(state, dem=dem, stride=geocode_stride)
+    state = stage_geocode(state, dem=dem, stride=geocode_stride, device=device)
     state = stage_write(state, output_dir)
     state._note("DONE")
     return state

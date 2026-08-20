@@ -14,11 +14,10 @@ from faninsar.processing.geometry import (
     ConstantHeightDEM,
     RadarGeometryModel,
     TransformCacheKey,
-    geo2rdr,
-    rdr2geo_with_dem,
     read_transform_cache,
     write_transform_cache,
 )
+from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr2geo
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -26,6 +25,7 @@ if TYPE_CHECKING:
     from faninsar.processing.contracts import SLCProduct
     from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.geometry.transforms import TransformResult
+    from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
 
@@ -62,6 +62,7 @@ class RadarSLC:
     def rdr2geo(
         self,
         *,
+        device: DeviceLike,
         dem: DEMSampler | None = None,
         geo_grid: GeoGrid | None = None,
         use_cache: bool = True,
@@ -70,6 +71,8 @@ class RadarSLC:
 
         Parameters
         ----------
+        device : DeviceLike
+            Required production device (``auto`` resolves to cpu or cuda).
         dem : DEMSampler, optional
             Height sampler. Defaults to a zero-height ellipsoid.
         geo_grid : GeoGrid, optional
@@ -112,6 +115,7 @@ class RadarSLC:
             dem_sampler=dem_sampler,
             cache_key=cache_key,
             use_cache=use_cache,
+            device=device,
         )
 
         target_grid = geo_grid or _geo_grid_from_transform(transform)
@@ -145,13 +149,14 @@ class RadarSLC:
         dem_sampler: DEMSampler,
         cache_key: TransformCacheKey,
         use_cache: bool,
+        device: DeviceLike,
     ) -> TransformResult:
         if use_cache and self.cache_root is not None:
             store = self.cache_root / f"{cache_key.as_path_stem()}.zarr"
             if store.exists():
                 _, cached = read_transform_cache(store)
                 return cached
-        transform = rdr2geo_with_dem(model, az, rg, dem_sampler)
+        transform = run_rdr2geo(model, az, rg, dem_sampler, device=device)
         if use_cache and self.cache_root is not None:
             write_transform_cache(self.cache_root, cache_key, transform)
         return transform
@@ -189,6 +194,7 @@ class GeoSLC:
         self,
         radar_grid: RadarGrid,
         *,
+        device: DeviceLike,
         dem: DEMSampler | None = None,
         height_m: float = 0.0,
     ) -> RadarSLC:
@@ -198,6 +204,8 @@ class GeoSLC:
         ----------
         radar_grid : RadarGrid
             Target radar grid.
+        device : DeviceLike
+            Required production device (``auto`` resolves to cpu or cuda).
         dem : DEMSampler, optional
             Unused placeholder for DEM-aware inverse paths.
         height_m : float, optional
@@ -217,7 +225,7 @@ class GeoSLC:
         _ = dem  # reserved for DEM-aware inverse composition
         model = RadarGeometryModel.from_radar_grid(radar_grid, self.product.orbit)
         lat, lon = _geo_centres(self.grid)
-        transform = geo2rdr(model, lat, lon, height_m)
+        transform = run_geo2rdr(model, lat, lon, height_m, device=device)
         radar_samples = _geo_to_radar_resample(
             self.samples,
             transform,

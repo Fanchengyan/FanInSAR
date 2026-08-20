@@ -8,12 +8,14 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.geometry import RadarGeometryModel, rdr2geo_with_dem
 from faninsar.processing.geometry.dem import RasterDEM
 from faninsar.processing.geometry.ellipsoid import llh_to_ecef
+from faninsar.processing.geometry.prepare_production import run_rdr2geo
 
 if TYPE_CHECKING:
+    from faninsar.processing.geometry import RadarGeometryModel
     from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
 
@@ -118,6 +120,7 @@ def compute_topographic_phase(
     range_index: np.ndarray,
     dem: DEMSampler,
     *,
+    device: DeviceLike,
     secondary_azimuth_index: np.ndarray | None = None,
     wavelength_m: float | None = None,
 ) -> np.ndarray:
@@ -146,6 +149,8 @@ def compute_topographic_phase(
         Radar sample coordinates on the coregistered grid.
     dem : DEMSampler
         DEM height sampler.
+    device : DeviceLike
+        Required production device (``auto`` resolves to cpu or cuda).
     secondary_azimuth_index : numpy.ndarray, optional
         Secondary zero-Doppler azimuth coordinates for the same ground targets.
         Direct-remap workflows should pass the fractional source coordinates
@@ -167,12 +172,12 @@ def compute_topographic_phase(
         logger.error(message)
         raise ValueError(message)
 
-    # Map radar indices to geodetic coordinates with DEM heights (reference geometry)
-    geo = rdr2geo_with_dem(
+    geo = run_rdr2geo(
         model_ref,
         azimuth_index,
         range_index,
-        dem=dem,
+        dem,
+        device=device,
     )
 
     phase = np.full(geo.latitude_deg.shape, np.nan, dtype=np.float64)

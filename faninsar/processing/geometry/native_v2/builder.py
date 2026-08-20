@@ -326,11 +326,8 @@ class NativeBuilder:
             (),
             (request.source_root / "cuda",),
             runtime_name=None,
-            supported=False,
-            unsupported_reason=(
-                "native-v2 CUDA kernels are experimental and not scientifically "
-                "qualified"
-            ),
+            supported=True,
+            unsupported_reason="",
         )
 
     def prepare(

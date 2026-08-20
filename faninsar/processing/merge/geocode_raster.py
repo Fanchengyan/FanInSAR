@@ -9,11 +9,13 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
-from faninsar.processing.geometry import RadarGeometryModel, geo2rdr
+from faninsar.processing.geometry.prepare_production import run_geo2rdr
 from faninsar.processing.resampling import lanczos_resample
 
 if TYPE_CHECKING:
+    from faninsar.processing.geometry import RadarGeometryModel
     from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
 
@@ -78,6 +80,7 @@ def geocode_complex_to_grid(
     coherence: np.ndarray | None = None,
     chunk_size: int | None = None,
     radar_shape: tuple[int, int] | None = None,
+    device: DeviceLike,
 ) -> GeocodedComplex:
     """Resample a radar complex array onto a common geographic grid.
 
@@ -111,6 +114,8 @@ def geocode_complex_to_grid(
     radar_shape : tuple of int, optional
         Expected radar array shape ``(height, width)``. When provided the
         input array is checked against it.
+    device : DeviceLike
+        Required production device (``auto`` resolves to cpu or cuda).
 
     Returns
     -------
@@ -159,7 +164,7 @@ def geocode_complex_to_grid(
         # raise; we will mask these pixels out afterwards.
         safe_lat = np.where(geo_finite, lat_c, 0.0)
         safe_lon = np.where(geo_finite, lon_c, 0.0)
-        result = geo2rdr(geometry, safe_lat, safe_lon, height_m)
+        result = run_geo2rdr(geometry, safe_lat, safe_lon, height_m, device=device)
         az = result.azimuth_index
         rg = result.range_index
         conv = result.converged

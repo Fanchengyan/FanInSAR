@@ -81,7 +81,7 @@ def test_step_by_step_workflow(tmp_path: Path) -> None:
     assert state.complex_ifg is not None
     state = stage_unwrap(state)
     assert state.unwrapped_phase is not None
-    state = stage_geocode(state, stride=4)
+    state = stage_geocode(state, stride=4, device="cpu")
     assert state.geocoded_unwrapped is not None
     state = stage_write(state, tmp_path / "steps")
     assert state.zarr_path is not None

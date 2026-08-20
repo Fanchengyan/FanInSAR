@@ -2,7 +2,7 @@
 
 This is **Path A** (forward geocode) in the terminology of the
 ``sar-resampling-kernels`` skill: for each output pixel we invert the radar
-geometry with ``rdr2geo_with_dem`` to get fractional radar ``(az, rg)``
+geometry with ``run_rdr2geo`` to get fractional radar ``(az, rg)``
 coordinates, then resample the radar image at those coordinates.
 
 Resampling kernel is chosen from the array's physical type — **never** by
@@ -23,15 +23,13 @@ from scipy.ndimage import map_coordinates
 from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import RadarGrid
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.geometry import (
-    ConstantHeightDEM,
-    RadarGeometryModel,
-    rdr2geo_with_dem,
-)
+from faninsar.processing.geometry import ConstantHeightDEM, RadarGeometryModel
+from faninsar.processing.geometry.prepare_production import run_rdr2geo
 
 if TYPE_CHECKING:
     from faninsar.missions.sentinel1.types import S1Burst, S1Swath
     from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
 
@@ -203,12 +201,14 @@ def geocode_layer(
     row0: int,
     col0: int,
     dem: DEMSampler | None = None,
+    device: DeviceLike,
     stride: int = 1,
 ) -> GeocodedLayer:
     """Geocode a radar-coordinate layer to lon/lat samples.
 
     Forward geocode (Path A): for each output pixel, invert the radar geometry
-    with :func:`rdr2geo_with_dem` to get fractional radar ``(az, rg)``
+    with :func:`~faninsar.processing.geometry.prepare_production.run_rdr2geo`
+    to get fractional radar ``(az, rg)``
     coordinates, then resample ``values`` at those coordinates with a kernel
     matched to the array's physical type — Lanczos a=4 for complex,
     bilinear for real smooth, nearest for hard integer labels. Nearest-gather
@@ -224,6 +224,8 @@ def geocode_layer(
         Window origin in the measurement raster.
     dem : DEMSampler, optional
         Height sampler. Defaults to zero-height ellipsoid.
+    device : DeviceLike
+        Required production device (``auto`` resolves to cpu or cuda).
     stride : int, optional
         Subsample factor for the rdr2geo solve (1 = every pixel).
 
@@ -250,7 +252,7 @@ def geocode_layer(
     rg = np.arange(0, width, stride, dtype=np.float64)
     az_grid, rg_grid = np.meshgrid(az, rg, indexing="ij")
     dem_sampler = dem if dem is not None else ConstantHeightDEM(0.0)
-    transform = rdr2geo_with_dem(model, az_grid, rg_grid, dem_sampler)
+    transform = run_rdr2geo(model, az_grid, rg_grid, dem_sampler, device=device)
 
     # Resample values at the fractional radar coordinates returned by geo2rdr.
     # The kernel is chosen inside _resample_at_radar_coords by physical type:
