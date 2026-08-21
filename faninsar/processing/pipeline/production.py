@@ -577,6 +577,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     ifg_dir = Path(task["ifg_dir"])
     dem = task["dem"]
     geo_work_dir = task["geo_work_dir"]
+    geo_lut_cache_dir = task.get("geo_lut_cache_dir")
     scene_store_dir = task.get("scene_store_dir")
     scene_grid_shape = task.get("scene_grid_shape")
     prepared_lut_handle = task.get("prepared_geo_lut_handle")
@@ -697,6 +698,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         geo_height_m=geo_height_m,
         geo_chunk_size=geo_chunk_size,
         geo_work_dir=burst_work_dir,
+        geo_lut_cache_dir=geo_lut_cache_dir,
         roi=roi,
         roi_buffer_m=roi_buffer_m,
         roi_window=roi_window,
@@ -1613,6 +1615,7 @@ def stage_coregister(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    geo_lut_cache_dir: str | Path | None = None,
     roi: BoundingBox | Polygons | None = None,
     roi_buffer_m: float = 320.0,
     roi_window: tuple[int, int, int, int] | None = None,
@@ -1677,6 +1680,9 @@ def stage_coregister(
         Geo2rdr row chunk size.
     geo_work_dir : str or pathlib.Path, optional
         Directory for disk-backed Geo intermediate arrays.
+    geo_lut_cache_dir : str or pathlib.Path, optional
+        Shared cache for reference-scene geo2rdr LUTs; entries are keyed by
+        scene, burst, and grid identity.
     roi : BoundingBox or Polygons, optional
         Restricts geo processing to the ROI-burst quad intersection
         (buffered by ``roi_buffer_m``) instead of the full burst bbox.
@@ -2084,6 +2090,22 @@ def stage_coregister(
         state.geo_bbox = (burst_row0, burst_row1, burst_col0, burst_col1)
         if prepared_geo_lut is None:
             substage_started = time.perf_counter()
+            from faninsar.processing.pipeline.geo_lut import geo_grid_hash
+
+            lut_cache_key = None
+            lut_cache_dir = (
+                Path(geo_lut_cache_dir) if geo_lut_cache_dir is not None else None
+            )
+            if lut_cache_dir is not None:
+                reference_scene = str(state.reference.scene_id)
+                reference_swath = str(getattr(state.reference.swath, "swath", ""))
+                reference_burst = int(
+                    getattr(getattr(state.reference, "burst", None), "index", 0)
+                )
+                lut_cache_key = (
+                    f"{reference_scene}_{reference_swath}_b{reference_burst}_"
+                    f"{geo_grid_hash(geo_grid)}"
+                )
             lut = build_geo2rdr_lut(
                 geometry=state.reference.geometry,
                 grid=geo_grid,
@@ -2093,6 +2115,8 @@ def stage_coregister(
                 device=device,
                 chunk_size=geo_chunk_size,
                 storage_dir=work_directory / "lut",
+                cache_dir=lut_cache_dir,
+                cache_key=lut_cache_key,
                 row_range=(burst_row0, burst_row1),
                 col_range=(burst_col0, burst_col1),
                 footprint_lonlat=footprint_lonlat,
@@ -3707,6 +3731,7 @@ def run_pair(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    geo_lut_cache_dir: str | Path | None = None,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
@@ -3751,6 +3776,7 @@ def run_pair(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    geo_lut_cache_dir: str | Path | None = None,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
@@ -3796,6 +3822,7 @@ def run_pair(
     geo_height_m: float = 0.0,
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
+    geo_lut_cache_dir: str | Path | None = None,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
@@ -3873,6 +3900,11 @@ def run_pair(
     geo_chunk_size : int, optional
         Row chunk shared by geo2rdr and SLC remapping in geo mode.
     geo_work_dir : path, optional
+        Directory for geo-mode burst work products (LUT, geocoded SLC memmaps).
+    geo_lut_cache_dir : path, optional
+        Shared cache directory for reference-scene geo2rdr LUTs. Pairs that
+        share the same reference date and grid reuse the cached solve instead
+        of recomputing it.
         Working directory for geo memmaps; a temporary directory is used
         when omitted.
     scene_store_dir : path, optional
@@ -3966,6 +3998,7 @@ def run_pair(
             geo_height_m=geo_height_m,
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=geo_work_dir,
+            geo_lut_cache_dir=geo_lut_cache_dir,
             scene_store_dir=scene_store_dir,
             n_jobs=n_jobs,
             resource_limits=resource_limits,
@@ -4637,6 +4670,7 @@ def _run_pair_sweep(
     geo_height_m: float,
     geo_chunk_size: int,
     geo_work_dir: str | Path | None,
+    geo_lut_cache_dir: str | Path | None = None,
     scene_store_dir: str | Path | None = None,
     snaphu_config: SnaphuConfig | None,
     unwrap_method: UnwrapBackend | None,
@@ -4947,6 +4981,7 @@ def _run_pair_sweep(
             geo_height_m=geo_height_m,
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=resolved_geo_work_dir,
+            geo_lut_cache_dir=geo_lut_cache_dir,
             scene_store_dir=scene_store_dir,
             n_jobs=n_jobs,
             resource_limits=resource_limits,
@@ -5027,6 +5062,7 @@ def _archive_burst_ifgs(
     geo_height_m: float,
     geo_chunk_size: int,
     geo_work_dir: Path | None,
+    geo_lut_cache_dir: str | Path | None = None,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
@@ -5190,6 +5226,7 @@ def _archive_burst_ifgs(
                     "ifg_dir": ifg_dir,
                     "dem": dem_sampler,
                     "geo_work_dir": geo_work_dir,
+                    "geo_lut_cache_dir": geo_lut_cache_dir,
                     "scene_store_dir": scene_store_dir,
                     "scene_grid_shape": (
                         geo_grid.shape

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -13,8 +18,6 @@ from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr
 from faninsar.processing.memory import release_memmap_pages
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from faninsar.processing.geometry import RadarGeometryModel
     from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.merge.grid import GeoGridSpec
@@ -433,6 +436,179 @@ def grid_lonlat_rows(
     )
 
 
+def geo_grid_hash(grid: GeoGridSpec) -> str:
+    """Return a stable short hash identifying the geographic grid layout."""
+    payload = "|".join(
+        str(part)
+        for part in (
+            grid.crs,
+            tuple(grid.transform),
+            int(grid.width),
+            int(grid.height),
+        )
+    )
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
+
+
+_LUT_CACHE_ARRAY_FILES = (
+    "reference_azimuth.float64",
+    "reference_range.float64",
+    "reference_valid.bool",
+    "height.float64",
+)
+_LUT_CACHE_META_NAME = "meta.json"
+
+
+def _lut_cache_path(
+    cache_dir: str | Path | None,
+    cache_key: str | None,
+) -> Path | None:
+    """Return the cache entry directory, or ``None`` when caching is off."""
+    if cache_dir is None and cache_key is None:
+        return None
+    if cache_dir is None or cache_key is None:
+        reject_invalid_state("geo2rdr LUT cache requires both cache_dir and cache_key")
+    safe_key = "".join(
+        ch if ch.isalnum() or ch in "-_." else "_" for ch in str(cache_key)
+    )
+    return Path(cache_dir) / safe_key
+
+
+def _load_cached_lut(
+    cache_path: Path,
+    *,
+    crop_shape: tuple[int, int],
+    full_radar_shape: tuple[int, int],
+    grid: GeoGridSpec,
+    row0: int,
+    col0: int,
+) -> tuple[float, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] | None:
+    """Load a cached LUT when its identity matches; otherwise return ``None``."""
+    mismatch = _lut_cache_mismatch_reason(
+        cache_path,
+        crop_shape=crop_shape,
+        full_radar_shape=full_radar_shape,
+        grid=grid,
+        row0=row0,
+        col0=col0,
+    )
+    if mismatch is not None:
+        if mismatch != "missing":
+            logger.warning("geo2rdr LUT cache %s %s", cache_path, mismatch)
+        return None
+    meta_path = cache_path / _LUT_CACHE_META_NAME
+    try:
+        import json
+
+        meta = json.loads(meta_path.read_text())
+        arrays = []
+        for name in _LUT_CACHE_ARRAY_FILES:
+            path = cache_path / name
+            dtype = {
+                "reference_azimuth.float64": np.float64,
+                "reference_range.float64": np.float64,
+                "reference_valid.bool": np.bool_,
+                "height.float64": np.float64,
+            }[name]
+            arrays.append(np.memmap(path, mode="r", dtype=dtype, shape=crop_shape))
+        return float(meta["mean_height"]), (arrays[0], arrays[1], arrays[2], arrays[3])
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning("geo2rdr LUT cache %s unusable (%s); rebuilding", meta_path, exc)
+        return None
+
+
+def _lut_cache_mismatch_reason(
+    cache_path: Path,
+    *,
+    crop_shape: tuple[int, int],
+    full_radar_shape: tuple[int, int],
+    grid: GeoGridSpec,
+    row0: int,
+    col0: int,
+) -> str | None:
+    """Return ``None`` when the cache entry is usable, else why it is not."""
+    import json
+
+    meta_path = cache_path / _LUT_CACHE_META_NAME
+    if not meta_path.exists():
+        return "missing"
+    try:
+        meta = json.loads(meta_path.read_text())
+    except OSError as exc:
+        return f"unreadable meta ({exc})"
+    expected: dict[str, object] = {
+        "crop_shape": [int(crop_shape[0]), int(crop_shape[1])],
+        "full_radar_shape": [int(full_radar_shape[0]), int(full_radar_shape[1])],
+        "bbox": [int(row0), int(col0)],
+        "grid_hash": geo_grid_hash(grid),
+    }
+    actual = {
+        "crop_shape": meta.get("crop_shape"),
+        "full_radar_shape": meta.get("full_radar_shape"),
+        "bbox": [
+            int(meta.get("row0", -1)),
+            int(meta.get("col0", -1)),
+        ],
+        "grid_hash": str(meta.get("grid_hash")),
+    }
+    for key, want in expected.items():
+        if actual[key] != want:
+            return f"{key} mismatch"
+    missing_arrays = [
+        name for name in _LUT_CACHE_ARRAY_FILES if not (cache_path / name).exists()
+    ]
+    if missing_arrays:
+        return f"missing arrays {missing_arrays}"
+    return None
+
+
+def _materialize_work_lut_files(storage_dir: Path, cache_path: Path) -> None:
+    """Expose cached arrays under ``storage_dir`` for downstream reopen."""
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    for name in _LUT_CACHE_ARRAY_FILES:
+        src = cache_path / name
+        dst = storage_dir / name
+        if dst.exists():
+            continue
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copyfile(src, dst)
+
+
+def _store_lut_cache(
+    cache_path: Path,
+    storage_dir: Path,
+    *,
+    crop_shape: tuple[int, int],
+    full_radar_shape: tuple[int, int],
+    grid: GeoGridSpec,
+    row0: int,
+    col0: int,
+    mean_height: float,
+) -> None:
+    """Persist the freshly built LUT as a reusable cache entry."""
+    cache_path.mkdir(parents=True, exist_ok=True)
+    for name in _LUT_CACHE_ARRAY_FILES:
+        src = storage_dir / name
+        dst = cache_path / name
+        if dst.exists():
+            continue
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copyfile(src, dst)
+    meta = {
+        "crop_shape": [int(crop_shape[0]), int(crop_shape[1])],
+        "full_radar_shape": [int(full_radar_shape[0]), int(full_radar_shape[1])],
+        "grid_hash": geo_grid_hash(grid),
+        "row0": int(row0),
+        "col0": int(col0),
+        "mean_height": float(mean_height),
+    }
+    (cache_path / _LUT_CACHE_META_NAME).write_text(json.dumps(meta))
+
+
 def build_geo2rdr_lut(
     *,
     geometry: RadarGeometryModel,
@@ -442,6 +618,8 @@ def build_geo2rdr_lut(
     dem: DEMSampler | None = None,
     chunk_size: int = 128,
     storage_dir: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    cache_key: str | None = None,
     row_range: tuple[int, int] | None = None,
     col_range: tuple[int, int] | None = None,
     footprint_lonlat: np.ndarray | None = None,
@@ -470,6 +648,13 @@ def build_geo2rdr_lut(
     storage_dir : str or pathlib.Path, optional
         Directory for disk-backed LUT arrays. In-memory arrays are used when
         omitted.
+    cache_dir : str or pathlib.Path, optional
+        Shared directory for reusable LUT caches keyed by ``cache_key``. When
+        a cache entry exists and matches the grid/radar shape it is loaded
+        instead of recomputing the geometry solve. Requires ``storage_dir``.
+    cache_key : str, optional
+        Identity of this LUT (reference scene + burst + grid). Required when
+        ``cache_dir`` is given.
     row_range : tuple[int, int], optional
         Half-open row interval of the geographic grid to process. Rows outside
         are left NaN/invalid. When omitted the full grid is processed.
@@ -512,6 +697,42 @@ def build_geo2rdr_lut(
     full_height, full_width = full_radar_shape
     crop_shape = (row1 - row0, col1 - col0)
     full_crop = (row_range is not None) or (col_range is not None)
+    cache_path = _lut_cache_path(cache_dir, cache_key)
+    if cache_path is not None:
+        if storage_dir is None:
+            reject_invalid_state(
+                "geo2rdr LUT cache requires storage_dir for downstream reopen"
+            )
+        cached = _load_cached_lut(
+            cache_path,
+            crop_shape=crop_shape,
+            full_radar_shape=(int(full_height), int(full_width)),
+            grid=grid,
+            row0=row0,
+            col0=col0,
+        )
+        if cached is not None:
+            mean_height, arrays = cached
+            azimuth, range_index, valid, height_lookup = arrays
+            assert storage_dir is not None
+            _materialize_work_lut_files(Path(storage_dir), cache_path)
+            logger.info(
+                "Reused cached geo2rdr LUT %s: %d/%d valid, radar_shape=%s",
+                cache_key,
+                int(valid.sum()),
+                valid.size,
+                full_radar_shape,
+            )
+            return Geo2RdrLUT(
+                az_full=azimuth,
+                rg_full=range_index,
+                valid=valid,
+                full_radar_shape=(int(full_height), int(full_width)),
+                height_m=mean_height,
+                height_full=height_lookup,
+                row0=row0 if full_crop else 0,
+                col0=col0 if full_crop else 0,
+            )
     if storage_dir is None:
         azimuth = np.full(crop_shape, np.nan, dtype=np.float64)
         range_index = np.full(crop_shape, np.nan, dtype=np.float64)
@@ -667,6 +888,18 @@ def build_geo2rdr_lut(
     if isinstance(height_lookup, np.memmap):
         height_lookup.flush()
     mean_height = float(np.mean(mean_heights)) if mean_heights else fallback_height
+    if cache_path is not None:
+        assert storage_dir is not None
+        _store_lut_cache(
+            cache_path,
+            Path(storage_dir),
+            crop_shape=crop_shape,
+            full_radar_shape=(int(full_height), int(full_width)),
+            grid=grid,
+            row0=row0,
+            col0=col0,
+            mean_height=mean_height,
+        )
     logger.info(
         "Built geo2rdr LUT: %d/%d valid, radar_shape=%s, mean_height=%.1f m",
         int(valid.sum()),
