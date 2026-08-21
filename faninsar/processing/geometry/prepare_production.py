@@ -6,6 +6,8 @@ inside this module. Failed native prepare stays on same-device Torch.
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -79,6 +81,21 @@ def _native_build_dir() -> Path:
     return path
 
 
+def _prepend_packaged_cuda_toolchain() -> None:
+    """Prefer the interpreter's CUDA 12 nvcc/ninja over a stale system CUDA 10."""
+    pixi_bin = Path(sys.executable).resolve().parent
+    nvcc = pixi_bin / "nvcc"
+    if not nvcc.is_file():
+        return
+    current = os.environ.get("PATH", "")
+    prefix = str(pixi_bin)
+    if not current.startswith(prefix + os.pathsep) and current != prefix:
+        os.environ["PATH"] = prefix + os.pathsep + current
+    os.environ["CUDA_HOME"] = str(pixi_bin.parent)
+    os.environ["CUDA_NVCC_EXECUTABLE"] = str(nvcc)
+    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
+
+
 def _try_load_cuda_module(operation: NativeOperation) -> object | None:
     """Prepare a CUDA geo module; return None on any failure."""
     import torch
@@ -86,6 +103,7 @@ def _try_load_cuda_module(operation: NativeOperation) -> object | None:
 
     if not torch.cuda.is_available():
         return None
+    _prepend_packaged_cuda_toolchain()
     request = NativeBuildRequest(
         operation,
         NativeBackend.CUDA,
