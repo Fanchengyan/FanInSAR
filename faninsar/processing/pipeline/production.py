@@ -4535,6 +4535,9 @@ def run_pair(
         from faninsar.processing.interferometry.pair import goldstein_filter
 
         filtered = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
+        # Keep the saved wrapped phase consistent with the filtered product;
+        # unwrapping also consumes the filtered phase (standard practice).
+        wrapped = np.where(invalid, np.nan, np.angle(filtered).astype(np.float32))
 
     result = ProductionPairState(
         pair_id=_scene_id(ref_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair",
@@ -5510,6 +5513,9 @@ def _finalize_sweep_config(
         from faninsar.processing.interferometry.pair import goldstein_filter
 
         filtered = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
+        # Keep the saved wrapped phase consistent with the filtered product;
+        # unwrapping also consumes the filtered phase (standard practice).
+        wrapped = np.where(invalid, np.nan, np.angle(filtered).astype(np.float32))
 
     origin = merged["origin_state"]
     if merged.get("grid_mode") == "geo":
@@ -5731,6 +5737,9 @@ def _finalize_geo_config(
         from faninsar.processing.interferometry.pair import goldstein_filter
 
         filtered = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
+        # Keep the saved wrapped phase consistent with the filtered product;
+        # unwrapping also consumes the filtered phase (standard practice).
+        wrapped = np.where(invalid, np.nan, np.angle(filtered).astype(np.float32))
     origin = merged["origin_state"]
     resolved_method: UnwrapBackend = (
         unwrap_method if unwrap_method is not None else "irls"
