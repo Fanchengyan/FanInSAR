@@ -1,115 +1,104 @@
-# PROPOSAL-0030 TDD Plan (accepted revision, 2026-08-22)
+# PROPOSAL-0030 TDD Plan v2 (provider-axis design, 2026-08-23)
 
 Normative source: `waymark/proposals/PROPOSAL-0030-multi-source-parallel-dem-manager.md`
-(revision after ROUND-01M0EH1AWZHVKBENK89VHA03AX; re-review ROUND-01M0EHXCBZ4J3YNDNB3FGASPE6
-4/4 recommend-accept). Worktree: `/Users/fancy/Documents/GitHub/FanInSAR-stac-waymark-worktrees/PROPOSAL-0030/PROPOSAL-0030/multi-source-parallel-dem-manager`
+(ratified provider two-axis revision, checkpoints through 92ae7ae8; council MINUTES-r2).
+Worktree: `/Users/fancy/Documents/GitHub/FanInSAR-stac-waymark-worktrees/PROPOSAL-0030/PROPOSAL-0030/multi-source-parallel-dem-manager`
 branch `wm/0030/multi-source-parallel-dem-manager`.
 
-## Amendment (decision-owner, 2026-08-22, sidecar commit e4bfbf6d)
-
-`DemSource` separates a PRODUCT group (`product_kind`,
-`resolution_m`, `vertical_datum`, `derived`, `coverage`, `raster_open`) from a
-PROVIDER group (default base_url, `auth`
-`Literal["none","token","registration"]` default `"none"`, `layout_id`
-e.g. `"copernicus-cog-stem"` / `"skadi-hgt-gz"` / `"terrain-zxy"`); selection
-level = `name`, `description`, `tiles(bounds)`, `fallback`. Registry-metadata
-unit tests pin: product_kind copernicus-30/90 = dsm, srtm-skadi = dsm,
-terrain-tiles = merged-derived; auth == none for all v1 entries. Behavior
-unchanged (same five names, URLs, transport semantics).
-
-## Amendment 2 (decision-owner, 2026-08-22, sidecar commit 41ef977c)
-
-Product group broadened: `product_kind` is now a four-kind literal
-`Literal["dsm", "dtm", "topo-bathy", "merged-derived"]` (dtm/topo-bathy
-reserved), plus modifiers `method`
-(`Literal["radar-interferometric", "optical-photogrammetric", "lidar",
-"composite"] | None`; v1: copernicus-30/90 = radar-interferometric,
-srtm-skadi = radar-interferometric, terrain-tiles = composite) and
-`hydro_conditioned: bool = False`, `void_filled: bool = False` (all v1
-entries False). Provider group and selection level unchanged; behavior
-unchanged.
+NOTE: the worktree contains partial S1–S4 commits from the earlier (pre-reversion)
+implementation pass. Reconcile: keep reusable scaffolding, re-align names and
+structure to THIS plan; every test must pass against the current ratified design.
 
 ## Test-first slices
 
-Each slice: write the failing tests first, then implement until green.
+### S1 — Transport engine (`faninsar/processing/geometry/dem_transport.py`)
 
-### S1 — Source registry (`faninsar/processing/geometry/dem_sources.py`)
+Tests (`tests/processing/geometry/test_dem_transport.py`, mocked transport):
+1. FetchPlan union: TileSet(allowed_hosts) / Artifact(scheme https|ftp, members,
+   member_pattern, expand, credential_ref); grammar rejects unknown fields.
+2. URL host-pinning: every https Tile/Artifact URL host must be in allowed_hosts —
+   mismatch is a hard error before connect (CMR-injection regression pin).
+3. Cross-host redirect: followed WITHOUT credentials; auth attached cross-host is a
+   hard error.
+4. Retry matrix: 429/500/502/503/504 + ConnectionError/Timeout/ChunkedEncodingError/
+   urllib3 ProtocolError retried with capped jitter; Retry-After honored;
+   certificate-verification errors fail fast (distinct unit tests);
+   401/403 are terminal loud errors (named test).
+5. Ranged mode: fake HEAD Accept-Ranges → 8 MiB chunks, per-chunk status==206 AND
+   matching Content-Range else hard error; short-chunk tail; os.pwrite assembly;
+   Windows per-thread seek+write branch forced via fake transport (runs on POSIX);
+   final size == HEAD Content-Length.
+6. Ranged exclusion for Earthdata hosts (HEAD/GET divergence) — always whole-file.
+7. FTP branch via urllib ftp://; no Content-Length → floor + post-extract checks.
+8. Zip expand: central-directory CRC verified; resolved-path-within-staging
+   containment on every member before write (zip-slip hostile payload named test);
+   only members/member_pattern extracted; staging dir covered by age sweep.
+9. Unique {target}.{pid}-{uuid}.part → os.replace publish; orphan sweep.
+10. Credential hygiene (caplog assertions): no netrc/token/SAS sig/se content in
+    logs, dumps, exceptions, cache paths, GeoTIFF tags.
+
+### S2 — Source registry (`faninsar/processing/geometry/dem_sources.py`)
 
 Tests (`tests/processing/geometry/test_dem_sources.py`):
-1. Registry metadata for the four wired sources: names `copernicus-30`, `copernicus-90`,
-   `auto`, `srtm-skadi`, `terrain-tiles`; resolution_m; vertical_datum literal values
-   (`egm2008`, `mixed-derived`); derived flags.
-2. URL builders: GLO-30 stem layout unchanged from PROPOSAL-0013;
-   **GLO-90 stem `Copernicus_DSM_COG_30_{N|S}{lat:02d}_00_{E|W}{lon:03d}_00_DEM` at the
-   bucket root — no directory prefix** (regression-pins the R1 feasibility finding);
-   skadi `skadi/{N|S}{YY}/{N|S}{YY}{E|W}{XXX}.hgt.gz`;
-   terrain-tiles `geotiff/12/{x}/{y}.tif` XYZ orientation pinned at a known cell.
-3. Tile enumeration over bounds incl. degree boundaries and per-tile minimum-bytes floors
-   (GLO ≥1 MiB, skadi much smaller with ~25.9 MB expected-decompressed metadata,
-   terrain z12 floor).
-4. Coverage fail-closed message for out-of-coverage latitude (skadi 56°S–60°N).
-5. `get_dem_source(name)` fail-closed error listing valid names;
-   `list_dem_sources()` returns all five.
-
-### S2 — Parallel transport (`faninsar/processing/geometry/dem_transport.py`)
-
-Tests (`tests/processing/geometry/test_dem_transport.py`) — all mocked transport:
-1. Concurrent fetch dispatches through a bounded pool (>1 worker structural assertion).
-2. Retry matrix: 429/500/502/503/504 + ConnectionError/Timeout/ChunkedEncodingError retried
-   with backoff; certificate-verification SSLError fails fast (distinct from transient
-   handshake/EOF truncation which retries) — unwrap the reason chain.
-3. Ranged mode: fake HEAD (size, Accept-Ranges), parallel chunk GETs written via os.pwrite
-   into ftruncate-preallocated .part; short-chunk tail; final size == Content-Length;
-   sha256 equality vs single-stream reference; **200-to-a-Range-request hard failure**;
-   **mismatched Content-Range hard failure**.
-4. Windows branch forced via fake transport: per-thread handle seek+write path exercised on
-   POSIX too; shared stream budget: tiles+chunks ≤ max_workers total in-flight.
-5. Atomicity: unique `{target}.{pid}-{uuid}.part` → os.replace publish; .part unlinked on
-   failure; age-based sweep threshold above worst-case in-flight download.
-6. Transport-boundary guard: cache-relative paths containing `..` or absolute components are
-   rejected before any I/O.
+1. Seven shape classes instantiate; abstract surface = plan() only; zero fetching.
+2. Selection grammar "product" / "product:provider": fail closed on unknown product,
+   unknown provider (lists valid), registered-but-unwired pair (cites wired status),
+   hostile payloads (`glo30:../..`, trailing colon, homoglyphs, whitespace);
+   charset validation on raw-DemSource name escape hatch.
+3. Closed valid-pair matrix resolves exactly as the Goals table; dem_catalog()
+   returns structured matrix (providers/default/auth/wired/datum/resolution) with a
+   zero-network unit assertion (import/list/get/catalog perform no socket I/O).
+4. LatLonGridSource: glo30/glo90 stem layouts (COG_10_/COG_30_, no directory prefix),
+   skadi layout + small floors + ocean-404 skip flag scoped to skadi.
+5. PgcQuadSource: QuadEnumerator protocol; v1 listing implementation loops until
+   IsTruncated=false, reconciles bounds→expected-quad set, errors on gaps; quad-grid
+   mapping pinned; coverage fail-closed outside polar bands.
+6. TerrainPyramidSource: z12 XYZ orientation pin; derived=true registry-wide warning.
+7. FtpZipSource: alos-dem@jaxa-ftp Artifact(scheme="ftp", expand="zip").
+8. AuthenticatedGranuleSource: nasadem@earthdata (CMR C2763264762-LPCLOUD, EGM96,
+   60N–56S coverage fail-closed) and nisar-glo30@earthdata (C3803703055-ASF,
+   ellipsoidal no-wrap, unconditional EPSG4326 title filter + `-vrt` exclusion);
+   URS-302→200-HTML magic-byte hard error (named test).
+9. PcStacSource: sign_inplace modifier flow (mocked STAC); optional [pc] extra
+   fail-closed with install guidance when planetary_computer/pystac_client absent.
+10. MosaicRecipe dataclass drives all mosaic-side behavior (gdal_open prefix,
+    source_crs/warp target/resampling/nodata/mask_to_nan) — manager reads recipe
+    only; per-entry recipes for all 14 names asserted.
 
 ### S3 — DEMManager reshaping (`dem_manager.py`)
 
 Tests (extend `tests/processing/geometry/test_dem_manager.py`):
-1. Constructor: `source=` name or DemSource; legacy flat-cache hit still resolves first;
-   new downloads land under `cache_dir/<source-name>/`.
-2. fetch_dem passes explicit `res=` to rasterio.merge (registry resolution_m); mixed-
-   resolution auto mosaic keeps primary resolution; fallback-tile warning logged; mosaic
-   GeoTIFF stamped with source name(s)+datum tags; void pixels (nodata −32768) mask to NaN.
-3. auto semantics: control tile is a live HEAD against the configured base bypassing local
-   cache; probe required tiles until one 200s, else canonical out-of-ROI known-present cell
-   or proceed all-fallback under fraction warning — never misreport mirror misconfiguration;
-   fallback fraction >25% warning; FANINSAR_DEM_SOURCE_URL applies to primary only (auto
-   fallback uses default base).
-4. get_dem_manager env parsing: FANINSAR_DEM_SOURCE (default copernicus-30), https-enforced
-   base override rejection of non-https scheme, cross-source override warning.
-5. Resumable-not-transactional semantics stated by test: completed tiles persist when a later
-   tile fails; permanent 404 without fallback fails loud after retries.
-6. flatten.copernicus_glo30_dem delegates to the shared lookup (results unchanged).
+1. Constructor source="glo30"/"glo30:pc"/DemSource; resolution kwarg > env >
+   default (env FANINSAR_DEM_SOURCE carries compound value); auto + non-default
+   provider rejected loudly; auto = glo30 with control-tile-guarded GLO-90 fallback
+   (control independent of ROI withheld set; >25% fraction warning).
+2. Cache partitions cache_dir/<product>-<provider>/; legacy flat probe bound to
+   glo30@aws only; partition dirs opaque labels never parsed back.
+3. fetch_dem: explicit merge res= (no silent downgrade), fallback warning,
+   provenance tags product+provider+datum+date+host (advisory-only rule +
+   contradiction-warning-use-after-warning semantics), resumable-not-transactional.
+4. Structured DEMProviderUnavailableError with same-product alternatives
+   (excluding unwired v1 providers) + cache-hit hints.
+5. get_dem_manager env parsing incl. FANINSAR_DEM_SOURCE compound + SOURCE_URL
+   override rules (https enforced, primary-only, non-default warning).
+6. flatten.copernicus_glo30_dem delegates to shared lookup unchanged.
 
 ### S4 — Pipeline & CLI integration
 
-Tests (`tests/processing/pipeline/…`, `tests/cli/…`):
-1. `_resolve_auto_dem` helper used by run_pair, _run_pair_sweep, AND cli/frame.py bare-name
-   path (no third GeoidAdjustedDEM construction site remains).
-2. Datum-aware wrap: ellipsoidal source ⇒ no GeoidAdjustedDEM wrap (unit-level via registry);
-   CLI geoid_correction default pinned explicitly so the unified helper cannot drift per site.
-3. run_pair dem=None smoke with FANINSAR_DEM_SOURCE=auto writes pair/dem/dem.tif at primary
-   resolution (existing PROPOSAL-0013 smoke re-targeted).
+1. Public shared helper (rename _resolve_auto_dem) used by run_pair,
+   _run_pair_sweep, and cli/frame.py bare-name path; single datum-aware wrap rule
+   everywhere; CLI geoid_correction default pinned.
+2. CLI --dem-source accepts compound values; --dem-source glo30:ot fails closed
+   citing unwired status (v1).
 
-## Real-network verification matrix (opt-in marks, after green units)
+## Ordered landing
 
-- GLO-30 tile; GLO-90 withheld-cell N38E045 (stem layout live-verified 200+206);
-- skadi N34E094.hgt.gz via /vsigzip/: finite heights, void→NaN, sequential read note;
-- terrain-tiles z12 tile WarpedVRT→4326 finite heights after masking;
-- Caucasus auto ROI: control validation → GLO-90 fallback tile fetched, mosaic stays 30 m;
-- ranged single-tile fetch sha256 == plain-fetch sha256;
-- same-run throughput gate: serial-vs-parallel ratio ≥3x expected (structural pool
-  assertion + <20 min absolute bound as backstops);
-- run_pair(roi=..., dem=None) FANINSAR_DEM_SOURCE=auto pipeline smoke.
-
-## Quality gates
-
-ruff check + format clean on changed files; tests/processing suite green;
-Windows-compat import smoke for dem_transport; every commit cites PROPOSAL-0030.
+Transport engine first (S1+S2 core), then AWS shapes, then PcStacSource (+[pc]
+extra in pyproject with requests>=2.33.0 runtime floor), then Earthdata/nisar-glo30
+last. Real-network matrix (opt-in marks): one tile per wired source incl. GLO-90
+withheld-cell N38E045 fallback staying 30m, PC glo30/glo90/nasadem/alos-dem signed
+opens, ArcticDEM/REMA 32m quads reprojection, AW3D30 FTP zip extraction + ~1m
+agreement vs GLO-30, ranged-vs-plain sha256 equality, same-run serial-vs-parallel
+>=3x ratio (<20min absolute bound). Pipeline smoke deferred to verification
+(Sentinel-1 data dependency). Quality gates: ruff clean, tests/processing green,
+Windows import smoke; commits cite PROPOSAL-0030.
