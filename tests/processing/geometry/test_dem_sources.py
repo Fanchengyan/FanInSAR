@@ -64,6 +64,29 @@ def test_registry_metadata_for_wired_sources() -> None:
     assert terrain.default_base_url == "https://elevation-tiles-prod.s3.amazonaws.com"
 
 
+def test_product_group_modifiers_for_wired_sources() -> None:
+    """Method/modifier product-group fields pin the v1 values."""
+    expectations = {
+        "copernicus-30": ("dsm", "radar-interferometric"),
+        "copernicus-90": ("dsm", "radar-interferometric"),
+        AUTO_SOURCE_NAME: ("dsm", "radar-interferometric"),
+        "srtm-skadi": ("dsm", "radar-interferometric"),
+        "terrain-tiles": ("merged-derived", "composite"),
+    }
+    for name, (kind, method) in expectations.items():
+        source = get_dem_source(name)
+        assert source.product_kind == kind, name
+        assert source.method == method, name
+        assert source.hydro_conditioned is False, name
+        assert source.void_filled is False, name
+        assert source.auth == "none", name
+    # dtm / topo-bathy are reserved for future registry entries.
+    assert "dtm" not in {get_dem_source(n).product_kind for n in list_dem_sources()}
+    assert "topo-bathy" not in {
+        get_dem_source(n).product_kind for n in list_dem_sources()
+    }
+
+
 def test_auto_source_is_selection_only() -> None:
     """Auto is a selection-level source without its own transport layout."""
     auto = get_dem_source(AUTO_SOURCE_NAME)

@@ -26,7 +26,13 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 VerticalDatum = Literal["egm2008", "egm96", "mixed-derived", "ellipsoidal"]
-ProductKind = Literal["dsm", "dtm", "merged-derived"]
+ProductKind = Literal["dsm", "dtm", "topo-bathy", "merged-derived"]
+DemMethod = Literal[
+    "radar-interferometric",
+    "optical-photogrammetric",
+    "lidar",
+    "composite",
+]
 AuthClass = Literal["none", "token", "registration"]
 
 AUTO_SOURCE_NAME = "auto"
@@ -131,7 +137,14 @@ class DemSource:
     -------------
     product_kind:
         ``"dsm"`` for surface models, ``"dtm"`` for terrain models,
+        ``"topo-bathy"`` for combined topography/bathymetry, and
         ``"merged-derived"`` for merged products mixing sources/datums.
+    method:
+        Measurement method (``"radar-interferometric"``,
+        ``"optical-photogrammetric"``, ``"lidar"``, ``"composite"``); None
+        when not applicable.
+    hydro_conditioned / void_filled:
+        Product modifiers; all v1 entries are False.
     resolution_m:
         Nominal ground sampling distance in degrees per pixel.
     vertical_datum / derived:
@@ -162,6 +175,9 @@ class DemSource:
     resolution_m: float = 1.0 / 3600
     vertical_datum: VerticalDatum = "egm2008"
     derived: bool = False
+    method: DemMethod | None = None
+    hydro_conditioned: bool = False
+    void_filled: bool = False
 
     # provider group
     default_base_url: str = COPERNICUS_GLO30_BASE
@@ -413,6 +429,7 @@ _SOURCES: dict[str, DemSource] = {
         resolution_m=1.0 / 3600,
         vertical_datum="egm2008",
         derived=False,
+        method="radar-interferometric",
         default_base_url=COPERNICUS_GLO30_BASE,
         auth="none",
         layout_id="copernicus-cog-stem",
@@ -429,6 +446,7 @@ _SOURCES: dict[str, DemSource] = {
         resolution_m=1.0 / 1200,
         vertical_datum="egm2008",
         derived=False,
+        method="radar-interferometric",
         default_base_url=COPERNICUS_GLO90_BASE,
         auth="none",
         layout_id="copernicus-cog-stem",
@@ -447,6 +465,7 @@ _SOURCES: dict[str, DemSource] = {
         resolution_m=1.0 / 3600,
         vertical_datum="egm2008",
         derived=False,
+        method="radar-interferometric",
         default_base_url=COPERNICUS_GLO30_BASE,
         auth="none",
         layout_id="copernicus-cog-stem",
@@ -462,6 +481,7 @@ _SOURCES: dict[str, DemSource] = {
         resolution_m=1.0 / 3600,
         vertical_datum="egm96",
         derived=False,
+        method="radar-interferometric",
         default_base_url=TERRAIN_TILES_BASE,
         auth="none",
         layout_id="skadi-hgt-gz",
@@ -477,6 +497,7 @@ _SOURCES: dict[str, DemSource] = {
         resolution_m=_TERRAIN_Z12_METERS_PER_PIXEL,
         vertical_datum="mixed-derived",
         derived=True,
+        method="composite",
         default_base_url=TERRAIN_TILES_BASE,
         auth="none",
         layout_id="terrain-zxy",

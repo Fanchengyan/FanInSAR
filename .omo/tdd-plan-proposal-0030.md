@@ -7,15 +7,27 @@ branch `wm/0030/multi-source-parallel-dem-manager`.
 
 ## Amendment (decision-owner, 2026-08-22, sidecar commit e4bfbf6d)
 
-`DemSource` separates a PRODUCT group (`product_kind`
-`Literal["dsm","dtm","merged-derived"]`, `resolution_m`, `vertical_datum`,
-`derived`, `coverage`, `raster_open`) from a PROVIDER group (default base_url,
-`auth` `Literal["none","token","registration"]` default `"none"`, `layout_id`
+`DemSource` separates a PRODUCT group (`product_kind`,
+`resolution_m`, `vertical_datum`, `derived`, `coverage`, `raster_open`) from a
+PROVIDER group (default base_url, `auth`
+`Literal["none","token","registration"]` default `"none"`, `layout_id`
 e.g. `"copernicus-cog-stem"` / `"skadi-hgt-gz"` / `"terrain-zxy"`); selection
 level = `name`, `description`, `tiles(bounds)`, `fallback`. Registry-metadata
 unit tests pin: product_kind copernicus-30/90 = dsm, srtm-skadi = dsm,
 terrain-tiles = merged-derived; auth == none for all v1 entries. Behavior
 unchanged (same five names, URLs, transport semantics).
+
+## Amendment 2 (decision-owner, 2026-08-22, sidecar commit 41ef977c)
+
+Product group broadened: `product_kind` is now a four-kind literal
+`Literal["dsm", "dtm", "topo-bathy", "merged-derived"]` (dtm/topo-bathy
+reserved), plus modifiers `method`
+(`Literal["radar-interferometric", "optical-photogrammetric", "lidar",
+"composite"] | None`; v1: copernicus-30/90 = radar-interferometric,
+srtm-skadi = radar-interferometric, terrain-tiles = composite) and
+`hydro_conditioned: bool = False`, `void_filled: bool = False` (all v1
+entries False). Provider group and selection level unchanged; behavior
+unchanged.
 
 ## Test-first slices
 
