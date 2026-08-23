@@ -165,6 +165,7 @@ def run_frame_cli(
     rg_looks: int = 10,
     goldstein: float = 0.5,
     device: str = "cpu",
+    dem_source: str | None = None,
 ) -> int:
     """Run the unified pair production pipeline from the command line.
 
@@ -178,11 +179,16 @@ def run_frame_cli(
     int
         Exit code (0 on success).
 
+    Raises
+    ------
+    ValueError
+        When ``dem_source`` names an unknown or unwired provider (the CLI
+        converts this to a non-zero exit with the failure message).
+
     """
-    from faninsar.processing.geometry.dem import GeoidAdjustedDEM, RasterDEM
-    from faninsar.processing.geometry.dem_manager import get_dem_manager
-    from faninsar.processing.geometry.egm96 import EGM96Geoid
+    from faninsar.processing.geometry.dem import RasterDEM
     from faninsar.processing.pipeline import run_pair
+    from faninsar.processing.pipeline.production import resolve_auto_dem
 
     roi_box = _parse_roi(roi)
     dem_sampler = None
@@ -190,10 +196,16 @@ def run_frame_cli(
         dem_path = _resolve_dem_path(dem, Path(output))
         if not dem_path.exists():
             bounds = _cli_dem_bounds(roi_box, _as_path_list(reference))
-            dem_path = get_dem_manager().fetch_dem(bounds, dem_path)
-        dem_sampler = GeoidAdjustedDEM(
-            RasterDEM(path=dem_path, interpolation="biquintic"), EGM96Geoid()
-        )
+            # Shared datum-aware wrap rule; never wraps ellipsoidal sources.
+            dem_sampler = resolve_auto_dem(
+                bounds,
+                output_dir=Path(output),
+                geoid_correction=True,
+                dem_source=dem_source,
+                output_name=dem_path.name,
+            )
+        else:
+            dem_sampler = RasterDEM(path=dem_path, interpolation="biquintic")
 
     state = run_pair(
         _as_path_list(reference),
@@ -206,6 +218,7 @@ def run_frame_cli(
         multilook=(az_looks, rg_looks),
         goldstein_alpha=goldstein,
         device=device,
+        dem_source=dem_source,
         reference_orbit_path=(
             _as_path_list(reference_orbit) if reference_orbit else None
         ),

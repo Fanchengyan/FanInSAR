@@ -873,13 +873,19 @@ class DEMManager:
         return self._write_mosaic(resolved, out, tags=tags)
 
 
-def get_dem_manager() -> DEMManager:
+def get_dem_manager(*, source: str | None = None) -> DEMManager:
     """Return a DEMManager configured from environment variables.
 
     Reads ``FANINSAR_DEM_CACHE_DIR`` (required), ``FANINSAR_DEM_SOURCE``
     (optional ``<product>`` / ``<product>:<provider>`` compound grammar), and
     ``FANINSAR_DEM_SOURCE_URL`` (https-enforced primary-base override; warned
     when combined with a non-default source).
+
+    Parameters
+    ----------
+    source : str, optional
+        Explicit selection overriding ``FANINSAR_DEM_SOURCE``; ``None``
+        defers to the environment and then the ``glo30`` default.
 
     Returns
     -------
@@ -901,7 +907,11 @@ def get_dem_manager() -> DEMManager:
         )
         logger.error(message)
         raise InvalidProcessingStateError(message)
-    selection = os.environ.get(DEM_SELECTION_ENV, DEFAULT_PRODUCT)
+    selection = (
+        source
+        if source is not None
+        else os.environ.get(DEM_SELECTION_ENV, DEFAULT_PRODUCT)
+    )
     base_url = os.environ.get(DEM_SOURCE_ENV)
     manager = DEMManager(
         cache_dir=Path(cache_dir),
@@ -909,7 +919,7 @@ def get_dem_manager() -> DEMManager:
         base_url=base_url,
     )
     if base_url is not None:
-        default_pair = (PRODUCT_DEFAULTS.get(manager.product, {}).get("default"),)
+        default_pair = PRODUCT_DEFAULTS.get(manager.product, {}).get("default")
         if (manager.product, manager.provider) != (DEFAULT_PRODUCT, default_pair):
             logger.warning(
                 "FANINSAR_DEM_SOURCE_URL override combined with non-default "
