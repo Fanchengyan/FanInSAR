@@ -1031,6 +1031,7 @@ dependencies = [
     { name = "pystac" },
     { name = "rasterio", version = "1.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "rasterio", version = "1.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "requests" },
     { name = "rio-cogeo" },
     { name = "rioxarray", version = "0.19.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "rioxarray", version = "0.20.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -1092,6 +1093,10 @@ docs = [
 opencv = [
     { name = "opencv-python" },
 ]
+pc = [
+    { name = "planetary-computer" },
+    { name = "pystac-client" },
+]
 test = [
     { name = "coverage" },
     { name = "h5py" },
@@ -1139,6 +1144,7 @@ requires-dist = [
     { name = "opencv-python", marker = "extra == 'opencv'", specifier = ">=4.8" },
     { name = "pandas" },
     { name = "pint", specifier = ">=0.20" },
+    { name = "planetary-computer", marker = "extra == 'pc'", specifier = ">=1.0" },
     { name = "pre-commit", marker = "extra == 'code-style'" },
     { name = "psutil" },
     { name = "pyarrow", marker = "extra == 'cloud'" },
@@ -1148,10 +1154,12 @@ requires-dist = [
     { name = "pystac", marker = "extra == 'cloud'" },
     { name = "pystac", marker = "extra == 'dev'" },
     { name = "pystac-client", marker = "extra == 'dev'" },
+    { name = "pystac-client", marker = "extra == 'pc'", specifier = ">=0.9" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "pytest-cov", marker = "extra == 'test'" },
     { name = "rasterio", specifier = ">=1.0.26" },
     { name = "recommonmark", marker = "extra == 'docs'" },
+    { name = "requests", specifier = ">=2.33.0" },
     { name = "rio-cogeo" },
     { name = "rio-cogeo", marker = "extra == 'cloud'" },
     { name = "rioxarray" },
@@ -1171,7 +1179,7 @@ requires-dist = [
     { name = "xarray" },
     { name = "zarr", specifier = ">=3.0" },
 ]
-provides-extras = ["opencv", "code-style", "test", "cloud", "docs", "dev"]
+provides-extras = ["opencv", "code-style", "pc", "test", "cloud", "docs", "dev"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3221,6 +3229,25 @@ wheels = [
 ]
 
 [[package]]
+name = "planetary-computer"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "packaging" },
+    { name = "pydantic" },
+    { name = "pystac" },
+    { name = "pystac-client" },
+    { name = "python-dotenv" },
+    { name = "pytz" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9b/d3/ccfb0e823e9beb72b7e6b749f0985c4db1530d4e4a145b1b5d12f5de417e/planetary-computer-1.0.0.tar.gz", hash = "sha256:5958a8e1d8ba1aafc7ac45878df2d7d03405806ae31ed2e675333faebca960cc", size = 17076, upload-time = "2023-07-05T13:06:58.679Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4f/7a/3965a2b58d172e106c1064af19707d29f86a0142c28ff40185490a0a8cfe/planetary_computer-1.0.0-py3-none-any.whl", hash = "sha256:7af5839f9346c1d23d53fff4e80e955db18a2d81992877816e22dcbc2f90c40d", size = 14163, upload-time = "2023-07-05T13:06:57.06Z" },
+]
+
+[[package]]
 name = "platformdirs"
 version = "4.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3904,6 +3931,15 @@ wheels = [
 ]
 
 [[package]]
+name = "python-dotenv"
+version = "1.2.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6a/53/ed9d74092561d4b01a2ef1349d52cdbc135e526c245f366b089cfca6de49/python_dotenv-1.2.3.tar.gz", hash = "sha256:a20a594dabeaa385725aa239d5244871c143ecb356add8a20fcf23773a6c3a35", size = 58945, upload-time = "2026-08-16T16:54:54.067Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/17/c5c6b53ddc18f297992099b3d9ec16c855c0ccc83263a21fe4d1c625ec6c/python_dotenv-1.2.3-py3-none-any.whl", hash = "sha256:904552145e8bfed22162c09dab1c2b9b54fefa7b23ba780f4f26ca0316b0f0d9", size = 22780, upload-time = "2026-08-16T16:54:52.473Z" },
+]
+
+[[package]]
 name = "pytz"
 version = "2026.2"
 source = { registry = "https://pypi.org/simple" }
@@ -4308,7 +4344,7 @@ wheels = [
 
 [[package]]
 name = "requests"
-version = "2.32.5"
+version = "2.34.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
@@ -4316,9 +4352,9 @@ dependencies = [
     { name = "idna" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c9/74/b3ff8e6c8446842c3f5c837e9c3dfcfe2018ea6ecef224c710c85ef728f4/requests-2.32.5.tar.gz", hash = "sha256:dbba0bac56e100853db0ea71b82b4dfd5fe2bf6d3754a8893c3af500cec7d7cf", size = 134517, upload-time = "2025-08-18T20:46:02.573Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ac/c3/e2a2b89f2d3e2179abd6d00ebd70bff6273f37fb3e0cc209f48b39d00cbf/requests-2.34.2.tar.gz", hash = "sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed", size = 142856, upload-time = "2026-05-14T19:25:27.735Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/db/4254e3eabe8020b458f1a747140d32277ec7a271daf1d235b70dc0b4e6e3/requests-2.32.5-py3-none-any.whl", hash = "sha256:2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6", size = 64738, upload-time = "2025-08-18T20:46:00.542Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/f4/c67b0b3f1b9245e8d266f0f112c500d50e5b4e83cb6f3b71b6528104182a/requests-2.34.2-py3-none-any.whl", hash = "sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0", size = 73075, upload-time = "2026-05-14T19:25:26.443Z" },
 ]
 
 [[package]]
