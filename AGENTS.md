@@ -25,6 +25,15 @@ must hold for day-to-day development.
   pass one centralized validator before ABI access. Native, Compile, and Eager
   benchmarks use identical fixture, DEM, iteration budget, and I/O boundaries;
   compute-only timings cannot replace the full public-call promotion boundary.
+- **PROPOSAL-0030** — the DEM manager is a two-axis contract: fourteen
+  selection names (thirteen products plus `auto`) on the product axis and a
+  manual `product:provider` grammar on the provider axis. Defaults are
+  anonymous cloud channels (AWS/Planetary Computer); the manager never
+  silently switches product or provider, `auto` rescues withheld GLO-30 cells
+  with same-family GLO-90 only, and provider failures raise the structured
+  `DEMProviderUnavailableError` instead of a hidden fallback. Selection fails
+  closed before any network traffic; user-facing usage is documented in
+  `docs/dem_manager_guide.md`.
 
 When a change would intentionally violate one of these rules, do not patch
 around the Proposal. Amend the relevant Proposal or create a new accepted
