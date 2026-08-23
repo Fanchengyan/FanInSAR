@@ -494,7 +494,7 @@ class TestPcStacSource:
 
         class _FakeItem:
             id = "nasadem-item-0"
-            assets = {"dem": _FakeAsset()}
+            assets = {"elevation": _FakeAsset()}
 
         class _FakeSearch:
             def __init__(self, **kwargs: object) -> None:
@@ -597,3 +597,90 @@ class TestMosaicRecipe:
             assert recipe.warp_target == warp, name
             assert recipe.resampling == resampling, name
             assert recipe.nodata == nodata, name
+
+
+class TestMatrixRegression:
+    """Regression pins for defects found in the 2026-08-23 live matrix run.
+
+    Evidence: /Volumes/DATA2/TEST_sentinel-1/proposal-0030-impl-v2/MATRIX.md
+    (F1: PC asset keys; F2: PGC meter-to-degree resolution conversion).
+    """
+
+    def test_pc_entries_use_live_asset_keys(self) -> None:
+        """F1: nasadem/alos-dem PC assets match the live collections."""
+        assert get_dem_source("nasadem").asset_key == "elevation"
+        assert get_dem_source("alos-dem").asset_key == "data"
+
+    def test_pgc_resolution_m_stays_meters(self) -> None:
+        """F2 part 1: registry keeps resolution_m in meters (pair-matrix pin).
+
+        The conversion to degrees happens at the mosaic call site.
+        """
+        import math
+
+        src = get_dem_source("arcticdem-32")
+        assert src.resolution_m == 32.0
+
+    def test_pgc_mosaic_grid_conversion_is_deterministic(self) -> None:
+        """F2 part 2: the meter-to-degree conversion is deterministic.
+
+        32 m at the documented cos(75 deg) mid-band factor must land in the
+        GLO-30-class range on the EPSG:4326 grid (not 32 degrees).
+        """
+        import math
+
+        from faninsar.processing.geometry.dem_manager import (
+            resolution_m_to_degrees,
+        )
+
+        deg = resolution_m_to_degrees(32.0)
+        expected = 32.0 / (111_320.0 * math.cos(math.radians(75.0)))
+        assert math.isclose(deg, expected, rel_tol=1e-9)
+        assert 1 / 1200 / 2 < deg < 1 / 900, deg
+
+    def test_pgc_default_entry_grid_not_degenerate(self) -> None:
+        """F2 end-to-end: a 1-degree PGC mosaic plan sizes a real grid."""
+        import numpy as np
+
+        from faninsar.processing.geometry.dem_manager import _mosaic_arrays
+        from faninsar.processing.geometry.dem_sources import get_dem_source
+
+        source = get_dem_source("arcticdem-32")
+        recipe = source.mosaic_recipe()
+        # Synthetic polar-stereo tile covering ~1 degree square near 75N.
+        import io
+
+        import rasterio
+        from rasterio.crs import CRS
+        from rasterio.transform import from_origin
+
+        profile = {
+            "driver": "GTiff",
+            "width": 100,
+            "height": 100,
+            "count": 1,
+            "dtype": "float32",
+            "crs": CRS.from_epsg(3413),
+            "transform": from_origin(-500000, -500000, 3200, 3200),
+        }
+        buf = io.BytesIO()
+        with rasterio.open(buf, "w", **profile) as dst:
+            dst.write(np.full((100, 100), 500.0, dtype=np.float32), 1)
+        buf.seek(0)
+        tmp = Path("/tmp/p0030_regression_tile.tif")
+        tmp.write_bytes(buf.read())
+
+        try:
+            # The manager converts meters→degrees before calling the mosaic
+            # (polar-stereo sources reproject to EPSG:4326); replicate it.
+            from faninsar.processing.geometry.dem_manager import (
+                resolution_m_to_degrees,
+            )
+
+            deg = resolution_m_to_degrees(source.resolution_m)
+            mosaic, transform = _mosaic_arrays([tmp], recipe, deg)
+            assert mosaic.shape[0] > 50 and mosaic.shape[1] > 50
+            finite = np.isfinite(mosaic)
+            assert finite.any()
+        finally:
+            tmp.unlink(missing_ok=True)

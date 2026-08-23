@@ -1258,6 +1258,7 @@ def _build_registry() -> dict[str, DemSource]:
         auth="none",
         wired=True,
         collection_id="nasadem",
+        asset_key="elevation",
     )
     registry["alos-dem"] = PcStacSource(
         name="alos-dem",
@@ -1270,6 +1271,7 @@ def _build_registry() -> dict[str, DemSource]:
         auth="none",
         wired=True,
         collection_id="alos-dem",
+        asset_key="data",
     )
 
     # -- nasadem@earthdata ---------------------------------------------------
@@ -1353,6 +1355,9 @@ def _build_registry() -> dict[str, DemSource]:
             ),
             product=product_name,
             provider="aws",
+            # resolution_m stays in METERS (product metadata, pinned by the
+            # pair-matrix test). The meter-to-degree conversion for the
+            # EPSG:4326 output grid happens in _mosaic_arrays.
             resolution_m=30.0 if tier == "10" else (32.0 if tier == "32" else 2.0),
             vertical_datum="ellipsoidal",
             derived=False,

@@ -15,6 +15,7 @@ loud mirror-misconfiguration error instead of a silent whole-ROI downgrade.
 
 from __future__ import annotations
 
+import math
 import os
 import urllib.parse
 from dataclasses import dataclass, field, replace
@@ -255,6 +256,15 @@ def _resampling(name: str) -> object:
         message = f"unsupported mosaic resampling {name!r}"
         logger.exception(message)
         raise InvalidProcessingStateError(message) from exc
+
+
+def resolution_m_to_degrees(resolution_m: float) -> float:
+    """Convert a meters resolution to EPSG:4326 degrees.
+
+    Uses a cos(75 deg) mid-band factor documented for the PGC polar mosaics;
+    deterministic so tests can pin the exact value.
+    """
+    return resolution_m / (111_320.0 * math.cos(math.radians(75.0)))
 
 
 def _mosaic_arrays(
@@ -651,9 +661,18 @@ class DEMManager:
         import rasterio
 
         recipe = self.source_entry.mosaic_recipe()
-        mosaic, transform = _mosaic_arrays(
-            paths, recipe, self.source_entry.resolution_m
+        # PGC-style sources keep resolution_m in METERS on their native
+        # polar-stereo grid; when the recipe reprojects to EPSG:4326 the
+        # output grid is sized in degrees (cos(75 deg) mid-band factor,
+        # deterministic per the proposal). Orthometric degree-native sources
+        # (glo30 etc.) use their resolution directly.
+        resolution_deg = (
+            resolution_m_to_degrees(self.source_entry.resolution_m)
+            if recipe.warp_target == "epsg4326"
+            and self.source_entry.vertical_datum == "ellipsoidal"
+            else self.source_entry.resolution_m
         )
+        mosaic, transform = _mosaic_arrays(paths, recipe, resolution_deg)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists():
             self._warn_contradicting_tags(output_path)
