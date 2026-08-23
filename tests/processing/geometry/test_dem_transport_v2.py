@@ -845,10 +845,12 @@ class TestExpectedDecompressedSize:
         assert executed == [target]
         assert target.read_bytes() == body
 
+    @pytest.mark.parametrize("delta", [1, -1], ids=["over-size", "under-size"])
     def test_decompressed_size_mismatch_refuses_publish(
         self,
         tmp_path: Path,
         session: RecordingSession,
+        delta: int,
     ) -> None:
         import gzip
 
@@ -861,7 +863,7 @@ class TestExpectedDecompressedSize:
             cache_path=Path("skadi/N34/N34E094.hgt.gz"),
             min_bytes=16,
             ranged=False,
-            expected_decompressed_bytes=len(raw) + 1,
+            expected_decompressed_bytes=len(raw) + delta,
         )
         plan = TileSet(allowed_hosts=("example.test",), tiles=(tile,))
         with pytest.raises(
@@ -894,6 +896,34 @@ class TestOcean404Skip:
             ocean_404_skip=True,
         )
         plan = TileSet(allowed_hosts=("example.test",), tiles=(tile,))
+        with caplog.at_level(
+            logging.INFO, logger="faninsar.processing.geometry.dem_transport"
+        ):
+            executed = fetch_plan(plan, tmp_path)
+        assert executed == []
+        assert not (tmp_path / "skadi" / "N34" / "N34E094.hgt.gz").is_file()
+        assert any("ocean" in record.message.lower() for record in caplog.records)
+
+    def test_plan_level_ocean_404_skip_skips_without_tile_flag(
+        self,
+        tmp_path: Path,
+        session: RecordingSession,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        url = "https://example.test/skadi/N34/N34E094.hgt.gz"
+        session.script_response("GET", url, [FakeResponse(status=404)])
+        tile = Tile(
+            url=url,
+            cache_path=Path("skadi/N34/N34E094.hgt.gz"),
+            min_bytes=1024,
+            ranged=False,
+            ocean_404_skip=False,
+        )
+        plan = TileSet(
+            allowed_hosts=("example.test",),
+            tiles=(tile,),
+            ocean_404_skip=True,
+        )
         with caplog.at_level(
             logging.INFO, logger="faninsar.processing.geometry.dem_transport"
         ):

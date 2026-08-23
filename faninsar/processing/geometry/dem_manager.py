@@ -690,25 +690,33 @@ class DEMManager:
         Tile lookups probe the partitioned target first, then the legacy
         flat layout (``glo30@aws`` only); every planned tile must resolve,
         otherwise the fetch already failed loudly inside ``_execute``.
+        Multi-tile fan-out records are expanded so every planned sub-tile
+        (e.g. the 2x2 PGC 2m grid) becomes a mosaic input.
         """
         if isinstance(plan, TileSet):
+            if executed:
+                # The engine already returns one path per expanded unit
+                # (cache hits and fresh fetches alike); trust it the same
+                # way the artifact branches do and only drop duplicates.
+                return list(dict.fromkeys(executed))
             paths: list[Path] = []
-            for tile in plan.tiles:
-                target = self.cache_dir / tile.cache_path
-                if target.is_file():
-                    paths.append(target)
-                    continue
-                legacy = self._legacy_hit(tile)
-                if legacy is not None:
-                    paths.append(legacy)
-                    continue
-                message = (
-                    f"tile fetch did not produce {tile.cache_path}; refusing "
-                    "to mosaic an incomplete set"
-                )
-                logger.error(message)
-                raise InvalidProcessingStateError(message)
-            return paths
+            for raw in plan.tiles:
+                for tile in expand_tile_parts(raw):
+                    target = self.cache_dir / tile.cache_path
+                    if target.is_file():
+                        paths.append(target)
+                        continue
+                    legacy = self._legacy_hit(tile)
+                    if legacy is not None:
+                        paths.append(legacy)
+                        continue
+                    message = (
+                        f"tile fetch did not produce {tile.cache_path}; "
+                        "refusing to mosaic an incomplete set"
+                    )
+                    logger.error(message)
+                    raise InvalidProcessingStateError(message)
+            return list(dict.fromkeys(paths))
         if isinstance(plan, Artifact):
             return executed
         members: list[Path] = []

@@ -728,6 +728,92 @@ class TestMultiTileTwoMeterTier:
 
 
 # ---------------------------------------------------------------------------
+# NOTE-p30 hygiene: _paths_for_plan TileSet branch stays self-consistent
+# ---------------------------------------------------------------------------
+
+
+class TestPathsForPlanTileSetBranch:
+    def test_tileset_branch_expands_multi_tile_parts(self, tmp_path: Path) -> None:
+        """The TileSet branch expands ``_MultiTileTile`` fan-out records.
+
+        Every concrete sub-tile of every planned tile must resolve to a
+        mosaic input; without ``expand_tile_parts`` the 2m sub-tiles
+        would be silently dropped (the retired BLOCKER-0030-B2 shape).
+        """
+        from faninsar.processing.geometry.dem_sources import _MultiTileTile
+        from faninsar.processing.geometry.dem_transport import Tile, TileSet
+
+        manager = DEMManager(tmp_path, source="arcticdem-2")
+        parts = tuple(
+            Tile(
+                url=(
+                    "https://pgc-opendata-dems.s3.us-west-2.amazonaws.com/"
+                    f"arcticdem/mosaics/v4.1/2m/07_40/07_40_{row}_{col}"
+                    "_2m_v4.1_dem.tif"
+                ),
+                cache_path=Path("arcticdem-v4.1-2m/07_40")
+                / f"07_40_{row}_{col}_2m_v4.1_dem.tif",
+                min_bytes=1,
+            )
+            for row in (1, 2)
+            for col in (1, 2)
+        )
+        plain = Tile(
+            url=(
+                "https://pgc-opendata-dems.s3.us-west-2.amazonaws.com/"
+                "arcticdem/mosaics/v4.1/2m/07_40/07_40_plain.tif"
+            ),
+            cache_path=Path("arcticdem-v4.1-2m/07_40/07_40_plain.tif"),
+            min_bytes=1,
+        )
+        for tile in (*parts, plain):
+            cached = tmp_path / tile.cache_path
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(b"dem")
+        plan = TileSet(
+            allowed_hosts=("pgc-opendata-dems.s3.us-west-2.amazonaws.com",),
+            tiles=(_MultiTileTile(*parts), plain),
+        )
+
+        paths = manager._paths_for_plan(plan, executed=[])
+
+        expected = {tmp_path / tile.cache_path for tile in (*parts, plain)}
+        assert set(paths) == expected
+        assert len(paths) == len(expected)
+
+    def test_tileset_branch_prefers_executed_paths(self, tmp_path: Path) -> None:
+        """Executed paths win over cache probing and are deduplicated."""
+        from faninsar.processing.geometry.dem_sources import _MultiTileTile
+        from faninsar.processing.geometry.dem_transport import Tile, TileSet
+
+        manager = DEMManager(tmp_path, source="arcticdem-2")
+        fan_out = _MultiTileTile(
+            Tile(
+                url="https://example.test/07_40_1_1_2m_v4.1_dem.tif",
+                cache_path=Path("arcticdem-v4.1-2m/07_40")
+                / "07_40_1_1_2m_v4.1_dem.tif",
+                min_bytes=1,
+            ),
+            Tile(
+                url="https://example.test/07_40_1_2_2m_v4.1_dem.tif",
+                cache_path=Path("arcticdem-v4.1-2m/07_40")
+                / "07_40_1_2_2m_v4.1_dem.tif",
+                min_bytes=1,
+            ),
+        )
+        plan = TileSet(
+            allowed_hosts=("example.test",),
+            tiles=(fan_out,),
+        )
+        first = tmp_path / "arcticdem-v4.1-2m/07_40/07_40_1_1_2m_v4.1_dem.tif"
+        second = tmp_path / "arcticdem-v4.1-2m/07_40/07_40_1_2_2m_v4.1_dem.tif"
+
+        paths = manager._paths_for_plan(plan, executed=[first, first, second])
+
+        assert paths == [first, second]
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers and misc
 # ---------------------------------------------------------------------------
 
