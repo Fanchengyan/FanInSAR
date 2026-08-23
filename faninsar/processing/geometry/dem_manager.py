@@ -431,6 +431,16 @@ class DEMManager:
         return self.source_entry.provider
 
     @property
+    def vertical_datum(self) -> str:
+        """Vertical datum declared by the resolved registry entry.
+
+        Drives the shared datum-aware wrap rule in
+        :func:`faninsar.processing.pipeline.production.resolve_auto_dem`;
+        ``ellipsoidal`` sources are returned unwrapped.
+        """
+        return self.source_entry.vertical_datum
+
+    @property
     def partition_name(self) -> str:
         """Opaque hyphen-joined cache partition label for this identity."""
         return f"{self.source_entry.product}-{self.source_entry.provider}"
