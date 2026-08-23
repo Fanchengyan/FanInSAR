@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,9 +26,17 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+
+def _add_timing(timings: dict[str, float] | None, key: str, started: float) -> None:
+    """Accumulate one exclusive substage into ``timings`` when provided."""
+    if timings is None:
+        return
+    timings[key] = timings.get(key, 0.0) + (time.perf_counter() - started)
+
 __all__ = [
     "Geo2RdrLUT",
     "build_geo2rdr_lut",
+    "burst_geo_footprint_lonlat",
     "burst_geo_quad_lonlat",
     "grid_lonlat",
     "grid_lonlat_rows",
@@ -209,6 +218,66 @@ def burst_geo_quad_lonlat(
     if int(ok.sum()) < 3:
         return None
     return np.column_stack([lon[ok], lat[ok]])
+
+
+def burst_geo_footprint_lonlat(
+    geometry: RadarGeometryModel,
+    radar_shape: tuple[int, int],
+    dem: DEMSampler | None,
+    grid: GeoGridSpec,
+    *,
+    device: DeviceLike,
+) -> np.ndarray | None:
+    """Return an eight-point convex hull in (lon, lat) for the burst footprint.
+
+    Vertices are the same rdr2geo corners and edge midpoints used by
+    :func:`derive_burst_geo_bbox`. The hull is formed in destination-grid
+    pixel space so a lon/lat convex hull cannot drop a midpoint that is
+    extreme after the map projection.
+    """
+    from scipy.spatial import ConvexHull
+
+    height, width = radar_shape
+    points = np.array(
+        [
+            [0.0, 0.0],
+            [0.0, width - 1],
+            [height - 1, 0.0],
+            [height - 1, width - 1],
+            [0.0, (width - 1) / 2],
+            [height - 1, (width - 1) / 2],
+            [(height - 1) / 2, 0.0],
+            [(height - 1) / 2, width - 1],
+        ],
+        dtype=np.float64,
+    )
+    res = run_rdr2geo(
+        geometry,
+        points[:, 0],
+        points[:, 1],
+        dem,
+        device=device,
+    )
+    lat = np.asarray(res.latitude_deg, dtype=np.float64)
+    lon = np.asarray(res.longitude_deg, dtype=np.float64)
+    ok = np.isfinite(lat) & np.isfinite(lon)
+    if int(ok.sum()) < 3:
+        return None
+    px = _lonlat_ring_to_grid_px(np.column_stack([lon[ok], lat[ok]]), grid)
+    finite = np.isfinite(px).all(axis=1)
+    px = px[finite]
+    if px.shape[0] < 3:
+        return None
+    hull = ConvexHull(px)
+    ring_px = px[hull.vertices]
+    x0, dx, _, y0, _, dy = grid.transform
+    xs = (ring_px[:, 0] + 0.5) * dx + x0
+    ys = y0 - (ring_px[:, 1] + 0.5) * (-dy)
+    from pyproj import Transformer
+
+    transformer = Transformer.from_crs(grid.crs, "EPSG:4326", always_xy=True)
+    ring_lon, ring_lat = transformer.transform(xs, ys)
+    return np.column_stack([np.asarray(ring_lon), np.asarray(ring_lat)])
 
 
 def footprint_polygon_mask(
@@ -457,6 +526,7 @@ _LUT_CACHE_ARRAY_FILES = (
     "height.float64",
 )
 _LUT_CACHE_META_NAME = "meta.json"
+_LUT_MASK_ALGORITHM = "8pt-hull-v1"
 
 
 def _lut_cache_path(
@@ -482,6 +552,8 @@ def _load_cached_lut(
     grid: GeoGridSpec,
     row0: int,
     col0: int,
+    footprint_applied: bool = False,
+    footprint_dilate_px: int = 64,
 ) -> tuple[float, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] | None:
     """Load a cached LUT when its identity matches; otherwise return ``None``."""
     mismatch = _lut_cache_mismatch_reason(
@@ -491,6 +563,8 @@ def _load_cached_lut(
         grid=grid,
         row0=row0,
         col0=col0,
+        footprint_applied=footprint_applied,
+        footprint_dilate_px=footprint_dilate_px,
     )
     if mismatch is not None:
         if mismatch != "missing":
@@ -517,7 +591,7 @@ def _load_cached_lut(
         return None
 
 
-def _lut_cache_mismatch_reason(
+def _lut_cache_mismatch_reason(  # noqa: PLR0911
     cache_path: Path,
     *,
     crop_shape: tuple[int, int],
@@ -525,6 +599,8 @@ def _lut_cache_mismatch_reason(
     grid: GeoGridSpec,
     row0: int,
     col0: int,
+    footprint_applied: bool = False,
+    footprint_dilate_px: int = 64,
 ) -> str | None:
     """Return ``None`` when the cache entry is usable, else why it is not."""
     import json
@@ -554,6 +630,17 @@ def _lut_cache_mismatch_reason(
     for key, want in expected.items():
         if actual[key] != want:
             return f"{key} mismatch"
+    stored_algorithm = meta.get("mask_algorithm")
+    if stored_algorithm is None or stored_algorithm != _LUT_MASK_ALGORITHM:
+        return "mask_algorithm mismatch"
+    if "footprint_applied" not in meta:
+        return "footprint_applied missing"
+    if bool(meta["footprint_applied"]) != bool(footprint_applied):
+        return "footprint_applied mismatch"
+    if "footprint_dilate_px" not in meta:
+        return "footprint_dilate_px missing"
+    if int(meta["footprint_dilate_px"]) != int(footprint_dilate_px):
+        return "footprint_dilate_px mismatch"
     missing_arrays = [
         name for name in _LUT_CACHE_ARRAY_FILES if not (cache_path / name).exists()
     ]
@@ -586,6 +673,9 @@ def _store_lut_cache(
     row0: int,
     col0: int,
     mean_height: float,
+    mask_algorithm: str = _LUT_MASK_ALGORITHM,
+    footprint_dilate_px: int = 64,
+    footprint_applied: bool = False,
 ) -> None:
     """Persist the freshly built LUT as a reusable cache entry."""
     cache_path.mkdir(parents=True, exist_ok=True)
@@ -605,6 +695,9 @@ def _store_lut_cache(
         "row0": int(row0),
         "col0": int(col0),
         "mean_height": float(mean_height),
+        "mask_algorithm": str(mask_algorithm),
+        "footprint_dilate_px": int(footprint_dilate_px),
+        "footprint_applied": bool(footprint_applied),
     }
     (cache_path / _LUT_CACHE_META_NAME).write_text(json.dumps(meta))
 
@@ -625,7 +718,9 @@ def build_geo2rdr_lut(
     footprint_lonlat: np.ndarray | None = None,
     roi_geometry: object | None = None,
     polygon_dilate_px: int = 64,
+    footprint_dilate_px: int = 64,
     device: DeviceLike,
+    timings_out: dict[str, float] | None = None,
 ) -> Geo2RdrLUT:
     """Build a reusable geographic-to-radar lookup table.
 
@@ -672,6 +767,13 @@ def build_geo2rdr_lut(
     polygon_dilate_px : int, optional
         Dilation radius applied to the footprint mask so edge pixels stay
         inside the crop and the optimization remains lossless.
+    footprint_dilate_px : int, optional
+        Dilation applied to the eight-point hull mask, independent of ROI
+        ``polygon_dilate_px``.
+    timings_out : dict, optional
+        Exclusive LUT substages accumulated in seconds (``polygon_mask``,
+        ``dem_sample``, ``geo2rdr``, ``store``). Nested observations of the
+        parent ``geo2rdr_lut`` wall, not an independent public-call boundary.
 
     Returns
     -------
@@ -710,6 +812,8 @@ def build_geo2rdr_lut(
             grid=grid,
             row0=row0,
             col0=col0,
+            footprint_applied=footprint_lonlat is not None,
+            footprint_dilate_px=int(footprint_dilate_px),
         )
         if cached is not None:
             mean_height, arrays = cached
@@ -777,6 +881,7 @@ def build_geo2rdr_lut(
 
     mean_heights: list[float] = []
     polygon_mask: np.ndarray | None = None
+    mask_started = time.perf_counter()
     if footprint_lonlat is not None:
         polygon_mask = footprint_polygon_mask(
             grid,
@@ -785,7 +890,7 @@ def build_geo2rdr_lut(
             col0,
             col1,
             np.asarray(footprint_lonlat),
-            dilate_px=polygon_dilate_px,
+            dilate_px=footprint_dilate_px,
         )
     elif roi_geometry is not None:
         polygon_mask = roi_geo_mask(
@@ -797,6 +902,7 @@ def build_geo2rdr_lut(
             col1,
             dilate_px=polygon_dilate_px,
         )
+    _add_timing(timings_out, "polygon_mask", mask_started)
     for row_start in range(row0, row1, chunk_size):
         row_stop = min(row_start + chunk_size, row1)
         latitude_chunk, longitude_chunk = grid_lonlat_rows(
@@ -815,14 +921,19 @@ def build_geo2rdr_lut(
             finite_geo &= polygon_mask[poly_rows, :]
         safe_latitude = np.where(finite_geo, latitude_chunk, 0.0)
         safe_longitude = np.where(finite_geo, longitude_chunk, 0.0)
+        dem_started = time.perf_counter()
         if dem is not None:
-            sampled_height = np.asarray(
-                dem.sample(
-                    np.where(grid_ok, latitude_chunk, 0.0),
-                    np.where(grid_ok, longitude_chunk, 0.0),
-                ),
-                dtype=np.float64,
-            )
+            sampled_height = np.full(finite_geo.shape, np.nan, dtype=np.float64)
+            sample_mask = finite_geo if polygon_mask is not None else grid_ok
+            if sample_mask.any():
+                packed = np.asarray(
+                    dem.sample(
+                        latitude_chunk[sample_mask],
+                        longitude_chunk[sample_mask],
+                    ),
+                    dtype=np.float64,
+                )
+                sampled_height[sample_mask] = packed
             raw_height = sampled_height
             height_chunk = np.where(
                 np.isfinite(sampled_height),
@@ -846,7 +957,9 @@ def build_geo2rdr_lut(
         height_lookup[row_start - row0 : row_stop - row0, :] = raw_height
         if not np.isscalar(height_chunk):
             mean_heights.append(float(np.nanmean(height_chunk)))
+        _add_timing(timings_out, "dem_sample", dem_started)
 
+        geo2rdr_started = time.perf_counter()
         result = run_geo2rdr(
             geometry,
             safe_latitude,
@@ -854,6 +967,7 @@ def build_geo2rdr_lut(
             height_chunk,
             device=device,
         )
+        _add_timing(timings_out, "geo2rdr", geo2rdr_started)
         chunk_valid = (
             finite_geo
             & result.converged
@@ -875,10 +989,13 @@ def build_geo2rdr_lut(
             np.nan,
         )
         valid[row_start - row0 : row_stop - row0, :] = chunk_valid
+        store_started = time.perf_counter()
         for array in (azimuth, range_index, valid, height_lookup):
             if isinstance(array, np.memmap):
                 release_memmap_pages(array)
+        _add_timing(timings_out, "store", store_started)
 
+    flush_started = time.perf_counter()
     if isinstance(azimuth, np.memmap):
         azimuth.flush()
     if isinstance(range_index, np.memmap):
@@ -899,7 +1016,11 @@ def build_geo2rdr_lut(
             row0=row0,
             col0=col0,
             mean_height=mean_height,
+            mask_algorithm=_LUT_MASK_ALGORITHM,
+            footprint_dilate_px=int(footprint_dilate_px),
+            footprint_applied=footprint_lonlat is not None,
         )
+    _add_timing(timings_out, "store", flush_started)
     logger.info(
         "Built geo2rdr LUT: %d/%d valid, radar_shape=%s, mean_height=%.1f m",
         int(valid.sum()),

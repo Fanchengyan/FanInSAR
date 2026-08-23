@@ -95,6 +95,40 @@ logger = setup_logger(__name__)
 
 DEM_BOUNDS_BUFFER_M = 2000.0
 
+
+def _sync_admitted_device(device: object) -> None:
+    """Block until admitted CUDA work is visible to the host clock."""
+    ident = str(device)
+    if not ident.startswith("cuda"):
+        return
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _clock_start(device: object) -> float:
+    """Return a device-synchronized perf_counter start time."""
+    _sync_admitted_device(device)
+    return time.perf_counter()
+
+
+def _clock_stop(device: object, started: float) -> float:
+    """Return elapsed seconds after a device-synchronized stop."""
+    _sync_admitted_device(device)
+    return time.perf_counter() - started
+
+
+def _merge_coreg_stage_times(
+    stage_times: dict[str, float],
+    coregistration_timings_s: Mapping[str, float],
+) -> None:
+    """Copy exclusive coreg substages into the per-burst timing record."""
+    for key, value in coregistration_timings_s.items():
+        stage_times[f"coreg.{key}"] = float(value)
+
 SPEED_OF_LIGHT_M_S = 299_792_458.0
 ScopeMode = Literal["burst", "swath"]
 CoregistrationGrid = Literal["radar", "geo"]
@@ -578,6 +612,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     dem = task["dem"]
     geo_work_dir = task["geo_work_dir"]
     geo_lut_cache_dir = task.get("geo_lut_cache_dir")
+    geo_footprint_mask_enabled = bool(task.get("geo_footprint_mask_enabled", True))
     scene_store_dir = task.get("scene_store_dir")
     scene_grid_shape = task.get("scene_grid_shape")
     prepared_lut_handle = task.get("prepared_geo_lut_handle")
@@ -617,6 +652,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
             prepared_provider_token,
         )
 
+    load_started = time.perf_counter()
     ref_product = open_safe_product(ref_path)
     sec_product = open_safe_product(sec_path)
 
@@ -651,6 +687,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
 
     ref = load_burst_worker(ref_path, ref_orbit, ref_product)
     sec = load_burst_worker(sec_path, sec_orbit, sec_product)
+    load_s = time.perf_counter() - load_started
     state = ProductionPairState(
         pair_id=ref.scene_id + "_" + sec.scene_id + "_" + tag,
         reference=ref,
@@ -662,11 +699,11 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         unwrap_method="snaphu",
         record_scientific_lineage=record_scientific_lineage,
     )
-    stage_times: dict[str, float] = {}
-    t0 = time.perf_counter()
+    stage_times: dict[str, float] = {"load": load_s}
+    t0 = _clock_start(device)
     state = stage_deramp(state, device=device, dask_client=dask_client)
-    stage_times["deramp"] = time.perf_counter() - t0
-    t0 = time.perf_counter()
+    stage_times["deramp"] = _clock_stop(device, t0)
+    t0 = _clock_start(device)
     burst_work_dir: Path | None = None
     if coregistration_grid == "geo" and geo_work_dir is not None:
         burst_work_dir = Path(geo_work_dir) / tag
@@ -699,12 +736,14 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         geo_chunk_size=geo_chunk_size,
         geo_work_dir=burst_work_dir,
         geo_lut_cache_dir=geo_lut_cache_dir,
+        geo_footprint_mask_enabled=geo_footprint_mask_enabled,
         roi=roi,
         roi_buffer_m=roi_buffer_m,
         roi_window=roi_window,
         prepared_geo_lut=prepared_geo_lut,
     )
-    stage_times["coregister"] = time.perf_counter() - t0
+    stage_times["coregister"] = _clock_stop(device, t0)
+    _merge_coreg_stage_times(stage_times, state.coregistration_timings_s)
     burst_row0 = 0
     burst_col0 = 0
     geo_valid_mask: np.ndarray | None = None
@@ -764,7 +803,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         )
     pri_power = state.reference_deramped.real**2 + state.reference_deramped.imag**2
     sec_power = state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
-    t0 = time.perf_counter()
+    t0 = _clock_start(device)
     state = stage_interferogram(
         state,
         multilook=(1, 1),
@@ -773,8 +812,8 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         device=device,
         dask_client=dask_client,
     )
-    stage_times["interferogram"] = time.perf_counter() - t0
-    t0 = time.perf_counter()
+    stage_times["interferogram"] = _clock_stop(device, t0)
+    t0 = _clock_start(device)
     if coregistration_grid == "geo":
         state.complex_ifg_flat = state.complex_ifg
         state.note("FLATTEN applied to secondary geocoded SLC before IFG formation")
@@ -785,7 +824,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
             device=device,
             dask_client=dask_client,
         )
-        stage_times["flatten"] = time.perf_counter() - t0
+        stage_times["flatten"] = _clock_stop(device, t0)
     ifg_full = (
         state.complex_ifg_flat
         if state.complex_ifg_flat is not None
@@ -1455,6 +1494,8 @@ def _apply_geo_topographic_phase_chunked(
     watchdog: MemoryWatchdog | None,
     row0_offset: int = 0,
     col0_offset: int = 0,
+    timings_out: dict[str, float] | None = None,
+    device: str = "cpu",
 ) -> tuple[np.memmap, np.ndarray]:
     """Apply geometric phase to disk-backed geographic SLC row tiles.
 
@@ -1479,6 +1520,10 @@ def _apply_geo_topographic_phase_chunked(
     row0_offset, col0_offset : int
         Offset of the cropped LUT inside the full geographic grid, used to
         map cropped rows/cols back to global grid coordinates.
+    timings_out : dict, optional
+        Exclusive topographic substages (``compose``, ``phase``, ``apply``).
+    device : str, optional
+        Admitted compose device. CUDA uses Torch ``grid_sample``; CPU uses SciPy.
 
     Returns
     -------
@@ -1517,9 +1562,11 @@ def _apply_geo_topographic_phase_chunked(
             height_m=lut.height_m,
             height_full=(None if lut.height_full is None else lut.height_full[rows]),
         )
+        compose_started = time.perf_counter()
         secondary_azimuth, _, coordinate_valid = compose_secondary_coordinates(
             tile_lut,
             offsets,
+            device=device,
         )
         latitude, longitude = grid_lonlat_rows(
             grid,
@@ -1537,6 +1584,11 @@ def _apply_geo_topographic_phase_chunked(
             )
         else:
             height = np.asarray(tile_lut.height_full, dtype=np.float64)
+        if timings_out is not None:
+            timings_out["compose"] = timings_out.get("compose", 0.0) + (
+                time.perf_counter() - compose_started
+            )
+        phase_started = time.perf_counter()
         phase = compute_geometric_phase_from_geo(
             state.reference.geometry,
             state.secondary.geometry,
@@ -1547,6 +1599,11 @@ def _apply_geo_topographic_phase_chunked(
             secondary_azimuth,
             reference_range_index=tile_lut.rg_full,
         )
+        if timings_out is not None:
+            timings_out["phase"] = timings_out.get("phase", 0.0) + (
+                time.perf_counter() - phase_started
+            )
+        apply_started = time.perf_counter()
         tile_valid = valid[rows] & coordinate_valid & np.isfinite(phase)
         corrected_secondary = secondary_geo[rows] * np.exp(1j * phase).astype(
             np.complex64
@@ -1587,6 +1644,10 @@ def _apply_geo_topographic_phase_chunked(
                 release_memmap_pages(array)
         if watchdog is not None:
             watchdog.sample(f"geo_topographic_phase:{row_start}:{row_stop}")
+        if timings_out is not None:
+            timings_out["apply"] = timings_out.get("apply", 0.0) + (
+                time.perf_counter() - apply_started
+            )
     reference_geo.flush()
     secondary_geo.flush()
     valid.flush()
@@ -1616,6 +1677,7 @@ def stage_coregister(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     geo_lut_cache_dir: str | Path | None = None,
+    geo_footprint_mask_enabled: bool = True,
     roi: BoundingBox | Polygons | None = None,
     roi_buffer_m: float = 320.0,
     roi_window: tuple[int, int, int, int] | None = None,
@@ -1683,6 +1745,9 @@ def stage_coregister(
     geo_lut_cache_dir : str or pathlib.Path, optional
         Shared cache for reference-scene geo2rdr LUTs; entries are keyed by
         scene, burst, and grid identity.
+    geo_footprint_mask_enabled : bool, optional
+        When True (default), crop the geo LUT with the eight-point burst
+        hull and skip destination pixels outside the dilated footprint.
     roi : BoundingBox or Polygons, optional
         Restricts geo processing to the ROI-burst quad intersection
         (buffered by ``roi_buffer_m``) instead of the full burst bbox.
@@ -1809,7 +1874,7 @@ def stage_coregister(
             state.reference_deramped = ref
             state.secondary_deramped = sec
             state.radar_roi_origin = window_origin
-        substage_started = time.perf_counter()
+        substage_started = _clock_start(device)
         if prepared_geometry_field is None:
             geometry_field = dense_geometry_offsets(
                 shape=ref.shape,
@@ -1821,8 +1886,8 @@ def stage_coregister(
                 row0=0 if window_origin is None else window_origin[0],
                 col0=0 if window_origin is None else window_origin[1],
             )
-            state.coregistration_timings_s["dense_geometry_offsets"] = (
-                time.perf_counter() - substage_started
+            state.coregistration_timings_s["dense_geometry_offsets"] = _clock_stop(
+                device, substage_started
             )
         else:
             geometry_field = prepared_geometry_field.field
@@ -1838,6 +1903,7 @@ def stage_coregister(
         amp_res_az = 0.0
         amp_az_measured = 0.0
         esd_az = 0.0
+        ampcor_started = _clock_start(device)
         # Residual measure is always on radar deramped samples (PROPOSAL-0017);
         # independent of final product grid (radar vs geo).
         # Multi-burst pairs pass force_* so every burst shares one residual
@@ -1879,6 +1945,8 @@ def stage_coregister(
                 state.note("amplitude refinement skipped (non-finite result)")
         elif amplitude_refinement_enabled:
             state.note("amplitude refinement skipped (non-finite geometry prior)")
+        state.coregistration_timings_s["ampcor"] = _clock_stop(device, ampcor_started)
+        esd_started = _clock_start(device)
         if force_esd_azimuth_shift_px is not None:
             esd_az = float(force_esd_azimuth_shift_px)
             state.esd_azimuth_shift_px = esd_az
@@ -1917,6 +1985,7 @@ def stage_coregister(
             state.note(f"ESD az={esd_az:.4f} px coherence={esd.coherence:.3f}")
             del pre
             gc.collect()
+        state.coregistration_timings_s["esd"] = _clock_stop(device, esd_started)
         state.amplitude_residual_rg_px = float(amp_res_rg)
 
         offsets = combine_offset_fields(
@@ -2014,6 +2083,7 @@ def stage_coregister(
             reject_invalid_state("geo coregistration requires geo_grid")
         from faninsar.processing.pipeline.geo_lut import (
             build_geo2rdr_lut,
+            burst_geo_footprint_lonlat,
             burst_geo_quad_lonlat,
             derive_burst_geo_bbox,
             roi_geo_bbox,
@@ -2043,6 +2113,7 @@ def stage_coregister(
             roi_geometry = None
             state.note("COREG reused provider-owned Geo LUT/view")
         else:
+            bbox_started = _clock_start(device)
             burst_row0, burst_row1, burst_col0, burst_col1 = derive_burst_geo_bbox(
                 geometry=state.reference.geometry,
                 radar_shape=ref.shape,
@@ -2050,8 +2121,28 @@ def stage_coregister(
                 grid=geo_grid,
                 device=device,
             )
+            state.coregistration_timings_s["geo_bbox"] = _clock_stop(
+                device, bbox_started
+            )
             footprint_lonlat = None
             roi_geometry = None
+            if geo_footprint_mask_enabled and roi is None:
+                footprint_started = _clock_start(device)
+                footprint_lonlat = burst_geo_footprint_lonlat(
+                    geometry=state.reference.geometry,
+                    radar_shape=ref.shape,
+                    dem=state.dem,
+                    grid=geo_grid,
+                    device=device,
+                )
+                state.coregistration_timings_s["geo_footprint"] = _clock_stop(
+                    device, footprint_started
+                )
+                if footprint_lonlat is None:
+                    logger.warning(
+                        "burst footprint polygon could not be derived; "
+                        "continuing without geo footprint mask"
+                    )
             if roi is not None:
                 from shapely.geometry import MultiPolygon
                 from shapely.geometry import Polygon as ShapelyPolygon
@@ -2089,7 +2180,7 @@ def stage_coregister(
                         )
         state.geo_bbox = (burst_row0, burst_row1, burst_col0, burst_col1)
         if prepared_geo_lut is None:
-            substage_started = time.perf_counter()
+            substage_started = _clock_start(device)
             from faninsar.processing.pipeline.geo_lut import geo_grid_hash
 
             lut_cache_key = None
@@ -2102,10 +2193,14 @@ def stage_coregister(
                 reference_burst = int(
                     getattr(getattr(state.reference, "burst", None), "index", 0)
                 )
+                mask_applied = footprint_lonlat is not None
                 lut_cache_key = (
                     f"{reference_scene}_{reference_swath}_b{reference_burst}_"
-                    f"{geo_grid_hash(geo_grid)}"
+                    f"{geo_grid_hash(geo_grid)}_"
+                    f"m{int(geo_footprint_mask_enabled)}_"
+                    f"a{int(mask_applied)}_d64_8pt-hull-v1"
                 )
+            lut_timings: dict[str, float] = {}
             lut = build_geo2rdr_lut(
                 geometry=state.reference.geometry,
                 grid=geo_grid,
@@ -2122,14 +2217,18 @@ def stage_coregister(
                 footprint_lonlat=footprint_lonlat,
                 roi_geometry=roi_geometry,
                 polygon_dilate_px=2,
+                footprint_dilate_px=64,
+                timings_out=lut_timings,
             )
-            state.coregistration_timings_s["geo2rdr_lut"] = (
-                time.perf_counter() - substage_started
+            state.coregistration_timings_s["geo2rdr_lut"] = _clock_stop(
+                device, substage_started
             )
+            for key, value in lut_timings.items():
+                state.coregistration_timings_s[f"geo2rdr_lut.{key}"] = float(value)
         else:
             lut = prepared_geo_lut
             state.coregistration_timings_s["geo2rdr_lut_reused"] = 0.0
-        substage_started = time.perf_counter()
+        substage_started = _clock_start(device)
         reference_geo, secondary_geo, valid = coregister_geocoded_slcs_chunked(
             ref,
             sec,
@@ -2144,10 +2243,11 @@ def stage_coregister(
             dask_client=dask_client,
             watchdog=memory_watchdog,
         )
-        state.coregistration_timings_s["geo_slc_resample"] = (
-            time.perf_counter() - substage_started
+        state.coregistration_timings_s["geo_slc_resample"] = _clock_stop(
+            device, substage_started
         )
-        substage_started = time.perf_counter()
+        substage_started = _clock_start(device)
+        topo_timings: dict[str, float] = {}
         topo_phase, height_field = _apply_geo_topographic_phase_chunked(
             state,
             lut,
@@ -2161,10 +2261,16 @@ def stage_coregister(
             watchdog=memory_watchdog,
             row0_offset=burst_row0,
             col0_offset=burst_col0,
+            timings_out=topo_timings,
+            device=str(resolved_torch_device),
         )
-        state.coregistration_timings_s["geo_topographic_phase"] = (
-            time.perf_counter() - substage_started
+        state.coregistration_timings_s["geo_topographic_phase"] = _clock_stop(
+            device, substage_started
         )
+        for key, value in topo_timings.items():
+            state.coregistration_timings_s[f"geo_topographic_phase.{key}"] = float(
+                value
+            )
         state.reference_geocoded_slc = reference_geo
         state.secondary_geocoded_slc = secondary_geo
         state.geocoded_slc_valid = valid
@@ -2220,7 +2326,7 @@ def stage_coregister(
         )
         return state
 
-    substage_started = time.perf_counter()
+    substage_started = _clock_start(device)
     secondary_input = state.secondary_deramped
     sec_resamp = resample_complex_deramped_reramp(
         sec,
@@ -2233,6 +2339,9 @@ def stage_coregister(
         col0=0 if window_origin is None else window_origin[1],
         native_height=state.reference.array.samples.shape[0],
     )
+    state.coregistration_timings_s["radar_resample"] = _clock_stop(
+        device, substage_started
+    )
     secondary_geometry = state.secondary.geometry
     phase_per_range_pixel = (
         4.0
@@ -2241,14 +2350,18 @@ def stage_coregister(
         / secondary_geometry.wavelength_m
     )
     range_carrier_phase = phase_per_range_pixel * offsets.range_offset_px
+    flatten_started = _clock_start(device)
     sec_resamp = _flatten_complex_ifg(
         sec_resamp,
         range_carrier_phase,
         resolved_torch_device,
         dask_client,
     ).astype(np.complex64, copy=False)
-    state.coregistration_timings_s["radar_resample_and_flatten"] = (
-        time.perf_counter() - substage_started
+    state.coregistration_timings_s["radar_range_flatten"] = _clock_stop(
+        device, flatten_started
+    )
+    state.coregistration_timings_s["radar_resample_and_flatten"] = _clock_stop(
+        device, substage_started
     )
     state.secondary_aligned_is_flattened = True
     state.range_offset_flatten_phase = (
@@ -2257,6 +2370,7 @@ def stage_coregister(
     state.secondary_deramped = None
     from faninsar.backends.dask_gpu import run_carrier_multiply, should_accelerate
 
+    reramp_started = _clock_start(device)
     if should_accelerate(
         resolved_torch_device,
         dask_client,
@@ -2280,6 +2394,9 @@ def stage_coregister(
             col0=0 if window_origin is None else window_origin[1],
             native_height=state.reference.array.samples.shape[0],
         )
+    state.coregistration_timings_s["radar_reramp"] = _clock_stop(
+        device, reramp_started
+    )
     state.secondary_aligned = sec_resamp
     radar_offset_digest: str | None = None
     radar_range_phase_digest: str | None = None
@@ -3732,6 +3849,7 @@ def run_pair(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     geo_lut_cache_dir: str | Path | None = None,
+    geo_footprint_mask_enabled: bool = True,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
@@ -3777,6 +3895,7 @@ def run_pair(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     geo_lut_cache_dir: str | Path | None = None,
+    geo_footprint_mask_enabled: bool = True,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
@@ -3823,6 +3942,7 @@ def run_pair(
     geo_chunk_size: int = 128,
     geo_work_dir: str | Path | None = None,
     geo_lut_cache_dir: str | Path | None = None,
+    geo_footprint_mask_enabled: bool = True,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
@@ -3907,6 +4027,9 @@ def run_pair(
         of recomputing it.
         Working directory for geo memmaps; a temporary directory is used
         when omitted.
+    geo_footprint_mask_enabled : bool, optional
+        When True (default), apply the burst-footprint hull mask in geo mode
+        when no ROI is supplied.  ROI burst-quad intersection is unchanged.
     scene_store_dir : path, optional
         Caller-owned directory for immutable master-aligned scene units. Radar
         and Geo sweep paths support this seam when ``n_jobs=1``; parallel
@@ -3999,6 +4122,7 @@ def run_pair(
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=geo_work_dir,
             geo_lut_cache_dir=geo_lut_cache_dir,
+            geo_footprint_mask_enabled=geo_footprint_mask_enabled,
             scene_store_dir=scene_store_dir,
             n_jobs=n_jobs,
             resource_limits=resource_limits,
@@ -4016,9 +4140,16 @@ def run_pair(
             record_scientific_lineage=record_scientific_lineage,
         )
     from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.geometry.dem import (
+        admit_dem_device_identity,
+        clone_raster_dem,
+        pin_dem_sampler_device,
+    )
     from faninsar.processing.geometry.egm96 import EGM96Geoid
 
+    dem_identity = admit_dem_device_identity(device)
     dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
     snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
     if snapshot_root is not None and isinstance(dem_sampler, RasterDEM):
         from faninsar.processing.source_snapshots import snapshot_local_source
@@ -4027,11 +4158,7 @@ def run_pair(
             dem_sampler.path,
             snapshot_root / "dem",
         )
-        dem_sampler = RasterDEM(
-            dem_snapshot.path,
-            nodata=dem_sampler.nodata,
-            interpolation=dem_sampler.interpolation,
-        )
+        dem_sampler = clone_raster_dem(dem_sampler, path=dem_snapshot.path)
     if geoid_correction and isinstance(dem_sampler, RasterDEM):
         dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
@@ -4169,7 +4296,9 @@ def run_pair(
             bounds, Path(output_dir) / "dem" / default_dem_name()
         )
         logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
-        dem_sampler = RasterDEM(dem_path, interpolation="biquintic")
+        dem_sampler = RasterDEM(
+            dem_path, interpolation="biquintic", device=dem_identity
+        )
         if geoid_correction:
             dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
@@ -4329,11 +4458,13 @@ def run_pair(
                     unwrap_method="snaphu",
                     record_scientific_lineage=record_scientific_lineage,
                 )
+                measure_started = _clock_start(device)
                 measure_state = stage_deramp(
                     measure_state,
                     device=device,
                     dask_client=dask_client,
                 )
+                measure_deramp_s = _clock_stop(device, measure_started)
                 roi_window_m: tuple[int, int, int, int] | None = None
                 if roi is not None:
                     assert measure_state.reference_deramped is not None
@@ -4345,6 +4476,7 @@ def run_pair(
                         device=device,
                         buffer_m=roi_buffer_m,
                     )
+                measure_coreg_started = _clock_start(device)
                 measure_state = stage_coregister(
                     measure_state,
                     control_spacing=control_spacing,
@@ -4356,8 +4488,18 @@ def run_pair(
                     executor=executor,
                     device=device,
                     dask_client=dask_client,
+                    geo_footprint_mask_enabled=geo_footprint_mask_enabled,
                     roi_window=roi_window_m,
                 )
+                measure_coreg_s = _clock_stop(device, measure_coreg_started)
+                measure_times = {
+                    "deramp": measure_deramp_s,
+                    "coregister": measure_coreg_s,
+                }
+                _merge_coreg_stage_times(
+                    measure_times, measure_state.coregistration_timings_s
+                )
+                per_burst_timings[f"measure.{tag}"] = measure_times
                 if measure_state.amplitude_residual_rg_px is not None:
                     measured_amp.append(float(measure_state.amplitude_residual_rg_px))
                 if measure_state.esd_azimuth_shift_px is not None:
@@ -4419,14 +4561,14 @@ def run_pair(
             if origin_state is None:
                 origin_state = state
             stage_times: dict[str, float] = {}
-            t0 = time.perf_counter()
+            t0 = _clock_start(device)
             state = stage_deramp(
                 state,
                 device=device,
                 dask_client=dask_client,
             )
-            stage_times["deramp"] = time.perf_counter() - t0
-            t0 = time.perf_counter()
+            stage_times["deramp"] = _clock_stop(device, t0)
+            t0 = _clock_start(device)
             roi_window: tuple[int, int, int, int] | None = None
             if roi is not None:
                 assert state.reference_deramped is not None
@@ -4451,9 +4593,11 @@ def run_pair(
                 executor=executor,
                 device=device,
                 dask_client=dask_client,
+                geo_footprint_mask_enabled=geo_footprint_mask_enabled,
                 roi_window=roi_window,
             )
-            stage_times["coregister"] = time.perf_counter() - t0
+            stage_times["coregister"] = _clock_stop(device, t0)
+            _merge_coreg_stage_times(stage_times, state.coregistration_timings_s)
             burst_row0 = 0
             burst_col0 = 0
             if state.radar_roi_origin is not None:
@@ -4484,7 +4628,7 @@ def run_pair(
             sec_power = (
                 state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
             )
-            t0 = time.perf_counter()
+            t0 = _clock_start(device)
             state = stage_interferogram(
                 state,
                 multilook=(1, 1),
@@ -4493,14 +4637,14 @@ def run_pair(
                 device=device,
                 dask_client=dask_client,
             )
-            stage_times["interferogram"] = time.perf_counter() - t0
-            t0 = time.perf_counter()
+            stage_times["interferogram"] = _clock_stop(device, t0)
+            t0 = _clock_start(device)
             state = stage_flatten(
                 state,
                 device=device,
                 dask_client=dask_client,
             )
-            stage_times["flatten"] = time.perf_counter() - t0
+            stage_times["flatten"] = _clock_stop(device, t0)
             ifg_full = (
                 state.complex_ifg_flat
                 if state.complex_ifg_flat is not None
@@ -4540,6 +4684,7 @@ def run_pair(
     if first_state is None:
         reject_invalid_state("no burst units selected for processing")
 
+    merge_started = time.perf_counter()
     merged_ifg = np.zeros((out_rows, out_cols), dtype=np.complex64)
     coherence = np.full((out_rows, out_cols), np.nan, dtype=np.float32)
     for swath, swath_acc in ifc_acc.items():
@@ -4562,8 +4707,10 @@ def run_pair(
         del swath_ifg, swath_coh
     invalid = np.abs(merged_ifg) <= 0
     wrapped = np.where(invalid, np.nan, np.angle(merged_ifg).astype(np.float32))
+    merge_s = time.perf_counter() - merge_started
 
     filtered = merged_ifg
+    goldstein_started = time.perf_counter()
     if goldstein_alpha > 0.0:
         from faninsar.processing.interferometry.pair import goldstein_filter
 
@@ -4571,6 +4718,7 @@ def run_pair(
         # Keep the saved wrapped phase consistent with the filtered product;
         # unwrapping also consumes the filtered phase (standard practice).
         wrapped = np.where(invalid, np.nan, np.angle(filtered).astype(np.float32))
+    goldstein_s = time.perf_counter() - goldstein_started
 
     result = ProductionPairState(
         pair_id=_scene_id(ref_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair",
@@ -4604,6 +4752,8 @@ def run_pair(
         stage_timings_s={
             "total": time.perf_counter() - total_started,
             "per_burst": per_burst_timings,
+            "merge": merge_s,
+            "goldstein": goldstein_s,
         },
     )
     if origin_state is not None:
@@ -4671,6 +4821,7 @@ def _run_pair_sweep(
     geo_chunk_size: int,
     geo_work_dir: str | Path | None,
     geo_lut_cache_dir: str | Path | None = None,
+    geo_footprint_mask_enabled: bool = True,
     scene_store_dir: str | Path | None = None,
     snaphu_config: SnaphuConfig | None,
     unwrap_method: UnwrapBackend | None,
@@ -4692,6 +4843,11 @@ def _run_pair_sweep(
 ) -> ProductionPairState | ProductionPairSweepResult:
     """Run one shared prefix and emit every look configuration."""
     from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.processing.geometry.dem import (
+        admit_dem_device_identity,
+        clone_raster_dem,
+        pin_dem_sampler_device,
+    )
     from faninsar.processing.geometry.egm96 import EGM96Geoid
 
     if (prepared_geo_lut_handles is None) != (prepared_provider_root is None):
@@ -4737,7 +4893,9 @@ def _run_pair_sweep(
             if stale.exists():
                 shutil.rmtree(stale)
 
+    dem_identity = admit_dem_device_identity(device)
     dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
     snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
     if snapshot_root is not None and isinstance(dem_sampler, RasterDEM):
         from faninsar.processing.source_snapshots import snapshot_local_source
@@ -4746,11 +4904,7 @@ def _run_pair_sweep(
             dem_sampler.path,
             snapshot_root / "dem",
         )
-        dem_sampler = RasterDEM(
-            dem_snapshot.path,
-            nodata=dem_sampler.nodata,
-            interpolation=dem_sampler.interpolation,
-        )
+        dem_sampler = clone_raster_dem(dem_sampler, path=dem_snapshot.path)
     if geoid_correction and isinstance(dem_sampler, RasterDEM):
         dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
@@ -4887,7 +5041,9 @@ def _run_pair_sweep(
             bounds, output_root / "dem" / default_dem_name()
         )
         logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
-        dem_sampler = RasterDEM(dem_path, interpolation="biquintic")
+        dem_sampler = RasterDEM(
+            dem_path, interpolation="biquintic", device=dem_identity
+        )
         if geoid_correction:
             dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
@@ -4982,6 +5138,7 @@ def _run_pair_sweep(
             geo_chunk_size=geo_chunk_size,
             geo_work_dir=resolved_geo_work_dir,
             geo_lut_cache_dir=geo_lut_cache_dir,
+            geo_footprint_mask_enabled=geo_footprint_mask_enabled,
             scene_store_dir=scene_store_dir,
             n_jobs=n_jobs,
             resource_limits=resource_limits,
@@ -4998,6 +5155,7 @@ def _run_pair_sweep(
         single_state: ProductionPairState | None = None
         for config in configs:
             az_looks, rg_looks = config
+            merge_started = time.perf_counter()
             merged = _merge_burst_ifgs(
                 archive,
                 swath_tuple=swath_tuple,
@@ -5010,6 +5168,7 @@ def _run_pair_sweep(
                 rg_looks=rg_looks,
                 geo_grid=geo_grid,
             )
+            merged["merge_s"] = time.perf_counter() - merge_started
             outcome, state = _finalize_sweep_config(
                 merged,
                 config=config,
@@ -5063,6 +5222,7 @@ def _archive_burst_ifgs(
     geo_chunk_size: int,
     geo_work_dir: Path | None,
     geo_lut_cache_dir: str | Path | None = None,
+    geo_footprint_mask_enabled: bool = True,
     scene_store_dir: str | Path | None = None,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
@@ -5227,6 +5387,7 @@ def _archive_burst_ifgs(
                     "dem": dem_sampler,
                     "geo_work_dir": geo_work_dir,
                     "geo_lut_cache_dir": geo_lut_cache_dir,
+                    "geo_footprint_mask_enabled": geo_footprint_mask_enabled,
                     "scene_store_dir": scene_store_dir,
                     "scene_grid_shape": (
                         geo_grid.shape
@@ -5592,6 +5753,7 @@ def _finalize_sweep_config(
         stage_timings_s={
             "total": merged["total_seconds"],
             "per_burst": merged["per_burst_timings"],
+            "merge": float(merged.get("merge_s", 0.0)),
             "resource_peak_rss_bytes": merged.get("resource_peak_rss_bytes", 0),
             "resource_sample_count": merged.get("resource_sample_count", 0),
         },
@@ -5807,6 +5969,7 @@ def _finalize_geo_config(
         stage_timings_s={
             "total": merged["total_seconds"],
             "per_burst": merged["per_burst_timings"],
+            "merge": float(merged.get("merge_s", 0.0)),
             "resource_peak_rss_bytes": merged.get("resource_peak_rss_bytes", 0),
             "resource_sample_count": merged.get("resource_sample_count", 0),
         },

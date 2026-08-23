@@ -192,8 +192,14 @@ def run_frame_cli(
         if not dem_path.exists():
             bounds = _cli_dem_bounds(roi_box, _as_path_list(reference))
             dem_path = get_dem_manager().fetch_dem(bounds, dem_path)
+        from faninsar.processing.geometry.dem import admit_dem_device_identity
+
+        dem_identity = admit_dem_device_identity(device)
         dem_sampler = GeoidAdjustedDEM(
-            RasterDEM(path=dem_path, interpolation="biquintic"), EGM96Geoid()
+            RasterDEM(
+                path=dem_path, interpolation="biquintic", device=dem_identity
+            ),
+            EGM96Geoid(),
         )
 
     state = run_pair(

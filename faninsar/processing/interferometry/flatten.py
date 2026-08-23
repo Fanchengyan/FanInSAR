@@ -1314,6 +1314,7 @@ def copernicus_glo30_dem(
     longitude_deg: float,
     *,
     base_path: str | Path,
+    device: str,
 ) -> RasterDEM:
     """Return a :class:`RasterDEM` for the Copernicus GLO-30 tile covering a coordinate.
 
@@ -1326,6 +1327,8 @@ def copernicus_glo30_dem(
         Geodetic coordinate in degrees.
     base_path : str or Path
         Directory containing Copernicus GLO-30 COG tiles.
+    device : str
+        Admitted DEM device identity (``cpu`` / ``cuda`` / ``cuda:N``).
 
     Returns
     -------
@@ -1353,4 +1356,4 @@ def copernicus_glo30_dem(
         message = f"Copernicus GLO-30 tile not found for {filename} under {base}"
         logger.error(message)
         raise FileNotFoundError(message)
-    return RasterDEM(path=path)
+    return RasterDEM(path=path, device=device)

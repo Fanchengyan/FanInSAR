@@ -108,6 +108,53 @@ class GeoidAdjustedDEM:
         return np.asarray(orthometric) + np.asarray(undulation)
 
 
+def admit_dem_device_identity(request: str) -> str:
+    """Return a stored DEM device identity (`cpu` / `cuda` / `cuda:N`).
+
+    ``cpu`` does not import Torch. Any other request, including ``auto``,
+    goes through :func:`faninsar._core.device.parse_device` after a lazy
+    import.
+    """
+    stripped = str(request).strip()
+    lowered = stripped.lower()
+    if lowered == "cpu":
+        return "cpu"
+    from faninsar._core.device import parse_device
+
+    admitted = parse_device(None if lowered in {"", "auto", "gpu"} else stripped)
+    return str(admitted)
+
+
+def clone_raster_dem(
+    dem: RasterDEM,
+    *,
+    path: Path | None = None,
+    device: str | None = None,
+) -> RasterDEM:
+    """Copy path/nodata/interpolation/device/chunk fields onto a new sampler."""
+    return RasterDEM(
+        path if path is not None else dem.path,
+        nodata=dem.nodata,
+        interpolation=dem.interpolation,
+        device=dem.device if device is None else device,
+        sample_chunk_points=dem.sample_chunk_points,
+    )
+
+
+def pin_dem_sampler_device(dem: DEMSampler, identity: str) -> DEMSampler:
+    """Bind a DEM sampler tree to an already-admitted device identity."""
+    if isinstance(dem, GeoidAdjustedDEM):
+        inner = pin_dem_sampler_device(dem.orthometric_dem, identity)
+        if inner is dem.orthometric_dem:
+            return dem
+        return GeoidAdjustedDEM(inner, dem.geoid)
+    if isinstance(dem, RasterDEM):
+        if dem.device == identity:
+            return dem
+        return clone_raster_dem(dem, device=identity)
+    return dem
+
+
 @dataclass(slots=True)
 class NetCDFGeoid:
     """Sample geoid undulation from a regular NetCDF longitude/latitude grid."""
@@ -168,9 +215,13 @@ class RasterDEM:
     path: Path
     nodata: float | None = None
     interpolation: Literal["bilinear", "bicubic", "biquintic"] = "biquintic"
+    device: str = "auto"
+    sample_chunk_points: int = 500_000
     _dataset: DatasetReader | None = None
     _height_array: np.ndarray | None = None
     _spline_coefficients: np.ndarray | None = None
+    _height_tensor: object | None = None
+    _height_tensor_identity: str | None = None
 
     def __post_init__(self) -> None:
         """Validate that the DEM path exists."""
@@ -183,6 +234,11 @@ class RasterDEM:
             message = f"unsupported DEM interpolation: {self.interpolation}"
             logger.error(message)
             raise ValueError(message)
+        if int(self.sample_chunk_points) <= 0:
+            message = "sample_chunk_points must be a positive integer"
+            logger.error(message)
+            raise ValueError(message)
+        self.device = str(self.device)
 
     def __getstate__(self) -> dict[str, object]:
         """Return a picklable state without the open rasterio handle."""
@@ -190,6 +246,8 @@ class RasterDEM:
             "path": self.path,
             "nodata": self.nodata,
             "interpolation": self.interpolation,
+            "device": self.device,
+            "sample_chunk_points": self.sample_chunk_points,
             "_height_array": self._height_array,
             "_spline_coefficients": self._spline_coefficients,
         }
@@ -199,9 +257,24 @@ class RasterDEM:
         self.path = Path(state["path"])
         self.nodata = state["nodata"]
         self.interpolation = state["interpolation"]
+        stored = state.get("device")
+        self.device = "cpu" if stored is None else str(stored)
+        chunk = state.get("sample_chunk_points", 500_000)
+        self.sample_chunk_points = int(chunk)
         self._height_array = state["_height_array"]
         self._spline_coefficients = state["_spline_coefficients"]
+        self._height_tensor = None
+        self._height_tensor_identity = None
         self._dataset = None
+
+    def _resolved_identity(self) -> str:
+        """Admit ``device`` once and store ``cpu`` / ``cuda`` / ``cuda:N``."""
+        current = str(self.device).strip()
+        if current.lower() == "cpu":
+            return "cpu"
+        admitted = admit_dem_device_identity(current)
+        self.device = admitted
+        return admitted
 
     def _open(self) -> DatasetReader:
         if self._dataset is None:
@@ -244,6 +317,18 @@ class RasterDEM:
             Sampled heights in metres. Out-of-bounds samples are NaN.
 
         """
+        identity = self._resolved_identity()
+        if identity != "cpu" and not identity.startswith("cuda"):
+            message = f"DEM sampling has no identity on {identity}"
+            logger.error(message)
+            raise ValueError(message)
+        if identity != "cpu" and self.interpolation != "biquintic":
+            message = (
+                "DEM interpolation "
+                f"{self.interpolation!r} has no identity on {identity}"
+            )
+            logger.error(message)
+            raise ValueError(message)
         lat = np.asarray(latitude_deg, dtype=np.float64)
         lon = np.asarray(longitude_deg, dtype=np.float64)
         lat_b, lon_b = np.broadcast_arrays(lat, lon)
@@ -280,6 +365,10 @@ class RasterDEM:
         rows = np.asarray(rows, dtype=np.float64)
 
         if self.interpolation == "biquintic":
+            if identity != "cpu":
+                return self._sample_biquintic_cuda(
+                    rows, cols, h_arr, lat_b.shape, identity
+                )
             row_floor = np.floor(rows).astype(np.int64)
             col_floor = np.floor(cols).astype(np.int64)
             height, width = h_arr.shape
@@ -353,6 +442,74 @@ class RasterDEM:
             heights[idx] = vals
         return heights.reshape(lat_b.shape)
 
+    def _sample_biquintic_cuda(
+        self,
+        rows: np.ndarray,
+        cols: np.ndarray,
+        height_array: np.ndarray,
+        out_shape: tuple[int, ...],
+        identity: str,
+    ) -> np.ndarray:
+        """Evaluate the six-sample spline on an admitted CUDA device."""
+        import torch
+
+        from faninsar.processing.geometry.torch_kernels import (
+            _natural_spline_six as torch_spline,
+        )
+
+        torch_device = torch.device(identity)
+        if (
+            self._height_tensor is None
+            or self._height_tensor_identity != identity
+        ):
+            self._height_tensor = torch.as_tensor(height_array, device=torch_device)
+            self._height_tensor_identity = identity
+        dem_tensor = self._height_tensor
+        n_points = int(rows.size)
+        heights_t = torch.full(
+            (n_points,),
+            float("nan"),
+            dtype=torch.float64,
+            device=torch_device,
+        )
+        chunk = int(self.sample_chunk_points)
+        neighbours = torch.arange(-1, 5, dtype=torch.int64, device=torch_device)
+        raster_h, raster_w = height_array.shape
+        for start in range(0, n_points, chunk):
+            stop = min(start + chunk, n_points)
+            row_t = torch.as_tensor(
+                rows[start:stop], dtype=torch.float64, device=torch_device
+            )
+            col_t = torch.as_tensor(
+                cols[start:stop], dtype=torch.float64, device=torch_device
+            )
+            row_floor = torch.floor(row_t).to(torch.int64)
+            col_floor = torch.floor(col_t).to(torch.int64)
+            in_bounds = (
+                (row_floor >= 1)
+                & (row_floor <= raster_h - 5)
+                & (col_floor >= 1)
+                & (col_floor <= raster_w - 5)
+            )
+            if not bool(in_bounds.any()):
+                continue
+            selected = torch.nonzero(in_bounds, as_tuple=False).squeeze(-1)
+            row_base = row_floor[selected]
+            col_base = col_floor[selected]
+            row_indices = row_base[:, None] + neighbours[None, :]
+            col_indices = col_base[:, None] + neighbours[None, :]
+            windows = dem_tensor[row_indices[:, :, None], col_indices[:, None, :]].to(
+                torch.float64
+            )
+            along_columns = torch_spline(
+                windows, (col_t[selected] - col_base.to(torch.float64))[:, None]
+            )
+            sampled = torch_spline(
+                along_columns, row_t[selected] - row_base.to(torch.float64)
+            )
+            heights_t[start + selected] = sampled
+        return heights_t.detach().cpu().numpy().reshape(out_shape)
+
     def close(self) -> None:
         """Close the underlying raster dataset if open."""
         if self._dataset is not None:
@@ -360,3 +517,5 @@ class RasterDEM:
             self._dataset = None
         self._height_array = None
         self._spline_coefficients = None
+        self._height_tensor = None
+        self._height_tensor_identity = None

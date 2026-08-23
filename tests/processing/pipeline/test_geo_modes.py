@@ -239,6 +239,43 @@ def test_compose_secondary_coordinates_uses_source_offset_convention() -> None:
     assert valid.all()
 
 
+def test_compose_secondary_coordinates_torch_matches_numpy() -> None:
+    """CUDA compose matches the SciPy bilinear oracle on interior samples."""
+    pytest.importorskip("torch")
+    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.pipeline.geo_resample import (
+        _compose_secondary_coordinates_torch,
+    )
+
+    rng = np.random.default_rng(0)
+    radar_shape = (16, 20)
+    az = rng.uniform(1.0, 14.0, size=(8, 10))
+    rg = rng.uniform(1.0, 18.0, size=(8, 10))
+    lut = Geo2RdrLUT(
+        az_full=az,
+        rg_full=rg,
+        valid=np.ones((8, 10), dtype=bool),
+        full_radar_shape=radar_shape,
+        height_m=0.0,
+    )
+    offsets = OffsetFieldResult(
+        range_offset_px=rng.normal(0.0, 0.4, size=radar_shape).astype(np.float32),
+        azimuth_offset_px=rng.normal(0.0, 0.4, size=radar_shape).astype(np.float32),
+        coverage=np.ones(radar_shape, dtype=bool),
+        uncertainty_px=np.zeros(radar_shape, dtype=np.float32),
+    )
+    numpy_az, numpy_rg, numpy_valid = compose_secondary_coordinates(lut, offsets)
+    torch_az, torch_rg, torch_valid = _compose_secondary_coordinates_torch(
+        lut, offsets, "cpu"
+    )
+    assert numpy_valid.shape == torch_valid.shape
+    common = numpy_valid & torch_valid
+    assert common.any()
+    assert np.allclose(numpy_az[common], torch_az[common], atol=1e-5, rtol=0.0)
+    assert np.allclose(numpy_rg[common], torch_rg[common], atol=1e-5, rtol=0.0)
+
+
 def test_coregister_geocoded_slcs_remaps_deramped_inputs_once() -> None:
     """Geo coregistration returns two reramped SLCs on the LUT grid."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
