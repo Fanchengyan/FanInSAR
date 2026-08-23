@@ -734,11 +734,18 @@ def _stream_to_part(response: requests.Response, part: Path) -> int:
     return written
 
 
-def _head_content_length(url: str, headers: dict[str, str]) -> tuple[int | None, bool]:
+def _head_content_length(
+    url: str,
+    headers: dict[str, str],
+    *,
+    surface_contract_errors: bool = False,
+) -> tuple[int | None, bool]:
     """Probe ranged support; returns (content_length, accept_ranges).
 
-    Best-effort: ANY probe failure (including non-HTTP-layer errors)
-    degrades gracefully to ``(None, False)`` and the caller streams plain.
+    Best-effort: probe failures degrade gracefully to ``(None, False)`` and
+    the caller streams plain.  With ``surface_contract_errors`` (plan-based
+    execution) assertion-type contract violations propagate untouched so
+    they are never masked into a silent transfer-mode downgrade.
     """
     try:
         response = thread_local_session().head(
@@ -750,6 +757,11 @@ def _head_content_length(url: str, headers: dict[str, str]) -> tuple[int | None,
         length = int(length_raw) if length_raw and length_raw.isdigit() else None
         accept_ranges = response.headers.get("Accept-Ranges", "").lower() == "bytes"
         return length, accept_ranges  # noqa: TRY300
+    except AssertionError:
+        if surface_contract_errors:
+            raise
+        logger.debug("HEAD probe failed for %s: %s", redact_url(url), "AssertionError")
+        return None, False
     except Exception as exc:
         logger.debug(
             "HEAD probe failed for %s: %s", redact_url(url), type(exc).__name__
@@ -984,10 +996,13 @@ def _execute_tile_set(
         url, target, min_bytes, ranged_capable = job
         headers = credentials.headers_for(url) if credentials else {}
         use_ranged = ranged_capable and _is_earthdata_head_safe(url)
+        target.parent.mkdir(parents=True, exist_ok=True)
         part = part_path(target)
         try:
             if use_ranged:
-                length, accept_ranges = _head_content_length(url, headers)
+                length, accept_ranges = _head_content_length(
+                    url, headers, surface_contract_errors=True
+                )
                 if length is not None and accept_ranges and length <= 64 << 30:
                     _download_ranged(
                         url,
@@ -1066,6 +1081,7 @@ def _execute_artifact(
         target = Path(tail)
     validate_cache_target(cache_dir, cache_dir / target)
     target = cache_dir / target
+    target.parent.mkdir(parents=True, exist_ok=True)
 
     if plan.scheme == "ftp":
         part = part_path(target)

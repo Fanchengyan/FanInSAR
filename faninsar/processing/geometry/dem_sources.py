@@ -72,9 +72,7 @@ COPERNICUS_GLO30_BASE = "https://copernicus-dem-30m.s3.amazonaws.com"
 COPERNICUS_GLO90_BASE = "https://copernicus-dem-90m.s3.amazonaws.com"
 TERRAIN_TILES_BASE = "https://elevation-tiles-prod.s3.amazonaws.com"
 PGC_OPEN_DATA_BASE = "https://pgc-opendata-dems.s3.us-west-2.amazonaws.com"
-JAXA_AW3D30_FTP_BASE = (
-    "ftp://ftp.eorc.jaxa.jp/pub/ALOS/ext1/AW3D30/release_v2303"
-)
+JAXA_AW3D30_FTP_BASE = "ftp://ftp.eorc.jaxa.jp/pub/ALOS/ext1/AW3D30/release_v2303"
 PC_STAC_API = "https://planetarycomputer.microsoft.com/api/stac/v1"
 CMR_API = "https://cmr.earthdata.nasa.gov/search/granules.json"
 
@@ -105,7 +103,7 @@ class DemSourceUnavailableError(InvalidProcessingStateError):
 
 
 def _bounds_tuple(bounds: BoundsLike) -> tuple[float, float, float, float]:
-    """Normalize a BoundingBox or plain tuple to (lon_min, lat_min, lon_max, lat_max)."""
+    """Normalize a BoundingBox or tuple to (lon_min, lat_min, lon_max, lat_max)."""
     if isinstance(bounds, BoundingBox):
         return (
             float(bounds.left),
@@ -309,7 +307,6 @@ class S3ListQuadEnumerator(QuadEnumerator):
 QUAD_ENUMERATOR_OVERRIDES: dict[str, QuadEnumerator] = {}
 
 
-
 # ---------------------------------------------------------------------------
 # DemSource ABC + shape subclasses
 # ---------------------------------------------------------------------------
@@ -362,9 +359,10 @@ class DemSource(ABC):
 
     @abstractmethod
     def plan(self, bounds: BoundsLike) -> FetchPlan:
-        """Return the self-describing fetch plan for ``bounds`` (no I/O here
-        beyond optional read-only remote discovery delegated to injected
-        enumerator strategies).
+        """Return the self-describing fetch plan for ``bounds``.
+
+        No I/O here beyond optional read-only remote discovery delegated to
+        injected enumerator strategies.
         """
 
     def coverage(self, bounds: BoundsLike) -> str | None:
@@ -423,7 +421,6 @@ class LatLonGridSource(DemSource):
             logger.error(message)
             raise ValueError(message)
 
-
     def plan(self, bounds: BoundsLike) -> FetchPlan:
         """Enumerate degree-cell tiles into a TileSet plan."""
         from faninsar.processing.geometry.dem_transport import Tile
@@ -456,12 +453,12 @@ class LatLonGridSource(DemSource):
                 continue
             stem = f"{self.stem_prefix}_{_copernicus_stem_fragment(tag)}_DEM"
             filename = f"{stem}{self.suffix}"
-            relative = f"{stem}/{filename}" if self.suffix == ".tif" else filename
+            relative = f"{tag}/{stem}/{filename}"
             url = f"{self.base_url}/{stem}/{filename}"
             tiles.append(
                 Tile(
                     url=url,
-                    cache_path=_safe_relative(f"{tag}/{stem}/{filename}"),
+                    cache_path=_safe_relative(relative),
                     min_bytes=self.min_bytes,
                     ranged=True,
                     ocean_404_skip=False,
@@ -568,12 +565,9 @@ class PgcQuadSource(DemSource):
         return [f"{col:02d}_{row:02d}" for col, row in sorted(cells)]
 
     def _expected_quads(self, bounds: BoundsLike) -> list[str]:
-        """Expected quad set with listing-completeness reconciliation."""
+        """Derive the expected quad set with listing-completeness checks."""
         expected = self.bounds_to_quads(bounds)
-        prefix = (
-            f"{self.collection}/mosaics/{self.version}/"
-            f"{self.resolution_tag}m/"
-        )
+        prefix = f"{self.collection}/mosaics/{self.version}/{self.resolution_tag}m/"
         listed, truncated = self.quad_enumerator.list_quads(prefix)
         if truncated:  # pragma: no cover - defensive; loop should exhaust
             message = f"quad listing for {prefix!r} reported truncation"
@@ -582,8 +576,7 @@ class PgcQuadSource(DemSource):
         # Listing entries may be quad directory ids ("07_40/") or full file
         # keys (".../07_40/07_40_32m_v4.1_dem.tif"); normalize to quad ids.
         listed_set = {
-            entry.rstrip("/").rsplit("/", 1)[-1].split("_2m")[0]
-            for entry in listed
+            entry.rstrip("/").rsplit("/", 1)[-1].split("_2m")[0] for entry in listed
         }
         missing = sorted(set(expected) - listed_set)
         if missing:
@@ -625,8 +618,7 @@ class PgcQuadSource(DemSource):
         quads = self.quads_for_bounds(bounds)
         if not quads:
             message = (
-                f"no {self.collection} quads intersect bounds "
-                f"{_bounds_tuple(bounds)}"
+                f"no {self.collection} quads intersect bounds {_bounds_tuple(bounds)}"
             )
             logger.error(message)
             raise DemSourceUnavailableError(message)
@@ -644,10 +636,7 @@ class PgcQuadSource(DemSource):
 
     def _quad_tile(self, quad: str) -> Tile:
         """Build the Tile for one quad id at this tier's key layout."""
-        prefix = (
-            f"{self.collection}/mosaics/{self.version}/"
-            f"{self.resolution_tag}m/"
-        )
+        prefix = f"{self.collection}/mosaics/{self.version}/{self.resolution_tag}m/"
         if self.resolution_tag == "2":
             # 2m quads ship a 2x2 row/col sub-tile grid inside each quad
             # directory (live-verified 2026-08-23 against the PGC bucket:
@@ -747,9 +736,7 @@ class TerrainPyramidSource(DemSource):
         tiles = [
             Tile(
                 url=(f"{self.base_url}/geotiff/{self.zoom}/{x}/{y}.tif"),
-                cache_path=_safe_relative(
-                    f"geotiff/{self.zoom}/{x}/{y}.tif"
-                ),
+                cache_path=_safe_relative(f"geotiff/{self.zoom}/{x}/{y}.tif"),
                 min_bytes=self.min_bytes,
                 ranged=False,
             )
@@ -807,12 +794,12 @@ class FtpZipSource(DemSource):
         artifacts: list[Artifact] = []
         blocks: set[tuple[int, int]] = set()
         lat_blocks = range(
-            int(math.floor(min_lat / 5.0)),
-            int(math.floor(max_lat / 5.0)) + 1,
+            math.floor(min_lat / 5.0),
+            math.floor(max_lat / 5.0) + 1,
         )
         lon_blocks = range(
-            int(math.floor(min_lon / 5.0)),
-            int(math.floor(max_lon / 5.0)) + 1,
+            math.floor(min_lon / 5.0),
+            math.floor(max_lon / 5.0) + 1,
         )
         for lat_block in lat_blocks:
             for lon_block in lon_blocks:
@@ -884,8 +871,9 @@ class _MultiTileTile(Tile):
 
 @dataclass(frozen=True, slots=True)
 class AuthenticatedGranuleSource(DemSource):
-    """CMR-discovered, Earthdata-authenticated granule zips (nasadem,
-    nisar-glo30).
+    """CMR-discovered, Earthdata-authenticated granule zips.
+
+    Covers ``nasadem@earthdata`` and ``nisar-glo30@earthdata``.
     """
 
     cmr_collection: str = "C2763264762-LPCLOUD"
@@ -926,7 +914,7 @@ class AuthenticatedGranuleSource(DemSource):
             _resolve_credentials("earthdata")
         except RuntimeError as exc:
             message = str(exc)
-            logger.error(message)
+            logger.exception(message)
             raise DemSourceUnavailableError(message) from None
         min_lon, min_lat, max_lon, max_lat = _bounds_tuple(bounds)
         granules = self._cmr_granules(min_lon, min_lat, max_lon, max_lat)
@@ -993,16 +981,15 @@ class AuthenticatedGranuleSource(DemSource):
         for link in granule.get("links", []):
             href = str(link.get("href", ""))
             rel = str(link.get("rel", ""))
-            if rel.endswith("#data") and fnmatch.fnmatch(href, f"*{self.asset_pattern}"):
+            if rel.endswith("#data") and fnmatch.fnmatch(
+                href, f"*{self.asset_pattern}"
+            ):
                 urls.append(href)
         return urls
 
     def mosaic_recipe(self) -> MosaicRecipe:
         """Granules are zips opened per-member through /vsizip/."""
-        return MosaicRecipe(
-            gdal_open="/vsizip/{path}/{member}",
-            nodata=None if self.vertical_datum != "ellipsoidal" else None,
-        )
+        return MosaicRecipe(gdal_open="/vsizip/{path}/{member}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1013,6 +1000,7 @@ class RoiClipSource(DemSource):
 
     def plan(self, bounds: BoundsLike) -> FetchPlan:
         """Reserved: one bounded-ROI GET returning a clipped GeoTIFF."""
+        del bounds
         message = (
             "OpenTopography ROI clipping is reserved (unwired in v1); "
             "select a wired provider instead"
@@ -1083,9 +1071,7 @@ class PcStacSource(DemSource):
             tiles.append(
                 Tile(
                     url=signed,
-                    cache_path=_safe_relative(
-                        f"{self.collection_id}/{tail}"
-                    ),
+                    cache_path=_safe_relative(f"{self.collection_id}/{tail}"),
                     min_bytes=GLO_MIN_TILE_BYTES,
                     ranged=True,
                 )
@@ -1105,7 +1091,7 @@ class PcStacSource(DemSource):
         return TileSet(allowed_hosts=tuple(sorted(hosts)), tiles=tuple(tiles))
 
 
-def _import_pc_stack():
+def _import_pc_stack() -> tuple | None:
     """Import planetary_computer + pystac_client; None when absent."""
     try:
         import planetary_computer
@@ -1145,8 +1131,7 @@ def parse_selection(selection: str) -> DemSource:
     """
     if not isinstance(selection, str):
         message = f"DEM selection must be a string, got {type(selection)!r}"
-        logger.error(message)
-        raise ValueError(message)
+        raise TypeError(message)
     parts = selection.split(":")
     if len(parts) > 2:
         message = (
@@ -1160,8 +1145,7 @@ def parse_selection(selection: str) -> DemSource:
     if product not in PRODUCT_DEFAULTS:
         valid_products = ", ".join(sorted(PRODUCT_DEFAULTS))
         message = (
-            f"unknown DEM product {product!r}; valid products are: "
-            f"{valid_products}"
+            f"unknown DEM product {product!r}; valid products are: {valid_products}"
         )
         logger.error(message)
         raise ValueError(message)
@@ -1246,8 +1230,7 @@ def _build_registry() -> dict[str, DemSource]:
     registry["srtm-skadi"] = LatLonGridSource(
         name="srtm-skadi",
         description=(
-            "SRTM 1-arc-second equivalent (.hgt.gz) from AWS terrain-tiles "
-            "(EGM96)"
+            "SRTM 1-arc-second equivalent (.hgt.gz) from AWS terrain-tiles (EGM96)"
         ),
         product="srtm-skadi",
         provider="aws",
@@ -1433,11 +1416,26 @@ PRODUCT_DEFAULTS: dict[str, dict] = {
         },
         "default": "aws",
     },
-    "arcticdem-10": {"providers": {"aws": {"wired": True, "auth": "none"}}, "default": "aws"},
-    "arcticdem-32": {"providers": {"aws": {"wired": True, "auth": "none"}}, "default": "aws"},
-    "arcticdem-2": {"providers": {"aws": {"wired": True, "auth": "none"}}, "default": "aws"},
-    "rema-10": {"providers": {"aws": {"wired": True, "auth": "none"}}, "default": "aws"},
-    "rema-32": {"providers": {"aws": {"wired": True, "auth": "none"}}, "default": "aws"},
+    "arcticdem-10": {
+        "providers": {"aws": {"wired": True, "auth": "none"}},
+        "default": "aws",
+    },
+    "arcticdem-32": {
+        "providers": {"aws": {"wired": True, "auth": "none"}},
+        "default": "aws",
+    },
+    "arcticdem-2": {
+        "providers": {"aws": {"wired": True, "auth": "none"}},
+        "default": "aws",
+    },
+    "rema-10": {
+        "providers": {"aws": {"wired": True, "auth": "none"}},
+        "default": "aws",
+    },
+    "rema-32": {
+        "providers": {"aws": {"wired": True, "auth": "none"}},
+        "default": "aws",
+    },
     "rema-2": {"providers": {"aws": {"wired": True, "auth": "none"}}, "default": "aws"},
     "nisar-glo30": {
         "providers": {"earthdata": {"wired": True, "auth": "token"}},
@@ -1474,8 +1472,7 @@ _AUTO_ENTRY = LatLonGridSource(
 def _compute_selection_aliases() -> dict[str, str]:
     """Map bare products and ``product@provider`` identities to entries."""
     aliases: dict[str, str] = {}
-    for name in _REGISTRY:
-        source = _REGISTRY[name]
+    for name, source in _REGISTRY.items():
         if source.name == name:
             # Canonical bare-name entry: also reachable as product@provider.
             aliases[f"{source.product}@{source.provider}"] = name
@@ -1575,12 +1572,11 @@ def get_dem_source(name: str) -> DemSource:
     if ":" in name and name.count(":") == 1:
         try:
             return parse_selection(name)
-        except ValueError as exc:
-            logger.error("%s", exc)
-            raise ValueError(str(exc)) from None
-    message = (
-        f"unknown DEM source {name!r}; valid sources are: "
-        + ", ".join(list_dem_sources())
+        except ValueError:
+            logger.exception("selection resolution failed for %r", name)
+            raise
+    message = f"unknown DEM source {name!r}; valid sources are: " + ", ".join(
+        list_dem_sources()
     )
     logger.error(message)
     raise ValueError(message) from None
