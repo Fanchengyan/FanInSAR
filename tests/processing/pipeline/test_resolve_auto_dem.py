@@ -8,9 +8,12 @@ CLI fail-closed contract for unwired providers.
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from faninsar.processing.geometry.dem import RasterDEM
 from faninsar.processing.pipeline.production import resolve_auto_dem
@@ -59,7 +62,7 @@ def _install_fake_manager(
         def fetch_dem(
             self,
             bounds: tuple[float, float, float, float],
-            output_path: Path,
+            output_path: Path,  # noqa: ARG002 - protocol signature
         ) -> Path:
             if seen is not None:
                 seen["bounds"] = bounds
