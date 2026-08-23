@@ -19,7 +19,9 @@ from faninsar.processing.geometry.dem_transport import (
     CHUNK_SIZE_BYTES,
     RETRYABLE_STATUS_CODES,
     TransientDemFetchError,
-    fetch_tiles,
+    Tile,
+    TileSet,
+    fetch_plan,
     sweep_part_files,
 )
 
@@ -137,6 +139,38 @@ def _head_headers(size: int) -> Headers:
     }
 
 
+def _fetch_paths(
+    urls_and_targets: list[tuple[str, Path]],
+    cache_dir: Path,
+    *,
+    max_workers: int = 8,
+    minimum_bytes: int = 0,
+    ranged: bool = False,
+) -> list[Path]:
+    """Plan-based equivalent of the removed fetch_tiles compatibility API."""
+    from urllib.parse import urlsplit
+
+    plan = TileSet(
+        allowed_hosts=tuple(
+            sorted({urlsplit(url).hostname or "" for url, _ in urls_and_targets})
+        ),
+        tiles=tuple(
+            Tile(
+                url=url,
+                cache_path=(
+                    target.relative_to(cache_dir)
+                    if target.is_relative_to(cache_dir)
+                    else Path(target.name)
+                ),
+                min_bytes=minimum_bytes,
+                ranged=ranged,
+            )
+            for url, target in urls_and_targets
+        ),
+    )
+    return fetch_plan(plan, cache_dir, max_workers=max_workers)
+
+
 # ---------------------------------------------------------------------------
 # Structural dispatch
 # ---------------------------------------------------------------------------
@@ -165,7 +199,7 @@ def test_fetch_dispatches_through_bounded_pool(
                 "GET", url, [FakeResponse(status=200, body=payload)]
             )
         targets = [tmp_path / f"tile-{index}.tif" for index in range(4)]
-        results = fetch_tiles(list(zip(urls, targets)), tmp_path)
+        results = _fetch_paths(list(zip(urls, targets)), tmp_path)
     finally:
         ThreadPoolExecutor.__init__ = original_init  # type: ignore[method-assign]
     assert observed_pools and observed_pools[0] > 1
@@ -184,7 +218,7 @@ def test_cached_files_are_not_refetched(
     patched_session.script_response(
         "GET", missing_url, [FakeResponse(status=200, body=_payload(1 << 20))]
     )
-    fetch_tiles([(missing_url, tmp_path / "missing.tif")], tmp_path)
+    _fetch_paths([(missing_url, tmp_path / "missing.tif")], tmp_path)
     gets = [url for method, url in patched_session.calls if method == "GET"]
     assert gets == [missing_url]
 
@@ -217,7 +251,7 @@ def test_retryable_status_codes_are_retried(
         ],
     )
     target = tmp_path / "retry.tif"
-    fetch_tiles([(url, target)], tmp_path)
+    _fetch_paths([(url, target)], tmp_path)
     assert target.read_bytes() == body
     gets = [u for m, u in patched_session.calls if m == "GET"]
     assert gets == [url, url]
@@ -255,7 +289,7 @@ def test_transient_exceptions_are_retried(
         ],
     )
     target = tmp_path / "transient.tif"
-    fetch_tiles([(url, target)], tmp_path)
+    _fetch_paths([(url, target)], tmp_path)
     assert target.read_bytes() == body
 
 
@@ -278,7 +312,7 @@ def test_certificate_verification_error_fails_fast(
     patched_session.script_response("GET", url, [cert_error])
     target = tmp_path / "cert.tif"
     with pytest.raises(requests.exceptions.SSLError):
-        fetch_tiles([(url, target)], tmp_path)
+        _fetch_paths([(url, target)], tmp_path)
     gets = [u for m, u in patched_session.calls if m == "GET"]
     assert gets == [url]
 
@@ -305,7 +339,7 @@ def test_tls_eof_truncation_retries(
         [eof_error, FakeResponse(status=200, body=body)],
     )
     target = tmp_path / "eof.tif"
-    fetch_tiles([(url, target)], tmp_path)
+    _fetch_paths([(url, target)], tmp_path)
     assert target.read_bytes() == body
 
 
@@ -319,7 +353,7 @@ def test_permanent_404_fails_loud_without_retry(
     url = "https://example.test/gone.tif"
     patched_session.script_response("GET", url, [FakeResponse(status=404)])
     with pytest.raises(InvalidProcessingStateError):
-        fetch_tiles([(url, tmp_path / "gone.tif")], tmp_path)
+        _fetch_paths([(url, tmp_path / "gone.tif")], tmp_path)
     gets = [u for m, u in patched_session.calls if m == "GET"]
     assert gets == [url]
 
@@ -341,7 +375,7 @@ def test_exhausted_retries_raise_transient_error(
         [FakeResponse(status=503) for _ in range(10)],
     )
     with pytest.raises(TransientDemFetchError):
-        fetch_tiles([(url, tmp_path / "flaky.tif")], tmp_path)
+        _fetch_paths([(url, tmp_path / "flaky.tif")], tmp_path)
 
 
 def test_small_tile_below_size_floor_is_retried_and_fails(
@@ -360,7 +394,7 @@ def test_small_tile_below_size_floor_is_retried_and_fails(
         "GET", url, [FakeResponse(status=200, body=b"tiny") for _ in range(10)]
     )
     with pytest.raises(Exception):
-        fetch_tiles([(url, target)], tmp_path, minimum_bytes=1 << 20)
+        _fetch_paths([(url, target)], tmp_path, minimum_bytes=1 << 20)
     assert not target.exists()
 
 
@@ -401,7 +435,7 @@ def test_ranged_assembly_matches_single_stream_sha256(
     target = tmp_path / "ranged.tif"
     reference = tmp_path / "reference.tif"
     reference.write_bytes(body)
-    fetch_tiles([(url, target)], tmp_path)
+    _fetch_paths([(url, target)], tmp_path, ranged=True)
     assert target.stat().st_size == len(body)
     assert _sha256(target) == _sha256(reference)
 
@@ -429,7 +463,7 @@ def test_200_to_range_request_hard_failure(
     )
     target = tmp_path / "stripped.tif"
     with pytest.raises(Exception, match="[Rr]ange"):
-        fetch_tiles([(url, target)], tmp_path)
+        _fetch_paths([(url, target)], tmp_path, ranged=True)
     assert not target.exists()
 
 
@@ -462,7 +496,7 @@ def test_mismatched_content_range_hard_failure(
     )
     target = tmp_path / "mismatch.tif"
     with pytest.raises(Exception, match="Content-Range"):
-        fetch_tiles([(url, target)], tmp_path)
+        _fetch_paths([(url, target)], tmp_path, ranged=True)
     assert not target.exists()
 
 
@@ -482,7 +516,7 @@ def test_ranged_mode_skipped_when_accept_ranges_missing(
         "GET", url, [FakeResponse(status=200, body=body)]
     )
     target = tmp_path / "norange.tif"
-    fetch_tiles([(url, target)], tmp_path)
+    _fetch_paths([(url, target)], tmp_path, ranged=True)
     range_gets = [u for m, u in patched_session.calls if m == "GET"]
     assert range_gets == [url]
     assert _sha256(target) == hashlib.sha256(body).hexdigest()
@@ -502,7 +536,7 @@ def test_head_probe_failure_falls_back_to_plain_stream(
         "GET", url, [FakeResponse(status=200, body=body)]
     )
     target = tmp_path / "nohead.tif"
-    fetch_tiles([(url, target)], tmp_path)
+    _fetch_paths([(url, target)], tmp_path, ranged=True)
     assert target.read_bytes() == body
 
 
@@ -543,7 +577,7 @@ def test_windows_seek_write_branch_forced_on_posix(
             ],
         )
     target = tmp_path / "winbranch.tif"
-    fetch_tiles([(url, target)], tmp_path)
+    _fetch_paths([(url, target)], tmp_path, ranged=True)
     assert _sha256(target) == hashlib.sha256(body).hexdigest()
 
 
@@ -605,7 +639,12 @@ def test_shared_stream_budget_bounds_in_flight_requests(
                 ],
             )
     targets = [tmp_path / f"budget-{i}.tif" for i in range(max_workers)]
-    fetch_tiles(list(zip(urls, targets)), tmp_path, max_workers=max_workers)
+    _fetch_paths(
+        list(zip(urls, targets)),
+        tmp_path,
+        max_workers=max_workers,
+        ranged=True,
+    )
     assert peak <= max_workers
 
 
@@ -644,7 +683,7 @@ def test_unique_part_names_published_via_replace(
 
     transport._publish_target = spy_publish  # type: ignore[assignment]
     try:
-        fetch_tiles([(url, tmp_path / "atomic.tif")], tmp_path)
+        _fetch_paths([(url, tmp_path / "atomic.tif")], tmp_path)
     finally:
         transport._publish_target = original  # type: ignore[assignment]
     del spy_iterdir, real_iterdir
@@ -670,7 +709,7 @@ def test_part_file_removed_on_failure(
     from faninsar.processing.errors import InvalidProcessingStateError
 
     with pytest.raises(InvalidProcessingStateError):
-        fetch_tiles([(url, tmp_path / "fail.tif")], tmp_path)
+        _fetch_paths([(url, tmp_path / "fail.tif")], tmp_path)
     assert not list(tmp_path.glob("*.part"))
 
 
@@ -709,10 +748,9 @@ def test_orphan_part_never_false_hits_as_cache_tile(tmp_path: Path) -> None:
 
 def test_transport_guard_rejects_traversal_targets(tmp_path: Path) -> None:
     """Targets escaping cache_dir are rejected before any I/O."""
+    from faninsar.processing.geometry.dem_transport import validate_cache_target
+
     outside = tmp_path.parent / "escape-target.tif"
-    with pytest.raises(ValueError):
-        fetch_tiles(
-            [("https://example.test/x.tif", outside)],
-            tmp_path,
-        )
+    with pytest.raises(ValueError, match="escapes"):
+        validate_cache_target(tmp_path, outside)
     assert not outside.exists()

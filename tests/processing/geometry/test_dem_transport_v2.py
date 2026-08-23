@@ -369,8 +369,19 @@ class TestTerminalAuthErrors:
         monkeypatch.setattr(transport, "_is_earthdata_host", lambda _url: True)
         url = "https://example.test/denied.tif"
         session.script_response("GET", url, [FakeResponse(status=status)])
+        plan = TileSet(
+            allowed_hosts=("example.test",),
+            tiles=(
+                Tile(
+                    url=url,
+                    cache_path=Path("denied.tif"),
+                    min_bytes=1024,
+                    ranged=False,
+                ),
+            ),
+        )
         with pytest.raises(transport.DemAuthProviderError) as excinfo:
-            transport.fetch_tiles([(url, tmp_path / "denied.tif")], tmp_path)
+            fetch_plan(plan, tmp_path)
         assert excinfo.value.status == status
         gets = [c for c in session.calls if c[0] == "GET"]
         assert len(gets) == 1
@@ -395,7 +406,11 @@ class TestTerminalAuthErrors:
                 FakeResponse(status=200, body=payload),
             ],
         )
-        transport.fetch_tiles([(url, tmp_path / "slow.tif")], tmp_path)
+        plan = TileSet(
+            allowed_hosts=("example.test",),
+            tiles=(Tile(url=url, cache_path=Path("slow.tif"), min_bytes=1024),),
+        )
+        fetch_plan(plan, tmp_path)
         assert any(s >= 3.0 for s in sleeps)
 
 
@@ -682,9 +697,20 @@ class TestCredentialHygiene:
         session.script_response(
             "GET", url, [FakeResponse(status=503), FakeResponse(status=503)]
         )
+        plan = TileSet(
+            allowed_hosts=("auth.example.test",),
+            tiles=(
+                Tile(
+                    url=url,
+                    cache_path=Path("g.tif"),
+                    min_bytes=1024,
+                    ranged=False,
+                ),
+            ),
+        )
         with caplog.at_level(logging.DEBUG, logger="faninsar.processing.geometry.dem_transport"):
             with pytest.raises(Exception) as excinfo:
-                transport.fetch_tiles([(url, tmp_path / "g.tif")], tmp_path)
+                fetch_plan(plan, tmp_path)
         rendered_logs = caplog.text
         assert _TOKEN not in rendered_logs
         assert _TOKEN not in repr(excinfo.value)
@@ -705,3 +731,191 @@ class TestCredentialHygiene:
         scrubbed = transport.redact_url(signed_url)
         assert "TOPSECRET" not in scrubbed
         assert "sig=REDACTED" in scrubbed or "sig=[REDACTED]" in scrubbed
+
+
+# ---------------------------------------------------------------------------
+# 11. BLOCKER-0030-B2: multi-tile fan-out consumes every part
+# ---------------------------------------------------------------------------
+
+
+class TestMultiTileParts:
+    def test_all_parts_executed_into_mosaic_inputs(
+        self,
+        tmp_path: Path,
+        session: RecordingSession,
+    ) -> None:
+        """A Tile plan carrying a ``_MultiTileTile`` fetches every sub-tile."""
+        from faninsar.processing.geometry.dem_sources import _MultiTileTile
+
+        body = _payload(4096)
+        urls = [f"https://example.test/07_40/{i}.tif" for i in (1, 2, 3, 4)]
+        for url in urls:
+            session.script_response("GET", url, [FakeResponse(status=200, body=body)])
+        parts = tuple(
+            Tile(
+                url=url,
+                cache_path=Path(f"quad/part-{index}.tif"),
+                min_bytes=16,
+                ranged=False,
+            )
+            for index, url in enumerate(urls, start=1)
+        )
+        plan = TileSet(
+            allowed_hosts=("example.test",),
+            tiles=(_MultiTileTile(*parts),),
+        )
+        executed = fetch_plan(plan, tmp_path)
+        expected_names = {f"part-{index}.tif" for index in range(1, 5)}
+        assert {path.name for path in executed} == expected_names
+        for index in range(1, 5):
+            assert (tmp_path / "quad" / f"part-{index}.tif").read_bytes() == body
+        gets = [url for method, url, _headers in session.calls if method == "GET"]
+        assert set(gets) == set(urls)
+        assert len(gets) == 4
+
+
+# ---------------------------------------------------------------------------
+# 12. BLOCKER-0030-B1: multi-artifact plans execute every block
+# ---------------------------------------------------------------------------
+
+
+class TestMultiArtifactExecution:
+    def test_multi_artifact_plan_executes_every_block(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FtpZipSource multi-block plans fetch each zip sequentially."""
+        import zipfile
+
+        from faninsar.processing.geometry.dem_sources import parse_selection
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+            zf.writestr("ALPSMLC30_N000E006_DSM.tif", b"dsm-1")
+            zf.writestr("padding.bin", b"\0" * (1 << 20))
+        archive = buf.getvalue()
+        assert len(archive) >= 1 << 20  # min_total_bytes floor
+
+        calls: list[str] = []
+
+        def fake_urlopen(url: str, timeout: float) -> io.BytesIO:
+            calls.append(url)
+            return io.BytesIO(archive)
+
+        monkeypatch.setattr(transport.urllib.request, "urlopen", fake_urlopen)
+        source = parse_selection("alos-dem:jaxa-ftp")
+        plan = source.plan((1.0, 3.0, 7.0, 7.0))
+        assert len(plan.artifacts) >= 2
+        executed = fetch_plan(plan, tmp_path)
+        assert len(calls) == len(plan.artifacts)
+        assert len(executed) == len(plan.artifacts)
+        for path in executed:
+            assert path.is_file()
+            assert path.read_bytes() == archive
+
+
+# ---------------------------------------------------------------------------
+# 13. ADVISORY-0030-A2: expected decompressed size enforced by the engine
+# ---------------------------------------------------------------------------
+
+
+class TestExpectedDecompressedSize:
+    def test_decompressed_size_enforced_after_download(
+        self,
+        tmp_path: Path,
+        session: RecordingSession,
+    ) -> None:
+        import gzip
+
+        raw = _payload(16 << 10)
+        body = gzip.compress(raw)
+        url = "https://example.test/skadi/N34/N34E094.hgt.gz"
+        session.script_response("GET", url, [FakeResponse(status=200, body=body)])
+        tile = Tile(
+            url=url,
+            cache_path=Path("skadi/N34/N34E094.hgt.gz"),
+            min_bytes=16,
+            ranged=False,
+            expected_decompressed_bytes=len(raw),
+        )
+        plan = TileSet(allowed_hosts=("example.test",), tiles=(tile,))
+        executed = fetch_plan(plan, tmp_path)
+        target = tmp_path / "skadi" / "N34" / "N34E094.hgt.gz"
+        assert executed == [target]
+        assert target.read_bytes() == body
+
+    def test_decompressed_size_mismatch_refuses_publish(
+        self,
+        tmp_path: Path,
+        session: RecordingSession,
+    ) -> None:
+        import gzip
+
+        raw = _payload(16 << 10)
+        body = gzip.compress(raw)
+        url = "https://example.test/skadi/N34/N34E094.hgt.gz"
+        session.script_response("GET", url, [FakeResponse(status=200, body=body)])
+        tile = Tile(
+            url=url,
+            cache_path=Path("skadi/N34/N34E094.hgt.gz"),
+            min_bytes=16,
+            ranged=False,
+            expected_decompressed_bytes=len(raw) + 1,
+        )
+        plan = TileSet(allowed_hosts=("example.test",), tiles=(tile,))
+        with pytest.raises(
+            transport.InvalidProcessingStateError, match="decompressed"
+        ):
+            fetch_plan(plan, tmp_path)
+        assert not (tmp_path / "skadi" / "N34" / "N34E094.hgt.gz").is_file()
+        assert not list(tmp_path.rglob("*.part"))
+
+
+# ---------------------------------------------------------------------------
+# 14. ADVISORY-0030-A3: ocean_404_skip honored by the engine
+# ---------------------------------------------------------------------------
+
+
+class TestOcean404Skip:
+    def test_ocean_404_skip_becomes_skip_with_log(
+        self,
+        tmp_path: Path,
+        session: RecordingSession,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        url = "https://example.test/skadi/N34/N34E094.hgt.gz"
+        session.script_response("GET", url, [FakeResponse(status=404)])
+        tile = Tile(
+            url=url,
+            cache_path=Path("skadi/N34/N34E094.hgt.gz"),
+            min_bytes=1024,
+            ranged=False,
+            ocean_404_skip=True,
+        )
+        plan = TileSet(allowed_hosts=("example.test",), tiles=(tile,))
+        with caplog.at_level(
+            logging.INFO, logger="faninsar.processing.geometry.dem_transport"
+        ):
+            executed = fetch_plan(plan, tmp_path)
+        assert executed == []
+        assert not (tmp_path / "skadi" / "N34" / "N34E094.hgt.gz").is_file()
+        assert any("ocean" in record.message.lower() for record in caplog.records)
+
+    def test_ocean_404_skip_false_still_hard_fails(
+        self,
+        tmp_path: Path,
+        session: RecordingSession,
+    ) -> None:
+        url = "https://example.test/skadi/N34/N34E094.hgt.gz"
+        session.script_response("GET", url, [FakeResponse(status=404)])
+        tile = Tile(
+            url=url,
+            cache_path=Path("skadi/N34/N34E094.hgt.gz"),
+            min_bytes=1024,
+            ranged=False,
+            ocean_404_skip=False,
+        )
+        plan = TileSet(allowed_hosts=("example.test",), tiles=(tile,))
+        with pytest.raises(transport.InvalidProcessingStateError, match="404"):
+            fetch_plan(plan, tmp_path)

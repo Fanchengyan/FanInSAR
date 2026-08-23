@@ -55,9 +55,9 @@ __all__ = [
     "TileSet",
     "TransientDemFetchError",
     "compute_backoff_sleep",
+    "expand_tile_parts",
     "extract_zip_members",
     "fetch_plan",
-    "fetch_tiles",
     "part_path",
     "redact_url",
     "resolve_credentials",
@@ -254,9 +254,6 @@ def resolve_credentials(credential_ref: str) -> CredentialProvider:
     raise ValueError(message)
 
 
-_REDACT_PARAMS = ("sig", "se", "token", "sig=", "SASToken", "st", "sp")
-
-
 def redact_url(url: str) -> str:
     """Scrub oauth/SAS query parameters from a URL for safe logging."""
     parts = urllib.parse.urlsplit(url)
@@ -369,7 +366,6 @@ def _request_with_retries(
     *,
     stream: bool = False,
     headers: dict[str, str] | None = None,
-    expect_status: tuple[int, ...] = (200,),
 ) -> requests.Response:
     """Issue one request through the shared retry matrix."""
     last_error: Exception | None = None
@@ -407,10 +403,7 @@ def _request_with_retries(
                 raise DemAuthProviderError(message, status=response.status_code)  # noqa: TRY301
             if response.status_code in (301, 302, 303, 307, 308):
                 return response
-            if (
-                response.status_code >= 400
-                and response.status_code not in expect_status
-            ):
+            if response.status_code >= 400:
                 message = (
                     f"DEM fetch failed with status {response.status_code} "
                     f"for {redact_url(url)}"
@@ -966,6 +959,60 @@ def _resolve_effective_credentials(
     return None
 
 
+def expand_tile_parts(tile: Tile) -> tuple[Tile, ...]:
+    """Expand one Tile into the fetchable units it stands for.
+
+    Multi-tile fan-out records (``_MultiTileTile`` from the registry) carry
+    their concrete sub-tiles in ``parts``; plain tiles expand to themselves.
+    The engine and the manager consume every part, so no planned sub-tile
+    (e.g. the 2x2 PGC 2m grid) is ever silently dropped from a mosaic.
+
+    Parameters
+    ----------
+    tile : Tile
+        A planned tile, possibly a multi-tile fan-out record.
+
+    Returns
+    -------
+    tuple[Tile, ...]
+        The concrete fetchable tiles covering ``tile``.
+
+    """
+    parts = getattr(tile, "parts", ())
+    return tuple(parts) if parts else (tile,)
+
+
+def _verify_tile_decompressed(path: Path, expected: int) -> None:
+    """Enforce the expected post-decompression size of a gzip tile.
+
+    Proposal-mandated for skadi HGT tiles: a one-pass streaming
+    decompression is cheap relative to the download itself and runs on the
+    ``.part`` file before any content is published to the cache.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        When the decompressed byte count differs from ``expected``.
+
+    """
+    import gzip
+
+    total = 0
+    with gzip.open(path, "rb") as gz:
+        while True:
+            block = gz.read(1 << 20)
+            if not block:
+                break
+            total += len(block)
+    if total != expected:
+        message = (
+            f"decompressed tile size mismatch for {path.name}: {total} "
+            f"!= expected {expected}; refusing to publish corrupt data"
+        )
+        logger.error(message)
+        raise InvalidProcessingStateError(message)
+
+
 def _execute_tile_set(
     plan: TileSet,
     cache_dir: Path,
@@ -977,25 +1024,29 @@ def _execute_tile_set(
     """Fetch missing tiles concurrently under one shared worker budget."""
     del chunked_threshold  # reserved for ranged-mode thresholding
     allowed = {host.lower() for host in plan.allowed_hosts}
-    jobs: list[tuple[str, Path, int, bool]] = []
-    for tile in plan.tiles:
+    units = [unit for tile in plan.tiles for unit in expand_tile_parts(tile)]
+    jobs: list[tuple[Tile, Path]] = []
+    for tile in units:
         target = cache_dir / tile.cache_path
         if target.is_file() and target.stat().st_size >= tile.min_bytes:
             logger.info("DEM tile cache hit: %s", target)
             continue
         validate_cache_target(cache_dir, target)
-        jobs.append((tile.url, target, tile.min_bytes, tile.ranged))
+        jobs.append((tile, target))
 
     if not jobs:
-        return [cache_dir / tile.cache_path for tile in plan.tiles]
+        return [cache_dir / tile.cache_path for tile in units]
 
     results: dict[Path, Path] = {}
+    skipped: set[Path] = set()
     lock = __import__("threading").Lock()
 
-    def run_job(job: tuple[str, Path, int, bool]) -> Path:
-        url, target, min_bytes, ranged_capable = job
+    def run_job(job: tuple[Tile, Path]) -> Path | None:
+        tile, target = job
+        url = tile.url
         headers = credentials.headers_for(url) if credentials else {}
-        use_ranged = ranged_capable and _is_earthdata_head_safe(url)
+        use_ranged = tile.ranged and _is_earthdata_head_safe(url)
+        ocean_skip = tile.ocean_404_skip or plan.ocean_404_skip
         target.parent.mkdir(parents=True, exist_ok=True)
         part = part_path(target)
         try:
@@ -1016,7 +1067,7 @@ def _execute_tile_set(
                         url,
                         part,
                         headers=headers,
-                        min_bytes=min_bytes,
+                        min_bytes=tile.min_bytes,
                         credentials=credentials,
                         allowed_hosts=allowed,
                     )
@@ -1025,31 +1076,49 @@ def _execute_tile_set(
                     url,
                     part,
                     headers=headers,
-                    min_bytes=min_bytes,
+                    min_bytes=tile.min_bytes,
                     credentials=credentials,
                     allowed_hosts=allowed,
                 )
+            if tile.expected_decompressed_bytes is not None:
+                _verify_tile_decompressed(part, tile.expected_decompressed_bytes)
             sha = hashlib.sha256(part.read_bytes()).hexdigest()
             logger.debug("tile sha256 %s: %s", target.name, sha)
             _publish_target(target, part)
             return target  # noqa: TRY300
-        except Exception as exc:
-            scrubbed = _scrub_message(str(exc))
+        except DemAuthProviderError as exc:
             part.unlink(missing_ok=True)
+            raise DemAuthProviderError(
+                _scrub_message(str(exc)), status=exc.status
+            ) from exc.__cause__
+        except InvalidProcessingStateError as exc:
+            part.unlink(missing_ok=True)
+            if ocean_skip and "status 404" in str(exc):
+                logger.info("ocean tile 404 skipped: %s", redact_url(url))
+                return None
+            raise
+        except Exception as exc:
+            part.unlink(missing_ok=True)
+            scrubbed = _scrub_message(str(exc))
             raise type(exc)(scrubbed) if scrubbed else exc from exc.__cause__
 
     workers = max(1, max_workers)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(run_job, job) for job in jobs]
-        for future in futures:
+        for future, job in zip(futures, jobs, strict=True):
             path = future.result()
+            if path is None:
+                skipped.add(job[1])
+                continue
             with lock:
                 results[path] = path
 
     ordered: list[Path] = []
     by_name = {path.name: path for path in results}
-    for tile in plan.tiles:
+    for tile in units:
         target = cache_dir / tile.cache_path
+        if target in skipped:
+            continue
         found = results.get(target) or by_name.get(target.name)
         if found is None and not target.is_file():
             message = f"tile fetch did not produce {target}"
@@ -1160,104 +1229,6 @@ def _execute_artifact(
     return target
 
 
-def fetch_tiles(
-    urls_and_targets: list[tuple[str, Path]],
-    cache_dir: Path,
-    *,
-    max_workers: int = 8,
-    minimum_bytes: int = 0,
-) -> list[Path]:
-    """Compatibility entry point: concurrent plain/ranged tile downloads.
-
-    ``minimum_bytes`` defaults to 0 here; per-tile size floors are carried
-    by :class:`Tile` records on plan-based execution.  The explicit 1 MiB
-    floor used by PROPOSAL-0013 callers passes ``minimum_bytes`` directly.
-    """
-    plan = TileSet(
-        allowed_hosts=tuple(
-            {
-                (urllib.parse.urlsplit(url).hostname or "").lower()
-                for url, _ in urls_and_targets
-            }
-        ),
-        tiles=tuple(
-            Tile(
-                url=url,
-                cache_path=target.relative_to(cache_dir),
-                min_bytes=minimum_bytes,
-            )
-            if target.is_relative_to(cache_dir)
-            else Tile(url=url, cache_path=Path(target.name), min_bytes=minimum_bytes)
-            for url, target in urls_and_targets
-        ),
-    )
-    validate_plan_urls(plan)
-    missing: list[tuple[str, Path]] = []
-    present: list[Path] = []
-    for url, target in urls_and_targets:
-        if target.is_file() and target.stat().st_size >= minimum_bytes:
-            present.append(target)
-        else:
-            missing.append((url, target))
-
-    results: list[Path] = []
-    lock = __import__("threading").Lock()
-    error_box: dict[str, BaseException] = {}
-
-    def run(entry: tuple[str, Path]) -> Path | None:
-        url, target = entry
-        try:
-            validate_cache_target(cache_dir, target)
-            part = part_path(target)
-            headers: dict[str, str] = {}
-            ranged_ok = not _is_earthdata_host(url) and _is_earthdata_head_safe(url)
-            length, accept_ranges = (
-                _head_content_length(url, headers) if ranged_ok else (None, False)
-            )
-            try:
-                if length is not None and accept_ranges:
-                    _download_ranged(
-                        url,
-                        part,
-                        length,
-                        headers=headers,
-                        max_workers=min(max_workers, 4),
-                    )
-                else:
-                    _download_whole(url, part, headers=headers, min_bytes=minimum_bytes)
-            except InvalidProcessingStateError as exc:
-                raise _map_transport_exception(url, exc) from exc
-            except Exception as exc:  # surface typed terminal failures
-                raise _map_transport_exception(url, exc) from exc
-            _publish_target(target, part)
-            return target  # noqa: TRY300
-        except BaseException as exc:
-            with lock:
-                error_box.setdefault(url, exc)
-            return None
-
-    if missing:
-        with ThreadPoolExecutor(max_workers=max(2, max_workers)) as pool:
-            outcomes = [o for o in pool.map(run, missing) if o is not None]
-            results.extend(outcomes)
-    if error_box:
-        raise error_box[next(iter(error_box))]
-    return present + results
-
-
-def _map_transport_exception(url: str, exc: Exception) -> Exception:
-    """Re-map low-level responses into the module's typed errors."""
-    del url
-    if isinstance(exc, DemAuthProviderError):
-        return exc
-    text = str(exc)
-    if "terminal status 401" in text:
-        return DemAuthProviderError(_scrub_message(text), status=401)
-    if "terminal status 403" in text:
-        return DemAuthProviderError(_scrub_message(text), status=403)
-    return exc
-
-
 def fetch_plan(
     plan: FetchPlan,
     cache_dir: Path,
@@ -1299,6 +1270,21 @@ def fetch_plan(
         )
     if isinstance(plan, Artifact):
         return [_execute_artifact(plan, cache_dir, credentials=credentials)]
+    artifacts = getattr(plan, "artifacts", ())
+    if artifacts:
+        # Multi-artifact plans (e.g. JAXA FTP zip blocks) execute each
+        # sub-artifact sequentially through the same audited engine.
+        executed: list[Path] = []
+        for artifact in artifacts:
+            executed.extend(
+                fetch_plan(
+                    artifact,
+                    cache_dir,
+                    max_workers=max_workers,
+                    chunked_threshold=chunked_threshold,
+                )
+            )
+        return executed
     message = f"unsupported FetchPlan subtype: {type(plan).__name__}"
     logger.error(message)
     raise InvalidProcessingStateError(message)

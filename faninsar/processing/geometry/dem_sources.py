@@ -398,9 +398,6 @@ class LatLonGridSource(DemSource):
     #: ``"copernicus"`` renders ``COG_10_{cell}`` stems; ``"skadi"`` selects
     #: the terrain-tiles HGT layout (``skadi/{N|S}YY/{N|S}YY{E|W}XXX.hgt.gz``).
     remote_layout: Literal["copernicus", "skadi"] = "copernicus"
-    #: Legacy alias for ``remote_layout`` kept for constructor compatibility;
-    #: an explicit non-default value wins over ``remote_layout``'s default.
-    stem_template: str | None = None
     stem_prefix: str = "Copernicus_DSM_COG_10"
     suffix: str = ".tif"
     min_bytes: int = GLO_MIN_TILE_BYTES
@@ -411,8 +408,6 @@ class LatLonGridSource(DemSource):
     def __post_init__(self) -> None:
         """Validate identity invariants at construction (fail closed)."""
         DemSource.__post_init__(self)  # zero-arg super() breaks frozen slots
-        if self.stem_template is not None and self.remote_layout == "copernicus":
-            object.__setattr__(self, "remote_layout", self.stem_template)
         if self.remote_layout not in {"copernicus", "skadi"}:
             message = (
                 f"invalid remote_layout {self.remote_layout!r}: expected "
@@ -821,7 +816,7 @@ class FtpZipSource(DemSource):
             )
         if len(artifacts) == 1:
             return artifacts[0]
-        return _MultiArtifactPlan(artifacts=tuple(artifacts))
+        return _MultiArtifactPlan(allowed_hosts=(host,), artifacts=tuple(artifacts))
 
 
 from faninsar.processing.geometry.dem_transport import (  # noqa: E402
@@ -832,8 +827,15 @@ from faninsar.processing.geometry.dem_transport import (  # noqa: E402
 )
 
 
+@dataclass(frozen=True, slots=True)
 class _MultiArtifactPlan(FetchPlan):
-    """Internal multi-artifact wrapper (executed sequentially by the engine)."""
+    """Internal multi-artifact wrapper (executed sequentially by the engine).
+
+    The dataclass decorator is load-bearing: without it the inherited
+    ``FetchPlan.__init__`` rejects the ``artifacts`` keyword, so plans
+    spanning more than one 5-degree JAXA block crash with a TypeError at
+    construction.
+    """
 
     artifacts: tuple[Artifact, ...] = ()
 

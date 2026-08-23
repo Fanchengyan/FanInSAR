@@ -43,6 +43,7 @@ from faninsar.processing.geometry.dem_transport import (
     FetchPlan,
     Tile,
     TileSet,
+    expand_tile_parts,
     fetch_plan,
 )
 from faninsar.query import BoundingBox
@@ -64,7 +65,7 @@ DEM_CACHE_ENV = "FANINSAR_DEM_CACHE_DIR"
 #: Selection grammar environment (``<product>`` / ``<product>:<provider>``).
 DEM_SELECTION_ENV = "FANINSAR_DEM_SOURCE"
 #: Base-URL override for the primary selected source (https enforced).
-DEM_SOURCE_ENV = "FANINSAR_DEM_SOURCE_URL"
+DEM_SOURCE_URL_ENV = "FANINSAR_DEM_SOURCE_URL"
 DEM_NAME_ENV = "FANINSAR_DEM_NAME"
 DEFAULT_DEM_NAME = "dem.tif"
 
@@ -336,6 +337,58 @@ def _mosaic_arrays(
     return mosaic, transform
 
 
+def find_legacy_tile(
+    cache_dir: Path,
+    relative: Path,
+    *,
+    min_bytes: int = 0,
+    recursive: bool = False,
+) -> Path | None:
+    """Probe legacy cache layouts for ``relative`` first-hit-wins.
+
+    Shared cache lookup for legacy flat/tagged tile layouts: candidates are
+    ``<cache_dir>/<file>``, ``<cache_dir>/<tag>/<file>`` and — with
+    ``recursive`` — every ``<cache_dir>/*/<tag>/<file>`` and
+    ``<cache_dir>/**/<file>`` shape (the flatten helper's full probe set).
+    A positive ``min_bytes`` floor applies like the manager's legacy probe;
+    0 means any existing file matches.
+
+    Parameters
+    ----------
+    cache_dir : Path
+        Cache root probed for candidates.
+    relative : Path
+        Cache-relative tile path (first component is the tag directory).
+    min_bytes : int, optional
+        Minimum valid size in bytes; 0 (default) matches any file.
+    recursive : bool, optional
+        Whether the ``*/<tag>/<file>`` and ``**/<file>`` glob shapes are
+        included (true for the flatten helper, false for the manager).
+
+    Returns
+    -------
+    Path or None
+        The first matching candidate, or None when nothing was found.
+
+    """
+    parts = relative.parts
+    if len(parts) < 2:
+        candidates = [cache_dir / relative]
+    else:
+        tag_dir, filename = parts[0], parts[-1]
+        candidates = [
+            cache_dir / filename,
+            cache_dir / tag_dir / filename,
+        ]
+        if recursive:
+            candidates.extend(sorted(cache_dir.glob(f"*/{tag_dir}/{filename}")))
+            candidates.extend(sorted(cache_dir.glob(f"**/{filename}")))
+    for candidate in candidates:
+        if candidate.is_file() and candidate.stat().st_size >= min_bytes:
+            return candidate
+    return None
+
+
 @dataclass(slots=True)
 class DEMManager:
     """Resolve, cache, download, and mosaic a selectable DEM source.
@@ -466,7 +519,11 @@ class DEMManager:
         """
         plan = self.source_entry.plan(bounds)
         if isinstance(plan, TileSet):
-            return [self._partition_tile(tile) for tile in plan.tiles]
+            return [
+                self._partition_tile(unit)
+                for tile in plan.tiles
+                for unit in expand_tile_parts(tile)
+            ]
         message = (
             f"source {self.source_entry.name!r} plans whole-artifact units "
             f"({type(plan).__name__}); required_tiles is undefined for it"
@@ -482,25 +539,20 @@ class DEMManager:
         Existing DATA2 caches store tiles flat or under ``<tag>/``
         subdirectories directly below the cache root; other identities must
         never adopt those stems as hits because they collide across cache
-        directories.
+        directories.  The flat/tagged candidate probing is shared with the
+        flatten helper (``find_legacy_tile``); the manager never enables its
+        recursive glob extras.
         """
         if (self.source_entry.product, self.source_entry.provider) not in {
             ("glo30", "aws"),
             (AUTO_SOURCE_NAME, "aws"),
         }:
             return None
-        parts = tile.cache_path.parts
-        if len(parts) < 2:
-            return None
-        tag_dir, filename = parts[0], parts[-1]
-        candidates = [
-            self.cache_dir / filename,
-            self.cache_dir / tag_dir / filename,
-        ]
-        for candidate in candidates:
-            if candidate.is_file() and candidate.stat().st_size >= tile.min_bytes:
-                return candidate
-        return None
+        return find_legacy_tile(
+            self.cache_dir,
+            tile.cache_path,
+            min_bytes=tile.min_bytes,
+        )
 
     def _tile_hit(self, tile: Tile) -> Path | None:
         """Probe the partitioned target, then the legacy layout, for a tile."""
@@ -512,27 +564,31 @@ class DEMManager:
     def _resolve_tile_hits(self, plan: TileSet) -> list[Path]:
         """Resolve every planned tile against the cache, fetching only misses.
 
-        Hits come from the identity partition directory or (for ``glo30@aws``
-        lookups only) the legacy flat layout; the remaining tiles are wrapped
-        into the partition and handed to the transport engine together.
+        Multi-tile fan-out records are expanded into their concrete
+        sub-tiles first, so every part of every planned tile is either
+        cached or fetched.  Hits come from the identity partition directory
+        or (for ``glo30@aws`` lookups only) the legacy flat layout; the
+        remaining tiles are wrapped into the partition and handed to the
+        transport engine together.
         """
         resolved: list[Path] = []
         missing: list[Tile] = []
         seen_paths: set[str] = set()
         seen_targets: set[str] = set()
         for raw in plan.tiles:
-            tile = self._partition_tile(raw)
-            hit = self._tile_hit(tile)
-            if hit is not None:
-                key = str(hit)
-                if key not in seen_paths:
-                    seen_paths.add(key)
-                    resolved.append(hit)
-                continue
-            key = str(tile.cache_path)
-            if key not in seen_targets:
-                seen_targets.add(key)
-                missing.append(tile)
+            for unit in expand_tile_parts(raw):
+                tile = self._partition_tile(unit)
+                hit = self._tile_hit(tile)
+                if hit is not None:
+                    key = str(hit)
+                    if key not in seen_paths:
+                        seen_paths.add(key)
+                        resolved.append(hit)
+                    continue
+                key = str(tile.cache_path)
+                if key not in seen_targets:
+                    seen_targets.add(key)
+                    missing.append(tile)
         if missing:
             executed = self._execute(replace(plan, tiles=tuple(missing)))
             for path in executed:
@@ -658,7 +714,9 @@ class DEMManager:
         members: list[Path] = []
         for sub in getattr(plan, "artifacts", ()):
             members.extend(executed if executed else self._artifact_members(sub))
-        return members
+        # Sequential multi-artifact execution returns every sub-artifact's
+        # paths once; drop duplicates before mosaic input.
+        return list(dict.fromkeys(members))
 
     def _write_mosaic(
         self,
@@ -941,7 +999,7 @@ def get_dem_manager(*, source: str | None = None) -> DEMManager:
         if source is not None
         else os.environ.get(DEM_SELECTION_ENV, DEFAULT_PRODUCT)
     )
-    base_url = os.environ.get(DEM_SOURCE_ENV)
+    base_url = os.environ.get(DEM_SOURCE_URL_ENV)
     manager = DEMManager(
         cache_dir=Path(cache_dir),
         source=selection,

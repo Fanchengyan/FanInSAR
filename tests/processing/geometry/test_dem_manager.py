@@ -631,6 +631,103 @@ class TestGetDemManagerEnvironment:
 
 
 # ---------------------------------------------------------------------------
+# BLOCKER-0030-B2: 2m-tier fan-out consumes every part end-to-end
+# ---------------------------------------------------------------------------
+
+
+def _seed_pgc_2m_body(tmp_path: Path, value: float) -> bytes:
+    """Write a >= 1 MiB EPSG:3413 GeoTIFF body for a 2m quad sub-tile."""
+    path = tmp_path / f"seed-2m-{int(value)}.tif"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    profile = {
+        "driver": "GTiff",
+        "height": 512,
+        "width": 512,
+        "count": 1,
+        "dtype": "float32",
+        "crs": "EPSG:3413",
+        "transform": Affine.translation(-512.0, -1_668_976.0) * Affine.scale(2.0, -2.0),
+    }
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(np.full((512, 512), value, dtype="float32"), 1)
+    return path.read_bytes()
+
+
+class TestMultiTileTwoMeterTier:
+    def test_arcticdem_2m_fetch_dem_consumes_every_part(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """BLOCKER-0030-B2: 2m fetch_dem fetches and mosaics all four sub-tiles.
+
+        The plan's ``_MultiTileTile`` fan-out must be expanded by the
+        manager: every ``{quad}_{r}_{c}_2m_v4.1_dem.tif`` part is fetched
+        into the partition cache and a second run is a full cache hit.
+        """
+        from faninsar.processing.geometry.dem_sources import get_dem_source
+
+        class _ScriptedQuadEnumerator:
+            def __init__(self, quads: list[str]) -> None:
+                self.quads = quads
+
+            def quads_for_bounds(self, bounds) -> list[str]:
+                return list(self.quads)
+
+            def list_quads(self, prefix: str) -> tuple[list[str], bool]:
+                del prefix
+                return list(self.quads), False
+
+        source = get_dem_source("arcticdem-2")
+        source.quad_enumerator = _ScriptedQuadEnumerator(["07_40"])
+        fake = HttpFake().install(monkeypatch)
+        bodies: dict[str, bytes] = {}
+        for row in (1, 2):
+            for col in (1, 2):
+                filename = f"07_40_{row}_{col}_2m_v4.1_dem.tif"
+                url = (
+                    "https://pgc-opendata-dems.s3.us-west-2.amazonaws.com/"
+                    f"arcticdem/mosaics/v4.1/2m/07_40/{filename}"
+                )
+                body = _seed_pgc_2m_body(tmp_path, float(100 * row + col))
+                fake.register_ok(url, body)
+                bodies[url] = body
+
+        manager = DEMManager(tmp_path / "cache", source=source)
+        out = tmp_path / "out" / "dem.tif"
+        manager.fetch_dem((-70.0, 75.0, -60.0, 80.0), out)
+
+        gets = [url for method, url in fake.calls if method == "GET"]
+        fetched = set(bodies) & set(gets)
+        assert fetched == set(bodies)
+        assert len(fetched) == 4
+        for filename in (
+            "07_40_1_1_2m_v4.1_dem.tif",
+            "07_40_1_2_2m_v4.1_dem.tif",
+            "07_40_2_1_2m_v4.1_dem.tif",
+            "07_40_2_2_2m_v4.1_dem.tif",
+        ):
+            cached = (
+                tmp_path
+                / "cache"
+                / "arcticdem-2-aws"
+                / "arcticdem-v4.1-2m"
+                / "07_40"
+                / filename
+            )
+            assert cached.is_file(), filename
+
+        # A second run must be a complete cache hit: no new requests.
+        fake.calls.clear()
+        manager.fetch_dem((-70.0, 75.0, -60.0, 80.0), out)
+        assert fake.calls == []
+
+        with rasterio.open(out) as dataset:
+            band = dataset.read(1)
+        assert np.isfinite(band).any()
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers and misc
 # ---------------------------------------------------------------------------
 

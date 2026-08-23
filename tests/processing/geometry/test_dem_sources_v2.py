@@ -132,7 +132,6 @@ class TestSelectionGrammar:
                 product="glo30",
                 provider="aws",
                 base_url="https://x.test",
-                stem_template=None,
                 suffix=".tif",
                 min_bytes=1024,
                 remote_layout="skadi",
@@ -349,6 +348,33 @@ class TestPgcQuadSource:
         plan = source.plan(_bounds(-70.0, 75.0, -60.0, 80.0))
         assert any("_2m_v4.1_dem.tif" in tile.url for tile in plan.tiles)
 
+    def test_2m_tier_plan_covers_all_four_subtiles(self) -> None:
+        """BLOCKER-0030-B2: a 2m-tier plan entry fan-outs into 4 sub-tiles.
+
+        The registry's ``_MultiTileTile`` must carry every
+        ``{quad}_{r}_{c}_2m_v4.1_dem.tif`` part (r/c in 1..2), so planning
+        alone never silently drops three quarters of a quad.
+        """
+        source = get_dem_source("arcticdem-2")
+        assert isinstance(source, ds.PgcQuadSource)
+        source.quad_enumerator = _ScriptedEnumerator(["07_40"])
+        plan = source.plan(_bounds(-70.0, 75.0, -60.0, 80.0))
+        assert len(plan.tiles) == 1
+        entry = plan.tiles[0]
+        assert isinstance(entry, ds._MultiTileTile)
+        parts = entry.parts
+        assert len(parts) == 4
+        expected = {
+            f"07_40_{row}_{col}_2m_v4.1_dem.tif"
+            for row in (1, 2)
+            for col in (1, 2)
+        }
+        assert {part.cache_path.name for part in parts} == expected
+        # The fan-out entry mirrors the first sub-tile's URL but every part
+        # URL is distinct and planned.
+        assert len({part.url for part in parts}) == 4
+        assert entry.url == parts[0].url
+
 
 # ---------------------------------------------------------------------------
 # 6. TerrainPyramidSource
@@ -385,6 +411,28 @@ class TestFtpZipSource:
             "N000E005_N005E010.zip"
         )
         assert plan.member_pattern == "ALPSMLC30_*_DSM.tif"
+
+    def test_multi_block_bounds_plan_without_type_error(self) -> None:
+        """BLOCKER-0030-B1: multi-block plans construct without TypeError.
+
+        Bounds spanning more than one 5-degree JAXA block must produce a
+        ``_MultiArtifactPlan`` whose artifacts list carries every block zip
+        (the missing ``@dataclass`` used to crash with ``FetchPlan.__init__
+        got an unexpected keyword argument 'artifacts'``).
+        """
+        source = parse_selection("alos-dem:jaxa-ftp")
+        assert isinstance(source, ds.FtpZipSource)
+        plan = source.plan(_bounds(2.0, -2.0, 12.0, 5.0))
+        assert isinstance(plan, ds._MultiArtifactPlan)
+        assert isinstance(plan.artifacts, tuple)
+        assert len(plan.artifacts) >= 2
+        assert all(isinstance(artifact, ds.Artifact) for artifact in plan.artifacts)
+        assert plan.allowed_hosts == ("ftp.eorc.jaxa.jp",)
+        for artifact in plan.artifacts:
+            assert artifact.scheme == "ftp"
+            assert artifact.expand == "zip"
+            assert artifact.url.startswith("ftp://ftp.eorc.jaxa.jp/")
+            assert artifact.url.endswith(".zip")
 
 
 # ---------------------------------------------------------------------------
