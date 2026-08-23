@@ -51,6 +51,7 @@ dependencies = [
   "torch-dct>=0.1.6",
   "matplotlib",
   "data_downloader",
+  "requests>=2.33.0",
   "rasterio >= 1.0.26",
   "xarray",
   "psutil",
@@ -84,6 +85,10 @@ faninsar-merge-bursts = "faninsar.processing.merge.cli:main"
 
 opencv = ["opencv-python>=4.8"]
 code_style = ["pre-commit", "ruff"]
+pc = [
+  "planetary-computer>=1.0",
+  "pystac-client>=0.9",
+]
 test = [
   "FanInSAR",
   "coverage",

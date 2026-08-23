@@ -3633,6 +3633,67 @@ def _quad_bounds_with_buffer_m(
     return (min_lon, min_lat, max_lon, max_lat)
 
 
+def resolve_auto_dem(
+    bounds: tuple[float, float, float, float],
+    *,
+    output_dir: str | Path,
+    geoid_correction: bool = True,
+    dem_source: str | None = None,
+    output_name: str | None = None,
+) -> DEMSampler:
+    """Build (or reuse) the automatic DEM mosaic and apply one wrap rule.
+
+    This is the single datum-aware DEM entry point shared by
+    :func:`run_pair`, :func:`_run_pair_sweep`, and ``faninsar frame``:
+    :class:`GeoidAdjustedDEM` is applied only when ``geoid_correction`` is
+    requested AND the live selection's registry metadata declares an
+    orthometric vertical datum; ellipsoidal sources are returned unwrapped.
+
+    Parameters
+    ----------
+    bounds : tuple of float
+        (min_lon, min_lat, max_lon, max_lat) in EPSG:4326.
+    output_dir : path
+        Directory receiving ``dem/<name>.tif``.
+    geoid_correction : bool, optional
+        Whether an orthometric DEM should be wrapped into a geoid-adjusted
+        sampler. Defaults to True.
+    dem_source : str, optional
+        Selection grammar value (``<product>`` / ``<product>:<provider>``);
+        ``None`` defers to ``FANINSAR_DEM_SOURCE`` / the ``glo30`` default.
+    output_name : str, optional
+        Output file name; defaults to ``FANINSAR_DEM_NAME`` or ``dem.tif``.
+
+    Returns
+    -------
+    DEMSampler
+        The ready-to-use DEM sampler for the pipeline.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If ``FANINSAR_DEM_CACHE_DIR`` is unset or the selected provider
+        fails (structured outage).
+
+    """
+    from faninsar.processing.geometry.dem_manager import (
+        default_dem_name,
+        get_dem_manager,
+    )
+
+    name = output_name if output_name is not None else default_dem_name()
+    manager = get_dem_manager(source=dem_source)
+    out_path = Path(output_dir) / "dem" / name
+    dem_path = manager.fetch_dem(bounds, out_path)
+    logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
+    sampler: DEMSampler = RasterDEM(dem_path, interpolation="biquintic")
+    if geoid_correction and manager.vertical_datum != "ellipsoidal":
+        from faninsar.processing.geometry.egm96 import EGM96Geoid
+
+        sampler = GeoidAdjustedDEM(sampler, EGM96Geoid())
+    return sampler
+
+
 def _select_bursts_by_roi(
     roi: BoundingBox | Polygons,
     frame_paths: list[Path],
@@ -3865,6 +3926,7 @@ def run_pair(
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
+    dem_source: str | None = None,
     record_scientific_lineage: bool = False,
 ) -> ProductionPairState: ...
 
@@ -3911,6 +3973,7 @@ def run_pair(
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
+    dem_source: str | None = None,
     record_scientific_lineage: bool = False,
 ) -> ProductionPairSweepResult: ...
 
@@ -3958,6 +4021,7 @@ def run_pair(
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
+    dem_source: str | None = None,
     record_scientific_lineage: bool = False,
 ) -> ProductionPairState | ProductionPairSweepResult:
     """Process any burst selection across frames and swaths into one product.
@@ -4072,6 +4136,10 @@ def run_pair(
     geoid_correction : bool, optional
         Convert orthometric raster DEM heights to ellipsoidal with EGM96.
         Default True.
+    dem_source : str, optional
+        DEM selection for the automatic bare-name build (``<product>`` or
+        ``<product>:<provider>``); ``None`` defers to ``FANINSAR_DEM_SOURCE``
+        and then the ``glo30`` default.
     record_scientific_lineage : bool, optional
         Persist ordered residual/carrier/phase operation records with payload
         hashes. Disabled by default to keep the ordinary production path
@@ -4137,6 +4205,7 @@ def run_pair(
             secondary_orbit_path=secondary_orbit_path,
             unwrap=unwrap,
             geoid_correction=geoid_correction,
+            dem_source=dem_source,
             record_scientific_lineage=record_scientific_lineage,
         )
     from faninsar.missions.sentinel1.safe import open_safe_product
@@ -4281,26 +4350,19 @@ def run_pair(
         reject_invalid_state("selection contains no bursts")
 
     if dem is None and os.environ.get("FANINSAR_DEM_CACHE_DIR"):
-        from faninsar.processing.geometry.dem_manager import (
-            default_dem_name,
-            get_dem_manager,
-        )
-
         bounds = _auto_dem_bounds(
             roi,
             resolved,
             reference_products,
             orbits=ref_orbits,
         )
-        dem_path = get_dem_manager().fetch_dem(
-            bounds, Path(output_dir) / "dem" / default_dem_name()
+        dem_sampler = resolve_auto_dem(
+            bounds,
+            output_dir=Path(output_dir),
+            geoid_correction=geoid_correction,
+            dem_source=dem_source,
         )
-        logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
-        dem_sampler = RasterDEM(
-            dem_path, interpolation="biquintic", device=dem_identity
-        )
-        if geoid_correction:
-            dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
+        dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
 
     range_offsets = _swath_range_offsets(swath_tuple, reference_products)
     reference_swath0 = reference_products[0].swath(swath_tuple[0])
@@ -4830,6 +4892,7 @@ def _run_pair_sweep(
     secondary_orbit_path: str | Path | Sequence[str | Path] | None,
     unwrap: bool,
     geoid_correction: bool,
+    dem_source: str | None = None,
     record_scientific_lineage: bool = False,
     n_jobs: int = 1,
     resource_limits: ResourceLimits | None = None,
@@ -5026,26 +5089,19 @@ def _run_pair_sweep(
         reject_invalid_state("selection contains no bursts")
 
     if dem is None and os.environ.get("FANINSAR_DEM_CACHE_DIR"):
-        from faninsar.processing.geometry.dem_manager import (
-            default_dem_name,
-            get_dem_manager,
-        )
-
         bounds = _auto_dem_bounds(
             roi,
             resolved,
             reference_products,
             orbits=ref_orbits,
         )
-        dem_path = get_dem_manager().fetch_dem(
-            bounds, output_root / "dem" / default_dem_name()
+        dem_sampler = resolve_auto_dem(
+            bounds,
+            output_dir=output_root,
+            geoid_correction=geoid_correction,
+            dem_source=dem_source,
         )
-        logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
-        dem_sampler = RasterDEM(
-            dem_path, interpolation="biquintic", device=dem_identity
-        )
-        if geoid_correction:
-            dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
+        dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
 
     range_offsets = _swath_range_offsets(swath_tuple, reference_products)
     reference_swath0 = reference_products[0].swath(swath_tuple[0])

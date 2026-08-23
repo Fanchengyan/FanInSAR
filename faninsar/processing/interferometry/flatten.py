@@ -1342,16 +1342,17 @@ def copernicus_glo30_dem(
 
     """
     base = Path(base_path)
-    from faninsar.processing.geometry.dem_manager import copernicus_tile_name
+    from faninsar.processing.geometry.dem_manager import (
+        copernicus_tile_name,
+        find_legacy_tile,
+    )
 
     tile_dir, filename = copernicus_tile_name(latitude_deg, longitude_deg)
-    candidates = [
-        base / filename,
-        base / tile_dir / filename,
-        *sorted(base.glob(f"*/{tile_dir}/{filename}")),
-        *sorted(base.glob(f"**/{filename}")),
-    ]
-    path = next((p for p in candidates if p.is_file()), None)
+    path = find_legacy_tile(
+        base,
+        Path(tile_dir) / filename,
+        recursive=True,
+    )
     if path is None:
         message = f"Copernicus GLO-30 tile not found for {filename} under {base}"
         logger.error(message)

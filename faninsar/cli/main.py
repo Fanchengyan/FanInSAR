@@ -54,6 +54,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     frame.add_argument("--output", required=True, help="Output directory")
     frame.add_argument("--dem", default=None, help="DEM GeoTIFF (optional)")
+    frame.add_argument(
+        "--dem-source",
+        default=None,
+        help=(
+            "DEM source selection for bare-name/automatic builds "
+            "(<product> or <product>:<provider>, e.g. glo30, glo90, "
+            "nasadem:earthdata); omitted keeps env/default behavior"
+        ),
+    )
     frame.add_argument("--reference-orbit", default=None, help="Reference POEORB EOF")
     frame.add_argument("--secondary-orbit", default=None, help="Secondary POEORB EOF")
     frame.add_argument(
@@ -92,6 +101,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "frame":
         from faninsar.cli.frame import run_frame_cli
 
+        if args.dem_source:
+            # Fail closed BEFORE any pipeline work on unwired/unknown pairs.
+            # The 'auto' alias is valid everywhere else (DEMManager resolves
+            # it, not the selection grammar), so it passes the pre-gate
+            # untouched.
+            from faninsar.processing.geometry.dem_sources import (
+                AUTO_SOURCE_NAME,
+                parse_selection,
+            )
+
+            if args.dem_source != AUTO_SOURCE_NAME:
+                try:
+                    parse_selection(args.dem_source)
+                except (ValueError, TypeError) as exc:
+                    parser.exit(2, f"faninsar frame: error: {exc}\n")
+
         return run_frame_cli(
             reference=args.reference,
             secondary=args.secondary,
@@ -106,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
             rg_looks=args.rg_looks,
             goldstein=args.goldstein,
             device=args.device,
+            dem_source=args.dem_source,
         )
     parser.error(f"unknown command {args.command!r}")
     return 2
