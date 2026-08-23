@@ -123,6 +123,8 @@ class Tile:
     min_bytes: int = 1 << 20
     ranged: bool = True
     expected_decompressed_bytes: int | None = None
+    #: Tolerate a 404 for known-ocean tiles (skadi only).
+    ocean_404_skip: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +143,8 @@ class TileSet(FetchPlan):
     """Concurrent-tile plan produced by grid-shaped sources."""
 
     tiles: tuple[Tile, ...] = ()
+    #: Source-scoped flag: tolerate 404 for known-ocean tiles (skadi only).
+    ocean_404_skip: bool = False
 
 
 @dataclass(frozen=True, slots=True)
