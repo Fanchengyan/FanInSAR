@@ -32,8 +32,8 @@ must hold for day-to-day development.
   silently switches product or provider, `auto` rescues withheld GLO-30 cells
   with same-family GLO-90 only, and provider failures raise the structured
   `DEMProviderUnavailableError` instead of a hidden fallback. Selection fails
-  closed before any network traffic; user-facing usage is documented in
-  `docs/dem_manager_guide.md`.
+closed before any network traffic; user-facing usage is documented in
+`docs/source/user_guide/dem_manager.ipynb`.
 
 When a change would intentionally violate one of these rules, do not patch
 around the Proposal. Amend the relevant Proposal or create a new accepted
