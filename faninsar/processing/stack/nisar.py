@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any, Self
 from faninsar.core.acquisition import Acquisition
 from faninsar.logging import setup_logger
 from faninsar.missions.nisar import NisarSensor, _normalize_channel
-from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.config import ActivationMode, StackConfig
 from faninsar.processing.stack.nisar_provider import (
@@ -169,16 +168,6 @@ class NISARStack(Stack):
             configured_admission = extra.get(
                 "nisar_admission", extra.get("admission_policy")
             )
-        if configured_admission is None:
-            existing_paths = tuple(path for path in source_paths if path.exists())
-            if existing_paths:
-                message = (
-                    "NISARStack.from_rslc requires explicit nisar_admission for "
-                    "existing RSLC paths; refusing to open "
-                    f"{existing_paths[0]} without a trusted policy"
-                )
-                logger.error(message)
-                raise InvalidProcessingStateError(message)
         sensor = NisarSensor()
         handles: dict[Path, Any] = {}
         results: dict[str, SLCReadResult] = {}

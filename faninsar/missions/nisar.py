@@ -7,18 +7,13 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import stat
-import weakref
 from collections.abc import Mapping
-from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from numbers import Real
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -46,6 +41,7 @@ from faninsar.processing.readers import (
 logger = setup_logger(__name__)
 
 
+
 @dataclass(frozen=True, slots=True)
 class _AdmissionSnapshot:
     """Immutable identity captured before opening one RSLC source."""
@@ -57,44 +53,23 @@ class _AdmissionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class _AdmissionRecord:
-    """Admission snapshot bound to a handle identity.
-
-    Weak references are retained whenever the native handle supports them so
-    that a collected handle also removes its integer-id entry.  A few native
-    bindings are neither weak-referenceable nor extensible; those handles use
-    the source identity as a fail-closed fallback.
-    """
-
-    snapshot: _AdmissionSnapshot
-    handle_ref: weakref.ReferenceType[Any] | None = None
-    source_identity: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class NisarAdmissionPolicy:
-    """Fail-closed policy for opening a local NISAR RSLC source.
+    """Optional source metadata supplied by an application.
 
-    The policy is intentionally independent of the optional NISAR reader.  It
-    therefore runs before importing or constructing a native HDF5 reader and
-    can be used by applications to make source provenance an explicit input.
+    The policy is intentionally independent of the optional NISAR reader and
+    is carried only as source provenance metadata.  It never gates opening or
+    reading a source.
 
     Parameters
     ----------
     trusted_roots : sequence of path-like, optional
-        Existing local directories under which a source must reside.  Every
-        existing component is checked for symbolic links.
+        Legacy metadata retained for callers that record a source policy.
     expected_sha256 : mapping, optional
         Source inventory.  Keys may be the source path (or its canonical
         spelling), and values are hexadecimal SHA-256 digests.  A value may
         also be a mapping containing ``sha256``.
-    max_size_bytes : int, optional
-        Upper bound on the admitted regular file size.
-    reject_external_links : bool, default=True
-        Inspect HDF5 links without dereferencing them and reject external
-        links.  Non-HDF5 fake-reader fixtures are left to the native reader.
-    policy_id : str, default="nisar-trusted-preopen-v1"
-        Stable policy identity recorded in lineage and scene manifests.
+    policy_id : str, default="nisar-source-metadata-v1"
+        Stable metadata identity recorded in lineage and scene manifests.
 
     """
 
@@ -102,19 +77,14 @@ class NisarAdmissionPolicy:
     expected_sha256: Mapping[str, object] = field(default_factory=dict)
     max_size_bytes: int | None = None
     reject_external_links: bool = True
-    policy_id: str = "nisar-trusted-preopen-v1"
+    policy_id: str = "nisar-source-metadata-v1"
 
     def __post_init__(self) -> None:
-        """Validate policy scalars before any source is opened."""
+        """Validate only the metadata identity."""
         if not isinstance(self.policy_id, str) or not self.policy_id.strip():
             raise ValueError("NISAR admission policy_id must be non-empty")
-        if self.max_size_bytes is not None and (
-            isinstance(self.max_size_bytes, bool) or self.max_size_bytes < 0
-        ):
-            raise ValueError("NISAR admission max_size_bytes must be non-negative")
-
     def as_metadata(self) -> dict[str, object]:
-        """Return JSON-compatible policy metadata for provenance manifests."""
+        """Return JSON-compatible, non-authoritative source metadata."""
         inventory = {
             str(key): _inventory_digest(value)
             for key, value in self.expected_sha256.items()
@@ -130,25 +100,8 @@ class NisarAdmissionPolicy:
             "expected_sha256": inventory,
             "inventory_digest": hashlib.sha256(inventory_payload).hexdigest(),
             "max_size_bytes": self.max_size_bytes,
-            "external_links": "rejected" if self.reject_external_links else "checked",
-            "regular_file": True,
-            "no_follow": True,
+            "external_links": "not_checked",
         }
-
-
-_ADMISSION_SNAPSHOTS: dict[int, _AdmissionRecord] = {}
-_ADMISSION_WEAK: weakref.WeakKeyDictionary[Any, _AdmissionSnapshot] = (
-    weakref.WeakKeyDictionary()
-)
-
-# HDF5 links form a graph rather than a tree: hard links may alias an object or
-# even point back to an ancestor.  Keep the pre-open inspection bounded even for
-# adversarial files.  The limits are deliberately generous for ordinary RSLC
-# products while ensuring malformed graphs fail closed before native access.
-_HDF5_LINK_MAX_DEPTH = 256
-_HDF5_LINK_MAX_OBJECTS = 100_000
-_HDF5_LINK_MAX_LINKS = 1_000_000
-_HDF5_SIGNATURE = b"\x89HDF\r\n\x1a\n"
 
 
 def _admission_error(message: str) -> None:
@@ -272,241 +225,16 @@ def _coerce_admission_policy(
         expected_sha256=_normalise_inventory(inventory),
         max_size_bytes=maximum,
         reject_external_links=True if external is None else bool(external),
-        policy_id=str(values.get("policy_id", "nisar-trusted-preopen-v1")),
+        policy_id=str(values.get("policy_id", "nisar-source-metadata-v1")),
     )
-
-
-def _reject_symlink_components(path: Path) -> None:
-    """Reject symbolic links in an existing local source path."""
-    absolute = path.expanduser()
-    if not absolute.is_absolute():
-        absolute = Path.cwd() / absolute
-    current = Path(absolute.anchor)
-    for component in absolute.parts[1:]:
-        current /= component
-        try:
-            if current.is_symlink():
-                _admission_error(
-                    f"NISAR source path contains a symbolic link: {current}"
-                )
-        except OSError as error:
-            _admission_error(f"NISAR source path cannot be inspected: {error}")
-
-
-def _local_source_path(uri: str | Path) -> Path:
-    """Validate a source URI as a local path without credential parsing."""
-    raw = os.fspath(uri)
-    if isinstance(raw, bytes):
-        raw = os.fsdecode(raw)
-    if not isinstance(raw, str) or not raw.strip():
-        _admission_error("NISAR source URI must be a non-empty local path")
-    parsed = urlsplit(raw)
-    if parsed.scheme or parsed.netloc or raw.startswith("//"):
-        _admission_error(
-            "NISAR source URI must be a local path; remote or credential URI rejected"
-        )
-    return Path(raw).expanduser()
-
-
-def _secure_file_snapshot(
-    path: Path,
-    policy: NisarAdmissionPolicy,
-) -> _AdmissionSnapshot:
-    """Inspect, hash, and security-check one source before reader access."""
-    _reject_symlink_components(path)
-    source = path if path.is_absolute() else Path.cwd() / path
-    source_id = str(source.resolve(strict=False))
-    if policy.trusted_roots:
-        allowed = []
-        for root in policy.trusted_roots:
-            root_path = Path(root).expanduser()
-            _reject_symlink_components(root_path)
-            if (
-                not root_path.exists()
-                or not root_path.is_dir()
-                or root_path.is_symlink()
-            ):
-                _admission_error(
-                    f"NISAR trusted root is not a regular directory: {root}"
-                )
-            allowed.append(root_path.resolve())
-        try:
-            resolved_source = source.resolve(strict=True)
-        except FileNotFoundError:
-            _admission_error(
-                f"NISAR source does not exist under trusted roots: {source}"
-            )
-        if not any(resolved_source.is_relative_to(root) for root in allowed):
-            _admission_error(f"NISAR source is outside trusted roots: {source}")
-    flags = os.O_RDONLY
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(source, flags | no_follow)
-    except FileNotFoundError as error:
-        _admission_error(f"NISAR source does not exist: {source}")
-        raise AssertionError from error
-    except OSError as error:
-        _admission_error(
-            f"NISAR source cannot be opened without following links: {source}: {error}"
-        )
-        raise AssertionError from error
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            _admission_error(f"NISAR source is not a regular file: {source}")
-        size = int(info.st_size)
-        if policy.max_size_bytes is not None and size > policy.max_size_bytes:
-            _admission_error(
-                f"NISAR source exceeds max_size_bytes ({size} > {policy.max_size_bytes})"
-            )
-        digest = hashlib.sha256()
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    actual_digest = digest.hexdigest()
-    inventory = policy.expected_sha256
-    expected = None
-    for key in (str(path), str(source), source_id):
-        if key in inventory:
-            expected = _inventory_digest(inventory[key])
-            break
-    if inventory and expected is None:
-        _admission_error(
-            f"NISAR source is absent from expected SHA-256 inventory: {source_id}"
-        )
-    if expected is not None and actual_digest != expected:
-        _admission_error(
-            f"NISAR source SHA-256 mismatch for {source_id}: expected {expected}, got {actual_digest}"
-        )
-    _check_hdf5_links(source, policy)
-    return _AdmissionSnapshot(
-        source_id=source_id,
-        source_digest=actual_digest,
-        source_size_bytes=size,
-        policy=policy,
-    )
-
-
-def _check_hdf5_links(path: Path, policy: NisarAdmissionPolicy) -> None:
-    """Inspect HDF5 links with ``getlink=True`` so external targets are not followed."""
-    if not policy.reject_external_links:
-        return
-    try:
-        import h5py
-    except ImportError:
-        _admission_error(
-            "NISAR HDF5 link inspection requires h5py; optional dependency is unavailable"
-        )
-    try:
-        is_hdf5 = h5py.is_hdf5(path)
-        if not is_hdf5:
-            # Lightweight reader fakes commonly use arbitrary non-HDF5 bytes,
-            # but a file carrying the HDF5 signature must not be handed to a
-            # native reader after h5py has rejected it as malformed.
-            try:
-                with path.open("rb") as stream:
-                    has_hdf5_signature = (
-                        stream.read(len(_HDF5_SIGNATURE)) == _HDF5_SIGNATURE
-                    )
-            except OSError as error:
-                _admission_error(
-                    f"NISAR HDF5 source cannot be inspected for validity: {path}: {error}"
-                )
-            if has_hdf5_signature:
-                _admission_error(f"NISAR source is an invalid HDF5 file: {path}")
-            return
-        with h5py.File(path, "r") as source:
-            external_type = h5py.ExternalLink
-            soft_type = h5py.SoftLink
-
-            def object_identity(group: Any) -> tuple[str, int]:
-                """Return an identity stable across wrappers for one HDF5 object."""
-                try:
-                    address = h5py.h5o.get_info(group.id).addr
-                    return ("hdf5-address", int(address))
-                except (AttributeError, OSError, TypeError, ValueError):
-                    # Older/fake h5py implementations may not expose h5o.  The
-                    # low-level identifier hash is stable for wrappers of one
-                    # object and is preferable to Python's wrapper identity.
-                    try:
-                        return ("hdf5-id", hash(group.id))
-                    except (AttributeError, TypeError):
-                        return ("python-id", id(group))
-
-            visited_objects: set[tuple[str, int]] = set()
-            visited_paths: set[str] = set()
-            active_objects: set[tuple[str, int]] = set()
-            active_paths: set[str] = set()
-            inspected_objects = 0
-            inspected_links = 0
-
-            def walk(group: Any, path_name: str, depth: int) -> None:
-                """Visit hard-linked groups without dereferencing unsafe links."""
-                nonlocal inspected_objects, inspected_links
-                identity = object_identity(group)
-                if identity in active_objects or path_name in active_paths:
-                    _admission_error(
-                        "NISAR HDF5 hard-link cycle detected at "
-                        f"{path_name!r} (object identity {identity!r})"
-                    )
-                if identity in visited_objects or path_name in visited_paths:
-                    return
-                if depth > _HDF5_LINK_MAX_DEPTH:
-                    _admission_error(
-                        "NISAR HDF5 link traversal exceeded maximum depth "
-                        f"({_HDF5_LINK_MAX_DEPTH}) at {path_name!r}"
-                    )
-                inspected_objects += 1
-                if inspected_objects > _HDF5_LINK_MAX_OBJECTS:
-                    _admission_error(
-                        "NISAR HDF5 link traversal exceeded maximum object limit "
-                        f"({_HDF5_LINK_MAX_OBJECTS}) at {path_name!r}"
-                    )
-                visited_objects.add(identity)
-                visited_paths.add(path_name)
-                active_objects.add(identity)
-                active_paths.add(path_name)
-                try:
-                    for name in group:
-                        inspected_links += 1
-                        if inspected_links > _HDF5_LINK_MAX_LINKS:
-                            _admission_error(
-                                "NISAR HDF5 link traversal exceeded maximum link "
-                                f"limit ({_HDF5_LINK_MAX_LINKS}) at {path_name!r}"
-                            )
-                        link = group.get(name, getlink=True)
-                        child_path = (
-                            f"/{name}" if path_name == "/" else f"{path_name}/{name}"
-                        )
-                        if isinstance(link, (external_type, soft_type)):
-                            _admission_error(
-                                "NISAR HDF5 source contains an unsafe "
-                                f"{type(link).__name__}: {child_path}"
-                            )
-                        if isinstance(link, h5py.HardLink):
-                            child = group.get(name, getlink=False)
-                            if isinstance(child, h5py.Group):
-                                walk(child, child_path, depth + 1)
-                finally:
-                    active_objects.remove(identity)
-                    active_paths.remove(path_name)
-
-            walk(source, "/", 0)
-    except OSError as error:
-        _admission_error(f"NISAR HDF5 link inspection failed for {path}: {error}")
 
 
 def _source_snapshot(path: str | Path) -> _AdmissionSnapshot:
     """Return a reproducible path/content identity for one source.
 
-    A missing path is represented by a deterministic sentinel so lightweight
-    reader fakes can still exercise the adapter.  A real NISAR reader will
-    reject such a path while opening it; if the file subsequently appears,
-    the sentinel changes to its content digest and stale reuse is rejected.
+    This is provenance bookkeeping, not an admission gate.  Missing paths
+    retain a deterministic sentinel so in-memory reader fakes can exercise
+    the adapter; native readers remain responsible for opening real files.
     """
     resolved = Path(path).expanduser().resolve(strict=False)
     digest = hashlib.sha256()
@@ -519,9 +247,9 @@ def _source_snapshot(path: str | Path) -> _AdmissionSnapshot:
     except (FileNotFoundError, NotADirectoryError):
         digest.update(f"missing:{resolved}".encode())
     except OSError as error:
-        logger.error("NISAR RSLC source cannot be admitted: %s", resolved)
+        logger.error("NISAR RSLC source cannot be snapshotted: %s", resolved)
         raise InvalidProcessingStateError(
-            f"NISAR RSLC source cannot be admitted: {resolved}: {error}"
+            f"NISAR RSLC source cannot be snapshotted: {resolved}: {error}"
         ) from error
     return _AdmissionSnapshot(str(resolved), digest.hexdigest(), size)
 
@@ -542,123 +270,50 @@ def _handle_source_identity(handle: Any) -> str | None:
 
 
 def _remember_admission(handle: Any, snapshot: _AdmissionSnapshot) -> None:
-    """Remember an admission snapshot while preventing integer-id reuse."""
-    handle_id = id(handle)
-    source_identity = _handle_source_identity(handle)
-    handle_ref: weakref.ReferenceType[Any] | None = None
+    """Attach an optional baseline snapshot to a native handle.
+
+    Native handles normally allow attributes.  Handles that do not are still
+    usable; their current source is snapshotted at each public read boundary.
+    No process-wide identity or integer-id cache is used.
+    """
     try:
-        weakref_handle = weakref.ref(handle)
-    except TypeError:
-        weakref_handle = None
-    else:
-        handle_ref = weakref_handle
-        # WeakKeyDictionary is the preferred identity store where native
-        # wrappers are both weak-referenceable and hashable.  The id table is
-        # still populated because some wrappers are weak-referenceable but
-        # unhashable.
-        with suppress(TypeError):
-            _ADMISSION_WEAK[handle] = snapshot
-
-    record = _AdmissionRecord(snapshot, handle_ref, source_identity)
-    _ADMISSION_SNAPSHOTS[handle_id] = record
-
-    if handle_ref is not None:
-
-        def remove_record(reference: weakref.ReferenceType[Any]) -> None:
-            """Remove one stale integer-id record after handle collection."""
-            current = _ADMISSION_SNAPSHOTS.get(handle_id)
-            if current is not None and current.handle_ref is reference:
-                _ADMISSION_SNAPSHOTS.pop(handle_id, None)
-
-        # Replacing the temporary reference with a callback-bearing reference
-        # keeps the table self-cleaning without retaining the native handle.
-        callback_ref = weakref.ref(handle, remove_record)
-        _ADMISSION_SNAPSHOTS[handle_id] = _AdmissionRecord(
-            snapshot, callback_ref, source_identity
-        )
-
-    with suppress(AttributeError, TypeError):
-        handle._faninsar_nisar_admission = snapshot
+        handle._faninsar_nisar_source_snapshot = snapshot
+    except (AttributeError, TypeError):
+        return
 
 
 def _handle_admission(handle: Any) -> _AdmissionSnapshot | None:
-    """Return a snapshot only when handle identity or source identity matches."""
-    try:
-        weak_snapshot = _ADMISSION_WEAK.get(handle)
-    except TypeError:
-        weak_snapshot = None
-
-    record = _ADMISSION_SNAPSHOTS.get(id(handle))
-    if record is None:
-        return None
-    if record.handle_ref is not None:
-        if record.handle_ref() is handle:
-            # Require the identity-indexed record as well as the weak map.
-            # This avoids WeakKeyDictionary equality semantics authorizing a
-            # distinct but equal foreign wrapper.
-            if weak_snapshot is not None and weak_snapshot is not record.snapshot:
-                logger.error("NISAR admission stores disagree for this handle")
-                return None
-            return record.snapshot
-        logger.error("NISAR admission snapshot does not belong to this handle")
-        return None
-
-    # Non-weakref native wrappers can only use the integer-id fallback when
-    # their stable source identity is available and unchanged.  A source-less
-    # or differently sourced foreign wrapper must fail closed.
-    source_identity = _handle_source_identity(handle)
-    if (
-        record.source_identity is None
-        or source_identity is None
-        or source_identity != record.source_identity
-    ):
-        logger.error("NISAR admission snapshot does not match this handle")
-        return None
-    return record.snapshot
+    """Return an optional baseline snapshot attached by :meth:`open_product`."""
+    snapshot = getattr(handle, "_faninsar_nisar_source_snapshot", None)
+    return snapshot if isinstance(snapshot, _AdmissionSnapshot) else None
 
 
 def _validate_admission(
     handle: Any, *, expected_source: str | Path | None = None
 ) -> _AdmissionSnapshot:
-    """Reject a changed path or source byte stream before native access."""
+    """Check optional source lineage and detect changes since opening.
+
+    The check provides reproducibility for Stack resume and provenance.  It
+    does not authorize or reject a reader handle based on a trust policy.
+    """
     snapshot = _handle_admission(handle)
     if snapshot is None:
-        _admission_error(
-            "NISAR RSLC handle has no explicit admission snapshot; "
-            "source-less or compatible handles cannot bypass admission"
-        )
-
-    handle_source = _value(handle, "filename", "file_name", "source_path")
-
-    if handle_source is not None:
-        current_id = str(Path(handle_source).expanduser().resolve(strict=False))
-        if current_id != snapshot.source_id:
-            logger.error("NISAR RSLC source path changed: %s", snapshot.source_id)
-            raise InvalidProcessingStateError(
-                "NISAR RSLC source path changed after admission"
-            )
-    current = (
-        _secure_file_snapshot(Path(snapshot.source_id), snapshot.policy)
-        if snapshot.policy is not None
-        else _source_snapshot(snapshot.source_id)
-    )
-    if current.source_digest != snapshot.source_digest:
-        logger.error("NISAR RSLC source content changed: %s", snapshot.source_id)
-        raise InvalidProcessingStateError(
-            "NISAR RSLC source content changed after admission"
-        )
-    if current.source_size_bytes != snapshot.source_size_bytes:
-        logger.error("NISAR RSLC source size changed: %s", snapshot.source_id)
-        raise InvalidProcessingStateError(
-            "NISAR RSLC source size changed after admission"
-        )
-    if expected_source is not None:
+        handle_source = _value(handle, "filename", "file_name", "source_path")
+        source = expected_source if expected_source is not None else handle_source
+        if source is None:
+            return _AdmissionSnapshot("", "", 0)
+        snapshot = _source_snapshot(source)
+    elif expected_source is not None:
         expected_id = str(Path(expected_source).expanduser().resolve(strict=False))
         if expected_id != snapshot.source_id:
             logger.error("NISAR RSLC source lineage changed: %s", expected_source)
-            raise InvalidProcessingStateError(
-                "NISAR RSLC source lineage changed after admission"
-            )
+            raise InvalidProcessingStateError("NISAR RSLC source lineage changed")
+
+    if snapshot.source_id:
+        current = _source_snapshot(snapshot.source_id)
+        if current.source_digest != snapshot.source_digest:
+            logger.error("NISAR RSLC source content changed: %s", snapshot.source_id)
+            raise InvalidProcessingStateError("NISAR RSLC source content changed")
     return snapshot
 
 
@@ -890,15 +545,14 @@ class NisarSensor(Sensor):
         admission: NisarAdmissionPolicy | Mapping[str, object] | None = None,
         **policy_options: Any,
     ) -> _AdmissionSnapshot:
-        """Run trusted pre-open admission and return immutable source identity.
+        """Capture optional source identity and content digest.
 
         Parameters
         ----------
         uri : path-like
-            Local RSLC path.  URI schemes, credentials, symlinks, and
-            non-regular files are rejected whenever a policy is supplied.
+            RSLC path or reader URI.
         admission : NisarAdmissionPolicy or mapping, optional
-            Explicit trusted-root, inventory, size, and HDF5-link policy.
+            Optional metadata retained in the returned snapshot.
         **policy_options : Any
             Convenience scalar policy options accepted by the policy object.
 
@@ -907,22 +561,24 @@ class NisarSensor(Sensor):
         _AdmissionSnapshot
             Source id, SHA-256, size, and the effective policy.
 
-        Raises
-        ------
-        InvalidProcessingStateError
-            If the source fails the explicit admission policy.
-
         """
         policy = _coerce_admission_policy(admission, **policy_options)
-        if policy is None:
-            raise ValueError("NISAR admit_source requires explicit admission metadata")
-        return _secure_file_snapshot(_local_source_path(uri), policy)
+        snapshot = _source_snapshot(uri)
+        return _AdmissionSnapshot(
+            snapshot.source_id,
+            snapshot.source_digest,
+            snapshot.source_size_bytes,
+            policy,
+        )
 
     def admission_metadata(self, handle: Any) -> dict[str, object] | None:
-        """Return source admission metadata captured for one reader handle."""
+        """Return optional source identity metadata for one reader handle."""
         snapshot = _handle_admission(handle)
         if snapshot is None:
-            return None
+            source = _value(handle, "filename", "file_name", "source_path")
+            if source is None:
+                return None
+            snapshot = _source_snapshot(source)
         return {
             "source_id": snapshot.source_id,
             "source_digest": snapshot.source_digest,
@@ -947,12 +603,12 @@ class NisarSensor(Sensor):
         uri : str
             Local, already-admitted RSLC path supplied by the caller.
         admission, admission_policy : NisarAdmissionPolicy or mapping, optional
-            Explicit trusted pre-open source policy.  Existing sources must
-            provide trusted roots and an expected digest inventory.
+            Optional source metadata retained in lineage; it is never required
+            to open an existing source.
         **kwargs : Any
             Optional reader-specific construction arguments.  Scalar admission
-            options (``trusted_roots``, ``expected_sha256``, and
-            ``max_size_bytes``) are also accepted explicitly.
+            legacy policy options are consumed as metadata rather than passed
+            to the native reader.
 
         Returns
         -------
@@ -992,35 +648,12 @@ class NisarSensor(Sensor):
                 configured_policy = {**configured_policy, **policy_options}
             else:
                 raise TypeError(
-                    "NISAR admission policy object cannot mix scalar policy options"
+                    "NISAR policy object cannot mix scalar metadata options"
                 )
         policy = _coerce_admission_policy(configured_policy)
-        local_uri = _local_source_path(uri)
-        if os.path.lexists(local_uri) and policy is None:
-            _admission_error(
-                "NISAR open_product requires explicit admission policy with "
-                "trusted_roots and expected_sha256 inventory for an existing "
-                f"RSLC source: {local_uri}"
-            )
-        if os.path.lexists(local_uri) and policy is not None:
-            if not policy.trusted_roots:
-                _admission_error(
-                    "NISAR open_product requires trusted_roots for an existing "
-                    f"RSLC source: {local_uri}"
-                )
-            if not policy.expected_sha256:
-                _admission_error(
-                    "NISAR open_product requires expected_sha256 inventory for "
-                    f"an existing RSLC source: {local_uri}"
-                )
-        # Capture the source identity before importing/opening the optional
-        # reader. Native readers are allowed to cache metadata, so this is the
-        # admission boundary rather than a post-open diagnostic.
-        snapshot = (
-            _secure_file_snapshot(local_uri, policy)
-            if policy is not None
-            else _source_snapshot(local_uri)
-        )
+        # Snapshot the bytes for provenance and later source-change detection.
+        # This is deliberately independent of the optional metadata policy.
+        snapshot = _source_snapshot(uri)
         try:
             readers = import_module("nisar.products.readers")
         except ImportError as error:
@@ -1035,8 +668,6 @@ class NisarSensor(Sensor):
             try:
                 handle = factory(str(uri), **kwargs)
             except TypeError:
-                # The ISCE3/NISAR RSLC class accepts ``hdf5file=`` rather than
-                # a positional path; keep compatibility with simple fakes.
                 handle = factory(hdf5file=str(uri), **kwargs)
         except Exception:
             logger.exception("Failed to open NISAR RSLC at %s", uri)
@@ -1053,7 +684,15 @@ class NisarSensor(Sensor):
             )
             logger.error(message)
             raise ValueError(message)
-        _remember_admission(handle, snapshot)
+        _remember_admission(
+            handle,
+            _AdmissionSnapshot(
+                snapshot.source_id,
+                snapshot.source_digest,
+                snapshot.source_size_bytes,
+                policy,
+            ),
+        )
         return handle
 
     def to_slc_product(
@@ -1067,6 +706,10 @@ class NisarSensor(Sensor):
         **kwargs: Any,
     ) -> SLCReadResult:
         """Normalize one admitted NISAR RSLC channel without reading its raster."""
+        # Validate identity and content before selecting channels: native
+        # metadata accessors are executable reader boundaries and must never
+        # run for a compatible-but-unadmitted handle.
+        snapshot = _validate_admission(handle, expected_source=source_path)
         if "freq" in kwargs:
             alias = _normalize_channel(kwargs.pop("freq"), field="frequency")
             direct = _normalize_channel(frequency, field="frequency")
@@ -1094,7 +737,6 @@ class NisarSensor(Sensor):
             message = f"Unsupported NISAR product options: {tuple(kwargs)}"
             logger.error(message)
             raise TypeError(message)
-        snapshot = _validate_admission(handle, expected_source=source_path)
         dataset = handle.getSlcDatasetAsNativeComplex(frequency, polarization)
         shape = tuple(int(item) for item in getattr(dataset, "shape", ()))
         if len(shape) != 2 or min(shape) <= 0:
