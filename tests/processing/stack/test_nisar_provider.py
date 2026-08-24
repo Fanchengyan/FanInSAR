@@ -15,6 +15,7 @@ import pytest
 
 from faninsar.missions.nisar import NisarSensor
 from faninsar.processing.coordinates import GeoGrid
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.slc import GeoSLC, RadarSLC
 from faninsar.processing.stack import NISARStack
@@ -51,8 +52,7 @@ def _stack(
 ) -> tuple[NISARStack, tuple[Path, Path], dict[Path, SimpleNamespace]]:
     """Construct a Stack with two fake lazily-read RSLCs."""
     paths = tuple(
-        tmp_path / f"NISAR_RSLC_{date_id}.h5"
-        for date_id in ("20240101", "20240113")
+        tmp_path / f"NISAR_RSLC_{date_id}.h5" for date_id in ("20240101", "20240113")
     )
     for path in paths:
         path.touch()
@@ -68,6 +68,7 @@ def _stack(
         "open_product",
         lambda _sensor, uri: handles[Path(uri)],
     )
+
     def read_product(
         _sensor: object,
         handle: object,
@@ -165,6 +166,7 @@ def test_nisar_geo_provider_uses_one_shared_geo_target(
 
 def test_nisar_provider_maps_secondary_physical_window_and_metadata(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Secondary reads follow sensing time and update crop grid metadata."""
     reference_path = tmp_path / "NISAR_RSLC_20240101.h5"
@@ -214,6 +216,10 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
             selections.append((key, window))
             return (reference_array if key == "reference" else secondary_array)[window]
 
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar_provider._geometry_shared_radar_window",
+        lambda *_args, **_kwargs: (3, 6, 3, 7),
+    )
     callback = make_nisar_scene_provider(
         sensor=Sensor(),
         handles={
@@ -253,6 +259,11 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
     )
     np.testing.assert_array_equal(secondary_crop.samples, secondary_array[3:6, 3:7])
 
+    manifest = (tmp_path / "pair" / "scenes" / "manifest.json").read_text()
+    assert "source_digest" in manifest
+    assert "source_id" in manifest
+    assert "B/HH" in manifest
+
 
 def test_nisar_provider_fails_closed_without_bounded_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -265,4 +276,55 @@ def test_nisar_provider_fails_closed_without_bounded_window(
             paths[1],
             output_dir=tmp_path / "pair",
             options={"nisar_window": None},
+        )
+
+
+def test_nisar_provider_rejects_source_content_mutation_after_admission(
+    tmp_path: Path,
+) -> None:
+    """A provider snapshot prevents stale scene reuse after source mutation."""
+    reference_path = tmp_path / "NISAR_RSLC_20240101.h5"
+    secondary_path = tmp_path / "NISAR_RSLC_20240113.h5"
+    reference_path.write_bytes(b"reference-v1")
+    secondary_path.write_bytes(b"secondary-v1")
+    reference_result = _result(reference_path, "20240101")
+    secondary_result = _result(secondary_path, "20240113")
+    handles = {reference_path: object(), secondary_path: object()}
+
+    class Sensor:
+        """Fake normalized NISAR window reader."""
+
+        def read_slc_window(
+            self,
+            _handle: object,
+            window: tuple[slice, slice],
+            **_kwargs: object,
+        ) -> np.ndarray:
+            return np.ones(
+                (window[0].stop - window[0].start, window[1].stop - window[1].start),
+                dtype=np.complex64,
+            )
+
+    callback = make_nisar_scene_provider(
+        sensor=Sensor(),
+        handles=handles,
+        products={
+            "20240101": reference_result.product,
+            "20240113": secondary_result.product,
+        },
+        lineage={
+            "20240101": str(reference_path),
+            "20240113": str(secondary_path),
+        },
+        master="20240101",
+        channel=("B", "HH"),
+        configured_window=(0, 2, 0, 2),
+    )
+    secondary_path.write_bytes(b"secondary-v2")
+    with pytest.raises(InvalidProcessingStateError, match="changed after admission"):
+        callback(
+            reference_path,
+            secondary_path,
+            output_dir=tmp_path / "pair",
+            options={"coregistration_grid": "radar"},
         )

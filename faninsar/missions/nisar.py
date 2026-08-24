@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from numbers import Real
@@ -37,6 +40,92 @@ from faninsar.processing.readers import (
 )
 
 logger = setup_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmissionSnapshot:
+    """Immutable identity captured before opening one RSLC source."""
+
+    source_id: str
+    source_digest: str
+
+
+_ADMISSION_SNAPSHOTS: dict[int, _AdmissionSnapshot] = {}
+
+
+def _source_snapshot(path: str | Path) -> _AdmissionSnapshot:
+    """Return a reproducible path/content identity for one source.
+
+    A missing path is represented by a deterministic sentinel so lightweight
+    reader fakes can still exercise the adapter.  A real NISAR reader will
+    reject such a path while opening it; if the file subsequently appears,
+    the sentinel changes to its content digest and stale reuse is rejected.
+    """
+    resolved = Path(path).expanduser().resolve(strict=False)
+    digest = hashlib.sha256()
+    try:
+        with resolved.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except (FileNotFoundError, NotADirectoryError):
+        digest.update(f"missing:{resolved}".encode())
+    except OSError as error:
+        logger.error("NISAR RSLC source cannot be admitted: %s", resolved)
+        raise InvalidProcessingStateError(
+            f"NISAR RSLC source cannot be admitted: {resolved}: {error}"
+        ) from error
+    return _AdmissionSnapshot(str(resolved), digest.hexdigest())
+
+
+def _remember_admission(handle: Any, snapshot: _AdmissionSnapshot) -> None:
+    """Remember an admission snapshot even for native handles without attrs."""
+    _ADMISSION_SNAPSHOTS[id(handle)] = snapshot
+    with suppress(AttributeError, TypeError):
+        handle._faninsar_nisar_admission = snapshot
+    # pybind11 handles can be non-extensible; the id-keyed table covers those
+    # objects for the lifetime of the opened handle.
+
+
+def _handle_admission(handle: Any) -> _AdmissionSnapshot | None:
+    """Return a previously captured snapshot for a native reader handle."""
+    snapshot = getattr(handle, "_faninsar_nisar_admission", None)
+    if isinstance(snapshot, _AdmissionSnapshot):
+        return snapshot
+    return _ADMISSION_SNAPSHOTS.get(id(handle))
+
+
+def _validate_admission(
+    handle: Any, *, expected_source: str | Path | None = None
+) -> _AdmissionSnapshot | None:
+    """Reject a changed path or source byte stream before native access."""
+    snapshot = _handle_admission(handle)
+    if snapshot is None:
+        if expected_source is None:
+            return None
+        snapshot = _source_snapshot(expected_source)
+        _remember_admission(handle, snapshot)
+    handle_source = _value(handle, "filename", "file_name", "source_path")
+    if handle_source is not None:
+        current_id = str(Path(handle_source).expanduser().resolve(strict=False))
+        if current_id != snapshot.source_id:
+            logger.error("NISAR RSLC source path changed: %s", snapshot.source_id)
+            raise InvalidProcessingStateError(
+                "NISAR RSLC source path changed after admission"
+            )
+    current = _source_snapshot(snapshot.source_id)
+    if current.source_digest != snapshot.source_digest:
+        logger.error("NISAR RSLC source content changed: %s", snapshot.source_id)
+        raise InvalidProcessingStateError(
+            "NISAR RSLC source content changed after admission"
+        )
+    if expected_source is not None:
+        expected_id = str(Path(expected_source).expanduser().resolve(strict=False))
+        if expected_id != snapshot.source_id:
+            logger.error("NISAR RSLC source lineage changed: %s", expected_source)
+            raise InvalidProcessingStateError(
+                "NISAR RSLC source lineage changed after admission"
+            )
+    return snapshot
 
 
 def _value(value: Any, *names: str) -> Any:
@@ -82,18 +171,19 @@ def _select_channel(handle: Any, frequency: str, polarization: str) -> tuple[str
         message = f"NISAR frequency {selected_frequency!r} is unavailable"
         logger.error(message)
         raise ValueError(message)
-    values = polarizations.get(selected_frequency) or polarizations.get(
-        selected_frequency.lower()
-    ) if isinstance(polarizations, Mapping) else polarizations
+    values = (
+        polarizations.get(selected_frequency)
+        or polarizations.get(selected_frequency.lower())
+        if isinstance(polarizations, Mapping)
+        else polarizations
+    )
     if values is None:
         message = f"NISAR frequency {selected_frequency!r} has no polarizations"
         logger.error(message)
         raise InvalidProcessingStateError(message)
     if isinstance(values, str):
         values = (values,)
-    available_pols = {
-        _normalize_channel(item, field="polarization") for item in values
-    }
+    available_pols = {_normalize_channel(item, field="polarization") for item in values}
     selected_polarization = _normalize_channel(polarization, field="polarization")
     if selected_polarization not in available_pols:
         message = (
@@ -123,10 +213,10 @@ def _radar_grid(handle: Any, frequency: str, shape: tuple[int, int]) -> RadarGri
     look = str(fields[4]).lower()
     look_direction = "left" if "left" in look else "right" if "right" in look else None
     if look_direction is None:
-        raise InvalidProcessingStateError(f"unsupported NISAR look direction {fields[4]!r}")
-    sensing_start = _datetime(
-        _value(grid, "sensing_start"), _value(grid, "ref_epoch")
-    )
+        raise InvalidProcessingStateError(
+            f"unsupported NISAR look direction {fields[4]!r}"
+        )
+    sensing_start = _datetime(_value(grid, "sensing_start"), _value(grid, "ref_epoch"))
     grid_shape = tuple(int(item) for item in _value(grid, "shape") or shape)
     if grid_shape != shape:
         raise InvalidProcessingStateError(
@@ -173,10 +263,14 @@ def _valid_samples(handle: Any, frequency: str) -> ValidSampleMask:
     path = f"/science/LSAR/RSLC/swaths/frequency{frequency}/validSamplesSubSwath1"
     with h5py.File(str(handle.filename), "r") as source:
         if path not in source:
-            raise InvalidProcessingStateError(f"missing NISAR valid-sample dataset {path}")
+            raise InvalidProcessingStateError(
+                f"missing NISAR valid-sample dataset {path}"
+            )
         values = np.asarray(source[path])
     if values.ndim != 2 or values.shape[1] != 2:
-        raise InvalidProcessingStateError("NISAR valid-sample dataset must have shape (lines, 2)")
+        raise InvalidProcessingStateError(
+            "NISAR valid-sample dataset must have shape (lines, 2)"
+        )
     return ValidSampleMask(
         tuple(int(item) for item in values[:, 0]),
         tuple(int(item) for item in values[:, 1]),
@@ -196,7 +290,9 @@ def _doppler(handle: Any, frequency: str) -> DopplerCentroidPolynomial:
     degree = 1 if x_axis.size > 1 else 0
     fit = np.polyfit(centered, values, degree)
     coefficients = tuple(float(item) for item in fit[::-1])
-    return DopplerCentroidPolynomial(coefficients, reference_range, float(_value(lut, "y_start") or 0.0))
+    return DopplerCentroidPolynomial(
+        coefficients, reference_range, float(_value(lut, "y_start") or 0.0)
+    )
 
 
 def _normalize_channel(value: str, *, field: str) -> str:
@@ -276,6 +372,10 @@ class NisarSensor(Sensor):
             If the opened object does not expose the native-complex RSLC API.
 
         """
+        # Capture the source identity before importing/opening the optional
+        # reader.  Native readers are allowed to cache metadata, so this is
+        # the admission boundary rather than a post-open diagnostic.
+        snapshot = _source_snapshot(uri)
         try:
             readers = import_module("nisar.products.readers")
         except ImportError as error:
@@ -308,6 +408,7 @@ class NisarSensor(Sensor):
             )
             logger.error(message)
             raise ValueError(message)
+        _remember_admission(handle, snapshot)
         return handle
 
     def to_slc_product(
@@ -325,9 +426,7 @@ class NisarSensor(Sensor):
             alias = _normalize_channel(kwargs.pop("freq"), field="frequency")
             direct = _normalize_channel(frequency, field="frequency")
             if direct not in {"B", alias}:
-                message = (
-                    "NISAR frequency and freq aliases specify different channels"
-                )
+                message = "NISAR frequency and freq aliases specify different channels"
                 logger.error(message)
                 raise ValueError(message)
             frequency = alias
@@ -350,10 +449,13 @@ class NisarSensor(Sensor):
             message = f"Unsupported NISAR product options: {tuple(kwargs)}"
             logger.error(message)
             raise TypeError(message)
+        snapshot = _validate_admission(handle, expected_source=source_path)
         dataset = handle.getSlcDatasetAsNativeComplex(frequency, polarization)
         shape = tuple(int(item) for item in getattr(dataset, "shape", ()))
         if len(shape) != 2 or min(shape) <= 0:
-            raise InvalidProcessingStateError("NISAR SLC dataset must be a positive 2-D array")
+            raise InvalidProcessingStateError(
+                "NISAR SLC dataset must be a positive 2-D array"
+            )
         grid = _radar_grid(handle, frequency, shape)
         resolved_source = str(source_path or _value(handle, "filename") or "")
         if not resolved_source:
@@ -383,6 +485,9 @@ class NisarSensor(Sensor):
                 "product": "RSLC",
                 "frequency": frequency,
                 "polarization": polarization,
+                "source_id": snapshot.source_id if snapshot else resolved_source,
+                "source_digest": snapshot.source_digest if snapshot else "",
+                "lineage": snapshot.source_id if snapshot else resolved_source,
             },
         )
 
@@ -430,6 +535,7 @@ class NisarSensor(Sensor):
             message = f"Unsupported NISAR window-read options: {tuple(kwargs)}"
             logger.error(message)
             raise TypeError(message)
+        _validate_admission(handle)
         getter = getattr(handle, "getSlcDatasetAsNativeComplex", None)
         if not callable(getter):
             message = "NISAR handle has no getSlcDatasetAsNativeComplex method"

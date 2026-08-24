@@ -6,11 +6,16 @@ from __future__ import annotations
 
 import sys
 from types import ModuleType, SimpleNamespace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
 from faninsar.missions.nisar import NisarSensor
+from faninsar.processing.errors import InvalidProcessingStateError
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class FakeComplexDataset:
@@ -129,6 +134,27 @@ def test_nisar_window_read_rejects_out_of_bounds_window() -> None:
     with pytest.raises(ValueError, match="selection out of bounds"):
         NisarSensor().read_slc_window(handle, (slice(0, 5), slice(0, 2)))
 
+    assert dataset.selections == []
+
+
+def test_nisar_admission_rejects_content_mutation_before_window_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An admitted handle cannot read bytes from a changed RSLC source."""
+    source = tmp_path / "scene.h5"
+    source.write_bytes(b"rslc-v1")
+    dataset = FakeComplexDataset(np.ones((4, 4), dtype=np.complex64))
+    handle = SimpleNamespace(
+        filename=str(source),
+        getSlcDatasetAsNativeComplex=lambda *_args: dataset,
+    )
+    calls: list[str] = []
+    install_fake_reader(monkeypatch, handle, calls)
+    admitted = NisarSensor().open_product(str(source))
+    source.write_bytes(b"rslc-v2")
+
+    with pytest.raises(InvalidProcessingStateError, match="content changed"):
+        NisarSensor().read_slc_window(admitted, (slice(0, 2), slice(0, 2)))
     assert dataset.selections == []
 
 

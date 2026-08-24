@@ -9,6 +9,7 @@ downstream interferometric products.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -33,6 +34,24 @@ if TYPE_CHECKING:
     from faninsar.processing.stack.provider import SceneProductionCallback
 
 logger = setup_logger(__name__)
+
+
+def _source_digest(path: Path) -> tuple[str, str]:
+    """Return canonical source id and content SHA-256 for one RSLC path."""
+    source_id = str(path.expanduser().resolve(strict=False))
+    digest = hashlib.sha256()
+    try:
+        with Path(source_id).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except (FileNotFoundError, NotADirectoryError):
+        digest.update(f"missing:{source_id}".encode())
+    except OSError as error:
+        logger.exception("NISAR source cannot be snapshotted: %s", source_id)
+        reject_invalid_state(
+            f"NISAR source cannot be snapshotted: {source_id}: {error}"
+        )
+    return source_id, digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,8 +95,7 @@ def _window(value: object, shape: tuple[int, int]) -> tuple[int, int, int, int]:
     except (TypeError, ValueError) as error:
         reject_invalid_state(f"NISAR provider window is not integral: {error}")
     if not (
-        0 <= row_start < row_stop <= shape[0]
-        and 0 <= col_start < col_stop <= shape[1]
+        0 <= row_start < row_stop <= shape[0] and 0 <= col_start < col_stop <= shape[1]
     ):
         reject_invalid_state(
             f"NISAR provider window {(row_start, row_stop, col_start, col_stop)} "
@@ -140,8 +158,7 @@ def _shared_radar_window(
         / secondary.azimuth_time_interval_s
     )
     secondary_col_start = round(
-        (target_range - secondary.starting_slant_range_m)
-        / secondary.range_spacing_m
+        (target_range - secondary.starting_slant_range_m) / secondary.range_spacing_m
     )
     rows = row_stop - row_start
     cols = col_stop - col_start
@@ -151,13 +168,12 @@ def _shared_radar_window(
         secondary_col_start,
         secondary_col_start + cols,
     )
-    if (
-        0 <= secondary_bounds[0] < secondary_bounds[1] <= secondary.shape[0]
-        and 0 <= secondary_bounds[2] < secondary_bounds[3] <= secondary.shape[1]
-    ):
-        return secondary_bounds
     if reference_product is None or secondary_product is None:
+        # Explicit degraded mode for callers that only have grid metadata.
+        # A normalized NISAR pair always supplies products and therefore uses
+        # the physical geometry seam below, even when this seed is in bounds.
         _window(secondary_bounds, secondary.shape)
+        return secondary_bounds
     return _geometry_shared_radar_window(
         reference_product,
         secondary_product,
@@ -215,19 +231,15 @@ def _geometry_shared_radar_window(
         secondary_model,
         ground.latitude_deg,
         ground.longitude_deg,
-        0.0,
+        ground.height_m,
         device=device,
     )
     if not bool(np.asarray(mapped.converged).reshape(-1)[0]):
         reject_invalid_state("NISAR shared crop target did not converge in geo2rdr")
     rows = row_stop - row_start
     cols = col_stop - col_start
-    secondary_row_start = (
-        round(float(mapped.azimuth_index.reshape(-1)[0])) - rows // 2
-    )
-    secondary_col_start = (
-        round(float(mapped.range_index.reshape(-1)[0])) - cols // 2
-    )
+    secondary_row_start = round(float(mapped.azimuth_index.reshape(-1)[0])) - rows // 2
+    secondary_col_start = round(float(mapped.range_index.reshape(-1)[0])) - cols // 2
     secondary_row_start = min(
         max(secondary_row_start, 0), secondary_product.grid.shape[0] - rows
     )
@@ -312,6 +324,9 @@ def make_nisar_scene_provider(
 
     """
     path_dates = {Path(path): date_id for date_id, path in lineage.items()}
+    admitted_sources = {
+        date_id: _source_digest(Path(path)) for date_id, path in lineage.items()
+    }
 
     def produce_pair(
         reference_path: Path,
@@ -326,6 +341,15 @@ def make_nisar_scene_provider(
             reject_invalid_state("NISAR provider received an unadmitted source path")
         reference_product = products[reference_date]
         secondary_product = products[secondary_date]
+        for date_id, source_path in (
+            (reference_date, reference_path),
+            (secondary_date, secondary_path),
+        ):
+            current = _source_digest(Path(source_path))
+            if current != admitted_sources[date_id]:
+                reject_invalid_state(
+                    "NISAR RSLC source path or content changed after admission"
+                )
         if not isinstance(reference_product.grid, RadarGrid) or not isinstance(
             secondary_product.grid, RadarGrid
         ):
@@ -426,8 +450,22 @@ def make_nisar_scene_provider(
             wavelength_m=reference_product.grid.wavelength_m,
             grid_identity=grid_identity,
             scientific_lineage=(
-                {"stage": "nisar_rslc_window", "source": str(reference_path)},
-                {"stage": "nisar_rslc_window", "source": str(secondary_path)},
+                {
+                    "stage": "nisar_rslc_window",
+                    "source": str(reference_path),
+                    "source_id": admitted_sources[reference_date][0],
+                    "source_digest": admitted_sources[reference_date][1],
+                    "channel": f"{channel[0]}/{channel[1]}",
+                    "lineage": "reference",
+                },
+                {
+                    "stage": "nisar_rslc_window",
+                    "source": str(secondary_path),
+                    "source_id": admitted_sources[secondary_date][0],
+                    "source_digest": admitted_sources[secondary_date][1],
+                    "channel": f"{channel[0]}/{channel[1]}",
+                    "lineage": "secondary",
+                },
             ),
         )
         return NisarPairState(
