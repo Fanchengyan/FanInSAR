@@ -28,6 +28,7 @@ from faninsar.processing.readers import (
     ValidSampleMask,
 )
 from faninsar.processing.stack import NISARStack
+from faninsar.processing.stack.provider import UnsupportedStackCapabilityError
 
 
 def _result(path: Path, date_id: str) -> SLCReadResult:
@@ -212,9 +213,51 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
     )
     stack = NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
 
-    with pytest.raises(NotImplementedError, match="NISAR RSLC Stack"):
+    def fail_if_safe_opened(_path: object) -> object:
+        pytest.fail("NISAR RSLC was routed to the SAFE opener")
+
+    monkeypatch.setattr(
+        "faninsar.processing.pipeline.production.open_safe_product",
+        fail_if_safe_opened,
+    )
+
+    with pytest.raises(UnsupportedStackCapabilityError, match="NISAR RSLC Stack"):
         stack.measure_misreg()
-    with pytest.raises(NotImplementedError, match="NISAR RSLC Stack"):
+    with pytest.raises(UnsupportedStackCapabilityError, match="NISAR RSLC Stack"):
         stack.coregister_scenes()
-    with pytest.raises(NotImplementedError, match="NISAR RSLC Stack"):
+    with pytest.raises(UnsupportedStackCapabilityError, match="NISAR RSLC Stack"):
         stack.form_interferograms()
+
+
+def test_nisar_scene_provider_exposes_named_fail_closed_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NISAR advertises unsupported scene production instead of S1 fallback."""
+    paths = tuple(
+        tmp_path / f"NISAR_RSLC_{date_id}.h5" for date_id in ("20240101", "20240113")
+    )
+    handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar.NisarSensor.open_product",
+        lambda _sensor, uri: handles[Path(uri)],
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
+        lambda _sensor, handle, **_: _result(
+            Path(handle.filename), Path(handle.filename).stem.rsplit("_", 1)[-1]
+        ),
+    )
+
+    stack = NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
+
+    assert stack.scene_provider is not None
+    with pytest.raises(
+        UnsupportedStackCapabilityError,
+        match="scene-production",
+    ):
+        stack.scene_provider(
+            paths[0],
+            paths[1],
+            output_dir=tmp_path / "pair",
+            options={},
+        )

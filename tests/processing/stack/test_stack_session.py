@@ -15,7 +15,7 @@ from faninsar.processing.interferometry.pair import (
     goldstein_filter,
 )
 from faninsar.processing.merge.grid import GeoGridSpec
-from faninsar.processing.stack import Stack, StackConfig
+from faninsar.processing.stack import Stack, StackConfig, StackSceneProvider
 from faninsar.processing.stack.activation import LocalActivationAuthority
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.ifg_store import (
@@ -179,6 +179,79 @@ def test_coregister_scenes_releases_prior_pair_before_next_date(
     stack.coregister_scenes()
 
     assert call_count == 2
+
+
+def test_s1_default_scene_dispatch_remains_run_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SAFE stacks without a provider retain the existing production call."""
+    stack = _stack_with_three_date_network(tmp_path)
+    calls: list[tuple[Path, Path, Path]] = []
+    expected = SimpleNamespace(esd_azimuth_shift_px=0.0)
+
+    def fake_run_pair(
+        reference_path: Path,
+        secondary_path: Path,
+        *,
+        output_dir: Path,
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        calls.append((reference_path, secondary_path, output_dir))
+        return expected
+
+    monkeypatch.setattr(
+        "faninsar.processing.pipeline.production.run_pair", fake_run_pair
+    )
+
+    result = stack._produce_pair(
+        stack.catalog.path_for(stack.master),
+        stack.catalog.path_for("20240113"),
+        output_dir=tmp_path / "pair",
+        multilook=(1, 1),
+    )
+
+    assert result is expected
+    assert calls == [
+        (
+            stack.catalog.path_for(stack.master),
+            stack.catalog.path_for("20240113"),
+            tmp_path / "pair",
+        )
+    ]
+
+
+def test_stack_scene_provider_receives_normalized_callback_arguments(
+    tmp_path: Path,
+) -> None:
+    """A mission provider receives paths, output, and one options mapping."""
+    stack = _stack_with_three_date_network(tmp_path)
+    calls: list[tuple[Path, Path, Path, dict[str, object]]] = []
+
+    def produce_pair(
+        reference_path: Path,
+        secondary_path: Path,
+        *,
+        output_dir: Path,
+        options: dict[str, object],
+    ) -> SimpleNamespace:
+        calls.append((reference_path, secondary_path, output_dir, options))
+        return SimpleNamespace()
+
+    stack.scene_provider = StackSceneProvider(produce_pair=produce_pair, name="TEST")
+    result = stack._produce_pair(
+        stack.catalog.path_for(stack.master),
+        stack.catalog.path_for("20240113"),
+        output_dir=tmp_path / "pair",
+        multilook=(1, 1),
+    )
+
+    assert isinstance(result, SimpleNamespace)
+    assert calls[0][:3] == (
+        stack.catalog.path_for(stack.master),
+        stack.catalog.path_for("20240113"),
+        tmp_path / "pair",
+    )
+    assert calls[0][3] == {"multilook": (1, 1)}
 
 
 def test_stack_config_multilook_normalize(tmp_path: Path) -> None:
@@ -1066,7 +1139,12 @@ def test_stack_dask_persist_stage_reclaim_uses_client_run(
     remote_calls: list[tuple[object, tuple[object, ...]]] = []
 
     class FakeClient:
-        def run(self, func: object, *args: object, **_kwargs: object) -> dict[str, bool]:
+        def run(
+            self,
+            func: object,
+            *args: object,
+            **_kwargs: object,
+        ) -> dict[str, bool]:
             remote_calls.append((func, args))
             return {"gpu-worker": func(*args)}
 

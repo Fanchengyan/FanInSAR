@@ -13,6 +13,10 @@ from faninsar.logging import setup_logger
 from faninsar.missions.nisar import NisarSensor, _normalize_channel
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.config import ActivationMode, StackConfig
+from faninsar.processing.stack.provider import (
+    unavailable_scene_provider,
+    unsupported_stack_capability,
+)
 from faninsar.processing.stack.session import Stack, _pairs_from_factory
 
 if TYPE_CHECKING:
@@ -249,6 +253,14 @@ class NISARStack(Stack):
             misreg_pairs=network_pairs,
             master=master,
             acquisitions=Acquisition(list(dates)),
+            scene_provider=unavailable_scene_provider(
+                "NISAR RSLC",
+                capability="scene-production",
+                reason=(
+                    "the NISAR RSLC provider has not admitted normalized scene "
+                    "production"
+                ),
+            ),
         )
         stack._nisar_sensor = sensor
         stack._nisar_handles = handles
@@ -285,13 +297,9 @@ class NISARStack(Stack):
 
     def _reject_nisar_promotion(self, stage: str) -> None:
         """Reject a stage that has no NISAR provider implementation yet."""
-        message = (
-            f"NISAR RSLC Stack {stage} is unsupported: the shared Stack "
-            "provider seam has not admitted NISAR geometry/coregistration "
-            "inputs yet"
-        )
-        logger.error(message)
-        raise NotImplementedError(message)
+        mission = "NISAR RSLC"
+        error = unsupported_stack_capability(mission, stage)
+        raise error
 
     def measure_misreg(self, **kwargs: Any) -> Self:
         """Reject NISAR misregistration until a provider is admitted."""

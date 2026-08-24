@@ -60,6 +60,7 @@ if TYPE_CHECKING:
         InterferogramArtifactStore,
         UnwrappedArtifact,
     )
+    from faninsar.processing.stack.provider import StackSceneProvider
     from faninsar.processing.stack.stack_generation import StackResultGeneration
     from faninsar.processing.timeseries.inversion import TimeSeriesResult
     from faninsar.processing.unwrap.quality import StackQualityCriteria
@@ -165,6 +166,7 @@ class Stack:
     master: str
     acquisitions: Acquisition | None = None
     dask_client: Any | None = field(default=None, repr=False)
+    scene_provider: StackSceneProvider | None = field(default=None, repr=False)
     arcs: list[MisregArc] = field(default_factory=list)
     date_misreg: DateMisreg | None = None
     coreg_paths: dict[str, Path] = field(default_factory=dict)
@@ -415,6 +417,38 @@ class Stack:
         except Exception:
             logger.exception("reclaim_checkpoint failed (kind=%s)", kind)
 
+    def _produce_pair(
+        self,
+        reference_path: Path,
+        secondary_path: Path,
+        *,
+        output_dir: Path,
+        **options: Any,
+    ) -> Any:
+        """Produce one pair through the admitted mission provider.
+
+        The default ``None`` provider intentionally retains the existing S1
+        production call and its monkeypatch/runtime behavior.  Mission
+        adapters may supply a normalized callback; a provider without one
+        fails closed through :class:`UnsupportedStackCapabilityError` rather
+        than allowing a non-SAFE path to reach ``open_safe_product``.
+        """
+        if self.scene_provider is None:
+            from faninsar.processing.pipeline.production import run_pair
+
+            return run_pair(
+                reference_path,
+                secondary_path,
+                output_dir=output_dir,
+                **options,
+            )
+        return self.scene_provider(
+            reference_path,
+            secondary_path,
+            output_dir=output_dir,
+            options=options,
+        )
+
     def release_accelerator(self) -> None:
         """Explicitly return unused accelerator slabs before yielding the GPU."""
         self._reclaim_accelerator("explicit")
@@ -576,8 +610,6 @@ class Stack:
             logger.info("Loaded %s misreg arcs from cache", len(self.arcs))
             return self
 
-        from faninsar.processing.pipeline.production import run_pair
-
         arcs: list[MisregArc] = []
         for primary, secondary in _iter_pair_dates(use_pairs):
             if primary not in self.catalog.paths or secondary not in self.catalog.paths:
@@ -585,7 +617,7 @@ class Stack:
             out = self.config.work_dir / "misreg" / "measure" / f"{primary}_{secondary}"
             esd_on = method != "auto" or True
             # Measure-only: coreg + ESD/Ampcor; no unwrap; no IFG write required.
-            state = run_pair(
+            state = self._produce_pair(
                 self.catalog.path_for(primary),
                 self.catalog.path_for(secondary),
                 output_dir=out,
@@ -678,8 +710,6 @@ class Stack:
         This stage does **not** form interferograms.
         """
         self._ensure_prepared()
-        from faninsar.processing.pipeline.production import run_pair
-
         target_dates = (
             list(dates)
             if dates is not None
@@ -759,7 +789,7 @@ class Stack:
             geo_work = self.config.extra.get("geo_work_dir")
             if geo_work is not None:
                 pair_kwargs["geo_work_dir"] = Path(geo_work) / date_id
-            state = run_pair(
+            state = self._produce_pair(
                 master_path,
                 self.catalog.path_for(date_id),
                 output_dir=out,
