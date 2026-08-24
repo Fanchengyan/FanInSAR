@@ -51,6 +51,27 @@ def install_fake_reader(
     monkeypatch.setitem(sys.modules, "nisar.products.readers", readers)
 
 
+def admit_fake_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    handle: object,
+) -> object:
+    """Attach an explicit trusted admission snapshot to a reader fake."""
+    source = tmp_path / f"fake-rslc-{id(handle)}.h5"
+    source.write_bytes(b"reader-fake")
+    if getattr(handle, "filename", None) is None:
+        handle.filename = str(source)
+    install_fake_reader(monkeypatch, handle, [])
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    return NisarSensor().open_product(
+        str(source),
+        admission={
+            "trusted_roots": [tmp_path],
+            "expected_sha256": {str(source): digest},
+        },
+    )
+
+
 def test_nisar_sensor_instantiation() -> None:
     """Register and instantiate the NISAR sensor adapter."""
     assert NisarSensor().name == "nisar"
@@ -68,6 +89,7 @@ def test_nisar_open_product_reports_optional_dependency(
 
 
 def test_nisar_open_product_uses_optional_reader_mapping(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Resolve the optional factory only when an RSLC is explicitly opened."""
@@ -75,10 +97,19 @@ def test_nisar_open_product_uses_optional_reader_mapping(
     handle = SimpleNamespace(getSlcDatasetAsNativeComplex=lambda *_args: object())
     install_fake_reader(monkeypatch, handle, calls)
 
-    result = NisarSensor().open_product("/tmp/scene.h5")
+    source = tmp_path / "scene.h5"
+    source.write_bytes(b"reader-fake")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    result = NisarSensor().open_product(
+        str(source),
+        admission={
+            "trusted_roots": [tmp_path],
+            "expected_sha256": {str(source): digest},
+        },
+    )
 
     assert result is handle
-    assert calls == ["/tmp/scene.h5"]
+    assert calls == [str(source)]
 
 
 def test_nisar_open_product_rejects_existing_source_without_admission(
@@ -96,7 +127,9 @@ def test_nisar_open_product_rejects_existing_source_without_admission(
     assert calls == []
 
 
-def test_nisar_window_read_defaults_to_b_hh_and_stays_lazy() -> None:
+def test_nisar_window_read_defaults_to_b_hh_and_stays_lazy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Read precisely one B/HH selection instead of materializing the dataset."""
     samples = (
         np.arange(48, dtype=np.float32).reshape(6, 8)
@@ -110,7 +143,8 @@ def test_nisar_window_read_defaults_to_b_hh_and_stays_lazy() -> None:
         )
     )
 
-    result = NisarSensor().read_slc_window(handle, (slice(1, 4), slice(2, 6)))
+    admitted = admit_fake_handle(tmp_path, monkeypatch, handle)
+    result = NisarSensor().read_slc_window(admitted, (slice(1, 4), slice(2, 6)))
 
     np.testing.assert_array_equal(result, samples[1:4, 2:6])
     assert calls == [("B", "HH")]
@@ -138,7 +172,9 @@ def test_nisar_window_read_rejects_unadmitted_existing_source_before_native_acce
     assert calls == []
 
 
-def test_nisar_window_read_normalizes_channel_aliases() -> None:
+def test_nisar_window_read_normalizes_channel_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Accept compatibility aliases while passing normalized identifiers."""
     dataset = FakeComplexDataset(np.ones((4, 4), dtype=np.complex64))
     calls: list[tuple[str, str]] = []
@@ -148,8 +184,9 @@ def test_nisar_window_read_normalizes_channel_aliases() -> None:
         )
     )
 
+    admitted = admit_fake_handle(tmp_path, monkeypatch, handle)
     NisarSensor().read_slc_window(
-        handle,
+        admitted,
         (slice(0, 2), slice(0, 2)),
         freq=" b ",
         pol=" hh ",
@@ -158,22 +195,28 @@ def test_nisar_window_read_normalizes_channel_aliases() -> None:
     assert calls == [("B", "HH")]
 
 
-def test_nisar_window_read_rejects_real_samples() -> None:
+def test_nisar_window_read_rejects_real_samples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Reject a reader response that loses native complex sample semantics."""
     dataset = FakeComplexDataset(np.ones((4, 4), dtype=np.float32))
     handle = SimpleNamespace(getSlcDatasetAsNativeComplex=lambda *_args: dataset)
 
+    admitted = admit_fake_handle(tmp_path, monkeypatch, handle)
     with pytest.raises(ValueError, match="must retain complex"):
-        NisarSensor().read_slc_window(handle, (slice(0, 2), slice(0, 2)))
+        NisarSensor().read_slc_window(admitted, (slice(0, 2), slice(0, 2)))
 
 
-def test_nisar_window_read_rejects_out_of_bounds_window() -> None:
+def test_nisar_window_read_rejects_out_of_bounds_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Reject out-of-bounds native selections before accessing the dataset."""
     dataset = FakeComplexDataset(np.ones((4, 4), dtype=np.complex64))
     handle = SimpleNamespace(getSlcDatasetAsNativeComplex=lambda *_args: dataset)
 
+    admitted = admit_fake_handle(tmp_path, monkeypatch, handle)
     with pytest.raises(ValueError, match="selection out of bounds"):
-        NisarSensor().read_slc_window(handle, (slice(0, 5), slice(0, 2)))
+        NisarSensor().read_slc_window(admitted, (slice(0, 5), slice(0, 2)))
 
     assert dataset.selections == []
 
@@ -271,6 +314,40 @@ def test_nisar_product_rejects_unadmitted_existing_source_before_native_access(
 
     with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
         NisarSensor().to_slc_product(handle)
+
+    assert calls == []
+
+
+def test_nisar_product_rejects_source_less_compatible_handle_before_native_access() -> (
+    None
+):
+    """A metadata-compatible source-less fake cannot bypass admission."""
+    calls: list[tuple[str, str]] = []
+    handle = SimpleNamespace(
+        frequencies=("B",),
+        polarizations={"B": ("HH",)},
+        getSlcDatasetAsNativeComplex=lambda frequency, polarization: (
+            calls.append((frequency, polarization)) or object()
+        ),
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
+        NisarSensor().to_slc_product(handle)
+
+    assert calls == []
+
+
+def test_nisar_window_read_rejects_source_less_handle_before_native_access() -> None:
+    """A source-less compatible fake cannot reach the native dataset getter."""
+    calls: list[tuple[str, str]] = []
+    handle = SimpleNamespace(
+        getSlcDatasetAsNativeComplex=lambda frequency, polarization: (
+            calls.append((frequency, polarization)) or object()
+        )
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
+        NisarSensor().read_slc_window(handle, (slice(0, 1), slice(0, 1)))
 
     assert calls == []
 

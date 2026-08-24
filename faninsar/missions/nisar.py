@@ -526,16 +526,16 @@ def _handle_admission(handle: Any) -> _AdmissionSnapshot | None:
 
 def _validate_admission(
     handle: Any, *, expected_source: str | Path | None = None
-) -> _AdmissionSnapshot | None:
+) -> _AdmissionSnapshot:
     """Reject a changed path or source byte stream before native access."""
     snapshot = _handle_admission(handle)
-    handle_source = _value(handle, "filename", "file_name", "source_path")
     if snapshot is None:
-        if handle_source is not None or expected_source is not None:
-            _admission_error(
-                "NISAR RSLC handle has a source path but no explicit admission snapshot"
-            )
-        return None
+        _admission_error(
+            "NISAR RSLC handle has no explicit admission snapshot; "
+            "source-less or compatible handles cannot bypass admission"
+        )
+
+    handle_source = _value(handle, "filename", "file_name", "source_path")
 
     if handle_source is not None:
         current_id = str(Path(handle_source).expanduser().resolve(strict=False))
@@ -854,8 +854,8 @@ class NisarSensor(Sensor):
         uri : str
             Local, already-admitted RSLC path supplied by the caller.
         admission, admission_policy : NisarAdmissionPolicy or mapping, optional
-            Explicit trusted pre-open source policy.  If omitted, the legacy
-            lightweight reader-fake semantics are retained.
+            Explicit trusted pre-open source policy.  Existing sources must
+            provide trusted roots and an expected digest inventory.
         **kwargs : Any
             Optional reader-specific construction arguments.  Scalar admission
             options (``trusted_roots``, ``expected_sha256``, and
@@ -1010,7 +1010,9 @@ class NisarSensor(Sensor):
             )
         grid = _radar_grid(handle, frequency, shape)
         resolved_source = str(
-            source_path or _value(handle, "filename", "file_name", "source_path") or ""
+            source_path
+            or _value(handle, "filename", "file_name", "source_path")
+            or snapshot.source_id
         )
         if not resolved_source:
             raise InvalidProcessingStateError("NISAR RSLC handle has no source path")
@@ -1039,15 +1041,15 @@ class NisarSensor(Sensor):
                 "product": "RSLC",
                 "frequency": frequency,
                 "polarization": polarization,
-                "source_id": snapshot.source_id if snapshot else resolved_source,
-                "source_digest": snapshot.source_digest if snapshot else "",
-                "source_size_bytes": snapshot.source_size_bytes if snapshot else 0,
+                "source_id": snapshot.source_id,
+                "source_digest": snapshot.source_digest,
+                "source_size_bytes": snapshot.source_size_bytes,
                 "admission_policy": (
                     snapshot.policy.as_metadata()
-                    if snapshot is not None and snapshot.policy is not None
+                    if snapshot.policy is not None
                     else None
                 ),
-                "lineage": snapshot.source_id if snapshot else resolved_source,
+                "lineage": snapshot.source_id,
             },
         )
 
