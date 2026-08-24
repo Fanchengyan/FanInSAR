@@ -5,13 +5,18 @@
 from __future__ import annotations
 
 import sys
+import hashlib
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
-from faninsar.missions.nisar import NisarSensor
+from faninsar.missions.nisar import (
+    NisarAdmissionPolicy,
+    NisarSensor,
+    admit_nisar_source,
+)
 from faninsar.processing.errors import InvalidProcessingStateError
 
 if TYPE_CHECKING:
@@ -212,3 +217,75 @@ def test_nisar_product_rejects_conflicting_channel_aliases() -> None:
 
     with pytest.raises(ValueError, match="different channels"):
         NisarSensor().to_slc_product(handle, frequency="A", freq="B")
+
+
+def test_nisar_trusted_admission_enforces_root_inventory_and_size(
+    tmp_path: Path,
+) -> None:
+    """Trusted pre-open admission records policy and exact source digest."""
+    source = tmp_path / "scene.h5"
+    source.write_bytes(b"trusted-rslc")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    metadata = admit_nisar_source(
+        source,
+        admission={
+            "trusted_roots": [tmp_path],
+            "expected_sha256": {str(source): digest},
+            "max_size_bytes": source.stat().st_size,
+        },
+    )
+
+    assert metadata["source_id"] == str(source.resolve())
+    assert metadata["source_digest"] == digest
+    assert metadata["policy"]["no_follow"] is True  # type: ignore[index]
+    assert metadata["policy"]["max_size_bytes"] == source.stat().st_size  # type: ignore[index]
+
+    with pytest.raises(InvalidProcessingStateError, match="SHA-256 mismatch"):
+        admit_nisar_source(
+            source,
+            admission=NisarAdmissionPolicy(
+                trusted_roots=(tmp_path,),
+                expected_sha256={str(source): "0" * 64},
+            ),
+        )
+    with pytest.raises(InvalidProcessingStateError, match="max_size_bytes"):
+        admit_nisar_source(
+            source,
+            admission={"trusted_roots": [tmp_path], "max_size_bytes": 1},
+        )
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://user:secret@example.test/scene.h5",
+        "s3://bucket/scene.h5",
+        "file:///tmp/scene.h5",
+    ],
+)
+def test_nisar_trusted_admission_rejects_remote_and_credential_uris(uri: str) -> None:
+    """The NISAR reader never receives a remote or credential-bearing URI."""
+    with pytest.raises(InvalidProcessingStateError, match="remote or credential URI"):
+        admit_nisar_source(uri, admission={"trusted_roots": ["/tmp"]})
+
+
+def test_nisar_trusted_admission_rejects_symlink_and_external_hdf5_link(
+    tmp_path: Path,
+) -> None:
+    """No-follow admission rejects symlink paths and HDF5 external links."""
+    source = tmp_path / "scene.h5"
+    source.write_bytes(b"not-hdf5")
+    link = tmp_path / "scene-link.h5"
+    link.symlink_to(source)
+    with pytest.raises(InvalidProcessingStateError, match="symbolic link"):
+        admit_nisar_source(link, admission={"trusted_roots": [tmp_path]})
+
+    h5py = pytest.importorskip("h5py")
+    external = tmp_path / "external.h5"
+    with h5py.File(external, "w") as target:
+        target["value"] = [1]
+    with h5py.File(source, "w") as target:
+        target["external"] = h5py.ExternalLink(external.name, "/value")
+    with pytest.raises(InvalidProcessingStateError, match="ExternalLink"):
+        admit_nisar_source(source, admission={"trusted_roots": [tmp_path]})

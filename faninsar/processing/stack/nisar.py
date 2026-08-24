@@ -158,12 +158,27 @@ class NISARStack(Stack):
             logger.error(message)
             raise ValueError(message)
 
+        extra = dict(config_kwargs.pop("extra", {}) or {})
+        configured_admission = config_kwargs.pop("nisar_admission", None)
+        if configured_admission is None:
+            configured_admission = config_kwargs.pop("admission", None)
+        if configured_admission is None:
+            configured_admission = extra.get(
+                "nisar_admission", extra.get("admission_policy")
+            )
         sensor = NisarSensor()
         handles: dict[Path, Any] = {}
         results: dict[str, SLCReadResult] = {}
         lineage: dict[str, str] = {}
+        admission_lineage: dict[str, dict[str, object]] = {}
         for path in source_paths:
-            handle = sensor.open_product(str(path))
+            if configured_admission is None:
+                handle = sensor.open_product(str(path))
+            else:
+                handle = sensor.open_product(
+                    str(path),
+                    admission=configured_admission,
+                )
             result = sensor.to_slc_product(
                 handle,
                 frequency=admitted_frequency,
@@ -214,6 +229,18 @@ class NISARStack(Stack):
             handles[path] = handle
             results[acquisition_id] = result
             lineage[acquisition_id] = str(path)
+            metadata = sensor.admission_metadata(handle)
+            if metadata is None:
+                native = result.mission_native
+                if native.get("source_id") and native.get("source_digest"):
+                    metadata = {
+                        "source_id": native["source_id"],
+                        "source_digest": native["source_digest"],
+                        "source_size_bytes": native.get("source_size_bytes", 0),
+                        "policy": native.get("admission_policy"),
+                    }
+            if metadata is not None:
+                admission_lineage[acquisition_id] = metadata
 
         dates = tuple(sorted(results))
         catalog = SceneCatalog(
@@ -230,7 +257,6 @@ class NISARStack(Stack):
             max_interval=misreg_max_interval,
             max_days=misreg_max_days,
         )
-        extra = dict(config_kwargs.pop("extra", {}) or {})
         extra.update(
             {
                 "mission": "NISAR",
@@ -238,6 +264,7 @@ class NISARStack(Stack):
                 "frequency": admitted_frequency,
                 "polarization": admitted_polarization,
                 "source_lineage": dict(lineage),
+                "source_admission": dict(admission_lineage),
             }
         )
         config = StackConfig(
@@ -256,6 +283,7 @@ class NISARStack(Stack):
             master=master,
             channel=(admitted_frequency, admitted_polarization),
             configured_window=configured_window,
+            admission_lineage=admission_lineage,
         )
         stack = cls(
             catalog=catalog,
@@ -273,6 +301,7 @@ class NISARStack(Stack):
         stack._nisar_handles = handles
         stack._nisar_results = results
         stack._nisar_lineage = lineage
+        stack._nisar_admission = admission_lineage
         stack._nisar_channel = (
             admitted_frequency,
             admitted_polarization,
@@ -288,6 +317,11 @@ class NISARStack(Stack):
     def source_lineage(self) -> Mapping[str, str]:
         """Return date-to-source lineage for the admitted RSLCs."""
         return dict(self._nisar_lineage)
+
+    @property
+    def source_admission(self) -> Mapping[str, Mapping[str, object]]:
+        """Return digest, source id, and trusted-open policy by acquisition."""
+        return {date_id: dict(item) for date_id, item in self._nisar_admission.items()}
 
     @property
     def products(self) -> Mapping[str, SLCProduct]:

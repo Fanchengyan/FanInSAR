@@ -120,6 +120,41 @@ def test_nisar_stack_builds_shared_catalog_and_pair_topology(
     )
 
 
+def test_nisar_stack_passes_explicit_admission_metadata_to_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stack configuration cannot silently bypass trusted source admission."""
+    paths = tuple(
+        tmp_path / f"NISAR_RSLC_{date_id}.h5" for date_id in ("20240101", "20240113")
+    )
+    handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
+    admissions: list[object] = []
+
+    def open_product(_sensor: object, uri: str, **kwargs: object) -> object:
+        admissions.append(kwargs.get("admission"))
+        return handles[Path(uri)]
+
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar.NisarSensor.open_product", open_product
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
+        lambda _sensor, handle, **_: _result(
+            Path(handle.filename), Path(handle.filename).stem.rsplit("_", 1)[-1]
+        ),
+    )
+    policy = {"trusted_roots": [tmp_path], "max_size_bytes": 1024}
+
+    stack = NISARStack.from_rslc(
+        paths,
+        work_dir=tmp_path / "work",
+        extra={"nisar_admission": policy},
+    )
+
+    assert admissions == [policy, policy]
+    assert stack.config.extra["source_admission"] == {}
+
+
 def test_nisar_stack_rejects_duplicate_acquisitions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
