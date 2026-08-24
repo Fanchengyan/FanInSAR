@@ -887,6 +887,23 @@ class NisarSensor(Sensor):
                 )
         policy = _coerce_admission_policy(configured_policy)
         local_uri = _local_source_path(uri)
+        if os.path.lexists(local_uri) and policy is None:
+            _admission_error(
+                "NISAR open_product requires explicit admission policy with "
+                "trusted_roots and expected_sha256 inventory for an existing "
+                f"RSLC source: {local_uri}"
+            )
+        if os.path.lexists(local_uri) and policy is not None:
+            if not policy.trusted_roots:
+                _admission_error(
+                    "NISAR open_product requires trusted_roots for an existing "
+                    f"RSLC source: {local_uri}"
+                )
+            if not policy.expected_sha256:
+                _admission_error(
+                    "NISAR open_product requires expected_sha256 inventory for "
+                    f"an existing RSLC source: {local_uri}"
+                )
         # Capture the source identity before importing/opening the optional
         # reader. Native readers are allowed to cache metadata, so this is the
         # admission boundary rather than a post-open diagnostic.

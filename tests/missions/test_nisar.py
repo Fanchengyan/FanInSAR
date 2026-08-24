@@ -81,6 +81,21 @@ def test_nisar_open_product_uses_optional_reader_mapping(
     assert calls == ["/tmp/scene.h5"]
 
 
+def test_nisar_open_product_rejects_existing_source_without_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Require trusted admission before opening an existing local RSLC."""
+    source = tmp_path / "scene.h5"
+    source.write_bytes(b"rslc")
+    calls: list[str] = []
+    install_fake_reader(monkeypatch, SimpleNamespace(), calls)
+
+    with pytest.raises(InvalidProcessingStateError, match="explicit admission"):
+        NisarSensor().open_product(str(source))
+
+    assert calls == []
+
+
 def test_nisar_window_read_defaults_to_b_hh_and_stays_lazy() -> None:
     """Read precisely one B/HH selection instead of materializing the dataset."""
     samples = (
@@ -155,10 +170,16 @@ def test_nisar_admission_rejects_content_mutation_before_window_read(
     )
     calls: list[str] = []
     install_fake_reader(monkeypatch, handle, calls)
-    admitted = NisarSensor().open_product(str(source))
+    admitted = NisarSensor().open_product(
+        str(source),
+        admission={
+            "trusted_roots": [tmp_path],
+            "expected_sha256": {str(source): hashlib.sha256(b"rslc-v1").hexdigest()},
+        },
+    )
     source.write_bytes(b"rslc-v2")
 
-    with pytest.raises(InvalidProcessingStateError, match="content changed"):
+    with pytest.raises(InvalidProcessingStateError, match="SHA-256 mismatch"):
         NisarSensor().read_slc_window(admitted, (slice(0, 2), slice(0, 2)))
     assert dataset.selections == []
 
