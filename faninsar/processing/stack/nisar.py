@@ -13,9 +13,11 @@ from faninsar.logging import setup_logger
 from faninsar.missions.nisar import NisarSensor, _normalize_channel
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.config import ActivationMode, StackConfig
+from faninsar.processing.stack.nisar_provider import (
+    make_nisar_scene_provider,
+)
 from faninsar.processing.stack.provider import (
-    unavailable_scene_provider,
-    unsupported_stack_capability,
+    StackSceneProvider,
 )
 from faninsar.processing.stack.session import Stack, _pairs_from_factory
 
@@ -74,13 +76,12 @@ def _reference_id(value: object, dates: Sequence[str]) -> str:
 
 
 class NISARStack(Stack):
-    """Metadata-only NISAR RSLC Stack with explicit B/HH channel semantics.
+    """NISAR RSLC Stack with explicit B/HH channel semantics.
 
     The adapter owns optional-reader opening, normalized SLC metadata, source
-    lineage, and pair topology.  Geometry, flattening, multilooking,
-    coherence, and geocoding remain the shared Stack pipeline's responsibility;
-    that pipeline currently has no NISAR provider and therefore fails closed
-    at the corresponding stage.
+    lineage, pair topology, and bounded source-scene publication. Geometry,
+    flattening, multilooking, coherence, and geocoding remain the shared Stack
+    pipeline's responsibility.
     """
 
     @classmethod
@@ -246,6 +247,16 @@ class NISARStack(Stack):
             extra=extra,
             **config_kwargs,
         )
+        configured_window = extra.get("nisar_window", extra.get("rslc_window"))
+        provider_callback = make_nisar_scene_provider(
+            sensor=sensor,
+            handles=handles,
+            products={date_id: item.product for date_id, item in results.items()},
+            lineage=lineage,
+            master=master,
+            channel=(admitted_frequency, admitted_polarization),
+            configured_window=configured_window,
+        )
         stack = cls(
             catalog=catalog,
             config=config,
@@ -253,13 +264,9 @@ class NISARStack(Stack):
             misreg_pairs=network_pairs,
             master=master,
             acquisitions=Acquisition(list(dates)),
-            scene_provider=unavailable_scene_provider(
-                "NISAR RSLC",
-                capability="scene-production",
-                reason=(
-                    "the NISAR RSLC provider has not admitted normalized scene "
-                    "production"
-                ),
+            scene_provider=StackSceneProvider(
+                name="NISAR RSLC",
+                produce_pair=provider_callback,
             ),
         )
         stack._nisar_sensor = sensor
@@ -294,27 +301,5 @@ class NISARStack(Stack):
             date_id: self._nisar_handles[Path(source)]
             for date_id, source in self._nisar_lineage.items()
         }
-
-    def _reject_nisar_promotion(self, stage: str) -> None:
-        """Reject a stage that has no NISAR provider implementation yet."""
-        mission = "NISAR RSLC"
-        error = unsupported_stack_capability(mission, stage)
-        raise error
-
-    def measure_misreg(self, **kwargs: Any) -> Self:
-        """Reject NISAR misregistration until a provider is admitted."""
-        del kwargs
-        self._reject_nisar_promotion("misregistration")
-
-    def coregister_scenes(self, **kwargs: Any) -> Self:
-        """Reject NISAR coregistration before Sentinel-1 dispatch."""
-        del kwargs
-        self._reject_nisar_promotion("coregistration")
-
-    def form_interferograms(self, **kwargs: Any) -> Self:
-        """Reject NISAR pair formation before unsupported processing."""
-        del kwargs
-        self._reject_nisar_promotion("interferogram formation")
-
 
 __all__ = ["NISARStack"]
