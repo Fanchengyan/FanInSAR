@@ -116,6 +116,10 @@ def _shared_radar_window(
     reference: RadarGrid,
     secondary: RadarGrid,
     reference_bounds: tuple[int, int, int, int],
+    *,
+    reference_product: SLCProduct | None = None,
+    secondary_product: SLCProduct | None = None,
+    device: str = "cpu",
 ) -> tuple[int, int, int, int]:
     """Map a reference crop onto the secondary radar grid physically.
 
@@ -147,8 +151,95 @@ def _shared_radar_window(
         secondary_col_start,
         secondary_col_start + cols,
     )
-    _window(secondary_bounds, secondary.shape)
-    return secondary_bounds
+    if (
+        0 <= secondary_bounds[0] < secondary_bounds[1] <= secondary.shape[0]
+        and 0 <= secondary_bounds[2] < secondary_bounds[3] <= secondary.shape[1]
+    ):
+        return secondary_bounds
+    if reference_product is None or secondary_product is None:
+        _window(secondary_bounds, secondary.shape)
+    return _geometry_shared_radar_window(
+        reference_product,
+        secondary_product,
+        reference_bounds,
+        device=device,
+    )
+
+
+def _geometry_shared_radar_window(
+    reference_product: SLCProduct,
+    secondary_product: SLCProduct,
+    reference_bounds: tuple[int, int, int, int],
+    *,
+    device: str,
+) -> tuple[int, int, int, int]:
+    """Map a bounded crop through the shared Radar→Geo→Radar geometry seam."""
+    from faninsar.processing.geometry import RadarGeometryModel
+    from faninsar.processing.geometry.dem import ConstantHeightDEM
+    from faninsar.processing.geometry.prepare_production import (
+        run_geo2rdr,
+        run_rdr2geo,
+    )
+
+    if not isinstance(reference_product.grid, RadarGrid) or not isinstance(
+        secondary_product.grid, RadarGrid
+    ):
+        reject_invalid_state("NISAR geometry crop mapping requires radar products")
+    row_start, row_stop, col_start, col_stop = reference_bounds
+    center_row = np.array(
+        [[(row_start + row_stop - 1) / 2.0]],
+        dtype=np.float64,
+    )
+    center_col = np.array(
+        [[(col_start + col_stop - 1) / 2.0]],
+        dtype=np.float64,
+    )
+    reference_model = RadarGeometryModel.from_radar_grid(
+        reference_product.grid,
+        reference_product.orbit,
+    )
+    secondary_model = RadarGeometryModel.from_radar_grid(
+        secondary_product.grid,
+        secondary_product.orbit,
+    )
+    ground = run_rdr2geo(
+        reference_model,
+        center_row,
+        center_col,
+        ConstantHeightDEM(0.0),
+        device=device,
+    )
+    if not bool(np.asarray(ground.converged).reshape(-1)[0]):
+        reject_invalid_state("NISAR reference crop target did not converge in rdr2geo")
+    mapped = run_geo2rdr(
+        secondary_model,
+        ground.latitude_deg,
+        ground.longitude_deg,
+        0.0,
+        device=device,
+    )
+    if not bool(np.asarray(mapped.converged).reshape(-1)[0]):
+        reject_invalid_state("NISAR shared crop target did not converge in geo2rdr")
+    rows = row_stop - row_start
+    cols = col_stop - col_start
+    secondary_row_start = (
+        round(float(mapped.azimuth_index.reshape(-1)[0])) - rows // 2
+    )
+    secondary_col_start = (
+        round(float(mapped.range_index.reshape(-1)[0])) - cols // 2
+    )
+    secondary_row_start = min(
+        max(secondary_row_start, 0), secondary_product.grid.shape[0] - rows
+    )
+    secondary_col_start = min(
+        max(secondary_col_start, 0), secondary_product.grid.shape[1] - cols
+    )
+    return (
+        secondary_row_start,
+        secondary_row_start + rows,
+        secondary_col_start,
+        secondary_col_start + cols,
+    )
 
 
 def _geo_target(value: object) -> GeoGrid:
@@ -250,6 +341,9 @@ def make_nisar_scene_provider(
             reference_product.grid,
             secondary_product.grid,
             bounds,
+            reference_product=reference_product,
+            secondary_product=secondary_product,
+            device=str(options.get("device", "cpu")),
         )
         row_start, row_stop, col_start, col_stop = bounds
         (
