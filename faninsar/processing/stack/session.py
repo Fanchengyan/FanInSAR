@@ -11,7 +11,9 @@ import gc
 import hashlib
 import json
 import os
+import platform
 import shutil
+import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from functools import wraps
 from pathlib import Path
@@ -464,7 +466,14 @@ class Stack:
 
         def source_identity(path: Path) -> dict[str, object]:
             resolved = path.resolve()
-            stat = resolved.stat()
+            try:
+                stat = resolved.stat()
+            except OSError:
+                # Configuration paths such as an optional cache directory do
+                # not have to exist yet.  Source paths still carry their full
+                # stat identity when available, while an absent path remains
+                # deterministic and is validated by the production call.
+                return {"path": str(resolved)}
             return {
                 "path": str(resolved),
                 "device": int(stat.st_dev),
@@ -524,6 +533,147 @@ class Stack:
                 return {"type": type(roi).__qualname__, "bounds": list(bounds)}
             return {"type": type(roi).__qualname__, "value": str(roi)}
 
+        def digest_payload(value: object) -> str:
+            """Hash one JSON-compatible identity payload."""
+            try:
+                encoded = json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()
+            except (TypeError, ValueError) as error:
+                reject_invalid_state(
+                    f"coregistration identity cannot be canonicalized: {error}"
+                )
+            return hashlib.sha256(encoded).hexdigest()
+
+        def object_metadata(value: object) -> dict[str, object]:
+            """Extract stable source metadata without serializing object reprs."""
+            metadata: dict[str, object] = {}
+            for name in (
+                "source_id",
+                "source_path",
+                "source_uri",
+                "uri",
+                "filename",
+                "path",
+                "content_digest",
+                "source_digest",
+                "content_hash",
+                "sha256",
+                "digest",
+            ):
+                item = getattr(value, name, None)
+                if item is not None and not callable(item):
+                    metadata[name] = semantic_value(item)
+            native = getattr(value, "mission_native", None)
+            if isinstance(native, dict):
+                for name, item in native.items():
+                    key = str(name).lower()
+                    if (
+                        "id" in key
+                        or "digest" in key
+                        or "hash" in key
+                        or key in {"source", "uri", "path"}
+                    ):
+                        metadata[f"mission_native:{name}"] = semantic_value(item)
+            samples = getattr(value, "samples", None)
+            if isinstance(samples, np.ndarray):
+                # Reader products are normally lazy.  For an in-memory source,
+                # include its bytes when reasonably sized so content changes
+                # cannot reuse a prior marker without forcing a full read of a
+                # large mission product.
+                if samples.nbytes <= 32 * 1024 * 1024:
+                    metadata["samples_sha256"] = hashlib.sha256(
+                        np.ascontiguousarray(samples).tobytes()
+                    ).hexdigest()
+                else:
+                    metadata["samples_descriptor"] = {
+                        "shape": list(samples.shape),
+                        "dtype": str(samples.dtype),
+                        "nbytes": int(samples.nbytes),
+                    }
+            for name in ("content", "source_content", "data", "raw_bytes"):
+                content = getattr(value, name, None)
+                if isinstance(content, (bytes, bytearray, memoryview)):
+                    metadata[f"{name}_sha256"] = hashlib.sha256(
+                        bytes(content)
+                    ).hexdigest()
+            return metadata
+
+        def source_object_identity(acquisition_id: str) -> dict[str, object] | None:
+            """Return provider-owned identity metadata for one source, if any."""
+            objects: list[object] = []
+            results = getattr(self, "_nisar_results", None)
+            if isinstance(results, dict) and acquisition_id in results:
+                objects.append(results[acquisition_id])
+                product = getattr(results[acquisition_id], "product", None)
+                if product is not None:
+                    objects.append(product)
+            handles = getattr(self, "_nisar_handles", None)
+            lineage = getattr(self, "_nisar_lineage", None)
+            if isinstance(handles, dict) and isinstance(lineage, dict):
+                source_path = lineage.get(acquisition_id)
+                if source_path is not None:
+                    handle = handles.get(Path(source_path))
+                    if handle is not None:
+                        objects.append(handle)
+            metadata: dict[str, object] = {}
+            for item in objects:
+                metadata.update(object_metadata(item))
+            return metadata or None
+
+        def provider_identity() -> dict[str, object] | None:
+            """Collect the optional mission-provider identity contract."""
+            provider = self.scene_provider
+            if provider is None:
+                return None
+            payload: dict[str, object] = {
+                "name": str(getattr(provider, "name", type(provider).__qualname__)),
+                "capability": str(
+                    getattr(
+                        provider,
+                        "capability",
+                        getattr(provider, "unsupported_capability", "scene-production"),
+                    )
+                ),
+            }
+            capabilities = getattr(provider, "capabilities", None)
+            if capabilities is not None:
+                payload["capabilities"] = semantic_value(capabilities)
+            callback = getattr(provider, "produce_pair", None)
+            if callback is not None:
+                payload["callback"] = {
+                    "module": getattr(
+                        callback,
+                        "__module__",
+                        type(callback).__module__,
+                    ),
+                    "qualname": getattr(
+                        callback,
+                        "__qualname__",
+                        type(callback).__qualname__,
+                    ),
+                }
+            # Providers may expose either a plain metadata mapping or a
+            # zero-argument identity hook.  This keeps Stack mission-neutral
+            # while allowing adapters to bind windows, channels, and source
+            # lineage without Stack knowing their implementation details.
+            for name in ("identity_payload", "identity_metadata"):
+                hook = getattr(provider, name, None)
+                if hook is None:
+                    continue
+                try:
+                    metadata = hook() if callable(hook) else hook
+                except Exception as error:
+                    logger.exception("Stack provider identity hook failed")
+                    reject_invalid_state(
+                        f"Stack provider identity hook failed: {error}"
+                    )
+                payload[name] = semantic_value(metadata)
+            return payload
+
         geo_grid = self.config.geo_grid
         geo_grid_identity = (
             None
@@ -538,6 +688,49 @@ class Stack:
         bursts = self.config.bursts
         if bursts is None and self.config.swaths:
             bursts = {swath: [0] for swath in self.config.swaths}
+        provider_payload = provider_identity()
+        provider_metadata: dict[str, object] = {}
+        if provider_payload is not None:
+            provider_metadata["provider"] = provider_payload
+            channel = getattr(self, "_nisar_channel", None)
+            if channel is None:
+                channel = getattr(self, "channel", None)
+            if channel is not None:
+                provider_metadata["channel"] = semantic_value(channel)
+            provider_metadata["stack_metadata"] = {
+                name: semantic_value(getattr(self, name))
+                for name in ("_nisar_channel", "_nisar_lineage")
+                if hasattr(self, name)
+            }
+            provider_metadata["source_objects"] = {
+                "master": source_object_identity(self.master),
+                "secondary": source_object_identity(date_id),
+            }
+        configuration = {
+            "coreg_mode": self.config.coreg_mode,
+            "coregistration_grid": self.config.coregistration_grid,
+            "esd_method": self.config.esd_method,
+            "multilook": list(self.config.multilook),
+            "goldstein_alpha": self.config.goldstein_alpha,
+            "executor": self.config.executor,
+            "device": self.config.device,
+            "invert_device": self.config.invert_device,
+            "control_spacing": self.config.control_spacing,
+            "n_jobs": self.config.n_jobs,
+            "swaths": list(self.config.swaths),
+            "bursts": semantic_value(bursts),
+            "extra": semantic_value(self.config.extra),
+        }
+        runtime = {
+            "python": platform.python_version(),
+            "implementation": sys.implementation.name,
+            "numpy": np.__version__,
+            "provider_callback": (
+                provider_payload.get("callback")
+                if provider_payload is not None
+                else None
+            ),
+        }
         payload = {
             "schema": "stack_coreg_request_v1",
             "master_id": self.master,
@@ -564,19 +757,12 @@ class Stack:
             "device": self.config.device,
             "misreg_az_px": float(misreg_az_px),
             "misreg_rg_px": float(misreg_rg_px),
+            "provider_metadata": provider_metadata,
+            "configuration": configuration,
+            "configuration_fingerprint": digest_payload(configuration),
+            "runtime_fingerprint": digest_payload(runtime),
         }
-        try:
-            encoded = json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode()
-        except (TypeError, ValueError) as error:
-            reject_invalid_state(
-                f"coregistration request cannot be canonicalized: {error}"
-            )
-        return hashlib.sha256(encoded).hexdigest()
+        return digest_payload(payload)
 
     @_reclaim_after_stage
     def measure_misreg(

@@ -130,6 +130,127 @@ def test_coreg_resume_identity_accepts_all_burst_token(tmp_path: Path) -> None:
     assert len(digest) == 64
 
 
+def test_coreg_resume_identity_binds_provider_window_channel_and_source_metadata(
+    tmp_path: Path,
+) -> None:
+    """Provider-owned window, channel, and source content invalidate reuse."""
+    stack = _stack_with_three_date_network(tmp_path)
+    stack.config.extra.update(
+        {
+            "mission": "NISAR",
+            "product": "RSLC",
+            "frequency": "B",
+            "polarization": "HH",
+            "nisar_window": (0, 16, 0, 16),
+        }
+    )
+    stack.scene_provider = SimpleNamespace(
+        name="NISAR RSLC",
+        capability="scene-production",
+        produce_pair=lambda *_args, **_kwargs: None,
+        identity_metadata={"provider_revision": "v1"},
+    )
+    stack._nisar_channel = ("B", "HH")
+    stack._nisar_results = {
+        stack.master: SimpleNamespace(source_id="master", content_digest="m1"),
+        "20240113": SimpleNamespace(source_id="secondary", content_digest="s1"),
+    }
+    initial = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+
+    stack.config.extra["nisar_window"] = (0, 32, 0, 16)
+    changed_window = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    stack.config.extra["nisar_window"] = (0, 16, 0, 16)
+    stack._nisar_channel = ("A", "HH")
+    changed_channel = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    stack._nisar_channel = ("B", "HH")
+    stack._nisar_results["20240113"].content_digest = "s2"
+    changed_source = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+
+    assert initial != changed_window
+    assert initial != changed_channel
+    assert initial != changed_source
+
+
+def test_s1_default_coreg_resume_identity_is_stable(tmp_path: Path) -> None:
+    """The legacy S1 path remains provider-free and deterministic."""
+    stack = _stack_with_three_date_network(tmp_path)
+    first = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    second = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+
+    assert stack.scene_provider is None
+    assert first == second
+
+
+def test_coreg_resume_rejects_marker_after_provider_identity_change(
+    tmp_path: Path,
+) -> None:
+    """An old provider marker cannot authorize a changed source window."""
+    import json
+
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    stack.config.extra.update({"mission": "NISAR", "nisar_window": (0, 16, 0, 16)})
+    stack.scene_provider = SimpleNamespace(
+        name="NISAR RSLC",
+        capability="scene-production",
+        produce_pair=lambda *_args, **_kwargs: None,
+        identity_metadata={"provider_revision": "v1"},
+    )
+    date_id = "20240113"
+    out = stack.config.work_dir / "coreg" / date_id
+    data = np.ones((2, 2), dtype=np.complex64)
+    write_scene_unit(
+        out / "scenes",
+        date_id=date_id,
+        master_id=stack.master,
+        domain="radar",
+        tag="f0_IW1_b0",
+        reference=data,
+        secondary=data,
+        row_origin=0,
+        col_origin=0,
+    )
+    marker = {
+        "master": stack.master,
+        "date": date_id,
+        "coreg_identity": stack._coreg_resume_identity(
+            date_id,
+            misreg_az_px=0.0,
+            misreg_rg_px=0.0,
+        ),
+    }
+    (out / "coreg_done.json").write_text(json.dumps(marker), encoding="utf-8")
+    stack.config.extra["nisar_window"] = (0, 32, 0, 16)
+
+    with pytest.raises(InvalidProcessingStateError, match="current date"):
+        stack.coregister_scenes(dates=[date_id])
+
+
 def test_coregister_scenes_releases_prior_pair_before_next_date(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
