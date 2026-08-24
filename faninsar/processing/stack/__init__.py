@@ -15,6 +15,7 @@ from faninsar.processing.stack.config import (
     EsdMethod,
     StackConfig,
 )
+from faninsar.processing.stack.nisar import NISARStack
 from faninsar.processing.stack.session import Stack
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "EsdMethod",
     "GpuMemoryReclaim",
     "LocalActivationAuthority",
+    "NISARStack",
     "SceneCatalog",
     "Stack",
     "StackConfig",

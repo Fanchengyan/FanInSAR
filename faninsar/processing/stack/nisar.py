@@ -1,0 +1,281 @@
+"""Thin NISAR RSLC adapter for the mission-neutral Stack (PROPOSAL-0035)."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import replace
+from datetime import date, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Self
+
+from faninsar.core.acquisition import Acquisition
+from faninsar.logging import setup_logger
+from faninsar.missions.nisar import NisarSensor
+from faninsar.processing.stack.catalog import SceneCatalog
+from faninsar.processing.stack.config import ActivationMode, StackConfig
+from faninsar.processing.stack.session import Stack, _pairs_from_factory
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    from faninsar.core.pairs import Pairs
+    from faninsar.processing.contracts import SLCProduct
+    from faninsar.processing.readers import SLCReadResult
+
+logger = setup_logger(__name__)
+_DATE_RE = re.compile(r"(?<!\d)(\d{8})(?:T\d{6}(?:\.\d+)?)?")
+
+
+def _date_id(value: object) -> str | None:
+    """Return a canonical acquisition date id when ``value`` is date-like."""
+    if isinstance(value, datetime | date):
+        return value.strftime("%Y%m%d")
+    text = str(value).strip()
+    match = _DATE_RE.search(text)
+    if match is not None:
+        return match.group(1)
+    try:
+        return datetime.fromisoformat(text).strftime("%Y%m%d")
+    except ValueError:
+        return None
+
+
+def _acquisition_id(result: SLCReadResult, path: Path) -> str:
+    """Resolve one acquisition id from the source name or normalized grid."""
+    # NISAR file names carry the acquisition date in normal operational data.
+    # Prefer it over a reader-specific acquisition label so catalog identity is
+    # stable across reader versions.
+    source_id = _date_id(path.name)
+    if source_id is not None:
+        return source_id
+    grid_id = _date_id(result.product.grid.sensing_start)
+    if grid_id is not None:
+        return grid_id
+    product_id = _date_id(result.product.acquisition_id)
+    if product_id is not None:
+        return product_id
+    message = f"cannot discover NISAR acquisition date from {path}"
+    logger.error(message)
+    raise ValueError(message)
+
+
+def _reference_id(value: object, dates: Sequence[str]) -> str:
+    """Normalize an optional reference date and require catalog membership."""
+    result = _date_id(value)
+    if result is None or result not in dates:
+        message = f"NISAR reference {value!r} is not an acquisition"
+        logger.error(message)
+        raise ValueError(message)
+    return result
+
+
+class NISARStack(Stack):
+    """Metadata-only NISAR RSLC Stack with explicit B/HH channel semantics.
+
+    The adapter owns optional-reader opening, normalized SLC metadata, source
+    lineage, and pair topology.  Geometry, flattening, multilooking,
+    coherence, and geocoding remain the shared Stack pipeline's responsibility;
+    that pipeline currently has no NISAR provider and therefore fails closed
+    at the corresponding stage.
+    """
+
+    @classmethod
+    def from_rslc(
+        cls,
+        paths: Sequence[str | Path],
+        *,
+        work_dir: str | Path,
+        frequency: str = "B",
+        polarization: str = "HH",
+        reference: object | None = None,
+        pairs: Pairs | None = None,
+        misreg_pairs: Pairs | None = None,
+        pair_max_interval: int = 3,
+        pair_max_days: int = 72,
+        misreg_max_interval: int = 2,
+        misreg_max_days: int = 36,
+        activation_mode: ActivationMode = "reference",
+        **config_kwargs: Any,
+    ) -> Self:
+        """Construct a mission-neutral Stack from admitted NISAR RSLCs.
+
+        Parameters
+        ----------
+        paths : sequence of path-like
+            NISAR RSLC HDF5 sources.  Every source must represent a unique
+            acquisition date.
+        work_dir : path-like
+            Stack artifact directory, retained for shared lifecycle methods.
+        frequency, polarization : str, default="B", "HH"
+            Explicit NISAR channel selection.  The adapter never silently
+            chooses another channel.
+        reference : date-like, optional
+            Master acquisition.  Defaults to the earliest source date, as in
+            :meth:`Stack.from_safes`.
+        pairs, misreg_pairs : Pairs, optional
+            Explicit pair graphs.  If omitted, shared short-baseline graphs
+            are generated from the discovered dates.
+        pair_max_interval, pair_max_days : int, optional
+            Maximum temporal graph interval and baseline for the IFG pairs.
+        misreg_max_interval, misreg_max_days : int, optional
+            Maximum temporal graph interval and baseline for misregistration.
+        activation_mode : {"reference", "qualified"}, default="reference"
+            Shared Stack activation namespace.  Qualified mode still requires
+            its normal binding, token, and authority configuration.
+        **config_kwargs : Any
+            Additional :class:`StackConfig` options.
+
+        Returns
+        -------
+        NISARStack
+            Prepared metadata seam; raster data remains lazy.
+
+        Raises
+        ------
+        ValueError
+            If paths, dates, channels, or pair setup is unsupported.
+        ImportError
+            If the optional NISAR reader is unavailable.
+
+        """
+        source_paths = tuple(Path(path) for path in paths)
+        if len(source_paths) < 2:
+            message = "NISARStack requires at least two RSLC paths"
+            logger.error(message)
+            raise ValueError(message)
+        if len(set(source_paths)) != len(source_paths):
+            message = "NISARStack RSLC paths must be unique"
+            logger.error(message)
+            raise ValueError(message)
+
+        sensor = NisarSensor()
+        handles: dict[Path, Any] = {}
+        results: dict[str, SLCReadResult] = {}
+        lineage: dict[str, str] = {}
+        for path in source_paths:
+            handle = sensor.open_product(str(path))
+            result = sensor.to_slc_product(
+                handle,
+                frequency=frequency,
+                polarization=polarization,
+                source_path=path,
+            )
+            acquisition_id = _acquisition_id(result, path)
+            if acquisition_id in results:
+                message = (
+                    "NISARStack requires one RSLC per acquisition; duplicate "
+                    f"date {acquisition_id} appears in {path} and "
+                    f"{lineage[acquisition_id]}"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            # Keep the normalized product's acquisition identity aligned with
+            # the Stack catalog, while preserving every other reader field.
+            result = replace(
+                result,
+                product=replace(result.product, acquisition_id=acquisition_id),
+            )
+            handles[path] = handle
+            results[acquisition_id] = result
+            lineage[acquisition_id] = str(path)
+
+        dates = tuple(sorted(results))
+        catalog = SceneCatalog(
+            paths={date_id: Path(lineage[date_id]) for date_id in dates}
+        )
+        master = dates[0] if reference is None else _reference_id(reference, dates)
+        ifg_pairs = pairs or _pairs_from_factory(
+            dates,
+            max_interval=pair_max_interval,
+            max_days=pair_max_days,
+        )
+        network_pairs = misreg_pairs or _pairs_from_factory(
+            dates,
+            max_interval=misreg_max_interval,
+            max_days=misreg_max_days,
+        )
+        extra = dict(config_kwargs.pop("extra", {}) or {})
+        extra.update(
+            {
+                "mission": "NISAR",
+                "product": "RSLC",
+                "frequency": frequency.strip().upper(),
+                "polarization": polarization.strip().upper(),
+                "source_lineage": dict(lineage),
+            }
+        )
+        config = StackConfig(
+            work_dir=Path(work_dir),
+            activation_mode=activation_mode,
+            swaths=(),
+            extra=extra,
+            **config_kwargs,
+        )
+        stack = cls(
+            catalog=catalog,
+            config=config,
+            pairs=ifg_pairs,
+            misreg_pairs=network_pairs,
+            master=master,
+            acquisitions=Acquisition(list(dates)),
+        )
+        stack._nisar_sensor = sensor
+        stack._nisar_handles = handles
+        stack._nisar_results = results
+        stack._nisar_lineage = lineage
+        stack._nisar_channel = (
+            frequency.strip().upper(),
+            polarization.strip().upper(),
+        )
+        return stack
+
+    @property
+    def channel(self) -> tuple[str, str]:
+        """Return the selected ``(frequency, polarization)`` channel."""
+        return self._nisar_channel
+
+    @property
+    def source_lineage(self) -> Mapping[str, str]:
+        """Return date-to-source lineage for the admitted RSLCs."""
+        return dict(self._nisar_lineage)
+
+    @property
+    def products(self) -> Mapping[str, SLCProduct]:
+        """Return normalized lazy SLC products keyed by acquisition date."""
+        return {date_id: item.product for date_id, item in self._nisar_results.items()}
+
+    @property
+    def reader_handles(self) -> Mapping[str, Any]:
+        """Return opened native reader handles without reading raster arrays."""
+        return {
+            date_id: self._nisar_handles[Path(source)]
+            for date_id, source in self._nisar_lineage.items()
+        }
+
+    def _reject_nisar_promotion(self, stage: str) -> None:
+        """Reject a stage that has no NISAR provider implementation yet."""
+        message = (
+            f"NISAR RSLC Stack {stage} is unsupported: the shared Stack "
+            "provider seam has not admitted NISAR geometry/coregistration "
+            "inputs yet"
+        )
+        logger.error(message)
+        raise NotImplementedError(message)
+
+    def measure_misreg(self, **kwargs: Any) -> Self:
+        """Reject NISAR misregistration until a provider is admitted."""
+        del kwargs
+        self._reject_nisar_promotion("misregistration")
+
+    def coregister_scenes(self, **kwargs: Any) -> Self:
+        """Reject NISAR coregistration before Sentinel-1 dispatch."""
+        del kwargs
+        self._reject_nisar_promotion("coregistration")
+
+    def form_interferograms(self, **kwargs: Any) -> Self:
+        """Reject NISAR pair formation before unsupported processing."""
+        del kwargs
+        self._reject_nisar_promotion("interferogram formation")
+
+
+__all__ = ["NISARStack"]
