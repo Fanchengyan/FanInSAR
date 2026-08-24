@@ -356,6 +356,61 @@ def test_nisar_geometry_mapping_passes_dem_and_device(
     assert seen["geo2rdr_device"] == "cuda:0"
 
 
+def test_nisar_geometry_mapping_materializes_noncontiguous_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NISAR normalizes strided Radar→Geo outputs before Geo→Radar dispatch."""
+    reference = _result(tmp_path / "reference.h5", "20240101").product
+    secondary = _result(tmp_path / "secondary.h5", "20240113").product
+    seen: dict[str, object] = {}
+
+    def strided(value: float) -> np.ndarray:
+        """Return a non-contiguous one-pixel float64 array."""
+        backing = np.full((2, 2), value, dtype=np.float64)
+        return backing[::2, ::2]
+
+    def fake_rdr2geo(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            latitude_deg=strided(10.0),
+            longitude_deg=strided(20.0),
+            height_m=strided(123.0),
+            converged=np.array([[True]]),
+        )
+
+    def fake_geo2rdr(*args: object, **_kwargs: object) -> object:
+        geometry_inputs = args[1:4]
+        seen["inputs"] = geometry_inputs
+        assert all(
+            isinstance(value, np.ndarray) and value.flags.c_contiguous
+            for value in geometry_inputs
+        )
+        return SimpleNamespace(
+            azimuth_index=np.array([[2.0]]),
+            range_index=np.array([[2.0]]),
+            converged=np.array([[True]]),
+        )
+
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.run_rdr2geo",
+        fake_rdr2geo,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.run_geo2rdr",
+        fake_geo2rdr,
+    )
+
+    bounds = _geometry_shared_radar_window(
+        reference,
+        secondary,
+        (1, 3, 1, 3),
+        device="cuda:0",
+        height_m=123.0,
+    )
+
+    assert bounds == (1, 3, 1, 3)
+    assert len(seen["inputs"]) == 3  # type: ignore[arg-type]
+
+
 def test_nisar_geometry_mapping_rejects_full_window_outside_secondary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

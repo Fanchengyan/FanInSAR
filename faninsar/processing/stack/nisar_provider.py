@@ -70,6 +70,35 @@ def _dem_identity(dem: object) -> str:
     return qualified_name
 
 
+def _contiguous_geometry_input(value: object) -> object:
+    """Materialize one geometry input with exact contiguous strides.
+
+    Geometry results may be views (for example, a one-pixel result produced by
+    a broadcasted native output).  The public geometry validator intentionally
+    rejects those views before native dispatch.  Keep this normalization at
+    the NISAR provider seam so callers and the Sentinel-1 path retain their
+    existing array contracts.
+
+    Parameters
+    ----------
+    value : object
+        NumPy array or Torch tensor returned by the geometry operation.
+
+    Returns
+    -------
+    object
+        A same-dtype, same-shape contiguous value.  Torch tensors remain on
+        their original device.
+
+    """
+    if isinstance(value, np.ndarray):
+        return np.ascontiguousarray(value)
+    contiguous = getattr(value, "contiguous", None)
+    if callable(contiguous):
+        return contiguous()
+    return np.ascontiguousarray(np.asarray(value))
+
+
 @dataclass(frozen=True, slots=True)
 class NisarPairState:
     """Minimal state consumed by :meth:`Stack.coregister_scenes`.
@@ -277,9 +306,9 @@ def _geometry_shared_radar_window(
     if not converged_values.size or not bool(converged_values[0]):
         reject_invalid_state("NISAR reference crop target did not converge in rdr2geo")
     try:
-        ground_latitude = ground.latitude_deg
-        ground_longitude = ground.longitude_deg
-        ground_height = ground.height_m
+        ground_latitude = _contiguous_geometry_input(ground.latitude_deg)
+        ground_longitude = _contiguous_geometry_input(ground.longitude_deg)
+        ground_height = _contiguous_geometry_input(ground.height_m)
     except AttributeError as error:
         reject_invalid_state(
             f"NISAR reference crop rdr2geo result is missing coordinates: {error}"
