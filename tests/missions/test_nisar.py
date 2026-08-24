@@ -117,6 +117,27 @@ def test_nisar_window_read_defaults_to_b_hh_and_stays_lazy() -> None:
     assert dataset.selections == [(slice(1, 4), slice(2, 6))]
 
 
+def test_nisar_window_read_rejects_unadmitted_existing_source_before_native_access(
+    tmp_path: Path,
+) -> None:
+    """An existing source path cannot bypass admission at the native getter."""
+    source = tmp_path / "scene.h5"
+    source.write_bytes(b"reader-fake")
+    dataset = FakeComplexDataset(np.ones((4, 4), dtype=np.complex64))
+    calls: list[tuple[str, str]] = []
+    handle = SimpleNamespace(
+        filename=str(source),
+        getSlcDatasetAsNativeComplex=lambda frequency, polarization: (
+            calls.append((frequency, polarization)) or dataset
+        ),
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
+        NisarSensor().read_slc_window(handle, (slice(0, 2), slice(0, 2)))
+
+    assert calls == []
+
+
 def test_nisar_window_read_normalizes_channel_aliases() -> None:
     """Accept compatibility aliases while passing normalized identifiers."""
     dataset = FakeComplexDataset(np.ones((4, 4), dtype=np.complex64))
@@ -230,6 +251,28 @@ def test_nisar_product_defaults_to_explicit_b_hh_and_fails_closed() -> None:
 
     with pytest.raises(ValueError, match="frequency 'B' is unavailable"):
         NisarSensor().to_slc_product(handle)
+
+
+def test_nisar_product_rejects_unadmitted_existing_source_before_native_access(
+    tmp_path: Path,
+) -> None:
+    """Metadata-compatible handles still require admission before native access."""
+    source = tmp_path / "scene.h5"
+    source.write_bytes(b"reader-fake")
+    calls: list[tuple[str, str]] = []
+    handle = SimpleNamespace(
+        filename=str(source),
+        frequencies=("B",),
+        polarizations={"B": ("HH",)},
+        getSlcDatasetAsNativeComplex=lambda frequency, polarization: (
+            calls.append((frequency, polarization)) or object()
+        ),
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
+        NisarSensor().to_slc_product(handle)
+
+    assert calls == []
 
 
 def test_nisar_product_rejects_conflicting_channel_aliases() -> None:

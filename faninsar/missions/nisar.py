@@ -529,12 +529,14 @@ def _validate_admission(
 ) -> _AdmissionSnapshot | None:
     """Reject a changed path or source byte stream before native access."""
     snapshot = _handle_admission(handle)
-    if snapshot is None:
-        if expected_source is None:
-            return None
-        snapshot = _source_snapshot(expected_source)
-        _remember_admission(handle, snapshot)
     handle_source = _value(handle, "filename", "file_name", "source_path")
+    if snapshot is None:
+        if handle_source is not None or expected_source is not None:
+            _admission_error(
+                "NISAR RSLC handle has a source path but no explicit admission snapshot"
+            )
+        return None
+
     if handle_source is not None:
         current_id = str(Path(handle_source).expanduser().resolve(strict=False))
         if current_id != snapshot.source_id:
@@ -1007,7 +1009,9 @@ class NisarSensor(Sensor):
                 "NISAR SLC dataset must be a positive 2-D array"
             )
         grid = _radar_grid(handle, frequency, shape)
-        resolved_source = str(source_path or _value(handle, "filename") or "")
+        resolved_source = str(
+            source_path or _value(handle, "filename", "file_name", "source_path") or ""
+        )
         if not resolved_source:
             raise InvalidProcessingStateError("NISAR RSLC handle has no source path")
         acquisition = acquisition_id or Path(resolved_source).stem
