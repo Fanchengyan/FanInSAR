@@ -267,4 +267,3 @@ def test_nisar_product_rejects_conflicting_channel_aliases() -> None:
 
     with pytest.raises(ValueError, match="different channels"):
         NisarSensor().to_slc_product(handle, frequency="A", freq="B")
-

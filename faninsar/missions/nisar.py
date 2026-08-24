@@ -41,7 +41,6 @@ from faninsar.processing.readers import (
 logger = setup_logger(__name__)
 
 
-
 @dataclass(frozen=True, slots=True)
 class _AdmissionSnapshot:
     """Immutable identity captured before opening one RSLC source."""
@@ -83,6 +82,7 @@ class NisarAdmissionPolicy:
         """Validate only the metadata identity."""
         if not isinstance(self.policy_id, str) or not self.policy_id.strip():
             raise ValueError("NISAR admission policy_id must be non-empty")
+
     def as_metadata(self) -> dict[str, object]:
         """Return JSON-compatible, non-authoritative source metadata."""
         inventory = {
