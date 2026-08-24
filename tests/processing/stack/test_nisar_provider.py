@@ -154,15 +154,16 @@ def test_nisar_geo_provider_uses_one_shared_geo_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Geo RSLC windows are converted through the common RadarSLC API."""
-    calls: list[tuple[tuple[int, int], str]] = []
+    calls: list[tuple[tuple[int, int], str, object]] = []
 
     def fake_rdr2geo(
         slc: RadarSLC,
         *,
         geo_grid: GeoGrid,
+        dem: object,
         **_kwargs: object,
     ) -> GeoSLC:
-        calls.append((geo_grid.shape, geo_grid.crs))
+        calls.append((geo_grid.shape, geo_grid.crs, dem))
         product = replace(
             slc.product,
             grid=geo_grid,
@@ -180,7 +181,10 @@ def test_nisar_geo_provider_uses_one_shared_geo_target(
     )
     assert store.domain == "geo"
     assert store.grid_shape == (2, 3)
-    assert calls == [((2, 3), "EPSG:32633"), ((2, 3), "EPSG:32633")]
+    assert calls == [
+        ((2, 3), "EPSG:32633", stack.config.dem),
+        ((2, 3), "EPSG:32633", stack.config.dem),
+    ]
 
 
 def test_nisar_provider_maps_secondary_physical_window_and_metadata(

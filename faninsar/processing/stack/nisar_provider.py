@@ -541,16 +541,15 @@ def make_nisar_scene_provider(
             grid_identity = scene_grid_identity("radar", grid_shape)
         elif domain == "geo":
             target = _geo_target(options.get("geo_grid"))
-            dem = options.get("dem")
             reference_geo = reference_radar.rdr2geo(
                 device=str(options.get("device", "auto")),
-                dem=dem,
+                dem=mapping_dem,
                 geo_grid=target,
                 use_cache=False,
             )
             secondary_geo = secondary_radar.rdr2geo(
                 device=str(options.get("device", "auto")),
-                dem=dem,
+                dem=mapping_dem,
                 geo_grid=target,
                 use_cache=False,
             )
