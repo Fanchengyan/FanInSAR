@@ -117,14 +117,15 @@ def _shared_radar_window(
     indices.
     """
     row_start, row_stop, col_start, col_stop = reference_bounds
-    # Acquisition epochs differ by days, so use the within-scene zero-Doppler
-    # offset rather than comparing absolute datetimes across acquisitions.
-    target_azimuth_offset = row_start * reference.azimuth_time_interval_s
+    target_time = reference.sensing_start + timedelta(
+        seconds=row_start * reference.azimuth_time_interval_s
+    )
     target_range = (
         reference.starting_slant_range_m + col_start * reference.range_spacing_m
     )
     secondary_row_start = round(
-        target_azimuth_offset / secondary.azimuth_time_interval_s
+        (target_time - secondary.sensing_start).total_seconds()
+        / secondary.azimuth_time_interval_s
     )
     secondary_col_start = round(
         (target_range - secondary.starting_slant_range_m)
@@ -270,7 +271,11 @@ def make_nisar_scene_provider(
         except KeyError as error:
             reject_invalid_state(f"NISAR source handle is unavailable: {error}")
         reference_radar = _radar_crop(reference_product, reference_samples, bounds)
-        secondary_radar = _radar_crop(secondary_product, secondary_samples, bounds)
+        secondary_radar = _radar_crop(
+            secondary_product,
+            secondary_samples,
+            secondary_bounds,
+        )
         domain = str(options.get("coregistration_grid", "radar")).lower()
         if domain == "radar":
             reference_array = reference_radar.samples

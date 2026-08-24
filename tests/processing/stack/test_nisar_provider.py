@@ -1,11 +1,12 @@
 """Executable bounded NISAR provider tests (PROPOSAL-0035)."""
 
 # Test modules intentionally import runtime fixtures directly.
-# ruff: noqa: TC001, TC002
+# ruff: noqa: TC001
 
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,10 @@ from faninsar.processing.coordinates import GeoGrid
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.slc import GeoSLC, RadarSLC
 from faninsar.processing.stack import NISARStack
+from faninsar.processing.stack.nisar_provider import (
+    _radar_crop,
+    make_nisar_scene_provider,
+)
 from faninsar.processing.stack.scene_store import CoregisteredSceneStore
 
 from .test_nisar_stack import _result
@@ -62,14 +67,24 @@ def _stack(
         "open_product",
         lambda _sensor, uri: handles[Path(uri)],
     )
-    monkeypatch.setattr(
-        NisarSensor,
-        "to_slc_product",
-        lambda _sensor, handle, **_kwargs: _result(
-            Path(handle.filename),
-            Path(handle.filename).stem.rsplit("_", 1)[-1],
-        ),
-    )
+    def read_product(
+        _sensor: object,
+        handle: object,
+        **_kwargs: object,
+    ) -> object:
+        result = _result(
+            Path(handle.filename),  # type: ignore[attr-defined]
+            Path(handle.filename).stem.rsplit("_", 1)[-1],  # type: ignore[attr-defined]
+        )
+        # Keep the ordinary lifecycle fixture on one relative radar timeline;
+        # the dedicated regression below covers absolute sensing-time offsets.
+        grid = replace(
+            result.product.grid,
+            sensing_start=datetime(2024, 1, 1, tzinfo=UTC),
+        )
+        return replace(result, product=replace(result.product, grid=grid))
+
+    monkeypatch.setattr(NisarSensor, "to_slc_product", read_product)
     monkeypatch.setattr(
         NisarSensor,
         "read_slc_window",
@@ -145,3 +160,94 @@ def test_nisar_geo_provider_uses_one_shared_geo_target(
     assert store.domain == "geo"
     assert store.grid_shape == (2, 3)
     assert calls == [((2, 3), "EPSG:32633"), ((2, 3), "EPSG:32633")]
+
+
+def test_nisar_provider_maps_secondary_physical_window_and_metadata(
+    tmp_path: Path,
+) -> None:
+    """Secondary reads follow sensing time and update crop grid metadata."""
+    reference_path = tmp_path / "NISAR_RSLC_20240101.h5"
+    secondary_path = tmp_path / "NISAR_RSLC_20240113.h5"
+    reference_path.touch()
+    secondary_path.touch()
+    reference_result = _result(reference_path, "20240101")
+    secondary_result = _result(secondary_path, "20240113")
+    reference_grid = replace(
+        reference_result.product.grid,
+        shape=(8, 8),
+        sensing_start=datetime(2024, 1, 1, tzinfo=UTC),
+    )
+    secondary_grid = replace(
+        secondary_result.product.grid,
+        shape=(8, 10),
+        starting_slant_range_m=799_997.1,
+        sensing_start=datetime(2024, 1, 1, 0, 0, 0, 4000, tzinfo=UTC),
+    )
+    reference_product = replace(
+        reference_result.product,
+        grid=reference_grid,
+        samples=replace(reference_result.product.samples, shape=reference_grid.shape),
+    )
+    secondary_product = replace(
+        secondary_result.product,
+        grid=secondary_grid,
+        samples=replace(secondary_result.product.samples, shape=secondary_grid.shape),
+    )
+    reference_array = np.arange(64, dtype=np.float32).reshape(8, 8).astype(np.complex64)
+    secondary_array = (
+        np.arange(80, dtype=np.float32).reshape(8, 10).astype(np.complex64)
+    )
+    handles = {"reference": object(), "secondary": object()}
+    selections: list[tuple[str, tuple[slice, slice]]] = []
+
+    class Sensor:
+        """Fake normalized NISAR window reader."""
+
+        def read_slc_window(
+            self,
+            handle: object,
+            window: tuple[slice, slice],
+            **_kwargs: object,
+        ) -> np.ndarray:
+            key = "reference" if handle is handles["reference"] else "secondary"
+            selections.append((key, window))
+            return (reference_array if key == "reference" else secondary_array)[window]
+
+    callback = make_nisar_scene_provider(
+        sensor=Sensor(),
+        handles={
+            reference_path: handles["reference"],
+            secondary_path: handles["secondary"],
+        },
+        products={"20240101": reference_product, "20240113": secondary_product},
+        lineage={
+            "20240101": str(reference_path),
+            "20240113": str(secondary_path),
+        },
+        master="20240101",
+        channel=("B", "HH"),
+        configured_window=(5, 8, 2, 6),
+    )
+
+    callback(
+        reference_path,
+        secondary_path,
+        output_dir=tmp_path / "pair",
+        options={"coregistration_grid": "radar"},
+    )
+
+    assert selections == [
+        ("reference", (slice(5, 8), slice(2, 6))),
+        ("secondary", (slice(3, 6), slice(3, 7))),
+    ]
+    secondary_crop = _radar_crop(
+        secondary_product,
+        secondary_array[3:6, 3:7],
+        (3, 6, 3, 7),
+    )
+    assert secondary_crop.grid.shape == (3, 4)
+    assert secondary_crop.grid.starting_slant_range_m == pytest.approx(800_004.0)
+    assert secondary_crop.grid.sensing_start == datetime(
+        2024, 1, 1, 0, 0, 0, 10_000, tzinfo=UTC
+    )
+    np.testing.assert_array_equal(secondary_crop.samples, secondary_array[3:6, 3:7])
