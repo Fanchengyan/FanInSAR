@@ -68,7 +68,7 @@ def _stack(
     monkeypatch.setattr(
         NisarSensor,
         "open_product",
-        lambda _sensor, uri: handles[Path(uri)],
+        lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
 
     def read_product(
@@ -112,6 +112,10 @@ def _stack(
     )
     config: dict[str, object] = {
         "extra": {"nisar_window": (1, 4, 1, 5)},
+        "nisar_admission": {
+            "trusted_roots": [tmp_path],
+            "max_size_bytes": 1024,
+        },
         "dem": ConstantHeightDEM(0.0),
         "multilook": (1, 1),
         "goldstein_alpha": 0.0,

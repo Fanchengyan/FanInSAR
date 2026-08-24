@@ -91,7 +91,7 @@ def test_nisar_stack_builds_shared_catalog_and_pair_topology(
     handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar.NisarSensor.open_product",
-        lambda _sensor, uri: handles[Path(uri)],
+        lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(
@@ -104,7 +104,14 @@ def test_nisar_stack_builds_shared_catalog_and_pair_topology(
         ),
     )
 
-    stack = NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
+    stack = NISARStack.from_rslc(
+        paths,
+        work_dir=tmp_path / "work",
+        nisar_admission={
+            "trusted_roots": [tmp_path],
+            "max_size_bytes": 1024,
+        },
+    )
 
     assert stack.master == "20240101"
     assert stack.catalog.dates == ("20240101", "20240113", "20240125")
@@ -191,7 +198,7 @@ def test_nisar_stack_rejects_duplicate_acquisitions(
     handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar.NisarSensor.open_product",
-        lambda _sensor, uri: handles[Path(uri)],
+        lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
@@ -199,7 +206,14 @@ def test_nisar_stack_rejects_duplicate_acquisitions(
     )
 
     with pytest.raises(ValueError, match="one RSLC per acquisition"):
-        NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
+        NISARStack.from_rslc(
+            paths,
+            work_dir=tmp_path / "work",
+            nisar_admission={
+                "trusted_roots": [tmp_path],
+                "max_size_bytes": 1024,
+            },
+        )
 
 
 @pytest.mark.parametrize(
@@ -224,7 +238,7 @@ def test_nisar_stack_records_only_the_admitted_product_channel_and_lineage(
 
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar.NisarSensor.open_product",
-        lambda _sensor, uri: handles[Path(uri)],
+        lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
 
     def read_product(
@@ -251,7 +265,14 @@ def test_nisar_stack_records_only_the_admitted_product_channel_and_lineage(
     )
 
     with pytest.raises(ValueError, match=message):
-        NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
+        NISARStack.from_rslc(
+            paths,
+            work_dir=tmp_path / "work",
+            nisar_admission={
+                "trusted_roots": [tmp_path],
+                "max_size_bytes": 1024,
+            },
+        )
 
 
 def test_nisar_stack_fails_closed_before_shared_s1_processing(
@@ -277,7 +298,12 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
     stack = NISARStack.from_rslc(
         paths,
         work_dir=tmp_path / "work",
-        extra={"nisar_admission": {"trusted_roots": [tmp_path]}},
+        extra={
+            "nisar_admission": {
+                "trusted_roots": [tmp_path],
+                "max_size_bytes": 1024,
+            }
+        },
     )
 
     def fail_if_safe_opened(_path: object) -> object:
@@ -303,10 +329,12 @@ def test_nisar_scene_provider_exposes_named_fail_closed_capability(
     paths = tuple(
         tmp_path / f"NISAR_RSLC_{date_id}.h5" for date_id in ("20240101", "20240113")
     )
+    for path in paths:
+        path.touch()
     handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar.NisarSensor.open_product",
-        lambda _sensor, uri: handles[Path(uri)],
+        lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
@@ -315,7 +343,14 @@ def test_nisar_scene_provider_exposes_named_fail_closed_capability(
         ),
     )
 
-    stack = NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
+    stack = NISARStack.from_rslc(
+        paths,
+        work_dir=tmp_path / "work",
+        nisar_admission={
+            "trusted_roots": [tmp_path],
+            "max_size_bytes": 1024,
+        },
+    )
 
     assert stack.scene_provider is not None
     with pytest.raises(
