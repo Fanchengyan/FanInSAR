@@ -155,6 +155,31 @@ def test_nisar_stack_passes_explicit_admission_metadata_to_reader(
     assert stack.config.extra["source_admission"] == {}
 
 
+def test_nisar_stack_rejects_existing_paths_without_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing RSLC files cannot reach the reader without trusted admission."""
+    paths = tuple(
+        tmp_path / f"NISAR_RSLC_{date_id}.h5" for date_id in ("20240101", "20240113")
+    )
+    for path in paths:
+        path.touch()
+    opened: list[str] = []
+
+    def open_product(_sensor: object, uri: str, **_kwargs: object) -> object:
+        opened.append(uri)
+        pytest.fail("NISAR reader opened an existing path without admission")
+
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar.NisarSensor.open_product", open_product
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="explicit nisar_admission"):
+        NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
+
+    assert opened == []
+
+
 def test_nisar_stack_rejects_duplicate_acquisitions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -241,7 +266,7 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
     handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar.NisarSensor.open_product",
-        lambda _sensor, uri: handles[Path(uri)],
+        lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
@@ -249,7 +274,11 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
             Path(handle.filename), Path(handle.filename).stem.rsplit("_", 1)[-1]
         ),
     )
-    stack = NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
+    stack = NISARStack.from_rslc(
+        paths,
+        work_dir=tmp_path / "work",
+        extra={"nisar_admission": {"trusted_roots": [tmp_path]}},
+    )
 
     def fail_if_safe_opened(_path: object) -> object:
         pytest.fail("NISAR RSLC was routed to the SAFE opener")
