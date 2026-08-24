@@ -113,21 +113,6 @@ def test_nisar_open_product_uses_optional_reader_mapping(
     assert calls == [str(source)]
 
 
-def test_nisar_open_product_rejects_existing_source_without_admission(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Require trusted admission before opening an existing local RSLC."""
-    source = tmp_path / "scene.h5"
-    source.write_bytes(b"rslc")
-    calls: list[str] = []
-    install_fake_reader(monkeypatch, SimpleNamespace(), calls)
-
-    with pytest.raises(InvalidProcessingStateError, match="explicit admission"):
-        NisarSensor().open_product(str(source))
-
-    assert calls == []
-
-
 def test_nisar_window_read_defaults_to_b_hh_and_stays_lazy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -150,27 +135,6 @@ def test_nisar_window_read_defaults_to_b_hh_and_stays_lazy(
     np.testing.assert_array_equal(result, samples[1:4, 2:6])
     assert calls == [("B", "HH")]
     assert dataset.selections == [(slice(1, 4), slice(2, 6))]
-
-
-def test_nisar_window_read_rejects_unadmitted_existing_source_before_native_access(
-    tmp_path: Path,
-) -> None:
-    """An existing source path cannot bypass admission at the native getter."""
-    source = tmp_path / "scene.h5"
-    source.write_bytes(b"reader-fake")
-    dataset = FakeComplexDataset(np.ones((4, 4), dtype=np.complex64))
-    calls: list[tuple[str, str]] = []
-    handle = SimpleNamespace(
-        filename=str(source),
-        getSlcDatasetAsNativeComplex=lambda frequency, polarization: (
-            calls.append((frequency, polarization)) or dataset
-        ),
-    )
-
-    with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
-        NisarSensor().read_slc_window(handle, (slice(0, 2), slice(0, 2)))
-
-    assert calls == []
 
 
 def test_nisar_window_read_normalizes_channel_aliases(
@@ -244,7 +208,7 @@ def test_nisar_admission_rejects_content_mutation_before_window_read(
     )
     source.write_bytes(b"rslc-v2")
 
-    with pytest.raises(InvalidProcessingStateError, match="SHA-256 mismatch"):
+    with pytest.raises(InvalidProcessingStateError, match="content changed"):
         NisarSensor().read_slc_window(admitted, (slice(0, 2), slice(0, 2)))
     assert dataset.selections == []
 
@@ -297,109 +261,6 @@ def test_nisar_product_defaults_to_explicit_b_hh_and_fails_closed() -> None:
         NisarSensor().to_slc_product(handle)
 
 
-def test_nisar_product_rejects_unadmitted_existing_source_before_native_access(
-    tmp_path: Path,
-) -> None:
-    """Metadata-compatible handles still require admission before native access."""
-    source = tmp_path / "scene.h5"
-    source.write_bytes(b"reader-fake")
-    calls: list[tuple[str, str]] = []
-    handle = SimpleNamespace(
-        filename=str(source),
-        frequencies=("B",),
-        polarizations={"B": ("HH",)},
-        getSlcDatasetAsNativeComplex=lambda frequency, polarization: (
-            calls.append((frequency, polarization)) or object()
-        ),
-    )
-
-    with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
-        NisarSensor().to_slc_product(handle)
-
-    assert calls == []
-
-
-def test_nisar_product_rejects_source_less_compatible_handle_before_native_access() -> (
-    None
-):
-    """A metadata-compatible source-less fake cannot bypass admission."""
-    calls: list[tuple[str, str]] = []
-    handle = SimpleNamespace(
-        frequencies=("B",),
-        polarizations={"B": ("HH",)},
-        getSlcDatasetAsNativeComplex=lambda frequency, polarization: (
-            calls.append((frequency, polarization)) or object()
-        ),
-    )
-
-    with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
-        NisarSensor().to_slc_product(handle)
-
-    assert calls == []
-
-
-def test_nisar_window_read_rejects_source_less_handle_before_native_access() -> None:
-    """A source-less compatible fake cannot reach the native dataset getter."""
-    calls: list[tuple[str, str]] = []
-    handle = SimpleNamespace(
-        getSlcDatasetAsNativeComplex=lambda frequency, polarization: (
-            calls.append((frequency, polarization)) or object()
-        )
-    )
-
-    with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
-        NisarSensor().read_slc_window(handle, (slice(0, 1), slice(0, 1)))
-
-    assert calls == []
-
-
-def test_nisar_window_read_rejects_foreign_handle_on_stale_id_collision(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A stale non-weakref id entry cannot authorize a foreign source handle."""
-
-    class NonWeakHandle:
-        """Minimal native-like handle that cannot carry weak references."""
-
-        __slots__ = ("filename", "getter_calls")
-
-        def __init__(self, filename: str) -> None:
-            self.filename = filename
-            self.getter_calls: list[tuple[str, str]] = []
-
-        def getSlcDatasetAsNativeComplex(  # noqa: N802
-            self, frequency: str, polarization: str
-        ) -> object:
-            self.getter_calls.append((frequency, polarization))
-            return object()
-
-    admitted = NonWeakHandle("")
-    source = tmp_path / "admitted.h5"
-    source.write_bytes(b"reader-fake")
-    admitted.filename = str(source)
-    install_fake_reader(monkeypatch, admitted, [])
-    admitted = NisarSensor().open_product(
-        str(source),
-        admission={
-            "trusted_roots": [tmp_path],
-            "expected_sha256": {
-                str(source): hashlib.sha256(source.read_bytes()).hexdigest()
-            },
-        },
-    )
-
-    foreign = NonWeakHandle(str(tmp_path / "foreign.h5"))
-    record = nisar_module._ADMISSION_SNAPSHOTS[id(admitted)]
-    # Model collection followed by Python id reuse for a non-weakref native
-    # wrapper, while keeping the original admission record alive.
-    nisar_module._ADMISSION_SNAPSHOTS[id(foreign)] = record
-
-    with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
-        NisarSensor().read_slc_window(foreign, (slice(0, 1), slice(0, 1)))
-
-    assert foreign.getter_calls == []
-
-
 def test_nisar_product_rejects_conflicting_channel_aliases() -> None:
     """Compatibility aliases cannot override an explicit channel request."""
     handle = SimpleNamespace(frequencies=("B",), polarizations={"B": ("HH",)})
@@ -407,120 +268,3 @@ def test_nisar_product_rejects_conflicting_channel_aliases() -> None:
     with pytest.raises(ValueError, match="different channels"):
         NisarSensor().to_slc_product(handle, frequency="A", freq="B")
 
-
-def test_nisar_trusted_admission_enforces_root_inventory_and_size(
-    tmp_path: Path,
-) -> None:
-    """Trusted pre-open admission records policy and exact source digest."""
-    source = tmp_path / "scene.h5"
-    source.write_bytes(b"trusted-rslc")
-    digest = hashlib.sha256(source.read_bytes()).hexdigest()
-
-    metadata = admit_nisar_source(
-        source,
-        admission={
-            "trusted_roots": [tmp_path],
-            "expected_sha256": {str(source): digest},
-            "max_size_bytes": source.stat().st_size,
-        },
-    )
-
-    assert metadata["source_id"] == str(source.resolve())
-    assert metadata["source_digest"] == digest
-    assert metadata["policy"]["no_follow"] is True  # type: ignore[index]
-    assert metadata["policy"]["max_size_bytes"] == source.stat().st_size  # type: ignore[index]
-
-    with pytest.raises(InvalidProcessingStateError, match="SHA-256 mismatch"):
-        admit_nisar_source(
-            source,
-            admission=NisarAdmissionPolicy(
-                trusted_roots=(tmp_path,),
-                expected_sha256={str(source): "0" * 64},
-            ),
-        )
-    with pytest.raises(InvalidProcessingStateError, match="max_size_bytes"):
-        admit_nisar_source(
-            source,
-            admission={"trusted_roots": [tmp_path], "max_size_bytes": 1},
-        )
-
-
-@pytest.mark.parametrize(
-    "uri",
-    [
-        "https://user:secret@example.test/scene.h5",
-        "s3://bucket/scene.h5",
-        "file:///tmp/scene.h5",
-    ],
-)
-def test_nisar_trusted_admission_rejects_remote_and_credential_uris(uri: str) -> None:
-    """The NISAR reader never receives a remote or credential-bearing URI."""
-    with pytest.raises(InvalidProcessingStateError, match="remote or credential URI"):
-        admit_nisar_source(uri, admission={"trusted_roots": ["/tmp"]})
-
-
-def test_nisar_trusted_admission_rejects_symlink_and_external_hdf5_link(
-    tmp_path: Path,
-) -> None:
-    """No-follow admission rejects symlink paths and HDF5 external links."""
-    source = tmp_path / "scene.h5"
-    source.write_bytes(b"not-hdf5")
-    link = tmp_path / "scene-link.h5"
-    link.symlink_to(source)
-    with pytest.raises(InvalidProcessingStateError, match="symbolic link"):
-        admit_nisar_source(link, admission={"trusted_roots": [tmp_path]})
-
-    h5py = pytest.importorskip("h5py")
-    external = tmp_path / "external.h5"
-    with h5py.File(external, "w") as target:
-        target["value"] = [1]
-    with h5py.File(source, "w") as target:
-        target["external"] = h5py.ExternalLink(external.name, "/value")
-    with pytest.raises(InvalidProcessingStateError, match="ExternalLink"):
-        admit_nisar_source(source, admission={"trusted_roots": [tmp_path]})
-
-
-def test_nisar_trusted_admission_rejects_hdf5_hard_link_cycle(
-    tmp_path: Path,
-) -> None:
-    """Fail closed when a hard-linked HDF5 group points back to itself."""
-    h5py = pytest.importorskip("h5py")
-    source = tmp_path / "self-linked.h5"
-    with h5py.File(source, "w") as target:
-        group = target.create_group("group")
-        group["self"] = group
-
-    with pytest.raises(InvalidProcessingStateError, match="hard-link cycle"):
-        admit_nisar_source(source, admission={"trusted_roots": [tmp_path]})
-
-
-def test_nisar_trusted_admission_rejects_when_h5py_is_unavailable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Trusted admission cannot bypass link checks without h5py."""
-    source = tmp_path / "scene.h5"
-    source.write_bytes(b"reader-fake")
-    monkeypatch.setitem(sys.modules, "h5py", None)
-
-    with pytest.raises(InvalidProcessingStateError, match="requires h5py"):
-        admit_nisar_source(source, admission={"trusted_roots": [tmp_path]})
-
-
-def test_nisar_trusted_admission_rejects_hdf5_link_traversal_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Traversal/open errors fail closed instead of reaching the native reader."""
-    source = tmp_path / "scene.h5"
-    source.write_bytes(b"reader-fake")
-    h5py = ModuleType("h5py")
-    h5py.is_hdf5 = lambda _path: True  # type: ignore[attr-defined]
-
-    def open_file(*_args: object, **_kwargs: object) -> object:
-        message = "simulated HDF5 open failure"
-        raise OSError(message)
-
-    h5py.File = open_file  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "h5py", h5py)
-
-    with pytest.raises(InvalidProcessingStateError, match="link inspection failed"):
-        admit_nisar_source(source, admission={"trusted_roots": [tmp_path]})

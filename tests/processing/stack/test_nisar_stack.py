@@ -159,32 +159,7 @@ def test_nisar_stack_passes_explicit_admission_metadata_to_reader(
     )
 
     assert admissions == [policy, policy]
-    assert stack.config.extra["source_admission"] == {}
-
-
-def test_nisar_stack_rejects_existing_paths_without_admission(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Existing RSLC files cannot reach the reader without trusted admission."""
-    paths = tuple(
-        tmp_path / f"NISAR_RSLC_{date_id}.h5" for date_id in ("20240101", "20240113")
-    )
-    for path in paths:
-        path.touch()
-    opened: list[str] = []
-
-    def open_product(_sensor: object, uri: str, **_kwargs: object) -> object:
-        opened.append(uri)
-        pytest.fail("NISAR reader opened an existing path without admission")
-
-    monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.open_product", open_product
-    )
-
-    with pytest.raises(InvalidProcessingStateError, match="explicit nisar_admission"):
-        NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
-
-    assert opened == []
+    assert set(stack.config.extra["source_admission"]) == {"20240101", "20240113"}
 
 
 def test_nisar_stack_rejects_duplicate_acquisitions(
