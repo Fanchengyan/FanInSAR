@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import sys
 import hashlib
+import sys
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -288,4 +288,18 @@ def test_nisar_trusted_admission_rejects_symlink_and_external_hdf5_link(
     with h5py.File(source, "w") as target:
         target["external"] = h5py.ExternalLink(external.name, "/value")
     with pytest.raises(InvalidProcessingStateError, match="ExternalLink"):
+        admit_nisar_source(source, admission={"trusted_roots": [tmp_path]})
+
+
+def test_nisar_trusted_admission_rejects_hdf5_hard_link_cycle(
+    tmp_path: Path,
+) -> None:
+    """Fail closed when a hard-linked HDF5 group points back to itself."""
+    h5py = pytest.importorskip("h5py")
+    source = tmp_path / "self-linked.h5"
+    with h5py.File(source, "w") as target:
+        group = target.create_group("group")
+        group["self"] = group
+
+    with pytest.raises(InvalidProcessingStateError, match="hard-link cycle"):
         admit_nisar_source(source, admission={"trusted_roots": [tmp_path]})

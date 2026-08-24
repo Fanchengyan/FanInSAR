@@ -122,6 +122,14 @@ class NisarAdmissionPolicy:
 
 _ADMISSION_SNAPSHOTS: dict[int, _AdmissionSnapshot] = {}
 
+# HDF5 links form a graph rather than a tree: hard links may alias an object or
+# even point back to an ancestor.  Keep the pre-open inspection bounded even for
+# adversarial files.  The limits are deliberately generous for ordinary RSLC
+# products while ensuring malformed graphs fail closed before native access.
+_HDF5_LINK_MAX_DEPTH = 256
+_HDF5_LINK_MAX_OBJECTS = 100_000
+_HDF5_LINK_MAX_LINKS = 1_000_000
+
 
 def _admission_error(message: str) -> None:
     """Log and raise one NISAR pre-open admission failure."""
@@ -378,19 +386,80 @@ def _check_hdf5_links(path: Path, policy: NisarAdmissionPolicy) -> None:
         with h5py.File(path, "r") as source:
             external_type = h5py.ExternalLink
             soft_type = h5py.SoftLink
-            pending = [source]
-            while pending:
-                group = pending.pop()
-                for name in group:
-                    link = group.get(name, getlink=True)
-                    if isinstance(link, (external_type, soft_type)):
-                        _admission_error(
-                            f"NISAR HDF5 source contains an unsafe {type(link).__name__}: {name}"
+
+            def object_identity(group: Any) -> tuple[str, int]:
+                """Return an identity stable across wrappers for one HDF5 object."""
+                try:
+                    address = h5py.h5o.get_info(group.id).addr
+                    return ("hdf5-address", int(address))
+                except (AttributeError, OSError, TypeError, ValueError):
+                    # Older/fake h5py implementations may not expose h5o.  The
+                    # low-level identifier hash is stable for wrappers of one
+                    # object and is preferable to Python's wrapper identity.
+                    try:
+                        return ("hdf5-id", hash(group.id))
+                    except (AttributeError, TypeError):
+                        return ("python-id", id(group))
+
+            visited_objects: set[tuple[str, int]] = set()
+            visited_paths: set[str] = set()
+            active_objects: set[tuple[str, int]] = set()
+            active_paths: set[str] = set()
+            inspected_objects = 0
+            inspected_links = 0
+
+            def walk(group: Any, path_name: str, depth: int) -> None:
+                """Visit hard-linked groups without dereferencing unsafe links."""
+                nonlocal inspected_objects, inspected_links
+                identity = object_identity(group)
+                if identity in active_objects or path_name in active_paths:
+                    _admission_error(
+                        "NISAR HDF5 hard-link cycle detected at "
+                        f"{path_name!r} (object identity {identity!r})"
+                    )
+                if identity in visited_objects or path_name in visited_paths:
+                    return
+                if depth > _HDF5_LINK_MAX_DEPTH:
+                    _admission_error(
+                        "NISAR HDF5 link traversal exceeded maximum depth "
+                        f"({_HDF5_LINK_MAX_DEPTH}) at {path_name!r}"
+                    )
+                inspected_objects += 1
+                if inspected_objects > _HDF5_LINK_MAX_OBJECTS:
+                    _admission_error(
+                        "NISAR HDF5 link traversal exceeded maximum object limit "
+                        f"({_HDF5_LINK_MAX_OBJECTS}) at {path_name!r}"
+                    )
+                visited_objects.add(identity)
+                visited_paths.add(path_name)
+                active_objects.add(identity)
+                active_paths.add(path_name)
+                try:
+                    for name in group:
+                        inspected_links += 1
+                        if inspected_links > _HDF5_LINK_MAX_LINKS:
+                            _admission_error(
+                                "NISAR HDF5 link traversal exceeded maximum link "
+                                f"limit ({_HDF5_LINK_MAX_LINKS}) at {path_name!r}"
+                            )
+                        link = group.get(name, getlink=True)
+                        child_path = (
+                            f"/{name}" if path_name == "/" else f"{path_name}/{name}"
                         )
-                    if isinstance(link, h5py.HardLink):
-                        child = group.get(name, getlink=False)
-                        if isinstance(child, h5py.Group):
-                            pending.append(child)
+                        if isinstance(link, (external_type, soft_type)):
+                            _admission_error(
+                                "NISAR HDF5 source contains an unsafe "
+                                f"{type(link).__name__}: {child_path}"
+                            )
+                        if isinstance(link, h5py.HardLink):
+                            child = group.get(name, getlink=False)
+                            if isinstance(child, h5py.Group):
+                                walk(child, child_path, depth + 1)
+                finally:
+                    active_objects.remove(identity)
+                    active_paths.remove(path_name)
+
+            walk(source, "/", 0)
     except OSError as error:
         # Tiny fake-reader fixtures are often empty/non-HDF5 files.  A real
         # HDF5 source is checked above; malformed files remain the native
