@@ -150,7 +150,7 @@ def test_geocode_complex_to_grid_rejects_shape_mismatch() -> None:
             geometry=model,
             grid=grid,
             height_m=0.0,
-        device="cpu",
+            device="cpu",
             radar_shape=(32, 32),
         )
 

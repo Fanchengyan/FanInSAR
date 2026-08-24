@@ -64,8 +64,7 @@ class UnsupportedStackCapabilityError(StackProviderError, NotImplementedError):
         self.capability = capability
         self.reason = reason or "provider has not admitted this capability"
         message = (
-            f"{mission} Stack capability {capability!r} is unsupported: "
-            f"{self.reason}"
+            f"{mission} Stack capability {capability!r} is unsupported: {self.reason}"
         )
         logger.error(message)
         super().__init__(message)
