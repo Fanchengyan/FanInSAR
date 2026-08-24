@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from faninsar.core.acquisition import Acquisition
 from faninsar.logging import setup_logger
-from faninsar.missions.nisar import NisarSensor
+from faninsar.missions.nisar import NisarSensor, _normalize_channel
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.config import ActivationMode, StackConfig
 from faninsar.processing.stack.session import Stack, _pairs_from_factory
@@ -139,6 +139,11 @@ class NISARStack(Stack):
 
         """
         source_paths = tuple(Path(path) for path in paths)
+        admitted_frequency = _normalize_channel(frequency, field="frequency")
+        admitted_polarization = _normalize_channel(
+            polarization,
+            field="polarization",
+        )
         if len(source_paths) < 2:
             message = "NISARStack requires at least two RSLC paths"
             logger.error(message)
@@ -156,10 +161,36 @@ class NISARStack(Stack):
             handle = sensor.open_product(str(path))
             result = sensor.to_slc_product(
                 handle,
-                frequency=frequency,
-                polarization=polarization,
+                frequency=admitted_frequency,
+                polarization=admitted_polarization,
                 source_path=path,
             )
+            native_frequency = _normalize_channel(
+                result.mission_native.get("frequency"),
+                field="frequency",
+            )
+            native_polarization = _normalize_channel(
+                result.mission_native.get("polarization"),
+                field="polarization",
+            )
+            if (native_frequency, native_polarization) != (
+                admitted_frequency,
+                admitted_polarization,
+            ):
+                message = (
+                    "NISAR reader admitted a channel different from the requested "
+                    f"{admitted_frequency}/{admitted_polarization}: "
+                    f"{native_frequency}/{native_polarization}"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            if result.source_path != str(path):
+                message = (
+                    "NISAR reader source lineage does not match the admitted RSLC "
+                    f"path {path}: {result.source_path}"
+                )
+                logger.error(message)
+                raise ValueError(message)
             acquisition_id = _acquisition_id(result, path)
             if acquisition_id in results:
                 message = (
@@ -199,8 +230,8 @@ class NISARStack(Stack):
             {
                 "mission": "NISAR",
                 "product": "RSLC",
-                "frequency": frequency.strip().upper(),
-                "polarization": polarization.strip().upper(),
+                "frequency": admitted_frequency,
+                "polarization": admitted_polarization,
                 "source_lineage": dict(lineage),
             }
         )
@@ -224,8 +255,8 @@ class NISARStack(Stack):
         stack._nisar_results = results
         stack._nisar_lineage = lineage
         stack._nisar_channel = (
-            frequency.strip().upper(),
-            polarization.strip().upper(),
+            admitted_frequency,
+            admitted_polarization,
         )
         return stack
 

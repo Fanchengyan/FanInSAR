@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -139,6 +140,58 @@ def test_nisar_stack_rejects_duplicate_acquisitions(
         NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
 
 
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("channel", "different from the requested"),
+        ("lineage", "source lineage does not match"),
+    ],
+)
+def test_nisar_stack_records_only_the_admitted_product_channel_and_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    message: str,
+) -> None:
+    """Reject reader results whose channel or source lineage is inconsistent."""
+    paths = (
+        tmp_path / "NISAR_RSLC_20240101.h5",
+        tmp_path / "NISAR_RSLC_20240113.h5",
+    )
+    handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
+
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar.NisarSensor.open_product",
+        lambda _sensor, uri: handles[Path(uri)],
+    )
+
+    def read_product(
+        _sensor: object,
+        handle: object,
+        **_kwargs: object,
+    ) -> SLCReadResult:
+        path = Path(handle.filename)  # type: ignore[attr-defined]
+        result = _result(path, path.stem.rsplit("_", 1)[-1])
+        if field == "channel":
+            return replace(
+                result,
+                mission_native={
+                    **result.mission_native,
+                    "frequency": "A",
+                    "polarization": "VV",
+                },
+            )
+        return replace(result, source_path=str(tmp_path / "other.h5"))
+
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
+        read_product,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
+
+
 def test_nisar_stack_fails_closed_before_shared_s1_processing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -159,6 +212,8 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
     )
     stack = NISARStack.from_rslc(paths, work_dir=tmp_path / "work")
 
+    with pytest.raises(NotImplementedError, match="NISAR RSLC Stack"):
+        stack.measure_misreg()
     with pytest.raises(NotImplementedError, match="NISAR RSLC Stack"):
         stack.coregister_scenes()
     with pytest.raises(NotImplementedError, match="NISAR RSLC Stack"):

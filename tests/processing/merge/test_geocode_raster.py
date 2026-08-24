@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -143,7 +144,7 @@ def test_geocode_complex_to_grid_rejects_shape_mismatch() -> None:
     model = _toy_geometry((32, 32))
     complex_radar = np.ones((16, 16), dtype=np.complex64)
     grid = _toy_grid()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="shape"):
         geocode_complex_to_grid(
             complex_radar,
             geometry=model,
@@ -171,3 +172,57 @@ def test_geocoded_complex_carries_weight_field() -> None:
     assert result.weight.dtype == np.float32
     # weight is zero where invalid
     assert np.all(result.weight[~result.valid_mask] == 0.0)
+
+
+def test_geocode_forwards_independent_geometry_and_resampling_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Geo2Rdr and Lanczos receive their independently requested devices."""
+    calls: dict[str, object] = {}
+
+    def fake_geo2rdr(
+        _geometry: object,
+        lat: np.ndarray,
+        _lon: np.ndarray,
+        _height: object,
+        *,
+        device: object,
+    ) -> SimpleNamespace:
+        calls["geometry_device"] = device
+        shape = lat.shape
+        return SimpleNamespace(
+            azimuth_index=np.ones(shape, dtype=np.float64),
+            range_index=np.ones(shape, dtype=np.float64),
+            converged=np.ones(shape, dtype=bool),
+        )
+
+    def fake_lanczos(
+        _array: np.ndarray,
+        coords: np.ndarray,
+        *,
+        device: object,
+        **_kwargs: object,
+    ) -> np.ndarray:
+        calls["resampling_device"] = device
+        return np.ones(coords.shape[1], dtype=np.complex64)
+
+    monkeypatch.setattr(
+        "faninsar.processing.merge.geocode_raster.run_geo2rdr",
+        fake_geo2rdr,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.merge.geocode_raster.lanczos_resample",
+        fake_lanczos,
+    )
+
+    radar_shape = (8, 8)
+    result = geocode_complex_to_grid(
+        np.ones(radar_shape, dtype=np.complex64),
+        geometry=_toy_geometry(radar_shape),
+        grid=_toy_grid(),
+        device="cuda",
+        geometry_device="cpu",
+    )
+
+    assert result.valid_mask.all()
+    assert calls == {"geometry_device": "cpu", "resampling_device": "cuda"}

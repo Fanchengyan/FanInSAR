@@ -130,3 +130,59 @@ def test_nisar_window_read_rejects_out_of_bounds_window() -> None:
         NisarSensor().read_slc_window(handle, (slice(0, 5), slice(0, 2)))
 
     assert dataset.selections == []
+
+
+@pytest.mark.parametrize(
+    ("frequency", "polarization", "match"),
+    [
+        ("", "HH", "non-empty string"),
+        ("B", "", "non-empty string"),
+        (None, "HH", "non-empty string"),
+        ("B", None, "non-empty string"),
+        ("A", "VV", "frequency .* unavailable"),
+        ("B", "VV", "polarization .* unavailable"),
+    ],
+)
+def test_nisar_product_rejects_invalid_or_unavailable_channel_before_read(
+    frequency: str | None,
+    polarization: str | None,
+    match: str,
+) -> None:
+    """Channel admission fails before the reader can select a dataset."""
+    calls: list[tuple[str, str]] = []
+    handle = SimpleNamespace(
+        frequencies=("B",),
+        polarizations={"B": ("HH",)},
+        getSlcDatasetAsNativeComplex=lambda freq, pol: (
+            calls.append((freq, pol)) or object()
+        ),
+    )
+
+    with pytest.raises(ValueError, match=match):
+        NisarSensor().to_slc_product(
+            handle,
+            frequency=frequency,
+            polarization=polarization,
+        )
+
+    assert calls == []
+
+
+def test_nisar_product_defaults_to_explicit_b_hh_and_fails_closed() -> None:
+    """Omitted channel arguments mean B/HH, not an available-channel fallback."""
+    handle = SimpleNamespace(
+        frequencies=("A",),
+        polarizations={"A": ("VV",)},
+        getSlcDatasetAsNativeComplex=lambda *_args: object(),
+    )
+
+    with pytest.raises(ValueError, match="frequency 'B' is unavailable"):
+        NisarSensor().to_slc_product(handle)
+
+
+def test_nisar_product_rejects_conflicting_channel_aliases() -> None:
+    """Compatibility aliases cannot override an explicit channel request."""
+    handle = SimpleNamespace(frequencies=("B",), polarizations={"B": ("HH",)})
+
+    with pytest.raises(ValueError, match="different channels"):
+        NisarSensor().to_slc_product(handle, frequency="A", freq="B")

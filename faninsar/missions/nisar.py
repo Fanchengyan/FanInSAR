@@ -66,42 +66,42 @@ def _datetime(value: Any, reference: Any | None = None) -> datetime:
     return result if result.tzinfo else result.replace(tzinfo=UTC)
 
 
-def _select_channel(handle: Any, frequency: str | None, polarization: str | None) -> tuple[str, str]:
+def _select_channel(handle: Any, frequency: str, polarization: str) -> tuple[str, str]:
     """Select one available NISAR frequency and polarization."""
     frequencies = _value(handle, "frequencies")
     polarizations = _value(handle, "polarizations")
     if frequencies is None or polarizations is None:
-        raise InvalidProcessingStateError(
-            "NISAR RSLC must expose frequency and polarization metadata"
-        )
+        message = "NISAR RSLC must expose frequency and polarization metadata"
+        logger.error(message)
+        raise InvalidProcessingStateError(message)
     if isinstance(frequencies, str):
         frequencies = (frequencies,)
     available = {_normalize_channel(item, field="frequency") for item in frequencies}
-    selected_frequency = _normalize_channel(
-        frequency or sorted(available)[0], field="frequency"
-    )
+    selected_frequency = _normalize_channel(frequency, field="frequency")
     if selected_frequency not in available:
-        raise ValueError(f"NISAR frequency {selected_frequency!r} is unavailable")
+        message = f"NISAR frequency {selected_frequency!r} is unavailable"
+        logger.error(message)
+        raise ValueError(message)
     values = polarizations.get(selected_frequency) or polarizations.get(
         selected_frequency.lower()
     ) if isinstance(polarizations, Mapping) else polarizations
     if values is None:
-        raise InvalidProcessingStateError(
-            f"NISAR frequency {selected_frequency!r} has no polarizations"
-        )
+        message = f"NISAR frequency {selected_frequency!r} has no polarizations"
+        logger.error(message)
+        raise InvalidProcessingStateError(message)
     if isinstance(values, str):
         values = (values,)
     available_pols = {
         _normalize_channel(item, field="polarization") for item in values
     }
-    selected_polarization = _normalize_channel(
-        polarization or sorted(available_pols)[0], field="polarization"
-    )
+    selected_polarization = _normalize_channel(polarization, field="polarization")
     if selected_polarization not in available_pols:
-        raise ValueError(
+        message = (
             f"NISAR polarization {selected_polarization!r} is unavailable for "
             f"frequency {selected_frequency!r}"
         )
+        logger.error(message)
+        raise ValueError(message)
     return selected_frequency, selected_polarization
 
 
@@ -314,20 +314,42 @@ class NisarSensor(Sensor):
         self,
         handle: Any,
         *,
-        frequency: str | None = None,
-        polarization: str | None = None,
+        frequency: str = "B",
+        polarization: str = "HH",
         acquisition_id: str | None = None,
         source_path: str | Path | None = None,
         **kwargs: Any,
     ) -> SLCReadResult:
         """Normalize one admitted NISAR RSLC channel without reading its raster."""
+        if "freq" in kwargs:
+            alias = _normalize_channel(kwargs.pop("freq"), field="frequency")
+            direct = _normalize_channel(frequency, field="frequency")
+            if direct not in {"B", alias}:
+                message = (
+                    "NISAR frequency and freq aliases specify different channels"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            frequency = alias
+        if "pol" in kwargs:
+            alias = _normalize_channel(kwargs.pop("pol"), field="polarization")
+            direct = _normalize_channel(polarization, field="polarization")
+            if direct not in {"HH", alias}:
+                message = (
+                    "NISAR polarization and pol aliases specify different channels"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            polarization = alias
         frequency, polarization = _select_channel(
             handle,
-            frequency or kwargs.pop("freq", None),
-            polarization or kwargs.pop("pol", None),
+            frequency,
+            polarization,
         )
         if kwargs:
-            raise TypeError(f"Unsupported NISAR product options: {tuple(kwargs)}")
+            message = f"Unsupported NISAR product options: {tuple(kwargs)}"
+            logger.error(message)
+            raise TypeError(message)
         dataset = handle.getSlcDatasetAsNativeComplex(frequency, polarization)
         shape = tuple(int(item) for item in getattr(dataset, "shape", ()))
         if len(shape) != 2 or min(shape) <= 0:
