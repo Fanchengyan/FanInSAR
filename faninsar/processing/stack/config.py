@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
+    from faninsar._core.device import GpuMemoryReclaim
     from faninsar.processing.contracts.prepared_geometry import (
         ActivationToken,
         StackActivationBinding,
@@ -59,11 +60,19 @@ class StackConfig:
     n_jobs: int = 1
     retain_pair_states: bool = False
     record_scientific_lineage: bool = False
+    gpu_memory_reclaim: GpuMemoryReclaim = "adaptive"
     extra: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize path and multilook types."""
         self.work_dir = Path(self.work_dir)
+        if self.gpu_memory_reclaim not in {"lazy", "eager", "adaptive"}:
+            message = (
+                "gpu_memory_reclaim must be 'lazy', 'eager', or 'adaptive'; "
+                f"got {self.gpu_memory_reclaim!r}"
+            )
+            logger.error(message)
+            raise ValueError(message)
         if self.on_network_failure != "error":
             message = (
                 "P19 qualified Stack mode is fail-closed; "

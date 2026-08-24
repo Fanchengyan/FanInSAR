@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -25,9 +25,6 @@ from faninsar.processing.stack.ifg_store import (
 )
 from faninsar.processing.stack.scene_store import write_scene_unit
 from faninsar.processing.timeseries import write_timeseries_zarr
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def _stack_with_three_date_network(tmp_path: Path) -> Stack:
@@ -108,6 +105,29 @@ def test_stack_from_safes_defaults(tmp_path: Path) -> None:
     stack.measure_misreg()
     stack.invert_misreg()
     assert stack.date_misreg is None
+
+
+def test_coreg_resume_identity_accepts_all_burst_token(tmp_path: Path) -> None:
+    """Burst selection token ``all`` is part of the request identity."""
+    paths = []
+    for day in ("20160101", "20160113"):
+        path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
+        path.mkdir()
+        paths.append(path)
+    stack = Stack.from_safes(
+        paths,
+        work_dir=tmp_path / "out",
+        activation_mode="reference",
+        coreg_mode="pair",
+        swaths=("IW1", "IW2"),
+        bursts={"IW1": "all", "IW2": "all"},
+    )
+    digest = stack._coreg_resume_identity(
+        "20160113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    assert len(digest) == 64
 
 
 def test_coregister_scenes_releases_prior_pair_before_next_date(
@@ -948,3 +968,132 @@ def test_coreg_resume_identity_captures_nested_dem_sampling_semantics(
 
     assert bilinear_identity != bicubic_identity
     assert first_nested_identity != second_nested_identity
+
+
+def test_stack_config_gpu_memory_reclaim_defaults_to_adaptive(tmp_path: Path) -> None:
+    """PROPOSAL-0034: StackConfig.gpu_memory_reclaim default is adaptive."""
+    paths = []
+    for day in ("20160101", "20160113"):
+        path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
+        path.mkdir()
+        paths.append(path)
+    stack = Stack.from_safes(
+        paths,
+        work_dir=tmp_path / "out",
+        activation_mode="reference",
+    )
+    assert stack.config.gpu_memory_reclaim == "adaptive"
+    config = StackConfig(work_dir=tmp_path / "cfg", activation_mode="reference")
+    assert config.gpu_memory_reclaim == "adaptive"
+
+
+def test_reclaim_checkpoint_policy_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """lazy/eager/adaptive follow the capacity and pressure table."""
+    torch = pytest.importorskip("torch")
+    from faninsar._core.device import reclaim_checkpoint
+
+    calls: list[int] = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
+    device = torch.device("cuda")
+    gib = 1024**3
+    assert (
+        reclaim_checkpoint(
+            device, "lazy", kind="persist", total_bytes=8 * gib, reserved_bytes=8 * gib
+        )
+        is False
+    )
+    assert calls == []
+    assert reclaim_checkpoint(device, "lazy", kind="explicit") is True
+    assert calls == [1]
+    calls.clear()
+    assert reclaim_checkpoint(device, "lazy", kind="oom") is True
+    assert reclaim_checkpoint(device, "eager", kind="persist") is True
+    assert reclaim_checkpoint(device, "eager", kind="stage") is True
+    calls.clear()
+    assert (
+        reclaim_checkpoint(
+            device,
+            "adaptive",
+            kind="persist",
+            total_bytes=40 * gib,
+            reserved_bytes=39 * gib,
+        )
+        is False
+    )
+    assert (
+        reclaim_checkpoint(
+            device,
+            "adaptive",
+            kind="stage",
+            total_bytes=12 * gib,
+            reserved_bytes=1,
+        )
+        is True
+    )
+    assert (
+        reclaim_checkpoint(
+            device,
+            "adaptive",
+            kind="persist",
+            total_bytes=20 * gib,
+            reserved_bytes=int(0.9 * 20 * gib),
+        )
+        is True
+    )
+    calls.clear()
+    assert (
+        reclaim_checkpoint(
+            device,
+            "adaptive",
+            kind="stage",
+            total_bytes=20 * gib,
+            reserved_bytes=int(0.5 * 20 * gib),
+        )
+        is False
+    )
+    assert calls == []
+
+
+def test_stack_dask_persist_stage_reclaim_uses_client_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dask GPU workers receive reclaim_checkpoint; tiles do not empty_cache."""
+    import inspect
+
+    from faninsar.backends import dask_gpu
+    from faninsar.backends.dask_gpu import _reclaim_checkpoint_on_worker
+
+    remote_calls: list[tuple[object, tuple[object, ...]]] = []
+
+    class FakeClient:
+        def run(self, func: object, *args: object, **_kwargs: object) -> dict[str, bool]:
+            remote_calls.append((func, args))
+            return {"gpu-worker": func(*args)}
+
+    paths = []
+    for day in ("20160101", "20160113"):
+        path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
+        path.mkdir()
+        paths.append(path)
+    stack = Stack.from_safes(
+        paths,
+        work_dir=tmp_path / "out",
+        activation_mode="reference",
+        gpu_memory_reclaim="eager",
+        dask_client=FakeClient(),
+    )
+    monkeypatch.setattr(
+        "faninsar._core.device.reclaim_checkpoint",
+        lambda *_args, **kwargs: kwargs.get("kind"),
+    )
+    stack._reclaim_accelerator("persist")
+    stack._reclaim_accelerator("stage")
+    assert len(remote_calls) == 2
+    assert remote_calls[0][0] is _reclaim_checkpoint_on_worker
+    assert remote_calls[0][1][2] == "persist"
+    assert remote_calls[1][1][2] == "stage"
+    module_text = Path(dask_gpu.__file__).read_text(encoding="utf-8")
+    assert "empty_cache" not in module_text
+    schedule = inspect.getsource(dask_gpu._schedule_carrier_multiply)
+    assert "empty_cache" not in schedule
+    assert "reclaim_checkpoint" not in schedule

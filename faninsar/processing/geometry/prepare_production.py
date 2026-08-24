@@ -1,3 +1,5 @@
+# ruff: noqa: EM101, EM102, TRY003, PLR0911
+
 """Ampcor-style production helper for P20/P25/P26 geometry (PROPOSAL-0031).
 
 Callers pass ``device`` only. UUID, native executor, and candidate keys stay
@@ -6,6 +8,7 @@ inside this module. Failed native prepare stays on same-device Torch.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -28,7 +31,12 @@ from faninsar.processing.geometry.native_v2.builder import (
 )
 from faninsar.processing.geometry.public import execute_geometry, prepare_geometry
 from faninsar.processing.geometry.transforms import TransformResult
-from faninsar.processing.geometry.v2 import Operation, SolverSettings, TransformResultV2
+from faninsar.processing.geometry.v2 import (
+    GeometryValidationError,
+    Operation,
+    SolverSettings,
+    TransformResultV2,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -41,6 +49,11 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 _NATIVE_SOURCE_ROOT = Path(__file__).resolve().parent / "native_v2"
+_CUDA_MODULES: dict[str, object] = {}
+_PREPARED_CACHE: dict[tuple[object, ...], object] = {}
+_PREPARED_CACHE_LIMIT = 12
+_GPU_DEM_TABLE: dict[tuple[str, str], dict[str, object]] = {}
+_RDR2GEO_DEM_FIELDS = ("dem_values", "dem_metadata", "dem_height_bounds")
 
 
 def _require_device(device: DeviceLike) -> object:
@@ -58,6 +71,100 @@ def _require_device(device: DeviceLike) -> object:
         logger.error(message)
         raise DispatchError(message)
     return resolved
+
+
+def _device_cache_identity(
+    resolved: object,
+    physical_uuid: str | None,
+    mig_uuid: str | None,
+) -> str:
+    """Stable device identity for prepared cache and GPU DEM residency."""
+    kind = getattr(resolved, "type", None)
+    if kind == "cuda" and physical_uuid:
+        if mig_uuid:
+            return f"cuda-uuid:{physical_uuid}:mig:{mig_uuid}"
+        return f"cuda-uuid:{physical_uuid}"
+    if kind:
+        index = getattr(resolved, "index", None)
+        if index is not None:
+            return f"{kind}:{index}"
+        return str(kind)
+    return str(resolved)
+
+
+def _native_dem_context_bound(context: object) -> bool:
+    """Return True when Native rdr2geo context carries DEM raster tensors."""
+    if not isinstance(context, dict):
+        return False
+    return all(context.get(name) is not None for name in _RDR2GEO_DEM_FIELDS)
+
+
+def _resident_gpu_dem(
+    dem_digest: str,
+    device_identity: str,
+    torch_device: object,
+    dem: DEMSampler | None,
+) -> dict[str, object]:
+    """Return device DEM tensors, uploading once per digest and device.
+
+    Distinct prepared shapes share this table (PROPOSAL-0034). A digest
+    miss re-uploads; a hit aliases the resident tensors.
+    """
+    import torch
+
+    key = (dem_digest, device_identity)
+    cached = _GPU_DEM_TABLE.get(key)
+    if cached is not None:
+        return cached
+    dem_values, dem_metadata, dem_bounds = _dem_native_arrays(dem)
+    resident = {
+        "dem_values": torch.as_tensor(
+            dem_values, dtype=torch.float64, device=torch_device
+        ).contiguous(),
+        "dem_metadata": torch.as_tensor(
+            dem_metadata, dtype=torch.float64, device=torch_device
+        ),
+        "dem_height_bounds": torch.as_tensor(
+            dem_bounds, dtype=torch.float64, device=torch_device
+        ),
+    }
+    _GPU_DEM_TABLE[key] = resident
+    return resident
+
+
+def _prepared_cache_key(
+    op: Operation,
+    model: RadarGeometryModel,
+    *,
+    shape: tuple[int, ...],
+    resolved: object,
+    dem: DEMSampler | None,
+    solver: SolverSettings,
+    physical_uuid: str | None,
+    mig_uuid: str | None,
+) -> tuple[object, ...]:
+    """Operational prepared identity (PROPOSAL-0034).
+
+    Keyed by operation, model_digest, orbit digest, DEM digest, shape,
+    solver.for_operation, and device UUID. Excludes toolchain/runtime and
+    ``id(model)``.
+    """
+    from faninsar.processing.geometry.torch_backends_v2 import (
+        _dem_digest,
+        _model_digests,
+    )
+
+    model_digest, orbit_digest = _model_digests(model)
+    solver_items = tuple(sorted(solver.for_operation(op).items()))
+    return (
+        op.value,
+        model_digest,
+        orbit_digest,
+        _dem_digest(dem),
+        shape,
+        solver_items,
+        _device_cache_identity(resolved, physical_uuid, mig_uuid),
+    )
 
 
 def _cuda_uuids(resolved: object) -> tuple[str, str | None]:
@@ -81,29 +188,80 @@ def _native_build_dir() -> Path:
     return path
 
 
-def _prepend_packaged_cuda_toolchain() -> None:
-    """Prefer the interpreter's CUDA 12 nvcc/ninja over a stale system CUDA 10."""
-    pixi_bin = Path(sys.executable).resolve().parent
-    nvcc = pixi_bin / "nvcc"
+def _pixi_nvcc() -> Path | None:
+    """Return the interpreter-local nvcc, never ``/usr/bin/nvcc``."""
+    nvcc = Path(sys.executable).resolve().parent / "nvcc"
     if not nvcc.is_file():
-        return
-    current = os.environ.get("PATH", "")
-    prefix = str(pixi_bin)
-    if not current.startswith(prefix + os.pathsep) and current != prefix:
-        os.environ["PATH"] = prefix + os.pathsep + current
-    os.environ["CUDA_HOME"] = str(pixi_bin.parent)
+        return None
+    if nvcc.resolve() == Path("/usr/bin/nvcc").resolve():
+        return None
+    return nvcc
+
+
+def _prepend_packaged_cuda_toolchain() -> Path | None:
+    """Bind Torch cpp_extension to the pixi CUDA 12 toolkit.
+
+    Login PATH on the A100 host finds system CUDA 10 ``/usr/bin/nvcc`` first.
+    Torch records ``CUDA_HOME`` at ``cpp_extension`` import time, so this
+    must rewrite both the environment and the already-imported module.
+    """
+    nvcc = _pixi_nvcc()
+    if nvcc is None:
+        logger.error(
+            "pixi nvcc is required for native CUDA geometry; "
+            "refusing system /usr/bin/nvcc"
+        )
+        return None
+    pixi_bin = nvcc.parent
+    cuda_home = pixi_bin.parent
+    os.environ["PATH"] = str(pixi_bin) + os.pathsep + os.environ.get("PATH", "")
+    os.environ["CUDA_HOME"] = str(cuda_home)
     os.environ["CUDA_NVCC_EXECUTABLE"] = str(nvcc)
+    os.environ["CUDACXX"] = str(nvcc)
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
+    try:
+        from torch.utils import cpp_extension
+
+        cpp_extension.CUDA_HOME = str(cuda_home)
+    except ImportError:
+        pass
+    _scrub_stale_system_nvcc_ninja(nvcc)
+    return nvcc
+
+
+def _scrub_stale_system_nvcc_ninja(nvcc: Path) -> None:
+    """Drop ninja graphs that still hard-code system CUDA 10 ``/usr/bin/nvcc``."""
+    ninja = _native_build_dir() / "build.ninja"
+    if not ninja.is_file():
+        return
+    text = ninja.read_text(errors="replace")
+    if "nvcc = /usr/bin/nvcc" not in text:
+        return
+    logger.warning(
+        "removing stale native ninja graph that invoked /usr/bin/nvcc; "
+        "rebuilding with %s",
+        nvcc,
+    )
+    ninja.unlink(missing_ok=True)
+    for child in ninja.parent.glob("*.o"):
+        child.unlink(missing_ok=True)
+    for child in ninja.parent.glob("*.d"):
+        child.unlink(missing_ok=True)
 
 
 def _try_load_cuda_module(operation: NativeOperation) -> object | None:
     """Prepare a CUDA geo module; return None on any failure."""
+    cached = _CUDA_MODULES.get(operation.value)
+    if cached is not None:
+        return cached
+    nvcc = _prepend_packaged_cuda_toolchain()
+    if nvcc is None:
+        return None
     import torch
     from torch.utils import cpp_extension
 
     if not torch.cuda.is_available():
         return None
-    _prepend_packaged_cuda_toolchain()
     request = NativeBuildRequest(
         operation,
         NativeBackend.CUDA,
@@ -123,6 +281,7 @@ def _try_load_cuda_module(operation: NativeOperation) -> object | None:
     def build(plan_to_build: object) -> Path:
         """Explicit P25 cpp_extension callback; never compile on import."""
         plan_value = plan_to_build
+        cpp_extension.CUDA_HOME = str(nvcc.parent.parent)
         module = cpp_extension.load(
             name=plan_value.extension_name,
             sources=[str(source) for source in plan_value.sources],
@@ -134,6 +293,14 @@ def _try_load_cuda_module(operation: NativeOperation) -> object | None:
             with_cuda=True,
             verbose=False,
         )
+        ninja = _native_build_dir() / "build.ninja"
+        if ninja.is_file() and "nvcc = /usr/bin/nvcc" in ninja.read_text(
+            errors="replace"
+        ):
+            raise RuntimeError(
+                "native ninja still invokes /usr/bin/nvcc; "
+                f"expected pixi nvcc {nvcc}"
+            )
         module_holder["module"] = module
         return Path(getattr(module, "__file__", _native_build_dir()))
 
@@ -150,7 +317,10 @@ def _try_load_cuda_module(operation: NativeOperation) -> object | None:
             prepared.reason,
         )
         return None
-    return module_holder.get("module")
+    module = module_holder.get("module")
+    if module is not None:
+        _CUDA_MODULES[operation.value] = module
+    return module
 
 
 def to_transform_result(result: TransformResultV2) -> TransformResult:
@@ -165,6 +335,62 @@ def to_transform_result(result: TransformResultV2) -> TransformResult:
         residual_range_m=result.residual_range_m,
         residual_doppler_hz=result.residual_doppler_hz,
     )
+
+
+def _prepare_geometry_identities(
+    op: Operation,
+    model: RadarGeometryModel,
+    *,
+    shape: tuple[int, ...],
+    resolved: object,
+    dem: DEMSampler | None,
+    solver: SolverSettings,
+    native_ok: bool,
+    loaded: object,
+    native_key: object,
+    native_context: object,
+    physical_uuid: str | None,
+    mig_uuid: str | None,
+    use_compile: bool,
+) -> PreparedGeometry:
+    """Register Native (when bound) and optional Compile, then Eager."""
+    try:
+        return prepare_geometry(
+            op,
+            model,
+            shape=shape,
+            device=resolved,
+            dem=dem,
+            settings=solver,
+            native_executor=loaded if native_ok else None,
+            native_key=native_key if native_ok else None,
+            native_context_inputs=native_context if native_ok else None,
+            native_correctness_qualified=native_ok,
+            native_performance_eligible=native_ok,
+            compile=use_compile,
+            compile_performance_eligible=use_compile,
+            physical_uuid=physical_uuid,
+            mig_uuid=mig_uuid,
+        )
+    except (DispatchError, GeometryValidationError) as error:
+        logger.warning(
+            "native geometry registration failed (%s); continuing on Torch",
+            error,
+        )
+        return prepare_geometry(
+            op,
+            model,
+            shape=shape,
+            device=resolved,
+            dem=dem,
+            settings=solver,
+            native_correctness_qualified=False,
+            native_performance_eligible=False,
+            compile=use_compile,
+            compile_performance_eligible=use_compile,
+            physical_uuid=physical_uuid,
+            mig_uuid=mig_uuid,
+        )
 
 
 def prepare_production_geometry(
@@ -197,7 +423,12 @@ def prepare_production_geometry(
     Returns
     -------
     PreparedGeometry
-        Ready for :func:`execute_geometry`.
+        Ready for :func:`execute_geometry`.  CUDA prepares Native when the
+        operation ABI is bound (``geo2rdr`` orbit context, ``rdr2geo`` orbit
+        plus DEM raster/affine; PROPOSAL-0020 / PROPOSAL-0025 / PROPOSAL-0026).
+        ``torch.compile`` is prepared only when Native is not bound. CPU stays
+        Eager so CI does not pay compile. Native or compile failure stays on
+        same-device Eager.
 
     Raises
     ------
@@ -218,9 +449,30 @@ def prepare_production_geometry(
         physical_uuid, mig_uuid = _cuda_uuids(resolved)
     solver = settings or SolverSettings()
     op = Operation(operation)
+    normalized_shape = tuple(int(value) for value in shape)
+    dem_arg = dem
+    if op is Operation.RDR2GEO and dem_arg is None:
+        dem_arg = ConstantHeightDEM(0.0)
+    cache_key = _prepared_cache_key(
+        op,
+        model,
+        shape=normalized_shape,
+        resolved=resolved,
+        dem=dem_arg,
+        solver=solver,
+        physical_uuid=physical_uuid,
+        mig_uuid=mig_uuid,
+    )
+    cached = _PREPARED_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     native_op = (
         NativeOperation.GEO2RDR if op is Operation.GEO2RDR else NativeOperation.RDR2GEO
     )
+    loaded = None
+    native_key = None
+    native_context = None
+    native_ok = False
     if resolved.type == "cuda":
         loaded = _try_load_cuda_module(native_op)
         if loaded is None:
@@ -228,27 +480,408 @@ def prepare_production_geometry(
                 "CUDA %s native module not loaded; continuing on same-device Torch",
                 native_op.value,
             )
+        elif op is Operation.GEO2RDR:
+            try:
+                native_key, native_context = _geo2rdr_native_manifest(
+                    model=model,
+                    shape=normalized_shape,
+                    solver=solver,
+                    resolved=resolved,
+                    physical_uuid=physical_uuid,
+                    mig_uuid=mig_uuid,
+                    module=loaded,
+                )
+                native_ok = True
+                logger.info(
+                    "CUDA geo2rdr native module loaded and registered for auto dispatch"
+                )
+            except Exception as error:
+                logger.warning(
+                    "CUDA geo2rdr native registration failed (%s); "
+                    "continuing on same-device Torch",
+                    error,
+                )
+                loaded = None
         else:
-            logger.info(
-                "CUDA %s native module loaded; auto stays on Torch until a "
-                "same-process native-vs-Torch compare supplies CandidateKey "
-                "and qualification flags",
-                native_op.value,
-            )
-    dem_arg = dem
-    if op is Operation.RDR2GEO and dem_arg is None:
-        dem_arg = ConstantHeightDEM(0.0)
-    return prepare_geometry(
-        op,
+            try:
+                native_key, native_context = _rdr2geo_native_manifest(
+                    model=model,
+                    shape=normalized_shape,
+                    solver=solver,
+                    resolved=resolved,
+                    physical_uuid=physical_uuid,
+                    mig_uuid=mig_uuid,
+                    module=loaded,
+                    dem=dem_arg,
+                )
+                if not _native_dem_context_bound(native_context):
+                    logger.warning(
+                        "CUDA rdr2geo Native DEM-bound identity refused without "
+                        "DEM context; continuing on same-device Torch "
+                        "(PROPOSAL-0025 / PROPOSAL-0026)"
+                    )
+                    loaded = None
+                    native_key = None
+                    native_context = None
+                else:
+                    native_ok = True
+                    logger.info(
+                        "CUDA rdr2geo native module loaded and registered "
+                        "with DEM context"
+                    )
+            except Exception as error:
+                logger.warning(
+                    "CUDA rdr2geo native registration failed (%s); "
+                    "continuing on same-device Torch",
+                    error,
+                )
+                loaded = None
+    use_compile = resolved.type == "cuda" and not native_ok
+    try:
+        prepared = _prepare_geometry_identities(
+            op,
+            model,
+            shape=normalized_shape,
+            resolved=resolved,
+            dem=dem_arg,
+            solver=solver,
+            native_ok=native_ok,
+            loaded=loaded,
+            native_key=native_key,
+            native_context=native_context,
+            physical_uuid=physical_uuid,
+            mig_uuid=mig_uuid,
+            use_compile=use_compile,
+        )
+    except Exception as error:
+        if not use_compile:
+            raise
+        logger.warning(
+            "CUDA compile prepare failed (%s); continuing on same-device Eager",
+            error,
+        )
+        prepared = _prepare_geometry_identities(
+            op,
+            model,
+            shape=normalized_shape,
+            resolved=resolved,
+            dem=dem_arg,
+            solver=solver,
+            native_ok=native_ok,
+            loaded=loaded,
+            native_key=native_key,
+            native_context=native_context,
+            physical_uuid=physical_uuid,
+            mig_uuid=mig_uuid,
+            use_compile=False,
+        )
+    if len(_PREPARED_CACHE) >= _PREPARED_CACHE_LIMIT:
+        oldest = next(iter(_PREPARED_CACHE))
+        _PREPARED_CACHE.pop(oldest, None)
+    _PREPARED_CACHE[cache_key] = prepared
+    return prepared
+
+
+def _geo2rdr_native_manifest(
+    *,
+    model: RadarGeometryModel,
+    shape: tuple[int, ...],
+    solver: SolverSettings,
+    resolved: object,
+    physical_uuid: str | None,
+    mig_uuid: str | None,
+    module: object,
+) -> tuple[object, dict[str, object]]:
+    """Build the explicit CandidateKey + orbit context for CUDA geo2rdr."""
+    from faninsar.processing.geometry.backend_dispatch import CandidateKey
+    from faninsar.processing.geometry.torch_backends_v2 import prepare_torch_geometry
+    from faninsar.processing.geometry.v2 import DeviceKey, ExecutionProfile
+
+    if not physical_uuid:
+        message = "CUDA native geo2rdr requires a physical UUID"
+        raise DispatchError(message)
+    torch_prepared = prepare_torch_geometry(
+        Operation.GEO2RDR,
         model,
-        shape=tuple(int(value) for value in shape),
+        shape=shape,
         device=resolved,
+        max_iter=solver.max_iter,
+        extra_iter=solver.extra_iter,
+        range_tol_m=solver.range_tolerance_m,
+        doppler_tol_hz=solver.doppler_tolerance_hz,
+        compile_kernel=False,
+    )
+    device_key = DeviceKey.cuda(physical_uuid, mig_uuid)
+    artifact = str(getattr(module, "__file__", "") or "cuda-geo2rdr")
+    digest = hashlib.sha256(artifact.encode()).hexdigest()
+    key_solver = torch_prepared.settings.operation_settings(Operation.GEO2RDR).solver
+    key = CandidateKey(
+        operation=Operation.GEO2RDR,
+        backend="native",
+        device=device_key,
+        dtype=torch_prepared.dtype,
+        shape=shape,
+        solver=key_solver,
+        orbit_digest=torch_prepared.identity.orbit_digest,
+        dem_digest=torch_prepared.identity.dem_digest,
+        model_digest=torch_prepared.identity.model_digest,
+        source_digest=digest,
+        toolchain_digest=digest,
+        runtime_digest=digest,
+        artifact_digest=digest,
+        abi_digest=hashlib.sha256(b"faninsar.geometry.native_v2.14-field.v1").hexdigest(),
+        support_contract_digest=torch_prepared.identity.settings_digest,
+        profile=ExecutionProfile(device_key),
+    )
+    import torch
+
+    torch_device = torch.device(str(resolved))
+    orbit = model.orbit
+    times = np.asarray(orbit.times_s, dtype=np.float64)
+    positions = np.stack(
+        [spline(orbit.times_s) for spline in orbit.trajectory_splines],
+        axis=-1,
+    ).astype(np.float64, copy=False)
+    velocities = np.stack(
+        [spline(orbit.times_s, 1) for spline in orbit.trajectory_splines],
+        axis=-1,
+    ).astype(np.float64, copy=False)
+    parameters = np.array(
+        [
+            (model.sensing_start - model.orbit.epoch).total_seconds(),
+            model.azimuth_time_interval_s,
+            model.starting_slant_range_m,
+            model.range_spacing_m,
+            model.wavelength_m,
+        ],
+        dtype=np.float64,
+    )
+    context = {
+        "orbit_times": torch.as_tensor(times, dtype=torch.float64, device=torch_device),
+        "orbit_positions": torch.as_tensor(
+            positions, dtype=torch.float64, device=torch_device
+        ),
+        "orbit_velocities": torch.as_tensor(
+            velocities, dtype=torch.float64, device=torch_device
+        ),
+        "model_parameters": torch.as_tensor(
+            parameters, dtype=torch.float64, device=torch_device
+        ),
+        "look_right": model.look_direction == "right",
+    }
+    return key, context
+
+
+def _dem_native_arrays(
+    dem: DEMSampler | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Materialize DEM raster, affine metadata, and height bounds.
+
+    Metadata is canonical ``[lat_start, lon_start, lat_spacing, lon_spacing]``.
+    CUDA dispatch reorders that tuple to the native ABI. Constant-height DEMs
+    become a coarse global raster so the six-point stencil stays in-bounds.
+    """
+    from faninsar.processing.geometry.dem import GeoidAdjustedDEM, RasterDEM
+
+    sampler = ConstantHeightDEM(0.0) if dem is None else dem
+    if isinstance(sampler, GeoidAdjustedDEM):
+        ortho = sampler.orthometric_dem
+        geoid = sampler.geoid
+        if not isinstance(ortho, RasterDEM) or not isinstance(geoid, RasterDEM):
+            message = "native CUDA rdr2geo needs RasterDEM members on GeoidAdjustedDEM"
+            raise DispatchError(message)
+        values, metadata, bounds = _raster_dem_native_arrays(ortho)
+        geoid_values, geoid_metadata, _geoid_bounds = _raster_dem_native_arrays(geoid)
+        if not np.allclose(metadata, geoid_metadata):
+            message = "native CUDA rdr2geo GeoidAdjustedDEM grids must share affine"
+            raise DispatchError(message)
+        if geoid_values.shape != values.shape:
+            message = "native CUDA rdr2geo GeoidAdjustedDEM grids must share shape"
+            raise DispatchError(message)
+        values = values + geoid_values
+        finite = np.isfinite(values)
+        if not np.any(finite):
+            raise DispatchError("native CUDA rdr2geo DEM has no finite samples")
+        bounds = np.array(
+            [float(np.min(values[finite])), float(np.max(values[finite]))],
+            dtype=np.float64,
+        )
+        return values, metadata, bounds
+    if isinstance(sampler, RasterDEM):
+        return _raster_dem_native_arrays(sampler)
+    if isinstance(sampler, ConstantHeightDEM):
+        rows, cols = 80, 160
+        height = float(sampler.height_m)
+        values = np.full((rows, cols), height, dtype=np.float64)
+        metadata = np.array(
+            [90.0, -180.0, -180.0 / float(rows - 1), 360.0 / float(cols - 1)],
+            dtype=np.float64,
+        )
+        bounds = np.array([height, height], dtype=np.float64)
+        return values, metadata, bounds
+    message = f"unsupported DEM type for native CUDA rdr2geo: {type(sampler).__name__}"
+    raise DispatchError(message)
+
+
+def _raster_dem_native_arrays(
+    dem: object,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Upload one RasterDEM into the native context arrays."""
+    dataset = dem._open()
+    samples = dem._height_array
+    if samples is None:
+        samples = dataset.read(1).astype(np.float32, copy=False)
+        nodata = dem.nodata
+        if nodata is None:
+            nodata = dataset.nodata
+        if nodata is not None:
+            samples = np.where(np.isclose(samples, nodata), np.nan, samples)
+        dem._height_array = samples
+    transform = dataset.transform
+    if abs(float(transform.b)) > 1.0e-12 or abs(float(transform.d)) > 1.0e-12:
+        raise DispatchError(
+            "native CUDA rdr2geo requires an unrotated geographic DEM affine"
+        )
+    values = np.asarray(samples, dtype=np.float64)
+    if values.ndim != 2 or min(values.shape) < 6:
+        raise DispatchError("native CUDA rdr2geo DEM must be at least 6x6")
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        raise DispatchError("native CUDA rdr2geo DEM has no finite samples")
+    metadata = np.array(
+        [
+            float(transform.f),
+            float(transform.c),
+            float(transform.e),
+            float(transform.a),
+        ],
+        dtype=np.float64,
+    )
+    bounds = np.array(
+        [float(np.min(values[finite])), float(np.max(values[finite]))],
+        dtype=np.float64,
+    )
+    return values, metadata, bounds
+
+
+def _rdr2geo_native_manifest(
+    *,
+    model: RadarGeometryModel,
+    shape: tuple[int, ...],
+    solver: SolverSettings,
+    resolved: object,
+    physical_uuid: str | None,
+    mig_uuid: str | None,
+    module: object,
+    dem: DEMSampler | None,
+) -> tuple[object, dict[str, object]]:
+    """Build the CandidateKey + orbit/DEM context for CUDA rdr2geo."""
+    from faninsar.processing.geometry.backend_dispatch import CandidateKey
+    from faninsar.processing.geometry.torch_backends_v2 import prepare_torch_geometry
+    from faninsar.processing.geometry.v2 import DeviceKey, ExecutionProfile
+
+    if not physical_uuid:
+        message = "CUDA native rdr2geo requires a physical UUID"
+        raise DispatchError(message)
+    dem_arg = ConstantHeightDEM(0.0) if dem is None else dem
+    torch_prepared = prepare_torch_geometry(
+        Operation.RDR2GEO,
+        model,
+        shape=shape,
         dem=dem_arg,
-        settings=solver,
-        native_correctness_qualified=False,
-        native_performance_eligible=False,
-        physical_uuid=physical_uuid,
-        mig_uuid=mig_uuid,
+        device=resolved,
+        max_iter=solver.max_iter,
+        extra_iter=solver.extra_iter,
+        range_tol_m=solver.slant_range_tolerance_m,
+        doppler_tol_hz=solver.doppler_tolerance_hz,
+        compile_kernel=False,
+    )
+    device_key = DeviceKey.cuda(physical_uuid, mig_uuid)
+    artifact = str(getattr(module, "__file__", "") or "cuda-rdr2geo")
+    digest = hashlib.sha256(artifact.encode()).hexdigest()
+    key_solver = torch_prepared.settings.operation_settings(Operation.RDR2GEO).solver
+    key = CandidateKey(
+        operation=Operation.RDR2GEO,
+        backend="native",
+        device=device_key,
+        dtype=torch_prepared.dtype,
+        shape=shape,
+        solver=key_solver,
+        orbit_digest=torch_prepared.identity.orbit_digest,
+        dem_digest=torch_prepared.identity.dem_digest,
+        model_digest=torch_prepared.identity.model_digest,
+        source_digest=digest,
+        toolchain_digest=digest,
+        runtime_digest=digest,
+        artifact_digest=digest,
+        abi_digest=hashlib.sha256(b"faninsar.geometry.native_v2.14-field.v1").hexdigest(),
+        support_contract_digest=torch_prepared.identity.settings_digest,
+        profile=ExecutionProfile(device_key),
+    )
+    import torch
+
+    torch_device = torch.device(str(resolved))
+    orbit = model.orbit
+    times = np.asarray(orbit.times_s, dtype=np.float64)
+    positions = np.stack(
+        [spline(orbit.times_s) for spline in orbit.trajectory_splines],
+        axis=-1,
+    ).astype(np.float64, copy=False)
+    velocities = np.stack(
+        [spline(orbit.times_s, 1) for spline in orbit.trajectory_splines],
+        axis=-1,
+    ).astype(np.float64, copy=False)
+    parameters = np.array(
+        [
+            (model.sensing_start - model.orbit.epoch).total_seconds(),
+            model.azimuth_time_interval_s,
+            model.starting_slant_range_m,
+            model.range_spacing_m,
+            model.wavelength_m,
+        ],
+        dtype=np.float64,
+    )
+    resident_dem = _resident_gpu_dem(
+        torch_prepared.identity.dem_digest,
+        _device_cache_identity(resolved, physical_uuid, mig_uuid),
+        torch_device,
+        dem_arg,
+    )
+    context = {
+        "orbit_times": torch.as_tensor(times, dtype=torch.float64, device=torch_device),
+        "orbit_positions": torch.as_tensor(
+            positions, dtype=torch.float64, device=torch_device
+        ),
+        "orbit_velocities": torch.as_tensor(
+            velocities, dtype=torch.float64, device=torch_device
+        ),
+        "model_parameters": torch.as_tensor(
+            parameters, dtype=torch.float64, device=torch_device
+        ),
+        "look_right": model.look_direction == "right",
+        "dem_values": resident_dem["dem_values"],
+        "dem_metadata": resident_dem["dem_metadata"],
+        "dem_height_bounds": resident_dem["dem_height_bounds"],
+    }
+    return key, context
+
+
+def _reshape_transform_result(
+    result: TransformResult,
+    shape: tuple[int, ...],
+) -> TransformResult:
+    """Restore the public ND layout after a 1-D native or Torch solve."""
+    if result.azimuth_index.shape == shape:
+        return result
+    return TransformResult(
+        latitude_deg=np.asarray(result.latitude_deg).reshape(shape),
+        longitude_deg=np.asarray(result.longitude_deg).reshape(shape),
+        height_m=np.asarray(result.height_m).reshape(shape),
+        range_index=np.asarray(result.range_index).reshape(shape),
+        azimuth_index=np.asarray(result.azimuth_index).reshape(shape),
+        converged=np.asarray(result.converged).reshape(shape),
+        residual_range_m=np.asarray(result.residual_range_m).reshape(shape),
+        residual_doppler_hz=np.asarray(result.residual_doppler_hz).reshape(shape),
     )
 
 
@@ -263,23 +896,29 @@ def run_geo2rdr(
     range_tol_m: float = 0.01,
     doppler_tol_hz: float = 0.1,
 ) -> TransformResult:
-    """Execute production geo2rdr through the mandatory helper."""
+    """Execute production geo2rdr through the mandatory helper.
+
+    CUDA native geo2rdr accepts 1-D or 2-D tiles (ISCE3 gpuGeo2rdr style:
+    flatten to one thread per pixel, restore the raster layout on output).
+    """
     lat = np.asarray(latitude_deg, dtype=np.float64)
     lon = np.asarray(longitude_deg, dtype=np.float64)
     height = np.asarray(height_m, dtype=np.float64)
     lat, lon, height = np.broadcast_arrays(lat, lon, height)
+    original_shape = lat.shape
     prepared = prepare_production_geometry(
         Operation.GEO2RDR,
         model,
         device=device,
-        shape=lat.shape,
+        shape=original_shape,
         settings=SolverSettings(
             max_iter=max_iter,
             range_tolerance_m=range_tol_m,
             doppler_tolerance_hz=doppler_tol_hz,
         ),
     )
-    return to_transform_result(execute_geometry(prepared, lat, lon, height))
+    result = to_transform_result(execute_geometry(prepared, lat, lon, height))
+    return _reshape_transform_result(result, original_shape)
 
 
 def run_rdr2geo(

@@ -33,13 +33,12 @@ def _resolve_torch_device(device: DeviceName) -> torch.device:
 
 
 def _cleanup_device(device: torch.device) -> None:
-    """Release allocator caches for an accelerator device."""
-    import torch
+    """Drop no allocator slabs from a resampling kernel (PROPOSAL-0034).
 
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    elif device.type == "mps":
-        torch.mps.empty_cache()
+    Callers still ``del`` tensor references. Reclaim is orchestrated by
+    :func:`faninsar._core.device.reclaim_checkpoint`.
+    """
+    del device
 
 
 def _lanczos_resample_device_persistent(

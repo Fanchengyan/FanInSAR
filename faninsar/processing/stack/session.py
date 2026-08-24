@@ -13,8 +13,9 @@ import json
 import os
 import shutil
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
+from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, ParamSpec, Self, TypeVar
 
 import numpy as np
 
@@ -39,8 +40,9 @@ from faninsar.processing.stack.scene_store import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
 
+    from faninsar._core.device import GpuMemoryReclaim
     from faninsar.core.acquisition import Acquisition
     from faninsar.core.pairs import Pairs
     from faninsar.processing.contracts.prepared_geometry import (
@@ -65,6 +67,25 @@ if TYPE_CHECKING:
     from faninsar.query import BoundingBox, Polygons
 
 logger = setup_logger(__name__)
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _reclaim_after_stage(
+    method: Callable[_P, _R],
+) -> Callable[_P, _R]:
+    """Run reclaim_checkpoint(kind=stage) when a public Stack method returns."""
+
+    @wraps(method)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        self = args[0]
+        try:
+            return method(*args, **kwargs)
+        finally:
+            self._reclaim_accelerator("stage")
+
+    return wrapped
 
 
 def _atomic_write_array(path: Path, array: np.ndarray) -> None:
@@ -186,6 +207,7 @@ class Stack:
         activation_authority_root: str | Path | None = None,
         retain_pair_states: bool = False,
         record_scientific_lineage: bool = False,
+        gpu_memory_reclaim: GpuMemoryReclaim = "adaptive",
     ) -> Stack:
         """Construct a Stack from SAFE paths and optional pair graphs."""
         catalog = SceneCatalog.from_paths(list(paths))
@@ -233,6 +255,7 @@ class Stack:
             ),
             retain_pair_states=retain_pair_states,
             record_scientific_lineage=record_scientific_lineage,
+            gpu_memory_reclaim=gpu_memory_reclaim,
         )
         return cls(
             catalog=catalog,
@@ -244,6 +267,7 @@ class Stack:
             dask_client=dask_client,
         )
 
+    @_reclaim_after_stage
     def prepare_scenes(self) -> Self:
         """Create work directories and validate catalog/master."""
         self.config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -369,6 +393,32 @@ class Stack:
             "n_jobs": cfg.n_jobs,
         }
 
+    def _reclaim_accelerator(self, kind: str) -> None:
+        """Evaluate gpu_memory_reclaim on the CUDA-owning process."""
+        from faninsar._core.device import reclaim_checkpoint
+        from faninsar.backends.dask_gpu import run_reclaim_checkpoint
+
+        policy = self.config.gpu_memory_reclaim
+        device = self.config.device
+        client = self.dask_client
+        if client is not None:
+            try:
+                run_reclaim_checkpoint(client, device, policy, kind=kind)
+            except Exception:
+                logger.exception(
+                    "reclaim_checkpoint on Dask GPU workers failed (kind=%s)",
+                    kind,
+                )
+            return
+        try:
+            reclaim_checkpoint(device, policy, kind=kind)
+        except Exception:
+            logger.exception("reclaim_checkpoint failed (kind=%s)", kind)
+
+    def release_accelerator(self) -> None:
+        """Explicitly return unused accelerator slabs before yielding the GPU."""
+        self._reclaim_accelerator("explicit")
+
     def _coreg_resume_identity(
         self,
         date_id: str,
@@ -465,7 +515,11 @@ class Stack:
             "esd_method": self.config.esd_method,
             "swaths": list(self.config.swaths),
             "bursts": {
-                str(swath): [int(index) for index in indices]
+                str(swath): (
+                    indices
+                    if isinstance(indices, str)
+                    else [int(index) for index in indices]
+                )
                 for swath, indices in sorted((bursts or {}).items())
             },
             "roi": roi_identity(self.config.roi),
@@ -490,6 +544,7 @@ class Stack:
             )
         return hashlib.sha256(encoded).hexdigest()
 
+    @_reclaim_after_stage
     def measure_misreg(
         self,
         *,
@@ -565,6 +620,7 @@ class Stack:
         logger.info("Measured %s misreg arcs (method=%s)", len(arcs), method)
         return self
 
+    @_reclaim_after_stage
     def invert_misreg(
         self,
         *,
@@ -610,6 +666,7 @@ class Stack:
         )
         return self
 
+    @_reclaim_after_stage
     def coregister_scenes(
         self,
         *,
@@ -634,12 +691,18 @@ class Stack:
         master_dir.mkdir(parents=True, exist_ok=True)
         self.coreg_paths[self.master] = master_dir
 
+        # PROPOSAL-0017: pair = dense geometry + Ampcor range + ESD azimuth.
+        # geometry skips residual measure; network apply uses date constants only.
         esd_on = self.config.coreg_mode == "pair"
         amp_on = self.config.coreg_mode in {"pair", "network"}
-        # network: measure-only residuals already inverted; do not re-apply pair ESD
         if self.config.coreg_mode == "network":
             esd_on = False
             amp_on = False
+        orbit_paths = self.config.extra.get("orbit_paths")
+        if orbit_paths is not None and not isinstance(orbit_paths, dict):
+            reject_invalid_state(
+                "Stack extra orbit_paths must be a date-to-path mapping"
+            )
 
         for date_id in target_dates:
             out = self.config.work_dir / "coreg" / date_id
@@ -678,12 +741,30 @@ class Stack:
                 if date_id == target_dates[0]:
                     copy_reference_units(out / "scenes", master_dir / "scenes")
                 continue
+            pair_kwargs = dict(self._burst_kwargs())
+            if isinstance(orbit_paths, dict):
+                master_orbit = orbit_paths.get(self.master)
+                date_orbit = orbit_paths.get(date_id)
+                if master_orbit is not None:
+                    pair_kwargs["reference_orbit_path"] = master_orbit
+                if date_orbit is not None:
+                    pair_kwargs["secondary_orbit_path"] = date_orbit
+            for extra_key in (
+                "geoid_correction",
+                "geo_lut_cache_dir",
+                "geo_footprint_mask_enabled",
+            ):
+                if extra_key in self.config.extra:
+                    pair_kwargs[extra_key] = self.config.extra[extra_key]
+            geo_work = self.config.extra.get("geo_work_dir")
+            if geo_work is not None:
+                pair_kwargs["geo_work_dir"] = Path(geo_work) / date_id
             state = run_pair(
                 master_path,
                 self.catalog.path_for(date_id),
                 output_dir=out,
                 multilook=self.config.multilook,
-                goldstein_alpha=self.config.goldstein_alpha,
+                goldstein_alpha=0.0,
                 esd_enabled=esd_on,
                 amplitude_refinement_enabled=amp_on,
                 unwrap=False,
@@ -691,7 +772,7 @@ class Stack:
                 misreg_az_px=misreg_az,
                 misreg_rg_px=misreg_rg,
                 scene_store_dir=out / "scenes",
-                **self._burst_kwargs(),
+                **pair_kwargs,
             )
             if self.config.retain_pair_states:
                 self.pair_states[f"{self.master}_{date_id}"] = state
@@ -718,8 +799,15 @@ class Stack:
                         "esd_azimuth_shift_px": state.esd_azimuth_shift_px,
                         "range_shift_px": state.range_shift_px,
                         "azimuth_shift_px": state.azimuth_shift_px,
+                        "esd_enabled": esd_on,
+                        "amplitude_refinement_enabled": amp_on,
+                        "stage_timings_s": getattr(state, "stage_timings_s", {}),
+                        "coregistration_timings_s": getattr(
+                            state, "coregistration_timings_s", {}
+                        ),
                     },
                     indent=2,
+                    default=str,
                 ),
                 encoding="utf-8",
             )
@@ -730,9 +818,11 @@ class Stack:
                 # arrays now so adjacent dates cannot overlap in memory.
                 del state
                 gc.collect()
+            self._reclaim_accelerator("persist")
         self._write_qualified_activation_record()
         return self
 
+    @_reclaim_after_stage
     def form_interferograms(
         self,
         *,
@@ -852,6 +942,7 @@ class Stack:
                 self.ifg_dirs.append(sub)
         return self
 
+    @_reclaim_after_stage
     def unwrap(
         self,
         *,
@@ -1057,6 +1148,7 @@ class Stack:
         self.unwrap_result = result
         return self
 
+    @_reclaim_after_stage
     def invert_timeseries(
         self,
         *,

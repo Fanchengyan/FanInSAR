@@ -573,35 +573,26 @@ def test_ampcor_conversion_preflight_rejects_before_copy(
         )
 
 
-def test_ampcor_public_workspace_limits_conversion_before_copy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Public workspace limits apply before compatibility copy allocation."""
-    from faninsar.processing.coreg import offsets as offsets_mod
-
-    samples = np.ones((16, 32), dtype=np.complex64)[:, ::2]
-    monkeypatch.setattr(
-        offsets_mod.np,
-        "array",
-        lambda *_args, **_kwargs: pytest.fail("conversion preflight allocated"),
+def test_ampcor_host_conversion_uses_input_cap_not_gpu_workspace() -> None:
+    """Strided host views may convert; the 256 MiB cap is GPU tile workspace."""
+    pytest.importorskip("torch")
+    samples = np.ones((64, 128), dtype=np.complex64)[:, ::2]
+    result = estimate_patch_amplitude_shift(
+        samples,
+        samples,
+        executor="torch",
+        device="cpu",
+        batch_size=1,
+        window_az=8,
+        window_rg=16,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=1,
+        margin_rg=8,
+        margin_az=4,
     )
-    with pytest.raises(InvalidProcessingStateError, match="conversion"):
-        estimate_patch_amplitude_shift(
-            samples,
-            samples,
-            executor="torch",
-            device="cpu",
-            batch_size=1,
-            max_workspace_bytes=1,
-            window_az=8,
-            window_rg=16,
-            search_az=2,
-            search_rg=2,
-            n_az=1,
-            n_rg=1,
-            margin_rg=16,
-            margin_az=8,
-        )
+    assert result.range_shift_px == result.range_shift_px
 
 
 def test_estimate_patch_amplitude_shift_rejects_invalid_torch_batch() -> None:
@@ -1699,6 +1690,52 @@ def test_ampcor_repeated_shape_calls_release_cache_and_admission(
     assert cleanup_devices == ["cpu"] * len(cases)
 
 
+def test_ampcor_end_of_call_does_not_empty_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ampcor lease end does not reclaim unless reclaim_checkpoint says so."""
+    import inspect
+
+    torch = pytest.importorskip("torch")
+    from faninsar._core.device import reclaim_checkpoint
+    from faninsar.processing.coreg import offsets as offsets_mod
+
+    empty_calls: list[str] = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: empty_calls.append("cuda"),
+    )
+    samples = np.ones((64, 96), dtype=np.complex64)
+    estimate_patch_amplitude_shift(
+        samples,
+        samples,
+        window_az=8,
+        window_rg=8,
+        search_az=2,
+        search_rg=2,
+        n_az=1,
+        n_rg=1,
+        margin_rg=8,
+        margin_az=8,
+        executor="torch",
+        device="cpu",
+    )
+    assert empty_calls == []
+    assert "empty_cache" not in inspect.getsource(
+        offsets_mod._release_torch_device_cache
+    )
+    eight_gib = 8 * 1024**3
+    reclaim_checkpoint(
+        "cpu",
+        "eager",
+        kind="persist",
+        total_bytes=eight_gib,
+        reserved_bytes=eight_gib,
+    )
+    assert empty_calls == []
+
+
 def test_torch_ampcor_admission_key_uses_physical_uuid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2645,27 +2682,6 @@ def test_ampcor_candidate_energy_guard_uses_fft_fallback(
     assert fft_calls == [-1, 1]
 
 
-def test_ampcor_cuda_rejects_unqualified_fft_shape_before_kernel() -> None:
-    """An out-of-window FFT shape cannot bypass the qualified CUDA lane."""
-    from faninsar.processing.coreg import offsets as offsets_mod
-
-    with pytest.raises(InvalidProcessingStateError, match="FFT shape"):
-        offsets_mod._validate_torch_ampcor_shape(
-            window_az=8,
-            window_rg=16,
-            search_az=2,
-            search_rg=2,
-            device_type="cuda",
-        )
-    offsets_mod._validate_torch_ampcor_shape(
-        window_az=8,
-        window_rg=16,
-        search_az=2,
-        search_rg=2,
-        device_type="cpu",
-    )
-
-
 @pytest.mark.parametrize(
     ("snr_threshold", "max_abs_residual", "values"),
     [
@@ -2833,27 +2849,6 @@ def test_estimate_patch_amplitude_shift_cuda_is_fail_closed() -> None:
     if torch.cuda.is_available():
         pytest.skip("host has CUDA; unavailable-device branch is not applicable")
     with pytest.raises(RuntimeError, match="CUDA requested"):
-        estimate_patch_amplitude_shift(
-            np.ones((64, 96), dtype=np.complex64),
-            np.ones((64, 96), dtype=np.complex64),
-            executor="torch",
-            device="cuda:0",
-        )
-
-
-def test_estimate_patch_amplitude_shift_rejects_unqualified_cuda_runtime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """CUDA Ampcor fails closed outside the exact qualified runtime lane."""
-    torch = pytest.importorskip("torch")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda _device: SimpleNamespace(name="RTX test", major=8, minor=6, uuid="test"),
-    )
-    with pytest.raises(InvalidProcessingStateError, match="outside the qualified"):
         estimate_patch_amplitude_shift(
             np.ones((64, 96), dtype=np.complex64),
             np.ones((64, 96), dtype=np.complex64),

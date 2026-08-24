@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
 
 from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
+from faninsar.processing.geometry import prepare_production as prepare_mod
 from faninsar.processing.geometry.backend_dispatch import DispatchError
+from faninsar.processing.geometry.dem import ConstantHeightDEM
 from faninsar.processing.geometry.native_v2.builder import (
     NativeBackend,
     NativeBuilder,
@@ -18,12 +21,23 @@ from faninsar.processing.geometry.native_v2.builder import (
 )
 from faninsar.processing.geometry.orbit import OrbitInterpolator
 from faninsar.processing.geometry.prepare_production import (
+    _dem_native_arrays,
     prepare_production_geometry,
     run_geo2rdr,
     run_rdr2geo,
 )
 from faninsar.processing.geometry.transforms import RadarGeometryModel
 from faninsar.processing.geometry.v2 import Operation
+
+
+@pytest.fixture(autouse=True)
+def _clear_production_residency() -> Iterator[None]:
+    """Isolate prepared-cache and GPU DEM table across tests."""
+    prepare_mod._PREPARED_CACHE.clear()
+    prepare_mod._GPU_DEM_TABLE.clear()
+    yield
+    prepare_mod._PREPARED_CACHE.clear()
+    prepare_mod._GPU_DEM_TABLE.clear()
 
 
 def _model() -> RadarGeometryModel:
@@ -102,6 +116,133 @@ def test_prepare_production_geometry_cpu_roundtrip() -> None:
     _ = prepared
 
 
+def test_cuda_prepare_requests_compile_identity(monkeypatch) -> None:
+    """PROPOSAL-0020/0025: CUDA production prepare registers Compile."""
+    from types import SimpleNamespace
+
+    calls: list[dict[str, object]] = []
+
+    def fake_prepare(*_args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(compile=kwargs.get("compile"))
+
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.prepare_geometry",
+        fake_prepare,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production._require_device",
+        lambda _device: SimpleNamespace(type="cuda"),
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production._cuda_uuids",
+        lambda _resolved: ("gpu-uuid", None),
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production._try_load_cuda_module",
+        lambda _op: None,
+    )
+    prepared = prepare_production_geometry(
+        Operation.RDR2GEO,
+        _model(),
+        device="cuda",
+        shape=(2, 2),
+    )
+    assert prepared.compile is True
+    assert calls
+    assert calls[0]["compile"] is True
+    assert calls[0]["compile_performance_eligible"] is True
+
+
+def test_dem_native_arrays_constant_height() -> None:
+    """ConstantHeightDEM becomes a coarse global raster for the six-point stencil."""
+    values, metadata, bounds = _dem_native_arrays(ConstantHeightDEM(12.5))
+    assert values.shape[0] >= 6 and values.shape[1] >= 6
+    assert np.allclose(values, 12.5)
+    assert metadata.shape == (4,)
+    assert bounds.tolist() == [12.5, 12.5]
+
+
+def test_cuda_rdr2geo_prepare_registers_native_dem(monkeypatch) -> None:
+    """PROPOSAL-0026: CUDA rdr2geo prepare binds DEM context for Native."""
+    from types import SimpleNamespace
+
+    captured: list[dict[str, object]] = []
+
+    def fake_manifest(**kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(backend="native"), {
+            "look_right": True,
+            "dem_values": object(),
+            "dem_metadata": object(),
+            "dem_height_bounds": object(),
+        }
+
+    def fake_prepare(*_args, **kwargs):
+        captured.append({"prepare": kwargs})
+        return SimpleNamespace(compile=kwargs.get("compile"))
+
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production._rdr2geo_native_manifest",
+        fake_manifest,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.prepare_geometry",
+        fake_prepare,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production._require_device",
+        lambda _device: SimpleNamespace(type="cuda"),
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production._cuda_uuids",
+        lambda _resolved: ("gpu-uuid", None),
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production._try_load_cuda_module",
+        lambda _op: object(),
+    )
+    dem = ConstantHeightDEM(4.0)
+    prepared = prepare_production_geometry(
+        Operation.RDR2GEO,
+        _model(),
+        device="cuda",
+        shape=(4, 4),
+        dem=dem,
+    )
+    assert captured[0]["dem"] is dem
+    prepare_kwargs = captured[1]["prepare"]
+    assert prepare_kwargs["native_executor"] is not None
+    assert prepare_kwargs["native_context_inputs"]["look_right"] is True
+    assert prepare_kwargs["compile"] is False
+    assert prepared.compile is False
+
+
+def test_cpu_prepare_does_not_request_compile(monkeypatch) -> None:
+    """CPU production prepare stays Eager so CI does not pay torch.compile."""
+    from types import SimpleNamespace
+
+    calls: list[dict[str, object]] = []
+
+    def fake_prepare(*_args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(compile=kwargs.get("compile"))
+
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.prepare_geometry",
+        fake_prepare,
+    )
+    prepared = prepare_production_geometry(
+        Operation.RDR2GEO,
+        _model(),
+        device="cpu",
+        shape=(2, 2),
+    )
+    assert prepared.compile is False
+    assert calls[0]["compile"] is False
+    assert calls[0]["compile_performance_eligible"] is False
+
+
 def test_prepare_production_geometry_rejects_mps() -> None:
     """MPS fails closed after Newton deletion."""
     pytest.importorskip("torch")
@@ -123,3 +264,243 @@ def test_prepare_production_geometry_rejects_mps() -> None:
             device="mps",
             shape=(1,),
         )
+
+
+def test_prepared_cache_hits_on_model_digest_not_object_id(monkeypatch) -> None:
+    """Two models with the same operational digest reuse PreparedGeometry."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    calls: list[dict[str, object]] = []
+
+    def fake_prepare(*_args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(compile=False, token=len(calls))
+
+    monkeypatch.setattr(prepare_mod, "prepare_geometry", fake_prepare)
+    first_model = _model()
+    second_model = replace(first_model)
+    assert first_model is not second_model
+    first = prepare_production_geometry(
+        Operation.GEO2RDR,
+        first_model,
+        device="cpu",
+        shape=(3, 3),
+    )
+    second = prepare_production_geometry(
+        Operation.GEO2RDR,
+        second_model,
+        device="cpu",
+        shape=(3, 3),
+    )
+    assert first is second
+    assert len(calls) == 1
+
+
+def test_prepared_cache_misses_on_sensing_start_or_look(monkeypatch) -> None:
+    """Bursts that share orbit+DEM but differ in timing or look miss."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    calls: list[dict[str, object]] = []
+
+    def fake_prepare(*_args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(compile=False, token=len(calls))
+
+    monkeypatch.setattr(prepare_mod, "prepare_geometry", fake_prepare)
+    model = _model()
+    prepare_production_geometry(
+        Operation.GEO2RDR, model, device="cpu", shape=(3, 3)
+    )
+    shifted = replace(
+        model,
+        sensing_start=model.sensing_start + timedelta(seconds=1),
+    )
+    prepare_production_geometry(
+        Operation.GEO2RDR, shifted, device="cpu", shape=(3, 3)
+    )
+    looked = replace(model, look_direction="left")
+    prepare_production_geometry(
+        Operation.GEO2RDR, looked, device="cpu", shape=(3, 3)
+    )
+    assert len(calls) == 3
+
+
+def test_prepared_cache_misses_on_dem_digest(monkeypatch) -> None:
+    """A DEM content change misses the prepared cache."""
+    from types import SimpleNamespace
+
+    calls: list[dict[str, object]] = []
+
+    def fake_prepare(*_args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(compile=False, token=len(calls))
+
+    monkeypatch.setattr(prepare_mod, "prepare_geometry", fake_prepare)
+    model = _model()
+    prepare_production_geometry(
+        Operation.RDR2GEO,
+        model,
+        device="cpu",
+        shape=(2, 2),
+        dem=ConstantHeightDEM(0.0),
+    )
+    prepare_production_geometry(
+        Operation.RDR2GEO,
+        model,
+        device="cpu",
+        shape=(2, 2),
+        dem=ConstantHeightDEM(12.0),
+    )
+    assert len(calls) == 2
+
+
+def test_gpu_dem_table_aliases_across_prepared_shapes(monkeypatch) -> None:
+    """Shape miss does not re-upload DEM tensors keyed by dem_digest+device."""
+    from types import SimpleNamespace
+
+    original_arrays = prepare_mod._dem_native_arrays
+    array_calls: list[int] = []
+
+    def counting_arrays(dem):
+        array_calls.append(1)
+        return original_arrays(dem)
+
+    monkeypatch.setattr(prepare_mod, "_dem_native_arrays", counting_arrays)
+
+    def fake_manifest(**kwargs):
+        import torch
+
+        from faninsar.processing.geometry.torch_backends_v2 import _dem_digest
+
+        dem = kwargs["dem"]
+        resident = prepare_mod._resident_gpu_dem(
+            _dem_digest(dem),
+            "cuda-uuid:gpu-uuid",
+            torch.device("cpu"),
+            dem,
+        )
+        return SimpleNamespace(backend="native"), {
+            "look_right": True,
+            **resident,
+        }
+
+    captured: list[dict[str, object]] = []
+
+    def fake_prepare(*_args, **kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(compile=kwargs.get("compile"))
+
+    monkeypatch.setattr(prepare_mod, "_rdr2geo_native_manifest", fake_manifest)
+    monkeypatch.setattr(prepare_mod, "prepare_geometry", fake_prepare)
+    monkeypatch.setattr(
+        prepare_mod,
+        "_require_device",
+        lambda _device: SimpleNamespace(type="cuda"),
+    )
+    monkeypatch.setattr(prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None))
+    monkeypatch.setattr(prepare_mod, "_try_load_cuda_module", lambda _op: object())
+    dem = ConstantHeightDEM(4.0)
+    model = _model()
+    prepare_production_geometry(
+        Operation.RDR2GEO, model, device="cuda", shape=(4, 4), dem=dem
+    )
+    prepare_production_geometry(
+        Operation.RDR2GEO, model, device="cuda", shape=(8, 8), dem=dem
+    )
+    assert len(array_calls) == 1
+    first_dem = captured[0]["native_context_inputs"]["dem_values"]
+    second_dem = captured[1]["native_context_inputs"]["dem_values"]
+    assert first_dem is second_dem
+
+
+def test_rdr2geo_without_dem_context_does_not_admit_native(monkeypatch) -> None:
+    """Native DEM-bound identity is refused without DEM raster context."""
+    from types import SimpleNamespace
+
+    def fake_manifest(**kwargs):
+        return SimpleNamespace(backend="native"), {"look_right": True}
+
+    captured: list[dict[str, object]] = []
+
+    def fake_prepare(*_args, **kwargs):
+        captured.append(kwargs)
+        return SimpleNamespace(compile=kwargs.get("compile"))
+
+    monkeypatch.setattr(prepare_mod, "_rdr2geo_native_manifest", fake_manifest)
+    monkeypatch.setattr(prepare_mod, "prepare_geometry", fake_prepare)
+    monkeypatch.setattr(
+        prepare_mod,
+        "_require_device",
+        lambda _device: SimpleNamespace(type="cuda"),
+    )
+    monkeypatch.setattr(prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None))
+    monkeypatch.setattr(prepare_mod, "_try_load_cuda_module", lambda _op: object())
+    prepare_production_geometry(
+        Operation.RDR2GEO,
+        _model(),
+        device="cuda",
+        shape=(4, 4),
+        dem=ConstantHeightDEM(4.0),
+    )
+    assert captured[0]["native_executor"] is None
+    assert captured[0]["native_context_inputs"] is None
+    assert captured[0]["compile"] is True
+
+
+def test_native_rdr2geo_registers_dem_once_per_digest(monkeypatch) -> None:
+    """Second prepare of the same digest does not re-register DEM context."""
+    from types import SimpleNamespace
+
+    original_arrays = prepare_mod._dem_native_arrays
+    array_calls: list[int] = []
+
+    def counting_arrays(dem):
+        array_calls.append(1)
+        return original_arrays(dem)
+
+    monkeypatch.setattr(prepare_mod, "_dem_native_arrays", counting_arrays)
+    manifest_calls: list[int] = []
+
+    def fake_manifest(**kwargs):
+        import torch
+
+        from faninsar.processing.geometry.torch_backends_v2 import _dem_digest
+
+        manifest_calls.append(1)
+        dem = kwargs["dem"]
+        resident = prepare_mod._resident_gpu_dem(
+            _dem_digest(dem),
+            "cuda-uuid:gpu-uuid",
+            torch.device("cpu"),
+            dem,
+        )
+        return SimpleNamespace(backend="native"), {
+            "look_right": True,
+            **resident,
+        }
+
+    def fake_prepare(*_args, **kwargs):
+        return SimpleNamespace(compile=kwargs.get("compile"))
+
+    monkeypatch.setattr(prepare_mod, "_rdr2geo_native_manifest", fake_manifest)
+    monkeypatch.setattr(prepare_mod, "prepare_geometry", fake_prepare)
+    monkeypatch.setattr(
+        prepare_mod,
+        "_require_device",
+        lambda _device: SimpleNamespace(type="cuda"),
+    )
+    monkeypatch.setattr(prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None))
+    monkeypatch.setattr(prepare_mod, "_try_load_cuda_module", lambda _op: object())
+    dem = ConstantHeightDEM(7.0)
+    model = _model()
+    first = prepare_production_geometry(
+        Operation.RDR2GEO, model, device="cuda", shape=(4, 4), dem=dem
+    )
+    second = prepare_production_geometry(
+        Operation.RDR2GEO, _model(), device="cuda", shape=(4, 4), dem=dem
+    )
+    assert first is second
+    assert len(manifest_calls) == 1
+    assert len(array_calls) == 1

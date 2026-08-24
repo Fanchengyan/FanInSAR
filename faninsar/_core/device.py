@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -13,6 +13,16 @@ logger = setup_logger(__name__)
 
 if TYPE_CHECKING:
     from faninsar.typing import DeviceLike
+
+GpuMemoryReclaim = Literal["lazy", "eager", "adaptive"]
+ReclaimKind = Literal["persist", "stage", "oom", "explicit"]
+
+_GIB = 1024**3
+ADAPTIVE_LAZY_MIN_TOTAL_BYTES = 40 * _GIB
+ADAPTIVE_EAGER_MAX_TOTAL_BYTES = 12 * _GIB
+ADAPTIVE_RESERVED_RATIO = 0.85
+_RECLAIM_KINDS: frozenset[str] = frozenset({"persist", "stage", "oom", "explicit"})
+_RECLAIM_POLICIES: frozenset[str] = frozenset({"lazy", "eager", "adaptive"})
 
 PUBLISHED_DEVICE_TYPES: frozenset[str] = frozenset({"cpu", "cuda"})
 _AUTO_ALIASES: frozenset[str] = frozenset({"auto", "gpu"})
@@ -174,3 +184,163 @@ def _admit_constructed_device(
             stacklevel=2,
         )
     return device
+
+
+def probe_accelerator_memory(
+    device: DeviceLike | torch.device | None,
+) -> tuple[int | None, int | None]:
+    """Return ``(total_bytes, reserved_bytes)`` for an accelerator.
+
+    Tests monkeypatch this probe to inject capacity and pressure. CPU
+    returns ``(None, None)``. Missing CUDA/MPS stats also return
+    ``None`` rather than inventing a size.
+
+    Parameters
+    ----------
+    device : str or torch.device or None
+        Device whose allocator accounting is read.
+
+    Returns
+    -------
+    tuple of int or None
+        Total device memory and currently reserved caching-allocator
+        bytes. Either element may be ``None`` when the backend does not
+        expose the figure.
+
+    """
+    resolved = device if isinstance(device, torch.device) else parse_device(device)
+    if resolved.type == "cuda":
+        if not cuda_available():
+            return None, None
+        try:
+            total = int(torch.cuda.get_device_properties(resolved).total_memory)
+        except Exception:
+            logger.exception("unable to read CUDA total memory")
+            total = None
+        try:
+            reserved = int(torch.cuda.memory_reserved(resolved))
+        except Exception:
+            logger.exception("unable to read CUDA reserved memory")
+            reserved = None
+        return total, reserved
+    if resolved.type == "mps":
+        driver = getattr(torch.mps, "driver_allocated_memory", None)
+        current = getattr(torch.mps, "current_allocated_memory", None)
+        try:
+            total = int(driver()) if callable(driver) else None
+        except Exception:
+            logger.exception("unable to read MPS driver memory")
+            total = None
+        try:
+            reserved = int(current()) if callable(current) else None
+        except Exception:
+            logger.exception("unable to read MPS allocated memory")
+            reserved = None
+        return total, reserved
+    return None, None
+
+
+def release_accelerator_cache(device: DeviceLike | torch.device | None) -> None:
+    """Return unused caching-allocator slabs to the driver.
+
+    This is the only product wrapper around ``torch.cuda.empty_cache`` /
+    the MPS equivalent (PROPOSAL-0034). Live tensors are untouched.
+    CPU is a no-op.
+
+    Parameters
+    ----------
+    device : str or torch.device or None
+        Accelerator whose unused cached slabs are released.
+
+    """
+    resolved = device if isinstance(device, torch.device) else parse_device(device)
+    if resolved.type == "cuda":
+        torch.cuda.empty_cache()
+        return
+    if resolved.type == "mps":
+        empty_cache = getattr(torch.mps, "empty_cache", None)
+        if empty_cache is not None:
+            empty_cache()
+
+
+def _should_reclaim(
+    policy: GpuMemoryReclaim,
+    kind: ReclaimKind,
+    *,
+    total_bytes: int | None,
+    reserved_bytes: int | None,
+) -> bool:
+    """Evaluate the PROPOSAL-0034 reclaim table for one checkpoint."""
+    if kind in {"oom", "explicit"}:
+        return True
+    if policy == "lazy":
+        return False
+    if policy == "eager":
+        return True
+    if total_bytes is None or total_bytes <= ADAPTIVE_EAGER_MAX_TOTAL_BYTES:
+        return True
+    if total_bytes >= ADAPTIVE_LAZY_MIN_TOTAL_BYTES or reserved_bytes is None:
+        return False
+    return (reserved_bytes / total_bytes) > ADAPTIVE_RESERVED_RATIO
+
+
+def reclaim_checkpoint(
+    device: DeviceLike | torch.device | None,
+    policy: GpuMemoryReclaim,
+    *,
+    kind: ReclaimKind,
+    total_bytes: int | None = None,
+    reserved_bytes: int | None = None,
+) -> bool:
+    """Apply ``gpu_memory_reclaim`` at a Stack or worker checkpoint.
+
+    Kernels never call this. ``lazy`` is a no-op except ``oom`` and
+    ``explicit``. ``eager`` reclaims at ``persist`` and ``stage``.
+    ``adaptive`` uses the 40 GiB / 12 GiB / 0.85 reserved-ratio table
+    (PROPOSAL-0034; cutoffs are REFERENCE).
+
+    Parameters
+    ----------
+    device : str or torch.device or None
+        Process-local device that owns the caching allocator.
+    policy : {"lazy", "eager", "adaptive"}
+        Reclaim policy carried by the orchestrator.
+    kind : {"persist", "stage", "oom", "explicit"}
+        Checkpoint that triggered the evaluation.
+    total_bytes, reserved_bytes : int, optional
+        Injected capacity and reserved size for tests. When omitted the
+        values come from :func:`probe_accelerator_memory`.
+
+    Returns
+    -------
+    bool
+        ``True`` when :func:`release_accelerator_cache` ran.
+
+    Raises
+    ------
+    ValueError
+        If *policy* or *kind* is not an admitted token.
+
+    """
+    if policy not in _RECLAIM_POLICIES:
+        message = f"unsupported gpu_memory_reclaim policy: {policy!r}"
+        logger.error(message)
+        raise ValueError(message)
+    if kind not in _RECLAIM_KINDS:
+        message = f"unsupported reclaim checkpoint kind: {kind!r}"
+        logger.error(message)
+        raise ValueError(message)
+    resolved = device if isinstance(device, torch.device) else parse_device(device)
+    if resolved.type not in {"cuda", "mps"}:
+        return False
+    if total_bytes is None and reserved_bytes is None:
+        total_bytes, reserved_bytes = probe_accelerator_memory(resolved)
+    if not _should_reclaim(
+        policy,
+        kind,
+        total_bytes=total_bytes,
+        reserved_bytes=reserved_bytes,
+    ):
+        return False
+    release_accelerator_cache(resolved)
+    return True

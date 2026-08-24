@@ -130,15 +130,26 @@ def test_unqualified_explicit_float32_falls_back_to_float64() -> None:
 def test_cleanup_runs_when_kernel_validation_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The kernel wrapper releases device caches on exception paths."""
+    """Kernel wrappers never call empty_cache, including on exception paths."""
+    import inspect
+
+    import torch
+
     import faninsar.processing.torch_kernels as kernels
 
-    cleaned_devices: list[str] = []
+    empty_calls: list[str] = []
     monkeypatch.setattr(
-        kernels,
-        "cleanup_device",
-        lambda device: cleaned_devices.append(device.type),
+        torch.cuda,
+        "empty_cache",
+        lambda: empty_calls.append("cuda"),
     )
+    if hasattr(torch, "mps"):
+        monkeypatch.setattr(
+            torch.mps,
+            "empty_cache",
+            lambda: empty_calls.append("mps"),
+            raising=False,
+        )
     with pytest.raises(RuntimeError, match="2-D complex array"):
         kernels.carrier_multiply_torch(
             np.ones(8, dtype=np.complex64),
@@ -146,7 +157,64 @@ def test_cleanup_runs_when_kernel_validation_raises(
             sign=-1.0,
             device="cpu",
         )
-    assert cleaned_devices == ["cpu"]
+    assert empty_calls == []
+    assert "empty_cache" not in inspect.getsource(kernels.cleanup_device)
+    assert "empty_cache" not in inspect.getsource(kernels._cleanup_after_kernel)
+
+
+def test_kernel_tiles_do_not_empty_cache_under_eager_8gib(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FINDING-c03ef278: mocked 8 GiB eager still has zero kernel empty_cache."""
+    import inspect
+
+    import torch
+
+    import faninsar.processing.torch_kernels as kernels
+    from faninsar._core.device import reclaim_checkpoint
+
+    empty_calls: list[str] = []
+
+    def record_empty() -> None:
+        empty_calls.append("cuda")
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", record_empty)
+    samples = _random_slc((32, 48), seed=3)
+    model = _carrier_model()
+    kernels.tops_carrier_multiply_torch(
+        samples,
+        model,
+        sign=-1.0,
+        device="cpu",
+    )
+    assert empty_calls == []
+    from faninsar.processing import resampling_torch
+
+    assert "empty_cache" not in inspect.getsource(resampling_torch._cleanup_device)
+    eight_gib = 8 * 1024**3
+    reclaim_checkpoint(
+        torch.device("cuda"),
+        "eager",
+        kind="persist",
+        total_bytes=eight_gib,
+        reserved_bytes=eight_gib,
+    )
+    assert empty_calls == ["cuda"]
+    empty_calls.clear()
+    kernels.tops_carrier_multiply_torch(
+        samples,
+        model,
+        sign=-1.0,
+        device="cpu",
+    )
+    reclaim_checkpoint(
+        torch.device("cuda"),
+        "adaptive",
+        kind="stage",
+        total_bytes=eight_gib,
+        reserved_bytes=eight_gib,
+    )
+    assert empty_calls == ["cuda"]
 
 
 def test_multilook_interferogram_torch_matches_numpy() -> None:

@@ -36,6 +36,7 @@ __all__ = [
     "run_goldstein_filter",
     "run_multilook_interferogram",
     "run_multilook_real",
+    "run_reclaim_checkpoint",
     "run_remove_topographic_phase",
     "should_accelerate",
     "should_use_cuda",
@@ -159,6 +160,46 @@ def validate_cuda_worker_binding(client: Any | None) -> bool:
             return False
         physical_ids.add(physical_id)
     return True
+
+
+def _reclaim_checkpoint_on_worker(
+    device: str,
+    policy: str,
+    kind: str,
+) -> bool:
+    """Evaluate reclaim policy on the process that owns the CUDA pool."""
+    from faninsar._core.device import reclaim_checkpoint
+
+    return reclaim_checkpoint(device, policy, kind=kind)  # type: ignore[arg-type]
+
+
+def run_reclaim_checkpoint(
+    client: Any,
+    device: str,
+    policy: str,
+    *,
+    kind: str,
+) -> object:
+    """Invoke :func:`reclaim_checkpoint` on Dask workers, never on tiles.
+
+    Parameters
+    ----------
+    client : object
+        Injected Dask client that owns GPU workers.
+    device : str
+        Device request resolved on each worker.
+    policy : str
+        ``gpu_memory_reclaim`` policy.
+    kind : str
+        Checkpoint kind (``persist``, ``stage``, ``oom``, ``explicit``).
+
+    Returns
+    -------
+    object
+        ``client.run`` result mapping workers to whether they reclaimed.
+
+    """
+    return client.run(_reclaim_checkpoint_on_worker, device, policy, kind)
 
 
 def _device_backend(device: str) -> str:

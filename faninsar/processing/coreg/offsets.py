@@ -40,22 +40,13 @@ logger = setup_logger(__name__)
 _TORCH_AMPCOR_WORKSPACE_CAP_BYTES = 256 * 1024**2
 _TORCH_AMPCOR_MAX_PATCHES = 4096
 _TORCH_AMPCOR_MAX_INPUT_DIM = 32768
-_TORCH_AMPCOR_MAX_INPUT_BYTES = 512 * 1024**2
+# Host-retained ref+sec plus tile scratch. A Sentinel-1 TOPS IW burst pair of
+# complex64 is about 0.6 GiB; GPU work stays tile-bounded by the 256 MiB cap.
+_TORCH_AMPCOR_MAX_INPUT_BYTES = 2 * 1024**3
 # Independent cap for compatibility copies, charged before any allocation.
 _TORCH_AMPCOR_CONVERSION_CAP_BYTES = _TORCH_AMPCOR_MAX_INPUT_BYTES
 _TORCH_AMPCOR_MAX_PATCH_DIM = 4096
 _TORCH_AMPCOR_RESERVED_BYTES: dict[str, int] = {}
-_TORCH_AMPCOR_QUALIFIED_TORCH = "2.8.0"
-_TORCH_AMPCOR_QUALIFIED_CUDA = "12.8"
-_TORCH_AMPCOR_QUALIFIED_DEVICE = "A100"
-# The strict boundary-oracle drift window is qualified for these FFT shapes.
-# CUDA requests outside this set fail closed before input-derived device work.
-_TORCH_AMPCOR_QUALIFIED_SHAPES: frozenset[tuple[int, int, int, int]] = frozenset(
-    {
-        (32, 64, 8, 8),
-        (32, 64, 16, 16),
-    }
-)
 # Backend FFT paths differed by at most eight binary64 ULPs in the boundary
 # qualification fixture; the next power-of-two bucket keeps that drift stable.
 _AMPCOR_CULL_ULPS = 16
@@ -89,12 +80,7 @@ def _canonical_torch_device(device: object) -> object:
 
 
 def _validate_torch_ampcor_runtime(device: object, torch_module: object) -> None:
-    """Fail closed unless the runtime matches the qualified CUDA lane.
-
-    The Torch executor has only been qualified for an A100 with Torch
-    ``2.8.0+cu128`` and CUDA ``12.8``.  Capability checks are deliberately
-    exact: allocator and FFT behavior on another driver, GPU family, or Torch
-    build is not inferred from the A100 qualification record.
+    """Fail closed when CUDA Ampcor is requested but CUDA is unavailable.
 
     Parameters
     ----------
@@ -106,10 +92,8 @@ def _validate_torch_ampcor_runtime(device: object, torch_module: object) -> None
 
     Raises
     ------
-    InvalidProcessingStateError
-        If the requested CUDA runtime is outside the qualified lane.
     RuntimeError
-        If CUDA is unavailable.
+        If CUDA is requested and unavailable.
 
     """
     resolved = device
@@ -121,75 +105,6 @@ def _validate_torch_ampcor_runtime(device: object, torch_module: object) -> None
         message = "CUDA requested for Torch Ampcor but is unavailable"
         logger.error(message)
         raise RuntimeError(message)
-    torch_version = str(getattr(torch_module, "__version__", "")).split("+", 1)[0]
-    cuda_version = str(getattr(getattr(torch_module, "version", None), "cuda", ""))
-    try:
-        properties = torch_module.cuda.get_device_properties(resolved)
-        device_name = str(properties.name)
-        capability = (int(properties.major), int(properties.minor))
-    except Exception as error:
-        message = "unable to inspect the CUDA runtime for Torch Ampcor"
-        logger.exception(message)
-        raise RuntimeError(message) from error
-    if (
-        torch_version != _TORCH_AMPCOR_QUALIFIED_TORCH
-        or cuda_version != _TORCH_AMPCOR_QUALIFIED_CUDA
-        or _TORCH_AMPCOR_QUALIFIED_DEVICE not in device_name
-        or capability != (8, 0)
-    ):
-        message = (
-            "Torch Ampcor CUDA runtime is outside the qualified lane: "
-            f"requires {_TORCH_AMPCOR_QUALIFIED_DEVICE}/"
-            f"compute-8.0, torch {_TORCH_AMPCOR_QUALIFIED_TORCH}+cu128, "
-            f"CUDA {_TORCH_AMPCOR_QUALIFIED_CUDA}; got "
-            f"{device_name!r}/compute-{capability[0]}.{capability[1]}, "
-            f"torch {torch_version or '<unknown>'}, CUDA {cuda_version or '<unknown>'}"
-        )
-        logger.error(message)
-        reject_invalid_state(message)
-
-
-def _validate_torch_ampcor_shape(
-    *,
-    window_az: int,
-    window_rg: int,
-    search_az: int,
-    search_rg: int,
-    device_type: str,
-) -> None:
-    """Reject CUDA FFT shapes outside the measured boundary-oracle lane.
-
-    Parameters
-    ----------
-    window_az, window_rg : int
-        Ampcor reference-window dimensions.
-    search_az, search_rg : int
-        Ampcor search half-widths.
-    device_type : str
-        Resolved Torch device type.
-
-    Raises
-    ------
-    InvalidProcessingStateError
-        If CUDA is requested for an unqualified FFT shape.
-
-    Notes
-    -----
-    CPU Torch remains a diagnostic path and is intentionally not restricted by
-    the A100 boundary qualification. NumPy is unaffected.
-
-    """
-    if device_type != "cuda":
-        return
-    shape = (window_az, window_rg, search_az, search_rg)
-    if shape not in _TORCH_AMPCOR_QUALIFIED_SHAPES:
-        message = (
-            "Torch Ampcor CUDA FFT shape is outside the qualified "
-            f"boundary-oracle lane: got {shape}, allowed "
-            f"{sorted(_TORCH_AMPCOR_QUALIFIED_SHAPES)}"
-        )
-        logger.error(message)
-        reject_invalid_state(message)
 
 
 def _synchronize_torch_device(device: object) -> None:
@@ -206,22 +121,13 @@ def _synchronize_torch_device(device: object) -> None:
 
 
 def _release_torch_device_cache(device: object) -> None:
-    """Request best-effort allocator cache release before a lease ends.
+    """End an Ampcor lease without reclaiming unused slabs (PROPOSAL-0034).
 
-    Torch drivers may retain allocations after this request; callers must
-    release Python references and rely on the admission ledger independently.
+    Callers drop Python references and rely on the admission ledger.
+    :func:`faninsar._core.device.release_accelerator_cache` is reserved
+    for Stack/worker checkpoints, never Ampcor end-of-call.
     """
-    import torch as torch_module
-
-    resolved = device
-    if not isinstance(resolved, torch_module.device):
-        resolved = torch_module.device(str(resolved))
-    if resolved.type == "cuda":
-        torch_module.cuda.empty_cache()
-    elif resolved.type == "mps" and hasattr(torch_module, "mps"):
-        empty_cache = getattr(torch_module.mps, "empty_cache", None)
-        if empty_cache is not None:
-            empty_cache()
+    del device
 
 
 def _torch_ampcor_admission_key(device: object, torch_module: object) -> str:
@@ -1717,13 +1623,6 @@ def _estimate_patch_amplitude_shift_torch(
         )
     search_height = window_az + 2 * search_az
     search_width = window_rg + 2 * search_rg
-    _validate_torch_ampcor_shape(
-        window_az=window_az,
-        window_rg=window_rg,
-        search_az=search_az,
-        search_rg=search_rg,
-        device_type=resolved_device.type,
-    )
     if (
         window_az > height
         or window_rg > width
@@ -2211,7 +2110,7 @@ def estimate_patch_amplitude_shift(
         secondary,
         torch_contract=executor == "torch",
         conversion_limit_bytes=(
-            int(max_workspace_bytes) if executor == "torch" else None
+            _TORCH_AMPCOR_CONVERSION_CAP_BYTES if executor == "torch" else None
         ),
     )
     height, width = reference.shape

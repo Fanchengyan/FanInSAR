@@ -16,7 +16,6 @@ precision is selected per kernel from qualified parity evidence.
 from __future__ import annotations
 
 import math
-from functools import wraps
 from typing import TYPE_CHECKING, Literal, ParamSpec, TypeVar
 
 import numpy as np
@@ -117,37 +116,25 @@ def resolve_torch_device(
 
 
 def cleanup_device(device: torch.device) -> None:
-    """Release allocator caches after accelerator kernel execution.
+    """Leave the caching allocator intact after a kernel (PROPOSAL-0034).
 
-    Required between Dask tasks so a persistent worker never accumulates GPU
-    memory across scheduled chunks.
+    Per-tile and per-kernel reclaim is forbidden. Stack or a Dask GPU
+    worker calls :func:`faninsar._core.device.release_accelerator_cache`
+    at persist, stage, OOM-retry, or explicit checkpoints.
 
     Parameters
     ----------
     device : torch.device
-        Device whose allocator cache is released.
+        Device that executed the kernel. Unused; kept for call-site
+        compatibility.
 
     """
-    torch = _import_torch()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    elif device.type == "mps":
-        torch.mps.empty_cache()
+    del device
 
 
 def _cleanup_after_kernel(func: Callable[_P, _R]) -> Callable[_P, _R]:
-    """Guarantee accelerator cache cleanup on success and exception paths."""
-
-    @wraps(func)
-    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        device = kwargs.get("device", "auto")
-        resolved = resolve_torch_device(device)
-        try:
-            return func(*args, **kwargs)
-        finally:
-            cleanup_device(resolved)
-
-    return wrapped
+    """Identity wrapper; kernels must not reclaim unused allocator slabs."""
+    return func
 
 
 def _precision_name(

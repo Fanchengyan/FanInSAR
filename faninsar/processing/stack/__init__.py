@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from faninsar._core.device import GpuMemoryReclaim
 from faninsar.processing.stack.activation import (
     ActivationIssuerRecord,
     LocalActivationAuthority,
@@ -21,6 +22,7 @@ __all__ = [
     "ActivationMode",
     "CoregMode",
     "EsdMethod",
+    "GpuMemoryReclaim",
     "LocalActivationAuthority",
     "SceneCatalog",
     "Stack",
