@@ -22,6 +22,7 @@ from faninsar.processing.stack.nisar_provider import (
     _radar_crop,
     make_nisar_scene_provider,
 )
+from faninsar.processing.stack.provider import UnsupportedStackCapabilityError
 from faninsar.processing.stack.scene_store import CoregisteredSceneStore
 
 from .test_nisar_stack import _result
@@ -251,3 +252,17 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
         2024, 1, 1, 0, 0, 0, 10_000, tzinfo=UTC
     )
     np.testing.assert_array_equal(secondary_crop.samples, secondary_array[3:6, 3:7])
+
+
+def test_nisar_provider_fails_closed_without_bounded_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unbounded scene promotion remains an explicit capability failure."""
+    stack, paths, _handles = _stack(tmp_path, monkeypatch)
+    with pytest.raises(UnsupportedStackCapabilityError, match="scene-production"):
+        stack.scene_provider(
+            paths[0],
+            paths[1],
+            output_dir=tmp_path / "pair",
+            options={"nisar_window": None},
+        )

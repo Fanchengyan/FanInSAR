@@ -20,6 +20,7 @@ from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import GeoGrid, RadarGrid
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.slc import RadarSLC
+from faninsar.processing.stack.provider import UnsupportedStackCapabilityError
 from faninsar.processing.stack.scene_store import (
     scene_grid_identity,
     write_scene_unit,
@@ -55,9 +56,16 @@ class NisarPairState:
 def _window(value: object, shape: tuple[int, int]) -> tuple[int, int, int, int]:
     """Validate a row/column crop against one source shape."""
     if value is None:
-        reject_invalid_state(
-            "NISAR provider requires an explicit bounded nisar_window; "
+        mission = "NISAR RSLC Stack"
+        capability = "scene-production"
+        reason = (
+            "bounded scene production requires an explicit nisar_window; "
             "full-scene promotion is unsupported"
+        )
+        raise UnsupportedStackCapabilityError(
+            mission,
+            capability,
+            reason,
         )
     if not isinstance(value, (tuple, list)) or len(value) != 4:
         reject_invalid_state(
