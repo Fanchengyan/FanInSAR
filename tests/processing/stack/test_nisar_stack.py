@@ -22,6 +22,7 @@ from faninsar.processing.coordinates import (
     ArrayRepresentation,
     RadarGrid,
 )
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.readers import (
     DopplerCentroidPolynomial,
     SLCReadResult,
@@ -200,6 +201,8 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
     paths = tuple(
         tmp_path / f"NISAR_RSLC_{date_id}.h5" for date_id in ("20240101", "20240113")
     )
+    for path in paths:
+        path.touch()
     handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar.NisarSensor.open_product",
@@ -225,7 +228,7 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
         stack.measure_misreg()
     with pytest.raises(UnsupportedStackCapabilityError, match="NISAR RSLC Stack"):
         stack.coregister_scenes()
-    with pytest.raises(UnsupportedStackCapabilityError, match="NISAR RSLC Stack"):
+    with pytest.raises(InvalidProcessingStateError, match="scene generation missing"):
         stack.form_interferograms()
 
 
