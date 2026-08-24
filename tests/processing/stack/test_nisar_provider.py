@@ -16,10 +16,12 @@ import pytest
 from faninsar.missions.nisar import NisarSensor
 from faninsar.processing.coordinates import GeoGrid
 from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.geometry.dem import ConstantHeightDEM
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.slc import GeoSLC, RadarSLC
 from faninsar.processing.stack import NISARStack
 from faninsar.processing.stack.nisar_provider import (
+    _geometry_shared_radar_window,
     _radar_crop,
     make_nisar_scene_provider,
 )
@@ -94,6 +96,7 @@ def _stack(
     )
     config: dict[str, object] = {
         "extra": {"nisar_window": (1, 4, 1, 5)},
+        "dem": ConstantHeightDEM(0.0),
         "multilook": (1, 1),
         "goldstein_alpha": 0.0,
         "coregistration_grid": domain,
@@ -240,7 +243,7 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
         reference_path,
         secondary_path,
         output_dir=tmp_path / "pair",
-        options={"coregistration_grid": "radar"},
+        options={"coregistration_grid": "radar", "height": 0.0},
     )
 
     assert selections == [
@@ -262,7 +265,133 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
     manifest = (tmp_path / "pair" / "scenes" / "manifest.json").read_text()
     assert "source_digest" in manifest
     assert "source_id" in manifest
+    assert "dem_identity" in manifest
     assert "B/HH" in manifest
+
+
+def test_nisar_geometry_mapping_passes_dem_and_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Radar→Geo→Radar seam uses the admitted DEM and device unchanged."""
+    reference = _result(tmp_path / "reference.h5", "20240101").product
+    secondary = _result(tmp_path / "secondary.h5", "20240113").product
+    dem = ConstantHeightDEM(123.0)
+    seen: dict[str, object] = {}
+
+    def fake_rdr2geo(*args: object, **kwargs: object) -> object:
+        seen["dem"] = args[3]
+        seen["rdr2geo_device"] = kwargs["device"]
+        return SimpleNamespace(
+            latitude_deg=np.array([[10.0]]),
+            longitude_deg=np.array([[20.0]]),
+            height_m=np.array([[123.0]]),
+            converged=np.array([[True]]),
+        )
+
+    def fake_geo2rdr(*args: object, **kwargs: object) -> object:
+        seen["height"] = args[3]
+        seen["geo2rdr_device"] = kwargs["device"]
+        return SimpleNamespace(
+            azimuth_index=np.array([[2.0]]),
+            range_index=np.array([[2.0]]),
+            converged=np.array([[True]]),
+        )
+
+    # The helpers are imported lazily, so patch their defining module.
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.run_rdr2geo",
+        fake_rdr2geo,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.run_geo2rdr",
+        fake_geo2rdr,
+    )
+
+    bounds = _geometry_shared_radar_window(
+        reference,
+        secondary,
+        (1, 3, 1, 3),
+        device="cuda:0",
+        dem=dem,
+    )
+
+    assert bounds == (1, 3, 1, 3)
+    assert seen["dem"] is dem
+    np.testing.assert_array_equal(seen["height"], np.array([[123.0]]))
+    assert seen["rdr2geo_device"] == "cuda:0"
+    assert seen["geo2rdr_device"] == "cuda:0"
+
+
+def test_nisar_geometry_mapping_rejects_full_window_outside_secondary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mapped crop outside the secondary grid is rejected without clamping."""
+    reference = _result(tmp_path / "reference.h5", "20240101").product
+    secondary = _result(tmp_path / "secondary.h5", "20240113").product
+
+    def fake_rdr2geo(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            latitude_deg=np.array([[10.0]]),
+            longitude_deg=np.array([[20.0]]),
+            height_m=np.array([[0.0]]),
+            converged=np.array([[True]]),
+        )
+
+    def fake_geo2rdr(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            azimuth_index=np.array([[99.0]]),
+            range_index=np.array([[99.0]]),
+            converged=np.array([[True]]),
+        )
+
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.run_rdr2geo",
+        fake_rdr2geo,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.run_geo2rdr",
+        fake_geo2rdr,
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="outside the source grid"):
+        _geometry_shared_radar_window(
+            reference,
+            secondary,
+            (1, 3, 1, 3),
+            device="cpu",
+            height_m=0.0,
+        )
+
+
+def test_nisar_geometry_mapping_rejects_missing_height_and_nonconvergence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing height and failed geometry lanes produce explicit errors."""
+    reference = _result(tmp_path / "reference.h5", "20240101").product
+    secondary = _result(tmp_path / "secondary.h5", "20240113").product
+
+    with pytest.raises(InvalidProcessingStateError, match="explicit DEM or height"):
+        _geometry_shared_radar_window(
+            reference,
+            secondary,
+            (1, 3, 1, 3),
+            device="cpu",
+        )
+
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.run_rdr2geo",
+        lambda *_args, **_kwargs: SimpleNamespace(converged=np.array([[False]])),
+    )
+    with pytest.raises(
+        InvalidProcessingStateError, match="did not converge in rdr2geo"
+    ):
+        _geometry_shared_radar_window(
+            reference,
+            secondary,
+            (1, 3, 1, 3),
+            device="cpu",
+            height_m=0.0,
+        )
 
 
 def test_nisar_provider_fails_closed_without_bounded_window(
@@ -326,5 +455,5 @@ def test_nisar_provider_rejects_source_content_mutation_after_admission(
             reference_path,
             secondary_path,
             output_dir=tmp_path / "pair",
-            options={"coregistration_grid": "radar"},
+            options={"coregistration_grid": "radar", "height": 0.0},
         )

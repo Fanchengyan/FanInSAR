@@ -19,7 +19,7 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import GeoGrid, RadarGrid
-from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.errors import InvalidProcessingStateError, reject_invalid_state
 from faninsar.processing.slc import RadarSLC
 from faninsar.processing.stack.provider import UnsupportedStackCapabilityError
 from faninsar.processing.stack.scene_store import (
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from faninsar.processing.contracts import SLCProduct
+    from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.stack.provider import SceneProductionCallback
 
 logger = setup_logger(__name__)
@@ -52,6 +53,21 @@ def _source_digest(path: Path) -> tuple[str, str]:
             f"NISAR source cannot be snapshotted: {source_id}: {error}"
         )
     return source_id, digest.hexdigest()
+
+
+def _dem_identity(dem: object) -> str:
+    """Return a stable, human-readable identity for a geometry DEM."""
+    qualified_name = f"{type(dem).__module__}.{type(dem).__qualname__}"
+    height = getattr(dem, "height_m", None)
+    if height is not None:
+        try:
+            return f"{qualified_name}:height_m={float(height):.17g}"
+        except (TypeError, ValueError):
+            return f"{qualified_name}:height_m={height!r}"
+    path = getattr(dem, "path", None)
+    if path is not None:
+        return f"{qualified_name}:path={Path(path).expanduser().resolve(strict=False)}"
+    return qualified_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +154,8 @@ def _shared_radar_window(
     reference_product: SLCProduct | None = None,
     secondary_product: SLCProduct | None = None,
     device: str = "cpu",
+    dem: DEMSampler | None = None,
+    height_m: float | None = None,
 ) -> tuple[int, int, int, int]:
     """Map a reference crop onto the secondary radar grid physically.
 
@@ -179,6 +197,8 @@ def _shared_radar_window(
         secondary_product,
         reference_bounds,
         device=device,
+        dem=dem,
+        height_m=height_m,
     )
 
 
@@ -188,6 +208,8 @@ def _geometry_shared_radar_window(
     reference_bounds: tuple[int, int, int, int],
     *,
     device: str,
+    dem: DEMSampler | None = None,
+    height_m: float | None = None,
 ) -> tuple[int, int, int, int]:
     """Map a bounded crop through the shared Radar→Geo→Radar geometry seam."""
     from faninsar.processing.geometry import RadarGeometryModel
@@ -201,6 +223,23 @@ def _geometry_shared_radar_window(
         secondary_product.grid, RadarGrid
     ):
         reject_invalid_state("NISAR geometry crop mapping requires radar products")
+    reference_bounds = _window(reference_bounds, reference_product.grid.shape)
+    if dem is None and height_m is None:
+        reject_invalid_state(
+            "NISAR geometry crop mapping requires an explicit DEM or height"
+        )
+    if dem is not None and height_m is not None:
+        reject_invalid_state(
+            "NISAR geometry crop mapping cannot combine DEM and height inputs"
+        )
+    if height_m is not None:
+        try:
+            resolved_height = float(height_m)
+        except (TypeError, ValueError) as error:
+            reject_invalid_state(f"NISAR geometry mapping height is invalid: {error}")
+        if not np.isfinite(resolved_height):
+            reject_invalid_state("NISAR geometry mapping height must be finite")
+        dem = ConstantHeightDEM(resolved_height)
     row_start, row_stop, col_start, col_stop = reference_bounds
     center_row = np.array(
         [[(row_start + row_stop - 1) / 2.0]],
@@ -218,40 +257,84 @@ def _geometry_shared_radar_window(
         secondary_product.grid,
         secondary_product.orbit,
     )
-    ground = run_rdr2geo(
-        reference_model,
-        center_row,
-        center_col,
-        ConstantHeightDEM(0.0),
-        device=device,
+    try:
+        ground = run_rdr2geo(
+            reference_model,
+            center_row,
+            center_col,
+            dem,
+            device=device,
+        )
+    except (RuntimeError, TypeError, ValueError) as error:
+        logger.exception("NISAR reference crop geometry mapping failed")
+        reject_invalid_state(f"NISAR reference crop rdr2geo failed: {error}")
+    converged = getattr(ground, "converged", None)
+    converged_values = (
+        np.asarray(converged, dtype=bool).reshape(-1)
+        if converged is not None
+        else np.array([], dtype=bool)
     )
-    if not bool(np.asarray(ground.converged).reshape(-1)[0]):
+    if not converged_values.size or not bool(converged_values[0]):
         reject_invalid_state("NISAR reference crop target did not converge in rdr2geo")
-    mapped = run_geo2rdr(
-        secondary_model,
-        ground.latitude_deg,
-        ground.longitude_deg,
-        ground.height_m,
-        device=device,
+    try:
+        ground_latitude = ground.latitude_deg
+        ground_longitude = ground.longitude_deg
+        ground_height = ground.height_m
+    except AttributeError as error:
+        reject_invalid_state(
+            f"NISAR reference crop rdr2geo result is missing coordinates: {error}"
+        )
+    try:
+        mapped = run_geo2rdr(
+            secondary_model,
+            ground_latitude,
+            ground_longitude,
+            ground_height,
+            device=device,
+        )
+    except (RuntimeError, TypeError, ValueError) as error:
+        logger.exception("NISAR secondary crop geometry mapping failed")
+        reject_invalid_state(f"NISAR secondary crop geo2rdr failed: {error}")
+    mapped_converged = getattr(mapped, "converged", None)
+    mapped_converged_values = (
+        np.asarray(mapped_converged, dtype=bool).reshape(-1)
+        if mapped_converged is not None
+        else np.array([], dtype=bool)
     )
-    if not bool(np.asarray(mapped.converged).reshape(-1)[0]):
+    if not mapped_converged_values.size or not bool(mapped_converged_values[0]):
         reject_invalid_state("NISAR shared crop target did not converge in geo2rdr")
+    mapped_azimuth = np.asarray(
+        getattr(mapped, "azimuth_index", np.array([])), dtype=np.float64
+    ).reshape(-1)
+    mapped_range = np.asarray(
+        getattr(mapped, "range_index", np.array([])), dtype=np.float64
+    ).reshape(-1)
+    if (
+        mapped_azimuth.size == 0
+        or mapped_range.size == 0
+        or not np.isfinite(mapped_azimuth[0])
+        or not np.isfinite(mapped_range[0])
+    ):
+        reject_invalid_state(
+            "NISAR shared crop target returned non-finite radar indices in geo2rdr"
+        )
     rows = row_stop - row_start
     cols = col_stop - col_start
-    secondary_row_start = round(float(mapped.azimuth_index.reshape(-1)[0])) - rows // 2
-    secondary_col_start = round(float(mapped.range_index.reshape(-1)[0])) - cols // 2
-    secondary_row_start = min(
-        max(secondary_row_start, 0), secondary_product.grid.shape[0] - rows
-    )
-    secondary_col_start = min(
-        max(secondary_col_start, 0), secondary_product.grid.shape[1] - cols
-    )
-    return (
+    secondary_row_start = round(float(mapped_azimuth[0])) - rows // 2
+    secondary_col_start = round(float(mapped_range[0])) - cols // 2
+    secondary_bounds = (
         secondary_row_start,
         secondary_row_start + rows,
         secondary_col_start,
         secondary_col_start + cols,
     )
+    try:
+        return _window(secondary_bounds, secondary_product.grid.shape)
+    except InvalidProcessingStateError as error:
+        reject_invalid_state(
+            "NISAR mapped secondary radar crop lies outside the source grid; "
+            f"full-window rejection: {error}"
+        )
 
 
 def _geo_target(value: object) -> GeoGrid:
@@ -299,6 +382,7 @@ def make_nisar_scene_provider(
     master: str,
     channel: tuple[str, str],
     configured_window: object = None,
+    admission_lineage: Mapping[str, Mapping[str, object]] | None = None,
 ) -> SceneProductionCallback:
     """Build a callback that publishes one bounded NISAR pair scene.
 
@@ -316,6 +400,9 @@ def make_nisar_scene_provider(
         Admitted ``(frequency, polarization)`` pair.
     configured_window : sequence of int, optional
         Default crop as ``(row_start, row_stop, col_start, col_stop)``.
+    admission_lineage : mapping, optional
+        Date-keyed trusted pre-open metadata.  It is copied into the scene
+        manifest so source identity and policy survive stack publication.
 
     Returns
     -------
@@ -324,6 +411,7 @@ def make_nisar_scene_provider(
 
     """
     path_dates = {Path(path): date_id for date_id, path in lineage.items()}
+    admission_lineage = dict(admission_lineage or {})
     admitted_sources = {
         date_id: _source_digest(Path(path)) for date_id, path in lineage.items()
     }
@@ -368,6 +456,8 @@ def make_nisar_scene_provider(
             reference_product=reference_product,
             secondary_product=secondary_product,
             device=str(options.get("device", "cpu")),
+            dem=options.get("dem"),
+            height_m=options.get("height_m", options.get("height")),
         )
         row_start, row_stop, col_start, col_stop = bounds
         (
@@ -403,6 +493,22 @@ def make_nisar_scene_provider(
             secondary_bounds,
         )
         domain = str(options.get("coregistration_grid", "radar")).lower()
+        mapping_dem = options.get("dem")
+        mapping_height = options.get("height_m", options.get("height"))
+        if mapping_dem is None and mapping_height is None:
+            reject_invalid_state(
+                "NISAR geometry crop mapping requires an explicit DEM or height "
+                "in provider options"
+            )
+        if mapping_dem is not None and mapping_height is not None:
+            reject_invalid_state(
+                "NISAR geometry crop mapping cannot combine DEM and height inputs"
+            )
+        if mapping_dem is None:
+            from faninsar.processing.geometry.dem import ConstantHeightDEM
+
+            mapping_dem = ConstantHeightDEM(float(mapping_height))
+        dem_identity = _dem_identity(mapping_dem)
         if domain == "radar":
             reference_array = reference_radar.samples
             secondary_array = secondary_radar.samples
@@ -455,16 +561,24 @@ def make_nisar_scene_provider(
                     "source": str(reference_path),
                     "source_id": admitted_sources[reference_date][0],
                     "source_digest": admitted_sources[reference_date][1],
+                    "admission_policy": admission_lineage.get(reference_date, {}).get(
+                        "policy"
+                    ),
                     "channel": f"{channel[0]}/{channel[1]}",
                     "lineage": "reference",
+                    "dem_identity": dem_identity,
                 },
                 {
                     "stage": "nisar_rslc_window",
                     "source": str(secondary_path),
                     "source_id": admitted_sources[secondary_date][0],
                     "source_digest": admitted_sources[secondary_date][1],
+                    "admission_policy": admission_lineage.get(secondary_date, {}).get(
+                        "policy"
+                    ),
                     "channel": f"{channel[0]}/{channel[1]}",
                     "lineage": "secondary",
+                    "dem_identity": dem_identity,
                 },
             ),
         )
