@@ -373,6 +373,21 @@ def _provider_window(options: Mapping[str, Any], configured: object) -> object:
     return configured
 
 
+def _geometry_inputs(
+    options: Mapping[str, Any],
+    *,
+    configured_dem: DEMSampler | None,
+    configured_height: float | None,
+) -> tuple[DEMSampler | None, float | None]:
+    """Resolve per-call geometry inputs over callback-level configuration."""
+    option_dem = options.get("dem")
+    dem = option_dem if option_dem is not None else configured_dem
+    height = options.get("height_m", options.get("height"))
+    if height is None:
+        height = configured_height
+    return dem, height
+
+
 def make_nisar_scene_provider(
     *,
     sensor: Any,
@@ -382,6 +397,8 @@ def make_nisar_scene_provider(
     master: str,
     channel: tuple[str, str],
     configured_window: object = None,
+    configured_dem: DEMSampler | None = None,
+    configured_height: float | None = None,
     admission_lineage: Mapping[str, Mapping[str, object]] | None = None,
 ) -> SceneProductionCallback:
     """Build a callback that publishes one bounded NISAR pair scene.
@@ -400,6 +417,11 @@ def make_nisar_scene_provider(
         Admitted ``(frequency, polarization)`` pair.
     configured_window : sequence of int, optional
         Default crop as ``(row_start, row_stop, col_start, col_stop)``.
+    configured_dem : DEMSampler, optional
+        Callback-level DEM used when a scene-production call omits ``dem``.
+    configured_height : float, optional
+        Callback-level constant height used when a scene-production call omits
+        both ``dem`` and ``height``.
     admission_lineage : mapping, optional
         Date-keyed trusted pre-open metadata.  It is copied into the scene
         manifest so source identity and policy survive stack publication.
@@ -429,6 +451,11 @@ def make_nisar_scene_provider(
             reject_invalid_state("NISAR provider received an unadmitted source path")
         reference_product = products[reference_date]
         secondary_product = products[secondary_date]
+        mapping_dem, mapping_height = _geometry_inputs(
+            options,
+            configured_dem=configured_dem,
+            configured_height=configured_height,
+        )
         for date_id, source_path in (
             (reference_date, reference_path),
             (secondary_date, secondary_path),
@@ -456,8 +483,8 @@ def make_nisar_scene_provider(
             reference_product=reference_product,
             secondary_product=secondary_product,
             device=str(options.get("device", "cpu")),
-            dem=options.get("dem"),
-            height_m=options.get("height_m", options.get("height")),
+            dem=mapping_dem,
+            height_m=mapping_height,
         )
         row_start, row_stop, col_start, col_stop = bounds
         (
@@ -493,8 +520,6 @@ def make_nisar_scene_provider(
             secondary_bounds,
         )
         domain = str(options.get("coregistration_grid", "radar")).lower()
-        mapping_dem = options.get("dem")
-        mapping_height = options.get("height_m", options.get("height"))
         if mapping_dem is None and mapping_height is None:
             reject_invalid_state(
                 "NISAR geometry crop mapping requires an explicit DEM or height "

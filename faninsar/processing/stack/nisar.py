@@ -283,6 +283,8 @@ class NISARStack(Stack):
             master=master,
             channel=(admitted_frequency, admitted_polarization),
             configured_window=configured_window,
+            configured_dem=config.dem,
+            configured_height=extra.get("height_m", extra.get("height")),
             admission_lineage=admission_lineage,
         )
         stack = cls(

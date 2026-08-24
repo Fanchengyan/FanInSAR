@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,13 +86,29 @@ def _stack(
             result.product.grid,
             sensing_start=datetime(2024, 1, 1, tzinfo=UTC),
         )
-        return replace(result, product=replace(result.product, grid=grid))
+        orbit = replace(
+            result.product.orbit,
+            vectors=tuple(
+                replace(
+                    vector,
+                    time=datetime(2024, 1, 1, tzinfo=UTC) + timedelta(seconds=index),
+                )
+                for index, vector in enumerate(result.product.orbit.vectors)
+            ),
+        )
+        return replace(result, product=replace(result.product, grid=grid, orbit=orbit))
 
     monkeypatch.setattr(NisarSensor, "to_slc_product", read_product)
     monkeypatch.setattr(
         NisarSensor,
         "read_slc_window",
         lambda _sensor, handle, window, **_kwargs: handle.dataset[window],
+    )
+    # The tiny lifecycle fixture has synthetic orbit metadata; the geometry
+    # seam itself is covered by dedicated tests below.
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar_provider._geometry_shared_radar_window",
+        lambda *_args, **_kwargs: (1, 4, 1, 5),
     )
     config: dict[str, object] = {
         "extra": {"nisar_window": (1, 4, 1, 5)},
@@ -219,10 +235,17 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
             selections.append((key, window))
             return (reference_array if key == "reference" else secondary_array)[window]
 
+    mapping_inputs: dict[str, object] = {}
+
+    def fake_mapping(*_args: object, **kwargs: object) -> tuple[int, int, int, int]:
+        mapping_inputs.update(kwargs)
+        return (3, 6, 3, 7)
+
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar_provider._geometry_shared_radar_window",
-        lambda *_args, **_kwargs: (3, 6, 3, 7),
+        fake_mapping,
     )
+    configured_dem = ConstantHeightDEM(55.0)
     callback = make_nisar_scene_provider(
         sensor=Sensor(),
         handles={
@@ -237,15 +260,18 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
         master="20240101",
         channel=("B", "HH"),
         configured_window=(5, 8, 2, 6),
+        configured_dem=configured_dem,
     )
 
     callback(
         reference_path,
         secondary_path,
         output_dir=tmp_path / "pair",
-        options={"coregistration_grid": "radar", "height": 0.0},
+        options={"coregistration_grid": "radar"},
     )
 
+    assert mapping_inputs["dem"] is configured_dem
+    assert mapping_inputs["height_m"] is None
     assert selections == [
         ("reference", (slice(5, 8), slice(2, 6))),
         ("secondary", (slice(3, 6), slice(3, 7))),
