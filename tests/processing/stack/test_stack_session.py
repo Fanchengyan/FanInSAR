@@ -205,6 +205,110 @@ def test_s1_default_coreg_resume_identity_is_stable(tmp_path: Path) -> None:
     assert first == second
 
 
+def test_stack_runtime_identity_mutations_invalidate_coreg_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runtime and callback identity changes cannot reuse coregistration."""
+    from faninsar.processing.stack import session as session_module
+
+    stack = _stack_with_three_date_network(tmp_path)
+    initial = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+
+    monkeypatch.setattr(
+        session_module,
+        "_faninsar_git_revision",
+        lambda: "different-revision",
+    )
+    changed_revision = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    assert changed_revision != initial
+
+    monkeypatch.setattr(
+        session_module,
+        "_runtime_image_identity",
+        lambda: {"platform": "different-runtime-image"},
+    )
+    changed_image = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    assert changed_image != changed_revision
+
+    monkeypatch.setattr(
+        session_module,
+        "_cuda_runtime_identity",
+        lambda: {
+            "available": True,
+            "driver": "different-driver",
+            "runtime": "different-runtime",
+            "devices": [{"index": 0, "uuid": "different-uuid", "name": "different"}],
+        },
+    )
+    changed_cuda = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    assert changed_cuda != changed_image
+
+    def callback(_reference: object, _secondary: object, **_kwargs: object) -> None:
+        """Mutation-only callback fixture."""
+
+    stack.scene_provider = SimpleNamespace(produce_pair=callback)
+    changed_callback = stack._coreg_resume_identity(
+        "20240113",
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+    )
+    assert changed_callback != changed_cuda
+
+
+def test_ifg_resume_binds_runtime_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IFG source lineage includes the same runtime fingerprint as coreg."""
+    from faninsar.processing.stack import session as session_module
+
+    stack = _stack_with_three_date_network(tmp_path)
+    data = np.ones((2, 2), dtype=np.complex64)
+    for date_id in stack.catalog.dates:
+        root = stack.config.work_dir / "coreg" / date_id / "scenes"
+        write_scene_unit(
+            root,
+            date_id=date_id,
+            master_id=stack.master,
+            domain="radar",
+            tag="f0_IW1_b0",
+            reference=data,
+            secondary=data,
+            row_origin=0,
+            col_origin=0,
+        )
+        stack.coreg_paths[date_id] = root.parent
+
+    stack.form_interferograms(multilook=(1, 1))
+    store = InterferogramArtifactStore.open(stack.ifg_dirs[0])
+    assert store.source_manifest_digests[
+        "runtime"
+    ] == session_module._runtime_fingerprint(None)
+
+    monkeypatch.setattr(
+        session_module, "_runtime_fingerprint", lambda _callback: "f" * 64
+    )
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    with pytest.raises(InvalidProcessingStateError, match="lineage"):
+        stack.form_interferograms(multilook=(1, 1))
+
+
 def test_coreg_resume_rejects_marker_after_provider_identity_change(
     tmp_path: Path,
 ) -> None:

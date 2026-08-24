@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
 import shutil
+import subprocess
 import sys
+import sysconfig
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from functools import wraps
 from pathlib import Path
@@ -73,6 +76,209 @@ logger = setup_logger(__name__)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+
+
+def _callable_identity(callback: object | None) -> dict[str, str] | None:
+    """Return the stable import identity of a callback, when available.
+
+    Parameters
+    ----------
+    callback : object, optional
+        Provider callback or callable object.
+
+    Returns
+    -------
+    dict[str, str] or None
+        Module and qualified name, without serializing the callable repr.
+
+    """
+    if callback is None:
+        return None
+    return {
+        "module": str(getattr(callback, "__module__", type(callback).__module__)),
+        "qualname": str(getattr(callback, "__qualname__", type(callback).__qualname__)),
+    }
+
+
+def _provider_callback(provider: object | None) -> object | None:
+    """Return a provider's production callback without inspecting its repr."""
+    if provider is None:
+        return None
+    callback = getattr(provider, "produce_pair", None)
+    if callback is None and callable(provider):
+        callback = provider
+    return callback
+
+
+def _distribution_version(names: tuple[str, ...]) -> str | None:
+    """Read the first installed distribution version from a name allowlist."""
+    for name in names:
+        try:
+            return str(importlib.metadata.version(name))
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        except Exception:
+            logger.debug("Unable to inspect distribution version: %s", name)
+            continue
+    return None
+
+
+def _loaded_module_version(names: tuple[str, ...]) -> str | None:
+    """Read a version from an already-loaded optional module, if exposed."""
+    for name in names:
+        module = sys.modules.get(name)
+        value = getattr(module, "__version__", None) if module is not None else None
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _faninsar_git_revision() -> str | None:
+    """Return the enclosing FanInSAR Git revision, when the checkout exposes it."""
+    repository = Path(__file__).resolve().parents[3]
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(repository), "rev-parse", "HEAD"),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    revision = completed.stdout.strip()
+    return revision if revision else None
+
+
+def _runtime_image_identity() -> dict[str, object]:
+    """Return bounded platform metadata identifying the runtime image."""
+    os_release: dict[str, str] = {}
+    try:
+        raw_release = platform.freedesktop_os_release()
+    except (AttributeError, OSError):
+        raw_release = {}
+    for name in ("ID", "VERSION_ID", "BUILD_ID", "IMAGE_ID", "IMAGE_VERSION"):
+        value = raw_release.get(name)
+        if value:
+            os_release[name.lower()] = str(value)
+    return {
+        "platform": platform.platform(aliased=True, terse=True),
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "os_release": os_release,
+    }
+
+
+def _cuda_runtime_identity() -> dict[str, object]:
+    """Return serializable CUDA availability and physical-device identity."""
+    identity: dict[str, object] = {
+        "available": False,
+        "driver": None,
+        "runtime": None,
+        "devices": [],
+    }
+    try:
+        import torch
+    except Exception:
+        return identity
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None:
+        return identity
+    try:
+        available = bool(cuda.is_available())
+    except Exception:
+        return identity
+    identity["available"] = available
+    version = getattr(torch, "version", None)
+    cuda_runtime = getattr(version, "cuda", None)
+    identity["runtime"] = None if cuda_runtime is None else str(cuda_runtime)
+    driver = getattr(cuda, "driver_version", None)
+    if driver is None:
+        driver = getattr(cuda, "get_driver_version", None)
+    try:
+        if callable(driver):
+            driver = driver()
+    except Exception:
+        driver = None
+    identity["driver"] = None if driver is None else str(driver)
+    if not available:
+        return identity
+    try:
+        count = int(cuda.device_count())
+    except Exception:
+        return identity
+    devices: list[dict[str, object]] = []
+    for index in range(max(0, count)):
+        try:
+            properties = cuda.get_device_properties(index)
+            devices.append(
+                {
+                    "index": index,
+                    "uuid": (
+                        None
+                        if getattr(properties, "uuid", None) is None
+                        else str(properties.uuid)
+                    ),
+                    "name": (
+                        None
+                        if getattr(properties, "name", None) is None
+                        else str(properties.name)
+                    ),
+                }
+            )
+        except Exception:
+            # An unavailable device is still represented by the count and the
+            # availability bit; never let diagnostics prevent S1 execution.
+            devices.append({"index": index, "uuid": None, "name": None})
+    identity["devices"] = devices
+    return identity
+
+
+def _stack_runtime_identity(callback: object | None) -> dict[str, object]:
+    """Build the canonical runtime identity used by all Stack resume stages."""
+    compiler = sysconfig.get_config_var("CC")
+    compiler_name = None
+    if compiler:
+        compiler_name = Path(str(compiler).split()[0]).name
+    return {
+        "faninsar_git_revision": _faninsar_git_revision(),
+        "versions": {
+            "faninsar": _distribution_version(("FanInSAR", "faninsar")),
+            "nisar": _distribution_version(("nisar", "nisar-products"))
+            or _loaded_module_version(("nisar", "nisar.products")),
+            "isce3": _distribution_version(("isce3", "isce3-python"))
+            or _loaded_module_version(("isce3",)),
+            "numpy": np.__version__,
+            "python": platform.python_version(),
+        },
+        "compiler": {
+            "python": platform.python_compiler(),
+            "python_build": list(platform.python_build()),
+            "c_compiler": compiler_name,
+            "implementation": sys.implementation.name,
+            "cache_tag": sys.implementation.cache_tag,
+        },
+        "runtime_image": _runtime_image_identity(),
+        "cuda": _cuda_runtime_identity(),
+        "callback": _callable_identity(callback),
+    }
+
+
+def _runtime_fingerprint(callback: object | None) -> str:
+    """Return the canonical digest of one Stack execution runtime."""
+    payload = _stack_runtime_identity(callback)
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        logger.exception("Stack runtime identity cannot be canonicalized")
+        reject_invalid_state(f"Stack runtime identity cannot be canonicalized: {error}")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _reclaim_after_stage(
@@ -642,20 +848,10 @@ class Stack:
             capabilities = getattr(provider, "capabilities", None)
             if capabilities is not None:
                 payload["capabilities"] = semantic_value(capabilities)
-            callback = getattr(provider, "produce_pair", None)
-            if callback is not None:
-                payload["callback"] = {
-                    "module": getattr(
-                        callback,
-                        "__module__",
-                        type(callback).__module__,
-                    ),
-                    "qualname": getattr(
-                        callback,
-                        "__qualname__",
-                        type(callback).__qualname__,
-                    ),
-                }
+            callback = _provider_callback(provider)
+            callback_identity = _callable_identity(callback)
+            if callback_identity is not None:
+                payload["callback"] = callback_identity
             # Providers may expose either a plain metadata mapping or a
             # zero-argument identity hook.  This keeps Stack mission-neutral
             # while allowing adapters to bind windows, channels, and source
@@ -721,16 +917,8 @@ class Stack:
             "bursts": semantic_value(bursts),
             "extra": semantic_value(self.config.extra),
         }
-        runtime = {
-            "python": platform.python_version(),
-            "implementation": sys.implementation.name,
-            "numpy": np.__version__,
-            "provider_callback": (
-                provider_payload.get("callback")
-                if provider_payload is not None
-                else None
-            ),
-        }
+        callback = _provider_callback(self.scene_provider)
+        runtime = _stack_runtime_identity(callback)
         payload = {
             "schema": "stack_coreg_request_v1",
             "master_id": self.master,
@@ -1091,6 +1279,12 @@ class Stack:
                 expected_sources = {
                     "primary": reference_store.manifest_digest,
                     "secondary": secondary_store.manifest_digest,
+                    # The IFG manifest is also a runtime admission boundary:
+                    # reusing bytes produced under another binary, Python,
+                    # CUDA, or provider callback identity is unsafe.
+                    "runtime": _runtime_fingerprint(
+                        _provider_callback(self.scene_provider)
+                    ),
                 }
                 expected_filter_name = "goldstein" if alpha > 0.0 else "none"
                 expected_filter_parameters = (
