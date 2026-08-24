@@ -324,3 +324,35 @@ def test_nisar_trusted_admission_rejects_hdf5_hard_link_cycle(
 
     with pytest.raises(InvalidProcessingStateError, match="hard-link cycle"):
         admit_nisar_source(source, admission={"trusted_roots": [tmp_path]})
+
+
+def test_nisar_trusted_admission_rejects_when_h5py_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Trusted admission cannot bypass link checks without h5py."""
+    source = tmp_path / "scene.h5"
+    source.write_bytes(b"reader-fake")
+    monkeypatch.setitem(sys.modules, "h5py", None)
+
+    with pytest.raises(InvalidProcessingStateError, match="requires h5py"):
+        admit_nisar_source(source, admission={"trusted_roots": [tmp_path]})
+
+
+def test_nisar_trusted_admission_rejects_hdf5_link_traversal_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Traversal/open errors fail closed instead of reaching the native reader."""
+    source = tmp_path / "scene.h5"
+    source.write_bytes(b"reader-fake")
+    h5py = ModuleType("h5py")
+    h5py.is_hdf5 = lambda _path: True  # type: ignore[attr-defined]
+
+    def open_file(*_args: object, **_kwargs: object) -> object:
+        message = "simulated HDF5 open failure"
+        raise OSError(message)
+
+    h5py.File = open_file  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "h5py", h5py)
+
+    with pytest.raises(InvalidProcessingStateError, match="link inspection failed"):
+        admit_nisar_source(source, admission={"trusted_roots": [tmp_path]})

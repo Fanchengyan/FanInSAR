@@ -129,6 +129,7 @@ _ADMISSION_SNAPSHOTS: dict[int, _AdmissionSnapshot] = {}
 _HDF5_LINK_MAX_DEPTH = 256
 _HDF5_LINK_MAX_OBJECTS = 100_000
 _HDF5_LINK_MAX_LINKS = 1_000_000
+_HDF5_SIGNATURE = b"\x89HDF\r\n\x1a\n"
 
 
 def _admission_error(message: str) -> None:
@@ -378,10 +379,26 @@ def _check_hdf5_links(path: Path, policy: NisarAdmissionPolicy) -> None:
     try:
         import h5py
     except ImportError:
-        logger.warning("h5py unavailable; external-link inspection is not applicable")
-        return
+        _admission_error(
+            "NISAR HDF5 link inspection requires h5py; optional dependency is unavailable"
+        )
     try:
-        if not h5py.is_hdf5(path):
+        is_hdf5 = h5py.is_hdf5(path)
+        if not is_hdf5:
+            # Lightweight reader fakes commonly use arbitrary non-HDF5 bytes,
+            # but a file carrying the HDF5 signature must not be handed to a
+            # native reader after h5py has rejected it as malformed.
+            try:
+                with path.open("rb") as stream:
+                    has_hdf5_signature = (
+                        stream.read(len(_HDF5_SIGNATURE)) == _HDF5_SIGNATURE
+                    )
+            except OSError as error:
+                _admission_error(
+                    f"NISAR HDF5 source cannot be inspected for validity: {path}: {error}"
+                )
+            if has_hdf5_signature:
+                _admission_error(f"NISAR source is an invalid HDF5 file: {path}")
             return
         with h5py.File(path, "r") as source:
             external_type = h5py.ExternalLink
@@ -461,10 +478,7 @@ def _check_hdf5_links(path: Path, policy: NisarAdmissionPolicy) -> None:
 
             walk(source, "/", 0)
     except OSError as error:
-        # Tiny fake-reader fixtures are often empty/non-HDF5 files.  A real
-        # HDF5 source is checked above; malformed files remain the native
-        # reader's responsibility for compatibility with the optional reader.
-        logger.warning("NISAR source HDF5 link check skipped for %s: %s", path, error)
+        _admission_error(f"NISAR HDF5 link inspection failed for {path}: {error}")
 
 
 def _source_snapshot(path: str | Path) -> _AdmissionSnapshot:
