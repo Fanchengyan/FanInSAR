@@ -81,6 +81,7 @@ def geocode_complex_to_grid(
     chunk_size: int | None = None,
     radar_shape: tuple[int, int] | None = None,
     device: DeviceLike,
+    geometry_device: DeviceLike | None = None,
 ) -> GeocodedComplex:
     """Resample a radar complex array onto a common geographic grid.
 
@@ -116,6 +117,10 @@ def geocode_complex_to_grid(
         input array is checked against it.
     device : DeviceLike
         Required production device (``auto`` resolves to cpu or cuda).
+    geometry_device : DeviceLike, optional
+        Device used for the Geo2Rdr solve. When omitted, ``device`` is used;
+        callers may keep geometry on CPU while explicitly placing the complex
+        Lanczos resampling on CUDA during a bounded smoke test.
 
     Returns
     -------
@@ -164,7 +169,13 @@ def geocode_complex_to_grid(
         # raise; we will mask these pixels out afterwards.
         safe_lat = np.where(geo_finite, lat_c, 0.0)
         safe_lon = np.where(geo_finite, lon_c, 0.0)
-        result = run_geo2rdr(geometry, safe_lat, safe_lon, height_m, device=device)
+        result = run_geo2rdr(
+            geometry,
+            safe_lat,
+            safe_lon,
+            height_m,
+            device=geometry_device or device,
+        )
         az = result.azimuth_index
         rg = result.range_index
         conv = result.converged
@@ -183,7 +194,12 @@ def geocode_complex_to_grid(
         # Bilinear-on-real/imag attenuates in-band signal and leaks aliasing,
         # producing a sub-pixel-offset-dependent phase bias.
         block_vals = lanczos_resample(
-            complex_radar, coords, a=4, mode="constant", cval=0.0
+            complex_radar,
+            coords,
+            a=4,
+            mode="constant",
+            cval=0.0,
+            device=device,
         )
         block = np.zeros(lat_c.shape, dtype=np.complex64)
         block[in_range] = block_vals.astype(np.complex64)
