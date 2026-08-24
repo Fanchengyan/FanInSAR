@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
+import faninsar.missions.nisar as nisar_module
 from faninsar.missions.nisar import (
     NisarAdmissionPolicy,
     NisarSensor,
@@ -350,6 +351,53 @@ def test_nisar_window_read_rejects_source_less_handle_before_native_access() -> 
         NisarSensor().read_slc_window(handle, (slice(0, 1), slice(0, 1)))
 
     assert calls == []
+
+
+def test_nisar_window_read_rejects_foreign_handle_on_stale_id_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale non-weakref id entry cannot authorize a foreign source handle."""
+
+    class NonWeakHandle:
+        """Minimal native-like handle that cannot carry weak references."""
+
+        __slots__ = ("filename", "getter_calls")
+
+        def __init__(self, filename: str) -> None:
+            self.filename = filename
+            self.getter_calls: list[tuple[str, str]] = []
+
+        def getSlcDatasetAsNativeComplex(  # noqa: N802
+            self, frequency: str, polarization: str
+        ) -> object:
+            self.getter_calls.append((frequency, polarization))
+            return object()
+
+    admitted = NonWeakHandle("")
+    source = tmp_path / "admitted.h5"
+    source.write_bytes(b"reader-fake")
+    admitted.filename = str(source)
+    install_fake_reader(monkeypatch, admitted, [])
+    admitted = NisarSensor().open_product(
+        str(source),
+        admission={
+            "trusted_roots": [tmp_path],
+            "expected_sha256": {
+                str(source): hashlib.sha256(source.read_bytes()).hexdigest()
+            },
+        },
+    )
+
+    foreign = NonWeakHandle(str(tmp_path / "foreign.h5"))
+    record = nisar_module._ADMISSION_SNAPSHOTS[id(admitted)]
+    # Model collection followed by Python id reuse for a non-weakref native
+    # wrapper, while keeping the original admission record alive.
+    nisar_module._ADMISSION_SNAPSHOTS[id(foreign)] = record
+
+    with pytest.raises(InvalidProcessingStateError, match="admission snapshot"):
+        NisarSensor().read_slc_window(foreign, (slice(0, 1), slice(0, 1)))
+
+    assert foreign.getter_calls == []
 
 
 def test_nisar_product_rejects_conflicting_channel_aliases() -> None:

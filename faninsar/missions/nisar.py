@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import weakref
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -53,6 +54,21 @@ class _AdmissionSnapshot:
     source_digest: str
     source_size_bytes: int = 0
     policy: NisarAdmissionPolicy | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmissionRecord:
+    """Admission snapshot bound to a handle identity.
+
+    Weak references are retained whenever the native handle supports them so
+    that a collected handle also removes its integer-id entry.  A few native
+    bindings are neither weak-referenceable nor extensible; those handles use
+    the source identity as a fail-closed fallback.
+    """
+
+    snapshot: _AdmissionSnapshot
+    handle_ref: weakref.ReferenceType[Any] | None = None
+    source_identity: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +136,10 @@ class NisarAdmissionPolicy:
         }
 
 
-_ADMISSION_SNAPSHOTS: dict[int, _AdmissionSnapshot] = {}
+_ADMISSION_SNAPSHOTS: dict[int, _AdmissionRecord] = {}
+_ADMISSION_WEAK: weakref.WeakKeyDictionary[Any, _AdmissionSnapshot] = (
+    weakref.WeakKeyDictionary()
+)
 
 # HDF5 links form a graph rather than a tree: hard links may alias an object or
 # even point back to an ancestor.  Keep the pre-open inspection bounded even for
@@ -507,21 +526,95 @@ def _source_snapshot(path: str | Path) -> _AdmissionSnapshot:
     return _AdmissionSnapshot(str(resolved), digest.hexdigest(), size)
 
 
+def _handle_source_identity(handle: Any) -> str | None:
+    """Return a canonical source identity exposed by a native handle."""
+    try:
+        source = _value(handle, "filename", "file_name", "source_path")
+    except Exception:
+        logger.exception("Unable to inspect NISAR handle source identity")
+        return None
+    if source is None:
+        return None
+    try:
+        return str(Path(source).expanduser().resolve(strict=False))
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def _remember_admission(handle: Any, snapshot: _AdmissionSnapshot) -> None:
-    """Remember an admission snapshot even for native handles without attrs."""
-    _ADMISSION_SNAPSHOTS[id(handle)] = snapshot
+    """Remember an admission snapshot while preventing integer-id reuse."""
+    handle_id = id(handle)
+    source_identity = _handle_source_identity(handle)
+    handle_ref: weakref.ReferenceType[Any] | None = None
+    try:
+        weakref_handle = weakref.ref(handle)
+    except TypeError:
+        weakref_handle = None
+    else:
+        handle_ref = weakref_handle
+        # WeakKeyDictionary is the preferred identity store where native
+        # wrappers are both weak-referenceable and hashable.  The id table is
+        # still populated because some wrappers are weak-referenceable but
+        # unhashable.
+        with suppress(TypeError):
+            _ADMISSION_WEAK[handle] = snapshot
+
+    record = _AdmissionRecord(snapshot, handle_ref, source_identity)
+    _ADMISSION_SNAPSHOTS[handle_id] = record
+
+    if handle_ref is not None:
+
+        def remove_record(reference: weakref.ReferenceType[Any]) -> None:
+            """Remove one stale integer-id record after handle collection."""
+            current = _ADMISSION_SNAPSHOTS.get(handle_id)
+            if current is not None and current.handle_ref is reference:
+                _ADMISSION_SNAPSHOTS.pop(handle_id, None)
+
+        # Replacing the temporary reference with a callback-bearing reference
+        # keeps the table self-cleaning without retaining the native handle.
+        callback_ref = weakref.ref(handle, remove_record)
+        _ADMISSION_SNAPSHOTS[handle_id] = _AdmissionRecord(
+            snapshot, callback_ref, source_identity
+        )
+
     with suppress(AttributeError, TypeError):
         handle._faninsar_nisar_admission = snapshot
-    # pybind11 handles can be non-extensible; the id-keyed table covers those
-    # objects for the lifetime of the opened handle.
 
 
 def _handle_admission(handle: Any) -> _AdmissionSnapshot | None:
-    """Return a previously captured snapshot for a native reader handle."""
-    snapshot = getattr(handle, "_faninsar_nisar_admission", None)
-    if isinstance(snapshot, _AdmissionSnapshot):
-        return snapshot
-    return _ADMISSION_SNAPSHOTS.get(id(handle))
+    """Return a snapshot only when handle identity or source identity matches."""
+    try:
+        weak_snapshot = _ADMISSION_WEAK.get(handle)
+    except TypeError:
+        weak_snapshot = None
+
+    record = _ADMISSION_SNAPSHOTS.get(id(handle))
+    if record is None:
+        return None
+    if record.handle_ref is not None:
+        if record.handle_ref() is handle:
+            # Require the identity-indexed record as well as the weak map.
+            # This avoids WeakKeyDictionary equality semantics authorizing a
+            # distinct but equal foreign wrapper.
+            if weak_snapshot is not None and weak_snapshot is not record.snapshot:
+                logger.error("NISAR admission stores disagree for this handle")
+                return None
+            return record.snapshot
+        logger.error("NISAR admission snapshot does not belong to this handle")
+        return None
+
+    # Non-weakref native wrappers can only use the integer-id fallback when
+    # their stable source identity is available and unchanged.  A source-less
+    # or differently sourced foreign wrapper must fail closed.
+    source_identity = _handle_source_identity(handle)
+    if (
+        record.source_identity is None
+        or source_identity is None
+        or source_identity != record.source_identity
+    ):
+        logger.error("NISAR admission snapshot does not match this handle")
+        return None
+    return record.snapshot
 
 
 def _validate_admission(
