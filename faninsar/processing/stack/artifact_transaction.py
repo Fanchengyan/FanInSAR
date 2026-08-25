@@ -65,7 +65,7 @@ class _PinnedGenerationPath(_ConcretePath):
         _relative_parts: tuple[str, ...] = (),
     ) -> Self:
         """Create a descriptor-backed path with stable display metadata."""
-        return super().__new__(cls)
+        return super().__new__(cls, os.fspath(_display_path))
 
     def __init__(
         self,
@@ -74,7 +74,12 @@ class _PinnedGenerationPath(_ConcretePath):
         relative_parts: tuple[str, ...] = (),
     ) -> None:
         """Initialize descriptor and caller-facing path representations."""
-        super().__init__(display_path)
+        # pathlib's concrete implementation changed between Python 3.11 and
+        # 3.12: the former initializes in ``__new__`` while the latter fills
+        # ``_raw_paths`` in ``__init__``.  Keep the compatible initialization
+        # when available, but do not make the 3.11 object initializer fatal.
+        with suppress(TypeError):
+            super().__init__(display_path)
         self._display_path = display_path
         self._relative_parts = relative_parts
         self._state = state

@@ -9,6 +9,8 @@ import pytest
 
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.stack.artifact_transaction import (
+    _PinnedDescriptorState,
+    _PinnedGenerationPath,
     commit_generation,
     open_current_generation,
     stage_generation,
@@ -16,6 +18,32 @@ from faninsar.processing.stack.artifact_transaction import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def test_pinned_generation_path_constructs(tmp_path: Path) -> None:
+    """Pinned paths must construct when pathlib.Path.__init__ is object.__init__."""
+    descriptor = os.open(tmp_path, os.O_RDONLY)
+    state = _PinnedDescriptorState(
+        generation_descriptor=descriptor,
+        display_path=tmp_path,
+        payload_descriptors=[],
+    )
+    pinned = _PinnedGenerationPath(state, tmp_path)
+    assert pinned._display_path == tmp_path
+    child = pinned / "payload.npy"
+    assert child._relative_parts == ("payload.npy",)
+
+
+def test_open_current_generation_reopens_with_pinned_path(tmp_path: Path) -> None:
+    """Opening a published generation must work on Linux pathlib runtimes."""
+    root = tmp_path / "artifacts"
+    _publish_minimal_generation(root)
+
+    opened = open_current_generation(root, "ifg")
+    try:
+        assert (opened.path / "payload.bin").read_bytes() == b"payload"
+    finally:
+        opened.lease.close()
 
 
 def test_staging_rejects_symlinked_namespace_directory(tmp_path: Path) -> None:
