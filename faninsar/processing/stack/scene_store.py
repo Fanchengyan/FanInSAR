@@ -364,8 +364,41 @@ def write_scene_unit(
     grid_identity: str | None = None,
     scientific_lineage: Sequence[Mapping[str, str]] | None = None,
     phase_state: Mapping[str, object] | None = None,
+    validate_existing_payloads: bool = True,
 ) -> None:
-    """Atomically add one aligned unit and publish a complete manifest."""
+    """Atomically add one aligned unit and publish a complete manifest.
+
+    Parameters
+    ----------
+    root : path-like
+        Scene-store directory.
+    date_id, master_id : str
+        Secondary acquisition and alignment-master identifiers.
+    domain : str
+        Coordinate domain, either radar or geographic.
+    tag : str
+        Stable unit identifier within the store.
+    reference, secondary : numpy.ndarray
+        Matching complex64 scene arrays.
+    row_origin, col_origin : int
+        Unit origin within the declared common grid.
+    grid_shape : tuple of int, optional
+        Common scene dimensions. Defaults to the unit extent.
+    wavelength_m : float, optional
+        Radar wavelength in metres.
+    grid_identity : str, optional
+        Canonical coordinate-grid SHA-256.
+    scientific_lineage : sequence of mappings, optional
+        Source and processing lineage attached to the unit.
+    phase_state : mapping, optional
+        Phase-correction state attached to the unit.
+    validate_existing_payloads : bool, optional
+        Re-read all previously published payload bytes before appending. A
+        streaming producer that has already validated its resume tiles may set
+        this to ``False`` to avoid quadratic I/O while retaining manifest
+        validation. The default preserves the public fail-closed behavior.
+
+    """
     path = _validated_store_root(root, create=True)
     _require_basename(tag, "tag")
     if (
@@ -408,8 +441,9 @@ def write_scene_unit(
     existing: dict[str, object] = {}
     if manifest_path.is_file():
         existing_store = CoregisteredSceneStore.open(path)
-        for existing_unit in existing_store.units:
-            existing_store.read(existing_unit.tag)
+        if validate_existing_payloads:
+            for existing_unit in existing_store.units:
+                existing_store.read(existing_unit.tag)
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (
             existing.get("date_id") != date_id
@@ -483,6 +517,10 @@ def copy_reference_units(source: str | Path, target: str | Path) -> None:
     """Copy reference payloads into the master store without source aliases."""
     source_store = CoregisteredSceneStore.open(source)
     destination = Path(target)
+    if (destination / "manifest.json").is_file():
+        existing_store = CoregisteredSceneStore.open(destination)
+        for existing_unit in existing_store.units:
+            existing_store.read(existing_unit.tag)
     for unit in source_store.units:
         reference, _, _ = source_store.read(unit.tag)
         write_scene_unit(
@@ -499,6 +537,7 @@ def copy_reference_units(source: str | Path, target: str | Path) -> None:
             wavelength_m=source_store.wavelength_m,
             grid_identity=source_store.grid_identity,
             scientific_lineage=unit.scientific_lineage,
+            validate_existing_payloads=False,
         )
 
 
@@ -604,9 +643,8 @@ def form_merged_scene_interferogram(
             from faninsar.backends.dask_gpu import should_accelerate
 
             if (
-                (dask_client is not None or device.lower() == "cuda")
-                and should_accelerate(device, dask_client, kernel="goldstein_filter")
-            ):
+                dask_client is not None or device.lower() == "cuda"
+            ) and should_accelerate(device, dask_client, kernel="goldstein_filter"):
                 from faninsar.backends.dask_gpu import run_goldstein_filter
 
                 filtered = run_goldstein_filter(
@@ -731,9 +769,8 @@ def form_merged_scene_interferogram(
     if goldstein_alpha > 0.0:
         from faninsar.backends.dask_gpu import should_accelerate
 
-        if (
-            (dask_client is not None or device.lower() == "cuda")
-            and should_accelerate(device, dask_client, kernel="goldstein_filter")
+        if (dask_client is not None or device.lower() == "cuda") and should_accelerate(
+            device, dask_client, kernel="goldstein_filter"
         ):
             from faninsar.backends.dask_gpu import run_goldstein_filter
 
@@ -823,9 +860,8 @@ def form_scene_interferograms(
             from faninsar.backends.dask_gpu import should_accelerate
 
             if (
-                (dask_client is not None or device.lower() == "cuda")
-                and should_accelerate(device, dask_client, kernel="goldstein_filter")
-            ):
+                dask_client is not None or device.lower() == "cuda"
+            ) and should_accelerate(device, dask_client, kernel="goldstein_filter"):
                 from faninsar.backends.dask_gpu import run_goldstein_filter
 
                 complex_ifg = run_goldstein_filter(

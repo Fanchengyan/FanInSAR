@@ -1,7 +1,6 @@
 """Executable bounded NISAR provider tests (PROPOSAL-0035)."""
 
 # Test modules intentionally import runtime fixtures directly.
-# ruff: noqa: TC001
 
 from __future__ import annotations
 
@@ -21,11 +20,11 @@ from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.slc import GeoSLC, RadarSLC
 from faninsar.processing.stack import NISARStack
 from faninsar.processing.stack.nisar_provider import (
+    _geo_tile_for_radar_crop,
     _geometry_shared_radar_window,
     _radar_crop,
     make_nisar_scene_provider,
 )
-from faninsar.processing.stack.provider import UnsupportedStackCapabilityError
 from faninsar.processing.stack.scene_store import CoregisteredSceneStore
 
 from .test_nisar_stack import _result
@@ -490,18 +489,154 @@ def test_nisar_geometry_mapping_rejects_missing_height_and_nonconvergence(
         )
 
 
-def test_nisar_provider_fails_closed_without_bounded_window(
+def test_nisar_provider_promotes_full_scene_without_bounded_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Unbounded scene promotion remains an explicit capability failure."""
+    """Omitting the bounded window publishes the common full-scene overlap."""
     stack, paths, _handles = _stack(tmp_path, monkeypatch)
-    with pytest.raises(UnsupportedStackCapabilityError, match="scene-production"):
-        stack.scene_provider(
-            paths[0],
-            paths[1],
-            output_dir=tmp_path / "pair",
-            options={"nisar_window": None},
-        )
+    stack.scene_provider(
+        paths[0],
+        paths[1],
+        output_dir=tmp_path / "pair",
+        options={
+            "nisar_window": None,
+            "coregistration_grid": "radar",
+        },
+    )
+
+    store = CoregisteredSceneStore.open(tmp_path / "pair" / "scenes")
+    assert store.grid_shape == (3, 4)
+    assert [unit.tag for unit in store.units] == ["NISAR_b000000"]
+    assert store.units[0].row_origin == 0
+    assert store.units[0].col_origin == 0
+
+
+def test_nisar_full_scene_uses_deterministic_row_major_tiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Full-scene tile reads and manifest placements cover the common grid."""
+    reference_path = tmp_path / "NISAR_RSLC_20240101.h5"
+    secondary_path = tmp_path / "NISAR_RSLC_20240113.h5"
+    reference_path.write_bytes(b"reference")
+    secondary_path.write_bytes(b"secondary")
+    reference_result = _result(reference_path, "20240101")
+    secondary_result = _result(secondary_path, "20240113")
+    handles = {reference_path: object(), secondary_path: object()}
+    selections: list[tuple[slice, slice]] = []
+
+    class Sensor:
+        """Record every normalized window read."""
+
+        def read_slc_window(
+            self,
+            _handle: object,
+            window: tuple[slice, slice],
+            **_kwargs: object,
+        ) -> np.ndarray:
+            selections.append(window)
+            return np.ones(
+                (window[0].stop - window[0].start, window[1].stop - window[1].start),
+                dtype=np.complex64,
+            )
+
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar_provider._geometry_shared_radar_window",
+        lambda _reference, _secondary, bounds, **_kwargs: bounds,
+    )
+    callback = make_nisar_scene_provider(
+        sensor=Sensor(),
+        handles=handles,
+        products={
+            "20240101": reference_result.product,
+            "20240113": secondary_result.product,
+        },
+        lineage={
+            "20240101": str(reference_path),
+            "20240113": str(secondary_path),
+        },
+        master="20240101",
+        channel=("B", "HH"),
+        configured_tile_shape=(2, 3),
+        configured_height=0.0,
+    )
+    callback(
+        reference_path,
+        secondary_path,
+        output_dir=tmp_path / "full",
+        options={"coregistration_grid": "radar", "device": "cpu"},
+    )
+
+    store = CoregisteredSceneStore.open(tmp_path / "full" / "scenes")
+    assert store.grid_shape == (4, 5)
+    assert [unit.tag for unit in store.units] == [
+        "NISAR_b000000",
+        "NISAR_b000001",
+        "NISAR_b000002",
+        "NISAR_b000003",
+    ]
+    assert [(unit.row_origin, unit.col_origin, unit.shape) for unit in store.units] == [
+        (0, 0, (2, 3)),
+        (0, 3, (2, 2)),
+        (2, 0, (2, 3)),
+        (2, 3, (2, 2)),
+    ]
+    assert len(selections) == 8
+
+    callback(
+        reference_path,
+        secondary_path,
+        output_dir=tmp_path / "full",
+        options={"coregistration_grid": "radar", "device": "cpu"},
+    )
+    assert len(selections) == 8
+
+
+def test_nisar_geo_tile_preserves_projected_global_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A UTM tile keeps its placement in the configured full Geo grid."""
+    from pyproj import Transformer
+
+    longitude = np.array([-147.001, -147.0, -146.999], dtype=np.float64)
+    latitude = np.array([65.001, 65.0, 64.999], dtype=np.float64)
+    longitude_grid, latitude_grid = np.meshgrid(longitude, latitude)
+    x_coordinates, y_coordinates = Transformer.from_crs(
+        "EPSG:4326", "EPSG:32606", always_xy=True
+    ).transform(longitude_grid, latitude_grid)
+    x_min = float(np.min(x_coordinates)) - 100.0
+    y_max = float(np.max(y_coordinates)) + 100.0
+    target = GeoGrid(
+        shape=(30, 30),
+        crs="EPSG:32606",
+        transform=(20.0, 0.0, x_min, 0.0, -20.0, y_max),
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.geometry.prepare_production.run_rdr2geo",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            converged=np.ones(9, dtype=bool),
+            latitude_deg=latitude_grid.reshape(-1),
+            longitude_deg=longitude_grid.reshape(-1),
+        ),
+    )
+
+    local, row_origin, col_origin = _geo_tile_for_radar_crop(
+        _result(tmp_path / "reference.h5", "20240101").product,
+        (0, 4, 0, 5),
+        target,
+        device="cpu",
+        dem=ConstantHeightDEM(0.0),
+    )
+
+    assert row_origin > 0
+    assert col_origin > 0
+    assert local.transform[2] == pytest.approx(
+        target.transform[2] + col_origin * target.transform[0]
+    )
+    assert local.transform[5] == pytest.approx(
+        target.transform[5] + row_origin * target.transform[4]
+    )
+    assert row_origin + local.shape[0] <= target.shape[0]
+    assert col_origin + local.shape[1] <= target.shape[1]
 
 
 def test_nisar_provider_rejects_source_content_mutation_after_admission(

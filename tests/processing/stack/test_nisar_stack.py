@@ -29,7 +29,6 @@ from faninsar.processing.readers import (
     ValidSampleMask,
 )
 from faninsar.processing.stack import NISARStack
-from faninsar.processing.stack.provider import UnsupportedStackCapabilityError
 
 
 def _result(path: Path, date_id: str) -> SLCReadResult:
@@ -289,18 +288,18 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
         fail_if_safe_opened,
     )
 
-    with pytest.raises(UnsupportedStackCapabilityError, match="NISAR RSLC Stack"):
+    with pytest.raises(InvalidProcessingStateError, match="explicit DEM or height"):
         stack.measure_misreg()
-    with pytest.raises(UnsupportedStackCapabilityError, match="NISAR RSLC Stack"):
+    with pytest.raises(InvalidProcessingStateError, match="explicit DEM or height"):
         stack.coregister_scenes()
     with pytest.raises(InvalidProcessingStateError, match="scene generation missing"):
         stack.form_interferograms()
 
 
-def test_nisar_scene_provider_exposes_named_fail_closed_capability(
+def test_nisar_scene_provider_requires_geometry_for_full_scene(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """NISAR advertises unsupported scene production instead of S1 fallback."""
+    """Full-scene NISAR fails before reads when geometry input is absent."""
     paths = tuple(
         tmp_path / f"NISAR_RSLC_{date_id}.h5" for date_id in ("20240101", "20240113")
     )
@@ -328,10 +327,7 @@ def test_nisar_scene_provider_exposes_named_fail_closed_capability(
     )
 
     assert stack.scene_provider is not None
-    with pytest.raises(
-        UnsupportedStackCapabilityError,
-        match="scene-production",
-    ):
+    with pytest.raises(InvalidProcessingStateError, match="explicit DEM or height"):
         stack.scene_provider(
             paths[0],
             paths[1],

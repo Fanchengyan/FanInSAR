@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,6 +21,7 @@ from faninsar.processing.contracts import (
 from faninsar.processing.coordinates import GeoGrid, RadarGrid
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.slc import RadarSLC, choose_processing_grid
+from faninsar.processing.slc.dual import _radar_to_geo_resample
 
 
 def _radar_product() -> SLCProduct:
@@ -90,3 +92,42 @@ def test_radar_slc_accepts_matching_complex_window() -> None:
     slc = RadarSLC(product=product, samples=samples)
     assert isinstance(slc.grid, RadarGrid)
     assert slc.samples.shape == (8, 8)
+
+
+def test_radar_to_geo_resample_projects_wgs84_into_utm() -> None:
+    """Projected Geo grids receive WGS84 geometry at the correct pixel."""
+    from pyproj import Transformer
+
+    longitude = np.array([[-147.0]], dtype=np.float64)
+    latitude = np.array([[65.0]], dtype=np.float64)
+    x_coordinate, y_coordinate = Transformer.from_crs(
+        "EPSG:4326", "EPSG:32606", always_xy=True
+    ).transform(longitude, latitude)
+    target = GeoGrid(
+        shape=(3, 3),
+        crs="EPSG:32606",
+        transform=(
+            20.0,
+            0.0,
+            float(x_coordinate[0, 0]) - 20.0,
+            0.0,
+            -20.0,
+            float(y_coordinate[0, 0]) + 20.0,
+        ),
+    )
+    transform = SimpleNamespace(
+        converged=np.array([[True]]),
+        latitude_deg=latitude,
+        longitude_deg=longitude,
+        azimuth_index=np.array([[0.0]]),
+        range_index=np.array([[0.0]]),
+    )
+
+    result = _radar_to_geo_resample(
+        np.array([[2.0 + 3.0j]], dtype=np.complex64),
+        transform,
+        target,
+    )
+
+    assert result[1, 1] == np.complex64(2.0 + 3.0j)
+    assert np.count_nonzero(result) == 1

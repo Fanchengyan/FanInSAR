@@ -313,10 +313,36 @@ def _radar_to_geo_resample(
         return out
     lat = transform.latitude_deg[valid]
     lon = transform.longitude_deg[valid]
+    normalized_crs = target_grid.crs.upper().replace(" ", "")
+    if normalized_crs in {"EPSG:4326", "OGC:CRS84", "CRS84"}:
+        x_coordinates = lon
+        y_coordinates = lat
+    else:
+        try:
+            from pyproj import Transformer
+
+            transformer = Transformer.from_crs(
+                "EPSG:4326",
+                target_grid.crs,
+                always_xy=True,
+            )
+            x_coordinates, y_coordinates = transformer.transform(lon, lat)
+        except Exception as error:
+            logger.exception("RadarSLC target coordinates cannot be projected")
+            reject_invalid_state(
+                f"RadarSLC target CRS cannot project WGS84 coordinates: {error}"
+            )
+        x_coordinates = np.asarray(x_coordinates, dtype=np.float64)
+        y_coordinates = np.asarray(y_coordinates, dtype=np.float64)
     az = transform.azimuth_index[valid]
     rg = transform.range_index[valid]
-    col = np.rint((lon - c) / a).astype(np.int64)
-    row = np.rint((lat - f) / e).astype(np.int64)
+    finite_coordinates = np.isfinite(x_coordinates) & np.isfinite(y_coordinates)
+    col = np.rint(np.where(finite_coordinates, (x_coordinates - c) / a, 0.0)).astype(
+        np.int64
+    )
+    row = np.rint(np.where(finite_coordinates, (y_coordinates - f) / e, 0.0)).astype(
+        np.int64
+    )
     src_az = np.rint(az).astype(np.int64)
     src_rg = np.rint(rg).astype(np.int64)
     src_h, src_w = samples.shape
@@ -329,6 +355,7 @@ def _radar_to_geo_resample(
         & (src_az < src_h)
         & (src_rg >= 0)
         & (src_rg < src_w)
+        & finite_coordinates
     )
     out[row[keep], col[keep]] = samples[src_az[keep], src_rg[keep]]
     return out

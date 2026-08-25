@@ -277,6 +277,7 @@ class NISARStack(Stack):
             **config_kwargs,
         )
         configured_window = extra.get("nisar_window", extra.get("rslc_window"))
+        configured_tile_shape = extra.get("nisar_tile_shape")
         provider_callback = make_nisar_scene_provider(
             sensor=sensor,
             handles=handles,
@@ -285,6 +286,7 @@ class NISARStack(Stack):
             master=master,
             channel=(admitted_frequency, admitted_polarization),
             configured_window=configured_window,
+            configured_tile_shape=configured_tile_shape,
             configured_dem=config.dem,
             configured_height=extra.get("height_m", extra.get("height")),
             admission_lineage=admission_lineage,
