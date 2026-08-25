@@ -562,10 +562,9 @@ def _validate_nisar_geo_ownership(store: CoregisteredSceneStore) -> None:
     if policies == {None}:
         # Backward-compatible bounded NISAR generations predate tiled ownership.
         return
-    if policies != {"first_valid_row_major_v1"}:
+    if policies != {"joint_first_valid_row_major_v1"}:
         reject_invalid_state("NISAR Geo scene mixes ownership contracts")
-    reference_owned = np.zeros(store.grid_shape, dtype=bool)
-    secondary_owned = np.zeros(store.grid_shape, dtype=bool)
+    pair_owned = np.zeros(store.grid_shape, dtype=bool)
     for unit in sorted(store.units, key=lambda item: item.tag):
         reference, secondary, _ = store.read(unit.tag)
         row_slice = slice(unit.row_origin, unit.row_origin + unit.shape[0])
@@ -580,12 +579,18 @@ def _validate_nisar_geo_ownership(store: CoregisteredSceneStore) -> None:
             & np.isfinite(secondary.imag)
             & (np.abs(secondary) > 0.0)
         )
-        if np.any(reference_owned[row_slice, col_slice] & reference_valid) or np.any(
-            secondary_owned[row_slice, col_slice] & secondary_valid
-        ):
+        if not np.array_equal(reference_valid, secondary_valid):
+            reject_invalid_state(
+                f"NISAR Geo scene unit {unit.tag!r} has asymmetric pair ownership"
+            )
+        declared_count = (unit.phase_state or {}).get("pair_valid_pixels")
+        if declared_count != int(np.sum(reference_valid)):
+            reject_invalid_state(
+                f"NISAR Geo scene unit {unit.tag!r} pair coverage count differs"
+            )
+        if np.any(pair_owned[row_slice, col_slice] & reference_valid):
             reject_invalid_state("NISAR Geo scene tiles have overlapping ownership")
-        reference_owned[row_slice, col_slice] |= reference_valid
-        secondary_owned[row_slice, col_slice] |= secondary_valid
+        pair_owned[row_slice, col_slice] |= reference_valid
 
 
 def form_merged_scene_interferogram(

@@ -925,16 +925,19 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
         _product: object,
         reference: np.ndarray,
         secondary: np.ndarray,
-        _bounds: tuple[int, int, int, int],
+        bounds: tuple[int, int, int, int],
         target: GeoGrid,
         **_kwargs: object,
     ) -> tuple[np.ndarray, np.ndarray]:
         reference_value = reference[np.isfinite(reference)][0]
         secondary_value = secondary[np.isfinite(secondary)][0]
-        return (
-            np.full(target.shape, reference_value, np.complex64),
-            np.full(target.shape, secondary_value, np.complex64),
-        )
+        reference_geo = np.full(target.shape, reference_value, np.complex64)
+        secondary_geo = np.full(target.shape, secondary_value, np.complex64)
+        if bounds[2] == 0:
+            # Reference-only validity at this overlap must not claim half a pair;
+            # the following range tile owns the pixel jointly instead.
+            secondary_geo[:, -1] = np.complex64(np.nan + 1j * np.nan)
+        return reference_geo, secondary_geo
 
     monkeypatch.setattr(
         "faninsar.processing.stack.nisar_provider._geocode_aligned_radar_tile",
@@ -970,6 +973,17 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
             col_slice = slice(unit.col_origin, unit.col_origin + unit.shape[1])
             reference_coverage[row_slice, col_slice] += np.isfinite(reference.real)
             secondary_coverage[row_slice, col_slice] += np.isfinite(secondary.real)
+            assert np.array_equal(
+                np.isfinite(reference.real),
+                np.isfinite(secondary.real),
+            )
+            assert unit.phase_state is not None
+            assert unit.phase_state["coverage_policy"] == (
+                "joint_first_valid_row_major_v1"
+            )
+            assert unit.phase_state["pair_valid_pixels"] == int(
+                np.sum(np.isfinite(reference.real))
+            )
         assert np.all(reference_coverage == 1)
         assert np.all(secondary_coverage == 1)
     assert {date_id for date_id, _bounds in mapping_calls} == {

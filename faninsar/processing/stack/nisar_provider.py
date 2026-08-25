@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -67,9 +68,21 @@ def _dem_identity(dem: object) -> str:
             return f"{qualified_name}:height_m={float(height):.17g}"
         except (TypeError, ValueError):
             return f"{qualified_name}:height_m={height!r}"
+    for name in ("content_digest", "source_digest", "sha256"):
+        digest = getattr(dem, name, None)
+        if isinstance(digest, str) and digest:
+            return f"{qualified_name}:{name}={digest}"
     path = getattr(dem, "path", None)
     if path is not None:
-        return f"{qualified_name}:path={Path(path).expanduser().resolve(strict=False)}"
+        resolved = Path(path).expanduser().resolve(strict=False)
+        try:
+            stat = resolved.stat()
+        except OSError:
+            return f"{qualified_name}:path={resolved}"
+        return (
+            f"{qualified_name}:path={resolved}:size={stat.st_size}:"
+            f"mtime_ns={stat.st_mtime_ns}"
+        )
     return qualified_name
 
 
@@ -1020,12 +1033,7 @@ def make_nisar_scene_provider(
                 {"crs": target.crs, "transform": list(target.transform)},
             )
         scenes = output_dir / "scenes"
-        reference_claimed = (
-            np.zeros(grid_shape, dtype=bool) if domain == "geo" else None
-        )
-        secondary_claimed = (
-            np.zeros(grid_shape, dtype=bool) if domain == "geo" else None
-        )
+        pair_claimed = np.zeros(grid_shape, dtype=bool) if domain == "geo" else None
         for tile_index, tile_bounds in enumerate(tiles):
             dense_mapping: _DenseRadarMapping | None = None
             if full_scene:
@@ -1091,6 +1099,11 @@ def make_nisar_scene_provider(
                 "grid_identity": grid_identity,
                 "channel": list(channel),
                 "dem_identity": dem_identity,
+                "device": device,
+                "runtime": {
+                    "python": ".".join(str(item) for item in sys.version_info[:3]),
+                    "numpy": np.__version__,
+                },
                 "geometry": (
                     "per_pixel_rdr2geo_geo2rdr_lanczos4"
                     if full_scene
@@ -1119,18 +1132,22 @@ def make_nisar_scene_provider(
                     existing_reference, existing_secondary, _ = existing.read(tag)
                     row_slice = slice(row_origin, row_origin + tile_output_shape[0])
                     col_slice = slice(col_origin, col_origin + tile_output_shape[1])
-                    assert reference_claimed is not None
-                    assert secondary_claimed is not None
-                    reference_claimed[row_slice, col_slice] |= (
+                    assert pair_claimed is not None
+                    reference_valid = (
                         np.isfinite(existing_reference.real)
                         & np.isfinite(existing_reference.imag)
                         & (np.abs(existing_reference) > 0.0)
                     )
-                    secondary_claimed[row_slice, col_slice] |= (
+                    secondary_valid = (
                         np.isfinite(existing_secondary.real)
                         & np.isfinite(existing_secondary.imag)
                         & (np.abs(existing_secondary) > 0.0)
                     )
+                    if not np.array_equal(reference_valid, secondary_valid):
+                        reject_invalid_state(
+                            f"persisted NISAR Geo tile {tag!r} has asymmetric ownership"
+                        )
+                    pair_claimed[row_slice, col_slice] |= reference_valid
                 continue
             reference_window = (
                 slice(row_start, row_stop),
@@ -1252,8 +1269,7 @@ def make_nisar_scene_provider(
                         geo_grid=local_target,
                         use_cache=False,
                     ).samples
-                assert reference_claimed is not None
-                assert secondary_claimed is not None
+                assert pair_claimed is not None
                 row_slice = slice(row_origin, row_origin + tile_output_shape[0])
                 col_slice = slice(col_origin, col_origin + tile_output_shape[1])
                 reference_valid = (
@@ -1266,24 +1282,22 @@ def make_nisar_scene_provider(
                     & np.isfinite(secondary_array.imag)
                     & (np.abs(secondary_array) > 0.0)
                 )
-                reference_owner = (
-                    reference_valid & ~reference_claimed[row_slice, col_slice]
-                )
-                secondary_owner = (
-                    secondary_valid & ~secondary_claimed[row_slice, col_slice]
+                pair_owner = (
+                    reference_valid
+                    & secondary_valid
+                    & ~pair_claimed[row_slice, col_slice]
                 )
                 reference_array = np.where(
-                    reference_owner,
+                    pair_owner,
                     reference_array,
                     np.complex64(np.nan + 1j * np.nan),
                 )
                 secondary_array = np.where(
-                    secondary_owner,
+                    pair_owner,
                     secondary_array,
                     np.complex64(np.nan + 1j * np.nan),
                 )
-                reference_claimed[row_slice, col_slice] |= reference_owner
-                secondary_claimed[row_slice, col_slice] |= secondary_owner
+                pair_claimed[row_slice, col_slice] |= pair_owner
             write_scene_unit(
                 scenes,
                 date_id=secondary_date,
@@ -1335,7 +1349,9 @@ def make_nisar_scene_provider(
                 phase_state={
                     "resume_identity": resume_identity,
                     "coverage_policy": (
-                        "first_valid_row_major_v1" if domain == "geo" else "nan_mask_v1"
+                        "joint_first_valid_row_major_v1"
+                        if domain == "geo"
+                        else "nan_mask_v1"
                     ),
                     "geometry_method": resume_payload["geometry"],
                     "reference_valid_pixels": int(
@@ -1349,6 +1365,16 @@ def make_nisar_scene_provider(
                         np.sum(
                             np.isfinite(secondary_array.real)
                             & np.isfinite(secondary_array.imag)
+                            & (np.abs(secondary_array) > 0.0)
+                        )
+                    ),
+                    "pair_valid_pixels": int(
+                        np.sum(
+                            np.isfinite(reference_array.real)
+                            & np.isfinite(reference_array.imag)
+                            & np.isfinite(secondary_array.real)
+                            & np.isfinite(secondary_array.imag)
+                            & (np.abs(reference_array) > 0.0)
                             & (np.abs(secondary_array) > 0.0)
                         )
                     ),
