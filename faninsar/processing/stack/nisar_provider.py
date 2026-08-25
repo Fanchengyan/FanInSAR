@@ -159,8 +159,8 @@ def _apply_range_offset_flatten(
     interferogram.  Since scene stores retain the aligned secondary SLC and
     form ``reference * conj(secondary)`` later, the inverse-conjugate screen
     is applied to the secondary here.  The resulting interferogram therefore
-    carries ``exp(-1j * phase)`` with
-    ``phase = 4*pi*range_spacing/wavelength*(reference-secondary)``.
+    carries ``exp(-1j * phase)`` with the ISCE3 range-offset convention
+    ``phase = 4*pi*range_spacing/wavelength*(secondary-reference)``.
 
     Parameters
     ----------
@@ -184,7 +184,7 @@ def _apply_range_offset_flatten(
     reference_range = reference_col_origin + np.arange(
         secondary.shape[1], dtype=np.float64
     )[None, :]
-    range_offset = reference_range - np.asarray(secondary_range_index, dtype=np.float64)
+    range_offset = np.asarray(secondary_range_index, dtype=np.float64) - reference_range
     phase = (4.0 * np.pi * range_spacing_m / wavelength_m) * range_offset
     flattened = np.asarray(secondary, dtype=np.complex64) * np.exp(1j * phase)
     return flattened.astype(np.complex64, copy=False), phase.astype(np.float32)

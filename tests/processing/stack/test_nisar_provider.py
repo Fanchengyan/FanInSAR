@@ -36,7 +36,7 @@ from .test_nisar_stack import _result
 
 
 def test_nisar_range_offset_flatten_applies_nisar_ifg_sign() -> None:
-    """Secondary phase produces the NISAR exp(-j*phase) IFG convention."""
+    """ISCE3 secondary-minus-reference offset produces exp(-j*phase)."""
     secondary = np.ones((2, 3), dtype=np.complex64)
     secondary_range = np.array([[10.0, 12.0, 14.0], [10.0, 12.0, 14.0]])
     flattened, phase = _apply_range_offset_flatten(
@@ -47,7 +47,7 @@ def test_nisar_range_offset_flatten_applies_nisar_ifg_sign() -> None:
         wavelength_m=4.0,
     )
     expected_phase = 4.0 * np.pi * 2.0 / 4.0 * np.array(
-        [[2.0, 1.0, 0.0], [2.0, 1.0, 0.0]]
+        [[-2.0, -1.0, 0.0], [-2.0, -1.0, 0.0]]
     )
     assert np.allclose(phase, expected_phase)
     ifg_phase = np.angle(np.conj(flattened))
