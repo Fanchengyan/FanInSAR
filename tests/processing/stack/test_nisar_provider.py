@@ -394,7 +394,14 @@ def test_nisar_geometry_mapping_materializes_noncontiguous_outputs(
         backing = np.full((2, 2), value, dtype=np.float64)
         return backing[::2, ::2]
 
-    def fake_rdr2geo(*_args: object, **_kwargs: object) -> object:
+    def fake_rdr2geo(*args: object, **_kwargs: object) -> object:
+        assert all(
+            isinstance(value, np.ndarray)
+            and value.ndim == 1
+            and value.shape == (1,)
+            and value.flags.c_contiguous
+            for value in args[1:3]
+        )
         return SimpleNamespace(
             latitude_deg=strided(10.0),
             longitude_deg=strided(20.0),

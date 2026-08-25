@@ -288,34 +288,45 @@ def _dense_secondary_mapping(
     secondary_model = RadarGeometryModel.from_radar_grid(
         secondary_product.grid, secondary_product.orbit
     )
+    tile_shape = azimuth.shape
     ground = run_rdr2geo(
         reference_model,
-        azimuth,
-        range_index,
+        azimuth.reshape(-1),
+        range_index.reshape(-1),
         dem,
         device=device,
         doppler_tol_hz=0.1,
     )
-    ground_valid = _numpy_geometry(ground.converged, dtype=np.dtype(bool))
-    latitude = _numpy_geometry(ground.latitude_deg, dtype=np.dtype(np.float64))
-    longitude = _numpy_geometry(ground.longitude_deg, dtype=np.dtype(np.float64))
-    height = _numpy_geometry(ground.height_m, dtype=np.dtype(np.float64))
+    ground_valid = _numpy_geometry(ground.converged, dtype=np.dtype(bool)).reshape(
+        tile_shape
+    )
+    latitude = _numpy_geometry(ground.latitude_deg, dtype=np.dtype(np.float64)).reshape(
+        tile_shape
+    )
+    longitude = _numpy_geometry(
+        ground.longitude_deg, dtype=np.dtype(np.float64)
+    ).reshape(tile_shape)
+    height = _numpy_geometry(ground.height_m, dtype=np.dtype(np.float64)).reshape(
+        tile_shape
+    )
     ground_valid &= np.isfinite(latitude) & np.isfinite(longitude) & np.isfinite(height)
     mapped = run_geo2rdr(
         secondary_model,
-        np.where(ground_valid, latitude, 0.0),
-        np.where(ground_valid, longitude, 0.0),
-        np.where(ground_valid, height, 0.0),
+        np.where(ground_valid, latitude, 0.0).reshape(-1),
+        np.where(ground_valid, longitude, 0.0).reshape(-1),
+        np.where(ground_valid, height, 0.0).reshape(-1),
         device=device,
         doppler_tol_hz=0.1,
     )
     secondary_azimuth = _numpy_geometry(
         mapped.azimuth_index, dtype=np.dtype(np.float64)
-    )
-    secondary_range = _numpy_geometry(mapped.range_index, dtype=np.dtype(np.float64))
+    ).reshape(tile_shape)
+    secondary_range = _numpy_geometry(
+        mapped.range_index, dtype=np.dtype(np.float64)
+    ).reshape(tile_shape)
     valid = (
         ground_valid
-        & _numpy_geometry(mapped.converged, dtype=np.dtype(bool))
+        & _numpy_geometry(mapped.converged, dtype=np.dtype(bool)).reshape(tile_shape)
         & np.isfinite(secondary_azimuth)
         & np.isfinite(secondary_range)
         & (secondary_azimuth >= 0.0)
@@ -730,11 +741,11 @@ def _geometry_shared_radar_window(
         dem = ConstantHeightDEM(resolved_height)
     row_start, row_stop, col_start, col_stop = reference_bounds
     center_row = np.array(
-        [[(row_start + row_stop - 1) / 2.0]],
+        [(row_start + row_stop - 1) / 2.0],
         dtype=np.float64,
     )
     center_col = np.array(
-        [[(col_start + col_stop - 1) / 2.0]],
+        [(col_start + col_stop - 1) / 2.0],
         dtype=np.float64,
     )
     reference_model = RadarGeometryModel.from_radar_grid(
