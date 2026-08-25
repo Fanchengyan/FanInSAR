@@ -11,6 +11,7 @@ downstream interferometric products.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -121,6 +122,16 @@ class NisarPairState:
     coregistration_timings_s: dict[str, float] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _DenseRadarMapping:
+    """Secondary source coordinates for one master radar tile."""
+
+    azimuth: np.ndarray
+    range_index: np.ndarray
+    valid: np.ndarray
+    source_bounds: tuple[int, int, int, int] | None
+
+
 def _window(value: object, shape: tuple[int, int]) -> tuple[int, int, int, int]:
     """Validate a row/column crop against one source shape."""
     if value is None:
@@ -193,35 +204,13 @@ def _full_reference_bounds(
     dem: DEMSampler | None,
     height_m: float | None,
 ) -> tuple[int, int, int, int]:
-    """Return the maximal rectangular reference/secondary radar overlap."""
+    """Return the full reference grid; invalid secondary coverage is masked."""
     if not isinstance(reference_product.grid, RadarGrid) or not isinstance(
         secondary_product.grid, RadarGrid
     ):
         reject_invalid_state("NISAR full-scene overlap requires radar products")
-    reference = reference_product.grid
-    secondary = secondary_product.grid
-    center_row = reference.shape[0] // 2
-    center_col = reference.shape[1] // 2
-    seed = (center_row, center_row + 1, center_col, center_col + 1)
-    mapped = _shared_radar_window(
-        reference,
-        secondary,
-        seed,
-        reference_product=reference_product,
-        secondary_product=secondary_product,
-        device=device,
-        dem=dem,
-        height_m=height_m,
-    )
-    row_offset = mapped[0] - center_row
-    col_offset = mapped[2] - center_col
-    row_start = max(0, -row_offset)
-    row_stop = min(reference.shape[0], secondary.shape[0] - row_offset)
-    col_start = max(0, -col_offset)
-    col_stop = min(reference.shape[1], secondary.shape[1] - col_offset)
-    if row_start >= row_stop or col_start >= col_stop:
-        reject_invalid_state("NISAR acquisitions have no common radar coverage")
-    return row_start, row_stop, col_start, col_stop
+    _ = device, dem, height_m
+    return (0, reference_product.grid.shape[0], 0, reference_product.grid.shape[1])
 
 
 def _full_stack_reference_bounds(
@@ -236,26 +225,224 @@ def _full_stack_reference_bounds(
     reference_product = products[master]
     if not isinstance(reference_product.grid, RadarGrid):
         reject_invalid_state("NISAR full Stack master must use a radar grid")
-    common = (0, reference_product.grid.shape[0], 0, reference_product.grid.shape[1])
-    for date_id in sorted(products):
-        if date_id == master:
-            continue
-        pair_bounds = _full_reference_bounds(
-            reference_product,
-            products[date_id],
-            device=device,
-            dem=dem,
-            height_m=height_m,
+    _ = products, device, dem, height_m
+    return (0, reference_product.grid.shape[0], 0, reference_product.grid.shape[1])
+
+
+def _numpy_geometry(value: object, *, dtype: np.dtype[Any]) -> np.ndarray:
+    """Move one geometry field to a contiguous NumPy array."""
+    detach = getattr(value, "detach", None)
+    if callable(detach):
+        value = detach()
+    cpu = getattr(value, "cpu", None)
+    if callable(cpu):
+        value = cpu()
+    numpy = getattr(value, "numpy", None)
+    if callable(numpy):
+        value = numpy()
+    return np.ascontiguousarray(np.asarray(value, dtype=dtype))
+
+
+def _dense_secondary_mapping(
+    reference_product: SLCProduct,
+    secondary_product: SLCProduct,
+    bounds: tuple[int, int, int, int],
+    *,
+    device: str,
+    dem: DEMSampler,
+    lanczos_a: int = 4,
+) -> _DenseRadarMapping:
+    """Map every master tile pixel into the secondary radar grid."""
+    from faninsar.processing.geometry import RadarGeometryModel
+    from faninsar.processing.geometry.prepare_production import (
+        run_geo2rdr,
+        run_rdr2geo,
+    )
+
+    if not isinstance(reference_product.grid, RadarGrid) or not isinstance(
+        secondary_product.grid, RadarGrid
+    ):
+        reject_invalid_state("NISAR dense coregistration requires radar products")
+    row_start, row_stop, col_start, col_stop = bounds
+    azimuth, range_index = np.meshgrid(
+        np.arange(row_start, row_stop, dtype=np.float64),
+        np.arange(col_start, col_stop, dtype=np.float64),
+        indexing="ij",
+    )
+    reference_model = RadarGeometryModel.from_radar_grid(
+        reference_product.grid, reference_product.orbit
+    )
+    secondary_model = RadarGeometryModel.from_radar_grid(
+        secondary_product.grid, secondary_product.orbit
+    )
+    ground = run_rdr2geo(
+        reference_model,
+        azimuth,
+        range_index,
+        dem,
+        device=device,
+        doppler_tol_hz=0.1,
+    )
+    ground_valid = _numpy_geometry(ground.converged, dtype=np.dtype(bool))
+    latitude = _numpy_geometry(ground.latitude_deg, dtype=np.dtype(np.float64))
+    longitude = _numpy_geometry(ground.longitude_deg, dtype=np.dtype(np.float64))
+    height = _numpy_geometry(ground.height_m, dtype=np.dtype(np.float64))
+    ground_valid &= np.isfinite(latitude) & np.isfinite(longitude) & np.isfinite(height)
+    mapped = run_geo2rdr(
+        secondary_model,
+        np.where(ground_valid, latitude, 0.0),
+        np.where(ground_valid, longitude, 0.0),
+        np.where(ground_valid, height, 0.0),
+        device=device,
+        doppler_tol_hz=0.1,
+    )
+    secondary_azimuth = _numpy_geometry(
+        mapped.azimuth_index, dtype=np.dtype(np.float64)
+    )
+    secondary_range = _numpy_geometry(mapped.range_index, dtype=np.dtype(np.float64))
+    valid = (
+        ground_valid
+        & _numpy_geometry(mapped.converged, dtype=np.dtype(bool))
+        & np.isfinite(secondary_azimuth)
+        & np.isfinite(secondary_range)
+        & (secondary_azimuth >= 0.0)
+        & (secondary_azimuth <= secondary_product.grid.shape[0] - 1.0)
+        & (secondary_range >= 0.0)
+        & (secondary_range <= secondary_product.grid.shape[1] - 1.0)
+    )
+    if not np.any(valid):
+        return _DenseRadarMapping(
+            azimuth=np.zeros_like(secondary_azimuth),
+            range_index=np.zeros_like(secondary_range),
+            valid=valid,
+            source_bounds=None,
         )
-        common = (
-            max(common[0], pair_bounds[0]),
-            min(common[1], pair_bounds[1]),
-            max(common[2], pair_bounds[2]),
-            min(common[3], pair_bounds[3]),
-        )
-    if common[0] >= common[1] or common[2] >= common[3]:
-        reject_invalid_state("NISAR Stack acquisitions have no shared radar coverage")
-    return common
+    halo = int(lanczos_a) + 1
+    source_row_start = max(0, int(np.floor(np.min(secondary_azimuth[valid]))) - halo)
+    source_row_stop = min(
+        secondary_product.grid.shape[0],
+        int(np.ceil(np.max(secondary_azimuth[valid]))) + halo + 1,
+    )
+    source_col_start = max(0, int(np.floor(np.min(secondary_range[valid]))) - halo)
+    source_col_stop = min(
+        secondary_product.grid.shape[1],
+        int(np.ceil(np.max(secondary_range[valid]))) + halo + 1,
+    )
+    return _DenseRadarMapping(
+        azimuth=secondary_azimuth - source_row_start,
+        range_index=secondary_range - source_col_start,
+        valid=valid,
+        source_bounds=(
+            source_row_start,
+            source_row_stop,
+            source_col_start,
+            source_col_stop,
+        ),
+    )
+
+
+def _lanczos_source_coverage(
+    samples: np.ndarray,
+    azimuth: np.ndarray,
+    range_index: np.ndarray,
+    *,
+    lanczos_a: int = 4,
+) -> np.ndarray:
+    """Return destinations whose complete Lanczos source support is valid."""
+    from scipy.ndimage import map_coordinates, minimum_filter
+
+    source_valid = (
+        np.isfinite(samples.real) & np.isfinite(samples.imag) & (np.abs(samples) > 0.0)
+    )
+    support_width = 2 * int(lanczos_a) + 1
+    full_support = minimum_filter(
+        source_valid.astype(np.uint8),
+        size=support_width,
+        mode="constant",
+        cval=0,
+    )
+    sampled = map_coordinates(
+        full_support,
+        [azimuth, range_index],
+        order=0,
+        mode="constant",
+        cval=0,
+    )
+    return np.asarray(sampled, dtype=bool)
+
+
+def _geocode_aligned_radar_tile(
+    reference_product: SLCProduct,
+    reference: np.ndarray,
+    secondary: np.ndarray,
+    radar_bounds: tuple[int, int, int, int],
+    target: GeoGrid,
+    *,
+    device: str,
+    dem: DEMSampler,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Forward-geocode aligned complex tiles through Geo2Rdr + Lanczos."""
+    from faninsar.processing.geometry import RadarGeometryModel
+    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.pipeline.geo_lut import build_geo2rdr_lut
+    from faninsar.processing.pipeline.geo_resample import (
+        resample_complex_at_coordinates,
+    )
+
+    if not isinstance(reference_product.grid, RadarGrid):
+        reject_invalid_state("NISAR Geo coregistration requires a radar product")
+    a, b, c, d, e, f = target.transform
+    if b != 0.0 or d != 0.0:
+        reject_invalid_state("NISAR Geo coregistration requires a north-up grid")
+    grid = GeoGridSpec(
+        crs=target.crs,
+        transform=(c, a, 0.0, f, 0.0, e),
+        width=target.shape[1],
+        height=target.shape[0],
+        resolution_m=(abs(a), abs(e)),
+    )
+    geometry = RadarGeometryModel.from_radar_grid(
+        reference_product.grid,
+        reference_product.orbit,
+    )
+    lut = build_geo2rdr_lut(
+        geometry=geometry,
+        grid=grid,
+        full_radar_shape=reference_product.grid.shape,
+        dem=dem,
+        device=device,
+    )
+    row_start, _row_stop, col_start, _col_stop = radar_bounds
+    local_azimuth = np.asarray(lut.az_full, dtype=np.float64) - row_start
+    local_range = np.asarray(lut.rg_full, dtype=np.float64) - col_start
+    valid = np.asarray(lut.valid, dtype=bool)
+    reference_geo, reference_valid = resample_complex_at_coordinates(
+        reference,
+        local_azimuth,
+        local_range,
+        valid=valid,
+        device=device,
+    )
+    secondary_geo, secondary_valid = resample_complex_at_coordinates(
+        secondary,
+        local_azimuth,
+        local_range,
+        valid=valid,
+        device=device,
+    )
+    reference_valid &= _lanczos_source_coverage(
+        reference,
+        local_azimuth,
+        local_range,
+    )
+    secondary_valid &= _lanczos_source_coverage(
+        secondary,
+        local_azimuth,
+        local_range,
+    )
+    reference_geo[~reference_valid] = np.complex64(np.nan + 1j * np.nan)
+    secondary_geo[~secondary_valid] = np.complex64(np.nan + 1j * np.nan)
+    return reference_geo, secondary_geo
 
 
 def _geo_tile_for_radar_crop(
@@ -364,6 +551,7 @@ def _scene_tile_exists(
     row_origin: int,
     col_origin: int,
     shape: tuple[int, int],
+    resume_identity: str,
 ) -> bool:
     """Return whether one prior tile is complete and matches this request."""
     manifest = root / "manifest.json"
@@ -387,8 +575,24 @@ def _scene_tile_exists(
         or unit.shape != shape
     ):
         reject_invalid_state(f"persisted NISAR tile {tag!r} has different placement")
+    if (unit.phase_state or {}).get("resume_identity") != resume_identity:
+        reject_invalid_state(f"persisted NISAR tile {tag!r} has a stale identity")
     store.read(tag)
     return True
+
+
+def _tile_resume_identity(payload: Mapping[str, object]) -> str:
+    """Hash the scientific and tiling inputs for one resumable tile."""
+    try:
+        encoded = json.dumps(
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    except (TypeError, ValueError) as error:
+        reject_invalid_state(f"NISAR tile identity is not canonical: {error}")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _radar_crop(
@@ -652,13 +856,16 @@ def _geometry_inputs(
     configured_dem: DEMSampler | None,
     configured_height: float | None,
 ) -> tuple[DEMSampler | None, float | None]:
-    """Resolve per-call geometry inputs over callback-level configuration."""
+    """Resolve one DEM source by explicit-call then configured precedence."""
     option_dem = options.get("dem")
-    dem = option_dem if option_dem is not None else configured_dem
-    height = options.get("height_m", options.get("height"))
-    if height is None:
-        height = configured_height
-    return dem, height
+    if option_dem is not None:
+        return option_dem, None
+    option_height = options.get("height_m", options.get("height"))
+    if option_height is not None:
+        return None, option_height
+    if configured_dem is not None:
+        return configured_dem, None
+    return None, configured_height
 
 
 def make_nisar_scene_provider(
@@ -771,6 +978,7 @@ def make_nisar_scene_provider(
         requested_window = _provider_window(options, configured_window)
         full_scene = requested_window is None
         if full_scene:
+            resolved_tile_shape = _tile_shape(configured_tile_shape)
             if reference_date == master:
                 bounds = _full_stack_reference_bounds(
                     products,
@@ -787,8 +995,9 @@ def make_nisar_scene_provider(
                     dem=mapping_dem,
                     height_m=mapping_height,
                 )
-            tiles = tuple(_iter_tiles(bounds, _tile_shape(configured_tile_shape)))
+            tiles = tuple(_iter_tiles(bounds, resolved_tile_shape))
         else:
+            resolved_tile_shape = None
             source_shape = (
                 min(reference_product.grid.shape[0], secondary_product.grid.shape[0]),
                 min(reference_product.grid.shape[1], secondary_product.grid.shape[1]),
@@ -811,19 +1020,41 @@ def make_nisar_scene_provider(
                 {"crs": target.crs, "transform": list(target.transform)},
             )
         scenes = output_dir / "scenes"
+        reference_claimed = (
+            np.zeros(grid_shape, dtype=bool) if domain == "geo" else None
+        )
+        secondary_claimed = (
+            np.zeros(grid_shape, dtype=bool) if domain == "geo" else None
+        )
         for tile_index, tile_bounds in enumerate(tiles):
-            secondary_bounds = _shared_radar_window(
-                reference_product.grid,
-                secondary_product.grid,
-                tile_bounds,
-                reference_product=reference_product,
-                secondary_product=secondary_product,
-                device=device,
-                dem=mapping_dem,
-                height_m=mapping_height,
-            )
+            dense_mapping: _DenseRadarMapping | None = None
+            if full_scene:
+                dense_mapping = _dense_secondary_mapping(
+                    reference_product,
+                    secondary_product,
+                    tile_bounds,
+                    device=device,
+                    dem=mapping_dem,
+                )
+                secondary_bounds = dense_mapping.source_bounds
+            else:
+                secondary_bounds = _shared_radar_window(
+                    reference_product.grid,
+                    secondary_product.grid,
+                    tile_bounds,
+                    reference_product=reference_product,
+                    secondary_product=secondary_product,
+                    device=device,
+                    dem=mapping_dem,
+                    height_m=mapping_height,
+                )
             row_start, row_stop, col_start, col_stop = tile_bounds
-            sec_row_start, sec_row_stop, sec_col_start, sec_col_stop = secondary_bounds
+            if secondary_bounds is None:
+                sec_row_start = sec_row_stop = sec_col_start = sec_col_stop = 0
+            else:
+                sec_row_start, sec_row_stop, sec_col_start, sec_col_stop = (
+                    secondary_bounds
+                )
             tag = "NISAR_b0" if not full_scene else f"NISAR_b{tile_index:06d}"
             if domain == "radar":
                 local_target = None
@@ -845,6 +1076,31 @@ def make_nisar_scene_provider(
                     row_origin = 0
                     col_origin = 0
                 tile_output_shape = local_target.shape
+            resume_payload = {
+                "schema": "nisar_scene_tile_v2",
+                "reference_date": reference_date,
+                "secondary_date": secondary_date,
+                "master": master,
+                "domain": domain,
+                "tag": tag,
+                "tile_bounds": list(tile_bounds),
+                "tile_shape": (
+                    None if resolved_tile_shape is None else list(resolved_tile_shape)
+                ),
+                "grid_shape": list(grid_shape),
+                "grid_identity": grid_identity,
+                "channel": list(channel),
+                "dem_identity": dem_identity,
+                "geometry": (
+                    "per_pixel_rdr2geo_geo2rdr_lanczos4"
+                    if full_scene
+                    else "bounded_window"
+                ),
+                "secondary_source_bounds": (
+                    None if secondary_bounds is None else list(secondary_bounds)
+                ),
+            }
+            resume_identity = _tile_resume_identity(resume_payload)
             if _scene_tile_exists(
                 scenes,
                 tag=tag,
@@ -856,15 +1112,29 @@ def make_nisar_scene_provider(
                 row_origin=row_origin,
                 col_origin=col_origin,
                 shape=tile_output_shape,
+                resume_identity=resume_identity,
             ):
+                if domain == "geo":
+                    existing = CoregisteredSceneStore.open(scenes)
+                    existing_reference, existing_secondary, _ = existing.read(tag)
+                    row_slice = slice(row_origin, row_origin + tile_output_shape[0])
+                    col_slice = slice(col_origin, col_origin + tile_output_shape[1])
+                    assert reference_claimed is not None
+                    assert secondary_claimed is not None
+                    reference_claimed[row_slice, col_slice] |= (
+                        np.isfinite(existing_reference.real)
+                        & np.isfinite(existing_reference.imag)
+                        & (np.abs(existing_reference) > 0.0)
+                    )
+                    secondary_claimed[row_slice, col_slice] |= (
+                        np.isfinite(existing_secondary.real)
+                        & np.isfinite(existing_secondary.imag)
+                        & (np.abs(existing_secondary) > 0.0)
+                    )
                 continue
             reference_window = (
                 slice(row_start, row_stop),
                 slice(col_start, col_stop),
-            )
-            secondary_window = (
-                slice(sec_row_start, sec_row_stop),
-                slice(sec_col_start, sec_col_stop),
             )
             try:
                 reference_samples = sensor.read_slc_window(
@@ -873,39 +1143,147 @@ def make_nisar_scene_provider(
                     frequency=channel[0],
                     polarization=channel[1],
                 )
-                secondary_samples = sensor.read_slc_window(
-                    handles[Path(secondary_path)],
-                    secondary_window,
-                    frequency=channel[0],
-                    polarization=channel[1],
-                )
+                if secondary_bounds is not None:
+                    secondary_samples = sensor.read_slc_window(
+                        handles[Path(secondary_path)],
+                        (
+                            slice(sec_row_start, sec_row_stop),
+                            slice(sec_col_start, sec_col_stop),
+                        ),
+                        frequency=channel[0],
+                        polarization=channel[1],
+                    )
+                else:
+                    secondary_samples = None
             except KeyError as error:
                 reject_invalid_state(f"NISAR source handle is unavailable: {error}")
             reference_radar = _radar_crop(
                 reference_product, reference_samples, tile_bounds
             )
-            secondary_radar = _radar_crop(
-                secondary_product,
-                secondary_samples,
-                secondary_bounds,
-            )
-            if domain == "radar":
+            if full_scene:
+                assert dense_mapping is not None
+                if secondary_samples is None:
+                    secondary_array = np.full(
+                        reference_radar.samples.shape,
+                        np.nan + 1j * np.nan,
+                        dtype=np.complex64,
+                    )
+                    dense_valid = dense_mapping.valid
+                else:
+                    from faninsar.processing.pipeline.geo_resample import (
+                        resample_complex_at_coordinates,
+                    )
+
+                    secondary_array, dense_valid = resample_complex_at_coordinates(
+                        np.asarray(secondary_samples, dtype=np.complex64),
+                        dense_mapping.azimuth,
+                        dense_mapping.range_index,
+                        valid=dense_mapping.valid,
+                        device=device,
+                    )
+                    dense_valid &= _lanczos_source_coverage(
+                        np.asarray(secondary_samples, dtype=np.complex64),
+                        dense_mapping.azimuth,
+                        dense_mapping.range_index,
+                    )
+                    secondary_array[~dense_valid] = np.complex64(np.nan + 1j * np.nan)
+                dense_valid &= (
+                    np.isfinite(reference_radar.samples.real)
+                    & np.isfinite(reference_radar.samples.imag)
+                    & (np.abs(reference_radar.samples) > 0.0)
+                )
+                secondary_array[~dense_valid] = np.complex64(np.nan + 1j * np.nan)
+                reference_array = np.where(
+                    dense_valid,
+                    reference_radar.samples,
+                    np.complex64(np.nan + 1j * np.nan),
+                ).astype(np.complex64, copy=False)
+                aligned_product = replace(
+                    secondary_product,
+                    grid=reference_radar.grid,
+                    orbit=reference_product.orbit,
+                    samples=replace(
+                        secondary_product.samples,
+                        shape=reference_radar.grid.shape,
+                    ),
+                )
+                secondary_radar = RadarSLC(
+                    product=aligned_product,
+                    samples=np.asarray(secondary_array, dtype=np.complex64),
+                )
+                reference_radar = RadarSLC(
+                    product=reference_radar.product,
+                    samples=np.asarray(reference_array, dtype=np.complex64),
+                )
+            else:
+                assert secondary_samples is not None
+                assert secondary_bounds is not None
+                secondary_radar = _radar_crop(
+                    secondary_product,
+                    secondary_samples,
+                    secondary_bounds,
+                )
                 reference_array = reference_radar.samples
                 secondary_array = secondary_radar.samples
+            if domain == "radar":
+                pass
             else:
                 assert local_target is not None
-                reference_array = reference_radar.rdr2geo(
-                    device=device,
-                    dem=mapping_dem,
-                    geo_grid=local_target,
-                    use_cache=False,
-                ).samples
-                secondary_array = secondary_radar.rdr2geo(
-                    device=device,
-                    dem=mapping_dem,
-                    geo_grid=local_target,
-                    use_cache=False,
-                ).samples
+                if full_scene:
+                    reference_array, secondary_array = _geocode_aligned_radar_tile(
+                        reference_product,
+                        np.asarray(reference_array, dtype=np.complex64),
+                        np.asarray(secondary_array, dtype=np.complex64),
+                        tile_bounds,
+                        local_target,
+                        device=device,
+                        dem=mapping_dem,
+                    )
+                else:
+                    reference_array = reference_radar.rdr2geo(
+                        device=device,
+                        dem=mapping_dem,
+                        geo_grid=local_target,
+                        use_cache=False,
+                    ).samples
+                    secondary_array = secondary_radar.rdr2geo(
+                        device=device,
+                        dem=mapping_dem,
+                        geo_grid=local_target,
+                        use_cache=False,
+                    ).samples
+                assert reference_claimed is not None
+                assert secondary_claimed is not None
+                row_slice = slice(row_origin, row_origin + tile_output_shape[0])
+                col_slice = slice(col_origin, col_origin + tile_output_shape[1])
+                reference_valid = (
+                    np.isfinite(reference_array.real)
+                    & np.isfinite(reference_array.imag)
+                    & (np.abs(reference_array) > 0.0)
+                )
+                secondary_valid = (
+                    np.isfinite(secondary_array.real)
+                    & np.isfinite(secondary_array.imag)
+                    & (np.abs(secondary_array) > 0.0)
+                )
+                reference_owner = (
+                    reference_valid & ~reference_claimed[row_slice, col_slice]
+                )
+                secondary_owner = (
+                    secondary_valid & ~secondary_claimed[row_slice, col_slice]
+                )
+                reference_array = np.where(
+                    reference_owner,
+                    reference_array,
+                    np.complex64(np.nan + 1j * np.nan),
+                )
+                secondary_array = np.where(
+                    secondary_owner,
+                    secondary_array,
+                    np.complex64(np.nan + 1j * np.nan),
+                )
+                reference_claimed[row_slice, col_slice] |= reference_owner
+                secondary_claimed[row_slice, col_slice] |= secondary_owner
             write_scene_unit(
                 scenes,
                 date_id=secondary_date,
@@ -954,6 +1332,27 @@ def make_nisar_scene_provider(
                         ),
                     },
                 ),
+                phase_state={
+                    "resume_identity": resume_identity,
+                    "coverage_policy": (
+                        "first_valid_row_major_v1" if domain == "geo" else "nan_mask_v1"
+                    ),
+                    "geometry_method": resume_payload["geometry"],
+                    "reference_valid_pixels": int(
+                        np.sum(
+                            np.isfinite(reference_array.real)
+                            & np.isfinite(reference_array.imag)
+                            & (np.abs(reference_array) > 0.0)
+                        )
+                    ),
+                    "secondary_valid_pixels": int(
+                        np.sum(
+                            np.isfinite(secondary_array.real)
+                            & np.isfinite(secondary_array.imag)
+                            & (np.abs(secondary_array) > 0.0)
+                        )
+                    ),
+                },
                 validate_existing_payloads=not full_scene,
             )
         return NisarPairState(

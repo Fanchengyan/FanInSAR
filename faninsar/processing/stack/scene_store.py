@@ -537,6 +537,7 @@ def copy_reference_units(source: str | Path, target: str | Path) -> None:
             wavelength_m=source_store.wavelength_m,
             grid_identity=source_store.grid_identity,
             scientific_lineage=unit.scientific_lineage,
+            phase_state=unit.phase_state,
             validate_existing_payloads=False,
         )
 
@@ -549,6 +550,42 @@ def _tag_swath(tag: str) -> str:
     if len(parts) != 3 or not parts[0].startswith("f") or not parts[2].startswith("b"):
         reject_invalid_state(f"scene unit tag has no stable swath identity: {tag!r}")
     return parts[1]
+
+
+def _validate_nisar_geo_ownership(store: CoregisteredSceneStore) -> None:
+    """Validate deterministic, non-overlapping NISAR Geo tile ownership."""
+    if store.domain != "geo" or not any(
+        unit.tag.startswith("NISAR_b") for unit in store.units
+    ):
+        return
+    policies = {(unit.phase_state or {}).get("coverage_policy") for unit in store.units}
+    if policies == {None}:
+        # Backward-compatible bounded NISAR generations predate tiled ownership.
+        return
+    if policies != {"first_valid_row_major_v1"}:
+        reject_invalid_state("NISAR Geo scene mixes ownership contracts")
+    reference_owned = np.zeros(store.grid_shape, dtype=bool)
+    secondary_owned = np.zeros(store.grid_shape, dtype=bool)
+    for unit in sorted(store.units, key=lambda item: item.tag):
+        reference, secondary, _ = store.read(unit.tag)
+        row_slice = slice(unit.row_origin, unit.row_origin + unit.shape[0])
+        col_slice = slice(unit.col_origin, unit.col_origin + unit.shape[1])
+        reference_valid = (
+            np.isfinite(reference.real)
+            & np.isfinite(reference.imag)
+            & (np.abs(reference) > 0.0)
+        )
+        secondary_valid = (
+            np.isfinite(secondary.real)
+            & np.isfinite(secondary.imag)
+            & (np.abs(secondary) > 0.0)
+        )
+        if np.any(reference_owned[row_slice, col_slice] & reference_valid) or np.any(
+            secondary_owned[row_slice, col_slice] & secondary_valid
+        ):
+            reject_invalid_state("NISAR Geo scene tiles have overlapping ownership")
+        reference_owned[row_slice, col_slice] |= reference_valid
+        secondary_owned[row_slice, col_slice] |= secondary_valid
 
 
 def form_merged_scene_interferogram(
@@ -601,6 +638,8 @@ def form_merged_scene_interferogram(
         reject_invalid_state("scene artifact radar wavelengths do not match")
     if reference_store.grid_identity != secondary_store.grid_identity:
         reject_invalid_state("scene artifact coordinate grids do not match")
+    _validate_nisar_geo_ownership(reference_store)
+    _validate_nisar_geo_ownership(secondary_store)
     reference_units = reference_store.unit_map()
     secondary_units = secondary_store.unit_map()
     if set(reference_units) != set(secondary_units):
