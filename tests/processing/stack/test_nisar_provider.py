@@ -351,7 +351,7 @@ def test_nisar_geometry_mapping_passes_dem_and_device(
 
     assert bounds == (1, 3, 1, 3)
     assert seen["dem"] is dem
-    np.testing.assert_array_equal(seen["height"], np.array([[123.0]]))
+    np.testing.assert_array_equal(seen["height"], np.array([123.0]))
     assert seen["rdr2geo_device"] == "cuda:0"
     assert seen["geo2rdr_device"] == "cuda:0"
 
@@ -381,7 +381,10 @@ def test_nisar_geometry_mapping_materializes_noncontiguous_outputs(
         geometry_inputs = args[1:4]
         seen["inputs"] = geometry_inputs
         assert all(
-            isinstance(value, np.ndarray) and value.flags.c_contiguous
+            isinstance(value, np.ndarray)
+            and value.ndim == 1
+            and value.shape == (1,)
+            and value.flags.c_contiguous
             for value in geometry_inputs
         )
         return SimpleNamespace(

@@ -71,7 +71,7 @@ def _dem_identity(dem: object) -> str:
 
 
 def _contiguous_geometry_input(value: object) -> object:
-    """Materialize one geometry input with exact contiguous strides.
+    """Materialize one geometry input as a contiguous one-dimensional lane.
 
     Geometry results may be views (for example, a one-pixel result produced by
     a broadcasted native output).  The public geometry validator intentionally
@@ -87,16 +87,18 @@ def _contiguous_geometry_input(value: object) -> object:
     Returns
     -------
     object
-        A same-dtype, same-shape contiguous value.  Torch tensors remain on
-        their original device.
+        A same-dtype, one-dimensional contiguous value.  Torch tensors remain
+        on their original device.
 
     """
     if isinstance(value, np.ndarray):
-        return np.ascontiguousarray(value)
+        return np.ascontiguousarray(value).reshape(-1)
     contiguous = getattr(value, "contiguous", None)
     if callable(contiguous):
-        return contiguous()
-    return np.ascontiguousarray(np.asarray(value))
+        normalized = contiguous()
+        reshape = getattr(normalized, "reshape", None)
+        return reshape(-1) if callable(reshape) else normalized
+    return np.ascontiguousarray(np.asarray(value)).reshape(-1)
 
 
 @dataclass(frozen=True, slots=True)
