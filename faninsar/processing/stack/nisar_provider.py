@@ -295,6 +295,7 @@ def _geometry_shared_radar_window(
             center_col,
             dem,
             device=device,
+            doppler_tol_hz=0.1,
         )
     except (RuntimeError, TypeError, ValueError) as error:
         logger.exception("NISAR reference crop geometry mapping failed")
@@ -322,6 +323,7 @@ def _geometry_shared_radar_window(
             ground_longitude,
             ground_height,
             device=device,
+            doppler_tol_hz=0.1,
         )
     except (RuntimeError, TypeError, ValueError) as error:
         logger.exception("NISAR secondary crop geometry mapping failed")

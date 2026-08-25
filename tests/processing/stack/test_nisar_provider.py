@@ -315,6 +315,7 @@ def test_nisar_geometry_mapping_passes_dem_and_device(
     def fake_rdr2geo(*args: object, **kwargs: object) -> object:
         seen["dem"] = args[3]
         seen["rdr2geo_device"] = kwargs["device"]
+        seen["rdr2geo_doppler_tol_hz"] = kwargs["doppler_tol_hz"]
         return SimpleNamespace(
             latitude_deg=np.array([[10.0]]),
             longitude_deg=np.array([[20.0]]),
@@ -325,6 +326,7 @@ def test_nisar_geometry_mapping_passes_dem_and_device(
     def fake_geo2rdr(*args: object, **kwargs: object) -> object:
         seen["height"] = args[3]
         seen["geo2rdr_device"] = kwargs["device"]
+        seen["geo2rdr_doppler_tol_hz"] = kwargs["doppler_tol_hz"]
         return SimpleNamespace(
             azimuth_index=np.array([[2.0]]),
             range_index=np.array([[2.0]]),
@@ -354,6 +356,8 @@ def test_nisar_geometry_mapping_passes_dem_and_device(
     np.testing.assert_array_equal(seen["height"], np.array([123.0]))
     assert seen["rdr2geo_device"] == "cuda:0"
     assert seen["geo2rdr_device"] == "cuda:0"
+    assert seen["rdr2geo_doppler_tol_hz"] == 0.1
+    assert seen["geo2rdr_doppler_tol_hz"] == 0.1
 
 
 def test_nisar_geometry_mapping_materializes_noncontiguous_outputs(
