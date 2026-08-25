@@ -145,6 +145,51 @@ class _DenseRadarMapping:
     source_bounds: tuple[int, int, int, int] | None
 
 
+def _apply_range_offset_flatten(
+    secondary: np.ndarray,
+    secondary_range_index: np.ndarray,
+    *,
+    reference_col_origin: int,
+    range_spacing_m: float,
+    wavelength_m: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply the NISAR ellipsoidal range-offset phase to one aligned tile.
+
+    The NISAR RIFG convention removes the geometric screen from the complex
+    interferogram.  Since scene stores retain the aligned secondary SLC and
+    form ``reference * conj(secondary)`` later, the inverse-conjugate screen
+    is applied to the secondary here.  The resulting interferogram therefore
+    carries ``exp(-1j * phase)`` with
+    ``phase = 4*pi*range_spacing/wavelength*(reference-secondary)``.
+
+    Parameters
+    ----------
+    secondary : numpy.ndarray
+        Aligned secondary SLC tile.
+    secondary_range_index : numpy.ndarray
+        Secondary fractional range coordinates for each reference pixel.
+    reference_col_origin : int
+        Full-grid range origin of the reference tile.
+    range_spacing_m, wavelength_m : float
+        Radar range spacing and wavelength.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, numpy.ndarray]
+        Flattened secondary tile and applied phase screen in radians.
+
+    """
+    if secondary.ndim != 2 or secondary_range_index.shape != secondary.shape:
+        reject_invalid_state("range-offset flatten inputs must be matching 2-D tiles")
+    reference_range = reference_col_origin + np.arange(
+        secondary.shape[1], dtype=np.float64
+    )[None, :]
+    range_offset = reference_range - np.asarray(secondary_range_index, dtype=np.float64)
+    phase = (4.0 * np.pi * range_spacing_m / wavelength_m) * range_offset
+    flattened = np.asarray(secondary, dtype=np.complex64) * np.exp(1j * phase)
+    return flattened.astype(np.complex64, copy=False), phase.astype(np.float32)
+
+
 def _window(value: object, shape: tuple[int, int]) -> tuple[int, int, int, int]:
     """Validate a row/column crop against one source shape."""
     if value is None:
@@ -1123,6 +1168,7 @@ def make_nisar_scene_provider(
                 "secondary_source_bounds": (
                     None if secondary_bounds is None else list(secondary_bounds)
                 ),
+                "range_offset_flatten": "nisar_ellipsoidal_v1",
             }
             resume_identity = _tile_resume_identity(resume_payload)
             if _scene_tile_exists(
@@ -1253,6 +1299,26 @@ def make_nisar_scene_provider(
                 )
                 reference_array = reference_radar.samples
                 secondary_array = secondary_radar.samples
+            if full_scene:
+                assert dense_mapping is not None
+                assert secondary_bounds is not None
+                secondary_range_index = (
+                    np.asarray(dense_mapping.range_index, dtype=np.float64)
+                    + float(sec_col_start)
+                )
+            else:
+                secondary_range_index = np.broadcast_to(
+                    float(sec_col_start)
+                    + np.arange(secondary_array.shape[1], dtype=np.float64)[None, :],
+                    secondary_array.shape,
+                )
+            secondary_array, range_offset_phase = _apply_range_offset_flatten(
+                np.asarray(secondary_array, dtype=np.complex64),
+                secondary_range_index,
+                reference_col_origin=col_start,
+                range_spacing_m=float(reference_product.grid.range_spacing_m),
+                wavelength_m=float(reference_product.grid.wavelength_m),
+            )
             if domain == "radar":
                 pass
             else:
@@ -1351,6 +1417,7 @@ def make_nisar_scene_provider(
                         "channel": f"{channel[0]}/{channel[1]}",
                         "lineage": "secondary",
                         "dem_identity": dem_identity,
+                        "range_offset_flatten": "nisar_ellipsoidal_v1",
                         "window": (
                             f"{sec_row_start}:{sec_row_stop},"
                             f"{sec_col_start}:{sec_col_stop}"
@@ -1365,6 +1432,11 @@ def make_nisar_scene_provider(
                         else "nan_mask_v1"
                     ),
                     "geometry_method": resume_payload["geometry"],
+                    "range_offset_flatten": "nisar_ellipsoidal_v1",
+                    "range_offset_phase_sign": "ifg_exp_minus_j_phase",
+                    "range_offset_phase_rms_rad": float(
+                        np.nanstd(range_offset_phase)
+                    ),
                     "reference_valid_pixels": int(
                         np.sum(
                             np.isfinite(reference_array.real)

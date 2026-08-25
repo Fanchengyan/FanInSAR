@@ -20,6 +20,7 @@ from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.slc import GeoSLC, RadarSLC
 from faninsar.processing.stack import NISARStack
 from faninsar.processing.stack.nisar_provider import (
+    _apply_range_offset_flatten,
     _dense_secondary_mapping,
     _full_stack_reference_bounds,
     _geo_tile_for_radar_crop,
@@ -32,6 +33,25 @@ from faninsar.processing.stack.nisar_provider import (
 from faninsar.processing.stack.scene_store import CoregisteredSceneStore
 
 from .test_nisar_stack import _result
+
+
+def test_nisar_range_offset_flatten_applies_nisar_ifg_sign() -> None:
+    """Secondary phase produces the NISAR exp(-j*phase) IFG convention."""
+    secondary = np.ones((2, 3), dtype=np.complex64)
+    secondary_range = np.array([[10.0, 12.0, 14.0], [10.0, 12.0, 14.0]])
+    flattened, phase = _apply_range_offset_flatten(
+        secondary,
+        secondary_range,
+        reference_col_origin=12,
+        range_spacing_m=2.0,
+        wavelength_m=4.0,
+    )
+    expected_phase = 4.0 * np.pi * 2.0 / 4.0 * np.array(
+        [[2.0, 1.0, 0.0], [2.0, 1.0, 0.0]]
+    )
+    assert np.allclose(phase, expected_phase)
+    ifg_phase = np.angle(np.conj(flattened))
+    assert np.allclose(np.angle(np.exp(1j * (ifg_phase + expected_phase))), 0.0)
 
 
 class _Dataset:
