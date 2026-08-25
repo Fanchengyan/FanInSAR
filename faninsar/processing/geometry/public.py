@@ -271,7 +271,7 @@ def _resolve_native_entrypoint(
                 50,
                 1.0e-3,
             )
-        return entry(
+        common = (
             *direct_inputs,
             orbit_times,
             orbit_positions,
@@ -283,10 +283,13 @@ def _resolve_native_entrypoint(
             wavelength,
             solver.max_iter,
             solver.extra_iter,
+            1.0e-6,
             solver.range_tolerance_m,
             solver.doppler_tolerance_hz,
-            bool(look_right),
         )
+        if device.kind == "cuda":
+            return entry(*common)
+        return entry(*common, bool(look_right))
 
     return invoke
 
