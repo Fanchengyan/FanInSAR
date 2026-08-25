@@ -962,30 +962,35 @@ def build_geo2rdr_lut(
         geo2rdr_started = time.perf_counter()
         result = run_geo2rdr(
             geometry,
-            safe_latitude,
-            safe_longitude,
-            height_chunk,
+            safe_latitude.reshape(-1),
+            safe_longitude.reshape(-1),
+            (
+                np.asarray(height_chunk).reshape(-1)
+                if not np.isscalar(height_chunk)
+                else np.full(finite_geo.shape, height_chunk).reshape(-1)
+            ),
             device=device,
         )
         _add_timing(timings_out, "geo2rdr", geo2rdr_started)
+        result_converged = np.asarray(result.converged).reshape(finite_geo.shape)
+        result_azimuth = np.asarray(result.azimuth_index).reshape(finite_geo.shape)
+        result_range = np.asarray(result.range_index).reshape(finite_geo.shape)
         chunk_valid = (
             finite_geo
-            & result.converged
-            & np.isfinite(result.azimuth_index)
-            & np.isfinite(result.range_index)
-            & (result.azimuth_index >= 0.0)
-            & (result.azimuth_index <= full_height - 1.0)
-            & (result.range_index >= 0.0)
-            & (result.range_index <= full_width - 1.0)
+            & result_converged
+            & np.isfinite(result_azimuth)
+            & np.isfinite(result_range)
+            & (result_azimuth >= 0.0)
+            & (result_azimuth <= full_height - 1.0)
+            & (result_range >= 0.0)
+            & (result_range <= full_width - 1.0)
         )
         azimuth[row_start - row0 : row_stop - row0, :] = np.where(
-            chunk_valid,
-            result.azimuth_index,
+            chunk_valid, result_azimuth,
             np.nan,
         )
         range_index[row_start - row0 : row_stop - row0, :] = np.where(
-            chunk_valid,
-            result.range_index,
+            chunk_valid, result_range,
             np.nan,
         )
         valid[row_start - row0 : row_stop - row0, :] = chunk_valid
