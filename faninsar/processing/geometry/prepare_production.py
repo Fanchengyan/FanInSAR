@@ -179,11 +179,21 @@ def _cuda_uuids(resolved: object) -> tuple[str, str | None]:
     return physical, str(mig) if mig is not None else None
 
 
-def _native_build_dir() -> Path:
-    """Process-scoped P25-style cache root for geometry extensions."""
+def _native_build_dir(operation: NativeOperation | None = None) -> Path:
+    """Return the operation-isolated P25 cache directory.
+
+    Parameters
+    ----------
+    operation : NativeOperation, optional
+        Geometry operation whose Ninja graph and objects must be isolated.
+        A shared fallback is retained for compatibility with diagnostics that
+        run before an operation is selected.
+
+    """
     from faninsar.compute.cache import resolve_compile_cache_dir
 
-    path = resolve_compile_cache_dir().parent / "native_v2_geometry"
+    root = resolve_compile_cache_dir().parent / "native_v2_geometry"
+    path = root / (operation.value if operation is not None else "shared")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -198,7 +208,9 @@ def _pixi_nvcc() -> Path | None:
     return nvcc
 
 
-def _prepend_packaged_cuda_toolchain() -> Path | None:
+def _prepend_packaged_cuda_toolchain(
+    operation: NativeOperation | None = None,
+) -> Path | None:
     """Bind Torch cpp_extension to the pixi CUDA 12 toolkit.
 
     Login PATH on the A100 host finds system CUDA 10 ``/usr/bin/nvcc`` first.
@@ -225,13 +237,16 @@ def _prepend_packaged_cuda_toolchain() -> Path | None:
         cpp_extension.CUDA_HOME = str(cuda_home)
     except ImportError:
         pass
-    _scrub_stale_system_nvcc_ninja(nvcc)
+    _scrub_stale_system_nvcc_ninja(nvcc, operation)
     return nvcc
 
 
-def _scrub_stale_system_nvcc_ninja(nvcc: Path) -> None:
+def _scrub_stale_system_nvcc_ninja(
+    nvcc: Path,
+    operation: NativeOperation | None = None,
+) -> None:
     """Drop ninja graphs that still hard-code system CUDA 10 ``/usr/bin/nvcc``."""
-    ninja = _native_build_dir() / "build.ninja"
+    ninja = _native_build_dir(operation) / "build.ninja"
     if not ninja.is_file():
         return
     text = ninja.read_text(errors="replace")
@@ -254,7 +269,7 @@ def _try_load_cuda_module(operation: NativeOperation) -> object | None:
     cached = _CUDA_MODULES.get(operation.value)
     if cached is not None:
         return cached
-    nvcc = _prepend_packaged_cuda_toolchain()
+    nvcc = _prepend_packaged_cuda_toolchain(operation)
     if nvcc is None:
         return None
     import torch
@@ -289,11 +304,11 @@ def _try_load_cuda_module(operation: NativeOperation) -> object | None:
             extra_cuda_cflags=list(plan_value.compile_flags),
             extra_ldflags=list(plan_value.link_flags),
             extra_include_paths=[str(path) for path in plan_value.include_dirs],
-            build_directory=str(_native_build_dir()),
+            build_directory=str(_native_build_dir(operation)),
             with_cuda=True,
             verbose=False,
         )
-        ninja = _native_build_dir() / "build.ninja"
+        ninja = _native_build_dir(operation) / "build.ninja"
         if ninja.is_file() and "nvcc = /usr/bin/nvcc" in ninja.read_text(
             errors="replace"
         ):
@@ -302,7 +317,7 @@ def _try_load_cuda_module(operation: NativeOperation) -> object | None:
                 f"expected pixi nvcc {nvcc}"
             )
         module_holder["module"] = module
-        return Path(getattr(module, "__file__", _native_build_dir()))
+        return Path(getattr(module, "__file__", _native_build_dir(operation)))
 
     try:
         prepared = builder.prepare(request, build=build)
