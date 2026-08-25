@@ -906,18 +906,29 @@ def run_geo2rdr(
     height = np.asarray(height_m, dtype=np.float64)
     lat, lon, height = np.broadcast_arrays(lat, lon, height)
     original_shape = lat.shape
+    # The native ABI is lane-oriented and accepts only contiguous 1-D
+    # coordinate arrays.  Keep the public helper N-D friendly by flattening
+    # before dispatch and restoring the caller's raster shape on return.
+    flat_shape = (lat.size,)
     prepared = prepare_production_geometry(
         Operation.GEO2RDR,
         model,
         device=device,
-        shape=original_shape,
+        shape=flat_shape,
         settings=SolverSettings(
             max_iter=max_iter,
             range_tolerance_m=range_tol_m,
             doppler_tolerance_hz=doppler_tol_hz,
         ),
     )
-    result = to_transform_result(execute_geometry(prepared, lat, lon, height))
+    result = to_transform_result(
+        execute_geometry(
+            prepared,
+            lat.reshape(-1),
+            lon.reshape(-1),
+            height.reshape(-1),
+        )
+    )
     return _reshape_transform_result(result, original_shape)
 
 
