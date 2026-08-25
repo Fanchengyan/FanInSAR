@@ -46,8 +46,8 @@ def test_nisar_range_offset_flatten_applies_nisar_ifg_sign() -> None:
         range_spacing_m=2.0,
         wavelength_m=4.0,
     )
-    expected_phase = 4.0 * np.pi * 2.0 / 4.0 * np.array(
-        [[-2.0, -1.0, 0.0], [-2.0, -1.0, 0.0]]
+    expected_phase = (
+        4.0 * np.pi * 2.0 / 4.0 * np.array([[-2.0, -1.0, 0.0], [-2.0, -1.0, 0.0]])
     )
     assert np.allclose(phase, expected_phase)
     ifg_phase = np.angle(np.conj(flattened))
@@ -654,6 +654,104 @@ def test_nisar_full_scene_uses_deterministic_row_major_tiles(
         options={"coregistration_grid": "radar", "device": "cpu"},
     )
     assert len(selections) == 8
+
+
+def test_nisar_full_scene_masks_edge_no_overlap_and_resumes_mixed_tiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Edge tiles may be empty while valid dense tiles remain resumable."""
+    stack, paths, handles = _stack(tmp_path, monkeypatch)
+    calls = 0
+
+    def mixed_mapping(
+        _reference: object,
+        _secondary: object,
+        bounds: tuple[int, int, int, int],
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        if calls % 4 == 2:
+            rows = bounds[1] - bounds[0]
+            cols = bounds[3] - bounds[2]
+            return SimpleNamespace(
+                azimuth=np.zeros((rows, cols), dtype=np.float64),
+                range_index=np.zeros((rows, cols), dtype=np.float64),
+                valid=np.zeros((rows, cols), dtype=bool),
+                source_bounds=None,
+            )
+        return _identity_dense_mapping(bounds)
+
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar_provider._dense_secondary_mapping",
+        mixed_mapping,
+    )
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar_provider._lanczos_source_coverage",
+        lambda _samples, azimuth, _range_index: np.ones(azimuth.shape, dtype=bool),
+    )
+    callback = make_nisar_scene_provider(
+        sensor=stack._nisar_sensor,
+        handles=handles,
+        products=stack.products,
+        lineage=stack.source_lineage,
+        master=stack.master,
+        channel=stack.channel,
+        configured_tile_shape=(2, 3),
+        configured_height=0.0,
+    )
+    output_dir = tmp_path / "mixed"
+    options = {"nisar_window": None, "coregistration_grid": "radar"}
+    callback(paths[0], paths[1], output_dir=output_dir, options=options)
+
+    store = CoregisteredSceneStore.open(output_dir / "scenes")
+    _reference, empty_secondary, empty_unit = store.read("NISAR_b000001")
+    assert np.isnan(empty_secondary).all()
+    assert empty_unit.phase_state is not None
+    assert empty_unit.phase_state["pair_valid_pixels"] == 0
+    _reference, valid_secondary, valid_unit = store.read("NISAR_b000000")
+    assert np.isfinite(valid_secondary).all()
+    assert valid_unit.phase_state is not None
+    assert valid_unit.phase_state["pair_valid_pixels"] > 0
+
+    callback(paths[0], paths[1], output_dir=output_dir, options=options)
+    assert calls == 8
+
+
+def test_nisar_full_scene_rejects_pair_without_physical_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An all-empty dense pair fails explicitly instead of publishing success."""
+    stack, paths, _handles = _stack(tmp_path, monkeypatch)
+
+    def empty_mapping(
+        _reference: object,
+        _secondary: object,
+        bounds: tuple[int, int, int, int],
+        **_kwargs: object,
+    ) -> SimpleNamespace:
+        rows = bounds[1] - bounds[0]
+        cols = bounds[3] - bounds[2]
+        return SimpleNamespace(
+            azimuth=np.zeros((rows, cols), dtype=np.float64),
+            range_index=np.zeros((rows, cols), dtype=np.float64),
+            valid=np.zeros((rows, cols), dtype=bool),
+            source_bounds=None,
+        )
+
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar_provider._dense_secondary_mapping",
+        empty_mapping,
+    )
+    with pytest.raises(
+        InvalidProcessingStateError, match="no physical secondary overlap"
+    ):
+        stack.scene_provider(
+            paths[0],
+            paths[1],
+            output_dir=tmp_path / "empty",
+            options={"nisar_window": None, "coregistration_grid": "radar"},
+        )
 
 
 def test_nisar_full_stack_uses_complete_master_grid(tmp_path: Path) -> None:

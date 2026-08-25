@@ -181,9 +181,9 @@ def _apply_range_offset_flatten(
     """
     if secondary.ndim != 2 or secondary_range_index.shape != secondary.shape:
         reject_invalid_state("range-offset flatten inputs must be matching 2-D tiles")
-    reference_range = reference_col_origin + np.arange(
-        secondary.shape[1], dtype=np.float64
-    )[None, :]
+    reference_range = (
+        reference_col_origin + np.arange(secondary.shape[1], dtype=np.float64)[None, :]
+    )
     range_offset = np.asarray(secondary_range_index, dtype=np.float64) - reference_range
     phase = (4.0 * np.pi * range_spacing_m / wavelength_m) * range_offset
     flattened = np.asarray(secondary, dtype=np.complex64) * np.exp(1j * phase)
@@ -380,6 +380,41 @@ def _dense_secondary_mapping(
         & (secondary_range <= secondary_product.grid.shape[1] - 1.0)
     )
     if not np.any(valid):
+        finite_latitude = latitude[np.isfinite(latitude)]
+        finite_longitude = longitude[np.isfinite(longitude)]
+        finite_azimuth = secondary_azimuth[np.isfinite(secondary_azimuth)]
+        finite_range = secondary_range[np.isfinite(secondary_range)]
+        logger.warning(
+            "NISAR dense tile has no secondary coverage: "
+            "reference_bounds=%s ground_valid_count=%d "
+            "mapped_converged_count=%d "
+            "latitude_range=%s longitude_range=%s "
+            "mapped_azimuth_range=%s mapped_range_range=%s "
+            "secondary_grid_shape=%s",
+            bounds,
+            int(np.count_nonzero(ground_valid)),
+            int(
+                np.count_nonzero(
+                    _numpy_geometry(mapped.converged, dtype=np.dtype(bool))
+                )
+            ),
+            None
+            if finite_latitude.size == 0
+            else (float(np.min(finite_latitude)), float(np.max(finite_latitude))),
+            None
+            if finite_longitude.size == 0
+            else (
+                float(np.min(finite_longitude)),
+                float(np.max(finite_longitude)),
+            ),
+            None
+            if finite_azimuth.size == 0
+            else (float(np.min(finite_azimuth)), float(np.max(finite_azimuth))),
+            None
+            if finite_range.size == 0
+            else (float(np.min(finite_range)), float(np.max(finite_range))),
+            secondary_product.grid.shape,
+        )
         return _DenseRadarMapping(
             azimuth=np.zeros_like(secondary_azimuth),
             range_index=np.zeros_like(secondary_range),
@@ -1090,6 +1125,7 @@ def make_nisar_scene_provider(
             )
         scenes = output_dir / "scenes"
         pair_claimed = np.zeros(grid_shape, dtype=bool) if domain == "geo" else None
+        pair_valid_pixels = 0
         for tile_index, tile_bounds in enumerate(tiles):
             dense_mapping: _DenseRadarMapping | None = None
             if full_scene:
@@ -1184,9 +1220,9 @@ def make_nisar_scene_provider(
                 shape=tile_output_shape,
                 resume_identity=resume_identity,
             ):
+                existing = CoregisteredSceneStore.open(scenes)
+                existing_reference, existing_secondary, _ = existing.read(tag)
                 if domain == "geo":
-                    existing = CoregisteredSceneStore.open(scenes)
-                    existing_reference, existing_secondary, _ = existing.read(tag)
                     row_slice = slice(row_origin, row_origin + tile_output_shape[0])
                     col_slice = slice(col_origin, col_origin + tile_output_shape[1])
                     assert pair_claimed is not None
@@ -1205,6 +1241,18 @@ def make_nisar_scene_provider(
                             f"persisted NISAR Geo tile {tag!r} has asymmetric ownership"
                         )
                     pair_claimed[row_slice, col_slice] |= reference_valid
+                    pair_valid_pixels += int(np.count_nonzero(reference_valid))
+                elif full_scene:
+                    pair_valid_pixels += int(
+                        np.count_nonzero(
+                            np.isfinite(existing_reference.real)
+                            & np.isfinite(existing_reference.imag)
+                            & np.isfinite(existing_secondary.real)
+                            & np.isfinite(existing_secondary.imag)
+                            & (np.abs(existing_reference) > 0.0)
+                            & (np.abs(existing_secondary) > 0.0)
+                        )
+                    )
                 continue
             reference_window = (
                 slice(row_start, row_stop),
@@ -1301,11 +1349,22 @@ def make_nisar_scene_provider(
                 secondary_array = secondary_radar.samples
             if full_scene:
                 assert dense_mapping is not None
-                assert secondary_bounds is not None
-                secondary_range_index = (
-                    np.asarray(dense_mapping.range_index, dtype=np.float64)
-                    + float(sec_col_start)
-                )
+                if secondary_bounds is None:
+                    # A full-scene tile can lie outside the secondary swath.
+                    # Keep the tile in the common manifest as an explicit
+                    # all-NaN/no-overlap tile; do not invent a source window or
+                    # feed zero-filled samples to the Lanczos resampler.
+                    secondary_range_index = np.broadcast_to(
+                        float(col_start)
+                        + np.arange(secondary_array.shape[1], dtype=np.float64)[
+                            None, :
+                        ],
+                        secondary_array.shape,
+                    )
+                else:
+                    secondary_range_index = np.asarray(
+                        dense_mapping.range_index, dtype=np.float64
+                    ) + float(sec_col_start)
             else:
                 secondary_range_index = np.broadcast_to(
                     float(sec_col_start)
@@ -1419,8 +1478,12 @@ def make_nisar_scene_provider(
                         "dem_identity": dem_identity,
                         "range_offset_flatten": "nisar_ellipsoidal_v1",
                         "window": (
-                            f"{sec_row_start}:{sec_row_stop},"
-                            f"{sec_col_start}:{sec_col_stop}"
+                            "no_intersection"
+                            if secondary_bounds is None
+                            else (
+                                f"{sec_row_start}:{sec_row_stop},"
+                                f"{sec_col_start}:{sec_col_stop}"
+                            )
                         ),
                     },
                 ),
@@ -1434,9 +1497,7 @@ def make_nisar_scene_provider(
                     "geometry_method": resume_payload["geometry"],
                     "range_offset_flatten": "nisar_ellipsoidal_v1",
                     "range_offset_phase_sign": "ifg_exp_minus_j_phase",
-                    "range_offset_phase_rms_rad": float(
-                        np.nanstd(range_offset_phase)
-                    ),
+                    "range_offset_phase_rms_rad": float(np.nanstd(range_offset_phase)),
                     "reference_valid_pixels": int(
                         np.sum(
                             np.isfinite(reference_array.real)
@@ -1464,6 +1525,29 @@ def make_nisar_scene_provider(
                 },
                 validate_existing_payloads=not full_scene,
             )
+            if full_scene:
+                pair_valid_pixels += int(
+                    np.sum(
+                        np.isfinite(reference_array.real)
+                        & np.isfinite(reference_array.imag)
+                        & np.isfinite(secondary_array.real)
+                        & np.isfinite(secondary_array.imag)
+                        & (np.abs(reference_array) > 0.0)
+                        & (np.abs(secondary_array) > 0.0)
+                    )
+                )
+        if full_scene:
+            if domain == "geo":
+                has_pair_coverage = pair_claimed is not None and bool(
+                    np.any(pair_claimed)
+                )
+            else:
+                has_pair_coverage = pair_valid_pixels > 0
+            if not has_pair_coverage:
+                reject_invalid_state(
+                    "NISAR full-scene pair has no physical secondary overlap; "
+                    "all dense radar-to-geo-to-radar lanes were invalid"
+                )
         return NisarPairState(
             pair_id=f"{reference_date}_{secondary_date}",
             stage_timings_s={},
