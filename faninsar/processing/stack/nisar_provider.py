@@ -224,6 +224,40 @@ def _full_reference_bounds(
     return row_start, row_stop, col_start, col_stop
 
 
+def _full_stack_reference_bounds(
+    products: Mapping[str, SLCProduct],
+    master: str,
+    *,
+    device: str,
+    dem: DEMSampler | None,
+    height_m: float | None,
+) -> tuple[int, int, int, int]:
+    """Intersect every acquisition onto one stable master radar grid."""
+    reference_product = products[master]
+    if not isinstance(reference_product.grid, RadarGrid):
+        reject_invalid_state("NISAR full Stack master must use a radar grid")
+    common = (0, reference_product.grid.shape[0], 0, reference_product.grid.shape[1])
+    for date_id in sorted(products):
+        if date_id == master:
+            continue
+        pair_bounds = _full_reference_bounds(
+            reference_product,
+            products[date_id],
+            device=device,
+            dem=dem,
+            height_m=height_m,
+        )
+        common = (
+            max(common[0], pair_bounds[0]),
+            min(common[1], pair_bounds[1]),
+            max(common[2], pair_bounds[2]),
+            min(common[3], pair_bounds[3]),
+        )
+    if common[0] >= common[1] or common[2] >= common[3]:
+        reject_invalid_state("NISAR Stack acquisitions have no shared radar coverage")
+    return common
+
+
 def _geo_tile_for_radar_crop(
     product: SLCProduct,
     bounds: tuple[int, int, int, int],
@@ -737,13 +771,22 @@ def make_nisar_scene_provider(
         requested_window = _provider_window(options, configured_window)
         full_scene = requested_window is None
         if full_scene:
-            bounds = _full_reference_bounds(
-                reference_product,
-                secondary_product,
-                device=device,
-                dem=mapping_dem,
-                height_m=mapping_height,
-            )
+            if reference_date == master:
+                bounds = _full_stack_reference_bounds(
+                    products,
+                    master,
+                    device=device,
+                    dem=mapping_dem,
+                    height_m=mapping_height,
+                )
+            else:
+                bounds = _full_reference_bounds(
+                    reference_product,
+                    secondary_product,
+                    device=device,
+                    dem=mapping_dem,
+                    height_m=mapping_height,
+                )
             tiles = tuple(_iter_tiles(bounds, _tile_shape(configured_tile_shape)))
         else:
             source_shape = (

@@ -20,6 +20,7 @@ from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.slc import GeoSLC, RadarSLC
 from faninsar.processing.stack import NISARStack
 from faninsar.processing.stack.nisar_provider import (
+    _full_stack_reference_bounds,
     _geo_tile_for_radar_crop,
     _geometry_shared_radar_window,
     _radar_crop,
@@ -589,6 +590,46 @@ def test_nisar_full_scene_uses_deterministic_row_major_tiles(
         options={"coregistration_grid": "radar", "device": "cpu"},
     )
     assert len(selections) == 8
+
+
+def test_nisar_full_stack_intersects_every_date_on_master_grid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All coregistered dates share one master-grid extent."""
+    products = {
+        date_id: _result(tmp_path / f"{date_id}.h5", date_id).product
+        for date_id in ("20240101", "20240113", "20240125")
+    }
+    offsets = {"20240113": (0, 0), "20240125": (-1, 1)}
+
+    def shifted_window(
+        _reference_grid: object,
+        _secondary_grid: object,
+        bounds: tuple[int, int, int, int],
+        *,
+        secondary_product: object,
+        **_kwargs: object,
+    ) -> tuple[int, int, int, int]:
+        row_offset, col_offset = offsets[secondary_product.acquisition_id]
+        return (
+            bounds[0] + row_offset,
+            bounds[1] + row_offset,
+            bounds[2] + col_offset,
+            bounds[3] + col_offset,
+        )
+
+    monkeypatch.setattr(
+        "faninsar.processing.stack.nisar_provider._shared_radar_window",
+        shifted_window,
+    )
+
+    assert _full_stack_reference_bounds(
+        products,
+        "20240101",
+        device="cpu",
+        dem=None,
+        height_m=0.0,
+    ) == (1, 4, 0, 4)
 
 
 def test_nisar_geo_tile_preserves_projected_global_origin(
