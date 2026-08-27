@@ -15,6 +15,8 @@ import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Self
 
+import numpy as np
+
 from faninsar.core.network import (
     AssetKind,
     PhaseConvention,
@@ -24,7 +26,9 @@ from faninsar.core.network import (
 )
 from faninsar.logging import setup_logger
 
-from .frame.frame import Frame
+from .frame.geometry import FrameGeometry
+from .frame.interferogram import FrameInterferogramCollection
+from .frame.timeseries import FrameTimeSeries
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -407,7 +411,7 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
     return root_manifest
 
 
-class Network(Frame, NetworkContract):
+class Network(NetworkContract):
     """Concrete path-based view of one canonical InSAR Network."""
 
     def __init__(self, root: str | PathLike[str]) -> None:
@@ -428,7 +432,20 @@ class Network(Frame, NetworkContract):
             / NETWORK_GENERATIONS_NAME
             / str(self.manifest["generation_id"])
         )
-        super().__init__(resolved_root)
+        # Network owns the path-level data facade directly.  Frame remains a
+        # separate legacy Dataset entry point; sharing its component Dataset
+        # readers avoids inheriting its broader discovery and fallback rules.
+        self._root = resolved_root
+        geometry_root = resolved_root / "geometry"
+        self._geometry = (
+            FrameGeometry(geometry_root) if geometry_root.is_dir() else None
+        )
+        interferograms_root = resolved_root / "interferograms"
+        self._interferograms = FrameInterferogramCollection(interferograms_root)
+        timeseries_root = resolved_root / "timeseries"
+        self._timeseries = (
+            FrameTimeSeries(timeseries_root) if timeseries_root.is_dir() else None
+        )
         self._product_index: Any = None
         index = self.interferograms.index_metadata if self.interferograms else None
         if index is None:
@@ -445,6 +462,73 @@ class Network(Frame, NetworkContract):
             logger.error(message)
             raise IncompleteNetworkProductError(message)
 
+    @property
+    def root(self) -> Path:
+        """Return the mounted Network root directory."""
+        return self._root
+
+    @property
+    def geometry(self) -> FrameGeometry | None:
+        """Return the optional geometry Dataset facade."""
+        return self._geometry
+
+    @property
+    def interferograms(self) -> FrameInterferogramCollection:
+        """Return the validated interferogram Dataset facade."""
+        return self._interferograms
+
+    @property
+    def timeseries(self) -> FrameTimeSeries | None:
+        """Return the optional time-series Dataset facade."""
+        return self._timeseries
+
+    def to_ifg_stack(self, *, pairs: Any = None) -> Any:
+        """Build the analysis stack by reading products through Dataset.
+
+        Parameters
+        ----------
+        pairs : Pairs, optional
+            Subset of Pair products; defaults to all products in the Network.
+
+        Returns
+        -------
+        InterferogramStack
+            Unwrapped phase and optional coherence accepted by time-series
+            solvers.
+
+        Raises
+        ------
+        ValueError
+            If the Network has no readable unwrapped phase products.
+
+        """
+        from faninsar.processing.contracts.ifg import InterferogramStack
+
+        pair_obj = pairs if pairs is not None else self.interferograms.pairs()
+        unwrapped: np.ndarray | None = None
+        coherence: np.ndarray | None = None
+        try:
+            unwrapped_data = self.interferograms.open_stack("unw_phase")
+            unwrapped = np.asarray(unwrapped_data.values, dtype=np.float64)
+            if unwrapped.ndim == 3:
+                unwrapped = unwrapped.reshape(unwrapped.shape[0], -1)
+        except Exception as exc:
+            logger.exception("Network unwrapped phase products cannot be read")
+            message = "could not load unwrapped phase stack from Network Dataset"
+            raise ValueError(message) from exc
+        try:
+            coherence_data = self.interferograms.open_stack("coherence")
+            coherence = np.asarray(coherence_data.values, dtype=np.float64)
+            if coherence.ndim == 3:
+                coherence = coherence.reshape(coherence.shape[0], -1)
+        except Exception:
+            coherence = None
+        return InterferogramStack.from_unwrapped(
+            stack_id=str(self._root),
+            pairs=pair_obj,
+            unwrapped=unwrapped,
+            coherence=coherence,
+        )
     @classmethod
     def from_path(cls, root: str | PathLike[str]) -> Self:
         """Construct a Network from a canonical filesystem path."""

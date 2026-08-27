@@ -238,5 +238,4 @@ def _resolve_backend(backend: str | ComputeBackend) -> ComputeBackend:
         raise ValueError(message)
     return backend
 
-
 __all__ = ["run"]

@@ -111,6 +111,7 @@ def test_network_requires_versioned_manifest_and_generation(tmp_path: Path) -> N
     network = Network(root)
     assert network.manifest["schema_version"] == "network_v1"
     assert network.manifest["generation_id"] == "generation-1"
+    assert all(base.__name__ != "Frame" for base in Network.__mro__)
 
 
 def test_network_rejects_unknown_manifest_version(tmp_path: Path) -> None:

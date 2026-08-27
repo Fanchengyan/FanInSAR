@@ -13,7 +13,7 @@ from faninsar.processing.errors import PairConfigurationMigrationError
 
 def test_run_requires_stack_paths() -> None:
     """The config facade requires an explicit Stack source collection."""
-    from faninsar.run import run
+    from faninsar._stack_config import run
 
     with pytest.raises(ValueError, match="paths"):
         run({})
@@ -22,7 +22,15 @@ def test_run_requires_stack_paths() -> None:
 def test_root_has_no_third_execution_entry_point() -> None:
     """The root package exposes Stack/Network, not a module-level runner."""
     result = subprocess.run(
-        [sys.executable, "-c", "import faninsar; assert not hasattr(faninsar, 'run')"],
+        [
+            sys.executable,
+            "-c",
+            (
+                "import faninsar, importlib.util; "
+                "assert not hasattr(faninsar, 'run'); "
+                "assert importlib.util.find_spec('faninsar.run') is None"
+            ),
+        ],
         check=False,
     )
     assert result.returncode == 0
@@ -30,7 +38,7 @@ def test_root_has_no_third_execution_entry_point() -> None:
 
 def test_run_rejects_pair_configuration_before_backend_resolution() -> None:
     """Legacy reference/secondary fields fail with a typed migration error."""
-    from faninsar.run import run
+    from faninsar._stack_config import run
 
     with pytest.raises(PairConfigurationMigrationError, match="paths"):
         run({"reference": "ref.SAFE", "secondary": "sec.SAFE"})
