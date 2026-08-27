@@ -11,13 +11,14 @@ REQUIRED_NAMES = {
     "Loops",
     "Acquisition",
     "Baselines",
-    "Frame",
+    "Network",
+    "Stack",
+    "S1Stack",
+    "NISARStack",
     "invert",
     "NSBAS",
     "SBAS",
-    "Pipeline",
     "Stage",
-    "run",
     "open_stac",
     "open_zarr",
     "register",
@@ -32,6 +33,13 @@ def test_all_length_at_most_20() -> None:
 def test_required_names_present() -> None:
     missing = REQUIRED_NAMES - set(fis.__all__)
     assert not missing, f"missing public names: {sorted(missing)}"
+
+
+def test_removed_execution_names_absent() -> None:
+    """Stack and Network are the only public interferometry roots."""
+    for name in ("Frame", "Pipeline", "Workflow", "run"):
+        assert name not in fis.__all__
+        assert not hasattr(fis, name)
 
 
 def test_ports_not_in_root_all() -> None:
