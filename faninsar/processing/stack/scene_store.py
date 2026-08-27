@@ -158,7 +158,7 @@ class SceneUnit:
     """One immutable Reference-grid aligned SLC unit."""
 
     tag: str
-    reference_path: Path
+    primary_path: Path
     secondary_path: Path
     shape: tuple[int, int]
     row_origin: int
@@ -232,20 +232,20 @@ class CoregisteredSceneStore:
         for raw in raw_units:
             if not isinstance(raw, dict):
                 reject_invalid_state("scene manifest unit must be an object")
-            reference = _safe_payload_path(
-                path, raw.get("reference_file"), "reference_file"
+            primary = _safe_payload_path(
+                path, raw.get("primary_file"), "primary_file"
             )
             secondary = _safe_payload_path(
                 path, raw.get("secondary_file"), "secondary_file"
             )
-            for payload in (reference, secondary):
+            for payload in (primary, secondary):
                 if not payload.is_file() or payload.is_symlink():
                     reject_invalid_state(f"scene payload missing or unsafe: {payload}")
             shape = (int(raw["rows"]), int(raw["cols"]))
             units.append(
                 SceneUnit(
                     tag=str(raw["tag"]),
-                    reference_path=reference,
+                    primary_path=primary,
                     secondary_path=secondary,
                     shape=shape,
                     row_origin=int(raw["row_origin"]),
@@ -342,17 +342,17 @@ class CoregisteredSceneStore:
         if unit is None:
             reject_invalid_state(f"scene unit {tag!r} is not in the manifest")
         payload_digest = hashlib.sha256(
-            (_sha256(unit.reference_path) + _sha256(unit.secondary_path)).encode()
+            (_sha256(unit.primary_path) + _sha256(unit.secondary_path)).encode()
         ).hexdigest()
         if payload_digest != unit.payload_digest:
             reject_invalid_state(f"scene unit {tag!r} payload digest mismatch")
-        reference = np.load(unit.reference_path, allow_pickle=False)
+        primary = np.load(unit.primary_path, allow_pickle=False)
         secondary = np.load(unit.secondary_path, allow_pickle=False)
-        if reference.shape != unit.shape or secondary.shape != unit.shape:
+        if primary.shape != unit.shape or secondary.shape != unit.shape:
             reject_invalid_state(f"scene unit {tag!r} shape mismatch")
-        if reference.dtype != np.complex64 or secondary.dtype != np.complex64:
+        if primary.dtype != np.complex64 or secondary.dtype != np.complex64:
             reject_invalid_state(f"scene unit {tag!r} dtype mismatch")
-        return reference, secondary, unit
+        return primary, secondary, unit
 
 
 def write_scene_unit(
@@ -362,7 +362,7 @@ def write_scene_unit(
     reference_id: str,
     domain: str,
     tag: str,
-    reference: np.ndarray,
+    primary: np.ndarray,
     secondary: np.ndarray,
     row_origin: int,
     col_origin: int,
@@ -385,7 +385,7 @@ def write_scene_unit(
         Coordinate domain, either radar or geographic.
     tag : str
         Stable unit identifier within the store.
-    reference, secondary : numpy.ndarray
+    primary, secondary : numpy.ndarray
         Matching complex64 scene arrays.
     row_origin, col_origin : int
         Unit origin within the declared common grid.
@@ -409,25 +409,25 @@ def write_scene_unit(
     path = _validated_store_root(root, create=True)
     _require_basename(tag, "tag")
     if (
-        reference.ndim != 2
+        primary.ndim != 2
         or secondary.ndim != 2
-        or reference.shape != secondary.shape
-        or any(size <= 0 for size in reference.shape)
-        or reference.dtype != np.complex64
+        or primary.shape != secondary.shape
+        or any(size <= 0 for size in primary.shape)
+        or primary.dtype != np.complex64
         or secondary.dtype != np.complex64
     ):
         reject_invalid_state("aligned scene arrays must be matching complex64 arrays")
     resolved_grid_shape = grid_shape or (
-        int(row_origin) + int(reference.shape[0]),
-        int(col_origin) + int(reference.shape[1]),
+        int(row_origin) + int(primary.shape[0]),
+        int(col_origin) + int(primary.shape[1]),
     )
     if (
         len(resolved_grid_shape) != 2
         or any(size <= 0 for size in resolved_grid_shape)
         or row_origin < 0
         or col_origin < 0
-        or row_origin + reference.shape[0] > resolved_grid_shape[0]
-        or col_origin + reference.shape[1] > resolved_grid_shape[1]
+        or row_origin + primary.shape[0] > resolved_grid_shape[0]
+        or col_origin + primary.shape[1] > resolved_grid_shape[1]
     ):
         reject_invalid_state("scene unit lies outside the declared common grid")
     if wavelength_m is not None and (
@@ -472,9 +472,9 @@ def write_scene_unit(
             existing_grid_identity != resolved_grid_identity
         ):
             reject_invalid_state("scene units must share one coordinate grid")
-    ref_path = path / f"{tag}.reference.npy"
+    primary_path = path / f"{tag}.primary.npy"
     sec_path = path / f"{tag}.secondary.npy"
-    for target, array in ((ref_path, reference), (sec_path, secondary)):
+    for target, array in ((primary_path, primary), (sec_path, secondary)):
         temporary = target.with_suffix(target.suffix + ".tmp")
         with temporary.open("wb") as stream:
             np.save(stream, np.asarray(array, dtype=np.complex64), allow_pickle=False)
@@ -485,14 +485,14 @@ def write_scene_unit(
     units.append(
         {
             "tag": tag,
-            "reference_file": ref_path.name,
+            "primary_file": primary_path.name,
             "secondary_file": sec_path.name,
-            "rows": int(reference.shape[0]),
-            "cols": int(reference.shape[1]),
+            "rows": int(primary.shape[0]),
+            "cols": int(primary.shape[1]),
             "row_origin": int(row_origin),
             "col_origin": int(col_origin),
             "payload_digest": hashlib.sha256(
-                (_sha256(ref_path) + _sha256(sec_path)).encode()
+                (_sha256(primary_path) + _sha256(sec_path)).encode()
             ).hexdigest(),
             "scientific_lineage": [dict(item) for item in (scientific_lineage or ())],
             "phase_state": dict(phase_state) if phase_state is not None else None,
@@ -531,15 +531,15 @@ def copy_reference_units(source: str | Path, target: str | Path) -> None:
         for existing_unit in existing_store.units:
             existing_store.read(existing_unit.tag)
     for unit in source_store.units:
-        reference, _, _ = source_store.read(unit.tag)
+        primary, _, _ = source_store.read(unit.tag)
         write_scene_unit(
             destination,
             date_id=source_store.reference_id,
             reference_id=source_store.reference_id,
             domain=source_store.domain,
             tag=unit.tag,
-            reference=reference,
-            secondary=reference,
+            primary=primary,
+            secondary=primary,
             row_origin=unit.row_origin,
             col_origin=unit.col_origin,
             grid_shape=source_store.grid_shape,
@@ -575,38 +575,38 @@ def _validate_nisar_geo_ownership(store: CoregisteredSceneStore) -> None:
         reject_invalid_state("NISAR Geo scene mixes ownership contracts")
     pair_owned = np.zeros(store.grid_shape, dtype=bool)
     for unit in sorted(store.units, key=lambda item: item.tag):
-        reference, secondary, _ = store.read(unit.tag)
+        primary, secondary, _ = store.read(unit.tag)
         row_slice = slice(unit.row_origin, unit.row_origin + unit.shape[0])
         col_slice = slice(unit.col_origin, unit.col_origin + unit.shape[1])
-        reference_valid = (
-            np.isfinite(reference.real)
-            & np.isfinite(reference.imag)
-            & (np.abs(reference) > 0.0)
+        primary_valid = (
+            np.isfinite(primary.real)
+            & np.isfinite(primary.imag)
+            & (np.abs(primary) > 0.0)
         )
         secondary_valid = (
             np.isfinite(secondary.real)
             & np.isfinite(secondary.imag)
             & (np.abs(secondary) > 0.0)
         )
-        if not np.array_equal(reference_valid, secondary_valid):
+        if not np.array_equal(primary_valid, secondary_valid):
             reject_invalid_state(
                 f"NISAR Geo scene unit {unit.tag!r} has asymmetric pair ownership"
             )
         declared_count = (unit.phase_state or {}).get("pair_valid_pixels")
-        if declared_count != int(np.sum(reference_valid)):
+        if declared_count != int(np.sum(primary_valid)):
             reject_invalid_state(
                 f"NISAR Geo scene unit {unit.tag!r} pair coverage count differs"
             )
-        if np.any(pair_owned[row_slice, col_slice] & reference_valid):
+        if np.any(pair_owned[row_slice, col_slice] & primary_valid):
             reject_invalid_state("NISAR Geo scene tiles have overlapping ownership")
-        pair_owned[row_slice, col_slice] |= reference_valid
+        pair_owned[row_slice, col_slice] |= primary_valid
 
 
 def form_merged_scene_interferogram(
-    reference_store: CoregisteredSceneStore,
+    primary_store: CoregisteredSceneStore,
     secondary_store: CoregisteredSceneStore,
     *,
-    reference_role: str = "reference",
+    primary_role: str = "primary",
     secondary_role: str = "secondary",
     multilook: tuple[int, int] = (1, 1),
     goldstein_alpha: float = 0.0,
@@ -623,9 +623,9 @@ def form_merged_scene_interferogram(
 
     Parameters
     ----------
-    reference_store, secondary_store : CoregisteredSceneStore
+    primary_store, secondary_store : CoregisteredSceneStore
         Persisted Reference-aligned scene generations on one common grid.
-    reference_role, secondary_role : {"reference", "secondary"}, optional
+    primary_role, secondary_role : {"primary", "secondary"}, optional
         Payload role selected from each generation.
     multilook : tuple[int, int], optional
         Azimuth and range boxcar look factors aligned to global origins.
@@ -642,52 +642,50 @@ def form_merged_scene_interferogram(
         One merged common-grid interferogram and its quality layers.
 
     """
-    if reference_store.domain != secondary_store.domain:
+    if primary_store.domain != secondary_store.domain:
         reject_invalid_state("scene artifact domains do not match")
-    if reference_store.reference_id != secondary_store.reference_id:
+    if primary_store.reference_id != secondary_store.reference_id:
         reject_invalid_state("scene artifacts use different References")
-    if reference_store.grid_shape != secondary_store.grid_shape:
+    if primary_store.grid_shape != secondary_store.grid_shape:
         reject_invalid_state("scene artifact common grid shapes do not match")
-    if reference_store.wavelength_m != secondary_store.wavelength_m:
+    if primary_store.wavelength_m != secondary_store.wavelength_m:
         reject_invalid_state("scene artifact radar wavelengths do not match")
-    if reference_store.grid_identity != secondary_store.grid_identity:
+    if primary_store.grid_identity != secondary_store.grid_identity:
         reject_invalid_state("scene artifact coordinate grids do not match")
-    _validate_nisar_geo_ownership(reference_store)
+    _validate_nisar_geo_ownership(primary_store)
     _validate_nisar_geo_ownership(secondary_store)
-    reference_units = reference_store.unit_map()
+    primary_units = primary_store.unit_map()
     secondary_units = secondary_store.unit_map()
-    if set(reference_units) != set(secondary_units):
+    if set(primary_units) != set(secondary_units):
         reject_invalid_state("scene artifact unit manifests differ")
     az_looks, rg_looks = multilook
     if az_looks < 1 or rg_looks < 1:
         reject_invalid_state("multilook factors must be >= 1")
-    out_rows = reference_store.grid_shape[0] // az_looks
-    out_cols = reference_store.grid_shape[1] // rg_looks
+    out_rows = primary_store.grid_shape[0] // az_looks
+    out_cols = primary_store.grid_shape[1] // rg_looks
     if out_rows < 1 or out_cols < 1:
         reject_invalid_state("multilook factors exceed the common scene grid")
-    if len(reference_units) == 1:
-        tag = next(iter(reference_units))
-        reference_ref, reference_sec, reference_unit = reference_store.read(tag)
+    if len(primary_units) == 1:
+        tag = next(iter(primary_units))
+        primary_ref, primary_sec, primary_unit = primary_store.read(tag)
         secondary_ref, secondary_sec, secondary_unit = secondary_store.read(tag)
         if (
-            reference_unit.shape == secondary_unit.shape
-            and reference_unit.row_origin == secondary_unit.row_origin
-            and reference_unit.col_origin == secondary_unit.col_origin
-            and reference_unit.row_origin == 0
-            and reference_unit.col_origin == 0
-            and reference_unit.shape == reference_store.grid_shape
+            primary_unit.shape == secondary_unit.shape
+            and primary_unit.row_origin == secondary_unit.row_origin
+            and primary_unit.col_origin == secondary_unit.col_origin
+            and primary_unit.row_origin == 0
+            and primary_unit.col_origin == 0
+            and primary_unit.shape == primary_store.grid_shape
         ):
-            valid_roles = {"reference", "secondary"}
-            if reference_role not in valid_roles or secondary_role not in valid_roles:
+            valid_roles = {"primary", "secondary"}
+            if primary_role not in valid_roles or secondary_role not in valid_roles:
                 reject_invalid_state("unsupported scene payload role")
-            reference = (
-                reference_ref if reference_role == "reference" else reference_sec
-            )
+            primary = primary_ref if primary_role == "primary" else primary_sec
             secondary = (
-                secondary_ref if secondary_role == "reference" else secondary_sec
+                secondary_ref if secondary_role == "primary" else secondary_sec
             )
             product = form_interferogram(
-                reference,
+                primary,
                 secondary,
                 multilook=multilook,
             )
@@ -722,15 +720,15 @@ def form_merged_scene_interferogram(
             )
 
     groups = (
-        {"geo": sorted(reference_units)}
-        if reference_store.domain == "geo"
+        {"geo": sorted(primary_units)}
+        if primary_store.domain == "geo"
         else {
             swath: sorted(
-                (tag for tag in reference_units if _tag_swath(tag) == swath),
-                key=lambda tag: reference_units[tag].row_origin,
+                (tag for tag in primary_units if _tag_swath(tag) == swath),
+                key=lambda tag: primary_units[tag].row_origin,
                 reverse=True,
             )
-            for swath in sorted({_tag_swath(tag) for tag in reference_units})
+            for swath in sorted({_tag_swath(tag) for tag in primary_units})
         }
     )
     group_products: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -741,31 +739,29 @@ def form_merged_scene_interferogram(
         secondary_power_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
         claimed = np.zeros((out_rows, out_cols), dtype=np.int32)
         for tag in tags:
-            reference_ref, reference_sec, reference_unit = reference_store.read(tag)
+            primary_ref, primary_sec, primary_unit = primary_store.read(tag)
             secondary_ref, secondary_sec, secondary_unit = secondary_store.read(tag)
             if (
-                reference_unit.shape != secondary_unit.shape
-                or reference_unit.row_origin != secondary_unit.row_origin
-                or reference_unit.col_origin != secondary_unit.col_origin
+                primary_unit.shape != secondary_unit.shape
+                or primary_unit.row_origin != secondary_unit.row_origin
+                or primary_unit.col_origin != secondary_unit.col_origin
             ):
                 reject_invalid_state(
                     f"scene unit {tag!r} grid placement differs across dates"
                 )
-            reference = (
-                reference_ref if reference_role == "reference" else reference_sec
-            )
+            primary = primary_ref if primary_role == "primary" else primary_sec
             secondary = (
-                secondary_ref if secondary_role == "reference" else secondary_sec
+                secondary_ref if secondary_role == "primary" else secondary_sec
             )
-            valid_roles = {"reference", "secondary"}
-            if reference_role not in valid_roles or secondary_role not in valid_roles:
+            valid_roles = {"primary", "secondary"}
+            if primary_role not in valid_roles or secondary_role not in valid_roles:
                 reject_invalid_state("unsupported scene payload role")
-            ifg = reference * np.conjugate(secondary)
-            primary_power = reference.real**2 + reference.imag**2
+            ifg = primary * np.conjugate(secondary)
+            primary_power = primary.real**2 + primary.imag**2
             secondary_power = secondary.real**2 + secondary.imag**2
             valid = np.isfinite(ifg.real) & np.isfinite(ifg.imag) & (np.abs(ifg) > 0)
-            rows = reference_unit.row_origin + np.arange(reference_unit.shape[0])
-            cols = reference_unit.col_origin + np.arange(reference_unit.shape[1])
+            rows = primary_unit.row_origin + np.arange(primary_unit.shape[0])
+            cols = primary_unit.col_origin + np.arange(primary_unit.shape[1])
             output_rows = rows[:, None] // az_looks
             output_cols = cols[None, :] // rg_looks
             in_bounds = (
@@ -847,10 +843,10 @@ def form_merged_scene_interferogram(
 
 
 def form_scene_interferograms(
-    reference_store: CoregisteredSceneStore,
+    primary_store: CoregisteredSceneStore,
     secondary_store: CoregisteredSceneStore,
     *,
-    reference_role: str = "reference",
+    primary_role: str = "primary",
     secondary_role: str = "secondary",
     multilook: tuple[int, int] = (1, 1),
     goldstein_alpha: float = 0.0,
@@ -861,9 +857,9 @@ def form_scene_interferograms(
 
     Parameters
     ----------
-    reference_store, secondary_store : CoregisteredSceneStore
+    primary_store, secondary_store : CoregisteredSceneStore
         Persisted Reference-aligned scene generations.
-    reference_role, secondary_role : str, optional
+    primary_role, secondary_role : str, optional
         Payload role to consume from each generation.
     multilook : tuple[int, int], optional
         Azimuth and range looks applied through the Pair interferogram kernel.
@@ -880,32 +876,32 @@ def form_scene_interferograms(
         Multilooked and optionally filtered complex interferograms by burst tag.
 
     """
-    if reference_store.domain != secondary_store.domain:
+    if primary_store.domain != secondary_store.domain:
         reject_invalid_state("scene artifact domains do not match")
-    reference_units = reference_store.unit_map()
+    primary_units = primary_store.unit_map()
     secondary_units = secondary_store.unit_map()
-    if set(reference_units) != set(secondary_units):
+    if set(primary_units) != set(secondary_units):
         reject_invalid_state("scene artifact unit manifests differ")
     outputs: dict[str, np.ndarray] = {}
-    for tag in sorted(reference_units):
-        reference_ref, reference_sec, reference_unit = reference_store.read(tag)
+    for tag in sorted(primary_units):
+        primary_ref, primary_sec, primary_unit = primary_store.read(tag)
         secondary_ref, secondary_sec, secondary_unit = secondary_store.read(tag)
-        if reference_unit.shape != secondary_unit.shape:
+        if primary_unit.shape != secondary_unit.shape:
             reject_invalid_state(f"scene unit {tag!r} shape differs across dates")
-        if reference_role == "reference":
-            reference = reference_ref
-        elif reference_role == "secondary":
-            reference = reference_sec
+        if primary_role == "primary":
+            primary = primary_ref
+        elif primary_role == "secondary":
+            primary = primary_sec
         else:
-            reject_invalid_state("unsupported reference scene role")
-        if secondary_role == "reference":
+            reject_invalid_state("unsupported primary scene role")
+        if secondary_role == "primary":
             secondary = secondary_ref
         elif secondary_role == "secondary":
             secondary = secondary_sec
         else:
             reject_invalid_state("unsupported secondary scene role")
         complex_ifg = form_interferogram(
-            reference,
+            primary,
             secondary,
             multilook=multilook,
         ).complex_ifg

@@ -791,7 +791,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
             reference_id=_scene_id(ref_path),
             domain=str(coregistration_grid),
             tag=tag,
-            reference=np.asarray(state.reference_deramped, dtype=np.complex64),
+            primary=np.asarray(state.reference_deramped, dtype=np.complex64),
             secondary=np.asarray(state.secondary_aligned, dtype=np.complex64),
             row_origin=row_origin,
             col_origin=col_origin,
@@ -1429,7 +1429,7 @@ def stage_deramp(
     """
     from faninsar.backends.dask_gpu import should_accelerate
 
-    reference_input = state.reference.array.samples
+    primary_input = state.reference.array.samples
     secondary_input = state.secondary.array.samples
     if not should_accelerate(device, dask_client, kernel="carrier_multiply"):
         state.reference_deramped = deramp(
@@ -1473,7 +1473,7 @@ def stage_deramp(
     _record_scientific_transition(
         state,
         "deramp",
-        (reference_input, secondary_input),
+        (primary_input, secondary_input),
         (state.reference_deramped, state.secondary_deramped),
         carrier="tops",
     )
@@ -2189,13 +2189,13 @@ def stage_coregister(
             )
             if lut_cache_dir is not None:
                 reference_scene = str(state.reference.scene_id)
-                reference_swath = str(getattr(state.reference.swath, "swath", ""))
+                primary_swath = str(getattr(state.reference.swath, "swath", ""))
                 reference_burst = int(
                     getattr(getattr(state.reference, "burst", None), "index", 0)
                 )
                 mask_applied = footprint_lonlat is not None
                 lut_cache_key = (
-                    f"{reference_scene}_{reference_swath}_b{reference_burst}_"
+                    f"{reference_scene}_{primary_swath}_b{reference_burst}_"
                     f"{geo_grid_hash(geo_grid)}_"
                     f"m{int(geo_footprint_mask_enabled)}_"
                     f"a{int(mask_applied)}_d64_8pt-hull-v1"
@@ -2471,7 +2471,7 @@ def stage_interferogram(
     if state.reference_deramped is None or state.secondary_aligned is None:
         reject_invalid_state("interferogram requires coregister")
     state.multilook = multilook
-    reference_input = state.reference_deramped
+    primary_input = state.reference_deramped
     secondary_input = state.secondary_aligned
     # Geographic coregistration keeps the two aligned SLCs in memmaps that
     # are released below.  Scientific lineage hashes are computed after the
@@ -2479,10 +2479,10 @@ def stage_interferogram(
     # opt-in lineage record is enabled; otherwise preserve the zero-copy
     # production path.
     if state.record_scientific_lineage:
-        reference_lineage_input = np.array(reference_input, copy=True)
+        primary_lineage_input = np.array(primary_input, copy=True)
         secondary_lineage_input = np.array(secondary_input, copy=True)
     else:
-        reference_lineage_input = reference_input
+        primary_lineage_input = primary_input
         secondary_lineage_input = secondary_input
     from faninsar.backends.dask_gpu import should_accelerate
 
@@ -2566,7 +2566,7 @@ def stage_interferogram(
     _record_scientific_transition(
         state,
         "form_interferogram",
-        (reference_lineage_input, secondary_lineage_input),
+        (primary_lineage_input, secondary_lineage_input),
         (state.complex_ifg, state.coherence, state.wrapped_phase),
         multilook=multilook,
         goldstein_alpha=goldstein_alpha,
@@ -3529,7 +3529,7 @@ def _roi_geometry(roi: BoundingBox | Polygons) -> Any:
 def _auto_dem_bounds(
     roi: BoundingBox | Polygons | None,
     resolved: dict[tuple[int, str], list[int]],
-    reference_products: list,
+    primary_products: list,
     orbits: Sequence[str | Path | None] | None = None,
     dem: DEMSampler | None = None,
 ) -> tuple[float, float, float, float]:
@@ -3541,7 +3541,7 @@ def _auto_dem_bounds(
         ROI passed to the Stack provider.
     resolved : dict
         Selected burst indices per (frame_index, swath).
-    reference_products : list
+    primary_products : list
         Opened reference SAFE products, one per frame.
     orbits : sequence of path or None, optional
         Per-frame precise orbit files used to build the burst quads.
@@ -3577,7 +3577,7 @@ def _auto_dem_bounds(
 
     quads: list[np.ndarray] = []
     for (frame_index, swath), indices in resolved.items():
-        s1_swath = reference_products[frame_index].swath(swath)
+        s1_swath = primary_products[frame_index].swath(swath)
         orbit_path = None if orbits is None else orbits[frame_index]
         if orbit_path is not None:
             s1_swath = _replace(s1_swath, orbit=read_eof_orbit(orbit_path))
@@ -3838,14 +3838,14 @@ def _seconds_of_day(value: datetime) -> float:
 
 
 def _common_burst_indices(
-    reference_swath: S1Swath,
+    primary_swath: S1Swath,
     secondary_swath: S1Swath,
 ) -> list[int]:
     common: list[int] = []
-    max_index = min(len(reference_swath.bursts), len(secondary_swath.bursts))
-    window_s = reference_swath.lines_per_burst * reference_swath.azimuth_time_interval_s
+    max_index = min(len(primary_swath.bursts), len(secondary_swath.bursts))
+    window_s = primary_swath.lines_per_burst * primary_swath.azimuth_time_interval_s
     for index in range(max_index):
-        ref_burst = reference_swath.bursts[index]
+        ref_burst = primary_swath.bursts[index]
         sec_burst = secondary_swath.bursts[index]
         if ref_burst.azimuth_time is None or sec_burst.azimuth_time is None:
             common.append(index)
@@ -3863,12 +3863,12 @@ def _common_burst_indices(
 
 def _swath_range_offsets(
     swaths: tuple[str, ...],
-    reference_products: Sequence[S1Product],
+    primary_products: Sequence[S1Product],
 ) -> dict[str, int]:
-    first = reference_products[0].swath(swaths[0])
+    first = primary_products[0].swath(swaths[0])
     offsets: dict[str, int] = {}
     for name in swaths:
-        item = reference_products[0].swath(name)
+        item = primary_products[0].swath(name)
         if name == swaths[0]:
             offsets[name] = 0
         else:
@@ -3886,7 +3886,7 @@ def _swath_range_offsets(
 
 @overload
 def produce_interferogram_pair(
-    reference_path: str | Path | Sequence[str | Path],
+    primary_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
     output_dir: str | Path,
@@ -3922,7 +3922,7 @@ def produce_interferogram_pair(
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
-    reference_orbit_path: str | Path | Sequence[str | Path] | None = None,
+    primary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
@@ -3933,7 +3933,7 @@ def produce_interferogram_pair(
 
 @overload
 def produce_interferogram_pair(
-    reference_path: str | Path | Sequence[str | Path],
+    primary_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
     output_dir: str | Path,
@@ -3969,7 +3969,7 @@ def produce_interferogram_pair(
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
-    reference_orbit_path: str | Path | Sequence[str | Path] | None = None,
+    primary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
@@ -3979,7 +3979,7 @@ def produce_interferogram_pair(
 
 
 def produce_interferogram_pair(
-    reference_path: str | Path | Sequence[str | Path],
+    primary_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
     output_dir: str | Path,
@@ -4017,7 +4017,7 @@ def produce_interferogram_pair(
     snaphu_config: SnaphuConfig | None = None,
     unwrap_method: UnwrapBackend | None = None,
     irls_kwargs: dict[str, Any] | None = None,
-    reference_orbit_path: str | Path | Sequence[str | Path] | None = None,
+    primary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     secondary_orbit_path: str | Path | Sequence[str | Path] | None = None,
     unwrap: bool = False,
     geoid_correction: bool = True,
@@ -4028,7 +4028,7 @@ def produce_interferogram_pair(
 
     Parameters
     ----------
-    reference_path, secondary_path : str, Path, or sequence
+    primary_path, secondary_path : str, Path, or sequence
         One or more SAFE products per date. Sequences represent consecutive
         frames along the same pass; all entries are placed on one shared
         absolute azimuth/range grid.
@@ -4128,7 +4128,7 @@ def produce_interferogram_pair(
         Unwrapping backend when unwrap=True.
     irls_kwargs : dict, optional
         Arguments forwarded to the IRLS unwrap backend.
-    reference_orbit_path, secondary_orbit_path : path or sequence, optional
+    primary_orbit_path, secondary_orbit_path : path or sequence, optional
         Precise ESA EOF orbits; one per frame or a single orbit reused for
         every frame.
     unwrap : bool, optional
@@ -4165,7 +4165,7 @@ def produce_interferogram_pair(
         )
     if not _is_multilook_pair(multilook) or coregistration_grid == "geo":
         return _produce_interferogram_sweep(
-            reference_path,
+            primary_path,
             secondary_path,
             output_dir=output_dir,
             roi=roi,
@@ -4201,7 +4201,7 @@ def produce_interferogram_pair(
             snaphu_config=snaphu_config,
             unwrap_method=unwrap_method,
             irls_kwargs=irls_kwargs,
-            reference_orbit_path=reference_orbit_path,
+            primary_orbit_path=primary_orbit_path,
             secondary_orbit_path=secondary_orbit_path,
             unwrap=unwrap,
             geoid_correction=geoid_correction,
@@ -4231,24 +4231,24 @@ def produce_interferogram_pair(
     if geoid_correction and isinstance(dem_sampler, RasterDEM):
         dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
-    ref_paths = _as_frame_paths(reference_path, "reference_path")
+    primary_paths = _as_frame_paths(primary_path, "primary_path")
     sec_paths = _as_frame_paths(secondary_path, "secondary_path")
-    if len(ref_paths) != len(sec_paths):
+    if len(primary_paths) != len(sec_paths):
         reject_invalid_state(
             "reference/secondary frame counts differ: "
-            + str(len(ref_paths))
+            + str(len(primary_paths))
             + " vs "
             + str(len(sec_paths))
         )
-    frame_count = len(ref_paths)
+    frame_count = len(primary_paths)
     ref_orbits = _as_optional_frame_sequence(
-        reference_orbit_path, frame_count, "reference_orbit_path"
+        primary_orbit_path, frame_count, "primary_orbit_path"
     )
     sec_orbits = _as_optional_frame_sequence(
         secondary_orbit_path, frame_count, "secondary_orbit_path"
     )
     if snapshot_root is not None:
-        ref_paths = _snapshot_paths(ref_paths, snapshot_root / "safe")
+        primary_paths = _snapshot_paths(primary_paths, snapshot_root / "safe")
         sec_paths = _snapshot_paths(sec_paths, snapshot_root / "safe")
         ref_orbits = _snapshot_optional_paths(
             ref_orbits,
@@ -4259,11 +4259,11 @@ def produce_interferogram_pair(
             snapshot_root / "orbit",
         )
 
-    reference_products = [open_safe_product(path) for path in ref_paths]
+    primary_products = [open_safe_product(path) for path in primary_paths]
     secondary_products = [open_safe_product(path) for path in sec_paths]
     if swaths is None:
         ordered = sorted(
-            reference_products[0].swaths,
+            primary_products[0].swaths,
             key=lambda item: item.slant_range_time_s,
         )
         swath_tuple = tuple(item.swath for item in ordered)
@@ -4271,7 +4271,7 @@ def produce_interferogram_pair(
         swath_tuple = tuple(swaths)
     if not swath_tuple:
         reject_invalid_state("swaths must not be empty")
-    for frame_index, product in enumerate(reference_products):
+    for frame_index, product in enumerate(primary_products):
         present = {item.swath for item in product.swaths}
         missing = [name for name in swath_tuple if name not in present]
         if missing:
@@ -4279,7 +4279,7 @@ def produce_interferogram_pair(
                 "reference frame "
                 + str(frame_index)
                 + " ("
-                + ref_paths[frame_index].name
+                + primary_paths[frame_index].name
                 + ") missing swaths "
                 + str(missing)
                 + "; available="
@@ -4305,13 +4305,13 @@ def produce_interferogram_pair(
             "Stack provider: ROI provided; explicit swaths/bursts selection ignored"
         )
         ordered = sorted(
-            reference_products[0].swaths,
+            primary_products[0].swaths,
             key=lambda item: item.slant_range_time_s,
         )
         swath_tuple = tuple(item.swath for item in ordered)
         resolved = _select_bursts_by_roi(
             roi,
-            ref_paths,
+            primary_paths,
             swath_tuple,
             orbits=ref_orbits,
             dem=dem_sampler,
@@ -4319,7 +4319,7 @@ def produce_interferogram_pair(
     else:
         burst_counts = {
             (frame_index, swath): len(
-                reference_products[frame_index].swath(swath).bursts
+                primary_products[frame_index].swath(swath).bursts
             )
             for frame_index in range(frame_count)
             for swath in swath_tuple
@@ -4331,9 +4331,9 @@ def produce_interferogram_pair(
     common_aligned: dict[tuple[int, str], list[int]] = {}
     for frame_index in range(frame_count):
         for swath in swath_tuple:
-            reference_swath = reference_products[frame_index].swath(swath)
+            primary_swath = primary_products[frame_index].swath(swath)
             secondary_swath = secondary_products[frame_index].swath(swath)
-            common = _common_burst_indices(reference_swath, secondary_swath)
+            common = _common_burst_indices(primary_swath, secondary_swath)
             selected = [
                 index for index in resolved[(frame_index, swath)] if index in common
             ]
@@ -4355,7 +4355,7 @@ def produce_interferogram_pair(
         bounds = _auto_dem_bounds(
             roi,
             resolved,
-            reference_products,
+            primary_products,
             orbits=ref_orbits,
         )
         dem_sampler = resolve_auto_dem(
@@ -4366,20 +4366,20 @@ def produce_interferogram_pair(
         )
         dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
 
-    range_offsets = _swath_range_offsets(swath_tuple, reference_products)
-    reference_swath0 = reference_products[0].swath(swath_tuple[0])
-    dt = reference_swath0.azimuth_time_interval_s
+    range_offsets = _swath_range_offsets(swath_tuple, primary_products)
+    primary_swath0 = primary_products[0].swath(swath_tuple[0])
+    dt = primary_swath0.azimuth_time_interval_s
     burst_lines = {
-        swath: reference_products[0].swath(swath).lines_per_burst
+        swath: primary_products[0].swath(swath).lines_per_burst
         for swath in swath_tuple
     }
     burst_width = {
-        swath: reference_products[0].swath(swath).samples_per_burst
+        swath: primary_products[0].swath(swath).samples_per_burst
         for swath in swath_tuple
     }
 
     azimuth_origin = min(
-        reference_products[frame_index].swath(swath).bursts[burst_index].azimuth_time
+        primary_products[frame_index].swath(swath).bursts[burst_index].azimuth_time
         for (frame_index, swath), indices in resolved.items()
         for burst_index in indices
     )
@@ -4389,7 +4389,7 @@ def produce_interferogram_pair(
         for (frame_index, swath_key), indices in resolved.items():
             if swath_key != swath:
                 continue
-            swath_obj = reference_products[frame_index].swath(swath)
+            swath_obj = primary_products[frame_index].swath(swath)
             for burst_index in indices:
                 azimuth_offset = round(
                     (
@@ -4500,9 +4500,9 @@ def produce_interferogram_pair(
                 ref = load_burst(
                     swath,
                     burst_index,
-                    ref_paths[frame_index],
+                    primary_paths[frame_index],
                     ref_orbits[frame_index],
-                    reference_products[frame_index],
+                    primary_products[frame_index],
                 )
                 sec = load_burst(
                     swath,
@@ -4598,9 +4598,9 @@ def produce_interferogram_pair(
             ref = load_burst(
                 swath,
                 burst_index,
-                ref_paths[frame_index],
+                primary_paths[frame_index],
                 ref_orbits[frame_index],
-                reference_products[frame_index],
+                primary_products[frame_index],
             )
             sec = load_burst(
                 swath,
@@ -4674,10 +4674,10 @@ def produce_interferogram_pair(
                 write_scene_unit(
                     scene_store_dir,
                     date_id=_scene_id(sec_paths[0]),
-                    reference_id=_scene_id(ref_paths[0]),
+                    reference_id=_scene_id(primary_paths[0]),
                     domain="radar",
                     tag=tag,
-                    reference=np.asarray(state.reference_deramped, dtype=np.complex64),
+                    primary=np.asarray(state.reference_deramped, dtype=np.complex64),
                     secondary=np.asarray(state.secondary_aligned, dtype=np.complex64),
                     row_origin=azimuth_offset + burst_row0,
                     col_origin=range_offsets[swath] + burst_col0,
@@ -4785,7 +4785,7 @@ def produce_interferogram_pair(
     goldstein_s = time.perf_counter() - goldstein_started
 
     result = ProductionPairState(
-        pair_id=_scene_id(ref_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair",
+        pair_id=_scene_id(primary_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair",
         reference=(
             origin_state.reference
             if origin_state is not None
@@ -4861,7 +4861,7 @@ def produce_interferogram_pair(
 
 
 def _produce_interferogram_sweep(
-    reference_path: str | Path | Sequence[str | Path],
+    primary_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
     output_dir: str | Path,
@@ -4890,7 +4890,7 @@ def _produce_interferogram_sweep(
     snaphu_config: SnaphuConfig | None,
     unwrap_method: UnwrapBackend | None,
     irls_kwargs: dict[str, Any] | None,
-    reference_orbit_path: str | Path | Sequence[str | Path] | None,
+    primary_orbit_path: str | Path | Sequence[str | Path] | None,
     secondary_orbit_path: str | Path | Sequence[str | Path] | None,
     unwrap: bool,
     geoid_correction: bool,
@@ -4973,24 +4973,24 @@ def _produce_interferogram_sweep(
     if geoid_correction and isinstance(dem_sampler, RasterDEM):
         dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
 
-    ref_paths = _as_frame_paths(reference_path, "reference_path")
+    primary_paths = _as_frame_paths(primary_path, "primary_path")
     sec_paths = _as_frame_paths(secondary_path, "secondary_path")
-    if len(ref_paths) != len(sec_paths):
+    if len(primary_paths) != len(sec_paths):
         reject_invalid_state(
             "reference/secondary frame counts differ: "
-            + str(len(ref_paths))
+            + str(len(primary_paths))
             + " vs "
             + str(len(sec_paths))
         )
-    frame_count = len(ref_paths)
+    frame_count = len(primary_paths)
     ref_orbits = _as_optional_frame_sequence(
-        reference_orbit_path, frame_count, "reference_orbit_path"
+        primary_orbit_path, frame_count, "primary_orbit_path"
     )
     sec_orbits = _as_optional_frame_sequence(
         secondary_orbit_path, frame_count, "secondary_orbit_path"
     )
     if snapshot_root is not None:
-        ref_paths = _snapshot_paths(ref_paths, snapshot_root / "safe")
+        primary_paths = _snapshot_paths(primary_paths, snapshot_root / "safe")
         sec_paths = _snapshot_paths(sec_paths, snapshot_root / "safe")
         ref_orbits = _snapshot_optional_paths(
             ref_orbits,
@@ -5000,11 +5000,11 @@ def _produce_interferogram_sweep(
             sec_orbits,
             snapshot_root / "orbit",
         )
-    reference_products = [open_safe_product(path) for path in ref_paths]
+    primary_products = [open_safe_product(path) for path in primary_paths]
     secondary_products = [open_safe_product(path) for path in sec_paths]
     if swaths is None:
         ordered = sorted(
-            reference_products[0].swaths,
+            primary_products[0].swaths,
             key=lambda item: item.slant_range_time_s,
         )
         swath_tuple = tuple(item.swath for item in ordered)
@@ -5012,7 +5012,7 @@ def _produce_interferogram_sweep(
         swath_tuple = tuple(swaths)
     if not swath_tuple:
         reject_invalid_state("swaths must not be empty")
-    for frame_index, product in enumerate(reference_products):
+    for frame_index, product in enumerate(primary_products):
         present = {item.swath for item in product.swaths}
         missing = [name for name in swath_tuple if name not in present]
         if missing:
@@ -5020,7 +5020,7 @@ def _produce_interferogram_sweep(
                 "reference frame "
                 + str(frame_index)
                 + " ("
-                + ref_paths[frame_index].name
+                + primary_paths[frame_index].name
                 + ") missing swaths "
                 + str(missing)
                 + "; available="
@@ -5046,13 +5046,13 @@ def _produce_interferogram_sweep(
             "Stack provider: ROI provided; explicit swaths/bursts selection ignored"
         )
         ordered = sorted(
-            reference_products[0].swaths,
+            primary_products[0].swaths,
             key=lambda item: item.slant_range_time_s,
         )
         swath_tuple = tuple(item.swath for item in ordered)
         resolved = _select_bursts_by_roi(
             roi,
-            ref_paths,
+            primary_paths,
             swath_tuple,
             orbits=ref_orbits,
             dem=dem_sampler,
@@ -5060,7 +5060,7 @@ def _produce_interferogram_sweep(
     else:
         burst_counts = {
             (frame_index, swath): len(
-                reference_products[frame_index].swath(swath).bursts
+                primary_products[frame_index].swath(swath).bursts
             )
             for frame_index in range(frame_count)
             for swath in swath_tuple
@@ -5072,9 +5072,9 @@ def _produce_interferogram_sweep(
     common_aligned: dict[tuple[int, str], list[int]] = {}
     for frame_index in range(frame_count):
         for swath in swath_tuple:
-            reference_swath = reference_products[frame_index].swath(swath)
+            primary_swath = primary_products[frame_index].swath(swath)
             secondary_swath = secondary_products[frame_index].swath(swath)
-            common = _common_burst_indices(reference_swath, secondary_swath)
+            common = _common_burst_indices(primary_swath, secondary_swath)
             selected = [
                 index for index in resolved[(frame_index, swath)] if index in common
             ]
@@ -5096,7 +5096,7 @@ def _produce_interferogram_sweep(
         bounds = _auto_dem_bounds(
             roi,
             resolved,
-            reference_products,
+            primary_products,
             orbits=ref_orbits,
         )
         dem_sampler = resolve_auto_dem(
@@ -5107,19 +5107,19 @@ def _produce_interferogram_sweep(
         )
         dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
 
-    range_offsets = _swath_range_offsets(swath_tuple, reference_products)
-    reference_swath0 = reference_products[0].swath(swath_tuple[0])
-    dt = reference_swath0.azimuth_time_interval_s
+    range_offsets = _swath_range_offsets(swath_tuple, primary_products)
+    primary_swath0 = primary_products[0].swath(swath_tuple[0])
+    dt = primary_swath0.azimuth_time_interval_s
     burst_lines = {
-        swath: reference_products[0].swath(swath).lines_per_burst
+        swath: primary_products[0].swath(swath).lines_per_burst
         for swath in swath_tuple
     }
     burst_width = {
-        swath: reference_products[0].swath(swath).samples_per_burst
+        swath: primary_products[0].swath(swath).samples_per_burst
         for swath in swath_tuple
     }
     azimuth_origin = min(
-        reference_products[frame_index].swath(swath).bursts[burst_index].azimuth_time
+        primary_products[frame_index].swath(swath).bursts[burst_index].azimuth_time
         for (frame_index, swath), indices in resolved.items()
         for burst_index in indices
     )
@@ -5129,7 +5129,7 @@ def _produce_interferogram_sweep(
         for (frame_index, swath_key), indices in resolved.items():
             if swath_key != swath:
                 continue
-            swath_obj = reference_products[frame_index].swath(swath)
+            swath_obj = primary_products[frame_index].swath(swath)
             for burst_index in indices:
                 azimuth_offset = round(
                     (
@@ -5171,11 +5171,11 @@ def _produce_interferogram_sweep(
     try:
         archive = _archive_burst_ifgs(
             Path(temporary.name),
-            ref_paths=ref_paths,
+            primary_paths=primary_paths,
             sec_paths=sec_paths,
             ref_orbits=ref_orbits,
             sec_orbits=sec_orbits,
-            reference_products=reference_products,
+            primary_products=primary_products,
             secondary_products=secondary_products,
             swath_tuple=swath_tuple,
             units_by_swath=units_by_swath,
@@ -5210,7 +5210,7 @@ def _produce_interferogram_sweep(
         resources.ifg_archive = archive
         if coregistration_grid == "geo":
             resources.prefix_state = archive.get("geo_prefix_state")
-        pair_id = _scene_id(ref_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair"
+        pair_id = _scene_id(primary_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair"
         per_config: dict[tuple[int, int], PairSweepOutcome] = {}
         single_state: ProductionPairState | None = None
         for config in configs:
@@ -5257,11 +5257,11 @@ def _produce_interferogram_sweep(
 def _archive_burst_ifgs(
     work_dir: Path,
     *,
-    ref_paths: Sequence[str | Path],
+    primary_paths: Sequence[str | Path],
     sec_paths: Sequence[str | Path],
     ref_orbits: Sequence[Path | None],
     sec_orbits: Sequence[Path | None],
-    reference_products: Sequence[object],
+    primary_products: Sequence[object],
     secondary_products: Sequence[object],
     swath_tuple: tuple[str, ...],
     units_by_swath: dict[str, list[tuple[int, int, int]]],
@@ -5361,7 +5361,7 @@ def _archive_burst_ifgs(
         burst_index: int,
     ) -> dict[str, object]:
         return {
-            "ref_path": ref_paths[frame_index],
+            "ref_path": primary_paths[frame_index],
             "sec_path": sec_paths[frame_index],
             "ref_orbit": ref_orbits[frame_index],
             "sec_orbit": sec_orbits[frame_index],
@@ -5379,7 +5379,7 @@ def _archive_burst_ifgs(
             int(scene_args["burst_index"]),
             Path(scene_args["ref_path"]),
             scene_args["ref_orbit"],
-            reference_products[int(scene_args["frame_index"])],
+            primary_products[int(scene_args["frame_index"])],
         )
         sec = load_burst(
             str(scene_args["swath"]),
@@ -5424,7 +5424,7 @@ def _archive_burst_ifgs(
                     "burst_index": burst_index,
                     "azimuth_offset": azimuth_offset,
                     "range_offset": range_offsets[swath],
-                    "ref_path": ref_paths[frame_index],
+                    "ref_path": primary_paths[frame_index],
                     "sec_path": sec_paths[frame_index],
                     "ref_orbit": ref_orbits[frame_index],
                     "sec_orbit": sec_orbits[frame_index],

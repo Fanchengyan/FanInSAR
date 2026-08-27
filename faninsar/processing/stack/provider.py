@@ -72,7 +72,7 @@ class SceneProductionCallback(Protocol):
 
     def __call__(
         self,
-        reference_path: SourceHandle,
+        primary_path: SourceHandle,
         secondary_path: SourceHandle,
         *,
         output_dir: Path,
@@ -141,7 +141,7 @@ class StackSceneProvider:
 
     def __call__(
         self,
-        reference_path: SourceHandle,
+        primary_path: SourceHandle,
         secondary_path: SourceHandle,
         *,
         output_dir: Path,
@@ -155,7 +155,7 @@ class StackSceneProvider:
                 self.unsupported_reason,
             )
         return self.produce_pair(
-            SourceHandle._from_source(reference_path),
+            SourceHandle._from_source(primary_path),
             SourceHandle._from_source(secondary_path),
             output_dir=output_dir,
             options=options,

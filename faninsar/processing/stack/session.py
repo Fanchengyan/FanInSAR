@@ -689,7 +689,7 @@ class Stack(Network):
 
     def _produce_pair(
         self,
-        reference_path: SourceHandle | Path | tuple[Path, ...],
+        primary_path: SourceHandle | Path | tuple[Path, ...],
         secondary_path: SourceHandle | Path | tuple[Path, ...],
         *,
         output_dir: Path,
@@ -713,7 +713,7 @@ class Stack(Network):
                 reason,
             )
         return self.scene_provider(
-            SourceHandle._from_source(reference_path),
+            SourceHandle._from_source(primary_path),
             SourceHandle._from_source(secondary_path),
             output_dir=output_dir,
             options=options,
@@ -1153,7 +1153,7 @@ class Stack(Network):
             if dates is not None
             else [d for d in self.catalog.dates if d != self.reference]
         )
-        reference_path = self.catalog.paths_for(self.reference)
+        primary_path = self.catalog.paths_for(self.reference)
         # Cache Reference identity product path (no self-coreg).
         reference_dir = self.config.work_dir / "coreg" / self.reference
         reference_dir.mkdir(parents=True, exist_ok=True)
@@ -1214,7 +1214,7 @@ class Stack(Network):
                 reference_orbit = orbit_paths.get(self.reference)
                 date_orbit = orbit_paths.get(date_id)
                 if reference_orbit is not None:
-                    pair_kwargs["reference_orbit_path"] = reference_orbit
+                    pair_kwargs["primary_orbit_path"] = reference_orbit
                 if date_orbit is not None:
                     pair_kwargs["secondary_orbit_path"] = date_orbit
             for extra_key in (
@@ -1228,7 +1228,7 @@ class Stack(Network):
             if geo_work is not None:
                 pair_kwargs["geo_work_dir"] = Path(geo_work) / date_id
             state = self._produce_pair(
-                reference_path,
+                primary_path,
                 self.catalog.paths_for(date_id),
                 output_dir=out,
                 multilook=self.config.multilook,
@@ -1334,14 +1334,14 @@ class Stack(Network):
                     reject_invalid_state(
                         "Stack scene generation missing; run coregister_scenes first"
                     )
-                reference_store = CoregisteredSceneStore.open(
+                primary_store = CoregisteredSceneStore.open(
                     self.coreg_paths[primary] / "scenes"
                 )
                 secondary_store = CoregisteredSceneStore.open(
                     self.coreg_paths[secondary] / "scenes"
                 )
                 expected_sources = {
-                    "primary": reference_store.manifest_digest,
+                    "primary": primary_store.manifest_digest,
                     "secondary": secondary_store.manifest_digest,
                     # The IFG manifest is also a runtime admission boundary:
                     # reusing bytes produced under another binary, Python,
@@ -1363,9 +1363,9 @@ class Stack(Network):
                     if (
                         existing_store.pair != (primary, secondary)
                         or existing_store.looks != looks
-                        or existing_store.domain != reference_store.domain
-                        or existing_store.wavelength_m != reference_store.wavelength_m
-                        or existing_store.grid_identity != reference_store.grid_identity
+                        or existing_store.domain != primary_store.domain
+                        or existing_store.wavelength_m != primary_store.wavelength_m
+                        or existing_store.grid_identity != primary_store.grid_identity
                         or existing_store.filter_name != expected_filter_name
                         or existing_store.filter_parameters
                         != expected_filter_parameters
@@ -1383,13 +1383,13 @@ class Stack(Network):
                         "partial IFG artifact directory exists without a manifest"
                     )
                 product = form_merged_scene_interferogram(
-                    reference_store,
+                    primary_store,
                     secondary_store,
-                    reference_role=(
-                        "reference" if primary == self.reference else "secondary"
+                    primary_role=(
+                        "primary" if primary == self.reference else "secondary"
                     ),
                     secondary_role=(
-                        "reference" if secondary == self.reference else "secondary"
+                        "primary" if secondary == self.reference else "secondary"
                     ),
                     multilook=looks,
                     goldstein_alpha=alpha,
@@ -1402,9 +1402,9 @@ class Stack(Network):
                     sub,
                     pair=(primary, secondary),
                     looks=looks,
-                    domain=reference_store.domain,
-                    wavelength_m=reference_store.wavelength_m,
-                    grid_identity=reference_store.grid_identity,
+                    domain=primary_store.domain,
+                    wavelength_m=primary_store.wavelength_m,
+                    grid_identity=primary_store.grid_identity,
                     filter_name=expected_filter_name,
                     filter_parameters=expected_filter_parameters,
                     source_manifest_digests=expected_sources,
@@ -1856,7 +1856,7 @@ class Stack(Network):
         **kwargs: Any,
     ) -> TimeSeriesResult:
         """Run Stack's existing inversion after Network generation admission."""
-        del _products, generation_id
+        del _products
         # Keep the IFG generation pinned for the complete analysis call.  The
         # solver reads the unwrap payloads before doing its numerical solve;
         # closing the stores immediately after those reads would allow a
@@ -1871,6 +1871,13 @@ class Stack(Network):
             ifg_root=kwargs.get("ifg_root"),
         )
         try:
+            observed_generation_id = hashlib.sha256(
+                "|".join(sorted(store.manifest_digest for store in stores)).encode()
+            ).hexdigest()
+            if observed_generation_id != generation_id:
+                reject_invalid_state(
+                    "Stack IFG artifacts changed after Network generation refresh"
+                )
             for store in stores:
                 store._lease.heartbeat()
             result = self.invert_timeseries(

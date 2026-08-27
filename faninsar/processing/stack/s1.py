@@ -17,7 +17,7 @@ logger = setup_logger(__name__)
 
 
 def _produce_s1_pair(
-    reference_path: SourceHandle,
+    primary_path: SourceHandle,
     secondary_path: SourceHandle,
     *,
     output_dir: Path,
@@ -26,22 +26,22 @@ def _produce_s1_pair(
     """Dispatch one admitted SAFE pair through the S1 production adapter."""
     from faninsar.processing.pipeline.production import produce_interferogram_pair
 
-    reference_sources = reference_path._resolve()
+    primary_sources = primary_path._resolve()
     secondary_sources = secondary_path._resolve()
 
     # Preserve the scalar callback shape for ordinary one-frame acquisitions;
     # frame stacks remain tuples and are consumed by the production adapter.
-    reference_input: Path | tuple[Path, ...] = (
-        reference_sources[0]
-        if len(reference_sources) == 1
-        else reference_sources
+    primary_input: Path | tuple[Path, ...] = (
+        primary_sources[0]
+        if len(primary_sources) == 1
+        else primary_sources
     )
     secondary_input: Path | tuple[Path, ...] = (
         secondary_sources[0] if len(secondary_sources) == 1 else secondary_sources
     )
 
     return produce_interferogram_pair(
-        reference_input,
+        primary_input,
         secondary_input,
         output_dir=output_dir,
         **options,

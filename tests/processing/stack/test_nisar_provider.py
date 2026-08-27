@@ -42,7 +42,7 @@ def test_nisar_range_offset_flatten_applies_nisar_ifg_sign() -> None:
     flattened, phase = _apply_range_offset_flatten(
         secondary,
         secondary_range,
-        reference_col_origin=12,
+        primary_col_origin=12,
         range_spacing_m=2.0,
         wavelength_m=4.0,
     )
