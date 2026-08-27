@@ -1,8 +1,9 @@
 """Canonical, path-based access to a FanInSAR acquisition Network.
 
-``Frame`` remains the reader for historical frame products.  ``Network`` is
-the stricter public seam: a product must carry a versioned manifest, a
-complete immutable generation, and the canonical interferogram index type.
+``Network`` is the strict public seam: a product must carry a versioned
+manifest, a complete immutable generation, and the canonical interferogram
+index type. Existing geometry, interferogram, and time-series Dataset
+components are reused internally; they do not define the Network lifecycle.
 External processor names are declaration-only adapters in this MVP; they do
 not probe or infer unrelated processor layouts.
 """
@@ -427,9 +428,9 @@ class Network(NetworkContract):
             / NETWORK_GENERATIONS_NAME
             / str(self.manifest["generation_id"])
         )
-        # Network owns the path-level data facade directly.  Frame remains a
-        # separate legacy Dataset entry point; sharing its component Dataset
-        # readers avoids inheriting its broader discovery and fallback rules.
+        # Network owns the path-level data facade directly. Sharing the
+        # component Dataset readers avoids inheriting broader discovery and
+        # fallback rules from an unrelated lifecycle facade.
         self._root = resolved_root
         geometry_root = resolved_root / "geometry"
         self._geometry = (
