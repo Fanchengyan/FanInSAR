@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from faninsar.logging import setup_logger
+from faninsar.processing.errors import reject_pair_configuration
 
 if TYPE_CHECKING:
     import numpy as np
@@ -105,11 +106,11 @@ def _resolve_dem_path(value: str, output: Path) -> Path:
 
 def _cli_dem_bounds(
     roi: BoundingBox | None,
-    reference: list[str],
+    source_paths: list[str],
 ) -> tuple[float, float, float, float]:
     """Return EPSG:4326 bounds for the CLI DEM build.
 
-    Uses ROI bounds or the union of every reference SAFE burst radar quad
+    Uses ROI bounds or the union of every source SAFE burst radar quad
     buffered by 2 km.
     """
     if roi is not None:
@@ -128,7 +129,7 @@ def _cli_dem_bounds(
     )
 
     quads: list[np.ndarray] = []
-    for path in reference:
+    for path in source_paths:
         product = open_safe_product(path)
         for swath_item in product.swaths:
             shape = (swath_item.lines_per_burst, swath_item.samples_per_burst)
@@ -153,9 +154,10 @@ def _cli_dem_bounds(
 
 def run_frame_cli(
     *,
-    reference: str,
-    secondary: str,
+    paths: str | None = None,
     output: str,
+    reference: str | None = None,
+    secondary: str | None = None,
     dem: str | None = None,
     reference_orbit: str | None = None,
     secondary_orbit: str | None = None,
@@ -168,12 +170,13 @@ def run_frame_cli(
     device: str = "cpu",
     dem_source: str | None = None,
 ) -> int:
-    """Run the unified pair production pipeline from the command line.
+    """Run the Stack lifecycle for an acquisition set from the command line.
 
-    ``reference``/``secondary`` may be comma-separated lists of SAFE products
-    spanning consecutive frames along the same pass. ``--roi`` takes
+    ``paths`` is a comma-separated list of SAFE products. ``--roi`` takes
     ``lon_min,lat_min,lon_max,lat_max`` (EPSG:4326) and selects the bursts
-    intersecting it, overriding ``--swaths``/``--bursts``.
+    intersecting it, overriding ``--swaths``/``--bursts``. The former
+    ``reference``/``secondary`` arguments are rejected with a typed migration
+    error so a pair-shaped invocation cannot bypass Stack admission.
 
     Returns
     -------
@@ -187,18 +190,27 @@ def run_frame_cli(
         converts this to a non-zero exit with the failure message).
 
     """
-    from faninsar.processing.geometry.dem import RasterDEM
-    from faninsar.processing.pipeline import run_pair
-    from faninsar.processing.pipeline.production import resolve_auto_dem
-
+    if reference is not None or secondary is not None:
+        reject_pair_configuration(
+            "faninsar frame no longer accepts --reference/--secondary; "
+            "provide all acquisitions with --paths"
+        )
+    source_paths = _as_path_list(paths or "")
+    if len(source_paths) < 2:
+        reject_pair_configuration(
+            "faninsar frame requires at least two SAFE paths via --paths"
+        )
     roi_box = _parse_roi(roi)
+    from faninsar.processing.geometry.dem import RasterDEM
+    from faninsar.processing.pipeline.production import resolve_auto_dem
+    from faninsar.processing.stack import Stack
+
     dem_sampler = None
     if dem is not None:
         dem_path = _resolve_dem_path(dem, Path(output))
         if not dem_path.exists():
-            bounds = _cli_dem_bounds(roi_box, _as_path_list(reference))
+            bounds = _cli_dem_bounds(roi_box, source_paths)
             # Shared datum-aware wrap rule; never wraps ellipsoidal sources.
-            # run_pair pins the returned sampler onto the admitted device.
             dem_sampler = resolve_auto_dem(
                 bounds,
                 output_dir=Path(output),
@@ -221,10 +233,9 @@ def run_frame_cli(
                 EGM96Geoid(),
             )
 
-    state = run_pair(
-        _as_path_list(reference),
-        _as_path_list(secondary),
-        output_dir=Path(output),
+    stack = Stack.from_safes(
+        source_paths,
+        work_dir=Path(output),
         dem=dem_sampler,
         roi=roi_box,
         swaths=tuple(name.strip() for name in swaths.split(",") if name.strip()),
@@ -232,15 +243,9 @@ def run_frame_cli(
         multilook=(az_looks, rg_looks),
         goldstein_alpha=goldstein,
         device=device,
-        dem_source=dem_source,
-        reference_orbit_path=(
-            _as_path_list(reference_orbit) if reference_orbit else None
-        ),
-        secondary_orbit_path=(
-            _as_path_list(secondary_orbit) if secondary_orbit else None
-        ),
+        activation_mode="reference",
+        coreg_mode="pair",
     )
-    assert state.complex_ifg is not None
-    logger.info("merged frame: %s", state.complex_ifg.shape)
-    logger.info("timings: %s", state.stage_timings_s)
+    stack.prepare_scenes().coregister_scenes().form_interferograms()
+    logger.info("formed %s interferogram product(s)", len(stack.ifg_dirs))
     return 0

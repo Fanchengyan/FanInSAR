@@ -43,14 +43,19 @@ def main(argv: list[str] | None = None) -> int:
         "frame", help="Process one or more frames, sub-swaths, or an ROI"
     )
     frame.add_argument(
+        "--paths",
+        default=None,
+        help="All acquisition SAFE products, comma-separated",
+    )
+    frame.add_argument(
         "--reference",
-        required=True,
-        help="Reference SAFE product(s), comma-separated for multiple frames",
+        default=None,
+        help="Removed pair-era option; use --paths",
     )
     frame.add_argument(
         "--secondary",
-        required=True,
-        help="Secondary SAFE product(s), comma-separated for multiple frames",
+        default=None,
+        help="Removed pair-era option; use --paths",
     )
     frame.add_argument("--output", required=True, help="Output directory")
     frame.add_argument("--dem", default=None, help="DEM GeoTIFF (optional)")
@@ -100,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_warmup(device=args.device, profile=args.profile)
     if args.command == "frame":
         from faninsar.cli.frame import run_frame_cli
+        from faninsar.processing.errors import PairConfigurationMigrationError
 
         if args.dem_source:
             # Fail closed BEFORE any pipeline work on unwired/unknown pairs.
@@ -117,22 +123,26 @@ def main(argv: list[str] | None = None) -> int:
                 except (ValueError, TypeError) as exc:
                     parser.exit(2, f"faninsar frame: error: {exc}\n")
 
-        return run_frame_cli(
-            reference=args.reference,
-            secondary=args.secondary,
-            output=args.output,
-            dem=args.dem,
-            reference_orbit=args.reference_orbit,
-            secondary_orbit=args.secondary_orbit,
-            swaths=args.swaths,
-            bursts=args.bursts,
-            roi=args.roi,
-            az_looks=args.az_looks,
-            rg_looks=args.rg_looks,
-            goldstein=args.goldstein,
-            device=args.device,
-            dem_source=args.dem_source,
-        )
+        try:
+            return run_frame_cli(
+                paths=args.paths,
+                reference=args.reference,
+                secondary=args.secondary,
+                output=args.output,
+                dem=args.dem,
+                reference_orbit=args.reference_orbit,
+                secondary_orbit=args.secondary_orbit,
+                swaths=args.swaths,
+                bursts=args.bursts,
+                roi=args.roi,
+                az_looks=args.az_looks,
+                rg_looks=args.rg_looks,
+                goldstein=args.goldstein,
+                device=args.device,
+                dem_source=args.dem_source,
+            )
+        except PairConfigurationMigrationError as exc:
+            parser.exit(2, f"faninsar frame: migration error: {exc}\n")
     parser.error(f"unknown command {args.command!r}")
     return 2
 

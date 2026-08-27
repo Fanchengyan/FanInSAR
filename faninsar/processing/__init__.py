@@ -27,6 +27,7 @@ from .coordinates import (
 from .errors import (
     GridMismatchError,
     InvalidProcessingStateError,
+    PairConfigurationMigrationError,
     ProcessingContractError,
 )
 from .provenance import ProcessingEvent, ProvenanceRecord, SoftwareIdentity
@@ -84,6 +85,7 @@ __all__ = [
     "OrbitMetadata",
     "OrbitStateVector",
     "PairProduct",
+    "PairConfigurationMigrationError",
     "ProcessTreeAdmission",
     "ProcessTreeMemoryWatchdog",
     "ProcessTreeSampler",

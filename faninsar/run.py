@@ -1,4 +1,4 @@
-"""Public ``run(config)`` front door."""
+"""Public Stack-oriented ``run(config)`` front door."""
 
 from __future__ import annotations
 
@@ -6,9 +6,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from faninsar.compute.numpy_backend import NumpyBackend
+from faninsar.logging import setup_logger
+from faninsar.processing.errors import reject_pair_configuration
 
 if TYPE_CHECKING:
     from faninsar.ports.compute import ComputeBackend
+
+logger = setup_logger(__name__)
 
 
 def run(
@@ -19,16 +23,16 @@ def run(
     backend: str | ComputeBackend = "numpy",
     fmt: str = "cog",
 ) -> Any:
-    """Run a pair or stack workflow from a config mapping or YAML path.
+    """Run a configured Stack workflow from a mapping or YAML path.
 
     Parameters
     ----------
     config : str, Path, or dict
-        Workflow configuration. Required keys for the pair path:
-
-        - ``reference`` / ``secondary``: SAFE URIs
-        - ``output``: output URI/directory
-    - optional ``swaths``, ``bursts``, ``roi``, ``multilook``, …
+        Stack configuration. ``paths`` (or ``sources``) must contain every
+        acquisition path and ``output`` identifies the Stack artifact root.
+        ``master`` (or the Stack-compatible ``reference`` date) optionally
+        selects the master acquisition. Pair-shaped ``reference`` plus
+        ``secondary`` configurations are rejected with a migration error.
 
     client : optional
         Injected Dask Client (never constructed here).
@@ -42,23 +46,70 @@ def run(
     Returns
     -------
     Any
-        Production pair state or workflow result.
+        The prepared and processed :class:`~faninsar.processing.stack.Stack`.
+
+    Raises
+    ------
+    PairConfigurationMigrationError
+        If a removed pair-shaped configuration is supplied.
+    ValueError
+        If required Stack fields are missing or unsupported options are used.
 
     """
     del client, store, fmt  # reserved for full YAML wiring (Phase 7)
     cfg = _load_config(config)
-    compute = _resolve_backend(backend)
-
-    reference = cfg.get("reference") or cfg.get("reference_path")
-    secondary = cfg.get("secondary") or cfg.get("secondary_path")
+    paths = cfg.get("paths") or cfg.get("sources")
     output = cfg.get("output") or cfg.get("output_dir")
-    if not reference or not secondary or not output:
-        message = (
-            "run() pair config requires 'reference', 'secondary', and 'output' keys"
-        )
+    _reject_legacy_pair_config(cfg, has_stack_paths=paths is not None)
+    if not paths or not output:
+        message = "run() Stack config requires 'paths' (or 'sources') plus 'output'"
+        logger.error(message)
         raise ValueError(message)
 
-    from faninsar.processing.pipeline import run_pair
+    raw_paths = [paths] if isinstance(paths, (str, Path)) else list(paths)
+    source_paths: list[str | Path] = []
+    for item in raw_paths:
+        if isinstance(item, (str, Path)):
+            source_paths.append(item)
+        else:
+            try:
+                source_paths.extend(item)
+            except TypeError as exc:
+                message = "run() Stack config paths must be path-like values"
+                logger.error(message)
+                raise TypeError(message) from exc
+    if len(source_paths) < 2:
+        message = "run() Stack config requires at least two acquisition paths"
+        logger.error(message)
+        raise ValueError(message)
+
+    unsupported = sorted(
+        {
+            key
+            for key in (
+                "dead_pixel_amp_threshold",
+                "esd_enabled",
+                "amplitude_refinement_enabled",
+                "geoid_correction",
+                "unwrap_method",
+            )
+            if key in cfg
+        }
+    )
+    if unsupported:
+        message = (
+            "run() Stack config contains unsupported stage options: "
+            + ", ".join(unsupported)
+        )
+        logger.error(message)
+        raise ValueError(message)
+
+    # Resolve the requested backend only after the shape and required fields
+    # have been admitted. The Stack remains the sole public execution seam.
+    compute = _resolve_backend(backend)
+    del compute
+
+    from faninsar.processing.stack import Stack
 
     kwargs: dict[str, Any] = {}
     if "swaths" in cfg:
@@ -75,23 +126,66 @@ def run(
         "dem",
         "multilook",
         "goldstein_alpha",
-        "dead_pixel_amp_threshold",
-        "esd_enabled",
-        "amplitude_refinement_enabled",
         "control_spacing",
         "executor",
         "device",
         "reference_orbit_path",
         "secondary_orbit_path",
-        "geoid_correction",
+        "coreg_mode",
+        "coregistration_grid",
+        "geo_grid",
+        "invert_device",
+        "activation_binding",
+        "activation_token",
+        "activation_authority_root",
+        "retain_pair_states",
+        "record_scientific_lineage",
     ):
         if key in cfg:
             kwargs[key] = cfg[key]
-    if cfg.get("unwrap") or cfg.get("unwrap_method") is not None:
-        kwargs["unwrap"] = True
-    # backend reserved for stage-level dispatch; production uses torch executor today
-    del compute
-    return run_pair(reference, secondary, output_dir=output, **kwargs)
+    stack = Stack.from_safes(
+        source_paths,
+        work_dir=output,
+        master=cfg.get("master", cfg.get("reference")),
+        activation_mode=cfg.get("activation_mode", "reference"),
+        **kwargs,
+    )
+    overwrite = bool(cfg.get("overwrite", False))
+    stack.prepare_scenes().coregister_scenes().form_interferograms(
+        overwrite=overwrite,
+    )
+    if cfg.get("unwrap"):
+        stack.unwrap()
+    return stack
+
+
+def _reject_legacy_pair_config(
+    cfg: dict[str, Any],
+    *,
+    has_stack_paths: bool,
+) -> None:
+    """Reject removed pair-shaped fields before Stack or backend dispatch."""
+    secondary_keys = {"secondary", "secondary_path"} & cfg.keys()
+    reference_path = "reference_path" in cfg
+    if secondary_keys or reference_path or ("reference" in cfg and not has_stack_paths):
+        fields = sorted(
+            {
+                key
+                for key in (
+                    "reference",
+                    "secondary",
+                    "reference_path",
+                    "secondary_path",
+                )
+                if key in cfg
+            }
+        )
+        detail = ", ".join(fields) or "reference/secondary"
+        reject_pair_configuration(
+            "run() no longer accepts pair-shaped configuration fields "
+            f"({detail}); provide all acquisitions under 'paths' or 'sources' "
+            "and select an optional Stack 'master' instead"
+        )
 
 
 def _load_config(config: str | Path | dict[str, Any]) -> dict[str, Any]:

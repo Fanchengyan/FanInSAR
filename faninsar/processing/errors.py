@@ -13,6 +13,15 @@ class ProcessingContractError(RuntimeError):
     """Base error for invalid processing metadata or state transitions."""
 
 
+class PairConfigurationMigrationError(ProcessingContractError):
+    """Raised when a removed pair configuration reaches a Stack boundary.
+
+    Pair-shaped execution is retained only as an internal implementation
+    detail.  Public callers must provide a Stack configuration containing all
+    source scenes under ``paths`` or ``sources``.
+    """
+
+
 class InvalidProcessingStateError(ProcessingContractError):
     """Raised when a processing stage violates the product state machine."""
 
@@ -91,3 +100,20 @@ def reject_grid_mismatch(message: str) -> Never:
     """
     logger.error("processing grid rejected: %s", message)
     raise GridMismatchError(message)
+
+
+def reject_pair_configuration(message: str) -> Never:
+    """Log and reject a legacy pair-shaped public configuration.
+
+    Parameters
+    ----------
+    message : str
+        Migration guidance explaining the Stack configuration boundary.
+
+    Raises
+    ------
+    PairConfigurationMigrationError
+        Always raised after the rejection is logged.
+    """
+    logger.error("legacy pair configuration rejected: %s", message)
+    raise PairConfigurationMigrationError(message)
