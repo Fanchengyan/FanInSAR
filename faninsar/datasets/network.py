@@ -53,10 +53,19 @@ class LegacyNetworkLayoutError(NetworkConstructionError):
         )
 
 
+class NetworkAnalysisError(NetworkConstructionError):
+    """Base error raised when a Network cannot schedule analysis."""
+
+
+class IncompleteNetworkProductError(NetworkAnalysisError):
+    """Raised when required interferogram products are absent or incomplete."""
+
+
 # Short aliases make the typed failure categories discoverable without making
 # callers depend on the implementation's longer class names.
 NetworkLayoutError = LegacyNetworkLayoutError
 LegacyLayoutError = LegacyNetworkLayoutError
+IncompleteNetworkError = IncompleteNetworkProductError
 
 
 def _legacy_markers(root: Path) -> tuple[Path, ...]:
@@ -140,6 +149,18 @@ class Network(Frame):
         # Frame is the concrete implementation.  Calling super() directly
         # keeps Network a real class while preserving all Dataset behavior.
         super().__init__(resolved_root)
+        metadata = self.interferograms.index_metadata if self.interferograms else None
+        if metadata is not None:
+            product_type = metadata.get("type")
+            if isinstance(product_type, str) and product_type.startswith("Frame"):
+                marker = self.interferograms.root / "interferograms_index.json"
+                message = (
+                    "Frame metadata is not a canonical Network product; rebuild "
+                    f"the interferogram index at {marker}"
+                )
+                logger.error(message)
+                raise LegacyNetworkLayoutError(resolved_root, (marker,))
+        self._product_index = None
 
     @classmethod
     def from_path(cls, root: str | PathLike[str]) -> Self:
@@ -158,6 +179,108 @@ class Network(Frame):
         """
         return cls(root)
 
+    @property
+    def product_index(self) -> Any:
+        """Return the validated logical product index, when registered."""
+        return self._product_index
+
+    def register_products(self, products: Any) -> Any:
+        """Register one homogeneous set of logical product records.
+
+        Product records contain locators and lineage only; Dataset objects are
+        still opened internally by the Network data layer.  Registration
+        rejects duplicate keys or mixed analysis cohorts before solving.
+
+        Parameters
+        ----------
+        products : iterable of NetworkProduct
+            Logical product records to register.
+
+        Returns
+        -------
+        NetworkProductIndex
+            The validated index retained by this Network.
+
+        """
+        from faninsar.core.network import NetworkProductIndex
+
+        try:
+            index = NetworkProductIndex(tuple(products)).homogeneous()
+        except (TypeError, ValueError) as exc:
+            message = f"Network product registration rejected: {exc}"
+            logger.exception(message)
+            raise NetworkConstructionError(message) from exc
+        self._product_index = index
+        return index
+
+    def analyze_time_series(
+        self,
+        *,
+        solver: str = "sbas",
+        model: Any | None = None,
+        pairs: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run time-series analysis over the Network's committed products.
+
+        Dataset discovery remains internal to :class:`Network`; callers pass
+        solver options, not raster objects.  The method consumes the existing
+        ``InterferogramStack`` seam and fails before solver construction when
+        no complete unwrapped product set is available.
+
+        Parameters
+        ----------
+        solver : {"sbas", "nsbas"}, default="sbas"
+            Time-series solver family.
+        model : object, optional
+            Optional NSBAS temporal model.
+        pairs : Pairs, optional
+            Optional homogeneous subset of registered pairs.
+        **kwargs : Any
+            Solver keyword arguments.
+
+        Returns
+        -------
+        Any
+            Existing FanInSAR time-series result type.
+
+        Raises
+        ------
+        ValueError
+            If products are absent or *solver* is unknown.
+
+        """
+        if self.interferograms is None:
+            message = "Network has no interferogram products to analyze"
+            logger.error(message)
+            raise IncompleteNetworkProductError(message)
+        if self.interferograms.index_metadata is not None:
+            product_type = self.interferograms.index_metadata.get("type")
+            if product_type not in {None, "NetworkInterferogramIndex"}:
+                message = "Network product index is not a canonical Network index"
+                logger.error(message)
+                raise IncompleteNetworkProductError(message)
+        try:
+            stack = self.to_ifg_stack(pairs=pairs)
+        except Exception as exc:
+            if isinstance(exc, NetworkAnalysisError):
+                raise
+            message = f"Network products cannot be opened for analysis: {exc}"
+            logger.exception(message)
+            raise IncompleteNetworkProductError(message) from exc
+        normalized_solver = solver.lower()
+        if normalized_solver == "sbas":
+            from faninsar.timeseries.invert import SBAS
+
+            return SBAS.solve(stack, **kwargs)
+        if normalized_solver == "nsbas":
+            from faninsar.timeseries.invert import invert
+
+            return invert(stack, model=model, **kwargs)
+        message = f"unknown Network time-series solver {solver!r}"
+        logger.error(message)
+        raise ValueError(message)
+
     def __repr__(self) -> str:
         """Return a concise Network summary."""
         parts = [f"Network(root={self.root!r})"]
@@ -169,11 +292,44 @@ class Network(Frame):
         return "\n".join(parts)
 
 
+class ISCE2Network(Network):
+    """Network adapter for products authored by ISCE2.
+
+    The adapter intentionally reuses the canonical path contract.  Format
+    discovery is explicit at the class boundary and never probes unrelated
+    processor layouts.
+    """
+
+
+class ISCE3Network(Network):
+    """Network adapter for products authored by ISCE3."""
+
+
+class GAMMANetwork(Network):
+    """Network adapter for products authored by GAMMA."""
+
+
+class GMTSARNetwork(Network):
+    """Network adapter for products authored by GMTSAR."""
+
+
+class SNAPNetwork(Network):
+    """Network adapter for products authored by SNAP."""
+
+
 __all__ = [
+    "GAMMANetwork",
+    "GMTSARNetwork",
+    "ISCE2Network",
+    "ISCE3Network",
+    "IncompleteNetworkError",
+    "IncompleteNetworkProductError",
     "LegacyLayoutError",
     "LegacyNetworkLayoutError",
     "Network",
+    "NetworkAnalysisError",
     "NetworkConstructionError",
     "NetworkLayoutError",
     "NetworkPathError",
+    "SNAPNetwork",
 ]

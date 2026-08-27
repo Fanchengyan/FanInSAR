@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING, Any
 
 from faninsar.logging import setup_logger
 from faninsar.processing.pipeline.products import PairProductArrays
-from faninsar.processing.pipeline.workflow import PairWorkflowState, run_pair_workflow
+from faninsar.processing.pipeline.workflow import (
+    PairWorkflowState,
+    execute_pair_workflow,
+)
 
 if TYPE_CHECKING:
     from faninsar.processing.tops.deramp import TOPSCarrierModel
@@ -28,7 +31,7 @@ class PairPipelineResult:
     state: PairWorkflowState
 
 
-def run_pair_pipeline(
+def execute_pair_pipeline(
     primary: str | Path,
     secondary: str | Path,
     *,
@@ -47,13 +50,13 @@ def run_pair_pipeline(
     _ = (carrier, metadata, pair_id)
     if not isinstance(primary, (str, Path)) or not isinstance(secondary, (str, Path)):
         message = (
-            "run_pair_pipeline requires SAFE paths so deramp/coreg/geocode "
+            "the pair pipeline requires SAFE paths so deramp/coreg/geocode "
             "use annotation metadata."
         )
         logger.error(message)
         raise TypeError(message)
 
-    state = run_pair_workflow(
+    state = execute_pair_workflow(
         primary,
         secondary,
         output_dir=output_dir,

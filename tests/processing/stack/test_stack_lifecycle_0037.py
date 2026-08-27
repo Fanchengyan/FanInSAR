@@ -72,13 +72,16 @@ def test_s1_provider_owns_pair_dispatch(
     )
     calls: list[tuple[object, object]] = []
 
-    def fake_run_pair(reference: object, secondary: object, **kwargs: object) -> object:
+    def fake_producer(
+        reference: object, secondary: object, **kwargs: object
+    ) -> object:
         calls.append((reference, secondary))
         assert kwargs["output_dir"] == tmp_path / "pair"
         return SimpleNamespace()
 
     monkeypatch.setattr(
-        "faninsar.processing.pipeline.production.run_pair", fake_run_pair
+        "faninsar.processing.pipeline.production.produce_interferogram_pair",
+        fake_producer,
     )
     stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")
     assert calls == [(source[0], source[1])]

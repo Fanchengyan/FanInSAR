@@ -84,7 +84,7 @@ def default_pair_list(scene_ids: Sequence[str]) -> list[tuple[str, str]]:
     return [(a, b) for a, b in combinations(ordered, 2)]
 
 
-def run_stack_pipeline(
+def execute_stack_pipeline(
     scene_paths: Iterable[str | Path],
     *,
     output_dir: str | Path,
@@ -171,7 +171,7 @@ def run_stack_pipeline(
     """
     if height != 256 or width != 256:
         warnings.warn(
-            "run_stack_pipeline height/width are deprecated no-ops; "
+            "height/width are deprecated no-ops; "
             "production uses full burst",
             DeprecationWarning,
             stacklevel=2,

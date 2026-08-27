@@ -190,6 +190,11 @@ def run_frame_cli(
         converts this to a non-zero exit with the failure message).
 
     """
+    if reference_orbit is not None or secondary_orbit is not None:
+        reject_pair_configuration(
+            "faninsar frame no longer accepts pair-specific orbit options; "
+            "provide a Stack orbit mapping instead"
+        )
     if reference is not None or secondary is not None:
         reject_pair_configuration(
             "faninsar frame no longer accepts --reference/--secondary; "

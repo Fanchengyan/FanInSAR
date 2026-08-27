@@ -2459,7 +2459,7 @@ def stage_interferogram(
     dead_pixel_amp_threshold : float, optional
         SLC amplitude below which a pixel is excluded from the multilook
         average (dead-pixel masking). Set to 0 to disable. The production
-        entry point :func:`run_pair` passes 3.0 for real S1
+        Stack provider entry point passes 3.0 for real S1
         data; synthetic tests use the default 0.
     device : {"auto", "cpu", "cuda", "mps"}, optional
         Numerical device. CPU and CUDA use the unified Torch kernels; MPS uses
@@ -3538,7 +3538,7 @@ def _auto_dem_bounds(
     Parameters
     ----------
     roi : BoundingBox, Polygons, or None
-        ROI passed to run_pair.
+        ROI passed to the Stack provider.
     resolved : dict
         Selected burst indices per (frame_index, swath).
     reference_products : list
@@ -3644,7 +3644,7 @@ def resolve_auto_dem(
     """Build (or reuse) the automatic DEM mosaic and apply one wrap rule.
 
     This is the single datum-aware DEM entry point shared by
-    :func:`run_pair`, :func:`_run_pair_sweep`, and ``faninsar frame``:
+    the Stack provider, its sweep helper, and ``faninsar frame``:
     :class:`GeoidAdjustedDEM` is applied only when ``geoid_correction`` is
     requested AND the live selection's registry metadata declares an
     orthometric vertical datum; ellipsoidal sources are returned unwrapped.
@@ -3885,7 +3885,7 @@ def _swath_range_offsets(
 
 
 @overload
-def run_pair(
+def produce_interferogram_pair(
     reference_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
@@ -3932,7 +3932,7 @@ def run_pair(
 
 
 @overload
-def run_pair(
+def produce_interferogram_pair(
     reference_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
@@ -3978,7 +3978,7 @@ def run_pair(
 ) -> ProductionPairSweepResult: ...
 
 
-def run_pair(
+def produce_interferogram_pair(
     reference_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
@@ -4164,7 +4164,7 @@ def run_pair(
             "n_jobs > 1; use n_jobs=1 for device-local admission"
         )
     if not _is_multilook_pair(multilook) or coregistration_grid == "geo":
-        return _run_pair_sweep(
+        return _produce_interferogram_sweep(
             reference_path,
             secondary_path,
             output_dir=output_dir,
@@ -4301,7 +4301,9 @@ def run_pair(
             )
 
     if roi is not None:
-        logger.info("run_pair: ROI provided; explicit swaths/bursts selection ignored")
+        logger.info(
+            "Stack provider: ROI provided; explicit swaths/bursts selection ignored"
+        )
         ordered = sorted(
             reference_products[0].swaths,
             key=lambda item: item.slant_range_time_s,
@@ -4858,7 +4860,7 @@ def run_pair(
     return result
 
 
-def _run_pair_sweep(
+def _produce_interferogram_sweep(
     reference_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
@@ -5040,7 +5042,9 @@ def _run_pair_sweep(
             )
 
     if roi is not None:
-        logger.info("run_pair: ROI provided; explicit swaths/bursts selection ignored")
+        logger.info(
+            "Stack provider: ROI provided; explicit swaths/bursts selection ignored"
+        )
         ordered = sorted(
             reference_products[0].swaths,
             key=lambda item: item.slant_range_time_s,

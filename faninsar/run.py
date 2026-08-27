@@ -30,9 +30,10 @@ def run(
     config : str, Path, or dict
         Stack configuration. ``paths`` (or ``sources``) must contain every
         acquisition path and ``output`` identifies the Stack artifact root.
-        ``master`` (or the Stack-compatible ``reference`` date) optionally
-        selects the master acquisition. Pair-shaped ``reference`` plus
-        ``secondary`` configurations are rejected with a migration error.
+        ``reference`` optionally selects the Stack-wide Reference acquisition.
+        Pair-shaped ``reference`` plus ``secondary`` configurations are
+        rejected with a migration error; the removed ``master`` key is also
+        rejected rather than silently translated.
 
     client : optional
         Injected Dask Client (never constructed here).
@@ -76,7 +77,7 @@ def run(
                 source_paths.extend(item)
             except TypeError as exc:
                 message = "run() Stack config paths must be path-like values"
-                logger.error(message)
+                logger.exception(message)
                 raise TypeError(message) from exc
     if len(source_paths) < 2:
         message = "run() Stack config requires at least two acquisition paths"
@@ -129,8 +130,7 @@ def run(
         "control_spacing",
         "executor",
         "device",
-        "reference_orbit_path",
-        "secondary_orbit_path",
+        "orbit_paths",
         "coreg_mode",
         "coregistration_grid",
         "geo_grid",
@@ -146,7 +146,7 @@ def run(
     stack = Stack.from_safes(
         source_paths,
         work_dir=output,
-        master=cfg.get("master", cfg.get("reference")),
+        reference=cfg.get("reference"),
         activation_mode=cfg.get("activation_mode", "reference"),
         **kwargs,
     )
@@ -165,7 +165,17 @@ def _reject_legacy_pair_config(
     has_stack_paths: bool,
 ) -> None:
     """Reject removed pair-shaped fields before Stack or backend dispatch."""
-    secondary_keys = {"secondary", "secondary_path"} & cfg.keys()
+    secondary_keys = {
+        "secondary",
+        "secondary_path",
+        "secondary_orbit_path",
+        "reference_orbit_path",
+    } & cfg.keys()
+    if "master" in cfg:
+        reject_pair_configuration(
+            "run() no longer accepts the removed 'master' key; use the Stack "
+            "'reference' field"
+        )
     reference_path = "reference_path" in cfg
     if secondary_keys or reference_path or ("reference" in cfg and not has_stack_paths):
         fields = sorted(
@@ -175,7 +185,9 @@ def _reject_legacy_pair_config(
                     "reference",
                     "secondary",
                     "reference_path",
+                    "reference_orbit_path",
                     "secondary_path",
+                    "secondary_orbit_path",
                 )
                 if key in cfg
             }
@@ -184,7 +196,7 @@ def _reject_legacy_pair_config(
         reject_pair_configuration(
             "run() no longer accepts pair-shaped configuration fields "
             f"({detail}); provide all acquisitions under 'paths' or 'sources' "
-            "and select an optional Stack 'master' instead"
+            "and select an optional Stack 'reference' instead"
         )
 
 

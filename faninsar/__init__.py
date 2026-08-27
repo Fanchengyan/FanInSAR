@@ -51,35 +51,70 @@ from faninsar._public import __all__ as _public_all
 # Network is loaded lazily: importing its Dataset-backed implementation while
 # this package is still initializing would make the existing Dataset imports
 # observe a partially initialized ``faninsar`` module.
-__all__ = [*_public_all, "Network"]  # noqa: F405, PLE0604
+_NETWORK_EXPORTS = (
+    "Network",
+    "Stack",
+)
+__all__ = [*_public_all, *_NETWORK_EXPORTS]  # noqa: PLE0604
 
 
 def __getattr__(name: str) -> Any:
     """Lazily expose the path-based Network public seam and its errors."""
     if name in {
+        "GAMMANetwork",
+        "GMTSARNetwork",
+        "ISCE2Network",
+        "ISCE3Network",
+        "IncompleteNetworkError",
+        "IncompleteNetworkProductError",
         "LegacyLayoutError",
         "LegacyNetworkLayoutError",
         "Network",
+        "NetworkAnalysisError",
         "NetworkConstructionError",
         "NetworkLayoutError",
         "NetworkPathError",
+        "NISARStack",
+        "SNAPNetwork",
+        "S1Stack",
+        "Stack",
     }:
         from faninsar.datasets.network import (
+            GAMMANetwork,
+            GMTSARNetwork,
+            IncompleteNetworkError,
+            IncompleteNetworkProductError,
+            ISCE2Network,
+            ISCE3Network,
             LegacyLayoutError,
             LegacyNetworkLayoutError,
             Network,
+            NetworkAnalysisError,
             NetworkConstructionError,
             NetworkLayoutError,
             NetworkPathError,
+            SNAPNetwork,
         )
+        from faninsar.processing.stack import NISARStack, S1Stack, Stack
 
         values = {
+            "GAMMANetwork": GAMMANetwork,
+            "GMTSARNetwork": GMTSARNetwork,
+            "ISCE2Network": ISCE2Network,
+            "ISCE3Network": ISCE3Network,
+            "IncompleteNetworkError": IncompleteNetworkError,
+            "IncompleteNetworkProductError": IncompleteNetworkProductError,
             "LegacyLayoutError": LegacyLayoutError,
             "LegacyNetworkLayoutError": LegacyNetworkLayoutError,
             "Network": Network,
+            "NetworkAnalysisError": NetworkAnalysisError,
             "NetworkConstructionError": NetworkConstructionError,
             "NetworkLayoutError": NetworkLayoutError,
             "NetworkPathError": NetworkPathError,
+            "NISARStack": NISARStack,
+            "SNAPNetwork": SNAPNetwork,
+            "S1Stack": S1Stack,
+            "Stack": Stack,
         }
         return values[name]
     msg = f"module {__name__!r} has no attribute {name!r}"

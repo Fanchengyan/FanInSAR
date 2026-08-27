@@ -18,12 +18,20 @@ from .geogrid import GeoGrid as GeoBox
 from .hierarchical import HierarchicalDataset
 from .ifg import CoherenceDataset, InterferogramDataset
 from .network import (
+    GAMMANetwork,
+    GMTSARNetwork,
+    IncompleteNetworkError,
+    IncompleteNetworkProductError,
+    ISCE2Network,
+    ISCE3Network,
     LegacyLayoutError,
     LegacyNetworkLayoutError,
     Network,
+    NetworkAnalysisError,
     NetworkConstructionError,
     NetworkLayoutError,
     NetworkPathError,
+    SNAPNetwork,
 )
 from .xarray_dataset import XarrayDataset
 
