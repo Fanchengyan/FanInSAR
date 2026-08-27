@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
+from faninsar.core.network import Network as NetworkContract
 from faninsar.logging import setup_logger
 
 from .frame.frame import Frame
@@ -200,7 +201,7 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
     return root_manifest
 
 
-class Network(Frame):
+class Network(Frame, NetworkContract):
     """Concrete path-based view of one canonical InSAR Network."""
 
     def __init__(self, root: str | PathLike[str]) -> None:
