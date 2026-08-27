@@ -232,9 +232,7 @@ class CoregisteredSceneStore:
         for raw in raw_units:
             if not isinstance(raw, dict):
                 reject_invalid_state("scene manifest unit must be an object")
-            primary = _safe_payload_path(
-                path, raw.get("primary_file"), "primary_file"
-            )
+            primary = _safe_payload_path(path, raw.get("primary_file"), "primary_file")
             secondary = _safe_payload_path(
                 path, raw.get("secondary_file"), "secondary_file"
             )
@@ -457,9 +455,7 @@ def write_scene_unit(
             or existing.get("reference_id") != reference_id
             or existing.get("domain") != domain
         ):
-            reject_invalid_state(
-                "scene units must share date, Reference, and domain"
-            )
+            reject_invalid_state("scene units must share date, Reference, and domain")
         existing_grid_shape = existing.get("grid_shape")
         if existing_grid_shape is not None and existing_grid_shape != list(
             resolved_grid_shape
@@ -681,9 +677,7 @@ def form_merged_scene_interferogram(
             if primary_role not in valid_roles or secondary_role not in valid_roles:
                 reject_invalid_state("unsupported scene payload role")
             primary = primary_ref if primary_role == "primary" else primary_sec
-            secondary = (
-                secondary_ref if secondary_role == "primary" else secondary_sec
-            )
+            secondary = secondary_ref if secondary_role == "primary" else secondary_sec
             product = form_interferogram(
                 primary,
                 secondary,
@@ -750,9 +744,7 @@ def form_merged_scene_interferogram(
                     f"scene unit {tag!r} grid placement differs across dates"
                 )
             primary = primary_ref if primary_role == "primary" else primary_sec
-            secondary = (
-                secondary_ref if secondary_role == "primary" else secondary_sec
-            )
+            secondary = secondary_ref if secondary_role == "primary" else secondary_sec
             valid_roles = {"primary", "secondary"}
             if primary_role not in valid_roles or secondary_role not in valid_roles:
                 reject_invalid_state("unsupported scene payload role")

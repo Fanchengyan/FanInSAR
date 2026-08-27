@@ -1033,13 +1033,10 @@ def make_nisar_scene_provider(
     """
     if "master" in legacy:
         reject_pair_configuration(
-            "make_nisar_scene_provider no longer accepts 'master'; "
-            "use 'reference'"
+            "make_nisar_scene_provider no longer accepts 'master'; use 'reference'"
         )
     if legacy:
-        reject_invalid_state(
-            f"unsupported NISAR provider options: {sorted(legacy)}"
-        )
+        reject_invalid_state(f"unsupported NISAR provider options: {sorted(legacy)}")
     if reference is None:
         reject_invalid_state("NISAR provider Reference date is required")
 
@@ -1316,9 +1313,7 @@ def make_nisar_scene_provider(
                     secondary_samples = None
             except KeyError as error:
                 reject_invalid_state(f"NISAR source handle is unavailable: {error}")
-            primary_radar = _radar_crop(
-                primary_product, primary_samples, tile_bounds
-            )
+            primary_radar = _radar_crop(primary_product, primary_samples, tile_bounds)
             if full_scene:
                 assert dense_mapping is not None
                 if secondary_samples is None:
@@ -1492,9 +1487,9 @@ def make_nisar_scene_provider(
                         "source": str(primary_source),
                         "source_id": admitted_sources[primary_date][0],
                         "source_digest": admitted_sources[primary_date][1],
-                        "admission_policy": admission_lineage.get(
-                            primary_date, {}
-                        ).get("policy"),
+                        "admission_policy": admission_lineage.get(primary_date, {}).get(
+                            "policy"
+                        ),
                         "channel": f"{channel[0]}/{channel[1]}",
                         "lineage": "primary",
                         "dem_identity": dem_identity,

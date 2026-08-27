@@ -32,9 +32,7 @@ def _produce_s1_pair(
     # Preserve the scalar callback shape for ordinary one-frame acquisitions;
     # frame stacks remain tuples and are consumed by the production adapter.
     primary_input: Path | tuple[Path, ...] = (
-        primary_sources[0]
-        if len(primary_sources) == 1
-        else primary_sources
+        primary_sources[0] if len(primary_sources) == 1 else primary_sources
     )
     secondary_input: Path | tuple[Path, ...] = (
         secondary_sources[0] if len(secondary_sources) == 1 else secondary_sources

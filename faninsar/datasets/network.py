@@ -270,9 +270,7 @@ def _validate_manifest(
             not isinstance(content_digest, str)
             or _SHA256_RE.fullmatch(content_digest) is None
         ):
-            message = (
-                f"Network product record {position} has no content_digest: {path}"
-            )
+            message = f"Network product record {position} has no content_digest: {path}"
             logger.error(message)
             raise NetworkManifestError(message)
         lineage = product.get("lineage")
@@ -280,9 +278,7 @@ def _validate_manifest(
             not isinstance(lineage, list)
             or not lineage
             or any(
-                not isinstance(item, str)
-                or not item.strip()
-                or item != item.strip()
+                not isinstance(item, str) or not item.strip() or item != item.strip()
                 for item in lineage
             )
         ):
@@ -379,8 +375,7 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
     generation_root = generations / str(generation_id)
     if not generation_root.is_dir() or generation_root.is_symlink():
         message = (
-            "Network generation directory is missing or unsafe: "
-            f"{generation_root}"
+            f"Network generation directory is missing or unsafe: {generation_root}"
         )
         logger.error(message)
         raise NetworkCurrentError(message)
@@ -529,6 +524,7 @@ class Network(NetworkContract):
             unwrapped=unwrapped,
             coherence=coherence,
         )
+
     @classmethod
     def from_path(cls, root: str | PathLike[str]) -> Self:
         """Construct a Network from a canonical filesystem path."""

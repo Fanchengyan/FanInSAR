@@ -704,6 +704,7 @@ class Stack(Network):
             from faninsar.processing.stack.provider import (
                 UnsupportedStackCapabilityError,
             )
+
             mission = "Stack"
             capability = "scene-production"
             reason = "no mission scene provider was admitted"
@@ -1512,9 +1513,7 @@ class Stack(Network):
         self,
         generation_id: str,
         products: (
-            NetworkProductIndex
-            | tuple[NetworkProduct, ...]
-            | list[NetworkProduct]
+            NetworkProductIndex | tuple[NetworkProduct, ...] | list[NetworkProduct]
         ),
     ) -> Self:
         """Atomically refresh the inherited Network product index."""

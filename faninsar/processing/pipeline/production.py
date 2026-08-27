@@ -129,6 +129,7 @@ def _merge_coreg_stage_times(
     for key, value in coregistration_timings_s.items():
         stage_times[f"coreg.{key}"] = float(value)
 
+
 SPEED_OF_LIGHT_M_S = 299_792_458.0
 ScopeMode = Literal["burst", "swath"]
 CoregistrationGrid = Literal["radar", "geo"]
@@ -2394,9 +2395,7 @@ def stage_coregister(
             col0=0 if window_origin is None else window_origin[1],
             native_height=state.reference.array.samples.shape[0],
         )
-    state.coregistration_timings_s["radar_reramp"] = _clock_stop(
-        device, reramp_started
-    )
+    state.coregistration_timings_s["radar_reramp"] = _clock_stop(device, reramp_started)
     state.secondary_aligned = sec_resamp
     radar_offset_digest: str | None = None
     radar_range_phase_digest: str | None = None
@@ -4318,9 +4317,7 @@ def produce_interferogram_pair(
         )
     else:
         burst_counts = {
-            (frame_index, swath): len(
-                primary_products[frame_index].swath(swath).bursts
-            )
+            (frame_index, swath): len(primary_products[frame_index].swath(swath).bursts)
             for frame_index in range(frame_count)
             for swath in swath_tuple
         }
@@ -4370,8 +4367,7 @@ def produce_interferogram_pair(
     primary_swath0 = primary_products[0].swath(swath_tuple[0])
     dt = primary_swath0.azimuth_time_interval_s
     burst_lines = {
-        swath: primary_products[0].swath(swath).lines_per_burst
-        for swath in swath_tuple
+        swath: primary_products[0].swath(swath).lines_per_burst for swath in swath_tuple
     }
     burst_width = {
         swath: primary_products[0].swath(swath).samples_per_burst
@@ -5059,9 +5055,7 @@ def _produce_interferogram_sweep(
         )
     else:
         burst_counts = {
-            (frame_index, swath): len(
-                primary_products[frame_index].swath(swath).bursts
-            )
+            (frame_index, swath): len(primary_products[frame_index].swath(swath).bursts)
             for frame_index in range(frame_count)
             for swath in swath_tuple
         }
@@ -5111,8 +5105,7 @@ def _produce_interferogram_sweep(
     primary_swath0 = primary_products[0].swath(swath_tuple[0])
     dt = primary_swath0.azimuth_time_interval_s
     burst_lines = {
-        swath: primary_products[0].swath(swath).lines_per_burst
-        for swath in swath_tuple
+        swath: primary_products[0].swath(swath).lines_per_burst for swath in swath_tuple
     }
     burst_width = {
         swath: primary_products[0].swath(swath).samples_per_burst
