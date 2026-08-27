@@ -15,8 +15,10 @@ from faninsar.core.network import (
     NetworkProduct,
     NetworkProductIndex,
     NetworkProductKey,
+    Network,
     PhaseConvention,
 )
+from faninsar.processing.stack.session import Stack
 
 
 def _key(acquisition_id: str, *, swath: str = "IW1") -> AcquisitionKey:
@@ -151,3 +153,50 @@ def test_unknown_phase_convention_and_transform_operation_fail_closed() -> None:
             PhaseConvention.PRIMARY_MINUS_SECONDARY,
             AssetTransformOperation.COMPLEX_CONJUGATE,
         )
+
+
+def test_network_analysis_is_fail_closed_until_generation_refresh() -> None:
+    """The analysis seam cannot run before a complete generation is admitted."""
+
+    class ConcreteNetwork(Network):
+        """Test implementation recording the generation passed to analysis."""
+
+        def _analyze_network_products(
+            self,
+            products: NetworkProductIndex,
+            *,
+            generation_id: str,
+        ) -> tuple[str, int]:
+            return generation_id, len(products.products)
+
+    network = ConcreteNetwork()
+    assert not network.analysis_ready
+    with pytest.raises(RuntimeError, match="before"):
+        network.analyze_time_series()
+
+    product = _product()
+    network.refresh_generation("generation-a", (product,))
+    assert network.analysis_ready
+    assert network.analyze_time_series() == ("generation-a", 1)
+
+
+def test_invalid_refresh_does_not_replace_previous_generation() -> None:
+    """Generation replacement is atomic with respect to cohort validation."""
+    network = Network()
+    network.refresh_generation("generation-a", (_product(),))
+    with pytest.raises(ValueError, match="homogeneous"):
+        network.refresh_generation("generation-b", (_product(), _product(swath="IW2")))
+    assert network.network_generation_id == "generation-a"
+    assert network.analysis_ready
+
+
+def test_stack_analysis_delegates_through_network_base(monkeypatch) -> None:
+    """Stack uses inherited Network admission before its existing inversion."""
+    stack = object.__new__(Stack)
+    stack.refresh_generation("generation-a", (_product(),))
+    monkeypatch.setattr(
+        stack,
+        "invert_timeseries",
+        lambda **_: "inversion-result",
+    )
+    assert stack.analyze_time_series() == "inversion-result"

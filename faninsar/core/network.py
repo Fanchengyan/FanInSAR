@@ -404,10 +404,97 @@ class NetworkProductIndex:
                 actual = (*product.primary.cohort, product.geometry_identity)
                 if actual != expected:
                     logger.error("Network product index mixes analysis cohorts")
-                    raise ValueError(
-                        "Network analysis requires one homogeneous cohort"
-                    )
+                    raise ValueError("Network analysis requires one homogeneous cohort")
         return self
+
+
+class Network:
+    """Small analysis base that owns a generation-scoped product index.
+
+    ``Network`` deliberately knows nothing about raster decoding.  A concrete
+    Network or Stack supplies ``_analyze_network_products``; this base class
+    validates and snapshots the immutable product records before dispatching
+    analysis.  The snapshot prevents an index replacement from mixing product
+    generations during one call.
+    """
+
+    _network_generation_id: str | None = None
+    _network_product_index: NetworkProductIndex | None = None
+
+    @property
+    def network_generation_id(self) -> str | None:
+        """Return the committed generation currently visible to analysis."""
+        return getattr(self, "_network_generation_id", None)
+
+    @property
+    def network_product_index(self) -> NetworkProductIndex | None:
+        """Return the immutable Network product index, if refreshed."""
+        return getattr(self, "_network_product_index", None)
+
+    @property
+    def analysis_ready(self) -> bool:
+        """Whether a complete, homogeneous Network generation is available."""
+        return (
+            self.network_generation_id is not None
+            and self.network_product_index is not None
+        )
+
+    def refresh_generation(
+        self,
+        generation_id: str,
+        products: (
+            NetworkProductIndex | tuple[NetworkProduct, ...] | list[NetworkProduct]
+        ),
+    ) -> Self:
+        """Atomically replace the product index for one committed generation.
+
+        Parameters
+        ----------
+        generation_id : str
+            Stable committed generation identity.
+        products : NetworkProductIndex or sequence of NetworkProduct
+            Products read from that generation.  Validation completes before
+            either field on this object is changed.
+
+        Raises
+        ------
+        ValueError
+            If the generation identity is empty or products are mixed.
+
+        """
+        _require_text(generation_id, "generation_id")
+        index = (
+            products
+            if isinstance(products, NetworkProductIndex)
+            else NetworkProductIndex(tuple(products))
+        )
+        if not index.products:
+            logger.error("Network generation contains no products")
+            raise ValueError("Network generation requires at least one product")
+        index.homogeneous()
+        object.__setattr__(self, "_network_product_index", index)
+        object.__setattr__(self, "_network_generation_id", generation_id)
+        return self
+
+    def analyze_time_series(self, *args: Any, **kwargs: Any) -> Any:
+        """Analyze the currently refreshed generation through the concrete seam."""
+        index = self.network_product_index
+        generation_id = self.network_generation_id
+        if generation_id is None or index is None:
+            logger.error("Network analysis requested before generation refresh")
+            raise RuntimeError(
+                "Network analysis is unavailable before a complete generation refresh"
+            )
+        callback = getattr(self, "_analyze_network_products", None)
+        if not callable(callback):
+            logger.error("Network has no concrete analysis implementation")
+            raise NotImplementedError(
+                "concrete Network must implement _analyze_network_products"
+            )
+        # Keep a local immutable reference for the whole call.  A concurrent
+        # refresh may advance the object for the next call, but cannot alter
+        # this invocation's product cohort.
+        return callback(index, *args, generation_id=generation_id, **kwargs)
 
 
 # ``NetworkProductRecord`` is the descriptive name used in manifest-oriented
@@ -420,6 +507,7 @@ __all__ = [
     "AssetKind",
     "AssetTransform",
     "AssetTransformOperation",
+    "Network",
     "NetworkProduct",
     "NetworkProductIndex",
     "NetworkProductKey",

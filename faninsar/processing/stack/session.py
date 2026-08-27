@@ -24,6 +24,16 @@ from typing import TYPE_CHECKING, Any, ParamSpec, Self, TypeVar
 
 import numpy as np
 
+from faninsar.core.network import (
+    AcquisitionKey,
+    AssetKind,
+    AssetTransform,
+    Network as NetworkContract,
+    NetworkProduct,
+    NetworkProductIndex,
+    NetworkProductKey,
+    PhaseConvention,
+)
 from faninsar.datasets.network import Network
 from faninsar.logging import setup_logger
 from faninsar.processing.coreg.misreg_network import (
@@ -386,6 +396,8 @@ class Stack(Network):
     unwrap_result: StackUnwrapResult | None = None
     _prepared: bool = False
     _generation: StackResultGeneration | None = field(default=None, repr=False)
+    _network_generation_id: str | None = field(default=None, repr=False)
+    _network_product_index: NetworkProductIndex | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Initialize the inherited Network analysis surface lazily.
@@ -1093,7 +1105,7 @@ class Stack(Network):
         try:
             self.date_misreg = invert_pair_misregistration(
                 self.arcs,
-                master=ref,
+                reference=ref,
                 dates=list(self.catalog.dates),
                 min_n_valid=min_n_valid,
                 max_sigma_px=max_sigma_px,
@@ -1109,7 +1121,7 @@ class Stack(Network):
         out.write_text(
             json.dumps(
                 {
-                    "reference": self.date_misreg.master,
+                    "reference": self.date_misreg.reference,
                     "azimuth_px": dict(self.date_misreg.azimuth_px),
                     "range_px": dict(self.date_misreg.range_px),
                     "metadata": dict(self.date_misreg.metadata),
@@ -1181,7 +1193,7 @@ class Stack(Network):
                     marker_data.get("reference") != self.reference
                     or marker_data.get("date") != date_id
                     or marker_data.get("coreg_identity") != coreg_identity
-                    or store.master_id != self.reference
+                    or store.reference_id != self.reference
                     or store.date_id != date_id
                     or store.domain != self.config.coregistration_grid
                 ):
@@ -1398,6 +1410,97 @@ class Stack(Network):
                     amplitude=product.amplitude,
                 )
                 self.ifg_dirs.append(sub)
+        self._refresh_network_from_ifg_dirs()
+        return self
+
+    def _refresh_network_from_ifg_dirs(self) -> None:
+        """Refresh inherited Network state from complete IFG artifacts.
+
+        Product records are created only from manifest-validated artifact
+        stores.  Validation completes before the immutable Network index is
+        replaced, so a partial or mixed generation leaves the previous index
+        untouched.
+        """
+        from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
+
+        if not self.ifg_dirs:
+            reject_invalid_state(
+                "Stack cannot refresh Network products without IFG artifacts"
+            )
+
+        dimensions = self.config.extra
+        frame = str(dimensions.get("frame_id", "stack"))
+        swath = str(dimensions.get("swath", "merged"))
+        channel = str(dimensions.get("channel", "merged"))
+        polarization = str(dimensions.get("polarization", "merged"))
+        products: list[NetworkProduct] = []
+        manifest_digests: list[str] = []
+        seen_paths: set[Path] = set()
+        for raw_path in self.ifg_dirs:
+            path = Path(raw_path)
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            store = InterferogramArtifactStore.open(path)
+            try:
+                primary, secondary = store.pair
+                primary_key = AcquisitionKey(
+                    primary, frame, swath, channel, polarization
+                )
+                secondary_key = AcquisitionKey(
+                    secondary, frame, swath, channel, polarization
+                )
+                kind = AssetKind.COMPLEX_INTERFEROGRAM
+                products.append(
+                    NetworkProduct(
+                        key=NetworkProductKey(primary_key, secondary_key, kind),
+                        asset_location=str(store.generation_root / "complex_ifg.npy"),
+                        geometry_identity=store.grid_identity,
+                        source_software="faninsar",
+                        phase_convention=PhaseConvention.PRIMARY_MINUS_SECONDARY,
+                        asset_transform=AssetTransform.for_convention(
+                            kind, PhaseConvention.PRIMARY_MINUS_SECONDARY
+                        ),
+                        content_digest=store.manifest_digest,
+                        lineage=(store.manifest_digest,),
+                    )
+                )
+                manifest_digests.append(store.manifest_digest)
+            finally:
+                store.close()
+
+        if not products:
+            reject_invalid_state("Stack IFG generation contains no products")
+        generation_id = hashlib.sha256(
+            "|".join(sorted(manifest_digests)).encode("utf-8")
+        ).hexdigest()
+        self.refresh_generation(generation_id, tuple(products))
+
+    @property
+    def network_generation_id(self) -> str | None:
+        """Return the committed Network generation visible to analysis."""
+        return self._network_generation_id
+
+    @property
+    def network_product_index(self) -> NetworkProductIndex | None:
+        """Return the immutable Network product index, if refreshed."""
+        return self._network_product_index
+
+    @property
+    def analysis_ready(self) -> bool:
+        """Whether a complete Network generation is available for analysis."""
+        return (
+            self._network_generation_id is not None
+            and self._network_product_index is not None
+        )
+
+    def _refresh_network_generation(
+        self,
+        generation_id: str,
+        products: NetworkProductIndex | tuple[NetworkProduct, ...] | list[NetworkProduct],
+    ) -> Self:
+        """Atomically refresh the inherited Network product index."""
+        NetworkContract.refresh_generation(self, generation_id, products)
         return self
 
     @_reclaim_after_stage
@@ -1712,13 +1815,24 @@ class Stack(Network):
             message = f"unsupported Stack time-series solver {solver!r}"
             logger.error(message)
             raise ValueError(message)
-        if self.unwrap_result is None:
+        if hasattr(self, "unwrap_result") and self.unwrap_result is None:
             message = (
                 "Stack Network analysis is unavailable before committed "
                 "interferograms are unwrapped"
             )
             logger.error(message)
             raise ValueError(message)
+        return NetworkContract.analyze_time_series(self, **kwargs)
+
+    def _analyze_network_products(
+        self,
+        _products: NetworkProductIndex,
+        *,
+        generation_id: str,
+        **kwargs: Any,
+    ) -> TimeSeriesResult:
+        """Run Stack's existing inversion after Network generation admission."""
+        del _products, generation_id
         return self.invert_timeseries(**kwargs)
 
     def estimate_ionosphere(self, **kwargs: Any) -> list[Any]:
@@ -1828,7 +1942,14 @@ class Stack(Network):
             )
         return generation
 
-    def refresh_generation(self) -> StackResultGeneration:
+    def refresh_generation(
+        self,
+        generation_id: str | None = None,
+        products: NetworkProductIndex
+        | tuple[NetworkProduct, ...]
+        | list[NetworkProduct]
+        | None = None,
+    ) -> StackResultGeneration | Self:
         """Refresh the pinned derived-result generation from durable storage.
 
         A caller that keeps a Stack object alive across a new publication can
@@ -1837,6 +1958,13 @@ class Stack(Network):
         :meth:`open_generation`, so incomplete or mismatched generations fail
         closed.
         """
+        if generation_id is not None or products is not None:
+            if generation_id is None or products is None:
+                reject_invalid_state(
+                    "Network generation refresh requires id and products together"
+                )
+            return self._refresh_network_generation(generation_id, products)
+
         previous = self._generation
         if previous is not None:
             previous.close()
