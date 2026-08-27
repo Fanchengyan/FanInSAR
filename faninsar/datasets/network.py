@@ -104,16 +104,20 @@ def _read_manifest(path: Path) -> dict[str, Any]:
         logger.error(message)
         raise NetworkManifestError(message)
     try:
-        if path.stat().st_size > _MAX_MANIFEST_BYTES:
-            message = f"Network manifest exceeds size limit: {path}"
-            logger.error(message)
-            raise NetworkManifestError(message)
+        size = path.stat().st_size
+    except OSError as exc:
+        message = f"Network manifest cannot be read: {path}"
+        logger.exception(message)
+        raise NetworkManifestError(message) from exc
+    if size > _MAX_MANIFEST_BYTES:
+        message = f"Network manifest exceeds size limit: {path}"
+        logger.error(message)
+        raise NetworkManifestError(message)
+    try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except NetworkManifestError:
-        raise
     except (OSError, UnicodeError, ValueError) as exc:
         message = f"Network manifest cannot be read: {path}"
-        logger.error("%s: %s", message, exc)
+        logger.exception(message)
         raise NetworkManifestError(message) from exc
     if not isinstance(data, dict):
         message = f"Network manifest must be an object: {path}"
@@ -210,11 +214,11 @@ class Network(Frame, NetworkContract):
             resolved_root = Path(root)
         except TypeError as exc:
             message = f"Network root must be path-like, got {root!r}"
-            logger.error(message)
+            logger.exception(message)
             raise NetworkConstructionError(message) from exc
         if not resolved_root.exists() or not resolved_root.is_dir():
             message = f"Network directory not found: {resolved_root}"
-            logger.error(message)
+            logger.exception(message)
             raise NetworkPathError(message)
         self.manifest = _validate_network_layout(resolved_root)
         self.generation_root = (
@@ -227,7 +231,7 @@ class Network(Frame, NetworkContract):
         index = self.interferograms.index_metadata if self.interferograms else None
         if index is None:
             message = "Network interferograms have no canonical index"
-            logger.error(message)
+            logger.exception(message)
             raise IncompleteNetworkProductError(message)
         index_type = index.get("type", index.get("index_type"))
         if index_type != NETWORK_INDEX_TYPE:
@@ -262,7 +266,7 @@ class Network(Frame, NetworkContract):
             index = NetworkProductIndex(tuple(products)).homogeneous()
         except (TypeError, ValueError) as exc:
             message = f"Network product registration rejected: {exc}"
-            logger.error(message)
+            logger.exception(message)
             raise NetworkConstructionError(message) from exc
         self._product_index = index
         return index
@@ -288,7 +292,7 @@ class Network(Frame, NetworkContract):
             stack = self.to_ifg_stack(pairs=pairs)
         except Exception as exc:
             message = f"Network products cannot be opened for analysis: {exc}"
-            logger.error(message)
+            logger.exception(message)
             raise IncompleteNetworkProductError(message) from exc
         normalized_solver = solver.lower()
         if normalized_solver == "sbas":
@@ -300,7 +304,7 @@ class Network(Frame, NetworkContract):
 
             return invert(stack, model=model, **kwargs)
         message = f"unknown Network time-series solver {solver!r}"
-        logger.error(message)
+        logger.exception(message)
         raise ValueError(message)
 
     def __repr__(self) -> str:
@@ -369,13 +373,13 @@ __all__ = [
     "GMTSARNetwork",
     "ISCE2Network",
     "ISCE3Network",
-    "IncompleteNetworkProductError",
     "IncompleteNetworkError",
+    "IncompleteNetworkProductError",
     "LegacyLayoutError",
     "LegacyNetworkLayoutError",
     "Network",
-    "NetworkConstructionError",
     "NetworkAnalysisError",
+    "NetworkConstructionError",
     "NetworkCurrentError",
     "NetworkGenerationError",
     "NetworkLayoutError",

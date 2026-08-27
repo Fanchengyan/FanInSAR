@@ -28,11 +28,13 @@ from faninsar.core.network import (
     AcquisitionKey,
     AssetKind,
     AssetTransform,
-    Network as NetworkContract,
     NetworkProduct,
     NetworkProductIndex,
     NetworkProductKey,
     PhaseConvention,
+)
+from faninsar.core.network import (
+    Network as NetworkContract,
 )
 from faninsar.datasets.network import Network
 from faninsar.logging import setup_logger
@@ -1497,7 +1499,11 @@ class Stack(Network):
     def _refresh_network_generation(
         self,
         generation_id: str,
-        products: NetworkProductIndex | tuple[NetworkProduct, ...] | list[NetworkProduct],
+        products: (
+            NetworkProductIndex
+            | tuple[NetworkProduct, ...]
+            | list[NetworkProduct]
+        ),
     ) -> Self:
         """Atomically refresh the inherited Network product index."""
         NetworkContract.refresh_generation(self, generation_id, products)

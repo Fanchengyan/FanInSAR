@@ -1,3 +1,5 @@
+from typing import Any
+
 import odc.geo.xr  # ensure odc is loaded when using datasets
 
 from .aps import ApsDataset, ApsPairs
@@ -19,10 +21,10 @@ from .network import (
     ExternalNetworkLayoutError,
     GAMMANetwork,
     GMTSARNetwork,
-    ISCE2Network,
-    ISCE3Network,
     IncompleteNetworkError,
     IncompleteNetworkProductError,
+    ISCE2Network,
+    ISCE3Network,
     LegacyNetworkLayoutError,
     Network,
     NetworkAnalysisError,
@@ -37,7 +39,7 @@ from .network import (
 from .xarray_dataset import XarrayDataset
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     """Lazy loaders rehomed under :mod:`faninsar.io.datasets`."""
     if name == "HyP3S1":
         from faninsar.io.datasets.hyp3 import HyP3S1
@@ -51,4 +53,5 @@ def __getattr__(name: str):
         from faninsar.io.datasets.aria import ARIA
 
         return ARIA
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    message = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(message)
