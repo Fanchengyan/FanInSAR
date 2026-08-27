@@ -17,7 +17,9 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+from collections import Counter
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
+from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ParamSpec, Self, TypeVar
@@ -1431,6 +1433,8 @@ class Stack(Network):
             )
 
         dimensions = self.config.extra
+        expected_pairs = tuple(_iter_pair_dates(self.pairs))
+        expected_counts = Counter(expected_pairs)
         frame = str(dimensions.get("frame_id", "stack"))
         swath = str(dimensions.get("swath", "merged"))
         channel = str(dimensions.get("channel", "merged"))
@@ -1438,6 +1442,7 @@ class Stack(Network):
         products: list[NetworkProduct] = []
         manifest_digests: list[str] = []
         seen_paths: set[Path] = set()
+        actual_pairs: list[tuple[str, str]] = []
         for raw_path in self.ifg_dirs:
             path = Path(raw_path)
             if path in seen_paths:
@@ -1446,11 +1451,12 @@ class Stack(Network):
             store = InterferogramArtifactStore.open(path)
             try:
                 primary, secondary = store.pair
+                actual_pairs.append(_canonical_pair_strings((primary, secondary)))
                 primary_key = AcquisitionKey(
-                    primary, frame, swath, channel, polarization
+                    actual_pairs[-1][0], frame, swath, channel, polarization
                 )
                 secondary_key = AcquisitionKey(
-                    secondary, frame, swath, channel, polarization
+                    actual_pairs[-1][1], frame, swath, channel, polarization
                 )
                 kind = AssetKind.COMPLEX_INTERFEROGRAM
                 products.append(
@@ -1473,6 +1479,13 @@ class Stack(Network):
 
         if not products:
             reject_invalid_state("Stack IFG generation contains no products")
+        actual_counts = Counter(actual_pairs)
+        if actual_counts != expected_counts:
+            reject_invalid_state(
+                "Stack IFG product pair set does not exactly match the configured "
+                f"Pair network: expected={dict(expected_counts)!r}, "
+                f"discovered={dict(actual_counts)!r}"
+            )
         generation_id = hashlib.sha256(
             "|".join(sorted(manifest_digests)).encode("utf-8")
         ).hexdigest()
@@ -2142,6 +2155,22 @@ def _iter_pair_dates(pairs: Pairs) -> list[tuple[str, str]]:
         pair = Pair(values)
         out.append((pair.primary_string(), pair.secondary_string()))
     return out
+
+
+def _canonical_pair_strings(values: tuple[str, str]) -> tuple[str, str]:
+    """Normalize persisted pair roles through the FanInSAR :class:`Pair` type."""
+    from faninsar.core.pairs import Pair
+
+    try:
+        pair = Pair(
+            tuple(
+                datetime.strptime(value, "%Y%m%d").replace(tzinfo=UTC)
+                for value in values
+            )
+        )
+    except (TypeError, ValueError):
+        reject_invalid_state(f"Stack IFG artifact has an invalid Pair: {values!r}")
+    return pair.primary_string(), pair.secondary_string()
 
 
 def _normalize_multilook(

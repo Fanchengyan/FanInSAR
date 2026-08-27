@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from faninsar.datasets.network import (
     ExternalNetworkLayoutError,
@@ -33,8 +36,22 @@ def _write_layout(
         "status": "complete",
         "generation_id": generation,
         "index_type": index_type,
+        "phase_convention": "primary_minus_secondary",
         "products": (
-            products if products is not None else [{"id": "20240101_20240113"}]
+            products
+            if products is not None
+            else [
+                {
+                    "id": "20240101_20240113",
+                    "primary_id": "20240101",
+                    "secondary_id": "20240113",
+                    "product_kind": "complex_interferogram",
+                    "asset_location": "interferograms/20240101_20240113/complex.npy",
+                    "geometry_identity": "grid-1",
+                    "source_software": "faninsar",
+                    "phase_convention": "primary_minus_secondary",
+                }
+            ]
         ),
     }
     if source_software is not None:
@@ -42,7 +59,14 @@ def _write_layout(
     root.mkdir(parents=True, exist_ok=True)
     (root / "manifest.json").write_text(json.dumps(payload), encoding="utf-8")
     (root / "CURRENT").write_text(
-        json.dumps({"generation_id": generation}), encoding="utf-8"
+        json.dumps(
+            {
+                "schema_version": "network_current_v1",
+                "status": "complete",
+                "generation_id": generation,
+            }
+        ),
+        encoding="utf-8",
     )
     generation_root = root / ".network_generations" / generation
     generation_root.mkdir(parents=True)
@@ -106,6 +130,47 @@ def test_network_rejects_missing_generation(tmp_path: Path) -> None:
         path.unlink()
     generation_root.rmdir()
     with pytest.raises(NetworkGenerationError):
+        Network(root)
+
+
+@pytest.mark.parametrize(
+    "current_update",
+    [
+        {"schema_version": "network_v0"},
+        {"schema_version": "network_current_v1", "status": "writing"},
+        {"schema_version": "network_current_v1", "status": "complete"},
+    ],
+)
+def test_network_rejects_unversioned_or_incomplete_current(
+    tmp_path: Path, current_update: dict[str, str]
+) -> None:
+    """CURRENT is a versioned complete pointer, not a bare generation ID."""
+    root = tmp_path / "network"
+    _write_layout(root)
+    (root / "CURRENT").write_text(json.dumps(current_update), encoding="utf-8")
+    with pytest.raises(NetworkGenerationError, match="CURRENT"):
+        Network(root)
+
+
+def test_network_rejects_incomplete_product_record(tmp_path: Path) -> None:
+    """A product record must carry all stable identity and asset fields."""
+    root = tmp_path / "network"
+    _write_layout(root, products=[{"id": "20240101_20240113"}])
+    with pytest.raises(NetworkManifestError, match="primary_id"):
+        Network(root)
+
+
+def test_network_rejects_generation_product_set_mismatch(tmp_path: Path) -> None:
+    """The root index and immutable generation must describe one product set."""
+    root = tmp_path / "network"
+    _write_layout(root)
+    generation_manifest = (
+        root / ".network_generations" / "generation-1" / "manifest.json"
+    )
+    payload = json.loads(generation_manifest.read_text())
+    payload["products"][0]["id"] = "20240201_20240213"
+    generation_manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(NetworkGenerationError, match="product set"):
         Network(root)
 
 

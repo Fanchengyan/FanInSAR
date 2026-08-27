@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -422,117 +421,6 @@ def stage_write(
     state.zarr_path = zarr_path
     state.stac_path = stac_path
     state._note(f"WRITE {zarr_path} {stac_path}")
-    return state
-
-
-def _run_pair_workflow(
-    reference_path: str | Path,
-    secondary_path: str | Path,
-    *,
-    output_dir: str | Path,
-    swath: str = "IW1",
-    burst_index: int = 0,
-    height: int = 256,
-    width: int = 256,
-    multilook: tuple[int, int] = (2, 8),
-    goldstein_alpha: float = 0.5,
-    dem: DEMSampler | None = None,
-    geocode_stride: int = 2,
-    executor: str = "torch",
-    device: str = "auto",
-    snaphu_config: SnaphuConfig | None = None,
-) -> PairWorkflowState:
-    """Run the windowed educational pair workflow internally (deprecated).
-
-    This remains available only to the legacy compatibility implementation.
-    Public callers should use the acquisition-set
-    :class:`~faninsar.processing.stack.Stack` lifecycle.
-
-
-    Stages
-    ------
-    1. ``stage_read_scene`` for reference and secondary
-    2. ``stage_deramp``
-    3. ``stage_coregister`` (geometry prior + correlation + resample + reramp)
-    4. ``stage_interferogram``
-    5. ``stage_unwrap``
-    6. ``stage_geocode``
-    7. ``stage_write``
-
-    Parameters
-    ----------
-    reference_path, secondary_path : path
-        SAFE ZIP/directory paths.
-    output_dir : path
-        Product directory.
-    swath, burst_index : optional
-        Sub-swath and burst selection.
-    height, width : int, optional
-        Radar window size used for this run.
-    multilook, goldstein_alpha : optional
-        Interferogram parameters.
-    dem : DEMSampler, optional
-        DEM for geocoding. Defaults to zero-height ellipsoid.
-    geocode_stride : int, optional
-        Subsampling for geocode solve.
-    executor : {"torch"}, optional
-        Unified Torch Lanczos path for coreg resampling.
-    device : {"auto","cpu","cuda","mps"}, optional
-        Torch compute device. Default ``"auto"``.
-    snaphu_config : SnaphuConfig, optional
-        snaphu-py configuration.
-
-    Returns
-    -------
-    PairWorkflowState
-        Full intermediate state including paths and stage log.
-
-    """
-    warnings.warn(
-        "_run_pair_workflow is private and deprecated; use Stack for production",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    reference = stage_read_scene(
-        reference_path,
-        swath=swath,
-        burst_index=burst_index,
-        height=height,
-        width=width,
-    )
-    secondary = stage_read_scene(
-        secondary_path,
-        swath=swath,
-        burst_index=burst_index,
-        height=height,
-        width=width,
-        row_offset=100,
-        col_offset=100,
-    )
-    # Align secondary window origin to the same radar crop when possible.
-    if secondary.samples.shape != reference.samples.shape:
-        reject_invalid_state("reference/secondary windows must share a shape")
-
-    pair_id = f"{reference.scene_id}_{secondary.scene_id}"
-    state = PairWorkflowState(
-        pair_id=pair_id,
-        reference=reference,
-        secondary=secondary,
-    )
-    state._note("START pair workflow")
-    state = stage_deramp(state)
-    state = stage_coregister(state, executor=executor, device=device)
-    state = stage_interferogram(
-        state,
-        multilook=multilook,
-        goldstein_alpha=goldstein_alpha,
-    )
-    if snaphu_config is None:
-        snaphu_config = SnaphuConfig(nlooks=float(multilook[0] * multilook[1]))
-    state = stage_unwrap(state, config=snaphu_config)
-    state = stage_geocode(state, dem=dem, stride=geocode_stride, device=device)
-    state = stage_write(state, output_dir)
-    state._note("DONE")
     return state
 
 

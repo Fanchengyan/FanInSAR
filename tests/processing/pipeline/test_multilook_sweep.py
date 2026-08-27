@@ -17,7 +17,8 @@ from faninsar.missions.sentinel1.errors import Sentinel1ProductError
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import ConstantHeightDEM
 from faninsar.processing.merge.grid import GeoGridSpec
-from faninsar.processing.pipeline import ProductionPairState, run_pair
+from faninsar.processing.pipeline import ProductionPairState
+from faninsar.processing.pipeline.production import produce_interferogram_pair
 from faninsar.processing.pipeline import production as production_mod
 from faninsar.processing.pipeline.production import (
     SharedPairResources,
@@ -521,7 +522,7 @@ def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None
     sec_swath = open_safe_product(secondary).swath("IW1")
     if not _common_burst_indices(ref_swath, sec_swath):
         pytest.skip("no common IW1 burst between the first two scenes")
-    single = run_pair(
+    single = produce_interferogram_pair(
         reference,
         secondary,
         output_dir=tmp_path / "single",
@@ -531,7 +532,7 @@ def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None
         goldstein_alpha=0.0,
         unwrap=False,
     )
-    sweep = run_pair(
+    sweep = produce_interferogram_pair(
         reference,
         secondary,
         output_dir=tmp_path / "sweep",
@@ -804,7 +805,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
     assert geo_state.geocoded_slc_valid is None
     assert geo_state.geo_height_field is None
     assert lut.az_full._mmap.closed
-    single = run_pair(
+    single = produce_interferogram_pair(
         "reference.SAFE",
         "secondary.SAFE",
         output_dir=tmp_path / "single-out",

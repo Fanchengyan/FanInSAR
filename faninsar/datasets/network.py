@@ -13,7 +13,13 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from faninsar.core.network import Network as NetworkContract
+from faninsar.core.network import (
+    AssetKind,
+    PhaseConvention,
+)
+from faninsar.core.network import (
+    Network as NetworkContract,
+)
 from faninsar.logging import setup_logger
 
 from .frame.frame import Frame
@@ -28,7 +34,18 @@ NETWORK_MANIFEST_NAME = "manifest.json"
 NETWORK_CURRENT_NAME = "CURRENT"
 NETWORK_GENERATIONS_NAME = ".network_generations"
 NETWORK_INDEX_TYPE = "NetworkInterferogramIndex"
+NETWORK_CURRENT_SCHEMA_VERSION = "network_current_v1"
 _MAX_MANIFEST_BYTES = 1024 * 1024
+_REQUIRED_PRODUCT_FIELDS = (
+    "id",
+    "primary_id",
+    "secondary_id",
+    "product_kind",
+    "asset_location",
+    "geometry_identity",
+    "source_software",
+    "phase_convention",
+)
 
 
 class NetworkConstructionError(RuntimeError):
@@ -163,7 +180,90 @@ def _validate_manifest(
         message = f"Network product index is empty or missing: {path}"
         logger.error(message)
         raise IncompleteNetworkProductError(message)
+    phase_convention = manifest.get("phase_convention")
+    if not isinstance(phase_convention, str) or not phase_convention.strip():
+        message = f"Network manifest has no phase_convention: {path}"
+        logger.error(message)
+        raise NetworkManifestError(message)
+    try:
+        PhaseConvention(phase_convention)
+    except (TypeError, ValueError) as error:
+        message = f"unknown Network phase_convention {phase_convention!r}: {path}"
+        logger.exception(message)
+        raise NetworkManifestError(message) from error
+    product_ids: set[str] = set()
+    for position, product in enumerate(products):
+        if not isinstance(product, dict):
+            message = f"Network product record {position} is not an object: {path}"
+            logger.error(message)
+            raise NetworkManifestError(message)
+        for field_name in _REQUIRED_PRODUCT_FIELDS:
+            value = product.get(field_name)
+            if not isinstance(value, str) or not value.strip():
+                message = (
+                    f"Network product record {position} has no {field_name}: {path}"
+                )
+                logger.error(message)
+                raise NetworkManifestError(message)
+        product_id = product["id"]
+        if product_id in product_ids:
+            message = f"Network product IDs are not unique: {product_id!r}"
+            logger.error(message)
+            raise NetworkManifestError(message)
+        product_ids.add(product_id)
+        if product["primary_id"] == product["secondary_id"]:
+            message = f"Network product has identical Pair roles: {product_id!r}"
+            logger.error(message)
+            raise NetworkManifestError(message)
+        try:
+            AssetKind(product["product_kind"])
+        except (TypeError, ValueError) as error:
+            message = (
+                f"unknown Network product_kind {product['product_kind']!r}: {path}"
+            )
+            logger.exception(message)
+            raise NetworkManifestError(message) from error
+        if product["phase_convention"] != phase_convention:
+            message = (
+                f"Network product phase_convention disagrees with manifest: {path}"
+            )
+            logger.error(message)
+            raise NetworkManifestError(message)
     return manifest
+
+
+def _product_set(manifest: dict[str, Any]) -> tuple[str, ...]:
+    """Return a deterministic signature for a manifest's product records."""
+    products = manifest["products"]
+    return tuple(
+        sorted(
+            json.dumps(product, sort_keys=True, separators=(",", ":"))
+            for product in products
+        )
+    )
+
+
+def _validate_current(path: Path, *, expected_generation: str) -> dict[str, Any]:
+    """Validate the versioned pointer to the selected Network generation."""
+    current = _read_manifest(path)
+    if current.get("schema_version") != NETWORK_CURRENT_SCHEMA_VERSION:
+        message = f"unsupported Network CURRENT version at {path}"
+        logger.error(message)
+        raise NetworkCurrentError(message)
+    if current.get("status") != "complete":
+        message = f"Network CURRENT is not complete: {path}"
+        logger.error(message)
+        raise NetworkCurrentError(message)
+    generation_id = current.get("generation_id")
+    if not isinstance(generation_id, str) or not generation_id.strip():
+        message = f"Network CURRENT has no generation_id: {path}"
+        logger.error(message)
+        raise NetworkCurrentError(message)
+    if generation_id != expected_generation:
+        message = "Network CURRENT does not select the root manifest generation"
+        logger.error(message)
+        raise NetworkCurrentError(message)
+    return current
 
 
 def _validate_network_layout(root: Path) -> dict[str, Any]:
@@ -180,12 +280,8 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
         logger.error(message)
         raise NetworkGenerationError(message)
     current_path = root / NETWORK_CURRENT_NAME
-    current = _read_manifest(current_path)
-    generation_id = current.get("generation_id")
-    if generation_id != root_manifest["generation_id"]:
-        message = "Network CURRENT does not select the root manifest generation"
-        logger.error(message)
-        raise NetworkCurrentError(message)
+    generation_id = str(root_manifest["generation_id"])
+    _validate_current(current_path, expected_generation=generation_id)
     generation_root = generations / str(generation_id)
     if not generation_root.is_dir() or generation_root.is_symlink():
         message = (
@@ -194,10 +290,18 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
         )
         logger.error(message)
         raise NetworkCurrentError(message)
-    _validate_manifest(
+    generation_manifest = _validate_manifest(
         generation_root / NETWORK_MANIFEST_NAME,
-        expected_generation=str(generation_id),
+        expected_generation=generation_id,
     )
+    if _product_set(generation_manifest) != _product_set(root_manifest):
+        message = "Network generation manifest does not match root product set"
+        logger.error(message)
+        raise NetworkGenerationError(message)
+    if generation_manifest["phase_convention"] != root_manifest["phase_convention"]:
+        message = "Network generation manifest phase convention mismatch"
+        logger.error(message)
+        raise NetworkGenerationError(message)
     if not (root / "interferograms").is_dir():
         message = "Network requires an interferograms/ product collection"
         logger.error(message)
@@ -251,7 +355,7 @@ class Network(Frame, NetworkContract):
     @property
     def product_index(self) -> Any:
         """Return the validated logical product index, when registered."""
-        return self._product_index
+        return getattr(self, "_product_index", None) or self.network_product_index
 
     def register_products(self, products: Any) -> Any:
         """Register one homogeneous set of logical product records.
@@ -268,6 +372,14 @@ class Network(Frame, NetworkContract):
             message = f"Network product registration rejected: {exc}"
             logger.exception(message)
             raise NetworkConstructionError(message) from exc
+        # Keep the Dataset-facing registration and the shared generation
+        # contract on one immutable snapshot.  Stack uses the same protected
+        # refresh operation directly; external Networks use this public path.
+        NetworkContract.refresh_generation(
+            self,
+            str(self.manifest["generation_id"]),
+            index,
+        )
         self._product_index = index
         return index
 

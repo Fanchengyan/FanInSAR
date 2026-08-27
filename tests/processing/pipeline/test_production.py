@@ -20,7 +20,6 @@ from faninsar.processing.pipeline import (
     ProductionPairState,
     load_production_scene,
     read_prepared_geometry_field,
-    run_pair,
     stage_coregister,
     stage_deramp,
     stage_flatten,
@@ -32,6 +31,7 @@ from faninsar.processing.pipeline.production import (
     _apply_geo_topographic_phase_chunked,
     _inherit_coregistration_residuals,
     _own_geo_valid_mask,
+    produce_interferogram_pair,
 )
 from faninsar.processing.tops.deramp import TOPSCarrierModel
 from faninsar.processing.unwrap import SnaphuConfig
@@ -111,7 +111,7 @@ def test_run_pair_rejects_cuda_process_parallelism_before_opening_inputs(
 ) -> None:
     """CUDA Ampcor cannot enter a multi-process sweep without a cross-process gate."""
     with pytest.raises(InvalidProcessingStateError, match="ProcessPoolExecutor"):
-        run_pair(
+        produce_interferogram_pair(
             "missing-reference.SAFE",
             "missing-secondary.SAFE",
             output_dir=tmp_path / "out",
@@ -172,7 +172,7 @@ def test_geo_run_pair_forwards_scene_store_dir(
     monkeypatch.setattr(production_mod, "_run_pair_sweep", fake_sweep)
     scene_store = tmp_path / "scenes"
     snapshot_root = tmp_path / "snapshots"
-    result = run_pair(
+    result = produce_interferogram_pair(
         "reference.SAFE",
         "secondary.SAFE",
         output_dir=tmp_path / "out",
@@ -204,7 +204,7 @@ def test_geo_run_pair_forwards_prepared_lut_inputs(
     monkeypatch.setattr(production_mod, "_run_pair_sweep", fake_sweep)
     handles = {"f0_IW1_b0": (object(), object())}
     provider_root = tmp_path / "prepared"
-    result = run_pair(
+    result = produce_interferogram_pair(
         "reference.SAFE",
         "secondary.SAFE",
         output_dir=tmp_path / "out",
@@ -1263,7 +1263,7 @@ def test_run_pair_single_burst(tmp_path: Path) -> None:
     pair = _first_common_pair()
     assert pair is not None
     reference, secondary = pair
-    state = run_pair(
+    state = produce_interferogram_pair(
         reference,
         secondary,
         output_dir=tmp_path / "pair",
