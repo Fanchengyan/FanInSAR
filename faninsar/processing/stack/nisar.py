@@ -115,7 +115,7 @@ class NISARStack(Stack):
             Explicit NISAR channel selection.  The adapter never silently
             chooses another channel.
         reference : date-like, optional
-            Master acquisition.  Defaults to the earliest source date, as in
+            Reference acquisition.  Defaults to the earliest source date, as in
             :meth:`Stack.from_safes`.
         pairs, misreg_pairs : Pairs, optional
             Explicit pair graphs.  If omitted, shared short-baseline graphs
@@ -248,7 +248,9 @@ class NISARStack(Stack):
         catalog = SceneCatalog(
             paths={date_id: Path(lineage[date_id]) for date_id in dates}
         )
-        master = dates[0] if reference is None else _reference_id(reference, dates)
+        reference_id = (
+            dates[0] if reference is None else _reference_id(reference, dates)
+        )
         ifg_pairs = pairs or _pairs_from_factory(
             dates,
             max_interval=pair_max_interval,
@@ -283,7 +285,9 @@ class NISARStack(Stack):
             handles=handles,
             products={date_id: item.product for date_id, item in results.items()},
             lineage=lineage,
-            master=master,
+            # The provider callback is an internal seam; the Stack API uses
+            # the canonical Reference terminology above.
+            master=reference_id,
             channel=(admitted_frequency, admitted_polarization),
             configured_window=configured_window,
             configured_tile_shape=configured_tile_shape,
@@ -296,7 +300,7 @@ class NISARStack(Stack):
             config=config,
             pairs=ifg_pairs,
             misreg_pairs=network_pairs,
-            master=master,
+            reference=reference_id,
             acquisitions=Acquisition(list(dates)),
             scene_provider=StackSceneProvider(
                 name="NISAR RSLC",

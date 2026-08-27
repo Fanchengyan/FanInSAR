@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from faninsar.processing.errors import PairConfigurationMigrationError
 from faninsar.processing.stack import (
     S1Stack,
     Stack,
@@ -85,3 +86,25 @@ def test_s1_provider_owns_pair_dispatch(
     )
     stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")
     assert calls == [(source[0], source[1])]
+
+
+def test_stack_reference_is_the_only_public_common_acquisition_name(
+    tmp_path: Path,
+) -> None:
+    """Stack constructors expose Reference and reject the removed spelling."""
+    source = [_safe(tmp_path, "20240101"), _safe(tmp_path, "20240113")]
+    stack = S1Stack.from_safes(
+        source,
+        work_dir=tmp_path / "work",
+        reference="20240113",
+        activation_mode="reference",
+    )
+
+    assert stack.reference == "20240113"
+    assert not hasattr(stack, "master")
+    with pytest.raises(PairConfigurationMigrationError, match="reference"):
+        S1Stack.from_safes(
+            source,
+            work_dir=tmp_path / "old-work",
+            master="20240113",
+        )

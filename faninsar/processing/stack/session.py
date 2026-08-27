@@ -372,7 +372,7 @@ class Stack(Network):
     config: StackConfig
     pairs: Pairs
     misreg_pairs: Pairs
-    master: str
+    reference: str
     acquisitions: Acquisition | None = None
     dask_client: Any | None = field(default=None, repr=False)
     scene_provider: StackSceneProvider | None = field(default=None, repr=False)
@@ -399,19 +399,6 @@ class Stack(Network):
         self._interferograms = None
         self._timeseries = None
         self._product_index = None
-
-    @property
-    def reference(self) -> str:
-        """Return the canonical Stack reference acquisition ID.
-
-        Reference is the Stack-wide common acquisition used for alignment.
-        """
-        return self.master
-
-    @reference.setter
-    def reference(self, value: object) -> None:
-        """Set the reference after normalizing its date identifier."""
-        self.master = _date_to_yyyymmdd(value)
 
     @classmethod
     def from_safes(
@@ -477,7 +464,7 @@ class Stack(Network):
         """Construct a Stack from SAFE paths and optional pair graphs."""
         catalog = SceneCatalog.from_paths(list(paths))
         dates = list(catalog.dates)
-        reference_id = reference or dates[0]
+        reference_id = dates[0] if reference is None else _date_to_yyyymmdd(reference)
         if reference_id not in catalog.paths:
             reject_invalid_state(f"reference {reference_id} not in catalog")
         ifg_pairs = pairs or _pairs_from_factory(
@@ -527,25 +514,26 @@ class Stack(Network):
             config=config,
             pairs=ifg_pairs,
             misreg_pairs=m_pairs,
-            master=reference_id,
+            reference=_date_to_yyyymmdd(reference_id),
             acquisitions=acq,
             dask_client=dask_client,
         )
 
     @_reclaim_after_stage
     def prepare_scenes(self) -> Self:
-        """Create work directories and validate catalog/master."""
+        """Create work directories and validate the Reference acquisition."""
         self.config.work_dir.mkdir(parents=True, exist_ok=True)
         (self.config.work_dir / "coreg").mkdir(exist_ok=True)
         (self.config.work_dir / "misreg").mkdir(exist_ok=True)
         (self.config.work_dir / "ifg").mkdir(exist_ok=True)
         (self.config.work_dir / "pairs").mkdir(exist_ok=True)
-        if self.master not in self.catalog.paths:
-            reject_invalid_state(f"master {self.master} missing from catalog")
+        if self.reference not in self.catalog.paths:
+            reject_invalid_state(f"reference {self.reference} missing from catalog")
         self._prepared = True
         logger.info(
-            "Stack prepared master=%s n_scenes=%s n_pairs=%s n_misreg_pairs=%s mode=%s",
-            self.master,
+            "Stack prepared reference=%s n_scenes=%s n_pairs=%s "
+            "n_misreg_pairs=%s mode=%s",
+            self.reference,
             len(self.catalog),
             len(self.pairs),
             len(self.misreg_pairs),
@@ -596,7 +584,7 @@ class Stack(Network):
             "activation_token": asdict(token),
             "activation_token_digest": token.digest(),
             "scene_dates": list(self.catalog.dates),
-            "master": self.master,
+            "reference": self.reference,
         }
         path = self.config.work_dir / "activation" / "scene_artifact_v1.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -634,6 +622,8 @@ class Stack(Network):
             reject_invalid_state("Stack activation token does not match config")
         if record.get("activation_token_digest") != token.digest():
             reject_invalid_state("Stack activation token digest is invalid")
+        if record.get("reference") != self.reference:
+            reject_invalid_state("Stack activation Reference does not match config")
         if record.get("scene_dates") != list(self.catalog.dates):
             reject_invalid_state("Stack activation scene set does not match catalog")
 
@@ -956,7 +946,7 @@ class Stack(Network):
                 if hasattr(self, name)
             }
             provider_metadata["source_objects"] = {
-                "master": source_object_identity(self.master),
+                "reference": source_object_identity(self.reference),
                 "secondary": source_object_identity(date_id),
             }
         configuration = {
@@ -978,9 +968,9 @@ class Stack(Network):
         runtime = _stack_runtime_identity(callback)
         payload = {
             "schema": "stack_coreg_request_v1",
-            "master_id": self.master,
+            "reference_id": self.reference,
             "date_id": date_id,
-            "master_source": source_identity(self.catalog.paths_for(self.master)),
+            "reference_source": source_identity(self.catalog.paths_for(self.reference)),
             "secondary_source": source_identity(self.catalog.paths_for(date_id)),
             "coreg_mode": self.config.coreg_mode,
             "coregistration_grid": self.config.coregistration_grid,
@@ -1087,18 +1077,18 @@ class Stack(Network):
     def invert_misreg(
         self,
         *,
-        master: str | None = None,
+        reference: str | None = None,
         min_n_valid: int = 0,
         max_sigma_px: float = 1e3,
     ) -> Self:
-        """Invert arcs to per-date az/rg with master fixed at 0."""
+        """Invert arcs to per-date az/rg with Reference fixed at 0."""
         self._ensure_prepared()
         if self.config.coreg_mode != "network":
             logger.info("invert_misreg skipped (coreg_mode=%s)", self.config.coreg_mode)
             return self
         if not self.arcs:
             self.measure_misreg()
-        ref = master or self.master
+        ref = reference or self.reference
         try:
             self.date_misreg = invert_pair_misregistration(
                 self.arcs,
@@ -1118,7 +1108,7 @@ class Stack(Network):
         out.write_text(
             json.dumps(
                 {
-                    "master": self.date_misreg.master,
+                    "reference": self.date_misreg.master,
                     "azimuth_px": dict(self.date_misreg.azimuth_px),
                     "range_px": dict(self.date_misreg.range_px),
                     "metadata": dict(self.date_misreg.metadata),
@@ -1136,7 +1126,7 @@ class Stack(Network):
         dates: Sequence[str] | None = None,
         overwrite: bool = False,
     ) -> Self:
-        """Coregister each non-master date once onto the master grid and cache.
+        """Coregister each non-Reference date onto the Reference grid and cache.
 
         This stage does **not** form interferograms.
         """
@@ -1144,13 +1134,13 @@ class Stack(Network):
         target_dates = (
             list(dates)
             if dates is not None
-            else [d for d in self.catalog.dates if d != self.master]
+            else [d for d in self.catalog.dates if d != self.reference]
         )
-        master_path = self.catalog.paths_for(self.master)
-        # Cache master identity product path (no self-coreg).
-        master_dir = self.config.work_dir / "coreg" / self.master
-        master_dir.mkdir(parents=True, exist_ok=True)
-        self.coreg_paths[self.master] = master_dir
+        reference_path = self.catalog.paths_for(self.reference)
+        # Cache Reference identity product path (no self-coreg).
+        reference_dir = self.config.work_dir / "coreg" / self.reference
+        reference_dir.mkdir(parents=True, exist_ok=True)
+        self.coreg_paths[self.reference] = reference_dir
 
         # PROPOSAL-0017: pair = dense geometry + Ampcor range + ESD azimuth.
         # geometry skips residual measure; network apply uses date constants only.
@@ -1187,27 +1177,27 @@ class Stack(Network):
                     )
                 store = CoregisteredSceneStore.open(out / "scenes")
                 if (
-                    marker_data.get("master") != self.master
+                    marker_data.get("reference") != self.reference
                     or marker_data.get("date") != date_id
                     or marker_data.get("coreg_identity") != coreg_identity
-                    or store.master_id != self.master
+                    or store.master_id != self.reference
                     or store.date_id != date_id
                     or store.domain != self.config.coregistration_grid
                 ):
                     reject_invalid_state(
                         "persisted coregistration scene or marker does not match "
-                        "the current date, master, or coordinate domain"
+                        "the current date, Reference, or coordinate domain"
                     )
                 self.coreg_paths[date_id] = out
                 if date_id == target_dates[0]:
-                    copy_reference_units(out / "scenes", master_dir / "scenes")
+                    copy_reference_units(out / "scenes", reference_dir / "scenes")
                 continue
             pair_kwargs = dict(self._burst_kwargs())
             if isinstance(orbit_paths, dict):
-                master_orbit = orbit_paths.get(self.master)
+                reference_orbit = orbit_paths.get(self.reference)
                 date_orbit = orbit_paths.get(date_id)
-                if master_orbit is not None:
-                    pair_kwargs["reference_orbit_path"] = master_orbit
+                if reference_orbit is not None:
+                    pair_kwargs["reference_orbit_path"] = reference_orbit
                 if date_orbit is not None:
                     pair_kwargs["secondary_orbit_path"] = date_orbit
             for extra_key in (
@@ -1221,7 +1211,7 @@ class Stack(Network):
             if geo_work is not None:
                 pair_kwargs["geo_work_dir"] = Path(geo_work) / date_id
             state = self._produce_pair(
-                master_path,
+                reference_path,
                 self.catalog.paths_for(date_id),
                 output_dir=out,
                 multilook=self.config.multilook,
@@ -1236,7 +1226,7 @@ class Stack(Network):
                 **pair_kwargs,
             )
             if self.config.retain_pair_states:
-                self.pair_states[f"{self.master}_{date_id}"] = state
+                self.pair_states[f"{self.reference}_{date_id}"] = state
             else:
                 logger.info(
                     "Released in-memory ProductionPairState for %s after scene "
@@ -1245,11 +1235,11 @@ class Stack(Network):
                 )
             self.coreg_paths[date_id] = out
             if date_id == target_dates[0]:
-                copy_reference_units(out / "scenes", master_dir / "scenes")
+                copy_reference_units(out / "scenes", reference_dir / "scenes")
             marker.write_text(
                 json.dumps(
                     {
-                        "master": self.master,
+                        "reference": self.reference,
                         "date": date_id,
                         "coreg_identity": coreg_identity,
                         "misreg_az_px": misreg_az,
@@ -1272,7 +1262,7 @@ class Stack(Network):
                 ),
                 encoding="utf-8",
             )
-            logger.info("Coregistered %s → master %s", date_id, self.master)
+            logger.info("Coregistered %s → Reference %s", date_id, self.reference)
             if not self.config.retain_pair_states:
                 # Assignment evaluates the next provider call before
                 # replacing this local. Drop the completed state's full-burst
@@ -1293,7 +1283,7 @@ class Stack(Network):
         output_dir: str | Path | None = None,
         overwrite: bool = False,
     ) -> Self:
-        """Form interferograms from persisted master-aligned scene artifacts.
+        """Form interferograms from persisted Reference-aligned scene artifacts.
 
         This method deliberately has no SAFE-path or pair-runner fallback.
         Missing, incomplete, mixed-domain, or multi-unit generations fail
@@ -1379,10 +1369,10 @@ class Stack(Network):
                     reference_store,
                     secondary_store,
                     reference_role=(
-                        "reference" if primary == self.master else "secondary"
+                        "reference" if primary == self.reference else "secondary"
                     ),
                     secondary_role=(
-                        "reference" if secondary == self.master else "secondary"
+                        "reference" if secondary == self.reference else "secondary"
                     ),
                     multilook=looks,
                     goldstein_alpha=alpha,
