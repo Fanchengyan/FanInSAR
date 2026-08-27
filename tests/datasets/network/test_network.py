@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -26,7 +26,7 @@ def _write_layout(
     *,
     schema_version: str = "network_v1",
     index_type: str = "NetworkInterferogramIndex",
-    products: list[dict[str, str]] | None = None,
+    products: list[dict[str, Any]] | None = None,
     source_software: str | None = None,
 ) -> None:
     """Write the smallest canonical Network root and one generation."""
@@ -50,6 +50,8 @@ def _write_layout(
                     "geometry_identity": "grid-1",
                     "source_software": "faninsar",
                     "phase_convention": "primary_minus_secondary",
+                    "content_digest": "a" * 64,
+                    "lineage": ["source:20240101", "source:20240113"],
                 }
             ]
         ),
@@ -171,6 +173,30 @@ def test_network_rejects_generation_product_set_mismatch(tmp_path: Path) -> None
     payload["products"][0]["id"] = "20240201_20240213"
     generation_manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(NetworkGenerationError, match="product set"):
+        Network(root)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("content_digest", None, "content_digest"),
+        ("lineage", [], "lineage"),
+        ("asset_location", "/outside/network.npy", "relative path"),
+        ("asset_location", "interferograms/../outside.npy", "relative path"),
+        ("asset_location", "C:\\outside\\network.npy", "separators"),
+    ],
+)
+def test_network_rejects_invalid_content_lineage_and_asset_location(
+    tmp_path: Path, field_name: str, value: object, message: str
+) -> None:
+    """Content identity is structured and asset paths stay inside the Network."""
+    root = tmp_path / "network"
+    _write_layout(root)
+    manifest_path = root / "manifest.json"
+    payload = json.loads(manifest_path.read_text())
+    payload["products"][0][field_name] = value
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(NetworkManifestError, match=message):
         Network(root)
 
 

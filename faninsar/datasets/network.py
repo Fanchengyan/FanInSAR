@@ -10,7 +10,7 @@ not probe or infer unrelated processor layouts.
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Self
 
 from faninsar.core.network import (
@@ -143,6 +143,29 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     return data
 
 
+def _validate_asset_location(value: object, *, path: Path, product_id: str) -> None:
+    """Reject absolute, traversing, or platform-ambiguous asset locations."""
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        message = f"Network product asset_location is invalid: {product_id!r}"
+        logger.error(message)
+        raise NetworkManifestError(message)
+    if "\\" in value:
+        message = f"Network product asset_location uses unsafe separators: {path}"
+        logger.error(message)
+        raise NetworkManifestError(message)
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or ".." in posix.parts
+    ):
+        message = f"Network product asset_location must be a safe relative path: {path}"
+        logger.error(message)
+        raise NetworkManifestError(message)
+
+
 def _validate_manifest(
     path: Path,
     *,
@@ -206,11 +229,35 @@ def _validate_manifest(
                 logger.error(message)
                 raise NetworkManifestError(message)
         product_id = product["id"]
+        content_digest = product.get("content_digest")
+        if not isinstance(content_digest, str) or not content_digest.strip():
+            message = (
+                f"Network product record {position} has no content_digest: {path}"
+            )
+            logger.error(message)
+            raise NetworkManifestError(message)
+        lineage = product.get("lineage")
+        if (
+            not isinstance(lineage, list)
+            or not lineage
+            or any(
+                not isinstance(item, str)
+                or not item.strip()
+                or item != item.strip()
+                for item in lineage
+            )
+        ):
+            message = f"Network product lineage is invalid: {product_id!r}"
+            logger.error(message)
+            raise NetworkManifestError(message)
         if product_id in product_ids:
             message = f"Network product IDs are not unique: {product_id!r}"
             logger.error(message)
             raise NetworkManifestError(message)
         product_ids.add(product_id)
+        _validate_asset_location(
+            product["asset_location"], path=path, product_id=product_id
+        )
         if product["primary_id"] == product["secondary_id"]:
             message = f"Network product has identical Pair roles: {product_id!r}"
             logger.error(message)
