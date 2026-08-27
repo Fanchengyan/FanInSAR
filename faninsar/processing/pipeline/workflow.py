@@ -425,7 +425,7 @@ def stage_write(
     return state
 
 
-def run_pair_workflow(
+def execute_pair_workflow(
     reference_path: str | Path,
     secondary_path: str | Path,
     *,
@@ -444,7 +444,7 @@ def run_pair_workflow(
 ) -> PairWorkflowState:
     """Run the windowed educational pair workflow (deprecated).
 
-    Prefer :func:`~faninsar.processing.pipeline.production.run_pair` for
+    Prefer the Stack provider for production interferograms.
     production radar processing.
 
 
@@ -488,7 +488,7 @@ def run_pair_workflow(
 
     """
     warnings.warn(
-        "run_pair_workflow is deprecated; use run_pair for production",
+        "the legacy pair workflow is no longer a public entry point; use Stack",
         DeprecationWarning,
         stacklevel=2,
     )
