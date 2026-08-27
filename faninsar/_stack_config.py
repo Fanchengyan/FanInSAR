@@ -98,9 +98,8 @@ def run(
         }
     )
     if unsupported:
-        message = (
-            "run() Stack config contains unsupported stage options: "
-            + ", ".join(unsupported)
+        message = "run() Stack config contains unsupported stage options: " + ", ".join(
+            unsupported
         )
         logger.error(message)
         raise ValueError(message)
@@ -237,5 +236,6 @@ def _resolve_backend(backend: str | ComputeBackend) -> ComputeBackend:
         message = f"unknown backend {backend!r}"
         raise ValueError(message)
     return backend
+
 
 __all__ = ["run"]
