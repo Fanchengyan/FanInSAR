@@ -9,6 +9,17 @@ from __future__ import annotations
 from faninsar.core.acquisition import Acquisition, DateManager, DaySpan
 from faninsar.core.baseline import Baselines
 from faninsar.core.loops import Loop, Loops, TripletLoop, TripletLoops
+from faninsar.core.network import (
+    AcquisitionKey,
+    AssetKind,
+    AssetTransform,
+    AssetTransformOperation,
+    NetworkProduct,
+    NetworkProductIndex,
+    NetworkProductKey,
+    NetworkProductRecord,
+    PhaseConvention,
+)
 from faninsar.core.pairs import Pair, Pairs, PairsFactory
 from faninsar.core.physical import (
     PHYSICAL_TYPE_MEMBERS,
@@ -25,15 +36,24 @@ __all__ = [
     "SAR",
     "SEQ_TRANSITIONS",
     "Acquisition",
+    "AcquisitionKey",
+    "AssetKind",
+    "AssetTransform",
+    "AssetTransformOperation",
     "Baselines",
     "DateManager",
     "DaySpan",
     "Frequency",
     "Loop",
     "Loops",
+    "NetworkProduct",
+    "NetworkProductIndex",
+    "NetworkProductKey",
+    "NetworkProductRecord",
     "Pair",
     "Pairs",
     "PairsFactory",
+    "PhaseConvention",
     "PhaseDeformationConverter",
     "PhysicalType",
     "Sentinel1",

@@ -1,0 +1,153 @@
+"""Tests for the immutable Network identity and phase contracts."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from faninsar.core import Pair
+from faninsar.core.network import (
+    AcquisitionKey,
+    AssetKind,
+    AssetTransform,
+    AssetTransformOperation,
+    NetworkProduct,
+    NetworkProductIndex,
+    NetworkProductKey,
+    PhaseConvention,
+)
+
+
+def _key(acquisition_id: str, *, swath: str = "IW1") -> AcquisitionKey:
+    """Build a representative Sentinel-1 acquisition key."""
+    return AcquisitionKey(acquisition_id, "frame-1", swath, "S1", "VV")
+
+
+def _product(
+    *,
+    phase_convention: PhaseConvention = PhaseConvention.PRIMARY_MINUS_SECONDARY,
+    swath: str = "IW1",
+) -> NetworkProduct:
+    """Build a representative immutable product record."""
+    primary = _key("20200101", swath=swath)
+    secondary = _key("20200113", swath=swath)
+    kind = AssetKind.COMPLEX_INTERFEROGRAM
+    return NetworkProduct(
+        key=NetworkProductKey(primary, secondary, kind),
+        asset_location="generation-1/ifg/20200101_20200113.zarr",
+        geometry_identity="geo-grid-a",
+        source_software="isce3",
+        phase_convention=phase_convention,
+        asset_transform=AssetTransform.for_convention(kind, phase_convention),
+    )
+
+
+def test_acquisition_key_disambiguates_same_date_products() -> None:
+    """Frame/swath/channel/polarization are part of stable identity."""
+    first = _key("20200101", swath="IW1")
+    second = _key("20200101", swath="IW2")
+    assert first != second
+    assert first.cohort != second.cohort
+    assert first.canonical == "20200101|frame-1|IW1|S1|VV"
+
+
+@pytest.mark.parametrize(
+    ("kind", "operation"),
+    [
+        (AssetKind.COMPLEX_INTERFEROGRAM, AssetTransformOperation.COMPLEX_CONJUGATE),
+        (
+            AssetKind.WRAPPED_PHASE,
+            AssetTransformOperation.WRAPPED_PHASE_NEGATE_MODULO,
+        ),
+        (AssetKind.UNWRAPPED_PHASE, AssetTransformOperation.UNWRAPPED_PHASE_NEGATE),
+        (AssetKind.DISPLACEMENT, AssetTransformOperation.SCALAR_NEGATE),
+    ],
+)
+def test_reverse_phase_convention_has_asset_specific_transform(
+    kind: AssetKind,
+    operation: AssetTransformOperation,
+) -> None:
+    """Reverse phase orientation never relies on a filename convention."""
+    transform = AssetTransform.for_convention(
+        kind,
+        PhaseConvention.SECONDARY_MINUS_PRIMARY,
+    )
+    assert transform.operation is operation
+
+
+def test_phase_transforms_apply_expected_math() -> None:
+    """Complex, wrapped, and unwrapped assets normalize with distinct rules."""
+    complex_asset = np.asarray([1.0 + 2.0j], dtype=np.complex64)
+    assert np.allclose(
+        AssetTransform.for_convention(
+            AssetKind.COMPLEX,
+            PhaseConvention.SECONDARY_MINUS_PRIMARY,
+        ).apply(complex_asset),
+        np.conjugate(complex_asset),
+    )
+    wrapped = np.asarray([np.pi * 0.75, -np.pi * 0.75])
+    expected_wrapped = np.angle(np.exp(-1j * wrapped))
+    actual_wrapped = AssetTransform.for_convention(
+        AssetKind.WRAPPED_PHASE,
+        PhaseConvention.SECONDARY_MINUS_PRIMARY,
+    ).apply(wrapped)
+    assert np.allclose(actual_wrapped, expected_wrapped)
+    unwrapped = np.asarray([-4.0, 2.0])
+    assert np.array_equal(
+        AssetTransform.for_convention(
+            AssetKind.UNWRAPPED_PHASE,
+            PhaseConvention.SECONDARY_MINUS_PRIMARY,
+        ).apply(unwrapped),
+        -unwrapped,
+    )
+
+
+def test_transform_and_product_convention_must_agree() -> None:
+    """A stale transform declaration is rejected before indexing."""
+    with pytest.raises(ValueError, match="phase convention"):
+        NetworkProduct(
+            key=NetworkProductKey(
+                _key("20200101"), _key("20200113"), AssetKind.COMPLEX
+            ),
+            asset_location="ifg.zarr",
+            geometry_identity="geo-grid-a",
+            source_software="isce3",
+            phase_convention=PhaseConvention.PRIMARY_MINUS_SECONDARY,
+            asset_transform=AssetTransform.for_convention(
+                AssetKind.COMPLEX,
+                PhaseConvention.SECONDARY_MINUS_PRIMARY,
+            ),
+        )
+
+
+def test_product_index_rejects_duplicates_and_mixed_cohorts() -> None:
+    """A Network index cannot silently mix or overwrite products."""
+    product = _product()
+    with pytest.raises(ValueError, match="unique"):
+        NetworkProductIndex((product, product))
+
+    mixed = _product(swath="IW2")
+    index = NetworkProductIndex((product, mixed))
+    with pytest.raises(ValueError, match="homogeneous"):
+        index.homogeneous()
+
+
+def test_pair_retains_chronological_primary_secondary_roles() -> None:
+    """Network identity additions do not alter FanInSAR Pair ordering."""
+    pair = Pair((pd.Timestamp("2020-01-13"), pd.Timestamp("2020-01-01")))
+    assert pair.primary == pd.Timestamp("2020-01-01")
+    assert pair.secondary == pd.Timestamp("2020-01-13")
+    assert pair.name == "20200101_20200113"
+
+
+def test_unknown_phase_convention_and_transform_operation_fail_closed() -> None:
+    """Free-form phase labels and mismatched operations are not accepted."""
+    with pytest.raises(ValueError, match="unknown phase convention"):
+        AssetTransform.for_convention(AssetKind.COMPLEX, "filename_order")
+    with pytest.raises(ValueError, match="not valid"):
+        AssetTransform(
+            AssetKind.COMPLEX,
+            PhaseConvention.PRIMARY_MINUS_SECONDARY,
+            AssetTransformOperation.COMPLEX_CONJUGATE,
+        )
