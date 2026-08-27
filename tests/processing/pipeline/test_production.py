@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import zarr
 
+from faninsar._core.device import cuda_available
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import (
     ConstantHeightDEM,
@@ -106,11 +107,17 @@ def test_production_pair_state_note() -> None:
     assert state.log == ["hello", "world"]
 
 
-def test_run_pair_rejects_cuda_process_parallelism_before_opening_inputs(
+def test_produce_pair_rejects_unadmitted_or_parallel_cuda(
     tmp_path: Path,
 ) -> None:
-    """CUDA Ampcor cannot enter a multi-process sweep without a cross-process gate."""
-    with pytest.raises(InvalidProcessingStateError, match="ProcessPoolExecutor"):
+    """CUDA is either admitted then gated, or rejected before opening inputs."""
+    expected_error = InvalidProcessingStateError if cuda_available() else RuntimeError
+    expected_match = (
+        "ProcessPoolExecutor"
+        if cuda_available()
+        else "CUDA requested but is not available"
+    )
+    with pytest.raises(expected_error, match=expected_match):
         produce_interferogram_pair(
             "missing-reference.SAFE",
             "missing-secondary.SAFE",
@@ -154,70 +161,6 @@ def test_geo_valid_mask_owns_data_before_memmap_cleanup(tmp_path: Path) -> None:
     assert copied is not None
     np.testing.assert_array_equal(copied, expected)
     assert not isinstance(copied, np.memmap)
-
-
-def test_geo_run_pair_forwards_scene_store_dir(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Geo mode forwards scene publication instead of rejecting the seam."""
-    from faninsar.processing.pipeline import production as production_mod
-
-    captured: dict[str, object] = {}
-    sentinel = object()
-
-    def fake_sweep(*_args: object, **kwargs: object) -> object:
-        captured.update(kwargs)
-        return sentinel
-
-    monkeypatch.setattr(production_mod, "_run_pair_sweep", fake_sweep)
-    scene_store = tmp_path / "scenes"
-    snapshot_root = tmp_path / "snapshots"
-    result = produce_interferogram_pair(
-        "reference.SAFE",
-        "secondary.SAFE",
-        output_dir=tmp_path / "out",
-        multilook=(1, 1),
-        coregistration_grid="geo",
-        geo_grid=MagicMock(),
-        scene_store_dir=scene_store,
-        source_snapshot_root=snapshot_root,
-    )
-
-    assert result is sentinel
-    assert captured["scene_store_dir"] == scene_store
-    assert captured["source_snapshot_root"] == snapshot_root
-
-
-def test_geo_run_pair_forwards_prepared_lut_inputs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Geo runs preserve prepared LUT handles and provider roots for workers."""
-    from faninsar.processing.pipeline import production as production_mod
-
-    captured: dict[str, object] = {}
-    sentinel = object()
-
-    def fake_sweep(*_args: object, **kwargs: object) -> object:
-        captured.update(kwargs)
-        return sentinel
-
-    monkeypatch.setattr(production_mod, "_run_pair_sweep", fake_sweep)
-    handles = {"f0_IW1_b0": (object(), object())}
-    provider_root = tmp_path / "prepared"
-    result = produce_interferogram_pair(
-        "reference.SAFE",
-        "secondary.SAFE",
-        output_dir=tmp_path / "out",
-        multilook=(1, 1),
-        coregistration_grid="geo",
-        geo_grid=MagicMock(),
-        prepared_geo_lut_handles=handles,
-        prepared_provider_root=provider_root,
-    )
-
-    assert result is sentinel
-    assert captured["prepared_geo_lut_handles"] is handles
-    assert captured["prepared_provider_root"] == provider_root
 
 
 def test_stage_deramp_with_synthetic() -> None:
@@ -303,21 +246,10 @@ def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
     assert geometry_call["stride"] == 8
 
 
-@pytest.mark.parametrize(
-    (
-        "requested_device",
-        "expected_ampcor_executor",
-        "expected_ampcor_device",
-        "expected_resample_device",
-    ),
-    [("gpu", "torch", "cuda", "cuda"), ("auto", "numpy", "cpu", "auto")],
-)
+@pytest.mark.parametrize("requested_device", ["gpu", "auto"])
 def test_stage_coregister_forwards_ampcor_executor_and_device(
     monkeypatch: pytest.MonkeyPatch,
     requested_device: str,
-    expected_ampcor_executor: str,
-    expected_ampcor_device: str,
-    expected_resample_device: str,
 ) -> None:
     """Production separates Ampcor policy from Torch remapping policy."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
@@ -370,6 +302,15 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
     )
 
     assert result.amplitude_residual_rg_px == pytest.approx(0.0)
+    expected_ampcor_executor = "torch"
+    expected_ampcor_device = (
+        "cuda"
+        if requested_device == "gpu" and cuda_available()
+        else "cpu"
+    )
+    expected_resample_device = (
+        "auto" if requested_device == "auto" else expected_ampcor_device
+    )
     assert captured["executor"] == expected_ampcor_executor
     assert captured["device"] == expected_ampcor_device
     assert resample_kwargs["executor"] == "torch"

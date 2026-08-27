@@ -5,6 +5,7 @@ from __future__ import annotations
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -25,6 +26,9 @@ from faninsar.processing.stack.ifg_store import (
 )
 from faninsar.processing.stack.scene_store import write_scene_unit
 from faninsar.processing.timeseries import write_timeseries_zarr
+
+if TYPE_CHECKING:
+    from faninsar.processing.stack.provider import SourceHandle
 
 
 def _stack_with_three_date_network(tmp_path: Path) -> Stack:
@@ -83,7 +87,7 @@ def test_scene_catalog_from_paths(tmp_path: Path) -> None:
 
 
 def test_stack_from_safes_defaults(tmp_path: Path) -> None:
-    """Stack builds default short-baseline pairs and earliest master."""
+    """Stack builds default short-baseline pairs and earliest Reference."""
     paths = []
     for day in ("20160101", "20160113", "20160125"):
         p = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
@@ -97,7 +101,7 @@ def test_stack_from_safes_defaults(tmp_path: Path) -> None:
         pair_max_interval=2,
         pair_max_days=60,
     )
-    assert stack.master == "20160101"
+    assert stack.reference == "20160101"
     assert len(stack.catalog) == 3
     stack.prepare_scenes()
     assert (tmp_path / "out" / "coreg").is_dir()
@@ -152,7 +156,7 @@ def test_coreg_resume_identity_binds_provider_window_channel_and_source_metadata
     )
     stack._nisar_channel = ("B", "HH")
     stack._nisar_results = {
-        stack.master: SimpleNamespace(source_id="master", content_digest="m1"),
+        stack.reference: SimpleNamespace(source_id="reference", content_digest="m1"),
         "20240113": SimpleNamespace(source_id="secondary", content_digest="s1"),
     }
     initial = stack._coreg_resume_identity(
@@ -201,7 +205,7 @@ def test_s1_default_coreg_resume_identity_is_stable(tmp_path: Path) -> None:
         misreg_rg_px=0.0,
     )
 
-    assert stack.scene_provider is None
+    assert isinstance(stack.scene_provider, StackSceneProvider)
     assert first == second
 
 
@@ -284,10 +288,10 @@ def test_ifg_resume_binds_runtime_fingerprint(
         write_scene_unit(
             root,
             date_id=date_id,
-            master_id=stack.master,
+            reference_id=stack.reference,
             domain="radar",
             tag="f0_IW1_b0",
-            reference=data,
+            primary=data,
             secondary=data,
             row_origin=0,
             col_origin=0,
@@ -298,7 +302,7 @@ def test_ifg_resume_binds_runtime_fingerprint(
     store = InterferogramArtifactStore.open(stack.ifg_dirs[0])
     assert store.source_manifest_digests[
         "runtime"
-    ] == session_module._runtime_fingerprint(None)
+    ] == session_module._runtime_fingerprint(stack.scene_provider.produce_pair)
 
     monkeypatch.setattr(
         session_module, "_runtime_fingerprint", lambda _callback: "f" * 64
@@ -331,16 +335,16 @@ def test_coreg_resume_rejects_marker_after_provider_identity_change(
     write_scene_unit(
         out / "scenes",
         date_id=date_id,
-        master_id=stack.master,
+        reference_id=stack.reference,
         domain="radar",
         tag="f0_IW1_b0",
-        reference=data,
+        primary=data,
         secondary=data,
         row_origin=0,
         col_origin=0,
     )
     marker = {
-        "master": stack.master,
+        "reference": stack.reference,
         "date": date_id,
         "coreg_identity": stack._coreg_resume_identity(
             date_id,
@@ -356,18 +360,18 @@ def test_coreg_resume_rejects_marker_after_provider_identity_change(
 
 
 def test_coregister_scenes_releases_prior_pair_before_next_date(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     """Non-retained Pair arrays die before the next date starts processing."""
     stack = _stack_with_three_date_network(tmp_path)
     first_payload_ref: weakref.ReferenceType[np.ndarray] | None = None
     call_count = 0
 
-    def fake_run_pair(
-        _reference_path: Path,
-        secondary_path: Path,
+    def fake_produce_pair(
+        _reference_path: SourceHandle,
+        secondary_handle: SourceHandle,
         *,
-        scene_store_dir: Path,
+        options: dict[str, object],
         **_kwargs: object,
     ) -> SimpleNamespace:
         nonlocal call_count, first_payload_ref
@@ -378,14 +382,17 @@ def test_coregister_scenes_releases_prior_pair_before_next_date(
         payload = np.ones((64, 64), dtype=np.complex64)
         if first_payload_ref is None:
             first_payload_ref = weakref.ref(payload)
+        secondary_path = secondary_handle._resolve()[0]
+        scene_store_dir = options["scene_store_dir"]
+        assert isinstance(scene_store_dir, Path)
         date_id = secondary_path.name.split("_")[5][:8]
         write_scene_unit(
             scene_store_dir,
             date_id=date_id,
-            master_id=stack.master,
+            reference_id=stack.reference,
             domain="radar",
             tag="f0_IW1_b0",
-            reference=np.ones((2, 2), dtype=np.complex64),
+            primary=np.ones((2, 2), dtype=np.complex64),
             secondary=np.ones((2, 2), dtype=np.complex64),
             row_origin=0,
             col_origin=0,
@@ -397,8 +404,9 @@ def test_coregister_scenes_releases_prior_pair_before_next_date(
             azimuth_shift_px=0.0,
         )
 
-    monkeypatch.setattr(
-        "faninsar.processing.pipeline.production.run_pair", fake_run_pair
+    stack.scene_provider = StackSceneProvider(
+        produce_pair=fake_produce_pair,
+        name="TEST",
     )
 
     stack.coregister_scenes()
@@ -406,30 +414,38 @@ def test_coregister_scenes_releases_prior_pair_before_next_date(
     assert call_count == 2
 
 
-def test_s1_default_scene_dispatch_remains_run_pair(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_s1_default_scene_dispatch_uses_provider(
+    tmp_path: Path,
 ) -> None:
-    """SAFE stacks without a provider retain the existing production call."""
+    """SAFE stacks dispatch scene production through their provider."""
     stack = _stack_with_three_date_network(tmp_path)
     calls: list[tuple[Path, Path, Path]] = []
     expected = SimpleNamespace(esd_azimuth_shift_px=0.0)
 
-    def fake_run_pair(
-        reference_path: Path,
-        secondary_path: Path,
+    def fake_produce_pair(
+        reference_path: SourceHandle,
+        secondary_path: SourceHandle,
         *,
         output_dir: Path,
-        **_kwargs: object,
+        options: dict[str, object],
     ) -> SimpleNamespace:
-        calls.append((reference_path, secondary_path, output_dir))
+        del options
+        calls.append(
+            (
+                reference_path._resolve()[0],
+                secondary_path._resolve()[0],
+                output_dir,
+            )
+        )
         return expected
 
-    monkeypatch.setattr(
-        "faninsar.processing.pipeline.production.run_pair", fake_run_pair
+    stack.scene_provider = StackSceneProvider(
+        produce_pair=fake_produce_pair,
+        name="TEST",
     )
 
     result = stack._produce_pair(
-        stack.catalog.path_for(stack.master),
+        stack.catalog.path_for(stack.reference),
         stack.catalog.path_for("20240113"),
         output_dir=tmp_path / "pair",
         multilook=(1, 1),
@@ -438,7 +454,7 @@ def test_s1_default_scene_dispatch_remains_run_pair(
     assert result is expected
     assert calls == [
         (
-            stack.catalog.path_for(stack.master),
+            stack.catalog.path_for(stack.reference),
             stack.catalog.path_for("20240113"),
             tmp_path / "pair",
         )
@@ -453,18 +469,25 @@ def test_stack_scene_provider_receives_normalized_callback_arguments(
     calls: list[tuple[Path, Path, Path, dict[str, object]]] = []
 
     def produce_pair(
-        reference_path: Path,
-        secondary_path: Path,
+        reference_path: SourceHandle,
+        secondary_path: SourceHandle,
         *,
         output_dir: Path,
         options: dict[str, object],
     ) -> SimpleNamespace:
-        calls.append((reference_path, secondary_path, output_dir, options))
+        calls.append(
+            (
+                reference_path._resolve()[0],
+                secondary_path._resolve()[0],
+                output_dir,
+                options,
+            )
+        )
         return SimpleNamespace()
 
     stack.scene_provider = StackSceneProvider(produce_pair=produce_pair, name="TEST")
     result = stack._produce_pair(
-        stack.catalog.path_for(stack.master),
+        stack.catalog.path_for(stack.reference),
         stack.catalog.path_for("20240113"),
         output_dir=tmp_path / "pair",
         multilook=(1, 1),
@@ -472,7 +495,7 @@ def test_stack_scene_provider_receives_normalized_callback_arguments(
 
     assert isinstance(result, SimpleNamespace)
     assert calls[0][:3] == (
-        stack.catalog.path_for(stack.master),
+        stack.catalog.path_for(stack.reference),
         stack.catalog.path_for("20240113"),
         tmp_path / "pair",
     )
@@ -536,7 +559,7 @@ def test_stack_config_rejects_qualified_mode_without_binding(tmp_path: Path) -> 
 
 
 def test_stack_measure_misreg_keeps_ampcor_range_residual(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     """Network arcs retain the production state's Ampcor range residual."""
     paths = []
@@ -554,11 +577,10 @@ def test_stack_measure_misreg_keeps_ampcor_range_residual(
     )
     stack.prepare_scenes()
 
-    monkeypatch.setattr(
-        "faninsar.processing.pipeline.production.run_pair",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            esd_azimuth_shift_px=-0.3,
-            amplitude_residual_rg_px=0.7,
+    stack.scene_provider = StackSceneProvider(
+        name="TEST",
+        produce_pair=lambda *_args, **_kwargs: SimpleNamespace(
+            esd_azimuth_shift_px=-0.3, amplitude_residual_rg_px=0.7
         ),
     )
     stack.measure_misreg(overwrite=True)
@@ -591,10 +613,10 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
             write_scene_unit(
                 root,
                 date_id=date_id,
-                master_id=dates[0],
+                reference_id=dates[0],
                 domain="radar",
                 tag=tag,
-                reference=reference,
+                primary=reference,
                 secondary=secondary,
                 row_origin=0,
                 col_origin=0,
@@ -652,10 +674,10 @@ def test_stack_applies_multilook_before_publishing_ifg(
         write_scene_unit(
             root,
             date_id=date_id,
-            master_id=dates[0],
+            reference_id=dates[0],
             domain="radar",
             tag="IW1_b0",
-            reference=reference,
+            primary=reference,
             secondary=secondary,
             row_origin=0,
             col_origin=0,
@@ -779,10 +801,10 @@ def test_qualified_stack_form_requires_matching_activation_record(
         write_scene_unit(
             root,
             date_id=date_id,
-            master_id=dates[0],
+            reference_id=dates[0],
             domain="radar",
             tag="IW1_b0",
-            reference=reference,
+            primary=reference,
             secondary=secondary,
             row_origin=0,
             col_origin=0,
@@ -954,10 +976,10 @@ def test_scene_artifacts_flow_through_merge_unwrap_and_sbas(
             write_scene_unit(
                 root,
                 date_id=date_id,
-                master_id="20240101",
+                reference_id="20240101",
                 domain="radar",
                 tag=tag,
-                reference=reference,
+                primary=reference,
                 secondary=aligned,
                 row_origin=row_origin,
                 col_origin=0,
@@ -1023,10 +1045,10 @@ def test_form_interferograms_rejects_stale_scene_lineage(tmp_path: Path) -> None
         write_scene_unit(
             root,
             date_id=date_id,
-            master_id=dates[0],
+            reference_id=dates[0],
             domain="radar",
             tag="f0_IW1_b0",
-            reference=data,
+            primary=data,
             secondary=data,
             row_origin=0,
             col_origin=0,
@@ -1038,10 +1060,10 @@ def test_form_interferograms_rejects_stale_scene_lineage(tmp_path: Path) -> None
     write_scene_unit(
         stack.coreg_paths[dates[1]] / "scenes",
         date_id=dates[1],
-        master_id=dates[0],
+        reference_id=dates[0],
         domain="radar",
         tag="f0_IW1_b0",
-        reference=data,
+        primary=data,
         secondary=changed,
         row_origin=0,
         col_origin=0,
@@ -1145,10 +1167,10 @@ def test_stack_invert_rejects_unqualified_unwrap_artifacts(tmp_path: Path) -> No
         stack.invert_timeseries()
 
 
-def test_coregister_resume_rejects_scene_aligned_to_old_master(
+def test_coregister_resume_rejects_scene_aligned_to_old_reference(
     tmp_path: Path,
 ) -> None:
-    """A work directory cannot resume scene artifacts from another master."""
+    """A work directory cannot resume scene artifacts from another Reference."""
     import json
 
     from faninsar.processing.errors import InvalidProcessingStateError
@@ -1160,20 +1182,20 @@ def test_coregister_resume_rejects_scene_aligned_to_old_master(
     write_scene_unit(
         out / "scenes",
         date_id=date_id,
-        master_id="20231220",
+        reference_id="20231220",
         domain="radar",
         tag="f0_IW1_b0",
-        reference=data,
+        primary=data,
         secondary=data,
         row_origin=0,
         col_origin=0,
     )
     (out / "coreg_done.json").write_text(
-        json.dumps({"master": "20231220", "date": date_id}),
+        json.dumps({"reference": "20231220", "date": date_id}),
         encoding="utf-8",
     )
 
-    with pytest.raises(InvalidProcessingStateError, match="master"):
+    with pytest.raises(InvalidProcessingStateError, match="Reference"):
         stack.coregister_scenes(dates=[date_id])
 
 
@@ -1190,10 +1212,10 @@ def test_coregister_resume_rejects_changed_burst_request(tmp_path: Path) -> None
     write_scene_unit(
         out / "scenes",
         date_id=date_id,
-        master_id=stack.master,
+        reference_id=stack.reference,
         domain="radar",
         tag="f0_IW1_b0",
-        reference=data,
+        primary=data,
         secondary=data,
         row_origin=0,
         col_origin=0,
@@ -1206,7 +1228,7 @@ def test_coregister_resume_rejects_changed_burst_request(tmp_path: Path) -> None
     (out / "coreg_done.json").write_text(
         json.dumps(
             {
-                "master": stack.master,
+                "reference": stack.reference,
                 "date": date_id,
                 "coreg_identity": initial_identity,
             }

@@ -18,13 +18,13 @@ from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import ConstantHeightDEM
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.pipeline import ProductionPairState
-from faninsar.processing.pipeline.production import produce_interferogram_pair
 from faninsar.processing.pipeline import production as production_mod
 from faninsar.processing.pipeline.production import (
     SharedPairResources,
     _is_multilook_pair,
     looks_dir,
     normalize_multilook_sweep,
+    produce_interferogram_pair,
 )
 
 SHAPE = (8, 16)
@@ -308,7 +308,7 @@ def test_sweep_preflight_refuses_existing_output(tmp_path: Path) -> None:
     """Existing looks_* subtrees are refused unless overwrite=True."""
     (tmp_path / looks_dir(2, 4)).mkdir(parents=True)
     with pytest.raises(InvalidProcessingStateError, match="already exist"):
-        production_mod._run_pair_sweep(
+        production_mod._produce_interferogram_sweep(
             "reference.SAFE",
             "secondary.SAFE",
             output_dir=tmp_path,
@@ -325,6 +325,7 @@ def test_sweep_preflight_refuses_existing_output(tmp_path: Path) -> None:
             control_spacing=None,
             executor="torch",
             device="cpu",
+            dask_client=None,
             coregistration_grid="radar",
             geo_grid=None,
             geo_height_m=0.0,
@@ -333,7 +334,7 @@ def test_sweep_preflight_refuses_existing_output(tmp_path: Path) -> None:
             snaphu_config=None,
             unwrap_method=None,
             irls_kwargs=None,
-            reference_orbit_path=None,
+            primary_orbit_path=None,
             secondary_orbit_path=None,
             unwrap=False,
             geoid_correction=True,
@@ -661,7 +662,7 @@ def test_overwrite_true_removes_stale_subtree(tmp_path: Path) -> None:
     subtree.mkdir()
     (subtree / "stale.bin").write_bytes(b"stale")
     with pytest.raises(Sentinel1ProductError):
-        production_mod._run_pair_sweep(
+        production_mod._produce_interferogram_sweep(
             "reference.SAFE",
             "secondary.SAFE",
             output_dir=tmp_path,
@@ -678,6 +679,7 @@ def test_overwrite_true_removes_stale_subtree(tmp_path: Path) -> None:
             control_spacing=None,
             executor="torch",
             device="cpu",
+            dask_client=None,
             coregistration_grid="radar",
             geo_grid=None,
             geo_height_m=0.0,
@@ -686,7 +688,7 @@ def test_overwrite_true_removes_stale_subtree(tmp_path: Path) -> None:
             snaphu_config=None,
             unwrap_method=None,
             irls_kwargs=None,
-            reference_orbit_path=None,
+            primary_orbit_path=None,
             secondary_orbit_path=None,
             unwrap=False,
             geoid_correction=True,
@@ -767,7 +769,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
     monkeypatch.setattr(
         production_mod, "_archive_burst_ifgs", lambda *_args, **_kwargs: archive
     )
-    result = production_mod._run_pair_sweep(
+    result = production_mod._produce_interferogram_sweep(
         "reference.SAFE",
         "secondary.SAFE",
         output_dir=tmp_path / "out",
@@ -784,6 +786,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
         control_spacing=None,
         executor="torch",
         device="cpu",
+        dask_client=None,
         coregistration_grid="geo",
         geo_grid=geo_grid,
         geo_height_m=0.0,
@@ -792,7 +795,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
         snaphu_config=None,
         unwrap_method=None,
         irls_kwargs=None,
-        reference_orbit_path=None,
+        primary_orbit_path=None,
         secondary_orbit_path=None,
         unwrap=False,
         geoid_correction=True,
@@ -830,7 +833,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
         snaphu_config=None,
         unwrap_method=None,
         irls_kwargs=None,
-        reference_orbit_path=None,
+        primary_orbit_path=None,
         secondary_orbit_path=None,
         unwrap=False,
         geoid_correction=True,
