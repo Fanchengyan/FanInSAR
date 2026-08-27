@@ -475,12 +475,12 @@ def test_shared_resources_cleanup_is_idempotent(tmp_path: Path) -> None:
         secondary=_make_scene(shape, "20161231"),
         dem=ConstantHeightDEM(0.0),
         coregistration_grid="geo",
-        reference_geocoded_slc=reference_slc,
+        primary_geocoded_slc=reference_slc,
         secondary_geocoded_slc=secondary_slc,
         geocoded_slc_valid=valid_slc,
         topo_phase=topo_phase,
         geo_height_field=height_full,
-        reference_deramped=reference_slc,
+        primary_deramped=reference_slc,
         secondary_aligned=secondary_slc,
         geo_work_dir=work,
         geo_grid=GeoGridSpec(
@@ -506,7 +506,7 @@ def test_shared_resources_cleanup_is_idempotent(tmp_path: Path) -> None:
     assert owner.cleanup_calls == 1
     assert resources.temporary_directory is None
     assert state.geo2rdr_lut is None
-    assert state.reference_geocoded_slc is None
+    assert state.primary_geocoded_slc is None
     resources.cleanup()
     assert owner.cleanup_calls == 1
 
@@ -726,12 +726,12 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
         secondary=_make_scene(shape, "20161231"),
         dem=ConstantHeightDEM(0.0),
         coregistration_grid="geo",
-        reference_geocoded_slc=_memmap("ref.c64", np.complex64),
+        primary_geocoded_slc=_memmap("ref.c64", np.complex64),
         secondary_geocoded_slc=_memmap("sec.c64", np.complex64),
         geocoded_slc_valid=_memmap("slc_valid.bool", np.bool_),
         topo_phase=_memmap("topo.f32", np.float32),
         geo_height_field=_memmap("geo_h.f64", np.float64),
-        reference_deramped=_memmap("deramp.c64", np.complex64),
+        primary_deramped=_memmap("deramp.c64", np.complex64),
         secondary_aligned=_memmap("aligned.c64", np.complex64),
         geo_work_dir=work,
         geo2rdr_lut=lut,
@@ -804,7 +804,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
     assert outcome.metadata["multilook_sweep"] == [[1, 1]]
     assert outcome.metadata["wavelength_m"] == pytest.approx(WAVELENGTH_M)
     assert geo_state.geo2rdr_lut is None
-    assert geo_state.reference_geocoded_slc is None
+    assert geo_state.primary_geocoded_slc is None
     assert geo_state.geocoded_slc_valid is None
     assert geo_state.geo_height_field is None
     assert lut.az_full._mmap.closed

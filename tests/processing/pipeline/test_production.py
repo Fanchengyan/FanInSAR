@@ -174,9 +174,9 @@ def test_stage_deramp_with_synthetic() -> None:
         dem=ConstantHeightDEM(0.0),
     )
     result = stage_deramp(state)
-    assert result.reference_deramped is not None
+    assert result.primary_deramped is not None
     assert result.secondary_deramped is not None
-    assert result.reference_deramped.shape == (16, 16)
+    assert result.primary_deramped.shape == (16, 16)
     assert "DERAMP" in " ".join(result.log)
 
 
@@ -200,7 +200,7 @@ def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
         dem=ConstantHeightDEM(0.0),
         multilook=(2, 4),
     )
-    state.reference_deramped = np.ones(shape, dtype=np.complex64)
+    state.primary_deramped = np.ones(shape, dtype=np.complex64)
     state.secondary_deramped = np.ones(shape, dtype=np.complex64)
     offsets = MagicMock()
     offsets.range_offset_px = np.zeros(shape, dtype=np.float32)
@@ -268,7 +268,7 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
-    state.reference_deramped = np.ones(shape, dtype=np.complex64)
+    state.primary_deramped = np.ones(shape, dtype=np.complex64)
     state.secondary_deramped = np.ones(shape, dtype=np.complex64)
     offsets = OffsetFieldResult(
         range_offset_px=np.full(shape, 0.25, dtype=np.float32),
@@ -361,7 +361,7 @@ def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
-    measure.reference_deramped = np.ones(shape, dtype=np.complex64)
+    measure.primary_deramped = np.ones(shape, dtype=np.complex64)
     measure.secondary_deramped = np.ones(shape, dtype=np.complex64)
     measure = stage_coregister(measure, residuals_only=True, device="cpu")
     prepared = measure.prepared_geometry_field
@@ -382,7 +382,7 @@ def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
-    product.reference_deramped = np.ones(shape, dtype=np.complex64)
+    product.primary_deramped = np.ones(shape, dtype=np.complex64)
     product.secondary_deramped = np.ones(shape, dtype=np.complex64)
     product = stage_coregister(
         product,
@@ -439,7 +439,7 @@ def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
-    state.reference_deramped = np.ones(radar_shape, dtype=np.complex64)
+    state.primary_deramped = np.ones(radar_shape, dtype=np.complex64)
     state.secondary_deramped = np.ones(radar_shape, dtype=np.complex64)
     offsets = OffsetFieldResult(
         range_offset_px=np.zeros(radar_shape, dtype=np.float32),
@@ -558,7 +558,7 @@ def test_prepared_geometry_field_rejects_unbound_geo_reuse() -> None:
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
-    state.reference_deramped = np.ones(shape, dtype=np.complex64)
+    state.primary_deramped = np.ones(shape, dtype=np.complex64)
     state.secondary_deramped = np.ones(shape, dtype=np.complex64)
     with pytest.raises(InvalidProcessingStateError):
         stage_coregister(
@@ -616,7 +616,7 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
-    measure.reference_deramped = np.ones(shape, dtype=np.complex64)
+    measure.primary_deramped = np.ones(shape, dtype=np.complex64)
     measure.secondary_deramped = np.ones(shape, dtype=np.complex64)
     measure = stage_coregister(measure, roi_window=window, residuals_only=True)
     prepared = measure.prepared_geometry_field
@@ -639,7 +639,7 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
-    product.reference_deramped = np.ones(shape, dtype=np.complex64)
+    product.primary_deramped = np.ones(shape, dtype=np.complex64)
     product.secondary_deramped = np.ones(shape, dtype=np.complex64)
     product = stage_coregister(product, prepared_geometry_field=prepared)
     assert calls == stage_a_calls
@@ -672,7 +672,7 @@ def test_stage_coregister_grows_roi_halo_for_large_offsets(
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
-    state.reference_deramped = np.ones(shape, dtype=np.complex64)
+    state.primary_deramped = np.ones(shape, dtype=np.complex64)
     state.secondary_deramped = np.ones(shape, dtype=np.complex64)
 
     geometry_calls: list[tuple[tuple[int, int], int, int, int]] = []
@@ -742,7 +742,7 @@ def test_stage_interferogram_with_synthetic() -> None:
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
-    state.reference_deramped = np.ones((16, 16), dtype=np.complex64)
+    state.primary_deramped = np.ones((16, 16), dtype=np.complex64)
     state.secondary_aligned = np.ones((16, 16), dtype=np.complex64)
     result = stage_interferogram(state, multilook=(2, 4), goldstein_alpha=0.0)
     assert result.complex_ifg is not None
@@ -878,7 +878,7 @@ def test_stage_interferogram_masks_zero_power_edge_as_nan() -> None:
     secondary[-2:, :] = 0
     # First two range samples of secondary → first ML range look invalid.
     secondary[:, :2] = 0
-    state.reference_deramped = primary
+    state.primary_deramped = primary
     state.secondary_aligned = secondary
     result = stage_interferogram(state, multilook=(2, 4), goldstein_alpha=0.0)
     assert result.complex_ifg is not None
@@ -1163,7 +1163,7 @@ def test_stage_write_persists_geocoded_slcs(tmp_path: Path) -> None:
     state.wrapped_phase = np.zeros((4, 4), dtype=np.float32)
     state.unwrapped_phase = np.zeros((4, 4), dtype=np.float32)
     state.connected_components = np.zeros((4, 4), dtype=np.int32)
-    state.reference_geocoded_slc = np.ones((8, 8), dtype=np.complex64)
+    state.primary_geocoded_slc = np.ones((8, 8), dtype=np.complex64)
     state.secondary_geocoded_slc = np.full((8, 8), 2 + 1j, dtype=np.complex64)
     state.geocoded_slc_valid = np.ones((8, 8), dtype=bool)
     state.geo_grid = GeoGridSpec(
