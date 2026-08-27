@@ -1295,7 +1295,7 @@ class Stack(Network):
     ) -> Self:
         """Form interferograms from persisted master-aligned scene artifacts.
 
-        This method deliberately has no SAFE-path or ``run_pair`` fallback.
+        This method deliberately has no SAFE-path or pair-runner fallback.
         Missing, incomplete, mixed-domain, or multi-unit generations fail
         closed until the provider supplies a complete scene manifest.
         """
@@ -1680,6 +1680,88 @@ class Stack(Network):
             wavelength_m=wavelength_m,
         )
         return self.timeseries
+
+    def analyze_time_series(
+        self,
+        *,
+        solver: str = "sbas",
+        model: Any | None = None,
+        **kwargs: Any,
+    ) -> TimeSeriesResult:
+        """Analyze the Stack's inherited Network products after unwrapping.
+
+        ``Stack`` owns the SLC-to-interferogram lifecycle.  Once the unwrap
+        stage has committed a complete product set, this method schedules the
+        existing SBAS time-series solver over that same pair network.  No
+        second Network instance or Dataset injection path is created.
+
+        Parameters
+        ----------
+        solver : str, default="sbas"
+            Currently the shared Stack inversion is the SBAS solver.
+        model : object, optional
+            Reserved for a future NSBAS model adapter.
+        **kwargs : Any
+            Options forwarded to :meth:`invert_timeseries`.
+
+        Returns
+        -------
+        TimeSeriesResult
+            Inverted per-date time series.
+
+        Raises
+        ------
+        ValueError
+            If analysis is requested before unwrapped products are ready or
+            an unsupported solver is selected.
+
+        """
+        del model
+        if solver.lower() != "sbas":
+            message = f"unsupported Stack time-series solver {solver!r}"
+            logger.error(message)
+            raise ValueError(message)
+        if self.unwrap_result is None:
+            message = (
+                "Stack Network analysis is unavailable before committed "
+                "interferograms are unwrapped"
+            )
+            logger.error(message)
+            raise ValueError(message)
+        return self.invert_timeseries(**kwargs)
+
+    def estimate_ionosphere(self, **kwargs: Any) -> list[Any]:
+        """Estimate per-pair ionospheric screens (PROPOSAL-0036).
+
+        See
+        :func:`faninsar.processing.stack.stack_api.estimate_ionosphere`
+        for the full parameter contract.
+        """
+        from faninsar.processing.stack.stack_api import estimate_ionosphere
+
+        return estimate_ionosphere(self, **kwargs)
+
+    def apply_ionosphere_correction(self, **kwargs: Any) -> dict[str, Path]:
+        """Subtract qualified ion screens from unwrapped pair phases.
+
+        See
+        :func:`faninsar.processing.stack.stack_api.apply_ionosphere_correction`
+        for the full parameter contract.
+        """
+        from faninsar.processing.stack.stack_api import apply_ionosphere_correction
+
+        return apply_ionosphere_correction(self, **kwargs)
+
+    def invert_ionosphere_dates(self, **kwargs: Any) -> Any:
+        """Invert published pair ion screens into per-date screens.
+
+        See
+        :func:`faninsar.processing.stack.stack_api.invert_ionosphere_dates`
+        for the full parameter contract.
+        """
+        from faninsar.processing.stack.stack_api import invert_ionosphere_dates
+
+        return invert_ionosphere_dates(self, **kwargs)
 
     def publish_generation(
         self,
