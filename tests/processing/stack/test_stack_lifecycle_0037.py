@@ -10,6 +10,7 @@ import pytest
 from faninsar.processing.errors import PairConfigurationMigrationError
 from faninsar.processing.stack import (
     S1Stack,
+    SourceHandle,
     Stack,
     StackSceneProvider,
     UnsupportedStackCapabilityError,
@@ -74,7 +75,7 @@ def test_s1_provider_owns_pair_dispatch(
     calls: list[tuple[object, object]] = []
 
     def fake_producer(
-        reference: object, secondary: object, **kwargs: object
+        reference: SourceHandle, secondary: SourceHandle, **kwargs: object
     ) -> object:
         calls.append((reference, secondary))
         assert kwargs["output_dir"] == tmp_path / "pair"
@@ -85,7 +86,45 @@ def test_s1_provider_owns_pair_dispatch(
         fake_producer,
     )
     stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")
-    assert calls == [(source[0], source[1])]
+    assert len(calls) == 1
+    assert calls[0][0]._resolve() == (source[0],)
+    assert calls[0][1]._resolve() == (source[1],)
+
+
+def test_stack_provider_receives_opaque_handles_without_path_leak(
+    tmp_path: Path,
+) -> None:
+    """Provider callbacks receive handles whose repr and string are opaque."""
+    source = [_safe(tmp_path, "20240101"), _safe(tmp_path, "20240113")]
+    stack = Stack._from_safes(
+        source,
+        work_dir=tmp_path / "work",
+        activation_mode="reference",
+    )
+    received: list[tuple[SourceHandle, SourceHandle]] = []
+
+    def produce_pair(
+        reference: SourceHandle,
+        secondary: SourceHandle,
+        *,
+        output_dir: Path,
+        options: dict[str, object],
+    ) -> SimpleNamespace:
+        del output_dir, options
+        received.append((reference, secondary))
+        return SimpleNamespace()
+
+    stack.scene_provider = StackSceneProvider(
+        name="opaque-test",
+        produce_pair=produce_pair,
+    )
+    stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")
+
+    reference, secondary = received[0]
+    assert str(source[0]) not in repr(reference)
+    assert str(source[1]) not in repr(secondary)
+    assert str(source[0]) not in str(reference)
+    assert str(source[1]) not in str(secondary)
 
 
 def test_stack_reference_is_the_only_public_common_acquisition_name(

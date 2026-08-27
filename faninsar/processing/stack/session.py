@@ -39,6 +39,7 @@ from faninsar.processing.stack.config import (
     EsdMethod,
     StackConfig,
 )
+from faninsar.processing.stack.provider import SourceHandle
 from faninsar.processing.stack.scene_store import (
     CoregisteredSceneStore,
     copy_reference_units,
@@ -672,8 +673,8 @@ class Stack(Network):
 
     def _produce_pair(
         self,
-        reference_path: Path,
-        secondary_path: Path,
+        reference_path: SourceHandle | Path | tuple[Path, ...],
+        secondary_path: SourceHandle | Path | tuple[Path, ...],
         *,
         output_dir: Path,
         **options: Any,
@@ -696,8 +697,8 @@ class Stack(Network):
                 reason,
             )
         return self.scene_provider(
-            reference_path,
-            secondary_path,
+            SourceHandle._from_source(reference_path),
+            SourceHandle._from_source(secondary_path),
             output_dir=output_dir,
             options=options,
         )

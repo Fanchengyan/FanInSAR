@@ -18,6 +18,7 @@ from faninsar.processing.stack.config import (
 from faninsar.processing.stack.nisar import NISARStack
 from faninsar.processing.stack.provider import (
     SceneProductionCallback,
+    SourceHandle,
     StackProviderError,
     StackSceneProvider,
     UnsupportedStackCapabilityError,
@@ -38,6 +39,7 @@ __all__ = [
     "S1Stack",
     "SceneCatalog",
     "SceneProductionCallback",
+    "SourceHandle",
     "Stack",
     "StackConfig",
     "StackGateEvent",

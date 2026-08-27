@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_pair_configuration
-from faninsar.processing.stack.provider import StackSceneProvider
+from faninsar.processing.stack.provider import SourceHandle, StackSceneProvider
 from faninsar.processing.stack.session import Stack
 
 if TYPE_CHECKING:
@@ -17,8 +17,8 @@ logger = setup_logger(__name__)
 
 
 def _produce_s1_pair(
-    reference_path: Path | tuple[Path, ...],
-    secondary_path: Path | tuple[Path, ...],
+    reference_path: SourceHandle,
+    secondary_path: SourceHandle,
     *,
     output_dir: Path,
     options: dict[str, Any],
@@ -26,16 +26,23 @@ def _produce_s1_pair(
     """Dispatch one admitted SAFE pair through the S1 production adapter."""
     from faninsar.processing.pipeline.production import produce_interferogram_pair
 
+    reference_sources = reference_path._resolve()
+    secondary_sources = secondary_path._resolve()
+
     # Preserve the scalar callback shape for ordinary one-frame acquisitions;
     # frame stacks remain tuples and are consumed by the production adapter.
-    if isinstance(reference_path, tuple) and len(reference_path) == 1:
-        reference_path = reference_path[0]
-    if isinstance(secondary_path, tuple) and len(secondary_path) == 1:
-        secondary_path = secondary_path[0]
+    reference_input: Path | tuple[Path, ...] = (
+        reference_sources[0]
+        if len(reference_sources) == 1
+        else reference_sources
+    )
+    secondary_input: Path | tuple[Path, ...] = (
+        secondary_sources[0] if len(secondary_sources) == 1 else secondary_sources
+    )
 
     return produce_interferogram_pair(
-        reference_path,
-        secondary_path,
+        reference_input,
+        secondary_input,
         output_dir=output_dir,
         **options,
     )

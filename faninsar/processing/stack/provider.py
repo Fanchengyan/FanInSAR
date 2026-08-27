@@ -3,20 +3,20 @@
 The Stack orchestration layer owns lifecycle, persistence, and downstream
 products.  Mission adapters own the way a pair of source scenes is converted
 into the normalized scene units consumed by that lifecycle.  This module keeps
-that seam deliberately small: a provider receives two source paths and the
-already-normalized production options, and returns the provider's pair state.
+that seam deliberately small: a provider receives two opaque source handles
+and the already-normalized production options, and returns its pair state.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
 
     SourcePath = Path | tuple[Path, ...]
 else:
@@ -25,13 +25,55 @@ else:
 logger = setup_logger(__name__)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class SourceHandle:
+    """Opaque provider input for an admitted source acquisition.
+
+    Source paths are intentionally absent from the public representation and
+    string form.  Mission adapters may resolve the private handle at their
+    boundary, while provider callbacks never receive raw paths or URIs from
+    Stack orchestration.
+    """
+
+    _paths: tuple[Path, ...]
+
+    def __post_init__(self) -> None:
+        """Validate and normalize the private source payload."""
+        paths = tuple(Path(path) for path in self._paths)
+        if not paths:
+            message = "source handle requires at least one source path"
+            logger.error(message)
+            raise ValueError(message)
+        object.__setattr__(self, "_paths", paths)
+
+    @classmethod
+    def _from_source(cls, source: SourcePath | SourceHandle) -> SourceHandle:
+        """Create or preserve a handle at the Stack/provider boundary."""
+        if isinstance(source, cls):
+            return source
+        paths = (source,) if isinstance(source, Path) else tuple(source)
+        return cls(paths)
+
+    def _resolve(self) -> tuple[Path, ...]:
+        """Resolve source paths for use inside a trusted mission adapter."""
+        return self._paths
+
+    def __repr__(self) -> str:
+        """Return a representation that cannot disclose source paths."""
+        return "SourceHandle(<opaque>)"
+
+    def __str__(self) -> str:
+        """Return an opaque, path-free string form."""
+        return "SourceHandle(<opaque>)"
+
+
 class SceneProductionCallback(Protocol):
     """Callable contract for one provider-owned pair scene production."""
 
     def __call__(
         self,
-        reference_path: SourcePath,
-        secondary_path: SourcePath,
+        reference_path: SourceHandle,
+        secondary_path: SourceHandle,
         *,
         output_dir: Path,
         options: Mapping[str, Any],
@@ -99,8 +141,8 @@ class StackSceneProvider:
 
     def __call__(
         self,
-        reference_path: SourcePath,
-        secondary_path: SourcePath,
+        reference_path: SourceHandle,
+        secondary_path: SourceHandle,
         *,
         output_dir: Path,
         options: Mapping[str, Any],
@@ -113,8 +155,8 @@ class StackSceneProvider:
                 self.unsupported_reason,
             )
         return self.produce_pair(
-            reference_path,
-            secondary_path,
+            SourceHandle._from_source(reference_path),
+            SourceHandle._from_source(secondary_path),
             output_dir=output_dir,
             options=options,
         )
@@ -177,6 +219,7 @@ def unsupported_stack_capability(
 
 __all__ = [
     "SceneProductionCallback",
+    "SourceHandle",
     "StackProviderError",
     "StackSceneProvider",
     "UnsupportedStackCapabilityError",

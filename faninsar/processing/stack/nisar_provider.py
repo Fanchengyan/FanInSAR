@@ -24,7 +24,10 @@ from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import GeoGrid, RadarGrid
 from faninsar.processing.errors import InvalidProcessingStateError, reject_invalid_state
 from faninsar.processing.slc import RadarSLC
-from faninsar.processing.stack.provider import UnsupportedStackCapabilityError
+from faninsar.processing.stack.provider import (
+    SourceHandle,
+    UnsupportedStackCapabilityError,
+)
 from faninsar.processing.stack.scene_store import (
     CoregisteredSceneStore,
     scene_grid_identity,
@@ -1027,21 +1030,23 @@ def make_nisar_scene_provider(
     }
 
     def produce_pair(
-        reference_path: Path | tuple[Path, ...],
-        secondary_path: Path | tuple[Path, ...],
+        reference_path: SourceHandle,
+        secondary_path: SourceHandle,
         *,
         output_dir: Path,
         options: Mapping[str, Any],
     ) -> NisarPairState:
-        def one_path(value: Path | tuple[Path, ...], label: str) -> Path:
+        def one_path(
+            value: SourceHandle | Path | tuple[Path, ...],
+            label: str,
+        ) -> Path:
             """Resolve one source path from a logical acquisition payload."""
-            if isinstance(value, tuple):
-                if len(value) != 1:
-                    reject_invalid_state(
-                        f"NISAR provider requires one RSLC path for {label}"
-                    )
-                return value[0]
-            return value
+            sources = SourceHandle._from_source(value)._resolve()
+            if len(sources) != 1:
+                reject_invalid_state(
+                    f"NISAR provider requires one RSLC path for {label}"
+                )
+            return sources[0]
 
         reference_source = one_path(reference_path, "reference")
         secondary_source = one_path(secondary_path, "secondary")
