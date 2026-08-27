@@ -162,4 +162,3 @@ def test_restore_original_domain_is_unit_magnitude() -> None:
     np.testing.assert_allclose(
         np.abs(out[interior]), amp0[interior], rtol=1e-5, atol=1e-5
     )
-

@@ -21,14 +21,10 @@ def test_pipeline_exports_have_no_pair_execution_entry_points() -> None:
 
 def test_legacy_pipeline_modules_are_removed() -> None:
     """The old pair and stack execution modules are no longer importable."""
-    import importlib
+    import importlib.util
 
     for name in (
         "faninsar.processing.pipeline.pair_pipeline",
         "faninsar.processing.pipeline.stack_pipeline",
     ):
-        try:
-            importlib.import_module(name)
-        except ModuleNotFoundError:
-            continue
-        raise AssertionError(f"legacy module remains importable: {name}")
+        assert importlib.util.find_spec(name) is None

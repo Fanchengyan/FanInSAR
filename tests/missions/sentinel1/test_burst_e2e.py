@@ -26,4 +26,3 @@ def test_read_burst_window_from_real_safe() -> None:
     assert window.samples.shape == (64, 64)
     assert np.iscomplexobj(window.samples)
     assert float(np.mean(np.abs(window.samples) > 0)) > 0.5
-
