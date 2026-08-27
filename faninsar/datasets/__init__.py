@@ -9,7 +9,7 @@ from .base.hierarchical import HierarchicalMixin
 from .base.pair import PairDataset
 from .base.raster import RasterDataset
 from .base.timeseries import TimeSeriesDataset
-from .frame import Frame, FrameGeometry, FrameInterferogramCollection
+from .frame import FrameGeometry, FrameInterferogramCollection
 from .gacos import GACOS, GACOSPairs
 from .geogrid import GeoGrid
 

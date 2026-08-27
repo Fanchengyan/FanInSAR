@@ -53,6 +53,8 @@ from faninsar._public import __all__ as _public_all
 # observe a partially initialized ``faninsar`` module.
 _NETWORK_EXPORTS = (
     "Network",
+    "NISARStack",
+    "S1Stack",
     "Stack",
 )
 __all__ = [*_public_all, *_NETWORK_EXPORTS]  # noqa: PLE0604
