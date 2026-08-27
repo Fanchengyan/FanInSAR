@@ -1,13 +1,15 @@
-"""Path-based public access to a standardized InSAR network.
+"""Canonical, path-based access to a FanInSAR acquisition Network.
 
-The on-disk representation of a network is the standardized frame product
-already implemented by :mod:`faninsar.datasets.frame`.  ``Network`` is the
-public name for that path-based product; it intentionally uses the concrete
-Frame implementation rather than introducing a second compatibility proxy.
+``Frame`` remains the reader for historical frame products.  ``Network`` is
+the stricter public seam: a product must carry a versioned manifest, a
+complete immutable generation, and the canonical interferogram index type.
+External processor names are declaration-only adapters in this MVP; they do
+not probe or infer unrelated processor layouts.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -15,68 +17,77 @@ from faninsar.logging import setup_logger
 
 from .frame.frame import Frame
 
-logger = setup_logger(__name__)
-
 if TYPE_CHECKING:
     from os import PathLike
 
+logger = setup_logger(__name__)
 
-class NetworkConstructionError(Exception):
+NETWORK_SCHEMA_VERSION = "network_v1"
+NETWORK_MANIFEST_NAME = "manifest.json"
+NETWORK_CURRENT_NAME = "CURRENT"
+NETWORK_GENERATIONS_NAME = ".network_generations"
+NETWORK_INDEX_TYPE = "NetworkInterferogramIndex"
+_MAX_MANIFEST_BYTES = 1024 * 1024
+
+
+class NetworkConstructionError(RuntimeError):
     """Base error raised when a path cannot construct a :class:`Network`."""
 
 
 class NetworkPathError(NetworkConstructionError, FileNotFoundError):
-    """Raised when the requested network root is missing or not a directory."""
+    """Raised when the requested Network root is missing or not a directory."""
+
+
+class NetworkManifestError(NetworkConstructionError):
+    """Raised when a Network manifest is missing, malformed, or unsupported."""
+
+
+class NetworkAnalysisError(NetworkConstructionError):
+    """Base error raised when a Network cannot be analyzed."""
+
+
+class NetworkGenerationError(NetworkConstructionError):
+    """Raised when the selected Network generation is absent or incomplete."""
+
+
+class NetworkCurrentError(NetworkGenerationError):
+    """Raised when the current-generation pointer is missing or inconsistent."""
+
+
+class UnknownNetworkIndexTypeError(NetworkManifestError):
+    """Raised when a product declares an index type outside the MVP contract."""
+
+
+class IncompleteNetworkProductError(NetworkAnalysisError):
+    """Raised when a Network has no non-empty interferogram product index."""
 
 
 class LegacyNetworkLayoutError(NetworkConstructionError):
-    """Raised when a path contains a pre-standardization network layout."""
+    """Raised when a path contains a pre-standardization Network layout."""
 
     def __init__(self, root: Path, markers: tuple[Path, ...]) -> None:
-        """Initialize an error describing the legacy paths that were found.
-
-        Parameters
-        ----------
-        root : pathlib.Path
-            Requested network root.
-        markers : tuple[pathlib.Path, ...]
-            Legacy marker paths found below *root*.
-
-        """
+        """Initialize an error describing legacy paths found below *root*."""
         self.root = root
         self.markers = markers
         marker_text = ", ".join(str(path) for path in markers)
         super().__init__(
             f"Legacy InSAR network layout under {root}: {marker_text}. "
-            "Convert the product to the standardized interferograms/ layout "
-            "before constructing Network."
+            "Publish a canonical versioned Network generation first."
         )
 
 
-class NetworkAnalysisError(NetworkConstructionError):
-    """Base error raised when a Network cannot schedule analysis."""
+class ExternalNetworkLayoutError(NetworkConstructionError):
+    """Raised when a processor adapter lacks an explicit layout declaration."""
 
 
-class IncompleteNetworkProductError(NetworkAnalysisError):
-    """Raised when required interferogram products are absent or incomplete."""
-
-
-# Short aliases make the typed failure categories discoverable without making
-# callers depend on the implementation's longer class names.
+# Compatibility aliases for callers that used the first Network seam.
 NetworkLayoutError = LegacyNetworkLayoutError
 LegacyLayoutError = LegacyNetworkLayoutError
 IncompleteNetworkError = IncompleteNetworkProductError
 
 
 def _legacy_markers(root: Path) -> tuple[Path, ...]:
-    """Return legacy interferogram markers directly under *root*.
-
-    ``Frame`` historically accepted ``ifg/`` and ``ifg_index.json``.  The
-    latter can occur either at the product root or inside the interferogram
-    collection, so both locations are checked.  This check is deliberately
-    shallow: unrelated nested source products must not prevent a standard
-    network from being mounted.
-    """
+    """Return legacy interferogram markers directly under *root*."""
     candidates = (
         root / "ifg",
         root / "ifg_index.json",
@@ -85,98 +96,151 @@ def _legacy_markers(root: Path) -> tuple[Path, ...]:
     return tuple(path for path in candidates if path.exists())
 
 
+def _read_manifest(path: Path) -> dict[str, Any]:
+    """Read one bounded, regular JSON manifest object."""
+    if not path.is_file() or path.is_symlink():
+        message = f"Network manifest is missing or unsafe: {path}"
+        logger.error(message)
+        raise NetworkManifestError(message)
+    try:
+        if path.stat().st_size > _MAX_MANIFEST_BYTES:
+            message = f"Network manifest exceeds size limit: {path}"
+            logger.error(message)
+            raise NetworkManifestError(message)
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except NetworkManifestError:
+        raise
+    except (OSError, UnicodeError, ValueError) as exc:
+        message = f"Network manifest cannot be read: {path}"
+        logger.error("%s: %s", message, exc)
+        raise NetworkManifestError(message) from exc
+    if not isinstance(data, dict):
+        message = f"Network manifest must be an object: {path}"
+        logger.error(message)
+        raise NetworkManifestError(message)
+    return data
+
+
+def _validate_manifest(
+    path: Path,
+    *,
+    expected_generation: str | None = None,
+) -> dict[str, Any]:
+    """Validate schema, complete status, generation identity, and index type."""
+    manifest = _read_manifest(path)
+    if manifest.get("schema_version") != NETWORK_SCHEMA_VERSION:
+        message = (
+            f"unsupported Network manifest version at {path}: "
+            f"{manifest.get('schema_version')!r}"
+        )
+        logger.error(message)
+        raise NetworkManifestError(message)
+    if manifest.get("status") != "complete":
+        message = f"Network manifest is not complete: {path}"
+        logger.error(message)
+        raise NetworkGenerationError(message)
+    generation_id = manifest.get("generation_id")
+    if not isinstance(generation_id, str) or not generation_id.strip():
+        message = f"Network manifest has no generation_id: {path}"
+        logger.error(message)
+        raise NetworkManifestError(message)
+    if expected_generation is not None and generation_id != expected_generation:
+        message = f"Network generation identity mismatch at {path}"
+        logger.error(message)
+        raise NetworkGenerationError(message)
+    index_type = manifest.get("index_type", manifest.get("type"))
+    if index_type != NETWORK_INDEX_TYPE:
+        message = f"unknown Network index type {index_type!r} at {path}"
+        logger.error(message)
+        raise UnknownNetworkIndexTypeError(message)
+    products = manifest.get("products")
+    if not isinstance(products, list) or not products:
+        message = f"Network product index is empty or missing: {path}"
+        logger.error(message)
+        raise IncompleteNetworkProductError(message)
+    return manifest
+
+
+def _validate_network_layout(root: Path) -> dict[str, Any]:
+    """Validate the canonical root manifest and selected immutable generation."""
+    markers = _legacy_markers(root)
+    if markers:
+        logger.error("Refusing legacy Network layout at %s; markers=%s", root, markers)
+        raise LegacyNetworkLayoutError(root, markers)
+
+    root_manifest = _validate_manifest(root / NETWORK_MANIFEST_NAME)
+    generations = root / NETWORK_GENERATIONS_NAME
+    if not generations.is_dir() or generations.is_symlink():
+        message = f"Network generation root is missing or unsafe: {generations}"
+        logger.error(message)
+        raise NetworkGenerationError(message)
+    current_path = root / NETWORK_CURRENT_NAME
+    current = _read_manifest(current_path)
+    generation_id = current.get("generation_id")
+    if generation_id != root_manifest["generation_id"]:
+        message = "Network CURRENT does not select the root manifest generation"
+        logger.error(message)
+        raise NetworkCurrentError(message)
+    generation_root = generations / str(generation_id)
+    if not generation_root.is_dir() or generation_root.is_symlink():
+        message = (
+            "Network generation directory is missing or unsafe: "
+            f"{generation_root}"
+        )
+        logger.error(message)
+        raise NetworkCurrentError(message)
+    _validate_manifest(
+        generation_root / NETWORK_MANIFEST_NAME,
+        expected_generation=str(generation_id),
+    )
+    if not (root / "interferograms").is_dir():
+        message = "Network requires an interferograms/ product collection"
+        logger.error(message)
+        raise IncompleteNetworkProductError(message)
+    return root_manifest
+
+
 class Network(Frame):
-    """Concrete path-based view of one standardized InSAR network.
-
-    ``Network`` exposes the geometry, interferogram, and time-series members
-    of the existing Dataset-backed :class:`~faninsar.datasets.frame.Frame`.
-    Its constructor admits only the standardized product layout and rejects
-    legacy ``ifg/`` and ``ifg_index.json`` products before Frame performs any
-    dataset discovery.
-
-    Parameters
-    ----------
-    root : str or os.PathLike or pathlib.Path
-        Existing directory containing the standardized ``geometry/`` and/or
-        ``interferograms/`` product members.
-
-    Examples
-    --------
-    >>> network = Network("standardized-frame")
-    >>> network.interferograms
-
-    """
+    """Concrete path-based view of one canonical InSAR Network."""
 
     def __init__(self, root: str | PathLike[str]) -> None:
-        """Mount a standardized network from *root*.
-
-        Parameters
-        ----------
-        root : str or os.PathLike or pathlib.Path
-            Existing standardized network directory.
-
-        Raises
-        ------
-        NetworkPathError
-            If *root* does not exist or is not a directory.
-        LegacyNetworkLayoutError
-            If *root* contains a legacy ``ifg/`` or ``ifg_index.json`` marker.
-        NetworkConstructionError
-            If *root* cannot be interpreted as a filesystem path.
-
-        """
+        """Mount and validate a canonical Network product."""
         try:
             resolved_root = Path(root)
         except TypeError as exc:
-            msg = f"Network root must be path-like, got {root!r}"
-            logger.exception(msg)
-            raise NetworkConstructionError(msg) from exc
-
+            message = f"Network root must be path-like, got {root!r}"
+            logger.error(message)
+            raise NetworkConstructionError(message) from exc
         if not resolved_root.exists() or not resolved_root.is_dir():
-            msg = f"Network directory not found: {resolved_root}"
-            logger.error(msg)
-            raise NetworkPathError(msg)
-
-        markers = _legacy_markers(resolved_root)
-        if markers:
-            logger.error(
-                "Refusing legacy Network layout at %s; markers=%s",
-                resolved_root,
-                markers,
-            )
-            raise LegacyNetworkLayoutError(resolved_root, markers)
-
-        # Frame is the concrete implementation.  Calling super() directly
-        # keeps Network a real class while preserving all Dataset behavior.
+            message = f"Network directory not found: {resolved_root}"
+            logger.error(message)
+            raise NetworkPathError(message)
+        self.manifest = _validate_network_layout(resolved_root)
+        self.generation_root = (
+            resolved_root
+            / NETWORK_GENERATIONS_NAME
+            / str(self.manifest["generation_id"])
+        )
         super().__init__(resolved_root)
-        metadata = self.interferograms.index_metadata if self.interferograms else None
-        if metadata is not None:
-            product_type = metadata.get("type")
-            if isinstance(product_type, str) and product_type.startswith("Frame"):
-                marker = self.interferograms.root / "interferograms_index.json"
-                message = (
-                    "Frame metadata is not a canonical Network product; rebuild "
-                    f"the interferogram index at {marker}"
-                )
-                logger.error(message)
-                raise LegacyNetworkLayoutError(resolved_root, (marker,))
-        self._product_index = None
+        self._product_index: Any = None
+        index = self.interferograms.index_metadata if self.interferograms else None
+        if index is None:
+            message = "Network interferograms have no canonical index"
+            logger.error(message)
+            raise IncompleteNetworkProductError(message)
+        index_type = index.get("type", index.get("index_type"))
+        if index_type != NETWORK_INDEX_TYPE:
+            message = f"unknown Network index type {index_type!r}"
+            logger.error(message)
+            raise UnknownNetworkIndexTypeError(message)
+        if not self.interferograms.pairs().names:
+            message = "Network interferogram index contains no products"
+            logger.error(message)
+            raise IncompleteNetworkProductError(message)
 
     @classmethod
     def from_path(cls, root: str | PathLike[str]) -> Self:
-        """Construct a network from a filesystem path.
-
-        Parameters
-        ----------
-        root : str or os.PathLike or pathlib.Path
-            Existing standardized network directory.
-
-        Returns
-        -------
-        Network
-            Mounted network backed by the Dataset Frame implementation.
-
-        """
+        """Construct a Network from a canonical filesystem path."""
         return cls(root)
 
     @property
@@ -187,20 +251,9 @@ class Network(Frame):
     def register_products(self, products: Any) -> Any:
         """Register one homogeneous set of logical product records.
 
-        Product records contain locators and lineage only; Dataset objects are
-        still opened internally by the Network data layer.  Registration
-        rejects duplicate keys or mixed analysis cohorts before solving.
-
-        Parameters
-        ----------
-        products : iterable of NetworkProduct
-            Logical product records to register.
-
-        Returns
-        -------
-        NetworkProductIndex
-            The validated index retained by this Network.
-
+        Dataset discovery remains internal to Network; callers provide only
+        immutable product metadata and locators.  Duplicate or mixed cohorts
+        are rejected before a solver can be scheduled.
         """
         from faninsar.core.network import NetworkProductIndex
 
@@ -208,7 +261,7 @@ class Network(Frame):
             index = NetworkProductIndex(tuple(products)).homogeneous()
         except (TypeError, ValueError) as exc:
             message = f"Network product registration rejected: {exc}"
-            logger.exception(message)
+            logger.error(message)
             raise NetworkConstructionError(message) from exc
         self._product_index = index
         return index
@@ -221,52 +274,20 @@ class Network(Frame):
         pairs: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        """Run time-series analysis over the Network's committed products.
+        """Analyze the mounted Network through its Dataset-backed stack.
 
-        Dataset discovery remains internal to :class:`Network`; callers pass
-        solver options, not raster objects.  The method consumes the existing
-        ``InterferogramStack`` seam and fails before solver construction when
-        no complete unwrapped product set is available.
-
-        Parameters
-        ----------
-        solver : {"sbas", "nsbas"}, default="sbas"
-            Time-series solver family.
-        model : object, optional
-            Optional NSBAS temporal model.
-        pairs : Pairs, optional
-            Optional homogeneous subset of registered pairs.
-        **kwargs : Any
-            Solver keyword arguments.
-
-        Returns
-        -------
-        Any
-            Existing FanInSAR time-series result type.
-
-        Raises
-        ------
-        ValueError
-            If products are absent or *solver* is unknown.
-
+        The raster Dataset is opened internally from the canonical path.  No
+        caller-provided Dataset object is accepted at this boundary.
         """
         if self.interferograms is None:
             message = "Network has no interferogram products to analyze"
             logger.error(message)
             raise IncompleteNetworkProductError(message)
-        if self.interferograms.index_metadata is not None:
-            product_type = self.interferograms.index_metadata.get("type")
-            if product_type not in {None, "NetworkInterferogramIndex"}:
-                message = "Network product index is not a canonical Network index"
-                logger.error(message)
-                raise IncompleteNetworkProductError(message)
         try:
             stack = self.to_ifg_stack(pairs=pairs)
         except Exception as exc:
-            if isinstance(exc, NetworkAnalysisError):
-                raise
             message = f"Network products cannot be opened for analysis: {exc}"
-            logger.exception(message)
+            logger.error(message)
             raise IncompleteNetworkProductError(message) from exc
         normalized_solver = solver.lower()
         if normalized_solver == "sbas":
@@ -283,53 +304,82 @@ class Network(Frame):
 
     def __repr__(self) -> str:
         """Return a concise Network summary."""
-        parts = [f"Network(root={self.root!r})"]
-        if self.geometry is not None:
-            parts.append(f"  geometry: {self.geometry.root}")
-        if self.interferograms is not None:
-            summary: dict[str, Any] = self.interferograms.summary()
-            parts.append(f"  interferograms: {summary['pair_count']} pairs")
-        return "\n".join(parts)
+        pair_count = len(self.interferograms.pairs()) if self.interferograms else 0
+        return (
+            f"Network(root={self.root!r}, "
+            f"generation={self.manifest['generation_id']!r}, pairs={pair_count})"
+        )
 
 
-class ISCE2Network(Network):
-    """Network adapter for products authored by ISCE2.
+class _DeclaredProcessorNetwork(Network):
+    """Network adapter whose processor identity is an explicit manifest marker."""
 
-    The adapter intentionally reuses the canonical path contract.  Format
-    discovery is explicit at the class boundary and never probes unrelated
-    processor layouts.
-    """
+    processor_marker: str
+
+    def __init__(self, root: str | PathLike[str]) -> None:
+        """Mount only when ``source_software`` declares this processor."""
+        path = Path(root)
+        if not path.exists() or not path.is_dir():
+            super().__init__(path)
+        manifest = _read_manifest(path / NETWORK_MANIFEST_NAME)
+        if manifest.get("source_software") != self.processor_marker:
+            message = (
+                f"{type(self).__name__} requires manifest source_software="
+                f"{self.processor_marker!r}; no format discovery is performed"
+            )
+            logger.error(message)
+            raise ExternalNetworkLayoutError(message)
+        super().__init__(path)
 
 
-class ISCE3Network(Network):
-    """Network adapter for products authored by ISCE3."""
+class ISCE2Network(_DeclaredProcessorNetwork):
+    """Canonical Network explicitly declared as authored by ISCE2."""
+
+    processor_marker = "isce2"
 
 
-class GAMMANetwork(Network):
-    """Network adapter for products authored by GAMMA."""
+class ISCE3Network(_DeclaredProcessorNetwork):
+    """Canonical Network explicitly declared as authored by ISCE3."""
+
+    processor_marker = "isce3"
 
 
-class GMTSARNetwork(Network):
-    """Network adapter for products authored by GMTSAR."""
+class GAMMANetwork(_DeclaredProcessorNetwork):
+    """Canonical Network explicitly declared as authored by GAMMA."""
+
+    processor_marker = "gamma"
 
 
-class SNAPNetwork(Network):
-    """Network adapter for products authored by SNAP."""
+class GMTSARNetwork(_DeclaredProcessorNetwork):
+    """Canonical Network explicitly declared as authored by GMTSAR."""
+
+    processor_marker = "gmtsar"
+
+
+class SNAPNetwork(_DeclaredProcessorNetwork):
+    """Canonical Network explicitly declared as authored by SNAP."""
+
+    processor_marker = "snap"
 
 
 __all__ = [
+    "ExternalNetworkLayoutError",
     "GAMMANetwork",
     "GMTSARNetwork",
     "ISCE2Network",
     "ISCE3Network",
-    "IncompleteNetworkError",
     "IncompleteNetworkProductError",
+    "IncompleteNetworkError",
     "LegacyLayoutError",
     "LegacyNetworkLayoutError",
     "Network",
-    "NetworkAnalysisError",
     "NetworkConstructionError",
+    "NetworkAnalysisError",
+    "NetworkCurrentError",
+    "NetworkGenerationError",
     "NetworkLayoutError",
+    "NetworkManifestError",
     "NetworkPathError",
     "SNAPNetwork",
+    "UnknownNetworkIndexTypeError",
 ]

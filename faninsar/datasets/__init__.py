@@ -1,5 +1,3 @@
-from typing import Any
-
 import odc.geo.xr  # ensure odc is loaded when using datasets
 
 from .aps import ApsDataset, ApsPairs
@@ -18,25 +16,28 @@ from .geogrid import GeoGrid as GeoBox
 from .hierarchical import HierarchicalDataset
 from .ifg import CoherenceDataset, InterferogramDataset
 from .network import (
+    ExternalNetworkLayoutError,
     GAMMANetwork,
     GMTSARNetwork,
-    IncompleteNetworkError,
-    IncompleteNetworkProductError,
     ISCE2Network,
     ISCE3Network,
-    LegacyLayoutError,
+    IncompleteNetworkError,
+    IncompleteNetworkProductError,
     LegacyNetworkLayoutError,
     Network,
     NetworkAnalysisError,
     NetworkConstructionError,
-    NetworkLayoutError,
+    NetworkCurrentError,
+    NetworkGenerationError,
+    NetworkManifestError,
     NetworkPathError,
     SNAPNetwork,
+    UnknownNetworkIndexTypeError,
 )
 from .xarray_dataset import XarrayDataset
 
 
-def __getattr__(name: str) -> Any:
+def __getattr__(name: str):
     """Lazy loaders rehomed under :mod:`faninsar.io.datasets`."""
     if name == "HyP3S1":
         from faninsar.io.datasets.hyp3 import HyP3S1
@@ -50,5 +51,4 @@ def __getattr__(name: str) -> Any:
         from faninsar.io.datasets.aria import ARIA
 
         return ARIA
-    msg = f"module {__name__!r} has no attribute {name!r}"
-    raise AttributeError(msg)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
