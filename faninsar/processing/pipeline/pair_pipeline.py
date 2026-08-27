@@ -8,10 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from faninsar.logging import setup_logger
 from faninsar.processing.pipeline.products import PairProductArrays
-from faninsar.processing.pipeline.workflow import (
-    PairWorkflowState,
-    execute_pair_workflow,
-)
+from faninsar.processing.pipeline.workflow import PairWorkflowState, _run_pair_workflow
 
 if TYPE_CHECKING:
     from faninsar.processing.tops.deramp import TOPSCarrierModel
@@ -31,7 +28,7 @@ class PairPipelineResult:
     state: PairWorkflowState
 
 
-def execute_pair_pipeline(
+def _run_pair_pipeline(
     primary: str | Path,
     secondary: str | Path,
     *,
@@ -46,17 +43,23 @@ def execute_pair_pipeline(
     height: int = 256,
     width: int = 256,
 ) -> PairPipelineResult:
-    """Run the full pair workflow from two SAFE paths."""
+    """Run the legacy pair workflow from two SAFE paths internally.
+
+    This compatibility implementation is intentionally private.  New callers
+    must construct a :class:`~faninsar.processing.stack.Stack` and use its
+    lifecycle methods so acquisition-set admission and persistence stay under
+    one public execution seam.
+    """
     _ = (carrier, metadata, pair_id)
     if not isinstance(primary, (str, Path)) or not isinstance(secondary, (str, Path)):
         message = (
-            "the pair pipeline requires SAFE paths so deramp/coreg/geocode "
+            "_run_pair_pipeline requires SAFE paths so deramp/coreg/geocode "
             "use annotation metadata."
         )
         logger.error(message)
         raise TypeError(message)
 
-    state = execute_pair_workflow(
+    state = _run_pair_workflow(
         primary,
         secondary,
         output_dir=output_dir,
@@ -97,3 +100,6 @@ def execute_pair_pipeline(
         azimuth_shift_px=float(state.azimuth_shift_px or 0.0),
         state=state,
     )
+
+
+__all__ = ["PairPipelineResult"]

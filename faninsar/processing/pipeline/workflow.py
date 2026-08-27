@@ -425,7 +425,7 @@ def stage_write(
     return state
 
 
-def execute_pair_workflow(
+def _run_pair_workflow(
     reference_path: str | Path,
     secondary_path: str | Path,
     *,
@@ -442,10 +442,11 @@ def execute_pair_workflow(
     device: str = "auto",
     snaphu_config: SnaphuConfig | None = None,
 ) -> PairWorkflowState:
-    """Run the windowed educational pair workflow (deprecated).
+    """Run the windowed educational pair workflow internally (deprecated).
 
-    Prefer the Stack provider for production interferograms.
-    production radar processing.
+    This remains available only to the legacy compatibility implementation.
+    Public callers should use the acquisition-set
+    :class:`~faninsar.processing.stack.Stack` lifecycle.
 
 
     Stages
@@ -488,7 +489,7 @@ def execute_pair_workflow(
 
     """
     warnings.warn(
-        "the legacy pair workflow is no longer a public entry point; use Stack",
+        "_run_pair_workflow is private and deprecated; use Stack for production",
         DeprecationWarning,
         stacklevel=2,
     )
@@ -533,3 +534,16 @@ def execute_pair_workflow(
     state = stage_write(state, output_dir)
     state._note("DONE")
     return state
+
+
+__all__ = [
+    "PairWorkflowState",
+    "SceneBurstData",
+    "stage_coregister",
+    "stage_deramp",
+    "stage_geocode",
+    "stage_interferogram",
+    "stage_read_scene",
+    "stage_unwrap",
+    "stage_write",
+]

@@ -84,7 +84,7 @@ def default_pair_list(scene_ids: Sequence[str]) -> list[tuple[str, str]]:
     return [(a, b) for a, b in combinations(ordered, 2)]
 
 
-def execute_stack_pipeline(
+def _run_stack_pipeline(
     scene_paths: Iterable[str | Path],
     *,
     output_dir: str | Path,
@@ -112,7 +112,11 @@ def execute_stack_pipeline(
     activation_authority_root: str | Path | None = None,
     record_scientific_lineage: bool = False,
 ) -> StackPipelineResult:
-    """Process an arbitrary SAFE stack via :class:`~faninsar.processing.stack.Stack`.
+    """Process an arbitrary SAFE stack internally via :class:`Stack`.
+
+    The module-level convenience wrapper is private.  Public callers must use
+    a constructed :class:`~faninsar.processing.stack.Stack` so the Stack
+    lifecycle is the sole execution seam.
 
     Parameters
     ----------
@@ -171,7 +175,7 @@ def execute_stack_pipeline(
     """
     if height != 256 or width != 256:
         warnings.warn(
-            "height/width are deprecated no-ops; "
+            "_run_stack_pipeline height/width are deprecated no-ops; "
             "production uses full burst",
             DeprecationWarning,
             stacklevel=2,
@@ -287,3 +291,12 @@ def load_safe_burst_windows(
             width=width,
         )
     return out
+
+
+__all__ = [
+    "StackInterferogramResult",
+    "StackPipelineResult",
+    "default_pair_list",
+    "load_safe_burst_windows",
+    "scene_id_from_path",
+]
