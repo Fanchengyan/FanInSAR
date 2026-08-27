@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import stat
+import time
 import uuid
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
@@ -25,11 +26,24 @@ _DEFAULT_MAX_BYTES = 64 * 1024**3
 _DEFAULT_RESERVE_BYTES = 256 * 1024**2
 _MAX_FILES = 4096
 _MAX_DIMENSION = 2**31 - 1
+_DEFAULT_LEASE_TTL_NS = 30 * 1_000_000_000
+_DEFAULT_LEASE_GRACE_NS = 30 * 1_000_000_000
 _ACTIVE_ROOTS: ContextVar[tuple[tuple[str, int], ...]] = ContextVar(
     "artifact_transaction_active_roots",
     default=(),
 )
 _ConcretePath = type(Path())
+
+
+def _duration_ns(value: float, field: str) -> int:
+    """Convert a positive finite duration in seconds to nanoseconds."""
+    try:
+        duration_ns = int(value * 1_000_000_000)
+    except (TypeError, ValueError, OverflowError):
+        reject_invalid_state(f"artifact lease {field} is invalid")
+    if duration_ns <= 0:
+        reject_invalid_state(f"artifact lease {field} must be positive")
+    return duration_ns
 
 
 @dataclass(slots=True)
@@ -624,6 +638,34 @@ def _read_control_at(directory_descriptor: int, name: str) -> dict[str, Any]:
     return value
 
 
+def _read_lease_metadata_at(directory_descriptor: int, name: str) -> dict[str, Any]:
+    """Read and validate one owner-nonce lease record."""
+    if not name.endswith(".json") or "-" not in name:
+        reject_invalid_state("artifact reader lease name is unsafe")
+    file_nonce = name[:-5].rsplit("-", 1)[-1]
+    generation_id = name[:-5].rsplit("-", 1)[0]
+    _validate_component(generation_id, "generation id")
+    _validate_component(file_nonce, "lease nonce")
+    metadata = _read_control_at(directory_descriptor, name)
+    if (
+        metadata.get("schema") != "faninsar_reader_lease_v1"
+        or metadata.get("generation_id") != generation_id
+        or metadata.get("nonce") != file_nonce
+    ):
+        reject_invalid_state("artifact reader lease identity is invalid")
+    for field in ("issued_at_ns", "heartbeat_at_ns", "expires_at_ns", "grace_until_ns"):
+        value = metadata.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            reject_invalid_state("artifact reader lease deadline is invalid")
+    if (
+        metadata["issued_at_ns"] > metadata["heartbeat_at_ns"]
+        or metadata["heartbeat_at_ns"] > metadata["expires_at_ns"]
+        or metadata["expires_at_ns"] > metadata["grace_until_ns"]
+    ):
+        reject_invalid_state("artifact reader lease deadline order is invalid")
+    return metadata
+
+
 def _validate_component(value: str, field: str) -> str:
     if (
         not value
@@ -744,6 +786,74 @@ class GenerationLease:
     _leases_descriptor: int | None = None
     _generation_descriptor: int | None = None
     _closed: bool = False
+    lease_ttl_ns: int = _DEFAULT_LEASE_TTL_NS
+    lease_grace_ns: int = _DEFAULT_LEASE_GRACE_NS
+
+    @property
+    def nonce(self) -> str:
+        """Return the owner nonce embedded in this lease's filename."""
+        return self.path.stem.rsplit("-", 1)[-1]
+
+    def renew(self) -> None:
+        """Atomically renew this lease or fail closed.
+
+        Renewal validates the owner nonce and generation identity from the
+        durable record before writing a new deadline.  A missing, replaced,
+        expired, or malformed record raises :class:`InvalidProcessingStateError`;
+        callers must abort their read rather than continue on an unpinned
+        generation.
+        """
+        if self._closed:
+            reject_invalid_state("cannot renew a closed artifact generation lease")
+        now_ns = time.time_ns()
+        if not isinstance(now_ns, int) or now_ns < 0:
+            reject_invalid_state("artifact lease clock is invalid")
+        root_descriptor = self._root_descriptor
+        leases_descriptor = self._leases_descriptor
+        if root_descriptor is None or leases_descriptor is None:
+            reject_invalid_state("artifact generation lease is not cross-process safe")
+        import fcntl
+
+        try:
+            lock_descriptor = os.open(
+                ".root.lock",
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_descriptor,
+            )
+        except OSError as error:
+            reject_invalid_state(f"artifact generation lease cannot renew: {error}")
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            metadata = _read_lease_metadata_at(leases_descriptor, self.path.name)
+            if metadata["generation_id"] != self.generation_id:
+                reject_invalid_state("artifact lease generation identity changed")
+            if metadata["nonce"] != self.nonce:
+                reject_invalid_state("artifact lease owner nonce changed")
+            previous_heartbeat = metadata["heartbeat_at_ns"]
+            if now_ns < previous_heartbeat:
+                reject_invalid_state("artifact lease clock moved backwards")
+            if now_ns > metadata["expires_at_ns"]:
+                reject_invalid_state("artifact generation lease has expired")
+            expires_at_ns = now_ns + self.lease_ttl_ns
+            _atomic_control_at(
+                leases_descriptor,
+                self.path.name,
+                {
+                    **metadata,
+                    "heartbeat_at_ns": now_ns,
+                    "expires_at_ns": expires_at_ns,
+                    "grace_until_ns": expires_at_ns + self.lease_grace_ns,
+                },
+            )
+        except FileNotFoundError:
+            reject_invalid_state("artifact generation lease disappeared during renewal")
+        finally:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            os.close(lock_descriptor)
+
+    def heartbeat(self) -> None:
+        """Renew this lease using the explicit heartbeat spelling."""
+        self.renew()
 
     def close(self) -> None:
         """Release this reader pin."""
@@ -1001,9 +1111,23 @@ def _read_current(root: Path, namespace: str) -> tuple[str, str]:
         os.close(descriptor)
 
 
-def open_current_generation(root: Path, namespace: str) -> OpenGeneration:
-    """Select and durably pin exactly one current immutable generation."""
+def open_current_generation(
+    root: Path,
+    namespace: str,
+    *,
+    lease_ttl_s: float = 30.0,
+    lease_grace_s: float = 30.0,
+) -> OpenGeneration:
+    """Select and durably pin exactly one current immutable generation.
+
+    ``lease_ttl_s`` controls the interval between required heartbeats;
+    ``lease_grace_s`` controls conservative cleanup after an expired reader.
+    Both values are persisted in the lease deadline fields, allowing a
+    separate process to make the same decision without trusting a PID.
+    """
     root = initialize_root(root)
+    lease_ttl_ns = _duration_ns(lease_ttl_s, "ttl")
+    lease_grace_ns = _duration_ns(lease_grace_s, "grace")
     generation_descriptor: int | None = None
     leases_descriptor: int | None = None
     lease_root_descriptor: int | None = None
@@ -1036,6 +1160,10 @@ def open_current_generation(root: Path, namespace: str) -> OpenGeneration:
             os.close(generations_descriptor)
         lease_id = uuid.uuid4().hex
         lease_path = leases / f"{generation_id}-{lease_id}.json"
+        now_ns = time.time_ns()
+        if not isinstance(now_ns, int) or now_ns < 0:
+            reject_invalid_state("artifact lease clock is invalid")
+        expires_at_ns = now_ns + lease_ttl_ns
         _atomic_control_at(
             leases_descriptor,
             lease_path.name,
@@ -1044,6 +1172,10 @@ def open_current_generation(root: Path, namespace: str) -> OpenGeneration:
                 "generation_id": generation_id,
                 "pid": os.getpid(),
                 "nonce": lease_id,
+                "issued_at_ns": now_ns,
+                "heartbeat_at_ns": now_ns,
+                "expires_at_ns": expires_at_ns,
+                "grace_until_ns": expires_at_ns + lease_grace_ns,
             },
         )
         lease_root_descriptor = os.dup(root_descriptor)
@@ -1074,6 +1206,8 @@ def open_current_generation(root: Path, namespace: str) -> OpenGeneration:
             _root_descriptor=lease_root_descriptor,
             _leases_descriptor=leases_descriptor,
             _generation_descriptor=generation_descriptor,
+            lease_ttl_ns=lease_ttl_ns,
+            lease_grace_ns=lease_grace_ns,
         ),
     )
 
@@ -1081,9 +1215,20 @@ def open_current_generation(root: Path, namespace: str) -> OpenGeneration:
 def collect_generations(
     root: str | Path,
     namespace: Literal["ifg", "unwrap", "timeseries"],
+    *,
+    now_ns: int | None = None,
 ) -> tuple[str, ...]:
-    """Remove non-current generations not protected by a reader lease."""
+    """Remove unleased generations after a two-phase freshness recheck.
+
+    A lease remains protective through its persisted grace deadline, even when
+    its renewal deadline has elapsed.  The second metadata read immediately
+    before removal prevents a concurrent heartbeat from racing reclamation;
+    malformed or ambiguous lease state always aborts collection.
+    """
     root_path = initialize_root(Path(root))
+    current_time_ns = time.time_ns() if now_ns is None else now_ns
+    if not isinstance(current_time_ns, int) or current_time_ns < 0:
+        reject_invalid_state("artifact lease clock is invalid")
     removed: list[str] = []
     with root_lock(root_path) as root_descriptor:
         generations, _, leases, _ = _namespace_paths(root_path, namespace)
@@ -1099,7 +1244,8 @@ def collect_generations(
             label=str(leases),
         )
         try:
-            leased_ids: set[str] = set()
+            protected_ids: set[str] = set()
+            lease_names: list[str] = []
             for lease_name in os.listdir(leases_descriptor):  # noqa: PTH208
                 metadata = os.stat(
                     lease_name,
@@ -1113,12 +1259,29 @@ def collect_generations(
                     or metadata.st_uid != os.getuid()
                 ):
                     reject_invalid_state("artifact reader lease is unsafe")
-                leased_ids.add(lease_name.split("-", 1)[0])
+                lease = _read_lease_metadata_at(leases_descriptor, lease_name)
+                lease_names.append(lease_name)
+                if current_time_ns <= lease["grace_until_ns"]:
+                    protected_ids.add(lease["generation_id"])
+            candidates: list[str] = []
             for generation_name in os.listdir(  # noqa: PTH208
                 generations_descriptor
             ):
                 _validate_component(generation_name, "generation id")
-                if generation_name in {current_id, *leased_ids}:
+                if generation_name in {current_id, *protected_ids}:
+                    continue
+                candidates.append(generation_name)
+
+            # Re-read every lease while holding the same root lock immediately
+            # before removal.  A renewing process either wins before this
+            # phase or is observed on its next collection attempt.
+            protected_ids = set()
+            for lease_name in lease_names:
+                lease = _read_lease_metadata_at(leases_descriptor, lease_name)
+                if current_time_ns <= lease["grace_until_ns"]:
+                    protected_ids.add(lease["generation_id"])
+            for generation_name in candidates:
+                if generation_name in protected_ids:
                     continue
                 generation_descriptor = _open_directory_at(
                     generations_descriptor,
