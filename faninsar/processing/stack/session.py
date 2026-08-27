@@ -1,6 +1,6 @@
 """Mission-neutral Stack session (PROPOSAL-0017).
 
-Orchestrates master-centric coregistration and pair products. Co-registration
+Orchestrates Reference-relative coregistration and pair products. Co-registration
 and interferogram formation are separate stages: coreg caches per-date SLCs;
 ``form_interferograms`` only reads those products.
 """
@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, Self, TypeVar
 
 import numpy as np
 
+from faninsar.datasets.network import Network
 from faninsar.logging import setup_logger
 from faninsar.processing.coreg.misreg_network import (
     DateMisreg,
@@ -347,8 +348,8 @@ def _pairs_from_factory(
 
 
 @dataclass
-class Stack:
-    """Multi-scene InSAR session with master-centric coregistration.
+class Stack(Network):
+    """Multi-scene InSAR session with Reference-relative coregistration.
 
     Parameters
     ----------
@@ -360,8 +361,8 @@ class Stack:
         Interferogram network. Default: short-baseline auto.
     misreg_pairs : Pairs, optional
         Misregistration measurement network. Default: shorter auto subset.
-    master : str, optional
-        Master date id. Default: earliest catalog date.
+    reference : str, optional
+        Reference date id. Default: earliest catalog date.
     acquisitions : Acquisition, optional
         Optional domain Acquisition index (informational).
 
@@ -385,12 +386,25 @@ class Stack:
     _prepared: bool = False
     _generation: StackResultGeneration | None = field(default=None, repr=False)
 
+    def __post_init__(self) -> None:
+        """Initialize the inherited Network analysis surface lazily.
+
+        A raw Stack has no on-disk Network products until interferogram
+        formation commits them.  The Dataset-backed members are therefore
+        initialized as empty views and are populated only by a future
+        generation refresh; this keeps raw SAFE discovery out of Network.
+        """
+        self._root = self.config.work_dir
+        self._geometry = None
+        self._interferograms = None
+        self._timeseries = None
+        self._product_index = None
+
     @property
     def reference(self) -> str:
         """Return the canonical Stack reference acquisition ID.
 
-        ``master`` remains as a read/write compatibility spelling for older
-        clients, but all new Stack-facing APIs should use ``reference``.
+        Reference is the Stack-wide common acquisition used for alignment.
         """
         return self.master
 
@@ -403,6 +417,8 @@ class Stack:
     def from_safes(
         cls,
         paths: Sequence[str | Path],
+        *,
+        reference: str | None = None,
         **kwargs: Any,
     ) -> Stack:
         """Construct the concrete Sentinel-1 adapter from SAFE sources.
@@ -413,6 +429,14 @@ class Stack:
         """
         from faninsar.processing.stack.s1 import S1Stack
 
+        if "master" in kwargs:
+            from faninsar.processing.errors import reject_pair_configuration
+
+            reject_pair_configuration(
+                "Stack.from_safes no longer accepts 'master'; use 'reference'"
+            )
+        if reference is not None:
+            kwargs["reference"] = reference
         return S1Stack.from_safes(paths, **kwargs)
 
     @classmethod
@@ -423,7 +447,7 @@ class Stack:
         work_dir: str | Path,
         pairs: Pairs | None = None,
         misreg_pairs: Pairs | None = None,
-        master: str | None = None,
+        reference: str | None = None,
         dem: DEMSampler | None = None,
         geo_grid: GeoGridSpec | None = None,
         roi: BoundingBox | Polygons | None = None,
@@ -442,7 +466,7 @@ class Stack:
         pair_max_days: int = 72,
         misreg_max_interval: int = 2,
         misreg_max_days: int = 36,
-        activation_mode: ActivationMode,
+        activation_mode: ActivationMode = "reference",
         activation_binding: StackActivationBinding | None = None,
         activation_token: ActivationToken | None = None,
         activation_authority_root: str | Path | None = None,
@@ -453,9 +477,9 @@ class Stack:
         """Construct a Stack from SAFE paths and optional pair graphs."""
         catalog = SceneCatalog.from_paths(list(paths))
         dates = list(catalog.dates)
-        master_id = master or dates[0]
-        if master_id not in catalog.paths:
-            reject_invalid_state(f"master {master_id} not in catalog")
+        reference_id = reference or dates[0]
+        if reference_id not in catalog.paths:
+            reject_invalid_state(f"reference {reference_id} not in catalog")
         ifg_pairs = pairs or _pairs_from_factory(
             dates,
             max_interval=pair_max_interval,
@@ -503,7 +527,7 @@ class Stack:
             config=config,
             pairs=ifg_pairs,
             misreg_pairs=m_pairs,
-            master=master_id,
+            master=reference_id,
             acquisitions=acq,
             dask_client=dask_client,
         )
@@ -1250,7 +1274,7 @@ class Stack:
             )
             logger.info("Coregistered %s → master %s", date_id, self.master)
             if not self.config.retain_pair_states:
-                # Assignment evaluates the next ``run_pair`` call before
+                # Assignment evaluates the next provider call before
                 # replacing this local. Drop the completed state's full-burst
                 # arrays now so adjacent dates cannot overlap in memory.
                 del state
