@@ -194,6 +194,7 @@ def test_stack_analysis_delegates_through_network_base(monkeypatch) -> None:
     """Stack uses inherited Network admission before its existing inversion."""
     stack = object.__new__(Stack)
     stack.refresh_generation("generation-a", (_product(),))
+    stack.unwrap_result = object()
     monkeypatch.setattr(
         stack,
         "invert_timeseries",

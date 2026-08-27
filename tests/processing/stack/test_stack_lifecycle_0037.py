@@ -87,8 +87,7 @@ def test_s1_provider_owns_pair_dispatch(
     )
     stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")
     assert len(calls) == 1
-    assert calls[0][0]._resolve() == (source[0],)
-    assert calls[0][1]._resolve() == (source[1],)
+    assert calls == [(source[0], source[1])]
 
 
 def test_stack_provider_receives_opaque_handles_without_path_leak(
