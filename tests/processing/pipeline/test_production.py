@@ -304,9 +304,7 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
     assert result.amplitude_residual_rg_px == pytest.approx(0.0)
     expected_ampcor_executor = "torch"
     expected_ampcor_device = (
-        "cuda"
-        if requested_device == "gpu" and cuda_available()
-        else "cpu"
+        "cuda" if requested_device == "gpu" and cuda_available() else "cpu"
     )
     expected_resample_device = (
         "auto" if requested_device == "auto" else expected_ampcor_device

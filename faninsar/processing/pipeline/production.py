@@ -4682,9 +4682,7 @@ def produce_interferogram_pair(
                     scientific_lineage=state.scientific_lineage,
                     phase_state=_phase_state_manifest(state),
                 )
-            pri_power = (
-                state.primary_deramped.real**2 + state.primary_deramped.imag**2
-            )
+            pri_power = state.primary_deramped.real**2 + state.primary_deramped.imag**2
             sec_power = (
                 state.secondary_aligned.real**2 + state.secondary_aligned.imag**2
             )
@@ -4783,9 +4781,7 @@ def produce_interferogram_pair(
     result = ProductionPairState(
         pair_id=_scene_id(primary_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair",
         primary=(
-            origin_state.primary
-            if origin_state is not None
-            else first_state.primary
+            origin_state.primary if origin_state is not None else first_state.primary
         ),
         secondary=(
             origin_state.secondary
