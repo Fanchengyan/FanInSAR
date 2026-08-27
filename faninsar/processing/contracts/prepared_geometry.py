@@ -740,7 +740,7 @@ class PhaseState:
     """Immutable phase state machine that rejects duplicate applications."""
 
     carrier: PhaseCarrier
-    registration_model: Literal["master_relative", "network_relative"]
+    registration_model: Literal["reference_relative", "network_relative"]
     geometric_phase: GeometricPhase
     phase_model_id: str
     phase_lineage_id: str
@@ -751,7 +751,10 @@ class PhaseState:
 
     def __post_init__(self) -> None:
         """Validate phase state and residual lineage."""
-        if self.registration_model not in ("master_relative", "network_relative"):
+        if self.registration_model not in (
+            "reference_relative",
+            "network_relative",
+        ):
             reject_invalid_state("unsupported registration model")
         for name in ("phase_model_id", "phase_lineage_id"):
             _require_text(getattr(self, name), name)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -122,13 +123,15 @@ def test_phase_state_rejects_duplicate_residual_application() -> None:
     )
     state = PhaseState(
         carrier=PhaseCarrier.DERAMPED,
-        registration_model="master_relative",
+        registration_model="reference_relative",
         geometric_phase="none",  # type: ignore[arg-type]
         phase_model_id="phase-model",
         phase_lineage_id="lineage",
         residual_solution_id=None,
         residual_application_id=None,
     )
+    with pytest.raises(InvalidProcessingStateError, match="registration model"):
+        replace(state, registration_model="master_relative")
     applied = state.apply_solution(
         solution,
         payload_digest=digest("input"),

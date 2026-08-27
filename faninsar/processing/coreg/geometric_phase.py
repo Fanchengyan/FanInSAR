@@ -58,9 +58,9 @@ def geometric_phase_from_range_offset(
     Parameters
     ----------
     range_offset_px : array or float
-        Dense or scalar range offset (master − secondary), pixels.
+        Dense or scalar range offset (Reference - Secondary), pixels.
     range_spacing_m, wavelength_m : float
-        Secondary (or master-consistent) radar geometry constants.
+        Secondary (or Reference-consistent) radar geometry constants.
 
     Returns
     -------
@@ -126,7 +126,7 @@ def apply_geometric_phase_from_range_offset(
 
 
 def stage_topo(*_args: object, **_kwargs: object) -> None:
-    """Removed API (PROPOSAL-0017). Geometric phase lives in coreg only."""
+    """Reject the removed API; geometric phase lives in coreg only."""
     message = (
         "stage_topo was removed (PROPOSAL-0017). Geometric phase is applied "
         "during coregistration via apply_geometric_phase_from_range_offset; "
