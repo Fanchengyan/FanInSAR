@@ -287,7 +287,7 @@ class NISARStack(Stack):
             lineage=lineage,
             # The provider callback is an internal seam; the Stack API uses
             # the canonical Reference terminology above.
-            master=reference_id,
+            reference=reference_id,
             channel=(admitted_frequency, admitted_polarization),
             configured_window=configured_window,
             configured_tile_shape=configured_tile_shape,

@@ -22,7 +22,11 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import GeoGrid, RadarGrid
-from faninsar.processing.errors import InvalidProcessingStateError, reject_invalid_state
+from faninsar.processing.errors import (
+    InvalidProcessingStateError,
+    reject_invalid_state,
+    reject_pair_configuration,
+)
 from faninsar.processing.slc import RadarSLC
 from faninsar.processing.stack.provider import (
     SourceHandle,
@@ -140,7 +144,7 @@ class NisarPairState:
 
 @dataclass(frozen=True, slots=True)
 class _DenseRadarMapping:
-    """Secondary source coordinates for one master radar tile."""
+    """Secondary source coordinates for one Reference radar tile."""
 
     azimuth: np.ndarray
     range_index: np.ndarray
@@ -276,16 +280,16 @@ def _full_reference_bounds(
 
 def _full_stack_reference_bounds(
     products: Mapping[str, SLCProduct],
-    master: str,
+    reference: str | None = None,
     *,
     device: str,
     dem: DEMSampler | None,
     height_m: float | None,
 ) -> tuple[int, int, int, int]:
-    """Intersect every acquisition onto one stable master radar grid."""
-    reference_product = products[master]
+    """Intersect every acquisition onto one stable Reference radar grid."""
+    reference_product = products[reference]
     if not isinstance(reference_product.grid, RadarGrid):
-        reject_invalid_state("NISAR full Stack master must use a radar grid")
+        reject_invalid_state("NISAR full Stack Reference must use a radar grid")
     _ = products, device, dem, height_m
     return (0, reference_product.grid.shape[0], 0, reference_product.grid.shape[1])
 
@@ -313,7 +317,7 @@ def _dense_secondary_mapping(
     dem: DEMSampler,
     lanczos_a: int = 4,
 ) -> _DenseRadarMapping:
-    """Map every master tile pixel into the secondary radar grid."""
+    """Map every Reference tile pixel into the secondary radar grid."""
     from faninsar.processing.geometry import RadarGeometryModel
     from faninsar.processing.geometry.prepare_production import (
         run_geo2rdr,
@@ -651,7 +655,7 @@ def _scene_tile_exists(
     *,
     tag: str,
     date_id: str,
-    master_id: str,
+    reference_id: str,
     domain: str,
     grid_shape: tuple[int, int],
     grid_identity: str,
@@ -667,7 +671,7 @@ def _scene_tile_exists(
     store = CoregisteredSceneStore.open(root)
     if (
         store.date_id != date_id
-        or store.master_id != master_id
+        or store.reference_id != reference_id
         or store.domain != domain
         or store.grid_shape != grid_shape
         or store.grid_identity != grid_identity
@@ -981,13 +985,14 @@ def make_nisar_scene_provider(
     handles: Mapping[Path, Any],
     products: Mapping[str, SLCProduct],
     lineage: Mapping[str, str],
-    master: str,
+    reference: str,
     channel: tuple[str, str],
     configured_window: object = None,
     configured_tile_shape: object = None,
     configured_dem: DEMSampler | None = None,
     configured_height: float | None = None,
     admission_lineage: Mapping[str, Mapping[str, object]] | None = None,
+    **legacy: object,
 ) -> SceneProductionCallback:
     """Build a callback that publishes one bounded or full NISAR pair scene.
 
@@ -999,8 +1004,8 @@ def make_nisar_scene_provider(
         Lazy reader handles opened during stack construction.
     products, lineage : mappings
         Date-keyed normalized products and source paths.
-    master : str
-        Alignment master date used in scene manifests.
+    reference : str
+        Stack Reference date used in scene manifests.
     channel : tuple of str
         Admitted ``(frequency, polarization)`` pair.
     configured_window : sequence of int, optional
@@ -1016,6 +1021,9 @@ def make_nisar_scene_provider(
     admission_lineage : mapping, optional
         Date-keyed trusted pre-open metadata.  It is copied into the scene
         manifest so source identity and policy survive stack publication.
+    **legacy : object
+        Removed keyword arguments. The old ``master`` keyword is rejected with
+        a migration error.
 
     Returns
     -------
@@ -1023,6 +1031,18 @@ def make_nisar_scene_provider(
         Provider callback accepted by :class:`StackSceneProvider`.
 
     """
+    if "master" in legacy:
+        reject_pair_configuration(
+            "make_nisar_scene_provider no longer accepts 'master'; "
+            "use 'reference'"
+        )
+    if legacy:
+        reject_invalid_state(
+            f"unsupported NISAR provider options: {sorted(legacy)}"
+        )
+    if reference is None:
+        reject_invalid_state("NISAR provider Reference date is required")
+
     path_dates = {Path(path): date_id for date_id, path in lineage.items()}
     admission_lineage = dict(admission_lineage or {})
     admitted_sources = {
@@ -1100,10 +1120,10 @@ def make_nisar_scene_provider(
         full_scene = requested_window is None
         if full_scene:
             resolved_tile_shape = _tile_shape(configured_tile_shape)
-            if reference_date == master:
+            if reference_date == reference:
                 bounds = _full_stack_reference_bounds(
                     products,
-                    master,
+                    reference,
                     device=device,
                     dem=mapping_dem,
                     height_m=mapping_height,
@@ -1197,7 +1217,7 @@ def make_nisar_scene_provider(
                 "schema": "nisar_scene_tile_v2",
                 "reference_date": reference_date,
                 "secondary_date": secondary_date,
-                "master": master,
+                "reference_id": reference,
                 "domain": domain,
                 "tag": tag,
                 "tile_bounds": list(tile_bounds),
@@ -1228,7 +1248,7 @@ def make_nisar_scene_provider(
                 scenes,
                 tag=tag,
                 date_id=secondary_date,
-                master_id=master,
+                reference_id=reference,
                 domain=domain,
                 grid_shape=grid_shape,
                 grid_identity=grid_identity,
@@ -1454,7 +1474,7 @@ def make_nisar_scene_provider(
             write_scene_unit(
                 scenes,
                 date_id=secondary_date,
-                master_id=master,
+                reference_id=reference,
                 domain=domain,
                 tag=tag,
                 reference=np.asarray(reference_array, dtype=np.complex64),

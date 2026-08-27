@@ -1,4 +1,4 @@
-"""Manifest-bound master-aligned SLC scene storage for Stack formation."""
+"""Manifest-bound Reference-aligned SLC scene storage for Stack formation."""
 
 from __future__ import annotations
 
@@ -155,7 +155,7 @@ def _sha256(path: Path) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SceneUnit:
-    """One immutable master-grid aligned SLC unit."""
+    """One immutable Reference-grid aligned SLC unit."""
 
     tag: str
     reference_path: Path
@@ -185,7 +185,7 @@ class CoregisteredSceneStore:
 
     root: Path
     date_id: str
-    master_id: str
+    reference_id: str
     domain: str
     units: tuple[SceneUnit, ...]
     manifest_digest: str
@@ -218,6 +218,13 @@ class CoregisteredSceneStore:
             reject_invalid_state(f"scene manifest cannot be read: {error}")
         if manifest.get("schema_version") != SCENE_SCHEMA:
             reject_invalid_state("unsupported scene artifact schema")
+        if "master_id" in manifest or "master" in manifest:
+            reject_invalid_state(
+                "legacy scene manifest uses master terminology; rebuild with "
+                "reference_id"
+            )
+        if "reference_id" not in manifest:
+            reject_invalid_state("scene manifest reference_id is missing")
         raw_units = manifest.get("units")
         if not isinstance(raw_units, list):
             reject_invalid_state("scene manifest units must be a list")
@@ -313,7 +320,7 @@ class CoregisteredSceneStore:
         return cls(
             root=path,
             date_id=str(manifest["date_id"]),
-            master_id=str(manifest["master_id"]),
+            reference_id=str(manifest["reference_id"]),
             domain=domain,
             units=tuple(units),
             manifest_digest=actual_digest,
@@ -352,7 +359,7 @@ def write_scene_unit(
     root: str | Path,
     *,
     date_id: str,
-    master_id: str,
+    reference_id: str,
     domain: str,
     tag: str,
     reference: np.ndarray,
@@ -372,8 +379,8 @@ def write_scene_unit(
     ----------
     root : path-like
         Scene-store directory.
-    date_id, master_id : str
-        Secondary acquisition and alignment-master identifiers.
+    date_id, reference_id : str
+        Secondary acquisition and Stack Reference identifiers.
     domain : str
         Coordinate domain, either radar or geographic.
     tag : str
@@ -447,10 +454,12 @@ def write_scene_unit(
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (
             existing.get("date_id") != date_id
-            or existing.get("master_id") != master_id
+            or existing.get("reference_id") != reference_id
             or existing.get("domain") != domain
         ):
-            reject_invalid_state("scene units must share date, master, and domain")
+            reject_invalid_state(
+                "scene units must share date, Reference, and domain"
+            )
         existing_grid_shape = existing.get("grid_shape")
         if existing_grid_shape is not None and existing_grid_shape != list(
             resolved_grid_shape
@@ -493,7 +502,7 @@ def write_scene_unit(
         "schema_version": SCENE_SCHEMA,
         "status": "complete",
         "date_id": date_id,
-        "master_id": master_id,
+        "reference_id": reference_id,
         "domain": domain,
         "grid_shape": list(resolved_grid_shape),
         "wavelength_m": wavelength_m,
@@ -514,7 +523,7 @@ def write_scene_unit(
 
 
 def copy_reference_units(source: str | Path, target: str | Path) -> None:
-    """Copy reference payloads into the master store without source aliases."""
+    """Copy Reference payloads into the Reference store without source aliases."""
     source_store = CoregisteredSceneStore.open(source)
     destination = Path(target)
     if (destination / "manifest.json").is_file():
@@ -525,8 +534,8 @@ def copy_reference_units(source: str | Path, target: str | Path) -> None:
         reference, _, _ = source_store.read(unit.tag)
         write_scene_unit(
             destination,
-            date_id=source_store.master_id,
-            master_id=source_store.master_id,
+            date_id=source_store.reference_id,
+            reference_id=source_store.reference_id,
             domain=source_store.domain,
             tag=unit.tag,
             reference=reference,
@@ -615,7 +624,7 @@ def form_merged_scene_interferogram(
     Parameters
     ----------
     reference_store, secondary_store : CoregisteredSceneStore
-        Persisted master-aligned scene generations on one common grid.
+        Persisted Reference-aligned scene generations on one common grid.
     reference_role, secondary_role : {"reference", "secondary"}, optional
         Payload role selected from each generation.
     multilook : tuple[int, int], optional
@@ -635,8 +644,8 @@ def form_merged_scene_interferogram(
     """
     if reference_store.domain != secondary_store.domain:
         reject_invalid_state("scene artifact domains do not match")
-    if reference_store.master_id != secondary_store.master_id:
-        reject_invalid_state("scene artifacts use different alignment masters")
+    if reference_store.reference_id != secondary_store.reference_id:
+        reject_invalid_state("scene artifacts use different References")
     if reference_store.grid_shape != secondary_store.grid_shape:
         reject_invalid_state("scene artifact common grid shapes do not match")
     if reference_store.wavelength_m != secondary_store.wavelength_m:
@@ -853,7 +862,7 @@ def form_scene_interferograms(
     Parameters
     ----------
     reference_store, secondary_store : CoregisteredSceneStore
-        Persisted master-aligned scene generations.
+        Persisted Reference-aligned scene generations.
     reference_role, secondary_role : str, optional
         Payload role to consume from each generation.
     multilook : tuple[int, int], optional

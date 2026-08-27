@@ -20,13 +20,13 @@ from faninsar.processing.stack.scene_store import (
 
 
 def test_scene_store_round_trip_and_ifg_uses_aligned_payloads(tmp_path: Path) -> None:
-    """Persisted master-aligned arrays round-trip into one exact IFG."""
+    """Persisted Reference-aligned arrays round-trip into one exact IFG."""
     reference = np.ones((2, 3), dtype=np.complex64)
     secondary = np.full((2, 3), 1.0 + 2.0j, dtype=np.complex64)
     write_scene_unit(
         tmp_path / "reference",
         date_id="20240101",
-        master_id="20240101",
+        reference_id="20240101",
         domain="radar",
         tag="IW1_b0",
         reference=reference,
@@ -37,7 +37,7 @@ def test_scene_store_round_trip_and_ifg_uses_aligned_payloads(tmp_path: Path) ->
     write_scene_unit(
         tmp_path / "secondary",
         date_id="20240113",
-        master_id="20240101",
+        reference_id="20240101",
         domain="radar",
         tag="IW1_b0",
         reference=reference,
@@ -58,7 +58,7 @@ def test_scene_store_rejects_manifest_tampering(tmp_path: Path) -> None:
     write_scene_unit(
         root,
         date_id="20240113",
-        master_id="20240101",
+        reference_id="20240101",
         domain="radar",
         tag="IW1_b0",
         reference=data,
@@ -74,6 +74,35 @@ def test_scene_store_rejects_manifest_tampering(tmp_path: Path) -> None:
         CoregisteredSceneStore.open(root)
 
 
+def test_scene_store_rejects_legacy_master_manifest_key(tmp_path: Path) -> None:
+    """Old Stack manifests fail closed instead of being silently migrated."""
+    data = np.ones((2, 2), dtype=np.complex64)
+    root = tmp_path / "scene"
+    write_scene_unit(
+        root,
+        date_id="20240113",
+        reference_id="20240101",
+        domain="radar",
+        tag="IW1_b0",
+        reference=data,
+        secondary=data,
+        row_origin=0,
+        col_origin=0,
+    )
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["master_id"] = manifest.pop("reference_id")
+    unsigned = dict(manifest)
+    unsigned.pop("manifest_digest")
+    manifest["manifest_digest"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(InvalidProcessingStateError, match="master terminology"):
+        CoregisteredSceneStore.open(root)
+
+
 def test_scene_store_rejects_symlinked_root(tmp_path: Path) -> None:
     """A symlinked generation root must fail closed before manifest access."""
     data = np.ones((2, 2), dtype=np.complex64)
@@ -81,7 +110,7 @@ def test_scene_store_rejects_symlinked_root(tmp_path: Path) -> None:
     write_scene_unit(
         real_root,
         date_id="20240113",
-        master_id="20240101",
+        reference_id="20240101",
         domain="radar",
         tag="IW1_b0",
         reference=data,
@@ -104,7 +133,7 @@ def test_form_interferograms_supports_multiple_units(tmp_path: Path) -> None:
             write_scene_unit(
                 tmp_path / root,
                 date_id=date_id,
-                master_id="20240101",
+                reference_id="20240101",
                 domain="radar",
                 tag=tag,
                 reference=reference,
@@ -148,7 +177,7 @@ def test_merged_scene_interferogram_uses_global_origins_before_looks(
             write_scene_unit(
                 tmp_path / root,
                 date_id=date_id,
-                master_id="20240101",
+                reference_id="20240101",
                 domain="radar",
                 tag=tag,
                 reference=reference,
@@ -186,7 +215,7 @@ def test_merged_scene_interferogram_rejects_mixed_grid_placement(
         write_scene_unit(
             tmp_path / root,
             date_id="20240101" if root == "reference" else "20240113",
-            master_id="20240101",
+            reference_id="20240101",
             domain="radar",
             tag="f0_IW1_b0",
             reference=data,
@@ -211,7 +240,7 @@ def test_merged_scene_interferogram_rejects_equal_shape_shifted_grid(
         write_scene_unit(
             tmp_path / root,
             date_id="20240101" if root == "reference" else "20240113",
-            master_id="20240101",
+            reference_id="20240101",
             domain="geo",
             tag="f0_IW1_b0",
             reference=data,
@@ -237,7 +266,7 @@ def test_scene_store_rejects_geo_manifest_without_grid_identity(
     write_scene_unit(
         root,
         date_id="20240101",
-        master_id="20240101",
+        reference_id="20240101",
         domain="geo",
         tag="f0_IW1_b0",
         reference=data,
@@ -267,7 +296,7 @@ def test_scene_writer_requires_explicit_geo_grid_identity(tmp_path: Path) -> Non
         write_scene_unit(
             tmp_path / "geo",
             date_id="20240101",
-            master_id="20240101",
+            reference_id="20240101",
             domain="geo",
             tag="f0_IW1_b0",
             reference=data,
@@ -285,7 +314,7 @@ def test_scene_writer_rejects_corrupted_existing_generation(tmp_path: Path) -> N
     write_scene_unit(
         root,
         date_id="20240101",
-        master_id="20240101",
+        reference_id="20240101",
         domain="radar",
         tag="f0_IW1_b0",
         reference=data,
@@ -300,7 +329,7 @@ def test_scene_writer_rejects_corrupted_existing_generation(tmp_path: Path) -> N
         write_scene_unit(
             root,
             date_id="20240101",
-            master_id="20240101",
+            reference_id="20240101",
             domain="radar",
             tag="f0_IW1_b1",
             reference=data,
@@ -311,19 +340,19 @@ def test_scene_writer_rejects_corrupted_existing_generation(tmp_path: Path) -> N
         )
 
 
-def test_merged_scene_interferogram_rejects_different_masters(
+def test_merged_scene_interferogram_rejects_different_references(
     tmp_path: Path,
 ) -> None:
-    """Equal grids cannot hide scene generations aligned to different masters."""
+    """Equal grids cannot hide scene generations aligned to different References."""
     data = np.ones((2, 2), dtype=np.complex64)
-    for root, date_id, master_id in (
+    for root, date_id, reference_id in (
         ("reference", "20240101", "20240101"),
         ("secondary", "20240113", "20231220"),
     ):
         write_scene_unit(
             tmp_path / root,
             date_id=date_id,
-            master_id=master_id,
+            reference_id=reference_id,
             domain="radar",
             tag="f0_IW1_b0",
             reference=data,
@@ -333,7 +362,7 @@ def test_merged_scene_interferogram_rejects_different_masters(
             grid_shape=(2, 2),
         )
 
-    with pytest.raises(InvalidProcessingStateError, match="masters"):
+    with pytest.raises(InvalidProcessingStateError, match="References"):
         form_merged_scene_interferogram(
             CoregisteredSceneStore.open(tmp_path / "reference"),
             CoregisteredSceneStore.open(tmp_path / "secondary"),

@@ -306,7 +306,7 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
             "20240101": str(reference_path),
             "20240113": str(secondary_path),
         },
-        master="20240101",
+        reference="20240101",
         channel=("B", "HH"),
         configured_window=(5, 8, 2, 6),
         configured_dem=configured_dem,
@@ -619,7 +619,7 @@ def test_nisar_full_scene_uses_deterministic_row_major_tiles(
             "20240101": str(reference_path),
             "20240113": str(secondary_path),
         },
-        master="20240101",
+        reference="20240101",
         channel=("B", "HH"),
         configured_tile_shape=(2, 3),
         configured_height=0.0,
@@ -695,7 +695,7 @@ def test_nisar_full_scene_masks_edge_no_overlap_and_resumes_mixed_tiles(
         handles=handles,
         products=stack.products,
         lineage=stack.source_lineage,
-        master=stack.master,
+        reference=stack.reference,
         channel=stack.channel,
         configured_tile_shape=(2, 3),
         configured_height=0.0,
@@ -754,8 +754,8 @@ def test_nisar_full_scene_rejects_pair_without_physical_overlap(
         )
 
 
-def test_nisar_full_stack_uses_complete_master_grid(tmp_path: Path) -> None:
-    """All coregistered dates share the complete master-grid extent."""
+def test_nisar_full_stack_uses_complete_reference_grid(tmp_path: Path) -> None:
+    """All coregistered dates share the complete Reference-grid extent."""
     products = {
         date_id: _result(tmp_path / f"{date_id}.h5", date_id).product
         for date_id in ("20240101", "20240113", "20240125")
@@ -1154,7 +1154,7 @@ def test_nisar_provider_rejects_source_content_mutation_after_admission(
             "20240101": str(reference_path),
             "20240113": str(secondary_path),
         },
-        master="20240101",
+        reference="20240101",
         channel=("B", "HH"),
         configured_window=(0, 2, 0, 2),
     )

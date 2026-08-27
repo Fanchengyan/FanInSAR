@@ -41,7 +41,7 @@ def test_invert_pair_misregistration_closed_loop() -> None:
         )
         for a, b in pairs
     ]
-    result = invert_pair_misregistration(arcs, master="20160101")
+    result = invert_pair_misregistration(arcs, reference="20160101")
     assert result.azimuth_px["20160101"] == 0.0
     assert result.range_px["20160101"] == 0.0
     assert result.azimuth_px["20160113"] == pytest.approx(0.2, abs=1e-6)
@@ -64,7 +64,7 @@ def test_invert_rejects_disconnected_network() -> None:
     with pytest.raises(Exception, match="disconnected"):
         invert_pair_misregistration(
             arcs,
-            master="20160101",
+            reference="20160101",
             dates=["20160101", "20160113", "20160201"],
         )
 

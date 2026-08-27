@@ -788,7 +788,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         write_scene_unit(
             scene_store_dir,
             date_id=_scene_id(sec_path),
-            master_id=_scene_id(ref_path),
+            reference_id=_scene_id(ref_path),
             domain=str(coregistration_grid),
             tag=tag,
             reference=np.asarray(state.reference_deramped, dtype=np.complex64),
@@ -4095,7 +4095,7 @@ def produce_interferogram_pair(
         When True (default), apply the burst-footprint hull mask in geo mode
         when no ROI is supplied.  ROI burst-quad intersection is unchanged.
     scene_store_dir : path, optional
-        Caller-owned directory for immutable master-aligned scene units. Radar
+        Caller-owned directory for immutable Reference-aligned scene units. Radar
         and Geo sweep paths support this seam when ``n_jobs=1``; parallel
         publication is rejected until generation-level locking is enabled.
     n_jobs : int, optional
@@ -4674,7 +4674,7 @@ def produce_interferogram_pair(
                 write_scene_unit(
                     scene_store_dir,
                     date_id=_scene_id(sec_paths[0]),
-                    master_id=_scene_id(ref_paths[0]),
+                    reference_id=_scene_id(ref_paths[0]),
                     domain="radar",
                     tag=tag,
                     reference=np.asarray(state.reference_deramped, dtype=np.complex64),

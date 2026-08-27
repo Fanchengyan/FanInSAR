@@ -112,7 +112,7 @@ def test_nisar_stack_builds_shared_catalog_and_pair_topology(
         },
     )
 
-    assert stack.master == "20240101"
+    assert stack.reference == "20240101"
     assert stack.catalog.dates == ("20240101", "20240113", "20240125")
     assert len(stack.pairs) == 3
     assert stack.channel == ("B", "HH")
