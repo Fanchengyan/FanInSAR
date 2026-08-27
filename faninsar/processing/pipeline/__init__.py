@@ -31,7 +31,6 @@ from .production import (
     stage_write,
 )
 from .products import PairProductArrays, write_pair_stac_item, write_pair_zarr
-from .workflow import stage_read_scene
 
 __all__ = [
     "BurstSelection",
@@ -58,7 +57,6 @@ __all__ = [
     "stage_flatten",
     "stage_geocode",
     "stage_interferogram",
-    "stage_read_scene",
     "stage_unwrap",
     "stage_write",
     "write_pair_stac_item",

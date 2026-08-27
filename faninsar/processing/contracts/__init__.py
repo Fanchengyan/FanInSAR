@@ -45,7 +45,7 @@ from faninsar.processing.contracts.products import (
     StackProduct,
     UnwrapResult,
 )
-from faninsar.processing.contracts.stage import Stage, StageNode
+from faninsar.processing.contracts.stage import Stage
 from faninsar.processing.contracts.tokens import ArrayToken, assert_token
 
 __all__ = [
@@ -87,7 +87,6 @@ __all__ = [
     "StackActivationBinding",
     "StackProduct",
     "Stage",
-    "StageNode",
     "UnwrapResult",
     "WorkerAttestation",
     "assert_token",

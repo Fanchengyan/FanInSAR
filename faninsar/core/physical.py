@@ -8,8 +8,8 @@ from enum import StrEnum
 class PhysicalType(StrEnum):
     """Seven-member lattice of InSAR product physical types.
 
-    Used by ``Workflow.check()`` and ``assert_token`` to validate stage
-    composition. Values are stable string identifiers for YAML/config.
+    Used by processing contracts and ``assert_token`` to validate product
+    state. Values are stable string identifiers for serialized metadata.
     """
 
     SLC_RAW = "slc_raw"
@@ -23,7 +23,7 @@ class PhysicalType(StrEnum):
 
 PHYSICAL_TYPE_MEMBERS: frozenset[PhysicalType] = frozenset(PhysicalType)
 
-# Sequential stage transitions for DEFAULT_PAIR_STAGES lattice check.
+# Sequential processing transitions used by product-state validation.
 SEQ_TRANSITIONS: dict[PhysicalType, PhysicalType] = {
     PhysicalType.SLC_RAW: PhysicalType.SLC_DERAMPED,
     PhysicalType.SLC_DERAMPED: PhysicalType.SLC_COREG,
