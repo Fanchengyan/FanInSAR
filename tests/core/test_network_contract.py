@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -12,12 +14,13 @@ from faninsar.core.network import (
     AssetKind,
     AssetTransform,
     AssetTransformOperation,
+    Network,
     NetworkProduct,
     NetworkProductIndex,
     NetworkProductKey,
-    Network,
     PhaseConvention,
 )
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.stack.session import Stack
 
 
@@ -201,3 +204,80 @@ def test_stack_analysis_delegates_through_network_base(monkeypatch) -> None:
         lambda **_: "inversion-result",
     )
     assert stack.analyze_time_series() == "inversion-result"
+
+
+def test_stack_analysis_keeps_ifg_leases_until_solver_returns(monkeypatch) -> None:
+    """Stack pins, heartbeats, and releases IFG stores around the solver."""
+    stack = object.__new__(Stack)
+    stack.refresh_generation("generation-a", (_product(),))
+    stack.unwrap_result = object()
+    stack.config = SimpleNamespace(multilook=(1, 1))
+    stack.pairs = object()
+    events: list[str] = []
+
+    class Lease:
+        """Minimal lease double recording the analysis lifecycle."""
+
+        def heartbeat(self) -> None:
+            events.append("heartbeat")
+
+    class Store:
+        """Minimal artifact store double with one durable lease."""
+
+        _lease = Lease()
+
+        def close(self) -> None:
+            events.append("close")
+
+    store = Store()
+    monkeypatch.setattr(
+        stack,
+        "_pair_artifact_stores",
+        lambda **_: [store],
+    )
+
+    def solve(**kwargs: object) -> str:
+        assert kwargs["_artifact_stores"] == [store]
+        events.append("solver")
+        assert events == ["heartbeat", "solver"]
+        return "inversion-result"
+
+    monkeypatch.setattr(stack, "invert_timeseries", solve)
+    assert stack.analyze_time_series() == "inversion-result"
+    assert events == ["heartbeat", "solver", "heartbeat", "close"]
+
+
+def test_stack_analysis_closes_ifg_leases_when_heartbeat_fails(monkeypatch) -> None:
+    """A failed lease heartbeat aborts analysis and still releases stores."""
+    stack = object.__new__(Stack)
+    stack.refresh_generation("generation-a", (_product(),))
+    stack.unwrap_result = object()
+    stack.config = SimpleNamespace(multilook=(1, 1))
+    stack.pairs = object()
+    events: list[str] = []
+
+    class Lease:
+        """Lease double that fails closed on admission heartbeat."""
+
+        def heartbeat(self) -> None:
+            events.append("heartbeat")
+            raise InvalidProcessingStateError("lease expired")
+
+    class Store:
+        """Artifact store double used to verify cleanup after failure."""
+
+        _lease = Lease()
+
+        def close(self) -> None:
+            events.append("close")
+
+    store = Store()
+    monkeypatch.setattr(stack, "_pair_artifact_stores", lambda **_: [store])
+    monkeypatch.setattr(
+        stack,
+        "invert_timeseries",
+        lambda **_: pytest.fail("solver must not run after lease failure"),
+    )
+    with pytest.raises(InvalidProcessingStateError, match="expired"):
+        stack.analyze_time_series()
+    assert events == ["heartbeat", "close"]

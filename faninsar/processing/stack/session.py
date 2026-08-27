@@ -1723,6 +1723,7 @@ class Stack(Network):
         device: str | None = None,
         multilook: tuple[int, int] | None = None,
         ifg_root: str | Path | None = None,
+        _artifact_stores: Sequence[InterferogramArtifactStore] | None = None,
     ) -> TimeSeriesResult:
         """Invert persisted, temporally reconciled pair phases with SBAS.
 
@@ -1733,9 +1734,13 @@ class Stack(Network):
         from faninsar.processing.timeseries.inversion import invert_unwrapped_pairs
 
         if pair_phases is None:
-            stores = self._pair_artifact_stores(
-                looks=multilook or self.config.multilook,
-                ifg_root=ifg_root,
+            stores = (
+                list(_artifact_stores)
+                if _artifact_stores is not None
+                else self._pair_artifact_stores(
+                    looks=multilook or self.config.multilook,
+                    ifg_root=ifg_root,
+                )
             )
             active_unwrap = self.unwrap_result
             if active_unwrap is not None and active_unwrap.phase_1d_unw is not None:
@@ -1839,7 +1844,35 @@ class Stack(Network):
     ) -> TimeSeriesResult:
         """Run Stack's existing inversion after Network generation admission."""
         del _products, generation_id
-        return self.invert_timeseries(**kwargs)
+        # Keep the IFG generation pinned for the complete analysis call.  The
+        # solver reads the unwrap payloads before doing its numerical solve;
+        # closing the stores immediately after those reads would allow a
+        # concurrent collector to reclaim the generation while the solver is
+        # still consuming the resulting arrays.  Pure in-memory Network tests
+        # intentionally have no Stack config/catalog and retain their light
+        # weight inversion seam.
+        if not hasattr(self, "config") or not hasattr(self, "pairs"):
+            return self.invert_timeseries(**kwargs)
+        stores = self._pair_artifact_stores(
+            looks=kwargs.get("multilook") or self.config.multilook,
+            ifg_root=kwargs.get("ifg_root"),
+        )
+        try:
+            for store in stores:
+                store._lease.heartbeat()
+            result = self.invert_timeseries(
+                _artifact_stores=stores,
+                **kwargs,
+            )
+            # A heartbeat after the solve verifies that the reader remained
+            # valid for the whole call.  If renewal fails, fail closed rather
+            # than returning a result that was computed from an unpinned view.
+            for store in stores:
+                store._lease.heartbeat()
+            return result
+        finally:
+            for store in stores:
+                store.close()
 
     def estimate_ionosphere(self, **kwargs: Any) -> list[Any]:
         """Estimate per-pair ionospheric screens (PROPOSAL-0036).
