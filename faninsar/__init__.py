@@ -6,6 +6,8 @@ fast, and flexible way.
 
 from __future__ import annotations
 
+from typing import Any
+
 # dev versions should have "dev" in them, stable should not.
 # doc/conf.py makes use of this to set the version drop-down.
 # eg: "0.1.dev0", "0.1"
@@ -44,4 +46,41 @@ from faninsar._core import (
     xy_from_profile,
 )
 from faninsar._public import *  # noqa: F403
-from faninsar._public import __all__ as __all__
+from faninsar._public import __all__ as _public_all
+
+# Network is loaded lazily: importing its Dataset-backed implementation while
+# this package is still initializing would make the existing Dataset imports
+# observe a partially initialized ``faninsar`` module.
+__all__ = [*_public_all, "Network"]  # noqa: F405, PLE0604
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily expose the path-based Network public seam and its errors."""
+    if name in {
+        "LegacyLayoutError",
+        "LegacyNetworkLayoutError",
+        "Network",
+        "NetworkConstructionError",
+        "NetworkLayoutError",
+        "NetworkPathError",
+    }:
+        from faninsar.datasets.network import (
+            LegacyLayoutError,
+            LegacyNetworkLayoutError,
+            Network,
+            NetworkConstructionError,
+            NetworkLayoutError,
+            NetworkPathError,
+        )
+
+        values = {
+            "LegacyLayoutError": LegacyLayoutError,
+            "LegacyNetworkLayoutError": LegacyNetworkLayoutError,
+            "Network": Network,
+            "NetworkConstructionError": NetworkConstructionError,
+            "NetworkLayoutError": NetworkLayoutError,
+            "NetworkPathError": NetworkPathError,
+        }
+        return values[name]
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
