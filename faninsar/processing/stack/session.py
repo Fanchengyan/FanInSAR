@@ -1414,7 +1414,6 @@ class Stack(Network):
                     amplitude=product.amplitude,
                 )
                 self.ifg_dirs.append(sub)
-        self._refresh_network_from_ifg_dirs()
         return self
 
     def _refresh_network_from_ifg_dirs(self) -> None:
@@ -1666,6 +1665,12 @@ class Stack(Network):
                 ),
                 quality_report=quality_report,
             )
+            try:
+                self.ifg_dirs = [store.root for store in stores]
+                self._refresh_network_from_ifg_dirs()
+            finally:
+                for store in stores:
+                    store.close()
             return self
 
         wrapped_phase = np.stack(
@@ -1726,6 +1731,12 @@ class Stack(Network):
                 ifg_manifest_digest=store.manifest_digest,
             )
         self.unwrap_result = result
+        try:
+            self.ifg_dirs = [store.root for store in stores]
+            self._refresh_network_from_ifg_dirs()
+        finally:
+            for store in stores:
+                store.close()
         return self
 
     @_reclaim_after_stage

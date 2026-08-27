@@ -814,6 +814,7 @@ def test_qualified_stack_form_requires_matching_activation_record(
 
     stack.form_interferograms(multilook=(1, 1))
     assert stack.ifg_dirs
+    assert not stack.analysis_ready
 
 
 def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
@@ -832,6 +833,7 @@ def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
         _write_pair_artifact(stack, pair_id, phase)
 
     stack.unwrap(do_spatial=False)
+    assert stack.analysis_ready
     result = stack.invert_timeseries()
 
     assert stack.unwrap_result is not None
