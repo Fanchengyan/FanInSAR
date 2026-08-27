@@ -147,7 +147,7 @@ def _faninsar_git_revision() -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     revision = completed.stdout.strip()
-    return revision if revision else None
+    return revision or None
 
 
 def _runtime_image_identity() -> dict[str, object]:
@@ -383,9 +383,40 @@ class Stack:
     timeseries: TimeSeriesResult | None = None
     unwrap_result: StackUnwrapResult | None = None
     _prepared: bool = False
+    _generation: StackResultGeneration | None = field(default=None, repr=False)
+
+    @property
+    def reference(self) -> str:
+        """Return the canonical Stack reference acquisition ID.
+
+        ``master`` remains as a read/write compatibility spelling for older
+        clients, but all new Stack-facing APIs should use ``reference``.
+        """
+        return self.master
+
+    @reference.setter
+    def reference(self, value: object) -> None:
+        """Set the reference after normalizing its date identifier."""
+        self.master = _date_to_yyyymmdd(value)
 
     @classmethod
     def from_safes(
+        cls,
+        paths: Sequence[str | Path],
+        **kwargs: Any,
+    ) -> Stack:
+        """Construct the concrete Sentinel-1 adapter from SAFE sources.
+
+        Raw-source discovery is an adapter concern.  Keeping this compatibility
+        spelling on ``Stack`` lets older callers migrate without giving the
+        mission-neutral session a production implementation of its own.
+        """
+        from faninsar.processing.stack.s1 import S1Stack
+
+        return S1Stack.from_safes(paths, **kwargs)
+
+    @classmethod
+    def _from_safes(
         cls,
         paths: Sequence[str | Path],
         *,
@@ -635,20 +666,20 @@ class Stack:
     ) -> Any:
         """Produce one pair through the admitted mission provider.
 
-        The default ``None`` provider intentionally retains the existing S1
-        production call and its monkeypatch/runtime behavior.  Mission
-        adapters may supply a normalized callback; a provider without one
-        fails closed through :class:`UnsupportedStackCapabilityError` rather
-        than allowing a non-SAFE path to reach ``open_safe_product``.
+        Mission adapters supply a normalized callback; an unconfigured Stack
+        fails closed rather than guessing how to open or produce a source.
         """
         if self.scene_provider is None:
-            from faninsar.processing.pipeline.production import run_pair
-
-            return run_pair(
-                reference_path,
-                secondary_path,
-                output_dir=output_dir,
-                **options,
+            from faninsar.processing.stack.provider import (
+                UnsupportedStackCapabilityError,
+            )
+            mission = "Stack"
+            capability = "scene-production"
+            reason = "no mission scene provider was admitted"
+            raise UnsupportedStackCapabilityError(
+                mission,
+                capability,
+                reason,
             )
         return self.scene_provider(
             reference_path,
@@ -670,7 +701,9 @@ class Stack:
     ) -> str:
         """Return the canonical identity of one coregistration request."""
 
-        def source_identity(path: Path) -> dict[str, object]:
+        def source_identity(path: Path | Sequence[Path]) -> object:
+            if not isinstance(path, Path):
+                return [source_identity(item) for item in path]
             resolved = path.resolve()
             try:
                 stat = resolved.stat()
@@ -923,8 +956,8 @@ class Stack:
             "schema": "stack_coreg_request_v1",
             "master_id": self.master,
             "date_id": date_id,
-            "master_source": source_identity(self.catalog.path_for(self.master)),
-            "secondary_source": source_identity(self.catalog.path_for(date_id)),
+            "master_source": source_identity(self.catalog.paths_for(self.master)),
+            "secondary_source": source_identity(self.catalog.paths_for(date_id)),
             "coreg_mode": self.config.coreg_mode,
             "coregistration_grid": self.config.coregistration_grid,
             "esd_method": self.config.esd_method,
@@ -992,8 +1025,8 @@ class Stack:
             esd_on = method != "auto" or True
             # Measure-only: coreg + ESD/Ampcor; no unwrap; no IFG write required.
             state = self._produce_pair(
-                self.catalog.path_for(primary),
-                self.catalog.path_for(secondary),
+                self.catalog.paths_for(primary),
+                self.catalog.paths_for(secondary),
                 output_dir=out,
                 multilook=self.config.multilook,
                 goldstein_alpha=self.config.goldstein_alpha,
@@ -1089,7 +1122,7 @@ class Stack:
             if dates is not None
             else [d for d in self.catalog.dates if d != self.master]
         )
-        master_path = self.catalog.path_for(self.master)
+        master_path = self.catalog.paths_for(self.master)
         # Cache master identity product path (no self-coreg).
         master_dir = self.config.work_dir / "coreg" / self.master
         master_dir.mkdir(parents=True, exist_ok=True)
@@ -1165,7 +1198,7 @@ class Stack:
                 pair_kwargs["geo_work_dir"] = Path(geo_work) / date_id
             state = self._produce_pair(
                 master_path,
-                self.catalog.path_for(date_id),
+                self.catalog.paths_for(date_id),
                 output_dir=out,
                 multilook=self.config.multilook,
                 goldstein_alpha=0.0,
@@ -1697,6 +1730,22 @@ class Stack:
                 "current Stack generation does not match the configured pair network"
             )
         return generation
+
+    def refresh_generation(self) -> StackResultGeneration:
+        """Refresh the pinned derived-result generation from durable storage.
+
+        A caller that keeps a Stack object alive across a new publication can
+        use this hook to release the previous lease and atomically observe the
+        newest complete generation.  Validation remains delegated to
+        :meth:`open_generation`, so incomplete or mismatched generations fail
+        closed.
+        """
+        previous = self._generation
+        if previous is not None:
+            previous.close()
+        current = self.open_generation()
+        self._generation = current
+        return current
 
     def _qualified_unwrapped_artifacts(
         self,

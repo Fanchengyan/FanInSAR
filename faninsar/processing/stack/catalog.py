@@ -1,22 +1,25 @@
-"""Scene catalog: date id → product path (PROPOSAL-0017)."""
+"""Scene catalog for logical acquisitions (PROPOSAL-0037)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
-if TYPE_CHECKING:
-    from collections.abc import Mapping
+import pandas as pd
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
 
 logger = setup_logger(__name__)
 
 
 def scene_id_from_path(path: str | Path) -> str:
-    """Extract a YYYYMMDD-style scene id from a SAFE path when possible."""
+    """Extract a YYYYMMDD-style scene id from a source path when possible."""
     stem = Path(path).stem.replace(".SAFE", "")
     for part in stem.split("_"):
         if len(part) >= 8 and part[:8].isdigit():
@@ -26,40 +29,112 @@ def scene_id_from_path(path: str | Path) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SceneCatalog:
-    """Immutable map from acquisition date id to on-disk product path."""
+    """Immutable map from acquisition date to ordered source paths.
 
-    paths: Mapping[str, Path]
-    """Keys are ``YYYYMMDD`` scene ids."""
+    A logical acquisition can contain multiple compatible source segments.
+    Grouping remains a source concern; pair-network discovery remains a Stack
+    adapter concern.
+    """
+
+    paths: Mapping[str, tuple[Path, ...]]
+
+    def __post_init__(self) -> None:
+        """Normalize direct mappings and reject duplicate source paths."""
+        normalized: dict[str, tuple[Path, ...]] = {}
+        seen: set[str] = set()
+        for raw_date, raw_paths in self.paths.items():
+            scene_id = _normalize_scene_id(raw_date)
+            source_paths = (
+                (Path(raw_paths),)
+                if isinstance(raw_paths, (str, Path))
+                else tuple(Path(path) for path in raw_paths)
+            )
+            if not source_paths:
+                reject_invalid_state(f"catalog date {scene_id} has no source paths")
+            ordered = tuple(sorted(source_paths, key=_canonical_path_key))
+            for path in ordered:
+                key = _duplicate_path_key(path)
+                if key in seen:
+                    reject_invalid_state(f"duplicate source path {path}")
+                seen.add(key)
+            normalized[scene_id] = ordered
+        if not normalized:
+            reject_invalid_state("catalog requires at least one scene path")
+        object.__setattr__(self, "paths", normalized)
 
     @classmethod
-    def from_paths(
-        cls,
-        paths: list[str | Path] | tuple[str | Path, ...],
-    ) -> SceneCatalog:
-        """Build a catalog from SAFE paths; reject duplicate date ids."""
-        mapping: dict[str, Path] = {}
+    def from_paths(cls, paths: Sequence[str | Path]) -> Self:
+        """Build a catalog, grouping compatible source segments by date."""
+        mapping: dict[str, list[Path]] = {}
+        seen: set[str] = set()
         for raw in paths:
             path = Path(raw)
-            sid = scene_id_from_path(path)
-            if sid in mapping:
-                reject_invalid_state(f"duplicate scene id {sid} in catalog")
-            mapping[sid] = path
-        if not mapping:
-            reject_invalid_state("catalog requires at least one scene path")
+            scene_id = scene_id_from_path(path)
+            key = _duplicate_path_key(path)
+            if key in seen:
+                reject_invalid_state(f"duplicate source path {path}")
+            seen.add(key)
+            mapping.setdefault(scene_id, []).append(path)
         logger.info("Scene catalog: %s scenes", len(mapping))
-        return cls(paths=mapping)
+        return cls(
+            paths={scene_id: tuple(values) for scene_id, values in mapping.items()}
+        )
 
     @property
     def dates(self) -> tuple[str, ...]:
-        """Sorted date ids."""
+        """Return sorted logical acquisition date IDs."""
         return tuple(sorted(self.paths))
 
-    def path_for(self, date_id: str) -> Path:
-        """Return path for a date id or raise."""
-        if date_id not in self.paths:
-            reject_invalid_state(f"unknown scene id {date_id}")
-        return self.paths[date_id]
+    def paths_for(self, date_like: object) -> tuple[Path, ...]:
+        """Return all source paths for one logical acquisition."""
+        scene_id = _normalize_scene_id(date_like)
+        if scene_id not in self.paths:
+            reject_invalid_state(f"unknown scene id {scene_id}")
+        return self.paths[scene_id]
+
+    def path_for(self, date_like: object) -> Path:
+        """Return a singleton path, rejecting multi-segment acquisitions."""
+        paths = self.paths_for(date_like)
+        if len(paths) != 1:
+            reject_invalid_state(
+                "acquisition "
+                f"{_normalize_scene_id(date_like)} has multiple source paths"
+            )
+        return paths[0]
 
     def __len__(self) -> int:
-        """Return the number of scenes."""
+        """Return the number of logical acquisitions."""
         return len(self.paths)
+
+
+def _canonical_path_key(path: Path) -> str:
+    """Return a platform-independent ordering key for a source path."""
+    return path.as_posix().replace("\\", "/")
+
+
+def _duplicate_path_key(path: Path) -> str:
+    """Return a normalized key used to detect repeated source paths."""
+    return path.resolve(strict=False).as_posix()
+
+
+def _normalize_scene_id(date_like: object) -> str:
+    """Normalize a date-like value to a ``YYYYMMDD`` scene ID."""
+    if isinstance(date_like, str):
+        value = date_like.strip()
+        if len(value) == 8 and value.isdigit():
+            return value
+        if value:
+            try:
+                return pd.Timestamp(value).strftime("%Y%m%d")
+            except (TypeError, ValueError, OverflowError):
+                return value
+    if isinstance(date_like, (date, datetime, pd.Timestamp)):
+        timestamp = pd.Timestamp(date_like)
+    else:
+        try:
+            timestamp = pd.Timestamp(date_like)
+        except (TypeError, ValueError, OverflowError):
+            reject_invalid_state(f"invalid acquisition date {date_like!r}")
+    if pd.isna(timestamp):
+        reject_invalid_state(f"invalid acquisition date {date_like!r}")
+    return timestamp.strftime("%Y%m%d")

@@ -18,6 +18,10 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
+    SourcePath = Path | tuple[Path, ...]
+else:
+    SourcePath = object
+
 logger = setup_logger(__name__)
 
 
@@ -26,8 +30,8 @@ class SceneProductionCallback(Protocol):
 
     def __call__(
         self,
-        reference_path: Path,
-        secondary_path: Path,
+        reference_path: SourcePath,
+        secondary_path: SourcePath,
         *,
         output_dir: Path,
         options: Mapping[str, Any],
@@ -95,8 +99,8 @@ class StackSceneProvider:
 
     def __call__(
         self,
-        reference_path: Path,
-        secondary_path: Path,
+        reference_path: SourcePath,
+        secondary_path: SourcePath,
         *,
         output_dir: Path,
         options: Mapping[str, Any],

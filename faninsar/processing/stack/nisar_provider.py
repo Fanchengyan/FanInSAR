@@ -1027,14 +1027,26 @@ def make_nisar_scene_provider(
     }
 
     def produce_pair(
-        reference_path: Path,
-        secondary_path: Path,
+        reference_path: Path | tuple[Path, ...],
+        secondary_path: Path | tuple[Path, ...],
         *,
         output_dir: Path,
         options: Mapping[str, Any],
     ) -> NisarPairState:
-        reference_date = path_dates.get(Path(reference_path))
-        secondary_date = path_dates.get(Path(secondary_path))
+        def one_path(value: Path | tuple[Path, ...], label: str) -> Path:
+            """Resolve one source path from a logical acquisition payload."""
+            if isinstance(value, tuple):
+                if len(value) != 1:
+                    reject_invalid_state(
+                        f"NISAR provider requires one RSLC path for {label}"
+                    )
+                return value[0]
+            return value
+
+        reference_source = one_path(reference_path, "reference")
+        secondary_source = one_path(secondary_path, "secondary")
+        reference_date = path_dates.get(reference_source)
+        secondary_date = path_dates.get(secondary_source)
         if reference_date is None or secondary_date is None:
             reject_invalid_state("NISAR provider received an unadmitted source path")
         reference_product = products[reference_date]
@@ -1045,8 +1057,8 @@ def make_nisar_scene_provider(
             configured_height=configured_height,
         )
         for date_id, source_path in (
-            (reference_date, reference_path),
-            (secondary_date, secondary_path),
+            (reference_date, reference_source),
+            (secondary_date, secondary_source),
         ):
             current = _source_digest(Path(source_path))
             if current != admitted_sources[date_id]:
@@ -1260,14 +1272,14 @@ def make_nisar_scene_provider(
             )
             try:
                 reference_samples = sensor.read_slc_window(
-                    handles[Path(reference_path)],
+                    handles[reference_source],
                     reference_window,
                     frequency=channel[0],
                     polarization=channel[1],
                 )
                 if secondary_bounds is not None:
                     secondary_samples = sensor.read_slc_window(
-                        handles[Path(secondary_path)],
+                        handles[secondary_source],
                         (
                             slice(sec_row_start, sec_row_stop),
                             slice(sec_col_start, sec_col_stop),
@@ -1452,7 +1464,7 @@ def make_nisar_scene_provider(
                         "stage": "nisar_rslc_tile"
                         if full_scene
                         else "nisar_rslc_window",
-                        "source": str(reference_path),
+                        "source": str(reference_source),
                         "source_id": admitted_sources[reference_date][0],
                         "source_digest": admitted_sources[reference_date][1],
                         "admission_policy": admission_lineage.get(
@@ -1467,7 +1479,7 @@ def make_nisar_scene_provider(
                         "stage": "nisar_rslc_tile"
                         if full_scene
                         else "nisar_rslc_window",
-                        "source": str(secondary_path),
+                        "source": str(secondary_source),
                         "source_id": admitted_sources[secondary_date][0],
                         "source_digest": admitted_sources[secondary_date][1],
                         "admission_policy": admission_lineage.get(

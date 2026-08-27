@@ -24,6 +24,7 @@ from faninsar.processing.stack.provider import (
     unavailable_scene_provider,
     unsupported_stack_capability,
 )
+from faninsar.processing.stack.s1 import S1Stack
 from faninsar.processing.stack.session import Stack
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "GpuMemoryReclaim",
     "LocalActivationAuthority",
     "NISARStack",
+    "S1Stack",
     "SceneCatalog",
     "SceneProductionCallback",
     "Stack",
