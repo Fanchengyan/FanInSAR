@@ -1,4 +1,4 @@
-"""Tests for the unified run_pair multilook sweep and geo integration."""
+"""Tests for the unified Stack interferogram sweep and geo integration."""
 
 from __future__ import annotations
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -290,3 +291,13 @@ def test_stack_analysis_closes_ifg_leases_when_heartbeat_fails(monkeypatch) -> N
     with pytest.raises(InvalidProcessingStateError, match="expired"):
         stack.analyze_time_series()
     assert events == ["heartbeat", "close"]
+
+
+def test_stack_analysis_readiness_follows_unwrap_commit() -> None:
+    """IFG formation alone cannot publish the Network analysis generation."""
+    form_source = inspect.getsource(Stack.form_interferograms)
+    unwrap_source = inspect.getsource(Stack.unwrap)
+    assert "_refresh_network_from_ifg_dirs" not in form_source
+    assert unwrap_source.index("write_unwrapped_artifact") < unwrap_source.index(
+        "_refresh_network_from_ifg_dirs"
+    )

@@ -1199,8 +1199,8 @@ def test_load_production_scene_burst() -> None:
 
 @pytest.mark.slow
 @pytest.mark.skipif(len(SCENES) < 2, reason="need two local S1 ZIP scenes")
-def test_run_pair_single_burst(tmp_path: Path) -> None:
-    """Unified pair workflow writes products for an explicit burst selection."""
+def test_produce_interferogram_pair_single_burst(tmp_path: Path) -> None:
+    """Stack interferogram production writes an explicit burst selection."""
     pair = _first_common_pair()
     assert pair is not None
     reference, secondary = pair

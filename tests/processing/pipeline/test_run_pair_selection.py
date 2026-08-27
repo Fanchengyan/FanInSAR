@@ -1,4 +1,4 @@
-"""Unit tests for run_pair burst selection helpers."""
+"""Unit tests for Stack burst-selection helpers."""
 
 from __future__ import annotations
 

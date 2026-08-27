@@ -1,7 +1,7 @@
 """Tests for the shared datum-aware auto-DEM resolution helper (PROPOSAL-0030).
 
 Covers :func:`faninsar.processing.pipeline.production.resolve_auto_dem`: the
-single wrap rule used by ``run_pair``, ``_run_pair_sweep``, and
+single wrap rule used by Stack interferogram production and
 ``cli.frame.run_frame_cli``; source selection via ``dem_source``; and the
 CLI fail-closed contract for unwired providers.
 """

@@ -49,17 +49,17 @@ Hierarchical Datasets
    faninsar.datasets.XarrayDataset
    faninsar.datasets.HierarchicalDataset
 
-Frame-Level Products
-~~~~~~~~~~~~~~~~~~~~
+Network-Level Products
+~~~~~~~~~~~~~~~~~~~~~~
 
-Standardized geocoded raster InSAR frames: geometry + interferogram
-collections + time series, with COG/Zarr/STAC round-tripping and MintPy
-interoperability.
+Standardized geocoded raster InSAR products organized as an interferometric
+network. ``Network`` owns product relationships and time-series scheduling;
+the underlying Dataset components own raster reads.
 
 .. autosummary::
    :toctree: generated/
 
-   faninsar.datasets.frame.Frame
+   faninsar.datasets.Network
    faninsar.datasets.frame.FrameGeometry
    faninsar.datasets.frame.FrameInterferogramCollection
    faninsar.datasets.frame.FrameTimeSeries
