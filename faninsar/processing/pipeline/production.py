@@ -691,7 +691,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     load_s = time.perf_counter() - load_started
     state = ProductionPairState(
         pair_id=ref.scene_id + "_" + sec.scene_id + "_" + tag,
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=dem,
         coregistration_grid=coregistration_grid,
@@ -1260,7 +1260,7 @@ class ProductionPairState:
     """Mutable state for the production pair workflow with stage log."""
 
     pair_id: str
-    reference: ProductionScene
+    primary: ProductionScene
     secondary: ProductionScene
     dem: DEMSampler
     primary_deramped: np.ndarray | None = None
@@ -4509,7 +4509,7 @@ def produce_interferogram_pair(
                 )
                 measure_state = ProductionPairState(
                     pair_id=ref.scene_id + "_" + sec.scene_id + "_" + tag,
-                    reference=ref,
+                    primary=ref,
                     secondary=sec,
                     dem=dem_sampler,
                     coregistration_grid="radar",
@@ -4607,7 +4607,7 @@ def produce_interferogram_pair(
             )
             state = ProductionPairState(
                 pair_id=ref.scene_id + "_" + sec.scene_id + "_" + tag,
-                reference=ref,
+                primary=ref,
                 secondary=sec,
                 dem=dem_sampler,
                 coregistration_grid=coregistration_grid,
@@ -4782,7 +4782,7 @@ def produce_interferogram_pair(
 
     result = ProductionPairState(
         pair_id=_scene_id(primary_paths[0]) + "_" + _scene_id(sec_paths[0]) + "_pair",
-        reference=(
+        primary=(
             origin_state.primary
             if origin_state is not None
             else first_state.primary
@@ -5383,7 +5383,7 @@ def _archive_burst_ifgs(
         )
         return ProductionPairState(
             pair_id=ref.scene_id + "_" + sec.scene_id,
-            reference=ref,
+            primary=ref,
             secondary=sec,
             dem=dem,
             coregistration_grid=coregistration_grid,
@@ -5786,7 +5786,7 @@ def _finalize_sweep_config(
         )
     result = ProductionPairState(
         pair_id=pair_id,
-        reference=origin.primary,
+        primary=origin.primary,
         secondary=origin.secondary,
         dem=origin.dem,
         coregistration_grid="radar",
@@ -6001,7 +6001,7 @@ def _finalize_geo_config(
         resolved_irls_kwargs.setdefault("device", origin.coreg_device)
     result = ProductionPairState(
         pair_id=pair_id,
-        reference=origin.primary,
+        primary=origin.primary,
         secondary=origin.secondary,
         dem=origin.dem,
         coregistration_grid="geo",

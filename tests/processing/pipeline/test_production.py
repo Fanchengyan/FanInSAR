@@ -97,7 +97,7 @@ def test_production_pair_state_note() -> None:
     sec = _make_mock_scene((8, 8))
     state = ProductionPairState(
         pair_id="TEST",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -169,7 +169,7 @@ def test_stage_deramp_with_synthetic() -> None:
     sec = _make_mock_scene((16, 16))
     state = ProductionPairState(
         pair_id="TEST",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -195,7 +195,7 @@ def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
     sec.geometry.wavelength_m = 0.056
     state = ProductionPairState(
         pair_id="geometry_only_coregistration",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
         multilook=(2, 4),
@@ -264,7 +264,7 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
     sec.geometry.wavelength_m = 0.056
     state = ProductionPairState(
         pair_id="ampcor-dispatch",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -357,7 +357,7 @@ def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
 
     measure = ProductionPairState(
         pair_id="prepared-measure",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -378,7 +378,7 @@ def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
     )
     product = ProductionPairState(
         pair_id="prepared-product",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -435,7 +435,7 @@ def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
     sec = _make_mock_scene(radar_shape)
     state = ProductionPairState(
         pair_id="prepared-geo-lut",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -554,7 +554,7 @@ def test_prepared_geometry_field_rejects_unbound_geo_reuse() -> None:
     sec = _make_mock_scene(shape)
     state = ProductionPairState(
         pair_id="prepared-geo",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -612,7 +612,7 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
 
     measure = ProductionPairState(
         pair_id="prepared-roi-measure",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -635,7 +635,7 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
     )
     product = ProductionPairState(
         pair_id="prepared-roi-product",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -668,7 +668,7 @@ def test_stage_coregister_grows_roi_halo_for_large_offsets(
     sec.geometry.wavelength_m = 0.056
     state = ProductionPairState(
         pair_id="window_halo_growth",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -738,7 +738,7 @@ def test_stage_interferogram_with_synthetic() -> None:
     sec = _make_mock_scene((16, 16))
     state = ProductionPairState(
         pair_id="TEST",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -867,7 +867,7 @@ def test_stage_interferogram_masks_zero_power_edge_as_nan() -> None:
     sec = _make_mock_scene((16, 32))
     state = ProductionPairState(
         pair_id="edge",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -910,7 +910,7 @@ def test_stage_flatten_wrapped_phase_matches_flat_not_unflat(
     sec = _make_mock_scene((16, 32))
     state = ProductionPairState(
         pair_id="flat_edge",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -969,7 +969,7 @@ def test_stage_flatten_does_not_repeat_slc_domain_flattening(
     sec = _make_mock_scene((16, 32))
     state = ProductionPairState(
         pair_id="preflattened_slc",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -1023,7 +1023,7 @@ def test_staged_ifg_only_never_enters_unwrap(tmp_path: Path) -> None:
 
     state = ProductionPairState(
         pair_id="IFG_ONLY",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -1067,7 +1067,7 @@ def test_stage_unwrap_with_synthetic() -> None:
     sec = _make_mock_scene((8, 8))
     state = ProductionPairState(
         pair_id="TEST",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -1090,7 +1090,7 @@ def test_stage_unwrap_selects_irls_for_geo_products() -> None:
     sec = _make_mock_scene((16, 16))
     state = ProductionPairState(
         pair_id="GEO_IRLS",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
         coregistration_grid="geo",
@@ -1118,7 +1118,7 @@ def test_stage_write_with_synthetic(tmp_path: Path) -> None:
     sec = _make_mock_scene((8, 8))
     state = ProductionPairState(
         pair_id="TEST_PAIR",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
     )
@@ -1152,7 +1152,7 @@ def test_stage_write_persists_geocoded_slcs(tmp_path: Path) -> None:
     sec = _make_mock_scene((8, 8))
     state = ProductionPairState(
         pair_id="GEO_PAIR",
-        reference=ref,
+        primary=ref,
         secondary=sec,
         dem=ConstantHeightDEM(0.0),
         coregistration_grid="geo",

@@ -53,7 +53,7 @@ def _origin_state(shape: tuple[int, int] = SHAPE) -> ProductionPairState:
     """Build a minimal post-coreg origin state for sweep finalization."""
     return ProductionPairState(
         pair_id="20161207_20161231_pair",
-        reference=_make_scene(shape, "20161207"),
+        primary=_make_scene(shape, "20161207"),
         secondary=_make_scene(shape, "20161231"),
         dem=ConstantHeightDEM(0.0),
         coregistration_grid="radar",
@@ -414,7 +414,7 @@ def test_finalize_geo_products_builds_multilooked_grid() -> None:
     product_shape = (8, 8)
     state = ProductionPairState(
         pair_id="GEO_ML",
-        reference=_make_scene(shape, "20161207"),
+        primary=_make_scene(shape, "20161207"),
         secondary=_make_scene(shape, "20161231"),
         dem=ConstantHeightDEM(0.0),
         coregistration_grid="geo",
@@ -471,7 +471,7 @@ def test_shared_resources_cleanup_is_idempotent(tmp_path: Path) -> None:
     height_full = _memmap("lut/height.float64", np.float64, shape)
     state = ProductionPairState(
         pair_id="GEO_CLEANUP",
-        reference=_make_scene(shape, "20161207"),
+        primary=_make_scene(shape, "20161207"),
         secondary=_make_scene(shape, "20161231"),
         dem=ConstantHeightDEM(0.0),
         coregistration_grid="geo",
@@ -722,7 +722,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
     )
     geo_state = ProductionPairState(
         pair_id="GEO_WIRE",
-        reference=_make_scene(shape, "20161207"),
+        primary=_make_scene(shape, "20161207"),
         secondary=_make_scene(shape, "20161231"),
         dem=ConstantHeightDEM(0.0),
         coregistration_grid="geo",
