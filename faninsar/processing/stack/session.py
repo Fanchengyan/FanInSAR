@@ -1441,6 +1441,7 @@ class Stack(Network):
         polarization = str(dimensions.get("polarization", "merged"))
         products: list[NetworkProduct] = []
         manifest_digests: list[str] = []
+        unwrap_manifest_digests: list[str] = []
         seen_paths: set[Path] = set()
         actual_pairs: list[tuple[str, str]] = []
         unique_ifg_paths = tuple(
@@ -1488,28 +1489,10 @@ class Stack(Network):
                 manifest_digests.append(store.manifest_digest)
                 if has_unwrapped_products:
                     unwrapped = store.read_unwrapped()
-                    try:
-                        unwrap_manifest = json.loads(
-                            (store.root / "unwrap_manifest.json").read_text(
-                                encoding="utf-8"
-                            )
-                        )
-                    except (OSError, UnicodeError, ValueError) as error:
-                        reject_invalid_state(
-                            f"Stack unwrap manifest cannot be read: {error}"
-                        )
-                    if not isinstance(unwrap_manifest, dict):
-                        reject_invalid_state(
-                            "Stack unwrap manifest must be a JSON object"
-                        )
-                    unwrap_generation_id = unwrap_manifest.get("generation_id")
-                    unwrap_digest = unwrap_manifest.get("manifest_digest")
-                    if not isinstance(unwrap_generation_id, str) or not isinstance(
-                        unwrap_digest, str
-                    ):
-                        reject_invalid_state(
-                            "Stack unwrap manifest identity is incomplete"
-                        )
+                    unwrap_generation_id, unwrap_digest = (
+                        _read_unwrap_manifest_identity(store)
+                    )
+                    unwrap_manifest_digests.append(unwrap_digest)
                     unwrapped_artifacts.append(unwrapped)
                     unwrap_kind = AssetKind.UNWRAPPED_PHASE
                     products.append(
@@ -1561,9 +1544,9 @@ class Stack(Network):
                     reject_invalid_state(
                         "Stack unwrap products do not form one consistent Pair network"
                     )
-        generation_id = hashlib.sha256(
-            "|".join(sorted(manifest_digests)).encode("utf-8")
-        ).hexdigest()
+        generation_id = _network_generation_digest(
+            manifest_digests, unwrap_manifest_digests
+        )
         self.refresh_generation(generation_id, tuple(products))
 
     @property
@@ -1941,7 +1924,6 @@ class Stack(Network):
         **kwargs: Any,
     ) -> TimeSeriesResult:
         """Run Stack's existing inversion after Network generation admission."""
-        del _products
         # Keep the IFG generation pinned for the complete analysis call.  The
         # solver reads the unwrap payloads before doing its numerical solve;
         # closing the stores immediately after those reads would allow a
@@ -1956,12 +1938,13 @@ class Stack(Network):
             ifg_root=kwargs.get("ifg_root"),
         )
         try:
-            observed_generation_id = hashlib.sha256(
-                "|".join(sorted(store.manifest_digest for store in stores)).encode()
-            ).hexdigest()
+            observed_generation_id = _observed_network_generation_digest(
+                stores, _products
+            )
             if observed_generation_id != generation_id:
                 reject_invalid_state(
-                    "Stack IFG artifacts changed after Network generation refresh"
+                    "Stack IFG or unwrap artifacts changed after Network generation "
+                    "refresh"
                 )
             for store in stores:
                 store._lease.heartbeat()
@@ -1974,6 +1957,10 @@ class Stack(Network):
             # than returning a result that was computed from an unpinned view.
             for store in stores:
                 store._lease.heartbeat()
+            if _observed_network_generation_digest(stores, _products) != generation_id:
+                reject_invalid_state(
+                    "Stack IFG or unwrap artifacts changed during Network analysis"
+                )
             return result
         finally:
             for store in stores:
@@ -2263,6 +2250,92 @@ def _canonical_pair_strings(values: tuple[str, str]) -> tuple[str, str]:
     except (TypeError, ValueError):
         reject_invalid_state(f"Stack IFG artifact has an invalid Pair: {values!r}")
     return pair.primary_string(), pair.secondary_string()
+
+
+def _read_unwrap_manifest_identity(store: Any) -> tuple[str, str]:
+    """Read the validated unwrap generation and manifest identities."""
+    try:
+        manifest = json.loads(
+            (store.root / "unwrap_manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        reject_invalid_state(f"Stack unwrap manifest cannot be read: {error}")
+    if not isinstance(manifest, dict):
+        reject_invalid_state("Stack unwrap manifest must be a JSON object")
+    generation_id = manifest.get("generation_id")
+    manifest_digest = manifest.get("manifest_digest")
+    if not isinstance(generation_id, str) or not isinstance(manifest_digest, str):
+        reject_invalid_state("Stack unwrap manifest identity is incomplete")
+    return generation_id, manifest_digest
+
+
+def _network_generation_digest(
+    ifg_manifest_digests: Iterable[str],
+    unwrap_manifest_digests: Iterable[str] = (),
+) -> str:
+    """Hash one unambiguous IFG-plus-unwrap Network generation identity."""
+    unwrap_digests = tuple(unwrap_manifest_digests)
+    if not unwrap_digests:
+        # Keep the lightweight in-memory Stack test seam deterministic while a
+        # persisted Stack always supplies unwrap identities after unwrap.
+        return hashlib.sha256(
+            "|".join(sorted(ifg_manifest_digests)).encode("utf-8")
+        ).hexdigest()
+    components = [
+        *(f"ifg:{digest}" for digest in ifg_manifest_digests),
+        *(f"unwrap:{digest}" for digest in unwrap_digests),
+    ]
+    return hashlib.sha256("|".join(sorted(components)).encode("utf-8")).hexdigest()
+
+
+def _observed_network_generation_digest(
+    stores: Sequence[InterferogramArtifactStore],
+    products: NetworkProductIndex,
+) -> str:
+    """Validate current stores against products and return their generation ID."""
+    ifg_manifest_digests = [store.manifest_digest for store in stores]
+    indexed_unwrapped = {
+        (
+            product.primary.acquisition_id,
+            product.secondary.acquisition_id,
+        ): product
+        for product in products.products
+        if product.key.product_kind is AssetKind.UNWRAPPED_PHASE
+    }
+    if not indexed_unwrapped:
+        roots = [getattr(store, "root", None) for store in stores]
+        if roots and all(
+            isinstance(root, Path) and (root / "unwrap_manifest.json").is_file()
+            for root in roots
+        ):
+            reject_invalid_state(
+                "Stack Network index is missing current unwrapped phase products"
+            )
+        return _network_generation_digest(ifg_manifest_digests)
+    if len(indexed_unwrapped) != len(stores):
+        reject_invalid_state(
+            "Stack Network index does not contain one unwrapped product per IFG"
+        )
+
+    unwrap_manifest_digests: list[str] = []
+    for store in stores:
+        # read_unwrapped validates CURRENT, its manifest digest, payload hashes,
+        # and the binding back to this exact IFG before the digest is admitted.
+        store.read_unwrapped()
+        _generation_id, unwrap_digest = _read_unwrap_manifest_identity(store)
+        pair = _canonical_pair_strings(store.pair)
+        product = indexed_unwrapped.get(pair)
+        if product is None or product.content_digest != unwrap_digest:
+            reject_invalid_state(
+                "Stack Network unwrapped product does not match current unwrap"
+            )
+        if product.lineage != (store.manifest_digest, unwrap_digest):
+            reject_invalid_state(
+                "Stack Network unwrapped product lineage does not match current "
+                "artifacts"
+            )
+        unwrap_manifest_digests.append(unwrap_digest)
+    return _network_generation_digest(ifg_manifest_digests, unwrap_manifest_digests)
 
 
 def _normalize_multilook(

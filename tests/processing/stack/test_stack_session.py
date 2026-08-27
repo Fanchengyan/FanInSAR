@@ -885,6 +885,39 @@ def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
         )
 
 
+def test_stack_analysis_rejects_replaced_unwrap_generation(tmp_path: Path) -> None:
+    """Analysis fails closed when an unwrap CURRENT advances after refresh."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phases = {
+        "20240101_20240113": np.full((3, 4), 0.2, dtype=np.float32),
+        "20240113_20240125": np.full((3, 4), 0.35, dtype=np.float32),
+        "20240101_20240125": np.full((3, 4), 0.55, dtype=np.float32),
+    }
+    for pair_id, phase in phases.items():
+        _write_pair_artifact(stack, pair_id, phase)
+    stack.unwrap(do_spatial=False)
+
+    first_root = stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113"
+    first_store = InterferogramArtifactStore.open(first_root)
+    old_unwrapped = first_store.read_unwrapped()
+    ifg_manifest_digest = first_store.manifest_digest
+    first_store.close()
+    write_unwrapped_artifact(
+        first_root,
+        unwrapped_phase=old_unwrapped.unwrapped_phase,
+        connected_components=old_unwrapped.connected_components,
+        method=old_unwrapped.method,
+        method_parameters=old_unwrapped.method_parameters,
+        ifg_manifest_digest=ifg_manifest_digest,
+        replace_existing=True,
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="unwrapped product"):
+        stack.analyze_time_series()
+
+
 def test_stack_generation_binds_complete_ifg_unwrap_and_timeseries_set(
     tmp_path: Path,
 ) -> None:
