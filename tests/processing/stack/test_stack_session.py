@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
+from faninsar.core.network import AssetKind
 from faninsar.processing.contracts import ActivationToken, StackActivationBinding
 from faninsar.processing.interferometry.pair import (
     form_interferogram,
@@ -834,6 +835,19 @@ def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
 
     stack.unwrap(do_spatial=False)
     assert stack.analysis_ready
+    index = stack.network_product_index
+    assert index is not None
+    product_kinds = tuple(product.key.product_kind for product in index.products)
+    assert product_kinds.count(AssetKind.COMPLEX_INTERFEROGRAM) == len(phases)
+    assert product_kinds.count(AssetKind.UNWRAPPED_PHASE) == len(phases)
+    assert len(product_kinds) == 2 * len(phases)
+    for product in index.products:
+        assert product.content_digest
+        assert product.lineage
+    for product in index.products:
+        if product.key.product_kind is AssetKind.UNWRAPPED_PHASE:
+            assert len(product.lineage) == 2
+            assert product.content_digest == product.lineage[-1]
     result = stack.invert_timeseries()
 
     assert stack.unwrap_result is not None
@@ -944,6 +958,13 @@ def test_partial_unwrap_network_cannot_publish_stack_generation(tmp_path: Path) 
         ifg_manifest_digest=first_store.manifest_digest,
     )
     first_store.close()
+    stack.ifg_dirs = [
+        stack.config.work_dir / "ifg" / "ml_1x1" / pair_id for pair_id in phases
+    ]
+    with pytest.raises(InvalidProcessingStateError, match="partial unwrap product set"):
+        stack._refresh_network_from_ifg_dirs()
+    assert not stack.analysis_ready
+
     timeseries_root = write_timeseries_zarr(
         stack.invert_timeseries(pair_phases=phases),
         stack.config.work_dir / "timeseries.zarr",

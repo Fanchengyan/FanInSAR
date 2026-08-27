@@ -1443,6 +1443,18 @@ class Stack(Network):
         manifest_digests: list[str] = []
         seen_paths: set[Path] = set()
         actual_pairs: list[tuple[str, str]] = []
+        unique_ifg_paths = tuple(
+            dict.fromkeys(Path(raw_path) for raw_path in self.ifg_dirs)
+        )
+        unwrap_flags = [
+            (path / "unwrap_manifest.json").is_file() for path in unique_ifg_paths
+        ]
+        if any(unwrap_flags) and not all(unwrap_flags):
+            reject_invalid_state(
+                "Stack IFG generation contains a partial unwrap product set"
+            )
+        has_unwrapped_products = bool(unwrap_flags) and all(unwrap_flags)
+        unwrapped_artifacts: list[Any] = []
         for raw_path in self.ifg_dirs:
             path = Path(raw_path)
             if path in seen_paths:
@@ -1474,6 +1486,56 @@ class Stack(Network):
                     )
                 )
                 manifest_digests.append(store.manifest_digest)
+                if has_unwrapped_products:
+                    unwrapped = store.read_unwrapped()
+                    try:
+                        unwrap_manifest = json.loads(
+                            (store.root / "unwrap_manifest.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                    except (OSError, UnicodeError, ValueError) as error:
+                        reject_invalid_state(
+                            f"Stack unwrap manifest cannot be read: {error}"
+                        )
+                    if not isinstance(unwrap_manifest, dict):
+                        reject_invalid_state(
+                            "Stack unwrap manifest must be a JSON object"
+                        )
+                    unwrap_generation_id = unwrap_manifest.get("generation_id")
+                    unwrap_digest = unwrap_manifest.get("manifest_digest")
+                    if not isinstance(unwrap_generation_id, str) or not isinstance(
+                        unwrap_digest, str
+                    ):
+                        reject_invalid_state(
+                            "Stack unwrap manifest identity is incomplete"
+                        )
+                    unwrapped_artifacts.append(unwrapped)
+                    unwrap_kind = AssetKind.UNWRAPPED_PHASE
+                    products.append(
+                        NetworkProduct(
+                            key=NetworkProductKey(
+                                primary_key,
+                                secondary_key,
+                                unwrap_kind,
+                            ),
+                            asset_location=str(
+                                store.root
+                                / ".unwrap_generations"
+                                / unwrap_generation_id
+                                / "unwrapped_phase.npy"
+                            ),
+                            geometry_identity=store.grid_identity,
+                            source_software="faninsar",
+                            phase_convention=PhaseConvention.PRIMARY_MINUS_SECONDARY,
+                            asset_transform=AssetTransform.for_convention(
+                                unwrap_kind,
+                                PhaseConvention.PRIMARY_MINUS_SECONDARY,
+                            ),
+                            content_digest=unwrap_digest,
+                            lineage=(store.manifest_digest, unwrap_digest),
+                        )
+                    )
             finally:
                 store.close()
 
@@ -1486,6 +1548,19 @@ class Stack(Network):
                 f"Pair network: expected={dict(expected_counts)!r}, "
                 f"discovered={dict(actual_counts)!r}"
             )
+        if has_unwrapped_products:
+            expected_pair_ids = [
+                f"{primary}_{secondary}" for primary, secondary in expected_pairs
+            ]
+            expected_parameters = unwrapped_artifacts[0].method_parameters
+            for artifact in unwrapped_artifacts:
+                if (
+                    artifact.method_parameters != expected_parameters
+                    or artifact.method_parameters.get("pair_ids") != expected_pair_ids
+                ):
+                    reject_invalid_state(
+                        "Stack unwrap products do not form one consistent Pair network"
+                    )
         generation_id = hashlib.sha256(
             "|".join(sorted(manifest_digests)).encode("utf-8")
         ).hexdigest()
