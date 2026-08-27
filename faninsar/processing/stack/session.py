@@ -2089,11 +2089,19 @@ class Stack(Network):
 
 
 def _iter_pair_dates(pairs: Pairs) -> list[tuple[str, str]]:
-    """Yield (primary, secondary) YYYYMMDD pairs from a Pairs object."""
+    """Yield chronological ``(primary, secondary)`` IDs from ``Pairs``.
+
+    ``Pair`` is the single authority for role direction.  Reconstructing the
+    roles from a filename would duplicate (and eventually drift from) the
+    FanInSAR ordering contract, so each edge is normalized through ``Pair``
+    before it enters Stack persistence or analysis.
+    """
+    from faninsar.core.pairs import Pair
+
     out: list[tuple[str, str]] = []
-    for name in pairs.names:
-        a, b = str(name).split("_")
-        out.append((a, b))
+    for values in pairs.values:
+        pair = Pair(values)
+        out.append((pair.primary_string(), pair.secondary_string()))
     return out
 
 
