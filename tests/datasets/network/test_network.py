@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -15,10 +16,27 @@ from faninsar.datasets.network import (
     IncompleteNetworkProductError,
     ISCE2Network,
     Network,
+    NetworkCurrentError,
     NetworkGenerationError,
     NetworkManifestError,
     UnknownNetworkIndexTypeError,
 )
+
+
+def _refresh_manifest_digest(payload: dict[str, Any]) -> None:
+    """Update the test manifest's canonical self-digest after a mutation."""
+    payload["manifest_digest"] = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in payload.items()
+                if key != "manifest_digest"
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _write_layout(
@@ -58,6 +76,7 @@ def _write_layout(
     }
     if source_software is not None:
         payload["source_software"] = source_software
+    _refresh_manifest_digest(payload)
     root.mkdir(parents=True, exist_ok=True)
     (root / "manifest.json").write_text(json.dumps(payload), encoding="utf-8")
     (root / "CURRENT").write_text(
@@ -66,6 +85,7 @@ def _write_layout(
                 "schema_version": "network_current_v1",
                 "status": "complete",
                 "generation_id": generation,
+                "manifest_digest": payload["manifest_digest"],
             }
         ),
         encoding="utf-8",
@@ -171,6 +191,7 @@ def test_network_rejects_generation_product_set_mismatch(tmp_path: Path) -> None
     )
     payload = json.loads(generation_manifest.read_text())
     payload["products"][0]["id"] = "20240201_20240213"
+    _refresh_manifest_digest(payload)
     generation_manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(NetworkGenerationError, match="product set"):
         Network(root)
@@ -195,8 +216,33 @@ def test_network_rejects_invalid_content_lineage_and_asset_location(
     manifest_path = root / "manifest.json"
     payload = json.loads(manifest_path.read_text())
     payload["products"][0][field_name] = value
+    _refresh_manifest_digest(payload)
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(NetworkManifestError, match=message):
+        Network(root)
+
+
+def test_network_rejects_manifest_digest_tampering(tmp_path: Path) -> None:
+    """Changing a manifest without republishing its digest fails closed."""
+    root = tmp_path / "network"
+    _write_layout(root)
+    manifest_path = root / "manifest.json"
+    payload = json.loads(manifest_path.read_text())
+    payload["products"][0]["geometry_identity"] = "forged-grid"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(NetworkManifestError, match="manifest_digest"):
+        Network(root)
+
+
+def test_network_rejects_forged_current_digest(tmp_path: Path) -> None:
+    """CURRENT cannot point at a different manifest generation digest."""
+    root = tmp_path / "network"
+    _write_layout(root)
+    current_path = root / "CURRENT"
+    payload = json.loads(current_path.read_text())
+    payload["manifest_digest"] = "b" * 64
+    current_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(NetworkCurrentError, match="manifest_digest"):
         Network(root)
 
 

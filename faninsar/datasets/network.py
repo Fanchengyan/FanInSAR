@@ -9,7 +9,9 @@ not probe or infer unrelated processor layouts.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Self
 
@@ -46,6 +48,7 @@ _REQUIRED_PRODUCT_FIELDS = (
     "source_software",
     "phase_convention",
 )
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class NetworkConstructionError(RuntimeError):
@@ -143,6 +146,34 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     return data
 
 
+def _canonical_manifest_digest(manifest: dict[str, Any]) -> str:
+    """Compute the digest over a manifest without its self-referential field."""
+    unsigned = dict(manifest)
+    unsigned.pop("manifest_digest", None)
+    encoded = json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_manifest_digest(manifest: dict[str, Any], *, path: Path) -> str:
+    """Require a valid SHA-256 digest for one immutable manifest."""
+    digest = manifest.get("manifest_digest")
+    if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+        message = f"Network manifest_digest is invalid: {path}"
+        logger.error(message)
+        raise NetworkManifestError(message)
+    if digest != _canonical_manifest_digest(manifest):
+        message = f"Network manifest_digest mismatch: {path}"
+        logger.error(message)
+        raise NetworkManifestError(message)
+    return digest
+
+
 def _validate_asset_location(value: object, *, path: Path, product_id: str) -> None:
     """Reject absolute, traversing, or platform-ambiguous asset locations."""
     if not isinstance(value, str) or not value.strip() or value != value.strip():
@@ -173,6 +204,7 @@ def _validate_manifest(
 ) -> dict[str, Any]:
     """Validate schema, complete status, generation identity, and index type."""
     manifest = _read_manifest(path)
+    _validate_manifest_digest(manifest, path=path)
     if manifest.get("schema_version") != NETWORK_SCHEMA_VERSION:
         message = (
             f"unsupported Network manifest version at {path}: "
@@ -230,7 +262,10 @@ def _validate_manifest(
                 raise NetworkManifestError(message)
         product_id = product["id"]
         content_digest = product.get("content_digest")
-        if not isinstance(content_digest, str) or not content_digest.strip():
+        if (
+            not isinstance(content_digest, str)
+            or _SHA256_RE.fullmatch(content_digest) is None
+        ):
             message = (
                 f"Network product record {position} has no content_digest: {path}"
             )
@@ -310,6 +345,14 @@ def _validate_current(path: Path, *, expected_generation: str) -> dict[str, Any]
         message = "Network CURRENT does not select the root manifest generation"
         logger.error(message)
         raise NetworkCurrentError(message)
+    manifest_digest = current.get("manifest_digest")
+    if (
+        not isinstance(manifest_digest, str)
+        or _SHA256_RE.fullmatch(manifest_digest) is None
+    ):
+        message = f"Network CURRENT manifest_digest is invalid: {path}"
+        logger.error(message)
+        raise NetworkCurrentError(message)
     return current
 
 
@@ -328,7 +371,7 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
         raise NetworkGenerationError(message)
     current_path = root / NETWORK_CURRENT_NAME
     generation_id = str(root_manifest["generation_id"])
-    _validate_current(current_path, expected_generation=generation_id)
+    current = _validate_current(current_path, expected_generation=generation_id)
     generation_root = generations / str(generation_id)
     if not generation_root.is_dir() or generation_root.is_symlink():
         message = (
@@ -345,6 +388,14 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
         message = "Network generation manifest does not match root product set"
         logger.error(message)
         raise NetworkGenerationError(message)
+    if generation_manifest["manifest_digest"] != root_manifest["manifest_digest"]:
+        message = "Network generation manifest_digest does not match root manifest"
+        logger.error(message)
+        raise NetworkGenerationError(message)
+    if current["manifest_digest"] != root_manifest["manifest_digest"]:
+        message = "Network CURRENT manifest_digest does not select root manifest"
+        logger.error(message)
+        raise NetworkCurrentError(message)
     if generation_manifest["phase_convention"] != root_manifest["phase_convention"]:
         message = "Network generation manifest phase convention mismatch"
         logger.error(message)
