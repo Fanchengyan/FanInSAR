@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from types import SimpleNamespace
 
 import numpy as np
@@ -225,11 +226,15 @@ def test_stack_analysis_keeps_ifg_leases_until_solver_returns(monkeypatch) -> No
         """Minimal artifact store double with one durable lease."""
 
         _lease = Lease()
+        manifest_digest = "manifest-digest"
 
         def close(self) -> None:
             events.append("close")
 
     store = Store()
+    stack._network_generation_id = hashlib.sha256(
+        store.manifest_digest.encode()
+    ).hexdigest()
     monkeypatch.setattr(
         stack,
         "_pair_artifact_stores",
@@ -267,11 +272,15 @@ def test_stack_analysis_closes_ifg_leases_when_heartbeat_fails(monkeypatch) -> N
         """Artifact store double used to verify cleanup after failure."""
 
         _lease = Lease()
+        manifest_digest = "manifest-digest"
 
         def close(self) -> None:
             events.append("close")
 
     store = Store()
+    stack._network_generation_id = hashlib.sha256(
+        store.manifest_digest.encode()
+    ).hexdigest()
     monkeypatch.setattr(stack, "_pair_artifact_stores", lambda **_: [store])
     monkeypatch.setattr(
         stack,
