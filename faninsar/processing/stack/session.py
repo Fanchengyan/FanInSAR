@@ -718,7 +718,6 @@ class Stack(Network):
             "roi": cfg.roi,
             "control_spacing": cfg.control_spacing,
             "n_jobs": cfg.n_jobs,
-            "flatten_stage": cfg.flatten_stage,
         }
 
     def _reclaim_accelerator(self, kind: str) -> None:
