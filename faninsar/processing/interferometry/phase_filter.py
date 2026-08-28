@@ -119,6 +119,8 @@ class GoldsteinWerner(PhaseFilter):
         support = _validate_input(interferogram, valid_mask)
         height, width = interferogram.shape
         patch = self.patch_size
+        if height < patch or width < patch:
+            return PhaseFilterResult(interferogram.clone(), support)
         step = patch // 2
         taper_1d = 1.0 - torch.abs(
             2.0
@@ -145,10 +147,18 @@ class GoldsteinWerner(PhaseFilter):
                 weight = torch.pow(
                     magnitude / magnitude.amax().clamp_min(1e-12), self.alpha
                 )
-                filtered = torch.fft.ifft2(spectrum * weight)
+                filtered = torch.fft.ifft2(spectrum * weight) * float(patch * patch)
                 output[row : row + rows, col : col + cols] += (
                     filtered[:rows, :cols] * taper[:rows, :cols]
                 )
+        input_magnitude = torch.abs(interferogram)
+        output_magnitude = torch.abs(output)
+        scale = torch.where(
+            (output_magnitude > 0) & (input_magnitude > 0),
+            input_magnitude / output_magnitude.clamp_min(1e-12),
+            torch.ones_like(output_magnitude),
+        )
+        output = output * scale
         finite = torch.isfinite(output.real) & torch.isfinite(output.imag)
         result_mask = support & finite
         return PhaseFilterResult(output, result_mask)
