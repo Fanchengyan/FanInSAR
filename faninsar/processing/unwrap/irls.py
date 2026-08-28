@@ -663,7 +663,7 @@ class SpatialIRLS(SpatialUnwrapper):
         )
         return labels, anchors, (h_src, h_dst, h_active), (v_src, v_dst, v_active)
 
-    def _solve_component(
+    def _solve_component(  # noqa: PLR0911
         self,
         state: torch.Tensor,
         phase: torch.Tensor,
