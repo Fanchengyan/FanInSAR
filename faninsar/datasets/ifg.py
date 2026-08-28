@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -29,6 +30,121 @@ if TYPE_CHECKING:
     from faninsar.core import Baselines, PhaseDeformationConverter
 
 logger = setup_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class StackInterferogramDataset:
+    """Internal array view of one pinned Stack IFG generation.
+
+    This narrow Stack seam is intentionally separate from the path-discovery
+    :class:`InterferogramDataset`.  The supplied artifact store has already
+    selected and pinned one immutable generation.  Only the five named Stack
+    layers are read from that generation; this class never opens ``CURRENT``
+    and never recomputes payload digests during a normal read.
+
+    Attributes
+    ----------
+    complex_ifg : numpy.ndarray
+        Complex wrapped interferogram samples.
+    coherence : numpy.ndarray
+        Dimensionless coherence values, normally in ``[0, 1]``.
+    wrapped_phase : numpy.ndarray
+        Wrapped phase in radians.
+    amplitude : numpy.ndarray
+        IFG amplitude in the same raster grid.
+    valid_mask : numpy.ndarray
+        Boolean authoritative support mask.
+
+    Notes
+    -----
+    The current IFG writer predates the explicit persisted mask.  Until that
+    writer is upgraded, the mask is derived from finite values as a narrow
+    read-only fallback; a persisted ``valid_mask.npy`` takes precedence.
+
+    """
+
+    complex_ifg: np.ndarray
+    coherence: np.ndarray
+    wrapped_phase: np.ndarray
+    amplitude: np.ndarray
+    valid_mask: np.ndarray
+
+    @classmethod
+    def from_generation(cls, store: object) -> StackInterferogramDataset:
+        """Read the named layers from an already pinned IFG store.
+
+        Parameters
+        ----------
+        store : InterferogramArtifactStore
+            Open store whose ``generation_root`` identifies the immutable
+            generation to read.  The caller owns its lease and closes it
+            after the complete Stack operation.
+
+        Returns
+        -------
+        StackInterferogramDataset
+            Eager arrays in ``(azimuth, range)`` order.
+
+        Raises
+        ------
+        ValueError
+            If the store has no generation root, a layer is malformed, or
+            layer shapes do not agree.
+
+        """
+        generation_root = getattr(store, "generation_root", None)
+        if not isinstance(generation_root, Path):
+            message = "Stack IFG Dataset requires an opened artifact store"
+            logger.error(message)
+            raise TypeError(message)
+
+        def load(name: str) -> np.ndarray:
+            path = generation_root / f"{name}.npy"
+            try:
+                array = np.load(path, allow_pickle=False)
+            except (OSError, ValueError, EOFError) as error:
+                message = f"Stack IFG Dataset layer cannot be read: {name}"
+                logger.exception("Stack IFG Dataset layer cannot be read: %s", path)
+                raise ValueError(message) from error
+            if array.ndim != 2:
+                message = f"Stack IFG Dataset layer must be 2-D: {name}"
+                raise ValueError(message)
+            return np.asarray(array)
+
+        complex_ifg = load("complex_ifg")
+        coherence = load("coherence")
+        wrapped_phase = load("wrapped_phase")
+        amplitude = load("amplitude")
+        arrays = (coherence, wrapped_phase, amplitude)
+        if complex_ifg.dtype.kind != "c" or any(
+            array.dtype.kind != "f" for array in arrays
+        ):
+            message = "Stack IFG Dataset layer dtypes are incompatible"
+            raise ValueError(message)
+        if any(array.shape != complex_ifg.shape for array in arrays):
+            message = "Stack IFG Dataset layers must share one shape"
+            raise ValueError(message)
+
+        mask_path = generation_root / "valid_mask.npy"
+        if mask_path.is_file():
+            valid_mask = load("valid_mask")
+            if valid_mask.dtype != np.bool_ or valid_mask.shape != complex_ifg.shape:
+                message = "Stack IFG Dataset valid_mask is incompatible"
+                raise ValueError(message)
+        else:
+            valid_mask = (
+                np.isfinite(complex_ifg)
+                & np.isfinite(coherence)
+                & np.isfinite(wrapped_phase)
+                & np.isfinite(amplitude)
+            )
+        return cls(
+            complex_ifg=complex_ifg,
+            coherence=coherence,
+            wrapped_phase=wrapped_phase,
+            amplitude=amplitude,
+            valid_mask=np.asarray(valid_mask, dtype=bool),
+        )
 
 
 class CoherenceDataset(PairDataset):

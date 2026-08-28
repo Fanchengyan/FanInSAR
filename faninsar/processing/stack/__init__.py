@@ -37,6 +37,11 @@ from faninsar.processing.stack.provider import (
 )
 from faninsar.processing.stack.s1 import S1Stack
 from faninsar.processing.stack.session import Stack
+from faninsar.processing.stack.stack_generation import (
+    UnwrapResultGeneration,
+    open_unwrap_generation,
+    publish_unwrap_generation,
+)
 
 __all__ = [
     "ActivationIssuerRecord",
@@ -61,7 +66,10 @@ __all__ = [
     "StackProviderError",
     "StackSceneProvider",
     "UnsupportedStackCapabilityError",
+    "UnwrapResultGeneration",
     "UnwrappedArtifact",
+    "open_unwrap_generation",
+    "publish_unwrap_generation",
     "unavailable_scene_provider",
     "unsupported_stack_capability",
 ]

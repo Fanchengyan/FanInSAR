@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
+
+import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
@@ -28,6 +31,7 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 STACK_GENERATION_SCHEMA = "stack_result_generation_v1"
+UNWRAP_GENERATION_SCHEMA = "stack_unwrap_generation_v1"
 _MAX_MANIFEST_BYTES = 1024 * 1024
 
 
@@ -98,6 +102,50 @@ class StackResultGeneration:
 
     def __exit__(self, *_: object) -> None:
         """Release the parent generation reader pin."""
+        self.close()
+
+
+@dataclass(frozen=True, slots=True)
+class UnwrapResultGeneration:
+    """One complete Stack-root spatial unwrap result generation.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Stack transaction root.
+    generation_id, generation_root, manifest_digest : object
+        Immutable generation identity and selected directory.
+    pair_ids : tuple[str, ...]
+        Complete ordered Pair universe captured at call entry.
+    products : dict[str, dict[str, numpy.ndarray]]
+        Eager named result layers keyed by canonical Pair id.
+
+    Notes
+    -----
+    Payloads are decoded from the immutable generation selected by
+    ``UNWRAP_CURRENT``.  Normal reads validate metadata and shape but do not
+    recompute payload SHA-256 digests.
+
+    """
+
+    root: Path
+    generation_id: str
+    generation_root: Path
+    manifest_digest: str
+    pair_ids: tuple[str, ...]
+    products: dict[str, dict[str, np.ndarray]]
+    _lease: GenerationLease
+
+    def close(self) -> None:
+        """Release the generation reader lease."""
+        self._lease.close()
+
+    def __enter__(self) -> Self:
+        """Return this generation as a context manager."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Release the generation reader lease."""
         self.close()
 
 
@@ -185,6 +233,238 @@ def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
         stream.write(canonical_json(manifest) + b"\n")
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _write_array(path: Path, value: object) -> np.ndarray:
+    """Write one non-object result array and return an owned copy."""
+    array = np.asarray(value)
+    if array.dtype.hasobject or array.ndim == 0 or array.ndim > 2:
+        reject_invalid_state("Stack unwrap result layers must be 1-D or 2-D arrays")
+    try:
+        with path.open("wb") as stream:
+            np.save(stream, array, allow_pickle=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except (OSError, ValueError) as error:
+        reject_invalid_state(f"Stack unwrap result cannot be written: {error}")
+    return array.copy()
+
+
+def _unwrap_payload_descriptor(path: Path, array: np.ndarray) -> dict[str, Any]:
+    """Describe one published layer without a read-time content hash."""
+    return {
+        "file": path.name,
+        "shape": [int(size) for size in array.shape],
+        "dtype": array.dtype.str,
+    }
+
+
+def publish_unwrap_generation(
+    stack_root: str | Path,
+    *,
+    pair_ids: Sequence[str],
+    products: Mapping[str, Mapping[str, object]],
+) -> UnwrapResultGeneration:
+    """Atomically publish one complete Stack-root unwrap result set.
+
+    Parameters
+    ----------
+    stack_root : str or pathlib.Path
+        Stack work directory owning ``UNWRAP_CURRENT``.
+    pair_ids : sequence of str
+        Complete ordered Pair universe frozen by the Stack call.
+    products : mapping[str, mapping[str, object]]
+        Result layers for every Pair, stored below canonical Pair directories.
+
+    Returns
+    -------
+    UnwrapResultGeneration
+        The newly committed generation reopened through ``UNWRAP_CURRENT``.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If Pair coverage or result layer declarations are invalid.
+
+    Notes
+    -----
+    The root manifest records shape and dtype only for result payloads.
+    Publication computes the manifest identity once; normal reads do not
+    recalculate payload SHA-256 digests.
+
+    """
+    root = Path(stack_root)
+    ordered_pairs = tuple(pair_ids)
+    if (
+        not ordered_pairs
+        or any(not isinstance(pair_id, str) or not pair_id for pair_id in ordered_pairs)
+        or len(set(ordered_pairs)) != len(ordered_pairs)
+    ):
+        reject_invalid_state("Stack unwrap generation requires unique Pair ids")
+    if set(products) != set(ordered_pairs):
+        reject_invalid_state("Stack unwrap generation Pair results are incomplete")
+
+    normalized: dict[str, dict[str, np.ndarray]] = {}
+    final_bytes = 1024
+    file_count = 1
+    for pair_id in ordered_pairs:
+        raw_layers = products[pair_id]
+        if not isinstance(raw_layers, Mapping) or not raw_layers:
+            reject_invalid_state(f"Stack unwrap result is empty: {pair_id}")
+        layers: dict[str, np.ndarray] = {}
+        for name, value in raw_layers.items():
+            if not isinstance(name, str) or not name or "/" in name or "\\" in name:
+                reject_invalid_state("Stack unwrap result layer name is invalid")
+            array = np.asarray(value)
+            if array.dtype.hasobject or array.ndim == 0 or array.ndim > 2:
+                reject_invalid_state(
+                    "Stack unwrap result layer shape or dtype is invalid"
+                )
+            final_bytes += int(array.nbytes) + 1024
+            file_count += 1
+            layers[name] = array
+        normalized[pair_id] = layers
+
+    with stage_generation(
+        root,
+        "unwrap",
+        final_bytes=final_bytes,
+        temporary_bytes=final_bytes,
+        file_count=file_count,
+    ) as (generation_id, staging):
+        manifest_pairs: list[dict[str, Any]] = []
+        for pair_id in ordered_pairs:
+            pair_root = staging / pair_id
+            pair_root.mkdir(mode=0o700)
+            payloads: dict[str, dict[str, Any]] = {}
+            for name, value in normalized[pair_id].items():
+                payload_path = pair_root / f"{name}.npy"
+                array = _write_array(payload_path, value)
+                payloads[name] = _unwrap_payload_descriptor(payload_path, array)
+            manifest_pairs.append({"pair_id": pair_id, "payloads": payloads})
+        unsigned: dict[str, Any] = {
+            "schema_version": UNWRAP_GENERATION_SCHEMA,
+            "status": "complete",
+            "generation_id": generation_id,
+            "pair_ids": list(ordered_pairs),
+            "pairs": manifest_pairs,
+        }
+        manifest = {
+            **unsigned,
+            "manifest_digest": sha256_bytes(canonical_json(unsigned)),
+        }
+        _write_manifest(staging / "unwrap_manifest.json", manifest)
+        commit_generation(
+            root,
+            "unwrap",
+            generation_id,
+            staging,
+            manifest_digest=str(manifest["manifest_digest"]),
+            compatibility_manifest=manifest,
+        )
+    return open_unwrap_generation(root)
+
+
+def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
+    """Open and decode the complete generation selected by ``UNWRAP_CURRENT``.
+
+    Parameters
+    ----------
+    stack_root : str or pathlib.Path
+        Stack work directory containing a committed ``UNWRAP_CURRENT``.
+
+    Returns
+    -------
+    UnwrapResultGeneration
+        Pinned immutable root generation.  Call :meth:`close` when finished.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the root manifest, Pair coverage, or payload shape/dtype is invalid.
+
+    """
+    root = Path(stack_root)
+    opened = open_current_generation(root, "unwrap")
+    try:
+        manifest = _read_manifest(
+            opened.path / "unwrap_manifest.json", UNWRAP_GENERATION_SCHEMA
+        )
+        compatibility = _read_manifest(
+            root / "unwrap_manifest.json", UNWRAP_GENERATION_SCHEMA
+        )
+        if (
+            manifest != compatibility
+            or manifest.get("generation_id") != opened.generation_id
+            or manifest.get("manifest_digest") != opened.manifest_digest
+        ):
+            reject_invalid_state("Stack unwrap CURRENT and manifest identities differ")
+        raw_pair_ids = manifest.get("pair_ids")
+        if not isinstance(raw_pair_ids, list) or any(
+            not isinstance(pair_id, str) or not pair_id for pair_id in raw_pair_ids
+        ):
+            reject_invalid_state("Stack unwrap generation Pair ids are invalid")
+        pair_ids = tuple(raw_pair_ids)
+        if not pair_ids or len(set(pair_ids)) != len(pair_ids):
+            reject_invalid_state("Stack unwrap generation Pair ids are not unique")
+        raw_pairs = manifest.get("pairs")
+        if not isinstance(raw_pairs, list) or len(raw_pairs) != len(pair_ids):
+            reject_invalid_state("Stack unwrap generation Pair results are incomplete")
+        products: dict[str, dict[str, np.ndarray]] = {}
+        for pair_id, raw_pair in zip(pair_ids, raw_pairs, strict=True):
+            if not isinstance(raw_pair, dict) or raw_pair.get("pair_id") != pair_id:
+                reject_invalid_state("Stack unwrap generation Pair order is invalid")
+            raw_payloads = raw_pair.get("payloads")
+            if not isinstance(raw_payloads, dict) or not raw_payloads:
+                reject_invalid_state("Stack unwrap generation payload table is empty")
+            pair_root = opened.path / pair_id
+            layers: dict[str, np.ndarray] = {}
+            for name, descriptor in raw_payloads.items():
+                if (
+                    not isinstance(name, str)
+                    or not isinstance(descriptor, dict)
+                    or descriptor.get("file") != f"{name}.npy"
+                    or not isinstance(descriptor.get("shape"), list)
+                    or not isinstance(descriptor.get("dtype"), str)
+                ):
+                    reject_invalid_state("Stack unwrap payload descriptor is invalid")
+                try:
+                    expected_dtype = np.dtype(descriptor["dtype"])
+                    expected_shape = tuple(int(size) for size in descriptor["shape"])
+                except (TypeError, ValueError):
+                    reject_invalid_state("Stack unwrap payload descriptor is invalid")
+                if expected_dtype.hasobject or not expected_shape or any(
+                    size <= 0 for size in expected_shape
+                ):
+                    reject_invalid_state(
+                        "Stack unwrap payload shape or dtype is invalid"
+                    )
+                try:
+                    array = np.load(
+                        pair_root / str(descriptor["file"]), allow_pickle=False
+                    )
+                except (OSError, ValueError, EOFError) as error:
+                    reject_invalid_state(
+                        f"Stack unwrap payload cannot be read: {error}"
+                    )
+                if array.shape != expected_shape or array.dtype != expected_dtype:
+                    reject_invalid_state(
+                        "Stack unwrap payload shape or dtype mismatch"
+                    )
+                layers[name] = np.asarray(array)
+            products[pair_id] = layers
+    except Exception:
+        opened.lease.close()
+        raise
+    return UnwrapResultGeneration(
+        root=root,
+        generation_id=opened.generation_id,
+        generation_root=opened.path,
+        manifest_digest=opened.manifest_digest,
+        pair_ids=pair_ids,
+        products=products,
+        _lease=opened.lease,
+    )
 
 
 def _timeseries_pair_ids(generation_root: Path) -> tuple[str, ...]:
@@ -511,8 +791,12 @@ def open_stack_generation(stack_root: str | Path) -> StackResultGeneration:
 
 __all__ = [
     "STACK_GENERATION_SCHEMA",
+    "UNWRAP_GENERATION_SCHEMA",
     "PairGenerationBinding",
     "StackResultGeneration",
+    "UnwrapResultGeneration",
     "open_stack_generation",
+    "open_unwrap_generation",
     "publish_stack_generation",
+    "publish_unwrap_generation",
 ]

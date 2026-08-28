@@ -16,7 +16,7 @@ from .geogrid import GeoGrid
 # Backwards-compat alias — deprecated, use GeoGrid.
 from .geogrid import GeoGrid as GeoBox
 from .hierarchical import HierarchicalDataset
-from .ifg import CoherenceDataset, InterferogramDataset
+from .ifg import CoherenceDataset, InterferogramDataset, StackInterferogramDataset
 from .network import (
     ExternalNetworkLayoutError,
     GAMMANetwork,
