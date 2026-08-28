@@ -20,6 +20,43 @@ class InterferogramProduct:
     coherence: np.ndarray
     wrapped_phase: np.ndarray
     amplitude: np.ndarray
+    valid_mask: np.ndarray | None = None
+
+
+def validate_coherence_window(
+    value: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """Validate a centered coherence support before numerical work.
+
+    Parameters
+    ----------
+    value : tuple of int or None
+        ``(azimuth, range)`` support in pixels. ``None`` selects direct MLE
+        within each output multilook block.
+
+    Returns
+    -------
+    tuple of int or None
+        The validated support.
+
+    Raises
+    ------
+    ValueError
+        If either axis is not an odd integer of at least three pixels.
+
+    """
+    if value is None:
+        return None
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 2
+        or any(type(axis) is not int for axis in value)
+        or any(axis < 3 or axis % 2 == 0 for axis in value)
+    ):
+        message = "coherence_window axes must be odd integers >= 3"
+        logger.error(message)
+        raise ValueError(message)
+    return value
 
 
 def _block_reduce(array: np.ndarray, az_looks: int, rg_looks: int) -> np.ndarray:
@@ -82,11 +119,12 @@ def mask_invalid_looks(
 DEAD_PIXEL_AMP_THRESHOLD: float = 0.0
 
 
-def form_interferogram(
+def _legacy_form_interferogram(
     primary: np.ndarray,
     secondary: np.ndarray,
     *,
     multilook: tuple[int, int] = (1, 1),
+    coherence_window: tuple[int, int] | None = (5, 5),
     dead_pixel_amp_threshold: float = DEAD_PIXEL_AMP_THRESHOLD,
 ) -> InterferogramProduct:
     """Form a complex interferogram and coherence from two complex SLCs.
@@ -114,6 +152,10 @@ def form_interferogram(
         ``(azimuth_looks, range_looks)`` non-overlapping boxcar looks. The
         output is downsampled by these factors (true multilook), not merely
         smoothed.
+    coherence_window : tuple[int, int] or None, optional
+        Centered stride-one ``(azimuth, range)`` support for the first MLE
+        coherence stage. Axes must be odd integers at least 3. ``None``
+        computes direct MLE in each output block.
     dead_pixel_amp_threshold : float, optional
         SLC amplitude below which a pixel is excluded from the multilook
         average. Set to 0 to disable dead-pixel masking (revert to the
@@ -125,12 +167,18 @@ def form_interferogram(
         Complex interferogram, coherence, wrapped phase and amplitude.
 
     """
+    coherence_window = validate_coherence_window(coherence_window)
     if primary.shape != secondary.shape or primary.ndim != 2:
         reject_invalid_state("interferogram inputs must be matching 2-D arrays")
     if not np.iscomplexobj(primary) or not np.iscomplexobj(secondary):
         reject_invalid_state("interferogram inputs must remain complex")
     az_looks, rg_looks = multilook
-    if az_looks < 1 or rg_looks < 1:
+    if (
+        type(az_looks) is not int
+        or type(rg_looks) is not int
+        or az_looks < 1
+        or rg_looks < 1
+    ):
         reject_invalid_state("multilook factors must be >= 1")
 
     use_dead_mask = dead_pixel_amp_threshold > 0.0 and (az_looks > 1 or rg_looks > 1)
@@ -217,6 +265,144 @@ def form_interferogram(
         coherence=coherence,
         wrapped_phase=wrapped.astype(np.float32, copy=False),
         amplitude=amplitude,
+    )
+
+
+def _sliding_coherence(
+    primary: np.ndarray,
+    secondary: np.ndarray,
+    window: tuple[int, int],
+) -> np.ndarray:
+    """Compute stride-one centered coherence MLE with clipped edges."""
+    height, width = primary.shape
+    half_az, half_rg = window[0] // 2, window[1] // 2
+    output = np.full((height, width), np.nan, dtype=np.float64)
+    finite = np.isfinite(primary.real) & np.isfinite(primary.imag)
+    finite &= np.isfinite(secondary.real) & np.isfinite(secondary.imag)
+    for row in range(height):
+        r0, r1 = max(0, row - half_az), min(height, row + half_az + 1)
+        for col in range(width):
+            c0, c1 = max(0, col - half_rg), min(width, col + half_rg + 1)
+            valid = finite[r0:r1, c0:c1]
+            if np.count_nonzero(valid) < 2:
+                continue
+            p = primary[r0:r1, c0:c1][valid]
+            s = secondary[r0:r1, c0:c1][valid]
+            numerator = abs(np.sum(p * np.conjugate(s)))
+            denominator = np.sqrt(np.sum(abs(p) ** 2) * np.sum(abs(s) ** 2))
+            if np.isfinite(denominator) and denominator > 0:
+                output[row, col] = numerator / denominator
+    return output
+
+
+def _block_finite_mean(array: np.ndarray, multilook: tuple[int, int]) -> np.ndarray:
+    """Average finite values over non-overlapping blocks, retaining tails."""
+    height, width = array.shape
+    az_looks, rg_looks = multilook
+    output = np.full(
+        ((height + az_looks - 1) // az_looks, (width + rg_looks - 1) // rg_looks),
+        np.nan,
+        dtype=np.float64,
+    )
+    for row in range(output.shape[0]):
+        for col in range(output.shape[1]):
+            block = array[
+                row * az_looks : min((row + 1) * az_looks, height),
+                col * rg_looks : min((col + 1) * rg_looks, width),
+            ]
+            finite = block[np.isfinite(block)]
+            if finite.size:
+                output[row, col] = finite.mean()
+    return output
+
+
+def form_interferogram(
+    primary: np.ndarray,
+    secondary: np.ndarray,
+    *,
+    multilook: tuple[int, int] = (1, 1),
+    coherence_window: tuple[int, int] | None = None,
+    dead_pixel_amp_threshold: float = DEAD_PIXEL_AMP_THRESHOLD,
+) -> InterferogramProduct:
+    """Form a valid-sample multilooked IFG with configurable coherence MLE.
+
+    ``coherence_window`` is a centered, stride-one ``(azimuth, range)``
+    support with odd axes at least 3. It is computed at full ``H x W`` and
+    then reduced by finite-only blocks. ``None`` computes direct MLE per
+    output block. Multilook blocks start at ``(0, 0)``, retain tails, and use
+    ``ceil`` dimensions.
+    """
+    coherence_window = validate_coherence_window(coherence_window)
+    if primary.shape != secondary.shape or primary.ndim != 2:
+        reject_invalid_state("interferogram inputs must be matching 2-D arrays")
+    if not np.iscomplexobj(primary) or not np.iscomplexobj(secondary):
+        reject_invalid_state("interferogram inputs must remain complex")
+    if (
+        not isinstance(multilook, tuple)
+        or len(multilook) != 2
+        or any(type(axis) is not int or axis < 1 for axis in multilook)
+    ):
+        reject_invalid_state("multilook factors must be positive integers")
+    az_looks, rg_looks = multilook
+    use_dead_mask = dead_pixel_amp_threshold > 0.0
+    height, width = primary.shape
+    out_h = (height + az_looks - 1) // az_looks
+    out_w = (width + rg_looks - 1) // rg_looks
+    finite_pair = np.isfinite(primary.real) & np.isfinite(primary.imag)
+    finite_pair &= np.isfinite(secondary.real) & np.isfinite(secondary.imag)
+    if use_dead_mask:
+        finite_pair &= np.abs(primary) >= dead_pixel_amp_threshold
+        finite_pair &= np.abs(secondary) >= dead_pixel_amp_threshold
+    ifg = np.full((out_h, out_w), np.nan + 0j, dtype=np.complex64)
+    power_pri = np.full((out_h, out_w), np.nan, dtype=np.float64)
+    power_sec = np.full((out_h, out_w), np.nan, dtype=np.float64)
+    valid_out = np.zeros((out_h, out_w), dtype=bool)
+    for row in range(out_h):
+        r0, r1 = row * az_looks, min((row + 1) * az_looks, height)
+        for col in range(out_w):
+            c0, c1 = col * rg_looks, min((col + 1) * rg_looks, width)
+            support = finite_pair[r0:r1, c0:c1]
+            if not np.any(support):
+                continue
+            p = primary[r0:r1, c0:c1][support]
+            s = secondary[r0:r1, c0:c1][support]
+            ifg[row, col] = np.mean(p * np.conjugate(s))
+            power_pri[row, col] = np.mean(np.abs(p) ** 2)
+            power_sec[row, col] = np.mean(np.abs(s) ** 2)
+            valid_out[row, col] = bool(
+                np.isfinite(ifg[row, col].real)
+                and np.isfinite(ifg[row, col].imag)
+                and power_pri[row, col] > 0
+                and power_sec[row, col] > 0
+            )
+    denominator = np.sqrt(power_pri * power_sec)
+    direct = np.divide(
+        np.abs(ifg),
+        denominator,
+        out=np.full_like(denominator, np.nan),
+        where=denominator > 0,
+    )
+    if coherence_window is None:
+        coherence = direct
+    else:
+        coherence = _block_finite_mean(
+            _sliding_coherence(primary, secondary, coherence_window), multilook
+        )
+    coherence = np.clip(coherence, 0.0, 1.0).astype(np.float32)
+    invalid = ~valid_out | ~np.isfinite(coherence)
+    if np.any(invalid):
+        ifg[invalid] = np.nan + 1j * np.nan
+        coherence[invalid] = np.nan
+    amplitude = np.abs(ifg).astype(np.float32)
+    amplitude[invalid] = np.nan
+    wrapped = np.angle(ifg).astype(np.float32)
+    wrapped[invalid] = np.nan
+    return InterferogramProduct(
+        complex_ifg=ifg,
+        coherence=coherence,
+        wrapped_phase=wrapped,
+        amplitude=amplitude,
+        valid_mask=valid_out,
     )
 
 

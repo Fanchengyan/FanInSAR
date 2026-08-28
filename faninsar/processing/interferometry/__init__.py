@@ -21,10 +21,25 @@ from .pair import (
     form_interferogram,
     goldstein_filter,
     mask_invalid_looks,
+    validate_coherence_window,
+)
+from .phase_filter import (
+    BoxcarFilter,
+    FilterProvenance,
+    GaussianFilter,
+    GoldsteinWerner,
+    PhaseFilter,
+    PhaseFilterResult,
 )
 
 __all__ = [
+    "BoxcarFilter",
+    "FilterProvenance",
+    "GaussianFilter",
+    "GoldsteinWerner",
     "InterferogramProduct",
+    "PhaseFilter",
+    "PhaseFilterResult",
     "apply_residual_phase_screen_to_products",
     "compute_topographic_phase",
     "copernicus_glo30_dem",
@@ -40,4 +55,5 @@ __all__ = [
     "remove_azimuth_phase_ramp",
     "remove_residual_phase_screen",
     "remove_topographic_phase",
+    "validate_coherence_window",
 ]
