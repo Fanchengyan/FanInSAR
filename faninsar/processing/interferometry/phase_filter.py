@@ -128,7 +128,7 @@ class GoldsteinWerner(PhaseFilter):
             )
             / (patch + 1)
         )
-        taper = torch.outer(taper_1d, taper_1d) / float(patch * patch)
+        taper = torch.outer(taper_1d, taper_1d)
         source = torch.where(support, interferogram, torch.zeros_like(interferogram))
         output = torch.zeros_like(interferogram)
         for row in range(0, height, step):
@@ -142,7 +142,10 @@ class GoldsteinWerner(PhaseFilter):
                 block[:rows, :cols] = source[row : row + rows, col : col + cols]
                 spectrum = torch.fft.fft2(block)
                 magnitude = torch.abs(spectrum)
-                filtered = torch.fft.ifft2(spectrum * torch.pow(magnitude, self.alpha))
+                weight = torch.pow(
+                    magnitude / magnitude.amax().clamp_min(1e-12), self.alpha
+                )
+                filtered = torch.fft.ifft2(spectrum * weight)
                 output[row : row + rows, col : col + cols] += (
                     filtered[:rows, :cols] * taper[:rows, :cols]
                 )
