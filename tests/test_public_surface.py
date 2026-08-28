@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import faninsar as fis
 
-
 REQUIRED_NAMES = {
     "Pair",
     "Pairs",

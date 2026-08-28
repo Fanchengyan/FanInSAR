@@ -131,6 +131,7 @@ def run(
         "device",
         "orbit_paths",
         "coreg_mode",
+        "flatten_stage",
         "coregistration_grid",
         "geo_grid",
         "invert_device",

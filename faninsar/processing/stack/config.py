@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 CoregMode = Literal["geometry", "pair", "network"]
 EsdMethod = Literal["auto", "splitband", "overlap"]
 OnNetworkFailure = Literal["error"]
+FlattenStage = Literal["coregistration", "interferogram"]
 ActivationMode = Literal["reference", "qualified"]
 
 logger = setup_logger(__name__)
@@ -40,6 +41,7 @@ class StackConfig:
     work_dir: Path
     activation_mode: ActivationMode
     coreg_mode: CoregMode = "pair"
+    flatten_stage: FlattenStage = "coregistration"
     coregistration_grid: CoregistrationGrid = "radar"
     esd_method: EsdMethod = "auto"
     multilook: tuple[int, int] = (2, 10)
@@ -66,6 +68,13 @@ class StackConfig:
     def __post_init__(self) -> None:
         """Normalize path and multilook types."""
         self.work_dir = Path(self.work_dir)
+        if self.flatten_stage not in {"coregistration", "interferogram"}:
+            message = (
+                "flatten_stage must be 'coregistration' or 'interferogram'; "
+                f"got {self.flatten_stage!r}"
+            )
+            logger.error(message)
+            raise ValueError(message)
         if self.gpu_memory_reclaim not in {"lazy", "eager", "adaptive"}:
             message = (
                 "gpu_memory_reclaim must be 'lazy', 'eager', or 'adaptive'; "

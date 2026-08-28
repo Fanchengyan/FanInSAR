@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -245,23 +246,158 @@ def _scrub_stale_system_nvcc_ninja(
     nvcc: Path,
     operation: NativeOperation | None = None,
 ) -> None:
-    """Drop ninja graphs that still hard-code system CUDA 10 ``/usr/bin/nvcc``."""
-    ninja = _native_build_dir(operation) / "build.ninja"
-    if not ninja.is_file():
+    """Drop stale Ninja graphs and abandoned JIT locks for one operation.
+
+    ``torch.utils.cpp_extension`` coordinates JIT builds with an existence
+    based ``FileBaton`` lock.  A process terminated during compilation can
+    leave that zero-byte lock behind; subsequent callers then wait forever
+    even though no compiler owns the file.  The build graph is also tied to
+    absolute source and Torch include paths, so a graph from another checkout
+    must not be reused silently.
+
+    Only the operation-specific cache directory is touched.  A lock that is
+    still open by any process is preserved and its graph is left untouched.
+    Stale graphs are moved atomically aside instead of deleting files in
+    place, so a compiler that races with the probe retains an isolated build
+    directory.
+    """
+    build_dir = _native_build_dir(operation)
+    # All FanInSAR preparation callers take this advisory guard.  It does not
+    # replace FileBaton (the external builder still owns that lock), but it
+    # serializes stale-lock cleanup among our callers before the atomic rename.
+    guard_fd: int | None = None
+    fcntl_module: object | None = None
+    try:
+        import fcntl as fcntl_module
+
+        guard_path = build_dir.parent / f"{build_dir.name}.guard"
+        guard_fd = os.open(guard_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl_module.flock(guard_fd, fcntl_module.LOCK_EX)
+    except (ImportError, OSError):
+        logger.exception("cannot acquire native cache guard for %s", build_dir)
+        if guard_fd is not None:
+            os.close(guard_fd)
         return
-    text = ninja.read_text(errors="replace")
-    if "nvcc = /usr/bin/nvcc" not in text:
-        return
-    logger.warning(
-        "removing stale native ninja graph that invoked /usr/bin/nvcc; "
-        "rebuilding with %s",
-        nvcc,
-    )
-    ninja.unlink(missing_ok=True)
-    for child in ninja.parent.glob("*.o"):
-        child.unlink(missing_ok=True)
-    for child in ninja.parent.glob("*.d"):
-        child.unlink(missing_ok=True)
+
+    claimed_fd: int | None = None
+    try:
+        lock = build_dir / "lock"
+        lock_active = _native_lock_is_open(lock)
+        ninja = build_dir / "build.ninja"
+        if lock_active or not ninja.is_file():
+            if lock.exists() and not lock_active:
+                logger.warning("removing abandoned native JIT lock %s", lock)
+                lock.unlink(missing_ok=True)
+            return
+        text = ninja.read_text(errors="replace")
+        expected_nvcc = f"nvcc = {nvcc}"
+        expected_source_root = str(_NATIVE_SOURCE_ROOT)
+        stale_toolchain = "nvcc = /usr/bin/nvcc" in text or expected_nvcc not in text
+        stale_source = expected_source_root not in text
+        # The include path is emitted by the currently running Torch
+        # installation.  Checking it prevents a graph from another
+        # environment being considered up to date merely because mtimes match.
+        try:
+            import torch
+
+            torch_root = str(Path(torch.__file__).resolve().parent)
+        except (ImportError, OSError):
+            torch_root = ""
+        stale_torch = bool(torch_root) and torch_root not in text
+        if not (stale_toolchain or stale_source or stale_torch):
+            if lock.exists() and not lock_active:
+                logger.warning("removing abandoned native JIT lock %s", lock)
+                lock.unlink(missing_ok=True)
+            return
+
+        # If no FileBaton marker exists, claim it before renaming.  A builder
+        # that wins the race creates the marker first; in that case return and
+        # leave its live directory completely untouched.
+        if not lock.exists():
+            try:
+                claimed_fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            except FileExistsError:
+                logger.warning(
+                    "native build appeared while isolating %s; preserving it",
+                    build_dir,
+                )
+                return
+        stale_dir = build_dir.with_name(
+            f"{build_dir.name}.stale-{os.getpid()}-{time.time_ns()}"
+        )
+        try:
+            build_dir.rename(stale_dir)
+        except OSError:
+            logger.exception(
+                "cannot isolate stale native ninja graph %s",
+                build_dir,
+            )
+            # Do not strand the lock we claimed if the atomic rename fails;
+            # otherwise the next caller would wait on our now-closed marker.
+            # Compare inodes before unlinking so a concurrent replacement is
+            # never mistaken for the marker created by this process.
+            if claimed_fd is not None:
+                try:
+                    lock_stat = lock.stat()
+                    claimed_stat = os.fstat(claimed_fd)
+                    if (
+                        lock_stat.st_dev == claimed_stat.st_dev
+                        and lock_stat.st_ino == claimed_stat.st_ino
+                    ):
+                        lock.unlink(missing_ok=True)
+                except OSError:
+                    logger.exception("cannot release claimed native lock %s", lock)
+            return
+        logger.warning(
+            "isolated stale native ninja graph %s -> %s "
+            "(toolchain=%s source=%s torch=%s); rebuilding with %s",
+            build_dir,
+            stale_dir,
+            stale_toolchain,
+            stale_source,
+            stale_torch,
+            nvcc,
+        )
+    finally:
+        if claimed_fd is not None:
+            os.close(claimed_fd)
+        if guard_fd is not None and fcntl_module is not None:
+            fcntl_module.flock(guard_fd, fcntl_module.LOCK_UN)
+            os.close(guard_fd)
+
+
+def _native_lock_is_open(lock: Path) -> bool:
+    """Return whether a live process currently has a native JIT lock open.
+
+    PyTorch's ``FileBaton`` lock is an existence marker rather than an OS
+    advisory lock.  On Linux, inspecting ``/proc/*/fd`` lets us distinguish a
+    live compiler from a stale marker left by a terminated process.  If the
+    process table cannot be inspected, fail closed and retain the lock.
+    """
+    if not lock.exists():
+        return False
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return True
+    try:
+        target = lock.resolve()
+        for process in proc_root.iterdir():
+            if not process.name.isdigit():
+                continue
+            fd_root = process / "fd"
+            try:
+                descriptors = tuple(fd_root.iterdir())
+            except OSError:
+                continue
+            for descriptor in descriptors:
+                try:
+                    if descriptor.resolve() == target:
+                        return True
+                except OSError:
+                    continue
+    except OSError:
+        return True
+    return False
 
 
 def _try_load_cuda_module(operation: NativeOperation) -> object | None:

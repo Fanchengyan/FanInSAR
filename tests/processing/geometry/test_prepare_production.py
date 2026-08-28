@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -22,6 +23,7 @@ from faninsar.processing.geometry.native_v2.builder import (
 from faninsar.processing.geometry.orbit import OrbitInterpolator
 from faninsar.processing.geometry.prepare_production import (
     _dem_native_arrays,
+    _native_lock_is_open,
     prepare_production_geometry,
     run_geo2rdr,
     run_rdr2geo,
@@ -67,6 +69,63 @@ def _model() -> RadarGeometryModel:
         wavelength_m=0.056,
         look_direction="right",
     )
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux /proc is required")
+def test_native_lock_probe_distinguishes_live_and_stale_lock(tmp_path: Path) -> None:
+    """A live FileBaton descriptor is retained while a stale marker is removable."""
+    lock = tmp_path / "lock"
+    stream = lock.open("w", encoding="utf-8")
+    try:
+        assert _native_lock_is_open(lock)
+    finally:
+        stream.close()
+    assert not _native_lock_is_open(lock)
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux /proc is required")
+def test_stale_native_graph_isolated_without_deleting_racing_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale graph is renamed as one unit so a racing compiler stays isolated."""
+    build_dir = tmp_path / "geo2rdr"
+    build_dir.mkdir()
+    (build_dir / "build.ninja").write_text("nvcc = /usr/bin/nvcc\n", encoding="utf-8")
+    (build_dir / "geo2rdr_cuda.cuda.o").write_bytes(b"stale")
+    monkeypatch.setattr(prepare_mod, "_native_build_dir", lambda _operation: build_dir)
+    prepare_mod._scrub_stale_system_nvcc_ninja(
+        Path("/opt/pixi/bin/nvcc"),
+        NativeOperation.GEO2RDR,
+    )
+    assert not build_dir.exists()
+    isolated = tuple(tmp_path.glob("geo2rdr.stale-*"))
+    assert len(isolated) == 1
+    assert (isolated[0] / "build.ninja").is_file()
+    assert (isolated[0] / "geo2rdr_cuda.cuda.o").is_file()
+    assert (isolated[0] / "lock").is_file()
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux /proc is required")
+def test_failed_stale_graph_rename_releases_claimed_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed isolation rename does not leave a blocking FileBaton marker."""
+    build_dir = tmp_path / "geo2rdr"
+    build_dir.mkdir()
+    (build_dir / "build.ninja").write_text("nvcc = /usr/bin/nvcc\n", encoding="utf-8")
+    monkeypatch.setattr(prepare_mod, "_native_build_dir", lambda _operation: build_dir)
+
+    def fail_rename(_source: Path, _target: Path) -> Path:
+        raise OSError("injected rename failure")
+
+    monkeypatch.setattr(type(build_dir), "rename", fail_rename)
+    prepare_mod._scrub_stale_system_nvcc_ninja(
+        Path("/opt/pixi/bin/nvcc"),
+        NativeOperation.GEO2RDR,
+    )
+    assert not (build_dir / "lock").exists()
 
 
 def test_cuda_geo_plan_is_supported_for_build() -> None:

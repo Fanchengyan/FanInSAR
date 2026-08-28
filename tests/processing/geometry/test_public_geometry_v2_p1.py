@@ -1589,14 +1589,14 @@ def test_native_context_rejects_nonfinite_orbit_before_executor(
 
 
 def test_native_context_rejects_nonfinite_dem_before_executor() -> None:
-    """A nonfinite rdr2geo DEM span is rejected before callback invocation."""
+    """Infinite rdr2geo DEM samples are rejected before callback invocation."""
     model = _model()
     context = _native_context(model, Operation.RDR2GEO)
     dem_values = np.asarray(context["dem_values"]).copy()
     dem_values[0, 0] = np.inf
     context["dem_values"] = dem_values
     calls: list[int] = []
-    with pytest.raises(GeometryValidationError, match="finite"):
+    with pytest.raises(GeometryValidationError, match="infinities"):
         prepare_geometry(
             Operation.RDR2GEO,
             model,
@@ -1606,6 +1606,22 @@ def test_native_context_rejects_nonfinite_dem_before_executor() -> None:
             native_key=_native_key(model, (1,), Operation.RDR2GEO),
         )
     assert calls == []
+
+
+def test_native_context_allows_nan_dem_nodata() -> None:
+    """NaN DEM nodata is part of the native raster contract."""
+    from faninsar.processing.geometry.public import _validate_native_context_inputs
+    from faninsar.processing.geometry.v2 import DeviceKey
+
+    model = _model()
+    context = _native_context(model, Operation.RDR2GEO)
+    dem_values = np.asarray(context["dem_values"]).copy()
+    dem_values[0, 0] = np.nan
+    context["dem_values"] = dem_values
+    values = _validate_native_context_inputs(
+        Operation.RDR2GEO, context, DeviceKey.cpu()
+    )
+    assert np.isnan(np.asarray(values[5])[0, 0])
 
 
 @pytest.mark.parametrize("operation", [Operation.GEO2RDR, Operation.RDR2GEO])

@@ -1214,7 +1214,7 @@ def open_current_generation(
 
 def collect_generations(
     root: str | Path,
-    namespace: Literal["ifg", "unwrap", "timeseries"],
+    namespace: Literal["ifg", "unwrap", "timeseries", "ion", "ion_correction"],
     *,
     now_ns: int | None = None,
 ) -> tuple[str, ...]:

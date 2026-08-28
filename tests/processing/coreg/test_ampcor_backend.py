@@ -534,7 +534,7 @@ def test_ncc_registry_rejects_unqualified_runtime(
     torch_version: str,
     cuda_runtime: str,
 ) -> None:
-    """A same-shape candidate is rejected outside the qualified runtime."""
+    """A candidate prepared for another runtime is not selected."""
     from faninsar.processing.coreg import ampcor_backend
 
     candidate_profile = _ncc_profile()

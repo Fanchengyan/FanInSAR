@@ -197,6 +197,24 @@ def _apply_range_offset_flatten(
     return flattened.astype(np.complex64, copy=False), phase.astype(np.float32)
 
 
+def _sanitize_phase_screen(phase: np.ndarray) -> np.ndarray:
+    """Replace invalid phase-screen lanes with neutral finite phase.
+
+    Parameters
+    ----------
+    phase : numpy.ndarray
+        Phase-screen values in radians.
+
+    Returns
+    -------
+    numpy.ndarray
+        Finite ``float32`` phase-screen values, with invalid lanes set to
+        zero radians.
+
+    """
+    return np.where(np.isfinite(phase), phase, 0.0).astype(np.float32, copy=False)
+
+
 def _window(value: object, shape: tuple[int, int]) -> tuple[int, int, int, int]:
     """Validate a row/column crop against one source shape."""
     if value is None:
@@ -991,6 +1009,7 @@ def make_nisar_scene_provider(
     configured_tile_shape: object = None,
     configured_dem: DEMSampler | None = None,
     configured_height: float | None = None,
+    flatten_stage: str = "coregistration",
     admission_lineage: Mapping[str, Mapping[str, object]] | None = None,
     **legacy: object,
 ) -> SceneProductionCallback:
@@ -1018,6 +1037,8 @@ def make_nisar_scene_provider(
     configured_height : float, optional
         Callback-level constant height used when a scene-production call omits
         both ``dem`` and ``height``.
+    flatten_stage : {"coregistration", "interferogram"}, optional
+        Stage at which the NISAR range-offset phase screen is applied.
     admission_lineage : mapping, optional
         Date-keyed trusted pre-open metadata.  It is copied into the scene
         manifest so source identity and policy survive stack publication.
@@ -1039,6 +1060,10 @@ def make_nisar_scene_provider(
         reject_invalid_state(f"unsupported NISAR provider options: {sorted(legacy)}")
     if reference is None:
         reject_invalid_state("NISAR provider Reference date is required")
+    if flatten_stage not in {"coregistration", "interferogram"}:
+        reject_invalid_state(
+            "NISAR flatten_stage must be 'coregistration' or 'interferogram'"
+        )
 
     path_dates = {Path(path): date_id for date_id, path in lineage.items()}
     admission_lineage = dict(admission_lineage or {})
@@ -1073,6 +1098,11 @@ def make_nisar_scene_provider(
             reject_invalid_state("NISAR provider received an unadmitted source path")
         primary_product = products[primary_date]
         secondary_product = products[secondary_date]
+        requested_flatten_stage = str(options.get("flatten_stage", flatten_stage))
+        if requested_flatten_stage != flatten_stage:
+            reject_invalid_state(
+                "NISAR provider flatten_stage differs from its admitted configuration"
+            )
         mapping_dem, mapping_height = _geometry_inputs(
             options,
             configured_dem=configured_dem,
@@ -1239,6 +1269,7 @@ def make_nisar_scene_provider(
                     None if secondary_bounds is None else list(secondary_bounds)
                 ),
                 "range_offset_flatten": "nisar_ellipsoidal_v1",
+                "flatten_stage": requested_flatten_stage,
             }
             resume_identity = _tile_resume_identity(resume_payload)
             if _scene_tile_exists(
@@ -1403,12 +1434,28 @@ def make_nisar_scene_provider(
                     + np.arange(secondary_array.shape[1], dtype=np.float64)[None, :],
                     secondary_array.shape,
                 )
-            secondary_array, range_offset_phase = _apply_range_offset_flatten(
-                np.asarray(secondary_array, dtype=np.complex64),
+            raw_secondary_array = np.asarray(secondary_array, dtype=np.complex64)
+            flattened_secondary, range_offset_phase = _apply_range_offset_flatten(
+                raw_secondary_array,
                 secondary_range_index,
                 primary_col_origin=col_start,
                 range_spacing_m=float(primary_product.grid.range_spacing_m),
                 wavelength_m=float(primary_product.grid.wavelength_m),
+            )
+            if requested_flatten_stage == "interferogram" and domain == "radar":
+                # Invalid dense-mapping lanes are represented by non-finite
+                # source coordinates.  They remain excluded by the sample
+                # mask below, but the persisted screen must still be a
+                # finite float32 payload.  Zero is the neutral phase on
+                # those lanes and matches the Geo path's policy.
+                range_offset_phase = _sanitize_phase_screen(range_offset_phase)
+            # Coregistration stores the inverse-conjugate screen on the
+            # secondary.  Interferogram-stage flattening stores raw secondary
+            # samples and persists the exact screen for the IFG boundary.
+            secondary_array = (
+                flattened_secondary
+                if requested_flatten_stage == "coregistration"
+                else raw_secondary_array
             )
             if domain == "radar":
                 pass
@@ -1424,6 +1471,25 @@ def make_nisar_scene_provider(
                         device=device,
                         dem=mapping_dem,
                     )
+                    if requested_flatten_stage == "interferogram":
+                        phase_factor = np.exp(1j * range_offset_phase).astype(
+                            np.complex64,
+                            copy=False,
+                        )
+                        _, phase_geo = _geocode_aligned_radar_tile(
+                            primary_product,
+                            phase_factor,
+                            phase_factor,
+                            tile_bounds,
+                            local_target,
+                            device=device,
+                            dem=mapping_dem,
+                        )
+                        range_offset_phase = np.angle(phase_geo).astype(
+                            np.float32,
+                            copy=False,
+                        )
+                        range_offset_phase = _sanitize_phase_screen(range_offset_phase)
                 else:
                     primary_array = primary_radar.rdr2geo(
                         device=device,
@@ -1437,6 +1503,25 @@ def make_nisar_scene_provider(
                         geo_grid=local_target,
                         use_cache=False,
                     ).samples
+                    if requested_flatten_stage == "interferogram":
+                        phase_radar = RadarSLC(
+                            product=primary_radar.product,
+                            samples=np.exp(1j * range_offset_phase).astype(
+                                np.complex64,
+                                copy=False,
+                            ),
+                        )
+                        phase_geo = phase_radar.rdr2geo(
+                            device=device,
+                            dem=mapping_dem,
+                            geo_grid=local_target,
+                            use_cache=False,
+                        ).samples
+                        range_offset_phase = np.angle(phase_geo).astype(
+                            np.float32,
+                            copy=False,
+                        )
+                        range_offset_phase = _sanitize_phase_screen(range_offset_phase)
                 assert pair_claimed is not None
                 row_slice = slice(row_origin, row_origin + tile_output_shape[0])
                 col_slice = slice(col_origin, col_origin + tile_output_shape[1])
@@ -1509,6 +1594,7 @@ def make_nisar_scene_provider(
                         "lineage": "secondary",
                         "dem_identity": dem_identity,
                         "range_offset_flatten": "nisar_ellipsoidal_v1",
+                        "flatten_stage": requested_flatten_stage,
                         "window": (
                             "no_intersection"
                             if secondary_bounds is None
@@ -1528,7 +1614,16 @@ def make_nisar_scene_provider(
                     ),
                     "geometry_method": resume_payload["geometry"],
                     "range_offset_flatten": "nisar_ellipsoidal_v1",
+                    "flatten_stage": requested_flatten_stage,
                     "range_offset_phase_sign": "ifg_exp_minus_j_phase",
+                    "range_offset_phase_model": (
+                        "phase=4*pi*range_spacing/wavelength*(secondary-reference)"
+                    ),
+                    "range_offset_phase_array_digest": hashlib.sha256(
+                        np.ascontiguousarray(
+                            range_offset_phase, dtype=np.float32
+                        ).tobytes()
+                    ).hexdigest(),
                     "range_offset_phase_rms_rad": float(np.nanstd(range_offset_phase)),
                     "primary_valid_pixels": int(
                         np.sum(
@@ -1555,6 +1650,11 @@ def make_nisar_scene_provider(
                         )
                     ),
                 },
+                phase_screen=(
+                    range_offset_phase
+                    if requested_flatten_stage == "interferogram"
+                    else None
+                ),
                 validate_existing_payloads=not full_scene,
             )
             if full_scene:

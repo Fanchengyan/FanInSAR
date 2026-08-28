@@ -83,6 +83,13 @@ class S1Stack(Stack):
             reject_pair_configuration(
                 "S1Stack.from_safes no longer accepts 'master'; use 'reference'"
             )
+        if kwargs.get("flatten_stage", "coregistration") != "coregistration":
+            message = (
+                "Sentinel-1 SAFE does not support non-default flatten_stage; "
+                "use 'coregistration'"
+            )
+            logger.error(message)
+            raise ValueError(message)
         if reference is not None:
             kwargs["reference"] = reference
 

@@ -88,6 +88,7 @@ def test_cuda_sources_expose_operation_entry_points_and_diagnostics() -> None:
     assert "is_contiguous()" in common
     assert "geo2rdr_cuda_public" in binding
     assert "rdr2geo_cuda_public" in binding
+    assert "geo2rdr input arrays must be one- or two-dimensional" in binding
     assert "geo2rdr_cuda_visit_counts" in binding
     assert "rdr2geo_cuda_visit_counts" in binding
     assert '"native CUDA geo2rdr public ABI must return 14 fields"' in binding

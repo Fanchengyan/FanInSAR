@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -35,6 +35,15 @@ _IFG_FILENAMES = {
     "wrapped_phase": "wrapped_phase.npy",
     "amplitude": "amplitude.npy",
 }
+_PHASE_SCREEN_MANIFEST_FIELDS = frozenset(
+    {
+        "flatten_stage",
+        "phase_screen_model",
+        "phase_screen_digests",
+        "phase_screen_domain",
+        "phase_screen_grid_identity",
+    }
+)
 _UNWRAP_FILENAMES = {
     "unwrapped_phase": "unwrapped_phase.npy",
     "connected_components": "connected_components.npy",
@@ -268,6 +277,28 @@ def _validate_json_mapping(value: object, field: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _validate_phase_screen_digests(value: object) -> dict[str, dict[str, str]]:
+    """Validate the role- and unit-keyed phase-screen digest table."""
+    if not isinstance(value, dict) or any(
+        role not in {"primary", "secondary"} or not isinstance(digests, dict)
+        for role, digests in value.items()
+    ):
+        reject_invalid_state(
+            "artifact phase_screen_digests must map primary/secondary to unit digests"
+        )
+    result: dict[str, dict[str, str]] = {}
+    for role, raw_digests in value.items():
+        if any(
+            not isinstance(tag, str) or not tag or not _is_sha256(digest)
+            for tag, digest in raw_digests.items()
+        ):
+            reject_invalid_state("artifact phase-screen digests are invalid")
+        result[str(role)] = {
+            str(tag): str(digest) for tag, digest in raw_digests.items()
+        }
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class InterferogramArtifact:
     """Validated arrays from one complete interferogram generation.
@@ -327,6 +358,16 @@ class InterferogramArtifactStore:
         Canonical JSON filter configuration.
     source_manifest_digests : dict[str, str]
         Named source scene manifest digests.
+    flatten_stage : str
+        Stage at which flattening was applied (or deferred).
+    phase_screen_model : str, optional
+        Phase-screen model/convention, when a screen was applied.
+    phase_screen_digests : dict[str, dict[str, str]]
+        Exact phase-screen payload digests keyed by source role and scene unit.
+    phase_screen_domain : str
+        Coordinate domain bound to the phase screens.
+    phase_screen_grid_identity : str
+        Coordinate-grid identity bound to the phase screens.
     shape : tuple[int, int]
         Shared output grid shape.
     manifest_digest : str
@@ -349,6 +390,14 @@ class InterferogramArtifactStore:
     manifest_digest: str
     _payloads: dict[str, dict[str, Any]]
     _lease: GenerationLease
+    # Keep the metadata fields optional for callers that constructed this
+    # dataclass directly before IFG phase lineage was added.  ``open`` always
+    # resolves them to concrete manifest-bound values.
+    flatten_stage: str = "coregistration"
+    phase_screen_model: str | None = None
+    phase_screen_digests: dict[str, dict[str, str]] = field(default_factory=dict)
+    phase_screen_domain: str = "radar"
+    phase_screen_grid_identity: str = ""
 
     @classmethod
     def open(cls, root: str | Path) -> Self:
@@ -437,6 +486,54 @@ class InterferogramArtifactStore:
             )
         ):
             reject_invalid_state("artifact source manifest digests are invalid")
+        missing_phase_fields = _PHASE_SCREEN_MANIFEST_FIELDS.difference(manifest)
+        if missing_phase_fields:
+            reject_invalid_state(
+                "IFG manifest is missing explicit phase-screen lineage fields: "
+                + ", ".join(sorted(missing_phase_fields))
+            )
+        flatten_stage = manifest["flatten_stage"]
+        if not isinstance(flatten_stage, str) or flatten_stage not in {
+            "coregistration",
+            "interferogram",
+        }:
+            reject_invalid_state("artifact flatten_stage is invalid")
+        phase_screen_model = manifest.get("phase_screen_model")
+        if not (
+            phase_screen_model is None or phase_screen_model == "nisar_ellipsoidal_v1"
+        ):
+            reject_invalid_state("artifact phase_screen_model is invalid")
+        phase_screen_digests = _validate_phase_screen_digests(
+            manifest["phase_screen_digests"]
+        )
+        phase_screen_domain = manifest["phase_screen_domain"]
+        if not isinstance(phase_screen_domain, str) or phase_screen_domain not in {
+            "radar",
+            "geo",
+        }:
+            reject_invalid_state("artifact phase_screen_domain is invalid")
+        phase_screen_grid_identity = manifest["phase_screen_grid_identity"]
+        if not _is_sha256(phase_screen_grid_identity):
+            reject_invalid_state("artifact phase_screen_grid_identity is invalid")
+        if phase_screen_domain != domain or phase_screen_grid_identity != grid_identity:
+            reject_invalid_state("artifact phase-screen grid binding differs")
+        if flatten_stage == "coregistration" and (
+            phase_screen_model is not None or phase_screen_digests
+        ):
+            reject_invalid_state(
+                "coregistration IFG artifacts must not carry a phase screen"
+            )
+        if flatten_stage == "interferogram" and (
+            phase_screen_model != "nisar_ellipsoidal_v1"
+            or not phase_screen_digests
+            or not any(phase_screen_digests.values())
+        ):
+            reject_invalid_state(
+                "interferogram IFG artifacts require non-empty NISAR "
+                "phase-screen lineage"
+            )
+        if phase_screen_model is None and phase_screen_digests:
+            reject_invalid_state("phase-screen digests require a phase-screen model")
         shape = _validate_shape(manifest.get("shape"), "shape")
         payloads = _validate_payload_table(
             opened.path, manifest.get("payloads"), _IFG_FILENAMES, shape
@@ -454,6 +551,13 @@ class InterferogramArtifactStore:
             filter_name=str(raw_filter["name"]),
             filter_parameters=filter_parameters,
             source_manifest_digests={str(k): str(v) for k, v in sources.items()},
+            flatten_stage=str(flatten_stage),
+            phase_screen_model=(
+                None if phase_screen_model is None else str(phase_screen_model)
+            ),
+            phase_screen_digests=phase_screen_digests,
+            phase_screen_domain=str(phase_screen_domain),
+            phase_screen_grid_identity=str(phase_screen_grid_identity),
             shape=shape,
             manifest_digest=digest,
             _payloads=payloads,
@@ -561,6 +665,11 @@ def write_ifg_artifact(
     filter_name: str,
     filter_parameters: Mapping[str, Any],
     source_manifest_digests: Mapping[str, str],
+    flatten_stage: str = "coregistration",
+    phase_screen_model: str | None = None,
+    phase_screen_digests: Mapping[str, Mapping[str, str]] | None = None,
+    phase_screen_domain: str | None = None,
+    phase_screen_grid_identity: str | None = None,
     complex_ifg: np.ndarray,
     coherence: np.ndarray,
     wrapped_phase: np.ndarray,
@@ -594,6 +703,15 @@ def write_ifg_artifact(
         Canonical JSON parameters for the filter.
     source_manifest_digests : mapping[str, str]
         Named SHA-256 digests of every source scene manifest.
+    flatten_stage : {"coregistration", "interferogram"}, optional
+        Stage at which flattening was applied (or deferred).
+    phase_screen_model : {None, "nisar_ellipsoidal_v1"}, optional
+        Phase-screen model/convention.
+    phase_screen_digests : mapping[str, mapping[str, str]], optional
+        Exact source-role and scene-unit phase-screen payload digests.
+    phase_screen_domain, phase_screen_grid_identity : str, optional
+        Coordinate-domain and grid identity binding for the phase screen.
+        Defaults to the IFG domain and grid identity.
     resource_limits : ArtifactResourceLimits, optional
         Hard publication size, file-count, and free-space limits.
     replace_existing : bool, optional
@@ -635,6 +753,8 @@ def write_ifg_artifact(
         or not isinstance(filter_name, str)
         or not filter_name
         or domain not in {"radar", "geo"}
+        or not isinstance(flatten_stage, str)
+        or flatten_stage not in {"coregistration", "interferogram"}
     ):
         reject_invalid_state("IFG artifact processing metadata is invalid")
     if wavelength_m is not None and (
@@ -653,6 +773,43 @@ def write_ifg_artifact(
     )
     if not _is_sha256(resolved_grid_identity):
         reject_invalid_state("IFG artifact grid_identity is invalid")
+    resolved_phase_screen_domain = (
+        domain if phase_screen_domain is None else phase_screen_domain
+    )
+    resolved_phase_screen_grid_identity = (
+        resolved_grid_identity
+        if phase_screen_grid_identity is None
+        else phase_screen_grid_identity
+    )
+    if not isinstance(resolved_phase_screen_domain, str) or (
+        resolved_phase_screen_domain not in {"radar", "geo"}
+    ):
+        reject_invalid_state("IFG phase_screen_domain is invalid")
+    if resolved_phase_screen_domain != domain:
+        reject_invalid_state("IFG phase-screen domain differs from IFG domain")
+    if not _is_sha256(resolved_phase_screen_grid_identity):
+        reject_invalid_state("IFG phase_screen_grid_identity is invalid")
+    if resolved_phase_screen_grid_identity != resolved_grid_identity:
+        reject_invalid_state("IFG phase-screen grid differs from IFG grid")
+    screen_digests = _validate_phase_screen_digests(phase_screen_digests or {})
+    if not (phase_screen_model is None or phase_screen_model == "nisar_ellipsoidal_v1"):
+        reject_invalid_state("IFG phase_screen_model is invalid")
+    if flatten_stage == "coregistration" and (
+        phase_screen_model is not None or screen_digests
+    ):
+        reject_invalid_state(
+            "coregistration IFG artifacts must not carry a phase screen"
+        )
+    if flatten_stage == "interferogram" and (
+        phase_screen_model != "nisar_ellipsoidal_v1"
+        or not screen_digests
+        or not any(screen_digests.values())
+    ):
+        reject_invalid_state(
+            "interferogram IFG artifacts require non-empty NISAR phase-screen lineage"
+        )
+    if phase_screen_model is None and screen_digests:
+        reject_invalid_state("phase-screen digests require a phase-screen model")
     parameters = dict(filter_parameters)
     _canonical_json(parameters)
     sources = dict(source_manifest_digests)
@@ -691,6 +848,11 @@ def write_ifg_artifact(
             "domain": domain,
             "wavelength_m": wavelength_m,
             "grid_identity": resolved_grid_identity,
+            "flatten_stage": flatten_stage,
+            "phase_screen_model": phase_screen_model,
+            "phase_screen_digests": screen_digests,
+            "phase_screen_domain": resolved_phase_screen_domain,
+            "phase_screen_grid_identity": resolved_phase_screen_grid_identity,
             "filter": {"name": filter_name, "parameters": parameters},
             "source_manifest_digests": sources,
             "shape": [int(shape[0]), int(shape[1])],

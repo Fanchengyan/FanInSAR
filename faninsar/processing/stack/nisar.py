@@ -294,6 +294,7 @@ class NISARStack(Stack):
             configured_dem=config.dem,
             configured_height=extra.get("height_m", extra.get("height")),
             admission_lineage=admission_lineage,
+            flatten_stage=config.flatten_stage,
         )
         stack = cls(
             catalog=catalog,

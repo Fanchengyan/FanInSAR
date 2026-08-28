@@ -428,19 +428,24 @@ def _validate_native_context_inputs(
             validated[name] = bool(value)
             continue
         shape = expected_shapes[name]
+        finite_required = name != "dem_values"
         if torch_type is not None and isinstance(value, torch_type):
             validate_tensor_span(
                 value,
                 expected_dtype=torch_module.float64,
                 expected_shape=shape,
                 expected_device=expected_device,
-                require_finite=True,
+                require_finite=finite_required,
                 name=f"native context {name}",
             )
             if name == "dem_values" and (value.ndim != 2 or min(value.shape) < 6):
                 raise GeometryValidationError(
                     "native context dem_values must be a 2-D raster with both "
                     "dimensions at least 6"
+                )
+            if name == "dem_values" and bool(torch_module.isinf(value).any().item()):
+                raise GeometryValidationError(
+                    "native context dem_values must not contain infinities"
                 )
             validated[name] = value
             continue
@@ -453,13 +458,17 @@ def _validate_native_context_inputs(
             expected_dtype=np.dtype(np.float64),
             expected_shape=shape,
             expected_device=DeviceKey.cpu(),
-            require_finite=True,
+            require_finite=finite_required,
             name=f"native context {name}",
         )
         if name == "dem_values" and (value.ndim != 2 or min(value.shape) < 6):
             raise GeometryValidationError(
                 "native context dem_values must be a 2-D raster with both "
                 "dimensions at least 6"
+            )
+        if name == "dem_values" and bool(np.isinf(value).any()):
+            raise GeometryValidationError(
+                "native context dem_values must not contain infinities"
             )
         if expected_device.kind != "cpu":
             raise GeometryValidationError(

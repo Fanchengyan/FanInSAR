@@ -13,7 +13,17 @@ from faninsar.processing.stack.config import (
     ActivationMode,
     CoregMode,
     EsdMethod,
+    FlattenStage,
     StackConfig,
+)
+from faninsar.processing.stack.ifg_store import (
+    InterferogramArtifact,
+    InterferogramArtifactStore,
+    UnwrappedArtifact,
+)
+from faninsar.processing.stack.ion_store import (
+    IonosphereArtifact,
+    IonosphereArtifactStore,
 )
 from faninsar.processing.stack.nisar import NISARStack
 from faninsar.processing.stack.provider import (
@@ -33,7 +43,12 @@ __all__ = [
     "ActivationMode",
     "CoregMode",
     "EsdMethod",
+    "FlattenStage",
     "GpuMemoryReclaim",
+    "InterferogramArtifact",
+    "InterferogramArtifactStore",
+    "IonosphereArtifact",
+    "IonosphereArtifactStore",
     "LocalActivationAuthority",
     "NISARStack",
     "S1Stack",
@@ -46,6 +61,7 @@ __all__ = [
     "StackProviderError",
     "StackSceneProvider",
     "UnsupportedStackCapabilityError",
+    "UnwrappedArtifact",
     "unavailable_scene_provider",
     "unsupported_stack_capability",
 ]

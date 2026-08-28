@@ -51,6 +51,7 @@ from faninsar.processing.stack.config import (
     ActivationMode,
     CoregMode,
     EsdMethod,
+    FlattenStage,
     StackConfig,
 )
 from faninsar.processing.stack.provider import SourceHandle
@@ -297,6 +298,58 @@ def _runtime_fingerprint(callback: object | None) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _phase_screen_lineage(
+    primary_store: CoregisteredSceneStore,
+    secondary_store: CoregisteredSceneStore,
+    flatten_stage: str,
+) -> tuple[str | None, dict[str, dict[str, str]]]:
+    """Derive explicit phase-screen lineage from persisted scene units.
+
+    Parameters
+    ----------
+    primary_store, secondary_store : CoregisteredSceneStore
+        Source scene generations for the IFG pair.
+    flatten_stage : str
+        Validated flattening stage shared by both source generations.
+
+    Returns
+    -------
+    tuple[str or None, dict[str, dict[str, str]]]
+        Phase-screen model and role/unit payload digests.  Coregistration
+        artifacts deliberately report no model or screen digest.
+
+    """
+    if flatten_stage == "coregistration":
+        return None, {}
+
+    stores = (("primary", primary_store), ("secondary", secondary_store))
+    models: set[str] = set()
+    digests: dict[str, dict[str, str]] = {}
+    for role, store in stores:
+        role_digests = {
+            unit.tag: unit.phase_screen_digest
+            for unit in store.units
+            if unit.phase_screen_digest is not None
+        }
+        if role_digests:
+            digests[role] = {
+                tag: digest
+                for tag, digest in sorted(role_digests.items())
+                if digest is not None
+            }
+        for unit in store.units:
+            state = unit.phase_state or {}
+            model = state.get("range_offset_flatten", state.get("phase_screen_model"))
+            if model is not None:
+                models.add(str(model))
+    if len(models) > 1:
+        reject_invalid_state("scene units mix phase-screen models")
+    model = next(iter(models), None)
+    if model is None and digests:
+        reject_invalid_state("phase-screen digests have no declared model")
+    return model, digests
+
+
 def _reclaim_after_stage(
     method: Callable[_P, _R],
 ) -> Callable[_P, _R]:
@@ -456,6 +509,7 @@ class Stack(Network):
         geo_grid: GeoGridSpec | None = None,
         roi: BoundingBox | Polygons | None = None,
         coreg_mode: CoregMode = "pair",
+        flatten_stage: FlattenStage = "coregistration",
         coregistration_grid: CoregistrationGrid = "radar",
         multilook: tuple[int, int] = (2, 10),
         goldstein_alpha: float = 0.5,
@@ -502,6 +556,7 @@ class Stack(Network):
         config = StackConfig(
             work_dir=Path(work_dir),
             coreg_mode=coreg_mode,
+            flatten_stage=flatten_stage,
             coregistration_grid=coregistration_grid,
             esd_method=esd_method,
             multilook=multilook,
@@ -663,6 +718,7 @@ class Stack(Network):
             "roi": cfg.roi,
             "control_spacing": cfg.control_spacing,
             "n_jobs": cfg.n_jobs,
+            "flatten_stage": cfg.flatten_stage,
         }
 
     def _reclaim_accelerator(self, kind: str) -> None:
@@ -969,6 +1025,7 @@ class Stack(Network):
             }
         configuration = {
             "coreg_mode": self.config.coreg_mode,
+            "flatten_stage": self.config.flatten_stage,
             "coregistration_grid": self.config.coregistration_grid,
             "esd_method": self.config.esd_method,
             "multilook": list(self.config.multilook),
@@ -991,6 +1048,7 @@ class Stack(Network):
             "reference_source": source_identity(self.catalog.paths_for(self.reference)),
             "secondary_source": source_identity(self.catalog.paths_for(date_id)),
             "coreg_mode": self.config.coreg_mode,
+            "flatten_stage": self.config.flatten_stage,
             "coregistration_grid": self.config.coregistration_grid,
             "esd_method": self.config.esd_method,
             "swaths": list(self.config.swaths),
@@ -1341,6 +1399,14 @@ class Stack(Network):
                 secondary_store = CoregisteredSceneStore.open(
                     self.coreg_paths[secondary] / "scenes"
                 )
+                if primary_store.flatten_stage != secondary_store.flatten_stage:
+                    reject_invalid_state("scene artifacts mix flattening stages")
+                flatten_stage = primary_store.flatten_stage
+                phase_screen_model, phase_screen_digests = _phase_screen_lineage(
+                    primary_store,
+                    secondary_store,
+                    flatten_stage,
+                )
                 expected_sources = {
                     "primary": primary_store.manifest_digest,
                     "secondary": secondary_store.manifest_digest,
@@ -1371,6 +1437,12 @@ class Stack(Network):
                         or existing_store.filter_parameters
                         != expected_filter_parameters
                         or existing_store.source_manifest_digests != expected_sources
+                        or existing_store.flatten_stage != flatten_stage
+                        or existing_store.phase_screen_model != phase_screen_model
+                        or existing_store.phase_screen_digests != phase_screen_digests
+                        or existing_store.phase_screen_domain != primary_store.domain
+                        or existing_store.phase_screen_grid_identity
+                        != primary_store.grid_identity
                     ):
                         reject_invalid_state(
                             "persisted IFG artifact does not match current scene "
@@ -1396,6 +1468,7 @@ class Stack(Network):
                     goldstein_alpha=alpha,
                     device=self.config.device,
                     dask_client=self.dask_client,
+                    flatten_stage=flatten_stage,
                 )
                 from faninsar.processing.stack.ifg_store import write_ifg_artifact
 
@@ -1409,6 +1482,11 @@ class Stack(Network):
                     filter_name=expected_filter_name,
                     filter_parameters=expected_filter_parameters,
                     source_manifest_digests=expected_sources,
+                    flatten_stage=flatten_stage,
+                    phase_screen_model=phase_screen_model,
+                    phase_screen_digests=phase_screen_digests,
+                    phase_screen_domain=primary_store.domain,
+                    phase_screen_grid_identity=primary_store.grid_identity,
                     complex_ifg=product.complex_ifg,
                     coherence=product.coherence,
                     wrapped_phase=product.wrapped_phase,

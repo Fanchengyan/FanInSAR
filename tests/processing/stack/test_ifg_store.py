@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import TYPE_CHECKING
 
@@ -47,6 +48,49 @@ def _write_base(root: Path) -> InterferogramArtifactStore:
     )
 
 
+def _redigest_ifg_manifest(
+    root: Path,
+    update: dict[str, object] | None = None,
+    remove: str | None = None,
+) -> None:
+    """Apply a manifest mutation and refresh every canonical pointer digest."""
+    current_path = root / "CURRENT"
+    current = json.loads(current_path.read_text())
+    generation_path = root / ".ifg_generations" / current["generation_id"]
+    manifest_paths = [root / "manifest.json", generation_path / "manifest.json"]
+    digest = ""
+    for manifest_path in manifest_paths:
+        manifest = json.loads(manifest_path.read_text())
+        if update:
+            manifest.update(update)
+        if remove is not None:
+            manifest.pop(remove)
+        unsigned = dict(manifest)
+        unsigned.pop("manifest_digest", None)
+        digest = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        manifest["manifest_digest"] = digest
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    current["manifest_digest"] = digest
+    unsigned_current = dict(current)
+    unsigned_current.pop("control_digest", None)
+    current["control_digest"] = hashlib.sha256(
+        json.dumps(
+            unsigned_current,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    current_path.write_text(json.dumps(current), encoding="utf-8")
+
+
 def test_ifg_artifact_round_trip_records_provenance(tmp_path: Path) -> None:
     """All IFG layers and their processing provenance round-trip exactly."""
     root = tmp_path / "ifg"
@@ -76,6 +120,163 @@ def test_ifg_artifact_round_trip_records_provenance(tmp_path: Path) -> None:
         "wrapped_phase",
     }
     assert not list(root.glob("*.tmp"))
+
+
+def test_ifg_artifact_records_phase_screen_lineage(tmp_path: Path) -> None:
+    """Phase-screen metadata is explicit and bound into the manifest digest."""
+    root = tmp_path / "ifg"
+    store = write_ifg_artifact(
+        root,
+        pair=("20240101", "20240113"),
+        looks=(1, 1),
+        filter_name="none",
+        filter_parameters={},
+        source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
+        flatten_stage="interferogram",
+        phase_screen_model="nisar_ellipsoidal_v1",
+        phase_screen_digests={"secondary": {"IW1_b1": "c" * 64}},
+        **_ifg_arrays(),
+    )
+
+    assert store.flatten_stage == "interferogram"
+    assert store.phase_screen_model == "nisar_ellipsoidal_v1"
+    assert store.phase_screen_digests == {"secondary": {"IW1_b1": "c" * 64}}
+    assert store.phase_screen_domain == store.domain
+    assert store.phase_screen_grid_identity == store.grid_identity
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["phase_screen_model"] == "nisar_ellipsoidal_v1"
+    assert manifest["phase_screen_digests"] == {"secondary": {"IW1_b1": "c" * 64}}
+
+
+def test_ifg_artifact_rejects_tampered_phase_screen_lineage(tmp_path: Path) -> None:
+    """Changing phase-screen lineage makes reopening fail closed."""
+    root = tmp_path / "ifg"
+    write_ifg_artifact(
+        root,
+        pair=("20240101", "20240113"),
+        looks=(1, 1),
+        filter_name="none",
+        filter_parameters={},
+        source_manifest_digests={"primary": "a" * 64},
+        flatten_stage="interferogram",
+        phase_screen_model="nisar_ellipsoidal_v1",
+        phase_screen_digests={"primary": {"IW1_b1": "c" * 64}},
+        **_ifg_arrays(),
+    )
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["phase_screen_digests"]["primary"]["IW1_b1"] = "d" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(InvalidProcessingStateError, match="digest mismatch"):
+        InterferogramArtifactStore.open(root)
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "flatten_stage",
+        "phase_screen_model",
+        "phase_screen_digests",
+        "phase_screen_domain",
+        "phase_screen_grid_identity",
+    ],
+)
+def test_ifg_artifact_rejects_redigested_missing_phase_lineage(
+    tmp_path: Path,
+    missing_field: str,
+) -> None:
+    """A valid digest cannot legitimize a manifest missing lineage fields."""
+    root = tmp_path / "ifg"
+    _write_base(root)
+    _redigest_ifg_manifest(root, remove=missing_field)
+
+    with pytest.raises(InvalidProcessingStateError, match="missing explicit"):
+        InterferogramArtifactStore.open(root)
+
+
+@pytest.mark.parametrize(
+    ("phase_screen_model", "phase_screen_digests"),
+    [
+        (None, None),
+        ("nisar_ellipsoidal_v1", {}),
+    ],
+)
+def test_ifg_artifact_rejects_deferred_without_screen_lineage(
+    tmp_path: Path,
+    phase_screen_model: str | None,
+    phase_screen_digests: dict[str, dict[str, str]] | None,
+) -> None:
+    """Deferred flattening requires an explicit non-empty screen lineage."""
+    with pytest.raises(InvalidProcessingStateError, match="non-empty NISAR"):
+        write_ifg_artifact(
+            tmp_path / "ifg",
+            pair=("20240101", "20240113"),
+            looks=(1, 1),
+            filter_name="none",
+            filter_parameters={},
+            source_manifest_digests={"primary": "a" * 64},
+            flatten_stage="interferogram",
+            phase_screen_model=phase_screen_model,
+            phase_screen_digests=phase_screen_digests,
+            **_ifg_arrays(),
+        )
+
+
+def test_ifg_artifact_open_rejects_redigested_deferred_without_screen(
+    tmp_path: Path,
+) -> None:
+    """Re-digesting a deferred artifact cannot remove its screen lineage."""
+    root = tmp_path / "ifg"
+    write_ifg_artifact(
+        root,
+        pair=("20240101", "20240113"),
+        looks=(1, 1),
+        filter_name="none",
+        filter_parameters={},
+        source_manifest_digests={"primary": "a" * 64},
+        flatten_stage="interferogram",
+        phase_screen_model="nisar_ellipsoidal_v1",
+        phase_screen_digests={"primary": {"IW1_b1": "c" * 64}},
+        **_ifg_arrays(),
+    )
+    _redigest_ifg_manifest(root, update={"phase_screen_digests": {}})
+
+    with pytest.raises(InvalidProcessingStateError, match="non-empty NISAR"):
+        InterferogramArtifactStore.open(root)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("flatten_stage", "invalid"),
+        ("phase_screen_model", "invalid"),
+        ("phase_screen_digests", {"primary": {"IW1_b1": "not-a-digest"}}),
+    ],
+)
+def test_ifg_artifact_rejects_invalid_phase_lineage(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    """Invalid phase-lineage enums and digests are rejected before publish."""
+    kwargs: dict[str, object] = {
+        "flatten_stage": "interferogram",
+        "phase_screen_model": "nisar_ellipsoidal_v1",
+        "phase_screen_digests": {"primary": {"IW1_b1": "c" * 64}},
+    }
+    kwargs[field] = value
+    with pytest.raises(InvalidProcessingStateError):
+        write_ifg_artifact(
+            tmp_path / "ifg",
+            pair=("20240101", "20240113"),
+            looks=(1, 1),
+            filter_name="none",
+            filter_parameters={},
+            source_manifest_digests={"primary": "a" * 64},
+            **kwargs,
+            **_ifg_arrays(),
+        )
 
 
 @pytest.mark.parametrize("failure", ["missing", "corrupt", "shape"])

@@ -114,6 +114,7 @@ def reject_pair_configuration(message: str) -> Never:
     ------
     PairConfigurationMigrationError
         Always raised after the rejection is logged.
+
     """
     logger.error("legacy pair configuration rejected: %s", message)
     raise PairConfigurationMigrationError(message)

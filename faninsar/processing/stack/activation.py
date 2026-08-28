@@ -423,9 +423,7 @@ class LocalActivationAuthority:
                 )
                 matched = True
         if not matched:
-            reject_invalid_state(
-                f"{gate_id} has no {required_gate} predecessor event"
-            )
+            reject_invalid_state(f"{gate_id} has no {required_gate} predecessor event")
 
     @staticmethod
     def _token_subject_digest(token: ActivationToken) -> str:

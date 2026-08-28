@@ -149,8 +149,14 @@ def resample_complex_at_coordinates(
 def compose_secondary_coordinates(
     reference_lut: Geo2RdrLUT,
     offsets: OffsetFieldResult,
+    *,
+    device: str = "cpu",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compose reference geo2rdr coordinates with dense secondary offsets.
+
+    Secondary radar coordinates follow the reference LUT minus the dense
+    reference-minus-secondary offset field. The offset field is interpolated
+    onto the geographic LUT; it is not a second geo2rdr solve.
 
     Parameters
     ----------
@@ -158,6 +164,9 @@ def compose_secondary_coordinates(
         Reference radar coordinates on the geographic grid.
     offsets : OffsetFieldResult
         Dense offsets using ``offset = reference - secondary``.
+    device : str, optional
+        ``cpu`` uses SciPy bilinear ``map_coordinates``. An admitted CUDA
+        identity uses Torch ``grid_sample`` with ``align_corners=True``.
 
     Returns
     -------
@@ -165,6 +174,19 @@ def compose_secondary_coordinates(
         Fractional secondary source coordinates and validity mask.
 
     """
+    identity = str(device)
+    if identity.startswith("cuda"):
+        return _compose_secondary_coordinates_torch(
+            reference_lut, offsets, identity
+        )
+    return _compose_secondary_coordinates_numpy(reference_lut, offsets)
+
+
+def _compose_secondary_coordinates_numpy(
+    reference_lut: Geo2RdrLUT,
+    offsets: OffsetFieldResult,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """CPU bilinear compose used as the identity oracle."""
     coordinates = np.array(
         [reference_lut.az_full.ravel(), reference_lut.rg_full.ravel()],
         dtype=np.float64,
@@ -190,6 +212,94 @@ def compose_secondary_coordinates(
         mode="constant",
         cval=0,
     ).reshape(reference_lut.shape)
+    return _finalize_composed_coordinates(
+        reference_lut, offsets, azimuth_offset, range_offset, coverage
+    )
+
+
+def _compose_secondary_coordinates_torch(
+    reference_lut: Geo2RdrLUT,
+    offsets: OffsetFieldResult,
+    identity: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Same-device bilinear compose for an admitted CUDA identity."""
+    import torch
+    import torch.nn.functional as torch_F
+
+    torch_device = torch.device(identity)
+    radar_h, radar_w = offsets.coverage.shape
+    az = torch.as_tensor(
+        np.asarray(reference_lut.az_full, dtype=np.float64),
+        device=torch_device,
+    )
+    rg = torch.as_tensor(
+        np.asarray(reference_lut.rg_full, dtype=np.float64),
+        device=torch_device,
+    )
+    denom_h = max(radar_h - 1, 1)
+    denom_w = max(radar_w - 1, 1)
+    grid_y = (2.0 * az / denom_h) - 1.0
+    grid_x = (2.0 * rg / denom_w) - 1.0
+    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).to(torch.float32)
+    az_field = torch.as_tensor(
+        np.asarray(offsets.azimuth_offset_px, dtype=np.float32),
+        device=torch_device,
+    ).view(1, 1, radar_h, radar_w)
+    rg_field = torch.as_tensor(
+        np.asarray(offsets.range_offset_px, dtype=np.float32),
+        device=torch_device,
+    ).view(1, 1, radar_h, radar_w)
+    cov_field = torch.as_tensor(
+        np.asarray(offsets.coverage, dtype=np.float32),
+        device=torch_device,
+    ).view(1, 1, radar_h, radar_w)
+    azimuth_offset = (
+        torch_F.grid_sample(
+            az_field, grid, mode="bilinear", padding_mode="zeros", align_corners=True
+        )
+        .squeeze(0)
+        .squeeze(0)
+        .to(torch.float64)
+    )
+    range_offset = (
+        torch_F.grid_sample(
+            rg_field, grid, mode="bilinear", padding_mode="zeros", align_corners=True
+        )
+        .squeeze(0)
+        .squeeze(0)
+        .to(torch.float64)
+    )
+    coverage = (
+        torch_F.grid_sample(
+            cov_field, grid, mode="nearest", padding_mode="zeros", align_corners=True
+        )
+        .squeeze(0)
+        .squeeze(0)
+    )
+    finite_src = torch.isfinite(az) & torch.isfinite(rg)
+    azimuth_offset = torch.where(
+        finite_src, azimuth_offset, torch.full_like(azimuth_offset, float("nan"))
+    )
+    range_offset = torch.where(
+        finite_src, range_offset, torch.full_like(range_offset, float("nan"))
+    )
+    return _finalize_composed_coordinates(
+        reference_lut,
+        offsets,
+        azimuth_offset.detach().cpu().numpy(),
+        range_offset.detach().cpu().numpy(),
+        (coverage > 0.5).detach().cpu().numpy(),
+    )
+
+
+def _finalize_composed_coordinates(
+    reference_lut: Geo2RdrLUT,
+    offsets: OffsetFieldResult,
+    azimuth_offset: np.ndarray,
+    range_offset: np.ndarray,
+    coverage: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply the reference-minus-secondary offset convention and in-window mask."""
     secondary_azimuth = reference_lut.az_full - azimuth_offset
     secondary_range = reference_lut.rg_full - range_offset
     height, width = offsets.coverage.shape

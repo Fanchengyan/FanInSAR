@@ -76,13 +76,27 @@ std::vector<torch::Tensor> geo2rdr_cuda_public(
     double range_spacing, double wavelength, int64_t max_iter,
     int64_t extra_iter, double time_tolerance, double range_tolerance,
     double doppler_tolerance) {
+  // ISCE3 gpuGeo2rdr launches one thread per pixel on a flattened
+  // blockLength*blockWidth tile, then writes 2-D rasters.  The Newton
+  // kernel is independent per point; dim==1 was only an ABI check.
+  TORCH_CHECK(latitude.dim() == longitude.dim() && latitude.dim() == height.dim(),
+              "geo2rdr input arrays must have matching dimensions");
+  TORCH_CHECK(latitude.dim() == 1 || latitude.dim() == 2,
+              "geo2rdr input arrays must be one- or two-dimensional");
+  const auto sizes = latitude.sizes();
+  const auto flat_shape = std::vector<int64_t>{latitude.numel()};
   auto result = geo2rdr_cuda_v2(
-      latitude, longitude, height, orbit_times, orbit_positions,
+      latitude.contiguous().reshape(flat_shape),
+      longitude.contiguous().reshape(flat_shape),
+      height.contiguous().reshape(flat_shape), orbit_times, orbit_positions,
       orbit_velocities, sensing_offset, azimuth_interval, starting_range,
       range_spacing, wavelength, max_iter, extra_iter, time_tolerance,
       range_tolerance, doppler_tolerance);
   TORCH_CHECK(result.size() == 14,
               "native CUDA geo2rdr public ABI must return 14 fields");
+  if (latitude.dim() == 2) {
+    for (auto& field : result) field = field.reshape(sizes);
+  }
   return result;
 }
 

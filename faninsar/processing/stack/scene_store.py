@@ -166,6 +166,8 @@ class SceneUnit:
     payload_digest: str
     scientific_lineage: tuple[dict[str, str], ...] = ()
     phase_state: dict[str, object] | None = None
+    phase_screen_path: Path | None = None
+    phase_screen_digest: str | None = None
 
     def __post_init__(self) -> None:
         """Validate the unit's bounded shape and digest."""
@@ -192,6 +194,7 @@ class CoregisteredSceneStore:
     grid_shape: tuple[int, int]
     wavelength_m: float | None
     grid_identity: str
+    flatten_stage: str = "coregistration"
 
     @classmethod
     def open(cls, root: str | Path) -> CoregisteredSceneStore:
@@ -259,8 +262,47 @@ class CoregisteredSceneStore:
                         if isinstance(raw.get("phase_state"), dict)
                         else None
                     ),
+                    phase_screen_path=(
+                        _safe_payload_path(
+                            path,
+                            raw["phase_screen_file"],
+                            "phase_screen_file",
+                        )
+                        if raw.get("phase_screen_file") is not None
+                        else None
+                    ),
+                    phase_screen_digest=(
+                        str(raw["phase_screen_digest"])
+                        if raw.get("phase_screen_digest") is not None
+                        else None
+                    ),
                 )
             )
+            unit = units[-1]
+            if unit.phase_screen_path is not None:
+                if (
+                    not unit.phase_screen_path.is_file()
+                    or unit.phase_screen_path.is_symlink()
+                    or unit.phase_screen_digest is None
+                    or _sha256(unit.phase_screen_path) != unit.phase_screen_digest
+                ):
+                    reject_invalid_state(
+                        f"scene phase screen missing or digest mismatch: {unit.tag}"
+                    )
+                try:
+                    screen = np.load(unit.phase_screen_path, allow_pickle=False)
+                except (OSError, ValueError) as error:
+                    reject_invalid_state(
+                        f"scene phase screen cannot be read for {unit.tag!r}: {error}"
+                    )
+                if screen.shape != unit.shape or screen.dtype != np.float32:
+                    reject_invalid_state(
+                        f"scene phase screen shape or dtype mismatch for {unit.tag!r}"
+                    )
+            elif unit.phase_screen_digest is not None:
+                reject_invalid_state(
+                    f"scene phase screen digest has no payload for {unit.tag!r}"
+                )
         if not units:
             reject_invalid_state("scene store has no complete units")
         expected_digest = str(manifest.get("manifest_digest", ""))
@@ -296,6 +338,17 @@ class CoregisteredSceneStore:
             for unit in units
         ):
             reject_invalid_state("scene unit lies outside the declared common grid")
+        unit_stages = {
+            str((unit.phase_state or {}).get("flatten_stage", "coregistration"))
+            for unit in units
+        }
+        manifest_stage = str(
+            manifest.get("flatten_stage", next(iter(unit_stages), "coregistration"))
+        )
+        if manifest_stage not in {"coregistration", "interferogram"}:
+            reject_invalid_state("scene manifest flatten_stage is unsupported")
+        if unit_stages != {manifest_stage}:
+            reject_invalid_state("scene units mix flattening stages")
         raw_wavelength = manifest.get("wavelength_m")
         wavelength_m = None if raw_wavelength is None else float(raw_wavelength)
         if wavelength_m is not None and (
@@ -325,7 +378,22 @@ class CoregisteredSceneStore:
             grid_shape=grid_shape,
             wavelength_m=wavelength_m,
             grid_identity=grid_identity,
+            flatten_stage=manifest_stage,
         )
+
+    def read_phase_screen(self, tag: str) -> np.ndarray | None:
+        """Read one persisted range-offset phase screen, if present."""
+        unit = self.unit_map().get(tag)
+        if unit is None:
+            reject_invalid_state(f"scene unit {tag!r} is not in the manifest")
+        if unit.phase_screen_path is None:
+            return None
+        screen = np.load(unit.phase_screen_path, allow_pickle=False)
+        if screen.shape != unit.shape or screen.dtype != np.float32:
+            reject_invalid_state(f"scene phase screen shape mismatch for {tag!r}")
+        if _sha256(unit.phase_screen_path) != unit.phase_screen_digest:
+            reject_invalid_state(f"scene phase screen digest mismatch for {tag!r}")
+        return np.asarray(screen, dtype=np.float32)
 
     def unit_map(self) -> dict[str, SceneUnit]:
         """Return units keyed by their stable burst tag."""
@@ -369,6 +437,7 @@ def write_scene_unit(
     grid_identity: str | None = None,
     scientific_lineage: Sequence[Mapping[str, str]] | None = None,
     phase_state: Mapping[str, object] | None = None,
+    phase_screen: np.ndarray | None = None,
     validate_existing_payloads: bool = True,
 ) -> None:
     """Atomically add one aligned unit and publish a complete manifest.
@@ -397,6 +466,8 @@ def write_scene_unit(
         Source and processing lineage attached to the unit.
     phase_state : mapping, optional
         Phase-correction state attached to the unit.
+    phase_screen : numpy.ndarray, optional
+        Exact finite float32 phase screen in radians for the unit.
     validate_existing_payloads : bool, optional
         Re-read all previously published payload bytes before appending. A
         streaming producer that has already validated its resume tiles may set
@@ -415,6 +486,13 @@ def write_scene_unit(
         or secondary.dtype != np.complex64
     ):
         reject_invalid_state("aligned scene arrays must be matching complex64 arrays")
+    if phase_screen is not None and (
+        phase_screen.ndim != 2
+        or phase_screen.shape != primary.shape
+        or phase_screen.dtype != np.float32
+        or not np.all(np.isfinite(phase_screen))
+    ):
+        reject_invalid_state("phase screen must be finite matching float32 array")
     resolved_grid_shape = grid_shape or (
         int(row_origin) + int(primary.shape[0]),
         int(col_origin) + int(primary.shape[1]),
@@ -477,23 +555,45 @@ def write_scene_unit(
             stream.flush()
             os.fsync(stream.fileno())
         temporary.replace(target)
+    phase_path: Path | None = None
+    phase_digest: str | None = None
+    if phase_screen is not None:
+        phase_path = path / f"{tag}.phase.npy"
+        temporary = phase_path.with_suffix(phase_path.suffix + ".tmp")
+        with temporary.open("wb") as stream:
+            np.save(
+                stream,
+                np.asarray(phase_screen, dtype=np.float32),
+                allow_pickle=False,
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(phase_path)
+        phase_digest = _sha256(phase_path)
+    else:
+        (path / f"{tag}.phase.npy").unlink(missing_ok=True)
     units = [item for item in existing.get("units", []) if item.get("tag") != tag]
-    units.append(
-        {
-            "tag": tag,
-            "primary_file": primary_path.name,
-            "secondary_file": sec_path.name,
-            "rows": int(primary.shape[0]),
-            "cols": int(primary.shape[1]),
-            "row_origin": int(row_origin),
-            "col_origin": int(col_origin),
-            "payload_digest": hashlib.sha256(
-                (_sha256(primary_path) + _sha256(sec_path)).encode()
-            ).hexdigest(),
-            "scientific_lineage": [dict(item) for item in (scientific_lineage or ())],
-            "phase_state": dict(phase_state) if phase_state is not None else None,
-        }
-    )
+    unit_record = {
+        "tag": tag,
+        "primary_file": primary_path.name,
+        "secondary_file": sec_path.name,
+        "rows": int(primary.shape[0]),
+        "cols": int(primary.shape[1]),
+        "row_origin": int(row_origin),
+        "col_origin": int(col_origin),
+        "payload_digest": hashlib.sha256(
+            (_sha256(primary_path) + _sha256(sec_path)).encode()
+        ).hexdigest(),
+        "scientific_lineage": [dict(item) for item in (scientific_lineage or ())],
+        "phase_state": dict(phase_state) if phase_state is not None else None,
+    }
+    if phase_path is not None:
+        unit_record["phase_screen_file"] = phase_path.name
+        unit_record["phase_screen_digest"] = phase_digest
+    units.append(unit_record)
+    flatten_stage = str((phase_state or {}).get("flatten_stage", "coregistration"))
+    if flatten_stage not in {"coregistration", "interferogram"}:
+        reject_invalid_state("scene flatten_stage is unsupported")
     unsigned = {
         "schema_version": SCENE_SCHEMA,
         "status": "complete",
@@ -503,6 +603,7 @@ def write_scene_unit(
         "grid_shape": list(resolved_grid_shape),
         "wavelength_m": wavelength_m,
         "grid_identity": resolved_grid_identity,
+        "flatten_stage": flatten_stage,
         "units": sorted(units, key=lambda item: str(item["tag"])),
     }
     manifest = {
@@ -543,6 +644,7 @@ def copy_reference_units(source: str | Path, target: str | Path) -> None:
             grid_identity=source_store.grid_identity,
             scientific_lineage=unit.scientific_lineage,
             phase_state=unit.phase_state,
+            phase_screen=None,
             validate_existing_payloads=False,
         )
 
@@ -608,6 +710,7 @@ def form_merged_scene_interferogram(
     goldstein_alpha: float = 0.0,
     device: str = "auto",
     dask_client: object | None = None,
+    flatten_stage: str = "coregistration",
 ) -> InterferogramProduct:
     """Form one common-grid complex IFG from all persisted scene units.
 
@@ -627,6 +730,8 @@ def form_merged_scene_interferogram(
         Azimuth and range boxcar look factors aligned to global origins.
     goldstein_alpha : float, optional
         Goldstein filter exponent. Zero disables filtering.
+    flatten_stage : {"coregistration", "interferogram"}, optional
+        Stage at which the NISAR range-offset phase screen is applied.
     device : str, optional
         Numerical device policy for the qualified Goldstein stage.
     dask_client : object, optional
@@ -648,6 +753,13 @@ def form_merged_scene_interferogram(
         reject_invalid_state("scene artifact radar wavelengths do not match")
     if primary_store.grid_identity != secondary_store.grid_identity:
         reject_invalid_state("scene artifact coordinate grids do not match")
+    if flatten_stage not in {"coregistration", "interferogram"}:
+        reject_invalid_state("unsupported interferogram flattening stage")
+    if (
+        primary_store.flatten_stage != flatten_stage
+        or secondary_store.flatten_stage != flatten_stage
+    ):
+        reject_invalid_state("scene artifacts mix flattening stages")
     _validate_nisar_geo_ownership(primary_store)
     _validate_nisar_geo_ownership(secondary_store)
     primary_units = primary_store.unit_map()
@@ -678,6 +790,26 @@ def form_merged_scene_interferogram(
                 reject_invalid_state("unsupported scene payload role")
             primary = primary_ref if primary_role == "primary" else primary_sec
             secondary = secondary_ref if secondary_role == "primary" else secondary_sec
+            if flatten_stage == "interferogram":
+                primary_screen = (
+                    primary_store.read_phase_screen(tag)
+                    if primary_role == "secondary"
+                    else None
+                )
+                secondary_screen = (
+                    secondary_store.read_phase_screen(tag)
+                    if secondary_role == "secondary"
+                    else None
+                )
+                if primary_screen is None:
+                    primary_screen = np.zeros(primary.shape, dtype=np.float32)
+                if secondary_screen is None:
+                    secondary_screen = np.zeros(secondary.shape, dtype=np.float32)
+                screen = secondary_screen - primary_screen
+                # Multiplying the secondary by exp(+j screen) makes the
+                # resulting native IFG carry the required exp(-j screen)
+                # before the Pair kernel performs multilooking.
+                secondary = secondary * np.exp(1j * screen)
             product = form_interferogram(
                 primary,
                 secondary,
@@ -749,6 +881,22 @@ def form_merged_scene_interferogram(
             if primary_role not in valid_roles or secondary_role not in valid_roles:
                 reject_invalid_state("unsupported scene payload role")
             ifg = primary * np.conjugate(secondary)
+            if flatten_stage == "interferogram":
+                primary_screen = (
+                    primary_store.read_phase_screen(tag)
+                    if primary_role == "secondary"
+                    else None
+                )
+                secondary_screen = (
+                    secondary_store.read_phase_screen(tag)
+                    if secondary_role == "secondary"
+                    else None
+                )
+                if primary_screen is None:
+                    primary_screen = np.zeros(primary.shape, dtype=np.float32)
+                if secondary_screen is None:
+                    secondary_screen = np.zeros(secondary.shape, dtype=np.float32)
+                ifg *= np.exp(-1j * (secondary_screen - primary_screen))
             primary_power = primary.real**2 + primary.imag**2
             secondary_power = secondary.real**2 + secondary.imag**2
             valid = np.isfinite(ifg.real) & np.isfinite(ifg.imag) & (np.abs(ifg) > 0)

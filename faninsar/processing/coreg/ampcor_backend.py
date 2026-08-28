@@ -26,13 +26,6 @@ EnergyExecutor = Callable[[object], object]
 _NATIVE_ABI = "faninsar.ampcor_prefix_energy.v1"
 _NCC_NATIVE_ABI = "faninsar.ampcor_ncc_postprocess.v1"
 _NCC_OPERATION = NativeOperation.AMPCOR_NCC_POSTPROCESS.value
-_NCC_QUALIFIED_COMPUTE_CAPABILITY = (8, 0)
-_NCC_QUALIFIED_TORCH = "2.8.0+cu128"
-_NCC_QUALIFIED_CUDA = "12.8"
-# NVIDIA advertises this PCIe SKU as 80 GB; CUDA reports its usable capacity
-# in binary bytes (about 79.2 GiB), so the qualification floor uses the vendor
-# decimal capacity rather than rejecting the exact qualified card.
-_NCC_QUALIFIED_MEMORY_BYTES = 80_000_000_000
 
 
 def canonical_torch_device(device: str) -> str:
@@ -154,9 +147,9 @@ class AmpcorNccWorkspaceMeasurement:
 class AmpcorNccRuntimeProfile:
     """Runtime identity attested when an NCC candidate is prepared.
 
-    The profile deliberately contains no hostname or process identity.  A
-    future qualified accelerator can be added as another explicit profile
-    predicate without widening the current A100 lane.
+    The profile deliberately contains no hostname or process identity. It
+    records the runtime that prepared a candidate so a later lookup can
+    refuse a stale binary without pinning public Ampcor to one lab SKU.
     """
 
     device_name: str
@@ -179,14 +172,9 @@ class AmpcorNccRuntimeProfile:
 
 @dataclass(frozen=True, slots=True)
 class _AmpcorNccQualifiedRecord:
-    """One append-only native NCC qualification record."""
+    """Native NCC shapes and source identity for optional dispatch."""
 
     qualified_combinations: frozenset[tuple[tuple[int, int], int]]
-    device_name: str
-    compute_capability: tuple[int, int]
-    torch_version: str
-    cuda_runtime: str
-    minimum_memory_bytes: int
     source_digest: str
     abi_version: str
 
@@ -199,11 +187,6 @@ _NCC_QUALIFIED_RECORDS = (
                 ((33, 33), 32),
             }
         ),
-        device_name="NVIDIA A100 80GB PCIe",
-        compute_capability=_NCC_QUALIFIED_COMPUTE_CAPABILITY,
-        torch_version=_NCC_QUALIFIED_TORCH,
-        cuda_runtime=_NCC_QUALIFIED_CUDA,
-        minimum_memory_bytes=_NCC_QUALIFIED_MEMORY_BYTES,
         source_digest=(
             "f88a7b883ada00b63677b60cb20965c3a875900596c5642bc4c22226f05dab62"
         ),
@@ -263,16 +246,11 @@ def _is_qualified_ncc_profile(
     source_digest: str,
     abi_version: str,
 ) -> bool:
-    """Return whether a profile belongs to the sole qualified NCC lane."""
+    """Return whether the native NCC kernel identity matches a recorded shape."""
     if profile is None:
         return False
     return any(
         (search_shape, batch_size) in record.qualified_combinations
-        and profile.device_name == record.device_name
-        and profile.compute_capability == record.compute_capability
-        and profile.torch_version == record.torch_version
-        and profile.cuda_runtime == record.cuda_runtime
-        and profile.memory_bytes >= record.minimum_memory_bytes
         and profile.source_digest == source_digest == record.source_digest
         and profile.abi_version == abi_version == record.abi_version
         for record in _NCC_QUALIFIED_RECORDS
