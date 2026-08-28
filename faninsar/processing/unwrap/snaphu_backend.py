@@ -12,7 +12,13 @@ import numpy as np
 from faninsar.capabilities import snaphu_capability
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import ProcessingContractError, reject_invalid_state
-from faninsar.processing.unwrap.common import CommonUnwrapResult, build_common_result
+from faninsar.processing.unwrap.common import (
+    CommonUnwrapResult,
+    SpatialUnwrapper,
+    SpatialUnwrapResult,
+    build_common_result,
+)
+from faninsar.processing.unwrap.errors import NoValidSupportError
 
 logger = setup_logger(__name__)
 
@@ -31,6 +37,225 @@ class SnaphuConfig:
     nlooks: float = 1.0
     ntiles: tuple[int, int] = (1, 1)
     nproc: int = 1
+
+
+class Snaphu(SpatialUnwrapper):
+    """Adapt the SNAPHU spatial backend to the Torch spatial seam.
+
+    Parameters
+    ----------
+    config : SnaphuConfig, optional
+        Typed configuration passed to ``snaphu-py``.
+
+    Notes
+    -----
+    The adapter accepts Torch tensors and performs the only NumPy boundary in
+    this strategy around the external SNAPHU package. It never falls back to
+    another unwrapper. Input tensors are returned on their original device.
+
+    """
+
+    def __init__(self, config: SnaphuConfig | None = None) -> None:
+        """Store the explicit SNAPHU configuration."""
+        self.config = config or SnaphuConfig()
+
+    def unwrap(
+        self,
+        wrapped_phase: Any,
+        *,
+        coherence: Any | None = None,
+        valid_mask: Any | None = None,
+    ) -> SpatialUnwrapResult:
+        """Unwrap one 2-D Torch phase tensor with SNAPHU.
+
+        Parameters
+        ----------
+        wrapped_phase : torch.Tensor
+            Wrapped phase in radians, ordered ``(azimuth, range)``.
+        coherence : torch.Tensor, optional
+            Finite values in ``[0, 1]``. Nonfinite values remove support.
+        valid_mask : torch.Tensor, optional
+            Boolean support mask matching ``wrapped_phase``.
+
+        Returns
+        -------
+        SpatialUnwrapResult
+            The parsed SNAPHU phase and deterministic spatial diagnostics.
+
+        Raises
+        ------
+        NoValidSupportError
+            If no input pixel is supported.
+        SnaphuNotAvailableError
+            If the external SNAPHU package is unavailable.
+        ValueError
+            If tensor inputs violate the spatial contract.
+
+        """
+        import torch
+
+        self._validate_tensors(wrapped_phase, coherence, valid_mask)
+        support = torch.isfinite(wrapped_phase)
+        if valid_mask is not None:
+            support &= valid_mask
+        if coherence is not None:
+            finite = torch.isfinite(coherence)
+            finite_values = coherence[finite]
+            if torch.any(finite_values < 0) or torch.any(finite_values > 1):
+                raise ValueError("coherence finite values must be within [0, 1]")
+            support &= finite
+            backend_coherence = torch.nan_to_num(coherence, nan=0.0)
+        else:
+            backend_coherence = torch.ones_like(wrapped_phase)
+        if not bool(torch.any(support)):
+            logger.error("SNAPHU input has no valid support")
+            raise NoValidSupportError
+
+        phase = torch.remainder(wrapped_phase + torch.pi, 2 * torch.pi) - torch.pi
+        if coherence is None:
+            coherence = backend_coherence
+        try:
+            backend_result = snaphu_unwrap(
+                torch.exp(1j * torch.nan_to_num(phase)).detach().cpu().numpy(),
+                backend_coherence.detach().cpu().numpy(),
+                config=self.config,
+            )
+        except SnaphuNotAvailableError:
+            raise
+        except Exception:
+            logger.exception("SNAPHU backend failed")
+            return self._failed_result(phase, support)
+
+        output = torch.as_tensor(
+            backend_result.unwrapped_phase,
+            dtype=phase.dtype,
+            device=phase.device,
+        )
+        output_valid = support & torch.isfinite(output)
+        if tuple(output.shape) != tuple(phase.shape) or not bool(
+            torch.all(torch.isfinite(output[output_valid]))
+        ):
+            logger.error("SNAPHU returned malformed or nonfinite output")
+            return self._failed_result(phase, support)
+        labels, references, active_h, active_v = self._labels_and_edges(
+            phase, output_valid, coherence
+        )
+        residual = self._residual_norm(phase, output, active_h, active_v)
+        output = output.clone()
+        output[~output_valid] = torch.nan
+        return SpatialUnwrapResult(
+            phase=output,
+            valid_mask=output_valid,
+            component_labels=labels,
+            reference_values=references,
+            converged=True,
+            iterations=0,
+            pcg_iterations=0,
+            residual_norm=residual,
+            failure_reason=None,
+        )
+
+    @staticmethod
+    def _validate_tensors(phase: Any, coherence: Any, valid_mask: Any) -> None:
+        """Validate Torch tensor shape, dtype, and device constraints."""
+        import torch
+
+        if not isinstance(phase, torch.Tensor) or phase.ndim != 2:
+            raise ValueError("wrapped_phase must be a 2-D torch tensor")
+        if not phase.is_floating_point() or phase.is_complex():
+            raise ValueError("wrapped_phase must be a real floating tensor")
+        for name, value in (("coherence", coherence), ("valid_mask", valid_mask)):
+            if value is not None and not isinstance(value, torch.Tensor):
+                raise ValueError(f"{name} must be a torch tensor")
+            if value is not None and value.shape != phase.shape:
+                raise ValueError(f"{name} must match wrapped_phase shape")
+            if value is not None and value.device != phase.device:
+                raise ValueError(f"{name} must share wrapped_phase device")
+        if coherence is not None and not coherence.is_floating_point():
+            raise ValueError("coherence must be a floating tensor")
+        if valid_mask is not None and valid_mask.dtype is not torch.bool:
+            raise ValueError("valid_mask must have dtype torch.bool")
+
+    @staticmethod
+    def _labels_and_edges(
+        phase: Any,
+        support: Any,
+        coherence: Any,
+    ) -> tuple[Any, Any, Any, Any]:
+        """Build row-major support labels and positive-quality edge masks."""
+        import torch
+
+        height, width = phase.shape
+        active_h = support[:, :-1] & support[:, 1:]
+        active_v = support[:-1, :] & support[1:, :]
+        if coherence is not None:
+            active_h &= coherence[:, :-1] > 0
+            active_h &= coherence[:, 1:] > 0
+            active_v &= coherence[:-1, :] > 0
+            active_v &= coherence[1:, :] > 0
+        parent = list(range(height * width))
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        for row, col in zip(*torch.where(active_h), strict=True):
+            union(int(row) * width + int(col), int(row) * width + int(col) + 1)
+        for row, col in zip(*torch.where(active_v), strict=True):
+            union(int(row) * width + int(col), int(row) * width + int(col) + width)
+        labels = torch.full_like(support, -1, dtype=torch.int64)
+        anchors: list[int] = []
+        root_labels: dict[int, int] = {}
+        for index in range(height * width):
+            row, col = divmod(index, width)
+            if not bool(support[row, col]):
+                continue
+            root = find(index)
+            label = root_labels.setdefault(root, len(root_labels))
+            labels[row, col] = label
+            if label == len(anchors):
+                anchors.append(index)
+        anchor_tensor = torch.as_tensor(anchors, device=phase.device)
+        return labels, phase.flatten()[anchor_tensor], active_h, active_v
+
+    @staticmethod
+    def _residual_norm(phase: Any, output: Any, active_h: Any, active_v: Any) -> float:
+        """Compute active-edge wrapped-gradient residual norm."""
+        import torch
+
+        def wrap(values: Any) -> Any:
+            return torch.remainder(values + torch.pi, 2 * torch.pi) - torch.pi
+
+        residual_h = output[:, 1:] - output[:, :-1] - wrap(phase[:, 1:] - phase[:, :-1])
+        residual_v = output[1:, :] - output[:-1, :] - wrap(phase[1:, :] - phase[:-1, :])
+        values = torch.cat((residual_h[active_h], residual_v[active_v]))
+        return float(torch.linalg.vector_norm(values)) if values.numel() else 0.0
+
+    @staticmethod
+    def _failed_result(phase: Any, support: Any) -> SpatialUnwrapResult:
+        """Return a closed failed result after an admitted backend failure."""
+        import torch
+
+        labels = torch.full_like(phase, -1, dtype=torch.int64)
+        output = torch.full_like(phase, torch.nan)
+        return SpatialUnwrapResult(
+            phase=output,
+            valid_mask=torch.zeros_like(support, dtype=torch.bool),
+            component_labels=labels,
+            reference_values=torch.empty(0, dtype=phase.dtype, device=phase.device),
+            converged=False,
+            iterations=0,
+            pcg_iterations=0,
+            residual_norm=float("inf"),
+            failure_reason="backend_failure",
+        )
 
 
 def snaphu_available() -> bool:

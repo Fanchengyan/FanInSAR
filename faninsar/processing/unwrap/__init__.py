@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 from .api import UnwrapBackend, unwrap
-from .common import CommonUnwrapResult, UnwrapMethod, build_common_result
-from .irls import IRLSUnwrapResult, irls_unwrap, wrap_phase
+from .common import (
+    CommonUnwrapResult,
+    SpatialUnwrapper,
+    SpatialUnwrapResult,
+    UnwrapMethod,
+    build_common_result,
+)
+from .errors import NoValidSupportError, UnwrapFailedError
+from .irls import IRLSUnwrapResult, SpatialIRLS, irls_unwrap, wrap_phase
 from .quality import (
     MetricDistribution,
     StackQualityCriteria,
@@ -19,6 +26,7 @@ from .reconcile import (
     reconcile_components,
 )
 from .snaphu_backend import (
+    Snaphu,
     SnaphuConfig,
     SnaphuNotAvailableError,
     snaphu_available,
@@ -32,14 +40,20 @@ __all__ = [
     "ComponentCorrection",
     "IRLSUnwrapResult",
     "MetricDistribution",
+    "NoValidSupportError",
     "ReconciliationResult",
+    "Snaphu",
     "SnaphuConfig",
     "SnaphuNotAvailableError",
+    "SpatialIRLS",
+    "SpatialUnwrapResult",
+    "SpatialUnwrapper",
     "StackQualityCriteria",
     "StackQualityReport",
     "StackUnwrapResult",
     "TemporalUnwrapResult",
     "UnwrapBackend",
+    "UnwrapFailedError",
     "UnwrapMethod",
     "align_components_to_reference",
     "build_common_result",
