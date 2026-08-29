@@ -17,10 +17,18 @@ PROJECT_ROOT = Path(__file__).parents[1]
 
 def test_base_import_does_not_load_snaphu() -> None:
     """Given a base import, when inspected, then snaphu remains unloaded."""
-    # Given / When: FanInSAR was imported while collecting this test module.
-
-    # Then
-    assert "snaphu" not in sys.modules
+    result = run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import faninsar; assert 'snaphu' not in sys.modules",
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stderr == ""
 
 
 def test_unwrap_dispatcher_does_not_load_optional_snaphu_adapter() -> None:
