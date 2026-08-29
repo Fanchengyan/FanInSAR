@@ -45,7 +45,8 @@ def unwrap(
     snaphu_config : SnaphuConfig, optional
         Configuration for the snaphu backend.
     irls_kwargs : dict, optional
-        Extra keyword arguments for :func:`irls_unwrap`.
+        Extra keyword arguments for :class:`~.irls.SpatialIRLS`. The
+        ``device`` entry selects the Torch device before input conversion.
 
     Returns
     -------

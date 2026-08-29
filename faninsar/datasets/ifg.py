@@ -46,8 +46,10 @@ class StackInterferogramDataset:
     ----------
     complex_ifg : numpy.ndarray
         Complex wrapped interferogram samples.
-    coherence : numpy.ndarray
-        Dimensionless coherence values, normally in ``[0, 1]``.
+    coherence : numpy.ndarray or None
+        Optional dimensionless coherence values, normally in ``[0, 1]``.
+        A missing persisted layer remains ``None``; it does not remove phase
+        support or cause the Dataset to synthesize a coherence raster.
     wrapped_phase : numpy.ndarray
         Wrapped phase in radians.
     amplitude : numpy.ndarray
@@ -57,14 +59,18 @@ class StackInterferogramDataset:
 
     Notes
     -----
-    The current IFG writer predates the explicit persisted mask.  Until that
-    writer is upgraded, the mask is derived from finite values as a narrow
-    read-only fallback; a persisted ``valid_mask.npy`` takes precedence.
+    All rasters use ``(azimuth, range)`` order and are eagerly loaded as NumPy
+    arrays. ``wrapped_phase`` is in radians; coherence is dimensionless and
+    expected in ``[0, 1]``; amplitude and complex IFG use the product's native
+    normalized units. The current IFG writer predates the explicit persisted
+    mask. Until that writer is upgraded, the mask is derived from finite values
+    as a narrow read-only fallback; a persisted ``valid_mask.npy`` takes
+    precedence.
 
     """
 
     complex_ifg: np.ndarray
-    coherence: np.ndarray
+    coherence: np.ndarray | None
     wrapped_phase: np.ndarray
     amplitude: np.ndarray
     valid_mask: np.ndarray
@@ -87,9 +93,14 @@ class StackInterferogramDataset:
 
         Raises
         ------
+        TypeError
+            If ``store`` is not an opened artifact store with a generation
+            root.
         ValueError
-            If the store has no generation root, a layer is malformed, or
-            layer shapes do not agree.
+            If a named layer is missing, malformed, non-finite in a required
+            structural field, has the wrong dtype, or layer shapes do not
+            agree. A persisted ``valid_mask`` must be boolean and match the
+            common ``(azimuth, range)`` shape.
 
         """
         generation_root = getattr(store, "generation_root", None)
@@ -112,16 +123,21 @@ class StackInterferogramDataset:
             return np.asarray(array)
 
         complex_ifg = load("complex_ifg")
-        coherence = load("coherence")
+        coherence_path = generation_root / "coherence.npy"
+        coherence = load("coherence") if coherence_path.is_file() else None
         wrapped_phase = load("wrapped_phase")
         amplitude = load("amplitude")
-        arrays = (coherence, wrapped_phase, amplitude)
-        if complex_ifg.dtype.kind != "c" or any(
-            array.dtype.kind != "f" for array in arrays
+        arrays = (wrapped_phase, amplitude)
+        if (
+            complex_ifg.dtype.kind != "c"
+            or any(array.dtype.kind != "f" for array in arrays)
+            or (coherence is not None and coherence.dtype.kind != "f")
         ):
             message = "Stack IFG Dataset layer dtypes are incompatible"
             raise ValueError(message)
-        if any(array.shape != complex_ifg.shape for array in arrays):
+        if any(array.shape != complex_ifg.shape for array in arrays) or (
+            coherence is not None and coherence.shape != complex_ifg.shape
+        ):
             message = "Stack IFG Dataset layers must share one shape"
             raise ValueError(message)
 
@@ -134,10 +150,11 @@ class StackInterferogramDataset:
         else:
             valid_mask = (
                 np.isfinite(complex_ifg)
-                & np.isfinite(coherence)
                 & np.isfinite(wrapped_phase)
                 & np.isfinite(amplitude)
             )
+            if coherence is not None:
+                valid_mask &= np.isfinite(coherence)
         return cls(
             complex_ifg=complex_ifg,
             coherence=coherence,

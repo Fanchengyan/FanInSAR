@@ -104,7 +104,15 @@ class SpatialUnwrapResult:
 
 
 class SpatialUnwrapper(ABC):
-    """Abstract strategy for unwrapping one spatial interferometric pair."""
+    """Abstract strategy for one spatial interferometric pair.
+
+    Implementations consume a two-dimensional Torch tensor in
+    ``(azimuth, range)`` order and return :class:`SpatialUnwrapResult` on the
+    same device. This seam intentionally covers spatial unwrapping only;
+    temporal/network or composite orchestration is outside this interface.
+    A strategy may use any numerical backend, but it must preserve the input
+    shape and report unsupported pixels through the result mask and NaNs.
+    """
 
     @abstractmethod
     def unwrap(
@@ -114,4 +122,32 @@ class SpatialUnwrapper(ABC):
         coherence: torch.Tensor | None = None,
         valid_mask: torch.Tensor | None = None,
     ) -> SpatialUnwrapResult:
-        """Unwrap one 2-D phase tensor without changing its device."""
+        """Unwrap one 2-D phase tensor without changing its device.
+
+        Parameters
+        ----------
+        wrapped_phase : torch.Tensor
+            Phase in radians, shape ``(azimuth, range)``. It must be a real
+            floating tensor and remain on its original Torch device.
+        coherence : torch.Tensor, optional
+            Dimensionless quality values in ``[0, 1]`` with the same shape.
+            ``None`` means uniform quality; finite zero values may disconnect
+            incident graph edges while retaining their pixels.
+        valid_mask : torch.Tensor, optional
+            Boolean authoritative support mask in ``(azimuth, range)`` order.
+            ``None`` means the finite phase support is authoritative.
+
+        Returns
+        -------
+        SpatialUnwrapResult
+            Same-shape, same-device phase, support mask, component labels,
+            reference anchors, and numerical diagnostics.
+
+        Raises
+        ------
+        NoValidSupportError
+            If no pixel remains supported for the selected algorithm.
+        ValueError
+            If shape, dtype, device, or quality bounds are invalid.
+
+        """

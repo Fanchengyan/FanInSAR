@@ -69,7 +69,39 @@ class PhaseFilter(ABC):
         *,
         valid_mask: torch.Tensor | None = None,
     ) -> PhaseFilterResult:
-        """Filter a 2-D ``(azimuth, range)`` tensor without device transfer."""
+        """Filter a 2-D ``(azimuth, range)`` tensor without device transfer.
+
+        Parameters
+        ----------
+        interferogram : torch.Tensor
+            Complex wrapped-interferogram samples. Shape is
+            ``(azimuth, range)``; amplitudes are dimensionless in the stored
+            normalized product convention.
+        valid_mask : torch.Tensor, optional
+            Boolean input support mask. ``None`` derives support from finite
+            real and imaginary samples. Invalid samples are not made valid by
+            filtering.
+
+        Returns
+        -------
+        PhaseFilterResult
+            Filtered complex raster with the input shape, dtype family, and
+            device, plus a mask that is a subset of the input support.
+
+        Raises
+        ------
+        ValueError
+            If the input is not a two-dimensional complex tensor or the mask
+            does not match its shape, dtype, or device.
+
+        Notes
+        -----
+        This is a runtime strategy object. Custom subclasses are trusted
+        Python objects and are not serialized or reconstructed from product
+        metadata. Built-ins document their own window units and boundary
+        rules.
+
+        """
 
     def describe(self) -> FilterProvenance:
         """Return inert provenance; custom strategies default to ``custom``."""
@@ -122,7 +154,14 @@ class GoldsteinWerner(PhaseFilter):
         *,
         valid_mask: torch.Tensor | None = None,
     ) -> PhaseFilterResult:
-        """Apply spectral weighting with Torch on the input device."""
+        """Apply Goldstein-Werner spectral weighting.
+
+        Invalid input holes are zero-filled inside each zero-padded square
+        FFT patch, while the returned mask keeps those holes invalid. Patches
+        use half-patch stride and triangular overlap-add; image tails are
+        retained through zero padding. The output remains on the input Torch
+        device and has the same ``(azimuth, range)`` shape.
+        """
         support = _validate_input(interferogram, valid_mask)
         height, width = interferogram.shape
         patch = self.patch_size
@@ -252,7 +291,12 @@ class BoxcarFilter(_SpatialFilter):
     def apply(
         self, interferogram: torch.Tensor, *, valid_mask: torch.Tensor | None = None
     ) -> PhaseFilterResult:
-        """Apply clipped, valid-weighted boxcar convolution."""
+        """Apply valid-weighted clipped boxcar convolution.
+
+        The window is an odd ``(azimuth, range)`` size in pixels. Edge windows
+        are clipped by the valid-weight denominator; unsupported input pixels
+        remain invalid in the returned mask.
+        """
         support = _validate_input(interferogram, valid_mask)
         kernel = torch.ones(
             self.window, dtype=interferogram.real.dtype, device=interferogram.device
@@ -312,7 +356,13 @@ class GaussianFilter(_SpatialFilter):
     def apply(
         self, interferogram: torch.Tensor, *, valid_mask: torch.Tensor | None = None
     ) -> PhaseFilterResult:
-        """Apply clipped valid-weighted separable Gaussian convolution."""
+        """Apply valid-weighted separable Gaussian convolution.
+
+        ``sigma`` is measured in pixels as ``(azimuth, range)`` standard
+        deviation. The radius is ``ceil(truncate * sigma)`` in each axis.
+        Edges are handled by valid-weighted clipped convolution, and the
+        returned support never includes an invalid input pixel.
+        """
         support = _validate_input(interferogram, valid_mask)
         radii = tuple(math.ceil(self.truncate * value) for value in self.sigma)
         axes = [

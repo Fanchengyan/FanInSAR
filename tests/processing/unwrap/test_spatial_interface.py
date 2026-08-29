@@ -124,3 +124,20 @@ def test_spatial_irls_uses_dct_preconditioner_for_each_pcg_solve(
     assert result.pcg_iterations > 0
     assert calls["dct"] > 0
     assert calls["idct"] > 0
+
+
+def test_unwrap_package_has_no_temporal_or_legacy_composite_exports() -> None:
+    """The MVP package exposes only the spatial result and strategy seam."""
+    import faninsar.processing.unwrap as unwrap_package
+
+    for name in (
+        "IRLSUnwrapResult",
+        "irls_unwrap",
+        "StackUnwrapResult",
+        "unwrap_stack",
+        "TemporalUnwrapResult",
+        "unwrap_temporal_irls",
+        "StackQualityCriteria",
+        "reconcile_components",
+    ):
+        assert not hasattr(unwrap_package, name)

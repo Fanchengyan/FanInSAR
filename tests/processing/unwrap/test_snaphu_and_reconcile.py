@@ -7,13 +7,15 @@ import pytest
 
 from faninsar.processing.unwrap import (
     SnaphuNotAvailableError,
-    align_components_to_reference,
-    loop_closure_phase,
-    reconcile_components,
     snaphu_available,
     snaphu_unwrap,
     unwrap,
     wrap_phase,
+)
+from faninsar.processing.unwrap.reconcile import (
+    align_components_to_reference,
+    loop_closure_phase,
+    reconcile_components,
 )
 
 
