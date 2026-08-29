@@ -2890,7 +2890,7 @@ def stage_unwrap(
         "spatial_unwrap_and_residual_screen",
         (unwrap_input,),
         (state.unwrapped_phase, state.complex_ifg_flat),
-        method=result.method,
+        method=method,
         residual_screen_applied=applied,
     )
     return state
