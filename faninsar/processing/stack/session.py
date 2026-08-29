@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ParamSpec, Self, TypeVar
+from typing import TYPE_CHECKING, Any, NoReturn, ParamSpec, Self, TypeVar
 
 import numpy as np
 
@@ -65,6 +65,8 @@ from faninsar.processing.stack.scene_store import (
     copy_reference_units,
     form_merged_scene_interferogram,
 )
+from faninsar.processing.unwrap.errors import UnwrapFailedError
+from faninsar.processing.unwrap.irls import SpatialIRLS
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -90,6 +92,7 @@ if TYPE_CHECKING:
     from faninsar.processing.stack.provider import StackSceneProvider
     from faninsar.processing.stack.stack_generation import StackResultGeneration
     from faninsar.processing.timeseries.inversion import TimeSeriesResult
+    from faninsar.processing.unwrap.common import SpatialUnwrapper
     from faninsar.processing.unwrap.quality import StackQualityCriteria
     from faninsar.processing.unwrap.stack import SpatialExecutor, StackUnwrapResult
     from faninsar.query import BoundingBox, Polygons
@@ -97,6 +100,7 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 _DEFAULT_PHASE_FILTER = GoldsteinWerner(alpha=0.5, patch_size=32)
+_DEFAULT_UNWRAPPER = SpatialIRLS()
 
 
 def _phase_filter_metadata(  # noqa: PLR0911
@@ -159,6 +163,15 @@ def _phase_filter_metadata(  # noqa: PLR0911
             )
             return "custom", {}
     return name, dict(parameters)
+
+
+def _raise_unwrap_failed(
+    message: str,
+    result: Any | None = None,
+) -> NoReturn:
+    """Raise the typed Stack boundary error after logging its cause."""
+    logger.error(message)
+    raise UnwrapFailedError(message, result)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -522,6 +535,7 @@ class Stack(Network):
     unwrap_result: StackUnwrapResult | None = None
     _prepared: bool = False
     _generation: StackResultGeneration | None = field(default=None, repr=False)
+    _unwrap_generation: Any | None = field(default=None, repr=False)
     _network_generation_id: str | None = field(default=None, repr=False)
     _network_product_index: NetworkProductIndex | None = field(default=None, repr=False)
 
@@ -1732,8 +1746,290 @@ class Stack(Network):
         NetworkContract.refresh_generation(self, generation_id, products)
         return self
 
+    def _refresh_network_from_unwrap_generation(self, generation: Any) -> None:
+        """Refresh Network products from one committed spatial unwrap root.
+
+        The root generation is the durable authority for unwrapped products.
+        Existing IFG product records supply the shared acquisition and grid
+        metadata; this method only adds the newly committed spatial layers.
+        """
+        from faninsar.processing.stack.stack_generation import UnwrapResultGeneration
+
+        if not isinstance(generation, UnwrapResultGeneration):
+            logger.error("Stack unwrap refresh received an invalid generation")
+            message = "generation must be an UnwrapResultGeneration"
+            raise TypeError(message)
+        index = self.network_product_index
+        if index is None:
+            self._refresh_network_from_ifg_dirs()
+            index = self.network_product_index
+        if index is None:
+            reject_invalid_state("Stack unwrap refresh has no IFG Network products")
+        dimensions = self.config.extra
+        frame = str(dimensions.get("frame_id", "stack"))
+        swath = str(dimensions.get("swath", "merged"))
+        channel = str(dimensions.get("channel", "merged"))
+        polarization = str(dimensions.get("polarization", "merged"))
+        products = [
+            product
+            for product in index.products
+            if product.key.product_kind is not AssetKind.UNWRAPPED_PHASE
+        ]
+        for pair_id in generation.pair_ids:
+            try:
+                primary, secondary = pair_id.split("_", 1)
+            except ValueError as error:
+                reject_invalid_state(f"Stack unwrap Pair id is invalid: {pair_id!r}")
+                raise AssertionError from error
+            source = next(
+                (
+                    product
+                    for product in products
+                    if product.primary.acquisition_id == primary
+                    and product.secondary.acquisition_id == secondary
+                    and product.key.product_kind is AssetKind.COMPLEX_INTERFEROGRAM
+                ),
+                None,
+            )
+            if source is None:
+                reject_invalid_state(
+                    f"Stack unwrap has no IFG Network product for Pair {pair_id}"
+                )
+            key = NetworkProductKey(
+                AcquisitionKey(primary, frame, swath, channel, polarization),
+                AcquisitionKey(secondary, frame, swath, channel, polarization),
+                AssetKind.UNWRAPPED_PHASE,
+            )
+            products.append(
+                NetworkProduct(
+                    key=key,
+                    asset_location=str(
+                        generation.generation_root / pair_id / "unwrapped_phase.npy"
+                    ),
+                    geometry_identity=source.geometry_identity,
+                    source_software="faninsar",
+                    phase_convention=PhaseConvention.PRIMARY_MINUS_SECONDARY,
+                    asset_transform=AssetTransform.for_convention(
+                        AssetKind.UNWRAPPED_PHASE,
+                        PhaseConvention.PRIMARY_MINUS_SECONDARY,
+                    ),
+                    content_digest=generation.manifest_digest,
+                    lineage=(
+                        source.content_digest or source.canonical,
+                        generation.manifest_digest,
+                    ),
+                )
+            )
+        generation_id = _network_generation_digest(
+            [product.content_digest or product.canonical for product in products],
+            [generation.manifest_digest],
+        )
+        self._refresh_network_generation(generation_id, products)
+
+    def refresh_unwrap_generation(self) -> Self:
+        """Rebuild the Network cache from the durable ``UNWRAP_CURRENT`` root."""
+        from faninsar.processing.stack.stack_generation import open_unwrap_generation
+
+        generation = open_unwrap_generation(self.config.work_dir)
+        previous = self._unwrap_generation
+        try:
+            self._refresh_network_from_unwrap_generation(generation)
+        except Exception:
+            generation.close()
+            raise
+        self._unwrap_generation = generation
+        if previous is not None:
+            previous.close()
+        return self
+
     @_reclaim_after_stage
     def unwrap(
+        self,
+        unwrapper: SpatialUnwrapper = _DEFAULT_UNWRAPPER,
+    ) -> Self:
+        """Spatially unwrap every persisted interferogram in this Stack.
+
+        ``Stack`` owns pair iteration, Dataset materialization, and one atomic
+        root-generation publication.  ``unwrapper`` owns the numerical solve
+        for one two-dimensional pair.  The complete ordered Pair snapshot is
+        frozen at call entry; this method has no temporal/network options and
+        does not perform temporal reconciliation or time-series inversion.
+
+        Parameters
+        ----------
+        unwrapper : SpatialUnwrapper, default=SpatialIRLS()
+            Trusted runtime strategy for one pair.  The strategy receives
+            Torch tensors in ``(azimuth, range)`` order.  Its result must be a
+            same-shape, same-device :class:`SpatialUnwrapResult` whose valid
+            output is finite and is a subset of the Dataset support.
+
+        Returns
+        -------
+        Stack
+            This Stack after ``UNWRAP_CURRENT`` has been atomically advanced
+            and its Network cache rebuilt from that durable generation.
+
+        Raises
+        ------
+        ValueError
+            If the Pair set, IFG Dataset, or unwrapper result violates the
+            scientific shape, dtype, mask, or finite-value contract.
+        NoValidSupportError, ResourceAdmissionError
+            Propagated from the selected unwrapper before numerical work.
+        UnwrapFailedError
+            If an admitted strategy fails, returns ``converged=False``, or
+            publication cannot complete.  The failed result, when available,
+            is attached as ``error.result`` and is never published.
+
+        Notes
+        -----
+        IFG stores are pinned before Dataset reads and remain open for the
+        whole call.  The result generation contains all expected Pairs under
+        one Stack-root ``UNWRAP_CURRENT`` pointer; no partial Pair result is
+        visible.  Normal Dataset reads do not recompute payload hashes.
+
+        """
+        import torch
+
+        from faninsar._core.device import parse_device
+        from faninsar.datasets.ifg import StackInterferogramDataset
+        from faninsar.processing.resources import ResourceAdmissionError
+        from faninsar.processing.stack.stack_generation import (
+            publish_unwrap_generation,
+        )
+        from faninsar.processing.unwrap.common import (
+            SpatialUnwrapper,
+            SpatialUnwrapResult,
+        )
+        from faninsar.processing.unwrap.errors import (
+            NoValidSupportError,
+            UnwrapFailedError,
+        )
+
+        if not isinstance(unwrapper, SpatialUnwrapper):
+            logger.error("Stack unwrap requires a SpatialUnwrapper instance")
+            message = "unwrapper must be a SpatialUnwrapper"
+            raise TypeError(message)
+
+        expected_pairs = tuple(_iter_pair_dates(self.pairs))
+        if not expected_pairs or len(set(expected_pairs)) != len(expected_pairs):
+            reject_invalid_state(
+                "Stack unwrap requires a non-empty, unique Pair network"
+            )
+        pair_ids = tuple(
+            f"{primary}_{secondary}" for primary, secondary in expected_pairs
+        )
+        stores = self._pair_artifact_stores(
+            looks=self.config.multilook,
+            ifg_root=None,
+        )
+        device = parse_device(self.config.device)
+        products: dict[str, dict[str, np.ndarray]] = {}
+        failed_result: SpatialUnwrapResult | None = None
+        try:
+            for pair_id, store in zip(pair_ids, stores, strict=True):
+                dataset = StackInterferogramDataset.from_generation(store)
+                wrapped_phase = torch.as_tensor(
+                    dataset.wrapped_phase,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                coherence = None
+                if bool(np.any(np.isfinite(dataset.coherence))):
+                    coherence = torch.as_tensor(
+                        dataset.coherence,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                valid_mask = torch.as_tensor(
+                    dataset.valid_mask,
+                    dtype=torch.bool,
+                    device=device,
+                )
+                try:
+                    result = unwrapper.unwrap(
+                        wrapped_phase,
+                        coherence=coherence,
+                        valid_mask=valid_mask,
+                    )
+                except (NoValidSupportError, ResourceAdmissionError):
+                    raise
+                except Exception as error:
+                    logger.exception("Stack spatial unwrap failed for %s", pair_id)
+                    message = f"spatial unwrap failed for Pair {pair_id}"
+                    raise UnwrapFailedError(message) from error
+                failed_result = (
+                    result if isinstance(result, SpatialUnwrapResult) else None
+                )
+                if not isinstance(result, SpatialUnwrapResult):
+                    logger.error(
+                        "spatial unwrapper returned an invalid result for %s",
+                        pair_id,
+                    )
+                    message = (
+                        "spatial unwrapper returned an invalid result for Pair "
+                        f"{pair_id}"
+                    )
+                    _raise_unwrap_failed(message)
+                support = torch.isfinite(wrapped_phase) & valid_mask
+                if coherence is not None:
+                    support &= torch.isfinite(coherence)
+                if result.phase.shape != wrapped_phase.shape:
+                    _raise_unwrap_failed(
+                        f"spatial unwrapper changed shape for Pair {pair_id}", result
+                    )
+                if (
+                    result.phase.device != device
+                    or result.valid_mask.device != device
+                ):
+                    _raise_unwrap_failed(
+                        f"spatial unwrapper changed device for Pair {pair_id}", result
+                    )
+                if bool(torch.any(result.valid_mask & ~support)):
+                    _raise_unwrap_failed(
+                        f"spatial unwrapper expanded support for Pair {pair_id}",
+                        result,
+                    )
+                if bool(torch.any(~torch.isfinite(result.phase[result.valid_mask]))):
+                    _raise_unwrap_failed(
+                        "spatial unwrapper returned nonfinite valid phase for "
+                        f"Pair {pair_id}",
+                        result,
+                    )
+                if not result.converged or result.failure_reason is not None:
+                    _raise_unwrap_failed(
+                        f"spatial unwrap did not converge for Pair {pair_id}",
+                        result,
+                    )
+                products[pair_id] = {
+                    "unwrapped_phase": result.phase.detach().cpu().numpy(),
+                    "valid_mask": result.valid_mask.detach().cpu().numpy(),
+                    "component_labels": result.component_labels.detach().cpu().numpy(),
+                    "reference_values": result.reference_values.detach().cpu().numpy(),
+                }
+            generation = publish_unwrap_generation(
+                self.config.work_dir,
+                pair_ids=pair_ids,
+                products=products,
+            )
+            previous = self._unwrap_generation
+            self._unwrap_generation = generation
+            if previous is not None:
+                previous.close()
+            self._refresh_network_from_unwrap_generation(generation)
+        except (NoValidSupportError, ResourceAdmissionError, UnwrapFailedError):
+            raise
+        except Exception as error:
+            logger.exception("Stack unwrap generation failed")
+            message = "Stack unwrap generation failed"
+            raise UnwrapFailedError(message, failed_result) from error
+        finally:
+            for store in stores:
+                store.close()
+        return self
+
+    @_reclaim_after_stage
+    def _legacy_temporal_unwrap(
         self,
         *,
         multilook: tuple[int, int] | None = None,
