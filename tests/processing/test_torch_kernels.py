@@ -300,6 +300,26 @@ def test_multilook_interferogram_torch_identical_slcs_unit_coherence() -> None:
     assert float(np.nanmax(np.abs(product.wrapped_phase))) < 1e-5
 
 
+def test_multilook_interferogram_torch_singleton_keeps_ifg_but_not_coherence() -> None:
+    """A one-sample look remains valid complex support without MLE coherence."""
+    primary = np.full((2, 2), np.nan + 1j * np.nan, dtype=np.complex64)
+    secondary = np.full((2, 2), np.nan + 1j * np.nan, dtype=np.complex64)
+    primary[0, 0] = 2.0 + 0.0j
+    secondary[0, 0] = 1.0 + 0.0j
+
+    product = multilook_interferogram_torch(
+        primary,
+        secondary,
+        multilook=(2, 2),
+        device="cpu",
+    )
+
+    assert product.valid_mask is not None
+    assert bool(product.valid_mask[0, 0])
+    assert product.complex_ifg[0, 0] == pytest.approx(2.0 + 0.0j)
+    assert np.isnan(product.coherence[0, 0])
+
+
 def test_goldstein_filter_torch_matches_numpy() -> None:
     """Torch Goldstein filter matches the NumPy ISCE2-port within tolerance."""
     ifg = _random_slc((64, 64), seed=31)

@@ -508,55 +508,60 @@ def multilook_interferogram_torch(
         dtype=complex_dtype,
         device=resolved,
     )
-    use_dead_mask = dead_pixel_amp_threshold > 0.0 and (az_looks > 1 or rg_looks > 1)
-
-    if az_looks == 1 and rg_looks == 1:
-        ifg = p * s.conj()
-        power_pri = (p.real**2 + p.imag**2).to(dtype=float_dtype)
-        power_sec = (s.real**2 + s.imag**2).to(dtype=float_dtype)
-    else:
-        height, width = p.shape
-        h = (height // az_looks) * az_looks
-        w = (width // rg_looks) * rg_looks
-        out_h = h // az_looks
-        out_w = w // rg_looks
-        pr = p[:h, :w].real.reshape(out_h, az_looks, out_w, rg_looks)
-        pi = p[:h, :w].imag.reshape(out_h, az_looks, out_w, rg_looks)
-        sr = s[:h, :w].real.reshape(out_h, az_looks, out_w, rg_looks)
-        si = s[:h, :w].imag.reshape(out_h, az_looks, out_w, rg_looks)
-        ir = pr * sr + pi * si
-        ii = pi * sr - pr * si
-        pp = pr * pr + pi * pi
-        ss = sr * sr + si * si
-        if use_dead_mask:
-            amp_p = torch.sqrt(torch.clamp(pp, min=0.0))
-            amp_s = torch.sqrt(torch.clamp(ss, min=0.0))
-            valid = (amp_p >= dead_pixel_amp_threshold) & (
-                amp_s >= dead_pixel_amp_threshold
-            )
-            wgt = valid.to(dtype=float_dtype)
-            w_sum = wgt.sum(dim=(1, 3))
-            safe_w = torch.where(
-                w_sum > 0,
-                w_sum,
-                torch.ones_like(w_sum),
-            )
-            ifg_real = (ir * wgt).sum(dim=(1, 3)) / safe_w
-            ifg_imag = (ii * wgt).sum(dim=(1, 3)) / safe_w
-            power_pri = (pp * wgt).sum(dim=(1, 3)) / safe_w
-            power_sec = (ss * wgt).sum(dim=(1, 3)) / safe_w
-        else:
-            inv_looks = 1.0 / float(az_looks * rg_looks)
-            ifg_real = ir.sum(dim=(1, 3)) * inv_looks
-            ifg_imag = ii.sum(dim=(1, 3)) * inv_looks
-            power_pri = pp.sum(dim=(1, 3)) * inv_looks
-            power_sec = ss.sum(dim=(1, 3)) * inv_looks
-        ifg = torch.complex(ifg_real, ifg_imag)
-        logger.info(
-            "Torch multilook %s -> output shape %s",
-            multilook,
-            tuple(ifg.shape),
-        )
+    # A look with one finite sample still has a meaningful complex average,
+    # but it cannot support a two-sample MLE coherence estimate.  Keep this
+    # distinction on the Torch path as on the NumPy reference: ``valid_mask``
+    # describes complex support, while coherence is NaN when the support count
+    # is below two.
+    height, width = p.shape
+    out_h = (height + az_looks - 1) // az_looks
+    out_w = (width + rg_looks - 1) // rg_looks
+    padded_height = out_h * az_looks
+    padded_width = out_w * rg_looks
+    finite_pair = torch.isfinite(p.real) & torch.isfinite(p.imag)
+    finite_pair &= torch.isfinite(s.real) & torch.isfinite(s.imag)
+    if dead_pixel_amp_threshold > 0.0:
+        finite_pair &= torch.abs(p) >= dead_pixel_amp_threshold
+        finite_pair &= torch.abs(s) >= dead_pixel_amp_threshold
+    zero_complex = torch.zeros((), dtype=complex_dtype, device=resolved)
+    p_clean = torch.where(finite_pair, p, zero_complex)
+    s_clean = torch.where(finite_pair, s, zero_complex)
+    padded_p = torch.zeros(
+        (padded_height, padded_width), dtype=complex_dtype, device=resolved
+    )
+    padded_s = torch.zeros_like(padded_p)
+    padded_valid = torch.zeros(
+        (padded_height, padded_width), dtype=torch.bool, device=resolved
+    )
+    padded_p[:height, :width] = p_clean
+    padded_s[:height, :width] = s_clean
+    padded_valid[:height, :width] = finite_pair
+    pr = padded_p.real.reshape(out_h, az_looks, out_w, rg_looks)
+    pi = padded_p.imag.reshape(out_h, az_looks, out_w, rg_looks)
+    sr = padded_s.real.reshape(out_h, az_looks, out_w, rg_looks)
+    si = padded_s.imag.reshape(out_h, az_looks, out_w, rg_looks)
+    valid_blocks = padded_valid.reshape(out_h, az_looks, out_w, rg_looks)
+    ir = pr * sr + pi * si
+    ii = pi * sr - pr * si
+    pp = pr * pr + pi * pi
+    ss = sr * sr + si * si
+    wgt = valid_blocks.to(dtype=float_dtype)
+    sample_counts = wgt.sum(dim=(1, 3))
+    safe_count = torch.where(
+        sample_counts > 0,
+        sample_counts,
+        torch.ones_like(sample_counts),
+    )
+    ifg_real = (ir * wgt).sum(dim=(1, 3)) / safe_count
+    ifg_imag = (ii * wgt).sum(dim=(1, 3)) / safe_count
+    power_pri = (pp * wgt).sum(dim=(1, 3)) / safe_count
+    power_sec = (ss * wgt).sum(dim=(1, 3)) / safe_count
+    ifg = torch.complex(ifg_real, ifg_imag)
+    logger.info(
+        "Torch multilook %s -> output shape %s",
+        multilook,
+        tuple(ifg.shape),
+    )
 
     denom = torch.sqrt(torch.clamp(power_pri * power_sec, min=1e-30))
     output_complex_dtype = np.result_type(primary.dtype, secondary.dtype)
@@ -575,7 +580,16 @@ def multilook_interferogram_torch(
         dtype=torch_output_float_dtype
     )
     amplitude = ifg.abs().to(dtype=torch_output_float_dtype)
-    invalid = (power_pri <= 0.0) | (power_sec <= 0.0) | ~torch.isfinite(power_pri)
+    valid_out = (
+        (sample_counts > 0)
+        & (power_pri > 0.0)
+        & (power_sec > 0.0)
+        & torch.isfinite(power_pri)
+        & torch.isfinite(power_sec)
+        & torch.isfinite(ifg.real)
+        & torch.isfinite(ifg.imag)
+    )
+    invalid = ~valid_out
     nan_complex = torch.tensor(
         complex(float("nan"), float("nan")),
         dtype=complex_dtype,
@@ -589,7 +603,11 @@ def multilook_interferogram_torch(
         dtype=torch_output_float_dtype,
         device=resolved,
     )
-    coherence_out = torch.where(invalid, nan_float, coherence)
+    coherence_out = torch.where(
+        invalid | (sample_counts < 2),
+        nan_float,
+        coherence,
+    )
     amplitude_out = torch.where(invalid, nan_float, amplitude)
     wrapped = ifg_out.angle()
     wrapped = torch.where(
@@ -608,6 +626,7 @@ def multilook_interferogram_torch(
         coherence=coherence_np,
         wrapped_phase=wrapped_np,
         amplitude=amplitude_np,
+        valid_mask=np.asarray(valid_out.cpu().numpy(), dtype=bool),
     )
 
 
