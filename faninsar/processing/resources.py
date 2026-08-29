@@ -24,6 +24,13 @@ class ResourceAdmissionError(RuntimeError):
     """Raised when a run cannot be admitted under its finite resource budget."""
 
 
+MAX_INPUT_PIXELS = 2**28
+"""Largest admitted two-dimensional raster size in pixels."""
+
+MAX_ESTIMATED_WORK = 2**36
+"""Largest admitted deterministic element-operation estimate."""
+
+
 def bootstrap_worker_runtime(thread_cap: int = 1) -> None:
     """Apply deterministic BLAS/Torch thread caps in a worker initializer.
 
@@ -130,6 +137,365 @@ class ResourceUsage:
     workers: int = 0
     processes: int = 0
     device_bytes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceEstimate:
+    """Deterministic byte and work estimate for a built-in processing stage.
+
+    Parameters
+    ----------
+    usage : ResourceUsage
+        Byte-class reservation required before the stage allocates arrays.
+    work : int
+        Conservative element-operation upper bound.  This value is checked
+        against :data:`MAX_ESTIMATED_WORK`; it is not a performance estimate.
+
+    Notes
+    -----
+    Estimates describe only FanInSAR built-in numerical paths.  A custom
+    runtime Python strategy remains trusted code and owns its own allocation
+    behaviour.
+
+    """
+
+    usage: ResourceUsage
+    work: int
+
+
+def _checked_integer(value: object, name: str, *, minimum: int = 0) -> int:
+    """Return a bounded integer or raise the sole resource admission error."""
+    if type(value) is not int or value < minimum:
+        _raise_resource_error(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _checked_add(*values: int, name: str) -> int:
+    """Add non-negative integer terms without exceeding the work ceiling."""
+    total = 0
+    for value in values:
+        _checked_integer(value, name)
+        total += value
+        if total > MAX_ESTIMATED_WORK:
+            _raise_resource_error(f"{name} exceeds the hard work ceiling")
+    return total
+
+
+def _checked_product(*values: int, name: str) -> int:
+    """Multiply non-negative integer terms with a fixed hard ceiling."""
+    product = 1
+    for value in values:
+        _checked_integer(value, name)
+        if value and product > MAX_ESTIMATED_WORK // value:
+            _raise_resource_error(f"{name} exceeds the hard work ceiling")
+        product *= value
+    return product
+
+
+def _ceil_dividend(dividend: int, divisor: int, *, name: str) -> int:
+    """Return a checked positive ceiling division result."""
+    _checked_integer(dividend, name, minimum=1)
+    _checked_integer(divisor, name, minimum=1)
+    return 1 + (dividend - 1) // divisor
+
+
+def _ceil_log2(value: int) -> int:
+    """Return ``ceil(log2(value))`` for a positive integer."""
+    _checked_integer(value, "logarithm argument", minimum=1)
+    return (value - 1).bit_length()
+
+
+def _checked_shape(shape: tuple[int, int]) -> tuple[int, int, int]:
+    """Validate a raster shape and return ``(height, width, pixels)``."""
+    if not isinstance(shape, tuple) or len(shape) != 2:
+        _raise_resource_error("resource estimate shape must be a two-dimensional tuple")
+    height = _checked_integer(shape[0], "shape height", minimum=1)
+    width = _checked_integer(shape[1], "shape width", minimum=1)
+    pixels = _checked_product(height, width, name="input pixels")
+    if pixels > MAX_INPUT_PIXELS:
+        _raise_resource_error("input pixels exceed the hard admission ceiling")
+    return height, width, pixels
+
+
+def _built_in_filter_work(
+    *,
+    output_pixels: int,
+    input_shape: tuple[int, int],
+    phase_filter: object | None,
+) -> tuple[int, int]:
+    """Return deterministic work and device bytes for one built-in filter.
+
+    Custom filters intentionally contribute neither term: they are trusted
+    runtime Python and are outside the deterministic admission promise.
+    """
+    if phase_filter is None:
+        return 0, 0
+    try:
+        from faninsar.processing.interferometry.phase_filter import (
+            BoxcarFilter,
+            GaussianFilter,
+            GoldsteinWerner,
+        )
+    except ImportError:  # pragma: no cover - imports are package-local
+        return 0, 0
+    if isinstance(phase_filter, GoldsteinWerner):
+        patch = _checked_integer(phase_filter.patch_size, "Goldstein patch", minimum=1)
+        step = patch // 2
+        height, width = input_shape
+        patches = _checked_product(
+            _ceil_dividend(height, step, name="Goldstein rows"),
+            _ceil_dividend(width, step, name="Goldstein columns"),
+            name="Goldstein patches",
+        )
+        patch_area = _checked_product(patch, patch, name="Goldstein patch area")
+        work = _checked_product(
+            2,
+            patches,
+            patch_area,
+            1 + _ceil_log2(patch_area),
+            name="Goldstein work",
+        )
+        # Input, overlap-add output, support, and one FFT patch's complex
+        # working buffers.  complex64 is the narrow on-device Stack contract.
+        device = _checked_add(
+            _checked_product(output_pixels, 17, name="Goldstein device bytes"),
+            _checked_product(patch_area, 32, name="Goldstein patch bytes"),
+            name="Goldstein device bytes",
+        )
+        return work, device
+    if isinstance(phase_filter, BoxcarFilter):
+        kernel = _checked_product(*phase_filter.window, name="boxcar kernel area")
+        return (
+            _checked_product(output_pixels, kernel, name="boxcar work"),
+            _checked_product(output_pixels, 25, name="boxcar device bytes"),
+        )
+    if isinstance(phase_filter, GaussianFilter):
+        import math
+
+        radii = tuple(
+            math.ceil(phase_filter.truncate * sigma) for sigma in phase_filter.sigma
+        )
+        kernel = _checked_product(
+            2 * radii[0] + 1,
+            2 * radii[1] + 1,
+            name="Gaussian kernel area",
+        )
+        return (
+            _checked_product(output_pixels, kernel, name="Gaussian work"),
+            _checked_product(output_pixels, 25, name="Gaussian device bytes"),
+        )
+    return 0, 0
+
+
+def estimate_formation_resources(
+    *,
+    shape: tuple[int, int],
+    multilook: tuple[int, int],
+    coherence_window: tuple[int, int] | None,
+    phase_filter: object | None,
+) -> ResourceEstimate:
+    """Estimate the built-in IFG formation live set before raster processing.
+
+    Parameters
+    ----------
+    shape : tuple[int, int]
+        Full-resolution ``(azimuth, range)`` scene grid.
+    multilook : tuple[int, int]
+        Positive output look factors.
+    coherence_window : tuple[int, int] or None
+        Centered first-stage coherence support, or direct output-block MLE.
+    phase_filter : object or None
+        Filter strategy.  Only built-in filters add a deterministic filter
+        workspace; custom trusted strategies are excluded.
+
+    Returns
+    -------
+    ResourceEstimate
+        Decoded/staged, temporary, device, and work reservations.
+
+    Raises
+    ------
+    ResourceAdmissionError
+        If dimensions or the conservative work estimate exceed hard limits.
+
+    """
+    height, width, pixels = _checked_shape(shape)
+    if not isinstance(multilook, tuple) or len(multilook) != 2:
+        _raise_resource_error("multilook must be a two-dimensional tuple")
+    azimuth = _checked_integer(multilook[0], "multilook azimuth", minimum=1)
+    range_ = _checked_integer(multilook[1], "multilook range", minimum=1)
+    block_area = _checked_product(azimuth, range_, name="multilook area")
+    output_rows = _ceil_dividend(height, azimuth, name="output rows")
+    output_cols = _ceil_dividend(width, range_, name="output columns")
+    output_pixels = _checked_product(output_rows, output_cols, name="output pixels")
+    formation_work = _checked_product(
+        2, output_pixels, block_area, name="formation work"
+    )
+    if coherence_window is None:
+        coherence_work = _checked_product(
+            output_pixels, block_area, name="direct coherence work"
+        )
+    else:
+        if not isinstance(coherence_window, tuple) or len(coherence_window) != 2:
+            _raise_resource_error("coherence_window must be a two-dimensional tuple")
+        window_area = _checked_product(
+            _checked_integer(coherence_window[0], "coherence azimuth", minimum=1),
+            _checked_integer(coherence_window[1], "coherence range", minimum=1),
+            name="coherence window area",
+        )
+        coherence_work = _checked_add(
+            _checked_product(pixels, window_area, name="window coherence work"),
+            _checked_product(output_pixels, block_area, name="look coherence work"),
+            name="coherence work",
+        )
+    filter_work, filter_device = _built_in_filter_work(
+        output_pixels=output_pixels,
+        input_shape=(output_rows, output_cols),
+        phase_filter=phase_filter,
+    )
+    work = _checked_add(
+        formation_work, coherence_work, filter_work, name="formation work"
+    )
+    # Two complex source rasters, output complex/float layers, and the
+    # persisted boolean support.  Counts are deliberately conservative.
+    decoded = _checked_add(
+        _checked_product(pixels, 16, name="formation decoded bytes"),
+        _checked_product(output_pixels, 21, name="formation decoded bytes"),
+        name="formation decoded bytes",
+    )
+    staged = _checked_product(output_pixels, 21, name="formation staged bytes")
+    temporary = _checked_add(
+        _checked_product(pixels, 24, name="formation temporary bytes"),
+        _checked_product(output_pixels, 24, name="formation temporary bytes"),
+        filter_device,
+        name="formation temporary bytes",
+    )
+    return ResourceEstimate(
+        usage=ResourceUsage(
+            files=5,
+            chunks=1,
+            encoded_bytes=staged,
+            decoded_bytes=decoded,
+            temporary_bytes=temporary,
+            device_bytes=filter_device,
+        ),
+        work=work,
+    )
+
+
+def estimate_unwrap_decode_resources(
+    *,
+    shape: tuple[int, int],
+    coherence_present: bool,
+) -> ResourceEstimate:
+    """Estimate Dataset decode and device conversion before unwrapping.
+
+    The concrete Stack Dataset reads complex IFG, wrapped phase, amplitude,
+    validity mask, and an optional float32 coherence layer.  Only wrapped
+    phase, optional coherence, and the support mask cross to the Stack device.
+    """
+    _, _, pixels = _checked_shape(shape)
+    decoded_per_pixel = 8 + 4 + 4 + 1 + (4 if coherence_present else 0)
+    decoded = _checked_product(pixels, decoded_per_pixel, name="unwrap decoded bytes")
+    device = _checked_product(
+        pixels,
+        4 + 1 + (4 if coherence_present else 0),
+        name="unwrap device bytes",
+    )
+    return ResourceEstimate(
+        usage=ResourceUsage(
+            files=5 if coherence_present else 4,
+            chunks=1,
+            decoded_bytes=decoded,
+            temporary_bytes=decoded,
+            device_bytes=device,
+        ),
+        work=0,
+    )
+
+
+def estimate_spatial_irls_resources(
+    *,
+    shape: tuple[int, int],
+    active_edges: int,
+    component_bbox_areas: tuple[int, ...],
+    max_iter: int,
+    cg_max_iter: int,
+    phase_itemsize: int = 4,
+) -> ResourceEstimate:
+    """Estimate component-aware DCT/PCG workspace after support decoding.
+
+    ``component_bbox_areas`` contains the bounding-box area of every active
+    connected component.  The reservation follows the documented
+    ``S * (6*B + 4*M)`` DCT/PCG live-set bound.
+    """
+    _, _, pixels = _checked_shape(shape)
+    edges = _checked_integer(active_edges, "active edges")
+    outer = _checked_integer(max_iter, "IRLS max_iter", minimum=1)
+    inner = _checked_integer(cg_max_iter, "IRLS cg_max_iter", minimum=1)
+    itemsize = _checked_integer(phase_itemsize, "phase itemsize", minimum=1)
+    if not component_bbox_areas:
+        _raise_resource_error("IRLS requires at least one component")
+    areas = tuple(
+        _checked_integer(area, "component bounding-box area", minimum=1)
+        for area in component_bbox_areas
+    )
+    total_area = _checked_add(*areas, name="component bounding-box area")
+    largest_area = max(areas)
+    workspace = _checked_product(
+        itemsize,
+        _checked_add(
+            _checked_product(6, total_area, name="IRLS workspace"),
+            _checked_product(4, largest_area, name="IRLS workspace"),
+            name="IRLS workspace",
+        ),
+        name="IRLS workspace bytes",
+    )
+    dct_work = _checked_product(
+        4,
+        total_area,
+        1 + _ceil_log2(max(1, largest_area)),
+        name="IRLS DCT work",
+    )
+    inner_work = _checked_add(
+        _checked_product(12, edges, name="IRLS edge work"),
+        _checked_product(8, pixels, name="IRLS pixel work"),
+        dct_work,
+        name="IRLS inner work",
+    )
+    work = _checked_add(
+        _checked_product(2, pixels, name="IRLS initial work"),
+        _checked_product(
+            outer,
+            _checked_add(
+                _checked_product(8, edges, name="IRLS outer edge work"),
+                _checked_product(8, pixels, name="IRLS outer pixel work"),
+                _checked_product(inner, inner_work, name="IRLS iterative work"),
+                name="IRLS outer work",
+            ),
+            name="IRLS solver work",
+        ),
+        name="IRLS solver work",
+    )
+    return ResourceEstimate(
+        usage=ResourceUsage(
+            chunks=len(areas),
+            temporary_bytes=workspace,
+            device_bytes=workspace,
+        ),
+        work=work,
+    )
+
+
+def reserve_estimate(
+    ledger: ResourceAdmissionLedger,
+    estimate: ResourceEstimate,
+) -> ResourceReservation:
+    """Reserve all byte classes represented by one checked estimate."""
+    return ledger.reserve(**{
+        name: getattr(estimate.usage, name)
+        for name in ResourceUsage.__dataclass_fields__
+    })
 
 
 @dataclass
@@ -523,6 +889,8 @@ def _raise_sampling_error(cause: BaseException) -> None:
 
 
 __all__ = [
+    "MAX_ESTIMATED_WORK",
+    "MAX_INPUT_PIXELS",
     "ProcessTreeAdmission",
     "ProcessTreeMemoryWatchdog",
     "ProcessTreeSampler",
@@ -531,7 +899,12 @@ __all__ = [
     "ResourceAdmissionError",
     "ResourceAdmissionLedger",
     "ResourceBudget",
+    "ResourceEstimate",
     "ResourceReservation",
     "ResourceUsage",
     "bootstrap_worker_runtime",
+    "estimate_formation_resources",
+    "estimate_spatial_irls_resources",
+    "estimate_unwrap_decode_resources",
+    "reserve_estimate",
 ]

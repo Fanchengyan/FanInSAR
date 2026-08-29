@@ -85,6 +85,7 @@ if TYPE_CHECKING:
         CoregistrationGrid,
         ProductionPairState,
     )
+    from faninsar.processing.resources import ResourceBudget
     from faninsar.processing.stack.ifg_store import (
         InterferogramArtifactStore,
         UnwrappedArtifact,
@@ -614,6 +615,7 @@ class Stack(Network):
         retain_pair_states: bool = False,
         record_scientific_lineage: bool = False,
         gpu_memory_reclaim: GpuMemoryReclaim = "adaptive",
+        resource_budget: ResourceBudget | None = None,
     ) -> Stack:
         """Construct a Stack from SAFE paths and optional pair graphs."""
         catalog = SceneCatalog.from_paths(list(paths))
@@ -663,6 +665,7 @@ class Stack(Network):
             retain_pair_states=retain_pair_states,
             record_scientific_lineage=record_scientific_lineage,
             gpu_memory_reclaim=gpu_memory_reclaim,
+            resource_budget=resource_budget,
         )
         return cls(
             catalog=catalog,
@@ -1452,6 +1455,12 @@ class Stack(Network):
         self._ensure_prepared()
         self._require_qualified_activation_record()
 
+        from faninsar.processing.resources import (
+            ResourceAdmissionLedger,
+            estimate_formation_resources,
+            reserve_estimate,
+        )
+
         use_pairs = pairs or self.pairs
         looks_list = _normalize_multilook(multilook or self.config.multilook)
         # ``goldstein_alpha`` remains an internal transition path for existing
@@ -1468,6 +1477,11 @@ class Stack(Network):
             Path(output_dir)
             if output_dir is not None
             else (self.config.work_dir / "ifg")
+        )
+        formation_ledger = (
+            ResourceAdmissionLedger(self.config.resource_budget, self.config.work_dir)
+            if self.config.resource_budget is not None
+            else None
         )
 
         for primary, secondary in _iter_pair_dates(use_pairs):
@@ -1542,23 +1556,36 @@ class Stack(Network):
                     reject_invalid_state(
                         "partial IFG artifact directory exists without a manifest"
                     )
-                product = form_merged_scene_interferogram(
-                    primary_store,
-                    secondary_store,
-                    primary_role=(
-                        "primary" if primary == self.reference else "secondary"
-                    ),
-                    secondary_role=(
-                        "primary" if secondary == self.reference else "secondary"
-                    ),
-                    multilook=looks,
-                    goldstein_alpha=alpha,
-                    coherence_window=selected_coherence_window,
-                    phase_filter=selected_filter,
-                    device=self.config.device,
-                    dask_client=self.dask_client,
-                    flatten_stage=flatten_stage,
-                )
+                reservation = None
+                if formation_ledger is not None:
+                    estimate = estimate_formation_resources(
+                        shape=primary_store.grid_shape,
+                        multilook=looks,
+                        coherence_window=selected_coherence_window,
+                        phase_filter=selected_filter,
+                    )
+                    reservation = reserve_estimate(formation_ledger, estimate)
+                try:
+                    product = form_merged_scene_interferogram(
+                        primary_store,
+                        secondary_store,
+                        primary_role=(
+                            "primary" if primary == self.reference else "secondary"
+                        ),
+                        secondary_role=(
+                            "primary" if secondary == self.reference else "secondary"
+                        ),
+                        multilook=looks,
+                        goldstein_alpha=alpha,
+                        coherence_window=selected_coherence_window,
+                        phase_filter=selected_filter,
+                        device=self.config.device,
+                        dask_client=self.dask_client,
+                        flatten_stage=flatten_stage,
+                    )
+                finally:
+                    if reservation is not None:
+                        reservation.release()
                 from faninsar.processing.stack.ifg_store import write_ifg_artifact
 
                 write_ifg_artifact(
@@ -1893,7 +1920,13 @@ class Stack(Network):
 
         from faninsar._core.device import parse_device
         from faninsar.datasets.ifg import StackInterferogramDataset
-        from faninsar.processing.resources import ResourceAdmissionError
+        from faninsar.processing.resources import (
+            ResourceAdmissionError,
+            ResourceAdmissionLedger,
+            estimate_spatial_irls_resources,
+            estimate_unwrap_decode_resources,
+            reserve_estimate,
+        )
         from faninsar.processing.stack.stack_generation import (
             publish_unwrap_generation,
         )
@@ -1926,38 +1959,93 @@ class Stack(Network):
         device = parse_device(self.config.device)
         products: dict[str, dict[str, np.ndarray]] = {}
         failed_result: SpatialUnwrapResult | None = None
+        unwrap_ledger = (
+            ResourceAdmissionLedger(self.config.resource_budget, self.config.work_dir)
+            if self.config.resource_budget is not None
+            else None
+        )
         try:
             for pair_id, store in zip(pair_ids, stores, strict=True):
-                dataset = StackInterferogramDataset.from_generation(store)
-                wrapped_phase = torch.as_tensor(
-                    dataset.wrapped_phase,
-                    dtype=torch.float32,
-                    device=device,
-                )
-                coherence = None
-                if bool(np.any(np.isfinite(dataset.coherence))):
-                    coherence = torch.as_tensor(
-                        dataset.coherence,
+                decode_reservation = None
+                solver_reservation = None
+                if unwrap_ledger is not None:
+                    decode_reservation = reserve_estimate(
+                        unwrap_ledger,
+                        estimate_unwrap_decode_resources(
+                            shape=store.shape,
+                            coherence_present="coherence" in store._payloads,
+                        ),
+                    )
+                try:
+                    dataset = StackInterferogramDataset.from_generation(store)
+                    wrapped_phase = torch.as_tensor(
+                        dataset.wrapped_phase,
                         dtype=torch.float32,
                         device=device,
                     )
-                valid_mask = torch.as_tensor(
-                    dataset.valid_mask,
-                    dtype=torch.bool,
-                    device=device,
-                )
-                try:
-                    result = unwrapper.unwrap(
-                        wrapped_phase,
-                        coherence=coherence,
-                        valid_mask=valid_mask,
+                    coherence = None
+                    if dataset.coherence is not None and bool(
+                        np.any(np.isfinite(dataset.coherence))
+                    ):
+                        coherence = torch.as_tensor(
+                            dataset.coherence,
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                    valid_mask = torch.as_tensor(
+                        dataset.valid_mask,
+                        dtype=torch.bool,
+                        device=device,
                     )
-                except (NoValidSupportError, ResourceAdmissionError):
-                    raise
-                except Exception as error:
-                    logger.exception("Stack spatial unwrap failed for %s", pair_id)
-                    message = f"spatial unwrap failed for Pair {pair_id}"
-                    raise UnwrapFailedError(message) from error
+                    if unwrap_ledger is not None and isinstance(unwrapper, SpatialIRLS):
+                        support = torch.isfinite(wrapped_phase) & valid_mask
+                        if coherence is not None:
+                            support &= torch.isfinite(coherence)
+                        labels, anchors, horizontal, vertical = unwrapper._graph(
+                            support, coherence
+                        )
+                        if int(anchors.numel()) > 0:
+                            areas: list[int] = []
+                            for component in range(int(anchors.numel())):
+                                rows, columns = torch.where(labels == component)
+                                if int(rows.numel()) == 0:
+                                    continue
+                                height = int(rows.max().item() - rows.min().item() + 1)
+                                width = int(
+                                    columns.max().item() - columns.min().item() + 1
+                                )
+                                areas.append(height * width)
+                            active_edges = int(
+                                horizontal[2].sum().item() + vertical[2].sum().item()
+                            )
+                            solver_reservation = reserve_estimate(
+                                unwrap_ledger,
+                                estimate_spatial_irls_resources(
+                                    shape=tuple(wrapped_phase.shape),
+                                    active_edges=active_edges,
+                                    component_bbox_areas=tuple(areas),
+                                    max_iter=unwrapper.max_iter,
+                                    cg_max_iter=unwrapper.cg_max_iter,
+                                    phase_itemsize=wrapped_phase.element_size(),
+                                ),
+                            )
+                    try:
+                        result = unwrapper.unwrap(
+                            wrapped_phase,
+                            coherence=coherence,
+                            valid_mask=valid_mask,
+                        )
+                    except (NoValidSupportError, ResourceAdmissionError):
+                        raise
+                    except Exception as error:
+                        logger.exception("Stack spatial unwrap failed for %s", pair_id)
+                        message = f"spatial unwrap failed for Pair {pair_id}"
+                        raise UnwrapFailedError(message) from error
+                finally:
+                    if solver_reservation is not None:
+                        solver_reservation.release()
+                    if decode_reservation is not None:
+                        decode_reservation.release()
                 failed_result = (
                     result if isinstance(result, SpatialUnwrapResult) else None
                 )

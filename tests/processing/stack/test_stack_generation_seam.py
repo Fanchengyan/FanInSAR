@@ -55,6 +55,34 @@ def test_stack_dataset_reads_named_fields_from_pinned_generation(
     store.close()
 
 
+def test_stack_dataset_preserves_missing_optional_coherence(
+    tmp_path: Path,
+) -> None:
+    """A pinned generation may intentionally omit the coherence layer."""
+    complex_ifg = np.ones((2, 3), dtype=np.complex64)
+    store = write_ifg_artifact(
+        tmp_path / "ifg_without_coherence",
+        pair=("20240101", "20240113"),
+        looks=(1, 1),
+        filter_name="none",
+        filter_parameters={},
+        source_manifest_digests={"reference": "a" * 64, "secondary": "b" * 64},
+        complex_ifg=complex_ifg,
+        coherence=None,
+        wrapped_phase=np.zeros((2, 3), dtype=np.float32),
+        amplitude=np.ones((2, 3), dtype=np.float32),
+    )
+    try:
+        dataset = StackInterferogramDataset.from_generation(store)
+        assert dataset.coherence is None
+        np.testing.assert_array_equal(
+            dataset.valid_mask, np.ones((2, 3), dtype=bool)
+        )
+        assert store.read().coherence is None
+    finally:
+        store.close()
+
+
 def test_unwrap_generation_round_trip_is_one_complete_pair_snapshot(
     tmp_path: Path,
 ) -> None:

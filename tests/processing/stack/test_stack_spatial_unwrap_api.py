@@ -5,9 +5,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pytest
 import torch
 
 from faninsar import Pairs
+from faninsar.processing.resources import ResourceAdmissionError, ResourceBudget
 from faninsar.processing.stack import Stack
 from faninsar.processing.stack.ifg_store import write_ifg_artifact
 from faninsar.processing.unwrap.common import SpatialUnwrapper, SpatialUnwrapResult
@@ -104,3 +106,25 @@ def test_stack_unwrap_public_signature_has_no_temporal_controls() -> None:
     parameters = inspect.signature(Stack.unwrap).parameters
     assert tuple(parameters)[:2] == ("self", "unwrapper")
     assert not any(name.startswith("temporal") for name in parameters)
+
+
+def test_stack_unwrap_rejects_decode_before_dataset_materialization(
+    tmp_path: Path,
+) -> None:
+    """A configured budget rejects the pinned Dataset decode before dispatch."""
+    stack = _stack_with_ifg(tmp_path)
+    stack.config.resource_budget = ResourceBudget(
+        max_files=8,
+        max_chunks=8,
+        max_encoded_bytes=1024,
+        max_decoded_bytes=1,
+        max_temporary_bytes=1024,
+        max_workers=1,
+        max_processes=1,
+        disk_reserve_bytes=1,
+        max_rss_bytes=4 * 1024 * 1024 * 1024,
+        max_device_bytes=1024,
+    )
+
+    with pytest.raises(ResourceAdmissionError, match="decoded_bytes"):
+        stack.unwrap(_IdentityUnwrapper())

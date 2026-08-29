@@ -35,6 +35,9 @@ _IFG_FILENAMES = {
     "wrapped_phase": "wrapped_phase.npy",
     "amplitude": "amplitude.npy",
 }
+_REQUIRED_IFG_FILENAMES = {
+    name: filename for name, filename in _IFG_FILENAMES.items() if name != "coherence"
+}
 _VALID_MASK_FILENAME = "valid_mask.npy"
 _PHASE_SCREEN_MANIFEST_FIELDS = frozenset(
     {
@@ -306,13 +309,16 @@ class InterferogramArtifact:
 
     Attributes
     ----------
-    complex_ifg, coherence, wrapped_phase, amplitude : numpy.ndarray
+    complex_ifg, wrapped_phase, amplitude : numpy.ndarray
         Hash-validated product layers sharing one grid.
+    coherence : numpy.ndarray or None
+        Optional hash-validated coherence layer.  A generation created without
+        this layer is valid and represents unavailable coherence explicitly.
 
     """
 
     complex_ifg: np.ndarray
-    coherence: np.ndarray
+    coherence: np.ndarray | None
     wrapped_phase: np.ndarray
     amplitude: np.ndarray
     valid_mask: np.ndarray | None = None
@@ -541,20 +547,28 @@ class InterferogramArtifactStore:
             reject_invalid_state("phase-screen digests require a phase-screen model")
         shape = _validate_shape(manifest.get("shape"), "shape")
         raw_payloads = manifest["payloads"]
+        if not isinstance(raw_payloads, dict):
+            reject_invalid_state("artifact payload table is incomplete")
         payloads = _validate_payload_table(
             opened.path,
-            (
-                {
-                    name: raw_payloads[name]
-                    for name in _IFG_FILENAMES
-                }
-                if isinstance(raw_payloads, dict)
-                else raw_payloads
-            ),
-            _IFG_FILENAMES,
+            {
+                name: raw_payloads[name]
+                for name in _REQUIRED_IFG_FILENAMES
+                if name in raw_payloads
+            },
+            _REQUIRED_IFG_FILENAMES,
             shape,
         )
-        if isinstance(raw_payloads, dict) and "valid_mask" in raw_payloads:
+        if "coherence" in raw_payloads:
+            payloads.update(
+                _validate_payload_table(
+                    opened.path,
+                    {"coherence": raw_payloads["coherence"]},
+                    {"coherence": _IFG_FILENAMES["coherence"]},
+                    shape,
+                )
+            )
+        if "valid_mask" in raw_payloads:
             payloads.update(
                 _validate_payload_table(
                     opened.path,
@@ -606,7 +620,10 @@ class InterferogramArtifactStore:
         arrays = _read_payloads(self.generation_root, self._payloads)
         if arrays["complex_ifg"].dtype.kind != "c" or any(
             arrays[name].dtype.kind != "f"
-            for name in ("coherence", "wrapped_phase", "amplitude")
+            for name in ("wrapped_phase", "amplitude")
+        ) or (
+            arrays.get("coherence") is not None
+            and arrays["coherence"].dtype.kind != "f"
         ):
             reject_invalid_state("artifact IFG layer dtypes are incompatible")
         valid_mask = arrays.get("valid_mask")
@@ -614,7 +631,7 @@ class InterferogramArtifactStore:
             reject_invalid_state("artifact IFG valid_mask dtype is incompatible")
         return InterferogramArtifact(
             complex_ifg=arrays["complex_ifg"],
-            coherence=arrays["coherence"],
+            coherence=arrays.get("coherence"),
             wrapped_phase=arrays["wrapped_phase"],
             amplitude=arrays["amplitude"],
             valid_mask=valid_mask,
@@ -700,7 +717,7 @@ def write_ifg_artifact(
     phase_screen_domain: str | None = None,
     phase_screen_grid_identity: str | None = None,
     complex_ifg: np.ndarray,
-    coherence: np.ndarray,
+    coherence: np.ndarray | None,
     wrapped_phase: np.ndarray,
     amplitude: np.ndarray,
     valid_mask: np.ndarray | None = None,
@@ -746,8 +763,11 @@ def write_ifg_artifact(
         Hard publication size, file-count, and free-space limits.
     replace_existing : bool, optional
         Publish a new immutable generation and advance ``CURRENT`` when true.
-    complex_ifg, coherence, wrapped_phase, amplitude : numpy.ndarray
-        Matching two-dimensional IFG product layers.
+    complex_ifg, wrapped_phase, amplitude : numpy.ndarray
+        Matching two-dimensional required IFG product layers.
+    coherence : numpy.ndarray, optional
+        Optional matching coherence layer.  ``None`` preserves the explicit
+        absence of coherence for a downstream spatial unwrapper.
     valid_mask : numpy.ndarray, optional
         Boolean authoritative support mask. If omitted, finite complex support
         is used when publishing the artifact.
@@ -760,10 +780,11 @@ def write_ifg_artifact(
     """
     arrays = {
         "complex_ifg": np.asarray(complex_ifg),
-        "coherence": np.asarray(coherence),
         "wrapped_phase": np.asarray(wrapped_phase),
         "amplitude": np.asarray(amplitude),
     }
+    if coherence is not None:
+        arrays["coherence"] = np.asarray(coherence)
     if valid_mask is not None:
         arrays["valid_mask"] = np.asarray(valid_mask)
     shapes = {array.shape for array in arrays.values()}
@@ -774,7 +795,9 @@ def write_ifg_artifact(
         reject_invalid_state("IFG artifact layers must be non-empty 2-D arrays")
     if arrays["complex_ifg"].dtype.kind != "c" or any(
         arrays[name].dtype.kind != "f"
-        for name in ("coherence", "wrapped_phase", "amplitude")
+        for name in ("wrapped_phase", "amplitude")
+    ) or (
+        coherence is not None and arrays["coherence"].dtype.kind != "f"
     ):
         reject_invalid_state("IFG artifact layer dtypes are incompatible")
     if valid_mask is not None and arrays["valid_mask"].dtype != np.bool_:
@@ -873,6 +896,8 @@ def write_ifg_artifact(
             reject_invalid_state("IFG artifact generation is already published")
         descriptors: dict[str, dict[str, Any]] = {}
         for name, filename in _IFG_FILENAMES.items():
+            if name not in arrays:
+                continue
             payload_path = staging / filename
             _atomic_save(payload_path, arrays[name])
             descriptors[name] = _array_descriptor(payload_path, arrays[name])

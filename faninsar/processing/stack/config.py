@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from faninsar.logging import setup_logger
+from faninsar.processing.resources import ResourceBudget
 
 if TYPE_CHECKING:
     from faninsar._core.device import GpuMemoryReclaim
@@ -63,11 +64,18 @@ class StackConfig:
     retain_pair_states: bool = False
     record_scientific_lineage: bool = False
     gpu_memory_reclaim: GpuMemoryReclaim = "adaptive"
+    resource_budget: ResourceBudget | None = None
     extra: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize path and multilook types."""
         self.work_dir = Path(self.work_dir)
+        if self.resource_budget is not None and not isinstance(
+            self.resource_budget, ResourceBudget
+        ):
+            message = "resource_budget must be a ResourceBudget or None"
+            logger.error(message)
+            raise ValueError(message)
         if self.flatten_stage not in {"coregistration", "interferogram"}:
             message = (
                 "flatten_stage must be 'coregistration' or 'interferogram'; "
