@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
+
 from .api import UnwrapBackend, unwrap
 from .common import (
     SpatialUnwrapper,
@@ -22,14 +25,16 @@ from .reconcile import (
     loop_closure_phase,
     reconcile_components,
 )
-from .snaphu_backend import (
-    Snaphu,
-    SnaphuConfig,
-    SnaphuNotAvailableError,
-    snaphu_available,
-    snaphu_unwrap,
-)
 from .stack import StackUnwrapResult, unwrap_stack
+
+if TYPE_CHECKING:
+    from .snaphu_backend import (
+        Snaphu,
+        SnaphuConfig,
+        SnaphuNotAvailableError,
+        snaphu_available,
+        snaphu_unwrap,
+    )
 
 __all__ = [
     "ComponentCorrection",
@@ -59,3 +64,19 @@ __all__ = [
     "unwrap_stack",
     "wrap_phase",
 ]
+
+_SNAPHU_EXPORTS = {
+    "Snaphu",
+    "SnaphuConfig",
+    "SnaphuNotAvailableError",
+    "snaphu_available",
+    "snaphu_unwrap",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load the optional SNAPHU adapter only when its API is requested."""
+    if name in _SNAPHU_EXPORTS:
+        backend = import_module("faninsar.processing.unwrap.snaphu_backend")
+        return getattr(backend, name)
+    raise AttributeError(name)

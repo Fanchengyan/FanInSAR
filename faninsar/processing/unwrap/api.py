@@ -9,10 +9,10 @@ import numpy as np
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.unwrap.irls import SpatialIRLS, _resolve_device
-from faninsar.processing.unwrap.snaphu_backend import Snaphu, SnaphuConfig
 
 if TYPE_CHECKING:
     from faninsar.processing.unwrap.common import SpatialUnwrapResult
+    from faninsar.processing.unwrap.snaphu_backend import SnaphuConfig
 
 logger = setup_logger(__name__)
 
@@ -81,6 +81,11 @@ def unwrap(
             coherence=coherence_tensor,
         )
     if method == "snaphu":
+        # Keep the optional backend out of the import graph until it is
+        # explicitly selected.  In particular, importing the dispatcher for
+        # IRLS must not load the external snaphu package or its adapter.
+        from faninsar.processing.unwrap.snaphu_backend import Snaphu
+
         if not np.iscomplexobj(wrapped_or_complex):
             reject_invalid_state(
                 "snaphu backend requires a complex interferogram input"

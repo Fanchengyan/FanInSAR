@@ -23,6 +23,26 @@ def test_base_import_does_not_load_snaphu() -> None:
     assert "snaphu" not in sys.modules
 
 
+def test_unwrap_dispatcher_does_not_load_optional_snaphu_adapter() -> None:
+    """Importing the core dispatcher leaves the optional adapter unloaded."""
+    result = run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import faninsar.processing.unwrap.api; "
+                "assert 'faninsar.processing.unwrap.snaphu_backend' "
+                "not in sys.modules; assert 'snaphu' not in sys.modules"
+            ),
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stderr == ""
+
+
 def test_capability_output_separates_availability_and_license_caveat() -> None:
     """Given capability output, then availability and licensing are distinct."""
     # Given / When
