@@ -45,7 +45,7 @@ class StackConfig:
     flatten_stage: FlattenStage = "coregistration"
     coregistration_grid: CoregistrationGrid = "radar"
     esd_method: EsdMethod = "auto"
-    multilook: tuple[int, int] = (2, 10)
+    multilook: tuple[int, int] = (5, 2)
     goldstein_alpha: float = 0.5
     executor: str = "torch"
     device: str = "auto"

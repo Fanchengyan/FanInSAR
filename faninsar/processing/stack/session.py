@@ -46,6 +46,7 @@ from faninsar.processing.coreg.misreg_network import (
     invert_pair_misregistration,
 )
 from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.interferometry.pair import validate_coherence_window
 from faninsar.processing.interferometry.phase_filter import (
     FilterProvenance,
     GoldsteinWerner,
@@ -595,7 +596,7 @@ class Stack(Network):
         coreg_mode: CoregMode = "pair",
         flatten_stage: FlattenStage = "coregistration",
         coregistration_grid: CoregistrationGrid = "radar",
-        multilook: tuple[int, int] = (2, 10),
+        multilook: tuple[int, int] = (5, 2),
         goldstein_alpha: float = 0.5,
         esd_method: EsdMethod = "auto",
         swaths: tuple[str, ...] = ("IW1",),
@@ -1446,12 +1447,80 @@ class Stack(Network):
         output_dir: str | Path | None = None,
         overwrite: bool = False,
     ) -> Self:
-        """Form interferograms from persisted Reference-aligned scene artifacts.
+        """Form wrapped interferograms from persisted Reference-aligned scenes.
 
+        Parameters
+        ----------
+        pairs : Pairs, optional
+            Pair graph to form. ``None`` uses the Stack graph fixed at
+            construction. Pair endpoints are acquisition dates; their order is
+            canonicalized by :class:`~faninsar.core.pairs.Pairs`.
+        multilook : tuple[int, int] or list[tuple[int, int]], optional
+            One or more true boxcar look factors in ``(azimuth, range)``
+            pixels. ``None`` uses :attr:`StackConfig.multilook`, whose default
+            is ``(5, 2)``. Each result is aligned to the common scene-grid
+            origin. Scene-grid edge coverage and incomplete look support are
+            represented by the validity mask rather than interpolation.
+        coherence_window : tuple[int, int] or None, default=(5, 5)
+            Odd, centered ``(azimuth, range)`` MLE support, with each axis at
+            least three pixels. This selects the ISCE2-like first stage: a
+            stride-one, clipped local coherence image followed by multilook
+            averaging. ``None`` instead estimates coherence directly in each
+            output look block, matching a direct-multilook workflow. The value
+            is validated before this method reads scenes or opens stores.
+        phase_filter : PhaseFilter or None, default=GoldsteinWerner()
+            Runtime wrapped-phase strategy applied after multilooking.
+            ``GoldsteinWerner(alpha=0.5, patch_size=32)`` is the default.
+            ``None`` preserves the unfiltered complex interferogram. A custom
+            strategy is a trusted in-memory object, is not persisted for later
+            restoration, and must return an equal-shape, same-device, same
+            complex-dtype tensor with a boolean support mask that is a subset
+            of its input support. Valid returned samples must be finite.
+        goldstein_alpha : float, optional
+            Deprecated internal compatibility path for legacy callers. New
+            callers should use ``phase_filter=GoldsteinWerner(alpha=...)``.
+            An explicitly supplied ``phase_filter`` (including ``None``)
+            takes precedence.
+        output_dir : path-like, optional
+            Root directory for immutable per-pair IFG artifacts. ``None`` uses
+            ``config.work_dir / "ifg"``.
+        overwrite : bool, default=False
+            Replace an existing complete artifact at the selected output path.
+
+        Returns
+        -------
+        Stack
+            This Stack, with complete IFG artifact directories appended to its
+            product set.
+
+        Raises
+        ------
+        ValueError
+            If ``coherence_window`` is not ``None`` or two odd integers at
+            least three, or if other public numeric options are invalid.
+        InvalidProcessingStateError
+            If prerequisite scene generations are absent, incomplete, mixed in
+            domain or grid, or a phase-filter result violates its runtime
+            contract.
+
+        Notes
+        -----
+        Invalid, nonfinite, and uncovered samples remain invalid through
+        formation and filtering; filters may never resurrect masked support.
+        The stored coherence is clamped to ``[0, 1]`` where it is defined.
         This method deliberately has no SAFE-path or pair-runner fallback.
         Missing, incomplete, mixed-domain, or multi-unit generations fail
         closed until the provider supplies a complete scene manifest.
+
+        References
+        ----------
+        The centered two-stage coherence layout follows the TOPS Stack
+        convention used by ISCE2. Goldstein-Werner filtering follows
+        Goldstein and Werner (1998), *Radar interferogram filtering for
+        geophysical applications*.
+
         """
+        coherence_window = validate_coherence_window(coherence_window)
         self._ensure_prepared()
         self._require_qualified_activation_record()
 

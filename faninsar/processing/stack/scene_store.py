@@ -24,7 +24,85 @@ SCENE_SCHEMA = "scene_artifact_v1"
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from faninsar.processing.interferometry.phase_filter import PhaseFilter
+    import torch
+
+    from faninsar.processing.interferometry.phase_filter import (
+        PhaseFilter,
+        PhaseFilterResult,
+    )
+
+
+def _apply_phase_filter_contract(
+    phase_filter: PhaseFilter,
+    interferogram: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> PhaseFilterResult:
+    """Apply a runtime filter and enforce the formation-result contract.
+
+    Parameters
+    ----------
+    phase_filter : PhaseFilter
+        Trusted runtime strategy selected at the public Stack formation
+        boundary.
+    interferogram : torch.Tensor
+        Two-dimensional complex IFG on the selected Stack device.
+    valid_mask : torch.Tensor
+        Boolean finite support mask on the same device as ``interferogram``.
+
+    Returns
+    -------
+    PhaseFilterResult
+        Contract-conforming filtered tensor and support mask.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If a strategy returns a result with incompatible shape, dtype, device,
+        support, or finite-value semantics.
+
+    Notes
+    -----
+    Custom filters are trusted Python execution objects, but their output is
+    still validated here because this is the one boundary that converts their
+    result into a durable Stack artifact. No implicit cast, device transfer,
+    or mask widening is permitted.
+
+    """
+    import torch
+
+    from faninsar.processing.interferometry.phase_filter import PhaseFilterResult
+
+    result = phase_filter.apply(interferogram, valid_mask=valid_mask)
+    if not isinstance(result, PhaseFilterResult):
+        reject_invalid_state("phase filter must return a PhaseFilterResult")
+    output = result.interferogram
+    output_mask = result.valid_mask
+    if not isinstance(output, torch.Tensor):
+        reject_invalid_state("phase filter interferogram result must be a Tensor")
+    if output.shape != interferogram.shape:
+        reject_invalid_state("phase filter result shape must match its input")
+    if not output.is_complex() or output.dtype != interferogram.dtype:
+        reject_invalid_state(
+            "phase filter result must preserve the input complex dtype"
+        )
+    if output.device != interferogram.device:
+        reject_invalid_state("phase filter result must remain on the input device")
+    if not isinstance(output_mask, torch.Tensor):
+        reject_invalid_state("phase filter valid_mask result must be a Tensor")
+    if output_mask.shape != valid_mask.shape:
+        reject_invalid_state("phase filter valid_mask shape must match its input")
+    if output_mask.dtype != torch.bool:
+        reject_invalid_state("phase filter valid_mask result must have bool dtype")
+    if output_mask.device != valid_mask.device:
+        reject_invalid_state("phase filter valid_mask must remain on the input device")
+    if bool(torch.any(output_mask & ~valid_mask)):
+        reject_invalid_state("phase filter valid_mask cannot expand input support")
+    valid_values = output[output_mask]
+    if not bool(
+        torch.all(torch.isfinite(valid_values.real) & torch.isfinite(valid_values.imag))
+    ):
+        reject_invalid_state("phase filter valid output samples must be finite")
+    return result
 
 
 def scene_grid_identity(
@@ -836,10 +914,11 @@ def form_merged_scene_interferogram(
                 support = torch.as_tensor(
                     product.valid_mask, dtype=torch.bool, device=filter_device
                 )
-                filtered = phase_filter.apply(tensor, valid_mask=support)
+                filtered = _apply_phase_filter_contract(
+                    phase_filter, tensor, support
+                )
                 result_ifg = filtered.interferogram.detach().cpu().numpy()
-                result_mask = filtered.valid_mask.detach().cpu().numpy().astype(bool)
-                result_ifg = np.asarray(result_ifg, dtype=np.complex64)
+                result_mask = filtered.valid_mask.detach().cpu().numpy()
                 result_ifg[~result_mask] = np.nan + 1j * np.nan
                 _, result_coh, result_phase = mask_invalid_looks(
                     result_ifg, product.coherence
@@ -1004,10 +1083,9 @@ def form_merged_scene_interferogram(
             dtype=torch.bool,
             device=filter_device,
         )
-        filtered = phase_filter.apply(tensor, valid_mask=support)
+        filtered = _apply_phase_filter_contract(phase_filter, tensor, support)
         merged_ifg = filtered.interferogram.detach().cpu().numpy()
-        filtered_mask = filtered.valid_mask.detach().cpu().numpy().astype(bool)
-        merged_ifg = np.asarray(merged_ifg, dtype=np.complex64)
+        filtered_mask = filtered.valid_mask.detach().cpu().numpy()
         merged_ifg[~filtered_mask] = np.nan + 1j * np.nan
     elif goldstein_alpha > 0.0:
         from faninsar.backends.dask_gpu import should_accelerate

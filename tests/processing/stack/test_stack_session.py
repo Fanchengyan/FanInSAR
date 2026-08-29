@@ -515,6 +515,31 @@ def test_stack_config_multilook_normalize(tmp_path: Path) -> None:
     assert cfg.multilook == (2, 10)
 
 
+def test_stack_config_default_multilook_is_isce2_like(tmp_path: Path) -> None:
+    """Stack defaults to five azimuth by two range looks."""
+    cfg = StackConfig(work_dir=tmp_path, activation_mode="reference")
+    assert cfg.multilook == (5, 2)
+
+
+def test_stack_formation_validates_coherence_before_scene_io(tmp_path: Path) -> None:
+    """Invalid coherence support fails before formation reads any scene store."""
+    paths = []
+    for day in ("20160101", "20160113"):
+        path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
+        path.mkdir()
+        paths.append(path)
+    stack = Stack.from_safes(
+        paths,
+        work_dir=tmp_path / "out",
+        activation_mode="reference",
+    )
+
+    with pytest.raises(ValueError, match="odd integers >= 3"):
+        stack.form_interferograms(coherence_window=(2, 5))
+
+    assert not (tmp_path / "out").exists()
+
+
 def test_stack_requires_explicit_activation_namespace(tmp_path: Path) -> None:
     """Corrected Stack execution has no implicit reference activation path."""
     with pytest.raises(TypeError, match="activation_mode"):

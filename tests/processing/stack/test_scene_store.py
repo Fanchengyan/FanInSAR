@@ -9,14 +9,45 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.interferometry import PhaseFilter, PhaseFilterResult
 from faninsar.processing.stack.scene_store import (
     CoregisteredSceneStore,
     form_merged_scene_interferogram,
     form_scene_interferograms,
     write_scene_unit,
 )
+
+
+class _InvalidPhaseFilter(PhaseFilter):
+    """Test double that violates one formation-boundary output postcondition."""
+
+    def __init__(self, violation: str) -> None:
+        self.violation = violation
+
+    def apply(
+        self,
+        interferogram: torch.Tensor,
+        *,
+        valid_mask: torch.Tensor | None = None,
+    ) -> PhaseFilterResult:
+        """Return a deliberately malformed filter result."""
+        assert valid_mask is not None
+        if self.violation == "shape":
+            return PhaseFilterResult(interferogram[:, :-1], valid_mask[:, :-1])
+        if self.violation == "dtype":
+            return PhaseFilterResult(interferogram.real, valid_mask)
+        if self.violation == "mask_dtype":
+            return PhaseFilterResult(interferogram, valid_mask.to(torch.uint8))
+        if self.violation == "mask_subset":
+            return PhaseFilterResult(interferogram, torch.ones_like(valid_mask))
+        if self.violation == "finite":
+            output = interferogram.clone()
+            output[0, 1] = torch.nan + 0j
+            return PhaseFilterResult(output, valid_mask)
+        raise AssertionError
 
 
 def test_scene_store_round_trip_and_ifg_uses_aligned_payloads(tmp_path: Path) -> None:
@@ -49,6 +80,47 @@ def test_scene_store_round_trip_and_ifg_uses_aligned_payloads(tmp_path: Path) ->
     second = CoregisteredSceneStore.open(tmp_path / "secondary")
     output = form_scene_interferograms(first, second)
     np.testing.assert_array_equal(output["IW1_b0"], np.conj(secondary))
+
+
+@pytest.mark.parametrize(
+    ("violation", "match"),
+    [
+        ("shape", "shape"),
+        ("dtype", "complex dtype"),
+        ("mask_dtype", "bool dtype"),
+        ("mask_subset", "cannot expand"),
+        ("finite", "must be finite"),
+    ],
+)
+def test_merged_scene_filter_rejects_invalid_custom_result(
+    tmp_path: Path,
+    violation: str,
+    match: str,
+) -> None:
+    """The durable Stack boundary rejects malformed custom filter outputs."""
+    primary = np.ones((3, 3), dtype=np.complex64)
+    secondary = np.full((3, 3), 1.0 + 1.0j, dtype=np.complex64)
+    primary[0, 0] = np.nan + 1j * np.nan
+    secondary[0, 0] = np.nan + 1j * np.nan
+    for root, date_id in (("reference", "20240101"), ("secondary", "20240113")):
+        write_scene_unit(
+            tmp_path / root,
+            date_id=date_id,
+            reference_id="20240101",
+            domain="radar",
+            tag="IW1_b0",
+            primary=primary,
+            secondary=secondary,
+            row_origin=0,
+            col_origin=0,
+        )
+
+    with pytest.raises(InvalidProcessingStateError, match=match):
+        form_merged_scene_interferogram(
+            CoregisteredSceneStore.open(tmp_path / "reference"),
+            CoregisteredSceneStore.open(tmp_path / "secondary"),
+            phase_filter=_InvalidPhaseFilter(violation),
+        )
 
 
 def test_scene_store_rejects_manifest_tampering(tmp_path: Path) -> None:
