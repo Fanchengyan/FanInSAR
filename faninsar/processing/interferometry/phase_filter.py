@@ -151,9 +151,14 @@ class GoldsteinWerner(PhaseFilter):
                 block[:rows, :cols] = source[row : row + rows, col : col + cols]
                 spectrum = torch.fft.fft2(block)
                 magnitude = torch.abs(spectrum)
-                weight = torch.pow(
-                    magnitude / magnitude.amax().clamp_min(1e-12), self.alpha
-                )
+                # Goldstein-Werner uses the local spectral magnitude itself as
+                # the adaptive weight.  Do not normalize each patch by its
+                # own maximum: overlapping patches can have different maxima,
+                # and that normalization changes their relative contribution
+                # during overlap-add.  The final per-pixel magnitude restore
+                # below supplies the amplitude convention without changing
+                # the relative spatial weighting of patches.
+                weight = torch.pow(magnitude, self.alpha)
                 filtered = torch.fft.ifft2(spectrum * weight) * float(patch * patch)
                 output[row : row + rows, col : col + cols] += (
                     filtered[:rows, :cols] * taper[:rows, :cols]

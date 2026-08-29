@@ -22,6 +22,40 @@ from faninsar.processing.interferometry import (
 )
 
 
+def _goldstein_werner_reference(
+    interferogram: np.ndarray,
+    *,
+    alpha: float,
+    patch_size: int,
+) -> np.ndarray:
+    """Build an ISCE2 weighted overlap-add reference in NumPy."""
+    height, width = interferogram.shape
+    step = patch_size // 2
+    axis = np.arange(patch_size, dtype=np.float32)
+    taper_1d = 1.0 - np.abs(
+        2.0 * (axis - patch_size / 2) / (patch_size + 1)
+    )
+    taper = np.outer(taper_1d, taper_1d)
+    output = np.zeros_like(interferogram)
+    for row in range(0, height, step):
+        for col in range(0, width, step):
+            rows = min(patch_size, height - row)
+            cols = min(patch_size, width - col)
+            block = np.zeros((patch_size, patch_size), dtype=interferogram.dtype)
+            block[:rows, :cols] = interferogram[row : row + rows, col : col + cols]
+            spectrum = np.fft.fft2(block)
+            spectrum *= np.abs(spectrum) ** alpha
+            filtered = np.fft.ifft2(spectrum) * float(patch_size * patch_size)
+            output[row : row + rows, col : col + cols] += (
+                filtered[:rows, :cols] * taper[:rows, :cols]
+            )
+    input_magnitude = np.abs(interferogram)
+    output_magnitude = np.abs(output)
+    mask = (output_magnitude > 0) & (input_magnitude > 0)
+    output[mask] *= input_magnitude[mask] / output_magnitude[mask]
+    return output
+
+
 @pytest.mark.parametrize("value", [(), (1, 5), (2, 5), (4, 5), (3, 0), (3, -1)])
 def test_coherence_window_rejects_non_centered_support(value: tuple[int, ...]) -> None:
     """A centered support has two odd axes and each axis is at least 3."""
@@ -129,6 +163,23 @@ def test_goldstein_patch_size_is_scalar_even_and_bounded() -> None:
         GoldsteinWerner(patch_size=(32, 32))  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="patch_size"):
         GoldsteinWerner(patch_size=7)
+
+
+def test_goldstein_werner_matches_isce2_reference_without_patch_normalization() -> None:
+    """Torch Goldstein-Werner agrees with the ISCE2 formula within float error."""
+    rng = np.random.default_rng(3801)
+    interferogram = (
+        rng.standard_normal((64, 64)) + 1j * rng.standard_normal((64, 64))
+    ).astype(np.complex64)
+    expected = _goldstein_werner_reference(
+        interferogram,
+        alpha=0.5,
+        patch_size=16,
+    )
+    actual = GoldsteinWerner(alpha=0.5, patch_size=16).apply(
+        torch.from_numpy(interferogram)
+    ).interferogram.cpu().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-5)
 
 
 @pytest.mark.parametrize(
