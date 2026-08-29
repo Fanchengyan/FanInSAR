@@ -46,6 +46,11 @@ from faninsar.processing.coreg.misreg_network import (
     invert_pair_misregistration,
 )
 from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.interferometry.phase_filter import (
+    FilterProvenance,
+    GoldsteinWerner,
+    PhaseFilter,
+)
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.config import (
     ActivationMode,
@@ -90,6 +95,70 @@ if TYPE_CHECKING:
     from faninsar.query import BoundingBox, Polygons
 
 logger = setup_logger(__name__)
+
+_DEFAULT_PHASE_FILTER = GoldsteinWerner(alpha=0.5, patch_size=32)
+
+
+def _phase_filter_metadata(  # noqa: PLR0911
+    phase_filter: PhaseFilter | None,
+) -> tuple[str, dict[str, int | float | bool | str | None]]:
+    """Return bounded inert provenance for a runtime phase filter.
+
+    A custom filter is trusted for execution but its description is never
+    required for persistence.  Missing, raising, or malformed descriptions
+    therefore degrade to the stable ``custom``/empty metadata pair.
+    """
+    if phase_filter is None:
+        return "none", {}
+    try:
+        description = phase_filter.describe()
+    except Exception as error:  # pragma: no cover - defensive custom boundary
+        logger.warning(
+            "phase filter description failed; using custom metadata: %s", error
+        )
+        return "custom", {}
+    if not isinstance(description, FilterProvenance):
+        logger.warning("phase filter description is malformed; using custom metadata")
+        return "custom", {}
+    name = description.name
+    parameters = description.parameters
+    if (
+        not isinstance(name, str)
+        or not name
+        or len(name) > 64
+        or not name.isascii()
+        or any(not (character.isalnum() or character in "-_.") for character in name)
+        or not isinstance(parameters, dict)
+        or len(parameters) > 32
+    ):
+        logger.warning(
+            "phase filter description is out of bounds; using custom metadata"
+        )
+        return "custom", {}
+    for key, value in parameters.items():
+        if not isinstance(key, str) or len(key) > 64 or not key.isascii():
+            logger.warning(
+                "phase filter parameter key is invalid; using custom metadata"
+            )
+            return "custom", {}
+        if isinstance(value, float) and not np.isfinite(value):
+            logger.warning(
+                "phase filter parameter is non-finite; using custom metadata"
+            )
+            return "custom", {}
+        if not isinstance(value, (str, int, float, bool)) and value is not None:
+            logger.warning(
+                "phase filter parameter is not a JSON scalar; "
+                "using custom metadata"
+            )
+            return "custom", {}
+        if isinstance(value, str) and len(value) > 256:
+            logger.warning(
+                "phase filter parameter string is too long; "
+                "using custom metadata"
+            )
+            return "custom", {}
+    return name, dict(parameters)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -1354,6 +1423,8 @@ class Stack(Network):
         *,
         pairs: Pairs | None = None,
         multilook: tuple[int, int] | list[tuple[int, int]] | None = None,
+        coherence_window: tuple[int, int] | None = (5, 5),
+        phase_filter: PhaseFilter | None = _DEFAULT_PHASE_FILTER,
         goldstein_alpha: float | None = None,
         output_dir: str | Path | None = None,
         overwrite: bool = False,
@@ -1369,11 +1440,16 @@ class Stack(Network):
 
         use_pairs = pairs or self.pairs
         looks_list = _normalize_multilook(multilook or self.config.multilook)
-        alpha = (
-            self.config.goldstein_alpha
-            if goldstein_alpha is None
-            else float(goldstein_alpha)
+        # ``goldstein_alpha`` remains an internal transition path for existing
+        # callers.  The public MVP API is ``phase_filter``; an explicit filter
+        # (including None) always takes precedence over the old scalar option.
+        legacy_filter = (
+            phase_filter is _DEFAULT_PHASE_FILTER and goldstein_alpha is not None
         )
+        alpha = float(goldstein_alpha) if legacy_filter else 0.0
+        selected_filter = None if legacy_filter else phase_filter
+        selected_coherence_window = None if legacy_filter else coherence_window
+        filter_name, filter_parameters = _phase_filter_metadata(selected_filter)
         base_out = (
             Path(output_dir)
             if output_dir is not None
@@ -1416,10 +1492,8 @@ class Stack(Network):
                         _provider_callback(self.scene_provider)
                     ),
                 }
-                expected_filter_name = "goldstein" if alpha > 0.0 else "none"
-                expected_filter_parameters = (
-                    {"alpha": alpha, "window": 32} if alpha > 0.0 else {}
-                )
+                expected_filter_name = filter_name
+                expected_filter_parameters = filter_parameters
                 if (sub / "manifest.json").exists():
                     from faninsar.processing.stack.ifg_store import (
                         InterferogramArtifactStore,
@@ -1465,6 +1539,8 @@ class Stack(Network):
                     ),
                     multilook=looks,
                     goldstein_alpha=alpha,
+                    coherence_window=selected_coherence_window,
+                    phase_filter=selected_filter,
                     device=self.config.device,
                     dask_client=self.dask_client,
                     flatten_stage=flatten_stage,
@@ -1490,6 +1566,7 @@ class Stack(Network):
                     coherence=product.coherence,
                     wrapped_phase=product.wrapped_phase,
                     amplitude=product.amplitude,
+                    valid_mask=product.valid_mask,
                 )
                 self.ifg_dirs.append(sub)
         return self

@@ -357,6 +357,7 @@ def form_interferogram(
     power_pri = np.full((out_h, out_w), np.nan, dtype=np.float64)
     power_sec = np.full((out_h, out_w), np.nan, dtype=np.float64)
     valid_out = np.zeros((out_h, out_w), dtype=bool)
+    sample_counts = np.zeros((out_h, out_w), dtype=np.intp)
     for row in range(out_h):
         r0, r1 = row * az_looks, min((row + 1) * az_looks, height)
         for col in range(out_w):
@@ -366,6 +367,7 @@ def form_interferogram(
                 continue
             p = primary[r0:r1, c0:c1][support]
             s = secondary[r0:r1, c0:c1][support]
+            sample_counts[row, col] = p.size
             ifg[row, col] = np.mean(p * np.conjugate(s))
             power_pri[row, col] = np.mean(np.abs(p) ** 2)
             power_sec[row, col] = np.mean(np.abs(s) ** 2)
@@ -383,13 +385,17 @@ def form_interferogram(
         where=denominator > 0,
     )
     if coherence_window is None:
-        coherence = direct
+        coherence = np.where(sample_counts >= 2, direct, np.nan)
     else:
         coherence = _block_finite_mean(
             _sliding_coherence(primary, secondary, coherence_window), multilook
         )
     coherence = np.clip(coherence, 0.0, 1.0).astype(np.float32)
-    invalid = ~valid_out | ~np.isfinite(coherence)
+    # ``valid_mask`` describes whether the complex look itself is supported.
+    # Coherence has a stricter statistical requirement: a singleton look is a
+    # valid complex sample but has no two-sample MLE, so its coherence remains
+    # NaN without discarding the IFG sample.
+    invalid = ~valid_out | ~np.isfinite(ifg.real) | ~np.isfinite(ifg.imag)
     if np.any(invalid):
         ifg[invalid] = np.nan + 1j * np.nan
         coherence[invalid] = np.nan

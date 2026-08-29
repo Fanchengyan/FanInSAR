@@ -54,7 +54,13 @@ def _validate_input(
 
 
 class PhaseFilter(ABC):
-    """Runtime strategy for filtering one wrapped complex interferogram."""
+    """Runtime strategy for filtering one wrapped complex interferogram.
+
+    Arrays use ``(azimuth, range)`` order and contain complex samples.  A
+    strategy preserves shape, dtype family, and device; its returned boolean
+    support is a subset of the supplied support.  Custom strategies are
+    trusted runtime objects and are never serialized for later restoration.
+    """
 
     @abstractmethod
     def apply(
@@ -86,7 +92,8 @@ class GoldsteinWerner(PhaseFilter):
     def __init__(self, alpha: float = 0.5, patch_size: int = 32) -> None:
         """Initialize the spectral exponent and square patch size."""
         if (
-            not isinstance(alpha, (int, float))
+            isinstance(alpha, bool)
+            or not isinstance(alpha, (int, float))
             or not math.isfinite(alpha)
             or not 0 <= alpha <= 1
         ):
@@ -204,7 +211,14 @@ class _SpatialFilter(PhaseFilter):
 
 
 class BoxcarFilter(_SpatialFilter):
-    """Valid-weighted odd boxcar smoothing of a wrapped complex IFG."""
+    """Valid-weighted odd boxcar smoothing of a wrapped complex IFG.
+
+    Parameters
+    ----------
+    window : tuple[int, int], default=(5, 5)
+        Odd ``(azimuth, range)`` kernel widths, each in ``[3, 257]`` pixels.
+
+    """
 
     def __init__(self, window: tuple[int, int] = (5, 5)) -> None:
         """Initialize odd ``(azimuth, range)`` boxcar dimensions."""
@@ -214,6 +228,7 @@ class BoxcarFilter(_SpatialFilter):
             or any(
                 type(axis) is not int or axis < 3 or axis % 2 == 0 for axis in window
             )
+            or any(axis > 257 for axis in window)
         ):
             message = "Boxcar window axes must be odd integers >= 3"
             raise ValueError(message)
@@ -241,7 +256,18 @@ class BoxcarFilter(_SpatialFilter):
 
 
 class GaussianFilter(_SpatialFilter):
-    """Valid-weighted separable Gaussian smoothing of a wrapped IFG."""
+    """Valid-weighted separable Gaussian smoothing of a wrapped IFG.
+
+    Parameters
+    ----------
+    sigma : tuple[float, float]
+        Positive finite ``(azimuth, range)`` standard deviations in pixels,
+        each no greater than ``128``.
+    truncate : float, default=4.0
+        Positive finite kernel radius in standard deviations, no greater than
+        ``16``.  The discrete radius is ``ceil(truncate * sigma)``.
+
+    """
 
     def __init__(self, sigma: tuple[float, float], truncate: float = 4.0) -> None:
         """Initialize ``(azimuth, range)`` Gaussian widths in pixels."""
@@ -249,13 +275,18 @@ class GaussianFilter(_SpatialFilter):
             not isinstance(sigma, tuple)
             or len(sigma) != 2
             or any(
-                not isinstance(axis, (int, float))
+                isinstance(axis, bool)
+                or not isinstance(axis, (int, float))
                 or not math.isfinite(axis)
                 or axis <= 0
+                or axis > 128.0
                 for axis in sigma
             )
+            or isinstance(truncate, bool)
+            or not isinstance(truncate, (int, float))
             or not math.isfinite(truncate)
             or truncate <= 0
+            or truncate > 16.0
         ):
             message = "Gaussian sigma and truncate must be finite and positive"
             raise ValueError(message)

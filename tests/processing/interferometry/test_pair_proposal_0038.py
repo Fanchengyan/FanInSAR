@@ -61,6 +61,27 @@ def test_multilook_retains_partial_tail_with_actual_sample_count() -> None:
     assert product.complex_ifg[1, 2] == pytest.approx(3.0 + 0.0j)
 
 
+def test_direct_mle_marks_singleton_coherence_invalid_but_keeps_complex_support(
+) -> None:
+    """One valid sample supports an IFG, but not a two-sample MLE coherence."""
+    primary = np.full((2, 2), np.nan + 1j * np.nan, dtype=np.complex64)
+    secondary = np.full((2, 2), np.nan + 1j * np.nan, dtype=np.complex64)
+    primary[0, 0] = 2.0 + 0.0j
+    secondary[0, 0] = 1.0 + 0.0j
+
+    product = form_interferogram(
+        primary,
+        secondary,
+        multilook=(2, 2),
+        coherence_window=None,
+    )
+
+    assert product.valid_mask is not None
+    assert bool(product.valid_mask[0, 0])
+    assert product.complex_ifg[0, 0] == pytest.approx(2.0 + 0.0j)
+    assert np.isnan(product.coherence[0, 0])
+
+
 def test_two_stage_coherence_uses_full_resolution_sliding_mle() -> None:
     """Tuple windows form HxW gamma first, then average gamma by blocks."""
     primary = np.ones((3, 3), dtype=np.complex64)
@@ -108,3 +129,17 @@ def test_goldstein_patch_size_is_scalar_even_and_bounded() -> None:
         GoldsteinWerner(patch_size=(32, 32))  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="patch_size"):
         GoldsteinWerner(patch_size=7)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: GoldsteinWerner(alpha=True),
+        lambda: GaussianFilter(sigma=(True, 1.0)),
+        lambda: GaussianFilter(sigma=(1.0, 1.0), truncate=True),
+    ],
+)
+def test_filter_scalar_parameters_reject_bool(factory: _Factory) -> None:
+    """Boolean values must not silently act as numeric filter parameters."""
+    with pytest.raises(ValueError, match="finite"):
+        factory()

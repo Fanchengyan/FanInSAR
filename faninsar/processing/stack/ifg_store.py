@@ -35,6 +35,7 @@ _IFG_FILENAMES = {
     "wrapped_phase": "wrapped_phase.npy",
     "amplitude": "amplitude.npy",
 }
+_VALID_MASK_FILENAME = "valid_mask.npy"
 _PHASE_SCREEN_MANIFEST_FIELDS = frozenset(
     {
         "flatten_stage",
@@ -314,6 +315,7 @@ class InterferogramArtifact:
     coherence: np.ndarray
     wrapped_phase: np.ndarray
     amplitude: np.ndarray
+    valid_mask: np.ndarray | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,7 +417,10 @@ class InterferogramArtifactStore:
 
         """
         path = _store_root(root, create=False)
-        direct_payloads = [path / filename for filename in _IFG_FILENAMES.values()]
+        direct_payloads = [
+            path / filename
+            for filename in (*_IFG_FILENAMES.values(), _VALID_MASK_FILENAME)
+        ]
         if any(payload.exists() for payload in direct_payloads):
             reject_invalid_state(
                 "legacy direct IFG payload layout is quarantined and cannot be read"
@@ -535,9 +540,29 @@ class InterferogramArtifactStore:
         if phase_screen_model is None and phase_screen_digests:
             reject_invalid_state("phase-screen digests require a phase-screen model")
         shape = _validate_shape(manifest.get("shape"), "shape")
+        raw_payloads = manifest["payloads"]
         payloads = _validate_payload_table(
-            opened.path, manifest.get("payloads"), _IFG_FILENAMES, shape
+            opened.path,
+            (
+                {
+                    name: raw_payloads[name]
+                    for name in _IFG_FILENAMES
+                }
+                if isinstance(raw_payloads, dict)
+                else raw_payloads
+            ),
+            _IFG_FILENAMES,
+            shape,
         )
+        if isinstance(raw_payloads, dict) and "valid_mask" in raw_payloads:
+            payloads.update(
+                _validate_payload_table(
+                    opened.path,
+                    {"valid_mask": raw_payloads["valid_mask"]},
+                    {"valid_mask": _VALID_MASK_FILENAME},
+                    shape,
+                )
+            )
         digest = str(manifest["manifest_digest"])
         return cls(
             root=path,
@@ -584,11 +609,15 @@ class InterferogramArtifactStore:
             for name in ("coherence", "wrapped_phase", "amplitude")
         ):
             reject_invalid_state("artifact IFG layer dtypes are incompatible")
+        valid_mask = arrays.get("valid_mask")
+        if valid_mask is not None and valid_mask.dtype != np.bool_:
+            reject_invalid_state("artifact IFG valid_mask dtype is incompatible")
         return InterferogramArtifact(
             complex_ifg=arrays["complex_ifg"],
             coherence=arrays["coherence"],
             wrapped_phase=arrays["wrapped_phase"],
             amplitude=arrays["amplitude"],
+            valid_mask=valid_mask,
         )
 
     def read_unwrapped(self) -> UnwrappedArtifact:
@@ -674,6 +703,7 @@ def write_ifg_artifact(
     coherence: np.ndarray,
     wrapped_phase: np.ndarray,
     amplitude: np.ndarray,
+    valid_mask: np.ndarray | None = None,
     resource_limits: ArtifactResourceLimits | None = None,
     replace_existing: bool = False,
 ) -> InterferogramArtifactStore:
@@ -718,6 +748,9 @@ def write_ifg_artifact(
         Publish a new immutable generation and advance ``CURRENT`` when true.
     complex_ifg, coherence, wrapped_phase, amplitude : numpy.ndarray
         Matching two-dimensional IFG product layers.
+    valid_mask : numpy.ndarray, optional
+        Boolean authoritative support mask. If omitted, finite complex support
+        is used when publishing the artifact.
 
     Returns
     -------
@@ -731,6 +764,8 @@ def write_ifg_artifact(
         "wrapped_phase": np.asarray(wrapped_phase),
         "amplitude": np.asarray(amplitude),
     }
+    if valid_mask is not None:
+        arrays["valid_mask"] = np.asarray(valid_mask)
     shapes = {array.shape for array in arrays.values()}
     if len(shapes) != 1:
         reject_invalid_state("IFG artifact layers must share one shape")
@@ -742,6 +777,8 @@ def write_ifg_artifact(
         for name in ("coherence", "wrapped_phase", "amplitude")
     ):
         reject_invalid_state("IFG artifact layer dtypes are incompatible")
+    if valid_mask is not None and arrays["valid_mask"].dtype != np.bool_:
+        reject_invalid_state("IFG artifact valid_mask must be boolean")
     if (
         len(pair) != 2
         or any(not isinstance(value, str) or not value for value in pair)
@@ -839,6 +876,12 @@ def write_ifg_artifact(
             payload_path = staging / filename
             _atomic_save(payload_path, arrays[name])
             descriptors[name] = _array_descriptor(payload_path, arrays[name])
+        if valid_mask is not None:
+            payload_path = staging / _VALID_MASK_FILENAME
+            _atomic_save(payload_path, arrays["valid_mask"])
+            descriptors["valid_mask"] = _array_descriptor(
+                payload_path, arrays["valid_mask"]
+            )
         unsigned: dict[str, Any] = {
             "schema_version": IFG_ARTIFACT_SCHEMA,
             "status": "complete",

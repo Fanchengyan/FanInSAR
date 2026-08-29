@@ -24,6 +24,8 @@ SCENE_SCHEMA = "scene_artifact_v1"
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from faninsar.processing.interferometry.phase_filter import PhaseFilter
+
 
 def scene_grid_identity(
     domain: str,
@@ -711,6 +713,8 @@ def form_merged_scene_interferogram(
     device: str = "auto",
     dask_client: object | None = None,
     flatten_stage: str = "coregistration",
+    coherence_window: tuple[int, int] | None = None,
+    phase_filter: PhaseFilter | None = None,
 ) -> InterferogramProduct:
     """Form one common-grid complex IFG from all persisted scene units.
 
@@ -736,6 +740,12 @@ def form_merged_scene_interferogram(
         Numerical device policy for the qualified Goldstein stage.
     dask_client : object, optional
         Explicitly trusted Dask client for qualified remote Goldstein work.
+    coherence_window : tuple[int, int] or None, optional
+        Coherence MLE support passed to the pair kernel. ``None`` computes
+        direct MLE in each multilook block.
+    phase_filter : PhaseFilter or None, optional
+        Runtime filter applied after multilooking. ``None`` leaves the
+        multilooked complex interferogram unchanged.
 
     Returns
     -------
@@ -814,7 +824,34 @@ def form_merged_scene_interferogram(
                 primary,
                 secondary,
                 multilook=multilook,
+                coherence_window=coherence_window,
             )
+            if phase_filter is not None:
+                import torch
+
+                filter_device = device
+                if filter_device in {"", "auto"}:
+                    filter_device = "cuda" if torch.cuda.is_available() else "cpu"
+                tensor = torch.as_tensor(product.complex_ifg, device=filter_device)
+                support = torch.as_tensor(
+                    product.valid_mask, dtype=torch.bool, device=filter_device
+                )
+                filtered = phase_filter.apply(tensor, valid_mask=support)
+                result_ifg = filtered.interferogram.detach().cpu().numpy()
+                result_mask = filtered.valid_mask.detach().cpu().numpy().astype(bool)
+                result_ifg = np.asarray(result_ifg, dtype=np.complex64)
+                result_ifg[~result_mask] = np.nan + 1j * np.nan
+                _, result_coh, result_phase = mask_invalid_looks(
+                    result_ifg, product.coherence
+                )
+                assert result_coh is not None
+                return InterferogramProduct(
+                    complex_ifg=result_ifg,
+                    coherence=result_coh,
+                    wrapped_phase=result_phase,
+                    amplitude=np.abs(result_ifg).astype(np.float32),
+                    valid_mask=result_mask,
+                )
             if goldstein_alpha <= 0.0:
                 return product
             from faninsar.backends.dask_gpu import should_accelerate
@@ -955,7 +992,24 @@ def form_merged_scene_interferogram(
         valid = np.abs(group_ifg) > 0
         merged_ifg[valid] = group_ifg[valid]
         coherence[valid] = group_coherence[valid]
-    if goldstein_alpha > 0.0:
+    if phase_filter is not None:
+        import torch
+
+        filter_device = device
+        if filter_device in {"", "auto"}:
+            filter_device = "cuda" if torch.cuda.is_available() else "cpu"
+        tensor = torch.as_tensor(merged_ifg, device=filter_device)
+        support = torch.as_tensor(
+            np.isfinite(merged_ifg.real) & np.isfinite(merged_ifg.imag),
+            dtype=torch.bool,
+            device=filter_device,
+        )
+        filtered = phase_filter.apply(tensor, valid_mask=support)
+        merged_ifg = filtered.interferogram.detach().cpu().numpy()
+        filtered_mask = filtered.valid_mask.detach().cpu().numpy().astype(bool)
+        merged_ifg = np.asarray(merged_ifg, dtype=np.complex64)
+        merged_ifg[~filtered_mask] = np.nan + 1j * np.nan
+    elif goldstein_alpha > 0.0:
         from faninsar.backends.dask_gpu import should_accelerate
 
         if (dask_client is not None or device.lower() == "cuda") and should_accelerate(
@@ -973,12 +1027,19 @@ def form_merged_scene_interferogram(
         else:
             merged_ifg = goldstein_filter(merged_ifg, alpha=goldstein_alpha)
     merged_ifg, coherence_out, wrapped = mask_invalid_looks(merged_ifg, coherence)
+    if phase_filter is not None:
+        valid_mask = filtered_mask & np.isfinite(merged_ifg.real) & np.isfinite(
+            merged_ifg.imag
+        )
+    else:
+        valid_mask = np.isfinite(merged_ifg.real) & np.isfinite(merged_ifg.imag)
     assert coherence_out is not None
     return InterferogramProduct(
         complex_ifg=merged_ifg,
         coherence=coherence_out,
         wrapped_phase=wrapped,
         amplitude=np.abs(merged_ifg).astype(np.float32),
+        valid_mask=valid_mask,
     )
 
 
