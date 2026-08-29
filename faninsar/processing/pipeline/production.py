@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
-    from faninsar.processing.unwrap.common import CommonUnwrapResult
+    from faninsar.processing.unwrap.common import SpatialUnwrapResult
 
 logger = setup_logger(__name__)
 
@@ -2837,17 +2837,20 @@ def stage_unwrap(
     if ifg is None or state.coherence is None:
         reject_invalid_state("unwrap requires interferogram")
     unwrap_input = ifg
-    result: CommonUnwrapResult = unwrap_dispatch(
+    result: SpatialUnwrapResult = unwrap_dispatch(
         ifg,
         state.coherence,
         method=method,
         snaphu_config=config,
         irls_kwargs=irls_kwargs,
     )
-    state.unwrapped_phase = result.unwrapped_phase
-    state.connected_components = result.connected_components
-    state.unwrap_method = result.method
-    state.note(f"UNWRAP method={result.method} metrics={result.metrics}")
+    state.unwrapped_phase = result.phase.detach().cpu().numpy()
+    state.connected_components = result.component_labels.detach().cpu().numpy()
+    state.unwrap_method = method
+    state.note(
+        f"UNWRAP method={method} converged={result.converged} "
+        f"iterations={result.iterations} pcg_iterations={result.pcg_iterations}"
+    )
 
     # Non-DEM residual range/azimuth poly (orbit residual / APS / far-range).
     # Non-DEM residual range/azimuth poly (orbit residual / APS / far-range).

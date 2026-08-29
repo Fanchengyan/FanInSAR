@@ -29,14 +29,14 @@ def test_snaphu_backend_raises_when_not_installed() -> None:
         unwrap(ifg, coh, method="snaphu")
 
 
-def test_unwrap_dispatcher_irls_returns_common_result() -> None:
-    """IRLS path through the dispatcher yields method='irls'."""
+def test_unwrap_dispatcher_irls_returns_spatial_result() -> None:
+    """IRLS dispatcher returns the sole spatial result contract."""
     _, x = np.mgrid[0:12, 0:12]
     wrapped = wrap_phase(0.3 * x)
     result = unwrap(wrapped, method="irls")
-    assert result.method == "irls"
-    assert result.unwrapped_phase.shape == wrapped.shape
-    assert result.connected_components.shape == wrapped.shape
+    assert result.phase.shape == wrapped.shape
+    assert result.component_labels.shape == wrapped.shape
+    assert result.valid_mask.shape == wrapped.shape
 
 
 def test_align_components_corrects_integer_cycle_offset() -> None:

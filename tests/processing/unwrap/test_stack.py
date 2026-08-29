@@ -87,7 +87,8 @@ def test_unwrap_stack_retains_independent_spatial_islands() -> None:
     assert result.connected_components is not None
     assert np.isfinite(result.phase_2d_unw[:, :, :5]).all()
     assert np.isfinite(result.phase_2d_unw[:, :, 7:]).all()
-    assert np.nanmax(result.connected_components) >= 2
+    valid_labels = result.connected_components[result.connected_components >= 0]
+    assert np.unique(valid_labels).size >= 2
 
 
 def test_unwrap_stack_full_chain() -> None:
