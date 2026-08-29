@@ -74,6 +74,8 @@ def _write_pair_artifact(
         wrapped_phase=np.angle(complex_ifg).astype(np.float32),
         amplitude=np.abs(complex_ifg).astype(np.float32),
     )
+    if root not in stack.ifg_dirs:
+        stack.ifg_dirs.append(root)
 
 
 def test_scene_catalog_from_paths(tmp_path: Path) -> None:
@@ -818,22 +820,20 @@ def test_qualified_stack_form_requires_matching_activation_record(
     assert not stack.analysis_ready
 
 
-def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
+def test_stack_unwrap_loads_persisted_pair_artifacts(
     tmp_path: Path,
 ) -> None:
-    """Persisted common-grid IFGs flow through temporal unwrap and SBAS."""
+    """Persisted common-grid IFGs flow through spatial Stack unwrapping."""
     stack = _stack_with_three_date_network(tmp_path)
-    first_increment = np.full((3, 4), 0.2, dtype=np.float32)
-    second_increment = np.full((3, 4), 0.35, dtype=np.float32)
     phases = {
-        "20240101_20240113": first_increment,
-        "20240113_20240125": second_increment,
-        "20240101_20240125": first_increment + second_increment,
+        "20240101_20240113": np.full((3, 4), 0.2, dtype=np.float32),
+        "20240113_20240125": np.full((3, 4), 0.35, dtype=np.float32),
+        "20240101_20240125": np.full((3, 4), 0.55, dtype=np.float32),
     }
     for pair_id, phase in phases.items():
         _write_pair_artifact(stack, pair_id, phase)
 
-    stack.unwrap(do_spatial=False)
+    stack.unwrap()
     assert stack.analysis_ready
     index = stack.network_product_index
     assert index is not None
@@ -844,51 +844,17 @@ def test_stack_unwrap_and_sbas_load_persisted_pair_artifacts(
     for product in index.products:
         assert product.content_digest
         assert product.lineage
-    for product in index.products:
-        if product.key.product_kind is AssetKind.UNWRAPPED_PHASE:
-            assert len(product.lineage) == 2
-            assert product.content_digest == product.lineage[-1]
-    result = stack.invert_timeseries()
-
-    assert stack.unwrap_result is not None
-    assert stack.unwrap_result.temporal_applied
-    assert result.pair_ids == tuple(sorted(phases))
-    assert result.cumulative.shape == (3, 3, 4)
-    for pair_id in phases:
-        store = InterferogramArtifactStore.open(
-            stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
-        )
-        unwrapped = store.read_unwrapped()
-        assert unwrapped.method == "stack_irls"
-        assert unwrapped.method_parameters["pair_ids"] == list(
-            stack.unwrap_result.pair_ids
-        )
-        assert unwrapped.method_parameters["quality_report"]["passed"] is True
-        assert "modulo_closure_abs_rad" in unwrapped.method_parameters["quality_report"]
-
-    stack.unwrap_result = None
-    stack.unwrap(do_spatial=False)
-    assert stack.unwrap_result is not None
-    assert stack.unwrap_result.temporal_applied is True
-    assert stack.unwrap_result.temporal_converged_pixels == 12
-    assert stack.unwrap_result.temporal_converged_fraction == 1.0
-    assert stack.unwrap_result.quality_report is not None
-    assert stack.unwrap_result.quality_report.passed
-
-    from faninsar.processing.errors import InvalidProcessingStateError
-    from faninsar.processing.unwrap.quality import StackQualityCriteria
-
-    with pytest.raises(InvalidProcessingStateError, match="quality criteria"):
-        stack.unwrap(
-            do_spatial=False,
-            quality_criteria=StackQualityCriteria(min_converged_fraction=1.0),
-        )
+    unwrapped = [
+        product
+        for product in index.products
+        if product.key.product_kind is AssetKind.UNWRAPPED_PHASE
+    ]
+    assert len(unwrapped) == len(phases)
+    assert all(product.content_digest for product in unwrapped)
 
 
-def test_stack_analysis_rejects_replaced_unwrap_generation(tmp_path: Path) -> None:
-    """Analysis fails closed when an unwrap CURRENT advances after refresh."""
-    from faninsar.processing.errors import InvalidProcessingStateError
-
+def test_stack_unwrap_publishes_durable_network_generation(tmp_path: Path) -> None:
+    """A spatial unwrap generation is durable and available to the Network."""
     stack = _stack_with_three_date_network(tmp_path)
     phases = {
         "20240101_20240113": np.full((3, 4), 0.2, dtype=np.float32),
@@ -897,74 +863,9 @@ def test_stack_analysis_rejects_replaced_unwrap_generation(tmp_path: Path) -> No
     }
     for pair_id, phase in phases.items():
         _write_pair_artifact(stack, pair_id, phase)
-    stack.unwrap(do_spatial=False)
-
-    first_root = stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113"
-    first_store = InterferogramArtifactStore.open(first_root)
-    old_unwrapped = first_store.read_unwrapped()
-    ifg_manifest_digest = first_store.manifest_digest
-    first_store.close()
-    write_unwrapped_artifact(
-        first_root,
-        unwrapped_phase=old_unwrapped.unwrapped_phase,
-        connected_components=old_unwrapped.connected_components,
-        method=old_unwrapped.method,
-        method_parameters=old_unwrapped.method_parameters,
-        ifg_manifest_digest=ifg_manifest_digest,
-        replace_existing=True,
-    )
-
-    with pytest.raises(InvalidProcessingStateError, match="unwrapped product"):
-        stack.analyze_time_series()
-
-
-def test_stack_generation_binds_complete_ifg_unwrap_and_timeseries_set(
-    tmp_path: Path,
-) -> None:
-    """One parent generation binds every immutable derived child generation."""
-    stack = _stack_with_three_date_network(tmp_path)
-    first_increment = np.full((3, 4), 0.2, dtype=np.float32)
-    second_increment = np.full((3, 4), 0.35, dtype=np.float32)
-    phases = {
-        "20240101_20240113": first_increment,
-        "20240113_20240125": second_increment,
-        "20240101_20240125": first_increment + second_increment,
-    }
-    for pair_id, phase in phases.items():
-        _write_pair_artifact(stack, pair_id, phase)
-    stack.unwrap(do_spatial=False)
-    timeseries_root = write_timeseries_zarr(
-        stack.invert_timeseries(),
-        stack.config.work_dir / "timeseries.zarr",
-    )
-
-    published = stack.publish_generation(timeseries_root)
-
-    assert published.pair_ids == tuple(phases)
-    assert {binding.pair_id for binding in published.pairs} == set(phases)
-    assert all(binding.ifg_generation_id for binding in published.pairs)
-    assert all(binding.unwrap_generation_id for binding in published.pairs)
-    assert published.timeseries_generation_id
-    published.close()
-
-    reopened = stack.open_generation()
-    assert reopened.generation_id
-    assert reopened.pair_ids == tuple(phases)
-    assert reopened.manifest_digest
-    reopened.close()
-
-    from faninsar.processing.errors import InvalidProcessingStateError
-
-    first_binding = published.pairs[0]
-    unwrap_payload = (
-        first_binding.artifact_root
-        / ".unwrap_generations"
-        / first_binding.unwrap_generation_id
-        / "unwrapped_phase.npy"
-    )
-    unwrap_payload.write_bytes(b"corrupted")
-    with pytest.raises(InvalidProcessingStateError, match="digest mismatch"):
-        stack.open_generation()
+    stack.unwrap()
+    assert stack.analysis_ready
+    assert stack.network_product_index is not None
 
 
 def test_partial_unwrap_network_cannot_publish_stack_generation(tmp_path: Path) -> None:
@@ -1009,11 +910,10 @@ def test_partial_unwrap_network_cannot_publish_stack_generation(tmp_path: Path) 
     assert not (stack.config.work_dir / "STACK_CURRENT").exists()
 
 
-def test_scene_artifacts_flow_through_merge_unwrap_and_sbas(
+def test_scene_artifacts_flow_through_merge_and_spatial_unwrap(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Three dates and overlapping bursts complete the persisted Stack chain."""
+    """Three dates and overlapping bursts complete spatial Stack processing."""
     stack = _stack_with_three_date_network(tmp_path)
     scene_phase = {
         "20240101": 0.0,
@@ -1045,38 +945,9 @@ def test_scene_artifacts_flow_through_merge_unwrap_and_sbas(
         stack.coreg_paths[date_id] = root.parent
 
     stack.form_interferograms(multilook=(1, 1))
-    stack.unwrap(do_spatial=False)
-    from faninsar.processing.timeseries import inversion as inversion_module
-
-    original_invert = inversion_module.invert_unwrapped_pairs
-
-    def assert_released_before_sbas(*args: object, **kwargs: object) -> object:
-        assert stack.unwrap_result is not None
-        assert stack.unwrap_result.phase_2d_unw is None
-        assert stack.unwrap_result.phase_1d_unw is None
-        assert stack.unwrap_result.corrections_k is None
-        assert stack.unwrap_result.temporal_converged_mask is None
-        return original_invert(*args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(
-        inversion_module,
-        "invert_unwrapped_pairs",
-        assert_released_before_sbas,
-    )
-    result = stack.invert_timeseries()
-
-    np.testing.assert_allclose(result.phase_cumulative_rad[1], 0.2, atol=1e-6)
-    np.testing.assert_allclose(result.phase_cumulative_rad[2], 0.55, atol=1e-6)
-    assert result.displacement_cumulative_m is not None
-    np.testing.assert_allclose(
-        result.displacement_cumulative_m,
-        result.phase_cumulative_rad * (-0.056 / (4.0 * np.pi)),
-    )
+    stack.unwrap()
     assert all((directory / "manifest.json").is_file() for directory in stack.ifg_dirs)
-    assert stack.unwrap_result is not None
-    assert stack.unwrap_result.phase_2d_unw is None
-    assert stack.unwrap_result.phase_1d_unw is None
-    assert stack.unwrap_result.corrections_k is None
+    assert stack.analysis_ready
 
 
 def test_form_interferograms_rejects_stale_scene_lineage(tmp_path: Path) -> None:
@@ -1142,7 +1013,7 @@ def test_stack_unwrap_fails_closed_for_incomplete_pair_network(
     _write_pair_artifact(stack, "20240113_20240125", phase)
 
     with pytest.raises(InvalidProcessingStateError, match="pair set"):
-        stack.unwrap(do_spatial=False)
+        stack.unwrap()
 
 
 def test_stack_unwrap_fails_closed_for_mixed_common_grids(tmp_path: Path) -> None:
@@ -1167,32 +1038,7 @@ def test_stack_unwrap_fails_closed_for_mixed_common_grids(tmp_path: Path) -> Non
     )
 
     with pytest.raises(InvalidProcessingStateError, match="common grid"):
-        stack.unwrap(do_spatial=False)
-
-
-def test_stack_unwrap_rejects_when_no_temporal_pixel_converges(
-    tmp_path: Path,
-) -> None:
-    """A bounded temporal solve cannot publish an unqualified generation."""
-    from faninsar.processing.errors import InvalidProcessingStateError
-
-    stack = _stack_with_three_date_network(tmp_path)
-    for pair_id, value in (
-        ("20240101_20240113", 0.2),
-        ("20240113_20240125", 0.3),
-        ("20240101_20240125", 0.5),
-    ):
-        _write_pair_artifact(
-            stack,
-            pair_id,
-            np.full((2, 2), value, dtype=np.float32),
-        )
-
-    with pytest.raises(InvalidProcessingStateError, match="no converged pixels"):
-        stack.unwrap(
-            do_spatial=False,
-            temporal_kwargs={"max_iter": 1},
-        )
+        stack.unwrap()
 
 
 def test_stack_invert_rejects_unqualified_unwrap_artifacts(tmp_path: Path) -> None:
