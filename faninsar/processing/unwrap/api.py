@@ -2,29 +2,25 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.unwrap.common import CommonUnwrapResult, build_common_result
-from faninsar.processing.unwrap.irls import irls_unwrap
-from faninsar.processing.unwrap.snaphu_backend import SnaphuConfig, snaphu_unwrap
-from faninsar.processing.unwrap.temporal_irls import (
-    TemporalUnwrapResult,
-    unwrap_temporal_irls,
-)
+from faninsar.processing.unwrap.irls import SpatialIRLS, _resolve_device
+from faninsar.processing.unwrap.snaphu_backend import Snaphu, SnaphuConfig
+
+if TYPE_CHECKING:
+    from faninsar.processing.unwrap.common import SpatialUnwrapResult
 
 logger = setup_logger(__name__)
 
 UnwrapBackend = Literal["irls", "snaphu"]
 
 __all__ = [
-    "TemporalUnwrapResult",
     "UnwrapBackend",
     "unwrap",
-    "unwrap_temporal_irls",
 ]
 
 
@@ -35,7 +31,7 @@ def unwrap(
     method: UnwrapBackend = "snaphu",
     snaphu_config: SnaphuConfig | None = None,
     irls_kwargs: dict[str, Any] | None = None,
-) -> CommonUnwrapResult:
+) -> SpatialUnwrapResult:
     """Unwrap phase with an explicitly selected backend.
 
     Parameters
@@ -53,36 +49,53 @@ def unwrap(
 
     Returns
     -------
-    CommonUnwrapResult
-        Normalized unwrap product.
+    SpatialUnwrapResult
+        Torch spatial result on the explicitly selected device.
 
     """
     if method == "irls":
+        import torch
+
         phase = np.asarray(wrapped_or_complex)
         if np.iscomplexobj(phase):
             phase = np.angle(phase)
-        result = irls_unwrap(phase, coherence, **(irls_kwargs or {}))
-        return build_common_result(
-            wrapped_phase=phase,
-            unwrapped_phase=result.unwrapped_phase,
-            connected_components=result.connected_components,
-            method="irls",
-            metrics={
-                "iterations": float(result.iterations),
-                "converged": float(result.converged),
-            },
-            configuration=dict(irls_kwargs or {}),
+        options = dict(irls_kwargs or {})
+        requested_device = options.pop("device", "auto")
+        resolved_device = _resolve_device(requested_device)
+        phase_tensor = torch.as_tensor(
+            phase,
+            dtype=torch.float32,
+            device=resolved_device,
+        )
+        coherence_tensor = (
+            None
+            if coherence is None
+            else torch.as_tensor(
+                coherence,
+                dtype=torch.float32,
+                device=resolved_device,
+            )
+        )
+        return SpatialIRLS(**options).unwrap(
+            phase_tensor,
+            coherence=coherence_tensor,
         )
     if method == "snaphu":
         if not np.iscomplexobj(wrapped_or_complex):
             reject_invalid_state(
                 "snaphu backend requires a complex interferogram input"
             )
+        import torch
+
         if coherence is None:
             reject_invalid_state("snaphu backend requires coherence")
-        return snaphu_unwrap(
-            np.asarray(wrapped_or_complex),
-            np.asarray(coherence),
-            config=snaphu_config,
+        if not isinstance(wrapped_or_complex, np.ndarray):
+            wrapped_or_complex = np.asarray(wrapped_or_complex)
+        phase = np.angle(wrapped_or_complex)
+        phase_tensor = torch.as_tensor(phase, dtype=torch.float32)
+        coherence_tensor = torch.as_tensor(coherence, dtype=torch.float32)
+        return Snaphu(snaphu_config).unwrap(
+            phase_tensor,
+            coherence=coherence_tensor,
         )
     return reject_invalid_state(f"unknown unwrap method: {method}")

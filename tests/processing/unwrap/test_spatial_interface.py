@@ -90,3 +90,37 @@ def test_spatial_irls_solves_a_wrapped_ramp_and_reports_work() -> None:
     assert result.iterations >= 1
     assert result.pcg_iterations >= 1
     assert result.residual_norm < 0.2
+
+
+def test_spatial_irls_uses_dct_preconditioner_for_each_pcg_solve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public solver admits work through the DCT-II/III preconditioner."""
+    import torch_dct
+
+    calls = {"dct": 0, "idct": 0}
+    dct = torch_dct.dct
+    idct = torch_dct.idct
+
+    def counted_dct(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["dct"] += 1
+        return dct(*args, **kwargs)
+
+    def counted_idct(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["idct"] += 1
+        return idct(*args, **kwargs)
+
+    monkeypatch.setattr(torch_dct, "dct", counted_dct)
+    monkeypatch.setattr(torch_dct, "idct", counted_idct)
+
+    rows, columns = torch.meshgrid(
+        torch.arange(8, dtype=torch.float32),
+        torch.arange(8, dtype=torch.float32),
+        indexing="ij",
+    )
+    phase = wrap_phase(0.9 * columns + 0.7 * rows)
+    result = SpatialIRLS(max_iter=2, cg_max_iter=4).unwrap(phase)
+
+    assert result.pcg_iterations > 0
+    assert calls["dct"] > 0
+    assert calls["idct"] > 0

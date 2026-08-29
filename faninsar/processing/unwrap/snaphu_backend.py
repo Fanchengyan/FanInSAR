@@ -13,10 +13,8 @@ from faninsar.capabilities import snaphu_capability
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import ProcessingContractError, reject_invalid_state
 from faninsar.processing.unwrap.common import (
-    CommonUnwrapResult,
     SpatialUnwrapper,
     SpatialUnwrapResult,
-    build_common_result,
 )
 from faninsar.processing.unwrap.errors import NoValidSupportError
 
@@ -102,7 +100,7 @@ class Snaphu(SpatialUnwrapper):
             finite = torch.isfinite(coherence)
             finite_values = coherence[finite]
             if torch.any(finite_values < 0) or torch.any(finite_values > 1):
-                raise ValueError("coherence finite values must be within [0, 1]")
+                reject_invalid_state("coherence finite values must be within [0, 1]")
             support &= finite
             backend_coherence = torch.nan_to_num(coherence, nan=0.0)
         else:
@@ -115,7 +113,7 @@ class Snaphu(SpatialUnwrapper):
         if coherence is None:
             coherence = backend_coherence
         try:
-            backend_result = snaphu_unwrap(
+            backend_phase, _backend_components = _snaphu_numpy(
                 torch.exp(1j * torch.nan_to_num(phase)).detach().cpu().numpy(),
                 backend_coherence.detach().cpu().numpy(),
                 config=self.config,
@@ -127,7 +125,7 @@ class Snaphu(SpatialUnwrapper):
             return self._failed_result(phase, support)
 
         output = torch.as_tensor(
-            backend_result.unwrapped_phase,
+            backend_phase,
             dtype=phase.dtype,
             device=phase.device,
         )
@@ -161,20 +159,20 @@ class Snaphu(SpatialUnwrapper):
         import torch
 
         if not isinstance(phase, torch.Tensor) or phase.ndim != 2:
-            raise ValueError("wrapped_phase must be a 2-D torch tensor")
+            reject_invalid_state("wrapped_phase must be a 2-D torch tensor")
         if not phase.is_floating_point() or phase.is_complex():
-            raise ValueError("wrapped_phase must be a real floating tensor")
+            reject_invalid_state("wrapped_phase must be a real floating tensor")
         for name, value in (("coherence", coherence), ("valid_mask", valid_mask)):
             if value is not None and not isinstance(value, torch.Tensor):
-                raise ValueError(f"{name} must be a torch tensor")
+                reject_invalid_state(f"{name} must be a torch tensor")
             if value is not None and value.shape != phase.shape:
-                raise ValueError(f"{name} must match wrapped_phase shape")
+                reject_invalid_state(f"{name} must match wrapped_phase shape")
             if value is not None and value.device != phase.device:
-                raise ValueError(f"{name} must share wrapped_phase device")
+                reject_invalid_state(f"{name} must share wrapped_phase device")
         if coherence is not None and not coherence.is_floating_point():
-            raise ValueError("coherence must be a floating tensor")
+            reject_invalid_state("coherence must be a floating tensor")
         if valid_mask is not None and valid_mask.dtype is not torch.bool:
-            raise ValueError("valid_mask must have dtype torch.bool")
+            reject_invalid_state("valid_mask must have dtype torch.bool")
 
     @staticmethod
     def _labels_and_edges(
@@ -289,12 +287,12 @@ def require_snaphu() -> Any:
     return import_module("snaphu")
 
 
-def snaphu_unwrap(
+def _snaphu_numpy(
     complex_ifg: np.ndarray,
     coherence: np.ndarray,
     *,
     config: SnaphuConfig | None = None,
-) -> CommonUnwrapResult:
+) -> tuple[np.ndarray, np.ndarray]:
     r"""Unwrap a complex interferogram with the snaphu-py API.
 
     Parameters
@@ -305,11 +303,6 @@ def snaphu_unwrap(
         Coherence in ``[0, 1]`` matching the interferogram shape.
     config : SnaphuConfig, optional
         Typed snaphu configuration.
-
-    Returns
-    -------
-    CommonUnwrapResult
-        Normalized unwrap product with method ``"snaphu"``.
 
     Raises
     ------
@@ -359,22 +352,44 @@ def snaphu_unwrap(
         np.asarray(coherence, dtype=np.float32),
         **kwargs,
     )
-    wrapped = np.angle(complex_ifg)
-    return build_common_result(
-        wrapped_phase=wrapped,
-        unwrapped_phase=np.asarray(unwrapped, dtype=np.float32),
-        connected_components=np.asarray(conncomp, dtype=np.int32),
-        method="snaphu",
-        metrics={
-            "mean_coherence": float(np.nanmean(coherence)),
-        },
-        configuration={
-            "cost": cfg.cost,
-            "nlooks": cfg.nlooks,
-            "ntiles": cfg.ntiles,
-            "nproc": cfg.nproc,
-            "wrapper_version": capability.wrapper_version,
-            "bundled_snaphu_version": capability.bundled_snaphu_version,
-            "license_caveat": capability.license_caveat,
-        },
+    return (
+        np.asarray(unwrapped, dtype=np.float32),
+        np.asarray(conncomp, dtype=np.int32),
+    )
+
+
+def snaphu_unwrap(
+    complex_ifg: np.ndarray,
+    coherence: np.ndarray,
+    *,
+    config: SnaphuConfig | None = None,
+) -> SpatialUnwrapResult:
+    """Unwrap a complex interferogram and return the spatial result contract.
+
+    Parameters
+    ----------
+    complex_ifg : numpy.ndarray
+        Two-dimensional complex interferogram.
+    coherence : numpy.ndarray
+        Coherence in ``[0, 1]`` matching ``complex_ifg``.
+    config : SnaphuConfig, optional
+        Explicit SNAPHU configuration.
+
+    Returns
+    -------
+    SpatialUnwrapResult
+        Torch result on CPU. Use :class:`Snaphu` to preserve a caller's
+        existing Torch device.
+
+    """
+    import torch
+
+    if not isinstance(complex_ifg, np.ndarray):
+        complex_ifg = np.asarray(complex_ifg)
+    if not isinstance(coherence, np.ndarray):
+        coherence = np.asarray(coherence)
+    phase = np.angle(complex_ifg).astype(np.float32)
+    return Snaphu(config).unwrap(
+        torch.as_tensor(phase),
+        coherence=torch.as_tensor(coherence, dtype=torch.float32),
     )

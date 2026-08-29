@@ -207,8 +207,8 @@ def unwrap_stack(
                 irls_kwargs=spatial_kw,
             )
             return (
-                np.asarray(result_2d.unwrapped_phase, dtype=np.float64),
-                np.asarray(result_2d.connected_components, dtype=np.int32),
+                result_2d.phase.detach().cpu().numpy().astype(np.float64),
+                result_2d.component_labels.detach().cpu().numpy().astype(np.int32),
             )
 
         if spatial_executor == "dask" and n_pairs > 1:

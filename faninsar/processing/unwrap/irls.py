@@ -768,17 +768,64 @@ class SpatialIRLS(SpatialUnwrapper):
             full = full.reshape_as(state)
             return apply(full, weights_h, weights_v).flatten()[free_index]
 
+        try:
+            torch_dct = importlib.import_module("torch_dct")
+        except ImportError:
+            message = (
+                "SpatialIRLS requires torch-dct for its DCT-II/DCT-III "
+                "preconditioner; install FanInSAR with core dependencies"
+            )
+            logger.exception(message)
+            raise ImportError(message) from None
+
+        dct = torch_dct.dct
+        idct = torch_dct.idct
+        height, width = state.shape
+        row = torch.arange(height, dtype=state.dtype, device=state.device)
+        column = torch.arange(width, dtype=state.dtype, device=state.device)
+        eigenvalues = (
+            4.0
+            - 2.0 * torch.cos(torch.pi * row[:, None] / height)
+            - 2.0 * torch.cos(torch.pi * column[None, :] / width)
+        )
+        eigenvalues = eigenvalues.clone()
+        eigenvalues[0, 0] = 1.0
+
+        def dct2(values: torch.Tensor) -> torch.Tensor:
+            """Apply orthonormal DCT-II along both spatial dimensions."""
+            return dct(dct(values, norm="ortho").T, norm="ortho").T
+
+        def idct2(values: torch.Tensor) -> torch.Tensor:
+            """Apply orthonormal DCT-III along both spatial dimensions."""
+            return idct(idct(values, norm="ortho").T, norm="ortho").T
+
+        def precondition(reduced: torch.Tensor) -> torch.Tensor:
+            """Apply the regular-grid Neumann Laplacian preconditioner."""
+            full = torch.zeros_like(state).flatten()
+            full[free_index] = reduced
+            full = full.reshape_as(state)
+            spectrum = dct2(full)
+            spectrum = spectrum.clone()
+            spectrum[0, 0] = 0.0
+            result = idct2(spectrum / eigenvalues)
+            return result.flatten()[free_index]
+
         solution = current_flat[free_index].clone()
         residual = rhs_flat - operator_free(solution)
         if not bool(torch.isfinite(residual).all()):
             return state, 0, "nonfinite_state"
-        direction = residual.clone()
-        rr = torch.dot(residual, residual)
+        preconditioned = precondition(residual)
+        rho = torch.dot(residual, preconditioned)
+        if not bool(torch.isfinite(preconditioned).all()) or not bool(
+            torch.isfinite(rho) and rho > 0.0
+        ):
+            return state, 0, "pcg_breakdown"
+        direction = preconditioned.clone()
         cg_limit = max(
             self.cg_atol,
             self.cg_tol * max(float(torch.linalg.vector_norm(rhs_flat)), 1.0),
         )
-        if float(torch.sqrt(rr)) <= cg_limit:
+        if float(torch.sqrt(torch.dot(residual, residual))) <= cg_limit:
             current_flat[free_index] = solution
             return current_flat.reshape_as(state), 0, None
         used = 0
@@ -787,22 +834,26 @@ class SpatialIRLS(SpatialUnwrapper):
             denominator = torch.dot(direction, adirection)
             if not bool(torch.isfinite(denominator)) or float(denominator) <= 0.0:
                 return state, used, "pcg_breakdown"
-            step = rr / denominator
+            step = rho / denominator
             solution = solution + step * direction
             residual = residual - step * adirection
             if not bool(
                 torch.isfinite(solution).all() and torch.isfinite(residual).all()
             ):
                 return state, used, "nonfinite_state"
-            next_rr = torch.dot(residual, residual)
-            if float(torch.sqrt(next_rr)) <= max(
+            residual_norm = torch.linalg.vector_norm(residual)
+            if float(residual_norm) <= max(
                 self.cg_atol,
                 self.cg_tol * max(float(torch.linalg.vector_norm(rhs_flat)), 1.0),
             ):
                 current_flat[free_index] = solution
                 return current_flat.reshape_as(state), used, None
-            direction = residual + (next_rr / rr) * direction
-            rr = next_rr
+            next_preconditioned = precondition(residual)
+            next_rho = torch.dot(residual, next_preconditioned)
+            if not bool(torch.isfinite(next_rho) and next_rho > 0.0):
+                return state, used, "pcg_breakdown"
+            direction = next_preconditioned + (next_rho / rho) * direction
+            rho = next_rho
         return state, used, "inner_iteration_limit"
 
     @staticmethod
