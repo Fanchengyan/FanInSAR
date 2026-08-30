@@ -380,8 +380,10 @@ class MaskPlan:
         callers must opt into that stage explicitly.
         """
         selected = tuple(stages)
+        from faninsar.processing.masking.mask import Mask
+
         return cls(
-            {"water": MaskDefinition("water", "water", provider=provider)},
+            {"water": Mask.from_water(provider=provider)},
             dict.fromkeys(selected, ("water",)),
         )
 

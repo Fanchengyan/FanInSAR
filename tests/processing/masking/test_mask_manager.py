@@ -295,7 +295,7 @@ def _seed_single_tile(
 def _qualified_manager(cache_dir: Path, **kwargs: object) -> MaskManager:
     """Build a manager with an explicit, unambiguous raster category policy."""
     kwargs.setdefault("ocean_shore_keep_m", 0.0)
-    kwargs.setdefault("inland_water_buffer_m", 0.0)
+    kwargs.setdefault("inland_shore_keep_m", 0.0)
     return MaskManager(cache_dir, **kwargs)  # type: ignore[arg-type]
 
 
@@ -417,7 +417,7 @@ class TestWaterExtractionAndVectorize:
         """A caller may explicitly make equal category policies applicable."""
         fake = _seed_single_tile(tmp_path, monkeypatch)
         manager = MaskManager(
-            tmp_path / "cache", ocean_shore_keep_m=0.0, inland_water_buffer_m=0.0
+            tmp_path / "cache", ocean_shore_keep_m=0.0, inland_shore_keep_m=0.0
         )
         layer = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
         assert layer.feature_count == 1
@@ -722,7 +722,7 @@ class TestResolveAutoMask:
             dem_path=dem_path,
             output_dir=tmp_path / "run",
             ocean_shore_keep_m=0.0,
-            inland_water_buffer_m=0.0,
+            inland_shore_keep_m=0.0,
         )
 
         assert out is not None

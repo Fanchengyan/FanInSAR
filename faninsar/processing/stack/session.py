@@ -1253,9 +1253,54 @@ class Stack(Network):
 
         if not isinstance(target, GridSpec):
             raise TypeError("mask targets must be GridSpec instances")
+
+        def _water_mask(provider: str = "auto", policy: object | None = None) -> Mask:
+            """Bind a deferred water mask to this Stack target grid."""
+            bounds = target.bounds
+            if target.crs != "EPSG:4326":
+                import pyproj
+
+                transformer = pyproj.Transformer.from_crs(
+                    target.crs, "EPSG:4326", always_xy=True
+                )
+                corners = [
+                    transformer.transform(x, y)
+                    for x, y in (
+                        (bounds[0], bounds[1]),
+                        (bounds[0], bounds[3]),
+                        (bounds[2], bounds[1]),
+                        (bounds[2], bounds[3]),
+                    )
+                ]
+                bounds = (
+                    min(point[0] for point in corners),
+                    min(point[1] for point in corners),
+                    max(point[0] for point in corners),
+                    max(point[1] for point in corners),
+                )
+            return Mask.from_water(
+                bounds=bounds,
+                provider=provider,
+                policy=policy if policy is not None else None,
+            )
+
         masks = []
         for definition in self.config.mask_plan.for_stage(stage):
-            if definition.kind == "raster":
+            # Python callers may register an already normalized Mask (including
+            # the deferred VectorMask returned by Mask.from_water()).  Check
+            # this before looking at recipe-only fields such as ``kind``.
+            if isinstance(definition, Mask):
+                recipe = getattr(definition, "_water_recipe", None)
+                if recipe is not None and recipe.get("bounds") is None:
+                    masks.append(
+                        _water_mask(
+                            provider=str(recipe.get("provider", "auto")),
+                            policy=recipe.get("policy"),
+                        )
+                    )
+                else:
+                    masks.append(definition)
+            elif definition.kind == "raster":
                 import rasterio
 
                 with rasterio.open(definition.path) as source:
@@ -1272,33 +1317,7 @@ class Stack(Network):
                 frame = gpd.read_file(definition.path)
                 masks.append(Mask.from_vector(frame))
             else:
-                bounds = target.bounds
-                if target.crs != "EPSG:4326":
-                    import pyproj
-
-                    transformer = pyproj.Transformer.from_crs(
-                        target.crs, "EPSG:4326", always_xy=True
-                    )
-                    corners = [
-                        transformer.transform(x, y)
-                        for x, y in (
-                            (bounds[0], bounds[1]),
-                            (bounds[0], bounds[3]),
-                            (bounds[2], bounds[1]),
-                            (bounds[2], bounds[3]),
-                        )
-                    ]
-                    bounds = (
-                        min(point[0] for point in corners),
-                        min(point[1] for point in corners),
-                        max(point[0] for point in corners),
-                        max(point[1] for point in corners),
-                    )
-                masks.append(
-                    Mask.from_water(
-                        bounds=bounds, provider=definition.provider or "auto"
-                    )
-                )
+                masks.append(_water_mask(provider=definition.provider or "auto"))
         combined = masks[0]
         for mask in masks[1:]:
             combined = combined + mask

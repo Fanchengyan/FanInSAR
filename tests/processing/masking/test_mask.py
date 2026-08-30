@@ -148,6 +148,18 @@ def test_water_recipe_is_deferred_and_requires_bounds(tmp_path: Path) -> None:
         recipe.to_raster(_grid())
 
 
+def test_water_policy_uses_shore_keep_names() -> None:
+    """Water recipes accept the public shore policy names only."""
+    recipe = Mask.from_water(
+        policy={"ocean_shore_keep_m": 1000.0, "inland_shore_keep_m": 0.0}
+    )
+
+    assert recipe._water_recipe["policy"]["ocean_shore_keep_m"] == 1000.0
+    assert recipe._water_recipe["policy"]["inland_shore_keep_m"] == 0.0
+    with pytest.raises(ValueError, match="unsupported fields"):
+        Mask.from_water(policy={"inland_water_buffer_m": 0.0})
+
+
 def test_projected_grid_rasterization() -> None:
     """Vector masks transform WGS84 geometry onto an explicit UTM grid."""
     import pyproj

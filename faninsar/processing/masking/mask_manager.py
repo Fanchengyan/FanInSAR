@@ -106,7 +106,7 @@ logger = setup_logger(__name__)
 
 __all__ = [
     "DEFAULT_MASK_NAME",
-    "INLAND_WATER_BUFFER_M",
+    "INLAND_SHORE_KEEP_M",
     "MASK_BUFFER_ENV",
     "MASK_CACHE_ENV",
     "MASK_SOURCE_ENV",
@@ -145,7 +145,7 @@ _ON_FAILURE_POLICIES = frozenset({"error"})
 # its authoritative footprint.  They are deliberately fixed in v1 rather
 # than exposed as a public classifier/protocol surface.
 OCEAN_SHORE_KEEP_M = 1000.0
-INLAND_WATER_BUFFER_M = 0.0
+INLAND_SHORE_KEEP_M = 0.0
 _CLASSIFICATION_VERSION = WATER_CLASSIFICATION_VERSION
 
 
@@ -403,7 +403,7 @@ def _padded_water_bounds(
     buffer_km = max(
         float(manager.buffer_km),
         float(manager.ocean_shore_keep_m) / 1000.0,
-        float(manager.inland_water_buffer_m) / 1000.0,
+        float(manager.inland_shore_keep_m) / 1000.0,
     )
     zone_lon = (raw[0] + raw[2]) / 2.0
     zone_lat = (raw[1] + raw[3]) / 2.0
@@ -583,7 +583,7 @@ class MaskManager:
     simplify_tolerance_m: float = 30.0
     min_area_km2: float = 1.0
     ocean_shore_keep_m: float = OCEAN_SHORE_KEEP_M
-    inland_water_buffer_m: float = INLAND_WATER_BUFFER_M
+    inland_shore_keep_m: float = INLAND_SHORE_KEEP_M
     max_workers: int = 8
     chunked_threshold: int = 4
     base_url: str | None = None
@@ -597,7 +597,7 @@ class MaskManager:
             logger.error(message)
             raise ValueError(message)
         self.buffer_km = float(self.buffer_km)
-        for field_name in ("ocean_shore_keep_m", "inland_water_buffer_m"):
+        for field_name in ("ocean_shore_keep_m", "inland_shore_keep_m"):
             value = float(getattr(self, field_name))
             if not np.isfinite(value) or value < 0.0:
                 message = f"{field_name} must be a finite number >= 0; got {value!r}"
@@ -706,7 +706,7 @@ class MaskManager:
             "simplify_tolerance_m": float(self.simplify_tolerance_m),
             "min_area_km2": float(self.min_area_km2),
             "ocean_shore_keep_m": float(self.ocean_shore_keep_m),
-            "inland_water_buffer_m": float(self.inland_water_buffer_m),
+            "inland_shore_keep_m": float(self.inland_shore_keep_m),
             "classification_version": _CLASSIFICATION_VERSION,
         }
         return _sha256_hex(_canonical_json(payload))
@@ -724,7 +724,7 @@ class MaskManager:
             "source_version": version,
             "classification_version": _CLASSIFICATION_VERSION,
             "ocean_shore_keep_m": float(self.ocean_shore_keep_m),
-            "inland_water_buffer_m": float(self.inland_water_buffer_m),
+            "inland_shore_keep_m": float(self.inland_shore_keep_m),
         }
 
     # -- planning and guard -------------------------------------------------
@@ -970,7 +970,7 @@ class MaskManager:
                     geometry, category = item
                 if category in {None, "water"}:
                     if float(self.ocean_shore_keep_m) != float(
-                        self.inland_water_buffer_m
+                        self.inland_shore_keep_m
                     ):
                         message = (
                             "water source did not qualify ocean versus inland "
@@ -1009,7 +1009,7 @@ class MaskManager:
         categories: list[str] = []
         operations = {
             "ocean": -float(self.ocean_shore_keep_m),
-            "inland": float(self.inland_water_buffer_m),
+            "inland": float(self.inland_shore_keep_m),
         }
         min_area_m2 = float(self.min_area_km2) * 1e6
         # ``band`` is fetch context, not the scientific ROI.  A polygon that
@@ -1135,7 +1135,7 @@ class MaskManager:
         if layer_path.is_file():
             _, cached_categories = _load_layer_features(layer_path)
             if "water" in cached_categories and float(self.ocean_shore_keep_m) != float(
-                self.inland_water_buffer_m
+                self.inland_shore_keep_m
             ):
                 message = (
                     "cached water layer lacks authoritative ocean/inland category, "
@@ -1238,7 +1238,7 @@ class MaskManager:
         buffer_km = max(
             float(self.buffer_km),
             float(self.ocean_shore_keep_m) / 1000.0,
-            float(self.inland_water_buffer_m) / 1000.0,
+            float(self.inland_shore_keep_m) / 1000.0,
         )
 
         dem_file = Path(dem_path)
@@ -1303,7 +1303,7 @@ class MaskManager:
         }
         tags["mask_buffer_km"] = str(float(buffer_km))
         tags["ocean_shore_keep_m"] = str(float(self.ocean_shore_keep_m))
-        tags["inland_water_buffer_m"] = str(float(self.inland_water_buffer_m))
+        tags["inland_shore_keep_m"] = str(float(self.inland_shore_keep_m))
         tags["classification_version"] = _CLASSIFICATION_VERSION
         tags["mask_identity"] = layer.identity
         return tags
@@ -1458,7 +1458,7 @@ def realize_water(
         "simplify_tolerance_m",
         "min_area_km2",
         "ocean_shore_keep_m",
-        "inland_water_buffer_m",
+        "inland_shore_keep_m",
         "max_workers",
         "chunked_threshold",
     }

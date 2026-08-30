@@ -171,7 +171,7 @@ class TestStackConfigMaskFields:
         for dropped in (
             "mask_buffer_km",
             "ocean_water_buffer_km",
-            "inland_water_buffer_km",
+            "inland_shore_keep_m",
             "mask_resolution_m",
         ):
             assert dropped not in names
@@ -324,7 +324,7 @@ class TestRunConfigMaskKeys:
             _run_config(
                 mask_buffer_km=2.0,
                 mask_resolution_m=30.0,
-                inland_water_buffer_km=1.0,
+                inland_shore_keep_m=1.0,
             )
         )
         captured = _RecordingStack.captured
@@ -332,7 +332,7 @@ class TestRunConfigMaskKeys:
             "mask_buffer_km",
             "mask_resolution_m",
             "ocean_water_buffer_km",
-            "inland_water_buffer_km",
+            "inland_shore_keep_m",
         ):
             assert dropped not in captured
 

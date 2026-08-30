@@ -25,6 +25,19 @@ logger = setup_logger(__name__)
 LonLatBounds = tuple[float, float, float, float]
 _SEAM_TOLERANCE_DEG = 1e-9
 _ROLE_OVERLAP_TOLERANCE = 1e-12
+_WATER_POLICY_KEYS = frozenset(
+    {
+        "threshold",
+        "excluded_values",
+        "invert",
+        "simplify_tolerance_m",
+        "min_area_km2",
+        "ocean_shore_keep_m",
+        "inland_shore_keep_m",
+        "max_workers",
+        "chunked_threshold",
+    }
+)
 
 
 def _utm_transformers(longitude_deg: float, latitude_deg: float) -> tuple[Any, Any]:
@@ -429,6 +442,16 @@ class Mask(ABC):
         policy: Mapping[str, object] | None = None,
     ) -> VectorMask:
         """Create a deferred water recipe without provider I/O."""
+        if policy is not None and not isinstance(policy, Mapping):
+            message = "water mask policy must be a mapping"
+            logger.error(message)
+            raise TypeError(message)
+        if policy:
+            unknown = sorted(set(policy) - _WATER_POLICY_KEYS)
+            if unknown:
+                message = f"water mask policy contains unsupported fields: {unknown!r}"
+                logger.error(message)
+                raise ValueError(message)
         return VectorMask(
             None,
             crs="EPSG:4326",
