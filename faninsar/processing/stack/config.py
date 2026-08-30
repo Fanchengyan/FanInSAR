@@ -28,17 +28,6 @@ EsdMethod = Literal["auto", "splitband", "overlap"]
 OnNetworkFailure = Literal["error"]
 FlattenStage = Literal["coregistration", "interferogram"]
 ActivationMode = Literal["reference", "qualified"]
-MaskFailurePolicy = Literal["error"]
-
-#: Stack default: the automatic water mask resolved through the
-#: :mod:`faninsar.processing.masking` manager (PROPOSAL-0039 G5).
-AUTO_WATER_MASK = "water"
-#: String spelling that explicitly disables masking (``mask: none`` in a
-#: mapping config; normalized to ``None`` in :meth:`StackConfig.__post_init__`).
-MASK_DISABLED = "none"
-
-_MASK_FAILURE_POLICIES = frozenset({"error", "warning", "skip"})
-
 logger = setup_logger(__name__)
 
 
@@ -49,15 +38,9 @@ class StackConfig:
     Step methods may override individual fields for a single call; overrides
     do not mutate this config unless the step is written to do so.
 
-    .. note::
-        The ``mask`` fields implement the PROPOSAL-0039 Stack surface: the
-        default is the automatic water mask (resolved through the masking
-        manager and subtracted from the ROI at burst-selection level), while
-        ``mask=None`` explicitly disables masking and restores unmasked
-        processing. The water-pipeline buffer (``MaskManager.buffer_km``,
-        ``FANINSAR_MASK_BUFFER_KM``) and the mask grid (always the DEM grid
-        via the manager) are owned by the masking manager, not by
-        :class:`StackConfig`.
+    ``mask_plan`` is the only mask configuration surface.  An empty plan is
+    unmasked processing; every non-empty stage is explicit and normalized
+    before this object is constructed.
     """
 
     work_dir: Path

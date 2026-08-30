@@ -406,6 +406,8 @@ class InterferogramArtifactStore:
     phase_screen_digests: dict[str, dict[str, str]] = field(default_factory=dict)
     phase_screen_domain: str = "radar"
     phase_screen_grid_identity: str = ""
+    mask_plan_identity: str = ""
+    mask_identity: str | None = None
 
     @classmethod
     def open(cls, root: str | Path) -> Self:
@@ -528,6 +530,12 @@ class InterferogramArtifactStore:
             reject_invalid_state("artifact phase_screen_grid_identity is invalid")
         if phase_screen_domain != domain or phase_screen_grid_identity != grid_identity:
             reject_invalid_state("artifact phase-screen grid binding differs")
+        mask_plan_identity = manifest.get("mask_plan_identity", "")
+        if not isinstance(mask_plan_identity, str):
+            reject_invalid_state("artifact mask_plan_identity is invalid")
+        mask_identity = manifest.get("mask_identity")
+        if mask_identity is not None and not isinstance(mask_identity, str):
+            reject_invalid_state("artifact mask_identity is invalid")
         if flatten_stage == "coregistration" and (
             phase_screen_model is not None or phase_screen_digests
         ):
@@ -597,6 +605,8 @@ class InterferogramArtifactStore:
             phase_screen_digests=phase_screen_digests,
             phase_screen_domain=str(phase_screen_domain),
             phase_screen_grid_identity=str(phase_screen_grid_identity),
+            mask_plan_identity=mask_plan_identity,
+            mask_identity=mask_identity,
             shape=shape,
             manifest_digest=digest,
             _payloads=payloads,
@@ -618,12 +628,16 @@ class InterferogramArtifactStore:
     def read(self) -> InterferogramArtifact:
         """Read all IFG layers after validating hashes, shapes, and dtypes."""
         arrays = _read_payloads(self.generation_root, self._payloads)
-        if arrays["complex_ifg"].dtype.kind != "c" or any(
-            arrays[name].dtype.kind != "f"
-            for name in ("wrapped_phase", "amplitude")
-        ) or (
-            arrays.get("coherence") is not None
-            and arrays["coherence"].dtype.kind != "f"
+        if (
+            arrays["complex_ifg"].dtype.kind != "c"
+            or any(
+                arrays[name].dtype.kind != "f"
+                for name in ("wrapped_phase", "amplitude")
+            )
+            or (
+                arrays.get("coherence") is not None
+                and arrays["coherence"].dtype.kind != "f"
+            )
         ):
             reject_invalid_state("artifact IFG layer dtypes are incompatible")
         valid_mask = arrays.get("valid_mask")
@@ -711,6 +725,8 @@ def write_ifg_artifact(
     filter_name: str,
     filter_parameters: Mapping[str, Any],
     source_manifest_digests: Mapping[str, str],
+    mask_plan_identity: str = "",
+    mask_identity: str | None = None,
     flatten_stage: str = "coregistration",
     phase_screen_model: str | None = None,
     phase_screen_digests: Mapping[str, Mapping[str, str]] | None = None,
@@ -750,6 +766,10 @@ def write_ifg_artifact(
         Canonical JSON parameters for the filter.
     source_manifest_digests : mapping[str, str]
         Named SHA-256 digests of every source scene manifest.
+    mask_plan_identity : str, optional
+        Normalized Stack mask-plan identity bound to this artifact.
+    mask_identity : str, optional
+        Materialized target-grid mask identity, when a stage mask is applied.
     flatten_stage : {"coregistration", "interferogram"}, optional
         Stage at which flattening was applied (or deferred).
     phase_screen_model : {None, "nisar_ellipsoidal_v1"}, optional
@@ -793,11 +813,12 @@ def write_ifg_artifact(
     shape = next(iter(shapes))
     if len(shape) != 2 or any(size <= 0 for size in shape):
         reject_invalid_state("IFG artifact layers must be non-empty 2-D arrays")
-    if arrays["complex_ifg"].dtype.kind != "c" or any(
-        arrays[name].dtype.kind != "f"
-        for name in ("wrapped_phase", "amplitude")
-    ) or (
-        coherence is not None and arrays["coherence"].dtype.kind != "f"
+    if (
+        arrays["complex_ifg"].dtype.kind != "c"
+        or any(
+            arrays[name].dtype.kind != "f" for name in ("wrapped_phase", "amplitude")
+        )
+        or (coherence is not None and arrays["coherence"].dtype.kind != "f")
     ):
         reject_invalid_state("IFG artifact layer dtypes are incompatible")
     if valid_mask is not None and arrays["valid_mask"].dtype != np.bool_:
@@ -923,6 +944,8 @@ def write_ifg_artifact(
             "phase_screen_grid_identity": resolved_phase_screen_grid_identity,
             "filter": {"name": filter_name, "parameters": parameters},
             "source_manifest_digests": sources,
+            "mask_plan_identity": mask_plan_identity,
+            "mask_identity": mask_identity,
             "shape": [int(shape[0]), int(shape[1])],
             "payloads": descriptors,
         }

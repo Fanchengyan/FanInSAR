@@ -16,13 +16,6 @@ from faninsar.processing.stack.config import (
     FlattenStage,
     StackConfig,
 )
-from faninsar.processing.stack.mask_plan import (
-    MASK_KINDS,
-    STAGES,
-    WATER_MASK_PLAN,
-    MaskDefinition,
-    MaskPlan,
-)
 from faninsar.processing.stack.ifg_store import (
     InterferogramArtifact,
     InterferogramArtifactStore,
@@ -31,6 +24,12 @@ from faninsar.processing.stack.ifg_store import (
 from faninsar.processing.stack.ion_store import (
     IonosphereArtifact,
     IonosphereArtifactStore,
+)
+from faninsar.processing.stack.mask_plan import (
+    MASK_KINDS,
+    STAGES,
+    MaskDefinition,
+    MaskPlan,
 )
 from faninsar.processing.stack.nisar import NISARStack
 from faninsar.processing.stack.provider import (
@@ -51,6 +50,8 @@ from faninsar.processing.stack.stack_generation import (
 )
 
 __all__ = [
+    "MASK_KINDS",
+    "STAGES",
     "ActivationIssuerRecord",
     "ActivationMode",
     "CoregMode",
@@ -62,7 +63,6 @@ __all__ = [
     "IonosphereArtifact",
     "IonosphereArtifactStore",
     "LocalActivationAuthority",
-    "MASK_KINDS",
     "MaskDefinition",
     "MaskPlan",
     "NISARStack",
@@ -78,8 +78,6 @@ __all__ = [
     "UnsupportedStackCapabilityError",
     "UnwrapResultGeneration",
     "UnwrappedArtifact",
-    "STAGES",
-    "WATER_MASK_PLAN",
     "open_unwrap_generation",
     "publish_unwrap_generation",
     "unavailable_scene_provider",

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -19,6 +20,119 @@ import numpy as np
 from faninsar.logging import setup_logger
 
 logger = setup_logger(__name__)
+
+LonLatBounds = tuple[float, float, float, float]
+_SEAM_TOLERANCE_DEG = 1e-9
+
+
+def _utm_transformers(longitude_deg: float, latitude_deg: float) -> tuple[Any, Any]:
+    """Return always-XY WGS84 and auto-UTM transformers for water adapters."""
+    import pyproj
+
+    zone = int((float(longitude_deg) + 180.0) // 6.0) + 1
+    epsg = 32600 + zone if float(latitude_deg) >= 0 else 32700 + zone
+    projected = f"EPSG:{epsg}"
+    return (
+        pyproj.Transformer.from_crs("EPSG:4326", projected, always_xy=True),
+        pyproj.Transformer.from_crs(projected, "EPSG:4326", always_xy=True),
+    )
+
+
+def padded_fetch_band(
+    bounds: LonLatBounds, buffer_km: float, *, zone_lon: float, zone_lat: float
+) -> LonLatBounds:
+    """Expand geographic bounds by a small UTM-distance padding."""
+    forward, reverse = _utm_transformers(zone_lon, zone_lat)
+    west, south, east, north = (float(value) for value in bounds)
+    xs, ys = forward.transform([west, east, west, east], [south, south, north, north])
+    pad = float(buffer_km) * 1000.0
+    lons, lats = reverse.transform(
+        np.asarray(xs) + np.array([-pad, pad, -pad, pad]),
+        np.asarray(ys) + np.array([-pad, -pad, pad, pad]),
+    )
+    lons, lats = np.asarray(lons), np.asarray(lats)
+    if not np.all(np.isfinite(lons)) or not np.all(np.isfinite(lats)):
+        lon_pad = float(buffer_km) / (
+            111.32 * math.cos(math.radians(min(89.0, max(abs(south), abs(north)))))
+        )
+        lat_pad = float(buffer_km) / 111.32
+        return west - lon_pad, south - lat_pad, east + lon_pad, north + lat_pad
+    return float(lons.min()), float(lats.min()), float(lons.max()), float(lats.max())
+
+
+def snap_band(band: LonLatBounds, tile_size_deg: float) -> LonLatBounds:
+    """Snap geographic bounds outwards to a regular tile grid."""
+    west, south, east, north = (float(value) for value in band)
+    tile = float(tile_size_deg)
+    return (
+        math.floor((west + 180.0) / tile) * tile - 180.0,
+        math.floor((south + 90.0) / tile) * tile - 90.0,
+        math.floor((east + 180.0) / tile) * tile + tile - 180.0,
+        math.floor((north + 90.0) / tile) * tile + tile - 90.0,
+    )
+
+
+def antimeridian_seam_guard(
+    raw_bounds: LonLatBounds, *, padded_band: LonLatBounds
+) -> tuple[bool, str]:
+    """Reject geographic requests that cross or reach the antimeridian."""
+    west, _south, east, _north = (float(value) for value in raw_bounds)
+    if west < -180.0 or east > 180.0:
+        return False, "out-of-range longitude"
+    if east - west > 180.0:
+        return False, "planar longitude span > 180 deg"
+    padded_west, _a, padded_east, _b = (float(value) for value in padded_band)
+    if (
+        padded_west + 180.0 <= _SEAM_TOLERANCE_DEG
+        or 180.0 - padded_east <= _SEAM_TOLERANCE_DEG
+    ):
+        return False, "padded fetch band reaches the +/-180 seam"
+    return True, "ok"
+
+
+def rasterize_to_grid(
+    geometries: object,
+    transform: object,
+    shape: tuple[int, int],
+    *,
+    all_touched: bool = False,
+    validity: np.ndarray | None = None,
+    crs: object = None,
+) -> np.ndarray:
+    """Rasterize geometry values using canonical uint8 labels."""
+    import pyproj
+    import shapely.ops
+    from rasterio.features import rasterize
+    from shapely.geometry.base import BaseGeometry
+
+    if isinstance(geometries, BaseGeometry):
+        values = [geometries]
+    elif hasattr(geometries, "geometry"):
+        values = list(geometries.geometry)
+    else:
+        values = list(geometries)
+    target_crs = "EPSG:4326" if crs is None else crs
+    if str(target_crs) != "EPSG:4326":
+        transformer = pyproj.Transformer.from_crs(
+            "EPSG:4326", target_crs, always_xy=True
+        )
+        values = [
+            shapely.ops.transform(transformer.transform, value) for value in values
+        ]
+    result = rasterize(
+        [(value, 1) for value in values if not value.is_empty],
+        out_shape=tuple(int(size) for size in shape),
+        transform=transform,
+        fill=0,
+        all_touched=all_touched,
+        dtype="uint8",
+    )
+    if validity is not None:
+        valid = np.asarray(validity, dtype=bool)
+        if valid.shape != result.shape:
+            raise ValueError("validity shape does not match raster shape")
+        result[~valid] = 255
+    return np.asarray(result, dtype=np.uint8)
 
 
 class GridSpec:
@@ -188,14 +302,9 @@ class Mask(ABC):
         *,
         grid: GridSpec,
         source: object | None = None,
-        predicate: object | None = None,
     ) -> RasterMask:
         """Construct a raster mask from bool or uint8 data."""
         del source
-        if predicate is not None:
-            message = "raster predicates are not supported; pass bool/uint8 data"
-            logger.error(message)
-            raise TypeError(message)
         if not isinstance(grid, GridSpec):
             raise TypeError("grid must be a GridSpec")
         return RasterMask(data, grid)
@@ -489,9 +598,14 @@ class VectorMask(Mask):
     def to_vector(self, bounds: object | None = None) -> VectorMask:
         """Return a snapshot, optionally clipped to a finite geometry."""
         if self._water_recipe is not None:
-            message = "deferred water mask has no realization provider in this slice"
-            logger.error(message)
-            raise RuntimeError(message)
+            # Import lazily so constructing a recipe remains a zero-I/O
+            # operation and the masking manager stays an optional boundary.
+            from faninsar.processing.masking.mask_manager import realize_water_mask
+
+            realized = realize_water_mask(self, cache_dir=None)
+            if not isinstance(realized, VectorMask):
+                raise TypeError("water realization did not return a VectorMask")
+            return realized.to_vector(bounds)
         if bounds is None:
             geometries = list(self.geometry)
         else:
@@ -511,9 +625,12 @@ class VectorMask(Mask):
     def to_raster(self, grid: GridSpec) -> RasterMask:
         """Rasterize excluded and invalid roles with center-pixel semantics."""
         if self._water_recipe is not None:
-            message = "deferred water mask has no realization provider in this slice"
-            logger.error(message)
-            raise RuntimeError(message)
+            from faninsar.processing.masking.mask_manager import realize_water_mask
+
+            realized = realize_water_mask(self, grid=grid, cache_dir=None)
+            if not isinstance(realized, RasterMask):
+                raise TypeError("water realization did not return a RasterMask")
+            return realized
         if not isinstance(grid, GridSpec):
             raise TypeError("grid must be a GridSpec")
         import pyproj
@@ -572,6 +689,15 @@ class VectorMask(Mask):
         self, distances_m: Mapping[object, float], *, category_field: str = "category"
     ) -> VectorMask:
         """Apply signed metre buffers independently by category."""
+        if self._water_recipe is not None:
+            from faninsar.processing.masking.mask_manager import realize_water_mask
+
+            realized = realize_water_mask(self, cache_dir=None)
+            if not isinstance(realized, VectorMask):
+                raise TypeError("water realization did not return a VectorMask")
+            return realized.buffer_by_category(
+                distances_m, category_field=category_field
+            )
         del category_field
         import pyproj
         import shapely.ops
@@ -603,9 +729,13 @@ class VectorMask(Mask):
     def save(self, path: str | Path, *, overwrite: bool = False) -> None:
         """Write features to GeoJSON, GPKG, or Parquet."""
         if self._water_recipe is not None:
-            message = "deferred water mask has no realization provider in this slice"
-            logger.error(message)
-            raise RuntimeError(message)
+            from faninsar.processing.masking.mask_manager import realize_water_mask
+
+            realized = realize_water_mask(self, cache_dir=None)
+            if not isinstance(realized, VectorMask):
+                raise TypeError("water realization did not return a VectorMask")
+            realized.save(path, overwrite=overwrite)
+            return
         target = Path(path)
         suffix = target.suffix.lower()
         if suffix not in {".geojson", ".gpkg", ".parquet"}:

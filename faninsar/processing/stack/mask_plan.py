@@ -461,12 +461,9 @@ class MaskPlan:
             _fail(f"unknown stage {stage!r}; expected {', '.join(STAGES)}")
 
 
-WATER_MASK_PLAN = MaskPlan.water()
-
 __all__ = [
     "MASK_KINDS",
     "STAGES",
-    "WATER_MASK_PLAN",
     "MaskDefinition",
     "MaskKind",
     "MaskPlan",

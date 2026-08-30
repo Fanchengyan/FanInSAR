@@ -5,6 +5,10 @@ and interferogram formation are separate stages: coreg caches per-date SLCs;
 ``form_interferograms`` only reads those products.
 """
 
+# The Stack session preserves established runtime exception messages while
+# the public mask-plan seam performs strict validation at its boundary.
+# ruff: noqa: EM101, TRY003
+
 from __future__ import annotations
 
 import gc
@@ -46,7 +50,6 @@ from faninsar.processing.coreg.misreg_network import (
     invert_pair_misregistration,
 )
 from faninsar.processing.errors import (
-    InvalidProcessingStateError,
     reject_invalid_state,
 )
 from faninsar.processing.interferometry.pair import validate_coherence_window
@@ -57,14 +60,13 @@ from faninsar.processing.interferometry.phase_filter import (
 )
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.config import (
-    AUTO_WATER_MASK,
     ActivationMode,
     CoregMode,
     EsdMethod,
     FlattenStage,
-    MaskFailurePolicy,
     StackConfig,
 )
+from faninsar.processing.stack.mask_plan import MaskPlan, StageName
 from faninsar.processing.stack.provider import SourceHandle
 from faninsar.processing.stack.scene_store import (
     CoregisteredSceneStore,
@@ -85,7 +87,6 @@ if TYPE_CHECKING:
         StackActivationBinding,
     )
     from faninsar.processing.geometry.dem import DEMSampler
-    from faninsar.processing.masking.mask import MaskSampler
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.production import (
         BurstSelection,
@@ -181,7 +182,7 @@ def _raise_unwrap_failed(
 
 
 # ---------------------------------------------------------------------------
-# PROPOSAL-0039 mask-aware effective ROI (Stack integration, Slice D1)
+# PROPOSAL-0040 canonical mask-plan integration
 # ---------------------------------------------------------------------------
 
 
@@ -262,179 +263,71 @@ def _effective_roi_polygons(parts: list[Any]) -> object:
     )
 
 
-def _mask_failure_lineage(
-    mask_on_failure: str,
-    error: Exception,
-    roi: object | None,
-) -> _EffectiveRoi:
-    """Apply the failure policy after an unresolvable mask; record absence.
+def _mask_vector_for_roi(plan: MaskPlan, roi: object) -> object | None:
+    """Materialize the explicit ROI stage and return excluded geometry only."""
+    refs = plan.references("roi")
+    if not refs:
+        return None
+    from faninsar.processing.masking.mask import Mask, VectorMask
 
-    ``error`` policy re-raises the structured failure; ``warning`` logs
-    loudly and ``skip`` logs quietly, both recording ``{"mask": "absent",
-    "reason": ...}`` for the run manifest while keeping the unmasked ROI.
-    """
-    if mask_on_failure == "error":
-        raise error
-    reason = str(error)
-    if mask_on_failure == "warning":
-        logger.error(
-            "water mask unavailable; continuing WITHOUT mask (mask-absent) "
-            "and recording the mask-absent state in the run manifest "
-            "(PROPOSAL-0039 on_failure=warning): %s",
-            reason,
-        )
-    else:
-        logger.debug(
-            "water mask unavailable; skipping silently (on_failure=skip): %s",
-            reason,
-        )
-    return _EffectiveRoi(
-        roi=roi,
-        geometry=None,
-        lineage={"mask": "absent", "reason": reason},
-    )
+    bounds = _roi_to_geometry(roi)
+    parts: list[VectorMask] = []
+    for definition in plan.for_stage("roi"):
+        if definition.kind == "raster":
+            # Raster ROI masks require a target grid and therefore cannot be
+            # used for geometric subtraction at this seam.
+            raise ValueError(
+                "ROI stage raster masks require an explicit grid"
+            )
+        if definition.kind == "vector":
+            import geopandas as gpd
+
+            frame = gpd.read_file(definition.path)
+            parts.append(Mask.from_vector(frame).to_vector(bounds))
+        else:
+            recipe = Mask.from_water(
+                bounds=tuple(float(value) for value in bounds.bounds),
+                provider=definition.provider or "auto",
+            )
+            parts.append(recipe.to_vector(bounds))
+    geometries = [
+        geometry
+        for vector in parts
+        for geometry, role in zip(vector.geometry, vector.roles, strict=True)
+        if role == "excluded"
+    ]
+    if not geometries:
+        return None
+    return Mask.from_vector(geometries, crs=parts[0].crs).to_vector()
 
 
 def _resolve_effective_roi(
     roi: BoundingBox | Polygons | None,
     *,
-    mask: str | MaskSampler | None,
-    mask_source: str | None,
-    mask_on_failure: MaskFailurePolicy,
+    mask_plan: MaskPlan,
 ) -> _EffectiveRoi:
-    """Resolve ``effective_ROI = ROI - water_beyond_buffer`` (PROPOSAL-0039 G6).
-
-    The antimeridian seam guard runs FIRST on the raw ROI bounds with the
-    padded, tile-snapped fetch band and fails closed before any fetch; the
-    cached vector water layer is read back (geopandas), buffered with
-    :func:`~faninsar.processing.masking.mask.buffer_land_utm_km` in the ROI's
-    auto-UTM zone, and subtracted from the ROI geometry. The land buffer is
-    owned by the water pipeline (``MaskManager.buffer_km``, overridable via
-    ``FANINSAR_MASK_BUFFER_KM`` through ``get_mask_manager``). An empty
-    result raises a structured :class:`InvalidProcessingStateError`
-    independent of ``mask_on_failure``. Mask *resolution* failures (provider
-    outage, misconfigured manager) route through the ``mask_on_failure``
-    policy and degrade to the unmasked ROI with a mask-absent lineage record.
-
-    Parameters
-    ----------
-    roi : BoundingBox, Polygons, or None
-        The configured Stack ROI. ``None`` defers masking to the product
-        level (Slice D2); no ROI is forced.
-    mask : str, MaskSampler, or None
-        ``None`` disables masking (bitwise-identical legacy path);
-        ``AUTO_WATER_MASK`` selects the automatic water mask; any other
-        object is a user-supplied sampler whose masking is product-level
-        (Slice D2), leaving the ROI untouched in this slice.
-    mask_source : str or None
-        MaskManager selection override (``water`` / ``water:<provider>``).
-    mask_on_failure : "error", "warning", or "skip"
-        Failure policy for mask *resolution* failures only.
-
-    Returns
-    -------
-    _EffectiveRoi
-        The effective ROI, its geometry, and the run-manifest lineage record.
-
-    Raises
-    ------
-    InvalidProcessingStateError
-        When the seam guard rejects the ROI or when the effective ROI is
-        empty (both structural).
-    MaskProviderUnavailableError
-        When the provider fails under the ``error`` policy.
-
-    """
-    if mask is None:
-        # Explicitly disabled: bitwise-identical legacy path, no lineage.
+    """Subtract only explicitly excluded ROI-stage geometry from the ROI."""
+    if roi is None or not mask_plan.references("roi"):
         return _EffectiveRoi(roi=roi, geometry=None, lineage={})
-    if roi is None:
-        # Without an ROI the mask still applies at the product level
-        # (PROPOSAL-0039 Stack integration, Slice D2); never force an ROI.
-        return _EffectiveRoi(roi=None, geometry=None, lineage={})
-    if not isinstance(mask, str):
-        # User-supplied samplers are product-level masks (Slice D2); the
-        # geometric ROI subtraction is pinned to the automatic water mask.
-        return _EffectiveRoi(roi=roi, geometry=None, lineage={})
-    if mask != AUTO_WATER_MASK:  # defensive; StackConfig validates strings
-        reject_invalid_state(f"unsupported Stack mask selection: {mask!r}")
-
-    from faninsar.processing.masking.mask import (
-        antimeridian_seam_guard,
-        buffer_land_utm_km,
-        padded_fetch_band,
-        snap_band,
-    )
-    from faninsar.processing.masking.mask_manager import (
-        MaskProviderUnavailableError,
-        get_mask_manager,
-    )
-
-    try:
-        manager = get_mask_manager(source=mask_source, on_failure=mask_on_failure)
-    except InvalidProcessingStateError as error:
-        # A misconfigured manager (e.g. unset mask cache dir) is an
-        # unresolvable mask, not a structural ROI problem: the failure
-        # policy governs, mirroring a provider outage.
-        return _mask_failure_lineage(mask_on_failure, error, roi)
-
-    # The buffer is owned by the water pipeline (MaskManager.buffer_km).
-    buffer_km = float(manager.buffer_km)
-    roi_geometry = _roi_to_geometry(roi)
-    raw_bounds = tuple(float(value) for value in roi_geometry.bounds)
-    zone_lon = (raw_bounds[0] + raw_bounds[2]) / 2.0
-    zone_lat = (raw_bounds[1] + raw_bounds[3]) / 2.0
-
-    # Seam guard FIRST: fail closed on the raw ROI bounds with the padded,
-    # tile-snapped fetch band before any fetch (PROPOSAL-0039 G4).
-    padded = padded_fetch_band(
-        raw_bounds, buffer_km, zone_lon=zone_lon, zone_lat=zone_lat
-    )
-    band = snap_band(padded, manager.source_entry.tile_size_deg)
-    seam_ok, seam_reason = antimeridian_seam_guard(raw_bounds, padded_band=band)
-    if not seam_ok:
-        reject_invalid_state(
-            "water-mask ROI rejected by the antimeridian seam guard "
-            f"({seam_reason}); ROI bounds {raw_bounds} fail closed before "
-            "any fetch (PROPOSAL-0039)"
-        )
-
-    try:
-        layer = manager.get_water_layer(padded)
-    except MaskProviderUnavailableError as error:
-        return _mask_failure_lineage(mask_on_failure, error, roi)
-
-    import geopandas as gpd
     import shapely
 
-    layer_frame = gpd.read_file(layer.path)
-    series = layer_frame.geometry
-    water = series.union_all() if hasattr(series, "union_all") else series.unary_union
-    buffered = buffer_land_utm_km(
-        water, buffer_km, zone_lon=zone_lon, zone_lat=zone_lat
-    )
-    effective = roi_geometry.difference(buffered)
-    parts = _polygonal_parts(effective)
+    roi_geometry = _roi_to_geometry(roi)
+    excluded = _mask_vector_for_roi(mask_plan, roi)
+    if excluded is None or not excluded.geometry:
+        return _EffectiveRoi(roi=roi, geometry=None, lineage={})
+    geometries = [
+        geometry
+        for geometry, role in zip(excluded.geometry, excluded.roles, strict=True)
+        if role == "excluded"
+    ]
+    difference = roi_geometry.difference(shapely.union_all(geometries))
+    parts = _polygonal_parts(difference)
     if not parts:
-        reject_invalid_state(
-            "effective ROI is empty after water-mask subtraction: the ROI "
-            f"{raw_bounds} is fully covered by buffered water "
-            f"(mask={mask!r}, buffer_km={buffer_km}, provider="
-            f"{manager.source_entry.provider}); this structural guard holds "
-            "regardless of mask_on_failure (PROPOSAL-0039 G6)"
-        )
+        reject_invalid_state("ROI is empty after applying excluded mask geometry")
     return _EffectiveRoi(
         roi=_effective_roi_polygons(parts),
         geometry=parts[0] if len(parts) == 1 else shapely.union_all(parts),
-        lineage={
-            "mask": "present",
-            "mask_identity": layer.identity,
-            "mask_source_version": layer.source_version,
-            "buffer_km": buffer_km,
-            # Reused by the product-level mask resolution (Slice D2) so the
-            # ROI arithmetic and the IFG/unwrap mask share one vector layer.
-            "mask_layer_path": str(layer.path),
-        },
+        lineage={"mask_plan": mask_plan.identity},
     )
 
 
@@ -458,46 +351,17 @@ def _grid_crs_epsg(grid: Any) -> int | None:
 
 
 def _mask_removed_plane(
-    mask: MaskSampler,
+    mask: object,
     *,
     transform: Any,
     shape: tuple[int, int],
 ) -> np.ndarray:
-    """Rasterize or nearest-resample any mask onto one target geo grid.
+    """Return a nearest-neighbour canonical plane on one geographic grid."""
+    from faninsar.processing.masking.mask import GridSpec
 
-    The target grid is EPSG:4326 degrees (``transform`` maps pixel
-    coordinates to lon/lat).  :class:`~faninsar.processing.masking.mask.\
-RasterMask` input goes through :func:`faninsar.processing.masking.mask.\
-resample_mask_to_grid` (nearest-neighbour only, the globally pinned rule —
-    this is how a mask on a different grid follows an IFG grid);
-    :class:`~faninsar.processing.masking.mask.VectorMask` input rasterizes
-    directly; any other :class:`~faninsar.processing.masking.mask.MaskSampler`
-    is sampled at the target cell centers.
-
-    Returns
-    -------
-    numpy.ndarray
-        uint8 plane with ``1`` = removed (water/masked), ``0`` = keep, and
-        ``255`` = invalid where the mask raster holds NoData.  The Stack
-        consumption rule treats **only** ``1`` as removing support; absence
-        of mask data never deletes data.
-
-    """
-    from faninsar.processing.masking.mask import (
-        RasterMask,
-        VectorMask,
-        resample_mask_to_grid,
-    )
-
-    target_shape = (int(shape[0]), int(shape[1]))
-    if isinstance(mask, RasterMask):
-        return resample_mask_to_grid(mask, transform, target_shape)
-    if isinstance(mask, VectorMask):
-        return np.asarray(mask.rasterize(transform, target_shape), dtype=np.uint8)
-    rows, cols = np.indices(target_shape, dtype=np.float64)
-    xs, ys = transform * (cols + 0.5, rows + 0.5)
-    keep = np.asarray(mask.sample(ys, xs), dtype=bool)
-    return np.where(keep, np.uint8(0), np.uint8(1))
+    target = GridSpec("EPSG:4326", transform, shape=shape)
+    result = mask.to_raster(target)
+    return np.asarray(result.data, dtype=np.uint8)
 
 
 def _apply_mask_to_valid_mask(
@@ -514,7 +378,7 @@ def _apply_mask_to_valid_mask(
     """
     if mask_plane is None:
         return valid_mask
-    removed = np.asarray(mask_plane) == 1
+    removed = np.asarray(mask_plane) != 0
     if valid_mask is None:
         return ~removed
     intersected = np.asarray(valid_mask, dtype=bool).copy()
@@ -888,8 +752,8 @@ class Stack(Network):
     _network_generation_id: str | None = field(default=None, repr=False)
     _network_product_index: NetworkProductIndex | None = field(default=None, repr=False)
     _effective_roi_resolution: _EffectiveRoi | None = field(default=None, repr=False)
-    _product_mask_resolved: tuple[MaskSampler | None, dict[str, object]] | None = field(
-        default=None, repr=False
+    _materialized_masks: dict[tuple[str, tuple[str, ...], str], object] = field(
+        default_factory=dict, repr=False
     )
 
     def __post_init__(self) -> None:
@@ -944,10 +808,7 @@ class Stack(Network):
         dem: DEMSampler | None = None,
         geo_grid: GeoGridSpec | None = None,
         roi: BoundingBox | Polygons | None = None,
-        mask: str | MaskSampler | None = AUTO_WATER_MASK,
-        mask_source: str | None = None,
-        mask_on_failure: MaskFailurePolicy = "warning",
-        mask_apply_ionosphere: bool = False,
+        mask_plan: MaskPlan | None = None,
         coreg_mode: CoregMode = "pair",
         flatten_stage: FlattenStage = "coregistration",
         coregistration_grid: CoregistrationGrid = "radar",
@@ -1008,10 +869,7 @@ class Stack(Network):
             dem=dem,
             geo_grid=geo_grid,
             roi=roi,
-            mask=mask,
-            mask_source=mask_source,
-            mask_on_failure=mask_on_failure,
-            mask_apply_ionosphere=mask_apply_ionosphere,
+            mask_plan=mask_plan or MaskPlan(),
             swaths=swaths,
             bursts=bursts,
             activation_mode=activation_mode,
@@ -1146,235 +1004,16 @@ class Stack(Network):
             reject_invalid_state("Stack activation scene set does not match catalog")
 
     def _effective_roi_with_mask(self) -> _EffectiveRoi:
-        """Resolve the mask-aware effective ROI once per Stack run.
-
-        The resolution (manager construction, seam guard, water-layer fetch,
-        subtraction) is cached so every stage of one run shares a single
-        resolution and a single run-manifest lineage record.
-
-        Returns
-        -------
-        _EffectiveRoi
-            The effective ROI, its geometry, and the lineage record.
-
-        """
+        """Resolve the explicit ROI mask stage once per Stack run."""
         if self._effective_roi_resolution is None:
-            cfg = self.config
             self._effective_roi_resolution = _resolve_effective_roi(
-                cfg.roi,
-                mask=cfg.mask,
-                mask_source=cfg.mask_source,
-                mask_on_failure=cfg.mask_on_failure,
+                self.config.roi, mask_plan=self.config.mask_plan
             )
         return self._effective_roi_resolution
 
     def _mask_lineage_record(self) -> dict[str, object]:
-        """Return the mask lineage record merged into run-manifest payloads.
-
-        The record is ``{}`` for unmasked runs, ``{"mask": "absent",
-        "reason": ...}`` when the mask could not be resolved under the
-        warning/skip policy, and ``{"mask": "present", ...}`` with provenance
-        when the automatic water mask resolved (PROPOSAL-0039 G2/G3).
-        """
+        """Return normalized mask-plan lineage for run manifests."""
         return self._effective_roi_with_mask().lineage
-
-    # -- PROPOSAL-0039 product-level mask application (Slice D2) -------------
-
-    def _mask_unavailable(self, reason: str) -> None:
-        """Apply the ``mask_on_failure`` policy to a non-applicable mask.
-
-        ``error`` fails closed (explicit user masks never silently lose their
-        mask); ``warning`` logs loudly and ``skip`` logs quietly, both
-        continuing unmasked with the reason available to the caller.
-        """
-        policy = self.config.mask_on_failure
-        if policy == "error":
-            message = f"water mask cannot be applied: {reason}"
-            logger.error(message)
-            raise InvalidProcessingStateError(message)
-        if policy == "warning":
-            logger.error(
-                "water mask resolved but not applicable; continuing WITHOUT "
-                "mask (mask-absent) and recording the reason in the run "
-                "manifest (PROPOSAL-0039 on_failure=warning): %s",
-                reason,
-            )
-            return
-        logger.debug(
-            "water mask resolved but not applicable; skipping silently "
-            "(on_failure=skip): %s",
-            reason,
-        )
-
-    def _product_mask_resolution(
-        self,
-    ) -> tuple[MaskSampler | None, dict[str, object]]:
-        """Resolve the product-level mask once per Stack run (cached).
-
-        Returns ``(sampler, record)`` where ``sampler`` is the mask to apply
-        at the IFG/unwrap/ionosphere seams (``None`` = unmasked run) and
-        ``record`` is the provenance/lineage payload.  ``mask=None`` (the
-        ``MASK_DISABLED`` spelling normalizes to ``None``) short-circuits to
-        the bitwise-identical legacy path; a D1 mask-absent ROI resolution
-        short-circuits so the run degrades exactly once; user-supplied
-        :class:`~faninsar.processing.masking.mask.MaskSampler` objects pass
-        through untouched; the automatic water mask resolves through the
-        masking manager into the buffered binary mask product (1 = water)
-        written under ``<work_dir>/mask/``.
-        """
-        if self._product_mask_resolved is None:
-            self._product_mask_resolved = self._resolve_product_mask()
-        return self._product_mask_resolved
-
-    def _resolve_product_mask(
-        self,
-    ) -> tuple[MaskSampler | None, dict[str, object]]:
-        """Resolve :attr:`StackConfig.mask` into a product-level sampler."""
-        config = self.config
-        if config.mask is None:
-            return None, {}
-        roi_lineage = self._effective_roi_with_mask().lineage
-        if roi_lineage.get("mask") == "absent":
-            # D1 already degraded and logged the resolution failure.
-            return None, dict(roi_lineage)
-        if not isinstance(config.mask, str):
-            # User-supplied samplers apply directly at the product level.
-            return config.mask, {}
-        if config.mask != AUTO_WATER_MASK:  # defensive; StackConfig validates
-            reject_invalid_state(f"unsupported Stack mask selection: {config.mask!r}")
-        return self._resolve_auto_water_mask()
-
-    def _resolve_auto_water_mask(
-        self,
-    ) -> tuple[MaskSampler | None, dict[str, object]]:
-        """Resolve the automatic water mask into its buffered mask product.
-
-        The mask grid is always the DEM grid via the masking manager
-        (PROPOSAL-0039): the rasterized product caches under
-        ``<work_dir>/mask/`` with provenance tags (mask
-        product/provider/retrieved/threshold/buffer) and is written onto the
-        DEM mosaic grid when the configured DEM sampler carries a usable
-        mosaic path (the manager's own consume cache). Without a DEM mosaic
-        path there is no mask grid and the run degrades under the
-        ``mask_on_failure`` policy.
-        """
-        from faninsar.processing.masking.mask_manager import (
-            MaskManager,
-            get_mask_manager,
-        )
-
-        config = self.config
-        try:
-            manager: MaskManager = get_mask_manager(
-                source=config.mask_source, on_failure=config.mask_on_failure
-            )
-        except InvalidProcessingStateError as error:
-            return None, self._mask_failure_record(error)
-
-        bounds = self._mask_source_bounds()
-        if bounds is None:
-            return None, self._mask_failure_record(
-                InvalidProcessingStateError(
-                    "no ROI or EPSG:4326 config.geo_grid bounds are available "
-                    "to resolve the automatic water mask over"
-                )
-            )
-
-        provenance = self._mask_provenance(manager)
-        dem_path = getattr(config.dem, "path", None)
-        if dem_path is not None and Path(dem_path).is_file():
-            return self._resolve_dem_grid_mask(manager, bounds, provenance)
-        return None, self._mask_failure_record(
-            InvalidProcessingStateError(
-                "the automatic water mask rasterizes onto the DEM mosaic grid "
-                "through the masking manager (the mask grid is always the DEM "
-                "grid); the configured dem sampler carries no mosaic path, so "
-                "no mask grid is available"
-            )
-        )
-
-    def _mask_provenance(self, manager: Any) -> dict[str, object]:
-        """Build the shared provenance record for the water mask product."""
-        entry = manager.source_entry
-        return {
-            "mask": "present",
-            "mask_product": entry.product,
-            "mask_provider": entry.provider,
-            "mask_retrieved": datetime.now(tz=UTC).date().isoformat(),
-            "mask_threshold": manager.effective_threshold,
-            "buffer_km": float(manager.buffer_km),
-        }
-
-    def _resolve_dem_grid_mask(
-        self,
-        manager: Any,
-        bounds: tuple[float, float, float, float],
-        provenance: dict[str, object],
-    ) -> tuple[MaskSampler | None, dict[str, object]]:
-        """Rasterize the water mask onto the DEM mosaic grid.
-
-        The manager owns the DEM-grid consume step including its
-        ``(vector digest, buffer, grid)`` raster cache and the failure policy
-        for provider outages.
-        """
-        from faninsar.processing.masking.mask import RasterMask
-        from faninsar.processing.masking.mask_manager import (
-            MaskProviderUnavailableError,
-        )
-
-        try:
-            product_path = manager.resolve_auto_mask(
-                bounds,
-                dem_path=self.config.dem.path,
-                output_dir=self.config.work_dir,
-            )
-        except MaskProviderUnavailableError as error:
-            return None, self._mask_failure_record(error)
-        if product_path is None:
-            return None, {
-                "mask": "absent",
-                "reason": (
-                    "water provider unavailable; the masking manager applied "
-                    "the configured failure policy"
-                ),
-            }
-        provenance["mask_asset"] = str(product_path)
-        logger.info("Stack water mask resolved on the DEM grid: %s", product_path)
-        return RasterMask(product_path), provenance
-
-    def _mask_failure_record(self, error: Exception) -> dict[str, object]:
-        """Apply the ``mask_on_failure`` policy; return the absence record."""
-        policy = self.config.mask_on_failure
-        if policy == "error":
-            raise error
-        reason = str(error)
-        if policy == "warning":
-            logger.error(
-                "water mask unavailable; continuing WITHOUT mask (mask-absent) "
-                "and recording the mask-absent state in the run manifest "
-                "(PROPOSAL-0039 on_failure=warning): %s",
-                reason,
-            )
-        else:
-            logger.debug(
-                "water mask unavailable; skipping silently (on_failure=skip): %s",
-                reason,
-            )
-        return {"mask": "absent", "reason": reason}
-
-    def _mask_source_bounds(self) -> tuple[float, float, float, float] | None:
-        """Return the lon/lat bounds the automatic water mask resolves over."""
-        if self.config.roi is not None:
-            geometry = _roi_to_geometry(self.config.roi)
-            return tuple(float(value) for value in geometry.bounds)
-        grid = self.config.geo_grid
-        if grid is None:
-            return None
-        crs = _grid_crs_epsg(grid)
-        if crs != 4326:
-            return None
-        west, south, east, north = grid.bbox
-        return (float(west), float(south), float(east), float(north))
 
     def _ifg_geo_grid(
         self, looks: tuple[int, int]
@@ -1418,71 +1057,125 @@ class Stack(Network):
         looks: tuple[int, int],
         expected_shape: tuple[int, int] | None = None,
     ) -> np.ndarray | None:
-        """Return the mask removed-plane for one IFG grid (or ``None``).
+        """Return a canonical mask plane for an IFG target grid."""
+        if not self.config.mask_plan.references("interferogram"):
+            return None
+        if domain != "geo":
+            raise ValueError(
+                "radar mask projection requires an explicit radar LUT"
+            )
+        grid = self._ifg_geo_grid(looks)
+        if grid is None:
+            raise ValueError(
+                "interferogram masks require an EPSG:4326 geo_grid"
+            )
+        transform, shape = grid
+        if expected_shape is not None and tuple(expected_shape) != shape:
+            reject_invalid_state("mask target grid shape does not match IFG shape")
+        from faninsar.processing.masking.mask import GridSpec
 
-        The plane is ``1`` where the active mask removes support and is
-        resampled onto the IFG grid with nearest-neighbour only semantics.
-        ``None`` when masking is disabled or the mask degraded under the
-        failure policy.  Geo-domain IFG grids resample the mask product
-        directly; radar-domain grids need the dense geo2rdr LUT or radar
-        geometry projection source (PROPOSAL-0039 radar projection), which
-        the session does not carry in this slice and therefore degrades
-        under the ``mask_on_failure`` policy instead of silently unmasking.
-        """
-        if self.config.mask is None:
+        target = GridSpec("EPSG:4326", transform, shape=shape)
+        materialized = self._materialize_stage_mask("interferogram", target)
+        return None if materialized is None else materialized.data
+
+    def _materialize_stage_mask(
+        self, stage: StageName, target: object
+    ) -> object | None:
+        """Materialize, union, and cache one normalized stage mask exactly once."""
+        refs = self.config.mask_plan.references(stage)
+        if not refs:
             return None
-        sampler, _record = self._product_mask_resolution()
-        if sampler is None:
-            return None
-        if domain == "geo":
-            grid = self._ifg_geo_grid(looks)
-            if grid is None:
-                self._mask_unavailable(
-                    "geo-domain IFG masking requires an EPSG:4326 "
-                    "config.geo_grid; none is configured"
+        target_identity = hashlib.sha256(
+            json.dumps(
+                {
+                    "crs": str(target.crs),
+                    "transform": tuple(float(value) for value in target.transform),
+                    "shape": tuple(int(value) for value in target.shape),
+                    "validity": (
+                        None
+                        if target.validity is None
+                        else np.asarray(target.validity, dtype=bool).tobytes().hex()
+                    ),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        key = (stage, refs, target_identity)
+        if key in self._materialized_masks:
+            return self._materialized_masks[key]
+        from faninsar.processing.masking.mask import GridSpec, Mask
+
+        if not isinstance(target, GridSpec):
+            raise TypeError("mask targets must be GridSpec instances")
+        masks = []
+        for definition in self.config.mask_plan.for_stage(stage):
+            if definition.kind == "raster":
+                import rasterio
+
+                with rasterio.open(definition.path) as source:
+                    data = source.read(1)
+                    source_grid = GridSpec(
+                        source.crs,
+                        source.transform,
+                        shape=(source.height, source.width),
+                    )
+                masks.append(Mask.from_raster(data, grid=source_grid))
+            elif definition.kind == "vector":
+                import geopandas as gpd
+
+                frame = gpd.read_file(definition.path)
+                masks.append(Mask.from_vector(frame))
+            else:
+                bounds = target.bounds
+                masks.append(
+                    Mask.from_water(
+                        bounds=bounds, provider=definition.provider or "auto"
+                    )
                 )
-                return None
-            transform, shape = grid
-            if expected_shape is not None and tuple(expected_shape) != shape:
-                reject_invalid_state(
-                    "derived mask grid shape "
-                    f"{shape} does not match the IFG grid "
-                    f"{tuple(expected_shape)}; the geo grid and the scene "
-                    "grid disagree (PROPOSAL-0039 fail-closed)"
-                )
-            return _mask_removed_plane(sampler, transform=transform, shape=shape)
-        self._mask_unavailable(
-            "radar-domain IFG masking needs the dense geo2rdr LUT or radar "
-            "geometry projection source, which the Stack session does not "
-            "carry in this slice"
-        )
-        return None
+        combined = masks[0]
+        for mask in masks[1:]:
+            combined = combined + mask
+        result = combined.to_raster(target)
+        self._materialized_masks[key] = result
+        return result
 
     def _ionosphere_mask_plane(
         self, ion_multilook: tuple[int, int] | None
     ) -> np.ndarray | None:
-        """Return the mask plane for the ionosphere estimation grid.
-
-        Consumes ``mask_apply_ionosphere`` (PROPOSAL-0039): the plane feeds
-        :func:`faninsar.processing.stack.stack_api.estimate_ionosphere`'s
-        existing ``valid_mask`` seam.  ``None`` leaves the call arguments
-        unchanged.
-        """
-        if self.config.mask is None:
-            return None
-        sampler, _record = self._product_mask_resolution()
-        if sampler is None:
+        """Return the explicit ionosphere-stage mask plane."""
+        if not self.config.mask_plan.references("ionosphere"):
             return None
         looks = tuple(int(value) for value in (ion_multilook or self.config.multilook))
         grid = self._ifg_geo_grid(looks)
         if grid is None:
-            self._mask_unavailable(
-                "the ionosphere mask plane requires an EPSG:4326 "
-                "config.geo_grid; none is configured"
+            raise ValueError(
+                "ionosphere masks require an EPSG:4326 geo_grid"
             )
-            return None
+        from faninsar.processing.masking.mask import GridSpec
+
         transform, shape = grid
-        return _mask_removed_plane(sampler, transform=transform, shape=shape)
+        return self._materialize_stage_mask(
+            "ionosphere", GridSpec("EPSG:4326", transform, shape=shape)
+        ).data
+
+    def _unwrap_mask_plane(self, shape: tuple[int, int]) -> np.ndarray | None:
+        """Materialize the explicit unwrap-stage mask on the IFG grid."""
+        if not self.config.mask_plan.references("unwrap"):
+            return None
+        grid = self._ifg_geo_grid(self.config.multilook)
+        if grid is None:
+            raise ValueError(
+                "unwrap masks require an EPSG:4326 geo_grid"
+            )
+        from faninsar.processing.masking.mask import GridSpec
+
+        transform, target_shape = grid
+        if tuple(shape) != target_shape:
+            reject_invalid_state("unwrap mask target grid shape does not match IFG")
+        return self._materialize_stage_mask(
+            "unwrap", GridSpec("EPSG:4326", transform, shape=target_shape)
+        ).data
 
     def _burst_kwargs(self) -> dict[str, Any]:
         cfg = self.config
@@ -2302,6 +1995,17 @@ class Stack(Network):
                         _provider_callback(self.scene_provider)
                     ),
                 }
+                mask_plan_identity = self.config.mask_plan.identity
+                mask_identity = None
+                if self.config.mask_plan.references("interferogram"):
+                    mask_grid = self._ifg_geo_grid(looks)
+                    if mask_grid is not None:
+                        from faninsar.processing.masking.mask import GridSpec
+
+                        mask_identity = self._materialize_stage_mask(
+                            "interferogram",
+                            GridSpec("EPSG:4326", mask_grid[0], shape=mask_grid[1]),
+                        ).identity
                 expected_filter_name = filter_name
                 expected_filter_parameters = filter_parameters
                 if (sub / "manifest.json").exists():
@@ -2326,6 +2030,8 @@ class Stack(Network):
                         or existing_store.phase_screen_domain != primary_store.domain
                         or existing_store.phase_screen_grid_identity
                         != primary_store.grid_identity
+                        or existing_store.mask_plan_identity != mask_plan_identity
+                        or existing_store.mask_identity != mask_identity
                     ):
                         reject_invalid_state(
                             "persisted IFG artifact does not match current scene "
@@ -2399,6 +2105,8 @@ class Stack(Network):
                     filter_name=expected_filter_name,
                     filter_parameters=expected_filter_parameters,
                     source_manifest_digests=expected_sources,
+                    mask_plan_identity=mask_plan_identity,
+                    mask_identity=mask_identity,
                     flatten_stage=flatten_stage,
                     phase_screen_model=phase_screen_model,
                     phase_screen_digests=phase_screen_digests,
@@ -2770,11 +2478,7 @@ class Stack(Network):
         # once per call and converted to the Stack device exactly once with
         # the other arrays; per pair it intersects the persisted IFG mask
         # (finite phase and finite coherence remain the unwrapper's rule).
-        mask_plane = self._ifg_mask_plane(
-            domain=stores[0].domain,
-            looks=self.config.multilook,
-            expected_shape=stores[0].shape,
-        )
+        mask_plane = self._unwrap_mask_plane(stores[0].shape)
         mask_removed: Any = None
         if mask_plane is not None:
             mask_removed = torch.as_tensor(
@@ -3333,15 +3037,15 @@ class Stack(Network):
         :func:`faninsar.processing.stack.stack_api.estimate_ionosphere`
         for the full parameter contract.
 
-        .. note::
-            With ``mask_apply_ionosphere=True`` (PROPOSAL-0039) the active
-            mask plane feeds the estimation's existing ``valid_mask`` seam
-            unless the caller supplies their own ``valid_mask``. The default
-            ``False`` leaves the call arguments exactly unchanged.
+        The explicit ``ionosphere`` mask stage feeds the estimator's existing
+        ``valid_mask`` seam unless the caller supplies one.
         """
         from faninsar.processing.stack.stack_api import estimate_ionosphere
 
-        if self.config.mask_apply_ionosphere and kwargs.get("valid_mask") is None:
+        if (
+            self.config.mask_plan.references("ionosphere")
+            and kwargs.get("valid_mask") is None
+        ):
             mask_plane = self._ionosphere_mask_plane(kwargs.get("ion_multilook"))
             if mask_plane is not None:
                 kwargs = {**kwargs, "valid_mask": mask_plane}
