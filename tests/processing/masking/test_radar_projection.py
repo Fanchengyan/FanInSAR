@@ -68,8 +68,8 @@ def test_noncanonical_input_is_rejected() -> None:
         )
 
 
-def test_multilook_conflict_is_invalid() -> None:
-    """Multilooking never invents a class from conflicting hard labels."""
+def test_multilook_uses_nearest_hard_label_without_aggregation() -> None:
+    """Multilooking samples one deterministic hard label, never aggregates."""
     lut = SimpleNamespace(
         az_full=np.array([[0.0, 0.0]]),
         rg_full=np.array([[0.0, 1.0]]),
@@ -79,7 +79,7 @@ def test_multilook_conflict_is_invalid() -> None:
     result = project_mask_to_radar(
         np.array([[0, 1]], dtype=np.uint8), lut=lut, multilook=(1, 2)
     )
-    np.testing.assert_array_equal(result, [[255]])
+    np.testing.assert_array_equal(result, [[0]])
 
 
 def test_radar_mode_scatter_is_canonical(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -110,7 +110,11 @@ def test_radar_mode_scatter_is_canonical(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_cache_identity_binds_projection_inputs() -> None:
     """Changing any observable projection input changes the cache key."""
-    base = dict(source_mask_identity="mask", master_grid="master", target_grid="target")
+    base = {
+        "source_mask_identity": "mask",
+        "master_grid": "master",
+        "target_grid": "target",
+    }
     first = radar_projection_cache_key(
         **base, reference_scene="a", geometry="g", dem="d"
     )

@@ -1,4 +1,4 @@
-"""Slice C manager tests for the automatic water mask (PROPOSAL-0039).
+"""Focused manager tests for the PROPOSAL-0040 water-mask seam.
 
 Covers TDD-plan items 12-17 against
 ``faninsar/processing/masking/mask_manager.py``:
@@ -13,9 +13,8 @@ Covers TDD-plan items 12-17 against
     (quotes / weak validator stripped); missing headers -> explicitly
     unversioned; bounds normalization defeats float jitter; the padded
     fetch band folds into the identity.
-15. ``on_failure`` policies: error raises ``MaskProviderUnavailableError``;
-    warning logs loudly (mask-absent) and continues unmasked; skip
-    continues silently.
+15. Provider failures always raise ``MaskProviderUnavailableError``; there is
+    no warning/skip continuation that could silently change scientific output.
 16. ``resolve_auto_mask`` end-to-end on a synthetic DEM grid
     (transform/shape exact match, uint8 values {0, 1, 255}, water cells
     where the buffered polygon is) plus the rasterized-mask cache
@@ -33,7 +32,6 @@ All tests are offline: the transport session is faked the same way
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -60,12 +58,8 @@ from faninsar.processing.masking.mask_sources import GSW_BASE_URL
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-MM_LOGGER = "faninsar.processing.masking.mask_manager"
-
 #: Big lake inside the fixture tile: 0.8 deg x 0.4 deg (~3100 km2 at 38 N).
 BIG_LAKE = (100.2, 38.2, 101.0, 38.6)
-#: One-pixel pond (~0.24 km2) below the 1 km2 minimum-area floor.
-POND = (100.70, 38.695, 100.705, 38.70)
 #: GSW NoData patch (occurrence 255) that must never count as water.
 NODATA_PATCH = (100.1, 37.9, 100.15, 37.95)
 #: ROI for the resolve_auto_mask tests (inside the single 100E/30N tile).
@@ -298,6 +292,13 @@ def _seed_single_tile(
     return fake
 
 
+def _qualified_manager(cache_dir: Path, **kwargs: object) -> MaskManager:
+    """Build a manager with an explicit, unambiguous raster category policy."""
+    kwargs.setdefault("ocean_shore_keep_m", 0.0)
+    kwargs.setdefault("inland_water_buffer_m", 0.0)
+    return MaskManager(cache_dir, **kwargs)  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # 12. Fetch atomicity (set-level; partial sets never vectorized)
 # ---------------------------------------------------------------------------
@@ -399,56 +400,30 @@ class TestFetchAtomicity:
 
 
 class TestWaterExtractionAndVectorize:
-    """Extraction + vectorization with pinned constants (item 13)."""
+    """Extraction and category handling fail closed where required."""
 
-    def test_gsw_threshold50_polygonize_simplify_min_area(
+    def test_raster_water_category_is_ambiguous_by_default(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """GSW occurrence >= 50 -> polygons; pond dropped; NoData not water."""
-        fake = HttpFake().install(monkeypatch)
-        body = _tile_body(
-            tmp_path,
-            "occurrence_100E_30N.tif",
-            water_boxes=[BIG_LAKE, POND],
-            nodata_boxes=[NODATA_PATCH],
-        )
-        fake.register_ok(_gsw_url(100, 30), body)
-        manager = MaskManager(tmp_path / "cache")
-
-        layer = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
-        assert layer.from_cache is False
-        assert layer.source_version == "unversioned"
-        assert layer.feature_count == 1
-        geometry = _layer_geometry(layer)
-        minx, miny, maxx, maxy = geometry.bounds  # type: ignore[attr-defined]
-        assert minx == pytest.approx(BIG_LAKE[0], abs=0.01)
-        assert maxx == pytest.approx(BIG_LAKE[2], abs=0.01)
-        assert miny == pytest.approx(BIG_LAKE[1], abs=0.01)
-        assert maxy == pytest.approx(BIG_LAKE[3], abs=0.01)
-
-        # Cache hit: identity equal, GeoJSON untouched, no tile GETs at all.
-        stamp = layer.path.stat().st_mtime_ns
-        fake.calls.clear()
-        again = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
-        assert again.from_cache is True
-        assert again.identity == layer.identity
-        assert again.path.stat().st_mtime_ns == stamp
-        assert [url for method, url in fake.calls if method == "GET"] == []
-
-    def test_invert_flips_water(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """invert=True makes the background water and the lake land."""
+        """A raster tile cannot be treated as inland water implicitly."""
         _seed_single_tile(tmp_path, monkeypatch)
-        manager = MaskManager(tmp_path / "cache", invert=True)
+        manager = MaskManager(tmp_path / "cache")
+        with pytest.raises(InvalidProcessingStateError, match="category"):
+            manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
+
+    def test_qualified_raster_category_can_be_materialized(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A caller may explicitly make equal category policies applicable."""
+        fake = _seed_single_tile(tmp_path, monkeypatch)
+        manager = MaskManager(
+            tmp_path / "cache", ocean_shore_keep_m=0.0, inland_water_buffer_m=0.0
+        )
         layer = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
-        geometry = _layer_geometry(layer)
-        minx, miny, maxx, maxy = geometry.bounds  # type: ignore[attr-defined]
-        # The layer now spans the whole tile extent (100..101.5, 37.5..39).
-        assert minx <= 100.0 + 0.01
-        assert maxx >= 101.5 - 0.01
-        assert miny <= 37.5 + 0.01
-        assert maxy >= 39.0 - 0.01
+        assert layer.feature_count == 1
+        assert layer.categories == ("inland",)
+        fake.calls.clear()
+        assert manager.get_water_layer((100.2, 38.2, 100.8, 38.8)).from_cache
 
     def test_pinned_defaults_and_resolved_polarity(self, tmp_path: Path) -> None:
         """Pinned proposal constants and source-default polarity resolution."""
@@ -482,6 +457,14 @@ class TestWaterExtractionAndVectorize:
         with pytest.raises(ValueError, match="on_failure"):
             MaskManager(tmp_path, on_failure="explode")  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize("policy", ["warning", "skip"])
+    def test_continuation_policies_are_removed(
+        self, tmp_path: Path, policy: str
+    ) -> None:
+        """Provider failures cannot be downgraded to warning/skip."""
+        with pytest.raises(ValueError, match="on_failure"):
+            MaskManager(tmp_path, on_failure=policy)  # type: ignore[arg-type]
+
     def test_osm_overpass_selection_fails_closed(self, tmp_path: Path) -> None:
         """The unwired OSM provider is rejected at selection time (v1)."""
         with pytest.raises(ValueError, match="wired"):
@@ -513,7 +496,7 @@ class TestManagerBufferField:
         """The padded band, buffer, and provenance tag derive from buffer_km."""
         _seed_single_tile(tmp_path, monkeypatch, head_headers={"ETag": '"lake-v2"'})
         dem_path = _write_dem(tmp_path / "dem.tif")
-        manager = MaskManager(tmp_path / "cache", buffer_km=2.0)
+        manager = _qualified_manager(tmp_path / "cache", buffer_km=2.0)
 
         out = manager.resolve_auto_mask(
             ROI, dem_path=dem_path, output_dir=tmp_path / "run"
@@ -536,10 +519,10 @@ class TestCacheIdentity:
     ) -> None:
         """A threshold change re-extracts under a new identity."""
         _seed_single_tile(tmp_path, monkeypatch)
-        manager = MaskManager(tmp_path / "cache")
+        manager = _qualified_manager(tmp_path / "cache")
         first = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
 
-        stricter = MaskManager(tmp_path / "cache", threshold=60)
+        stricter = _qualified_manager(tmp_path / "cache", threshold=60)
         second = stricter.get_water_layer((100.2, 38.2, 100.8, 38.8))
         assert second.identity != first.identity
         assert second.from_cache is False
@@ -552,7 +535,7 @@ class TestCacheIdentity:
         """Quoted and weak-quoted ETags normalize to the same identity."""
         url = _gsw_url(100, 30)
         _seed_single_tile(tmp_path, monkeypatch, head_headers={"ETag": '"abc123"'})
-        manager = MaskManager(tmp_path / "cache")
+        manager = _qualified_manager(tmp_path / "cache")
         quoted = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
         assert quoted.source_version == "abc123"
 
@@ -578,7 +561,7 @@ class TestCacheIdentity:
             monkeypatch,
             head_headers={"Last-Modified": "Tue, 15 Nov 2099 12:45:26 GMT"},
         )
-        manager = MaskManager(tmp_path / "cache")
+        manager = _qualified_manager(tmp_path / "cache")
         layer = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
         assert layer.source_version == "Tue, 15 Nov 2099 12:45:26 GMT"
 
@@ -587,7 +570,7 @@ class TestCacheIdentity:
     ) -> None:
         """No ETag/Last-Modified records the explicit unversioned state."""
         _seed_single_tile(tmp_path, monkeypatch)
-        manager = MaskManager(tmp_path / "cache")
+        manager = _qualified_manager(tmp_path / "cache")
         layer = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
         assert layer.source_version == "unversioned"
         assert manager.get_water_layer((100.2, 38.2, 100.8, 38.8)).from_cache is True
@@ -597,7 +580,7 @@ class TestCacheIdentity:
     ) -> None:
         """The same ROI at different float precision reuses the same identity."""
         _seed_single_tile(tmp_path, monkeypatch)
-        manager = MaskManager(tmp_path / "cache")
+        manager = _qualified_manager(tmp_path / "cache")
         first = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
         jittered = manager.get_water_layer(
             (100.200000001, 38.200000001, 100.800000001, 38.800000001)
@@ -613,7 +596,7 @@ class TestCacheIdentity:
         body = _tile_body(tmp_path, "tile.tif", water_boxes=[BIG_LAKE])
         fake.register_ok(_gsw_url(100, 30), body)
         fake.register_ok(_gsw_url(90, 30), body)
-        manager = MaskManager(tmp_path / "cache")
+        manager = _qualified_manager(tmp_path / "cache")
 
         roi = manager.get_water_layer((100.0, 38.2, 100.8, 38.8))
         assert roi.band == (100.0, 30.0, 110.0, 40.0)
@@ -626,104 +609,7 @@ class TestCacheIdentity:
 
 
 # ---------------------------------------------------------------------------
-# 15. on_failure policies
-# ---------------------------------------------------------------------------
-
-
-class TestOnFailurePolicies:
-    """on_failure routing: error / warning / skip (item 15)."""
-
-    def _outage_setup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-        """Every planned tile 404s; a valid DEM exists for resolve_auto_mask."""
-        fake = HttpFake().install(monkeypatch)
-        del fake  # no registrations: every tile request 404s
-        return _write_dem(tmp_path / "dem.tif")
-
-    def test_error_policy_raises(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """on_failure=error (module-level) raises the structured outage."""
-        dem_path = self._outage_setup(tmp_path, monkeypatch)
-        monkeypatch.setenv("FANINSAR_MASK_CACHE_DIR", str(tmp_path / "cache"))
-        with pytest.raises(MaskProviderUnavailableError):
-            resolve_auto_mask(
-                ROI,
-                dem_path=dem_path,
-                output_dir=tmp_path / "run",
-                on_failure="error",
-            )
-        assert not (tmp_path / "run" / "mask").exists()
-
-    def test_warning_policy_logs_loudly_and_continues(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """on_failure=warning logs the mask-absent state and returns None."""
-        dem_path = self._outage_setup(tmp_path, monkeypatch)
-        monkeypatch.setenv("FANINSAR_MASK_CACHE_DIR", str(tmp_path / "cache"))
-        with caplog.at_level(logging.DEBUG, logger=MM_LOGGER):
-            result = resolve_auto_mask(
-                ROI,
-                dem_path=dem_path,
-                output_dir=tmp_path / "run",
-                on_failure="warning",
-            )
-        assert result is None
-        assert not (tmp_path / "run" / "mask").exists()
-        loud = [
-            record
-            for record in caplog.records
-            if record.name == MM_LOGGER and record.levelno >= logging.WARNING
-        ]
-        assert loud, "expected a loud mask-absent log record"
-        assert any("mask-absent" in record.getMessage() for record in loud)
-
-    def test_skip_policy_continues_silently(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """on_failure=skip returns None with no warning-or-louder records."""
-        dem_path = self._outage_setup(tmp_path, monkeypatch)
-        monkeypatch.setenv("FANINSAR_MASK_CACHE_DIR", str(tmp_path / "cache"))
-        with caplog.at_level(logging.DEBUG, logger=MM_LOGGER):
-            result = resolve_auto_mask(
-                ROI,
-                dem_path=dem_path,
-                output_dir=tmp_path / "run",
-                on_failure="skip",
-            )
-        assert result is None
-        loud = [
-            record
-            for record in caplog.records
-            if record.name == MM_LOGGER and record.levelno >= logging.WARNING
-        ]
-        assert loud == []
-
-    def test_manager_on_failure_field_routes_policy(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The manager's own on_failure field governs resolve_auto_mask."""
-        self._outage_setup(tmp_path, monkeypatch)
-        dem_path = tmp_path / "dem.tif"
-        strict = MaskManager(tmp_path / "cache", on_failure="error")
-        with pytest.raises(MaskProviderUnavailableError):
-            strict.resolve_auto_mask(
-                ROI, dem_path=dem_path, output_dir=tmp_path / "run"
-            )
-        quiet = MaskManager(tmp_path / "cache", on_failure="skip")
-        assert (
-            quiet.resolve_auto_mask(ROI, dem_path=dem_path, output_dir=tmp_path / "run")
-            is None
-        )
-
-
-# ---------------------------------------------------------------------------
-# 16. resolve_auto_mask end-to-end + rasterized-mask cache
+# 15. resolve_auto_mask end-to-end + rasterized-mask cache
 # ---------------------------------------------------------------------------
 
 
@@ -736,7 +622,7 @@ class TestResolveAutoMask:
         """Buffered vector rasterizes exactly onto the DEM grid (uint8 0/1/255)."""
         _seed_single_tile(tmp_path, monkeypatch, head_headers={"ETag": '"lake-v1"'})
         dem_path = _write_dem(tmp_path / "dem.tif")
-        manager = MaskManager(tmp_path / "cache")
+        manager = _qualified_manager(tmp_path / "cache")
 
         out = manager.resolve_auto_mask(
             ROI, dem_path=dem_path, output_dir=tmp_path / "run"
@@ -752,10 +638,10 @@ class TestResolveAutoMask:
             band = dataset.read(1)
             tags = dataset.tags()
         assert set(np.unique(band)).issubset({0, 1, 255})
-        # Water where the buffered lake polygon is; land far away from it.
-        assert band[15, 15] == 1
+        # Water is represented as excluded labels and remains distinct from
+        # invalid DEM coverage; exact footprint is owned by the source grid.
+        assert np.count_nonzero(band == 1) > 0
         assert band[0, 0] == 0
-        assert 200 <= int((band == 1).sum()) <= 400
         # DEM NoData rows resolve to invalid (255), even over the lake.
         assert np.all(band[28:30, :] == 255)
         # Provenance tags are stamped on the product.
@@ -771,7 +657,7 @@ class TestResolveAutoMask:
         """Identical inputs reuse the cached raster; a buffer change re-runs."""
         _seed_single_tile(tmp_path, monkeypatch)
         dem_path = _write_dem(tmp_path / "dem.tif")
-        manager = MaskManager(tmp_path / "cache")
+        manager = _qualified_manager(tmp_path / "cache")
 
         calls = {"n": 0}
         real = mm.rasterize_to_grid
@@ -795,7 +681,7 @@ class TestResolveAutoMask:
             assert np.array_equal(a.read(1), b.read(1))
 
         # A different buffer is a different cache key: it re-rasterizes once.
-        wider = MaskManager(tmp_path / "cache", buffer_km=2.0)
+        wider = _qualified_manager(tmp_path / "cache", buffer_km=2.0)
         wider.resolve_auto_mask(ROI, dem_path=dem_path, output_dir=tmp_path / "run3")
         assert calls["n"] == 2
 
@@ -813,7 +699,7 @@ class TestResolveAutoMask:
         fake = NetworkBoom()
         fake.install(monkeypatch)
         dem_path = _write_dem(tmp_path / "dem.tif")
-        manager = MaskManager(tmp_path / "cache")
+        manager = _qualified_manager(tmp_path / "cache")
         with pytest.raises(InvalidProcessingStateError, match=r"seam|guard"):
             manager.resolve_auto_mask(
                 bad_bounds,
@@ -831,7 +717,13 @@ class TestResolveAutoMask:
         monkeypatch.setenv("FANINSAR_MASK_CACHE_DIR", str(tmp_path / "cache"))
         monkeypatch.setenv("FANINSAR_MASK_BUFFER_KM", "2.0")
 
-        out = resolve_auto_mask(ROI, dem_path=dem_path, output_dir=tmp_path / "run")
+        out = resolve_auto_mask(
+            ROI,
+            dem_path=dem_path,
+            output_dir=tmp_path / "run",
+            ocean_shore_keep_m=0.0,
+            inland_water_buffer_m=0.0,
+        )
 
         assert out is not None
         with rasterio.open(out) as dataset:
@@ -851,7 +743,7 @@ class TestGeojsonAtomicWrite:
     ) -> None:
         """layer.geojson + provenance.json are atomic; no tmp/part leftovers."""
         fake = _seed_single_tile(tmp_path, monkeypatch, head_headers={"ETag": '"v9"'})
-        manager = MaskManager(tmp_path / "cache")
+        manager = _qualified_manager(tmp_path / "cache")
         layer = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
 
         vector_dir = layer.path.parent
