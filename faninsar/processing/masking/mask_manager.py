@@ -41,9 +41,9 @@ buffer_land_utm_km`'s zone convention.
    no data). The rasterized mask is cached keyed by (vector-layer digest,
    buffer_km, grid) so unchanged configuration never re-rasterizes.
 
-Failure contract: ``on_failure=error`` raises the structured error (class
-default, used for explicit user masks); ``warning`` logs loudly and continues
-unmasked; ``skip`` continues silently. Stack automation passes ``warning``.
+Failure contract: provider failures always raise the structured error. There
+is no warning/skip branch in the v1 manager; a missing water layer must not be
+silently mistaken for a successful scientific result.
 
 Governing proposals: PROPOSAL-0039 (mask manager pipeline, owner-directed
 UTM planar buffer design, three-condition antimeridian seam guard, fetch
@@ -54,10 +54,12 @@ outage patterns mirrored here).
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import secrets
 import urllib.parse
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -81,13 +83,13 @@ from faninsar.processing.masking.mask import (
     LonLatBounds,
     _utm_transformers,
     antimeridian_seam_guard,
-    buffer_land_utm_km,
     padded_fetch_band,
     rasterize_to_grid,
     snap_band,
 )
 from faninsar.processing.masking.mask_sources import (
     AUTO_SOURCE_NAME,
+    WATER_CLASSIFICATION_VERSION,
     MaskSource,
     MaskSourceUnavailableError,
     get_mask_source,
@@ -105,16 +107,20 @@ logger = setup_logger(__name__)
 
 __all__ = [
     "DEFAULT_MASK_NAME",
+    "INLAND_WATER_BUFFER_M",
     "MASK_BUFFER_ENV",
     "MASK_CACHE_ENV",
     "MASK_SOURCE_ENV",
     "MASK_SOURCE_URL_ENV",
+    "OCEAN_SHORE_KEEP_M",
     "UNVERSIONED",
     "FetchResult",
     "MaskManager",
     "MaskProviderUnavailableError",
     "WaterLayer",
     "get_mask_manager",
+    "realize_water",
+    "realize_water_mask",
     "resolve_auto_mask",
 ]
 
@@ -132,8 +138,16 @@ DEFAULT_MASK_NAME = "water_mask.tif"
 UNVERSIONED = "unversioned"
 
 Bounds = BoundingBox | tuple[float, float, float, float]
-FailurePolicy = Literal["error", "warning", "skip"]
-_ON_FAILURE_POLICIES = frozenset({"error", "warning", "skip"})
+FailurePolicy = Literal["error"]
+_ON_FAILURE_POLICIES = frozenset({"error"})
+
+# Water-class operation constants.  The negative ocean operation keeps a
+# one-kilometre shore strip in the effective land ROI; inland water is kept at
+# its authoritative footprint.  They are deliberately fixed in v1 rather
+# than exposed as a public classifier/protocol surface.
+OCEAN_SHORE_KEEP_M = 1000.0
+INLAND_WATER_BUFFER_M = 0.0
+_CLASSIFICATION_VERSION = WATER_CLASSIFICATION_VERSION
 
 
 class MaskProviderUnavailableError(InvalidProcessingStateError):
@@ -218,6 +232,7 @@ class WaterLayer:
     band: LonLatBounds
     from_cache: bool
     feature_count: int
+    categories: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +295,12 @@ def _polygon_parts(geometry: BaseGeometry) -> list[BaseGeometry]:
         return []
     members = getattr(geometry, "geoms", None)
     if members is None:
-        return [geometry]
-    return [part for part in members if not part.is_empty]
+        return [geometry] if geometry.geom_type in {"Polygon", "MultiPolygon"} else []
+    return [
+        part
+        for part in members
+        if not part.is_empty and part.geom_type in {"Polygon", "MultiPolygon"}
+    ]
 
 
 def _tile_crs_to_lonlat(crs: object) -> object | None:
@@ -302,17 +321,30 @@ def _tile_crs_to_lonlat(crs: object) -> object | None:
     return lambda geometry: shapely.ops.transform(transformer.transform, geometry)
 
 
-def _geojson_payload(parts: Sequence[BaseGeometry]) -> dict[str, object]:
-    """Build the GeoJSON FeatureCollection payload for polygon parts."""
+def _geojson_payload(
+    parts: Sequence[BaseGeometry], categories: Sequence[str] | None = None
+) -> dict[str, object]:
+    """Build a GeoJSON FeatureCollection with optional water categories.
+
+    ``category`` is intentionally a plain feature property rather than a
+    public classifier API.  It is the authoritative label attached to the
+    materialized water result and is covered by the layer identity.
+    """
     import shapely
 
+    if categories is None:
+        categories = ("water",) * len(parts)
+    if len(categories) != len(parts):
+        message = "water geometry categories must align with polygons"
+        logger.error(message)
+        raise ValueError(message)
     features = [
         {
             "type": "Feature",
-            "properties": {},
+            "properties": {"category": category},
             "geometry": json.loads(shapely.to_geojson(part)),
         }
-        for part in parts
+        for part, category in zip(parts, categories, strict=True)
     ]
     return {"type": "FeatureCollection", "features": features}
 
@@ -339,6 +371,28 @@ def _load_layer_geometries(path: Path) -> BaseGeometry:
     import shapely
 
     return shapely.union_all(geoms)
+
+
+def _load_layer_features(path: Path) -> tuple[list[BaseGeometry], tuple[str, ...]]:
+    """Load materialized water geometries and their qualified categories."""
+    from shapely.geometry import shape
+
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    geometries: list[BaseGeometry] = []
+    categories: list[str] = []
+    for feature in payload.get("features", []):
+        geometry = shape(feature["geometry"])
+        if geometry.is_empty:
+            continue
+        properties = feature.get("properties", {})
+        category = properties.get("category", "water")
+        if category not in {"ocean", "inland", "water"}:
+            message = f"invalid water layer category {category!r}"
+            logger.error(message)
+            raise InvalidProcessingStateError(message)
+        geometries.append(geometry)
+        categories.append(str(category))
+    return geometries, tuple(categories)
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:
@@ -457,11 +511,9 @@ class MaskManager:
         Selection grammar value (``water`` / ``water:<provider>``).
         ``None`` (the default) defers to ``FANINSAR_MASK_SOURCE`` and then
         to the ``water`` auto alias (GSW occurrence).
-    on_failure : "error", "warning", or "skip"
-        Failure policy applied by :meth:`resolve_auto_mask` when the mask
-        provider is unavailable (PROPOSAL-0039 failure contract). The class
-        default ``error`` is for explicit user masks; Stack automation
-        passes ``warning``.
+    on_failure : "error"
+        Provider failures always raise the structured
+        :class:`MaskProviderUnavailableError` in v1.
     buffer_km : float
         Land-buffer width in kilometres owned by the water pipeline (default
         1.0; ``get_mask_manager`` overrides it from
@@ -508,6 +560,8 @@ class MaskManager:
     invert: bool = False
     simplify_tolerance_m: float = 30.0
     min_area_km2: float = 1.0
+    ocean_shore_keep_m: float = OCEAN_SHORE_KEEP_M
+    inland_water_buffer_m: float = INLAND_WATER_BUFFER_M
     max_workers: int = 8
     chunked_threshold: int = 4
     base_url: str | None = None
@@ -521,6 +575,13 @@ class MaskManager:
             logger.error(message)
             raise ValueError(message)
         self.buffer_km = float(self.buffer_km)
+        for field_name in ("ocean_shore_keep_m", "inland_water_buffer_m"):
+            value = float(getattr(self, field_name))
+            if not np.isfinite(value) or value < 0.0:
+                message = f"{field_name} must be a finite number >= 0; got {value!r}"
+                logger.error(message)
+                raise ValueError(message)
+            setattr(self, field_name, value)
         if self.on_failure not in _ON_FAILURE_POLICIES:
             message = (
                 f"invalid on_failure policy {self.on_failure!r}: expected one "
@@ -529,9 +590,9 @@ class MaskManager:
             logger.error(message)
             raise ValueError(message)
         if self.source is not None:
-            entry = get_mask_source(str(self.source).strip())
+            entry = get_mask_source(str(self.source))
         else:
-            selection = os.environ.get(MASK_SOURCE_ENV, AUTO_SOURCE_NAME).strip()
+            selection = os.environ.get(MASK_SOURCE_ENV, AUTO_SOURCE_NAME)
             entry = get_mask_source(selection)
         if self.base_url is not None:
             entry = self._apply_base_override(entry)
@@ -622,6 +683,9 @@ class MaskManager:
             "invert": bool(self.invert),
             "simplify_tolerance_m": float(self.simplify_tolerance_m),
             "min_area_km2": float(self.min_area_km2),
+            "ocean_shore_keep_m": float(self.ocean_shore_keep_m),
+            "inland_water_buffer_m": float(self.inland_water_buffer_m),
+            "classification_version": _CLASSIFICATION_VERSION,
         }
         return _sha256_hex(_canonical_json(payload))
 
@@ -636,6 +700,9 @@ class MaskManager:
             "excluded_values": sorted(int(v) for v in self.effective_excluded_values),
             "invert": bool(self.invert),
             "source_version": version,
+            "classification_version": _CLASSIFICATION_VERSION,
+            "ocean_shore_keep_m": float(self.ocean_shore_keep_m),
+            "inland_water_buffer_m": float(self.inland_water_buffer_m),
         }
 
     # -- planning and guard -------------------------------------------------
@@ -726,10 +793,7 @@ class MaskManager:
     def _outage_error(self, exc: BaseException) -> MaskProviderUnavailableError:
         """Wrap a transport failure into the structured outage contract.
 
-        The loud ERROR record is reserved for the ``error`` policy (the
-        policy owns the user-facing loudness); ``warning``/``skip`` runs log
-        the outage at DEBUG so the only warning-or-louder record is the
-        policy's own ``mask-absent`` statement.
+        The structured outage is logged before it is raised.
         """
         entry = self.source_entry
         failure_class = _classify_failure(exc)
@@ -841,12 +905,111 @@ class MaskManager:
         return polygons
 
     def _vectorize(self, tiles: list[Path], band: LonLatBounds) -> BaseGeometry:
-        """Dissolve, simplify (metric), and minimum-area filter the water.
+        """Classify, repair, operate, and dissolve water polygons.
 
-        The dissolve runs on the raw tile polygons; simplification and the
-        minimum-area filter run in the band's auto-UTM zone so the pinned
-        30 m / 1 km2 constants are metric-correct (PROPOSAL-0039 G4).
+        Classification happens after the tile polygons are unioned, so a
+        tile edge cannot masquerade as a shoreline.  Water touching the
+        *padded fetch* edge is ocean; all other water is inland.  Each class
+        then receives its pinned operation in one local UTM zone: ocean is
+        eroded by :data:`OCEAN_SHORE_KEEP_M` to retain the shore strip and
+        inland water is unchanged.  Simplification is guarded with
+        ``make_valid`` and minimum-area filtering is only applied to ocean
+        parts.  Inland components are deliberately never removed, preserving
+        narrow rivers regardless of the configured area floor.
+
+        The method returns a geometry for compatibility with the P0039
+        private seam.  Category-bearing output is available through
+        :meth:`_vectorize_features` and is what gets cached.
         """
+        parts, _categories = self._vectorize_features(tiles, band)
+        import shapely
+        from shapely.geometry import Polygon
+
+        return shapely.union_all(parts) if parts else Polygon()
+
+    def _vectorize_features(
+        self, tiles: list[Path], band: LonLatBounds
+    ) -> tuple[list[BaseGeometry], tuple[str, ...]]:
+        """Return operated water polygons and their authoritative categories."""
+        import shapely
+        import shapely.ops
+        from shapely.geometry import box
+
+        polygons: list[BaseGeometry] = []
+        for path in tiles:
+            polygons.extend(self._tile_water_polygons(path))
+        polygons = [geom for geom in polygons if not geom.is_empty]
+        if not polygons:
+            return [], ()
+
+        # Repair before union.  Invalid raster-derived rings should not make
+        # classification dependent on a particular GEOS overlay version.
+        repaired = []
+        for geometry in polygons:
+            candidate = shapely.make_valid(geometry)
+            if not candidate.is_empty:
+                repaired.append(candidate)
+        if not repaired:
+            return [], ()
+        union = shapely.make_valid(shapely.union_all(repaired))
+        raw_parts = [part for part in _polygon_parts(union) if not part.is_empty]
+
+        # A fetch-edge touch is the source-independent, deterministic ocean
+        # label.  The fetch band is padded by the shore context before this
+        # method is reached, so the edge is never interpreted as a shoreline.
+        fetch_edge = box(*band).boundary
+        classified: dict[str, list[BaseGeometry]] = {"ocean": [], "inland": []}
+        for geometry in raw_parts:
+            category = "ocean" if geometry.intersects(fetch_edge) else "inland"
+            classified[category].append(geometry)
+
+        zone_lon = (band[0] + band[2]) / 2.0
+        zone_lat = (band[1] + band[3]) / 2.0
+        forward, reverse = _utm_transformers(zone_lon, zone_lat)
+        result: list[BaseGeometry] = []
+        categories: list[str] = []
+        operations = {
+            "ocean": -float(self.ocean_shore_keep_m),
+            "inland": float(self.inland_water_buffer_m),
+        }
+        min_area_m2 = float(self.min_area_km2) * 1e6
+        for category in ("ocean", "inland"):
+            if not classified[category]:
+                continue
+            projected = [
+                shapely.ops.transform(forward.transform, geometry)
+                for geometry in classified[category]
+            ]
+            operated = [
+                shapely.make_valid(geometry.buffer(operations[category]))
+                for geometry in projected
+            ]
+            dissolved = shapely.make_valid(shapely.union_all(operated))
+            simplified = dissolved.simplify(
+                float(self.simplify_tolerance_m), preserve_topology=True
+            )
+            for part in _polygon_parts(shapely.make_valid(simplified)):
+                if part.area < min_area_m2:
+                    if category == "ocean":
+                        # Suppress isolated coastal slivers after shore
+                        # erosion, but never let them affect inland labels.
+                        continue
+                    # Preserve narrow, river-like inland components while
+                    # retaining the useful floor for compact speckle/ponds.
+                    rectangle = part.minimum_rotated_rectangle
+                    corners = list(rectangle.exterior.coords)
+                    lengths = [
+                        first.distance(second)
+                        for first, second in itertools.pairwise(corners)
+                    ]
+                    lengths = [length for length in lengths if length > 0.0]
+                    if not lengths or max(lengths) / min(lengths) < 4.0:
+                        continue
+                geographic = shapely.ops.transform(reverse.transform, part)
+                if not geographic.is_empty:
+                    result.append(geographic)
+                    categories.append(category)
+        return result, tuple(categories)
         import shapely
         import shapely.ops
         from shapely.geometry import Polygon
@@ -947,6 +1110,7 @@ class MaskManager:
         vector_dir = self.partition_dir / "vectors" / identity
         layer_path = vector_dir / "layer.geojson"
         if layer_path.is_file():
+            _, cached_categories = _load_layer_features(layer_path)
             return WaterLayer(
                 path=layer_path,
                 identity=identity,
@@ -954,6 +1118,7 @@ class MaskManager:
                 band=band,
                 from_cache=True,
                 feature_count=_count_features(layer_path),
+                categories=cached_categories,
             )
         if entry.extraction == "vector":
             message = (
@@ -964,9 +1129,8 @@ class MaskManager:
             logger.error(message)
             raise MaskSourceUnavailableError(message)
         tiles = self._resolve_tiles(plan)
-        geometry = self._vectorize(tiles, band)
-        parts = _polygon_parts(geometry)
-        _atomic_write_json(layer_path, _geojson_payload(parts))
+        parts, categories = self._vectorize_features(tiles, band)
+        _atomic_write_json(layer_path, _geojson_payload(parts, categories))
         _atomic_write_json(vector_dir / "provenance.json", self._provenance(version))
         logger.info(
             "water layer vectorized: %s features=%d identity=%s version=%s",
@@ -982,6 +1146,7 @@ class MaskManager:
             band=band,
             from_cache=False,
             feature_count=len(parts),
+            categories=categories,
         )
 
     def resolve_auto_mask(
@@ -990,7 +1155,7 @@ class MaskManager:
         *,
         dem_path: str | Path,
         output_dir: str | Path,
-    ) -> Path | None:
+    ) -> Path:
         """Resolve the buffered binary water mask onto the DEM mosaic grid.
 
         Cached vector -> UTM planar buffer (:func:`buffer_land_utm_km` in
@@ -1017,10 +1182,8 @@ class MaskManager:
 
         Returns
         -------
-        pathlib.Path or None
-            The written mask path, or ``None`` when the water provider is
-            unavailable and :attr:`on_failure` is ``warning``/``skip``
-            (the failure policy is logged; the run continues unmasked).
+        pathlib.Path
+            The written mask path.
 
         Raises
         ------
@@ -1034,7 +1197,15 @@ class MaskManager:
         import rasterio
 
         entry = self.source_entry
-        buffer_km = float(self.buffer_km)
+        # Fetch context must contain every category operation's neighbourhood.
+        # ``buffer_km`` remains accepted as a compatibility alias for callers
+        # that used the P0039 manager, but can never make the context smaller
+        # than the pinned ocean shoreline keep distance.
+        buffer_km = max(
+            float(self.buffer_km),
+            float(self.ocean_shore_keep_m) / 1000.0,
+            float(self.inland_water_buffer_m) / 1000.0,
+        )
         raw = _bounds_tuple(roi_bounds)
         zone_lon = (raw[0] + raw[2]) / 2.0
         zone_lat = (raw[1] + raw[3]) / 2.0
@@ -1057,12 +1228,7 @@ class MaskManager:
             grid_shape = (dataset.height, dataset.width)
             validity = dataset.read_masks(1) != 0
 
-        try:
-            layer = self.get_water_layer(padded)
-        except MaskProviderUnavailableError:
-            if self.on_failure == "error":
-                raise
-            return self._continue_without_mask()
+        layer = self.get_water_layer(padded)
 
         raster_key = _raster_cache_key(buffer_km, transform, grid_shape, crs, validity)
         cached = self.partition_dir / "rasters" / layer.identity / f"{raster_key}.tif"
@@ -1071,12 +1237,13 @@ class MaskManager:
                 mask = src.read(1)
             logger.info("water mask raster cache hit: %s", cached)
         else:
-            geometry = _load_layer_geometries(layer.path)
-            buffered = buffer_land_utm_km(
-                geometry, buffer_km, zone_lon=zone_lon, zone_lat=zone_lat
-            )
+            geometries, _categories = _load_layer_features(layer.path)
+            import shapely
+            from shapely.geometry import Polygon
+
+            operated = shapely.union_all(geometries) if geometries else Polygon()
             mask = rasterize_to_grid(
-                [buffered], transform, grid_shape, validity=validity
+                [operated], transform, grid_shape, validity=validity
             )
             _atomic_write_raster(cached, mask, transform, crs, tags={})
 
@@ -1096,25 +1263,6 @@ class MaskManager:
         )
         return out_path
 
-    def _continue_without_mask(self) -> None:
-        """Apply the warning/skip policy after a provider outage."""
-        entry = self.source_entry
-        if self.on_failure == "warning":
-            logger.error(
-                "water mask unavailable (%s@%s); continuing WITHOUT mask "
-                "(mask-absent) for this run — record the mask-absent state "
-                "in the run manifest (PROPOSAL-0039 on_failure=warning)",
-                entry.product,
-                entry.provider,
-            )
-            return
-        logger.debug(
-            "water mask unavailable (%s@%s); skipping silently (on_failure=skip)",
-            entry.product,
-            entry.provider,
-        )
-        return
-
     def _raster_tags(self, layer: WaterLayer, buffer_km: float) -> dict[str, str]:
         """Build the GeoTIFF provenance tags for one resolved mask."""
         tags = {
@@ -1122,6 +1270,9 @@ class MaskManager:
             for key, value in self._provenance(layer.source_version).items()
         }
         tags["mask_buffer_km"] = str(float(buffer_km))
+        tags["ocean_shore_keep_m"] = str(float(self.ocean_shore_keep_m))
+        tags["inland_water_buffer_m"] = str(float(self.inland_water_buffer_m))
+        tags["classification_version"] = _CLASSIFICATION_VERSION
         tags["mask_identity"] = layer.identity
         return tags
 
@@ -1147,8 +1298,8 @@ def get_mask_manager(
     source : str, optional
         Explicit selection overriding ``FANINSAR_MASK_SOURCE``; ``None``
         defers to the environment and then the ``water`` default.
-    on_failure : "error", "warning", or "skip"
-        Failure policy carried by the manager (class default ``error``).
+    on_failure : "error"
+        Provider failures always raise the structured outage error.
     buffer_km : float, optional
         Explicit land-buffer width overriding ``FANINSAR_MASK_BUFFER_KM``;
         ``None`` defers to the environment and then the 1.0 default.
@@ -1194,23 +1345,155 @@ def get_mask_manager(
     )
 
 
+def realize_water(
+    recipe: object,
+    *,
+    grid: object | None = None,
+    cache_dir: str | Path | None = None,
+) -> object:
+    """Materialize a deferred ``Mask.from_water`` recipe.
+
+    A recipe must carry finite bounds; provider selection and extraction
+    policy are resolved here, so constructing a deferred recipe remains a
+    zero-I/O operation.  With no ``grid`` a category-bearing ``VectorMask``
+    is returned.  Supplying the mask core's ``GridSpec`` returns its
+    nearest-neighbour ``RasterMask`` instead.
+
+    Parameters
+    ----------
+    recipe : object
+        A recipe mapping or a deferred ``VectorMask`` created by
+        :meth:`faninsar.processing.masking.mask.Mask.from_water`.
+    grid : object, optional
+        Target ``GridSpec``.  Omit to receive the authoritative vector
+        realization.
+    cache_dir : pathlib.Path, optional
+        Raw/vector cache root.  Defaults to ``FANINSAR_MASK_CACHE_DIR``.
+
+    Returns
+    -------
+    object
+        A ``VectorMask`` or ``RasterMask`` from the mask core.
+
+    Raises
+    ------
+    ValueError
+        If bounds are absent, non-finite, or malformed.
+    InvalidProcessingStateError
+        If no cache directory is configured.
+
+    """
+    deferred = getattr(recipe, "_water_recipe", None)
+    if deferred is None:
+        deferred = recipe
+    if not isinstance(deferred, Mapping):
+        message = "water realization requires a deferred water recipe mapping"
+        logger.error(message)
+        raise TypeError(message)
+    bounds = deferred.get("bounds")
+    if bounds is None:
+        message = "deferred water recipe requires finite bounds at realization"
+        logger.error(message)
+        raise ValueError(message)
+    try:
+        raw_bounds = tuple(float(value) for value in _bounds_tuple(bounds))
+    except (TypeError, ValueError) as error:
+        message = "deferred water recipe bounds must contain four finite numbers"
+        logger.exception(message)
+        raise ValueError(message) from error
+    if len(raw_bounds) != 4 or not np.all(np.isfinite(raw_bounds)):
+        message = "deferred water recipe bounds must contain four finite numbers"
+        logger.error(message)
+        raise ValueError(message)
+    provider = str(deferred.get("provider", "auto"))
+    if provider == "auto":
+        selection = AUTO_SOURCE_NAME
+    elif provider == AUTO_SOURCE_NAME or provider.startswith(f"{AUTO_SOURCE_NAME}:"):
+        selection = provider
+    else:
+        selection = f"{AUTO_SOURCE_NAME}:{provider}"
+    policy = deferred.get("policy", {})
+    if policy is None:
+        policy = {}
+    if not isinstance(policy, Mapping):
+        message = "deferred water recipe policy must be a mapping"
+        logger.error(message)
+        raise TypeError(message)
+    accepted = {
+        "threshold",
+        "excluded_values",
+        "invert",
+        "simplify_tolerance_m",
+        "min_area_km2",
+        "ocean_shore_keep_m",
+        "inland_water_buffer_m",
+        "max_workers",
+        "chunked_threshold",
+    }
+    unknown = sorted(set(policy) - accepted)
+    if unknown:
+        message = (
+            "deferred water recipe policy contains unsupported fields: "
+            f"{unknown!r}"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    options = {key: value for key, value in policy.items() if key in accepted}
+    if cache_dir is None and not os.environ.get(MASK_CACHE_ENV):
+        message = f"{MASK_CACHE_ENV} is not set; cannot realize deferred water mask"
+        logger.error(message)
+        raise InvalidProcessingStateError(message)
+    manager = MaskManager(
+        cache_dir=Path(cache_dir)
+        if cache_dir is not None
+        else Path(os.environ[MASK_CACHE_ENV]),
+        source=selection,
+        **options,
+    )
+    layer = manager.get_water_layer(raw_bounds)
+    geometries, categories = _load_layer_features(layer.path)
+    from faninsar.processing.masking.mask import Mask
+
+    vector = Mask.from_vector(
+        geometries,
+        crs="EPSG:4326",
+        categories=categories,
+        provenance={
+            "mask_identity": layer.identity,
+            "source_version": layer.source_version,
+            "classification_version": _CLASSIFICATION_VERSION,
+        },
+    )
+    if grid is None:
+        return vector
+    return vector.to_raster(grid)
+
+
+def realize_water_mask(
+    recipe: object,
+    *,
+    grid: object | None = None,
+    cache_dir: str | Path | None = None,
+) -> object:
+    """Alias for :func:`realize_water` used by integration callers."""
+    return realize_water(recipe, grid=grid, cache_dir=cache_dir)
+
+
 def resolve_auto_mask(
     bounds: Bounds,
     *,
     dem_path: str | Path,
     output_dir: str | Path,
     buffer_km: float | None = None,
-    on_failure: FailurePolicy = "warning",
+    on_failure: FailurePolicy = "error",
     **kwargs: object,
-) -> Path | None:
+) -> Path:
     """Module-level automatic water-mask convenience (mirrors resolve_auto_dem).
 
     Builds the manager via :func:`get_mask_manager` (environment-driven,
     with ``on_failure`` and ``buffer_km`` applied), resolves the buffered
-    binary mask onto the DEM grid, and lets the manager apply the failure
-    policy: ``error`` raises :class:`MaskProviderUnavailableError`;
-    ``warning`` logs loudly (mask-absent) and returns ``None``; ``skip``
-    returns ``None`` silently. The Stack default is ``warning``.
+    binary mask onto the DEM grid. Provider failures always raise
+    :class:`MaskProviderUnavailableError`.
 
     Parameters
     ----------
@@ -1223,8 +1506,8 @@ def resolve_auto_mask(
     buffer_km : float, optional
         Land buffer width in kilometres; ``None`` defers to
         ``FANINSAR_MASK_BUFFER_KM`` and then the 1.0 default.
-    on_failure : "error", "warning", or "skip"
-        Failure policy (default ``warning``, the Stack convention).
+    on_failure : "error"
+        Provider failures always raise the structured outage error.
     **kwargs
         Extra :class:`MaskManager` configuration fields (``threshold``,
         ``excluded_values``, ``invert``, ``simplify_tolerance_m``,
@@ -1233,9 +1516,8 @@ def resolve_auto_mask(
 
     Returns
     -------
-    pathlib.Path or None
-        The written mask path, or ``None`` when the provider is unavailable
-        under a ``warning``/``skip`` policy.
+    pathlib.Path
+        The written mask path.
 
     """
     source = kwargs.pop("source", None)

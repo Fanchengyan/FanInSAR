@@ -63,6 +63,7 @@ __all__ = [
     "GSW_DEFAULT_THRESHOLD",
     "GSW_TILE_SIZE_DEG",
     "MASK_PRODUCT_DEFAULTS",
+    "WATER_CLASSIFICATION_VERSION",
     "WORLDCOVER_BASE_URL",
     "WORLDCOVER_TILE_SIZE_DEG",
     "WORLDCOVER_WATER_CLASS",
@@ -102,6 +103,9 @@ WORLDCOVER_RESOLUTION_M = 10.0
 #: Water polarity defaults: GSW occurrence threshold, WorldCover class code.
 GSW_DEFAULT_THRESHOLD = 50
 WORLDCOVER_WATER_CLASS = 80
+# Internal qualified-label receipt used by the water realization seam.  This
+# is metadata, not a selectable classifier protocol.
+WATER_CLASSIFICATION_VERSION = "edge-connected-v1"
 
 #: Minimum valid tile size in bytes. GSW coastal tiles run ~15.6 MB and
 #: WorldCover land tiles ~10 MB, but all-land/all-water tiles compress far
