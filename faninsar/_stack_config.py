@@ -121,6 +121,10 @@ def run(
     elif "burst_index" in cfg:
         swath = cfg.get("swath", "IW1")
         kwargs["bursts"] = {swath: [cfg["burst_index"]]}
+    if "mask" in cfg:
+        # ``mask: none`` is the explicit-disable spelling for mapping configs;
+        # ``water`` (or an absent key) keeps the Stack auto-water default.
+        kwargs["mask"] = None if cfg["mask"] == "none" else cfg["mask"]
     for key in (
         "roi",
         "dem",
@@ -140,6 +144,13 @@ def run(
         "activation_authority_root",
         "retain_pair_states",
         "record_scientific_lineage",
+        "mask_source",
+        "mask_buffer_km",
+        "mask_resolution_m",
+        "ocean_water_buffer_km",
+        "inland_water_buffer_km",
+        "mask_on_failure",
+        "mask_apply_ionosphere",
     ):
         if key in cfg:
             kwargs[key] = cfg[key]

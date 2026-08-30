@@ -45,7 +45,10 @@ from faninsar.processing.coreg.misreg_network import (
     MisregArc,
     invert_pair_misregistration,
 )
-from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.errors import (
+    InvalidProcessingStateError,
+    reject_invalid_state,
+)
 from faninsar.processing.interferometry.pair import validate_coherence_window
 from faninsar.processing.interferometry.phase_filter import (
     FilterProvenance,
@@ -54,10 +57,12 @@ from faninsar.processing.interferometry.phase_filter import (
 )
 from faninsar.processing.stack.catalog import SceneCatalog
 from faninsar.processing.stack.config import (
+    AUTO_WATER_MASK,
     ActivationMode,
     CoregMode,
     EsdMethod,
     FlattenStage,
+    MaskFailurePolicy,
     StackConfig,
 )
 from faninsar.processing.stack.provider import SourceHandle
@@ -80,6 +85,7 @@ if TYPE_CHECKING:
         StackActivationBinding,
     )
     from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.masking.mask import MaskSampler
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.production import (
         BurstSelection,
@@ -174,6 +180,300 @@ def _raise_unwrap_failed(
     """Raise the typed Stack boundary error after logging its cause."""
     logger.error(message)
     raise UnwrapFailedError(message, result)
+
+
+# ---------------------------------------------------------------------------
+# PROPOSAL-0039 mask-aware effective ROI (Stack integration, Slice D1)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectiveRoi:
+    """Mask-aware effective-ROI resolution for one Stack run.
+
+    Attributes
+    ----------
+    roi
+        ROI feeding the existing burst-selection path: the original ROI when
+        the mask is inactive or unresolvable, a :class:`~faninsar.query.\
+Polygons` wrapping the subtracted geometry when reshaped, or ``None``
+        when no ROI was configured.
+    geometry
+        EPSG:4326 shapely geometry of the effective ROI (canonical coreg
+        identity input), or ``None`` when the ROI was not reshaped.
+    lineage
+        Run-manifest record: ``{}`` for unmasked runs, ``{"mask": "absent",
+        "reason": ...}`` after a degraded resolution, and ``{"mask":
+        "present", ...}`` with provenance after a resolved mask.
+
+    """
+
+    roi: object | None
+    geometry: object | None
+    lineage: dict[str, object]
+
+
+def _roi_to_geometry(roi: object) -> Any:
+    """Convert a Stack ROI into one EPSG:4326 shapely geometry.
+
+    Mirrors ``faninsar.processing.pipeline.production._roi_geometry`` so the
+    mask subtraction operates on exactly the geometry the burst-selection
+    path consumes.
+    """
+    from shapely.geometry import box
+
+    from faninsar.query import BoundingBox
+
+    if isinstance(roi, BoundingBox):
+        return box(roi.left, roi.bottom, roi.right, roi.top)
+    series = roi.geometry  # Polygons
+    union = series.union_all() if hasattr(series, "union_all") else series.unary_union
+    crs = getattr(roi, "crs", None)
+    if crs is not None and str(crs) != "EPSG:4326":
+        import geopandas as gpd
+
+        return gpd.GeoSeries([union], crs=crs).to_crs("EPSG:4326").iloc[0]
+    return union
+
+
+def _polygonal_parts(geometry: Any) -> list[Any]:
+    """Return the non-empty polygonal parts of a difference result."""
+    from shapely.geometry import MultiPolygon, Polygon
+
+    if geometry is None or geometry.is_empty:
+        return []
+    if isinstance(geometry, (Polygon, MultiPolygon)):
+        return [geometry]
+    return [
+        part
+        for part in getattr(geometry, "geoms", ())
+        if isinstance(part, (Polygon, MultiPolygon)) and not part.is_empty
+    ]
+
+
+def _effective_roi_polygons(parts: list[Any]) -> object:
+    """Wrap polygonal effective-ROI parts into a Polygons object."""
+    import geopandas as gpd
+
+    from faninsar.query import Polygons
+
+    return Polygons(
+        gpd.GeoDataFrame(geometry=parts, crs="EPSG:4326"),
+        types="desired",
+        crs="EPSG:4326",
+    )
+
+
+def _resolved_mask_buffer_km(
+    mask_buffer_km: float,
+    ocean_water_buffer_km: float | None,
+    inland_water_buffer_km: float | None,
+) -> float:
+    """Collapse the configured buffers into one land-buffer width.
+
+    Equal ocean/inland buffers collapse to one land buffer with no water-body
+    classification (PROPOSAL-0039 G4); differing buffers require the
+    connectivity classification that is not wired in this slice and fail
+    closed instead of silently changing the masking semantics.
+    """
+    if ocean_water_buffer_km is None and inland_water_buffer_km is None:
+        return float(mask_buffer_km)
+    if ocean_water_buffer_km is None or inland_water_buffer_km is None:
+        reject_invalid_state(
+            "ocean_water_buffer_km and inland_water_buffer_km must be "
+            "configured together"
+        )
+    if float(ocean_water_buffer_km) != float(inland_water_buffer_km):
+        message = (
+            "differing ocean_water_buffer_km/inland_water_buffer_km require "
+            "the water-body connectivity classification, which is not wired "
+            "in this slice; configure equal buffers or a single "
+            "mask_buffer_km"
+        )
+        logger.error(message)
+        raise InvalidProcessingStateError(message)
+    return float(ocean_water_buffer_km)
+
+
+def _mask_failure_lineage(
+    mask_on_failure: str,
+    error: Exception,
+    roi: object | None,
+) -> _EffectiveRoi:
+    """Apply the failure policy after an unresolvable mask; record absence.
+
+    ``error`` policy re-raises the structured failure; ``warning`` logs
+    loudly and ``skip`` logs quietly, both recording ``{"mask": "absent",
+    "reason": ...}`` for the run manifest while keeping the unmasked ROI.
+    """
+    if mask_on_failure == "error":
+        raise error
+    reason = str(error)
+    if mask_on_failure == "warning":
+        logger.error(
+            "water mask unavailable; continuing WITHOUT mask (mask-absent) "
+            "and recording the mask-absent state in the run manifest "
+            "(PROPOSAL-0039 on_failure=warning): %s",
+            reason,
+        )
+    else:
+        logger.debug(
+            "water mask unavailable; skipping silently (on_failure=skip): %s",
+            reason,
+        )
+    return _EffectiveRoi(
+        roi=roi,
+        geometry=None,
+        lineage={"mask": "absent", "reason": reason},
+    )
+
+
+def _resolve_effective_roi(
+    roi: BoundingBox | Polygons | None,
+    *,
+    mask: str | MaskSampler | None,
+    mask_source: str | None,
+    mask_buffer_km: float,
+    ocean_water_buffer_km: float | None,
+    inland_water_buffer_km: float | None,
+    mask_on_failure: MaskFailurePolicy,
+) -> _EffectiveRoi:
+    """Resolve ``effective_ROI = ROI - water_beyond_buffer`` (PROPOSAL-0039 G6).
+
+    The antimeridian seam guard runs FIRST on the raw ROI bounds with the
+    padded, tile-snapped fetch band and fails closed before any fetch; the
+    cached vector water layer is read back (geopandas), buffered with
+    :func:`~faninsar.processing.masking.mask.buffer_land_utm_km` in the ROI's
+    auto-UTM zone, and subtracted from the ROI geometry. An empty result
+    raises a structured :class:`InvalidProcessingStateError` independent of
+    ``mask_on_failure``. Mask *resolution* failures (provider outage,
+    misconfigured manager) route through the ``mask_on_failure`` policy and
+    degrade to the unmasked ROI with a mask-absent lineage record.
+
+    Parameters
+    ----------
+    roi : BoundingBox, Polygons, or None
+        The configured Stack ROI. ``None`` defers masking to the product
+        level (Slice D2); no ROI is forced.
+    mask : str, MaskSampler, or None
+        ``None`` disables masking (bitwise-identical legacy path);
+        ``AUTO_WATER_MASK`` selects the automatic water mask; any other
+        object is a user-supplied sampler whose masking is product-level
+        (Slice D2), leaving the ROI untouched in this slice.
+    mask_source : str or None
+        MaskManager selection override (``water`` / ``water:<provider>``).
+    mask_buffer_km : float
+        Land buffer width in kilometres (default 1.0).
+    ocean_water_buffer_km, inland_water_buffer_km : float or None
+        Dual-buffer configuration; equal values collapse to one land buffer,
+        differing values fail closed (classification unwired).
+    mask_on_failure : "error", "warning", or "skip"
+        Failure policy for mask *resolution* failures only.
+
+    Returns
+    -------
+    _EffectiveRoi
+        The effective ROI, its geometry, and the run-manifest lineage record.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        When the seam guard rejects the ROI, when the effective ROI is
+        empty, or when the buffers cannot be collapsed (all structural).
+    MaskProviderUnavailableError
+        When the provider fails under the ``error`` policy.
+
+    """
+    if mask is None:
+        # Explicitly disabled: bitwise-identical legacy path, no lineage.
+        return _EffectiveRoi(roi=roi, geometry=None, lineage={})
+    if roi is None:
+        # Without an ROI the mask still applies at the product level
+        # (PROPOSAL-0039 Stack integration, Slice D2); never force an ROI.
+        return _EffectiveRoi(roi=None, geometry=None, lineage={})
+    if not isinstance(mask, str):
+        # User-supplied samplers are product-level masks (Slice D2); the
+        # geometric ROI subtraction is pinned to the automatic water mask.
+        return _EffectiveRoi(roi=roi, geometry=None, lineage={})
+    if mask != AUTO_WATER_MASK:  # defensive; StackConfig validates strings
+        reject_invalid_state(f"unsupported Stack mask selection: {mask!r}")
+
+    from faninsar.processing.masking.mask import (
+        antimeridian_seam_guard,
+        buffer_land_utm_km,
+        padded_fetch_band,
+        snap_band,
+    )
+    from faninsar.processing.masking.mask_manager import (
+        MaskProviderUnavailableError,
+        get_mask_manager,
+    )
+
+    roi_geometry = _roi_to_geometry(roi)
+    raw_bounds = tuple(float(value) for value in roi_geometry.bounds)
+    zone_lon = (raw_bounds[0] + raw_bounds[2]) / 2.0
+    zone_lat = (raw_bounds[1] + raw_bounds[3]) / 2.0
+    buffer_km = _resolved_mask_buffer_km(
+        mask_buffer_km, ocean_water_buffer_km, inland_water_buffer_km
+    )
+
+    try:
+        manager = get_mask_manager(source=mask_source, on_failure=mask_on_failure)
+    except InvalidProcessingStateError as error:
+        # A misconfigured manager (e.g. unset mask cache dir) is an
+        # unresolvable mask, not a structural ROI problem: the failure
+        # policy governs, mirroring a provider outage.
+        return _mask_failure_lineage(mask_on_failure, error, roi)
+
+    # Seam guard FIRST: fail closed on the raw ROI bounds with the padded,
+    # tile-snapped fetch band before any fetch (PROPOSAL-0039 G4).
+    padded = padded_fetch_band(
+        raw_bounds, buffer_km, zone_lon=zone_lon, zone_lat=zone_lat
+    )
+    band = snap_band(padded, manager.source_entry.tile_size_deg)
+    seam_ok, seam_reason = antimeridian_seam_guard(raw_bounds, padded_band=band)
+    if not seam_ok:
+        reject_invalid_state(
+            "water-mask ROI rejected by the antimeridian seam guard "
+            f"({seam_reason}); ROI bounds {raw_bounds} fail closed before "
+            "any fetch (PROPOSAL-0039)"
+        )
+
+    try:
+        layer = manager.get_water_layer(padded)
+    except MaskProviderUnavailableError as error:
+        return _mask_failure_lineage(mask_on_failure, error, roi)
+
+    import geopandas as gpd
+    import shapely
+
+    layer_frame = gpd.read_file(layer.path)
+    series = layer_frame.geometry
+    water = series.union_all() if hasattr(series, "union_all") else series.unary_union
+    buffered = buffer_land_utm_km(
+        water, buffer_km, zone_lon=zone_lon, zone_lat=zone_lat
+    )
+    effective = roi_geometry.difference(buffered)
+    parts = _polygonal_parts(effective)
+    if not parts:
+        reject_invalid_state(
+            "effective ROI is empty after water-mask subtraction: the ROI "
+            f"{raw_bounds} is fully covered by buffered water "
+            f"(mask={mask!r}, buffer_km={buffer_km}, provider="
+            f"{manager.source_entry.provider}); this structural guard holds "
+            "regardless of mask_on_failure (PROPOSAL-0039 G6)"
+        )
+    return _EffectiveRoi(
+        roi=_effective_roi_polygons(parts),
+        geometry=parts[0] if len(parts) == 1 else shapely.union_all(parts),
+        lineage={
+            "mask": "present",
+            "mask_identity": layer.identity,
+            "mask_source_version": layer.source_version,
+            "mask_buffer_km": buffer_km,
+        },
+    )
+
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -540,6 +840,7 @@ class Stack(Network):
     _unwrap_generation: Any | None = field(default=None, repr=False)
     _network_generation_id: str | None = field(default=None, repr=False)
     _network_product_index: NetworkProductIndex | None = field(default=None, repr=False)
+    _effective_roi_resolution: _EffectiveRoi | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Initialize the inherited Network analysis surface lazily.
@@ -593,6 +894,14 @@ class Stack(Network):
         dem: DEMSampler | None = None,
         geo_grid: GeoGridSpec | None = None,
         roi: BoundingBox | Polygons | None = None,
+        mask: str | MaskSampler | None = AUTO_WATER_MASK,
+        mask_source: str | None = None,
+        mask_resolution_m: float | None = None,
+        mask_buffer_km: float = 1.0,
+        ocean_water_buffer_km: float | None = None,
+        inland_water_buffer_km: float | None = None,
+        mask_on_failure: MaskFailurePolicy = "warning",
+        mask_apply_ionosphere: bool = False,
         coreg_mode: CoregMode = "pair",
         flatten_stage: FlattenStage = "coregistration",
         coregistration_grid: CoregistrationGrid = "radar",
@@ -653,6 +962,14 @@ class Stack(Network):
             dem=dem,
             geo_grid=geo_grid,
             roi=roi,
+            mask=mask,
+            mask_source=mask_source,
+            mask_resolution_m=mask_resolution_m,
+            mask_buffer_km=mask_buffer_km,
+            ocean_water_buffer_km=ocean_water_buffer_km,
+            inland_water_buffer_km=inland_water_buffer_km,
+            mask_on_failure=mask_on_failure,
+            mask_apply_ionosphere=mask_apply_ionosphere,
             swaths=swaths,
             bursts=bursts,
             activation_mode=activation_mode,
@@ -786,6 +1103,42 @@ class Stack(Network):
         if record.get("scene_dates") != list(self.catalog.dates):
             reject_invalid_state("Stack activation scene set does not match catalog")
 
+    def _effective_roi_with_mask(self) -> _EffectiveRoi:
+        """Resolve the mask-aware effective ROI once per Stack run.
+
+        The resolution (manager construction, seam guard, water-layer fetch,
+        subtraction) is cached so every stage of one run shares a single
+        resolution and a single run-manifest lineage record.
+
+        Returns
+        -------
+        _EffectiveRoi
+            The effective ROI, its geometry, and the lineage record.
+
+        """
+        if self._effective_roi_resolution is None:
+            cfg = self.config
+            self._effective_roi_resolution = _resolve_effective_roi(
+                cfg.roi,
+                mask=cfg.mask,
+                mask_source=cfg.mask_source,
+                mask_buffer_km=cfg.mask_buffer_km,
+                ocean_water_buffer_km=cfg.ocean_water_buffer_km,
+                inland_water_buffer_km=cfg.inland_water_buffer_km,
+                mask_on_failure=cfg.mask_on_failure,
+            )
+        return self._effective_roi_resolution
+
+    def _mask_lineage_record(self) -> dict[str, object]:
+        """Return the mask lineage record merged into run-manifest payloads.
+
+        The record is ``{}`` for unmasked runs, ``{"mask": "absent",
+        "reason": ...}`` when the mask could not be resolved under the
+        warning/skip policy, and ``{"mask": "present", ...}`` with provenance
+        when the automatic water mask resolved (PROPOSAL-0039 G2/G3).
+        """
+        return self._effective_roi_with_mask().lineage
+
     def _burst_kwargs(self) -> dict[str, Any]:
         cfg = self.config
         bursts = cfg.bursts
@@ -802,7 +1155,7 @@ class Stack(Network):
             "dask_client": self.dask_client,
             "record_scientific_lineage": cfg.record_scientific_lineage,
             "coregistration_grid": cfg.coregistration_grid,
-            "roi": cfg.roi,
+            "roi": self._effective_roi_with_mask().roi,
             "control_spacing": cfg.control_spacing,
             "n_jobs": cfg.n_jobs,
         }
@@ -1091,6 +1444,15 @@ class Stack(Network):
         bursts = self.config.bursts
         if bursts is None and self.config.swaths:
             bursts = {swath: [0] for swath in self.config.swaths}
+        # The coreg identity binds to the ROI the run actually consumed: the
+        # mask-aware effective ROI when the water mask reshaped it, otherwise
+        # the configured ROI unchanged (a degraded unmasked run resumes).
+        effective_roi = self._effective_roi_with_mask()
+        identity_roi = (
+            effective_roi.geometry
+            if effective_roi.geometry is not None
+            else self.config.roi
+        )
         provider_payload = provider_identity()
         provider_metadata: dict[str, object] = {}
         if provider_payload is not None:
@@ -1146,7 +1508,7 @@ class Stack(Network):
                 )
                 for swath, indices in sorted((bursts or {}).items())
             },
-            "roi": roi_identity(self.config.roi),
+            "roi": roi_identity(identity_roi),
             "dem": dem_identity(self.config.dem),
             "geo_grid": geo_grid_identity,
             "control_spacing": self.config.control_spacing,
@@ -1418,6 +1780,7 @@ class Stack(Network):
                         "coregistration_timings_s": getattr(
                             state, "coregistration_timings_s", {}
                         ),
+                        **self._mask_lineage_record(),
                     },
                     indent=2,
                     default=str,
