@@ -85,6 +85,12 @@ def write_pair_stac_item(
 ) -> Path:
     """Write a minimal STAC item describing the pair Zarr product.
 
+    When the pair metadata carries a mask product (``mask_href`` plus the
+    ``mask_product``/``mask_provider``/``mask_retrieved``/``mask_threshold``/
+    ``mask_buffer_km`` provenance keys, PROPOSAL-0039), the buffered binary
+    mask is registered as a ``mask`` STAC asset next to the Zarr store and
+    the provenance keys surface as ``faninsar:mask_*`` item properties.
+
     Parameters
     ----------
     product : PairProductArrays
@@ -108,6 +114,22 @@ def write_pair_stac_item(
     if not item_id:
         reject_invalid_state("pair_id is required for STAC item identity")
     height, width = product.wrapped_phase.shape
+    assets: dict[str, dict[str, Any]] = {
+        "zarr": {
+            "href": str(zarr_path),
+            "type": "application/vnd+zarr",
+            "roles": ["data"],
+            "title": "Pair product Zarr store",
+        }
+    }
+    mask_href = product.metadata.get("mask_href")
+    if mask_href:
+        assets["mask"] = {
+            "href": str(mask_href),
+            "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+            "roles": ["mask", "data"],
+            "title": "Buffered mask (1 = water/removed)",
+        }
     item = {
         "type": "Feature",
         "stac_version": "1.0.0",
@@ -121,14 +143,7 @@ def write_pair_stac_item(
             "faninsar:unwrap_method": product.metadata.get("unwrap_method", "snaphu"),
             **{f"faninsar:{k}": v for k, v in product.metadata.items()},
         },
-        "assets": {
-            "zarr": {
-                "href": str(zarr_path),
-                "type": "application/vnd+zarr",
-                "roles": ["data"],
-                "title": "Pair product Zarr store",
-            }
-        },
+        "assets": assets,
         "links": [],
         "stac_extensions": [],
     }
