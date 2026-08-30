@@ -289,6 +289,12 @@ def _apply_validity(grid: GridSpec, data: np.ndarray) -> np.ndarray:
 
 def _freeze(value: object) -> object:
     """Return an immutable defensive snapshot of nested metadata."""
+    if isinstance(value, np.ndarray):
+        result = np.array(value, copy=True)
+        result.setflags(write=False)
+        return result
+    if isinstance(value, np.generic):
+        return value.item()
     if isinstance(value, Mapping):
         return MappingProxyType(
             {_freeze(key): _freeze(item) for key, item in value.items()}
@@ -297,11 +303,30 @@ def _freeze(value: object) -> object:
         return tuple(_freeze(item) for item in value)
     if isinstance(value, (set, frozenset)):
         return frozenset(_freeze(item) for item in value)
+    # A caller may use a small metadata object as a source/provenance value.
+    # Keep an immutable structural snapshot instead of retaining the mutable
+    # object reference.  Private implementation state is intentionally not
+    # part of mask identity.
+    attributes = getattr(value, "__dict__", None)
+    if isinstance(attributes, dict):
+        return MappingProxyType(
+            {
+                "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
+                "attributes": _freeze(attributes),
+            }
+        )
     return value
 
 
 def _jsonable(value: object) -> object:
     """Convert frozen metadata to deterministic JSON-compatible values."""
+    if isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        return {
+            "dtype": str(array.dtype),
+            "shape": list(array.shape),
+            "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+        }
     if isinstance(value, Mapping):
         return {
             str(key): _jsonable(item)
@@ -413,13 +438,18 @@ class RasterMask(Mask):
             message = f"raster shape {array.shape} does not match grid {grid.shape}"
             logger.error(message)
             raise ValueError(message)
-        self._data, self.grid, self.source = _apply_validity(grid, array), grid, source
+        normalized_source = _freeze(source)
+        self._data, self.grid, self.source = (
+            _apply_validity(grid, array),
+            grid,
+            normalized_source,
+        )
         self._identity = _digest(
             {
                 "kind": "raster",
                 "data": self._data.tobytes().hex(),
                 "grid": (grid.crs, tuple(grid.transform), grid.shape, grid.bounds),
-                "source": source,
+                "source": normalized_source,
             }
         )
 
@@ -734,7 +764,7 @@ class VectorMask(Mask):
                 dtype="uint8",
             )
             result[np.asarray(invalid_plane, dtype=bool)] = 255
-        return RasterMask(result, grid)
+        return RasterMask(result, grid, source=self.provenance)
 
     def buffer_by_category(
         self, distances_m: Mapping[object, float], *, category_field: str = "category"
@@ -799,7 +829,7 @@ class VectorMask(Mask):
             {
                 "mask_role": self.roles,
                 "category": self.categories,
-                "provenance": [json.dumps(self.provenance, default=str)]
+                "provenance": [json.dumps(_jsonable(self.provenance), default=str)]
                 * len(self.geometry),
             },
             geometry=list(self.geometry),

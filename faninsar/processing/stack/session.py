@@ -778,6 +778,9 @@ class Stack(Network):
     _radar_projected_masks: dict[str, np.ndarray] = field(
         default_factory=dict, repr=False
     )
+    _radar_mask_identities: dict[
+        tuple[str, tuple[int, int], tuple[int, int]], str
+    ] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         """Initialize the inherited Network analysis surface lazily.
@@ -1073,15 +1076,16 @@ class Stack(Network):
         )
         return transform, shape
 
-    def _ifg_mask_plane(
+    def _stage_mask_plane(
         self,
         *,
+        stage: StageName,
         domain: str,
         looks: tuple[int, int],
         expected_shape: tuple[int, int] | None = None,
     ) -> np.ndarray | None:
-        """Return a canonical mask plane for an IFG target grid."""
-        if not self.config.mask_plan.references("interferogram"):
+        """Return one stage's canonical mask plane on its target domain/grid."""
+        if not self.config.mask_plan.references(stage):
             return None
         if domain == "radar":
             from faninsar.processing.masking.mask import GridSpec
@@ -1103,12 +1107,23 @@ class Stack(Network):
                 )
                 logger.error(message)
                 raise ValueError(message)
-            if not all(hasattr(master, name) for name in ("crs", "transform", "shape")):
+            if isinstance(master, dict):
+                if not all(key in master for key in ("crs", "transform", "shape")):
+                    message = "radar mask projection master GridSpec is incomplete"
+                    logger.error(message)
+                    raise ValueError(message)
+                target = GridSpec(
+                    master["crs"], master["transform"], shape=tuple(master["shape"])
+                )
+            elif all(
+                hasattr(master, name) for name in ("crs", "transform", "shape")
+            ):
+                target = GridSpec(master.crs, master.transform, shape=master.shape)
+            else:
                 message = "radar mask projection master GridSpec is incomplete"
                 logger.error(message)
                 raise ValueError(message)
-            target = GridSpec(master.crs, master.transform, shape=master.shape)
-            materialized = self._materialize_stage_mask("interferogram", target)
+            materialized = self._materialize_stage_mask(stage, target)
             if materialized is None:
                 return None
             if context is None:
@@ -1161,6 +1176,12 @@ class Stack(Network):
                     master_grid=target,
                     reference_scene=context.get("reference_scene", self.reference),
                 )
+            projected_shape = tuple(
+                expected_shape or self._radar_projected_masks[projection_key].shape
+            )
+            self._radar_mask_identities[(stage, tuple(looks), projected_shape)] = (
+                projection_key
+            )
             projected = self._radar_projected_masks[projection_key]
             if expected_shape is not None and tuple(expected_shape) != projected.shape:
                 message = (
@@ -1183,8 +1204,23 @@ class Stack(Network):
         from faninsar.processing.masking.mask import GridSpec
 
         target = GridSpec("EPSG:4326", transform, shape=shape)
-        materialized = self._materialize_stage_mask("interferogram", target)
+        materialized = self._materialize_stage_mask(stage, target)
         return None if materialized is None else materialized.data
+
+    def _ifg_mask_plane(
+        self,
+        *,
+        domain: str,
+        looks: tuple[int, int],
+        expected_shape: tuple[int, int] | None = None,
+    ) -> np.ndarray | None:
+        """Return the interferogram-stage mask on its target grid."""
+        return self._stage_mask_plane(
+            stage="interferogram",
+            domain=domain,
+            looks=looks,
+            expected_shape=expected_shape,
+        )
 
     def _materialize_stage_mask(
         self, stage: StageName, target: object
@@ -1290,41 +1326,55 @@ class Stack(Network):
         ).data
 
     def _unwrap_mask_plane(self, shape: tuple[int, int]) -> np.ndarray | None:
-        """Materialize the explicit unwrap-stage mask on the IFG grid."""
-        if not self.config.mask_plan.references("unwrap"):
-            return None
-        grid = self._ifg_geo_grid(self.config.multilook)
-        if grid is None:
-            raise ValueError("unwrap masks require an EPSG:4326 geo_grid")
-        from faninsar.processing.masking.mask import GridSpec
+        """Materialize the explicit unwrap-stage mask on the IFG grid.
 
-        transform, target_shape = grid
-        if tuple(shape) != target_shape:
-            reject_invalid_state("unwrap mask target grid shape does not match IFG")
-        return self._materialize_stage_mask(
-            "unwrap", GridSpec("EPSG:4326", transform, shape=target_shape)
-        ).data
+        Radar-domain unwrap uses the same authoritative master grid and
+        projection cache as interferogram formation.  Geographic unwrap keeps
+        the shared geo grid directly.  Keeping both paths in the common stage
+        helper prevents the two consumers from silently materializing masks on
+        different grids.
+        """
+        return self._stage_mask_plane(
+            stage="unwrap",
+            domain=self.config.coregistration_grid,
+            looks=self.config.multilook,
+            expected_shape=shape,
+        )
 
     def _unwrap_mask_identity(self, shape: tuple[int, int]) -> str | None:
         """Return the materialized unwrap-mask identity for generation binding."""
         if not self.config.mask_plan.references("unwrap"):
             return None
-        grid = self._ifg_geo_grid(self.config.multilook)
-        if grid is None:
-            message = "unwrap masks require an EPSG:4326 geo_grid"
-            logger.error(message)
-            raise ValueError(message)
-        transform, target_shape = grid
-        if tuple(shape) != target_shape:
-            message = "unwrap mask target grid shape does not match IFG"
-            logger.error(message)
-            raise ValueError(message)
-        from faninsar.processing.masking.mask import GridSpec
-
-        result = self._materialize_stage_mask(
-            "unwrap", GridSpec("EPSG:4326", transform, shape=target_shape)
+        # Resolve through the exact same target-domain path as
+        # ``_unwrap_mask_plane`` so identity and payload cannot diverge.
+        plane = self._stage_mask_plane(
+            stage="unwrap",
+            domain=self.config.coregistration_grid,
+            looks=self.config.multilook,
+            expected_shape=shape,
         )
-        return None if result is None else str(result.identity)
+        if plane is None:
+            return None
+        if self.config.coregistration_grid == "geo":
+            grid = self._ifg_geo_grid(self.config.multilook)
+            if grid is None:
+                reject_invalid_state("unwrap masks require an EPSG:4326 geo_grid")
+            transform, target_shape = grid
+            if tuple(shape) != target_shape:
+                reject_invalid_state("unwrap mask target grid shape does not match IFG")
+            from faninsar.processing.masking.mask import GridSpec
+
+            target = GridSpec("EPSG:4326", transform, shape=target_shape)
+            materialized = self._materialize_stage_mask("unwrap", target)
+            return None if materialized is None else str(materialized.identity)
+        key = self._radar_mask_identities.get(
+            ("unwrap", tuple(self.config.multilook), tuple(shape))
+        )
+        if key is None:
+            reject_invalid_state(
+                "radar unwrap mask identity requires a projected mask result"
+            )
+        return key
 
     def _burst_kwargs(self) -> dict[str, Any]:
         cfg = self.config
@@ -1345,6 +1395,102 @@ class Stack(Network):
             "roi": self._effective_roi_with_mask().roi,
             "control_spacing": cfg.control_spacing,
             "n_jobs": cfg.n_jobs,
+        }
+
+    def _radar_projection_context_record(self, state: Any) -> dict[str, object]:
+        """Return a durable descriptor for the authoritative radar context."""
+        scene = getattr(state, "primary", None)
+        geometry = getattr(scene, "geometry", None)
+        shape = getattr(getattr(scene, "array", None), "shape", None)
+        if shape is None:
+            shape = getattr(getattr(scene, "array", None), "samples", None)
+            shape = getattr(shape, "shape", None)
+        if geometry is None or shape is None:
+            reject_invalid_state(
+                "radar projection context cannot be persisted without reference "
+                "geometry and full radar shape"
+            )
+        burst = getattr(scene, "burst", None)
+        swath = getattr(getattr(scene, "swath", None), "swath", None)
+        orbit_paths = self.config.extra.get("orbit_paths")
+        orbit_path = (
+            orbit_paths.get(self.reference)
+            if isinstance(orbit_paths, dict)
+            else None
+        )
+        return {
+            "source_path": str(
+                getattr(scene, "path", self.catalog.paths_for(self.reference))
+            ),
+            "swath": str(
+                swath or (self.config.swaths[0] if self.config.swaths else "IW1")
+            ),
+            "burst_index": int(getattr(burst, "index", 0)),
+            "orbit_path": None if orbit_path is None else str(orbit_path),
+            "full_range": True,
+            "full_radar_shape": [int(value) for value in shape],
+            "reference_scene": self.reference,
+            "master_grid": self._radar_master_grid_metadata(),
+        }
+
+    def _radar_master_grid_metadata(self) -> dict[str, object]:
+        """Return serializable metadata for the canonical radar mask master."""
+        grid = self.config.geo_grid
+        if grid is None:
+            return {}
+        return {
+            "crs": str(grid.crs),
+            "transform": [float(value) for value in grid.transform],
+            "shape": [int(value) for value in grid.shape],
+        }
+
+    def _restore_radar_projection_context(
+        self, marker_data: Mapping[str, object]
+    ) -> None:
+        """Restore radar geometry needed by masks after a coreg resume."""
+        configured = self.config.extra.get("radar_projection_context")
+        if isinstance(configured, dict) and configured.get("geometry") is not None:
+            self._radar_projection_context = dict(configured)
+            return
+        record = marker_data.get("radar_projection_context")
+        if not isinstance(record, dict):
+            # No context is allowed to degrade silently.  Keep the error at the
+            # projection boundary so callers without mask stages can still
+            # resume ordinary radar scenes.
+            self._radar_projection_context = None
+            return
+        source_path = record.get("source_path")
+        if not isinstance(source_path, str) or not source_path:
+            reject_invalid_state("persisted radar projection context lacks source_path")
+        try:
+            from faninsar.processing.pipeline.production import load_production_scene
+
+            scene = load_production_scene(
+                source_path,
+                swath=str(record.get("swath", "IW1")),
+                burst_index=int(record.get("burst_index", 0)),
+                orbit_path=record.get("orbit_path"),
+                coregistration_grid="radar",
+                full_range=bool(record.get("full_range", True)),
+            )
+        except Exception as error:
+            logger.exception("failed to restore radar projection geometry")
+            reject_invalid_state(
+                f"persisted radar projection context cannot be restored: {error}"
+            )
+        shape = tuple(int(value) for value in record.get("full_radar_shape", ()))
+        if len(shape) != 2 or any(value <= 0 for value in shape):
+            reject_invalid_state("persisted radar projection context shape is invalid")
+        if tuple(scene.array.shape) != shape:
+            reject_invalid_state(
+                "restored radar projection geometry shape differs from persisted "
+                "coregistration shape"
+            )
+        self._radar_projection_context = {
+            "geometry": scene.geometry,
+            "full_radar_shape": shape,
+            "reference_scene": record.get("reference_scene", self.reference),
+            "master_grid": self.config.geo_grid,
         }
 
     def _reclaim_accelerator(self, kind: str) -> None:
@@ -1900,6 +2046,8 @@ class Stack(Network):
                         "the current date, Reference, or coordinate domain"
                     )
                 self.coreg_paths[date_id] = out
+                if self.config.coregistration_grid == "radar":
+                    self._restore_radar_projection_context(marker_data)
                 if date_id == target_dates[0]:
                     copy_reference_units(out / "scenes", reference_dir / "scenes")
                 continue
@@ -1938,6 +2086,8 @@ class Stack(Network):
             )
             if self.config.coregistration_grid == "radar":
                 shape = getattr(state.primary.array, "shape", None)
+                if shape is None:
+                    shape = getattr(state.primary.array.samples, "shape", None)
                 geometry = getattr(state.primary, "geometry", None)
                 if shape is not None and geometry is not None:
                     self._radar_projection_context = {
@@ -1946,6 +2096,10 @@ class Stack(Network):
                         "reference_scene": self.reference,
                         "master_grid": self.config.geo_grid,
                     }
+                else:
+                    reject_invalid_state(
+                        "radar coregistration did not produce projection geometry"
+                    )
             if self.config.retain_pair_states:
                 self.pair_states[f"{self.reference}_{date_id}"] = state
             else:
@@ -1976,6 +2130,11 @@ class Stack(Network):
                         "stage_timings_s": getattr(state, "stage_timings_s", {}),
                         "coregistration_timings_s": getattr(
                             state, "coregistration_timings_s", {}
+                        ),
+                        "radar_projection_context": (
+                            self._radar_projection_context_record(state)
+                            if self.config.coregistration_grid == "radar"
+                            else None
                         ),
                         **self._mask_lineage_record(),
                     },

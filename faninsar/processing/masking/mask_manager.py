@@ -1012,6 +1012,13 @@ class MaskManager:
             "inland": float(self.inland_water_buffer_m),
         }
         min_area_m2 = float(self.min_area_km2) * 1e6
+        # ``band`` is fetch context, not the scientific ROI.  A polygon that
+        # reaches this artificial boundary is truncated by tile coverage, so
+        # treating that edge as a real shoreline would erode valid water when
+        # applying the ocean keep distance.  The per-category dissolve below
+        # joins neighbouring tiles first; the contact guard then supplies a
+        # metric halo only for components still touching the fetch boundary.
+        coverage_boundary = shapely.box(*band).boundary
         for category in ("ocean", "inland"):
             if not classified[category]:
                 continue
@@ -1019,11 +1026,23 @@ class MaskManager:
                 shapely.ops.transform(forward.transform, geometry)
                 for geometry in classified[category]
             ]
-            operated = [
-                shapely.make_valid(geometry.buffer(operations[category]))
-                for geometry in projected
-            ]
-            dissolved = shapely.make_valid(shapely.union_all(operated))
+            dissolved_input = shapely.make_valid(shapely.union_all(projected))
+            operation = operations[category]
+            # Extend only at the artificial fetch edge.  This makes a later
+            # negative ocean buffer contact-safe while retaining the exact
+            # category operation in the interior.  Positive inland buffers
+            # naturally extend, but using the same guard keeps the rule
+            # symmetric and deterministic.
+            guarded = dissolved_input
+            if operation < 0.0:
+                projected_boundary = shapely.ops.transform(
+                    forward.transform, coverage_boundary
+                )
+                if dissolved_input.intersects(projected_boundary):
+                    guarded = shapely.make_valid(
+                        dissolved_input.buffer(abs(float(operation)))
+                    )
+            dissolved = shapely.make_valid(guarded.buffer(operation))
             simplified = dissolved.simplify(
                 float(self.simplify_tolerance_m), preserve_topology=True
             )
