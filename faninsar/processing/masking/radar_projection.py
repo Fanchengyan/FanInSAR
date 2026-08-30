@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -60,10 +61,6 @@ INVALID = np.uint8(255)
 
 def radar_projection_cache_key(
     *,
-    vector_digest: str | None = None,
-    buffer_km: float | None = None,
-    resolution_m: float | None = None,
-    dem_identity: object | None = None,
     source_mask_identity: object | None = None,
     master_grid: object | None = None,
     target_grid: object | None = None,
@@ -77,17 +74,9 @@ def radar_projection_cache_key(
 
     The materialized source mask, master and target grids, reference scene,
     geometry/LUT, DEM, and final target validity form the cache identity.
-    ``vector_digest`` and ``dem_identity`` are retained as input aliases for
-    callers transitioning to those canonical identities.  Buffer and
-    resolution settings do not identify a materialized product and are
-    intentionally ignored.
 
     Parameters
     ----------
-    vector_digest, dem_identity : object, optional
-        Legacy aliases for ``source_mask_identity`` and ``dem``.
-    buffer_km, resolution_m : float, optional
-        Legacy settings ignored by the hard-cutover identity.
     source_mask_identity, master_grid, target_grid, reference_scene : object, optional
         Materialized source, source/target grids, and reference-scene inputs.
     lut, geometry, dem, target_validity : object, optional
@@ -99,10 +88,6 @@ def radar_projection_cache_key(
         Lowercase SHA-256 hexdigest of the canonical identity payload.
 
     """
-    if source_mask_identity is None:
-        source_mask_identity = vector_digest
-    if dem is None:
-        dem = dem_identity
     payload = {
         "proposal": "PROPOSAL-0040",
         "source_mask_identity": _identity(source_mask_identity),
@@ -139,6 +124,11 @@ def _identity(value: object) -> object:  # noqa: PLR0911
             "dtype": str(array.dtype),
             "shape": array.shape,
             "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+        }
+    if isinstance(value, Mapping):
+        return {
+            str(key): _identity(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
         }
     identity = getattr(value, "identity", None)
     if identity is not None and not callable(identity):
@@ -225,9 +215,7 @@ def _nearest_label_view(plane: np.ndarray, multilook: tuple[int, int]) -> np.nda
     # Select the pixel nearest to each output pixel centre.  This preserves
     # the original hard label and has deterministic edge behaviour for odd
     # and even look factors alike.
-    azimuth = np.minimum(
-        np.arange(out_h) * az_looks + (az_looks - 1) // 2, height - 1
-    )
+    azimuth = np.minimum(np.arange(out_h) * az_looks + (az_looks - 1) // 2, height - 1)
     range_index = np.minimum(
         np.arange(out_w) * rg_looks + (rg_looks - 1) // 2, width - 1
     )
@@ -522,7 +510,6 @@ def project_mask_to_radar(
             geometry=geometry,
             dem=dem,
             target_validity=validity_array,
-            dem_identity=dem,
         )
     cache_file = _cache_path(cache_dir, cache_key)
     full_plane: np.ndarray | None = None

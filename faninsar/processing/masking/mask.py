@@ -3,7 +3,7 @@
 # The masking boundary intentionally performs driver/geometry operations in a
 # compact module.  Keep the repository's stricter migration-only checks out of
 # this implementation while retaining formatting and import checks.
-# ruff: noqa: B905, EM101, EM102, TC003, TRY003, TRY004, TRY400
+# ruff: noqa: B905, EM101, EM102, TRY003, TRY400
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -286,9 +287,41 @@ def _apply_validity(grid: GridSpec, data: np.ndarray) -> np.ndarray:
     return result
 
 
+def _freeze(value: object) -> object:
+    """Return an immutable defensive snapshot of nested metadata."""
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {_freeze(key): _freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze(item) for item in value)
+    return value
+
+
+def _jsonable(value: object) -> object:
+    """Convert frozen metadata to deterministic JSON-compatible values."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _jsonable(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple, frozenset, set)):
+        values = [_jsonable(item) for item in value]
+        return (
+            sorted(values, key=str) if isinstance(value, (frozenset, set)) else values
+        )
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def _digest(value: object) -> str:
     """Return a stable identity digest."""
-    serialized = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+    serialized = json.dumps(
+        _jsonable(value), sort_keys=True, default=str, separators=(",", ":")
+    )
     return hashlib.sha256(serialized.encode()).hexdigest()
 
 
@@ -304,10 +337,11 @@ class Mask(ABC):
         source: object | None = None,
     ) -> RasterMask:
         """Construct a raster mask from bool or uint8 data."""
-        del source
         if not isinstance(grid, GridSpec):
-            raise TypeError("grid must be a GridSpec")
-        return RasterMask(data, grid)
+            message = "grid must be a GridSpec"
+            logger.error(message)
+            raise TypeError(message)
+        return RasterMask(data, grid, source=source)
 
     @classmethod
     def from_vector(
@@ -337,9 +371,9 @@ class Mask(ABC):
             None,
             crs="EPSG:4326",
             _water_recipe={
-                "bounds": bounds,
+                "bounds": _freeze(bounds),
                 "provider": provider,
-                "policy": dict(policy or {}),
+                "policy": _freeze(policy or {}),
             },
         )
 
@@ -442,9 +476,24 @@ class RasterMask(Mask):
 
     def to_vector(self, bounds: object | None = None) -> VectorMask:
         """Convert excluded and invalid cells to explicit role polygons."""
-        del bounds
         from rasterio.features import shapes
-        from shapely.geometry import shape
+        from shapely.geometry import box, shape
+
+        if bounds is not None:
+            if isinstance(bounds, (tuple, list)) and len(bounds) == 4:
+                bounds = box(*bounds)
+            if not hasattr(bounds, "equals"):
+                message = "raster vector conversion bounds must be a geometry"
+                logger.error(message)
+                raise TypeError(message)
+            full_bounds = box(*self.grid.bounds)
+            if not bounds.equals(full_bounds):
+                message = (
+                    "RasterMask.to_vector supports only the exact full grid bounds; "
+                    "partial conversion is not lossless"
+                )
+                logger.error(message)
+                raise ValueError(message)
 
         geometries, roles = [], []
         for value, role in ((1, "excluded"), (255, "invalid")):
@@ -564,8 +613,10 @@ class VectorMask(Mask):
             logger.error(message)
             raise ValueError(message)
         self.categories = self._normalise_field(categories, len(geometries), None)
-        self.provenance = dict(provenance or {})
-        self._water_recipe = dict(_water_recipe) if _water_recipe is not None else None
+        self.provenance = _freeze(provenance or {})
+        self._water_recipe = (
+            _freeze(_water_recipe) if _water_recipe is not None else None
+        )
         self._identity = _digest(
             {
                 "kind": "vector",
@@ -817,7 +868,24 @@ class UnionMask(Mask):
         """Concatenate lossless vector children."""
         vectors = [operand.to_vector(bounds) for operand in self.operands]
         if not vectors:
-            raise ValueError("empty UnionMask has no vector geometry")
+            message = "empty UnionMask has no vector geometry"
+            logger.error(message)
+            raise ValueError(message)
+        for vector in vectors:
+            excluded = [
+                geometry
+                for geometry, role in zip(vector.geometry, vector.roles, strict=True)
+                if role == "excluded"
+            ]
+            invalid = [
+                geometry
+                for geometry, role in zip(vector.geometry, vector.roles, strict=True)
+                if role == "invalid"
+            ]
+            if any(left.intersects(right) for left in excluded for right in invalid):
+                message = "excluded and invalid vector roles overlap"
+                logger.error(message)
+                raise ValueError(message)
         crs = vectors[0].crs
         if any(vector.crs != crs for vector in vectors):
             import pyproj
@@ -844,6 +912,22 @@ class UnionMask(Mask):
                     )
                 )
             vectors = transformed
+        excluded = [
+            geometry
+            for vector in vectors
+            for geometry, role in zip(vector.geometry, vector.roles, strict=True)
+            if role == "excluded"
+        ]
+        invalid = [
+            geometry
+            for vector in vectors
+            for geometry, role in zip(vector.geometry, vector.roles, strict=True)
+            if role == "invalid"
+        ]
+        if any(left.intersects(right) for left in excluded for right in invalid):
+            message = "excluded and invalid vector roles overlap"
+            logger.error(message)
+            raise ValueError(message)
         return VectorMask(
             [geometry for vector in vectors for geometry in vector.geometry],
             crs=crs,

@@ -276,9 +276,7 @@ def _mask_vector_for_roi(plan: MaskPlan, roi: object) -> object | None:
         if definition.kind == "raster":
             # Raster ROI masks require a target grid and therefore cannot be
             # used for geometric subtraction at this seam.
-            raise ValueError(
-                "ROI stage raster masks require an explicit grid"
-            )
+            raise ValueError("ROI stage raster masks require an explicit grid")
         if definition.kind == "vector":
             import geopandas as gpd
             import pyproj
@@ -777,6 +775,9 @@ class Stack(Network):
     _radar_projection_context: dict[str, object] | None = field(
         default=None, repr=False
     )
+    _radar_projected_masks: dict[str, np.ndarray] = field(
+        default_factory=dict, repr=False
+    )
 
     def __post_init__(self) -> None:
         """Initialize the inherited Network analysis surface lazily.
@@ -1102,20 +1103,11 @@ class Stack(Network):
                 )
                 logger.error(message)
                 raise ValueError(message)
-            if not all(
-                hasattr(master, name) for name in ("crs", "transform", "shape")
-            ):
+            if not all(hasattr(master, name) for name in ("crs", "transform", "shape")):
                 message = "radar mask projection master GridSpec is incomplete"
                 logger.error(message)
                 raise ValueError(message)
             target = GridSpec(master.crs, master.transform, shape=master.shape)
-            if target.crs != "EPSG:4326":
-                message = (
-                    "radar mask projection requires a WGS84 geographic master "
-                    f"GridSpec, got {target.crs}"
-                )
-                logger.error(message)
-                raise ValueError(message)
             materialized = self._materialize_stage_mask("interferogram", target)
             if materialized is None:
                 return None
@@ -1140,18 +1132,36 @@ class Stack(Network):
                 )
                 logger.error(message)
                 raise ValueError(message)
-            projected = project_mask_to_radar(
-                materialized,
-                full_radar_shape=tuple(int(value) for value in full_shape),
+            from faninsar.processing.masking.radar_projection import (
+                radar_projection_cache_key,
+            )
+
+            projection_key = radar_projection_cache_key(
+                source_mask_identity=materialized.identity,
+                master_grid=target,
+                target_grid={
+                    "shape": tuple(int(value) for value in full_shape),
+                    "multilook": looks,
+                },
+                reference_scene=context.get("reference_scene", self.reference),
                 lut=lut,
                 geometry=geometry,
-                mask_transform=target.transform,
                 dem=self.config.dem,
-                device=self.config.device,
-                multilook=looks,
-                master_grid=target,
-                reference_scene=context.get("reference_scene", self.reference),
             )
+            if projection_key not in self._radar_projected_masks:
+                self._radar_projected_masks[projection_key] = project_mask_to_radar(
+                    materialized,
+                    full_radar_shape=tuple(int(value) for value in full_shape),
+                    lut=lut,
+                    geometry=geometry,
+                    mask_transform=target.transform,
+                    dem=self.config.dem,
+                    device=self.config.device,
+                    multilook=looks,
+                    master_grid=target,
+                    reference_scene=context.get("reference_scene", self.reference),
+                )
+            projected = self._radar_projected_masks[projection_key]
             if expected_shape is not None and tuple(expected_shape) != projected.shape:
                 message = (
                     f"projected radar mask shape {projected.shape} does not match "
@@ -1166,9 +1176,7 @@ class Stack(Network):
             raise ValueError(message)
         grid = self._ifg_geo_grid(looks)
         if grid is None:
-            raise ValueError(
-                "interferogram masks require an EPSG:4326 geo_grid"
-            )
+            raise ValueError("interferogram masks require an EPSG:4326 geo_grid")
         transform, shape = grid
         if expected_shape is not None and tuple(expected_shape) != shape:
             reject_invalid_state("mask target grid shape does not match IFG shape")
@@ -1231,6 +1239,27 @@ class Stack(Network):
                 masks.append(Mask.from_vector(frame))
             else:
                 bounds = target.bounds
+                if target.crs != "EPSG:4326":
+                    import pyproj
+
+                    transformer = pyproj.Transformer.from_crs(
+                        target.crs, "EPSG:4326", always_xy=True
+                    )
+                    corners = [
+                        transformer.transform(x, y)
+                        for x, y in (
+                            (bounds[0], bounds[1]),
+                            (bounds[0], bounds[3]),
+                            (bounds[2], bounds[1]),
+                            (bounds[2], bounds[3]),
+                        )
+                    ]
+                    bounds = (
+                        min(point[0] for point in corners),
+                        min(point[1] for point in corners),
+                        max(point[0] for point in corners),
+                        max(point[1] for point in corners),
+                    )
                 masks.append(
                     Mask.from_water(
                         bounds=bounds, provider=definition.provider or "auto"
@@ -1252,9 +1281,7 @@ class Stack(Network):
         looks = tuple(int(value) for value in (ion_multilook or self.config.multilook))
         grid = self._ifg_geo_grid(looks)
         if grid is None:
-            raise ValueError(
-                "ionosphere masks require an EPSG:4326 geo_grid"
-            )
+            raise ValueError("ionosphere masks require an EPSG:4326 geo_grid")
         from faninsar.processing.masking.mask import GridSpec
 
         transform, shape = grid
@@ -1268,9 +1295,7 @@ class Stack(Network):
             return None
         grid = self._ifg_geo_grid(self.config.multilook)
         if grid is None:
-            raise ValueError(
-                "unwrap masks require an EPSG:4326 geo_grid"
-            )
+            raise ValueError("unwrap masks require an EPSG:4326 geo_grid")
         from faninsar.processing.masking.mask import GridSpec
 
         transform, target_shape = grid
@@ -2639,7 +2664,7 @@ class Stack(Network):
         mask_removed: Any = None
         if mask_plane is not None:
             mask_removed = torch.as_tensor(
-                np.asarray(mask_plane) == 1,
+                np.asarray(mask_plane) != 0,
                 dtype=torch.bool,
                 device=device,
             )

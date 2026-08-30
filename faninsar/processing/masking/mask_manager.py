@@ -384,6 +384,8 @@ def _load_layer_features(path: Path) -> tuple[list[BaseGeometry], tuple[str, ...
         if geometry.is_empty:
             continue
         properties = feature.get("properties", {})
+        # Keep a neutral label for legacy/manual layers.  The manager decides
+        # whether an unqualified feature is usable under the active policies.
         category = properties.get("category", "water")
         if category not in {"ocean", "inland", "water"}:
             message = f"invalid water layer category {category!r}"
@@ -392,6 +394,23 @@ def _load_layer_features(path: Path) -> tuple[list[BaseGeometry], tuple[str, ...
         geometries.append(geometry)
         categories.append(str(category))
     return geometries, tuple(categories)
+
+
+def _padded_water_bounds(
+    raw: LonLatBounds, manager: MaskManager, tile_size_deg: float
+) -> LonLatBounds:
+    """Return the fetch band padded for every category operation."""
+    buffer_km = max(
+        float(manager.buffer_km),
+        float(manager.ocean_shore_keep_m) / 1000.0,
+        float(manager.inland_water_buffer_m) / 1000.0,
+    )
+    zone_lon = (raw[0] + raw[2]) / 2.0
+    zone_lat = (raw[1] + raw[3]) / 2.0
+    padded = padded_fetch_band(raw, buffer_km, zone_lon=zone_lon, zone_lat=zone_lat)
+    band = snap_band(padded, tile_size_deg)
+    manager._guard_seam(raw, band)
+    return padded
 
 
 def _atomic_write_json(path: Path, payload: object) -> None:
@@ -460,6 +479,7 @@ def _raster_cache_key(
     shape: tuple[int, int],
     crs: CRS | None,
     validity: np.ndarray,
+    roi_bounds: LonLatBounds | None = None,
 ) -> str:
     """Digest the rasterized-mask cache key (vector digest added by caller).
 
@@ -487,6 +507,9 @@ def _raster_cache_key(
         "shape": [int(shape[0]), int(shape[1])],
         "crs": str(crs) if crs is not None else "",
         "validity": validity_digest,
+        "roi_bounds": None
+        if roi_bounds is None
+        else [round(float(value), 9) for value in roi_bounds],
     }
     return _sha256_hex(_canonical_json(payload))
 
@@ -907,8 +930,8 @@ class MaskManager:
         """Classify, repair, operate, and dissolve water polygons.
 
         Source-qualified classes are assigned before any dissolve.  Raster
-        products without an authoritative ocean/inland field are treated as
-        inland; no fetch-edge shoreline inference is performed.  The
+        products without an authoritative ocean/inland field fail closed when
+        category policies differ; no fetch-edge shoreline inference is done. The
         category-specific operation is then applied in one local UTM zone.
         Narrow inland components are retained because geometry aspect and area
         are not a scientific classification rule.
@@ -928,9 +951,9 @@ class MaskManager:
     ) -> tuple[list[BaseGeometry], tuple[str, ...]]:
         """Return operated water polygons and source-qualified categories.
 
-        Raster products do not encode an ocean/inland distinction.  Such
-        polygons are therefore conservatively qualified as ``inland`` rather
-        than inferred from an arbitrary fetch boundary.  A source adapter may
+        Raster products do not encode an ocean/inland distinction.  They fail
+        closed when category policies differ; no fetch-boundary inference or
+        implicit inland classification is performed.  A source adapter may
         return ``(geometry, category)`` records from ``_tile_water_polygons``;
         those categories are validated before any dissolve and remain the
         only basis for category-specific operations.
@@ -941,11 +964,11 @@ class MaskManager:
         records: list[tuple[BaseGeometry, str]] = []
         for path in tiles:
             for item in self._tile_water_polygons(path):
-                category = "inland"
+                category = None
                 geometry = item
                 if isinstance(item, tuple) and len(item) == 2:
                     geometry, category = item
-                if category == "water":
+                if category in {None, "water"}:
                     if float(self.ocean_shore_keep_m) != float(
                         self.inland_water_buffer_m
                     ):
@@ -957,7 +980,9 @@ class MaskManager:
                         raise InvalidProcessingStateError(message)
                     category = "inland"
                 if category not in {"ocean", "inland"}:
-                    message = f"water source returned an unqualified category {category!r}"
+                    message = (
+                        f"water source returned an unqualified category {category!r}"
+                    )
                     logger.error(message)
                     raise InvalidProcessingStateError(message)
                 if not hasattr(geometry, "is_empty"):
@@ -1090,6 +1115,15 @@ class MaskManager:
         layer_path = vector_dir / "layer.geojson"
         if layer_path.is_file():
             _, cached_categories = _load_layer_features(layer_path)
+            if "water" in cached_categories and float(self.ocean_shore_keep_m) != float(
+                self.inland_water_buffer_m
+            ):
+                message = (
+                    "cached water layer lacks authoritative ocean/inland category, "
+                    "but category policies differ"
+                )
+                logger.error(message)
+                raise InvalidProcessingStateError(message)
             return WaterLayer(
                 path=layer_path,
                 identity=identity,
@@ -1180,17 +1214,13 @@ class MaskManager:
         # ``buffer_km`` remains accepted as a compatibility alias for callers
         # that used the P0039 manager, but can never make the context smaller
         # than the pinned ocean shoreline keep distance.
+        raw = _bounds_tuple(roi_bounds)
+        padded = _padded_water_bounds(raw, self, entry.tile_size_deg)
         buffer_km = max(
             float(self.buffer_km),
             float(self.ocean_shore_keep_m) / 1000.0,
             float(self.inland_water_buffer_m) / 1000.0,
         )
-        raw = _bounds_tuple(roi_bounds)
-        zone_lon = (raw[0] + raw[2]) / 2.0
-        zone_lat = (raw[1] + raw[3]) / 2.0
-        padded = padded_fetch_band(raw, buffer_km, zone_lon=zone_lon, zone_lat=zone_lat)
-        band = snap_band(padded, entry.tile_size_deg)
-        self._guard_seam(raw, band)
 
         dem_file = Path(dem_path)
         with rasterio.open(dem_file) as dataset:
@@ -1209,7 +1239,9 @@ class MaskManager:
 
         layer = self.get_water_layer(padded)
 
-        raster_key = _raster_cache_key(buffer_km, transform, grid_shape, crs, validity)
+        raster_key = _raster_cache_key(
+            buffer_km, transform, grid_shape, crs, validity, raw
+        )
         cached = self.partition_dir / "rasters" / layer.identity / f"{raster_key}.tif"
         if cached.is_file():
             with rasterio.open(cached) as src:
@@ -1220,7 +1252,9 @@ class MaskManager:
             import shapely
             from shapely.geometry import Polygon
 
-            operated = shapely.union_all(geometries) if geometries else Polygon()
+            roi_geometry = shapely.box(*raw)
+            clipped = [geometry.intersection(roi_geometry) for geometry in geometries]
+            operated = shapely.union_all(clipped) if clipped else Polygon()
             mask = rasterize_to_grid(
                 [operated], transform, grid_shape, validity=validity
             )
@@ -1412,8 +1446,7 @@ def realize_water(
     unknown = sorted(set(policy) - accepted)
     if unknown:
         message = (
-            "deferred water recipe policy contains unsupported fields: "
-            f"{unknown!r}"
+            f"deferred water recipe policy contains unsupported fields: {unknown!r}"
         )
         logger.error(message)
         raise ValueError(message)
@@ -1429,18 +1462,28 @@ def realize_water(
         source=selection,
         **options,
     )
-    layer = manager.get_water_layer(raw_bounds)
+    padded_bounds = _padded_water_bounds(
+        raw_bounds, manager, manager.source_entry.tile_size_deg
+    )
+    layer = manager.get_water_layer(padded_bounds)
     geometries, categories = _load_layer_features(layer.path)
+    # The padded band is fetch context only.  The deferred recipe's original
+    # ROI is the authoritative output extent and identity input.
+    import shapely
+
+    roi_geometry = shapely.box(*raw_bounds)
+    clipped = [geometry.intersection(roi_geometry) for geometry in geometries]
     from faninsar.processing.masking.mask import Mask
 
     vector = Mask.from_vector(
-        geometries,
+        clipped,
         crs="EPSG:4326",
         categories=categories,
         provenance={
             "mask_identity": layer.identity,
             "source_version": layer.source_version,
             "classification_version": _CLASSIFICATION_VERSION,
+            "roi_bounds": raw_bounds,
         },
     )
     if grid is None:
