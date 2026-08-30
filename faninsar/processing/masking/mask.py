@@ -24,6 +24,7 @@ logger = setup_logger(__name__)
 
 LonLatBounds = tuple[float, float, float, float]
 _SEAM_TOLERANCE_DEG = 1e-9
+_ROLE_OVERLAP_TOLERANCE = 1e-12
 
 
 def _utm_transformers(longitude_deg: float, latitude_deg: float) -> tuple[Any, Any]:
@@ -350,6 +351,40 @@ def _digest(value: object) -> str:
         _jsonable(value), sort_keys=True, default=str, separators=(",", ":")
     )
     return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _has_positive_area_overlap(left: object, right: object) -> bool:
+    """Return whether two geometries overlap over a meaningful area.
+
+    ``intersects`` also reports shared boundaries and point contacts.  Those
+    contacts are expected when a raster is converted to adjacent role
+    polygons, so role validation must inspect the area of the actual
+    intersection.  A scale-relative tolerance avoids treating floating-point
+    overlay slivers as scientific overlap while preserving ordinary positive
+    areas.
+
+    Parameters
+    ----------
+    left, right : shapely geometry
+        Geometries to compare.
+
+    Returns
+    -------
+    bool
+        ``True`` only when the intersection area exceeds the robust tolerance.
+
+    """
+    if not left.intersects(right):  # type: ignore[attr-defined]
+        return False
+    intersection = left.intersection(right)  # type: ignore[attr-defined]
+    if intersection.is_empty:
+        return False
+    bounds = (*left.bounds, *right.bounds)  # type: ignore[attr-defined]
+    extent_x = max(bounds[2] - bounds[0], bounds[6] - bounds[4])
+    extent_y = max(bounds[3] - bounds[1], bounds[7] - bounds[5])
+    scale = max(1.0, abs(extent_x), abs(extent_y))
+    tolerance = _ROLE_OVERLAP_TOLERANCE * scale * scale
+    return float(intersection.area) > tolerance
 
 
 class Mask(ABC):
@@ -735,13 +770,18 @@ class VectorMask(Mask):
             for geometry, role in zip(projected, self.roles)
             if role == "invalid"
         ]
-        if excluded and invalid:
-            from shapely import intersects
-
-            if any(intersects(left, right) for left in excluded for right in invalid):
-                message = "excluded and invalid vector roles overlap"
-                logger.error(message)
-                raise ValueError(message)
+        if (
+            excluded
+            and invalid
+            and any(
+                _has_positive_area_overlap(left, right)
+                for left in excluded
+                for right in invalid
+            )
+        ):
+            message = "excluded and invalid vector roles overlap"
+            logger.error(message)
+            raise ValueError(message)
         result = (
             np.asarray(
                 rasterize(
@@ -914,7 +954,11 @@ class UnionMask(Mask):
                 for geometry, role in zip(vector.geometry, vector.roles, strict=True)
                 if role == "invalid"
             ]
-            if any(left.intersects(right) for left in excluded for right in invalid):
+            if any(
+                _has_positive_area_overlap(left, right)
+                for left in excluded
+                for right in invalid
+            ):
                 message = "excluded and invalid vector roles overlap"
                 logger.error(message)
                 raise ValueError(message)
@@ -956,7 +1000,11 @@ class UnionMask(Mask):
             for geometry, role in zip(vector.geometry, vector.roles, strict=True)
             if role == "invalid"
         ]
-        if any(left.intersects(right) for left in excluded for right in invalid):
+        if any(
+            _has_positive_area_overlap(left, right)
+            for left in excluded
+            for right in invalid
+        ):
             message = "excluded and invalid vector roles overlap"
             logger.error(message)
             raise ValueError(message)

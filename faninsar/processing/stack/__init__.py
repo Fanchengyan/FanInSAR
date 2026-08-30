@@ -21,10 +21,6 @@ from faninsar.processing.stack.ifg_store import (
     InterferogramArtifactStore,
     UnwrappedArtifact,
 )
-from faninsar.processing.stack.ion_store import (
-    IonosphereArtifact,
-    IonosphereArtifactStore,
-)
 from faninsar.processing.stack.mask_plan import (
     MASK_KINDS,
     STAGES,
@@ -60,8 +56,6 @@ __all__ = [
     "GpuMemoryReclaim",
     "InterferogramArtifact",
     "InterferogramArtifactStore",
-    "IonosphereArtifact",
-    "IonosphereArtifactStore",
     "LocalActivationAuthority",
     "MaskDefinition",
     "MaskPlan",

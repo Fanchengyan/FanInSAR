@@ -13,11 +13,14 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, NoReturn, Self
+from typing import TYPE_CHECKING, Literal, NoReturn, Self, TypeAlias
 
 from faninsar.logging import setup_logger
 
 logger = setup_logger(__name__)
+
+if TYPE_CHECKING:
+    from faninsar.processing.masking.mask import Mask
 
 StageName = Literal["roi", "interferogram", "unwrap", "ionosphere"]
 MaskKind = Literal["raster", "vector", "water"]
@@ -158,6 +161,23 @@ class MaskDefinition:
         return payload
 
 
+MaskValue: TypeAlias = "MaskDefinition | Mask | Mapping[str, object]"
+
+
+def _is_mask(value: object) -> bool:
+    """Return whether ``value`` is a concrete masking algebra object."""
+    from faninsar.processing.masking.mask import Mask
+
+    return isinstance(value, Mask)
+
+
+def _identity_payload(value: MaskDefinition | Mask) -> dict[str, str]:
+    """Return a deterministic identity payload for a registry value."""
+    if isinstance(value, MaskDefinition):
+        return value.identity_payload
+    return {"kind": "materialized", "identity": value.identity}
+
+
 def _unique_names(values: Iterable[object], *, stage: str) -> tuple[str, ...]:
     """Validate and canonicalize stage references."""
     if isinstance(values, (str, bytes)):
@@ -182,8 +202,8 @@ class MaskPlan:
     Parameters
     ----------
     masks : mapping, optional
-        Registry values as :class:`MaskDefinition` instances or strict recipe
-        mappings.
+        Registry values as concrete :class:`~faninsar.processing.masking.mask.Mask`
+        instances, :class:`MaskDefinition` instances, or strict recipe mappings.
     stages : mapping, optional
         Explicit references for the four supported stage names.
     base_dir : pathlib.Path, optional
@@ -195,7 +215,7 @@ class MaskPlan:
 
     def __init__(
         self,
-        masks: Mapping[str, MaskDefinition | Mapping[str, object]] | None = None,
+        masks: Mapping[str, MaskValue] | None = None,
         stages: Mapping[str, Sequence[str]] | None = None,
         *,
         base_dir: str | Path | None = None,
@@ -206,7 +226,7 @@ class MaskPlan:
             masks = {}
         if not isinstance(masks, Mapping):
             _fail("mask registry must be a mapping")
-        normalized: dict[str, MaskDefinition] = {}
+        normalized: dict[str, MaskDefinition | Mask] = {}
         for name, value in masks.items():
             if not isinstance(name, str) or not name.strip():
                 _fail("mask registry names must be non-empty strings")
@@ -219,6 +239,11 @@ class MaskPlan:
                         f"mask definition name mismatch: registry key {name!r}, "
                         f"definition name {definition.name!r}"
                     )
+            elif _is_mask(value):
+                # Concrete masks are already normalized, immutable public
+                # values.  Keep the instance so ``for_stage`` returns exactly
+                # the object supplied by Python callers.
+                definition = value
             else:
                 definition = MaskDefinition.from_mapping(name, value, base_dir=base)
             normalized[name] = definition
@@ -338,6 +363,8 @@ class MaskPlan:
             data = yaml.load(stream, Loader=UniqueLoader)
         if not isinstance(data, Mapping):
             _fail("MaskPlan YAML root must be a mapping")
+        if "masks" in data and not isinstance(data["masks"], Mapping):
+            _fail("'masks' in MaskPlan YAML must be a mapping")
         return cls.from_mapping(data, base_dir=config_path.parent)
 
     @classmethod
@@ -359,7 +386,7 @@ class MaskPlan:
         )
 
     @property
-    def masks(self) -> Mapping[str, MaskDefinition]:
+    def masks(self) -> Mapping[str, MaskDefinition | Mask]:
         """Return the immutable mask registry."""
         return self._masks
 
@@ -395,7 +422,7 @@ class MaskPlan:
     def _make_identity(self) -> str:
         used = sorted({ref for refs in self._stages.values() for ref in refs})
         payload = {
-            "masks": {name: self._masks[name].identity_payload for name in used},
+            "masks": {name: _identity_payload(self._masks[name]) for name in used},
             "stages": {stage: list(self._stages[stage]) for stage in STAGES},
         }
         text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -408,8 +435,8 @@ class MaskPlan:
 
     stage_refs = references
 
-    def for_stage(self, stage: StageName) -> tuple[MaskDefinition, ...]:
-        """Return inert definitions referenced by one stage."""
+    def for_stage(self, stage: StageName) -> tuple[MaskDefinition | Mask, ...]:
+        """Return definitions or concrete masks referenced by one stage."""
         return tuple(self._masks[name] for name in self.references(stage))
 
     masks_for = for_stage
@@ -426,15 +453,17 @@ class MaskPlan:
     def with_mask(
         self,
         name: str,
-        definition: MaskDefinition | Mapping[str, object],
+        definition: MaskValue,
         *,
         stages: Sequence[StageName] = (),
     ) -> Self:
         """Return a copy with a registry entry and optional stage refs added."""
         if isinstance(definition, Mapping):
             definition = MaskDefinition.from_mapping(name, definition)
-        if definition.name != name:
+        if isinstance(definition, MaskDefinition) and definition.name != name:
             _fail(f"mask definition name mismatch for {name!r}")
+        if not isinstance(definition, (MaskDefinition,)) and not _is_mask(definition):
+            _fail(f"mask {name!r} must be a MaskDefinition, Mask, or recipe mapping")
         masks = dict(self._masks)
         masks[name] = definition
         stage_map = dict(self._stages)

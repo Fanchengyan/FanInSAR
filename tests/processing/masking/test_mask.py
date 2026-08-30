@@ -84,6 +84,29 @@ def test_vector_roles_and_overlap_contract() -> None:
         overlap.to_raster(_grid())
 
 
+def test_vector_roles_allow_shared_boundary_and_raster_roundtrip() -> None:
+    """Adjacent excluded/invalid cells preserve tri-state labels losslessly."""
+    source = np.array([[1, 255], [0, 1]], dtype=np.uint8)
+    grid = _grid()
+    mask = Mask.from_raster(source, grid=grid)
+
+    vector = mask.to_vector()
+
+    np.testing.assert_array_equal(vector.to_raster(grid).data, source)
+
+
+def test_vector_roles_reject_positive_area_overlap() -> None:
+    """A genuine excluded/invalid area overlap remains invalid."""
+    overlap = Mask.from_vector(
+        [box(0, 0, 1.1, 1.1), box(0.5, 0.5, 1.5, 1.5)],
+        crs="EPSG:4326",
+        roles=["excluded", "invalid"],
+    )
+
+    with pytest.raises(ValueError, match="overlap"):
+        overlap.to_raster(_grid())
+
+
 def test_nested_identity_is_a_snapshot() -> None:
     """Nested recipe metadata is copied before identity hashing."""
     provenance: dict[str, object] = {"nested": {"values": ["a", "b"]}}
