@@ -1,4 +1,4 @@
-"""Stack session configuration (PROPOSAL-0017, PROPOSAL-0039)."""
+"""Stack session configuration (PROPOSAL-0017, PROPOSAL-0040)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from faninsar.logging import setup_logger
-from faninsar.processing.masking.mask import MaskSampler
 from faninsar.processing.resources import ResourceBudget
+from faninsar.processing.stack.mask_plan import MaskPlan
 
 if TYPE_CHECKING:
     from faninsar._core.device import GpuMemoryReclaim
@@ -28,7 +28,7 @@ EsdMethod = Literal["auto", "splitband", "overlap"]
 OnNetworkFailure = Literal["error"]
 FlattenStage = Literal["coregistration", "interferogram"]
 ActivationMode = Literal["reference", "qualified"]
-MaskFailurePolicy = Literal["error", "warning", "skip"]
+MaskFailurePolicy = Literal["error"]
 
 #: Stack default: the automatic water mask resolved through the
 #: :mod:`faninsar.processing.masking` manager (PROPOSAL-0039 G5).
@@ -76,16 +76,9 @@ class StackConfig:
     swaths: tuple[str, ...] = ("IW1",)
     bursts: BurstSelection | None = None
     roi: object | None = None
-    # -- PROPOSAL-0039 mask surface -----------------------------------------
-    # ``mask`` selects the removed region: ``"water"`` (the default) resolves
-    # the automatic water mask through the masking manager, a MaskSampler
-    # instance is a user-supplied mask, and ``None`` (or the ``"none"``
-    # spelling accepted from mapping configs) explicitly disables masking and
-    # restores unmasked processing.
-    mask: str | MaskSampler | None = AUTO_WATER_MASK
-    mask_source: str | None = None
-    mask_on_failure: MaskFailurePolicy = "warning"
-    mask_apply_ionosphere: bool = False
+    # An empty plan is the deliberate default; water is opt-in through
+    # ``MaskPlan.water()`` or an explicit registry definition.
+    mask_plan: MaskPlan = field(default_factory=MaskPlan)
     on_network_failure: OnNetworkFailure = "error"
     activation_binding: StackActivationBinding | None = None
     activation_token: ActivationToken | None = None
@@ -99,7 +92,7 @@ class StackConfig:
     extra: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Normalize path and multilook types, and validate mask fields."""
+        """Normalize path and multilook types, and validate the mask plan."""
         self.work_dir = Path(self.work_dir)
         if self.resource_budget is not None and not isinstance(
             self.resource_budget, ResourceBudget
@@ -167,35 +160,9 @@ class StackConfig:
             raise ValueError(message)
         if self.activation_authority_root is not None:
             self.activation_authority_root = Path(self.activation_authority_root)
-        self._validate_mask_fields()
+        if not isinstance(self.mask_plan, MaskPlan):
+            message = "mask_plan must be a MaskPlan"
+            logger.error(message)
+            raise TypeError(message)
         ml = self.multilook
         self.multilook = (int(ml[0]), int(ml[1]))
-
-    def _validate_mask_fields(self) -> None:
-        """Normalize and validate the PROPOSAL-0039 mask fields (fail closed)."""
-        if isinstance(self.mask, str):
-            selection = self.mask.strip()
-            if selection == MASK_DISABLED:
-                self.mask = None
-            elif selection != AUTO_WATER_MASK:
-                message = (
-                    "mask must be 'water' (automatic water mask), 'none' "
-                    "(explicitly disabled), a MaskSampler instance, or None; "
-                    f"got {self.mask!r}"
-                )
-                logger.error(message)
-                raise ValueError(message)
-        elif self.mask is not None and not isinstance(self.mask, MaskSampler):
-            message = (
-                "mask must be 'water', 'none', a MaskSampler instance, or "
-                f"None; got {type(self.mask).__name__}"
-            )
-            logger.error(message)
-            raise ValueError(message)
-        if self.mask_on_failure not in _MASK_FAILURE_POLICIES:
-            message = (
-                "mask_on_failure must be 'error', 'warning', or 'skip'; "
-                f"got {self.mask_on_failure!r}"
-            )
-            logger.error(message)
-            raise ValueError(message)

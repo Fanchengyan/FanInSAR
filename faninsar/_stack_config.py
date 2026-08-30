@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from faninsar.compute.numpy_backend import NumpyBackend
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_pair_configuration
+from faninsar.processing.stack.mask_plan import MaskPlan
 
 if TYPE_CHECKING:
     from faninsar.ports.compute import ComputeBackend
@@ -59,6 +60,7 @@ def run(
     """
     del client, store, fmt  # reserved for full YAML wiring (Phase 7)
     cfg = _load_config(config)
+    mask_plan = _load_mask_plan(config, cfg)
     paths = cfg.get("paths") or cfg.get("sources")
     output = cfg.get("output") or cfg.get("output_dir")
     _reject_legacy_pair_config(cfg, has_stack_paths=paths is not None)
@@ -121,10 +123,8 @@ def run(
     elif "burst_index" in cfg:
         swath = cfg.get("swath", "IW1")
         kwargs["bursts"] = {swath: [cfg["burst_index"]]}
-    if "mask" in cfg:
-        # ``mask: none`` is the explicit-disable spelling for mapping configs;
-        # ``water`` (or an absent key) keeps the Stack auto-water default.
-        kwargs["mask"] = None if cfg["mask"] == "none" else cfg["mask"]
+    if "mask_plan" in cfg:
+        kwargs["mask_plan"] = mask_plan
     for key in (
         "roi",
         "dem",
@@ -144,9 +144,6 @@ def run(
         "activation_authority_root",
         "retain_pair_states",
         "record_scientific_lineage",
-        "mask_source",
-        "mask_on_failure",
-        "mask_apply_ionosphere",
     ):
         if key in cfg:
             kwargs[key] = cfg[key]
@@ -209,7 +206,9 @@ def _reject_legacy_pair_config(
 
 def _load_config(config: str | Path | dict[str, Any]) -> dict[str, Any]:
     if isinstance(config, dict):
-        return dict(config)
+        data = dict(config)
+        _reject_legacy_mask_config(data)
+        return data
     path = Path(config)
     text = path.read_text(encoding="utf-8")
     if path.suffix in {".yaml", ".yml"}:
@@ -222,6 +221,7 @@ def _load_config(config: str | Path | dict[str, Any]) -> dict[str, Any]:
         if not isinstance(data, dict):
             message = "YAML config must be a mapping"
             raise ValueError(message)
+        _reject_legacy_mask_config(data)
         return data
     # JSON
     import json
@@ -230,7 +230,42 @@ def _load_config(config: str | Path | dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict):
         message = "JSON config must be a mapping"
         raise TypeError(message)
+    _reject_legacy_mask_config(data)
     return data
+
+
+def _load_mask_plan(
+    config: str | Path | dict[str, Any], cfg: dict[str, Any]
+) -> MaskPlan:
+    """Normalize the explicit ``mask_plan`` section of a Stack config."""
+    if "mask_plan" not in cfg:
+        return MaskPlan()
+    value = cfg["mask_plan"]
+    if not isinstance(value, dict):
+        message = "'mask_plan' must be a mapping"
+        logger.error(message)
+        raise TypeError(message)
+    base_dir = Path(config).resolve().parent if not isinstance(config, dict) else None
+    return MaskPlan.from_mapping(value, base_dir=base_dir)
+
+
+def _reject_legacy_mask_config(cfg: dict[str, Any]) -> None:
+    """Reject removed mask spellings at the public Stack config boundary."""
+    legacy = {
+        "mask",
+        "mask_source",
+        "mask_on_failure",
+        "mask_apply_ionosphere",
+        "water_mask",
+        "auto_water_mask",
+    } & cfg.keys()
+    if legacy:
+        message = (
+            "legacy mask configuration is not supported; use explicit "
+            "'mask_plan' definitions and stage references: " + ", ".join(sorted(legacy))
+        )
+        logger.error(message)
+        raise ValueError(message)
 
 
 def _resolve_backend(backend: str | ComputeBackend) -> ComputeBackend:
