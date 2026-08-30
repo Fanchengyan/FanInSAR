@@ -1,6 +1,6 @@
-"""Nearest-neighbour projection of a geo mask onto the radar grid (D2).
+"""Nearest-neighbour projection of a canonical mask onto the radar grid.
 
-PROPOSAL-0039 "Radar projection": a boolean water/removed mask lives on a
+PROPOSAL-0040: a canonical tri-state mask lives on a
 geographic grid while interferogram support masks live on the radar
 ``(azimuth, range)`` grid.  This module projects the mask into radar
 coordinates with **nearest-neighbour only** semantics:
@@ -8,15 +8,14 @@ coordinates with **nearest-neighbour only** semantics:
 - **geo mode** — a dense :class:`~faninsar.processing.pipeline.geo_lut.\
 Geo2RdrLUT` is available (geo-coregistered runs).  Mask values are scattered
 at the LUT's ``az_full``/``rg_full`` radar indices (``rint`` nearest) and
-radar pixels not covered by any LUT cell are filled with the value of the
-nearest covered pixel.
+radar pixels not covered by any LUT cell remain invalid (``255``).
 - **radar mode** — no dense LUT is available.  ``run_geo2rdr`` runs chunked
   over the mask grid rows (the
   :func:`faninsar.processing.pipeline.production.\
 _apply_geo_topographic_phase_chunked` memmap + watchdog pattern), scattering
   converged in-bounds radar indices into the radar plane.
 
-The full-resolution boolean plane caches under ``<cache_dir>/<cache_key>.npy``
+The full-resolution uint8 plane caches under ``<cache_dir>/<cache_key>.npy``
 (one file per ``(vector-layer digest, buffer, resolution, DEM identity)``
 identity, digested by the caller through
 :func:`radar_projection_cache_key`), so an unchanged configuration never
@@ -24,22 +23,18 @@ re-projects.  A ``multilook`` window reduces the cached full-resolution plane
 with ``any()``: a look is water/removed when **any** contributing
 full-resolution pixel is water.
 
-Array conventions follow :mod:`faninsar.processing.masking.mask`: the input
-mask product is uint8 with ``1`` = removed (water) and ``255`` = invalid where
-no data exists; invalid cells never remove data.  The returned plane is
-boolean with ``True`` = removed.
+Array conventions follow :mod:`faninsar.processing.masking.mask`: ``0`` = keep,
+``1`` = removed (water), and ``255`` = invalid.  The returned plane is always
+canonical contiguous uint8.
 
-Governing proposal: PROPOSAL-0039 (radar projection, cache identity,
-multilook ``any()`` reduction); PROPOSAL-0038 consumes the projected plane as
-a support input at the IFG/unwrap seams.
+Governing proposal: PROPOSAL-0040; PROPOSAL-0038 consumes the projected plane
+as a support input at the IFG/unwrap seams.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
-import secrets
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -61,25 +56,35 @@ __all__ = [
 
 #: Default geo2rdr chunk height (mask grid rows per tile) in radar mode.
 DEFAULT_CHUNK_SIZE = 256
+KEEP = np.uint8(0)
+EXCLUDED = np.uint8(1)
+INVALID = np.uint8(255)
 
 
 def radar_projection_cache_key(
     *,
-    vector_digest: str,
-    buffer_km: float,
-    resolution_m: float | None,
-    dem_identity: str,
+    vector_digest: str | None = None,
+    buffer_km: float | None = None,
+    resolution_m: float | None = None,
+    dem_identity: object | None = None,
+    source_mask_identity: object | None = None,
+    master_grid: object | None = None,
+    target_grid: object | None = None,
+    reference_scene: object | None = None,
+    lut: object | None = None,
+    geometry: object | None = None,
+    dem: object | None = None,
+    target_validity: object | None = None,
 ) -> str:
-    """Digest the radar-projection cache identity (PROPOSAL-0039).
+    """Digest every projection identity observable at this seam.
 
-    The key folds exactly the four identity components pinned by the
-    proposal — vector-layer digest, land buffer, mask grid resolution, and
-    DEM identity — so any configuration change projects a fresh plane while
-    an unchanged configuration reuses the cached one.
+    Legacy vector/buffer/resolution/DEM fields remain accepted.  The
+    PROPOSAL-0040 fields bind the materialized source mask, master and target
+    grids, reference scene, geometry/LUT, DEM, and final target validity.
 
     Parameters
     ----------
-    vector_digest : str
+    vector_digest : str, optional
         Digest of the vector mask layer (e.g. the ``WaterLayer.identity`` of
         the masking manager or any caller-defined layer digest).
     buffer_km : float
@@ -87,8 +92,12 @@ def radar_projection_cache_key(
     resolution_m : float or None
         Mask grid resolution override in metres (``None`` records the DEM /
         native grid resolution).
-    dem_identity : str
+    dem_identity : object, optional
         Stable DEM identity string (path, height, or sampler name).
+    source_mask_identity, master_grid, target_grid, reference_scene : object, optional
+        Materialized source, source/target grids, and reference-scene inputs.
+    lut, geometry, dem, target_validity : object, optional
+        Projection model inputs and explicit target validity plane.
 
     Returns
     -------
@@ -97,44 +106,120 @@ def radar_projection_cache_key(
 
     """
     payload = {
-        "vector_digest": str(vector_digest),
-        "buffer_km": float(buffer_km),
+        "proposal": "PROPOSAL-0040",
+        "vector_digest": None if vector_digest is None else str(vector_digest),
+        "buffer_km": None if buffer_km is None else float(buffer_km),
         "resolution_m": None if resolution_m is None else float(resolution_m),
-        "dem_identity": str(dem_identity),
+        "dem_identity": _identity(dem_identity),
+        "source_mask_identity": _identity(source_mask_identity),
+        "master_grid": _identity(master_grid),
+        "target_grid": _identity(target_grid),
+        "reference_scene": _identity(reference_scene),
+        "lut": _identity(lut),
+        "geometry": _identity(geometry),
+        "dem": _identity(dem),
+        "target_validity": _identity(target_validity),
     }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _load_mask_plane(mask: np.ndarray | str | Path) -> np.ndarray:
-    """Read the mask product into a uint8 plane (1 = removed, 255 = invalid)."""
-    if isinstance(mask, (str, Path)):
+def _identity(value: object) -> object:  # noqa: PLR0911
+    """Return a stable representation for materialization identity inputs."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        path = value.expanduser().resolve()
+        try:
+            stat = path.stat()
+            return {
+                "path": str(path),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        except OSError:
+            return {"path": str(path)}
+    if isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        return {
+            "dtype": str(array.dtype),
+            "shape": array.shape,
+            "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+        }
+    identity = getattr(value, "identity", None)
+    if identity is not None and not callable(identity):
+        return {"type": type(value).__qualname__, "identity": _identity(identity)}
+    if (
+        hasattr(value, "crs")
+        and hasattr(value, "transform")
+        and hasattr(value, "shape")
+    ):
+        result: dict[str, object] = {
+            "type": type(value).__qualname__,
+            "crs": str(value.crs),
+            "transform": tuple(value.transform),
+            "shape": tuple(value.shape),
+        }
+        for attribute in ("bounds", "validity"):
+            if hasattr(value, attribute):
+                result[attribute] = _identity(getattr(value, attribute))
+        return result
+    if hasattr(value, "__dict__"):
+        return {
+            "type": type(value).__qualname__,
+            "attributes": {
+                key: _identity(item)
+                for key, item in sorted(vars(value).items())
+                if not key.startswith("_")
+            },
+        }
+    return {"type": f"{type(value).__module__}.{type(value).__qualname__}"}
+
+
+def _load_mask_plane(mask: object) -> tuple[np.ndarray, object | None, object | None]:
+    """Read and validate a canonical plane, grid, and source identity."""
+    source_grid = getattr(mask, "grid", None)
+    source_identity = getattr(mask, "identity", None)
+    if hasattr(mask, "data") and source_identity is not None:
+        plane = np.asarray(mask.data)
+    elif isinstance(mask, (str, Path)):
+        path = Path(mask)
         import rasterio
 
-        with rasterio.open(Path(mask)) as dataset:
+        with rasterio.open(path) as dataset:
             plane = np.asarray(dataset.read(1))
+            source_grid = {
+                "crs": str(dataset.crs),
+                "transform": dataset.transform,
+                "shape": (dataset.height, dataset.width),
+            }
+        source_identity = _identity(path)
     else:
         plane = np.asarray(mask)
+        source_identity = _identity(plane)
     if plane.ndim != 2:
         message = "mask plane must be two-dimensional"
         logger.error(message)
         raise ValueError(message)
     if plane.dtype == np.bool_:
-        return plane.astype(np.uint8)
-    if plane.dtype.kind not in "ui":
-        message = f"mask plane must be an integer or boolean raster, got {plane.dtype}"
+        result = plane.astype(np.uint8)
+    elif plane.dtype != np.uint8:
+        message = f"mask plane must be bool or uint8, got {plane.dtype}"
+        logger.error(message)
+        raise TypeError(message)
+    else:
+        result = np.ascontiguousarray(plane)
+    if np.any(~np.isin(result, np.array([0, 1, 255], dtype=np.uint8))):
+        message = "mask plane may contain only canonical labels 0, 1, and 255"
         logger.error(message)
         raise ValueError(message)
-    return plane.astype(np.uint8, copy=False)
+    return result, source_grid, source_identity
 
 
-def _multilook_any(plane: np.ndarray, multilook: tuple[int, int]) -> np.ndarray:
-    """Reduce a boolean plane per look window with ``any()`` (tails kept).
+def _multilook_labels(plane: np.ndarray, multilook: tuple[int, int]) -> np.ndarray:
+    """Reduce hard labels without inventing a class.
 
-    A look is removed when any contributing full-resolution pixel is removed;
-    edge windows keep their partial support (the
-    :func:`faninsar.processing.interferometry.pair.form_interferogram` ceil
-    convention).
+    Mixed keep/excluded windows and windows without valid labels are invalid.
     """
     az_looks, rg_looks = (int(multilook[0]), int(multilook[1]))
     if az_looks < 1 or rg_looks < 1:
@@ -142,81 +227,88 @@ def _multilook_any(plane: np.ndarray, multilook: tuple[int, int]) -> np.ndarray:
         logger.error(message)
         raise ValueError(message)
     if az_looks == 1 and rg_looks == 1:
-        return np.ascontiguousarray(plane, dtype=bool)
+        return np.ascontiguousarray(plane, dtype=np.uint8)
     height, width = plane.shape
     out_h = (height + az_looks - 1) // az_looks
     out_w = (width + rg_looks - 1) // rg_looks
-    padded = np.zeros((out_h * az_looks, out_w * rg_looks), dtype=bool)
+    padded = np.full((out_h * az_looks, out_w * rg_looks), INVALID, dtype=np.uint8)
     padded[:height, :width] = plane
     blocks = padded.reshape(out_h, az_looks, out_w, rg_looks)
-    return np.any(blocks, axis=(1, 3))
+    has_keep = np.any(blocks == KEEP, axis=(1, 3))
+    has_excluded = np.any(blocks == EXCLUDED, axis=(1, 3))
+    result = np.full((out_h, out_w), INVALID, dtype=np.uint8)
+    result[has_keep & ~has_excluded] = KEEP
+    result[has_excluded & ~has_keep] = EXCLUDED
+    return result
+
+
+def _scatter_candidates(
+    output: np.ndarray,
+    best_distance: np.ndarray,
+    labels: np.ndarray,
+    azimuth: np.ndarray,
+    range_index: np.ndarray,
+    valid: np.ndarray,
+) -> None:
+    """Assign nearest hard-label candidates into an output plane."""
+    finite = (
+        np.asarray(valid, dtype=bool) & np.isfinite(azimuth) & np.isfinite(range_index)
+    )
+    height, width = output.shape
+    azimuth_int = np.rint(np.where(finite, azimuth, 0.0)).astype(np.int64)
+    range_int = np.rint(np.where(finite, range_index, 0.0)).astype(np.int64)
+    in_bounds = (
+        finite
+        & (azimuth_int >= 0)
+        & (azimuth_int < height)
+        & (range_int >= 0)
+        & (range_int < width)
+    )
+    if not np.any(in_bounds):
+        return
+    rows = azimuth_int[in_bounds]
+    cols = range_int[in_bounds]
+    candidate_distance = (azimuth[in_bounds] - rows) ** 2 + (
+        range_index[in_bounds] - cols
+    ) ** 2
+    take = candidate_distance < best_distance[rows, cols]
+    if np.any(take):
+        selected_labels = np.asarray(labels)[in_bounds]
+        output[rows[take], cols[take]] = selected_labels[take]
+        best_distance[rows[take], cols[take]] = candidate_distance[take]
 
 
 def _scatter_lut_mask(
-    water_geo: np.ndarray,
+    labels_geo: np.ndarray,
     lut: Geo2RdrLUT,
     full_radar_shape: tuple[int, int],
 ) -> np.ndarray:
-    """Scatter the geo mask at the dense LUT indices and nearest-fill holes.
-
-    The mask plane must share the LUT's geographic grid exactly (its
-    ``shape``).  Valid LUT cells land on radar pixel
-    ``(rint(az_full), rint(rg_full))``; a radar pixel is water when **any**
-    contributing geo cell is water.  Radar pixels covered by no LUT cell are
-    filled with the value of the nearest covered pixel (nearest fill; an
-    entirely uncovered radar frame projects to all-False — no mask
-    information, nothing removed).
-    """
-    from scipy.ndimage import distance_transform_edt
-
-    height, width = (int(full_radar_shape[0]), int(full_radar_shape[1]))
-    if water_geo.shape != lut.valid.shape:
+    """Scatter canonical labels through a dense LUT; holes remain invalid."""
+    if labels_geo.shape != lut.valid.shape:
         message = (
-            f"mask plane shape {water_geo.shape} does not match the LUT "
+            f"mask plane shape {labels_geo.shape} does not match the LUT "
             f"geographic grid {lut.valid.shape}"
         )
         logger.error(message)
         raise ValueError(message)
-    water = np.asarray(water_geo) == 1
+    height, width = (int(full_radar_shape[0]), int(full_radar_shape[1]))
+    output = np.full((height, width), INVALID, dtype=np.uint8)
+    best_distance = np.full((height, width), np.inf, dtype=np.float64)
     az_values = np.asarray(lut.az_full, dtype=np.float64)
     rg_values = np.asarray(lut.rg_full, dtype=np.float64)
-    finite = (
-        np.isfinite(az_values)
-        & np.isfinite(rg_values)
-        & np.asarray(lut.valid, dtype=bool)
+    _scatter_candidates(
+        output,
+        best_distance,
+        labels_geo.ravel(),
+        az_values.ravel(),
+        rg_values.ravel(),
+        np.asarray(lut.valid, dtype=bool).ravel(),
     )
-    # Replace non-finite entries before the integer cast (they are excluded
-    # by ``finite`` anyway) so the cast never warns on NaN.
-    az_index = np.rint(np.where(finite, az_values, 0.0)).astype(np.int64)
-    rg_index = np.rint(np.where(finite, rg_values, 0.0)).astype(np.int64)
-    in_bounds = (
-        finite
-        & (az_index >= 0)
-        & (az_index < height)
-        & (rg_index >= 0)
-        & (rg_index < width)
-    )
-    out = np.zeros((height, width), dtype=bool)
-    covered = np.zeros((height, width), dtype=bool)
-    if np.any(in_bounds):
-        rows = az_index[in_bounds]
-        cols = rg_index[in_bounds]
-        np.logical_or.at(out, (rows, cols), water[in_bounds])
-        covered[rows, cols] = True
-    if bool(covered.all()):
-        return out
-    if not bool(covered.any()):
-        logger.debug(
-            "radar mask projection: no LUT cell covered the radar frame; "
-            "the projected mask is empty (nothing removed)"
-        )
-        return out
-    _, nearest = distance_transform_edt(~covered, return_indices=True)
-    return out[nearest[0], nearest[1]]
+    return output
 
 
 def _project_radar_mode(
-    water_geo: np.ndarray,
+    labels_geo: np.ndarray,
     *,
     geometry: Any,
     mask_transform: Affine,
@@ -239,12 +331,11 @@ def _project_radar_mode(
     DEM-exact path.
     """
     from faninsar.processing.geometry.prepare_production import run_geo2rdr
-    from faninsar.processing.memory import release_memmap_pages
 
-    grid_height, grid_width = water_geo.shape
-    water = np.asarray(water_geo) == 1
+    grid_height, grid_width = labels_geo.shape
     rows_index, cols_index = np.indices((grid_height, grid_width), dtype=np.float64)
     longitudes, latitudes = mask_transform * (cols_index + 0.5, rows_index + 0.5)
+    best_distance = np.full(output_plane.shape, np.inf, dtype=np.float64)
     for row_start in range(0, grid_height, chunk_size):
         row_stop = min(row_start + chunk_size, grid_height)
         rows = slice(row_start, row_stop)
@@ -260,32 +351,14 @@ def _project_radar_mode(
             height_chunk,
             device=device,
         )
-        azimuth = np.asarray(result.azimuth_index, dtype=np.float64)
-        range_index = np.asarray(result.range_index, dtype=np.float64)
-        converged = (
-            np.asarray(result.converged, dtype=bool)
-            & np.isfinite(azimuth)
-            & np.isfinite(range_index)
+        _scatter_candidates(
+            output_plane,
+            best_distance,
+            labels_geo[rows].ravel(),
+            np.asarray(result.azimuth_index, dtype=np.float64).ravel(),
+            np.asarray(result.range_index, dtype=np.float64).ravel(),
+            np.asarray(result.converged, dtype=bool).ravel(),
         )
-        azimuth_int = np.rint(np.where(converged, azimuth, 0.0)).astype(np.int64)
-        range_int = np.rint(np.where(converged, range_index, 0.0)).astype(np.int64)
-        height_img, width_img = output_plane.shape
-        in_bounds = (
-            converged
-            & (azimuth_int >= 0)
-            & (azimuth_int < height_img)
-            & (range_int >= 0)
-            & (range_int < width_img)
-        )
-        if np.any(in_bounds):
-            np.logical_or.at(
-                output_plane,
-                (azimuth_int[in_bounds], range_int[in_bounds]),
-                water[rows][in_bounds],
-            )
-        if isinstance(output_plane, np.memmap):
-            output_plane.flush()
-            release_memmap_pages(output_plane)
         if watchdog is not None:
             watchdog.sample(f"mask_radar_projection:{row_start}:{row_stop}")
 
@@ -310,9 +383,9 @@ def _cache_path(cache_dir: str | Path | None, cache_key: str | None) -> Path | N
 
 
 def project_mask_to_radar(
-    mask: np.ndarray | str | Path,
+    mask: object,
     *,
-    full_radar_shape: tuple[int, int],
+    full_radar_shape: tuple[int, int] | None = None,
     lut: Geo2RdrLUT | None = None,
     geometry: Any | None = None,
     mask_transform: Affine | None = None,
@@ -323,6 +396,10 @@ def project_mask_to_radar(
     cache_key: str | None = None,
     cache_dir: str | Path | None = None,
     watchdog: Any | None = None,
+    master_grid: object | None = None,
+    target_grid: object | None = None,
+    reference_scene: object | None = None,
+    target_validity: object | None = None,
 ) -> np.ndarray:
     """Project a geographic mask onto the full-resolution radar grid.
 
@@ -363,6 +440,10 @@ def project_mask_to_radar(
     watchdog : object, optional
         Memory guard with ``sample(label)`` invoked after every radar-mode
         tile (the production chunked-stage pattern).
+    master_grid, target_grid, reference_scene : object, optional
+        Source/target grid and reference-scene identity inputs.
+    target_validity : array-like, optional
+        Final target validity plane; false cells are always ``255``.
 
     Returns
     -------
@@ -379,13 +460,21 @@ def project_mask_to_radar(
 
     """
     if (lut is None) == (geometry is None):
-        message = (
-            "project_mask_to_radar requires exactly one projection source: "
-            "a dense Geo2RdrLUT (geo mode) or a radar geometry model "
-            "(radar mode)"
-        )
+        message = "project_mask_to_radar requires exactly one projection source"
         logger.error(message)
         raise ValueError(message)
+    labels, source_grid, source_identity = _load_mask_plane(mask)
+    if (
+        master_grid is not None
+        and tuple(getattr(master_grid, "shape", labels.shape)) != labels.shape
+    ):
+        message = f"mask plane shape {labels.shape} does not match master grid"
+        logger.error(message)
+        raise ValueError(message)
+    if mask_transform is None and source_grid is not None:
+        mask_transform = getattr(source_grid, "transform", None)
+        if mask_transform is None and isinstance(source_grid, dict):
+            mask_transform = source_grid.get("transform")
     if lut is not None and lut.valid.shape != tuple(
         int(size) for size in lut.az_full.shape
     ):
@@ -394,40 +483,21 @@ def project_mask_to_radar(
         logger.error(message)
         raise ValueError(message)
 
+    if full_radar_shape is None:
+        if target_grid is not None and hasattr(target_grid, "shape"):
+            full_radar_shape = tuple(int(size) for size in target_grid.shape)
+        elif lut is not None:
+            full_radar_shape = tuple(int(size) for size in lut.full_radar_shape)
+        else:
+            message = "full_radar_shape or target_grid is required"
+            logger.error(message)
+            raise ValueError(message)
     height, width = (int(full_radar_shape[0]), int(full_radar_shape[1]))
     if height < 1 or width < 1:
         message = f"full_radar_shape must be positive, got {full_radar_shape!r}"
         logger.error(message)
         raise ValueError(message)
-
-    cache_file = _cache_path(cache_dir, cache_key)
-    full_plane: np.ndarray | None = None
-    if cache_file is not None and cache_file.is_file():
-        full_plane = np.load(cache_file, mmap_mode="r")
-        if full_plane.shape != (height, width) or full_plane.dtype != np.bool_:
-            message = (
-                f"radar-projection cache {cache_file} holds "
-                f"{full_plane.shape}/{full_plane.dtype}; expected "
-                f"{(height, width)}/bool — the cache identity is stale"
-            )
-            logger.error(message)
-            raise ValueError(message)
-        logger.info("radar-projection cache hit: %s", cache_file)
-        return _multilook_any(np.asarray(full_plane), multilook)
-
-    water_geo = (_load_mask_plane(mask) == 1).astype(bool)
-    if lut is not None:
-        full_plane = _scatter_lut_mask(water_geo, lut, (height, width))
-        if cache_file is not None:
-            _atomic_cache_save(cache_file, full_plane)
-        logger.info(
-            "Projected mask to radar (geo mode): %d/%d pixels removed",
-            int(np.count_nonzero(full_plane)),
-            full_plane.size,
-        )
-        return _multilook_any(full_plane, multilook)
-
-    if mask_transform is None:
+    if geometry is not None and mask_transform is None:
         message = "radar mode requires the mask grid transform"
         logger.error(message)
         raise ValueError(message)
@@ -435,17 +505,54 @@ def project_mask_to_radar(
         message = f"chunk_size must be >= 1, got {chunk_size}"
         logger.error(message)
         raise ValueError(message)
-    staged: np.memmap | None = None
-    staging_path: Path | None = None
-    try:
-        if cache_file is not None:
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            staged, staging_path = _staging_memmap(cache_file, (height, width))
-            full_plane = staged
-        else:
-            full_plane = np.zeros((height, width), dtype=bool)
+
+    validity = target_validity
+    if validity is None and target_grid is not None:
+        validity = getattr(target_grid, "validity", None)
+    validity_array = (
+        np.ones((height, width), dtype=bool)
+        if validity is None
+        else np.asarray(validity, dtype=bool)
+    )
+    if validity_array.shape != (height, width):
+        message = (
+            f"target validity shape {validity_array.shape} does not match "
+            f"{(height, width)}"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    if cache_key is None and cache_dir is not None:
+        cache_key = radar_projection_cache_key(
+            source_mask_identity=source_identity,
+            master_grid=master_grid if master_grid is not None else source_grid,
+            target_grid=target_grid,
+            reference_scene=reference_scene,
+            lut=lut,
+            geometry=geometry,
+            dem=dem,
+            target_validity=validity_array,
+            dem_identity=dem,
+        )
+    cache_file = _cache_path(cache_dir, cache_key)
+    full_plane: np.ndarray | None = None
+    if cache_file is not None and cache_file.is_file():
+        full_plane = np.asarray(np.load(cache_file))
+        if full_plane.shape != (height, width) or full_plane.dtype != np.uint8:
+            message = f"radar-projection cache {cache_file} is not canonical uint8"
+            logger.error(message)
+            raise ValueError(message)
+        if np.any(~np.isin(full_plane, np.array([0, 1, 255], dtype=np.uint8))):
+            message = (
+                f"radar-projection cache {cache_file} contains non-canonical labels"
+            )
+            logger.error(message)
+            raise ValueError(message)
+    elif lut is not None:
+        full_plane = _scatter_lut_mask(labels, lut, (height, width))
+    else:
+        full_plane = np.full((height, width), INVALID, dtype=np.uint8)
         _project_radar_mode(
-            water_geo,
+            labels,
             geometry=geometry,
             mask_transform=mask_transform,
             dem=dem,
@@ -454,48 +561,8 @@ def project_mask_to_radar(
             watchdog=watchdog,
             output_plane=full_plane,
         )
-    except BaseException:
-        # Never publish a partially projected plane under the cache identity.
-        if staged is not None:
-            del staged
-        if staging_path is not None:
-            staging_path.unlink(missing_ok=True)
-        raise
-    if staging_path is not None:
-        # The staging plane is a raw boolean dump; publish it under the
-        # cache identity as a proper .npy (header-carrying, memmap-loadable).
-        staged.flush()
-        del staged
-        raw = np.memmap(staging_path, mode="r", dtype=bool, shape=(height, width))
-        _atomic_cache_save(cache_file, raw)
-        del raw
-        staging_path.unlink(missing_ok=True)
-        full_plane = np.ascontiguousarray(np.load(cache_file, mmap_mode="r"))
-    logger.info(
-        "Projected mask to radar (radar mode): %d/%d pixels removed",
-        int(np.count_nonzero(full_plane)),
-        full_plane.size,
-    )
-    return _multilook_any(np.asarray(full_plane), multilook)
-
-
-def _staging_memmap(cache_file: Path, shape: tuple[int, int]) -> tuple[np.memmap, Path]:
-    """Create a disk-backed staging plane beside the final cache file."""
-    staging_path = cache_file.with_name(
-        f".{cache_file.name}.{os.getpid()}-{secrets.token_hex(8)}.tmp"
-    )
-    return np.memmap(staging_path, mode="w+", dtype=bool, shape=shape), staging_path
-
-
-def _atomic_cache_save(cache_file: Path, plane: np.ndarray) -> None:
-    """Publish one full-resolution cache plane (temp file + rename)."""
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-    temporary = cache_file.with_name(
-        f".{cache_file.name}.{os.getpid()}-{secrets.token_hex(8)}.tmp"
-    )
-    try:
-        with temporary.open("wb") as stream:
-            np.save(stream, np.ascontiguousarray(plane, dtype=bool))
-        temporary.replace(cache_file)
-    finally:
-        temporary.unlink(missing_ok=True)
+    full_plane[~validity_array] = INVALID
+    if cache_file is not None and not cache_file.is_file():
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache_file, np.ascontiguousarray(full_plane, dtype=np.uint8))
+    return _multilook_labels(full_plane, multilook)
