@@ -18,6 +18,12 @@ Covers TDD-plan items 1-8 against ``faninsar/processing/masking/mask.py``:
    ``round5_seam_guard.py`` re-expressed on the padded band.
 8. ``boundary is None`` guard (shapely 2.x GeometryCollection).
 
+Plus the grid-first consumption seam: ``RasterMask.to_grid`` /
+``VectorMask.to_grid`` / ``MaskOperator.to_grid`` on duck-typed grids
+(GeoGridSpec objects and ``(transform, shape, crs)`` tuples), including
+projected-CRS (UTM) target grids, with ``sample`` as the secondary WGS84
+point query.
+
 All tests are offline: no network access, fixtures are written locally.
 """
 
@@ -48,6 +54,7 @@ from faninsar.processing.masking.mask import (
     resample_mask_to_grid,
     snap_band,
 )
+from faninsar.processing.merge.grid import GeoGridSpec
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -315,6 +322,251 @@ def test_rasterize_to_grid_nodata_plane() -> None:
     plain = rasterize_to_grid(box(0.5, 0.5, 1.5, 1.5), transform, (20, 20))
     assert int(plain.sum()) == 100
     assert not np.any(plain == 255)
+
+
+# ---------------------------------------------------------------------------
+# 3b. Grid-first consumption seam: to_grid on duck-typed grids
+# ---------------------------------------------------------------------------
+
+
+def _lonlat_grid(width: int, height: int) -> GeoGridSpec:
+    """GeoGridSpec over the ``_class_raster`` extent (lon 10-11, lat 1-2)."""
+    return GeoGridSpec(
+        crs="EPSG:4326",
+        transform=(10.0, 0.1, 0.0, 2.0, 0.0, -0.1),
+        width=width,
+        height=height,
+        resolution_m=(11132.0, 11057.0),
+    )
+
+
+def _utm_grid(
+    *,
+    width: int = 12,
+    height: int = 12,
+    resolution_m: float = 10_000.0,
+) -> GeoGridSpec:
+    """Small projected (UTM zone 32N) GeoGridSpec around the class raster."""
+    transformer = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:32632", always_xy=True)
+    x_center, y_center = transformer.transform(10.5, 1.5)
+    west = x_center - width * resolution_m / 2.0
+    north = y_center + height * resolution_m / 2.0
+    return GeoGridSpec(
+        crs="EPSG:32632",
+        transform=(west, resolution_m, 0.0, north, 0.0, -resolution_m),
+        width=width,
+        height=height,
+        resolution_m=(resolution_m, resolution_m),
+    )
+
+
+def _grid_centers_lonlat(grid: GeoGridSpec) -> tuple[np.ndarray, np.ndarray]:
+    """Test-side oracle: cell centers transformed to EPSG:4326 degrees."""
+    from affine import Affine
+
+    gdal_x0, gdal_dx, gdal_rx, gdal_y0, gdal_ry, gdal_dy = grid.transform
+    affine = Affine(gdal_dx, gdal_rx, gdal_x0, gdal_ry, gdal_dy, gdal_y0)
+    transformer = pyproj.Transformer.from_crs(grid.crs, "EPSG:4326", always_xy=True)
+    rows, cols = np.indices(grid.shape, dtype=np.float64)
+    xs, ys = affine * (cols + 0.5, rows + 0.5)
+    lons, lats = transformer.transform(xs, ys)
+    return np.asarray(lats), np.asarray(lons)
+
+
+def _class_raster_expectation(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Independent uint8 oracle for the ``_class_raster`` pattern.
+
+    West half (lon < 10.5) carries class 80 -> removed; the (0, 0) cell is
+    NoData -> invalid; everything outside the raster extent resolves to
+    valid keep (0).
+    """
+    cols_f = (lons - 10.0) / 0.1
+    rows_f = (2.0 - lats) / 0.1
+    in_extent = (cols_f >= 0.0) & (cols_f <= 10.0) & (rows_f >= 0.0) & (rows_f <= 10.0)
+    cols = np.floor(np.clip(cols_f, 0.0, 9.0)).astype(np.int64)
+    rows = np.floor(np.clip(rows_f, 0.0, 9.0)).astype(np.int64)
+    expected = np.zeros(lons.shape, dtype=np.uint8)
+    expected[in_extent & (cols < 5)] = 1
+    expected[in_extent & (rows == 0) & (cols == 0)] = 255
+    return expected
+
+
+def test_raster_mask_to_grid_geographic_object_and_tuple(
+    tmp_path: Path,
+) -> None:
+    """GeoGridSpec object, tuple, and None-CRS spellings agree on 4326."""
+    mask = RasterMask(_class_raster(tmp_path), excluded_values=frozenset({80}))
+    grid = _lonlat_grid(10, 10)
+    lats, lons = _grid_centers_lonlat(grid)
+    expected = _class_raster_expectation(lats, lons)
+
+    from_object = mask.to_grid(grid)
+    assert from_object.dtype == np.uint8
+    np.testing.assert_array_equal(from_object, expected)
+    # identical grid maps exactly onto itself via the helper too
+    np.testing.assert_array_equal(
+        resample_mask_to_grid(mask, from_origin(10.0, 2.0, 0.1, 0.1), (10, 10)),
+        expected,
+    )
+
+    # tuple spellings: explicit CRS and the documented None = EPSG:4326
+    from_tuple = mask.to_grid((from_origin(10.0, 2.0, 0.1, 0.1), (10, 10), "EPSG:4326"))
+    from_none = mask.to_grid((from_origin(10.0, 2.0, 0.1, 0.1), (10, 10), None))
+    np.testing.assert_array_equal(from_tuple, expected)
+    np.testing.assert_array_equal(from_none, expected)
+
+
+def test_raster_mask_to_grid_projected_utm(tmp_path: Path) -> None:
+    """A projected (UTM) GeoGridSpec target extracts with pinned semantics."""
+    mask = RasterMask(_class_raster(tmp_path), excluded_values=frozenset({80}))
+    grid = _utm_grid()
+
+    out = mask.to_grid(grid)
+    assert out.dtype == np.uint8
+    assert out.shape == grid.shape
+    assert set(np.unique(out)).issubset({0, 1, 255})
+    lats, lons = _grid_centers_lonlat(grid)
+    np.testing.assert_array_equal(out, _class_raster_expectation(lats, lons))
+
+
+def test_vector_mask_to_grid_geographic() -> None:
+    """Object/tuple spellings reproduce the exact-grid rasterize on 4326."""
+    water = box(0.5, 0.5, 1.5, 1.5)
+    vector = VectorMask(geometries=water)
+    expected = vector.rasterize(from_origin(0.0, 2.0, 0.1, 0.1), (20, 20))
+
+    grid = GeoGridSpec(
+        crs="EPSG:4326",
+        transform=(0.0, 0.1, 0.0, 2.0, 0.0, -0.1),
+        width=20,
+        height=20,
+        resolution_m=(11132.0, 11057.0),
+    )
+    from_object = vector.to_grid(grid)
+    from_tuple = vector.to_grid(
+        (from_origin(0.0, 2.0, 0.1, 0.1), (20, 20), "EPSG:4326")
+    )
+    from_none = vector.to_grid((from_origin(0.0, 2.0, 0.1, 0.1), (20, 20), None))
+    assert from_object.dtype == np.uint8
+    np.testing.assert_array_equal(from_object, expected)
+    np.testing.assert_array_equal(from_tuple, expected)
+    np.testing.assert_array_equal(from_none, expected)
+
+
+def test_vector_mask_to_grid_projected_utm() -> None:
+    """Lon/lat geometries are reprojected into the UTM target before burning."""
+    import shapely
+    import shapely.ops
+    from affine import Affine
+
+    grid = _utm_grid(width=12, height=12)
+    water = box(10.3, 1.2, 10.7, 1.8)
+
+    out = VectorMask(geometries=water).to_grid(grid)
+    assert out.dtype == np.uint8
+    assert out.shape == grid.shape
+
+    # Oracle: the exact projected polygon against the exact UTM cell
+    # centers (point-in-polygon, independent of the GDAL burn path). A
+    # naive degrees-as-metres burn would produce nothing inside the frame.
+    gdal_x0, gdal_dx, gdal_rx, gdal_y0, gdal_ry, gdal_dy = grid.transform
+    affine = Affine(gdal_dx, gdal_rx, gdal_x0, gdal_ry, gdal_dy, gdal_y0)
+    rows, cols = np.indices(grid.shape, dtype=np.float64)
+    xs, ys = affine * (cols + 0.5, rows + 0.5)
+    forward = pyproj.Transformer.from_crs("EPSG:4326", grid.crs, always_xy=True)
+    projected = shapely.ops.transform(forward.transform, water)
+    inside = shapely.contains(projected, shapely.points(xs, ys))
+    expected = inside.reshape(grid.shape).astype(np.uint8)
+
+    assert 0 < int(expected.sum()) < expected.size
+    np.testing.assert_array_equal(out, expected)
+
+
+def test_mask_operator_to_grid_composition(tmp_path: Path) -> None:
+    """Union / intersection / invert compose the uint8 removed planes."""
+    raster = RasterMask(_class_raster(tmp_path), excluded_values=frozenset({80}))
+    vector = VectorMask(geometries=box(10.0, 1.0, 10.5, 2.0))
+    grid = _lonlat_grid(10, 10)
+    raster_plane = raster.to_grid(grid)
+    vector_plane = vector.to_grid(grid)
+
+    union = MaskOperator.union(raster, vector).to_grid(grid)
+    np.testing.assert_array_equal(
+        union,
+        np.where((raster_plane == 1) | (vector_plane == 1), 1, 0).astype(np.uint8),
+    )
+    # the vector covers the raster's NoData cell, so the union has data there
+    assert union[0, 0] == 1
+
+    intersection = MaskOperator.intersection(raster, vector).to_grid(grid)
+    np.testing.assert_array_equal(
+        intersection,
+        np.where((raster_plane == 1) & (vector_plane == 1), 1, 0).astype(np.uint8),
+    )
+
+    inverted = MaskOperator.invert(raster).to_grid(grid)
+    expected_inv = np.ones((10, 10), dtype=np.uint8)
+    expected_inv[raster_plane == 1] = 0
+    expected_inv[raster_plane == 255] = 255
+    np.testing.assert_array_equal(inverted, expected_inv)
+
+
+def test_mask_operator_to_grid_fallback_sampler() -> None:
+    """Operands without to_grid are sampled at the target cell centers."""
+    grid = GeoGridSpec(
+        crs="EPSG:4326",
+        transform=(0.0, 0.25, 0.0, 1.0, 0.0, -0.25),
+        width=4,
+        height=4,
+        resolution_m=(25000.0, 25000.0),
+    )
+    union = MaskOperator.union(
+        _LongitudeKeepMask(0.5), _LongitudeKeepMask(0.8)
+    ).to_grid(grid)
+    expected = np.zeros((4, 4), dtype=np.uint8)
+    expected[:, 2:] = 1  # center lons 0.625/0.875 are removed by mask a
+    np.testing.assert_array_equal(union, expected)
+
+
+def test_mask_operator_to_grid_all_invalid_propagates(tmp_path: Path) -> None:
+    """255 only where every operand has no mask data (never deletes data)."""
+    values = np.full((4, 4), 255, dtype="uint8")
+    path = _write_uint8_tif(
+        tmp_path / "nodata.tif", values, from_origin(0.0, 1.0, 0.25, 0.25), nodata=255
+    )
+    mask = RasterMask(path)
+    grid = GeoGridSpec(
+        crs="EPSG:4326",
+        transform=(0.0, 0.25, 0.0, 1.0, 0.0, -0.25),
+        width=4,
+        height=4,
+        resolution_m=(25000.0, 25000.0),
+    )
+    assert np.all(mask.to_grid(grid) == 255)
+
+    both_invalid = MaskOperator.intersection(mask, mask).to_grid(grid)
+    assert np.all(both_invalid == 255)
+
+    # data from the second operand wins over the first operand's absence
+    keeps_all = VectorMask(geometries=box(0.1, 0.1, 0.2, 0.2))
+    recovered = MaskOperator.union(mask, keeps_all).to_grid(grid)
+    assert not np.any(recovered == 255)
+    assert int((recovered == 1).sum()) >= 1
+
+
+def test_to_grid_rejects_malformed_grid(tmp_path: Path) -> None:
+    """Malformed grids/transforms fail closed with structured errors."""
+    mask = RasterMask(_class_raster(tmp_path), excluded_values=frozenset({80}))
+    with pytest.raises(TypeError, match="grid must be"):
+        mask.to_grid(object())
+    with pytest.raises(TypeError, match="grid must be"):
+        mask.to_grid((from_origin(10.0, 2.0, 0.1, 0.1), (10, 10), "EPSG:4326", 1))
+    with pytest.raises(TypeError, match="6 GDAL-order values"):
+        mask.to_grid(((1.0, 2.0, 3.0, 4.0, 5.0), (10, 10), None))
+    with pytest.raises(ValueError, match="grid shape"):
+        mask.to_grid((from_origin(10.0, 2.0, 0.1, 0.1), (0, 10), None))
+    with pytest.raises(ValueError, match="CRS"):
+        mask.to_grid((from_origin(10.0, 2.0, 0.1, 0.1), (10, 10), "not-a-crs"))
 
 
 # ---------------------------------------------------------------------------

@@ -262,37 +262,6 @@ def _effective_roi_polygons(parts: list[Any]) -> object:
     )
 
 
-def _resolved_mask_buffer_km(
-    mask_buffer_km: float,
-    ocean_water_buffer_km: float | None,
-    inland_water_buffer_km: float | None,
-) -> float:
-    """Collapse the configured buffers into one land-buffer width.
-
-    Equal ocean/inland buffers collapse to one land buffer with no water-body
-    classification (PROPOSAL-0039 G4); differing buffers require the
-    connectivity classification that is not wired in this slice and fail
-    closed instead of silently changing the masking semantics.
-    """
-    if ocean_water_buffer_km is None and inland_water_buffer_km is None:
-        return float(mask_buffer_km)
-    if ocean_water_buffer_km is None or inland_water_buffer_km is None:
-        reject_invalid_state(
-            "ocean_water_buffer_km and inland_water_buffer_km must be "
-            "configured together"
-        )
-    if float(ocean_water_buffer_km) != float(inland_water_buffer_km):
-        message = (
-            "differing ocean_water_buffer_km/inland_water_buffer_km require "
-            "the water-body connectivity classification, which is not wired "
-            "in this slice; configure equal buffers or a single "
-            "mask_buffer_km"
-        )
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
-    return float(ocean_water_buffer_km)
-
-
 def _mask_failure_lineage(
     mask_on_failure: str,
     error: Exception,
@@ -331,9 +300,6 @@ def _resolve_effective_roi(
     *,
     mask: str | MaskSampler | None,
     mask_source: str | None,
-    mask_buffer_km: float,
-    ocean_water_buffer_km: float | None,
-    inland_water_buffer_km: float | None,
     mask_on_failure: MaskFailurePolicy,
 ) -> _EffectiveRoi:
     """Resolve ``effective_ROI = ROI - water_beyond_buffer`` (PROPOSAL-0039 G6).
@@ -342,11 +308,13 @@ def _resolve_effective_roi(
     padded, tile-snapped fetch band and fails closed before any fetch; the
     cached vector water layer is read back (geopandas), buffered with
     :func:`~faninsar.processing.masking.mask.buffer_land_utm_km` in the ROI's
-    auto-UTM zone, and subtracted from the ROI geometry. An empty result
-    raises a structured :class:`InvalidProcessingStateError` independent of
-    ``mask_on_failure``. Mask *resolution* failures (provider outage,
-    misconfigured manager) route through the ``mask_on_failure`` policy and
-    degrade to the unmasked ROI with a mask-absent lineage record.
+    auto-UTM zone, and subtracted from the ROI geometry. The land buffer is
+    owned by the water pipeline (``MaskManager.buffer_km``, overridable via
+    ``FANINSAR_MASK_BUFFER_KM`` through ``get_mask_manager``). An empty
+    result raises a structured :class:`InvalidProcessingStateError`
+    independent of ``mask_on_failure``. Mask *resolution* failures (provider
+    outage, misconfigured manager) route through the ``mask_on_failure``
+    policy and degrade to the unmasked ROI with a mask-absent lineage record.
 
     Parameters
     ----------
@@ -360,11 +328,6 @@ def _resolve_effective_roi(
         (Slice D2), leaving the ROI untouched in this slice.
     mask_source : str or None
         MaskManager selection override (``water`` / ``water:<provider>``).
-    mask_buffer_km : float
-        Land buffer width in kilometres (default 1.0).
-    ocean_water_buffer_km, inland_water_buffer_km : float or None
-        Dual-buffer configuration; equal values collapse to one land buffer,
-        differing values fail closed (classification unwired).
     mask_on_failure : "error", "warning", or "skip"
         Failure policy for mask *resolution* failures only.
 
@@ -376,8 +339,8 @@ def _resolve_effective_roi(
     Raises
     ------
     InvalidProcessingStateError
-        When the seam guard rejects the ROI, when the effective ROI is
-        empty, or when the buffers cannot be collapsed (all structural).
+        When the seam guard rejects the ROI or when the effective ROI is
+        empty (both structural).
     MaskProviderUnavailableError
         When the provider fails under the ``error`` policy.
 
@@ -407,14 +370,6 @@ def _resolve_effective_roi(
         get_mask_manager,
     )
 
-    roi_geometry = _roi_to_geometry(roi)
-    raw_bounds = tuple(float(value) for value in roi_geometry.bounds)
-    zone_lon = (raw_bounds[0] + raw_bounds[2]) / 2.0
-    zone_lat = (raw_bounds[1] + raw_bounds[3]) / 2.0
-    buffer_km = _resolved_mask_buffer_km(
-        mask_buffer_km, ocean_water_buffer_km, inland_water_buffer_km
-    )
-
     try:
         manager = get_mask_manager(source=mask_source, on_failure=mask_on_failure)
     except InvalidProcessingStateError as error:
@@ -422,6 +377,13 @@ def _resolve_effective_roi(
         # unresolvable mask, not a structural ROI problem: the failure
         # policy governs, mirroring a provider outage.
         return _mask_failure_lineage(mask_on_failure, error, roi)
+
+    # The buffer is owned by the water pipeline (MaskManager.buffer_km).
+    buffer_km = float(manager.buffer_km)
+    roi_geometry = _roi_to_geometry(roi)
+    raw_bounds = tuple(float(value) for value in roi_geometry.bounds)
+    zone_lon = (raw_bounds[0] + raw_bounds[2]) / 2.0
+    zone_lat = (raw_bounds[1] + raw_bounds[3]) / 2.0
 
     # Seam guard FIRST: fail closed on the raw ROI bounds with the padded,
     # tile-snapped fetch band before any fetch (PROPOSAL-0039 G4).
@@ -468,7 +430,7 @@ def _resolve_effective_roi(
             "mask": "present",
             "mask_identity": layer.identity,
             "mask_source_version": layer.source_version,
-            "mask_buffer_km": buffer_km,
+            "buffer_km": buffer_km,
             # Reused by the product-level mask resolution (Slice D2) so the
             # ROI arithmetic and the IFG/unwrap mask share one vector layer.
             "mask_layer_path": str(layer.path),
@@ -479,15 +441,6 @@ def _resolve_effective_roi(
 # ---------------------------------------------------------------------------
 # PROPOSAL-0039 product-level mask application (Stack integration, Slice D2)
 # ---------------------------------------------------------------------------
-
-
-def _mask_tag_value(value: object) -> str:
-    """Render one mask provenance value as a GeoTIFF tag string."""
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
 
 
 def _grid_crs_epsg(grid: Any) -> int | None:
@@ -516,8 +469,7 @@ def _mask_removed_plane(
     coordinates to lon/lat).  :class:`~faninsar.processing.masking.mask.\
 RasterMask` input goes through :func:`faninsar.processing.masking.mask.\
 resample_mask_to_grid` (nearest-neighbour only, the globally pinned rule —
-    this is how a mask rasterized at ``mask_resolution_m`` follows an IFG
-    grid of a different resolution);
+    this is how a mask on a different grid follows an IFG grid);
     :class:`~faninsar.processing.masking.mask.VectorMask` input rasterizes
     directly; any other :class:`~faninsar.processing.masking.mask.MaskSampler`
     is sampled at the target cell centers.
@@ -568,73 +520,6 @@ def _apply_mask_to_valid_mask(
     intersected = np.asarray(valid_mask, dtype=bool).copy()
     intersected &= ~removed
     return intersected
-
-
-def _mask_grid_at_resolution(
-    bounds: tuple[float, float, float, float],
-    resolution_m: float,
-) -> tuple[Any, tuple[int, int]]:
-    """Build the ``mask_resolution_m`` override grid over ``bounds``.
-
-    The metre resolution converts to degrees at the band's maximum absolute
-    latitude (the same ``111.32 km`` degree convention as
-    :func:`faninsar.processing.masking.mask.padded_fetch_band`'s fallback)
-    and the bounds snap outwards onto whole override cells.
-    """
-    import math
-
-    from affine import Affine
-
-    min_lon, min_lat, max_lon, max_lat = (float(value) for value in bounds)
-    if not (max_lon > min_lon and max_lat > min_lat):
-        message = f"mask bounds are empty: {bounds!r}"
-        logger.error(message)
-        raise InvalidProcessingStateError(message)
-    reference_lat = min(max(abs(min_lat), abs(max_lat)), 89.0)
-    dx_deg = float(resolution_m) / (111_320.0 * math.cos(math.radians(reference_lat)))
-    dy_deg = float(resolution_m) / 111_320.0
-    west = math.floor(min_lon / dx_deg) * dx_deg
-    north = math.ceil(max_lat / dy_deg) * dy_deg
-    width = max(1, math.ceil((max_lon - west) / dx_deg))
-    height = max(1, math.ceil((north - min_lat) / dy_deg))
-    transform = Affine(dx_deg, 0.0, west, 0.0, -dy_deg, north)
-    return transform, (height, width)
-
-
-def _write_mask_product(
-    path: Path,
-    plane: np.ndarray,
-    transform: Any,
-    *,
-    tags: dict[str, str],
-) -> Path:
-    """Atomically write the uint8 mask GeoTIFF product (nodata 255)."""
-    import rasterio
-
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    profile = {
-        "driver": "GTiff",
-        "height": int(plane.shape[0]),
-        "width": int(plane.shape[1]),
-        "count": 1,
-        "dtype": "uint8",
-        "nodata": 255,
-        "crs": rasterio.crs.CRS.from_epsg(4326),
-        "transform": transform,
-        "compress": "deflate",
-    }
-    try:
-        with rasterio.open(temporary, "w", **profile) as dataset:
-            dataset.write(np.asarray(plane, dtype=np.uint8), 1)
-            if tags:
-                dataset.update_tags(**tags)
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    logger.info("Wrote mask product: %s", path)
-    return path
 
 
 _P = ParamSpec("_P")
@@ -1061,10 +946,6 @@ class Stack(Network):
         roi: BoundingBox | Polygons | None = None,
         mask: str | MaskSampler | None = AUTO_WATER_MASK,
         mask_source: str | None = None,
-        mask_resolution_m: float | None = None,
-        mask_buffer_km: float = 1.0,
-        ocean_water_buffer_km: float | None = None,
-        inland_water_buffer_km: float | None = None,
         mask_on_failure: MaskFailurePolicy = "warning",
         mask_apply_ionosphere: bool = False,
         coreg_mode: CoregMode = "pair",
@@ -1129,10 +1010,6 @@ class Stack(Network):
             roi=roi,
             mask=mask,
             mask_source=mask_source,
-            mask_resolution_m=mask_resolution_m,
-            mask_buffer_km=mask_buffer_km,
-            ocean_water_buffer_km=ocean_water_buffer_km,
-            inland_water_buffer_km=inland_water_buffer_km,
             mask_on_failure=mask_on_failure,
             mask_apply_ionosphere=mask_apply_ionosphere,
             swaths=swaths,
@@ -1287,9 +1164,6 @@ class Stack(Network):
                 cfg.roi,
                 mask=cfg.mask,
                 mask_source=cfg.mask_source,
-                mask_buffer_km=cfg.mask_buffer_km,
-                ocean_water_buffer_km=cfg.ocean_water_buffer_km,
-                inland_water_buffer_km=cfg.inland_water_buffer_km,
                 mask_on_failure=cfg.mask_on_failure,
             )
         return self._effective_roi_resolution
@@ -1375,11 +1249,14 @@ class Stack(Network):
     ) -> tuple[MaskSampler | None, dict[str, object]]:
         """Resolve the automatic water mask into its buffered mask product.
 
-        The rasterized product caches under ``<work_dir>/mask/`` with
-        provenance tags (mask product/provider/retrieved/threshold/buffer)
-        and is written onto the DEM mosaic grid when the configured DEM
-        sampler carries a usable mosaic path (the manager's own consume
-        cache), or onto the ``mask_resolution_m`` override grid otherwise.
+        The mask grid is always the DEM grid via the masking manager
+        (PROPOSAL-0039): the rasterized product caches under
+        ``<work_dir>/mask/`` with provenance tags (mask
+        product/provider/retrieved/threshold/buffer) and is written onto the
+        DEM mosaic grid when the configured DEM sampler carries a usable
+        mosaic path (the manager's own consume cache). Without a DEM mosaic
+        path there is no mask grid and the run degrades under the
+        ``mask_on_failure`` policy.
         """
         from faninsar.processing.masking.mask_manager import (
             MaskManager,
@@ -1388,11 +1265,6 @@ class Stack(Network):
 
         config = self.config
         try:
-            buffer_km = _resolved_mask_buffer_km(
-                config.mask_buffer_km,
-                config.ocean_water_buffer_km,
-                config.inland_water_buffer_km,
-            )
             manager: MaskManager = get_mask_manager(
                 source=config.mask_source, on_failure=config.mask_on_failure
             )
@@ -1408,13 +1280,20 @@ class Stack(Network):
                 )
             )
 
-        provenance = self._mask_provenance(manager, buffer_km)
+        provenance = self._mask_provenance(manager)
         dem_path = getattr(config.dem, "path", None)
         if dem_path is not None and Path(dem_path).is_file():
-            return self._resolve_dem_grid_mask(manager, bounds, buffer_km, provenance)
-        return self._resolve_override_grid_mask(manager, bounds, buffer_km, provenance)
+            return self._resolve_dem_grid_mask(manager, bounds, provenance)
+        return None, self._mask_failure_record(
+            InvalidProcessingStateError(
+                "the automatic water mask rasterizes onto the DEM mosaic grid "
+                "through the masking manager (the mask grid is always the DEM "
+                "grid); the configured dem sampler carries no mosaic path, so "
+                "no mask grid is available"
+            )
+        )
 
-    def _mask_provenance(self, manager: Any, buffer_km: float) -> dict[str, object]:
+    def _mask_provenance(self, manager: Any) -> dict[str, object]:
         """Build the shared provenance record for the water mask product."""
         entry = manager.source_entry
         return {
@@ -1423,14 +1302,13 @@ class Stack(Network):
             "mask_provider": entry.provider,
             "mask_retrieved": datetime.now(tz=UTC).date().isoformat(),
             "mask_threshold": manager.effective_threshold,
-            "mask_buffer_km": buffer_km,
+            "buffer_km": float(manager.buffer_km),
         }
 
     def _resolve_dem_grid_mask(
         self,
         manager: Any,
         bounds: tuple[float, float, float, float],
-        buffer_km: float,
         provenance: dict[str, object],
     ) -> tuple[MaskSampler | None, dict[str, object]]:
         """Rasterize the water mask onto the DEM mosaic grid.
@@ -1448,7 +1326,6 @@ class Stack(Network):
             product_path = manager.resolve_auto_mask(
                 bounds,
                 dem_path=self.config.dem.path,
-                buffer_km=buffer_km,
                 output_dir=self.config.work_dir,
             )
         except MaskProviderUnavailableError as error:
@@ -1463,86 +1340,6 @@ class Stack(Network):
             }
         provenance["mask_asset"] = str(product_path)
         logger.info("Stack water mask resolved on the DEM grid: %s", product_path)
-        return RasterMask(product_path), provenance
-
-    def _resolve_override_grid_mask(
-        self,
-        manager: Any,
-        bounds: tuple[float, float, float, float],
-        buffer_km: float,
-        provenance: dict[str, object],
-    ) -> tuple[MaskSampler | None, dict[str, object]]:
-        """Rasterize the water mask onto the ``mask_resolution_m`` grid.
-
-        Consumes ``mask_resolution_m`` (PROPOSAL-0039): the buffered water
-        vector rasterizes onto a regular EPSG:4326 grid built over the padded
-        fetch band at that resolution, and the product is written under
-        ``<work_dir>/mask/`` with provenance tags.
-        """
-        import geopandas as gpd
-
-        from faninsar.processing.masking.mask import (
-            RasterMask,
-            buffer_land_utm_km,
-            padded_fetch_band,
-            rasterize_to_grid,
-        )
-        from faninsar.processing.masking.mask_manager import (
-            MaskProviderUnavailableError,
-        )
-
-        if self.config.mask_resolution_m is None:
-            return None, self._mask_failure_record(
-                InvalidProcessingStateError(
-                    "the automatic water mask needs either a DEM mosaic path "
-                    "on the configured dem sampler or a positive "
-                    "mask_resolution_m override to rasterize onto"
-                )
-            )
-        zone_lon = (bounds[0] + bounds[2]) / 2.0
-        zone_lat = (bounds[1] + bounds[3]) / 2.0
-        padded = padded_fetch_band(
-            bounds, buffer_km, zone_lon=zone_lon, zone_lat=zone_lat
-        )
-        try:
-            layer = manager.get_water_layer(padded)
-        except MaskProviderUnavailableError as error:
-            return None, self._mask_failure_record(error)
-        layer_frame = gpd.read_file(layer.path)
-        series = layer_frame.geometry
-        water = (
-            series.union_all() if hasattr(series, "union_all") else series.unary_union
-        )
-        buffered = buffer_land_utm_km(
-            water, buffer_km, zone_lon=zone_lon, zone_lat=zone_lat
-        )
-        transform, grid_shape = _mask_grid_at_resolution(
-            padded, self.config.mask_resolution_m
-        )
-        plane = rasterize_to_grid([buffered], transform, grid_shape)
-        tags = {key: _mask_tag_value(value) for key, value in provenance.items()}
-        tags["mask_identity"] = layer.identity
-        tags["mask_source_version"] = layer.source_version
-        tags["mask_resolution_m"] = str(float(self.config.mask_resolution_m))
-        product_path = _write_mask_product(
-            self.config.work_dir / "mask" / "water_mask.tif",
-            plane,
-            transform,
-            tags=tags,
-        )
-        provenance.update(
-            {
-                "mask_asset": str(product_path),
-                "mask_identity": layer.identity,
-                "mask_source_version": layer.source_version,
-                "mask_resolution_m": float(self.config.mask_resolution_m),
-            }
-        )
-        logger.info(
-            "Stack water mask resolved at mask_resolution_m=%s: %s",
-            self.config.mask_resolution_m,
-            product_path,
-        )
         return RasterMask(product_path), provenance
 
     def _mask_failure_record(self, error: Exception) -> dict[str, object]:

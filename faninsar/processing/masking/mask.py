@@ -9,6 +9,14 @@ padded fetch band :func:`padded_fetch_band`, the shared tile-grid snap
 :func:`antimeridian_seam_guard`, :func:`resample_mask_to_grid` (nearest
 neighbour only), and :func:`rasterize_to_grid` (uint8 0/1 with 255 = invalid).
 
+The primary consumption seam for every mask is :meth:`RasterMask.to_grid` /
+:meth:`VectorMask.to_grid` / :meth:`MaskOperator.to_grid`:
+``to_grid(grid) -> uint8 ndarray (0/1/255)`` extracts the mask onto a
+duck-typed target grid (a GeoGridSpec-like object or a
+``(transform, shape, crs)`` tuple) in **any** CRS, projected target grids
+included. The ``sample(lat_deg, lon_deg)`` point query is the documented
+*secondary* WGS84 convenience.
+
 Two array conventions are used consistently:
 
 - **Sampler planes** are boolean with ``True`` = keep (valid), mirroring
@@ -242,12 +250,46 @@ class RasterMask:
             matched.reshape(out_shape),
         )
 
+    def to_grid(self, grid: object) -> np.ndarray:
+        """Extract the mask onto a duck-typed target grid (primary seam).
+
+        This is the primary consumption seam of the mask (PROPOSAL-0039):
+        nearest-neighbour only (the globally pinned rule for boolean masks —
+        bilinear would invent fractional values at coastlines), with the
+        pinned fill semantics. A target grid identical to the source grid
+        (same transform/shape, EPSG:4326) maps exactly onto itself.
+
+        Parameters
+        ----------
+        grid : GeoGridSpec-like or (transform, shape, crs) tuple
+            The target grid: a GeoGridSpec-like object carrying ``.transform``,
+            ``.shape`` (or ``.width``/``.height``), and ``.crs`` — the
+            :class:`faninsar.processing.merge.grid.GeoGridSpec` shape,
+            duck-typed so masking never imports it — or a ``(transform,
+            shape, crs)`` tuple. Any CRS is supported (projected target grids
+            included); a 6-element transform sequence is consumed as a
+            GDAL-order geotransform and ``None`` CRS as EPSG:4326.
+
+        Returns
+        -------
+        numpy.ndarray
+            uint8 mask with ``0`` = valid keep, ``1`` = removed, ``255`` =
+            invalid (NoData). Cells whose center falls outside the raster
+            extent resolve to ``0`` (valid), never to ``255``.
+
+        """
+        transform, shape, crs = _grid_parts(grid)
+        return resample_mask_to_grid(self, transform, shape, crs=crs)
+
     def sample(
         self,
         latitude_deg: np.ndarray,
         longitude_deg: np.ndarray,
     ) -> np.ndarray:
-        """Return the boolean keep plane for the requested coordinates.
+        """Return the boolean keep plane for WGS84 point queries (secondary).
+
+        Secondary convenience seam: :meth:`to_grid` is the primary grid-first
+        consumption interface; ``sample`` answers WGS84 point queries only.
 
         Parameters
         ----------
@@ -300,11 +342,13 @@ class VectorMask:
     """Vector geometries marking the removed (masked) region.
 
     The geometries are interpreted as the region to remove (water polygons for
-    the automatic water mask). :meth:`rasterize` burns them onto an exact
-    target grid as uint8 ``1`` (removed) / ``0`` (kept); :meth:`sample` reports
-    ``True`` = keep for points outside every geometry (boundary points count
-    as covered). v1 expects lon/lat (EPSG:4326) geometries, which is what the
-    water manager's cached vector layer stores.
+    the automatic water mask). :meth:`to_grid` / :meth:`rasterize` burn them
+    onto an exact target grid as uint8 ``1`` (removed) / ``0`` (kept);
+    :meth:`sample` reports ``True`` = keep for points outside every geometry
+    (boundary points count as covered; it is the secondary WGS84 point-query
+    convenience). The geometries are lon/lat (EPSG:4326), which is what the
+    water manager's cached vector layer stores; :meth:`to_grid` reprojects
+    them into the target CRS, so projected target grids are supported.
 
     Parameters
     ----------
@@ -381,12 +425,55 @@ class VectorMask:
             dtype=np.uint8,
         )
 
+    def to_grid(self, grid: object, *, all_touched: bool = False) -> np.ndarray:
+        """Rasterize the geometries onto a duck-typed target grid (primary seam).
+
+        The primary consumption seam of the mask (PROPOSAL-0039): the
+        lon/lat geometries are reprojected into the target CRS when needed
+        and burned onto the exact target grid, so **any** target CRS works
+        (projected target grids included).
+
+        Parameters
+        ----------
+        grid : GeoGridSpec-like or (transform, shape, crs) tuple
+            The target grid: a GeoGridSpec-like object carrying ``.transform``,
+            ``.shape`` (or ``.width``/``.height``), and ``.crs`` — the
+            :class:`faninsar.processing.merge.grid.GeoGridSpec` shape,
+            duck-typed so masking never imports it — or a ``(transform,
+            shape, crs)`` tuple. A 6-element transform sequence is consumed
+            as a GDAL-order geotransform and ``None`` CRS as EPSG:4326.
+        all_touched : bool
+            GDAL burn rule: ``False`` burns cells whose center is inside the
+            geometry; ``True`` burns every cell the geometry touches (the
+            coastline tie-break).
+
+        Returns
+        -------
+        numpy.ndarray
+            uint8 array with ``1`` = covered by the geometries (removed) and
+            ``0`` = outside (kept); the shape/transform match the target grid
+            exactly. No ``255`` is produced (a pure vector mask has no
+            NoData concept).
+
+        """
+        transform, shape, crs = _grid_parts(grid)
+        return rasterize_to_grid(
+            self.geometries,
+            transform,
+            shape,
+            all_touched=all_touched,
+            crs=crs,
+        )
+
     def sample(
         self,
         latitude_deg: np.ndarray,
         longitude_deg: np.ndarray,
     ) -> np.ndarray:
-        """Return the boolean keep plane for the requested coordinates.
+        """Return the boolean keep plane for WGS84 point queries (secondary).
+
+        Secondary convenience seam: :meth:`to_grid` is the primary grid-first
+        consumption interface; ``sample`` answers WGS84 point queries only.
 
         Parameters
         ----------
@@ -426,6 +513,10 @@ class MaskOperator:
       versa).
 
     Operators nest: a :class:`MaskOperator` is itself a :class:`MaskSampler`.
+    :meth:`to_grid` composes the uint8 ``0/1/255`` product planes directly:
+    only plane value ``1`` removes, ``255`` (no mask data) never deletes data,
+    and the composed output is ``255`` only where **every** operand is
+    ``255``.
 
     Raises
     ------
@@ -469,12 +560,74 @@ class MaskOperator:
         """Return the complement of ``mask`` (exactly one mask required)."""
         return cls("invert", masks)
 
+    def to_grid(self, grid: object) -> np.ndarray:
+        """Compose the operands' uint8 removed planes on the target grid.
+
+        The primary consumption seam of the composition (PROPOSAL-0039):
+        operands that provide ``to_grid`` (RasterMask / VectorMask /
+        MaskOperator) are consumed grid-first; any other MaskSampler operand
+        is sampled at the target cell centers (WGS84 fallback). Composition
+        runs on the removed regions: ``union`` removes where any operand
+        removes, ``intersection`` where every operand removes, and ``invert``
+        complements the single operand. Plane value ``255`` (no mask data)
+        never removes support; the output is ``255`` only where every operand
+        is ``255`` (``invert`` keeps its operand's ``255`` cells).
+
+        Parameters
+        ----------
+        grid : GeoGridSpec-like or (transform, shape, crs) tuple
+            The target grid (any CRS; see :meth:`RasterMask.to_grid` for the
+            duck-typed contract).
+
+        Returns
+        -------
+        numpy.ndarray
+            uint8 plane with ``1`` = removed, ``0`` = kept, and ``255`` only
+            where every operand has no mask data.
+
+        Raises
+        ------
+        ValueError
+            If an operand plane does not match the target grid shape.
+
+        """
+        transform, shape, crs = _grid_parts(grid)
+        planes = [
+            _operand_removed_plane(mask, grid, transform, shape, crs)
+            for mask in self.masks
+        ]
+        target = tuple(shape)
+        for plane in planes:
+            if tuple(plane.shape) != target:
+                message = (
+                    f"operand mask plane shape {tuple(plane.shape)} does not "
+                    f"match the target grid {target}"
+                )
+                logger.error(message)
+                raise ValueError(message)
+        if self.mode == "invert":
+            out = np.zeros(target, dtype=np.uint8)
+            out[planes[0] == 0] = 1
+            out[planes[0] == 255] = 255
+            return out
+        reduced: object = np.logical_or if self.mode == "union" else np.logical_and
+        removed = reduced.reduce([plane == 1 for plane in planes])
+        all_invalid = np.logical_and.reduce([plane == 255 for plane in planes])
+        out: np.ndarray = np.where(removed, np.uint8(1), np.uint8(0)).astype(np.uint8)
+        out[all_invalid] = 255
+        return out
+
     def sample(
         self,
         latitude_deg: np.ndarray,
         longitude_deg: np.ndarray,
     ) -> np.ndarray:
-        """Return the composed boolean keep plane for the coordinates.
+        """Return the composed boolean keep plane (WGS84 point query, secondary).
+
+        Secondary convenience seam: :meth:`to_grid` is the primary grid-first
+        consumption interface; ``sample`` answers WGS84 point queries only
+        (it composes boolean keep planes, so it cannot distinguish ``255``
+        no-data cells from removed cells the way :meth:`to_grid` does).
 
         Parameters
         ----------
@@ -773,17 +926,187 @@ def antimeridian_seam_guard(
 # ---------------------------------------------------------------------------
 
 
+def _as_affine(transform: object) -> Affine:
+    """Normalize a transform into an :class:`affine.Affine`.
+
+    An ``affine.Affine`` instance passes through unchanged; a 6-element
+    sequence is consumed as a GDAL-order geotransform
+    ``(x0, dx, rot_x, y0, rot_y, dy)`` — the GeoGridSpec convention (the
+    order rasterio documents for map transforms).
+
+    Raises
+    ------
+    TypeError
+        If the transform is neither an Affine nor a 6-element numeric
+        sequence.
+
+    """
+    from affine import Affine as _Affine
+
+    if isinstance(transform, _Affine):
+        return transform
+    try:
+        values = tuple(float(value) for value in transform)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as error:
+        message = (
+            "grid transform must be an affine.Affine or a GDAL-order "
+            f"6-element sequence; got {type(transform).__name__}"
+        )
+        logger.exception(message)
+        raise TypeError(message) from error
+    if len(values) != 6:
+        message = (
+            "grid transform sequence must have 6 GDAL-order values "
+            f"(x0, dx, rot_x, y0, rot_y, dy); got {len(values)}"
+        )
+        logger.error(message)
+        raise TypeError(message)
+    return _Affine.from_gdal(*values)
+
+
+def _grid_parts(grid: object) -> tuple[Affine, tuple[int, int], object]:
+    """Normalize a duck-typed grid into ``(affine, (height, width), crs)``.
+
+    Two grid spellings are accepted (PROPOSAL-0039 grid-first consumption):
+
+    - a GeoGridSpec-like object carrying ``.transform``, ``.shape`` (or
+      ``.width``/``.height``), and ``.crs`` — the
+      :class:`faninsar.processing.merge.grid.GeoGridSpec` shape, duck-typed
+      so the masking core never imports it;
+    - a ``(transform, shape, crs)`` tuple with ``shape = (height, width)``.
+
+    The transform may be an :class:`affine.Affine` or a GDAL-order 6-element
+    sequence. The CRS may be anything :mod:`pyproj` accepts (``"EPSG:32633"``,
+    WKT, a rasterio/pyproj CRS object); ``None`` is consumed as EPSG:4326
+    (the geographic convention of the mask helpers) and an unresolvable CRS
+    fails closed.
+
+    Raises
+    ------
+    TypeError
+        If ``grid`` matches neither accepted spelling or the transform is
+        malformed.
+    ValueError
+        If the grid shape is not two positive dimensions or the CRS cannot
+        be resolved.
+
+    """
+    if not isinstance(grid, (tuple, list)) and hasattr(grid, "transform"):
+        transform = grid.transform
+        shape_attr = getattr(grid, "shape", None)
+        if shape_attr is not None:
+            shape = (int(shape_attr[0]), int(shape_attr[1]))
+        elif hasattr(grid, "height") and hasattr(grid, "width"):
+            shape = (int(grid.height), int(grid.width))
+        else:
+            message = (
+                "grid object must expose .shape or .height/.width; got "
+                f"{type(grid).__name__}"
+            )
+            logger.error(message)
+            raise TypeError(message)
+        crs = getattr(grid, "crs", None)
+    elif isinstance(grid, (tuple, list)) and len(grid) == 3:
+        transform, shape_attr, crs = grid
+        shape = (int(shape_attr[0]), int(shape_attr[1]))
+    else:
+        message = (
+            "grid must be a GeoGridSpec-like object (transform/shape/crs) "
+            "or a (transform, shape, crs) tuple; got "
+            f"{type(grid).__name__}"
+        )
+        logger.error(message)
+        raise TypeError(message)
+    if len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0:
+        message = f"grid shape must be two positive dimensions; got {shape}"
+        logger.error(message)
+        raise ValueError(message)
+    return _as_affine(transform), shape, crs
+
+
+def _grid_is_lonlat_identity(crs: object) -> bool:
+    """Return True when grid coordinates are already EPSG:4326 lon/lat.
+
+    ``None`` is consumed as EPSG:4326 (the geographic convention of the mask
+    helpers); an unresolvable CRS fails closed instead of being silently
+    treated as geographic.
+    """
+    if crs is None:
+        return True
+    import pyproj
+
+    try:
+        return bool(pyproj.CRS.from_user_input(crs).to_epsg() == 4326)
+    except Exception as error:
+        message = f"unresolvable grid CRS: {crs!r}"
+        logger.exception(message)
+        raise ValueError(message) from error
+
+
+def _cell_centers_lonlat(
+    transform: Affine,
+    shape: tuple[int, int],
+    crs: object,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(latitude, longitude)`` planes of the grid cell centers.
+
+    Centers are computed with the pixel-area convention (``floor`` of the
+    fractional pixel coordinate + 0.5) and, for a non-EPSG:4326 grid CRS
+    (projected target grids included), transformed to EPSG:4326 degrees with
+    pyproj. The EPSG:4326 path is the exact identity.
+    """
+    rows, cols = np.indices(tuple(shape), dtype=np.float64)
+    xs, ys = transform * (cols + 0.5, rows + 0.5)
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
+    if _grid_is_lonlat_identity(crs):
+        return ys, xs
+    import pyproj
+
+    transformer = pyproj.Transformer.from_crs(
+        pyproj.CRS.from_user_input(crs), "EPSG:4326", always_xy=True
+    )
+    lons, lats = transformer.transform(xs, ys)
+    return (
+        np.asarray(lats, dtype=np.float64),
+        np.asarray(lons, dtype=np.float64),
+    )
+
+
+def _operand_removed_plane(
+    operand: object,
+    grid: object,
+    transform: Affine,
+    shape: tuple[int, int],
+    crs: object,
+) -> np.ndarray:
+    """Return one operand's uint8 removed plane on the duck-typed grid.
+
+    Operands providing ``to_grid`` are consumed grid-first with the original
+    grid object; any other MaskSampler operand is sampled at the target cell
+    centers (the boolean keep plane maps to ``0`` = keep / ``1`` = removed).
+    """
+    operand_to_grid = getattr(operand, "to_grid", None)
+    if callable(operand_to_grid):
+        return np.asarray(operand_to_grid(grid), dtype=np.uint8)
+    latitude, longitude = _cell_centers_lonlat(transform, shape, crs)
+    keep = np.asarray(operand.sample(latitude, longitude), dtype=bool)
+    return np.where(keep, np.uint8(0), np.uint8(1)).astype(np.uint8)
+
+
 def resample_mask_to_grid(
     raster_mask: RasterMask,
     transform: Affine,
     shape: tuple[int, int],
+    *,
+    crs: object = None,
 ) -> np.ndarray:
     """Extract a :class:`RasterMask` onto an exact target grid.
 
     Nearest-neighbour only (the globally pinned rule for boolean masks —
     bilinear would invent fractional values at coastlines). A target grid
-    identical to the source grid (same transform/shape) maps exactly onto
-    itself.
+    identical to the source grid (same transform/shape, EPSG:4326) maps
+    exactly onto itself.
 
     Parameters
     ----------
@@ -791,9 +1114,14 @@ def resample_mask_to_grid(
         The user raster mask (``excluded_values`` / ``threshold`` /
         ``invert`` configure the predicate).
     transform : affine.Affine
-        Affine transform of the target grid (EPSG:4326 degrees).
+        Affine transform of the target grid.
     shape : tuple[int, int]
         ``(height, width)`` of the target grid.
+    crs : object or None
+        CRS of the target grid (anything :mod:`pyproj` accepts; ``None`` is
+        consumed as EPSG:4326). Non-4326 target grids — projected grids
+        included — have their cell centers transformed to EPSG:4326 for the
+        nearest-neighbour lookup.
 
     Returns
     -------
@@ -803,9 +1131,8 @@ def resample_mask_to_grid(
         resolve to ``0`` (valid), never to ``255``.
 
     """
-    rows, cols = np.indices(tuple(shape), dtype=np.float64)
-    xs, ys = transform * (cols + 0.5, rows + 0.5)
-    in_extent, is_nodata, excluded = raster_mask._extract(ys, xs)
+    latitude, longitude = _cell_centers_lonlat(transform, shape, crs)
+    in_extent, is_nodata, excluded = raster_mask._extract(latitude, longitude)
     out = np.zeros(in_extent.shape, dtype=np.uint8)
     out[in_extent & is_nodata] = 255
     out[in_extent & ~is_nodata & excluded] = 1
@@ -819,20 +1146,24 @@ def rasterize_to_grid(
     *,
     all_touched: bool = False,
     validity: np.ndarray | None = None,
+    crs: object = None,
 ) -> np.ndarray:
     """Rasterize vector geometries onto an exact target grid.
 
     The consumption step of the water pipeline (PROPOSAL-0039): the buffered
-    water vector is rasterized directly onto the DEM mosaic grid
-    (``mask_resolution_m`` overrides) as a uint8 binary mask.
+    water vector is rasterized directly onto the DEM mosaic grid as a uint8
+    binary mask.
 
     Parameters
     ----------
     geometries : geopandas.GeoDataFrame or geopandas.GeoSeries or \
             shapely geometry or sequence
-        Geometries marking the removed region.
+        Geometries marking the removed region, in lon/lat (EPSG:4326) — the
+        vector-layer convention. A target grid in any other CRS (projected
+        grids included) receives the geometries reprojected into the target
+        CRS before burning.
     transform : affine.Affine
-        Affine transform of the target grid (EPSG:4326 degrees).
+        Affine transform of the target grid.
     shape : tuple[int, int]
         ``(height, width)`` of the target grid.
     all_touched : bool
@@ -840,6 +1171,9 @@ def rasterize_to_grid(
     validity : numpy.ndarray or None
         Optional boolean plane of the target grid (``True`` = valid, e.g. DEM
         cells with data). Cells marked invalid become ``255``.
+    crs : object or None
+        CRS of the target grid (anything :mod:`pyproj` accepts; ``None`` is
+        consumed as EPSG:4326, the identity path).
 
     Returns
     -------
@@ -851,14 +1185,28 @@ def rasterize_to_grid(
     Raises
     ------
     ValueError
-        If ``validity`` does not match the target grid shape.
+        If ``validity`` does not match the target grid shape or the target
+        CRS cannot be resolved.
 
     """
     from rasterio import features as rio_features
 
-    shapes = [
-        (geom, 1) for geom in _as_shapely_geometries(geometries) if not geom.is_empty
+    empty_geoms = [
+        geom for geom in _as_shapely_geometries(geometries) if not geom.is_empty
     ]
+    if _grid_is_lonlat_identity(crs):
+        shapes = [(geom, 1) for geom in empty_geoms]
+    else:
+        import pyproj
+        import shapely.ops
+
+        transformer = pyproj.Transformer.from_crs(
+            "EPSG:4326", pyproj.CRS.from_user_input(crs), always_xy=True
+        )
+        shapes = [
+            (shapely.ops.transform(transformer.transform, geom), 1)
+            for geom in empty_geoms
+        ]
     out = np.asarray(
         rio_features.rasterize(
             shapes,

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -67,6 +67,7 @@ from faninsar.query import BoundingBox
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from faninsar.processing.merge.grid import GeoGridSpec as GeoGridSpecType
 
@@ -432,7 +433,8 @@ class TestFormationWiring:
 
 
 # ---------------------------------------------------------------------------
-# Item 19 — mask_resolution_m consumption (override-grid rasterization)
+# Item 19 — the automatic water mask resolves through the manager only
+# (the mask grid is always the DEM grid; no resolution override)
 # ---------------------------------------------------------------------------
 
 
@@ -477,57 +479,93 @@ def _install_fake_manager(
     monkeypatch.setattr(MaskManager, "get_water_layer", fake_fetch)
 
 
-class TestMaskResolutionOverrideGrid:
-    """``mask_resolution_m`` builds the override mask grid (D2 consumption)."""
+class TestAutoWaterMaskManagerOnly:
+    """The mask grid is always the DEM grid via the masking manager."""
 
-    def test_rasterizes_buffered_water_onto_override_grid(
+    ROI = BoundingBox(11.0, 45.99, 11.018, 46.0)
+
+    def test_without_dem_mosaic_path_degrades(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The automatic mask product lands under work_dir with provenance."""
+        """No DEM mosaic path means no mask grid: the run degrades (warning)."""
         layer_path = _write_vector_layer(
             tmp_path / "layer.geojson", (11.0, 45.99, 11.005, 46.0)
         )
         _install_fake_manager(monkeypatch, tmp_path, layer_path)
         stack = _offline_stack(
             tmp_path,
-            roi=BoundingBox(11.0, 45.99, 11.018, 46.0),
+            roi=self.ROI,
             geo_grid=GEO_GRID,
-            mask_buffer_km=0.0,
-            mask_resolution_m=200.0,
         )
 
         sampler, record = stack._product_mask_resolution()
 
-        assert isinstance(sampler, RasterMask)
-        product = Path(str(record["mask_asset"]))
-        assert product == stack.config.work_dir / "mask" / "water_mask.tif"
-        assert product.is_file()
-        assert record["mask"] == "present"
-        assert record["mask_product"] == "water"
-        assert record["mask_provider"] == "gsw"
-        assert record["mask_threshold"] == 50
-        assert record["mask_buffer_km"] == pytest.approx(0.0)
-        # The D1 ROI subtraction keeps the right (unmasked) half: the run
-        # never hits the structural empty-effective-ROI guard.
-        assert record["mask_resolution_m"] == pytest.approx(200.0)
-        assert record["mask_identity"] == "testidentity"
+        assert sampler is None
+        assert record["mask"] == "absent"
+        assert "DEM mosaic grid" in str(record["reason"])
 
-        import rasterio
+    def test_without_dem_mosaic_path_fails_closed_under_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``mask_on_failure='error'`` fails closed without a mask grid."""
+        from faninsar.processing.errors import InvalidProcessingStateError
 
-        with rasterio.open(product) as dataset:
-            assert dataset.crs.to_epsg() == 4326
-            tags = dataset.tags()
-        assert tags["mask_product"] == "water"
-        assert tags["mask_identity"] == "testidentity"
-
-        # The product feeds the IFG seam: the water half is removed on the
-        # override grid sampled onto the geo IFG grid.
-        plane = stack._ifg_mask_plane(
-            domain="geo", looks=(1, 1), expected_shape=GEO_GRID.shape
+        layer_path = _write_vector_layer(
+            tmp_path / "layer.geojson", (11.0, 45.99, 11.005, 46.0)
         )
-        assert plane is not None
-        assert plane[:, :2].all()
-        assert not plane[:, 2:].any()
+        _install_fake_manager(monkeypatch, tmp_path, layer_path)
+        stack = _offline_stack(
+            tmp_path,
+            roi=self.ROI,
+            geo_grid=GEO_GRID,
+            mask_on_failure="error",
+        )
+
+        with pytest.raises(InvalidProcessingStateError, match="DEM mosaic"):
+            stack._product_mask_resolution()
+
+    def test_resolves_through_manager_on_the_dem_grid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The manager's new consume signature owns the DEM-grid rasterize."""
+        layer_path = _write_vector_layer(
+            tmp_path / "layer.geojson", (11.0, 45.99, 11.005, 46.0)
+        )
+        _install_fake_manager(monkeypatch, tmp_path, layer_path)
+        dem_path = tmp_path / "dem.tif"
+        dem_path.write_bytes(b"dem")  # existence gates the manager path
+        stack = _offline_stack(
+            tmp_path,
+            roi=self.ROI,
+            geo_grid=GEO_GRID,
+        )
+        stack.config.dem = SimpleNamespace(path=str(dem_path))
+
+        seen: dict[str, object] = {}
+
+        def fake_resolve(
+            self: MaskManager,
+            roi_bounds: object,
+            *,
+            dem_path: Path,
+            output_dir: Path,
+        ) -> Path:
+            # Manager-owned signature: no buffer kwarg is forwarded anymore.
+            del self, roi_bounds
+            seen["dem_path"] = dem_path
+            seen["output_dir"] = output_dir
+            return dem_path
+
+        monkeypatch.setattr(MaskManager, "resolve_auto_mask", fake_resolve)
+
+        sampler, record = stack._product_mask_resolution()
+
+        assert isinstance(sampler, RasterMask)
+        assert record["mask"] == "present"
+        assert record["mask_asset"] == str(dem_path)
+        assert record["buffer_km"] == pytest.approx(1.0)
+        assert seen["dem_path"] == str(dem_path)
+        assert seen["output_dir"] == stack.config.work_dir
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1110,11 @@ class TestIonosphereOptIn:
 
 def test_stack_config_mask_surface_unchanged(tmp_path: Path) -> None:
     """The D2 work builds on the D1 mask surface verbatim."""
+    import dataclasses
+
     config = StackConfig(work_dir=tmp_path, activation_mode="reference")
     assert config.mask == "water"
     assert config.mask_apply_ionosphere is False
-    assert config.mask_resolution_m is None
+    field_names = {field.name for field in dataclasses.fields(StackConfig)}
+    assert "mask_buffer_km" not in field_names
+    assert "mask_resolution_m" not in field_names

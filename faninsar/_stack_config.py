@@ -145,10 +145,6 @@ def run(
         "retain_pair_states",
         "record_scientific_lineage",
         "mask_source",
-        "mask_buffer_km",
-        "mask_resolution_m",
-        "ocean_water_buffer_km",
-        "inland_water_buffer_km",
         "mask_on_failure",
         "mask_apply_ionosphere",
     ):

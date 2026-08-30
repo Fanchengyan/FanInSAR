@@ -489,6 +489,41 @@ class TestWaterExtractionAndVectorize:
 
 
 # ---------------------------------------------------------------------------
+# 13b. Manager-owned buffer (buffer ownership moved to the water pipeline)
+# ---------------------------------------------------------------------------
+
+
+class TestManagerBufferField:
+    """``MaskManager.buffer_km`` owns the land buffer (default/validation)."""
+
+    def test_default_and_validation(self, tmp_path: Path) -> None:
+        """Default 1.0; negative and NaN rejected fail-closed; 0 admitted."""
+        manager = MaskManager(tmp_path)
+        assert manager.buffer_km == 1.0
+        with pytest.raises(ValueError, match="buffer_km"):
+            MaskManager(tmp_path, buffer_km=-0.5)
+        with pytest.raises(ValueError, match="buffer_km"):
+            MaskManager(tmp_path, buffer_km=float("nan"))
+        zero = MaskManager(tmp_path, buffer_km=0.0)
+        assert zero.buffer_km == 0.0
+
+    def test_resolve_auto_mask_uses_the_manager_buffer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The padded band, buffer, and provenance tag derive from buffer_km."""
+        _seed_single_tile(tmp_path, monkeypatch, head_headers={"ETag": '"lake-v2"'})
+        dem_path = _write_dem(tmp_path / "dem.tif")
+        manager = MaskManager(tmp_path / "cache", buffer_km=2.0)
+
+        out = manager.resolve_auto_mask(
+            ROI, dem_path=dem_path, output_dir=tmp_path / "run"
+        )
+        assert out is not None
+        with rasterio.open(out) as dataset:
+            assert dataset.tags()["mask_buffer_km"] == "2.0"
+
+
+# ---------------------------------------------------------------------------
 # 14. Cache identity digest
 # ---------------------------------------------------------------------------
 
@@ -516,9 +551,7 @@ class TestCacheIdentity:
     ) -> None:
         """Quoted and weak-quoted ETags normalize to the same identity."""
         url = _gsw_url(100, 30)
-        _seed_single_tile(
-            tmp_path, monkeypatch, head_headers={"ETag": '"abc123"'}
-        )
+        _seed_single_tile(tmp_path, monkeypatch, head_headers={"ETag": '"abc123"'})
         manager = MaskManager(tmp_path / "cache")
         quoted = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
         assert quoted.source_version == "abc123"
@@ -680,13 +713,11 @@ class TestOnFailurePolicies:
         strict = MaskManager(tmp_path / "cache", on_failure="error")
         with pytest.raises(MaskProviderUnavailableError):
             strict.resolve_auto_mask(
-                ROI, dem_path=dem_path, buffer_km=1.0, output_dir=tmp_path / "run"
+                ROI, dem_path=dem_path, output_dir=tmp_path / "run"
             )
         quiet = MaskManager(tmp_path / "cache", on_failure="skip")
         assert (
-            quiet.resolve_auto_mask(
-                ROI, dem_path=dem_path, buffer_km=1.0, output_dir=tmp_path / "run"
-            )
+            quiet.resolve_auto_mask(ROI, dem_path=dem_path, output_dir=tmp_path / "run")
             is None
         )
 
@@ -703,14 +734,12 @@ class TestResolveAutoMask:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Buffered vector rasterizes exactly onto the DEM grid (uint8 0/1/255)."""
-        _seed_single_tile(
-            tmp_path, monkeypatch, head_headers={"ETag": '"lake-v1"'}
-        )
+        _seed_single_tile(tmp_path, monkeypatch, head_headers={"ETag": '"lake-v1"'})
         dem_path = _write_dem(tmp_path / "dem.tif")
         manager = MaskManager(tmp_path / "cache")
 
         out = manager.resolve_auto_mask(
-            ROI, dem_path=dem_path, buffer_km=1.0, output_dir=tmp_path / "run"
+            ROI, dem_path=dem_path, output_dir=tmp_path / "run"
         )
         assert out == tmp_path / "run" / "mask" / "water_mask.tif"
         with rasterio.open(dem_path) as dem_ds:
@@ -754,10 +783,10 @@ class TestResolveAutoMask:
         monkeypatch.setattr(mm, "rasterize_to_grid", counting)
 
         first = manager.resolve_auto_mask(
-            ROI, dem_path=dem_path, buffer_km=1.0, output_dir=tmp_path / "run1"
+            ROI, dem_path=dem_path, output_dir=tmp_path / "run1"
         )
         second = manager.resolve_auto_mask(
-            ROI, dem_path=dem_path, buffer_km=1.0, output_dir=tmp_path / "run2"
+            ROI, dem_path=dem_path, output_dir=tmp_path / "run2"
         )
         assert calls["n"] == 1
         assert first is not None
@@ -766,9 +795,8 @@ class TestResolveAutoMask:
             assert np.array_equal(a.read(1), b.read(1))
 
         # A different buffer is a different cache key: it re-rasterizes once.
-        manager.resolve_auto_mask(
-            ROI, dem_path=dem_path, buffer_km=2.0, output_dir=tmp_path / "run3"
-        )
+        wider = MaskManager(tmp_path / "cache", buffer_km=2.0)
+        wider.resolve_auto_mask(ROI, dem_path=dem_path, output_dir=tmp_path / "run3")
         assert calls["n"] == 2
 
     @pytest.mark.parametrize(
@@ -790,10 +818,24 @@ class TestResolveAutoMask:
             manager.resolve_auto_mask(
                 bad_bounds,
                 dem_path=dem_path,
-                buffer_km=1.0,
                 output_dir=tmp_path / "run",
             )
         assert fake.calls == []
+
+    def test_module_level_buffer_km_defers_to_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Module-level ``buffer_km=None`` reads ``FANINSAR_MASK_BUFFER_KM``."""
+        _seed_single_tile(tmp_path, monkeypatch, head_headers={"ETag": '"lake-v3"'})
+        dem_path = _write_dem(tmp_path / "dem.tif")
+        monkeypatch.setenv("FANINSAR_MASK_CACHE_DIR", str(tmp_path / "cache"))
+        monkeypatch.setenv("FANINSAR_MASK_BUFFER_KM", "2.0")
+
+        out = resolve_auto_mask(ROI, dem_path=dem_path, output_dir=tmp_path / "run")
+
+        assert out is not None
+        with rasterio.open(out) as dataset:
+            assert dataset.tags()["mask_buffer_km"] == "2.0"
 
 
 # ---------------------------------------------------------------------------
@@ -808,9 +850,7 @@ class TestGeojsonAtomicWrite:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """layer.geojson + provenance.json are atomic; no tmp/part leftovers."""
-        fake = _seed_single_tile(
-            tmp_path, monkeypatch, head_headers={"ETag": '"v9"'}
-        )
+        fake = _seed_single_tile(tmp_path, monkeypatch, head_headers={"ETag": '"v9"'})
         manager = MaskManager(tmp_path / "cache")
         layer = manager.get_water_layer((100.2, 38.2, 100.8, 38.8))
 
@@ -875,6 +915,30 @@ class TestGetMaskManagerEnvironment:
         assert get_mask_manager().provider == "worldcover"
         assert get_mask_manager(source="gsw").provider == "gsw"
 
+    def test_buffer_km_env_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``FANINSAR_MASK_BUFFER_KM`` feeds buffer_km; an explicit kwarg wins."""
+        monkeypatch.setenv("FANINSAR_MASK_CACHE_DIR", str(tmp_path))
+        monkeypatch.delenv("FANINSAR_MASK_BUFFER_KM", raising=False)
+        assert get_mask_manager().buffer_km == 1.0
+
+        monkeypatch.setenv("FANINSAR_MASK_BUFFER_KM", "2.5")
+        assert get_mask_manager().buffer_km == 2.5
+        assert get_mask_manager(buffer_km=0.5).buffer_km == 0.5
+
+    def test_buffer_km_env_must_be_a_non_negative_number(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Garbage and negative buffer overrides fail closed."""
+        monkeypatch.setenv("FANINSAR_MASK_CACHE_DIR", str(tmp_path))
+        monkeypatch.setenv("FANINSAR_MASK_BUFFER_KM", "not-a-number")
+        with pytest.raises(ValueError, match="FANINSAR_MASK_BUFFER_KM"):
+            get_mask_manager()
+        monkeypatch.setenv("FANINSAR_MASK_BUFFER_KM", "-1.0")
+        with pytest.raises(ValueError, match="buffer_km"):
+            get_mask_manager()
+
     def test_source_url_must_be_https(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Plain-http mirror URLs are rejected fail-closed."""
         monkeypatch.setenv("FANINSAR_MASK_CACHE_DIR", "/tmp/mask-cache")
@@ -882,12 +946,12 @@ class TestGetMaskManagerEnvironment:
         with pytest.raises(InvalidProcessingStateError, match="https"):
             get_mask_manager()
 
-    def test_source_url_rejects_userinfo(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_source_url_rejects_userinfo(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """user:pass@host mirror URLs are rejected at runtime (fail closed)."""
         monkeypatch.setenv("FANINSAR_MASK_CACHE_DIR", "/tmp/mask-cache")
-        monkeypatch.setenv("FANINSAR_MASK_SOURCE_URL", "https://user:pass@mirror.test/gsw")
+        monkeypatch.setenv(
+            "FANINSAR_MASK_SOURCE_URL", "https://user:pass@mirror.test/gsw"
+        )
         with pytest.raises(InvalidProcessingStateError, match="credential"):
             get_mask_manager()
 

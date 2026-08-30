@@ -21,6 +21,7 @@ vector layer. No real Stack runs, no network.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -100,13 +101,15 @@ def _install_manager(
     *,
     layer_path: Path,
     on_failure: str = "warning",
+    buffer_km: float = 1.0,
     get_water_layer: Callable[..., WaterLayer] | None = None,
 ) -> list[tuple[str | None, str]]:
     """Route session mask resolution to an offline fake manager.
 
     Returns the recorded ``(source, on_failure)`` factory calls. The fake
     ``get_water_layer`` serves ``layer_path`` (or the provided callable), so
-    the real fetch/vectorize pipeline is never exercised.
+    the real fetch/vectorize pipeline is never exercised. ``buffer_km``
+    configures the manager-owned land buffer under test.
     """
     calls: list[tuple[str | None, str]] = []
 
@@ -118,6 +121,7 @@ def _install_manager(
             cache_dir=tmp_path / "mask-cache",
             source=source if source is not None else "water",
             on_failure=on_failure,  # type: ignore[arg-type]
+            buffer_km=buffer_km,
         )
 
     if get_water_layer is None:
@@ -158,12 +162,19 @@ class TestStackConfigMaskFields:
         config = StackConfig(work_dir=tmp_path, activation_mode="reference")
         assert config.mask == AUTO_WATER_MASK == "water"
         assert config.mask_source is None
-        assert config.mask_resolution_m is None
-        assert config.mask_buffer_km == 1.0
-        assert config.ocean_water_buffer_km is None
-        assert config.inland_water_buffer_km is None
         assert config.mask_on_failure == "warning"
         assert config.mask_apply_ionosphere is False
+
+    def test_dropped_buffer_and_resolution_fields_are_gone(self) -> None:
+        """Buffer and resolution ownership moved to the masking manager."""
+        names = {field.name for field in dataclasses.fields(StackConfig)}
+        for dropped in (
+            "mask_buffer_km",
+            "ocean_water_buffer_km",
+            "inland_water_buffer_km",
+            "mask_resolution_m",
+        ):
+            assert dropped not in names
 
     @pytest.mark.parametrize("disabled", [MASK_DISABLED, None], ids=["str", "none"])
     def test_mask_disabled_normalizes_to_none(
@@ -236,71 +247,6 @@ class TestStackConfigMaskFields:
         )
         assert config.mask_on_failure == policy
 
-    @pytest.mark.parametrize("buffer_km", [-1.0, float("nan")])
-    def test_mask_buffer_km_must_be_non_negative(
-        self, tmp_path: Path, buffer_km: float
-    ) -> None:
-        """Negative and NaN land buffers fail closed."""
-        with pytest.raises(ValueError, match="mask_buffer_km"):
-            StackConfig(
-                work_dir=tmp_path,
-                activation_mode="reference",
-                mask_buffer_km=buffer_km,
-            )
-
-    def test_mask_buffer_km_zero_is_admitted(self, tmp_path: Path) -> None:
-        """``buffer_km=0`` is the documented identity buffer."""
-        config = StackConfig(
-            work_dir=tmp_path,
-            activation_mode="reference",
-            mask_buffer_km=0.0,
-        )
-        assert config.mask_buffer_km == 0.0
-
-    def test_dual_buffers_must_be_configured_together(self, tmp_path: Path) -> None:
-        """Dual ocean/inland buffers are both-or-neither."""
-        with pytest.raises(ValueError, match="together"):
-            StackConfig(
-                work_dir=tmp_path,
-                activation_mode="reference",
-                ocean_water_buffer_km=2.0,
-            )
-        with pytest.raises(ValueError, match="together"):
-            StackConfig(
-                work_dir=tmp_path,
-                activation_mode="reference",
-                inland_water_buffer_km=2.0,
-            )
-
-    @pytest.mark.parametrize(
-        ("ocean", "inland"),
-        [(1.0, 1.0), (1.0, 2.0), (0.0, 0.0)],
-    )
-    def test_dual_buffers_admitted_when_paired(
-        self, tmp_path: Path, ocean: float, inland: float
-    ) -> None:
-        """Paired buffers (equal or differing) are admitted by the config."""
-        config = StackConfig(
-            work_dir=tmp_path,
-            activation_mode="reference",
-            ocean_water_buffer_km=ocean,
-            inland_water_buffer_km=inland,
-        )
-        assert config.ocean_water_buffer_km == ocean
-        assert config.inland_water_buffer_km == inland
-
-    @pytest.mark.parametrize("resolution_m", [0.0, -30.0, float("nan")])
-    def test_mask_resolution_m_must_be_positive_or_none(
-        self, tmp_path: Path, resolution_m: float
-    ) -> None:
-        """A resolution override must be positive or explicitly None."""
-        with pytest.raises(ValueError, match="mask_resolution_m"):
-            StackConfig(
-                work_dir=tmp_path,
-                activation_mode="reference",
-                mask_resolution_m=resolution_m,
-            )
-
 
 # ---------------------------------------------------------------------------
 # run(config) keys (TDD-plan item 18)
@@ -357,10 +303,6 @@ class TestRunConfigMaskKeys:
             _run_config(
                 mask="water",
                 mask_source="water:worldcover",
-                mask_buffer_km=2.0,
-                mask_resolution_m=30.0,
-                ocean_water_buffer_km=1.0,
-                inland_water_buffer_km=1.0,
                 mask_on_failure="error",
                 mask_apply_ionosphere=True,
             )
@@ -368,12 +310,31 @@ class TestRunConfigMaskKeys:
         captured = _RecordingStack.captured
         assert captured["mask"] == "water"
         assert captured["mask_source"] == "water:worldcover"
-        assert captured["mask_buffer_km"] == 2.0
-        assert captured["mask_resolution_m"] == 30.0
-        assert captured["ocean_water_buffer_km"] == 1.0
-        assert captured["inland_water_buffer_km"] == 1.0
         assert captured["mask_on_failure"] == "error"
         assert captured["mask_apply_ionosphere"] is True
+
+    def test_dropped_buffer_and_resolution_keys_are_not_forwarded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Removed buffer/resolution keys no longer reach Stack construction."""
+        monkeypatch.setattr(stack_package, "Stack", _RecordingStack)
+        from faninsar._stack_config import run
+
+        run(
+            _run_config(
+                mask_buffer_km=2.0,
+                mask_resolution_m=30.0,
+                inland_water_buffer_km=1.0,
+            )
+        )
+        captured = _RecordingStack.captured
+        for dropped in (
+            "mask_buffer_km",
+            "mask_resolution_m",
+            "ocean_water_buffer_km",
+            "inland_water_buffer_km",
+        ):
+            assert dropped not in captured
 
     def test_mask_none_normalizes_to_none(
         self, monkeypatch: pytest.MonkeyPatch
@@ -409,15 +370,12 @@ class TestResolveEffectiveRoi:
     ) -> None:
         """Land beyond the buffered water is kept; water is removed."""
         layer_path = _write_vector_layer(tmp_path / "layer.geojson", WATER_LEFT)
-        _install_manager(monkeypatch, tmp_path, layer_path=layer_path)
+        _install_manager(monkeypatch, tmp_path, layer_path=layer_path, buffer_km=0.1)
 
         result = _resolve_effective_roi(
             ROI,
             mask=AUTO_WATER_MASK,
             mask_source=None,
-            mask_buffer_km=0.1,
-            ocean_water_buffer_km=None,
-            inland_water_buffer_km=None,
             mask_on_failure="warning",
         )
 
@@ -439,15 +397,12 @@ class TestResolveEffectiveRoi:
         from faninsar.query import Polygons
 
         layer_path = _write_vector_layer(tmp_path / "layer.geojson", WATER_LEFT)
-        _install_manager(monkeypatch, tmp_path, layer_path=layer_path)
+        _install_manager(monkeypatch, tmp_path, layer_path=layer_path, buffer_km=0.1)
 
         result = _resolve_effective_roi(
             ROI,
             mask=AUTO_WATER_MASK,
             mask_source=None,
-            mask_buffer_km=0.1,
-            ocean_water_buffer_km=None,
-            inland_water_buffer_km=None,
             mask_on_failure="warning",
         )
 
@@ -464,16 +419,13 @@ class TestResolveEffectiveRoi:
         layer_path = _write_vector_layer(
             tmp_path / "layer.geojson", (0.0, 0.0, 2.0, 1.0)
         )
-        _install_manager(monkeypatch, tmp_path, layer_path=layer_path)
+        _install_manager(monkeypatch, tmp_path, layer_path=layer_path, buffer_km=0.1)
 
         with pytest.raises(InvalidProcessingStateError, match="empty"):
             _resolve_effective_roi(
                 ROI,
                 mask=AUTO_WATER_MASK,
                 mask_source=None,
-                mask_buffer_km=0.1,
-                ocean_water_buffer_km=None,
-                inland_water_buffer_km=None,
                 mask_on_failure=policy,  # type: ignore[arg-type]
             )
 
@@ -499,9 +451,6 @@ class TestResolveEffectiveRoi:
                 BoundingBox(170.0, 8.0, 179.5, 10.0),
                 mask=AUTO_WATER_MASK,
                 mask_source=None,
-                mask_buffer_km=1.0,
-                ocean_water_buffer_km=None,
-                inland_water_buffer_km=None,
                 mask_on_failure="warning",
             )
 
@@ -511,9 +460,6 @@ class TestResolveEffectiveRoi:
             ROI,
             mask=None,
             mask_source=None,
-            mask_buffer_km=1.0,
-            ocean_water_buffer_km=None,
-            inland_water_buffer_km=None,
             mask_on_failure="warning",
         )
         assert result.roi is ROI
@@ -526,9 +472,6 @@ class TestResolveEffectiveRoi:
             BoundingBox(170.0, 8.0, 179.5, 10.0),
             mask=None,
             mask_source=None,
-            mask_buffer_km=1.0,
-            ocean_water_buffer_km=None,
-            inland_water_buffer_km=None,
             mask_on_failure="warning",
         )
         assert result.roi is not None
@@ -545,9 +488,6 @@ class TestResolveEffectiveRoi:
             None,
             mask=AUTO_WATER_MASK,
             mask_source=None,
-            mask_buffer_km=1.0,
-            ocean_water_buffer_km=None,
-            inland_water_buffer_km=None,
             mask_on_failure="warning",
         )
         assert result.roi is None
@@ -572,9 +512,6 @@ class TestResolveEffectiveRoi:
             ROI,
             mask=AUTO_WATER_MASK,
             mask_source=None,
-            mask_buffer_km=1.0,
-            ocean_water_buffer_km=None,
-            inland_water_buffer_km=None,
             mask_on_failure=policy,  # type: ignore[arg-type]
         )
         assert result.roi is ROI  # degraded to the unmasked ROI
@@ -603,9 +540,6 @@ class TestResolveEffectiveRoi:
                 ROI,
                 mask=AUTO_WATER_MASK,
                 mask_source=None,
-                mask_buffer_km=1.0,
-                ocean_water_buffer_km=None,
-                inland_water_buffer_km=None,
                 mask_on_failure="error",
             )
 
@@ -620,9 +554,6 @@ class TestResolveEffectiveRoi:
             ROI,
             mask=AUTO_WATER_MASK,
             mask_source=None,
-            mask_buffer_km=1.0,
-            ocean_water_buffer_km=None,
-            inland_water_buffer_km=None,
             mask_on_failure="warning",
         )
         assert result.roi is ROI
@@ -643,9 +574,6 @@ class TestResolveEffectiveRoi:
                 ROI,
                 mask=AUTO_WATER_MASK,
                 mask_source=None,
-                mask_buffer_km=1.0,
-                ocean_water_buffer_km=None,
-                inland_water_buffer_km=None,
                 mask_on_failure="error",
             )
 
@@ -654,60 +582,18 @@ class TestResolveEffectiveRoi:
     ) -> None:
         """A resolved mask records identity, version, and buffer in lineage."""
         layer_path = _write_vector_layer(tmp_path / "layer.geojson", WATER_LEFT)
-        _install_manager(monkeypatch, tmp_path, layer_path=layer_path)
+        _install_manager(monkeypatch, tmp_path, layer_path=layer_path, buffer_km=0.1)
 
         result = _resolve_effective_roi(
             ROI,
             mask=AUTO_WATER_MASK,
             mask_source=None,
-            mask_buffer_km=0.1,
-            ocean_water_buffer_km=None,
-            inland_water_buffer_km=None,
             mask_on_failure="warning",
         )
         assert result.lineage["mask"] == "present"
         assert result.lineage["mask_identity"] == "testidentity"
         assert result.lineage["mask_source_version"] == "test-version"
-        assert result.lineage["mask_buffer_km"] == pytest.approx(0.1)
-
-    def test_dual_equal_buffers_collapse_to_one_land_buffer(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Equal ocean/inland buffers collapse to one land buffer."""
-        layer_path = _write_vector_layer(tmp_path / "layer.geojson", WATER_LEFT)
-        _install_manager(monkeypatch, tmp_path, layer_path=layer_path)
-
-        result = _resolve_effective_roi(
-            ROI,
-            mask=AUTO_WATER_MASK,
-            mask_source=None,
-            mask_buffer_km=1.0,
-            ocean_water_buffer_km=2.0,
-            inland_water_buffer_km=2.0,
-            mask_on_failure="warning",
-        )
-        assert result.lineage["mask_buffer_km"] == pytest.approx(2.0)
-
-    def test_dual_differing_buffers_fail_closed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Differing buffers need the (unwired) connectivity classification."""
-        from faninsar.processing.errors import InvalidProcessingStateError
-
-        layer_path = _write_vector_layer(tmp_path / "layer.geojson", WATER_LEFT)
-        calls = _install_manager(monkeypatch, tmp_path, layer_path=layer_path)
-
-        with pytest.raises(InvalidProcessingStateError, match="connectivity"):
-            _resolve_effective_roi(
-                ROI,
-                mask=AUTO_WATER_MASK,
-                mask_source=None,
-                mask_buffer_km=1.0,
-                ocean_water_buffer_km=1.0,
-                inland_water_buffer_km=3.0,
-                mask_on_failure="warning",
-            )
-        assert calls == []  # structural guard fires before manager resolution
+        assert result.lineage["buffer_km"] == pytest.approx(0.1)
 
     def test_user_sampler_defers_to_product_level(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -720,9 +606,6 @@ class TestResolveEffectiveRoi:
             ROI,
             mask=_SamplerStub(),
             mask_source=None,
-            mask_buffer_km=1.0,
-            ocean_water_buffer_km=None,
-            inland_water_buffer_km=None,
             mask_on_failure="warning",
         )
         assert result.roi is ROI
@@ -740,9 +623,6 @@ class TestResolveEffectiveRoi:
             ROI,
             mask=AUTO_WATER_MASK,
             mask_source="water:worldcover",
-            mask_buffer_km=1.0,
-            ocean_water_buffer_km=None,
-            inland_water_buffer_km=None,
             mask_on_failure="error",
         )
         assert calls == [("water:worldcover", "error")]
@@ -777,9 +657,8 @@ class TestSessionWiring:
     ) -> None:
         """``_burst_kwargs`` passes the subtracted ROI to pair production."""
         layer_path = _write_vector_layer(tmp_path / "layer.geojson", WATER_LEFT)
-        _install_manager(monkeypatch, tmp_path, layer_path=layer_path)
+        _install_manager(monkeypatch, tmp_path, layer_path=layer_path, buffer_km=0.1)
         stack = _offline_stack(tmp_path, BoundingBox(0.0, 0.0, 2.0, 1.0))
-        stack.config.mask_buffer_km = 0.1
 
         kwargs = stack._burst_kwargs()
 

@@ -105,6 +105,7 @@ logger = setup_logger(__name__)
 
 __all__ = [
     "DEFAULT_MASK_NAME",
+    "MASK_BUFFER_ENV",
     "MASK_CACHE_ENV",
     "MASK_SOURCE_ENV",
     "MASK_SOURCE_URL_ENV",
@@ -123,6 +124,8 @@ MASK_CACHE_ENV = "FANINSAR_MASK_CACHE_DIR"
 MASK_SOURCE_ENV = "FANINSAR_MASK_SOURCE"
 #: Base-URL override for the selected source (https enforced, no userinfo).
 MASK_SOURCE_URL_ENV = "FANINSAR_MASK_SOURCE_URL"
+#: Land-buffer width override in kilometres (``MaskManager.buffer_km``).
+MASK_BUFFER_ENV = "FANINSAR_MASK_BUFFER_KM"
 #: Output file name under ``<output_dir>/mask/``.
 DEFAULT_MASK_NAME = "water_mask.tif"
 #: Explicit version recorded when the transport carries no validator.
@@ -459,6 +462,11 @@ class MaskManager:
         provider is unavailable (PROPOSAL-0039 failure contract). The class
         default ``error`` is for explicit user masks; Stack automation
         passes ``warning``.
+    buffer_km : float
+        Land-buffer width in kilometres owned by the water pipeline (default
+        1.0; ``get_mask_manager`` overrides it from
+        ``FANINSAR_MASK_BUFFER_KM``). The padded fetch band, the UTM planar
+        buffer, and the raster-cache key all derive from this single value.
     threshold : float, optional
         Occurrence threshold override; ``None`` resolves the source default
         (GSW 50).
@@ -494,6 +502,7 @@ class MaskManager:
     cache_dir: Path
     source: str | None = None
     on_failure: FailurePolicy = "error"
+    buffer_km: float = 1.0
     threshold: float | None = None
     excluded_values: frozenset[int] | None = None
     invert: bool = False
@@ -505,8 +514,13 @@ class MaskManager:
     source_entry: MaskSource = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Resolve the selection and apply the base override (fail closed)."""
+        """Resolve the selection, validate the buffer, apply the override."""
         self.cache_dir = Path(self.cache_dir)
+        if not float(self.buffer_km) >= 0.0:
+            message = f"buffer_km must be a number >= 0; got {self.buffer_km!r}"
+            logger.error(message)
+            raise ValueError(message)
+        self.buffer_km = float(self.buffer_km)
         if self.on_failure not in _ON_FAILURE_POLICIES:
             message = (
                 f"invalid on_failure policy {self.on_failure!r}: expected one "
@@ -604,9 +618,7 @@ class MaskManager:
             "plan_url": getattr(entry, "base_url", "") or "",
             "source_version": version,
             "threshold": self.effective_threshold,
-            "excluded_values": sorted(
-                int(v) for v in self.effective_excluded_values
-            ),
+            "excluded_values": sorted(int(v) for v in self.effective_excluded_values),
             "invert": bool(self.invert),
             "simplify_tolerance_m": float(self.simplify_tolerance_m),
             "min_area_km2": float(self.min_area_km2),
@@ -802,9 +814,7 @@ class MaskManager:
         if threshold is not None:
             matched = np.asarray(values, dtype=np.float64) >= float(threshold)
         elif excluded:
-            matched = np.isin(
-                values, np.asarray(sorted(excluded), dtype=values.dtype)
-            )
+            matched = np.isin(values, np.asarray(sorted(excluded), dtype=values.dtype))
         else:
             matched = np.asarray(values) != 0
         if self.invert:
@@ -858,9 +868,7 @@ class MaskManager:
         parts = list(getattr(simplified, "geoms", ()) or (simplified,))
         min_area_m2 = float(self.min_area_km2) * 1e6
         kept = [
-            part
-            for part in parts
-            if not part.is_empty and part.area >= min_area_m2
+            part for part in parts if not part.is_empty and part.area >= min_area_m2
         ]
         if not kept:
             return Polygon()
@@ -981,7 +989,6 @@ class MaskManager:
         roi_bounds: Bounds,
         *,
         dem_path: str | Path,
-        buffer_km: float = 1.0,
         output_dir: str | Path,
     ) -> Path | None:
         """Resolve the buffered binary water mask onto the DEM mosaic grid.
@@ -992,7 +999,7 @@ class MaskManager:
         255 = invalid where the DEM has no data), written under
         ``<output_dir>/mask/`` with provenance tags. The rasterized mask is
         cached under ``<product>-<provider>/rasters/<identity>/`` keyed by
-        (vector-layer digest, buffer_km, grid + DEM data mask), so an
+        (vector-layer digest, :attr:`buffer_km`, grid + DEM data mask), so an
         unchanged configuration never re-rasterizes. The antimeridian seam
         guard runs on the raw ROI bounds with the padded band BEFORE any
         fetch.
@@ -1005,8 +1012,6 @@ class MaskManager:
         dem_path : path
             The DEM mosaic GeoTIFF whose transform/shape define the target
             grid (EPSG:4326; other CRS fail closed in v1).
-        buffer_km : float
-            Land buffer width in kilometres (default 1.0).
         output_dir : path
             Run output directory receiving ``mask/<DEFAULT_MASK_NAME>``.
 
@@ -1029,12 +1034,11 @@ class MaskManager:
         import rasterio
 
         entry = self.source_entry
+        buffer_km = float(self.buffer_km)
         raw = _bounds_tuple(roi_bounds)
         zone_lon = (raw[0] + raw[2]) / 2.0
         zone_lat = (raw[1] + raw[3]) / 2.0
-        padded = padded_fetch_band(
-            raw, float(buffer_km), zone_lon=zone_lon, zone_lat=zone_lat
-        )
+        padded = padded_fetch_band(raw, buffer_km, zone_lon=zone_lon, zone_lat=zone_lat)
         band = snap_band(padded, entry.tile_size_deg)
         self._guard_seam(raw, band)
 
@@ -1060,7 +1064,6 @@ class MaskManager:
                 raise
             return self._continue_without_mask()
 
-        buffer_km = float(buffer_km)
         raster_key = _raster_cache_key(buffer_km, transform, grid_shape, crs, validity)
         cached = self.partition_dir / "rasters" / layer.identity / f"{raster_key}.tif"
         if cached.is_file():
@@ -1106,8 +1109,7 @@ class MaskManager:
             )
             return
         logger.debug(
-            "water mask unavailable (%s@%s); skipping silently "
-            "(on_failure=skip)",
+            "water mask unavailable (%s@%s); skipping silently (on_failure=skip)",
             entry.product,
             entry.provider,
         )
@@ -1125,15 +1127,20 @@ class MaskManager:
 
 
 def get_mask_manager(
-    *, source: str | None = None, on_failure: FailurePolicy = "error"
+    *,
+    source: str | None = None,
+    on_failure: FailurePolicy = "error",
+    buffer_km: float | None = None,
 ) -> MaskManager:
     """Return a MaskManager configured from environment variables.
 
     Reads ``FANINSAR_MASK_CACHE_DIR`` (required), ``FANINSAR_MASK_SOURCE``
-    (optional ``water`` / ``water:<provider>`` grammar), and
+    (optional ``water`` / ``water:<provider>`` grammar),
     ``FANINSAR_MASK_SOURCE_URL`` (https-enforced primary-base override;
     mirror URLs embedding userinfo ``user:pass@host`` are rejected
-    fail-closed at runtime).
+    fail-closed at runtime), and ``FANINSAR_MASK_BUFFER_KM`` (optional land
+    buffer in kilometres; must be >= 0, garbage or negative values fail
+    closed).
 
     Parameters
     ----------
@@ -1142,6 +1149,9 @@ def get_mask_manager(
         defers to the environment and then the ``water`` default.
     on_failure : "error", "warning", or "skip"
         Failure policy carried by the manager (class default ``error``).
+    buffer_km : float, optional
+        Explicit land-buffer width overriding ``FANINSAR_MASK_BUFFER_KM``;
+        ``None`` defers to the environment and then the 1.0 default.
 
     Returns
     -------
@@ -1153,6 +1163,9 @@ def get_mask_manager(
     InvalidProcessingStateError
         If ``FANINSAR_MASK_CACHE_DIR`` is unset or the URL override is not
         https / embeds credentials / is unsupported for the source shape.
+    ValueError
+        If the buffer override (explicit or environmental) is not a number
+        >= 0.
 
     """
     cache_dir = os.environ.get(MASK_CACHE_ENV)
@@ -1164,13 +1177,19 @@ def get_mask_manager(
         )
         logger.error(message)
         raise InvalidProcessingStateError(message)
-    selection = (
-        source if source is not None else os.environ.get(MASK_SOURCE_ENV)
-    )
+    selection = source if source is not None else os.environ.get(MASK_SOURCE_ENV)
+    raw_buffer = buffer_km if buffer_km is not None else os.environ.get(MASK_BUFFER_ENV)
+    try:
+        resolved_buffer = 1.0 if raw_buffer is None else float(raw_buffer)
+    except (TypeError, ValueError) as error:
+        message = f"{MASK_BUFFER_ENV} must be a number >= 0; got {raw_buffer!r}"
+        logger.exception(message)
+        raise ValueError(message) from error
     return MaskManager(
         cache_dir=Path(cache_dir),
         source=selection,
         on_failure=on_failure,
+        buffer_km=resolved_buffer,
         base_url=os.environ.get(MASK_SOURCE_URL_ENV),
     )
 
@@ -1180,18 +1199,18 @@ def resolve_auto_mask(
     *,
     dem_path: str | Path,
     output_dir: str | Path,
-    buffer_km: float = 1.0,
+    buffer_km: float | None = None,
     on_failure: FailurePolicy = "warning",
     **kwargs: object,
 ) -> Path | None:
     """Module-level automatic water-mask convenience (mirrors resolve_auto_dem).
 
     Builds the manager via :func:`get_mask_manager` (environment-driven,
-    with ``on_failure`` applied), resolves the buffered binary mask onto the
-    DEM grid, and lets the manager apply the failure policy: ``error``
-    raises :class:`MaskProviderUnavailableError`; ``warning`` logs loudly
-    (mask-absent) and returns ``None``; ``skip`` returns ``None`` silently.
-    The Stack default is ``warning``.
+    with ``on_failure`` and ``buffer_km`` applied), resolves the buffered
+    binary mask onto the DEM grid, and lets the manager apply the failure
+    policy: ``error`` raises :class:`MaskProviderUnavailableError`;
+    ``warning`` logs loudly (mask-absent) and returns ``None``; ``skip``
+    returns ``None`` silently. The Stack default is ``warning``.
 
     Parameters
     ----------
@@ -1201,8 +1220,9 @@ def resolve_auto_mask(
         The DEM mosaic GeoTIFF defining the target grid.
     output_dir : path
         Run output directory receiving ``mask/<DEFAULT_MASK_NAME>``.
-    buffer_km : float
-        Land buffer width in kilometres (default 1.0).
+    buffer_km : float, optional
+        Land buffer width in kilometres; ``None`` defers to
+        ``FANINSAR_MASK_BUFFER_KM`` and then the 1.0 default.
     on_failure : "error", "warning", or "skip"
         Failure policy (default ``warning``, the Stack convention).
     **kwargs
@@ -1219,9 +1239,11 @@ def resolve_auto_mask(
 
     """
     source = kwargs.pop("source", None)
-    manager = get_mask_manager(source=source, on_failure=on_failure)  # type: ignore[arg-type]
+    manager = get_mask_manager(
+        source=source,  # type: ignore[arg-type]
+        on_failure=on_failure,
+        buffer_km=buffer_km,
+    )
     if kwargs:
         manager = replace(manager, **kwargs)  # type: ignore[arg-type]
-    return manager.resolve_auto_mask(
-        bounds, dem_path=dem_path, buffer_km=buffer_km, output_dir=output_dir
-    )
+    return manager.resolve_auto_mask(bounds, dem_path=dem_path, output_dir=output_dir)

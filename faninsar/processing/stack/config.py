@@ -54,7 +54,10 @@ class StackConfig:
         default is the automatic water mask (resolved through the masking
         manager and subtracted from the ROI at burst-selection level), while
         ``mask=None`` explicitly disables masking and restores unmasked
-        processing.
+        processing. The water-pipeline buffer (``MaskManager.buffer_km``,
+        ``FANINSAR_MASK_BUFFER_KM``) and the mask grid (always the DEM grid
+        via the manager) are owned by the masking manager, not by
+        :class:`StackConfig`.
     """
 
     work_dir: Path
@@ -81,10 +84,6 @@ class StackConfig:
     # restores unmasked processing.
     mask: str | MaskSampler | None = AUTO_WATER_MASK
     mask_source: str | None = None
-    mask_resolution_m: float | None = None
-    mask_buffer_km: float = 1.0
-    ocean_water_buffer_km: float | None = None
-    inland_water_buffer_km: float | None = None
     mask_on_failure: MaskFailurePolicy = "warning"
     mask_apply_ionosphere: bool = False
     on_network_failure: OnNetworkFailure = "error"
@@ -197,47 +196,6 @@ class StackConfig:
             message = (
                 "mask_on_failure must be 'error', 'warning', or 'skip'; "
                 f"got {self.mask_on_failure!r}"
-            )
-            logger.error(message)
-            raise ValueError(message)
-        if not float(self.mask_buffer_km) >= 0.0:
-            message = f"mask_buffer_km must be >= 0; got {self.mask_buffer_km!r}"
-            logger.error(message)
-            raise ValueError(message)
-        self.mask_buffer_km = float(self.mask_buffer_km)
-        if (self.ocean_water_buffer_km is None) != (
-            self.inland_water_buffer_km is None
-        ):
-            message = (
-                "ocean_water_buffer_km and inland_water_buffer_km must be "
-                "configured together (dual buffers are both-or-neither)"
-            )
-            logger.error(message)
-            raise ValueError(message)
-        if self.ocean_water_buffer_km is not None:
-            if not float(self.ocean_water_buffer_km) >= 0.0:
-                message = (
-                    "ocean_water_buffer_km must be >= 0; "
-                    f"got {self.ocean_water_buffer_km!r}"
-                )
-                logger.error(message)
-                raise ValueError(message)
-            if not float(self.inland_water_buffer_km) >= 0.0:
-                message = (
-                    "inland_water_buffer_km must be >= 0; "
-                    f"got {self.inland_water_buffer_km!r}"
-                )
-                logger.error(message)
-                raise ValueError(message)
-            self.ocean_water_buffer_km = float(self.ocean_water_buffer_km)
-            self.inland_water_buffer_km = float(self.inland_water_buffer_km)
-        if (
-            self.mask_resolution_m is not None
-            and not float(self.mask_resolution_m) > 0.0
-        ):
-            message = (
-                "mask_resolution_m must be a positive number or None; "
-                f"got {self.mask_resolution_m!r}"
             )
             logger.error(message)
             raise ValueError(message)
