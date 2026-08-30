@@ -77,7 +77,7 @@ from faninsar.processing.unwrap.errors import UnwrapFailedError
 from faninsar.processing.unwrap.irls import SpatialIRLS
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
     from faninsar._core.device import GpuMemoryReclaim
     from faninsar.core.acquisition import Acquisition
@@ -778,9 +778,9 @@ class Stack(Network):
     _radar_projected_masks: dict[str, np.ndarray] = field(
         default_factory=dict, repr=False
     )
-    _radar_mask_identities: dict[
-        tuple[str, tuple[int, int], tuple[int, int]], str
-    ] = field(default_factory=dict, repr=False)
+    _radar_mask_identities: dict[tuple[str, tuple[int, int], tuple[int, int]], str] = (
+        field(default_factory=dict, repr=False)
+    )
 
     def __post_init__(self) -> None:
         """Initialize the inherited Network analysis surface lazily.
@@ -1115,9 +1115,7 @@ class Stack(Network):
                 target = GridSpec(
                     master["crs"], master["transform"], shape=tuple(master["shape"])
                 )
-            elif all(
-                hasattr(master, name) for name in ("crs", "transform", "shape")
-            ):
+            elif all(hasattr(master, name) for name in ("crs", "transform", "shape")):
                 target = GridSpec(master.crs, master.transform, shape=master.shape)
             else:
                 message = "radar mask projection master GridSpec is incomplete"
@@ -1414,9 +1412,7 @@ class Stack(Network):
         swath = getattr(getattr(scene, "swath", None), "swath", None)
         orbit_paths = self.config.extra.get("orbit_paths")
         orbit_path = (
-            orbit_paths.get(self.reference)
-            if isinstance(orbit_paths, dict)
-            else None
+            orbit_paths.get(self.reference) if isinstance(orbit_paths, dict) else None
         )
         return {
             "source_path": str(

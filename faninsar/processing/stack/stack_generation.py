@@ -278,6 +278,10 @@ def publish_unwrap_generation(
         Complete ordered Pair universe frozen by the Stack call.
     products : mapping[str, mapping[str, object]]
         Result layers for every Pair, stored below canonical Pair directories.
+    mask_plan_identity : str, optional
+        Identity of the canonical mask plan used for the result.
+    mask_identity : str, optional
+        Identity of the resolved mask product, when one was applied.
 
     Returns
     -------
@@ -438,8 +442,10 @@ def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
                     expected_shape = tuple(int(size) for size in descriptor["shape"])
                 except (TypeError, ValueError):
                     reject_invalid_state("Stack unwrap payload descriptor is invalid")
-                if expected_dtype.hasobject or not expected_shape or any(
-                    size <= 0 for size in expected_shape
+                if (
+                    expected_dtype.hasobject
+                    or not expected_shape
+                    or any(size <= 0 for size in expected_shape)
                 ):
                     reject_invalid_state(
                         "Stack unwrap payload shape or dtype is invalid"
@@ -453,9 +459,7 @@ def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
                         f"Stack unwrap payload cannot be read: {error}"
                     )
                 if array.shape != expected_shape or array.dtype != expected_dtype:
-                    reject_invalid_state(
-                        "Stack unwrap payload shape or dtype mismatch"
-                    )
+                    reject_invalid_state("Stack unwrap payload shape or dtype mismatch")
                 layers[name] = np.asarray(array)
             products[pair_id] = layers
     except Exception:

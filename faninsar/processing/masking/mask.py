@@ -292,30 +292,32 @@ def _freeze(value: object) -> object:
     if isinstance(value, np.ndarray):
         result = np.array(value, copy=True)
         result.setflags(write=False)
-        return result
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Mapping):
-        return MappingProxyType(
+    elif isinstance(value, np.generic):
+        result = value.item()
+    elif isinstance(value, Mapping):
+        result = MappingProxyType(
             {_freeze(key): _freeze(item) for key, item in value.items()}
         )
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return frozenset(_freeze(item) for item in value)
-    # A caller may use a small metadata object as a source/provenance value.
-    # Keep an immutable structural snapshot instead of retaining the mutable
-    # object reference.  Private implementation state is intentionally not
-    # part of mask identity.
-    attributes = getattr(value, "__dict__", None)
-    if isinstance(attributes, dict):
-        return MappingProxyType(
-            {
-                "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
-                "attributes": _freeze(attributes),
-            }
-        )
-    return value
+    elif isinstance(value, (list, tuple)):
+        result = tuple(_freeze(item) for item in value)
+    elif isinstance(value, (set, frozenset)):
+        result = frozenset(_freeze(item) for item in value)
+    else:
+        # A caller may use a small metadata object as a source/provenance value.
+        # Keep an immutable structural snapshot instead of retaining the mutable
+        # object reference.  Private implementation state is intentionally not
+        # part of mask identity.
+        attributes = getattr(value, "__dict__", None)
+        if isinstance(attributes, dict):
+            result = MappingProxyType(
+                {
+                    "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
+                    "attributes": _freeze(attributes),
+                }
+            )
+        else:
+            result = value
+    return result
 
 
 def _jsonable(value: object) -> object:
