@@ -54,7 +54,6 @@ outage patterns mirrored here).
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import os
 import secrets
@@ -907,15 +906,12 @@ class MaskManager:
     def _vectorize(self, tiles: list[Path], band: LonLatBounds) -> BaseGeometry:
         """Classify, repair, operate, and dissolve water polygons.
 
-        Classification happens after the tile polygons are unioned, so a
-        tile edge cannot masquerade as a shoreline.  Water touching the
-        *padded fetch* edge is ocean; all other water is inland.  Each class
-        then receives its pinned operation in one local UTM zone: ocean is
-        eroded by :data:`OCEAN_SHORE_KEEP_M` to retain the shore strip and
-        inland water is unchanged.  Simplification is guarded with
-        ``make_valid`` and minimum-area filtering is only applied to ocean
-        parts.  Inland components are deliberately never removed, preserving
-        narrow rivers regardless of the configured area floor.
+        Source-qualified classes are assigned before any dissolve.  Raster
+        products without an authoritative ocean/inland field are treated as
+        inland; no fetch-edge shoreline inference is performed.  The
+        category-specific operation is then applied in one local UTM zone.
+        Narrow inland components are retained because geometry aspect and area
+        are not a scientific classification rule.
 
         The method returns a geometry for compatibility with the P0039
         private seam.  Category-bearing output is available through
@@ -930,38 +926,56 @@ class MaskManager:
     def _vectorize_features(
         self, tiles: list[Path], band: LonLatBounds
     ) -> tuple[list[BaseGeometry], tuple[str, ...]]:
-        """Return operated water polygons and their authoritative categories."""
+        """Return operated water polygons and source-qualified categories.
+
+        Raster products do not encode an ocean/inland distinction.  Such
+        polygons are therefore conservatively qualified as ``inland`` rather
+        than inferred from an arbitrary fetch boundary.  A source adapter may
+        return ``(geometry, category)`` records from ``_tile_water_polygons``;
+        those categories are validated before any dissolve and remain the
+        only basis for category-specific operations.
+        """
         import shapely
         import shapely.ops
-        from shapely.geometry import box
 
-        polygons: list[BaseGeometry] = []
+        records: list[tuple[BaseGeometry, str]] = []
         for path in tiles:
-            polygons.extend(self._tile_water_polygons(path))
-        polygons = [geom for geom in polygons if not geom.is_empty]
-        if not polygons:
+            for item in self._tile_water_polygons(path):
+                category = "inland"
+                geometry = item
+                if isinstance(item, tuple) and len(item) == 2:
+                    geometry, category = item
+                if category == "water":
+                    if float(self.ocean_shore_keep_m) != float(
+                        self.inland_water_buffer_m
+                    ):
+                        message = (
+                            "water source did not qualify ocean versus inland "
+                            "geometry, but category policies differ"
+                        )
+                        logger.error(message)
+                        raise InvalidProcessingStateError(message)
+                    category = "inland"
+                if category not in {"ocean", "inland"}:
+                    message = f"water source returned an unqualified category {category!r}"
+                    logger.error(message)
+                    raise InvalidProcessingStateError(message)
+                if not hasattr(geometry, "is_empty"):
+                    message = "water source returned a non-geometric polygon"
+                    logger.error(message)
+                    raise InvalidProcessingStateError(message)
+                if not geometry.is_empty:
+                    records.append((geometry, category))
+        if not records:
             return [], ()
 
-        # Repair before union.  Invalid raster-derived rings should not make
-        # classification dependent on a particular GEOS overlay version.
-        repaired = []
-        for geometry in polygons:
+        # Classify before dissolve.  Dissolving first can merge separately
+        # qualified classes and make their policy choice unknowable.
+        classified: dict[str, list[BaseGeometry]] = {"ocean": [], "inland": []}
+        for geometry, category in records:
             candidate = shapely.make_valid(geometry)
             if not candidate.is_empty:
-                repaired.append(candidate)
-        if not repaired:
-            return [], ()
-        union = shapely.make_valid(shapely.union_all(repaired))
-        raw_parts = [part for part in _polygon_parts(union) if not part.is_empty]
-
-        # A fetch-edge touch is the source-independent, deterministic ocean
-        # label.  The fetch band is padded by the shore context before this
-        # method is reached, so the edge is never interpreted as a shoreline.
-        fetch_edge = box(*band).boundary
-        classified: dict[str, list[BaseGeometry]] = {"ocean": [], "inland": []}
-        for geometry in raw_parts:
-            category = "ocean" if geometry.intersects(fetch_edge) else "inland"
-            classified[category].append(geometry)
+                classified[category].append(candidate)
 
         zone_lon = (band[0] + band[2]) / 2.0
         zone_lat = (band[1] + band[3]) / 2.0
@@ -988,55 +1002,20 @@ class MaskManager:
             simplified = dissolved.simplify(
                 float(self.simplify_tolerance_m), preserve_topology=True
             )
+            # Do not use area/aspect-ratio guesses to decide whether an
+            # unqualified narrow river is real.  The source classification is
+            # authoritative; minimum-area filtering applies only to explicitly
+            # qualified ocean polygons.
+            if category == "inland":
+                min_area_m2 = 0.0
             for part in _polygon_parts(shapely.make_valid(simplified)):
-                if part.area < min_area_m2:
-                    if category == "ocean":
-                        # Suppress isolated coastal slivers after shore
-                        # erosion, but never let them affect inland labels.
-                        continue
-                    # Preserve narrow, river-like inland components while
-                    # retaining the useful floor for compact speckle/ponds.
-                    rectangle = part.minimum_rotated_rectangle
-                    corners = list(rectangle.exterior.coords)
-                    lengths = [
-                        first.distance(second)
-                        for first, second in itertools.pairwise(corners)
-                    ]
-                    lengths = [length for length in lengths if length > 0.0]
-                    if not lengths or max(lengths) / min(lengths) < 4.0:
-                        continue
+                if category == "ocean" and part.area < min_area_m2:
+                    continue
                 geographic = shapely.ops.transform(reverse.transform, part)
                 if not geographic.is_empty:
                     result.append(geographic)
                     categories.append(category)
         return result, tuple(categories)
-        import shapely
-        import shapely.ops
-        from shapely.geometry import Polygon
-
-        polygons: list[BaseGeometry] = []
-        for path in tiles:
-            polygons.extend(self._tile_water_polygons(path))
-        polygons = [geom for geom in polygons if not geom.is_empty]
-        if not polygons:
-            return Polygon()
-        union = shapely.union_all(polygons)
-        zone_lon = (band[0] + band[2]) / 2.0
-        zone_lat = (band[1] + band[3]) / 2.0
-        forward, reverse = _utm_transformers(zone_lon, zone_lat)
-        projected = shapely.ops.transform(forward.transform, union)
-        simplified = projected.simplify(
-            float(self.simplify_tolerance_m), preserve_topology=True
-        )
-        parts = list(getattr(simplified, "geoms", ()) or (simplified,))
-        min_area_m2 = float(self.min_area_km2) * 1e6
-        kept = [
-            part for part in parts if not part.is_empty and part.area >= min_area_m2
-        ]
-        if not kept:
-            return Polygon()
-        final = shapely.union_all(kept)
-        return shapely.ops.transform(reverse.transform, final)
 
     # -- public entry points -------------------------------------------------
 

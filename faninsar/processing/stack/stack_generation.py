@@ -134,6 +134,8 @@ class UnwrapResultGeneration:
     pair_ids: tuple[str, ...]
     products: dict[str, dict[str, np.ndarray]]
     _lease: GenerationLease
+    mask_plan_identity: str = ""
+    mask_identity: str | None = None
 
     def close(self) -> None:
         """Release the generation reader lease."""
@@ -263,6 +265,8 @@ def publish_unwrap_generation(
     *,
     pair_ids: Sequence[str],
     products: Mapping[str, Mapping[str, object]],
+    mask_plan_identity: str = "",
+    mask_identity: str | None = None,
 ) -> UnwrapResultGeneration:
     """Atomically publish one complete Stack-root unwrap result set.
 
@@ -347,6 +351,8 @@ def publish_unwrap_generation(
             "generation_id": generation_id,
             "pair_ids": list(ordered_pairs),
             "pairs": manifest_pairs,
+            "mask_plan_identity": str(mask_plan_identity),
+            "mask_identity": mask_identity,
         }
         manifest = {
             **unsigned,
@@ -462,6 +468,8 @@ def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
         manifest_digest=opened.manifest_digest,
         pair_ids=pair_ids,
         products=products,
+        mask_plan_identity=str(manifest.get("mask_plan_identity", "")),
+        mask_identity=manifest.get("mask_identity"),
         _lease=opened.lease,
     )
 

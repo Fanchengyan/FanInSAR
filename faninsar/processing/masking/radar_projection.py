@@ -16,12 +16,9 @@ _apply_geo_topographic_phase_chunked` memmap + watchdog pattern), scattering
   converged in-bounds radar indices into the radar plane.
 
 The full-resolution uint8 plane caches under ``<cache_dir>/<cache_key>.npy``
-(one file per ``(vector-layer digest, buffer, resolution, DEM identity)``
-identity, digested by the caller through
-:func:`radar_projection_cache_key`), so an unchanged configuration never
-re-projects.  A ``multilook`` window reduces the cached full-resolution plane
-with ``any()``: a look is water/removed when **any** contributing
-full-resolution pixel is water.
+using the materialized source mask, grids, projection model, DEM, and target
+validity as its identity.  A ``multilook`` request is a nearest-neighbour view
+of that plane; labels are never aggregated into a new class.
 
 Array conventions follow :mod:`faninsar.processing.masking.mask`: ``0`` = keep,
 ``1`` = removed (water), and ``255`` = invalid.  The returned plane is always
@@ -78,22 +75,19 @@ def radar_projection_cache_key(
 ) -> str:
     """Digest every projection identity observable at this seam.
 
-    Legacy vector/buffer/resolution/DEM fields remain accepted.  The
-    PROPOSAL-0040 fields bind the materialized source mask, master and target
-    grids, reference scene, geometry/LUT, DEM, and final target validity.
+    The materialized source mask, master and target grids, reference scene,
+    geometry/LUT, DEM, and final target validity form the cache identity.
+    ``vector_digest`` and ``dem_identity`` are retained as input aliases for
+    callers transitioning to those canonical identities.  Buffer and
+    resolution settings do not identify a materialized product and are
+    intentionally ignored.
 
     Parameters
     ----------
-    vector_digest : str, optional
-        Digest of the vector mask layer (e.g. the ``WaterLayer.identity`` of
-        the masking manager or any caller-defined layer digest).
-    buffer_km : float
-        Land buffer width in kilometres used to build the mask.
-    resolution_m : float or None
-        Mask grid resolution override in metres (``None`` records the DEM /
-        native grid resolution).
-    dem_identity : object, optional
-        Stable DEM identity string (path, height, or sampler name).
+    vector_digest, dem_identity : object, optional
+        Legacy aliases for ``source_mask_identity`` and ``dem``.
+    buffer_km, resolution_m : float, optional
+        Legacy settings ignored by the hard-cutover identity.
     source_mask_identity, master_grid, target_grid, reference_scene : object, optional
         Materialized source, source/target grids, and reference-scene inputs.
     lut, geometry, dem, target_validity : object, optional
@@ -105,12 +99,12 @@ def radar_projection_cache_key(
         Lowercase SHA-256 hexdigest of the canonical identity payload.
 
     """
+    if source_mask_identity is None:
+        source_mask_identity = vector_digest
+    if dem is None:
+        dem = dem_identity
     payload = {
         "proposal": "PROPOSAL-0040",
-        "vector_digest": None if vector_digest is None else str(vector_digest),
-        "buffer_km": None if buffer_km is None else float(buffer_km),
-        "resolution_m": None if resolution_m is None else float(resolution_m),
-        "dem_identity": _identity(dem_identity),
         "source_mask_identity": _identity(source_mask_identity),
         "master_grid": _identity(master_grid),
         "target_grid": _identity(target_grid),
@@ -216,11 +210,8 @@ def _load_mask_plane(mask: object) -> tuple[np.ndarray, object | None, object | 
     return result, source_grid, source_identity
 
 
-def _multilook_labels(plane: np.ndarray, multilook: tuple[int, int]) -> np.ndarray:
-    """Reduce hard labels without inventing a class.
-
-    Mixed keep/excluded windows and windows without valid labels are invalid.
-    """
+def _nearest_label_view(plane: np.ndarray, multilook: tuple[int, int]) -> np.ndarray:
+    """Return a nearest-neighbour view of a canonical hard-label plane."""
     az_looks, rg_looks = (int(multilook[0]), int(multilook[1]))
     if az_looks < 1 or rg_looks < 1:
         message = f"multilook factors must be >= 1, got {multilook}"
@@ -231,15 +222,16 @@ def _multilook_labels(plane: np.ndarray, multilook: tuple[int, int]) -> np.ndarr
     height, width = plane.shape
     out_h = (height + az_looks - 1) // az_looks
     out_w = (width + rg_looks - 1) // rg_looks
-    padded = np.full((out_h * az_looks, out_w * rg_looks), INVALID, dtype=np.uint8)
-    padded[:height, :width] = plane
-    blocks = padded.reshape(out_h, az_looks, out_w, rg_looks)
-    has_keep = np.any(blocks == KEEP, axis=(1, 3))
-    has_excluded = np.any(blocks == EXCLUDED, axis=(1, 3))
-    result = np.full((out_h, out_w), INVALID, dtype=np.uint8)
-    result[has_keep & ~has_excluded] = KEEP
-    result[has_excluded & ~has_keep] = EXCLUDED
-    return result
+    # Select the pixel nearest to each output pixel centre.  This preserves
+    # the original hard label and has deterministic edge behaviour for odd
+    # and even look factors alike.
+    azimuth = np.minimum(
+        np.arange(out_h) * az_looks + (az_looks - 1) // 2, height - 1
+    )
+    range_index = np.minimum(
+        np.arange(out_w) * rg_looks + (rg_looks - 1) // 2, width - 1
+    )
+    return np.ascontiguousarray(plane[np.ix_(azimuth, range_index)], dtype=np.uint8)
 
 
 def _scatter_candidates(
@@ -428,15 +420,14 @@ def project_mask_to_radar(
     chunk_size : int, optional
         Mask grid rows per radar-mode tile (default 256).
     multilook : tuple of int, optional
-        ``(azimuth, range)`` look factors.  The cached full-resolution plane
-        is reduced with ``any()`` per look window (default ``(1, 1)`` keeps
-        full resolution).
+        ``(azimuth, range)`` nearest-neighbour view factors (default
+        ``(1, 1)`` keeps full resolution).  No labels are aggregated.
     cache_key : str, optional
         SHA-256 identity from :func:`radar_projection_cache_key`.  Required
         together with ``cache_dir`` to enable caching.
     cache_dir : path-like, optional
-        Directory receiving ``<cache_key>.npy`` (one boolean plane per
-        ``(vector digest, buffer, resolution, DEM identity)`` identity).
+        Directory receiving ``<cache_key>.npy`` for the canonical projection
+        identity.
     watchdog : object, optional
         Memory guard with ``sample(label)`` invoked after every radar-mode
         tile (the production chunked-stage pattern).
@@ -448,9 +439,9 @@ def project_mask_to_radar(
     Returns
     -------
     numpy.ndarray
-        Boolean plane with ``True`` = water/removed, at the multilooked
-        radar shape (``ceil(full_radar_shape / multilook)``; the full shape
-        for ``(1, 1)``).
+        Canonical uint8 plane at the nearest-neighbour radar shape
+        (``ceil(full_radar_shape / multilook)``; the full shape for
+        ``(1, 1)``).
 
     Raises
     ------
@@ -565,4 +556,4 @@ def project_mask_to_radar(
     if cache_file is not None and not cache_file.is_file():
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         np.save(cache_file, np.ascontiguousarray(full_plane, dtype=np.uint8))
-    return _multilook_labels(full_plane, multilook)
+    return _nearest_label_view(full_plane, multilook)

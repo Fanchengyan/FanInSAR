@@ -815,20 +815,35 @@ class UnionMask(Mask):
 
     def to_vector(self, bounds: object | None = None) -> VectorMask:
         """Concatenate lossless vector children."""
-        vectors = []
-        for operand in self.operands:
-            if isinstance(operand, RasterMask):
-                message = (
-                    "RasterMask requires an explicit finite-grid to_vector conversion"
-                )
-                logger.error(message)
-                raise ValueError(message)
-            vectors.append(operand.to_vector(bounds))
+        vectors = [operand.to_vector(bounds) for operand in self.operands]
         if not vectors:
             raise ValueError("empty UnionMask has no vector geometry")
         crs = vectors[0].crs
         if any(vector.crs != crs for vector in vectors):
-            raise ValueError("union vector conversion requires one common CRS")
+            import pyproj
+            import shapely.ops
+
+            transformed = []
+            for vector in vectors:
+                if vector.crs == crs:
+                    transformed.append(vector)
+                    continue
+                transformer = pyproj.Transformer.from_crs(
+                    vector.crs, crs, always_xy=True
+                )
+                transformed.append(
+                    VectorMask(
+                        [
+                            shapely.ops.transform(transformer.transform, geometry)
+                            for geometry in vector.geometry
+                        ],
+                        crs=crs,
+                        roles=vector.roles,
+                        categories=vector.categories,
+                        provenance=vector.provenance,
+                    )
+                )
+            vectors = transformed
         return VectorMask(
             [geometry for vector in vectors for geometry in vector.geometry],
             crs=crs,

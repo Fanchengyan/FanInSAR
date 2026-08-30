@@ -281,9 +281,28 @@ def _mask_vector_for_roi(plan: MaskPlan, roi: object) -> object | None:
             )
         if definition.kind == "vector":
             import geopandas as gpd
+            import pyproj
+            import shapely.ops
 
             frame = gpd.read_file(definition.path)
-            parts.append(Mask.from_vector(frame).to_vector(bounds))
+            vector = Mask.from_vector(frame).to_vector()
+            transformer = pyproj.Transformer.from_crs(
+                vector.crs, "EPSG:4326", always_xy=True
+            )
+            projected = [
+                shapely.ops.transform(transformer.transform, geometry)
+                for geometry in vector.geometry
+            ]
+            clipped = [geometry.intersection(bounds) for geometry in projected]
+            parts.append(
+                VectorMask(
+                    clipped,
+                    crs="EPSG:4326",
+                    roles=vector.roles,
+                    categories=vector.categories,
+                    provenance=vector.provenance,
+                )
+            )
         else:
             recipe = Mask.from_water(
                 bounds=tuple(float(value) for value in bounds.bounds),
@@ -752,8 +771,11 @@ class Stack(Network):
     _network_generation_id: str | None = field(default=None, repr=False)
     _network_product_index: NetworkProductIndex | None = field(default=None, repr=False)
     _effective_roi_resolution: _EffectiveRoi | None = field(default=None, repr=False)
-    _materialized_masks: dict[tuple[str, tuple[str, ...], str], object] = field(
+    _materialized_masks: dict[tuple[tuple[str, ...], str], object] = field(
         default_factory=dict, repr=False
+    )
+    _radar_projection_context: dict[str, object] | None = field(
+        default=None, repr=False
     )
 
     def __post_init__(self) -> None:
@@ -1060,10 +1082,88 @@ class Stack(Network):
         """Return a canonical mask plane for an IFG target grid."""
         if not self.config.mask_plan.references("interferogram"):
             return None
-        if domain != "geo":
-            raise ValueError(
-                "radar mask projection requires an explicit radar LUT"
+        if domain == "radar":
+            from faninsar.processing.masking.mask import GridSpec
+            from faninsar.processing.masking.radar_projection import (
+                project_mask_to_radar,
             )
+
+            context = self._radar_projection_context
+            if context is None:
+                configured = self.config.extra.get("radar_projection_context")
+                context = configured if isinstance(configured, dict) else None
+            master = None if context is None else context.get("master_grid")
+            if master is None:
+                master = self.config.geo_grid
+            if master is None:
+                message = (
+                    "radar mask projection requires the authoritative geographic "
+                    "mask GridSpec (configure StackConfig.geo_grid)"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            if not all(
+                hasattr(master, name) for name in ("crs", "transform", "shape")
+            ):
+                message = "radar mask projection master GridSpec is incomplete"
+                logger.error(message)
+                raise ValueError(message)
+            target = GridSpec(master.crs, master.transform, shape=master.shape)
+            if target.crs != "EPSG:4326":
+                message = (
+                    "radar mask projection requires a WGS84 geographic master "
+                    f"GridSpec, got {target.crs}"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            materialized = self._materialize_stage_mask("interferogram", target)
+            if materialized is None:
+                return None
+            if context is None:
+                message = (
+                    "radar mask projection requires authoritative Stack radar "
+                    "geometry or LUT; run coregister_scenes first"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            geometry = context.get("geometry")
+            lut = context.get("lut")
+            full_shape = context.get("full_radar_shape")
+            if full_shape is None:
+                message = "radar mask projection context is missing full_radar_shape"
+                logger.error(message)
+                raise ValueError(message)
+            if (geometry is None) == (lut is None):
+                message = (
+                    "radar mask projection context must provide exactly one "
+                    "authoritative geometry or LUT"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            projected = project_mask_to_radar(
+                materialized,
+                full_radar_shape=tuple(int(value) for value in full_shape),
+                lut=lut,
+                geometry=geometry,
+                mask_transform=target.transform,
+                dem=self.config.dem,
+                device=self.config.device,
+                multilook=looks,
+                master_grid=target,
+                reference_scene=context.get("reference_scene", self.reference),
+            )
+            if expected_shape is not None and tuple(expected_shape) != projected.shape:
+                message = (
+                    f"projected radar mask shape {projected.shape} does not match "
+                    f"IFG shape {expected_shape}"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            return projected
+        if domain != "geo":
+            message = f"unsupported mask projection domain {domain!r}"
+            logger.error(message)
+            raise ValueError(message)
         grid = self._ifg_geo_grid(looks)
         if grid is None:
             raise ValueError(
@@ -1101,7 +1201,10 @@ class Stack(Network):
                 separators=(",", ":"),
             ).encode()
         ).hexdigest()
-        key = (stage, refs, target_identity)
+        # The identity is the normalized mask set plus target grid.  Stage is
+        # deliberately excluded: the same declared set must materialize once
+        # and be reusable when two stages share it.
+        key = (refs, target_identity)
         if key in self._materialized_masks:
             return self._materialized_masks[key]
         from faninsar.processing.masking.mask import GridSpec, Mask
@@ -1176,6 +1279,27 @@ class Stack(Network):
         return self._materialize_stage_mask(
             "unwrap", GridSpec("EPSG:4326", transform, shape=target_shape)
         ).data
+
+    def _unwrap_mask_identity(self, shape: tuple[int, int]) -> str | None:
+        """Return the materialized unwrap-mask identity for generation binding."""
+        if not self.config.mask_plan.references("unwrap"):
+            return None
+        grid = self._ifg_geo_grid(self.config.multilook)
+        if grid is None:
+            message = "unwrap masks require an EPSG:4326 geo_grid"
+            logger.error(message)
+            raise ValueError(message)
+        transform, target_shape = grid
+        if tuple(shape) != target_shape:
+            message = "unwrap mask target grid shape does not match IFG"
+            logger.error(message)
+            raise ValueError(message)
+        from faninsar.processing.masking.mask import GridSpec
+
+        result = self._materialize_stage_mask(
+            "unwrap", GridSpec("EPSG:4326", transform, shape=target_shape)
+        )
+        return None if result is None else str(result.identity)
 
     def _burst_kwargs(self) -> dict[str, Any]:
         cfg = self.config
@@ -1787,6 +1911,16 @@ class Stack(Network):
                 scene_store_dir=out / "scenes",
                 **pair_kwargs,
             )
+            if self.config.coregistration_grid == "radar":
+                shape = getattr(state.primary.array, "shape", None)
+                geometry = getattr(state.primary, "geometry", None)
+                if shape is not None and geometry is not None:
+                    self._radar_projection_context = {
+                        "geometry": geometry,
+                        "full_radar_shape": tuple(int(v) for v in shape),
+                        "reference_scene": self.reference,
+                        "master_grid": self.config.geo_grid,
+                    }
             if self.config.retain_pair_states:
                 self.pair_states[f"{self.reference}_{date_id}"] = state
             else:
@@ -2369,6 +2503,27 @@ class Stack(Network):
         generation = open_unwrap_generation(self.config.work_dir)
         previous = self._unwrap_generation
         try:
+            expected_plan = self.config.mask_plan.identity
+            expected_mask = None
+            if self.config.mask_plan.references("unwrap"):
+                stores = self._pair_artifact_stores(
+                    looks=self.config.multilook, ifg_root=None
+                )
+                try:
+                    expected_mask = self._unwrap_mask_identity(stores[0].shape)
+                finally:
+                    for store in stores:
+                        store.close()
+            if (
+                generation.mask_plan_identity != expected_plan
+                or generation.mask_identity != expected_mask
+            ):
+                message = (
+                    "persisted unwrap generation mask plan or materialized mask "
+                    "identity does not match the current Stack configuration"
+                )
+                logger.error(message)
+                reject_invalid_state(message)
             self._refresh_network_from_unwrap_generation(generation)
         except Exception:
             generation.close()
@@ -2479,6 +2634,8 @@ class Stack(Network):
         # the other arrays; per pair it intersects the persisted IFG mask
         # (finite phase and finite coherence remain the unwrapper's rule).
         mask_plane = self._unwrap_mask_plane(stores[0].shape)
+        mask_plan_identity = self.config.mask_plan.identity
+        mask_identity = self._unwrap_mask_identity(stores[0].shape)
         mask_removed: Any = None
         if mask_plane is not None:
             mask_removed = torch.as_tensor(
@@ -2625,6 +2782,8 @@ class Stack(Network):
                 self.config.work_dir,
                 pair_ids=pair_ids,
                 products=products,
+                mask_plan_identity=mask_plan_identity,
+                mask_identity=mask_identity,
             )
             previous = self._unwrap_generation
             self._unwrap_generation = generation
