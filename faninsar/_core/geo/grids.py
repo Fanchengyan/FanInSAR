@@ -28,6 +28,155 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 
+class GridSpec:
+    """Immutable description of a north-up geographic or projected grid.
+
+    Parameters
+    ----------
+    crs : object
+        CRS accepted by :class:`pyproj.CRS`.
+    transform : object
+        An ``affine.Affine`` or six GDAL-order coefficients.
+    height, width : int
+        Positive raster dimensions in rows and columns.
+    bounds : tuple[float, float, float, float]
+        Outer pixel-edge bounds in ``(min_x, min_y, max_x, max_y)`` order.
+    validity : numpy.ndarray, optional
+        Optional boolean target-coverage array matching ``(height, width)``.
+
+    Notes
+    -----
+    The object defensively copies mutable inputs and exposes a read-only
+    validity array.  Equality and hashing include every observable field.
+
+    """
+
+    __slots__ = ("bounds", "crs", "height", "transform", "validity", "width")
+
+    def __init__(
+        self,
+        *,
+        crs: object,
+        transform: object,
+        height: int,
+        width: int,
+        bounds: tuple[float, float, float, float] | None = None,
+        validity: np.ndarray | None = None,
+    ) -> None:
+        """Validate and freeze a grid specification."""
+        from affine import Affine
+
+        try:
+            canonical_crs = CRS.from_user_input(crs).to_string()
+        except Exception as error:
+            message = f"unresolvable grid CRS: {crs!r}"
+            logger.exception(message)
+            raise ValueError(message) from error
+        try:
+            affine = transform if isinstance(transform, Affine) else Affine(*transform)
+        except (TypeError, ValueError) as error:
+            message = "transform must be an Affine or six coefficients"
+            logger.exception(message)
+            raise TypeError(message) from error
+        if not isinstance(affine, Affine):
+            message = "transform must be an Affine or six coefficients"
+            logger.error(message)
+            raise TypeError(message)
+        rows, columns = int(height), int(width)
+        if rows <= 0 or columns <= 0:
+            message = f"grid dimensions must be positive, got {(rows, columns)}"
+            logger.error(message)
+            raise ValueError(message)
+        if not all(np.isfinite(value) for value in affine):
+            message = "grid transform must contain finite values"
+            logger.error(message)
+            raise ValueError(message)
+        if affine.b != 0 or affine.d != 0 or affine.a <= 0 or affine.e >= 0:
+            message = "GridSpec requires a finite north-up affine transform"
+            logger.error(message)
+            raise ValueError(message)
+        if bounds is None:
+            left, top = affine.c, affine.f
+            right = left + affine.a * columns
+            bottom = top + affine.e * rows
+            bounds_value = (left, bottom, right, top)
+        else:
+            try:
+                values = tuple(float(value) for value in bounds)
+            except (TypeError, ValueError) as error:
+                message = "bounds must contain four finite values"
+                logger.exception(message)
+                raise ValueError(message) from error
+            if len(values) != 4 or not all(np.isfinite(value) for value in values):
+                message = "bounds must contain four finite values"
+                logger.error(message)
+                raise ValueError(message)
+            bounds_value = values
+            expected = (
+                affine.c,
+                affine.f + affine.e * rows,
+                affine.c + affine.a * columns,
+                affine.f,
+            )
+            tolerance = max(1e-9, max(abs(value) for value in expected) * 1e-12)
+            if any(
+                abs(actual - wanted) > tolerance
+                for actual, wanted in zip(values, expected, strict=True)
+            ):
+                message = "bounds do not match transform and dimensions"
+                logger.error(message)
+                raise ValueError(message)
+        if (
+            not bounds_value[0] < bounds_value[2]
+            or not bounds_value[1] < bounds_value[3]
+        ):
+            message = "bounds must be ordered as min_x, min_y, max_x, max_y"
+            logger.error(message)
+            raise ValueError(message)
+        valid = None if validity is None else np.array(validity, dtype=bool, copy=True)
+        if valid is not None:
+            if valid.shape != (rows, columns):
+                message = (
+                    f"validity shape {valid.shape} does not match {(rows, columns)}"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            valid.setflags(write=False)
+        object.__setattr__(self, "crs", canonical_crs)
+        object.__setattr__(self, "transform", tuple(float(value) for value in affine))
+        object.__setattr__(self, "height", rows)
+        object.__setattr__(self, "width", columns)
+        object.__setattr__(self, "bounds", bounds_value)
+        object.__setattr__(self, "validity", valid)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Return dimensions in ``(height, width)`` order."""
+        return self.height, self.width
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Prevent changes after construction."""
+        message = "GridSpec is immutable"
+        raise AttributeError(message)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare all canonical grid fields."""
+        if not isinstance(other, GridSpec):
+            return NotImplemented
+        return (
+            self.crs == other.crs
+            and self.transform == other.transform
+            and self.shape == other.shape
+            and self.bounds == other.bounds
+            and np.array_equal(self.validity, other.validity)
+        )
+
+    def __hash__(self) -> int:
+        """Hash canonical metadata and validity bytes."""
+        validity = None if self.validity is None else self.validity.tobytes()
+        return hash((self.crs, self.transform, self.shape, self.bounds, validity))
+
+
 class GeoGridMixin:
     """A class to manage GeoGrid information of a raster image.
 
