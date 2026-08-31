@@ -1,4 +1,4 @@
-# ruff: noqa: E501, EM101, EM102, TRY003, TID252, PLW2901, RUF005, D105
+# ruff: noqa: E501, EM101, EM102, TRY003, TID252, PLW2901, D105
 """Provider registry and Planetary Computer Copernicus DEM adapters."""
 
 from __future__ import annotations
@@ -74,7 +74,20 @@ class SourceResource:
     @property
     def identity(self) -> str:
         """Return identity independent of ephemeral SAS query parameters."""
-        unsigned = urllib.parse.urlunsplit(urllib.parse.urlsplit(self.href)[:3] + ("", ""))
+        parts = urllib.parse.urlsplit(self.href)
+        # Identity never includes query signatures or URL userinfo, even when
+        # a resource record is constructed directly in a test/tooling seam.
+        hostname = parts.hostname or ""
+        netloc = hostname
+        try:
+            port = parts.port
+        except ValueError:
+            port = -1
+        if port not in (None, 443):
+            netloc = f"{hostname}:{port}"
+        unsigned = urllib.parse.urlunsplit(
+            (parts.scheme.lower(), netloc, parts.path, "", "")
+        )
         return f"{self.collection_id}/{self.item_id}/{self.asset_key}:{unsigned}"
 
 
@@ -200,10 +213,12 @@ class PcStacSource:
 
     @staticmethod
     def _validate_asset_href(href: str) -> None:
-        parts = urllib.parse.urlsplit(href)
-        host = (parts.hostname or "").lower()
-        if parts.scheme != "https" or host != PC_ASSET_HOST:
-            raise ProviderUnavailableError("Planetary Computer asset origin is not approved")
+        try:
+            validate_https_origin(href, {PC_ASSET_HOST})
+        except ValueError as error:
+            raise ProviderUnavailableError(
+                "Planetary Computer asset origin is not approved"
+            ) from error
 
 
 GLO30_PC = PcStacSource("glo30")
@@ -518,13 +533,13 @@ def fetch_asset(
     import requests
 
     PcStacSource._validate_asset_href(resource.href)
+    destination = resolve_cache_path(cache_dir, resource.cache_path)
     client = session or requests.Session()
     response = client.get(resource.href, stream=True, allow_redirects=False, timeout=(10, 120))
     try:
         if response.status_code in {301, 302, 303, 307, 308}:
             raise ProviderUnavailableError("Planetary Computer asset redirects are rejected")
         response.raise_for_status()
-        destination = resolve_cache_path(cache_dir, resource.cache_path)
         stream_response_to_cache(
             response,
             destination,

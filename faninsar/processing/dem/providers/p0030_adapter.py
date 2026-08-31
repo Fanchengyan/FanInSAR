@@ -52,6 +52,7 @@ def _execute_plan(
         TileSet,
         expand_tile_parts,
         fetch_plan,
+        validate_cache_target,
     )
 
     max_fetch_bytes = budget.max_fetch_bytes if budget is not None else 2**33
@@ -61,6 +62,7 @@ def _execute_plan(
         missing = []
         for unit in units:
             target = cache_dir / unit.cache_path
+            validate_cache_target(cache_dir, target)
             if target.is_file() and target.stat().st_size >= unit.min_bytes:
                 hits.append(target)
             else:

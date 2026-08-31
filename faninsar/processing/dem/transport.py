@@ -50,15 +50,38 @@ def validate_https_origin(url: str, allowed_hosts: set[str] | frozenset[str]) ->
         raise ValueError("URL may not contain NUL")
     parts = urllib.parse.urlsplit(url)
     host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
     if (
         parts.scheme.lower() != "https"
         or not host
         or host not in {h.lower() for h in allowed_hosts}
         or parts.username is not None
         or parts.password is not None
-        or parts.port not in (None, 443)
+        or port not in (None, 443)
     ):
-        raise ValueError(f"URL origin is not registry-owned: {url!r}")
+        raise ValueError(f"URL origin is not registry-owned: {_redact_url(url)}")
+
+
+def _redact_url(url: str) -> str:
+    """Remove URL userinfo, query values, and fragments from diagnostics."""
+    parts = urllib.parse.urlsplit(url)
+    hostname = parts.hostname or ""
+    try:
+        port = parts.port
+    except ValueError:
+        port = "REDACTED"
+    netloc = hostname if port in (None, 443) else f"{hostname}:{port}"
+    query = ""
+    if parts.query:
+        query = urllib.parse.urlencode(
+            [(key, "REDACTED") for key, _ in urllib.parse.parse_qsl(
+                parts.query, keep_blank_values=True
+            )]
+        )
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, ""))
 
 
 def validate_redirect(
@@ -123,6 +146,10 @@ def stream_to_cache(
             raise BoundedTransferError("HTTP range length does not match Content-Range")
         if total != "*" and int(total) < end + 1:
             raise BoundedTransferError("Content-Range exceeds resource length")
+        preflight_transfer(
+            expected_length,
+            budget=ResourceBudget(max_fetch_bytes=max_bytes),
+        )
     target = Path(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
     written = 0

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Self
@@ -219,15 +220,46 @@ def _identity(
     return digest.hexdigest()
 
 
+@lru_cache(maxsize=1)
 def _pyproj_runtime_identity() -> str:
-    """Return the projection runtime/data identity used for DEM warps."""
+    """Return a stable projection runtime/data identity without host paths."""
     try:
         import pyproj
         from pyproj import datadir
 
-        return f"{pyproj.__version__}:{datadir.get_data_dir()}"
+        data_root = Path(datadir.get_data_dir())
+        data_digest = hashlib.sha256()
+        candidates = sorted(
+            path for path in data_root.rglob("*") if path.is_file()
+        )
+        for candidate in candidates:
+            relative = candidate.relative_to(data_root).as_posix()
+            data_digest.update(relative.encode("utf-8"))
+            try:
+                with candidate.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1 << 20), b""):
+                        data_digest.update(block)
+            except OSError as error:
+                logger.warning(
+                    "unable to fingerprint PROJ data file %s: %s",
+                    relative,
+                    type(error).__name__,
+                )
+                return (
+                    f"pyproj={pyproj.__version__};proj={pyproj.proj_version_str};"
+                    "data=unavailable"
+                )
+        return (
+            f"pyproj={pyproj.__version__};proj={pyproj.proj_version_str};"
+            f"data-sha256={data_digest.hexdigest()}"
+        )
     except ImportError:
         return "pyproj-unavailable"
+    except OSError as error:
+        logger.warning(
+            "unable to inspect PROJ data directory: %s", type(error).__name__
+        )
+        return "pyproj-data-unavailable"
 
 
 class DEM(ABC):

@@ -210,7 +210,11 @@ def _netrc_auth(host: str) -> tuple[str, str] | None:
     if entry is None:
         return None
     login, _, password = entry
-    return login or "", password or ""
+    login_value = login or ""
+    password_value = password or ""
+    if not login_value or not password_value:
+        return None
+    return login_value, password_value
 
 
 class EarthdataCredentialProvider(CredentialProvider):
@@ -260,20 +264,28 @@ def resolve_credentials(credential_ref: str) -> CredentialProvider:
 
 
 def redact_url(url: str) -> str:
-    """Scrub oauth/SAS query parameters from a URL for safe logging."""
+    """Scrub credentials, userinfo, and signed query values from a URL."""
     parts = urllib.parse.urlsplit(url)
-    if not parts.query:
-        return url
-    kept: list[tuple[str, str]] = []
-    for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
-        lowered = key.lower()
-        if lowered in {"sig", "se", "st", "sp", "token", "sastoken"}:
-            kept.append((key, "REDACTED"))
-        else:
-            kept.append((key, value))
-    query = urllib.parse.urlencode(kept)
+    # Query values are not part of diagnostics or stable identities.  A signed
+    # URL commonly uses provider-specific names, so redacting every value is
+    # safer than maintaining an incomplete allowlist of secret parameters.
+    query = ""
+    if parts.query:
+        query = urllib.parse.urlencode(
+            [(key, "REDACTED") for key, _ in urllib.parse.parse_qsl(
+                parts.query, keep_blank_values=True
+            )]
+        )
+    hostname = parts.hostname or ""
+    netloc = hostname
+    try:
+        port = parts.port
+    except ValueError:
+        port = "REDACTED"
+    if port is not None:
+        netloc = f"{hostname}:{port}"
     return urllib.parse.urlunsplit(
-        (parts.scheme, parts.netloc, parts.path, query, parts.fragment)
+        (parts.scheme, netloc, parts.path, query, "")
     )
 
 
@@ -488,15 +500,25 @@ def validate_plan_urls(plan: FetchPlan) -> None:
 
     def _check_https(url: str) -> None:
         parts = urllib.parse.urlsplit(url)
-        if parts.scheme != "https":
+        host = parts.hostname
+        try:
+            port = parts.port
+        except ValueError:
+            port = -1
+        if (
+            parts.scheme.lower() != "https"
+            or host is None
+            or parts.username is not None
+            or parts.password is not None
+            or port not in (None, 443)
+        ):
             message = (
-                f"DEM plan URLs must use https, got {parts.scheme!r} in "
+                f"DEM plan URL must use https and be an approved origin, got "
                 f"{redact_url(url)}"
             )
             logger.error(message)
             raise ValueError(message)
-        host = parts.hostname
-        if host is None or host.lower() not in allowed:
+        if host.lower() not in allowed:
             message = (
                 f"DEM URL host {host!r} is not in the plan allowlist "
                 f"{sorted(allowed)} ({redact_url(url)})"
@@ -543,8 +565,23 @@ def _validate_redirect_chain(
     if not location:
         return None
     next_url = urllib.parse.urljoin(start_url, location)
-    next_host = (urllib.parse.urlsplit(next_url).hostname or "").lower()
+    next_parts = urllib.parse.urlsplit(next_url)
+    next_host = (next_parts.hostname or "").lower()
     start_host = (urllib.parse.urlsplit(start_url).hostname or "").lower()
+    try:
+        next_port = next_parts.port
+    except ValueError:
+        next_port = -1
+    if (
+        next_parts.scheme.lower() != "https"
+        or not next_host
+        or next_parts.username is not None
+        or next_parts.password is not None
+        or next_port not in (None, 443)
+    ):
+        message = f"redirect target must use https and have no URL credentials: {redact_url(next_url)}"
+        logger.error(message)
+        raise ValueError(message)
     # Cross-host hops are permitted ONLY credential-free: strip auth, then
     # verify no auth provider would attach to the new host.
     if next_host != start_host:
@@ -556,7 +593,7 @@ def _validate_redirect_chain(
             logger.error(message)
             leak = f"redirect credential leak: {next_host}"
             raise ValueError(leak)
-        if next_host and next_host not in allowed_hosts:
+        if next_host not in allowed_hosts:
             logger.warning(
                 "DEM redirect leaves the allowlist (%s -> %s); following "
                 "without credentials",
@@ -850,12 +887,13 @@ def _download_whole(
                             f"{redact_url(current_url)} (auth redirect failure)"
                         )
                         raise InvalidProcessingStateError(message)
-                out.write(block)
-                written += len(block)
-                if written > max_fetch_bytes:
+                next_written = written + len(block)
+                if next_written > max_fetch_bytes:
                     raise InvalidProcessingStateError(
                         f"DEM transfer exceeds max_fetch_bytes={max_fetch_bytes}"
                     )
+                out.write(block)
+                written = next_written
     finally:
         response.close()
     del magic
@@ -918,8 +956,7 @@ def _download_ranged(
                     )
                     raise InvalidProcessingStateError(message)
                 raw_range = response.headers.get("Content-Range", "")
-                match = _CONTENT_RANGE_RE.match(raw_range)
-                body = b"".join(response.iter_content(1 << 20))
+                match = _CONTENT_RANGE_RE.fullmatch(raw_range.strip())
                 if (
                     match is None
                     or int(match.group(1)) != start
@@ -931,7 +968,25 @@ def _download_ranged(
                         f"requested bytes {start}-{end}, got {raw_range!r}"
                     )
                     raise InvalidProcessingStateError(message)
-                return start, body
+                expected_chunk = end - start + 1
+                received = 0
+                body = bytearray()
+                for block in response.iter_content(1 << 20):
+                    if not block:
+                        continue
+                    next_received = received + len(block)
+                    if next_received > expected_chunk or next_received > max_fetch_bytes:
+                        raise InvalidProcessingStateError(
+                            "ranged response body exceeds its declared byte range"
+                        )
+                    body.extend(block)
+                    received = next_received
+                if received != expected_chunk:
+                    raise InvalidProcessingStateError(
+                        f"ranged response length mismatch: expected {expected_chunk}, "
+                        f"got {received}"
+                    )
+                return start, bytes(body)
             finally:
                 response.close()
 
@@ -1056,10 +1111,10 @@ def _execute_tile_set(
     jobs: list[tuple[Tile, Path]] = []
     for tile in units:
         target = cache_dir / tile.cache_path
+        validate_cache_target(cache_dir, target)
         if target.is_file() and target.stat().st_size >= tile.min_bytes:
             logger.info("DEM tile cache hit: %s", target)
             continue
-        validate_cache_target(cache_dir, target)
         jobs.append((tile, target))
 
     if not jobs:
@@ -1276,6 +1331,24 @@ def _execute_artifact(
     return target
 
 
+def _validate_plan_cache_targets(plan: FetchPlan, cache_dir: Path) -> None:
+    """Validate every planned destination before touching the cache tree."""
+    if isinstance(plan, TileSet):
+        for tile in plan.tiles:
+            for unit in expand_tile_parts(tile):
+                validate_cache_target(cache_dir, cache_dir / unit.cache_path)
+        return
+    if isinstance(plan, Artifact):
+        target = plan.cache_path
+        if target is None:
+            tail = urllib.parse.urlsplit(plan.url).path.rsplit("/", 1)[-1]
+            target = Path(tail or "artifact.bin")
+        validate_cache_target(cache_dir, cache_dir / target)
+        return
+    for artifact in getattr(plan, "artifacts", ()):
+        _validate_plan_cache_targets(artifact, cache_dir)
+
+
 def fetch_plan(
     plan: FetchPlan,
     cache_dir: Path,
@@ -1309,6 +1382,7 @@ def fetch_plan(
     credentials = _resolve_effective_credentials(plan)
     if plan.credential_ref == "earthdata" and credentials is None:
         EarthdataCredentialProvider.require_available()
+    _validate_plan_cache_targets(plan, cache_dir)
     sweep_part_files(cache_dir)
     if isinstance(plan, TileSet):
         return _execute_tile_set(
