@@ -281,7 +281,16 @@ class SourceDEM(DEM):
 
             name, provider = parse_selection(selection)
         except (TypeError, ValueError) as error:
-            message = f"unsupported DEM source selection {product!r}"
+            # The provider parser owns admission and emits one actionable
+            # boundary message for an explicitly unknown provider.  Preserve
+            # only that validated message for CLI/API callers; product and
+            # unwired-pair failures remain intentionally opaque so registry
+            # details do not become part of the public contract.
+            detail = str(error)
+            if detail.startswith("unknown DEM provider "):
+                message = detail
+            else:
+                message = f"unsupported DEM source selection {product!r}"
             logger.exception(message)
             raise ValueError(message) from error
         self.product = name

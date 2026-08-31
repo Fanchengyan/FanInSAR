@@ -11,9 +11,9 @@ import numpy as np
 import pytest
 
 from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
+from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.geometry import prepare_production as prepare_mod
 from faninsar.processing.geometry.backend_dispatch import DispatchError
-from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.geometry.native_v2.builder import (
     NativeBackend,
     NativeBuilder,

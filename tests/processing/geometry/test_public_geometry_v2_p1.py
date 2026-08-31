@@ -10,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 
+from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.geometry import (
     Operation,
     execute_geometry,
@@ -25,7 +26,6 @@ from faninsar.processing.geometry.backend_dispatch import (
     FatalExecutionError,
     RecoverableExecutionError,
 )
-from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.geometry.native_v2.bindings import (
     ecef_from_native_outputs,
     result_from_native_outputs,

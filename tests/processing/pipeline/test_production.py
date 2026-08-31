@@ -10,9 +10,9 @@ import pytest
 import zarr
 
 from faninsar._core.device import cuda_available
+from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import PreparedGeometryArrayPayload
-from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.pipeline import (
     PreparedGeometryField,

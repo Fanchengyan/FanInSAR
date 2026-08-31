@@ -14,8 +14,8 @@ import pytest
 import zarr
 
 from faninsar.missions.sentinel1.errors import Sentinel1ProductError
-from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.dem import ConstantDEM
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.pipeline import ProductionPairState
 from faninsar.processing.pipeline import production as production_mod
