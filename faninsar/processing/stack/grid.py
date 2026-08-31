@@ -118,9 +118,37 @@ def automatic_grid(
 ) -> GridSpec:
     """Build Stack's deterministic UTM/UPS grid from a WGS84 ROI.
 
-    Explicit grids should be passed directly to :func:`resolve_stack_grid`.
-    The automatic path warns for seams, projection boundaries, and large
-    extents, while continuing with the center-selected CRS.
+    Parameters
+    ----------
+    roi : object
+        WGS84 bounds, GeoDataFrame-like ``total_bounds``, or an object with
+        ``bounds``. Longitudes are normalized to the shortest continuous
+        interval before the centre is calculated.
+    resolution_m : float, default=30.0
+        Positive output spacing in metres. Pixel edges are aligned from the
+        projected minimum/maximum bounds and expanded to whole pixels.
+    margin_m : float, default=0.0
+        Non-negative projected margin added before whole-pixel alignment.
+    budget : ResourceBudget, optional
+        Resource limits checked before constructing the returned grid.
+    explicit : bool, default=False
+        Mark the ROI as caller-explicit; an antimeridian crossing then raises
+        :class:`ExplicitAntimeridianError` before planning.
+
+    Returns
+    -------
+    GridSpec
+        Centre-selected UTM (EPSG:32601--32660 or EPSG:32701--32760) for
+        latitudes ``[-80, 84)`` and UPS (EPSG:32761 or EPSG:32661) at the
+        southern or northern polar cut-off. The selected CRS is retained in
+        the canonical grid.
+
+    Notes
+    -----
+    Automatic cross-zone, UTM/UPS-boundary, antimeridian, and projected
+    extents above 1,000 km warn and continue. Explicit grids should be passed
+    directly to :func:`resolve_stack_grid` when a seam must be controlled.
+
     """
     if not np.isfinite(resolution_m) or resolution_m <= 0:
         raise ValueError("resolution_m must be a finite positive number")
@@ -174,7 +202,34 @@ def resolve_stack_grid(
     budget: object | None = None,
     explicit_roi: bool = False,
 ) -> GridSpec:
-    """Resolve an explicit GridSpec or the automatic UTM/UPS policy."""
+    """Resolve one explicit grid or the automatic UTM/UPS policy.
+
+    Parameters
+    ----------
+    grid : GridSpec or {"auto"}
+        Explicit grid wins and is returned after resource preflight.
+    roi : object, optional
+        WGS84 ROI used by the automatic centre-based selector.
+    resolution_m : float
+        Automatic output spacing in metres.
+    budget : ResourceBudget, optional
+        Checked before output allocation.
+    explicit_roi : bool
+        Treat the ROI as caller-explicit; antimeridian crossings then fail
+        before planning, network access, or allocation.
+
+    Returns
+    -------
+    GridSpec
+        One canonical geographic or projected Stack grid.
+
+    Notes
+    -----
+    Automatic cross-zone, polar-boundary, antimeridian, and over-1,000-km
+    cases warn and continue with the centre-selected CRS. Provide an
+    explicit grid when a seam must be represented deliberately.
+
+    """
     if isinstance(grid, GridSpec):
         preflight_grid(grid.height, grid.width, budget=_coerce_budget(budget))
         return grid

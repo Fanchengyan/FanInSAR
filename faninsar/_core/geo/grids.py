@@ -46,6 +46,11 @@ class GridSpec:
 
     Notes
     -----
+    The transform is canonical GDAL order ``(a, b, c, d, e, f)`` and maps a
+    pixel column/row to CRS coordinates. MVP grids are finite, invertible,
+    north-up affine transforms (``b=d=0``, ``a>0``, ``e<0``). Geographic,
+    UTM/UPS, and other caller CRSs accepted by the shared pyproj boundary are
+    allowed; this class does not infer a CRS from bounds or filenames.
     The object defensively copies mutable inputs and exposes a read-only
     validity array.  Equality and hashing include every observable field.
 
@@ -66,7 +71,34 @@ class GridSpec:
         resolution_m: tuple[float, float] | None = None,
         validity: np.ndarray | None = None,
     ) -> None:
-        """Validate and freeze a grid specification."""
+        """Validate and freeze a grid specification.
+
+        Parameters
+        ----------
+        crs : object
+            CRS accepted by :class:`pyproj.CRS`; it is canonicalized once.
+        transform : affine.Affine or tuple of float
+            North-up GDAL-order affine transform.
+        height, width : int, optional
+            Positive row and column dimensions.  Supply these or ``shape``.
+        shape : tuple of int, optional
+            ``(height, width)`` dimensions.
+        bounds, bbox : tuple of float, optional
+            Matching outer pixel-edge bounds; ``bbox`` is an accepted alias.
+        resolution_m : tuple of float, optional
+            Expected absolute pixel spacing, validated against the transform.
+        validity : numpy.ndarray, optional
+            Boolean target-coverage array.  It is defensively copied and
+            exposed read-only; invalid target cells become nodata in DEM and
+            mask materialization.
+
+        Raises
+        ------
+        TypeError, ValueError
+            If CRS, transform, dimensions, bounds, resolution, or validity
+            cannot define one finite north-up grid.
+
+        """
         from affine import Affine
 
         if shape is not None:

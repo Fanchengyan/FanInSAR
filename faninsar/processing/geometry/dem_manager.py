@@ -30,6 +30,7 @@ from faninsar.processing.geometry.dem_sources import (
     AUTO_SOURCE_NAME,
     DEFAULT_PRODUCT,
     PRODUCT_DEFAULTS,
+    DeferredStacPlan,
     DemSource,
     MosaicRecipe,
     PcStacSource,
@@ -517,7 +518,7 @@ class DEMManager:
             When the resolved source plans Artifacts instead of tiles.
 
         """
-        plan = self.source_entry.plan(bounds)
+        plan = self._planned_fetch(bounds)
         if isinstance(plan, TileSet):
             return [
                 self._partition_tile(unit)
@@ -530,6 +531,19 @@ class DEMManager:
         )
         logger.error(message)
         raise InvalidProcessingStateError(message)
+
+    def _planned_fetch(self, bounds: Bounds) -> FetchPlan:
+        """Resolve a registry plan at the manager's materialization boundary."""
+        plan = self.source_entry.plan(bounds)
+        if isinstance(plan, DeferredStacPlan):
+            if not isinstance(self.source_entry, PcStacSource):
+                message = (
+                    "deferred STAC plan is only supported by PcStacSource"
+                )
+                logger.error(message)
+                raise InvalidProcessingStateError(message)
+            return self.source_entry.discover(plan)
+        return plan
 
     # -- cache lookups ------------------------------------------------------
 
@@ -854,7 +868,7 @@ class DEMManager:
         out = Path(output_path)
         if self.source_entry.name == AUTO_SOURCE_NAME:
             return self._fetch_auto(_bounds_tuple(bounds), out)
-        plan = self.source_entry.plan(bounds)
+        plan = self._planned_fetch(bounds)
         if isinstance(plan, TileSet):
             paths = self._resolve_tile_hits(plan)
         else:

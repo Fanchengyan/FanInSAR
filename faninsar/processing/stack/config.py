@@ -42,7 +42,15 @@ class StackConfig:
 
     ``mask_plan`` is the only mask configuration surface.  An empty plan is
     unmasked processing; every non-empty stage is explicit and normalized
-    before this object is constructed.
+    before this object is constructed. ``grid`` is either an explicit shared
+    :class:`~faninsar.processing.dem.GridSpec` or ``"auto"``. In automatic
+    mode, ``roi`` has precedence over selected acquisition/swath/burst
+    footprints; the footprint centre selects UTM or UPS. Seam and large-range
+    cases warn and continue, while an explicit seam-crossing ROI fails before
+    planning. ``resolution_m`` supplies automatic projected pixel spacing;
+    pixel edges are expanded to whole pixels around the projected ROI.
+    ``dem_cache_dir`` supplies the source cache at materialization. An
+    explicit ``GridSpec`` always wins over automatic ROI selection.
     """
 
     work_dir: Path

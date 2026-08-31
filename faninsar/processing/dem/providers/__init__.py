@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from faninsar.logging import setup_logger
+from faninsar.processing.geometry.dem_sources import (
+    DeferredStacPlan,
+    _stac_endpoint_identity,
+)
 
 from ..resources import ResourceBudget, preflight_grid
 from ..seam import (
@@ -127,13 +131,25 @@ class PcStacSource:
 
     def discover(
         self,
-        bounds: tuple[float, float, float, float],
+        bounds: tuple[float, float, float, float] | DeferredStacPlan,
         *,
         client: object | None = None,
         signer: Callable[[object], object] | None = None,
     ) -> tuple[SourceResource, ...]:
         """Search and sign assets for automatic source windows."""
-        windows = plan_query_windows(bounds)
+        plan = bounds if isinstance(bounds, DeferredStacPlan) else self.plan(bounds)
+        endpoint, allowed_hosts = _stac_endpoint_identity(self.stac_url)
+        if (
+            plan.endpoint_identity != endpoint
+            or plan.collection != self.collection_id
+            or plan.asset != self.asset_key
+            or plan.provider != self.provider
+            or plan.product != self.product
+            or plan.allowed_hosts != allowed_hosts
+        ):
+            message = "deferred STAC plan does not belong to this source"
+            logger.error(message)
+            raise ProviderUnavailableError(message)
         if client is None:
             try:
                 import planetary_computer
@@ -145,14 +161,14 @@ class PcStacSource:
             signer = signer or planetary_computer.sign_inplace
             client = pystac_client.Client.open(self.stac_url)
         resources: list[SourceResource] = []
-        for window in windows:
+        for window in plan.windows:
             resources.extend(self._discover_window(window, client, signer))
         unique: dict[str, SourceResource] = {}
         for resource in sorted(resources, key=lambda value: value.identity):
             unique.setdefault(resource.identity, resource)
         if not unique:
             raise ProviderUnavailableError(
-                f"no {self.collection_id}/{self.asset_key} coverage for {bounds!r}"
+                f"no {plan.collection}/{plan.asset} coverage for {plan.bounds!r}"
             )
         return tuple(unique.values())
 
@@ -162,9 +178,29 @@ class PcStacSource:
         *,
         client: object | None = None,
         signer: Callable[[object], object] | None = None,
-    ) -> tuple[SourceResource, ...]:
-        """Alias for discovery retained at the provider adapter boundary."""
-        return self.discover(bounds, client=client, signer=signer)
+    ) -> DeferredStacPlan:
+        """Return an immutable query descriptor without opening a socket.
+
+        ``client`` and ``signer`` are accepted for call-shape parity with
+        :meth:`discover`, but are intentionally ignored.  They cannot make a
+        planning call perform network I/O; discovery belongs exclusively to
+        the materialization boundary.
+        """
+        del client, signer
+        raw_bounds = tuple(float(value) for value in bounds)
+        endpoint, allowed_hosts = _stac_endpoint_identity(self.stac_url)
+        windows = plan_query_windows(raw_bounds)
+        return DeferredStacPlan(
+            endpoint_identity=endpoint,
+            collection=self.collection_id,
+            asset=self.asset_key,
+            bounds=raw_bounds,
+            windows=windows,
+            provider=self.provider,
+            product=self.product,
+            vertical_datum=self.vertical_datum,  # type: ignore[arg-type]
+            allowed_hosts=allowed_hosts,
+        )
 
     def _discover_window(
         self,
@@ -436,7 +472,7 @@ def materialize_source(
     lon_a, lat_a = transformer.transform(left, bottom)
     lon_b, lat_b = transformer.transform(right, top)
     bounds = (min(lon_a, lon_b), min(lat_a, lat_b), max(lon_a, lon_b), max(lat_a, lat_b))
-    resources = source.discover(bounds, client=client, signer=signer)
+    resources = source.discover(source.plan(bounds), client=client, signer=signer)
     destination = np.full((height, width), np.nan, dtype=np.float32)
     target_transform = Affine(*grid.transform)
     columns, rows = np.meshgrid(

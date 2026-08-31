@@ -748,6 +748,17 @@ class Stack(Network):
     acquisitions : Acquisition, optional
         Optional domain Acquisition index (informational).
 
+    Notes
+    -----
+    ``grid`` is the authoritative shared output grid for DEMs, masks, and
+    geographic products. An explicit ``StackConfig.grid`` always wins. With
+    ``grid="auto"``, ROI precedence is an explicit ``resolve_grid(roi=...)``
+    override, then ``StackConfig.roi``, then the deterministic union of
+    selected acquisition/swath/burst footprints. The centre chooses UTM or
+    UPS. Cross-zone, UTM/UPS-boundary, antimeridian, and large projected
+    extents warn and continue; an explicit seam-crossing ROI fails before
+    provider planning or allocation. Resource limits still fail closed.
+
     """
 
     catalog: SceneCatalog

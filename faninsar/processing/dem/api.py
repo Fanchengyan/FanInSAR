@@ -263,13 +263,37 @@ def _pyproj_runtime_identity() -> str:
 
 
 class DEM(ABC):
-    """Typed DEM facade with offline factories and one materialization seam."""
+    """Typed DEM facade with offline factories and one materialization seam.
+
+    The three concrete categories are :class:`SourceDEM`, :class:`RasterDEM`,
+    and :class:`ConstantDEM`.  Factory calls and source planning are offline;
+    provider and geoid I/O begins only at :meth:`to_raster`.  Materialization
+    evaluates terrain once on the requested :class:`GridSpec`, then performs
+    any source-to-target vertical-datum conversion at the same target pixel
+    centres.  Invalid grids, unsupported datums, missing source caches, and
+    provider failures are reported as typed boundary errors.
+    """
 
     @classmethod
     def from_source(
         cls, product: DEMProduct | str, *, cache_dir: Path | None = None
     ) -> SourceDEM:
-        """Create an offline source recipe."""
+        """Create an offline source recipe.
+
+        Parameters
+        ----------
+        product : str
+            Canonical product or ``product:provider`` selection.
+        cache_dir : pathlib.Path, optional
+            Raw-source cache root.  It is required when this recipe is later
+            materialized; no global cache is invented for a standalone source.
+
+        Returns
+        -------
+        SourceDEM
+            Immutable-in-behavior recipe whose provider I/O is deferred.
+
+        """
         return SourceDEM(product, cache_dir=cache_dir)
 
     @classmethod
@@ -279,14 +303,23 @@ class DEM(ABC):
         *,
         vertical_datum: VerticalDatum | None = None,
     ) -> RasterDEM:
-        """Open a georeferenced local raster and resolve its vertical datum."""
+        """Open a georeferenced local raster and resolve its vertical datum.
+
+        A path-backed raster must carry authoritative datum metadata or an
+        explicit ``vertical_datum`` override.  Horizontal CRS metadata is
+        read from the raster and is never guessed from its filename.
+        """
         return RasterDEM(path=path, vertical_datum=vertical_datum)
 
     @classmethod
     def from_constant(
         cls, height: float, *, vertical_datum: VerticalDatum = "ellipsoidal"
     ) -> ConstantDEM:
-        """Create a finite constant-height DEM without I/O."""
+        """Create a finite constant-height DEM without I/O.
+
+        ``height`` is interpreted in ``vertical_datum`` and is converted to a
+        requested target datum only during :meth:`to_raster`.
+        """
         return ConstantDEM(height, vertical_datum=vertical_datum)
 
     @abstractmethod
@@ -297,11 +330,49 @@ class DEM(ABC):
         vertical_datum: VerticalDatum = "ellipsoidal",
         budget: ResourceBudget | None = None,
     ) -> RasterDEM:
-        """Materialize the DEM on one target grid."""
+        """Materialize the DEM on one target grid.
+
+        Parameters
+        ----------
+        grid : GridSpec
+            Complete geographic or projected target grid. Its CRS, affine
+            transform, shape, bounds, and validity determine output pixels;
+            the grid is never inferred from the source.
+        vertical_datum : {"ellipsoidal", "egm96", "egm2008"}
+            Target vertical datum; defaults to WGS84 ellipsoidal height.
+        budget : ResourceBudget, optional
+            Shape, byte, and temporary-memory limits checked before I/O.
+
+        Notes
+        -----
+        Source terrain is sampled directly at target pixel centres using the
+        fixed P0032-compatible 6x6 biquintic rule; no EPSG:4326 intermediate
+        raster is created. Source nodata and ``grid.validity=False`` become
+        target NaN/nodata, while datum conversion is pointwise at those same
+        centres. The returned ``RasterDEM`` records CRS, transform, datum,
+        resampling, source/provider, cache, and PROJ runtime identity.
+
+        Returns
+        -------
+        RasterDEM
+            Complete target-grid raster with read-only array and provenance.
+
+        Raises
+        ------
+        ValueError, TypeError, InvalidProcessingStateError
+            If the grid, datum, cache, source, or resource budget is invalid.
+
+        """
 
 
 class SourceDEM(DEM):
-    """Offline source recipe resolved only when materialized."""
+    """Offline source recipe resolved only when materialized.
+
+    ``SourceDEM`` owns product/provider selection and the explicit raw cache
+    root.  ``to_raster`` is the only operation that may discover STAC items,
+    sign assets, download bytes, or construct the output raster.  The source
+    and provider identities remain in cache partitions and provenance.
+    """
 
     def __init__(
         self, product: DEMProduct | str, *, cache_dir: Path | None = None
@@ -373,7 +444,12 @@ class SourceDEM(DEM):
 
 
 class ConstantDEM(DEM):
-    """Finite constant-height DEM in a declared vertical datum."""
+    """Finite constant-height DEM in a declared vertical datum.
+
+    The value is broadcast to the requested grid.  Grid validity marks cells
+    outside the target footprint as nodata, and datum conversion remains a
+    pointwise operation at target centres.
+    """
 
     def __init__(
         self, height: float, *, vertical_datum: VerticalDatum = "ellipsoidal"
@@ -393,7 +469,23 @@ class ConstantDEM(DEM):
         vertical_datum: VerticalDatum = "ellipsoidal",
         budget: ResourceBudget | None = None,
     ) -> RasterDEM:
-        """Fill the target grid with this constant height."""
+        """Fill the target grid with this constant height.
+
+        Parameters
+        ----------
+        grid : GridSpec
+            Authoritative output grid and optional validity mask.
+        vertical_datum : {"ellipsoidal", "egm96", "egm2008"}
+            Output height datum; conversion is pointwise when needed.
+        budget : ResourceBudget, optional
+            Pre-allocation resource limits.
+
+        Returns
+        -------
+        RasterDEM
+            Read-only constant field on ``grid`` with provenance.
+
+        """
         _admit_grid(grid)
         preflight_grid(grid.height, grid.width, budget=budget)
         target = _admit_datum(vertical_datum)
@@ -438,7 +530,15 @@ class ConstantDEM(DEM):
 
 
 class RasterDEM(DEM):
-    """Materialized, georeferenced elevation raster with complete identity."""
+    """Materialized georeferenced elevation raster with complete identity.
+
+    The internal float32 array is defensive-copied and read-only.  NumPy
+    conversion exposes that array directly; ``1``/finite heights remain
+    values while nodata is represented by NaN.  ``to_raster`` uses the fixed
+    P0032 biquintic 6x6 rule for a changed grid and pointwise datum conversion
+    for a changed datum.  ``save`` writes one strict GeoTIFF and refuses to
+    overwrite an existing path.
+    """
 
     def __init__(
         self,
@@ -608,7 +708,24 @@ class RasterDEM(DEM):
         vertical_datum: VerticalDatum = "ellipsoidal",
         budget: ResourceBudget | None = None,
     ) -> Self:
-        """Regrid once onto ``grid`` using the fixed P0032 rule."""
+        """Regrid once onto ``grid`` using the fixed P0032 rule.
+
+        Parameters
+        ----------
+        grid : GridSpec
+            Authoritative geographic or projected destination grid.
+        vertical_datum : {"ellipsoidal", "egm96", "egm2008"}
+            Destination datum. Conversion is pointwise after sampling.
+        budget : ResourceBudget, optional
+            Pre-allocation resource limits.
+
+        Returns
+        -------
+        RasterDEM
+            A read-only raster with updated grid/datum identity, or ``self``
+            when both are already canonical-equal.
+
+        """
         _admit_grid(grid)
         preflight_grid(grid.height, grid.width, budget=budget)
         target_datum = _admit_datum(vertical_datum)
@@ -697,7 +814,22 @@ class RasterDEM(DEM):
         )
 
     def save(self, path: Path) -> None:
-        """Write one new GeoTIFF without overwriting an existing file."""
+        """Write one new GeoTIFF without overwriting an existing file.
+
+        Parameters
+        ----------
+        path : pathlib.Path
+            Destination whose suffix is ``.tif`` or ``.tiff``.
+
+        Raises
+        ------
+        ValueError
+            If the destination does not have a GeoTIFF suffix.
+        FileExistsError
+            If ``path`` already exists. Writes are ordinary non-atomic file
+            writes; no locking or transaction guarantee is provided.
+
+        """
         destination = Path(path)
         if destination.suffix.lower() not in {".tif", ".tiff"}:
             message = "RasterDEM.save requires a .tif or .tiff path"

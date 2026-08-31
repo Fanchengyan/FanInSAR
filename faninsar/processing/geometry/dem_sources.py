@@ -43,6 +43,7 @@ logger = setup_logger(__name__)
 __all__ = [
     "AUTO_SOURCE_NAME",
     "AuthenticatedGranuleSource",
+    "DeferredStacPlan",
     "DemSource",
     "DemSourceUnavailableError",
     "FtpZipSource",
@@ -95,6 +96,93 @@ BoundsLike = BoundingBox | tuple[float, float, float, float]
 
 class DemSourceUnavailableError(InvalidProcessingStateError):
     """A registry source cannot serve the requested bounds or environment."""
+
+
+@dataclass(frozen=True, slots=True)
+class DeferredStacPlan:
+    """Immutable, zero-network description of a deferred STAC query.
+
+    A registry ``plan()`` call must describe work without opening a socket.
+    This record carries the complete admission identity needed by the
+    materializer; STAC discovery, asset signing, and byte fetching happen
+    only when that materializer explicitly resolves the plan.
+
+    Parameters
+    ----------
+    endpoint_identity : str
+        Canonical HTTPS STAC endpoint identity without credentials, query, or
+        fragment components.
+    collection : str
+        Authoritative STAC collection identifier.
+    asset : str
+        Authoritative STAC asset key.
+    bounds : tuple of float
+        Original WGS84 request as ``(west, south, east, north)``.
+    windows : tuple of tuple of float
+        One or two deterministic query windows, split at the antimeridian
+        when necessary.
+    provider : str
+        Provider identity retained for provenance and cache partitioning.
+    product : str
+        Product identity retained for provenance and cache partitioning.
+    vertical_datum : str
+        Registry-owned source vertical datum.
+    allowed_hosts : tuple of str
+        Hosts permitted for the eventual STAC discovery request.
+
+    """
+
+    endpoint_identity: str
+    collection: str
+    asset: str
+    bounds: tuple[float, float, float, float]
+    windows: tuple[tuple[float, float, float, float], ...]
+    provider: str
+    product: str
+    vertical_datum: VerticalDatum
+    allowed_hosts: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Validate the descriptor without performing I/O."""
+        parts = urllib.parse.urlsplit(self.endpoint_identity)
+        if parts.scheme.lower() != "https" or not parts.hostname:
+            message = "deferred STAC endpoint must be an HTTPS origin"
+            logger.error(message)
+            raise ValueError(message)
+        if parts.username or parts.password or parts.query or parts.fragment:
+            message = "deferred STAC endpoint must not contain credentials or query"
+            logger.error(message)
+            raise ValueError(message)
+        if tuple(self.allowed_hosts) != (parts.hostname,):
+            message = "deferred STAC endpoint host does not match allowlist"
+            logger.error(message)
+            raise ValueError(message)
+        if len(self.bounds) != 4 or not all(np.isfinite(self.bounds)):
+            message = "deferred STAC bounds must be finite"
+            logger.error(message)
+            raise ValueError(message)
+        if not self.windows:
+            message = "deferred STAC plan requires at least one query window"
+            logger.error(message)
+            raise ValueError(message)
+
+
+def _stac_endpoint_identity(url: str) -> tuple[str, tuple[str, ...]]:
+    """Return a credential-free endpoint identity and its host allowlist."""
+    parts = urllib.parse.urlsplit(str(url))
+    if parts.scheme.lower() != "https" or not parts.hostname:
+        message = "STAC endpoint must be an HTTPS URL with a host"
+        logger.error(message)
+        raise ValueError(message)
+    if parts.username or parts.password or parts.query or parts.fragment:
+        message = "STAC endpoint must not contain credentials or query"
+        logger.error(message)
+        raise ValueError(message)
+    host = parts.hostname.lower()
+    port = parts.port
+    netloc = host if port in (None, 443) else f"{host}:{port}"
+    path = parts.path.rstrip("/")
+    return urllib.parse.urlunsplit(("https", netloc, path, "", "")), (host,)
 
 
 # ---------------------------------------------------------------------------
@@ -1020,12 +1108,47 @@ class PcStacSource(DemSource):
     asset_key: str = "dem"
     item_grid_degrees: float = 1.0
 
-    def plan(self, bounds: BoundsLike) -> FetchPlan:
-        """Search STAC items by bbox and sign assets in place.
+    def plan(self, bounds: BoundsLike) -> DeferredStacPlan:
+        """Return an immutable STAC query descriptor without network I/O.
 
-        The official ``planetary_computer.sign_inplace`` modifier is applied
-        to every returned item before asset hrefs are read; SAS query
-        parameters never reach the cache identity.
+        STAC search, anonymous asset signing, and remote asset enumeration are
+        deliberately deferred until :meth:`discover` is called by a
+        materializer.  This keeps construction, registry listing, catalog
+        inspection, and planning safe for dry-run and offline workflows.
+        """
+        raw_bounds = _bounds_tuple(bounds)
+        endpoint, allowed_hosts = _stac_endpoint_identity(self.stac_api_url)
+        west, south, east, north = raw_bounds
+        if not (-180.0 <= west <= 180.0 and -180.0 <= east <= 180.0):
+            message = "STAC bounds longitude must be within [-180, 180]"
+            logger.error(message)
+            raise ValueError(message)
+        if south > north or not (-90.0 <= south <= 90.0 and -90.0 <= north <= 90.0):
+            message = "STAC bounds latitude must be ordered within [-90, 90]"
+            logger.error(message)
+            raise ValueError(message)
+        if west > east:
+            windows = ((west, south, 180.0, north), (-180.0, south, east, north))
+        else:
+            windows = (raw_bounds,)
+        return DeferredStacPlan(
+            endpoint_identity=endpoint,
+            collection=self.collection_id,
+            asset=self.asset_key,
+            bounds=raw_bounds,
+            windows=windows,
+            provider=self.provider,
+            product=self.product,
+            vertical_datum=self.vertical_datum,
+            allowed_hosts=allowed_hosts,
+        )
+
+    def discover(self, plan: DeferredStacPlan) -> FetchPlan:
+        """Resolve a deferred plan through STAC and sign the returned assets.
+
+        This is the provider I/O boundary.  Callers must pass a descriptor
+        produced by this source's :meth:`plan`; all returned cache paths omit
+        ephemeral SAS query parameters.
         """
         from faninsar.processing.geometry.dem_transport import Tile, TileSet
 
@@ -1038,51 +1161,63 @@ class PcStacSource(DemSource):
             )
             logger.error(message)
             raise DemSourceUnavailableError(message)
+        if not isinstance(plan, DeferredStacPlan):
+            message = "PcStacSource.discover requires a DeferredStacPlan"
+            logger.error(message)
+            raise TypeError(message)
+        endpoint, allowed_hosts = _stac_endpoint_identity(self.stac_api_url)
+        if (
+            plan.endpoint_identity != endpoint
+            or plan.collection != self.collection_id
+            or plan.asset != self.asset_key
+            or plan.provider != self.provider
+            or plan.product != self.product
+            or plan.allowed_hosts != allowed_hosts
+        ):
+            message = "deferred STAC plan does not belong to this source"
+            logger.error(message)
+            raise ValueError(message)
         planetary_computer, stac_client = stack
-        min_lon, min_lat, max_lon, max_lat = _bounds_tuple(bounds)
-        search_kwargs = {
-            "collections": [self.collection_id],
-            "bbox": [min_lon, min_lat, max_lon, max_lat],
-        }
         catalog = stac_client.Client.open(
-            self.stac_api_url, modifier=planetary_computer.sign_inplace
+            plan.endpoint_identity, modifier=planetary_computer.sign_inplace
         )
-        try:
-            collection = catalog.get_collection(self.collection_id)
-            search = collection.search(**search_kwargs)
-        except AttributeError:
-            search_client = stac_client.Client.open(
-                self.stac_api_url, modifier=planetary_computer.sign_inplace
-            )
-            search = search_client.search(**search_kwargs)
         tiles: list[Tile] = []
         seen_hrefs: set[str] = set()
-        for item in search.items():
-            # Sign in place BEFORE reading the href so the URL carries a
-            # fresh anonymous SAS token.
-            planetary_computer.sign_inplace(item)
-            asset = item.assets.get(self.asset_key)
-            if asset is None:
-                continue
-            signed = str(asset.href)
-            unsigned = signed.split("?", 1)[0]
-            if unsigned in seen_hrefs:
-                continue
-            seen_hrefs.add(unsigned)
-            tail = urllib.parse.urlsplit(unsigned).path.rsplit("/", 1)[-1]
-            tiles.append(
-                Tile(
-                    url=signed,
-                    cache_path=_safe_relative(f"{self.collection_id}/{tail}"),
-                    min_bytes=GLO_MIN_TILE_BYTES,
-                    ranged=True,
+        for window in plan.windows:
+            search_kwargs = {
+                "collections": [plan.collection],
+                "bbox": list(window),
+            }
+            try:
+                collection = catalog.get_collection(plan.collection)
+                search = collection.search(**search_kwargs)
+            except AttributeError:
+                search = catalog.search(**search_kwargs)
+            for item in search.items():
+                # Sign in place BEFORE reading the href so the URL carries a
+                # fresh anonymous SAS token.
+                planetary_computer.sign_inplace(item)
+                asset = item.assets.get(plan.asset)
+                if asset is None:
+                    continue
+                signed = str(asset.href)
+                unsigned = signed.split("?", 1)[0]
+                if unsigned in seen_hrefs:
+                    continue
+                seen_hrefs.add(unsigned)
+                tail = urllib.parse.urlsplit(unsigned).path.rsplit("/", 1)[-1]
+                tiles.append(
+                    Tile(
+                        url=signed,
+                        cache_path=_safe_relative(f"{plan.collection}/{tail}"),
+                        min_bytes=GLO_MIN_TILE_BYTES,
+                        ranged=True,
+                    )
                 )
-            )
         if not tiles:
             message = (
-                f"no STAC items with asset {self.asset_key!r} in collection "
-                f"{self.collection_id!r} for bounds "
-                f"{(min_lon, min_lat, max_lon, max_lat)}"
+                f"no STAC items with asset {plan.asset!r} in collection "
+                f"{plan.collection!r} for bounds {plan.bounds}"
             )
             logger.error(message)
             raise DemSourceUnavailableError(message)

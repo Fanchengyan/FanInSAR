@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pytest
 from faninsar.processing.dem.providers import (
     GLO30_PC,
     GLO90_PC,
+    PC_STAC_URL,
     PcStacSource,
     parse_selection,
 )
@@ -36,6 +38,24 @@ def test_parse_selection_preserves_canonical_product_provider_grammar() -> None:
 def test_pc_construction_does_not_open_network() -> None:
     source = PcStacSource("glo30", "pc")
     assert source.collection_id == "cop-dem-glo-30"
+
+
+def test_pc_plan_is_immutable_and_zero_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planning records STAC identity but defers discovery to materialization."""
+    def blocked(*args: object, **kwargs: object) -> None:
+        raise AssertionError("PC planning must not touch the network")
+
+    monkeypatch.setattr(socket.socket, "connect", blocked)
+    plan = GLO30_PC.plan((170.0, -1.0, -170.0, 1.0))
+    assert plan.collection == "cop-dem-glo-30"
+    assert plan.asset == "data"
+    assert plan.bounds == (170.0, -1.0, -170.0, 1.0)
+    assert len(plan.windows) == 2
+    assert plan.endpoint_identity == PC_STAC_URL
+    with pytest.raises(AttributeError):
+        plan.collection = "other"  # type: ignore[misc]
 
 
 @dataclass
