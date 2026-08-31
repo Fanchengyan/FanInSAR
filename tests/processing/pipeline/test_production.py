@@ -12,7 +12,7 @@ import zarr
 from faninsar._core.device import cuda_available
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import PreparedGeometryArrayPayload
-from faninsar.processing.geometry.dem import ConstantHeightDEM
+from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.pipeline import (
     PreparedGeometryField,
@@ -97,7 +97,7 @@ def test_production_pair_state_note() -> None:
         pair_id="TEST",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     state.note("hello")
     assert state.log == ["hello"]
@@ -169,7 +169,7 @@ def test_stage_deramp_with_synthetic() -> None:
         pair_id="TEST",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     result = stage_deramp(state)
     assert result.primary_deramped is not None
@@ -195,7 +195,7 @@ def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
         pair_id="geometry_only_coregistration",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         multilook=(2, 4),
     )
     state.primary_deramped = np.ones(shape, dtype=np.complex64)
@@ -264,7 +264,7 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
         pair_id="ampcor-dispatch",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     state.primary_deramped = np.ones(shape, dtype=np.complex64)
     state.secondary_deramped = np.ones(shape, dtype=np.complex64)
@@ -355,7 +355,7 @@ def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
         pair_id="prepared-measure",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     measure.primary_deramped = np.ones(shape, dtype=np.complex64)
     measure.secondary_deramped = np.ones(shape, dtype=np.complex64)
@@ -376,7 +376,7 @@ def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
         pair_id="prepared-product",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     product.primary_deramped = np.ones(shape, dtype=np.complex64)
     product.secondary_deramped = np.ones(shape, dtype=np.complex64)
@@ -433,7 +433,7 @@ def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
         pair_id="prepared-geo-lut",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     state.primary_deramped = np.ones(radar_shape, dtype=np.complex64)
     state.secondary_deramped = np.ones(radar_shape, dtype=np.complex64)
@@ -552,7 +552,7 @@ def test_prepared_geometry_field_rejects_unbound_geo_reuse() -> None:
         pair_id="prepared-geo",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     state.primary_deramped = np.ones(shape, dtype=np.complex64)
     state.secondary_deramped = np.ones(shape, dtype=np.complex64)
@@ -610,7 +610,7 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
         pair_id="prepared-roi-measure",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     measure.primary_deramped = np.ones(shape, dtype=np.complex64)
     measure.secondary_deramped = np.ones(shape, dtype=np.complex64)
@@ -633,7 +633,7 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
         pair_id="prepared-roi-product",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     product.primary_deramped = np.ones(shape, dtype=np.complex64)
     product.secondary_deramped = np.ones(shape, dtype=np.complex64)
@@ -666,7 +666,7 @@ def test_stage_coregister_grows_roi_halo_for_large_offsets(
         pair_id="window_halo_growth",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     state.primary_deramped = np.ones(shape, dtype=np.complex64)
     state.secondary_deramped = np.ones(shape, dtype=np.complex64)
@@ -736,7 +736,7 @@ def test_stage_interferogram_with_synthetic() -> None:
         pair_id="TEST",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     state.primary_deramped = np.ones((16, 16), dtype=np.complex64)
     state.secondary_aligned = np.ones((16, 16), dtype=np.complex64)
@@ -865,7 +865,7 @@ def test_stage_interferogram_masks_zero_power_edge_as_nan() -> None:
         pair_id="edge",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     primary = np.ones((16, 32), dtype=np.complex64)
     secondary = np.ones((16, 32), dtype=np.complex64)
@@ -908,7 +908,7 @@ def test_stage_flatten_wrapped_phase_matches_flat_not_unflat(
         pair_id="flat_edge",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     # Unflattened phase ≈ 0.5 rad; zero-power bottom row (black-edge risk).
     ifg = (np.exp(1j * 0.5) * np.ones((h, w))).astype(np.complex64)
@@ -967,7 +967,7 @@ def test_stage_flatten_does_not_repeat_slc_domain_flattening(
         pair_id="preflattened_slc",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     phase = np.linspace(-1.0, 1.0, 64, dtype=np.float32).reshape(shape)
     state.complex_ifg = np.exp(1j * phase).astype(np.complex64)
@@ -1021,7 +1021,7 @@ def test_staged_ifg_only_never_enters_unwrap(tmp_path: Path) -> None:
         pair_id="IFG_ONLY",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     wd = MemoryWatchdog(limit_mib=2048.0)
     state = wd.run_stage("deramp", stage_deramp, state)
@@ -1065,7 +1065,7 @@ def test_stage_unwrap_with_synthetic() -> None:
         pair_id="TEST",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     # Create a simple ramp phase for reliable unwrapping
     az = np.arange(8)
@@ -1088,7 +1088,7 @@ def test_stage_unwrap_selects_irls_for_geo_products() -> None:
         pair_id="GEO_IRLS",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         coregistration_grid="geo",
         unwrap_method="irls",
     )
@@ -1116,7 +1116,7 @@ def test_stage_write_with_synthetic(tmp_path: Path) -> None:
         pair_id="TEST_PAIR",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     state.complex_ifg = np.ones((8, 8), dtype=np.complex64)
     state.complex_ifg_flat = np.ones((8, 8), dtype=np.complex64)
@@ -1150,7 +1150,7 @@ def test_stage_write_persists_geocoded_slcs(tmp_path: Path) -> None:
         pair_id="GEO_PAIR",
         primary=ref,
         secondary=sec,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         coregistration_grid="geo",
     )
     state.complex_ifg = np.ones((4, 4), dtype=np.complex64)
@@ -1179,7 +1179,7 @@ def test_stage_write_persists_geocoded_slcs(tmp_path: Path) -> None:
     assert np.asarray(root["slc/valid"]).shape == (8, 8)
     assert root["slc"].attrs["crs"] == "EPSG:32647"
     np.testing.assert_array_equal(root["slc/x"][:], 446_125.0 + 10.0 * np.arange(8))
-    np.testing.assert_array_equal(root["slc/y"][:], 4_133_700.0 + 40.0 * np.arange(8))
+    np.testing.assert_array_equal(root["slc/y"][:], 4_133_980.0 - 40.0 * np.arange(8))
 
 
 @pytest.mark.skipif(len(SCENES) < 1, reason="local S1 ZIP corpus unavailable")

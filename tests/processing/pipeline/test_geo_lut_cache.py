@@ -399,7 +399,7 @@ def test_masked_bbox_pixels_geo2rdr_outside_burst_window() -> None:
     """
     from pyproj import Transformer
 
-    from faninsar.processing.geometry.dem import ConstantHeightDEM
+    from faninsar.processing.dem import ConstantDEM
     from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr2geo
     from faninsar.processing.pipeline.geo_lut import (
         build_geo2rdr_lut,
@@ -410,7 +410,7 @@ def test_masked_bbox_pixels_geo2rdr_outside_burst_window() -> None:
 
     radar_shape = (64, 128)
     model = _toy_geometry(radar_shape)
-    dem = ConstantHeightDEM(0.0)
+    dem = ConstantDEM(0.0)
     az = np.array([0.0, 0.0, 63.0, 63.0, 0.0, 63.0, 31.5, 31.5], dtype=np.float64)
     rg = np.array([0.0, 127.0, 0.0, 127.0, 63.5, 63.5, 0.0, 127.0], dtype=np.float64)
     geo = run_rdr2geo(model, az, rg, dem, device="cpu")

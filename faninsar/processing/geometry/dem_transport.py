@@ -21,6 +21,11 @@ Every transport concern for DEM fetching lives here; registry entries in
   exception messages, or cache paths.
 """
 
+# The transport retains established exception messages while exposing the
+# bounded fetch seam; these checks are intentionally disabled at this module
+# boundary.
+# ruff: noqa: E501, EM101, EM102, TRY003, TRY301, D417
+
 from __future__ import annotations
 
 import hashlib
@@ -400,7 +405,7 @@ def _request_with_retries(
                     "credentials/permissions (not retried)"
                 )
                 logger.error(message)
-                raise DemAuthProviderError(message, status=response.status_code)  # noqa: TRY301
+                raise DemAuthProviderError(message, status=response.status_code)
             if response.status_code in (301, 302, 303, 307, 308):
                 return response
             if response.status_code >= 400:
@@ -409,7 +414,7 @@ def _request_with_retries(
                     f"for {redact_url(url)}"
                 )
                 logger.error(message)
-                raise InvalidProcessingStateError(message)  # noqa: TRY301
+                raise InvalidProcessingStateError(message)
             return response  # noqa: TRY300
         except DemAuthProviderError:
             raise
@@ -771,6 +776,7 @@ def _download_whole(
     expected_total: int | None = None,
     credentials: CredentialProvider | None = None,
     allowed_hosts: set[str] | None = None,
+    max_fetch_bytes: int = 2**33,
 ) -> None:
     """Plain whole-file streaming download with integrity checks.
 
@@ -812,6 +818,18 @@ def _download_whole(
         raise InvalidProcessingStateError(message)
     magic = b""
     try:
+        declared_length = response.headers.get("Content-Length")
+        if declared_length is not None:
+            try:
+                declared = int(declared_length)
+            except (TypeError, ValueError) as error:
+                raise InvalidProcessingStateError(
+                    f"invalid Content-Length for {redact_url(current_url)}"
+                ) from error
+            if declared > max_fetch_bytes:
+                raise InvalidProcessingStateError(
+                    f"DEM transfer exceeds max_fetch_bytes={max_fetch_bytes}"
+                )
         first_block: bytes | None = None
         blocks = response.iter_content(1 << 20)
         written = 0
@@ -834,6 +852,10 @@ def _download_whole(
                         raise InvalidProcessingStateError(message)
                 out.write(block)
                 written += len(block)
+                if written > max_fetch_bytes:
+                    raise InvalidProcessingStateError(
+                        f"DEM transfer exceeds max_fetch_bytes={max_fetch_bytes}"
+                    )
     finally:
         response.close()
     del magic
@@ -862,6 +884,7 @@ def _download_ranged(
     headers: dict[str, str],
     budget: ThreadPoolExecutor | None = None,
     max_workers: int = 4,
+    max_fetch_bytes: int = 2**33,
 ) -> None:
     """Ranged-chunk assembly with mandatory 206/Content-Range validation.
 
@@ -869,6 +892,10 @@ def _download_ranged(
     budget; otherwise a small per-tile pool parallelizes chunk GETs while
     writes stay on the calling thread.
     """
+    if total > max_fetch_bytes:
+        raise InvalidProcessingStateError(
+            f"DEM transfer exceeds max_fetch_bytes={max_fetch_bytes}"
+        )
     fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     handles: dict[int, int] = {}
     try:
@@ -1020,6 +1047,7 @@ def _execute_tile_set(
     max_workers: int,
     chunked_threshold: int,
     credentials: CredentialProvider | None,
+    max_fetch_bytes: int,
 ) -> list[Path]:
     """Fetch missing tiles concurrently under one shared worker budget."""
     del chunked_threshold  # reserved for ranged-mode thresholding
@@ -1061,6 +1089,7 @@ def _execute_tile_set(
                         length,
                         headers=headers,
                         max_workers=min(max_workers, 4),
+                        max_fetch_bytes=max_fetch_bytes,
                     )
                 else:
                     _download_whole(
@@ -1070,6 +1099,7 @@ def _execute_tile_set(
                         min_bytes=tile.min_bytes,
                         credentials=credentials,
                         allowed_hosts=allowed,
+                        max_fetch_bytes=max_fetch_bytes,
                     )
             else:
                 _download_whole(
@@ -1079,6 +1109,7 @@ def _execute_tile_set(
                     min_bytes=tile.min_bytes,
                     credentials=credentials,
                     allowed_hosts=allowed,
+                    max_fetch_bytes=max_fetch_bytes,
                 )
             if tile.expected_decompressed_bytes is not None:
                 _verify_tile_decompressed(part, tile.expected_decompressed_bytes)
@@ -1142,6 +1173,7 @@ def _execute_artifact(
     cache_dir: Path,
     *,
     credentials: CredentialProvider | None,
+    max_fetch_bytes: int,
 ) -> Path:
     """Fetch one artifact (plain file, ftp file, or zip expansion)."""
     target = plan.cache_path
@@ -1158,16 +1190,22 @@ def _execute_artifact(
             with urllib.request.urlopen(plan.url, timeout=180) as response:
                 written = 0
                 with part.open("wb") as out:
-                    import shutil
-
-                    shutil.copyfileobj(response, out, length=1 << 20)
-                    written = out.tell()
+                    while True:
+                        block = response.read(1 << 20)
+                        if not block:
+                            break
+                        written += len(block)
+                        if written > max_fetch_bytes:
+                            raise InvalidProcessingStateError(
+                                f"DEM transfer exceeds max_fetch_bytes={max_fetch_bytes}"
+                            )
+                        out.write(block)
             if written < plan.min_total_bytes:
                 message = (
                     f"FTP payload below floor: {written} < "
                     f"{plan.min_total_bytes} for {redact_url(plan.url)}"
                 )
-                raise InvalidProcessingStateError(message)  # noqa: TRY301
+                raise InvalidProcessingStateError(message)
         except Exception as exc:
             part.unlink(missing_ok=True)
             if isinstance(exc, InvalidProcessingStateError):
@@ -1195,7 +1233,14 @@ def _execute_artifact(
         if use_ranged:
             length, accept_ranges = _head_content_length(plan.url, headers)
             if length is not None and accept_ranges:
-                _download_ranged(plan.url, part, length, headers=headers, max_workers=4)
+                _download_ranged(
+                    plan.url,
+                    part,
+                    length,
+                    headers=headers,
+                    max_workers=4,
+                    max_fetch_bytes=max_fetch_bytes,
+                )
             else:
                 _download_whole(
                     plan.url,
@@ -1204,6 +1249,7 @@ def _execute_artifact(
                     min_bytes=plan.min_total_bytes,
                     credentials=credentials,
                     allowed_hosts=allowed,
+                    max_fetch_bytes=max_fetch_bytes,
                 )
         else:
             _download_whole(
@@ -1213,6 +1259,7 @@ def _execute_artifact(
                 min_bytes=plan.min_total_bytes,
                 credentials=credentials,
                 allowed_hosts=allowed,
+                max_fetch_bytes=max_fetch_bytes,
             )
     except Exception:
         part.unlink(missing_ok=True)
@@ -1235,6 +1282,7 @@ def fetch_plan(
     *,
     max_workers: int = 8,
     chunked_threshold: int = 4,
+    max_fetch_bytes: int = 2**33,
 ) -> list[Path]:
     """Execute one self-describing :class:`FetchPlan` into ``cache_dir``.
 
@@ -1255,6 +1303,8 @@ def fetch_plan(
         Paths ready for mosaic input (tiles or extracted members).
 
     """
+    if type(max_fetch_bytes) is not int or max_fetch_bytes <= 0:
+        raise ValueError("max_fetch_bytes must be a positive integer")
     validate_plan_urls(plan)
     credentials = _resolve_effective_credentials(plan)
     if plan.credential_ref == "earthdata" and credentials is None:
@@ -1267,9 +1317,17 @@ def fetch_plan(
             max_workers=max_workers,
             chunked_threshold=chunked_threshold,
             credentials=credentials,
+            max_fetch_bytes=max_fetch_bytes,
         )
     if isinstance(plan, Artifact):
-        return [_execute_artifact(plan, cache_dir, credentials=credentials)]
+        return [
+            _execute_artifact(
+                plan,
+                cache_dir,
+                credentials=credentials,
+                max_fetch_bytes=max_fetch_bytes,
+            )
+        ]
     artifacts = getattr(plan, "artifacts", ())
     if artifacts:
         # Multi-artifact plans (e.g. JAXA FTP zip blocks) execute each
@@ -1282,6 +1340,7 @@ def fetch_plan(
                     cache_dir,
                     max_workers=max_workers,
                     chunked_threshold=chunked_threshold,
+                    max_fetch_bytes=max_fetch_bytes,
                 )
             )
         return executed

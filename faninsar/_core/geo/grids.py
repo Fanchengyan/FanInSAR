@@ -96,7 +96,22 @@ class GridSpec:
                 # -dy``. Normalize that spelling at the canonical boundary.
                 x0, dx, _zero_x, y0, _zero_y, dy = transform
                 legacy_row_down = float(dy) > 0
-                affine = Affine(dx, 0.0, x0, 0.0, float(dy), y0)
+                # Legacy tuple callers described the lower edge and used
+                # positive row-down spacing. Convert once at the shared
+                # boundary to the canonical north-up GDAL transform while
+                # preserving the same outer pixel bounds.
+                row_spacing = float(dy)
+                if row_spacing > 0:
+                    affine = Affine(
+                        float(dx),
+                        0.0,
+                        float(x0),
+                        0.0,
+                        -row_spacing,
+                        float(y0) + row_spacing * int(height),
+                    )
+                else:
+                    affine = Affine(dx, 0.0, x0, 0.0, row_spacing, y0)
             else:
                 affine = (
                     transform if isinstance(transform, Affine) else Affine(*transform)

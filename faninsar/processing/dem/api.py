@@ -148,23 +148,9 @@ def _sample_biquintic(
     cols = np.asarray(cols, dtype=np.float64).ravel()
     height, width = source.shape
     if height < 6 or width < 6:
-        # Tiny synthetic fixtures cannot provide the qualified support window.
-        # Bilinear is a deterministic boundary fallback, never exposed as a
-        # user-selectable production kernel.
-        r0 = np.floor(rows).astype(np.int64)
-        c0 = np.floor(cols).astype(np.int64)
-        valid = (r0 >= 0) & (r0 < height - 1) & (c0 >= 0) & (c0 < width - 1)
-        result = np.full(rows.shape, np.nan, dtype=np.float64)
-        if np.any(valid):
-            rr, cc = r0[valid], c0[valid]
-            dr, dc = rows[valid] - rr, cols[valid] - cc
-            result[valid] = (
-                source[rr, cc] * (1 - dr) * (1 - dc)
-                + source[rr, cc + 1] * (1 - dr) * dc
-                + source[rr + 1, cc] * dr * (1 - dc)
-                + source[rr + 1, cc + 1] * dr * dc
-            )
-        return result.reshape(output_shape)
+        message = "P0032 biquintic DEM sampling requires a 6x6 source support"
+        logger.error(message)
+        raise ValueError(message)
     row_floor = np.floor(rows).astype(np.int64)
     col_floor = np.floor(cols).astype(np.int64)
     valid = (

@@ -54,7 +54,7 @@ def _execute_plan(
         fetch_plan,
     )
 
-    del budget  # Byte reservations remain centralized in the transport engine.
+    max_fetch_bytes = budget.max_fetch_bytes if budget is not None else 2**33
     if isinstance(plan, TileSet):
         units = [unit for tile in plan.tiles for unit in expand_tile_parts(tile)]
         hits: list[Path] = []
@@ -66,7 +66,13 @@ def _execute_plan(
             else:
                 missing.append(unit)
         if missing:
-            hits.extend(fetch_plan(replace(plan, tiles=tuple(missing)), cache_dir))
+            hits.extend(
+                fetch_plan(
+                    replace(plan, tiles=tuple(missing)),
+                    cache_dir,
+                    max_fetch_bytes=max_fetch_bytes,
+                )
+            )
         by_name = {path.name: path for path in hits}
         resolved: list[Path] = []
         for unit in units:
@@ -80,7 +86,7 @@ def _execute_plan(
                 resolved.append(path)
         return resolved
 
-    executed = fetch_plan(plan, cache_dir)
+    executed = fetch_plan(plan, cache_dir, max_fetch_bytes=max_fetch_bytes)
     if isinstance(plan, Artifact) and plan.expand == "zip" and plan.cache_path:
         staging = cache_dir / plan.cache_path.parent / (
             plan.cache_path.name + ".zip-staging"

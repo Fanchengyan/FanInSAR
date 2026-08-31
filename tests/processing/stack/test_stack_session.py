@@ -114,6 +114,21 @@ def test_stack_from_safes_defaults(tmp_path: Path) -> None:
     assert stack.date_misreg is None
 
 
+def test_stack_auto_grid_uses_selected_footprint_union_when_roi_omitted(
+    tmp_path: Path,
+) -> None:
+    """Automatic Stack grid derives one deterministic extent after selection."""
+    stack = _stack_with_three_date_network(tmp_path)
+    stack.config.extra["selected_footprints"] = (
+        (10.0, 40.0, 10.2, 40.2),
+        (10.4, 40.1, 10.6, 40.3),
+    )
+    grid = stack.resolve_grid()
+    assert grid.crs == "EPSG:32632"
+    assert grid.width > 1000
+    assert grid.height > 1000
+
+
 def test_coreg_resume_identity_accepts_all_burst_token(tmp_path: Path) -> None:
     """Burst selection token ``all`` is part of the request identity."""
     paths = []
@@ -1172,31 +1187,33 @@ def test_coreg_resume_identity_captures_nested_dem_sampling_semantics(
     tmp_path: Path,
 ) -> None:
     """Interpolation and nested geoid samplers must invalidate scene reuse."""
-    from faninsar.processing.geometry.dem import (
-        ConstantHeightDEM,
-        GeoidAdjustedDEM,
-        RasterDEM,
-    )
+    from affine import Affine
+
+    from faninsar.processing.dem import DEM, GridSpec, RasterDEM
+    from faninsar.processing.geometry.dem import GeoidAdjustedDEM
 
     stack = _stack_with_three_date_network(tmp_path)
     date_id = "20240113"
-    raster_path = tmp_path / "dem.tif"
-    raster_path.write_bytes(b"identity-only-fixture")
-    stack.config.dem = RasterDEM(raster_path, interpolation="bilinear", nodata=-9999)
-    bilinear_identity = stack._coreg_resume_identity(
-        date_id,
-        misreg_az_px=0.0,
-        misreg_rg_px=0.0,
+    grid = GridSpec(
+        "EPSG:4326",
+        Affine(0.1, 0.0, 10.0, 0.0, -0.1, 42.0),
+        shape=(8, 8),
     )
-    stack.config.dem = RasterDEM(raster_path, interpolation="bicubic", nodata=-9999)
-    bicubic_identity = stack._coreg_resume_identity(
-        date_id,
-        misreg_az_px=0.0,
-        misreg_rg_px=0.0,
+    stack.config.dem = RasterDEM(
+        array=np.full(grid.shape, 10.0, dtype=np.float32), grid=grid
+    )
+    first_identity = stack._coreg_resume_identity(
+        date_id, misreg_az_px=0.0, misreg_rg_px=0.0
+    )
+    stack.config.dem = RasterDEM(
+        array=np.full(grid.shape, 11.0, dtype=np.float32), grid=grid
+    )
+    second_identity = stack._coreg_resume_identity(
+        date_id, misreg_az_px=0.0, misreg_rg_px=0.0
     )
     stack.config.dem = GeoidAdjustedDEM(
-        ConstantHeightDEM(10.0),
-        ConstantHeightDEM(2.0),
+        DEM.from_constant(10.0),
+        DEM.from_constant(2.0),
     )
     first_nested_identity = stack._coreg_resume_identity(
         date_id,
@@ -1204,8 +1221,8 @@ def test_coreg_resume_identity_captures_nested_dem_sampling_semantics(
         misreg_rg_px=0.0,
     )
     stack.config.dem = GeoidAdjustedDEM(
-        ConstantHeightDEM(10.0),
-        ConstantHeightDEM(3.0),
+        DEM.from_constant(10.0),
+        DEM.from_constant(3.0),
     )
     second_nested_identity = stack._coreg_resume_identity(
         date_id,
@@ -1213,7 +1230,7 @@ def test_coreg_resume_identity_captures_nested_dem_sampling_semantics(
         misreg_rg_px=0.0,
     )
 
-    assert bilinear_identity != bicubic_identity
+    assert first_identity != second_identity
     assert first_nested_identity != second_nested_identity
 
 

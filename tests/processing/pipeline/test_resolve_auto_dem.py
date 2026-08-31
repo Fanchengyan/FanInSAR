@@ -15,7 +15,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-from faninsar.processing.geometry.dem import RasterDEM
+from faninsar.processing.dem import DEM, RasterDEM
 from faninsar.processing.pipeline.production import resolve_auto_dem
 
 
@@ -48,35 +48,33 @@ def _install_fake_manager(
     vertical_datum: str,
     seen: dict[str, object] | None = None,
 ) -> None:
-    """Patch get_dem_manager to return a fake manager with fixed datum."""
+    """Patch the unified DEM factory with an offline source fixture."""
     datum_value = vertical_datum
 
-    class _FakeManager:
+    class _FakeSource:
         product = "glo30"
         provider = "aws"
 
-        @property
-        def vertical_datum(self) -> str:
-            return datum_value
-
-        def fetch_dem(
-            self,
-            bounds: tuple[float, float, float, float],
-            output_path: Path,  # noqa: ARG002 - protocol signature
-        ) -> Path:
+        def to_raster(self, grid: object, **kwargs: object) -> RasterDEM:
             if seen is not None:
-                seen["bounds"] = bounds
-            return raster
+                seen["grid"] = grid
+            import numpy as np
 
-    def fake_get_dem_manager(*, source: str | None = None) -> _FakeManager:
+            from faninsar.processing.dem import GridSpec
+
+            assert isinstance(grid, GridSpec)
+            return RasterDEM(
+                array=np.full(grid.shape, 12.5, dtype=np.float32),
+                grid=grid,
+                vertical_datum=str(kwargs.get("vertical_datum", datum_value)),
+            )
+
+    def fake_from_source(cls: type[DEM], source: str, **_kwargs: object) -> _FakeSource:
         if seen is not None:
             seen["source"] = source
-        return _FakeManager()
+        return _FakeSource()
 
-    monkeypatch.setattr(
-        "faninsar.processing.geometry.dem_manager.get_dem_manager",
-        fake_get_dem_manager,
-    )
+    monkeypatch.setattr(DEM, "from_source", classmethod(fake_from_source))
 
 
 class TestResolveAutoDem:
@@ -108,7 +106,7 @@ class TestResolveAutoDem:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Orthometric sources get GeoidAdjustedDEM when requested."""
+        """Orthometric sources are materialized directly at ellipsoidal datum."""
         raster = _make_raster(tmp_path / "mosaic.tif")
         _install_fake_manager(monkeypatch, raster, vertical_datum="egm2008")
         wrapped = resolve_auto_dem(
@@ -117,7 +115,8 @@ class TestResolveAutoDem:
             geoid_correction=True,
             dem_source="glo30",
         )
-        assert type(wrapped).__name__ == "GeoidAdjustedDEM"
+        assert isinstance(wrapped, RasterDEM)
+        assert wrapped.vertical_datum == "ellipsoidal"
 
     def test_geoid_correction_false_skips_wrap_for_orthometric_source(
         self,
@@ -149,7 +148,7 @@ class TestResolveAutoDem:
             output_dir=tmp_path / "out",
             geoid_correction=False,
         )
-        assert seen["source"] is None
+        assert seen["source"] == "glo30"
 
     def test_requires_cache_env(
         self,
@@ -196,7 +195,7 @@ class TestCliDemSourceOption:
         assert excinfo.value.code != 0
         captured = capsys.readouterr()
         err = (captured.err + captured.out).lower()
-        assert "unwired" in err or "not wired" in err
+        assert "unsupported" in err or "unwired" in err or "not wired" in err
 
     def test_unknown_product_fails_closed(
         self,

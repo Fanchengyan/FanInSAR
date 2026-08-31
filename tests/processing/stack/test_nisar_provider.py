@@ -15,7 +15,7 @@ import pytest
 from faninsar.missions.nisar import NisarSensor
 from faninsar.processing.coordinates import GeoGrid
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.geometry.dem import ConstantHeightDEM
+from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.slc import GeoSLC, RadarSLC
 from faninsar.processing.stack import NISARStack
@@ -157,7 +157,7 @@ def _stack(
             "trusted_roots": [tmp_path],
             "max_size_bytes": 1024,
         },
-        "dem": ConstantHeightDEM(0.0),
+        "dem": ConstantDEM(0.0),
         "multilook": (1, 1),
         "goldstein_alpha": 0.0,
         "coregistration_grid": domain,
@@ -294,7 +294,7 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
         "faninsar.processing.stack.nisar_provider._geometry_shared_radar_window",
         fake_mapping,
     )
-    configured_dem = ConstantHeightDEM(55.0)
+    configured_dem = ConstantDEM(55.0)
     callback = make_nisar_scene_provider(
         sensor=Sensor(),
         handles={
@@ -350,7 +350,7 @@ def test_nisar_geometry_mapping_passes_dem_and_device(
     """The Radar→Geo→Radar seam uses the admitted DEM and device unchanged."""
     reference = _result(tmp_path / "reference.h5", "20240101").product
     secondary = _result(tmp_path / "secondary.h5", "20240113").product
-    dem = ConstantHeightDEM(123.0)
+    dem = ConstantDEM(123.0)
     seen: dict[str, object] = {}
 
     def fake_rdr2geo(*args: object, **kwargs: object) -> object:
@@ -817,7 +817,7 @@ def test_nisar_dense_mapping_uses_spatially_varying_per_pixel_geometry(
         secondary,
         (1, 3, 1, 4),
         device="cpu",
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
 
     assert mapping.source_bounds == (0, 4, 0, 5)
@@ -893,7 +893,7 @@ def test_nisar_geo_tile_preserves_projected_global_origin(
         (0, 4, 0, 5),
         target,
         device="cpu",
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
 
     assert row_origin > 0
@@ -991,7 +991,7 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
     radar_stack = NISARStack.from_rslc(
         paths,
         work_dir=tmp_path / "radar_work",
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         multilook=(1, 1),
         goldstein_alpha=0.0,
         coregistration_grid="radar",
@@ -1071,7 +1071,7 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
     geo_stack = NISARStack.from_rslc(
         paths,
         work_dir=tmp_path / "geo_work",
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         geo_grid=GeoGridSpec(
             crs=full_geo_grid.crs,
             transform=(500_000.0, 20.0, 0.0, 7_200_000.0, 0.0, -20.0),

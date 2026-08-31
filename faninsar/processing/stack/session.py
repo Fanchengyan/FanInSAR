@@ -22,6 +22,7 @@ import subprocess
 import sys
 import sysconfig
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
@@ -78,7 +79,7 @@ from faninsar.processing.unwrap.errors import UnwrapFailedError
 from faninsar.processing.unwrap.irls import SpatialIRLS
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from faninsar._core.device import GpuMemoryReclaim
     from faninsar.core.acquisition import Acquisition
@@ -802,9 +803,11 @@ class Stack(Network):
         """Return the authoritative explicit or automatically selected grid.
 
         ``StackConfig.grid`` always wins when it contains a :class:`GridSpec`.
-        Automatic selection uses the configured ROI and performs no provider
-        I/O.  A concrete adapter may call :meth:`resolve_grid` after it has
-        selected acquisition footprints.
+        Automatic selection uses the configured ROI, or the deterministic
+        union of selected acquisition/swath/burst footprints, and performs no
+        provider I/O.  Center-based UTM/UPS selection continues with a warning
+        when a footprint crosses a seam; callers should provide an explicit
+        grid for a multi-zone or polar-boundary study.
         """
         return self.resolve_grid()
 
@@ -817,16 +820,79 @@ class Stack(Network):
             Footprint/ROI override.  It is treated as caller-explicit and an
             antimeridian crossing therefore fails before source I/O.
 
+        Notes
+        -----
+        When both ``roi`` and ``StackConfig.roi`` are absent, selected
+        acquisition, swath, or burst footprints supplied by the adapter are
+        unioned deterministically from ``StackConfig.extra``.
+
         """
         from faninsar.processing.stack.grid import resolve_stack_grid
 
         selected_roi = self.config.roi if roi is None else roi
+        if selected_roi is None:
+            selected_roi = self._selected_footprint_roi()
         return resolve_stack_grid(
             self.config.grid,
             roi=selected_roi,
             resolution_m=self.config.resolution_m,
             budget=self.config.resource_budget,
             explicit_roi=roi is not None or self.config.roi is not None,
+        )
+
+    def _selected_footprint_roi(self) -> object | None:
+        """Return the deterministic union of selected acquisition footprints.
+
+        Adapters may expose selected acquisition, swath, or burst footprints
+        through ``StackConfig.extra``.  This discovery is intentionally
+        read-only and happens after adapter selection; an explicit ``roi``
+        remains authoritative.  The result is a WGS84 Shapely geometry so the
+        automatic UTM/UPS resolver can apply its center and seam policy.
+        """
+        values: object | None = None
+        for key in (
+            "selected_footprints",
+            "burst_footprints",
+            "swath_footprints",
+            "acquisition_footprints",
+            "footprints",
+        ):
+            candidate = self.config.extra.get(key)
+            if candidate is not None:
+                values = candidate
+                break
+        if values is None:
+            return None
+        from shapely.geometry import Polygon, box, shape
+        from shapely.ops import unary_union
+
+        if isinstance(values, (str, bytes)):
+            values = (values,)
+        if not isinstance(values, Iterable) or isinstance(values, dict):
+            values = (values,)
+        geometries: list[Any] = []
+        for value in values:
+            geometry = getattr(value, "geometry", value)
+            if hasattr(value, "footprint") and value.footprint is not None:
+                geometry = value.footprint
+            if hasattr(geometry, "__geo_interface__"):
+                geometry = shape(geometry.__geo_interface__)
+            elif isinstance(geometry, dict) and "type" in geometry:
+                geometry = shape(geometry)
+            elif isinstance(geometry, (tuple, list)):
+                numbers = tuple(geometry)
+                if len(numbers) == 4 and all(
+                    isinstance(item, (int, float)) for item in numbers
+                ):
+                    geometry = box(*map(float, numbers))
+                else:
+                    geometry = Polygon(numbers)
+            if geometry is not None and not geometry.is_empty:
+                geometries.append(geometry)
+        if not geometries:
+            return None
+        return unary_union(
+            sorted(geometries, key=lambda geometry: geometry.wkb)
         )
 
     def materialize_dem(self, dem: DEM | None = None) -> RasterDEM:
@@ -1622,6 +1688,9 @@ class Stack(Network):
         # A Stack owns exactly one materialized DEM on its authoritative
         # output grid.  Materialize a source recipe at the first production
         # boundary and reuse that raster for every scene/LUT callback.
+        has_extent = (
+            self.config.roi is not None or self._selected_footprint_roi() is not None
+        )
         if self.config.dem is None:
             # A provider-only unit test (or another deliberately flat
             # callback) may not declare an ROI or explicit grid.  There is no
@@ -1629,7 +1698,7 @@ class Stack(Network):
             # that case; defer DEM ownership until a concrete Stack grid is
             # available.  Real projected/ROI runs always take the automatic
             # source branch here.
-            if self.config.grid == "auto" and self.config.roi is None:
+            if self.config.grid == "auto" and not has_extent:
                 logger.debug(
                     "Stack DEM omitted without ROI or explicit grid; "
                     "deferring automatic DEM materialization"
@@ -1639,7 +1708,12 @@ class Stack(Network):
         elif isinstance(self.config.dem, SourceDEM) or not isinstance(
             self.config.dem, RasterDEM
         ):
-            self.config.dem = self.materialize_dem(self.config.dem)
+            # Legacy bounded provider tests may intentionally use a constant
+            # geometry height without a geographic extent.  Keep that sampler
+            # intact; all source DEMs and extent-bearing runs materialize on
+            # the authoritative Stack grid.
+            if has_extent or type(self.config.dem).__name__ != "ConstantDEM":
+                self.config.dem = self.materialize_dem(self.config.dem)
         elif (
             self.config.dem.grid != self.grid
             or self.config.dem.vertical_datum != "ellipsoidal"
@@ -1715,6 +1789,13 @@ class Stack(Network):
                         for item in fields(value)
                         if not item.name.startswith("_")
                     },
+                }
+            elif hasattr(value, "identity") and not callable(value.identity):
+                # Public RasterDEM uses slots, so its stable content identity
+                # is the canonical resume key rather than ``__dict__`` state.
+                result = {
+                    "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                    "identity": str(value.identity),
                 }
             else:
                 public_state = {

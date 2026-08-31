@@ -123,6 +123,7 @@ def _dem_payload(dem: object, seen: set[int]) -> dict[str, object]:
         name
         for name in (
             "height_m",
+            "height",
             "values",
             "data",
             "path",
@@ -652,6 +653,28 @@ def prepare_torch_geometry(
                     float(affine.a),
                 )
             return ("raster", *raster_payload(value))
+        # Datum-adjusted samplers remain useful as an internal geometry
+        # composition.  Flatten the common raster-plus-constant case here so
+        # the numerical kernel still receives one authoritative raster view.
+        orthometric = getattr(value, "orthometric_dem", None)
+        geoid = getattr(value, "geoid", None)
+        if orthometric is not None and geoid is not None:
+            inner = dem_payload(orthometric)
+            correction = dem_payload(geoid)
+            if inner[0] == "constant" and correction[0] == "constant":
+                return ("constant", float(inner[1]) + float(correction[1]))
+            if inner[0] == "raster" and correction[0] == "constant":
+                return (
+                    "raster",
+                    inner[1] + float(correction[1]),
+                    *inner[2:],
+                )
+            message = (
+                "datum-adjusted DEM requires a raster-plus-constant or "
+                "constant-plus-constant composition for Torch geometry"
+            )
+            logger.error(message)
+            raise TypeError(message)
         message = f"unsupported DEM type: {kind}"
         logger.error(message)
         raise TypeError(message)

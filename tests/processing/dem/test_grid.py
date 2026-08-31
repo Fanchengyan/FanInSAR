@@ -45,3 +45,15 @@ def test_grid_spec_rejects_invalid_bounds_and_transform() -> None:
             height=2,
             width=2,
         )
+
+
+def test_grid_spec_normalizes_positive_row_down_legacy_tuple_once() -> None:
+    """Legacy lower-edge tuples become canonical north-up transforms."""
+    grid = GridSpec(
+        crs="EPSG:4326",
+        transform=(10.0, 2.0, 0.0, 20.0, 0.0, 3.0),
+        shape=(4, 5),
+        resolution_m=(2.0, 3.0),
+    )
+    assert grid.transform[:6] == (2.0, 0.0, 10.0, 0.0, -3.0, 32.0)
+    assert grid.bounds == (10.0, 20.0, 20.0, 32.0)

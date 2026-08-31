@@ -453,7 +453,7 @@ def test_shared_lut_apply_twice_same_shape() -> None:
 
 def test_build_geo2rdr_lut_accepts_height_array() -> None:
     """Per-pixel height_m array is accepted (DEM-aware LUT path)."""
-    from faninsar.processing.geometry import ConstantHeightDEM
+    from faninsar.processing.dem import ConstantDEM
 
     geom = _toy_geometry((32, 64))
     grid = _projected_grid()
@@ -472,7 +472,7 @@ def test_build_geo2rdr_lut_accepts_height_array() -> None:
         grid=grid,
         full_radar_shape=(32, 64),
         height_m=1000.0,
-        dem=ConstantHeightDEM(1000.0),
+        dem=ConstantDEM(1000.0),
         device="cpu",
         chunk_size=2,
     )

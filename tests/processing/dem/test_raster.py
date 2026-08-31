@@ -36,3 +36,11 @@ def test_save_requires_new_geotiff(tmp_path) -> None:
         raster.save(path)
     with pytest.raises(ValueError):
         raster.save(tmp_path / "dem.xyz")
+
+
+def test_raster_dem_rejects_undersized_source_without_bilinear_fallback() -> None:
+    """The public DEM sampler requires the qualified P0032 6x6 support."""
+    grid = _grid(4)
+    raster = RasterDEM(array=np.ones((4, 4), dtype=np.float32), grid=grid)
+    with pytest.raises(ValueError, match="6x6 source support"):
+        raster.sample(np.array([1.5]), np.array([10.15]))

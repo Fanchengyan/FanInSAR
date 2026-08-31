@@ -877,7 +877,21 @@ def _public_raster_dem_native_arrays(
             ),
             shape=source.shape,
         )
-        source = source.to_raster(view_grid)
+        # Geometry owns a private geographic execution view.  Do not route a
+        # projected public RasterDEM through ``to_raster``: that would publish
+        # an EPSG:4326 staging raster and introduce a second public warp.  The
+        # source sampler is evaluated directly at the private view centres;
+        # the resulting arrays never leave this geometry preparation seam.
+        view_x, view_y = view_grid.xy_pixel_centers()
+        source = RasterDEM(
+            array=np.asarray(
+                dem.sample(np.asarray(view_y), np.asarray(view_x)),
+                dtype=np.float32,
+            ),
+            grid=view_grid,
+            vertical_datum=dem.vertical_datum,
+            provenance={"kind": "private-geometry-view"},
+        )
     values = np.asarray(source.array, dtype=np.float64)
     if values.ndim != 2 or min(values.shape) < 6:
         raise DispatchError("native rdr2geo DEM must be at least 6x6")
