@@ -273,14 +273,21 @@ class SourceDEM(DEM):
         provider lane installs the materializer at this boundary.
         """
         _admit_grid(grid)
-        _admit_datum(vertical_datum)
+        target_datum = _admit_datum(vertical_datum)
         if self.cache_dir is None:
             message = "SourceDEM.to_raster requires an explicit cache_dir"
             logger.error(message)
             raise ValueError(message)
-        message = f"DEM source materialization is not installed for {self.product}"
-        logger.error(message)
-        raise NotImplementedError(message)
+        from .providers import get_provider, materialize_source
+
+        selection = f"{self.product}:{self.provider or 'pc'}"
+        source = get_provider("glo30:pc" if self.product == "auto" else selection)
+        result = materialize_source(source, grid, cache_dir=self.cache_dir)
+        if not isinstance(result, RasterDEM):
+            raise TypeError("DEM provider did not return a RasterDEM")
+        if target_datum == result.vertical_datum:
+            return result
+        return result.to_raster(grid, vertical_datum=target_datum)
 
 
 class ConstantDEM(DEM):
