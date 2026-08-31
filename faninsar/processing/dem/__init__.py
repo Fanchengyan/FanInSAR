@@ -37,13 +37,20 @@ from .providers import (
     PC_STAC_URL,
     PcStacSource,
     ProviderUnavailableError,
+    SourceConflictError,
     SourceResource,
     get_provider,
     materialize_source,
     parse_selection,
 )
 from .resources import ResourceBudget, ResourcePreflightError, preflight_grid
-from .seam import ExplicitAntimeridianError, SeamAwareSourceSampler, plan_query_windows
+from .seam import (
+    SOURCE_KERNEL_RADIUS,
+    SOURCE_KERNEL_SIZE,
+    ExplicitAntimeridianError,
+    SeamAwareSourceSampler,
+    plan_query_windows,
+)
 from .transport import (
     BoundedTransferError,
     download,
@@ -64,6 +71,8 @@ __all__ = [
     "GLO90_PC",
     "PC_REGISTRY",
     "PC_STAC_URL",
+    "SOURCE_KERNEL_RADIUS",
+    "SOURCE_KERNEL_SIZE",
     "ArtifactValidationError",
     "BoundedTransferError",
     "CachePathError",
@@ -83,6 +92,7 @@ __all__ = [
     "ResourceBudget",
     "ResourcePreflightError",
     "SeamAwareSourceSampler",
+    "SourceConflictError",
     "SourceDEM",
     "SourceResource",
     "VerticalDatum",

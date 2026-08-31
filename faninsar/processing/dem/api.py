@@ -290,13 +290,16 @@ class SourceDEM(DEM):
     ) -> None:
         """Validate a canonical product/provider selection without network I/O."""
         selection = str(product).strip().lower()
-        name, separator, provider = selection.partition(":")
-        if name not in _PRODUCTS or (separator and not provider):
+        try:
+            from .providers import parse_selection
+
+            name, provider = parse_selection(selection)
+        except (TypeError, ValueError) as error:
             message = f"unsupported DEM source selection {product!r}"
-            logger.error(message)
-            raise ValueError(message)
+            logger.exception(message)
+            raise ValueError(message) from error
         self.product = name
-        self.provider = provider or None
+        self.provider = provider
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
 
     def to_raster(
@@ -320,8 +323,14 @@ class SourceDEM(DEM):
             raise ValueError(message)
         from .providers import get_provider, materialize_source
 
-        selection = f"{self.product}:{self.provider or 'pc'}"
-        source = get_provider("glo30:pc" if self.product == "auto" else selection)
+        selection = (
+            "auto"
+            if self.product == "auto"
+            else self.product
+            if self.provider is None
+            else f"{self.product}:{self.provider}"
+        )
+        source = get_provider(selection)
         result = materialize_source(
             source, grid, cache_dir=self.cache_dir, budget=budget
         )
@@ -410,7 +419,7 @@ class RasterDEM(DEM):
         grid: GridSpec | None = None,
         *,
         path: Path | None = None,
-        vertical_datum: VerticalDatum | None = "ellipsoidal",
+        vertical_datum: VerticalDatum | None = None,
         nodata: float | None = None,
         provenance: Mapping[str, object] | None = None,
     ) -> None:
@@ -447,6 +456,11 @@ class RasterDEM(DEM):
             message = "RasterDEM requires array and grid, or path"
             logger.error(message)
             raise TypeError(message)
+        if vertical_datum is None:
+            # Array-backed DEMs have no external metadata and use the public
+            # constructor's documented ellipsoidal default. Path-backed DEMs
+            # must have been resolved above from an explicit argument/tag.
+            vertical_datum = "ellipsoidal"
         _admit_grid(grid)
         preflight_grid(grid.height, grid.width)
         datum = _admit_datum(
@@ -465,6 +479,8 @@ class RasterDEM(DEM):
             **({} if provenance is None else dict(provenance)),
         }
         self._provenance = _freeze_mapping(metadata)
+        source_path = self._provenance.get("source_path")
+        self._path = None if source_path is None else Path(source_path)
         self._identity = _identity(self._array, grid, datum, self._provenance)
 
     def sample(
@@ -538,6 +554,11 @@ class RasterDEM(DEM):
     def nodata(self) -> float | None:
         """Return the declared output nodata value, if any."""
         return self._nodata
+
+    @property
+    def path(self) -> Path | None:
+        """Return the local source path when this raster was file-backed."""
+        return self._path
 
     @property
     def identity(self) -> str:

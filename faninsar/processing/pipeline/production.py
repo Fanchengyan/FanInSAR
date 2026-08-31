@@ -36,13 +36,19 @@ from faninsar.processing.coreg import (
     resample_complex_deramped_reramp,
     resolve_ampcor_policy,
 )
-from faninsar.processing.dem import ConstantDEM
+from faninsar.processing.dem import (
+    DEM,
+    ConstantDEM,
+    GridSpec,
+)
+from faninsar.processing.dem import (
+    RasterDEM as PublicRasterDEM,
+)
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import (
     RadarGeometryModel,
 )
 from faninsar.processing.geometry.baseline import BaselineComponents
-from faninsar.processing.geometry.dem import DatumAdjustedDEM, RasterDEM
 from faninsar.processing.geometry.prepare_production import (
     run_geo2rdr,
     run_rdr2geo_chunked,
@@ -85,7 +91,6 @@ if TYPE_CHECKING:
         ResourceLimits,
     )
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.dem import DEM
     from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
@@ -3655,13 +3660,12 @@ def resolve_auto_dem(
     dem_source: str | None = None,
     output_name: str | None = None,
 ) -> DEM:
-    """Build (or reuse) the automatic DEM mosaic and apply one wrap rule.
+    """Build (or reuse) the automatic DEM raster on one geographic grid.
 
     This is the single datum-aware DEM entry point shared by
     the Stack provider, its sweep helper, and ``faninsar frame``:
-    The canonical datum conversion is applied only when ``geoid_correction`` is
-    requested AND the live selection's registry metadata declares an
-    orthometric vertical datum; ellipsoidal sources are returned unwrapped.
+    The provider is selected through the public DEM facade and the datum
+    conversion is applied at target pixel centres when requested.
 
     Parameters
     ----------
@@ -3670,8 +3674,8 @@ def resolve_auto_dem(
     output_dir : path
         Directory receiving ``dem/<name>.tif``.
     geoid_correction : bool, optional
-        Whether an orthometric DEM should be wrapped into a geoid-adjusted
-        sampler. Defaults to True.
+        Whether orthometric heights should be converted to ellipsoidal values.
+        Defaults to True.
     dem_source : str, optional
         Selection grammar value (``<product>`` / ``<product>:<provider>``);
         ``None`` defers to ``FANINSAR_DEM_SOURCE`` / the ``glo30`` default.
@@ -3685,26 +3689,43 @@ def resolve_auto_dem(
 
     Raises
     ------
-    InvalidProcessingStateError
-        If ``FANINSAR_DEM_CACHE_DIR`` is unset or the selected provider
-        fails (structured outage).
+    ValueError
+        If bounds or the selected source grammar is invalid.
 
     """
-    from faninsar.processing.geometry.dem_manager import (
-        default_dem_name,
-        get_dem_manager,
-    )
-
-    name = output_name if output_name is not None else default_dem_name()
-    manager = get_dem_manager(source=dem_source)
+    west, south, east, north = (float(value) for value in bounds)
+    if not (-180.0 <= west <= east <= 180.0 and -90.0 <= south <= north <= 90.0):
+        message = f"invalid automatic DEM bounds: {bounds!r}"
+        logger.error(message)
+        raise ValueError(message)
+    name = output_name or os.environ.get("FANINSAR_DEM_NAME", "dem.tif")
     out_path = Path(output_dir) / "dem" / name
-    dem_path = manager.fetch_dem(bounds, out_path)
-    logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
-    sampler: DEM = RasterDEM(dem_path, interpolation="biquintic")
-    if geoid_correction and manager.vertical_datum != "ellipsoidal":
-        from faninsar.processing.geometry.egm96 import EGM96Geoid
+    if out_path.is_file():
+        return DEM.from_raster(out_path, vertical_datum="ellipsoidal")
 
-        sampler = DatumAdjustedDEM(sampler, EGM96Geoid())
+    selection = dem_source or os.environ.get("FANINSAR_DEM_SOURCE", "glo30")
+    cache_root = Path(
+        os.environ.get("FANINSAR_DEM_CACHE_DIR", str(Path(output_dir) / "dem-cache"))
+    )
+    # Automatic production uses a small geographic target grid only as the
+    # requested output identity.  The provider performs one direct warp from
+    # source tiles to this grid; no intermediate manager/mosaic is involved.
+    resolution_deg = 30.0 / 111_320.0
+    width = max(1, int(np.ceil((east - west) / resolution_deg)))
+    height = max(1, int(np.ceil((north - south) / resolution_deg)))
+    grid = GridSpec(
+        "EPSG:4326",
+        (resolution_deg, 0.0, west, 0.0, -resolution_deg, north),
+        shape=(height, width),
+    )
+    source = DEM.from_source(selection, cache_dir=cache_root)
+    target_datum = "ellipsoidal" if geoid_correction else "egm2008"
+    sampler = source.to_raster(
+        grid,
+        vertical_datum=target_datum,
+    )
+    sampler.save(out_path)
+    logger.info("Automatic DEM built for %s: %s", bounds, out_path)
     return sampler
 
 
@@ -4148,7 +4169,7 @@ def produce_interferogram_pair(
     unwrap : bool, optional
         Run unwrapping on the merged wrapped phase when True.
     geoid_correction : bool, optional
-        Convert orthometric raster DEM heights to ellipsoidal with EGM96.
+        Convert orthometric raster DEM heights to ellipsoidal with EGM2008.
         Default True.
     dem_source : str, optional
         DEM selection for the automatic bare-name build (``<product>`` or
@@ -4223,27 +4244,25 @@ def produce_interferogram_pair(
             record_scientific_lineage=record_scientific_lineage,
         )
     from faninsar.missions.sentinel1.safe import open_safe_product
-    from faninsar.processing.geometry.dem import (
-        admit_dem_device_identity,
-        clone_raster_dem,
-        pin_dem_sampler_device,
-    )
-    from faninsar.processing.geometry.egm96 import EGM96Geoid
-
-    dem_identity = admit_dem_device_identity(device)
     dem_sampler: DEM = dem if dem is not None else ConstantDEM(0.0)
-    dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
     snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
-    if snapshot_root is not None and isinstance(dem_sampler, RasterDEM):
+    if snapshot_root is not None and isinstance(dem_sampler, PublicRasterDEM):
         from faninsar.processing.source_snapshots import snapshot_local_source
 
-        dem_snapshot = snapshot_local_source(
-            dem_sampler.path,
-            snapshot_root / "dem",
+        if dem_sampler.path is not None:
+            dem_snapshot = snapshot_local_source(
+                dem_sampler.path,
+                snapshot_root / "dem",
+            )
+            dem_sampler = DEM.from_raster(
+                dem_snapshot.path,
+                vertical_datum=dem_sampler.vertical_datum,
+            )
+    if geoid_correction and isinstance(dem_sampler, PublicRasterDEM):
+        dem_sampler = dem_sampler.to_raster(
+            dem_sampler.grid,
+            vertical_datum="ellipsoidal",
         )
-        dem_sampler = clone_raster_dem(dem_sampler, path=dem_snapshot.path)
-    if geoid_correction and isinstance(dem_sampler, RasterDEM):
-        dem_sampler = DatumAdjustedDEM(dem_sampler, EGM96Geoid())
 
     primary_paths = _as_frame_paths(primary_path, "primary_path")
     sec_paths = _as_frame_paths(secondary_path, "secondary_path")
@@ -4376,7 +4395,6 @@ def produce_interferogram_pair(
             geoid_correction=geoid_correction,
             dem_source=dem_source,
         )
-        dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
 
     range_offsets = _swath_range_offsets(swath_tuple, primary_products)
     primary_swath0 = primary_products[0].swath(swath_tuple[0])
@@ -4915,13 +4933,6 @@ def _produce_interferogram_sweep(
 ) -> ProductionPairState | ProductionPairSweepResult:
     """Run one shared prefix and emit every look configuration."""
     from faninsar.missions.sentinel1.safe import open_safe_product
-    from faninsar.processing.geometry.dem import (
-        admit_dem_device_identity,
-        clone_raster_dem,
-        pin_dem_sampler_device,
-    )
-    from faninsar.processing.geometry.egm96 import EGM96Geoid
-
     if (prepared_geo_lut_handles is None) != (prepared_provider_root is None):
         reject_invalid_state(
             "prepared Geo LUT reuse requires both handles and provider root"
@@ -4965,20 +4976,25 @@ def _produce_interferogram_sweep(
             if stale.exists():
                 shutil.rmtree(stale)
 
-    dem_identity = admit_dem_device_identity(device)
     dem_sampler: DEM = dem if dem is not None else ConstantDEM(0.0)
-    dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
     snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
-    if snapshot_root is not None and isinstance(dem_sampler, RasterDEM):
+    if snapshot_root is not None and isinstance(dem_sampler, PublicRasterDEM):
         from faninsar.processing.source_snapshots import snapshot_local_source
 
-        dem_snapshot = snapshot_local_source(
-            dem_sampler.path,
-            snapshot_root / "dem",
+        if dem_sampler.path is not None:
+            dem_snapshot = snapshot_local_source(
+                dem_sampler.path,
+                snapshot_root / "dem",
+            )
+            dem_sampler = DEM.from_raster(
+                dem_snapshot.path,
+                vertical_datum=dem_sampler.vertical_datum,
+            )
+    if geoid_correction and isinstance(dem_sampler, PublicRasterDEM):
+        dem_sampler = dem_sampler.to_raster(
+            dem_sampler.grid,
+            vertical_datum="ellipsoidal",
         )
-        dem_sampler = clone_raster_dem(dem_sampler, path=dem_snapshot.path)
-    if geoid_correction and isinstance(dem_sampler, RasterDEM):
-        dem_sampler = DatumAdjustedDEM(dem_sampler, EGM96Geoid())
 
     primary_paths = _as_frame_paths(primary_path, "primary_path")
     sec_paths = _as_frame_paths(secondary_path, "secondary_path")
@@ -5110,7 +5126,6 @@ def _produce_interferogram_sweep(
             geoid_correction=geoid_correction,
             dem_source=dem_source,
         )
-        dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
 
     range_offsets = _swath_range_offsets(swath_tuple, primary_products)
     primary_swath0 = primary_products[0].swath(swath_tuple[0])

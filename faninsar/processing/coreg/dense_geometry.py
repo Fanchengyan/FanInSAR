@@ -22,7 +22,7 @@ from faninsar.processing.geometry.prepare_production import (
 )
 
 if TYPE_CHECKING:
-    from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.dem import DEM
     from faninsar.processing.geometry.transforms import RadarGeometryModel
     from faninsar.typing import DeviceLike
 
@@ -110,7 +110,7 @@ def _control_point_geometry_offsets(
     reference_model: RadarGeometryModel,
     secondary_model: RadarGeometryModel,
     device: DeviceLike,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     stride: int = 32,
     max_iter: int = 30,
     range_tol_m: float = 0.001,
@@ -135,7 +135,7 @@ def _control_point_geometry_offsets(
         Geometry models for the reference and secondary images.
     device : DeviceLike
         Required production device (``auto`` resolves to cpu or cuda).
-    dem : DEMSampler | None, optional
+    dem : DEM | None, optional
         DEM height sampler.  If ``None``, a constant zero-height ellipsoid
         is used.
     stride : int, optional
@@ -238,7 +238,7 @@ def dense_geometry_offsets(
     reference_model: RadarGeometryModel,
     secondary_model: RadarGeometryModel,
     device: DeviceLike,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     stride: int = 32,
     max_iter: int = 30,
     range_tol_m: float = 0.001,
@@ -263,7 +263,7 @@ def dense_geometry_offsets(
         Geometry models for the reference and secondary images.
     device : DeviceLike
         Required production device (``auto`` resolves to cpu or cuda).
-    dem : DEMSampler | None, optional
+    dem : DEM | None, optional
         DEM height sampler.  If ``None``, a constant zero-height ellipsoid
         is used.
     stride : int, optional
@@ -421,7 +421,7 @@ def geometry_offset_window_extent(
     reference_model: RadarGeometryModel,
     secondary_model: RadarGeometryModel,
     device: DeviceLike,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     probe_stride: int = 64,
     max_iter: int = 30,
     range_tol_m: float = 0.001,
@@ -448,7 +448,7 @@ def geometry_offset_window_extent(
         Geometry models for the reference and secondary images.
     device : DeviceLike
         Required production device (``auto`` resolves to cpu or cuda).
-    dem : DEMSampler | None, optional
+    dem : DEM | None, optional
         DEM height sampler.  If ``None``, a constant zero-height ellipsoid
         is used.
     probe_stride : int, optional

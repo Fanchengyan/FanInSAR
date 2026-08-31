@@ -40,7 +40,7 @@ from faninsar.processing.geometry.v2 import (
 if TYPE_CHECKING:
     import torch
 
-    from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.dem import DEM
     from faninsar.processing.geometry.transforms import RadarGeometryModel
 
 logger = setup_logger(__name__)
@@ -450,7 +450,7 @@ class PreparedTorchGeometry:
 
     operation: GeometryOperation
     model: RadarGeometryModel
-    dem: DEMSampler | None
+    dem: DEM | None
     shape: tuple[int, ...]
     settings: TorchGeometrySettings
     operation_settings: OperationSettings
@@ -525,7 +525,7 @@ def prepare_torch_geometry(
     model: RadarGeometryModel,
     *,
     shape: tuple[int, ...],
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     device: str | torch.device = "cpu",
     dtype: str | torch.dtype | None = None,
     max_iter: int = 20,
@@ -629,22 +629,29 @@ def prepare_torch_geometry(
     def dem_payload(value: object) -> tuple[object, ...]:
         """Materialize supported DEM compositions into one device payload."""
         kind = type(value).__name__
-        if kind == "ConstantHeightDEM":
-            return ("constant", float(value.height_m))  # type: ignore[attr-defined]
+        if kind == "ConstantDEM":
+            return ("constant", float(value.height))  # type: ignore[attr-defined]
         if kind == "RasterDEM":
+            if hasattr(value, "array") and hasattr(value, "grid"):
+                from affine import Affine
+
+                affine = Affine(*value.grid.transform)  # type: ignore[attr-defined]
+                samples = torch.as_tensor(
+                    np.asarray(value.array, dtype=np.float64),  # type: ignore[attr-defined]
+                    dtype=torch.float64,
+                    device=resolved_device,
+                ).contiguous()
+                if samples.ndim != 2 or min(samples.shape) < 6:
+                    raise ValueError("RasterDEM must provide at least a 6x6 grid")
+                return (
+                    "raster",
+                    samples,
+                    float(affine.f),
+                    float(affine.c),
+                    float(affine.e),
+                    float(affine.a),
+                )
             return ("raster", *raster_payload(value))
-        if kind == "GeoidAdjustedDEM":
-            left = dem_payload(value.orthometric_dem)  # type: ignore[attr-defined]
-            right = dem_payload(value.geoid)  # type: ignore[attr-defined]
-            if left[0] == right[0] == "constant":
-                return ("constant", left[1] + right[1])
-            if left[0] == "constant":
-                left, right = right, left
-            if right[0] == "constant":
-                return ("raster", left[1] + right[1], *left[2:])
-            if left[0] != right[0] or left[2:] != right[2:]:
-                raise ValueError("composed RasterDEM grids must share affine metadata")
-            return ("raster", left[1] + right[1], *left[2:])
         message = f"unsupported DEM type: {kind}"
         logger.error(message)
         raise TypeError(message)
@@ -988,7 +995,7 @@ def torch_rdr2geo(
     azimuth_index: object,
     range_index: object,
     *,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     height_m: object | None = None,
     **kwargs: object,
 ) -> TorchGeometryResult:

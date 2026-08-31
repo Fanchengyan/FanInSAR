@@ -49,6 +49,7 @@ from faninsar.processing.coreg.misreg_network import (
     MisregArc,
     invert_pair_misregistration,
 )
+from faninsar.processing.dem import SourceDEM
 from faninsar.processing.errors import (
     reject_invalid_state,
 )
@@ -1614,6 +1615,14 @@ class Stack(Network):
                 capability,
                 reason,
             )
+        options = dict(options)
+        # A Stack owns exactly one materialized DEM on its authoritative
+        # output grid.  Materialize a source recipe at the first production
+        # boundary and reuse that raster for every scene/LUT callback.
+        if isinstance(self.config.dem, SourceDEM):
+            self.config.dem = self.materialize_dem(self.config.dem)
+        if self.config.dem is not None:
+            options.setdefault("dem", self.config.dem)
         return self.scene_provider(
             SourceHandle._from_source(primary_path),
             SourceHandle._from_source(secondary_path),

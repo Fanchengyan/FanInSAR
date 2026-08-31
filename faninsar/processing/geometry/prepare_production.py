@@ -18,11 +18,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from faninsar.logging import setup_logger
+from faninsar.processing.dem import ConstantDEM, GridSpec, RasterDEM
 from faninsar.processing.geometry.backend_dispatch import (
     DispatchError,
     resolve_geometry_device,
 )
-from faninsar.processing.geometry.dem import ConstantHeightDEM
 from faninsar.processing.geometry.native_v2.builder import (
     NativeBackend,
     NativeBuilder,
@@ -42,7 +42,7 @@ from faninsar.processing.geometry.v2 import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.dem import DEM
     from faninsar.processing.geometry.public import PreparedGeometry
     from faninsar.processing.geometry.transforms import RadarGeometryModel
     from faninsar.typing import DeviceLike
@@ -104,7 +104,7 @@ def _resident_gpu_dem(
     dem_digest: str,
     device_identity: str,
     torch_device: object,
-    dem: DEMSampler | None,
+    dem: DEM | None,
 ) -> dict[str, object]:
     """Return device DEM tensors, uploading once per digest and device.
 
@@ -139,7 +139,7 @@ def _prepared_cache_key(
     *,
     shape: tuple[int, ...],
     resolved: object,
-    dem: DEMSampler | None,
+    dem: DEM | None,
     solver: SolverSettings,
     physical_uuid: str | None,
     mig_uuid: str | None,
@@ -494,7 +494,7 @@ def _prepare_geometry_identities(
     *,
     shape: tuple[int, ...],
     resolved: object,
-    dem: DEMSampler | None,
+    dem: DEM | None,
     solver: SolverSettings,
     native_ok: bool,
     loaded: object,
@@ -550,7 +550,7 @@ def prepare_production_geometry(
     *,
     device: DeviceLike,
     shape: Sequence[int],
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     settings: SolverSettings | None = None,
 ) -> PreparedGeometry:
     """Prepare production geometry without exposing UUID or native executor.
@@ -566,7 +566,7 @@ def prepare_production_geometry(
         ``mps`` fails closed after resolution.
     shape : sequence of int
         Exact input shape for this prepare (tile shape, not full grid).
-    dem : DEMSampler, optional
+    dem : DEM, optional
         Height sampler for ``rdr2geo``.
     settings : SolverSettings, optional
         Iteration and tolerance settings.
@@ -603,7 +603,7 @@ def prepare_production_geometry(
     normalized_shape = tuple(int(value) for value in shape)
     dem_arg = dem
     if op is Operation.RDR2GEO and dem_arg is None:
-        dem_arg = ConstantHeightDEM(0.0)
+        dem_arg = ConstantDEM(0.0)
     cache_key = _prepared_cache_key(
         op,
         model,
@@ -824,7 +824,7 @@ def _geo2rdr_native_manifest(
 
 
 def _dem_native_arrays(
-    dem: DEMSampler | None,
+    dem: DEM | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Materialize DEM raster, affine metadata, and height bounds.
 
@@ -832,37 +832,12 @@ def _dem_native_arrays(
     CUDA dispatch reorders that tuple to the native ABI. Constant-height DEMs
     become a coarse global raster so the six-point stencil stays in-bounds.
     """
-    from faninsar.processing.geometry.dem import GeoidAdjustedDEM, RasterDEM
-
-    sampler = ConstantHeightDEM(0.0) if dem is None else dem
-    if isinstance(sampler, GeoidAdjustedDEM):
-        ortho = sampler.orthometric_dem
-        geoid = sampler.geoid
-        if not isinstance(ortho, RasterDEM) or not isinstance(geoid, RasterDEM):
-            message = "native CUDA rdr2geo needs RasterDEM members on GeoidAdjustedDEM"
-            raise DispatchError(message)
-        values, metadata, bounds = _raster_dem_native_arrays(ortho)
-        geoid_values, geoid_metadata, _geoid_bounds = _raster_dem_native_arrays(geoid)
-        if not np.allclose(metadata, geoid_metadata):
-            message = "native CUDA rdr2geo GeoidAdjustedDEM grids must share affine"
-            raise DispatchError(message)
-        if geoid_values.shape != values.shape:
-            message = "native CUDA rdr2geo GeoidAdjustedDEM grids must share shape"
-            raise DispatchError(message)
-        values = values + geoid_values
-        finite = np.isfinite(values)
-        if not np.any(finite):
-            raise DispatchError("native CUDA rdr2geo DEM has no finite samples")
-        bounds = np.array(
-            [float(np.min(values[finite])), float(np.max(values[finite]))],
-            dtype=np.float64,
-        )
-        return values, metadata, bounds
+    sampler = ConstantDEM(0.0) if dem is None else dem
     if isinstance(sampler, RasterDEM):
-        return _raster_dem_native_arrays(sampler)
-    if isinstance(sampler, ConstantHeightDEM):
+        return _public_raster_dem_native_arrays(sampler)
+    if isinstance(sampler, ConstantDEM):
         rows, cols = 80, 160
-        height = float(sampler.height_m)
+        height = float(sampler.height)
         values = np.full((rows, cols), height, dtype=np.float64)
         metadata = np.array(
             [90.0, -180.0, -180.0 / float(rows - 1), 360.0 / float(cols - 1)],
@@ -874,38 +849,44 @@ def _dem_native_arrays(
     raise DispatchError(message)
 
 
-def _raster_dem_native_arrays(
-    dem: object,
+def _public_raster_dem_native_arrays(
+    dem: RasterDEM,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Upload one RasterDEM into the native context arrays."""
-    dataset = dem._open()
-    samples = dem._height_array
-    if samples is None:
-        samples = dataset.read(1).astype(np.float32, copy=False)
-        nodata = dem.nodata
-        if nodata is None:
-            nodata = dataset.nodata
-        if nodata is not None:
-            samples = np.where(np.isclose(samples, nodata), np.nan, samples)
-        dem._height_array = samples
-    transform = dataset.transform
-    if abs(float(transform.b)) > 1.0e-12 or abs(float(transform.d)) > 1.0e-12:
-        raise DispatchError(
-            "native CUDA rdr2geo requires an unrotated geographic DEM affine"
+    """Build the private WGS84 execution view for a public ``RasterDEM``."""
+    from affine import Affine
+    from pyproj import Transformer
+
+    source = dem
+    if source.crs != "EPSG:4326":
+        transformer = Transformer.from_crs(source.crs, "EPSG:4326", always_xy=True)
+        west, south, east, north = source.bounds
+        longitudes, latitudes = transformer.transform(
+            [west, east, west, east], [south, south, north, north]
         )
-    values = np.asarray(samples, dtype=np.float64)
+        lon_min, lon_max = float(np.min(longitudes)), float(np.max(longitudes))
+        lat_min, lat_max = float(np.min(latitudes)), float(np.max(latitudes))
+        view_grid = GridSpec(
+            "EPSG:4326",
+            Affine(
+                (lon_max - lon_min) / source.width,
+                0.0,
+                lon_min,
+                0.0,
+                -(lat_max - lat_min) / source.height,
+                lat_max,
+            ),
+            shape=source.shape,
+        )
+        source = source.to_raster(view_grid)
+    values = np.asarray(source.array, dtype=np.float64)
     if values.ndim != 2 or min(values.shape) < 6:
-        raise DispatchError("native CUDA rdr2geo DEM must be at least 6x6")
+        raise DispatchError("native rdr2geo DEM must be at least 6x6")
     finite = np.isfinite(values)
     if not np.any(finite):
-        raise DispatchError("native CUDA rdr2geo DEM has no finite samples")
+        raise DispatchError("native rdr2geo DEM has no finite samples")
+    affine = Affine(*source.grid.transform)
     metadata = np.array(
-        [
-            float(transform.f),
-            float(transform.c),
-            float(transform.e),
-            float(transform.a),
-        ],
+        [float(affine.f), float(affine.c), float(affine.e), float(affine.a)],
         dtype=np.float64,
     )
     bounds = np.array(
@@ -924,7 +905,7 @@ def _rdr2geo_native_manifest(
     physical_uuid: str | None,
     mig_uuid: str | None,
     module: object,
-    dem: DEMSampler | None,
+    dem: DEM | None,
 ) -> tuple[object, dict[str, object]]:
     """Build the CandidateKey + orbit/DEM context for CUDA rdr2geo."""
     from faninsar.processing.geometry.backend_dispatch import CandidateKey
@@ -934,7 +915,7 @@ def _rdr2geo_native_manifest(
     if not physical_uuid:
         message = "CUDA native rdr2geo requires a physical UUID"
         raise DispatchError(message)
-    dem_arg = ConstantHeightDEM(0.0) if dem is None else dem
+    dem_arg = ConstantDEM(0.0) if dem is None else dem
     torch_prepared = prepare_torch_geometry(
         Operation.RDR2GEO,
         model,
@@ -1087,7 +1068,7 @@ def run_rdr2geo(
     model: RadarGeometryModel,
     azimuth_index: np.ndarray,
     range_index: np.ndarray,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     *,
     device: DeviceLike,
     max_iter: int = 20,
@@ -1117,7 +1098,7 @@ def run_rdr2geo_chunked(
     model: RadarGeometryModel,
     azimuth_index: np.ndarray,
     range_index: np.ndarray,
-    dem: DEMSampler | None,
+    dem: DEM | None,
     *,
     device: DeviceLike,
     chunk_size: tuple[int, int] = (256, 256),

@@ -12,9 +12,11 @@ from faninsar.logging import setup_logger
 
 from ..resources import ResourceBudget, preflight_grid
 from ..seam import (
+    SOURCE_KERNEL_SIZE,
     SeamAwareSourceSampler,
     canonical_item_ids,
     plan_query_windows,
+    unwrap_longitude,
 )
 from ..transport import (
     resolve_cache_path,
@@ -25,6 +27,8 @@ from ..transport import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    import numpy as np
+
 logger = setup_logger(__name__)
 
 PC_STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
@@ -34,6 +38,24 @@ PC_ASSET_HOST = "elevationeuwest.blob.core.windows.net"
 
 class ProviderUnavailableError(RuntimeError):
     """Raised when a registered provider cannot serve a request."""
+
+
+class SourceConflictError(ProviderUnavailableError):
+    """Raised when overlapping source windows disagree at a target pixel."""
+
+
+@dataclass(frozen=True, slots=True)
+class _P0030Source:
+    """Private adapter around one accepted P0030 product/provider entry."""
+
+    product: str
+    provider: str
+    entry_name: str
+
+    @property
+    def collection_id(self) -> str:
+        """Return the stable P0030 selection identity."""
+        return f"{self.product}:{self.provider}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,20 +221,143 @@ _PRODUCTS = frozenset(
 def parse_selection(selection: str) -> tuple[str, str | None]:
     """Parse canonical ``product[:provider]`` selection before any I/O."""
     value = str(selection).strip().lower()
-    product, separator, provider = value.partition(":")
-    if product not in _PRODUCTS or (separator and not provider) or value.count(":") > 1:
-        raise ValueError(f"unsupported DEM source selection {selection!r}")
-    return product, provider or None
+    if value == "auto":
+        return "auto", None
+    if value in PC_REGISTRY:
+        product, provider = value.split(":", 1)
+        return product, provider
+    from faninsar.processing.geometry.dem_sources import parse_selection as admit
+
+    entry = admit(value)
+    if ":" not in value:
+        return entry.product, None
+    return entry.product, entry.provider
 
 
-def get_provider(selection: str) -> PcStacSource:
-    """Return the registered PC adapter for a selection."""
+def get_provider(selection: str) -> PcStacSource | _P0030Source:
+    """Return the admitted provider adapter without network I/O."""
     product, provider = parse_selection(selection)
-    key = f"{product}:{provider or 'pc'}"
-    try:
+    if product == "auto":
+        return _P0030Source("auto", "p0030", "auto")
+    if provider is None:
+        from faninsar.processing.geometry.dem_sources import parse_selection as admit
+
+        provider = admit(product).provider
+    key = f"{product}:{provider}"
+    if key in PC_REGISTRY:
         return PC_REGISTRY[key]
-    except KeyError as error:
-        raise ProviderUnavailableError(f"DEM provider is not wired: {selection!r}") from error
+    try:
+        from faninsar.processing.geometry.dem_sources import get_dem_source
+
+        entry = get_dem_source(key)
+    except (KeyError, ValueError) as error:
+        raise ProviderUnavailableError(str(error)) from error
+    return _P0030Source(product, str(provider), entry.name)
+
+
+def _sample_geographic_mosaic(
+    resources: tuple[SourceResource, ...],
+    *,
+    cache_dir: Path,
+    target_longitudes: np.ndarray,
+    target_latitudes: np.ndarray,
+    target_center_longitude: float,
+    max_fetch_bytes: int,
+) -> np.ndarray | None:
+    """Sample one logical geographic mosaic with a cross-window 6x6 halo.
+
+    The complete source windows are placed on one logical array before the
+    fixed P0032 kernel runs.  Consequently a target close to a tile or
+    antimeridian seam sees neighbouring pixels in its six-sample support
+    instead of falling back to the edge of one independently sampled tile.
+    ``None`` requests the generic projected-source path.
+    """
+    import numpy as np
+    import rasterio
+    from affine import Affine
+
+    loaded: list[tuple[SourceResource, np.ndarray, object]] = []
+    for resource in resources:
+        local = resolve_cache_path(cache_dir, resource.cache_path)
+        if not local.is_file():
+            fetch_asset(resource, cache_dir=cache_dir, max_bytes=max_fetch_bytes)
+        with rasterio.open(local) as dataset:
+            source_crs = dataset.crs or resource.crs
+            transform = dataset.transform
+            if str(source_crs).upper() not in {"EPSG:4326", "OGC:CRS84"}:
+                return None
+            if abs(float(transform.b)) > 1.0e-12 or abs(float(transform.d)) > 1.0e-12:
+                return None
+            loaded.append((resource, np.asarray(dataset.read(1), dtype=np.float64), transform))
+    if not loaded:
+        return None
+    resolution_x = abs(float(loaded[0][2].a))
+    resolution_y = abs(float(loaded[0][2].e))
+    if resolution_x == 0.0 or resolution_y == 0.0:
+        return None
+    for _resource, _array, transform in loaded[1:]:
+        if not np.isclose(abs(float(transform.a)), resolution_x) or not np.isclose(
+            abs(float(transform.e)), resolution_y
+        ):
+            return None
+    positions = [
+        unwrap_longitude(float(transform.c), target_center_longitude)
+        for _resource, _array, transform in loaded
+    ]
+    left = min(positions)
+    top = max(float(transform.f) for _resource, _array, transform in loaded)
+    right = max(
+        position + resolution_x * array.shape[1]
+        for position, (_resource, array, _transform) in zip(
+            positions, loaded, strict=True
+        )
+    )
+    bottom = min(
+        float(transform.f) - resolution_y * array.shape[0]
+        for _resource, array, transform in loaded
+    )
+    mosaic = np.full(
+        (
+            max(1, round((top - bottom) / resolution_y)),
+            max(1, round((right - left) / resolution_x)),
+        ),
+        np.nan,
+        dtype=np.float64,
+    )
+    for index in np.argsort(
+        [resource.identity for resource, _array, _transform in loaded]
+    ):
+        resource, array, transform = loaded[int(index)]
+        row = round((top - float(transform.f)) / resolution_y)
+        col = round((positions[int(index)] - left) / resolution_x)
+        target = mosaic[row : row + array.shape[0], col : col + array.shape[1]]
+        overlap = np.isfinite(target) & np.isfinite(array)
+        if np.any(overlap & ~np.isclose(target, array, atol=1e-3, rtol=1e-6)):
+            message = f"overlapping DEM source windows disagree; source={resource.identity}"
+            logger.error(message)
+            raise SourceConflictError(message)
+        fill = ~np.isfinite(target) & np.isfinite(array)
+        target[fill] = array[fill]
+    seam_sampler = SeamAwareSourceSampler(
+        lambda longitude, _latitude: longitude,
+        target_center_longitude,
+    )
+    longitudes = np.asarray(
+        seam_sampler.sample(
+            np.asarray(target_longitudes).ravel().tolist(),
+            np.asarray(target_latitudes).ravel().tolist(),
+        ),
+        dtype=np.float64,
+    ).reshape(np.asarray(target_longitudes).shape)
+    source_transform = Affine(resolution_x, 0.0, left, 0.0, -resolution_y, top)
+    source_columns, source_rows = (~source_transform) * (longitudes, target_latitudes)
+    from faninsar.processing.dem.api import _sample_biquintic
+
+    return _sample_biquintic(
+        mosaic,
+        np.asarray(source_rows, dtype=np.float64),
+        np.asarray(source_columns, dtype=np.float64),
+    )
 
 
 def materialize_source(
@@ -234,6 +379,34 @@ def materialize_source(
     import rasterio
     from affine import Affine
 
+    if isinstance(source, _P0030Source):
+        from pyproj import Transformer
+
+        from faninsar.processing.dem.api import RasterDEM
+        from faninsar.processing.geometry.dem_manager import DEMManager
+
+        left, bottom, right, top = grid.bounds
+        transformer = Transformer.from_crs(grid.crs, "EPSG:4326", always_xy=True)
+        lon_a, lat_a = transformer.transform(left, bottom)
+        lon_b, lat_b = transformer.transform(right, top)
+        manager = DEMManager(
+            cache_dir=Path(cache_dir),
+            source="auto" if source.product == "auto" else source.collection_id,
+        )
+        path = manager.fetch_dem(
+            (
+                min(lon_a, lon_b),
+                min(lat_a, lat_b),
+                max(lon_a, lon_b),
+                max(lat_a, lat_b),
+            )
+        )
+        local = RasterDEM(path=path, vertical_datum=manager.vertical_datum)
+        return local.to_raster(
+            grid,
+            vertical_datum=local.vertical_datum,
+            budget=budget,
+        )
     if not isinstance(source, PcStacSource):
         raise ProviderUnavailableError(f"DEM provider is not wired: {source!r}")
     height, width = int(grid.height), int(grid.width)
@@ -254,6 +427,30 @@ def materialize_source(
         np.arange(height, dtype=np.float64) + 0.5,
     )
     target_x, target_y = target_transform * (columns, rows)
+    target_longitudes, target_latitudes = transformer.transform(target_x, target_y)
+    logical_samples = _sample_geographic_mosaic(
+        resources,
+        cache_dir=cache_dir,
+        target_longitudes=np.asarray(target_longitudes, dtype=np.float64),
+        target_latitudes=np.asarray(target_latitudes, dtype=np.float64),
+        target_center_longitude=0.5 * (bounds[0] + bounds[2]),
+        max_fetch_bytes=(budget.max_fetch_bytes if budget else 2**33),
+    )
+    if logical_samples is not None:
+        from faninsar.processing.dem.api import RasterDEM
+
+        return RasterDEM(
+            array=np.asarray(logical_samples, dtype=np.float32),
+            grid=grid,
+            vertical_datum="egm2008",
+            provenance={
+                "provider": "pc",
+                "collection": source.collection_id,
+                "asset": source.asset_key,
+                "resampling": "direct-source-target",
+                "seam_support": "6x6-logical-mosaic",
+            },
+        )
     from faninsar.processing.dem.api import _sample_biquintic
 
     for resource in resources:
@@ -293,11 +490,25 @@ def materialize_source(
                 ).reshape(np.asarray(source_x).shape)
             source_transform = dataset.transform
             source_columns, source_rows = (~source_transform) * (source_x, source_y)
+            if min(source_array.shape) < SOURCE_KERNEL_SIZE:
+                logger.debug(
+                    "source window is smaller than the qualified %dx%d halo",
+                    SOURCE_KERNEL_SIZE,
+                    SOURCE_KERNEL_SIZE,
+                )
             sampled = _sample_biquintic(
                 source_array,
                 np.asarray(source_rows, dtype=np.float64),
                 np.asarray(source_columns, dtype=np.float64),
             )
+            overlap = np.isfinite(destination) & np.isfinite(sampled)
+            if np.any(overlap & ~np.isclose(destination, sampled, atol=1e-3, rtol=1e-6)):
+                message = (
+                    "overlapping DEM source windows disagree; "
+                    f"source={resource.identity}"
+                )
+                logger.error(message)
+                raise SourceConflictError(message)
             fill = np.isnan(destination) & np.isfinite(sampled)
             destination[fill] = np.asarray(sampled, dtype=np.float32)[fill]
     from faninsar.processing.dem.api import RasterDEM
@@ -346,6 +557,7 @@ def fetch_asset(
 
 __all__ = [
     "GLO30_PC", "GLO90_PC", "PC_REGISTRY", "PC_STAC_URL", "PcStacSource",
-    "ProviderUnavailableError", "SourceResource", "get_provider", "materialize_source",
+    "ProviderUnavailableError", "SourceConflictError", "SourceResource",
+    "get_provider", "materialize_source",
     "parse_selection",
 ]

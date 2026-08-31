@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+SOURCE_KERNEL_SIZE = 6
+SOURCE_KERNEL_RADIUS = SOURCE_KERNEL_SIZE // 2
+
 
 class ExplicitAntimeridianError(ValueError):
     """Raised when caller-explicit source geometry crosses +/-180 degrees."""
@@ -73,6 +76,12 @@ class SeamAwareSourceSampler:
 
     source_sampler: Callable[[float, float], float]
     target_center_longitude: float
+    halo_pixels: int = SOURCE_KERNEL_RADIUS
+
+    def __post_init__(self) -> None:
+        """Enforce the fixed source support required by the DEM kernel."""
+        if self.halo_pixels != SOURCE_KERNEL_RADIUS:
+            raise ValueError("DEM seam sampling requires a fixed 6x6 source halo")
 
     def sample(self, longitudes: Sequence[float], latitudes: Sequence[float]) -> list[float]:
         """Sample points after target-centred longitude unwrapping."""
@@ -85,6 +94,8 @@ class SeamAwareSourceSampler:
 
 
 __all__ = [
+    "SOURCE_KERNEL_RADIUS",
+    "SOURCE_KERNEL_SIZE",
     "ExplicitAntimeridianError",
     "SeamAwareSourceSampler",
     "canonical_item_ids",
