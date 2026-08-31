@@ -9,7 +9,8 @@ import pytest
 
 from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
 from faninsar.processing.coordinates import RadarGrid
-from faninsar.processing.geometry import ConstantHeightDEM, RadarGeometryModel
+from faninsar.processing.geometry import RadarGeometryModel
+from faninsar.processing.geometry.dem import ConstantHeightDEM
 from faninsar.processing.interferometry.flatten import (
     compute_topographic_phase,
     estimate_residual_topographic_scale,

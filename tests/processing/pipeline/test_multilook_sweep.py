@@ -15,7 +15,7 @@ import zarr
 
 from faninsar.missions.sentinel1.errors import Sentinel1ProductError
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.geometry import ConstantHeightDEM
+from faninsar.processing.geometry.dem import ConstantHeightDEM
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.pipeline import ProductionPairState
 from faninsar.processing.pipeline import production as production_mod

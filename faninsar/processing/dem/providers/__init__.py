@@ -255,7 +255,7 @@ def get_provider(selection: str) -> PcStacSource | _P0030Source:
     return _P0030Source(product, str(provider), entry.name)
 
 
-def _sample_geographic_mosaic(
+def _sample_geographic_windows(
     resources: tuple[SourceResource, ...],
     *,
     cache_dir: Path,
@@ -264,80 +264,87 @@ def _sample_geographic_mosaic(
     target_center_longitude: float,
     max_fetch_bytes: int,
 ) -> np.ndarray | None:
-    """Sample one logical geographic mosaic with a cross-window 6x6 halo.
+    """Sample geographic source windows lazily with a cross-window halo.
 
-    The complete source windows are placed on one logical array before the
-    fixed P0032 kernel runs.  Consequently a target close to a tile or
-    antimeridian seam sees neighbouring pixels in its six-sample support
-    instead of falling back to the edge of one independently sampled tile.
-    ``None`` requests the generic projected-source path.
+    Source datasets remain independent.  For each target point this view
+    resolves the six-by-six support pixels against the source windows, reads
+    only those pixels (with a bounded LRU cache), checks deterministic overlap,
+    and evaluates the P0032 stencil once. ``None`` requests the generic
+    projected-source path.
     """
+    from functools import lru_cache
+
     import numpy as np
     import rasterio
-    from affine import Affine
+    from rasterio.windows import Window
 
-    loaded: list[tuple[SourceResource, np.ndarray, object]] = []
+    loaded: list[tuple[SourceResource, object, object, float, float, float, float]] = []
     for resource in resources:
         local = resolve_cache_path(cache_dir, resource.cache_path)
         if not local.is_file():
             fetch_asset(resource, cache_dir=cache_dir, max_bytes=max_fetch_bytes)
-        with rasterio.open(local) as dataset:
-            source_crs = dataset.crs or resource.crs
-            transform = dataset.transform
-            if str(source_crs).upper() not in {"EPSG:4326", "OGC:CRS84"}:
-                return None
-            if abs(float(transform.b)) > 1.0e-12 or abs(float(transform.d)) > 1.0e-12:
-                return None
-            loaded.append((resource, np.asarray(dataset.read(1), dtype=np.float64), transform))
+        dataset = rasterio.open(local)
+        source_crs = dataset.crs or resource.crs
+        transform = dataset.transform
+        if str(source_crs).upper() not in {"EPSG:4326", "OGC:CRS84"}:
+            dataset.close()
+            return None
+        if abs(float(transform.b)) > 1.0e-12 or abs(float(transform.d)) > 1.0e-12:
+            dataset.close()
+            return None
+        left = unwrap_longitude(float(transform.c), target_center_longitude)
+        right = left + abs(float(transform.a)) * int(dataset.width)
+        top = float(transform.f)
+        bottom = top - abs(float(transform.e)) * int(dataset.height)
+        loaded.append((resource, dataset, transform, left, right, bottom, top))
     if not loaded:
         return None
+    loaded.sort(key=lambda item: item[0].identity)
     resolution_x = abs(float(loaded[0][2].a))
     resolution_y = abs(float(loaded[0][2].e))
     if resolution_x == 0.0 or resolution_y == 0.0:
+        for _resource, dataset, _transform, _left, _right, _bottom, _top in loaded:
+            dataset.close()
         return None
-    for _resource, _array, transform in loaded[1:]:
-        if not np.isclose(abs(float(transform.a)), resolution_x) or not np.isclose(
-            abs(float(transform.e)), resolution_y
-        ):
-            return None
-    positions = [
-        unwrap_longitude(float(transform.c), target_center_longitude)
-        for _resource, _array, transform in loaded
-    ]
-    left = min(positions)
-    top = max(float(transform.f) for _resource, _array, transform in loaded)
-    right = max(
-        position + resolution_x * array.shape[1]
-        for position, (_resource, array, _transform) in zip(
-            positions, loaded, strict=True
-        )
-    )
-    bottom = min(
-        float(transform.f) - resolution_y * array.shape[0]
-        for _resource, array, transform in loaded
-    )
-    mosaic = np.full(
-        (
-            max(1, round((top - bottom) / resolution_y)),
-            max(1, round((right - left) / resolution_x)),
-        ),
-        np.nan,
-        dtype=np.float64,
-    )
-    for index in np.argsort(
-        [resource.identity for resource, _array, _transform in loaded]
-    ):
-        resource, array, transform = loaded[int(index)]
-        row = round((top - float(transform.f)) / resolution_y)
-        col = round((positions[int(index)] - left) / resolution_x)
-        target = mosaic[row : row + array.shape[0], col : col + array.shape[1]]
-        overlap = np.isfinite(target) & np.isfinite(array)
-        if np.any(overlap & ~np.isclose(target, array, atol=1e-3, rtol=1e-6)):
-            message = f"overlapping DEM source windows disagree; source={resource.identity}"
+
+    @lru_cache(maxsize=4096)
+    def read_pixel(index: int, row: int, column: int) -> float:
+        """Read one source pixel while retaining only a bounded tile cache."""
+        _resource, dataset, _transform, _left, _right, _bottom, _top = loaded[index]
+        if row < 0 or column < 0 or row >= dataset.height or column >= dataset.width:
+            return float("nan")
+        values = dataset.read(1, window=Window(column, row, 1, 1))
+        value = float(values[0, 0])
+        nodata = dataset.nodata
+        return float("nan") if nodata is not None and np.isclose(value, nodata) else value
+
+    def candidates(longitude: float, latitude: float) -> list[int]:
+        """Return sorted source windows covering one logical coordinate."""
+        return [
+            index
+            for index, (_resource, _dataset, _transform, left, right, bottom, top) in enumerate(loaded)
+            if left <= longitude < right and bottom <= latitude < top
+        ]
+
+    def support_value(longitude: float, latitude: float) -> float:
+        """Read one logical support pixel and detect source disagreement."""
+        matches = candidates(longitude, latitude)
+        if not matches:
+            return float("nan")
+        values: list[float] = []
+        for index in matches:
+            _resource, _dataset, transform, left, _right, _bottom, _top = loaded[index]
+            shift = left - float(transform.c)
+            _column, _row = (~transform) * (longitude - shift, latitude)
+            values.append(read_pixel(index, int(np.floor(_row)), int(np.floor(_column))))
+        finite = np.asarray(values, dtype=np.float64)[np.isfinite(values)]
+        if finite.size > 1 and not np.allclose(finite, finite[0], atol=1e-3, rtol=1e-6):
+            identity = loaded[matches[0]][0].identity
+            message = f"overlapping DEM source windows disagree; source={identity}"
             logger.error(message)
             raise SourceConflictError(message)
-        fill = ~np.isfinite(target) & np.isfinite(array)
-        target[fill] = array[fill]
+        return values[0]
+
     seam_sampler = SeamAwareSourceSampler(
         lambda longitude, _latitude: longitude,
         target_center_longitude,
@@ -349,15 +356,34 @@ def _sample_geographic_mosaic(
         ),
         dtype=np.float64,
     ).reshape(np.asarray(target_longitudes).shape)
-    source_transform = Affine(resolution_x, 0.0, left, 0.0, -resolution_y, top)
-    source_columns, source_rows = (~source_transform) * (longitudes, target_latitudes)
-    from faninsar.processing.dem.api import _sample_biquintic
+    output = np.full(longitudes.shape, np.nan, dtype=np.float64)
+    from faninsar.processing.dem.api import _natural_spline_six
 
-    return _sample_biquintic(
-        mosaic,
-        np.asarray(source_rows, dtype=np.float64),
-        np.asarray(source_columns, dtype=np.float64),
-    )
+    for flat_index, (longitude, latitude) in enumerate(
+        zip(longitudes.ravel(), np.asarray(target_latitudes).ravel(), strict=True)
+    ):
+        matches = candidates(float(longitude), float(latitude))
+        if not matches:
+            continue
+        _resource, _dataset, transform, left, _right, _bottom, _top = loaded[matches[0]]
+        shift = left - float(transform.c)
+        _column, _row = (~transform) * (float(longitude) - shift, float(latitude))
+        row_base, col_base = int(np.floor(_row)), int(np.floor(_column))
+        window = np.empty((6, 6), dtype=np.float64)
+        for row_offset in range(6):
+            for col_offset in range(6):
+                world_x, world_y = transform * (
+                    col_base + col_offset - 0.5,
+                    row_base + row_offset - 0.5,
+                )
+                world_x += shift
+                window[row_offset, col_offset] = support_value(world_x, world_y)
+        along = _natural_spline_six(window, np.asarray([_column - col_base]))
+        value = _natural_spline_six(along, np.asarray([_row - row_base]))
+        output.ravel()[flat_index] = float(value[0])
+    for _resource, dataset, _transform, _left, _right, _bottom, _top in loaded:
+        dataset.close()
+    return output
 
 
 def materialize_source(
@@ -380,33 +406,9 @@ def materialize_source(
     from affine import Affine
 
     if isinstance(source, _P0030Source):
-        from pyproj import Transformer
+        from .p0030_adapter import materialize
 
-        from faninsar.processing.dem.api import RasterDEM
-        from faninsar.processing.geometry.dem_manager import DEMManager
-
-        left, bottom, right, top = grid.bounds
-        transformer = Transformer.from_crs(grid.crs, "EPSG:4326", always_xy=True)
-        lon_a, lat_a = transformer.transform(left, bottom)
-        lon_b, lat_b = transformer.transform(right, top)
-        manager = DEMManager(
-            cache_dir=Path(cache_dir),
-            source="auto" if source.product == "auto" else source.collection_id,
-        )
-        path = manager.fetch_dem(
-            (
-                min(lon_a, lon_b),
-                min(lat_a, lat_b),
-                max(lon_a, lon_b),
-                max(lat_a, lat_b),
-            )
-        )
-        local = RasterDEM(path=path, vertical_datum=manager.vertical_datum)
-        return local.to_raster(
-            grid,
-            vertical_datum=local.vertical_datum,
-            budget=budget,
-        )
+        return materialize(source, grid, cache_dir=cache_dir, budget=budget)
     if not isinstance(source, PcStacSource):
         raise ProviderUnavailableError(f"DEM provider is not wired: {source!r}")
     height, width = int(grid.height), int(grid.width)
@@ -428,7 +430,7 @@ def materialize_source(
     )
     target_x, target_y = target_transform * (columns, rows)
     target_longitudes, target_latitudes = transformer.transform(target_x, target_y)
-    logical_samples = _sample_geographic_mosaic(
+    logical_samples = _sample_geographic_windows(
         resources,
         cache_dir=cache_dir,
         target_longitudes=np.asarray(target_longitudes, dtype=np.float64),
@@ -448,10 +450,13 @@ def materialize_source(
                 "collection": source.collection_id,
                 "asset": source.asset_key,
                 "resampling": "direct-source-target",
-                "seam_support": "6x6-logical-mosaic",
+                "seam_support": "6x6-logical-window",
             },
         )
-    from faninsar.processing.dem.api import _sample_biquintic
+    # Projected or rotated PC assets use the same bounded source-window
+    # sampler as the P0030 adapter.  Keep this fallback lazy as well: a
+    # provider resource must never be expanded into a full source mosaic.
+    from .p0030_adapter import _sample_dataset
 
     for resource in resources:
         local = resolve_cache_path(cache_dir, resource.cache_path)
@@ -462,45 +467,21 @@ def materialize_source(
                 max_bytes=(budget.max_fetch_bytes if budget else 2**33),
             )
         with rasterio.open(local) as dataset:
-            source_array = np.asarray(dataset.read(1), dtype=np.float64)
             source_crs = dataset.crs or resource.crs
-            if str(source_crs) != str(grid.crs):
-                transformer = Transformer.from_crs(
-                    grid.crs, source_crs, always_xy=True
-                )
-                source_x, source_y = transformer.transform(target_x, target_y)
-            else:
-                source_x, source_y = target_x, target_y
-            if str(source_crs).upper() in {"EPSG:4326", "OGC:CRS84"}:
-                # Apply the same target-centred unwrapping used during STAC
-                # planning before converting geographic coordinates to source
-                # pixel indices. This is the materializer's real seam path,
-                # rather than a planning-only helper.
-                center_longitude = 0.5 * (bounds[0] + bounds[2])
-                seam_sampler = SeamAwareSourceSampler(
-                    lambda longitude, _latitude: longitude,
-                    center_longitude,
-                )
-                source_x = np.asarray(
-                    seam_sampler.sample(
-                        np.asarray(source_x).ravel().tolist(),
-                        np.asarray(source_y).ravel().tolist(),
-                    ),
-                    dtype=np.float64,
-                ).reshape(np.asarray(source_x).shape)
-            source_transform = dataset.transform
-            source_columns, source_rows = (~source_transform) * (source_x, source_y)
-            if min(source_array.shape) < SOURCE_KERNEL_SIZE:
+            sampled = _sample_dataset(
+                dataset,
+                np.asarray(target_x),
+                np.asarray(target_y),
+                target_crs=str(grid.crs),
+                source_crs=source_crs,
+                source_nodata=dataset.nodata,
+            )
+            if min(dataset.height, dataset.width) < SOURCE_KERNEL_SIZE:
                 logger.debug(
                     "source window is smaller than the qualified %dx%d halo",
                     SOURCE_KERNEL_SIZE,
                     SOURCE_KERNEL_SIZE,
                 )
-            sampled = _sample_biquintic(
-                source_array,
-                np.asarray(source_rows, dtype=np.float64),
-                np.asarray(source_columns, dtype=np.float64),
-            )
             overlap = np.isfinite(destination) & np.isfinite(sampled)
             if np.any(overlap & ~np.isclose(destination, sampled, atol=1e-3, rtol=1e-6)):
                 message = (

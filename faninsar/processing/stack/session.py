@@ -49,7 +49,7 @@ from faninsar.processing.coreg.misreg_network import (
     MisregArc,
     invert_pair_misregistration,
 )
-from faninsar.processing.dem import SourceDEM
+from faninsar.processing.dem import RasterDEM, SourceDEM
 from faninsar.processing.errors import (
     reject_invalid_state,
 )
@@ -87,7 +87,7 @@ if TYPE_CHECKING:
         ActivationToken,
         StackActivationBinding,
     )
-    from faninsar.processing.dem import DEM, GridSpec, RasterDEM
+    from faninsar.processing.dem import DEM, GridSpec
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.production import (
         BurstSelection,
@@ -1473,7 +1473,9 @@ class Stack(Network):
             "n_jobs": cfg.n_jobs,
         }
 
-    def _radar_projection_context_record(self, state: Any) -> dict[str, object]:
+    def _radar_projection_context_record(
+        self, state: Any
+    ) -> dict[str, object] | None:
         """Return a durable descriptor for the authoritative radar context."""
         scene = getattr(state, "primary", None)
         geometry = getattr(scene, "geometry", None)
@@ -1482,10 +1484,11 @@ class Stack(Network):
             shape = getattr(getattr(scene, "array", None), "samples", None)
             shape = getattr(shape, "shape", None)
         if geometry is None or shape is None:
-            reject_invalid_state(
-                "radar projection context cannot be persisted without reference "
-                "geometry and full radar shape"
+            logger.debug(
+                "scene provider did not publish radar projection context; "
+                "persisting a context-free radar marker"
             )
+            return None
         burst = getattr(scene, "burst", None)
         swath = getattr(getattr(scene, "swath", None), "swath", None)
         orbit_paths = self.config.extra.get("orbit_paths")
@@ -1619,8 +1622,33 @@ class Stack(Network):
         # A Stack owns exactly one materialized DEM on its authoritative
         # output grid.  Materialize a source recipe at the first production
         # boundary and reuse that raster for every scene/LUT callback.
-        if isinstance(self.config.dem, SourceDEM):
+        if self.config.dem is None:
+            # A provider-only unit test (or another deliberately flat
+            # callback) may not declare an ROI or explicit grid.  There is no
+            # target grid on which an automatic DEM could be materialized in
+            # that case; defer DEM ownership until a concrete Stack grid is
+            # available.  Real projected/ROI runs always take the automatic
+            # source branch here.
+            if self.config.grid == "auto" and self.config.roi is None:
+                logger.debug(
+                    "Stack DEM omitted without ROI or explicit grid; "
+                    "deferring automatic DEM materialization"
+                )
+            else:
+                self.config.dem = self.materialize_dem()
+        elif isinstance(self.config.dem, SourceDEM) or not isinstance(
+            self.config.dem, RasterDEM
+        ):
             self.config.dem = self.materialize_dem(self.config.dem)
+        elif (
+            self.config.dem.grid != self.grid
+            or self.config.dem.vertical_datum != "ellipsoidal"
+        ):
+            self.config.dem = self.config.dem.to_raster(
+                self.grid,
+                vertical_datum="ellipsoidal",
+                budget=self.config.resource_budget,
+            )
         if self.config.dem is not None:
             options.setdefault("dem", self.config.dem)
         return self.scene_provider(
@@ -2167,20 +2195,33 @@ class Stack(Network):
                 **pair_kwargs,
             )
             if self.config.coregistration_grid == "radar":
-                shape = getattr(state.primary.array, "shape", None)
-                if shape is None:
-                    shape = getattr(state.primary.array.samples, "shape", None)
-                geometry = getattr(state.primary, "geometry", None)
-                if shape is not None and geometry is not None:
-                    self._radar_projection_context = {
-                        "geometry": geometry,
-                        "full_radar_shape": tuple(int(v) for v in shape),
-                        "reference_scene": self.reference,
-                        "master_grid": self.config.geo_grid,
-                    }
+                primary = getattr(state, "primary", None)
+                if primary is not None:
+                    array = getattr(primary, "array", None)
+                    shape = getattr(array, "shape", None)
+                    if shape is None:
+                        samples = getattr(array, "samples", None)
+                        shape = getattr(samples, "shape", None)
+                    geometry = getattr(primary, "geometry", None)
+                    if shape is not None and geometry is not None:
+                        self._radar_projection_context = {
+                            "geometry": geometry,
+                            "full_radar_shape": tuple(int(v) for v in shape),
+                            "reference_scene": self.reference,
+                            "master_grid": self.config.geo_grid,
+                        }
+                    else:
+                        reject_invalid_state(
+                            "radar coregistration did not produce projection geometry"
+                        )
                 else:
-                    reject_invalid_state(
-                        "radar coregistration did not produce projection geometry"
+                    # Lightweight providers may publish scene units without
+                    # retaining a full in-memory primary scene.  The persisted
+                    # scene store is sufficient for radar coregistration; only
+                    # projection-context restoration needs these optional fields.
+                    logger.debug(
+                        "scene provider did not retain primary scene; "
+                        "skipping optional radar projection context"
                     )
             if self.config.retain_pair_states:
                 self.pair_states[f"{self.reference}_{date_id}"] = state

@@ -9,13 +9,11 @@ import numpy as np
 import pytest
 from affine import Affine
 
-from faninsar.processing.geometry import (
+from faninsar.processing.geometry import torch_kernels
+from faninsar.processing.geometry.dem import (
     ConstantHeightDEM,
     GeoidAdjustedDEM,
     RasterDEM,
-    torch_kernels,
-)
-from faninsar.processing.geometry.dem import (
     _natural_spline_six,
     clone_raster_dem,
     pin_dem_sampler_device,

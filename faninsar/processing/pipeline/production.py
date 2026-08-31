@@ -39,7 +39,6 @@ from faninsar.processing.coreg import (
 from faninsar.processing.dem import (
     DEM,
     ConstantDEM,
-    GridSpec,
 )
 from faninsar.processing.dem import (
     RasterDEM as PublicRasterDEM,
@@ -3660,12 +3659,14 @@ def resolve_auto_dem(
     dem_source: str | None = None,
     output_name: str | None = None,
 ) -> DEM:
-    """Build (or reuse) the automatic DEM raster on one geographic grid.
+    """Build (or reuse) the automatic DEM raster on one projected grid.
 
     This is the single datum-aware DEM entry point shared by
-    the Stack provider, its sweep helper, and ``faninsar frame``:
+    the Stack provider, its sweep helper, and ``faninsar frame``.
     The provider is selected through the public DEM facade and the datum
-    conversion is applied at target pixel centres when requested.
+    conversion is applied at target pixel centres when requested.  The
+    target is the same projected UTM/UPS policy used by :class:`Stack`; no
+    EPSG:4326 raster is materialized as a relay.
 
     Parameters
     ----------
@@ -3707,16 +3708,17 @@ def resolve_auto_dem(
     cache_root = Path(
         os.environ.get("FANINSAR_DEM_CACHE_DIR", str(Path(output_dir) / "dem-cache"))
     )
-    # Automatic production uses a small geographic target grid only as the
-    # requested output identity.  The provider performs one direct warp from
-    # source tiles to this grid; no intermediate manager/mosaic is involved.
-    resolution_deg = 30.0 / 111_320.0
-    width = max(1, int(np.ceil((east - west) / resolution_deg)))
-    height = max(1, int(np.ceil((north - south) / resolution_deg)))
-    grid = GridSpec(
-        "EPSG:4326",
-        (resolution_deg, 0.0, west, 0.0, -resolution_deg, north),
-        shape=(height, width),
+    from shapely.geometry import box
+
+    from faninsar.processing.stack.grid import automatic_grid
+
+    # Resolve the authoritative projected target before opening or fetching
+    # source resources.  The provider then warps directly to this grid, so a
+    # geographic source view remains logical/windowed rather than becoming a
+    # full EPSG:4326 ndarray.
+    grid = automatic_grid(
+        box(west, south, east, north),
+        resolution_m=30.0,
     )
     source = DEM.from_source(selection, cache_dir=cache_root)
     target_datum = "ellipsoidal" if geoid_correction else "egm2008"
