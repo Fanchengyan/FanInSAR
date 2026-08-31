@@ -12,7 +12,13 @@ from .api import (
     VerticalDatum,
 )
 from .cache import ArtifactValidationError, CachePathError, validate_artifact
-from .datum import conversion_models, fetch_required, requires_fetch, validate_datum
+from .datum import (
+    conversion_models,
+    convert_heights,
+    fetch_required,
+    requires_fetch,
+    validate_datum,
+)
 from .fetch import (
     DEFAULT_RESOURCES,
     EGM96,
@@ -81,6 +87,7 @@ __all__ = [
     "SourceResource",
     "VerticalDatum",
     "conversion_models",
+    "convert_heights",
     "download",
     "download_ftp",
     "fetch_required",

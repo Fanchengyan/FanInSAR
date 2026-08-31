@@ -26,7 +26,7 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn, ParamSpec, Self, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, Self, TypeVar
 
 import numpy as np
 
@@ -86,6 +86,7 @@ if TYPE_CHECKING:
         ActivationToken,
         StackActivationBinding,
     )
+    from faninsar.processing.dem import DEM, GridSpec, RasterDEM
     from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.production import (
@@ -796,6 +797,54 @@ class Stack(Network):
         self._timeseries = None
         self._product_index = None
 
+    @property
+    def grid(self) -> GridSpec:
+        """Return the authoritative explicit or automatically selected grid.
+
+        ``StackConfig.grid`` always wins when it contains a :class:`GridSpec`.
+        Automatic selection uses the configured ROI and performs no provider
+        I/O.  A concrete adapter may call :meth:`resolve_grid` after it has
+        selected acquisition footprints.
+        """
+        return self.resolve_grid()
+
+    def resolve_grid(self, roi: object | None = None) -> GridSpec:
+        """Resolve the Stack output grid from config or a WGS84 ROI.
+
+        Parameters
+        ----------
+        roi : object, optional
+            Footprint/ROI override.  It is treated as caller-explicit and an
+            antimeridian crossing therefore fails before source I/O.
+
+        """
+        from faninsar.processing.stack.grid import resolve_stack_grid
+
+        selected_roi = self.config.roi if roi is None else roi
+        return resolve_stack_grid(
+            self.config.grid,
+            roi=selected_roi,
+            resolution_m=self.config.resolution_m,
+            budget=self.config.resource_budget,
+            explicit_roi=roi is not None or self.config.roi is not None,
+        )
+
+    def materialize_dem(self, dem: DEM | None = None) -> RasterDEM:
+        """Materialize one DEM directly on the authoritative Stack grid.
+
+        The source recipe remains inert until this method is called.  Stack
+        supplies its work-directory cache when a source recipe needs it.
+        """
+        from faninsar.processing import dem as dem_api
+
+        selected = dem or self.config.dem
+        if selected is None:
+            selected = dem_api.DEM.from_source("auto")
+        cache_dir = self.config.dem_cache_dir or (self.config.work_dir / "dem-cache")
+        if hasattr(selected, "cache_dir") and selected.cache_dir is None:
+            selected.cache_dir = cache_dir  # type: ignore[attr-defined]
+        return selected.to_raster(self.grid, vertical_datum="ellipsoidal")
+
     @classmethod
     def from_safes(
         cls,
@@ -833,6 +882,9 @@ class Stack(Network):
         reference: str | None = None,
         dem: DEMSampler | None = None,
         geo_grid: GeoGridSpec | None = None,
+        grid: GridSpec | Literal["auto"] = "auto",
+        resolution_m: float = 30.0,
+        dem_cache_dir: str | Path | None = None,
         roi: BoundingBox | Polygons | None = None,
         mask_plan: MaskPlan | None = None,
         coreg_mode: CoregMode = "pair",
@@ -894,6 +946,9 @@ class Stack(Network):
             invert_device=invert_device,
             dem=dem,
             geo_grid=geo_grid,
+            grid=grid,
+            resolution_m=resolution_m,
+            dem_cache_dir=(Path(dem_cache_dir) if dem_cache_dir is not None else None),
             roi=roi,
             mask_plan=mask_plan or MaskPlan(),
             swaths=swaths,
