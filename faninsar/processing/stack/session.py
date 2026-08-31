@@ -87,7 +87,6 @@ if TYPE_CHECKING:
         StackActivationBinding,
     )
     from faninsar.processing.dem import DEM, GridSpec, RasterDEM
-    from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.production import (
         BurstSelection,
@@ -843,7 +842,11 @@ class Stack(Network):
         cache_dir = self.config.dem_cache_dir or (self.config.work_dir / "dem-cache")
         if hasattr(selected, "cache_dir") and selected.cache_dir is None:
             selected.cache_dir = cache_dir  # type: ignore[attr-defined]
-        return selected.to_raster(self.grid, vertical_datum="ellipsoidal")
+        return selected.to_raster(
+            self.grid,
+            vertical_datum="ellipsoidal",
+            budget=self.config.resource_budget,
+        )
 
     @classmethod
     def from_safes(
@@ -880,7 +883,7 @@ class Stack(Network):
         pairs: Pairs | None = None,
         misreg_pairs: Pairs | None = None,
         reference: str | None = None,
-        dem: DEMSampler | None = None,
+        dem: DEM | None = None,
         geo_grid: GeoGridSpec | None = None,
         grid: GridSpec | Literal["auto"] = "auto",
         resolution_m: float = 30.0,

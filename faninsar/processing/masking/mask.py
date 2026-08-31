@@ -11,13 +11,14 @@ import hashlib
 import json
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 import numpy as np
 
+from faninsar._core.geo.grids import GridSpec
 from faninsar.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -148,129 +149,6 @@ def rasterize_to_grid(
             raise ValueError("validity shape does not match raster shape")
         result[~valid] = 255
     return np.asarray(result, dtype=np.uint8)
-
-
-class GridSpec:
-    """Immutable description of an exact raster grid.
-
-    Parameters
-    ----------
-    crs : object
-        Coordinate reference system accepted by :mod:`pyproj`.
-    transform : object
-        ``affine.Affine`` or six GDAL-order transform values.
-    height, width : int, optional
-        Dimensions.  Alternatively pass ``shape``.
-    shape : tuple[int, int], optional
-        Dimensions in ``(height, width)`` order.
-    bounds : Sequence[float], optional
-        Bounds in the grid CRS.  Derived from transform when omitted.
-    validity : numpy.ndarray, optional
-        Boolean coverage; false cells are always encoded as 255.
-
-    """
-
-    __slots__ = ("bounds", "crs", "height", "transform", "validity", "width")
-
-    def __init__(
-        self,
-        crs: object,
-        transform: object,
-        height: int | None = None,
-        width: int | None = None,
-        *,
-        shape: tuple[int, int] | None = None,
-        bounds: Sequence[float] | None = None,
-        validity: np.ndarray | None = None,
-    ) -> None:
-        """Create and validate a grid specification."""
-        import pyproj
-        from affine import Affine
-
-        if shape is not None:
-            if height is not None or width is not None:
-                raise ValueError("pass either shape or height/width, not both")
-            height, width = int(shape[0]), int(shape[1])
-        if height is None or width is None:
-            raise TypeError("GridSpec requires shape or both height and width")
-        if height <= 0 or width <= 0:
-            raise ValueError(f"grid dimensions must be positive, got {(height, width)}")
-        if isinstance(transform, Affine):
-            affine = transform
-        else:
-            try:
-                values = tuple(float(value) for value in transform)  # type: ignore[arg-type]
-            except (TypeError, ValueError) as error:
-                message = "transform must be Affine or six GDAL-order values"
-                logger.error(message)
-                raise TypeError(message) from error
-            if len(values) != 6:
-                message = "transform must contain six GDAL-order values"
-                logger.error(message)
-                raise ValueError(message)
-            affine = Affine.from_gdal(*values)
-        try:
-            canonical_crs = pyproj.CRS.from_user_input(crs).to_string()
-        except Exception as error:
-            message = f"unresolvable grid CRS: {crs!r}"
-            logger.error(message)
-            raise ValueError(message) from error
-        if bounds is None:
-            corners = [
-                affine * point
-                for point in ((0, 0), (width, 0), (0, height), (width, height))
-            ]
-            bounds_value = (
-                min(point[0] for point in corners),
-                min(point[1] for point in corners),
-                max(point[0] for point in corners),
-                max(point[1] for point in corners),
-            )
-        else:
-            if len(bounds) != 4:
-                raise ValueError("bounds must contain four values")
-            bounds_value = tuple(float(value) for value in bounds)
-        valid = None if validity is None else np.array(validity, dtype=bool, copy=True)
-        if valid is not None:
-            if valid.shape != (height, width):
-                message = (
-                    f"validity shape {valid.shape} does not match {(height, width)}"
-                )
-                logger.error(message)
-                raise ValueError(message)
-            valid.setflags(write=False)
-        object.__setattr__(self, "crs", canonical_crs)
-        object.__setattr__(self, "transform", affine)
-        object.__setattr__(self, "height", height)
-        object.__setattr__(self, "width", width)
-        object.__setattr__(self, "bounds", bounds_value)
-        object.__setattr__(self, "validity", valid)
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        """Return ``(height, width)``."""
-        return self.height, self.width
-
-    def __setattr__(self, name: str, value: object) -> None:
-        """Prevent mutation after construction."""
-        raise AttributeError("GridSpec is immutable")
-
-    def __eq__(self, other: object) -> bool:
-        """Compare observable metadata and validity."""
-        if not isinstance(other, GridSpec):
-            return NotImplemented
-        return (
-            self.crs == other.crs
-            and self.transform == other.transform
-            and self.shape == other.shape
-            and self.bounds == other.bounds
-            and np.array_equal(self.validity, other.validity)
-        )
-
-    def __hash__(self) -> int:
-        """Hash immutable metadata."""
-        valid = None if self.validity is None else self.validity.tobytes()
-        return hash((self.crs, tuple(self.transform), self.shape, self.bounds, valid))
 
 
 def _readonly_uint8(data: np.ndarray) -> np.ndarray:

@@ -224,12 +224,21 @@ class Fetch:
         if resource.url is None:
             raise GeoidResourceError(f"resource {resource.name} has no download URL")
         target.parent.mkdir(parents=True, exist_ok=True)
+        received = 0
+        # The pinned descriptor is the authoritative upper bound.  Unknown
+        # internal fixtures still receive the finite package-wide ceiling.
+        budget = resource.expected_size or 2**33
         try:
             with target.open("wb") as stream:
                 for chunk in self.transport(resource.url):
                     if not isinstance(chunk, bytes):
                         raise GeoidArtifactError(
                             "geoid transport returned a non-bytes chunk"
+                        )
+                    received += len(chunk)
+                    if received > budget:
+                        raise GeoidArtifactError(
+                            "geoid transport exceeded its finite byte budget"
                         )
                     stream.write(chunk)
             validate_artifact(

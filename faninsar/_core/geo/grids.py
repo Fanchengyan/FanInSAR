@@ -55,17 +55,31 @@ class GridSpec:
 
     def __init__(
         self,
-        *,
         crs: object,
         transform: object,
-        height: int,
-        width: int,
+        height: int | None = None,
+        width: int | None = None,
+        *,
+        shape: tuple[int, int] | None = None,
         bounds: tuple[float, float, float, float] | None = None,
+        bbox: tuple[float, float, float, float] | None = None,
+        resolution_m: tuple[float, float] | None = None,
         validity: np.ndarray | None = None,
     ) -> None:
         """Validate and freeze a grid specification."""
         from affine import Affine
 
+        if shape is not None:
+            if height is not None or width is not None or len(shape) != 2:
+                message = "pass either shape or height/width, not both"
+                logger.error(message)
+                raise ValueError(message)
+            height, width = int(shape[0]), int(shape[1])
+        if height is None or width is None:
+            message = "GridSpec requires shape or both height and width"
+            logger.error(message)
+            raise TypeError(message)
+        legacy_row_down = False
         try:
             canonical_crs = CRS.from_user_input(crs).to_string()
         except Exception as error:
@@ -73,7 +87,20 @@ class GridSpec:
             logger.exception(message)
             raise ValueError(message) from error
         try:
-            affine = transform if isinstance(transform, Affine) else Affine(*transform)
+            if (
+                not isinstance(transform, Affine)
+                and resolution_m is not None
+                and len(transform) == 6
+            ):
+                # Merge callers historically supplied ``x0, dx, 0, y0, 0,
+                # -dy``. Normalize that spelling at the canonical boundary.
+                x0, dx, _zero_x, y0, _zero_y, dy = transform
+                legacy_row_down = float(dy) > 0
+                affine = Affine(dx, 0.0, x0, 0.0, float(dy), y0)
+            else:
+                affine = (
+                    transform if isinstance(transform, Affine) else Affine(*transform)
+                )
         except (TypeError, ValueError) as error:
             message = "transform must be an Affine or six coefficients"
             logger.exception(message)
@@ -91,15 +118,39 @@ class GridSpec:
             message = "grid transform must contain finite values"
             logger.error(message)
             raise ValueError(message)
-        if affine.b != 0 or affine.d != 0 or affine.a <= 0 or affine.e >= 0:
+        if (
+            affine.b != 0
+            or affine.d != 0
+            or affine.a <= 0
+            or (affine.e >= 0 and not legacy_row_down)
+        ):
             message = "GridSpec requires a finite north-up affine transform"
             logger.error(message)
             raise ValueError(message)
+        if bounds is not None and bbox is not None:
+            message = "pass either bounds or bbox, not both"
+            logger.error(message)
+            raise ValueError(message)
+        if bbox is not None:
+            bounds = bbox
+        if resolution_m is not None:
+            if len(resolution_m) != 2 or any(
+                not np.isfinite(value) or value <= 0 for value in resolution_m
+            ):
+                message = "resolution_m must contain two positive finite values"
+                logger.error(message)
+                raise ValueError(message)
+            if not np.isclose(abs(affine.a), resolution_m[0]) or not np.isclose(
+                abs(affine.e), resolution_m[1]
+            ):
+                message = "resolution_m does not match transform"
+                logger.error(message)
+                raise ValueError(message)
         if bounds is None:
             left, top = affine.c, affine.f
             right = left + affine.a * columns
-            bottom = top + affine.e * rows
-            bounds_value = (left, bottom, right, top)
+            edge_y = top + affine.e * rows
+            bounds_value = (left, min(top, edge_y), right, max(top, edge_y))
         else:
             try:
                 values = tuple(float(value) for value in bounds)
@@ -114,9 +165,9 @@ class GridSpec:
             bounds_value = values
             expected = (
                 affine.c,
-                affine.f + affine.e * rows,
+                min(affine.f, affine.f + affine.e * rows),
                 affine.c + affine.a * columns,
-                affine.f,
+                max(affine.f, affine.f + affine.e * rows),
             )
             tolerance = max(1e-9, max(abs(value) for value in expected) * 1e-12)
             if any(
@@ -153,6 +204,26 @@ class GridSpec:
     def shape(self) -> tuple[int, int]:
         """Return dimensions in ``(height, width)`` order."""
         return self.height, self.width
+
+    @property
+    def bbox(self) -> tuple[float, float, float, float]:
+        """Return bounds under the merge-grid spelling."""
+        return self.bounds
+
+    @property
+    def resolution_m(self) -> tuple[float, float]:
+        """Return absolute pixel spacing in CRS units."""
+        return abs(self.transform[0]), abs(self.transform[4])
+
+    def xy_pixel_centers(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return pixel-centre coordinate arrays in the grid CRS."""
+        from affine import Affine
+
+        columns, rows = np.meshgrid(
+            np.arange(self.width, dtype=np.float64) + 0.5,
+            np.arange(self.height, dtype=np.float64) + 0.5,
+        )
+        return Affine(*self.transform) * (columns, rows)
 
     def __setattr__(self, name: str, value: object) -> None:
         """Prevent changes after construction."""

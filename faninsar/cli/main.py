@@ -108,20 +108,12 @@ def main(argv: list[str] | None = None) -> int:
         from faninsar.processing.errors import PairConfigurationMigrationError
 
         if args.dem_source:
-            # Fail closed BEFORE any pipeline work on unwired/unknown pairs.
-            # The 'auto' alias is valid everywhere else (DEMManager resolves
-            # it, not the selection grammar), so it passes the pre-gate
-            # untouched.
-            from faninsar.processing.geometry.dem_sources import (
-                AUTO_SOURCE_NAME,
-                parse_selection,
-            )
+            from faninsar.processing.dem import DEM
 
-            if args.dem_source != AUTO_SOURCE_NAME:
-                try:
-                    parse_selection(args.dem_source)
-                except (ValueError, TypeError) as exc:
-                    parser.exit(2, f"faninsar frame: error: {exc}\n")
+            try:
+                DEM.from_source(args.dem_source)
+            except (ValueError, TypeError) as exc:
+                parser.exit(2, f"faninsar frame: error: {exc}\n")
 
         try:
             return run_frame_cli(

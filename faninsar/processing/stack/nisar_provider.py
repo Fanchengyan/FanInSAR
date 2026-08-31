@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
     from faninsar.processing.contracts import SLCProduct
-    from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.dem import DEM
     from faninsar.processing.stack.provider import SceneProductionCallback
 
 logger = setup_logger(__name__)
@@ -284,7 +284,7 @@ def _full_primary_bounds(
     secondary_product: SLCProduct,
     *,
     device: str,
-    dem: DEMSampler | None,
+    dem: DEM | None,
     height_m: float | None,
 ) -> tuple[int, int, int, int]:
     """Return the full Primary grid; invalid Secondary coverage is masked."""
@@ -301,7 +301,7 @@ def _full_stack_reference_bounds(
     reference: str | None = None,
     *,
     device: str,
-    dem: DEMSampler | None,
+    dem: DEM | None,
     height_m: float | None,
 ) -> tuple[int, int, int, int]:
     """Intersect every acquisition onto one stable Reference radar grid."""
@@ -332,7 +332,7 @@ def _dense_secondary_mapping(
     bounds: tuple[int, int, int, int],
     *,
     device: str,
-    dem: DEMSampler,
+    dem: DEM,
     lanczos_a: int = 4,
 ) -> _DenseRadarMapping:
     """Map every Reference tile pixel into the secondary radar grid."""
@@ -508,7 +508,7 @@ def _geocode_aligned_radar_tile(
     target: GeoGrid,
     *,
     device: str,
-    dem: DEMSampler,
+    dem: DEM,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Forward-geocode aligned complex tiles through Geo2Rdr + Lanczos."""
     from faninsar.processing.geometry import RadarGeometryModel
@@ -580,7 +580,7 @@ def _geo_tile_for_radar_crop(
     target: GeoGrid,
     *,
     device: str,
-    dem: DEMSampler,
+    dem: DEM,
 ) -> tuple[GeoGrid, int, int]:
     """Map radar-crop control points to a bounded target-grid window."""
     from faninsar.processing.geometry import RadarGeometryModel
@@ -758,7 +758,7 @@ def _shared_radar_window(
     primary_product: SLCProduct | None = None,
     secondary_product: SLCProduct | None = None,
     device: str = "cpu",
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     height_m: float | None = None,
 ) -> tuple[int, int, int, int]:
     """Map a reference crop onto the secondary radar grid physically.
@@ -812,12 +812,12 @@ def _geometry_shared_radar_window(
     primary_bounds: tuple[int, int, int, int],
     *,
     device: str,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     height_m: float | None = None,
 ) -> tuple[int, int, int, int]:
     """Map a bounded crop through the shared Radar→Geo→Radar geometry seam."""
+    from faninsar.processing.dem import ConstantDEM
     from faninsar.processing.geometry import RadarGeometryModel
-    from faninsar.processing.geometry.dem import ConstantHeightDEM
     from faninsar.processing.geometry.prepare_production import (
         run_geo2rdr,
         run_rdr2geo,
@@ -843,7 +843,7 @@ def _geometry_shared_radar_window(
             reject_invalid_state(f"NISAR geometry mapping height is invalid: {error}")
         if not np.isfinite(resolved_height):
             reject_invalid_state("NISAR geometry mapping height must be finite")
-        dem = ConstantHeightDEM(resolved_height)
+        dem = ConstantDEM(resolved_height)
     row_start, row_stop, col_start, col_stop = primary_bounds
     center_row = np.array(
         [(row_start + row_stop - 1) / 2.0],
@@ -959,9 +959,12 @@ def _geo_target(value: object) -> GeoGrid:
     if not crs or transform is None:
         reject_invalid_state("NISAR geo_grid must expose crs, transform, and shape")
     try:
-        # ``GeoGridSpec`` stores ``(x0, dx, 0, y0, 0, dy)`` while the
+        # Canonical ``GridSpec`` stores an affine in GDAL order while the
         # processing ``GeoGrid`` contract stores ``(dx, 0, x0, 0, dy, y0)``.
-        x0, dx, _, y0, _, dy = tuple(transform)
+        from affine import Affine
+
+        affine = Affine(*tuple(transform))
+        x0, dx, y0, dy = affine.c, affine.a, affine.f, affine.e
         return GeoGrid(
             shape=(int(shape[0]), int(shape[1])),
             crs=str(crs),
@@ -982,9 +985,9 @@ def _provider_window(options: Mapping[str, Any], configured: object) -> object:
 def _geometry_inputs(
     options: Mapping[str, Any],
     *,
-    configured_dem: DEMSampler | None,
+    configured_dem: DEM | None,
     configured_height: float | None,
-) -> tuple[DEMSampler | None, float | None]:
+) -> tuple[DEM | None, float | None]:
     """Resolve one DEM source by explicit-call then configured precedence."""
     option_dem = options.get("dem")
     if option_dem is not None:
@@ -1007,7 +1010,7 @@ def make_nisar_scene_provider(
     channel: tuple[str, str],
     configured_window: object = None,
     configured_tile_shape: object = None,
-    configured_dem: DEMSampler | None = None,
+    configured_dem: DEM | None = None,
     configured_height: float | None = None,
     flatten_stage: str = "coregistration",
     admission_lineage: Mapping[str, Mapping[str, object]] | None = None,
@@ -1032,7 +1035,7 @@ def make_nisar_scene_provider(
         Omitting it enables chunked full-scene production.
     configured_tile_shape : sequence of int, optional
         Full-scene tile dimensions. Defaults to ``(2048, 2048)``.
-    configured_dem : DEMSampler, optional
+    configured_dem : DEM, optional
         Callback-level DEM used when a scene-production call omits ``dem``.
     configured_height : float, optional
         Callback-level constant height used when a scene-production call omits
@@ -1134,9 +1137,9 @@ def make_nisar_scene_provider(
                 "NISAR geometry crop mapping cannot combine DEM and height inputs"
             )
         if mapping_dem is None:
-            from faninsar.processing.geometry.dem import ConstantHeightDEM
+            from faninsar.processing.dem import ConstantDEM
 
-            mapping_dem = ConstantHeightDEM(float(mapping_height))
+            mapping_dem = ConstantDEM(float(mapping_height))
         dem_identity = _dem_identity(mapping_dem)
         if domain not in {"radar", "geo"}:
             reject_invalid_state(

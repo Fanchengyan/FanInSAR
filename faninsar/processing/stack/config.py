@@ -18,8 +18,7 @@ if TYPE_CHECKING:
         ActivationToken,
         StackActivationBinding,
     )
-    from faninsar.processing.dem import GridSpec
-    from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.dem import DEM, GridSpec
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.production import (
         BurstSelection,
@@ -57,7 +56,7 @@ class StackConfig:
     executor: str = "torch"
     device: str = "auto"
     invert_device: str = "cpu"
-    dem: DEMSampler | None = None
+    dem: DEM | None = None
     geo_grid: GeoGridSpec | None = None
     swaths: tuple[str, ...] = ("IW1",)
     bursts: BurstSelection | None = None

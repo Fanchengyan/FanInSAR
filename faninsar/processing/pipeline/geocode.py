@@ -22,13 +22,13 @@ from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import RadarGrid
+from faninsar.processing.dem import DEM, ConstantDEM
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.geometry import ConstantHeightDEM, RadarGeometryModel
+from faninsar.processing.geometry import RadarGeometryModel
 from faninsar.processing.geometry.prepare_production import run_rdr2geo
 
 if TYPE_CHECKING:
     from faninsar.missions.sentinel1.types import S1Burst, S1Swath
-    from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
@@ -200,7 +200,7 @@ def geocode_layer(
     burst: S1Burst,
     row0: int,
     col0: int,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     device: DeviceLike,
     stride: int = 1,
 ) -> GeocodedLayer:
@@ -222,7 +222,7 @@ def geocode_layer(
         Geometry metadata for the window.
     row0, col0 : int
         Window origin in the measurement raster.
-    dem : DEMSampler, optional
+    dem : DEM, optional
         Height sampler. Defaults to zero-height ellipsoid.
     device : DeviceLike
         Required production device (``auto`` resolves to cpu or cuda).
@@ -251,7 +251,7 @@ def geocode_layer(
     az = np.arange(0, height, stride, dtype=np.float64)
     rg = np.arange(0, width, stride, dtype=np.float64)
     az_grid, rg_grid = np.meshgrid(az, rg, indexing="ij")
-    dem_sampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    dem_sampler = dem if dem is not None else ConstantDEM(0.0)
     transform = run_rdr2geo(model, az_grid, rg_grid, dem_sampler, device=device)
 
     # Resample values at the fractional radar coordinates returned by geo2rdr.

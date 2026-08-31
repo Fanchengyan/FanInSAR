@@ -32,7 +32,9 @@ def resolve_cache_path(root: str | Path, relative: str | Path) -> Path:
     """Resolve a cache-relative path and reject traversal on every platform."""
     base = Path(root).expanduser().resolve(strict=False)
     value = str(relative).replace("\\", "/")
-    if value.startswith("/") or re.match(r"^[A-Za-z]:/", value):
+    if "\x00" in value:
+        raise ValueError("cache path may not contain NUL")
+    if value.startswith("/") or re.match(r"^[A-Za-z]:(?:/|$)", value):
         raise ValueError("cache path must be relative")
     candidate = (base / Path(value)).resolve(strict=False)
     try:
@@ -44,9 +46,18 @@ def resolve_cache_path(root: str | Path, relative: str | Path) -> Path:
 
 def validate_https_origin(url: str, allowed_hosts: set[str] | frozenset[str]) -> None:
     """Require HTTPS and a registry-owned host before connecting."""
+    if "\x00" in url:
+        raise ValueError("URL may not contain NUL")
     parts = urllib.parse.urlsplit(url)
     host = (parts.hostname or "").lower()
-    if parts.scheme.lower() != "https" or not host or host not in {h.lower() for h in allowed_hosts}:
+    if (
+        parts.scheme.lower() != "https"
+        or not host
+        or host not in {h.lower() for h in allowed_hosts}
+        or parts.username is not None
+        or parts.password is not None
+        or parts.port not in (None, 443)
+    ):
         raise ValueError(f"URL origin is not registry-owned: {url!r}")
 
 

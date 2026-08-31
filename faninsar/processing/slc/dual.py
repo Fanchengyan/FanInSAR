@@ -9,9 +9,9 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import CoordinateSystem, GeoGrid, RadarGrid
+from faninsar.processing.dem import DEM, ConstantDEM
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import (
-    ConstantHeightDEM,
     RadarGeometryModel,
     TransformCacheKey,
     read_transform_cache,
@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from faninsar.processing.contracts import SLCProduct
-    from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.geometry.transforms import TransformResult
     from faninsar.typing import DeviceLike
 
@@ -63,7 +62,7 @@ class RadarSLC:
         self,
         *,
         device: DeviceLike,
-        dem: DEMSampler | None = None,
+        dem: DEM | None = None,
         geo_grid: GeoGrid | None = None,
         use_cache: bool = True,
     ) -> GeoSLC:
@@ -73,7 +72,7 @@ class RadarSLC:
         ----------
         device : DeviceLike
             Required production device (``auto`` resolves to cpu or cuda).
-        dem : DEMSampler, optional
+        dem : DEM, optional
             Height sampler. Defaults to a zero-height ellipsoid.
         geo_grid : GeoGrid, optional
             Target geographic grid. When omitted, a coarse grid is derived from
@@ -92,7 +91,7 @@ class RadarSLC:
         loss, not a mathematically lossless inverse of radar coordinates.
 
         """
-        dem_sampler = dem if dem is not None else ConstantHeightDEM(0.0)
+        dem_sampler = dem if dem is not None else ConstantDEM(0.0)
         model = RadarGeometryModel.from_radar_grid(self.grid, self.product.orbit)
         height, width = self.grid.shape
         az, rg = np.meshgrid(
@@ -146,7 +145,7 @@ class RadarSLC:
         model: RadarGeometryModel,
         az: np.ndarray,
         rg: np.ndarray,
-        dem_sampler: DEMSampler,
+        dem_sampler: DEM,
         cache_key: TransformCacheKey,
         use_cache: bool,
         device: DeviceLike,
@@ -195,7 +194,7 @@ class GeoSLC:
         radar_grid: RadarGrid,
         *,
         device: DeviceLike,
-        dem: DEMSampler | None = None,
+        dem: DEM | None = None,
         height_m: float = 0.0,
     ) -> RadarSLC:
         """Resample this geocoded SLC back onto a radar grid.
@@ -206,7 +205,7 @@ class GeoSLC:
             Target radar grid.
         device : DeviceLike
             Required production device (``auto`` resolves to cpu or cuda).
-        dem : DEMSampler, optional
+        dem : DEM, optional
             Unused placeholder for DEM-aware inverse paths.
         height_m : float, optional
             Constant height used when projecting geo centres to radar.

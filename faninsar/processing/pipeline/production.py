@@ -36,13 +36,13 @@ from faninsar.processing.coreg import (
     resample_complex_deramped_reramp,
     resolve_ampcor_policy,
 )
+from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import (
-    ConstantHeightDEM,
     RadarGeometryModel,
 )
 from faninsar.processing.geometry.baseline import BaselineComponents
-from faninsar.processing.geometry.dem import GeoidAdjustedDEM, RasterDEM
+from faninsar.processing.geometry.dem import DatumAdjustedDEM, RasterDEM
 from faninsar.processing.geometry.prepare_production import (
     run_geo2rdr,
     run_rdr2geo_chunked,
@@ -85,7 +85,7 @@ if TYPE_CHECKING:
         ResourceLimits,
     )
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.dem import DEM
     from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
@@ -1262,7 +1262,7 @@ class ProductionPairState:
     pair_id: str
     primary: ProductionScene
     secondary: ProductionScene
-    dem: DEMSampler
+    dem: DEM
     primary_deramped: np.ndarray | None = None
     secondary_deramped: np.ndarray | None = None
     range_shift_px: float | None = None
@@ -1321,7 +1321,7 @@ def load_production_scene(
     swath: str = "IW1",
     scope: ScopeMode = "burst",
     burst_index: int = 0,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     orbit_path: str | Path | None = None,
     coregistration_grid: CoregistrationGrid = "radar",
     full_range: bool = False,
@@ -1338,7 +1338,7 @@ def load_production_scene(
         ``burst`` reads one full burst; ``swath`` reads and stitches all bursts.
     burst_index : int, optional
         Burst index when ``scope="burst"``.
-    dem : DEMSampler, optional
+    dem : DEM, optional
         DEM used only to attach geometry context (not required for load).
     orbit_path : path, optional
         Precise ESA EOF orbit. Annotation orbit vectors are used when omitted.
@@ -3119,7 +3119,10 @@ def stage_write(
             )
             if reopened_from_work and isinstance(slc_valid, np.memmap):
                 close_memmap(slc_valid)
-        x0, dx, _, y0, _, dy = state.geo_grid.transform
+        from affine import Affine
+
+        affine = Affine(*state.geo_grid.transform)
+        x0, dx, y0, dy = affine.c, affine.a, affine.f, affine.e
         x = x0 + dx * (0.5 + np.arange(state.geo_grid.width, dtype=np.float64))
         y = y0 + dy * (0.5 + np.arange(state.geo_grid.height, dtype=np.float64))
         slc.create_array("x", data=x, overwrite=True)
@@ -3255,7 +3258,7 @@ def stage_write(
     return state
 
 
-def _dem_id(dem: DEMSampler) -> str:
+def _dem_id(dem: DEM) -> str:
     """Stable DEM identity string for product provenance."""
     name = type(dem).__name__
     path = getattr(dem, "path", None)
@@ -3288,10 +3291,19 @@ def _multilooked_geo_grid(
     from faninsar.processing.merge.grid import GeoGridSpec
 
     azimuth_looks, range_looks = multilook
-    x0, dx, x_skew, y0, y_skew, dy = grid.transform
+    from affine import Affine
+
+    affine = Affine(*grid.transform)
     return GeoGridSpec(
         crs=grid.crs,
-        transform=(x0, dx * range_looks, x_skew, y0, y_skew, dy * azimuth_looks),
+        transform=Affine(
+            affine.a * range_looks,
+            affine.b,
+            affine.c,
+            affine.d,
+            affine.e * azimuth_looks,
+            affine.f,
+        ),
         width=grid.width // range_looks,
         height=grid.height // azimuth_looks,
         resolution_m=(
@@ -3533,7 +3545,7 @@ def _auto_dem_bounds(
     resolved: dict[tuple[int, str], list[int]],
     primary_products: list,
     orbits: Sequence[str | Path | None] | None = None,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
 ) -> tuple[float, float, float, float]:
     """Return EPSG:4326 bounds covering the ROI or the selected bursts.
 
@@ -3547,7 +3559,7 @@ def _auto_dem_bounds(
         Opened reference SAFE products, one per frame.
     orbits : sequence of path or None, optional
         Per-frame precise orbit files used to build the burst quads.
-    dem : DEMSampler, optional
+    dem : DEM, optional
         DEM used by the burst quad rdr2geo.
 
     Returns
@@ -3642,12 +3654,12 @@ def resolve_auto_dem(
     geoid_correction: bool = True,
     dem_source: str | None = None,
     output_name: str | None = None,
-) -> DEMSampler:
+) -> DEM:
     """Build (or reuse) the automatic DEM mosaic and apply one wrap rule.
 
     This is the single datum-aware DEM entry point shared by
     the Stack provider, its sweep helper, and ``faninsar frame``:
-    :class:`GeoidAdjustedDEM` is applied only when ``geoid_correction`` is
+    The canonical datum conversion is applied only when ``geoid_correction`` is
     requested AND the live selection's registry metadata declares an
     orthometric vertical datum; ellipsoidal sources are returned unwrapped.
 
@@ -3668,7 +3680,7 @@ def resolve_auto_dem(
 
     Returns
     -------
-    DEMSampler
+    DEM
         The ready-to-use DEM sampler for the pipeline.
 
     Raises
@@ -3688,11 +3700,11 @@ def resolve_auto_dem(
     out_path = Path(output_dir) / "dem" / name
     dem_path = manager.fetch_dem(bounds, out_path)
     logger.info("Automatic DEM built for %s: %s", bounds, dem_path)
-    sampler: DEMSampler = RasterDEM(dem_path, interpolation="biquintic")
+    sampler: DEM = RasterDEM(dem_path, interpolation="biquintic")
     if geoid_correction and manager.vertical_datum != "ellipsoidal":
         from faninsar.processing.geometry.egm96 import EGM96Geoid
 
-        sampler = GeoidAdjustedDEM(sampler, EGM96Geoid())
+        sampler = DatumAdjustedDEM(sampler, EGM96Geoid())
     return sampler
 
 
@@ -3701,7 +3713,7 @@ def _select_bursts_by_roi(
     frame_paths: list[Path],
     swaths: tuple[str, ...],
     orbits: Sequence[str | Path | None] | None = None,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
 ) -> dict[tuple[int, str], list[int]]:
     """Select bursts whose radar-frame ground quad intersects the ROI."""
     from dataclasses import replace as _replace
@@ -3777,7 +3789,7 @@ def _buffer_geometry_meters(
 def _roi_burst_window(
     roi: BoundingBox | Polygons,
     geometry: RadarGeometryModel,
-    dem: DEMSampler,
+    dem: DEM,
     shape: tuple[int, int],
     *,
     device: str,
@@ -3895,7 +3907,7 @@ def produce_interferogram_pair(
     roi: BoundingBox | Polygons | None = None,
     swaths: tuple[str, ...] | None = None,
     bursts: BurstSelection | None = None,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     multilook: tuple[int, int] | list[int] = (2, 10),
     overwrite: bool = False,
     goldstein_alpha: float = 0.5,
@@ -3942,7 +3954,7 @@ def produce_interferogram_pair(
     roi: BoundingBox | Polygons | None = None,
     swaths: tuple[str, ...] | None = None,
     bursts: BurstSelection | None = None,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     multilook: Iterable[tuple[int, int]],
     overwrite: bool = False,
     goldstein_alpha: float = 0.5,
@@ -3988,7 +4000,7 @@ def produce_interferogram_pair(
     roi: BoundingBox | Polygons | None = None,
     swaths: tuple[str, ...] | None = None,
     bursts: BurstSelection | None = None,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     multilook: tuple[int, int] | list[int] | Iterable[tuple[int, int]] = (2, 10),
     overwrite: bool = False,
     goldstein_alpha: float = 0.5,
@@ -4048,7 +4060,7 @@ def produce_interferogram_pair(
         Explicit per-swath burst selection: {"IW1": [0, 2], "IW2": "1:4",
         "IW3": "all"} applied to every frame, or a list with one such
         mapping per frame. None selects every burst.
-    dem : DEMSampler, optional
+    dem : DEM, optional
         DEM for coregistration, flattening, and geometry. Defaults to a zero
         ellipsoid.
     multilook : tuple[int, int] or iterable of pairs, optional
@@ -4219,7 +4231,7 @@ def produce_interferogram_pair(
     from faninsar.processing.geometry.egm96 import EGM96Geoid
 
     dem_identity = admit_dem_device_identity(device)
-    dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    dem_sampler: DEM = dem if dem is not None else ConstantDEM(0.0)
     dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
     snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
     if snapshot_root is not None and isinstance(dem_sampler, RasterDEM):
@@ -4231,7 +4243,7 @@ def produce_interferogram_pair(
         )
         dem_sampler = clone_raster_dem(dem_sampler, path=dem_snapshot.path)
     if geoid_correction and isinstance(dem_sampler, RasterDEM):
-        dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
+        dem_sampler = DatumAdjustedDEM(dem_sampler, EGM96Geoid())
 
     primary_paths = _as_frame_paths(primary_path, "primary_path")
     sec_paths = _as_frame_paths(secondary_path, "secondary_path")
@@ -4863,7 +4875,7 @@ def _produce_interferogram_sweep(
     roi: BoundingBox | Polygons | None,
     swaths: tuple[str, ...] | None,
     bursts: BurstSelection | None,
-    dem: DEMSampler | None,
+    dem: DEM | None,
     multilook: object,
     overwrite: bool,
     goldstein_alpha: float,
@@ -4954,7 +4966,7 @@ def _produce_interferogram_sweep(
                 shutil.rmtree(stale)
 
     dem_identity = admit_dem_device_identity(device)
-    dem_sampler: DEMSampler = dem if dem is not None else ConstantHeightDEM(0.0)
+    dem_sampler: DEM = dem if dem is not None else ConstantDEM(0.0)
     dem_sampler = pin_dem_sampler_device(dem_sampler, dem_identity)
     snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
     if snapshot_root is not None and isinstance(dem_sampler, RasterDEM):
@@ -4966,7 +4978,7 @@ def _produce_interferogram_sweep(
         )
         dem_sampler = clone_raster_dem(dem_sampler, path=dem_snapshot.path)
     if geoid_correction and isinstance(dem_sampler, RasterDEM):
-        dem_sampler = GeoidAdjustedDEM(dem_sampler, EGM96Geoid())
+        dem_sampler = DatumAdjustedDEM(dem_sampler, EGM96Geoid())
 
     primary_paths = _as_frame_paths(primary_path, "primary_path")
     sec_paths = _as_frame_paths(secondary_path, "secondary_path")
@@ -5260,7 +5272,7 @@ def _archive_burst_ifgs(
     range_offsets: dict[str, int],
     frame_shape: tuple[int, int],
     roi: BoundingBox | Polygons | None,
-    dem_sampler: DEMSampler,
+    dem_sampler: DEM,
     control_spacing: int | None,
     esd_enabled: bool,
     amplitude_refinement_enabled: bool,
@@ -5364,7 +5376,7 @@ def _archive_burst_ifgs(
 
     def rebuild_origin_state(
         scene_args: dict[str, object],
-        dem: DEMSampler,
+        dem: DEM,
     ) -> ProductionPairState:
         ref = load_burst(
             str(scene_args["swath"]),

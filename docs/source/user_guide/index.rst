@@ -16,4 +16,4 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
    plots/index
    query
    sampler
-   dem_manager
+   dem

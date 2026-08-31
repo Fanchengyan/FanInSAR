@@ -290,9 +290,11 @@ def write_mosaic_stac_item(
     valid = mosaic.weight_sum > 0
     if valid.any():
         rows, cols = np.where(valid)
-        x0, dx, _, y0, _, dy = mosaic.grid.transform
-        xs = x0 + dx * (cols + 0.5)
-        ys = y0 + dy * (rows + 0.5)
+        from affine import Affine
+
+        affine = Affine(*mosaic.grid.transform)
+        xs = affine.c + affine.a * (cols + 0.5)
+        ys = affine.f + affine.e * (rows + 0.5)
         bbox = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
     else:
         bbox = list(mosaic.grid.bbox)

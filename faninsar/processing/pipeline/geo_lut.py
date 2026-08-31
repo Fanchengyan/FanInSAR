@@ -19,12 +19,20 @@ from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr
 from faninsar.processing.memory import release_memmap_pages
 
 if TYPE_CHECKING:
+    from faninsar.processing.dem import DEM
     from faninsar.processing.geometry import RadarGeometryModel
-    from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
+
+
+def _grid_axes(grid: GeoGridSpec) -> tuple[float, float, float, float]:
+    """Return canonical affine ``(x0, dx, y0, dy)`` components."""
+    from affine import Affine
+
+    affine = Affine(*grid.transform)
+    return affine.c, affine.a, affine.f, affine.e
 
 
 def _add_timing(timings: dict[str, float] | None, key: str, started: float) -> None:
@@ -90,7 +98,7 @@ def derive_burst_geo_bbox(
     grid: GeoGridSpec,
     *,
     margin_px: int = 32,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     device: DeviceLike,
 ) -> tuple[int, int, int, int]:
     """Return ``(row0, row1, col0, col1)`` bounding the burst footprint.
@@ -112,7 +120,7 @@ def derive_burst_geo_bbox(
         Shared geographic grid.
     margin_px : int, optional
         Extra rows/cols added around the footprint bbox.
-    dem : DEMSampler, optional
+    dem : DEM, optional
         DEM used by rdr2geo. When omitted an ellipsoid is used.
     device : DeviceLike
         Required production device (``auto`` resolves to cpu or cuda).
@@ -155,7 +163,7 @@ def derive_burst_geo_bbox(
 
     transformer = Transformer.from_crs("EPSG:4326", grid.crs, always_xy=True)
     xs, ys = transformer.transform(lon[ok], lat[ok])
-    x0, dx, _, y0, _, dy = grid.transform
+    x0, dx, y0, dy = _grid_axes(grid)
     cols = (np.asarray(xs) - x0) / dx - 0.5
     rows = (y0 - np.asarray(ys)) / (-dy) - 0.5  # dy is negative north-up
     col0 = max(0, int(np.floor(np.min(cols))) - margin_px)
@@ -168,7 +176,7 @@ def derive_burst_geo_bbox(
 def burst_geo_quad_lonlat(
     geometry: RadarGeometryModel,
     radar_shape: tuple[int, int],
-    dem: DEMSampler | None,
+    dem: DEM | None,
     *,
     device: DeviceLike,
 ) -> np.ndarray | None:
@@ -184,7 +192,7 @@ def burst_geo_quad_lonlat(
         Reference-scene radar geometry for the burst.
     radar_shape : tuple[int, int]
         Radar image shape ``(height, width)``.
-    dem : DEMSampler, optional
+    dem : DEM, optional
         DEM for rdr2geo; when omitted an ellipsoid is used.
     device : DeviceLike
         Required production device (``auto`` resolves to cpu or cuda).
@@ -223,7 +231,7 @@ def burst_geo_quad_lonlat(
 def burst_geo_footprint_lonlat(
     geometry: RadarGeometryModel,
     radar_shape: tuple[int, int],
-    dem: DEMSampler | None,
+    dem: DEM | None,
     grid: GeoGridSpec,
     *,
     device: DeviceLike,
@@ -270,7 +278,7 @@ def burst_geo_footprint_lonlat(
         return None
     hull = ConvexHull(px)
     ring_px = px[hull.vertices]
-    x0, dx, _, y0, _, dy = grid.transform
+    x0, dx, y0, dy = _grid_axes(grid)
     xs = (ring_px[:, 0] + 0.5) * dx + x0
     ys = y0 - (ring_px[:, 1] + 0.5) * (-dy)
     from pyproj import Transformer
@@ -319,7 +327,7 @@ def footprint_polygon_mask(
         footprint_lonlat[:, 0],
         footprint_lonlat[:, 1],
     )
-    x0, dx, _, y0, _, dy = grid.transform
+    x0, dx, y0, dy = _grid_axes(grid)
     polygon = np.column_stack(
         [
             (np.asarray(xs) - x0) / dx - 0.5,
@@ -350,7 +358,7 @@ def _lonlat_ring_to_grid_px(
 
     transformer = Transformer.from_crs("EPSG:4326", grid.crs, always_xy=True)
     xs, ys = transformer.transform(ring_coords[:, 0], ring_coords[:, 1])
-    x0, dx, _, y0, _, dy = grid.transform
+    x0, dx, y0, dy = _grid_axes(grid)
     return np.column_stack(
         [
             (np.asarray(xs) - x0) / dx - 0.5,
@@ -493,7 +501,7 @@ def grid_lonlat_rows(
 
     if row_start < 0 or row_stop > grid.height or row_start >= row_stop:
         reject_invalid_state("invalid geographic grid row interval")
-    x0, dx, _, y0, _, dy = grid.transform
+    x0, dx, y0, dy = _grid_axes(grid)
     x_coordinates = x0 + dx * (0.5 + np.arange(grid.width, dtype=np.float64))
     y_coordinates = y0 + dy * (0.5 + np.arange(row_start, row_stop, dtype=np.float64))
     x, y = np.meshgrid(x_coordinates, y_coordinates)
@@ -708,7 +716,7 @@ def build_geo2rdr_lut(
     grid: GeoGridSpec,
     full_radar_shape: tuple[int, int],
     height_m: float | np.ndarray = 0.0,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     chunk_size: int = 128,
     storage_dir: str | Path | None = None,
     cache_dir: str | Path | None = None,
@@ -734,7 +742,7 @@ def build_geo2rdr_lut(
         Full-resolution radar image shape.
     height_m : float or numpy.ndarray, optional
         Fallback ellipsoidal height.
-    dem : DEMSampler, optional
+    dem : DEM, optional
         Per-pixel ellipsoidal height source.
     device : DeviceLike
         Required production device (``auto`` resolves to cpu or cuda).

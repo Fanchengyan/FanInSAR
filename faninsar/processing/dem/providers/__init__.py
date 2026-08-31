@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING
 from faninsar.logging import setup_logger
 
 from ..resources import ResourceBudget, preflight_grid
-from ..seam import canonical_item_ids, plan_query_windows
+from ..seam import (
+    SeamAwareSourceSampler,
+    canonical_item_ids,
+    plan_query_windows,
+)
 from ..transport import (
     resolve_cache_path,
     stream_response_to_cache,
@@ -255,7 +259,11 @@ def materialize_source(
     for resource in resources:
         local = resolve_cache_path(cache_dir, resource.cache_path)
         if not local.is_file():
-            fetch_asset(resource, cache_dir=cache_dir)
+            fetch_asset(
+                resource,
+                cache_dir=cache_dir,
+                max_bytes=(budget.max_fetch_bytes if budget else 2**33),
+            )
         with rasterio.open(local) as dataset:
             source_array = np.asarray(dataset.read(1), dtype=np.float64)
             source_crs = dataset.crs or resource.crs
@@ -266,6 +274,23 @@ def materialize_source(
                 source_x, source_y = transformer.transform(target_x, target_y)
             else:
                 source_x, source_y = target_x, target_y
+            if str(source_crs).upper() in {"EPSG:4326", "OGC:CRS84"}:
+                # Apply the same target-centred unwrapping used during STAC
+                # planning before converting geographic coordinates to source
+                # pixel indices. This is the materializer's real seam path,
+                # rather than a planning-only helper.
+                center_longitude = 0.5 * (bounds[0] + bounds[2])
+                seam_sampler = SeamAwareSourceSampler(
+                    lambda longitude, _latitude: longitude,
+                    center_longitude,
+                )
+                source_x = np.asarray(
+                    seam_sampler.sample(
+                        np.asarray(source_x).ravel().tolist(),
+                        np.asarray(source_y).ravel().tolist(),
+                    ),
+                    dtype=np.float64,
+                ).reshape(np.asarray(source_x).shape)
             source_transform = dataset.transform
             source_columns, source_rows = (~source_transform) * (source_x, source_y)
             sampled = _sample_biquintic(

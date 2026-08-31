@@ -15,10 +15,14 @@ from affine import Affine
 from faninsar._core.geo.grids import GridSpec
 from faninsar.logging import setup_logger
 
+from .resources import preflight_grid
+
 logger = setup_logger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from .resources import ResourceBudget
 
 VerticalDatum = Literal["ellipsoidal", "egm96", "egm2008"]
 DEMProduct = Literal[
@@ -194,6 +198,21 @@ def _grid_centres(grid: GridSpec) -> tuple[np.ndarray, np.ndarray]:
     return np.asarray(xs), np.asarray(ys)
 
 
+def _grid_centres_wgs84(grid: GridSpec) -> tuple[np.ndarray, np.ndarray]:
+    """Return target pixel centres as WGS84 longitude/latitude arrays."""
+    x_values, y_values = _grid_centres(grid)
+    if grid.crs == "EPSG:4326":
+        return x_values, y_values
+    from pyproj import Transformer
+
+    transformer = Transformer.from_crs(grid.crs, "EPSG:4326", always_xy=True)
+    longitude, latitude = transformer.transform(x_values, y_values)
+    return (
+        np.asarray(longitude, dtype=np.float64),
+        np.asarray(latitude, dtype=np.float64),
+    )
+
+
 def _identity(
     array: np.ndarray,
     grid: GridSpec,
@@ -208,9 +227,21 @@ def _identity(
         "datum": datum,
         "provenance": dict(provenance),
         "resampling": "isce-p0032-biquintic-6x6-v1",
+        "pyproj": _pyproj_runtime_identity(),
     }
     digest.update(json.dumps(payload, sort_keys=True, default=str).encode())
     return digest.hexdigest()
+
+
+def _pyproj_runtime_identity() -> str:
+    """Return the projection runtime/data identity used for DEM warps."""
+    try:
+        import pyproj
+        from pyproj import datadir
+
+        return f"{pyproj.__version__}:{datadir.get_data_dir()}"
+    except ImportError:
+        return "pyproj-unavailable"
 
 
 class DEM(ABC):
@@ -242,7 +273,11 @@ class DEM(ABC):
 
     @abstractmethod
     def to_raster(
-        self, grid: GridSpec, *, vertical_datum: VerticalDatum = "ellipsoidal"
+        self,
+        grid: GridSpec,
+        *,
+        vertical_datum: VerticalDatum = "ellipsoidal",
+        budget: ResourceBudget | None = None,
     ) -> RasterDEM:
         """Materialize the DEM on one target grid."""
 
@@ -265,7 +300,11 @@ class SourceDEM(DEM):
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
 
     def to_raster(
-        self, grid: GridSpec, *, vertical_datum: VerticalDatum = "ellipsoidal"
+        self,
+        grid: GridSpec,
+        *,
+        vertical_datum: VerticalDatum = "ellipsoidal",
+        budget: ResourceBudget | None = None,
     ) -> RasterDEM:
         """Materialize this source through the provider implementation.
 
@@ -273,6 +312,7 @@ class SourceDEM(DEM):
         provider lane installs the materializer at this boundary.
         """
         _admit_grid(grid)
+        preflight_grid(grid.height, grid.width, budget=budget)
         target_datum = _admit_datum(vertical_datum)
         if self.cache_dir is None:
             message = "SourceDEM.to_raster requires an explicit cache_dir"
@@ -282,12 +322,18 @@ class SourceDEM(DEM):
 
         selection = f"{self.product}:{self.provider or 'pc'}"
         source = get_provider("glo30:pc" if self.product == "auto" else selection)
-        result = materialize_source(source, grid, cache_dir=self.cache_dir)
+        result = materialize_source(
+            source, grid, cache_dir=self.cache_dir, budget=budget
+        )
         if not isinstance(result, RasterDEM):
-            raise TypeError("DEM provider did not return a RasterDEM")
+            message = "DEM provider did not return a RasterDEM"
+            logger.error(message)
+            raise TypeError(message)
         if target_datum == result.vertical_datum:
             return result
-        return result.to_raster(grid, vertical_datum=target_datum)
+        return result.to_raster(
+            grid, vertical_datum=target_datum, budget=budget
+        )
 
 
 class ConstantDEM(DEM):
@@ -305,16 +351,21 @@ class ConstantDEM(DEM):
         self.vertical_datum = _admit_datum(vertical_datum)
 
     def to_raster(
-        self, grid: GridSpec, *, vertical_datum: VerticalDatum = "ellipsoidal"
+        self,
+        grid: GridSpec,
+        *,
+        vertical_datum: VerticalDatum = "ellipsoidal",
+        budget: ResourceBudget | None = None,
     ) -> RasterDEM:
         """Fill the target grid with this constant height."""
         _admit_grid(grid)
+        preflight_grid(grid.height, grid.width, budget=budget)
         target = _admit_datum(vertical_datum)
         values = np.full(grid.shape, self.height, dtype=np.float32)
         if self.vertical_datum != target:
             from .datum import convert_heights
 
-            xs, ys = _grid_centres(grid)
+            xs, ys = _grid_centres_wgs84(grid)
             values = np.asarray(
                 convert_heights(values, xs, ys, self.vertical_datum, target),
                 dtype=np.float32,
@@ -335,6 +386,19 @@ class ConstantDEM(DEM):
             vertical_datum=target,
             provenance=provenance,
         )
+
+    def sample(
+        self,
+        latitude_deg: np.ndarray,
+        longitude_deg: np.ndarray,
+    ) -> np.ndarray:
+        """Return the constant height at geodetic coordinates."""
+        latitude, longitude = np.broadcast_arrays(
+            np.asarray(latitude_deg, dtype=np.float64),
+            np.asarray(longitude_deg, dtype=np.float64),
+        )
+        del longitude
+        return np.full(latitude.shape, self.height, dtype=np.float64)
 
 
 class RasterDEM(DEM):
@@ -384,6 +448,7 @@ class RasterDEM(DEM):
             logger.error(message)
             raise TypeError(message)
         _admit_grid(grid)
+        preflight_grid(grid.height, grid.width)
         datum = _admit_datum(
             "ellipsoidal" if vertical_datum is None else vertical_datum
         )
@@ -401,6 +466,28 @@ class RasterDEM(DEM):
         }
         self._provenance = _freeze_mapping(metadata)
         self._identity = _identity(self._array, grid, datum, self._provenance)
+
+    def sample(
+        self,
+        latitude_deg: np.ndarray,
+        longitude_deg: np.ndarray,
+    ) -> np.ndarray:
+        """Sample the raster at geodetic coordinates using its fixed kernel."""
+        from pyproj import Transformer
+
+        latitude, longitude = np.broadcast_arrays(
+            np.asarray(latitude_deg, dtype=np.float64),
+            np.asarray(longitude_deg, dtype=np.float64),
+        )
+        transformer = Transformer.from_crs("EPSG:4326", self.grid.crs, always_xy=True)
+        x_values, y_values = transformer.transform(longitude, latitude)
+        source_transform = Affine(*self.grid.transform)
+        columns, rows = (~source_transform) * (x_values, y_values)
+        return _sample_biquintic(
+            np.asarray(self._array, dtype=np.float64),
+            np.asarray(rows, dtype=np.float64),
+            np.asarray(columns, dtype=np.float64),
+        )
 
     @property
     def array(self) -> np.ndarray:
@@ -467,10 +554,15 @@ class RasterDEM(DEM):
         return np.asarray(self._array, dtype=dtype)
 
     def to_raster(
-        self, grid: GridSpec, *, vertical_datum: VerticalDatum = "ellipsoidal"
+        self,
+        grid: GridSpec,
+        *,
+        vertical_datum: VerticalDatum = "ellipsoidal",
+        budget: ResourceBudget | None = None,
     ) -> Self:
         """Regrid once onto ``grid`` using the fixed P0032 rule."""
         _admit_grid(grid)
+        preflight_grid(grid.height, grid.width, budget=budget)
         target_datum = _admit_datum(vertical_datum)
         if grid == self.grid and target_datum == self.vertical_datum:
             return self
@@ -496,7 +588,10 @@ class RasterDEM(DEM):
 
             values = np.asarray(
                 convert_heights(
-                    values, target_x, target_y, self.vertical_datum, target_datum
+                    values,
+                    *_grid_centres_wgs84(grid),
+                    self.vertical_datum,
+                    target_datum,
                 ),
                 dtype=np.float32,
             )
