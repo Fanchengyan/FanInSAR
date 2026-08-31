@@ -573,6 +573,43 @@ class RasterDEM(DEM):
         target_datum = _admit_datum(vertical_datum)
         if grid == self.grid and target_datum == self.vertical_datum:
             return self
+
+        # A canonical-equal grid is already the authoritative materialized
+        # terrain field.  Changing only the vertical datum is a pointwise
+        # coordinate conversion, not terrain resampling; in particular it
+        # must remain valid for small rasters that cannot provide P0032's 6x6
+        # support window (for example a direct 2x2 provider seam).
+        if grid == self.grid:
+            from .datum import convert_heights
+
+            values = np.asarray(self._array, dtype=np.float64).copy()
+            values = np.asarray(
+                convert_heights(
+                    values,
+                    *_grid_centres_wgs84(grid),
+                    self.vertical_datum,
+                    target_datum,
+                ),
+                dtype=np.float32,
+            )
+            if self.nodata is not None:
+                values[~np.isfinite(values)] = np.nan
+            if grid.validity is not None:
+                values = np.array(values, copy=True)
+                values[~grid.validity] = np.nan
+            provenance = {
+                **dict(self.provenance),
+                "resampling": "none",
+                "source_datum": self.vertical_datum,
+            }
+            return type(self)(
+                array=values,
+                grid=grid,
+                vertical_datum=target_datum,
+                nodata=self.nodata,
+                provenance=provenance,
+            )
+
         from pyproj import Transformer
 
         target_x, target_y = _grid_centres(grid)
@@ -611,7 +648,11 @@ class RasterDEM(DEM):
             "source_grid": self.grid.crs,
         }
         return type(self)(
-            array=values, grid=grid, vertical_datum=target_datum, provenance=provenance
+            array=values,
+            grid=grid,
+            vertical_datum=target_datum,
+            nodata=self.nodata,
+            provenance=provenance,
         )
 
     def save(self, path: Path) -> None:
