@@ -107,7 +107,8 @@ class Acquisition(pd.DatetimeIndex):
         """Return the physical identity for a record-shaped acquisition."""
         value = getattr(self, "_physical_key", None)
         if value is None:
-            raise AttributeError("date collections do not have a physical key")
+            message = "date collections do not have a physical key"
+            raise AttributeError(message)  # noqa: TRY003
         return value
 
     @key.setter
@@ -119,7 +120,8 @@ class Acquisition(pd.DatetimeIndex):
         """Return the sensing time for a record-shaped acquisition."""
         value = getattr(self, "_sensing_time", None)
         if value is None:
-            raise AttributeError("date collections do not have a sensing time")
+            message = "date collections do not have a sensing time"
+            raise AttributeError(message)  # noqa: TRY003
         return value
 
     @sensing_time.setter
