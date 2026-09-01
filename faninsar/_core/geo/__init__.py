@@ -10,7 +10,7 @@ from .coordinates import (
     xy_from_profile,
     xy_from_transform,
 )
-from .grids import GeoGrid, GeoGridMixin, format_bounds_and_crs
+from .grids import GeoGrid, GeoGridMixin, GridSpec, format_bounds_and_crs
 from .kmz import array2kmz, dataarray2kmz, save_colorbar
 from .profiles import Profile
 from .raster_ops import match_to_raster
@@ -19,6 +19,7 @@ __all__ = [
     "GeoDataFormatConverter",
     "GeoGrid",
     "GeoGridMixin",
+    "GridSpec",
     "Profile",
     "array2kmz",
     "bounds_from_xy",

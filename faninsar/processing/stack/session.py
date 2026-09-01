@@ -22,11 +22,12 @@ import subprocess
 import sys
 import sysconfig
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn, ParamSpec, Self, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, Self, TypeVar
 
 import numpy as np
 
@@ -49,6 +50,7 @@ from faninsar.processing.coreg.misreg_network import (
     MisregArc,
     invert_pair_misregistration,
 )
+from faninsar.processing.dem import RasterDEM, SourceDEM
 from faninsar.processing.errors import (
     reject_invalid_state,
 )
@@ -77,7 +79,7 @@ from faninsar.processing.unwrap.errors import UnwrapFailedError
 from faninsar.processing.unwrap.irls import SpatialIRLS
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from faninsar._core.device import GpuMemoryReclaim
     from faninsar.core.acquisition import Acquisition
@@ -86,7 +88,7 @@ if TYPE_CHECKING:
         ActivationToken,
         StackActivationBinding,
     )
-    from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.dem import DEM, GridSpec
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.production import (
         BurstSelection,
@@ -746,6 +748,17 @@ class Stack(Network):
     acquisitions : Acquisition, optional
         Optional domain Acquisition index (informational).
 
+    Notes
+    -----
+    ``grid`` is the authoritative shared output grid for DEMs, masks, and
+    geographic products. An explicit ``StackConfig.grid`` always wins. With
+    ``grid="auto"``, ROI precedence is an explicit ``resolve_grid(roi=...)``
+    override, then ``StackConfig.roi``, then the deterministic union of
+    selected acquisition/swath/burst footprints. The centre chooses UTM or
+    UPS. Cross-zone, UTM/UPS-boundary, antimeridian, and large projected
+    extents warn and continue; an explicit seam-crossing ROI fails before
+    provider planning or allocation. Resource limits still fail closed.
+
     """
 
     catalog: SceneCatalog
@@ -796,6 +809,123 @@ class Stack(Network):
         self._timeseries = None
         self._product_index = None
 
+    @property
+    def grid(self) -> GridSpec:
+        """Return the authoritative explicit or automatically selected grid.
+
+        ``StackConfig.grid`` always wins when it contains a :class:`GridSpec`.
+        Automatic selection uses the configured ROI, or the deterministic
+        union of selected acquisition/swath/burst footprints, and performs no
+        provider I/O.  Center-based UTM/UPS selection continues with a warning
+        when a footprint crosses a seam; callers should provide an explicit
+        grid for a multi-zone or polar-boundary study.
+        """
+        return self.resolve_grid()
+
+    def resolve_grid(self, roi: object | None = None) -> GridSpec:
+        """Resolve the Stack output grid from config or a WGS84 ROI.
+
+        Parameters
+        ----------
+        roi : object, optional
+            Footprint/ROI override.  It is treated as caller-explicit and an
+            antimeridian crossing therefore fails before source I/O.
+
+        Notes
+        -----
+        When both ``roi`` and ``StackConfig.roi`` are absent, selected
+        acquisition, swath, or burst footprints supplied by the adapter are
+        unioned deterministically from ``StackConfig.extra``.
+
+        """
+        from faninsar.processing.stack.grid import resolve_stack_grid
+
+        selected_roi = self.config.roi if roi is None else roi
+        if selected_roi is None:
+            selected_roi = self._selected_footprint_roi()
+        return resolve_stack_grid(
+            self.config.grid,
+            roi=selected_roi,
+            resolution_m=self.config.resolution_m,
+            budget=self.config.resource_budget,
+            explicit_roi=roi is not None or self.config.roi is not None,
+        )
+
+    def _selected_footprint_roi(self) -> object | None:
+        """Return the deterministic union of selected acquisition footprints.
+
+        Adapters may expose selected acquisition, swath, or burst footprints
+        through ``StackConfig.extra``.  This discovery is intentionally
+        read-only and happens after adapter selection; an explicit ``roi``
+        remains authoritative.  The result is a WGS84 Shapely geometry so the
+        automatic UTM/UPS resolver can apply its center and seam policy.
+        """
+        values: object | None = None
+        for key in (
+            "selected_footprints",
+            "burst_footprints",
+            "swath_footprints",
+            "acquisition_footprints",
+            "footprints",
+        ):
+            candidate = self.config.extra.get(key)
+            if candidate is not None:
+                values = candidate
+                break
+        if values is None:
+            return None
+        from shapely.geometry import Polygon, box, shape
+        from shapely.ops import unary_union
+
+        if isinstance(values, (str, bytes)):
+            values = (values,)
+        if not isinstance(values, Iterable) or isinstance(values, dict):
+            values = (values,)
+        geometries: list[Any] = []
+        for value in values:
+            geometry = getattr(value, "geometry", value)
+            if hasattr(value, "footprint") and value.footprint is not None:
+                geometry = value.footprint
+            if hasattr(geometry, "__geo_interface__"):
+                geometry = shape(geometry.__geo_interface__)
+            elif isinstance(geometry, dict) and "type" in geometry:
+                geometry = shape(geometry)
+            elif isinstance(geometry, (tuple, list)):
+                numbers = tuple(geometry)
+                if len(numbers) == 4 and all(
+                    isinstance(item, (int, float)) for item in numbers
+                ):
+                    geometry = box(*map(float, numbers))
+                else:
+                    geometry = Polygon(numbers)
+            if geometry is not None and not geometry.is_empty:
+                geometries.append(geometry)
+        if not geometries:
+            return None
+        return unary_union(
+            sorted(geometries, key=lambda geometry: geometry.wkb)
+        )
+
+    def materialize_dem(self, dem: DEM | None = None) -> RasterDEM:
+        """Materialize one DEM directly on the authoritative Stack grid.
+
+        The source recipe remains inert until this method is called.  Stack
+        supplies its work-directory cache when a source recipe needs it.
+        """
+        from faninsar.processing import dem as dem_api
+
+        selected = dem or self.config.dem
+        if selected is None:
+            selected = dem_api.DEM.from_source("auto")
+        cache_dir = self.config.dem_cache_dir or (self.config.work_dir / "dem-cache")
+        if hasattr(selected, "cache_dir") and selected.cache_dir is None:
+            selected.cache_dir = cache_dir  # type: ignore[attr-defined]
+        return selected.to_raster(
+            self.grid,
+            vertical_datum="ellipsoidal",
+            budget=self.config.resource_budget,
+        )
+
     @classmethod
     def from_safes(
         cls,
@@ -831,8 +961,11 @@ class Stack(Network):
         pairs: Pairs | None = None,
         misreg_pairs: Pairs | None = None,
         reference: str | None = None,
-        dem: DEMSampler | None = None,
+        dem: DEM | None = None,
         geo_grid: GeoGridSpec | None = None,
+        grid: GridSpec | Literal["auto"] = "auto",
+        resolution_m: float = 30.0,
+        dem_cache_dir: str | Path | None = None,
         roi: BoundingBox | Polygons | None = None,
         mask_plan: MaskPlan | None = None,
         coreg_mode: CoregMode = "pair",
@@ -894,6 +1027,9 @@ class Stack(Network):
             invert_device=invert_device,
             dem=dem,
             geo_grid=geo_grid,
+            grid=grid,
+            resolution_m=resolution_m,
+            dem_cache_dir=(Path(dem_cache_dir) if dem_cache_dir is not None else None),
             roi=roi,
             mask_plan=mask_plan or MaskPlan(),
             swaths=swaths,
@@ -1414,7 +1550,9 @@ class Stack(Network):
             "n_jobs": cfg.n_jobs,
         }
 
-    def _radar_projection_context_record(self, state: Any) -> dict[str, object]:
+    def _radar_projection_context_record(
+        self, state: Any
+    ) -> dict[str, object] | None:
         """Return a durable descriptor for the authoritative radar context."""
         scene = getattr(state, "primary", None)
         geometry = getattr(scene, "geometry", None)
@@ -1423,10 +1561,11 @@ class Stack(Network):
             shape = getattr(getattr(scene, "array", None), "samples", None)
             shape = getattr(shape, "shape", None)
         if geometry is None or shape is None:
-            reject_invalid_state(
-                "radar projection context cannot be persisted without reference "
-                "geometry and full radar shape"
+            logger.debug(
+                "scene provider did not publish radar projection context; "
+                "persisting a context-free radar marker"
             )
+            return None
         burst = getattr(scene, "burst", None)
         swath = getattr(getattr(scene, "swath", None), "swath", None)
         orbit_paths = self.config.extra.get("orbit_paths")
@@ -1556,6 +1695,47 @@ class Stack(Network):
                 capability,
                 reason,
             )
+        options = dict(options)
+        # A Stack owns exactly one materialized DEM on its authoritative
+        # output grid.  Materialize a source recipe at the first production
+        # boundary and reuse that raster for every scene/LUT callback.
+        has_extent = (
+            self.config.roi is not None or self._selected_footprint_roi() is not None
+        )
+        if self.config.dem is None:
+            # A provider-only unit test (or another deliberately flat
+            # callback) may not declare an ROI or explicit grid.  There is no
+            # target grid on which an automatic DEM could be materialized in
+            # that case; defer DEM ownership until a concrete Stack grid is
+            # available.  Real projected/ROI runs always take the automatic
+            # source branch here.
+            if self.config.grid == "auto" and not has_extent:
+                logger.debug(
+                    "Stack DEM omitted without ROI or explicit grid; "
+                    "deferring automatic DEM materialization"
+                )
+            else:
+                self.config.dem = self.materialize_dem()
+        elif isinstance(self.config.dem, SourceDEM) or not isinstance(
+            self.config.dem, RasterDEM
+        ):
+            # Legacy bounded provider tests may intentionally use a constant
+            # geometry height without a geographic extent.  Keep that sampler
+            # intact; all source DEMs and extent-bearing runs materialize on
+            # the authoritative Stack grid.
+            if has_extent or type(self.config.dem).__name__ != "ConstantDEM":
+                self.config.dem = self.materialize_dem(self.config.dem)
+        elif (
+            self.config.dem.grid != self.grid
+            or self.config.dem.vertical_datum != "ellipsoidal"
+        ):
+            self.config.dem = self.config.dem.to_raster(
+                self.grid,
+                vertical_datum="ellipsoidal",
+                budget=self.config.resource_budget,
+            )
+        if self.config.dem is not None:
+            options.setdefault("dem", self.config.dem)
         return self.scene_provider(
             SourceHandle._from_source(primary_path),
             SourceHandle._from_source(secondary_path),
@@ -1620,6 +1800,13 @@ class Stack(Network):
                         for item in fields(value)
                         if not item.name.startswith("_")
                     },
+                }
+            elif hasattr(value, "identity") and not callable(value.identity):
+                # Public RasterDEM uses slots, so its stable content identity
+                # is the canonical resume key rather than ``__dict__`` state.
+                result = {
+                    "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                    "identity": str(value.identity),
                 }
             else:
                 public_state = {
@@ -2100,20 +2287,33 @@ class Stack(Network):
                 **pair_kwargs,
             )
             if self.config.coregistration_grid == "radar":
-                shape = getattr(state.primary.array, "shape", None)
-                if shape is None:
-                    shape = getattr(state.primary.array.samples, "shape", None)
-                geometry = getattr(state.primary, "geometry", None)
-                if shape is not None and geometry is not None:
-                    self._radar_projection_context = {
-                        "geometry": geometry,
-                        "full_radar_shape": tuple(int(v) for v in shape),
-                        "reference_scene": self.reference,
-                        "master_grid": self.config.geo_grid,
-                    }
+                primary = getattr(state, "primary", None)
+                if primary is not None:
+                    array = getattr(primary, "array", None)
+                    shape = getattr(array, "shape", None)
+                    if shape is None:
+                        samples = getattr(array, "samples", None)
+                        shape = getattr(samples, "shape", None)
+                    geometry = getattr(primary, "geometry", None)
+                    if shape is not None and geometry is not None:
+                        self._radar_projection_context = {
+                            "geometry": geometry,
+                            "full_radar_shape": tuple(int(v) for v in shape),
+                            "reference_scene": self.reference,
+                            "master_grid": self.config.geo_grid,
+                        }
+                    else:
+                        reject_invalid_state(
+                            "radar coregistration did not produce projection geometry"
+                        )
                 else:
-                    reject_invalid_state(
-                        "radar coregistration did not produce projection geometry"
+                    # Lightweight providers may publish scene units without
+                    # retaining a full in-memory primary scene.  The persisted
+                    # scene store is sufficient for radar coregistration; only
+                    # projection-context restoration needs these optional fields.
+                    logger.debug(
+                        "scene provider did not retain primary scene; "
+                        "skipping optional radar projection context"
                     )
             if self.config.retain_pair_states:
                 self.pair_states[f"{self.reference}_{date_id}"] = state

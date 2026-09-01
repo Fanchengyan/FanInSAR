@@ -11,9 +11,9 @@ import numpy as np
 import pytest
 
 from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
+from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.geometry import prepare_production as prepare_mod
 from faninsar.processing.geometry.backend_dispatch import DispatchError
-from faninsar.processing.geometry.dem import ConstantHeightDEM
 from faninsar.processing.geometry.native_v2.builder import (
     NativeBackend,
     NativeBuilder,
@@ -24,6 +24,7 @@ from faninsar.processing.geometry.orbit import OrbitInterpolator
 from faninsar.processing.geometry.prepare_production import (
     _dem_native_arrays,
     _native_lock_is_open,
+    _public_raster_dem_native_arrays,
     prepare_production_geometry,
     run_geo2rdr,
     run_rdr2geo,
@@ -214,12 +215,39 @@ def test_cuda_prepare_requests_compile_identity(monkeypatch) -> None:
 
 
 def test_dem_native_arrays_constant_height() -> None:
-    """ConstantHeightDEM becomes a coarse global raster for the six-point stencil."""
-    values, metadata, bounds = _dem_native_arrays(ConstantHeightDEM(12.5))
+    """ConstantDEM becomes a coarse global raster for the six-point stencil."""
+    values, metadata, bounds = _dem_native_arrays(ConstantDEM(12.5))
     assert values.shape[0] >= 6 and values.shape[1] >= 6
     assert np.allclose(values, 12.5)
     assert metadata.shape == (4,)
     assert bounds.tolist() == [12.5, 12.5]
+
+
+def test_projected_raster_dem_geometry_view_does_not_materialize_epsg4326(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Projected public DEMs use the private sampler branch directly."""
+    from affine import Affine
+
+    from faninsar.processing.dem import GridSpec, RasterDEM
+
+    source = RasterDEM(
+        array=np.arange(64, dtype=np.float32).reshape(8, 8),
+        grid=GridSpec(
+            "EPSG:32632",
+            Affine(30.0, 0.0, 500000.0, 0.0, -30.0, 4200000.0),
+            shape=(8, 8),
+        ),
+    )
+
+    def fail_materialization(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("projected geometry view must not call to_raster")
+
+    monkeypatch.setattr(RasterDEM, "to_raster", fail_materialization)
+    values, metadata, bounds = _public_raster_dem_native_arrays(source)
+    assert values.shape == source.shape
+    assert metadata.shape == (4,)
+    assert np.all(np.isfinite(bounds))
 
 
 def test_cuda_rdr2geo_prepare_registers_native_dem(monkeypatch) -> None:
@@ -261,7 +289,7 @@ def test_cuda_rdr2geo_prepare_registers_native_dem(monkeypatch) -> None:
         "faninsar.processing.geometry.prepare_production._try_load_cuda_module",
         lambda _op: object(),
     )
-    dem = ConstantHeightDEM(4.0)
+    dem = ConstantDEM(4.0)
     prepared = prepare_production_geometry(
         Operation.RDR2GEO,
         _model(),
@@ -403,14 +431,14 @@ def test_prepared_cache_misses_on_dem_digest(monkeypatch) -> None:
         model,
         device="cpu",
         shape=(2, 2),
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
     )
     prepare_production_geometry(
         Operation.RDR2GEO,
         model,
         device="cpu",
         shape=(2, 2),
-        dem=ConstantHeightDEM(12.0),
+        dem=ConstantDEM(12.0),
     )
     assert len(calls) == 2
 
@@ -460,7 +488,7 @@ def test_gpu_dem_table_aliases_across_prepared_shapes(monkeypatch) -> None:
     )
     monkeypatch.setattr(prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None))
     monkeypatch.setattr(prepare_mod, "_try_load_cuda_module", lambda _op: object())
-    dem = ConstantHeightDEM(4.0)
+    dem = ConstantDEM(4.0)
     model = _model()
     prepare_production_geometry(
         Operation.RDR2GEO, model, device="cuda", shape=(4, 4), dem=dem
@@ -501,7 +529,7 @@ def test_rdr2geo_without_dem_context_does_not_admit_native(monkeypatch) -> None:
         _model(),
         device="cuda",
         shape=(4, 4),
-        dem=ConstantHeightDEM(4.0),
+        dem=ConstantDEM(4.0),
     )
     assert captured[0]["native_executor"] is None
     assert captured[0]["native_context_inputs"] is None
@@ -552,7 +580,7 @@ def test_native_rdr2geo_registers_dem_once_per_digest(monkeypatch) -> None:
     )
     monkeypatch.setattr(prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None))
     monkeypatch.setattr(prepare_mod, "_try_load_cuda_module", lambda _op: object())
-    dem = ConstantHeightDEM(7.0)
+    dem = ConstantDEM(7.0)
     model = _model()
     first = prepare_production_geometry(
         Operation.RDR2GEO, model, device="cuda", shape=(4, 4), dem=dem

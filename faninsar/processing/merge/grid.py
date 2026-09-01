@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from faninsar._core.geo.grids import GridSpec
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
@@ -20,70 +20,7 @@ LonLatFootprint: tuple[float, float, float, float]
 __all__ = ["GeoGridSpec", "build_geo_grid"]
 
 
-@dataclass(frozen=True, slots=True)
-class GeoGridSpec:
-    """Regular north-up projected grid shared by all merge products.
-
-    Parameters
-    ----------
-    crs : str
-        EPSG code or WKT string (e.g. ``"EPSG:32633"``).
-    transform : tuple of float
-        Affine mapping ``(x0, dx, 0, y0, 0, -dy)`` in CRS units, north-up.
-    width, height : int
-        Grid dimensions in pixels.
-    resolution_m : tuple of float
-        ``(dx, dy)`` pixel sizes in CRS units (metres for projected CRS).
-    bbox : tuple of float, optional
-        ``(west, south, east, north)`` in CRS units. When omitted it is
-        derived from ``transform`` and ``shape``.
-
-    """
-
-    crs: str
-    transform: tuple[float, float, float, float, float, float]
-    width: int
-    height: int
-    resolution_m: tuple[float, float]
-    bbox: tuple[float, float, float, float] = field(default=None)  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        """Validate dimensions and fill a default bbox from the transform."""
-        if self.width <= 0 or self.height <= 0:
-            msg = "GeoGridSpec width and height must be positive"
-            raise ValueError(msg)
-        if not self.crs:
-            msg = "GeoGridSpec crs must not be empty"
-            raise ValueError(msg)
-        x0, dx, _, y0, _, dy = self.transform
-        if dx == 0.0 or dy == 0.0:
-            msg = "GeoGridSpec pixel sizes must be non-zero"
-            raise ValueError(msg)
-        if self.bbox is None:
-            west = x0
-            north = y0
-            east = x0 + self.width * dx
-            south = y0 + self.height * dy  # dy is negative for north-up
-            object.__setattr__(self, "bbox", (west, south, east, north))
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        """Return ``(height, width)`` consistent with numpy array ordering."""
-        return (self.height, self.width)
-
-    def xy_pixel_centers(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return meshgrid of pixel-center X and Y coordinates in CRS units.
-
-        Returns
-        -------
-        x, y : numpy.ndarray
-            Both of shape ``(height, width)``.
-
-        """
-        x0, dx, _, y0, _, dy = self.transform
-        xs = x0 + dx * (0.5 + np.arange(self.width))
-        ys = y0 + dy * (0.5 + np.arange(self.height))
-        return np.meshgrid(xs, ys)
+GeoGridSpec = GridSpec
 
 
 def _utm_zone_for_lonlat(lon: float, lat: float) -> str:
@@ -172,7 +109,9 @@ def build_geo_grid(
 
     # North-up: y0 = y_max, dy negative.
     transform = (x_min, dx, 0.0, y_max, 0.0, -dy)
-    bbox = (x_min, y_min, x_max, y_max)
+    # A raster grid owns complete pixels, so ceil padding becomes part of the
+    # canonical bounds rather than an inconsistent half-open extent.
+    bbox = (x_min, y_max - height * dy, x_min + width * dx, y_max)
     logger.info(
         "built GeoGridSpec crs=%s shape=(%d, %d) bbox=%s",
         target_crs,

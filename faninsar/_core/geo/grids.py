@@ -28,6 +28,273 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 
+class GridSpec:
+    """Immutable description of a north-up geographic or projected grid.
+
+    Parameters
+    ----------
+    crs : object
+        CRS accepted by :class:`pyproj.CRS`.
+    transform : object
+        An ``affine.Affine`` or six GDAL-order coefficients.
+    height, width : int
+        Positive raster dimensions in rows and columns.
+    bounds : tuple[float, float, float, float]
+        Outer pixel-edge bounds in ``(min_x, min_y, max_x, max_y)`` order.
+    validity : numpy.ndarray, optional
+        Optional boolean target-coverage array matching ``(height, width)``.
+
+    Notes
+    -----
+    The transform is canonical GDAL order ``(a, b, c, d, e, f)`` and maps a
+    pixel column/row to CRS coordinates. MVP grids are finite, invertible,
+    north-up affine transforms (``b=d=0``, ``a>0``, ``e<0``). Geographic,
+    UTM/UPS, and other caller CRSs accepted by the shared pyproj boundary are
+    allowed; this class does not infer a CRS from bounds or filenames.
+    The object defensively copies mutable inputs and exposes a read-only
+    validity array.  Equality and hashing include every observable field.
+
+    """
+
+    __slots__ = ("bounds", "crs", "height", "transform", "validity", "width")
+
+    def __init__(
+        self,
+        crs: object,
+        transform: object,
+        height: int | None = None,
+        width: int | None = None,
+        *,
+        shape: tuple[int, int] | None = None,
+        bounds: tuple[float, float, float, float] | None = None,
+        bbox: tuple[float, float, float, float] | None = None,
+        resolution_m: tuple[float, float] | None = None,
+        validity: np.ndarray | None = None,
+    ) -> None:
+        """Validate and freeze a grid specification.
+
+        Parameters
+        ----------
+        crs : object
+            CRS accepted by :class:`pyproj.CRS`; it is canonicalized once.
+        transform : affine.Affine or tuple of float
+            North-up GDAL-order affine transform.
+        height, width : int, optional
+            Positive row and column dimensions.  Supply these or ``shape``.
+        shape : tuple of int, optional
+            ``(height, width)`` dimensions.
+        bounds, bbox : tuple of float, optional
+            Matching outer pixel-edge bounds; ``bbox`` is an accepted alias.
+        resolution_m : tuple of float, optional
+            Expected absolute pixel spacing, validated against the transform.
+        validity : numpy.ndarray, optional
+            Boolean target-coverage array.  It is defensively copied and
+            exposed read-only; invalid target cells become nodata in DEM and
+            mask materialization.
+
+        Raises
+        ------
+        TypeError, ValueError
+            If CRS, transform, dimensions, bounds, resolution, or validity
+            cannot define one finite north-up grid.
+
+        """
+        from affine import Affine
+
+        if shape is not None:
+            if height is not None or width is not None or len(shape) != 2:
+                message = "pass either shape or height/width, not both"
+                logger.error(message)
+                raise ValueError(message)
+            height, width = int(shape[0]), int(shape[1])
+        if height is None or width is None:
+            message = "GridSpec requires shape or both height and width"
+            logger.error(message)
+            raise TypeError(message)
+        legacy_row_down = False
+        try:
+            canonical_crs = CRS.from_user_input(crs).to_string()
+        except Exception as error:
+            message = f"unresolvable grid CRS: {crs!r}"
+            logger.exception(message)
+            raise ValueError(message) from error
+        try:
+            if (
+                not isinstance(transform, Affine)
+                and resolution_m is not None
+                and len(transform) == 6
+            ):
+                # Merge callers historically supplied ``x0, dx, 0, y0, 0,
+                # -dy``. Normalize that spelling at the canonical boundary.
+                x0, dx, _zero_x, y0, _zero_y, dy = transform
+                legacy_row_down = float(dy) > 0
+                # Legacy tuple callers described the lower edge and used
+                # positive row-down spacing. Convert once at the shared
+                # boundary to the canonical north-up GDAL transform while
+                # preserving the same outer pixel bounds.
+                row_spacing = float(dy)
+                if row_spacing > 0:
+                    affine = Affine(
+                        float(dx),
+                        0.0,
+                        float(x0),
+                        0.0,
+                        -row_spacing,
+                        float(y0) + row_spacing * int(height),
+                    )
+                else:
+                    affine = Affine(dx, 0.0, x0, 0.0, row_spacing, y0)
+            else:
+                affine = (
+                    transform if isinstance(transform, Affine) else Affine(*transform)
+                )
+        except (TypeError, ValueError) as error:
+            message = "transform must be an Affine or six coefficients"
+            logger.exception(message)
+            raise TypeError(message) from error
+        if not isinstance(affine, Affine):
+            message = "transform must be an Affine or six coefficients"
+            logger.error(message)
+            raise TypeError(message)
+        rows, columns = int(height), int(width)
+        if rows <= 0 or columns <= 0:
+            message = f"grid dimensions must be positive, got {(rows, columns)}"
+            logger.error(message)
+            raise ValueError(message)
+        if not all(np.isfinite(value) for value in affine):
+            message = "grid transform must contain finite values"
+            logger.error(message)
+            raise ValueError(message)
+        if (
+            affine.b != 0
+            or affine.d != 0
+            or affine.a <= 0
+            or (affine.e >= 0 and not legacy_row_down)
+        ):
+            message = "GridSpec requires a finite north-up affine transform"
+            logger.error(message)
+            raise ValueError(message)
+        if bounds is not None and bbox is not None:
+            message = "pass either bounds or bbox, not both"
+            logger.error(message)
+            raise ValueError(message)
+        if bbox is not None:
+            bounds = bbox
+        if resolution_m is not None:
+            if len(resolution_m) != 2 or any(
+                not np.isfinite(value) or value <= 0 for value in resolution_m
+            ):
+                message = "resolution_m must contain two positive finite values"
+                logger.error(message)
+                raise ValueError(message)
+            if not np.isclose(abs(affine.a), resolution_m[0]) or not np.isclose(
+                abs(affine.e), resolution_m[1]
+            ):
+                message = "resolution_m does not match transform"
+                logger.error(message)
+                raise ValueError(message)
+        if bounds is None:
+            left, top = affine.c, affine.f
+            right = left + affine.a * columns
+            edge_y = top + affine.e * rows
+            bounds_value = (left, min(top, edge_y), right, max(top, edge_y))
+        else:
+            try:
+                values = tuple(float(value) for value in bounds)
+            except (TypeError, ValueError) as error:
+                message = "bounds must contain four finite values"
+                logger.exception(message)
+                raise ValueError(message) from error
+            if len(values) != 4 or not all(np.isfinite(value) for value in values):
+                message = "bounds must contain four finite values"
+                logger.error(message)
+                raise ValueError(message)
+            bounds_value = values
+            expected = (
+                affine.c,
+                min(affine.f, affine.f + affine.e * rows),
+                affine.c + affine.a * columns,
+                max(affine.f, affine.f + affine.e * rows),
+            )
+            tolerance = max(1e-9, max(abs(value) for value in expected) * 1e-12)
+            if any(
+                abs(actual - wanted) > tolerance
+                for actual, wanted in zip(values, expected, strict=True)
+            ):
+                message = "bounds do not match transform and dimensions"
+                logger.error(message)
+                raise ValueError(message)
+        if (
+            not bounds_value[0] < bounds_value[2]
+            or not bounds_value[1] < bounds_value[3]
+        ):
+            message = "bounds must be ordered as min_x, min_y, max_x, max_y"
+            logger.error(message)
+            raise ValueError(message)
+        valid = None if validity is None else np.array(validity, dtype=bool, copy=True)
+        if valid is not None:
+            if valid.shape != (rows, columns):
+                message = (
+                    f"validity shape {valid.shape} does not match {(rows, columns)}"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            valid.setflags(write=False)
+        object.__setattr__(self, "crs", canonical_crs)
+        object.__setattr__(self, "transform", tuple(float(value) for value in affine))
+        object.__setattr__(self, "height", rows)
+        object.__setattr__(self, "width", columns)
+        object.__setattr__(self, "bounds", bounds_value)
+        object.__setattr__(self, "validity", valid)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Return dimensions in ``(height, width)`` order."""
+        return self.height, self.width
+
+    @property
+    def bbox(self) -> tuple[float, float, float, float]:
+        """Return bounds under the merge-grid spelling."""
+        return self.bounds
+
+    @property
+    def resolution_m(self) -> tuple[float, float]:
+        """Return absolute pixel spacing in CRS units."""
+        return abs(self.transform[0]), abs(self.transform[4])
+
+    def xy_pixel_centers(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return pixel-centre coordinate arrays in the grid CRS."""
+        from affine import Affine
+
+        columns, rows = np.meshgrid(
+            np.arange(self.width, dtype=np.float64) + 0.5,
+            np.arange(self.height, dtype=np.float64) + 0.5,
+        )
+        return Affine(*self.transform) * (columns, rows)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Prevent changes after construction."""
+        message = "GridSpec is immutable"
+        raise AttributeError(message)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare all canonical grid fields."""
+        if not isinstance(other, GridSpec):
+            return NotImplemented
+        return (
+            self.crs == other.crs
+            and self.transform == other.transform
+            and self.shape == other.shape
+            and self.bounds == other.bounds
+            and np.array_equal(self.validity, other.validity)
+        )
+
+    def __hash__(self) -> int:
+        """Hash canonical metadata and validity bytes."""
+        validity = None if self.validity is None else self.validity.tobytes()
+        return hash((self.crs, self.transform, self.shape, self.bounds, validity))
+
+
 class GeoGridMixin:
     """A class to manage GeoGrid information of a raster image.
 

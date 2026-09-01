@@ -14,6 +14,7 @@ import pytest
 
 from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
 from faninsar.processing.coordinates import RadarGrid
+from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.geometry import (
     RadarGeometryModel,
     interpolate_orbit,
@@ -98,11 +99,11 @@ def test_geo2rdr_and_range_consistency_for_constructed_target() -> None:
 
 def test_geoid_adjusted_dem_adds_undulation() -> None:
     """Orthometric and geoid samples combine into ellipsoidal height."""
-    from faninsar.processing.geometry import ConstantHeightDEM, GeoidAdjustedDEM
+    from faninsar.processing.geometry.dem import GeoidAdjustedDEM
 
     dem = GeoidAdjustedDEM(
-        orthometric_dem=ConstantHeightDEM(1000.0),
-        geoid=ConstantHeightDEM(-42.0),
+        orthometric_dem=ConstantDEM(1000.0),
+        geoid=ConstantDEM(-42.0),
     )
     height = dem.sample(np.array([30.0]), np.array([100.0]))
     np.testing.assert_allclose(height, [958.0])
@@ -125,7 +126,6 @@ def test_rdr2geo_marks_out_of_orbit_as_not_converged() -> None:
 def test_constant_dem_and_transform_cache_round_trip(tmp_path: Path) -> None:
     """Cache ellipsoid transform results and reload them byte-identically."""
     from faninsar.processing.geometry import (
-        ConstantHeightDEM,
         TransformCacheKey,
         read_transform_cache,
         write_transform_cache,
@@ -133,7 +133,7 @@ def test_constant_dem_and_transform_cache_round_trip(tmp_path: Path) -> None:
 
     orbit, grid = _orbit_and_grid()
     model = RadarGeometryModel.from_radar_grid(grid, orbit)
-    dem = ConstantHeightDEM(height_m=100.0)
+    dem = ConstantDEM(height=100.0)
     result = run_rdr2geo(
         model,
         np.array([0.0, 1.0]),
@@ -194,11 +194,9 @@ def test_rdr2geo_geo2rdr_round_trip_residuals() -> None:
 
 def test_rdr2geo_chunked_matches_full() -> None:
     """Chunked helper produces identical results to the full-array helper."""
-    from faninsar.processing.geometry import ConstantHeightDEM
-
     orbit, grid = _orbit_and_grid()
     model = RadarGeometryModel.from_radar_grid(grid, orbit)
-    dem = ConstantHeightDEM(height_m=50.0)
+    dem = ConstantDEM(height=50.0)
 
     az_idx = np.arange(0.0, 6.0).reshape(2, 3)
     rg_idx = np.arange(10.0, 40.0, 5.0).reshape(2, 3)

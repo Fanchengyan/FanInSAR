@@ -206,7 +206,7 @@ def run_frame_cli(
             "faninsar frame requires at least two SAFE paths via --paths"
         )
     roi_box = _parse_roi(roi)
-    from faninsar.processing.geometry.dem import RasterDEM
+    from faninsar.processing.dem import DEM
     from faninsar.processing.pipeline.production import resolve_auto_dem
     from faninsar.processing.stack import Stack
 
@@ -224,19 +224,7 @@ def run_frame_cli(
                 output_name=dem_path.name,
             )
         else:
-            from faninsar.processing.geometry.dem import (
-                GeoidAdjustedDEM,
-                admit_dem_device_identity,
-            )
-            from faninsar.processing.geometry.egm96 import EGM96Geoid
-
-            dem_identity = admit_dem_device_identity(device)
-            dem_sampler = GeoidAdjustedDEM(
-                RasterDEM(
-                    path=dem_path, interpolation="biquintic", device=dem_identity
-                ),
-                EGM96Geoid(),
-            )
+            dem_sampler = DEM.from_raster(dem_path, vertical_datum="ellipsoidal")
 
     stack = Stack.from_safes(
         source_paths,

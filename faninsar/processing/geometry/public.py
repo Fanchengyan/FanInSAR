@@ -55,7 +55,7 @@ from faninsar.processing.geometry.v2 import (
 )
 
 if TYPE_CHECKING:
-    from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.dem import DEM
     from faninsar.processing.geometry.native_v2.builder import PreparedNativeCandidate
     from faninsar.processing.geometry.transforms import RadarGeometryModel
     from faninsar.typing import DeviceLike
@@ -981,7 +981,7 @@ def prepare_geometry(
     shape: Sequence[int],
     device: DeviceLike | None = "cpu",
     dtype: str | None = None,
-    dem: DEMSampler | None = None,
+    dem: DEM | None = None,
     settings: SolverSettings | None = None,
     native_executor: NativeExecutor | None = None,
     native_candidate: PreparedNativeCandidate | None = None,

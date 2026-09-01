@@ -14,8 +14,8 @@ import pytest
 import zarr
 
 from faninsar.missions.sentinel1.errors import Sentinel1ProductError
+from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.geometry import ConstantHeightDEM
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.pipeline import ProductionPairState
 from faninsar.processing.pipeline import production as production_mod
@@ -55,7 +55,7 @@ def _origin_state(shape: tuple[int, int] = SHAPE) -> ProductionPairState:
         pair_id="20161207_20161231_pair",
         primary=_make_scene(shape, "20161207"),
         secondary=_make_scene(shape, "20161231"),
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         coregistration_grid="radar",
         coreg_executor="torch",
         coreg_device="cpu",
@@ -416,7 +416,7 @@ def test_finalize_geo_products_builds_multilooked_grid() -> None:
         pair_id="GEO_ML",
         primary=_make_scene(shape, "20161207"),
         secondary=_make_scene(shape, "20161231"),
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         coregistration_grid="geo",
         unwrapped_phase=np.full(product_shape, 0.25, dtype=np.float32),
         coherence=np.ones(product_shape, dtype=np.float32),
@@ -473,7 +473,7 @@ def test_shared_resources_cleanup_is_idempotent(tmp_path: Path) -> None:
         pair_id="GEO_CLEANUP",
         primary=_make_scene(shape, "20161207"),
         secondary=_make_scene(shape, "20161231"),
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         coregistration_grid="geo",
         primary_geocoded_slc=reference_slc,
         secondary_geocoded_slc=secondary_slc,
@@ -724,7 +724,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
         pair_id="GEO_WIRE",
         primary=_make_scene(shape, "20161207"),
         secondary=_make_scene(shape, "20161231"),
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         coregistration_grid="geo",
         primary_geocoded_slc=_memmap("ref.c64", np.complex64),
         secondary_geocoded_slc=_memmap("sec.c64", np.complex64),
@@ -776,7 +776,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
         roi=None,
         swaths=("IW1",),
         bursts=None,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         multilook=[(1, 1)],
         overwrite=False,
         goldstein_alpha=0.0,
@@ -815,7 +815,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
         roi=None,
         swaths=("IW1",),
         bursts=None,
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         multilook=(1, 1),
         overwrite=False,
         goldstein_alpha=0.0,

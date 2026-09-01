@@ -10,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 
+from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.geometry import (
     Operation,
     execute_geometry,
@@ -25,7 +26,6 @@ from faninsar.processing.geometry.backend_dispatch import (
     FatalExecutionError,
     RecoverableExecutionError,
 )
-from faninsar.processing.geometry.dem import ConstantHeightDEM
 from faninsar.processing.geometry.native_v2.bindings import (
     ecef_from_native_outputs,
     result_from_native_outputs,
@@ -449,7 +449,7 @@ def test_rdr2geo_default_height_seed_comes_from_prepared_dem(
         "rdr2geo",
         _model(),
         shape=(2,),
-        dem=ConstantHeightDEM(42.0),
+        dem=ConstantDEM(42.0),
     )
 
     prepared.execute(np.zeros(2, dtype=np.float64), np.zeros(2, dtype=np.float64))
@@ -473,7 +473,7 @@ def test_torch_rdr2geo_wrapper_reuses_prepared_default_height_seed(
         _model(),
         np.zeros(2, dtype=np.float64),
         np.zeros(2, dtype=np.float64),
-        dem=ConstantHeightDEM(42.0),
+        dem=ConstantDEM(42.0),
     )
 
     np.testing.assert_array_equal(captured[0], 42.0)
@@ -493,7 +493,7 @@ def test_rdr2geo_raster_seed_uses_finite_mean_and_composition_offset() -> None:
     class GeoidAdjustedDEM:
         def __init__(self) -> None:
             self.orthometric_dem = raster
-            self.geoid = ConstantHeightDEM(10.0)
+            self.geoid = ConstantDEM(10.0)
 
     composed = prepare_torch_geometry(
         "rdr2geo", _model(), shape=(1,), dem=GeoidAdjustedDEM()
@@ -532,14 +532,14 @@ def test_native_default_height_uses_prepared_eager_seed() -> None:
         Operation.RDR2GEO,
         model,
         shape=(1,),
-        dem=ConstantHeightDEM(37.0),
+        dem=ConstantDEM(37.0),
         native_executor=NativeModule(),
         native_context_inputs=_native_context(model, Operation.RDR2GEO),
         native_key=_native_key(
             model,
             (1,),
             Operation.RDR2GEO,
-            dem=ConstantHeightDEM(37.0),
+            dem=ConstantDEM(37.0),
         ),
         native_correctness_qualified=True,
     )
@@ -585,7 +585,7 @@ def test_public_preparation_uses_operation_specific_range_tolerance(
         operation,
         _model(),
         shape=(1,),
-        dem=ConstantHeightDEM(0.0),
+        dem=ConstantDEM(0.0),
         settings=settings,
         compile=True,
     )
@@ -596,7 +596,7 @@ def test_public_preparation_uses_operation_specific_range_tolerance(
 def test_native_rdr2geo_rejects_callable_no_dem_abi() -> None:
     """A callable cannot bypass the public DEM-aware ABI selection."""
     model = _model()
-    dem = ConstantHeightDEM(37.0)
+    dem = ConstantDEM(37.0)
     with pytest.raises(DispatchError, match=r"extension module.*rdr2geo_cpu_dem"):
         prepare_geometry(
             Operation.RDR2GEO,
@@ -721,7 +721,7 @@ def test_real_module_rdr2geo_adapter_uses_contiguous_torch_and_dem_abi() -> None
         return _native_outputs(model, direct)  # type: ignore[arg-type]
 
     module.rdr2geo_cpu_dem = rdr2geo_cpu_dem  # type: ignore[attr-defined]
-    dem = ConstantHeightDEM(37.0)
+    dem = ConstantDEM(37.0)
     prepared = prepare_geometry(
         Operation.RDR2GEO,
         model,
@@ -994,7 +994,7 @@ def test_constant_dem_bypasses_fixed_point_and_commits_sampled_height(
         "rdr2geo",
         _model(),
         shape=(2,),
-        dem=ConstantHeightDEM(50.0),
+        dem=ConstantDEM(50.0),
         max_iter=4,
         range_tol_m=1.0,
         dem_iterations=50,
@@ -1027,7 +1027,7 @@ def test_constant_dem_eager_and_compiled_match_near_threshold_multilane() -> Non
             "rdr2geo",
             model,
             shape=(2,),
-            dem=ConstantHeightDEM(50.0),
+            dem=ConstantDEM(50.0),
             max_iter=4,
             range_tol_m=1.0,
         )
@@ -1040,7 +1040,7 @@ def test_constant_dem_eager_and_compiled_match_near_threshold_multilane() -> Non
                 "rdr2geo",
                 model,
                 shape=(2,),
-                dem=ConstantHeightDEM(50.0),
+                dem=ConstantDEM(50.0),
                 max_iter=4,
                 range_tol_m=1.0,
                 compile_kernel=True,
@@ -1302,10 +1302,10 @@ def test_typed_cuda_prelaunch_oom_can_fallback_with_healthy_context() -> None:
 def test_dem_identity_includes_material_value() -> None:
     """Changing the DEM sample value changes the prepared identity digest."""
     first = prepare_torch_geometry(
-        "rdr2geo", _model(), shape=(1,), dem=ConstantHeightDEM(10.0)
+        "rdr2geo", _model(), shape=(1,), dem=ConstantDEM(10.0)
     )
     second = prepare_torch_geometry(
-        "rdr2geo", _model(), shape=(1,), dem=ConstantHeightDEM(11.0)
+        "rdr2geo", _model(), shape=(1,), dem=ConstantDEM(11.0)
     )
     assert first.identity.dem_digest != second.identity.dem_digest
 
@@ -1474,13 +1474,13 @@ def test_composed_dem_identity_changes_with_nested_sampler() -> None:
         "rdr2geo",
         _model(),
         shape=(1,),
-        dem=GeoidAdjustedDEM(ConstantHeightDEM(10.0), ConstantHeightDEM(1.0)),
+        dem=GeoidAdjustedDEM(ConstantDEM(10.0), ConstantDEM(1.0)),
     )
     second = prepare_torch_geometry(
         "rdr2geo",
         _model(),
         shape=(1,),
-        dem=GeoidAdjustedDEM(ConstantHeightDEM(10.0), ConstantHeightDEM(2.0)),
+        dem=GeoidAdjustedDEM(ConstantDEM(10.0), ConstantDEM(2.0)),
     )
     assert first.identity.dem_digest != second.identity.dem_digest
 

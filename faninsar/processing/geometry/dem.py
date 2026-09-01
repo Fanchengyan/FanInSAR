@@ -108,6 +108,11 @@ class GeoidAdjustedDEM:
         return np.asarray(orthometric) + np.asarray(undulation)
 
 
+# Canonical name used by new pipeline code. The implementation remains a
+# sampler adapter until all geometry backends consume materialized RasterDEM.
+DatumAdjustedDEM = GeoidAdjustedDEM
+
+
 def admit_dem_device_identity(request: str) -> str:
     """Return a stored DEM device identity (`cpu` / `cuda` / `cuda:N`).
 

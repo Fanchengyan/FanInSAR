@@ -8,13 +8,13 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.geometry.dem import RasterDEM
+from faninsar.processing.dem import DEM
 from faninsar.processing.geometry.ellipsoid import llh_to_ecef
 from faninsar.processing.geometry.prepare_production import run_rdr2geo
 
 if TYPE_CHECKING:
+    from faninsar.processing.dem import RasterDEM
     from faninsar.processing.geometry import RadarGeometryModel
-    from faninsar.processing.geometry.dem import DEMSampler
     from faninsar.typing import DeviceLike
 
 logger = setup_logger(__name__)
@@ -118,7 +118,7 @@ def compute_topographic_phase(
     model_sec: RadarGeometryModel,
     azimuth_index: np.ndarray,
     range_index: np.ndarray,
-    dem: DEMSampler,
+    dem: DEM,
     *,
     device: DeviceLike,
     secondary_azimuth_index: np.ndarray | None = None,
@@ -147,7 +147,7 @@ def compute_topographic_phase(
         Secondary acquisition geometry model.
     azimuth_index, range_index : numpy.ndarray
         Radar sample coordinates on the coregistered grid.
-    dem : DEMSampler
+    dem : DEM
         DEM height sampler.
     device : DeviceLike
         Required production device (``auto`` resolves to cpu or cuda).
@@ -1342,19 +1342,27 @@ def copernicus_glo30_dem(
 
     """
     base = Path(base_path)
-    from faninsar.processing.geometry.dem_manager import (
-        copernicus_tile_name,
-        find_legacy_tile,
+    # This helper accepts an already materialized local tile.  Keep the
+    # filename admission here so flattening does not compose the legacy
+    # network-facing DEM manager into the public geometry path.
+    lat_tile = int(np.floor(latitude_deg))
+    lon_tile = int(np.floor(longitude_deg))
+    ns = "N" if lat_tile >= 0 else "S"
+    ew = "E" if lon_tile >= 0 else "W"
+    tile_dir = f"{ns}{abs(lat_tile):02d}_{ew}{abs(lon_tile):03d}"
+    filename = (
+        f"Copernicus_DSM_COG_10_{ns}{abs(lat_tile):02d}_00_"
+        f"{ew}{abs(lon_tile):03d}_00_DEM.tif"
     )
-
-    tile_dir, filename = copernicus_tile_name(latitude_deg, longitude_deg)
-    path = find_legacy_tile(
-        base,
-        Path(tile_dir) / filename,
-        recursive=True,
+    candidates = (
+        base / filename,
+        base / tile_dir / filename,
+        *base.glob(f"**/{filename}"),
     )
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
     if path is None:
         message = f"Copernicus GLO-30 tile not found for {filename} under {base}"
         logger.error(message)
         raise FileNotFoundError(message)
-    return RasterDEM(path=path, device=device)
+    del device
+    return DEM.from_raster(path, vertical_datum="egm2008")

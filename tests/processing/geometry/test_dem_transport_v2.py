@@ -179,6 +179,33 @@ class TestFetchPlanGrammar:
             )
 
 
+def test_fetch_budget_rejects_declared_payload_before_cache_allocation(
+    tmp_path: Path,
+    session: RecordingSession,
+) -> None:
+    """A transport budget is enforced before opening a cache output file."""
+    url = "https://example.test/oversized.tif"
+    session.script_response(
+        "GET",
+        url,
+        [FakeResponse(headers={"Content-Length": "100"}, body=b"x" * 100)],
+    )
+    plan = TileSet(
+        allowed_hosts=("example.test",),
+        tiles=(
+            Tile(
+                url=url,
+                cache_path=Path("oversized.tif"),
+                min_bytes=1,
+                ranged=False,
+            ),
+        ),
+    )
+    with pytest.raises(transport.InvalidProcessingStateError, match="max_fetch_bytes"):
+        fetch_plan(plan, tmp_path, max_fetch_bytes=10)
+    assert not (tmp_path / "oversized.tif").exists()
+
+
 # ---------------------------------------------------------------------------
 # 2. URL host pinning
 # ---------------------------------------------------------------------------

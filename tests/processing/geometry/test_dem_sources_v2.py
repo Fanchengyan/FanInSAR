@@ -529,8 +529,9 @@ class TestPcStacSource:
         monkeypatch.setattr(ds, "_import_pc_stack", lambda: None)
         source = get_dem_source("nasadem")
         assert isinstance(source, ds.PcStacSource)
+        plan = source.plan(_bounds(10.0, 40.0, 11.0, 41.0))
         with pytest.raises(ds.DemSourceUnavailableError, match="pip install|\\[pc\\]"):
-            source.plan(_bounds(10.0, 40.0, 11.0, 41.0))
+            source.discover(plan)
 
     def test_pc_sign_inplace_modifier_flow(
         self, monkeypatch: pytest.MonkeyPatch
@@ -600,12 +601,14 @@ class TestPcStacSource:
         source = get_dem_source("nasadem")
         assert isinstance(source, ds.PcStacSource)
         plan = source.plan(_bounds(10.0, 40.0, 11.0, 41.0))
-        assert plan.tiles
+        assert isinstance(plan, ds.DeferredStacPlan)
+        resolved = source.discover(plan)
+        assert resolved.tiles
         assert calls.get("signed") is True
-        assert isinstance(plan, ds.TileSet)
-        assert plan.tiles
+        assert isinstance(resolved, ds.TileSet)
+        assert resolved.tiles
         # SAS signature must never leak into the plan's cache identity
-        assert all("sig=" not in str(tile.cache_path) for tile in plan.tiles)
+        assert all("sig=" not in str(tile.cache_path) for tile in resolved.tiles)
 
 
 # ---------------------------------------------------------------------------

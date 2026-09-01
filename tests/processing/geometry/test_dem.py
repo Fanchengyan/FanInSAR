@@ -9,13 +9,11 @@ import numpy as np
 import pytest
 from affine import Affine
 
-from faninsar.processing.geometry import (
-    ConstantHeightDEM,
+from faninsar.processing.dem import ConstantDEM
+from faninsar.processing.geometry import torch_kernels
+from faninsar.processing.geometry.dem import (
     GeoidAdjustedDEM,
     RasterDEM,
-    torch_kernels,
-)
-from faninsar.processing.geometry.dem import (
     _natural_spline_six,
     clone_raster_dem,
     pin_dem_sampler_device,
@@ -258,7 +256,7 @@ def test_pin_dem_sampler_device_walks_inner_sampler(tmp_path: Path) -> None:
     assert moved.device == "cuda"
     assert raster.device == "cpu"
 
-    wrapped = GeoidAdjustedDEM(raster, ConstantHeightDEM(0.0))
+    wrapped = GeoidAdjustedDEM(raster, ConstantDEM(0.0))
     pinned = pin_dem_sampler_device(wrapped, "cuda")
     assert isinstance(pinned, GeoidAdjustedDEM)
     assert pinned is not wrapped

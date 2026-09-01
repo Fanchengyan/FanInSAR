@@ -9,7 +9,8 @@ import pytest
 
 from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
 from faninsar.processing.coordinates import RadarGrid
-from faninsar.processing.geometry import ConstantHeightDEM, RadarGeometryModel
+from faninsar.processing.dem import ConstantDEM
+from faninsar.processing.geometry import RadarGeometryModel
 from faninsar.processing.interferometry.flatten import (
     compute_topographic_phase,
     estimate_residual_topographic_scale,
@@ -87,7 +88,7 @@ def test_remove_topographic_phase_on_synthetic_dem() -> None:
     az_idx = np.array([[0.0, 1.0], [2.0, 3.0]])
     rg_idx = np.array([[10.0, 20.0], [30.0, 40.0]])
 
-    dem = ConstantHeightDEM(height_m=50.0)
+    dem = ConstantDEM(height=50.0)
 
     topo_phase = compute_topographic_phase(
         model_ref,
@@ -140,12 +141,12 @@ def test_remove_topographic_phase_changes_phase_when_dem_varies() -> None:
     rg_idx = np.array([[10.0, 20.0], [30.0, 40.0]])
 
     # Varying DEM heights
-    dem = ConstantHeightDEM(height_m=0.0)
+    dem = ConstantDEM(height=0.0)
     topo_flat = compute_topographic_phase(
         model_ref, model_sec, az_idx, rg_idx, dem=dem, device="cpu"
     )
 
-    dem = ConstantHeightDEM(height_m=100.0)
+    dem = ConstantDEM(height=100.0)
     topo_hill = compute_topographic_phase(
         model_ref, model_sec, az_idx, rg_idx, dem=dem, device="cpu"
     )
@@ -170,7 +171,7 @@ def test_compute_topographic_phase_non_converged_are_nan() -> None:
     # Huge azimuth index far outside orbit coverage
     az_idx = np.array([1.0e9])
     rg_idx = np.array([10.0])
-    dem = ConstantHeightDEM(height_m=0.0)
+    dem = ConstantDEM(height=0.0)
 
     topo_phase = compute_topographic_phase(
         model_ref,

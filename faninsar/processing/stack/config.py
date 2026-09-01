@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
+
 from faninsar.logging import setup_logger
 from faninsar.processing.resources import ResourceBudget
 from faninsar.processing.stack.mask_plan import MaskPlan
@@ -16,7 +18,7 @@ if TYPE_CHECKING:
         ActivationToken,
         StackActivationBinding,
     )
-    from faninsar.processing.geometry.dem import DEMSampler
+    from faninsar.processing.dem import DEM, GridSpec
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.pipeline.production import (
         BurstSelection,
@@ -40,7 +42,15 @@ class StackConfig:
 
     ``mask_plan`` is the only mask configuration surface.  An empty plan is
     unmasked processing; every non-empty stage is explicit and normalized
-    before this object is constructed.
+    before this object is constructed. ``grid`` is either an explicit shared
+    :class:`~faninsar.processing.dem.GridSpec` or ``"auto"``. In automatic
+    mode, ``roi`` has precedence over selected acquisition/swath/burst
+    footprints; the footprint centre selects UTM or UPS. Seam and large-range
+    cases warn and continue, while an explicit seam-crossing ROI fails before
+    planning. ``resolution_m`` supplies automatic projected pixel spacing;
+    pixel edges are expanded to whole pixels around the projected ROI.
+    ``dem_cache_dir`` supplies the source cache at materialization. An
+    explicit ``GridSpec`` always wins over automatic ROI selection.
     """
 
     work_dir: Path
@@ -54,7 +64,7 @@ class StackConfig:
     executor: str = "torch"
     device: str = "auto"
     invert_device: str = "cpu"
-    dem: DEMSampler | None = None
+    dem: DEM | None = None
     geo_grid: GeoGridSpec | None = None
     swaths: tuple[str, ...] = ("IW1",)
     bursts: BurstSelection | None = None
@@ -72,11 +82,32 @@ class StackConfig:
     record_scientific_lineage: bool = False
     gpu_memory_reclaim: GpuMemoryReclaim = "adaptive"
     resource_budget: ResourceBudget | None = None
+    grid: GridSpec | Literal["auto"] = "auto"
+    resolution_m: float = 30.0
+    dem_cache_dir: Path | None = None
     extra: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize path and multilook types, and validate the mask plan."""
         self.work_dir = Path(self.work_dir)
+        valid_resolution = False
+        if isinstance(self.resolution_m, (int, float)):
+            valid_resolution = bool(
+                np.isfinite(self.resolution_m) and self.resolution_m > 0
+            )
+        if not valid_resolution:
+            message = "resolution_m must be a finite positive number"
+            logger.error(message)
+            raise ValueError(message)
+        if self.grid != "auto":
+            from faninsar.processing.dem import GridSpec
+
+            if not isinstance(self.grid, GridSpec):
+                message = "grid must be a GridSpec or 'auto'"
+                logger.error(message)
+                raise TypeError(message)
+        if self.dem_cache_dir is not None:
+            self.dem_cache_dir = Path(self.dem_cache_dir)
         if self.resource_budget is not None and not isinstance(
             self.resource_budget, ResourceBudget
         ):

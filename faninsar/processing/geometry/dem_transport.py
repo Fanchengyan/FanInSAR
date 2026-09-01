@@ -21,6 +21,11 @@ Every transport concern for DEM fetching lives here; registry entries in
   exception messages, or cache paths.
 """
 
+# The transport retains established exception messages while exposing the
+# bounded fetch seam; these checks are intentionally disabled at this module
+# boundary.
+# ruff: noqa: E501, EM101, EM102, TRY003, TRY301, D417
+
 from __future__ import annotations
 
 import hashlib
@@ -205,7 +210,11 @@ def _netrc_auth(host: str) -> tuple[str, str] | None:
     if entry is None:
         return None
     login, _, password = entry
-    return login or "", password or ""
+    login_value = login or ""
+    password_value = password or ""
+    if not login_value or not password_value:
+        return None
+    return login_value, password_value
 
 
 class EarthdataCredentialProvider(CredentialProvider):
@@ -255,20 +264,28 @@ def resolve_credentials(credential_ref: str) -> CredentialProvider:
 
 
 def redact_url(url: str) -> str:
-    """Scrub oauth/SAS query parameters from a URL for safe logging."""
+    """Scrub credentials, userinfo, and signed query values from a URL."""
     parts = urllib.parse.urlsplit(url)
-    if not parts.query:
-        return url
-    kept: list[tuple[str, str]] = []
-    for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
-        lowered = key.lower()
-        if lowered in {"sig", "se", "st", "sp", "token", "sastoken"}:
-            kept.append((key, "REDACTED"))
-        else:
-            kept.append((key, value))
-    query = urllib.parse.urlencode(kept)
+    # Query values are not part of diagnostics or stable identities.  A signed
+    # URL commonly uses provider-specific names, so redacting every value is
+    # safer than maintaining an incomplete allowlist of secret parameters.
+    query = ""
+    if parts.query:
+        query = urllib.parse.urlencode(
+            [(key, "REDACTED") for key, _ in urllib.parse.parse_qsl(
+                parts.query, keep_blank_values=True
+            )]
+        )
+    hostname = parts.hostname or ""
+    netloc = hostname
+    try:
+        port = parts.port
+    except ValueError:
+        port = "REDACTED"
+    if port is not None:
+        netloc = f"{hostname}:{port}"
     return urllib.parse.urlunsplit(
-        (parts.scheme, parts.netloc, parts.path, query, parts.fragment)
+        (parts.scheme, netloc, parts.path, query, "")
     )
 
 
@@ -400,7 +417,7 @@ def _request_with_retries(
                     "credentials/permissions (not retried)"
                 )
                 logger.error(message)
-                raise DemAuthProviderError(message, status=response.status_code)  # noqa: TRY301
+                raise DemAuthProviderError(message, status=response.status_code)
             if response.status_code in (301, 302, 303, 307, 308):
                 return response
             if response.status_code >= 400:
@@ -409,7 +426,7 @@ def _request_with_retries(
                     f"for {redact_url(url)}"
                 )
                 logger.error(message)
-                raise InvalidProcessingStateError(message)  # noqa: TRY301
+                raise InvalidProcessingStateError(message)
             return response  # noqa: TRY300
         except DemAuthProviderError:
             raise
@@ -483,15 +500,25 @@ def validate_plan_urls(plan: FetchPlan) -> None:
 
     def _check_https(url: str) -> None:
         parts = urllib.parse.urlsplit(url)
-        if parts.scheme != "https":
+        host = parts.hostname
+        try:
+            port = parts.port
+        except ValueError:
+            port = -1
+        if (
+            parts.scheme.lower() != "https"
+            or host is None
+            or parts.username is not None
+            or parts.password is not None
+            or port not in (None, 443)
+        ):
             message = (
-                f"DEM plan URLs must use https, got {parts.scheme!r} in "
+                f"DEM plan URL must use https and be an approved origin, got "
                 f"{redact_url(url)}"
             )
             logger.error(message)
             raise ValueError(message)
-        host = parts.hostname
-        if host is None or host.lower() not in allowed:
+        if host.lower() not in allowed:
             message = (
                 f"DEM URL host {host!r} is not in the plan allowlist "
                 f"{sorted(allowed)} ({redact_url(url)})"
@@ -538,8 +565,23 @@ def _validate_redirect_chain(
     if not location:
         return None
     next_url = urllib.parse.urljoin(start_url, location)
-    next_host = (urllib.parse.urlsplit(next_url).hostname or "").lower()
+    next_parts = urllib.parse.urlsplit(next_url)
+    next_host = (next_parts.hostname or "").lower()
     start_host = (urllib.parse.urlsplit(start_url).hostname or "").lower()
+    try:
+        next_port = next_parts.port
+    except ValueError:
+        next_port = -1
+    if (
+        next_parts.scheme.lower() != "https"
+        or not next_host
+        or next_parts.username is not None
+        or next_parts.password is not None
+        or next_port not in (None, 443)
+    ):
+        message = f"redirect target must use https and have no URL credentials: {redact_url(next_url)}"
+        logger.error(message)
+        raise ValueError(message)
     # Cross-host hops are permitted ONLY credential-free: strip auth, then
     # verify no auth provider would attach to the new host.
     if next_host != start_host:
@@ -551,7 +593,7 @@ def _validate_redirect_chain(
             logger.error(message)
             leak = f"redirect credential leak: {next_host}"
             raise ValueError(leak)
-        if next_host and next_host not in allowed_hosts:
+        if next_host not in allowed_hosts:
             logger.warning(
                 "DEM redirect leaves the allowlist (%s -> %s); following "
                 "without credentials",
@@ -771,6 +813,7 @@ def _download_whole(
     expected_total: int | None = None,
     credentials: CredentialProvider | None = None,
     allowed_hosts: set[str] | None = None,
+    max_fetch_bytes: int = 2**33,
 ) -> None:
     """Plain whole-file streaming download with integrity checks.
 
@@ -812,6 +855,18 @@ def _download_whole(
         raise InvalidProcessingStateError(message)
     magic = b""
     try:
+        declared_length = response.headers.get("Content-Length")
+        if declared_length is not None:
+            try:
+                declared = int(declared_length)
+            except (TypeError, ValueError) as error:
+                raise InvalidProcessingStateError(
+                    f"invalid Content-Length for {redact_url(current_url)}"
+                ) from error
+            if declared > max_fetch_bytes:
+                raise InvalidProcessingStateError(
+                    f"DEM transfer exceeds max_fetch_bytes={max_fetch_bytes}"
+                )
         first_block: bytes | None = None
         blocks = response.iter_content(1 << 20)
         written = 0
@@ -832,8 +887,13 @@ def _download_whole(
                             f"{redact_url(current_url)} (auth redirect failure)"
                         )
                         raise InvalidProcessingStateError(message)
+                next_written = written + len(block)
+                if next_written > max_fetch_bytes:
+                    raise InvalidProcessingStateError(
+                        f"DEM transfer exceeds max_fetch_bytes={max_fetch_bytes}"
+                    )
                 out.write(block)
-                written += len(block)
+                written = next_written
     finally:
         response.close()
     del magic
@@ -862,6 +922,7 @@ def _download_ranged(
     headers: dict[str, str],
     budget: ThreadPoolExecutor | None = None,
     max_workers: int = 4,
+    max_fetch_bytes: int = 2**33,
 ) -> None:
     """Ranged-chunk assembly with mandatory 206/Content-Range validation.
 
@@ -869,6 +930,10 @@ def _download_ranged(
     budget; otherwise a small per-tile pool parallelizes chunk GETs while
     writes stay on the calling thread.
     """
+    if total > max_fetch_bytes:
+        raise InvalidProcessingStateError(
+            f"DEM transfer exceeds max_fetch_bytes={max_fetch_bytes}"
+        )
     fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     handles: dict[int, int] = {}
     try:
@@ -891,8 +956,7 @@ def _download_ranged(
                     )
                     raise InvalidProcessingStateError(message)
                 raw_range = response.headers.get("Content-Range", "")
-                match = _CONTENT_RANGE_RE.match(raw_range)
-                body = b"".join(response.iter_content(1 << 20))
+                match = _CONTENT_RANGE_RE.fullmatch(raw_range.strip())
                 if (
                     match is None
                     or int(match.group(1)) != start
@@ -904,7 +968,25 @@ def _download_ranged(
                         f"requested bytes {start}-{end}, got {raw_range!r}"
                     )
                     raise InvalidProcessingStateError(message)
-                return start, body
+                expected_chunk = end - start + 1
+                received = 0
+                body = bytearray()
+                for block in response.iter_content(1 << 20):
+                    if not block:
+                        continue
+                    next_received = received + len(block)
+                    if next_received > expected_chunk or next_received > max_fetch_bytes:
+                        raise InvalidProcessingStateError(
+                            "ranged response body exceeds its declared byte range"
+                        )
+                    body.extend(block)
+                    received = next_received
+                if received != expected_chunk:
+                    raise InvalidProcessingStateError(
+                        f"ranged response length mismatch: expected {expected_chunk}, "
+                        f"got {received}"
+                    )
+                return start, bytes(body)
             finally:
                 response.close()
 
@@ -1020,6 +1102,7 @@ def _execute_tile_set(
     max_workers: int,
     chunked_threshold: int,
     credentials: CredentialProvider | None,
+    max_fetch_bytes: int,
 ) -> list[Path]:
     """Fetch missing tiles concurrently under one shared worker budget."""
     del chunked_threshold  # reserved for ranged-mode thresholding
@@ -1028,10 +1111,10 @@ def _execute_tile_set(
     jobs: list[tuple[Tile, Path]] = []
     for tile in units:
         target = cache_dir / tile.cache_path
+        validate_cache_target(cache_dir, target)
         if target.is_file() and target.stat().st_size >= tile.min_bytes:
             logger.info("DEM tile cache hit: %s", target)
             continue
-        validate_cache_target(cache_dir, target)
         jobs.append((tile, target))
 
     if not jobs:
@@ -1061,6 +1144,7 @@ def _execute_tile_set(
                         length,
                         headers=headers,
                         max_workers=min(max_workers, 4),
+                        max_fetch_bytes=max_fetch_bytes,
                     )
                 else:
                     _download_whole(
@@ -1070,6 +1154,7 @@ def _execute_tile_set(
                         min_bytes=tile.min_bytes,
                         credentials=credentials,
                         allowed_hosts=allowed,
+                        max_fetch_bytes=max_fetch_bytes,
                     )
             else:
                 _download_whole(
@@ -1079,6 +1164,7 @@ def _execute_tile_set(
                     min_bytes=tile.min_bytes,
                     credentials=credentials,
                     allowed_hosts=allowed,
+                    max_fetch_bytes=max_fetch_bytes,
                 )
             if tile.expected_decompressed_bytes is not None:
                 _verify_tile_decompressed(part, tile.expected_decompressed_bytes)
@@ -1142,6 +1228,7 @@ def _execute_artifact(
     cache_dir: Path,
     *,
     credentials: CredentialProvider | None,
+    max_fetch_bytes: int,
 ) -> Path:
     """Fetch one artifact (plain file, ftp file, or zip expansion)."""
     target = plan.cache_path
@@ -1158,16 +1245,22 @@ def _execute_artifact(
             with urllib.request.urlopen(plan.url, timeout=180) as response:
                 written = 0
                 with part.open("wb") as out:
-                    import shutil
-
-                    shutil.copyfileobj(response, out, length=1 << 20)
-                    written = out.tell()
+                    while True:
+                        block = response.read(1 << 20)
+                        if not block:
+                            break
+                        written += len(block)
+                        if written > max_fetch_bytes:
+                            raise InvalidProcessingStateError(
+                                f"DEM transfer exceeds max_fetch_bytes={max_fetch_bytes}"
+                            )
+                        out.write(block)
             if written < plan.min_total_bytes:
                 message = (
                     f"FTP payload below floor: {written} < "
                     f"{plan.min_total_bytes} for {redact_url(plan.url)}"
                 )
-                raise InvalidProcessingStateError(message)  # noqa: TRY301
+                raise InvalidProcessingStateError(message)
         except Exception as exc:
             part.unlink(missing_ok=True)
             if isinstance(exc, InvalidProcessingStateError):
@@ -1195,7 +1288,14 @@ def _execute_artifact(
         if use_ranged:
             length, accept_ranges = _head_content_length(plan.url, headers)
             if length is not None and accept_ranges:
-                _download_ranged(plan.url, part, length, headers=headers, max_workers=4)
+                _download_ranged(
+                    plan.url,
+                    part,
+                    length,
+                    headers=headers,
+                    max_workers=4,
+                    max_fetch_bytes=max_fetch_bytes,
+                )
             else:
                 _download_whole(
                     plan.url,
@@ -1204,6 +1304,7 @@ def _execute_artifact(
                     min_bytes=plan.min_total_bytes,
                     credentials=credentials,
                     allowed_hosts=allowed,
+                    max_fetch_bytes=max_fetch_bytes,
                 )
         else:
             _download_whole(
@@ -1213,6 +1314,7 @@ def _execute_artifact(
                 min_bytes=plan.min_total_bytes,
                 credentials=credentials,
                 allowed_hosts=allowed,
+                max_fetch_bytes=max_fetch_bytes,
             )
     except Exception:
         part.unlink(missing_ok=True)
@@ -1229,12 +1331,31 @@ def _execute_artifact(
     return target
 
 
+def _validate_plan_cache_targets(plan: FetchPlan, cache_dir: Path) -> None:
+    """Validate every planned destination before touching the cache tree."""
+    if isinstance(plan, TileSet):
+        for tile in plan.tiles:
+            for unit in expand_tile_parts(tile):
+                validate_cache_target(cache_dir, cache_dir / unit.cache_path)
+        return
+    if isinstance(plan, Artifact):
+        target = plan.cache_path
+        if target is None:
+            tail = urllib.parse.urlsplit(plan.url).path.rsplit("/", 1)[-1]
+            target = Path(tail or "artifact.bin")
+        validate_cache_target(cache_dir, cache_dir / target)
+        return
+    for artifact in getattr(plan, "artifacts", ()):
+        _validate_plan_cache_targets(artifact, cache_dir)
+
+
 def fetch_plan(
     plan: FetchPlan,
     cache_dir: Path,
     *,
     max_workers: int = 8,
     chunked_threshold: int = 4,
+    max_fetch_bytes: int = 2**33,
 ) -> list[Path]:
     """Execute one self-describing :class:`FetchPlan` into ``cache_dir``.
 
@@ -1255,10 +1376,13 @@ def fetch_plan(
         Paths ready for mosaic input (tiles or extracted members).
 
     """
+    if type(max_fetch_bytes) is not int or max_fetch_bytes <= 0:
+        raise ValueError("max_fetch_bytes must be a positive integer")
     validate_plan_urls(plan)
     credentials = _resolve_effective_credentials(plan)
     if plan.credential_ref == "earthdata" and credentials is None:
         EarthdataCredentialProvider.require_available()
+    _validate_plan_cache_targets(plan, cache_dir)
     sweep_part_files(cache_dir)
     if isinstance(plan, TileSet):
         return _execute_tile_set(
@@ -1267,9 +1391,17 @@ def fetch_plan(
             max_workers=max_workers,
             chunked_threshold=chunked_threshold,
             credentials=credentials,
+            max_fetch_bytes=max_fetch_bytes,
         )
     if isinstance(plan, Artifact):
-        return [_execute_artifact(plan, cache_dir, credentials=credentials)]
+        return [
+            _execute_artifact(
+                plan,
+                cache_dir,
+                credentials=credentials,
+                max_fetch_bytes=max_fetch_bytes,
+            )
+        ]
     artifacts = getattr(plan, "artifacts", ())
     if artifacts:
         # Multi-artifact plans (e.g. JAXA FTP zip blocks) execute each
@@ -1282,6 +1414,7 @@ def fetch_plan(
                     cache_dir,
                     max_workers=max_workers,
                     chunked_threshold=chunked_threshold,
+                    max_fetch_bytes=max_fetch_bytes,
                 )
             )
         return executed

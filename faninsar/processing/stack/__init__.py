@@ -16,6 +16,7 @@ from faninsar.processing.stack.config import (
     FlattenStage,
     StackConfig,
 )
+from faninsar.processing.stack.grid import automatic_grid, resolve_stack_grid
 from faninsar.processing.stack.ifg_store import (
     InterferogramArtifact,
     InterferogramArtifactStore,
@@ -72,8 +73,10 @@ __all__ = [
     "UnsupportedStackCapabilityError",
     "UnwrapResultGeneration",
     "UnwrappedArtifact",
+    "automatic_grid",
     "open_unwrap_generation",
     "publish_unwrap_generation",
+    "resolve_stack_grid",
     "unavailable_scene_provider",
     "unsupported_stack_capability",
 ]
