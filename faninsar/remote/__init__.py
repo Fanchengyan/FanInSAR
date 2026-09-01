@@ -667,7 +667,23 @@ def _fetch(
         return payload
 
     fetcher = getattr(adapter, "fetch", None)
-    result = None if fetcher is None else fetcher(asset, budget)
+    result = None
+    if fetcher is not None:
+        last_error: Exception | None = None
+        for attempt in range(budget.max_retries + 1):
+            if attempt > 0:
+                requests += 1
+                if requests > budget.max_requests:
+                    _fail(RemoteLimitError, "max_requests")
+            try:
+                result = fetcher(asset, budget)
+                last_error = None
+                break
+            except Exception as error:
+                last_error = error
+        if last_error is not None:
+            logger.exception("Remote adapter transfer failed")
+            _fail(RemoteAccessError, "transfer_failed")
     if isinstance(result, (bytes, bytearray)):
         payload = bytes(result)
         check_limits(len(payload))
