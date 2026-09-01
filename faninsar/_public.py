@@ -9,6 +9,7 @@ from __future__ import annotations
 from faninsar.core import (
     Acquisition,
     Baselines,
+    Interferogram,
     Loop,
     Loops,
     Pair,
@@ -28,6 +29,7 @@ __all__ = [
     "SBAS",
     "Acquisition",
     "Baselines",
+    "Interferogram",
     "Loop",
     "Loops",
     "Pair",

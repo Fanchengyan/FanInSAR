@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from faninsar.core.acquisition import Acquisition, DateManager, DaySpan
 from faninsar.core.baseline import Baselines
+from faninsar.core.interferogram import Interferogram
 from faninsar.core.loops import Loop, Loops, TripletLoop, TripletLoops
 from faninsar.core.network import (
     AcquisitionKey,
@@ -45,6 +46,7 @@ __all__ = [
     "DateManager",
     "DaySpan",
     "Frequency",
+    "Interferogram",
     "Loop",
     "Loops",
     "Network",
