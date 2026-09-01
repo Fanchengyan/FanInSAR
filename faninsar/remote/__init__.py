@@ -13,17 +13,19 @@ import os
 import re
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NoReturn, Protocol
 
 from pyproj import CRS, Transformer
+from pyproj.exceptions import CRSError
 from shapely.geometry import Point, box, mapping, shape
 from shapely.ops import transform as shapely_transform
 from shapely.ops import unary_union
@@ -38,7 +40,6 @@ __all__ = [
     "CatalogItem",
     "RemoteAccessError",
     "RemoteAsset",
-    "RemoteError",
     "RemoteIntegrityError",
     "RemoteLimitError",
     "RemoteQueryError",
@@ -198,7 +199,10 @@ def _utc(value: Any) -> datetime | None:
     if value is None:
         return None
     if isinstance(value, str):
-        value = datetime.fromisoformat(value)
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError as exc:
+            _fail(RemoteQueryError, "invalid_datetime", str(exc))
     if not isinstance(value, datetime):
         msg = "acquisition time is not a datetime"
         _fail(RemoteQueryError, "invalid_datetime", msg)
@@ -363,8 +367,11 @@ def _query_geometry(
     crs = getattr(spatial, "crs", None)
     if crs is None:
         _fail(RemoteQueryError, "missing_crs", "spatial queries must declare a CRS")
-    source = CRS.from_user_input(crs)
-    transformer = Transformer.from_crs(source, CRS.from_epsg(4326), always_xy=True)
+    try:
+        source = CRS.from_user_input(crs)
+        transformer = Transformer.from_crs(source, CRS.from_epsg(4326), always_xy=True)
+    except (CRSError, TypeError, ValueError) as exc:
+        _fail(RemoteQueryError, "invalid_crs", str(exc))
 
     def project(geometry: Any) -> Any:
         """Project one geometry to WGS84."""
@@ -527,7 +534,16 @@ def search(
     profile = auth_profile or "anonymous"
     if profile not in adapter.profiles:
         _fail(RemoteAccessError, "unknown_auth_profile")
-    start_end = tuple(_utc(item) for item in datetime_range) if datetime_range else None
+    if datetime_range is not None:
+        if len(datetime_range) != 2:
+            _fail(RemoteQueryError, "invalid_datetime_range")
+        start_end = (_utc(datetime_range[0]), _utc(datetime_range[1]))
+        if start_end[0] is None or start_end[1] is None:
+            _fail(RemoteQueryError, "invalid_datetime_range")
+        if start_end[1] < start_end[0]:
+            _fail(RemoteQueryError, "invalid_datetime_range")
+    else:
+        start_end = None
     results: list[CatalogItem] = []
     seen: set[tuple[str, str, str | None, str]] = set()
     for raw in adapter.items():
@@ -584,12 +600,22 @@ def _identity(asset: RemoteAsset) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _manifest_path(path: Path, asset: RemoteAsset) -> Path:
+    """Return a private manifest path qualified by the asset identity."""
+    return path.with_name(f"{path.name}.faninsar.remote.{_identity(asset)}.json")
+
+
+def _is_qualified(asset: RemoteAsset) -> bool:
+    """Return whether an asset has a stable version or content checksum."""
+    return asset.checksum is not None or asset.version is not None
+
+
 def _matching_manifest(path: Path, asset: RemoteAsset) -> bool:
     """Return whether an existing destination is a valid qualified reuse."""
-    manifest_path = path.with_name(path.name + ".faninsar.remote.json")
+    manifest_path = _manifest_path(path, asset)
     if not path.is_file() or not manifest_path.is_file():
         return False
-    if asset.checksum is None and asset.version is None:
+    if not _is_qualified(asset):
         return False
     try:
         manifest = json.loads(manifest_path.read_text())
@@ -610,6 +636,22 @@ def _fetch(
     asset: RemoteAsset, adapter: _Adapter, budget: RemoteResourceBudget
 ) -> bytes:
     """Fetch complete bytes through an adapter or standard HTTPS."""
+    started = time.monotonic()
+    requests = 1
+
+    if requests > budget.max_requests:
+        _fail(RemoteLimitError, "max_requests")
+
+    def check_limits(total: int) -> None:
+        """Enforce transfer limits shared by adapter and HTTPS fetches."""
+        if total > budget.max_response_bytes:
+            _fail(RemoteLimitError, "max_response_bytes")
+        if total > budget.max_output_bytes:
+            _fail(RemoteLimitError, "max_output_bytes")
+        if total > budget.max_operation_bytes:
+            _fail(RemoteLimitError, "max_operation_bytes")
+        if time.monotonic() - started > budget.max_elapsed_seconds:
+            _fail(RemoteLimitError, "max_elapsed_seconds")
 
     def bounded(chunks: Iterable[bytes]) -> bytes:
         """Collect chunks while enforcing the response and output limits."""
@@ -618,17 +660,18 @@ def _fetch(
         for chunk in chunks:
             part = bytes(chunk)
             total += len(part)
-            if total > budget.max_response_bytes:
-                _fail(RemoteLimitError, "max_response_bytes")
-            if total > budget.max_output_bytes:
-                _fail(RemoteLimitError, "max_output_bytes")
+            check_limits(total)
             parts.append(part)
-        return b"".join(parts)
+        payload = b"".join(parts)
+        check_limits(len(payload))
+        return payload
 
     fetcher = getattr(adapter, "fetch", None)
     result = None if fetcher is None else fetcher(asset, budget)
     if isinstance(result, (bytes, bytearray)):
-        return bytes(result)
+        payload = bytes(result)
+        check_limits(len(payload))
+        return payload
     if hasattr(result, "read"):
         return bounded(iter(lambda: result.read(1024 * 1024), b""))
     if isinstance(result, Iterable):
@@ -680,7 +723,8 @@ def download(
         if destination.exists() and not overwrite:
             if _matching_manifest(destination, asset):
                 return destination
-            _fail(RemoteIntegrityError, "destination_conflict")
+            if _is_qualified(asset):
+                _fail(RemoteIntegrityError, "destination_conflict")
     payload = _fetch(asset, adapter, budget)
     if len(payload) > budget.max_response_bytes:
         _fail(RemoteLimitError, "max_response_bytes")
@@ -698,9 +742,10 @@ def download(
         if destination.exists() and not overwrite:
             if _matching_manifest(destination, asset):
                 return destination
-            _fail(RemoteIntegrityError, "destination_conflict")
+            if _is_qualified(asset):
+                _fail(RemoteIntegrityError, "destination_conflict")
         temporary: Path | None = None
-        manifest = destination.with_name(destination.name + ".faninsar.remote.json")
+        manifest = _manifest_path(destination, asset)
         try:
             with tempfile.NamedTemporaryFile(
                 dir=destination.parent,

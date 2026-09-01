@@ -82,3 +82,47 @@ def test_download_is_atomic_and_reuses_verified_destination(tmp_path: Path) -> N
     destination.write_bytes(b"changed")
     with pytest.raises(remote.RemoteIntegrityError, match="destination_conflict"):
         remote.download(asset, destination)
+
+
+def test_unqualified_download_refreshes_existing_destination(tmp_path: Path) -> None:
+    """An asset without a version or checksum is fetched again on each call."""
+    name = "download-unqualified"
+    remote._register_fixture(
+        [
+            {
+                "id": "item-1",
+                "geometry": Polygon(((-1, -1), (1, -1), (1, 1), (-1, 1))),
+                "assets": {
+                    "data": {
+                        "href": "https://fixture.invalid/assets/data",
+                        "data": b"fresh bytes",
+                    }
+                },
+            }
+        ],
+        name=name,
+    )
+    asset = remote.search(Points([(0, 0)], crs=4326), catalog=name)[0].assets["data"]
+    destination = tmp_path / "asset.bin"
+
+    destination.write_bytes(b"stale bytes")
+    assert remote.download(asset, destination).read_bytes() == b"fresh bytes"
+    destination.write_bytes(b"changed bytes")
+    assert remote.download(asset, destination).read_bytes() == b"fresh bytes"
+
+
+def test_invalid_spatial_and_datetime_inputs_are_query_errors() -> None:
+    """Malformed CRS and datetime values use the public query error type."""
+    name = _register("invalid-inputs")
+    points = Points([(0, 0)], crs=4326)
+    points._crs = "not-a-crs"  # type: ignore[assignment]
+    with pytest.raises(remote.RemoteQueryError) as error:
+        remote.search(points, catalog=name)
+    assert error.value.reason == "invalid_crs"
+    with pytest.raises(remote.RemoteQueryError) as error:
+        remote.search(
+            Points([(0, 0)], crs=4326),
+            catalog=name,
+            datetime_range=("not-a-date", "2024-01-01T00:00:00+00:00"),  # type: ignore[arg-type]
+        )
+    assert error.value.reason == "invalid_datetime"
