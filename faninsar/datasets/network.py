@@ -14,7 +14,7 @@ import hashlib
 import json
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self
 
 import numpy as np
 
@@ -410,6 +410,8 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
 class Network(NetworkContract):
     """Concrete path-based view of one canonical InSAR Network."""
 
+    readers: ClassVar[Any]
+
     def __init__(self, root: str | PathLike[str]) -> None:
         """Mount and validate a canonical Network product."""
         try:
@@ -448,6 +450,110 @@ class Network(NetworkContract):
             message = "Network interferograms have no canonical index"
             logger.exception(message)
             raise IncompleteNetworkProductError(message)
+
+    @classmethod
+    def open(
+        cls,
+        path: str | PathLike[str],
+        *,
+        reader: object | None = None,
+        revision: str | None = None,
+        registry: object | None = None,
+    ) -> Any:
+        """Open a canonical Network or an explicitly selected reader.
+
+        Parameters
+        ----------
+        path : str or os.PathLike
+            Canonical Network root, or a source understood by a custom reader.
+        reader : str, type, or NetworkReader, optional
+            ``None`` selects only the canonical FanInSAR layout.  A string is
+            resolved through ``registry`` or :attr:`readers`; a reader class
+            is constructed without arguments; and a reader instance is used
+            directly.  External layouts are never auto-probed.
+        revision : str, optional
+            Immutable generation identifier.  Canonical reads accept the
+            current generation only; custom readers receive this value and
+            must reject it if their format cannot address snapshots.
+        registry : ReaderRegistry, optional
+            Isolated registry used only with a string ``reader`` selector.
+
+        Returns
+        -------
+        Network
+            The object returned by the selected reader.
+
+        Raises
+        ------
+        TypeError
+            If ``registry`` is supplied without a string reader selector.
+        NetworkGenerationError
+            If a canonical revision does not match the current generation.
+        NetworkConstructionError
+            If a selected reader cannot be instantiated or does not expose
+            the required ``read`` method.
+        """
+        if registry is not None and not isinstance(reader, str):
+            message = "registry is valid only with a registered reader string"
+            logger.error(message)
+            raise TypeError(message)
+
+        if reader is None:
+            # Canonical mode intentionally does not consult the entry-point
+            # registry and therefore cannot probe an external layout.
+            network = cls(path)
+            if revision is not None and network.manifest.get("generation_id") != revision:
+                message = (
+                    "requested Network revision is not the current canonical "
+                    f"generation: {revision!r}"
+                )
+                logger.error(message)
+                raise NetworkGenerationError(message)
+            return network
+
+        selected: object
+        if isinstance(reader, str):
+            resolver = getattr(registry or cls.readers, "resolve", None)
+            if not callable(resolver):
+                message = "reader registry must expose a callable resolve method"
+                logger.error(message)
+                raise TypeError(message)
+            selected_class = resolver(reader)
+            selected = cls._instantiate_reader(selected_class, reader)
+        elif isinstance(reader, type):
+            selected = cls._instantiate_reader(reader, reader.__name__)
+        else:
+            selected = reader
+
+        read = getattr(selected, "read", None)
+        if not callable(read):
+            message = "selected Network reader must define a callable read method"
+            logger.error(message)
+            raise NetworkConstructionError(message)
+        try:
+            return read(path, revision=revision)
+        except TypeError:
+            # A reader that cannot honor the explicit revision must fail
+            # honestly instead of falling back to a mutable current view.
+            if revision is not None:
+                message = "selected Network reader cannot honor revision"
+                logger.exception(message)
+                raise NetworkGenerationError(message) from None
+            raise
+
+    @staticmethod
+    def _instantiate_reader(reader: object, name: str) -> object:
+        """Construct one zero-argument reader class with typed diagnostics."""
+        if not isinstance(reader, type):
+            message = f"registered Network reader {name!r} must be a class"
+            logger.error(message)
+            raise NetworkConstructionError(message)
+        try:
+            return reader()
+        except Exception as error:
+            message = f"could not instantiate Network reader {name!r}"
+            logger.exception(message)
+            raise NetworkConstructionError(message) from error
         index_type = index.get("type", index.get("index_type"))
         if index_type != NETWORK_INDEX_TYPE:
             message = f"unknown Network index type {index_type!r}"
@@ -656,6 +762,14 @@ class SNAPNetwork(_DeclaredProcessorNetwork):
     """Canonical Network explicitly declared as authored by SNAP."""
 
     processor_marker = "snap"
+
+
+# Keep one process-wide default registry on the canonical data-backed class.
+# The import is intentionally after class definitions so importing this legacy
+# compatibility module cannot trigger a cycle through ``faninsar.network``.
+from faninsar.network.registry import ReaderRegistry  # noqa: E402
+
+Network.readers = ReaderRegistry()
 
 
 __all__ = [
