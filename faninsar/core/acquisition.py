@@ -108,7 +108,7 @@ class Acquisition(pd.DatetimeIndex):
         value = getattr(self, "_physical_key", None)
         if value is None:
             message = "date collections do not have a physical key"
-            raise AttributeError(message)  # noqa: TRY003
+            raise AttributeError(message)
         return value
 
     @key.setter
@@ -121,7 +121,7 @@ class Acquisition(pd.DatetimeIndex):
         value = getattr(self, "_sensing_time", None)
         if value is None:
             message = "date collections do not have a sensing time"
-            raise AttributeError(message)  # noqa: TRY003
+            raise AttributeError(message)
         return value
 
     @sensing_time.setter
