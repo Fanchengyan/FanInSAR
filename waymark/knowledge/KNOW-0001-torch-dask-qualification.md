@@ -24,7 +24,7 @@ derived_from:
   - NOTE-0122
 related_notes: []
 related_knowledge: []
-maturity: validated
+maturity: confirmed
 ---
 
 # Summary
