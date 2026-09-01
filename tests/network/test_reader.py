@@ -103,6 +103,59 @@ def test_canonical_mode_does_not_discover_entry_points(
         Network.open(tmp_path)
 
 
+def test_canonical_reader_accepts_existing_generation_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit immutable generation can be opened without CURRENT lookup."""
+    import json
+
+    payload = {
+        "schema_version": "network_v1",
+        "status": "complete",
+        "generation_id": "generation-1",
+        "index_type": "NetworkInterferogramIndex",
+        "phase_convention": "primary_minus_secondary",
+        "products": [
+            {
+                "id": "20240101_20240113",
+                "primary_id": "20240101",
+                "secondary_id": "20240113",
+                "product_kind": "complex_interferogram",
+                "asset_location": "interferograms/20240101_20240113/complex.npy",
+                "geometry_identity": "grid",
+                "source_software": "fixture",
+                "phase_convention": "primary_minus_secondary",
+                "content_digest": "a" * 64,
+                "lineage": ["source:20240101", "source:20240113"],
+            }
+        ],
+    }
+    import hashlib
+
+    payload["manifest_digest"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    root = tmp_path / "network"
+    (root / ".network_generations/generation-1").mkdir(parents=True)
+    (root / "interferograms").mkdir()
+    (root / "interferograms/interferograms_index.json").write_text(
+        json.dumps({"type": "NetworkInterferogramIndex", "pairs": ["20240101_20240113"]})
+    )
+    (root / "interferograms/20240101_20240113").mkdir()
+    (root / "manifest.json").write_text(json.dumps(payload))
+    (root / ".network_generations/generation-1/manifest.json").write_text(
+        json.dumps(payload)
+    )
+    (root / "CURRENT").write_text(json.dumps({
+        "schema_version": "network_current_v1",
+        "status": "writing",
+    }))
+    monkeypatch.setattr("faninsar.datasets.network._legacy_markers", lambda _: ())
+    network = Network.open(root, revision="generation-1")
+    assert network.manifest["generation_id"] == "generation-1"
+
+
 def test_registry_isolated_and_rejects_unknown_or_non_class_readers() -> None:
     """Registries do not merge and only accept classes, not import strings."""
 

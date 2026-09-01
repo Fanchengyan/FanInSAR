@@ -357,7 +357,11 @@ def _validate_current(path: Path, *, expected_generation: str) -> dict[str, Any]
     return current
 
 
-def _validate_network_layout(root: Path) -> dict[str, Any]:
+def _validate_network_layout(
+    root: Path,
+    *,
+    revision: str | None = None,
+) -> dict[str, Any]:
     """Validate the canonical root manifest and selected immutable generation."""
     markers = _legacy_markers(root)
     if markers:
@@ -372,7 +376,25 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
         raise NetworkGenerationError(message)
     current_path = root / NETWORK_CURRENT_NAME
     generation_id = str(root_manifest["generation_id"])
-    current = _validate_current(current_path, expected_generation=generation_id)
+    if revision is None:
+        current = _validate_current(current_path, expected_generation=generation_id)
+    else:
+        # Historical generations are immutable and may no longer be selected
+        # by CURRENT.  Validate the requested generation directly while still
+        # validating the canonical root manifest above.
+        if (
+            not isinstance(revision, str)
+            or not revision.strip()
+            or revision != revision.strip()
+            or revision in {".", ".."}
+            or "/" in revision
+            or "\\" in revision
+        ):
+            message = f"Network revision is invalid: {revision!r}"
+            logger.error(message)
+            raise NetworkGenerationError(message)
+        generation_id = revision
+        current = None
     generation_root = generations / str(generation_id)
     if not generation_root.is_dir() or generation_root.is_symlink():
         message = (
@@ -384,15 +406,23 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
         generation_root / NETWORK_MANIFEST_NAME,
         expected_generation=generation_id,
     )
-    if _product_set(generation_manifest) != _product_set(root_manifest):
+    if revision is None and _product_set(generation_manifest) != _product_set(
+        root_manifest
+    ):
         message = "Network generation manifest does not match root product set"
         logger.error(message)
         raise NetworkGenerationError(message)
-    if generation_manifest["manifest_digest"] != root_manifest["manifest_digest"]:
+    if (
+        revision is None
+        and generation_manifest["manifest_digest"] != root_manifest["manifest_digest"]
+    ):
         message = "Network generation manifest_digest does not match root manifest"
         logger.error(message)
         raise NetworkGenerationError(message)
-    if current["manifest_digest"] != root_manifest["manifest_digest"]:
+    if (
+        current is not None
+        and current["manifest_digest"] != root_manifest["manifest_digest"]
+    ):
         message = "Network CURRENT manifest_digest does not select root manifest"
         logger.error(message)
         raise NetworkCurrentError(message)
@@ -404,7 +434,7 @@ def _validate_network_layout(root: Path) -> dict[str, Any]:
         message = "Network requires an interferograms/ product collection"
         logger.error(message)
         raise IncompleteNetworkProductError(message)
-    return root_manifest
+    return generation_manifest
 
 
 class Network(NetworkContract):
@@ -412,7 +442,12 @@ class Network(NetworkContract):
 
     readers: ClassVar[Any]
 
-    def __init__(self, root: str | PathLike[str]) -> None:
+    def __init__(
+        self,
+        root: str | PathLike[str],
+        *,
+        revision: str | None = None,
+    ) -> None:
         """Mount and validate a canonical Network product."""
         try:
             resolved_root = Path(root)
@@ -424,7 +459,7 @@ class Network(NetworkContract):
             message = f"Network directory not found: {resolved_root}"
             logger.exception(message)
             raise NetworkPathError(message)
-        self.manifest = _validate_network_layout(resolved_root)
+        self.manifest = _validate_network_layout(resolved_root, revision=revision)
         self.generation_root = (
             resolved_root
             / NETWORK_GENERATIONS_NAME
@@ -511,18 +546,7 @@ class Network(NetworkContract):
         if reader is None:
             # Canonical mode intentionally does not consult the entry-point
             # registry and therefore cannot probe an external layout.
-            network = cls(path)
-            if (
-                revision is not None
-                and network.manifest.get("generation_id") != revision
-            ):
-                message = (
-                    "requested Network revision is not the current canonical "
-                    f"generation: {revision!r}"
-                )
-                logger.error(message)
-                raise NetworkGenerationError(message)
-            return network
+            return cls(path, revision=revision)
 
         selected: object
         if isinstance(reader, str):
