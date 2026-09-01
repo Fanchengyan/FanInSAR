@@ -781,6 +781,7 @@ class Stack(Network):
     _unwrap_generation: Any | None = field(default=None, repr=False)
     _network_generation_id: str | None = field(default=None, repr=False)
     _network_product_index: NetworkProductIndex | None = field(default=None, repr=False)
+    _network_view: Network | None = field(default=None, repr=False)
     _effective_roi_resolution: _EffectiveRoi | None = field(default=None, repr=False)
     _materialized_masks: dict[tuple[tuple[str, ...], str], object] = field(
         default_factory=dict, repr=False
@@ -816,7 +817,19 @@ class Stack(Network):
         The Stack and Network share one generation-scoped product index;
         before publication the view is intentionally unavailable.
         """
-        return self if self.analysis_ready else None
+        if not self.analysis_ready:
+            return None
+        if self._network_view is None:
+            view = object.__new__(Network)
+            view._root = self._root
+            view._geometry = self._geometry
+            view._interferograms = self._interferograms
+            view._timeseries = self._timeseries
+            view._product_index = self._network_product_index
+            view.manifest = {"generation_id": self._network_generation_id}
+            view.generation_root = self._root
+            self._network_view = view
+        return self._network_view
 
     @property
     def grid(self) -> GridSpec:

@@ -47,6 +47,8 @@ from faninsar._core import (
 )
 from faninsar._public import Acquisition, Acquisitions, Interferogram, Pair, Pairs
 from faninsar._public import __all__ as _public_all
+from faninsar.missions.base import list_missions, register
+from faninsar.timeseries.invert import NSBAS, SBAS, invert
 
 # Network is loaded lazily: importing its Dataset-backed implementation while
 # this package is still initializing would make the existing Dataset imports
@@ -58,15 +60,9 @@ _NETWORK_EXPORTS = (
     "Stack",
 )
 __all__ = [  # noqa: PLE0604
-    *_public_all,
-    "TimeSeries",
-    "Orbit",
-    "StackConfig",
-    "Points",
-    "BoundingBox",
-    "Polygons",
-    "DEM",
-    *_NETWORK_EXPORTS,
+    "Acquisition", "Acquisitions", "Baselines", "Interferogram", "Pair",
+    "Pairs", "Loops", "NSBAS", "SBAS", "Stage", "invert", "list_missions",
+    "open_stac", "open_zarr", "register", *_NETWORK_EXPORTS,
 ]
 
 

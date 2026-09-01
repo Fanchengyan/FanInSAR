@@ -9,18 +9,34 @@ from __future__ import annotations
 from faninsar.core import (
     Acquisition,
     Acquisitions,
+    Baselines,
     Interferogram,
+    Loops,
     Pair,
     Pairs,
 )
+from faninsar.io.readers import open_stac, open_zarr
+from faninsar.missions.base import list_missions, register
+from faninsar.processing.contracts.stage import Stage
+from faninsar.timeseries.invert import NSBAS, SBAS, invert
 
 # Stack and Network are exposed lazily from ``faninsar.__init__`` because their
 # Dataset-backed implementations import optional data-layer modules during
 # package initialization.
 __all__ = [
+    "NSBAS",
+    "SBAS",
     "Acquisition",
     "Acquisitions",
+    "Baselines",
     "Interferogram",
+    "Loops",
     "Pair",
     "Pairs",
+    "Stage",
+    "invert",
+    "list_missions",
+    "open_stac",
+    "open_zarr",
+    "register",
 ]
