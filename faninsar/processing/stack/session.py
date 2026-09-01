@@ -730,7 +730,7 @@ def _pairs_from_factory(
 
 
 @dataclass
-class Stack(Network):
+class Stack(NetworkContract):
     """Multi-scene InSAR session with Reference-relative coregistration.
 
     Parameters

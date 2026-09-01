@@ -96,8 +96,35 @@ class Acquisition(pd.DatetimeIndex):
     def __new__(cls, *args, **kwargs) -> Self:
         """Create a new instance of Acquisition."""
         if len(args) == 2 and isinstance(args[0], AcquisitionKey):
-            return AcquisitionRecord(args[0], args[1])  # type: ignore[return-value]
+            record = super(Acquisition, cls).__new__(cls, [args[1]])
+            record.key = args[0]
+            record.sensing_time = args[1]
+            return record
         return super(Acquisition, cls).__new__(cls, *args, **kwargs)
+
+    @property
+    def key(self) -> AcquisitionKey:
+        """Return the physical identity for a record-shaped acquisition."""
+        value = getattr(self, "_physical_key", None)
+        if value is None:
+            raise AttributeError("date collections do not have a physical key")
+        return value
+
+    @key.setter
+    def key(self, value: AcquisitionKey) -> None:
+        self._physical_key = value
+
+    @property
+    def sensing_time(self) -> datetime:
+        """Return the sensing time for a record-shaped acquisition."""
+        value = getattr(self, "_sensing_time", None)
+        if value is None:
+            raise AttributeError("date collections do not have a sensing time")
+        return value
+
+    @sensing_time.setter
+    def sensing_time(self, value: datetime) -> None:
+        self._sensing_time = value
 
     def _repr_html_(self) -> str:
         """Return the HTML representation of the class."""
