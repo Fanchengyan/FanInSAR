@@ -8,10 +8,8 @@ from __future__ import annotations
 # Domain nouns from core / _core.sar
 from faninsar.core import (
     Acquisition,
-    Baselines,
+    Acquisitions,
     Interferogram,
-    Loop,
-    Loops,
     Pair,
     Pairs,
 )
@@ -28,10 +26,8 @@ __all__ = [
     "NSBAS",
     "SBAS",
     "Acquisition",
-    "Baselines",
+    "Acquisitions",
     "Interferogram",
-    "Loop",
-    "Loops",
     "Pair",
     "Pairs",
     "Stage",

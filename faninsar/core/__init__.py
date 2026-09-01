@@ -6,7 +6,13 @@
 
 from __future__ import annotations
 
-from faninsar.core.acquisition import Acquisition, DateManager, DaySpan
+from faninsar.core.acquisition import (
+    Acquisition,
+    AcquisitionRecord,
+    Acquisitions,
+    DateManager,
+    DaySpan,
+)
 from faninsar.core.baseline import Baselines
 from faninsar.core.interferogram import Interferogram
 from faninsar.core.loops import Loop, Loops, TripletLoop, TripletLoops
@@ -39,6 +45,8 @@ __all__ = [
     "SEQ_TRANSITIONS",
     "Acquisition",
     "AcquisitionKey",
+    "AcquisitionRecord",
+    "Acquisitions",
     "AssetKind",
     "AssetTransform",
     "AssetTransformOperation",

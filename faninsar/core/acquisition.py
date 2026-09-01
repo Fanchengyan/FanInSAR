@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Self
 
@@ -21,13 +22,52 @@ from faninsar._core.render import array_repr
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Hashable, Sequence
+    from collections.abc import Callable, Hashable, Iterator, Sequence
 
     from matplotlib.axes import Axes
     from pandas._typing import ArrayLike
 
+    from faninsar.core.network import AcquisitionKey
+
 logger = setup_logger(__name__)
 _dtype_obj = np.dtype("object")
+
+
+@dataclass(frozen=True, slots=True)
+class AcquisitionRecord:
+    """Immutable physical acquisition keyed by ``AcquisitionKey``."""
+
+    key: AcquisitionKey
+    sensing_time: datetime
+
+
+class Acquisitions:
+    """Immutable ordered collection of physical acquisition records."""
+
+    def __init__(self, records: tuple[AcquisitionRecord, ...] = ()) -> None:
+        """Create a validated collection."""
+        if any(not isinstance(record, AcquisitionRecord) for record in records):
+            message = "records must contain AcquisitionRecord values"
+            raise TypeError(message)
+        keys = [record.key for record in records]
+        if len(set(keys)) != len(keys):
+            message = "acquisition keys must be unique"
+            raise ValueError(message)
+        self._records = tuple(records)
+
+    def __getitem__(
+        self, index: int | slice
+    ) -> AcquisitionRecord | tuple[AcquisitionRecord, ...]:
+        """Return one record or an immutable slice."""
+        return self._records[index]
+
+    def __len__(self) -> int:
+        """Return the number of records."""
+        return len(self._records)
+
+    def __iter__(self) -> Iterator[AcquisitionRecord]:
+        """Iterate over records."""
+        return iter(self._records)
 
 
 class Acquisition(pd.DatetimeIndex):

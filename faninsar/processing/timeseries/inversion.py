@@ -68,6 +68,15 @@ class TimeSeriesResult:
     metadata: dict[str, Any]
     displacement_increments_m: np.ndarray | None = None
     displacement_cumulative_m: np.ndarray | None = None
+    revision_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the optional source Network revision identity."""
+        if self.revision_id is not None and (
+            not isinstance(self.revision_id, str) or not self.revision_id.strip()
+        ):
+            message = "revision_id must be a non-empty string or None"
+            raise ValueError(message)
 
     @property
     def phase_increments_rad(self) -> np.ndarray:
