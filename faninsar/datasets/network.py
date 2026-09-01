@@ -450,6 +450,15 @@ class Network(NetworkContract):
             message = "Network interferograms have no canonical index"
             logger.exception(message)
             raise IncompleteNetworkProductError(message)
+        index_type = index.get("type", index.get("index_type"))
+        if index_type != NETWORK_INDEX_TYPE:
+            message = f"unknown Network index type {index_type!r}"
+            logger.error(message)
+            raise UnknownNetworkIndexTypeError(message)
+        if not self.interferograms.pairs().names:
+            message = "Network interferogram index contains no products"
+            logger.error(message)
+            raise IncompleteNetworkProductError(message)
 
     @classmethod
     def open(
@@ -492,6 +501,7 @@ class Network(NetworkContract):
         NetworkConstructionError
             If a selected reader cannot be instantiated or does not expose
             the required ``read`` method.
+
         """
         if registry is not None and not isinstance(reader, str):
             message = "registry is valid only with a registered reader string"
@@ -502,7 +512,10 @@ class Network(NetworkContract):
             # Canonical mode intentionally does not consult the entry-point
             # registry and therefore cannot probe an external layout.
             network = cls(path)
-            if revision is not None and network.manifest.get("generation_id") != revision:
+            if (
+                revision is not None
+                and network.manifest.get("generation_id") != revision
+            ):
                 message = (
                     "requested Network revision is not the current canonical "
                     f"generation: {revision!r}"
@@ -554,15 +567,6 @@ class Network(NetworkContract):
             message = f"could not instantiate Network reader {name!r}"
             logger.exception(message)
             raise NetworkConstructionError(message) from error
-        index_type = index.get("type", index.get("index_type"))
-        if index_type != NETWORK_INDEX_TYPE:
-            message = f"unknown Network index type {index_type!r}"
-            logger.error(message)
-            raise UnknownNetworkIndexTypeError(message)
-        if not self.interferograms.pairs().names:
-            message = "Network interferogram index contains no products"
-            logger.error(message)
-            raise IncompleteNetworkProductError(message)
 
     @property
     def root(self) -> Path:

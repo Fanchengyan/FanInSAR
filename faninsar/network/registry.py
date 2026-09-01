@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from importlib import metadata
-from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 from faninsar.logging import setup_logger
@@ -36,10 +35,10 @@ def _validate_name(name: object) -> str:
     """Validate and return one stable reader registration name."""
     if not isinstance(name, str) or not name or name != name.strip():
         logger.error("invalid Network reader name: %r", name)
-        raise ValueError("reader name must be a non-empty string")
+        raise ValueError("reader name must be a non-empty string")  # noqa: EM101, TRY003
     if any(character.isspace() for character in name):
         logger.error("Network reader name contains whitespace: %r", name)
-        raise ValueError("reader name must not contain whitespace")
+        raise ValueError("reader name must not contain whitespace")  # noqa: EM101, TRY003
     return name
 
 
@@ -47,10 +46,11 @@ def _validate_reader_class(reader: object) -> type[NetworkReader]:
     """Validate a zero-argument reader class without importing an instance."""
     if not isinstance(reader, type):
         logger.error("Network reader registration is not a class: %r", reader)
-        raise InvalidReaderError("registered readers must be classes")
+        raise InvalidReaderError("registered readers must be classes")  # noqa: EM101, TRY003
     if not callable(getattr(reader, "read", None)):
         logger.error("Network reader class has no callable read method: %r", reader)
-        raise InvalidReaderError("reader class must define a callable read method")
+        message = "reader class must define a callable read method"
+        raise InvalidReaderError(message)
     return reader
 
 
@@ -82,6 +82,7 @@ class ReaderRegistry:
     duplicate name, including a collision with an in-process registration,
     fails deterministically.  Passing a registry to :meth:`Network.open` is
     intentionally isolated; it never merges this registry with a default one.
+
     """
 
     def __init__(self, *, entry_point_group: str = ENTRY_POINT_GROUP) -> None:
@@ -107,12 +108,14 @@ class ReaderRegistry:
             If *reader* is not a class with a callable ``read`` method.
         ValueError
             If *name* is not a stable non-empty selector.
+
         """
         normalized_name = _validate_name(name)
         reader_class = _validate_reader_class(reader)
         if normalized_name in self._readers:
             logger.error("Network reader name is already registered: %s", name)
-            raise DuplicateReaderError(f"reader name already registered: {name}")
+            message = f"reader name already registered: {name}"
+            raise DuplicateReaderError(message)
         self._readers[normalized_name] = reader_class
 
     @property
@@ -134,16 +137,14 @@ class ReaderRegistry:
         entry_point = candidates.get(normalized_name)
         if entry_point is None:
             logger.error("unknown Network reader name: %s", normalized_name)
-            raise ReaderNotFoundError(
-                f"no Network reader is registered as {normalized_name!r}"
-            )
+            message = f"no Network reader is registered as {normalized_name!r}"
+            raise ReaderNotFoundError(message)
         try:
             loaded = entry_point.load()
         except Exception as error:
             logger.exception("could not import Network reader %s", normalized_name)
-            raise InvalidReaderError(
-                f"could not load Network reader {normalized_name!r}"
-            ) from error
+            message = f"could not load Network reader {normalized_name!r}"
+            raise InvalidReaderError(message) from error
         reader_class = _validate_reader_class(loaded)
         self._readers[normalized_name] = reader_class
         return reader_class
@@ -162,7 +163,8 @@ class ReaderRegistry:
         if duplicate_names:
             names = ", ".join(sorted(duplicate_names))
             logger.error("duplicate Network reader registrations: %s", names)
-            raise DuplicateReaderError(f"duplicate Network reader names: {names}")
+            message = f"duplicate Network reader names: {names}"
+            raise DuplicateReaderError(message)
         return {name: entries[0] for name, entries in grouped.items()}
 
 

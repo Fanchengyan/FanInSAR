@@ -7,10 +7,11 @@ their storage or scientific interpretation code.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .network import Network
 
 
