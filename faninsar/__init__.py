@@ -45,7 +45,7 @@ from faninsar._core import (
     transform_from_xy,
     xy_from_profile,
 )
-from faninsar._public import *  # noqa: F403
+from faninsar._public import Acquisition, Acquisitions, Interferogram, Pair, Pairs
 from faninsar._public import __all__ as _public_all
 
 # Network is loaded lazily: importing its Dataset-backed implementation while
@@ -57,7 +57,17 @@ _NETWORK_EXPORTS = (
     "S1Stack",
     "Stack",
 )
-__all__ = [*_public_all, *_NETWORK_EXPORTS]  # noqa: PLE0604
+__all__ = [  # noqa: PLE0604
+    *_public_all,
+    "TimeSeries",
+    "Orbit",
+    "StackConfig",
+    "Points",
+    "BoundingBox",
+    "Polygons",
+    "DEM",
+    *_NETWORK_EXPORTS,
+]
 
 
 def __getattr__(name: str) -> Any:
@@ -117,6 +127,31 @@ def __getattr__(name: str) -> Any:
             "SNAPNetwork": SNAPNetwork,
             "S1Stack": S1Stack,
             "Stack": Stack,
+        }
+        return values[name]
+    if name in {
+        "TimeSeries",
+        "Orbit",
+        "StackConfig",
+        "Points",
+        "BoundingBox",
+        "Polygons",
+        "DEM",
+    }:
+        from faninsar.processing.contracts.products import OrbitMetadata
+        from faninsar.processing.dem.api import DEM
+        from faninsar.processing.stack.config import StackConfig
+        from faninsar.processing.timeseries.inversion import TimeSeriesResult
+        from faninsar.query import BoundingBox, Points, Polygons
+
+        values = {
+            "TimeSeries": TimeSeriesResult,
+            "Orbit": OrbitMetadata,
+            "StackConfig": StackConfig,
+            "Points": Points,
+            "BoundingBox": BoundingBox,
+            "Polygons": Polygons,
+            "DEM": DEM,
         }
         return values[name]
     msg = f"module {__name__!r} has no attribute {name!r}"

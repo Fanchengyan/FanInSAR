@@ -810,15 +810,13 @@ class Stack(Network):
         self._product_index = None
 
     @property
-    def network(self) -> Network:
+    def network(self) -> Network | None:
         """Return this Stack's validated Network view.
 
         The Stack and Network share one generation-scoped product index;
         before publication the view is intentionally unavailable.
         """
-        if not self.analysis_ready:
-            raise RuntimeError("Stack Network is unavailable before publication")
-        return self
+        return self if self.analysis_ready else None
 
     @property
     def grid(self) -> GridSpec:

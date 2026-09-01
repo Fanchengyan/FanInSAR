@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Self
 
 import numpy as np
@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from pandas._typing import ArrayLike
 
     from faninsar.core.network import AcquisitionKey
+else:
+    from faninsar.core.network import AcquisitionKey
 
 logger = setup_logger(__name__)
 _dtype_obj = np.dtype("object")
@@ -39,6 +41,16 @@ class AcquisitionRecord:
 
     key: AcquisitionKey
     sensing_time: datetime
+
+    def __post_init__(self) -> None:
+        """Validate the physical identity and normalize time to UTC."""
+        if not isinstance(self.key, AcquisitionKey):
+            message = "key must be an AcquisitionKey"
+            raise TypeError(message)
+        if self.sensing_time.tzinfo is None:
+            message = "sensing_time must be timezone-aware"
+            raise ValueError(message)
+        object.__setattr__(self, "sensing_time", self.sensing_time.astimezone(UTC))
 
 
 class Acquisitions:
@@ -83,6 +95,8 @@ class Acquisition(pd.DatetimeIndex):
 
     def __new__(cls, *args, **kwargs) -> Self:
         """Create a new instance of Acquisition."""
+        if len(args) == 2 and isinstance(args[0], AcquisitionKey):
+            return AcquisitionRecord(args[0], args[1])  # type: ignore[return-value]
         return super(Acquisition, cls).__new__(cls, *args, **kwargs)
 
     def _repr_html_(self) -> str:
