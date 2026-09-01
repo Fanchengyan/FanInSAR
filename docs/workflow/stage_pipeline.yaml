@@ -1,0 +1,36 @@
+# FanInSAR production pair stages (PhysicalType lattice)
+# Consumed by Workflow.from_stages / future YAML loader (Phase 7).
+version: 1
+name: sentinel1-burst-pair
+stages:
+  - name: read
+    callable: faninsar.processing.stages.stage_read
+    output: slc_raw
+  - name: deramp
+    callable: faninsar.processing.stages.stage_deramp
+    input: slc_raw
+    output: slc_deramped
+  - name: coreg
+    callable: faninsar.processing.stages.stage_coreg
+    input: slc_deramped
+    output: slc_coreg
+  - name: ifg
+    callable: faninsar.processing.stages.stage_ifg
+    input: slc_coreg
+    output: ifg_complex
+  - name: flatten
+    callable: faninsar.processing.stages.stage_flatten
+    input: ifg_complex
+    output: ifg_flattened
+  - name: unwrap
+    callable: faninsar.processing.stages.stage_unwrap
+    input: ifg_flattened
+    output: phase_unwrapped
+  - name: write
+    callable: faninsar.processing.stages.stage_write
+    input: phase_unwrapped
+retry:
+  on: StageError
+  max_attempts: 2
+  checkpoint: true
+  hint: "Resume from last successful stage using output_dir state"
