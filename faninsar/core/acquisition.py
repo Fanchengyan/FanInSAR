@@ -54,12 +54,23 @@ class AcquisitionRecord:
 
 
 class Acquisitions:
-    """Immutable ordered collection of physical acquisition records."""
+    """Immutable ordered collection of physical acquisition values.
 
-    def __init__(self, records: tuple[AcquisitionRecord, ...] = ()) -> None:
+    Both :class:`AcquisitionRecord` and the record-shaped constructor form of
+    :class:`Acquisition` represent one physical observation.  Accepting both
+    keeps the public singular and collection forms on the same identity
+    boundary while preserving the value supplied by the caller.
+    """
+
+    def __init__(
+        self, records: tuple[AcquisitionRecord | Acquisition, ...] = ()
+    ) -> None:
         """Create a validated collection."""
-        if any(not isinstance(record, AcquisitionRecord) for record in records):
-            message = "records must contain AcquisitionRecord values"
+        if any(
+            not isinstance(record, (AcquisitionRecord, Acquisition))
+            for record in records
+        ):
+            message = "records must contain physical Acquisition values"
             raise TypeError(message)
         keys = [record.key for record in records]
         if len(set(keys)) != len(keys):
@@ -69,7 +80,7 @@ class Acquisitions:
 
     def __getitem__(
         self, index: int | slice
-    ) -> AcquisitionRecord | tuple[AcquisitionRecord, ...]:
+    ) -> AcquisitionRecord | Acquisition | tuple[AcquisitionRecord | Acquisition, ...]:
         """Return one record or an immutable slice."""
         return self._records[index]
 
@@ -77,7 +88,7 @@ class Acquisitions:
         """Return the number of records."""
         return len(self._records)
 
-    def __iter__(self) -> Iterator[AcquisitionRecord]:
+    def __iter__(self) -> Iterator[AcquisitionRecord | Acquisition]:
         """Iterate over records."""
         return iter(self._records)
 
@@ -113,6 +124,9 @@ class Acquisition(pd.DatetimeIndex):
 
     @key.setter
     def key(self, value: AcquisitionKey) -> None:
+        if hasattr(self, "_physical_key"):
+            message = "physical acquisition identity is immutable"
+            raise AttributeError(message)
         self._physical_key = value
 
     @property
@@ -126,7 +140,35 @@ class Acquisition(pd.DatetimeIndex):
 
     @sensing_time.setter
     def sensing_time(self, value: datetime) -> None:
+        if hasattr(self, "_sensing_time"):
+            message = "physical acquisition sensing time is immutable"
+            raise AttributeError(message)
         self._sensing_time = value
+
+    def __eq__(self, other: object) -> object:
+        """Compare physical records by key and date collections by values."""
+        if hasattr(self, "_physical_key"):
+            return (
+                isinstance(other, Acquisition)
+                and getattr(other, "_physical_key", None) == self._physical_key
+            )
+        return super().__eq__(other)
+
+    def __ne__(self, other: object) -> object:
+        """Compare physical records by the inverse of their key identity."""
+        if hasattr(self, "_physical_key"):
+            return not (
+                isinstance(other, Acquisition)
+                and getattr(other, "_physical_key", None) == self._physical_key
+            )
+        return super().__ne__(other)
+
+    def __hash__(self) -> int:
+        """Hash a physical record by its immutable acquisition key."""
+        if hasattr(self, "_physical_key"):
+            return hash(self._physical_key)
+        message = "date collection acquisitions are unhashable"
+        raise TypeError(message)
 
     def _repr_html_(self) -> str:
         """Return the HTML representation of the class."""

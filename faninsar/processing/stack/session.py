@@ -819,13 +819,18 @@ class Stack(NetworkContract):
         """
         if not self.analysis_ready:
             return None
-        if self._network_view is None:
+        if (
+            self._network_view is None
+            or self._network_view.network_generation_id != self._network_generation_id
+        ):
             view = object.__new__(Network)
             view._root = self._root
             view._geometry = self._geometry
             view._interferograms = self._interferograms
             view._timeseries = self._timeseries
             view._product_index = self._network_product_index
+            view._network_generation_id = self._network_generation_id
+            view._network_product_index = self._network_product_index
             view.manifest = {"generation_id": self._network_generation_id}
             view.generation_root = self._root
             self._network_view = view
@@ -924,9 +929,7 @@ class Stack(NetworkContract):
                 geometries.append(geometry)
         if not geometries:
             return None
-        return unary_union(
-            sorted(geometries, key=lambda geometry: geometry.wkb)
-        )
+        return unary_union(sorted(geometries, key=lambda geometry: geometry.wkb))
 
     def materialize_dem(self, dem: DEM | None = None) -> RasterDEM:
         """Materialize one DEM directly on the authoritative Stack grid.
@@ -1572,9 +1575,7 @@ class Stack(NetworkContract):
             "n_jobs": cfg.n_jobs,
         }
 
-    def _radar_projection_context_record(
-        self, state: Any
-    ) -> dict[str, object] | None:
+    def _radar_projection_context_record(self, state: Any) -> dict[str, object] | None:
         """Return a durable descriptor for the authoritative radar context."""
         scene = getattr(state, "primary", None)
         geometry = getattr(scene, "geometry", None)
@@ -2835,6 +2836,16 @@ class Stack(NetworkContract):
     ) -> Self:
         """Atomically refresh the inherited Network product index."""
         NetworkContract.refresh_generation(self, generation_id, products)
+        view = getattr(self, "_network_view", None)
+        if view is not None:
+            # Keep an already-obtained view current without exposing a partial
+            # index: NetworkContract.refresh_generation validated both fields
+            # before this synchronization point.
+            view._network_generation_id = self._network_generation_id
+            view._network_product_index = self._network_product_index
+            view._product_index = self._network_product_index
+            view.manifest = {"generation_id": self._network_generation_id}
+            view.generation_root = self._root
         return self
 
     def _refresh_network_from_unwrap_generation(self, generation: Any) -> None:
@@ -3576,7 +3587,12 @@ class Stack(NetworkContract):
         # intentionally have no Stack config/catalog and retain their light
         # weight inversion seam.
         if not hasattr(self, "config") or not hasattr(self, "pairs"):
-            return self.invert_timeseries(**kwargs)
+            result = self.invert_timeseries(**kwargs)
+            return (
+                replace(result, revision_id=generation_id)
+                if is_dataclass(result)
+                else result
+            )
         stores = self._pair_artifact_stores(
             looks=kwargs.get("multilook") or self.config.multilook,
             ifg_root=kwargs.get("ifg_root"),
@@ -3605,7 +3621,11 @@ class Stack(NetworkContract):
                 reject_invalid_state(
                     "Stack IFG or unwrap artifacts changed during Network analysis"
                 )
-            return result
+            return (
+                replace(result, revision_id=generation_id)
+                if is_dataclass(result)
+                else result
+            )
         finally:
             for store in stores:
                 store.close()

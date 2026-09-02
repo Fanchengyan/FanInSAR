@@ -5,28 +5,27 @@ from __future__ import annotations
 import faninsar as fis
 
 REQUIRED_NAMES = {
+    "Acquisition",
+    "Acquisitions",
     "Pair",
     "Pairs",
-    "Loops",
-    "Acquisition",
-    "Baselines",
+    "Interferogram",
     "Network",
+    "TimeSeries",
+    "Orbit",
     "Stack",
     "S1Stack",
     "NISARStack",
-    "invert",
-    "NSBAS",
-    "SBAS",
-    "Stage",
-    "open_stac",
-    "open_zarr",
-    "register",
-    "list_missions",
+    "StackConfig",
+    "Points",
+    "BoundingBox",
+    "Polygons",
+    "DEM",
 }
 
 
-def test_all_length_at_most_20() -> None:
-    assert len(fis.__all__) <= 20
+def test_all_is_exact_scientific_surface() -> None:
+    assert set(fis.__all__) == REQUIRED_NAMES
 
 
 def test_required_names_present() -> None:

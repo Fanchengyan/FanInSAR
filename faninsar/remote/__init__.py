@@ -437,10 +437,7 @@ def _safe_url(url: str, adapter: _Adapter) -> str:
         port_suffix = (
             f":{registered_port}" if registered_port and registered_port != 443 else ""
         )
-        registered_origins.append(
-            f"https://{registered_host}"
-            + port_suffix
-        )
+        registered_origins.append(f"https://{registered_host}" + port_suffix)
     if origin not in registered_origins:
         _fail(RemoteAccessError, "unregistered_endpoint")
     path = parsed.path or "/"

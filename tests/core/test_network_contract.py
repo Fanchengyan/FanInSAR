@@ -298,6 +298,6 @@ def test_stack_analysis_readiness_follows_unwrap_commit() -> None:
     form_source = inspect.getsource(Stack.form_interferograms)
     unwrap_source = inspect.getsource(Stack.unwrap)
     assert "_refresh_network_from_ifg_dirs" not in form_source
-    assert unwrap_source.index("write_unwrapped_artifact") < unwrap_source.index(
-        "_refresh_network_from_ifg_dirs"
+    assert unwrap_source.index("publish_unwrap_generation") < unwrap_source.index(
+        "_refresh_network_from_unwrap_generation"
     )

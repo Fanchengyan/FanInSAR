@@ -59,10 +59,23 @@ _NETWORK_EXPORTS = (
     "S1Stack",
     "Stack",
 )
-__all__ = [  # noqa: PLE0604
-    "Acquisition", "Acquisitions", "Baselines", "Interferogram", "Pair",
-    "Pairs", "Loops", "NSBAS", "SBAS", "Stage", "invert", "list_missions",
-    "open_stac", "open_zarr", "register", *_NETWORK_EXPORTS,
+__all__ = [  # noqa: RUF022
+    "Acquisition",
+    "Acquisitions",
+    "Pair",
+    "Pairs",
+    "Interferogram",
+    "Network",
+    "TimeSeries",
+    "Orbit",
+    "Stack",
+    "S1Stack",
+    "NISARStack",
+    "StackConfig",
+    "Points",
+    "BoundingBox",
+    "Polygons",
+    "DEM",
 ]
 
 
