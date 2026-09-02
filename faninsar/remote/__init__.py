@@ -415,6 +415,7 @@ def _safe_url(url: str, adapter: _Adapter) -> str:
         or not parsed.hostname
         or parsed.username
         or parsed.password
+        or parsed.fragment
     ):
         _fail(RemoteAccessError, "invalid_endpoint")
     if "\\" in url or "%2f" in raw_lower or "%5c" in raw_lower:
@@ -428,7 +429,19 @@ def _safe_url(url: str, adapter: _Adapter) -> str:
     except ValueError:
         _fail(RemoteAccessError, "invalid_endpoint")
     origin = f"https://{host}" + (f":{port}" if port and port != 443 else "")
-    if origin not in tuple(item.lower().rstrip("/") for item in adapter.origins):
+    registered_origins: list[str] = []
+    for item in adapter.origins:
+        registered = urllib.parse.urlsplit(item)
+        registered_host = (registered.hostname or "").lower()
+        registered_port = registered.port
+        port_suffix = (
+            f":{registered_port}" if registered_port and registered_port != 443 else ""
+        )
+        registered_origins.append(
+            f"https://{registered_host}"
+            + port_suffix
+        )
+    if origin not in registered_origins:
         _fail(RemoteAccessError, "unregistered_endpoint")
     path = parsed.path or "/"
     prefixes = adapter.path_prefixes or ("/",)
@@ -666,45 +679,40 @@ def _fetch(
         check_limits(len(payload))
         return payload
 
-    fetcher = getattr(adapter, "fetch", None)
-    result = None
-    if fetcher is not None:
-        last_error: Exception | None = None
-        for attempt in range(budget.max_retries + 1):
-            if attempt > 0:
-                requests += 1
-                if requests > budget.max_requests:
-                    _fail(RemoteLimitError, "max_requests")
-            try:
-                result = fetcher(asset, budget)
-                last_error = None
-                break
-            except Exception as error:
-                last_error = error
-        if last_error is not None:
-            logger.exception("Remote adapter transfer failed")
-            _fail(RemoteAccessError, "transfer_failed")
-    if isinstance(result, (bytes, bytearray)):
-        payload = bytes(result)
-        check_limits(len(payload))
-        return payload
-    if hasattr(result, "read"):
-        return bounded(iter(lambda: result.read(1024 * 1024), b""))
-    if isinstance(result, Iterable):
-        return bounded(result)
-    request = urllib.request.Request(
-        asset.href, headers={"Accept-Encoding": "identity"}
-    )
-    try:
+    def fetch_once() -> bytes:
+        """Perform and fully consume one transfer attempt."""
+        fetcher = getattr(adapter, "fetch", None)
+        result = None if fetcher is None else fetcher(asset, budget)
+        if isinstance(result, (bytes, bytearray)):
+            payload = bytes(result)
+            check_limits(len(payload))
+            return payload
+        if hasattr(result, "read"):
+            return bounded(iter(lambda: result.read(1024 * 1024), b""))
+        if isinstance(result, Iterable):
+            return bounded(result)
+        request = urllib.request.Request(
+            asset.href, headers={"Accept-Encoding": "identity"}
+        )
         with urllib.request.urlopen(
             request, timeout=budget.read_timeout_seconds
         ) as response:
             if response.headers.get("Content-Encoding", "identity") != "identity":
                 _fail(RemoteAccessError, "unexpected_content_encoding")
             return bounded(iter(lambda: response.read(1024 * 1024), b""))
-    except urllib.error.URLError:
-        logger.exception("Remote transfer failed")
-        _fail(RemoteAccessError, "transfer_failed")
+
+    for attempt in range(budget.max_retries + 1):
+        if attempt > 0:
+            requests += 1
+            if requests > budget.max_requests:
+                _fail(RemoteLimitError, "max_requests")
+        try:
+            return fetch_once()
+        except (urllib.error.URLError, OSError):
+            if attempt >= budget.max_retries:
+                logger.exception("Remote transfer failed")
+                _fail(RemoteAccessError, "transfer_failed")
+    _fail(RemoteAccessError, "transfer_failed")
 
 
 def download(
@@ -746,6 +754,10 @@ def download(
         _fail(RemoteLimitError, "max_response_bytes")
     if len(payload) > budget.max_output_bytes:
         _fail(RemoteLimitError, "max_output_bytes")
+    if len(payload) > budget.max_temporary_bytes:
+        _fail(RemoteLimitError, "max_temporary_bytes")
+    if len(payload) > budget.max_cache_bytes:
+        _fail(RemoteLimitError, "max_cache_bytes")
     if asset.size_bytes is not None and len(payload) != asset.size_bytes:
         _fail(RemoteIntegrityError, "content_length_mismatch")
     digest = hashlib.sha256(payload).hexdigest()
@@ -758,8 +770,7 @@ def download(
         if destination.exists() and not overwrite:
             if _matching_manifest(destination, asset):
                 return destination
-            if _is_qualified(asset):
-                _fail(RemoteIntegrityError, "destination_conflict")
+            _fail(RemoteIntegrityError, "destination_conflict")
         temporary: Path | None = None
         manifest = _manifest_path(destination, asset)
         try:

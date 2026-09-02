@@ -84,8 +84,8 @@ def test_download_is_atomic_and_reuses_verified_destination(tmp_path: Path) -> N
         remote.download(asset, destination)
 
 
-def test_unqualified_download_refreshes_existing_destination(tmp_path: Path) -> None:
-    """An asset without a version or checksum is fetched again on each call."""
+def test_unqualified_download_requires_explicit_overwrite(tmp_path: Path) -> None:
+    """An unqualified asset is fresh but cannot silently replace a destination."""
     name = "download-unqualified"
     remote._register_fixture(
         [
@@ -106,9 +106,13 @@ def test_unqualified_download_refreshes_existing_destination(tmp_path: Path) -> 
     destination = tmp_path / "asset.bin"
 
     destination.write_bytes(b"stale bytes")
-    assert remote.download(asset, destination).read_bytes() == b"fresh bytes"
+    with pytest.raises(remote.RemoteIntegrityError, match="destination_conflict"):
+        remote.download(asset, destination)
+    assert destination.read_bytes() == b"stale bytes"
+    assert remote.download(asset, destination, overwrite=True).read_bytes() == b"fresh bytes"
     destination.write_bytes(b"changed bytes")
-    assert remote.download(asset, destination).read_bytes() == b"fresh bytes"
+    with pytest.raises(remote.RemoteIntegrityError, match="destination_conflict"):
+        remote.download(asset, destination)
 
 
 def test_invalid_spatial_and_datetime_inputs_are_query_errors() -> None:
