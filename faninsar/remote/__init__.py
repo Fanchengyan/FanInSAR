@@ -291,6 +291,7 @@ class _Adapter(Protocol):
     provider: str
     origins: tuple[str, ...]
     path_prefixes: tuple[str, ...]
+    redirect_origins: tuple[str, ...]
     profiles: tuple[str, ...]
 
     def items(self) -> Iterable[Mapping[str, Any]]: ...
@@ -306,6 +307,7 @@ class _FixtureAdapter:
     provider: str = "fixture"
     origins: tuple[str, ...] = ("https://fixture.invalid",)
     path_prefixes: tuple[str, ...] = ("/",)
+    redirect_origins: tuple[str, ...] = ()
     profiles: tuple[str, ...] = ("anonymous",)
 
     def items(self) -> Iterable[Mapping[str, Any]]:
@@ -406,8 +408,13 @@ def _query_geometry(
     _fail(RemoteQueryError, "unsupported_geometry", msg)
 
 
-def _safe_url(url: str, adapter: _Adapter) -> str:
-    """Validate and canonicalize an asset URL against its registration."""
+def _safe_url(
+    url: str,
+    adapter: _Adapter,
+    *,
+    redirect: bool = False,
+) -> str:
+    """Validate and canonicalize a URL against a registered endpoint policy."""
     parsed = urllib.parse.urlsplit(url)
     raw_lower = url.lower()
     if (
@@ -430,7 +437,8 @@ def _safe_url(url: str, adapter: _Adapter) -> str:
         _fail(RemoteAccessError, "invalid_endpoint")
     origin = f"https://{host}" + (f":{port}" if port and port != 443 else "")
     registered_origins: list[str] = []
-    for item in adapter.origins:
+    origins = getattr(adapter, "redirect_origins", ()) if redirect else adapter.origins
+    for item in origins:
         registered = urllib.parse.urlsplit(item)
         registered_host = (registered.hostname or "").lower()
         registered_port = registered.port
@@ -442,14 +450,46 @@ def _safe_url(url: str, adapter: _Adapter) -> str:
         _fail(RemoteAccessError, "unregistered_endpoint")
     path = parsed.path or "/"
     prefixes = adapter.path_prefixes or ("/",)
-    if not any(
-        path == prefix.rstrip("/") or path.startswith(prefix.rstrip("/") + "/")
-        for prefix in prefixes
-    ):
+    allowed_path = False
+    for prefix in prefixes:
+        normalized_prefix = prefix.rstrip("/") or "/"
+        if normalized_prefix in {"/", path} or path.startswith(normalized_prefix + "/"):
+            allowed_path = True
+            break
+    if not allowed_path:
         _fail(RemoteAccessError, "unregistered_endpoint")
     return urllib.parse.urlunsplit(
         ("https", origin.removeprefix("https://"), path, "", "")
     )
+
+
+class _RedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow only redirects admitted by a registered adapter policy."""
+
+    def __init__(self, adapter: _Adapter, budget: RemoteResourceBudget) -> None:
+        """Initialize a handler with one operation-wide redirect budget."""
+        super().__init__()
+        self._adapter = adapter
+        self._budget = budget
+        self._redirects = 0
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        """Validate and charge one redirect before following it."""
+        self._redirects += 1
+        if self._redirects > self._budget.max_redirects:
+            _fail(RemoteLimitError, "max_redirects")
+        target = _safe_url(
+            urllib.parse.urljoin(req.full_url, newurl), self._adapter, redirect=True
+        )
+        return super().redirect_request(req, fp, code, msg, headers, target)
 
 
 def _normalize_checksum(value: Any) -> str | None:
@@ -648,20 +688,29 @@ def _fetch(
     """Fetch complete bytes through an adapter or standard HTTPS."""
     started = time.monotonic()
     requests = 1
+    operation_bytes = 0
+    redirect_handler = _RedirectHandler(adapter, budget)
+    opener = urllib.request.build_opener(redirect_handler)
 
     if requests > budget.max_requests:
         _fail(RemoteLimitError, "max_requests")
 
-    def check_limits(total: int) -> None:
+    def check_elapsed() -> None:
+        """Enforce the operation-wide elapsed-time limit."""
+        if time.monotonic() - started > budget.max_elapsed_seconds:
+            _fail(RemoteLimitError, "max_elapsed_seconds")
+
+    def check_limits(total: int, added_bytes: int = 0) -> None:
         """Enforce transfer limits shared by adapter and HTTPS fetches."""
+        nonlocal operation_bytes
+        operation_bytes += added_bytes
         if total > budget.max_response_bytes:
             _fail(RemoteLimitError, "max_response_bytes")
         if total > budget.max_output_bytes:
             _fail(RemoteLimitError, "max_output_bytes")
-        if total > budget.max_operation_bytes:
+        if operation_bytes > budget.max_operation_bytes:
             _fail(RemoteLimitError, "max_operation_bytes")
-        if time.monotonic() - started > budget.max_elapsed_seconds:
-            _fail(RemoteLimitError, "max_elapsed_seconds")
+        check_elapsed()
 
     def bounded(chunks: Iterable[bytes]) -> bytes:
         """Collect chunks while enforcing the response and output limits."""
@@ -670,7 +719,7 @@ def _fetch(
         for chunk in chunks:
             part = bytes(chunk)
             total += len(part)
-            check_limits(total)
+            check_limits(total, len(part))
             parts.append(part)
         payload = b"".join(parts)
         check_limits(len(payload))
@@ -682,7 +731,7 @@ def _fetch(
         result = None if fetcher is None else fetcher(asset, budget)
         if isinstance(result, (bytes, bytearray)):
             payload = bytes(result)
-            check_limits(len(payload))
+            check_limits(len(payload), len(payload))
             return payload
         if hasattr(result, "read"):
             return bounded(iter(lambda: result.read(1024 * 1024), b""))
@@ -691,21 +740,21 @@ def _fetch(
         request = urllib.request.Request(
             asset.href, headers={"Accept-Encoding": "identity"}
         )
-        with urllib.request.urlopen(
-            request, timeout=budget.read_timeout_seconds
-        ) as response:
+        with opener.open(request, timeout=budget.read_timeout_seconds) as response:
             if response.headers.get("Content-Encoding", "identity") != "identity":
                 _fail(RemoteAccessError, "unexpected_content_encoding")
             return bounded(iter(lambda: response.read(1024 * 1024), b""))
 
     for attempt in range(budget.max_retries + 1):
         if attempt > 0:
+            check_elapsed()
             requests += 1
             if requests > budget.max_requests:
                 _fail(RemoteLimitError, "max_requests")
         try:
             return fetch_once()
         except (urllib.error.URLError, OSError):
+            check_elapsed()
             if attempt >= budget.max_retries:
                 logger.exception("Remote transfer failed")
                 _fail(RemoteAccessError, "transfer_failed")
