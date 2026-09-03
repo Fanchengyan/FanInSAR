@@ -244,7 +244,9 @@ def _geometry_from_cmr(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
 
 def _umm_times(record: Mapping[str, Any]) -> tuple[datetime | None, datetime | None]:
     """Extract start/end from a UMM temporal extent."""
-    temporal = record.get("TemporalExtents", record.get("TemporalExtent"))
+    temporal = record.get("TemporalExtents")
+    if not temporal:
+        temporal = record.get("TemporalExtent")
     if isinstance(temporal, Mapping):
         temporal = [temporal]
     if not isinstance(temporal, list) or not temporal:
