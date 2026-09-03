@@ -12,7 +12,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -139,6 +139,12 @@ def _instrument_session(
         logger.error(message)
         _fail(RemoteAccessError, "unobservable_discovery", message)
     previous_send = send
+    headers = getattr(session, "headers", None)
+    previous_encoding: object = None
+    has_encoding = isinstance(headers, MutableMapping) and "Accept-Encoding" in headers
+    if isinstance(headers, MutableMapping):
+        previous_encoding = headers.get("Accept-Encoding")
+        headers["Accept-Encoding"] = "identity"
 
     def metered_send(request: Any, *args: Any, **kwargs: Any) -> Any:
         """Meter one requests send and every response in its redirect chain."""
@@ -175,6 +181,11 @@ def _instrument_session(
     def restore() -> None:
         """Restore the caller-owned session after the operation."""
         session.send = previous_send
+        if isinstance(headers, MutableMapping):
+            if has_encoding:
+                headers["Accept-Encoding"] = previous_encoding
+            else:
+                headers.pop("Accept-Encoding", None)
 
     return restore
 
@@ -295,6 +306,9 @@ class PlanetaryComputerAdapter:
                 ),
                 max_retries=0,
             )
+            # Requests exposes decompressed content, not wire bytes.  Ask the
+            # service for identity encoding so response-byte limits are real.
+            stac_io.session.headers.update({"Accept-Encoding": "identity"})
             restore = _instrument_session(stac_io.session, ledger, self)
             try:
                 client = pystac_client.Client.open(self.endpoint, stac_io=stac_io)
