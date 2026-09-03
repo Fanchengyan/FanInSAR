@@ -39,6 +39,7 @@ ASF_SEARCH_CERTIFIED_VERSION = "13.0.0"
 ASF_SEARCH_COMPATIBILITY = ">=13,<14"
 DEFAULT_CMR_ENDPOINT = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
 DEFAULT_DATA_ORIGINS = ("https://datapool.asf.alaska.edu",)
+_EARTHDATA_AUTH_ORIGIN = "https://urs.earthdata.nasa.gov"
 _COLLECTION_CONCEPT_IDS = {
     "sentinel-1": "C1214470488-ASF",
     "sentinel-1a_slc": "C1214470488-ASF",
@@ -646,7 +647,7 @@ class ASFSearchAdapter:
             object.__setattr__(
                 self,
                 "redirect_origins",
-                (endpoint_origin, *self.data_origins),
+                (endpoint_origin, *self.data_origins, _EARTHDATA_AUTH_ORIGIN),
             )
 
     def _options(
