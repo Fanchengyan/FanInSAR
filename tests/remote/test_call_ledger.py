@@ -1,0 +1,81 @@
+"""Per-public-call accounting tests for the remote boundary."""
+
+from __future__ import annotations
+
+import hashlib
+from collections.abc import Iterable, Mapping
+from pathlib import Path
+from typing import Any
+
+from faninsar import remote
+from faninsar.query import Points
+
+
+class _MeteredAdapter:
+    """Fixture adapter that charges both public operations independently."""
+
+    provider = "metered"
+    origins = ("https://metered.invalid",)
+    path_prefixes = ("/",)
+    redirect_origins = ()
+    profiles = ("anonymous",)
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.ledgers: list[Any] = []
+
+    def items(self, *, ledger: Any) -> Iterable[Mapping[str, Any]]:
+        self.ledgers.append(ledger)
+        ledger.request()
+        ledger.response_bytes(54)
+        return (
+            {
+                "id": "metered-item",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]],
+                },
+                "assets": {
+                    "data": {
+                        "href": "https://metered.invalid/data.bin",
+                        "size": len(self.payload),
+                        "checksum": f"sha256:{hashlib.sha256(self.payload).hexdigest()}",
+                    }
+                },
+            },
+        )
+
+    def fetch(
+        self,
+        asset: remote.RemoteAsset,
+        budget: remote.RemoteResourceBudget,
+        *,
+        ledger: Any,
+    ) -> Iterable[bytes]:
+        del asset, budget
+        self.ledgers.append(ledger)
+        ledger.request()
+        ledger.response_bytes(len(self.payload))
+        return (self.payload,)
+
+
+def test_search_and_download_receive_fresh_ledgers(
+    tmp_path: Path,
+) -> None:
+    """Search and its later download do not share accounting state."""
+    payload = b"metered payload"
+    adapter = _MeteredAdapter(payload)
+    remote._register_adapter("metered-ledger", adapter)
+
+    items = remote.search(
+        Points([(0.5, 0.5)], crs=4326),
+        catalog="metered-ledger",
+    )
+    remote.download(items[0].assets["data"], tmp_path / "data.bin")
+
+    assert len(adapter.ledgers) == 2
+    assert adapter.ledgers[0] is not adapter.ledgers[1]
+    assert adapter.ledgers[0].requests == 1
+    assert adapter.ledgers[1].requests == 1
+    assert adapter.ledgers[0].response_bytes_total == 54
+    assert adapter.ledgers[1].response_bytes_total == len(payload)

@@ -8,6 +8,7 @@ operations without introducing a second scientific object model.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -294,9 +295,102 @@ class _Adapter(Protocol):
     redirect_origins: tuple[str, ...]
     profiles: tuple[str, ...]
 
-    def items(self) -> Iterable[Mapping[str, Any]]: ...
+    def items(
+        self, *, ledger: _CallLedger | None = None
+    ) -> Iterable[Mapping[str, Any]]: ...
 
-    def fetch(self, asset: RemoteAsset, budget: RemoteResourceBudget) -> Any: ...
+    def fetch(
+        self,
+        asset: RemoteAsset,
+        budget: RemoteResourceBudget,
+        *,
+        ledger: _CallLedger | None = None,
+    ) -> Any: ...
+
+
+@dataclass(slots=True)
+class _CallLedger:
+    """Private meter for exactly one public remote operation.
+
+    Adapters receive this object only for the duration of one ``search`` or
+    ``download`` call.  Provider code must charge every request, retry,
+    redirect, and response byte it performs through the corresponding
+    methods.  The public API intentionally exposes neither this object nor a
+    cross-call session.
+    """
+
+    budget: RemoteResourceBudget
+    started: float = 0.0
+    requests: int = 0
+    retries: int = 0
+    redirects: int = 0
+    response_bytes_total: int = 0
+    _response_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        """Capture the operation start before provider work begins."""
+        self.started = time.monotonic()
+
+    def check_elapsed(self) -> None:
+        """Enforce the operation-wide elapsed-time limit."""
+        if time.monotonic() - self.started > self.budget.max_elapsed_seconds:
+            _fail(RemoteLimitError, "max_elapsed_seconds")
+
+    def request(self) -> None:
+        """Charge one provider request."""
+        self.requests += 1
+        if self.requests > self.budget.max_requests:
+            _fail(RemoteLimitError, "max_requests")
+
+    def retry(self) -> None:
+        """Charge one retry before the next request attempt."""
+        self.check_elapsed()
+        self.retries += 1
+        if self.retries > self.budget.max_retries:
+            _fail(RemoteLimitError, "max_retries")
+
+    def redirect(self) -> None:
+        """Charge one redirect followed by a provider request."""
+        self.check_elapsed()
+        self.redirects += 1
+        if self.redirects > self.budget.max_redirects:
+            _fail(RemoteLimitError, "max_redirects")
+
+    def begin_response(self) -> None:
+        """Start accounting for one response body."""
+        self._response_bytes = 0
+
+    def response_bytes(self, count: int) -> None:
+        """Charge bytes from the current response body.
+
+        Parameters
+        ----------
+        count : int
+            Number of newly consumed response bytes.
+
+        """
+        if count < 0:
+            msg = "response byte count must be non-negative"
+            raise ValueError(msg)
+        self._response_bytes += count
+        self.response_bytes_total += count
+        if self._response_bytes > self.budget.max_response_bytes:
+            _fail(RemoteLimitError, "max_response_bytes")
+        if self.response_bytes_total > self.budget.max_operation_bytes:
+            _fail(RemoteLimitError, "max_operation_bytes")
+        self.check_elapsed()
+
+
+def _accepts_ledger(method: Any) -> bool:
+    """Return whether an adapter method accepts the private ledger keyword."""
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter.name == "ledger"
+        for parameter in parameters
+    )
 
 
 @dataclass
@@ -466,11 +560,17 @@ def _safe_url(
 class _RedirectHandler(urllib.request.HTTPRedirectHandler):
     """Follow only redirects admitted by a registered adapter policy."""
 
-    def __init__(self, adapter: _Adapter, budget: RemoteResourceBudget) -> None:
+    def __init__(
+        self,
+        adapter: _Adapter,
+        budget: RemoteResourceBudget,
+        ledger: _CallLedger | None = None,
+    ) -> None:
         """Initialize a handler with one operation-wide redirect budget."""
         super().__init__()
         self._adapter = adapter
         self._budget = budget
+        self._ledger = ledger
         self._redirects = 0
 
     def redirect_request(
@@ -484,7 +584,12 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
     ) -> urllib.request.Request | None:
         """Validate and charge one redirect before following it."""
         self._redirects += 1
-        if self._redirects > self._budget.max_redirects:
+        if self._ledger is not None:
+            self._ledger.redirect()
+            # urllib follows the returned request internally, so account for
+            # that target request here before it leaves the public boundary.
+            self._ledger.request()
+        elif self._redirects > self._budget.max_redirects:
             _fail(RemoteLimitError, "max_redirects")
         target = _safe_url(
             urllib.parse.urljoin(req.full_url, newurl), self._adapter, redirect=True
@@ -594,9 +699,19 @@ def search(
             _fail(RemoteQueryError, "invalid_datetime_range")
     else:
         start_end = None
+    ledger = _CallLedger(budget)
+    items_method = adapter.items
+    if _accepts_ledger(items_method):
+        raw_items = items_method(ledger=ledger)
+    else:
+        # P0044 adapters predate the private ledger keyword.  Their one
+        # catalog operation still receives a conservative request charge.
+        ledger.request()
+        raw_items = items_method()
     results: list[CatalogItem] = []
     seen: set[tuple[str, str, str | None, str]] = set()
-    for raw in adapter.items():
+    for raw in raw_items:
+        ledger.check_elapsed()
         if collections is not None and raw.get("collection") not in collections:
             continue
         item = _normalize_record(raw, catalog, adapter, profile)
@@ -682,83 +797,119 @@ def _matching_manifest(path: Path, asset: RemoteAsset) -> bool:
     return manifest == {"identity": _identity(asset), "sha256": digest, "size": size}
 
 
-def _fetch(
-    asset: RemoteAsset, adapter: _Adapter, budget: RemoteResourceBudget
-) -> bytes:
-    """Fetch complete bytes through an adapter or standard HTTPS."""
-    started = time.monotonic()
-    requests = 1
-    operation_bytes = 0
-    redirect_handler = _RedirectHandler(adapter, budget)
+def _stream_download(
+    asset: RemoteAsset,
+    adapter: _Adapter,
+    budget: RemoteResourceBudget,
+    ledger: _CallLedger,
+    staging: Path,
+) -> tuple[int, str]:
+    """Stream one complete asset into ``staging`` and return size/digest."""
+    fetcher = getattr(adapter, "fetch", None)
+    supplied_ledger = fetcher is not None and _accepts_ledger(fetcher)
+    redirect_handler = _RedirectHandler(adapter, budget, ledger)
     opener = urllib.request.build_opener(redirect_handler)
+    hasher = hashlib.sha256()
+    checksum_algorithm = asset.checksum.split(":", 1)[0] if asset.checksum else None
+    checksum_hasher = (
+        hashlib.new(checksum_algorithm) if checksum_algorithm is not None else None
+    )
 
-    if requests > budget.max_requests:
-        _fail(RemoteLimitError, "max_requests")
-
-    def check_elapsed() -> None:
-        """Enforce the operation-wide elapsed-time limit."""
-        if time.monotonic() - started > budget.max_elapsed_seconds:
-            _fail(RemoteLimitError, "max_elapsed_seconds")
-
-    def check_limits(total: int, added_bytes: int = 0) -> None:
-        """Enforce transfer limits shared by adapter and HTTPS fetches."""
-        nonlocal operation_bytes
-        operation_bytes += added_bytes
-        if total > budget.max_response_bytes:
-            _fail(RemoteLimitError, "max_response_bytes")
+    def check_output(total: int) -> None:
+        """Enforce output, temporary, and cache limits while streaming."""
         if total > budget.max_output_bytes:
             _fail(RemoteLimitError, "max_output_bytes")
-        if operation_bytes > budget.max_operation_bytes:
-            _fail(RemoteLimitError, "max_operation_bytes")
-        check_elapsed()
+        if total > budget.max_temporary_bytes:
+            _fail(RemoteLimitError, "max_temporary_bytes")
+        if total > budget.max_cache_bytes:
+            _fail(RemoteLimitError, "max_cache_bytes")
+        ledger.check_elapsed()
 
-    def bounded(chunks: Iterable[bytes]) -> bytes:
-        """Collect chunks while enforcing the response and output limits."""
-        parts: list[bytes] = []
-        total = 0
-        for chunk in chunks:
-            part = bytes(chunk)
-            total += len(part)
-            check_limits(total, len(part))
-            parts.append(part)
-        payload = b"".join(parts)
-        check_limits(len(payload))
-        return payload
+    def consume(chunks: Iterable[bytes], *, meter: bool) -> int:
+        """Consume chunks directly into the staging file."""
+        response_bytes = 0
+        with staging.open("ab") as stream:
+            for chunk in chunks:
+                part = bytes(chunk)
+                response_bytes += len(part)
+                if meter:
+                    ledger.response_bytes(len(part))
+                if response_bytes > budget.max_response_bytes:
+                    _fail(RemoteLimitError, "max_response_bytes")
+                stream.write(part)
+                hasher.update(part)
+                if checksum_hasher is not None:
+                    checksum_hasher.update(part)
+                check_output(stream.tell())
+            stream.flush()
+            os.fsync(stream.fileno())
+        return response_bytes
 
-    def fetch_once() -> bytes:
-        """Perform and fully consume one transfer attempt."""
-        fetcher = getattr(adapter, "fetch", None)
-        result = None if fetcher is None else fetcher(asset, budget)
+    def result_chunks(result: Any) -> Iterable[bytes]:
+        """Adapt provider result forms to a one-pass chunk iterable."""
         if isinstance(result, (bytes, bytearray)):
+            # Slice fixture bytes so publication follows the same bounded
+            # sequential path as a real HTTP response.
             payload = bytes(result)
-            check_limits(len(payload), len(payload))
-            return payload
+            return (
+                payload[offset : offset + 1024 * 1024]
+                for offset in range(0, len(payload), 1024 * 1024)
+            )
         if hasattr(result, "read"):
-            return bounded(iter(lambda: result.read(1024 * 1024), b""))
+            return iter(lambda: result.read(1024 * 1024), b"")
         if isinstance(result, Iterable):
-            return bounded(result)
-        request = urllib.request.Request(
-            asset.href, headers={"Accept-Encoding": "identity"}
-        )
-        with opener.open(request, timeout=budget.read_timeout_seconds) as response:
-            if response.headers.get("Content-Encoding", "identity") != "identity":
-                _fail(RemoteAccessError, "unexpected_content_encoding")
-            return bounded(iter(lambda: response.read(1024 * 1024), b""))
+            return result
+        return ()
 
     for attempt in range(budget.max_retries + 1):
-        if attempt > 0:
-            check_elapsed()
-            requests += 1
-            if requests > budget.max_requests:
-                _fail(RemoteLimitError, "max_requests")
+        if attempt:
+            ledger.retry()
+        staging.write_bytes(b"")
+        hasher = hashlib.sha256()
+        if checksum_algorithm is not None:
+            checksum_hasher = hashlib.new(checksum_algorithm)
         try:
-            return fetch_once()
+            if fetcher is None:
+                result = None
+            elif supplied_ledger:
+                result = fetcher(asset, budget, ledger=ledger)
+            else:
+                ledger.request()
+                result = fetcher(asset, budget)
+
+            if result is None:
+                ledger.request()
+                ledger.begin_response()
+                request = urllib.request.Request(
+                    asset.href, headers={"Accept-Encoding": "identity"}
+                )
+                with opener.open(
+                    request, timeout=budget.read_timeout_seconds
+                ) as response:
+                    if (
+                        response.headers.get("Content-Encoding", "identity")
+                        != "identity"
+                    ):
+                        _fail(RemoteAccessError, "unexpected_content_encoding")
+                    consume(iter(lambda: response.read(1024 * 1024), b""), meter=True)
+            else:
+                if not supplied_ledger:
+                    ledger.begin_response()
+                consume(result_chunks(result), meter=not supplied_ledger)
+            break
         except (urllib.error.URLError, OSError):
-            check_elapsed()
             if attempt >= budget.max_retries:
                 logger.exception("Remote transfer failed")
                 _fail(RemoteAccessError, "transfer_failed")
-    _fail(RemoteAccessError, "transfer_failed")
+    size = staging.stat().st_size
+    if asset.size_bytes is not None and size != asset.size_bytes:
+        _fail(RemoteIntegrityError, "content_length_mismatch")
+    if asset.checksum:
+        _, expected = asset.checksum.split(":", 1)
+        actual = checksum_hasher.hexdigest() if checksum_hasher is not None else ""
+        if actual != expected:
+            _fail(RemoteIntegrityError, "checksum_mismatch")
+    return size, hasher.hexdigest()
 
 
 def download(
@@ -795,30 +946,14 @@ def download(
                 return destination
             if _is_qualified(asset):
                 _fail(RemoteIntegrityError, "destination_conflict")
-    payload = _fetch(asset, adapter, budget)
-    if len(payload) > budget.max_response_bytes:
-        _fail(RemoteLimitError, "max_response_bytes")
-    if len(payload) > budget.max_output_bytes:
-        _fail(RemoteLimitError, "max_output_bytes")
-    if len(payload) > budget.max_temporary_bytes:
-        _fail(RemoteLimitError, "max_temporary_bytes")
-    if len(payload) > budget.max_cache_bytes:
-        _fail(RemoteLimitError, "max_cache_bytes")
-    if asset.size_bytes is not None and len(payload) != asset.size_bytes:
-        _fail(RemoteIntegrityError, "content_length_mismatch")
-    digest = hashlib.sha256(payload).hexdigest()
-    if asset.checksum:
-        algorithm, expected = asset.checksum.split(":", 1)
-        actual = hashlib.new(algorithm, payload).hexdigest()
-        if actual != expected:
-            _fail(RemoteIntegrityError, "checksum_mismatch")
-    with lock:
+        ledger = _CallLedger(budget)
         if destination.exists() and not overwrite:
             if _matching_manifest(destination, asset):
                 return destination
             _fail(RemoteIntegrityError, "destination_conflict")
         temporary: Path | None = None
         manifest = _manifest_path(destination, asset)
+        manifest_temp: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 dir=destination.parent,
@@ -826,9 +961,13 @@ def download(
                 delete=False,
             ) as stream:
                 temporary = Path(stream.name)
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
+            size, digest = _stream_download(
+                asset,
+                adapter,
+                budget,
+                ledger,
+                temporary,
+            )
             temporary.replace(destination)
             temporary = None
             with tempfile.NamedTemporaryFile(
@@ -842,7 +981,7 @@ def download(
                     {
                         "identity": _identity(asset),
                         "sha256": digest,
-                        "size": len(payload),
+                        "size": size,
                     },
                     stream,
                     separators=(",", ":"),
@@ -850,9 +989,12 @@ def download(
                 stream.flush()
                 os.fsync(stream.fileno())
             manifest_temp.replace(manifest)
+            manifest_temp = None
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+            if manifest_temp is not None:
+                manifest_temp.unlink(missing_ok=True)
     return destination
 
 
