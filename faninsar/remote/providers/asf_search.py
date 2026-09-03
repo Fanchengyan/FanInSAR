@@ -631,7 +631,17 @@ class ASFSearchAdapter:
                 "invalid_data_origin",
                 "ASF data origins must be valid HTTPS URLs",
             )
-        object.__setattr__(self, "origins", (endpoint_origin,))
+        # Asset URLs are normally served from ASF's datapool origin rather
+        # than the CMR search endpoint.  Both must be admitted for initial
+        # asset validation; redirects may additionally use the same set.
+        object.__setattr__(
+            self,
+            "origins",
+            (
+                endpoint_origin,
+                *tuple(_endpoint_origin(origin) for origin in self.data_origins),
+            ),
+        )
         if not self.redirect_origins:
             object.__setattr__(
                 self,
