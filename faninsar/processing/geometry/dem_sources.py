@@ -1370,6 +1370,30 @@ def _build_registry() -> dict[str, DemSource]:
             min_bytes=GLO_MIN_TILE_BYTES,
         )
 
+    # -- glo30 / glo90 (Planetary Computer STAC) ------------------------
+    # Keep these alternate provider entries beside the canonical AWS entries;
+    # the selection grammar and PRODUCT_REGISTRY then resolve ``glo30:pc`` and
+    # ``glo90:pc`` without changing the default bare-product selections.
+    pc_collections = {
+        "glo30": "cop-dem-glo-30",
+        "glo90": "cop-dem-glo-90",
+    }
+    for product, collection in pc_collections.items():
+        registry[f"{product}@pc"] = PcStacSource(
+            name=f"{product}@pc",
+            description=f"Copernicus {product.upper()} DSM via Planetary Computer",
+            product=product,
+            provider="pc",
+            resolution_m=1.0 / (3600 if product == "glo30" else 1200),
+            vertical_datum="egm2008",
+            derived=False,
+            auth="none",
+            wired=True,
+            collection_id=collection,
+            asset_key="data",
+            item_grid_degrees=1.0,
+        )
+
     # -- srtm-skadi (LatLonGridSource @ aws, skadi layout) -----------------
     registry["srtm-skadi"] = LatLonGridSource(
         name="srtm-skadi",

@@ -228,7 +228,7 @@ wheels = [
 
 [[package]]
 name = "asf-search"
-version = "12.2.3"
+version = "13.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dateparser" },
@@ -239,9 +239,9 @@ dependencies = [
     { name = "shapely" },
     { name = "tenacity" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e7/2a/de2d1e2251b764584a32fc7207123416ebf67dd951af7db10495a79aab56/asf_search-12.2.3.tar.gz", hash = "sha256:01786f43cd66d2c44bba77bcb8a8e7e2b2997343e9c690027d3e5cedc7b956e3", size = 1513064, upload-time = "2026-07-07T00:26:40.382Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/99/4517722010cdc9fd6782cbb87fbde85b7e9080676989dba61f9418faa019/asf_search-13.0.0.tar.gz", hash = "sha256:31635416abc8159762fdafbd35c28c473bbc052a2e1a8ebdd43c0e0a44e5a1e3", size = 1513478, upload-time = "2026-08-27T22:18:37.945Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e6/20/80fa8e6c47c0491830dcead4d003fe756cea10f17203e2e0a4c1642bb4dd/asf_search-12.2.3-py3-none-any.whl", hash = "sha256:13643623aad343237d04e4cca89d8cfbc9889a68944120c7dca4e1a53c8e419a", size = 133782, upload-time = "2026-07-07T00:26:39.149Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/6b/3de46e5f86bf55240262bbc9093a4359f4389fb09a747d25cef9b1524ed6/asf_search-13.0.0-py3-none-any.whl", hash = "sha256:1700b7de00ee88921a06216b2c1587b461831955cf9aff3463e6510b541f40f1", size = 131534, upload-time = "2026-08-27T22:18:36.563Z" },
 ]
 
 [[package]]
@@ -1050,6 +1050,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+asf = [
+    { name = "asf-search" },
+]
 cloud = [
     { name = "huggingface-hub" },
     { name = "pyarrow" },
@@ -1122,6 +1125,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "asf-search", marker = "extra == 'asf'", specifier = ">=13,<14" },
     { name = "colorlog" },
     { name = "coverage", marker = "extra == 'test'" },
     { name = "dask", extras = ["array", "distributed"], specifier = ">=2023.1" },
@@ -1183,12 +1187,12 @@ requires-dist = [
     { name = "xarray" },
     { name = "zarr", specifier = ">=3.0" },
 ]
-provides-extras = ["opencv", "code-style", "pc", "test", "cloud", "docs", "dev"]
+provides-extras = ["opencv", "code-style", "pc", "asf", "test", "cloud", "docs", "dev"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "aiohttp", specifier = ">=3.14.3" },
-    { name = "asf-search", specifier = ">=12.2.3" },
+    { name = "asf-search", specifier = ">=13,<14" },
     { name = "curl-cffi", specifier = ">=0.15.0" },
     { name = "grequests", specifier = ">=0.7.0" },
     { name = "h2", specifier = ">=4.4.0" },

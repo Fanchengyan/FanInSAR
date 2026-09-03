@@ -22,6 +22,11 @@ locations. Construction, ``list``, ``get``, catalog inspection, and source
 start only at ``to_raster``. Unsupported product or provider selections fail
 before discovery.
 
+For the provider-neutral catalog API and general CMR/STAC discovery, see
+:doc:`remote`. DEM selection remains on the same explicit product/provider
+registry; a provider outage raises an error and never silently changes the
+requested product or provider.
+
 The default target datum is WGS84 ellipsoidal height. The source-to-target
 graph fetches only the geoid models it needs: same-datum conversion is a
 no-op, EGM96 and EGM2008 conversions use their respective model, and a

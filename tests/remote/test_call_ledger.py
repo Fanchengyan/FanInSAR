@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Mapping
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from faninsar import remote
 from faninsar.query import Points
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+    from pathlib import Path
 
 
 class _MeteredAdapter:
@@ -39,7 +41,9 @@ class _MeteredAdapter:
                     "data": {
                         "href": "https://metered.invalid/data.bin",
                         "size": len(self.payload),
-                        "checksum": f"sha256:{hashlib.sha256(self.payload).hexdigest()}",
+                        "checksum": (
+                            f"sha256:{hashlib.sha256(self.payload).hexdigest()}"
+                        ),
                     }
                 },
             },

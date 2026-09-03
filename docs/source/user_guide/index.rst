@@ -17,3 +17,4 @@ examples that describe many common tasks that you can accomplish with FanInSAR.
    query
    sampler
    dem
+   remote

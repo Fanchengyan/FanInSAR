@@ -640,7 +640,7 @@ class TestMosaicRecipe:
             "alos-dem": ("{path}", "none", "bilinear", None),
             "nasadem": ("{path}", "none", "bilinear", None),
             "nasadem:earthdata": ("/vsizip/{path}/{member}", "none", "bilinear", None),
-            "nisar-glo30": ("/vsizip/{path}/{member}", "none", "bilinear", None),
+            "nisar-glo30": ("{path}", "none", "bilinear", None),
         }
         for name, (gdal_open, warp, resampling, nodata) in expected.items():
             recipe = get_dem_source(name).mosaic_recipe()
