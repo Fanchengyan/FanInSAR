@@ -7,10 +7,12 @@ operations without introducing a second scientific object model.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib
 import inspect
 import json
+import netrc
 import os
 import re
 import tempfile
@@ -838,6 +840,27 @@ def _strip_redirect_credentials(
             del request.headers[name]
 
 
+def _netrc_authorization(url: str) -> str | None:
+    """Return a Basic authorization value from the user's netrc, if present.
+
+    ``urllib`` does not apply ``~/.netrc`` automatically (unlike ``requests``).
+    Earthdata providers commonly challenge after a redirect, so the matching
+    credential is attached only to the original host and is removed by the
+    redirect handler before any cross-origin request.
+    """
+    try:
+        host = urllib.parse.urlsplit(url).hostname
+        if not host:
+            return None
+        entry = netrc.netrc().authenticators(host)
+    except (OSError, netrc.NetrcParseError):
+        return None
+    if entry is None or entry[0] is None or entry[2] is None:
+        return None
+    token = f"{entry[0]}:{entry[2]}".encode()
+    return "Basic " + base64.b64encode(token).decode("ascii")
+
+
 class _RedirectHandler(urllib.request.HTTPRedirectHandler):
     """Follow only redirects admitted by a registered adapter policy."""
 
@@ -1182,7 +1205,15 @@ def _stream_download(
                 ledger.request()
                 ledger.begin_response()
                 request = urllib.request.Request(
-                    asset.href, headers={"Accept-Encoding": "identity"}
+                    asset.href,
+                    headers={
+                        "Accept-Encoding": "identity",
+                        **(
+                            {"Authorization": auth}
+                            if (auth := _netrc_authorization(asset.href))
+                            else {}
+                        ),
+                    },
                 )
                 with opener.open(
                     request, timeout=budget.read_timeout_seconds
