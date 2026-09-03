@@ -914,6 +914,13 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
             _fail(RemoteAccessError, "invalid_endpoint")
         if source_origin != target_origin:
             _strip_redirect_credentials(redirected)
+            # Re-apply only the target host's own netrc credential.  This is
+            # needed for Earthdata's cross-origin OAuth hop (data host ->
+            # urs.earthdata.nasa.gov) while preserving the no-credential-
+            # forwarding rule above.
+            auth = _netrc_authorization(target)
+            if auth is not None:
+                redirected.add_unredirected_header("Authorization", auth)
         return redirected
 
 
