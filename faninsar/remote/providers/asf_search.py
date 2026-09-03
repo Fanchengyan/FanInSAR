@@ -112,7 +112,17 @@ def _load_package(package: Any | None) -> Any:
 
 def _geometry_wkt(spatial: Any) -> str:
     """Translate a typed FanInSAR geometry into the package's private WKT input."""
+    from shapely.geometry.base import BaseGeometry
+
     from faninsar.remote import _query_geometry
+
+    if isinstance(spatial, BaseGeometry):
+        # ``remote.search`` has already projected the query to WGS84 before
+        # invoking adapters.  Preserve that normalized geometry instead of
+        # requiring the original typed query (and its CRS) a second time.
+        from shapely.wkt import dumps
+
+        return dumps(spatial, rounding_precision=8)
 
     geometry, _kind, _points = _query_geometry(spatial)
     from shapely.wkt import dumps
