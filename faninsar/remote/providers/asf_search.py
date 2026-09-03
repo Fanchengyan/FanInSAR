@@ -776,6 +776,11 @@ class ASFSearchAdapter:
                         record["collection"] = self.collection
                     if "provider" not in record and "Provider" not in record:
                         record["provider"] = self.provider
+                    # ASF product payloads often expose a short name such as
+                    # ``S1-SLC``.  Normalize against the API concept ID, then
+                    # restore the user-facing scientific identity below.
+                    if "GranuleUR" in record or "DataGranule" in record:
+                        record["collection"] = self.query_collection
                     if isinstance(record.get("assets"), Mapping):
                         yield record
                     else:
