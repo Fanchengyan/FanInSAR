@@ -724,7 +724,11 @@ class CMRCollectionAdapter:
     def _normalize(self, entry: Mapping[str, Any]) -> Mapping[str, Any]:
         """Normalize one compact or UMM granule into a remote record."""
         if isinstance(entry.get("umm"), Mapping):
-            entry = entry["umm"]
+            # CMR's UMM envelope keeps ``meta`` (including collection/provider
+            # concept identifiers) beside the nested UMM document.  Preserve the
+            # envelope while giving the UMM payload precedence for duplicate
+            # fields.
+            entry = {**entry, **entry["umm"]}
         is_umm = "GranuleUR" in entry or "DataGranule" in entry
         item_id = entry.get("id") if not is_umm else entry.get("GranuleUR")
         if not isinstance(item_id, str) or not item_id:

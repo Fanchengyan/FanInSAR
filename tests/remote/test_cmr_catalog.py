@@ -228,6 +228,11 @@ def test_official_umm_geometry_and_temporal_variants() -> None:
     assert record["geometry"]["coordinates"][0][-1] == [0.0, 0.0]
     assert record["acquisition"]["start"] == datetime(2024, 1, 1, tzinfo=UTC)
     assert record["acquisition"]["end"] == datetime(2024, 1, 2, tzinfo=UTC)
+    # Official CMR responses wrap UMM and ``meta`` as sibling fields.
+    enveloped = adapter._normalize(
+        {"meta": {"collection-concept-id": "C123"}, "umm": entry}
+    )
+    assert enveloped["collection"] == "provider-short-name"
 
 
 def test_compact_polygon_accepts_one_coordinate_string() -> None:
