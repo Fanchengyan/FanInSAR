@@ -300,6 +300,7 @@ class PlanetaryComputerAdapter:
         *,
         datetime_range: tuple[datetime, datetime] | None = None,
         filters: Mapping[str, Any] | None = None,
+        limit: int | None = None,
     ) -> Iterable[object]:
         """Search one WGS84 bbox through an instrumented STAC client."""
         if ledger is None:
@@ -316,7 +317,9 @@ class PlanetaryComputerAdapter:
         parameters: dict[str, Any] = {
             "collections": [self.collection],
             "bbox": bbox,
-            "max_items": ledger.budget.max_items,
+            "max_items": min(limit, ledger.budget.max_items)
+            if limit is not None
+            else ledger.budget.max_items,
         }
         if datetime_range is not None:
             parameters["datetime"] = "/".join(
@@ -392,6 +395,7 @@ class PlanetaryComputerAdapter:
         spatial: Any | None = None,
         datetime_range: tuple[datetime, datetime] | None = None,
         filters: Mapping[str, Any] | None = None,
+        limit: int | None = None,
     ) -> Iterable[Mapping[str, Any]]:
         """Yield normalized PC records, signing each item in memory."""
         if spatial is None:
@@ -411,6 +415,7 @@ class PlanetaryComputerAdapter:
             ledger=ledger,
             datetime_range=datetime_range,
             filters=filters,
+            limit=limit,
         )
 
     def search(
@@ -420,6 +425,7 @@ class PlanetaryComputerAdapter:
         ledger: _CallLedger | None = None,
         datetime_range: tuple[datetime, datetime] | None = None,
         filters: Mapping[str, Any] | None = None,
+        limit: int | None = None,
     ) -> list[Mapping[str, Any]]:
         """Discover one WGS84 bbox and return provider-neutral records."""
         records: list[Mapping[str, Any]] = []
@@ -428,6 +434,7 @@ class PlanetaryComputerAdapter:
             ledger,
             datetime_range=datetime_range,
             filters=filters,
+            limit=limit,
         )
         try:
             for raw_item in item_stream:
