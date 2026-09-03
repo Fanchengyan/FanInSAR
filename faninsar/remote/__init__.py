@@ -606,9 +606,11 @@ def _adapter_items(
         "budget": budget,
         "ledger": ledger,
     }
-    kwargs = values if accepts_any else {
-        name: value for name, value in values.items() if name in parameters
-    }
+    kwargs = (
+        values
+        if accepts_any
+        else {name: value for name, value in values.items() if name in parameters}
+    )
     if "ledger" not in kwargs:
         # P0044 adapters predate the private ledger keyword.  Their one
         # catalog operation still receives a conservative request charge.

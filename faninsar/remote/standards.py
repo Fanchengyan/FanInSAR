@@ -64,9 +64,7 @@ _INPUT_EXTENSION_URLS = {
     # This is the projection extension URI used by current Planetary
     # Computer STAC 1.0 responses.  No other legacy or arbitrary extension
     # URI is admitted.
-    "https://stac-extensions.github.io/projection/v1.0.0/schema.json": (
-        "projection"
-    ),
+    "https://stac-extensions.github.io/projection/v1.0.0/schema.json": ("projection"),
 }
 
 _PREFIX_TO_PROFILE = {
@@ -153,9 +151,7 @@ def _scrub_signed(value: Any) -> Any:
         if parsed.scheme and parsed.netloc:
             query = parse_qsl(parsed.query, keep_blank_values=True)
             if any(key.lower() in _SIGNED_QUERY_KEYS for key, _ in query):
-                return urlunsplit(
-                    (parsed.scheme, parsed.netloc, parsed.path, "", "")
-                )
+                return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
     return value
 
 
