@@ -431,6 +431,16 @@ class PlanetaryComputerAdapter:
         )
         try:
             for raw_item in item_stream:
+                raw_mapping = dict(_as_mapping(raw_item))
+                # Validate the provider response before invoking an optional
+                # signer.  This keeps malformed identity/asset failures typed
+                # even when the signer only accepts fully formed STAC items.
+                normalize_stac_item(
+                    raw_mapping,
+                    provider=self.provider,
+                    catalog=self.provider,
+                    collection=self.collection,
+                )
                 item = self._sign_item(raw_item)
                 item_mapping = dict(_as_mapping(item))
                 item_id = item_mapping.get("id")
