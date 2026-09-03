@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -51,12 +52,14 @@ class _Client:
     def __init__(self, item: _Item) -> None:
         self.item = item
         self.bboxes: list[list[float]] = []
+        self.search_kwargs: dict[str, object] = {}
 
     def search(
         self, *, collections: list[str], bbox: list[float], **_kwargs: object
     ) -> _Search:
         assert collections == [COP_DEM_GLO30_COLLECTION]
         self.bboxes.append(bbox)
+        self.search_kwargs = {"collections": collections, "bbox": bbox, **_kwargs}
         return _Search(self.item)
 
 
@@ -107,6 +110,21 @@ def test_planetary_computer_is_registered_with_remote_boundary() -> None:
     found = remote.search(BoundingBox(-1, -1, 1, 1, crs=4326), catalog="pc-task-c")
     assert found[0].provider == "pc"
     assert found[0].assets["data"].href.endswith("tile.tif")
+
+
+def test_planetary_computer_propagates_query_budget_to_stac_client() -> None:
+    """The typed query limit and datetime interval reach STAC discovery."""
+    client = _Client(_item())
+    adapter = PlanetaryComputerAdapter(client=client, signer=lambda value: value)
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 1, 3, tzinfo=UTC)
+
+    list(adapter.items(limit=3, datetime_range=(start, end)))
+
+    assert client.search_kwargs["max_items"] == 3
+    assert client.search_kwargs["datetime"] == (
+        "2024-01-01T00:00:00+00:00/2024-01-03T00:00:00+00:00"
+    )
 
 
 class _Response:
