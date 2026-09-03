@@ -17,6 +17,7 @@ from faninsar.query import BoundingBox
 from faninsar.remote.providers.planetary_computer import (
     COP_DEM_GLO30_COLLECTION,
     PlanetaryComputerAdapter,
+    _instrument_session,
 )
 from faninsar.remote.standards import MalformedSTACItemError
 
@@ -125,6 +126,47 @@ def test_planetary_computer_propagates_query_budget_to_stac_client() -> None:
     assert client.search_kwargs["datetime"] == (
         "2024-01-01T00:00:00+00:00/2024-01-03T00:00:00+00:00"
     )
+
+
+class _StacResponse:
+    headers = {"Content-Encoding": "identity"}
+
+    def __init__(self, content: bytes, history: tuple[_StacResponse, ...] = ()) -> None:
+        self.content = content
+        self.history = history
+
+
+class _StacSession:
+    def __init__(self, response: _StacResponse) -> None:
+        self.response = response
+
+    def send(self, _request: object, **_kwargs: object) -> _StacResponse:
+        return self.response
+
+
+def test_planetary_computer_stac_transport_meters_response_history() -> None:
+    """Discovery transport charges responses and returned redirect history."""
+    redirected = _StacResponse(b"redirect")
+    response = _StacResponse(b"final", history=(redirected,))
+    session = _StacSession(response)
+    budget = remote.RemoteResourceBudget()
+    ledger = remote._CallLedger(budget)
+    adapter = PlanetaryComputerAdapter(signer=lambda value: value)
+
+    restore = _instrument_session(session, ledger, adapter)
+    try:
+        request = type(
+            "Request",
+            (),
+            {"url": "https://planetarycomputer.microsoft.com/api/stac/v1"},
+        )()
+        session.send(request)
+    finally:
+        restore()
+
+    assert ledger.requests == 2
+    assert ledger.redirects == 1
+    assert ledger.response_bytes_total == len(b"redirectfinal")
 
 
 class _Response:

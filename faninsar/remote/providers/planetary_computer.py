@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -97,6 +98,8 @@ def _signed_href(item: object, key: str) -> str:
 
 def _meter_response(response: Any, ledger: _CallLedger) -> None:
     """Charge one requests response, including its already-loaded body."""
+    if getattr(response, "_faninsar_metered", False):
+        return
     if response.headers.get("Content-Encoding", "identity") != "identity":
         _fail(RemoteAccessError, "unexpected_content_encoding")
     try:
@@ -108,6 +111,11 @@ def _meter_response(response: Any, ledger: _CallLedger) -> None:
         _fail(RemoteAccessError, "unobservable_response")
     ledger.begin_response()
     ledger.response_bytes(len(content))
+    with suppress(AttributeError, TypeError):
+        # A requests.Response accepts arbitrary attributes.  Test doubles
+        # with slots do not, but their response is still fully metered for
+        # this invocation.
+        response._faninsar_metered = True
 
 
 def _instrument_session(
@@ -137,14 +145,22 @@ def _instrument_session(
         url = getattr(request, "url", "")
         _safe_url(str(url), adapter)
         ledger.check_elapsed()
+        requests_before = ledger.requests
         ledger.request()
         response = previous_send(request, *args, **kwargs)
         history = getattr(response, "history", ())
-        if isinstance(history, Iterable):
-            for previous in history:
-                ledger.redirect()
-                ledger.request()
-                _meter_response(previous, ledger)
+        history_values = list(history) if isinstance(history, Iterable) else []
+        # Real requests recursively calls this wrapped ``send`` for each
+        # redirect, so those requests are already charged by nested wrappers.
+        # Fixture transports may instead return a complete ``history`` list;
+        # charge only the redirect entries that were not observed recursively.
+        nested_requests = ledger.requests - requests_before - 1
+        missing_redirects = max(0, len(history_values) - nested_requests)
+        for _ in range(missing_redirects):
+            ledger.redirect()
+            ledger.request()
+        for previous in history_values:
+            _meter_response(previous, ledger)
         _meter_response(response, ledger)
         ledger.check_elapsed()
         return response
