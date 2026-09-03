@@ -13,7 +13,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -100,8 +100,17 @@ def _geometry_from_umm(record: Mapping[str, Any]) -> Mapping[str, Any] | None:  
     geometry = domain.get("Geometry")
     if not isinstance(geometry, Mapping):
         return None
+    polygons: list[Mapping[str, Any]] = []
     polygon = geometry.get("GPolygon")
     if isinstance(polygon, Mapping):
+        polygons.append(polygon)
+    polygon_values = geometry.get("GPolygons")
+    if isinstance(polygon_values, Mapping):
+        polygons.append(polygon_values)
+    elif isinstance(polygon_values, list):
+        polygons.extend(value for value in polygon_values if isinstance(value, Mapping))
+    rings: list[list[list[float]]] = []
+    for polygon in polygons:
         boundary = polygon.get("Boundary")
         points = boundary.get("Points") if isinstance(boundary, Mapping) else None
         if isinstance(points, list):
@@ -110,7 +119,9 @@ def _geometry_from_umm(record: Mapping[str, Any]) -> Mapping[str, Any] | None:  
             if len(coords) >= 3:
                 if coords[0] != coords[-1]:
                     coords.append(coords[0])
-                return {"type": "Polygon", "coordinates": [coords]}
+                rings.append(coords)
+    if rings:
+        return {"type": "Polygon", "coordinates": rings}
     mbr = geometry.get("BoundingRect")
     if isinstance(mbr, Mapping):
         try:
@@ -160,28 +171,68 @@ def _geometry_from_cmr(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
                     ]
                 ],
             }
+    if isinstance(polygons, str):
+        polygons = [polygons]
     if not isinstance(polygons, list) or not polygons:
         return None
     rings: list[list[list[float]]] = []
     for polygon in polygons:
-        if not isinstance(polygon, (list, tuple)):
+        if isinstance(polygon, str):
+            # FedSearch compact polygons are sometimes encoded as one
+            # whitespace/comma-delimited latitude/longitude string rather
+            # than a list of point strings.
+            values = [value for value in re.split(r"[,\s]+", polygon.strip()) if value]
+            if len(values) < 6 or len(values) % 2:
+                continue
+            try:
+                pairs = [
+                    (float(values[index]), float(values[index + 1]))
+                    for index in range(0, len(values), 2)
+                ]
+            except ValueError:
+                continue
+            ring = [[longitude, latitude] for latitude, longitude in pairs]
+        elif isinstance(polygon, (list, tuple)):
+            # A flat numeric list is another compact CMR representation.
+            if polygon and all(
+                isinstance(point, (int, float)) and not isinstance(point, bool)
+                for point in polygon
+            ):
+                values = [str(value) for value in polygon]
+                if len(values) < 6 or len(values) % 2:
+                    continue
+                try:
+                    pairs = [
+                        (float(values[index]), float(values[index + 1]))
+                        for index in range(0, len(values), 2)
+                    ]
+                except ValueError:
+                    continue
+                ring = [[longitude, latitude] for latitude, longitude in pairs]
+            else:
+                ring = []
+                for point in polygon:
+                    if isinstance(point, str):
+                        values = [
+                            value
+                            for value in re.split(r"[,\s]+", point.strip())
+                            if value
+                        ]
+                        if len(values) != 2:
+                            continue
+                        try:
+                            latitude, longitude = (float(value) for value in values)
+                        except ValueError:
+                            continue
+                        ring.append([longitude, latitude])
+                    elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                        try:
+                            # CMR compact polygons are latitude/longitude pairs.
+                            ring.append([float(point[1]), float(point[0])])
+                        except (ValueError, TypeError):
+                            continue
+        else:
             continue
-        ring: list[list[float]] = []
-        for point in polygon:
-            if isinstance(point, str):
-                try:
-                    latitude, longitude = (
-                        float(value) for value in point.replace(",", " ").split()
-                    )
-                except (ValueError, TypeError):
-                    continue
-                ring.append([longitude, latitude])
-            elif isinstance(point, (list, tuple)) and len(point) >= 2:
-                try:
-                    # CMR compact polygons are latitude/longitude pairs.
-                    ring.append([float(point[1]), float(point[0])])
-                except (ValueError, TypeError):
-                    continue
         if len(ring) >= 3:
             if ring[0] != ring[-1]:
                 ring.append(ring[0])
@@ -193,7 +244,9 @@ def _geometry_from_cmr(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
 
 def _umm_times(record: Mapping[str, Any]) -> tuple[datetime | None, datetime | None]:
     """Extract start/end from a UMM temporal extent."""
-    temporal = record.get("TemporalExtents")
+    temporal = record.get("TemporalExtents", record.get("TemporalExtent"))
+    if isinstance(temporal, Mapping):
+        temporal = [temporal]
     if not isinstance(temporal, list) or not temporal:
         return None, None
     extent = temporal[0]
@@ -235,8 +288,19 @@ def _cmr_links(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     for link in links:
         if not isinstance(link, Mapping) or not isinstance(link.get("href"), str):
             continue
-        rel = str(link.get("rel", "")).lower()
-        if rel.startswith("data") or rel in {"enclosure", "download"}:
+        rel = str(link.get("rel", "")).strip().lower()
+        # FedSearch uses a URI such as
+        # ``http://esipfed.org/ns/fedsearch/1.1/data#``.  Prefix matching
+        # would also admit browse/service links, which are not data assets.
+        if (
+            rel == "data#"
+            or rel.endswith("/data#")
+            or rel
+            in {
+                "enclosure",
+                "download",
+            }
+        ):
             selected.append(link)
     return selected
 
@@ -302,11 +366,54 @@ def _cmr_collection_parameters(
     # CMR concept identifiers are conventionally C-prefixed.  Other
     # collection identities are short names; retaining this distinction avoids
     # accidentally treating a provider's human-readable name as an ID.
-    if all(re.fullmatch(r"C\d+", value, re.IGNORECASE) for value in selected):
+    if all(_is_concept_id(value) for value in selected):
         return {"collection_concept_id": ",".join(selected)}
     if collections is None and collection_concept_id:
         return {"collection_concept_id": collection_concept_id}
     return {"short_name": ",".join(selected)}
+
+
+def _is_concept_id(value: str) -> bool:
+    """Return whether a CMR collection value has concept-id syntax."""
+    return re.fullmatch(r"C\d+(?:-[A-Za-z0-9_-]+)?", value, re.IGNORECASE) is not None
+
+
+def _metadata_values(record: Mapping[str, Any], *names: str) -> list[str]:
+    """Collect non-empty scalar values from a record and its CMR metadata."""
+    values: list[str] = []
+    metadata = record.get("meta")
+    mappings = [record, metadata] if isinstance(metadata, Mapping) else [record]
+    for source in mappings:
+        for name in names:
+            value = source.get(name)
+            if isinstance(value, str) and value.strip():
+                values.append(value.strip())
+    return values
+
+
+def _collection_claims(
+    record: Mapping[str, Any], *, is_umm: bool
+) -> tuple[list[str], list[str]]:
+    """Return explicit collection concept and human-readable identity claims."""
+    concepts = _metadata_values(
+        record,
+        "collection_concept_id",
+        "collection-concept-id",
+        "CollectionConceptId",
+        "collectionConceptId",
+    )
+    identities = _metadata_values(record, "collection", "short_name", "ShortName")
+    if is_umm:
+        reference = record.get("CollectionReference")
+        if isinstance(reference, Mapping):
+            concept = reference.get("CollectionConceptId")
+            if isinstance(concept, str) and concept.strip():
+                concepts.append(concept.strip())
+            for key in ("ShortName", "EntryTitle"):
+                value = reference.get(key)
+                if isinstance(value, str) and value.strip():
+                    identities.append(value.strip())
+    return concepts, identities
 
 
 @dataclass(slots=True)
@@ -328,6 +435,11 @@ class CMRCollectionAdapter:
         Maximum pages consumed by one search operation.
     collection_concept_id : str, optional
         CMR concept id used as an additional server-side collection filter.
+    profiles : sequence of str, default=("anonymous",)
+        Authentication profile names accepted by this registration.
+    auth_resolver : callable, optional
+        Operation-scoped callback receiving a profile name and returning
+        transient request headers.  Resolved values are never persisted.
 
     """
 
@@ -345,6 +457,7 @@ class CMRCollectionAdapter:
     path_prefixes: tuple[str, ...] = field(init=False)
     redirect_origins: tuple[str, ...] = field(init=False)
     profiles: tuple[str, ...] = ("anonymous",)
+    auth_resolver: Callable[[str], Mapping[str, str] | None] | None = None
 
     def __post_init__(self) -> None:
         """Validate collection identity and configure endpoint allowlists."""
@@ -365,6 +478,15 @@ class CMRCollectionAdapter:
                 CMRRegistrationError,
                 "invalid_pagination",
                 "page_size and max_pages must be positive",
+            )
+        if not self.profiles or any(
+            not isinstance(profile, str) or not profile.strip()
+            for profile in self.profiles
+        ):
+            _error(
+                CMRRegistrationError,
+                "invalid_auth_profiles",
+                "auth profiles must contain non-empty names",
             )
         try:
             parsed = urllib.parse.urlsplit(self.endpoint)
@@ -416,6 +538,45 @@ class CMRCollectionAdapter:
             "redirect_origins",
             (_origin(self.endpoint), *self.data_origins),
         )
+
+    def _auth_headers(self, profile: str) -> Mapping[str, str]:
+        """Resolve one profile into transient request headers.
+
+        The resolver runs once per operation.  Its result is retained only in
+        the local iterator state and is never included in normalized records,
+        exceptions, or logs.
+        """
+        if profile not in self.profiles:
+            _error(
+                CMRRegistrationError,
+                "unknown_auth_profile",
+                "unknown CMR auth profile",
+            )
+        if self.auth_resolver is None:
+            return {}
+        try:
+            resolved = self.auth_resolver(profile)
+        except Exception:
+            # Resolver exceptions may contain credential material.  Keep the
+            # diagnostic deliberately generic and never stringify the cause.
+            logger.warning("CMR auth profile resolution failed")
+            _error(
+                CMRDiscoveryError,
+                "auth_resolution_failed",
+                "CMR auth profile could not be resolved",
+            )
+        if resolved is None:
+            return {}
+        if not isinstance(resolved, Mapping) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in resolved.items()
+        ):
+            _error(
+                CMRDiscoveryError,
+                "auth_resolution_failed",
+                "CMR auth resolver must return string headers",
+            )
+        return dict(resolved)
 
     def _request_page(
         self, url: str, headers: Mapping[str, str], ledger: _CallLedger
@@ -489,6 +650,7 @@ class CMRCollectionAdapter:
         datetime_range: tuple[datetime, datetime] | None = None,
         collections: tuple[str, ...] | None = None,
         limit: int | None = None,
+        request_headers: Mapping[str, str] | None = None,
     ) -> Iterator[Mapping[str, Any]]:
         """Yield CMR granule mappings while following Search-After."""
         page_size = min(
@@ -515,9 +677,10 @@ class CMRCollectionAdapter:
         for _ in range(self.max_pages):
             query = urllib.parse.urlencode(params)
             url = f"{self.endpoint}?{query}"
-            response, response_headers = self._request_page(
-                url, {"CMR-Search-After": search_after} if search_after else {}, ledger
-            )
+            page_headers = dict(request_headers or {})
+            if search_after:
+                page_headers["CMR-Search-After"] = search_after
+            response, response_headers = self._request_page(url, page_headers, ledger)
             entries = (
                 response.get("feed", {}).get("entry", [])
                 if isinstance(response.get("feed"), Mapping)
@@ -561,26 +724,42 @@ class CMRCollectionAdapter:
         item_id = entry.get("id") if not is_umm else entry.get("GranuleUR")
         if not isinstance(item_id, str) or not item_id:
             _error(CMRDiscoveryError, "invalid_item_id", "CMR granule has no stable id")
-        claimed_provider = entry.get("provider") or entry.get("Provider")
-        if claimed_provider is not None and str(claimed_provider) != self.provider:
+        provider_claims = _metadata_values(
+            entry, "provider", "Provider", "provider_id", "provider-id", "ProviderId"
+        )
+        if provider_claims and any(
+            claim.casefold() != self.provider.casefold() for claim in provider_claims
+        ):
             _error(
                 CMRDiscoveryError,
                 "provider_mismatch",
                 f"granule {item_id!r} is not from registered provider",
             )
-        claimed = entry.get("collection_concept_id") or entry.get("collection")
-        if is_umm:
-            reference = entry.get("CollectionReference")
-            if isinstance(reference, Mapping):
-                claimed = (
-                    reference.get("ShortName")
-                    or reference.get("EntryTitle")
-                    or reference.get("CollectionConceptId")
-                )
-        if claimed is not None and str(claimed) not in {
-            self.collection,
-            self.collection_concept_id,
-        }:
+        concept_claims, identity_claims = _collection_claims(entry, is_umm=is_umm)
+        expected_concepts = {
+            value.casefold()
+            for value in (self.collection_concept_id, self.collection)
+            if isinstance(value, str) and _is_concept_id(value)
+        }
+        expected_identity = self.collection.casefold()
+        concept_matches = any(
+            claim.casefold() in expected_concepts for claim in concept_claims
+        )
+        # UMM commonly reports a concept id in ``meta`` while the
+        # CollectionReference.ShortName is a provider-specific alias.  Once
+        # an explicitly registered concept id matches, the alias is not a
+        # contradictory identity and must not reject the granule.
+        if expected_concepts and concept_claims and not concept_matches:
+            mismatch = True
+        elif concept_matches:
+            mismatch = False
+        elif identity_claims:
+            mismatch = all(
+                claim.casefold() != expected_identity for claim in identity_claims
+            )
+        else:
+            mismatch = False
+        if mismatch:
             _error(
                 CMRDiscoveryError,
                 "collection_mismatch",
@@ -700,7 +879,7 @@ class CMRCollectionAdapter:
                 "budget_mismatch",
                 "budget must match the supplied operation ledger",
             )
-        del auth_profile
+        request_headers = self._auth_headers(auth_profile)
         if limit <= 0:
             _error(CMRRegistrationError, "invalid_limit", "limit must be positive")
         for entry in self._pages(
@@ -711,6 +890,7 @@ class CMRCollectionAdapter:
             datetime_range=datetime_range,
             collections=collections,
             limit=limit,
+            request_headers=request_headers,
         ):
             yield self._normalize(entry)
 
@@ -776,10 +956,17 @@ def register_cmr_catalog(
     max_pages: int = 100,
     collection_concept_id: str | None = None,
     headers: Mapping[str, str] | None = None,
+    profiles: Sequence[str] = ("anonymous",),
+    auth_resolver: Callable[[str], Mapping[str, str] | None] | None = None,
     data_origins: tuple[str, ...] = (),
     data_path_prefixes: tuple[str, ...] = ("/",),
 ) -> CMRCollectionAdapter:
-    """Register one CMR collection in the private remote adapter registry."""
+    """Register one CMR collection in the private remote adapter registry.
+
+    ``auth_resolver`` is invoked only when an operation selects one of the
+    registered ``profiles``.  Credentials therefore remain in the caller's
+    resolver and transient request state rather than in the catalog registry.
+    """
     adapter = CMRCollectionAdapter(
         provider=provider,
         collection=collection,
@@ -788,6 +975,8 @@ def register_cmr_catalog(
         max_pages=max_pages,
         collection_concept_id=collection_concept_id,
         headers=headers or {},
+        profiles=tuple(profiles),
+        auth_resolver=auth_resolver,
         data_origins=data_origins,
         data_path_prefixes=data_path_prefixes,
     )
