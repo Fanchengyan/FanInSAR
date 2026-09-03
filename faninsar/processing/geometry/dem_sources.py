@@ -327,8 +327,12 @@ _PGC_MOSAIC_RECIPE = MosaicRecipe(
     nodata=-9999.0,
 )
 
-#: NISAR Mission Modified Copernicus granules are zips opened per-member.
-_NISAR_MOSAIC_RECIPE = MosaicRecipe(gdal_open="/vsizip/{path}/{member}")
+#: NISAR Mission Modified Copernicus assets are native WGS84 COGs.
+_NISAR_MOSAIC_RECIPE = MosaicRecipe(
+    gdal_open="{path}",
+    source_crs="EPSG:4326",
+    warp_target="none",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1060,7 +1064,7 @@ class AuthenticatedGranuleSource(DemSource):
             entries = [
                 entry
                 for entry in entries
-                if str(entry.get("title", "")).startswith("EPSG4326")
+                if "EPSG4326" in str(entry.get("title", "")).upper()
                 and "-vrt" not in str(entry.get("title", ""))
             ]
         return entries
@@ -1071,15 +1075,18 @@ class AuthenticatedGranuleSource(DemSource):
         for link in granule.get("links", []):
             href = str(link.get("href", ""))
             rel = str(link.get("rel", ""))
+            path = urllib.parse.urlsplit(href).path
             if rel.endswith("#data") and fnmatch.fnmatch(
-                href, f"*{self.asset_pattern}"
+                path, f"*{self.asset_pattern}"
             ):
                 urls.append(href)
         return urls
 
     def mosaic_recipe(self) -> MosaicRecipe:
-        """Granules are zips opened per-member through /vsizip/."""
-        return MosaicRecipe(gdal_open="/vsizip/{path}/{member}")
+        """Return the source-native archive or COG opening recipe."""
+        if self.asset_pattern.lower().endswith(".zip"):
+            return MosaicRecipe(gdal_open="/vsizip/{path}/{member}")
+        return MosaicRecipe(gdal_open="{path}", source_crs="EPSG:4326")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1440,6 +1447,9 @@ def _build_registry() -> dict[str, DemSource]:
         auth="token",
         wired=True,
         cmr_collection="C3803703055-ASF",
+        data_host="nisar.asf.earthdatacloud.nasa.gov",
+        asset_pattern="*.tif",
+        title_filter_required=True,
         mosaic_recipe_override=_NISAR_MOSAIC_RECIPE,
     )
 

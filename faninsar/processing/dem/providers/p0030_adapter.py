@@ -240,6 +240,33 @@ def _materialize_entry(
     )
 
 
+def _resolve_entry(source: _P0030Source) -> DemSource:
+    """Resolve one admitted product/provider pair to its registry entry.
+
+    The source adapter deliberately resolves by the canonical compound
+    selection rather than guessing a product's default provider.  This keeps
+    the P0030 ``auto``/datum/cache behavior intact while making the explicit
+    LPDAAC ZIP and ASF WGS84 COG product lanes unambiguous.
+    """
+    from faninsar.processing.geometry.dem_sources import get_dem_source
+
+    try:
+        entry = get_dem_source(source.collection_id)
+    except (KeyError, TypeError, ValueError) as error:
+        message = f"DEM provider selection is unavailable: {source.collection_id!r}"
+        logger.exception(message)
+        raise RuntimeError(message) from error
+    if entry.product != source.product or entry.provider != source.provider:
+        message = (
+            "DEM provider selection resolved to a different product/provider: "
+            f"requested {source.collection_id!r}, got {entry.product!r}:"
+            f"{entry.provider!r}"
+        )
+        logger.error(message)
+        raise RuntimeError(message)
+    return entry
+
+
 def _materialize_auto(
     grid: GridSpec,
     *,
@@ -328,12 +355,10 @@ def materialize(
     budget: ResourceBudget | None = None,
 ) -> RasterDEM:
     """Materialize one registered P0030 source without the legacy manager."""
-    from faninsar.processing.geometry.dem_sources import get_dem_source
-
     if source.product == "auto":
         return _materialize_auto(grid, cache_dir=Path(cache_dir), budget=budget)
     return _materialize_entry(
-        get_dem_source(source.collection_id),
+        _resolve_entry(source),
         _bounds(grid),
         grid,
         cache_dir=Path(cache_dir),
