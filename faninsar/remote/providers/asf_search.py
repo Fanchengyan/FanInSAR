@@ -741,7 +741,7 @@ class ASFSearchAdapter:
                 )
             normalizer = CMRCollectionAdapter(
                 provider=self.provider,
-                collection=self.collection,
+                collection=self.query_collection,
                 endpoint=self.endpoint,
                 data_origins=self.data_origins,
                 data_path_prefixes=self.path_prefixes,
@@ -779,7 +779,9 @@ class ASFSearchAdapter:
                     if isinstance(record.get("assets"), Mapping):
                         yield record
                     else:
-                        yield normalizer._normalize(record)
+                        normalized = normalizer._normalize(record)
+                        normalized["collection"] = self.collection
+                        yield normalized
                     produced += 1
             if saw_page and not last_page_complete:
                 _error(
