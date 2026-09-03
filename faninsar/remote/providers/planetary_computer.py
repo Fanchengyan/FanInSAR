@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from faninsar.logging import setup_logger
@@ -26,6 +27,7 @@ from faninsar.remote import (
     _register_adapter,
     _safe_url,
 )
+from faninsar.remote.standards import MalformedSTACItemError, normalize_stac_item
 
 logger = setup_logger(__name__)
 
@@ -72,6 +74,12 @@ def _as_mapping(item: object) -> Mapping[str, Any]:
         "properties": dict(getattr(item, "properties", {}) or {}),
         "assets": normalized_assets,
     }
+    stac_version = getattr(item, "stac_version", None)
+    if stac_version is not None:
+        result["stac_version"] = str(stac_version)
+    stac_extensions = getattr(item, "stac_extensions", None)
+    if stac_extensions is not None:
+        result["stac_extensions"] = list(stac_extensions)
     if collection is not None:
         result["collection"] = str(collection)
     return result
@@ -85,6 +93,74 @@ def _signed_href(item: object, key: str) -> str:
     assets = getattr(item, "assets", {})
     asset = assets.get(key)
     return str(getattr(asset, "href", ""))
+
+
+def _meter_response(response: Any, ledger: _CallLedger) -> None:
+    """Charge one requests response, including its already-loaded body."""
+    if response.headers.get("Content-Encoding", "identity") != "identity":
+        _fail(RemoteAccessError, "unexpected_content_encoding")
+    try:
+        content = response.content
+    except Exception as error:
+        logger.exception("Planetary Computer STAC response is unreadable")
+        _fail(RemoteAccessError, "unobservable_response", str(error))
+    if not isinstance(content, (bytes, bytearray)):
+        _fail(RemoteAccessError, "unobservable_response")
+    ledger.begin_response()
+    ledger.response_bytes(len(content))
+
+
+def _instrument_session(
+    session: Any,
+    ledger: _CallLedger,
+    adapter: PlanetaryComputerAdapter,
+) -> Callable[[], None]:
+    """Instrument one operation-scoped requests-like session.
+
+    ``pystac-client`` uses ``requests.Session.send`` after preparing each
+    STAC request.  Wrapping that concrete boundary lets the remote operation
+    account for the request, redirect, response-byte, and elapsed-time
+    portions that are otherwise invisible to the provider-neutral ledger.
+    Retries are disabled on the operation session by the caller; this keeps
+    retry accounting from occurring inside urllib3 without an observable
+    boundary.
+    """
+    send = getattr(session, "send", None)
+    if not callable(send):
+        message = "Planetary Computer STAC session cannot be instrumented"
+        logger.error(message)
+        _fail(RemoteAccessError, "unobservable_discovery", message)
+    previous_send = send
+
+    def metered_send(request: Any, *args: Any, **kwargs: Any) -> Any:
+        """Meter one requests send and every response in its redirect chain."""
+        url = getattr(request, "url", "")
+        _safe_url(str(url), adapter)
+        ledger.check_elapsed()
+        ledger.request()
+        response = previous_send(request, *args, **kwargs)
+        history = getattr(response, "history", ())
+        if isinstance(history, Iterable):
+            for previous in history:
+                ledger.redirect()
+                ledger.request()
+                _meter_response(previous, ledger)
+        _meter_response(response, ledger)
+        ledger.check_elapsed()
+        return response
+
+    try:
+        session.send = metered_send
+    except (AttributeError, TypeError) as error:
+        message = "Planetary Computer STAC session cannot be instrumented"
+        logger.exception(message)
+        _fail(RemoteAccessError, "unobservable_discovery", str(error))
+
+    def restore() -> None:
+        """Restore the caller-owned session after the operation."""
+        session.send = previous_send
+
+    return restore
 
 
 @dataclass(slots=True)
@@ -128,16 +204,13 @@ class PlanetaryComputerAdapter:
             (_origin(self.endpoint), f"https://{PC_ASSET_HOST}"),
         )
         object.__setattr__(self, "redirect_origins", self.origins)
-        object.__setattr__(
-            self, "path_prefixes", (parts.path.rstrip("/") or "/", "/")
-        )
+        object.__setattr__(self, "path_prefixes", (parts.path.rstrip("/") or "/", "/"))
         if (
             self.collection != COP_DEM_GLO30_COLLECTION
             or self.asset_key != PC_ASSET_KEY
         ):
             message = (
-                "Planetary Computer GLO-30 collection and asset are "
-                "registry-owned"
+                "Planetary Computer GLO-30 collection and asset are registry-owned"
             )
             logger.error(message)
             raise ValueError(message)
@@ -164,10 +237,27 @@ class PlanetaryComputerAdapter:
         signed = signer(item)
         return item if signed is None else signed
 
-    def _client(self) -> object:
-        """Return an injected or lazily-created STAC client."""
+    def _client(self, ledger: _CallLedger) -> tuple[object, Callable[[], None] | None]:
+        """Return a STAC client and cleanup callback for one operation.
+
+        Injected clients must expose their ``pystac-client`` ``_stac_io``
+        session so it can be instrumented.  A deterministic fixture may opt
+        into the explicit ``_faninsar_offline`` marker; such a client performs
+        no network I/O and therefore needs no fabricated request accounting.
+        """
         if self.client is not None:
-            return self.client
+            if getattr(self.client, "_faninsar_offline", False):
+                return self.client, None
+            stac_io = getattr(self.client, "_stac_io", None)
+            session = getattr(stac_io, "session", None)
+            if session is None:
+                message = (
+                    "injected Planetary Computer client has no observable "
+                    "STAC transport"
+                )
+                logger.error(message)
+                _fail(RemoteAccessError, "unobservable_discovery", message)
+            return self.client, _instrument_session(session, ledger, self)
         try:
             import pystac_client
         except ImportError as error:
@@ -177,19 +267,85 @@ class PlanetaryComputerAdapter:
                 _fail(RemoteAccessError, "missing_optional_dependency", message)
             except RemoteAccessError as raised:
                 raise raised from error
-        return pystac_client.Client.open(self.endpoint)
+        try:
+            from pystac_client.stac_api_io import StacApiIO
+
+            # urllib3 retries are intentionally disabled.  If retries are
+            # enabled internally, they cannot be charged at this boundary.
+            stac_io = StacApiIO(
+                timeout=(
+                    ledger.budget.connect_timeout_seconds,
+                    ledger.budget.read_timeout_seconds,
+                ),
+                max_retries=0,
+            )
+            restore = _instrument_session(stac_io.session, ledger, self)
+            try:
+                client = pystac_client.Client.open(self.endpoint, stac_io=stac_io)
+            except Exception:
+                restore()
+                stac_io.session.close()
+                raise
+        except RemoteAccessError:
+            raise
+        except Exception as error:
+            logger.exception("Planetary Computer STAC client initialization failed")
+            _fail(RemoteAccessError, "request_failed", str(error))
+        return client, lambda: (restore(), stac_io.session.close())
 
     def _search_items(
-        self, bbox: list[float], ledger: _CallLedger | None
+        self,
+        bbox: list[float],
+        ledger: _CallLedger | None,
+        *,
+        datetime_range: tuple[datetime, datetime] | None = None,
+        filters: Mapping[str, Any] | None = None,
     ) -> Iterable[object]:
-        """Search one WGS84 bbox through an injected or HTTP STAC client."""
-        client = self._client()
+        """Search one WGS84 bbox through an instrumented STAC client."""
+        if ledger is None:
+            ledger = _CallLedger(RemoteResourceBudget())
+        client, restore = self._client(ledger)
         search = getattr(client, "search", None)
-        if callable(search):
-            result = search(collections=[self.collection], bbox=bbox)
+        if not callable(search):
+            if restore is not None:
+                restore()
+            message = "Planetary Computer client exposes no search method"
+            logger.error(message)
+            _fail(RemoteAccessError, "unobservable_discovery", message)
+
+        parameters: dict[str, Any] = {
+            "collections": [self.collection],
+            "bbox": bbox,
+            "max_items": ledger.budget.max_items,
+        }
+        if datetime_range is not None:
+            parameters["datetime"] = "/".join(
+                value.astimezone(UTC).isoformat() for value in datetime_range
+            )
+        if filters:
+            parameters["query"] = dict(filters)
+        try:
+            result = search(**parameters)
             items = getattr(result, "items", None)
-            return items() if callable(items) else result
-        return self._http_items(bbox, ledger)
+            values = items() if callable(items) else result
+            if values is None or isinstance(values, (str, bytes, Mapping)):
+                message = "Planetary Computer search returned no item iterator"
+                logger.error(message)
+                _fail(RemoteAccessError, "unobservable_discovery", message)
+            try:
+                yield from values
+            finally:
+                if restore is not None:
+                    restore()
+        except RemoteAccessError:
+            if restore is not None:
+                restore()
+            raise
+        except Exception as error:
+            if restore is not None:
+                restore()
+            logger.exception("Planetary Computer STAC search failed")
+            _fail(RemoteAccessError, "request_failed", str(error))
 
     def _http_items(
         self, bbox: list[float], ledger: _CallLedger | None
@@ -207,9 +363,7 @@ class PlanetaryComputerAdapter:
         if ledger is None:
             ledger = _CallLedger(RemoteResourceBudget())
         ledger.request()
-        request = urllib.request.Request(
-            url, headers={"Accept-Encoding": "identity"}
-        )
+        request = urllib.request.Request(url, headers={"Accept-Encoding": "identity"})
         opener = urllib.request.build_opener(
             _RedirectHandler(self, ledger.budget, ledger)
         )
@@ -232,40 +386,106 @@ class PlanetaryComputerAdapter:
         return features if isinstance(features, list) else ()
 
     def items(
-        self, *, ledger: _CallLedger | None = None
+        self,
+        *,
+        ledger: _CallLedger | None = None,
+        spatial: Any | None = None,
+        datetime_range: tuple[datetime, datetime] | None = None,
+        filters: Mapping[str, Any] | None = None,
     ) -> Iterable[Mapping[str, Any]]:
         """Yield normalized PC records, signing each item in memory."""
-        # ``remote.search`` supplies no spatial bbox to this adapter protocol;
-        # callers that need spatially narrow discovery should use ``search``.
-        return self.search((-180.0, -90.0, 180.0, 90.0), ledger=ledger)
+        if spatial is None:
+            bounds = (-180.0, -90.0, 180.0, 90.0)
+        # The public boundary passes its already-projected Shapely query
+        # geometry.  Keep compatibility with direct adapter callers that
+        # still provide a FanInSAR query object.
+        elif hasattr(spatial, "bounds") and not hasattr(spatial, "crs"):
+            bounds = spatial.bounds
+        else:
+            from faninsar.remote import _query_geometry
+
+            geometry, _kind, _points = _query_geometry(spatial)
+            bounds = geometry.bounds
+        return self.search(
+            bounds,
+            ledger=ledger,
+            datetime_range=datetime_range,
+            filters=filters,
+        )
 
     def search(
         self,
         bounds: tuple[float, float, float, float],
         *,
         ledger: _CallLedger | None = None,
+        datetime_range: tuple[datetime, datetime] | None = None,
+        filters: Mapping[str, Any] | None = None,
     ) -> list[Mapping[str, Any]]:
         """Discover one WGS84 bbox and return provider-neutral records."""
         records: list[Mapping[str, Any]] = []
-        for raw_item in self._search_items(list(bounds), ledger):
-            item = self._sign_item(raw_item)
-            mapping = dict(_as_mapping(item))
-            item_id = str(mapping.get("id", ""))
-            assets = dict(mapping.get("assets", {}))
-            asset = assets.get(self.asset_key)
-            href = _signed_href(item, self.asset_key)
-            if not item_id or not href or not isinstance(asset, Mapping):
-                continue
-            unsigned = urllib.parse.urlsplit(href)
-            if unsigned.scheme.lower() != "https" or unsigned.hostname != PC_ASSET_HOST:
-                _fail(RemoteAccessError, "unregistered_endpoint")
-            self._signed[(item_id, self.asset_key)] = href
-            record = dict(mapping)
-            record["collection"] = self.collection
-            assets[self.asset_key] = dict(asset)
-            assets[self.asset_key]["href"] = href
-            record["assets"] = assets
-            records.append(record)
+        item_stream = self._search_items(
+            list(bounds),
+            ledger,
+            datetime_range=datetime_range,
+            filters=filters,
+        )
+        try:
+            for raw_item in item_stream:
+                item = self._sign_item(raw_item)
+                item_mapping = dict(_as_mapping(item))
+                item_id = item_mapping.get("id")
+                assets = item_mapping.get("assets")
+                if not isinstance(assets, Mapping):
+                    _fail(
+                        MalformedSTACItemError,
+                        "missing_assets",
+                        "Planetary Computer STAC Item must contain assets",
+                    )
+                asset = assets.get(self.asset_key)
+                href = str(asset.get("href", "")) if isinstance(asset, Mapping) else ""
+                if not isinstance(item_id, str) or not item_id:
+                    _fail(
+                        MalformedSTACItemError,
+                        "invalid_item_id",
+                        "Planetary Computer STAC Item id must be non-empty",
+                    )
+                if not isinstance(asset, Mapping) or not href:
+                    _fail(
+                        MalformedSTACItemError,
+                        "missing_data_asset",
+                        f"STAC Item {item_id!r} has no {self.asset_key!r} asset",
+                    )
+                unsigned = urllib.parse.urlsplit(href)
+                if (
+                    unsigned.scheme.lower() != "https"
+                    or unsigned.hostname != PC_ASSET_HOST
+                ):
+                    _fail(RemoteAccessError, "unregistered_endpoint")
+                self._signed[(item_id, self.asset_key)] = href
+                persisted_assets = dict(assets)
+                persisted_asset = dict(asset)
+                persisted_asset["href"] = urllib.parse.urlunsplit(
+                    (unsigned.scheme, unsigned.netloc, unsigned.path, "", "")
+                )
+                persisted_assets[self.asset_key] = persisted_asset
+                persisted_item = dict(item_mapping)
+                persisted_item["collection"] = self.collection
+                persisted_item["assets"] = persisted_assets
+                # Every item passes the pinned profile normalizer.  In
+                # particular, malformed identities, geometry, temporal fields,
+                # and any asset (not just the selected DEM asset) fail with
+                # typed errors.
+                record = normalize_stac_item(
+                    persisted_item,
+                    provider=self.provider,
+                    catalog=self.provider,
+                    collection=self.collection,
+                )
+                records.append(record)
+        finally:
+            close = getattr(item_stream, "close", None)
+            if callable(close):
+                close()
         return records
 
     def fetch(

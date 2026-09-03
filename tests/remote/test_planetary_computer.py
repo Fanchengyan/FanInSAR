@@ -1,12 +1,12 @@
 """Planetary Computer adapter seams (PROPOSAL-0045 Task C)."""
 
 # Test fixtures intentionally use mutable simple objects and runtime pytest.
-# ruff: noqa: E501, TC002, TC003, RUF012, PYI034
+# ruff: noqa: TC003, RUF012, PYI034
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -17,6 +17,7 @@ from faninsar.remote.providers.planetary_computer import (
     COP_DEM_GLO30_COLLECTION,
     PlanetaryComputerAdapter,
 )
+from faninsar.remote.standards import MalformedSTACItemError
 
 
 @dataclass
@@ -30,7 +31,10 @@ class _Item:
     id: str
     geometry: dict[str, object]
     assets: dict[str, _Asset]
+    properties: dict[str, object]
     collection_id: str = COP_DEM_GLO30_COLLECTION
+    stac_version: str = "1.1.0"
+    stac_extensions: list[str] = field(default_factory=list)
 
 
 class _Search:
@@ -42,11 +46,15 @@ class _Search:
 
 
 class _Client:
+    _faninsar_offline = True
+
     def __init__(self, item: _Item) -> None:
         self.item = item
         self.bboxes: list[list[float]] = []
 
-    def search(self, *, collections: list[str], bbox: list[float]) -> _Search:
+    def search(
+        self, *, collections: list[str], bbox: list[float], **_kwargs: object
+    ) -> _Search:
         assert collections == [COP_DEM_GLO30_COLLECTION]
         self.bboxes.append(bbox)
         return _Search(self.item)
@@ -65,10 +73,14 @@ def _item() -> _Item:
                 {"file:size": 4},
             )
         },
+        properties={"datetime": "2024-01-02T03:04:05Z"},
+        stac_extensions=[],
     )
 
 
-def test_planetary_computer_search_signs_in_memory_and_preserves_safe_identity() -> None:
+def test_planetary_computer_search_signs_in_memory_and_preserves_safe_identity() -> (
+    None
+):
     """STAC discovery signs an item in memory and emits a safe record."""
     item = _item()
     calls: list[object] = []
@@ -83,7 +95,8 @@ def test_planetary_computer_search_signs_in_memory_and_preserves_safe_identity()
 
     assert len(records) == 1
     assert calls == [item]
-    assert records[0]["assets"]["data"]["href"].endswith("sig=secret")
+    assert records[0]["assets"]["data"]["href"].endswith("tile.tif")
+    assert adapter._signed[("tile-1", "data")].endswith("sig=secret")
 
 
 def test_planetary_computer_is_registered_with_remote_boundary() -> None:
@@ -91,9 +104,7 @@ def test_planetary_computer_is_registered_with_remote_boundary() -> None:
     item = _item()
     adapter = PlanetaryComputerAdapter(client=_Client(item), signer=lambda value: value)
     adapter.register("pc-task-c")
-    found = remote.search(
-        BoundingBox(-1, -1, 1, 1, crs=4326), catalog="pc-task-c"
-    )
+    found = remote.search(BoundingBox(-1, -1, 1, 1, crs=4326), catalog="pc-task-c")
     assert found[0].provider == "pc"
     assert found[0].assets["data"].href.endswith("tile.tif")
 
@@ -143,3 +154,23 @@ def test_planetary_computer_fetch_uses_p0044_ledger_and_signing(
     adapter.register("pc-task-c-fetch")
     destination = remote.download(asset, tmp_path / "dem.tif")
     assert destination.read_bytes() == payload
+
+
+def test_planetary_computer_rejects_unobservable_injected_client() -> None:
+    """A client without an inspectable transport fails before network I/O."""
+    item = _item()
+    adapter = PlanetaryComputerAdapter(client=_Client(item), signer=lambda value: value)
+    adapter.client._faninsar_offline = False  # type: ignore[attr-defined]
+    with pytest.raises(remote.RemoteAccessError) as error:
+        list(adapter.items())
+    assert error.value.reason == "unobservable_discovery"
+
+
+def test_planetary_computer_normalizes_and_types_malformed_stac_items() -> None:
+    """Required STAC identity and asset fields cannot be silently skipped."""
+    item = _item()
+    item.id = ""
+    adapter = PlanetaryComputerAdapter(client=_Client(item), signer=lambda value: value)
+    with pytest.raises(MalformedSTACItemError) as error:
+        list(adapter.items())
+    assert error.value.reason == "invalid_item_id"
