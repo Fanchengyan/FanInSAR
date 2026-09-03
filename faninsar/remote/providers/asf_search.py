@@ -39,6 +39,11 @@ ASF_SEARCH_CERTIFIED_VERSION = "13.0.0"
 ASF_SEARCH_COMPATIBILITY = ">=13,<14"
 DEFAULT_CMR_ENDPOINT = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
 DEFAULT_DATA_ORIGINS = ("https://datapool.asf.alaska.edu",)
+_COLLECTION_CONCEPT_IDS = {
+    "sentinel-1": "C1214470488-ASF",
+    "sentinel-1a_slc": "C1214470488-ASF",
+    "sentinel-1_slc": "C1214470488-ASF",
+}
 _SECRET_HEADER = re.compile(
     r"(?:authorization|cookie|token|password|passwd|secret|signature|credential|api.?key)",
     re.IGNORECASE,
@@ -586,6 +591,7 @@ class ASFSearchAdapter:
     redirect_origins: tuple[str, ...] = ()
     profiles: tuple[str, ...] = ("anonymous", "earthdata-asf")
     engine: str = "asf-search"
+    query_collection: str = field(init=False)
 
     def __post_init__(self) -> None:
         """Validate the explicit engine and register endpoint policy."""
@@ -597,6 +603,11 @@ class ASFSearchAdapter:
             )
         if not isinstance(self.collection, str) or not self.collection.strip():
             _error(ASFSearchError, "invalid_collection", "ASF collection is required")
+        object.__setattr__(
+            self,
+            "query_collection",
+            _COLLECTION_CONCEPT_IDS.get(self.collection.casefold(), self.collection),
+        )
         parsed = urllib.parse.urlsplit(self.endpoint)
         if parsed.scheme.lower() != "https" or not parsed.hostname:
             _error(ASFSearchError, "invalid_endpoint", "ASF endpoint must be HTTPS")
@@ -709,7 +720,7 @@ class ASFSearchAdapter:
             query_filters = dict(self.filters)
             query_filters.update(filters or {})
             parameters = _query_parameters(
-                self.collection,
+                self.query_collection,
                 spatial=spatial if spatial is not None else self.spatial,
                 datetime_range=datetime_range
                 if datetime_range is not None
