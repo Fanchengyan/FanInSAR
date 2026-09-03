@@ -90,8 +90,8 @@ def _execute_plan(
 
     executed = fetch_plan(plan, cache_dir, max_fetch_bytes=max_fetch_bytes)
     if isinstance(plan, Artifact) and plan.expand == "zip" and plan.cache_path:
-        staging = cache_dir / plan.cache_path.parent / (
-            plan.cache_path.name + ".zip-staging"
+        staging = (
+            cache_dir / plan.cache_path.parent / (plan.cache_path.name + ".zip-staging")
         )
         pattern = plan.member_pattern or "*"
         members = [
@@ -104,11 +104,86 @@ def _execute_plan(
     return executed
 
 
+def _execute_remote_granules(
+    entry: DemSource,
+    plan: object,
+    cache_dir: Path,
+    *,
+    budget: ResourceBudget | None,
+) -> list[Path]:
+    """Resolve a deferred CMR plan through the remote search/download API."""
+    from faninsar.processing.geometry.dem_sources import (
+        DeferredGranulePlan,
+        DeferredStacPlan,
+    )
+
+    if not isinstance(plan, (DeferredGranulePlan, DeferredStacPlan)):
+        message = "expected a deferred remote plan"
+        raise TypeError(message)
+    discover = getattr(entry, "discover", None)
+    if not callable(discover):
+        message = f"DEM source {entry.name!r} cannot resolve deferred granules"
+        logger.error(message)
+        raise TypeError(message)
+    try:
+        if isinstance(plan, DeferredStacPlan):
+            discover = entry.discover_remote_assets
+        assets = discover(plan, budget=budget)
+    except Exception:
+        logger.exception("deferred DEM granule discovery failed")
+        raise
+    from faninsar.processing.geometry.dem_transport import extract_zip_members
+    from faninsar.remote import RemoteResourceBudget, download
+
+    max_bytes = budget.max_fetch_bytes if budget is not None else 2**33
+    remote_budget = RemoteResourceBudget(
+        max_output_bytes=max_bytes,
+        max_temporary_bytes=max_bytes,
+        max_cache_bytes=max_bytes,
+    )
+    paths: list[Path] = []
+    for asset in assets:
+        href = str(getattr(asset, "href", ""))
+        tail = href.split("?", 1)[0].rsplit("/", 1)[-1]
+        if isinstance(plan, DeferredStacPlan):
+            relative = Path(plan.collection) / tail
+        else:
+            relative = Path(f"{entry.product}-{entry.provider}") / "granules" / tail
+        target = cache_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        download(asset, target, budget=remote_budget)
+        if str(getattr(entry, "asset_pattern", "")).lower().endswith(".zip"):
+            staging = target.parent / (target.name + ".zip-staging")
+            members = extract_zip_members(
+                target,
+                staging,
+                members=None,
+                member_pattern=getattr(entry, "asset_pattern", "*"),
+            )
+            paths.extend(members)
+        else:
+            paths.append(target)
+    return paths
+
+
 def _source_path(path: Path, recipe: object) -> str:
     """Apply the registry's GDAL open prefix to a local cache path."""
     template = str(getattr(recipe, "gdal_open", "{path}"))
     if "{member}" in template:
-        return str(path)
+        # Zip expansion is still performed by the audited transport engine
+        # (including CRC and zip-slip checks).  Keep opening the validated
+        # source through GDAL's archive VFS, however, so sampling uses the
+        # same archive/member identity as the registry recipe.  Expanded
+        # paths carry a ``.zip-staging`` marker from which the original
+        # archive and member can be recovered deterministically.
+        marker = ".zip-staging"
+        text_path = str(path)
+        marker_index = text_path.find(marker)
+        if marker_index >= 0:
+            archive = text_path[:marker_index]
+            member = text_path[marker_index + len(marker) :].lstrip("/")
+            return template.format(path=archive, member=member)
+        return template.format(path=path.with_suffix(".zip"), member=path.name)
     return template.format(path=path)
 
 
@@ -189,9 +264,7 @@ def _sample_paths(paths: list[Path], entry: DemSource, grid: GridSpec) -> np.nda
     for path in paths:
         with rasterio.open(_source_path(path, recipe)) as dataset:
             source_crs = (
-                dataset.crs
-                or getattr(recipe, "source_crs", None)
-                or "EPSG:4326"
+                dataset.crs or getattr(recipe, "source_crs", None) or "EPSG:4326"
             )
             sampled = _sample_dataset(
                 dataset,
@@ -225,8 +298,16 @@ def _materialize_entry(
 ) -> RasterDEM:
     """Plan, fetch, and directly sample one P0030 registry entry."""
     from faninsar.processing.dem.api import RasterDEM
+    from faninsar.processing.geometry.dem_sources import (
+        DeferredGranulePlan,
+        DeferredStacPlan,
+    )
 
-    paths = _execute_plan(entry.plan(bounds), cache_dir, budget=budget)
+    plan = entry.plan(bounds)
+    if isinstance(plan, (DeferredGranulePlan, DeferredStacPlan)):
+        paths = _execute_remote_granules(entry, plan, cache_dir, budget=budget)
+    else:
+        paths = _execute_plan(plan, cache_dir, budget=budget)
     values = _sample_paths(paths, entry, grid)
     return RasterDEM(
         array=values,

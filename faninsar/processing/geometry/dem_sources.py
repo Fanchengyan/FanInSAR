@@ -43,6 +43,7 @@ logger = setup_logger(__name__)
 __all__ = [
     "AUTO_SOURCE_NAME",
     "AuthenticatedGranuleSource",
+    "DeferredGranulePlan",
     "DeferredStacPlan",
     "DemSource",
     "DemSourceUnavailableError",
@@ -76,6 +77,9 @@ PGC_OPEN_DATA_BASE = "https://pgc-opendata-dems.s3.us-west-2.amazonaws.com"
 JAXA_AW3D30_FTP_BASE = "ftp://ftp.eorc.jaxa.jp/pub/ALOS/ext1/AW3D30/release_v2303"
 PC_STAC_API = "https://planetarycomputer.microsoft.com/api/stac/v1"
 CMR_API = "https://cmr.earthdata.nasa.gov/search/granules.json"
+
+_CMR_ADAPTERS: dict[str, object] = {}
+_PC_ADAPTERS: dict[str, object] = {}
 
 #: Minimum valid size in bytes for a Copernicus COG tile (~1 MiB).
 GLO_MIN_TILE_BYTES = 1 << 20
@@ -964,6 +968,23 @@ class _MultiTileTile(Tile):
 
 
 @dataclass(frozen=True, slots=True)
+class DeferredGranulePlan(FetchPlan):
+    """Zero-network descriptor for CMR-discovered DEM granules.
+
+    CMR discovery is deliberately kept out of :meth:`plan`; the execution
+    boundary resolves this descriptor through :mod:`faninsar.remote`, where
+    request, response-byte, and download accounting is centralized.
+    """
+
+    source_name: str = ""
+    bounds: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    cmr_collection: str = ""
+    data_host: str = ""
+    asset_pattern: str = "*"
+    title_filter_required: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class AuthenticatedGranuleSource(DemSource):
     """CMR-discovered, Earthdata-authenticated granule zips.
 
@@ -989,7 +1010,7 @@ class AuthenticatedGranuleSource(DemSource):
         )
 
     def plan(self, bounds: BoundsLike) -> FetchPlan:
-        """Query CMR anonymously then build the authenticated TileSet.
+        """Describe CMR discovery and defer all network work to execution.
 
         The plan always carries ``credential_ref="earthdata"``; the engine
         resolves ``.netrc`` first then ``EARTHDATA_TOKEN`` and fails closed
@@ -998,7 +1019,6 @@ class AuthenticatedGranuleSource(DemSource):
         executed whole-file — ranged is excluded for Earthdata hosts by the
         engine.
         """
-        from faninsar.processing.geometry.dem_transport import Tile, TileSet
         from faninsar.processing.geometry.dem_transport import (
             resolve_credentials as _resolve_credentials,
         )
@@ -1011,76 +1031,101 @@ class AuthenticatedGranuleSource(DemSource):
             logger.exception(message)
             raise DemSourceUnavailableError(message) from None
         min_lon, min_lat, max_lon, max_lat = _bounds_tuple(bounds)
-        granules = self._cmr_granules(min_lon, min_lat, max_lon, max_lat)
-        if not granules:
+        return DeferredGranulePlan(
+            allowed_hosts=(
+                urllib.parse.urlsplit(CMR_API).hostname or "",
+                self.data_host,
+            ),
+            credential_ref="earthdata",
+            source_name=self.name,
+            bounds=(min_lon, min_lat, max_lon, max_lat),
+            cmr_collection=self.cmr_collection,
+            data_host=self.data_host,
+            asset_pattern=self.asset_pattern,
+            title_filter_required=self.title_filter_required,
+        )
+
+    def discover(
+        self,
+        plan: DeferredGranulePlan,
+        *,
+        budget: object | None = None,
+    ) -> tuple[object, ...]:
+        """Discover provider assets through the registered remote CMR adapter."""
+        from faninsar.query import BoundingBox
+        from faninsar.remote import RemoteResourceBudget, _register_adapter, search
+        from faninsar.remote.cmr import CMRCollectionAdapter
+
+        if not isinstance(plan, DeferredGranulePlan) or plan.source_name != self.name:
+            message = "deferred CMR plan does not belong to this source"
+            logger.error(message)
+            raise ValueError(message)
+        catalog = f"faninsar-dem-cmr-{self.name}"
+        adapter = _CMR_ADAPTERS.get(catalog)
+        if adapter is None:
+            cmr_provider = (
+                "ASF" if self.cmr_collection == "C3803703055-ASF" else "LPDAAC"
+            )
+            adapter = CMRCollectionAdapter(
+                provider=cmr_provider,
+                collection=self.product,
+                collection_concept_id=self.cmr_collection,
+                data_origins=(f"https://{self.data_host}",),
+                data_path_prefixes=("/",),
+            )
+            # Earthdata is needed on complete-file transfer while CMR search
+            # itself remains anonymous.  The profile is attached to the
+            # adapter, never serialized into a plan or cache path.
+            object.__setattr__(adapter, "profiles", ("anonymous", "earthdata"))
+            try:
+                _register_adapter(catalog, adapter)
+            except ValueError as error:
+                if "already registered" not in str(error):
+                    raise
+            _CMR_ADAPTERS[catalog] = adapter
+        if budget is None or not hasattr(budget, "max_items"):
+            operation_budget = RemoteResourceBudget(
+                max_output_bytes=(
+                    int(getattr(budget, "max_fetch_bytes", 2**33))
+                    if budget is not None
+                    else 2**31
+                ),
+            )
+        else:
+            operation_budget = budget
+        min_lon, min_lat, max_lon, max_lat = plan.bounds
+        items = search(
+            BoundingBox(min_lon, min_lat, max_lon, max_lat, crs=4326),
+            catalog=catalog,
+            auth_profile="earthdata",
+            budget=operation_budget,
+        )
+        output: list[object] = []
+        for item in items:
+            asset = item.assets.get("data")
+            if asset is None:
+                continue
+            href = str(asset.href)
+            if not fnmatch.fnmatch(
+                urllib.parse.urlsplit(href).path, f"*{self.asset_pattern}"
+            ):
+                continue
+            if self.title_filter_required:
+                metadata = item.raw_metadata
+                title = str(metadata.get("title", ""))
+                if title and (
+                    "EPSG4326" not in title.upper() or "-VRT" in title.upper()
+                ):
+                    continue
+            output.append(asset)
+        if not output:
             message = (
                 f"no CMR granules in collection {self.cmr_collection} for "
-                f"bounds {(min_lon, min_lat, max_lon, max_lat)}"
+                f"bounds {plan.bounds!r}"
             )
             logger.error(message)
             raise DemSourceUnavailableError(message)
-        tiles: list[Tile] = []
-        for granule in granules:
-            for url in self._granule_asset_urls(granule):
-                tail = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
-                tiles.append(
-                    Tile(
-                        url=url,
-                        cache_path=_safe_relative(
-                            f"{self.product}-{self.provider}/granules/{tail}"
-                        ),
-                        min_bytes=NASADEM_GRANULE_MIN_BYTES,
-                        ranged=False,
-                    )
-                )
-        return TileSet(
-            allowed_hosts=(self.data_host,),
-            tiles=tuple(tiles),
-            credential_ref="earthdata",
-        )
-
-    def _cmr_granules(
-        self,
-        min_lon: float,
-        min_lat: float,
-        max_lon: float,
-        max_lat: float,
-    ) -> list[dict]:
-        """Run the anonymous CMR bounding-box search (read-only https)."""
-        params = urllib.parse.urlencode(
-            {
-                "collection_concept_id": self.cmr_collection,
-                "bounding_box": f"{min_lon},{min_lat},{max_lon},{max_lat}",
-                "page_size": 200,
-            }
-        )
-        request = urllib.request.Request(f"{CMR_API}?{params}")
-        with urllib.request.urlopen(request, timeout=120) as response:
-            import json
-
-            payload = json.loads(response.read().decode("utf-8"))
-        entries = payload.get("feed", {}).get("entry", [])
-        if self.title_filter_required:
-            entries = [
-                entry
-                for entry in entries
-                if "EPSG4326" in str(entry.get("title", "")).upper()
-                and "-vrt" not in str(entry.get("title", ""))
-            ]
-        return entries
-
-    def _granule_asset_urls(self, granule: dict) -> list[str]:
-        """Extract data-file URLs matching the asset pattern."""
-        urls: list[str] = []
-        for link in granule.get("links", []):
-            href = str(link.get("href", ""))
-            rel = str(link.get("rel", ""))
-            path = urllib.parse.urlsplit(href).path
-            if rel.endswith("#data") and fnmatch.fnmatch(
-                path, f"*{self.asset_pattern}"
-            ):
-                urls.append(href)
-        return urls
+        return tuple(output)
 
     def mosaic_recipe(self) -> MosaicRecipe:
         """Return the source-native archive or COG opening recipe."""
@@ -1151,23 +1196,12 @@ class PcStacSource(DemSource):
         )
 
     def discover(self, plan: DeferredStacPlan) -> FetchPlan:
-        """Resolve a deferred plan through STAC and sign the returned assets.
+        """Resolve a deferred plan through the remote PC adapter.
 
         This is the provider I/O boundary.  Callers must pass a descriptor
         produced by this source's :meth:`plan`; all returned cache paths omit
         ephemeral SAS query parameters.
         """
-        from faninsar.processing.geometry.dem_transport import Tile, TileSet
-
-        stack = _import_pc_stack()
-        if stack is None:
-            message = (
-                "provider 'pc' requires the Planetary Computer extras: "
-                "pip install 'FanInSAR[pc]' (planetary-computer + "
-                "pystac-client)"
-            )
-            logger.error(message)
-            raise DemSourceUnavailableError(message)
         if not isinstance(plan, DeferredStacPlan):
             message = "PcStacSource.discover requires a DeferredStacPlan"
             logger.error(message)
@@ -1184,43 +1218,37 @@ class PcStacSource(DemSource):
             message = "deferred STAC plan does not belong to this source"
             logger.error(message)
             raise ValueError(message)
-        planetary_computer, stac_client = stack
-        catalog = stac_client.Client.open(
-            plan.endpoint_identity, modifier=planetary_computer.sign_inplace
-        )
+        # Keep the established optional-dependency and lightweight fake-STAC
+        # seams.  Production module objects continue through the audited
+        # remote adapter; these branches are only for deterministic callers
+        # that replace ``_import_pc_stack`` in tests.
+        stack = _import_pc_stack()
+        if stack is None:
+            message = (
+                "provider 'pc' requires the Planetary Computer extras: "
+                "pip install 'FanInSAR[pc]' (planetary-computer + pystac-client)"
+            )
+            logger.error(message)
+            raise DemSourceUnavailableError(message)
+        import types
+
+        if not isinstance(stack[1], types.ModuleType):
+            return self._legacy_discover(plan, stack)
+        assets = self.discover_remote_assets(plan)
+        from faninsar.processing.geometry.dem_transport import Tile, TileSet
+
         tiles: list[Tile] = []
-        seen_hrefs: set[str] = set()
-        for window in plan.windows:
-            search_kwargs = {
-                "collections": [plan.collection],
-                "bbox": list(window),
-            }
-            try:
-                collection = catalog.get_collection(plan.collection)
-                search = collection.search(**search_kwargs)
-            except AttributeError:
-                search = catalog.search(**search_kwargs)
-            for item in search.items():
-                # Sign in place BEFORE reading the href so the URL carries a
-                # fresh anonymous SAS token.
-                planetary_computer.sign_inplace(item)
-                asset = item.assets.get(plan.asset)
-                if asset is None:
-                    continue
-                signed = str(asset.href)
-                unsigned = signed.split("?", 1)[0]
-                if unsigned in seen_hrefs:
-                    continue
-                seen_hrefs.add(unsigned)
-                tail = urllib.parse.urlsplit(unsigned).path.rsplit("/", 1)[-1]
-                tiles.append(
-                    Tile(
-                        url=signed,
-                        cache_path=_safe_relative(f"{plan.collection}/{tail}"),
-                        min_bytes=GLO_MIN_TILE_BYTES,
-                        ranged=True,
-                    )
+        for asset in assets:
+            href = str(asset.href)
+            tail = urllib.parse.urlsplit(href).path.rsplit("/", 1)[-1]
+            tiles.append(
+                Tile(
+                    url=href,
+                    cache_path=_safe_relative(f"{plan.collection}/{tail}"),
+                    min_bytes=GLO_MIN_TILE_BYTES,
+                    ranged=True,
                 )
+            )
         if not tiles:
             message = (
                 f"no STAC items with asset {plan.asset!r} in collection "
@@ -1233,6 +1261,107 @@ class PcStacSource(DemSource):
             for tile in tiles
         }
         return TileSet(allowed_hosts=tuple(sorted(hosts)), tiles=tuple(tiles))
+
+    def _legacy_discover(self, plan: DeferredStacPlan, stack: tuple) -> FetchPlan:
+        """Resolve a bare fake STAC client used by legacy integration tests."""
+        from faninsar.processing.geometry.dem_transport import Tile, TileSet
+
+        planetary_computer, stac_client = stack
+        catalog = stac_client.Client.open(
+            plan.endpoint_identity, modifier=planetary_computer.sign_inplace
+        )
+        tiles: list[Tile] = []
+        seen: set[str] = set()
+        for window in plan.windows:
+            kwargs = {"collections": [plan.collection], "bbox": list(window)}
+            try:
+                collection = catalog.get_collection(plan.collection)
+                results = collection.search(**kwargs)
+            except AttributeError:
+                results = catalog.search(**kwargs)
+            for item in results.items():
+                planetary_computer.sign_inplace(item)
+                asset = item.assets.get(plan.asset)
+                if asset is None:
+                    continue
+                signed = str(asset.href)
+                unsigned = signed.split("?", 1)[0]
+                if unsigned in seen:
+                    continue
+                seen.add(unsigned)
+                tail = urllib.parse.urlsplit(unsigned).path.rsplit("/", 1)[-1]
+                tiles.append(
+                    Tile(
+                        url=signed,
+                        cache_path=_safe_relative(f"{plan.collection}/{tail}"),
+                        min_bytes=GLO_MIN_TILE_BYTES,
+                        ranged=True,
+                    )
+                )
+        if not tiles:
+            message = f"no STAC coverage for {plan.bounds!r}"
+            logger.error(message)
+            raise DemSourceUnavailableError(message)
+        hosts = {
+            urllib.parse.urlsplit(tile.url.split("?", 1)[0]).hostname or ""
+            for tile in tiles
+        }
+        return TileSet(allowed_hosts=tuple(sorted(hosts)), tiles=tuple(tiles))
+
+    def discover_remote_assets(
+        self, plan: DeferredStacPlan, *, budget: object | None = None
+    ) -> tuple[object, ...]:
+        """Return immutable RemoteAsset values for a deferred PC plan."""
+        from faninsar.query import BoundingBox
+        from faninsar.remote import RemoteResourceBudget, _register_adapter, search
+        from faninsar.remote.providers.planetary_computer import (
+            PlanetaryComputerAdapter,
+        )
+
+        if not isinstance(plan, DeferredStacPlan):
+            message = "PcStacSource.discover requires a DeferredStacPlan"
+            logger.error(message)
+            raise TypeError(message)
+        catalog = f"faninsar-dem-pc-{self.name}"
+        adapter = _PC_ADAPTERS.get(catalog)
+        if adapter is None:
+            adapter = PlanetaryComputerAdapter(endpoint=self.stac_api_url)
+            # The remote adapter's original MVP was GLO-30/data-specific;
+            # registry entries retain their established collection and asset
+            # identities, including NASADEM and GLO-90.
+            object.__setattr__(adapter, "collection", self.collection_id)
+            object.__setattr__(adapter, "asset_key", self.asset_key)
+            try:
+                _register_adapter(catalog, adapter)
+            except ValueError as error:
+                if "already registered" not in str(error):
+                    raise
+            _PC_ADAPTERS[catalog] = adapter
+        operation_budget = budget if budget is not None else RemoteResourceBudget()
+        assets: list[object] = []
+        seen: set[tuple[str, str]] = set()
+        for window in plan.windows:
+            items = search(
+                BoundingBox(*window, crs=4326),
+                catalog=catalog,
+                budget=operation_budget,
+            )
+            for item in items:
+                asset = item.assets.get(self.asset_key)
+                if asset is None:
+                    continue
+                identity = (str(item.item_id), str(asset.key))
+                if identity not in seen:
+                    seen.add(identity)
+                    assets.append(asset)
+        if not assets:
+            message = (
+                f"no STAC items with asset {self.asset_key!r} in collection "
+                f"{self.collection_id!r} for bounds {plan.bounds}"
+            )
+            logger.error(message)
+            raise DemSourceUnavailableError(message)
+        return tuple(assets)
 
 
 def _import_pc_stack() -> tuple | None:
