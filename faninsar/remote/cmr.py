@@ -9,6 +9,7 @@ geometry filtering and publication to that boundary.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -248,6 +249,66 @@ def _asset_candidates(record: Mapping[str, Any]) -> list[tuple[str, Mapping[str,
     return [(str(value.get("title") or "data"), value) for value in _cmr_links(record)]
 
 
+def _cmr_number(value: Any) -> str:
+    """Format a WGS84 coordinate compactly for CMR query parameters."""
+    return format(float(value), ".12g")
+
+
+def _cmr_spatial_parameters(
+    spatial: Any | None,
+    spatial_kind: str | None,
+    point_geometries: tuple[Any, ...],
+) -> dict[str, str]:
+    """Translate the normalized WGS84 query into CMR spatial parameters.
+
+    CMR has a point parameter for one point, a bounding-box parameter for
+    rectangular (and multi-point) coverage, and a polygon parameter for a
+    single polygon.  Complex polygons are deliberately widened to their
+    envelope; the public boundary still applies the exact geometry predicate
+    after records are normalized.
+    """
+    if spatial is None or not hasattr(spatial, "bounds"):
+        return {}
+    if spatial_kind == "points" and len(point_geometries) == 1:
+        point = point_geometries[0]
+        if hasattr(point, "x") and hasattr(point, "y"):
+            return {"point": f"{_cmr_number(point.x)},{_cmr_number(point.y)}"}
+    geometry = spatial
+    if spatial_kind == "polygons" and getattr(geometry, "geom_type", "") == "Polygon":
+        exterior = getattr(geometry, "exterior", None)
+        coordinates = getattr(exterior, "coords", None)
+        if coordinates is not None:
+            values = [
+                f"{_cmr_number(longitude)} {_cmr_number(latitude)}"
+                for longitude, latitude, *_ in coordinates
+            ]
+            if len(values) >= 4:
+                return {"polygon": ",".join(values)}
+    west, south, east, north = geometry.bounds
+    return {
+        "bounding_box": ",".join(
+            _cmr_number(value) for value in (west, south, east, north)
+        )
+    }
+
+
+def _cmr_collection_parameters(
+    collection: str,
+    collection_concept_id: str | None,
+    collections: tuple[str, ...] | None,
+) -> dict[str, str]:
+    """Translate public collection identities into CMR filters."""
+    selected = collections or (collection,)
+    # CMR concept identifiers are conventionally C-prefixed.  Other
+    # collection identities are short names; retaining this distinction avoids
+    # accidentally treating a provider's human-readable name as an ID.
+    if all(re.fullmatch(r"C\d+", value, re.IGNORECASE) for value in selected):
+        return {"collection_concept_id": ",".join(selected)}
+    if collections is None and collection_concept_id:
+        return {"collection_concept_id": collection_concept_id}
+    return {"short_name": ",".join(selected)}
+
+
 @dataclass(slots=True)
 class CMRCollectionAdapter:
     """Registered CMR collection with bounded JSON pagination.
@@ -418,13 +479,38 @@ class CMRCollectionAdapter:
             logger.exception("CMR request failed")
             _error(CMRDiscoveryError, "request_failed", str(exc))
 
-    def _pages(self, ledger: _CallLedger) -> Iterator[Mapping[str, Any]]:
+    def _pages(
+        self,
+        ledger: _CallLedger,
+        *,
+        spatial: Any | None = None,
+        spatial_kind: str | None = None,
+        point_geometries: tuple[Any, ...] = (),
+        datetime_range: tuple[datetime, datetime] | None = None,
+        collections: tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> Iterator[Mapping[str, Any]]:
         """Yield CMR granule mappings while following Search-After."""
-        params: dict[str, str] = {"page_size": str(self.page_size)}
+        page_size = min(
+            self.page_size,
+            limit if limit is not None else self.page_size,
+            ledger.budget.max_items,
+        )
+        params: dict[str, str] = {"page_size": str(page_size)}
         if self.provider:
             params["provider"] = self.provider
-        if self.collection_concept_id:
-            params["collection_concept_id"] = self.collection_concept_id
+        params.update(
+            _cmr_collection_parameters(
+                self.collection, self.collection_concept_id, collections
+            )
+        )
+        params.update(_cmr_spatial_parameters(spatial, spatial_kind, point_geometries))
+        if datetime_range is not None:
+            start, end = datetime_range
+            params["temporal"] = (
+                f"{start.astimezone(UTC).isoformat().replace('+00:00', 'Z')},"
+                f"{end.astimezone(UTC).isoformat().replace('+00:00', 'Z')}"
+            )
         search_after: str | None = None
         for _ in range(self.max_pages):
             query = urllib.parse.urlencode(params)
@@ -456,7 +542,7 @@ class CMRCollectionAdapter:
             token = response_headers.get("cmr-search-after") or response_headers.get(
                 "search-after"
             )
-            if not token or not entries or len(entries) < self.page_size:
+            if not token or not entries or len(entries) < page_size:
                 return
             if token == search_after:
                 _error(
@@ -590,12 +676,42 @@ class CMRCollectionAdapter:
         }
 
     def items(
-        self, *, ledger: _CallLedger | None = None
+        self,
+        *,
+        spatial: Any | None = None,
+        spatial_kind: str | None = None,
+        point_geometries: tuple[Any, ...] = (),
+        datetime_range: tuple[datetime, datetime] | None = None,
+        collections: tuple[str, ...] | None = None,
+        auth_profile: str = "anonymous",
+        limit: int = 100,
+        budget: RemoteResourceBudget | None = None,
+        ledger: _CallLedger | None = None,
     ) -> Iterable[Mapping[str, Any]]:
         """Yield normalized records from the registered CMR collection."""
         if ledger is None:
-            ledger = _CallLedger(RemoteResourceBudget())
-        for entry in self._pages(ledger):
+            ledger = _CallLedger(budget or RemoteResourceBudget())
+        if budget is not None and budget is not ledger.budget:
+            # The public boundary supplies one operation budget.  A direct
+            # adapter call may provide only a ledger or only a budget, but a
+            # mismatched pair would make accounting ambiguous.
+            _error(
+                CMRRegistrationError,
+                "budget_mismatch",
+                "budget must match the supplied operation ledger",
+            )
+        del auth_profile
+        if limit <= 0:
+            _error(CMRRegistrationError, "invalid_limit", "limit must be positive")
+        for entry in self._pages(
+            ledger,
+            spatial=spatial,
+            spatial_kind=spatial_kind,
+            point_geometries=point_geometries,
+            datetime_range=datetime_range,
+            collections=collections,
+            limit=limit,
+        ):
             yield self._normalize(entry)
 
 

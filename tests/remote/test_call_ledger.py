@@ -63,6 +63,35 @@ class _MeteredAdapter:
         return (self.payload,)
 
 
+class _QueryAdapter(_MeteredAdapter):
+    """Fixture adapter recording the normalized public search contract."""
+
+    def items(
+        self,
+        *,
+        spatial: Any,
+        spatial_kind: str,
+        point_geometries: tuple[Any, ...],
+        datetime_range: tuple[Any, Any] | None,
+        collections: tuple[str, ...] | None,
+        auth_profile: str,
+        limit: int,
+        budget: remote.RemoteResourceBudget,
+        ledger: Any,
+    ) -> Iterable[Mapping[str, Any]]:
+        self.query = {
+            "spatial": spatial,
+            "spatial_kind": spatial_kind,
+            "point_geometries": point_geometries,
+            "datetime_range": datetime_range,
+            "collections": collections,
+            "auth_profile": auth_profile,
+            "limit": limit,
+            "budget": budget,
+        }
+        return super().items(ledger=ledger)
+
+
 def test_search_and_download_receive_fresh_ledgers(
     tmp_path: Path,
 ) -> None:
@@ -83,3 +112,50 @@ def test_search_and_download_receive_fresh_ledgers(
     assert adapter.ledgers[1].requests == 1
     assert adapter.ledgers[0].response_bytes_total == 54
     assert adapter.ledgers[1].response_bytes_total == len(payload)
+
+
+def test_persisted_metadata_scrubs_the_complete_azure_sas_query() -> None:
+    """Azure SAS fields and unrelated signed-query material never persist."""
+    signed = (
+        "https://blob.invalid/path/file.tif?sp=r&st=2024-01-01T00%3A00%3A00Z&"
+        "se=2024-01-02T00%3A00%3A00Z&sv=2023-11-03&sr=b&spr=https&sip=127.0.0.1&"
+        "si=policy&sig=secret&x-request-context=also-signed"
+    )
+    clean = remote._sanitize(
+        {
+            "href": signed,
+            "sp": "r",
+            "sv": "2023-11-03",
+            "nested": {"si": "policy", "safe": "value"},
+        }
+    )
+
+    assert clean == {
+        "href": "https://blob.invalid/path/file.tif",
+        "nested": {"safe": "value"},
+    }
+
+
+def test_search_propagates_normalized_query_to_capable_adapter() -> None:
+    """Adapters receive the same normalized values used by public filtering."""
+    adapter = _QueryAdapter(b"payload")
+    remote._register_adapter("query-contract", adapter)
+    start = "2024-01-01T00:00:00+00:00"
+    end = "2024-01-02T00:00:00+00:00"
+
+    remote.search(
+        Points([(0.5, 0.5)], crs=4326),
+        catalog="query-contract",
+        collections=["C123"],
+        datetime_range=(start, end),  # type: ignore[arg-type]
+        auth_profile="anonymous",
+        limit=3,
+    )
+
+    assert adapter.query["spatial_kind"] == "points"
+    assert adapter.query["spatial"].x == 0.5
+    assert adapter.query["spatial"].y == 0.5
+    assert adapter.query["collections"] == ("C123",)
+    assert adapter.query["datetime_range"][0].tzinfo is not None
+    assert adapter.query["auth_profile"] == "anonymous"
+    assert adapter.query["limit"] == 3

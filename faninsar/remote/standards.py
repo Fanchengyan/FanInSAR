@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse, urlsplit, urlunsplit
 
 from faninsar.logging import setup_logger
 
@@ -60,6 +60,33 @@ _PREFIX_TO_PROFILE = {
     "file": "file",
     "insar": "insar",
 }
+_SIGNED_QUERY_KEYS = frozenset(
+    {
+        "sig",
+        "signature",
+        "token",
+        "expires",
+        "se",
+        "sp",
+        "st",
+        "sv",
+        "sr",
+        "spr",
+        "sip",
+        "si",
+        "skoid",
+        "sktid",
+        "skt",
+        "ske",
+        "sks",
+        "skv",
+        "rscc",
+        "rscd",
+        "rsce",
+        "rscl",
+        "rsct",
+    }
+)
 _KNOWN_TOP_LEVEL = {
     "type",
     "stac_version",
@@ -92,15 +119,34 @@ def _fail(error_type: type[STACProfileError], reason: str, message: str) -> None
     raise error_type(reason, message)
 
 
+def _scrub_signed(value: Any) -> Any:
+    """Remove Azure SAS material from values retained by STAC normalization."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _scrub_signed(item)
+            for key, item in value.items()
+            if str(key).lower() not in _SIGNED_QUERY_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_scrub_signed(item) for item in value]
+    if isinstance(value, str):
+        parsed = urlsplit(value)
+        if parsed.scheme and parsed.netloc:
+            query = parse_qsl(parsed.query, keep_blank_values=True)
+            if any(key.lower() in _SIGNED_QUERY_KEYS for key, _ in query):
+                return urlunsplit(
+                    (parsed.scheme, parsed.netloc, parsed.path, "", "")
+                )
+    return value
+
+
 def _extension_name(value: str) -> str | None:
     """Resolve one STAC extension URL or short name to its profile name."""
     if value in _EXTENSION_URLS.values():
         return next(name for name, url in _EXTENSION_URLS.items() if url == value)
-    parsed = urlparse(value)
-    path = parsed.path.rstrip("/")
-    for name, url in _EXTENSION_URLS.items():
-        if path == urlparse(url).path:
-            return name
+    # The schema URI is an origin-qualified trust anchor.  Matching only the
+    # path would allow an unrelated host to claim one of our approved
+    # extensions (for example ``https://attacker.invalid/sar/...``).
     return None
 
 
@@ -208,7 +254,7 @@ def _asset_to_record(asset: Mapping[str, Any], key: str) -> dict[str, Any]:
         for name, value in asset.items()
         if name in {"roles", "title", "description"}
     }
-    result: dict[str, Any] = {"href": href}
+    result: dict[str, Any] = {"href": _scrub_signed(href)}
     if media_type is not None:
         result["media_type"] = media_type
     if size is not None:
@@ -358,7 +404,7 @@ def normalize_stac_item(
             "collection_mismatch",
             f"expected collection {collection!r}",
         )
-    properties = dict(item["properties"])
+    properties = _scrub_signed(dict(item["properties"]))
     start = _utc_datetime(properties.get("start_datetime"), "start_datetime")
     end = _utc_datetime(properties.get("end_datetime"), "end_datetime")
     instant = _utc_datetime(properties.get("datetime"), "datetime")

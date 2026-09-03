@@ -84,6 +84,39 @@ def test_unknown_extension_fails_closed() -> None:
     assert error.value.reason == "unknown_stac_extension"
 
 
+def test_extension_schema_uri_requires_the_approved_https_host() -> None:
+    """A matching path on another host cannot impersonate a STAC schema."""
+    item = _item(
+        stac_extensions=[
+            "https://attacker.invalid/sar/v1.3.2/schema.json",
+        ]
+    )
+    with pytest.raises(UnknownSTACProfileError) as error:
+        validate_stac_item(item)
+    assert error.value.reason == "unknown_stac_extension"
+
+
+def test_normalized_stac_records_scrub_azure_sas_material() -> None:
+    """Direct STAC normalization does not persist signed URL query fields."""
+    item = _item(
+        properties={
+            "datetime": "2024-01-02T03:04:05Z",
+            "provider_href": "https://blob.invalid/meta.json?sv=2023&sig=secret&x=1",
+            "sp": "r",
+        },
+        assets={
+            "data": {
+                "href": "https://blob.invalid/data.tif?sp=r&sv=2023&sig=secret&x=1"
+            }
+        },
+    )
+    record = normalize_stac_item(item, provider="fixture", catalog="catalog")
+
+    assert record["assets"]["data"]["href"] == "https://blob.invalid/data.tif"
+    assert "sp" not in record["properties"]
+    assert record["properties"]["provider_href"] == "https://blob.invalid/meta.json"
+
+
 def test_malformed_geometry_and_unqualified_insar_fields_are_typed() -> None:
     """Geometry and InSAR policy violations use typed profile errors."""
     with pytest.raises(MalformedSTACItemError) as error:

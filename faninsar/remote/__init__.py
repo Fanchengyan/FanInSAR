@@ -303,20 +303,26 @@ _SECRET_KEY = re.compile(
     re.IGNORECASE,
 )
 _SIGNED_QUERY_KEY = re.compile(
-    r"(?:sig(?:nature)?|token|expires?|se(?:curity)?|x-amz-|authorization)",
+    r"^(?:sig(?:nature)?|token|expires?|se(?:curity)?|x-amz-|authorization|"
+    r"sp|st|sv|sr|spr|sip|si|skoid|sktid|skt|ske|sks|skv|rscc|rscd|rsce|rscl|rsct)$",
+    re.IGNORECASE,
+)
+_AZURE_SAS_KEY = re.compile(
+    r"^(?:sp|st|se|sv|sr|spr|sip|si|sig|skoid|sktid|skt|ske|sks|skv|"
+    r"rscc|rscd|rsce|rscl|rsct)$",
     re.IGNORECASE,
 )
 
 
 def _sanitize(value: Any, key: str | None = None) -> Any:  # noqa: PLR0911
     """Remove credential-bearing values from nested provider data."""
-    if key is not None and _SECRET_KEY.search(key):
+    if key is not None and (_SECRET_KEY.search(key) or _SIGNED_QUERY_KEY.search(key)):
         return None
     if isinstance(value, Mapping):
         return {
             str(k): _sanitize(v, str(k))
             for k, v in value.items()
-            if not _SECRET_KEY.search(str(k))
+            if not (_SECRET_KEY.search(str(k)) or _SIGNED_QUERY_KEY.search(str(k)))
         }
     if isinstance(value, (list, tuple)):
         return [_sanitize(item) for item in value]
@@ -328,6 +334,15 @@ def _sanitize(value: Any, key: str | None = None) -> Any:  # noqa: PLR0911
                     (parsed.scheme, parsed.hostname or "", parsed.path, "", "")
                 )
             query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            # An Azure SAS URL signs the complete query string.  Retaining an
+            # unrecognised parameter alongside the SAS fields can still leak
+            # signed request material, so drop the entire query whenever a
+            # SAS marker is present.  The provider may retain a request-local
+            # signed URL separately for the immediate transfer.
+            if any(_AZURE_SAS_KEY.fullmatch(k) for k, _ in query):
+                return urllib.parse.urlunsplit(
+                    (parsed.scheme, parsed.netloc, parsed.path, "", "")
+                )
             query = [(k, v) for k, v in query if not _SIGNED_QUERY_KEY.search(k)]
             clean_query = urllib.parse.urlencode(query)
             return urllib.parse.urlunsplit(
@@ -439,7 +454,17 @@ class _Adapter(Protocol):
     profiles: tuple[str, ...]
 
     def items(
-        self, *, ledger: _CallLedger | None = None
+        self,
+        *,
+        spatial: Any | None = None,
+        spatial_kind: str | None = None,
+        point_geometries: tuple[Any, ...] = (),
+        datetime_range: tuple[datetime, datetime] | None = None,
+        collections: tuple[str, ...] | None = None,
+        auth_profile: str = "anonymous",
+        limit: int = 100,
+        budget: RemoteResourceBudget | None = None,
+        ledger: _CallLedger | None = None,
     ) -> Iterable[Mapping[str, Any]]: ...
 
     def fetch(
@@ -534,6 +559,56 @@ def _accepts_ledger(method: Any) -> bool:
         parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter.name == "ledger"
         for parameter in parameters
     )
+
+
+def _adapter_items(
+    adapter: _Adapter,
+    *,
+    spatial: Any,
+    spatial_kind: str,
+    point_geometries: tuple[Any, ...],
+    datetime_range: tuple[datetime, datetime] | None,
+    collections: tuple[str, ...] | None,
+    auth_profile: str,
+    limit: int,
+    budget: RemoteResourceBudget,
+    ledger: _CallLedger,
+) -> Iterable[Mapping[str, Any]]:
+    """Invoke an adapter with the normalized query it advertises.
+
+    The registry is private, but adapters from the preceding remote MVP are
+    intentionally kept source-compatible.  Keyword arguments are therefore
+    limited to parameters accepted by the concrete method; an adapter that
+    exposes ``**kwargs`` receives the complete query contract.
+    """
+    method = adapter.items
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_any = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    values: dict[str, Any] = {
+        "spatial": spatial,
+        "spatial_kind": spatial_kind,
+        "point_geometries": point_geometries,
+        "datetime_range": datetime_range,
+        "collections": collections,
+        "auth_profile": auth_profile,
+        "limit": limit,
+        "budget": budget,
+        "ledger": ledger,
+    }
+    kwargs = values if accepts_any else {
+        name: value for name, value in values.items() if name in parameters
+    }
+    if "ledger" not in kwargs:
+        # P0044 adapters predate the private ledger keyword.  Their one
+        # catalog operation still receives a conservative request charge.
+        ledger.request()
+    return method(**kwargs)
 
 
 @dataclass
@@ -843,14 +918,18 @@ def search(
     else:
         start_end = None
     ledger = _CallLedger(budget)
-    items_method = adapter.items
-    if _accepts_ledger(items_method):
-        raw_items = items_method(ledger=ledger)
-    else:
-        # P0044 adapters predate the private ledger keyword.  Their one
-        # catalog operation still receives a conservative request charge.
-        ledger.request()
-        raw_items = items_method()
+    raw_items = _adapter_items(
+        adapter,
+        spatial=query,
+        spatial_kind=query_kind,
+        point_geometries=point_geometries,
+        datetime_range=start_end,
+        collections=tuple(collections) if collections is not None else None,
+        auth_profile=profile,
+        limit=limit,
+        budget=budget,
+        ledger=ledger,
+    )
     results: list[CatalogItem] = []
     seen: set[tuple[str, str, str | None, str]] = set()
     for raw in raw_items:
