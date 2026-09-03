@@ -12,7 +12,7 @@ import importlib
 import importlib.metadata
 import re
 import urllib.parse
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +24,7 @@ from faninsar.remote import (
     _CallLedger,
     _fail,
     _register_adapter,
+    _safe_url,
 )
 from faninsar.remote.cmr import CMRCollectionAdapter
 
@@ -38,6 +39,10 @@ ASF_SEARCH_CERTIFIED_VERSION = "13.0.0"
 ASF_SEARCH_COMPATIBILITY = ">=13,<14"
 DEFAULT_CMR_ENDPOINT = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
 DEFAULT_DATA_ORIGINS = ("https://datapool.asf.alaska.edu",)
+_SECRET_HEADER = re.compile(
+    r"(?:authorization|cookie|token|password|passwd|secret|signature|credential|api.?key)",
+    re.IGNORECASE,
+)
 
 
 class ASFSearchError(RemoteAccessError):
@@ -213,18 +218,127 @@ def _response_bytes(response: Any, ledger: _CallLedger) -> None:
     ledger.response_bytes(len(content))
 
 
+def _endpoint_origin(url: str) -> str:
+    """Return the canonical origin of an HTTPS endpoint."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        _fail(RemoteAccessError, "invalid_endpoint")
+    port = parsed.port
+    return f"https://{parsed.hostname}" + (f":{port}" if port and port != 443 else "")
+
+
+def _validate_request_url(
+    url: str,
+    adapter: Any,
+    *,
+    request_url: str | None = None,
+    redirect: bool | None = None,
+) -> str:
+    """Validate one Requests URL against the ASF endpoint policy."""
+    del request_url
+    if not isinstance(url, str) or not url:
+        _error(
+            UnobservableASFSearchError,
+            "unobservable_response_url",
+            "asf-search URL cannot be validated",
+        )
+    if redirect is None:
+        try:
+            redirect = _endpoint_origin(url) != _endpoint_origin(adapter.endpoint)
+        except (TypeError, ValueError):
+            _fail(RemoteAccessError, "invalid_endpoint")
+    return _safe_url(url, adapter, redirect=redirect)
+
+
+def _strip_cross_origin_credentials(request: Any, adapter: Any) -> None:
+    """Remove secret-bearing headers before a cross-origin request is sent."""
+    request_url = getattr(request, "url", None)
+    if not isinstance(request_url, str) or not request_url:
+        _error(
+            UnobservableASFSearchError,
+            "unobservable_request_url",
+            "asf-search request URL cannot be validated",
+        )
+    try:
+        cross_origin = _endpoint_origin(request_url) != _endpoint_origin(
+            adapter.endpoint
+        )
+    except (TypeError, ValueError):
+        _fail(RemoteAccessError, "invalid_endpoint")
+    if not cross_origin:
+        return
+    headers = getattr(request, "headers", None)
+    if not isinstance(headers, Mapping):
+        _error(
+            UnobservableASFSearchError,
+            "unobservable_request_headers",
+            "asf-search request headers cannot be inspected",
+        )
+    for name in list(headers):
+        if _SECRET_HEADER.search(str(name)):
+            del headers[name]
+
+
 def _response_hook(
-    response: Any, *args: Any, ledger: _CallLedger, **kwargs: Any
+    response: Any,
+    *args: Any,
+    ledger: _CallLedger,
+    adapter: Any,
+    request_url: str | None = None,
+    **kwargs: Any,
 ) -> Any:
-    """Meter a requests response hook and each redirect response."""
+    """Validate and meter a requests response hook and each redirect response.
+
+    Requests invokes response hooks before resolving a redirect.  Validating
+    ``Location`` here closes the window in which Requests could otherwise
+    prepare and send a credential-bearing redirected request.
+    """
     del args, kwargs
     if getattr(response, "_faninsar_metered", False):
         return response
+    response_url = getattr(response, "url", None) or request_url
+    _validate_request_url(response_url, adapter, request_url=request_url)
+    if getattr(response, "is_redirect", False):
+        headers = getattr(response, "headers", None)
+        location = headers.get("Location") if isinstance(headers, Mapping) else None
+        if not isinstance(location, str) or not location:
+            _error(
+                UnobservableASFSearchError,
+                "unobservable_redirect",
+                "asf-search redirect location cannot be validated",
+            )
+        _validate_request_url(
+            urllib.parse.urljoin(response_url, location),
+            adapter,
+            request_url=response_url,
+            redirect=True,
+        )
     response._faninsar_metered = True
     history = getattr(response, "history", ())
     for previous in history if isinstance(history, Iterable) else ():
         if getattr(previous, "_faninsar_metered", False):
             continue
+        previous_url = getattr(previous, "url", None)
+        _validate_request_url(previous_url, adapter, redirect=True)
+        if getattr(previous, "is_redirect", False):
+            previous_headers = getattr(previous, "headers", None)
+            previous_location = (
+                previous_headers.get("Location")
+                if isinstance(previous_headers, Mapping)
+                else None
+            )
+            if not isinstance(previous_location, str) or not previous_location:
+                _error(
+                    UnobservableASFSearchError,
+                    "unobservable_redirect",
+                    "asf-search redirect location cannot be validated",
+                )
+            _validate_request_url(
+                urllib.parse.urljoin(previous_url, previous_location),
+                adapter,
+                request_url=previous_url,
+                redirect=True,
+            )
         previous._faninsar_metered = True
         ledger.redirect()
         _response_bytes(previous, ledger)
@@ -247,7 +361,7 @@ def _request_key(request: Any) -> tuple[Any, ...]:
 
 
 def _instrument_requests_session(
-    session: Any, ledger: _CallLedger
+    session: Any, ledger: _CallLedger, adapter_policy: Any
 ) -> Callable[[], None]:
     """Install request/response hooks on a real requests session."""
     import requests
@@ -269,12 +383,24 @@ def _instrument_requests_session(
             "unobservable_retries",
             "asf-search session has unmetered transport retries",
         )
-    previous_hooks = dict(getattr(session, "hooks", {}))
-    session.hooks.setdefault("response", []).append(
-        lambda response, *args, **kwargs: _response_hook(
-            response, *args, ledger=ledger, **kwargs
+    if not isinstance(getattr(session, "hooks", None), Mapping):
+        _error(
+            UnobservableASFSearchError,
+            "unobservable_session_hooks",
+            "asf-search session response hooks cannot be installed",
         )
-    )
+    previous_hooks = {
+        name: list(hooks) if isinstance(hooks, list) else hooks
+        for name, hooks in session.hooks.items()
+    }
+
+    def response_callback(response: Any, *args: Any, **kwargs: Any) -> Any:
+        """Validate and meter one Requests response."""
+        return _response_hook(
+            response, *args, ledger=ledger, adapter=adapter_policy, **kwargs
+        )
+
+    session.hooks.setdefault("response", []).append(response_callback)
     previous_keys: list[tuple[Any, ...]] = []
 
     def wrap(adapter: Any) -> Any:
@@ -282,13 +408,40 @@ def _instrument_requests_session(
             """Charge each low-level request before delegated transport."""
 
             def send(self, request: Any, **kwargs: Any) -> Any:
+                request_hooks = getattr(request, "hooks", None)
+                if not isinstance(request_hooks, Mapping):
+                    _error(
+                        UnobservableASFSearchError,
+                        "unobservable_request_hooks",
+                        "asf-search request response hooks cannot be inspected",
+                    )
+                response_hooks = request_hooks.setdefault("response", [])
+                if not isinstance(response_hooks, list):
+                    _error(
+                        UnobservableASFSearchError,
+                        "unobservable_request_hooks",
+                        "asf-search request response hooks cannot be installed",
+                    )
+                if response_callback not in response_hooks:
+                    response_hooks.append(response_callback)
+                _validate_request_url(request.url, adapter_policy)
+                _strip_cross_origin_credentials(request, adapter_policy)
                 key = _request_key(request)
                 if key in previous_keys:
                     ledger.retry()
                 previous_keys.append(key)
                 ledger.check_elapsed()
                 ledger.request()
-                return adapter.send(request, **kwargs)
+                response = adapter.send(request, **kwargs)
+                response_url = getattr(response, "url", None)
+                if not isinstance(response_url, str) or not response_url:
+                    _error(
+                        UnobservableASFSearchError,
+                        "unobservable_response_url",
+                        "asf-search response URL cannot be validated",
+                    )
+                _validate_request_url(response_url, adapter_policy)
+                return response
 
         return LedgerAdapter()
 
@@ -305,7 +458,7 @@ def _instrument_requests_session(
 
 
 def _instrument_generic_session(
-    session: Any, ledger: _CallLedger
+    session: Any, ledger: _CallLedger, adapter_policy: Any
 ) -> Callable[[], None]:
     """Instrument a requests-like fixture session used by deterministic tests."""
     post = getattr(session, "post", None)
@@ -326,8 +479,33 @@ def _instrument_generic_session(
         previous_keys.append(key)
         ledger.check_elapsed()
         ledger.request()
+        request_url = kwargs.get("url")
+        if not isinstance(request_url, str) and args and isinstance(args[0], str):
+            request_url = args[0]
+        if not isinstance(request_url, str):
+            _error(
+                UnobservableASFSearchError,
+                "unobservable_request_url",
+                "asf-search request URL cannot be validated",
+            )
+        _validate_request_url(request_url, adapter_policy)
         response = previous_post(*args, **kwargs)
-        _response_hook(response, ledger=ledger)
+        if not isinstance(getattr(response, "url", None), str):
+            try:
+                response.url = request_url
+            except (AttributeError, TypeError) as exc:
+                _error(
+                    UnobservableASFSearchError,
+                    "unobservable_response_url",
+                    "asf-search response URL cannot be validated",
+                )
+                raise AssertionError from exc
+        _response_hook(
+            response,
+            ledger=ledger,
+            adapter=adapter_policy,
+            request_url=request_url,
+        )
         return response
 
     try:
@@ -347,12 +525,17 @@ def _instrument_generic_session(
     return restore
 
 
-def _instrument_session(session: Any, ledger: _CallLedger) -> Callable[[], None]:
+def _instrument_session(
+    session: Any, ledger: _CallLedger, adapter_policy: Any
+) -> Callable[[], None]:
     """Choose a requests or deterministic fixture instrumentation strategy."""
     try:
-        return _instrument_requests_session(session, ledger)
-    except (ImportError, TypeError):
-        return _instrument_generic_session(session, ledger)
+        import requests
+    except ImportError:
+        requests = None
+    if requests is not None and isinstance(session, requests.Session):
+        return _instrument_requests_session(session, ledger, adapter_policy)
+    return _instrument_generic_session(session, ledger, adapter_policy)
 
 
 @dataclass(slots=True)
@@ -389,6 +572,7 @@ class ASFSearchAdapter:
     provider: str = "ASF"
     data_origins: tuple[str, ...] = DEFAULT_DATA_ORIGINS
     path_prefixes: tuple[str, ...] = ("/",)
+    origins: tuple[str, ...] = field(init=False)
     redirect_origins: tuple[str, ...] = ()
     profiles: tuple[str, ...] = ("anonymous", "earthdata-asf")
     engine: str = "asf-search"
@@ -404,13 +588,34 @@ class ASFSearchAdapter:
         if not isinstance(self.collection, str) or not self.collection.strip():
             _error(ASFSearchError, "invalid_collection", "ASF collection is required")
         parsed = urllib.parse.urlsplit(self.endpoint)
-        if parsed.scheme != "https" or not parsed.hostname:
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
             _error(ASFSearchError, "invalid_endpoint", "ASF endpoint must be HTTPS")
+        try:
+            endpoint_origin = _endpoint_origin(self.endpoint)
+            for origin in self.data_origins:
+                parsed_origin = urllib.parse.urlsplit(origin)
+                if (
+                    parsed_origin.scheme.lower() != "https"
+                    or not parsed_origin.hostname
+                ):
+                    _error(
+                        ASFSearchError,
+                        "invalid_data_origin",
+                        "ASF data origins must be valid HTTPS URLs",
+                    )
+                _endpoint_origin(origin)
+        except (TypeError, ValueError):
+            _error(
+                ASFSearchError,
+                "invalid_data_origin",
+                "ASF data origins must be valid HTTPS URLs",
+            )
+        object.__setattr__(self, "origins", (endpoint_origin,))
         if not self.redirect_origins:
             object.__setattr__(
                 self,
                 "redirect_origins",
-                (f"https://{parsed.hostname}", *self.data_origins),
+                (endpoint_origin, *self.data_origins),
             )
 
     def _options(
@@ -458,10 +663,19 @@ class ASFSearchAdapter:
         spatial: Any | None = None,
         datetime_range: tuple[datetime, datetime] | None = None,
         filters: Mapping[str, Any] | None = None,
+        collections: Sequence[str] | None = None,
+        auth_profile: str | None = None,
+        limit: int | None = None,
     ) -> Iterator[Mapping[str, Any]]:
         """Yield B-normalized records under one operation-scoped ledger."""
         ledger = ledger or _CallLedger(RemoteResourceBudget())
         package = _load_package(self.package)
+        if collections is not None and self.collection not in collections:
+            return
+        if auth_profile is not None and auth_profile not in self.profiles:
+            _error(ASFSearchError, "unknown_auth_profile", "unknown ASF auth profile")
+        if limit is not None and (limit <= 0 or limit > ledger.budget.max_items):
+            _error(ASFSearchError, "invalid_limit", "invalid ASF search limit")
         session: Any | None = None
         restore: Callable[[], None] | None = None
         try:
@@ -481,7 +695,7 @@ class ASFSearchAdapter:
                 session = self.session_factory()
             else:
                 session = self.session
-            restore = _instrument_session(session, ledger)
+            restore = _instrument_session(session, ledger, self)
             query_filters = dict(self.filters)
             query_filters.update(filters or {})
             parameters = _query_parameters(
@@ -492,7 +706,10 @@ class ASFSearchAdapter:
                 else self.datetime_range,
                 filters=query_filters,
             )
-            parameters["maxResults"] = ledger.budget.max_items
+            parameters["maxResults"] = min(
+                ledger.budget.max_items,
+                limit if limit is not None else ledger.budget.max_items,
+            )
             options = self._options(package, session, parameters)
             previous_timeout: Any = None
             internal = getattr(package, "INTERNAL", None)
@@ -509,23 +726,29 @@ class ASFSearchAdapter:
                 data_path_prefixes=self.path_prefixes,
             )
             produced = 0
+            saw_page = False
+            last_page_complete = True
             for page in self._pages(package, options):
+                saw_page = True
                 complete = getattr(
                     page, "searchComplete", getattr(page, "search_complete", True)
                 )
-                if complete is False:
+                if not isinstance(complete, bool):
                     _error(
                         ASFSearchError,
-                        "incomplete_results",
-                        "asf-search returned an incomplete page",
+                        "inconsistent_results",
+                        "asf-search returned an invalid completion marker",
                     )
+                # ASF marks intermediate pages false and the terminal page
+                # true.  Only an incomplete final page is unsafe to publish.
+                last_page_complete = complete
                 values = (
                     page
                     if isinstance(page, Iterable) and not isinstance(page, Mapping)
                     else (page,)
                 )
                 for product in values:
-                    if produced >= ledger.budget.max_items:
+                    if produced >= parameters["maxResults"]:
                         return
                     record = _with_asset_link(_record_from_product(product), product)
                     if "collection" not in record and "GranuleUR" not in record:
@@ -537,6 +760,12 @@ class ASFSearchAdapter:
                     else:
                         yield normalizer._normalize(record)
                     produced += 1
+            if saw_page and not last_page_complete:
+                _error(
+                    ASFSearchError,
+                    "incomplete_results",
+                    "asf-search returned an incomplete terminal page",
+                )
         except (RemoteLimitError, ASFSearchError):
             raise
         except Exception as exc:

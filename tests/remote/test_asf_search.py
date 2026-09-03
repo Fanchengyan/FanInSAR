@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 import pytest
+import requests
 
 from faninsar import remote
 from faninsar.remote.providers.asf_search import (
@@ -12,9 +14,6 @@ from faninsar.remote.providers.asf_search import (
     EngineUnavailableError,
     UnsupportedASFSearchVersionError,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
 
 
 class _Response:
@@ -79,6 +78,30 @@ class _ASFModule:
         )
         del response
         yield [self.product]
+
+
+class _Page(list[Mapping[str, Any]]):
+    """ASF page fixture carrying the package completion marker."""
+
+    def __init__(self, products: Iterable[Mapping[str, Any]], complete: bool) -> None:
+        super().__init__(products)
+        self.searchComplete = complete
+
+
+class _TwoPageModule(_ASFModule):
+    """ASF module fixture exposing an intermediate and terminal page."""
+
+    def search_generator(
+        self, *, opts: _ASFOptions
+    ) -> Iterable[list[Mapping[str, Any]]]:
+        self.options = opts
+        for complete in (False, True):
+            opts.values["session"].post(
+                url="https://cmr.earthdata.nasa.gov/search/granules.umm_json",
+                data=dict(opts.values),
+                timeout=opts.values.get("timeout", 1.0),
+            )
+            yield _Page([self.product], complete)
 
 
 def _product() -> Mapping[str, Any]:
@@ -155,6 +178,80 @@ def test_asf_search_uses_supplied_operation_session_and_normalizes_product() -> 
     assert ledger.requests == 1
     assert ledger.response_bytes_total == len(b'{"items":[1]}')
     assert session.closed
+
+
+def test_asf_search_yields_intermediate_and_terminal_pages() -> None:
+    """Intermediate ``searchComplete=False`` pages are valid ASF results."""
+    module = _TwoPageModule(_product())
+    session = _Session(_Response(b'{"items":[1]}'))
+    adapter = ASFSearchAdapter(
+        collection="S1-SLC",
+        package=module,
+        session_factory=lambda: session,
+    )
+    ledger = remote._CallLedger(remote.RemoteResourceBudget())
+
+    records = list(adapter.items(ledger=ledger))
+
+    assert len(records) == 2
+    assert ledger.requests == 2
+    assert session.closed
+
+
+class _RedirectTransport(requests.adapters.BaseAdapter):
+    """Requests transport returning one denied redirect."""
+
+    def __init__(self) -> None:
+        self.requests: list[requests.PreparedRequest] = []
+
+    def send(
+        self, request: requests.PreparedRequest, **kwargs: Any
+    ) -> requests.Response:
+        del kwargs
+        self.requests.append(request)
+        response = requests.Response()
+        response.status_code = 302
+        response.headers["Location"] = "https://evil.invalid/steal"
+        response.url = request.url
+        response.request = request
+        response._content = b"redirect"
+        return response
+
+    def close(self) -> None:
+        """Close the fixture transport."""
+
+
+def test_asf_search_denies_redirect_before_following_credentials() -> None:
+    """A denied Location is rejected before Requests sends the next hop."""
+
+    class RedirectModule(_ASFModule):
+        def search_generator(
+            self, *, opts: _ASFOptions
+        ) -> Iterable[list[Mapping[str, Any]]]:
+            self.options = opts
+            opts.values["session"].post(
+                url="https://cmr.earthdata.nasa.gov/search/granules.umm_json",
+                headers={
+                    "Authorization": "Bearer test-secret",
+                    "Cookie": "session=test-secret",
+                },
+            )
+            yield []
+
+    session = requests.Session()
+    transport = _RedirectTransport()
+    session.mount("https://", transport)
+    adapter = ASFSearchAdapter(
+        collection="S1-SLC",
+        package=RedirectModule(_product()),
+        session_factory=lambda: session,
+    )
+
+    with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+        list(adapter.items(ledger=remote._CallLedger(remote.RemoteResourceBudget())))
+
+    assert len(transport.requests) == 1
+    assert transport.requests[0].url.startswith("https://cmr.earthdata.nasa.gov/")
 
 
 def test_asf_search_failure_does_not_fall_back_to_cmr() -> None:
