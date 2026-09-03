@@ -32,6 +32,12 @@ except ImportError:  # pragma: no cover - useful when imported standalone
 STAC_CORE_VERSION = "1.1.0"
 """Version of the STAC core supported by this boundary."""
 
+# Planetary Computer currently serves STAC 1.0 items while FanInSAR's own
+# generated documents remain on the pinned 1.1 profile above.  Input
+# compatibility is intentionally kept private: accepting an older provider
+# representation must not change the profile FanInSAR emits.
+_INPUT_STAC_CORE_VERSIONS = frozenset({"1.0.0", STAC_CORE_VERSION})
+
 STAC_PROFILE_VERSIONS: dict[str, str] = {
     "sar": "1.3.2",
     "satellite": "1.2.0",
@@ -52,6 +58,16 @@ _EXTENSION_URLS = {
     "insar": "https://stac-extensions.github.io/insar/v1.0.0/schema.json",
 }
 SUPPORTED_STAC_EXTENSIONS = _EXTENSION_URLS
+
+_INPUT_EXTENSION_URLS = {
+    **{url: name for name, url in _EXTENSION_URLS.items()},
+    # This is the projection extension URI used by current Planetary
+    # Computer STAC 1.0 responses.  No other legacy or arbitrary extension
+    # URI is admitted.
+    "https://stac-extensions.github.io/projection/v1.0.0/schema.json": (
+        "projection"
+    ),
+}
 
 _PREFIX_TO_PROFILE = {
     "sar": "sar",
@@ -85,6 +101,9 @@ _SIGNED_QUERY_KEYS = frozenset(
         "rsce",
         "rscl",
         "rsct",
+        "ss",
+        "srt",
+        "sdd",
     }
 )
 _KNOWN_TOP_LEVEL = {
@@ -142,8 +161,8 @@ def _scrub_signed(value: Any) -> Any:
 
 def _extension_name(value: str) -> str | None:
     """Resolve one STAC extension URL or short name to its profile name."""
-    if value in _EXTENSION_URLS.values():
-        return next(name for name, url in _EXTENSION_URLS.items() if url == value)
+    if value in _INPUT_EXTENSION_URLS:
+        return _INPUT_EXTENSION_URLS[value]
     # The schema URI is an origin-qualified trust anchor.  Matching only the
     # path would allow an unrelated host to claim one of our approved
     # extensions (for example ``https://attacker.invalid/sar/...``).
@@ -299,7 +318,7 @@ def validate_stac_item(
             "STAC Item type must be Feature",
         )
     version = item.get("stac_version")
-    if version != STAC_CORE_VERSION:
+    if version not in _INPUT_STAC_CORE_VERSIONS:
         _fail(
             STACProfileError,
             "unsupported_stac_version",
@@ -405,6 +424,17 @@ def normalize_stac_item(
             f"expected collection {collection!r}",
         )
     properties = _scrub_signed(dict(item["properties"]))
+    epsg = properties.get("proj:epsg")
+    if (
+        "proj:code" not in properties
+        and isinstance(epsg, int)
+        and not isinstance(epsg, bool)
+        and epsg > 0
+    ):
+        # Keep the provider's projection-1.0 input at the boundary only; all
+        # normalized records expose the qualified canonical field.
+        properties.pop("proj:epsg", None)
+        properties["proj:code"] = f"EPSG:{epsg}"
     start = _utc_datetime(properties.get("start_datetime"), "start_datetime")
     end = _utc_datetime(properties.get("end_datetime"), "end_datetime")
     instant = _utc_datetime(properties.get("datetime"), "datetime")
@@ -428,7 +458,7 @@ def normalize_stac_item(
         "sat:orbit_state",
         "sat:relative_orbit",
         "sat:orbit_cycle",
-        "proj:epsg",
+        "proj:code",
         "proj:shape",
         "proj:transform",
         "proj:bbox",

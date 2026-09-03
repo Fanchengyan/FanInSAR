@@ -304,12 +304,13 @@ _SECRET_KEY = re.compile(
 )
 _SIGNED_QUERY_KEY = re.compile(
     r"^(?:sig(?:nature)?|token|expires?|se(?:curity)?|x-amz-|authorization|"
-    r"sp|st|sv|sr|spr|sip|si|skoid|sktid|skt|ske|sks|skv|rscc|rscd|rsce|rscl|rsct)$",
+    r"sp|st|sv|sr|spr|sip|si|skoid|sktid|skt|ske|sks|skv|rscc|rscd|rsce|rscl|rsct|"
+    r"ss|srt|sdd)$",
     re.IGNORECASE,
 )
 _AZURE_SAS_KEY = re.compile(
     r"^(?:sp|st|se|sv|sr|spr|sip|si|sig|skoid|sktid|skt|ske|sks|skv|"
-    r"rscc|rscd|rsce|rscl|rsct)$",
+    r"rscc|rscd|rsce|rscl|rsct|ss|srt|sdd)$",
     re.IGNORECASE,
 )
 
@@ -419,6 +420,10 @@ class RemoteAsset:
     def __post_init__(self) -> None:
         """Normalize checksum and protect asset metadata from mutation."""
         object.__setattr__(self, "checksum", _normalize_checksum(self.checksum))
+        # The request-local signed URL, when one exists, belongs to the
+        # provider adapter.  A public asset descriptor must never retain its
+        # query credentials (including Azure SAS fields).
+        object.__setattr__(self, "href", _sanitize(self.href))
         object.__setattr__(self, "properties", _freeze(_sanitize(self.properties)))
 
 
@@ -720,15 +725,36 @@ def _query_geometry(
     _fail(RemoteQueryError, "unsupported_geometry", msg)
 
 
-def _safe_url(
+def _url_origin(url: str) -> str:
+    """Return the normalized origin for an HTTPS URL."""
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname
+    if not host:
+        message = "URL has no hostname"
+        raise ValueError(message)
+    port = parsed.port
+    return f"https://{host.lower()}" + (f":{port}" if port and port != 443 else "")
+
+
+def _validate_url(
     url: str,
     adapter: _Adapter,
     *,
     redirect: bool = False,
 ) -> str:
-    """Validate and canonicalize a URL against a registered endpoint policy."""
-    parsed = urllib.parse.urlsplit(url)
-    raw_lower = url.lower()
+    """Validate a URL while preserving request-local query credentials.
+
+    Query strings are intentionally not inspected or rewritten here.  A
+    provider may need a short-lived signed query on an immediate transfer or
+    redirect.  Call :func:`_safe_url` at persistence boundaries to obtain the
+    scrubbed canonical representation instead.
+    """
+    if not isinstance(url, str) or not url:
+        _fail(RemoteAccessError, "invalid_endpoint")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        _fail(RemoteAccessError, "invalid_endpoint")
     if (
         parsed.scheme.lower() != "https"
         or not parsed.hostname
@@ -737,27 +763,24 @@ def _safe_url(
         or parsed.fragment
     ):
         _fail(RemoteAccessError, "invalid_endpoint")
-    if "\\" in url or "%2f" in raw_lower or "%5c" in raw_lower:
+    path_lower = parsed.path.lower()
+    if "\\" in parsed.path or "%2f" in path_lower or "%5c" in path_lower:
         _fail(RemoteAccessError, "invalid_endpoint")
     segments = urllib.parse.unquote(parsed.path).split("/")
     if any(segment in {".", ".."} for segment in segments):
         _fail(RemoteAccessError, "invalid_endpoint")
-    host = parsed.hostname.lower()
     try:
-        port = parsed.port
+        origin = _url_origin(url)
     except ValueError:
         _fail(RemoteAccessError, "invalid_endpoint")
-    origin = f"https://{host}" + (f":{port}" if port and port != 443 else "")
     registered_origins: list[str] = []
     origins = getattr(adapter, "redirect_origins", ()) if redirect else adapter.origins
     for item in origins:
-        registered = urllib.parse.urlsplit(item)
-        registered_host = (registered.hostname or "").lower()
-        registered_port = registered.port
-        port_suffix = (
-            f":{registered_port}" if registered_port and registered_port != 443 else ""
-        )
-        registered_origins.append(f"https://{registered_host}" + port_suffix)
+        try:
+            registered_origin = _url_origin(item)
+        except ValueError:
+            continue
+        registered_origins.append(registered_origin)
     if origin not in registered_origins:
         _fail(RemoteAccessError, "unregistered_endpoint")
     path = parsed.path or "/"
@@ -770,9 +793,47 @@ def _safe_url(
             break
     if not allowed_path:
         _fail(RemoteAccessError, "unregistered_endpoint")
+    # Return the original URL, including its query, for immediate network use.
+    return url
+
+
+def _safe_url(
+    url: str,
+    adapter: _Adapter,
+    *,
+    redirect: bool = False,
+) -> str:
+    """Validate and return a scrubbed canonical URL for persistence.
+
+    This compatibility wrapper retains the historical private helper name for
+    provider adapters.  Network redirect code uses :func:`_validate_url`
+    directly so signed ``Location`` queries survive the hop.
+    """
+    validated = _validate_url(url, adapter, redirect=redirect)
+    parsed = urllib.parse.urlsplit(validated)
+    origin = _url_origin(validated)
     return urllib.parse.urlunsplit(
-        ("https", origin.removeprefix("https://"), path, "", "")
+        ("https", origin.removeprefix("https://"), parsed.path or "/", "", "")
     )
+
+
+def _canonicalize_url(
+    url: str,
+    adapter: _Adapter,
+    *,
+    redirect: bool = False,
+) -> str:
+    """Return the persistence-safe URL after endpoint validation."""
+    return _safe_url(url, adapter, redirect=redirect)
+
+
+def _strip_redirect_credentials(
+    request: urllib.request.Request,
+) -> None:
+    """Remove credential headers before an approved cross-origin redirect."""
+    for name in list(request.headers):
+        if _SECRET_KEY.search(str(name)):
+            del request.headers[name]
 
 
 class _RedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -809,10 +870,26 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
             self._ledger.request()
         elif self._redirects > self._budget.max_redirects:
             _fail(RemoteLimitError, "max_redirects")
-        target = _safe_url(
-            urllib.parse.urljoin(req.full_url, newurl), self._adapter, redirect=True
+        target = _validate_url(
+            urllib.parse.urljoin(req.full_url, newurl),
+            self._adapter,
+            redirect=True,
         )
-        return super().redirect_request(req, fp, code, msg, headers, target)
+        redirected = super().redirect_request(req, fp, code, msg, headers, target)
+        if redirected is None:
+            return None
+        # A signed query is deliberately preserved on an approved redirect,
+        # but ordinary request credentials must not cross origins.  The
+        # standard urllib handler copies headers verbatim, including custom
+        # Authorization/Cookie headers, so enforce the boundary here.
+        try:
+            source_origin = _url_origin(req.full_url)
+            target_origin = _url_origin(target)
+        except ValueError:
+            _fail(RemoteAccessError, "invalid_endpoint")
+        if source_origin != target_origin:
+            _strip_redirect_credentials(redirected)
+        return redirected
 
 
 def _normalize_checksum(value: Any) -> str | None:
@@ -859,7 +936,7 @@ def _normalize_record(
     )
     assets: dict[str, RemoteAsset] = {}
     for key, value in dict(record.get("assets", {})).items():
-        href = _safe_url(str(value.get("href", "")), adapter)
+        href = _canonicalize_url(str(value.get("href", "")), adapter)
         assets[str(key)] = RemoteAsset(
             provider=adapter.provider,
             catalog=catalog,

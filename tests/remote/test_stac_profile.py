@@ -74,6 +74,34 @@ def test_profile_maps_common_sar_satellite_projection_and_file_fields() -> None:
     assert not any(str(key).startswith("faninsar:") for key in record["properties"])
 
 
+def test_live_planetary_computer_stac_1_0_projection_input_is_accepted() -> None:
+    """The live PC profile is accepted without changing FanInSAR output policy."""
+    record = normalize_stac_item(
+        _item(
+            stac_version="1.0.0",
+            stac_extensions=[
+                "https://stac-extensions.github.io/projection/v1.0.0/schema.json"
+            ],
+        ),
+        provider="planetary-computer",
+        catalog="planetary-computer",
+    )
+
+    assert record["stac_profiles"] == ("projection",)
+    assert record["properties"]["proj:code"] == "EPSG:4326"
+    assert "proj:epsg" not in record["properties"]
+
+
+def test_unknown_legacy_extension_is_still_rejected() -> None:
+    """Input compatibility does not become an arbitrary-extension escape hatch."""
+    item = _item(
+        stac_version="1.0.0",
+        stac_extensions=["https://stac-extensions.github.io/eo/v1.0.0/schema.json"],
+    )
+    with pytest.raises(UnknownSTACProfileError):
+        validate_stac_item(item)
+
+
 def test_unknown_extension_fails_closed() -> None:
     """A provider cannot opt into an unregistered extension by name."""
     item = _item(
@@ -115,6 +143,25 @@ def test_normalized_stac_records_scrub_azure_sas_material() -> None:
     assert record["assets"]["data"]["href"] == "https://blob.invalid/data.tif"
     assert "sp" not in record["properties"]
     assert record["properties"]["provider_href"] == "https://blob.invalid/meta.json"
+
+
+def test_normalized_properties_scrub_all_azure_sas_keys() -> None:
+    """New Azure SAS fields are removed from nested properties as well."""
+    item = _item(
+        properties={
+            "datetime": "2024-01-02T03:04:05Z",
+            "ss": "b",
+            "srt": "o",
+            "sdd": "2024-01-01",
+            "nested": {"ss": "b", "safe": "value"},
+        }
+    )
+    record = normalize_stac_item(item, provider="fixture", catalog="catalog")
+
+    assert "ss" not in record["properties"]
+    assert "srt" not in record["properties"]
+    assert "sdd" not in record["properties"]
+    assert record["properties"]["nested"] == {"safe": "value"}
 
 
 def test_malformed_geometry_and_unqualified_insar_fields_are_typed() -> None:

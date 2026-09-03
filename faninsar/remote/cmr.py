@@ -402,6 +402,11 @@ def _collection_claims(
         "CollectionConceptId",
         "collectionConceptId",
     )
+    # A few FedSearch/UMM wrappers flatten the collection concept into
+    # ``meta.concept-id``.  Native UMM ``concept-id`` values are granule IDs
+    # (G-prefixed), so only CMR collection-id syntax is admitted here.
+    concept_ids = _metadata_values(record, "concept-id", "concept_id")
+    concepts.extend(value for value in concept_ids if _is_concept_id(value))
     identities = _metadata_values(record, "collection", "short_name", "ShortName")
     if is_umm:
         reference = record.get("CollectionReference")

@@ -136,6 +136,37 @@ def test_persisted_metadata_scrubs_the_complete_azure_sas_query() -> None:
     }
 
 
+def test_redirect_preserves_signed_query_and_strips_cross_origin_headers() -> None:
+    """An approved signed redirect keeps SAS query material request-local."""
+    adapter = _MeteredAdapter(b"payload")
+    adapter.origins = ("https://source.invalid",)
+    adapter.redirect_origins = ("https://cdn.invalid",)
+    handler = remote._RedirectHandler(
+        adapter,
+        remote.RemoteResourceBudget(max_redirects=1),
+    )
+    request = remote.urllib.request.Request(
+        "https://source.invalid/data/file.tif",
+        headers={"Authorization": "Bearer secret", "Cookie": "session=secret"},
+    )
+    location = (
+        "https://cdn.invalid/data/file.tif?sv=2023-11-03&sig=secret&ss=b&srt=o&sdd=1"
+    )
+    redirected = handler.redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {"Location": location},
+        location,
+    )
+
+    assert redirected is not None
+    assert redirected.full_url == location
+    assert "Authorization" not in redirected.headers
+    assert "Cookie" not in redirected.headers
+
+
 def test_search_propagates_normalized_query_to_capable_adapter() -> None:
     """Adapters receive the same normalized values used by public filtering."""
     adapter = _QueryAdapter(b"payload")
