@@ -144,6 +144,19 @@ class _StacSession:
         return self.response
 
 
+class _RetryStacSession(_StacSession):
+    def __init__(self, response: _StacResponse) -> None:
+        super().__init__(response)
+        self.calls = 0
+
+    def send(self, request: object, **kwargs: object) -> _StacResponse:
+        self.calls += 1
+        if self.calls == 1:
+            message = "transient"
+            raise OSError(message)
+        return super().send(request, **kwargs)
+
+
 def test_planetary_computer_stac_transport_meters_response_history() -> None:
     """Discovery transport charges responses and returned redirect history."""
     redirected = _StacResponse(b"redirect")
@@ -167,6 +180,28 @@ def test_planetary_computer_stac_transport_meters_response_history() -> None:
     assert ledger.requests == 2
     assert ledger.redirects == 1
     assert ledger.response_bytes_total == len(b"redirectfinal")
+
+
+def test_planetary_computer_stac_transport_charges_retries() -> None:
+    """Transient transport failures consume the operation retry budget."""
+    session = _RetryStacSession(_StacResponse(b"final"))
+    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_retries=1))
+    adapter = PlanetaryComputerAdapter(signer=lambda value: value)
+
+    restore = _instrument_session(session, ledger, adapter)
+    try:
+        request = type(
+            "Request",
+            (),
+            {"url": "https://planetarycomputer.microsoft.com/api/stac/v1"},
+        )()
+        session.send(request)
+    finally:
+        restore()
+
+    assert session.calls == 2
+    assert ledger.requests == 2
+    assert ledger.retries == 1
 
 
 class _Response:

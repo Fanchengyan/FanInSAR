@@ -129,9 +129,8 @@ def _instrument_session(
     STAC request.  Wrapping that concrete boundary lets the remote operation
     account for the request, redirect, response-byte, and elapsed-time
     portions that are otherwise invisible to the provider-neutral ledger.
-    Retries are disabled on the operation session by the caller; this keeps
-    retry accounting from occurring inside urllib3 without an observable
-    boundary.
+    Retries are disabled on the operation session by the caller; the wrapper
+    owns the bounded retry loop so each attempt is observable to the ledger.
     """
     send = getattr(session, "send", None)
     if not callable(send):
@@ -152,8 +151,18 @@ def _instrument_session(
         _safe_url(str(url), adapter)
         ledger.check_elapsed()
         requests_before = ledger.requests
-        ledger.request()
-        response = previous_send(request, *args, **kwargs)
+        attempts = 0
+        while True:
+            ledger.request()
+            try:
+                response = previous_send(request, *args, **kwargs)
+            except Exception:
+                if attempts >= ledger.budget.max_retries:
+                    raise
+                ledger.retry()
+                attempts += 1
+                continue
+            break
         history = getattr(response, "history", ())
         history_values = list(history) if isinstance(history, Iterable) else []
         # Real requests recursively calls this wrapped ``send`` for each
