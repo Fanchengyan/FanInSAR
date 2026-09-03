@@ -888,9 +888,9 @@ class CMRCollectionAdapter:
                 "budget_mismatch",
                 "budget must match the supplied operation ledger",
             )
-        request_headers = self._auth_headers(auth_profile)
         if limit <= 0:
             _error(CMRRegistrationError, "invalid_limit", "limit must be positive")
+        request_headers = self._auth_headers(auth_profile)
         for entry in self._pages(
             ledger,
             spatial=spatial,
