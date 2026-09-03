@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.cookiejar
 import importlib
 import inspect
 import json
@@ -1139,7 +1140,14 @@ def _stream_download(
     fetcher = getattr(adapter, "fetch", None)
     supplied_ledger = fetcher is not None and _accepts_ledger(fetcher)
     redirect_handler = _RedirectHandler(adapter, budget, ledger)
-    opener = urllib.request.build_opener(redirect_handler)
+    # Earthdata authentication completes through an OAuth redirect chain that
+    # sets short-lived cookies.  Keep them scoped to this one transfer so the
+    # chain can finish without persisting credentials between operations.
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        redirect_handler,
+        urllib.request.HTTPCookieProcessor(cookie_jar),
+    )
     hasher = hashlib.sha256()
     checksum_algorithm = asset.checksum.split(":", 1)[0] if asset.checksum else None
     checksum_hasher = (
