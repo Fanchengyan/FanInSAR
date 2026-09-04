@@ -8,7 +8,6 @@ operations without introducing a second scientific object model.
 from __future__ import annotations
 
 import base64
-import concurrent.futures
 import hashlib
 import http.cookiejar
 import importlib
@@ -51,7 +50,6 @@ __all__ = [
     "RemoteQueryError",
     "RemoteResourceBudget",
     "download",
-    "download_many",
     "search",
 ]
 
@@ -504,8 +502,6 @@ class _CallLedger:
     redirects: int = 0
     response_bytes_total: int = 0
     _response_bytes: int = 0
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    _local: threading.local = field(default_factory=threading.local, repr=False)
 
     def __post_init__(self) -> None:
         """Capture the operation start before provider work begins."""
@@ -518,30 +514,27 @@ class _CallLedger:
 
     def request(self) -> None:
         """Charge one provider request."""
-        with self._lock:
-            self.requests += 1
-            if self.requests > self.budget.max_requests:
-                _fail(RemoteLimitError, "max_requests")
+        self.requests += 1
+        if self.requests > self.budget.max_requests:
+            _fail(RemoteLimitError, "max_requests")
 
     def retry(self) -> None:
         """Charge one retry before the next request attempt."""
         self.check_elapsed()
-        with self._lock:
-            self.retries += 1
-            if self.retries > self.budget.max_retries:
-                _fail(RemoteLimitError, "max_retries")
+        self.retries += 1
+        if self.retries > self.budget.max_retries:
+            _fail(RemoteLimitError, "max_retries")
 
     def redirect(self) -> None:
         """Charge one redirect followed by a provider request."""
         self.check_elapsed()
-        with self._lock:
-            self.redirects += 1
-            if self.redirects > self.budget.max_redirects:
-                _fail(RemoteLimitError, "max_redirects")
+        self.redirects += 1
+        if self.redirects > self.budget.max_redirects:
+            _fail(RemoteLimitError, "max_redirects")
 
     def begin_response(self) -> None:
         """Start accounting for one response body."""
-        self._local.response_bytes = 0
+        self._response_bytes = 0
 
     def response_bytes(self, count: int) -> None:
         """Charge bytes from the current response body.
@@ -555,14 +548,12 @@ class _CallLedger:
         if count < 0:
             msg = "response byte count must be non-negative"
             raise ValueError(msg)
-        with self._lock:
-            current = getattr(self._local, "response_bytes", 0) + count
-            self._local.response_bytes = current
-            self.response_bytes_total += count
-            if current > self.budget.max_response_bytes:
-                _fail(RemoteLimitError, "max_response_bytes")
-            if self.response_bytes_total > self.budget.max_operation_bytes:
-                _fail(RemoteLimitError, "max_operation_bytes")
+        self._response_bytes += count
+        self.response_bytes_total += count
+        if self._response_bytes > self.budget.max_response_bytes:
+            _fail(RemoteLimitError, "max_response_bytes")
+        if self.response_bytes_total > self.budget.max_operation_bytes:
+            _fail(RemoteLimitError, "max_operation_bytes")
         self.check_elapsed()
 
 
@@ -1268,96 +1259,12 @@ def _stream_download(
     return size, hasher.hexdigest()
 
 
-def _stream_download_parts(
-    asset: RemoteAsset,
-    adapter: _Adapter,
-    budget: RemoteResourceBudget,
-    ledger: _CallLedger,
-    staging: Path,
-    part_size: int,
-) -> tuple[int, str]:
-    """Download a known-size HTTP asset with bounded concurrent byte ranges.
-
-    Range mode is deliberately limited to URL-backed adapters. Provider
-    ``fetch`` callables remain sequential because they may carry provider
-    specific session state that cannot safely be cloned.
-    """
-    if asset.size_bytes is None or getattr(adapter, "fetch", None) is not None:
-        return _stream_download(asset, adapter, budget, ledger, staging)
-    if part_size <= 0:
-        msg = "part_size must be positive"
-        raise ValueError(msg)
-    total = asset.size_bytes
-    ranges = [
-        (start, min(start + part_size, total) - 1)
-        for start in range(0, total, part_size)
-    ]
-    workers = min(budget.max_workers, len(ranges))
-    part_paths = [
-        staging.with_name(f"{staging.name}.part-{i}") for i in range(len(ranges))
-    ]
-
-    def fetch_part(index: int) -> None:
-        start, end = ranges[index]
-        jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(
-            _RedirectHandler(adapter, budget, ledger),
-            urllib.request.HTTPCookieProcessor(jar),
-        )
-        request = urllib.request.Request(
-            asset.href,
-            headers={
-                "Accept-Encoding": "identity",
-                "Range": f"bytes={start}-{end}",
-                **(
-                    {"Authorization": auth}
-                    if (auth := _netrc_authorization(asset.href))
-                    else {}
-                ),
-            },
-        )
-        ledger.request()
-        ledger.begin_response()
-        with opener.open(request, timeout=budget.read_timeout_seconds) as response:
-            payload = response.read(end - start + 1)
-            ledger.response_bytes(len(payload))
-            if len(payload) != end - start + 1:
-                _fail(RemoteIntegrityError, "range_length_mismatch")
-            part_paths[index].write_bytes(payload)
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(fetch_part, range(len(ranges))))
-        hasher = hashlib.sha256()
-        with staging.open("wb") as output:
-            for part in part_paths:
-                data = part.read_bytes()
-                output.write(data)
-                hasher.update(data)
-            output.flush()
-            os.fsync(output.fileno())
-    finally:
-        for part in part_paths:
-            part.unlink(missing_ok=True)
-    size = staging.stat().st_size
-    if size != total:
-        _fail(RemoteIntegrityError, "content_length_mismatch")
-    if asset.checksum:
-        algorithm, expected = asset.checksum.split(":", 1)
-        digest = hashlib.new(algorithm, staging.read_bytes()).hexdigest()
-        if digest != expected:
-            _fail(RemoteIntegrityError, "checksum_mismatch")
-    return size, hasher.hexdigest()
-
-
 def download(
     asset: RemoteAsset,
     destination: Path,
     *,
     overwrite: bool = False,
     budget: RemoteResourceBudget | None = None,
-    parallel_parts: bool = False,
-    part_size: int = 16 * 1024 * 1024,
 ) -> Path:
     """Download one complete asset and publish it atomically.
 
@@ -1401,11 +1308,12 @@ def download(
                 delete=False,
             ) as stream:
                 temporary = Path(stream.name)
-            stream = _stream_download_parts if parallel_parts else _stream_download
-            size, digest = (
-                stream(asset, adapter, budget, ledger, temporary, part_size)
-                if parallel_parts
-                else stream(asset, adapter, budget, ledger, temporary)
+            size, digest = _stream_download(
+                asset,
+                adapter,
+                budget,
+                ledger,
+                temporary,
             )
             temporary.replace(destination)
             temporary = None
@@ -1435,54 +1343,6 @@ def download(
             if manifest_temp is not None:
                 manifest_temp.unlink(missing_ok=True)
     return destination
-
-
-def download_many(
-    assets: Sequence[RemoteAsset],
-    destinations: Sequence[Path],
-    *,
-    overwrite: bool = False,
-    budget: RemoteResourceBudget | None = None,
-    parallel_files: bool = False,
-    parallel_parts: bool = False,
-    part_size: int = 16 * 1024 * 1024,
-) -> list[Path]:
-    """Download multiple assets, optionally in parallel.
-
-    ``parallel_files`` controls concurrency across assets. ``parallel_parts``
-    controls byte-range concurrency within each individual HTTP asset.
-    """
-    if len(assets) != len(destinations):
-        msg = "assets and destinations must have equal length"
-        raise ValueError(msg)
-    budget = budget or RemoteResourceBudget()
-    if not parallel_files:
-        return [
-            download(
-                asset,
-                destination,
-                overwrite=overwrite,
-                budget=budget,
-                parallel_parts=parallel_parts,
-                part_size=part_size,
-            )
-            for asset, destination in zip(assets, destinations, strict=True)
-        ]
-    workers = min(budget.max_workers, len(assets))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(
-                download,
-                asset,
-                destination,
-                overwrite=overwrite,
-                budget=budget,
-                parallel_parts=parallel_parts,
-                part_size=part_size,
-            )
-            for asset, destination in zip(assets, destinations, strict=True)
-        ]
-        return [future.result() for future in futures]
 
 
 def _default_fixture() -> None:
