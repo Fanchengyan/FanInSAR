@@ -80,6 +80,28 @@ def test_asf_cmr_profile_registers_provider_auth_redirects() -> None:
     assert "https://cumulus.asf.alaska.edu" in adapter.redirect_origins
 
 
+def test_asf_cmr_auth_redirects_use_scoped_exact_paths() -> None:
+    """Default ASF registration admits only its token and OAuth endpoints."""
+    adapter = CMRCollectionAdapter(
+        provider="ASF",
+        collection="sentinel-1",
+        data_origins=("https://datapool.asf.alaska.edu",),
+        profiles=("anonymous", "earthdata-asf"),
+    )
+    for url in (
+        "https://urs.earthdata.nasa.gov/api/users/find_or_create_token",
+        "https://urs.earthdata.nasa.gov/oauth/authorize?response_type=code",
+    ):
+        assert remote._validate_url(url, adapter, redirect=True) == url
+    for url in (
+        "https://urs.earthdata.nasa.gov/api/users/other",
+        "https://urs.earthdata.nasa.gov/api/account",
+        "https://cumulus.asf.alaska.edu/admin",
+    ):
+        with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+            remote._validate_url(url, adapter, redirect=True)
+
+
 def test_cmr_json_pagination_uses_search_after_and_collection_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -342,6 +364,91 @@ def test_provider_candidate_filter_selects_valid_nisar_tiff() -> None:
     assert record["assets"]["data"]["href"].endswith("DEM_S90_00_W180_00_C01.tif")
 
 
+def test_provider_candidate_filter_skips_mismatch_and_continues_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Filtered representation mismatches do not abort later CMR pages."""
+    adapter = CMRCollectionAdapter(
+        provider="ASF",
+        collection="nisar-glo30",
+        endpoint="https://cmr.invalid/search/granules.json",
+        page_size=1,
+        data_origins=("https://nisar.asf.earthdatacloud.nasa.gov",),
+        candidate_filter=lambda _candidate, href: href.lower().endswith(".tif"),
+    )
+    base = {
+        "collection_concept_id": "C3803703055-ASF",
+        "polygons": ["0 0 0 1 1 1 0 0"],
+    }
+    pages = [
+        (
+            {
+                **base,
+                "id": "VRT",
+                "links": [
+                    {
+                        "rel": "data#",
+                        "href": "https://nisar.asf.earthdatacloud.nasa.gov/adjacent.vrt",
+                    }
+                ],
+            },
+            {"cmr-search-after": "next"},
+        ),
+        (
+            {
+                **base,
+                "id": "TIFF",
+                "links": [
+                    {
+                        "rel": "data#",
+                        "href": "https://nisar.asf.earthdatacloud.nasa.gov/native.tif",
+                    }
+                ],
+            },
+            {},
+        ),
+    ]
+
+    def page(
+        _self: CMRCollectionAdapter,
+        _url: str,
+        _headers: dict[str, str],
+        _ledger: Any,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        entry, headers = pages.pop(0)
+        return {"feed": {"entry": [entry]}}, headers
+
+    monkeypatch.setattr(CMRCollectionAdapter, "_request_page", page)
+    records = list(
+        adapter.items(ledger=remote._CallLedger(remote.RemoteResourceBudget()))
+    )
+    assert [record["id"] for record in records] == ["TIFF"]
+
+
+def test_cmr_candidate_filter_and_unfiltered_adapters_fail_closed() -> None:
+    """A matching unsafe URL, or any unsafe unfiltered URL, is rejected."""
+    entry = {
+        "id": "G1",
+        "collection_concept_id": "C123",
+        "polygons": ["0 0 0 1 1 1 0 0"],
+        "links": [{"rel": "data#", "href": "https://evil.invalid/native.tif"}],
+    }
+    filtered = CMRCollectionAdapter(
+        provider="FIXTURE",
+        collection="C123",
+        endpoint="https://cmr.invalid/search/granules.json",
+        candidate_filter=lambda _candidate, href: href.endswith(".tif"),
+    )
+    unfiltered = CMRCollectionAdapter(
+        provider="FIXTURE",
+        collection="C123",
+        endpoint="https://cmr.invalid/search/granules.json",
+    )
+    for adapter in (filtered, unfiltered):
+        with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+            adapter._normalize(entry)
+
+
 def test_compact_polygon_accepts_one_coordinate_string() -> None:
     """Decode compact CMR's one-string latitude/longitude polygon form."""
     adapter = CMRCollectionAdapter(
@@ -360,6 +467,46 @@ def test_compact_polygon_accepts_one_coordinate_string() -> None:
         "type": "Polygon",
         "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
     }
+
+
+def test_compact_polygon_accepts_nested_single_coordinate_string() -> None:
+    """Decode the nested single-string ring emitted by real compact CMR."""
+    adapter = CMRCollectionAdapter(
+        provider="FIXTURE",
+        collection="C123",
+        endpoint="https://cmr.invalid/search/granules.json",
+    )
+    entry = {
+        "id": "G1",
+        "collection_concept_id": "C123",
+        "polygons": [["34.0 -117.0 34.0 -116.0 35.0 -116.0 34.0 -117.0"]],
+        "links": [{"rel": "data#", "href": "https://cmr.invalid/data/g1"}],
+    }
+    record = adapter._normalize(entry)
+    assert record["geometry"] == {
+        "type": "Polygon",
+        "coordinates": [
+            [[-117.0, 34.0], [-116.0, 34.0], [-116.0, 35.0], [-117.0, 34.0]]
+        ],
+    }
+
+
+def test_compact_polygon_rejects_ambiguous_nested_ring() -> None:
+    """Do not silently combine a complete string with point strings."""
+    adapter = CMRCollectionAdapter(
+        provider="FIXTURE",
+        collection="C123",
+        endpoint="https://cmr.invalid/search/granules.json",
+    )
+    entry = {
+        "id": "G1",
+        "collection_concept_id": "C123",
+        "polygons": [["0 0 0 1 1 1 0 0", "0 0"]],
+        "links": [{"rel": "data#", "href": "https://cmr.invalid/data/g1"}],
+    }
+    with pytest.raises(remote.RemoteAccessError) as error:
+        adapter._normalize(entry)
+    assert error.value.reason == "missing_footprint"
 
 
 def test_auth_profile_resolver_is_operation_scoped(

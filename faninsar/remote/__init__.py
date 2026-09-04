@@ -488,6 +488,7 @@ class _Adapter(Protocol):
     origins: tuple[str, ...]
     path_prefixes: tuple[str, ...]
     redirect_origins: tuple[str, ...]
+    redirect_path_prefixes: Mapping[str, tuple[str, ...]]
     profiles: tuple[str, ...]
 
     def items(
@@ -818,7 +819,12 @@ def _validate_url(
     if origin not in registered_origins:
         _fail(RemoteAccessError, "unregistered_endpoint")
     path = parsed.path or "/"
-    prefixes = adapter.path_prefixes or ("/",)
+    origin_prefixes = getattr(adapter, "redirect_path_prefixes", {})
+    prefixes = (
+        origin_prefixes.get(origin, adapter.path_prefixes)
+        if redirect and isinstance(origin_prefixes, Mapping)
+        else adapter.path_prefixes
+    ) or ("/",)
     allowed_path = False
     for prefix in prefixes:
         normalized_prefix = prefix.rstrip("/") or "/"

@@ -196,8 +196,26 @@ def _geometry_from_cmr(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
                 continue
             ring = [[longitude, latitude] for latitude, longitude in pairs]
         elif isinstance(polygon, (list, tuple)):
+            # Real compact CMR responses may wrap a complete ring in one
+            # string: ``[["lat lon lat lon ..."]]``.  Treat a mixed list of
+            # point strings and a complete coordinate string as ambiguous,
+            # rather than silently dropping part of the footprint.
+            if len(polygon) == 1 and isinstance(polygon[0], str):
+                values = [
+                    value for value in re.split(r"[,\s]+", polygon[0].strip()) if value
+                ]
+                if len(values) < 6 or len(values) % 2:
+                    continue
+                try:
+                    pairs = [
+                        (float(values[index]), float(values[index + 1]))
+                        for index in range(0, len(values), 2)
+                    ]
+                except ValueError:
+                    continue
+                ring = [[longitude, latitude] for latitude, longitude in pairs]
             # A flat numeric list is another compact CMR representation.
-            if polygon and all(
+            elif polygon and all(
                 isinstance(point, (int, float)) and not isinstance(point, bool)
                 for point in polygon
             ):
@@ -307,6 +325,12 @@ def _cmr_links(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     selected: list[Mapping[str, Any]] = []
     for link in links:
         if not isinstance(link, Mapping) or not isinstance(link.get("href"), str):
+            continue
+        # CMR repeats collection-level documentation/search links on every
+        # granule with ``inherited=true``.  They are not granule assets and
+        # commonly point at unrelated origins; only granule-owned links enter
+        # the URL allowlist.
+        if link.get("inherited") is True:
             continue
         rel = str(link.get("rel", "")).strip().lower()
         # FedSearch uses a URI such as
@@ -474,7 +498,9 @@ class CMRCollectionAdapter:
         transient request headers.  Resolved values are never persisted.
     candidate_filter : callable, optional
         Provider-registered predicate receiving a candidate and its scrubbed
-        URL.  Candidates rejected by the predicate are not published.
+        URL.  An URL rejected by the allowlist is passed in its original form
+        only so the predicate can reject a mismatched representation; it is
+        never published.  Candidates rejected by the predicate are skipped.
 
     """
 
@@ -491,6 +517,7 @@ class CMRCollectionAdapter:
     origins: tuple[str, ...] = field(init=False)
     path_prefixes: tuple[str, ...] = field(init=False)
     redirect_origins: tuple[str, ...] = field(init=False)
+    redirect_path_prefixes: Mapping[str, tuple[str, ...]] = field(init=False)
     profiles: tuple[str, ...] = ("anonymous",)
     auth_resolver: Callable[[str], Mapping[str, str] | None] | None = None
     candidate_filter: Callable[[Mapping[str, Any], str], bool] | None = None
@@ -587,6 +614,17 @@ class CMRCollectionAdapter:
                 ),
             ),
         )
+        auth_path_prefixes: dict[str, tuple[str, ...]] = {}
+        if self.provider.casefold() == "asf" and "earthdata-asf" in self.profiles:
+            # These are the only URS paths used by the ASF token/OAuth
+            # handshake.  Keep them scoped to URS; the data/catalog prefixes
+            # must never turn the whole authentication origin into a wildcard.
+            auth_path_prefixes[_ASF_EDL_ORIGIN] = (
+                "/api/users/find_or_create_token",
+                "/oauth/authorize",
+            )
+            auth_path_prefixes[_ASF_AUTH_ORIGIN] = ("/login",)
+        object.__setattr__(self, "redirect_path_prefixes", auth_path_prefixes)
 
     def _auth_headers(self, profile: str) -> Mapping[str, str]:
         """Resolve one profile into transient request headers.
@@ -866,13 +904,44 @@ class CMRCollectionAdapter:
             try:
                 clean_href = _safe_url(href, self)
             except RemoteAccessError:
-                continue
-            if self.candidate_filter is not None and not self.candidate_filter(
-                candidate, clean_href
-            ):
-                continue
+                if self.candidate_filter is None:
+                    raise
+                # Filters need to see an unsafe URL to reject a mismatched
+                # representation, but it must never be published.  A filter
+                # that claims this candidate matches still fails closed below.
+                try:
+                    matches = self.candidate_filter(candidate, href)
+                except Exception:
+                    logger.exception("CMR candidate filter failed")
+                    _error(
+                        CMRDiscoveryError,
+                        "candidate_filter_failed",
+                        f"candidate filter failed for granule {item_id!r}",
+                    )
+                if not matches:
+                    continue
+                raise
+            if self.candidate_filter is not None:
+                try:
+                    matches = self.candidate_filter(candidate, clean_href)
+                except Exception:
+                    logger.exception("CMR candidate filter failed")
+                    _error(
+                        CMRDiscoveryError,
+                        "candidate_filter_failed",
+                        f"candidate filter failed for granule {item_id!r}",
+                    )
+                if not matches:
+                    continue
             safe_candidates.append((name, candidate, clean_href))
         if not safe_candidates:
+            if self.candidate_filter is not None:
+                # A filtered representation mismatch is an expected
+                # discovery result, not an operation failure.  Let ``items``
+                # advance to the next granule without emitting an error log.
+                reason = "candidate_mismatch"
+                message = f"granule {item_id!r} has no matching data representation"
+                raise CMRDiscoveryError(reason, message)
             _error(
                 CMRDiscoveryError,
                 "unsafe_data_url",
@@ -949,7 +1018,16 @@ class CMRCollectionAdapter:
             limit=limit,
             request_headers=request_headers,
         ):
-            yield self._normalize(entry)
+            try:
+                normalized = self._normalize(entry)
+            except CMRDiscoveryError as error:
+                if (
+                    self.candidate_filter is not None
+                    and error.reason == "candidate_mismatch"
+                ):
+                    continue
+                raise
+            yield normalized
 
 
 CMRAdapter = CMRCollectionAdapter
@@ -1015,6 +1093,7 @@ def register_cmr_catalog(
     headers: Mapping[str, str] | None = None,
     profiles: Sequence[str] = ("anonymous",),
     auth_resolver: Callable[[str], Mapping[str, str] | None] | None = None,
+    candidate_filter: Callable[[Mapping[str, Any], str], bool] | None = None,
     data_origins: tuple[str, ...] = (),
     data_path_prefixes: tuple[str, ...] = ("/",),
 ) -> CMRCollectionAdapter:
@@ -1034,6 +1113,7 @@ def register_cmr_catalog(
         headers=headers or {},
         profiles=tuple(profiles),
         auth_resolver=auth_resolver,
+        candidate_filter=candidate_filter,
         data_origins=data_origins,
         data_path_prefixes=data_path_prefixes,
     )
