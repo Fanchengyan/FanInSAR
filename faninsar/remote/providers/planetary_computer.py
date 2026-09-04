@@ -12,7 +12,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -89,11 +89,29 @@ def _as_mapping(item: object) -> Mapping[str, Any]:
 def _signed_href(item: object, key: str) -> str:
     """Read one asset href after the item has been signed in place."""
     if isinstance(item, Mapping):
-        asset = item.get("assets", {}).get(key, {})
-        return str(asset.get("href", ""))
+        assets = item.get("assets", {})
+        asset = assets.get(key, {}) if isinstance(assets, Mapping) else {}
+        return str(asset.get("href", "")) if isinstance(asset, Mapping) else ""
     assets = getattr(item, "assets", {})
     asset = assets.get(key)
     return str(getattr(asset, "href", ""))
+
+
+@dataclass(slots=True)
+class _SigningAsset:
+    """Minimal private asset shape accepted by Planetary Computer signers."""
+
+    href: str
+    extra_fields: dict[str, object] = field(default_factory=dict)
+    media_type: str | None = None
+
+
+@dataclass(slots=True)
+class _SigningItem:
+    """Minimal private STAC item shape used for operation-local signing."""
+
+    id: str
+    assets: dict[str, _SigningAsset]
 
 
 def _meter_response(response: Any, ledger: _CallLedger) -> None:
@@ -225,7 +243,7 @@ class PlanetaryComputerAdapter:
     path_prefixes: tuple[str, ...] = field(init=False)
     redirect_origins: tuple[str, ...] = field(init=False)
     profiles: tuple[str, ...] = ("anonymous",)
-    _signed: dict[tuple[str, str], str] = field(default_factory=dict, init=False)
+    _allow_anonymous_delivery: bool = field(default=True, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate the endpoint and configure URL allowlists."""
@@ -257,14 +275,13 @@ class PlanetaryComputerAdapter:
         return self
 
     def _sign_item(self, item: object) -> object:
-        """Sign one STAC item without writing credentials to disk."""
+        """Sign one STAC-shaped object without writing credentials to disk."""
         signer = self.signer
         if signer is None:
             try:
                 import planetary_computer
             except ImportError as error:
                 message = "Planetary Computer support requires planetary-computer"
-                logger.exception(message)
                 try:
                     _fail(RemoteAccessError, "missing_optional_dependency", message)
                 except RemoteAccessError as raised:
@@ -272,6 +289,63 @@ class PlanetaryComputerAdapter:
             signer = planetary_computer.sign_inplace
         signed = signer(item)
         return item if signed is None else signed
+
+    def _transfer_url(
+        self,
+        asset: object,
+        *,
+        budget: RemoteResourceBudget,
+        ledger: _CallLedger,
+    ) -> str:
+        """Resolve one signed asset URL for exactly one download operation.
+
+        The temporary STAC-shaped object exists only while the signer runs;
+        neither it nor its signed href is retained by the adapter or remote
+        asset descriptor.  Signing is deliberately outside discovery so a
+        fresh download gets a fresh capability and ledger.
+        """
+        del budget
+        href = str(getattr(asset, "href", ""))
+        key = str(getattr(asset, "key", self.asset_key))
+        if not href:
+            _fail(RemoteAccessError, "invalid_endpoint")
+        _safe_url(href, self)
+        ledger.check_elapsed()
+        signing_asset = _SigningAsset(href=href)
+        signing_item = _SigningItem(
+            id=str(getattr(asset, "item_id", "")),
+            assets={key: signing_asset},
+        )
+        try:
+            signed = self._sign_item(signing_item)
+            signed_href = _signed_href(signed, key)
+        except RemoteAccessError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "Planetary Computer signing failed (%s)", type(error).__name__
+            )
+            _fail(RemoteAccessError, "signing_failed")
+        if not signed_href:
+            _fail(RemoteAccessError, "signing_failed")
+        # A signer may only issue a capability for the validated PC asset
+        # origin.  Redirects from that gateway are handled by the common
+        # anonymous-delivery validator in ``faninsar.remote``.
+        try:
+            if _origin(signed_href) != _origin(href):
+                _fail(RemoteAccessError, "unregistered_endpoint")
+            from faninsar.remote import _validate_url
+
+            _validate_url(signed_href, self)
+        except RemoteAccessError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "Planetary Computer signed URL validation failed (%s)",
+                type(error).__name__,
+            )
+            _fail(RemoteAccessError, "invalid_endpoint")
+        return signed_href
 
     def _client(self, ledger: _CallLedger) -> tuple[object, Callable[[], None] | None]:
         """Return a STAC client and cleanup callback for one operation.
@@ -487,8 +561,10 @@ class PlanetaryComputerAdapter:
                     catalog=self.provider,
                     collection=self.collection,
                 )
-                item = self._sign_item(raw_item)
-                item_mapping = dict(_as_mapping(item))
+                # Discovery stays unsigned.  The selected public href is
+                # normalized into the immutable RemoteAsset and is signed
+                # only by ``_transfer_url`` inside a later download call.
+                item_mapping = raw_mapping
                 item_id = item_mapping.get("id")
                 assets = item_mapping.get("assets")
                 if not isinstance(assets, Mapping):
@@ -517,7 +593,6 @@ class PlanetaryComputerAdapter:
                     or unsigned.hostname != PC_ASSET_HOST
                 ):
                     _fail(RemoteAccessError, "unregistered_endpoint")
-                self._signed[(item_id, self.asset_key)] = href
                 persisted_assets = dict(assets)
                 persisted_asset = dict(asset)
                 persisted_asset["href"] = urllib.parse.urlunsplit(
@@ -543,46 +618,6 @@ class PlanetaryComputerAdapter:
             if callable(close):
                 close()
         return records
-
-    def fetch(
-        self,
-        asset: object,
-        budget: RemoteResourceBudget,
-        *,
-        ledger: _CallLedger | None = None,
-    ) -> Iterator[bytes]:
-        """Stream one complete signed COG using the P0044 accounting seam."""
-        item_id = str(getattr(asset, "item_id", ""))
-        key = str(getattr(asset, "key", self.asset_key))
-        url = self._signed.get((item_id, key), str(getattr(asset, "href", "")))
-        unsigned = urllib.parse.urlunsplit((*urllib.parse.urlsplit(url)[:3], "", ""))
-        _safe_url(unsigned, self)
-        if ledger is None:
-            ledger = _CallLedger(budget)
-        ledger.request()
-        ledger.begin_response()
-        request = urllib.request.Request(url, headers={"Accept-Encoding": "identity"})
-        opener = urllib.request.build_opener(_RedirectHandler(self, budget, ledger))
-        try:
-            response = self._open(opener, request, budget.read_timeout_seconds)
-            with response:
-                if response.headers.get("Content-Encoding", "identity") != "identity":
-                    _fail(RemoteAccessError, "unexpected_content_encoding")
-                for chunk in iter(lambda: response.read(1024 * 1024), b""):
-                    ledger.response_bytes(len(chunk))
-                    yield bytes(chunk)
-        except (urllib.error.URLError, OSError):
-            logger.exception("Planetary Computer asset transfer failed")
-            # Preserve the standard-library exception so the P0044 public
-            # boundary can apply its operation-wide retry policy.
-            raise
-
-    def _open(
-        self, opener: object, request: urllib.request.Request, timeout: float
-    ) -> object:
-        """Open a request; isolated for deterministic transfer tests."""
-        return opener.open(request, timeout=timeout)  # type: ignore[attr-defined]
-
 
 def register_planetary_computer(
     name: str = "pc", **kwargs: Any

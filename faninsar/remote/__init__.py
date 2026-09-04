@@ -10,7 +10,6 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
-import http.cookiejar
 import importlib
 import inspect
 import json
@@ -376,7 +375,11 @@ def _sanitize(value: Any, key: str | None = None) -> Any:  # noqa: PLR0911
                 return urllib.parse.urlunsplit(
                     (parsed.scheme, parsed.netloc, parsed.path, "", "")
                 )
-            query = [(k, v) for k, v in query if not _SIGNED_QUERY_KEY.search(k)]
+            query = [
+                (k, v)
+                for k, v in query
+                if not (_SIGNED_QUERY_KEY.search(k) or _SECRET_KEY.search(k))
+            ]
             clean_query = urllib.parse.urlencode(query)
             return urllib.parse.urlunsplit(
                 (parsed.scheme, parsed.netloc, parsed.path, clean_query, "")
@@ -850,6 +853,139 @@ def _validate_url(
     return url
 
 
+def _registered_origin(url: str, adapter: _Adapter, *, redirect: bool) -> bool:
+    """Return whether ``url`` belongs to one registered adapter origin."""
+    try:
+        origin = _url_origin(url)
+    except (TypeError, ValueError):
+        return False
+    origins = getattr(adapter, "redirect_origins", ()) if redirect else adapter.origins
+    for candidate in origins:
+        try:
+            if _url_origin(candidate) == origin:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _validate_anonymous_delivery_url(
+    source_url: str,
+    target_url: str,
+    adapter: _Adapter,
+) -> str:
+    """Validate a credential-free HTTPS object target after a trusted hop.
+
+    The source must be a registered redirect origin, which is the provider
+    gateway trust boundary.  Once that boundary has been crossed, the target
+    host and storage path are intentionally not registry-owned.  Structural
+    URL checks still reject the forms that could change authority or route a
+    request through a traversal-like path.
+    """
+    if not _registered_origin(source_url, adapter, redirect=True):
+        _fail(RemoteAccessError, "unregistered_endpoint")
+    if not isinstance(target_url, str) or not target_url:
+        _fail(RemoteAccessError, "invalid_endpoint")
+    try:
+        parsed = urllib.parse.urlsplit(target_url)
+    except ValueError:
+        _fail(RemoteAccessError, "invalid_endpoint")
+    try:
+        port = parsed.port
+    except ValueError:
+        _fail(RemoteAccessError, "invalid_endpoint")
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or (port is None and ":" in parsed.netloc.rsplit("@", 1)[-1])
+    ):
+        _fail(RemoteAccessError, "invalid_endpoint")
+    path_lower = parsed.path.lower()
+    if "\\" in parsed.path or "%2f" in path_lower or "%5c" in path_lower:
+        _fail(RemoteAccessError, "invalid_endpoint")
+    segments = urllib.parse.unquote(parsed.path).split("/")
+    if any(segment in {".", ".."} for segment in segments):
+        _fail(RemoteAccessError, "invalid_endpoint")
+    try:
+        # Accessing ``port`` above catches malformed ``host:port`` values.
+        _url_origin(target_url)
+    except (TypeError, ValueError):
+        _fail(RemoteAccessError, "invalid_endpoint")
+    return target_url
+
+
+def _has_signed_query(url: str) -> bool:
+    """Return whether a URL query contains request-capability material."""
+    try:
+        query = urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(url).query,
+            keep_blank_values=True,
+        )
+    except ValueError:
+        return False
+    return any(
+        _SECRET_KEY.search(key) or _SIGNED_QUERY_KEY.fullmatch(key)
+        for key, _value in query
+    )
+
+
+def _response_is_complete(response: Any) -> None:
+    """Require a complete, un-ranged HTTP response before streaming."""
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(response, "status", None)
+    headers = getattr(response, "headers", {})
+    has_content_range = isinstance(headers, Mapping) and any(
+        str(name).lower() == "content-range" and value
+        for name, value in headers.items()
+    )
+    if status == 206 or has_content_range:
+        _fail(RemoteAccessError, "partial_content")
+    if status != 200:
+        _fail(RemoteAccessError, "unexpected_status")
+
+
+def _representation_kind(asset: RemoteAsset) -> str | None:
+    """Infer a binary representation classifier from safe asset metadata."""
+    media_type = (asset.media_type or "").lower().split(";", 1)[0].strip()
+    path = urllib.parse.urlsplit(asset.href).path.lower()
+    if "zip" in media_type or path.endswith(".zip"):
+        return "zip"
+    if media_type in {"image/tiff", "image/geotiff"} or path.endswith(
+        (".tif", ".tiff", ".geotiff")
+    ):
+        return "tiff"
+    if "hdf" in media_type or path.endswith((".h5", ".hdf", ".hdf5")):
+        return "hdf5"
+    return None
+
+
+def _validate_representation(staging: Path, asset: RemoteAsset) -> None:
+    """Validate the bounded binary prefix before atomic publication."""
+    kind = _representation_kind(asset)
+    if kind is None:
+        return
+    try:
+        with staging.open("rb") as stream:
+            prefix = stream.read(512)
+    except OSError:
+        _fail(RemoteIntegrityError, "representation_unreadable")
+    probe = prefix.removeprefix(b"\xef\xbb\xbf").lstrip(b" \t\r\n")
+    lowered = probe[:16].lower()
+    if lowered.startswith((b"<!doctype html", b"<html", b"<?xml")):
+        _fail(RemoteIntegrityError, "representation_mismatch")
+    magic: dict[str, tuple[bytes, ...]] = {
+        "zip": (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
+        "tiff": (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"),
+        "hdf5": (b"\x89HDF\r\n\x1a\n",),
+    }
+    if not any(prefix.startswith(value) for value in magic[kind]):
+        _fail(RemoteIntegrityError, "representation_mismatch")
+
+
 def _safe_url(
     url: str,
     adapter: _Adapter,
@@ -958,68 +1094,12 @@ def _asf_redirect_url(
     asset: RemoteAsset,
     adapter: _Adapter,
 ) -> str:
-    """Validate one ASF redirect, including its scoped CloudFront handoff.
-
-    ASF's Sentinel-1 service issues a short-lived CloudFront URL whose host is
-    deployment-specific.  That URL is admitted only when it comes directly
-    from the registered Sentinel-1 origin, names the approved ASF SLC bucket,
-    and retains the exact SAFE ZIP filename selected during discovery.
-    """
+    """Validate one ASF redirect and its anonymous delivery handoff."""
+    del asset
     try:
         return _validate_url(target_url, adapter, redirect=True)
     except RemoteAccessError:
-        pass
-    try:
-        source_origin = _url_origin(source_url)
-        source_path = urllib.parse.unquote(
-            urllib.parse.urlsplit(source_url).path or "/"
-        )
-        parsed = urllib.parse.urlsplit(target_url)
-        host = (parsed.hostname or "").lower()
-        source_name = urllib.parse.unquote(
-            urllib.parse.urlsplit(asset.href).path.rsplit("/", 1)[-1]
-        )
-        target_name = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
-        asset_path = urllib.parse.unquote(urllib.parse.urlsplit(asset.href).path or "/")
-        target_path = urllib.parse.unquote(parsed.path)
-    except (TypeError, ValueError):
-        _fail(RemoteAccessError, "invalid_endpoint")
-    is_sentinel1 = source_origin == _ASF_SENTINEL1_ORIGIN
-    is_nisar = source_origin == _ASF_NISAR_ORIGIN
-    nisar_key = (
-        source_path.removeprefix(_ASF_NISAR_GATEWAY_PREFIX)
-        if source_path.startswith(f"{_ASF_NISAR_GATEWAY_PREFIX}/DEM/v1.2/")
-        else None
-    )
-    nisar_target = (
-        _ASF_NISAR_CLOUDFRONT_PATH.fullmatch(urllib.parse.unquote(parsed.path))
-        if is_nisar
-        else None
-    )
-    if (
-        not (is_sentinel1 or is_nisar)
-        or parsed.scheme.lower() != "https"
-        or not _ASF_CLOUDFRONT_HOST.fullmatch(host)
-        or parsed.username
-        or parsed.password
-        or parsed.fragment
-        or "\\" in parsed.path
-        or "%2f" in parsed.path.lower()
-        or "%5c" in parsed.path.lower()
-        or any(segment in {".", ".."} for segment in target_path.split("/"))
-        or not (
-            _ASF_SLC_CLOUDFRONT_PATH.fullmatch(parsed.path)
-            if is_sentinel1
-            else nisar_target is not None
-            and nisar_key is not None
-            and source_path == asset_path
-            and nisar_target.group("key") == nisar_key
-        )
-        or not source_name
-        or target_name != source_name
-    ):
-        _fail(RemoteAccessError, "unregistered_endpoint")
-    return target_url
+        return _validate_anonymous_delivery_url(source_url, target_url, adapter)
 
 
 def _lpdaac_redirect_url(
@@ -1028,54 +1108,12 @@ def _lpdaac_redirect_url(
     asset: RemoteAsset,
     adapter: _Adapter,
 ) -> str:
-    """Validate one LPDAAC redirect, including its scoped CloudFront hop.
-
-    LPDAAC's Earthdata Cloud delivery authenticates through URS and returns a
-    short-lived CloudFront URL for the original object.  The CDN hostname is
-    deployment-specific, so it is admitted only when the redirect originated
-    at the registered LPDAAC data URL and the target names the exact S3 key
-    and filename selected during CMR discovery.
-    """
+    """Validate one LPDAAC redirect and its anonymous delivery handoff."""
+    del asset
     try:
         return _validate_url(target_url, adapter, redirect=True)
     except RemoteAccessError:
-        pass
-    try:
-        source_origin = _url_origin(source_url)
-        source_path = urllib.parse.unquote(
-            urllib.parse.urlsplit(source_url).path or "/"
-        )
-        asset_path = urllib.parse.unquote(urllib.parse.urlsplit(asset.href).path or "/")
-        parsed = urllib.parse.urlsplit(target_url)
-        target_path = urllib.parse.unquote(parsed.path)
-        target_host = (parsed.hostname or "").lower()
-        target_match = _LPDAAC_CLOUDFRONT_PATH.fullmatch(target_path)
-    except (TypeError, ValueError):
-        _fail(RemoteAccessError, "invalid_endpoint")
-    source_key = asset_path.removeprefix(f"/{_LPDAAC_BUCKET}")
-    target_key = target_match.group("key") if target_match is not None else None
-    target_name = target_key.rsplit("/", 1)[-1] if target_key else ""
-    source_name = source_key.rsplit("/", 1)[-1]
-    if (
-        source_origin != _LPDAAC_DATA_ORIGIN
-        or source_path != asset_path
-        or not asset_path.startswith(f"/{_LPDAAC_BUCKET}/")
-        or parsed.scheme.lower() != "https"
-        or not _ASF_CLOUDFRONT_HOST.fullmatch(target_host)
-        or parsed.username
-        or parsed.password
-        or parsed.fragment
-        or "\\" in parsed.path
-        or "%2f" in parsed.path.lower()
-        or "%5c" in parsed.path.lower()
-        or any(segment in {".", ".."} for segment in target_path.split("/"))
-        or target_match is None
-        or target_key != source_key
-        or not source_name
-        or target_name != source_name
-    ):
-        _fail(RemoteAccessError, "unregistered_endpoint")
-    return target_url
+        return _validate_anonymous_delivery_url(source_url, target_url, adapter)
 
 
 def _asf_request(
@@ -1096,6 +1134,7 @@ def _asf_request(
     current_headers = dict(headers or {})
     current_data = data
     first_request = True
+    anonymous = False
     while True:
         if first_request:
             current_url = _validate_url(current_url, adapter, redirect=True)
@@ -1107,7 +1146,9 @@ def _asf_request(
             current_url,
             headers=current_headers,
             data=current_data,
-            auth=None,
+            # A truthy no-op auth hook prevents requests from consulting
+            # ``.netrc`` for an otherwise anonymous delivery request.
+            auth=_no_auth,
             allow_redirects=False,
             stream=True,
             timeout=(
@@ -1116,7 +1157,13 @@ def _asf_request(
             ),
         )
         if response.status_code not in _ASF_REDIRECT_CODES:
+            if anonymous:
+                with contextlib.suppress(AttributeError):
+                    session.cookies.clear()
             return response
+        if _has_signed_query(current_url):
+            _drain_asf_response(response, ledger, budget.max_response_bytes)
+            _fail(RemoteAccessError, "signed_redirect")
         location = response.headers.get("Location")
         if not location:
             _drain_asf_response(response, ledger, budget.max_response_bytes)
@@ -1136,6 +1183,12 @@ def _asf_request(
             current_headers = _redirect_headers(
                 current_headers, source_origin, target_origin
             )
+        if not _registered_origin(target, adapter, redirect=True):
+            anonymous = True
+            current_headers.pop("Authorization", None)
+            current_headers.pop("Cookie", None)
+            with contextlib.suppress(AttributeError):
+                session.cookies.clear()
         if response.status_code == 303 or (
             response.status_code in {301, 302} and current_method == "POST"
         ):
@@ -1170,6 +1223,7 @@ def _lpdaac_request(
     current_url = _validate_url(url, adapter, redirect=True)
     current_headers: dict[str, str] = {"Accept-Encoding": "identity"}
     current_data: Mapping[str, str] | None = None
+    anonymous = False
     while True:
         current_origin = _url_origin(current_url)
         if current_origin == _ASF_EDL_ORIGIN:
@@ -1191,7 +1245,13 @@ def _lpdaac_request(
             timeout=(budget.connect_timeout_seconds, budget.read_timeout_seconds),
         )
         if response.status_code not in _ASF_REDIRECT_CODES:
+            if anonymous:
+                with contextlib.suppress(AttributeError):
+                    session.cookies.clear()
             return response
+        if _has_signed_query(current_url):
+            _drain_asf_response(response, ledger, budget.max_response_bytes)
+            _fail(RemoteAccessError, "signed_redirect")
         location = response.headers.get("Location")
         if not location:
             _drain_asf_response(response, ledger, budget.max_response_bytes)
@@ -1222,6 +1282,12 @@ def _lpdaac_request(
             if target_origin != _LPDAAC_DATA_ORIGIN:
                 with contextlib.suppress(AttributeError, KeyError):
                     session.cookies.clear()
+        if not _registered_origin(target, adapter, redirect=True):
+            anonymous = True
+            current_headers.pop("Authorization", None)
+            current_headers.pop("Cookie", None)
+            with contextlib.suppress(AttributeError):
+                session.cookies.clear()
         if response.status_code == 303 or (
             response.status_code in {301, 302} and current_method == "POST"
         ):
@@ -1410,11 +1476,22 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
         elif self._redirects > self._budget.max_redirects:
             _fail(RemoteLimitError, "max_redirects")
         _drain_urllib_response(fp, self._ledger, self._budget.max_response_bytes)
-        target = _validate_url(
-            urllib.parse.urljoin(req.full_url, newurl),
-            self._adapter,
-            redirect=True,
-        )
+        if _has_signed_query(req.full_url):
+            _fail(RemoteAccessError, "signed_redirect")
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        try:
+            target = _validate_url(target, self._adapter, redirect=True)
+        except RemoteAccessError:
+            # Anonymous object delivery is an explicit capability of built-in
+            # complete-file adapters.  Keep the generic urllib redirect
+            # policy strict for custom adapters and legacy callers.
+            if not getattr(self._adapter, "_allow_anonymous_delivery", False):
+                raise
+            target = _validate_anonymous_delivery_url(
+                req.full_url,
+                target,
+                self._adapter,
+            )
         redirected = super().redirect_request(req, fp, code, msg, headers, target)
         if redirected is None:
             return None
@@ -1658,14 +1735,24 @@ def _stream_download(
     fetcher = getattr(adapter, "fetch", None)
     supplied_ledger = fetcher is not None and _accepts_ledger(fetcher)
     redirect_handler = _RedirectHandler(adapter, budget, ledger)
-    # Earthdata authentication completes through an OAuth redirect chain that
-    # sets short-lived cookies.  Keep them scoped to this one transfer so the
-    # chain can finish without persisting credentials between operations.
-    cookie_jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(
-        redirect_handler,
-        urllib.request.HTTPCookieProcessor(cookie_jar),
-    )
+    # Anonymous delivery uses no cookie processor at all.  This deliberately
+    # ignores Set-Cookie and prevents a response on one object hop from
+    # affecting every later hop in the operation.
+    opener = urllib.request.build_opener(redirect_handler)
+    resolver = getattr(adapter, "_transfer_url", None)
+    transfer_url = asset.href
+    if fetcher is None and callable(resolver):
+        try:
+            transfer_url = resolver(asset, budget=budget, ledger=ledger)
+        except RemoteError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "Remote transfer setup failed (%s)", type(error).__name__
+            )
+            _fail(RemoteAccessError, "transfer_setup_failed")
+    if not isinstance(transfer_url, str):
+        _fail(RemoteAccessError, "invalid_endpoint")
     hasher = hashlib.sha256()
     checksum_algorithm = asset.checksum.split(":", 1)[0] if asset.checksum else None
     checksum_hasher = (
@@ -1756,8 +1843,7 @@ def _stream_download(
                             "Authorization": f"Bearer {token}",
                         },
                     )
-                    if not 200 <= response.status_code < 300:
-                        _fail(RemoteAccessError, "asf_transfer_denied")
+                    _response_is_complete(response)
                     if (
                         response.headers.get("Content-Encoding", "identity")
                         != "identity"
@@ -1781,8 +1867,7 @@ def _stream_download(
                         budget=budget,
                         ledger=ledger,
                     )
-                    if not 200 <= response.status_code < 300:
-                        _fail(RemoteAccessError, "lpdaac_transfer_denied")
+                    _response_is_complete(response)
                     if (
                         response.headers.get("Content-Encoding", "identity")
                         != "identity"
@@ -1797,7 +1882,7 @@ def _stream_download(
                 ledger.request()
                 ledger.begin_response()
                 request = urllib.request.Request(
-                    asset.href,
+                    transfer_url,
                     headers={
                         "Accept-Encoding": "identity",
                         **(
@@ -1811,6 +1896,7 @@ def _stream_download(
                 with opener.open(
                     request, timeout=budget.read_timeout_seconds
                 ) as response:
+                    _response_is_complete(response)
                     if (
                         response.headers.get("Content-Encoding", "identity")
                         != "identity"
@@ -1825,9 +1911,11 @@ def _stream_download(
                     ledger.begin_response()
                 consume(result_chunks(result), meter=not supplied_ledger)
             break
-        except (requests.RequestException, urllib.error.URLError, OSError):
+        except RemoteError:
+            raise
+        except Exception as error:
             if attempt >= budget.max_retries:
-                logger.exception("Remote transfer failed")
+                logger.warning("Remote transfer failed (%s)", type(error).__name__)
                 _fail(RemoteAccessError, "transfer_failed")
     size = staging.stat().st_size
     if asset.size_bytes is not None and size != asset.size_bytes:
@@ -1837,6 +1925,7 @@ def _stream_download(
         actual = checksum_hasher.hexdigest() if checksum_hasher is not None else ""
         if actual != expected:
             _fail(RemoteIntegrityError, "checksum_mismatch")
+    _validate_representation(staging, asset)
     return size, hasher.hexdigest()
 
 

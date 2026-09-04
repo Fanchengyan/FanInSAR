@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -186,7 +187,7 @@ def test_asf_download_pre_authenticates_and_follows_trusted_redirects(
     tmp_path: Path,
 ) -> None:
     """ASF transfer gets a bearer/cookie before the complete SAFE GET."""
-    payload = b"complete-safe-zip"
+    payload = b"PK\x03\x04complete-safe-zip"
     session = _ASFSession(payload)
     monkeypatch.setattr(remote.requests, "Session", lambda: session)
     monkeypatch.setattr(
@@ -345,7 +346,7 @@ def test_lpdaac_download_meters_redirects_and_strips_credentials(
     tmp_path: Path,
 ) -> None:
     """LPDAAC auth credentials stop at URS and never reach CloudFront."""
-    payload = b"nasadem-zip"
+    payload = b"PK\x03\x04nasadem-zip"
     session = _LPDAACSession(payload)
     monkeypatch.setattr(remote.requests, "Session", lambda: session)
     monkeypatch.setattr(
@@ -413,8 +414,8 @@ def test_lpdaac_download_meters_redirects_and_strips_credentials(
     assert session.closed
 
 
-def test_lpdaac_cloudfront_handoff_is_bound_to_exact_object() -> None:
-    """An LPDAAC CDN hostname cannot redirect to another bucket or object."""
+def test_lpdaac_anonymous_handoff_admits_changed_delivery_origins() -> None:
+    """A trusted LPDAAC gateway may hand off to any safe HTTPS object URL."""
 
     class _LPDAACAdapter:
         origins = ("https://data.lpdaac.earthdatacloud.nasa.gov",)
@@ -445,16 +446,16 @@ def test_lpdaac_cloudfront_handoff_is_bound_to_exact_object() -> None:
     )
     assert remote._lpdaac_redirect_url(source, valid, asset, _LPDAACAdapter()) == valid
     for invalid in (
-        valid.replace("lp-prod-protected.s3", "other-bucket.s3"),
-        valid.replace("NASADEM_HGT_n36w121.zip", "other.zip"),
-        valid.replace("d123example", "evil.example"),
+        valid.replace("https://d123example.cloudfront.net", "http://evil.example"),
+        valid.replace("/s3-012", "/../"),
+        valid.replace("d123example", "evil.example") + "#fragment",
     ):
-        with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+        with pytest.raises(remote.RemoteAccessError):
             remote._lpdaac_redirect_url(source, invalid, asset, _LPDAACAdapter())
 
 
-def test_asf_cloudfront_handoff_is_bound_to_source_bucket_and_filename() -> None:
-    """A dynamic CDN host is not a general redirect wildcard."""
+def test_asf_anonymous_handoff_admits_changed_delivery_origins() -> None:
+    """A trusted ASF gateway may hand off to any safe HTTPS object URL."""
 
     class _ASFAdapter:
         origins = ("https://datapool.asf.alaska.edu",)
@@ -491,17 +492,20 @@ def test_asf_cloudfront_handoff_is_bound_to_source_bucket_and_filename() -> None
             asset,
             _ASFAdapter(),
         )
-    with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+    changed = "https://objects.example/new-layout/other.zip"
+    assert (
         remote._asf_redirect_url(
             "https://sentinel1.asf.alaska.edu/SLC/item.zip",
-            valid.replace("item.zip", "other.zip"),
+            changed,
             asset,
             _ASFAdapter(),
         )
+        == changed
+    )
 
 
-def test_asf_nisar_cloudfront_handoff_is_bound_to_source_path() -> None:
-    """The observed NISAR CDN handoff cannot be reused for another object."""
+def test_asf_nisar_anonymous_handoff_admits_changed_delivery_origins() -> None:
+    """A trusted NISAR gateway may hand off to a changed object layout."""
 
     class _ASFAdapter:
         origins = ("https://nisar.asf.earthdatacloud.nasa.gov",)
@@ -527,14 +531,121 @@ def test_asf_nisar_cloudfront_handoff_is_bound_to_source_path() -> None:
         "DEM/v1.2/EPSG4326/S90/S90_W180/DEM_S90_00_W180_00_C01.tif"
     )
     assert remote._asf_redirect_url(source, valid, asset, _ASFAdapter()) == valid
-    with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
-        remote._asf_redirect_url(
-            source,
-            valid.replace("/DEM/", "/NISAR/DEM/"),
+    changed = "https://objects.example/new-layout/dem.tif"
+    assert remote._asf_redirect_url(source, changed, asset, _ASFAdapter()) == changed
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "reason"),
+    [
+        (206, {}, "partial_content"),
+        (200, {"Content-Range": "bytes 0-3/4"}, "partial_content"),
+        (404, {}, "unexpected_status"),
+    ],
+)
+def test_complete_download_rejects_partial_or_non_success_responses(
+    status: int, headers: dict[str, str], reason: str
+) -> None:
+    """Complete-file publication admits only an un-ranged HTTP 200."""
+    response = type("Response", (), {"status_code": status, "headers": headers})()
+    with pytest.raises(remote.RemoteAccessError, match=reason):
+        remote._response_is_complete(response)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "payload"),
+    [
+        ("zip", b"PK\x03\x04payload"),
+        ("zip", b"PK\x05\x06payload"),
+        ("zip", b"PK\x07\x08payload"),
+        ("tif", b"II*\x00payload"),
+        ("tif", b"MM\x00*payload"),
+        ("tif", b"II+\x00payload"),
+        ("tif", b"MM\x00+payload"),
+        ("h5", b"\x89HDF\r\n\x1a\npayload"),
+    ],
+)
+def test_representation_magic_is_checked_before_publication(
+    suffix: str, payload: bytes, tmp_path: Path
+) -> None:
+    """Known binary suffixes require their representation magic."""
+    staging = tmp_path / f"asset.{suffix}"
+    asset = remote.RemoteAsset(
+        "fixture",
+        "fixture",
+        None,
+        "item",
+        "data",
+        f"https://fixture.invalid/asset.{suffix}",
+    )
+    staging.write_bytes(payload)
+    remote._validate_representation(staging, asset)
+
+    staging.write_bytes(b"\xef\xbb\xbf  <HTML>login</HTML>")
+    with pytest.raises(remote.RemoteIntegrityError, match="representation_mismatch"):
+        remote._validate_representation(staging, asset)
+
+
+def test_signed_query_redirect_is_terminal() -> None:
+    """A request carrying a delivery capability cannot follow a 3xx."""
+    adapter = _ChunkAdapter((b"payload",))
+    handler = remote._RedirectHandler(
+        adapter,
+        remote.RemoteResourceBudget(max_redirects=1),
+    )
+    request = remote.urllib.request.Request(
+        "https://chunks.invalid/data.bin?x-random-signature=fixture-secret"
+    )
+    response = io.BytesIO(b"redirect")
+    response.headers = {"Location": "https://objects.example/data.bin"}  # type: ignore[attr-defined]
+    with pytest.raises(remote.RemoteAccessError, match="signed_redirect"):
+        handler.redirect_request(
+            request,
+            response,
+            302,
+            "Found",
+            response.headers,
+            response.headers["Location"],
+        )
+
+
+def test_transfer_failure_does_not_surface_signed_url(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """Transport exception text and unknown query values stay private."""
+
+    class _FailingAdapter:
+        provider = "failing"
+        origins = ("https://failing.invalid",)
+        path_prefixes = ("/",)
+        redirect_origins = ()
+        profiles = ("anonymous",)
+
+        def fetch(self, asset: object, budget: object) -> bytes:
+            del asset, budget
+            message = (
+                "request failed at https://objects.example/file.bin?"
+                "x-random-signature=fixture-secret"
+            )
+            raise OSError(message)
+
+    remote._register_adapter("failing-p0047", _FailingAdapter())
+    asset = remote.RemoteAsset(
+        "failing",
+        "failing-p0047",
+        None,
+        "item",
+        "data",
+        "https://failing.invalid/file.bin?x-random-signature=fixture-secret",
+    )
+    with caplog.at_level("WARNING"), pytest.raises(
+        remote.RemoteAccessError, match="transfer_failed"
+    ) as error:
+        remote.download(
             asset,
-            _ASFAdapter(),
+            tmp_path / "file.bin",
+            budget=remote.RemoteResourceBudget(max_retries=1),
         )
-    with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
-        remote._asf_redirect_url(
-            source, valid.replace("S90_W180", "S90_W179"), asset, _ASFAdapter()
-        )
+    assert "fixture-secret" not in str(error.value)
+    assert "fixture-secret" not in caplog.text
+    assert "objects.example" not in caplog.text

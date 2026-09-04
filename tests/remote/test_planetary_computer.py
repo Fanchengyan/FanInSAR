@@ -82,10 +82,10 @@ def _item() -> _Item:
     )
 
 
-def test_planetary_computer_search_signs_in_memory_and_preserves_safe_identity() -> (
+def test_planetary_computer_search_stays_unsigned_and_preserves_safe_identity() -> (
     None
 ):
-    """STAC discovery signs an item in memory and emits a safe record."""
+    """STAC discovery emits a safe unsigned record for later transfer signing."""
     item = _item()
     calls: list[object] = []
 
@@ -98,9 +98,9 @@ def test_planetary_computer_search_signs_in_memory_and_preserves_safe_identity()
     records = list(adapter.items())
 
     assert len(records) == 1
-    assert calls == [item]
+    assert calls == []
     assert records[0]["assets"]["data"]["href"].endswith("tile.tif")
-    assert adapter._signed[("tile-1", "data")].endswith("sig=secret")
+    assert not hasattr(adapter, "_signed")
 
 
 def test_planetary_computer_is_registered_with_remote_boundary() -> None:
@@ -206,6 +206,7 @@ def test_planetary_computer_stac_transport_charges_retries() -> None:
 
 class _Response:
     headers = {"Content-Encoding": "identity", "Content-Length": "12"}
+    status = 200
 
     def __enter__(self) -> _Response:
         return self
@@ -217,11 +218,11 @@ class _Response:
         return b"pc-dem-bytes" if not hasattr(self, "done") else b""
 
 
-def test_planetary_computer_fetch_uses_p0044_ledger_and_signing(
+def test_planetary_computer_download_signs_inside_the_mediated_stream(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Fetch returns bounded chunks and charges the operation ledger."""
-    payload = b"pc-dem-bytes"
+    """A download resolves a fresh signed URL without adapter retention."""
+    payload = b"II*\x00pc-dem-bytes"
     response = _Response()
 
     def read(_size: int) -> bytes:
@@ -232,11 +233,11 @@ def test_planetary_computer_fetch_uses_p0044_ledger_and_signing(
 
     response.read = read  # type: ignore[method-assign]
     adapter = PlanetaryComputerAdapter(signer=lambda value: value)
-    monkeypatch.setattr(
-        PlanetaryComputerAdapter,
-        "_open",
-        lambda *_args, **_kwargs: response,
-    )
+    class _Opener:
+        def open(self, *_args: object, **_kwargs: object) -> _Response:
+            return response
+
+    monkeypatch.setattr(remote.urllib.request, "build_opener", lambda *_args: _Opener())
     asset = remote.RemoteAsset(
         provider="pc",
         catalog="pc-task-c-fetch",
@@ -249,6 +250,7 @@ def test_planetary_computer_fetch_uses_p0044_ledger_and_signing(
     adapter.register("pc-task-c-fetch")
     destination = remote.download(asset, tmp_path / "dem.tif")
     assert destination.read_bytes() == payload
+    assert not hasattr(adapter, "_signed")
 
 
 def test_planetary_computer_rejects_unobservable_injected_client() -> None:
