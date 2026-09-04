@@ -9,7 +9,6 @@ geometry filtering and publication to that boundary.
 from __future__ import annotations
 
 import json
-import math
 import re
 import urllib.error
 import urllib.parse
@@ -286,38 +285,18 @@ def _umm_urls(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 
 def _umm_size_bytes(record: Mapping[str, Any]) -> int | None:
-    """Return one source-declared UMM granule size in bytes, if unambiguous."""
+    """Return only the exact UMM SizeInBytes declaration.
+
+    ArchiveAndDistributionInformation.Size is a human-readable distribution
+    hint and is intentionally excluded from integrity metadata.
+    """
     granule = record.get("DataGranule")
     if not isinstance(granule, Mapping):
         return None
     direct = granule.get("SizeInBytes")
     if isinstance(direct, int) and not isinstance(direct, bool) and direct >= 0:
         return direct
-    archive = granule.get("ArchiveAndDistributionInformation")
-    distribution = (
-        archive[0] if isinstance(archive, list) and len(archive) == 1 else None
-    )
-    if not isinstance(distribution, Mapping):
-        return None
-    size = distribution.get("Size")
-    unit = str(distribution.get("SizeUnit", "")).strip().upper()
-    factors = {
-        "B": 1,
-        "KB": 1024,
-        "MB": 1024**2,
-        "GB": 1024**3,
-        "TB": 1024**4,
-    }
-    if not isinstance(size, (int, float)) or isinstance(size, bool):
-        return None
-    if not math.isfinite(float(size)) or float(size) < 0 or unit not in factors:
-        return None
-    bytes_value = float(size) * factors[unit]
-    # UMM's human-readable Size field is often derived from a byte count and
-    # represented in binary units.  Preserve it only when the conversion is
-    # lossless; rounding an approximate MB value into ``size_bytes`` would
-    # turn a hint into a false integrity requirement.
-    return int(bytes_value) if bytes_value.is_integer() else None
+    return None
 
 
 def _cmr_links(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -493,6 +472,9 @@ class CMRCollectionAdapter:
     auth_resolver : callable, optional
         Operation-scoped callback receiving a profile name and returning
         transient request headers.  Resolved values are never persisted.
+    candidate_filter : callable, optional
+        Provider-registered predicate receiving a candidate and its scrubbed
+        URL.  Candidates rejected by the predicate are not published.
 
     """
 
@@ -511,6 +493,7 @@ class CMRCollectionAdapter:
     redirect_origins: tuple[str, ...] = field(init=False)
     profiles: tuple[str, ...] = ("anonymous",)
     auth_resolver: Callable[[str], Mapping[str, str] | None] | None = None
+    candidate_filter: Callable[[Mapping[str, Any], str], bool] | None = None
 
     def __post_init__(self) -> None:
         """Validate collection identity and configure endpoint allowlists."""
@@ -596,7 +579,11 @@ class CMRCollectionAdapter:
                     (_ASF_SENTINEL1_ORIGIN, _ASF_EDL_ORIGIN, _ASF_AUTH_ORIGIN)
                     if self.provider.casefold() == "asf"
                     and "earthdata-asf" in self.profiles
-                    else ()
+                    else (
+                        (_ASF_EDL_ORIGIN,)
+                        if "earthdata-lpdaac" in self.profiles
+                        else ()
+                    )
                 ),
             ),
         )
@@ -879,6 +866,10 @@ class CMRCollectionAdapter:
             try:
                 clean_href = _safe_url(href, self)
             except RemoteAccessError:
+                continue
+            if self.candidate_filter is not None and not self.candidate_filter(
+                candidate, clean_href
+            ):
                 continue
             safe_candidates.append((name, candidate, clean_href))
         if not safe_candidates:

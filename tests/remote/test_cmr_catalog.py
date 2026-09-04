@@ -246,12 +246,100 @@ def test_official_umm_geometry_and_temporal_variants() -> None:
     assert record["geometry"]["coordinates"][0][-1] == [0.0, 0.0]
     assert record["acquisition"]["start"] == datetime(2024, 1, 1, tzinfo=UTC)
     assert record["acquisition"]["end"] == datetime(2024, 1, 2, tzinfo=UTC)
-    assert record["assets"]["data"]["size"] == 1_572_864
+    assert "size" not in record["assets"]["data"]
     # Official CMR responses wrap UMM and ``meta`` as sibling fields.
     enveloped = adapter._normalize(
         {"meta": {"collection-concept-id": "C123"}, "umm": entry}
     )
     assert enveloped["collection"] == "provider-short-name"
+
+
+def test_umm_size_uses_only_exact_size_in_bytes() -> None:
+    """Human-readable archive size metadata is not an integrity claim."""
+    adapter = CMRCollectionAdapter(
+        provider="FIXTURE",
+        collection="C123",
+        endpoint="https://cmr.invalid/search/granules.json",
+    )
+    base = {
+        "GranuleUR": "G1",
+        "CollectionReference": {"ShortName": "C123"},
+        "SpatialExtent": {
+            "HorizontalSpatialDomain": {
+                "Geometry": {
+                    "GPolygon": {
+                        "Boundary": {
+                            "Points": [
+                                {"Longitude": 0, "Latitude": 0},
+                                {"Longitude": 1, "Latitude": 0},
+                                {"Longitude": 1, "Latitude": 1},
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        "DataGranule": {
+            "ArchiveAndDistributionInformation": [{"Size": 1.5, "SizeUnit": "MB"}],
+            "RelatedUrls": [{"Type": "GET DATA", "URL": "https://cmr.invalid/data/g1"}],
+        },
+    }
+    without_exact = adapter._normalize(base)
+    assert "size" not in without_exact["assets"]["data"]
+    base["DataGranule"]["SizeInBytes"] = 123
+    with_exact = adapter._normalize(base)
+    assert with_exact["assets"]["data"]["size"] == 123
+
+
+def test_provider_candidate_filter_selects_valid_nisar_tiff() -> None:
+    """A registered NISAR filter can skip a VRT and choose the native COG."""
+    adapter = CMRCollectionAdapter(
+        provider="ASF",
+        collection="nisar-glo30",
+        collection_concept_id="C3803703055-ASF",
+        endpoint="https://cmr.invalid/search/granules.json",
+        data_origins=("https://nisar.asf.earthdatacloud.nasa.gov",),
+        candidate_filter=lambda candidate, href: (
+            href.lower().endswith(".tif")
+            and "epsg4326" in href.lower()
+            and "vrt" not in str(candidate.get("Name", "")).lower()
+        ),
+    )
+    entry = {
+        "GranuleUR": "G3964549387-ASF",
+        "CollectionReference": {"ShortName": "nisar-glo30"},
+        "SpatialExtent": {
+            "HorizontalSpatialDomain": {
+                "Geometry": {
+                    "GPolygon": {
+                        "Boundary": {
+                            "Points": [
+                                {"Longitude": 0, "Latitude": 0},
+                                {"Longitude": 1, "Latitude": 0},
+                                {"Longitude": 1, "Latitude": 1},
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        "DataGranule": {
+            "RelatedUrls": [
+                {
+                    "Type": "GET DATA",
+                    "Name": "DEM_VRT",
+                    "URL": "https://nisar.asf.earthdatacloud.nasa.gov/NISAR/DEM/v1.2/EPSG4326/S90/S90_W180/DEM_VRT.tif",
+                },
+                {
+                    "Type": "GET DATA",
+                    "Name": "DEM_S90_00_W180_00_C01.tif",
+                    "URL": "https://nisar.asf.earthdatacloud.nasa.gov/NISAR/DEM/v1.2/EPSG4326/S90/S90_W180/DEM_S90_00_W180_00_C01.tif",
+                },
+            ]
+        },
+    }
+    record = adapter._normalize(entry)
+    assert record["assets"]["data"]["href"].endswith("DEM_S90_00_W180_00_C01.tif")
 
 
 def test_compact_polygon_accepts_one_coordinate_string() -> None:

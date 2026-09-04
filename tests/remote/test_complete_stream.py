@@ -145,6 +145,7 @@ class _ASFSession:
             return _ASFResponse(
                 url,
                 302,
+                body=b"oauth-redirect",
                 headers={"Location": "https://cumulus.asf.alaska.edu/login"},
             )
         if url == "https://cumulus.asf.alaska.edu/login":
@@ -154,12 +155,14 @@ class _ASFSession:
             return _ASFResponse(
                 url,
                 307,
+                body=b"data-redirect",
                 headers={"Location": "https://sentinel1.asf.alaska.edu/SLC/item.zip"},
             )
         if url == "https://sentinel1.asf.alaska.edu/SLC/item.zip":
             return _ASFResponse(
                 url,
                 303,
+                body=b"sentinel-redirect",
                 headers={
                     "Location": (
                         "https://dy4owt9f80bz7.cloudfront.net/"
@@ -231,6 +234,15 @@ def test_asf_download_pre_authenticates_and_follows_trusted_redirects(
     assert staging.read_bytes() == payload
     assert ledger.requests == 6
     assert ledger.redirects == 3
+    assert ledger.response_bytes_total == (
+        len(b'{"access_token":"fixture-token"}')
+        + len(b"oauth-redirect")
+        + len(b"data-redirect")
+        + len(b"sentinel-redirect")
+        + len(payload)
+    )
+    assert "Authorization" not in session.requests[2][2]
+    assert session.requests[4][2]["Authorization"] == "Bearer fixture-token"
     assert session.requests[-2][2]["Authorization"] == "Bearer fixture-token"
     assert "Authorization" not in session.requests[-1][2]
     assert "X-Amz-Signature=fixture" in session.requests[-1][1]
@@ -249,7 +261,7 @@ def test_asf_cloudfront_handoff_is_bound_to_source_bucket_and_filename() -> None
         "ASF",
         "asf-live",
         "sentinel-1",
-        "S1_FIXTURE",
+        "G3964549387-ASF",
         "data",
         "https://datapool.asf.alaska.edu/SLC/item.zip",
         auth_profile="earthdata-asf",
@@ -308,9 +320,16 @@ def test_asf_nisar_cloudfront_handoff_is_bound_to_source_path() -> None:
     valid = (
         "https://d1mv8zhcvry6x4.cloudfront.net/s3-7fdf/"
         "sds-n-cumulus-prod-nisar-products.s3.us-west-2.amazonaws.com/"
-        "NISAR/DEM/v1.2/EPSG4326/S90/S90_W180/DEM_S90_00_W180_00_C01.tif"
+        "DEM/v1.2/EPSG4326/S90/S90_W180/DEM_S90_00_W180_00_C01.tif"
     )
     assert remote._asf_redirect_url(source, valid, asset, _ASFAdapter()) == valid
+    with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+        remote._asf_redirect_url(
+            source,
+            valid.replace("/DEM/", "/NISAR/DEM/"),
+            asset,
+            _ASFAdapter(),
+        )
     with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
         remote._asf_redirect_url(
             source, valid.replace("S90_W180", "S90_W179"), asset, _ASFAdapter()

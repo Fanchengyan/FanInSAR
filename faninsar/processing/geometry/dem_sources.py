@@ -33,7 +33,7 @@ from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.query import BoundingBox
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
     from faninsar.processing.geometry.dem_transport import FetchPlan
@@ -984,6 +984,19 @@ class DeferredGranulePlan(FetchPlan):
     title_filter_required: bool = False
 
 
+def _nisar_dem_candidate_filter(candidate: Mapping[str, object], href: str) -> bool:
+    """Select native EPSG:4326 TIFF candidates from an ASF NISAR granule."""
+    path = urllib.parse.unquote(urllib.parse.urlsplit(href).path).casefold()
+    metadata = " ".join(
+        str(candidate.get(name, "")) for name in ("Name", "Title", "Description")
+    ).casefold()
+    return (
+        path.endswith((".tif", ".tiff"))
+        and "epsg4326" in f"{path} {metadata}"
+        and "vrt" not in f"{path} {metadata}"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AuthenticatedGranuleSource(DemSource):
     """CMR-discovered, Earthdata-authenticated granule zips.
@@ -1072,11 +1085,14 @@ class AuthenticatedGranuleSource(DemSource):
                 collection_concept_id=self.cmr_collection,
                 data_origins=(f"https://{self.data_host}",),
                 data_path_prefixes=("/",),
+                profiles=(
+                    "anonymous",
+                    "earthdata-asf" if cmr_provider == "ASF" else "earthdata-lpdaac",
+                ),
+                candidate_filter=(
+                    _nisar_dem_candidate_filter if cmr_provider == "ASF" else None
+                ),
             )
-            # Earthdata is needed on complete-file transfer while CMR search
-            # itself remains anonymous.  The profile is attached to the
-            # adapter, never serialized into a plan or cache path.
-            object.__setattr__(adapter, "profiles", ("anonymous", "earthdata"))
             try:
                 _register_adapter(catalog, adapter)
             except ValueError as error:
@@ -1094,10 +1110,15 @@ class AuthenticatedGranuleSource(DemSource):
         else:
             operation_budget = budget
         min_lon, min_lat, max_lon, max_lat = plan.bounds
+        auth_profile = (
+            "earthdata-asf"
+            if self.cmr_collection.endswith("-ASF")
+            else "earthdata-lpdaac"
+        )
         items = search(
             BoundingBox(min_lon, min_lat, max_lon, max_lat, crs=4326),
             catalog=catalog,
-            auth_profile="earthdata",
+            auth_profile=auth_profile,
             budget=operation_budget,
         )
         output: list[object] = []

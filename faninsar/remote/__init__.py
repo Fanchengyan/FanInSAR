@@ -325,15 +325,6 @@ _ASF_NISAR_ORIGIN = "https://nisar.asf.earthdatacloud.nasa.gov"
 _ASF_NISAR_BUCKET = "sds-n-cumulus-prod-nisar-products.s3.us-west-2.amazonaws.com"
 _ASF_EDL_CLIENT_ID = "BO_n7nTIlMljdvU6kRRB3g"
 _ASF_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
-_ASF_CREDENTIAL_ORIGINS = frozenset(
-    {
-        _ASF_EDL_ORIGIN,
-        _ASF_AUTH_ORIGIN,
-        _ASF_DATA_ORIGIN,
-        _ASF_SENTINEL1_ORIGIN,
-        _ASF_NISAR_ORIGIN,
-    }
-)
 _ASF_CLOUDFRONT_HOST = re.compile(r"^[a-z0-9]+\.cloudfront\.net$")
 _ASF_SLC_CLOUDFRONT_PATH = re.compile(
     r"^/s3-[^/]+/asf-ngap2w-p-s1-slc-[a-z0-9]+\."
@@ -342,9 +333,10 @@ _ASF_SLC_CLOUDFRONT_PATH = re.compile(
 )
 _ASF_NISAR_CLOUDFRONT_PATH = re.compile(
     r"^/s3-[^/]+/sds-n-cumulus-prod-nisar-products\.s3\.us-west-2\.amazonaws\.com"
-    r"/NISAR/DEM/.+$",
+    r"(?P<key>/DEM/v1\.2/.+)$",
     re.IGNORECASE,
 )
+_ASF_NISAR_GATEWAY_PREFIX = "/NISAR"
 
 
 def _sanitize(value: Any, key: str | None = None) -> Any:  # noqa: PLR0911
@@ -870,6 +862,32 @@ def _strip_redirect_credentials(
             del request.headers[name]
 
 
+def _redirect_headers(
+    headers: Mapping[str, str], source_origin: str, target_origin: str
+) -> dict[str, str]:
+    """Apply the minimal credential policy to one cross-origin hop.
+
+    Bearer authentication is retained only for the ASF datapool-to-Sentinel-1
+    handoff.  In particular, Basic Earthdata Login credentials never cross
+    URS or reach a CloudFront object URL.
+    """
+    filtered = {
+        key: value for key, value in headers.items() if not _SECRET_KEY.search(key)
+    }
+    authorization = next(
+        (value for key, value in headers.items() if key.lower() == "authorization"),
+        None,
+    )
+    if (
+        source_origin == _ASF_DATA_ORIGIN
+        and target_origin == _ASF_SENTINEL1_ORIGIN
+        and isinstance(authorization, str)
+        and authorization.lower().startswith("bearer ")
+    ):
+        filtered["Authorization"] = authorization
+    return filtered
+
+
 def _netrc_authorization(url: str) -> str | None:
     """Return a Basic authorization value from the user's netrc, if present.
 
@@ -921,17 +939,31 @@ def _asf_redirect_url(
         pass
     try:
         source_origin = _url_origin(source_url)
-        source_path = urllib.parse.urlsplit(source_url).path or "/"
+        source_path = urllib.parse.unquote(
+            urllib.parse.urlsplit(source_url).path or "/"
+        )
         parsed = urllib.parse.urlsplit(target_url)
         host = (parsed.hostname or "").lower()
         source_name = urllib.parse.unquote(
             urllib.parse.urlsplit(asset.href).path.rsplit("/", 1)[-1]
         )
         target_name = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+        asset_path = urllib.parse.unquote(urllib.parse.urlsplit(asset.href).path or "/")
+        target_path = urllib.parse.unquote(parsed.path)
     except (TypeError, ValueError):
         _fail(RemoteAccessError, "invalid_endpoint")
     is_sentinel1 = source_origin == _ASF_SENTINEL1_ORIGIN
     is_nisar = source_origin == _ASF_NISAR_ORIGIN
+    nisar_key = (
+        source_path.removeprefix(_ASF_NISAR_GATEWAY_PREFIX)
+        if source_path.startswith(f"{_ASF_NISAR_GATEWAY_PREFIX}/DEM/v1.2/")
+        else None
+    )
+    nisar_target = (
+        _ASF_NISAR_CLOUDFRONT_PATH.fullmatch(urllib.parse.unquote(parsed.path))
+        if is_nisar
+        else None
+    )
     if (
         not (is_sentinel1 or is_nisar)
         or parsed.scheme.lower() != "https"
@@ -942,11 +974,14 @@ def _asf_redirect_url(
         or "\\" in parsed.path
         or "%2f" in parsed.path.lower()
         or "%5c" in parsed.path.lower()
+        or any(segment in {".", ".."} for segment in target_path.split("/"))
         or not (
             _ASF_SLC_CLOUDFRONT_PATH.fullmatch(parsed.path)
             if is_sentinel1
-            else _ASF_NISAR_CLOUDFRONT_PATH.fullmatch(parsed.path)
-            and parsed.path.rsplit(_ASF_NISAR_BUCKET, 1)[-1] == source_path
+            else nisar_target is not None
+            and nisar_key is not None
+            and source_path == asset_path
+            and nisar_target.group("key") == nisar_key
         )
         or not source_name
         or target_name != source_name
@@ -996,27 +1031,23 @@ def _asf_request(
             return response
         location = response.headers.get("Location")
         if not location:
+            _drain_asf_response(response, ledger, budget.max_response_bytes)
             response.close()
             _fail(RemoteAccessError, "invalid_redirect")
         target = urllib.parse.urljoin(current_url, location)
+        _drain_asf_response(response, ledger, budget.max_response_bytes)
+        response.close()
         ledger.redirect()
         target = _asf_redirect_url(current_url, target, asset, adapter)
         try:
             source_origin = _url_origin(current_url)
             target_origin = _url_origin(target)
         except ValueError:
-            response.close()
             _fail(RemoteAccessError, "invalid_endpoint")
-        response.close()
-        if source_origin != target_origin and not (
-            source_origin in _ASF_CREDENTIAL_ORIGINS
-            and target_origin in _ASF_CREDENTIAL_ORIGINS
-        ):
-            current_headers = {
-                key: value
-                for key, value in current_headers.items()
-                if not _SECRET_KEY.search(key)
-            }
+        if source_origin != target_origin:
+            current_headers = _redirect_headers(
+                current_headers, source_origin, target_origin
+            )
         if response.status_code == 303 or (
             response.status_code in {301, 302} and current_method == "POST"
         ):
@@ -1040,6 +1071,59 @@ def _asf_response_body(
         if len(content) > max_bytes:
             _fail(RemoteLimitError, "max_response_bytes")
     return bytes(content)
+
+
+def _drain_asf_response(
+    response: requests.Response, ledger: _CallLedger, max_bytes: int
+) -> None:
+    """Drain and meter a bounded redirect response before closing it."""
+    iterator = getattr(response, "iter_content", None)
+    if not callable(iterator):
+        return
+    ledger.begin_response()
+    total = 0
+    try:
+        for chunk in iterator(chunk_size=64 * 1024):
+            part_size = len(bytes(chunk))
+            total += part_size
+            if total > max_bytes:
+                _fail(RemoteLimitError, "max_response_bytes")
+            ledger.response_bytes(part_size)
+    finally:
+        response.close()
+
+
+def _drain_urllib_response(
+    response: Any, ledger: _CallLedger | None, max_bytes: int
+) -> None:
+    """Drain and meter one urllib redirect body before it is closed."""
+    reader = getattr(response, "read", None)
+    if not callable(reader):
+        return
+    if ledger is not None:
+        ledger.begin_response()
+    total = 0
+    try:
+        while True:
+            try:
+                chunk = reader(64 * 1024)
+            except (OSError, ValueError):
+                # Some urllib test doubles (and already-closed error paths)
+                # expose a closed file object.  There is no body left to
+                # account for.
+                break
+            if not chunk:
+                break
+            part_size = len(bytes(chunk))
+            total += part_size
+            if total > max_bytes:
+                _fail(RemoteLimitError, "max_response_bytes")
+            if ledger is not None:
+                ledger.response_bytes(part_size)
+    finally:
+        closer = getattr(response, "close", None)
+        if callable(closer):
+            closer()
 
 
 def _asf_authenticated_session(
@@ -1151,6 +1235,7 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
             self._ledger.request()
         elif self._redirects > self._budget.max_redirects:
             _fail(RemoteLimitError, "max_redirects")
+        _drain_urllib_response(fp, self._ledger, self._budget.max_response_bytes)
         target = _validate_url(
             urllib.parse.urljoin(req.full_url, newurl),
             self._adapter,
@@ -1169,14 +1254,18 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
         except ValueError:
             _fail(RemoteAccessError, "invalid_endpoint")
         if source_origin != target_origin:
-            _strip_redirect_credentials(redirected)
-            # Re-apply only the target host's own netrc credential.  This is
-            # needed for Earthdata's cross-origin OAuth hop (data host ->
-            # urs.earthdata.nasa.gov) while preserving the no-credential-
-            # forwarding rule above.
-            auth = _netrc_authorization(target)
-            if auth is not None:
-                redirected.add_unredirected_header("Authorization", auth)
+            # urllib copies custom headers verbatim, so apply the same
+            # minimal policy as the ASF requests transport.  Never attach a
+            # target netrc credential here: that would forward Basic EDL
+            # credentials from URS to another origin.
+            headers = _redirect_headers(
+                dict(redirected.headers), source_origin, target_origin
+            )
+            redirected.headers.clear()
+            redirected.headers.update(headers)
+            for name in list(getattr(redirected, "unredirected_hdrs", {})):
+                if _SECRET_KEY.search(str(name)):
+                    del redirected.unredirected_hdrs[name]
         return redirected
 
 
@@ -1514,7 +1603,8 @@ def _stream_download(
                         "Accept-Encoding": "identity",
                         **(
                             {"Authorization": auth}
-                            if (auth := _netrc_authorization(asset.href))
+                            if asset.auth_profile == "earthdata-lpdaac"
+                            and (auth := _netrc_authorization(asset.href))
                             else {}
                         ),
                     },
