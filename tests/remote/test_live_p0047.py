@@ -37,6 +37,18 @@ _ROOT = Path(
     os.environ.get("FANINSAR_P0047_LIVE_ROOT", f"/private/tmp/p0047-live-{_COMMIT}")
 )
 _REPORT = _ROOT / "report.json"
+_REGISTERED_TERMINAL_ORIGINS = frozenset(
+    {
+        "https://datapool.asf.alaska.edu",
+        "https://sentinel1.asf.alaska.edu",
+        "https://nisar.asf.earthdatacloud.nasa.gov",
+        "https://urs.earthdata.nasa.gov",
+        "https://cumulus.asf.alaska.edu",
+        "https://data.lpdaac.earthdatacloud.nasa.gov",
+        "https://planetarycomputer.microsoft.com",
+        "https://elevationeuwest.blob.core.windows.net",
+    }
+)
 
 
 def _digest(path: Path) -> tuple[int, str]:
@@ -393,4 +405,13 @@ def test_live_p0047_fixed_full_transfers(monkeypatch: pytest.MonkeyPatch) -> Non
         "lanes": lanes,
     }
     _REPORT.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    assert all(lane["status"] != "FAIL" for lane in lanes), report
+    # INCONCLUSIVE is useful in the report for diagnosing unavailable live
+    # services, but it cannot satisfy the three-lane acceptance gate.
+    assert len(lanes) == 3, report
+    assert all(lane.get("status") == "PASS" for lane in lanes), report
+    # At least one lane must prove the changed-origin object-delivery path;
+    # a report containing only registered gateway origins is insufficient.
+    assert any(
+        lane.get("final_origin") not in _REGISTERED_TERMINAL_ORIGINS
+        for lane in lanes
+    ), report

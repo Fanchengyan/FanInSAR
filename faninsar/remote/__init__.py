@@ -873,16 +873,21 @@ def _validate_anonymous_delivery_url(
     source_url: str,
     target_url: str,
     adapter: _Adapter,
+    *,
+    source_is_anonymous: bool = False,
 ) -> str:
     """Validate a credential-free HTTPS object target after a trusted hop.
 
     The source must be a registered redirect origin, which is the provider
-    gateway trust boundary.  Once that boundary has been crossed, the target
+    gateway trust boundary, unless this operation has already crossed that
+    boundary anonymously.  Once that boundary has been crossed, the target
     host and storage path are intentionally not registry-owned.  Structural
     URL checks still reject the forms that could change authority or route a
     request through a traversal-like path.
     """
-    if not _registered_origin(source_url, adapter, redirect=True):
+    if not source_is_anonymous and not _registered_origin(
+        source_url, adapter, redirect=True
+    ):
         _fail(RemoteAccessError, "unregistered_endpoint")
     if not isinstance(target_url, str) or not target_url:
         _fail(RemoteAccessError, "invalid_endpoint")
@@ -1093,13 +1098,20 @@ def _asf_redirect_url(
     target_url: str,
     asset: RemoteAsset,
     adapter: _Adapter,
+    *,
+    anonymous: bool = False,
 ) -> str:
     """Validate one ASF redirect and its anonymous delivery handoff."""
     del asset
     try:
         return _validate_url(target_url, adapter, redirect=True)
     except RemoteAccessError:
-        return _validate_anonymous_delivery_url(source_url, target_url, adapter)
+        return _validate_anonymous_delivery_url(
+            source_url,
+            target_url,
+            adapter,
+            source_is_anonymous=anonymous,
+        )
 
 
 def _lpdaac_redirect_url(
@@ -1107,13 +1119,20 @@ def _lpdaac_redirect_url(
     target_url: str,
     asset: RemoteAsset,
     adapter: _Adapter,
+    *,
+    anonymous: bool = False,
 ) -> str:
     """Validate one LPDAAC redirect and its anonymous delivery handoff."""
     del asset
     try:
         return _validate_url(target_url, adapter, redirect=True)
     except RemoteAccessError:
-        return _validate_anonymous_delivery_url(source_url, target_url, adapter)
+        return _validate_anonymous_delivery_url(
+            source_url,
+            target_url,
+            adapter,
+            source_is_anonymous=anonymous,
+        )
 
 
 def _asf_request(
@@ -1173,7 +1192,13 @@ def _asf_request(
         _drain_asf_response(response, ledger, budget.max_response_bytes)
         response.close()
         ledger.redirect()
-        target = _asf_redirect_url(current_url, target, asset, adapter)
+        target = _asf_redirect_url(
+            current_url,
+            target,
+            asset,
+            adapter,
+            anonymous=anonymous,
+        )
         try:
             source_origin = _url_origin(current_url)
             target_origin = _url_origin(target)
@@ -1226,7 +1251,7 @@ def _lpdaac_request(
     anonymous = False
     while True:
         current_origin = _url_origin(current_url)
-        if current_origin == _ASF_EDL_ORIGIN:
+        if current_origin == _ASF_EDL_ORIGIN and not anonymous:
             current_headers["Authorization"] = basic
         else:
             current_headers.pop("Authorization", None)
@@ -1262,14 +1287,20 @@ def _lpdaac_request(
         try:
             target = _validate_url(target, adapter, redirect=True)
         except RemoteAccessError:
-            target = _lpdaac_redirect_url(current_url, target, asset, adapter)
+            target = _lpdaac_redirect_url(
+                current_url,
+                target,
+                asset,
+                adapter,
+                anonymous=anonymous,
+            )
         source_origin = _url_origin(current_url)
         target_origin = _url_origin(target)
         if source_origin != target_origin:
             current_headers = _redirect_headers(
                 current_headers, source_origin, target_origin
             )
-        if target_origin == _ASF_EDL_ORIGIN:
+        if target_origin == _ASF_EDL_ORIGIN and not anonymous:
             current_headers["Authorization"] = basic
         else:
             current_headers.pop("Authorization", None)
@@ -1456,6 +1487,7 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
         self._budget = budget
         self._ledger = ledger
         self._redirects = 0
+        self._anonymous_delivery = False
 
     def redirect_request(
         self,
@@ -1491,6 +1523,7 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
                 req.full_url,
                 target,
                 self._adapter,
+                source_is_anonymous=self._anonymous_delivery,
             )
         redirected = super().redirect_request(req, fp, code, msg, headers, target)
         if redirected is None:
@@ -1517,6 +1550,12 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
             for name in list(getattr(redirected, "unredirected_hdrs", {})):
                 if _SECRET_KEY.search(str(name)):
                     del redirected.unredirected_hdrs[name]
+        if not _registered_origin(target, self._adapter, redirect=True):
+            # Once credentials have been removed at the first object-delivery
+            # handoff, every later structurally valid HTTPS hop stays
+            # anonymous, regardless of how many storage/CDN hosts are used.
+            self._anonymous_delivery = True
+            _strip_redirect_credentials(redirected)
         return redirected
 
 

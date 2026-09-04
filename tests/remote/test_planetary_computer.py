@@ -253,6 +253,38 @@ def test_planetary_computer_download_signs_inside_the_mediated_stream(
     assert not hasattr(adapter, "_signed")
 
 
+def test_planetary_computer_default_signer_uses_real_sdk_mapping_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The installed SDK signer accepts the operation-local STAC mapping."""
+    import planetary_computer
+
+    calls: list[str] = []
+
+    def sign_url(url: str) -> str:
+        calls.append(url)
+        return f"{url}?sig=fixture"
+
+    monkeypatch.setattr(planetary_computer.sas, "sign_url", sign_url)
+    adapter = PlanetaryComputerAdapter()
+    asset = remote.RemoteAsset(
+        provider="pc",
+        catalog="pc-sdk-shape",
+        collection=COP_DEM_GLO30_COLLECTION,
+        item_id="tile-1",
+        key="data",
+        href="https://elevationeuwest.blob.core.windows.net/tile.tif",
+    )
+    ledger = remote._CallLedger(remote.RemoteResourceBudget())
+
+    signed_href = adapter._transfer_url(asset, budget=ledger.budget, ledger=ledger)
+
+    assert signed_href.endswith("tile.tif?sig=fixture")
+    assert calls == [asset.href]
+    assert asset.href == "https://elevationeuwest.blob.core.windows.net/tile.tif"
+    assert not hasattr(adapter, "_signed")
+
+
 def test_planetary_computer_rejects_unobservable_injected_client() -> None:
     """A client without an inspectable transport fails before network I/O."""
     item = _item()

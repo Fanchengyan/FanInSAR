@@ -414,6 +414,88 @@ def test_lpdaac_download_meters_redirects_and_strips_credentials(
     assert session.closed
 
 
+def test_asf_anonymous_delivery_stays_sticky_across_unknown_hosts() -> None:
+    """Credentials stay stripped through a CDN and object-host handoff."""
+
+    class _AnonymousChainSession:
+        def __init__(self) -> None:
+            self.cookies = requests.cookies.RequestsCookieJar()
+            self.cookies.set("session", "secret")
+            self.requests: list[tuple[str, str, dict[str, str], object]] = []
+
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: dict[str, str],
+            data: Any = None,
+            auth: Any = None,
+            allow_redirects: bool,
+            stream: bool,
+            timeout: tuple[float, float],
+        ) -> _ASFResponse:
+            del data, allow_redirects, stream, timeout
+            self.requests.append((method, url, dict(headers), auth))
+            if url == "https://datapool.asf.alaska.edu/item.zip":
+                return _ASFResponse(
+                    url,
+                    302,
+                    body=b"gateway",
+                    headers={"Location": "https://cdn.unknown.example/item.zip"},
+                )
+            if url == "https://cdn.unknown.example/item.zip":
+                return _ASFResponse(
+                    url,
+                    302,
+                    body=b"cdn",
+                    headers={"Location": "https://objects.unknown.example/item.zip"},
+                )
+            if url == "https://objects.unknown.example/item.zip":
+                return _ASFResponse(url, 200, body=b"payload")
+            message = f"unexpected fixture URL: {url}"
+            raise AssertionError(message)
+
+        def close(self) -> None:
+            return None
+
+    class _ASFAdapter:
+        provider = "ASF"
+        origins = ("https://datapool.asf.alaska.edu",)
+        path_prefixes = ("/",)
+        redirect_origins = ("https://datapool.asf.alaska.edu",)
+        profiles = ("earthdata-asf",)
+
+    session = _AnonymousChainSession()
+    asset = remote.RemoteAsset(
+        "ASF",
+        "asf-anonymous-chain",
+        "sentinel-1",
+        "G3964549387-ASF",
+        "data",
+        "https://datapool.asf.alaska.edu/item.zip",
+        auth_profile="earthdata-asf",
+    )
+    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_redirects=3))
+    response = remote._asf_request(
+        session,
+        "GET",
+        asset.href,
+        adapter=_ASFAdapter(),
+        asset=asset,
+        budget=ledger.budget,
+        ledger=ledger,
+        headers={"Authorization": "Bearer fixture", "Cookie": "session=secret"},
+    )
+
+    assert response.status_code == 200
+    assert len(session.requests) == 3
+    for _method, _url, headers, auth in session.requests[1:]:
+        assert "Authorization" not in headers
+        assert "Cookie" not in headers
+        assert auth is remote._no_auth
+
+
 def test_lpdaac_anonymous_handoff_admits_changed_delivery_origins() -> None:
     """A trusted LPDAAC gateway may hand off to any safe HTTPS object URL."""
 

@@ -97,23 +97,6 @@ def _signed_href(item: object, key: str) -> str:
     return str(getattr(asset, "href", ""))
 
 
-@dataclass(slots=True)
-class _SigningAsset:
-    """Minimal private asset shape accepted by Planetary Computer signers."""
-
-    href: str
-    extra_fields: dict[str, object] = field(default_factory=dict)
-    media_type: str | None = None
-
-
-@dataclass(slots=True)
-class _SigningItem:
-    """Minimal private STAC item shape used for operation-local signing."""
-
-    id: str
-    assets: dict[str, _SigningAsset]
-
-
 def _meter_response(response: Any, ledger: _CallLedger) -> None:
     """Charge one requests response, including its already-loaded body."""
     if getattr(response, "_faninsar_metered", False):
@@ -311,11 +294,18 @@ class PlanetaryComputerAdapter:
             _fail(RemoteAccessError, "invalid_endpoint")
         _safe_url(href, self)
         ledger.check_elapsed()
-        signing_asset = _SigningAsset(href=href)
-        signing_item = _SigningItem(
-            id=str(getattr(asset, "item_id", "")),
-            assets={key: signing_asset},
-        )
+        # ``planetary_computer.sign_inplace`` dispatches on supported public
+        # types, including STAC mappings.  Keep a tiny operation-local Item
+        # mapping rather than passing FanInSAR-private dataclasses that the
+        # SDK cannot recognize.  The mapping is never retained or exposed.
+        signing_item: dict[str, Any] = {
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": str(getattr(asset, "item_id", "")),
+            "geometry": None,
+            "properties": {},
+            "assets": {key: {"href": href}},
+        }
         try:
             signed = self._sign_item(signing_item)
             signed_href = _signed_href(signed, key)
