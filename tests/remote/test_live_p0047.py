@@ -357,6 +357,7 @@ def _register_lanes() -> tuple[tuple[str, str | None, str, str], ...]:
             f"?concept_id={_ASF_GRANULE}"
         ),
         collection_concept_id="C4175278193-ASF",
+        profiles=("earthdata-asf",),
         data_origins=("https://datapool.asf.alaska.edu",),
     )
     register_cmr_catalog(
@@ -439,6 +440,106 @@ def test_cmr_granule_pin_is_merged_with_public_query(
     assert params["concept_id"] == [_ASF_GRANULE]
 
 
+def test_asf_cmr_selection_uses_authenticated_download_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """CMR ASF records retain the selected profile for authenticated transfer."""
+    from faninsar.remote.cmr import CMRCollectionAdapter
+
+    def page(
+        _self: CMRCollectionAdapter,
+        _url: str,
+        _headers: Mapping[str, str],
+        _ledger: Any,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        return {
+            "feed": {
+                "entry": [
+                    {
+                        "id": _ASF_GRANULE,
+                        "producer_granule_id": _ASF_ITEM,
+                        "collection_concept_id": "C4175278193-ASF",
+                        "polygons": ["0 0 0 1 1 1 0 0"],
+                        "links": [
+                            {
+                                "rel": "http://esipfed.org/ns/fedsearch/1.1/data#",
+                                "href": (
+                                    "https://datapool.asf.alaska.edu/"
+                                    "data/item.zip"
+                                ),
+                            }
+                        ],
+                    }
+                ]
+            }
+        }, {}
+
+    monkeypatch.setattr(CMRCollectionAdapter, "_request_page", page)
+    _register_lanes()
+    items = remote.search(
+        BoundingBox(-1, -1, 2, 2, crs=4326),
+        catalog="p0047-live-asf",
+        auth_profile="earthdata-asf",
+        limit=1,
+    )
+    selected = _select_pinned_item(items, _ASF_GRANULE, _ASF_ITEM)
+    assert selected is not None
+    asset = selected.assets["data"]
+    assert selected.provider == "ASF"
+    assert asset.auth_profile == "earthdata-asf"
+
+    payload = b"PK\x03\x04fixture-safe-zip"
+    calls: list[str] = []
+
+    class _Response:
+        def __init__(self) -> None:
+            self.status_code = 200
+            self.headers: dict[str, str] = {}
+
+        def iter_content(self, chunk_size: int) -> list[bytes]:
+            del chunk_size
+            return [payload]
+
+        def close(self) -> None:
+            pass
+
+    class _Session:
+        def close(self) -> None:
+            pass
+
+    def authenticated_session(
+        selected_asset: remote.RemoteAsset,
+        _adapter: Any,
+        _budget: remote.RemoteResourceBudget,
+        _ledger: remote._CallLedger,
+    ) -> tuple[_Session, str]:
+        assert selected_asset.auth_profile == "earthdata-asf"
+        return _Session(), "fixture-token"
+
+    def asf_request(
+        _session: _Session,
+        method: str,
+        _url: str,
+        **_kwargs: Any,
+    ) -> _Response:
+        calls.append(method)
+        return _Response()
+
+    monkeypatch.setattr(remote, "_asf_authenticated_session", authenticated_session)
+    monkeypatch.setattr(remote, "_asf_request", asf_request)
+    monkeypatch.setattr(
+        remote.urllib.request.OpenerDirector,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("ASF download used urllib"),
+    )
+
+    destination = tmp_path / "asset.zip"
+    remote.download(asset, destination, overwrite=True)
+    assert destination.read_bytes() == payload
+    assert calls == ["GET"]
+
+
 @pytest.mark.skipif(
     not _LIVE_ENABLED, reason="set FANINSAR_P0047_LIVE=1 for the opt-in live verifier"
 )
@@ -469,7 +570,9 @@ def test_live_p0047_fixed_full_transfers(monkeypatch: pytest.MonkeyPatch) -> Non
                     bounds,
                     catalog=catalog,
                     auth_profile=(
-                        "earthdata-lpdaac"
+                        "earthdata-asf"
+                        if lane.startswith("ASF")
+                        else "earthdata-lpdaac"
                         if lane.startswith("LP DAAC")
                         else "anonymous"
                     ),
