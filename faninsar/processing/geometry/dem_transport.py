@@ -240,8 +240,9 @@ class EarthdataCredentialProvider(CredentialProvider):
         """Fail closed when neither .netrc nor EARTHDATA_TOKEN provide creds."""
         if os.environ.get("EARTHDATA_TOKEN"):
             return
-        # Probe a representative Earthdata host for a netrc entry.
-        if _netrc_auth("data.lpdaac.earthdatacloud.nasa.gov") is not None:
+        # LPDAAC's protected URL redirects to URS, where credentials are
+        # consumed.  Do not require or probe a data/CDN host credential.
+        if _netrc_auth("urs.earthdata.nasa.gov") is not None:
             return
         message = (
             "Earthdata credentials not found: add a machine entry covering "
@@ -257,7 +258,7 @@ def resolve_credentials(credential_ref: str) -> CredentialProvider:
     """Resolve a named credential provider, failing closed when absent."""
     if credential_ref == "earthdata":
         EarthdataCredentialProvider.require_available()
-        return EarthdataCredentialProvider("data.lpdaac.earthdatacloud.nasa.gov")
+        return EarthdataCredentialProvider("urs.earthdata.nasa.gov")
     message = f"unknown credential reference: {credential_ref!r}"
     logger.error(message)
     raise ValueError(message)

@@ -249,6 +249,210 @@ def test_asf_download_pre_authenticates_and_follows_trusted_redirects(
     assert session.closed
 
 
+class _LPDAACSession:
+    """Fixture for LPDAAC's data -> URS -> data -> CloudFront flow."""
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.cookies = requests.cookies.RequestsCookieJar()
+        self.requests: list[tuple[str, str, dict[str, str]]] = []
+        self.closed = False
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        data: Any = None,
+        auth: Any = None,
+        allow_redirects: bool,
+        stream: bool,
+        timeout: tuple[float, float],
+    ) -> _ASFResponse:
+        """Return one response for each explicitly followed request."""
+        del data, auth, allow_redirects, stream, timeout
+        self.requests.append((method, url, dict(headers)))
+        if len(self.requests) == 1:
+            return _ASFResponse(
+                url,
+                302,
+                body=b"data-redirect",
+                headers={
+                    "Location": (
+                        "https://urs.earthdata.nasa.gov/oauth/authorize?"
+                        "client_id=fixture&state=object"
+                    )
+                },
+            )
+        if url.endswith("NASADEM_HGT_n36w121.zip"):
+            return _ASFResponse(
+                url,
+                302,
+                body=b"object-redirect",
+                headers={
+                    "Location": (
+                        "https://d123example.cloudfront.net/"
+                        "s3-0123456789abcdef0123456789abcdef/"
+                        "lp-prod-protected.s3.us-west-2.amazonaws.com/"
+                        "NASADEM_HGT.001/NASADEM_HGT_n36w121/"
+                        "NASADEM_HGT_n36w121.zip?X-Amz-Signature=fixture"
+                    )
+                },
+            )
+        if url.startswith("https://urs.earthdata.nasa.gov/oauth/"):
+            return _ASFResponse(
+                url,
+                302,
+                body=b"urs-redirect",
+                headers={
+                    "Location": (
+                        "https://data.lpdaac.earthdatacloud.nasa.gov/login?"
+                        "code=fixture"
+                    )
+                },
+            )
+        if url.startswith("https://data.lpdaac.earthdatacloud.nasa.gov/login"):
+            return _ASFResponse(
+                url,
+                302,
+                body=b"login-redirect",
+                headers={
+                    "Location": (
+                        "https://data.lpdaac.earthdatacloud.nasa.gov/"
+                        "lp-prod-protected/NASADEM_HGT.001/"
+                        "NASADEM_HGT_n36w121/NASADEM_HGT_n36w121.zip"
+                    )
+                },
+            )
+        if url.startswith("https://d123example.cloudfront.net/"):
+            return _ASFResponse(
+                url,
+                200,
+                self.payload,
+                headers={"Content-Encoding": "identity"},
+            )
+        message = f"unexpected fixture URL: {url}"
+        raise AssertionError(message)
+
+    def close(self) -> None:
+        """Record session cleanup."""
+        self.closed = True
+
+
+def test_lpdaac_download_meters_redirects_and_strips_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """LPDAAC auth credentials stop at URS and never reach CloudFront."""
+    payload = b"nasadem-zip"
+    session = _LPDAACSession(payload)
+    monkeypatch.setattr(remote.requests, "Session", lambda: session)
+    monkeypatch.setattr(
+        remote,
+        "_netrc_credentials",
+        lambda host: (
+            ("fixture-user", "fixture-password")
+            if host == "urs.earthdata.nasa.gov"
+            else None
+        ),
+    )
+
+    class _LPDAACAdapter:
+        provider = "LPCLOUD"
+        origins = (
+            "https://data.lpdaac.earthdatacloud.nasa.gov",
+        )
+        path_prefixes = ("/",)
+        redirect_origins = (
+            "https://data.lpdaac.earthdatacloud.nasa.gov",
+            "https://urs.earthdata.nasa.gov",
+        )
+        profiles = ("earthdata-lpdaac",)
+
+    source = (
+        "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/"
+        "NASADEM_HGT.001/NASADEM_HGT_n36w121/NASADEM_HGT_n36w121.zip"
+    )
+    asset = remote.RemoteAsset(
+        "LPCLOUD",
+        "lpdaac-live",
+        "NASADEM",
+        "G2816843744-LPCLOUD",
+        "data",
+        source,
+        size_bytes=len(payload),
+        auth_profile="earthdata-lpdaac",
+    )
+    adapter = _LPDAACAdapter()
+    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_redirects=5))
+    staging = tmp_path / "NASADEM_HGT_n36w121.zip"
+
+    size, digest = remote._stream_download(
+        asset, adapter, ledger.budget, ledger, staging
+    )
+
+    assert size == len(payload)
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert ledger.requests == 5, [item[1] for item in session.requests]
+    assert ledger.redirects == 4
+    assert ledger.response_bytes_total == len(payload) + sum(
+        len(body)
+        for body in (
+            b"data-redirect",
+            b"urs-redirect",
+            b"login-redirect",
+            b"object-redirect",
+        )
+    )
+    urs_headers = session.requests[1][2]
+    assert urs_headers["Authorization"].startswith("Basic ")
+    assert "Authorization" not in session.requests[-1][2]
+    assert "Cookie" not in session.requests[-1][2]
+    assert "X-Amz-Signature=fixture" in session.requests[-1][1]
+    assert session.closed
+
+
+def test_lpdaac_cloudfront_handoff_is_bound_to_exact_object() -> None:
+    """An LPDAAC CDN hostname cannot redirect to another bucket or object."""
+
+    class _LPDAACAdapter:
+        origins = ("https://data.lpdaac.earthdatacloud.nasa.gov",)
+        path_prefixes = ("/",)
+        redirect_origins = (
+            "https://data.lpdaac.earthdatacloud.nasa.gov",
+            "https://urs.earthdata.nasa.gov",
+        )
+
+    source = (
+        "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/"
+        "NASADEM_HGT.001/NASADEM_HGT_n36w121/NASADEM_HGT_n36w121.zip"
+    )
+    asset = remote.RemoteAsset(
+        "LPCLOUD",
+        "lpdaac-live",
+        "NASADEM",
+        "G2816843744-LPCLOUD",
+        "data",
+        source,
+        auth_profile="earthdata-lpdaac",
+    )
+    valid = (
+        "https://d123example.cloudfront.net/"
+        "s3-0123456789abcdef0123456789abcdef/"
+        "lp-prod-protected.s3.us-west-2.amazonaws.com/"
+        "NASADEM_HGT.001/NASADEM_HGT_n36w121/NASADEM_HGT_n36w121.zip"
+    )
+    assert remote._lpdaac_redirect_url(source, valid, asset, _LPDAACAdapter()) == valid
+    for invalid in (
+        valid.replace("lp-prod-protected.s3", "other-bucket.s3"),
+        valid.replace("NASADEM_HGT_n36w121.zip", "other.zip"),
+        valid.replace("d123example", "evil.example"),
+    ):
+        with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
+            remote._lpdaac_redirect_url(source, invalid, asset, _LPDAACAdapter())
+
+
 def test_asf_cloudfront_handoff_is_bound_to_source_bucket_and_filename() -> None:
     """A dynamic CDN host is not a general redirect wildcard."""
 

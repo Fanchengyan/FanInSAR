@@ -1077,7 +1077,7 @@ class AuthenticatedGranuleSource(DemSource):
         adapter = _CMR_ADAPTERS.get(catalog)
         if adapter is None:
             cmr_provider = (
-                "ASF" if self.cmr_collection == "C3803703055-ASF" else "LPDAAC"
+                "ASF" if self.cmr_collection == "C3803703055-ASF" else "LPCLOUD"
             )
             adapter = CMRCollectionAdapter(
                 provider=cmr_provider,

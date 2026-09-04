@@ -8,6 +8,7 @@ operations without introducing a second scientific object model.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import http.cookiejar
 import importlib
@@ -337,6 +338,13 @@ _ASF_NISAR_CLOUDFRONT_PATH = re.compile(
     re.IGNORECASE,
 )
 _ASF_NISAR_GATEWAY_PREFIX = "/NISAR"
+_LPDAAC_DATA_ORIGIN = "https://data.lpdaac.earthdatacloud.nasa.gov"
+_LPDAAC_BUCKET = "lp-prod-protected"
+_LPDAAC_BUCKET_HOST = "lp-prod-protected.s3.us-west-2.amazonaws.com"
+_LPDAAC_CLOUDFRONT_PATH = re.compile(
+    rf"^/s3-[0-9a-f]{{32}}/{re.escape(_LPDAAC_BUCKET_HOST)}"
+    r"(?P<key>/[^/].*)$"
+)
 
 
 def _sanitize(value: Any, key: str | None = None) -> Any:  # noqa: PLR0911
@@ -920,6 +928,11 @@ def _netrc_credentials(host: str) -> tuple[str, str] | None:
     return entry[0], entry[2]
 
 
+def _no_auth(request: requests.PreparedRequest) -> requests.PreparedRequest:
+    """Prevent implicit netrc lookup without changing requests' environment."""
+    return request
+
+
 def _asf_redirect_url(
     source_url: str,
     target_url: str,
@@ -990,6 +1003,62 @@ def _asf_redirect_url(
     return target_url
 
 
+def _lpdaac_redirect_url(
+    source_url: str,
+    target_url: str,
+    asset: RemoteAsset,
+    adapter: _Adapter,
+) -> str:
+    """Validate one LPDAAC redirect, including its scoped CloudFront hop.
+
+    LPDAAC's Earthdata Cloud delivery authenticates through URS and returns a
+    short-lived CloudFront URL for the original object.  The CDN hostname is
+    deployment-specific, so it is admitted only when the redirect originated
+    at the registered LPDAAC data URL and the target names the exact S3 key
+    and filename selected during CMR discovery.
+    """
+    try:
+        return _validate_url(target_url, adapter, redirect=True)
+    except RemoteAccessError:
+        pass
+    try:
+        source_origin = _url_origin(source_url)
+        source_path = urllib.parse.unquote(
+            urllib.parse.urlsplit(source_url).path or "/"
+        )
+        asset_path = urllib.parse.unquote(urllib.parse.urlsplit(asset.href).path or "/")
+        parsed = urllib.parse.urlsplit(target_url)
+        target_path = urllib.parse.unquote(parsed.path)
+        target_host = (parsed.hostname or "").lower()
+        target_match = _LPDAAC_CLOUDFRONT_PATH.fullmatch(target_path)
+    except (TypeError, ValueError):
+        _fail(RemoteAccessError, "invalid_endpoint")
+    source_key = asset_path.removeprefix(f"/{_LPDAAC_BUCKET}")
+    target_key = target_match.group("key") if target_match is not None else None
+    target_name = target_key.rsplit("/", 1)[-1] if target_key else ""
+    source_name = source_key.rsplit("/", 1)[-1]
+    if (
+        source_origin != _LPDAAC_DATA_ORIGIN
+        or source_path != asset_path
+        or not asset_path.startswith(f"/{_LPDAAC_BUCKET}/")
+        or parsed.scheme.lower() != "https"
+        or not _ASF_CLOUDFRONT_HOST.fullmatch(target_host)
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or "\\" in parsed.path
+        or "%2f" in parsed.path.lower()
+        or "%5c" in parsed.path.lower()
+        or any(segment in {".", ".."} for segment in target_path.split("/"))
+        or target_match is None
+        or target_key != source_key
+        or not source_name
+        or target_name != source_name
+    ):
+        _fail(RemoteAccessError, "unregistered_endpoint")
+    return target_url
+
+
 def _asf_request(
     session: requests.Session,
     method: str,
@@ -1048,6 +1117,92 @@ def _asf_request(
             current_headers = _redirect_headers(
                 current_headers, source_origin, target_origin
             )
+        if response.status_code == 303 or (
+            response.status_code in {301, 302} and current_method == "POST"
+        ):
+            current_method = "GET"
+            current_data = None
+        current_url = target
+
+
+def _lpdaac_request(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    adapter: _Adapter,
+    asset: RemoteAsset,
+    budget: RemoteResourceBudget,
+    ledger: _CallLedger,
+) -> requests.Response:
+    """Issue one metered LPDAAC request through its explicit auth redirects.
+
+    Basic credentials are attached solely to the URS hop.  Every other hop,
+    including the signed CloudFront transfer, receives no Authorization or
+    Cookie header.  Redirect responses are drained before being closed so
+    their bodies count against the operation budget.
+    """
+    credentials = _netrc_credentials("urs.earthdata.nasa.gov")
+    if credentials is None:
+        _fail(RemoteAccessError, "missing_earthdata_credentials")
+    username, password = credentials
+    basic = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+    current_method = method.upper()
+    current_url = _validate_url(url, adapter, redirect=True)
+    current_headers: dict[str, str] = {"Accept-Encoding": "identity"}
+    current_data: Mapping[str, str] | None = None
+    while True:
+        current_origin = _url_origin(current_url)
+        if current_origin == _ASF_EDL_ORIGIN:
+            current_headers["Authorization"] = basic
+        else:
+            current_headers.pop("Authorization", None)
+        ledger.request()
+        ledger.begin_response()
+        response = session.request(
+            current_method,
+            current_url,
+            headers=current_headers,
+            data=current_data,
+            # A truthy no-op auth hook suppresses requests' implicit netrc
+            # lookup while preserving proxy and CA environment settings.
+            auth=_no_auth,
+            allow_redirects=False,
+            stream=True,
+            timeout=(budget.connect_timeout_seconds, budget.read_timeout_seconds),
+        )
+        if response.status_code not in _ASF_REDIRECT_CODES:
+            return response
+        location = response.headers.get("Location")
+        if not location:
+            _drain_asf_response(response, ledger, budget.max_response_bytes)
+            _fail(RemoteAccessError, "invalid_redirect")
+        target = urllib.parse.urljoin(current_url, location)
+        _drain_asf_response(response, ledger, budget.max_response_bytes)
+        ledger.redirect()
+        try:
+            target = _validate_url(target, adapter, redirect=True)
+        except RemoteAccessError:
+            target = _lpdaac_redirect_url(current_url, target, asset, adapter)
+        source_origin = _url_origin(current_url)
+        target_origin = _url_origin(target)
+        if source_origin != target_origin:
+            current_headers = _redirect_headers(
+                current_headers, source_origin, target_origin
+            )
+        if target_origin == _ASF_EDL_ORIGIN:
+            current_headers["Authorization"] = basic
+        else:
+            current_headers.pop("Authorization", None)
+        if target_origin != _ASF_EDL_ORIGIN:
+            # Cookie headers are never carried to the data or CDN origin.  A
+            # requests cookie jar still supplies only cookies scoped to the
+            # target domain, but clearing it at the CDN boundary makes that
+            # policy explicit for custom sessions and test doubles alike.
+            current_headers.pop("Cookie", None)
+            if target_origin != _LPDAAC_DATA_ORIGIN:
+                with contextlib.suppress(AttributeError, KeyError):
+                    session.cookies.clear()
         if response.status_code == 303 or (
             response.status_code in {301, 302} and current_method == "POST"
         ):
@@ -1584,6 +1739,31 @@ def _stream_download(
                     )
                     if not 200 <= response.status_code < 300:
                         _fail(RemoteAccessError, "asf_transfer_denied")
+                    if (
+                        response.headers.get("Content-Encoding", "identity")
+                        != "identity"
+                    ):
+                        _fail(RemoteAccessError, "unexpected_content_encoding")
+                    consume(response.iter_content(chunk_size=1024 * 1024), meter=True)
+                finally:
+                    if response is not None:
+                        response.close()
+                    session.close()
+            elif result is None and asset.auth_profile == "earthdata-lpdaac":
+                session = requests.Session()
+                response: requests.Response | None = None
+                try:
+                    response = _lpdaac_request(
+                        session,
+                        "GET",
+                        asset.href,
+                        adapter=adapter,
+                        asset=asset,
+                        budget=budget,
+                        ledger=ledger,
+                    )
+                    if not 200 <= response.status_code < 300:
+                        _fail(RemoteAccessError, "lpdaac_transfer_denied")
                     if (
                         response.headers.get("Content-Encoding", "identity")
                         != "identity"
