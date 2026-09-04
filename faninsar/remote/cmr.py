@@ -9,6 +9,7 @@ geometry filtering and publication to that boundary.
 from __future__ import annotations
 
 import json
+import math
 import re
 import urllib.error
 import urllib.parse
@@ -317,6 +318,28 @@ def _umm_size_bytes(record: Mapping[str, Any]) -> int | None:
     return None
 
 
+def _compact_size_bytes(value: Any) -> int | None:
+    """Convert compact CMR's MiB declaration to an exact byte count.
+
+    Compact CMR records expose ``granule_size`` in binary mebibytes.  The
+    declaration is usable as integrity metadata only when its conversion to
+    bytes is a finite, non-negative integer.
+    """
+    if isinstance(value, int):
+        return value * 1024**2 if not isinstance(value, bool) and value >= 0 else None
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, float) or not math.isfinite(value) or value < 0:
+        return None
+    size_bytes = value * 1024**2
+    if not math.isfinite(size_bytes) or not size_bytes.is_integer():
+        return None
+    return int(size_bytes)
+
+
 def _cmr_links(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """Return compact CMR links representing data downloads."""
     links = record.get("links")
@@ -361,7 +384,14 @@ def _asset_candidates(record: Mapping[str, Any]) -> list[tuple[str, Mapping[str,
             )
             for value in values
         ]
-    return [(str(value.get("title") or "data"), value) for value in _cmr_links(record)]
+    size = _compact_size_bytes(record.get("granule_size"))
+    return [
+        (
+            str(value.get("title") or "data"),
+            {**value, **({"Size": size} if size is not None else {})},
+        )
+        for value in _cmr_links(record)
+    ]
 
 
 def _cmr_number(value: Any) -> str:

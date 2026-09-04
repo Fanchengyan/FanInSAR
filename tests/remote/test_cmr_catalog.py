@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from faninsar import remote
-from faninsar.remote.cmr import CMRCollectionAdapter
+from faninsar.remote.cmr import CMRCollectionAdapter, _compact_size_bytes
 
 
 class _ResponseFixture:
@@ -471,6 +471,47 @@ def test_compact_polygon_accepts_one_coordinate_string() -> None:
         "type": "Polygon",
         "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
     }
+
+
+def test_compact_granule_size_preserves_exact_binary_mib_value() -> None:
+    """Preserve the exact byte count declared by a real compact CMR item."""
+    adapter = CMRCollectionAdapter(
+        provider="ASF",
+        collection="sentinel-1",
+        endpoint="https://cmr.invalid/search/granules.json",
+    )
+    entry = {
+        "id": "G4297731264-ASF",
+        "collection_concept_id": "C123",
+        "granule_size": "149.3316593170166",
+        "polygons": ["0 0 0 1 1 1 0 0"],
+        "links": [{"rel": "data#", "href": "https://cmr.invalid/data/g1"}],
+    }
+
+    record = adapter._normalize(entry)
+
+    assert record["assets"]["data"]["size"] == 156_585_594
+    item = remote._normalize_record(record, "fixture", adapter, "anonymous")
+    assert item.assets["data"].size_bytes == 156_585_594
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        False,
+        None,
+        "not-a-number",
+        float("nan"),
+        float("inf"),
+        -1,
+        "-1",
+        "1.0000001",
+    ],
+)
+def test_compact_granule_size_rejects_invalid_declarations(value: Any) -> None:
+    """Ignore malformed, unsafe, and fractional-byte compact sizes."""
+    assert _compact_size_bytes(value) is None
 
 
 def test_compact_polygon_accepts_nested_single_coordinate_string() -> None:
