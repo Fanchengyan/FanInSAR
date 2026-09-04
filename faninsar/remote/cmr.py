@@ -792,8 +792,25 @@ class CMRCollectionAdapter:
             )
         search_after: str | None = None
         for _ in range(self.max_pages):
-            query = urllib.parse.urlencode(params)
-            url = f"{self.endpoint}?{query}"
+            # Registrations may pin a deterministic granule with an endpoint
+            # query (for example, ``concept_id=G...``).  Preserve that
+            # server-side selector while adding the normalized public query
+            # parameters; blindly appending a second ``?`` would turn the
+            # selector into part of another parameter value.
+            endpoint = urllib.parse.urlsplit(self.endpoint)
+            endpoint_query = urllib.parse.parse_qsl(
+                endpoint.query, keep_blank_values=True
+            )
+            query = urllib.parse.urlencode([*endpoint_query, *params.items()])
+            url = urllib.parse.urlunsplit(
+                (
+                    endpoint.scheme,
+                    endpoint.netloc,
+                    endpoint.path,
+                    query,
+                    endpoint.fragment,
+                )
+            )
             page_headers = dict(request_headers or {})
             if search_after:
                 page_headers["CMR-Search-After"] = search_after
@@ -842,7 +859,14 @@ class CMRCollectionAdapter:
             # fields.
             entry = {**entry, **entry["umm"]}
         is_umm = "GranuleUR" in entry or "DataGranule" in entry
-        item_id = entry.get("id") if not is_umm else entry.get("GranuleUR")
+        concept_id = entry.get("id")
+        producer_id = entry.get("producer_granule_id")
+        if is_umm:
+            item_id = entry.get("GranuleUR")
+        elif isinstance(producer_id, str) and producer_id:
+            item_id = producer_id
+        else:
+            item_id = entry.get("id")
         if not isinstance(item_id, str) or not item_id:
             _error(CMRDiscoveryError, "invalid_item_id", "CMR granule has no stable id")
         provider_claims = _metadata_values(
@@ -920,7 +944,11 @@ class CMRCollectionAdapter:
             platform = entry.get("platform")
             instrument = entry.get("instrument")
             candidates = _asset_candidates(entry)
-            properties = {}
+            properties = (
+                {"cmr_concept_id": concept_id}
+                if isinstance(concept_id, str) and concept_id
+                else {}
+            )
         if not candidates:
             _error(
                 CMRDiscoveryError,

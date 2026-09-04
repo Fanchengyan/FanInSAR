@@ -1,7 +1,9 @@
 """Fixed, opt-in P0047 live transfer verifier.
 
-The module is inert unless ``FANINSAR_P0047_LIVE=1`` is set.  Live payloads
-and evidence are written only below the caller-selected temporary root.
+The transfer verifier is inert unless ``FANINSAR_P0047_LIVE=1`` is set.  Its
+deterministic discovery checks remain available without network access.  Live
+payloads and evidence are written only below the caller-selected temporary
+root.
 """
 
 from __future__ import annotations
@@ -11,6 +13,8 @@ import json
 import os
 import subprocess
 import time
+import urllib.parse
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -22,15 +26,11 @@ import requests
 from faninsar import remote
 from faninsar.query import BoundingBox
 
-if os.environ.get("FANINSAR_P0047_LIVE") != "1":
-    pytest.skip(
-        "set FANINSAR_P0047_LIVE=1 for the opt-in live verifier",
-        allow_module_level=True,
-    )
-
-
+_LIVE_ENABLED = os.environ.get("FANINSAR_P0047_LIVE") == "1"
 _ASF_GRANULE = "G4297731264-ASF"
+_ASF_ITEM = "S1D_WV_SLC__1SSV_20260903T071057_20260903T071115_004410_008296_C928"
 _LPDAAC_GRANULE = "G2816843744-LPCLOUD"
+_LPDAAC_ITEM = "NASADEM_HGT_n36w121"
 _PC_ITEM = "Copernicus_DSM_COG_10_N39_00_W105_00_DEM"
 _COMMIT = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 _ROOT = Path(
@@ -290,6 +290,11 @@ def _lane_result(
         "lane": lane,
         "status": "PASS",
         "identity": identity,
+        "cmr_concept_id": (
+            item.raw_metadata.get("properties", {}).get("cmr_concept_id")
+            if isinstance(item.raw_metadata.get("properties", {}), Mapping)
+            else None
+        ),
         "provider": item.provider,
         "collection": item.collection,
         "item_id": item.item_id,
@@ -315,30 +320,128 @@ def _origin(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def _register_lanes() -> tuple[tuple[str, str, object], ...]:
+def _select_pinned_item(
+    items: list[remote.CatalogItem], concept_id: str | None, item_id: str
+) -> remote.CatalogItem | None:
+    """Select an item only when its CMR and normalized identities both match.
+
+    CMR compact JSON uses ``id`` for the granule concept identifier while the
+    normalized remote contract uses ``producer_granule_id`` as ``item_id``.
+    Keeping these checks separate prevents an accidental match on either
+    identity alone.
+    """
+    for item in items:
+        properties = item.raw_metadata.get("properties", {})
+        returned_concept = (
+            properties.get("cmr_concept_id")
+            if isinstance(properties, Mapping)
+            else None
+        )
+        if (
+            concept_id is None or returned_concept == concept_id
+        ) and item.item_id == item_id:
+            return item
+    return None
+
+
+def _register_lanes() -> tuple[tuple[str, str | None, str, str], ...]:
     """Register the three fixed production lanes."""
     from faninsar.remote import register_cmr_catalog, register_pc_catalog
 
     register_cmr_catalog(
+        "p0047-live-asf",
+        provider="ASF",
+        collection="sentinel-1",
+        endpoint=(
+            "https://cmr.earthdata.nasa.gov/search/granules.json"
+            f"?concept_id={_ASF_GRANULE}"
+        ),
+        collection_concept_id="C4175278193-ASF",
+        data_origins=("https://datapool.asf.alaska.edu",),
+    )
+    register_cmr_catalog(
         "p0047-live-lpdaac",
         provider="LPCLOUD",
         collection="NASADEM",
+        endpoint=(
+            "https://cmr.earthdata.nasa.gov/search/granules.json"
+            f"?concept_id={_LPDAAC_GRANULE}"
+        ),
+        collection_concept_id="C2763264762-LPCLOUD",
         profiles=("earthdata-lpdaac",),
         data_origins=("https://data.lpdaac.earthdatacloud.nasa.gov",),
-        candidate_filter=lambda candidate, _url: candidate.get("granule_id")
-        == _LPDAAC_GRANULE,
     )
     register_pc_catalog("p0047-live-pc")
-    from faninsar.remote.providers.asf_search import register_asf_search_catalog
-
-    register_asf_search_catalog("p0047-live-asf", collection="sentinel-1")
     return (
-        ("ASF SAFE", _ASF_GRANULE, "p0047-live-asf"),
-        ("LP DAAC NASADEM", _LPDAAC_GRANULE, "p0047-live-lpdaac"),
-        ("Planetary Computer DEM", _PC_ITEM, "p0047-live-pc"),
+        ("ASF SAFE", _ASF_GRANULE, _ASF_ITEM, "p0047-live-asf"),
+        ("LP DAAC NASADEM", _LPDAAC_GRANULE, _LPDAAC_ITEM, "p0047-live-lpdaac"),
+        ("Planetary Computer DEM", None, _PC_ITEM, "p0047-live-pc"),
     )
 
 
+def test_pinned_item_selector_requires_both_identities() -> None:
+    """CMR concept IDs and normalized product IDs are checked independently."""
+    from faninsar.remote.cmr import CMRCollectionAdapter
+
+    adapter = CMRCollectionAdapter(
+        provider="ASF",
+        collection="sentinel-1",
+        endpoint="https://cmr.invalid/search/granules.json",
+        data_origins=("https://datapool.asf.alaska.edu",),
+    )
+    record = adapter._normalize(
+        {
+            "id": _ASF_GRANULE,
+            "producer_granule_id": _ASF_ITEM,
+            "collection_concept_id": "C4175278193-ASF",
+            "polygons": ["0 0 0 1 1 1 0 0"],
+            "links": [
+                {
+                    "rel": "http://esipfed.org/ns/fedsearch/1.1/data#",
+                    "href": "https://datapool.asf.alaska.edu/data/item.zip",
+                }
+            ],
+        }
+    )
+    item = remote._normalize_record(record, "fixture", adapter, "anonymous")
+
+    assert _select_pinned_item([item], _ASF_GRANULE, "wrong-item") is None
+    assert _select_pinned_item([item], _ASF_GRANULE, _ASF_ITEM) is not None
+    assert _select_pinned_item([item], "G0000000000-ASF", item.item_id) is None
+
+
+def test_cmr_granule_pin_is_merged_with_public_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pinned CMR concept remains a server-side search parameter."""
+    from faninsar.remote.cmr import CMRCollectionAdapter
+
+    endpoint = f"https://cmr.invalid/search/granules.json?concept_id={_ASF_GRANULE}"
+    adapter = CMRCollectionAdapter(
+        provider="ASF",
+        collection="sentinel-1",
+        endpoint=endpoint,
+    )
+    seen_urls: list[str] = []
+
+    def page(
+        _self: CMRCollectionAdapter,
+        url: str,
+        _headers: Mapping[str, str],
+        _ledger: Any,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        seen_urls.append(url)
+        return {"feed": {"entry": []}}, {}
+
+    monkeypatch.setattr(CMRCollectionAdapter, "_request_page", page)
+    list(adapter.items(ledger=remote._CallLedger(remote.RemoteResourceBudget())))
+    params = urllib.parse.parse_qs(urllib.parse.urlsplit(seen_urls[0]).query)
+    assert params["concept_id"] == [_ASF_GRANULE]
+
+
+@pytest.mark.skipif(
+    not _LIVE_ENABLED, reason="set FANINSAR_P0047_LIVE=1 for the opt-in live verifier"
+)
 def test_live_p0047_fixed_full_transfers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify fresh ASF, LP DAAC, and Planetary Computer complete transfers."""
     if _ROOT.exists():
@@ -352,7 +455,7 @@ def test_live_p0047_fixed_full_transfers(monkeypatch: pytest.MonkeyPatch) -> Non
         registrations = _register_lanes()
     except Exception as error:
         pytest.fail(f"live registration failed ({type(error).__name__})")
-    for lane, identity, catalog in registrations:
+    for lane, concept_id, item_id, catalog in registrations:
         suffix = ".tif" if lane.startswith("Planetary") else ".zip"
         destination = _ROOT / lane.lower().replace(" ", "-") / f"asset{suffix}"
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -373,13 +476,11 @@ def test_live_p0047_fixed_full_transfers(monkeypatch: pytest.MonkeyPatch) -> Non
                     limit=1,
                 ),
             )
-            selected = next(
-                (value for value in items if value.item_id == identity), None
-            )
+            selected = _select_pinned_item(items, concept_id, item_id)
             if selected is None:
                 remote._fail(remote.RemoteAccessError, "identity_mismatch")
             lanes.append(
-                _lane_result(lane, identity, selected, destination, recorder)
+                _lane_result(lane, item_id, selected, destination, recorder)
             )
         except Exception as error:
             reason = getattr(error, "reason", "")
@@ -392,7 +493,8 @@ def test_live_p0047_fixed_full_transfers(monkeypatch: pytest.MonkeyPatch) -> Non
                 {
                     "lane": lane,
                     "status": status,
-                    "identity": identity,
+                    "identity": item_id,
+                    "cmr_concept_id": concept_id,
                     "error_class": type(error).__name__,
                     "reason": reason or "live_transfer_failed",
                 }
