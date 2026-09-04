@@ -29,6 +29,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NoReturn, Protocol
 
+import requests
 from pyproj import CRS, Transformer
 from pyproj.exceptions import CRSError
 from shapely.geometry import Point, box, mapping, shape
@@ -314,6 +315,34 @@ _SIGNED_QUERY_KEY = re.compile(
 _AZURE_SAS_KEY = re.compile(
     r"^(?:sp|st|se|sv|sr|spr|sip|si|sig|skoid|sktid|skt|ske|sks|skv|"
     r"rscc|rscd|rsce|rscl|rsct|ss|srt|sdd)$",
+    re.IGNORECASE,
+)
+_ASF_EDL_ORIGIN = "https://urs.earthdata.nasa.gov"
+_ASF_AUTH_ORIGIN = "https://cumulus.asf.alaska.edu"
+_ASF_DATA_ORIGIN = "https://datapool.asf.alaska.edu"
+_ASF_SENTINEL1_ORIGIN = "https://sentinel1.asf.alaska.edu"
+_ASF_NISAR_ORIGIN = "https://nisar.asf.earthdatacloud.nasa.gov"
+_ASF_NISAR_BUCKET = "sds-n-cumulus-prod-nisar-products.s3.us-west-2.amazonaws.com"
+_ASF_EDL_CLIENT_ID = "BO_n7nTIlMljdvU6kRRB3g"
+_ASF_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_ASF_CREDENTIAL_ORIGINS = frozenset(
+    {
+        _ASF_EDL_ORIGIN,
+        _ASF_AUTH_ORIGIN,
+        _ASF_DATA_ORIGIN,
+        _ASF_SENTINEL1_ORIGIN,
+        _ASF_NISAR_ORIGIN,
+    }
+)
+_ASF_CLOUDFRONT_HOST = re.compile(r"^[a-z0-9]+\.cloudfront\.net$")
+_ASF_SLC_CLOUDFRONT_PATH = re.compile(
+    r"^/s3-[^/]+/asf-ngap2w-p-s1-slc-[a-z0-9]+\."
+    r"s3\.us-west-2\.amazonaws\.com/[^/]+\.zip$",
+    re.IGNORECASE,
+)
+_ASF_NISAR_CLOUDFRONT_PATH = re.compile(
+    r"^/s3-[^/]+/sds-n-cumulus-prod-nisar-products\.s3\.us-west-2\.amazonaws\.com"
+    r"/NISAR/DEM/.+$",
     re.IGNORECASE,
 )
 
@@ -862,6 +891,232 @@ def _netrc_authorization(url: str) -> str | None:
     return "Basic " + base64.b64encode(token).decode("ascii")
 
 
+def _netrc_credentials(host: str) -> tuple[str, str] | None:
+    """Resolve one host's username and password without persisting either."""
+    try:
+        entry = netrc.netrc().authenticators(host)
+    except (OSError, netrc.NetrcParseError):
+        return None
+    if entry is None or entry[0] is None or entry[2] is None:
+        return None
+    return entry[0], entry[2]
+
+
+def _asf_redirect_url(
+    source_url: str,
+    target_url: str,
+    asset: RemoteAsset,
+    adapter: _Adapter,
+) -> str:
+    """Validate one ASF redirect, including its scoped CloudFront handoff.
+
+    ASF's Sentinel-1 service issues a short-lived CloudFront URL whose host is
+    deployment-specific.  That URL is admitted only when it comes directly
+    from the registered Sentinel-1 origin, names the approved ASF SLC bucket,
+    and retains the exact SAFE ZIP filename selected during discovery.
+    """
+    try:
+        return _validate_url(target_url, adapter, redirect=True)
+    except RemoteAccessError:
+        pass
+    try:
+        source_origin = _url_origin(source_url)
+        source_path = urllib.parse.urlsplit(source_url).path or "/"
+        parsed = urllib.parse.urlsplit(target_url)
+        host = (parsed.hostname or "").lower()
+        source_name = urllib.parse.unquote(
+            urllib.parse.urlsplit(asset.href).path.rsplit("/", 1)[-1]
+        )
+        target_name = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+    except (TypeError, ValueError):
+        _fail(RemoteAccessError, "invalid_endpoint")
+    is_sentinel1 = source_origin == _ASF_SENTINEL1_ORIGIN
+    is_nisar = source_origin == _ASF_NISAR_ORIGIN
+    if (
+        not (is_sentinel1 or is_nisar)
+        or parsed.scheme.lower() != "https"
+        or not _ASF_CLOUDFRONT_HOST.fullmatch(host)
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or "\\" in parsed.path
+        or "%2f" in parsed.path.lower()
+        or "%5c" in parsed.path.lower()
+        or not (
+            _ASF_SLC_CLOUDFRONT_PATH.fullmatch(parsed.path)
+            if is_sentinel1
+            else _ASF_NISAR_CLOUDFRONT_PATH.fullmatch(parsed.path)
+            and parsed.path.rsplit(_ASF_NISAR_BUCKET, 1)[-1] == source_path
+        )
+        or not source_name
+        or target_name != source_name
+    ):
+        _fail(RemoteAccessError, "unregistered_endpoint")
+    return target_url
+
+
+def _asf_request(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    adapter: _Adapter,
+    asset: RemoteAsset,
+    budget: RemoteResourceBudget,
+    ledger: _CallLedger,
+    headers: Mapping[str, str] | None = None,
+    data: Mapping[str, str] | None = None,
+) -> requests.Response:
+    """Issue one metered ASF request while following redirects explicitly."""
+    current_method = method.upper()
+    current_url = url
+    current_headers = dict(headers or {})
+    current_data = data
+    first_request = True
+    while True:
+        if first_request:
+            current_url = _validate_url(current_url, adapter, redirect=True)
+            first_request = False
+        ledger.request()
+        ledger.begin_response()
+        response = session.request(
+            current_method,
+            current_url,
+            headers=current_headers,
+            data=current_data,
+            auth=None,
+            allow_redirects=False,
+            stream=True,
+            timeout=(
+                budget.connect_timeout_seconds,
+                budget.read_timeout_seconds,
+            ),
+        )
+        if response.status_code not in _ASF_REDIRECT_CODES:
+            return response
+        location = response.headers.get("Location")
+        if not location:
+            response.close()
+            _fail(RemoteAccessError, "invalid_redirect")
+        target = urllib.parse.urljoin(current_url, location)
+        ledger.redirect()
+        target = _asf_redirect_url(current_url, target, asset, adapter)
+        try:
+            source_origin = _url_origin(current_url)
+            target_origin = _url_origin(target)
+        except ValueError:
+            response.close()
+            _fail(RemoteAccessError, "invalid_endpoint")
+        response.close()
+        if source_origin != target_origin and not (
+            source_origin in _ASF_CREDENTIAL_ORIGINS
+            and target_origin in _ASF_CREDENTIAL_ORIGINS
+        ):
+            current_headers = {
+                key: value
+                for key, value in current_headers.items()
+                if not _SECRET_KEY.search(key)
+            }
+        if response.status_code == 303 or (
+            response.status_code in {301, 302} and current_method == "POST"
+        ):
+            current_method = "GET"
+            current_data = None
+        current_url = target
+
+
+def _asf_response_body(
+    response: requests.Response,
+    ledger: _CallLedger,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Read and meter a small ASF authentication response body."""
+    content = bytearray()
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        part = bytes(chunk)
+        ledger.response_bytes(len(part))
+        content.extend(part)
+        if len(content) > max_bytes:
+            _fail(RemoteLimitError, "max_response_bytes")
+    return bytes(content)
+
+
+def _asf_authenticated_session(
+    asset: RemoteAsset,
+    adapter: _Adapter,
+    budget: RemoteResourceBudget,
+    ledger: _CallLedger,
+) -> tuple[requests.Session, str]:
+    """Create one provider-scoped ASF bearer/cookie session from ``.netrc``."""
+    credentials = _netrc_credentials("urs.earthdata.nasa.gov")
+    if credentials is None:
+        _fail(RemoteAccessError, "missing_earthdata_credentials")
+    username, password = credentials
+    basic = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+    session = requests.Session()
+    try:
+        token_url = f"{_ASF_EDL_ORIGIN}/api/users/find_or_create_token"
+        _validate_url(token_url, adapter, redirect=True)
+        token_response = _asf_request(
+            session,
+            "POST",
+            token_url,
+            adapter=adapter,
+            asset=asset,
+            budget=budget,
+            ledger=ledger,
+            headers={"Authorization": basic, "Accept-Encoding": "identity"},
+        )
+        try:
+            if not 200 <= token_response.status_code < 300:
+                _fail(RemoteAccessError, "asf_auth_failed")
+            body = _asf_response_body(
+                token_response,
+                ledger,
+                max_bytes=min(1024 * 1024, budget.max_response_bytes),
+            )
+            try:
+                token = json.loads(body).get("access_token")
+            except (UnicodeDecodeError, ValueError):
+                token = None
+            if not isinstance(token, str) or not token:
+                _fail(RemoteAccessError, "asf_auth_failed")
+        finally:
+            token_response.close()
+
+        oauth_query = urllib.parse.urlencode(
+            {
+                "splash": "false",
+                "client_id": _ASF_EDL_CLIENT_ID,
+                "response_type": "code",
+                "redirect_uri": f"{_ASF_AUTH_ORIGIN}/login",
+            }
+        )
+        oauth_url = f"{_ASF_EDL_ORIGIN}/oauth/authorize?{oauth_query}"
+        oauth_response = _asf_request(
+            session,
+            "GET",
+            oauth_url,
+            adapter=adapter,
+            asset=asset,
+            budget=budget,
+            ledger=ledger,
+            headers={"Authorization": basic, "Accept-Encoding": "identity"},
+        )
+        try:
+            if not 200 <= oauth_response.status_code < 300:
+                _fail(RemoteAccessError, "asf_auth_failed")
+        finally:
+            oauth_response.close()
+        if "asf-urs" not in session.cookies:
+            _fail(RemoteAccessError, "asf_auth_cookie_missing")
+    except Exception:
+        session.close()
+        raise
+    return session, token
+
+
 class _RedirectHandler(urllib.request.HTTPRedirectHandler):
     """Follow only redirects admitted by a registered adapter policy."""
 
@@ -1216,7 +1471,41 @@ def _stream_download(
                 ledger.request()
                 result = fetcher(asset, budget)
 
-            if result is None:
+            if result is None and asset.auth_profile == "earthdata-asf":
+                session, token = _asf_authenticated_session(
+                    asset,
+                    adapter,
+                    budget,
+                    ledger,
+                )
+                response: requests.Response | None = None
+                try:
+                    response = _asf_request(
+                        session,
+                        "GET",
+                        asset.href,
+                        adapter=adapter,
+                        asset=asset,
+                        budget=budget,
+                        ledger=ledger,
+                        headers={
+                            "Accept-Encoding": "identity",
+                            "Authorization": f"Bearer {token}",
+                        },
+                    )
+                    if not 200 <= response.status_code < 300:
+                        _fail(RemoteAccessError, "asf_transfer_denied")
+                    if (
+                        response.headers.get("Content-Encoding", "identity")
+                        != "identity"
+                    ):
+                        _fail(RemoteAccessError, "unexpected_content_encoding")
+                    consume(response.iter_content(chunk_size=1024 * 1024), meter=True)
+                finally:
+                    if response is not None:
+                        response.close()
+                    session.close()
+            elif result is None:
                 ledger.request()
                 ledger.begin_response()
                 request = urllib.request.Request(
@@ -1238,13 +1527,16 @@ def _stream_download(
                         != "identity"
                     ):
                         _fail(RemoteAccessError, "unexpected_content_encoding")
-                    consume(iter(lambda: response.read(1024 * 1024), b""), meter=True)
+                    consume(
+                        iter(lambda response=response: response.read(1024 * 1024), b""),
+                        meter=True,
+                    )
             else:
                 if not supplied_ledger:
                     ledger.begin_response()
                 consume(result_chunks(result), meter=not supplied_ledger)
             break
-        except (urllib.error.URLError, OSError):
+        except (requests.RequestException, urllib.error.URLError, OSError):
             if attempt >= budget.max_retries:
                 logger.exception("Remote transfer failed")
                 _fail(RemoteAccessError, "transfer_failed")

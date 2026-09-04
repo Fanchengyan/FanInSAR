@@ -140,6 +140,24 @@ def _product() -> Mapping[str, Any]:
     }
 
 
+def _geojson_product() -> Mapping[str, Any]:
+    """Return the compact shape emitted by real ``ASFProduct.geojson``."""
+    return {
+        "type": "Feature",
+        "id": "S1_WV_FIXTURE",
+        "geometry": {"type": "Point", "coordinates": [0.5, 0.5]},
+        "properties": {
+            "sceneName": "S1_WV_FIXTURE",
+            "startTime": "2026-09-03T07:10:57Z",
+            "stopTime": "2026-09-03T07:11:15Z",
+            "platform": "Sentinel-1D",
+            "processingLevel": "SLC",
+            "url": "https://datapool.asf.alaska.edu/SLC/SD/S1_WV_FIXTURE.zip",
+            "bytes": 156_585_594,
+        },
+    }
+
+
 def test_unsupported_asf_search_fails_before_session_or_provider_io() -> None:
     """An unsupported package version is rejected before constructing a session."""
     created: list[object] = []
@@ -196,6 +214,35 @@ def test_asf_search_yields_intermediate_and_terminal_pages() -> None:
     assert len(records) == 2
     assert ledger.requests == 2
     assert session.closed
+
+
+def test_asf_search_registers_current_download_redirect_origins() -> None:
+    """Current ASF Data Pool and OAuth hops are admitted internally."""
+    adapter = ASFSearchAdapter(collection="sentinel-1", package=_ASFModule(_product()))
+
+    assert "https://sentinel1.asf.alaska.edu" in adapter.redirect_origins
+    assert "https://cumulus.asf.alaska.edu" in adapter.redirect_origins
+
+
+def test_asf_search_preserves_declared_complete_safe_size() -> None:
+    """ASF's exact byte count reaches the normalized remote asset."""
+    module = _ASFModule(_geojson_product())
+    session = _Session(_Response(b'{"items":[1]}'))
+    adapter = ASFSearchAdapter(
+        collection="sentinel-1",
+        package=module,
+        session_factory=lambda: session,
+    )
+    remote._register_adapter("asf-size", adapter)
+
+    items = remote.search(
+        remote.Points([(0.5, 0.5)], crs=4326),
+        catalog="asf-size",
+        auth_profile="earthdata-asf",
+        limit=1,
+    )
+
+    assert items[0].assets["data"].size_bytes == 156_585_594
 
 
 class _RedirectTransport(requests.adapters.BaseAdapter):

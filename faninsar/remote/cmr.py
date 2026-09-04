@@ -9,6 +9,7 @@ geometry filtering and publication to that boundary.
 from __future__ import annotations
 
 import json
+import math
 import re
 import urllib.error
 import urllib.parse
@@ -21,6 +22,9 @@ from typing import Any
 from faninsar.logging import setup_logger
 
 from . import (
+    _ASF_AUTH_ORIGIN,
+    _ASF_EDL_ORIGIN,
+    _ASF_SENTINEL1_ORIGIN,
     RemoteAccessError,
     RemoteLimitError,
     RemoteQueryError,
@@ -281,6 +285,41 @@ def _umm_urls(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     ]
 
 
+def _umm_size_bytes(record: Mapping[str, Any]) -> int | None:
+    """Return one source-declared UMM granule size in bytes, if unambiguous."""
+    granule = record.get("DataGranule")
+    if not isinstance(granule, Mapping):
+        return None
+    direct = granule.get("SizeInBytes")
+    if isinstance(direct, int) and not isinstance(direct, bool) and direct >= 0:
+        return direct
+    archive = granule.get("ArchiveAndDistributionInformation")
+    distribution = (
+        archive[0] if isinstance(archive, list) and len(archive) == 1 else None
+    )
+    if not isinstance(distribution, Mapping):
+        return None
+    size = distribution.get("Size")
+    unit = str(distribution.get("SizeUnit", "")).strip().upper()
+    factors = {
+        "B": 1,
+        "KB": 1024,
+        "MB": 1024**2,
+        "GB": 1024**3,
+        "TB": 1024**4,
+    }
+    if not isinstance(size, (int, float)) or isinstance(size, bool):
+        return None
+    if not math.isfinite(float(size)) or float(size) < 0 or unit not in factors:
+        return None
+    bytes_value = float(size) * factors[unit]
+    # UMM's human-readable Size field is often derived from a byte count and
+    # represented in binary units.  Preserve it only when the conversion is
+    # lossless; rounding an approximate MB value into ``size_bytes`` would
+    # turn a hint into a false integrity requirement.
+    return int(bytes_value) if bytes_value.is_integer() else None
+
+
 def _cmr_links(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """Return compact CMR links representing data downloads."""
     links = record.get("links")
@@ -311,7 +350,14 @@ def _asset_candidates(record: Mapping[str, Any]) -> list[tuple[str, Mapping[str,
     """Build deterministic data asset candidates from CMR metadata."""
     values = _umm_urls(record)
     if values:
-        return [(str(value.get("Name") or "data"), value) for value in values]
+        size = _umm_size_bytes(record)
+        return [
+            (
+                str(value.get("Name") or "data"),
+                {**value, **({"Size": size} if size is not None else {})},
+            )
+            for value in values
+        ]
     return [(str(value.get("title") or "data"), value) for value in _cmr_links(record)]
 
 
@@ -543,7 +589,16 @@ class CMRCollectionAdapter:
         object.__setattr__(
             self,
             "redirect_origins",
-            (_origin(self.endpoint), *self.data_origins),
+            (
+                _origin(self.endpoint),
+                *self.data_origins,
+                *(
+                    (_ASF_SENTINEL1_ORIGIN, _ASF_EDL_ORIGIN, _ASF_AUTH_ORIGIN)
+                    if self.provider.casefold() == "asf"
+                    and "earthdata-asf" in self.profiles
+                    else ()
+                ),
+            ),
         )
 
     def _auth_headers(self, profile: str) -> Mapping[str, str]:

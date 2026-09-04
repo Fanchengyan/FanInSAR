@@ -65,6 +65,21 @@ def test_cmr_items_builds_server_side_query_from_normalized_values(
     assert params["page_size"] == ["7"]
 
 
+def test_asf_cmr_profile_registers_provider_auth_redirects() -> None:
+    """Direct CMR discovery and ASF delivery share the scoped auth policy."""
+    adapter = CMRCollectionAdapter(
+        provider="ASF",
+        collection="sentinel-1",
+        collection_concept_id="C1214470488-ASF",
+        data_origins=("https://datapool.asf.alaska.edu",),
+        profiles=("anonymous", "earthdata-asf"),
+    )
+
+    assert "https://sentinel1.asf.alaska.edu" in adapter.redirect_origins
+    assert "https://urs.earthdata.nasa.gov" in adapter.redirect_origins
+    assert "https://cumulus.asf.alaska.edu" in adapter.redirect_origins
+
+
 def test_cmr_json_pagination_uses_search_after_and_collection_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -221,13 +236,17 @@ def test_official_umm_geometry_and_temporal_variants() -> None:
             }
         },
         "DataGranule": {
-            "RelatedUrls": [{"Type": "GET DATA", "URL": "https://cmr.invalid/data/g1"}]
+            "ArchiveAndDistributionInformation": [
+                {"Name": "Not provided", "Size": 1.5, "SizeUnit": "MB"}
+            ],
+            "RelatedUrls": [{"Type": "GET DATA", "URL": "https://cmr.invalid/data/g1"}],
         },
     }
     record = adapter._normalize(entry)
     assert record["geometry"]["coordinates"][0][-1] == [0.0, 0.0]
     assert record["acquisition"]["start"] == datetime(2024, 1, 1, tzinfo=UTC)
     assert record["acquisition"]["end"] == datetime(2024, 1, 2, tzinfo=UTC)
+    assert record["assets"]["data"]["size"] == 1_572_864
     # Official CMR responses wrap UMM and ``meta`` as sibling fields.
     enveloped = adapter._normalize(
         {"meta": {"collection-concept-id": "C123"}, "umm": entry}

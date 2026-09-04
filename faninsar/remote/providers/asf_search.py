@@ -40,10 +40,14 @@ ASF_SEARCH_COMPATIBILITY = ">=13,<14"
 DEFAULT_CMR_ENDPOINT = "https://cmr.earthdata.nasa.gov/search/granules.umm_json"
 DEFAULT_DATA_ORIGINS = ("https://datapool.asf.alaska.edu",)
 _EARTHDATA_AUTH_ORIGIN = "https://urs.earthdata.nasa.gov"
+_ASF_AUTH_ORIGIN = "https://cumulus.asf.alaska.edu"
+_SENTINEL1_DATA_ORIGIN = "https://sentinel1.asf.alaska.edu"
 _COLLECTION_CONCEPT_IDS = {
     "sentinel-1": "C1214470488-ASF",
     "sentinel-1a_slc": "C1214470488-ASF",
     "sentinel-1_slc": "C1214470488-ASF",
+    "sentinel-1d": "C4175278193-ASF",
+    "sentinel-1d_slc": "C4175278193-ASF",
 }
 _SECRET_HEADER = re.compile(
     r"(?:authorization|cookie|token|password|passwd|secret|signature|credential|api.?key)",
@@ -215,7 +219,15 @@ def _with_asset_link(record: dict[str, Any], product: Any) -> dict[str, Any]:
         or getattr(product, "url", None)
     )
     if isinstance(url, str):
-        record["links"] = [{"rel": "data", "href": url, "title": "SAFE ZIP"}]
+        link: dict[str, Any] = {
+            "rel": "download",
+            "href": url,
+            "title": "SAFE ZIP",
+        }
+        size = nested.get("bytes") if isinstance(nested, Mapping) else None
+        if isinstance(size, int) and size >= 0:
+            link["size"] = size
+        record["links"] = [link]
     return record
 
 
@@ -647,7 +659,13 @@ class ASFSearchAdapter:
             object.__setattr__(
                 self,
                 "redirect_origins",
-                (endpoint_origin, *self.data_origins, _EARTHDATA_AUTH_ORIGIN),
+                (
+                    endpoint_origin,
+                    *self.data_origins,
+                    _SENTINEL1_DATA_ORIGIN,
+                    _EARTHDATA_AUTH_ORIGIN,
+                    _ASF_AUTH_ORIGIN,
+                ),
             )
 
     def _options(
@@ -783,18 +801,16 @@ class ASFSearchAdapter:
                     if produced >= parameters["maxResults"]:
                         return
                     record = _with_asset_link(_record_from_product(product), product)
-                    if "collection" not in record and "GranuleUR" not in record:
-                        record["collection"] = self.collection
                     if "provider" not in record and "Provider" not in record:
                         record["provider"] = self.provider
                     # ASF product payloads often expose a short name such as
                     # ``S1-SLC``.  Normalize against the API concept ID, then
                     # restore the user-facing scientific identity below.
-                    if "GranuleUR" in record or "DataGranule" in record:
-                        record["collection"] = self.query_collection
                     if isinstance(record.get("assets"), Mapping):
+                        record["collection"] = self.collection
                         yield record
                     else:
+                        record["collection"] = self.query_collection
                         normalized = normalizer._normalize(record)
                         normalized["collection"] = self.collection
                         yield normalized
