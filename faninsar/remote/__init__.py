@@ -820,15 +820,28 @@ def _validate_url(
         _fail(RemoteAccessError, "unregistered_endpoint")
     path = parsed.path or "/"
     origin_prefixes = getattr(adapter, "redirect_path_prefixes", {})
+    scoped_redirect_paths = (
+        redirect
+        and isinstance(origin_prefixes, Mapping)
+        and origin in origin_prefixes
+    )
     prefixes = (
         origin_prefixes.get(origin, adapter.path_prefixes)
-        if redirect and isinstance(origin_prefixes, Mapping)
+        if scoped_redirect_paths
         else adapter.path_prefixes
     ) or ("/",)
     allowed_path = False
     for prefix in prefixes:
         normalized_prefix = prefix.rstrip("/") or "/"
-        if normalized_prefix in {"/", path} or path.startswith(normalized_prefix + "/"):
+        # An explicitly scoped root is an exact root route.  The unscoped
+        # default ``/`` remains a wildcard for registered data origins.
+        path_matches = (
+            path == normalized_prefix
+            if scoped_redirect_paths
+            else normalized_prefix in {"/", path}
+            or path.startswith(normalized_prefix + "/")
+        )
+        if path_matches:
             allowed_path = True
             break
     if not allowed_path:

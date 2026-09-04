@@ -81,7 +81,7 @@ def test_asf_cmr_profile_registers_provider_auth_redirects() -> None:
 
 
 def test_asf_cmr_auth_redirects_use_scoped_exact_paths() -> None:
-    """Default ASF registration admits only its token and OAuth endpoints."""
+    """Default ASF registration admits only its token, OAuth, and root routes."""
     adapter = CMRCollectionAdapter(
         provider="ASF",
         collection="sentinel-1",
@@ -91,12 +91,16 @@ def test_asf_cmr_auth_redirects_use_scoped_exact_paths() -> None:
     for url in (
         "https://urs.earthdata.nasa.gov/api/users/find_or_create_token",
         "https://urs.earthdata.nasa.gov/oauth/authorize?response_type=code",
+        "https://cumulus.asf.alaska.edu/login",
+        "https://cumulus.asf.alaska.edu/",
     ):
         assert remote._validate_url(url, adapter, redirect=True) == url
     for url in (
         "https://urs.earthdata.nasa.gov/api/users/other",
         "https://urs.earthdata.nasa.gov/api/account",
+        "https://urs.earthdata.nasa.gov/",
         "https://cumulus.asf.alaska.edu/admin",
+        "https://cumulus.asf.alaska.edu/login/other",
     ):
         with pytest.raises(remote.RemoteAccessError, match="unregistered_endpoint"):
             remote._validate_url(url, adapter, redirect=True)

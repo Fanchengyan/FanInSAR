@@ -623,7 +623,7 @@ class CMRCollectionAdapter:
                 "/api/users/find_or_create_token",
                 "/oauth/authorize",
             )
-            auth_path_prefixes[_ASF_AUTH_ORIGIN] = ("/login",)
+            auth_path_prefixes[_ASF_AUTH_ORIGIN] = ("/login", "/")
         object.__setattr__(self, "redirect_path_prefixes", auth_path_prefixes)
 
     def _auth_headers(self, profile: str) -> Mapping[str, str]:
