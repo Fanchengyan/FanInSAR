@@ -24,6 +24,8 @@ from .network import (
     SNAPNetwork,
     UnknownNetworkIndexTypeError,
 )
+from faninsar.core.interferogram import Interferogram
+from .readers.interferogram import InterferogramCollection
 from .protocols import NetworkReader
 from .registry import (
     ENTRY_POINT_GROUP,
@@ -43,6 +45,8 @@ __all__ = [
     "ISCE3Network",
     "IncompleteNetworkError",
     "IncompleteNetworkProductError",
+    "Interferogram",
+    "InterferogramCollection",
     "InvalidReaderError",
     "LegacyLayoutError",
     "LegacyNetworkLayoutError",
