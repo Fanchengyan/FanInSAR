@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from faninsar.processing.errors import PairConfigurationMigrationError
-from faninsar.processing.stack import (
+from faninsar.stack import (
     S1Stack,
     SourceHandle,
     Stack,

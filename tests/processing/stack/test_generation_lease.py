@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.stack.artifact_transaction import (
+from faninsar.stack.artifact_transaction import (
     collect_generations,
     commit_generation,
     open_current_generation,

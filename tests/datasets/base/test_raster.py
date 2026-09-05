@@ -16,8 +16,8 @@ from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 from shapely.geometry import box
 
-from faninsar.datasets.base import RasterDataset
-from faninsar.query import BoundingBox, Points, Polygons
+from faninsar.data.datasets.base import RasterDataset
+from faninsar.data.query import BoundingBox, Points, Polygons
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -262,7 +262,7 @@ class TestRasterDatasetDask:
         self, temp_dataset_dir: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Graceful error when dask is unavailable."""
-        import faninsar.datasets.base.raster as raster_mod
+        import faninsar.data.datasets.base.raster as raster_mod
 
         class _Dummy:
             def __init__(self, *_: object, **__: object) -> None:

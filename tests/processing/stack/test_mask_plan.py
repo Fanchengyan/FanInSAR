@@ -9,7 +9,7 @@ import pytest
 from affine import Affine
 
 from faninsar.processing.masking import GridSpec, Mask
-from faninsar.processing.stack.mask_plan import MaskDefinition, MaskPlan
+from faninsar.stack.mask_plan import MaskDefinition, MaskPlan
 
 if TYPE_CHECKING:
     from pathlib import Path

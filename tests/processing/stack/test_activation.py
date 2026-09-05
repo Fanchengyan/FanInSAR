@@ -10,7 +10,7 @@ import pytest
 
 from faninsar.processing.contracts import ActivationToken
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.stack.activation import LocalActivationAuthority
+from faninsar.stack.activation import LocalActivationAuthority
 
 if TYPE_CHECKING:
     from pathlib import Path

@@ -15,7 +15,7 @@ import xarray as xr
 from pyproj.crs import CRS
 
 from faninsar.datasets.frame import Frame, FrameTimeSeries
-from faninsar.datasets.geogrid import GeoGrid
+from faninsar.data.datasets.geogrid import GeoGrid
 
 
 def _write_tiff(path: Path, bounds: tuple, arr: np.ndarray) -> None:

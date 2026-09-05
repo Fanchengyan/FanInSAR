@@ -24,7 +24,7 @@ import pytest
 import requests
 
 from faninsar import remote
-from faninsar.query import BoundingBox
+from faninsar.data.query import BoundingBox
 
 _LIVE_ENABLED = os.environ.get("FANINSAR_P0047_LIVE") == "1"
 _ASF_GRANULE = "G4297731264-ASF"

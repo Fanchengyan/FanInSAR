@@ -1,4 +1,4 @@
-"""Tests for :mod:`faninsar.datasets.xarray_dataset`."""
+"""Tests for :mod:`faninsar.data.datasets.xarray_dataset`."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import rasterio
 from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 
-from faninsar.datasets.xarray_dataset import XarrayDataset
-from faninsar.query.bbox import BoundingBox
+from faninsar.data.datasets.xarray_dataset import XarrayDataset
+from faninsar.data.query.bbox import BoundingBox
 
 
 def _write_tiff(path: Path, bounds: tuple[float, float, float, float], data: np.ndarray) -> None:

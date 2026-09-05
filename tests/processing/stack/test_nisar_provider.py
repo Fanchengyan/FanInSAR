@@ -18,8 +18,8 @@ from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.slc import GeoSLC, RadarSLC
-from faninsar.processing.stack import NISARStack
-from faninsar.processing.stack.nisar_provider import (
+from faninsar.stack import NISARStack
+from faninsar.stack.nisar_provider import (
     _apply_range_offset_flatten,
     _dense_secondary_mapping,
     _full_stack_reference_bounds,
@@ -30,7 +30,7 @@ from faninsar.processing.stack.nisar_provider import (
     _tile_resume_identity,
     make_nisar_scene_provider,
 )
-from faninsar.processing.stack.scene_store import CoregisteredSceneStore
+from faninsar.stack.scene_store import CoregisteredSceneStore
 
 from .test_nisar_stack import _result
 
@@ -148,7 +148,7 @@ def _stack(
     # The tiny lifecycle fixture has synthetic orbit metadata; the geometry
     # seam itself is covered by dedicated tests below.
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._geometry_shared_radar_window",
+        "faninsar.stack.nisar_provider._geometry_shared_radar_window",
         lambda *_args, **_kwargs: (1, 4, 1, 5),
     )
     config: dict[str, object] = {
@@ -291,7 +291,7 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
         return (3, 6, 3, 7)
 
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._geometry_shared_radar_window",
+        "faninsar.stack.nisar_provider._geometry_shared_radar_window",
         fake_mapping,
     )
     configured_dem = ConstantDEM(55.0)
@@ -544,13 +544,13 @@ def test_nisar_provider_promotes_full_scene_without_bounded_window(
     """Omitting the bounded window publishes the common full-scene overlap."""
     stack, paths, _handles = _stack(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._dense_secondary_mapping",
+        "faninsar.stack.nisar_provider._dense_secondary_mapping",
         lambda _reference, _secondary, bounds, **_kwargs: _identity_dense_mapping(
             bounds
         ),
     )
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._lanczos_source_coverage",
+        "faninsar.stack.nisar_provider._lanczos_source_coverage",
         lambda _samples, azimuth, _range_index: np.ones(azimuth.shape, dtype=bool),
     )
     stack.scene_provider(
@@ -599,13 +599,13 @@ def test_nisar_full_scene_uses_deterministic_row_major_tiles(
             )
 
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._dense_secondary_mapping",
+        "faninsar.stack.nisar_provider._dense_secondary_mapping",
         lambda _reference, _secondary, bounds, **_kwargs: _identity_dense_mapping(
             bounds
         ),
     )
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._lanczos_source_coverage",
+        "faninsar.stack.nisar_provider._lanczos_source_coverage",
         lambda _samples, azimuth, _range_index: np.ones(azimuth.shape, dtype=bool),
     )
     callback = make_nisar_scene_provider(
@@ -683,11 +683,11 @@ def test_nisar_full_scene_masks_edge_no_overlap_and_resumes_mixed_tiles(
         return _identity_dense_mapping(bounds)
 
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._dense_secondary_mapping",
+        "faninsar.stack.nisar_provider._dense_secondary_mapping",
         mixed_mapping,
     )
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._lanczos_source_coverage",
+        "faninsar.stack.nisar_provider._lanczos_source_coverage",
         lambda _samples, azimuth, _range_index: np.ones(azimuth.shape, dtype=bool),
     )
     callback = make_nisar_scene_provider(
@@ -740,7 +740,7 @@ def test_nisar_full_scene_rejects_pair_without_physical_overlap(
         )
 
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._dense_secondary_mapping",
+        "faninsar.stack.nisar_provider._dense_secondary_mapping",
         empty_mapping,
     )
     with pytest.raises(
@@ -976,11 +976,11 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
         return np.full(azimuth.shape, value, np.complex64), valid.copy()
 
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._dense_secondary_mapping",
+        "faninsar.stack.nisar_provider._dense_secondary_mapping",
         varying_dense_mapping,
     )
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._lanczos_source_coverage",
+        "faninsar.stack.nisar_provider._lanczos_source_coverage",
         lambda _samples, azimuth, _range_index: np.ones(azimuth.shape, dtype=bool),
     )
     monkeypatch.setattr(
@@ -1042,7 +1042,7 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
         )
 
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._geo_tile_for_radar_crop",
+        "faninsar.stack.nisar_provider._geo_tile_for_radar_crop",
         overlapping_geo_tile,
     )
 
@@ -1065,7 +1065,7 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
         return reference_geo, secondary_geo
 
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar_provider._geocode_aligned_radar_tile",
+        "faninsar.stack.nisar_provider._geocode_aligned_radar_tile",
         fake_geocode_aligned,
     )
     geo_stack = NISARStack.from_rslc(

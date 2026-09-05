@@ -1,4 +1,4 @@
-"""Tests for :mod:`faninsar.datasets.geobox` utilities."""
+"""Tests for :mod:`faninsar.data.datasets.geobox` utilities."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import pytest
 from pyproj.crs import CRS
 from rasterio.transform import Affine
 
-from faninsar.datasets.geobox import GeoBox, GeoBoxTileGrid
-from faninsar.query.bbox import BoundingBox
+from faninsar.data.datasets.geobox import GeoBox, GeoBoxTileGrid
+from faninsar.data.query.bbox import BoundingBox
 
 
 def make_geobox_dataset() -> GeoBox:

@@ -10,8 +10,8 @@ import torch
 
 from faninsar import Pairs
 from faninsar.processing.resources import ResourceAdmissionError, ResourceBudget
-from faninsar.processing.stack import Stack
-from faninsar.processing.stack.ifg_store import write_ifg_artifact
+from faninsar.stack import Stack
+from faninsar.stack.ifg_store import write_ifg_artifact
 from faninsar.processing.unwrap.common import SpatialUnwrapper, SpatialUnwrapResult
 
 if TYPE_CHECKING:

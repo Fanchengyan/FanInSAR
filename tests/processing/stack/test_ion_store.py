@@ -6,11 +6,11 @@ import numpy as np
 import pytest
 
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.stack.ifg_store import (
+from faninsar.stack.ifg_store import (
     InterferogramArtifactStore,
     write_ifg_artifact,
 )
-from faninsar.processing.stack.ion_store import (
+from faninsar.stack.ion_store import (
     IonosphereArtifactStore,
     read_ion_correction_artifact,
     write_ion_correction_artifact,

@@ -11,7 +11,7 @@ import pytest
 from shapely.geometry import Polygon
 
 from faninsar import remote
-from faninsar.query import Points, Polygons
+from faninsar.data.query import Points, Polygons
 
 if TYPE_CHECKING:
     from pathlib import Path

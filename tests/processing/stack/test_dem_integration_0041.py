@@ -9,7 +9,7 @@ from affine import Affine
 from faninsar.processing.dem import GridSpec
 from faninsar.processing.dem.datum import convert_heights
 from faninsar.processing.dem.seam import ExplicitAntimeridianError
-from faninsar.processing.stack.grid import automatic_grid, resolve_stack_grid
+from faninsar.stack.grid import automatic_grid, resolve_stack_grid
 
 
 class _ConstantGeoid:

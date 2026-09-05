@@ -11,7 +11,7 @@ import pytest
 import requests
 
 from faninsar import remote
-from faninsar.query import Points
+from faninsar.data.query import Points
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping

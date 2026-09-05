@@ -12,7 +12,7 @@ from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 
 from faninsar.core.acquisition import Acquisition
-from faninsar.datasets.base import TimeSeriesDataset
+from faninsar.data.datasets.base import TimeSeriesDataset
 
 
 def _write_tile(

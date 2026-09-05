@@ -23,7 +23,7 @@ from faninsar.core.network import (
     PhaseConvention,
 )
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.stack.session import Stack
+from faninsar.stack.session import Stack
 
 
 def _key(acquisition_id: str, *, swath: str = "IW1") -> AcquisitionKey:

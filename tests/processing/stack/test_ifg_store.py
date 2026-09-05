@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.stack.ifg_store import (
+from faninsar.stack.ifg_store import (
     ArtifactResourceLimits,
     InterferogramArtifactStore,
     write_ifg_artifact,
@@ -449,7 +449,7 @@ def test_ifg_current_tampering_and_partial_staging_fail_closed(tmp_path: Path) -
 
 def test_ifg_reader_lease_prevents_generation_collection(tmp_path: Path) -> None:
     """An open reader pins its generation across a CURRENT replacement."""
-    from faninsar.processing.stack.artifact_transaction import collect_generations
+    from faninsar.stack.artifact_transaction import collect_generations
 
     root = tmp_path / "ifg"
     first = _write_base(root)

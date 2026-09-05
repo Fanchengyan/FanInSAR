@@ -28,7 +28,7 @@ from faninsar.processing.readers import (
     SLCReadResult,
     ValidSampleMask,
 )
-from faninsar.processing.stack import NISARStack
+from faninsar.stack import NISARStack
 
 
 def _result(path: Path, date_id: str) -> SLCReadResult:
@@ -89,12 +89,12 @@ def test_nisar_stack_builds_shared_catalog_and_pair_topology(
     )
     handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.open_product",
+        "faninsar.stack.nisar.NisarSensor.open_product",
         lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
+        "faninsar.stack.nisar.NisarSensor.to_slc_product",
         lambda _sensor, handle, **kwargs: (
             calls.append(kwargs)
             or _result(
@@ -141,10 +141,10 @@ def test_nisar_stack_passes_explicit_admission_metadata_to_reader(
         return handles[Path(uri)]
 
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.open_product", open_product
+        "faninsar.stack.nisar.NisarSensor.open_product", open_product
     )
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
+        "faninsar.stack.nisar.NisarSensor.to_slc_product",
         lambda _sensor, handle, **_: _result(
             Path(handle.filename), Path(handle.filename).stem.rsplit("_", 1)[-1]
         ),
@@ -171,11 +171,11 @@ def test_nisar_stack_rejects_duplicate_acquisitions(
     )
     handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.open_product",
+        "faninsar.stack.nisar.NisarSensor.open_product",
         lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
+        "faninsar.stack.nisar.NisarSensor.to_slc_product",
         lambda _sensor, handle, **_: _result(Path(handle.filename), "20240101"),
     )
 
@@ -211,7 +211,7 @@ def test_nisar_stack_records_only_the_admitted_product_channel_and_lineage(
     handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
 
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.open_product",
+        "faninsar.stack.nisar.NisarSensor.open_product",
         lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
 
@@ -234,7 +234,7 @@ def test_nisar_stack_records_only_the_admitted_product_channel_and_lineage(
         return replace(result, source_path=str(tmp_path / "other.h5"))
 
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
+        "faninsar.stack.nisar.NisarSensor.to_slc_product",
         read_product,
     )
 
@@ -260,11 +260,11 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
         path.touch()
     handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.open_product",
+        "faninsar.stack.nisar.NisarSensor.open_product",
         lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
+        "faninsar.stack.nisar.NisarSensor.to_slc_product",
         lambda _sensor, handle, **_: _result(
             Path(handle.filename), Path(handle.filename).stem.rsplit("_", 1)[-1]
         ),
@@ -307,11 +307,11 @@ def test_nisar_scene_provider_requires_geometry_for_full_scene(
         path.touch()
     handles = {path: SimpleNamespace(filename=str(path)) for path in paths}
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.open_product",
+        "faninsar.stack.nisar.NisarSensor.open_product",
         lambda _sensor, uri, **_kwargs: handles[Path(uri)],
     )
     monkeypatch.setattr(
-        "faninsar.processing.stack.nisar.NisarSensor.to_slc_product",
+        "faninsar.stack.nisar.NisarSensor.to_slc_product",
         lambda _sensor, handle, **_: _result(
             Path(handle.filename), Path(handle.filename).stem.rsplit("_", 1)[-1]
         ),

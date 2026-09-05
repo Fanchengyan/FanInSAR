@@ -24,7 +24,7 @@ from faninsar.processing.geometry.dem_manager import (
     default_dem_name,
     get_dem_manager,
 )
-from faninsar.query import BoundingBox
+from faninsar.data.query import BoundingBox
 
 
 def _write_tile(

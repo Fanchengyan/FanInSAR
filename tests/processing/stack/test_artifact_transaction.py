@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.stack.artifact_transaction import (
+from faninsar.stack.artifact_transaction import (
     _PinnedDescriptorState,
     _PinnedGenerationPath,
     commit_generation,

@@ -6,7 +6,7 @@ import hashlib
 from typing import TYPE_CHECKING, Any
 
 from faninsar import remote
-from faninsar.query import Points
+from faninsar.data.query import Points
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping

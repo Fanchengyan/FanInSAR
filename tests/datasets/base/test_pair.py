@@ -13,8 +13,8 @@ from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 
 from faninsar.core.pairs import Pairs
-from faninsar.datasets.base import PairDataset
-from faninsar.datasets.ifg import InterferogramDataset
+from faninsar.data.datasets.base import PairDataset
+from faninsar.data.datasets.ifg import InterferogramDataset
 
 if TYPE_CHECKING:
     from collections.abc import Iterable

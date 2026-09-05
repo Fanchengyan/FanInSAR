@@ -19,7 +19,7 @@ from faninsar.processing.geometry.dem_sources import (
     list_dem_sources,
     parse_selection,
 )
-from faninsar.query import BoundingBox
+from faninsar.data.query import BoundingBox
 
 Bounds = BoundingBox | tuple[float, float, float, float]
 

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from faninsar import remote
-from faninsar.query import BoundingBox
+from faninsar.data.query import BoundingBox
 from faninsar.remote.providers.planetary_computer import (
     COP_DEM_GLO30_COLLECTION,
     PlanetaryComputerAdapter,

@@ -12,8 +12,8 @@ from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from shapely.geometry import box
 
-from faninsar.datasets import RasterDataset
-from faninsar.query import BoundingBox, Points, Polygons
+from faninsar.data.datasets import RasterDataset
+from faninsar.data.query import BoundingBox, Points, Polygons
 
 
 def _create_test_tiff(path: Path, bounds: tuple[float, float, float, float], data: np.ndarray, crs: str = "EPSG:4326") -> None:

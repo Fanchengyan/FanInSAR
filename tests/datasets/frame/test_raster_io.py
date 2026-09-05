@@ -17,7 +17,7 @@ from faninsar.datasets.frame.raster_io import (
     reproject_phase_to_geogrid,
     reproject_to_geogrid,
 )
-from faninsar.datasets.geogrid import GeoGrid
+from faninsar.data.datasets.geogrid import GeoGrid
 
 _WGS84_CRS = "EPSG:4326"
 

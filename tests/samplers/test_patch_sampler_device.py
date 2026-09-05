@@ -11,8 +11,8 @@ import torch
 from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 
-from faninsar.datasets import RasterDataset
-from faninsar.samplers import RowSampler, tensor_collate
+from faninsar.data.datasets import RasterDataset
+from faninsar.data.samplers import RowSampler, tensor_collate
 
 
 def _write_tile(path: Path, bounds: tuple[float, float, float, float], value: float) -> None:

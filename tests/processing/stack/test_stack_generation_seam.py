@@ -7,16 +7,16 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from faninsar.datasets.ifg import StackInterferogramDataset
+from faninsar.data.datasets.ifg import StackInterferogramDataset
 
 if TYPE_CHECKING:
     from pathlib import Path
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.stack.ifg_store import (
+from faninsar.stack.ifg_store import (
     InterferogramArtifactStore,
     write_ifg_artifact,
 )
-from faninsar.processing.stack.stack_generation import (
+from faninsar.stack.stack_generation import (
     open_unwrap_generation,
     publish_unwrap_generation,
 )

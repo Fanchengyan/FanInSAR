@@ -37,7 +37,7 @@ from faninsar.processing.masking.mask_sources import (
     tile_snap,
     validate_mask_source_name,
 )
-from faninsar.query import BoundingBox
+from faninsar.data.query import BoundingBox
 
 #: Live-verified flat GSW filename shape: ``occurrence_{lon}{E|W}_{lat}{N|S}``
 #: with hemisphere letters and no zero padding (e.g. ``occurrence_10W_0N.tif``).

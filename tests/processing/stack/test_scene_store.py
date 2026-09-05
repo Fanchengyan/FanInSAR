@@ -13,7 +13,7 @@ import torch
 
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.interferometry import PhaseFilter, PhaseFilterResult
-from faninsar.processing.stack.scene_store import (
+from faninsar.stack.scene_store import (
     CoregisteredSceneStore,
     form_merged_scene_interferogram,
     form_scene_interferograms,

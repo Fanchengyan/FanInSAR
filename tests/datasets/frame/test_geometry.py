@@ -12,7 +12,7 @@ from rasterio.transform import from_bounds
 
 from faninsar.datasets.frame.exceptions import MissingGeometryAssetError
 from faninsar.datasets.frame.geometry import FrameGeometry
-from faninsar.query import BoundingBox
+from faninsar.data.query import BoundingBox
 
 
 def _write_tiff(
