@@ -7,7 +7,7 @@ from faninsar.core.baseline import Baselines
 from faninsar.core.pair import Pair, Pairs
 from faninsar.core.sar_property import Frequency, Wavelength
 
-# Import the grouped facades only after core values exist. Dataset modules use
+# Import grouped facades only after core values exist. Dataset modules use
 # these values in their type-level imports during package initialization.
 from faninsar import data, network, remote, stack
 from faninsar.network import Network

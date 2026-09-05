@@ -221,7 +221,7 @@ def test_form_interferograms_supports_multiple_units(tmp_path: Path) -> None:
 
 def test_form_interferograms_has_no_legacy_pair_call() -> None:
     """Stack formation must not import or invoke the Pair engine."""
-    source = Path("faninsar/processing/stack/session.py").read_text()
+    source = Path("faninsar/stack/session.py").read_text()
     tree = ast.parse(source)
     method = next(
         node

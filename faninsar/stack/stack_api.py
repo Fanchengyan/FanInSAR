@@ -33,13 +33,13 @@ from faninsar.processing.atmosphere.network import (
 )
 from faninsar.processing.atmosphere.split_spectrum import split_range_spectrum
 from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.unwrap.snaphu_backend import SnaphuConfig
 from faninsar.stack.ion_store import (
     IonosphereArtifactStore,
     write_ion_correction_artifact,
     write_ionosphere_artifact,
 )
 from faninsar.stack.scene_store import CoregisteredSceneStore
-from faninsar.processing.unwrap.snaphu_backend import SnaphuConfig
 
 if TYPE_CHECKING:
     from faninsar.processing.atmosphere.config import IonosphereEstimationConfig
@@ -197,8 +197,8 @@ def estimate_ionosphere(
 
     """
     from faninsar.processing.interferometry.pair import form_interferogram
-    from faninsar.stack.session import _iter_pair_dates
     from faninsar.processing.unwrap.api import unwrap
+    from faninsar.stack.session import _iter_pair_dates
 
     stack._ensure_prepared()
     stack._require_qualified_activation_record()
@@ -240,17 +240,22 @@ def estimate_ionosphere(
             continue
         primary_store = _scene_pair_store(stack, primary)
         secondary_store = _scene_pair_store(stack, secondary)
-        for attribute in ("grid_shape", "grid_identity", "wavelength_m", "master_id"):
+        for attribute in (
+            "grid_shape",
+            "grid_identity",
+            "wavelength_m",
+            "reference_id",
+        ):
             if getattr(primary_store, attribute) != getattr(secondary_store, attribute):
                 reject_invalid_state(
                     f"scene generations disagree on {attribute}; ionosphere "
                     "estimation requires one common aligned grid"
                 )
         primary_slc = _load_role_payload(
-            primary_store, date_id=primary, master=stack.master
+            primary_store, date_id=primary, master=stack.reference
         )
         secondary_slc = _load_role_payload(
-            secondary_store, date_id=secondary, master=stack.master
+            secondary_store, date_id=secondary, master=stack.reference
         )
         if primary_slc.shape != secondary_slc.shape:
             reject_invalid_state("scene payloads do not share one grid")
@@ -277,6 +282,7 @@ def estimate_ionosphere(
                 sub[0].cpu().numpy(),
                 sub[1].cpu().numpy(),
                 multilook=ion_looks,
+                coherence_window=(3, 3),
             )
             for sub in (
                 (primary_low, secondary_low),
@@ -295,14 +301,17 @@ def estimate_ionosphere(
                 * np.asarray(valid_mask, dtype=np.float32),
                 method=unwrap_method,
                 snaphu_config=snaphu_config,
+                irls_kwargs={"device": resolved_device}
+                if unwrap_method == "irls"
+                else None,
             )
             for product in subband_products
         ]
         low_phase = torch.as_tensor(
-            np.asarray(unwrap_results[0].unwrapped_phase), dtype=torch.float64
+            np.asarray(unwrap_results[0].phase), dtype=torch.float64
         ).to(torch_device)
         high_phase = torch.as_tensor(
-            np.asarray(unwrap_results[1].unwrapped_phase), dtype=torch.float64
+            np.asarray(unwrap_results[1].phase), dtype=torch.float64
         ).to(torch_device)
         coherence = np.minimum(
             subband_products[0].coherence, subband_products[1].coherence

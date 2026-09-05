@@ -12,9 +12,9 @@ from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.logging import setup_logger
 
 from .exceptions import (
-    NetworkGeometryError,
     GridMismatchError,
     MissingGeometryAssetError,
+    NetworkGeometryError,
 )
 from .metadata import (
     CATEGORICAL_ASSETS,
@@ -38,9 +38,9 @@ if TYPE_CHECKING:
 
     import pystac
 
-    from faninsar.network.readers.interferogram import InterferogramCollection
     from faninsar.data.datasets.xarray_dataset import XarrayDataset
     from faninsar.data.query import BoundingBox
+    from faninsar.network.readers.interferogram import InterferogramCollection
 
 logger = setup_logger(__name__)
 

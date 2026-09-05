@@ -276,6 +276,9 @@ class XarrayDataset(GeoDataset):
             raise ValueError(msg)
 
         self._open_specs = specs
+        # ``lazy_loading`` controls whether xarray should retain dask-backed
+        # arrays; it is an XarrayDataset option, not an xarray backend option.
+        kwargs.pop("lazy_loading", None)
         self._open_dataset_kwargs = dict(kwargs)
 
         # Initialize cache for opened datasets
@@ -748,6 +751,7 @@ class XarrayDataset(GeoDataset):
 
         """
         stacked_arrays: list[xr.DataArray] = []
+        y_dim, x_dim = query_geobox.dims
 
         for meta in self._file_meta_list:
             file_geobox = meta.geobox
@@ -789,22 +793,26 @@ class XarrayDataset(GeoDataset):
                         self.nodata,
                         dtype=self.dtype,
                     ),
-                    dims=("file", self._y_dim, self._x_dim),
+                    dims=("file", meta.y_dim, meta.x_dim),
                     coords={
                         "file": [meta.path.name],
-                        self._y_dim: query_geobox.y,
-                        self._x_dim: query_geobox.x,
+                        meta.y_dim: query_geobox.y,
+                        meta.x_dim: query_geobox.x,
                     },
                 )
+            rename_dims = {
+                meta.y_dim: y_dim,
+                meta.x_dim: x_dim,
+            }
+            if meta.y_dim != y_dim or meta.x_dim != x_dim:
+                target_array = target_array.rename(rename_dims)
             stacked_arrays.append(target_array)
 
         da_box = xr.concat(stacked_arrays, dim="file")
-        da_box = da_box.assign_coords(file=[spec.path for spec in self._open_specs])
-        y_dim, x_dim = query_geobox.dims
-        if y_dim not in da_box.dims:
-            da_box = da_box.rename({self._y_dim: y_dim})
-        if x_dim not in da_box.dims:
-            da_box = da_box.rename({self._x_dim: x_dim})
+        da_box = da_box.assign_coords(
+            file=np.arange(len(self._open_specs), dtype=int),
+            file_path=("file", [spec.path for spec in self._open_specs]),
+        )
         return da_box
 
     def _parse_single_file(self, spec: XarrayDataSpec) -> FileMetadata:
@@ -876,6 +884,11 @@ class XarrayDataset(GeoDataset):
         kwargs = dict(self._open_dataset_kwargs)
         if group is not None:
             kwargs["group"] = group
+        chunks = kwargs.get("chunks")
+        if isinstance(chunks, tuple):
+            if len(chunks) != 2:
+                raise ValueError("tuple chunks must contain (y, x) sizes")
+            kwargs["chunks"] = {"y": chunks[0], "x": chunks[1]}
         return kwargs
 
     def _read_file_window(

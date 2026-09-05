@@ -96,7 +96,7 @@ class GridSampler(Sampler):
         num_workers: int = 1,
         prefetch_factor: int | None = None,
         pin_memory: bool = False,
-        tensor: bool = False,
+        tensor: bool = True,
         tensor_scope: Literal["data", "all"] = "data",
         collate_fn: Callable[[list[Any]], Any] | None = None,
         **kwargs: Any,
@@ -118,7 +118,7 @@ class GridSampler(Sampler):
             Whether to use pinned (page-locked) memory for faster host-to-device
             transfers. Default is False.
         tensor : bool, optional
-            Whether to convert numpy arrays to CPU torch tensors. Default is False.
+            Whether to convert numpy arrays to CPU torch tensors. Default is True.
         tensor_scope : {"data", "all"}, optional
             Conversion scope. ``"data"`` converts only ``data`` fields;
             ``"all"`` converts every numpy array recursively. Default is ``"data"``.

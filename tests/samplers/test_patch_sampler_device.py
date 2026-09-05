@@ -72,6 +72,7 @@ def test_tensor_collate_converts_only_data_by_default() -> None:
     sample = {
         "data": np.arange(6, dtype=np.float32).reshape(2, 3),
         "indexes": np.array([0, 1], dtype=np.int64),
+        "meta": {"data": np.arange(3, dtype=np.float32)},
         "paths": ["a.tif", "b.tif"],
     }
 

@@ -26,7 +26,6 @@ from faninsar.core.network import (
     Network as NetworkContract,
 )
 from faninsar.logging import setup_logger
-
 from faninsar.network.readers.geometry import NetworkGeometry
 from faninsar.network.readers.interferogram import InterferogramCollection
 from faninsar.network.readers.timeseries import NetworkTimeSeries

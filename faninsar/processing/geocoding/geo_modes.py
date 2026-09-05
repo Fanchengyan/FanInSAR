@@ -8,16 +8,16 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.memory import release_memmap_pages
 from faninsar.processing.geocoding.geo_resample import (
     compose_secondary_coordinates,
     resample_complex_at_coordinates,
 )
+from faninsar.processing.memory import release_memmap_pages
 
 if TYPE_CHECKING:
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
+    from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.tops.deramp import TOPSCarrierModel
 
 __all__ = ["coregister_geocoded_slcs", "coregister_geocoded_slcs_chunked"]

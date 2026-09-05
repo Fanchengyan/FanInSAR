@@ -43,8 +43,8 @@ if TYPE_CHECKING:
 
     import pystac
 
-    from faninsar.network.readers.geometry import NetworkGeometry
     from faninsar.data.datasets.ifg import InterferogramDataset
+    from faninsar.network.readers.geometry import NetworkGeometry
 
 logger = setup_logger(__name__)
 

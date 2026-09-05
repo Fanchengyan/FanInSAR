@@ -67,12 +67,12 @@ from faninsar.processing.interferometry.pair import (
     goldstein_filter,
     mask_invalid_looks,
 )
-from faninsar.processing.memory import close_memmap, release_memmap_pages
 from faninsar.processing.interferometry.products import (
     PairProductArrays,
     write_pair_stac_item,
     write_pair_zarr,
 )
+from faninsar.processing.memory import close_memmap, release_memmap_pages
 from faninsar.processing.tops.carrier import carrier_from_swath
 from faninsar.processing.tops.deramp import TOPSCarrierModel, deramp, reramp
 from faninsar.processing.unwrap import SnaphuConfig, UnwrapBackend
@@ -90,9 +90,9 @@ if TYPE_CHECKING:
         ResourceLimits,
     )
     from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
     from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.merge.grid import GeoGridSpec
-    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
     from faninsar.processing.unwrap.common import SpatialUnwrapResult
 
 logger = setup_logger(__name__)

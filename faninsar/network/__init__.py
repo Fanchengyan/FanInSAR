@@ -4,15 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from .protocols import NetworkReader
-from .registry import (
-    ENTRY_POINT_GROUP,
-    DuplicateReaderError,
-    InvalidReaderError,
-    ReaderNotFoundError,
-    ReaderRegistry,
-    ReaderRegistryError,
-)
 from .network import (
     ExternalNetworkLayoutError,
     GAMMANetwork,
@@ -33,17 +24,26 @@ from .network import (
     SNAPNetwork,
     UnknownNetworkIndexTypeError,
 )
+from .protocols import NetworkReader
+from .registry import (
+    ENTRY_POINT_GROUP,
+    DuplicateReaderError,
+    InvalidReaderError,
+    ReaderNotFoundError,
+    ReaderRegistry,
+    ReaderRegistryError,
+)
 
 __all__ = [
     "ENTRY_POINT_GROUP",
     "DuplicateReaderError",
-    "InvalidReaderError",
     "ExternalNetworkLayoutError",
     "GAMMANetwork",
-    "IncompleteNetworkError",
-    "IncompleteNetworkProductError",
     "ISCE2Network",
     "ISCE3Network",
+    "IncompleteNetworkError",
+    "IncompleteNetworkProductError",
+    "InvalidReaderError",
     "LegacyLayoutError",
     "LegacyNetworkLayoutError",
     "Network",
@@ -53,8 +53,8 @@ __all__ = [
     "NetworkGenerationError",
     "NetworkLayoutError",
     "NetworkManifestError",
-    "NetworkReader",
     "NetworkPathError",
+    "NetworkReader",
     "ReaderNotFoundError",
     "ReaderRegistry",
     "ReaderRegistryError",

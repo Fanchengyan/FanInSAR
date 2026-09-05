@@ -17,9 +17,9 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 __all__ = [
-    "run_network_merge",
     "run_multi_burst_pair_merge",
     "run_multi_path_pair_merge",
+    "run_network_merge",
     "write_mosaic_stac_item",
     "write_mosaic_zarr",
 ]

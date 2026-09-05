@@ -6,6 +6,12 @@ from .geocode_raster import GeocodedComplex, geocode_complex_to_grid
 from .grid import GeoGridSpec, build_geo_grid
 from .methods import MergeMethod, merge_bursts
 from .mosaic import merge_burst_products
+from .orchestration import (
+    run_multi_burst_pair_merge,
+    run_multi_path_pair_merge,
+    run_network_merge,
+    write_mosaic_zarr,
+)
 from .overlap import (
     apply_feather,
     compute_feather,
@@ -22,12 +28,6 @@ from .phase_network import (
     estimate_edge,
     estimate_edges,
     solve_network,
-)
-from .orchestration import (
-    run_network_merge,
-    run_multi_burst_pair_merge,
-    run_multi_path_pair_merge,
-    write_mosaic_zarr,
 )
 from .products import BurstGeoProduct, MosaicProduct
 from .unwrap_seam import (
@@ -62,9 +62,9 @@ __all__ = [
     "overlap_mask",
     "reintegrate_highcoh_from_seed",
     "reintegrate_unwrapped_along_range",
-    "run_network_merge",
     "run_multi_burst_pair_merge",
     "run_multi_path_pair_merge",
+    "run_network_merge",
     "solve_network",
     "write_mosaic_zarr",
 ]

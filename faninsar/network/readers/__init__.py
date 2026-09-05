@@ -29,11 +29,11 @@ from .metadata import (
 from .timeseries import NetworkTimeSeries
 
 __all__ = [
-    "COGValidationError",
     "GEOMETRY_ASSETS",
     "INTERFEROGRAM_ASSETS",
-    "GridMismatchError",
+    "COGValidationError",
     "GeometryAssetName",
+    "GridMismatchError",
     "InterferogramAssetName",
     "InterferogramCollection",
     "MetadataError",

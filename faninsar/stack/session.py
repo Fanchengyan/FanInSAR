@@ -43,8 +43,8 @@ from faninsar.core.network import (
 from faninsar.core.network import (
     Network as NetworkContract,
 )
-from faninsar.network.network import Network
 from faninsar.logging import setup_logger
+from faninsar.network.network import Network
 from faninsar.processing.coreg.misreg_network import (
     DateMisreg,
     MisregArc,
@@ -60,6 +60,8 @@ from faninsar.processing.interferometry.phase_filter import (
     GoldsteinWerner,
     PhaseFilter,
 )
+from faninsar.processing.unwrap.errors import UnwrapFailedError
+from faninsar.processing.unwrap.irls import SpatialIRLS
 from faninsar.stack.catalog import SceneCatalog
 from faninsar.stack.config import (
     ActivationMode,
@@ -75,8 +77,6 @@ from faninsar.stack.scene_store import (
     copy_reference_units,
     form_merged_scene_interferogram,
 )
-from faninsar.processing.unwrap.errors import UnwrapFailedError
-from faninsar.processing.unwrap.irls import SpatialIRLS
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -91,22 +91,22 @@ if TYPE_CHECKING:
     )
     from faninsar.processing.dem import DEM, GridSpec
     from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.resources import ResourceBudget
     from faninsar.processing.stages import (
         BurstSelection,
         CoregistrationGrid,
         ProductionPairState,
     )
-    from faninsar.processing.resources import ResourceBudget
+    from faninsar.processing.timeseries.inversion import TimeSeriesResult
+    from faninsar.processing.unwrap.common import SpatialUnwrapper
+    from faninsar.processing.unwrap.quality import StackQualityCriteria
+    from faninsar.processing.unwrap.stack import SpatialExecutor, StackUnwrapResult
     from faninsar.stack.ifg_store import (
         InterferogramArtifactStore,
         UnwrappedArtifact,
     )
     from faninsar.stack.provider import StackSceneProvider
     from faninsar.stack.stack_generation import StackResultGeneration
-    from faninsar.processing.timeseries.inversion import TimeSeriesResult
-    from faninsar.processing.unwrap.common import SpatialUnwrapper
-    from faninsar.processing.unwrap.quality import StackQualityCriteria
-    from faninsar.processing.unwrap.stack import SpatialExecutor, StackUnwrapResult
 
 logger = setup_logger(__name__)
 
@@ -3028,9 +3028,6 @@ class Stack(NetworkContract):
             estimate_unwrap_decode_resources,
             reserve_estimate,
         )
-        from faninsar.stack.stack_generation import (
-            publish_unwrap_generation,
-        )
         from faninsar.processing.unwrap.common import (
             SpatialUnwrapper,
             SpatialUnwrapResult,
@@ -3038,6 +3035,9 @@ class Stack(NetworkContract):
         from faninsar.processing.unwrap.errors import (
             NoValidSupportError,
             UnwrapFailedError,
+        )
+        from faninsar.stack.stack_generation import (
+            publish_unwrap_generation,
         )
 
         if not isinstance(unwrapper, SpatialUnwrapper):
@@ -3282,13 +3282,13 @@ class Stack(NetworkContract):
             This session with :attr:`unwrap_result` populated.
 
         """
-        from faninsar.stack.ifg_store import write_unwrapped_artifact
         from faninsar.processing.unwrap.quality import (
             MetricDistribution,
             StackQualityCriteria,
             StackQualityReport,
         )
         from faninsar.processing.unwrap.stack import unwrap_stack
+        from faninsar.stack.ifg_store import write_unwrapped_artifact
 
         requested_quality_criteria = asdict(quality_criteria or StackQualityCriteria())
         looks = multilook or self.config.multilook
