@@ -10,8 +10,8 @@ import pytest
 
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.merge.overlap import compute_feather
-from faninsar.processing.merge.pipeline import (
-    run_frame_merge,
+from faninsar.processing.merge.orchestration import (
+    run_network_merge,
     write_mosaic_stac_item,
     write_mosaic_zarr,
 )
@@ -67,10 +67,10 @@ def _three_swath_products() -> list[BurstGeoProduct]:
     ]
 
 
-def test_run_frame_merge_writes_zarr(tmp_path: Path) -> None:
-    """run_frame_merge writes a Zarr store for a multi-swath frame."""
+def test_run_network_merge_writes_zarr(tmp_path: Path) -> None:
+    """run_network_merge writes a Zarr store for a multi-swath Network."""
     products = _three_swath_products()
-    out = run_frame_merge(
+    out = run_network_merge(
         products,
         output_dir=tmp_path,
         merge_paths=False,
@@ -82,7 +82,7 @@ def test_run_frame_merge_writes_zarr(tmp_path: Path) -> None:
     assert out.name == "frame_test_mosaic.zarr"
 
 
-def test_run_frame_merge_three_swath_single_component() -> None:
+def test_run_network_merge_three_swath_single_component() -> None:
     """Three overlapping swaths produce a single connected component."""
     products = _three_swath_products()
     mosaic = merge_burst_products(

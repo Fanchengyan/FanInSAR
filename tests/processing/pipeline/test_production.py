@@ -14,7 +14,7 @@ from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import PreparedGeometryArrayPayload
 from faninsar.processing.merge.grid import GeoGridSpec
-from faninsar.processing.pipeline import (
+from faninsar.processing.stages import (
     PreparedGeometryField,
     ProductionPairState,
     load_production_scene,
@@ -26,7 +26,7 @@ from faninsar.processing.pipeline import (
     stage_unwrap,
     stage_write,
 )
-from faninsar.processing.pipeline.production import (
+from faninsar.processing.stages import (
     _apply_geo_topographic_phase_chunked,
     _inherit_coregistration_residuals,
     _own_geo_valid_mask,
@@ -44,7 +44,7 @@ if not SCENES and SLC_ROOT_RAW.exists():
 
 def _first_common_pair() -> tuple[Path, Path] | None:
     from faninsar.missions.sentinel1.safe import open_safe_product
-    from faninsar.processing.pipeline.production import _common_burst_indices
+    from faninsar.processing.stages import _common_burst_indices
 
     for index, reference in enumerate(SCENES):
         for secondary in SCENES[index + 1 :]:
@@ -182,7 +182,7 @@ def test_stage_coregister_can_use_geometry_offsets_without_empirical_shift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Geometry-only radar coregistration must skip global shift refinement."""
-    from faninsar.processing.pipeline import production as production_mod
+    import faninsar.processing.stages as production_mod
 
     shape = (16, 32)
     ref = _make_mock_scene(shape)
@@ -251,7 +251,7 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
 ) -> None:
     """Production separates Ampcor policy from Torch remapping policy."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.pipeline import production as production_mod
+    import faninsar.processing.stages as production_mod
 
     shape = (64, 96)
     ref = _make_mock_scene(shape)
@@ -318,7 +318,7 @@ def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
 ) -> None:
     """A captured Stage-A field preserves the product pass without re-solving."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.pipeline import production as production_mod
+    import faninsar.processing.stages as production_mod
 
     shape = (16, 32)
     ref = _make_mock_scene(shape)
@@ -422,8 +422,8 @@ def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
 ) -> None:
     """Geo stage consumes a provider LUT without rebuilding or shifting it."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.pipeline import production as production_mod
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    import faninsar.processing.stages as production_mod
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     radar_shape = (4, 4)
     lut_shape = (2, 2)
@@ -478,7 +478,7 @@ def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
         raising=False,
     )
     monkeypatch.setattr(
-        "faninsar.processing.pipeline.geo_modes.coregister_geocoded_slcs_chunked",
+        "faninsar.processing.geocoding.geo_modes.coregister_geocoded_slcs_chunked",
         lambda *_args, **_kwargs: (
             np.ones(lut_shape, dtype=np.complex64),
             np.ones(lut_shape, dtype=np.complex64),
@@ -569,7 +569,7 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
 ) -> None:
     """Stage B reuses the Stage-A ROI crop without probing or solving again."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.pipeline import production as production_mod
+    import faninsar.processing.stages as production_mod
 
     shape = (128, 256)
     window = (24, 72, 64, 160)
@@ -652,7 +652,7 @@ def test_stage_coregister_grows_roi_halo_for_large_offsets(
 ) -> None:
     """A large geometric offset grows the ROI crop until the margin covers it."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.pipeline import production as production_mod
+    import faninsar.processing.stages as production_mod
 
     shape = (512, 1024)
     window = (100, 200, 200, 400)
@@ -754,8 +754,8 @@ def test_geo_topographic_phase_preserves_row_order_when_chunked(
     """Disk-backed topographic phase tiles preserve geographic row order."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
     from faninsar.processing.merge.grid import GeoGridSpec
-    from faninsar.processing.pipeline import production
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing import stages as production
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     state = MagicMock()
     shape = (12, 5)
@@ -829,7 +829,7 @@ def test_geo_topographic_phase_preserves_row_order_when_chunked(
         fake_geometric_phase,
     )
     monkeypatch.setattr(
-        "faninsar.processing.pipeline.geo_lut.grid_lonlat_rows",
+        "faninsar.processing.geocoding.geo_lut.grid_lonlat_rows",
         lambda _grid, row_start, row_stop: (
             np.arange(60, dtype=np.float64).reshape(shape)[row_start:row_stop],
             np.full(shape, 3.0)[row_start:row_stop],
@@ -899,7 +899,7 @@ def test_stage_flatten_wrapped_phase_matches_flat_not_unflat(
     matching wrapped_phase must be angle(flat), not angle(unflattened), and
     zero-power edge looks must remain NaN (not phase=0).
     """
-    from faninsar.processing.pipeline import production as production_mod
+    import faninsar.processing.stages as production_mod
 
     h, w = 8, 8
     ref = _make_mock_scene((16, 32))  # full-res shape for look-index scaling
@@ -958,7 +958,7 @@ def test_stage_flatten_does_not_repeat_slc_domain_flattening(
     removing a spurious residual. Full topographic phase is not re-applied
     as if coreg never flattened.
     """
-    from faninsar.processing.pipeline import production as production_mod
+    import faninsar.processing.stages as production_mod
 
     shape = (8, 8)
     ref = _make_mock_scene((16, 32))

@@ -23,8 +23,8 @@ from .phase_network import (
     estimate_edges,
     solve_network,
 )
-from .pipeline import (
-    run_frame_merge,
+from .orchestration import (
+    run_network_merge,
     run_multi_burst_pair_merge,
     run_multi_path_pair_merge,
     write_mosaic_zarr,
@@ -62,7 +62,7 @@ __all__ = [
     "overlap_mask",
     "reintegrate_highcoh_from_seed",
     "reintegrate_unwrapped_along_range",
-    "run_frame_merge",
+    "run_network_merge",
     "run_multi_burst_pair_merge",
     "run_multi_path_pair_merge",
     "solve_network",

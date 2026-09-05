@@ -513,8 +513,8 @@ def _geocode_aligned_radar_tile(
     """Forward-geocode aligned complex tiles through Geo2Rdr + Lanczos."""
     from faninsar.processing.geometry import RadarGeometryModel
     from faninsar.processing.merge.grid import GeoGridSpec
-    from faninsar.processing.pipeline.geo_lut import build_geo2rdr_lut
-    from faninsar.processing.pipeline.geo_resample import (
+    from faninsar.processing.geocoding.geo_lut import build_geo2rdr_lut
+    from faninsar.processing.geocoding.geo_resample import (
         resample_complex_at_coordinates,
     )
 
@@ -1358,7 +1358,7 @@ def make_nisar_scene_provider(
                     )
                     dense_valid = dense_mapping.valid
                 else:
-                    from faninsar.processing.pipeline.geo_resample import (
+                    from faninsar.processing.geocoding.geo_resample import (
                         resample_complex_at_coordinates,
                     )
 

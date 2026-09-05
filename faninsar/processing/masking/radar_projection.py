@@ -5,13 +5,13 @@ geographic grid while interferogram support masks live on the radar
 ``(azimuth, range)`` grid.  This module projects the mask into radar
 coordinates with **nearest-neighbour only** semantics:
 
-- **geo mode** — a dense :class:`~faninsar.processing.pipeline.geo_lut.\
+- **geo mode** — a dense :class:`~faninsar.processing.geocoding.geo_lut.\
 Geo2RdrLUT` is available (geo-coregistered runs).  Mask values are scattered
 at the LUT's ``az_full``/``rg_full`` radar indices (``rint`` nearest) and
 radar pixels not covered by any LUT cell remain invalid (``255``).
 - **radar mode** — no dense LUT is available.  ``run_geo2rdr`` runs chunked
   over the mask grid rows (the
-  :func:`faninsar.processing.pipeline.production.\
+  :func:`faninsar.processing.stages.\
 _apply_geo_topographic_phase_chunked` memmap + watchdog pattern), scattering
   converged in-bounds radar indices into the radar plane.
 
@@ -43,7 +43,7 @@ from faninsar.logging import setup_logger
 if TYPE_CHECKING:
     from affine import Affine
 
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
 logger = setup_logger(__name__)
 

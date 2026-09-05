@@ -17,9 +17,9 @@ from faninsar.missions.sentinel1.errors import Sentinel1ProductError
 from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.merge.grid import GeoGridSpec
-from faninsar.processing.pipeline import ProductionPairState
-from faninsar.processing.pipeline import production as production_mod
-from faninsar.processing.pipeline.production import (
+from faninsar.processing.stages import ProductionPairState
+import faninsar.processing.stages as production_mod
+from faninsar.processing.stages import (
     SharedPairResources,
     _is_multilook_pair,
     looks_dir,
@@ -439,7 +439,7 @@ def test_finalize_geo_products_builds_multilooked_grid() -> None:
 
 def test_shared_resources_cleanup_is_idempotent(tmp_path: Path) -> None:
     """cleanup() removes the geo work dir once and is safe to call twice."""
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     class CountingTemporaryDirectory(tempfile.TemporaryDirectory):
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -516,7 +516,7 @@ def test_shared_resources_cleanup_is_idempotent(tmp_path: Path) -> None:
 def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None:
     """A one-config radar sweep is array-identical to the single-config run."""
     from faninsar.missions.sentinel1.safe import open_safe_product
-    from faninsar.processing.pipeline.production import _common_burst_indices
+    from faninsar.processing.stages import _common_burst_indices
 
     reference, secondary = SCENES[0], SCENES[1]
     ref_swath = open_safe_product(reference).swath("IW1")
@@ -701,7 +701,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
 ) -> None:
     """Geo sweeps hand the last unit state to SharedPairResources cleanup."""
     from faninsar.missions.sentinel1 import safe as safe_module
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     work = tmp_path / "geo-memmaps"
     work.mkdir()

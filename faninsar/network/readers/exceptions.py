@@ -1,17 +1,17 @@
-"""Custom exceptions for FanInSAR frame products."""
+"""Custom exceptions for FanInSAR Network products."""
 
 from __future__ import annotations
 
 
-class FrameProductError(Exception):
+class NetworkProductError(Exception):
     """Base exception for frame product errors."""
 
 
-class FrameGeometryError(FrameProductError):
+class NetworkGeometryError(NetworkProductError):
     """Base exception for frame geometry errors."""
 
 
-class GridMismatchError(FrameGeometryError):
+class GridMismatchError(NetworkGeometryError):
     """Raised when raster grids do not align."""
 
     def __init__(self, detail: str = "") -> None:
@@ -22,11 +22,11 @@ class GridMismatchError(FrameGeometryError):
         super().__init__(msg)
 
 
-class COGValidationError(FrameGeometryError):
+class COGValidationError(NetworkGeometryError):
     """Raised when a raster fails COG validation."""
 
 
-class MissingGeometryAssetError(FrameGeometryError):
+class MissingGeometryAssetError(NetworkGeometryError):
     """Raised when a required geometry asset is missing."""
 
     def __init__(self, name: str) -> None:
@@ -34,11 +34,11 @@ class MissingGeometryAssetError(FrameGeometryError):
         super().__init__(f"Geometry asset '{name}' not found or not created.")
 
 
-class FrameInterferogramError(FrameProductError):
+class NetworkInterferogramError(NetworkProductError):
     """Base exception for frame interferogram errors."""
 
 
-class MissingInterferogramAssetError(FrameInterferogramError):
+class MissingInterferogramAssetError(NetworkInterferogramError):
     """Raised when a required interferogram asset is missing."""
 
     def __init__(self, pair: str, name: str) -> None:
@@ -46,7 +46,7 @@ class MissingInterferogramAssetError(FrameInterferogramError):
         super().__init__(f"Interferogram asset '{name}' not found for pair '{pair}'.")
 
 
-class PairNotFoundError(FrameInterferogramError):
+class PairNotFoundError(NetworkInterferogramError):
     """Raised when a requested pair is not in the collection."""
 
     def __init__(self, pair: str) -> None:
@@ -54,5 +54,5 @@ class PairNotFoundError(FrameInterferogramError):
         super().__init__(f"Pair '{pair}' not found in the interferogram collection.")
 
 
-class MetadataError(FrameProductError):
+class MetadataError(NetworkProductError):
     """Raised when metadata is invalid or missing."""

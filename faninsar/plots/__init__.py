@@ -2,12 +2,6 @@ from matplotlib.figure import Figure, SubFigure
 
 from .cm import cmaps
 from .formatters import PiFormatter, PiLocator, setup_phase_axis
-from .frame import (
-    plot_coherence,
-    plot_displacement_timeseries,
-    plot_interferogram,
-    plot_velocity,
-)
 from .hist_colorbar import HistColorbar, _hist_colorbar
 from .ucm import (
     DEFAULT_UCM_MOSAIC,

@@ -984,7 +984,7 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
         lambda _samples, azimuth, _range_index: np.ones(azimuth.shape, dtype=bool),
     )
     monkeypatch.setattr(
-        "faninsar.processing.pipeline.geo_resample.resample_complex_at_coordinates",
+        "faninsar.processing.geocoding.geo_resample.resample_complex_at_coordinates",
         fake_resample,
     )
 

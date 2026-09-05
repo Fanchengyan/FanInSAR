@@ -27,9 +27,9 @@ from faninsar.core.network import (
 )
 from faninsar.logging import setup_logger
 
-from faninsar.datasets.frame.geometry import FrameGeometry
-from faninsar.datasets.frame.interferogram import FrameInterferogramCollection
-from faninsar.datasets.frame.timeseries import FrameTimeSeries
+from faninsar.network.readers.geometry import NetworkGeometry
+from faninsar.network.readers.interferogram import InterferogramCollection
+from faninsar.network.readers.timeseries import NetworkTimeSeries
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -471,13 +471,13 @@ class Network(NetworkContract):
         self._root = resolved_root
         geometry_root = resolved_root / "geometry"
         self._geometry = (
-            FrameGeometry(geometry_root) if geometry_root.is_dir() else None
+            NetworkGeometry(geometry_root) if geometry_root.is_dir() else None
         )
         interferograms_root = resolved_root / "interferograms"
-        self._interferograms = FrameInterferogramCollection(interferograms_root)
+        self._interferograms = InterferogramCollection(interferograms_root)
         timeseries_root = resolved_root / "timeseries"
         self._timeseries = (
-            FrameTimeSeries(timeseries_root) if timeseries_root.is_dir() else None
+            NetworkTimeSeries(timeseries_root) if timeseries_root.is_dir() else None
         )
         self._product_index: Any = None
         index = self.interferograms.index_metadata if self.interferograms else None
@@ -598,17 +598,17 @@ class Network(NetworkContract):
         return self._root
 
     @property
-    def geometry(self) -> FrameGeometry | None:
+    def geometry(self) -> NetworkGeometry | None:
         """Return the optional geometry Dataset facade."""
         return self._geometry
 
     @property
-    def interferograms(self) -> FrameInterferogramCollection:
+    def interferograms(self) -> InterferogramCollection:
         """Return the validated interferogram Dataset facade."""
         return self._interferograms
 
     @property
-    def timeseries(self) -> FrameTimeSeries | None:
+    def timeseries(self) -> NetworkTimeSeries | None:
         """Return the optional time-series Dataset facade."""
         return self._timeseries
 

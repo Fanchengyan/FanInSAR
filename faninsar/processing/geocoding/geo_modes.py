@@ -9,7 +9,7 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.memory import release_memmap_pages
-from faninsar.processing.pipeline.geo_resample import (
+from faninsar.processing.geocoding.geo_resample import (
     compose_secondary_coordinates,
     resample_complex_at_coordinates,
 )
@@ -17,7 +17,7 @@ from faninsar.processing.pipeline.geo_resample import (
 if TYPE_CHECKING:
     from faninsar.processing.coreg.offsets import OffsetFieldResult
     from faninsar.processing.memory import MemoryWatchdog
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
     from faninsar.processing.tops.deramp import TOPSCarrierModel
 
 __all__ = ["coregister_geocoded_slcs", "coregister_geocoded_slcs_chunked"]
@@ -211,7 +211,7 @@ def coregister_geocoded_slcs_chunked(
 
     """
     from faninsar.processing.errors import reject_invalid_state
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     if row_chunk < 1:
         reject_invalid_state("row_chunk must be >= 1")

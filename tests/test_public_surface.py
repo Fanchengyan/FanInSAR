@@ -7,20 +7,16 @@ import faninsar as fis
 REQUIRED_NAMES = {
     "Acquisition",
     "Acquisitions",
+    "Baselines",
+    "Frequency",
+    "Network",
     "Pair",
     "Pairs",
-    "Interferogram",
-    "Network",
-    "TimeSeries",
-    "Orbit",
-    "Stack",
-    "S1Stack",
-    "NISARStack",
-    "StackConfig",
-    "Points",
-    "BoundingBox",
-    "Polygons",
-    "DEM",
+    "Wavelength",
+    "data",
+    "network",
+    "remote",
+    "stack",
 }
 
 
@@ -35,7 +31,7 @@ def test_required_names_present() -> None:
 
 def test_removed_execution_names_absent() -> None:
     """Stack and Network are the only public interferometry roots."""
-    for name in ("Frame", "Pipeline", "Workflow", "run"):
+    for name in ("Frame", "Pipeline", "Workflow", "run", "run_pair"):
         assert name not in fis.__all__
         assert not hasattr(fis, name)
 

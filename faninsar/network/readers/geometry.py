@@ -1,4 +1,4 @@
-"""Frame-level geometry assets for one InSAR frame."""
+"""Network product geometry assets for one InSAR frame."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.logging import setup_logger
 
 from .exceptions import (
-    FrameGeometryError,
+    NetworkGeometryError,
     GridMismatchError,
     MissingGeometryAssetError,
 )
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
     import pystac
 
-    from faninsar.datasets.frame.interferogram import FrameInterferogramCollection
+    from faninsar.network.readers.interferogram import InterferogramCollection
     from faninsar.data.datasets.xarray_dataset import XarrayDataset
     from faninsar.data.query import BoundingBox
 
@@ -48,8 +48,8 @@ logger = setup_logger(__name__)
 _ASSET_FILENAMES: dict[str, str] = {name: f"{name}.cog.tif" for name in GEOMETRY_ASSETS}
 
 
-class FrameGeometry:
-    """Standardized frame-level geometry assets for one InSAR frame.
+class NetworkGeometry:
+    """Standardized network product geometry assets for one InSAR frame.
 
     Parameters
     ----------
@@ -60,7 +60,7 @@ class FrameGeometry:
     --------
     Create from raw rasters:
 
-    >>> geom = FrameGeometry.from_rasters(
+    >>> geom = NetworkGeometry.from_rasters(
     ...     out_dir="frame",
     ...     incidence="/path/to/inc_map_ell.tif",
     ...     angle_unit="radian",
@@ -79,7 +79,7 @@ class FrameGeometry:
     """
 
     def __init__(self, root: str | Path) -> None:
-        """Initialise FrameGeometry from an existing geometry directory."""
+        """Initialise NetworkGeometry from an existing geometry directory."""
         self._root = Path(root)
         if not self._root.is_dir():
             msg = f"Geometry directory not found: {self._root}"
@@ -110,9 +110,9 @@ class FrameGeometry:
         if self._metadata is None:
             msg = (
                 f"geometry.json not found at {self._metadata_path}. "
-                "Create the geometry first with FrameGeometry.from_rasters()."
+                "Create the geometry first with NetworkGeometry.from_rasters()."
             )
-            raise FrameGeometryError(msg)
+            raise NetworkGeometryError(msg)
         return self._metadata
 
     @classmethod
@@ -168,8 +168,8 @@ class FrameGeometry:
 
         Returns
         -------
-        FrameGeometry
-            A new :class:`FrameGeometry` pointing to the output directory.
+        NetworkGeometry
+            A new :class:`NetworkGeometry` pointing to the output directory.
 
         """
         import rasterio.enums
@@ -301,7 +301,7 @@ class FrameGeometry:
             value_ranges=geom_value_ranges or None,
         )
         save_json(meta, geometry_dir / "geometry.json")
-        logger.info("FrameGeometry created at %s", geometry_dir)
+        logger.info("NetworkGeometry created at %s", geometry_dir)
 
         return cls(geometry_dir)
 
@@ -344,7 +344,7 @@ class FrameGeometry:
 
         Returns
         -------
-        FrameGeometry
+        NetworkGeometry
 
         Raises
         ------
@@ -619,7 +619,7 @@ class FrameGeometry:
         """Wrap a single geometry asset in a FanInSAR :class:`XarrayDataset`.
 
         This bridges the geometry asset to FanInSAR's existing
-        :class:`~faninsar.datasets.XarrayDataset` query system, enabling
+        :class:`~faninsar.data.datasets.XarrayDataset` query system, enabling
         :class:`~faninsar.data.query.BoundingBox`-based ``boxes_query`` workflows.
 
         Parameters
@@ -667,7 +667,7 @@ class FrameGeometry:
 
     def to_stac(
         self,
-        ifgs: FrameInterferogramCollection | None = None,
+        ifgs: InterferogramCollection | None = None,
         *,
         catalog_id: str = "insar-frame",
         description: str = "",
@@ -679,7 +679,7 @@ class FrameGeometry:
 
         Parameters
         ----------
-        ifgs : FrameInterferogramCollection, optional
+        ifgs : InterferogramCollection, optional
             If provided, interferogram items are added as a child collection.
         catalog_id : str
             STAC Catalog id.

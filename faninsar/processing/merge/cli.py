@@ -157,9 +157,9 @@ def main(argv: list[str] | None = None) -> int:
 
     products = [_build_synthetic_product(entry, grid_shape) for entry in spec]
 
-    from faninsar.processing.merge.pipeline import run_frame_merge
+    from faninsar.processing.merge.orchestration import run_network_merge
 
-    out_path = run_frame_merge(
+    out_path = run_network_merge(
         products,
         output_dir=Path(args.output_dir),
         merge_paths=args.path_policy == "allow_cross_path",

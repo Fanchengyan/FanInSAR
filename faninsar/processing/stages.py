@@ -68,7 +68,7 @@ from faninsar.processing.interferometry.pair import (
     mask_invalid_looks,
 )
 from faninsar.processing.memory import close_memmap, release_memmap_pages
-from faninsar.processing.pipeline.products import (
+from faninsar.processing.interferometry.products import (
     PairProductArrays,
     write_pair_stac_item,
     write_pair_zarr,
@@ -92,7 +92,7 @@ if TYPE_CHECKING:
     from faninsar.processing.coreg.offsets import OffsetFieldResult
     from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.merge.grid import GeoGridSpec
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
     from faninsar.processing.unwrap.common import SpatialUnwrapResult
 
 logger = setup_logger(__name__)
@@ -1161,7 +1161,7 @@ def read_prepared_lut(
     payload = reader(lut_handle, token)
     if not isinstance(payload, PreparedLutArrayPayload):
         reject_invalid_state("prepared provider returned an invalid LUT payload")
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     row0, _, col0, _ = payload.crop_bounds
     return Geo2RdrLUT(
@@ -1536,8 +1536,8 @@ def _apply_geo_topographic_phase_chunked(
         Complete disk-backed geographic fields.
 
     """
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT, grid_lonlat_rows
-    from faninsar.processing.pipeline.geo_resample import (
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT, grid_lonlat_rows
+    from faninsar.processing.geocoding.geo_resample import (
         compose_secondary_coordinates,
     )
 
@@ -2086,14 +2086,14 @@ def stage_coregister(
     if coregistration_grid == "geo":
         if geo_grid is None:
             reject_invalid_state("geo coregistration requires geo_grid")
-        from faninsar.processing.pipeline.geo_lut import (
+        from faninsar.processing.geocoding.geo_lut import (
             build_geo2rdr_lut,
             burst_geo_footprint_lonlat,
             burst_geo_quad_lonlat,
             derive_burst_geo_bbox,
             roi_geo_bbox,
         )
-        from faninsar.processing.pipeline.geo_modes import (
+        from faninsar.processing.geocoding.geo_modes import (
             coregister_geocoded_slcs_chunked,
         )
 
@@ -2152,7 +2152,7 @@ def stage_coregister(
                 from shapely.geometry import MultiPolygon
                 from shapely.geometry import Polygon as ShapelyPolygon
 
-                from faninsar.processing.pipeline.geo_lut import polygon_parts
+                from faninsar.processing.geocoding.geo_lut import polygon_parts
 
                 burst_quad = burst_geo_quad_lonlat(
                     geometry=state.primary.geometry,
@@ -2186,7 +2186,7 @@ def stage_coregister(
         state.geo_bbox = (burst_row0, burst_row1, burst_col0, burst_col1)
         if prepared_geo_lut is None:
             substage_started = _clock_start(device)
-            from faninsar.processing.pipeline.geo_lut import geo_grid_hash
+            from faninsar.processing.geocoding.geo_lut import geo_grid_hash
 
             lut_cache_key = None
             lut_cache_dir = (
@@ -3344,7 +3344,7 @@ def _finalize_geo_products(
     geo_height_m: float,
 ) -> ProductionPairState:
     """Assemble the multilooked geographic product grid from unwrapped phase."""
-    from faninsar.processing.pipeline.geo_lut import grid_lonlat
+    from faninsar.processing.geocoding.geo_lut import grid_lonlat
 
     assert state.unwrapped_phase is not None
     assert state.coherence is not None
@@ -3591,7 +3591,7 @@ def _auto_dem_bounds(
     from dataclasses import replace as _replace
 
     from faninsar.missions.sentinel1 import read_eof_orbit
-    from faninsar.processing.pipeline.geo_lut import burst_geo_quad_lonlat
+    from faninsar.processing.geocoding.geo_lut import burst_geo_quad_lonlat
 
     quads: list[np.ndarray] = []
     for (frame_index, swath), indices in resolved.items():
@@ -3745,7 +3745,7 @@ def _select_bursts_by_roi(
 
     from faninsar.missions.sentinel1 import read_eof_orbit
     from faninsar.missions.sentinel1.safe import open_safe_product
-    from faninsar.processing.pipeline.geo_lut import burst_geo_quad_lonlat
+    from faninsar.processing.geocoding.geo_lut import burst_geo_quad_lonlat
 
     region = _roi_geometry(roi)
     resolved: dict[tuple[int, str], list[int]] = {}
@@ -3821,7 +3821,7 @@ def _roi_burst_window(
     """Return the radar window covering the ROI-burst quad intersection."""
     from shapely.geometry import Polygon as ShapelyPolygon
 
-    from faninsar.processing.pipeline.geo_lut import (
+    from faninsar.processing.geocoding.geo_lut import (
         burst_geo_quad_lonlat,
         polygon_parts,
     )

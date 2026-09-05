@@ -1,6 +1,6 @@
 """Tests for the shared datum-aware auto-DEM resolution helper (PROPOSAL-0030).
 
-Covers :func:`faninsar.processing.pipeline.production.resolve_auto_dem`: the
+Covers :func:`faninsar.processing.stages.resolve_auto_dem`: the
 single wrap rule used by Stack interferogram production and
 ``cli.frame.run_frame_cli``; source selection via ``dem_source``; and the
 CLI fail-closed contract for unwired providers.
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from faninsar.processing.dem import DEM, RasterDEM
-from faninsar.processing.pipeline.production import resolve_auto_dem
+from faninsar.processing.stages import resolve_auto_dem
 
 
 def _make_raster(path: Path) -> Path:

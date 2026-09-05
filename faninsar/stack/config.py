@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     )
     from faninsar.processing.dem import DEM, GridSpec
     from faninsar.processing.merge.grid import GeoGridSpec
-    from faninsar.processing.pipeline.production import (
+    from faninsar.processing.stages import (
         BurstSelection,
         CoregistrationGrid,
     )

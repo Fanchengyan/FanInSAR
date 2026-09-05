@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 
 from faninsar.processing.merge.grid import GeoGridSpec
-from faninsar.processing.pipeline import geo_lut
-from faninsar.processing.pipeline.geo_lut import (
+from faninsar.processing.geocoding import geo_lut
+from faninsar.processing.geocoding.geo_lut import (
     _LUT_CACHE_ARRAY_FILES,
     _load_cached_lut,
     _lut_cache_mismatch_reason,
@@ -401,7 +401,7 @@ def test_masked_bbox_pixels_geo2rdr_outside_burst_window() -> None:
 
     from faninsar.processing.dem import ConstantDEM
     from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr2geo
-    from faninsar.processing.pipeline.geo_lut import (
+    from faninsar.processing.geocoding.geo_lut import (
         build_geo2rdr_lut,
         burst_geo_footprint_lonlat,
         grid_lonlat,

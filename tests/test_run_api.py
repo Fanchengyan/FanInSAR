@@ -46,7 +46,7 @@ def test_run_rejects_pair_configuration_before_backend_resolution() -> None:
 
 def test_processing_pipeline_hides_removed_pair_entry_points() -> None:
     """Removed execution callables are absent from the public pipeline."""
-    from faninsar.processing import pipeline
+    from faninsar.processing import stages
 
     for name in (
         "run_pair",
@@ -55,5 +55,5 @@ def test_processing_pipeline_hides_removed_pair_entry_points() -> None:
         "PairWorkflowState",
         "run_stack_pipeline",
     ):
-        assert not hasattr(pipeline, name)
-        assert name not in pipeline.__all__
+        assert not hasattr(stages, name)
+        assert name not in getattr(stages, "__all__", ())

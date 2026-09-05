@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.pipeline.production import (
+from faninsar.processing.stages import (
     _align_crop_end,
     _burst_index_list,
     _common_burst_indices,
@@ -166,7 +166,7 @@ def test_roi_burst_window_projects_onto_real_geometry() -> None:
     """The ROI radar window stays inside the burst extent."""
     from faninsar.missions.sentinel1.safe import open_safe_product
     from faninsar.processing.dem import ConstantDEM
-    from faninsar.processing.pipeline.production import _radar_model
+    from faninsar.processing.stages import _radar_model
     from faninsar.data.query import BoundingBox
 
     product = open_safe_product(SCENES[0])

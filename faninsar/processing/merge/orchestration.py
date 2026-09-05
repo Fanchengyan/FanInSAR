@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 __all__ = [
-    "run_frame_merge",
+    "run_network_merge",
     "run_multi_burst_pair_merge",
     "run_multi_path_pair_merge",
     "write_mosaic_stac_item",
@@ -121,7 +121,7 @@ def run_multi_path_pair_merge(
     )
 
 
-def run_frame_merge(
+def run_network_merge(
     products: list[BurstGeoProduct],
     *,
     output_dir: Path,

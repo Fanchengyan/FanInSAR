@@ -284,7 +284,7 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
         pytest.fail("NISAR RSLC was routed to the SAFE opener")
 
     monkeypatch.setattr(
-        "faninsar.processing.pipeline.production.open_safe_product",
+        "faninsar.processing.stages.open_safe_product",
         fail_if_safe_opened,
     )
 

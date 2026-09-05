@@ -12,7 +12,7 @@ import zarr
 from faninsar.processing.merge.grid import GeoGridSpec
 from faninsar.processing.merge.overlap import compute_feather
 from faninsar.processing.merge.path_catalog import PathCatalog
-from faninsar.processing.merge.pipeline import (
+from faninsar.processing.merge.orchestration import (
     run_multi_burst_pair_merge,
     write_mosaic_zarr,
 )

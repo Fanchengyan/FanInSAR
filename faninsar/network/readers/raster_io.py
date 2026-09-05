@@ -1,4 +1,4 @@
-"""Raster I/O helpers for FanInSAR frame products."""
+"""Raster I/O helpers for FanInSAR Network products."""
 
 from __future__ import annotations
 

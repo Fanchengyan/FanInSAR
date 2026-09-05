@@ -12,19 +12,19 @@ from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
 from faninsar.processing.coordinates import RadarGrid
 from faninsar.processing.geometry import RadarGeometryModel
 from faninsar.processing.merge.grid import GeoGridSpec
-from faninsar.processing.pipeline.geo_lut import (
+from faninsar.processing.geocoding.geo_lut import (
     build_geo2rdr_lut,
     grid_lonlat,
     grid_lonlat_rows,
     roi_geo_bbox,
     roi_geo_mask,
 )
-from faninsar.processing.pipeline.geo_modes import (
+from faninsar.processing.geocoding.geo_modes import (
     _apply_reramp,
     coregister_geocoded_slcs,
     coregister_geocoded_slcs_chunked,
 )
-from faninsar.processing.pipeline.geo_resample import (
+from faninsar.processing.geocoding.geo_resample import (
     apply_lut_complex,
     compose_secondary_coordinates,
     resample_complex_at_coordinates,
@@ -124,7 +124,7 @@ def test_build_geo2rdr_lut_with_roi_geometry_masks_outside(
     """ROI geometry prefilter keeps only converged pixels inside the ROI."""
     from shapely.geometry import box
 
-    from faninsar.processing.pipeline import geo_lut
+    from faninsar.processing.geocoding import geo_lut
 
     def _fake_geo2rdr(
         _geometry: object,
@@ -218,7 +218,7 @@ def _carrier() -> TOPSCarrierModel:
 def test_compose_secondary_coordinates_uses_source_offset_convention() -> None:
     """Geo coordinates compose reference LUT and dense reference-minus-secondary."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     lut = Geo2RdrLUT(
         az_full=np.array([[2.0, 3.0]], dtype=np.float64),
@@ -243,8 +243,8 @@ def test_compose_secondary_coordinates_torch_matches_numpy() -> None:
     """CUDA compose matches the SciPy bilinear oracle on interior samples."""
     pytest.importorskip("torch")
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
-    from faninsar.processing.pipeline.geo_resample import (
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_resample import (
         _compose_secondary_coordinates_torch,
     )
 
@@ -279,7 +279,7 @@ def test_compose_secondary_coordinates_torch_matches_numpy() -> None:
 def test_coregister_geocoded_slcs_remaps_deramped_inputs_once() -> None:
     """Geo coregistration returns two reramped SLCs on the LUT grid."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     shape = (8, 10)
     azimuth, range_index = np.meshgrid(
@@ -354,7 +354,7 @@ def test_geo_reramp_keeps_nonqualified_stage_on_cpu(
 def test_chunked_coregistration_matches_full_result(tmp_path: Path) -> None:
     """Chunked Geo coregistration is numerically identical to the full path."""
     from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.pipeline.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     shape = (12, 14)
     azimuth, range_index = np.meshgrid(

@@ -1,4 +1,4 @@
-"""Frame-level time-series product (M2).
+"""Network product time-series product (M2).
 
 Represents the standardised ``frame/timeseries/`` folder produced by an
 InSAR time-series inversion (NSBAS, MintPy, etc.). The folder holds:
@@ -12,7 +12,7 @@ InSAR time-series inversion (NSBAS, MintPy, etc.). The folder holds:
 
 The implementation is deliberately minimal in M2: it knows how to *read* a
 standardised folder and *lazily open* its assets. The actual inversion
-pipeline (running NSBAS on a ``FrameInterferogramCollection`` to produce
+pipeline (running NSBAS on a ``InterferogramCollection`` to produce
 these files) is out of scope for M2 and will be added later.
 
 """
@@ -48,7 +48,7 @@ TIMESERIES_ASSETS: dict[str, str] = {
 }
 
 
-class FrameTimeSeries:
+class NetworkTimeSeries:
     """Standardised ``frame/timeseries/`` folder.
 
     Parameters
@@ -141,7 +141,7 @@ class FrameTimeSeries:
         """Return a summary dict of the time-series product."""
         meta = self._meta or {}
         return {
-            "type": "FrameTimeSeries",
+            "type": "NetworkTimeSeries",
             "root": str(self._root),
             "has_displacement": self.has_displacement(),
             "velocity": self.exists("velocity"),
@@ -165,12 +165,12 @@ class FrameTimeSeries:
         reference: Any = None,
         method: str = "unknown",
         overwrite: bool = False,
-    ) -> FrameTimeSeries:
+    ) -> NetworkTimeSeries:
         """Write a synthetic time-series product from in-memory arrays.
 
         This is primarily a **test/seed helper** — it writes a
         ``displacement.zarr`` and (optionally) a ``velocity.cog.tif`` so a
-        ``FrameTimeSeries`` can be exercised without running a real
+        ``NetworkTimeSeries`` can be exercised without running a real
         inversion. The real NSBAS-driven pipeline will live in
         ``faninsar.timeseries`` and call a lower-level writer.
 
@@ -222,7 +222,7 @@ class FrameTimeSeries:
             displacement["time"].values.tolist() if "time" in displacement.dims else []
         )
         meta = {
-            "type": "FrameTimeSeries",
+            "type": "NetworkTimeSeries",
             "version": "0.1.0",
             "method": method,
             "pair_count": None,
@@ -236,16 +236,16 @@ class FrameTimeSeries:
             meta["assets"]["velocity"] = {"href": TIMESERIES_ASSETS["velocity"]}
         save_json(meta, ts_dir / "timeseries.json")
 
-        logger.info("FrameTimeSeries written to %s", ts_dir)
+        logger.info("NetworkTimeSeries written to %s", ts_dir)
         return cls(ts_dir)
 
     def __repr__(self) -> str:
         """Return a short summary string."""
         n_assets = sum(self.exists(k) for k in TIMESERIES_ASSETS)
         return (
-            f"FrameTimeSeries(root={self._root.name!r}, "
+            f"NetworkTimeSeries(root={self._root.name!r}, "
             f"displacement={self.has_displacement()}, assets={n_assets})"
         )
 
 
-__all__ = ["FrameTimeSeries", "TimeSeriesAssetName"]
+__all__ = ["NetworkTimeSeries", "TimeSeriesAssetName"]

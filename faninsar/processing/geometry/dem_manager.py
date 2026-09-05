@@ -489,7 +489,7 @@ class DEMManager:
         """Vertical datum declared by the resolved registry entry.
 
         Drives the shared datum-aware wrap rule in
-        :func:`faninsar.processing.pipeline.production.resolve_auto_dem`;
+        :func:`faninsar.processing.stages.resolve_auto_dem`;
         ``ellipsoidal`` sources are returned unwrapped.
         """
         return self.source_entry.vertical_datum

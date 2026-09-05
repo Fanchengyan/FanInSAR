@@ -1,4 +1,4 @@
-"""Metadata types and schema for FanInSAR frame products."""
+"""Metadata types and schema for FanInSAR Network products."""
 
 from __future__ import annotations
 
@@ -107,7 +107,7 @@ def build_geometry_metadata(
     values without guessing (e.g. incidence angle in degrees vs radians).
     """
     meta: dict[str, Any] = {
-        "type": "FrameGeometry",
+        "type": "NetworkGeometry",
         "version": METADATA_VERSION,
         "crs": str(crs),
         "width": width,
@@ -162,7 +162,7 @@ def build_item_metadata(
     without it downstream consumers silently misinterpret the values.
     """
     item: dict[str, Any] = {
-        "type": "FrameInterferogramItem",
+        "type": "NetworkInterferogramItem",
         "version": METADATA_VERSION,
         "pair_name": pair_name,
         "reference_date": reference_date,
@@ -211,7 +211,7 @@ def build_interferograms_index(
 ) -> dict[str, Any]:
     """Build an interferograms_index.json metadata dictionary."""
     index: dict[str, Any] = {
-        "type": "FrameInterferogramIndex",
+        "type": "NetworkInterferogramIndex",
         "version": METADATA_VERSION,
         "pair_count": pair_count,
         "pairs": pairs,

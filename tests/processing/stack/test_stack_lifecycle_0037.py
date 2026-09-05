@@ -82,7 +82,7 @@ def test_s1_provider_owns_pair_dispatch(
         return SimpleNamespace()
 
     monkeypatch.setattr(
-        "faninsar.processing.pipeline.production.produce_interferogram_pair",
+        "faninsar.processing.stages.produce_interferogram_pair",
         fake_producer,
     )
     stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")

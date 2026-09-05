@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
     import pystac
 
-    from faninsar.datasets.frame.geometry import FrameGeometry
+    from faninsar.network.readers.geometry import NetworkGeometry
     from faninsar.data.datasets.ifg import InterferogramDataset
 
 logger = setup_logger(__name__)
@@ -101,7 +101,7 @@ def _records_to_index(records: list[dict[str, Any]]) -> dict[str, Any]:
     pairs = [r["pair_name"] for r in records]
     assets_by_pair = {r["pair_name"]: json.loads(r["assets"]) for r in records}
     return {
-        "type": first.get("type", "FrameInterferogramIndex"),
+        "type": first.get("type", "NetworkInterferogramIndex"),
         "version": first.get("version"),
         "pair_count": len(pairs),
         "pairs": pairs,
@@ -136,7 +136,7 @@ def _load_index_parquet(path: str | Path) -> dict[str, Any]:
     return _records_to_index(records)
 
 
-class FrameInterferogramCollection:
+class InterferogramCollection:
     """Standardized pair-level interferogram assets for one InSAR frame.
 
     Parameters
@@ -150,7 +150,7 @@ class FrameInterferogramCollection:
 
     >>> from faninsar.data.datasets import HyP3S1
     >>> ds = HyP3S1(root_dir="/path/to/hyp3_products")
-    >>> ifgs = FrameInterferogramCollection.from_dataset(
+    >>> ifgs = InterferogramCollection.from_dataset(
     ...     out_dir="frame",
     ...     dataset=ds,
     ...     geometry=geom,
@@ -158,7 +158,7 @@ class FrameInterferogramCollection:
 
     Build from HyP3 directly:
 
-    >>> ifgs = FrameInterferogramCollection.from_hyp3(
+    >>> ifgs = InterferogramCollection.from_hyp3(
     ...     out_dir="frame",
     ...     root_dir="/path/to/hyp3_products",
     ...     geometry=geom,
@@ -371,7 +371,7 @@ class FrameInterferogramCollection:
         return out_path
 
     @classmethod
-    def from_parquet(cls, parquet_path: str | Path) -> FrameInterferogramCollection:
+    def from_parquet(cls, parquet_path: str | Path) -> InterferogramCollection:
         """Construct a collection rooted at the parquet's parent directory.
 
         Parameters
@@ -381,7 +381,7 @@ class FrameInterferogramCollection:
 
         Returns
         -------
-        FrameInterferogramCollection
+        InterferogramCollection
             Collection whose root is the parquet's parent directory. The
             index is read from parquet (not JSON).
 
@@ -405,7 +405,7 @@ class FrameInterferogramCollection:
         out_dir: str | Path,
         dataset: InterferogramDataset,
         *,
-        geometry: FrameGeometry | None = None,
+        geometry: NetworkGeometry | None = None,
         pairs: Pairs | None = None,
         assets: Sequence[InterferogramAssetName] = ("unw_phase", "coherence"),
         include_optional_hyp3_assets: bool = False,
@@ -423,7 +423,7 @@ class FrameInterferogramCollection:
             *out_dir* already points to a directory named ``ifg``.
         dataset : InterferogramDataset
             Source dataset providing unwrapped phase and coherence files.
-        geometry : FrameGeometry, optional
+        geometry : NetworkGeometry, optional
             Geometry providing the reference grid.
         pairs : Pairs, optional
             Subset of pairs to standardize. If *None*, all valid pairs.
@@ -446,7 +446,7 @@ class FrameInterferogramCollection:
 
         Returns
         -------
-        FrameInterferogramCollection
+        InterferogramCollection
 
         """
         import rasterio.enums
@@ -709,7 +709,7 @@ class FrameInterferogramCollection:
                 logger.warning("Failed to write parquet index: %s", e)
 
         logger.info(
-            "FrameInterferogramCollection created at %s with %d pairs",
+            "InterferogramCollection created at %s with %d pairs",
             ifgs_dir,
             len(pair_names_list),
         )
@@ -721,7 +721,7 @@ class FrameInterferogramCollection:
         out_dir: str | Path,
         root_dir: str | Path,
         *,
-        geometry: FrameGeometry | None = None,
+        geometry: NetworkGeometry | None = None,
         pairs: Pairs | None = None,
         assets: Sequence[InterferogramAssetName] = ("unw_phase", "coherence"),
         include_optional_assets: bool = True,
@@ -738,7 +738,7 @@ class FrameInterferogramCollection:
             Output directory.
         root_dir : str or Path
             Root directory of the HyP3 products.
-        geometry : FrameGeometry, optional
+        geometry : NetworkGeometry, optional
             Geometry providing the reference grid.
         pairs : Pairs, optional
             Subset of pairs.
@@ -757,7 +757,7 @@ class FrameInterferogramCollection:
 
         Returns
         -------
-        FrameInterferogramCollection
+        InterferogramCollection
 
         """
         from faninsar.io.datasets.hyp3 import HyP3S1
@@ -1006,7 +1006,7 @@ class FrameInterferogramCollection:
         stacked.attrs.update(
             {
                 "long_name": name,
-                "frame_asset": name,
+                "network_asset": name,
                 "crs": str(ref_grid.crs) if ref_grid is not None else "",
                 "transform": list(ref_grid.transform)[:6]
                 if ref_grid is not None
@@ -1028,33 +1028,6 @@ class FrameInterferogramCollection:
             "Wrote Zarr cube for '%s' (%d pairs) to %s", name, len(arrays), out
         )
         return out
-
-    def plot_interferogram(
-        self,
-        pair: str,
-        *,
-        name: InterferogramAssetName = "unw_phase",
-        ax: Any = None,
-        **kwargs: Any,
-    ) -> Any:
-        """Plot the unwrapped phase for a pair (thin wrapper over plots.frame)."""
-        from faninsar.plots.frame import plot_interferogram
-
-        da = self.open(pair, name, masked=True)
-        return plot_interferogram(da, pair=pair, ax=ax, **kwargs)
-
-    def plot_coherence(
-        self,
-        pair: str,
-        *,
-        ax: Any = None,
-        **kwargs: Any,
-    ) -> Any:
-        """Plot the coherence map for a pair (thin wrapper over plots.frame)."""
-        from faninsar.plots.frame import plot_coherence
-
-        da = self.open(pair, "coherence", masked=True)
-        return plot_coherence(da, pair=pair, ax=ax, **kwargs)
 
     def as_interferogram_dataset(self) -> InterferogramDataset:
         """Return a FanInSAR InterferogramDataset backed by the frame layout.
@@ -1086,7 +1059,7 @@ class FrameInterferogramCollection:
 
     def to_stac(
         self,
-        geometry: FrameGeometry | None = None,
+        geometry: NetworkGeometry | None = None,
         *,
         catalog_id: str = "insar-interferograms",
         description: str = "",
@@ -1098,7 +1071,7 @@ class FrameInterferogramCollection:
 
         Parameters
         ----------
-        geometry : FrameGeometry, optional
+        geometry : NetworkGeometry, optional
             If provided, include geometry assets as a sibling collection.
         catalog_id : str
             STAC Catalog id.

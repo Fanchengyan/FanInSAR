@@ -91,7 +91,7 @@ if TYPE_CHECKING:
     )
     from faninsar.processing.dem import DEM, GridSpec
     from faninsar.processing.merge.grid import GeoGridSpec
-    from faninsar.processing.pipeline.production import (
+    from faninsar.processing.stages import (
         BurstSelection,
         CoregistrationGrid,
         ProductionPairState,
@@ -217,7 +217,7 @@ Polygons` wrapping the subtracted geometry when reshaped, or ``None``
 def _roi_to_geometry(roi: object) -> Any:
     """Convert a Stack ROI into one EPSG:4326 shapely geometry.
 
-    Mirrors ``faninsar.processing.pipeline.production._roi_geometry`` so the
+    Mirrors ``faninsar.processing.stages._roi_geometry`` so the
     mask subtraction operates on exactly the geometry the burst-selection
     path consumes.
     """
@@ -1640,7 +1640,7 @@ class Stack(NetworkContract):
         if not isinstance(source_path, str) or not source_path:
             reject_invalid_state("persisted radar projection context lacks source_path")
         try:
-            from faninsar.processing.pipeline.production import load_production_scene
+            from faninsar.processing.stages import load_production_scene
 
             scene = load_production_scene(
                 source_path,

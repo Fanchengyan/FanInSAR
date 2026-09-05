@@ -24,7 +24,7 @@ def _produce_s1_pair(
     options: dict[str, Any],
 ) -> Any:
     """Dispatch one admitted SAFE pair through the S1 production adapter."""
-    from faninsar.processing.pipeline.production import produce_interferogram_pair
+    from faninsar.processing.stages import produce_interferogram_pair
 
     primary_sources = primary_path._resolve()
     secondary_sources = secondary_path._resolve()
