@@ -763,7 +763,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     assert state.primary_deramped is not None
     assert state.secondary_aligned is not None
     if scene_store_dir is not None:
-        from faninsar.processing.stack.scene_store import (
+        from faninsar.stack.scene_store import (
             scene_grid_identity,
             write_scene_unit,
         )
@@ -3710,7 +3710,7 @@ def resolve_auto_dem(
     )
     from shapely.geometry import box
 
-    from faninsar.processing.stack.grid import automatic_grid
+    from faninsar.stack.grid import automatic_grid
 
     # Resolve the authoritative projected target before opening or fetching
     # source resources.  The provider then warps directly to this grid, so a
@@ -4700,7 +4700,7 @@ def produce_interferogram_pair(
             assert state.primary_deramped is not None
             assert state.secondary_aligned is not None
             if scene_store_dir is not None:
-                from faninsar.processing.stack.scene_store import write_scene_unit
+                from faninsar.stack.scene_store import write_scene_unit
 
                 write_scene_unit(
                     scene_store_dir,

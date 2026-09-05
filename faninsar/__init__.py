@@ -116,7 +116,7 @@ def __getattr__(name: str) -> Any:
             NetworkPathError,
             SNAPNetwork,
         )
-        from faninsar.processing.stack import NISARStack, S1Stack, Stack
+        from faninsar.stack import NISARStack, S1Stack, Stack
 
         values = {
             "GAMMANetwork": GAMMANetwork,
@@ -149,7 +149,7 @@ def __getattr__(name: str) -> Any:
     }:
         from faninsar.processing.contracts.products import OrbitMetadata
         from faninsar.processing.dem.api import DEM
-        from faninsar.processing.stack.config import StackConfig
+        from faninsar.stack.config import StackConfig
         from faninsar.processing.timeseries.inversion import TimeSeriesResult
         from faninsar.data.query import BoundingBox, Points, Polygons
 

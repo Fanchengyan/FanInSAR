@@ -13,7 +13,7 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.stack.artifact_transaction import (
+from faninsar.stack.artifact_transaction import (
     GenerationLease,
     canonical_json,
     commit_generation,
@@ -25,7 +25,7 @@ from faninsar.processing.stack.artifact_transaction import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
+    from faninsar.stack.ifg_store import InterferogramArtifactStore
 
 logger = setup_logger(__name__)
 
@@ -638,7 +638,7 @@ def _decode_pair_bindings(
     pair_ids: tuple[str, ...],
 ) -> tuple[PairGenerationBinding, ...]:
     """Decode and validate every immutable pair child named by a parent."""
-    from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
+    from faninsar.stack.ifg_store import InterferogramArtifactStore
 
     if not isinstance(raw_bindings, list) or len(raw_bindings) != len(pair_ids):
         reject_invalid_state("Stack generation pair bindings are incomplete")

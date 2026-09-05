@@ -18,14 +18,14 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.stack.artifact_transaction import (
+from faninsar.stack.artifact_transaction import (
     ArtifactResourceLimits,
     GenerationLease,
     commit_generation,
     open_current_generation,
     stage_generation,
 )
-from faninsar.processing.stack.ifg_store import (
+from faninsar.stack.ifg_store import (
     _array_descriptor,
     _atomic_manifest,
     _atomic_save,
@@ -492,7 +492,7 @@ def write_ion_correction_artifact(
         Publish a new correction generation when true.
 
     """
-    from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
+    from faninsar.stack.ifg_store import InterferogramArtifactStore
 
     store = InterferogramArtifactStore.open(root)
     try:

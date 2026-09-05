@@ -11,15 +11,15 @@ from typing import TYPE_CHECKING, Any, Self
 from faninsar.core.acquisition import Acquisition
 from faninsar.logging import setup_logger
 from faninsar.missions.nisar import NisarSensor, _normalize_channel
-from faninsar.processing.stack.catalog import SceneCatalog
-from faninsar.processing.stack.config import ActivationMode, StackConfig
-from faninsar.processing.stack.nisar_provider import (
+from faninsar.stack.catalog import SceneCatalog
+from faninsar.stack.config import ActivationMode, StackConfig
+from faninsar.stack.nisar_provider import (
     make_nisar_scene_provider,
 )
-from faninsar.processing.stack.provider import (
+from faninsar.stack.provider import (
     StackSceneProvider,
 )
-from faninsar.processing.stack.session import Stack, _pairs_from_factory
+from faninsar.stack.session import Stack, _pairs_from_factory
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence

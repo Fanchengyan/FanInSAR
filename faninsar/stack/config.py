@@ -10,7 +10,7 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.resources import ResourceBudget
-from faninsar.processing.stack.mask_plan import MaskPlan
+from faninsar.stack.mask_plan import MaskPlan
 
 if TYPE_CHECKING:
     from faninsar._core.device import GpuMemoryReclaim
@@ -35,7 +35,7 @@ logger = setup_logger(__name__)
 
 @dataclass
 class StackConfig:
-    """Session-level defaults for :class:`~faninsar.processing.stack.session.Stack`.
+    """Session-level defaults for :class:`~faninsar.stack.session.Stack`.
 
     Step methods may override individual fields for a single call; overrides
     do not mutate this config unless the step is written to do so.

@@ -28,11 +28,11 @@ from faninsar.processing.errors import (
     reject_pair_configuration,
 )
 from faninsar.processing.slc import RadarSLC
-from faninsar.processing.stack.provider import (
+from faninsar.stack.provider import (
     SourceHandle,
     UnsupportedStackCapabilityError,
 )
-from faninsar.processing.stack.scene_store import (
+from faninsar.stack.scene_store import (
     CoregisteredSceneStore,
     scene_grid_identity,
     write_scene_unit,
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
     from faninsar.processing.contracts import SLCProduct
     from faninsar.processing.dem import DEM
-    from faninsar.processing.stack.provider import SceneProductionCallback
+    from faninsar.stack.provider import SceneProductionCallback
 
 logger = setup_logger(__name__)
 

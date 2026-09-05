@@ -33,17 +33,17 @@ from faninsar.processing.atmosphere.network import (
 )
 from faninsar.processing.atmosphere.split_spectrum import split_range_spectrum
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.stack.ion_store import (
+from faninsar.stack.ion_store import (
     IonosphereArtifactStore,
     write_ion_correction_artifact,
     write_ionosphere_artifact,
 )
-from faninsar.processing.stack.scene_store import CoregisteredSceneStore
+from faninsar.stack.scene_store import CoregisteredSceneStore
 from faninsar.processing.unwrap.snaphu_backend import SnaphuConfig
 
 if TYPE_CHECKING:
     from faninsar.processing.atmosphere.config import IonosphereEstimationConfig
-    from faninsar.processing.stack.session import Stack
+    from faninsar.stack.session import Stack
 
 logger = setup_logger(__name__)
 
@@ -52,7 +52,7 @@ IONOSPHERE_METHOD_NAME = "ionosphere_split_spectrum"
 
 def _runtime_identity(stack: Stack) -> str:
     """Return the canonical Stack runtime fingerprint for admission."""
-    from faninsar.processing.stack.session import (
+    from faninsar.stack.session import (
         _provider_callback,
         _runtime_fingerprint,
     )
@@ -197,7 +197,7 @@ def estimate_ionosphere(
 
     """
     from faninsar.processing.interferometry.pair import form_interferogram
-    from faninsar.processing.stack.session import _iter_pair_dates
+    from faninsar.stack.session import _iter_pair_dates
     from faninsar.processing.unwrap.api import unwrap
 
     stack._ensure_prepared()
@@ -556,7 +556,7 @@ def invert_ionosphere_dates(
         Per-date screens plus exact pair provenance.
 
     """
-    from faninsar.processing.stack.session import _iter_pair_dates
+    from faninsar.stack.session import _iter_pair_dates
 
     expected_pairs = [
         f"{primary}_{secondary}" for primary, secondary in _iter_pair_dates(stack.pairs)

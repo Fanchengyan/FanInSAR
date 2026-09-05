@@ -13,7 +13,7 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.stack.artifact_transaction import (
+from faninsar.stack.artifact_transaction import (
     ArtifactResourceLimits,
     GenerationLease,
     canonical_json,

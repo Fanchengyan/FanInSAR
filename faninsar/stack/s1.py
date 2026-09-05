@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Any, Self
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_pair_configuration
-from faninsar.processing.stack.provider import SourceHandle, StackSceneProvider
-from faninsar.processing.stack.session import Stack
+from faninsar.stack.provider import SourceHandle, StackSceneProvider
+from faninsar.stack.session import Stack
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

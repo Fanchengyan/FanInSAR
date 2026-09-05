@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 from faninsar.compute.numpy_backend import NumpyBackend
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_pair_configuration
-from faninsar.processing.stack.mask_plan import MaskPlan
+from faninsar.stack.mask_plan import MaskPlan
 
 if TYPE_CHECKING:
     from faninsar.ports.compute import ComputeBackend
@@ -48,7 +48,7 @@ def run(
     Returns
     -------
     Any
-        The prepared and processed :class:`~faninsar.processing.stack.Stack`.
+        The prepared and processed :class:`~faninsar.stack.Stack`.
 
     Raises
     ------
@@ -111,7 +111,7 @@ def run(
     compute = _resolve_backend(backend)
     del compute
 
-    from faninsar.processing.stack import Stack
+    from faninsar.stack import Stack
 
     kwargs: dict[str, Any] = {}
     if "swaths" in cfg:

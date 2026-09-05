@@ -208,7 +208,7 @@ def run_frame_cli(
     roi_box = _parse_roi(roi)
     from faninsar.processing.dem import DEM
     from faninsar.processing.pipeline.production import resolve_auto_dem
-    from faninsar.processing.stack import Stack
+    from faninsar.stack import Stack
 
     dem_sampler = None
     if dem is not None:

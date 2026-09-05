@@ -60,17 +60,17 @@ from faninsar.processing.interferometry.phase_filter import (
     GoldsteinWerner,
     PhaseFilter,
 )
-from faninsar.processing.stack.catalog import SceneCatalog
-from faninsar.processing.stack.config import (
+from faninsar.stack.catalog import SceneCatalog
+from faninsar.stack.config import (
     ActivationMode,
     CoregMode,
     EsdMethod,
     FlattenStage,
     StackConfig,
 )
-from faninsar.processing.stack.mask_plan import MaskPlan, StageName
-from faninsar.processing.stack.provider import SourceHandle
-from faninsar.processing.stack.scene_store import (
+from faninsar.stack.mask_plan import MaskPlan, StageName
+from faninsar.stack.provider import SourceHandle
+from faninsar.stack.scene_store import (
     CoregisteredSceneStore,
     copy_reference_units,
     form_merged_scene_interferogram,
@@ -97,12 +97,12 @@ if TYPE_CHECKING:
         ProductionPairState,
     )
     from faninsar.processing.resources import ResourceBudget
-    from faninsar.processing.stack.ifg_store import (
+    from faninsar.stack.ifg_store import (
         InterferogramArtifactStore,
         UnwrappedArtifact,
     )
-    from faninsar.processing.stack.provider import StackSceneProvider
-    from faninsar.processing.stack.stack_generation import StackResultGeneration
+    from faninsar.stack.provider import StackSceneProvider
+    from faninsar.stack.stack_generation import StackResultGeneration
     from faninsar.processing.timeseries.inversion import TimeSeriesResult
     from faninsar.processing.unwrap.common import SpatialUnwrapper
     from faninsar.processing.unwrap.quality import StackQualityCriteria
@@ -865,7 +865,7 @@ class Stack(NetworkContract):
         unioned deterministically from ``StackConfig.extra``.
 
         """
-        from faninsar.processing.stack.grid import resolve_stack_grid
+        from faninsar.stack.grid import resolve_stack_grid
 
         selected_roi = self.config.roi if roi is None else roi
         if selected_roi is None:
@@ -965,7 +965,7 @@ class Stack(NetworkContract):
         spelling on ``Stack`` lets older callers migrate without giving the
         mission-neutral session a production implementation of its own.
         """
-        from faninsar.processing.stack.s1 import S1Stack
+        from faninsar.stack.s1 import S1Stack
 
         if "master" in kwargs:
             from faninsar.processing.errors import reject_pair_configuration
@@ -1121,7 +1121,7 @@ class Stack(NetworkContract):
         authority_root = self.config.activation_authority_root
         if authority_root is None:
             reject_invalid_state("qualified Stack activation authority is missing")
-        from faninsar.processing.stack.activation import LocalActivationAuthority
+        from faninsar.stack.activation import LocalActivationAuthority
 
         authority = LocalActivationAuthority.open(authority_root)
         _ = authority.verify_token(token)
@@ -1165,7 +1165,7 @@ class Stack(NetworkContract):
         authority_root = self.config.activation_authority_root
         if authority_root is None:
             reject_invalid_state("qualified Stack activation authority is missing")
-        from faninsar.processing.stack.activation import LocalActivationAuthority
+        from faninsar.stack.activation import LocalActivationAuthority
 
         authority = LocalActivationAuthority.open(authority_root)
         _ = authority.verify_token(token)
@@ -1706,7 +1706,7 @@ class Stack(NetworkContract):
         fails closed rather than guessing how to open or produce a source.
         """
         if self.scene_provider is None:
-            from faninsar.processing.stack.provider import (
+            from faninsar.stack.provider import (
                 UnsupportedStackCapabilityError,
             )
 
@@ -2565,7 +2565,7 @@ class Stack(NetworkContract):
                 expected_filter_name = filter_name
                 expected_filter_parameters = filter_parameters
                 if (sub / "manifest.json").exists():
-                    from faninsar.processing.stack.ifg_store import (
+                    from faninsar.stack.ifg_store import (
                         InterferogramArtifactStore,
                     )
 
@@ -2630,7 +2630,7 @@ class Stack(NetworkContract):
                 finally:
                     if reservation is not None:
                         reservation.release()
-                from faninsar.processing.stack.ifg_store import write_ifg_artifact
+                from faninsar.stack.ifg_store import write_ifg_artifact
 
                 # PROPOSAL-0039 (AC-5): the active mask is a support input
                 # intersected into the persisted valid_mask AFTER formation
@@ -2685,7 +2685,7 @@ class Stack(NetworkContract):
         replaced, so a partial or mixed generation leaves the previous index
         untouched.
         """
-        from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
+        from faninsar.stack.ifg_store import InterferogramArtifactStore
 
         if not self.ifg_dirs:
             reject_invalid_state(
@@ -2855,7 +2855,7 @@ class Stack(NetworkContract):
         Existing IFG product records supply the shared acquisition and grid
         metadata; this method only adds the newly committed spatial layers.
         """
-        from faninsar.processing.stack.stack_generation import UnwrapResultGeneration
+        from faninsar.stack.stack_generation import UnwrapResultGeneration
 
         if not isinstance(generation, UnwrapResultGeneration):
             logger.error("Stack unwrap refresh received an invalid generation")
@@ -2930,7 +2930,7 @@ class Stack(NetworkContract):
 
     def refresh_unwrap_generation(self) -> Self:
         """Rebuild the Network cache from the durable ``UNWRAP_CURRENT`` root."""
-        from faninsar.processing.stack.stack_generation import open_unwrap_generation
+        from faninsar.stack.stack_generation import open_unwrap_generation
 
         generation = open_unwrap_generation(self.config.work_dir)
         previous = self._unwrap_generation
@@ -3028,7 +3028,7 @@ class Stack(NetworkContract):
             estimate_unwrap_decode_resources,
             reserve_estimate,
         )
-        from faninsar.processing.stack.stack_generation import (
+        from faninsar.stack.stack_generation import (
             publish_unwrap_generation,
         )
         from faninsar.processing.unwrap.common import (
@@ -3282,7 +3282,7 @@ class Stack(NetworkContract):
             This session with :attr:`unwrap_result` populated.
 
         """
-        from faninsar.processing.stack.ifg_store import write_unwrapped_artifact
+        from faninsar.stack.ifg_store import write_unwrapped_artifact
         from faninsar.processing.unwrap.quality import (
             MetricDistribution,
             StackQualityCriteria,
@@ -3634,13 +3634,13 @@ class Stack(NetworkContract):
         """Estimate per-pair ionospheric screens (PROPOSAL-0036).
 
         See
-        :func:`faninsar.processing.stack.stack_api.estimate_ionosphere`
+        :func:`faninsar.stack.stack_api.estimate_ionosphere`
         for the full parameter contract.
 
         The explicit ``ionosphere`` mask stage feeds the estimator's existing
         ``valid_mask`` seam unless the caller supplies one.
         """
-        from faninsar.processing.stack.stack_api import estimate_ionosphere
+        from faninsar.stack.stack_api import estimate_ionosphere
 
         if (
             self.config.mask_plan.references("ionosphere")
@@ -3655,10 +3655,10 @@ class Stack(NetworkContract):
         """Subtract qualified ion screens from unwrapped pair phases.
 
         See
-        :func:`faninsar.processing.stack.stack_api.apply_ionosphere_correction`
+        :func:`faninsar.stack.stack_api.apply_ionosphere_correction`
         for the full parameter contract.
         """
-        from faninsar.processing.stack.stack_api import apply_ionosphere_correction
+        from faninsar.stack.stack_api import apply_ionosphere_correction
 
         return apply_ionosphere_correction(self, **kwargs)
 
@@ -3666,10 +3666,10 @@ class Stack(NetworkContract):
         """Invert published pair ion screens into per-date screens.
 
         See
-        :func:`faninsar.processing.stack.stack_api.invert_ionosphere_dates`
+        :func:`faninsar.stack.stack_api.invert_ionosphere_dates`
         for the full parameter contract.
         """
-        from faninsar.processing.stack.stack_api import invert_ionosphere_dates
+        from faninsar.stack.stack_api import invert_ionosphere_dates
 
         return invert_ionosphere_dates(self, **kwargs)
 
@@ -3699,7 +3699,7 @@ class Stack(NetworkContract):
             the generation is no longer needed.
 
         """
-        from faninsar.processing.stack.stack_generation import (
+        from faninsar.stack.stack_generation import (
             publish_stack_generation,
         )
 
@@ -3733,7 +3733,7 @@ class Stack(NetworkContract):
 
     def open_generation(self) -> StackResultGeneration:
         """Open the current complete derived-result generation for this Stack."""
-        from faninsar.processing.stack.stack_generation import open_stack_generation
+        from faninsar.stack.stack_generation import open_stack_generation
 
         generation = open_stack_generation(self.config.work_dir)
         expected_pair_ids = tuple(
@@ -3844,7 +3844,7 @@ class Stack(NetworkContract):
         ifg_root: str | Path | None,
     ) -> list[InterferogramArtifactStore]:
         """Open the exact ordered common-grid artifact set for this Stack."""
-        from faninsar.processing.stack.ifg_store import InterferogramArtifactStore
+        from faninsar.stack.ifg_store import InterferogramArtifactStore
 
         azimuth_looks, range_looks = (int(looks[0]), int(looks[1]))
         root = (
