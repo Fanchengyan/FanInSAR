@@ -151,7 +151,7 @@ def test_canonical_reader_accepts_existing_generation_revision(
         "schema_version": "network_current_v1",
         "status": "writing",
     }))
-    monkeypatch.setattr("faninsar.datasets.network._legacy_markers", lambda _: ())
+    monkeypatch.setattr("faninsar.network.network._legacy_markers", lambda _: ())
     network = Network.open(root, revision="generation-1")
     assert network.manifest["generation_id"] == "generation-1"
 

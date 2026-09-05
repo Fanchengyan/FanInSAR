@@ -100,7 +100,7 @@ def __getattr__(name: str) -> Any:
         "S1Stack",
         "Stack",
     }:
-        from faninsar.datasets.network import (
+        from faninsar.network.network import (
             GAMMANetwork,
             GMTSARNetwork,
             IncompleteNetworkError,

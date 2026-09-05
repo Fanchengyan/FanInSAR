@@ -13,24 +13,51 @@ from .registry import (
     ReaderRegistry,
     ReaderRegistryError,
 )
+from .network import (
+    ExternalNetworkLayoutError,
+    GAMMANetwork,
+    IncompleteNetworkError,
+    IncompleteNetworkProductError,
+    ISCE2Network,
+    ISCE3Network,
+    LegacyLayoutError,
+    LegacyNetworkLayoutError,
+    Network,
+    NetworkAnalysisError,
+    NetworkConstructionError,
+    NetworkCurrentError,
+    NetworkGenerationError,
+    NetworkLayoutError,
+    NetworkManifestError,
+    NetworkPathError,
+    SNAPNetwork,
+    UnknownNetworkIndexTypeError,
+)
 
 __all__ = [
     "ENTRY_POINT_GROUP",
     "DuplicateReaderError",
     "InvalidReaderError",
+    "ExternalNetworkLayoutError",
+    "GAMMANetwork",
+    "IncompleteNetworkError",
+    "IncompleteNetworkProductError",
+    "ISCE2Network",
+    "ISCE3Network",
+    "LegacyLayoutError",
+    "LegacyNetworkLayoutError",
     "Network",
+    "NetworkAnalysisError",
+    "NetworkConstructionError",
+    "NetworkCurrentError",
+    "NetworkGenerationError",
+    "NetworkLayoutError",
+    "NetworkManifestError",
     "NetworkReader",
+    "NetworkPathError",
     "ReaderNotFoundError",
     "ReaderRegistry",
     "ReaderRegistryError",
+    "SNAPNetwork",
+    "UnknownNetworkIndexTypeError",
 ]
-
-
-def __getattr__(name: str) -> Any:
-    """Resolve the data-backed Network lazily to avoid import cycles."""
-    if name == "Network":
-        from .network import Network
-
-        return Network
-    message = f"module {__name__!r} has no attribute {name!r}"
-    raise AttributeError(message)

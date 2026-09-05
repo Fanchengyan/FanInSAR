@@ -43,7 +43,7 @@ from faninsar.core.network import (
 from faninsar.core.network import (
     Network as NetworkContract,
 )
-from faninsar.datasets.network import Network
+from faninsar.network.network import Network
 from faninsar.logging import setup_logger
 from faninsar.processing.coreg.misreg_network import (
     DateMisreg,
