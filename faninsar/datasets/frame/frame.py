@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     import pystac
 
     from faninsar.datasets.frame.remote import RemoteFrame
-    from faninsar.datasets.geogrid import GeoGrid
+    from faninsar.data.datasets.geogrid import GeoGrid
 
 logger = setup_logger(__name__)
 
@@ -39,7 +39,7 @@ def _grid_from_geometry(geometry: FrameGeometry) -> GeoGrid | None:
     width = meta.get("width")
     if not all(v is not None for v in (bounds, crs, height, width)):
         return None
-    from faninsar.datasets.geogrid import GeoGrid
+    from faninsar.data.datasets.geogrid import GeoGrid
 
     return GeoGrid.from_bounds(bounds, crs=crs, shape=(height, width), tight=True)
 

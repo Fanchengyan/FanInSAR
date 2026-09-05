@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from faninsar.datasets.xarray_dataset import XarrayDataSpec
+    from faninsar.data.datasets.xarray_dataset import XarrayDataSpec
 
 
 class HierarchicalMixin:

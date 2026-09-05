@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike
     from rasterio.profiles import Profile as RasterioProfile
 
-    from faninsar.query.bbox import BoundingBox
+    from faninsar.data.query.bbox import BoundingBox
     from faninsar.typing import CrsLike
 
 logger = setup_logger(__name__)
@@ -99,7 +99,7 @@ def bounds_from_xy(
         :meth:`pyproj.CRS.from_user_input`. Default is "WGS84".
 
     """
-    from faninsar.query.bbox import BoundingBox
+    from faninsar.data.query.bbox import BoundingBox
 
     width, height = len(x), len(y)
     tf = transform_from_xy(x, y, loc=loc)
@@ -140,7 +140,7 @@ def geoinfo_from_xy(
         the shape of the raster
 
     """
-    from faninsar.query.bbox import BoundingBox
+    from faninsar.data.query.bbox import BoundingBox
 
     tf = transform_from_xy(x, y, loc=loc)
     res = (abs(tf.a), abs(tf.e))

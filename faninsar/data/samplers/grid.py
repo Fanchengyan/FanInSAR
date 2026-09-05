@@ -9,16 +9,16 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 from torch.utils.data import Sampler
 
+from faninsar.data.query import BoundingBox
+from faninsar.data.samplers._collate import identity_collate, tensor_collate
 from faninsar.logging import setup_logger
-from faninsar.query import BoundingBox
-from faninsar.samplers._collate import identity_collate, tensor_collate
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
 
     from torch.utils.data import DataLoader
 
-    from faninsar.datasets import GeoDataset
+    from faninsar.data.datasets import GeoDataset
 
 logger = setup_logger(__name__)
 

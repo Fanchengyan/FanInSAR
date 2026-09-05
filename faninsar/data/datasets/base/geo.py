@@ -1,4 +1,4 @@
-"""GeoDataset base class extracted from faninsar.datasets.base."""
+"""GeoDataset base class extracted from faninsar.data.datasets.base."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from rtree.index import Index, Property
 from shapely import ops
 from torch.utils.data import Dataset
 
+from faninsar.data.query import BoundingBox, Points, Polygons
 from faninsar.logging import setup_logger
-from faninsar.query import BoundingBox, Points, Polygons
 
 if TYPE_CHECKING:
     from faninsar._core.geo import Profile

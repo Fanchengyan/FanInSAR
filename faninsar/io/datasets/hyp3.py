@@ -7,7 +7,7 @@ import numpy as np
 from faninsar._core.file_tools import load_meta
 from faninsar.core import Baselines, Pairs
 from faninsar.core.sar_missions import Sentinel1
-from faninsar.datasets.ifg import InterferogramDataset
+from faninsar.data.datasets.ifg import InterferogramDataset
 
 
 class HyP3S1(InterferogramDataset, Sentinel1):

@@ -13,7 +13,7 @@ import rasterio
 from rasterio.enums import Resampling
 
 from faninsar.core.pairs import Pairs
-from faninsar.datasets.base import PairDataset, TimeSeriesDataset
+from faninsar.data.datasets.base import PairDataset, TimeSeriesDataset
 from faninsar.logging import setup_logger
 
 logger = setup_logger(__name__)
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
     from pyproj.crs.crs import CRS
 
-    from faninsar.query import BoundingBox, Points
+    from faninsar.data.query import BoundingBox, Points
 
 
 class ApsDataset(TimeSeriesDataset, ABC):

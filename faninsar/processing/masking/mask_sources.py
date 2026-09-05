@@ -46,12 +46,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from faninsar.data.query import BoundingBox
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import dem_sources as _dem_sources
 from faninsar.processing.geometry.dem_sources import _bounds_tuple
 from faninsar.processing.geometry.dem_transport import FetchPlan, Tile, TileSet
-from faninsar.query import BoundingBox
 
 logger = setup_logger(__name__)
 

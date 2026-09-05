@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from faninsar._core.device import GpuMemoryReclaim
     from faninsar.core.acquisition import Acquisition
     from faninsar.core.pairs import Pairs
+    from faninsar.data.query import BoundingBox, Polygons
     from faninsar.processing.contracts.prepared_geometry import (
         ActivationToken,
         StackActivationBinding,
@@ -106,7 +107,6 @@ if TYPE_CHECKING:
     from faninsar.processing.unwrap.common import SpatialUnwrapper
     from faninsar.processing.unwrap.quality import StackQualityCriteria
     from faninsar.processing.unwrap.stack import SpatialExecutor, StackUnwrapResult
-    from faninsar.query import BoundingBox, Polygons
 
 logger = setup_logger(__name__)
 
@@ -196,7 +196,7 @@ class _EffectiveRoi:
     ----------
     roi
         ROI feeding the existing burst-selection path: the original ROI when
-        the mask is inactive or unresolvable, a :class:`~faninsar.query.\
+        the mask is inactive or unresolvable, a :class:`~faninsar.data.query.\
 Polygons` wrapping the subtracted geometry when reshaped, or ``None``
         when no ROI was configured.
     geometry
@@ -223,7 +223,7 @@ def _roi_to_geometry(roi: object) -> Any:
     """
     from shapely.geometry import box
 
-    from faninsar.query import BoundingBox
+    from faninsar.data.query import BoundingBox
 
     if isinstance(roi, BoundingBox):
         return box(roi.left, roi.bottom, roi.right, roi.top)
@@ -256,7 +256,7 @@ def _effective_roi_polygons(parts: list[Any]) -> object:
     """Wrap polygonal effective-ROI parts into a Polygons object."""
     import geopandas as gpd
 
-    from faninsar.query import Polygons
+    from faninsar.data.query import Polygons
 
     return Polygons(
         gpd.GeoDataFrame(geometry=parts, crs="EPSG:4326"),
@@ -3020,7 +3020,7 @@ class Stack(NetworkContract):
         import torch
 
         from faninsar._core.device import parse_device
-        from faninsar.datasets.ifg import StackInterferogramDataset
+        from faninsar.data.datasets.ifg import StackInterferogramDataset
         from faninsar.processing.resources import (
             ResourceAdmissionError,
             ResourceAdmissionLedger,

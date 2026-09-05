@@ -6,7 +6,7 @@ from pathlib import Path
 
 from faninsar.core.pairs import Pairs
 from faninsar.core.sar_missions import Sentinel1
-from faninsar.datasets.ifg import HierarchicalInterferogramDataset
+from faninsar.data.datasets.ifg import HierarchicalInterferogramDataset
 
 
 class ARIA(HierarchicalInterferogramDataset, Sentinel1):

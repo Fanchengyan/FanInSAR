@@ -66,6 +66,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
+from faninsar.data.query import BoundingBox
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry.dem_sources import _bounds_tuple
@@ -93,7 +94,6 @@ from faninsar.processing.masking.mask_sources import (
     MaskSourceUnavailableError,
     get_mask_source,
 )
-from faninsar.query import BoundingBox
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
-from faninsar.datasets.aps import ApsDataset, ApsPairs
+from faninsar.data.datasets.aps import ApsDataset, ApsPairs
 
 if TYPE_CHECKING:
     from os import PathLike
 
     from faninsar.core.pairs import Pairs
-    from faninsar.query.query import BoundingBox, Points
+    from faninsar.data.query.query import BoundingBox, Points
 
 
 class GACOS(ApsDataset):
@@ -26,9 +26,9 @@ class GACOS(ApsDataset):
 
     Examples
     --------
-    >>> from faninsar.datasets import GACOS
-    >>> from faninsar.datasets import HyP3
-    >>> from faninsar.query import BoundingBox, Points
+    >>> from faninsar.data.datasets import GACOS
+    >>> from faninsar.data.datasets import HyP3
+    >>> from faninsar.data.query import BoundingBox, Points
 
     >>> hyp3_dir = Path("data/hyp3/descending_roi")
     >>> home_dir = Path("data/hyp3/descending_gacos")

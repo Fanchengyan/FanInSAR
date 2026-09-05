@@ -1,4 +1,4 @@
-"""TimeSeriesDataset base class extracted from faninsar.datasets.base."""
+"""TimeSeriesDataset base class extracted from faninsar.data.datasets.base."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pandas as pd
 import rioxarray  # noqa: F401
 
 from faninsar import Acquisition
-from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
+from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
 
 from .raster import RasterDataset
 

@@ -11,8 +11,8 @@ import rioxarray  # noqa: F401
 from rasterio.dtypes import dtype_ranges
 
 from faninsar.core.pairs import Pairs
+from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
 from faninsar.logging import setup_logger
-from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 
 logger = setup_logger(__name__)
 

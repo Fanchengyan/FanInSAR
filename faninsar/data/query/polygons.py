@@ -250,7 +250,7 @@ class Polygons:
         """Return a GeoDataFrame of the polygons.
 
         This method is an alias of :attr:`geodataframe` for API consistency with
-        :class:`~faninsar.query.Points` and :class:`BoundingBox`.
+        :class:`~faninsar.data.query.Points` and :class:`BoundingBox`.
         """
         return self.geodataframe
 

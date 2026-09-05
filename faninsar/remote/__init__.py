@@ -36,8 +36,8 @@ from shapely.geometry import Point, box, mapping, shape
 from shapely.ops import transform as shapely_transform
 from shapely.ops import unary_union
 
+from faninsar.data.query import BoundingBox, Points, Polygons
 from faninsar.logging import setup_logger
-from faninsar.query import BoundingBox, Points, Polygons
 
 logger = setup_logger(__name__)
 

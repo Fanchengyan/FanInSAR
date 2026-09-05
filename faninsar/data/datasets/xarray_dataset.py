@@ -13,8 +13,8 @@ Basic usage:
 
 >>> from pathlib import Path
 >>> from pyproj.crs import CRS
->>> from faninsar.datasets.xarray_dataset import XarrayDataset
->>> from faninsar.query.bbox import BoundingBox
+>>> from faninsar.data.datasets.xarray_dataset import XarrayDataset
+>>> from faninsar.data.query.bbox import BoundingBox
 >>> dataset = XarrayDataset(paths=[Path("tile.tif")])
 >>> bbox = BoundingBox(0, 0, 100, 100, crs=CRS.from_epsg(4326))
 >>> data = dataset.boxes_query(bbox)
@@ -45,18 +45,18 @@ from rasterio.enums import Resampling
 from rasterio.transform import Affine, array_bounds
 from tqdm import tqdm
 
-from faninsar.datasets.base.geo import GeoDataset
-from faninsar.datasets.geogrid import GeoGrid as GeoBox
+from faninsar.data.datasets.base.geo import GeoDataset
+from faninsar.data.datasets.geogrid import GeoGrid as GeoBox
+from faninsar.data.query.bbox import BoundingBox
 from faninsar.logging import setup_logger
-from faninsar.query.bbox import BoundingBox
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
     from rasterio.windows import Window
 
-    from faninsar.query.points import Points
-    from faninsar.query.polygons import Polygons
+    from faninsar.data.query.points import Points
+    from faninsar.data.query.polygons import Polygons
     from faninsar.typing import ResamplingLike
 
 __all__ = ["FileMetadata", "XarrayDataSpec", "XarrayDataset"]

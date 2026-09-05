@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict, overload
 
 import numpy as np
 
+from faninsar.data.query import BoundingBox, Polygons
 from faninsar.logging import setup_logger
 from faninsar.missions.sentinel1 import (
     open_safe_product,
@@ -76,7 +77,6 @@ from faninsar.processing.tops.carrier import carrier_from_swath
 from faninsar.processing.tops.deramp import TOPSCarrierModel, deramp, reramp
 from faninsar.processing.unwrap import SnaphuConfig, UnwrapBackend
 from faninsar.processing.unwrap import unwrap as unwrap_dispatch
-from faninsar.query import BoundingBox, Polygons
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

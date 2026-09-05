@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike
     from odc.geo import GeoBox
 
-    from faninsar.query.bbox import BoundingBox
+    from faninsar.data.query.bbox import BoundingBox
     from faninsar.typing import CrsLike
 
 logger = setup_logger(__name__)
@@ -315,7 +315,7 @@ class GeoGridMixin:
 
     def _parse_bounds(self) -> BoundingBox:
         """Parse the bounds from geogrid data."""
-        from faninsar.query.bbox import BoundingBox
+        from faninsar.data.query.bbox import BoundingBox
 
         west, south, east, north = array_bounds(self.height, self.width, self.transform)
         left = min(west, east)
@@ -689,7 +689,7 @@ def format_bounds_and_crs(
     crs: CrsLike | None = None,
 ) -> tuple[BoundingBox, CRS | None]:
     """Get the formatted bounds and crs from the input."""
-    from faninsar.query.bbox import BoundingBox
+    from faninsar.data.query.bbox import BoundingBox
 
     if not isinstance(bounds, BoundingBox):
         left, bottom, right, top = bounds

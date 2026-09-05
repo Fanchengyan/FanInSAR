@@ -12,9 +12,9 @@ This architecture enables hierarchical datasets to be combined with temporal
 
 See Also
 --------
-faninsar.datasets.xarray_dataset
+faninsar.data.datasets.xarray_dataset
     Base implementation with Xarray-backed queries and GeoDataset integration.
-faninsar.datasets.base.hierarchical
+faninsar.data.datasets.base.hierarchical
     Mixin providing hierarchical container support.
 
 """
@@ -26,10 +26,10 @@ from typing import TYPE_CHECKING
 
 from rasterio.enums import Resampling
 
-from faninsar.datasets.base.hierarchical import HierarchicalMixin
-from faninsar.datasets.base.pair import PairDataset
-from faninsar.datasets.base.timeseries import TimeSeriesDataset
-from faninsar.datasets.xarray_dataset import XarrayDataset, XarrayDataSpec
+from faninsar.data.datasets.base.hierarchical import HierarchicalMixin
+from faninsar.data.datasets.base.pair import PairDataset
+from faninsar.data.datasets.base.timeseries import TimeSeriesDataset
+from faninsar.data.datasets.xarray_dataset import XarrayDataset, XarrayDataSpec
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import xarray as xr
 
-from faninsar.datasets.geogrid import GeoGrid
+from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.logging import setup_logger
 
 from .exceptions import (
@@ -39,8 +39,8 @@ if TYPE_CHECKING:
     import pystac
 
     from faninsar.datasets.frame.interferogram import FrameInterferogramCollection
-    from faninsar.datasets.xarray_dataset import XarrayDataset
-    from faninsar.query import BoundingBox
+    from faninsar.data.datasets.xarray_dataset import XarrayDataset
+    from faninsar.data.query import BoundingBox
 
 logger = setup_logger(__name__)
 
@@ -72,7 +72,7 @@ class FrameGeometry:
 
     Clip with a bounding box:
 
-    >>> from faninsar.query import BoundingBox
+    >>> from faninsar.data.query import BoundingBox
     >>> bbox = BoundingBox(10.0, 45.0, 11.0, 46.0, crs="EPSG:4326")
     >>> clipped = geom.clip_bbox("incidence", bbox)
 
@@ -620,7 +620,7 @@ class FrameGeometry:
 
         This bridges the geometry asset to FanInSAR's existing
         :class:`~faninsar.datasets.XarrayDataset` query system, enabling
-        :class:`~faninsar.query.BoundingBox`-based ``boxes_query`` workflows.
+        :class:`~faninsar.data.query.BoundingBox`-based ``boxes_query`` workflows.
 
         Parameters
         ----------
@@ -638,7 +638,7 @@ class FrameGeometry:
             If the named asset does not exist on disk.
 
         """
-        from faninsar.datasets.xarray_dataset import XarrayDataset
+        from faninsar.data.datasets.xarray_dataset import XarrayDataset
 
         asset_path = self.path(name)
         if not asset_path.exists():

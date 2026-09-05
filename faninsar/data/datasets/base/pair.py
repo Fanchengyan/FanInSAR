@@ -1,4 +1,4 @@
-"""PairDataset base class extracted from faninsar.datasets.base."""
+"""PairDataset base class extracted from faninsar.data.datasets.base."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import pandas as pd
 import rioxarray  # noqa: F401
 
 from faninsar.core.pairs import Pairs
+from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
 from faninsar.logging import setup_logger
-from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 
 from .raster import RasterDataset
 

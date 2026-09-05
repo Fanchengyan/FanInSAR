@@ -9,7 +9,7 @@ compatibility methods for BoundingBox-based APIs. The class is named
 See Also
 --------
 odc.geo.GeoBox : Base class with full geobox functionality
-faninsar.query.bbox : BoundingBox primitives
+faninsar.data.query.bbox : BoundingBox primitives
 
 """
 
@@ -26,8 +26,8 @@ from rasterio.transform import rowcol
 from rasterio.windows import Window
 from rasterio.windows import transform as _window_transform
 
+from faninsar.data.query.bbox import BoundingBox
 from faninsar.logging import setup_logger
-from faninsar.query.bbox import BoundingBox
 
 if TYPE_CHECKING:
     from affine import Affine

@@ -28,9 +28,9 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
+from faninsar.data.query import BoundingBox
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.query import BoundingBox
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -1065,7 +1065,7 @@ class AuthenticatedGranuleSource(DemSource):
         budget: object | None = None,
     ) -> tuple[object, ...]:
         """Discover provider assets through the registered remote CMR adapter."""
-        from faninsar.query import BoundingBox
+        from faninsar.data.query import BoundingBox
         from faninsar.remote import RemoteResourceBudget, _register_adapter, search
         from faninsar.remote.cmr import CMRCollectionAdapter
 
@@ -1333,7 +1333,7 @@ class PcStacSource(DemSource):
         self, plan: DeferredStacPlan, *, budget: object | None = None
     ) -> tuple[object, ...]:
         """Return immutable RemoteAsset values for a deferred PC plan."""
-        from faninsar.query import BoundingBox
+        from faninsar.data.query import BoundingBox
         from faninsar.remote import RemoteResourceBudget, _register_adapter, search
         from faninsar.remote.providers.planetary_computer import (
             PlanetaryComputerAdapter,

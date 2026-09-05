@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
+from faninsar.data.query import BoundingBox
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry.dem_sources import (
@@ -47,7 +48,6 @@ from faninsar.processing.geometry.dem_transport import (
     expand_tile_parts,
     fetch_plan,
 )
-from faninsar.query import BoundingBox
 
 logger = setup_logger(__name__)
 

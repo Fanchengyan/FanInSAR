@@ -10,7 +10,7 @@ import numpy as np
 import xarray as xr
 
 from faninsar.core import Pairs
-from faninsar.datasets.geogrid import GeoGrid
+from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.logging import setup_logger
 
 from .exceptions import (
@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     import pystac
 
     from faninsar.datasets.frame.geometry import FrameGeometry
-    from faninsar.datasets.ifg import InterferogramDataset
+    from faninsar.data.datasets.ifg import InterferogramDataset
 
 logger = setup_logger(__name__)
 
@@ -148,7 +148,7 @@ class FrameInterferogramCollection:
     --------
     Build from an existing FanInSAR dataset:
 
-    >>> from faninsar.datasets import HyP3S1
+    >>> from faninsar.data.datasets import HyP3S1
     >>> ds = HyP3S1(root_dir="/path/to/hyp3_products")
     >>> ifgs = FrameInterferogramCollection.from_dataset(
     ...     out_dir="frame",
@@ -1062,7 +1062,7 @@ class FrameInterferogramCollection:
         This bridges the frame product to the existing FanInSAR query system.
 
         """
-        from faninsar.datasets.ifg import InterferogramDataset
+        from faninsar.data.datasets.ifg import InterferogramDataset
 
         pairs_obj = self.pairs()
         pair_names = pairs_obj.to_names().tolist() if len(pairs_obj) > 0 else []

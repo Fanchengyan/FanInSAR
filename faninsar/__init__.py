@@ -151,7 +151,7 @@ def __getattr__(name: str) -> Any:
         from faninsar.processing.dem.api import DEM
         from faninsar.processing.stack.config import StackConfig
         from faninsar.processing.timeseries.inversion import TimeSeriesResult
-        from faninsar.query import BoundingBox, Points, Polygons
+        from faninsar.data.query import BoundingBox, Points, Polygons
 
         values = {
             "TimeSeries": TimeSeriesResult,

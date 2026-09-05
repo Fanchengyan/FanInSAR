@@ -11,7 +11,7 @@ from faninsar.processing.errors import reject_pair_configuration
 if TYPE_CHECKING:
     import numpy as np
 
-    from faninsar.query import BoundingBox
+    from faninsar.data.query import BoundingBox
 
 logger = setup_logger(__name__)
 
@@ -25,7 +25,7 @@ def _parse_roi(value: str | None) -> BoundingBox | None:
     """Parse ``lon_min,lat_min,lon_max,lat_max`` into a BoundingBox."""
     if value is None:
         return None
-    from faninsar.query import BoundingBox
+    from faninsar.data.query import BoundingBox
 
     parts = [part.strip() for part in value.split(",")]
     if len(parts) != 4:

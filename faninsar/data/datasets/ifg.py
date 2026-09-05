@@ -15,8 +15,8 @@ from rasterio.enums import Resampling
 from tqdm import tqdm
 
 from faninsar.core import Pairs
+from faninsar.data.query import BoundingBox, GeoQuery, Points
 from faninsar.logging import setup_logger
-from faninsar.query import BoundingBox, GeoQuery, Points
 
 from . import PairDataset, RasterDataset
 from .aps import ApsPairs

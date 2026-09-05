@@ -266,7 +266,7 @@ class PcStacSource:
         for window in plan.windows:
             # ``remote.search`` returns immutable RemoteAsset descriptors;
             # no provider SDK object crosses back into the DEM layer.
-            from faninsar.query import BoundingBox
+            from faninsar.data.query import BoundingBox
 
             items = search(
                 BoundingBox(*window, crs=4326),

@@ -1,4 +1,4 @@
-"""RasterDataset base class extracted from faninsar.datasets.base."""
+"""RasterDataset base class extracted from faninsar.data.datasets.base."""
 
 from __future__ import annotations
 
@@ -32,9 +32,9 @@ from faninsar._core.geo import (
     bounds_from_xy,
     xy_from_transform,
 )
+from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
 from faninsar.io.lazy_rasterio import LazyMultiFileReader
 from faninsar.logging import setup_logger
-from faninsar.query import BoundingBox, GeoQuery, Points, Polygons
 
 from ._base_common import (
     _serialize_bbox,
@@ -61,8 +61,8 @@ class RasterDataset(GeoDataset):
     Examples
     --------
     >>> from pathlib import Path
-    >>> from faninsar.datasets import RasterDataset
-    >>> from faninsar.query import BoundingBox, GeoQuery, Points,
+    >>> from faninsar.data.datasets import RasterDataset
+    >>> from faninsar.data.query import BoundingBox, GeoQuery, Points,
     >>> home_dir = Path("./work/data")
     >>> files = list(home_dir.rglob("*unw_phase.tif"))
 

@@ -11,7 +11,7 @@ from rasterio.enums import Resampling
 from rasterio.warp import reproject
 
 from faninsar._core.geo import Profile
-from faninsar.datasets.geogrid import GeoGrid
+from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.logging import setup_logger
 
 from .exceptions import COGValidationError

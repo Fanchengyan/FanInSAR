@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
     import xarray as xr
 
-    from faninsar.query.bbox import BoundingBox
+    from faninsar.data.query.bbox import BoundingBox
 
 logger = setup_logger(__name__)
 
@@ -78,7 +78,7 @@ def _normalize_kml_bounds(
         If ``bounds`` is not an iterable of four floats or a bounding box.
 
     """
-    from faninsar.query.bbox import BoundingBox
+    from faninsar.data.query.bbox import BoundingBox
 
     wgs84 = CRS.from_epsg(4326)
     if isinstance(bounds, BoundingBox):
@@ -433,7 +433,7 @@ def _pixel_window_to_bounds(
         Geographic bounds for the requested pixel window.
 
     """
-    from faninsar.query.bbox import BoundingBox
+    from faninsar.data.query.bbox import BoundingBox
 
     lon_span = image_bounds.right - image_bounds.left
     lat_span = image_bounds.top - image_bounds.bottom

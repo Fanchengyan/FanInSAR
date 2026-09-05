@@ -9,7 +9,7 @@ import pandas as pd
 
 from faninsar.core.pairs import Pairs
 from faninsar.core.sar_missions import Sentinel1
-from faninsar.datasets.ifg import InterferogramDataset
+from faninsar.data.datasets.ifg import InterferogramDataset
 
 
 class LiCSAR(InterferogramDataset, Sentinel1):
