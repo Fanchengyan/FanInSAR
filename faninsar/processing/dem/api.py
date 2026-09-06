@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING, Literal, Self
 import numpy as np
 from affine import Affine
 
-from faninsar.processing.geometry.grids import GridSpec
 from faninsar.logging import setup_logger
+from faninsar.processing.geometry.grids import GridSpec
 
 from .resources import preflight_grid
 

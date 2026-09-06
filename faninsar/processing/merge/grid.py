@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.processing.geometry.grids import GridSpec
 from faninsar.logging import setup_logger
+from faninsar.processing.geometry.grids import GridSpec
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

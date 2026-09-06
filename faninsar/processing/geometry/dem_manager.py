@@ -442,7 +442,7 @@ class DEMManager:
         """Resolve a selection string, handling the ``auto`` alias fail-closed."""
         if selection == AUTO_SOURCE_NAME:
             return get_dem_source(AUTO_SOURCE_NAME)
-        if selection.split(":")[0] == AUTO_SOURCE_NAME:
+        if selection.split(":", maxsplit=1)[0] == AUTO_SOURCE_NAME:
             message = (
                 f"invalid DEM source {selection!r}: 'auto' accepts no "
                 "provider override; select the underlying product "
@@ -735,7 +735,7 @@ class DEMManager:
             return executed
         members: list[Path] = []
         for sub in getattr(plan, "artifacts", ()):
-            members.extend(executed if executed else self._artifact_members(sub))
+            members.extend(executed or self._artifact_members(sub))
         # Sequential multi-artifact execution returns every sub-artifact's
         # paths once; drop duplicates before mosaic input.
         return list(dict.fromkeys(members))

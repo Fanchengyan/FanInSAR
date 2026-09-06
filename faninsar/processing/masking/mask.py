@@ -18,8 +18,8 @@ from typing import Any
 
 import numpy as np
 
-from faninsar.processing.geometry.grids import GridSpec
 from faninsar.logging import setup_logger
+from faninsar.processing.geometry.grids import GridSpec
 
 logger = setup_logger(__name__)
 

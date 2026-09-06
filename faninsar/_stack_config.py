@@ -5,9 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from faninsar.processing.runtime.compute.numpy_backend import NumpyBackend
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_pair_configuration
+from faninsar.processing.runtime.compute.numpy_backend import NumpyBackend
 from faninsar.stack.mask_plan import MaskPlan
 
 if TYPE_CHECKING:
