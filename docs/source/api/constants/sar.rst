@@ -11,4 +11,4 @@ Resampling
 .. autosummary::
    :toctree: generated/
 
-   faninsar.constants.Resampling
+   rasterio.enums.Resampling

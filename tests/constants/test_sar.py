@@ -292,7 +292,7 @@ class TestSentinel1:
 
     def test_inheritance_pattern(self) -> None:
         """Test that SAR class can be easily inherited."""
-        from faninsar.constants.sar import SAR
+        from faninsar.core.sar_missions import SAR
 
         # Define a new SAR mission by subclassing
         class TestSAR(SAR):
