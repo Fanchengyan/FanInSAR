@@ -6,9 +6,9 @@ from typing import Any
 
 import numpy as np
 
-from faninsar.ports.compute import ComputeBackend
-from faninsar.ports.io import IOBackend, Store
-from faninsar.ports.sensor import SensorAdapter
+from faninsar.processing.runtime.protocols import ComputeBackend
+from faninsar.io.protocols import IOBackend, Store
+from faninsar.missions.protocols import SensorAdapter
 
 
 class _DummyCompute:

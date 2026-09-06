@@ -11,7 +11,7 @@ from faninsar.processing.errors import reject_pair_configuration
 from faninsar.stack.mask_plan import MaskPlan
 
 if TYPE_CHECKING:
-    from faninsar.ports.compute import ComputeBackend
+    from faninsar.processing.runtime.protocols import ComputeBackend
 
 logger = setup_logger(__name__)
 

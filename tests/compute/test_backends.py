@@ -6,7 +6,7 @@ import numpy as np
 
 from faninsar.processing.runtime.compute.dask_torch import DaskTorchBackend
 from faninsar.processing.runtime.compute.numpy_backend import NumpyBackend
-from faninsar.ports.compute import ComputeBackend
+from faninsar.processing.runtime.protocols import ComputeBackend
 
 
 def test_numpy_backend_protocol() -> None:

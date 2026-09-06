@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-import numpy as np
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    import numpy as np
 
 
 @runtime_checkable

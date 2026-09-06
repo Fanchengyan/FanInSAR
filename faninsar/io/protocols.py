@@ -40,7 +40,9 @@ class IOBackend(Protocol):
         """Open or create a store at *uri*."""
         ...
 
-    def write(self, product: Any, uri: str, *, format: str = "cog") -> None:
+    def write(
+        self, product: Any, uri: str, *, format: str = "cog"  # noqa: A002
+    ) -> None:
         """Write *product* to *uri* using *format*."""
         ...
 
