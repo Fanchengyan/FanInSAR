@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
     from faninsar.processing.contracts import SLCProduct
     from faninsar.processing.geometry.transforms import TransformResult
-    from faninsar.typing import DeviceLike
+    from faninsar.processing.runtime.types import DeviceLike
 
 logger = setup_logger(__name__)
 

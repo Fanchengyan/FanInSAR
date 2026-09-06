@@ -16,7 +16,7 @@ from faninsar.logging import setup_logger
 if TYPE_CHECKING:
     from numpy.typing import DTypeLike, NDArray
 
-    from faninsar.typing import TripletLoopLike
+    from faninsar.core.types import TripletLoopLike
 
 logger = setup_logger(__name__)
 
@@ -493,7 +493,12 @@ class TripletLoops:
         """
         if target == "pairs":
             return pd.DataFrame(
-                zip(self.pairs12.values, self.pairs23.values, self.pairs13.values),
+                zip(
+                    self.pairs12.values,
+                    self.pairs23.values,
+                    self.pairs13.values,
+                    strict=True,
+                ),
                 columns=["pair12", "pair23", "pair13"],
             )
         if target == "dates":

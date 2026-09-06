@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from rasterio.profiles import Profile as RasterioProfile
 
     from faninsar.data.query.bbox import BoundingBox
-    from faninsar.typing import CrsLike
+    from faninsar.core.types import CrsLike
 
 logger = setup_logger(__name__)
 

@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from numpy.typing import ArrayLike
 
     from faninsar.data.query.bbox import BoundingBox
-    from faninsar.typing import CrsLike
+    from faninsar.core.types import CrsLike
 
 logger = setup_logger(__name__)
 

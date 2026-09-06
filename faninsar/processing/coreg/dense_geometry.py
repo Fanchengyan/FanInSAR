@@ -24,7 +24,7 @@ from faninsar.processing.geometry.prepare_production import (
 if TYPE_CHECKING:
     from faninsar.processing.dem import DEM
     from faninsar.processing.geometry.transforms import RadarGeometryModel
-    from faninsar.typing import DeviceLike
+    from faninsar.processing.runtime.types import DeviceLike
 
 logger = setup_logger(__name__)
 

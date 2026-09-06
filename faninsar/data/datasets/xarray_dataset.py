@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 
     from faninsar.data.query.points import Points
     from faninsar.data.query.polygons import Polygons
-    from faninsar.typing import ResamplingLike
+    from faninsar.core.types import ResamplingLike
 
 __all__ = ["FileMetadata", "XarrayDataSpec", "XarrayDataset"]
 

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
     from matplotlib.axes import Axes
 
-    from faninsar.typing import CrsLike
+    from faninsar.core.types import CrsLike
 
     from .bbox import BoundingBox
 

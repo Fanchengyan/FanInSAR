@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
     import numpy.typing as npt
 
-    from faninsar.typing import CrsLike
+    from faninsar.core.types import CrsLike
 
 
 class Points:

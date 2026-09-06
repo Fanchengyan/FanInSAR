@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from faninsar.processing.dem import DEM
     from faninsar.processing.geometry import RadarGeometryModel
     from faninsar.processing.merge.grid import GeoGridSpec
-    from faninsar.typing import DeviceLike
+    from faninsar.processing.runtime.types import DeviceLike
 
 logger = setup_logger(__name__)
 

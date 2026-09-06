@@ -12,7 +12,7 @@ from faninsar.logging import setup_logger
 logger = setup_logger(__name__)
 
 if TYPE_CHECKING:
-    from faninsar.typing import DeviceLike
+    from faninsar.processing.runtime.types import DeviceLike
 
 GpuMemoryReclaim = Literal["lazy", "eager", "adaptive"]
 ReclaimKind = Literal["persist", "stage", "oom", "explicit"]

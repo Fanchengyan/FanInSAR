@@ -9,7 +9,7 @@ import numpy as np
 from faninsar.core.sar_property import Frequency, Wavelength
 
 if TYPE_CHECKING:
-    from faninsar.typing import FrequencyUnit, WavelengthUnit
+    from faninsar.core.types import FrequencyUnit, WavelengthUnit
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray

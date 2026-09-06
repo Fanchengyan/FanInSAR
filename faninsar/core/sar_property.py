@@ -60,13 +60,13 @@ import pint
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
-    from faninsar.typing.sar import FrequencyUnit, WavelengthUnit
+    from faninsar.core.types import FrequencyUnit, WavelengthUnit
 
 logger = setup_logger(__name__)
 
 # Valid unit tuples used for runtime validation. These mirror the Literal types
-# defined in faninsar.typing.sar (which is the canonical source for type checkers).
-# Direct import is avoided to prevent circular imports through faninsar.typing.
+# defined in faninsar.core.types (which is the canonical source for type checkers).
+# Direct import is avoided to prevent circular imports through faninsar.core.types.
 _WAVELENGTH_UNITS: tuple[str, ...] = ("m", "cm", "dm", "mm", "nm", "km", "um")
 _FREQUENCY_UNITS: tuple[str, ...] = ("GHz", "MHz", "kHz", "Hz", "THz")
 

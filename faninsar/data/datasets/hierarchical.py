@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
     from pyproj.crs import CRS
 
-    from faninsar.typing import ResamplingLike
+    from faninsar.core.types import ResamplingLike
 
 logger = setup_logger(__name__)
 

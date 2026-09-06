@@ -32,7 +32,7 @@ from faninsar.processing.runtime.device import parse_device
 if TYPE_CHECKING:
     import torch
 
-    from faninsar.typing import DeviceLike
+    from faninsar.processing.runtime.types import DeviceLike
 
 logger = setup_logger(__name__)
 

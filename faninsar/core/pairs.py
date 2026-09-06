@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
     from faninsar.core.baseline import BaselinePlotResult, Baselines
     from faninsar.core.loops import Loop, Loops, TripletLoops
-    from faninsar.typing import PairLike, PairsLike, PairsOrder
+    from faninsar.core.types import PairLike, PairsLike, PairsOrder
 
 logger = setup_logger(__name__)
 

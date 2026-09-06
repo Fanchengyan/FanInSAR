@@ -13,7 +13,7 @@ from faninsar.logging import setup_logger
 if TYPE_CHECKING:
     from os import PathLike
 
-    from faninsar.typing import CrsLike
+    from faninsar.core.types import CrsLike
 
 logger = setup_logger(__name__)
 
