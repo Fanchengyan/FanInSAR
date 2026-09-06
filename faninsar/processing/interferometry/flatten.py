@@ -312,7 +312,7 @@ def azimuth_ramp_device_kwargs(device: str) -> dict[str, str]:
     Parameters
     ----------
     device : str
-        Stack device string admitted by :func:`~faninsar._core.device.parse_device`.
+        Stack device string admitted by :func:`~faninsar.processing.runtime.device.parse_device`.
 
     Returns
     -------

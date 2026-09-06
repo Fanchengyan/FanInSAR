@@ -933,12 +933,12 @@ def form_merged_scene_interferogram(
                 )
             if goldstein_alpha <= 0.0:
                 return product
-            from faninsar.backends.dask_gpu import should_accelerate
+            from faninsar.processing.runtime.dask_gpu import should_accelerate
 
             if (
                 dask_client is not None or device.lower() == "cuda"
             ) and should_accelerate(device, dask_client, kernel="goldstein_filter"):
-                from faninsar.backends.dask_gpu import run_goldstein_filter
+                from faninsar.processing.runtime.dask_gpu import run_goldstein_filter
 
                 filtered = run_goldstein_filter(
                     product.complex_ifg,
@@ -1088,12 +1088,12 @@ def form_merged_scene_interferogram(
         filtered_mask = filtered.valid_mask.detach().cpu().numpy()
         merged_ifg[~filtered_mask] = np.nan + 1j * np.nan
     elif goldstein_alpha > 0.0:
-        from faninsar.backends.dask_gpu import should_accelerate
+        from faninsar.processing.runtime.dask_gpu import should_accelerate
 
         if (dask_client is not None or device.lower() == "cuda") and should_accelerate(
             device, dask_client, kernel="goldstein_filter"
         ):
-            from faninsar.backends.dask_gpu import run_goldstein_filter
+            from faninsar.processing.runtime.dask_gpu import run_goldstein_filter
 
             merged_ifg = run_goldstein_filter(
                 merged_ifg,
@@ -1185,12 +1185,12 @@ def form_scene_interferograms(
             multilook=multilook,
         ).complex_ifg
         if goldstein_alpha > 0.0:
-            from faninsar.backends.dask_gpu import should_accelerate
+            from faninsar.processing.runtime.dask_gpu import should_accelerate
 
             if (
                 dask_client is not None or device.lower() == "cuda"
             ) and should_accelerate(device, dask_client, kernel="goldstein_filter"):
-                from faninsar.backends.dask_gpu import run_goldstein_filter
+                from faninsar.processing.runtime.dask_gpu import run_goldstein_filter
 
                 complex_ifg = run_goldstein_filter(
                     complex_ifg,

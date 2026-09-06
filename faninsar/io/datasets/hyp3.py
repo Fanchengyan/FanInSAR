@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from faninsar._core.file_tools import load_meta
+from faninsar.io.file_tools import load_meta
 from faninsar.core import Baselines, Pairs
 from faninsar.core.sar_missions import Sentinel1
 from faninsar.data.datasets.ifg import InterferogramDataset

@@ -159,7 +159,7 @@ def _solve_connected_pixels(
     """
     import torch
 
-    from faninsar._core.device import parse_device
+    from faninsar.processing.runtime.device import parse_device
 
     n_pairs, n_pixels = observations.shape
     n_increments = design_matrix.shape[1]

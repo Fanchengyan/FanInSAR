@@ -1519,7 +1519,7 @@ def test_stack_config_gpu_memory_reclaim_defaults_to_adaptive(tmp_path: Path) ->
 def test_reclaim_checkpoint_policy_table(monkeypatch: pytest.MonkeyPatch) -> None:
     """lazy/eager/adaptive follow the capacity and pressure table."""
     torch = pytest.importorskip("torch")
-    from faninsar._core.device import reclaim_checkpoint
+    from faninsar.processing.runtime.device import reclaim_checkpoint
 
     calls: list[int] = []
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
@@ -1589,8 +1589,8 @@ def test_stack_dask_persist_stage_reclaim_uses_client_run(
     """Dask GPU workers receive reclaim_checkpoint; tiles do not empty_cache."""
     import inspect
 
-    from faninsar.backends import dask_gpu
-    from faninsar.backends.dask_gpu import _reclaim_checkpoint_on_worker
+    from faninsar.processing.runtime import dask_gpu
+    from faninsar.processing.runtime.dask_gpu import _reclaim_checkpoint_on_worker
 
     remote_calls: list[tuple[object, tuple[object, ...]]] = []
 
@@ -1617,7 +1617,7 @@ def test_stack_dask_persist_stage_reclaim_uses_client_run(
         dask_client=FakeClient(),
     )
     monkeypatch.setattr(
-        "faninsar._core.device.reclaim_checkpoint",
+        "faninsar.processing.runtime.device.reclaim_checkpoint",
         lambda *_args, **kwargs: kwargs.get("kind"),
     )
     stack._reclaim_accelerator("persist")

@@ -6,7 +6,7 @@ mirror the reference NumPy implementations in this package (deramp, multilook
 interferogram formation, Goldstein filtering, topographic flattening, and
 ESD) so accelerator results stay numerically comparable to the CPU truth.
 
-Device policy matches :mod:`faninsar._core.device`: ``"auto"`` resolves from
+Device policy matches :mod:`faninsar.processing.runtime.device`: ``"auto"`` resolves from
 hardware visible to the current process, preferring CUDA and otherwise using
 CPU. Distributed callers pass ``"cuda"`` explicitly after selecting a trusted
 GPU worker. On CPU the kernels compute in float64/complex128; accelerator
@@ -87,7 +87,7 @@ def resolve_torch_device(
 ) -> torch.device:
     """Resolve a Torch execution device following the Stack device policy.
 
-    Thin wrapper around :func:`faninsar._core.device.parse_device`.
+    Thin wrapper around :func:`faninsar.processing.runtime.device.parse_device`.
     ``"auto"`` inspects only hardware visible to the current process.
     CUDA is preferred among published devices, unpublished backends are
     never auto-selected, and an explicit request stays on that device.
@@ -110,7 +110,7 @@ def resolve_torch_device(
         If an explicit device is requested but unavailable or unusable.
 
     """
-    from faninsar._core.device import parse_device
+    from faninsar.processing.runtime.device import parse_device
 
     return parse_device(device)
 
@@ -119,7 +119,7 @@ def cleanup_device(device: torch.device) -> None:
     """Leave the caching allocator intact after a kernel (PROPOSAL-0034).
 
     Per-tile and per-kernel reclaim is forbidden. Stack or a Dask GPU
-    worker calls :func:`faninsar._core.device.release_accelerator_cache`
+    worker calls :func:`faninsar.processing.runtime.device.release_accelerator_cache`
     at persist, stage, OOM-retry, or explicit checkpoints.
 
     Parameters

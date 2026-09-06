@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import time
 
-from faninsar.compute.cache import apply_compile_cache_env
-from faninsar.compute.compile import COMPILE_TARGETS, get_compile_manager
-from faninsar.compute.profiles import get_profile
 from faninsar.logging import setup_logger
+from faninsar.processing.runtime.compute.cache import apply_compile_cache_env
+from faninsar.processing.runtime.compute.compile import (
+    COMPILE_TARGETS,
+    get_compile_manager,
+)
+from faninsar.processing.runtime.compute.profiles import get_profile
 
 logger = setup_logger(__name__)
 

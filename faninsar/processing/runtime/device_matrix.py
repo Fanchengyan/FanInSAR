@@ -8,8 +8,8 @@ from typing import Final
 
 import torch
 
-from faninsar._core.device import cuda_available, mps_available
 from faninsar.logging import setup_logger
+from faninsar.processing.runtime.device import cuda_available, mps_available
 
 logger = setup_logger(__name__)
 

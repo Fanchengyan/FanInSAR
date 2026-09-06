@@ -12,7 +12,7 @@ import rasterio
 from rasterio import Affine, transform
 from rasterio.profiles import Profile as RasterioProfile
 
-from faninsar._core.file_tools import load_metas
+from faninsar.io.file_tools import load_metas
 from faninsar.logging import setup_logger
 
 from .coordinates import xy_from_transform

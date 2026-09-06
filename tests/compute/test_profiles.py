@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from faninsar.compute.profiles import PROFILES, get_profile
+from faninsar.processing.runtime.compute.profiles import PROFILES, get_profile
 
 
 def test_sentinel1_profiles_exist() -> None:

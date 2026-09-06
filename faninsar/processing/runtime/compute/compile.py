@@ -7,8 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from faninsar.compute.cache import apply_compile_cache_env
-from faninsar.compute.compile_specs import DEFAULT_CHUNK
+from faninsar.processing.runtime.compute.cache import apply_compile_cache_env
+from faninsar.processing.runtime.compute.compile_specs import DEFAULT_CHUNK
 
 logger = logging.getLogger(__name__)
 

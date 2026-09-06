@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from faninsar.compute.compile import COMPILE_TARGETS, get_compile_manager
+from faninsar.processing.runtime.compute.compile import COMPILE_TARGETS, get_compile_manager
 
 torch = pytest.importorskip("torch")
 

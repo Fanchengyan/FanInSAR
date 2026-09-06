@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from faninsar.backends.dask_exec import (
+from faninsar.processing.runtime.dask_exec import (
     compute_with_profile,
     map_elementwise,
     map_finite_halo,
 )
-from faninsar.backends.execution import ExecutionProfile
+from faninsar.processing.runtime.execution import ExecutionProfile
 
 
 def test_map_elementwise_matches_numpy() -> None:

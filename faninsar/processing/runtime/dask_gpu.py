@@ -168,7 +168,7 @@ def _reclaim_checkpoint_on_worker(
     kind: str,
 ) -> bool:
     """Evaluate reclaim policy on the process that owns the CUDA pool."""
-    from faninsar._core.device import reclaim_checkpoint
+    from faninsar.processing.runtime.device import reclaim_checkpoint
 
     return reclaim_checkpoint(device, policy, kind=kind)  # type: ignore[arg-type]
 
@@ -228,7 +228,7 @@ def _cuda_is_admitted(device: str, client: Any | None) -> bool:
     if has_gpu_workers(client) or backend == "cuda":
         return True
     if backend in {"auto", "gpu"}:
-        from faninsar._core.device import parse_device
+        from faninsar.processing.runtime.device import parse_device
 
         return parse_device(device).type == "cuda"
     return False

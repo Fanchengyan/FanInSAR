@@ -13,13 +13,13 @@ from faninsar.processing.resources import ResourceBudget
 from faninsar.stack.mask_plan import MaskPlan
 
 if TYPE_CHECKING:
-    from faninsar._core.device import GpuMemoryReclaim
     from faninsar.processing.contracts.prepared_geometry import (
         ActivationToken,
         StackActivationBinding,
     )
     from faninsar.processing.dem import DEM, GridSpec
     from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.stages import (
         BurstSelection,
         CoregistrationGrid,

@@ -124,7 +124,7 @@ def _release_torch_device_cache(device: object) -> None:
     """End an Ampcor lease without reclaiming unused slabs (PROPOSAL-0034).
 
     Callers drop Python references and rely on the admission ledger.
-    :func:`faninsar._core.device.release_accelerator_cache` is reserved
+    :func:`faninsar.processing.runtime.device.release_accelerator_cache` is reserved
     for Stack/worker checkpoints, never Ampcor end-of-call.
     """
     del device
@@ -279,7 +279,7 @@ def _is_cpu_ampcor_device(device: object) -> bool:
 
 
 def _admit_ampcor_device(device: str) -> str:
-    """Admit an Ampcor device through :func:`faninsar._core.device.parse_device`.
+    """Admit an Ampcor device through :func:`faninsar.processing.runtime.device.parse_device`.
 
     ``auto`` and ``gpu`` follow the shared contract: CUDA when it is visible
     to this process, otherwise CPU. MPS is never auto-selected. Explicit
@@ -305,7 +305,7 @@ def _admit_ampcor_device(device: str) -> str:
 
     """
     try:
-        from faninsar._core.device import parse_device
+        from faninsar.processing.runtime.device import parse_device
     except ImportError as error:
         if device in {"auto", "gpu", "cpu"} or device.startswith("cpu:"):
             return "cpu"
@@ -329,7 +329,7 @@ def resolve_ampcor_policy(
     """Resolve the public Ampcor executor/device contract.
 
     Device admission is authoritative. After
-    :func:`faninsar._core.device.parse_device` resolves ``auto`` or
+    :func:`faninsar.processing.runtime.device.parse_device` resolves ``auto`` or
     ``gpu`` to CUDA, the request is the existing explicit-CUDA Torch
     path even when ``executor="numpy"``. ``torch`` plus ``auto`` is no
     longer a NumPy synonym: it becomes Torch CUDA when CUDA is admitted
@@ -2008,7 +2008,7 @@ def estimate_patch_amplitude_shift(
         Number of patches materialized in one Torch batch. Default 32.
     device : {"auto", "cpu", "cuda"}, optional
         Requested device. Resolved through
-        :func:`faninsar._core.device.parse_device`. ``"auto"`` admits CUDA
+        :func:`faninsar.processing.runtime.device.parse_device`. ``"auto"`` admits CUDA
         when it is visible, otherwise CPU. ``torch`` plus ``auto`` is not a
         NumPy synonym. Explicit ``"cpu"`` keeps the requested executor.
         After CUDA admission, ``executor="numpy"`` cannot succeed on host

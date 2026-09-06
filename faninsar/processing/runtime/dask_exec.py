@@ -10,7 +10,8 @@ if TYPE_CHECKING:
 import dask.array as da
 import numpy as np
 
-from faninsar.backends.execution import (
+from faninsar.logging import setup_logger
+from faninsar.processing.runtime.execution import (
     Backend,
     ChunkLayout,
     DTypePolicy,
@@ -19,7 +20,6 @@ from faninsar.backends.execution import (
     OperationPlan,
     validate_execution,
 )
-from faninsar.logging import setup_logger
 
 logger = setup_logger(__name__)
 

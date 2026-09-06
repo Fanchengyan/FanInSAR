@@ -7,7 +7,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from faninsar._core.device import parse_device
+from faninsar.processing.runtime.device import parse_device
 from faninsar.processing.resampling_torch import _resolve_torch_device
 from faninsar.processing.torch_kernels import resolve_torch_device
 
@@ -24,7 +24,7 @@ def _force_cuda(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: available)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: count)
     monkeypatch.setattr(
-        "faninsar._core.device.cuda_available",
+        "faninsar.processing.runtime.device.cuda_available",
         lambda: available,
     )
 
@@ -65,7 +65,7 @@ def test_auto_never_selects_unpublished_backend(
 ) -> None:
     """Auto stays on the published set even when MPS is visible."""
     _force_cuda(monkeypatch, available=False, count=0)
-    monkeypatch.setattr("faninsar._core.device.mps_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.mps_available", lambda: True)
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
     resolved = resolver("auto")
     assert resolved.type == "cpu"
@@ -138,7 +138,7 @@ def test_explicit_unavailable_mps_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Explicit MPS fails before compute when the backend cannot run."""
-    monkeypatch.setattr("faninsar._core.device.mps_available", lambda: False)
+    monkeypatch.setattr("faninsar.processing.runtime.device.mps_available", lambda: False)
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="MPS"):
         resolver("mps")

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from faninsar.compute.dask_torch import DaskTorchBackend
-from faninsar.compute.numpy_backend import NumpyBackend
+from faninsar.processing.runtime.compute.dask_torch import DaskTorchBackend
+from faninsar.processing.runtime.compute.numpy_backend import NumpyBackend
 from faninsar.ports.compute import ComputeBackend
 
 

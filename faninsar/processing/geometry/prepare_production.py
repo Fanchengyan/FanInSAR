@@ -191,7 +191,7 @@ def _native_build_dir(operation: NativeOperation | None = None) -> Path:
         run before an operation is selected.
 
     """
-    from faninsar.compute.cache import resolve_compile_cache_dir
+    from faninsar.processing.runtime.compute.cache import resolve_compile_cache_dir
 
     root = resolve_compile_cache_dir().parent / "native_v2_geometry"
     path = root / (operation.value if operation is not None else "shared")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from faninsar.backends.execution import (
+from faninsar.processing.runtime.execution import (
     Backend,
     ChunkLayout,
     DTypePolicy,

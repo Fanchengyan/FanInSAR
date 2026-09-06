@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import zarr
 
-from faninsar._core.device import cuda_available
+from faninsar.processing.runtime.device import cuda_available
 from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import PreparedGeometryArrayPayload
@@ -289,7 +289,7 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
         lambda samples, **kwargs: (resample_kwargs.update(kwargs) or samples.copy()),
     )
     monkeypatch.setattr(
-        "faninsar.backends.dask_gpu.should_accelerate",
+        "faninsar.processing.runtime.dask_gpu.should_accelerate",
         lambda *_args, **_kwargs: False,
     )
     result = stage_coregister(

@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from faninsar.backends.dask_gpu import (
+from faninsar.processing.runtime.dask_gpu import (
     CUDA_PERFORMANCE_QUALIFIED,
     _schedule_carrier_multiply,
     _schedule_goldstein_filter,
@@ -60,7 +60,7 @@ def test_no_client_means_no_gpu_resources() -> None:
 
 def test_schedule_builders_are_internal_only() -> None:
     """Only exact-client run functions form the public scheduling API."""
-    from faninsar.backends import dask_gpu
+    from faninsar.processing.runtime import dask_gpu
 
     for name in (
         "map_torch_blocks",
@@ -341,7 +341,7 @@ def test_gpu_less_client_falls_back_without_building_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A connected GPU-less client uses eager execution instead of hanging."""
-    from faninsar.backends import dask_gpu
+    from faninsar.processing.runtime import dask_gpu
 
     def reject_graph(*_args: Any, **_kwargs: Any) -> None:
         message = "an unschedulable graph was built"
@@ -361,7 +361,7 @@ def test_gpu_less_client_falls_back_without_building_graph(
 
 def test_run_uses_exact_injected_client(monkeypatch: pytest.MonkeyPatch) -> None:
     """Distributed execution computes and gathers through the selected client."""
-    from faninsar.backends import dask_gpu
+    from faninsar.processing.runtime import dask_gpu
 
     class _FakeGraph:
         def compute(self) -> np.ndarray:
@@ -423,7 +423,7 @@ def test_ambient_client_does_not_trigger_submission(
     """An ambient default client is ignored without explicit injection."""
     from dask.distributed import Client, LocalCluster
 
-    from faninsar.backends import dask_gpu
+    from faninsar.processing.runtime import dask_gpu
 
     def reject_graph(*_args: Any, **_kwargs: Any) -> None:
         message = "ambient client triggered distributed graph construction"
@@ -501,7 +501,7 @@ def test_geo_carrier_unqualified_stage_stays_local(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Unqualified reramp stays on the admitted device instead of hopping to CPU."""
-    from faninsar.backends import dask_gpu
+    from faninsar.processing.runtime import dask_gpu
 
     sentinel = np.ones((4, 5), dtype=np.complex64)
     observed: dict[str, str] = {}

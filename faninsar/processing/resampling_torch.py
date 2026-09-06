@@ -24,7 +24,7 @@ __all__ = ["lanczos_resample_torch"]
 def _resolve_torch_device(device: DeviceName) -> torch.device:
     """Resolve an available Torch execution device via ``parse_device``."""
     try:
-        from faninsar._core.device import parse_device
+        from faninsar.processing.runtime.device import parse_device
     except ImportError as error:
         message = "Lanczos resampling requires torch; install FanInSAR dependencies"
         logger.exception(message)
@@ -36,7 +36,7 @@ def _cleanup_device(device: torch.device) -> None:
     """Drop no allocator slabs from a resampling kernel (PROPOSAL-0034).
 
     Callers still ``del`` tensor references. Reclaim is orchestrated by
-    :func:`faninsar._core.device.reclaim_checkpoint`.
+    :func:`faninsar.processing.runtime.device.reclaim_checkpoint`.
     """
     del device
 

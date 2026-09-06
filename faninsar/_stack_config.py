@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from faninsar.compute.numpy_backend import NumpyBackend
+from faninsar.processing.runtime.compute.numpy_backend import NumpyBackend
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_pair_configuration
 from faninsar.stack.mask_plan import MaskPlan
@@ -273,7 +273,7 @@ def _resolve_backend(backend: str | ComputeBackend) -> ComputeBackend:
         if backend == "numpy":
             return NumpyBackend()
         if backend in {"dask_torch", "dask"}:
-            from faninsar.compute.dask_torch import DaskTorchBackend
+            from faninsar.processing.runtime.compute.dask_torch import DaskTorchBackend
 
             return DaskTorchBackend()
         message = f"unknown backend {backend!r}"

@@ -171,7 +171,7 @@ def test_kernel_tiles_do_not_empty_cache_under_eager_8gib(
     import torch
 
     import faninsar.processing.torch_kernels as kernels
-    from faninsar._core.device import reclaim_checkpoint
+    from faninsar.processing.runtime.device import reclaim_checkpoint
 
     empty_calls: list[str] = []
 

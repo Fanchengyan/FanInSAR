@@ -7,12 +7,12 @@ from dataclasses import dataclass
 from importlib.util import find_spec
 from typing import Any
 
-from faninsar.backends.device_matrix import capability_matrix, probe_devices
 from faninsar.capabilities import (
     format_backend_capabilities,
     snaphu_capability,
 )
 from faninsar.logging import setup_logger
+from faninsar.processing.runtime.device_matrix import capability_matrix, probe_devices
 
 logger = setup_logger(__name__)
 
@@ -49,9 +49,9 @@ def assert_core_imports() -> bool:
         "faninsar.processing.stages",
         "faninsar.processing.unwrap",
         "faninsar.missions.sentinel1",
-        "faninsar.backends.execution",
-        "faninsar.backends.dask_exec",
-        "faninsar.backends.device_matrix",
+        "faninsar.processing.runtime.execution",
+        "faninsar.processing.runtime.dask_exec",
+        "faninsar.processing.runtime.device_matrix",
         "faninsar.missions.nisar",
     )
     for name in modules:

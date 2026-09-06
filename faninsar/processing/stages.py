@@ -1432,7 +1432,7 @@ def stage_deramp(
         Updated state with deramped scenes.
 
     """
-    from faninsar.backends.dask_gpu import should_accelerate
+    from faninsar.processing.runtime.dask_gpu import should_accelerate
 
     primary_input = state.primary.array.samples
     secondary_input = state.secondary.array.samples
@@ -1444,7 +1444,7 @@ def stage_deramp(
             state.secondary.array.samples, state.secondary.carrier
         )
     else:
-        from faninsar.backends.dask_gpu import run_carrier_multiply
+        from faninsar.processing.runtime.dask_gpu import run_carrier_multiply
 
         state.primary_deramped = run_carrier_multiply(
             state.primary.array.samples,
@@ -1968,14 +1968,14 @@ def stage_coregister(
                 executor="torch",
                 device=resolved_torch_device,
             )
-            from faninsar.backends.dask_gpu import should_accelerate
+            from faninsar.processing.runtime.dask_gpu import should_accelerate
 
             if should_accelerate(
                 resolved_torch_device,
                 dask_client,
                 kernel="esd_azimuth_shift",
             ):
-                from faninsar.backends.dask_gpu import run_esd_azimuth_shift
+                from faninsar.processing.runtime.dask_gpu import run_esd_azimuth_shift
 
                 esd = run_esd_azimuth_shift(
                     ref,
@@ -2373,7 +2373,10 @@ def stage_coregister(
         phase_per_range_pixel * offsets.range_offset_px
     ).astype(np.float32)
     state.secondary_deramped = None
-    from faninsar.backends.dask_gpu import run_carrier_multiply, should_accelerate
+    from faninsar.processing.runtime.dask_gpu import (
+        run_carrier_multiply,
+        should_accelerate,
+    )
 
     reramp_started = _clock_start(device)
     if should_accelerate(
@@ -2487,7 +2490,7 @@ def stage_interferogram(
     else:
         primary_lineage_input = primary_input
         secondary_lineage_input = secondary_input
-    from faninsar.backends.dask_gpu import should_accelerate
+    from faninsar.processing.runtime.dask_gpu import should_accelerate
 
     accelerated = should_accelerate(
         device,
@@ -2502,7 +2505,7 @@ def stage_interferogram(
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
         )
     else:
-        from faninsar.backends.dask_gpu import run_multilook_interferogram
+        from faninsar.processing.runtime.dask_gpu import run_multilook_interferogram
 
         ifg = run_multilook_interferogram(
             state.primary_deramped,
@@ -2543,7 +2546,7 @@ def stage_interferogram(
     # fringes stay intact for flattening.
     if goldstein_alpha > 0.0:
         if should_accelerate(device, dask_client, kernel="goldstein_filter"):
-            from faninsar.backends.dask_gpu import run_goldstein_filter
+            from faninsar.processing.runtime.dask_gpu import run_goldstein_filter
 
             complex_ifg = run_goldstein_filter(
                 ifg.complex_ifg,
@@ -2584,7 +2587,7 @@ def _flatten_complex_ifg(
     dask_client: Any | None,
 ) -> np.ndarray:
     """Remove a phase screen with Torch on CPU/CUDA and NumPy on MPS."""
-    from faninsar.backends.dask_gpu import should_accelerate
+    from faninsar.processing.runtime.dask_gpu import should_accelerate
 
     if not should_accelerate(
         device,
@@ -2592,7 +2595,7 @@ def _flatten_complex_ifg(
         kernel="remove_topographic_phase",
     ):
         return remove_topographic_phase(complex_ifg, topo_phase)
-    from faninsar.backends.dask_gpu import run_remove_topographic_phase
+    from faninsar.processing.runtime.dask_gpu import run_remove_topographic_phase
 
     return run_remove_topographic_phase(
         complex_ifg,

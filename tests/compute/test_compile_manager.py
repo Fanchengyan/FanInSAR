@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from faninsar.compute.compile import COMPILE_TARGETS, CompileManager
+from faninsar.processing.runtime.compute.compile import COMPILE_TARGETS, CompileManager
 
 
 def test_unknown_target_raises() -> None:

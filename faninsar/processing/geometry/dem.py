@@ -117,14 +117,14 @@ def admit_dem_device_identity(request: str) -> str:
     """Return a stored DEM device identity (`cpu` / `cuda` / `cuda:N`).
 
     ``cpu`` does not import Torch. Any other request, including ``auto``,
-    goes through :func:`faninsar._core.device.parse_device` after a lazy
+    goes through :func:`faninsar.processing.runtime.device.parse_device` after a lazy
     import.
     """
     stripped = str(request).strip()
     lowered = stripped.lower()
     if lowered == "cpu":
         return "cpu"
-    from faninsar._core.device import parse_device
+    from faninsar.processing.runtime.device import parse_device
 
     admitted = parse_device(None if lowered in {"", "auto", "gpu"} else stripped)
     return str(admitted)

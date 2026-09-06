@@ -1003,7 +1003,7 @@ def test_ampcor_mock_cuda_admission_spans_the_public_call(
         "_release_torch_device_cache",
         lambda device: events.append(("cache", active, device)),
     )
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: True)
 
     def valid_ncc(ref: object, *_args: object, **_kwargs: object) -> tuple[object, ...]:
         assert active
@@ -1093,7 +1093,7 @@ def test_ampcor_mock_cuda_admission_releases_on_batch_failure(
         "_release_torch_device_cache",
         lambda device: events.append(("cache", active, device)),
     )
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: True)
     calls = 0
 
     def failing_ncc(
@@ -1480,7 +1480,7 @@ def test_ampcor_numpy_compatibility_spelling_uses_torch_limits(
     pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets as offsets_mod
 
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: True)
     monkeypatch.setattr(offsets_mod, "_validate_torch_ampcor_runtime", lambda *_: None)
     monkeypatch.setattr(offsets_mod, "_torch_ampcor_admission_key", lambda *_: "cuda:0")
     samples = np.ones((64, 96), dtype=np.complex64)
@@ -1697,7 +1697,7 @@ def test_ampcor_end_of_call_does_not_empty_cache(
     import inspect
 
     torch = pytest.importorskip("torch")
-    from faninsar._core.device import reclaim_checkpoint
+    from faninsar.processing.runtime.device import reclaim_checkpoint
     from faninsar.processing.coreg import offsets as offsets_mod
 
     empty_calls: list[str] = []
@@ -1782,7 +1782,7 @@ def test_ampcor_policy_explicit_cpu_stays_cpu(
     pytest.importorskip("torch")
     from faninsar.processing.coreg import resolve_ampcor_policy
 
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: True)
     assert resolve_ampcor_policy("torch", "cpu") == ("torch", "cpu")
     assert resolve_ampcor_policy("numpy", "cpu") == ("numpy", "cpu")
 
@@ -1794,7 +1794,7 @@ def test_ampcor_policy_auto_without_cuda_keeps_executor(
     pytest.importorskip("torch")
     from faninsar.processing.coreg import resolve_ampcor_policy
 
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: False)
     assert resolve_ampcor_policy("auto", "cpu") == ("numpy", "cpu")
     assert resolve_ampcor_policy("torch", "auto") == ("torch", "cpu")
     assert resolve_ampcor_policy("numpy", "auto") == ("numpy", "cpu")
@@ -1809,7 +1809,7 @@ def test_ampcor_policy_auto_cuda_overrides_numpy_executor(
     pytest.importorskip("torch")
     from faninsar.processing.coreg import resolve_ampcor_policy
 
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: True)
     assert resolve_ampcor_policy("torch", "auto") == ("torch", "cuda")
     assert resolve_ampcor_policy("numpy", "auto") == ("torch", "cuda")
     assert resolve_ampcor_policy("numpy", "gpu") == ("torch", "cuda")
@@ -1822,7 +1822,7 @@ def test_ampcor_policy_canonicalizes_cuda_aliases_and_rejects_mps(
     """CUDA ordinals share one admission key; MPS stays unqualified."""
     torch = pytest.importorskip("torch")
     from faninsar.processing.coreg import resolve_ampcor_policy
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     assert resolve_ampcor_policy("torch", "cuda:00") == ("torch", "cuda:0")
     assert resolve_ampcor_policy("numpy", "cuda") == ("torch", "cuda")
@@ -2035,7 +2035,7 @@ def test_ampcor_direct_torch_auto_uses_torch_cpu_policy(
 
     # Keep this unit test on the portable auto/CPU branch when it runs on a
     # qualified CUDA host; the CUDA override is covered separately below.
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: False)
 
     monkeypatch.setattr(
         offsets_mod,
@@ -2075,7 +2075,7 @@ def test_ampcor_auto_cuda_does_not_run_host_numpy(
     pytest.importorskip("torch")
     from faninsar.processing.coreg import offsets as offsets_mod
 
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: True)
     monkeypatch.setattr(
         offsets_mod,
         "_patch_ncc_shift",
@@ -2790,7 +2790,7 @@ def test_refine_shift_cuda_overrides_numpy_before_secondary_roll(
         "_validate_ampcor_accelerator",
         lambda _device: None,
     )
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     captured: dict[str, object] = {}
 
@@ -2878,7 +2878,7 @@ def test_refine_shift_with_correlation_resolves_cuda_to_torch(
     monkeypatch.setattr(
         geometry_coreg, "_validate_ampcor_accelerator", lambda _device: None
     )
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: True)
     result = geometry_coreg.refine_shift_with_correlation(
         np.ones((32, 64), dtype=np.complex64),
         np.ones((32, 64), dtype=np.complex64),
@@ -2891,7 +2891,7 @@ def test_refine_shift_with_correlation_resolves_cuda_to_torch(
     assert captured["executor"] == "torch"
     assert captured["device"] == "cuda"
     captured.clear()
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: False)
     geometry_coreg.refine_shift_with_correlation(
         np.ones((32, 64), dtype=np.complex64),
         np.ones((32, 64), dtype=np.complex64),

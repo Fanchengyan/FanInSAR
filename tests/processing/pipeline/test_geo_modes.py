@@ -319,7 +319,7 @@ def test_geo_reramp_keeps_nonqualified_stage_on_cpu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Geographic reramp does not bypass the CUDA qualification registry."""
-    from faninsar.backends import dask_gpu
+    from faninsar.processing.runtime import dask_gpu
 
     client = object()
     samples = np.ones((3, 4), dtype=np.complex64)

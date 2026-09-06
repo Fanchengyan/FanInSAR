@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from faninsar.backends.device_matrix import (
+from faninsar.processing.runtime.device_matrix import (
     DeviceKind,
     capability_matrix,
     complex_multiply,

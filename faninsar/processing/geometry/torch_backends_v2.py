@@ -177,7 +177,7 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
     """Resolve a public device request through the shared parser."""
     import torch
 
-    from faninsar._core.device import parse_device
+    from faninsar.processing.runtime.device import parse_device
 
     try:
         resolved = parse_device(device)

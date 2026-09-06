@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from faninsar._core.device import GpuMemoryReclaim
+from faninsar.processing.runtime.device import GpuMemoryReclaim
 from faninsar.stack.activation import (
     ActivationIssuerRecord,
     LocalActivationAuthority,

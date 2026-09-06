@@ -35,7 +35,7 @@ def _apply_reramp(
     device: str,
     dask_client: Any | None,
 ) -> np.ndarray:
-    from faninsar.backends.dask_gpu import should_accelerate
+    from faninsar.processing.runtime.dask_gpu import should_accelerate
 
     if not should_accelerate(device, dask_client, kernel="carrier_multiply"):
         logger.warning(
@@ -56,7 +56,7 @@ def _apply_reramp(
         )
         return output.astype(np.complex64, copy=False)
 
-    from faninsar.backends.dask_gpu import run_carrier_multiply_at_points
+    from faninsar.processing.runtime.dask_gpu import run_carrier_multiply_at_points
 
     return run_carrier_multiply_at_points(
         np.asarray(deramped, dtype=np.complex64),

@@ -81,7 +81,6 @@ from faninsar.stack.scene_store import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
-    from faninsar._core.device import GpuMemoryReclaim
     from faninsar.core.acquisition import Acquisition
     from faninsar.core.pairs import Pairs
     from faninsar.data.query import BoundingBox, Polygons
@@ -92,6 +91,7 @@ if TYPE_CHECKING:
     from faninsar.processing.dem import DEM, GridSpec
     from faninsar.processing.merge.grid import GeoGridSpec
     from faninsar.processing.resources import ResourceBudget
+    from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.stages import (
         BurstSelection,
         CoregistrationGrid,
@@ -1693,8 +1693,8 @@ class Stack(NetworkContract):
 
     def _reclaim_accelerator(self, kind: str) -> None:
         """Evaluate gpu_memory_reclaim on the CUDA-owning process."""
-        from faninsar._core.device import reclaim_checkpoint
-        from faninsar.backends.dask_gpu import run_reclaim_checkpoint
+        from faninsar.processing.runtime.dask_gpu import run_reclaim_checkpoint
+        from faninsar.processing.runtime.device import reclaim_checkpoint
 
         policy = self.config.gpu_memory_reclaim
         device = self.config.device
@@ -3070,7 +3070,6 @@ class Stack(NetworkContract):
         """
         import torch
 
-        from faninsar._core.device import parse_device
         from faninsar.data.datasets.ifg import StackInterferogramDataset
         from faninsar.processing.resources import (
             ResourceAdmissionError,
@@ -3079,6 +3078,7 @@ class Stack(NetworkContract):
             estimate_unwrap_decode_resources,
             reserve_estimate,
         )
+        from faninsar.processing.runtime.device import parse_device
         from faninsar.processing.unwrap.common import (
             SpatialUnwrapper,
             SpatialUnwrapResult,

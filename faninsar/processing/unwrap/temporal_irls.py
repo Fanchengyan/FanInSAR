@@ -12,9 +12,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from faninsar._core.device import parse_device
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.runtime.device import parse_device
 from faninsar.processing.unwrap._incidence import build_incidence_matrix
 
 if TYPE_CHECKING:

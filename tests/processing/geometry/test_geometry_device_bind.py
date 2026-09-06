@@ -21,7 +21,7 @@ def test_resolve_geometry_device_auto_selects_cuda_when_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``auto`` follows ``parse_device`` onto CUDA when a GPU is present."""
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: True)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: True)
     assert resolve_geometry_device("auto").type == "cuda"
     assert resolve_geometry_device("gpu").type == "cuda"
     assert _resolve_device("auto").type == "cuda"
@@ -51,7 +51,7 @@ def test_resolve_geometry_device_missing_cuda_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Explicit CUDA is a hard error when the shared resolver has no GPU."""
-    monkeypatch.setattr("faninsar._core.device.cuda_available", lambda: False)
+    monkeypatch.setattr("faninsar.processing.runtime.device.cuda_available", lambda: False)
     with pytest.raises(RuntimeError, match="not available"):
         resolve_geometry_device("cuda")
     with pytest.raises(RuntimeError, match="not available"):

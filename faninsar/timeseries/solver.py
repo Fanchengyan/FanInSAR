@@ -10,9 +10,9 @@ import psutil
 import torch
 from tqdm import tqdm
 
-from faninsar._core.device import parse_device
 from faninsar.core import Loops, Pairs
 from faninsar.logging import setup_logger
+from faninsar.processing.runtime.device import parse_device
 from faninsar.timeseries.models import TimeSeriesModels
 
 if TYPE_CHECKING:
