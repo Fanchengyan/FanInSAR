@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal
 import pandas as pd
 import rioxarray  # noqa: F401
 
-from faninsar import Acquisition
+from faninsar.core.acquisition import Acquisition
 from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
 
 from .raster import RasterDataset
