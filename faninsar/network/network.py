@@ -746,7 +746,7 @@ class Network(NetworkContract):
             # Use the persisted processing result contract for the canonical
             # path.  The lower-level historical solver returns four arrays;
             # Network callers need one self-describing TimeSeriesResult.
-            from faninsar.processing.timeseries.inversion import (
+            from faninsar.timeseries.results import (
                 invert_unwrapped_pairs,
             )
 
@@ -769,7 +769,7 @@ class Network(NetworkContract):
                 message = "NSBAS solver returned an invalid result"
                 logger.error(message)
                 raise NetworkAnalysisError(message)
-            from faninsar.processing.timeseries.inversion import TimeSeriesResult
+            from faninsar.timeseries.results import TimeSeriesResult
 
             increments, _parameters, residual_pairs, _residual_model = raw
             increments_array = np.asarray(increments, dtype=np.float32)

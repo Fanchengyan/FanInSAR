@@ -11,7 +11,7 @@ import pytest
 from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
 from faninsar.processing.coordinates import RadarGrid
 from faninsar.processing.geometry import RadarGeometryModel
-from faninsar.processing.merge.grid import GeoGridSpec
+from faninsar.processing.mosaicking.grid import GeoGridSpec
 from faninsar.processing.geocoding.geo_lut import (
     build_geo2rdr_lut,
     grid_lonlat,
@@ -29,7 +29,7 @@ from faninsar.processing.geocoding.geo_resample import (
     compose_secondary_coordinates,
     resample_complex_at_coordinates,
 )
-from faninsar.processing.tops.deramp import TOPSCarrierModel
+from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -217,7 +217,7 @@ def _carrier() -> TOPSCarrierModel:
 
 def test_compose_secondary_coordinates_uses_source_offset_convention() -> None:
     """Geo coordinates compose reference LUT and dense reference-minus-secondary."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     lut = Geo2RdrLUT(
@@ -242,7 +242,7 @@ def test_compose_secondary_coordinates_uses_source_offset_convention() -> None:
 def test_compose_secondary_coordinates_torch_matches_numpy() -> None:
     """CUDA compose matches the SciPy bilinear oracle on interior samples."""
     pytest.importorskip("torch")
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
     from faninsar.processing.geocoding.geo_resample import (
         _compose_secondary_coordinates_torch,
@@ -278,7 +278,7 @@ def test_compose_secondary_coordinates_torch_matches_numpy() -> None:
 
 def test_coregister_geocoded_slcs_remaps_deramped_inputs_once() -> None:
     """Geo coregistration returns two reramped SLCs on the LUT grid."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     shape = (8, 10)
@@ -338,7 +338,7 @@ def test_geo_reramp_keeps_nonqualified_stage_on_cpu(
         device="auto",
         dask_client=client,
     )
-    from faninsar.processing.tops.deramp import carrier_phase_at_points
+    from faninsar.processing.coregistration.tops.deramp import carrier_phase_at_points
 
     phase = carrier_phase_at_points(
         _carrier(),
@@ -353,7 +353,7 @@ def test_geo_reramp_keeps_nonqualified_stage_on_cpu(
 
 def test_chunked_coregistration_matches_full_result(tmp_path: Path) -> None:
     """Chunked Geo coregistration is numerically identical to the full path."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     shape = (12, 14)

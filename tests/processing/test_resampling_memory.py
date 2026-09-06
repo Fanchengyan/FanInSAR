@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from faninsar.processing.coreg.offsets import resample_complex
+from faninsar.processing.coregistration.offsets import resample_complex
 from faninsar.processing.resampling import (
     DEFAULT_LANCZOS_CHUNK,
     lanczos_resample,

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from faninsar.processing.merge.grid import GeoGridSpec
+from faninsar.processing.mosaicking.grid import GeoGridSpec
 from faninsar.processing.geocoding import geo_lut
 from faninsar.processing.geocoding.geo_lut import (
     _LUT_CACHE_ARRAY_FILES,

@@ -28,7 +28,7 @@ from faninsar.processing.interferometry.pair import (
     form_interferogram,
     goldstein_filter,
 )
-from faninsar.processing.tops import TOPSCarrierModel, deramp
+from faninsar.processing.coregistration.tops import TOPSCarrierModel, deramp
 
 
 def _carrier_model() -> TOPSCarrierModel:
@@ -481,7 +481,7 @@ def test_esd_is_submitted_as_one_gpu_task(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_unpublished_esd_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     """An explicit MPS request must not succeed on the NumPy ESD path."""
-    from faninsar.processing.coreg import esd
+    from faninsar.processing.coregistration import esd
 
     def reject_numpy(*_args: object) -> None:
         message = "unpublished device used NumPy ESD"

@@ -43,9 +43,8 @@ def register(cls: type | None = None, *, name: str | None = None):
 
 def list_missions() -> list[str]:
     """Return sorted registered mission names."""
-    import faninsar.missions.alos2
     import faninsar.missions.nisar
-    import faninsar.missions.sentinel1  # noqa: F401
+    import faninsar.missions.s1  # noqa: F401
 
     return sorted(_REGISTRY)
 

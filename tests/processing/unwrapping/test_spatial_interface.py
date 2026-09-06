@@ -1,0 +1,143 @@
+"""Public contract tests for spatial unwrapping."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from faninsar.processing.unwrapping.common import (
+    SpatialUnwrapper,
+    SpatialUnwrapResult,
+)
+from faninsar.processing.unwrapping.errors import NoValidSupportError
+from faninsar.processing.unwrapping.irls import SpatialIRLS, wrap_phase
+
+
+def test_spatial_irls_returns_torch_result_with_row_major_anchors() -> None:
+    """A supported field is labelled deterministically and remains device-local."""
+    phase = torch.tensor(
+        [[0.0, 0.2, float("nan")], [0.1, 0.3, float("nan")]],
+        dtype=torch.float32,
+    )
+    result = SpatialIRLS().unwrap(phase, valid_mask=torch.isfinite(phase))
+
+    assert isinstance(SpatialIRLS(), SpatialUnwrapper)
+    assert isinstance(result, SpatialUnwrapResult)
+    assert result.phase.device == phase.device
+    assert result.phase.shape == phase.shape
+    assert result.component_labels.tolist() == [[0, 0, -1], [0, 0, -1]]
+    assert torch.equal(result.reference_values, torch.tensor([0.0]))
+    assert torch.isnan(result.phase[0, 2])
+    assert result.converged
+    assert result.iterations == 0
+    assert result.pcg_iterations == 0
+    assert result.failure_reason is None
+
+
+def test_zero_coherence_cuts_edges_but_keeps_supported_pixels() -> None:
+    """Zero quality disconnects edges without invalidating either endpoint."""
+    phase = torch.zeros((1, 3), dtype=torch.float32)
+    coherence = torch.tensor([[1.0, 0.0, 1.0]])
+    result = SpatialIRLS().unwrap(phase, coherence=coherence)
+
+    assert result.component_labels.tolist() == [[0, 1, 2]]
+    assert result.valid_mask.tolist() == [[True, True, True]]
+    assert result.reference_values.tolist() == [0.0, 0.0, 0.0]
+
+
+def test_spatial_irls_rejects_nonfinite_or_out_of_range_coherence() -> None:
+    """Coherence is a finite probability-like quality value."""
+    phase = torch.zeros((2, 2))
+    with pytest.raises(ValueError, match="coherence"):
+        SpatialIRLS().unwrap(phase, coherence=torch.tensor([[1.1, 0.0], [0.0, 0.0]]))
+    result = SpatialIRLS().unwrap(
+        phase, coherence=torch.tensor([[float("nan"), 0.0], [0.0, 0.0]])
+    )
+    assert not result.valid_mask[0, 0]
+
+
+def test_spatial_irls_raises_before_solving_without_support() -> None:
+    """An empty authoritative support has a dedicated public exception."""
+    phase = torch.zeros((2, 2))
+    with pytest.raises(NoValidSupportError):
+        SpatialIRLS().unwrap(
+            phase, valid_mask=torch.zeros_like(phase, dtype=torch.bool)
+        )
+
+
+def test_wrap_phase_uses_half_open_interval() -> None:
+    """Wrapping maps positive pi to the documented half-open interval."""
+    result = wrap_phase(torch.tensor([-torch.pi, torch.pi, 3.0 * torch.pi]))
+    assert torch.all(result >= -torch.pi)
+    assert torch.all(result < torch.pi)
+    assert result[1].item() == pytest.approx(-torch.pi)
+
+
+def test_spatial_irls_solves_a_wrapped_ramp_and_reports_work() -> None:
+    """A wrapped ramp is recovered while the solver reports finite work."""
+    rows, columns = torch.meshgrid(
+        torch.arange(8, dtype=torch.float32),
+        torch.arange(8, dtype=torch.float32),
+        indexing="ij",
+    )
+    truth = 0.9 * columns + 0.7 * rows
+    result = SpatialIRLS(max_iter=12, cg_max_iter=100).unwrap(wrap_phase(truth))
+
+    residual = wrap_phase(result.phase - truth)
+    assert float(torch.linalg.vector_norm(residual)) < 0.2
+    assert result.converged
+    assert result.failure_reason is None
+    assert result.iterations >= 1
+    assert result.pcg_iterations >= 1
+    assert result.residual_norm < 0.2
+
+
+def test_spatial_irls_uses_dct_preconditioner_for_each_pcg_solve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public solver admits work through the DCT-II/III preconditioner."""
+    import torch_dct
+
+    calls = {"dct": 0, "idct": 0}
+    dct = torch_dct.dct
+    idct = torch_dct.idct
+
+    def counted_dct(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["dct"] += 1
+        return dct(*args, **kwargs)
+
+    def counted_idct(*args: object, **kwargs: object) -> torch.Tensor:
+        calls["idct"] += 1
+        return idct(*args, **kwargs)
+
+    monkeypatch.setattr(torch_dct, "dct", counted_dct)
+    monkeypatch.setattr(torch_dct, "idct", counted_idct)
+
+    rows, columns = torch.meshgrid(
+        torch.arange(8, dtype=torch.float32),
+        torch.arange(8, dtype=torch.float32),
+        indexing="ij",
+    )
+    phase = wrap_phase(0.9 * columns + 0.7 * rows)
+    result = SpatialIRLS(max_iter=2, cg_max_iter=4).unwrap(phase)
+
+    assert result.pcg_iterations > 0
+    assert calls["dct"] > 0
+    assert calls["idct"] > 0
+
+
+def test_unwrap_package_has_no_temporal_or_legacy_composite_exports() -> None:
+    """The MVP package exposes only the spatial result and strategy seam."""
+    import faninsar.processing.unwrapping as unwrap_package
+
+    for name in (
+        "IRLSUnwrapResult",
+        "irls_unwrap",
+        "StackUnwrapResult",
+        "unwrap_stack",
+        "TemporalUnwrapResult",
+        "unwrap_temporal_irls",
+        "StackQualityCriteria",
+        "reconcile_components",
+    ):
+        assert not hasattr(unwrap_package, name)

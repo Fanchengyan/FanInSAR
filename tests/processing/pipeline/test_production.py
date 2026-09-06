@@ -13,7 +13,7 @@ from faninsar.processing.runtime.device import cuda_available
 from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import PreparedGeometryArrayPayload
-from faninsar.processing.merge.grid import GeoGridSpec
+from faninsar.processing.mosaicking.grid import GeoGridSpec
 from faninsar.processing.stages import (
     PreparedGeometryField,
     ProductionPairState,
@@ -32,8 +32,8 @@ from faninsar.processing.stages import (
     _own_geo_valid_mask,
     produce_interferogram_pair,
 )
-from faninsar.processing.tops.deramp import TOPSCarrierModel
-from faninsar.processing.unwrap import SnaphuConfig
+from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
+from faninsar.processing.unwrapping import SnaphuConfig
 
 SLC_ROOT = Path("/Volumes/DATA2/TEST_sentinel-1/sentinel-slc")
 SLC_ROOT_RAW = Path("/Volumes/DATA2/TEST_sentinel-1/Raw Data/sentinel-slc")
@@ -43,7 +43,7 @@ if not SCENES and SLC_ROOT_RAW.exists():
 
 
 def _first_common_pair() -> tuple[Path, Path] | None:
-    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.missions.s1.safe import open_safe_product
     from faninsar.processing.stages import _common_burst_indices
 
     for index, reference in enumerate(SCENES):
@@ -250,7 +250,7 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
     requested_device: str,
 ) -> None:
     """Production separates Ampcor policy from Torch remapping policy."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     import faninsar.processing.stages as production_mod
 
     shape = (64, 96)
@@ -317,7 +317,7 @@ def test_stage_coregister_reuses_prepared_geometry_without_a_second_solve(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A captured Stage-A field preserves the product pass without re-solving."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     import faninsar.processing.stages as production_mod
 
     shape = (16, 32)
@@ -421,7 +421,7 @@ def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
     tmp_path: Path,
 ) -> None:
     """Geo stage consumes a provider LUT without rebuilding or shifting it."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     import faninsar.processing.stages as production_mod
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
@@ -510,7 +510,7 @@ def test_stage_coregister_reuses_prepared_geo_lut_and_crop_origin(
 
 def test_prepared_geometry_field_rejects_shape_or_dtype_mismatch() -> None:
     """A prepared field cannot silently change the materialized domain."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.errors import InvalidProcessingStateError
 
     shape = (4, 4)
@@ -531,7 +531,7 @@ def test_prepared_geometry_field_rejects_shape_or_dtype_mismatch() -> None:
 
 def test_prepared_geometry_field_rejects_unbound_geo_reuse() -> None:
     """Radar-only prepared fields cannot silently enter the Geo2Rdr path."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.errors import InvalidProcessingStateError
 
     shape = (4, 4)
@@ -568,7 +568,7 @@ def test_prepared_geometry_field_freezes_final_roi_crop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Stage B reuses the Stage-A ROI crop without probing or solving again."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     import faninsar.processing.stages as production_mod
 
     shape = (128, 256)
@@ -651,7 +651,7 @@ def test_stage_coregister_grows_roi_halo_for_large_offsets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A large geometric offset grows the ROI crop until the margin covers it."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     import faninsar.processing.stages as production_mod
 
     shape = (512, 1024)
@@ -752,8 +752,8 @@ def test_geo_topographic_phase_preserves_row_order_when_chunked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Disk-backed topographic phase tiles preserve geographic row order."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
-    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
+    from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing import stages as production
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 

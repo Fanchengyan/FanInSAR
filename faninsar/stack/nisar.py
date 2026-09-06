@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from faninsar.core.acquisition import Acquisition
 from faninsar.logging import setup_logger
-from faninsar.missions.nisar import NisarSensor, _normalize_channel
+from faninsar.missions.nisar.adapter import NisarSensor, _normalize_channel
 from faninsar.stack.catalog import SceneCatalog
 from faninsar.stack.config import ActivationMode, StackConfig
 from faninsar.stack.nisar_provider import (

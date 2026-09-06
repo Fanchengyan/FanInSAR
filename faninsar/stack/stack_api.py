@@ -42,7 +42,7 @@ from faninsar.stack.scene_store import CoregisteredSceneStore
 
 if TYPE_CHECKING:
     from faninsar.processing.atmosphere.config import IonosphereEstimationConfig
-    from faninsar.processing.unwrap.snaphu_backend import SnaphuConfig
+    from faninsar.processing.unwrapping.snaphu_backend import SnaphuConfig
     from faninsar.stack.session import Stack
 
 logger = setup_logger(__name__)
@@ -200,7 +200,7 @@ def estimate_ionosphere(
 
     """
     from faninsar.processing.interferometry.pair import form_interferogram
-    from faninsar.processing.unwrap.api import unwrap
+    from faninsar.processing.unwrapping.api import unwrap
     from faninsar.stack.session import _iter_pair_dates
 
     stack._ensure_prepared()

@@ -516,7 +516,7 @@ def _geocode_aligned_radar_tile(
         resample_complex_at_coordinates,
     )
     from faninsar.processing.geometry import RadarGeometryModel
-    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.mosaicking.grid import GeoGridSpec
 
     if not isinstance(primary_product.grid, RadarGrid):
         reject_invalid_state("NISAR Geo coregistration requires a radar product")

@@ -10,7 +10,7 @@ def test_list_missions_includes_defaults() -> None:
     names = list_missions()
     assert "sentinel1" in names
     assert "nisar" in names
-    assert "alos2" in names
+    assert "alos2" not in names
 
 
 def test_register_custom() -> None:

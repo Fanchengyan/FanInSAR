@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
     import torch
 
-    from faninsar.processing.tops.deramp import TOPSCarrierModel
+    from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
 
 logger = setup_logger(__name__)
 
@@ -208,7 +208,7 @@ def carrier_phase_at_points_torch(
 ) -> np.ndarray:
     """Evaluate the analytical TOPS carrier phase with a Torch backend.
 
-    Numerically mirrors :func:`faninsar.processing.tops.deramp.carrier_phase_at_points`
+    Numerically mirrors :func:`faninsar.processing.coregistration.tops.deramp.carrier_phase_at_points`
     but accepts broadcastable row/column arrays so tiled kernels never
     materialise a full meshgrid.
 
@@ -304,7 +304,7 @@ def carrier_multiply_torch(
 ) -> np.ndarray:
     """Multiply complex samples by ``exp(sign * 1j * phase)`` on a device.
 
-    Mirrors :func:`faninsar.processing.tops.deramp._apply_carrier_phase`:
+    Mirrors :func:`faninsar.processing.coregistration.tops.deramp._apply_carrier_phase`:
     cos/sin are evaluated in float64 for large carrier phases and multiplied
     in float32, avoiding complex128 temporary planes on full bursts.
 
@@ -370,7 +370,7 @@ def tops_carrier_multiply_torch(
 ) -> np.ndarray:
     """Deramp (``sign=-1``) or reramp (``sign=+1``) a burst window in Torch.
 
-    Mirrors :func:`faninsar.processing.tops.deramp._apply_carrier_tiled`:
+    Mirrors :func:`faninsar.processing.coregistration.tops.deramp._apply_carrier_tiled`:
     the analytical carrier is evaluated in azimuth tiles so phase and
     cos/sin temporaries never cover the full burst.
 
@@ -905,7 +905,7 @@ def esd_azimuth_shift_torch(
 ) -> object:
     """Estimate the ESD residual azimuth shift with a Torch backend.
 
-    Mirrors :func:`faninsar.processing.coreg.esd.estimate_azimuth_shift_esd`:
+    Mirrors :func:`faninsar.processing.coregistration.esd.estimate_azimuth_shift_esd`:
     azimuth spectral looks are split with a Tukey-tapered bandpass, dual-look
     interferograms are formed, and the amplitude-weighted circular mean of
     the differential phase yields the residual shift in pixels.
@@ -1021,7 +1021,7 @@ def esd_azimuth_shift_torch(
         logger.warning(
             "Torch ESD has no valid differential samples; returning zero shift"
         )
-        from faninsar.processing.coreg.esd import ESDResult
+        from faninsar.processing.coregistration.esd import ESDResult
 
         return ESDResult(azimuth_shift_px=0.0, coherence=0.0, phase_rad=0.0)
     phase_mean = float(weighted.angle().item())
@@ -1029,7 +1029,7 @@ def esd_azimuth_shift_torch(
     coherence = float(np.clip(coherence, min_coherence, 1.0))
     denom = 2.0 * math.pi * bandwidth_fraction
     az_shift = -phase_mean / denom
-    from faninsar.processing.coreg.esd import ESDResult
+    from faninsar.processing.coregistration.esd import ESDResult
 
     logger.info(
         "Torch ESD az_shift=%.4f px coherence=%.3f phase=%.3f rad",

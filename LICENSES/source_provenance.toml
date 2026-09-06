@@ -1,0 +1,13 @@
+# Machine-readable source provenance policy shipped with FanInSAR.
+
+schema_version = 1
+project = "FanInSAR"
+
+[[policy]]
+id = "snaphu-separate-license"
+name = "snaphu-py optional unwrapping backend"
+license = "external dependency; inspect installed notices"
+implementation_method = "external_optional_dependency"
+status = "quarantined"
+attribution = "snaphu-py and bundled SNAPHU sources retain their own notices"
+test_oracle = "FanInSAR functional backend tests"

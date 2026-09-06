@@ -14,6 +14,7 @@ import pandas as pd
 import rasterio
 import rioxarray  # noqa: F401
 import xarray as xr
+from odc.geo.types import Resolution
 from pyproj.crs import CRS
 from rasterio import features, fill, plot
 from rasterio import mask as rio_mask
@@ -26,12 +27,12 @@ from rasterio.warp import transform as warp_transform
 from tqdm import tqdm
 
 from faninsar.data.datasets.geogrid import GeoGrid
-from faninsar.io.export.kmz import array2kmz
-from faninsar.processing.geometry.coordinates import bounds_from_xy, xy_from_transform
-from faninsar.processing.geometry.profiles import Profile
 from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
+from faninsar.io.export.kmz import array2kmz
 from faninsar.io.lazy_rasterio import LazyMultiFileReader
 from faninsar.logging import setup_logger
+from faninsar.processing.geometry.coordinates import bounds_from_xy, xy_from_transform
+from faninsar.processing.geometry.profiles import Profile
 
 from ._base_common import (
     _serialize_bbox,
@@ -1106,16 +1107,18 @@ class RasterDataset(GeoDataset):
                         qroot["boxes"] = [_serialize_bbox(query.boxes)]
                 if query.polygons is not None:
                     qroot["polygons"] = _serialize_polygons(query.polygons)
-            root_attrs.update({
-                "query_json": json.dumps(qroot),
-                "query_repr": (
-                    "GeoQuery("
-                    f"points={query.points is not None}, "
-                    f"boxes={query.boxes is not None}, "
-                    f"polygons={query.polygons is not None}"
-                    ")"
-                ),
-            })
+            root_attrs.update(
+                {
+                    "query_json": json.dumps(qroot),
+                    "query_repr": (
+                        "GeoQuery("
+                        f"points={query.points is not None}, "
+                        f"boxes={query.boxes is not None}, "
+                        f"polygons={query.polygons is not None}"
+                        ")"
+                    ),
+                }
+            )
         except Exception:
             pass
         root_ds = xr.Dataset(attrs=root_attrs)
@@ -1288,10 +1291,12 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update({
-                "y": ("y", np.asarray(y)),
-                "x": ("x", np.asarray(x)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(y)),
+                    "x": ("x", np.asarray(x)),
+                }
+            )
 
             # Create Dataset with dask array (still lazy!)
             ds = xr.Dataset(
@@ -1343,10 +1348,12 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update({
-                "y": ("y", np.asarray(y)),
-                "x": ("x", np.asarray(x)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(y)),
+                    "x": ("x", np.asarray(x)),
+                }
+            )
 
             # Create Dataset with dask array (still lazy!)
             ds = xr.Dataset(
@@ -1443,10 +1450,12 @@ class RasterDataset(GeoDataset):
             dims = (file_dim, "y", "x")
 
             coords = self._file_coords(resolved_indexes, paths, files_df)
-            coords.update({
-                "y": ("y", np.asarray(y)),
-                "x": ("x", np.asarray(x)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(y)),
+                    "x": ("x", np.asarray(x)),
+                }
+            )
 
             # Create Dataset with lazy array
             wkt = poly_geom.wkt if hasattr(poly_geom, "wkt") else str(poly_geom)
@@ -1459,11 +1468,13 @@ class RasterDataset(GeoDataset):
                     "nodata": self.nodata,
                     "lazy": True,
                     "polygon_wkt": wkt,
-                    "query_json": json.dumps({
-                        "type": "Polygon",
-                        "crs": str(self.crs) if self.crs is not None else None,
-                        "wkt": wkt,
-                    }),
+                    "query_json": json.dumps(
+                        {
+                            "type": "Polygon",
+                            "crs": str(self.crs) if self.crs is not None else None,
+                            "wkt": wkt,
+                        }
+                    ),
                     "query_repr": f"Polygon(crs={self.crs})",
                 },
             )
@@ -1510,23 +1521,27 @@ class RasterDataset(GeoDataset):
         y_pts = np.asarray(pts.y, dtype=float)
 
         coords = self._file_coords(resolved_indexes, paths, files_df)
-        coords.update({
-            "point": ("point", np.arange(data.shape[-1])),
-            "x": ("point", x_pts),
-            "y": ("point", y_pts),
-        })
+        coords.update(
+            {
+                "point": ("point", np.arange(data.shape[-1])),
+                "x": ("point", x_pts),
+                "y": ("point", y_pts),
+            }
+        )
         if data.ndim == 3:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
         ds = xr.Dataset({"data": (dims, data)}, coords=coords)
         # Dual-track saving: query_json + human-readable query_repr
         qjson = json.dumps(_serialize_points(points))
-        ds.attrs.update({
-            "crs": str(self.crs) if self.crs is not None else None,
-            "nodata": self.nodata,
-            "query_json": qjson,
-            "query_repr": f"Points(count={len(points)}, crs={points.crs})",
-        })
+        ds.attrs.update(
+            {
+                "crs": str(self.crs) if self.crs is not None else None,
+                "nodata": self.nodata,
+                "query_json": qjson,
+                "query_repr": f"Points(count={len(points)}, crs={points.crs})",
+            }
+        )
         return ds
 
     def _make_bbox_ds(
@@ -1553,10 +1568,12 @@ class RasterDataset(GeoDataset):
         dims = (file_dim, "band", "y", "x") if data.ndim == 4 else (file_dim, "y", "x")
 
         coords = self._file_coords(indexes, paths, files_df)
-        coords.update({
-            "y": ("y", np.asarray(y)),
-            "x": ("x", np.asarray(x)),
-        })
+        coords.update(
+            {
+                "y": ("y", np.asarray(y)),
+                "x": ("x", np.asarray(x)),
+            }
+        )
         if data.ndim == 4:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
@@ -1571,16 +1588,18 @@ class RasterDataset(GeoDataset):
                 "nodata": self.nodata,
             },
         )
-        ds.attrs.update({
-            "query_json": json.dumps(_serialize_bbox(single_bbox)),
-            "query_repr": (
-                "BBox("
-                f"{single_bbox.left}, {single_bbox.bottom}, "
-                f"{single_bbox.right}, {single_bbox.top}, "
-                f"crs={single_bbox.crs}"
-                ")"
-            ),
-        })
+        ds.attrs.update(
+            {
+                "query_json": json.dumps(_serialize_bbox(single_bbox)),
+                "query_repr": (
+                    "BBox("
+                    f"{single_bbox.left}, {single_bbox.bottom}, "
+                    f"{single_bbox.right}, {single_bbox.top}, "
+                    f"crs={single_bbox.crs}"
+                    ")"
+                ),
+            }
+        )
         ds["data"] = ds["data"].fis.set_spatial_ref(
             crs=self.crs,
             x_dim="x",
@@ -1612,10 +1631,12 @@ class RasterDataset(GeoDataset):
         dims = (file_dim, "band", "y", "x") if data.ndim == 4 else (file_dim, "y", "x")
 
         coords = self._file_coords(indexes, paths, files_df)
-        coords.update({
-            "y": ("y", np.asarray(y)),
-            "x": ("x", np.asarray(x)),
-        })
+        coords.update(
+            {
+                "y": ("y", np.asarray(y)),
+                "x": ("x", np.asarray(x)),
+            }
+        )
         if data.ndim == 4:
             coords["band"] = ("band", np.arange(data.shape[1]))
 
@@ -1666,10 +1687,12 @@ class RasterDataset(GeoDataset):
                 dims = (file_dim, "y", "x")
 
             coords = dict(file_coords)
-            coords.update({
-                "y": ("y", np.asarray(y)),
-                "x": ("x", np.asarray(x)),
-            })
+            coords.update(
+                {
+                    "y": ("y", np.asarray(y)),
+                    "x": ("x", np.asarray(x)),
+                }
+            )
             if vals_i.ndim == 4:
                 coords["band"] = ("band", np.arange(vals_i.shape[1]))
 
@@ -1688,14 +1711,18 @@ class RasterDataset(GeoDataset):
                 wkt = poly_geom.wkt
             except Exception:
                 wkt = str(poly_geom)
-            ds.attrs.update({
-                "query_json": json.dumps({
-                    "type": "Polygon",
-                    "crs": str(self.crs) if self.crs is not None else None,
-                    "wkt": wkt,
-                }),
-                "query_repr": f"Polygon(crs={self.crs})",
-            })
+            ds.attrs.update(
+                {
+                    "query_json": json.dumps(
+                        {
+                            "type": "Polygon",
+                            "crs": str(self.crs) if self.crs is not None else None,
+                            "wkt": wkt,
+                        }
+                    ),
+                    "query_repr": f"Polygon(crs={self.crs})",
+                }
+            )
             ds["data"] = ds["data"].fis.set_spatial_ref(
                 crs=self.crs,
                 x_dim="x",
@@ -2027,7 +2054,11 @@ class RasterDataset(GeoDataset):
 
         """
         bbox = self._ensure_bbox(bbox)
-        grid = GeoGrid.from_bounds(self.bounds, res=self.res, crs=self.crs)
+        grid = GeoGrid.from_bounds(
+            self.bounds,
+            resolution=Resolution(self.res[0], -self.res[1]),
+            crs=self.crs,
+        )
         profile = Profile.from_geogrid(grid.to_view(bbox))
 
         profile["count"] = self.count

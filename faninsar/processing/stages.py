@@ -19,7 +19,7 @@ import numpy as np
 
 from faninsar.data.query import BoundingBox, Polygons
 from faninsar.logging import setup_logger
-from faninsar.missions.sentinel1 import (
+from faninsar.missions.s1 import (
     open_safe_product,
     read_eof_orbit,
     read_full_burst,
@@ -27,7 +27,7 @@ from faninsar.missions.sentinel1 import (
     stitch_bursts,
 )
 from faninsar.processing.coordinates import RadarGrid
-from faninsar.processing.coreg import (
+from faninsar.processing.coregistration import (
     combine_offset_fields,
     dense_geometry_offsets,
     estimate_azimuth_shift_esd,
@@ -36,6 +36,12 @@ from faninsar.processing.coreg import (
     resample_complex,
     resample_complex_deramped_reramp,
     resolve_ampcor_policy,
+)
+from faninsar.processing.coregistration.tops.carrier import carrier_from_swath
+from faninsar.processing.coregistration.tops.deramp import (
+    TOPSCarrierModel,
+    deramp,
+    reramp,
 )
 from faninsar.processing.dem import (
     DEM,
@@ -73,27 +79,25 @@ from faninsar.processing.interferometry.products import (
     write_pair_zarr,
 )
 from faninsar.processing.memory import close_memmap, release_memmap_pages
-from faninsar.processing.tops.carrier import carrier_from_swath
-from faninsar.processing.tops.deramp import TOPSCarrierModel, deramp, reramp
-from faninsar.processing.unwrap import SnaphuConfig, UnwrapBackend
-from faninsar.processing.unwrap import unwrap as unwrap_dispatch
+from faninsar.processing.unwrapping import SnaphuConfig, UnwrapBackend
+from faninsar.processing.unwrapping import unwrap as unwrap_dispatch
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from faninsar.missions.sentinel1.io import BurstArray
-    from faninsar.missions.sentinel1.types import S1Burst, S1Product, S1Swath
+    from faninsar.missions.s1.io import BurstArray
+    from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
     from faninsar.processing.contracts.prepared_geometry import (
         PhaseState,
         PreparedLutHandle,
         ProviderLeaseToken,
         ResourceLimits,
     )
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
     from faninsar.processing.memory import MemoryWatchdog
-    from faninsar.processing.merge.grid import GeoGridSpec
-    from faninsar.processing.unwrap.common import SpatialUnwrapResult
+    from faninsar.processing.mosaicking.grid import GeoGridSpec
+    from faninsar.processing.unwrapping.common import SpatialUnwrapResult
 
 logger = setup_logger(__name__)
 
@@ -575,9 +579,9 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
 
     from dataclasses import replace as _replace
 
-    from faninsar.missions.sentinel1 import read_eof_orbit, read_full_burst
-    from faninsar.missions.sentinel1.safe import open_safe_product
-    from faninsar.processing.tops.carrier import carrier_from_swath
+    from faninsar.missions.s1 import read_eof_orbit, read_full_burst
+    from faninsar.missions.s1.safe import open_safe_product
+    from faninsar.processing.coregistration.tops.carrier import carrier_from_swath
 
     tag = str(task["tag"])
     swath = str(task["swath"])
@@ -1107,7 +1111,7 @@ def read_prepared_geometry_field(
         reject_invalid_state(
             "prepared provider returned an invalid geometry payload record"
         )
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
 
     return PreparedGeometryField(
         field=OffsetFieldResult(
@@ -3295,7 +3299,7 @@ def _multilooked_geo_grid(
     multilook: tuple[int, int],
 ) -> GeoGridSpec:
     """Return the pixel-centre-aligned product grid after block multilooking."""
-    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.mosaicking.grid import GeoGridSpec
 
     azimuth_looks, range_looks = multilook
     from affine import Affine
@@ -3593,7 +3597,7 @@ def _auto_dem_bounds(
         )
     from dataclasses import replace as _replace
 
-    from faninsar.missions.sentinel1 import read_eof_orbit
+    from faninsar.missions.s1 import read_eof_orbit
     from faninsar.processing.geocoding.geo_lut import burst_geo_quad_lonlat
 
     quads: list[np.ndarray] = []
@@ -3746,8 +3750,8 @@ def _select_bursts_by_roi(
 
     from shapely.geometry import Polygon as ShapelyPolygon
 
-    from faninsar.missions.sentinel1 import read_eof_orbit
-    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.missions.s1 import read_eof_orbit
+    from faninsar.missions.s1.safe import open_safe_product
     from faninsar.processing.geocoding.geo_lut import burst_geo_quad_lonlat
 
     region = _roi_geometry(roi)
@@ -4248,7 +4252,7 @@ def produce_interferogram_pair(
             dem_source=dem_source,
             record_scientific_lineage=record_scientific_lineage,
         )
-    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.missions.s1.safe import open_safe_product
     dem_sampler: DEM = dem if dem is not None else ConstantDEM(0.0)
     snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
     if snapshot_root is not None and isinstance(dem_sampler, PublicRasterDEM):
@@ -4869,7 +4873,7 @@ def produce_interferogram_pair(
         + format(float(np.nanmean(coherence)), ".3f")
     )
     if unwrap:
-        from faninsar.processing.unwrap import SnaphuConfig
+        from faninsar.processing.unwrapping import SnaphuConfig
 
         method: UnwrapBackend = unwrap_method if unwrap_method is not None else "snaphu"
         config_for_unwrap = snaphu_config
@@ -4937,7 +4941,7 @@ def _produce_interferogram_sweep(
     misreg_rg_px: float = 0.0,
 ) -> ProductionPairState | ProductionPairSweepResult:
     """Run one shared prefix and emit every look configuration."""
-    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.missions.s1.safe import open_safe_product
     if (prepared_geo_lut_handles is None) != (prepared_provider_root is None):
         reject_invalid_state(
             "prepared Geo LUT reuse requires both handles and provider root"
@@ -5325,8 +5329,8 @@ def _archive_burst_ifgs(
     the shared ``geo_grid`` and archived as valid-bounding-box crops of the
     geocoded interferogram, per-unit power, and DEM height field.
     """
-    from faninsar.missions.sentinel1 import read_eof_orbit, read_full_burst
-    from faninsar.processing.tops.carrier import carrier_from_swath
+    from faninsar.missions.s1 import read_eof_orbit, read_full_burst
+    from faninsar.processing.coregistration.tops.carrier import carrier_from_swath
 
     if coregistration_grid == "geo" and (geo_grid is None or geo_work_dir is None):
         reject_invalid_state("geo coregistration requires geo_grid and geo_work_dir")

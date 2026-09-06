@@ -418,7 +418,7 @@ def test_local_provider_decodes_geo_lut_with_explicit_crop_origin(
     tmp_path: Path,
 ) -> None:
     """A prepared LUT read preserves grid identity and crop coordinates."""
-    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.stages import read_prepared_lut
 
     grid = GeoGridSpec(
@@ -528,7 +528,7 @@ def test_local_provider_decodes_geo_lut_with_explicit_crop_origin(
 
 def test_local_provider_rejects_geo_lut_grid_identity_mismatch(tmp_path: Path) -> None:
     """A LUT cannot be opened for a different CRS or grid shape."""
-    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.mosaicking.grid import GeoGridSpec
 
     grid = GeoGridSpec(
         crs="EPSG:32633",

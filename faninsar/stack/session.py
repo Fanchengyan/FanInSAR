@@ -45,7 +45,7 @@ from faninsar.core.network import (
 )
 from faninsar.logging import setup_logger
 from faninsar.network.network import Network
-from faninsar.processing.coreg.misreg_network import (
+from faninsar.processing.coregistration.misreg_network import (
     DateMisreg,
     MisregArc,
     invert_pair_misregistration,
@@ -60,8 +60,8 @@ from faninsar.processing.interferometry.phase_filter import (
     GoldsteinWerner,
     PhaseFilter,
 )
-from faninsar.processing.unwrap.errors import UnwrapFailedError
-from faninsar.processing.unwrap.irls import SpatialIRLS
+from faninsar.processing.unwrapping.errors import UnwrapFailedError
+from faninsar.processing.unwrapping.irls import SpatialIRLS
 from faninsar.stack.catalog import SceneCatalog
 from faninsar.stack.config import (
     ActivationMode,
@@ -89,7 +89,7 @@ if TYPE_CHECKING:
         StackActivationBinding,
     )
     from faninsar.processing.dem import DEM, GridSpec
-    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.resources import ResourceBudget
     from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.stages import (
@@ -97,16 +97,16 @@ if TYPE_CHECKING:
         CoregistrationGrid,
         ProductionPairState,
     )
-    from faninsar.processing.timeseries.inversion import TimeSeriesResult
-    from faninsar.processing.unwrap.common import SpatialUnwrapper
-    from faninsar.processing.unwrap.quality import StackQualityCriteria
-    from faninsar.processing.unwrap.stack import SpatialExecutor, StackUnwrapResult
+    from faninsar.processing.unwrapping.common import SpatialUnwrapper
+    from faninsar.processing.unwrapping.quality import StackQualityCriteria
+    from faninsar.processing.unwrapping.stack import SpatialExecutor, StackUnwrapResult
     from faninsar.stack.ifg_store import (
         InterferogramArtifactStore,
         UnwrappedArtifact,
     )
     from faninsar.stack.provider import StackSceneProvider
     from faninsar.stack.stack_generation import StackResultGeneration
+    from faninsar.timeseries.results import TimeSeriesResult
 
 logger = setup_logger(__name__)
 
@@ -3079,11 +3079,11 @@ class Stack(NetworkContract):
             reserve_estimate,
         )
         from faninsar.processing.runtime.device import parse_device
-        from faninsar.processing.unwrap.common import (
+        from faninsar.processing.unwrapping.common import (
             SpatialUnwrapper,
             SpatialUnwrapResult,
         )
-        from faninsar.processing.unwrap.errors import (
+        from faninsar.processing.unwrapping.errors import (
             NoValidSupportError,
             UnwrapFailedError,
         )
@@ -3341,12 +3341,12 @@ class Stack(NetworkContract):
             This session with :attr:`unwrap_result` populated.
 
         """
-        from faninsar.processing.unwrap.quality import (
+        from faninsar.processing.unwrapping.quality import (
             MetricDistribution,
             StackQualityCriteria,
             StackQualityReport,
         )
-        from faninsar.processing.unwrap.stack import unwrap_stack
+        from faninsar.processing.unwrapping.stack import unwrap_stack
         from faninsar.stack.ifg_store import write_unwrapped_artifact
 
         requested_quality_criteria = asdict(quality_criteria or StackQualityCriteria())
@@ -3526,7 +3526,7 @@ class Stack(NetworkContract):
         is omitted, the exact configured pair network is loaded from immutable
         unwrap artifacts without rerunning any upstream processing.
         """
-        from faninsar.processing.timeseries.inversion import invert_unwrapped_pairs
+        from faninsar.timeseries.results import invert_unwrapped_pairs
 
         if pair_phases is None:
             stores = (
@@ -3972,7 +3972,7 @@ class Stack(NetworkContract):
         ----------
         timeseries_root : str or pathlib.Path
             Immutable time-series transaction root produced by
-            :func:`~faninsar.processing.timeseries.write_timeseries_zarr`.
+            :func:`~faninsar.timeseries.io.write_timeseries_zarr`.
         multilook : tuple[int, int], optional
             Artifact view to bind. Defaults to the configured look factors.
         ifg_root : str or pathlib.Path, optional

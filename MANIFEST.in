@@ -1,5 +1,6 @@
-recursive-include faninsar/plots/cm *.csv *.cpt *.pdf *.pyi *.txt
+recursive-include faninsar/plotting/colormaps *.csv *.cpt *.pdf *.pyi *.txt
 recursive-include faninsar/processing/geometry/native_v2 *.cpp *.h *.cu *.cuh
+recursive-include LICENSES *
 prune build
 prune dist
 prune FanInSAR.egg-info

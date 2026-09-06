@@ -19,7 +19,7 @@ import numpy as np
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
-    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.mosaicking.grid import GeoGridSpec
 
 PROVIDER_SCHEMA = "prepared_geometry_provider.v1"
 ViewKind = Literal["pair_window", "stack_scene_view"]

@@ -23,7 +23,7 @@ import numpy as np
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
-    from faninsar.processing.tops.deramp import TOPSCarrierModel
+    from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
 
 logger = setup_logger(__name__)
 

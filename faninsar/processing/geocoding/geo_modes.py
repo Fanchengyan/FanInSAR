@@ -15,10 +15,10 @@ from faninsar.processing.geocoding.geo_resample import (
 from faninsar.processing.memory import release_memmap_pages
 
 if TYPE_CHECKING:
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
     from faninsar.processing.memory import MemoryWatchdog
-    from faninsar.processing.tops.deramp import TOPSCarrierModel
 
 __all__ = ["coregister_geocoded_slcs", "coregister_geocoded_slcs_chunked"]
 
@@ -42,7 +42,9 @@ def _apply_reramp(
             "Geographic reramp is not CUDA-qualified; using the NumPy CPU "
             "reference path"
         )
-        from faninsar.processing.tops.deramp import carrier_phase_at_points
+        from faninsar.processing.coregistration.tops.deramp import (
+            carrier_phase_at_points,
+        )
 
         phase = carrier_phase_at_points(
             carrier,

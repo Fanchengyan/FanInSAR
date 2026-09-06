@@ -28,7 +28,7 @@ from faninsar.processing.geometry import RadarGeometryModel
 from faninsar.processing.geometry.prepare_production import run_rdr2geo
 
 if TYPE_CHECKING:
-    from faninsar.missions.sentinel1.types import S1Burst, S1Swath
+    from faninsar.missions.s1.types import S1Burst, S1Swath
     from faninsar.processing.runtime.types import DeviceLike
 
 logger = setup_logger(__name__)

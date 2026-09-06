@@ -16,8 +16,7 @@ from faninsar.processing.interferometry.pair import (
     form_interferogram,
     goldstein_filter,
 )
-from faninsar.processing.merge.grid import GeoGridSpec
-from faninsar.processing.timeseries import write_timeseries_zarr
+from faninsar.processing.mosaicking.grid import GeoGridSpec
 from faninsar.stack import Stack, StackConfig, StackSceneProvider
 from faninsar.stack.activation import LocalActivationAuthority
 from faninsar.stack.catalog import SceneCatalog
@@ -27,6 +26,7 @@ from faninsar.stack.ifg_store import (
     write_unwrapped_artifact,
 )
 from faninsar.stack.scene_store import write_scene_unit
+from faninsar.timeseries.io import write_timeseries_zarr
 
 if TYPE_CHECKING:
     from faninsar.stack.provider import SourceHandle
@@ -233,7 +233,7 @@ def test_coreg_resume_restores_burst_array_shape_from_samples(
     """Radar resume accepts the production BurstArray shape contract."""
     from types import SimpleNamespace
 
-    from faninsar.missions.sentinel1.io import BurstArray
+    from faninsar.missions.s1.io import BurstArray
 
     stack = _stack_with_three_date_network(tmp_path)
     shape = (5, 7)
@@ -954,6 +954,34 @@ def test_stack_unwrap_publishes_durable_network_generation(tmp_path: Path) -> No
     stack.unwrap()
     assert stack.analysis_ready
     assert stack.network_product_index is not None
+
+
+def test_live_stack_network_view_exposes_committed_ifg_pairs(
+    tmp_path: Path,
+) -> None:
+    """A refreshed Stack Network view exposes its committed Pair products."""
+    stack = _stack_with_three_date_network(tmp_path)
+    phase = np.full((3, 4), 0.2, dtype=np.float32)
+    for pair_id in (
+        "20240101_20240113",
+        "20240113_20240125",
+        "20240101_20240125",
+    ):
+        _write_pair_artifact(stack, pair_id, phase)
+
+    stack._refresh_network_from_ifg_dirs()
+
+    network = stack.network
+    assert network is not None
+    assert network.interferograms is not None
+    assert network.interferograms.pairs().to_names().tolist() == [
+        "20240101_20240113",
+        "20240113_20240125",
+        "20240101_20240125",
+    ]
+    opened = network.interferograms.open_stack("complex_ifg")
+    assert opened.shape == (3, 3, 4)
+    np.testing.assert_allclose(opened.values, np.stack([np.exp(1j * phase)] * 3))
 
 
 def test_publish_generation_exports_canonical_network_view(tmp_path: Path) -> None:

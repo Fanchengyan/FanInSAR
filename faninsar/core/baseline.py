@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 
-from faninsar.plots.utils import create_discrete_colormap
+from faninsar.plotting.utils import create_discrete_colormap
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from matplotlib.legend import Legend
 
     from faninsar.core.pairs import Pairs
-    from faninsar.plots.hist_colorbar import HistColorbar
+    from faninsar.plotting.colorbar import HistColorbar
 
 
 class Baselines:
@@ -171,7 +171,7 @@ class Baselines:
             lc.set_array(days_array)
             pairs_collection = ax.add_collection(lc)
 
-            from faninsar.plots.hist_colorbar import HistColorbar
+            from faninsar.plotting.colorbar import HistColorbar
 
             colorbar = HistColorbar(
                 data=days_array,
@@ -223,7 +223,7 @@ class Baselines:
             of keys like ["pairs", "pairs_removed", "acquisitions", "gaps"].
 
         """
-        from faninsar.plots.utils import HandlerGradientLine
+        from faninsar.plotting.utils import HandlerGradientLine
 
         handles = []
         labels = []

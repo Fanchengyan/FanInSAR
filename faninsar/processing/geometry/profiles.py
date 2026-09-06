@@ -23,8 +23,8 @@ if TYPE_CHECKING:
 
     from numpy.typing import ArrayLike
 
-    from faninsar.data.query.bbox import BoundingBox
     from faninsar.core.types import CrsLike
+    from faninsar.data.query.bbox import BoundingBox
 
 logger = setup_logger(__name__)
 

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
         StackActivationBinding,
     )
     from faninsar.processing.dem import DEM, GridSpec
-    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.stages import (
         BurstSelection,

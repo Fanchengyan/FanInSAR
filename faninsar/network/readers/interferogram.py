@@ -760,7 +760,7 @@ class InterferogramCollection:
         InterferogramCollection
 
         """
-        from faninsar.io.datasets.hyp3 import HyP3S1
+        from faninsar.data._adapters.hyp3 import HyP3S1
 
         dataset = HyP3S1(root_dir=root_dir, **dataset_kwargs)
         return cls.from_dataset(

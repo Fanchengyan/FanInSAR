@@ -49,7 +49,7 @@ from faninsar.processing.geometry.prepared_store import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from faninsar.processing.merge.grid import GeoGridSpec
+    from faninsar.processing.mosaicking.grid import GeoGridSpec
 
 logger = setup_logger(__name__)
 

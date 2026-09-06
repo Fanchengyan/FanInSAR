@@ -10,7 +10,7 @@ from subprocess import run
 
 from packaging.requirements import Requirement
 
-from faninsar.capabilities import format_backend_capabilities
+from faninsar.processing.runtime.capabilities import format_backend_capabilities
 
 PROJECT_ROOT = Path(__file__).parents[1]
 
@@ -38,8 +38,8 @@ def test_unwrap_dispatcher_does_not_load_optional_snaphu_adapter() -> None:
             sys.executable,
             "-c",
             (
-                "import sys; import faninsar.processing.unwrap.api; "
-                "assert 'faninsar.processing.unwrap.snaphu_backend' "
+                "import sys; import faninsar.processing.unwrapping.api; "
+                "assert 'faninsar.processing.unwrapping.snaphu_backend' "
                 "not in sys.modules; assert 'snaphu' not in sys.modules"
             ),
         ],

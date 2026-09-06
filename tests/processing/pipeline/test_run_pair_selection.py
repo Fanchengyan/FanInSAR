@@ -122,7 +122,7 @@ def test_common_burst_indices_rejects_shifted_pass_times() -> None:
 @pytest.mark.skipif(not SCENES, reason="need a local S1 ZIP scene")
 def test_select_bursts_by_roi_uses_real_footprints() -> None:
     """An ROI around burst 0 selects it while a distant ROI selects nothing."""
-    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.missions.s1.safe import open_safe_product
     from faninsar.data.query import BoundingBox
 
     product = open_safe_product(SCENES[0])
@@ -145,7 +145,7 @@ def test_select_bursts_by_roi_uses_real_footprints() -> None:
 @pytest.mark.skipif(not SCENES, reason="need a local S1 ZIP scene")
 def test_roi_selection_ignores_explicit_swath_choice() -> None:
     """An ROI selects bursts from every swath, not just the requested one."""
-    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.missions.s1.safe import open_safe_product
     from faninsar.data.query import BoundingBox
 
     product = open_safe_product(SCENES[0])
@@ -164,7 +164,7 @@ def test_roi_selection_ignores_explicit_swath_choice() -> None:
 @pytest.mark.skipif(not SCENES, reason="need a local S1 ZIP scene")
 def test_roi_burst_window_projects_onto_real_geometry() -> None:
     """The ROI radar window stays inside the burst extent."""
-    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.missions.s1.safe import open_safe_product
     from faninsar.processing.dem import ConstantDEM
     from faninsar.processing.stages import _radar_model
     from faninsar.data.query import BoundingBox
@@ -223,7 +223,7 @@ def test_window_crop_bounds_are_stride_aligned_and_cover_window() -> None:
 
 def test_window_resample_halo_required_matches_offset_extent() -> None:
     """The required halo covers the offset magnitude plus the Lanczos kernel."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
 
     shape = (64, 128)
     offsets = OffsetFieldResult(
@@ -249,7 +249,7 @@ def test_window_resample_halo_required_matches_offset_extent() -> None:
 
 def test_window_halo_sufficient_exempts_burst_edges() -> None:
     """Burst-edge sides pass while interior shortfalls fail."""
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
 
     shape = (64, 128)
     offsets = OffsetFieldResult(

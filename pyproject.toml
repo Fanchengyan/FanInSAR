@@ -80,7 +80,7 @@ dependencies = [
 
 [project.scripts]
 faninsar = "faninsar.cli.main:main"
-faninsar-merge-bursts = "faninsar.processing.merge.cli:main"
+faninsar-merge-bursts = "faninsar.cli.mosaicking:main"
 
 
 [project.optional-dependencies]

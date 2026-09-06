@@ -116,7 +116,7 @@ def test_ampcor_native_ncc_cuda_product_contract(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    from faninsar.processing.coreg import (
+    from faninsar.processing.coregistration import (
         AmpcorNccPreDispatchError,
         ampcor_ncc_postprocess_reference,
         prepare_ampcor_ncc_native,

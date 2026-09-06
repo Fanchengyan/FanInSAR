@@ -682,7 +682,7 @@ def publish_stack_generation(
             )
     timeseries_path = Path(timeseries_root)
     relative_timeseries_root = _relative_artifact_root(root, timeseries_path)
-    from faninsar.processing.timeseries.inversion import open_timeseries_zarr
+    from faninsar.timeseries.io import open_timeseries_zarr
 
     with open_timeseries_zarr(timeseries_path) as timeseries_store:
         timeseries_pair_ids = _timeseries_pair_ids(timeseries_store.path)
@@ -919,7 +919,7 @@ def open_stack_generation(stack_root: str | Path) -> StackResultGeneration:
             reject_invalid_state(
                 "Stack time-series child generation binding is invalid"
             )
-        from faninsar.processing.timeseries.inversion import open_timeseries_zarr
+        from faninsar.timeseries.io import open_timeseries_zarr
 
         with open_timeseries_zarr(timeseries_root) as timeseries_store:
             if (

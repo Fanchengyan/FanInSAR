@@ -13,10 +13,10 @@ import numpy as np
 import pytest
 import zarr
 
-from faninsar.missions.sentinel1.errors import Sentinel1ProductError
+from faninsar.missions.s1.errors import Sentinel1ProductError
 from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.merge.grid import GeoGridSpec
+from faninsar.processing.mosaicking.grid import GeoGridSpec
 from faninsar.processing.stages import ProductionPairState
 import faninsar.processing.stages as production_mod
 from faninsar.processing.stages import (
@@ -515,7 +515,7 @@ def test_shared_resources_cleanup_is_idempotent(tmp_path: Path) -> None:
 @pytest.mark.skipif(len(SCENES) < 2, reason="need two local S1 ZIP scenes")
 def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None:
     """A one-config radar sweep is array-identical to the single-config run."""
-    from faninsar.missions.sentinel1.safe import open_safe_product
+    from faninsar.missions.s1.safe import open_safe_product
     from faninsar.processing.stages import _common_burst_indices
 
     reference, secondary = SCENES[0], SCENES[1]
@@ -560,7 +560,7 @@ def test_snaphu_config_nlooks_overridden_per_config_radar(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Explicit SnaphuConfig nlooks is replaced by az * rg in radar finalize."""
-    from faninsar.processing.unwrap import SnaphuConfig
+    from faninsar.processing.unwrapping import SnaphuConfig
 
     archive = _radar_archive(tmp_path / "prefix")
     merged = production_mod._merge_burst_ifgs(
@@ -610,7 +610,7 @@ def test_snaphu_config_nlooks_overridden_per_config_geo(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Explicit SnaphuConfig nlooks is replaced by az * rg in geo finalize."""
-    from faninsar.processing.unwrap import SnaphuConfig
+    from faninsar.processing.unwrapping import SnaphuConfig
 
     archive = _geo_archive(tmp_path / "prefix")
     merged = production_mod._merge_burst_ifgs(
@@ -700,7 +700,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Geo sweeps hand the last unit state to SharedPairResources cleanup."""
-    from faninsar.missions.sentinel1 import safe as safe_module
+    from faninsar.missions.s1 import safe as safe_module
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
     work = tmp_path / "geo-memmaps"

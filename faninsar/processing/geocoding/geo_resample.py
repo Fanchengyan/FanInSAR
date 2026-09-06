@@ -12,7 +12,7 @@ from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.resampling import lanczos_resample
 
 if TYPE_CHECKING:
-    from faninsar.processing.coreg.offsets import OffsetFieldResult
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 
 __all__ = [

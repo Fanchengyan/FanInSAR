@@ -9,7 +9,7 @@ import pytest
 
 from faninsar.processing.atmosphere import IonosphereEstimationConfig
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.unwrap import SpatialIRLS
+from faninsar.processing.unwrapping import SpatialIRLS
 from faninsar.stack import Stack
 from faninsar.stack.ion_store import IonosphereArtifactStore
 from faninsar.stack.scene_store import write_scene_unit

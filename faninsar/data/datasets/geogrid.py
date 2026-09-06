@@ -23,7 +23,7 @@ from odc.geo import GeoBox as OdcGeoBox
 from odc.geo.geobox import GeoboxTiles as OdcGeoboxTiles
 from odc.geo.geobox import pixel_translation
 from odc.geo.math import is_almost_int
-from rasterio.transform import from_bounds, rowcol
+from rasterio.transform import from_bounds, from_origin, rowcol
 from rasterio.windows import Window
 from rasterio.windows import transform as _window_transform
 
@@ -65,7 +65,7 @@ class GeoGrid(OdcGeoBox):
         height: int | None = None,
         res: float | tuple[float, float] | None = None,
         dtype: Any | None = None,
-        nodata: float | int | None = None,
+        nodata: float | None = None,
     ) -> None:
         """Construct a grid from odc-geo or raster geoinfo fields.
 
@@ -104,14 +104,14 @@ class GeoGrid(OdcGeoBox):
         bounds: BoundingBox,
         res: float | tuple[float, float],
         dtype: Any | None = None,
-        nodata: float | int | None = None,
+        nodata: float | None = None,
     ) -> GeoGrid:
         """Construct a grid from CRS, bounds, resolution, and raster metadata."""
         if isinstance(res, (int, float)):
             res = (float(res), float(res))
         xres, yres = abs(float(res[0])), abs(float(res[1]))
-        width = int(round((bounds.right - bounds.left) / xres))
-        height = int(round((bounds.top - bounds.bottom) / yres))
+        width = round((bounds.right - bounds.left) / xres)
+        height = round((bounds.top - bounds.bottom) / yres)
         if width <= 0 or height <= 0:
             raise ValueError("bounds and resolution must define a non-empty grid")
         return cls(
@@ -164,12 +164,53 @@ class GeoGrid(OdcGeoBox):
         if isinstance(res, (int, float)):
             res = (float(res), float(res))
         xres, yres = abs(float(res[0])), abs(float(res[1]))
-        width = max(1, int(round((self.bounds.right - self.bounds.left) / xres)))
-        height = max(1, int(round((self.bounds.top - self.bounds.bottom) / yres)))
         return type(self).from_geoinfo(
             crs=self.crs,
             bounds=self.bounds,
             res=(xres, yres),
+            dtype=self.dtype,
+            nodata=self.nodata,
+        )
+
+    def to_view(self, roi: BoundingBox) -> GeoGrid:
+        """Return a pixel-aligned view covering ``roi``.
+
+        Parameters
+        ----------
+        roi : BoundingBox
+            Region of interest. A different CRS is transformed to this grid's
+            CRS before selecting the pixel window.
+
+        Returns
+        -------
+        GeoGrid
+            A grid with the same pixel size and CRS, cropped to the aligned
+            pixel window.
+
+        """
+        if roi.crs is not None and roi.crs != self.crs:
+            roi = roi.to_crs(self.crs)
+        if roi == self.bounds:
+            return self
+
+        rows, cols = rowcol(
+            self.transform,
+            [roi.left, roi.right, roi.right, roi.left],
+            [roi.top, roi.top, roi.bottom, roi.bottom],
+            op=float,
+        )
+        row_start, row_stop = int(np.floor(min(rows))), int(np.ceil(max(rows)))
+        col_start, col_stop = int(np.floor(min(cols))), int(np.ceil(max(cols)))
+        row_start = max(0, min(self.height, row_start))
+        row_stop = max(row_start, min(self.height, row_stop))
+        col_start = max(0, min(self.width, col_start))
+        col_stop = max(col_start, min(self.width, col_stop))
+        west, north = self.transform * (col_start, row_start)
+        transform = from_origin(west, north, self.res[0], self.res[1])
+        return type(self)(
+            shape=(row_stop - row_start, col_stop - col_start),
+            affine=transform,
+            crs=self.crs,
             dtype=self.dtype,
             nodata=self.nodata,
         )
@@ -237,7 +278,8 @@ class GeoGrid(OdcGeoBox):
         """Construct GeoGrid from a bounding box.
 
         Returns the FanInSAR GeoGrid subclass instead of odc.geo.GeoBox.
-        See odc.geo.GeoBox.from_bbox for full documentation.
+        See odc.geo.GeoBox.from_bbox for full documentation. Use odc-geo's
+        canonical ``resolution=`` keyword for resolution-based construction.
 
         """
         odc_geobox = OdcGeoBox.from_bbox(*args, **kwargs)

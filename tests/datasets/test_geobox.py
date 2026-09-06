@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from odc.geo.types import Resolution
 from pyproj.crs import CRS
 from rasterio.transform import Affine
 
@@ -30,6 +31,20 @@ def test_geobox_dataset_basic_properties() -> None:
     assert vd.height == 10
     assert vd.res == (10, 10)
     assert vd.nodata == -9999
+
+
+def test_from_bbox_uses_canonical_resolution() -> None:
+    """Constructing a GeoGrid accepts odc-geo's canonical resolution keyword."""
+    bbox = BoundingBox(0, 0, 100, 100, crs=CRS.from_epsg(32633))
+    grid = GeoBox.from_bbox(
+        bbox.to_tuple(),
+        crs=bbox.crs,
+        resolution=Resolution(10, -10),
+        tight=True,
+    )
+    assert grid.shape == (10, 10)
+    assert grid.res == (10, 10)
+    assert grid.crs == bbox.crs
 
 
 def test_alignment_check() -> None:

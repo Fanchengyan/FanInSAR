@@ -14,6 +14,7 @@ from faninsar.core.acquisition import (
     DaySpan,
 )
 from faninsar.core.baseline import Baselines
+from faninsar.core.constants import SAR, Frequency, Wavelength
 from faninsar.core.interferogram import Interferogram
 from faninsar.core.loops import Loop, Loops, TripletLoop, TripletLoops
 from faninsar.core.network import (
@@ -35,8 +36,7 @@ from faninsar.core.physical import (
     PhysicalType,
     is_complete_lattice,
 )
-from faninsar.core.sar_missions import SAR, Sentinel1
-from faninsar.core.sar_property import Frequency, Wavelength
+from faninsar.core.sar_missions import Sentinel1
 from faninsar.core.sar_tools import PhaseDeformationConverter, multi_look
 
 __all__ = [

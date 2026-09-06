@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from faninsar.processing.coreg.esd import estimate_azimuth_shift_esd
+from faninsar.processing.coregistration.esd import estimate_azimuth_shift_esd
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.interferometry.flatten import remove_topographic_phase
 from faninsar.processing.interferometry.pair import (
@@ -13,7 +13,7 @@ from faninsar.processing.interferometry.pair import (
     form_interferogram,
     goldstein_filter,
 )
-from faninsar.processing.tops import TOPSCarrierModel, deramp, reramp
+from faninsar.processing.coregistration.tops import TOPSCarrierModel, deramp, reramp
 from faninsar.processing.torch_kernels import (
     CUDA_DTYPE_CHOICE,
     carrier_multiply_torch,
@@ -377,8 +377,8 @@ def test_carrier_multiply_torch_matches_deramp_and_reramp() -> None:
 
 def test_carrier_phase_at_points_torch_matches_numpy() -> None:
     """Analytical carrier phase matches the NumPy polynomial evaluation."""
-    from faninsar.processing.tops import tops_carrier_phase
-    from faninsar.processing.tops.deramp import carrier_phase_at_points
+    from faninsar.processing.coregistration.tops import tops_carrier_phase
+    from faninsar.processing.coregistration.tops.deramp import carrier_phase_at_points
 
     model = _carrier_model()
     rows = np.arange(32, dtype=np.float64)[:, None]

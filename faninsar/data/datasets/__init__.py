@@ -24,15 +24,15 @@ from .xarray_dataset import XarrayDataset, XarrayDataSpec
 def __getattr__(name: str) -> Any:
     """Load optional provider-specific dataset adapters on demand."""
     if name == "HyP3S1":
-        from faninsar.io.datasets.hyp3 import HyP3S1
+        from faninsar.data._adapters.hyp3 import HyP3S1
 
         return HyP3S1
     if name == "LiCSAR":
-        from faninsar.io.datasets.licsar import LiCSAR
+        from faninsar.data._adapters.licsar import LiCSAR
 
         return LiCSAR
     if name == "ARIA":
-        from faninsar.io.datasets.aria import ARIA
+        from faninsar.data._adapters.aria import ARIA
 
         return ARIA
     message = f"module {__name__!r} has no attribute {name!r}"

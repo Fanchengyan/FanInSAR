@@ -16,7 +16,7 @@ from faninsar.missions.nisar import NisarSensor
 from faninsar.processing.coordinates import GeoGrid
 from faninsar.processing.dem import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.merge.grid import GeoGridSpec
+from faninsar.processing.mosaicking.grid import GeoGridSpec
 from faninsar.processing.slc import GeoSLC, RadarSLC
 from faninsar.stack import NISARStack
 from faninsar.stack.nisar_provider import (
