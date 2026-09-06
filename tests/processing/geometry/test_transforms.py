@@ -12,9 +12,9 @@ if TYPE_CHECKING:
 
 import pytest
 
-from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.processing.coordinates import RadarGrid
-from faninsar.processing.dem import ConstantDEM
+from faninsar.processing.geometry import ConstantDEM
 from faninsar.processing.geometry import (
     RadarGeometryModel,
     interpolate_orbit,

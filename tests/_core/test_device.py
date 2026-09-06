@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from faninsar.processing.runtime.device import parse_device
-from faninsar.processing.resampling_torch import _resolve_torch_device
-from faninsar.processing.torch_kernels import resolve_torch_device
+from faninsar.processing.coregistration.resampling_torch import _resolve_torch_device
+from faninsar.processing.runtime.torch_kernels import resolve_torch_device
 
 Resolver = Callable[[object], torch.device]
 

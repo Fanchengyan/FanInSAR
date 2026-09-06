@@ -71,7 +71,7 @@ def _authenticate(session: requests.Session) -> None:
             m = re.search(r'name="authenticity_token"\s+value="([^"]+)"', r.text)
             if not m:
                 msg = "authenticity_token not found in URS login page"
-                raise RuntimeError(msg)
+                raise RuntimeError(msg)  # noqa: TRY301
 
             session.post(
                 "https://urs.earthdata.nasa.gov/login",
@@ -99,7 +99,7 @@ def _authenticate(session: requests.Session) -> None:
                 "asf-urs cookie not set after OAuth; "
                 f"cookies={list(session.cookies.keys())}"
             )
-            raise RuntimeError(msg)
+            raise RuntimeError(msg)  # noqa: TRY301
 
         except Exception as exc:
             last_err = exc

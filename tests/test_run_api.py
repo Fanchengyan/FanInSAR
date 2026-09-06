@@ -1,47 +1,43 @@
-"""fis.run front-door smoke tests."""
+"""Stack configuration ownership and retired runner closure tests."""
 
 from __future__ import annotations
 
-import subprocess
-import sys
-
 import pytest
 
-import faninsar
-from faninsar.processing.errors import PairConfigurationMigrationError
+from faninsar.stack.config import _load_config, _resolve_backend
 
 
-def test_run_requires_stack_paths() -> None:
-    """The config facade requires an explicit Stack source collection."""
-    from faninsar._stack_config import run
+def test_retired_stack_config_owner_is_absent() -> None:
+    """The removed module cannot be imported as a third execution seam."""
+    import importlib.util
 
-    with pytest.raises(ValueError, match="paths"):
-        run({})
+    assert importlib.util.find_spec("faninsar._stack_config") is None
 
 
-def test_root_has_no_third_execution_entry_point() -> None:
-    """The root package exposes Stack/Network, not a module-level runner."""
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import faninsar, importlib.util; "
-                "assert not hasattr(faninsar, 'run'); "
-                "assert importlib.util.find_spec('faninsar.run') is None"
-            ),
-        ],
-        check=False,
+def test_retired_aggregate_owners_are_absent() -> None:
+    """Removed aggregate modules do not remain as importable compatibility paths."""
+    import importlib.util
+
+    retired = (
+        "faninsar._public",
+        "faninsar.provenance",
+        "faninsar.processing.provenance",
+        "faninsar.processing.release",
+        "faninsar.validation",
     )
-    assert result.returncode == 0
+    assert all(importlib.util.find_spec(name) is None for name in retired)
 
 
-def test_run_rejects_pair_configuration_before_backend_resolution() -> None:
-    """Legacy reference/secondary fields fail with a typed migration error."""
-    from faninsar._stack_config import run
+def test_stack_config_keeps_loader_and_backend_helpers() -> None:
+    """Configuration parsing and backend resolution have one canonical owner."""
+    assert _load_config({"paths": ["a", "b"]}) == {"paths": ["a", "b"]}
+    assert _resolve_backend("numpy").name == "numpy"
 
-    with pytest.raises(PairConfigurationMigrationError, match="paths"):
-        run({"reference": "ref.SAFE", "secondary": "sec.SAFE"})
+
+def test_stack_config_does_not_accept_legacy_mask_options() -> None:
+    """Legacy mask spellings fail at the canonical configuration boundary."""
+    with pytest.raises(ValueError, match="legacy mask"):
+        _load_config({"water_mask": True})
 
 
 def test_processing_pipeline_hides_removed_pair_entry_points() -> None:

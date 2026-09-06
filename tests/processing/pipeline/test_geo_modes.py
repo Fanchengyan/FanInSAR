@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.processing.coordinates import RadarGrid
 from faninsar.processing.geometry import RadarGeometryModel
 from faninsar.processing.mosaicking.grid import GeoGridSpec
@@ -453,7 +453,7 @@ def test_shared_lut_apply_twice_same_shape() -> None:
 
 def test_build_geo2rdr_lut_accepts_height_array() -> None:
     """Per-pixel height_m array is accepted (DEM-aware LUT path)."""
-    from faninsar.processing.dem import ConstantDEM
+    from faninsar.processing.geometry import ConstantDEM
 
     geom = _toy_geometry((32, 64))
     grid = _projected_grid()

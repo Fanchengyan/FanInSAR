@@ -424,7 +424,7 @@ def _schedule_carrier_multiply(
     """
     import dask.array as da
 
-    from faninsar.processing.torch_kernels import (
+    from faninsar.processing.runtime.torch_kernels import (
         carrier_multiply_torch,
         carrier_phase_at_points_torch,
     )
@@ -475,7 +475,7 @@ def _schedule_remove_topographic_phase(
     """Schedule topographic flattening as a lazy Dask graph."""
     import dask.array as da
 
-    from faninsar.processing.torch_kernels import remove_topographic_phase_torch
+    from faninsar.processing.runtime.torch_kernels import remove_topographic_phase_torch
 
     _validate_chunk_rows(chunk_rows)
     worker_device = _scheduled_device(device, client)
@@ -522,7 +522,7 @@ def _schedule_multilook_interferogram(
     import dask
     import dask.array as da
 
-    from faninsar.processing.torch_kernels import multilook_interferogram_torch
+    from faninsar.processing.runtime.torch_kernels import multilook_interferogram_torch
 
     _validate_chunk_rows(chunk_rows)
     worker_device = _scheduled_device(device, client)
@@ -614,7 +614,7 @@ def _schedule_multilook_real(
     import dask
     import dask.array as da
 
-    from faninsar.processing.torch_kernels import multilook_real_torch
+    from faninsar.processing.runtime.torch_kernels import multilook_real_torch
 
     _validate_chunk_rows(chunk_rows)
     worker_device = _scheduled_device(device, client)
@@ -683,7 +683,7 @@ def _schedule_goldstein_filter(
     import dask
     import dask.array as da
 
-    from faninsar.processing.torch_kernels import goldstein_filter_torch
+    from faninsar.processing.runtime.torch_kernels import goldstein_filter_torch
 
     _validate_chunk_rows(chunk_rows)
     worker_device = _scheduled_device(device, client)
@@ -730,7 +730,7 @@ def run_carrier_multiply(
     client: Any | None = None,
 ) -> np.ndarray:
     """Carrier-multiply via Dask scheduling, or eager Torch on the device."""
-    from faninsar.processing.torch_kernels import tops_carrier_multiply_torch
+    from faninsar.processing.runtime.torch_kernels import tops_carrier_multiply_torch
 
     _reject_unpublished_device(device)
     resolved_client = client
@@ -772,7 +772,7 @@ def _carrier_multiply_at_points(
     device: str,
 ) -> np.ndarray:
     """Evaluate and apply a TOPS carrier at arbitrary source coordinates."""
-    from faninsar.processing.torch_kernels import (
+    from faninsar.processing.runtime.torch_kernels import (
         carrier_multiply_torch,
         carrier_phase_at_points_torch,
     )
@@ -842,7 +842,7 @@ def run_multilook_interferogram(
 ) -> Any:
     """Form a multilooked interferogram via Dask, or eager Torch."""
     from faninsar.processing.interferometry.pair import InterferogramProduct
-    from faninsar.processing.torch_kernels import multilook_interferogram_torch
+    from faninsar.processing.runtime.torch_kernels import multilook_interferogram_torch
 
     _reject_unpublished_device(device)
     resolved_client = client
@@ -885,7 +885,7 @@ def run_goldstein_filter(
     client: Any | None = None,
 ) -> np.ndarray:
     """Apply the Goldstein filter via Dask, or eager Torch."""
-    from faninsar.processing.torch_kernels import goldstein_filter_torch
+    from faninsar.processing.runtime.torch_kernels import goldstein_filter_torch
 
     _reject_unpublished_device(device)
     resolved_client = client
@@ -929,7 +929,7 @@ def run_remove_topographic_phase(
         )
         future = resolved_client.compute(graph)
         return np.asarray(resolved_client.gather(future))
-    from faninsar.processing.torch_kernels import remove_topographic_phase_torch
+    from faninsar.processing.runtime.torch_kernels import remove_topographic_phase_torch
 
     return remove_topographic_phase_torch(
         complex_ifg,
@@ -963,7 +963,7 @@ def run_multilook_real(
         )
         future = resolved_client.compute(graph)
         return np.asarray(resolved_client.gather(future))
-    from faninsar.processing.torch_kernels import multilook_real_torch
+    from faninsar.processing.runtime.torch_kernels import multilook_real_torch
 
     return multilook_real_torch(
         array,
@@ -984,7 +984,7 @@ def run_esd_azimuth_shift(
     range_chunk_size: int = 512,
 ) -> Any:
     """Estimate ESD locally or as one chunked task on a trusted client."""
-    from faninsar.processing.torch_kernels import esd_azimuth_shift_torch
+    from faninsar.processing.runtime.torch_kernels import esd_azimuth_shift_torch
 
     _reject_unpublished_device(device)
     if client is not None and use_gpu_resources(device, client):

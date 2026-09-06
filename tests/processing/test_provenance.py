@@ -6,16 +6,16 @@ from pathlib import Path
 import pytest
 import yaml
 
-from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.provenance import (
+from faninsar.io.storage.provenance import (
     ProcessingEvent,
     ProvenanceRecord,
     SoftwareIdentity,
 )
-from faninsar.validation.provenance import (
+from faninsar.io.storage.validation import (
     ManifestValidationError,
     validate_pipeline_rebuild_manifest,
 )
+from faninsar.processing.errors import InvalidProcessingStateError
 
 
 def test_provenance_json_and_stac_are_deterministic() -> None:

@@ -5,22 +5,20 @@ from datetime import UTC, datetime
 
 import pytest
 
-from faninsar.processing.contracts import (
-    ArrayDescriptor,
-    ArrayRepresentation,
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
+from faninsar.processing.interferometry.products import (
     CalibrationState,
     CarrierState,
     ComplexInterferogram,
     CoregistrationState,
     FlatteningState,
-    OrbitMetadata,
-    OrbitStateVector,
     PairProduct,
-    SLCProduct,
-    StackProduct,
     UnwrapResult,
 )
+from faninsar.processing.slc.products import SLCProduct, StackProduct
 from faninsar.processing.coordinates import (
+    ArrayDescriptor,
+    ArrayRepresentation,
     CoordinateSystem,
     GeoGrid,
     GridMismatchError,

@@ -93,10 +93,7 @@ def carrier_from_swath(
     )
     wavelength_m = SPEED_OF_LIGHT_M_S / swath.radar_frequency_hz
     steering_rate_hz_s = (
-        2.0
-        * velocity_m_s
-        * swath.azimuth_steering_rate_rad_s
-        / wavelength_m
+        2.0 * velocity_m_s * swath.azimuth_steering_rate_rad_s / wavelength_m
     )
 
     model = TOPSCarrierModel(

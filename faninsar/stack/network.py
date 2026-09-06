@@ -214,7 +214,7 @@ class StackInterferogramCollection(InterferogramCollection):
                 if name == "unw_phase":
                     generation = self._stack._unwrap_generation
                     if generation is None:
-                        from faninsar.stack.artifact_transaction import (
+                        from faninsar.io.storage.artifact_transaction import (
                             open_current_generation,
                         )
 

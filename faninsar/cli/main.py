@@ -108,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         from faninsar.processing.errors import PairConfigurationMigrationError
 
         if args.dem_source:
-            from faninsar.processing.dem import DEM
+            from faninsar.processing.geometry import DEM
 
             try:
                 DEM.from_source(args.dem_source)

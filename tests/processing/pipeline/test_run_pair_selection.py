@@ -165,7 +165,7 @@ def test_roi_selection_ignores_explicit_swath_choice() -> None:
 def test_roi_burst_window_projects_onto_real_geometry() -> None:
     """The ROI radar window stays inside the burst extent."""
     from faninsar.missions.s1.safe import open_safe_product
-    from faninsar.processing.dem import ConstantDEM
+    from faninsar.processing.geometry import ConstantDEM
     from faninsar.processing.stages import _radar_model
     from faninsar.data.query import BoundingBox
 

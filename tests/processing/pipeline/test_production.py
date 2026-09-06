@@ -10,7 +10,7 @@ import pytest
 import zarr
 
 from faninsar.processing.runtime.device import cuda_available
-from faninsar.processing.dem import ConstantDEM
+from faninsar.processing.geometry import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import PreparedGeometryArrayPayload
 from faninsar.processing.mosaicking.grid import GeoGridSpec
@@ -1005,7 +1005,7 @@ def test_staged_ifg_only_never_enters_unwrap(tmp_path: Path) -> None:
     """
     import zarr
 
-    from faninsar.processing.memory import MemoryWatchdog
+    from faninsar.processing.runtime.memory import MemoryWatchdog
 
     shape = (32, 64)
     ref = _make_mock_scene(shape)

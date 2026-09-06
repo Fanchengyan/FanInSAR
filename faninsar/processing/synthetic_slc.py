@@ -8,16 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np  # noqa: TC002
 
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.logging import setup_logger
-
-from .contracts import (
+from faninsar.processing.interferometry.products import (
     CalibrationState,
     CarrierState,
     CoregistrationState,
-    OrbitMetadata,
-    OrbitStateVector,
-    SLCProduct,
 )
+from faninsar.processing.slc.products import SLCProduct
+
 from .coordinates import ArrayDescriptor, ArrayRepresentation, RadarGrid
 from .readers import (
     DopplerCentroidPolynomial,

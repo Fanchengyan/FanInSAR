@@ -9,6 +9,7 @@ class MemoryCatalog:
     """In-memory STAC item collection for tests and boundary emission."""
 
     def __init__(self) -> None:
+        """Initialize an empty in-memory catalog."""
         self.items: list[Any] = []
 
     def add_item(self, item: Any) -> None:

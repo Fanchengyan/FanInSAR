@@ -537,9 +537,7 @@ class DEMManager:
         plan = self.source_entry.plan(bounds)
         if isinstance(plan, DeferredStacPlan):
             if not isinstance(self.source_entry, PcStacSource):
-                message = (
-                    "deferred STAC plan is only supported by PcStacSource"
-                )
+                message = "deferred STAC plan is only supported by PcStacSource"
                 logger.error(message)
                 raise InvalidProcessingStateError(message)
             return self.source_entry.discover(plan)

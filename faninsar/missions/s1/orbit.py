@@ -6,9 +6,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.logging import setup_logger
 from faninsar.missions.s1.errors import reject_product
-from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
 
 logger = setup_logger(__name__)
 

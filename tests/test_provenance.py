@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from faninsar.provenance import ProvenanceLedgerError, check_provenance_ledger
+from faninsar.network.provenance import (
+    ProvenanceLedgerError,
+    check_provenance_ledger,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path

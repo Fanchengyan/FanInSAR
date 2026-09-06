@@ -12,13 +12,13 @@ from faninsar.processing.geocoding.geo_resample import (
     compose_secondary_coordinates,
     resample_complex_at_coordinates,
 )
-from faninsar.processing.memory import release_memmap_pages
+from faninsar.processing.runtime.memory import release_memmap_pages
 
 if TYPE_CHECKING:
     from faninsar.processing.coregistration.offsets import OffsetFieldResult
     from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
     from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
-    from faninsar.processing.memory import MemoryWatchdog
+    from faninsar.processing.runtime.memory import MemoryWatchdog
 
 __all__ = ["coregister_geocoded_slcs", "coregister_geocoded_slcs_chunked"]
 

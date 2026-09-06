@@ -7,7 +7,8 @@ import pytest
 
 from faninsar import Pairs
 from faninsar.core.physical import PhysicalType
-from faninsar.processing.contracts.ifg import Interferogram, InterferogramStack
+from faninsar.network.products import Interferogram
+from faninsar.processing.interferometry.contracts import InterferogramStack
 from faninsar.processing.errors import InvalidProcessingStateError
 
 

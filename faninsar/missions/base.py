@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
+
+from faninsar.logging import setup_logger
+
+logger = setup_logger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _REGISTRY: dict[str, type] = {}
 
@@ -12,26 +19,43 @@ class Sensor:
 
     name: ClassVar[str] = ""
 
-    def open_product(self, uri: str, **kwargs: Any) -> Any:
+    def open_product(self, _uri: str, **_kwargs: Any) -> Any:
         """Open a mission product. Override in subclasses."""
-        raise NotImplementedError(f"{type(self).__name__}.open_product")
+        message = f"{type(self).__name__}.open_product"
+        logger.error(message)
+        raise NotImplementedError(message)
 
-    def to_slc_product(self, handle: Any, **kwargs: Any) -> Any:
+    def to_slc_product(self, _handle: Any, **_kwargs: Any) -> Any:
         """Convert an open handle to SLCProduct. Override in subclasses."""
-        raise NotImplementedError(f"{type(self).__name__}.to_slc_product")
+        message = f"{type(self).__name__}.to_slc_product"
+        logger.error(message)
+        raise NotImplementedError(message)
 
-    def read_slc_window(self, handle: Any, window: Any, **kwargs: Any) -> Any:
+    def read_slc_window(
+        self,
+        _handle: Any,
+        _window: Any,
+        **_kwargs: Any,
+    ) -> Any:
         """Read a complex SLC window. Override in subclasses."""
-        raise NotImplementedError(f"{type(self).__name__}.read_slc_window")
+        message = f"{type(self).__name__}.read_slc_window"
+        logger.error(message)
+        raise NotImplementedError(message)
 
 
-def register(cls: type | None = None, *, name: str | None = None):
+def register(
+    cls: type | None = None,
+    *,
+    name: str | None = None,
+) -> type | Callable[[type], type]:
     """Register a Sensor subclass in the global mission registry."""
 
     def decorator(sensor_cls: type) -> type:
         key = name or getattr(sensor_cls, "name", None) or sensor_cls.__name__.lower()
         if not key:
-            raise ValueError("mission register requires a non-empty name")
+            message = "mission register requires a non-empty name"
+            logger.error(message)
+            raise ValueError(message)
         sensor_cls.name = key  # type: ignore[attr-defined]
         _REGISTRY[key] = sensor_cls
         return sensor_cls
@@ -53,7 +77,9 @@ def get_mission(name: str) -> type:
     """Return the registered Sensor class for *name*."""
     list_missions()
     if name not in _REGISTRY:
-        raise KeyError(f"unknown mission {name!r}; known={list(_REGISTRY)}")
+        message = f"unknown mission {name!r}; known={list(_REGISTRY)}"
+        logger.error(message)
+        raise KeyError(message)
     return _REGISTRY[name]
 
 

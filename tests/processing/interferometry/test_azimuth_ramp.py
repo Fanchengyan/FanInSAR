@@ -198,7 +198,7 @@ def test_torch_ramp_uses_shared_device_resolver(
     pytest.importorskip("torch")
     import torch
 
-    from faninsar.processing import torch_kernels
+    from faninsar.processing.runtime import torch_kernels
 
     seen: list[object] = []
     real_resolve = torch_kernels.resolve_torch_device

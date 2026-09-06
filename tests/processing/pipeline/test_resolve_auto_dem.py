@@ -14,7 +14,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-from faninsar.processing.dem import DEM, RasterDEM
+from faninsar.processing.geometry import DEM, RasterDEM
 from faninsar.processing.stages import resolve_auto_dem
 
 
@@ -59,7 +59,7 @@ def _install_fake_manager(
                 seen["grid"] = grid
             import numpy as np
 
-            from faninsar.processing.dem import GridSpec
+            from faninsar.processing.geometry import GridSpec
 
             assert isinstance(grid, GridSpec)
             return RasterDEM(

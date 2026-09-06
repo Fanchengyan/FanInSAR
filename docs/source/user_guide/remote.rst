@@ -53,7 +53,7 @@ extra (``planetary-computer`` and ``pystac-client``).  The DEM facade keeps
 planning offline and starts STAC search, anonymous asset signing, and bytes at
 materialization::
 
-   from faninsar.processing.dem import DEM
+   from faninsar.processing.geometry import DEM
 
    dem = DEM.from_source("glo30:pc", cache_dir=".cache/dem")
    raster = dem.to_raster(grid)

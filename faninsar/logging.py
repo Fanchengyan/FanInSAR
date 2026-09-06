@@ -29,7 +29,6 @@ except ImportError:
 
 if TYPE_CHECKING:
     from os import PathLike
-    from typing import Union
 
 __all__ = [
     "SUCCESS",
@@ -49,7 +48,7 @@ SUCCESS: Literal[25] = 25  # Between INFO and WARNING
 # Type aliases
 LogLevel = Literal["DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"]
 if TYPE_CHECKING:
-    HandlerType = Union[logging.Handler, list[logging.Handler]]
+    HandlerType = logging.Handler | list[logging.Handler]
 
 # Register SUCCESS level name
 logging.addLevelName(SUCCESS, "SUCCESS")

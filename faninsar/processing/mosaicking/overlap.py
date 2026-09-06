@@ -140,10 +140,7 @@ def compute_hanning_weight(
     w_full = np.zeros(valid_mask.shape[axis], dtype=np.float32)
     w_full[r0 : r1 + 1] = w_1d
 
-    if axis == 0:
-        w_2d = w_full[:, None]
-    else:
-        w_2d = w_full[None, :]
+    w_2d = w_full[:, None] if axis == 0 else w_full[None, :]
     return (w_2d * valid_mask.astype(np.float32)).astype(np.float32)
 
 

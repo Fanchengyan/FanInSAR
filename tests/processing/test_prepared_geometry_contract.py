@@ -8,7 +8,7 @@ from dataclasses import replace
 
 import pytest
 
-from faninsar.processing.contracts import (
+from faninsar.processing.geometry.prepared import (
     CoregistrationPolicy,
     PairResidualSolution,
     PhaseCarrier,

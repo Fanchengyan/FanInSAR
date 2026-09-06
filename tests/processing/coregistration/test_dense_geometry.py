@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import numpy as np
 import pytest
 
-from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.processing.coregistration.dense_geometry import (
     _build_control_grid,
     _interpolate_field,

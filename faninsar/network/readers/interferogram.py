@@ -1021,12 +1021,8 @@ class InterferogramCollection:
         out.parent.mkdir(parents=True, exist_ok=True)
         # mode="w" replaces the store; consolidated metadata disabled for
         # Zarr v3 compatibility (consolidation is not part of the v3 spec).
-        stacked.to_dataset(name=name).to_zarr(
-            str(out), mode="w", consolidated=False
-        )
-        logger.info(
-            "Wrote Zarr cube for '%s' (%d pairs) to %s", name, len(arrays), out
-        )
+        stacked.to_dataset(name=name).to_zarr(str(out), mode="w", consolidated=False)
+        logger.info("Wrote Zarr cube for '%s' (%d pairs) to %s", name, len(arrays), out)
         return out
 
     def as_interferogram_dataset(self) -> InterferogramDataset:

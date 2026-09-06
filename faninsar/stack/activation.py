@@ -2,7 +2,8 @@
 
 The authority stores signed gate events and token issuer records under a
 caller-owned local root.  Qualified Stack entry points verify these durable
-records before accepting an :class:`~faninsar.processing.contracts.ActivationToken`.
+    records before accepting an
+    :class:`~faninsar.processing.geometry.prepared.ActivationToken`.
 The implementation uses HMAC-SHA256 from the Python standard library so the
 private coordinator key never leaves the owner-only authority root.
 """
@@ -24,7 +25,7 @@ from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
-    from faninsar.processing.contracts.prepared_geometry import ActivationToken
+    from faninsar.processing.geometry.prepared import ActivationToken
 
 GateId = Literal[
     "P18-provider-qualified",

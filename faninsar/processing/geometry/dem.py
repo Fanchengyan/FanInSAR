@@ -463,10 +463,7 @@ class RasterDEM:
         )
 
         torch_device = torch.device(identity)
-        if (
-            self._height_tensor is None
-            or self._height_tensor_identity != identity
-        ):
+        if self._height_tensor is None or self._height_tensor_identity != identity:
             self._height_tensor = torch.as_tensor(height_array, device=torch_device)
             self._height_tensor_identity = identity
         dem_tensor = self._height_tensor

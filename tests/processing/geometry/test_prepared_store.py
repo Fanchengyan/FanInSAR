@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from faninsar.processing.contracts import PreparedIdentity
+from faninsar.processing.geometry.prepared import PreparedIdentity
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry.prepared_store import PreparedGenerationStore
 

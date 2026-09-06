@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.dem import ConstantDEM, GridSpec, RasterDEM
+from faninsar.processing.geometry import ConstantDEM, GridSpec, RasterDEM
 from faninsar.processing.geometry.backend_dispatch import (
     DispatchError,
     resolve_geometry_device,
@@ -42,7 +42,7 @@ from faninsar.processing.geometry.v2 import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from faninsar.processing.dem import DEM
+    from faninsar.processing.geometry import DEM
     from faninsar.processing.geometry.public import PreparedGeometry
     from faninsar.processing.geometry.transforms import RadarGeometryModel
     from faninsar.processing.runtime.types import DeviceLike
@@ -449,8 +449,7 @@ def _try_load_cuda_module(operation: NativeOperation) -> object | None:
             errors="replace"
         ):
             raise RuntimeError(
-                "native ninja still invokes /usr/bin/nvcc; "
-                f"expected pixi nvcc {nvcc}"
+                f"native ninja still invokes /usr/bin/nvcc; expected pixi nvcc {nvcc}"
             )
         module_holder["module"] = module
         return Path(getattr(module, "__file__", _native_build_dir(operation)))
@@ -780,7 +779,9 @@ def _geo2rdr_native_manifest(
         toolchain_digest=digest,
         runtime_digest=digest,
         artifact_digest=digest,
-        abi_digest=hashlib.sha256(b"faninsar.geometry.native_v2.14-field.v1").hexdigest(),
+        abi_digest=hashlib.sha256(
+            b"faninsar.geometry.native_v2.14-field.v1"
+        ).hexdigest(),
         support_contract_digest=torch_prepared.identity.settings_digest,
         profile=ExecutionProfile(device_key),
     )
@@ -960,7 +961,9 @@ def _rdr2geo_native_manifest(
         toolchain_digest=digest,
         runtime_digest=digest,
         artifact_digest=digest,
-        abi_digest=hashlib.sha256(b"faninsar.geometry.native_v2.14-field.v1").hexdigest(),
+        abi_digest=hashlib.sha256(
+            b"faninsar.geometry.native_v2.14-field.v1"
+        ).hexdigest(),
         support_contract_digest=torch_prepared.identity.settings_digest,
         profile=ExecutionProfile(device_key),
     )

@@ -89,9 +89,7 @@ class CompileManager:
                     return eager(*args, **kwargs)
 
         except Exception as exc:
-            logger.warning(
-                "torch.compile failed for %s (%s); using eager", name, exc
-            )
+            logger.warning("torch.compile failed for %s (%s); using eager", name, exc)
             if not self._eager_fallback:
                 raise
             self._cache[cache_key] = eager

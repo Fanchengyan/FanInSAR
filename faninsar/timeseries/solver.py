@@ -138,9 +138,13 @@ class NSBASSolver:
             NSBASSolver(unw, pairs, model=...)
         """
         # Preferred seam: InterferogramStack as first positional or stack=
-        from faninsar.processing.contracts.ifg import InterferogramStack
+        from faninsar.processing.interferometry.contracts import InterferogramStack
 
-        if stack is not None and unw is not None and not isinstance(unw, InterferogramStack):
+        if (
+            stack is not None
+            and unw is not None
+            and not isinstance(unw, InterferogramStack)
+        ):
             msg = "pass either stack= or unw/pairs, not both"
             logger.error(msg)
             raise TypeError(msg)

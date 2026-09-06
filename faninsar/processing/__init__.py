@@ -1,22 +1,20 @@
 """Mission-neutral SAR processing domain contracts."""
 
-from .backends import ArrayReader, ArrayWriter
-from .contracts import (
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
+from faninsar.io.storage.arrays import (
+    ChunkAccessLog,
+    ChunkedZarrArrayStore,
+    InMemoryArrayStore,
+)
+from faninsar.io.storage.provenance import (
+    ProcessingEvent,
+    ProvenanceRecord,
+    SoftwareIdentity,
+)
+
+from .coordinates import (
     ArrayDescriptor,
     ArrayRepresentation,
-    CalibrationState,
-    CarrierState,
-    ComplexInterferogram,
-    CoregistrationState,
-    FlatteningState,
-    OrbitMetadata,
-    OrbitStateVector,
-    PairProduct,
-    SLCProduct,
-    StackProduct,
-    UnwrapResult,
-)
-from .coordinates import (
     CoordinateSystem,
     GeoGrid,
     OffsetField,
@@ -24,13 +22,22 @@ from .coordinates import (
     TransformDirection,
     TransformLUT,
 )
+from .coregistration.resampling import lanczos_resample
 from .errors import (
     GridMismatchError,
     InvalidProcessingStateError,
     PairConfigurationMigrationError,
     ProcessingContractError,
 )
-from .provenance import ProcessingEvent, ProvenanceRecord, SoftwareIdentity
+from .interferometry.products import (
+    CalibrationState,
+    CarrierState,
+    ComplexInterferogram,
+    CoregistrationState,
+    FlatteningState,
+    PairProduct,
+    UnwrapResult,
+)
 from .readers import (
     DopplerCentroidPolynomial,
     MissingCriticalMetadataError,
@@ -39,8 +46,8 @@ from .readers import (
     ValidSampleMask,
     require_critical_metadata,
 )
-from .resampling import lanczos_resample
-from .resources import (
+from .runtime.backends import ArrayReader, ArrayWriter
+from .runtime.resources import (
     ProcessTreeAdmission,
     ProcessTreeMemoryWatchdog,
     ProcessTreeSampler,
@@ -54,12 +61,12 @@ from .resources import (
     ResourceUsage,
     bootstrap_worker_runtime,
 )
-from .source_snapshots import (
+from .runtime.source_snapshots import (
     ImmutableSourceSnapshot,
     SourceSnapshotEntry,
     snapshot_local_source,
 )
-from .storage import ChunkAccessLog, ChunkedZarrArrayStore, InMemoryArrayStore
+from .slc.products import SLCProduct, StackProduct
 from .synthetic_slc import SyntheticSLCReader, SyntheticSLCSpec, write_synthetic_slc
 
 __all__ = [

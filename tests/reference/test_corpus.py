@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from faninsar.validation.provenance import validate_pipeline_rebuild_manifest
+from faninsar.io.storage.validation import validate_pipeline_rebuild_manifest
 from tests.reference.corpus import (
     Artifact,
     ChecksumMismatchError,

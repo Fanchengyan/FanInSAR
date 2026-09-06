@@ -9,9 +9,10 @@ import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import CoordinateSystem, GeoGrid, RadarGrid
-from faninsar.processing.dem import DEM, ConstantDEM
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import (
+    DEM,
+    ConstantDEM,
     RadarGeometryModel,
     TransformCacheKey,
     read_transform_cache,
@@ -22,9 +23,9 @@ from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from faninsar.processing.contracts import SLCProduct
     from faninsar.processing.geometry.transforms import TransformResult
     from faninsar.processing.runtime.types import DeviceLike
+    from faninsar.processing.slc.products import SLCProduct
 
 logger = setup_logger(__name__)
 

@@ -17,26 +17,27 @@ from typing import Any
 
 import numpy as np
 
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.logging import setup_logger
 from faninsar.missions.base import Sensor, register
-from faninsar.processing.contracts import (
+from faninsar.processing.coordinates import (
     ArrayDescriptor,
     ArrayRepresentation,
+    RadarGrid,
+)
+from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.interferometry.products import (
     CalibrationState,
     CarrierState,
     CoregistrationState,
-    OrbitMetadata,
-    OrbitStateVector,
-    SLCProduct,
 )
-from faninsar.processing.coordinates import RadarGrid
-from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.readers import (
     DopplerCentroidPolynomial,
     SLCReadResult,
     ValidSampleMask,
     normalize_selection,
 )
+from faninsar.processing.slc.products import SLCProduct
 
 logger = setup_logger(__name__)
 

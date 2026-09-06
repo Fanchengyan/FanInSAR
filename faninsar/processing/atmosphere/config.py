@@ -143,8 +143,7 @@ class IonosphereEstimationConfig:
             raise ValueError(message)
         if self.solve_core not in ("isce3", "guided_split"):
             message = (
-                f"solve_core must be 'isce3' or 'guided_split', "
-                f"got {self.solve_core!r}"
+                f"solve_core must be 'isce3' or 'guided_split', got {self.solve_core!r}"
             )
             logger.error(message)
             raise ValueError(message)

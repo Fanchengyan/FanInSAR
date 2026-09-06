@@ -40,7 +40,7 @@ from faninsar.processing.geometry.v2 import (
 if TYPE_CHECKING:
     import torch
 
-    from faninsar.processing.dem import DEM
+    from faninsar.processing.geometry import DEM
     from faninsar.processing.geometry.transforms import RadarGeometryModel
 
 logger = setup_logger(__name__)
@@ -191,8 +191,7 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
             and "not in range" in error_text
         ):
             message = (
-                "unsupported device ordinal "
-                f"{int(requested.removeprefix('cuda:'))}"
+                f"unsupported device ordinal {int(requested.removeprefix('cuda:'))}"
             )
             logger.exception(message)
             raise RuntimeError(message) from error

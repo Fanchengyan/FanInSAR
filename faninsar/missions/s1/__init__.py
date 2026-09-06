@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from faninsar.logging import setup_logger
 from faninsar.missions.base import Sensor, register
 from faninsar.missions.s1.annotation import (
     parse_annotation_xml,
@@ -34,6 +35,8 @@ from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
 SPEED_OF_LIGHT_M_S: float = 299_792_458.0
 S1_C_BAND_WAVELENGTH_M: float = 0.05546576
 
+logger = setup_logger(__name__)
+
 
 @register(name="sentinel1")
 class Sentinel1Sensor(Sensor):
@@ -46,7 +49,7 @@ class Sentinel1Sensor(Sensor):
         """Open a SAFE directory or ZIP."""
         return open_safe_product(Path(uri), **kwargs)
 
-    def to_slc_product(self, handle: Any, **kwargs: Any) -> Any:
+    def to_slc_product(self, handle: Any, **_kwargs: Any) -> Any:
         """Return the open product handle for production loaders."""
         return handle
 
@@ -54,9 +57,9 @@ class Sentinel1Sensor(Sensor):
         """Read a complex window when the handle supports it."""
         if hasattr(handle, "read_window"):
             return handle.read_window(window, **kwargs)
-        raise NotImplementedError(
-            "Sentinel1 handle does not expose read_window; use production loaders"
-        )
+        message = "Sentinel1 handle does not expose read_window; use production loaders"
+        logger.error(message)
+        raise NotImplementedError(message)
 
 
 __all__ = [

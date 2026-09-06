@@ -41,7 +41,11 @@ class IOBackend(Protocol):
         ...
 
     def write(
-        self, product: Any, uri: str, *, format: str = "cog"  # noqa: A002
+        self,
+        product: Any,
+        uri: str,
+        *,
+        format: str = "cog",  # noqa: A002
     ) -> None:
         """Write *product* to *uri* using *format*."""
         ...

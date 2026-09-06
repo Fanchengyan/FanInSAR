@@ -160,9 +160,9 @@ def reproject_phase_to_geogrid(
     invalid = ~np.isfinite(src_phi)
     if src_nodata is not None:
         invalid |= src_phi == src_nodata
-    complex_src = np.where(
-        invalid, 0.0 + 0.0j, np.exp(1j * src_phi)
-    ).astype(np.complex64)
+    complex_src = np.where(invalid, 0.0 + 0.0j, np.exp(1j * src_phi)).astype(
+        np.complex64
+    )
 
     complex_dst = np.zeros((dst_height, dst_width), dtype=np.complex64)
     reproject(

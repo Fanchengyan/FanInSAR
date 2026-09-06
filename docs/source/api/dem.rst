@@ -50,10 +50,10 @@ API
 .. autosummary::
    :toctree: generated
 
-   faninsar.processing.dem.DEM
-   faninsar.processing.dem.SourceDEM
-   faninsar.processing.dem.RasterDEM
-   faninsar.processing.dem.ConstantDEM
-   faninsar.processing.dem.GridSpec
-   faninsar.processing.dem.Fetch
-   faninsar.processing.dem.convert_heights
+   faninsar.processing.geometry.DEM
+   faninsar.processing.geometry.SourceDEM
+   faninsar.processing.geometry.RasterDEM
+   faninsar.processing.geometry.ConstantDEM
+   faninsar.processing.geometry.GridSpec
+   faninsar.processing.geometry.Fetch
+   faninsar.processing.geometry.convert_heights

@@ -1088,7 +1088,7 @@ def prepare_ampcor_native(
         backend="native",
         device=canonical_torch_device(device),
         window_shape=window_shape,
-        executor=lambda secondary: prepared.dispatch(secondary),
+        executor=prepared.dispatch,
         workspace_bytes=required_workspace,
         input_shape=input_shape,
         runtime_profile=(

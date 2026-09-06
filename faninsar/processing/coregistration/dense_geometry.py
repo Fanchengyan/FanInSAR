@@ -22,7 +22,7 @@ from faninsar.processing.geometry.prepare_production import (
 )
 
 if TYPE_CHECKING:
-    from faninsar.processing.dem import DEM
+    from faninsar.processing.geometry import DEM
     from faninsar.processing.geometry.transforms import RadarGeometryModel
     from faninsar.processing.runtime.types import DeviceLike
 

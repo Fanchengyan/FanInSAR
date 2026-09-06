@@ -137,13 +137,11 @@ def invert_pair_misregistration(
     """
     if "master" in legacy:
         reject_pair_configuration(
-            "invert_pair_misregistration no longer accepts 'master'; "
-            "use 'reference'"
+            "invert_pair_misregistration no longer accepts 'master'; use 'reference'"
         )
     if legacy:
         reject_invalid_state(
-            "unsupported invert_pair_misregistration options: "
-            f"{sorted(legacy)}"
+            f"unsupported invert_pair_misregistration options: {sorted(legacy)}"
         )
     if not reference:
         reject_invalid_state("Reference date id is required")

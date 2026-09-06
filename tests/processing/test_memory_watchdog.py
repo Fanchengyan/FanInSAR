@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from faninsar.processing.memory import (
+from faninsar.processing.runtime.memory import (
     MemoryWatchdog,
     close_memmap,
     release_memmap_pages,
@@ -24,11 +24,11 @@ def test_watchdog_records_available_memory_and_jsonl(
 ) -> None:
     """A memory sample records both process RSS and system availability."""
     monkeypatch.setattr(
-        "faninsar.processing.memory.live_rss_bytes",
+        "faninsar.processing.runtime.memory.live_rss_bytes",
         lambda: 512 * 1024 * 1024,
     )
     monkeypatch.setattr(
-        "faninsar.processing.memory.available_memory_bytes",
+        "faninsar.processing.runtime.memory.available_memory_bytes",
         lambda: 8 * 1024 * 1024 * 1024,
     )
     watchdog = MemoryWatchdog(limit_mib=1024.0, minimum_available_mib=2048.0)
@@ -48,11 +48,11 @@ def test_watchdog_stops_before_system_memory_is_exhausted(
 ) -> None:
     """Low available system memory trips the guard before an OS-level OOM."""
     monkeypatch.setattr(
-        "faninsar.processing.memory.live_rss_bytes",
+        "faninsar.processing.runtime.memory.live_rss_bytes",
         lambda: 512 * 1024 * 1024,
     )
     monkeypatch.setattr(
-        "faninsar.processing.memory.available_memory_bytes",
+        "faninsar.processing.runtime.memory.available_memory_bytes",
         lambda: 1024 * 1024 * 1024,
     )
     watchdog = MemoryWatchdog(limit_mib=4096.0, minimum_available_mib=2048.0)
@@ -74,11 +74,11 @@ def test_dynamic_watchdog_refreshes_limit_when_available_recovers(
     available_mib = {"value": 4351.0}
 
     monkeypatch.setattr(
-        "faninsar.processing.memory.live_rss_bytes",
+        "faninsar.processing.runtime.memory.live_rss_bytes",
         lambda: int(live_mib["value"] * 1024 * 1024),
     )
     monkeypatch.setattr(
-        "faninsar.processing.memory.available_memory_bytes",
+        "faninsar.processing.runtime.memory.available_memory_bytes",
         lambda: int(available_mib["value"] * 1024 * 1024),
     )
 

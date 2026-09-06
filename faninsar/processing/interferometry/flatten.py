@@ -8,13 +8,12 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.dem import DEM
+from faninsar.processing.geometry import DEM
 from faninsar.processing.geometry.ellipsoid import llh_to_ecef
 from faninsar.processing.geometry.prepare_production import run_rdr2geo
 
 if TYPE_CHECKING:
-    from faninsar.processing.dem import RasterDEM
-    from faninsar.processing.geometry import RadarGeometryModel
+    from faninsar.processing.geometry import RadarGeometryModel, RasterDEM
     from faninsar.processing.runtime.types import DeviceLike
 
 logger = setup_logger(__name__)
@@ -312,7 +311,7 @@ def azimuth_ramp_device_kwargs(device: str) -> dict[str, str]:
     Parameters
     ----------
     device : str
-        Stack device string admitted by :func:`~faninsar.processing.runtime.device.parse_device`.
+        Stack device string admitted by the shared runtime device parser.
 
     Returns
     -------
@@ -355,7 +354,7 @@ def _estimate_residual_azimuth_ramp_torch(
     """
     import torch
 
-    from faninsar.processing.torch_kernels import resolve_torch_device
+    from faninsar.processing.runtime.torch_kernels import resolve_torch_device
 
     resolved = resolve_torch_device(device)
     residual_tensor = torch.as_tensor(residual, dtype=torch.float64, device=resolved)

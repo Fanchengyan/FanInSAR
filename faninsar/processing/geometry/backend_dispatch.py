@@ -61,7 +61,7 @@ def resolve_geometry_device(device: DeviceLike | None = None) -> torch.device:
     Parameters
     ----------
     device : str or torch.device or None, optional
-        The same request strings as :func:`~faninsar.processing.runtime.device.parse_device`.
+        The same request strings as the shared runtime device parser.
         ``auto`` / ``gpu`` / omitted select the first published device.
 
     Returns

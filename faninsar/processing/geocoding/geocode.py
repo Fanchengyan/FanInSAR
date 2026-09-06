@@ -22,9 +22,8 @@ from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import RadarGrid
-from faninsar.processing.dem import DEM, ConstantDEM
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.geometry import RadarGeometryModel
+from faninsar.processing.geometry import DEM, ConstantDEM, RadarGeometryModel
 from faninsar.processing.geometry.prepare_production import run_rdr2geo
 
 if TYPE_CHECKING:
@@ -154,27 +153,36 @@ def _resample_at_radar_coords(
         # Hard labels — nearest, never interpolate classes.
         out = np.zeros(out_shape, dtype=values.dtype)
         coords = np.array([az_clamped.ravel(), rg_clamped.ravel()])
-        sampled = map_coordinates(
-            values.astype(np.float32), coords, order=0,
-            mode="constant", cval=0.0,
-        ).reshape(out_shape).astype(values.dtype)
+        sampled = (
+            map_coordinates(
+                values.astype(np.float32),
+                coords,
+                order=0,
+                mode="constant",
+                cval=0.0,
+            )
+            .reshape(out_shape)
+            .astype(values.dtype)
+        )
         out[converged] = sampled[converged]
         return out
 
     if is_complex:
         # Complex SLC / wrapped ifg → Lanczos a=4 to preserve phase.
         # Import lazily to avoid a torch dependency for the real-field path.
-        from faninsar.processing.resampling import lanczos_resample
+        from faninsar.processing.coregistration.resampling import lanczos_resample
 
         out = np.full(out_shape, np.nan + 1j * np.nan, dtype=np.complex64)
         valid = converged & np.isfinite(az_clamped) & np.isfinite(rg_clamped)
         if not np.any(valid):
             return out
-        coords = np.array(
-            [az_clamped[valid], rg_clamped[valid]], dtype=np.float64
-        )
+        coords = np.array([az_clamped[valid], rg_clamped[valid]], dtype=np.float64)
         sampled = lanczos_resample(
-            values, coords, a=4, mode="constant", cval=0.0,
+            values,
+            coords,
+            a=4,
+            mode="constant",
+            cval=0.0,
         )
         out[valid] = np.asarray(sampled, dtype=np.complex64)
         return out
@@ -186,8 +194,11 @@ def _resample_at_radar_coords(
         return out
     coords = np.array([az_clamped[valid], rg_clamped[valid]], dtype=np.float64)
     sampled = map_coordinates(
-        np.asarray(values, dtype=np.float32), coords, order=1,
-        mode="constant", cval=0.0,
+        np.asarray(values, dtype=np.float32),
+        coords,
+        order=1,
+        mode="constant",
+        cval=0.0,
     )
     out[valid] = sampled.astype(np.float32)
     return out
@@ -259,7 +270,10 @@ def geocode_layer(
     # Lanczos for complex, bilinear for real smooth, nearest for hard labels.
     # Never nearest-gather continuous fields — it aliases and staircases.
     sampled = _resample_at_radar_coords(
-        values, az_grid, rg_grid, transform.converged,
+        values,
+        az_grid,
+        rg_grid,
+        transform.converged,
     )
 
     n_conv = int(np.count_nonzero(transform.converged))

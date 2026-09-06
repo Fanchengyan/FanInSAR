@@ -8,8 +8,8 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
+from faninsar.processing.coregistration.resampling import lanczos_resample
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.resampling import lanczos_resample
 
 if TYPE_CHECKING:
     from faninsar.processing.coregistration.offsets import OffsetFieldResult
@@ -176,9 +176,7 @@ def compose_secondary_coordinates(
     """
     identity = str(device)
     if identity.startswith("cuda"):
-        return _compose_secondary_coordinates_torch(
-            reference_lut, offsets, identity
-        )
+        return _compose_secondary_coordinates_torch(reference_lut, offsets, identity)
     return _compose_secondary_coordinates_numpy(reference_lut, offsets)
 
 
@@ -224,7 +222,7 @@ def _compose_secondary_coordinates_torch(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Same-device bilinear compose for an admitted CUDA identity."""
     import torch
-    import torch.nn.functional as torch_F
+    import torch.nn.functional as torch_functional
 
     torch_device = torch.device(identity)
     radar_h, radar_w = offsets.coverage.shape
@@ -254,7 +252,7 @@ def _compose_secondary_coordinates_torch(
         device=torch_device,
     ).view(1, 1, radar_h, radar_w)
     azimuth_offset = (
-        torch_F.grid_sample(
+        torch_functional.grid_sample(
             az_field, grid, mode="bilinear", padding_mode="zeros", align_corners=True
         )
         .squeeze(0)
@@ -262,7 +260,7 @@ def _compose_secondary_coordinates_torch(
         .to(torch.float64)
     )
     range_offset = (
-        torch_F.grid_sample(
+        torch_functional.grid_sample(
             rg_field, grid, mode="bilinear", padding_mode="zeros", align_corners=True
         )
         .squeeze(0)
@@ -270,7 +268,7 @@ def _compose_secondary_coordinates_torch(
         .to(torch.float64)
     )
     coverage = (
-        torch_F.grid_sample(
+        torch_functional.grid_sample(
             cov_field, grid, mode="nearest", padding_mode="zeros", align_corners=True
         )
         .squeeze(0)

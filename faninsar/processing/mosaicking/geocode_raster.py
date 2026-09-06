@@ -9,8 +9,8 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
+from faninsar.processing.coregistration.resampling import lanczos_resample
 from faninsar.processing.geometry.prepare_production import run_geo2rdr
-from faninsar.processing.resampling import lanczos_resample
 
 if TYPE_CHECKING:
     from faninsar.processing.geometry import RadarGeometryModel

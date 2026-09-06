@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+from faninsar.io.storage.ifg_store import (
+    InterferogramArtifact,
+    InterferogramArtifactStore,
+    UnwrappedArtifact,
+)
+from faninsar.io.storage.stack_generation import (
+    UnwrapResultGeneration,
+    open_unwrap_generation,
+    publish_unwrap_generation,
+)
 from faninsar.processing.runtime.device import GpuMemoryReclaim
 from faninsar.stack.activation import (
     ActivationIssuerRecord,
@@ -17,11 +27,6 @@ from faninsar.stack.config import (
     StackConfig,
 )
 from faninsar.stack.grid import automatic_grid, resolve_stack_grid
-from faninsar.stack.ifg_store import (
-    InterferogramArtifact,
-    InterferogramArtifactStore,
-    UnwrappedArtifact,
-)
 from faninsar.stack.mask_plan import (
     MASK_KINDS,
     STAGES,
@@ -40,11 +45,7 @@ from faninsar.stack.provider import (
 )
 from faninsar.stack.s1 import S1Stack
 from faninsar.stack.session import Stack
-from faninsar.stack.stack_generation import (
-    UnwrapResultGeneration,
-    open_unwrap_generation,
-    publish_unwrap_generation,
-)
+from faninsar.stack.stage import Stage
 
 __all__ = [
     "MASK_KINDS",
@@ -70,6 +71,7 @@ __all__ = [
     "StackGateEvent",
     "StackProviderError",
     "StackSceneProvider",
+    "Stage",
     "UnsupportedStackCapabilityError",
     "UnwrapResultGeneration",
     "UnwrappedArtifact",

@@ -20,6 +20,11 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from faninsar.io.storage.scene_store import (
+    CoregisteredSceneStore,
+    scene_grid_identity,
+    write_scene_unit,
+)
 from faninsar.logging import setup_logger
 from faninsar.processing.coordinates import GeoGrid, RadarGrid
 from faninsar.processing.errors import (
@@ -32,17 +37,12 @@ from faninsar.stack.provider import (
     SourceHandle,
     UnsupportedStackCapabilityError,
 )
-from faninsar.stack.scene_store import (
-    CoregisteredSceneStore,
-    scene_grid_identity,
-    write_scene_unit,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
-    from faninsar.processing.contracts import SLCProduct
-    from faninsar.processing.dem import DEM
+    from faninsar.processing.geometry import DEM
+    from faninsar.processing.slc.products import SLCProduct
     from faninsar.stack.provider import SceneProductionCallback
 
 logger = setup_logger(__name__)
@@ -816,8 +816,7 @@ def _geometry_shared_radar_window(
     height_m: float | None = None,
 ) -> tuple[int, int, int, int]:
     """Map a bounded crop through the shared Radar→Geo→Radar geometry seam."""
-    from faninsar.processing.dem import ConstantDEM
-    from faninsar.processing.geometry import RadarGeometryModel
+    from faninsar.processing.geometry import ConstantDEM, RadarGeometryModel
     from faninsar.processing.geometry.prepare_production import (
         run_geo2rdr,
         run_rdr2geo,
@@ -1137,7 +1136,7 @@ def make_nisar_scene_provider(
                 "NISAR geometry crop mapping cannot combine DEM and height inputs"
             )
         if mapping_dem is None:
-            from faninsar.processing.dem import ConstantDEM
+            from faninsar.processing.geometry import ConstantDEM
 
             mapping_dem = ConstantDEM(float(mapping_height))
         dem_identity = _dem_identity(mapping_dem)

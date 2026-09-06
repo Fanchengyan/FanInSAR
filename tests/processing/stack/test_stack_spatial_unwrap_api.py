@@ -9,10 +9,10 @@ import pytest
 import torch
 
 from faninsar import Pairs
-from faninsar.processing.resources import ResourceAdmissionError, ResourceBudget
+from faninsar.processing.runtime.resources import ResourceAdmissionError, ResourceBudget
 from faninsar.processing.unwrapping.common import SpatialUnwrapper, SpatialUnwrapResult
 from faninsar.stack import Stack
-from faninsar.stack.ifg_store import write_ifg_artifact
+from faninsar.io.storage.ifg_store import write_ifg_artifact
 
 if TYPE_CHECKING:
     from pathlib import Path

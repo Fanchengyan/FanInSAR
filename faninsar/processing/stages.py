@@ -43,16 +43,14 @@ from faninsar.processing.coregistration.tops.deramp import (
     deramp,
     reramp,
 )
-from faninsar.processing.dem import (
-    DEM,
-    ConstantDEM,
-)
-from faninsar.processing.dem import (
-    RasterDEM as PublicRasterDEM,
-)
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import (
+    DEM,
+    ConstantDEM,
     RadarGeometryModel,
+)
+from faninsar.processing.geometry import (
+    RasterDEM as PublicRasterDEM,
 )
 from faninsar.processing.geometry.baseline import BaselineComponents
 from faninsar.processing.geometry.prepare_production import (
@@ -78,7 +76,7 @@ from faninsar.processing.interferometry.products import (
     write_pair_stac_item,
     write_pair_zarr,
 )
-from faninsar.processing.memory import close_memmap, release_memmap_pages
+from faninsar.processing.runtime.memory import close_memmap, release_memmap_pages
 from faninsar.processing.unwrapping import SnaphuConfig, UnwrapBackend
 from faninsar.processing.unwrapping import unwrap as unwrap_dispatch
 
@@ -87,16 +85,16 @@ if TYPE_CHECKING:
 
     from faninsar.missions.s1.io import BurstArray
     from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
-    from faninsar.processing.contracts.prepared_geometry import (
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geometry.prepared import (
         PhaseState,
         PreparedLutHandle,
         ProviderLeaseToken,
         ResourceLimits,
     )
-    from faninsar.processing.coregistration.offsets import OffsetFieldResult
-    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
-    from faninsar.processing.memory import MemoryWatchdog
     from faninsar.processing.mosaicking.grid import GeoGridSpec
+    from faninsar.processing.runtime.memory import MemoryWatchdog
     from faninsar.processing.unwrapping.common import SpatialUnwrapResult
 
 logger = setup_logger(__name__)
@@ -288,7 +286,7 @@ def _record_scientific_transition(
         "apply_carrier_residual_range_phase",
         "apply_geo_carrier_residual_geometric_phase",
     }:
-        from faninsar.processing.contracts.prepared_geometry import (
+        from faninsar.processing.geometry.prepared import (
             GeometricPhase,
             PhaseCarrier,
             PhaseState,
@@ -642,7 +640,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         )
     prepared_geo_lut: Geo2RdrLUT | None = None
     if prepared_lut_handle is not None:
-        from faninsar.processing.contracts.prepared_geometry import (
+        from faninsar.processing.geometry.prepared import (
             ProviderLeaseToken as _ProviderLeaseToken,
         )
 
@@ -767,7 +765,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     assert state.primary_deramped is not None
     assert state.secondary_aligned is not None
     if scene_store_dir is not None:
-        from faninsar.stack.scene_store import (
+        from faninsar.io.storage.scene_store import (
             scene_grid_identity,
             write_scene_unit,
         )
@@ -1102,7 +1100,7 @@ def read_prepared_geometry_field(
     reader = getattr(provider, "read_prepared_geometry", None)
     if not callable(reader):
         reject_invalid_state("prepared provider does not expose read_prepared_geometry")
-    from faninsar.processing.contracts.prepared_geometry import (
+    from faninsar.processing.geometry.prepared import (
         PreparedGeometryArrayPayload,
     )
 
@@ -1158,7 +1156,7 @@ def read_prepared_lut(
     reader = getattr(provider, "read_prepared_lut", None)
     if not callable(reader):
         reject_invalid_state("prepared provider does not expose read_prepared_lut")
-    from faninsar.processing.contracts.prepared_geometry import (
+    from faninsar.processing.geometry.prepared import (
         PreparedLutArrayPayload,
     )
 
@@ -3429,7 +3427,7 @@ def _snapshot_paths(
     snapshot_root: str | Path,
 ) -> list[Path]:
     """Copy local input paths into one immutable source snapshot root."""
-    from faninsar.processing.source_snapshots import snapshot_local_source
+    from faninsar.processing.runtime.source_snapshots import snapshot_local_source
 
     root = Path(snapshot_root)
     cache: dict[str, Path] = {}
@@ -3806,12 +3804,12 @@ def _buffer_geometry_meters(
     transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
     inverse = Transformer.from_crs(target_crs, "EPSG:4326", always_xy=True)
     projected = shp_transform(
-        lambda x, y: transformer.transform(x, y),
+        transformer.transform,
         geometry,
     )
     buffered = projected.buffer(buffer_m)
     return shp_transform(
-        lambda x, y: inverse.transform(x, y),
+        inverse.transform,
         buffered,
     )
 
@@ -4253,10 +4251,11 @@ def produce_interferogram_pair(
             record_scientific_lineage=record_scientific_lineage,
         )
     from faninsar.missions.s1.safe import open_safe_product
+
     dem_sampler: DEM = dem if dem is not None else ConstantDEM(0.0)
     snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
     if snapshot_root is not None and isinstance(dem_sampler, PublicRasterDEM):
-        from faninsar.processing.source_snapshots import snapshot_local_source
+        from faninsar.processing.runtime.source_snapshots import snapshot_local_source
 
         if dem_sampler.path is not None:
             dem_snapshot = snapshot_local_source(
@@ -4707,7 +4706,7 @@ def produce_interferogram_pair(
             assert state.primary_deramped is not None
             assert state.secondary_aligned is not None
             if scene_store_dir is not None:
-                from faninsar.stack.scene_store import write_scene_unit
+                from faninsar.io.storage.scene_store import write_scene_unit
 
                 write_scene_unit(
                     scene_store_dir,
@@ -4942,6 +4941,7 @@ def _produce_interferogram_sweep(
 ) -> ProductionPairState | ProductionPairSweepResult:
     """Run one shared prefix and emit every look configuration."""
     from faninsar.missions.s1.safe import open_safe_product
+
     if (prepared_geo_lut_handles is None) != (prepared_provider_root is None):
         reject_invalid_state(
             "prepared Geo LUT reuse requires both handles and provider root"
@@ -4988,7 +4988,7 @@ def _produce_interferogram_sweep(
     dem_sampler: DEM = dem if dem is not None else ConstantDEM(0.0)
     snapshot_root = Path(source_snapshot_root) if source_snapshot_root else None
     if snapshot_root is not None and isinstance(dem_sampler, PublicRasterDEM):
-        from faninsar.processing.source_snapshots import snapshot_local_source
+        from faninsar.processing.runtime.source_snapshots import snapshot_local_source
 
         if dem_sampler.path is not None:
             dem_snapshot = snapshot_local_source(
@@ -5505,7 +5505,7 @@ def _archive_burst_ifgs(
 
     from contextlib import nullcontext
 
-    from faninsar.processing.resources import ProcessTreeAdmission
+    from faninsar.processing.runtime.resources import ProcessTreeAdmission
 
     worker_count = min(max(1, n_jobs), max(1, len(task_args)))
     output_file_count = len(task_args) * (4 if coregistration_grid == "geo" else 3)
@@ -5531,7 +5531,9 @@ def _archive_burst_ifgs(
             if resource_limits is not None:
                 from multiprocessing import get_context
 
-                from faninsar.processing.resources import bootstrap_worker_runtime
+                from faninsar.processing.runtime.resources import (
+                    bootstrap_worker_runtime,
+                )
 
                 pool_kwargs.update(
                     {

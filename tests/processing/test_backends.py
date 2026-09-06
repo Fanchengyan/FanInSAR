@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import get_type_hints
 
-from faninsar.processing.backends import ArrayReader, ArrayWriter
+from faninsar.processing.runtime.backends import ArrayReader, ArrayWriter
 
 
 def test_backend_protocol_annotations_resolve_at_runtime() -> None:

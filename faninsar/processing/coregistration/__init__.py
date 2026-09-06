@@ -46,6 +46,7 @@ from .offsets import (
     resample_complex,
     resample_complex_deramped_reramp,
 )
+from .resampling import lanczos_resample
 
 __all__ = [
     "AmpcorBackendRegistry",
@@ -76,6 +77,7 @@ __all__ = [
     "geometry_offset_window_extent",
     "geometry_shift_offsets",
     "invert_pair_misregistration",
+    "lanczos_resample",
     "native_workspace_bytes",
     "phase_per_range_pixel",
     "prepare_ampcor_compile",

@@ -12,7 +12,7 @@ from faninsar.data.datasets.aps import ApsDataset, ApsPairs
 if TYPE_CHECKING:
     from os import PathLike
 
-    from faninsar.core.pairs import Pairs
+    from faninsar.core.pair import Pairs
     from faninsar.data.query.query import BoundingBox, Points
 
 

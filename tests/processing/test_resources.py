@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from faninsar.processing.resources import (
+from faninsar.processing.runtime.resources import (
     ProcessTreeAdmission,
     ProcessTreeMemoryWatchdog,
     ProcessTreeSampler,

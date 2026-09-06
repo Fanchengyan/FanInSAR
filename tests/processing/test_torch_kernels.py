@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from faninsar.processing.coregistration.esd import estimate_azimuth_shift_esd
+from faninsar.processing.coregistration.tops import TOPSCarrierModel, deramp, reramp
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.interferometry.flatten import remove_topographic_phase
 from faninsar.processing.interferometry.pair import (
@@ -13,8 +14,7 @@ from faninsar.processing.interferometry.pair import (
     form_interferogram,
     goldstein_filter,
 )
-from faninsar.processing.coregistration.tops import TOPSCarrierModel, deramp, reramp
-from faninsar.processing.torch_kernels import (
+from faninsar.processing.runtime.torch_kernels import (
     CUDA_DTYPE_CHOICE,
     carrier_multiply_torch,
     carrier_phase_at_points_torch,
@@ -82,7 +82,7 @@ def test_explicit_float64_precision_override() -> None:
     """A per-kernel override selects the float64 fallback dtype."""
     import torch
 
-    import faninsar.processing.torch_kernels as kernels
+    import faninsar.processing.runtime.torch_kernels as kernels
 
     dtype = kernels._complex_dtype(
         torch.device("cuda"),
@@ -98,7 +98,7 @@ def test_unqualified_auto_float32_falls_back_to_float64(
     """A mapping entry cannot enable float32 without qualification evidence."""
     import torch
 
-    import faninsar.processing.torch_kernels as kernels
+    import faninsar.processing.runtime.torch_kernels as kernels
 
     monkeypatch.setitem(
         kernels.CUDA_DTYPE_CHOICE,
@@ -117,7 +117,7 @@ def test_unqualified_explicit_float32_falls_back_to_float64() -> None:
     """An explicit float32 override cannot bypass CUDA qualification."""
     import torch
 
-    import faninsar.processing.torch_kernels as kernels
+    import faninsar.processing.runtime.torch_kernels as kernels
 
     dtype = kernels._complex_dtype(
         torch.device("cuda"),
@@ -135,7 +135,7 @@ def test_cleanup_runs_when_kernel_validation_raises(
 
     import torch
 
-    import faninsar.processing.torch_kernels as kernels
+    import faninsar.processing.runtime.torch_kernels as kernels
 
     empty_calls: list[str] = []
     monkeypatch.setattr(
@@ -170,7 +170,7 @@ def test_kernel_tiles_do_not_empty_cache_under_eager_8gib(
 
     import torch
 
-    import faninsar.processing.torch_kernels as kernels
+    import faninsar.processing.runtime.torch_kernels as kernels
     from faninsar.processing.runtime.device import reclaim_checkpoint
 
     empty_calls: list[str] = []
@@ -188,7 +188,7 @@ def test_kernel_tiles_do_not_empty_cache_under_eager_8gib(
         device="cpu",
     )
     assert empty_calls == []
-    from faninsar.processing import resampling_torch
+    from faninsar.processing.coregistration import resampling_torch
 
     assert "empty_cache" not in inspect.getsource(resampling_torch._cleanup_device)
     eight_gib = 8 * 1024**3
@@ -509,7 +509,7 @@ def test_cuda_float32_qualification_records_parity() -> None:
     """Measure a qualified float32 path against the CPU float64 reference."""
     import torch
 
-    import faninsar.processing.torch_kernels as kernels
+    import faninsar.processing.runtime.torch_kernels as kernels
 
     samples = _random_slc((64, 96), seed=45)
     phase = np.linspace(-10.0, 10.0, samples.size).reshape(samples.shape)

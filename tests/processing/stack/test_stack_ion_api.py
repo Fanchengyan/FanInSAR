@@ -11,8 +11,8 @@ from faninsar.processing.atmosphere import IonosphereEstimationConfig
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.unwrapping import SpatialIRLS
 from faninsar.stack import Stack
-from faninsar.stack.ion_store import IonosphereArtifactStore
-from faninsar.stack.scene_store import write_scene_unit
+from faninsar.io.storage.ion_store import IonosphereArtifactStore
+from faninsar.io.storage.scene_store import write_scene_unit
 
 F0 = 1257.5e6
 BANDWIDTH = 28.0e6
@@ -134,7 +134,7 @@ def test_estimate_apply_and_invert_end_to_end(tmp_path: Path) -> None:
         try:
             pair_id = f"{store.pair[0]}_{store.pair[1]}"
             ifg_store_path = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
-            from faninsar.stack.ion_store import (
+            from faninsar.io.storage.ion_store import (
                 read_ion_correction_artifact,
             )
 

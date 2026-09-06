@@ -11,12 +11,12 @@ import pandas as pd
 import pytest
 
 from faninsar.core import Pair
-from faninsar.core.network import (
+from faninsar.network.network import NetworkContract
+from faninsar.network.products import (
     AcquisitionKey,
     AssetKind,
     AssetTransform,
     AssetTransformOperation,
-    Network,
     NetworkProduct,
     NetworkProductIndex,
     NetworkProductKey,
@@ -163,7 +163,7 @@ def test_unknown_phase_convention_and_transform_operation_fail_closed() -> None:
 def test_network_analysis_is_fail_closed_until_generation_refresh() -> None:
     """The analysis seam cannot run before a complete generation is admitted."""
 
-    class ConcreteNetwork(Network):
+    class ConcreteNetwork(NetworkContract):
         """Test implementation recording the generation passed to analysis."""
 
         def _analyze_network_products(
@@ -187,7 +187,7 @@ def test_network_analysis_is_fail_closed_until_generation_refresh() -> None:
 
 def test_invalid_refresh_does_not_replace_previous_generation() -> None:
     """Generation replacement is atomic with respect to cohort validation."""
-    network = Network()
+    network = NetworkContract()
     network.refresh_generation("generation-a", (_product(),))
     with pytest.raises(ValueError, match="homogeneous"):
         network.refresh_generation("generation-b", (_product(), _product(swath="IW2")))

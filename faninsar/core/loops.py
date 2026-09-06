@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING, Literal, overload
 import numpy as np
 import pandas as pd
 
-from faninsar.core.acquisition import DateManager
-from faninsar.core.pairs import Pair, Pairs
+from faninsar.core.dates import DateManager
+from faninsar.core.pair import Pair, Pairs
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
@@ -904,3 +904,88 @@ class Loops:
             matrix[i][np.isin(all_pairs, loop_pairs[:-1])] = 1
             matrix[i][np.isin(all_pairs, loop_pairs[-1])] = -1
         return matrix
+
+
+# TODO: accelerate the process using numba or cython
+def find_loops(
+    loops_pairs: Pairs,
+    loops: list[Loop],
+    loop: Loop,
+    pairs_left: Pairs,
+    end_date: datetime,
+    edge_pairs: Pairs,
+    max_acquisition: int = 5,
+) -> None:
+    """Recursively find all available loops within pairs_left and end_date."""
+    from faninsar import Loop
+
+    for pair_left in pairs_left:
+        if pair_left not in edge_pairs:
+            continue
+        m_candidate = (
+            (loops_pairs.primary == pair_left.secondary)
+            & (loops_pairs.secondary <= end_date)
+            & (loops_pairs.where(edge_pairs, return_type="mask"))
+        )
+        if not m_candidate.any():
+            continue
+        pairs_candidate = loops_pairs[m_candidate]
+        for pair_middle in pairs_candidate:
+            loop_i = loop.copy()
+            loop_i.append(pair_middle.primary)
+            if pair_middle.secondary == end_date:
+                loop_i.append(pair_middle.secondary)
+                loops.append(Loop(loop_i))
+            elif len(loop_i) + 1 < max_acquisition:
+                find_loops(
+                    loops_pairs,
+                    loops,
+                    loop_i,
+                    pairs_candidate,
+                    end_date,
+                    edge_pairs,
+                    max_acquisition,
+                )
+
+
+def valid_diagonal_pair(
+    pair: Pair,
+    pairs: Pairs,
+    edge_pairs: int | None = None,
+) -> bool:
+    """Check if the pair is a valid diagonal pair.
+
+    A valid diagonal pair can be used to form a loop using the edge pairs. This
+    function is just a simple check to see if days of diagonal pair is less than
+    the sum of edge pairs.
+
+    Parameters
+    ----------
+    pair: Pair
+        Pair to be checked if it is a valid diagonal pair.
+    pairs: Pairs
+        All pairs of the loop.
+    edge_pairs: int, optional
+        The edge pairs to form loops.
+
+    Returns
+    -------
+    valid: bool
+        Whether the pair is a valid diagonal pair.
+
+    """
+    valid = False
+    start_date, end_date = pair.values
+    mask_edge = (
+        (pairs.primary >= start_date)
+        & (pairs.secondary <= end_date)
+        & (pairs.where(edge_pairs, return_type="mask"))
+    )
+
+    if not mask_edge.any():
+        return False
+
+    edge_pairs_ = pairs[mask_edge]
+    if edge_pairs_.days.values.sum() >= pair.days:
+        valid = True
+    return valid

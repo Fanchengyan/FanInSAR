@@ -4,7 +4,7 @@ DEM materialization
 FanInSAR uses one public DEM facade. Construct a source recipe or a local
 raster, then materialize it on the grid owned by the consuming stage::
 
-   from faninsar.processing.dem import DEM
+   from faninsar.processing.geometry import DEM
 
    source = DEM.from_source("glo30:pc", cache_dir=".cache/dem")
    dem = source.to_raster(stack.grid, vertical_datum="ellipsoidal")

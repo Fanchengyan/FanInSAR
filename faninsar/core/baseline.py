@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from matplotlib.figure import Figure, SubFigure
     from matplotlib.legend import Legend
 
-    from faninsar.core.pairs import Pairs
+    from faninsar.core.pair import Pairs
     from faninsar.plotting.colorbar import HistColorbar
 
 

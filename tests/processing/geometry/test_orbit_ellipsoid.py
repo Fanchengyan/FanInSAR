@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 import pytest
 
-from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.processing.geometry import (
     OrbitInterpolationError,
     OrbitInterpolator,

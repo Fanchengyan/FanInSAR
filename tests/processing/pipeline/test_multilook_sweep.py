@@ -14,7 +14,7 @@ import pytest
 import zarr
 
 from faninsar.missions.s1.errors import Sentinel1ProductError
-from faninsar.processing.dem import ConstantDEM
+from faninsar.processing.geometry import ConstantDEM
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.mosaicking.grid import GeoGridSpec
 from faninsar.processing.stages import ProductionPairState

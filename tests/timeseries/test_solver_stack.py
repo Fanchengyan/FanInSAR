@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from faninsar import Pairs
-from faninsar.processing.contracts.ifg import InterferogramStack
+from faninsar.processing.interferometry.contracts import InterferogramStack
 from faninsar.timeseries.solver import NSBASSolver
 
 

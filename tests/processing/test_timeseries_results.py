@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.stack.ifg_store import ArtifactResourceLimits
+from faninsar.io.storage.ifg_store import ArtifactResourceLimits
 from faninsar.timeseries.io import open_timeseries_zarr, write_timeseries_zarr
 from faninsar.timeseries.results import TimeSeriesResult, invert_unwrapped_pairs
 

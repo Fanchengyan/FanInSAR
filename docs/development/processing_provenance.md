@@ -187,7 +187,7 @@ Validate the baseline through the public library driver before running a
 processor:
 
 ```bash
-uv run python -c "from pathlib import Path; from faninsar.validation.provenance import validate_pipeline_rebuild_manifest; print(validate_pipeline_rebuild_manifest(Path('tests/reference/pipeline_rebuild_manifest.yaml')))"
+uv run python -c "from pathlib import Path; from faninsar.io.storage.validation import validate_pipeline_rebuild_manifest; print(validate_pipeline_rebuild_manifest(Path('tests/reference/pipeline_rebuild_manifest.yaml')))"
 ```
 
 The validator rejects malformed YAML, missing or changed pinned bytes, changed

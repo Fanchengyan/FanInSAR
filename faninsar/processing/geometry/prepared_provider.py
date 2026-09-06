@@ -21,7 +21,8 @@ import numpy as np
 import psutil
 
 from faninsar.logging import setup_logger
-from faninsar.processing.contracts.prepared_geometry import (
+from faninsar.processing.errors import InvalidProcessingStateError, reject_invalid_state
+from faninsar.processing.geometry.prepared import (
     PROVIDER_SCHEMA,
     CoregistrationPolicy,
     PreparedGeometryArrayPayload,
@@ -40,7 +41,6 @@ from faninsar.processing.contracts.prepared_geometry import (
     WorkerAttestation,
     geo_grid_identity,
 )
-from faninsar.processing.errors import InvalidProcessingStateError, reject_invalid_state
 from faninsar.processing.geometry.prepared_store import (
     PreparedGenerationLease,
     PreparedGenerationStore,
@@ -307,9 +307,7 @@ class LocalPreparedGeometryProvider:
         try:
             reader = self.store.open(lease)
             manifest = reader.manifest
-            manifest_digest = hashlib.sha256(
-                _canonical_json(manifest)
-            ).hexdigest()
+            manifest_digest = hashlib.sha256(_canonical_json(manifest)).hexdigest()
             expected_capability = _digest(
                 {
                     "generation_id": token.parent_generation_id,
@@ -320,9 +318,7 @@ class LocalPreparedGeometryProvider:
                 }
             )
             if token.capability_digest != expected_capability:
-                reject_invalid_state(
-                    "worker lease manifest capability does not match"
-                )
+                reject_invalid_state("worker lease manifest capability does not match")
             if manifest.get("generation_id") != token.parent_generation_id:
                 reject_invalid_state("worker lease generation does not match manifest")
             if manifest.get("provider_schema") != PROVIDER_SCHEMA:
@@ -603,9 +599,7 @@ class LocalPreparedGeometryProvider:
                 range_offset_px = np.asarray(archive["range_offset_px"])
                 azimuth_offset_px = np.asarray(archive["azimuth_offset_px"])
                 uncertainty_px = np.asarray(archive["uncertainty_px"])
-            coverage = np.asarray(
-                np.load(io.BytesIO(mask_payload), allow_pickle=False)
-            )
+            coverage = np.asarray(np.load(io.BytesIO(mask_payload), allow_pickle=False))
         except (OSError, ValueError, TypeError) as error:
             reject_invalid_state(
                 "prepared geometry payload is not valid NumPy data: " + str(error)
@@ -631,9 +625,7 @@ class LocalPreparedGeometryProvider:
         bindings = metadata.get("geometry")
         if not isinstance(bindings, Mapping):
             reject_invalid_state("prepared generation has no geometry bindings")
-        return tuple(
-            f"{parent_handle_id}::geometry::{key}" for key in sorted(bindings)
-        )
+        return tuple(f"{parent_handle_id}::geometry::{key}" for key in sorted(bindings))
 
     def materialize_view(
         self,
@@ -645,9 +637,7 @@ class LocalPreparedGeometryProvider:
         reader, manifest = self._open_parent(handle_id, token)
         metadata = _manifest_metadata(manifest)
         if request.parent_id != handle_id:
-            reject_invalid_state(
-                "scene view parent does not match the provider handle"
-            )
+            reject_invalid_state("scene view parent does not match the provider handle")
         bindings = metadata.get("views")
         binding = (
             bindings.get(request.view_id) if isinstance(bindings, Mapping) else None
@@ -747,9 +737,7 @@ class LocalPreparedGeometryProvider:
             with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
                 expected_names = {"az_full", "rg_full", "valid", "height_full"}
                 if set(archive.files) != expected_names:
-                    reject_invalid_state(
-                        "geo LUT payload has unexpected array names"
-                    )
+                    reject_invalid_state("geo LUT payload has unexpected array names")
                 az_full = np.asarray(archive["az_full"])
                 rg_full = np.asarray(archive["rg_full"])
                 valid = np.asarray(archive["valid"])

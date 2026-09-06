@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from faninsar.core.network import AssetKind
-from faninsar.processing.contracts import ActivationToken, StackActivationBinding
+from faninsar.network.products import AssetKind
+from faninsar.processing.geometry.prepared import ActivationToken, StackActivationBinding
 from faninsar.processing.interferometry.pair import (
     form_interferogram,
     goldstein_filter,
@@ -20,12 +20,12 @@ from faninsar.processing.mosaicking.grid import GeoGridSpec
 from faninsar.stack import Stack, StackConfig, StackSceneProvider
 from faninsar.stack.activation import LocalActivationAuthority
 from faninsar.stack.catalog import SceneCatalog
-from faninsar.stack.ifg_store import (
+from faninsar.io.storage.ifg_store import (
     InterferogramArtifactStore,
     write_ifg_artifact,
     write_unwrapped_artifact,
 )
-from faninsar.stack.scene_store import write_scene_unit
+from faninsar.io.storage.scene_store import write_scene_unit
 from faninsar.timeseries.io import write_timeseries_zarr
 
 if TYPE_CHECKING:
@@ -716,7 +716,7 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
 
     stack.form_interferograms(multilook=(1, 1))
     output_root = stack.ifg_dirs[0]
-    from faninsar.stack.ifg_store import InterferogramArtifactStore
+    from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 
     store = InterferogramArtifactStore.open(output_root)
     assert store.pair == dates
@@ -778,7 +778,7 @@ def test_stack_applies_multilook_before_publishing_ifg(
     stack.form_interferograms(multilook=(2, 2), goldstein_alpha=0.5)
     assert observed["dask_client"] is client
 
-    from faninsar.stack.ifg_store import InterferogramArtifactStore
+    from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 
     payload = InterferogramArtifactStore.open(stack.ifg_dirs[0]).read().complex_ifg
     expected = goldstein_filter(
@@ -1482,7 +1482,7 @@ def test_coreg_resume_identity_captures_nested_dem_sampling_semantics(
     """Interpolation and nested geoid samplers must invalidate scene reuse."""
     from affine import Affine
 
-    from faninsar.processing.dem import DEM, GridSpec, RasterDEM
+    from faninsar.processing.geometry import DEM, GridSpec, RasterDEM
     from faninsar.processing.geometry.dem import GeoidAdjustedDEM
 
     stack = _stack_with_three_date_network(tmp_path)

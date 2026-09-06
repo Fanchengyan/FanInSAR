@@ -11,9 +11,7 @@ from typing import Any, Self
 
 import numpy as np
 
-from faninsar.logging import setup_logger
-from faninsar.processing.errors import reject_invalid_state
-from faninsar.stack.artifact_transaction import (
+from faninsar.io.storage.artifact_transaction import (
     ArtifactResourceLimits,
     GenerationLease,
     canonical_json,
@@ -22,6 +20,8 @@ from faninsar.stack.artifact_transaction import (
     sha256_bytes,
     stage_generation,
 )
+from faninsar.logging import setup_logger
+from faninsar.processing.errors import reject_invalid_state
 from faninsar.timeseries.results import TimeSeriesResult
 
 logger = setup_logger(__name__)

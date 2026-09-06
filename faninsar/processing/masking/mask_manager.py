@@ -1,7 +1,7 @@
 """Automatic water-mask manager (PROPOSAL-0039, Slice C).
 
 Uses the public PROPOSAL-0041 DEM source facade
-(:mod:`faninsar.processing.dem`): a selectable water source
+(:mod:`faninsar.processing.geometry`): a selectable water source
 (:mod:`faninsar.processing.masking.mask_sources`) is executed through the
 audited PROPOSAL-0030 transport engine
 (:func:`faninsar.processing.geometry.dem_transport.fetch_plan` — reused as-is,

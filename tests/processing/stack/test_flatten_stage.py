@@ -10,7 +10,7 @@ import pytest
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.stack.config import StackConfig
 from faninsar.stack.nisar_provider import _sanitize_phase_screen
-from faninsar.stack.scene_store import (
+from faninsar.io.storage.scene_store import (
     CoregisteredSceneStore,
     form_merged_scene_interferogram,
     write_scene_unit,

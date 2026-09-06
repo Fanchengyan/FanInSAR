@@ -21,11 +21,11 @@ from pathlib import Path
 from typing import Any
 
 from faninsar.logging import setup_logger
-from faninsar.processing.contracts.prepared_geometry import (
+from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.geometry.prepared import (
     PROVIDER_SCHEMA,
     PreparedIdentity,
 )
-from faninsar.processing.errors import reject_invalid_state
 
 logger = setup_logger(__name__)
 
@@ -312,9 +312,7 @@ class PreparedGenerationStore:
             _atomic_write(self.current_path, f"{generation_id}\n".encode("ascii"))
             return PreparedGenerationRecord(
                 generation_id=generation_id,
-                manifest_digest=hashlib.sha256(
-                    _canonical_json(manifest)
-                ).hexdigest(),
+                manifest_digest=hashlib.sha256(_canonical_json(manifest)).hexdigest(),
                 payload_names=tuple(sorted(manifest["payloads"])),
             )
 

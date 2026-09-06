@@ -7,12 +7,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from faninsar.processing.readers import MissingCriticalMetadataError
-from faninsar.processing.storage import (
+from faninsar.io.storage.arrays import (
     ChunkAccessLog,
     ChunkedZarrArrayStore,
     InMemoryArrayStore,
 )
+from faninsar.processing.readers import MissingCriticalMetadataError
 from faninsar.processing.synthetic_slc import (
     SyntheticSLCReader,
     register_specs,

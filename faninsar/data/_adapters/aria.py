@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from faninsar.core.pairs import Pairs
+from faninsar.core.pair import Pairs
 from faninsar.core.sar_missions import Sentinel1
 from faninsar.data.datasets.ifg import HierarchicalInterferogramDataset
 

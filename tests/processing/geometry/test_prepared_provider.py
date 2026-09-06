@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from faninsar.processing.contracts import (
+from faninsar.processing.geometry.prepared import (
     CoregistrationPolicy,
     PreparedIdentity,
     ResourceLimits,

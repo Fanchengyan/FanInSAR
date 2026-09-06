@@ -1,4 +1,9 @@
-"""FanInSAR's small science-oriented public surface."""
+"""FanInSAR's small science-oriented public surface.
+
+This module is the sole root API definition.  Keep the whitelist intentionally
+small: workflow implementations and persistence/runtime details belong to
+their owning subpackages.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +19,8 @@ from faninsar.network import Network
 
 __version__ = "0.1.dev0"
 
+# Hard cap: the root surface is deliberately limited to the stable scientific
+# values and grouped workflow facades below.
 __all__ = [
     "Acquisition",
     "Acquisitions",

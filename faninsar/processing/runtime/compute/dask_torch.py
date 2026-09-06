@@ -59,8 +59,10 @@ class DaskTorchBackend:
                 na = np.asarray(a)
                 dask_args.append(da.from_array(na, chunks=chunks or na.shape))
 
-        meta_dtype = np.dtype(dtype) if dtype is not None else np.result_type(
-            *[getattr(a, "dtype", np.float64) for a in dask_args]
+        meta_dtype = (
+            np.dtype(dtype)
+            if dtype is not None
+            else np.result_type(*[getattr(a, "dtype", np.float64) for a in dask_args])
         )
         # resources tag is recorded for injected Client scheduling; day-1
         # map_blocks does not construct a cluster.

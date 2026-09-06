@@ -262,7 +262,7 @@ class LazyMultiFileReader:
         self.readers = [LazyRasterioReader(path, chunks=self._chunks) for path in paths]
 
     @staticmethod
-    def _resolve_chunks(
+    def _resolve_chunks(  # noqa: PLR0911
         chunks: dict[str, int] | int | Literal["auto"] | None,
         reference_path: str | None,
     ) -> dict[str, int]:
@@ -288,7 +288,7 @@ class LazyMultiFileReader:
             return default_chunks
 
         # Auto-detect from file block size
-        if chunks == "auto" or chunks == {}:
+        if chunks == "auto" or (isinstance(chunks, dict) and not chunks):
             if reference_path is None:
                 return default_chunks
             try:

@@ -6,6 +6,10 @@ swath joins.  This module removes those integer cycles without changing the
 complex interferogram.
 """
 
+# Scientific notation in this mature numerical implementation intentionally
+# follows the symbols used by the underlying derivation.
+# ruff: noqa: E501, N806, RUF059, SIM102
+
 from __future__ import annotations
 
 from typing import Any
@@ -246,7 +250,11 @@ def majority_cycle_align(
 
     n_mode_jumps_before = 0
     for c in range(1, width):
-        if np.isfinite(modes[c]) and np.isfinite(modes[c - 1]) and modes[c] != modes[c - 1]:
+        if (
+            np.isfinite(modes[c])
+            and np.isfinite(modes[c - 1])
+            and modes[c] != modes[c - 1]
+        ):
             n_mode_jumps_before += 1
 
     if align_modes and np.any(np.isfinite(modes)):
@@ -260,12 +268,11 @@ def majority_cycle_align(
                 modes[c] = modes[c - 1]
                 continue
             dwr = np.angle(np.exp(1j * (wrap[:, c] - wrap[:, c - 1])))
-            m = (
-                (coh[:, c] >= coh_min)
-                & (coh[:, c - 1] >= coh_min)
-                & np.isfinite(dwr)
-            )
-            if int(m.sum()) < 20 or float(np.median(np.abs(dwr[m]))) < max_complex_step_rad:
+            m = (coh[:, c] >= coh_min) & (coh[:, c - 1] >= coh_min) & np.isfinite(dwr)
+            if (
+                int(m.sum()) < 20
+                or float(np.median(np.abs(dwr[m]))) < max_complex_step_rad
+            ):
                 if modes[c] != modes[c - 1]:
                     modes[c] = modes[c - 1]
         for c in range(seed - 1, -1, -1):
@@ -273,12 +280,11 @@ def majority_cycle_align(
                 modes[c] = modes[c + 1]
                 continue
             dwr = np.angle(np.exp(1j * (wrap[:, c + 1] - wrap[:, c])))
-            m = (
-                (coh[:, c] >= coh_min)
-                & (coh[:, c + 1] >= coh_min)
-                & np.isfinite(dwr)
-            )
-            if int(m.sum()) < 20 or float(np.median(np.abs(dwr[m]))) < max_complex_step_rad:
+            m = (coh[:, c] >= coh_min) & (coh[:, c + 1] >= coh_min) & np.isfinite(dwr)
+            if (
+                int(m.sum()) < 20
+                or float(np.median(np.abs(dwr[m]))) < max_complex_step_rad
+            ):
                 if modes[c] != modes[c + 1]:
                     modes[c] = modes[c + 1]
 
@@ -305,7 +311,11 @@ def majority_cycle_align(
 
     n_mode_jumps_after = 0
     for c in range(1, width):
-        if np.isfinite(modes[c]) and np.isfinite(modes[c - 1]) and modes[c] != modes[c - 1]:
+        if (
+            np.isfinite(modes[c])
+            and np.isfinite(modes[c - 1])
+            and modes[c] != modes[c - 1]
+        ):
             n_mode_jumps_after += 1
 
     report: dict[str, Any] = {
@@ -727,7 +737,9 @@ def correct_unwrapped_seam_cycles(
     # overall median is diluted.  Estimate k from the large-jump subset.
     large = jumps[np.abs(jumps - complex_step) > np.pi]
     if large.size >= max(min_rows // 4, 10):
-        k_large = int(np.round((float(np.median(large)) - complex_step) / (2.0 * np.pi)))
+        k_large = int(
+            np.round((float(np.median(large)) - complex_step) / (2.0 * np.pi))
+        )
         if abs(k_large) > abs(k_global):
             k_global = k_large
     k_rows_raw = np.round((jumps - complex_step) / (2.0 * np.pi)).astype(np.int32)

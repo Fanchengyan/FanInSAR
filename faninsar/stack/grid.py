@@ -11,9 +11,9 @@ from affine import Affine
 from pyproj import Transformer
 
 from faninsar.logging import setup_logger
-from faninsar.processing.dem.resources import ResourceBudget, preflight_grid
-from faninsar.processing.dem.seam import ExplicitAntimeridianError
 from faninsar.processing.geometry.grids import GridSpec
+from faninsar.processing.geometry.resources import ResourceBudget, preflight_grid
+from faninsar.processing.geometry.seam import ExplicitAntimeridianError
 
 logger = setup_logger(__name__)
 
@@ -25,9 +25,7 @@ def _geometry_bounds(roi: object) -> tuple[float, float, float, float]:
     roi_crs = getattr(roi, "crs", None)
     if roi_crs is not None:
         try:
-            if str(roi_crs) not in {"EPSG:4326", "WGS 84"} and hasattr(
-                roi, "to_crs"
-            ):
+            if str(roi_crs) not in {"EPSG:4326", "WGS 84"} and hasattr(roi, "to_crs"):
                 roi = roi.to_crs("EPSG:4326")
         except (TypeError, ValueError):
             raise ValueError("ROI CRS cannot be transformed to EPSG:4326") from None

@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 from affine import Affine
 
-from faninsar.processing.dem import GridSpec
-from faninsar.processing.dem.datum import convert_heights
-from faninsar.processing.dem.seam import ExplicitAntimeridianError
+from faninsar.processing.geometry import GridSpec
+from faninsar.processing.geometry.datum import convert_heights
+from faninsar.processing.geometry.seam import ExplicitAntimeridianError
 from faninsar.stack.grid import automatic_grid, resolve_stack_grid
 
 

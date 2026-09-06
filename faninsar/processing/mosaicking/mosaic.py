@@ -1,7 +1,8 @@
 """Weighted mosaic of geocoded burst products.
 
-The primary entry point is now :func:`faninsar.processing.mosaicking.methods.merge_bursts`,
-which exposes the seven reference-grounded merge strategies documented in
+The primary entry point is now
+:func:`faninsar.processing.mosaicking.methods.merge_bursts`, which exposes the
+seven reference-grounded merge strategies documented in
 Waymark ``NOTE-0001`` and the global ``sar-burst-merge`` skill.
 :func:`merge_burst_products` is retained as a
 backward-compatible wrapper that maps the legacy ``mode`` argument onto a

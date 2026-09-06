@@ -9,14 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from faninsar.processing.contracts import (
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
+from faninsar.processing.interferometry.products import (
     CalibrationState,
     CarrierState,
     CoregistrationState,
-    OrbitMetadata,
-    OrbitStateVector,
-    SLCProduct,
 )
+from faninsar.processing.slc.products import SLCProduct
 from faninsar.processing.coordinates import (
     ArrayDescriptor,
     ArrayRepresentation,

@@ -10,7 +10,7 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 
-from faninsar.processing.dem import ConstantDEM
+from faninsar.processing.geometry import ConstantDEM
 from faninsar.processing.geometry import (
     Operation,
     execute_geometry,

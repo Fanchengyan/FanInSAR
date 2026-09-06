@@ -399,7 +399,7 @@ def test_masked_bbox_pixels_geo2rdr_outside_burst_window() -> None:
     """
     from pyproj import Transformer
 
-    from faninsar.processing.dem import ConstantDEM
+    from faninsar.processing.geometry import ConstantDEM
     from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr2geo
     from faninsar.processing.geocoding.geo_lut import (
         build_geo2rdr_lut,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from faninsar.core.physical import PhysicalType
-from faninsar.processing.contracts.tokens import ArrayToken, assert_token
+from faninsar.processing.runtime.tokens import ArrayToken, assert_token
 from faninsar.processing.errors import StageError
 
 

@@ -55,7 +55,7 @@ from faninsar.processing.geometry.v2 import (
 )
 
 if TYPE_CHECKING:
-    from faninsar.processing.dem import DEM
+    from faninsar.processing.geometry import DEM
     from faninsar.processing.geometry.native_v2.builder import PreparedNativeCandidate
     from faninsar.processing.geometry.transforms import RadarGeometryModel
     from faninsar.processing.runtime.types import DeviceLike

@@ -5,9 +5,17 @@ from __future__ import annotations
 from typing import Any
 
 from faninsar.io.store import open_store
+from faninsar.logging import setup_logger
+
+logger = setup_logger(__name__)
 
 
-def write_pair(product: Any, uri: str, *, format: str = "cog") -> None:
+def write_pair(
+    product: Any,
+    uri: str,
+    *,
+    format: str = "cog",  # noqa: A002
+) -> None:
     """Write a pair product to *uri*.
 
     Parameters
@@ -32,11 +40,14 @@ def write_pair(product: Any, uri: str, *, format: str = "cog") -> None:
             root.attrs["product_type"] = type(product).__name__
         return
     if format in {"cog", "geotiff"}:
-        # Expect product to provide array + transform metadata for raster write
-        raise NotImplementedError(
-            "GeoTIFF/COG write requires raster metadata; use processing pipeline writers"
+        message = (
+            "GeoTIFF/COG write requires raster metadata; use domain product writers"
         )
-    raise ValueError(f"unsupported format {format!r}")
+        logger.error(message)
+        raise NotImplementedError(message)
+    message = f"unsupported format {format!r}"
+    logger.error(message)
+    raise ValueError(message)
 
 
 __all__ = ["write_pair"]

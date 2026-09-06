@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal
 import pandas as pd
 import rioxarray  # noqa: F401
 
-from faninsar.core.pairs import Pairs
+from faninsar.core.pair import Pairs
 from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
 from faninsar.logging import setup_logger
 
@@ -137,8 +137,6 @@ class PairDataset(RasterDataset):
             pair_names = files_df["pair_name"].astype(str).to_numpy()
         else:
             pair_names = self.pairs.to_names()
-        pairs = Pairs.from_names(pair_names)
-
         coords: dict[str, tuple[str, NDArray]] = {"pair": ("pair", pair_names)}
         return coords
 

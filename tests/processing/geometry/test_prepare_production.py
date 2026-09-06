@@ -10,8 +10,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from faninsar.processing.contracts import OrbitMetadata, OrbitStateVector
-from faninsar.processing.dem import ConstantDEM
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
+from faninsar.processing.geometry import ConstantDEM
 from faninsar.processing.geometry import prepare_production as prepare_mod
 from faninsar.processing.geometry.backend_dispatch import DispatchError
 from faninsar.processing.geometry.native_v2.builder import (
@@ -229,7 +229,7 @@ def test_projected_raster_dem_geometry_view_does_not_materialize_epsg4326(
     """Projected public DEMs use the private sampler branch directly."""
     from affine import Affine
 
-    from faninsar.processing.dem import GridSpec, RasterDEM
+    from faninsar.processing.geometry import GridSpec, RasterDEM
 
     source = RasterDEM(
         array=np.arange(64, dtype=np.float32).reshape(8, 8),

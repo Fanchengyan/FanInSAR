@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from faninsar.processing.contracts import ActivationToken
+from faninsar.processing.geometry.prepared import ActivationToken
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.stack.activation import LocalActivationAuthority
 

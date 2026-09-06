@@ -24,9 +24,9 @@ from faninsar.stack.session import Stack, _pairs_from_factory
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from faninsar.core.pairs import Pairs
-    from faninsar.processing.contracts import SLCProduct
+    from faninsar.core.pair import Pairs
     from faninsar.processing.readers import SLCReadResult
+    from faninsar.processing.slc.products import SLCProduct
 
 logger = setup_logger(__name__)
 _DATE_RE = re.compile(r"(?<!\d)(\d{8})(?:T\d{6}(?:\.\d+)?)?")

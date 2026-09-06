@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from faninsar.core.pairs import Pairs
+from faninsar.core.pair import Pairs
 from faninsar.core.sar_missions import Sentinel1
 from faninsar.data.datasets.ifg import InterferogramDataset
 

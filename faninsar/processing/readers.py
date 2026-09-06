@@ -10,8 +10,8 @@ from faninsar.logging import setup_logger
 from .errors import ProcessingContractError
 
 if TYPE_CHECKING:
-    from .contracts import SLCProduct
     from .coordinates import Shape2D
+    from .slc.products import SLCProduct
 
 logger = setup_logger(__name__)
 

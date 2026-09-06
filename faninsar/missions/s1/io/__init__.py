@@ -3,8 +3,8 @@
 Submodules:
 
 - :mod:`faninsar.missions.s1.io.read`   — rasterio-window full-burst reads
-- :mod:`faninsar.missions.s1.io.extract` — byte-offset fast burst extraction
-- :mod:`faninsar.missions.s1.io.remote`  — remote (ASF) burst extraction via ``requests``
+- :mod:`faninsar.missions.s1.io.extract` — byte-offset burst extraction
+- :mod:`faninsar.missions.s1.io.remote` — remote ASF burst extraction
 - :mod:`faninsar.missions.s1.io.export`  — SAFE subset directory export
 
 Public names are re-exported here so existing imports

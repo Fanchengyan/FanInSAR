@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 
 from faninsar.processing.coregistration.offsets import resample_complex
-from faninsar.processing.resampling import lanczos_resample
-from faninsar.processing.resampling_torch import lanczos_resample_torch
+from faninsar.processing.coregistration.resampling import lanczos_resample
+from faninsar.processing.coregistration.resampling_torch import lanczos_resample_torch
 
 torch = pytest.importorskip("torch")
 
@@ -24,7 +24,7 @@ def test_resample_complex_dask_torch_single_upload(
     2-D source uploads through ``torch.from_numpy``. Row tiles must only move
     coordinates, not re-upload the full SLC.
     """
-    from faninsar.processing import resampling_torch as rt
+    from faninsar.processing.coregistration import resampling_torch as rt
 
     rng = np.random.default_rng(7)
     height, width = 20, 16
@@ -106,7 +106,7 @@ def test_resample_complex_torch_cpu_does_not_use_numpy_dask() -> None:
     samples = (rng.normal(size=(24, 20)) + 1j * rng.normal(size=(24, 20))).astype(
         np.complex64
     )
-    assert find_spec("faninsar.processing.resampling_dask") is None
+    assert find_spec("faninsar.processing.coregistration.resampling_dask") is None
     resample_complex(
         samples,
         range_offset_px=0.4,

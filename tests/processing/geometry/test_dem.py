@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from affine import Affine
 
-from faninsar.processing.dem import ConstantDEM
+from faninsar.processing.geometry import ConstantDEM
 from faninsar.processing.geometry import torch_kernels
 from faninsar.processing.geometry.dem import (
     GeoidAdjustedDEM,

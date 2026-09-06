@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from datetime import datetime
     from pathlib import Path
 
-    from faninsar.processing.contracts import OrbitMetadata
+    from faninsar.core.orbit import OrbitMetadata
     from faninsar.processing.readers import (
         DopplerCentroidPolynomial,
         ValidSampleMask,

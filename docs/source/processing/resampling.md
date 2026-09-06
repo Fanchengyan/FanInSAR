@@ -121,14 +121,14 @@ data type:
 
 ### Lanczos for complex SLC / ifg
 
-`faninsar.processing.resampling.lanczos_resample` is a phase-preserving
+`faninsar.processing.coregistration.resampling.lanczos_resample` is a phase-preserving
 replacement for `scipy.ndimage.map_coordinates(order=1)` on complex SAR
 data. It applies a separable Lanczos-$a$ kernel along rows then columns,
 accumulating in float64 / complex128 to avoid precision bias:
 
 ```python
 import numpy as np
-from faninsar.processing.resampling import lanczos_resample
+from faninsar.processing.coregistration.resampling import lanczos_resample
 
 # slc: 2D complex64 SLC burst, shape (az, rg)
 # coords: output coordinates of shape (2, N), coords[0]=rows, coords[1]=cols

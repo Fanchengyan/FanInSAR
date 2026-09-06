@@ -1,19 +1,149 @@
-"""Persist pair products to Zarr and emit a minimal STAC item."""
+"""Interferogram product values and persistence writers."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.errors import reject_invalid_state
+from faninsar.processing.coordinates import (
+    ArrayDescriptor,
+    ArrayRepresentation,
+    ProcessingGrid,
+)
+from faninsar.processing.errors import reject_grid_mismatch, reject_invalid_state
+
+if TYPE_CHECKING:
+    from faninsar.processing.slc.products import SLCProduct
 
 logger = setup_logger(__name__)
+
+
+class CarrierState(StrEnum):
+    """TOPS carrier handling state."""
+
+    PRESENT = "present"
+    DERAMPED = "deramped"
+    RESTORED = "restored"
+
+
+class CoregistrationState(StrEnum):
+    """Registration state relative to the stack reference."""
+
+    NOT_REGISTERED = "not_registered"
+    REGISTERED = "registered"
+
+
+class FlatteningState(StrEnum):
+    """Interferometric reference-phase removal state."""
+
+    NOT_APPLIED = "not_applied"
+    APPLIED = "applied"
+
+
+class CalibrationState(StrEnum):
+    """Radiometric calibration state."""
+
+    RAW_DN = "raw_dn"
+    CALIBRATED = "calibrated"
+
+
+@dataclass(frozen=True, slots=True)
+class ComplexInterferogram:
+    """Metadata-only complex interferogram (URI/descriptor contracts).
+
+    .. deprecated::
+        Prefer the canonical Network interferogram products as the
+        processing ↔ timeseries seam for array-bearing products.  This type
+        remains for storage/STAC descriptor contracts until PairProduct is
+        fully migrated.
+    """
+
+    pair_id: str
+    primary_id: str
+    secondary_id: str
+    grid: ProcessingGrid
+    samples: ArrayDescriptor
+    flattening: FlatteningState
+
+    @classmethod
+    def form(
+        cls,
+        primary: SLCProduct,
+        secondary: SLCProduct,
+        *,
+        uri: str | None = None,
+    ) -> ComplexInterferogram:
+        """Create metadata for an interferogram after validating its inputs."""
+        if (
+            primary.coregistration is not CoregistrationState.REGISTERED
+            or secondary.coregistration is not CoregistrationState.REGISTERED
+        ):
+            reject_invalid_state("interferogram inputs must both be registered")
+        if primary.grid != secondary.grid:
+            reject_grid_mismatch("interferogram inputs must use the same grid")
+        pair_id = f"{primary.acquisition_id}_{secondary.acquisition_id}"
+        return cls(
+            pair_id=pair_id,
+            primary_id=primary.acquisition_id,
+            secondary_id=secondary.acquisition_id,
+            grid=primary.grid,
+            samples=ArrayDescriptor(
+                uri=uri or f"memory://{pair_id}/complex",
+                shape=primary.grid.shape,
+                dtype="complex64",
+                representation=ArrayRepresentation.COMPLEX,
+            ),
+            flattening=FlatteningState.NOT_APPLIED,
+        )
+
+    def __post_init__(self) -> None:
+        """Validate complex representation and grid identity."""
+        if self.samples.representation is not ArrayRepresentation.COMPLEX:
+            reject_invalid_state("interferogram samples must remain complex")
+        if self.samples.shape != self.grid.shape:
+            reject_grid_mismatch("interferogram samples must match their grid")
+
+
+@dataclass(frozen=True, slots=True)
+class UnwrapResult:
+    """Unwrapped phase and algorithm identity for one pair."""
+
+    pair_id: str
+    grid: ProcessingGrid
+    phase: ArrayDescriptor
+    method: str
+
+    def __post_init__(self) -> None:
+        """Validate unwrapped phase representation and grid identity."""
+        if self.phase.representation is not ArrayRepresentation.PHASE:
+            reject_invalid_state("unwrap output must be a phase array")
+        if self.phase.shape != self.grid.shape:
+            reject_grid_mismatch("unwrap phase must match its grid")
+        if not self.method:
+            reject_invalid_state("unwrap method must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class PairProduct:
+    """Interferogram and optional unwrapped result for one acquisition pair."""
+
+    interferogram: ComplexInterferogram
+    unwrap: UnwrapResult | None = None
+
+    def __post_init__(self) -> None:
+        """Validate that unwrapping belongs to the same pair and grid."""
+        if self.unwrap is not None and (
+            self.unwrap.pair_id != self.interferogram.pair_id
+            or self.unwrap.grid != self.interferogram.grid
+        ):
+            reject_invalid_state("unwrap result must match its interferogram")
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,3 +281,17 @@ def write_pair_stac_item(
     item_path.write_text(json.dumps(item, indent=2) + "\n", encoding="utf-8")
     logger.info("Wrote pair STAC item: %s", item_path)
     return item_path
+
+
+__all__ = [
+    "CalibrationState",
+    "CarrierState",
+    "ComplexInterferogram",
+    "CoregistrationState",
+    "FlatteningState",
+    "PairProduct",
+    "PairProductArrays",
+    "UnwrapResult",
+    "write_pair_stac_item",
+    "write_pair_zarr",
+]

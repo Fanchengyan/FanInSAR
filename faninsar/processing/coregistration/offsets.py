@@ -279,7 +279,7 @@ def _is_cpu_ampcor_device(device: object) -> bool:
 
 
 def _admit_ampcor_device(device: str) -> str:
-    """Admit an Ampcor device through :func:`faninsar.processing.runtime.device.parse_device`.
+    """Admit Ampcor through the shared runtime device parser.
 
     ``auto`` and ``gpu`` follow the shared contract: CUDA when it is visible
     to this process, otherwise CPU. MPS is never auto-selected. Explicit
@@ -2411,7 +2411,7 @@ def resample_complex(
     resolved_device: object | None = None
     chunk_size = 0
     if order is None:
-        from faninsar.processing.resampling_torch import (
+        from faninsar.processing.coregistration.resampling_torch import (
             DEFAULT_LANCZOS_CHUNK,
             _cleanup_device,
             _lanczos_resample_device_persistent,
@@ -2507,7 +2507,7 @@ def resample_complex_deramped_reramp(
        work, the kernel sees a band-limited stationary signal.
     2. Apply the secondary carrier back at the **source** fractional
        coordinates ``output_index - offset`` via
-       :func:`faninsar.processing.torch_kernels.carrier_phase_at_points_torch`
+       :func:`faninsar.processing.runtime.torch_kernels.carrier_phase_at_points_torch`
        (analytical polynomial), **not** by
        interpolating an integer-grid carrier plane. The latter is what
        collapsed to 65 rad in §6 because ``map_coordinates(order=1)``
@@ -2590,7 +2590,7 @@ def resample_complex_deramped_reramp(
         carrier_model = secondary_carrier if output_carrier is None else output_carrier
         carrier_row = (src_row if output_carrier is None else rows) + float(row0)
         carrier_col = (src_col if output_carrier is None else cols) + float(col0)
-        from faninsar.processing.torch_kernels import (
+        from faninsar.processing.runtime.torch_kernels import (
             carrier_multiply_torch,
             carrier_phase_at_points_torch,
         )

@@ -273,9 +273,12 @@ def redact_url(url: str) -> str:
     query = ""
     if parts.query:
         query = urllib.parse.urlencode(
-            [(key, "REDACTED") for key, _ in urllib.parse.parse_qsl(
-                parts.query, keep_blank_values=True
-            )]
+            [
+                (key, "REDACTED")
+                for key, _ in urllib.parse.parse_qsl(
+                    parts.query, keep_blank_values=True
+                )
+            ]
         )
     hostname = parts.hostname or ""
     netloc = hostname
@@ -285,9 +288,7 @@ def redact_url(url: str) -> str:
         port = "REDACTED"
     if port is not None:
         netloc = f"{hostname}:{port}"
-    return urllib.parse.urlunsplit(
-        (parts.scheme, netloc, parts.path, query, "")
-    )
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, ""))
 
 
 def _scrub_message(text: str) -> str:
@@ -976,7 +977,10 @@ def _download_ranged(
                     if not block:
                         continue
                     next_received = received + len(block)
-                    if next_received > expected_chunk or next_received > max_fetch_bytes:
+                    if (
+                        next_received > expected_chunk
+                        or next_received > max_fetch_bytes
+                    ):
                         raise InvalidProcessingStateError(
                             "ranged response body exceeds its declared byte range"
                         )

@@ -55,9 +55,9 @@ if TYPE_CHECKING:
 
     from rasterio.windows import Window
 
+    from faninsar.core.types import ResamplingLike
     from faninsar.data.query.points import Points
     from faninsar.data.query.polygons import Polygons
-    from faninsar.core.types import ResamplingLike
 
 __all__ = ["FileMetadata", "XarrayDataSpec", "XarrayDataset"]
 
@@ -651,7 +651,7 @@ class XarrayDataset(GeoDataset):
             # Sample using Xarray's selection
             values = np.full(len(points_crs), self.nodata, dtype=self.dtype)
 
-            for i, (x, y) in enumerate(zip(x_coords, y_coords)):
+            for i, (x, y) in enumerate(zip(x_coords, y_coords, strict=True)):
                 try:
                     # Use nearest neighbor selection
                     val = data_var.sel(
@@ -808,12 +808,10 @@ class XarrayDataset(GeoDataset):
                 target_array = target_array.rename(rename_dims)
             stacked_arrays.append(target_array)
 
-        da_box = xr.concat(stacked_arrays, dim="file")
-        da_box = da_box.assign_coords(
+        return xr.concat(stacked_arrays, dim="file").assign_coords(
             file=np.arange(len(self._open_specs), dtype=int),
             file_path=("file", [spec.path for spec in self._open_specs]),
         )
-        return da_box
 
     def _parse_single_file(self, spec: XarrayDataSpec) -> FileMetadata:
         """Extract metadata for a single raster.
@@ -887,7 +885,9 @@ class XarrayDataset(GeoDataset):
         chunks = kwargs.get("chunks")
         if isinstance(chunks, tuple):
             if len(chunks) != 2:
-                raise ValueError("tuple chunks must contain (y, x) sizes")
+                message = "tuple chunks must contain (y, x) sizes"
+                logger.error(message)
+                raise ValueError(message)
             kwargs["chunks"] = {"y": chunks[0], "x": chunks[1]}
         return kwargs
 

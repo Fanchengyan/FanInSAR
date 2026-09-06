@@ -16,11 +16,10 @@ import numpy as np
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr2geo
-from faninsar.processing.memory import release_memmap_pages
+from faninsar.processing.runtime.memory import release_memmap_pages
 
 if TYPE_CHECKING:
-    from faninsar.processing.dem import DEM
-    from faninsar.processing.geometry import RadarGeometryModel
+    from faninsar.processing.geometry import DEM, RadarGeometryModel
     from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.runtime.types import DeviceLike
 
@@ -40,6 +39,7 @@ def _add_timing(timings: dict[str, float] | None, key: str, started: float) -> N
     if timings is None:
         return
     timings[key] = timings.get(key, 0.0) + (time.perf_counter() - started)
+
 
 __all__ = [
     "Geo2RdrLUT",
@@ -994,11 +994,13 @@ def build_geo2rdr_lut(
             & (result_range <= full_width - 1.0)
         )
         azimuth[row_start - row0 : row_stop - row0, :] = np.where(
-            chunk_valid, result_azimuth,
+            chunk_valid,
+            result_azimuth,
             np.nan,
         )
         range_index[row_start - row0 : row_stop - row0, :] = np.where(
-            chunk_valid, result_range,
+            chunk_valid,
+            result_range,
             np.nan,
         )
         valid[row_start - row0 : row_stop - row0, :] = chunk_valid

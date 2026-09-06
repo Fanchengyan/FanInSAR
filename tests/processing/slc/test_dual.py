@@ -8,15 +8,16 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from faninsar.processing.contracts import (
-    ArrayDescriptor,
-    ArrayRepresentation,
+from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
+from faninsar.processing.interferometry.products import (
     CalibrationState,
     CarrierState,
     CoregistrationState,
-    OrbitMetadata,
-    OrbitStateVector,
-    SLCProduct,
+)
+from faninsar.processing.slc.products import SLCProduct
+from faninsar.processing.coordinates import (
+    ArrayDescriptor,
+    ArrayRepresentation,
 )
 from faninsar.processing.coordinates import GeoGrid, RadarGrid
 from faninsar.processing.errors import InvalidProcessingStateError

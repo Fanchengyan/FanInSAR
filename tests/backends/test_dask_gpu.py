@@ -219,7 +219,7 @@ def test_scheduled_carrier_forwards_explicit_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Worker block kernels receive the caller's device string unchanged."""
-    import faninsar.processing.torch_kernels as kernels
+    import faninsar.processing.runtime.torch_kernels as kernels
 
     observed_devices: list[str] = []
     original_phase = kernels.carrier_phase_at_points_torch
@@ -269,7 +269,7 @@ def test_gpu_worker_graph_forwards_fail_closed_cuda(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GPU-resource tasks receive explicit CUDA instead of ambiguous auto."""
-    import faninsar.processing.torch_kernels as kernels
+    import faninsar.processing.runtime.torch_kernels as kernels
 
     observed_devices: list[str] = []
 
@@ -305,7 +305,7 @@ def test_gpu_worker_graph_preserves_cuda_ordinal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Explicit ``cuda:N`` is forwarded unchanged when CUDA-N parsing is incomplete."""
-    import faninsar.processing.torch_kernels as kernels
+    import faninsar.processing.runtime.torch_kernels as kernels
 
     observed_devices: list[str] = []
 
@@ -454,7 +454,7 @@ def test_ambient_client_does_not_trigger_submission(
 
 def test_esd_is_submitted_as_one_gpu_task(monkeypatch: pytest.MonkeyPatch) -> None:
     """ESD uses one whole-array task on the explicitly selected GPU client."""
-    import faninsar.processing.torch_kernels as kernels
+    import faninsar.processing.runtime.torch_kernels as kernels
 
     sentinel = object()
     monkeypatch.setattr(

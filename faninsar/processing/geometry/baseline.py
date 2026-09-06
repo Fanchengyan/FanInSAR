@@ -14,7 +14,7 @@ from .orbit import OrbitInterpolator, OrbitState
 if TYPE_CHECKING:
     from datetime import datetime
 
-    from faninsar.processing.contracts import OrbitMetadata
+    from faninsar.core.orbit import OrbitMetadata
 
 logger = setup_logger(__name__)
 

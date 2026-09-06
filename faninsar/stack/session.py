@@ -31,7 +31,14 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, Self, TypeV
 
 import numpy as np
 
-from faninsar.core.network import (
+from faninsar.io.storage.scene_store import (
+    CoregisteredSceneStore,
+    copy_reference_units,
+    form_merged_scene_interferogram,
+)
+from faninsar.logging import setup_logger
+from faninsar.network.network import Network, NetworkContract
+from faninsar.network.products import (
     AcquisitionKey,
     AssetKind,
     AssetTransform,
@@ -40,20 +47,15 @@ from faninsar.core.network import (
     NetworkProductKey,
     PhaseConvention,
 )
-from faninsar.core.network import (
-    Network as NetworkContract,
-)
-from faninsar.logging import setup_logger
-from faninsar.network.network import Network
 from faninsar.processing.coregistration.misreg_network import (
     DateMisreg,
     MisregArc,
     invert_pair_misregistration,
 )
-from faninsar.processing.dem import RasterDEM, SourceDEM
 from faninsar.processing.errors import (
     reject_invalid_state,
 )
+from faninsar.processing.geometry import RasterDEM, SourceDEM
 from faninsar.processing.interferometry.pair import validate_coherence_window
 from faninsar.processing.interferometry.phase_filter import (
     FilterProvenance,
@@ -72,26 +74,26 @@ from faninsar.stack.config import (
 )
 from faninsar.stack.mask_plan import MaskPlan, StageName
 from faninsar.stack.provider import SourceHandle
-from faninsar.stack.scene_store import (
-    CoregisteredSceneStore,
-    copy_reference_units,
-    form_merged_scene_interferogram,
-)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from faninsar.core.acquisition import Acquisition
-    from faninsar.core.pairs import Pairs
+    from faninsar.core.pair import Pairs
     from faninsar.data.query import BoundingBox, Polygons
-    from faninsar.processing.contracts.prepared_geometry import (
+    from faninsar.io.storage.ifg_store import (
+        InterferogramArtifactStore,
+        UnwrappedArtifact,
+    )
+    from faninsar.io.storage.stack_generation import StackResultGeneration
+    from faninsar.processing.geometry import DEM, GridSpec
+    from faninsar.processing.geometry.prepared import (
         ActivationToken,
         StackActivationBinding,
     )
-    from faninsar.processing.dem import DEM, GridSpec
     from faninsar.processing.mosaicking.grid import GeoGridSpec
-    from faninsar.processing.resources import ResourceBudget
     from faninsar.processing.runtime.device import GpuMemoryReclaim
+    from faninsar.processing.runtime.resources import ResourceBudget
     from faninsar.processing.stages import (
         BurstSelection,
         CoregistrationGrid,
@@ -100,12 +102,7 @@ if TYPE_CHECKING:
     from faninsar.processing.unwrapping.common import SpatialUnwrapper
     from faninsar.processing.unwrapping.quality import StackQualityCriteria
     from faninsar.processing.unwrapping.stack import SpatialExecutor, StackUnwrapResult
-    from faninsar.stack.ifg_store import (
-        InterferogramArtifactStore,
-        UnwrappedArtifact,
-    )
     from faninsar.stack.provider import StackSceneProvider
-    from faninsar.stack.stack_generation import StackResultGeneration
     from faninsar.timeseries.results import TimeSeriesResult
 
 logger = setup_logger(__name__)
@@ -744,7 +741,7 @@ def _pairs_from_factory(
     max_days: int = 72,
 ) -> Pairs:
     """Build short-baseline pairs from date ids."""
-    from faninsar.core.pairs import PairsFactory
+    from faninsar.core.pair import PairsFactory
 
     factory = PairsFactory(list(dates))
     return factory.from_interval(max_interval=max_interval, max_days=max_days)
@@ -960,7 +957,7 @@ class Stack(NetworkContract):
         The source recipe remains inert until this method is called.  Stack
         supplies its work-directory cache when a source recipe needs it.
         """
-        from faninsar.processing import dem as dem_api
+        from faninsar.processing.geometry import api as dem_api
 
         selected = dem or self.config.dem
         if selected is None:
@@ -2428,7 +2425,7 @@ class Stack(NetworkContract):
         pairs : Pairs, optional
             Pair graph to form. ``None`` uses the Stack graph fixed at
             construction. Pair endpoints are acquisition dates; their order is
-            canonicalized by :class:`~faninsar.core.pairs.Pairs`.
+            canonicalized by :class:`~faninsar.core.pair.Pairs`.
         multilook : tuple[int, int] or list[tuple[int, int]], optional
             One or more true boxcar look factors in ``(azimuth, range)``
             pixels. ``None`` uses :attr:`StackConfig.multilook`, whose default
@@ -2503,7 +2500,7 @@ class Stack(NetworkContract):
         self._ensure_prepared()
         self._require_qualified_activation_record()
 
-        from faninsar.processing.resources import (
+        from faninsar.processing.runtime.resources import (
             ResourceAdmissionLedger,
             estimate_formation_resources,
             reserve_estimate,
@@ -2582,7 +2579,7 @@ class Stack(NetworkContract):
                 expected_filter_name = filter_name
                 expected_filter_parameters = filter_parameters
                 if (sub / "manifest.json").exists():
-                    from faninsar.stack.ifg_store import (
+                    from faninsar.io.storage.ifg_store import (
                         InterferogramArtifactStore,
                     )
 
@@ -2647,7 +2644,7 @@ class Stack(NetworkContract):
                 finally:
                     if reservation is not None:
                         reservation.release()
-                from faninsar.stack.ifg_store import write_ifg_artifact
+                from faninsar.io.storage.ifg_store import write_ifg_artifact
 
                 # PROPOSAL-0039 (AC-5): the active mask is a support input
                 # intersected into the persisted valid_mask AFTER formation
@@ -2702,7 +2699,7 @@ class Stack(NetworkContract):
         replaced, so a partial or mixed generation leaves the previous index
         untouched.
         """
-        from faninsar.stack.ifg_store import InterferogramArtifactStore
+        from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 
         if not self.ifg_dirs:
             reject_invalid_state(
@@ -2873,7 +2870,7 @@ class Stack(NetworkContract):
         Existing IFG product records supply the shared acquisition and grid
         metadata; this method only adds the newly committed spatial layers.
         """
-        from faninsar.stack.stack_generation import UnwrapResultGeneration
+        from faninsar.io.storage.stack_generation import UnwrapResultGeneration
 
         if not isinstance(generation, UnwrapResultGeneration):
             logger.error("Stack unwrap refresh received an invalid generation")
@@ -2981,7 +2978,7 @@ class Stack(NetworkContract):
 
     def refresh_unwrap_generation(self) -> Self:
         """Rebuild the Network cache from the durable ``UNWRAP_CURRENT`` root."""
-        from faninsar.stack.stack_generation import open_unwrap_generation
+        from faninsar.io.storage.stack_generation import open_unwrap_generation
 
         generation = open_unwrap_generation(self.config.work_dir)
         previous = self._unwrap_generation
@@ -3071,14 +3068,17 @@ class Stack(NetworkContract):
         import torch
 
         from faninsar.data.datasets.ifg import StackInterferogramDataset
-        from faninsar.processing.resources import (
+        from faninsar.io.storage.stack_generation import (
+            publish_unwrap_generation,
+        )
+        from faninsar.processing.runtime.device import parse_device
+        from faninsar.processing.runtime.resources import (
             ResourceAdmissionError,
             ResourceAdmissionLedger,
             estimate_spatial_irls_resources,
             estimate_unwrap_decode_resources,
             reserve_estimate,
         )
-        from faninsar.processing.runtime.device import parse_device
         from faninsar.processing.unwrapping.common import (
             SpatialUnwrapper,
             SpatialUnwrapResult,
@@ -3086,9 +3086,6 @@ class Stack(NetworkContract):
         from faninsar.processing.unwrapping.errors import (
             NoValidSupportError,
             UnwrapFailedError,
-        )
-        from faninsar.stack.stack_generation import (
-            publish_unwrap_generation,
         )
 
         if not isinstance(unwrapper, SpatialUnwrapper):
@@ -3341,13 +3338,13 @@ class Stack(NetworkContract):
             This session with :attr:`unwrap_result` populated.
 
         """
+        from faninsar.io.storage.ifg_store import write_unwrapped_artifact
         from faninsar.processing.unwrapping.quality import (
             MetricDistribution,
             StackQualityCriteria,
             StackQualityReport,
         )
         from faninsar.processing.unwrapping.stack import unwrap_stack
-        from faninsar.stack.ifg_store import write_unwrapped_artifact
 
         requested_quality_criteria = asdict(quality_criteria or StackQualityCriteria())
         looks = multilook or self.config.multilook
@@ -3771,7 +3768,7 @@ class Stack(NetworkContract):
         This keeps the migration small while avoiding a second large raster
         representation in the normal local-workspace case.
         """
-        from faninsar.stack.artifact_transaction import (
+        from faninsar.io.storage.artifact_transaction import (
             commit_generation,
             stage_generation,
         )
@@ -3985,7 +3982,7 @@ class Stack(NetworkContract):
             the generation is no longer needed.
 
         """
-        from faninsar.stack.stack_generation import (
+        from faninsar.io.storage.stack_generation import (
             publish_stack_generation,
         )
 
@@ -4024,7 +4021,7 @@ class Stack(NetworkContract):
 
     def open_generation(self) -> StackResultGeneration:
         """Open the current complete derived-result generation for this Stack."""
-        from faninsar.stack.stack_generation import open_stack_generation
+        from faninsar.io.storage.stack_generation import open_stack_generation
 
         generation = open_stack_generation(self.config.work_dir)
         expected_pair_ids = tuple(
@@ -4135,7 +4132,7 @@ class Stack(NetworkContract):
         ifg_root: str | Path | None,
     ) -> list[InterferogramArtifactStore]:
         """Open the exact ordered common-grid artifact set for this Stack."""
-        from faninsar.stack.ifg_store import InterferogramArtifactStore
+        from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 
         azimuth_looks, range_looks = (int(looks[0]), int(looks[1]))
         root = (
@@ -4192,7 +4189,7 @@ def _iter_pair_dates(pairs: Pairs) -> list[tuple[str, str]]:
     FanInSAR ordering contract, so each edge is normalized through ``Pair``
     before it enters Stack persistence or analysis.
     """
-    from faninsar.core.pairs import Pair
+    from faninsar.core.pair import Pair
 
     out: list[tuple[str, str]] = []
     for values in pairs.values:
@@ -4203,7 +4200,7 @@ def _iter_pair_dates(pairs: Pairs) -> list[tuple[str, str]]:
 
 def _canonical_pair_strings(values: tuple[str, str]) -> tuple[str, str]:
     """Normalize persisted pair roles through the FanInSAR :class:`Pair` type."""
-    from faninsar.core.pairs import Pair
+    from faninsar.core.pair import Pair
 
     try:
         pair = Pair(
