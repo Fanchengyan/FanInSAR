@@ -1,3 +1,5 @@
+"""Baseline values and conversions for SAR acquisition networks."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -125,8 +127,19 @@ class Baselines:
             The values of the baselines.
 
         """
-        baselines = self.series[pairs.secondary] - self.series[pairs.primary]
-        bs = pd.Series(baselines, index=pairs.to_names())
+        # ``Pairs.primary`` and ``Pairs.secondary`` intentionally repeat
+        # acquisition dates when a network has more than one edge touching a
+        # date.  Indexing a Series with those repeated labels is interpreted
+        # as a reindex operation by newer pandas versions and can fail (or
+        # produce an ambiguous index).  Resolve each endpoint explicitly and
+        # compute in the Pair order instead.
+        values_by_date = self.series
+        primary_dates = pd.to_datetime(pairs.primary.to_numpy())
+        secondary_dates = pd.to_datetime(pairs.secondary.to_numpy())
+        primary_values = values_by_date.loc[primary_dates].to_numpy()
+        secondary_values = values_by_date.loc[secondary_dates].to_numpy()
+        baselines = secondary_values - primary_values
+        bs = pd.Series(np.asarray(baselines), index=pairs.to_names())
         bs.index.name = "pairs"
         bs.name = "baseline"
         return bs
@@ -316,8 +329,7 @@ class Baselines:
         Or using chain:
 
         >>> result = (
-        ...     baselines
-        ...     .plot(pairs, cmap="plasma")
+        ...     baselines.plot(pairs, cmap="plasma")
         ...     .set_pairs_style(linewidths=2, alpha=0.8)
         ...     .set_acq_style(markersize=10, color="red")
         ...     .set_legend_labels(pairs="Valid", acquisitions="Acq")

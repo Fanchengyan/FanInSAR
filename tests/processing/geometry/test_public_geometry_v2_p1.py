@@ -794,7 +794,11 @@ def test_cuda_omitted_height_is_created_on_target_device() -> None:
     assert height.device.type == "cuda"
     assert height.dtype is torch.float64
     assert height.is_contiguous()
-    torch.testing.assert_close(height, torch.full((2,), 37.0, device="cuda"))
+    # The native geometry ABI is float64, while torch.full defaults to the
+    # process-wide default dtype (usually float32).  Compare against a tensor
+    # derived from the actual public value so this test checks the value and
+    # device contract without introducing a conflicting dtype assumption.
+    torch.testing.assert_close(height, torch.full_like(height, 37.0))
 
 
 @pytest.mark.parametrize("device_alias", ["auto", "gpu"])
