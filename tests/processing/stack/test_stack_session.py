@@ -1096,6 +1096,48 @@ def test_live_stack_network_declares_only_present_optional_assets(
     assert all("unw_phase" not in assets for assets in index["assets_by_pair"].values())
 
 
+def test_live_stack_network_per_ifg_unwrap_surface_is_consistent(
+    tmp_path: Path,
+) -> None:
+    """Per-IFG unwrap generations agree across read, path, exists, and item."""
+    from faninsar.stack.network import StackInterferogramCollection
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phase = np.full((3, 4), 0.2, dtype=np.float32)
+    pair_ids = (
+        "20240101_20240113",
+        "20240113_20240125",
+        "20240101_20240125",
+    )
+    for pair_id in pair_ids:
+        _write_pair_artifact(stack, pair_id, phase)
+        root = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
+        store = InterferogramArtifactStore.open(root)
+        try:
+            write_unwrapped_artifact(
+                root,
+                unwrapped_phase=phase,
+                connected_components=np.ones(phase.shape, dtype=np.int32),
+                method="test",
+                method_parameters={"pair_ids": list(pair_ids)},
+                ifg_manifest_digest=store.manifest_digest,
+            )
+        finally:
+            store.close()
+
+    collection = StackInterferogramCollection(stack)
+    for pair_id in pair_ids:
+        assert collection.exists(pair_id, "unw_phase")
+        path = collection.path(pair_id, "unw_phase")
+        assert path.is_file()
+        np.testing.assert_allclose(
+            collection.open(pair_id, "unw_phase").values,
+            phase,
+        )
+        item = collection.item(pair_id)
+        assert {"complex_ifg", "unw_phase"}.issubset(item["assets"])
+
+
 def test_refresh_rejects_root_unwrap_bound_to_stale_ifg(tmp_path: Path) -> None:
     """Refreshing a root unwrap cannot silently mix IFG generations."""
     from faninsar.processing.errors import InvalidProcessingStateError

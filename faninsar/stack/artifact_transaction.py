@@ -464,6 +464,22 @@ def _atomic_control_at(
 ) -> None:
     """Atomically write one control frame relative to a pinned directory."""
     payload = canonical_json(value) + b"\n"
+    _atomic_control_bytes_at(
+        directory_descriptor,
+        name,
+        payload,
+        max_bytes=max_bytes,
+    )
+
+
+def _atomic_control_bytes_at(
+    directory_descriptor: int,
+    name: str,
+    payload: bytes,
+    *,
+    max_bytes: int = _CONTROL_LIMIT_BYTES,
+) -> None:
+    """Atomically write raw control bytes relative to a pinned directory."""
     if len(payload) > max_bytes:
         reject_invalid_state(f"artifact control frame exceeds limit: {name}")
     try:
@@ -1053,6 +1069,32 @@ def commit_generation(
         )
         descriptors.append(staging_descriptor)
         _validate_generation_tree(staging_descriptor)
+        old_controls: dict[str, bytes | None] = {}
+        for control_name in (
+            "manifest.json"
+            if namespace in {"ifg", "network"}
+            else f"{namespace}_manifest.json",
+            current.name,
+        ):
+            try:
+                control_descriptor = os.open(
+                    control_name,
+                    os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=root_descriptor,
+                )
+            except FileNotFoundError:
+                old_controls[control_name] = None
+            except OSError as error:
+                reject_invalid_state(
+                    f"artifact control file cannot be snapshotted: {error}"
+                )
+            else:
+                try:
+                    old_controls[control_name] = os.read(
+                        control_descriptor, 1024 * 1024 + 1
+                    )
+                finally:
+                    os.close(control_descriptor)
         os.rename(
             generation_id,
             generation_id,
@@ -1060,39 +1102,54 @@ def commit_generation(
             dst_dir_fd=generations_descriptor,
         )
         os.fsync(generations_descriptor)
-        if compatibility_manifest is not None:
-            name = (
-                "manifest.json"
-                if namespace in {"ifg", "network"}
-                else f"{namespace}_manifest.json"
-            )
-            _atomic_control_at(
-                root_descriptor,
-                name,
-                compatibility_manifest,
-                max_bytes=(
-                    1024 * 1024 if namespace == "network" else _CONTROL_LIMIT_BYTES
-                ),
-            )
-        if namespace == "network":
-            unsigned = {
-                "schema_version": "network_current_v1",
-                "status": "complete",
-                "generation_id": generation_id,
-                "manifest_digest": manifest_digest,
-            }
-        else:
+        try:
+            if compatibility_manifest is not None:
+                name = (
+                    "manifest.json"
+                    if namespace in {"ifg", "network"}
+                    else f"{namespace}_manifest.json"
+                )
+                _atomic_control_at(
+                    root_descriptor,
+                    name,
+                    compatibility_manifest,
+                    max_bytes=(
+                        1024 * 1024 if namespace == "network" else _CONTROL_LIMIT_BYTES
+                    ),
+                )
             unsigned = {
                 "schema": "faninsar_artifact_current_v1",
                 "namespace": namespace,
                 "generation_id": generation_id,
                 "manifest_digest": manifest_digest,
             }
-        pointer = {
-            **unsigned,
-            "control_digest": sha256_bytes(canonical_json(unsigned)),
-        }
-        _atomic_control_at(root_descriptor, current.name, pointer)
+            if namespace == "network":
+                unsigned.update(
+                    schema_version="network_current_v1",
+                    status="complete",
+                )
+            pointer = {
+                **unsigned,
+                "control_digest": sha256_bytes(canonical_json(unsigned)),
+            }
+            _atomic_control_at(root_descriptor, current.name, pointer)
+        except Exception:
+            # The generation directory is immutable once renamed.  Restore both
+            # mutable compatibility controls before exposing the failure so an
+            # existing publication remains a valid, readable snapshot.
+            for control_name, previous in old_controls.items():
+                if previous is None:
+                    with suppress(FileNotFoundError):
+                        os.unlink(control_name, dir_fd=root_descriptor)
+                else:
+                    _atomic_control_bytes_at(
+                        root_descriptor,
+                        control_name,
+                        previous,
+                        max_bytes=1024 * 1024,
+                    )
+            os.fsync(root_descriptor)
+            raise
     finally:
         for descriptor in reversed(descriptors):
             os.close(descriptor)

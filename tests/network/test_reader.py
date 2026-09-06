@@ -18,7 +18,6 @@ from faninsar.network.registry import (
 
 def test_direct_reader_instance_bypasses_registry(tmp_path: Path) -> None:
     """A direct reader instance is used without consulting a registry."""
-
     expected = object()
     calls: list[tuple[Path, str | None]] = []
 
@@ -41,7 +40,6 @@ def test_registered_reader_class_is_constructed_without_arguments(
     tmp_path: Path,
 ) -> None:
     """A registered name resolves to a zero-argument reader class."""
-
     expected = object()
     constructed = 0
 
@@ -58,18 +56,20 @@ def test_registered_reader_class_is_constructed_without_arguments(
     registry = ReaderRegistry()
     registry.register("fixture", Reader)
 
-    assert Network.open(
-        tmp_path,
-        reader="fixture",
-        revision="generation-a",
-        registry=registry,
-    ) is expected
+    assert (
+        Network.open(
+            tmp_path,
+            reader="fixture",
+            revision="generation-a",
+            registry=registry,
+        )
+        is expected
+    )
     assert constructed == 1
 
 
 def test_reader_class_selector_bypasses_registry(tmp_path: Path) -> None:
     """A direct reader class is constructed without registry lookup."""
-
     expected = object()
 
     class Reader:
@@ -140,17 +140,36 @@ def test_canonical_reader_accepts_existing_generation_revision(
     (root / ".network_generations/generation-1").mkdir(parents=True)
     (root / "interferograms").mkdir()
     (root / "interferograms/interferograms_index.json").write_text(
-        json.dumps({"type": "NetworkInterferogramIndex", "pairs": ["20240101_20240113"]})
+        json.dumps(
+            {"type": "NetworkInterferogramIndex", "pairs": ["20240101_20240113"]}
+        )
     )
     (root / "interferograms/20240101_20240113").mkdir()
     (root / "manifest.json").write_text(json.dumps(payload))
     (root / ".network_generations/generation-1/manifest.json").write_text(
         json.dumps(payload)
     )
-    (root / "CURRENT").write_text(json.dumps({
-        "schema_version": "network_current_v1",
-        "status": "writing",
-    }))
+    generation_interferograms = (
+        root / ".network_generations/generation-1/interferograms"
+    )
+    generation_interferograms.mkdir()
+    (generation_interferograms / "interferograms_index.json").write_text(
+        json.dumps(
+            {
+                "type": "NetworkInterferogramIndex",
+                "pairs": ["20240101_20240113"],
+            }
+        )
+    )
+    (generation_interferograms / "20240101_20240113").mkdir()
+    (root / "CURRENT").write_text(
+        json.dumps(
+            {
+                "schema_version": "network_current_v1",
+                "status": "writing",
+            }
+        )
+    )
     monkeypatch.setattr("faninsar.network.network._legacy_markers", lambda _: ())
     network = Network.open(root, revision="generation-1")
     assert network.manifest["generation_id"] == "generation-1"
@@ -158,7 +177,6 @@ def test_canonical_reader_accepts_existing_generation_revision(
 
 def test_registry_isolated_and_rejects_unknown_or_non_class_readers() -> None:
     """Registries do not merge and only accept classes, not import strings."""
-
     registry = ReaderRegistry()
 
     class Reader:

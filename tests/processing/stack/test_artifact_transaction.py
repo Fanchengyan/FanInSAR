@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import TYPE_CHECKING
 
@@ -42,6 +43,91 @@ def test_open_current_generation_reopens_with_pinned_path(tmp_path: Path) -> Non
     opened = open_current_generation(root, "ifg")
     try:
         assert (opened.path / "payload.bin").read_bytes() == b"payload"
+    finally:
+        opened.lease.close()
+
+
+def test_network_commit_failure_restores_previous_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed Network publication leaves the previous snapshot readable."""
+    import faninsar.stack.artifact_transaction as transaction
+
+    root = tmp_path / "network"
+
+    def publish(manifest: dict[str, str]) -> str:
+        with stage_generation(
+            root,
+            "network",
+            final_bytes=7,
+            temporary_bytes=7,
+            file_count=1,
+        ) as (generation_id, staging):
+            (staging / "payload.bin").write_bytes(b"payload")
+            commit_generation(
+                root,
+                "network",
+                generation_id,
+                staging,
+                manifest_digest="a" * 64,
+                compatibility_manifest=manifest,
+            )
+        return generation_id
+
+    first_manifest = {"generation": "first"}
+    first_generation = publish(first_manifest)
+    previous_manifest = (root / "manifest.json").read_bytes()
+    previous_current = (root / "CURRENT").read_bytes()
+    current = json.loads(previous_current)
+    assert current["schema"] == "faninsar_artifact_current_v1"
+    assert current["namespace"] == "network"
+    assert current["schema_version"] == "network_current_v1"
+
+    original_atomic_control = transaction._atomic_control_at
+
+    def fail_current(
+        directory_descriptor: int,
+        name: str,
+        value: object,
+        **kwargs: object,
+    ) -> None:
+        if name == "CURRENT":
+            message = "injected CURRENT publication failure"
+            raise OSError(message)
+        original_atomic_control(
+            directory_descriptor,
+            name,
+            value,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(transaction, "_atomic_control_at", fail_current)
+    with (  # noqa: PT012
+        pytest.raises(OSError, match="injected"),
+        stage_generation(
+            root,
+            "network",
+            final_bytes=7,
+            temporary_bytes=7,
+            file_count=1,
+        ) as (generation_id, staging),
+    ):
+        (staging / "payload.bin").write_bytes(b"new")
+        commit_generation(
+            root,
+            "network",
+            generation_id,
+            staging,
+            manifest_digest="b" * 64,
+            compatibility_manifest={"generation": "second"},
+        )
+
+    assert (root / "manifest.json").read_bytes() == previous_manifest
+    assert (root / "CURRENT").read_bytes() == previous_current
+    opened = open_current_generation(root, "network")
+    try:
+        assert opened.generation_id == first_generation
     finally:
         opened.lease.close()
 

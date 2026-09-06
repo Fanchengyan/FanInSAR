@@ -429,10 +429,12 @@ def _validate_network_layout(
         message = "Network generation manifest phase convention mismatch"
         logger.error(message)
         raise NetworkGenerationError(message)
-    if not (
-        (root / "interferograms").is_dir()
-        or (generation_root / "interferograms").is_dir()
-    ):
+    interferograms_in_generation = (generation_root / "interferograms").is_dir()
+    if revision is not None and not interferograms_in_generation:
+        message = "selected Network revision has no interferograms product collection"
+        logger.error(message)
+        raise IncompleteNetworkProductError(message)
+    if not interferograms_in_generation and not (root / "interferograms").is_dir():
         message = "Network requires an interferograms/ product collection"
         logger.error(message)
         raise IncompleteNetworkProductError(message)
@@ -476,11 +478,9 @@ class Network(NetworkContract):
             NetworkGeometry(geometry_root) if geometry_root.is_dir() else None
         )
         generation_interferograms_root = self.generation_root / "interferograms"
-        interferograms_root = (
-            generation_interferograms_root
-            if generation_interferograms_root.is_dir()
-            else resolved_root / "interferograms"
-        )
+        interferograms_root = generation_interferograms_root
+        if revision is None and not interferograms_root.is_dir():
+            interferograms_root = resolved_root / "interferograms"
         index_path = interferograms_root / "interferograms_index.json"
         index_version = None
         if index_path.is_file():

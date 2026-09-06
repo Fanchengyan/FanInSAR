@@ -27,11 +27,7 @@ def _refresh_manifest_digest(payload: dict[str, Any]) -> None:
     """Update the test manifest's canonical self-digest after a mutation."""
     payload["manifest_digest"] = hashlib.sha256(
         json.dumps(
-            {
-                key: value
-                for key, value in payload.items()
-                if key != "manifest_digest"
-            },
+            {key: value for key, value in payload.items() if key != "manifest_digest"},
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -154,6 +150,26 @@ def test_network_rejects_missing_generation(tmp_path: Path) -> None:
     generation_root.rmdir()
     with pytest.raises(NetworkGenerationError):
         Network(root)
+
+
+def test_network_revision_requires_generation_local_interferograms(
+    tmp_path: Path,
+) -> None:
+    """An explicit revision cannot fall back to mutable root assets."""
+    root = tmp_path / "network"
+    _write_layout(root)
+    generation_interferograms = (
+        root / ".network_generations" / "generation-1" / "interferograms"
+    )
+    generation_interferograms.mkdir()
+    (generation_interferograms / "interferograms_index.json").write_text(
+        json.dumps({"type": "NetworkInterferogramIndex"}), encoding="utf-8"
+    )
+    for path in generation_interferograms.iterdir():
+        path.unlink()
+    generation_interferograms.rmdir()
+    with pytest.raises(IncompleteNetworkProductError, match="selected Network"):
+        Network.open(root, revision="generation-1")
 
 
 @pytest.mark.parametrize(

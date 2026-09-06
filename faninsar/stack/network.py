@@ -214,8 +214,17 @@ class StackInterferogramCollection(InterferogramCollection):
                 if name == "unw_phase":
                     generation = self._stack._unwrap_generation
                     if generation is None:
-                        message = "Stack has no committed unwrap generation"
-                        raise FileNotFoundError(message)
+                        from faninsar.stack.artifact_transaction import (
+                            open_current_generation,
+                        )
+
+                        if not (selected.root / "UNWRAP_CURRENT").is_file():
+                            raise FileNotFoundError(selected.root / "UNWRAP_CURRENT")
+                        opened = open_current_generation(selected.root, "unwrap")
+                        try:
+                            return opened.path / "unwrapped_phase.npy"
+                        finally:
+                            opened.lease.close()
                     pair_id = f"{selected.pair[0]}_{selected.pair[1]}"
                     return generation.generation_root / pair_id / "unwrapped_phase.npy"
                 return selected.generation_root / f"{name}.npy"
@@ -234,6 +243,7 @@ class StackInterferogramCollection(InterferogramCollection):
             "assets": {
                 name: {"href": str(self.path(str(pair), name))}
                 for name in (
+                    "complex_ifg",
                     "unw_phase",
                     "wrapped_phase",
                     "amplitude",
