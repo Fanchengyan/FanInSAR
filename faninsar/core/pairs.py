@@ -11,9 +11,9 @@ import pandas as pd
 import xarray as xr
 from xarray.core.indexes import Indexes
 
-from faninsar.plotting.render import formatting_html
 from faninsar.core.acquisition import Acquisition, DateManager, DaySpan
 from faninsar.logging import setup_logger
+from faninsar.plotting.render import formatting_html
 
 if TYPE_CHECKING:
     from numpy._typing import _ArrayLikeInt_co

@@ -18,8 +18,8 @@ from pandas.core.dtypes.common import is_iterator, is_list_like, is_scalar, pand
 from pandas.core.dtypes.generic import ABCMultiIndex, ABCSeries
 from pandas.core.indexes.base import maybe_extract_name
 
-from faninsar.plotting.render import array_repr
 from faninsar.logging import setup_logger
+from faninsar.plotting.render import array_repr
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Hashable, Iterator, Sequence
