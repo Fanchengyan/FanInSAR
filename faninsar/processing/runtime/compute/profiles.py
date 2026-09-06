@@ -45,7 +45,8 @@ def get_profile(name: str) -> CompileProfile:
         alias = f"{name}-cpu"
         if alias in PROFILES:
             return PROFILES[alias]
-        raise KeyError(f"unknown profile {name!r}; known={sorted(PROFILES)}")
+        message = f"unknown profile {name!r}; known={sorted(PROFILES)}"
+        raise KeyError(message)
     return PROFILES[name]
 
 

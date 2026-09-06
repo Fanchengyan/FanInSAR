@@ -124,8 +124,8 @@ def load_metas(
                 values[keys.index(key)] = strip_str(line.split(sep)[1])
             # once all values are found, return the dictionary
             if all(values):
-                return dict(zip(keys, values))
-        return dict(zip(keys, values))
+                return dict(zip(keys, values, strict=True))
+        return dict(zip(keys, values, strict=True))
 
 
 def ensure_int(value: str | int, name: str) -> int:

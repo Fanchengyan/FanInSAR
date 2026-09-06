@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from faninsar.processing.runtime.compute.cache import apply_compile_cache_env
 from faninsar.processing.runtime.compute.compile_specs import DEFAULT_CHUNK
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +58,8 @@ class CompileManager:
         """
         apply_compile_cache_env()
         if name not in COMPILE_TARGETS:
-            raise KeyError(f"unknown compile target {name!r}")
+            message = f"unknown compile target {name!r}"
+            raise KeyError(message)
 
         try:
             import torch
@@ -85,9 +88,6 @@ class CompileManager:
                     )
                     return eager(*args, **kwargs)
 
-            self.recompile_counts[name] = self.recompile_counts.get(name, 0) + 1
-            self._cache[cache_key] = _safe
-            return _safe
         except Exception as exc:
             logger.warning(
                 "torch.compile failed for %s (%s); using eager", name, exc
@@ -96,10 +96,14 @@ class CompileManager:
                 raise
             self._cache[cache_key] = eager
             return eager
+        else:
+            self.recompile_counts[name] = self.recompile_counts.get(name, 0) + 1
+            self._cache[cache_key] = _safe
+            return _safe
 
 
 def _identity_kernel() -> Callable[..., Any]:
-    """Placeholder factory until real kernels are registered."""
+    """Create an identity kernel until real kernels are registered."""
 
     def _fn(*args: Any, **kwargs: Any) -> Any:
         if len(args) == 1 and not kwargs:
