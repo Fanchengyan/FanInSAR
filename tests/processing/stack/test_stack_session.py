@@ -17,6 +17,7 @@ from faninsar.processing.interferometry.pair import (
     goldstein_filter,
 )
 from faninsar.processing.merge.grid import GeoGridSpec
+from faninsar.processing.timeseries import write_timeseries_zarr
 from faninsar.stack import Stack, StackConfig, StackSceneProvider
 from faninsar.stack.activation import LocalActivationAuthority
 from faninsar.stack.catalog import SceneCatalog
@@ -26,7 +27,6 @@ from faninsar.stack.ifg_store import (
     write_unwrapped_artifact,
 )
 from faninsar.stack.scene_store import write_scene_unit
-from faninsar.processing.timeseries import write_timeseries_zarr
 
 if TYPE_CHECKING:
     from faninsar.stack.provider import SourceHandle
@@ -225,6 +225,53 @@ def test_s1_default_coreg_resume_identity_is_stable(tmp_path: Path) -> None:
 
     assert isinstance(stack.scene_provider, StackSceneProvider)
     assert first == second
+
+
+def test_coreg_resume_restores_burst_array_shape_from_samples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Radar resume accepts the production BurstArray shape contract."""
+    from types import SimpleNamespace
+
+    from faninsar.missions.sentinel1.io import BurstArray
+
+    stack = _stack_with_three_date_network(tmp_path)
+    shape = (5, 7)
+    scene = SimpleNamespace(
+        array=BurstArray(
+            samples=np.ones(shape, dtype=np.complex64),
+            row0=0,
+            col0=0,
+            burst_index=0,
+            valid_mask=np.ones(shape, dtype=bool),
+        ),
+        geometry=object(),
+    )
+    def restore_scene(*_args: object, **_kwargs: object) -> object:
+        """Return a production-like scene with a BurstArray payload."""
+        return scene
+
+    monkeypatch.setattr(
+        "faninsar.processing.stages.load_production_scene", restore_scene
+    )
+
+    stack._restore_radar_projection_context(
+        {
+            "radar_projection_context": {
+                "source_path": "scene.SAFE",
+                "swath": "IW1",
+                "burst_index": 0,
+                "orbit_path": None,
+                "full_range": True,
+                "full_radar_shape": list(shape),
+                "reference_scene": stack.reference,
+                "master_grid": {},
+            }
+        }
+    )
+
+    assert stack._radar_projection_context is not None
+    assert stack._radar_projection_context["full_radar_shape"] == shape
 
 
 def test_stack_runtime_identity_mutations_invalidate_coreg_resume(

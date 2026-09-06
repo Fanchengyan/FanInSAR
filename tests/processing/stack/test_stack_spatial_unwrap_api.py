@@ -10,9 +10,9 @@ import torch
 
 from faninsar import Pairs
 from faninsar.processing.resources import ResourceAdmissionError, ResourceBudget
+from faninsar.processing.unwrap.common import SpatialUnwrapper, SpatialUnwrapResult
 from faninsar.stack import Stack
 from faninsar.stack.ifg_store import write_ifg_artifact
-from faninsar.processing.unwrap.common import SpatialUnwrapper, SpatialUnwrapResult
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -97,6 +97,34 @@ def test_stack_unwrap_is_spatial_only_and_publishes_one_root_generation(
     assert stack.analysis_ready
     assert stack.network_product_index is not None
     assert len(stack.network_product_index.products) == 2
+
+
+def test_stack_unwrap_connects_directly_to_time_series_analysis(tmp_path: Path) -> None:
+    """The root unwrap generation is the input to Stack SBAS analysis."""
+    stack = _stack_with_ifg(tmp_path)
+
+    stack.unwrap(_IdentityUnwrapper())
+
+    result = stack.analyze_time_series()
+
+    assert result.pair_ids == ("20240101_20240113",)
+    assert result.phase_cumulative_rad.shape == (2, 2, 3)
+
+
+def test_stack_network_exposes_its_interferogram_collection(tmp_path: Path) -> None:
+    """An analysis-ready Stack provides readable Network interferograms."""
+    stack = _stack_with_ifg(tmp_path)
+
+    stack.unwrap(_IdentityUnwrapper())
+    network = stack.network
+
+    assert network is not None
+    assert network.interferograms.pairs().to_names().tolist() == [
+        "20240101_20240113"
+    ]
+    unwrapped = network.interferograms.open_stack("unw_phase")
+    assert unwrapped.shape == (1, 2, 3)
+    np.testing.assert_allclose(unwrapped.values[0], 0.2)
 
 
 def test_stack_unwrap_public_signature_has_no_temporal_controls() -> None:

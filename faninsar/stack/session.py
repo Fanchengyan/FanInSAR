@@ -110,6 +110,26 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+
+def _scene_array_shape(scene: object) -> tuple[int, ...] | None:
+    """Return the raster shape exposed by a production scene.
+
+    Production Sentinel-1 scenes wrap the NumPy samples in ``BurstArray``;
+    lightweight providers may expose an array-like object directly.  Keeping
+    this normalization at the Stack boundary prevents resume metadata from
+    depending on one provider's representation.
+    """
+    array = getattr(scene, "array", None)
+    shape = getattr(array, "shape", None)
+    if shape is None:
+        shape = getattr(getattr(array, "samples", None), "shape", None)
+    if shape is None:
+        return None
+    try:
+        return tuple(int(value) for value in shape)
+    except (TypeError, ValueError):
+        return None
+
 _DEFAULT_PHASE_FILTER = GoldsteinWerner(alpha=0.5, patch_size=32)
 _DEFAULT_UNWRAPPER = SpatialIRLS()
 
@@ -823,10 +843,12 @@ class Stack(NetworkContract):
             self._network_view is None
             or self._network_view.network_generation_id != self._network_generation_id
         ):
+            from faninsar.stack.network import StackInterferogramCollection
+
             view = object.__new__(Network)
             view._root = self._root
             view._geometry = self._geometry
-            view._interferograms = self._interferograms
+            view._interferograms = StackInterferogramCollection(self)
             view._timeseries = self._timeseries
             view._product_index = self._network_product_index
             view._network_generation_id = self._network_generation_id
@@ -1579,10 +1601,7 @@ class Stack(NetworkContract):
         """Return a durable descriptor for the authoritative radar context."""
         scene = getattr(state, "primary", None)
         geometry = getattr(scene, "geometry", None)
-        shape = getattr(getattr(scene, "array", None), "shape", None)
-        if shape is None:
-            shape = getattr(getattr(scene, "array", None), "samples", None)
-            shape = getattr(shape, "shape", None)
+        shape = _scene_array_shape(scene)
         if geometry is None or shape is None:
             logger.debug(
                 "scene provider did not publish radar projection context; "
@@ -1658,7 +1677,8 @@ class Stack(NetworkContract):
         shape = tuple(int(value) for value in record.get("full_radar_shape", ()))
         if len(shape) != 2 or any(value <= 0 for value in shape):
             reject_invalid_state("persisted radar projection context shape is invalid")
-        if tuple(scene.array.shape) != shape:
+        restored_shape = _scene_array_shape(scene)
+        if restored_shape != shape:
             reject_invalid_state(
                 "restored radar projection geometry shape differs from persisted "
                 "coregistration shape"
@@ -2312,11 +2332,7 @@ class Stack(NetworkContract):
             if self.config.coregistration_grid == "radar":
                 primary = getattr(state, "primary", None)
                 if primary is not None:
-                    array = getattr(primary, "array", None)
-                    shape = getattr(array, "shape", None)
-                    if shape is None:
-                        samples = getattr(array, "samples", None)
-                        shape = getattr(samples, "shape", None)
+                    shape = _scene_array_shape(primary)
                     geometry = getattr(primary, "geometry", None)
                     if shape is not None and geometry is not None:
                         self._radar_projection_context = {
@@ -2923,7 +2939,11 @@ class Stack(NetworkContract):
                 )
             )
         generation_id = _network_generation_digest(
-            [product.content_digest or product.canonical for product in products],
+            [
+                product.content_digest or product.canonical
+                for product in products
+                if product.key.product_kind is AssetKind.COMPLEX_INTERFEROGRAM
+            ],
             [generation.manifest_digest],
         )
         self._refresh_network_generation(generation_id, products)
@@ -3492,6 +3512,21 @@ class Stack(NetworkContract):
                     pair_id: np.asarray(qualified_phase_stack[index])
                     for index, pair_id in enumerate(expected_pair_ids)
                 }
+            elif (
+                self._unwrap_generation is not None
+                and self._unwrap_generation.pair_ids
+                == tuple(f"{store.pair[0]}_{store.pair[1]}" for store in stores)
+            ):
+                # ``Stack.unwrap`` publishes spatial results in one atomic
+                # Stack-root generation.  Those arrays are the direct input
+                # to SBAS; requiring the private per-IFG temporal seam here
+                # made the public unwrap -> analyze path unusable.
+                pair_phases = {
+                    pair_id: np.asarray(
+                        self._unwrap_generation.products[pair_id]["unwrapped_phase"]
+                    )
+                    for pair_id in self._unwrap_generation.pair_ids
+                }
             else:
                 unwrapped = self._qualified_unwrapped_artifacts(stores)
                 pair_phases = {
@@ -3562,7 +3597,7 @@ class Stack(NetworkContract):
             message = f"unsupported Stack time-series solver {solver!r}"
             logger.error(message)
             raise ValueError(message)
-        if hasattr(self, "unwrap_result") and self.unwrap_result is None:
+        if self.unwrap_result is None and self._unwrap_generation is None:
             message = (
                 "Stack Network analysis is unavailable before committed "
                 "interferograms are unwrapped"
@@ -3599,7 +3634,9 @@ class Stack(NetworkContract):
         )
         try:
             observed_generation_id = _observed_network_generation_digest(
-                stores, _products
+                stores,
+                _products,
+                unwrap_generation=self._unwrap_generation,
             )
             if observed_generation_id != generation_id:
                 reject_invalid_state(
@@ -3617,7 +3654,14 @@ class Stack(NetworkContract):
             # than returning a result that was computed from an unpinned view.
             for store in stores:
                 store._lease.heartbeat()
-            if _observed_network_generation_digest(stores, _products) != generation_id:
+            if (
+                _observed_network_generation_digest(
+                    stores,
+                    _products,
+                    unwrap_generation=self._unwrap_generation,
+                )
+                != generation_id
+            ):
                 reject_invalid_state(
                     "Stack IFG or unwrap artifacts changed during Network analysis"
                 )
@@ -3965,6 +4009,7 @@ def _network_generation_digest(
 def _observed_network_generation_digest(
     stores: Sequence[InterferogramArtifactStore],
     products: NetworkProductIndex,
+    unwrap_generation: Any | None = None,
 ) -> str:
     """Validate current stores against products and return their generation ID."""
     ifg_manifest_digests = [store.manifest_digest for store in stores]
@@ -3989,6 +4034,36 @@ def _observed_network_generation_digest(
     if len(indexed_unwrapped) != len(stores):
         reject_invalid_state(
             "Stack Network index does not contain one unwrapped product per IFG"
+        )
+
+    if unwrap_generation is not None:
+        expected_pair_ids = tuple(
+            f"{store.pair[0]}_{store.pair[1]}" for store in stores
+        )
+        if tuple(unwrap_generation.pair_ids) != expected_pair_ids:
+            reject_invalid_state(
+                "Stack Network unwrap generation does not match current Pair order"
+            )
+        for store in stores:
+            pair = _canonical_pair_strings(store.pair)
+            product = indexed_unwrapped.get(pair)
+            if (
+                product is None
+                or product.content_digest != unwrap_generation.manifest_digest
+            ):
+                reject_invalid_state(
+                    "Stack Network unwrapped product does not match current unwrap"
+                )
+            if product.lineage != (
+                store.manifest_digest,
+                unwrap_generation.manifest_digest,
+            ):
+                reject_invalid_state(
+                    "Stack Network unwrapped product lineage does not match current "
+                    "artifacts"
+                )
+        return _network_generation_digest(
+            ifg_manifest_digests, [unwrap_generation.manifest_digest]
         )
 
     unwrap_manifest_digests: list[str] = []
