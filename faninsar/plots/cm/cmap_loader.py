@@ -326,9 +326,21 @@ class Cmaps:
             raise AttributeError(msg)
         return getattr(loader, name)
 
+    @property
+    def names(self) -> list[str]:
+        """Return available colormap names without reversed aliases.
+
+        Returns
+        -------
+        list of str
+            Sorted names from all registered collections.
+
+        """
+        return sorted({name.removesuffix("_r") for name in self._colormap_map})
+
     def __dir__(self) -> list[str]:
         """Return list of available attributes including all colormaps."""
-        attrs = ["GMT", "SCM", "cmocean", "colorcet", "mintpy"]
+        attrs = ["GMT", "SCM", "cmocean", "colorcet", "mintpy", "names"]
         attrs.extend(self._colormap_map.keys())
         return sorted(set(attrs))
 

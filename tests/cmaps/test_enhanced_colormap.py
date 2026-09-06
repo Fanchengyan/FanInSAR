@@ -374,9 +374,8 @@ class TestCodeCompletion:
         assert isinstance(cmap1, EnhancedLinearSegmentedColormap)
         assert hasattr(cmap1, "to_rgb_array")
 
-        # Test module-level access
-        import faninsar.plots.cm as cmaps_module
-        cmap2 = cmaps_module.abyss
+        # The unified registry is the canonical access point.
+        cmap2 = cmaps.abyss
         assert isinstance(cmap2, EnhancedLinearSegmentedColormap)
         assert hasattr(cmap2, "to_rgb_array")
 

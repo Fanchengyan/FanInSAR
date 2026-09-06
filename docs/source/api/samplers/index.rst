@@ -4,8 +4,8 @@ Dataset Samplers
 .. autosummary::
    :toctree: generated/
 
-   faninsar.samplers.GridSampler
-   faninsar.samplers.RowSampler
-   faninsar.samplers.ColSampler
-   faninsar.samplers.RowColSampler
+   faninsar.data.samplers.GridSampler
+   faninsar.data.samplers.RowSampler
+   faninsar.data.samplers.ColSampler
+   faninsar.data.samplers.RowColSampler
    

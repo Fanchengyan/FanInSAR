@@ -1,6 +1,6 @@
 import pytest
 
-from faninsar import Frequency, Sentinel1, Wavelength
+from faninsar.core import Frequency, Sentinel1, Wavelength
 
 
 @pytest.fixture

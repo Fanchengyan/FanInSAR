@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from faninsar import Acquisition, DaySpan, Pair, Pairs
+from faninsar.core import Acquisition, DaySpan, Pair, Pairs
 
 
 class TestPairsEdgeCases:
@@ -84,7 +84,7 @@ class TestPairsEdgeCases:
         df = empty_pairs.to_dataframe()
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 0
-        assert list(df.columns) == ['primary', 'secondary', 'days']
+        assert list(df.columns) == ["primary", "secondary", "days"]
 
         # Test to_numpy
         np_array = empty_pairs.to_numpy()
@@ -190,7 +190,7 @@ class TestPairsEdgeCases:
         df = single_pair.to_dataframe()
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 1
-        assert list(df.columns) == ['primary', 'secondary', 'days']
+        assert list(df.columns) == ["primary", "secondary", "days"]
 
         # Test to_numpy
         np_array = single_pair.to_numpy()

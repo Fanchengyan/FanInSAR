@@ -3,7 +3,7 @@
 
 import pytest
 
-from faninsar import Frequency, Sentinel1, Wavelength
+from faninsar.core import Frequency, Sentinel1, Wavelength
 
 
 def test_wavelength_conversions():

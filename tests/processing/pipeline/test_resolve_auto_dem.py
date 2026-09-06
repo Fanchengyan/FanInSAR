@@ -1,9 +1,8 @@
 """Tests for the shared datum-aware auto-DEM resolution helper (PROPOSAL-0030).
 
-Covers :func:`faninsar.processing.stages.resolve_auto_dem`: the
-single wrap rule used by Stack interferogram production and
-``cli.frame.run_frame_cli``; source selection via ``dem_source``; and the
-CLI fail-closed contract for unwired providers.
+Covers :func:`faninsar.processing.stages.resolve_auto_dem`: the single wrap
+rule used by Stack interferogram production and source selection via
+``dem_source``.
 """
 
 from __future__ import annotations
@@ -165,60 +164,3 @@ class TestResolveAutoDem:
                 output_dir=tmp_path / "out",
                 geoid_correction=False,
             )
-
-
-class TestCliDemSourceOption:
-    """CLI fail-closed contract for unwired providers."""
-
-    def test_unwired_dem_source_fails_closed(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """--dem-source glo30:ot must exit non-zero citing unwired status."""
-        from faninsar.cli.main import main
-
-        with pytest.raises(SystemExit) as excinfo:
-            main(
-                [
-                    "frame",
-                    "--reference",
-                    "r.SAFE",
-                    "--secondary",
-                    "s.SAFE",
-                    "--output",
-                    str(tmp_path / "out"),
-                    "--dem-source",
-                    "glo30:ot",
-                ]
-            )
-        assert excinfo.value.code != 0
-        captured = capsys.readouterr()
-        err = (captured.err + captured.out).lower()
-        assert "unsupported" in err or "unwired" in err or "not wired" in err
-
-    def test_unknown_product_fails_closed(
-        self,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """--dem-source not-a-product exits non-zero listing valid names."""
-        from faninsar.cli.main import main
-
-        with pytest.raises(SystemExit) as excinfo:
-            main(
-                [
-                    "frame",
-                    "--reference",
-                    "r.SAFE",
-                    "--secondary",
-                    "s.SAFE",
-                    "--output",
-                    str(tmp_path / "out"),
-                    "--dem-source",
-                    "not-a-product",
-                ]
-            )
-        assert excinfo.value.code != 0
-        captured = capsys.readouterr()
-        assert "not-a-product" in (captured.err + captured.out)

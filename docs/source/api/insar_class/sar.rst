@@ -9,5 +9,5 @@ SAR Constants
 
    faninsar.Wavelength
    faninsar.Frequency
-   faninsar.SAR
-   faninsar.Sentinel1
+   faninsar.core.SAR
+   faninsar.core.Sentinel1

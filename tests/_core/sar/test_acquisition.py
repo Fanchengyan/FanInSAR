@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from faninsar import Acquisition, DaySpan
+from faninsar.core import Acquisition, DaySpan
 
 
 class TestAcquisition:
@@ -115,7 +115,7 @@ class TestDaysSpanIndex:
         # Test the stats property
         stats = self.days_span.stats
         assert stats["min"] == pd.Timedelta(0)
-        assert stats["max"] == pd.Timedelta(9, unit='D')
+        assert stats["max"] == pd.Timedelta(9, unit="D")
         assert stats["unique"] == 10
         assert stats["total"] == 10
 

@@ -14,7 +14,7 @@ The adapter handles CMR JSON or UMM-JSON pagination and normalizes footprints,
 acquisition metadata, and explicit ``GET DATA`` links::
 
    from faninsar import remote
-   from faninsar.query import BoundingBox
+   from faninsar.data.query import BoundingBox
 
    remote.register_cmr_catalog(
        "asf-s1",

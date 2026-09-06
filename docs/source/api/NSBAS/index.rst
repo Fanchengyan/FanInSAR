@@ -1,5 +1,5 @@
-faninsar.NSBAS
-==============
+Time-Series Analysis
+====================
 
 
 ``NSBAS`` module provides two parts:

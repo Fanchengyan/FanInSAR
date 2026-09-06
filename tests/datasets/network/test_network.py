@@ -11,7 +11,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-from faninsar.datasets.network import (
+from faninsar.network import (
     ExternalNetworkLayoutError,
     IncompleteNetworkProductError,
     ISCE2Network,

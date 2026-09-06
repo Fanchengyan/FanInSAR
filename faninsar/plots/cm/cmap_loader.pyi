@@ -279,14 +279,14 @@ class MintpyColormaps(ColormapLoader):
     romanian: EnhancedLinearSegmentedColormap
     romanian_r: EnhancedLinearSegmentedColormap
 
-class Cmaps(
-    GMTColormaps, SCMColormaps, CmoceanColormaps, ColorcetColormaps, MintpyColormaps
-):
+class Cmaps:
     GMT: GMTColormaps
     SCM: SCMColormaps
     cmocean: CmoceanColormaps
     colorcet: ColorcetColormaps
     mintpy: MintpyColormaps
+    @property
+    def names(self) -> list[str]: ...
 
     def __getattr__(self, name: str) -> EnhancedLinearSegmentedColormap: ...
     def __dir__(self) -> list[str]: ...
@@ -295,20 +295,3 @@ class Cmaps(
 
 # Global instance
 cmaps: Cmaps
-
-# Custom colormaps
-GnBu_RdPl: EnhancedLinearSegmentedColormap
-GnBu_RdPl_r: EnhancedLinearSegmentedColormap
-RdGyBu: EnhancedLinearSegmentedColormap
-RdGyBu_r: EnhancedLinearSegmentedColormap
-WtBuPl: EnhancedLinearSegmentedColormap
-WtBuPl_r: EnhancedLinearSegmentedColormap
-WtBuGn: EnhancedLinearSegmentedColormap
-WtBuGn_r: EnhancedLinearSegmentedColormap
-WtRdPl: EnhancedLinearSegmentedColormap
-WtRdPl_r: EnhancedLinearSegmentedColormap
-WtHeatRed: EnhancedLinearSegmentedColormap
-WtHeatRed_r: EnhancedLinearSegmentedColormap
-
-# Module-level colormap access (all colormaps available at module level)
-def __getattr__(name: str) -> EnhancedLinearSegmentedColormap: ...

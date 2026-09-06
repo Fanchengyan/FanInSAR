@@ -28,17 +28,16 @@ Raster Based Datasets
 .. autosummary::
    :toctree: generated/
 
-   faninsar.datasets.GeoDataset
-   faninsar.datasets.RasterDataset
-   faninsar.datasets.PairDataset
-   faninsar.datasets.InterferogramDataset
-   faninsar.datasets.CoherenceDataset
-   faninsar.datasets.HyP3S1
-   faninsar.datasets.HyP3S1Burst
-   faninsar.datasets.LiCSAR
-   faninsar.datasets.ApsDataset
-   faninsar.datasets.GACOS
-   faninsar.datasets.GACOSPairs
+   faninsar.data.datasets.GeoDataset
+   faninsar.data.datasets.RasterDataset
+   faninsar.data.datasets.PairDataset
+   faninsar.data.datasets.InterferogramDataset
+   faninsar.data.datasets.CoherenceDataset
+   faninsar.data.datasets.HyP3S1
+   faninsar.data.datasets.LiCSAR
+   faninsar.data.datasets.ApsDataset
+   faninsar.data.datasets.GACOS
+   faninsar.data.datasets.GACOSPairs
 
 Hierarchical Datasets
 ~~~~~~~~~~~~~~~~~~~~~
@@ -46,33 +45,5 @@ Hierarchical Datasets
 .. autosummary::
    :toctree: generated/
 
-   faninsar.datasets.XarrayDataset
-   faninsar.datasets.HierarchicalDataset
-
-Network-Level Products
-~~~~~~~~~~~~~~~~~~~~~~
-
-Standardized geocoded raster InSAR products organized as an interferometric
-network. ``Network`` owns product relationships and time-series scheduling;
-the underlying Dataset components own raster reads.
-
-.. autosummary::
-   :toctree: generated/
-
-   faninsar.datasets.Network
-   faninsar.datasets.frame.FrameGeometry
-   faninsar.datasets.frame.FrameInterferogramCollection
-   faninsar.datasets.frame.FrameTimeSeries
-   faninsar.datasets.frame.RemoteFrame
-   faninsar.datasets.frame.build_mintpy
-
-Inversion Pipeline
-~~~~~~~~~~~~~~~~~~
-
-NSBAS time-series inversion orchestrated via Dask spatial tiling and
-(optional) GPU acceleration.
-
-.. autosummary::
-   :toctree: generated/
-
-   faninsar.pipeline.InversionPipeline
+   faninsar.data.datasets.XarrayDataset
+   faninsar.data.datasets.HierarchicalDataset

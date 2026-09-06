@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from faninsar import DaySpan, Pairs, PairsFactory
+from faninsar.core import DaySpan, Pairs, PairsFactory
 
 
 class TestPairs:

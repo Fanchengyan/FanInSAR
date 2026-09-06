@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from faninsar import list_missions, register
+from faninsar.missions import list_missions, register
 from faninsar.missions.base import Sensor, get_mission
 
 
