@@ -1,3 +1,5 @@
+"""SVG diagrams for pair topology."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -10,13 +12,18 @@ if TYPE_CHECKING:
 
 
 class PairsSVG:
+    """Render a compact pair topology diagram."""
+
     def __init__(self, n_pairs: int) -> None:
+        """Initialize the diagram for *n_pairs* relationships."""
         self.n_pairs = n_pairs
 
     def __str__(self) -> str:
+        """Return the rendered SVG as a string."""
         return str(self.to_tag())
 
     def to_tag(self) -> html_tag:
+        """Build the SVG dominate tag."""
         # Fixed dimensions
         width = 200
         height = 200

@@ -18,7 +18,7 @@ from pandas.core.dtypes.common import is_iterator, is_list_like, is_scalar, pand
 from pandas.core.dtypes.generic import ABCMultiIndex, ABCSeries
 from pandas.core.indexes.base import maybe_extract_name
 
-from faninsar._core.render import array_repr
+from faninsar.plotting.render import array_repr
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
@@ -348,7 +348,7 @@ class DaySpan(pd.Index):
 
     def _repr_html_(self) -> str:
         """Return the HTML representation of the class."""
-        from faninsar._core.render import array_repr
+        from faninsar.plotting.render import array_repr
 
         return array_repr(self)
 

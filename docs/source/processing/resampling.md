@@ -160,7 +160,7 @@ For label masks, use `order=0` (nearest).
 
 ### Raster-to-raster reprojection
 
-`faninsar._core.geo.raster_ops.match_to_raster` wraps
+`faninsar.processing.geometry.raster_ops.match_to_raster` wraps
 `rasterio.warp.reproject` and currently defaults to
 `Resampling.nearest`. **This default is conservative** — appropriate
 for label masks but suboptimal for DEM, amplitude, and coherence. Pass
@@ -168,7 +168,7 @@ the algorithm explicitly:
 
 ```python
 from rasterio.warp import Resampling
-from faninsar._core.geo.raster_ops import match_to_raster
+from faninsar.processing.geometry.raster_ops import match_to_raster
 
 # For DEM or coherence:
 dem_matched = match_to_raster(dem, src_profile, dst_profile,

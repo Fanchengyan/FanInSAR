@@ -11,13 +11,8 @@ from lxml import etree
 from rasterio import Affine
 from rasterio.profiles import Profile as RasterioProfile
 
-from faninsar._core.geo import (
-    GeoGrid,
-    Profile,
-    array2kmz,
-    bounds_from_xy,
-    dataarray2kmz,
-)
+from faninsar.io.export.kmz import array2kmz, dataarray2kmz
+from faninsar.processing.geometry import GeoGrid, Profile, bounds_from_xy
 
 profile = Profile(200, 300, Affine(*list(range(6))))
 

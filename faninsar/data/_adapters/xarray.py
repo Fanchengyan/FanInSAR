@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import rioxarray  # noqa: F401
 import xarray as xr
 
-from faninsar._core.geo.kmz import dataarray2kmz
+from faninsar.io.export.kmz import dataarray2kmz
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
@@ -238,7 +238,7 @@ class FanInSARDataArrayAccessor:
         img_kwargs : dict[str, Any] | None, optional
             Keyword arguments for :func:`matplotlib.pyplot.imshow`.
         cbar_kwargs : dict[str, Any] | None, optional
-            Keyword arguments for :func:`faninsar._core.geo.save_colorbar`,
+            Keyword arguments for :func:`faninsar.io.export.kmz.save_colorbar`,
             excluding ``out_file`` and ``mappable``.
         verbose : bool, optional
             Whether to log the output path.

@@ -7,6 +7,6 @@ processing workflows.
 
 from __future__ import annotations
 
-from . import datasets, query, samplers
+from . import _adapters, datasets, query, samplers
 
-__all__ = ["datasets", "query", "samplers"]
+__all__ = ["_adapters", "datasets", "query", "samplers"]

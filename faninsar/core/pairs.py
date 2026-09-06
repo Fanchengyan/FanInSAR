@@ -11,7 +11,7 @@ import pandas as pd
 import xarray as xr
 from xarray.core.indexes import Indexes
 
-from faninsar._core.render import formatting_html
+from faninsar.plotting.render import formatting_html
 from faninsar.core.acquisition import Acquisition, DateManager, DaySpan
 from faninsar.logging import setup_logger
 

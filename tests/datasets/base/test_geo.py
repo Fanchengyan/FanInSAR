@@ -7,7 +7,7 @@ import pytest
 from pyproj.crs import CRS
 from rasterio.transform import from_bounds
 
-from faninsar._core.geo import Profile
+from faninsar.processing.geometry.profiles import Profile
 from faninsar.data.datasets.base import GeoDataset
 from faninsar.data.query import BoundingBox, Points
 

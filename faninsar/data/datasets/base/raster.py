@@ -25,13 +25,10 @@ from rasterio.warp import Resampling
 from rasterio.warp import transform as warp_transform
 from tqdm import tqdm
 
-from faninsar._core.geo import (
-    GeoGrid,
-    Profile,
-    array2kmz,
-    bounds_from_xy,
-    xy_from_transform,
-)
+from faninsar.data.datasets.geogrid import GeoGrid
+from faninsar.io.export.kmz import array2kmz
+from faninsar.processing.geometry.coordinates import bounds_from_xy, xy_from_transform
+from faninsar.processing.geometry.profiles import Profile
 from faninsar.data.query import BoundingBox, GeoQuery, Points, Polygons
 from faninsar.io.lazy_rasterio import LazyMultiFileReader
 from faninsar.logging import setup_logger

@@ -23,8 +23,8 @@ from pykml.factory import KML_ElementMaker as KML
 from pyproj.crs import CRS
 from rioxarray.exceptions import MissingSpatialDimensionError
 
-from faninsar._core.geo.coordinates import bounds_from_xy
 from faninsar.logging import setup_logger
+from faninsar.processing.geometry.coordinates import bounds_from_xy
 
 if TYPE_CHECKING:
     from os import PathLike

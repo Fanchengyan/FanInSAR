@@ -1,3 +1,5 @@
+"""Array algorithms shared by Stack and Network processing stages."""
+
 from __future__ import annotations
 
 from typing import Any, Literal, overload

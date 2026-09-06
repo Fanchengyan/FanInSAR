@@ -24,7 +24,7 @@ from dominate.tags import (
 )
 from dominate.util import raw
 
-from faninsar._core.render.formatting_html import short_index_repr_html
+from faninsar.plotting.render.formatting_html import short_index_repr_html
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -50,10 +50,14 @@ data_icon = raw(_icon("icon-database"))
 
 
 class BaseHTML:
+    """Base class for small HTML renderers."""
+
     def to_tag(self) -> html_tag:
+        """Return the rendered dominate tag."""
         raise NotImplementedError
 
     def __str__(self) -> str:
+        """Return the rendered HTML string."""
         return str(self.to_tag())
 
 

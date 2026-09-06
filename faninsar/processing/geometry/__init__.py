@@ -8,6 +8,14 @@ from .boundary import (
     evaluate_canonical_boundary,
     normalize_result_boundary,
 )
+from .converters import GeoDataFormatConverter
+from .coordinates import (
+    bounds_from_xy,
+    geoinfo_from_xy,
+    transform_from_xy,
+    xy_from_profile,
+    xy_from_transform,
+)
 from .ellipsoid import (
     WGS84_A_M,
     WGS84_E2,
@@ -16,6 +24,7 @@ from .ellipsoid import (
     llh_to_ecef,
     local_earth_radius_m,
 )
+from .grids import GeoGrid, GeoGridMixin, GridSpec, format_bounds_and_crs
 from .lut_cache import TransformCacheKey, read_transform_cache, write_transform_cache
 from .orbit import (
     OrbitInterpolationError,
@@ -42,6 +51,7 @@ from .prepared_store import (
     PreparedGenerationRecord,
     PreparedGenerationStore,
 )
+from .profiles import Profile
 from .public import (
     BackendSelector,
     NativeContextInputs,
@@ -51,6 +61,7 @@ from .public import (
     prepare_geometry,
     prepare_geometry_v2,
 )
+from .raster_ops import match_to_raster
 from .transforms import RadarGeometryModel, TransformResult
 from .v2 import (
     INT32_MAX,
@@ -84,7 +95,11 @@ __all__ = [
     "CandidateKey",
     "DeviceKey",
     "ExecutionProfile",
+    "GeoDataFormatConverter",
+    "GeoGrid",
+    "GeoGridMixin",
     "GeometryValidationError",
+    "GridSpec",
     "LocalPreparedGeometryProvider",
     "NativeContextInputs",
     "NativeSpan",
@@ -101,6 +116,7 @@ __all__ = [
     "PreparedGeometryArrayPayload",
     "PreparedLutArrayPayload",
     "PreparedScenePayload",
+    "Profile",
     "RadarGeometryModel",
     "RawSpan",
     "ScenePreparationCallback",
@@ -108,14 +124,18 @@ __all__ = [
     "TransformCacheKey",
     "TransformResult",
     "TransformResultV2",
+    "bounds_from_xy",
     "ecef_to_llh",
     "evaluate_canonical_boundary",
     "execute_geometry",
     "execute_geometry_v2",
+    "format_bounds_and_crs",
+    "geoinfo_from_xy",
     "geometric_baseline",
     "interpolate_orbit",
     "llh_to_ecef",
     "local_earth_radius_m",
+    "match_to_raster",
     "normalize_result_boundary",
     "prepare_geometry",
     "prepare_geometry_v2",
@@ -124,11 +144,14 @@ __all__ = [
     "run_geo2rdr",
     "run_rdr2geo",
     "run_rdr2geo_chunked",
+    "transform_from_xy",
     "validate_array_span",
     "validate_input_span",
     "validate_native_spans",
     "validate_span",
     "validate_spans",
     "write_transform_cache",
+    "xy_from_profile",
+    "xy_from_transform",
     "zero_doppler_residual_hz",
 ]

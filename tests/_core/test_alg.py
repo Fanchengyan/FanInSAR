@@ -1,4 +1,4 @@
-"""Tests for faninsar._core.alg module."""
+"""Tests for the processing array algorithms."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from faninsar._core.alg import gradient_magnitude, percentile_range
+from faninsar.processing.alg import gradient_magnitude, percentile_range
 
 
 class TestGradientMagnitude:

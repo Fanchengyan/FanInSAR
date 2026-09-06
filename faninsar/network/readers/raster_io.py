@@ -10,7 +10,7 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 
-from faninsar._core.geo import Profile
+from faninsar.processing.geometry.profiles import Profile
 from faninsar.data.datasets.geogrid import GeoGrid
 from faninsar.logging import setup_logger
 

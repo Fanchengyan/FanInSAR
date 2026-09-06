@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar._core.geo.grids import GridSpec
+from faninsar.processing.geometry.grids import GridSpec
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:

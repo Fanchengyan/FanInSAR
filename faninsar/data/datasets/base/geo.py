@@ -18,7 +18,7 @@ from faninsar.data.query import BoundingBox, Points, Polygons
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
-    from faninsar._core.geo import Profile
+    from faninsar.processing.geometry.profiles import Profile
 
 logger = setup_logger(__name__)
 

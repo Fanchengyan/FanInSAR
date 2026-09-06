@@ -10,7 +10,7 @@ import numpy as np
 from affine import Affine
 from pyproj import Transformer
 
-from faninsar._core.geo.grids import GridSpec
+from faninsar.processing.geometry.grids import GridSpec
 from faninsar.logging import setup_logger
 from faninsar.processing.dem.resources import ResourceBudget, preflight_grid
 from faninsar.processing.dem.seam import ExplicitAntimeridianError

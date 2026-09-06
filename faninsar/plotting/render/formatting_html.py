@@ -62,6 +62,7 @@ def format_dims(
     dim_sizes: tuple[str, int],
     dims_with_index: Mapping[Hashable, object],
 ) -> str:
+    """Build a collapsible HTML section."""
     """Format dimensions as HTML."""
     if not dim_sizes:
         return ""
@@ -89,7 +90,7 @@ def _icon(icon_name: str) -> str:
 
 def summarize_attrs(attrs: dict[Hashable, object]) -> str:
     """Return a summary of the attributes as HTML."""
-    from faninsar._core.render import HtmlProperties
+    from faninsar.plotting.render import HtmlProperties
 
     return str(HtmlProperties(attrs, margin="0px 0px 0px 1em"))
 
@@ -198,7 +199,7 @@ def summarize_indexes(indexes: Indexes) -> str:
 
 def summarize_indexes_faninsar(indexes: Indexes) -> str:
     """Return a summary of the indexes as HTML for FanInSAR objects."""
-    from faninsar._core.render import HtmlIndexes
+    from faninsar.plotting.render import HtmlIndexes
 
     return str(HtmlIndexes(indexes, format_array_flat))
 
@@ -211,6 +212,7 @@ def collapsible_section(
     enabled: bool = True,
     collapsed: bool = False,
 ) -> str:
+    """Build a collapsible HTML section."""
     # "unique" id to expand/collapse the section
     data_id = "section-" + str(uuid.uuid4())
 
@@ -255,6 +257,7 @@ def _mapping_section(
 
 
 def dim_section(obj: DataArray | Dataset) -> str:
+    """Render dimension metadata as an HTML section."""
     dim_list = format_dims(obj.sizes, obj.xindexes.dims)
 
     return collapsible_section(
@@ -266,6 +269,7 @@ def dim_section(obj: DataArray | Dataset) -> str:
 
 
 def array_section(obj: DataArray) -> str:
+    """Render a data array preview as an HTML section."""
     # "unique" id to expand/collapse the section
     data_id = "section-" + str(uuid.uuid4())
     collapsed = (
@@ -291,7 +295,7 @@ def array_section(obj: DataArray) -> str:
 def pairs_section(pairs: Pairs) -> str:
     """Format a Pairs object as HTML."""
     # function import is delayed to avoid circular import
-    from faninsar._core.render import PairsSVG, add_svg_string
+    from faninsar.plotting.render import PairsSVG, add_svg_string
 
     # "unique" id to expand/collapse the section
     data_id = "section-" + str(uuid.uuid4())
@@ -398,7 +402,8 @@ def _obj_repr(obj: T_Xarray, header_components: str, sections: list) -> str:
 
 
 def array_repr(arr: DataArray) -> str:
-    dims = OrderedDict((k, v) for k, v in zip(arr.dims, arr.shape))
+    """Render a data array as HTML."""
+    dims = OrderedDict((k, v) for k, v in zip(arr.dims, arr.shape, strict=True))
     indexed_dims = arr.xindexes.dims if hasattr(arr, "xindexes") else {}
 
     obj_type = f"faninsar.{type(arr).__name__}"
@@ -427,6 +432,7 @@ def array_repr(arr: DataArray) -> str:
 
 
 def dataset_repr(ds: Dataset) -> str:
+    """Render a dataset as HTML."""
     obj_type = f"faninsar.{type(ds).__name__}"
 
     header_components = [f"<div class='xr-obj-type'>{escape(obj_type)}</div>"]
@@ -443,8 +449,9 @@ def dataset_repr(ds: Dataset) -> str:
 
 
 def pairs_repr(pairs: Pairs) -> str:
+    """Render a Pairs value as HTML."""
     # function import is delayed to avoid circular import
-    from faninsar._core.render import HtmlDims
+    from faninsar.plotting.render import HtmlDims
 
     obj_type = "faninsar.Pairs"
     dim = HtmlDims({"pairs": len(pairs), "dates": len(pairs.dates)}, sep="=")
@@ -463,6 +470,7 @@ def pairs_repr(pairs: Pairs) -> str:
 
 
 def summarize_datatree_children(children: Mapping[str, DataTree]) -> str:
+    """Render DataTree children as nested HTML sections."""
     n_children = len(children) - 1
 
     # Get result from datatree_node_repr and wrap it
@@ -495,6 +503,7 @@ children_section = partial(
 
 
 def datatree_node_repr(group_title: str, dt: DataTree) -> str:
+    """Render one DataTree node as HTML."""
     header_components = [f"<div class='xr-obj-type'>{escape(group_title)}</div>"]
 
     ds = dt._to_dataset_view(rebuild_dims=False)
@@ -581,6 +590,7 @@ def _wrap_datatree_repr(r: str, end: bool = False) -> str:
 
 
 def datatree_repr(dt: DataTree) -> str:
+    """Render a DataTree as HTML."""
     obj_type = f"datatree.{type(dt).__name__}"
     return datatree_node_repr(obj_type, dt)
 
