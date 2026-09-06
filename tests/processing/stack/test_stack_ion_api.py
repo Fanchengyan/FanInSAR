@@ -9,6 +9,7 @@ import pytest
 
 from faninsar.processing.atmosphere import IonosphereEstimationConfig
 from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.unwrap import SpatialIRLS
 from faninsar.stack import Stack
 from faninsar.stack.ion_store import IonosphereArtifactStore
 from faninsar.stack.scene_store import write_scene_unit
@@ -121,29 +122,30 @@ def test_estimate_apply_and_invert_end_to_end(tmp_path: Path) -> None:
 
     # Full IFG + unwrap generation on the same network.
     stack.form_interferograms(multilook=(1, 1))
-    stack.unwrap(do_spatial=False)
+    stack.unwrap(SpatialIRLS())
+    # Correction consumes the durable root generation, including after the
+    # in-memory generation lease has been refreshed from ``UNWRAP_CURRENT``.
+    stack.refresh_unwrap_generation()
 
     corrected = stack.apply_ionosphere_correction(ion_multilook=(1, 1))
     assert set(corrected) == set(expected_pair_screens)
+    unwrapped_stack = stack.network.interferograms.open_stack("unw_phase")
     for store in stores:
         try:
             pair_id = f"{store.pair[0]}_{store.pair[1]}"
             ifg_store_path = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
-            from faninsar.stack.ifg_store import (
-                InterferogramArtifactStore,
-            )
             from faninsar.stack.ion_store import (
                 read_ion_correction_artifact,
             )
 
-            ifg_store = InterferogramArtifactStore.open(ifg_store_path)
-            try:
-                unwrapped = ifg_store.read_unwrapped().unwrapped_phase
-            finally:
-                ifg_store.close()
-            ion_screen = IonosphereArtifactStore.open(
-                stack.config.work_dir / "ion" / "ml_1x1" / pair_id
-            ).read().ionosphere_phase
+            unwrapped = unwrapped_stack.sel(pair=pair_id).values
+            ion_screen = (
+                IonosphereArtifactStore.open(
+                    stack.config.work_dir / "ion" / "ml_1x1" / pair_id
+                )
+                .read()
+                .ionosphere_phase
+            )
             np.testing.assert_allclose(
                 read_ion_correction_artifact(ifg_store_path),
                 unwrapped - ion_screen,
@@ -202,7 +204,7 @@ def test_apply_refuses_degraded_generations_without_explicit_admission(
         degradation_reason="synthetic narrow-band mode",
     )
     stack.form_interferograms(multilook=(1, 1))
-    stack.unwrap(do_spatial=False)
+    stack.unwrap(SpatialIRLS())
     with pytest.raises(InvalidProcessingStateError, match="allow_degraded"):
         stack.apply_ionosphere_correction(ion_multilook=(1, 1))
     published = stack.apply_ionosphere_correction(

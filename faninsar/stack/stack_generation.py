@@ -118,6 +118,8 @@ class UnwrapResultGeneration:
         Complete ordered Pair universe captured at call entry.
     products : dict[str, dict[str, numpy.ndarray]]
         Eager named result layers keyed by canonical Pair id.
+    pair_bindings : dict[str, dict[str, str]]
+        Exact source IFG generation and grid identity keyed by Pair id.
 
     Notes
     -----
@@ -133,6 +135,7 @@ class UnwrapResultGeneration:
     manifest_digest: str
     pair_ids: tuple[str, ...]
     products: dict[str, dict[str, np.ndarray]]
+    pair_bindings: dict[str, dict[str, str]]
     _lease: GenerationLease
     mask_plan_identity: str = ""
     mask_identity: str | None = None
@@ -265,6 +268,7 @@ def publish_unwrap_generation(
     *,
     pair_ids: Sequence[str],
     products: Mapping[str, Mapping[str, object]],
+    pair_bindings: Mapping[str, Mapping[str, str]] | None = None,
     mask_plan_identity: str = "",
     mask_identity: str | None = None,
 ) -> UnwrapResultGeneration:
@@ -278,6 +282,10 @@ def publish_unwrap_generation(
         Complete ordered Pair universe frozen by the Stack call.
     products : mapping[str, mapping[str, object]]
         Result layers for every Pair, stored below canonical Pair directories.
+    pair_bindings : mapping[str, mapping[str, str]], optional
+        Exact source IFG generation identity and grid metadata for each Pair.
+        Stack publication supplies this binding so downstream stages can
+        consume the root generation without reopening a legacy per-IFG unwrap.
     mask_plan_identity : str, optional
         Identity of the canonical mask plan used for the result.
     mask_identity : str, optional
@@ -310,6 +318,31 @@ def publish_unwrap_generation(
         reject_invalid_state("Stack unwrap generation requires unique Pair ids")
     if set(products) != set(ordered_pairs):
         reject_invalid_state("Stack unwrap generation Pair results are incomplete")
+    bindings: dict[str, dict[str, str]] = {}
+    if pair_bindings is not None:
+        if set(pair_bindings) != set(ordered_pairs):
+            reject_invalid_state(
+                "Stack unwrap generation source bindings are incomplete"
+            )
+        for pair_id in ordered_pairs:
+            raw_binding = pair_bindings[pair_id]
+            if not isinstance(raw_binding, Mapping):
+                reject_invalid_state(
+                    "Stack unwrap generation source binding is invalid"
+                )
+            normalized_binding = {
+                str(key): str(value) for key, value in raw_binding.items()
+            }
+            required = {
+                "ifg_generation_id",
+                "ifg_manifest_digest",
+                "grid_identity",
+            }
+            if set(normalized_binding) != required:
+                reject_invalid_state(
+                    "Stack unwrap generation source binding is invalid"
+                )
+            bindings[pair_id] = normalized_binding
 
     normalized: dict[str, dict[str, np.ndarray]] = {}
     final_bytes = 1024
@@ -348,7 +381,13 @@ def publish_unwrap_generation(
                 payload_path = pair_root / f"{name}.npy"
                 array = _write_array(payload_path, value)
                 payloads[name] = _unwrap_payload_descriptor(payload_path, array)
-            manifest_pairs.append({"pair_id": pair_id, "payloads": payloads})
+            pair_manifest: dict[str, Any] = {
+                "pair_id": pair_id,
+                "payloads": payloads,
+            }
+            if pair_bindings is not None:
+                pair_manifest["source"] = bindings[pair_id]
+            manifest_pairs.append(pair_manifest)
         unsigned: dict[str, Any] = {
             "schema_version": UNWRAP_GENERATION_SCHEMA,
             "status": "complete",
@@ -472,6 +511,11 @@ def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
         manifest_digest=opened.manifest_digest,
         pair_ids=pair_ids,
         products=products,
+        pair_bindings={
+            pair_id: dict(raw_pair.get("source", {}))
+            for pair_id, raw_pair in zip(pair_ids, raw_pairs, strict=True)
+            if isinstance(raw_pair, dict) and isinstance(raw_pair.get("source"), dict)
+        },
         mask_plan_identity=str(manifest.get("mask_plan_identity", "")),
         mask_identity=manifest.get("mask_identity"),
         _lease=opened.lease,

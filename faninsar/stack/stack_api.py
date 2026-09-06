@@ -332,9 +332,7 @@ def estimate_ionosphere(
             high_phase,
             config,
             valid_mask=pixel_valid,
-            coherence=torch.as_tensor(coherence, dtype=torch.float64).to(
-                torch_device
-            ),
+            coherence=torch.as_tensor(coherence, dtype=torch.float64).to(torch_device),
         )
         weights = torch.where(
             pixel_valid,
@@ -451,6 +449,22 @@ def apply_ionosphere_correction(
         looks=multilook or stack.config.multilook,
         ifg_root=ifg_root,
     )
+    generation = stack._unwrap_generation
+    if generation is None:
+        if not (stack.config.work_dir / "UNWRAP_CURRENT").is_file():
+            reject_invalid_state(
+                "Stack ionosphere correction requires a committed root unwrap "
+                "generation; call Stack.unwrap(unwrapper) first"
+            )
+        stack.refresh_unwrap_generation()
+        generation = stack._unwrap_generation
+    if generation is None:  # pragma: no cover - refresh either returns or raises
+        reject_invalid_state("Stack root unwrap generation could not be loaded")
+    expected_pair_ids = tuple(f"{store.pair[0]}_{store.pair[1]}" for store in stores)
+    if tuple(generation.pair_ids) != expected_pair_ids:
+        reject_invalid_state(
+            "Stack root unwrap generation does not match the current Pair network"
+        )
     published: dict[str, Path] = {}
     try:
         for store in stores:
@@ -480,9 +494,34 @@ def apply_ionosphere_correction(
                             f"ion artifact for {pair_id} was estimated from "
                             f"different {role} scenes than the IFG generation"
                         )
-                unwrapped = store.read_unwrapped()
+                source_binding = generation.pair_bindings.get(pair_id)
+                if source_binding is None:
+                    reject_invalid_state(
+                        f"root unwrap generation has no IFG binding for {pair_id}"
+                    )
+                if (
+                    source_binding.get("ifg_generation_id") != store.generation_id
+                    or source_binding.get("ifg_manifest_digest")
+                    != store.manifest_digest
+                    or source_binding.get("grid_identity") != store.grid_identity
+                ):
+                    reject_invalid_state(
+                        f"root unwrap generation is not bound to the current IFG "
+                        f"for {pair_id}"
+                    )
+                try:
+                    unwrapped_phase = generation.products[pair_id]["unwrapped_phase"]
+                except KeyError:
+                    reject_invalid_state(
+                        f"root unwrap generation is missing phase for {pair_id}"
+                    )
+                if unwrapped_phase.shape != store.shape:
+                    reject_invalid_state(
+                        f"root unwrap grid shape for {pair_id} differs from the IFG "
+                        "grid"
+                    )
                 ion = ion_store.read()
-                if ion.ionosphere_phase.shape != unwrapped.unwrapped_phase.shape:
+                if ion.ionosphere_phase.shape != unwrapped_phase.shape:
                     reject_invalid_state(
                         f"ion grid shape for {pair_id} differs from the IFG "
                         "unwrap grid; estimate the ionosphere at the same "
@@ -497,9 +536,9 @@ def apply_ionosphere_correction(
                     continue
                 write_ion_correction_artifact(
                     store.root,
-                    unwrapped_phase=(
-                        unwrapped.unwrapped_phase - ion.ionosphere_phase
-                    ).astype(np.float32),
+                    unwrapped_phase=(unwrapped_phase - ion.ionosphere_phase).astype(
+                        np.float32
+                    ),
                     ion_manifest_digest=ion_store.manifest_digest,
                     ifg_manifest_digest=store.manifest_digest,
                     degraded_consumed=bool(ion_store.degraded),

@@ -3234,6 +3234,14 @@ class Stack(NetworkContract):
                 self.config.work_dir,
                 pair_ids=pair_ids,
                 products=products,
+                pair_bindings={
+                    pair_id: {
+                        "ifg_generation_id": store.generation_id,
+                        "ifg_manifest_digest": store.manifest_digest,
+                        "grid_identity": store.grid_identity,
+                    }
+                    for pair_id, store in zip(pair_ids, stores, strict=True)
+                },
                 mask_plan_identity=mask_plan_identity,
                 mask_identity=mask_identity,
             )
