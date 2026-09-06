@@ -9,7 +9,7 @@ from faninsar.core.sar_property import Frequency, Wavelength
 
 # Import grouped facades only after core values exist. Dataset modules use
 # these values in their type-level imports during package initialization.
-from faninsar import data, network, remote, stack
+from faninsar import data, network, remote, stack  # isort: skip
 from faninsar.network import Network
 
 __version__ = "0.1.dev0"

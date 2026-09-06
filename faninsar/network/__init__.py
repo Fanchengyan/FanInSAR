@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from faninsar.core.interferogram import Interferogram
+
 from .network import (
     ExternalNetworkLayoutError,
     GAMMANetwork,
@@ -24,9 +26,8 @@ from .network import (
     SNAPNetwork,
     UnknownNetworkIndexTypeError,
 )
-from faninsar.core.interferogram import Interferogram
-from .readers.interferogram import InterferogramCollection
 from .protocols import NetworkReader
+from .readers.interferogram import InterferogramCollection
 from .registry import (
     ENTRY_POINT_GROUP,
     DuplicateReaderError,
