@@ -3771,13 +3771,34 @@ class Stack(NetworkContract):
         This keeps the migration small while avoiding a second large raster
         representation in the normal local-workspace case.
         """
-        network_root = self.config.work_dir / "network"
-        interferograms_root = network_root / "interferograms"
-        generation_root = (
-            network_root / ".network_generations" / generation.generation_id
+        from faninsar.stack.artifact_transaction import (
+            commit_generation,
+            stage_generation,
         )
-        interferograms_root.mkdir(parents=True, exist_ok=True)
-        generation_root.mkdir(parents=True, exist_ok=True)
+
+        network_root = self.config.work_dir / "network"
+        unwrap_generation = self._unwrap_generation
+        asset_count = 0
+        final_bytes = 4096
+        for store in stores:
+            for name in ("complex_ifg", "wrapped_phase", "amplitude", "coherence"):
+                source = store.generation_root / f"{name}.npy"
+                if source.is_file():
+                    asset_count += 1
+                    final_bytes += source.stat().st_size
+            if unwrap_generation is not None:
+                source = (
+                    unwrap_generation.generation_root
+                    / f"{store.pair[0]}_{store.pair[1]}"
+                    / "unwrapped_phase.npy"
+                )
+                if source.is_file():
+                    asset_count += 1
+                    final_bytes += source.stat().st_size
+            else:
+                final_bytes += int(store.shape[0] * store.shape[1] * 4)
+                asset_count += 1
+        final_bytes += asset_count * 2048
 
         def publish_asset(
             source: Path | None, target: Path, array: np.ndarray | None = None
@@ -3803,130 +3824,139 @@ class Stack(NetworkContract):
                     digest.update(chunk)
             return digest.hexdigest()
 
-        assets_by_pair: dict[str, list[str]] = {}
-        products: list[dict[str, Any]] = []
-        unwrap_generation = self._unwrap_generation
-        for store in stores:
-            pair_id = f"{store.pair[0]}_{store.pair[1]}"
-            pair_root = interferograms_root / pair_id
-            artifact = store.read()
-            source_assets: dict[str, tuple[Path | None, np.ndarray | None]] = {
-                "complex_ifg": (
-                    store.generation_root / "complex_ifg.npy",
-                    artifact.complex_ifg,
-                ),
-                "wrapped_phase": (
-                    store.generation_root / "wrapped_phase.npy",
-                    artifact.wrapped_phase,
-                ),
-                "amplitude": (
-                    store.generation_root / "amplitude.npy",
-                    artifact.amplitude,
-                ),
-                "coherence": (
-                    store.generation_root / "coherence.npy"
-                    if artifact.coherence is not None
-                    else None,
-                    artifact.coherence,
-                ),
-            }
-            if unwrap_generation is not None:
-                unwrapped_path = (
-                    unwrap_generation.generation_root / pair_id / "unwrapped_phase.npy"
-                )
-                source_assets["unw_phase"] = (unwrapped_path, None)
-            else:
-                unwrapped = store.read_unwrapped()
-                source_assets["unw_phase"] = (None, unwrapped.unwrapped_phase)
-
-            available: list[str] = []
-            for asset_name, (source, array) in source_assets.items():
-                if source is None and array is None:
-                    continue
-                target = pair_root / f"{asset_name}.npy"
-                digest = publish_asset(source, target, array)
-                available.append(asset_name)
-                product_kind = {
-                    "complex_ifg": AssetKind.COMPLEX_INTERFEROGRAM.value,
-                    "wrapped_phase": AssetKind.WRAPPED_PHASE.value,
-                    "amplitude": AssetKind.DISPLACEMENT.value,
-                    "coherence": AssetKind.DISPLACEMENT.value,
-                    "unw_phase": AssetKind.UNWRAPPED_PHASE.value,
-                }[asset_name]
-                lineage = [store.manifest_digest]
-                if asset_name == "unw_phase":
-                    lineage.append(
-                        unwrap_generation.manifest_digest
-                        if unwrap_generation is not None
-                        else store.manifest_digest
+        with stage_generation(
+            network_root,
+            "network",
+            final_bytes=final_bytes,
+            temporary_bytes=final_bytes,
+            file_count=asset_count + len(stores) + 3,
+        ) as (network_generation_id, staging):
+            interferograms_root = staging / "interferograms"
+            assets_by_pair: dict[str, list[str]] = {}
+            products: list[dict[str, Any]] = []
+            for store in stores:
+                pair_id = f"{store.pair[0]}_{store.pair[1]}"
+                pair_root = interferograms_root / pair_id
+                artifact = store.read()
+                source_assets: dict[str, tuple[Path | None, np.ndarray | None]] = {
+                    "complex_ifg": (
+                        store.generation_root / "complex_ifg.npy",
+                        artifact.complex_ifg,
+                    ),
+                    "wrapped_phase": (
+                        store.generation_root / "wrapped_phase.npy",
+                        artifact.wrapped_phase,
+                    ),
+                    "amplitude": (
+                        store.generation_root / "amplitude.npy",
+                        artifact.amplitude,
+                    ),
+                    "coherence": (
+                        store.generation_root / "coherence.npy"
+                        if artifact.coherence is not None
+                        else None,
+                        artifact.coherence,
+                    ),
+                }
+                if unwrap_generation is not None:
+                    unwrapped_path = (
+                        unwrap_generation.generation_root
+                        / pair_id
+                        / "unwrapped_phase.npy"
                     )
-                products.append(
-                    {
-                        "id": f"{pair_id}:{asset_name}",
-                        "primary_id": store.pair[0],
-                        "secondary_id": store.pair[1],
-                        "product_kind": product_kind,
-                        "asset_location": f"interferograms/{pair_id}/{asset_name}.npy",
-                        "geometry_identity": store.grid_identity,
-                        "source_software": "faninsar",
-                        "phase_convention": (
-                            PhaseConvention.PRIMARY_MINUS_SECONDARY.value
-                        ),
-                        "content_digest": digest,
-                        "lineage": lineage,
-                    }
-                )
-            assets_by_pair[pair_id] = available
+                    source_assets["unw_phase"] = (unwrapped_path, None)
+                else:
+                    unwrapped = store.read_unwrapped()
+                    source_assets["unw_phase"] = (None, unwrapped.unwrapped_phase)
 
-        index = {
-            "type": "NetworkInterferogramIndex",
-            "version": "stack_artifact_v1",
-            "pair_count": len(assets_by_pair),
-            "pairs": list(assets_by_pair),
-            "assets_by_pair": assets_by_pair,
-            "common_grid": True,
-        }
-        (interferograms_root / "interferograms_index.json").write_text(
-            json.dumps(index, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-        )
-        unsigned = {
-            "schema_version": "network_v1",
-            "status": "complete",
-            "generation_id": generation.generation_id,
-            "index_type": "NetworkInterferogramIndex",
-            "phase_convention": PhaseConvention.PRIMARY_MINUS_SECONDARY.value,
-            "source_software": "faninsar",
-            "products": products,
-        }
-        manifest = {
-            **unsigned,
-            "manifest_digest": hashlib.sha256(
-                json.dumps(
-                    unsigned,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=True,
-                ).encode("utf-8")
-            ).hexdigest(),
-        }
-        encoded_manifest = json.dumps(manifest, sort_keys=True, indent=2) + "\n"
-        (generation_root / "manifest.json").write_text(
-            encoded_manifest, encoding="utf-8"
-        )
-        (network_root / "manifest.json").write_text(encoded_manifest, encoding="utf-8")
-        (network_root / "CURRENT").write_text(
-            json.dumps(
-                {
-                    "schema_version": "network_current_v1",
-                    "status": "complete",
-                    "generation_id": generation.generation_id,
-                    "manifest_digest": manifest["manifest_digest"],
-                },
-                sort_keys=True,
+                available: list[str] = []
+                for asset_name, (source, array) in source_assets.items():
+                    if source is None and array is None:
+                        continue
+                    target = pair_root / f"{asset_name}.npy"
+                    digest = publish_asset(source, target, array)
+                    available.append(asset_name)
+                    product_kind = {
+                        "complex_ifg": AssetKind.COMPLEX_INTERFEROGRAM.value,
+                        "wrapped_phase": AssetKind.WRAPPED_PHASE.value,
+                        "amplitude": AssetKind.AMPLITUDE.value,
+                        "coherence": AssetKind.COHERENCE.value,
+                        "unw_phase": AssetKind.UNWRAPPED_PHASE.value,
+                    }[asset_name]
+                    lineage = [store.manifest_digest]
+                    if asset_name == "unw_phase":
+                        lineage.append(
+                            unwrap_generation.manifest_digest
+                            if unwrap_generation is not None
+                            else store.manifest_digest
+                        )
+                    products.append(
+                        {
+                            "id": f"{pair_id}:{asset_name}",
+                            "primary_id": store.pair[0],
+                            "secondary_id": store.pair[1],
+                            "product_kind": product_kind,
+                            "asset_location": (
+                                f"interferograms/{pair_id}/{asset_name}.npy"
+                            ),
+                            "geometry_identity": store.grid_identity,
+                            "source_software": "faninsar",
+                            "phase_convention": (
+                                PhaseConvention.PRIMARY_MINUS_SECONDARY.value
+                            ),
+                            "content_digest": digest,
+                            "lineage": lineage,
+                        }
+                    )
+                assets_by_pair[pair_id] = available
+
+            index = {
+                "type": "NetworkInterferogramIndex",
+                "version": "stack_artifact_v1",
+                "pair_count": len(assets_by_pair),
+                "pairs": list(assets_by_pair),
+                "assets_by_pair": assets_by_pair,
+                "common_grid": True,
+            }
+            (interferograms_root / "interferograms_index.json").parent.mkdir(
+                parents=True, exist_ok=True
             )
-            + "\n",
-            encoding="utf-8",
-        )
+            (interferograms_root / "interferograms_index.json").write_text(
+                json.dumps(index, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+            )
+            unsigned = {
+                "schema_version": "network_v1",
+                "status": "complete",
+                "generation_id": network_generation_id,
+                "stack_generation_id": generation.generation_id,
+                "index_type": "NetworkInterferogramIndex",
+                "phase_convention": PhaseConvention.PRIMARY_MINUS_SECONDARY.value,
+                "source_software": "faninsar",
+                "products": products,
+            }
+            manifest = {
+                **unsigned,
+                "manifest_digest": hashlib.sha256(
+                    json.dumps(
+                        unsigned,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+            (staging / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            commit_generation(
+                network_root,
+                "network",
+                network_generation_id,
+                staging,
+                manifest_digest=str(manifest["manifest_digest"]),
+                compatibility_manifest=manifest,
+            )
         return network_root
 
     def publish_generation(

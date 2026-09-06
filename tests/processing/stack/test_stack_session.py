@@ -958,6 +958,7 @@ def test_stack_unwrap_publishes_durable_network_generation(tmp_path: Path) -> No
 
 def test_publish_generation_exports_canonical_network_view(tmp_path: Path) -> None:
     """A completed Stack generation can be admitted through Network.open."""
+    from faninsar import Pairs
     from faninsar.network import Network
 
     stack = _stack_with_three_date_network(tmp_path)
@@ -976,12 +977,123 @@ def test_publish_generation_exports_canonical_network_view(tmp_path: Path) -> No
     generation = stack.publish_generation(timeseries_root)
     try:
         network = Network.open(stack.config.work_dir / "network")
-        assert network.manifest["generation_id"] == generation.generation_id
+        assert network.manifest["stack_generation_id"] == generation.generation_id
         assert network.interferograms.open_stack("unw_phase").shape == (3, 3, 4)
         result = network.analyze_time_series()
-        assert result.revision_id == generation.generation_id
+        assert result.revision_id == network.manifest["generation_id"]
+        subset = Pairs.from_names(["20240101_20240113", "20240113_20240125"])
+        subset_result = network.analyze_time_series(pairs=subset)
+        assert subset_result.pair_ids == tuple(subset.to_names().tolist())
+        nsbas_result = network.analyze_time_series(solver="nsbas")
+        assert nsbas_result.revision_id == network.manifest["generation_id"]
+        assert nsbas_result.__class__.__name__ == "TimeSeriesResult"
     finally:
         generation.close()
+
+
+def test_network_revision_reads_its_own_generation_assets(tmp_path: Path) -> None:
+    """Selecting an old Network revision reads its immutable raster payloads."""
+    from faninsar.network import Network
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phase = np.full((3, 4), 0.2, dtype=np.float32)
+    for pair_id in (
+        "20240101_20240113",
+        "20240113_20240125",
+        "20240101_20240125",
+    ):
+        _write_pair_artifact(stack, pair_id, phase)
+    stack.unwrap()
+    timeseries_root = write_timeseries_zarr(
+        stack.invert_timeseries(), stack.config.work_dir / "timeseries.zarr"
+    )
+
+    generation = stack.publish_generation(timeseries_root)
+    try:
+        network_root = stack.config.work_dir / "network"
+        first = Network.open(network_root)
+        first_revision = str(first.manifest["generation_id"])
+        first_pixels = first.interferograms.open(
+            "20240101_20240113", "complex_ifg"
+        ).values.copy()
+
+        store = InterferogramArtifactStore.open(
+            stack.config.work_dir / "ifg/ml_1x1/20240101_20240113"
+        )
+        try:
+            artifact = store.read()
+            replacement = np.exp(1j * np.full((3, 4), 0.8, dtype=np.float32))
+            write_ifg_artifact(
+                store.root,
+                pair=store.pair,
+                looks=store.looks,
+                filter_name=store.filter_name,
+                filter_parameters=store.filter_parameters,
+                source_manifest_digests=store.source_manifest_digests,
+                grid_identity=store.grid_identity,
+                complex_ifg=replacement.astype(np.complex64),
+                coherence=artifact.coherence,
+                wrapped_phase=np.angle(replacement).astype(np.float32),
+                amplitude=np.abs(replacement).astype(np.float32),
+                replace_existing=True,
+            )
+        finally:
+            store.close()
+
+        stores = stack._pair_artifact_stores(looks=(1, 1), ifg_root=None)
+        try:
+            stack._publish_network_root(generation, stores)
+        finally:
+            for item in stores:
+                item.close()
+
+        current = Network.open(network_root)
+        historical = Network.open(network_root, revision=first_revision)
+        current_pixels = current.interferograms.open(
+            "20240101_20240113", "complex_ifg"
+        ).values
+        historical_pixels = historical.interferograms.open(
+            "20240101_20240113", "complex_ifg"
+        ).values
+        assert np.allclose(historical_pixels, first_pixels)
+        assert not np.allclose(current_pixels, historical_pixels)
+    finally:
+        generation.close()
+
+
+def test_live_stack_network_declares_only_present_optional_assets(
+    tmp_path: Path,
+) -> None:
+    """The live Stack view does not advertise absent coherence or unwrap data."""
+    from faninsar.stack.network import StackInterferogramCollection
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phase = np.full((3, 4), 0.2, dtype=np.float32)
+    for pair_id in (
+        "20240101_20240113",
+        "20240113_20240125",
+        "20240101_20240125",
+    ):
+        root = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
+        complex_ifg = np.exp(1j * phase).astype(np.complex64)
+        write_ifg_artifact(
+            root,
+            pair=tuple(pair_id.split("_")),  # type: ignore[arg-type]
+            looks=(1, 1),
+            filter_name="none",
+            filter_parameters={},
+            source_manifest_digests={"scenes": "a" * 64},
+            complex_ifg=complex_ifg,
+            coherence=None,
+            wrapped_phase=phase,
+            amplitude=np.abs(complex_ifg).astype(np.float32),
+        )
+        if root not in stack.ifg_dirs:
+            stack.ifg_dirs.append(root)
+
+    index = StackInterferogramCollection(stack).index_metadata
+    assert all("coherence" not in assets for assets in index["assets_by_pair"].values())
+    assert all("unw_phase" not in assets for assets in index["assets_by_pair"].values())
 
 
 def test_refresh_rejects_root_unwrap_bound_to_stale_ifg(tmp_path: Path) -> None:

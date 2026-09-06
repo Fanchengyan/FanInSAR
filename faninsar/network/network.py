@@ -429,7 +429,10 @@ def _validate_network_layout(
         message = "Network generation manifest phase convention mismatch"
         logger.error(message)
         raise NetworkGenerationError(message)
-    if not (root / "interferograms").is_dir():
+    if not (
+        (root / "interferograms").is_dir()
+        or (generation_root / "interferograms").is_dir()
+    ):
         message = "Network requires an interferograms/ product collection"
         logger.error(message)
         raise IncompleteNetworkProductError(message)
@@ -472,7 +475,12 @@ class Network(NetworkContract):
         self._geometry = (
             NetworkGeometry(geometry_root) if geometry_root.is_dir() else None
         )
-        interferograms_root = resolved_root / "interferograms"
+        generation_interferograms_root = self.generation_root / "interferograms"
+        interferograms_root = (
+            generation_interferograms_root
+            if generation_interferograms_root.is_dir()
+            else resolved_root / "interferograms"
+        )
         index_path = interferograms_root / "interferograms_index.json"
         index_version = None
         if index_path.is_file():
@@ -483,7 +491,9 @@ class Network(NetworkContract):
         if index_version == "stack_artifact_v1":
             from faninsar.stack.network import StackInterferogramCollection
 
-            self._interferograms = StackInterferogramCollection(resolved_root)
+            self._interferograms = StackInterferogramCollection(
+                interferograms_root.parent
+            )
         else:
             self._interferograms = InterferogramCollection(interferograms_root)
         timeseries_root = resolved_root / "timeseries"
@@ -650,7 +660,7 @@ class Network(NetworkContract):
         unwrapped: np.ndarray | None = None
         coherence: np.ndarray | None = None
         try:
-            unwrapped_data = self.interferograms.open_stack("unw_phase")
+            unwrapped_data = self.interferograms.open_stack("unw_phase", pairs=pair_obj)
             unwrapped = np.asarray(unwrapped_data.values, dtype=np.float64)
             if unwrapped.ndim == 3:
                 unwrapped = unwrapped.reshape(unwrapped.shape[0], -1)
@@ -659,7 +669,7 @@ class Network(NetworkContract):
             message = "could not load unwrapped phase stack from Network Dataset"
             raise ValueError(message) from exc
         try:
-            coherence_data = self.interferograms.open_stack("coherence")
+            coherence_data = self.interferograms.open_stack("coherence", pairs=pair_obj)
             coherence = np.asarray(coherence_data.values, dtype=np.float64)
             if coherence.ndim == 3:
                 coherence = coherence.reshape(coherence.shape[0], -1)
@@ -740,7 +750,7 @@ class Network(NetworkContract):
                 invert_unwrapped_pairs,
             )
 
-            values = self.interferograms.open_stack("unw_phase", pairs=pairs)
+            values = self.interferograms.open_stack("unw_phase", pairs=stack.pairs)
             pair_ids = [str(value) for value in values.coords["pair"].values]
             pair_phases = {
                 pair_id: np.asarray(values.isel(pair=index).values)
@@ -754,7 +764,43 @@ class Network(NetworkContract):
         if normalized_solver == "nsbas":
             from faninsar.timeseries.invert import invert
 
-            result = invert(stack, model=model, **kwargs)
+            raw = invert(stack, model=model, **kwargs)
+            if not isinstance(raw, tuple) or len(raw) != 4:
+                message = "NSBAS solver returned an invalid result"
+                logger.error(message)
+                raise NetworkAnalysisError(message)
+            from faninsar.processing.timeseries.inversion import TimeSeriesResult
+
+            increments, _parameters, residual_pairs, _residual_model = raw
+            increments_array = np.asarray(increments, dtype=np.float32)
+            residual_array = np.asarray(residual_pairs, dtype=np.float32)
+            n_pixels = int(np.asarray(stack.unwrapped_matrix()).shape[1])
+            n_dates = len(stack.pairs.dates)
+            if increments_array.shape != (n_dates - 1, n_pixels):
+                message = "NSBAS solver returned increments with an invalid shape"
+                logger.error(message)
+                raise NetworkAnalysisError(message)
+            if residual_array.shape != (len(stack.pairs), n_pixels):
+                message = "NSBAS solver returned residuals with an invalid shape"
+                logger.error(message)
+                raise NetworkAnalysisError(message)
+            cumulative_array = np.concatenate(
+                [
+                    np.zeros((1, n_pixels), dtype=np.float32),
+                    np.cumsum(increments_array, axis=0),
+                ],
+                axis=0,
+            )
+            result = TimeSeriesResult(
+                pair_ids=tuple(str(name) for name in stack.pairs.names),
+                dates=tuple(
+                    str(date.date()).replace("-", "") for date in stack.pairs.dates
+                ),
+                increments=increments_array,
+                residual_pairs=residual_array,
+                cumulative=cumulative_array,
+                metadata={"method": "nsbas", "n_pairs": len(stack.pairs)},
+            )
             return self._bind_analysis_revision(result)
         message = f"unknown Network time-series solver {solver!r}"
         logger.exception(message)

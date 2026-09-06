@@ -52,6 +52,8 @@ class AssetKind(StrEnum):
     UNWRAPPED_PHASE = "unwrapped_phase"
     DISPLACEMENT = "displacement"
     LOS = "los"
+    AMPLITUDE = "amplitude"
+    COHERENCE = "coherence"
 
     # Short aliases are useful to adapters while retaining one serialized
     # vocabulary.  StrEnum aliases do not create additional enum values.
@@ -186,6 +188,8 @@ class AssetTransform:
     ) -> AssetTransformOperation:
         """Return the only valid operation for an asset/convention pair."""
         if phase_convention is PhaseConvention.PRIMARY_MINUS_SECONDARY:
+            return AssetTransformOperation.IDENTITY
+        if asset_kind in {AssetKind.AMPLITUDE, AssetKind.COHERENCE}:
             return AssetTransformOperation.IDENTITY
         if asset_kind is AssetKind.COMPLEX_INTERFEROGRAM:
             return AssetTransformOperation.COMPLEX_CONJUGATE

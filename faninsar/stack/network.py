@@ -51,15 +51,28 @@ class StackInterferogramCollection(InterferogramCollection):
             return json.loads(index_path.read_text(encoding="utf-8"))
         assert self._stack is not None
         pair_names = [f"{first}_{second}" for first, second in self._pair_dates()]
+        stores = self._stores()
+        try:
+            assets_by_pair: dict[str, list[str]] = {}
+            for pair_name, store in zip(pair_names, stores, strict=True):
+                assets = ["complex_ifg", "wrapped_phase", "amplitude"]
+                if "coherence" in store._payloads:
+                    assets.append("coherence")
+                if (
+                    self._stack._unwrap_generation is not None
+                    or (store.root / "UNWRAP_CURRENT").is_file()
+                ):
+                    assets.append("unw_phase")
+                assets_by_pair[pair_name] = assets
+        finally:
+            for store in stores:
+                store.close()
         return {
             "type": "NetworkInterferogramIndex",
             "version": "stack_ifg_artifact_v1",
             "pair_count": len(pair_names),
             "pairs": pair_names,
-            "assets_by_pair": {
-                pair: ["coherence", "wrapped_phase", "amplitude", "unw_phase"]
-                for pair in pair_names
-            },
+            "assets_by_pair": assets_by_pair,
             "common_grid": True,
         }
 
@@ -101,8 +114,7 @@ class StackInterferogramCollection(InterferogramCollection):
         if name == "unw_phase":
             generation = self._stack._unwrap_generation
             if generation is None:
-                message = "Stack has no committed unwrap generation"
-                raise FileNotFoundError(message)
+                return np.asarray(store.read_unwrapped().unwrapped_phase)
             pair_id = f"{store.pair[0]}_{store.pair[1]}"
             return np.asarray(generation.products[pair_id]["unwrapped_phase"])
         artifact = store.read()
@@ -111,17 +123,19 @@ class StackInterferogramCollection(InterferogramCollection):
                 if artifact.coherence is None:
                     message = "coherence is not present"
                     raise FileNotFoundError(message)
-                return np.asarray(artifact.coherence)
-            if name == "wrapped_phase":
-                return np.asarray(artifact.wrapped_phase)
-            if name == "amplitude":
-                return np.asarray(artifact.amplitude)
-            if name == "complex_ifg":
-                return np.asarray(artifact.complex_ifg)
+                value = artifact.coherence
+            elif name == "wrapped_phase":
+                value = artifact.wrapped_phase
+            elif name == "amplitude":
+                value = artifact.amplitude
+            elif name == "complex_ifg":
+                value = artifact.complex_ifg
+            else:
+                message = f"unknown Stack interferogram asset: {name}"
+                raise ValueError(message)
         finally:
             del artifact
-        message = f"unknown Stack interferogram asset: {name}"
-        raise ValueError(message)
+        return np.asarray(value)
 
     def open_stack(
         self,

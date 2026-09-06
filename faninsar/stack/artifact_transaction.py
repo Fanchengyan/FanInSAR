@@ -459,10 +459,12 @@ def _atomic_control_at(
     directory_descriptor: int,
     name: str,
     value: Mapping[str, Any],
+    *,
+    max_bytes: int = _CONTROL_LIMIT_BYTES,
 ) -> None:
     """Atomically write one control frame relative to a pinned directory."""
     payload = canonical_json(value) + b"\n"
-    if len(payload) > _CONTROL_LIMIT_BYTES:
+    if len(payload) > max_bytes:
         reject_invalid_state(f"artifact control frame exceeds limit: {name}")
     try:
         existing = os.stat(
@@ -932,7 +934,9 @@ def _namespace_paths(root: Path, namespace: str) -> tuple[Path, Path, Path, Path
     generations = root / f".{safe_namespace}_generations"
     staging = root / f".{safe_namespace}_staging"
     leases = root / f".{safe_namespace}_leases"
-    current_name = "CURRENT" if namespace == "ifg" else f"{namespace.upper()}_CURRENT"
+    current_name = (
+        "CURRENT" if namespace in {"ifg", "network"} else f"{namespace.upper()}_CURRENT"
+    )
     current = root / current_name
     return generations, staging, leases, current
 
@@ -1058,15 +1062,32 @@ def commit_generation(
         os.fsync(generations_descriptor)
         if compatibility_manifest is not None:
             name = (
-                "manifest.json" if namespace == "ifg" else f"{namespace}_manifest.json"
+                "manifest.json"
+                if namespace in {"ifg", "network"}
+                else f"{namespace}_manifest.json"
             )
-            _atomic_control_at(root_descriptor, name, compatibility_manifest)
-        unsigned = {
-            "schema": "faninsar_artifact_current_v1",
-            "namespace": namespace,
-            "generation_id": generation_id,
-            "manifest_digest": manifest_digest,
-        }
+            _atomic_control_at(
+                root_descriptor,
+                name,
+                compatibility_manifest,
+                max_bytes=(
+                    1024 * 1024 if namespace == "network" else _CONTROL_LIMIT_BYTES
+                ),
+            )
+        if namespace == "network":
+            unsigned = {
+                "schema_version": "network_current_v1",
+                "status": "complete",
+                "generation_id": generation_id,
+                "manifest_digest": manifest_digest,
+            }
+        else:
+            unsigned = {
+                "schema": "faninsar_artifact_current_v1",
+                "namespace": namespace,
+                "generation_id": generation_id,
+                "manifest_digest": manifest_digest,
+            }
         pointer = {
             **unsigned,
             "control_digest": sha256_bytes(canonical_json(unsigned)),
