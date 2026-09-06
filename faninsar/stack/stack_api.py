@@ -33,7 +33,6 @@ from faninsar.processing.atmosphere.network import (
 )
 from faninsar.processing.atmosphere.split_spectrum import split_range_spectrum
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.processing.unwrap.snaphu_backend import SnaphuConfig
 from faninsar.stack.ion_store import (
     IonosphereArtifactStore,
     write_ion_correction_artifact,
@@ -43,6 +42,7 @@ from faninsar.stack.scene_store import CoregisteredSceneStore
 
 if TYPE_CHECKING:
     from faninsar.processing.atmosphere.config import IonosphereEstimationConfig
+    from faninsar.processing.unwrap.snaphu_backend import SnaphuConfig
     from faninsar.stack.session import Stack
 
 logger = setup_logger(__name__)
@@ -180,6 +180,9 @@ def estimate_ionosphere(
         Four-connected valid clusters below this size are dropped.
     unwrap_method : {"snaphu", "irls"}, optional
         Subband unwrapping backend. There is no silent fallback.
+    snaphu_config : SnaphuConfig, optional
+        Configuration passed to the SNAPHU backend when ``unwrap_method`` is
+        ``"snaphu"``.
     device : str, optional
         Numerical device for the Torch lanes. Defaults to the Stack
         device with ``auto`` resolved explicitly.

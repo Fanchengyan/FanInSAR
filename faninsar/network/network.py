@@ -461,7 +461,7 @@ class Network(NetworkContract):
             raise NetworkConstructionError(message) from exc
         if not resolved_root.exists() or not resolved_root.is_dir():
             message = f"Network directory not found: {resolved_root}"
-            logger.exception(message)
+            logger.error(message)
             raise NetworkPathError(message)
         self.manifest = _validate_network_layout(resolved_root, revision=revision)
         self.generation_root = (
@@ -505,7 +505,7 @@ class Network(NetworkContract):
         index = self.interferograms.index_metadata if self.interferograms else None
         if index is None:
             message = "Network interferograms have no canonical index"
-            logger.exception(message)
+            logger.error(message)
             raise IncompleteNetworkProductError(message)
         index_type = index.get("type", index.get("index_type"))
         if index_type != NETWORK_INDEX_TYPE:
@@ -803,7 +803,7 @@ class Network(NetworkContract):
             )
             return self._bind_analysis_revision(result)
         message = f"unknown Network time-series solver {solver!r}"
-        logger.exception(message)
+        logger.error(message)
         raise ValueError(message)
 
     def _bind_analysis_revision(self, result: Any) -> Any:
