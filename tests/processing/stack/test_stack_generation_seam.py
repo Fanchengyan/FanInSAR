@@ -75,9 +75,7 @@ def test_stack_dataset_preserves_missing_optional_coherence(
     try:
         dataset = StackInterferogramDataset.from_generation(store)
         assert dataset.coherence is None
-        np.testing.assert_array_equal(
-            dataset.valid_mask, np.ones((2, 3), dtype=bool)
-        )
+        np.testing.assert_array_equal(dataset.valid_mask, np.ones((2, 3), dtype=bool))
         assert store.read().coherence is None
     finally:
         store.close()
@@ -92,6 +90,13 @@ def test_unwrap_generation_round_trip_is_one_complete_pair_snapshot(
         tmp_path / "stack",
         pair_ids=("20240101_20240113",),
         products={"20240101_20240113": {"unwrapped_phase": phase}},
+        pair_bindings={
+            "20240101_20240113": {
+                "ifg_generation_id": "a" * 32,
+                "ifg_manifest_digest": "b" * 64,
+                "grid_identity": "c" * 64,
+            }
+        },
     )
     assert result.pair_ids == ("20240101_20240113",)
     result.close()
@@ -114,4 +119,23 @@ def test_unwrap_generation_rejects_missing_pair_result(tmp_path: Path) -> None:
             tmp_path / "stack",
             pair_ids=("20240101_20240113", "20240113_20240125"),
             products={"20240101_20240113": {"unwrapped_phase": np.zeros((2, 2))}},
+            pair_bindings={
+                pair_id: {
+                    "ifg_generation_id": "a" * 32,
+                    "ifg_manifest_digest": "b" * 64,
+                    "grid_identity": "c" * 64,
+                }
+                for pair_id in ("20240101_20240113", "20240113_20240125")
+            },
+        )
+
+
+def test_unwrap_generation_requires_exact_source_bindings(tmp_path: Path) -> None:
+    """A root unwrap snapshot cannot be published without IFG lineage."""
+    with pytest.raises(InvalidProcessingStateError, match="bindings"):
+        publish_unwrap_generation(
+            tmp_path / "stack",
+            pair_ids=("20240101_20240113",),
+            products={"20240101_20240113": {"unwrapped_phase": np.zeros((2, 2))}},
+            pair_bindings={},
         )

@@ -130,6 +130,7 @@ def _scene_array_shape(scene: object) -> tuple[int, ...] | None:
     except (TypeError, ValueError):
         return None
 
+
 _DEFAULT_PHASE_FILTER = GoldsteinWerner(alpha=0.5, patch_size=32)
 _DEFAULT_UNWRAPPER = SpatialIRLS()
 
@@ -2862,6 +2863,7 @@ class Stack(NetworkContract):
             view._product_index = self._network_product_index
             view.manifest = {"generation_id": self._network_generation_id}
             view.generation_root = self._root
+            view._timeseries = self.timeseries
         return self
 
     def _refresh_network_from_unwrap_generation(self, generation: Any) -> None:
@@ -2883,6 +2885,35 @@ class Stack(NetworkContract):
             index = self.network_product_index
         if index is None:
             reject_invalid_state("Stack unwrap refresh has no IFG Network products")
+        # The root unwrap snapshot is only admissible when every source binding
+        # still names the current IFG generation and exactly the same grid.
+        stores = self._pair_artifact_stores(
+            looks=self.config.multilook,
+            ifg_root=None,
+        )
+        try:
+            stores_by_pair = {
+                f"{store.pair[0]}_{store.pair[1]}": store for store in stores
+            }
+            if set(stores_by_pair) != set(generation.pair_ids):
+                reject_invalid_state(
+                    "Stack unwrap Pair network differs from current IFGs"
+                )
+            for pair_id in generation.pair_ids:
+                binding = generation.pair_bindings.get(pair_id)
+                store = stores_by_pair[pair_id]
+                if (
+                    not isinstance(binding, dict)
+                    or binding.get("ifg_generation_id") != store.generation_id
+                    or binding.get("ifg_manifest_digest") != store.manifest_digest
+                    or binding.get("grid_identity") != store.grid_identity
+                ):
+                    reject_invalid_state(
+                        f"Stack unwrap Pair {pair_id} is stale or not bound to its IFG"
+                    )
+        finally:
+            for store in stores:
+                store.close()
         dimensions = self.config.extra
         frame = str(dimensions.get("frame_id", "stack"))
         swath = str(dimensions.get("swath", "merged"))
@@ -3563,6 +3594,8 @@ class Stack(NetworkContract):
             device=device or self.config.invert_device,
             wavelength_m=wavelength_m,
         )
+        if self._network_view is not None:
+            self._network_view._timeseries = self.timeseries
         return self.timeseries
 
     def analyze_time_series(
@@ -3725,6 +3758,177 @@ class Stack(NetworkContract):
 
         return invert_ionosphere_dates(self, **kwargs)
 
+    def _publish_network_root(
+        self,
+        generation: StackResultGeneration,
+        stores: Sequence[InterferogramArtifactStore],
+    ) -> Path:
+        """Materialize the current Stack result as a canonical Network root.
+
+        The Network is a consumer-facing view of a completed Stack.  Its NPY
+        assets are hard-linked to the immutable Stack payloads when possible,
+        with a copy fallback for filesystems that do not support hard links.
+        This keeps the migration small while avoiding a second large raster
+        representation in the normal local-workspace case.
+        """
+        network_root = self.config.work_dir / "network"
+        interferograms_root = network_root / "interferograms"
+        generation_root = (
+            network_root / ".network_generations" / generation.generation_id
+        )
+        interferograms_root.mkdir(parents=True, exist_ok=True)
+        generation_root.mkdir(parents=True, exist_ok=True)
+
+        def publish_asset(
+            source: Path | None, target: Path, array: np.ndarray | None = None
+        ) -> str:
+            """Publish one asset and return its byte digest."""
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(f".{target.name}.tmp")
+            temporary.unlink(missing_ok=True)
+            if source is not None and source.is_file():
+                try:
+                    os.link(source, temporary)
+                except OSError:
+                    shutil.copy2(source, temporary)
+            elif array is not None:
+                with temporary.open("wb") as stream:
+                    np.save(stream, array, allow_pickle=False)
+            else:
+                reject_invalid_state(f"Network export asset is missing: {target.name}")
+            temporary.replace(target)
+            digest = hashlib.sha256()
+            with target.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        assets_by_pair: dict[str, list[str]] = {}
+        products: list[dict[str, Any]] = []
+        unwrap_generation = self._unwrap_generation
+        for store in stores:
+            pair_id = f"{store.pair[0]}_{store.pair[1]}"
+            pair_root = interferograms_root / pair_id
+            artifact = store.read()
+            source_assets: dict[str, tuple[Path | None, np.ndarray | None]] = {
+                "complex_ifg": (
+                    store.generation_root / "complex_ifg.npy",
+                    artifact.complex_ifg,
+                ),
+                "wrapped_phase": (
+                    store.generation_root / "wrapped_phase.npy",
+                    artifact.wrapped_phase,
+                ),
+                "amplitude": (
+                    store.generation_root / "amplitude.npy",
+                    artifact.amplitude,
+                ),
+                "coherence": (
+                    store.generation_root / "coherence.npy"
+                    if artifact.coherence is not None
+                    else None,
+                    artifact.coherence,
+                ),
+            }
+            if unwrap_generation is not None:
+                unwrapped_path = (
+                    unwrap_generation.generation_root / pair_id / "unwrapped_phase.npy"
+                )
+                source_assets["unw_phase"] = (unwrapped_path, None)
+            else:
+                unwrapped = store.read_unwrapped()
+                source_assets["unw_phase"] = (None, unwrapped.unwrapped_phase)
+
+            available: list[str] = []
+            for asset_name, (source, array) in source_assets.items():
+                if source is None and array is None:
+                    continue
+                target = pair_root / f"{asset_name}.npy"
+                digest = publish_asset(source, target, array)
+                available.append(asset_name)
+                product_kind = {
+                    "complex_ifg": AssetKind.COMPLEX_INTERFEROGRAM.value,
+                    "wrapped_phase": AssetKind.WRAPPED_PHASE.value,
+                    "amplitude": AssetKind.DISPLACEMENT.value,
+                    "coherence": AssetKind.DISPLACEMENT.value,
+                    "unw_phase": AssetKind.UNWRAPPED_PHASE.value,
+                }[asset_name]
+                lineage = [store.manifest_digest]
+                if asset_name == "unw_phase":
+                    lineage.append(
+                        unwrap_generation.manifest_digest
+                        if unwrap_generation is not None
+                        else store.manifest_digest
+                    )
+                products.append(
+                    {
+                        "id": f"{pair_id}:{asset_name}",
+                        "primary_id": store.pair[0],
+                        "secondary_id": store.pair[1],
+                        "product_kind": product_kind,
+                        "asset_location": f"interferograms/{pair_id}/{asset_name}.npy",
+                        "geometry_identity": store.grid_identity,
+                        "source_software": "faninsar",
+                        "phase_convention": (
+                            PhaseConvention.PRIMARY_MINUS_SECONDARY.value
+                        ),
+                        "content_digest": digest,
+                        "lineage": lineage,
+                    }
+                )
+            assets_by_pair[pair_id] = available
+
+        index = {
+            "type": "NetworkInterferogramIndex",
+            "version": "stack_artifact_v1",
+            "pair_count": len(assets_by_pair),
+            "pairs": list(assets_by_pair),
+            "assets_by_pair": assets_by_pair,
+            "common_grid": True,
+        }
+        (interferograms_root / "interferograms_index.json").write_text(
+            json.dumps(index, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+        unsigned = {
+            "schema_version": "network_v1",
+            "status": "complete",
+            "generation_id": generation.generation_id,
+            "index_type": "NetworkInterferogramIndex",
+            "phase_convention": PhaseConvention.PRIMARY_MINUS_SECONDARY.value,
+            "source_software": "faninsar",
+            "products": products,
+        }
+        manifest = {
+            **unsigned,
+            "manifest_digest": hashlib.sha256(
+                json.dumps(
+                    unsigned,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        encoded_manifest = json.dumps(manifest, sort_keys=True, indent=2) + "\n"
+        (generation_root / "manifest.json").write_text(
+            encoded_manifest, encoding="utf-8"
+        )
+        (network_root / "manifest.json").write_text(encoded_manifest, encoding="utf-8")
+        (network_root / "CURRENT").write_text(
+            json.dumps(
+                {
+                    "schema_version": "network_current_v1",
+                    "status": "complete",
+                    "generation_id": generation.generation_id,
+                    "manifest_digest": manifest["manifest_digest"],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return network_root
+
     def publish_generation(
         self,
         timeseries_root: str | Path,
@@ -3760,7 +3964,9 @@ class Stack(NetworkContract):
             ifg_root=ifg_root,
         )
         try:
-            self._qualified_unwrapped_artifacts(stores)
+            unwrap_generation = self._unwrap_generation
+            if unwrap_generation is None:
+                self._qualified_unwrapped_artifacts(stores)
             expected_pair_ids = tuple(
                 f"{primary}_{secondary}"
                 for primary, secondary in _iter_pair_dates(self.pairs)
@@ -3773,12 +3979,15 @@ class Stack(NetworkContract):
                 reject_invalid_state(
                     "Stack time-series result does not match the exact pair network"
                 )
-            return publish_stack_generation(
+            generation = publish_stack_generation(
                 self.config.work_dir,
                 expected_pair_ids=expected_pair_ids,
                 stores=stores,
                 timeseries_root=timeseries_root,
+                unwrap_generation=unwrap_generation,
             )
+            self._publish_network_root(generation, stores)
+            return generation
         finally:
             for store in stores:
                 store.close()

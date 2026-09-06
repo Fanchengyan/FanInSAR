@@ -473,12 +473,25 @@ class Network(NetworkContract):
             NetworkGeometry(geometry_root) if geometry_root.is_dir() else None
         )
         interferograms_root = resolved_root / "interferograms"
-        self._interferograms = InterferogramCollection(interferograms_root)
+        index_path = interferograms_root / "interferograms_index.json"
+        index_version = None
+        if index_path.is_file():
+            try:
+                index_version = json.loads(index_path.read_text()).get("version")
+            except (OSError, UnicodeError, ValueError, AttributeError):
+                index_version = None
+        if index_version == "stack_artifact_v1":
+            from faninsar.stack.network import StackInterferogramCollection
+
+            self._interferograms = StackInterferogramCollection(resolved_root)
+        else:
+            self._interferograms = InterferogramCollection(interferograms_root)
         timeseries_root = resolved_root / "timeseries"
         self._timeseries = (
             NetworkTimeSeries(timeseries_root) if timeseries_root.is_dir() else None
         )
         self._product_index: Any = None
+        self._network_generation_id = str(self.manifest["generation_id"])
         index = self.interferograms.index_metadata if self.interferograms else None
         if index is None:
             message = "Network interferograms have no canonical index"
@@ -489,7 +502,7 @@ class Network(NetworkContract):
             message = f"unknown Network index type {index_type!r}"
             logger.error(message)
             raise UnknownNetworkIndexTypeError(message)
-        if not self.interferograms.pairs().names:
+        if len(self.interferograms.pairs().names) == 0:
             message = "Network interferogram index contains no products"
             logger.error(message)
             raise IncompleteNetworkProductError(message)
@@ -720,16 +733,41 @@ class Network(NetworkContract):
             raise IncompleteNetworkProductError(message) from exc
         normalized_solver = solver.lower()
         if normalized_solver == "sbas":
-            from faninsar.timeseries.invert import SBAS
+            # Use the persisted processing result contract for the canonical
+            # path.  The lower-level historical solver returns four arrays;
+            # Network callers need one self-describing TimeSeriesResult.
+            from faninsar.processing.timeseries.inversion import (
+                invert_unwrapped_pairs,
+            )
 
-            return SBAS.solve(stack, **kwargs)
+            values = self.interferograms.open_stack("unw_phase", pairs=pairs)
+            pair_ids = [str(value) for value in values.coords["pair"].values]
+            pair_phases = {
+                pair_id: np.asarray(values.isel(pair=index).values)
+                for index, pair_id in enumerate(pair_ids)
+            }
+            result = invert_unwrapped_pairs(
+                pair_phases,
+                device=kwargs.pop("device", "cpu"),
+            )
+            return self._bind_analysis_revision(result)
         if normalized_solver == "nsbas":
             from faninsar.timeseries.invert import invert
 
-            return invert(stack, model=model, **kwargs)
+            result = invert(stack, model=model, **kwargs)
+            return self._bind_analysis_revision(result)
         message = f"unknown Network time-series solver {solver!r}"
         logger.exception(message)
         raise ValueError(message)
+
+    def _bind_analysis_revision(self, result: Any) -> Any:
+        """Attach this Network generation to a returned time-series result."""
+        revision = self.network_generation_id or str(self.manifest["generation_id"])
+        if hasattr(result, "revision_id"):
+            from dataclasses import replace
+
+            return replace(result, revision_id=revision)
+        return result
 
     def __repr__(self) -> str:
         """Return a concise Network summary."""

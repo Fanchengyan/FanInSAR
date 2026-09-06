@@ -42,8 +42,8 @@ class PairGenerationBinding:
     ----------
     pair_id : str
         Canonical ``primary_secondary`` pair identifier.
-    artifact_root : pathlib.Path
-        Pair transaction root inside the Stack work directory.
+    artifact_root, unwrap_artifact_root : pathlib.Path
+        IFG and root-unwrap transaction roots inside the Stack work directory.
     ifg_generation_id, unwrap_generation_id : str
         Exact immutable child generation identifiers.
     ifg_manifest_digest, unwrap_manifest_digest : str
@@ -53,6 +53,7 @@ class PairGenerationBinding:
 
     pair_id: str
     artifact_root: Path
+    unwrap_artifact_root: Path
     ifg_generation_id: str
     ifg_manifest_digest: str
     unwrap_generation_id: str
@@ -153,7 +154,7 @@ class UnwrapResultGeneration:
         self.close()
 
 
-def _read_manifest(path: Path, schema: str) -> dict[str, Any]:
+def _read_manifest(path: Path, schema: str | tuple[str, ...]) -> dict[str, Any]:
     """Read and self-verify one bounded immutable child manifest."""
     try:
         if (
@@ -172,7 +173,8 @@ def _read_manifest(path: Path, schema: str) -> dict[str, Any]:
     unsigned = dict(manifest)
     expected_digest = unsigned.pop("manifest_digest", None)
     if (
-        manifest.get("schema_version") != schema
+        manifest.get("schema_version")
+        not in ({schema} if isinstance(schema, str) else set(schema))
         or manifest.get("status") != "complete"
         or expected_digest != sha256_bytes(canonical_json(unsigned))
     ):
@@ -207,9 +209,9 @@ def _relative_artifact_root(stack_root: Path, artifact_root: Path) -> str:
         relative = artifact_root.absolute().relative_to(stack_root.absolute())
     except ValueError:
         reject_invalid_state("Stack child artifacts must be inside the Stack work root")
-    if not relative.parts or ".." in relative.parts:
+    if ".." in relative.parts:
         reject_invalid_state("Stack child artifact path is unsafe")
-    return relative.as_posix()
+    return relative.as_posix() if relative.parts else "."
 
 
 def _decode_relative_root(stack_root: Path, value: object) -> Path:
@@ -268,7 +270,7 @@ def publish_unwrap_generation(
     *,
     pair_ids: Sequence[str],
     products: Mapping[str, Mapping[str, object]],
-    pair_bindings: Mapping[str, Mapping[str, str]] | None = None,
+    pair_bindings: Mapping[str, Mapping[str, str]],
     mask_plan_identity: str = "",
     mask_identity: str | None = None,
 ) -> UnwrapResultGeneration:
@@ -282,7 +284,7 @@ def publish_unwrap_generation(
         Complete ordered Pair universe frozen by the Stack call.
     products : mapping[str, mapping[str, object]]
         Result layers for every Pair, stored below canonical Pair directories.
-    pair_bindings : mapping[str, mapping[str, str]], optional
+    pair_bindings : mapping[str, mapping[str, str]]
         Exact source IFG generation identity and grid metadata for each Pair.
         Stack publication supplies this binding so downstream stages can
         consume the root generation without reopening a legacy per-IFG unwrap.
@@ -319,30 +321,24 @@ def publish_unwrap_generation(
     if set(products) != set(ordered_pairs):
         reject_invalid_state("Stack unwrap generation Pair results are incomplete")
     bindings: dict[str, dict[str, str]] = {}
-    if pair_bindings is not None:
-        if set(pair_bindings) != set(ordered_pairs):
-            reject_invalid_state(
-                "Stack unwrap generation source bindings are incomplete"
-            )
-        for pair_id in ordered_pairs:
-            raw_binding = pair_bindings[pair_id]
-            if not isinstance(raw_binding, Mapping):
-                reject_invalid_state(
-                    "Stack unwrap generation source binding is invalid"
-                )
-            normalized_binding = {
-                str(key): str(value) for key, value in raw_binding.items()
-            }
-            required = {
-                "ifg_generation_id",
-                "ifg_manifest_digest",
-                "grid_identity",
-            }
-            if set(normalized_binding) != required:
-                reject_invalid_state(
-                    "Stack unwrap generation source binding is invalid"
-                )
-            bindings[pair_id] = normalized_binding
+    if set(pair_bindings) != set(ordered_pairs):
+        reject_invalid_state("Stack unwrap generation source bindings are incomplete")
+    required = {"ifg_generation_id", "ifg_manifest_digest", "grid_identity"}
+    for pair_id in ordered_pairs:
+        raw_binding = pair_bindings[pair_id]
+        if not isinstance(raw_binding, Mapping) or set(raw_binding) != required:
+            reject_invalid_state("Stack unwrap generation source binding is invalid")
+        if any(
+            not isinstance(value, str) or not value for value in raw_binding.values()
+        ):
+            reject_invalid_state("Stack unwrap generation source binding is invalid")
+        if (
+            not _is_lower_hex(raw_binding["ifg_generation_id"], 32)
+            or not _is_lower_hex(raw_binding["ifg_manifest_digest"], 64)
+            or not _is_lower_hex(raw_binding["grid_identity"], 64)
+        ):
+            reject_invalid_state("Stack unwrap generation source binding is invalid")
+        bindings[pair_id] = dict(raw_binding)
 
     normalized: dict[str, dict[str, np.ndarray]] = {}
     final_bytes = 1024
@@ -385,8 +381,7 @@ def publish_unwrap_generation(
                 "pair_id": pair_id,
                 "payloads": payloads,
             }
-            if pair_bindings is not None:
-                pair_manifest["source"] = bindings[pair_id]
+            pair_manifest["source"] = bindings[pair_id]
             manifest_pairs.append(pair_manifest)
         unsigned: dict[str, Any] = {
             "schema_version": UNWRAP_GENERATION_SCHEMA,
@@ -462,6 +457,26 @@ def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
         for pair_id, raw_pair in zip(pair_ids, raw_pairs, strict=True):
             if not isinstance(raw_pair, dict) or raw_pair.get("pair_id") != pair_id:
                 reject_invalid_state("Stack unwrap generation Pair order is invalid")
+            raw_source = raw_pair.get("source")
+            required_source = {
+                "ifg_generation_id",
+                "ifg_manifest_digest",
+                "grid_identity",
+            }
+            if (
+                not isinstance(raw_source, dict)
+                or set(raw_source) != required_source
+                or any(
+                    not isinstance(value, str) or not value
+                    for value in raw_source.values()
+                )
+                or not _is_lower_hex(raw_source["ifg_generation_id"], 32)
+                or not _is_lower_hex(raw_source["ifg_manifest_digest"], 64)
+                or not _is_lower_hex(raw_source["grid_identity"], 64)
+            ):
+                reject_invalid_state(
+                    "Stack unwrap generation source binding is invalid"
+                )
             raw_payloads = raw_pair.get("payloads")
             if not isinstance(raw_payloads, dict) or not raw_payloads:
                 reject_invalid_state("Stack unwrap generation payload table is empty")
@@ -512,9 +527,8 @@ def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
         pair_ids=pair_ids,
         products=products,
         pair_bindings={
-            pair_id: dict(raw_pair.get("source", {}))
+            pair_id: dict(raw_pair["source"])
             for pair_id, raw_pair in zip(pair_ids, raw_pairs, strict=True)
-            if isinstance(raw_pair, dict) and isinstance(raw_pair.get("source"), dict)
         },
         mask_plan_identity=str(manifest.get("mask_plan_identity", "")),
         mask_identity=manifest.get("mask_identity"),
@@ -579,6 +593,7 @@ def _pair_binding_payload(
     return {
         "pair_id": actual_pair_id,
         "artifact_root": _relative_artifact_root(stack_root, store.root),
+        "unwrap_artifact_root": _relative_artifact_root(stack_root, store.root),
         "ifg_generation_id": store.generation_id,
         "ifg_manifest_digest": store.manifest_digest,
         "unwrap_generation_id": unwrap_generation_id,
@@ -592,6 +607,7 @@ def publish_stack_generation(
     expected_pair_ids: Sequence[str],
     stores: Sequence[InterferogramArtifactStore],
     timeseries_root: str | Path,
+    unwrap_generation: UnwrapResultGeneration | None = None,
 ) -> StackResultGeneration:
     """Atomically publish one parent binding a complete derived Stack result set.
 
@@ -605,6 +621,9 @@ def publish_stack_generation(
         Pinned, validated current IFG generations for the pair network.
     timeseries_root : str or pathlib.Path
         Immutable time-series transaction root produced from the same network.
+    unwrap_generation : UnwrapResultGeneration, optional
+        Root Stack unwrap generation to bind when per-IFG unwrap artifacts are
+        not present.  When omitted, the per-IFG unwrap generation is used.
 
     Returns
     -------
@@ -618,10 +637,49 @@ def publish_stack_generation(
         reject_invalid_state("Stack generation requires unique expected pairs")
     if len(stores) != len(pair_ids):
         reject_invalid_state("Stack generation IFG set is incomplete")
-    pair_payloads = [
-        _pair_binding_payload(root, store, expected_pair_id)
-        for store, expected_pair_id in zip(stores, pair_ids, strict=True)
-    ]
+    if unwrap_generation is None:
+        pair_payloads = [
+            _pair_binding_payload(root, store, expected_pair_id)
+            for store, expected_pair_id in zip(stores, pair_ids, strict=True)
+        ]
+    else:
+        if unwrap_generation.pair_ids != pair_ids:
+            reject_invalid_state(
+                "Stack unwrap generation does not match the Pair network"
+            )
+        pair_payloads = []
+        for store, expected_pair_id in zip(stores, pair_ids, strict=True):
+            actual_pair_id = f"{store.pair[0]}_{store.pair[1]}"
+            if actual_pair_id != expected_pair_id:
+                reject_invalid_state(
+                    "Stack IFG pair order differs from the requested network"
+                )
+            binding = unwrap_generation.pair_bindings.get(expected_pair_id)
+            if binding is None:
+                reject_invalid_state(
+                    "Stack unwrap generation source bindings are incomplete"
+                )
+            if (
+                binding.get("ifg_generation_id") != store.generation_id
+                or binding.get("ifg_manifest_digest") != store.manifest_digest
+                or binding.get("grid_identity") != store.grid_identity
+            ):
+                reject_invalid_state(
+                    "Stack unwrap generation is not bound to its exact IFG"
+                )
+            pair_payloads.append(
+                {
+                    "pair_id": expected_pair_id,
+                    "artifact_root": _relative_artifact_root(root, store.root),
+                    "unwrap_artifact_root": _relative_artifact_root(
+                        root, unwrap_generation.root
+                    ),
+                    "ifg_generation_id": store.generation_id,
+                    "ifg_manifest_digest": store.manifest_digest,
+                    "unwrap_generation_id": unwrap_generation.generation_id,
+                    "unwrap_manifest_digest": unwrap_generation.manifest_digest,
+                }
+            )
     timeseries_path = Path(timeseries_root)
     relative_timeseries_root = _relative_artifact_root(root, timeseries_path)
     from faninsar.processing.timeseries.inversion import open_timeseries_zarr
@@ -691,6 +749,9 @@ def _decode_pair_bindings(
         if not isinstance(raw, dict) or raw.get("pair_id") != expected_pair_id:
             reject_invalid_state("Stack generation pair binding order is invalid")
         artifact_root = _decode_relative_root(stack_root, raw.get("artifact_root"))
+        unwrap_artifact_root = _decode_relative_root(
+            stack_root, raw.get("unwrap_artifact_root", raw.get("artifact_root"))
+        )
         ifg_generation_id = raw.get("ifg_generation_id")
         ifg_manifest_digest = raw.get("ifg_manifest_digest")
         unwrap_generation_id = raw.get("unwrap_generation_id")
@@ -710,35 +771,77 @@ def _decode_pair_bindings(
             "stack_ifg_artifact_v1",
         )
         unwrap_manifest = _read_manifest(
-            artifact_root
+            unwrap_artifact_root
             / ".unwrap_generations"
             / str(unwrap_generation_id)
             / "unwrap_manifest.json",
-            "stack_unwrap_artifact_v1",
+            ("stack_unwrap_artifact_v1", UNWRAP_GENERATION_SCHEMA),
         )
         if (
             ifg_manifest.get("generation_id") != ifg_generation_id
             or ifg_manifest.get("manifest_digest") != ifg_manifest_digest
             or unwrap_manifest.get("generation_id") != unwrap_generation_id
             or unwrap_manifest.get("manifest_digest") != unwrap_manifest_digest
-            or unwrap_manifest.get("ifg_generation_id") != ifg_generation_id
-            or unwrap_manifest.get("ifg_manifest_digest") != ifg_manifest_digest
+            or (
+                unwrap_manifest.get("schema_version") == "stack_unwrap_artifact_v1"
+                and (
+                    unwrap_manifest.get("ifg_generation_id") != ifg_generation_id
+                    or unwrap_manifest.get("ifg_manifest_digest") != ifg_manifest_digest
+                )
+            )
         ):
             reject_invalid_state("Stack pair child generation binding is invalid")
-        with InterferogramArtifactStore.open(artifact_root) as store:
+        if unwrap_manifest.get("schema_version") == UNWRAP_GENERATION_SCHEMA:
+            raw_root_pair_ids = unwrap_manifest.get("pair_ids")
+            raw_root_pairs = unwrap_manifest.get("pairs")
             if (
-                store.generation_id != ifg_generation_id
-                or store.manifest_digest != ifg_manifest_digest
+                raw_root_pair_ids != list(pair_ids)
+                or not isinstance(raw_root_pairs, list)
+                or len(raw_root_pairs) != len(pair_ids)
             ):
-                reject_invalid_state(
-                    "Stack pair CURRENT differs from the bound IFG generation"
-                )
-            store.read()
-            store.read_unwrapped()
+                reject_invalid_state("Stack root unwrap Pair network is invalid")
+            root_pair = next(
+                (
+                    item
+                    for item in raw_root_pairs
+                    if isinstance(item, dict)
+                    and item.get("pair_id") == expected_pair_id
+                ),
+                None,
+            )
+            source = root_pair.get("source") if isinstance(root_pair, dict) else None
+            if (
+                not isinstance(source, dict)
+                or source.get("ifg_generation_id") != ifg_generation_id
+                or source.get("ifg_manifest_digest") != ifg_manifest_digest
+                or source.get("grid_identity") != ifg_manifest.get("grid_identity")
+            ):
+                reject_invalid_state("Stack root unwrap binding is invalid")
+            with InterferogramArtifactStore.open(artifact_root) as store:
+                if (
+                    store.generation_id != ifg_generation_id
+                    or store.manifest_digest != ifg_manifest_digest
+                ):
+                    reject_invalid_state(
+                        "Stack pair CURRENT differs from the bound IFG generation"
+                    )
+                store.read()
+        else:
+            with InterferogramArtifactStore.open(artifact_root) as store:
+                if (
+                    store.generation_id != ifg_generation_id
+                    or store.manifest_digest != ifg_manifest_digest
+                ):
+                    reject_invalid_state(
+                        "Stack pair CURRENT differs from the bound IFG generation"
+                    )
+                store.read()
+                store.read_unwrapped()
         bindings.append(
             PairGenerationBinding(
                 pair_id=expected_pair_id,
                 artifact_root=artifact_root,
+                unwrap_artifact_root=unwrap_artifact_root,
                 ifg_generation_id=str(ifg_generation_id),
                 ifg_manifest_digest=str(ifg_manifest_digest),
                 unwrap_generation_id=str(unwrap_generation_id),

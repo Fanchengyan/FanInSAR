@@ -247,6 +247,7 @@ def test_coreg_resume_restores_burst_array_shape_from_samples(
         ),
         geometry=object(),
     )
+
     def restore_scene(*_args: object, **_kwargs: object) -> object:
         """Return a production-like scene with a BurstArray payload."""
         return scene
@@ -953,6 +954,69 @@ def test_stack_unwrap_publishes_durable_network_generation(tmp_path: Path) -> No
     stack.unwrap()
     assert stack.analysis_ready
     assert stack.network_product_index is not None
+
+
+def test_publish_generation_exports_canonical_network_view(tmp_path: Path) -> None:
+    """A completed Stack generation can be admitted through Network.open."""
+    from faninsar.network import Network
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phases = {
+        "20240101_20240113": np.full((3, 4), 0.2, dtype=np.float32),
+        "20240113_20240125": np.full((3, 4), 0.35, dtype=np.float32),
+        "20240101_20240125": np.full((3, 4), 0.55, dtype=np.float32),
+    }
+    for pair_id, phase in phases.items():
+        _write_pair_artifact(stack, pair_id, phase)
+    stack.unwrap()
+    timeseries_root = write_timeseries_zarr(
+        stack.invert_timeseries(), stack.config.work_dir / "timeseries.zarr"
+    )
+
+    generation = stack.publish_generation(timeseries_root)
+    try:
+        network = Network.open(stack.config.work_dir / "network")
+        assert network.manifest["generation_id"] == generation.generation_id
+        assert network.interferograms.open_stack("unw_phase").shape == (3, 3, 4)
+        result = network.analyze_time_series()
+        assert result.revision_id == generation.generation_id
+    finally:
+        generation.close()
+
+
+def test_refresh_rejects_root_unwrap_bound_to_stale_ifg(tmp_path: Path) -> None:
+    """Refreshing a root unwrap cannot silently mix IFG generations."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phase = np.full((3, 4), 0.2, dtype=np.float32)
+    _write_pair_artifact(stack, "20240101_20240113", phase)
+    _write_pair_artifact(stack, "20240113_20240125", phase)
+    _write_pair_artifact(stack, "20240101_20240125", phase)
+    stack.unwrap()
+    store = InterferogramArtifactStore.open(
+        stack.config.work_dir / "ifg/ml_1x1/20240101_20240113"
+    )
+    try:
+        artifact = store.read()
+        write_ifg_artifact(
+            store.root,
+            pair=store.pair,
+            looks=store.looks,
+            filter_name=store.filter_name,
+            filter_parameters=store.filter_parameters,
+            source_manifest_digests=store.source_manifest_digests,
+            grid_identity=store.grid_identity,
+            complex_ifg=artifact.complex_ifg * 1.0,
+            coherence=artifact.coherence,
+            wrapped_phase=artifact.wrapped_phase,
+            amplitude=artifact.amplitude,
+            replace_existing=True,
+        )
+    finally:
+        store.close()
+    with pytest.raises(InvalidProcessingStateError, match="stale"):
+        stack.refresh_unwrap_generation()
 
 
 def test_partial_unwrap_network_cannot_publish_stack_generation(tmp_path: Path) -> None:
