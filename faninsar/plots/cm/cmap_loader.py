@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+from matplotlib.colors import to_rgb
 
 from faninsar.logging import setup_logger
 
@@ -14,6 +15,7 @@ from .enhanced_colormap import EnhancedLinearSegmentedColormap
 logger = setup_logger(__name__)
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from os import PathLike
 
 
@@ -192,6 +194,67 @@ class ColormapLoader:
         return names
 
 
+class _InMemoryColormapLoader(ColormapLoader):
+    """Load built-in colormaps from immutable in-memory RGB samples."""
+
+    def __init__(self, colormap_data: Mapping[str, list[str] | np.ndarray]) -> None:
+        """Initialize an in-memory loader.
+
+        Parameters
+        ----------
+        colormap_data : Mapping[str, np.ndarray]
+            RGB samples keyed by their public colormap names.
+
+        """
+        super().__init__(Path("<built-in-colormaps>"))
+        self._colormap_data: dict[str, np.ndarray] = {}
+        for name, data in colormap_data.items():
+            data_array = np.asarray(data)
+            if data_array.ndim == 1:
+                rgb_data = np.asarray([to_rgb(color) for color in data_array])
+            else:
+                rgb_data = np.asarray(data, dtype=float)
+            self._colormap_data[name] = rgb_data.copy()
+        self._names = sorted(self._colormap_data)
+
+    def _load_colormap_data(self, name: str) -> np.ndarray:
+        """Return RGB samples for a built-in colormap."""
+        data = self._colormap_data.get(name)
+        if data is None:
+            msg = f"Built-in colormap not found: {name}"
+            logger.error(msg, stacklevel=2)
+            raise AttributeError(msg)
+        return data
+
+    @staticmethod
+    def _create_colormap(
+        name: str, data: np.ndarray
+    ) -> EnhancedLinearSegmentedColormap:
+        """Create a built-in map with the historical 100-sample resolution."""
+        return EnhancedLinearSegmentedColormap.from_list(name, data, N=100)
+
+    def _get_colormap(self, name: str) -> EnhancedLinearSegmentedColormap:
+        """Load built-in maps while reversing the original control points."""
+        if not name.endswith("_r"):
+            return super()._get_colormap(name)
+        if name in self._cache:
+            return self._cache[name]
+
+        base_name = name[:-2]
+        if base_name not in self.names:
+            msg = f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            logger.error(msg, stacklevel=2)
+            raise AttributeError(msg)
+        if base_name not in self._cache:
+            self._cache[base_name] = self._create_colormap(
+                base_name, self._colormap_data[base_name]
+            )
+        self._cache[name] = self._create_colormap(
+            name, self._colormap_data[base_name][::-1]
+        )
+        return self._cache[name]
+
+
 class Cmaps:
     """Unified colormap class providing access to all colormap collections.
 
@@ -233,9 +296,13 @@ class Cmaps:
         # Create a mapping of colormap names to their loaders
         self._colormap_map: dict[str, ColormapLoader] = {}
         for loader in self._loaders.values():
-            for cmap_name in loader.names:
-                self._colormap_map[cmap_name] = loader
-                self._colormap_map[f"{cmap_name}_r"] = loader
+            self._register_loader(loader)
+
+    def _register_loader(self, loader: ColormapLoader) -> None:
+        """Register a loader's names in the unified lookup table."""
+        for cmap_name in loader.names:
+            self._colormap_map[cmap_name] = loader
+            self._colormap_map[f"{cmap_name}_r"] = loader
 
     @property
     def GMT(self) -> ColormapLoader:  # noqa: N802
@@ -350,55 +417,29 @@ class Cmaps:
         return sorted(self._colormap_map.keys())
 
 
-# Create a global instance for direct access
+# Create a global instance for direct access and register project-specific maps.
 cmaps = Cmaps()
 
-
-# Define all custom colormaps immediately for guaranteed availability
-white = "0.95"
-
-# RdGyBu colormap
-colors = [
-    "#68011f",
-    "#bb2832",
-    "#e48066",
-    "#fbccb4",
-    "#ededed",
-    "#c2ddec",
-    "#6bacd1",
-    "#2a71b2",
-    "#0d3061",
-]
-RdGyBu = EnhancedLinearSegmentedColormap.from_list("RdGrBu", colors, N=100)
-RdGyBu_r = EnhancedLinearSegmentedColormap.from_list("RdGrBu_r", colors[::-1], N=100)
-
-# GnBu_RdPl colormap
-colors = ["#8f07ff", "#d5734a", white, "#0571b0", "#01ef6c"]
-GnBu_RdPl = EnhancedLinearSegmentedColormap.from_list("GnBu_RdPl", colors, N=100)
-GnBu_RdPl_r = EnhancedLinearSegmentedColormap.from_list(
-    "GnBu_RdPl_r", colors[::-1], N=100
-)
-
-# WtBuPl colormap
-colors = [white, "#0571b0", "#8f07ff", "#d5734a"]
-WtBuPl = EnhancedLinearSegmentedColormap.from_list("WtBuPl", colors, N=100)
-WtBuPl_r = EnhancedLinearSegmentedColormap.from_list("WtBuPl_r", colors[::-1], N=100)
-
-# WtBuGn colormap
-colors = [white, "#0571b0", "#01ef6c"]
-WtBuGn = EnhancedLinearSegmentedColormap.from_list("WtBuGn", colors, N=100)
-WtBuGn_r = EnhancedLinearSegmentedColormap.from_list("WtBuGn_r", colors[::-1], N=100)
-
-# WtRdPl colormap
-colors = [white, "#d5734a", "#8f07ff"]
-WtRdPl = EnhancedLinearSegmentedColormap.from_list("WtRdPl", colors, N=100)
-WtRdPl_r = EnhancedLinearSegmentedColormap.from_list("WtRdPl_r", colors[::-1], N=100)
-
-# WtHeatRed colormap
-colors = [white, "#fff7b3", "#fb9d59", "#aa0526"]
-WtHeatRed = EnhancedLinearSegmentedColormap.from_list("WtHeatRed", colors, N=100)
-WtHeatRed_r = EnhancedLinearSegmentedColormap.from_list(
-    "WtHeatRed_r", colors[::-1], N=100
-)
+_WHITE = "0.95"
+_BUILTIN_COLORMAPS = {
+    "RdGyBu": [
+        "#68011f",
+        "#bb2832",
+        "#e48066",
+        "#fbccb4",
+        "#ededed",
+        "#c2ddec",
+        "#6bacd1",
+        "#2a71b2",
+        "#0d3061",
+    ],
+    "GnBu_RdPl": ["#8f07ff", "#d5734a", _WHITE, "#0571b0", "#01ef6c"],
+    "WtBuPl": [_WHITE, "#0571b0", "#8f07ff", "#d5734a"],
+    "WtBuGn": [_WHITE, "#0571b0", "#01ef6c"],
+    "WtRdPl": [_WHITE, "#d5734a", "#8f07ff"],
+    "WtHeatRed": [_WHITE, "#fff7b3", "#fb9d59", "#aa0526"],
+}
+_builtin_loader = _InMemoryColormapLoader(_BUILTIN_COLORMAPS)
+cmaps._register_loader(_builtin_loader)
 
 names = cmaps.__all__.copy()

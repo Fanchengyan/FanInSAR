@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import matplotlib.colors as mcolors
+import numpy as np
 import pytest
 
 from faninsar.plots import cmaps
 from faninsar.plots.cm import Cmaps, ColormapLoader
+
+BUILTIN_NAMES = ("RdGyBu", "GnBu_RdPl", "WtBuPl", "WtBuGn", "WtRdPl", "WtHeatRed")
 
 
 def test_registry_is_the_single_public_colormap_entry_point() -> None:
@@ -54,6 +57,31 @@ def test_names_are_base_names_and_all_contains_reversed_aliases() -> None:
     assert "abyss" in cmaps.__all__
     assert "abyss_r" in cmaps.__all__
     assert "abyss" in dir(cmaps)
+
+
+@pytest.mark.parametrize("name", BUILTIN_NAMES)
+def test_builtin_colormap_is_registered_and_valid(name: str) -> None:
+    """Project-specific maps remain available through the unified registry."""
+    cmap = getattr(cmaps, name)
+
+    assert isinstance(cmap, mcolors.LinearSegmentedColormap)
+    assert cmap.N == 100
+    assert name in cmaps.names
+    assert name in cmaps.__all__
+    assert f"{name}_r" in cmaps.__all__
+    assert name in dir(cmaps)
+
+
+@pytest.mark.parametrize("name", BUILTIN_NAMES)
+def test_builtin_colormap_reverse_and_cache(name: str) -> None:
+    """Built-in maps use the same lazy reverse and caching contract."""
+    cmap = getattr(cmaps, name)
+    reversed_cmap = getattr(cmaps, f"{name}_r")
+
+    assert reversed_cmap is getattr(cmaps, f"{name}_r")
+    assert reversed_cmap is not cmap
+    endpoints = np.array([0.0, 1.0])
+    np.testing.assert_allclose(reversed_cmap(endpoints), cmap(endpoints[::-1]))
 
 
 def test_unknown_colormap_fails_with_attribute_error() -> None:
