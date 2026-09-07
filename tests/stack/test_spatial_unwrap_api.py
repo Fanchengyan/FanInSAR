@@ -14,6 +14,7 @@ from faninsar.missions.s1 import S1Stack
 from faninsar.processing.runtime import device as device_runtime
 from faninsar.processing.runtime.resources import ResourceAdmissionError, ResourceBudget
 from faninsar.processing.unwrapping.common import SpatialUnwrapper, SpatialUnwrapResult
+from faninsar.processing.unwrapping.snaphu_backend import Snaphu
 from faninsar.stack import Stack
 
 if TYPE_CHECKING:
@@ -81,9 +82,7 @@ def _stack_with_ifg(tmp_path: Path) -> Stack:
         wrapped_phase=phase,
         amplitude=np.ones_like(phase),
     )
-    stack.ifg_dirs = [
-        stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113"
-    ]
+    stack.ifg_dirs = [stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113"]
     return stack
 
 
@@ -99,6 +98,44 @@ def test_stack_unwrap_is_spatial_only_and_publishes_one_root_generation(
     assert stack.analysis_ready
     assert stack.network_product_index is not None
     assert len(stack.network_product_index.products) == 2
+
+
+def test_stack_unwrap_defaults_to_snaphu_without_running_external_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The default Stack strategy is SNAPHU and dispatch is explicit.
+
+    The external ``snaphu-py`` package is deliberately not needed for this
+    boundary test: the backend method is replaced after checking the default
+    instance type, while Stack still performs its normal orchestration.
+    """
+    import inspect
+
+    stack = _stack_with_ifg(tmp_path)
+    default = inspect.signature(Stack.unwrap).parameters["unwrapper"].default
+    assert isinstance(default, Snaphu)
+    dispatched: list[type[Snaphu]] = []
+
+    def fake_unwrap(
+        unwrapper: Snaphu,
+        wrapped_phase: torch.Tensor,
+        *,
+        coherence: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
+    ) -> SpatialUnwrapResult:
+        """Return a deterministic result without invoking external SNAPHU."""
+        dispatched.append(type(unwrapper))
+        return _IdentityUnwrapper().unwrap(
+            wrapped_phase,
+            coherence=coherence,
+            valid_mask=valid_mask,
+        )
+
+    monkeypatch.setattr(Snaphu, "unwrap", fake_unwrap)
+    stack.unwrap()
+
+    assert dispatched == [Snaphu]
 
 
 def test_stack_unwrap_accepts_concrete_device_for_generic_cuda_request(
@@ -150,9 +187,7 @@ def test_stack_network_exposes_its_interferogram_collection(tmp_path: Path) -> N
     network = stack.network
 
     assert network is not None
-    assert network.interferograms.pairs().to_names().tolist() == [
-        "20240101_20240113"
-    ]
+    assert network.interferograms.pairs().to_names().tolist() == ["20240101_20240113"]
     unwrapped = network.interferograms.open_stack("unw_phase")
     assert unwrapped.shape == (1, 2, 3)
     np.testing.assert_allclose(unwrapped.values[0], 0.2)

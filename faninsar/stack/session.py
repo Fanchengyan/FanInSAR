@@ -64,6 +64,7 @@ from faninsar.processing.interferometry.phase_filter import (
 )
 from faninsar.processing.unwrapping.errors import UnwrapFailedError
 from faninsar.processing.unwrapping.irls import SpatialIRLS
+from faninsar.processing.unwrapping.snaphu_backend import Snaphu
 from faninsar.stack.catalog import SceneCatalog
 from faninsar.stack.config import (
     ActivationMode,
@@ -129,7 +130,7 @@ def _scene_array_shape(scene: object) -> tuple[int, ...] | None:
 
 
 _DEFAULT_PHASE_FILTER = GoldsteinWerner(alpha=0.5, patch_size=32)
-_DEFAULT_UNWRAPPER = SpatialIRLS()
+_DEFAULT_UNWRAPPER = Snaphu()
 
 
 def _phase_filter_metadata(  # noqa: PLR0911
@@ -3002,11 +3003,14 @@ class Stack(NetworkContract):
 
         Parameters
         ----------
-        unwrapper : SpatialUnwrapper, default=SpatialIRLS()
-            Trusted runtime strategy for one pair.  The strategy receives
-            Torch tensors in ``(azimuth, range)`` order.  Its result must be a
-            same-shape, same-device :class:`SpatialUnwrapResult` whose valid
-            output is finite and is a subset of the Dataset support.
+        unwrapper : SpatialUnwrapper, default=Snaphu()
+            Trusted runtime strategy for one pair.  The default is the
+            production SNAPHU backend.  ``SpatialIRLS`` remains available as
+            an explicit developer/experimental strategy.  The strategy
+            receives Torch tensors in ``(azimuth, range)`` order.  Its result
+            must be a same-shape, same-device :class:`SpatialUnwrapResult`
+            whose valid output is finite and is a subset of the Dataset
+            support.
 
         Returns
         -------

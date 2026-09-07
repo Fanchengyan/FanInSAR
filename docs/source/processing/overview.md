@@ -6,7 +6,7 @@ Stack processing stages (explicit, not a black box):
 2. **DERAMP** — remove TOPS azimuth carrier  
 3. **COREG** — geometry coarse shift (orbits) + amplitude correlation refine + resample + reramp  
 4. **IFG** — complex interferogram, multilook, Goldstein filter  
-5. **UNWRAP** — clean-room IRLS  
+5. **UNWRAP** — SNAPHU (the default spatial unwrapper)
 6. **GEOCODE** — `rdr2geo` (+ DEM if provided) for unwrapped phase and coherence  
 7. **WRITE** — Zarr (radar layers + `geocoded/` group) and STAC item  
 
@@ -27,6 +27,15 @@ stack.coregister_scenes()
 stack.form_interferograms(multilook=(2, 8))
 stack.unwrap()
 result = stack.analyze_time_series()
+```
+
+`Stack.unwrap()` uses SNAPHU by default. The Torch-native `SpatialIRLS`
+backend remains available as an explicit developer/experimental strategy:
+
+```python
+from faninsar.processing.unwrapping import SpatialIRLS
+
+stack.unwrap(SpatialIRLS())
 ```
 
 For an existing interferogram collection, construct a path-based `Network`

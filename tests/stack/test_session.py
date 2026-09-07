@@ -27,6 +27,7 @@ from faninsar.processing.interferometry.pair import (
     goldstein_filter,
 )
 from faninsar.processing.mosaicking.grid import GeoGridSpec
+from faninsar.processing.unwrapping.irls import SpatialIRLS
 from faninsar.stack import Stack, StackConfig, StackSceneProvider
 from faninsar.stack.activation import LocalActivationAuthority
 from faninsar.stack.catalog import SceneCatalog
@@ -925,7 +926,7 @@ def test_stack_unwrap_loads_persisted_pair_artifacts(
     for pair_id, phase in phases.items():
         _write_pair_artifact(stack, pair_id, phase)
 
-    stack.unwrap()
+    stack.unwrap(SpatialIRLS())
     assert stack.analysis_ready
     index = stack.network_product_index
     assert index is not None
@@ -955,7 +956,7 @@ def test_stack_unwrap_publishes_durable_network_generation(tmp_path: Path) -> No
     }
     for pair_id, phase in phases.items():
         _write_pair_artifact(stack, pair_id, phase)
-    stack.unwrap()
+    stack.unwrap(SpatialIRLS())
     assert stack.analysis_ready
     assert stack.network_product_index is not None
 
@@ -1001,7 +1002,7 @@ def test_publish_generation_exports_canonical_network_view(tmp_path: Path) -> No
     }
     for pair_id, phase in phases.items():
         _write_pair_artifact(stack, pair_id, phase)
-    stack.unwrap()
+    stack.unwrap(SpatialIRLS())
     timeseries_root = write_timeseries_zarr(
         stack.invert_timeseries(), stack.config.work_dir / "timeseries.zarr"
     )
@@ -1037,7 +1038,7 @@ def test_network_revision_reads_its_own_generation_assets(tmp_path: Path) -> Non
         "20240101_20240125",
     ):
         _write_pair_artifact(stack, pair_id, phase)
-    stack.unwrap()
+    stack.unwrap(SpatialIRLS())
     timeseries_root = write_timeseries_zarr(
         stack.invert_timeseries(), stack.config.work_dir / "timeseries.zarr"
     )
@@ -1181,7 +1182,7 @@ def test_refresh_rejects_root_unwrap_bound_to_stale_ifg(tmp_path: Path) -> None:
     _write_pair_artifact(stack, "20240101_20240113", phase)
     _write_pair_artifact(stack, "20240113_20240125", phase)
     _write_pair_artifact(stack, "20240101_20240125", phase)
-    stack.unwrap()
+    stack.unwrap(SpatialIRLS())
     store = InterferogramArtifactStore.open(
         stack.config.work_dir / "ifg/ml_1x1/20240101_20240113"
     )
@@ -1284,7 +1285,7 @@ def test_scene_artifacts_flow_through_merge_and_spatial_unwrap(
         stack.coreg_paths[date_id] = root.parent
 
     stack.form_interferograms(multilook=(1, 1))
-    stack.unwrap()
+    stack.unwrap(SpatialIRLS())
     assert all((directory / "manifest.json").is_file() for directory in stack.ifg_dirs)
     assert stack.analysis_ready
 
@@ -1352,7 +1353,7 @@ def test_stack_unwrap_fails_closed_for_incomplete_pair_network(
     _write_pair_artifact(stack, "20240113_20240125", phase)
 
     with pytest.raises(InvalidProcessingStateError, match="pair set"):
-        stack.unwrap()
+        stack.unwrap(SpatialIRLS())
 
 
 def test_stack_unwrap_fails_closed_for_mixed_common_grids(tmp_path: Path) -> None:
@@ -1377,7 +1378,7 @@ def test_stack_unwrap_fails_closed_for_mixed_common_grids(tmp_path: Path) -> Non
     )
 
     with pytest.raises(InvalidProcessingStateError, match="common grid"):
-        stack.unwrap()
+        stack.unwrap(SpatialIRLS())
 
 
 def test_stack_invert_rejects_unqualified_unwrap_artifacts(tmp_path: Path) -> None:
