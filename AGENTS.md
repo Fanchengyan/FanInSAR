@@ -41,6 +41,15 @@ Proposal before formal implementation. Every change touching
 `faninsar/processing/geometry`, native sources, packaging, or the related CI
 must cite the governing Proposal IDs and run the relevant regression tests.
 
+## Waymark Workspace
+
+Waymark jobs for this repository must use the registered ProjectLink
+`workspace_root`. The current registration points to the separate Waymark
+application workspace directory at
+`/Users/fancy/Library/Application Support/Waymark/projects/FanInSAR-stac/workspaces`.
+Treat the ProjectLink configuration as the source of truth and resolve its
+current `workspace_root` before creating workspaces or large outputs.
+
 ## Build, Lint, and Test Commands
 
 ```bash
