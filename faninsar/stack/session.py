@@ -86,6 +86,11 @@ if TYPE_CHECKING:
         UnwrappedArtifact,
     )
     from faninsar.io.storage.stack_generation import StackResultGeneration
+    from faninsar.missions.s1.processing import (
+        BurstSelection,
+        CoregistrationGrid,
+        ProductionPairState,
+    )
     from faninsar.processing.geometry import DEM, GridSpec
     from faninsar.processing.geometry.prepared import (
         ActivationToken,
@@ -94,16 +99,11 @@ if TYPE_CHECKING:
     from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.runtime.resources import ResourceBudget
-    from faninsar.processing.stages import (
-        BurstSelection,
-        CoregistrationGrid,
-        ProductionPairState,
-    )
     from faninsar.processing.unwrapping.common import SpatialUnwrapper
     from faninsar.processing.unwrapping.quality import StackQualityCriteria
     from faninsar.processing.unwrapping.stack import SpatialExecutor, StackUnwrapResult
     from faninsar.stack.provider import StackSceneProvider
-    from faninsar.timeseries.results import TimeSeriesResult
+    from faninsar.timeseries.results import TimeSeries
 
 logger = setup_logger(__name__)
 
@@ -235,7 +235,7 @@ Polygons` wrapping the subtracted geometry when reshaped, or ``None``
 def _roi_to_geometry(roi: object) -> Any:
     """Convert a Stack ROI into one EPSG:4326 shapely geometry.
 
-    Mirrors ``faninsar.processing.stages._roi_geometry`` so the
+    Mirrors ``faninsar.missions.s1.processing._roi_geometry`` so the
     mask subtraction operates on exactly the geometry the burst-selection
     path consumes.
     """
@@ -792,7 +792,7 @@ class Stack(NetworkContract):
     coreg_paths: dict[str, Path] = field(default_factory=dict)
     pair_states: dict[str, ProductionPairState] = field(default_factory=dict)
     ifg_dirs: list[Path] = field(default_factory=list)
-    timeseries: TimeSeriesResult | None = None
+    timeseries: TimeSeries | None = None
     unwrap_result: StackUnwrapResult | None = None
     _prepared: bool = False
     _generation: StackResultGeneration | None = field(default=None, repr=False)
@@ -841,7 +841,7 @@ class Stack(NetworkContract):
             self._network_view is None
             or self._network_view.network_generation_id != self._network_generation_id
         ):
-            from faninsar.stack.network import StackInterferogramCollection
+            from faninsar.network.readers.stack import StackInterferogramCollection
 
             view = object.__new__(Network)
             view._root = self._root
@@ -970,32 +970,6 @@ class Stack(NetworkContract):
             vertical_datum="ellipsoidal",
             budget=self.config.resource_budget,
         )
-
-    @classmethod
-    def from_safes(
-        cls,
-        paths: Sequence[str | Path],
-        *,
-        reference: str | None = None,
-        **kwargs: Any,
-    ) -> Stack:
-        """Construct the concrete Sentinel-1 adapter from SAFE sources.
-
-        Raw-source discovery is an adapter concern.  Keeping this compatibility
-        spelling on ``Stack`` lets older callers migrate without giving the
-        mission-neutral session a production implementation of its own.
-        """
-        from faninsar.stack.s1 import S1Stack
-
-        if "master" in kwargs:
-            from faninsar.processing.errors import reject_pair_configuration
-
-            reject_pair_configuration(
-                "Stack.from_safes no longer accepts 'master'; use 'reference'"
-            )
-        if reference is not None:
-            kwargs["reference"] = reference
-        return S1Stack.from_safes(paths, **kwargs)
 
     @classmethod
     def _from_safes(
@@ -1657,7 +1631,7 @@ class Stack(NetworkContract):
         if not isinstance(source_path, str) or not source_path:
             reject_invalid_state("persisted radar projection context lacks source_path")
         try:
-            from faninsar.processing.stages import load_production_scene
+            from faninsar.missions.s1.processing import load_production_scene
 
             scene = load_production_scene(
                 source_path,
@@ -3232,7 +3206,15 @@ class Stack(NetworkContract):
                     _raise_unwrap_failed(
                         f"spatial unwrapper changed shape for Pair {pair_id}", result
                     )
-                if result.phase.device != device or result.valid_mask.device != device:
+                # Compare against the materialized input tensor rather than the
+                # requested device.  ``torch.device("cuda")`` and
+                # ``torch.device("cuda:0")`` are equivalent execution targets,
+                # but they are not equal values; tensors materialized from the
+                # former carry the latter as their concrete device identity.
+                if (
+                    result.phase.device != wrapped_phase.device
+                    or result.valid_mask.device != wrapped_phase.device
+                ):
                     _raise_unwrap_failed(
                         f"spatial unwrapper changed device for Pair {pair_id}", result
                     )
@@ -3516,7 +3498,7 @@ class Stack(NetworkContract):
         multilook: tuple[int, int] | None = None,
         ifg_root: str | Path | None = None,
         _artifact_stores: Sequence[InterferogramArtifactStore] | None = None,
-    ) -> TimeSeriesResult:
+    ) -> TimeSeries:
         """Invert persisted, temporally reconciled pair phases with SBAS.
 
         ``pair_phases`` remains available for backwards compatibility. When it
@@ -3601,7 +3583,7 @@ class Stack(NetworkContract):
         solver: str = "sbas",
         model: Any | None = None,
         **kwargs: Any,
-    ) -> TimeSeriesResult:
+    ) -> TimeSeries:
         """Analyze the Stack's inherited Network products after unwrapping.
 
         ``Stack`` owns the SLC-to-interferogram lifecycle.  Once the unwrap
@@ -3620,7 +3602,7 @@ class Stack(NetworkContract):
 
         Returns
         -------
-        TimeSeriesResult
+        TimeSeries
             Inverted per-date time series.
 
         Raises
@@ -3650,7 +3632,7 @@ class Stack(NetworkContract):
         *,
         generation_id: str,
         **kwargs: Any,
-    ) -> TimeSeriesResult:
+    ) -> TimeSeries:
         """Run Stack's existing inversion after Network generation admission."""
         # Keep the IFG generation pinned for the complete analysis call.  The
         # solver reads the unwrap payloads before doing its numerical solve;
@@ -3716,13 +3698,13 @@ class Stack(NetworkContract):
         """Estimate per-pair ionospheric screens (PROPOSAL-0036).
 
         See
-        :func:`faninsar.stack.stack_api.estimate_ionosphere`
+        :func:`faninsar.stack.analysis.estimate_ionosphere`
         for the full parameter contract.
 
         The explicit ``ionosphere`` mask stage feeds the estimator's existing
         ``valid_mask`` seam unless the caller supplies one.
         """
-        from faninsar.stack.stack_api import estimate_ionosphere
+        from faninsar.stack.analysis import estimate_ionosphere
 
         if (
             self.config.mask_plan.references("ionosphere")
@@ -3737,10 +3719,10 @@ class Stack(NetworkContract):
         """Subtract qualified ion screens from unwrapped pair phases.
 
         See
-        :func:`faninsar.stack.stack_api.apply_ionosphere_correction`
+        :func:`faninsar.stack.analysis.apply_ionosphere_correction`
         for the full parameter contract.
         """
-        from faninsar.stack.stack_api import apply_ionosphere_correction
+        from faninsar.stack.analysis import apply_ionosphere_correction
 
         return apply_ionosphere_correction(self, **kwargs)
 
@@ -3748,10 +3730,10 @@ class Stack(NetworkContract):
         """Invert published pair ion screens into per-date screens.
 
         See
-        :func:`faninsar.stack.stack_api.invert_ionosphere_dates`
+        :func:`faninsar.stack.analysis.invert_ionosphere_dates`
         for the full parameter contract.
         """
-        from faninsar.stack.stack_api import invert_ionosphere_dates
+        from faninsar.stack.analysis import invert_ionosphere_dates
 
         return invert_ionosphere_dates(self, **kwargs)
 

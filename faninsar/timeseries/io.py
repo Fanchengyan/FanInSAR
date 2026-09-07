@@ -22,7 +22,7 @@ from faninsar.io.storage.artifact_transaction import (
 )
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.timeseries.results import TimeSeriesResult
+from faninsar.timeseries.results import TimeSeries
 
 logger = setup_logger(__name__)
 
@@ -138,7 +138,7 @@ def invert_unwrapped_pairs(
     device: str | None = "cpu",
     gamma: float = 1e-4,
     wavelength_m: float | None = None,
-) -> TimeSeriesResult:
+) -> TimeSeries:
     """Invert a redundant unwrapped pair network with SBAS (no model term).
 
     Parameters
@@ -157,7 +157,7 @@ def invert_unwrapped_pairs(
 
     Returns
     -------
-    TimeSeriesResult
+    TimeSeries
         Incremental and cumulative phase, plus optional LOS displacement, on
         the pair grid. Pixels without a connected finite pair subnetwork are
         masked with ``NaN`` in every time-series epoch.
@@ -230,12 +230,12 @@ def invert_unwrapped_pairs(
         int(np.count_nonzero(valid_pixels)),
         n_pixels,
     )
-    return TimeSeriesResult(
+    return TimeSeries(
         pair_ids=pair_ids,
         dates=dates,
-        increments=increments,
-        residual_pairs=residual,
-        cumulative=cumulative,
+        phase_increments_rad=increments,
+        residual_phase_pairs_rad=residual,
+        phase_cumulative_rad=cumulative,
         metadata={
             "method": "sbas",
             "device": str(device),
@@ -263,15 +263,12 @@ def _digest_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _timeseries_arrays(result: TimeSeriesResult) -> dict[str, np.ndarray]:
-    """Return the explicit and legacy arrays in one publication."""
+def _timeseries_arrays(result: TimeSeries) -> dict[str, np.ndarray]:
+    """Return scientific arrays using their stable storage dataset names."""
     arrays = {
-        "phase_increments_rad": result.phase_increments_rad,
-        "phase_cumulative_rad": result.phase_cumulative_rad,
-        "residual_phase_pairs_rad": result.residual_phase_pairs_rad,
-        "increments": result.increments,
-        "cumulative": result.cumulative,
-        "residual_pairs": result.residual_pairs,
+        "increments": result.phase_increments_rad,
+        "cumulative": result.phase_cumulative_rad,
+        "residual_pairs": result.residual_phase_pairs_rad,
     }
     if result.displacement_increments_m is not None:
         arrays["displacement_increments_m"] = result.displacement_increments_m
@@ -387,7 +384,7 @@ def open_timeseries_zarr(store_path: str | Path) -> TimeSeriesZarrStore:
 
 
 def write_timeseries_zarr(
-    result: TimeSeriesResult,
+    result: TimeSeries,
     store_path: str | Path,
     *,
     resource_limits: ArtifactResourceLimits | None = None,

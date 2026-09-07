@@ -18,7 +18,7 @@ from faninsar.timeseries.models import (
     QuadraticModel,
     TimeSeriesModels,
 )
-from faninsar.timeseries.results import TimeSeriesResult, invert_unwrapped_pairs
+from faninsar.timeseries.results import TimeSeries, invert_unwrapped_pairs
 from faninsar.timeseries.solver import (
     NSBASSolver,
     batch_lstsq,
@@ -50,8 +50,8 @@ __all__ = [
     "NSBASSolver",
     "QuadraticModel",
     "ReferencePointsUncertainty",
+    "TimeSeries",
     "TimeSeriesModels",
-    "TimeSeriesResult",
     "TimeSeriesZarrStore",
     "Uncertainty",
     "UncertaintyPropagation",

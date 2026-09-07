@@ -26,6 +26,7 @@ from .metadata import (
     GeometryAssetName,
     InterferogramAssetName,
 )
+from .stack import StackInterferogramCollection
 from .timeseries import NetworkTimeSeries
 
 __all__ = [
@@ -45,4 +46,5 @@ __all__ = [
     "NetworkProductError",
     "NetworkTimeSeries",
     "PairNotFoundError",
+    "StackInterferogramCollection",
 ]

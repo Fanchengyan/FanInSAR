@@ -20,22 +20,22 @@ import numpy as np
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.logging import setup_logger
 from faninsar.missions.base import Sensor, register
-from faninsar.processing.coordinates import (
-    ArrayDescriptor,
-    ArrayRepresentation,
-    RadarGrid,
-)
-from faninsar.processing.errors import InvalidProcessingStateError
-from faninsar.processing.interferometry.products import (
-    CalibrationState,
-    CarrierState,
-    CoregistrationState,
-)
-from faninsar.processing.readers import (
+from faninsar.missions.protocols import (
     DopplerCentroidPolynomial,
     SLCReadResult,
     ValidSampleMask,
     normalize_selection,
+)
+from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.processing.geometry.coordinates import (
+    ArrayDescriptor,
+    ArrayRepresentation,
+    RadarGrid,
+)
+from faninsar.processing.interferometry.products import (
+    CalibrationState,
+    CarrierState,
+    CoregistrationState,
 )
 from faninsar.processing.slc.products import SLCProduct
 

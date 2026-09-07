@@ -40,9 +40,9 @@ def test_stack_config_does_not_accept_legacy_mask_options() -> None:
         _load_config({"water_mask": True})
 
 
-def test_processing_pipeline_hides_removed_pair_entry_points() -> None:
-    """Removed execution callables are absent from the public pipeline."""
-    from faninsar.processing import stages
+def test_s1_processing_hides_removed_pair_entry_points() -> None:
+    """Removed execution callables are absent from S1 processing."""
+    from faninsar.missions.s1 import processing as stages
 
     for name in (
         "run_pair",

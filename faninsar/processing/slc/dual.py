@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.coordinates import CoordinateSystem, GeoGrid, RadarGrid
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import (
     DEM,
@@ -17,6 +16,11 @@ from faninsar.processing.geometry import (
     TransformCacheKey,
     read_transform_cache,
     write_transform_cache,
+)
+from faninsar.processing.geometry.coordinates import (
+    CoordinateSystem,
+    GeoGrid,
+    RadarGrid,
 )
 from faninsar.processing.geometry.prepare_production import run_geo2rdr, run_rdr2geo
 

@@ -15,6 +15,10 @@ from faninsar.processing.runtime.resources import ResourceBudget
 from faninsar.stack.mask_plan import MaskPlan
 
 if TYPE_CHECKING:
+    from faninsar.missions.s1.processing import (
+        BurstSelection,
+        CoregistrationGrid,
+    )
     from faninsar.processing.geometry import DEM, GridSpec
     from faninsar.processing.geometry.prepared import (
         ActivationToken,
@@ -23,10 +27,6 @@ if TYPE_CHECKING:
     from faninsar.processing.mosaicking.grid import GeoGridSpec
     from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.runtime.protocols import ComputeBackend
-    from faninsar.processing.stages import (
-        BurstSelection,
-        CoregistrationGrid,
-    )
 
 CoregMode = Literal["geometry", "pair", "network"]
 EsdMethod = Literal["auto", "splitband", "overlap"]

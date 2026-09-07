@@ -15,11 +15,11 @@ from faninsar.processing.interferometry.products import (
     CoregistrationState,
 )
 from faninsar.processing.slc.products import SLCProduct
-from faninsar.processing.coordinates import (
+from faninsar.processing.geometry.coordinates import (
     ArrayDescriptor,
     ArrayRepresentation,
 )
-from faninsar.processing.coordinates import GeoGrid, RadarGrid
+from faninsar.processing.geometry.coordinates import GeoGrid, RadarGrid
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.slc import RadarSLC, choose_processing_grid
 from faninsar.processing.slc.dual import _radar_to_geo_resample

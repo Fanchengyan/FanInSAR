@@ -12,8 +12,8 @@ from faninsar.io.storage.arrays import (
     ChunkedZarrArrayStore,
     InMemoryArrayStore,
 )
-from faninsar.processing.readers import MissingCriticalMetadataError
-from faninsar.processing.synthetic_slc import (
+from faninsar.missions.protocols import MissingCriticalMetadataError
+from faninsar.missions.s1.synthetic_slc import (
     SyntheticSLCReader,
     register_specs,
     write_synthetic_slc,

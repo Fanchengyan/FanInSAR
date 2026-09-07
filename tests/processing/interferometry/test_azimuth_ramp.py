@@ -12,7 +12,7 @@ from faninsar.processing.interferometry.flatten import (
     estimate_residual_azimuth_ramp,
     remove_azimuth_phase_ramp,
 )
-from faninsar.processing.stages import stage_flatten
+from faninsar.missions.s1.processing import stage_flatten
 
 
 def _scalar_numpy_oracle(

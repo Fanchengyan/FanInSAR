@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from faninsar.core.orbit import OrbitMetadata
-    from faninsar.processing.readers import (
+    from faninsar.missions.protocols import (
         DopplerCentroidPolynomial,
         ValidSampleMask,
     )
@@ -34,7 +34,7 @@ class S1Burst:
     @property
     def valid_samples(self) -> ValidSampleMask:
         """Return valid-sample windows as a processing contract object."""
-        from faninsar.processing.readers import ValidSampleMask
+        from faninsar.missions.protocols import ValidSampleMask
 
         return ValidSampleMask(
             first_valid_sample=self.first_valid_sample,

@@ -8,8 +8,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.coordinates import ArrayDescriptor, ArrayRepresentation
-from faninsar.processing.readers import normalize_selection
+from faninsar.missions.protocols import normalize_selection
+from faninsar.processing.geometry.coordinates import (
+    ArrayDescriptor,
+    ArrayRepresentation,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

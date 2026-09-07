@@ -39,16 +39,8 @@ def _has_prefix(imports: set[str], prefix: str) -> bool:
 
 
 def test_core_does_not_import_missions_processing_timeseries_io_compute() -> None:
-    """core must stay free of heavy package dependencies.
-
-    Note: ``core.frame`` may late-import datasets for the Frame façade; the
-    static scan allows datasets but forbids missions/processing/timeseries/io/compute
-    at module top level of physical.py and pair modules.
-    """
-    # Scan only physical.py which must be pure
+    """Core physical values must stay free of heavy package dependencies."""
     physical = ROOT / "core" / "physical.py"
-    imports = _imports_in(physical.parent)
-    # physical.py alone
     text = physical.read_text(encoding="utf-8")
     tree = ast.parse(text)
     pure_imports: set[str] = set()
@@ -68,17 +60,31 @@ def test_core_does_not_import_missions_processing_timeseries_io_compute() -> Non
         assert not _has_prefix(pure_imports, prefix), pure_imports
 
 
-def test_processing_stages_do_not_import_missions() -> None:
-    stages = ROOT / "processing" / "stages"
-    imports = _imports_in(stages)
-    assert not _has_prefix(imports, "faninsar.missions")
-    assert not _has_prefix(imports, "faninsar.sentinel1")
+def test_retired_processing_stages_are_absent() -> None:
+    """The retired generic processing aggregate is no longer importable."""
+    import importlib.util
+
+    retired = (
+        "faninsar.processing.stages",
+        "faninsar.stack.s1",
+        "faninsar.stack.nisar",
+        "faninsar.stack.nisar_provider",
+        "faninsar.stack.stack_api",
+        "faninsar.stack.network",
+        "faninsar.processing.coordinates",
+        "faninsar.processing.readers",
+        "faninsar.processing.synthetic_slc",
+        "faninsar.data.datasets.geobox",
+    )
+    assert all(importlib.util.find_spec(name) is None for name in retired)
 
 
 def test_timeseries_does_not_import_missions() -> None:
+    """Time-series algorithms must remain mission-neutral."""
     imports = _imports_in(ROOT / "timeseries")
     assert not _has_prefix(imports, "faninsar.missions")
 
 
 def test_public_all_cap() -> None:
+    """The root API stays intentionally small."""
     assert len(faninsar.__all__) <= 20

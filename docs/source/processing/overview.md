@@ -13,7 +13,7 @@ Stack processing stages (explicit, not a black box):
 ## Stack API
 
 ```python
-from faninsar import S1Stack
+from faninsar.missions import S1Stack
 
 stack = S1Stack.from_safes(
     ["acquisitions/20240101.SAFE", "acquisitions/20240113.SAFE"],
@@ -30,5 +30,5 @@ result = stack.analyze_time_series()
 ```
 
 For an existing interferogram collection, construct a path-based `Network`
-adapter instead. `Network` opens its Dataset products internally and exposes
+instance instead. `Network` opens its persisted products internally and exposes
 the same time-series analysis seam; it does not read SAFE/RSLC sources.

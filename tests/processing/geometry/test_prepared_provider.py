@@ -419,7 +419,7 @@ def test_local_provider_decodes_geo_lut_with_explicit_crop_origin(
 ) -> None:
     """A prepared LUT read preserves grid identity and crop coordinates."""
     from faninsar.processing.mosaicking.grid import GeoGridSpec
-    from faninsar.processing.stages import read_prepared_lut
+    from faninsar.missions.s1.processing import read_prepared_lut
 
     grid = GeoGridSpec(
         crs="EPSG:32633",

@@ -12,12 +12,12 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.coordinates import (
+from faninsar.processing.errors import reject_grid_mismatch, reject_invalid_state
+from faninsar.processing.geometry.coordinates import (
     ArrayDescriptor,
     ArrayRepresentation,
     ProcessingGrid,
 )
-from faninsar.processing.errors import reject_grid_mismatch, reject_invalid_state
 
 if TYPE_CHECKING:
     from faninsar.processing.slc.products import SLCProduct

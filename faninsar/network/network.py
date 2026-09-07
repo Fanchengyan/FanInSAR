@@ -4,8 +4,8 @@
 manifest, a complete immutable generation, and the canonical interferogram
 index type. Existing geometry, interferogram, and time-series Dataset
 components are reused internally; they do not define the Network lifecycle.
-External processor names are declaration-only adapters in this MVP; they do
-not probe or infer unrelated processor layouts.
+External processor layouts are admitted through registered readers rather
+than a parallel hierarchy of processor-named Network classes.
 """
 
 from __future__ import annotations
@@ -99,16 +99,6 @@ class LegacyNetworkLayoutError(NetworkConstructionError):
             f"Legacy InSAR network layout under {root}: {marker_text}. "
             "Publish a canonical versioned Network generation first."
         )
-
-
-class ExternalNetworkLayoutError(NetworkConstructionError):
-    """Raised when a processor adapter lacks an explicit layout declaration."""
-
-
-# Compatibility aliases for callers that used the first Network seam.
-NetworkLayoutError = LegacyNetworkLayoutError
-LegacyLayoutError = LegacyNetworkLayoutError
-IncompleteNetworkError = IncompleteNetworkProductError
 
 
 def _legacy_markers(root: Path) -> tuple[Path, ...]:
@@ -579,7 +569,7 @@ class Network(NetworkContract):
             except (OSError, UnicodeError, ValueError, AttributeError):
                 index_version = None
         if index_version == "stack_artifact_v1":
-            from faninsar.stack.network import StackInterferogramCollection
+            from faninsar.network.readers.stack import StackInterferogramCollection
 
             self._interferograms = StackInterferogramCollection(
                 interferograms_root.parent
@@ -835,7 +825,7 @@ class Network(NetworkContract):
         if normalized_solver == "sbas":
             # Use the persisted processing result contract for the canonical
             # path.  The lower-level historical solver returns four arrays;
-            # Network callers need one self-describing TimeSeriesResult.
+            # Network callers need one self-describing TimeSeries.
             from faninsar.timeseries.results import (
                 invert_unwrapped_pairs,
             )
@@ -859,7 +849,7 @@ class Network(NetworkContract):
                 message = "NSBAS solver returned an invalid result"
                 logger.error(message)
                 raise NetworkAnalysisError(message)
-            from faninsar.timeseries.results import TimeSeriesResult
+            from faninsar.timeseries.results import TimeSeries
 
             increments, _parameters, residual_pairs, _residual_model = raw
             increments_array = np.asarray(increments, dtype=np.float32)
@@ -881,14 +871,14 @@ class Network(NetworkContract):
                 ],
                 axis=0,
             )
-            result = TimeSeriesResult(
+            result = TimeSeries(
                 pair_ids=tuple(str(name) for name in stack.pairs.names),
                 dates=tuple(
                     str(date.date()).replace("-", "") for date in stack.pairs.dates
                 ),
-                increments=increments_array,
-                residual_pairs=residual_array,
-                cumulative=cumulative_array,
+                phase_increments_rad=increments_array,
+                residual_phase_pairs_rad=residual_array,
+                phase_cumulative_rad=cumulative_array,
                 metadata={"method": "nsbas", "n_pairs": len(stack.pairs)},
             )
             return self._bind_analysis_revision(result)
@@ -914,83 +904,23 @@ class Network(NetworkContract):
         )
 
 
-class _DeclaredProcessorNetwork(Network):
-    """Network adapter whose processor identity is an explicit manifest marker."""
-
-    processor_marker: str
-
-    def __init__(self, root: str | PathLike[str]) -> None:
-        """Mount only when ``source_software`` declares this processor."""
-        path = Path(root)
-        if not path.exists() or not path.is_dir():
-            super().__init__(path)
-        manifest = _read_manifest(path / NETWORK_MANIFEST_NAME)
-        if manifest.get("source_software") != self.processor_marker:
-            message = (
-                f"{type(self).__name__} requires manifest source_software="
-                f"{self.processor_marker!r}; no format discovery is performed"
-            )
-            logger.error(message)
-            raise ExternalNetworkLayoutError(message)
-        super().__init__(path)
-
-
-class ISCE2Network(_DeclaredProcessorNetwork):
-    """Canonical Network explicitly declared as authored by ISCE2."""
-
-    processor_marker = "isce2"
-
-
-class ISCE3Network(_DeclaredProcessorNetwork):
-    """Canonical Network explicitly declared as authored by ISCE3."""
-
-    processor_marker = "isce3"
-
-
-class GAMMANetwork(_DeclaredProcessorNetwork):
-    """Canonical Network explicitly declared as authored by GAMMA."""
-
-    processor_marker = "gamma"
-
-
-class GMTSARNetwork(_DeclaredProcessorNetwork):
-    """Canonical Network explicitly declared as authored by GMTSAR."""
-
-    processor_marker = "gmtsar"
-
-
-class SNAPNetwork(_DeclaredProcessorNetwork):
-    """Canonical Network explicitly declared as authored by SNAP."""
-
-    processor_marker = "snap"
-
-
 # Keep one process-wide default registry on the canonical data-backed class.
-# The import is intentionally after class definitions so importing this legacy
-# compatibility module cannot trigger a cycle through ``faninsar.network``.
+# The import is intentionally after the class definition to avoid a cycle
+# through ``faninsar.network``.
 from faninsar.network.registry import ReaderRegistry  # noqa: E402
 
 Network.readers = ReaderRegistry()
 
 
 __all__ = [
-    "ExternalNetworkLayoutError",
-    "GAMMANetwork",
-    "GMTSARNetwork",
-    "ISCE2Network",
-    "ISCE3Network",
-    "IncompleteNetworkError",
     "IncompleteNetworkProductError",
-    "LegacyLayoutError",
     "LegacyNetworkLayoutError",
     "Network",
     "NetworkAnalysisError",
     "NetworkConstructionError",
     "NetworkCurrentError",
     "NetworkGenerationError",
-    "NetworkLayoutError",
     "NetworkManifestError",
     "NetworkPathError",
-    "SNAPNetwork",
     "UnknownNetworkIndexTypeError",
 ]

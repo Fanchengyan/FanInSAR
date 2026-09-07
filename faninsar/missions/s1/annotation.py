@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.logging import setup_logger
-from faninsar.processing.readers import DopplerCentroidPolynomial
+from faninsar.missions.protocols import DopplerCentroidPolynomial
 
 from .errors import reject_product
 from .types import S1Burst, S1Swath

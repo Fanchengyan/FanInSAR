@@ -5,7 +5,7 @@ from __future__ import annotations
 import collections.abc  # noqa: TC003
 from typing import Protocol, TypeVar
 
-from faninsar.processing import coordinates  # noqa: TC001
+from faninsar.processing.geometry import coordinates  # noqa: TC001
 
 ReadValueT_co = TypeVar("ReadValueT_co", covariant=True)
 WriteValueT_contra = TypeVar("WriteValueT_contra", contravariant=True)

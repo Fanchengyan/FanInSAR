@@ -5,13 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from faninsar.processing.coordinates import (
+from faninsar.processing.errors import reject_grid_mismatch, reject_invalid_state
+from faninsar.processing.geometry.coordinates import (
     ArrayDescriptor,
     ArrayRepresentation,
     CoordinateSystem,
     ProcessingGrid,
 )
-from faninsar.processing.errors import reject_grid_mismatch, reject_invalid_state
 from faninsar.processing.interferometry.products import (
     CalibrationState,
     CarrierState,

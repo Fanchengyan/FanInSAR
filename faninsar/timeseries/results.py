@@ -14,7 +14,7 @@ logger = setup_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class TimeSeriesResult:
+class TimeSeries:
     """Phase time series and optional LOS displacement from SBAS.
 
     Attributes
@@ -23,16 +23,13 @@ class TimeSeriesResult:
         Pair identifiers aligned with ``residual_phase_pairs_rad``.
     dates : tuple[str, ...]
         Acquisition dates aligned with ``phase_cumulative_rad``.
-    increments : numpy.ndarray
-        Incremental phase in radians between consecutive dates. Prefer the
-        explicit ``phase_increments_rad`` property in new code.
-    residual_pairs : numpy.ndarray
+    phase_increments_rad : numpy.ndarray
+        Incremental phase in radians between consecutive dates.
+    residual_phase_pairs_rad : numpy.ndarray
         Pair residual phase in radians. Missing observations and pixels whose
-        finite pair subnetwork is rank deficient are ``NaN``. Prefer the
-        explicit ``residual_phase_pairs_rad`` property in new code.
-    cumulative : numpy.ndarray
-        Cumulative phase in radians, referenced to the first date. Prefer the
-        explicit ``phase_cumulative_rad`` property in new code.
+        finite pair subnetwork is rank deficient are ``NaN``.
+    phase_cumulative_rad : numpy.ndarray
+        Cumulative phase in radians, referenced to the first date.
     displacement_increments_m : numpy.ndarray or None
         Incremental LOS displacement in metres when a wavelength was supplied.
     displacement_cumulative_m : numpy.ndarray or None
@@ -40,18 +37,13 @@ class TimeSeriesResult:
     metadata : dict[str, Any]
         Product semantics and inversion diagnostics.
 
-    Notes
-    -----
-    The legacy field names are retained so existing callers can still construct
-    and consume the result. Their values have always been phase, not metres.
-
     """
 
     pair_ids: tuple[str, ...]
     dates: tuple[str, ...]
-    increments: np.ndarray
-    residual_pairs: np.ndarray
-    cumulative: np.ndarray
+    phase_increments_rad: np.ndarray
+    residual_phase_pairs_rad: np.ndarray
+    phase_cumulative_rad: np.ndarray
     metadata: dict[str, Any]
     displacement_increments_m: np.ndarray | None = None
     displacement_cumulative_m: np.ndarray | None = None
@@ -64,21 +56,6 @@ class TimeSeriesResult:
         ):
             message = "revision_id must be a non-empty string or None"
             raise ValueError(message)
-
-    @property
-    def phase_increments_rad(self) -> np.ndarray:
-        """Return incremental phase explicitly identified as radians."""
-        return self.increments
-
-    @property
-    def residual_phase_pairs_rad(self) -> np.ndarray:
-        """Return pair residual phase explicitly identified as radians."""
-        return self.residual_pairs
-
-    @property
-    def phase_cumulative_rad(self) -> np.ndarray:
-        """Return cumulative phase explicitly identified as radians."""
-        return self.cumulative
 
 
 def _solve_connected_pixels(
@@ -156,7 +133,7 @@ def invert_unwrapped_pairs(
     device: str | None = "cpu",
     gamma: float = 1e-4,
     wavelength_m: float | None = None,
-) -> TimeSeriesResult:
+) -> TimeSeries:
     """Invert a redundant unwrapped pair network with SBAS (no model term).
 
     Parameters
@@ -175,7 +152,7 @@ def invert_unwrapped_pairs(
 
     Returns
     -------
-    TimeSeriesResult
+    TimeSeries
         Incremental and cumulative phase, plus optional LOS displacement, on
         the pair grid. Pixels without a connected finite pair subnetwork are
         masked with ``NaN`` in every time-series epoch.
@@ -248,12 +225,12 @@ def invert_unwrapped_pairs(
         int(np.count_nonzero(valid_pixels)),
         n_pixels,
     )
-    return TimeSeriesResult(
+    return TimeSeries(
         pair_ids=pair_ids,
         dates=dates,
-        increments=increments,
-        residual_pairs=residual,
-        cumulative=cumulative,
+        phase_increments_rad=increments,
+        residual_phase_pairs_rad=residual,
+        phase_cumulative_rad=cumulative,
         metadata={
             "method": "sbas",
             "device": str(device),

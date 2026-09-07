@@ -1,7 +1,7 @@
-"""Domain nouns: pairs, frame façade, physical types.
+"""Reusable scientific values: acquisitions, pairs, baselines, and SAR types.
 
 ``core`` must not import ``missions``, ``processing``, ``timeseries``,
-``io``, or ``compute`` (lint-enforced).
+``io``, or runtime backends (lint-enforced).
 """
 
 from __future__ import annotations

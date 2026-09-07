@@ -46,3 +46,22 @@ def test_ports_not_in_root_all() -> None:
 def test_pairs_importable() -> None:
     assert hasattr(fis, "Pairs")
     assert fis.Pairs is not None
+
+
+def test_concrete_stacks_are_mission_entry_points() -> None:
+    """Supported concrete Stacks are imported from the mission facade."""
+    from faninsar.missions import NISARStack, S1Stack
+    from faninsar.missions.nisar import NISARStack as NISARPackageStack
+    from faninsar.missions.s1 import S1Stack as S1PackageStack
+
+    assert S1Stack is S1PackageStack
+    assert NISARStack is NISARPackageStack
+    assert not hasattr(fis.stack, "S1Stack")
+    assert not hasattr(fis.stack, "NISARStack")
+
+
+def test_mission_neutral_stack_has_no_source_constructor() -> None:
+    """Raw-source constructors remain on concrete mission adapters only."""
+    from faninsar.stack import Stack
+
+    assert not hasattr(Stack, "from_safes")

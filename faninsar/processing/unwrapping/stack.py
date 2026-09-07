@@ -299,7 +299,7 @@ def unwrap_stack(
             for i, pid in enumerate(pair_ids)
         }
         ts_result = invert_unwrapped_pairs(pair_phases, device=lstsq_device)
-        timeseries = np.asarray(ts_result.cumulative, dtype=np.float64)
+        timeseries = np.asarray(ts_result.phase_cumulative_rad, dtype=np.float64)
         inverted = True
         logger.info(
             "Inversion finished: %s dates, device=%s",

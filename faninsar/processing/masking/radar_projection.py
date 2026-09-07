@@ -11,7 +11,7 @@ at the LUT's ``az_full``/``rg_full`` radar indices (``rint`` nearest) and
 radar pixels not covered by any LUT cell remain invalid (``255``).
 - **radar mode** — no dense LUT is available.  ``run_geo2rdr`` runs chunked
   over the mask grid rows (the
-  :func:`faninsar.processing.stages.\
+  :func:`faninsar.missions.s1.processing.\
 _apply_geo_topographic_phase_chunked` memmap + watchdog pattern), scattering
   converged in-bounds radar indices into the radar plane.
 

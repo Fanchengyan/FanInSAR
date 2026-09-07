@@ -18,7 +18,7 @@ from faninsar.processing.geometry.orbit import OrbitInterpolator
 
 if TYPE_CHECKING:
     from faninsar.core.orbit import OrbitMetadata
-    from faninsar.processing.coordinates import RadarGrid
+    from faninsar.processing.geometry.coordinates import RadarGrid
 
 logger = setup_logger(__name__)
 

@@ -21,9 +21,9 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 
 from faninsar.logging import setup_logger
-from faninsar.processing.coordinates import RadarGrid
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.geometry import DEM, ConstantDEM, RadarGeometryModel
+from faninsar.processing.geometry.coordinates import RadarGrid
 from faninsar.processing.geometry.prepare_production import run_rdr2geo
 
 if TYPE_CHECKING:

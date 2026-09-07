@@ -38,6 +38,15 @@ S1_C_BAND_WAVELENGTH_M: float = 0.05546576
 logger = setup_logger(__name__)
 
 
+def __getattr__(name: str) -> Any:
+    """Load the concrete Sentinel-1 Stack adapter lazily."""
+    if name == "S1Stack":
+        from faninsar.missions.s1.stack import S1Stack
+
+        return S1Stack
+    raise AttributeError(name)
+
+
 @register(name="sentinel1")
 class Sentinel1Sensor(Sensor):
     """Sentinel-1 SAFE / ZIP adapter implementing SensorAdapter."""
@@ -69,6 +78,7 @@ __all__ = [
     "RemoteSafe",
     "S1Burst",
     "S1Product",
+    "S1Stack",
     "S1Swath",
     "Sentinel1ProductError",
     "Sentinel1Sensor",

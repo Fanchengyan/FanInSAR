@@ -46,7 +46,7 @@ def assert_no_external_sar_runtime() -> bool:
 def assert_core_imports() -> bool:
     """Return True when required FanInSAR processing entrypoints import cleanly."""
     modules = (
-        "faninsar.processing.stages",
+        "faninsar.missions.s1.processing",
         "faninsar.processing.unwrapping",
         "faninsar.missions.s1",
         "faninsar.processing.runtime.execution",

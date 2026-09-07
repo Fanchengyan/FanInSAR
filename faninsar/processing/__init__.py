@@ -11,8 +11,20 @@ from faninsar.io.storage.provenance import (
     ProvenanceRecord,
     SoftwareIdentity,
 )
-
-from .coordinates import (
+from faninsar.missions.protocols import (
+    DopplerCentroidPolynomial,
+    MissingCriticalMetadataError,
+    SLCReader,
+    SLCReadResult,
+    ValidSampleMask,
+    require_critical_metadata,
+)
+from faninsar.missions.s1.synthetic_slc import (
+    SyntheticSLCReader,
+    SyntheticSLCSpec,
+    write_synthetic_slc,
+)
+from faninsar.processing.geometry.coordinates import (
     ArrayDescriptor,
     ArrayRepresentation,
     CoordinateSystem,
@@ -22,6 +34,7 @@ from .coordinates import (
     TransformDirection,
     TransformLUT,
 )
+
 from .coregistration.resampling import lanczos_resample
 from .errors import (
     GridMismatchError,
@@ -37,14 +50,6 @@ from .interferometry.products import (
     FlatteningState,
     PairProduct,
     UnwrapResult,
-)
-from .readers import (
-    DopplerCentroidPolynomial,
-    MissingCriticalMetadataError,
-    SLCReader,
-    SLCReadResult,
-    ValidSampleMask,
-    require_critical_metadata,
 )
 from .runtime.backends import ArrayReader, ArrayWriter
 from .runtime.resources import (
@@ -67,7 +72,6 @@ from .runtime.source_snapshots import (
     snapshot_local_source,
 )
 from .slc.products import SLCProduct, StackProduct
-from .synthetic_slc import SyntheticSLCReader, SyntheticSLCSpec, write_synthetic_slc
 
 __all__ = [
     "ArrayDescriptor",

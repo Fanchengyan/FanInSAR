@@ -16,7 +16,7 @@ from faninsar.processing.interferometry.products import (
     UnwrapResult,
 )
 from faninsar.processing.slc.products import SLCProduct, StackProduct
-from faninsar.processing.coordinates import (
+from faninsar.processing.geometry.coordinates import (
     ArrayDescriptor,
     ArrayRepresentation,
     CoordinateSystem,
