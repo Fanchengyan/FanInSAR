@@ -711,10 +711,10 @@ def test_transfer_failure_does_not_surface_signed_url(
             )
             raise OSError(message)
 
-    remote._register_adapter("failing-p0047", _FailingAdapter())
+    remote._register_adapter("failing-complete-stream", _FailingAdapter())
     asset = remote.RemoteAsset(
         "failing",
-        "failing-p0047",
+        "failing-complete-stream",
         None,
         "item",
         "data",

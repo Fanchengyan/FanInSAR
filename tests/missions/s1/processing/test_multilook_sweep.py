@@ -34,6 +34,33 @@ SLC_ROOT_RAW = Path("/Volumes/DATA2/TEST_sentinel-1/Raw Data/sentinel-slc")
 SCENES = sorted(SLC_ROOT_RAW.glob("S1A_IW_SLC*.zip")) if SLC_ROOT_RAW.exists() else []
 
 
+def _find_multilook_pair() -> tuple[Path, Path, list[int]] | None:
+    """Find two peer acquisitions with at least one common IW1 burst.
+
+    Co-registration may use a shared reference internally, but the resulting
+    acquisitions are peers.  This test therefore searches all distinct-date
+    pairs without assigning a special role to either endpoint.
+    """
+    if len(SCENES) < 2:
+        return None
+
+    from faninsar.missions.s1.processing import _common_burst_indices
+    from faninsar.missions.s1.safe import open_safe_product
+
+    swaths = [(scene, open_safe_product(scene).swath("IW1")) for scene in SCENES]
+    for index, (primary_path, primary_swath) in enumerate(swaths[:-1]):
+        for secondary_path, secondary_swath in swaths[index + 1 :]:
+            if (
+                primary_swath.sensing_start.date()
+                == secondary_swath.sensing_start.date()
+            ):
+                continue
+            common = _common_burst_indices(primary_swath, secondary_swath)
+            if common:
+                return primary_path, secondary_path, common
+    return None
+
+
 def _make_scene(shape: tuple[int, int], scene_id: str) -> MagicMock:
     """Build a mock scene with the attributes the production stages read."""
     scene = MagicMock()
@@ -514,38 +541,38 @@ def test_shared_resources_cleanup_is_idempotent(tmp_path: Path) -> None:
 @pytest.mark.slow
 @pytest.mark.skipif(len(SCENES) < 2, reason="need two local S1 ZIP scenes")
 def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None:
-    """A one-config radar sweep is array-identical to the single-config run."""
-    from faninsar.missions.s1.processing import _common_burst_indices
-    from faninsar.missions.s1.safe import open_safe_product
-
-    reference, secondary = SCENES[0], SCENES[1]
-    ref_swath = open_safe_product(reference).swath("IW1")
-    sec_swath = open_safe_product(secondary).swath("IW1")
-    if not _common_burst_indices(ref_swath, sec_swath):
-        pytest.skip("no common IW1 burst between the first two scenes")
+    """A real-data sweep matches one run and validates another config."""
+    pair = _find_multilook_pair()
+    if pair is None:
+        pytest.skip("no distinct-date pair has a common IW1 burst")
+    primary, secondary, common_bursts = pair
+    burst_index = common_bursts[0]
+    configs = [(2, 10), (4, 20)]
     single = produce_interferogram_pair(
-        reference,
+        primary,
         secondary,
         output_dir=tmp_path / "single",
         swaths=("IW1",),
-        bursts={"IW1": [0]},
-        multilook=(2, 10),
+        bursts={"IW1": [burst_index]},
+        multilook=configs[0],
         goldstein_alpha=0.0,
         unwrap=False,
     )
     sweep = produce_interferogram_pair(
-        reference,
+        primary,
         secondary,
         output_dir=tmp_path / "sweep",
         swaths=("IW1",),
-        bursts={"IW1": [0]},
-        multilook=[(2, 10)],
+        bursts={"IW1": [burst_index]},
+        multilook=configs,
         goldstein_alpha=0.0,
         unwrap=False,
     )
-    outcome = sweep.per_config[(2, 10)]
+    assert set(sweep.per_config) == set(configs)
+    outcome = sweep.per_config[configs[0]]
     single_root = zarr.open_group(str(single.zarr_path), mode="r")
     sweep_root = zarr.open_group(str(outcome.zarr_path), mode="r")
+    single_shape = tuple(single_root["wrapped_phase"].shape)
     for layer in ("unwrapped_phase", "coherence", "wrapped_phase", "complex_ifg"):
         np.testing.assert_allclose(
             np.asarray(single_root[layer]),
@@ -554,6 +581,13 @@ def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None
             atol=0.0,
             equal_nan=True,
         )
+
+    other = sweep.per_config[configs[1]]
+    other_root = zarr.open_group(str(other.zarr_path), mode="r")
+    assert other.metadata["multilook"] == [4, 20]
+    assert other.metadata["multilook_sweep"] == [[2, 10], [4, 20]]
+    assert other.shape == (single_shape[0] // 2, single_shape[1] // 2)
+    assert other.shape == tuple(other_root["wrapped_phase"].shape)
 
 
 def test_snaphu_config_nlooks_overridden_per_config_radar(
