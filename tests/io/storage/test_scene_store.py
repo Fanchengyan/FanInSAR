@@ -82,6 +82,59 @@ def test_scene_store_round_trip_and_ifg_uses_aligned_payloads(tmp_path: Path) ->
     np.testing.assert_array_equal(output["IW1_b0"], np.conj(secondary))
 
 
+def test_scene_store_publishes_zarr_assets_and_stac_metadata(tmp_path: Path) -> None:
+    """A durable aligned scene uses Zarr assets and carries a STAC record."""
+    data = np.ones((2, 3), dtype=np.complex64)
+    root = tmp_path / "scene"
+    write_scene_unit(
+        root,
+        date_id="20240113",
+        reference_id="20240101",
+        domain="radar",
+        tag="IW1_b0",
+        primary=data,
+        secondary=data,
+        row_origin=0,
+        col_origin=0,
+    )
+
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["domain"] == "radar"
+    assert manifest["shape"] == [2, 3]
+    assert len(manifest["grid_identity"]) == 64
+    assert manifest["units"][0]["primary_file"].endswith(".zarr")
+    assert not list(root.rglob("*.npy"))
+    stac = json.loads((root / "stac-item.json").read_text())
+    assert stac["type"] == "Feature"
+    assert stac["properties"]["faninsar:domain"] == "radar"
+    assert CoregisteredSceneStore.open(root).domain == "radar"
+
+
+def test_geo_scene_store_requires_and_preserves_projection_metadata(
+    tmp_path: Path,
+) -> None:
+    """Geo scenes persist CRS/transform while radar scenes do not invent them."""
+    data = np.ones((2, 3), dtype=np.complex64)
+    root = tmp_path / "geo"
+    write_scene_unit(
+        root,
+        date_id="20240113",
+        reference_id="20240101",
+        domain="geo",
+        tag="IW1_b0",
+        primary=data,
+        secondary=data,
+        row_origin=0,
+        col_origin=0,
+        grid_identity="a" * 64,
+        crs="EPSG:4326",
+        transform=(1, 0, 10, 0, -1, 20),
+    )
+    opened = CoregisteredSceneStore.open(root)
+    assert opened.crs == "EPSG:4326"
+    assert opened.transform == (1.0, 0.0, 10.0, 0.0, -1.0, 20.0)
+
+
 @pytest.mark.parametrize(
     ("violation", "match"),
     [
@@ -321,6 +374,8 @@ def test_merged_scene_interferogram_rejects_equal_shape_shifted_grid(
             col_origin=0,
             grid_shape=(2, 2),
             grid_identity=grid_identity,
+            crs="EPSG:4326",
+            transform=(1, 0, 0, 0, -1, 0),
         )
     with pytest.raises(InvalidProcessingStateError, match="coordinate grids"):
         form_merged_scene_interferogram(
@@ -347,6 +402,8 @@ def test_scene_store_rejects_geo_manifest_without_grid_identity(
         col_origin=0,
         grid_shape=(2, 2),
         grid_identity="a" * 64,
+        crs="EPSG:4326",
+        transform=(1, 0, 0, 0, -1, 0),
     )
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -376,6 +433,8 @@ def test_scene_writer_requires_explicit_geo_grid_identity(tmp_path: Path) -> Non
             row_origin=0,
             col_origin=0,
             grid_shape=(2, 2),
+            crs="EPSG:4326",
+            transform=(1, 0, 0, 0, -1, 0),
         )
 
 
@@ -395,7 +454,7 @@ def test_scene_writer_rejects_corrupted_existing_generation(tmp_path: Path) -> N
         col_origin=0,
         grid_shape=(4, 2),
     )
-    (root / "f0_IW1_b0.secondary.npy").write_bytes(b"corrupt")
+    (root / "f0_IW1_b0.secondary.zarr" / "zarr.json").write_bytes(b"corrupt")
 
     with pytest.raises(InvalidProcessingStateError, match="payload digest"):
         write_scene_unit(

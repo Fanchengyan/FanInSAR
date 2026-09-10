@@ -11,8 +11,8 @@ import zarr
 if TYPE_CHECKING:
     from pathlib import Path
 
-from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.io.storage.ifg_store import ArtifactResourceLimits
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.timeseries import TimeSeries, invert_unwrapped_pairs
 from faninsar.timeseries.io import open_timeseries_zarr, write_timeseries_zarr
 

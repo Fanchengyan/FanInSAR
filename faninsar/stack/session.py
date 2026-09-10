@@ -2647,6 +2647,8 @@ class Stack(NetworkContract):
                     domain=primary_store.domain,
                     wavelength_m=primary_store.wavelength_m,
                     grid_identity=primary_store.grid_identity,
+                    crs=primary_store.crs,
+                    transform=primary_store.transform,
                     filter_name=expected_filter_name,
                     filter_parameters=expected_filter_parameters,
                     source_manifest_digests=expected_sources,
@@ -2724,7 +2726,7 @@ class Stack(NetworkContract):
                 products.append(
                     NetworkProduct(
                         key=NetworkProductKey(primary_key, secondary_key, kind),
-                        asset_location=str(store.generation_root / "complex_ifg.npy"),
+                        asset_location=str(store.generation_root / "complex_ifg.zarr"),
                         geometry_identity=store.grid_identity,
                         source_software="faninsar",
                         phase_convention=PhaseConvention.PRIMARY_MINUS_SECONDARY,
@@ -2755,7 +2757,7 @@ class Stack(NetworkContract):
                                 store.root
                                 / ".unwrap_generations"
                                 / unwrap_generation_id
-                                / "unwrapped_phase.npy"
+                                / "unwrapped_phase.zarr"
                             ),
                             geometry_identity=store.grid_identity,
                             source_software="faninsar",
@@ -2925,7 +2927,7 @@ class Stack(NetworkContract):
                 NetworkProduct(
                     key=key,
                     asset_location=str(
-                        generation.generation_root / pair_id / "unwrapped_phase.npy"
+                        generation.generation_root / pair_id / "unwrapped_phase.zarr"
                     ),
                     geometry_identity=source.geometry_identity,
                     source_software="faninsar",
@@ -3256,6 +3258,10 @@ class Stack(NetworkContract):
                     }
                     for pair_id, store in zip(pair_ids, stores, strict=True)
                 },
+                domain=stores[0].domain,
+                shape=stores[0].shape,
+                crs=stores[0].crs,
+                transform=stores[0].transform,
                 mask_plan_identity=mask_plan_identity,
                 mask_identity=mask_identity,
             )
@@ -3748,12 +3754,11 @@ class Stack(NetworkContract):
     ) -> Path:
         """Materialize the current Stack result as a canonical Network root.
 
-        The Network is a consumer-facing view of a completed Stack.  Its NPY
-        assets are hard-linked to the immutable Stack payloads when possible,
-        with a copy fallback for filesystems that do not support hard links.
-        This keeps the migration small while avoiding a second large raster
-        representation in the normal local-workspace case.
+        The Network is a consumer-facing view of a completed Stack. Its
+        assets use the same STAC+Zarr payload contract as the source Stack
+        artifacts and are copied into the immutable Network generation.
         """
+        from faninsar.io.storage._zarr_stac import digest_path, write_zarr_array
         from faninsar.io.storage.artifact_transaction import (
             commit_generation,
             stage_generation,
@@ -3765,19 +3770,19 @@ class Stack(NetworkContract):
         final_bytes = 4096
         for store in stores:
             for name in ("complex_ifg", "wrapped_phase", "amplitude", "coherence"):
-                source = store.generation_root / f"{name}.npy"
-                if source.is_file():
+                source = store.generation_root / f"{name}.zarr"
+                if source.is_dir():
                     asset_count += 1
-                    final_bytes += source.stat().st_size
+                    final_bytes += int(store.shape[0] * store.shape[1] * 8)
             if unwrap_generation is not None:
                 source = (
                     unwrap_generation.generation_root
                     / f"{store.pair[0]}_{store.pair[1]}"
-                    / "unwrapped_phase.npy"
+                    / "unwrapped_phase.zarr"
                 )
-                if source.is_file():
+                if source.is_dir():
                     asset_count += 1
-                    final_bytes += source.stat().st_size
+                    final_bytes += int(store.shape[0] * store.shape[1] * 4)
             else:
                 final_bytes += int(store.shape[0] * store.shape[1] * 4)
                 asset_count += 1
@@ -3789,23 +3794,19 @@ class Stack(NetworkContract):
             """Publish one asset and return its byte digest."""
             target.parent.mkdir(parents=True, exist_ok=True)
             temporary = target.with_name(f".{target.name}.tmp")
-            temporary.unlink(missing_ok=True)
-            if source is not None and source.is_file():
-                try:
-                    os.link(source, temporary)
-                except OSError:
-                    shutil.copy2(source, temporary)
+            if temporary.is_dir():
+                shutil.rmtree(temporary)
+            else:
+                temporary.unlink(missing_ok=True)
+            if source is not None and source.is_dir():
+                source_path = Path(getattr(source, "_display_path", source))
+                shutil.copytree(source_path, temporary)
             elif array is not None:
-                with temporary.open("wb") as stream:
-                    np.save(stream, array, allow_pickle=False)
+                write_zarr_array(temporary, np.asarray(array))
             else:
                 reject_invalid_state(f"Network export asset is missing: {target.name}")
             temporary.replace(target)
-            digest = hashlib.sha256()
-            with target.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return digest.hexdigest()
+            return digest_path(target)
 
         with stage_generation(
             network_root,
@@ -3823,29 +3824,29 @@ class Stack(NetworkContract):
                 artifact = store.read()
                 source_assets: dict[str, tuple[Path | None, np.ndarray | None]] = {
                     "complex_ifg": (
-                        store.generation_root / "complex_ifg.npy",
-                        artifact.complex_ifg,
+                        store.generation_root / "complex_ifg.zarr",
+                        None,
                     ),
                     "wrapped_phase": (
-                        store.generation_root / "wrapped_phase.npy",
-                        artifact.wrapped_phase,
+                        store.generation_root / "wrapped_phase.zarr",
+                        None,
                     ),
                     "amplitude": (
-                        store.generation_root / "amplitude.npy",
-                        artifact.amplitude,
+                        store.generation_root / "amplitude.zarr",
+                        None,
                     ),
                     "coherence": (
-                        store.generation_root / "coherence.npy"
+                        store.generation_root / "coherence.zarr"
                         if artifact.coherence is not None
                         else None,
-                        artifact.coherence,
+                        None,
                     ),
                 }
                 if unwrap_generation is not None:
                     unwrapped_path = (
                         unwrap_generation.generation_root
                         / pair_id
-                        / "unwrapped_phase.npy"
+                        / "unwrapped_phase.zarr"
                     )
                     source_assets["unw_phase"] = (unwrapped_path, None)
                 else:
@@ -3856,7 +3857,7 @@ class Stack(NetworkContract):
                 for asset_name, (source, array) in source_assets.items():
                     if source is None and array is None:
                         continue
-                    target = pair_root / f"{asset_name}.npy"
+                    target = pair_root / f"{asset_name}.zarr"
                     digest = publish_asset(source, target, array)
                     available.append(asset_name)
                     product_kind = {
@@ -3880,7 +3881,7 @@ class Stack(NetworkContract):
                             "secondary_id": store.pair[1],
                             "product_kind": product_kind,
                             "asset_location": (
-                                f"interferograms/{pair_id}/{asset_name}.npy"
+                                f"interferograms/{pair_id}/{asset_name}.zarr"
                             ),
                             "geometry_identity": store.grid_identity,
                             "source_software": "faninsar",
@@ -3901,6 +3902,18 @@ class Stack(NetworkContract):
                 "assets_by_pair": assets_by_pair,
                 "common_grid": True,
             }
+            if stores:
+                first_store = stores[0]
+                spatial_metadata: dict[str, Any] = {
+                    "domain": first_store.domain,
+                    "shape": list(first_store.shape),
+                    "grid_identity": first_store.grid_identity,
+                }
+                if first_store.crs is not None:
+                    spatial_metadata["crs"] = first_store.crs
+                if first_store.transform is not None:
+                    spatial_metadata["transform"] = list(first_store.transform)
+                index["spatial_metadata"] = spatial_metadata
             (interferograms_root / "interferograms_index.json").parent.mkdir(
                 parents=True, exist_ok=True
             )

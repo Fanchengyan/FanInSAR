@@ -805,6 +805,16 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
             grid_shape=resolved_scene_grid_shape,
             wavelength_m=float(state.primary.geometry.wavelength_m),
             grid_identity=grid_identity,
+            crs=(
+                geo_grid.crs
+                if coregistration_grid == "geo" and geo_grid is not None
+                else None
+            ),
+            transform=(
+                tuple(float(value) for value in geo_grid.transform)
+                if coregistration_grid == "geo" and geo_grid is not None
+                else None
+            ),
             scientific_lineage=state.scientific_lineage,
             phase_state=_phase_state_manifest(state),
         )
@@ -4720,6 +4730,8 @@ def produce_interferogram_pair(
                     col_origin=range_offsets[swath] + burst_col0,
                     grid_shape=(frame_rows, frame_cols),
                     wavelength_m=float(state.primary.geometry.wavelength_m),
+                    crs=None,
+                    transform=None,
                     scientific_lineage=state.scientific_lineage,
                     phase_state=_phase_state_manifest(state),
                 )

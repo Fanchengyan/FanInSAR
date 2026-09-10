@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, ClassVar, Self
 
@@ -32,6 +33,8 @@ from faninsar.network.readers.timeseries import NetworkTimeSeries
 
 if TYPE_CHECKING:
     from os import PathLike
+
+    from faninsar.timeseries.models import TimeSeriesModels
 
 logger = setup_logger(__name__)
 
@@ -806,29 +809,77 @@ class Network(NetworkContract):
         pairs: Any | None = None,
         **kwargs: Any,
     ) -> Any:
-        """Analyze the mounted Network through its Dataset-backed stack.
+        """Compatibility alias for :meth:`invert`.
 
-        The raster Dataset is opened internally from the canonical path.  No
-        caller-provided Dataset object is accepted at this boundary.
+        ``invert`` is the preferred interface.  The historical ``solver``
+        selector remains here only so existing callers can migrate without a
+        second Network construction.
+        """
+        if not isinstance(solver, str):
+            message = f"Network time-series solver must be text, got {solver!r}"
+            logger.error(message)
+            raise TypeError(message)
+        if solver.lower() not in {"sbas", "nsbas"}:
+            message = f"unknown Network time-series solver {solver!r}"
+            logger.error(message)
+            raise ValueError(message)
+        if solver.lower() == "nsbas" and model is None:
+            # Preserve the historical compatibility path.  The new ``invert``
+            # seam intentionally defines model omission as SBAS, so routing
+            # this legacy spelling through it would silently change behavior.
+            return self._invert_legacy_nsbas(pairs=pairs, **kwargs)
+        return self.invert(model=model, pairs=pairs, **kwargs)
+
+    def invert(
+        self,
+        *,
+        model: type[TimeSeriesModels] | TimeSeriesModels | None = None,
+        pairs: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Invert unwrapped Network products into a time series.
+
+        Parameters
+        ----------
+        model : type[TimeSeriesModels] or TimeSeriesModels, optional
+            Omit the model for pure SBAS.  A model class is instantiated with
+            the selected acquisition dates.  A configured model instance is
+            accepted for models that need additional domain inputs and must
+            describe exactly those dates; either form selects NSBAS.
+        pairs : Pairs, optional
+            Pair subset to read and invert.  The selected pairs are resolved
+            before a model class is instantiated.
+        **kwargs : Any
+            Options forwarded to the selected inversion implementation.
+
+        Returns
+        -------
+        TimeSeries
+            Self-describing phase time series bound to this Network revision.
+
+        Raises
+        ------
+        TypeError
+            If ``model`` is not a model class or configured model instance,
+            or if a model class needs constructor arguments beyond ``dates``.
+        ValueError
+            If a configured model's dates do not match the selected pairs.
+
         """
         if self.interferograms is None:
-            message = "Network has no interferogram products to analyze"
+            message = "Network has no interferogram products to invert"
             logger.error(message)
             raise IncompleteNetworkProductError(message)
         try:
             stack = self.to_ifg_stack(pairs=pairs)
         except Exception as exc:
-            message = f"Network products cannot be opened for analysis: {exc}"
+            message = f"Network products cannot be opened for inversion: {exc}"
             logger.exception(message)
             raise IncompleteNetworkProductError(message) from exc
-        normalized_solver = solver.lower()
-        if normalized_solver == "sbas":
-            # Use the persisted processing result contract for the canonical
-            # path.  The lower-level historical solver returns four arrays;
-            # Network callers need one self-describing TimeSeries.
-            from faninsar.timeseries.results import (
-                invert_unwrapped_pairs,
-            )
+
+        normalized_model = self._normalize_inversion_model(model, stack.pairs.dates)
+        if normalized_model is None:
+            from faninsar.timeseries.results import invert_unwrapped_pairs
 
             values = self.interferograms.open_stack("unw_phase", pairs=stack.pairs)
             pair_ids = [str(value) for value in values.coords["pair"].values]
@@ -841,50 +892,187 @@ class Network(NetworkContract):
                 device=kwargs.pop("device", "cpu"),
             )
             return self._bind_analysis_revision(result)
-        if normalized_solver == "nsbas":
-            from faninsar.timeseries.invert import invert
 
-            raw = invert(stack, model=model, **kwargs)
-            if not isinstance(raw, tuple) or len(raw) != 4:
-                message = "NSBAS solver returned an invalid result"
-                logger.error(message)
-                raise NetworkAnalysisError(message)
-            from faninsar.timeseries.results import TimeSeries
+        return self._run_nsbas(stack, model=normalized_model, **kwargs)
 
-            increments, _parameters, residual_pairs, _residual_model = raw
-            increments_array = np.asarray(increments, dtype=np.float32)
-            residual_array = np.asarray(residual_pairs, dtype=np.float32)
-            n_pixels = int(np.asarray(stack.unwrapped_matrix()).shape[1])
-            n_dates = len(stack.pairs.dates)
-            if increments_array.shape != (n_dates - 1, n_pixels):
-                message = "NSBAS solver returned increments with an invalid shape"
-                logger.error(message)
-                raise NetworkAnalysisError(message)
-            if residual_array.shape != (len(stack.pairs), n_pixels):
-                message = "NSBAS solver returned residuals with an invalid shape"
-                logger.error(message)
-                raise NetworkAnalysisError(message)
-            cumulative_array = np.concatenate(
-                [
-                    np.zeros((1, n_pixels), dtype=np.float32),
-                    np.cumsum(increments_array, axis=0),
-                ],
-                axis=0,
-            )
-            result = TimeSeries(
-                pair_ids=tuple(str(name) for name in stack.pairs.names),
-                dates=tuple(
-                    str(date.date()).replace("-", "") for date in stack.pairs.dates
+    def _run_nsbas(
+        self,
+        stack: Any,
+        *,
+        model: TimeSeriesModels | None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run NSBAS and adapt its legacy tuple to a ``TimeSeries``."""
+        from faninsar.timeseries.invert import invert
+
+        raw = invert(stack, model=model, **kwargs)
+        if not isinstance(raw, tuple) or len(raw) != 4:
+            message = "NSBAS solver returned an invalid result"
+            logger.error(message)
+            raise NetworkAnalysisError(message)
+        from faninsar.timeseries.results import TimeSeries
+
+        increments, _parameters, residual_pairs, _residual_model = raw
+        increments_array = np.asarray(increments, dtype=np.float32)
+        residual_array = np.asarray(residual_pairs, dtype=np.float32)
+        n_pixels = int(np.asarray(stack.unwrapped_matrix()).shape[1])
+        n_dates = len(stack.pairs.dates)
+        if increments_array.shape != (n_dates - 1, n_pixels):
+            message = "NSBAS solver returned increments with an invalid shape"
+            logger.error(message)
+            raise NetworkAnalysisError(message)
+        if residual_array.shape != (len(stack.pairs), n_pixels):
+            message = "NSBAS solver returned residuals with an invalid shape"
+            logger.error(message)
+            raise NetworkAnalysisError(message)
+        cumulative_array = np.concatenate(
+            [
+                np.zeros((1, n_pixels), dtype=np.float32),
+                np.cumsum(increments_array, axis=0),
+            ],
+            axis=0,
+        )
+        result = TimeSeries(
+            pair_ids=tuple(str(name) for name in stack.pairs.names),
+            dates=tuple(
+                str(date.date()).replace("-", "") for date in stack.pairs.dates
+            ),
+            phase_increments_rad=increments_array,
+            residual_phase_pairs_rad=residual_array,
+            phase_cumulative_rad=cumulative_array,
+            metadata={"method": "nsbas", "n_pairs": len(stack.pairs)},
+        )
+        return self._bind_analysis_revision(result)
+
+    @staticmethod
+    def _normalize_inversion_model(
+        model: type[TimeSeriesModels] | TimeSeriesModels | None,
+        dates: Any,
+    ) -> TimeSeriesModels | None:
+        """Resolve and validate the optional model at the inversion seam."""
+        from faninsar.timeseries.models import TimeSeriesModels
+
+        if model is None:
+            return None
+        if isinstance(model, type):
+            if not issubclass(model, TimeSeriesModels):
+                message = (
+                    "model must be a TimeSeriesModels subclass or configured instance"
+                )
+                logger.error(message, extra={"model_type": model.__name__})
+                raise TypeError(message)
+            try:
+                return model(dates=dates)
+            except TypeError as exc:
+                message = (
+                    f"{model.__name__} could not be constructed from dates; "
+                    "pass a configured instance instead"
+                )
+                logger.exception(message)
+                raise TypeError(message) from exc
+        if not isinstance(model, TimeSeriesModels):
+            message = "model must be a TimeSeriesModels subclass or configured instance"
+            logger.error(message, extra={"model_type": type(model).__name__})
+            raise TypeError(message)
+        if not np.array_equal(np.asarray(model.dates), np.asarray(dates)):
+            message = "configured model dates must exactly match selected pairs dates"
+            logger.error(message)
+            raise ValueError(message)
+        return model
+
+    def _spatial_metadata_for_result(self, result: Any) -> Any:
+        """Build spatial metadata from the mounted interferogram facade."""
+        from faninsar.timeseries.results import SpatialMetadata
+
+        source = getattr(self.interferograms, "spatial_metadata", None)
+        if source is None:
+            return getattr(result, "spatial", None)
+        try:
+            raw = source() if callable(source) else source
+        except Exception as error:
+            message = "Network spatial metadata could not be read"
+            logger.exception(message)
+            raise NetworkAnalysisError(message) from error
+        if raw is None:
+            return getattr(result, "spatial", None)
+        if isinstance(raw, SpatialMetadata):
+            payload = raw.to_dict()
+        elif isinstance(raw, Mapping):
+            payload = dict(raw)
+        else:
+            payload = {
+                name: getattr(raw, name)
+                for name in (
+                    "domain",
+                    "shape",
+                    "grid_identity",
+                    "crs",
+                    "transform",
+                    "radar_coordinates",
+                )
+                if hasattr(raw, name)
+            }
+        try:
+            shape = tuple(int(size) for size in payload["shape"])
+            spatial = SpatialMetadata(
+                domain=payload["domain"],
+                shape=shape,
+                grid_identity=payload["grid_identity"],
+                crs=payload.get("crs"),
+                transform=(
+                    tuple(float(value) for value in payload["transform"])
+                    if payload.get("transform") is not None
+                    else None
                 ),
-                phase_increments_rad=increments_array,
-                residual_phase_pairs_rad=residual_array,
-                phase_cumulative_rad=cumulative_array,
-                metadata={"method": "nsbas", "n_pairs": len(stack.pairs)},
+                radar_coordinates=payload.get("radar_coordinates"),
             )
-            return self._bind_analysis_revision(result)
-        message = f"unknown Network time-series solver {solver!r}"
-        logger.error(message)
-        raise ValueError(message)
+        except (KeyError, TypeError, ValueError) as error:
+            message = "Network spatial metadata is invalid"
+            logger.exception(message)
+            raise NetworkAnalysisError(message) from error
+        expected_pixels = shape[0] * shape[1]
+        for name in (
+            "phase_increments_rad",
+            "phase_cumulative_rad",
+            "residual_phase_pairs_rad",
+            "displacement_increments_m",
+            "displacement_cumulative_m",
+        ):
+            values = getattr(result, name, None)
+            if values is None:
+                continue
+            array = np.asarray(values)
+            matches = (array.ndim >= 3 and tuple(array.shape[-2:]) == shape) or (
+                array.ndim == 2 and array.shape[-1] == expected_pixels
+            )
+            if not matches:
+                message = (
+                    f"Network spatial shape {shape} does not match "
+                    f"TimeSeries {name} shape {array.shape}"
+                )
+                logger.error(message)
+                raise ValueError(message)
+        return spatial
+
+    def _invert_legacy_nsbas(
+        self,
+        *,
+        pairs: Any | None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run the historical ``analyze_time_series(solver='nsbas')`` path."""
+        if self.interferograms is None:
+            message = "Network has no interferogram products to invert"
+            logger.error(message)
+            raise IncompleteNetworkProductError(message)
+        try:
+            stack = self.to_ifg_stack(pairs=pairs)
+        except Exception as exc:
+            message = f"Network products cannot be opened for inversion: {exc}"
+            logger.exception(message)
+            raise IncompleteNetworkProductError(message) from exc
+
+        return self._run_nsbas(stack, model=None, **kwargs)
 
     def _bind_analysis_revision(self, result: Any) -> Any:
         """Attach this Network generation to a returned time-series result."""
@@ -892,7 +1080,16 @@ class Network(NetworkContract):
         if hasattr(result, "revision_id"):
             from dataclasses import replace
 
-            return replace(result, revision_id=revision)
+            updates: dict[str, Any] = {"revision_id": revision}
+            if hasattr(result, "spatial"):
+                updates["spatial"] = self._spatial_metadata_for_result(result)
+            from faninsar.timeseries import write_timeseries_product
+
+            canonical_path = self.root / "timeseries"
+            bound = replace(result, **updates)
+            write_timeseries_product(bound, canonical_path)
+            self._timeseries = NetworkTimeSeries(canonical_path)
+            return replace(bound, canonical_path=canonical_path)
         return result
 
     def __repr__(self) -> str:

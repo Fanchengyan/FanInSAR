@@ -984,6 +984,17 @@ def test_live_stack_network_view_exposes_committed_ifg_pairs(
         "20240113_20240125",
         "20240101_20240125",
     ]
+    assert stack.network_product_index is not None
+    ifg_products = [
+        product
+        for product in stack.network_product_index.products
+        if product.key.product_kind is AssetKind.COMPLEX_INTERFEROGRAM
+    ]
+    assert ifg_products
+    assert all(
+        product.asset_location.endswith("complex_ifg.zarr") for product in ifg_products
+    )
+    assert all(Path(product.asset_location).is_dir() for product in ifg_products)
     opened = network.interferograms.open_stack("complex_ifg")
     assert opened.shape == (3, 3, 4)
     np.testing.assert_allclose(opened.values, np.stack([np.exp(1j * phase)] * 3))
@@ -1164,7 +1175,8 @@ def test_live_stack_network_per_ifg_unwrap_surface_is_consistent(
     for pair_id in pair_ids:
         assert collection.exists(pair_id, "unw_phase")
         path = collection.path(pair_id, "unw_phase")
-        assert path.is_file()
+        assert path.is_dir()
+        assert path.name.endswith(".zarr")
         np.testing.assert_allclose(
             collection.open(pair_id, "unw_phase").values,
             phase,

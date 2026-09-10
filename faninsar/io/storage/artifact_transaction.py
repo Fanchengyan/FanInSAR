@@ -174,8 +174,8 @@ class _PinnedGenerationPath(_ConcretePath):
             if (
                 not (stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode))
                 or not (stat.S_ISREG(opened.st_mode) or stat.S_ISDIR(opened.st_mode))
-                or metadata.st_nlink != 1
-                or opened.st_nlink != 1
+                or (stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1)
+                or (stat.S_ISREG(opened.st_mode) and opened.st_nlink != 1)
                 or metadata.st_uid != os.getuid()
                 or opened.st_dev != metadata.st_dev
                 or opened.st_ino != metadata.st_ino
@@ -262,7 +262,9 @@ class _PinnedGenerationPath(_ConcretePath):
                     dir_fd=directory_descriptor,
                     follow_symlinks=False,
                 )
-                if stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1:
+                if stat.S_ISLNK(metadata.st_mode) or (
+                    stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1
+                ):
                     reject_invalid_state(f"artifact generation entry is unsafe: {name}")
                 child_parts = (*relative_parts, name)
                 child = type(self)._create_child(

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import xarray as xr
 
+from faninsar.io.storage._zarr_stac import read_zarr_array
 from faninsar.network.readers.interferogram import (
     InterferogramCollection,
 )
@@ -20,8 +21,7 @@ if TYPE_CHECKING:
 class StackInterferogramCollection(InterferogramCollection):
     """Read-only interferogram collection backed by a committed Stack.
 
-    The Stack artifact store is the canonical producer format and stores
-    validated NumPy payloads rather than georeferenced COGs.  This collection
+    The Stack artifact store is the canonical STAC+Zarr producer format. This collection
     exposes the same pair-level Dataset surface used by :class:`Network`,
     without copying products into a second on-disk layout.
     """
@@ -76,6 +76,44 @@ class StackInterferogramCollection(InterferogramCollection):
             "common_grid": True,
         }
 
+    @property
+    def spatial_metadata(self) -> dict[str, Any]:
+        """Return common manifest-bound spatial metadata for this collection.
+
+        Returns
+        -------
+        dict
+            A read-only-by-convention mapping containing ``domain``, ``shape``,
+            ``grid_identity``, and optional ``crs``/``transform``. Radar
+            collections omit geographic metadata instead of fabricating it.
+
+        """
+        if self._stack is None:
+            metadata = self.index_metadata.get("spatial_metadata", {})
+            if not isinstance(metadata, dict):
+                message = "Stack spatial metadata is invalid"
+                raise ValueError(message)
+            return dict(metadata)
+        stores = self._stores()
+        try:
+            if not stores:
+                message = "Stack has no interferogram stores"
+                raise ValueError(message)
+            first = stores[0]
+            values = {
+                "domain": first.domain,
+                "shape": list(first.shape),
+                "grid_identity": first.grid_identity,
+            }
+            if first.crs is not None:
+                values["crs"] = first.crs
+            if first.transform is not None:
+                values["transform"] = list(first.transform)
+            return values
+        finally:
+            for store in stores:
+                store.close()
+
     def _pair_dates(self) -> list[tuple[str, str]]:
         """Return the Stack's immutable Pair order."""
         assert self._stack is not None
@@ -107,7 +145,7 @@ class StackInterferogramCollection(InterferogramCollection):
         if self._stack is None:
             path = self.path(str(store), name)
             try:
-                return np.load(path, allow_pickle=False)
+                return read_zarr_array(path)
             except (OSError, ValueError) as error:
                 raise FileNotFoundError(path) from error
         assert self._stack is not None
@@ -222,16 +260,16 @@ class StackInterferogramCollection(InterferogramCollection):
                             raise FileNotFoundError(selected.root / "UNWRAP_CURRENT")
                         opened = open_current_generation(selected.root, "unwrap")
                         try:
-                            return opened.path / "unwrapped_phase.npy"
+                            return opened.path / "unwrapped_phase.zarr"
                         finally:
                             opened.lease.close()
                     pair_id = f"{selected.pair[0]}_{selected.pair[1]}"
-                    return generation.generation_root / pair_id / "unwrapped_phase.npy"
-                return selected.generation_root / f"{name}.npy"
+                    return generation.generation_root / pair_id / "unwrapped_phase.zarr"
+                return selected.generation_root / f"{name}.zarr"
             finally:
                 for store in stores:
                     store.close()
-        return self.root / str(pair) / f"{name}.npy"
+        return self.root / str(pair) / f"{name}.zarr"
 
     def item(self, pair: str) -> dict[str, Any]:
         """Return a generated item-like record for one Stack Pair."""

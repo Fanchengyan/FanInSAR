@@ -26,7 +26,7 @@ stack.prepare_scenes()
 stack.coregister_scenes()
 stack.form_interferograms(multilook=(2, 8))
 stack.unwrap()
-result = stack.analyze_time_series()
+result = stack.network.invert()
 ```
 
 `Stack.unwrap()` uses SNAPHU by default. The Torch-native `SpatialIRLS`
@@ -38,6 +38,24 @@ from faninsar.processing.unwrapping import SpatialIRLS
 stack.unwrap(SpatialIRLS())
 ```
 
-For an existing interferogram collection, construct a path-based `Network`
-instance instead. `Network` opens its persisted products internally and exposes
-the same time-series analysis seam; it does not read SAFE/RSLC sources.
+With no model, `Network.invert()` performs SBAS. Pass a model class to select
+NSBAS; the class is instantiated internally for the selected acquisitions:
+
+```python
+from faninsar.timeseries import LinearModel
+
+result = stack.network.invert(model=LinearModel)
+```
+
+Inversion writes the canonical STAC+Zarr product automatically, and
+`result.canonical_path` identifies its root. Export is an optional conversion:
+
+```python
+result.export("out/timeseries")  # STAC+COG; requires complete geo metadata
+radar_result.export("out/timeseries-radar", exporter="stac-zarr")
+radar_result.export("out/timeseries-netcdf", exporter="netcdf")
+```
+
+There is no `publish_generation()` step in this workflow, and a live Stack
+does not need a manual `Network.open()` call. Use `Network.open(path)` only
+when opening a completed generation persisted elsewhere.

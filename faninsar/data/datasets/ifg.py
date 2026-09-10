@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from faninsar.core import Pairs
 from faninsar.data.query import BoundingBox, GeoQuery, Points
+from faninsar.io.storage._zarr_stac import read_zarr_array
 from faninsar.logging import setup_logger
 
 from . import PairDataset, RasterDataset
@@ -64,7 +65,7 @@ class StackInterferogramDataset:
     expected in ``[0, 1]``; amplitude and complex IFG use the product's native
     normalized units. The current IFG writer predates the explicit persisted
     mask. Until that writer is upgraded, the mask is derived from finite values
-    as a narrow read-only fallback; a persisted ``valid_mask.npy`` takes
+    as a narrow read-only fallback; a persisted ``valid_mask.zarr`` takes
     precedence.
 
     """
@@ -110,9 +111,9 @@ class StackInterferogramDataset:
             raise TypeError(message)
 
         def load(name: str) -> np.ndarray:
-            path = generation_root / f"{name}.npy"
+            path = generation_root / f"{name}.zarr"
             try:
-                array = np.load(path, allow_pickle=False)
+                array = read_zarr_array(path)
             except (OSError, ValueError, EOFError) as error:
                 message = f"Stack IFG Dataset layer cannot be read: {name}"
                 logger.exception("Stack IFG Dataset layer cannot be read: %s", path)
@@ -123,8 +124,8 @@ class StackInterferogramDataset:
             return np.asarray(array)
 
         complex_ifg = load("complex_ifg")
-        coherence_path = generation_root / "coherence.npy"
-        coherence = load("coherence") if coherence_path.is_file() else None
+        coherence_path = generation_root / "coherence.zarr"
+        coherence = load("coherence") if coherence_path.is_dir() else None
         wrapped_phase = load("wrapped_phase")
         amplitude = load("amplitude")
         arrays = (wrapped_phase, amplitude)
@@ -141,8 +142,8 @@ class StackInterferogramDataset:
             message = "Stack IFG Dataset layers must share one shape"
             raise ValueError(message)
 
-        mask_path = generation_root / "valid_mask.npy"
-        if mask_path.is_file():
+        mask_path = generation_root / "valid_mask.zarr"
+        if mask_path.is_dir():
             valid_mask = load("valid_mask")
             if valid_mask.dtype != np.bool_ or valid_mask.shape != complex_ifg.shape:
                 message = "Stack IFG Dataset valid_mask is incompatible"

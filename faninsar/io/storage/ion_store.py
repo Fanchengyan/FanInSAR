@@ -11,6 +11,7 @@ ionosphere generations can never silently resume or mix.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
@@ -24,16 +25,12 @@ from faninsar.io.storage.artifact_transaction import (
     stage_generation,
 )
 from faninsar.io.storage.ifg_store import (
-    _array_descriptor,
     _atomic_manifest,
-    _atomic_save,
     _canonical_json,
     _digest_bytes,
     _is_sha256,
-    _read_payloads,
     _store_root,
     _validate_json_mapping,
-    _validate_payload_table,
     _validate_shape,
     _verified_manifest,
 )
@@ -45,6 +42,88 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 logger = setup_logger(__name__)
+
+
+def _atomic_save(path: Path, array: np.ndarray) -> None:
+    """Write one legacy ionosphere diagnostic as a durable NPY file.
+
+    Ionosphere artifacts retain their established diagnostic payload contract;
+    the STAC+Zarr migration applies to scene, IFG, and unwrap products only.
+    """
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("wb") as stream:
+        np.save(stream, array, allow_pickle=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+def _ion_array_descriptor(path: Path, array: np.ndarray) -> dict[str, Any]:
+    """Build a descriptor for one NPY ionosphere diagnostic."""
+    from faninsar.io.storage._zarr_stac import digest_path
+
+    return {
+        "file": path.name,
+        "shape": [int(size) for size in array.shape],
+        "dtype": array.dtype.str,
+        "sha256": digest_path(path),
+    }
+
+
+def _validate_ion_payload_table(
+    root: Path,
+    raw_payloads: object,
+    expected_shape: tuple[int, int],
+) -> dict[str, dict[str, Any]]:
+    """Validate the NPY payload table used by ionosphere diagnostics."""
+    if not isinstance(raw_payloads, dict) or set(raw_payloads) != set(ION_FILENAMES):
+        reject_invalid_state("ion artifact payload table is incomplete")
+    payloads: dict[str, dict[str, Any]] = {}
+    for name, filename in ION_FILENAMES.items():
+        raw = raw_payloads[name]
+        if not isinstance(raw, dict) or raw.get("file") != filename:
+            reject_invalid_state(f"ion artifact payload descriptor is invalid: {name}")
+        if tuple(raw.get("shape", ())) != expected_shape:
+            reject_invalid_state(f"ion artifact payload shape mismatch: {name}")
+        try:
+            dtype = np.dtype(raw.get("dtype"))
+        except (TypeError, ValueError) as error:
+            reject_invalid_state(f"ion artifact payload dtype is invalid: {error}")
+        if dtype.hasobject or not _is_sha256(raw.get("sha256")):
+            reject_invalid_state(f"ion artifact payload metadata is unsafe: {name}")
+        path = root / filename
+        if not path.is_file() or path.is_symlink():
+            reject_invalid_state(f"ion artifact payload missing or unsafe: {path}")
+        payloads[name] = dict(raw)
+    return payloads
+
+
+def _read_ion_payloads(
+    root: Path,
+    descriptors: dict[str, dict[str, Any]],
+) -> dict[str, np.ndarray]:
+    """Hash, load, and validate NPY ionosphere diagnostics."""
+    from faninsar.io.storage._zarr_stac import digest_path
+
+    arrays: dict[str, np.ndarray] = {}
+    for name, descriptor in descriptors.items():
+        path = root / str(descriptor["file"])
+        if digest_path(path) != descriptor["sha256"]:
+            reject_invalid_state(f"ion artifact payload digest mismatch: {name}")
+        try:
+            array = np.load(path, allow_pickle=False)
+        except (OSError, ValueError, EOFError) as error:
+            reject_invalid_state(f"ion artifact payload cannot be loaded: {error}")
+        if (
+            array.shape != tuple(descriptor["shape"])
+            or array.dtype.str != descriptor["dtype"]
+        ):
+            reject_invalid_state(
+                f"ion artifact payload shape or dtype mismatch: {name}"
+            )
+        arrays[name] = array
+    return arrays
+
 
 ION_ARTIFACT_SCHEMA = "stack_ion_artifact_v1"
 ION_CORRECTION_SCHEMA = "stack_ion_correction_artifact_v1"
@@ -232,8 +311,8 @@ class IonosphereArtifactStore:
         ):
             reject_invalid_state("ion artifact source manifest digests are invalid")
         shape = _validate_shape(manifest.get("shape"), "ion shape")
-        payloads = _validate_payload_table(
-            opened.path, manifest.get("payloads"), ION_FILENAMES, shape
+        payloads = _validate_ion_payload_table(
+            opened.path, manifest.get("payloads"), shape
         )
         return cls(
             root=path,
@@ -273,7 +352,7 @@ class IonosphereArtifactStore:
 
     def read(self) -> IonosphereArtifact:
         """Read all ionosphere layers after full payload revalidation."""
-        arrays = _read_payloads(self.generation_root, self._payloads)
+        arrays = _read_ion_payloads(self.generation_root, self._payloads)
         if any(arrays[name].dtype.kind != "f" for name in ION_FILENAMES):
             reject_invalid_state("ion artifact layer dtypes are incompatible")
         return IonosphereArtifact(
@@ -421,7 +500,7 @@ def write_ionosphere_artifact(
         for name, filename in ION_FILENAMES.items():
             payload_path = staging / filename
             _atomic_save(payload_path, arrays[name])
-            descriptors[name] = _array_descriptor(payload_path, arrays[name])
+            descriptors[name] = _ion_array_descriptor(payload_path, arrays[name])
         unsigned: dict[str, Any] = {
             "schema_version": ION_ARTIFACT_SCHEMA,
             "status": "complete",
@@ -527,7 +606,7 @@ def write_ion_correction_artifact(
             for name, filename in ION_CORRECTION_FILENAMES.items():
                 payload_path = staging / filename
                 _atomic_save(payload_path, arrays[name])
-                descriptors[name] = _array_descriptor(payload_path, arrays[name])
+                descriptors[name] = _ion_array_descriptor(payload_path, arrays[name])
             unsigned: dict[str, Any] = {
                 "schema_version": ION_CORRECTION_SCHEMA,
                 "status": "complete",
@@ -569,13 +648,33 @@ def read_ion_correction_artifact(root: str | Path) -> np.ndarray:
             reject_invalid_state(
                 "ion correction CURRENT digest does not match its generation"
             )
-        descriptors = _validate_payload_table(
-            opened.path,
-            manifest.get("payloads"),
-            ION_CORRECTION_FILENAMES,
-            _validate_shape(manifest.get("shape"), "ion correction shape"),
+        correction_shape = _validate_shape(
+            manifest.get("shape"), "ion correction shape"
         )
-        arrays = _read_payloads(opened.path, descriptors)
+        raw_payloads = manifest.get("payloads")
+        if not isinstance(raw_payloads, dict) or set(raw_payloads) != set(
+            ION_CORRECTION_FILENAMES
+        ):
+            reject_invalid_state("ion correction payload table is incomplete")
+        descriptors: dict[str, dict[str, Any]] = {}
+        for name, filename in ION_CORRECTION_FILENAMES.items():
+            descriptor = raw_payloads[name]
+            if (
+                not isinstance(descriptor, dict)
+                or descriptor.get("file") != filename
+                or tuple(descriptor.get("shape", ())) != correction_shape
+                or not _is_sha256(descriptor.get("sha256"))
+            ):
+                reject_invalid_state(
+                    f"ion correction payload descriptor is invalid: {name}"
+                )
+            path = opened.path / filename
+            if not path.is_file() or path.is_symlink():
+                reject_invalid_state(
+                    f"ion correction payload missing or unsafe: {path}"
+                )
+            descriptors[name] = dict(descriptor)
+        arrays = _read_ion_payloads(opened.path, descriptors)
     finally:
         opened.lease.close()
     return arrays["corrected_unwrapped_phase"]

@@ -27,6 +27,23 @@ from faninsar.timeseries.results import TimeSeries
 logger = setup_logger(__name__)
 
 
+def _json_safe_metadata(value: Any) -> Any:
+    """Return metadata with NumPy scalar values converted for Zarr attrs."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return _json_safe_metadata(value.tolist())
+    if isinstance(value, dict):
+        return {str(key): _json_safe_metadata(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_metadata(item) for item in value]
+    try:
+        json.dumps(value)
+    except TypeError:
+        return str(value)
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class TimeSeriesZarrStore:
     """Pinned, hash-validated immutable time-series Zarr generation.
@@ -423,13 +440,14 @@ def write_timeseries_zarr(
                 chunks=array.shape,
                 overwrite=False,
             )
-        group.attrs.update(
-            {
-                "pair_ids": list(result.pair_ids),
-                "dates": list(result.dates),
-                **{str(k): str(v) for k, v in result.metadata.items()},
-            }
-        )
+        attrs: dict[str, Any] = {
+            "pair_ids": list(result.pair_ids),
+            "dates": list(result.dates),
+            "metadata": _json_safe_metadata(result.metadata),
+        }
+        if result.spatial is not None:
+            attrs["spatial"] = result.spatial.to_dict()
+        group.attrs.update(attrs)
         manifest = _write_generation_manifest(
             staging,
             generation_id=generation_id,

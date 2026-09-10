@@ -11,6 +11,14 @@ from typing import TYPE_CHECKING, Any, Self
 
 import numpy as np
 
+from faninsar.io.storage._zarr_stac import (
+    digest_path,
+    read_zarr_array,
+    validate_spatial_metadata,
+    validate_stac_item,
+    write_stac_item,
+    write_zarr_array,
+)
 from faninsar.io.storage.artifact_transaction import (
     ArtifactResourceLimits,
     GenerationLease,
@@ -30,15 +38,15 @@ IFG_ARTIFACT_SCHEMA = "stack_ifg_artifact_v1"
 UNWRAP_ARTIFACT_SCHEMA = "stack_unwrap_artifact_v1"
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _IFG_FILENAMES = {
-    "complex_ifg": "complex_ifg.npy",
-    "coherence": "coherence.npy",
-    "wrapped_phase": "wrapped_phase.npy",
-    "amplitude": "amplitude.npy",
+    "complex_ifg": "complex_ifg.zarr",
+    "coherence": "coherence.zarr",
+    "wrapped_phase": "wrapped_phase.zarr",
+    "amplitude": "amplitude.zarr",
 }
 _REQUIRED_IFG_FILENAMES = {
     name: filename for name, filename in _IFG_FILENAMES.items() if name != "coherence"
 }
-_VALID_MASK_FILENAME = "valid_mask.npy"
+_VALID_MASK_FILENAME = "valid_mask.zarr"
 _PHASE_SCREEN_MANIFEST_FIELDS = frozenset(
     {
         "flatten_stage",
@@ -49,9 +57,18 @@ _PHASE_SCREEN_MANIFEST_FIELDS = frozenset(
     }
 )
 _UNWRAP_FILENAMES = {
-    "unwrapped_phase": "unwrapped_phase.npy",
-    "connected_components": "connected_components.npy",
+    "unwrapped_phase": "unwrapped_phase.zarr",
+    "connected_components": "connected_components.zarr",
 }
+_LEGACY_IFG_FILENAMES = (
+    "complex_ifg.npy",
+    "coherence.npy",
+    "wrapped_phase.npy",
+    "amplitude.npy",
+    "valid_mask.npy",
+    "unwrapped_phase.npy",
+    "connected_components.npy",
+)
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:
@@ -74,14 +91,7 @@ def _digest_bytes(payload: bytes) -> str:
 
 def _digest_file(path: Path) -> str:
     """Hash one artifact payload without loading it into memory."""
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError as error:
-        reject_invalid_state(f"artifact payload cannot be hashed: {error}")
-    return digest.hexdigest()
+    return digest_path(path)
 
 
 def _is_sha256(value: object) -> bool:
@@ -161,18 +171,8 @@ def _verified_manifest(path: Path, schema: str) -> dict[str, Any]:
 
 
 def _atomic_save(path: Path, array: np.ndarray) -> None:
-    """Durably publish one NumPy payload through a same-directory rename."""
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        with temporary.open("wb") as stream:
-            np.save(stream, array, allow_pickle=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(path)
-    except OSError as error:
-        reject_invalid_state(f"artifact payload publication failed: {error}")
-    finally:
-        temporary.unlink(missing_ok=True)
+    """Durably publish one canonical Zarr payload."""
+    write_zarr_array(path, array)
 
 
 def _atomic_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
@@ -246,7 +246,7 @@ def _validate_payload_table(
             reject_invalid_state(f"artifact payload metadata is unsafe: {name}")
         path = root / filename
         _reject_symlink_components(path)
-        if not path.is_file() or path.is_symlink():
+        if not path.is_dir() or path.is_symlink():
             reject_invalid_state(f"artifact payload missing or unsafe: {path}")
         payloads[name] = dict(raw)
     return payloads
@@ -263,7 +263,7 @@ def _read_payloads(
         if _digest_file(path) != descriptor["sha256"]:
             reject_invalid_state(f"artifact payload digest mismatch: {name}")
         try:
-            array = np.load(path, allow_pickle=False)
+            array = read_zarr_array(path)
         except (OSError, ValueError, EOFError) as error:
             reject_invalid_state(f"artifact payload cannot be loaded: {error}")
         expected_shape = tuple(int(size) for size in descriptor["shape"])
@@ -408,6 +408,8 @@ class InterferogramArtifactStore:
     phase_screen_grid_identity: str = ""
     mask_plan_identity: str = ""
     mask_identity: str | None = None
+    crs: str | None = None
+    transform: tuple[float, ...] | None = None
 
     @classmethod
     def open(cls, root: str | Path) -> Self:
@@ -427,7 +429,11 @@ class InterferogramArtifactStore:
         path = _store_root(root, create=False)
         direct_payloads = [
             path / filename
-            for filename in (*_IFG_FILENAMES.values(), _VALID_MASK_FILENAME)
+            for filename in (
+                *_IFG_FILENAMES.values(),
+                _VALID_MASK_FILENAME,
+                *_LEGACY_IFG_FILENAMES,
+            )
         ]
         if any(payload.exists() for payload in direct_payloads):
             reject_invalid_state(
@@ -468,8 +474,6 @@ class InterferogramArtifactStore:
         ):
             reject_invalid_state("artifact looks must contain two positive integers")
         domain = manifest.get("domain", "radar")
-        if domain not in {"radar", "geo"}:
-            reject_invalid_state("artifact domain is invalid")
         raw_wavelength = manifest.get("wavelength_m")
         wavelength_m = None if raw_wavelength is None else float(raw_wavelength)
         if wavelength_m is not None and (
@@ -477,8 +481,6 @@ class InterferogramArtifactStore:
         ):
             reject_invalid_state("artifact wavelength_m is invalid")
         grid_identity = manifest.get("grid_identity")
-        if not _is_sha256(grid_identity):
-            reject_invalid_state("artifact grid_identity is invalid")
         raw_filter = manifest.get("filter")
         if (
             not isinstance(raw_filter, dict)
@@ -554,6 +556,13 @@ class InterferogramArtifactStore:
         if phase_screen_model is None and phase_screen_digests:
             reject_invalid_state("phase-screen digests require a phase-screen model")
         shape = _validate_shape(manifest.get("shape"), "shape")
+        domain, shape, grid_identity, crs, transform = validate_spatial_metadata(
+            domain,
+            shape,
+            grid_identity,
+            crs=manifest.get("crs"),
+            transform=manifest.get("transform"),
+        )
         raw_payloads = manifest["payloads"]
         if not isinstance(raw_payloads, dict):
             reject_invalid_state("artifact payload table is incomplete")
@@ -586,6 +595,15 @@ class InterferogramArtifactStore:
                 )
             )
         digest = str(manifest["manifest_digest"])
+        validate_stac_item(
+            path / "stac-item.json",
+            item_id=f"ifg-{raw_pair[0]}-{raw_pair[1]}",
+            domain=domain,
+            shape=shape,
+            grid_identity=grid_identity,
+            crs=crs,
+            transform=transform,
+        )
         return cls(
             root=path,
             generation_id=opened.generation_id,
@@ -594,6 +612,8 @@ class InterferogramArtifactStore:
             domain=str(domain),
             wavelength_m=wavelength_m,
             grid_identity=str(grid_identity),
+            crs=crs,
+            transform=transform,
             looks=(raw_looks[0], raw_looks[1]),
             filter_name=str(raw_filter["name"]),
             filter_parameters=filter_parameters,
@@ -682,6 +702,15 @@ class InterferogramArtifactStore:
             reject_invalid_state("unwrap artifact is bound to a different IFG")
         if _validate_shape(manifest.get("shape"), "unwrap shape") != self.shape:
             reject_invalid_state("unwrap artifact shape differs from its IFG")
+        domain, shape, grid_identity, crs, transform = validate_spatial_metadata(
+            manifest.get("domain"),
+            self.shape,
+            manifest.get("grid_identity"),
+            crs=manifest.get("crs"),
+            transform=manifest.get("transform"),
+        )
+        if domain != self.domain or grid_identity != self.grid_identity:
+            reject_invalid_state("unwrap artifact spatial metadata differs from IFG")
         raw_method = manifest.get("method")
         if (
             not isinstance(raw_method, dict)
@@ -700,6 +729,15 @@ class InterferogramArtifactStore:
         )
         arrays = _read_payloads(opened.path, descriptors)
         opened.lease.close()
+        validate_stac_item(
+            self.root / "unwrap-stac-item.json",
+            item_id=f"unwrap-{self.pair[0]}-{self.pair[1]}",
+            domain=domain,
+            shape=shape,
+            grid_identity=grid_identity,
+            crs=crs,
+            transform=transform,
+        )
         if (
             arrays["unwrapped_phase"].dtype.kind != "f"
             or arrays["connected_components"].dtype.kind not in "iu"
@@ -722,6 +760,8 @@ def write_ifg_artifact(
     domain: str = "radar",
     wavelength_m: float | None = None,
     grid_identity: str | None = None,
+    crs: object = None,
+    transform: object = None,
     filter_name: str,
     filter_parameters: Mapping[str, Any],
     source_manifest_digests: Mapping[str, str],
@@ -760,6 +800,10 @@ def write_ifg_artifact(
     grid_identity : str, optional
         Canonical source scene coordinate-grid identity. When omitted, a
         deterministic compatibility identity is derived from domain and shape.
+    crs : object, optional
+        Geographic CRS required for ``domain="geo"`` and forbidden for radar.
+    transform : object, optional
+        Six-value geographic affine transform required for ``domain="geo"``.
     filter_name : str
         Applied filter name, or ``"none"``.
     filter_parameters : mapping
@@ -854,6 +898,15 @@ def write_ifg_artifact(
     )
     if not _is_sha256(resolved_grid_identity):
         reject_invalid_state("IFG artifact grid_identity is invalid")
+    domain, shape, resolved_grid_identity, resolved_crs, resolved_transform = (
+        validate_spatial_metadata(
+            domain,
+            (int(shape[0]), int(shape[1])),
+            resolved_grid_identity,
+            crs=crs,
+            transform=transform,
+        )
+    )
     resolved_phase_screen_domain = (
         domain if phase_screen_domain is None else phase_screen_domain
     )
@@ -935,8 +988,11 @@ def write_ifg_artifact(
             "pair": list(pair),
             "looks": list(looks),
             "domain": domain,
+            "shape": [int(shape[0]), int(shape[1])],
             "wavelength_m": wavelength_m,
             "grid_identity": resolved_grid_identity,
+            "crs": resolved_crs,
+            "transform": list(resolved_transform) if resolved_transform else None,
             "flatten_stage": flatten_stage,
             "phase_screen_model": phase_screen_model,
             "phase_screen_digests": screen_digests,
@@ -946,7 +1002,6 @@ def write_ifg_artifact(
             "source_manifest_digests": sources,
             "mask_plan_identity": mask_plan_identity,
             "mask_identity": mask_identity,
-            "shape": [int(shape[0]), int(shape[1])],
             "payloads": descriptors,
         }
         manifest = {
@@ -962,6 +1017,19 @@ def write_ifg_artifact(
             manifest_digest=str(manifest["manifest_digest"]),
             compatibility_manifest=manifest,
         )
+    write_stac_item(
+        path / "stac-item.json",
+        item_id=f"ifg-{pair[0]}-{pair[1]}",
+        assets={
+            name: f".ifg_generations/{generation_id}/{descriptor['file']}"
+            for name, descriptor in descriptors.items()
+        },
+        domain=domain,
+        shape=(int(shape[0]), int(shape[1])),
+        grid_identity=resolved_grid_identity,
+        crs=resolved_crs,
+        transform=resolved_transform,
+    )
     logger.info("Published IFG artifact %s for pair %s", path, pair)
     return InterferogramArtifactStore.open(path)
 
@@ -974,6 +1042,8 @@ def write_unwrapped_artifact(
     method: str,
     method_parameters: Mapping[str, Any],
     ifg_manifest_digest: str,
+    crs: object = None,
+    transform: object = None,
     resource_limits: ArtifactResourceLimits | None = None,
     replace_existing: bool = False,
 ) -> None:
@@ -993,6 +1063,8 @@ def write_unwrapped_artifact(
         Canonical JSON parameters for the unwrapping method.
     ifg_manifest_digest : str
         Digest returned by :class:`InterferogramArtifactStore`.
+    crs, transform : object, optional
+        Geographic metadata inherited from the IFG when omitted.
     resource_limits : ArtifactResourceLimits, optional
         Hard publication size, file-count, and free-space limits.
     replace_existing : bool, optional
@@ -1019,6 +1091,15 @@ def write_unwrapped_artifact(
         "unwrapped_phase": phase,
         "connected_components": components,
     }
+    domain, shape, grid_identity, resolved_crs, resolved_transform = (
+        validate_spatial_metadata(
+            store.domain,
+            store.shape,
+            store.grid_identity,
+            crs=store.crs if crs is None else crs,
+            transform=store.transform if transform is None else transform,
+        )
+    )
     estimated_bytes = sum(int(array.nbytes) + 1024 for array in arrays.values())
     with stage_generation(
         store.root,
@@ -1046,6 +1127,10 @@ def write_unwrapped_artifact(
             "ifg_generation_id": store.generation_id,
             "ifg_manifest_digest": store.manifest_digest,
             "shape": list(store.shape),
+            "domain": domain,
+            "grid_identity": grid_identity,
+            "crs": resolved_crs,
+            "transform": list(resolved_transform) if resolved_transform else None,
             "method": {"name": method, "parameters": parameters},
             "payloads": descriptors,
         }
@@ -1062,6 +1147,19 @@ def write_unwrapped_artifact(
             manifest_digest=str(manifest["manifest_digest"]),
             compatibility_manifest=manifest,
         )
+    write_stac_item(
+        store.root / "unwrap-stac-item.json",
+        item_id=f"unwrap-{store.pair[0]}-{store.pair[1]}",
+        assets={
+            name: f".unwrap_generations/{generation_id}/{descriptor['file']}"
+            for name, descriptor in descriptors.items()
+        },
+        domain=domain,
+        shape=(int(shape[0]), int(shape[1])),
+        grid_identity=grid_identity,
+        crs=resolved_crs,
+        transform=resolved_transform,
+    )
     store.close()
     logger.info("Published unwrap artifact %s with method %s", store.root, method)
 

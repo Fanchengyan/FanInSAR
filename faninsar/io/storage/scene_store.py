@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from faninsar.io.storage._zarr_stac import (
+    digest_path,
+    read_zarr_array,
+    validate_spatial_metadata,
+    validate_stac_item,
+    write_stac_item,
+    write_zarr_array,
+)
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.interferometry.pair import (
     InterferogramProduct,
@@ -226,11 +233,7 @@ def _require_basename(value: object, field: str) -> str:
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return digest_path(path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +277,8 @@ class CoregisteredSceneStore:
     grid_shape: tuple[int, int]
     wavelength_m: float | None
     grid_identity: str
+    crs: str | None = None
+    transform: tuple[float, ...] | None = None
     flatten_stage: str = "coregistration"
 
     @classmethod
@@ -320,7 +325,7 @@ class CoregisteredSceneStore:
                 path, raw.get("secondary_file"), "secondary_file"
             )
             for payload in (primary, secondary):
-                if not payload.is_file() or payload.is_symlink():
+                if not payload.is_dir() or payload.is_symlink():
                     reject_invalid_state(f"scene payload missing or unsafe: {payload}")
             shape = (int(raw["rows"]), int(raw["cols"]))
             units.append(
@@ -361,7 +366,7 @@ class CoregisteredSceneStore:
             unit = units[-1]
             if unit.phase_screen_path is not None:
                 if (
-                    not unit.phase_screen_path.is_file()
+                    not unit.phase_screen_path.is_dir()
                     or unit.phase_screen_path.is_symlink()
                     or unit.phase_screen_digest is None
                     or _sha256(unit.phase_screen_path) != unit.phase_screen_digest
@@ -370,7 +375,7 @@ class CoregisteredSceneStore:
                         f"scene phase screen missing or digest mismatch: {unit.tag}"
                     )
                 try:
-                    screen = np.load(unit.phase_screen_path, allow_pickle=False)
+                    screen = read_zarr_array(unit.phase_screen_path)
                 except (OSError, ValueError) as error:
                     reject_invalid_state(
                         f"scene phase screen cannot be read for {unit.tag!r}: {error}"
@@ -393,7 +398,7 @@ class CoregisteredSceneStore:
         ).hexdigest()
         if expected_digest != actual_digest:
             reject_invalid_state("scene manifest digest mismatch")
-        raw_grid_shape = manifest.get("grid_shape")
+        raw_grid_shape = manifest.get("shape", manifest.get("grid_shape"))
         if raw_grid_shape is None:
             grid_shape = (
                 max(unit.row_origin + unit.shape[0] for unit in units),
@@ -435,7 +440,9 @@ class CoregisteredSceneStore:
             not np.isfinite(wavelength_m) or wavelength_m <= 0.0
         ):
             reject_invalid_state("scene manifest wavelength_m is invalid")
-        domain = str(manifest["domain"])
+        domain = manifest.get("domain")
+        if domain not in {"radar", "geo"}:
+            reject_invalid_state("scene manifest domain is invalid")
         raw_grid_identity = manifest.get("grid_identity")
         if domain == "geo" and raw_grid_identity is None:
             reject_invalid_state(
@@ -444,10 +451,24 @@ class CoregisteredSceneStore:
         grid_identity = str(
             raw_grid_identity or scene_grid_identity(domain, grid_shape)
         )
-        if len(grid_identity) != 64 or any(
-            character not in "0123456789abcdef" for character in grid_identity
-        ):
-            reject_invalid_state("scene manifest grid_identity is invalid")
+        crs = manifest.get("crs")
+        transform = manifest.get("transform")
+        _, _, grid_identity, crs, transform = validate_spatial_metadata(
+            domain,
+            grid_shape,
+            grid_identity,
+            crs=crs,
+            transform=transform,
+        )
+        validate_stac_item(
+            path / "stac-item.json",
+            item_id=f"scene-{manifest['date_id']}",
+            domain=domain,
+            shape=grid_shape,
+            grid_identity=grid_identity,
+            crs=crs,
+            transform=transform,
+        )
         return cls(
             root=path,
             date_id=str(manifest["date_id"]),
@@ -458,6 +479,8 @@ class CoregisteredSceneStore:
             grid_shape=grid_shape,
             wavelength_m=wavelength_m,
             grid_identity=grid_identity,
+            crs=crs,
+            transform=transform,
             flatten_stage=manifest_stage,
         )
 
@@ -468,7 +491,7 @@ class CoregisteredSceneStore:
             reject_invalid_state(f"scene unit {tag!r} is not in the manifest")
         if unit.phase_screen_path is None:
             return None
-        screen = np.load(unit.phase_screen_path, allow_pickle=False)
+        screen = read_zarr_array(unit.phase_screen_path)
         if screen.shape != unit.shape or screen.dtype != np.float32:
             reject_invalid_state(f"scene phase screen shape mismatch for {tag!r}")
         if _sha256(unit.phase_screen_path) != unit.phase_screen_digest:
@@ -492,8 +515,8 @@ class CoregisteredSceneStore:
         ).hexdigest()
         if payload_digest != unit.payload_digest:
             reject_invalid_state(f"scene unit {tag!r} payload digest mismatch")
-        primary = np.load(unit.primary_path, allow_pickle=False)
-        secondary = np.load(unit.secondary_path, allow_pickle=False)
+        primary = read_zarr_array(unit.primary_path)
+        secondary = read_zarr_array(unit.secondary_path)
         if primary.shape != unit.shape or secondary.shape != unit.shape:
             reject_invalid_state(f"scene unit {tag!r} shape mismatch")
         if primary.dtype != np.complex64 or secondary.dtype != np.complex64:
@@ -515,6 +538,8 @@ def write_scene_unit(
     grid_shape: tuple[int, int] | None = None,
     wavelength_m: float | None = None,
     grid_identity: str | None = None,
+    crs: object = None,
+    transform: object = None,
     scientific_lineage: Sequence[Mapping[str, str]] | None = None,
     phase_state: Mapping[str, object] | None = None,
     phase_screen: np.ndarray | None = None,
@@ -542,6 +567,10 @@ def write_scene_unit(
         Radar wavelength in metres.
     grid_identity : str, optional
         Canonical coordinate-grid SHA-256.
+    crs : object, optional
+        Geographic CRS required for ``domain="geo"`` and forbidden for radar.
+    transform : object, optional
+        Six-value geographic affine transform required for ``domain="geo"``.
     scientific_lineage : sequence of mappings, optional
         Source and processing lineage attached to the unit.
     phase_state : mapping, optional
@@ -590,6 +619,8 @@ def write_scene_unit(
         not np.isfinite(wavelength_m) or wavelength_m <= 0.0
     ):
         reject_invalid_state("scene wavelength_m must be finite and positive")
+    if domain not in {"radar", "geo"}:
+        reject_invalid_state("scene domain must be radar or geo")
     if domain == "geo" and grid_identity is None:
         reject_invalid_state("Geo scene publication requires an explicit grid_identity")
     resolved_grid_identity = grid_identity or scene_grid_identity(
@@ -600,6 +631,15 @@ def write_scene_unit(
         character not in "0123456789abcdef" for character in resolved_grid_identity
     ):
         reject_invalid_state("scene grid_identity must be a lowercase SHA-256")
+    _, _, resolved_grid_identity, resolved_crs, resolved_transform = (
+        validate_spatial_metadata(
+            domain,
+            (int(resolved_grid_shape[0]), int(resolved_grid_shape[1])),
+            resolved_grid_identity,
+            crs=crs,
+            transform=transform,
+        )
+    )
     manifest_path = path / "manifest.json"
     existing: dict[str, object] = {}
     if manifest_path.is_file():
@@ -626,32 +666,26 @@ def write_scene_unit(
             existing_grid_identity != resolved_grid_identity
         ):
             reject_invalid_state("scene units must share one coordinate grid")
-    primary_path = path / f"{tag}.primary.npy"
-    sec_path = path / f"{tag}.secondary.npy"
+        if existing.get("crs") != resolved_crs or existing.get("transform") != (
+            list(resolved_transform) if resolved_transform else None
+        ):
+            reject_invalid_state("scene units must share one spatial reference")
+    primary_path = path / f"{tag}.primary.zarr"
+    sec_path = path / f"{tag}.secondary.zarr"
     for target, array in ((primary_path, primary), (sec_path, secondary)):
-        temporary = target.with_suffix(target.suffix + ".tmp")
-        with temporary.open("wb") as stream:
-            np.save(stream, np.asarray(array, dtype=np.complex64), allow_pickle=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(target)
+        write_zarr_array(target, np.asarray(array, dtype=np.complex64))
     phase_path: Path | None = None
     phase_digest: str | None = None
     if phase_screen is not None:
-        phase_path = path / f"{tag}.phase.npy"
-        temporary = phase_path.with_suffix(phase_path.suffix + ".tmp")
-        with temporary.open("wb") as stream:
-            np.save(
-                stream,
-                np.asarray(phase_screen, dtype=np.float32),
-                allow_pickle=False,
-            )
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(phase_path)
+        phase_path = path / f"{tag}.phase.zarr"
+        write_zarr_array(phase_path, np.asarray(phase_screen, dtype=np.float32))
         phase_digest = _sha256(phase_path)
     else:
-        (path / f"{tag}.phase.npy").unlink(missing_ok=True)
+        import shutil
+
+        old_phase_path = path / f"{tag}.phase.zarr"
+        if old_phase_path.exists():
+            shutil.rmtree(old_phase_path)
     units = [item for item in existing.get("units", []) if item.get("tag") != tag]
     unit_record = {
         "tag": tag,
@@ -680,9 +714,12 @@ def write_scene_unit(
         "date_id": date_id,
         "reference_id": reference_id,
         "domain": domain,
+        "shape": list(resolved_grid_shape),
         "grid_shape": list(resolved_grid_shape),
         "wavelength_m": wavelength_m,
         "grid_identity": resolved_grid_identity,
+        "crs": resolved_crs,
+        "transform": list(resolved_transform) if resolved_transform else None,
         "flatten_stage": flatten_stage,
         "units": sorted(units, key=lambda item: str(item["tag"])),
     }
@@ -697,6 +734,24 @@ def write_scene_unit(
         json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
     temporary_manifest.replace(manifest_path)
+    assets = {
+        f"{unit['tag']}-{role}": unit[f"{role}_file"]
+        for unit in units
+        for role in ("primary", "secondary")
+    }
+    for unit in units:
+        if unit.get("phase_screen_file"):
+            assets[f"{unit['tag']}-phase"] = unit["phase_screen_file"]
+    write_stac_item(
+        path / "stac-item.json",
+        item_id=f"scene-{date_id}",
+        assets=assets,
+        domain=domain,
+        shape=(int(resolved_grid_shape[0]), int(resolved_grid_shape[1])),
+        grid_identity=resolved_grid_identity,
+        crs=resolved_crs,
+        transform=resolved_transform,
+    )
 
 
 def copy_reference_units(source: str | Path, target: str | Path) -> None:
@@ -722,6 +777,8 @@ def copy_reference_units(source: str | Path, target: str | Path) -> None:
             grid_shape=source_store.grid_shape,
             wavelength_m=source_store.wavelength_m,
             grid_identity=source_store.grid_identity,
+            crs=source_store.crs,
+            transform=source_store.transform,
             scientific_lineage=unit.scientific_lineage,
             phase_state=unit.phase_state,
             phase_screen=None,

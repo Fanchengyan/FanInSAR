@@ -122,6 +122,26 @@ def test_ifg_artifact_round_trip_records_provenance(tmp_path: Path) -> None:
     assert not list(root.glob("*.tmp"))
 
 
+def test_ifg_and_unwrap_are_zarr_assets_with_stac_records(tmp_path: Path) -> None:
+    """IFG and unwrap durable boundaries contain no NPY payloads."""
+    root = tmp_path / "ifg"
+    store = _write_base(root)
+    assert (root / "stac-item.json").is_file()
+    assert all(path.is_dir() for path in root.rglob("*.zarr"))
+    assert not list(root.rglob("*.npy"))
+    write_unwrapped_artifact(
+        root,
+        unwrapped_phase=np.ones((2, 3), dtype=np.float32),
+        connected_components=np.ones((2, 3), dtype=np.int32),
+        method="snaphu",
+        method_parameters={},
+        ifg_manifest_digest=store.manifest_digest,
+    )
+    assert (root / "unwrap-stac-item.json").is_file()
+    assert not list(root.rglob("*.npy"))
+    store.close()
+
+
 def test_ifg_artifact_records_phase_screen_lineage(tmp_path: Path) -> None:
     """Phase-screen metadata is explicit and bound into the manifest digest."""
     root = tmp_path / "ifg"
@@ -287,14 +307,20 @@ def test_ifg_artifact_payload_damage_fails_closed(
     """Missing, corrupt, and wrong-shape payloads cannot be consumed."""
     root = tmp_path / "ifg"
     _write_base(root)
-    payload = InterferogramArtifactStore.open(root).generation_root / "coherence.npy"
+    pinned_payload = (
+        InterferogramArtifactStore.open(root).generation_root / "coherence.zarr"
+    )
+    payload = pinned_payload.parent / pinned_payload.name
     if failure == "missing":
-        payload.unlink()
+        import shutil
+
+        shutil.rmtree(payload)
     elif failure == "corrupt":
-        payload.write_bytes(b"not a numpy array")
+        (payload / "zarr.json").write_bytes(b"not a zarr array")
     else:
-        with payload.open("wb") as stream:
-            np.save(stream, np.ones((1, 1), dtype=np.float32), allow_pickle=False)
+        import zarr
+
+        zarr.open_array(store=str(payload), mode="w", shape=(1, 1), dtype=np.float32)
 
     with pytest.raises(InvalidProcessingStateError):
         InterferogramArtifactStore.open(root).read()
@@ -383,7 +409,9 @@ def test_unwrapped_artifact_damage_fails_closed(tmp_path: Path) -> None:
     )
     unwrap_current = json.loads((root / "UNWRAP_CURRENT").read_text())
     unwrap_root = root / ".unwrap_generations" / unwrap_current["generation_id"]
-    (unwrap_root / "connected_components.npy").unlink()
+    import shutil
+
+    shutil.rmtree(unwrap_root / "connected_components.zarr")
 
     with pytest.raises(InvalidProcessingStateError):
         InterferogramArtifactStore.open(root).read_unwrapped()

@@ -1566,6 +1566,17 @@ def make_nisar_scene_provider(
                 grid_shape=grid_shape,
                 wavelength_m=primary_product.grid.wavelength_m,
                 grid_identity=grid_identity,
+                # Every tile belongs to one common scene grid.  Persist the
+                # requested scene CRS/transform; the local tile transform is
+                # only a processing detail and remains in lineage below.
+                crs=(
+                    str(target.crs) if domain == "geo" and target is not None else None
+                ),
+                transform=(
+                    tuple(float(value) for value in target.transform)
+                    if domain == "geo" and target is not None
+                    else None
+                ),
                 scientific_lineage=(
                     {
                         "stage": "nisar_rslc_tile"
@@ -1580,6 +1591,16 @@ def make_nisar_scene_provider(
                         "channel": f"{channel[0]}/{channel[1]}",
                         "lineage": "primary",
                         "dem_identity": dem_identity,
+                        "tile_grid": (
+                            None
+                            if local_target is None
+                            else {
+                                "crs": str(local_target.crs),
+                                "transform": [
+                                    float(value) for value in local_target.transform
+                                ],
+                            }
+                        ),
                         "window": f"{row_start}:{row_stop},{col_start}:{col_stop}",
                     },
                     {
@@ -1595,6 +1616,16 @@ def make_nisar_scene_provider(
                         "channel": f"{channel[0]}/{channel[1]}",
                         "lineage": "secondary",
                         "dem_identity": dem_identity,
+                        "tile_grid": (
+                            None
+                            if local_target is None
+                            else {
+                                "crs": str(local_target.crs),
+                                "transform": [
+                                    float(value) for value in local_target.transform
+                                ],
+                            }
+                        ),
                         "range_offset_flatten": "nisar_ellipsoidal_v1",
                         "flatten_stage": requested_flatten_stage,
                         "window": (

@@ -14,7 +14,20 @@ Use a supported mission Stack directly:
    s1_stack = S1Stack.from_safes(safe_paths, work_dir=work_dir)
    nisar_stack = NISARStack.from_rslc(rslc_paths, work_dir=work_dir)
 
-Open an already processed generation through Network:
+For a live Stack, use its Network directly after unwrapping:
+
+.. code-block:: python
+
+   s1_stack.unwrap()
+   time_series = s1_stack.network.invert()
+
+   # A model class selects NSBAS; omitting it selects SBAS.
+   from faninsar.timeseries import LinearModel
+
+   nsbas_result = s1_stack.network.invert(model=LinearModel)
+
+Open an already processed generation through Network only when it was
+persisted elsewhere:
 
 .. code-block:: python
 
@@ -22,7 +35,7 @@ Open an already processed generation through Network:
 
    network = Network.open(generation_path)
    interferograms = network.interferograms
-   time_series = network.analyze_time_series()
+   time_series = network.invert()
 
 ``faninsar.stack.Stack`` is the developer extension contract; it is not a root
 constructor. ``Interferogram`` is available from ``faninsar.network`` and

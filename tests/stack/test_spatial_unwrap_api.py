@@ -179,6 +179,20 @@ def test_stack_unwrap_connects_directly_to_time_series_analysis(tmp_path: Path) 
     assert result.phase_cumulative_rad.shape == (2, 2, 3)
 
 
+def test_stack_network_inverts_without_publish_or_reopen(tmp_path: Path) -> None:
+    """A live Stack Network view can run SBAS directly after unwrapping."""
+    stack = _stack_with_ifg(tmp_path)
+
+    stack.unwrap(_IdentityUnwrapper())
+
+    network = stack.network
+    assert network is not None
+    result = network.invert()
+
+    assert result.pair_ids == ("20240101_20240113",)
+    assert result.phase_cumulative_rad.shape == (2, 2, 3)
+
+
 def test_stack_network_exposes_its_interferogram_collection(tmp_path: Path) -> None:
     """An analysis-ready Stack provides readable Network interferograms."""
     stack = _stack_with_ifg(tmp_path)
@@ -188,6 +202,12 @@ def test_stack_network_exposes_its_interferogram_collection(tmp_path: Path) -> N
 
     assert network is not None
     assert network.interferograms.pairs().to_names().tolist() == ["20240101_20240113"]
+    spatial = network.interferograms.spatial_metadata
+    assert spatial["domain"] == "radar"
+    assert spatial["shape"] == [2, 3]
+    assert len(spatial["grid_identity"]) == 64
+    assert "crs" not in spatial
+    assert "transform" not in spatial
     unwrapped = network.interferograms.open_stack("unw_phase")
     assert unwrapped.shape == (1, 2, 3)
     np.testing.assert_allclose(unwrapped.values[0], 0.2)

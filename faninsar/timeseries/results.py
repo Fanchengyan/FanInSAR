@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
 
@@ -11,6 +12,70 @@ from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
 logger = setup_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class SpatialMetadata:
+    """Structured coordinate identity carried by a time-series result.
+
+    Parameters
+    ----------
+    domain : {"radar", "geo"}
+        Coordinate domain of the arrays.
+    shape : tuple[int, int]
+        Spatial ``(height, width)`` of every raster band.
+    grid_identity : str
+        Stable identity of the source coordinate grid.
+    crs : str, optional
+        CRS required for geographic products.
+    transform : tuple[float, ...], optional
+        Affine transform coefficients required for geographic products.
+    radar_coordinates : dict[str, Any], optional
+        Domain-specific radar coordinate metadata.
+
+    """
+
+    domain: Literal["radar", "geo"]
+    shape: tuple[int, int]
+    grid_identity: str
+    crs: str | None = None
+    transform: tuple[float, ...] | None = None
+    radar_coordinates: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the coordinate identity without guessing missing fields."""
+        if self.domain not in {"radar", "geo"}:
+            message = "spatial domain must be 'radar' or 'geo'"
+            raise ValueError(message)
+        if len(self.shape) != 2 or any(size <= 0 for size in self.shape):
+            message = "spatial shape must contain two positive dimensions"
+            raise ValueError(message)
+        if not isinstance(self.grid_identity, str) or not self.grid_identity.strip():
+            message = "spatial grid_identity must be a non-empty string"
+            raise ValueError(message)
+        if self.domain == "geo" and (
+            not isinstance(self.crs, str)
+            or not self.crs.strip()
+            or self.transform is None
+            or len(self.transform) != 6
+        ):
+            message = "geo spatial metadata requires CRS and six transform values"
+            raise ValueError(message)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-compatible structured representation."""
+        payload: dict[str, Any] = {
+            "domain": self.domain,
+            "shape": list(self.shape),
+            "grid_identity": self.grid_identity,
+        }
+        if self.crs is not None:
+            payload["crs"] = self.crs
+        if self.transform is not None:
+            payload["transform"] = list(self.transform)
+        if self.radar_coordinates is not None:
+            payload["radar_coordinates"] = dict(self.radar_coordinates)
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +101,8 @@ class TimeSeries:
         Cumulative LOS displacement in metres when a wavelength was supplied.
     metadata : dict[str, Any]
         Product semantics and inversion diagnostics.
+    canonical_path : pathlib.Path, optional
+        Canonical STAC+Zarr product root when the result has been persisted.
 
     """
 
@@ -48,6 +115,8 @@ class TimeSeries:
     displacement_increments_m: np.ndarray | None = None
     displacement_cumulative_m: np.ndarray | None = None
     revision_id: str | None = None
+    spatial: SpatialMetadata | None = None
+    canonical_path: Path | None = None
 
     def __post_init__(self) -> None:
         """Validate the optional source Network revision identity."""
@@ -56,6 +125,41 @@ class TimeSeries:
         ):
             message = "revision_id must be a non-empty string or None"
             raise ValueError(message)
+        if self.canonical_path is not None and not isinstance(
+            self.canonical_path, Path
+        ):
+            message = "canonical_path must be a pathlib.Path or None"
+            logger.error(message)
+            raise ValueError(message)
+
+    def export(
+        self,
+        path: str | Path,
+        *,
+        overwrite: bool = False,
+        exporter: object | None = None,
+    ) -> object:
+        """Export this result through the time-series exporter seam.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            Complete destination product root.
+        overwrite : bool, optional
+            Replace an existing destination when ``True``.
+        exporter : str, type, or callable, optional
+            Registered exporter name, zero-argument exporter class, or a
+            configured callable. ``None`` selects the default exporter.
+
+        Returns
+        -------
+        object
+            Exporter-defined result, normally the destination path.
+
+        """
+        from faninsar.timeseries.export import export_timeseries
+
+        return export_timeseries(self, path, overwrite=overwrite, exporter=exporter)
 
 
 def _solve_connected_pixels(

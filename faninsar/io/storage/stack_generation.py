@@ -11,6 +11,14 @@ from typing import TYPE_CHECKING, Any, Self
 
 import numpy as np
 
+from faninsar.io.storage._zarr_stac import (
+    digest_path,
+    read_zarr_array,
+    validate_spatial_metadata,
+    validate_stac_item,
+    write_stac_item,
+    write_zarr_array,
+)
 from faninsar.io.storage.artifact_transaction import (
     GenerationLease,
     canonical_json,
@@ -242,15 +250,12 @@ def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
 
 
 def _write_array(path: Path, value: object) -> np.ndarray:
-    """Write one non-object result array and return an owned copy."""
+    """Write one non-object result array as canonical Zarr and copy it."""
     array = np.asarray(value)
     if array.dtype.hasobject or array.ndim == 0 or array.ndim > 2:
         reject_invalid_state("Stack unwrap result layers must be 1-D or 2-D arrays")
     try:
-        with path.open("wb") as stream:
-            np.save(stream, array, allow_pickle=False)
-            stream.flush()
-            os.fsync(stream.fileno())
+        write_zarr_array(path, array)
     except (OSError, ValueError) as error:
         reject_invalid_state(f"Stack unwrap result cannot be written: {error}")
     return array.copy()
@@ -262,6 +267,7 @@ def _unwrap_payload_descriptor(path: Path, array: np.ndarray) -> dict[str, Any]:
         "file": path.name,
         "shape": [int(size) for size in array.shape],
         "dtype": array.dtype.str,
+        "sha256": digest_path(path),
     }
 
 
@@ -271,6 +277,10 @@ def publish_unwrap_generation(
     pair_ids: Sequence[str],
     products: Mapping[str, Mapping[str, object]],
     pair_bindings: Mapping[str, Mapping[str, str]],
+    domain: str = "radar",
+    shape: tuple[int, int] | None = None,
+    crs: object = None,
+    transform: object = None,
     mask_plan_identity: str = "",
     mask_identity: str | None = None,
 ) -> UnwrapResultGeneration:
@@ -288,6 +298,12 @@ def publish_unwrap_generation(
         Exact source IFG generation identity and grid metadata for each Pair.
         Stack publication supplies this binding so downstream stages can
         consume the root generation without reopening a legacy per-IFG unwrap.
+    domain : {"radar", "geo"}, optional
+        Common coordinate domain for the unwrap products.
+    shape : tuple[int, int], optional
+        Common spatial shape. Inferred from the first product when omitted.
+    crs, transform : object, optional
+        Geographic metadata required for ``domain="geo"``.
     mask_plan_identity : str, optional
         Identity of the canonical mask plan used for the result.
     mask_identity : str, optional
@@ -361,6 +377,30 @@ def publish_unwrap_generation(
             layers[name] = array
         normalized[pair_id] = layers
 
+    first_layers = next(iter(normalized.values()))
+    first_array = next(iter(first_layers.values()))
+    resolved_shape = shape or first_array.shape
+    grid_identities = {binding["grid_identity"] for binding in bindings.values()}
+    if len(grid_identities) != 1:
+        reject_invalid_state("Stack unwrap bindings must share one coordinate grid")
+    domain, resolved_shape, grid_identity, resolved_crs, resolved_transform = (
+        validate_spatial_metadata(
+            domain,
+            (int(resolved_shape[0]), int(resolved_shape[1])),
+            next(iter(grid_identities)),
+            crs=crs,
+            transform=transform,
+        )
+    )
+    spatial_layers = {"unwrapped_phase", "valid_mask", "component_labels"}
+    if any(
+        layer.shape != resolved_shape
+        for layers in normalized.values()
+        for name, layer in layers.items()
+        if name in spatial_layers
+    ):
+        reject_invalid_state("Stack unwrap spatial layers must share one shape")
+
     with stage_generation(
         root,
         "unwrap",
@@ -374,7 +414,7 @@ def publish_unwrap_generation(
             pair_root.mkdir(mode=0o700)
             payloads: dict[str, dict[str, Any]] = {}
             for name, value in normalized[pair_id].items():
-                payload_path = pair_root / f"{name}.npy"
+                payload_path = pair_root / f"{name}.zarr"
                 array = _write_array(payload_path, value)
                 payloads[name] = _unwrap_payload_descriptor(payload_path, array)
             pair_manifest: dict[str, Any] = {
@@ -389,6 +429,11 @@ def publish_unwrap_generation(
             "generation_id": generation_id,
             "pair_ids": list(ordered_pairs),
             "pairs": manifest_pairs,
+            "domain": domain,
+            "shape": list(resolved_shape),
+            "grid_identity": grid_identity,
+            "crs": resolved_crs,
+            "transform": list(resolved_transform) if resolved_transform else None,
             "mask_plan_identity": str(mask_plan_identity),
             "mask_identity": mask_identity,
         }
@@ -405,6 +450,23 @@ def publish_unwrap_generation(
             manifest_digest=str(manifest["manifest_digest"]),
             compatibility_manifest=manifest,
         )
+    write_stac_item(
+        root / "unwrap-stac-item.json",
+        item_id=f"stack-unwrap-{generation_id}",
+        assets={
+            f"{pair_id}-{name}": (
+                f".unwrap_generations/{generation_id}/{pair_id}/{descriptor['file']}"
+            )
+            for pair_manifest in manifest_pairs
+            for name, descriptor in pair_manifest["payloads"].items()
+            for pair_id in (pair_manifest["pair_id"],)
+        },
+        domain=domain,
+        shape=(int(resolved_shape[0]), int(resolved_shape[1])),
+        grid_identity=grid_identity,
+        crs=resolved_crs,
+        transform=resolved_transform,
+    )
     return open_unwrap_generation(root)
 
 
@@ -442,6 +504,14 @@ def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
             or manifest.get("manifest_digest") != opened.manifest_digest
         ):
             reject_invalid_state("Stack unwrap CURRENT and manifest identities differ")
+        raw_shape = manifest.get("shape")
+        domain, shape, grid_identity, crs, transform = validate_spatial_metadata(
+            manifest.get("domain"),
+            tuple(raw_shape) if isinstance(raw_shape, list) else (),
+            manifest.get("grid_identity"),
+            crs=manifest.get("crs"),
+            transform=manifest.get("transform"),
+        )
         raw_pair_ids = manifest.get("pair_ids")
         if not isinstance(raw_pair_ids, list) or any(
             not isinstance(pair_id, str) or not pair_id for pair_id in raw_pair_ids
@@ -486,9 +556,10 @@ def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
                 if (
                     not isinstance(name, str)
                     or not isinstance(descriptor, dict)
-                    or descriptor.get("file") != f"{name}.npy"
+                    or descriptor.get("file") != f"{name}.zarr"
                     or not isinstance(descriptor.get("shape"), list)
                     or not isinstance(descriptor.get("dtype"), str)
+                    or not isinstance(descriptor.get("sha256"), str)
                 ):
                     reject_invalid_state("Stack unwrap payload descriptor is invalid")
                 try:
@@ -505,9 +576,10 @@ def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
                         "Stack unwrap payload shape or dtype is invalid"
                     )
                 try:
-                    array = np.load(
-                        pair_root / str(descriptor["file"]), allow_pickle=False
-                    )
+                    payload_path = pair_root / str(descriptor["file"])
+                    if digest_path(payload_path) != descriptor["sha256"]:
+                        reject_invalid_state("Stack unwrap payload digest mismatch")
+                    array = read_zarr_array(payload_path)
                 except (OSError, ValueError, EOFError) as error:
                     reject_invalid_state(
                         f"Stack unwrap payload cannot be read: {error}"
@@ -519,6 +591,15 @@ def open_unwrap_generation(stack_root: str | Path) -> UnwrapResultGeneration:
     except Exception:
         opened.lease.close()
         raise
+    validate_stac_item(
+        root / "unwrap-stac-item.json",
+        item_id=f"stack-unwrap-{manifest['generation_id']}",
+        domain=domain,
+        shape=shape,
+        grid_identity=grid_identity,
+        crs=crs,
+        transform=transform,
+    )
     return UnwrapResultGeneration(
         root=root,
         generation_id=opened.generation_id,
