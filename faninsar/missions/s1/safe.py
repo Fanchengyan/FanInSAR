@@ -113,6 +113,7 @@ def _open_safe_zip(
             if "/annotation/" in name
             and name.endswith(".xml")
             and "/calibration/" not in name
+            and "/rfi/" not in name
             and not name.endswith("/")
         )
         if not annotation_names:
