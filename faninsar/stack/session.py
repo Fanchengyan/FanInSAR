@@ -22,7 +22,7 @@ import subprocess
 import sys
 import sysconfig
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
@@ -73,15 +73,26 @@ from faninsar.stack.config import (
     FlattenStage,
     StackConfig,
 )
+from faninsar.stack.input_manifest import (
+    build_manifest,
+    read_manifest,
+    write_manifest,
+)
 from faninsar.stack.mask_plan import MaskPlan, StageName
 from faninsar.stack.provider import SourceHandle
+from faninsar.stack.search import (
+    MissionPreparedInputs,
+    MissionSearchProfile,
+    SelectionRequest,
+    merge_profile_filters,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Sequence
 
     from faninsar.core.acquisition import Acquisition
     from faninsar.core.pair import Pairs
-    from faninsar.data.query import BoundingBox, Polygons
+    from faninsar.data.query import BoundingBox, Points, Polygons
     from faninsar.io.storage.ifg_store import (
         InterferogramArtifactStore,
         UnwrappedArtifact,
@@ -103,6 +114,7 @@ if TYPE_CHECKING:
     from faninsar.processing.unwrapping.common import SpatialUnwrapper
     from faninsar.processing.unwrapping.quality import StackQualityCriteria
     from faninsar.processing.unwrapping.stack import SpatialExecutor, StackUnwrapResult
+    from faninsar.remote.records import CatalogItem, RemoteResourceBudget
     from faninsar.stack.provider import StackSceneProvider
     from faninsar.timeseries.results import TimeSeries
 
@@ -796,6 +808,7 @@ class Stack(NetworkContract):
     timeseries: TimeSeries | None = None
     unwrap_result: StackUnwrapResult | None = None
     _prepared: bool = False
+    _mission_prepared: MissionPreparedInputs | None = field(default=None, repr=False)
     _generation: StackResultGeneration | None = field(default=None, repr=False)
     _unwrap_generation: Any | None = field(default=None, repr=False)
     _network_generation_id: str | None = field(default=None, repr=False)
@@ -963,6 +976,8 @@ class Stack(NetworkContract):
         selected = dem or self.config.dem
         if selected is None:
             selected = dem_api.DEM.from_source("auto")
+        if isinstance(selected, dem_api.RasterDEM):
+            dem_api.ensure_dem_covers_grid(selected, self.grid)
         cache_dir = self.config.dem_cache_dir or (self.config.work_dir / "dem-cache")
         if hasattr(selected, "cache_dir") and selected.cache_dir is None:
             selected.cache_dir = cache_dir  # type: ignore[attr-defined]
@@ -971,6 +986,234 @@ class Stack(NetworkContract):
             vertical_datum="ellipsoidal",
             budget=self.config.resource_budget,
         )
+
+    @classmethod
+    def _search_profile(cls) -> MissionSearchProfile:
+        """Return the mission profile used by :meth:`search`.
+
+        Concrete remote-capable mission adapters override this protected
+        method.  Keeping the default closed prevents a bare mission-neutral
+        ``Stack`` from guessing a provider or mission.
+        """
+        message = f"{cls.__name__} does not provide a remote search profile"
+        logger.error(message)
+        raise NotImplementedError(message)
+
+    @classmethod
+    def search(
+        cls,
+        spatial: Points | BoundingBox | Polygons,
+        *,
+        datetime_range: tuple[datetime, datetime] | None = None,
+        flight_direction: Literal["ASCENDING", "DESCENDING"] | None = None,
+        filters: Mapping[str, object] | None = None,
+        auth_profile: str | None = None,
+        limit: int = 100,
+        budget: RemoteResourceBudget | None = None,
+    ) -> list[CatalogItem]:
+        """Search a mission catalog through the provider-neutral remote API.
+
+        Parameters
+        ----------
+        spatial : Points, BoundingBox, or Polygons
+            FanInSAR spatial query.
+        datetime_range : tuple of datetime, optional
+            Inclusive acquisition interval.
+        flight_direction : {"ASCENDING", "DESCENDING"}, optional
+            Common orbit direction filter.
+        filters : mapping, optional
+            Advanced provider filters accepted by the mission profile.
+        auth_profile : str, optional
+            Registered authentication and delivery profile.
+        limit : int, default=100
+            Candidate limit after complete catalog traversal and mission
+            normalization.
+        budget : RemoteResourceBudget, optional
+            Bound on the remote operation.
+
+        Returns
+        -------
+        list of CatalogItem
+            Mission-normalized selected catalog records.
+
+        """
+        profile = cls._search_profile()
+        if not isinstance(profile, MissionSearchProfile):
+            message = "mission search profile must be MissionSearchProfile"
+            logger.error(message)
+            raise TypeError(message)
+        merged_filters = merge_profile_filters(profile.default_filters, filters)
+        from faninsar.remote import search as remote_search
+
+        items = remote_search(
+            spatial,
+            catalog=profile.catalog,
+            collections=profile.collections or None,
+            datetime_range=datetime_range,
+            flight_direction=flight_direction,
+            filters=merged_filters,
+            auth_profile=auth_profile,
+            limit=limit,
+            budget=budget,
+        )
+        normalized = profile.normalize(items)
+        request = SelectionRequest(
+            limit=limit,
+            datetime_range=datetime_range,
+            flight_direction=flight_direction,
+            filters=merged_filters,
+        )
+        return profile.select(normalized, request)
+
+    def _prepare_mission(self) -> MissionPreparedInputs:
+        """Return mission-owned local inputs for shared preparation.
+
+        Local-only stacks have no additional orbit or calibration inputs. A
+        mission adapter may override this hook after constructing a valid
+        local Stack; the result is validated before shared state is published.
+        """
+        selected = self.config.extra.get("selected_footprints", ())
+        if isinstance(selected, (str, bytes)):
+            selected = (selected,)
+        return MissionPreparedInputs(selected_footprints=tuple(selected))
+
+    @staticmethod
+    def _manifest_identity(value: object) -> object:
+        """Return a bounded identity for common preparation values."""
+        result: object
+        if value is None or isinstance(value, (str, int, float, bool)):
+            result = value
+        elif isinstance(value, Path):
+            result = str(value)
+        elif hasattr(value, "__geo_interface__"):
+            result = Stack._manifest_identity(value.__geo_interface__)
+        elif isinstance(value, Mapping):
+            result = {
+                str(key): Stack._manifest_identity(item) for key, item in value.items()
+            }
+        elif isinstance(value, (tuple, list)):
+            result = [Stack._manifest_identity(item) for item in value]
+        else:
+            result = None
+            for attribute in ("identity", "digest"):
+                candidate = getattr(value, attribute, None)
+                if isinstance(candidate, str):
+                    result = candidate
+                    break
+        return result
+
+    def _manifest_processing_options(self) -> dict[str, object]:
+        """Return the complete user-controlled preparation identity."""
+        return {
+            "mission": self.__class__.__name__,
+            "product_type": self.config.extra.get("search_product_type"),
+            "polarizations": self.config.extra.get(
+                "search_polarizations", self.config.extra.get("polarizations")
+            ),
+            "coreg_mode": self.config.coreg_mode,
+            "multilook": self.config.multilook,
+            "reference": self.reference,
+            "roi": self._manifest_identity(self.config.roi),
+            "grid": self._manifest_identity(self.config.grid),
+            "dem": self._manifest_identity(self.config.dem),
+            "mask": self.config.mask_plan.identity,
+        }
+
+    def _validate_mission_prepared(
+        self,
+        prepared: MissionPreparedInputs,
+    ) -> MissionPreparedInputs:
+        """Validate one immutable mission preparation result."""
+        if not isinstance(prepared, MissionPreparedInputs):
+            message = "_prepare_mission must return MissionPreparedInputs"
+            logger.error(message)
+            raise TypeError(message)
+        paths = (
+            *prepared.orbit_paths_by_acquisition.values(),
+            *prepared.calibration_paths,
+        )
+        for path in paths:
+            if not Path(path).is_file():
+                message = f"mission preparation path is not a file: {path}"
+                logger.error(message)
+                raise FileNotFoundError(message)
+        return prepared
+
+    def prepare(self, *, refresh: bool = False) -> Self:
+        """Prepare shared Stack inputs and publish the local input manifest.
+
+        The operation is idempotent when an existing manifest remains valid.
+        It uses a single temporary JSON file and an ``os.replace`` publication
+        boundary; no journal or deferred Stack state is introduced.
+        """
+        self._prepared = False
+        self._mission_prepared = None
+        manifest_path = self.config.work_dir / "input_manifest.json"
+        if not refresh and manifest_path.is_file():
+            options_match = True
+            try:
+                manifest = read_manifest(manifest_path)
+                expected_options = self._manifest_identity(
+                    self._manifest_processing_options()
+                )
+                recorded_options = manifest.get("processing_options")
+                options_match = recorded_options == expected_options
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+                message = f"Stack input manifest is invalid: {error}"
+                logger.exception(message)
+                raise ValueError(message) from error
+            if not options_match:
+                message = (
+                    "Stack input manifest processing options do not match "
+                    "the current Stack"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            prepared = self._validate_mission_prepared(self._prepare_mission())
+            self._mission_prepared = prepared
+            if prepared.selected_footprints:
+                self.config.extra["selected_footprints"] = prepared.selected_footprints
+            self.prepare_scenes()
+            return self
+
+        try:
+            prepared = self._validate_mission_prepared(self._prepare_mission())
+            self._mission_prepared = prepared
+            if prepared.selected_footprints:
+                self.config.extra["selected_footprints"] = prepared.selected_footprints
+
+            self.prepare_scenes()
+
+            resolved_grid: object | None = None
+            if (
+                self.config.grid != "auto"
+                or self.config.roi is not None
+                or prepared.selected_footprints
+            ):
+                resolved_grid = self.resolve_grid()
+            resolved_dem: object | None = None
+            if self.config.dem is not None and resolved_grid is not None:
+                resolved_dem = self.materialize_dem()
+            mask_identity = tuple(
+                (stage, self.config.mask_plan.references(stage))
+                for stage in ("roi", "interferogram", "unwrap", "ionosphere")
+                if self.config.mask_plan.references(stage)
+            )
+            document = build_manifest(
+                mission=self.__class__.__name__,
+                catalog_paths=self.catalog.paths,
+                prepared=prepared,
+                grid=self._manifest_identity(resolved_grid),
+                dem=self._manifest_identity(resolved_dem),
+                mask=self._manifest_identity(mask_identity),
+                processing_options=self._manifest_processing_options(),
+            )
+            write_manifest(manifest_path, document)
+        except Exception:
+            self._prepared = False
+            self._mission_prepared = None
+            raise
+        return self
 
     @classmethod
     def _from_safes(
@@ -1745,6 +1988,9 @@ class Stack(NetworkContract):
             self.config.dem.grid != self.grid
             or self.config.dem.vertical_datum != "ellipsoidal"
         ):
+            from faninsar.processing.geometry import api as dem_api
+
+            dem_api.ensure_dem_covers_grid(self.config.dem, self.grid)
             self.config.dem = self.config.dem.to_raster(
                 self.grid,
                 vertical_datum="ellipsoidal",

@@ -30,6 +30,14 @@ from faninsar.missions.s1.io import (
 )
 from faninsar.missions.s1.orbit import read_eof_orbit
 from faninsar.missions.s1.safe import open_safe_product
+from faninsar.missions.s1.search import (
+    S1DualPolarization,
+    S1Polarization,
+    S1PolarizationRequest,
+    S1ProductType,
+    normalize_polarizations,
+    product_filters,
+)
 from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
 
 SPEED_OF_LIGHT_M_S: float = 299_792_458.0
@@ -77,7 +85,11 @@ __all__ = [
     "BurstArray",
     "RemoteSafe",
     "S1Burst",
+    "S1DualPolarization",
+    "S1Polarization",
+    "S1PolarizationRequest",
     "S1Product",
+    "S1ProductType",
     "S1Stack",
     "S1Swath",
     "Sentinel1ProductError",
@@ -88,8 +100,10 @@ __all__ = [
     "extract_burst",
     "extract_bursts",
     "extract_remote_burst",
+    "normalize_polarizations",
     "open_safe_product",
     "parse_annotation_xml",
+    "product_filters",
     "read_burst_window",
     "read_eof_orbit",
     "read_full_burst",

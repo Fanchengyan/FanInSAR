@@ -27,6 +27,14 @@ from faninsar.stack.config import (
     StackConfig,
 )
 from faninsar.stack.grid import automatic_grid, resolve_stack_grid
+from faninsar.stack.input_manifest import (
+    MANIFEST_SCHEMA,
+    build_manifest,
+    file_identity,
+    read_manifest,
+    validate_manifest,
+    write_manifest,
+)
 from faninsar.stack.mask_plan import (
     MASK_KINDS,
     STAGES,
@@ -42,10 +50,17 @@ from faninsar.stack.provider import (
     unavailable_scene_provider,
     unsupported_stack_capability,
 )
+from faninsar.stack.search import (
+    MissionPreparedInputs,
+    MissionSearchProfile,
+    SelectionRequest,
+    merge_profile_filters,
+)
 from faninsar.stack.session import Stack
 from faninsar.stack.stage import Stage
 
 __all__ = [
+    "MANIFEST_SCHEMA",
     "MASK_KINDS",
     "STAGES",
     "ActivationIssuerRecord",
@@ -59,8 +74,11 @@ __all__ = [
     "LocalActivationAuthority",
     "MaskDefinition",
     "MaskPlan",
+    "MissionPreparedInputs",
+    "MissionSearchProfile",
     "SceneCatalog",
     "SceneProductionCallback",
+    "SelectionRequest",
     "SourceHandle",
     "Stack",
     "StackConfig",
@@ -72,9 +90,15 @@ __all__ = [
     "UnwrapResultGeneration",
     "UnwrappedArtifact",
     "automatic_grid",
+    "build_manifest",
+    "file_identity",
+    "merge_profile_filters",
     "open_unwrap_generation",
     "publish_unwrap_generation",
+    "read_manifest",
     "resolve_stack_grid",
     "unavailable_scene_provider",
     "unsupported_stack_capability",
+    "validate_manifest",
+    "write_manifest",
 ]
