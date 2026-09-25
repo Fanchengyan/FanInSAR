@@ -764,6 +764,12 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         burst_row0, burst_col0 = state.radar_roi_origin
     assert state.primary_deramped is not None
     assert state.secondary_aligned is not None
+    if coregistration_grid == "geo" and (
+        np.asarray(state.primary_deramped).size == 0
+        or np.asarray(state.secondary_aligned).size == 0
+    ):
+        logger.warning("%s: empty geocoded footprint; skipped", tag)
+        return {"unit": None, "stage_times": stage_times}
     if scene_store_dir is not None:
         from faninsar.io.storage.scene_store import (
             scene_grid_identity,
@@ -811,7 +817,7 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
                 else None
             ),
             transform=(
-                tuple(float(value) for value in geo_grid.transform)
+                tuple(float(value) for value in tuple(geo_grid.transform)[:6])
                 if coregistration_grid == "geo" and geo_grid is not None
                 else None
             ),
@@ -2461,6 +2467,7 @@ def stage_interferogram(
     multilook: tuple[int, int] = (4, 20),
     goldstein_alpha: float = 0.5,
     dead_pixel_amp_threshold: float = 0.0,
+    coherence_window: tuple[int, int] | None = None,
     device: str = "auto",
     dask_client: Any | None = None,
 ) -> ProductionPairState:
@@ -2479,6 +2486,10 @@ def stage_interferogram(
         average (dead-pixel masking). Set to 0 to disable. The production
         Stack provider entry point passes 3.0 for real S1
         data; synthetic tests use the default 0.
+    coherence_window : tuple[int, int] or None, optional
+        Centered stride-one support for the two-stage coherence estimate
+        (sliding-window MLE then per-block averaging). ``None`` keeps the
+        direct per-block MLE.
     device : {"auto", "cpu", "cuda", "mps"}, optional
         Numerical device. CPU and CUDA use the unified Torch kernels; MPS uses
         the logged NumPy CPU fallback.
@@ -2515,6 +2526,7 @@ def stage_interferogram(
             state.secondary_aligned,
             multilook=multilook,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            coherence_window=coherence_window,
         )
     else:
         from faninsar.processing.runtime.dask_gpu import run_multilook_interferogram
@@ -2524,6 +2536,7 @@ def stage_interferogram(
             state.secondary_aligned,
             multilook=multilook,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            coherence_window=coherence_window,
             device=device,
             client=dask_client,
         )

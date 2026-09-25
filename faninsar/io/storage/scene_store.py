@@ -21,6 +21,7 @@ from faninsar.io.storage._zarr_stac import (
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.interferometry.pair import (
     InterferogramProduct,
+    _sliding_coherence,
     form_interferogram,
     goldstein_filter,
     mask_invalid_looks,
@@ -1034,6 +1035,8 @@ def form_merged_scene_interferogram(
         ifg_acc = np.zeros((out_rows, out_cols), dtype=np.complex128)
         primary_power_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
         secondary_power_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
+        coherence_acc = np.zeros((out_rows, out_cols), dtype=np.float64)
+        coherence_count = np.zeros((out_rows, out_cols), dtype=np.int32)
         claimed = np.zeros((out_rows, out_cols), dtype=np.int32)
         for tag in tags:
             primary_ref, primary_sec, primary_unit = primary_store.read(tag)
@@ -1104,18 +1107,45 @@ def form_merged_scene_interferogram(
                 secondary_power[in_bounds][free],
             )
             np.add.at(claimed, (free_rows, free_cols), 1)
+            if coherence_window is not None:
+                unit_coherence = _sliding_coherence(
+                    primary, secondary, coherence_window
+                )
+                finite_coh = np.isfinite(unit_coherence)
+                coh_values = np.where(finite_coh, unit_coherence, 0.0)
+                np.add.at(
+                    coherence_acc,
+                    (free_rows, free_cols),
+                    coh_values[in_bounds][free],
+                )
+                np.add.at(
+                    coherence_count,
+                    (free_rows, free_cols),
+                    finite_coh[in_bounds][free].astype(np.int32),
+                )
         has_data = claimed > 0
         denominator = np.where(has_data, claimed, 1)
         group_ifg = np.where(has_data, ifg_acc / denominator, 0).astype(np.complex64)
-        coherence_denominator = np.sqrt(
-            np.maximum(
-                (primary_power_acc / denominator) * (secondary_power_acc / denominator),
-                1e-30,
+        if coherence_window is None:
+            coherence_denominator = np.sqrt(
+                np.maximum(
+                    (primary_power_acc / denominator)
+                    * (secondary_power_acc / denominator),
+                    1e-30,
+                )
             )
-        )
-        group_coherence = np.clip(
-            np.abs(group_ifg) / coherence_denominator, 0.0, 1.0
-        ).astype(np.float32)
+            group_coherence = np.clip(
+                np.abs(group_ifg) / coherence_denominator, 0.0, 1.0
+            ).astype(np.float32)
+        else:
+            # Documented window semantics: a stride-one local coherence MLE
+            # accumulated per fine sample and averaged over each look block,
+            # never a degenerate single-sample MLE under (1, 1) looks.
+            group_coherence = np.where(
+                coherence_count > 0,
+                coherence_acc / np.maximum(coherence_count, 1),
+                np.nan,
+            ).astype(np.float32)
         group_coherence[~has_data] = np.nan
         group_products[group] = group_ifg, group_coherence
 

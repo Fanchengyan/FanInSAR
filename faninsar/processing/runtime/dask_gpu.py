@@ -507,6 +507,7 @@ def _schedule_multilook_interferogram(
     *,
     multilook: tuple[int, int],
     dead_pixel_amp_threshold: float = 0.0,
+    coherence_window: tuple[int, int] | None = None,
     device: str = "auto",
     chunk_rows: int = 256,
     client: Any | None = None,
@@ -558,6 +559,7 @@ def _schedule_multilook_interferogram(
             secondary_chunk,
             multilook=multilook,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            coherence_window=coherence_window,
             device=worker_device,
         )
         return (
@@ -836,6 +838,7 @@ def run_multilook_interferogram(
     *,
     multilook: tuple[int, int],
     dead_pixel_amp_threshold: float = 0.0,
+    coherence_window: tuple[int, int] | None = None,
     device: str = "auto",
     chunk_rows: int = 256,
     client: Any | None = None,
@@ -852,6 +855,7 @@ def run_multilook_interferogram(
             secondary,
             multilook=multilook,
             dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+            coherence_window=coherence_window,
             device=device,
             chunk_rows=chunk_rows,
             client=resolved_client,
@@ -869,6 +873,7 @@ def run_multilook_interferogram(
         secondary,
         multilook=multilook,
         dead_pixel_amp_threshold=dead_pixel_amp_threshold,
+        coherence_window=coherence_window,
         device=_local_device_after_remote_rejection(
             device, resolved_client, "multilook_interferogram"
         ),

@@ -273,25 +273,33 @@ def _sliding_coherence(
     secondary: np.ndarray,
     window: tuple[int, int],
 ) -> np.ndarray:
-    """Compute stride-one centered coherence MLE with clipped edges."""
-    height, width = primary.shape
-    half_az, half_rg = window[0] // 2, window[1] // 2
-    output = np.full((height, width), np.nan, dtype=np.float64)
+    """Compute stride-one centered coherence MLE with clipped edges.
+
+    Boxcar sums via :func:`scipy.ndimage.uniform_filter` reproduce the
+    clipped window support and the exact MLE ratio while keeping the
+    estimator O(N) instead of per-pixel Python loops.
+    """
+    from scipy.ndimage import uniform_filter
+
+    size = (int(window[0]), int(window[1]))
     finite = np.isfinite(primary.real) & np.isfinite(primary.imag)
     finite &= np.isfinite(secondary.real) & np.isfinite(secondary.imag)
-    for row in range(height):
-        r0, r1 = max(0, row - half_az), min(height, row + half_az + 1)
-        for col in range(width):
-            c0, c1 = max(0, col - half_rg), min(width, col + half_rg + 1)
-            valid = finite[r0:r1, c0:c1]
-            if np.count_nonzero(valid) < 2:
-                continue
-            p = primary[r0:r1, c0:c1][valid]
-            s = secondary[r0:r1, c0:c1][valid]
-            numerator = abs(np.sum(p * np.conjugate(s)))
-            denominator = np.sqrt(np.sum(abs(p) ** 2) * np.sum(abs(s) ** 2))
-            if np.isfinite(denominator) and denominator > 0:
-                output[row, col] = numerator / denominator
+    p = np.where(finite, primary, 0).astype(np.complex128)
+    s = np.where(finite, secondary, 0).astype(np.complex128)
+    cross = p * np.conjugate(s)
+
+    def box(values: np.ndarray) -> np.ndarray:
+        return uniform_filter(values, size=size, mode="constant", cval=0.0)
+
+    numerator = np.hypot(box(cross.real), box(cross.imag))
+    denominator = np.sqrt(
+        np.maximum(box(np.abs(p) ** 2), 0.0) * np.maximum(box(np.abs(s) ** 2), 0.0)
+    )
+    counts = box(finite.astype(np.float64)) * float(size[0] * size[1])
+    valid = (counts >= 2.0) & (denominator > 0.0)
+    output = np.full(primary.shape, np.nan, dtype=np.float64)
+    np.divide(numerator, denominator, out=output, where=valid)
+    output[~valid] = np.nan
     return output
 
 

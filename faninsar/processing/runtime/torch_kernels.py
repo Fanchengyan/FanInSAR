@@ -456,6 +456,7 @@ def multilook_interferogram_torch(
     *,
     multilook: tuple[int, int] = (1, 1),
     dead_pixel_amp_threshold: float = 0.0,
+    coherence_window: tuple[int, int] | None = None,
     device: DeviceName = "auto",
     precision: PrecisionName = "auto",
 ) -> object:
@@ -474,6 +475,11 @@ def multilook_interferogram_torch(
         ``(azimuth_looks, range_looks)`` non-overlapping boxcar looks.
     dead_pixel_amp_threshold : float, optional
         SLC amplitude below which a pixel is excluded from the look average.
+    coherence_window : tuple[int, int] or None, optional
+        Centered stride-one ``(azimuth, range)`` support for the two-stage
+        coherence estimate: a sliding-window MLE on the fine grid followed by
+        a finite-only mean per look block.  ``None`` keeps the direct
+        per-block MLE, matching the NumPy reference either way.
     device : {"auto", "cpu", "cuda", "mps"}, optional
         Torch execution device.
     precision : {"auto", "float32", "float64"}, optional
@@ -492,6 +498,9 @@ def multilook_interferogram_torch(
     az_looks, rg_looks = multilook
     if az_looks < 1 or rg_looks < 1:
         reject_invalid_state("multilook factors must be >= 1")
+    from faninsar.processing.interferometry.pair import validate_coherence_window
+
+    coherence_window = validate_coherence_window(coherence_window)
     torch = _import_torch()
     resolved = resolve_torch_device(device)
     complex_dtype = _complex_dtype(
@@ -578,9 +587,76 @@ def multilook_interferogram_torch(
         if output_complex_dtype == np.dtype(np.complex128)
         else torch.complex64
     )
-    coherence = torch.clamp(ifg.abs() / denom, 0.0, 1.0).to(
-        dtype=torch_output_float_dtype
-    )
+    if coherence_window is None:
+        coherence = torch.clamp(ifg.abs() / denom, 0.0, 1.0).to(
+            dtype=torch_output_float_dtype
+        )
+    else:
+        # Two-stage window semantics (P0038): a stride-one sliding-window
+        # coherence MLE on the fine grid, then a finite-only mean per look
+        # block.  avg_pool2d with zero padding reproduces the NumPy
+        # reference's clipped-window sums: out-of-array cells contribute
+        # zero to every window sum, and validity keeps its own channel.
+        functional = torch.nn.functional
+        w_az, w_rg = coherence_window
+        fine_cross = padded_p * torch.conj(padded_s)
+        channels = torch.stack(
+            (
+                fine_cross.real,
+                fine_cross.imag,
+                padded_p.real**2 + padded_p.imag**2,
+                padded_s.real**2 + padded_s.imag**2,
+                padded_valid.to(dtype=float_dtype),
+            ),
+            dim=0,
+        ).unsqueeze(0)
+        pooled = functional.avg_pool2d(
+            channels,
+            kernel_size=(w_az, w_rg),
+            stride=1,
+            padding=(w_az // 2, w_rg // 2),
+            count_include_pad=True,
+        )[0]
+        sliding_count = pooled[4] * float(w_az * w_rg)
+        sliding_denominator = torch.sqrt(torch.clamp(pooled[2] * pooled[3], min=0.0))
+        # Estimate on real array cells only: a look-padding cell would
+        # otherwise extrapolate a window from its neighbours and leak into
+        # tail-block means that the NumPy reference never averages.  The
+        # centre cell itself may be invalid -- the NumPy reference estimates
+        # from the surrounding valid samples either way.
+        in_bounds = torch.zeros(
+            (padded_height, padded_width), dtype=torch.bool, device=resolved
+        )
+        in_bounds[:height, :width] = True
+        sliding_valid = (
+            in_bounds & (sliding_count >= 2.0) & (pooled[2] > 0.0) & (pooled[3] > 0.0)
+        )
+        sliding_coherence = torch.abs(torch.complex(pooled[0], pooled[1])) / (
+            torch.clamp(sliding_denominator, min=1e-30)
+        )
+        sliding_coherence = torch.clamp(sliding_coherence, 0.0, 1.0).to(
+            dtype=float_dtype
+        )
+        sliding_coherence = torch.where(
+            sliding_valid,
+            sliding_coherence,
+            torch.full_like(sliding_coherence, float("nan")),
+        )
+        finite_coh = torch.isfinite(sliding_coherence)
+        coh_values = torch.where(
+            finite_coh, sliding_coherence, torch.zeros_like(sliding_coherence)
+        )
+        block_sum = coh_values.reshape(out_h, az_looks, out_w, rg_looks).sum(dim=(1, 3))
+        block_count = (
+            finite_coh.to(dtype=float_dtype)
+            .reshape(out_h, az_looks, out_w, rg_looks)
+            .sum(dim=(1, 3))
+        )
+        coherence = torch.where(
+            block_count > 0,
+            block_sum / torch.clamp(block_count, min=1.0),
+            torch.full_like(block_sum, float("nan")),
+        ).to(dtype=torch_output_float_dtype)
     amplitude = ifg.abs().to(dtype=torch_output_float_dtype)
     valid_out = (
         (sample_counts > 0)
@@ -605,11 +681,10 @@ def multilook_interferogram_torch(
         dtype=torch_output_float_dtype,
         device=resolved,
     )
-    coherence_out = torch.where(
-        invalid | (sample_counts < 2),
-        nan_float,
-        coherence,
+    coherence_nan_mask = (
+        invalid | (sample_counts < 2) if coherence_window is None else invalid
     )
+    coherence_out = torch.where(coherence_nan_mask, nan_float, coherence)
     amplitude_out = torch.where(invalid, nan_float, amplitude)
     wrapped = ifg_out.angle()
     wrapped = torch.where(
