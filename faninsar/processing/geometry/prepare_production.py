@@ -884,11 +884,26 @@ def _public_raster_dem_native_arrays(
         # source sampler is evaluated directly at the private view centres;
         # the resulting arrays never leave this geometry preparation seam.
         view_x, view_y = view_grid.xy_pixel_centers()
+        view_values = np.asarray(
+            dem.sample(np.asarray(view_y), np.asarray(view_x)),
+            dtype=np.float32,
+        )
+        # The lon/lat bounding box of a projected grid covers corner
+        # triangles outside the source footprint; sampling there is
+        # out-of-grid.  Native kernels require a finite DEM bucket while the
+        # host seam only masks non-finite samples, so void cells fall back to
+        # 0 m (sea level) before the arrays leave this seam.  Coverage of the
+        # queried footprint itself is admitted upstream by
+        # ``ensure_dem_covers_grid``; this fill only touches cells outside it.
+        void_count = int(np.count_nonzero(~np.isfinite(view_values)))
+        view_values[~np.isfinite(view_values)] = 0.0
+        if void_count:
+            logger.info(
+                "native geometry DEM view filled %d out-of-footprint cells with 0 m",
+                void_count,
+            )
         source = RasterDEM(
-            array=np.asarray(
-                dem.sample(np.asarray(view_y), np.asarray(view_x)),
-                dtype=np.float32,
-            ),
+            array=view_values,
             grid=view_grid,
             vertical_datum=dem.vertical_datum,
             provenance={"kind": "private-geometry-view"},

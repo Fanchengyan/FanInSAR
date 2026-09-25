@@ -854,6 +854,98 @@ class RasterDEM(DEM):
             dataset.update_tags(dem_vertical_datum=self.vertical_datum)
 
 
+def ensure_dem_covers_grid(
+    dem: RasterDEM,
+    grid: GridSpec,
+    *,
+    margin_px: int = 4,
+) -> None:
+    """Fail closed unless a raster DEM covers one target grid footprint.
+
+    The target grid's corner bounding box is reprojected into the DEM's CRS
+    (a projected target over a geographic source bulges past its naive
+    bounds), expanded by ``margin_px`` DEM samples, and required to lie
+    inside the DEM bounds.  Without this admission a too-small DEM would be
+    silently void-filled at execution-view seams and produce wrong heights
+    with no user-visible error.
+
+    Parameters
+    ----------
+    dem : RasterDEM
+        Materialized raster DEM whose coverage is admitted.
+    grid : GridSpec
+        Complete target grid the DEM must over-cover.
+    margin_px : int, optional
+        Kernel safety margin in DEM samples added on every side.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        Naming every missing side and its shortfall in kilometres or degrees.
+
+    """
+    from affine import Affine
+    from pyproj import CRS, Transformer
+
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    affine = Affine(*dem.grid.transform)
+    margin_x = margin_px * abs(affine.a)
+    margin_y = margin_px * abs(affine.e)
+    target_west, target_south, target_east, target_north = grid.bounds
+    if str(dem.grid.crs) != str(grid.crs):
+        transformer = Transformer.from_crs(grid.crs, dem.grid.crs, always_xy=True)
+        xs, ys = transformer.transform(
+            [target_west, target_east, target_west, target_east],
+            [target_south, target_south, target_north, target_north],
+        )
+        target_west, target_east = min(xs), max(xs)
+        target_south, target_north = min(ys), max(ys)
+    dem_west, dem_south, dem_east, dem_north = dem.grid.bounds
+    required = {
+        "west": target_west - margin_x,
+        "south": target_south - margin_y,
+        "east": target_east + margin_x,
+        "north": target_north + margin_y,
+    }
+    actual = {
+        "west": dem_west,
+        "south": dem_south,
+        "east": dem_east,
+        "north": dem_north,
+    }
+    shortfalls = {
+        "west": actual["west"] - required["west"],
+        "south": actual["south"] - required["south"],
+        "east": required["east"] - actual["east"],
+        "north": required["north"] - actual["north"],
+    }
+    missing = {side: gap for side, gap in shortfalls.items() if gap > 0}
+    if not missing:
+        return
+    geographic = CRS.from_user_input(dem.grid.crs).is_geographic
+    if geographic:
+        sides = ", ".join(
+            f"{side} short by {gap:.4f} deg" for side, gap in missing.items()
+        )
+        digits = 4
+    else:
+        sides = ", ".join(
+            f"{side} short by {gap / 1000.0:.2f} km" for side, gap in missing.items()
+        )
+        digits = 1
+    message = (
+        f"DEM bounds [{dem_west:.{digits}f}, {dem_south:.{digits}f}, "
+        f"{dem_east:.{digits}f}, {dem_north:.{digits}f}] do not cover the "
+        f"target grid footprint [{required['west']:.{digits}f}, "
+        f"{required['south']:.{digits}f}, {required['east']:.{digits}f}, "
+        f"{required['north']:.{digits}f}] ({sides}); "
+        "provide a DEM larger than the SAR extent"
+    )
+    logger.error(message)
+    raise InvalidProcessingStateError(message)
+
+
 __all__ = [
     "DEM",
     "ConstantDEM",
@@ -862,4 +954,5 @@ __all__ = [
     "RasterDEM",
     "SourceDEM",
     "VerticalDatum",
+    "ensure_dem_covers_grid",
 ]

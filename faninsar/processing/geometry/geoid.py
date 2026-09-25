@@ -48,8 +48,8 @@ class GeoidSampler:
                     raise ValueError("geoid latitude must be within [-90, 90]")
                 wrapped = ((lon + 180.0) % 360.0) - 180.0
                 rows, cols = rowcol(dataset.transform, wrapped, lat)
-                rows = np.asarray(rows, dtype=np.int64)
-                cols = np.asarray(cols, dtype=np.int64)
+                rows = np.asarray(rows, dtype=np.int64).reshape(lat.shape)
+                cols = np.asarray(cols, dtype=np.int64).reshape(lat.shape)
                 valid = (
                     (rows >= 0)
                     & (rows < dataset.height)
