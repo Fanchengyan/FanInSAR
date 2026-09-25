@@ -23,6 +23,11 @@ class RemoteResourceBudget:
         Maximum number of catalog items returned.
     max_requests : int
         Maximum number of transfer attempts.
+    max_poll_attempts : int
+        Maximum number of observations made while waiting for a provider
+        generated asset.  This limit is separate from ordinary retries.
+    max_poll_interval_seconds : float
+        Maximum delay between observations of a provider generated asset.
     max_response_bytes : int
         Maximum bytes accepted from one response.
     max_output_bytes : int
@@ -36,6 +41,8 @@ class RemoteResourceBudget:
     max_requests: int = 256
     max_redirects: int = 5
     max_retries: int = 4
+    max_poll_attempts: int = 50
+    max_poll_interval_seconds: float = 10.0
     max_elapsed_seconds: float = 900.0
     max_workers: int = 8
     connect_timeout_seconds: float = 10.0
@@ -53,6 +60,7 @@ class RemoteResourceBudget:
             "max_requests",
             "max_redirects",
             "max_retries",
+            "max_poll_attempts",
             "max_workers",
             "max_response_bytes",
             "max_operation_bytes",
@@ -63,14 +71,21 @@ class RemoteResourceBudget:
             if getattr(self, name) <= 0:
                 msg = f"{name} must be positive"
                 raise ValueError(msg)
+        if self.max_poll_attempts > 50:
+            msg = "max_poll_attempts must be at most 50"
+            raise ValueError(msg)
         for name in (
             "max_elapsed_seconds",
+            "max_poll_interval_seconds",
             "connect_timeout_seconds",
             "read_timeout_seconds",
         ):
             if getattr(self, name) <= 0:
                 msg = f"{name} must be positive"
                 raise ValueError(msg)
+        if self.max_poll_interval_seconds > 10:
+            msg = "max_poll_interval_seconds must be at most 10"
+            raise ValueError(msg)
 
 
 def _freeze(value: Any) -> Any:

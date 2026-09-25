@@ -793,6 +793,7 @@ class CMRCollectionAdapter:
                 f"{end.astimezone(UTC).isoformat().replace('+00:00', 'Z')}"
             )
         search_after: str | None = None
+        emitted = 0
         for _ in range(self.max_pages):
             # Registrations may pin a deterministic granule with an endpoint
             # query (for example, ``concept_id=G...``).  Preserve that
@@ -838,9 +839,16 @@ class CMRCollectionAdapter:
                         "CMR entry must be an object",
                     )
                 yield entry
+                emitted += 1
             token = response_headers.get("cmr-search-after") or response_headers.get(
                 "search-after"
             )
+            if token and limit is not None and emitted >= limit:
+                _error(
+                    CMRDiscoveryError,
+                    "incomplete_results",
+                    "CMR result budget was reached before the terminal page",
+                )
             if not token or not entries or len(entries) < page_size:
                 return
             if token == search_after:
@@ -1007,11 +1015,21 @@ class CMRCollectionAdapter:
                 "unsafe_data_url",
                 f"granule {item_id!r} contains no registered data URL",
             )
-        # One complete-file asset is the portable remote contract.  If a
-        # provider advertises several GET DATA URLs, use the first registered
-        # HTTPS candidate and leave alternate representations to the provider
-        # adapter instead of silently publishing ambiguous choices.
-        _name, candidate, clean_href = safe_candidates[0]
+        # Provider response order is not a scientific selection rule.  The
+        # provider-specific filter must reduce alternate representations to
+        # exactly one complete file before it crosses the catalog boundary.
+        unique_candidates = {
+            clean_href: (name, candidate, clean_href)
+            for name, candidate, clean_href in safe_candidates
+        }
+        if len(unique_candidates) != 1:
+            _error(
+                CMRDiscoveryError,
+                "ambiguous_representation",
+                f"granule {item_id!r} has {len(unique_candidates)} matching data "
+                "representations",
+            )
+        _name, candidate, clean_href = next(iter(unique_candidates.values()))
         key = "data"
         asset = {"href": clean_href}
         if candidate.get("MimeType") or candidate.get("type"):

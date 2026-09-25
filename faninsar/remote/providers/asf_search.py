@@ -21,8 +21,10 @@ from faninsar.remote.access import _safe_url
 from faninsar.remote.catalog import _register_adapter
 from faninsar.remote.cmr import CMRCollectionAdapter
 from faninsar.remote.errors import (
+    BurstPendingError,
     RemoteAccessError,
     RemoteLimitError,
+    RemoteQueryError,
     _fail,
 )
 from faninsar.remote.protocols import _CallLedger
@@ -42,10 +44,13 @@ DEFAULT_DATA_ORIGINS = ("https://datapool.asf.alaska.edu",)
 _EARTHDATA_AUTH_ORIGIN = "https://urs.earthdata.nasa.gov"
 _ASF_AUTH_ORIGIN = "https://cumulus.asf.alaska.edu"
 _SENTINEL1_DATA_ORIGIN = "https://sentinel1.asf.alaska.edu"
+_SENTINEL1_BURST_ORIGIN = "https://sentinel1-burst.asf.alaska.edu"
 _COLLECTION_CONCEPT_IDS = {
     "sentinel-1": "C1214470488-ASF",
+    "s1-slc": "C1214470488-ASF",
     "sentinel-1a_slc": "C1214470488-ASF",
     "sentinel-1_slc": "C1214470488-ASF",
+    "slc-burst": "C2709161906-ASF",
     "sentinel-1d": "C4175278193-ASF",
     "sentinel-1d_slc": "C4175278193-ASF",
 }
@@ -142,6 +147,7 @@ def _geometry_wkt(spatial: Any) -> str:
 
 _FILTER_NAMES = frozenset(
     {
+        "dataset",
         "platform",
         "processingLevel",
         "instrument",
@@ -156,8 +162,221 @@ _FILTER_NAMES = frozenset(
         "granule_list",
         "product_list",
         "groupID",
+        "absoluteBurstID",
+        "relativeBurstID",
+        "fullBurstID",
     }
 )
+
+
+def _asset_title(url: str) -> str:
+    """Return a stable representation label for one ASF delivery URL."""
+    suffix = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1].casefold()
+    if suffix.endswith(".zip"):
+        return "SAFE ZIP"
+    if suffix.endswith((".tif", ".tiff")):
+        return "BURST TIFF"
+    if suffix.endswith(".xml"):
+        return "BURST XML"
+    return "data"
+
+
+def _complete_safe_candidate(candidate: Mapping[str, Any], href: str) -> bool:
+    """Return whether an ASF link is one complete SAFE ZIP representation."""
+    path = urllib.parse.urlsplit(href).path.casefold()
+    if path.endswith(".zip"):
+        return True
+    name = str(candidate.get("Name", candidate.get("title", ""))).casefold()
+    format_name = str(candidate.get("Format", candidate.get("format", ""))).casefold()
+    return format_name == "safe" and "safe" in name
+
+
+def _burst_safe_url(record: Mapping[str, Any]) -> str | None:
+    """Find ASF's burst-extractor SAFE service URL in UMM metadata."""
+    granule = record.get("DataGranule")
+    related = granule.get("RelatedUrls") if isinstance(granule, Mapping) else None
+    if not isinstance(related, list):
+        related = record.get("RelatedUrls")
+    if not isinstance(related, list):
+        return None
+    for value in related:
+        if not isinstance(value, Mapping) or not isinstance(value.get("URL"), str):
+            continue
+        url = str(value["URL"])
+        name = str(value.get("Name", "")).casefold()
+        fmt = str(value.get("Format", "")).casefold()
+        if fmt == "safe" or "safe" in name or url.casefold().endswith(".zip"):
+            return url
+    return None
+
+
+def _promote_burst_safe_link(record: dict[str, Any]) -> dict[str, Any]:
+    """Expose a burst SAFE service URL as the preferred complete asset."""
+    url = _burst_safe_url(record)
+    if url is None:
+        return record
+    granule = record.get("DataGranule")
+    if isinstance(granule, Mapping) and isinstance(granule.get("RelatedUrls"), list):
+        related = list(granule["RelatedUrls"])
+        duplicate = any(
+            isinstance(value, Mapping) and value.get("URL") == url for value in related
+        )
+        if not duplicate:
+            related.append(
+                {
+                    "Type": "GET DATA",
+                    "Name": "SAFE ZIP",
+                    "Format": "SAFE",
+                    "URL": url,
+                }
+            )
+        else:
+            related = [
+                (
+                    {**value, "Type": "GET DATA", "Name": "SAFE ZIP"}
+                    if isinstance(value, Mapping) and value.get("URL") == url
+                    else (
+                        {**value, "Type": "USE SERVICE API"}
+                        if isinstance(value, Mapping)
+                        and str(value.get("Type", "")).upper() == "GET DATA"
+                        else value
+                    )
+                )
+                for value in related
+            ]
+        related.sort(
+            key=lambda value: (
+                not (isinstance(value, Mapping) and value.get("URL") == url)
+            )
+        )
+        record["DataGranule"] = {**granule, "RelatedUrls": related}
+        return record
+    related = record.get("RelatedUrls")
+    if isinstance(related, list):
+        related_values = [
+            (
+                {**value, "Type": "GET DATA", "Name": "SAFE ZIP"}
+                if isinstance(value, Mapping) and value.get("URL") == url
+                else value
+            )
+            for value in related
+        ]
+        related_values.sort(
+            key=lambda value: (
+                not (isinstance(value, Mapping) and value.get("URL") == url)
+            )
+        )
+        record["RelatedUrls"] = related_values
+    return record
+
+
+def _validate_complete_safe_urls(record: Mapping[str, Any]) -> None:
+    """Reject records that advertise multiple distinct complete SAFE URLs."""
+    urls: set[str] = set()
+
+    def collect(values: Any, *, require_data: bool = False) -> None:
+        """Collect ZIP URLs from one provider link sequence."""
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            return
+        for value in values:
+            if not isinstance(value, Mapping) or not isinstance(value.get("URL"), str):
+                continue
+            if require_data and str(value.get("Type", "")).upper() != "GET DATA":
+                continue
+            url = str(value["URL"])
+            if urllib.parse.urlsplit(url).path.casefold().endswith(".zip"):
+                urls.add(url)
+
+    granule = record.get("DataGranule")
+    if isinstance(granule, Mapping):
+        collect(granule.get("RelatedUrls"), require_data=True)
+    collect(record.get("RelatedUrls"), require_data=True)
+    links = record.get("links")
+    if isinstance(links, Sequence) and not isinstance(links, (str, bytes)):
+        for value in links:
+            if not isinstance(value, Mapping) or not isinstance(value.get("href"), str):
+                continue
+            rel = str(value.get("rel", "")).casefold()
+            if rel in {"download", "enclosure", "data#"}:
+                url = str(value["href"])
+                if urllib.parse.urlsplit(url).path.casefold().endswith(".zip"):
+                    urls.add(url)
+    if len(urls) > 1:
+        _error(
+            ASFSearchError,
+            "ambiguous_representation",
+            "ASF product advertises multiple complete SAFE ZIP URLs",
+        )
+
+
+def _transfer_burst_safe_url(
+    url: str,
+    adapter: ASFSearchAdapter,
+    budget: RemoteResourceBudget,
+    ledger: _CallLedger,
+) -> str:
+    """Resolve one observation without sleeping or retrying."""
+    observation = _probe_burst_safe_url(url, adapter, budget, ledger)
+    if observation.state == "pending":
+        raise BurstPendingError(observation.url, observation.delay_seconds)
+    return observation.url
+
+
+def _probe_burst_safe_url(
+    url: str,
+    adapter: ASFSearchAdapter,
+    budget: RemoteResourceBudget,
+    ledger: _CallLedger,
+    attempt: int = 0,
+) -> Any:
+    """Perform one unauthenticated burst-extractor HEAD observation."""
+    from urllib.error import HTTPError
+    from urllib.request import Request, build_opener
+
+    from faninsar.remote.access import _validate_url
+    from faninsar.remote.transfer import (
+        _poll_delay_seconds,
+        _RedirectHandler,
+        _RemotePollObservation,
+    )
+
+    current = _validate_url(url, adapter)
+    opener = build_opener(_RedirectHandler(adapter, budget, ledger))
+    ledger.check_elapsed()
+    ledger.request()
+    response: Any | None = None
+    try:
+        try:
+            response = opener.open(
+                Request(
+                    current, method="HEAD", headers={"Accept-Encoding": "identity"}
+                ),
+                timeout=budget.read_timeout_seconds,
+            )
+        except HTTPError as error:
+            response = error
+        status = getattr(response, "status", getattr(response, "code", None))
+        if status == 202:
+            ledger.begin_response()
+            body = response.read(budget.max_response_bytes + 1)
+            ledger.response_bytes(len(body))
+            location = response.headers.get("Location")
+            next_url = urllib.parse.urljoin(current, location) if location else current
+            next_url = _validate_url(next_url, adapter, redirect=True)
+            delay = _poll_delay_seconds(
+                response.headers.get("Retry-After"),
+                attempt,
+                budget.max_poll_interval_seconds,
+            )
+            return _RemotePollObservation("pending", next_url, delay)
+        if status == 200:
+            return _RemotePollObservation(
+                "ready", _validate_url(response.geturl(), adapter, redirect=True)
+            )
+        _fail(RemoteAccessError, "unexpected_status")
+    finally:
+        if response is not None:
+            response.close()
 
 
 def _query_parameters(
@@ -185,6 +404,42 @@ def _query_parameters(
     return result
 
 
+def _merge_query_filters(
+    defaults: Mapping[str, Any],
+    filters: Mapping[str, Any],
+    flight_direction: str | None,
+) -> dict[str, Any]:
+    """Merge ASF filters while rejecting duplicate common-field spellings."""
+    merged = dict(defaults)
+    explicit = dict(filters)
+    if flight_direction is not None and "flightDirection" in explicit:
+        logger.error(
+            "ASF search failed: flight_direction duplicates filters['flightDirection'] "
+            "(duplicate_query_option)"
+        )
+        _fail(
+            RemoteQueryError,
+            "duplicate_query_option",
+            "flight_direction duplicates filters['flightDirection']",
+        )
+    merged.update(explicit)
+    if flight_direction is not None:
+        merged["flightDirection"] = flight_direction
+    unknown = set(merged).difference(_FILTER_NAMES)
+    if unknown:
+        logger.error(
+            "ASF search failed: unsupported ASF search option(s): %r "
+            "(unsupported_query_option)",
+            sorted(unknown),
+        )
+        _fail(
+            RemoteQueryError,
+            "unsupported_query_option",
+            f"unsupported ASF search option(s): {sorted(unknown)!r}",
+        )
+    return merged
+
+
 def _record_from_product(product: Any) -> dict[str, Any]:
     """Extract a plain mapping from one package product and nothing else."""
     if isinstance(product, Mapping):
@@ -208,7 +463,11 @@ def _record_from_product(product: Any) -> dict[str, Any]:
 
 def _with_asset_link(record: dict[str, Any], product: Any) -> dict[str, Any]:
     """Map ASF's URL property to a CMR data link when needed."""
+    _validate_complete_safe_urls(record)
+    record = _promote_burst_safe_link(record)
+    _validate_complete_safe_urls(record)
     if "links" in record or "RelatedUrls" in record or "DataGranule" in record:
+        _validate_complete_safe_urls(record)
         return record
     nested = record.get("properties")
     nested_url = nested.get("url") if isinstance(nested, Mapping) else None
@@ -222,12 +481,64 @@ def _with_asset_link(record: dict[str, Any], product: Any) -> dict[str, Any]:
         link: dict[str, Any] = {
             "rel": "download",
             "href": url,
-            "title": "SAFE ZIP",
+            "title": _asset_title(url),
         }
         size = nested.get("bytes") if isinstance(nested, Mapping) else None
         if isinstance(size, int) and size >= 0:
             link["size"] = size
-        record["links"] = [link]
+        links: list[dict[str, Any]] = [link]
+        additional = (
+            nested.get("additionalUrls") if isinstance(nested, Mapping) else None
+        )
+        if additional is None:
+            additional = record.get("additionalUrls")
+        if additional is None:
+            product_properties = getattr(product, "properties", {})
+            if isinstance(product_properties, Mapping):
+                additional = product_properties.get("additionalUrls")
+        if isinstance(additional, str):
+            additional = [additional]
+        if isinstance(additional, Sequence) and not isinstance(
+            additional, (str, bytes)
+        ):
+            additional_urls = list(
+                dict.fromkeys(
+                    extra
+                    for extra in additional
+                    if isinstance(extra, str) and extra and extra != url
+                )
+            )
+            safe_urls = [
+                extra
+                for extra in additional_urls
+                if urllib.parse.urlsplit(extra).path.casefold().endswith(".zip")
+            ]
+            if len(safe_urls) == 1:
+                safe_url = safe_urls[0]
+                links.insert(
+                    0,
+                    {
+                        "rel": "download",
+                        "href": safe_url,
+                        "title": "SAFE ZIP",
+                        "type": "application/zip",
+                        "representation": "complete",
+                    },
+                )
+                link["rel"] = "related"
+                link["representation"] = "burst-source"
+            links.extend(
+                {
+                    "rel": "related",
+                    "href": extra,
+                    "title": _asset_title(extra),
+                    "representation": "burst-metadata",
+                }
+                for extra in additional_urls
+                if extra not in safe_urls
+            )
+        record["links"] = links
+        _validate_complete_safe_urls(record)
     return record
 
 
@@ -653,6 +964,7 @@ class ASFSearchAdapter:
             (
                 endpoint_origin,
                 *tuple(_endpoint_origin(origin) for origin in self.data_origins),
+                _SENTINEL1_BURST_ORIGIN,
             ),
         )
         if not self.redirect_origins:
@@ -663,6 +975,7 @@ class ASFSearchAdapter:
                     endpoint_origin,
                     *self.data_origins,
                     _SENTINEL1_DATA_ORIGIN,
+                    _SENTINEL1_BURST_ORIGIN,
                     _EARTHDATA_AUTH_ORIGIN,
                     _ASF_AUTH_ORIGIN,
                 ),
@@ -705,6 +1018,72 @@ class ASFSearchAdapter:
             "asf-search exposes no discovery API",
         )
         raise AssertionError  # pragma: no cover
+
+    def prepare_query(
+        self,
+        *,
+        datetime_range: tuple[datetime, datetime] | None,
+        flight_direction: str | None,
+        filters: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Validate and translate the public common search fields."""
+        if flight_direction not in (None, "ASCENDING", "DESCENDING"):
+            logger.error(
+                "ASF search failed: invalid flight_direction (invalid_flight_direction)"
+            )
+            _fail(
+                RemoteQueryError,
+                "invalid_flight_direction",
+                "flight_direction must be ASCENDING or DESCENDING",
+            )
+        merged = _merge_query_filters(self.filters, filters, flight_direction)
+        return {
+            "datetime_range": datetime_range,
+            "filters": merged,
+            "requires_complete_traversal": True,
+        }
+
+    def _transfer_url(
+        self,
+        asset: Any,
+        *,
+        budget: RemoteResourceBudget,
+        ledger: _CallLedger,
+    ) -> str:
+        """Resolve generated ASF burst SAFE URLs during one download."""
+        href = str(getattr(asset, "href", ""))
+        if not href:
+            _fail(RemoteAccessError, "invalid_endpoint")
+        if (
+            urllib.parse.urlsplit(href).hostname
+            == urllib.parse.urlsplit(_SENTINEL1_BURST_ORIGIN).hostname
+        ):
+            return _transfer_burst_safe_url(
+                href,
+                self,
+                budget,
+                ledger,
+            )
+        return href
+
+    def _probe(
+        self,
+        _asset: Any,
+        *,
+        budget: RemoteResourceBudget,
+        ledger: _CallLedger,
+        url: str,
+        attempt: int = 0,
+    ) -> Any:
+        """Perform one HEAD observation for an unauthenticated burst URL."""
+        if (
+            urllib.parse.urlsplit(url).hostname
+            == urllib.parse.urlsplit(_SENTINEL1_BURST_ORIGIN).hostname
+        ):
+            return _probe_burst_safe_url(url, self, budget, ledger, attempt)
+        from faninsar.remote.transfer import _RemotePollObservation
+
+        return _RemotePollObservation("ready", url)
 
     def items(
         self,
@@ -756,10 +1135,10 @@ class ASFSearchAdapter:
                 else self.datetime_range,
                 filters=query_filters,
             )
-            parameters["maxResults"] = min(
-                ledger.budget.max_items,
-                limit if limit is not None else ledger.budget.max_items,
-            )
+            # The public ``limit`` is applied by ``remote.search`` only after
+            # the complete provider traversal.  Limiting ASF's own page
+            # traversal here would make an incomplete first page look final.
+            parameters["maxResults"] = ledger.budget.max_items
             options = self._options(package, session, parameters)
             previous_timeout: Any = None
             internal = getattr(package, "INTERNAL", None)
@@ -772,8 +1151,13 @@ class ASFSearchAdapter:
                 provider=self.provider,
                 collection=self.query_collection,
                 endpoint=self.endpoint,
-                data_origins=self.data_origins,
+                data_origins=(
+                    *self.data_origins,
+                    _SENTINEL1_DATA_ORIGIN,
+                    _SENTINEL1_BURST_ORIGIN,
+                ),
                 data_path_prefixes=self.path_prefixes,
+                candidate_filter=_complete_safe_candidate,
             )
             produced = 0
             saw_page = False
@@ -799,7 +1183,11 @@ class ASFSearchAdapter:
                 )
                 for product in values:
                     if produced >= parameters["maxResults"]:
-                        return
+                        _error(
+                            ASFSearchError,
+                            "incomplete_results",
+                            "ASF result budget was reached before completion",
+                        )
                     record = _with_asset_link(_record_from_product(product), product)
                     if "provider" not in record and "Provider" not in record:
                         record["provider"] = self.provider
@@ -815,6 +1203,12 @@ class ASFSearchAdapter:
                         normalized["collection"] = self.collection
                         yield normalized
                     produced += 1
+                if not complete and produced >= parameters["maxResults"]:
+                    _error(
+                        ASFSearchError,
+                        "incomplete_results",
+                        "ASF result budget was reached before completion",
+                    )
             if saw_page and not last_page_complete:
                 _error(
                     ASFSearchError,

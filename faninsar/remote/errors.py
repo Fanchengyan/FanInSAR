@@ -37,7 +37,18 @@ class RemoteIntegrityError(RemoteError):
     """Transferred bytes or a published destination failed validation."""
 
 
+class BurstPendingError(RemoteError):
+    """One burst preparation observation is still pending."""
+
+    def __init__(self, location: str, delay_seconds: float) -> None:
+        """Store the next provider URL and bounded retry delay."""
+        self.location = location
+        self.delay_seconds = delay_seconds
+        super().__init__("burst_pending")
+
+
 __all__ = [
+    "BurstPendingError",
     "RemoteAccessError",
     "RemoteError",
     "RemoteIntegrityError",

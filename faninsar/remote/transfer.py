@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
+import time
+import urllib.parse
 import urllib.request
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +44,7 @@ from .auth import (
 from .cache import _identity, _is_qualified, _manifest_path, _matching_manifest
 from .catalog import _ADAPTERS, _DESTINATION_LOCKS, _REGISTRY_LOCK
 from .errors import (
+    BurstPendingError,
     RemoteAccessError,
     RemoteError,
     RemoteIntegrityError,
@@ -49,6 +55,186 @@ from .protocols import _accepts_ledger, _Adapter, _CallLedger
 from .records import RemoteAsset, RemoteResourceBudget
 
 logger = setup_logger(__name__)
+
+_POLL_INTERVAL_CAP_SECONDS = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class _RemotePollObservation:
+    """Result of one provider preparation observation."""
+
+    state: str
+    url: str
+    delay_seconds: float = 0.0
+
+
+def _poll_delay_seconds(
+    retry_after: str | None,
+    attempt: int,
+    max_interval_seconds: float,
+) -> float:
+    """Return the bounded delay before one provider-poll observation.
+
+    A valid numeric or HTTP-date ``Retry-After`` value takes precedence over
+    the local backoff.  Missing and malformed values use 2, 4, 8, then 10
+    seconds.  The returned delay is always bounded by the operation budget.
+    """
+    if retry_after:
+        try:
+            value = float(retry_after)
+        except (TypeError, ValueError):
+            value = math.nan
+        if math.isfinite(value) and value >= 0:
+            return min(value, max_interval_seconds, _POLL_INTERVAL_CAP_SECONDS)
+        try:
+            retry_date = parsedate_to_datetime(retry_after)
+            value = retry_date.timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            value = math.nan
+        if math.isfinite(value) and value >= 0:
+            return min(value, max_interval_seconds, _POLL_INTERVAL_CAP_SECONDS)
+    return min(
+        float(2 ** min(max(attempt, 0) + 1, 4)),
+        max_interval_seconds,
+        _POLL_INTERVAL_CAP_SECONDS,
+    )
+
+
+class _BurstPollToken:
+    """Identity and stable priority for one Stack burst transfer."""
+
+    __slots__ = ("index", "submitted_at")
+
+    def __init__(self, index: int, submitted_at: float) -> None:
+        self.index = index
+        self.submitted_at = submitted_at
+
+
+class _BurstPollScheduler:
+    """Coordinate retries for concurrently requested ASF burst products.
+
+    Initial requests are made by each worker immediately.  Only subsequent
+    observations enter this coordinator.  An observation that is due is
+    selected by original submission time, with selection index as the stable
+    tie-breaker, while workers whose products are already ready continue to
+    download without waiting for another burst.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] | None = None,
+        wait: Callable[[threading.Condition, float], None] | None = None,
+    ) -> None:
+        """Initialize a scheduler, optionally with deterministic test hooks."""
+        self._clock = clock or time.monotonic
+        self._wait = wait or (lambda condition, timeout: condition.wait(timeout))
+        self._condition = threading.Condition()
+        self._priorities: dict[_BurstPollToken, tuple[float, int]] = {}
+        self._due: dict[_BurstPollToken, float] = {}
+        self._states: dict[_BurstPollToken, str] = {}
+        self._observations: dict[_BurstPollToken, int] = {}
+
+    def register(self, index: int) -> _BurstPollToken:
+        """Register one transfer before its first provider request."""
+        token = _BurstPollToken(index, self._clock())
+        with self._condition:
+            self._priorities[token] = (token.submitted_at, index)
+            self._states[token] = "not_started"
+            self._observations[token] = 0
+        return token
+
+    def observe(self, token: _BurstPollToken) -> int:
+        """Count one completed provider preparation observation."""
+        with self._condition:
+            self._observations[token] = self._observations.get(token, 0) + 1
+            return self._observations[token]
+
+    def mark_waiting(self, token: _BurstPollToken, delay: float) -> None:
+        """Put one pending product into the next-due waiting set."""
+        with self._condition:
+            self._states[token] = "waiting"
+            self._due[token] = self._clock() + max(0.0, delay)
+            self._condition.notify_all()
+
+    def claim_due(self) -> _BurstPollToken | None:
+        """Claim the oldest currently due waiting product."""
+        with self._condition:
+            now = self._clock()
+            candidates = [token for token, due in self._due.items() if due <= now]
+            if not candidates:
+                return None
+            token = min(candidates, key=self._priorities.__getitem__)
+            self._due.pop(token, None)
+            self._states[token] = "submitted"
+            return token
+
+    def next_due(self) -> float | None:
+        """Return the next scheduled retry time, if any."""
+        with self._condition:
+            return min(self._due.values(), default=None)
+
+    def set_state(self, token: _BurstPollToken | None, state: str) -> None:
+        """Record one in-memory transfer state for Stack sweep inspection."""
+        if token is None:
+            return
+        with self._condition:
+            if token in self._priorities:
+                self._states[token] = state
+                self._condition.notify_all()
+
+    def snapshot(self) -> tuple[tuple[int, str], ...]:
+        """Return states in deterministic selection order."""
+        with self._condition:
+            return tuple(
+                (token.index, self._states[token])
+                for token in sorted(self._states, key=self._priorities.__getitem__)
+            )
+
+    def details(self) -> tuple[dict[str, object], ...]:
+        """Return deterministic scheduler state for diagnostics and tests."""
+        with self._condition:
+            return tuple(
+                {
+                    "index": token.index,
+                    "submitted_at": token.submitted_at,
+                    "state": self._states[token],
+                    "next_due": self._due.get(token),
+                    "observations": self._observations[token],
+                }
+                for token in sorted(self._states, key=self._priorities.__getitem__)
+            )
+
+    def wait_for_retry(self, token: _BurstPollToken, delay: float) -> None:
+        """Wait until this token is the oldest currently due retry."""
+        with self._condition:
+            self._states[token] = "submitted"
+            self._due[token] = self._clock() + max(0.0, delay)
+            self._condition.notify_all()
+            while True:
+                now = self._clock()
+                due = [
+                    candidate
+                    for candidate, scheduled in self._due.items()
+                    if scheduled <= now
+                ]
+                if due and min(due, key=self._priorities.__getitem__) is token:
+                    self._due.pop(token, None)
+                    self._states[token] = "submitted"
+                    self._condition.notify_all()
+                    return
+                next_due = min(self._due.values(), default=now)
+                self._wait(self._condition, max(0.0, next_due - now))
+
+    def complete(self, token: _BurstPollToken | None) -> None:
+        """Remove a transfer from the waiting set after it finishes."""
+        if token is None:
+            return
+        with self._condition:
+            self._due.pop(token, None)
+            if self._states.get(token) != "failed":
+                self._states[token] = "complete"
+            self._condition.notify_all()
 
 
 def _facade_hook(name: str, fallback: Any) -> Any:
@@ -151,6 +337,9 @@ def _stream_download(
     budget: RemoteResourceBudget,
     ledger: _CallLedger,
     staging: Path,
+    poll_scheduler: _BurstPollScheduler | None = None,
+    poll_token: _BurstPollToken | None = None,
+    transfer_url_override: str | None = None,
 ) -> tuple[int, str]:
     """Stream one complete asset into ``staging`` and return size/digest."""
     fetcher = getattr(adapter, "fetch", None)
@@ -161,10 +350,16 @@ def _stream_download(
     # affecting every later hop in the operation.
     opener = urllib.request.build_opener(redirect_handler)
     resolver = getattr(adapter, "_transfer_url", None)
-    transfer_url = asset.href
-    if fetcher is None and callable(resolver):
+    transfer_url = transfer_url_override or asset.href
+    if (
+        transfer_url_override is None
+        and fetcher is None
+        and callable(resolver)
+        and asset.auth_profile != "earthdata-asf"
+    ):
         try:
-            transfer_url = resolver(asset, budget=budget, ledger=ledger)
+            resolver_kwargs: dict[str, Any] = {"budget": budget, "ledger": ledger}
+            transfer_url = resolver(asset, **resolver_kwargs)
         except RemoteError:
             raise
         except Exception as error:
@@ -253,10 +448,13 @@ def _stream_download(
                 response: requests.Response | None = None
                 try:
                     asf_request = _facade_hook("_asf_request", _asf_request)
+                    request_url = transfer_url
+                    if poll_scheduler is not None:
+                        poll_scheduler.set_state(poll_token, "submitted")
                     response = asf_request(
                         session,
                         "GET",
-                        asset.href,
+                        request_url,
                         adapter=adapter,
                         asset=asset,
                         budget=budget,
@@ -266,12 +464,38 @@ def _stream_download(
                             "Authorization": f"Bearer {token}",
                         },
                     )
+                    if response.status_code == 202:
+                        ledger.begin_response()
+                        pending_bytes = 0
+                        for chunk in response.iter_content(chunk_size=64 * 1024):
+                            pending_bytes += len(chunk)
+                            ledger.response_bytes(len(chunk))
+                            if pending_bytes > budget.max_response_bytes:
+                                _fail(RemoteLimitError, "max_response_bytes")
+                        location = response.headers.get("Location")
+                        retry_after = response.headers.get("Retry-After")
+                        response.close()
+                        response = None
+                        raise BurstPendingError(
+                            urllib.parse.urljoin(request_url, location)
+                            if location
+                            else request_url,
+                            _poll_delay_seconds(
+                                retry_after,
+                                0,
+                                budget.max_poll_interval_seconds,
+                            ),
+                        )
+                    if poll_scheduler is not None:
+                        poll_scheduler.set_state(poll_token, "ready")
                     _response_is_complete(response)
                     if (
                         response.headers.get("Content-Encoding", "identity")
                         != "identity"
                     ):
                         _fail(RemoteAccessError, "unexpected_content_encoding")
+                    if poll_scheduler is not None:
+                        poll_scheduler.set_state(poll_token, "downloading")
                     consume(response.iter_content(chunk_size=1024 * 1024), meter=True)
                 finally:
                     if response is not None:
@@ -326,6 +550,8 @@ def _stream_download(
                         != "identity"
                     ):
                         _fail(RemoteAccessError, "unexpected_content_encoding")
+                    if poll_scheduler is not None:
+                        poll_scheduler.set_state(poll_token, "downloading")
                     consume(
                         iter(lambda response=response: response.read(1024 * 1024), b""),
                         meter=True,
@@ -333,6 +559,8 @@ def _stream_download(
             else:
                 if not supplied_ledger:
                     ledger.begin_response()
+                if poll_scheduler is not None:
+                    poll_scheduler.set_state(poll_token, "downloading")
                 consume(result_chunks(result), meter=not supplied_ledger)
             break
         except RemoteError:
@@ -353,12 +581,127 @@ def _stream_download(
     return size, hasher.hexdigest()
 
 
+def probe(
+    asset: RemoteAsset,
+    *,
+    budget: RemoteResourceBudget | None = None,
+    url: str | None = None,
+    attempt: int = 0,
+    ledger: _CallLedger | None = None,
+) -> _RemotePollObservation:
+    """Perform exactly one observation of a generated remote asset.
+
+    The Sentinel-1 burst adapter uses this seam to separate provider
+    preparation from file transfer.  A pending observation returns its next
+    URL and bounded delay; a ready observation returns the final URL.  No
+    sleep or retry loop occurs here.
+    """
+    budget = budget or RemoteResourceBudget()
+    adapter = _ADAPTERS.get(asset.catalog)
+    if adapter is None or adapter.provider != asset.provider:
+        _fail(RemoteAccessError, "unknown_catalog")
+    ledger = ledger or _CallLedger(budget)
+    current = url or asset.href
+    if asset.auth_profile == "earthdata-asf" and "sentinel1-burst.asf.alaska.edu" in (
+        urllib.parse.urlsplit(current).hostname or ""
+    ):
+        authenticated_session = _facade_hook(
+            "_asf_authenticated_session", _asf_authenticated_session
+        )
+        session, token = authenticated_session(asset, adapter, budget, ledger)
+        response: requests.Response | None = None
+        try:
+            asf_request = _facade_hook("_asf_request", _asf_request)
+            response = asf_request(
+                session,
+                "GET",
+                current,
+                adapter=adapter,
+                asset=asset,
+                budget=budget,
+                ledger=ledger,
+                headers={
+                    "Accept-Encoding": "identity",
+                    "Authorization": f"Bearer {token}",
+                },
+            )
+            if response.status_code == 202:
+                pending_bytes = 0
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    pending_bytes += len(chunk)
+                    ledger.response_bytes(len(chunk))
+                    if pending_bytes > budget.max_response_bytes:
+                        _fail(RemoteLimitError, "max_response_bytes")
+                location = response.headers.get("Location")
+                next_url = (
+                    urllib.parse.urljoin(current, location) if location else current
+                )
+                next_url = _validate_url(next_url, adapter, redirect=True)
+                delay = _poll_delay_seconds(
+                    response.headers.get("Retry-After"),
+                    attempt,
+                    budget.max_poll_interval_seconds,
+                )
+                return _RemotePollObservation("pending", next_url, delay)
+            if response.status_code == 200:
+                return _RemotePollObservation(
+                    "ready",
+                    _validate_url(
+                        getattr(response, "url", current), adapter, redirect=True
+                    ),
+                )
+            _fail(RemoteAccessError, "unexpected_status")
+        finally:
+            if response is not None:
+                response.close()
+            session.close()
+    resolver = getattr(adapter, "_probe", None)
+    if callable(resolver):
+        return resolver(
+            asset,
+            budget=budget,
+            ledger=ledger,
+            url=current,
+            attempt=attempt,
+        )
+    return _RemotePollObservation("ready", current)
+
+
+def _prepare_burst_for_standalone_download(
+    asset: RemoteAsset,
+    budget: RemoteResourceBudget,
+    ledger: _CallLedger,
+) -> str:
+    """Drive the single-probe primitive synchronously for legacy callers."""
+    current = asset.href
+    for attempt in range(budget.max_poll_attempts):
+        observation = probe(
+            asset,
+            budget=budget,
+            url=current,
+            attempt=attempt,
+            ledger=ledger,
+        )
+        if observation.state == "ready":
+            return observation.url
+        if attempt >= budget.max_poll_attempts - 1:
+            _fail(RemoteLimitError, "max_poll_attempts")
+        ledger.poll_retry()
+        current = observation.url
+        time.sleep(observation.delay_seconds)
+    return _fail(RemoteLimitError, "max_poll_attempts")
+
+
 def download(
     asset: RemoteAsset,
     destination: Path,
     *,
     overwrite: bool = False,
     budget: RemoteResourceBudget | None = None,
+    poll_scheduler: _BurstPollScheduler | None = None,
+    poll_token: _BurstPollToken | None = None,
+    transfer_url: str | None = None,
+    ledger: _CallLedger | None = None,
 ) -> Path:
     """Download one complete asset and publish it atomically.
 
@@ -384,10 +727,12 @@ def download(
     with lock:
         if destination.exists() and not overwrite:
             if _matching_manifest(destination, asset):
+                if poll_scheduler is not None:
+                    poll_scheduler.complete(poll_token)
                 return destination
             if _is_qualified(asset):
                 _fail(RemoteIntegrityError, "destination_conflict")
-        ledger = _CallLedger(budget)
+        ledger = ledger or _CallLedger(budget)
         if destination.exists() and not overwrite:
             if _matching_manifest(destination, asset):
                 return destination
@@ -402,12 +747,25 @@ def download(
                 delete=False,
             ) as stream:
                 temporary = Path(stream.name)
+            prepared_url = transfer_url
+            if (
+                prepared_url is None
+                and asset.auth_profile == "earthdata-asf"
+                and "sentinel1-burst.asf.alaska.edu"
+                in (urllib.parse.urlsplit(asset.href).hostname or "")
+            ):
+                prepared_url = _prepare_burst_for_standalone_download(
+                    asset, budget, ledger
+                )
             size, digest = _stream_download(
                 asset,
                 adapter,
                 budget,
                 ledger,
                 temporary,
+                poll_scheduler,
+                poll_token,
+                prepared_url,
             )
             temporary.replace(destination)
             temporary = None
@@ -431,7 +789,13 @@ def download(
                 os.fsync(stream.fileno())
             manifest_temp.replace(manifest)
             manifest_temp = None
+        except BaseException:
+            if poll_scheduler is not None:
+                poll_scheduler.set_state(poll_token, "failed")
+            raise
         finally:
+            if poll_scheduler is not None:
+                poll_scheduler.complete(poll_token)
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
             if manifest_temp is not None:

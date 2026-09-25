@@ -250,6 +250,95 @@ def test_asf_download_pre_authenticates_and_follows_trusted_redirects(
     assert session.closed
 
 
+def test_asf_burst_download_returns_pending_without_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Burst SAFE generation polls with the authenticated ASF request path."""
+
+    class _Response:
+        def __init__(
+            self, status_code: int, *, location: str | None = None, body: bytes = b""
+        ) -> None:
+            self.status_code = status_code
+            self.headers = {"Location": location} if location else {}
+            self._body = body
+
+        def iter_content(self, *, chunk_size: int) -> Iterable[bytes]:
+            del chunk_size
+            return iter((self._body,)) if self._body else iter(())
+
+        def close(self) -> None:
+            return None
+
+    responses = iter(
+        (
+            _Response(
+                202,
+                location="https://sentinel1-burst.asf.alaska.edu/jobs/result.zip",
+                body=b"pending",
+            ),
+        )
+    )
+    calls: list[str] = []
+
+    class _Session:
+        def close(self) -> None:
+            return None
+
+    def authenticated_session(*_args: Any) -> tuple[_Session, str]:
+        return _Session(), "fixture-token"
+
+    def asf_request(
+        _session: _Session,
+        _method: str,
+        url: str,
+        *,
+        ledger: Any,
+        **_kwargs: Any,
+    ) -> _Response:
+        calls.append(url)
+        ledger.request()
+        ledger.begin_response()
+        return next(responses)
+
+    monkeypatch.setattr(remote, "_asf_authenticated_session", authenticated_session)
+    monkeypatch.setattr(remote, "_asf_request", asf_request)
+    delays: list[float] = []
+    monkeypatch.setattr("faninsar.remote.transfer.time.sleep", delays.append)
+
+    class _ASFAdapter:
+        provider = "ASF"
+        origins = ("https://sentinel1-burst.asf.alaska.edu",)
+        path_prefixes = ("/",)
+        redirect_origins = ("https://sentinel1-burst.asf.alaska.edu",)
+        profiles = ("earthdata-asf",)
+
+    asset = remote.RemoteAsset(
+        "ASF",
+        "asf-burst-transfer",
+        "SLC-BURST",
+        "burst-1",
+        "data",
+        "https://sentinel1-burst.asf.alaska.edu/jobs/request.zip",
+        auth_profile="earthdata-asf",
+    )
+    ledger = remote._CallLedger(remote.RemoteResourceBudget(max_retries=2))
+    staging = tmp_path / "burst.zip"
+
+    with pytest.raises(remote.BurstPendingError) as raised:
+        remote._stream_download(asset, _ASFAdapter(), ledger.budget, ledger, staging)
+
+    assert raised.value.location.endswith("/jobs/result.zip")
+    assert calls == [
+        "https://sentinel1-burst.asf.alaska.edu/jobs/request.zip",
+    ]
+    assert ledger.requests == 1
+    assert ledger.retries == 0
+    assert ledger.response_bytes_total == len(b"pending")
+    assert delays == []
+
+
 class _LPDAACSession:
     """Fixture for LPDAAC's data -> URS -> data -> CloudFront flow."""
 
@@ -308,8 +397,7 @@ class _LPDAACSession:
                 body=b"urs-redirect",
                 headers={
                     "Location": (
-                        "https://data.lpdaac.earthdatacloud.nasa.gov/login?"
-                        "code=fixture"
+                        "https://data.lpdaac.earthdatacloud.nasa.gov/login?code=fixture"
                     )
                 },
             )
@@ -361,9 +449,7 @@ def test_lpdaac_download_meters_redirects_and_strips_credentials(
 
     class _LPDAACAdapter:
         provider = "LPCLOUD"
-        origins = (
-            "https://data.lpdaac.earthdatacloud.nasa.gov",
-        )
+        origins = ("https://data.lpdaac.earthdatacloud.nasa.gov",)
         path_prefixes = ("/",)
         redirect_origins = (
             "https://data.lpdaac.earthdatacloud.nasa.gov",
@@ -720,9 +806,10 @@ def test_transfer_failure_does_not_surface_signed_url(
         "data",
         "https://failing.invalid/file.bin?x-random-signature=fixture-secret",
     )
-    with caplog.at_level("WARNING"), pytest.raises(
-        remote.RemoteAccessError, match="transfer_failed"
-    ) as error:
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(remote.RemoteAccessError, match="transfer_failed") as error,
+    ):
         remote.download(
             asset,
             tmp_path / "file.bin",

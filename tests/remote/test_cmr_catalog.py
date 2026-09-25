@@ -473,6 +473,27 @@ def test_compact_polygon_accepts_one_coordinate_string() -> None:
     }
 
 
+def test_cmr_rejects_ambiguous_complete_data_representations() -> None:
+    """CMR response ordering cannot choose between two complete assets."""
+    adapter = CMRCollectionAdapter(
+        provider="FIXTURE",
+        collection="C123",
+        endpoint="https://cmr.invalid/search/granules.json",
+    )
+    entry = {
+        "id": "G1",
+        "collection_concept_id": "C123",
+        "polygons": ["0 0 0 1 1 1 0 0"],
+        "links": [
+            {"rel": "data#", "href": "https://cmr.invalid/data/a.zip"},
+            {"rel": "data#", "href": "https://cmr.invalid/data/b.zip"},
+        ],
+    }
+    with pytest.raises(remote.RemoteAccessError) as error:
+        adapter._normalize(entry)
+    assert error.value.reason == "ambiguous_representation"
+
+
 def test_compact_granule_size_preserves_exact_binary_mib_value() -> None:
     """Preserve the exact byte count declared by a real compact CMR item."""
     adapter = CMRCollectionAdapter(

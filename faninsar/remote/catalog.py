@@ -6,7 +6,7 @@ import threading
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pyproj import CRS, Transformer
 from pyproj.exceptions import CRSError
@@ -18,7 +18,7 @@ from faninsar.data.query import BoundingBox, Points, Polygons
 
 from .access import _canonicalize_url
 from .errors import RemoteAccessError, RemoteQueryError, _fail
-from .protocols import _Adapter, _adapter_items, _CallLedger
+from .protocols import _Adapter, _adapter_items, _adapter_query, _CallLedger
 from .records import (
     AcquisitionMetadata,
     CatalogItem,
@@ -206,6 +206,8 @@ def search(
     catalog: str,
     collections: Sequence[str] | None = None,
     datetime_range: tuple[datetime, datetime] | None = None,
+    flight_direction: Literal["ASCENDING", "DESCENDING"] | None = None,
+    filters: Mapping[str, Any] | None = None,
     auth_profile: str | None = None,
     limit: int = 100,
     budget: RemoteResourceBudget | None = None,
@@ -231,16 +233,40 @@ def search(
             _fail(RemoteQueryError, "invalid_datetime_range")
     else:
         start_end = None
+    if flight_direction not in (None, "ASCENDING", "DESCENDING"):
+        _fail(RemoteQueryError, "invalid_flight_direction")
+    if filters is None:
+        query_filters: Mapping[str, Any] = {}
+    elif isinstance(filters, Mapping):
+        query_filters = dict(filters)
+    else:
+        _fail(RemoteQueryError, "invalid_filters", "filters must be a mapping")
+    prepared = _adapter_query(
+        adapter,
+        datetime_range=start_end,
+        flight_direction=flight_direction,
+        filters=query_filters,
+    )
+    prepared_datetime = prepared.get("datetime_range", start_end)
+    prepared_filters = prepared.get("filters", query_filters)
+    if not isinstance(prepared_filters, Mapping):
+        _fail(RemoteQueryError, "query_translation_failed", "filters must be a mapping")
+    traversal_limit = (
+        budget.max_items
+        if prepared.get("requires_complete_traversal", False)
+        else limit
+    )
     ledger = _CallLedger(budget)
     raw_items = _adapter_items(
         adapter,
         spatial=query,
         spatial_kind=query_kind,
         point_geometries=point_geometries,
-        datetime_range=start_end,
+        datetime_range=prepared_datetime,
         collections=tuple(collections) if collections is not None else None,
+        filters=prepared_filters,
         auth_profile=profile,
-        limit=limit,
+        limit=traversal_limit,
         budget=budget,
         ledger=ledger,
     )
@@ -278,9 +304,7 @@ def search(
         )
         results.append(item)
         seen.add(identity)
-        if len(results) >= limit:
-            break
-    return results
+    return results[:limit]
 
 
 __all__ = [

@@ -49,6 +49,7 @@ from .catalog import (
     search,
 )
 from .errors import (
+    BurstPendingError,
     RemoteAccessError,
     RemoteError,
     RemoteIntegrityError,
@@ -58,7 +59,7 @@ from .errors import (
 )
 from .protocols import _accepts_ledger, _Adapter, _adapter_items, _CallLedger
 from .records import RemoteAsset, RemoteResourceBudget, _normalize_checksum, _sanitize
-from .transfer import _RedirectHandler, _stream_download, download
+from .transfer import _RedirectHandler, _stream_download, download, probe
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DEFAULT_CMR_ENDPOINT": ("faninsar.remote.cmr", "DEFAULT_CMR_ENDPOINT"),
@@ -167,6 +168,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 __all__ = [
     "AcquisitionMetadata",
     "BoundingBox",
+    "BurstPendingError",
     "CatalogItem",
     "Points",
     "Polygons",
@@ -177,6 +179,7 @@ __all__ = [
     "RemoteQueryError",
     "RemoteResourceBudget",
     "download",
+    "probe",
     "search",
 ]
 __all__ += list(_LAZY_EXPORTS)
