@@ -22,11 +22,60 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 
 
-def _bounds(grid: GridSpec) -> tuple[float, float, float, float]:
-    """Return the WGS84 bounds of a target grid."""
-    from pyproj import Transformer
+def _head_status(url: str) -> int | None:
+    """Return the HTTP status of a HEAD request, or ``None`` on transport errors."""
+    from faninsar.processing.geometry import dem_transport
+
+    try:
+        response = dem_transport.thread_local_session().head(
+            url, timeout=dem_transport.REQUEST_TIMEOUT
+        )
+        status = int(response.status_code)
+        response.close()
+    except Exception:
+        return None
+    return status
+
+
+def _bounds(
+    grid: GridSpec, *, buffer_m: float = 1000.0
+) -> tuple[float, float, float, float]:
+    """Return WGS84 bounds of a target grid, padded by ``buffer_m`` metres.
+
+    The pad is applied in the grid CRS (metres for projected grids; an
+    approximate metre-to-degree conversion for geographic grids).  Tile
+    listing uses this window; the public RasterDEM remains on ``grid``.
+
+    Parameters
+    ----------
+    grid : GridSpec
+        Target public grid.
+    buffer_m : float, optional
+        Fetch-window pad in metres.  Default is 1 km.
+
+    Returns
+    -------
+    tuple of float
+        ``(min_lon, min_lat, max_lon, max_lat)`` in EPSG:4326.
+
+    """
+    from pyproj import CRS, Transformer
 
     left, bottom, right, top = grid.bounds
+    crs = CRS.from_user_input(grid.crs)
+    if crs.is_geographic:
+        lat0 = 0.5 * (bottom + top)
+        dlat = buffer_m / 111_320.0
+        dlon = buffer_m / (111_320.0 * max(math.cos(math.radians(lat0)), 0.2))
+        left -= dlon
+        right += dlon
+        bottom -= dlat
+        top += dlat
+    else:
+        left -= buffer_m
+        right += buffer_m
+        bottom -= buffer_m
+        top += buffer_m
     transformer = Transformer.from_crs(grid.crs, "EPSG:4326", always_xy=True)
     longitude, latitude = transformer.transform(
         np.array([left, left, right, right]),
@@ -354,7 +403,14 @@ def _materialize_auto(
     cache_dir: Path,
     budget: ResourceBudget | None,
 ) -> RasterDEM:
-    """Materialize GLO-30 with per-cell GLO-90 rescue for withheld cells."""
+    """Materialize GLO-30 with GLO-90 rescue and unpublished-ocean 0 m fill.
+
+    A glo30 HEAD 404 probes the glo90 twin: HTTP 200 rescues that cell; a
+    twin 404 is an unpublished Copernicus water cell and is not fetched.
+    Remaining NaNs after the mosaic are filled with 0 m and warned.  If no
+    published glo30/glo90 tile exists for the fetch window, this fails
+    closed instead of minting an all-zero DEM.
+    """
     from faninsar.processing.geometry.api import RasterDEM
     from faninsar.processing.geometry.dem_sources import get_dem_source
 
@@ -363,35 +419,35 @@ def _materialize_auto(
     fallback = get_dem_source("glo90")
     primary_plan = primary.plan(bounds)
     fallback_plan = fallback.plan(bounds)
-    statuses: dict[str, int | None] = {}
-    from faninsar.processing.geometry import dem_transport
-
-    for tile in primary_plan.tiles:
-        try:
-            response = dem_transport.thread_local_session().head(
-                tile.url, timeout=dem_transport.REQUEST_TIMEOUT
-            )
-            statuses[tile.url] = int(response.status_code)
-            response.close()
-        except Exception:
-            statuses[tile.url] = None
+    statuses = {tile.url: _head_status(tile.url) for tile in primary_plan.tiles}
     primary_tiles = []
     fallback_tiles = []
+    unpublished: list[str] = []
     for tile in primary_plan.tiles:
         if statuses.get(tile.url) == 404:
-            tag = tile.cache_path.parts[0]
+            tag = str(tile.cache_path.parts[0])
             twin = next(
                 (
                     candidate
                     for candidate in fallback_plan.tiles
-                    if candidate.cache_path.parts[0] == tag
+                    if str(candidate.cache_path.parts[0]) == tag
                 ),
                 None,
             )
-            if twin is not None:
+            twin_status = _head_status(twin.url) if twin is not None else None
+            if twin is not None and twin_status == 200:
                 fallback_tiles.append(twin)
-        else:
+            else:
+                unpublished.append(tag)
+        elif statuses.get(tile.url) == 200:
             primary_tiles.append(tile)
+    if not primary_tiles and not fallback_tiles:
+        message = (
+            "automatic DEM fetch found no published GLO-30/GLO-90 tiles "
+            f"(unpublished={unpublished!r}); refusing to mint an all-zero DEM"
+        )
+        logger.error(message)
+        raise RuntimeError(message)
     primary_paths = (
         _execute_plan(
             replace(primary_plan, tiles=tuple(primary_tiles)),
@@ -415,6 +471,17 @@ def _materialize_auto(
         rescued = _sample_paths(fallback_paths, fallback, grid)
         fill = np.isnan(output) & np.isfinite(rescued)
         output[fill] = rescued[fill]
+    if unpublished:
+        missing = ~np.isfinite(output)
+        n_missing = int(np.count_nonzero(missing))
+        if n_missing:
+            output = np.array(output, copy=True)
+            output[missing] = 0.0
+            logger.warning(
+                "unpublished Copernicus water cells filled 0 m (%d samples): %s",
+                n_missing,
+                unpublished,
+            )
     return RasterDEM(
         array=output,
         grid=grid,
