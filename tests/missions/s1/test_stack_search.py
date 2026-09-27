@@ -522,6 +522,9 @@ def test_open_reads_shared_manifest_sources_mapping(
     prepared: list[bool] = []
 
     class FakeStack:
+        def __init__(self) -> None:
+            self.config = type("Config", (), {"extra": {}})()
+
         def prepare(self, *, refresh: bool = True) -> None:
             prepared.append(refresh)
 
@@ -537,6 +540,7 @@ def test_open_reads_shared_manifest_sources_mapping(
     assert captured == [(safe,)]
     assert prepared == [False]
     assert options_seen == [expected]
+    assert result.config.extra["orbit_auto_fetch"] is False
 
 
 def test_open_omits_empty_orbit_bindings_to_preserve_embedded_vectors(
@@ -567,6 +571,9 @@ def test_open_omits_empty_orbit_bindings_to_preserve_embedded_vectors(
     options_seen: list[dict[str, object]] = []
 
     class FakeStack:
+        def __init__(self) -> None:
+            self.config = type("Config", (), {"extra": {}})()
+
         def prepare(self, *, refresh: bool = True) -> None:
             del refresh
 
@@ -576,6 +583,7 @@ def test_open_omits_empty_orbit_bindings_to_preserve_embedded_vectors(
         return FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    S1Stack.open(tmp_path)
+    result = S1Stack.open(tmp_path)
 
     assert all("orbit_paths" not in options for options in options_seen)
+    assert result.config.extra["orbit_auto_fetch"] is False

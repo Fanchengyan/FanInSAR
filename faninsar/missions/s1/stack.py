@@ -55,6 +55,7 @@ def _configure_s1_bindings(
 ) -> None:
     """Resolve explicit local S1 orbit and calibration bindings."""
     intervals: dict[str, tuple[Any, Any]] = {}
+    mission_ids: dict[str, str] = {}
     if orbit_paths is not None:
         from faninsar.missions.s1.safe import open_safe_product
 
@@ -70,7 +71,16 @@ def _configure_s1_bindings(
             ]
             if starts and stops:
                 intervals[date_id] = (min(starts), max(stops))
-    selected = select_orbit_bindings(orbit_paths, intervals)
+            mission = next(
+                (product.mission_id for product in products if product.mission_id),
+                "S1",
+            )
+            mission_ids[date_id] = str(mission)
+    selected = select_orbit_bindings(
+        orbit_paths,
+        intervals,
+        mission_ids=mission_ids or None,
+    )
     calibrations = validate_calibration_paths(calibration_paths)
     if any(
         safe_requires_aux_cal(path)
@@ -636,12 +646,77 @@ class S1Stack(Stack):
                 options.setdefault("polarizations", normalize_polarizations(values))
         options.pop("work_dir", None)
         stack = cls.from_safes(paths, work_dir=root, **options)
+        extra = getattr(getattr(stack, "config", None), "extra", None)
+        if isinstance(extra, dict):
+            extra["orbit_auto_fetch"] = False
         prepare = getattr(stack, "prepare", None)
         if callable(prepare):
             prepare(refresh=False)
         else:
             stack.prepare_scenes()
         return stack
+
+    def prepare(self, *, refresh: bool = False) -> Self:
+        """Prepare shared inputs, re-enabling orbit auto-fetch on refresh."""
+        if refresh:
+            self.config.extra["orbit_auto_fetch"] = True
+        return super().prepare(refresh=refresh)
+
+    def _ensure_precise_orbits(self) -> None:
+        """Download covering EOFs from s1-orbits before coregistration."""
+        from faninsar.missions.s1.orbit_fetch import ensure_covering_orbit_paths
+        from faninsar.missions.s1.safe import open_safe_product
+
+        auto_fetch = bool(self.config.extra.get("orbit_auto_fetch", True))
+        existing = self.config.extra.get("orbit_paths")
+        existing_paths: Mapping[str, Path] | None
+        if isinstance(existing, Mapping) and existing:
+            existing_paths = {str(key): Path(value) for key, value in existing.items()}
+        else:
+            existing_paths = None
+        polarizations = self.config.extra.get("polarizations")
+        selected_polarizations = (
+            None if polarizations == "all" else tuple(polarizations or ())
+        )
+        intervals: dict[str, tuple[Any, Any]] = {}
+        mission_ids: dict[str, str] = {}
+        for date_id in self.catalog.dates:
+            products = [
+                open_safe_product(path, polarizations=selected_polarizations)
+                for path in self.catalog.paths_for(date_id)
+            ]
+            starts = [
+                swath.sensing_start for product in products for swath in product.swaths
+            ]
+            stops = [
+                swath.sensing_stop for product in products for swath in product.swaths
+            ]
+            if starts and stops:
+                intervals[date_id] = (min(starts), max(stops))
+            mission = next(
+                (product.mission_id for product in products if product.mission_id),
+                "S1",
+            )
+            mission_ids[date_id] = str(mission)
+        if not intervals:
+            return
+        cache = self.config.extra.get("orbit_cache_dir")
+        cache_dir = (
+            Path(cache)
+            if cache is not None
+            else self.config.work_dir / "inputs" / "orbits"
+        )
+        selected = ensure_covering_orbit_paths(
+            intervals=intervals,
+            mission_ids=mission_ids,
+            cache_dir=cache_dir,
+            existing=existing_paths,
+            auto_fetch=auto_fetch,
+        )
+        if selected:
+            self.config.extra["orbit_paths"] = selected
+        elif existing_paths is None:
+            self.config.extra.pop("orbit_paths", None)
 
     def _prepare_mission(self) -> MissionPreparedInputs:
         """Return SAFE-derived S1 footprints and local mission bindings."""

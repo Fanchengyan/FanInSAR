@@ -47,6 +47,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         ".planetary_computer",
         "register_planetary_computer",
     ),
+    "S1_ORBITS_CATALOG": (".s1_orbits", "S1_ORBITS_CATALOG"),
+    "S1_ORBITS_ORIGIN": (".s1_orbits", "S1_ORBITS_ORIGIN"),
+    "S1OrbitsAdapter": (".s1_orbits", "S1OrbitsAdapter"),
+    "ensure_s1_orbits_catalog": (".s1_orbits", "ensure_s1_orbits_catalog"),
 }
 __all__ = list(_LAZY_EXPORTS)
 

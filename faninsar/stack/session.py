@@ -1346,6 +1346,15 @@ class Stack(NetworkContract):
         if not self._prepared:
             self.prepare_scenes()
 
+    def _ensure_precise_orbits(self) -> None:
+        """Bind covering precise orbits before geometry stages.
+
+        The base Stack has no orbit network dependency. Mission adapters may
+        override this hook so the first precise-orbit stage can download
+        covering files after local SAFE inputs already exist.
+        """
+        return
+
     def _write_qualified_activation_record(self) -> None:
         """Publish the typed P19 activation record after scene preparation."""
         if self.config.activation_mode != "qualified":
@@ -2452,6 +2461,7 @@ class Stack(NetworkContract):
         This stage does **not** form interferograms.
         """
         self._ensure_prepared()
+        self._ensure_precise_orbits()
         target_dates = (
             list(dates)
             if dates is not None

@@ -246,6 +246,9 @@ def local_destination(
 def select_orbit_bindings(
     candidates: Mapping[str, object] | Sequence[str | Path] | None,
     intervals: Mapping[str, tuple[datetime, datetime]],
+    *,
+    mission_ids: Mapping[str, str] | None = None,
+    require_coverage: bool = True,
 ) -> dict[str, Path]:
     """Select covering POEORB files before RESORB files for each acquisition.
 
@@ -256,6 +259,13 @@ def select_orbit_bindings(
         IDs; a sequence is considered for every acquisition.
     intervals : mapping
         Acquisition sensing intervals keyed by Stack date ID.
+    mission_ids : mapping, optional
+        SAFE ``mission_id`` (``S1A``/``S1B``/``S1C``) per date ID. When
+        provided, filenames that do not start with that prefix are ignored.
+    require_coverage : bool, default True
+        When true, a configured candidate set must cover every interval.
+        Auto-fetch uses ``False`` so uncovered dates keep SAFE-embedded
+        restituted vectors.
 
     Returns
     -------
@@ -266,8 +276,8 @@ def select_orbit_bindings(
     Raises
     ------
     ValueError
-        If configured candidates do not provide one covering valid orbit for
-        every acquisition.
+        If ``require_coverage`` is true and configured candidates do not
+        provide one covering valid orbit for every acquisition.
 
     """
     if candidates is None:
@@ -280,10 +290,14 @@ def select_orbit_bindings(
         shared = _as_paths(candidates)
         by_date = dict.fromkeys(intervals, shared)
     selected: dict[str, Path] = {}
+    missions = {
+        str(key): str(value).upper() for key, value in (mission_ids or {}).items()
+    }
     for date_id, interval in intervals.items():
         values = by_date.get(date_id, ())
         qualified: list[tuple[int, float, str, Path]] = []
         sensing_midpoint = interval[0] + (interval[1] - interval[0]) / 2
+        mission = missions.get(date_id, "")
         for candidate in values:
             try:
                 metadata = read_eof_orbit(candidate)
@@ -296,6 +310,8 @@ def select_orbit_bindings(
             stop = max(vector.time for vector in metadata.vectors)
             if start <= interval[0] and stop >= interval[1]:
                 name = candidate.name.upper()
+                if mission in {"S1A", "S1B", "S1C"} and not name.startswith(mission):
+                    continue
                 if "POEORB" in name or "POE_ORB" in name:
                     rank = 0
                 elif "RESORB" in name or "RES_ORB" in name:
@@ -306,6 +322,8 @@ def select_orbit_bindings(
                 distance = abs((orbit_midpoint - sensing_midpoint).total_seconds())
                 qualified.append((rank, distance, candidate.as_posix(), candidate))
         if not qualified:
+            if not require_coverage:
+                continue
             message = (
                 f"configured S1 orbit candidates do not cover acquisition {date_id}"
             )
