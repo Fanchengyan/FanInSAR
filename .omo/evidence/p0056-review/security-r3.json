@@ -1,0 +1,23 @@
+{
+  "lane": "security",
+  "reviewer": "security-reviewer-p0056-r3",
+  "verdict": "recommend-accept",
+  "blocking_issues": [],
+  "severity": "normal",
+  "evidence_refs": [
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/rounds/ROUND-01M43E94KS2Z7JQGGQ65VPKBRK/packets/security-20261004-123015.md",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/boundary.json",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/config.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/session.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/offsets.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/misreg_network.py"
+  ],
+  "advisories": [
+    "Optional: adaptive profile suggested=standard and selected=standard (ambiguous context). Inspected trust surfaces are local SAFE/annotation reads, existing TOPSCarrierModel plus resample_complex_deramped_reramp, and Stack esd_method / measure_misreg / force_esd_azimuth_shift_px seams. No new network, credentials, subprocess, or external tool. Standard depth is sufficient; no higher-depth round required.",
+    "Optional: keep work_dir/misreg/esd_overlap_diagnostics.json as a json.dumps sidecar that invert/apply never load; leave arcs.json MisregArc-shaped for _load_arcs. Reject non-finite force_esd_azimuth_shift_px as already specified. Do not pickle."
+  ],
+  "proposal_revision": 3,
+  "proposal_fingerprint": "da4bd0a293e046595bf17a8d189f71c92017ecf8a81be8015887b3552f62ff78",
+  "boundary_fingerprint": "a8f3eed3ffb80234c2d1a678dd6bb013f3e4ae19884a1f8df5149dc4c0b08df4"
+}

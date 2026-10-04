@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import gc
 import hashlib
 import json
@@ -552,6 +553,84 @@ def _output_bytes(path: Path) -> int:
     )
 
 
+_ARCHIVE_WRITE_CHUNK_BYTES = 256 * 1024 * 1024
+_ARCHIVE_WRITE_RETRIES = 120
+_ARCHIVE_RETRY_SECONDS = 60.0
+
+
+def _archive_write_chunks(payload: np.ndarray, path: str, tag: str) -> None:
+    """Write one contiguous payload, restarting after a transient ENOSPC.
+
+    A write that fails mid-transfer leaves an indeterminate number of bytes
+    in the file, so each ENOSPC attempt reopens the path with ``O_TRUNC``
+    and restarts the payload from byte zero.
+    """
+    stream = payload.view(np.uint8).reshape(-1)
+    for attempt in range(_ARCHIVE_WRITE_RETRIES):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            offset = 0
+            while offset < stream.size:
+                written = os.write(
+                    fd, stream[offset : offset + _ARCHIVE_WRITE_CHUNK_BYTES].tobytes()
+                )
+                offset += written
+            return
+        except OSError as error:
+            if (
+                error.errno != errno.ENOSPC
+                or attempt + 1 == _ARCHIVE_WRITE_RETRIES
+            ):
+                raise
+            logger.warning(
+                "%s: archive write ENOSPC at offset %d (attempt %d/%d); "
+                "syncing and restarting from byte 0",
+                tag,
+                offset,
+                attempt + 1,
+                _ARCHIVE_WRITE_RETRIES,
+            )
+            os.sync()
+            time.sleep(_ARCHIVE_RETRY_SECONDS)
+        finally:
+            os.close(fd)
+
+
+def _archive_tofile(array: np.ndarray, path: str, tag: str) -> None:
+    """Write one burst-archive array, recovering from a short ``tofile`` write.
+
+    Large archive writes have been observed to fail with numpy's generic
+    short-write ``OSError`` while the filesystem still reports free space
+    (a transient short ``fwrite`` of the whole payload).  Retry through
+    explicit chunked ``os.write`` calls with an ENOSPC backoff; a still
+    stuck file falls back to a sibling payload followed by an atomic
+    rename so one wedged inode cannot fail the run.
+    """
+    try:
+        array.tofile(path)
+    except OSError as error:
+        logger.warning(
+            "%s: archive tofile short write (errno=%s); retrying with chunked os.write",
+            tag,
+            error.errno,
+        )
+    else:
+        return
+    payload = np.ascontiguousarray(array)
+    try:
+        _archive_write_chunks(payload, path, tag)
+    except OSError as error:
+        if error.errno != errno.ENOSPC:
+            raise
+        logger.warning(
+            "%s: archive write persistently ENOSPC; retrying via sibling file",
+            tag,
+        )
+        sibling = path + ".archive_retry"
+        _archive_write_chunks(payload, sibling, tag)
+        Path(sibling).replace(path)
+
+
 def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
     """Process one burst unit in a worker process.
 
@@ -899,10 +978,10 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
         bbox_pri = pri_power[lr0:lr1, lc0:lc1]
         bbox_sec = sec_power[lr0:lr1, lc0:lc1]
         bbox_height = height_full[lr0:lr1, lc0:lc1]
-        bbox_ifg.astype(np.complex64, copy=False).tofile(ifg_path)
-        bbox_pri.astype(np.float64, copy=False).tofile(pri_path)
-        bbox_sec.astype(np.float64, copy=False).tofile(sec_path_out)
-        bbox_height.astype(np.float64, copy=False).tofile(height_path)
+        _archive_tofile(bbox_ifg.astype(np.complex64, copy=False), ifg_path, tag)
+        _archive_tofile(bbox_pri.astype(np.float64, copy=False), pri_path, tag)
+        _archive_tofile(bbox_sec.astype(np.float64, copy=False), sec_path_out, tag)
+        _archive_tofile(bbox_height.astype(np.float64, copy=False), height_path, tag)
         unit: dict[str, object] = {
             "tag": tag,
             "swath": swath,
@@ -918,9 +997,9 @@ def _process_burst_worker(task: dict[str, object]) -> dict[str, object]:
             "mode": "geo",
         }
     else:
-        ifg_full.astype(np.complex64, copy=False).tofile(ifg_path)
-        pri_power.astype(np.float64, copy=False).tofile(pri_path)
-        sec_power.astype(np.float64, copy=False).tofile(sec_path_out)
+        _archive_tofile(ifg_full.astype(np.complex64, copy=False), ifg_path, tag)
+        _archive_tofile(pri_power.astype(np.float64, copy=False), pri_path, tag)
+        _archive_tofile(sec_power.astype(np.float64, copy=False), sec_path_out, tag)
         unit = {
             "tag": tag,
             "swath": swath,

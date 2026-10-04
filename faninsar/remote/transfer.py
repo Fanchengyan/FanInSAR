@@ -11,7 +11,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -331,7 +331,7 @@ class _RedirectHandler(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
-def _stream_download(
+def _stream_and_verify(
     asset: RemoteAsset,
     adapter: _Adapter,
     budget: RemoteResourceBudget,
@@ -340,8 +340,16 @@ def _stream_download(
     poll_scheduler: _BurstPollScheduler | None = None,
     poll_token: _BurstPollToken | None = None,
     transfer_url_override: str | None = None,
-) -> tuple[int, str]:
-    """Stream one complete asset into ``staging`` and return size/digest."""
+) -> tuple[int, str, dict[str, object]]:
+    """Stream one asset into ``staging`` and return size/digest/verification.
+
+    The verification record follows PROPOSAL-0055: ``{algorithm, checksum,
+    status, size}`` for assets that carry a provider checksum and
+    ``{status, size}`` for assets without one.  A bytes-vs-checksum mismatch
+    is returned with ``status: failed`` instead of being raised here so the
+    caller can persist the failed attempt in the per-destination manifest
+    before raising :class:`RemoteIntegrityError`.
+    """
     fetcher = getattr(adapter, "fetch", None)
     supplied_ledger = fetcher is not None and _accepts_ledger(fetcher)
     redirect_handler = _RedirectHandler(adapter, budget, ledger)
@@ -572,13 +580,54 @@ def _stream_download(
     size = staging.stat().st_size
     if asset.size_bytes is not None and size != asset.size_bytes:
         _fail(RemoteIntegrityError, "content_length_mismatch")
+    # Provider checksums are normalized upstream at search time
+    # (``records._normalize_checksum``); this layer never fetches a checksum
+    # sidecar itself.  A failed sidecar fetch (for example an ASF ``.md5``
+    # endpoint returning HTTP 503) is therefore an upstream retryable
+    # download failure and can never surface here as a verification state.
+    verification: dict[str, object] = {"status": "unverifiable", "size": size}
     if asset.checksum:
-        _, expected = asset.checksum.split(":", 1)
+        algorithm, expected = asset.checksum.split(":", 1)
         actual = checksum_hasher.hexdigest() if checksum_hasher is not None else ""
+        verification = {
+            "algorithm": algorithm,
+            "checksum": expected,
+            "status": "verified" if actual == expected else "failed",
+            "size": size,
+        }
         if actual != expected:
-            _fail(RemoteIntegrityError, "checksum_mismatch")
+            # A bytes-vs-checksum mismatch is the only verification failure.
+            # Return it so the caller records ``status: failed`` in the
+            # per-destination manifest before raising the integrity error.
+            return size, hasher.hexdigest(), verification
     _validate_representation(staging, asset)
-    return size, hasher.hexdigest()
+    return size, hasher.hexdigest(), verification
+
+
+def _stream_download(
+    asset: RemoteAsset,
+    adapter: _Adapter,
+    budget: RemoteResourceBudget,
+    ledger: _CallLedger,
+    staging: Path,
+    poll_scheduler: _BurstPollScheduler | None = None,
+    poll_token: _BurstPollToken | None = None,
+    transfer_url_override: str | None = None,
+) -> tuple[int, str]:
+    """Stream one complete asset into ``staging`` and return size/digest."""
+    size, digest, verification = _stream_and_verify(
+        asset,
+        adapter,
+        budget,
+        ledger,
+        staging,
+        poll_scheduler,
+        poll_token,
+        transfer_url_override,
+    )
+    if verification["status"] == "failed":
+        _fail(RemoteIntegrityError, "checksum_mismatch")
+    return size, digest
 
 
 def probe(
@@ -692,6 +741,77 @@ def _prepare_burst_for_standalone_download(
     return _fail(RemoteLimitError, "max_poll_attempts")
 
 
+def _publish_manifest(
+    manifest: Path,
+    identity: str,
+    digest: str,
+    size: int,
+    verification: Mapping[str, object],
+) -> None:
+    """Atomically publish one per-destination transfer manifest.
+
+    The manifest keeps the cache identity, the streaming self digest, and the
+    downloaded size, and carries the PROPOSAL-0055 verification record
+    (``{algorithm, checksum, status, size}`` or ``{status, size}``).
+    """
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=manifest.parent,
+            prefix=f".{manifest.name}.",
+            mode="w",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(
+                {
+                    "identity": identity,
+                    "sha256": digest,
+                    "size": size,
+                    "verification": dict(verification),
+                },
+                stream,
+                separators=(",", ":"),
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(manifest)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _extended_manifest_matches(path: Path, asset: RemoteAsset) -> bool:
+    """Return whether a verification-extended manifest qualifies for reuse.
+
+    ``cache._matching_manifest`` compares the manifest mapping exactly, so a
+    manifest carrying the PROPOSAL-0055 verification record cannot match it.
+    This fallback keeps the same identity, self-digest, and size gate while
+    ignoring the added record; the strict check is still tried first.
+    """
+    if not _is_qualified(asset) or not path.is_file():
+        return False
+    manifest_path = _manifest_path(path, asset)
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError):
+        return False
+    if (
+        not isinstance(manifest, dict)
+        or not manifest_path.is_file()
+        or manifest.get("identity") != _identity(asset)
+    ):
+        return False
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError:
+        return False
+    return manifest.get("sha256") == digest and manifest.get("size") == size
+
+
 def download(
     asset: RemoteAsset,
     destination: Path,
@@ -706,8 +826,11 @@ def download(
     """Download one complete asset and publish it atomically.
 
     Existing files are reused only with a qualified checksum or immutable
-    version and a matching private manifest.  Concurrent publishers targeting
-    one destination are serialized by a private process-local guard.
+    version and a matching private manifest.  Each download records a
+    PROPOSAL-0055 checksum verification entry (``{algorithm, checksum,
+    status, size}``, or ``{status, size}`` when the provider offers no
+    checksum) in the private per-destination manifest.  Concurrent publishers
+    targeting one destination are serialized by a private process-local guard.
     """
     if not isinstance(asset, RemoteAsset):
         msg = "asset must be a RemoteAsset"
@@ -726,7 +849,9 @@ def download(
         lock = _DESTINATION_LOCKS.setdefault(lock_key, threading.Lock())
     with lock:
         if destination.exists() and not overwrite:
-            if _matching_manifest(destination, asset):
+            if _matching_manifest(destination, asset) or _extended_manifest_matches(
+                destination, asset
+            ):
                 if poll_scheduler is not None:
                     poll_scheduler.complete(poll_token)
                 return destination
@@ -734,12 +859,13 @@ def download(
                 _fail(RemoteIntegrityError, "destination_conflict")
         ledger = ledger or _CallLedger(budget)
         if destination.exists() and not overwrite:
-            if _matching_manifest(destination, asset):
+            if _matching_manifest(destination, asset) or _extended_manifest_matches(
+                destination, asset
+            ):
                 return destination
             _fail(RemoteIntegrityError, "destination_conflict")
         temporary: Path | None = None
         manifest = _manifest_path(destination, asset)
-        manifest_temp: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 dir=destination.parent,
@@ -757,7 +883,7 @@ def download(
                 prepared_url = _prepare_burst_for_standalone_download(
                     asset, budget, ledger
                 )
-            size, digest = _stream_download(
+            size, digest, verification = _stream_and_verify(
                 asset,
                 adapter,
                 budget,
@@ -767,28 +893,17 @@ def download(
                 poll_token,
                 prepared_url,
             )
+            if verification["status"] == "failed":
+                # Persist the failed verification before raising so the
+                # failed attempt is recorded and the mission layer can
+                # exclude this acquisition from processing.
+                _publish_manifest(
+                    manifest, _identity(asset), digest, size, verification
+                )
+                _fail(RemoteIntegrityError, "checksum_mismatch")
             temporary.replace(destination)
             temporary = None
-            with tempfile.NamedTemporaryFile(
-                dir=destination.parent,
-                prefix=f".{manifest.name}.",
-                mode="w",
-                delete=False,
-            ) as stream:
-                manifest_temp = Path(stream.name)
-                json.dump(
-                    {
-                        "identity": _identity(asset),
-                        "sha256": digest,
-                        "size": size,
-                    },
-                    stream,
-                    separators=(",", ":"),
-                )
-                stream.flush()
-                os.fsync(stream.fileno())
-            manifest_temp.replace(manifest)
-            manifest_temp = None
+            _publish_manifest(manifest, _identity(asset), digest, size, verification)
         except BaseException:
             if poll_scheduler is not None:
                 poll_scheduler.set_state(poll_token, "failed")
@@ -798,9 +913,34 @@ def download(
                 poll_scheduler.complete(poll_token)
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-            if manifest_temp is not None:
-                manifest_temp.unlink(missing_ok=True)
     return destination
 
 
-__all__ = ["_RedirectHandler", "_stream_download", "download"]
+def read_verification(path: str | Path) -> dict[str, object] | None:
+    """Return the recorded PROPOSAL-0055 verification record for one input.
+
+    The transfer layer writes one qualified manifest per destination
+    (``<name>.faninsar.remote.<identity>.json``).  Callers that only hold the
+    destination path (e.g. manifest build) read the verification record from
+    the single qualified sibling when one exists.
+    """
+    destination = Path(path)
+    try:
+        siblings = sorted(
+            destination.parent.glob(f"{destination.name}.faninsar.remote.*.json"),
+            key=lambda item: item.stat().st_mtime,
+        )
+    except OSError:
+        return None
+    for candidate in reversed(siblings):
+        try:
+            manifest = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        verification = manifest.get("verification")
+        if isinstance(verification, dict):
+            return verification
+    return None
+
+
+__all__ = ["_RedirectHandler", "_stream_download", "download", "read_verification"]

@@ -1,0 +1,29 @@
+{
+  "lane": "security",
+  "reviewer": "security-reviewer-p0056-r1",
+  "verdict": "recommend-accept",
+  "blocking_issues": [],
+  "severity": "normal",
+  "evidence_refs": [
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/rounds/ROUND-01M3XYNFW5H3MT9TR7FKZWBXTW/packets/security-20261002-092110.md",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/boundary.json",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/config.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/session.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/esd.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/misreg_network.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/deramp.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/offsets.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/errors.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/types.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/annotation.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/protocols.py"
+  ],
+  "advisories": [
+    "Optional: invert_pair_misregistration keeps n_valid=0 arcs at default min_n_valid=0 (only non-finite shifts and non-positive/huge sigma are dropped). Decorrelated-scene fail-closed for AC-3 must be 'omit the arc' as specified; do not treat invert QC as a backstop and do not add invert-side gates for this MVP.",
+    "Optional: persist per-overlap diagnostics beside arcs.json, not as extra keys on the same objects. _load_arcs currently does MisregArc(**row) and will reject unknown fields; a sidecar matches the design without schema expansion."
+  ],
+  "proposal_revision": 1,
+  "proposal_fingerprint": "ab5c81f12674c0f09d30113e23043ada3f002e79fb607233c4f85da5c4aadebf",
+  "boundary_fingerprint": "d9c91a688b455d632e9937915056248b7ac6773449ee277b77b072168d59ae64"
+}

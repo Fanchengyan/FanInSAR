@@ -1,0 +1,29 @@
+{
+  "lane": "feasibility",
+  "reviewer": "feasibility-reviewer-p0056-r2",
+  "verdict": "recommend-accept",
+  "blocking_issues": [],
+  "severity": "normal",
+  "evidence_refs": [
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/rounds/ROUND-01M418E93JTZCWJKJ1S890KEM9/packets/feasibility-20261003-160946.md",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/boundary.json",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/esd.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/deramp.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/offsets.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/geometry_coreg.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/misreg_network.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/session.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/config.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/types.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/tests/processing/coregistration/"
+  ],
+  "advisories": [
+    "Optional: measure_misreg currently writes placeholder arc quality (azimuth_sigma_px=0.05/1.0 heuristic, n_valid=1) at faninsar/stack/session.py:2404-2407; when arcs switch to state.esd_sigma_px with weighted-scatter sigma (AC-3), replace these placeholders in the same change so invert_pair_misregistration QC (positive finite sigma, max_sigma_px drop, 1/sigma weighting) reflects measured quality rather than the hardcoded heuristics.",
+    "Optional: produce_interferogram_pair is declared with three overload stubs (faninsar/missions/s1/processing.py:4032, 4079, 4125); adding esd_method and esd_coherence_threshold kwargs must update all overloads plus the implementation so overload signatures stay accurate.",
+    "Optional: the multi-burst measure loop frees one measure_state per burst via gc.collect() (faninsar/missions/s1/processing.py, measure pass near line 4715); the overlap path adds per-window original-domain ref/sec crops and two carrier evaluations per window, so free per-window arrays inside the loop to preserve the existing memory discipline."
+  ],
+  "proposal_revision": 2,
+  "proposal_fingerprint": "35e023fd375889d20b065493f701763a40b1cb6af3622499a44c9cc4849d246d",
+  "boundary_fingerprint": "a5f7c9f463e83c75cb975ffbb20c08dca02db78652e85d28871ff1620e86428d"
+}

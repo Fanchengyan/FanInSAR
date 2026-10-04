@@ -283,17 +283,31 @@ class CatalogItem:
         )
 
 
+_CHECKSUM_DIGEST_LENGTHS: dict[str, int] = {
+    "md5": 32,
+    "sha256": 64,
+    "sha3_256": 64,
+    "sha512": 128,
+}
+
+
 def _normalize_checksum(value: Any) -> str | None:
-    """Accept only the qualified checksum grammar used by the cache."""
+    """Accept the qualified checksum grammar used by the cache.
+
+    Admits the provider algorithms recorded at download time (PROPOSAL-0055):
+    ``md5``, ``sha256``, ``sha3_256``, and ``sha512``, spelled
+    ``algorithm:hex``. CMR dict-shaped entries are normalized through their
+    ``checksum``/``Value`` keys. Unknown algorithms count as no checksum.
+    """
+    if isinstance(value, Mapping):
+        value = value.get("checksum") or value.get("Value") or value.get("value")
     if not isinstance(value, str) or ":" not in value:
         return None
     algorithm, digest = value.split(":", 1)
     algorithm = algorithm.lower()
-    if algorithm not in {"sha256", "sha512"} or not re.fullmatch(
-        r"[0-9a-fA-F]+", digest
-    ):
+    expected = _CHECKSUM_DIGEST_LENGTHS.get(algorithm)
+    if expected is None or not re.fullmatch(r"[0-9a-fA-F]+", digest):
         return None
-    expected = 64 if algorithm == "sha256" else 128
     return f"{algorithm}:{digest.lower()}" if len(digest) == expected else None
 
 

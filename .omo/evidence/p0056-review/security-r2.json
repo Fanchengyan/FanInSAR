@@ -1,0 +1,24 @@
+{
+  "lane": "security",
+  "reviewer": "security-reviewer-p0056-r2",
+  "verdict": "recommend-accept",
+  "blocking_issues": [],
+  "severity": "normal",
+  "evidence_refs": [
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/rounds/ROUND-01M418E93JTZCWJKJ1S890KEM9/packets/security-20261003-160946.md",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/boundary.json",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/session.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/misreg_network.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration"
+  ],
+  "advisories": [
+    "Optional (serialization contract): keep per-overlap ESD diagnostics in the separate work_dir/misreg/esd_overlap_diagnostics.json exactly as designed and never move them into arcs.json rows. The existing loader _load_arcs (faninsar/stack/session.py:4675) constructs MisregArc(**row), which raises on unknown keys, so any extra field added to arc rows would break arc loading for all existing caches. The proposed split preserves that contract; treat it as binding during implementation.",
+    "Optional (integrity hardening): the force_esd_azimuth_shift_px seam currently converts task kwargs with float(...) only (faninsar/missions/s1/processing.py:680-684). When injecting the overlap aggregate, reject non-finite values (NaN/inf) at the injection site so a degenerate overlap cannot silently poison the resample; a one-line finite check at the seam suffices. Not required for the MVP acceptance conditions.",
+    "Optional (config validation): validate esd_coherence_threshold (finite, within [0, 1]) and the multilook tuple (positive ints) at StackConfig validation time so a malformed runconfig fails at load instead of yielding a silently empty qualifying set. Robustness only; the design already fails closed on QC-empty results.",
+    "Optional (data minimization): keep the diagnostics JSON to numeric and geometry metadata only (indices, coherence, response ratios) and avoid absolute host paths or usernames, since scratch work-dirs in this domain are commonly shared between collaborators. Light-touch minimization consistent with the local trust model; not a boundary change."
+  ],
+  "proposal_revision": 2,
+  "proposal_fingerprint": "35e023fd375889d20b065493f701763a40b1cb6af3622499a44c9cc4849d246d",
+  "boundary_fingerprint": "a5f7c9f463e83c75cb975ffbb20c08dca02db78652e85d28871ff1620e86428d"
+}

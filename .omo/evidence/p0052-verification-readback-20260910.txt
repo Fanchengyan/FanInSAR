@@ -1,0 +1,46 @@
+P0052 independent verification readback (2026-09-10)
+
+Focused pytest:
+  uv run pytest tests/network/test_network_invert.py tests/timeseries/test_export.py tests/timeseries/test_results.py tests/io/storage/test_ifg_store.py tests/io/storage/test_scene_store.py tests/stack/test_spatial_unwrap_api.py -q --override-ini='addopts='
+  91 passed, 8 warnings
+  uv run pytest tests/io/storage/test_ifg_store.py -q --override-ini='addopts='
+  29 passed, 1 warning (including IFG and unwrap Zarr/STAC readback)
+
+Real artifact smoke:
+  SCENE_OK radar (2, 3) True (2, 3)
+  IFG_OK radar (2, 3) True True
+  TS_OK <generation-id> True True
+  SCENE_PHASE_ZARR_READBACK_OK True True
+  IFG_UNWRAP_ZARR_READBACK_OK True True
+  TIMESERIES_ZARR_READBACK_OK <generation-id> True
+
+Post-fix broad QA:
+  uv run pytest tests/io/storage tests/network tests/timeseries tests/stack -q --override-ini='addopts='
+  208 passed, 17 warnings
+  uv run pytest tests/stack/test_session.py tests/stack/test_spatial_unwrap_api.py tests/network/test_network_invert.py tests/io/storage/test_ifg_store.py tests/io/storage/test_scene_store.py tests/timeseries/test_export.py tests/missions/nisar/test_flatten_stage.py tests/missions/nisar/test_provider.py -q --override-ini='addopts='
+  147 passed, 15 warnings
+  uv run pytest tests/io/storage tests/network tests/timeseries tests/stack tests/missions/nisar/test_flatten_stage.py tests/missions/nisar/test_provider.py -q --override-ini='addopts='
+  232 passed, 17 warnings
+
+NetCDF/export registry smoke:
+  NETCDF_OK (2, 2, 3) True
+  RADAR_DEFAULT_REJECT_OK stac-cog export requires geo spatial metadata
+  REGISTRY ('netcdf', 'stac-cog', 'stac-zarr')
+
+Ruff:
+  uv run ruff check faninsar: PASS
+  uv run ruff format --check faninsar: PASS (264 files already formatted)
+  uv run python -m compileall -q faninsar: PASS
+  import smoke: PASS
+
+Full pytest --lf after interrupted broad run:
+  Previous 90 deselected, 9 failed run predates fixes. Post-fix affected suites are green above.
+  Remaining repository-wide failures, if any, are environment/data/legacy-surface related (missing external corpus, Torch libc++.1.dylib, optional snaphu import).
+
+COG artifact evidence is retained under .omo/evidence/p0052-timeseries-export-artifacts-20260910/; the managed focused export tests and captured COG artifact passed. A direct shell smoke without the managed PROJ environment was blocked by the local rasterio/PROJ installation.
+
+NPY audit:
+  No live NPY canonical path remains in scene, IFG, unwrap, Stack Network, or TimeSeries code.
+  faninsar/io/storage/ifg_store.py:_LEGACY_IFG_FILENAMES is quarantine-only compatibility detection.
+  faninsar/io/storage/ion_store.py NPY assets are intentional ionosphere diagnostic products, outside P0052 scene/IFG/unwrap/TimeSeries boundaries.
+  Live Stack index and Network publication asset locations are `.zarr`; no canonical `.npy` path remains.

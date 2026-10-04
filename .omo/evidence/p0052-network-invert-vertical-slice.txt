@@ -1,0 +1,56 @@
+Proposal 0052 Network.invert vertical slice evidence
+=====================================================
+
+Scope
+-----
+Owned files: faninsar/network/network.py and tests/network/test_network_invert.py.
+The existing analyze_time_series entry point remains a compatibility alias;
+the new preferred seam is Network.invert(model=None|model class|model instance).
+
+Red phase
+---------
+Invocation:
+  .venv/bin/python -m pytest tests/network/test_network_invert.py -q --override-ini='addopts='
+Observable before implementation:
+  5 failed, 1 warning in 1.37s
+  Each failure reported AttributeError: 'Network' object has no attribute 'invert'.
+Artifact:
+  tests/network/test_network_invert.py
+
+Green phase
+-----------
+Invocation:
+  .venv/bin/python -m pytest tests/network/test_network_invert.py -q --override-ini='addopts='
+Observable:
+  5 passed, 1 warning in 1.89s
+Scenarios covered:
+  - Network.invert() dispatches to pure SBAS.
+  - Network.invert(model=LinearModel) constructs the model from selected dates
+    and dispatches to the NSBAS path.
+  - A configured model with mismatched dates raises ValueError.
+  - An invalid model value raises TypeError with a configured-instance hint.
+  - A model class requiring extra constructor inputs raises TypeError with a
+    configured-instance hint.
+
+Regression checks
+-----------------
+Invocation:
+  .venv/bin/python -m pytest tests/network/test_network.py tests/network/test_reader.py tests/stack/test_session.py::test_publish_generation_exports_canonical_network_view tests/stack/test_spatial_unwrap_api.py::test_stack_network_exposes_its_interferogram_collection -q --override-ini='addopts='
+Observable:
+  29 passed, 3 warnings in 1.73s
+
+Invocation:
+  .venv/bin/ruff format faninsar/network/network.py tests/network/test_network_invert.py
+Observable:
+  2 files reformatted.
+
+Invocation:
+  .venv/bin/ruff check faninsar/network/network.py tests/network/test_network_invert.py
+Observable:
+  All checks passed!
+
+Note
+----
+`uv run pytest ...` could not build the local package because the isolated
+resolver could not fetch setuptools from PyPI (TLS handshake EOF). The local
+`.venv/bin/python` invocation above ran the same focused tests successfully.

@@ -1,141 +1,164 @@
 # AGENTS.md
 
-This file provides guidance to agents when working with code in this repository.
+This repository is a Python 3.11+ FanInSAR library. Keep changes small,
+domain-owned, and evidence-backed. This guide records repository conventions;
+`pyproject.toml`, `environment.yml`, the docs build files, and the Waymark
+sidecar remain the sources of truth for configuration and design details.
 
-## Governing Proposals
+## Before editing
 
-The following registered Waymarks are the normative design baseline for geometry,
-native acceleration, packaging, and their CI. The registered sidecar is the
-source of truth for the full designs; this section records only the rules that
-must hold for day-to-day development.
+- Inspect the current tree and the sources of truth for the files in scope.
+- For Waymark work, read
+  `/Users/fancy/Library/Application Support/Waymark/projects/FanInSAR-stac/project.json`.
+  Resolve both `sidecar_root` and `workspace_root` from that file; the cached
+  paths alone are not canonical.
+- When a branch below applies, read the applicable registered Proposal files from
+  `sidecar_root` before editing. Keep Proposal prose in the sidecar rather than
+  copying it here.
 
-- **PROPOSAL-0020** — one NumPy-in/NumPy-out geometry contract with Native,
-  prepared Compile, and Eager identities. Dispatch is native-first, then
-  Compile, then same-device Eager; an admitted execution never silently
-  switches backend. The retired finite-difference Newton path is forbidden.
-- **PROPOSAL-0025** — `auto` is the prepared native/Compile/Eager production
-  order. Native artifacts come from the packaged FanInSAR sources and the
-  explicit preparation API; unqualified artifacts fail closed, and CPU serial
-  packaging/dispatch smoke must remain green on Ubuntu, macOS, and Windows CI.
-  A Native/OpenMP performance claim requires evidence from the actual geometry
-  loop, not a separate probe; this CI is only serial/public-dispatch coverage.
-- **PROPOSAL-0026** — `geo2rdr` and `rdr2geo` share the fourteen-field result,
-  strict convergence and invalid-lane rules, variable-DEM semantics, and the
-  integrated device-resident execution contract. All native inputs and results
-  pass one centralized validator before ABI access. Native, Compile, and Eager
-  benchmarks use identical fixture, DEM, iteration budget, and I/O boundaries;
-  compute-only timings cannot replace the full public-call promotion boundary.
-- **PROPOSAL-0030** — the DEM manager is a two-axis contract: fourteen
-  selection names (thirteen products plus `auto`) on the product axis and a
-  manual `product:provider` grammar on the provider axis. Defaults are
-  anonymous cloud channels (AWS/Planetary Computer); the manager never
-  silently switches product or provider, `auto` rescues withheld GLO-30 cells
-  with same-family GLO-90 only, and provider failures raise the structured
-  `DEMProviderUnavailableError` instead of a hidden fallback. Selection fails
-closed before any network traffic; user-facing usage is documented in
-`docs/source/user_guide/dem_manager.ipynb`.
+### Proposal triggers
 
-When a change would intentionally violate one of these rules, do not patch
-around the Proposal. Amend the relevant Proposal or create a new accepted
-Proposal before formal implementation. Every change touching
-`faninsar/processing/geometry`, native sources, packaging, or the related CI
-must cite the governing Proposal IDs and run the relevant regression tests.
+- **Geometry, native code, backend dispatch, preparation, benchmarks, packaging,
+  or related CI:** read P0020, P0025, P0026, and any later applicable registered
+  Proposal that governs the touched seam.
+- **DEM selection, providers, fetching, materialization, or stack DEM wiring:**
+  read P0030 and P0041.
+- **Package layout, domain ownership, migration, Stack, Network, or storage
+  boundaries:** read P0043 and P0050.
+- **Remote catalogs, authentication, transfer, or automatic input preparation:**
+  read P0044, P0045, P0047, and P0049.
+- **Scientific result objects, inversion, persistence, or export semantics:**
+  read P0052.
 
-## Waymark Workspace
+Identify the governing Proposal in the work record. An intentional contract
+violation requires an amendment to the relevant Proposal or a new accepted
+Proposal before implementation.
 
-Waymark jobs for this repository must use the registered ProjectLink
-`workspace_root`. The current registration points to the separate Waymark
-application workspace directory at
-`/Users/fancy/Library/Application Support/Waymark/projects/FanInSAR-stac/workspaces`.
-Treat the ProjectLink configuration as the source of truth and resolve its
-current `workspace_root` before creating workspaces or large outputs.
+## Current domain ownership
 
-## Build, Lint, and Test Commands
+Use the post-P0050 tree as the ownership map; place new code with the concept
+that owns its behavior.
+
+- `faninsar/core/` — shared value objects and foundational contracts.
+- `faninsar/data/` — data objects, dataset representations, spatial queries,
+  and samplers.
+- `faninsar/stack/` — source-to-generation orchestration, Stack lifecycle,
+  search, preparation, grids, and run configuration.
+- `faninsar/network/` — persisted scientific products, Network views, readers,
+  and product provenance.
+- `faninsar/processing/` — scientific stages such as geometry, registration,
+  interferometry, masking, mosaicking, unwrapping, and runtime execution.
+- `faninsar/io/` — storage protocols, readers/writers, validation, and export.
+- `faninsar/remote/` — provider-neutral catalog, authentication, transfer,
+  cache, and remote-resource mechanics.
+- `faninsar/timeseries/` — time-series result types, inversion, and export.
+- `faninsar/missions/` — mission-owned behavior, including Sentinel-1 and NISAR.
+- `faninsar/plotting/` — plotting, colormaps, and renderers.
+- `faninsar/cli/` — command-line entry points and warm-up commands.
+
+Keep scientific selection and interpretation in its domain; keep shared
+transport in `remote`, persistence in `io`/`network`, and orchestration in
+`stack`.
+
+## Python standards
+
+- Write code, comments, names, and user-facing developer text in English.
+- Use Python 3.11+ type syntax: `|` unions, built-in generics, and
+  `Literal`, `TypedDict`, `Protocol`, `TypeAlias`, `Self`, or `@overload` when
+  they clarify the contract.
+- Add `from __future__ import annotations` to new or modified implementation
+  modules. Do not retrofit existing `__init__.py` files solely to satisfy this
+  rule.
+- Keep standard-library imports at module scope. Use `TYPE_CHECKING` for
+  type-only heavy or circular imports; lazy-load optional heavy dependencies
+  and raise a descriptive `ImportError` when a required optional dependency is
+  missing.
+- Use `pathlib.Path` internally and convert to `str` only for APIs that require
+  it, such as native C++ interfaces.
+- Give public modules, classes, functions, and methods NumPy-style docstrings;
+  add Parameters, Returns, Raises, Examples, and relevant Sphinx references as
+  the API requires.
+- Use the project logger before raising an error with useful context, using
+  `from faninsar.logging import setup_logger`; use logger methods for warnings.
+- Use Conventional Commits when making commits (`feat:`, `fix:`, `docs:`,
+  `refactor:`, `test:`, or `chore:`).
+- Ruff rules, ignores, exclusions, and formatting behavior come from
+  `pyproject.toml`; consult that file instead of duplicating its settings here.
+
+## Environment, tests, and docs
+
+Use the uv-managed environment for normal work:
 
 ```bash
-uv sync --dev                        # Install dev dependencies into the uv-managed .venv
-# OR
-conda env create -f environment.yml   # Use conda
-conda activate faninsar
+uv sync --dev
 ```
 
+The conda environment defined by `environment.yml` is `faninsar-dev`:
+
 ```bash
-uv run ruff check .                 # Lint with Ruff
-uv run ruff format .                # Format with Ruff
-uv run pre-commit install           # Install pre-commit hooks
+conda env create -f environment.yml
+conda activate faninsar-dev
+```
+
+Check-only verification commands are:
+
+```bash
+uv run ruff check --no-fix .
+uv run ruff format --check .
+```
+
+Mutating setup or formatting commands are separate:
+
+```bash
+uv run ruff format .
+uv run pre-commit install
 uv run pre-commit run --all-files
 ```
 
-```bash
-uv run pytest                                # Run all tests
-uv run pytest tests/test_pairs.py            # Run single test file
-uv run pytest tests/test_pairs.py::test_fn   # Run single test function
-uv run pytest tests/test_pairs.py::TestCls   # Run single test class
-uv run pytest --cov=faninsar                 # Run with coverage
-uv run pytest tests/test_file.py -v --override-ini="addopts="  # Without coverage (ISCE2 env)
-```
+Run focused tests first, then the broader suite when the change warrants it.
+Existing examples include:
 
 ```bash
-cd docs && make html              # Build HTML docs
-open _build/html/index.html       # View docs (macOS)
+uv run pytest --no-cov tests/processing/interferometry/test_pair.py
+uv run pytest --no-cov tests/processing/interferometry/test_pair.py::test_identical_slcs_have_unit_coherence_and_zero_phase
+uv run pytest -q --no-cov tests/processing/geometry/test_native_v2_cpu_sources.py::test_serial_cpu_extension_returns_validated_fourteen_field_result
+uv run pytest --cov=faninsar
+uv run pytest
 ```
 
-## Architecture
+The geometry native workflow job node is
+`.github/workflows/geometry-native.yml#jobs.cpu`; its public-dispatch tests
+are listed in that workflow and should be run with its `--no-cov` boundary.
 
-### Module Hierarchy
+```bash
+uv run pytest -q --no-cov tests/processing/geometry/test_public_geometry_v2.py::test_public_selectors_execute_prepared_eager_and_native
+```
 
-- **`faninsar/`** — Main package
-  - **`_core/`** — Core data structures and algorithms
-    - `alg.py` — Core algorithms
-    - `device.py` — Device/CPU/GPU management
-    - `file_tools.py` — File I/O utilities
-    - `geo/` — Geographic tools (`geo_tools.py`)
-    - `render/` — Rendering: HTML/SVG export, formatting (`formatting*.py`, `svg_graph.py`, `html_component.py`)
-    - `sar/` — SAR data structures: `Pairs`, `Acquisition`, `Baseline`, `loops`, `sar_missions`, `sar_property`, `sar_tools`
-  - **`backends/`** — Backend utilities (`lazy_rasterio.py`)
-  - **`constants/`** — Physical constants (`sar.py`)
-  - **`datasets/`** — Dataset loaders: HyP3, LiCSAR, ARIA, GACOS, APS, base, geobox, hierarchical, ifg, xarray_dataset
-  - **`isce2/`** — ISCE2 TOPS Sentinel-1 stack processing: workflow, config, command management, executors, sensors, workflows
-  - **`isce3/`** — ISCE3 utilities: alignment, geocoding, geometry, GPU, topo, transform, S1_base, metadata
-  - **`logging/`** — Logging utilities
-  - **`NSBAS/`** — NSBAS time series algorithms: inversion, tsmodels, freeze_thaw_process
-  - **`plots/`** — Visualization utilities: colorbars, formatters, hist_colorbar, utils
-  - **`query/`** — Spatial/temporal query: `BoundingBox`, points, polygons, query
-  - **`samplers/`** — Grid samplers: grid, collate
-  - **`typing/`** — Type definitions: device, geo, logging, pairs, sar
-  - **`uncertainties/`** — Uncertainty propagation (`uncertainty.py`)
+Build docs with `cd docs && make html`; the generated index is
+`docs/build/html/index.html`. For DEM behavior and user-facing examples, read
+`docs/source/user_guide/dem.rst`.
 
+## Temporary files
 
-## Sentinel-1 Ad-hoc Test Workspace
+Never write temporary or scratch files to the system `/tmp` or the filesystem
+root. Put them under the working directory instead: create a dedicated
+`tmp/` directory there for temporary files when needed and keep all of them
+inside it.
 
-When running ad-hoc Sentinel-1 / InSAR experiments (scratch scripts, campaign runs, large outputs, DEM/SLC caches, GeoTIFF/PNG comparisons):
+## Sentinel-1 scratch workspace
 
-- **Put scripts and data under** `/Volumes/DATA2/TEST_sentinel-1` — not under the repository root.
-- **Oracle / multi-stack compare drivers and former `processing.comparison` harness** live only under  
-  `/Volumes/DATA2/TEST_sentinel-1/faninsar-experiments/` (scripts, lib, campaign reports).  
-  Do **not** add compare/plot/ab_test/oracle drivers anywhere in the product tree.
-- Experimental notes and durable findings belong in the registered external Waymark
-  sidecar, not the product tree.
-- Do **not** write large intermediate products, `out/`, campaign trees, or one-off test scripts into the repo working tree.
-- Unit/integration tests that ship with the package stay in `tests/`; only heavy local data and throwaway experiment scripts go to DATA2.
-- Prefer a dated or named subfolder, e.g. `/Volumes/DATA2/TEST_sentinel-1/<campaign-or-run-id>/`.
+This policy is host-local. Before using it, check that `/Volumes/DATA2` is
+mounted and that `/Volumes/DATA2/TEST_sentinel-1` is accessible. Put ad-hoc
+Sentinel-1/InSAR scripts, campaign data, DEM/SLC caches, large outputs, and
+comparisons there; keep oracle and multi-stack experiment drivers under
+`/Volumes/DATA2/TEST_sentinel-1/faninsar-experiments/`. Keep shipping unit and
+integration tests under `tests/`, and keep durable experimental findings in
+the registered Waymark sidecar.
 
-## Code Style Guidelines
+## Completion
 
-### Language and Naming
-
-- Write all code and comments in English
-- Use descriptive English names for variables, functions, and classes
-- Follow PEP 8 and PEP 257 standards
-
-## Code Conventions
-
-- **Python 3.11+** required
-- **`from __future__ import annotations`** in every file
-- **Type hints**: Use Python 3.11+ syntax (`str | None`, `dict[str, int]`). Use `Literal` for fixed value sets. Use `@overload` for functions with multiple calling patterns or polymorphic return types
-- **Docstrings**: Use NumPy-style docstrings for all public modules, classes, functions, and methods. Include Parameters, Returns, Raises, and Examples where applicable, and use Sphinx reStructuredText markup such as :func:..., :class:..., and directives like .. note::, .. tip::, and .. warning:: when needed.
-- **Logging**: Use `from faninsar.logging import setup_logger; logger = setup_logger(__name__)` — log before raising exceptions errors
-- **Paths**: Use `pathlib.Path` internally; convert to `str` only when passing to C++ libraries or APIs that require strings
-- **Type-checking imports**: Put heavy/circular imports inside `if TYPE_CHECKING:` blocks
-- **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`)
-- **Linter**: ruff only (no black, no flake8). Line length 88. Ruff excludes `tests/`, `docs/`, `examples/` directories.
+A change is complete when the governing Proposal is identified where relevant,
+the focused tests pass, both check-only Ruff commands pass, and the exact
+commands and results are recorded with the work. Geometry/native changes also
+need the relevant CI and Proposal qualification gates, including packaging and
+public-dispatch evidence where applicable.

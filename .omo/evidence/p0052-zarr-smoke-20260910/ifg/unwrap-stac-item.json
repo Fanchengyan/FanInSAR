@@ -1,0 +1,30 @@
+{
+  "assets": {
+    "connected_components": {
+      "href": ".unwrap_generations/534a4dafa46d4c449ee4104c0913e85e/connected_components.zarr",
+      "roles": [
+        "data"
+      ]
+    },
+    "unwrapped_phase": {
+      "href": ".unwrap_generations/534a4dafa46d4c449ee4104c0913e85e/unwrapped_phase.zarr",
+      "roles": [
+        "data"
+      ]
+    }
+  },
+  "bbox": null,
+  "geometry": null,
+  "id": "unwrap-20240101-20240113",
+  "links": [],
+  "properties": {
+    "faninsar:domain": "radar",
+    "faninsar:grid_identity": "85e1484b9d32655845d4352da5d54ab0d44dec20cbfcb31dbdd5c43558aec0fe",
+    "faninsar:shape": [
+      2,
+      3
+    ]
+  },
+  "stac_version": "1.0.0",
+  "type": "Feature"
+}

@@ -1,0 +1,26 @@
+{
+  "lane": "adversarial",
+  "reviewer": "adversarial-reviewer-p0056-r3",
+  "verdict": "recommend-revision",
+  "blocking_issues": [
+    "FINDING: class=Necessary; condition=produce_interferogram_pair takes its sweep body (coregistration_grid=\"geo\", or multilook is not a single (az, rg) pair) with esd_method=\"overlap\" or auto and the selected set has adjacent-burst windows. _archive_burst_ifgs builds one worker task per burst, never sets force_esd_azimuth_shift_px, and each _process_burst_worker loads a single burst then runs stage_coregister(esd_enabled=...). origin_state.esd_azimuth_shift_px is the nanmedian of those per-burst split-band values. The serial selected_unit_count>1 consensus loop that the design rewires is in the direct radar body only and is not entered; path=AC-2 (pair and network dispatch, explicit-overlap fail-closed, skip per-burst split-band when overlap resolves) plus leftover F1 one-burst production ESD site; impact=explicit overlap neither measures overlap IFGs nor fails closed, auto never selects overlap, and measure_misreg/coregister_scenes on a geo (or multilook-sweep) Stack can record a split-band median under a resolved method of overlap; remedy=resolve esd_method on the selected burst set before workers in this body too: if overlap, load bursts i and i+1, measure/aggregate, inject force_esd_azimuth_shift_px into every task and skip worker ESD; if explicit overlap with no usable window or no qualifying samples, reject_invalid_state here as well; claim=a spec-conformant implementation that only rewires the direct-path consensus block leaves produce_interferogram_pair's second body as a one-burst ESD site, so AC-2 is false for shipping pair/network configurations; evidence=faninsar/missions/s1/processing.py:4310 (sweep dispatch), 4633-4724 (direct consensus only), 5551-5597 (worker tasks lack force_esd), 675-815 (one burst per worker), 5701-5714 (median of per-burst ESD onto origin_state), faninsar/stack/session.py:1828+2386 (measure_misreg forwards coregistration_grid and esd_enabled)."
+  ],
+  "severity": "normal",
+  "evidence_refs": [
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/session.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/offsets.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/deramp.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/esd.py"
+  ],
+  "advisories": [
+    "Optional: OverlapESDInput still has no col0 (or top_col0/bot_col0) while AC-1 requires the burst-absolute row0/col0/native_height triple for every carrier evaluation including R_A/R_B. Native full-range carriers (carrier_from_swath first_range_sample=array.col0=0) make crop-local columns wrong by window.col0. Resample wiring mentions col0; estimate_overlap_esd's src formula does not. Add the field or build crop-shifted carriers. Range error is much smaller than the F2/F5 centre_row class; not blocking.",
+    "Optional: pin that the burst-facing Lanczos inset applies to both ends of the shared output window and that max(|az_offset|) is over both top and bot fields. resample_complex_deramped_reramp cannot take a full-burst input and emit a crop (output shape equals input; cval=0). A tight crop-then-resample without that two-sided inset pulls zeros at each crop's interior edge, which is the opposite burst's facing edge.",
+    "Optional: measure_misreg still does az = float(state.esd_azimuth_shift_px or 0.0). origin_state is created in the apply loop (direct) or rebuilt from worker medians (sweep); _inherit_coregistration_residuals does not copy a new esd_sigma_px. A residuals_only produce_interferogram_pair that skips apply can return None and silently emit a 0-shift arc, contradicting F4. Populate pair-level esd_azimuth_shift_px and esd_sigma_px on the residuals_only return path and drop the or-0.0 default when a measurement was selected.",
+    "Optional: Stack._burst_kwargs defaults to first burst only per swath, so default auto never sees an adjacent pair. The migration sentence that runconfigs need no change and default auto starts using overlap is false until bursts selects >=2 adjacent bursts (already noted in AC-4). Correct the migration text rather than changing default selection in this proposal.",
+    "F5 text is closed: ref_*_native_height required with ref_*_carrier; secondary native_height is that secondary burst's own full line count; AC-4 fails R_A crop-local centre_row."
+  ],
+  "proposal_revision": 3,
+  "proposal_fingerprint": "da4bd0a293e046595bf17a8d189f71c92017ecf8a81be8015887b3552f62ff78",
+  "boundary_fingerprint": "a8f3eed3ffb80234c2d1a678dd6bb013f3e4ae19884a1f8df5149dc4c0b08df4"
+}

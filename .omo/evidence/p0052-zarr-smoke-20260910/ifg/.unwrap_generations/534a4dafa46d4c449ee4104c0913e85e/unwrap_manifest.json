@@ -1,0 +1,40 @@
+{
+  "crs": null,
+  "domain": "radar",
+  "generation_id": "534a4dafa46d4c449ee4104c0913e85e",
+  "grid_identity": "85e1484b9d32655845d4352da5d54ab0d44dec20cbfcb31dbdd5c43558aec0fe",
+  "ifg_generation_id": "c73f67305bc94866bbd4c19e06b2d541",
+  "ifg_manifest_digest": "7a68b67db636dcff0c5def8982ab17690cccea7c545d566b30282e5f1cbe8d2d",
+  "manifest_digest": "c620d2eaa08563dcc9c989b64e27089ec8952b35e448da56215d2162c2ef96fe",
+  "method": {
+    "name": "smoke",
+    "parameters": {}
+  },
+  "payloads": {
+    "connected_components": {
+      "dtype": "<i4",
+      "file": "connected_components.zarr",
+      "sha256": "3b8a0081425448051d15aa52575d1258c96b7353f45f3f09b488f4b1ef77050e",
+      "shape": [
+        2,
+        3
+      ]
+    },
+    "unwrapped_phase": {
+      "dtype": "<f4",
+      "file": "unwrapped_phase.zarr",
+      "sha256": "8e799fc19a0f3f5e6a225840dd63b74c47f98c1b4ea4938e44b8c692cd677445",
+      "shape": [
+        2,
+        3
+      ]
+    }
+  },
+  "schema_version": "stack_unwrap_artifact_v1",
+  "shape": [
+    2,
+    3
+  ],
+  "status": "complete",
+  "transform": null
+}

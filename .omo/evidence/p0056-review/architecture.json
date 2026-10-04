@@ -1,0 +1,35 @@
+{
+  "lane": "architecture",
+  "reviewer": "architecture-reviewer-p0056-r1",
+  "verdict": "recommend-revision",
+  "blocking_issues": [
+    "FINDING: class=Necessary; condition=AC-2; path=Proposed Design §4 Dispatch vs faninsar/stack/session.py::measure_misreg and ::coregister_scenes and faninsar/missions/s1/processing.py::stage_coregister / produce_interferogram_pair; impact=Overlap ESD is a two-adjacent-burst original-domain measurement. The shipping azimuth-ESD surface is a per-burst boolean esd_enabled: pair coregister_scenes sets esd_on from coreg_mode only and never reads esd_method; measure_misreg uses the tautology esd_on = method != 'auto' or True then records per-burst split-band state.esd_azimuth_shift_px; burst worker tasks carry only esd_enabled. An availability flag in _burst_kwargs cannot form overlap IFGs or stop workers from re-running split-band, so auto/overlap dispatch cannot satisfy AC-2 on the pair path and network arcs would still be split-band numbers; remedy=Name a pair-level two-burst measure step that calls esd_overlap after geometry+Ampcor; inject the weighted aggregate through the existing force_esd_azimuth_shift_px seam for pair apply and as MisregArc.azimuth_shift_px for network; pass esd_method (not a boolean availability flag) into produce_interferogram_pair; skip per-burst estimate_azimuth_shift_esd when overlap is selected; fail-closed for explicit overlap with no adjacent overlap at stack dispatch before production; claim=_burst_kwargs / task payloads carry the availability flag so burst workers stay consistent; auto is universal on pair and network paths; evidence=/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/session.py:1806-1825,2371,2480-2554; /Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py:1766-1821,2056-2084,4633-4724,5565",
+    "FINDING: class=Necessary; condition=AC-1; path=Proposed Design §2 Estimator (resample_complex_deramped_reramp / R_B); impact=Overlap patches are cropped burst strips. resample_complex_deramped_reramp sets centre_row from native_height else array height//2, and eta=(row-centre_row)*dt. A window-only resample that passes only row0 evaluates the steering carrier and R_B at the wrong burst centre, systematically biasing every overlap shift (the coordinate class this proposal exists to avoid). The shipping radar resample already passes row0, col0, and native_height together; the design names only row0; remedy=Specify the cropped-window carrier contract as the existing production triple: burst-absolute row0/col0 plus native_height equal to the full burst line count, for both resample_complex_deramped_reramp and R_A/R_B via carrier_phase_at_points. Include omitted-native_height in the AC-4 coordinate regression against a full-burst analytic carrier so a self-consistent wrong centre cannot pass; claim=Secondary patch from resample_complex_deramped_reramp with row0 added once at true source coordinates; evidence=/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/offsets.py:2499-2566,2591; /Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/deramp.py:368-420; /Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py:2433-2442"
+  ],
+  "severity": "normal",
+  "evidence_refs": [
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/rounds/ROUND-01M3XYNFW5H3MT9TR7FKZWBXTW/packets/architecture-20261002-092109.md",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/boundary.json",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/esd.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/__init__.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/config.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/session.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/misreg_network.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/offsets.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/deramp.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/__init__.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/carrier.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/types.py"
+  ],
+  "advisories": [
+    "Optional: default _burst_kwargs burst selection is first-burst-only ({swath: [0]}). auto will never take the overlap path unless the caller selects at least two adjacent bursts; document that operator requirement next to esd_method.",
+    "Optional: persist per-overlap diagnostics in a sidecar next to arcs.json. _load_arcs constructs MisregArc(**row) and will reject unknown keys if diagnostics are folded into the arc JSON rows.",
+    "Optional: when renaming esd.py to esd_splitband.py, update missions/s1/processing.py imports and the torch/dask split-band kernels that still name faninsar.processing.coregistration.esd so AC-5 behavior-unchanged holds.",
+    "Optional: carrier_phase_at_points exists on deramp.py but is not re-exported from faninsar.processing.coregistration.tops; import from deramp or add the export.",
+    "Optional: put the 0.85 coherence gate on StackConfig (or a named extra key) so pair and network dispatch share one knob rather than a hidden constant in esd_overlap.py."
+  ],
+  "proposal_revision": 1,
+  "proposal_fingerprint": "ab5c81f12674c0f09d30113e23043ada3f002e79fb607233c4f85da5c4aadebf",
+  "boundary_fingerprint": "d9c91a688b455d632e9937915056248b7ac6773449ee277b77b072168d59ae64"
+}

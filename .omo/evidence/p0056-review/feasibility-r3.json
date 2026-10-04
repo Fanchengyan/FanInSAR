@@ -1,0 +1,33 @@
+{
+  "lane": "feasibility",
+  "reviewer": "feasibility-reviewer-p0056-r3",
+  "verdict": "recommend-accept",
+  "blocking_issues": [],
+  "severity": "normal",
+  "evidence_refs": [
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/esd.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/deramp.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/offsets.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/geometry_coreg.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/misreg_network.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/dense_geometry.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/carrier.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/session.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/config.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/types.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/stack.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/tests/processing/coregistration/test_esd.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/tests/processing/coregistration/test_misreg_network.py"
+  ],
+  "advisories": [
+    "Optional: OverlapESDInput as sketched has top_row0/bot_row0 and native_height but no col0/ref_col0. AC-1 still requires the burst-absolute row0/col0/native_height triple; carrier_from_swath builds native-burst slant_range_time0 (full-range first_range_sample). Implement required col0 (and ref_col0 when ref_*_carrier is set) so R_B/R_A are not crop-local in range. Valid-sample intersections typically start at first_valid_sample >> 0.",
+    "Optional: resample_complex_deramped_reramp requires source, offsets, and output to share one shape (offsets.py:2556-2564). A windowed overlap resample must crop an already-deramped full burst (plus interior halo) rather than passing a full-burst source with a window-sized offset crop. deramp() has no row0/native_height (deramp.py:223-261); keep the never-deramp-a-crop rule.",
+    "Optional: pair-level sigma is additive and invert-legal (sigma_floor vs invert_pair_misregistration rejecting sigma<=0 at misreg_network.py:86-87), but ProductionPairState has no esd_sigma_px today, _inherit_coregistration_residuals copies only esd_azimuth_shift_px (processing.py:5873-5879), and measure_misreg hardcodes azimuth_sigma_px (session.py:2404). Thread the new field through those three sites.",
+    "Optional: Stack._burst_kwargs defaults to first burst per swath (session.py:1816-1818), so auto stays on split-band until the caller selects ≥2 adjacent bursts. Already in the verification plan; not a dispatch hole. produce_interferogram_pair currently takes esd_enabled, not esd_method; _produce_s1_pair forwards **options, so the additive kwarg is the smallest wiring path.",
+    "Optional: full-burst apply currently passes primary.array.samples.shape[0] with the secondary carrier (processing.py:2442). Overlap must use each date's own burst line count as specified (F5); do not copy that apply argument. Out of scope to fix the apply path in this proposal."
+  ],
+  "proposal_revision": 3,
+  "proposal_fingerprint": "da4bd0a293e046595bf17a8d189f71c92017ecf8a81be8015887b3552f62ff78",
+  "boundary_fingerprint": "a8f3eed3ffb80234c2d1a678dd6bb013f3e4ae19884a1f8df5149dc4c0b08df4"
+}

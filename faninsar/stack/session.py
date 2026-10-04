@@ -1199,6 +1199,12 @@ class Stack(NetworkContract):
                 for stage in ("roi", "interferogram", "unwrap", "ionosphere")
                 if self.config.mask_plan.references(stage)
             )
+            input_paths = [
+                path for paths in self.catalog.paths.values() for path in paths
+            ]
+            input_paths.extend(prepared.orbit_paths_by_acquisition.values())
+            input_paths.extend(prepared.calibration_paths)
+            verification = _input_verification_records(input_paths)
             document = build_manifest(
                 mission=self.__class__.__name__,
                 catalog_paths=self.catalog.paths,
@@ -1207,6 +1213,7 @@ class Stack(NetworkContract):
                 dem=self._manifest_identity(resolved_dem),
                 mask=self._manifest_identity(mask_identity),
                 processing_options=self._manifest_processing_options(),
+                verification=verification,
             )
             write_manifest(manifest_path, document)
         except Exception:
@@ -1468,15 +1475,17 @@ class Stack(NetworkContract):
             return None
         if _grid_crs_epsg(grid) != 4326:
             return None
-        gdal_x0, gdal_dx, gdal_rx, gdal_y0, gdal_ry, gdal_dy = grid.transform
+        aff_a, aff_b, aff_c, aff_d, aff_e, aff_f = (
+            float(value) for value in tuple(grid.transform)[:6]
+        )
         az_looks, rg_looks = (int(looks[0]), int(looks[1]))
         transform = Affine(
-            float(gdal_dx) * rg_looks,
-            float(gdal_rx),
-            float(gdal_x0),
-            float(gdal_ry),
-            float(gdal_dy) * az_looks,
-            float(gdal_y0),
+            aff_a * rg_looks,
+            aff_b,
+            aff_c,
+            aff_d,
+            aff_e * az_looks,
+            aff_f,
         )
         shape = (
             -(-int(grid.height) // az_looks),
@@ -2643,7 +2652,7 @@ class Stack(NetworkContract):
         *,
         pairs: Pairs | None = None,
         multilook: tuple[int, int] | list[tuple[int, int]] | None = None,
-        coherence_window: tuple[int, int] | None = (5, 5),
+        coherence_window: tuple[int, int] | None = None,
         phase_filter: PhaseFilter | None = _DEFAULT_PHASE_FILTER,
         goldstein_alpha: float | None = None,
         output_dir: str | Path | None = None,
@@ -2663,7 +2672,10 @@ class Stack(NetworkContract):
             is ``(5, 2)``. Each result is aligned to the common scene-grid
             origin. Scene-grid edge coverage and incomplete look support are
             represented by the validity mask rather than interpolation.
-        coherence_window : tuple[int, int] or None, default=(5, 5)
+        coherence_window : tuple[int, int] or None, default=None
+            ``None`` (the default) estimates coherence per multilook block
+            from that block's own samples (pure block MLE). A tuple enables
+            the P0038 two-stage sliding window instead.
             Odd, centered ``(azimuth, range)`` MLE support, with each axis at
             least three pixels. This selects the ISCE2-like first stage: a
             stride-one, clipped local coherence image followed by multilook
@@ -2904,7 +2916,9 @@ class Stack(NetworkContract):
                     wavelength_m=primary_store.wavelength_m,
                     grid_identity=primary_store.grid_identity,
                     crs=primary_store.crs,
-                    transform=primary_store.transform,
+                    transform=_scale_geo_artifact_transform(
+                        primary_store.transform, looks
+                    ),
                     filter_name=expected_filter_name,
                     filter_parameters=expected_filter_parameters,
                     source_manifest_digests=expected_sources,
@@ -4597,6 +4611,50 @@ def _normalize_multilook(
     ):
         return [(int(multilook[0]), int(multilook[1]))]
     return [(int(a), int(b)) for a, b in multilook]  # type: ignore[misc]
+
+
+def _scale_geo_artifact_transform(
+    transform: object | None, looks: tuple[int, int]
+) -> tuple[float, ...] | None:
+    """Scale one geo artifact transform by (azimuth, range) look factors.
+
+    Block multilooking multiplies the pixel sizes by the look factors and
+    keeps the grid origin, matching the scene-grid alignment convention of
+    ``form_interferograms``.  Radar-domain artifacts carry no transform, so
+    ``None`` passes through unchanged.  The stored convention is the
+    six-coefficient affine order of the persisted manifest.
+    """
+    if transform is None:
+        return None
+    from affine import Affine
+
+    aff_a, aff_b, aff_c, aff_d, aff_e, aff_f = (
+        float(value) for value in tuple(transform)[:6]
+    )
+    az_looks, rg_looks = (int(looks[0]), int(looks[1]))
+    scaled = Affine(
+        aff_a * rg_looks,
+        aff_b,
+        aff_c,
+        aff_d,
+        aff_e * az_looks,
+        aff_f,
+    )
+    return tuple(float(value) for value in scaled)[:6]
+
+
+def _input_verification_records(
+    paths: Iterable[str | Path],
+) -> dict[str, dict[str, object]]:
+    """Collect download-time verification records for manifest anchoring."""
+    from faninsar.remote.transfer import read_verification
+
+    records: dict[str, dict[str, object]] = {}
+    for path in paths:
+        record = read_verification(path)
+        if record:
+            records[str(Path(path))] = record
+    return records
 
 
 def _save_arcs(path: Path, arcs: list[MisregArc]) -> None:

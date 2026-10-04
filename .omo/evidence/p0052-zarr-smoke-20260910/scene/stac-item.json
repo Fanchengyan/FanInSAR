@@ -1,0 +1,30 @@
+{
+  "assets": {
+    "IW1_b0-primary": {
+      "href": "IW1_b0.primary.zarr",
+      "roles": [
+        "data"
+      ]
+    },
+    "IW1_b0-secondary": {
+      "href": "IW1_b0.secondary.zarr",
+      "roles": [
+        "data"
+      ]
+    }
+  },
+  "bbox": null,
+  "geometry": null,
+  "id": "scene-20240113",
+  "links": [],
+  "properties": {
+    "faninsar:domain": "radar",
+    "faninsar:grid_identity": "a814fa75ea965862b5a1751545476edd327eed246dc26b5769d68b0632d8cd40",
+    "faninsar:shape": [
+      2,
+      3
+    ]
+  },
+  "stac_version": "1.0.0",
+  "type": "Feature"
+}

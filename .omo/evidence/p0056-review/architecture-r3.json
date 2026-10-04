@@ -1,0 +1,23 @@
+{
+  "lane": "architecture",
+  "reviewer": "architecture-reviewer-p0056-r3",
+  "verdict": "recommend-accept",
+  "blocking_issues": [],
+  "severity": "normal",
+  "evidence_refs": [
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/offsets.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/deramp.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/session.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/misreg_network.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/config.py"
+  ],
+  "advisories": [
+    "Optional: OverlapESDInput still has no col0/ref_col0 while AC-1's binding triple includes col0; estimate_overlap_esd's src formula names row0/native_height only. BurstOverlapWindow.col0 exists and the production resample snippet already passes col0 into resample_complex_deramped_reramp. Plumb that column origin into the estimator input so R_A/R_B cannot silently use crop-local columns. Not Necessary: production reads full_range bursts (array.col0=0) and first_valid col0 is tens of samples against ~64 MHz range sampling; k_a/f_dc variation over that shift does not move overlap ESD at the 0.01 px AC.",
+    "Optional: F1 is specified on produce_interferogram_pair's sequential multi-burst consensus pass. The sweep/archive site (_archive_burst_ifgs / _process_burst_worker) still loads one burst per task and has no consensus/force_esd prelude. Default Stack radar + pair multilook uses the sequential path (AC-2 MVP). If geo/sweep/n_jobs must honor esd_method, compute the pair-level overlap residual once and inject it through force_esd_azimuth_shift_px on worker tasks; do not treat that as a new estimator.",
+    "Optional: keep OverlapESDInput.ref_*_native_height typed optional only because carriers are optional; reject_invalid_state in __post_init__ (and AC-4) must fire when ref_*_carrier is set and ref_*_native_height or ref_*_row0 is missing so the shipping native_height=None → crop_height//2 fallback in offsets.py/deramp.py cannot be reached on the R_A path."
+  ],
+  "proposal_revision": 3,
+  "proposal_fingerprint": "da4bd0a293e046595bf17a8d189f71c92017ecf8a81be8015887b3552f62ff78",
+  "boundary_fingerprint": "a8f3eed3ffb80234c2d1a678dd6bb013f3e4ae19884a1f8df5149dc4c0b08df4"
+}

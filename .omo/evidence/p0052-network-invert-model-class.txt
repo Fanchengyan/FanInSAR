@@ -1,0 +1,62 @@
+P0052 Network.invert model-class compatibility evidence
+Date: 2026-09-10
+
+Scenario: pure SBAS public inversion
+Invocation: uv run --offline pytest tests/network/test_network_invert.py -q --override-ini='addopts='
+Observable: 9 focused/integration tests passed; test_invert_without_model_uses_sbas verifies model=None uses invert_unwrapped_pairs.
+Artifact: tests/network/test_network_invert.py
+
+Scenario: model class and keyword-only dates construction
+Invocation: same focused pytest command
+Observable: test_invert_model_class_is_instantiated_with_selected_dates and test_invert_model_class_receives_dates_by_keyword passed. Built-in and custom model classes receive selected dates as dates=.
+Artifact: faninsar/network/network.py:933-969; tests/network/test_network_invert.py
+
+Scenario: configured model validation
+Invocation: same focused pytest command
+Observable: mismatched instance dates raise ValueError; invalid and extra-argument classes raise TypeError with configured-instance guidance.
+Artifact: faninsar/network/network.py:933-969; tests/network/test_network_invert.py
+
+Scenario: legacy compatibility selector
+Invocation: same focused pytest command plus uv run --offline pytest tests/stack/test_session.py::test_publish_generation_exports_canonical_network_view tests/stack/test_spatial_unwrap_api.py::test_stack_network_inverts_without_publish_or_reopen -q --override-ini='addopts='
+Observable: 9 Network/integration tests passed. analyze_time_series(solver='nsbas', model=None) retains its historical tuple-adaptation route and does not call public invert() SBAS semantics.
+Artifact: faninsar/network/network.py:801-825, 897-1000; tests/network/test_network_invert.py
+
+Scenario: lint and format
+Invocation: uv run --offline ruff check faninsar/network/network.py tests/network/test_network_invert.py && uv run --offline ruff format --check faninsar/network/network.py tests/network/test_network_invert.py
+Observable: All checks passed; both files already formatted.
+Artifact: faninsar/network/network.py; tests/network/test_network_invert.py
+
+Scenario: canonical persistence from Network.invert
+Invocation: uv run --offline pytest tests/network/test_network_invert.py -q --override-ini='addopts='
+Observable: 11 tests passed. Network.invert() created timeseries/item.json and timeseries/timeseries.zarr; returned TimeSeries.canonical_path points to the canonical root; open_timeseries_zarr reopened the committed generation.
+Artifact: faninsar/network/network.py:1080-1094; tests/network/test_network_invert.py:79-117
+
+Scenario: repeat and selected-pair persistence
+Invocation: same focused pytest command
+Observable: test_repeated_and_subset_inversion_advances_canonical_generation passed. Repeated full inversion and a selected-pair inversion each advanced the immutable CURRENT generation without replacing the root unsafely.
+Artifact: tests/network/test_network_invert.py:95-117
+
+Scenario: integrated Stack live Network view
+Invocation: uv run --offline pytest tests/network/test_network_invert.py tests/stack/test_spatial_unwrap_api.py::test_stack_network_inverts_without_publish_or_reopen -q --override-ini='addopts='
+Observable: 12 tests passed; Stack network view inverted without publish/reopen and Network persistence remained valid.
+Artifact: tests/stack/test_spatial_unwrap_api.py; tests/network/test_network_invert.py
+
+Scenario: complete Network regression
+Invocation: uv run --offline pytest tests/network -q --override-ini='addopts='
+Observable: 38 tests passed.
+Artifact: tests/network/
+
+Scenario: Network inversion canonical persistence
+Invocation: uv run --offline pytest tests/network/test_network_invert.py -q --override-ini='addopts='
+Observable: 11 tests passed. Network.invert() wrote timeseries/item.json and timeseries/timeseries.zarr, returned canonical_path, reopened the Zarr CURRENT generation, and advanced generations for repeat and subset inversion.
+Artifact: faninsar/network/network.py:1080-1095; tests/network/test_network_invert.py:79-117
+
+Scenario: Stack live Network persistence integration
+Invocation: uv run --offline pytest tests/network/test_network_invert.py tests/stack/test_spatial_unwrap_api.py::test_stack_network_inverts_without_publish_or_reopen -q --override-ini='addopts='
+Observable: 12 tests passed.
+Artifact: tests/network/test_network_invert.py; tests/stack/test_spatial_unwrap_api.py
+
+Scenario: exporter regression after Network persistence binding
+Invocation: uv run --offline pytest tests/timeseries/test_export.py -q --override-ini='addopts='
+Observable: 11 tests passed.
+Artifact: tests/timeseries/test_export.py

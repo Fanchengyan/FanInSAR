@@ -1,0 +1,23 @@
+Scenario: P0049 proposal wording and Verification Plan edit
+Invocation:
+  git -C /Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks diff --check -- \
+    waymark/proposals/PROPOSAL-0049-stack-automatic-input-preparation-mission-acquisition-seam.md
+Binary observable:
+  exit status 0; no diff-check output.
+
+Scenario: settled from_search graph statement
+Invocation:
+  rg -n 'It constructs the same|It may construct the same' \
+    /Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/proposals/PROPOSAL-0049-stack-automatic-input-preparation-mission-acquisition-seam.md
+Binary observable:
+  line 627 contains “It constructs the same”; no “It may construct the same” match.
+
+Scenario: deterministic Verification Plan coverage
+Invocation:
+  rg -n 'all path consumers|neither local|cross-field invariant mismatch|applied|target_grid_identity' \
+    /Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/proposals/PROPOSAL-0049-stack-automatic-input-preparation-mission-acquisition-seam.md
+Binary observable:
+  Verification Plan contains explicit pending path/production rejection,
+  failed atomic install of neither local SceneCatalog nor _PreparedStackInputs,
+  successful joint install, per-mismatch centralized-validator failure, and
+  per-(stage, target_grid_identity) applied-mask checks.

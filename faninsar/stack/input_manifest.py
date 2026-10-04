@@ -16,7 +16,41 @@ if TYPE_CHECKING:
     from faninsar.stack.search import MissionPreparedInputs
 
 logger = setup_logger(__name__)
-MANIFEST_SCHEMA = "faninsar.stack.input_manifest.v1"
+MANIFEST_SCHEMA = "faninsar.stack.input_manifest.v2"
+
+
+def _source_identity(
+    path: str | Path,
+    verification: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return the lightweight source identity recorded by the manifest.
+
+    PROPOSAL-0055: no byte hashing. The anchor is the download-time
+    verification record (when the transfer layer supplied one) plus the file
+    size, which reuse compares as a truncation tripwire. ``file_identity``
+    remains available to callers that want an explicit byte snapshot.
+    """
+    candidate = Path(path)
+    if not candidate.exists():
+        raise FileNotFoundError(candidate)
+    if candidate.is_dir():
+        size = sum(
+            item.stat().st_size for item in candidate.rglob("*") if item.is_file()
+        )
+        entry: dict[str, object] = {
+            "path": str(candidate),
+            "kind": "directory",
+            "size": size,
+        }
+    else:
+        entry = {
+            "path": str(candidate),
+            "kind": "file",
+            "size": candidate.stat().st_size,
+        }
+    if verification:
+        entry["verification"] = dict(verification)
+    return entry
 
 
 def file_identity(path: str | Path) -> dict[str, object]:
@@ -78,10 +112,19 @@ def build_manifest(
     dem: object | None = None,
     mask: object | None = None,
     processing_options: Mapping[str, object] | None = None,
+    verification: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
-    """Build the allowlisted manifest document without raw provider metadata."""
+    """Build the allowlisted manifest document without raw provider metadata.
+
+    ``verification`` maps an input path to the download-time verification
+    record `{algorithm, checksum, status, size}` supplied by the transfer
+    layer (PROPOSAL-0055). No byte hashing happens here.
+    """
+    verification = verification or {}
     sources = {
-        str(scene): [file_identity(path) for path in paths]
+        str(scene): [
+            _source_identity(path, verification.get(str(Path(path)))) for path in paths
+        ]
         for scene, paths in catalog_paths.items()
     }
     return {
@@ -92,10 +135,13 @@ def build_manifest(
             _json_value(footprint) for footprint in prepared.selected_footprints
         ],
         "orbits": {
-            str(key): file_identity(path)
+            str(key): _source_identity(path, verification.get(str(Path(path))))
             for key, path in prepared.orbit_paths_by_acquisition.items()
         },
-        "calibration": [file_identity(path) for path in prepared.calibration_paths],
+        "calibration": [
+            _source_identity(path, verification.get(str(Path(path))))
+            for path in prepared.calibration_paths
+        ],
         "provenance": dict(prepared.provenance),
         "grid": _json_value(grid),
         "dem": _json_value(dem),
@@ -109,12 +155,14 @@ def validate_manifest(
 ) -> dict[str, object]:
     """Validate and return a manifest with existing local bindings.
 
-    Unknown top-level keys are rejected so arbitrary provider metadata cannot
-    become part of the persistent Stack input contract. ``work_dir`` is kept
-    for callers that already pass it; cache roots are validated by their
-    owning acquisition layer rather than guessed here.
+    PROPOSAL-0055: no byte hashing. Each bound input must exist and match its
+    recorded size (the truncation tripwire); legacy v1 manifests carrying
+    `sha256` fields load unchanged with those fields inert. Unknown
+    top-level keys are rejected so arbitrary provider metadata cannot become
+    part of the persistent Stack input contract.
     """
-    if not isinstance(document, dict) or document.get("schema") != MANIFEST_SCHEMA:
+    schema = document.get("schema") if isinstance(document, dict) else None
+    if schema not in {MANIFEST_SCHEMA, "faninsar.stack.input_manifest.v1"}:
         message = "unsupported Stack input manifest"
         raise ValueError(message)
     allowed = {
@@ -154,10 +202,23 @@ def validate_manifest(
             path = Path(entry["path"]).resolve()
             if not path.exists():
                 raise FileNotFoundError(path)
-            if entry.get("sha256"):
-                current = file_identity(path)
-                if current.get("sha256") != entry["sha256"]:
-                    message = f"manifest checksum mismatch for {path}"
+            # PROPOSAL-0055: size tripwire only. Legacy sha256 fields are
+            # inert — never compared, never recomputed.
+            recorded_size = entry.get("size")
+            if isinstance(recorded_size, int):
+                if entry.get("kind") == "directory":
+                    found = sum(
+                        item.stat().st_size
+                        for item in path.rglob("*")
+                        if item.is_file()
+                    )
+                else:
+                    found = path.stat().st_size
+                if found != recorded_size:
+                    message = (
+                        f"manifest size mismatch for {path}: recorded "
+                        f"{recorded_size}, found {found}"
+                    )
                     raise ValueError(message)
     return document
 

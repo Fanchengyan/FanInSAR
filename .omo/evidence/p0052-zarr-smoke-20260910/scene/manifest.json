@@ -1,0 +1,35 @@
+{
+  "crs": null,
+  "date_id": "20240113",
+  "domain": "radar",
+  "flatten_stage": "coregistration",
+  "grid_identity": "a814fa75ea965862b5a1751545476edd327eed246dc26b5769d68b0632d8cd40",
+  "grid_shape": [
+    2,
+    3
+  ],
+  "manifest_digest": "8dda6f4739e397e6918aa97acebc7bf698d1d89923ed1478ea530f6dd8a8b18d",
+  "reference_id": "20240101",
+  "schema_version": "scene_artifact_v1",
+  "shape": [
+    2,
+    3
+  ],
+  "status": "complete",
+  "transform": null,
+  "units": [
+    {
+      "col_origin": 0,
+      "cols": 3,
+      "payload_digest": "c448585427a150a3a34763b9ace8fc8ca9b159f93bbca8de3055d55cd63a60e0",
+      "phase_state": null,
+      "primary_file": "IW1_b0.primary.zarr",
+      "row_origin": 0,
+      "rows": 2,
+      "scientific_lineage": [],
+      "secondary_file": "IW1_b0.secondary.zarr",
+      "tag": "IW1_b0"
+    }
+  ],
+  "wavelength_m": null
+}

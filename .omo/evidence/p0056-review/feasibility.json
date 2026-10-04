@@ -1,0 +1,36 @@
+{
+  "lane": "feasibility",
+  "reviewer": "feasibility-reviewer-p0056-r1",
+  "verdict": "recommend-accept",
+  "blocking_issues": [],
+  "severity": "normal",
+  "evidence_refs": [
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/rounds/ROUND-01M3XYNFW5H3MT9TR7FKZWBXTW/packets/feasibility-20261002-092110.md",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac-waymarks/waymark/reviews/PROPOSAL-0056/boundary.json",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/esd.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/__init__.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/misreg_network.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/offsets.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/deramp.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/coregistration/tops/carrier.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/errors.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/processing/mosaicking/overlap.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/types.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/annotation.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/io/read.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/missions/s1/processing.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/config.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/faninsar/stack/session.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/tests/processing/coregistration/test_esd.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/tests/processing/coregistration/test_misreg_network.py",
+    "/Users/fancy/Documents/GitHub/FanInSAR-stac/tests/processing/coregistration/tops/test_restore_original_domain.py"
+  ],
+  "advisories": [
+    "FINDING: class=Optional condition=weighted scatter of per-overlap shifts is 0/undefined when a pair has one qualifying overlap (1-swath 2-burst is the smallest overlap-capable set); invert_pair_misregistration rejects sigma<=0 path=faninsar/processing/coregistration/misreg_network.py:86-87 impact=a literal σ-from-scatter implementation would fail AC-3 invert on single-overlap arcs remedy=floor azimuth_sigma_px to a positive value (coherence/n_valid CRB or the current 0.05 px measure_misreg floor) when n_overlap<2 claim=AC-3 sigma from scatter must remain invert-legal evidence=faninsar/stack/session.py:2397; faninsar/processing/coregistration/misreg_network.py:86-87",
+    "FINDING: class=Optional condition=Stack._burst_kwargs defaults to first burst only ({sw: [0]}); BurstArray.row0 is index*lines_per_burst so raster windows abut and are not sensing-time overlaps; /Volumes/DATA2/TEST_sentinel-1 is currently unmounted path=faninsar/stack/session.py:1806-1811 impact=auto would fall back to split-band, explicit overlap would fail-closed, and AC-4 real-S1/seam checks cannot run until consecutive bursts are selected and the host-local volume is mounted remedy=qualification runconfig must select >=2 adjacent bursts per swath and confirm DATA2 before AC-4; overlap windows must use azimuth_time/azimuth_time_interval_s, not stitch_bursts row ranges claim=AC-4 real-S1 + burst-seam continuity evidence=faninsar/missions/s1/io/read.py:36-38,121; faninsar/missions/s1/types.py:20-31,59; AGENTS.md scratch-workspace policy",
+    "FINDING: class=Optional condition=produce_interferogram_pair/stage_coregister expose only esd_enabled and estimate_azimuth_shift_esd on a single burst; overlap needs two adjacent original-domain patches path=faninsar/missions/s1/processing.py:2056-2086,4633-4724 impact=wiring dispatch only in measure_misreg would miss AC-2 pair-path apply; workers already accept force_esd_azimuth_shift_px remedy=measure overlap in the existing multi-burst consensus pass (keep neighbor bursts), then force the pair-level residual; fail-closed overlap with no adjacent pair before _produce_pair claim=AC-2 pair and network dispatch evidence=faninsar/stack/session.py:2371,2480-2554; faninsar/missions/s1/processing.py:1819-1824,4633-4724"
+  ],
+  "proposal_revision": 1,
+  "proposal_fingerprint": "ab5c81f12674c0f09d30113e23043ada3f002e79fb607233c4f85da5c4aadebf",
+  "boundary_fingerprint": "d9c91a688b455d632e9937915056248b7ac6773449ee277b77b072168d59ae64"
+}

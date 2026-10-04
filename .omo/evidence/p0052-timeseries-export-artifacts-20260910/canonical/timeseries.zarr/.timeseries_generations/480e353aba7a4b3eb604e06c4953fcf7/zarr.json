@@ -1,0 +1,34 @@
+{
+  "attributes": {
+    "pair_ids": [
+      "20240101_20240113"
+    ],
+    "dates": [
+      "20240101",
+      "20240113"
+    ],
+    "metadata": {
+      "phase_unit": "radian",
+      "revision": 2
+    },
+    "spatial": {
+      "domain": "geo",
+      "shape": [
+        2,
+        3
+      ],
+      "grid_identity": "grid-evidence",
+      "crs": "EPSG:4326",
+      "transform": [
+        1.0,
+        0.0,
+        100.0,
+        0.0,
+        -1.0,
+        20.0
+      ]
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}

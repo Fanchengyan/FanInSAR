@@ -47,6 +47,50 @@ logger = setup_logger(__name__)
 _DEFAULT_S1_DOWNLOAD_WORKERS = 8
 
 
+def _acquisition_date_identity(item: CatalogItem) -> str:
+    """Return the stable acquisition date used to record download exclusions."""
+    start = item.acquisition.start
+    if start is not None:
+        return start.isoformat()
+    return str(item.acquisition.acquisition_id or item.item_id)
+
+
+def _excluded_acquisition_record(
+    item: CatalogItem, destination: Path
+) -> dict[str, str]:
+    """Build the persisted exclusion record for one failed download.
+
+    PROPOSAL-0055: a download whose bytes fail the provider checksum is
+    recorded as ``status: failed`` and excluded from pair formation.  The
+    transfer layer owns the ``checksum_mismatch`` reason; the mission layer
+    only reacts to it.
+    """
+    return {
+        "date": _acquisition_date_identity(item),
+        "path": str(destination),
+        "status": "failed",
+        "reason": "checksum_mismatch",
+    }
+
+
+def _excluded_acquisition_provenance(
+    records: Sequence[Mapping[str, str]],
+) -> dict[str, str]:
+    """Serialize download exclusions into the mission provenance record.
+
+    Returns
+    -------
+    dict
+        Empty when nothing was excluded; otherwise one deterministic JSON
+        entry consumed by the shared input manifest's ``provenance`` block.
+
+    """
+    if not records:
+        return {}
+    payload = [dict(record) for record in records]
+    return {"excluded_acquisitions": json.dumps(payload, sort_keys=True)}
+
+
 def _configure_s1_bindings(
     stack: S1Stack,
     *,
@@ -343,8 +387,16 @@ class S1Stack(Stack):
         Raises
         ------
         ValueError
-            If the query has no complete SAFE representation or local
-            construction fails.
+            If the query has no complete SAFE representation, every download
+            fails verification, or local construction fails.
+
+        Notes
+        -----
+        A download whose bytes fail provider checksum verification excludes
+        only that acquisition (PROPOSAL-0055): it is warned, recorded as
+        ``status: failed`` in ``config.extra["excluded_acquisitions"]``, and
+        excluded from pair formation.  Any other download error remains
+        operation-fatal.
 
         """
         selected_polarizations = normalize_polarizations(polarizations)
@@ -403,6 +455,8 @@ class S1Stack(Stack):
         worker_count = min(len(download_plans), max(1, worker_limit))
         operation_ledger = remote._CallLedger(budget)
         downloaded_paths: list[Path | None] = [None] * len(download_plans)
+        excluded_indices: set[int] = set()
+        excluded_acquisitions: list[dict[str, str]] = []
         executor = ThreadPoolExecutor(
             max_workers=worker_count,
             thread_name_prefix="faninsar-s1-download",
@@ -477,6 +531,27 @@ class S1Stack(Stack):
                                 token, pending_error.delay_seconds
                             )
                             waiting.add(index)
+                        except remote.RemoteIntegrityError as integrity_error:
+                            # PROPOSAL-0055 amends the all-or-nothing clause for
+                            # download verification only: a bytes-vs-checksum
+                            # mismatch skips that acquisition (warned, recorded,
+                            # excluded from pair formation) while the remaining
+                            # downloads continue.  Every other download error
+                            # re-raises into the fail-closed boundary below.
+                            if integrity_error.reason != "checksum_mismatch":
+                                raise
+                            _item, _asset, destination = download_plans[index]
+                            record = _excluded_acquisition_record(_item, destination)
+                            logger.warning(
+                                "Sentinel-1 input failed download verification "
+                                "and is excluded from this Stack: %s "
+                                "(acquisition %s). Delete the file and "
+                                "re-download it before processing.",
+                                destination,
+                                record["date"],
+                            )
+                            excluded_indices.add(index)
+                            excluded_acquisitions.append(record)
                         continue
                     token = poll_tokens[index]
                     assert token is not None
@@ -504,8 +579,11 @@ class S1Stack(Stack):
                         waiting.add(index)
         except BaseException:
             # A failed input must never produce a partially constructed Stack.
-            # Pending jobs are cancelled; already-running downloads are allowed
-            # to finish so their temporary files and destination locks unwind.
+            # Verification failures are excluded above (PROPOSAL-0055) and
+            # never reach this boundary; any other download error stays
+            # operation-fatal.  Pending jobs are cancelled; already-running
+            # downloads are allowed to finish so their temporary files and
+            # destination locks unwind.
             logger.exception("Sentinel-1 SAFE download failed")
             for future in futures:
                 future.cancel()
@@ -513,13 +591,24 @@ class S1Stack(Stack):
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
         local_paths: list[Path] = []
-        for path in downloaded_paths:
+        for index, path in enumerate(downloaded_paths):
+            if index in excluded_indices:
+                continue
             if path is None:  # pragma: no cover - executor invariant
                 message = "Sentinel-1 download completed without a local path"
                 logger.error(message)
                 raise RuntimeError(message)
             local_paths.append(path)
+        if not local_paths:
+            message = (
+                "every Sentinel-1 input failed download verification; delete "
+                "the recorded files and re-download them before preparing"
+            )
+            logger.error(message)
+            raise ValueError(message)
         extra = dict(kwargs.pop("extra", {}) or {})
+        if excluded_acquisitions:
+            extra["excluded_acquisitions"] = tuple(excluded_acquisitions)
         extra.update(
             {
                 "search_product_type": product_type,
@@ -739,6 +828,7 @@ class S1Stack(Stack):
                     for burst in swath.bursts
                     if burst.footprint
                 )
+        excluded = self.config.extra.get("excluded_acquisitions", ())
         return MissionPreparedInputs(
             selected_footprints=tuple(footprints),
             orbit_paths_by_acquisition=dict(self.config.extra.get("orbit_paths", {})),
@@ -754,6 +844,7 @@ class S1Stack(Stack):
                     if self.config.extra.get("polarizations") == "all"
                     else ",".join(tuple(self.config.extra.get("polarizations", ())))
                 ),
+                **_excluded_acquisition_provenance(excluded),
             },
         )
 
