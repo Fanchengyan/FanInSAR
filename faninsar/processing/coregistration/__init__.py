@@ -22,6 +22,13 @@ from .ampcor_backend import (
 )
 from .dense_geometry import dense_geometry_offsets, geometry_offset_window_extent
 from .esd import ESDResult, estimate_azimuth_shift_esd
+from .esd_overlap import (
+    OverlapESDAggregate,
+    OverlapESDInput,
+    OverlapESDRecord,
+    aggregate_overlap_esd,
+    estimate_overlap_esd,
+)
 from .geometric_phase import (
     apply_geometric_phase_from_range_offset,
     geometric_phase_from_range_offset,
@@ -62,7 +69,11 @@ __all__ = [
     "ESDResult",
     "MisregArc",
     "OffsetFieldResult",
+    "OverlapESDAggregate",
+    "OverlapESDInput",
+    "OverlapESDRecord",
     "PatchAmplitudeShiftResult",
+    "aggregate_overlap_esd",
     "ampcor_ncc_postprocess_reference",
     "apply_geometric_phase_from_range_offset",
     "build_offset_field",
@@ -71,6 +82,7 @@ __all__ = [
     "eager_ampcor_candidate",
     "estimate_azimuth_shift_esd",
     "estimate_global_shift",
+    "estimate_overlap_esd",
     "estimate_patch_amplitude_shift",
     "geometric_phase_from_range_offset",
     "geometry_coarse_shift",
