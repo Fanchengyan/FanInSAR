@@ -48,11 +48,19 @@ logger = setup_logger(__name__)
 
 
 def __getattr__(name: str) -> Any:
-    """Load the concrete Sentinel-1 Stack adapter lazily."""
+    """Load heavy Sentinel-1 adapters lazily to avoid circular imports."""
     if name == "S1Stack":
         from faninsar.missions.s1.stack import S1Stack
 
         return S1Stack
+    if name == "measure_s1_pair_misreg":
+        from faninsar.missions.s1.measure import measure_s1_pair_misreg
+
+        return measure_s1_pair_misreg
+    if name == "coregister_s1_scene":
+        from faninsar.missions.s1.coregister import coregister_s1_scene
+
+        return coregister_s1_scene
     raise AttributeError(name)
 
 
@@ -98,11 +106,13 @@ __all__ = [
     "Sentinel1Sensor",
     "UnsupportedPolarizationError",
     "burst_overlap_windows",
+    "coregister_s1_scene",
     "estimate_burst_bytes",
     "export_swath_bursts",
     "extract_burst",
     "extract_bursts",
     "extract_remote_burst",
+    "measure_s1_pair_misreg",
     "normalize_polarizations",
     "open_safe_product",
     "parse_annotation_xml",
