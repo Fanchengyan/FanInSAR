@@ -50,7 +50,7 @@ from faninsar.network.products import (
 from faninsar.processing.coregistration.misreg_network import (
     DateMisreg,
     MisregArc,
-    invert_pair_misregistration,
+    invert_optional_pair_misregistration,
 )
 from faninsar.processing.errors import (
     reject_invalid_state,
@@ -801,6 +801,7 @@ class Stack(NetworkContract):
     scene_provider: StackSceneProvider | None = field(default=None, repr=False)
     arcs: list[MisregArc] = field(default_factory=list)
     date_misreg: DateMisreg | None = None
+    _nesd_skipped_no_windows: bool = False
     coreg_paths: dict[str, Path] = field(default_factory=dict)
     pair_states: dict[str, ProductionPairState] = field(default_factory=dict)
     ifg_dirs: list[Path] = field(default_factory=list)
@@ -2343,110 +2344,47 @@ class Stack(NetworkContract):
         }
         return digest_payload(payload)
 
-    @_reclaim_after_stage
-    def measure_misreg(
-        self,
-        *,
-        pairs: Pairs | None = None,
-        overwrite: bool = False,
-    ) -> Self:
-        """Measure per-pair misreg arcs (no full IFG products).
+    def _misreg_arcs_path(self) -> Path:
+        """Return the persisted pair-arc JSON path."""
+        return self.config.work_dir / "misreg" / "arcs.json"
 
-        TODO(P0056): dispatch to measure_s1_pair_misreg. This body still uses
-        the pair-engine measure path and is not the NESD stage wrapper yet.
-        """
-        self._ensure_prepared()
-        if self.config.coreg_mode == "geometry":
-            logger.info("measure_misreg skipped (coreg_mode=geometry)")
-            return self
-        if self.config.coreg_mode == "pair":
-            # Pair mode applies residuals inside coregister; arcs optional.
-            logger.info(
-                "measure_misreg: pair mode — arcs recorded for diagnostics only",
-            )
+    def _nesd_skip_path(self) -> Path:
+        """Return the sidecar flag written when NESD is skipped for no windows."""
+        return self.config.work_dir / "misreg" / "no_overlap_windows.json"
 
-        method = "overlap"
-        use_pairs = pairs or self.misreg_pairs
-        arcs_path = self.config.work_dir / "misreg" / "arcs.json"
-        if arcs_path.is_file() and not overwrite:
-            self.arcs = _load_arcs(arcs_path)
-            logger.info("Loaded %s misreg arcs from cache", len(self.arcs))
-            return self
+    def _write_nesd_skip_flag(self, skipped: bool) -> None:
+        """Persist or clear the no-overlap-window skip marker."""
+        path = self._nesd_skip_path()
+        if skipped:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("true\n", encoding="utf-8")
+            return
+        if path.is_file():
+            path.unlink()
 
-        arcs: list[MisregArc] = []
-        for primary, secondary in _iter_pair_dates(use_pairs):
-            if primary not in self.catalog.paths or secondary not in self.catalog.paths:
-                continue
-            out = self.config.work_dir / "misreg" / "measure" / f"{primary}_{secondary}"
-            esd_on = method != "auto" or True
-            # Measure-only: coreg + ESD/Ampcor; no unwrap; no IFG write required.
-            state = self._produce_pair(
-                self.catalog.paths_for(primary),
-                self.catalog.paths_for(secondary),
-                output_dir=out,
-                multilook=self.config.multilook,
-                goldstein_alpha=self.config.goldstein_alpha,
-                esd_enabled=esd_on,
-                amplitude_refinement_enabled=True,
-                unwrap=False,
-                overwrite=overwrite,
-                **self._burst_kwargs(),
-            )
-            az = float(state.esd_azimuth_shift_px or 0.0)
-            # Ampcor exposes the range residual in pixel units.  Keep the
-            # network arc on the same semantic field used by the production
-            # state; silently defaulting to zero would discard a measured
-            # range correction and make the later ESD/network solve diverge.
-            amp_rg = float(getattr(state, "amplitude_residual_rg_px", 0.0) or 0.0)
-            arcs.append(
-                MisregArc(
-                    primary=primary,
-                    secondary=secondary,
-                    azimuth_shift_px=az,
-                    range_shift_px=amp_rg,
-                    azimuth_sigma_px=0.05 if abs(az) > 1e-9 else 1.0,
-                    range_sigma_px=0.1 if abs(amp_rg) > 1e-9 else 1.0,
-                    method=str(method),
-                    n_valid=1,
-                ),
-            )
-        self.arcs = arcs
-        _save_arcs(arcs_path, arcs)
-        logger.info("Measured %s misreg arcs (method=%s)", len(arcs), method)
-        return self
+    def _read_nesd_skip_flag(self) -> bool:
+        """Return True when a previous measure warned-and-skipped NESD."""
+        path = self._nesd_skip_path()
+        if not path.is_file():
+            return False
+        return path.read_text(encoding="utf-8").strip().lower() in {"true", "1", "yes"}
 
-    @_reclaim_after_stage
-    def invert_misreg(
-        self,
-        *,
-        reference: str | None = None,
-        min_n_valid: int = 0,
-        max_sigma_px: float = 1e3,
-    ) -> Self:
-        """Invert arcs to per-date az/rg with Reference fixed at 0."""
-        self._ensure_prepared()
-        if self.config.coreg_mode != "network":
-            logger.info("invert_misreg skipped (coreg_mode=%s)", self.config.coreg_mode)
-            return self
-        if not self.arcs:
-            self.measure_misreg()
-        ref = reference or self.reference
-        try:
-            self.date_misreg = invert_pair_misregistration(
-                self.arcs,
-                reference=ref,
-                dates=list(self.catalog.dates),
-                min_n_valid=min_n_valid,
-                max_sigma_px=max_sigma_px,
-            )
-        except Exception:
-            # Qualified Stack execution never silently changes registration
-            # semantics after a failed network inversion.  The configured
-            # policy is validated as ``error`` at construction, so this path
-            # remains fail-closed for missing/invalid residual solutions.
-            logger.exception("misreg network inversion failed; aborting Stack")
-            raise
+    def _zero_date_misreg(self, *, reason: str) -> DateMisreg:
+        """Return geometry-zero constants for every catalog date."""
+        dates = list(self.catalog.dates)
+        return DateMisreg(
+            reference=self.reference,
+            azimuth_px=dict.fromkeys(dates, 0.0),
+            range_px=dict.fromkeys(dates, 0.0),
+            metadata={"skipped": reason, "n_arcs": 0},
+        )
+
+    def _persist_date_misreg(self) -> None:
+        """Write :attr:`date_misreg` to the work directory."""
+        if self.date_misreg is None:
+            return
         out = self.config.work_dir / "misreg" / "date_misreg.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
             json.dumps(
                 {
@@ -2459,6 +2397,211 @@ class Stack(NetworkContract):
             ),
             encoding="utf-8",
         )
+
+    def _apply_misreg_constants(self, date_id: str) -> tuple[float, float]:
+        """Return apply-time az/rg constants (0 for an omitted axis)."""
+        if self.date_misreg is None:
+            return 0.0, 0.0
+        return (
+            float(self.date_misreg.azimuth_px.get(date_id, 0.0)),
+            float(self.date_misreg.range_px.get(date_id, 0.0)),
+        )
+
+    def _requires_inverted_nesd_constants(self) -> bool:
+        """Return whether apply must have inverted NESD constants.
+
+        Sentinel-1 overrides this to ``True`` in ``nesd`` mode. Other missions
+        still coregister through the pair engine without a prior invert.
+        """
+        return False
+
+    def _reject_nesd_apply_without_constants(self) -> None:
+        """Fail closed when nesd apply has no inverted constants and did not skip."""
+        if (
+            self._requires_inverted_nesd_constants()
+            and self.date_misreg is None
+            and not self._nesd_skipped_no_windows
+        ):
+            reject_invalid_state(
+                "coreg_mode='nesd' requires date_misreg from invert_misreg "
+                "before coregister_scenes"
+            )
+
+    def _orbit_path_for(self, date_id: str) -> Path | None:
+        """Return the extra orbit path bound to ``date_id``, if any."""
+        orbit_paths = self.config.extra.get("orbit_paths")
+        if not isinstance(orbit_paths, dict):
+            return None
+        value = orbit_paths.get(date_id)
+        return None if value is None else Path(value)
+
+    def _measure_pair_misreg(self, primary: str, secondary: str) -> MisregArc:
+        """Measure one misreg pair through the mission scene provider.
+
+        Sentinel-1 overrides this hook with
+        :func:`~faninsar.missions.s1.measure.measure_s1_pair_misreg`.
+        """
+        out = self.config.work_dir / "misreg" / "measure" / f"{primary}_{secondary}"
+        state = self._produce_pair(
+            self.catalog.paths_for(primary),
+            self.catalog.paths_for(secondary),
+            output_dir=out,
+            multilook=self.config.multilook,
+            goldstein_alpha=self.config.goldstein_alpha,
+            esd_enabled=True,
+            amplitude_refinement_enabled=True,
+            unwrap=False,
+            overwrite=True,
+            **self._burst_kwargs(),
+        )
+        azimuth = _optional_shift(getattr(state, "esd_azimuth_shift_px", None))
+        range_shift = _optional_shift(getattr(state, "amplitude_residual_rg_px", None))
+        n_valid = int(getattr(state, "n_valid", 0) or 0)
+        if n_valid <= 0:
+            n_valid = int(azimuth is not None or range_shift is not None)
+        return MisregArc(
+            primary=primary,
+            secondary=secondary,
+            azimuth_shift_px=azimuth,
+            range_shift_px=range_shift,
+            azimuth_sigma_px=0.05 if azimuth is not None else 1.0,
+            range_sigma_px=0.1 if range_shift is not None else 1.0,
+            method="overlap",
+            n_valid=n_valid,
+        )
+
+    def _coregister_one_scene(
+        self,
+        date_id: str,
+        *,
+        output_dir: Path,
+        misreg_az_px: float,
+        misreg_rg_px: float,
+        overwrite: bool,
+    ) -> Any:
+        """Resample one secondary date onto the Reference grid.
+
+        The base implementation uses the mission pair engine with ESD and
+        Ampcor measurement disabled. Sentinel-1 overrides this hook with
+        :func:`~faninsar.missions.s1.coregister.coregister_s1_scene`.
+        """
+        pair_kwargs = dict(self._burst_kwargs())
+        orbit_paths = self.config.extra.get("orbit_paths")
+        if isinstance(orbit_paths, dict):
+            reference_orbit = orbit_paths.get(self.reference)
+            date_orbit = orbit_paths.get(date_id)
+            if reference_orbit is not None:
+                pair_kwargs["primary_orbit_path"] = reference_orbit
+            if date_orbit is not None:
+                pair_kwargs["secondary_orbit_path"] = date_orbit
+        for extra_key in (
+            "geoid_correction",
+            "geo_lut_cache_dir",
+            "geo_footprint_mask_enabled",
+        ):
+            if extra_key in self.config.extra:
+                pair_kwargs[extra_key] = self.config.extra[extra_key]
+        geo_work = self.config.extra.get("geo_work_dir")
+        if geo_work is not None:
+            pair_kwargs["geo_work_dir"] = Path(geo_work) / date_id
+        return self._produce_pair(
+            self.catalog.paths_for(self.reference),
+            self.catalog.paths_for(date_id),
+            output_dir=output_dir,
+            multilook=self.config.multilook,
+            goldstein_alpha=0.0,
+            esd_enabled=False,
+            amplitude_refinement_enabled=False,
+            unwrap=False,
+            overwrite=overwrite,
+            misreg_az_px=misreg_az_px,
+            misreg_rg_px=misreg_rg_px,
+            scene_store_dir=output_dir / "scenes",
+            **pair_kwargs,
+        )
+
+    @_reclaim_after_stage
+    def measure_misreg(
+        self,
+        *,
+        pairs: Pairs | None = None,
+        overwrite: bool = False,
+    ) -> Self:
+        """Measure per-pair NESD misreg arcs (no full IFG products).
+
+        ``coreg_mode="geometry"`` is a no-op. ``nesd`` measures each misreg
+        pair through :meth:`_measure_pair_misreg`. A campaign whose every
+        component is omitted warns and skips NESD so apply does not see
+        ``date_misreg is None``.
+        """
+        self._ensure_prepared()
+        if self.config.coreg_mode == "geometry":
+            logger.info("measure_misreg skipped (coreg_mode=geometry)")
+            return self
+        self._ensure_precise_orbits()
+        use_pairs = pairs or self.misreg_pairs
+        arcs_path = self._misreg_arcs_path()
+        if arcs_path.is_file() and not overwrite:
+            self.arcs = _load_arcs(arcs_path)
+            self._nesd_skipped_no_windows = self._read_nesd_skip_flag()
+            logger.info("Loaded %s misreg arcs from cache", len(self.arcs))
+            return self
+
+        arcs: list[MisregArc] = []
+        for primary, secondary in _iter_pair_dates(use_pairs):
+            if primary not in self.catalog.paths or secondary not in self.catalog.paths:
+                continue
+            arcs.append(self._measure_pair_misreg(primary, secondary))
+        skipped = not arcs or all(
+            arc.azimuth_shift_px is None and arc.range_shift_px is None for arc in arcs
+        )
+        if skipped:
+            logger.warning(
+                "No burst-overlap windows in the resolved NESD selection; "
+                "skipping NESD (geometry constants)"
+            )
+        self._nesd_skipped_no_windows = skipped
+        self._write_nesd_skip_flag(skipped)
+        self.arcs = arcs
+        _save_arcs(arcs_path, arcs)
+        logger.info("Measured %s misreg arcs (method=overlap)", len(arcs))
+        return self
+
+    @_reclaim_after_stage
+    def invert_misreg(
+        self,
+        *,
+        reference: str | None = None,
+        min_n_valid: int = 0,
+        max_sigma_px: float = 1e3,
+    ) -> Self:
+        """Invert optional az/rg arcs to per-date constants (Reference = 0).
+
+        ``coreg_mode="geometry"`` is a no-op. A measure campaign that warned
+        and skipped NESD writes geometry zeros for every date.
+        """
+        self._ensure_prepared()
+        if self.config.coreg_mode == "geometry":
+            logger.info("invert_misreg skipped (coreg_mode=%s)", self.config.coreg_mode)
+            return self
+        _ = min_n_valid, max_sigma_px
+        if not self.arcs and not self._nesd_skipped_no_windows:
+            self.measure_misreg()
+        if self._nesd_skipped_no_windows:
+            self.date_misreg = self._zero_date_misreg(reason="no_overlap_windows")
+            self._persist_date_misreg()
+            return self
+        ref = reference or self.reference
+        try:
+            self.date_misreg = invert_optional_pair_misregistration(
+                self.arcs,
+                reference=ref,
+                dates=list(self.catalog.dates),
+            )
+        except Exception:
+            logger.exception("misreg network inversion failed; aborting Stack")
+            raise
+        self._persist_date_misreg()
         return self
 
     @_reclaim_after_stage
@@ -2470,7 +2613,10 @@ class Stack(NetworkContract):
     ) -> Self:
         """Coregister each non-Reference date onto the Reference grid and cache.
 
-        This stage does **not** form interferograms.
+        This stage does **not** form interferograms and never measures NESD.
+        ``coreg_mode="nesd"`` requires :attr:`date_misreg` unless measure
+        warned and skipped because the selection had no overlap windows.
+        ``geometry`` applies zero date constants.
         """
         self._ensure_prepared()
         self._ensure_precise_orbits()
@@ -2479,19 +2625,10 @@ class Stack(NetworkContract):
             if dates is not None
             else [d for d in self.catalog.dates if d != self.reference]
         )
-        primary_path = self.catalog.paths_for(self.reference)
-        # Cache Reference identity product path (no self-coreg).
         reference_dir = self.config.work_dir / "coreg" / self.reference
         reference_dir.mkdir(parents=True, exist_ok=True)
         self.coreg_paths[self.reference] = reference_dir
 
-        # PROPOSAL-0017: pair = dense geometry + Ampcor range + ESD azimuth.
-        # geometry skips residual measure; network apply uses date constants only.
-        esd_on = self.config.coreg_mode == "pair"
-        amp_on = self.config.coreg_mode in {"pair", "network"}
-        if self.config.coreg_mode == "network":
-            esd_on = False
-            amp_on = False
         orbit_paths = self.config.extra.get("orbit_paths")
         if orbit_paths is not None and not isinstance(orbit_paths, dict):
             reject_invalid_state(
@@ -2501,11 +2638,7 @@ class Stack(NetworkContract):
         for date_id in target_dates:
             out = self.config.work_dir / "coreg" / date_id
             marker = out / "coreg_done.json"
-            misreg_az = 0.0
-            misreg_rg = 0.0
-            if self.date_misreg is not None:
-                misreg_az = float(self.date_misreg.azimuth_px.get(date_id, 0.0))
-                misreg_rg = float(self.date_misreg.range_px.get(date_id, 0.0))
+            misreg_az, misreg_rg = self._apply_misreg_constants(date_id)
             coreg_identity = self._coreg_resume_identity(
                 date_id,
                 misreg_az_px=misreg_az,
@@ -2537,40 +2670,15 @@ class Stack(NetworkContract):
                 if date_id == target_dates[0]:
                     copy_reference_units(out / "scenes", reference_dir / "scenes")
                 continue
-            pair_kwargs = dict(self._burst_kwargs())
-            if isinstance(orbit_paths, dict):
-                reference_orbit = orbit_paths.get(self.reference)
-                date_orbit = orbit_paths.get(date_id)
-                if reference_orbit is not None:
-                    pair_kwargs["primary_orbit_path"] = reference_orbit
-                if date_orbit is not None:
-                    pair_kwargs["secondary_orbit_path"] = date_orbit
-            for extra_key in (
-                "geoid_correction",
-                "geo_lut_cache_dir",
-                "geo_footprint_mask_enabled",
-            ):
-                if extra_key in self.config.extra:
-                    pair_kwargs[extra_key] = self.config.extra[extra_key]
-            geo_work = self.config.extra.get("geo_work_dir")
-            if geo_work is not None:
-                pair_kwargs["geo_work_dir"] = Path(geo_work) / date_id
-            state = self._produce_pair(
-                primary_path,
-                self.catalog.paths_for(date_id),
+            self._reject_nesd_apply_without_constants()
+            state = self._coregister_one_scene(
+                date_id,
                 output_dir=out,
-                multilook=self.config.multilook,
-                goldstein_alpha=0.0,
-                esd_enabled=esd_on,
-                amplitude_refinement_enabled=amp_on,
-                unwrap=False,
-                overwrite=overwrite,
                 misreg_az_px=misreg_az,
                 misreg_rg_px=misreg_rg,
-                scene_store_dir=out / "scenes",
-                **pair_kwargs,
+                overwrite=overwrite,
             )
-            if self.config.coregistration_grid == "radar":
+            if state is not None and self.config.coregistration_grid == "radar":
                 primary = getattr(state, "primary", None)
                 if primary is not None:
                     shape = _scene_array_shape(primary)
@@ -2587,17 +2695,13 @@ class Stack(NetworkContract):
                             "radar coregistration did not produce projection geometry"
                         )
                 else:
-                    # Lightweight providers may publish scene units without
-                    # retaining a full in-memory primary scene.  The persisted
-                    # scene store is sufficient for radar coregistration; only
-                    # projection-context restoration needs these optional fields.
                     logger.debug(
                         "scene provider did not retain primary scene; "
                         "skipping optional radar projection context"
                     )
-            if self.config.retain_pair_states:
+            if state is not None and self.config.retain_pair_states:
                 self.pair_states[f"{self.reference}_{date_id}"] = state
-            else:
+            elif state is not None:
                 logger.info(
                     "Released in-memory ProductionPairState for %s after scene "
                     "publication",
@@ -2606,22 +2710,27 @@ class Stack(NetworkContract):
             self.coreg_paths[date_id] = out
             if date_id == target_dates[0]:
                 copy_reference_units(out / "scenes", reference_dir / "scenes")
-            marker.write_text(
-                json.dumps(
+            marker_payload: dict[str, object] = {
+                "reference": self.reference,
+                "date": date_id,
+                "coreg_identity": coreg_identity,
+                "misreg_az_px": misreg_az,
+                "misreg_rg_px": misreg_rg,
+                "geometric_phase_removed": (
+                    "topo" if self.config.dem is not None else "flat"
+                ),
+                "esd_enabled": False,
+                "amplitude_refinement_enabled": False,
+                **self._mask_lineage_record(),
+            }
+            if state is not None:
+                marker_payload.update(
                     {
-                        "reference": self.reference,
-                        "date": date_id,
-                        "coreg_identity": coreg_identity,
-                        "misreg_az_px": misreg_az,
-                        "misreg_rg_px": misreg_rg,
-                        "geometric_phase_removed": (
-                            "topo" if self.config.dem is not None else "flat"
+                        "esd_azimuth_shift_px": getattr(
+                            state, "esd_azimuth_shift_px", None
                         ),
-                        "esd_azimuth_shift_px": state.esd_azimuth_shift_px,
-                        "range_shift_px": state.range_shift_px,
-                        "azimuth_shift_px": state.azimuth_shift_px,
-                        "esd_enabled": esd_on,
-                        "amplitude_refinement_enabled": amp_on,
+                        "range_shift_px": getattr(state, "range_shift_px", None),
+                        "azimuth_shift_px": getattr(state, "azimuth_shift_px", None),
                         "stage_timings_s": getattr(state, "stage_timings_s", {}),
                         "coregistration_timings_s": getattr(
                             state, "coregistration_timings_s", {}
@@ -2631,18 +2740,14 @@ class Stack(NetworkContract):
                             if self.config.coregistration_grid == "radar"
                             else None
                         ),
-                        **self._mask_lineage_record(),
-                    },
-                    indent=2,
-                    default=str,
-                ),
+                    }
+                )
+            marker.write_text(
+                json.dumps(marker_payload, indent=2, default=str),
                 encoding="utf-8",
             )
             logger.info("Coregistered %s → Reference %s", date_id, self.reference)
-            if not self.config.retain_pair_states:
-                # Assignment evaluates the next provider call before
-                # replacing this local. Drop the completed state's full-burst
-                # arrays now so adjacent dates cannot overlap in memory.
+            if state is not None and not self.config.retain_pair_states:
                 del state
                 gc.collect()
             self._reclaim_accelerator("persist")
@@ -4660,14 +4765,32 @@ def _input_verification_records(
     return records
 
 
+def _optional_shift(value: object) -> float | None:
+    """Return a finite float observation, else ``None`` (F17).
+
+    JSON ``null`` and non-finite sentinels stay omitted. A measured ``0.0``
+    is preserved; it is never used to fill a missing component.
+    """
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return number
+
+
 def _save_arcs(path: Path, arcs: list[MisregArc]) -> None:
+    """Persist pair arcs with JSON ``null`` for omitted components."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = [
         {
             "primary": a.primary,
             "secondary": a.secondary,
-            "azimuth_shift_px": a.azimuth_shift_px,
-            "range_shift_px": a.range_shift_px,
+            "azimuth_shift_px": _optional_shift(a.azimuth_shift_px),
+            "range_shift_px": _optional_shift(a.range_shift_px),
             "azimuth_sigma_px": a.azimuth_sigma_px,
             "range_sigma_px": a.range_sigma_px,
             "method": a.method,
@@ -4675,9 +4798,25 @@ def _save_arcs(path: Path, arcs: list[MisregArc]) -> None:
         }
         for a in arcs
     ]
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
 
 
 def _load_arcs(path: Path) -> list[MisregArc]:
+    """Load pair arcs without coercing JSON ``null`` to ``0.0``."""
     data = json.loads(path.read_text(encoding="utf-8"))
-    return [MisregArc(**row) for row in data]
+    return [
+        MisregArc(
+            primary=str(row["primary"]),
+            secondary=str(row["secondary"]),
+            azimuth_shift_px=_optional_shift(row.get("azimuth_shift_px")),
+            range_shift_px=_optional_shift(row.get("range_shift_px")),
+            azimuth_sigma_px=float(row.get("azimuth_sigma_px", 1.0)),
+            range_sigma_px=float(row.get("range_sigma_px", 1.0)),
+            method=str(row.get("method", "unknown")),
+            n_valid=int(row.get("n_valid", 0)),
+        )
+        for row in data
+    ]

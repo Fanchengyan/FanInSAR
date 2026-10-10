@@ -865,5 +865,130 @@ class S1Stack(Stack):
             },
         )
 
+    def _requires_inverted_nesd_constants(self) -> bool:
+        """Sentinel-1 NESD apply requires inverted date constants (F11)."""
+        return self.config.coreg_mode == "nesd"
+
+    def _resolve_s1_nesd_selection(
+        self,
+    ) -> tuple[tuple[str, ...] | None, BurstSelection | None]:
+        """Resolve swaths/bursts for NESD measure and apply.
+
+        No ROI keeps the configured selection (``None`` means all). An ROI
+        selects bursts by footprint intersection, including neighboring bursts
+        at edges, matching produce. The returned burst list is the full
+        overlap-strip selection, not an ROI crop.
+        """
+        cached = getattr(self, "_s1_nesd_selection", None)
+        if cached is not None:
+            return cached
+        roi = self._effective_roi_with_mask().roi
+        if roi is None:
+            result = (self.config.swaths, self.config.bursts)
+            self._s1_nesd_selection = result
+            return result
+        from faninsar.missions.s1.processing import _select_bursts_by_roi
+        from faninsar.missions.s1.safe import open_safe_product
+
+        logger.info("ROI provided; explicit swaths/bursts selection ignored")
+        ref_paths = list(self.catalog.paths_for(self.reference))
+        polarizations = self.config.extra.get("polarizations")
+        selected_polarizations = (
+            None if polarizations == "all" else tuple(polarizations or ())
+        )
+        products = [
+            open_safe_product(path, polarizations=selected_polarizations)
+            for path in ref_paths
+        ]
+        ordered = sorted(
+            products[0].swaths,
+            key=lambda item: item.slant_range_time_s,
+        )
+        swath_tuple = tuple(item.swath for item in ordered)
+        ref_orbit = self._orbit_path_for(self.reference)
+        orbits = [ref_orbit] * len(ref_paths)
+        resolved = _select_bursts_by_roi(
+            roi,
+            ref_paths,
+            swath_tuple,
+            orbits=orbits,
+            dem=self.config.dem,
+        )
+        bursts = _burst_selection_from_resolved(resolved, len(ref_paths), swath_tuple)
+        result = (swath_tuple, bursts)
+        self._s1_nesd_selection = result
+        return result
+
+    def _measure_pair_misreg(self, primary: str, secondary: str) -> Any:
+        """Measure one pair with overlap ESD + overlap Ampcor (not the pair engine)."""
+        from faninsar.missions.s1.measure import measure_s1_pair_misreg
+
+        swaths, bursts = self._resolve_s1_nesd_selection()
+        return measure_s1_pair_misreg(
+            _source_input(self.catalog.paths_for(primary)),
+            _source_input(self.catalog.paths_for(secondary)),
+            dem=self.config.dem,
+            swaths=swaths,
+            bursts=bursts,
+            coherence_threshold=self.config.esd_coherence_threshold,
+            ampcor_snr_threshold=self.config.ampcor_snr_threshold,
+            primary_orbit_path=self._orbit_path_for(primary),
+            secondary_orbit_path=self._orbit_path_for(secondary),
+            device=self.config.device,
+        )
+
+    def _coregister_one_scene(
+        self,
+        date_id: str,
+        *,
+        output_dir: Path,
+        misreg_az_px: float,
+        misreg_rg_px: float,
+        overwrite: bool,
+    ) -> Any:
+        """Apply geometry plus date constants via ``coregister_s1_scene``."""
+        del overwrite
+        from faninsar.missions.s1.coregister import coregister_s1_scene
+
+        swaths, bursts = self._resolve_s1_nesd_selection()
+        coregister_s1_scene(
+            _source_input(self.catalog.paths_for(self.reference)),
+            _source_input(self.catalog.paths_for(date_id)),
+            output_scenes=output_dir / "scenes",
+            swaths=swaths,
+            bursts=bursts,
+            roi=self._effective_roi_with_mask().roi,
+            dem=self.config.dem,
+            misreg_az_px=misreg_az_px,
+            misreg_rg_px=misreg_rg_px,
+            coregistration_grid=self.config.coregistration_grid,
+            geo_grid=self.config.geo_grid,
+            primary_orbit_path=self._orbit_path_for(self.reference),
+            secondary_orbit_path=self._orbit_path_for(date_id),
+            device=self.config.device,
+        )
+        return None
+
+
+def _source_input(paths: tuple[Path, ...]) -> Path | tuple[Path, ...]:
+    """Return a scalar path for one-frame dates, else the frame tuple."""
+    if len(paths) == 1:
+        return paths[0]
+    return paths
+
+
+def _burst_selection_from_resolved(
+    resolved: dict[tuple[int, str], list[int]],
+    frame_count: int,
+    swaths: tuple[str, ...],
+) -> BurstSelection:
+    """Convert ROI ``(frame, swath)`` indices into a BurstSelection mapping."""
+    if frame_count == 1:
+        return {swath: list(resolved.get((0, swath), [])) for swath in swaths}
+    return [
+        {swath: list(resolved.get((frame, swath), [])) for swath in swaths}
+        for frame in range(frame_count)
+    ]
+
 
 __all__ = ["S1Stack"]

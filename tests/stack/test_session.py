@@ -56,7 +56,9 @@ def _stack_with_three_date_network(tmp_path: Path) -> Stack:
         ),
         multilook=(1, 1),
     )
-    return stack.prepare_scenes()
+    stack = stack.prepare_scenes()
+    stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
+    return stack
 
 
 def _write_pair_artifact(
@@ -432,33 +434,36 @@ def test_coreg_resume_rejects_marker_after_provider_identity_change(
 
 def test_coregister_scenes_releases_prior_pair_before_next_date(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-retained Pair arrays die before the next date starts processing."""
-    stack = _stack_with_three_date_network(tmp_path)
-    first_payload_ref: weakref.ReferenceType[np.ndarray] | None = None
-    call_count = 0
+    """S1 apply coregisters each date without routing through the pair engine."""
+    from faninsar.processing.coregistration.misreg_network import DateMisreg
 
-    def fake_produce_pair(
-        _reference_path: SourceHandle,
-        secondary_handle: SourceHandle,
+    stack = _stack_with_three_date_network(tmp_path)
+    stack.date_misreg = DateMisreg(
+        reference=stack.reference,
+        azimuth_px={date_id: 0.0 for date_id in stack.catalog.dates},
+        range_px={date_id: 0.0 for date_id in stack.catalog.dates},
+        metadata={},
+    )
+    produce_calls: list[str] = []
+    apply_dates: list[str] = []
+
+    def fake_produce_pair(*_args: object, **_kwargs: object) -> None:
+        produce_calls.append("produce_pair")
+        raise AssertionError("S1 coregister_scenes must not call _produce_pair")
+
+    def fake_coregister(
+        _reference_path: object,
+        secondary_path: object,
         *,
-        options: dict[str, object],
+        output_scenes: Path,
         **_kwargs: object,
-    ) -> SimpleNamespace:
-        nonlocal call_count, first_payload_ref
-        if call_count == 1:
-            assert first_payload_ref is not None
-            assert first_payload_ref() is None
-        call_count += 1
-        payload = np.ones((64, 64), dtype=np.complex64)
-        if first_payload_ref is None:
-            first_payload_ref = weakref.ref(payload)
-        secondary_path = secondary_handle._resolve()[0]
-        scene_store_dir = options["scene_store_dir"]
-        assert isinstance(scene_store_dir, Path)
-        date_id = secondary_path.name.split("_")[5][:8]
+    ) -> Path:
+        date_id = Path(str(secondary_path)).name.split("_")[5][:8]
+        apply_dates.append(date_id)
         write_scene_unit(
-            scene_store_dir,
+            output_scenes,
             date_id=date_id,
             reference_id=stack.reference,
             domain="radar",
@@ -468,21 +473,21 @@ def test_coregister_scenes_releases_prior_pair_before_next_date(
             row_origin=0,
             col_origin=0,
         )
-        return SimpleNamespace(
-            _payload=payload,
-            esd_azimuth_shift_px=0.0,
-            range_shift_px=0.0,
-            azimuth_shift_px=0.0,
-        )
+        return Path(output_scenes)
 
     stack.scene_provider = StackSceneProvider(
         produce_pair=fake_produce_pair,
         name="TEST",
     )
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.coregister_s1_scene",
+        fake_coregister,
+    )
 
     stack.coregister_scenes()
 
-    assert call_count == 2
+    assert produce_calls == []
+    assert apply_dates == ["20240113", "20240125"]
 
 
 def test_s1_default_scene_dispatch_uses_provider(
@@ -656,8 +661,11 @@ def test_stack_config_rejects_qualified_mode_without_binding(tmp_path: Path) -> 
 
 def test_stack_measure_misreg_keeps_ampcor_range_residual(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Network arcs retain the production state's Ampcor range residual."""
+    """NESD arcs retain optional azimuth and range components from the measurer."""
+    from faninsar.processing.coregistration.misreg_network import MisregArc
+
     paths = []
     for day in ("20160101", "20160113"):
         path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
@@ -672,12 +680,21 @@ def test_stack_measure_misreg_keeps_ampcor_range_residual(
         pair_max_days=60,
     )
     stack.prepare_scenes()
+    stack._ensure_precise_orbits = lambda: None  # type: ignore[method-assign]
 
-    stack.scene_provider = StackSceneProvider(
-        name="TEST",
-        produce_pair=lambda *_args, **_kwargs: SimpleNamespace(
-            esd_azimuth_shift_px=-0.3, amplitude_residual_rg_px=0.7
-        ),
+    def fake_measure(*_args: object, **_kwargs: object) -> MisregArc:
+        return MisregArc(
+            primary="20160101",
+            secondary="20160113",
+            azimuth_shift_px=-0.3,
+            range_shift_px=0.7,
+            method="overlap",
+            n_valid=4,
+        )
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.measure.measure_s1_pair_misreg",
+        fake_measure,
     )
     stack.measure_misreg(overwrite=True)
 
