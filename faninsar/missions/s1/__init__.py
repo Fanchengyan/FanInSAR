@@ -29,6 +29,7 @@ from faninsar.missions.s1.io import (
     stitch_bursts,
 )
 from faninsar.missions.s1.orbit import read_eof_orbit
+from faninsar.missions.s1.overlap import BurstOverlapWindow, burst_overlap_windows
 from faninsar.missions.s1.safe import open_safe_product
 from faninsar.missions.s1.search import (
     S1DualPolarization,
@@ -83,6 +84,7 @@ __all__ = [
     "S1_C_BAND_WAVELENGTH_M",
     "SPEED_OF_LIGHT_M_S",
     "BurstArray",
+    "BurstOverlapWindow",
     "RemoteSafe",
     "S1Burst",
     "S1DualPolarization",
@@ -95,6 +97,7 @@ __all__ = [
     "Sentinel1ProductError",
     "Sentinel1Sensor",
     "UnsupportedPolarizationError",
+    "burst_overlap_windows",
     "estimate_burst_bytes",
     "export_swath_bursts",
     "extract_burst",
