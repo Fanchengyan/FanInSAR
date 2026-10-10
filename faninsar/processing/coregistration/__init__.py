@@ -42,7 +42,12 @@ from .geometry_coreg import (
     refine_shift_with_correlation,
     resolve_ampcor_policy,
 )
-from .misreg_network import DateMisreg, MisregArc, invert_pair_misregistration
+from .misreg_network import (
+    DateMisreg,
+    MisregArc,
+    invert_optional_pair_misregistration,
+    invert_pair_misregistration,
+)
 from .offsets import (
     OffsetFieldResult,
     PatchAmplitudeShiftResult,
@@ -88,6 +93,7 @@ __all__ = [
     "geometry_coarse_shift",
     "geometry_offset_window_extent",
     "geometry_shift_offsets",
+    "invert_optional_pair_misregistration",
     "invert_pair_misregistration",
     "lanczos_resample",
     "native_workspace_bytes",

@@ -7,7 +7,7 @@ caller's responsibility (PROPOSAL-0017).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
@@ -15,7 +15,7 @@ from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state, reject_pair_configuration
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 logger = setup_logger(__name__)
 
@@ -28,8 +28,10 @@ class MisregArc:
     """Earlier (or design-matrix primary) date id ``YYYYMMDD``."""
     secondary: str
     """Later (or design-matrix secondary) date id."""
-    azimuth_shift_px: float
-    range_shift_px: float
+    azimuth_shift_px: float | None
+    """Finite float iff a valid azimuth observation; ``None`` omits the axis."""
+    range_shift_px: float | None
+    """Finite float iff a valid range observation; ``None`` omits the axis."""
     azimuth_sigma_px: float = 1.0
     range_sigma_px: float = 1.0
     method: str = "unknown"
@@ -98,6 +100,150 @@ def _weighted_lstsq(
     return x
 
 
+def _is_finite_observation(value: float | None) -> bool:
+    """Return True iff ``value`` is a finite float (F17 valid observation)."""
+    return value is not None and bool(np.isfinite(value))
+
+
+def _resolve_dates(
+    arcs: Sequence[MisregArc],
+    *,
+    reference: str,
+    dates: Sequence[str] | None,
+) -> list[str]:
+    """Return the date list, requiring ``reference`` when ``dates`` is given."""
+    if dates is None:
+        date_set: set[str] = {reference}
+        for arc in arcs:
+            date_set.add(arc.primary)
+            date_set.add(arc.secondary)
+        return sorted(date_set)
+    date_list = list(dates)
+    if reference not in date_list:
+        reject_invalid_state("Reference must be included in dates")
+    return date_list
+
+
+def _zeros_by_date(date_list: Sequence[str]) -> dict[str, float]:
+    """Return a geometry-zero map for every date."""
+    return dict.fromkeys(date_list, 0.0)
+
+
+def _select_axis_arcs(
+    arcs: Sequence[MisregArc],
+    *,
+    shift_attr: Literal["azimuth_shift_px", "range_shift_px"],
+    sigma_attr: Literal["azimuth_sigma_px", "range_sigma_px"],
+) -> list[MisregArc]:
+    """Keep arcs with a finite observation and finite positive sigma on one axis."""
+    kept: list[MisregArc] = []
+    for arc in arcs:
+        shift = getattr(arc, shift_attr)
+        sigma = getattr(arc, sigma_attr)
+        if not _is_finite_observation(shift):
+            continue
+        if not np.isfinite(sigma) or float(sigma) <= 0.0:
+            continue
+        kept.append(arc)
+    return kept
+
+
+def _axis_unusable_reason(
+    kept: list[MisregArc],
+    *,
+    reference: str,
+    date_list: list[str],
+    sigmas: np.ndarray,
+) -> str | None:
+    """Return why a single-axis network cannot be inverted, or None."""
+    if not kept:
+        return "empty"
+    touched = {reference}
+    for arc in kept:
+        touched.add(arc.primary)
+        touched.add(arc.secondary)
+    if any(date not in touched for date in date_list):
+        return "disconnected"
+    g, _free = _design_matrix(kept, date_list, reference)
+    if g.size == 0:
+        return None
+    sigma = np.asarray(sigmas, dtype=np.float64)
+    if np.any(sigma <= 0.0) or not np.all(np.isfinite(sigma)):
+        return "invalid_sigma"
+    weight = 1.0 / sigma
+    rank = int(np.linalg.matrix_rank(g * weight[:, None], tol=1e-8))
+    if rank < g.shape[1]:
+        return "rank-deficient"
+    return None
+
+
+def _invert_axis_observations(
+    kept: list[MisregArc],
+    *,
+    reference: str,
+    date_list: list[str],
+    observations: np.ndarray,
+    sigmas: np.ndarray,
+    on_unusable: Literal["error", "zeros"],
+    axis: str,
+) -> tuple[dict[str, float], dict[str, object]]:
+    """Invert one axis of finite pair observations with Reference fixed at 0."""
+    reason = _axis_unusable_reason(
+        kept,
+        reference=reference,
+        date_list=date_list,
+        sigmas=sigmas,
+    )
+    if reason is not None:
+        if on_unusable == "zeros":
+            if reason == "empty":
+                logger.info(
+                    "misreg %s invert: no usable observations; using geometry zeros",
+                    axis,
+                )
+            else:
+                logger.warning(
+                    "misreg %s invert: %s; using geometry zeros",
+                    axis,
+                    reason,
+                )
+            return _zeros_by_date(date_list), {
+                "n_arcs": len(kept),
+                "empty": reason == "empty",
+                "unusable": reason,
+            }
+        if reason == "empty":
+            reject_invalid_state("no misreg arcs remain after QC")
+        if reason == "disconnected":
+            touched = {reference}
+            for arc in kept:
+                touched.add(arc.primary)
+                touched.add(arc.secondary)
+            missing = [date for date in date_list if date not in touched]
+            reject_invalid_state(
+                f"misreg network disconnected; dates without arcs: {missing}",
+            )
+        if reason == "invalid_sigma":
+            reject_invalid_state("arc sigma must be finite and positive")
+        reject_invalid_state(f"misreg network is rank-deficient ({reason})")
+
+    g, free = _design_matrix(kept, date_list, reference)
+    solution = _weighted_lstsq(g, observations, sigmas)
+    result_map = {reference: 0.0}
+    for i, date in enumerate(free):
+        result_map[date] = float(solution[i])
+    for date in date_list:
+        result_map.setdefault(date, 0.0)
+    residual = observations - g @ solution if g.size else np.zeros(0, dtype=np.float64)
+    rms = float(np.sqrt(np.mean(residual**2))) if len(kept) else 0.0
+    return result_map, {
+        "n_arcs": len(kept),
+        "n_free": len(free),
+        "rms_px": rms,
+        "methods": sorted({arc.method for arc in kept}),
+    }
+
+
 def invert_pair_misregistration(
     arcs: list[MisregArc] | tuple[MisregArc, ...],
     *,
@@ -151,7 +297,9 @@ def invert_pair_misregistration(
             continue
         if arc.azimuth_sigma_px > max_sigma_px or arc.range_sigma_px > max_sigma_px:
             continue
-        if not np.isfinite(arc.azimuth_shift_px) or not np.isfinite(arc.range_shift_px):
+        az_ok = _is_finite_observation(arc.azimuth_shift_px)
+        rg_ok = _is_finite_observation(arc.range_shift_px)
+        if not az_ok or not rg_ok:
             continue
         kept.append(arc)
 
@@ -227,5 +375,110 @@ def invert_pair_misregistration(
             "rms_az_px": float(np.sqrt(np.mean(residual_az**2))),
             "rms_rg_px": float(np.sqrt(np.mean(residual_rg**2))),
             "methods": sorted({a.method for a in kept}),
+        },
+    )
+
+
+def invert_optional_pair_misregistration(
+    arcs: list[MisregArc] | tuple[MisregArc, ...],
+    *,
+    reference: str,
+    dates: list[str] | tuple[str, ...] | None = None,
+) -> DateMisreg:
+    """Invert independently optional azimuth and range pair observations.
+
+    Each axis keeps only arcs whose component is a finite float with a finite
+    positive sigma. ``None`` omits that axis and is never replaced with
+    ``0.0``. Empty, disconnected, or rank-deficient axes return geometry
+    zeros without aborting the other axis.
+
+    Parameters
+    ----------
+    arcs : sequence of MisregArc
+        Pair residuals. ``azimuth_shift_px`` / ``range_shift_px`` may be
+        ``None`` to omit that component (PROPOSAL-0056 F16b/F17).
+    reference : str
+        Reference date id fixed at zero misregistration.
+    dates : sequence of str, optional
+        Full date list. Default: ``reference`` plus every date appearing
+        in ``arcs``. Dates missing from one axis receive ``0.0`` on that
+        axis after the other axis is inverted.
+
+    Returns
+    -------
+    DateMisreg
+        Maps date → az/rg px with ``reference`` at 0. An unusable axis is
+        geometry zeros; the other axis is unchanged.
+
+    """
+    if not reference:
+        reject_invalid_state("Reference date id is required")
+    date_list = _resolve_dates(arcs, reference=reference, dates=dates)
+    if dates is not None:
+        known = set(date_list)
+        for arc in arcs:
+            if arc.primary not in known or arc.secondary not in known:
+                reject_invalid_state(
+                    f"arc {arc.pair_id} references unknown dates in network",
+                )
+
+    az_kept = _select_axis_arcs(
+        arcs,
+        shift_attr="azimuth_shift_px",
+        sigma_attr="azimuth_sigma_px",
+    )
+    rg_kept = _select_axis_arcs(
+        arcs,
+        shift_attr="range_shift_px",
+        sigma_attr="range_sigma_px",
+    )
+    az_dates = _resolve_dates(az_kept, reference=reference, dates=None)
+    rg_dates = _resolve_dates(rg_kept, reference=reference, dates=None)
+
+    az_obs = np.array([arc.azimuth_shift_px for arc in az_kept], dtype=np.float64)
+    az_sig = np.array([arc.azimuth_sigma_px for arc in az_kept], dtype=np.float64)
+    rg_obs = np.array([arc.range_shift_px for arc in rg_kept], dtype=np.float64)
+    rg_sig = np.array([arc.range_sigma_px for arc in rg_kept], dtype=np.float64)
+
+    az_map, az_meta = _invert_axis_observations(
+        az_kept,
+        reference=reference,
+        date_list=az_dates,
+        observations=az_obs,
+        sigmas=az_sig,
+        on_unusable="zeros",
+        axis="azimuth",
+    )
+    rg_map, rg_meta = _invert_axis_observations(
+        rg_kept,
+        reference=reference,
+        date_list=rg_dates,
+        observations=rg_obs,
+        sigmas=rg_sig,
+        on_unusable="zeros",
+        axis="range",
+    )
+
+    merged_az = _zeros_by_date(date_list)
+    merged_rg = _zeros_by_date(date_list)
+    merged_az.update(az_map)
+    merged_rg.update(rg_map)
+    logger.info(
+        "Inverted optional misreg network: n_az=%s n_rg=%s dates=%s Reference=%s",
+        az_meta.get("n_arcs", 0),
+        rg_meta.get("n_arcs", 0),
+        len(date_list),
+        reference,
+    )
+    return DateMisreg(
+        reference=reference,
+        azimuth_px=merged_az,
+        range_px=merged_rg,
+        metadata={
+            "n_arcs_az": az_meta.get("n_arcs", 0),
+            "n_arcs_rg": rg_meta.get("n_arcs", 0),
+            "n_dates": len(date_list),
+            "azimuth": az_meta,
+            "range": rg_meta,
         },
     )

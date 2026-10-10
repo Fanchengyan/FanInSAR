@@ -13,6 +13,7 @@ from faninsar.processing.coregistration.geometric_phase import (
 from faninsar.processing.coregistration.geometry_coreg import combine_offset_fields
 from faninsar.processing.coregistration.misreg_network import (
     MisregArc,
+    invert_optional_pair_misregistration,
     invert_pair_misregistration,
 )
 from faninsar.processing.coregistration.offsets import OffsetFieldResult
@@ -67,6 +68,104 @@ def test_invert_rejects_disconnected_network() -> None:
             reference="20160101",
             dates=["20160101", "20160113", "20160201"],
         )
+
+
+def test_optional_invert_mixed_arc_inverts_range_zeros_azimuth() -> None:
+    """A range-only arc inverts range; dates missing azimuth get geometry 0."""
+    arcs = [
+        MisregArc(
+            primary="20160101",
+            secondary="20160113",
+            azimuth_shift_px=None,
+            range_shift_px=0.1,
+            azimuth_sigma_px=0.01,
+            range_sigma_px=0.01,
+            method="overlap",
+            n_valid=50,
+        ),
+    ]
+    result = invert_optional_pair_misregistration(arcs, reference="20160101")
+    assert result.range_px["20160101"] == 0.0
+    assert result.range_px["20160113"] == pytest.approx(0.1, abs=1e-6)
+    assert result.azimuth_px["20160101"] == 0.0
+    assert result.azimuth_px["20160113"] == 0.0
+
+
+def test_optional_invert_disconnected_azimuth_does_not_abort_range() -> None:
+    """Disconnected azimuth zeros that axis only; range still inverts."""
+    arcs = [
+        MisregArc(
+            primary="20160101",
+            secondary="20160113",
+            azimuth_shift_px=None,
+            range_shift_px=0.1,
+            azimuth_sigma_px=0.01,
+            range_sigma_px=0.01,
+            method="overlap",
+            n_valid=50,
+        ),
+        MisregArc(
+            primary="20160113",
+            secondary="20160201",
+            azimuth_shift_px=0.2,
+            range_shift_px=0.05,
+            azimuth_sigma_px=0.01,
+            range_sigma_px=0.01,
+            method="overlap",
+            n_valid=50,
+        ),
+    ]
+    result = invert_optional_pair_misregistration(
+        arcs,
+        reference="20160101",
+        dates=["20160101", "20160113", "20160201"],
+    )
+    assert result.azimuth_px["20160101"] == 0.0
+    assert result.azimuth_px["20160113"] == 0.0
+    assert result.azimuth_px["20160201"] == 0.0
+    assert result.range_px["20160113"] == pytest.approx(0.1, abs=1e-6)
+    assert result.range_px["20160201"] == pytest.approx(0.15, abs=1e-6)
+
+
+def test_optional_invert_never_treats_none_as_zero_observation() -> None:
+    """None is omitted, not stuffed as 0.0, so the other azimuth arcs stay exact."""
+    arcs = [
+        MisregArc(
+            primary="20160101",
+            secondary="20160113",
+            azimuth_shift_px=0.2,
+            range_shift_px=0.1,
+            azimuth_sigma_px=0.01,
+            range_sigma_px=0.01,
+            method="overlap",
+            n_valid=50,
+        ),
+        MisregArc(
+            primary="20160113",
+            secondary="20160125",
+            azimuth_shift_px=None,
+            range_shift_px=0.05,
+            azimuth_sigma_px=0.01,
+            range_sigma_px=0.01,
+            method="overlap",
+            n_valid=50,
+        ),
+        MisregArc(
+            primary="20160101",
+            secondary="20160125",
+            azimuth_shift_px=0.4,
+            range_shift_px=None,
+            azimuth_sigma_px=0.01,
+            range_sigma_px=0.01,
+            method="overlap",
+            n_valid=50,
+        ),
+    ]
+    result = invert_optional_pair_misregistration(arcs, reference="20160101")
+    assert result.azimuth_px["20160113"] == pytest.approx(0.2, abs=1e-6)
+    assert result.azimuth_px["20160125"] == pytest.approx(0.4, abs=1e-6)
+    assert result.range_px["20160113"] == pytest.approx(0.1, abs=1e-6)
+    assert result.range_px["20160125"] == pytest.approx(0.15, abs=1e-6)
 
 
 def test_combine_offset_fields_includes_misreg_constants() -> None:
