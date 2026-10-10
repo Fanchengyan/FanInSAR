@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from faninsar.processing.errors import PairConfigurationMigrationError
 from faninsar.missions.s1 import S1Stack
+from faninsar.processing.errors import PairConfigurationMigrationError
 from faninsar.stack import (
     SourceHandle,
     Stack,
@@ -82,7 +82,7 @@ def test_s1_provider_owns_pair_dispatch(
         return SimpleNamespace()
 
     monkeypatch.setattr(
-        "faninsar.missions.s1.processing.produce_interferogram_pair",
+        "faninsar.missions.s1.processing._produce_interferogram_pair",
         fake_producer,
     )
     stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")

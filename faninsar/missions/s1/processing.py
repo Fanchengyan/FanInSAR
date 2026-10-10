@@ -577,10 +577,7 @@ def _archive_write_chunks(payload: np.ndarray, path: str, tag: str) -> None:
                 offset += written
             return
         except OSError as error:
-            if (
-                error.errno != errno.ENOSPC
-                or attempt + 1 == _ARCHIVE_WRITE_RETRIES
-            ):
+            if error.errno != errno.ENOSPC or attempt + 1 == _ARCHIVE_WRITE_RETRIES:
                 raise
             logger.warning(
                 "%s: archive write ENOSPC at offset %d (attempt %d/%d); "
@@ -4029,7 +4026,7 @@ def _swath_range_offsets(
 
 
 @overload
-def produce_interferogram_pair(
+def _produce_interferogram_pair(
     primary_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
@@ -4076,7 +4073,7 @@ def produce_interferogram_pair(
 
 
 @overload
-def produce_interferogram_pair(
+def _produce_interferogram_pair(
     primary_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
@@ -4122,7 +4119,7 @@ def produce_interferogram_pair(
 ) -> ProductionPairSweepResult: ...
 
 
-def produce_interferogram_pair(
+def _produce_interferogram_pair(
     primary_path: str | Path | Sequence[str | Path],
     secondary_path: str | Path | Sequence[str | Path],
     *,
@@ -6247,3 +6244,17 @@ def _finalize_geo_config(
         stage_timings_s=result.stage_timings_s,
         log=tuple(result.log),
     ), result
+
+
+def produce_interferogram_pair(*args: object, **kwargs: object) -> None:
+    """Reject the removed public pair-engine entry (PROPOSAL-0056).
+
+    The historical pair engine remains as ``_produce_interferogram_pair``
+    for internal IFG/sweep tests. Ordinary callers use ``S1Stack`` or
+    ``measure_s1_pair_misreg`` / ``coregister_s1_scene``.
+    """
+    _ = args, kwargs
+    reject_invalid_state(
+        "produce_interferogram_pair was removed; use S1Stack or "
+        "measure_s1_pair_misreg / coregister_s1_scene"
+    )

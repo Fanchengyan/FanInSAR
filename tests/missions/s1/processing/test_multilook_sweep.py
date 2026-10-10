@@ -19,9 +19,9 @@ from faninsar.missions.s1.processing import (
     ProductionPairState,
     SharedPairResources,
     _is_multilook_pair,
+    _produce_interferogram_pair,
     looks_dir,
     normalize_multilook_sweep,
-    produce_interferogram_pair,
 )
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import ConstantDEM
@@ -548,7 +548,7 @@ def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None
     primary, secondary, common_bursts = pair
     burst_index = common_bursts[0]
     configs = [(2, 10), (4, 20)]
-    single = produce_interferogram_pair(
+    single = _produce_interferogram_pair(
         primary,
         secondary,
         output_dir=tmp_path / "single",
@@ -558,7 +558,7 @@ def test_sweep_matches_single_config_run_array_for_array(tmp_path: Path) -> None
         goldstein_alpha=0.0,
         unwrap=False,
     )
-    sweep = produce_interferogram_pair(
+    sweep = _produce_interferogram_pair(
         primary,
         secondary,
         output_dir=tmp_path / "sweep",
@@ -842,7 +842,7 @@ def test_geo_sweep_wires_prefix_state_and_closes_memmaps(
     assert geo_state.geocoded_slc_valid is None
     assert geo_state.geo_height_field is None
     assert lut.az_full._mmap.closed
-    single = produce_interferogram_pair(
+    single = _produce_interferogram_pair(
         "reference.SAFE",
         "secondary.SAFE",
         output_dir=tmp_path / "single-out",

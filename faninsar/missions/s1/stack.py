@@ -157,7 +157,7 @@ def _produce_s1_pair(
     options: dict[str, Any],
 ) -> Any:
     """Dispatch one admitted SAFE pair through the S1 production adapter."""
-    from faninsar.missions.s1.processing import produce_interferogram_pair
+    from faninsar.missions.s1.processing import _produce_interferogram_pair
 
     primary_sources = primary_path._resolve()
     secondary_sources = secondary_path._resolve()
@@ -171,7 +171,7 @@ def _produce_s1_pair(
         secondary_sources[0] if len(secondary_sources) == 1 else secondary_sources
     )
 
-    return produce_interferogram_pair(
+    return _produce_interferogram_pair(
         primary_input,
         secondary_input,
         output_dir=output_dir,

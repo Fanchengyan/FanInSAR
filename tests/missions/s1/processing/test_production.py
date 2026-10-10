@@ -15,8 +15,8 @@ from faninsar.missions.s1.processing import (
     _apply_geo_topographic_phase_chunked,
     _inherit_coregistration_residuals,
     _own_geo_valid_mask,
+    _produce_interferogram_pair,
     load_production_scene,
-    produce_interferogram_pair,
     read_prepared_geometry_field,
     stage_coregister,
     stage_deramp,
@@ -113,7 +113,7 @@ def test_produce_pair_rejects_unadmitted_or_parallel_cuda(
         else "CUDA requested but is not available"
     )
     with pytest.raises(expected_error, match=expected_match):
-        produce_interferogram_pair(
+        _produce_interferogram_pair(
             "missing-reference.SAFE",
             "missing-secondary.SAFE",
             output_dir=tmp_path / "out",
@@ -1192,12 +1192,12 @@ def test_load_production_scene_burst() -> None:
 
 @pytest.mark.slow
 @pytest.mark.skipif(len(SCENES) < 2, reason="need two local S1 ZIP scenes")
-def test_produce_interferogram_pair_single_burst(tmp_path: Path) -> None:
+def test__produce_interferogram_pair_single_burst(tmp_path: Path) -> None:
     """Stack interferogram production writes an explicit burst selection."""
     pair = _first_common_pair()
     assert pair is not None
     reference, secondary = pair
-    state = produce_interferogram_pair(
+    state = _produce_interferogram_pair(
         reference,
         secondary,
         output_dir=tmp_path / "pair",
