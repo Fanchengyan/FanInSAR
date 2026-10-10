@@ -28,8 +28,7 @@ if TYPE_CHECKING:
     from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.runtime.protocols import ComputeBackend
 
-CoregMode = Literal["geometry", "pair", "network"]
-EsdMethod = Literal["auto", "splitband", "overlap"]
+CoregMode = Literal["geometry", "nesd"]
 OnNetworkFailure = Literal["error"]
 FlattenStage = Literal["coregistration", "interferogram"]
 ActivationMode = Literal["reference", "qualified"]
@@ -54,14 +53,17 @@ class StackConfig:
     pixel edges are expanded to whole pixels around the projected ROI.
     ``dem_cache_dir`` supplies the source cache at materialization. An
     explicit ``GridSpec`` always wins over automatic ROI selection.
+    ``coreg_mode`` is ``"geometry"`` or ``"nesd"`` (default ``"nesd"``).
+    ``swaths=None`` and ``bursts=None`` select every sub-swath and burst.
     """
 
     work_dir: Path
     activation_mode: ActivationMode
-    coreg_mode: CoregMode = "pair"
+    coreg_mode: CoregMode = "nesd"
     flatten_stage: FlattenStage = "coregistration"
     coregistration_grid: CoregistrationGrid = "radar"
-    esd_method: EsdMethod = "auto"
+    esd_coherence_threshold: float = 0.85
+    ampcor_snr_threshold: float = 6.0
     multilook: tuple[int, int] = (5, 2)
     goldstein_alpha: float = 0.5
     executor: str = "torch"
@@ -69,7 +71,7 @@ class StackConfig:
     invert_device: str = "cpu"
     dem: DEM | None = None
     geo_grid: GeoGridSpec | None = None
-    swaths: tuple[str, ...] = ("IW1",)
+    swaths: tuple[str, ...] | None = None
     bursts: BurstSelection | None = None
     roi: object | None = None
     # An empty plan is the deliberate default; water is opt-in through
@@ -115,6 +117,12 @@ class StackConfig:
             self.resource_budget, ResourceBudget
         ):
             message = "resource_budget must be a ResourceBudget or None"
+            logger.error(message)
+            raise ValueError(message)
+        if self.coreg_mode not in {"geometry", "nesd"}:
+            message = (
+                f"coreg_mode must be 'geometry' or 'nesd'; got {self.coreg_mode!r}"
+            )
             logger.error(message)
             raise ValueError(message)
         if self.flatten_stage not in {"coregistration", "interferogram"}:
@@ -287,7 +295,6 @@ def _resolve_backend(backend: str | ComputeBackend) -> ComputeBackend:
 __all__ = [
     "ActivationMode",
     "CoregMode",
-    "EsdMethod",
     "FlattenStage",
     "OnNetworkFailure",
     "StackConfig",

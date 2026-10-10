@@ -145,7 +145,7 @@ def test_coreg_resume_identity_accepts_all_burst_token(tmp_path: Path) -> None:
         paths,
         work_dir=tmp_path / "out",
         activation_mode="reference",
-        coreg_mode="pair",
+        coreg_mode="nesd",
         swaths=("IW1", "IW2"),
         bursts={"IW1": "all", "IW2": "all"},
     )
@@ -667,7 +667,7 @@ def test_stack_measure_misreg_keeps_ampcor_range_residual(
         paths,
         work_dir=tmp_path / "out",
         activation_mode="reference",
-        coreg_mode="network",
+        coreg_mode="nesd",
         pair_max_interval=2,
         pair_max_days=60,
     )

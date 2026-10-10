@@ -40,7 +40,9 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from faninsar.data.query import BoundingBox, Points, Polygons
+    from faninsar.missions.s1.processing import BurstSelection
     from faninsar.remote.records import CatalogItem, RemoteResourceBudget
+    from faninsar.stack.config import CoregMode
 
 logger = setup_logger(__name__)
 
@@ -266,6 +268,9 @@ class S1Stack(Stack):
         polarizations: S1PolarizationRequest | Sequence[str] | str | None = None,
         orbit_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
         calibration_paths: Sequence[str | Path] | None = None,
+        coreg_mode: CoregMode = "nesd",
+        swaths: tuple[str, ...] | None = None,
+        bursts: BurstSelection | None = None,
         **kwargs: Any,
     ) -> Self:
         """Build an S1 Stack and optionally select its reference acquisition.
@@ -282,6 +287,12 @@ class S1Stack(Stack):
             Explicit local POEORB/RESORB candidates or date bindings.
         calibration_paths : sequence, optional
             Explicit local AUX_CAL/calibration files.
+        coreg_mode : {"geometry", "nesd"}, optional
+            Stack coregistration mode. Defaults to ``"nesd"``.
+        swaths : tuple of str, optional
+            Sub-swaths to process. ``None`` selects every sub-swath.
+        bursts : BurstSelection, optional
+            Per-swath burst selection. ``None`` selects every burst.
         **kwargs : Any
             Remaining :meth:`Stack._from_safes` options.
 
@@ -312,7 +323,13 @@ class S1Stack(Stack):
         # The classmethod remains bound to this concrete adapter through
         # ``super()``, so the raw constructor creates an S1Stack directly
         # without duplicating Stack's large configuration signature.
-        stack = super()._from_safes(paths, **kwargs)
+        stack = super()._from_safes(
+            paths,
+            coreg_mode=coreg_mode,
+            swaths=swaths,
+            bursts=bursts,
+            **kwargs,
+        )
         stack.scene_provider = StackSceneProvider(
             name="Sentinel-1 SAFE",
             produce_pair=_produce_s1_pair,

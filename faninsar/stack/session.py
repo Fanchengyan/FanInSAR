@@ -69,7 +69,6 @@ from faninsar.stack.catalog import SceneCatalog
 from faninsar.stack.config import (
     ActivationMode,
     CoregMode,
-    EsdMethod,
     FlattenStage,
     StackConfig,
 )
@@ -1238,13 +1237,14 @@ class Stack(NetworkContract):
         dem_cache_dir: str | Path | None = None,
         roi: BoundingBox | Polygons | None = None,
         mask_plan: MaskPlan | None = None,
-        coreg_mode: CoregMode = "pair",
+        coreg_mode: CoregMode = "nesd",
         flatten_stage: FlattenStage = "coregistration",
         coregistration_grid: CoregistrationGrid = "radar",
         multilook: tuple[int, int] = (5, 2),
         goldstein_alpha: float = 0.5,
-        esd_method: EsdMethod = "auto",
-        swaths: tuple[str, ...] = ("IW1",),
+        esd_coherence_threshold: float = 0.85,
+        ampcor_snr_threshold: float = 6.0,
+        swaths: tuple[str, ...] | None = None,
         bursts: BurstSelection | None = None,
         executor: str = "torch",
         device: str = "auto",
@@ -1289,7 +1289,8 @@ class Stack(NetworkContract):
             coreg_mode=coreg_mode,
             flatten_stage=flatten_stage,
             coregistration_grid=coregistration_grid,
-            esd_method=esd_method,
+            esd_coherence_threshold=esd_coherence_threshold,
+            ampcor_snr_threshold=ampcor_snr_threshold,
             multilook=multilook,
             goldstein_alpha=goldstein_alpha,
             executor=executor,
@@ -1812,13 +1813,9 @@ class Stack(NetworkContract):
 
     def _burst_kwargs(self) -> dict[str, Any]:
         cfg = self.config
-        bursts = cfg.bursts
-        if bursts is None and cfg.swaths:
-            # Default: first burst of each listed swath.
-            bursts = {sw: [0] for sw in cfg.swaths}
         return {
             "swaths": cfg.swaths,
-            "bursts": bursts,
+            "bursts": cfg.bursts,
             "dem": cfg.dem,
             "geo_grid": cfg.geo_grid,
             "executor": cfg.executor,
@@ -2257,8 +2254,21 @@ class Stack(NetworkContract):
             }
         )
         bursts = self.config.bursts
-        if bursts is None and self.config.swaths:
-            bursts = {swath: [0] for swath in self.config.swaths}
+        swaths = None if self.config.swaths is None else list(self.config.swaths)
+        serialized_bursts: object
+        if bursts is None:
+            serialized_bursts = None
+        elif isinstance(bursts, dict):
+            serialized_bursts = {
+                str(swath): (
+                    indices
+                    if isinstance(indices, str)
+                    else [int(index) for index in indices]
+                )
+                for swath, indices in sorted(bursts.items())
+            }
+        else:
+            serialized_bursts = semantic_value(bursts)
         # The coreg identity binds to the ROI the run actually consumed: the
         # mask-aware effective ROI when the water mask reshaped it, otherwise
         # the configured ROI unchanged (a degraded unmasked run resumes).
@@ -2290,7 +2300,8 @@ class Stack(NetworkContract):
             "coreg_mode": self.config.coreg_mode,
             "flatten_stage": self.config.flatten_stage,
             "coregistration_grid": self.config.coregistration_grid,
-            "esd_method": self.config.esd_method,
+            "esd_coherence_threshold": self.config.esd_coherence_threshold,
+            "ampcor_snr_threshold": self.config.ampcor_snr_threshold,
             "multilook": list(self.config.multilook),
             "goldstein_alpha": self.config.goldstein_alpha,
             "executor": self.config.executor,
@@ -2298,8 +2309,8 @@ class Stack(NetworkContract):
             "invert_device": self.config.invert_device,
             "control_spacing": self.config.control_spacing,
             "n_jobs": self.config.n_jobs,
-            "swaths": list(self.config.swaths),
-            "bursts": semantic_value(bursts),
+            "swaths": swaths,
+            "bursts": serialized_bursts,
             "extra": semantic_value(self.config.extra),
         }
         callback = _provider_callback(self.scene_provider)
@@ -2313,16 +2324,10 @@ class Stack(NetworkContract):
             "coreg_mode": self.config.coreg_mode,
             "flatten_stage": self.config.flatten_stage,
             "coregistration_grid": self.config.coregistration_grid,
-            "esd_method": self.config.esd_method,
-            "swaths": list(self.config.swaths),
-            "bursts": {
-                str(swath): (
-                    indices
-                    if isinstance(indices, str)
-                    else [int(index) for index in indices]
-                )
-                for swath, indices in sorted((bursts or {}).items())
-            },
+            "esd_coherence_threshold": self.config.esd_coherence_threshold,
+            "ampcor_snr_threshold": self.config.ampcor_snr_threshold,
+            "swaths": swaths,
+            "bursts": serialized_bursts,
             "roi": roi_identity(identity_roi),
             "dem": dem_identity(self.config.dem),
             "geo_grid": geo_grid_identity,
@@ -2343,14 +2348,12 @@ class Stack(NetworkContract):
         self,
         *,
         pairs: Pairs | None = None,
-        esd_method: EsdMethod | None = None,
         overwrite: bool = False,
     ) -> Self:
         """Measure per-pair misreg arcs (no full IFG products).
 
-        For ``coreg_mode != "network"`` this is a no-op unless forced by
-        calling with pairs while mode is network. Arcs are written under
-        ``work_dir/misreg/arcs.json``.
+        TODO(P0056): dispatch to measure_s1_pair_misreg. This body still uses
+        the pair-engine measure path and is not the NESD stage wrapper yet.
         """
         self._ensure_prepared()
         if self.config.coreg_mode == "geometry":
@@ -2362,7 +2365,7 @@ class Stack(NetworkContract):
                 "measure_misreg: pair mode — arcs recorded for diagnostics only",
             )
 
-        method = esd_method or self.config.esd_method
+        method = "overlap"
         use_pairs = pairs or self.misreg_pairs
         arcs_path = self.config.work_dir / "misreg" / "arcs.json"
         if arcs_path.is_file() and not overwrite:

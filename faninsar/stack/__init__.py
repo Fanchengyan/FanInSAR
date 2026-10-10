@@ -22,7 +22,6 @@ from faninsar.stack.catalog import SceneCatalog
 from faninsar.stack.config import (
     ActivationMode,
     CoregMode,
-    EsdMethod,
     FlattenStage,
     StackConfig,
 )
@@ -66,7 +65,6 @@ __all__ = [
     "ActivationIssuerRecord",
     "ActivationMode",
     "CoregMode",
-    "EsdMethod",
     "FlattenStage",
     "GpuMemoryReclaim",
     "InterferogramArtifact",
