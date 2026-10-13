@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal, Self
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_pair_configuration
-from faninsar.stack.provider import SourceHandle, StackSceneProvider
+from faninsar.stack.provider import StackSceneProvider
 from faninsar.stack.search import (
     MissionPreparedInputs,
     MissionSearchProfile,
@@ -147,28 +147,6 @@ def _configure_s1_bindings(
         stack.config.extra["calibration_paths"] = calibrations
     else:
         stack.config.extra.pop("calibration_paths", None)
-
-
-def _s1_pair_engine_removed(
-    primary_path: SourceHandle,
-    secondary_path: SourceHandle,
-    *,
-    output_dir: Path,
-    options: dict[str, Any],
-) -> Any:
-    """Reject the retired one-shot pair engine.
-
-    Sentinel-1 coregistration and interferogram formation are separate
-    Stack stages: :meth:`S1Stack.coregister_scenes` then
-    :meth:`S1Stack.form_interferograms`.
-    """
-    del primary_path, secondary_path, output_dir, options
-    from faninsar.stack.provider import UnsupportedStackCapabilityError
-
-    mission = "Sentinel-1 SAFE"
-    capability = "produce-pair"
-    reason = "use coregister_scenes then form_interferograms"
-    raise UnsupportedStackCapabilityError(mission, capability, reason)
 
 
 class S1Stack(Stack):
@@ -324,7 +302,6 @@ class S1Stack(Stack):
         )
         stack.scene_provider = StackSceneProvider(
             name="Sentinel-1 SAFE",
-            produce_pair=_s1_pair_engine_removed,
         )
         stack.config.extra.update(extra)
         stack.config.extra.setdefault("polarizations", selected_polarizations)

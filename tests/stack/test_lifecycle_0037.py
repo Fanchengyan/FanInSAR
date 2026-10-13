@@ -64,14 +64,14 @@ def test_base_stack_provider_boundary_fails_closed(tmp_path: Path) -> None:
 def test_s1_pair_engine_is_not_a_production_entry(
     tmp_path: Path,
 ) -> None:
-    """S1 no longer exposes a one-shot pair engine on the Stack provider."""
+    """S1 Stack does not install a one-shot pair-production callback."""
     source = [_safe(tmp_path, "20240101"), _safe(tmp_path, "20240113")]
     stack = S1Stack.from_safes(
         source,
         work_dir=tmp_path / "work",
         activation_mode="reference",
     )
-    with pytest.raises(UnsupportedStackCapabilityError, match="form_interferograms"):
+    with pytest.raises(UnsupportedStackCapabilityError, match="scene-production"):
         stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")
 
 
