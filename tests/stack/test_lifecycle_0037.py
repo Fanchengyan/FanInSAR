@@ -61,33 +61,18 @@ def test_base_stack_provider_boundary_fails_closed(tmp_path: Path) -> None:
         )
 
 
-def test_s1_provider_owns_pair_dispatch(
+def test_s1_pair_engine_is_not_a_production_entry(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """S1 production dispatch is reachable only through its provider."""
+    """S1 no longer exposes a one-shot pair engine on the Stack provider."""
     source = [_safe(tmp_path, "20240101"), _safe(tmp_path, "20240113")]
     stack = S1Stack.from_safes(
         source,
         work_dir=tmp_path / "work",
         activation_mode="reference",
     )
-    calls: list[tuple[object, object]] = []
-
-    def fake_producer(
-        reference: SourceHandle, secondary: SourceHandle, **kwargs: object
-    ) -> object:
-        calls.append((reference, secondary))
-        assert kwargs["output_dir"] == tmp_path / "pair"
-        return SimpleNamespace()
-
-    monkeypatch.setattr(
-        "faninsar.missions.s1.processing._produce_interferogram_pair",
-        fake_producer,
-    )
-    stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")
-    assert len(calls) == 1
-    assert calls == [(source[0], source[1])]
+    with pytest.raises(UnsupportedStackCapabilityError, match="form_interferograms"):
+        stack._produce_pair(source[0], source[1], output_dir=tmp_path / "pair")
 
 
 def test_stack_provider_receives_opaque_handles_without_path_leak(

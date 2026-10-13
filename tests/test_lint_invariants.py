@@ -74,6 +74,7 @@ def test_retired_processing_stages_are_absent() -> None:
         "faninsar.processing.coordinates",
         "faninsar.processing.readers",
         "faninsar.processing.synthetic_slc",
+        "faninsar.missions.s1.synthetic_slc",
         "faninsar.data.datasets.geobox",
     )
     assert all(importlib.util.find_spec(name) is None for name in retired)

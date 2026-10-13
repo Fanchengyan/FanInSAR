@@ -13,10 +13,10 @@ import numpy as np
 import pytest
 import zarr
 
-import faninsar.missions.s1.processing as production_mod
+from tests.missions.s1.processing import pair_runner as production_mod
 from faninsar.missions.s1.errors import Sentinel1ProductError
-from faninsar.missions.s1.processing import (
-    ProductionPairState,
+from faninsar.missions.s1.processing import ProductionPairState
+from tests.missions.s1.processing.pair_runner import (
     SharedPairResources,
     _is_multilook_pair,
     _produce_interferogram_pair,

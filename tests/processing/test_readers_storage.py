@@ -13,7 +13,7 @@ from faninsar.io.storage.arrays import (
     InMemoryArrayStore,
 )
 from faninsar.missions.protocols import MissingCriticalMetadataError
-from faninsar.missions.s1.synthetic_slc import (
+from tests.support.synthetic_slc import (
     SyntheticSLCReader,
     register_specs,
     write_synthetic_slc,

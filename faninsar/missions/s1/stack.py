@@ -149,30 +149,26 @@ def _configure_s1_bindings(
         stack.config.extra.pop("calibration_paths", None)
 
 
-def _produce_s1_pair(
+def _s1_pair_engine_removed(
     primary_path: SourceHandle,
     secondary_path: SourceHandle,
     *,
     output_dir: Path,
     options: dict[str, Any],
 ) -> Any:
-    """Dispatch one admitted SAFE pair through the S1 production adapter."""
-    from faninsar.missions.s1.processing import _produce_interferogram_pair
+    """Reject the retired one-shot pair engine.
 
-    primary_sources = primary_path._resolve()
-    secondary_sources = secondary_path._resolve()
-    primary_input: Path | tuple[Path, ...] = (
-        primary_sources[0] if len(primary_sources) == 1 else primary_sources
-    )
-    secondary_input: Path | tuple[Path, ...] = (
-        secondary_sources[0] if len(secondary_sources) == 1 else secondary_sources
-    )
-    return _produce_interferogram_pair(
-        primary_input,
-        secondary_input,
-        output_dir=output_dir,
-        **options,
-    )
+    Sentinel-1 coregistration and interferogram formation are separate
+    Stack stages: :meth:`S1Stack.coregister_scenes` then
+    :meth:`S1Stack.form_interferograms`.
+    """
+    del primary_path, secondary_path, output_dir, options
+    from faninsar.stack.provider import UnsupportedStackCapabilityError
+
+    mission = "Sentinel-1 SAFE"
+    capability = "produce-pair"
+    reason = "use coregister_scenes then form_interferograms"
+    raise UnsupportedStackCapabilityError(mission, capability, reason)
 
 
 class S1Stack(Stack):
@@ -328,7 +324,7 @@ class S1Stack(Stack):
         )
         stack.scene_provider = StackSceneProvider(
             name="Sentinel-1 SAFE",
-            produce_pair=_produce_s1_pair,
+            produce_pair=_s1_pair_engine_removed,
         )
         stack.config.extra.update(extra)
         stack.config.extra.setdefault("polarizations", selected_polarizations)

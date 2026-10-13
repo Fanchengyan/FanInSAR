@@ -13,9 +13,7 @@ from faninsar.missions.s1.processing import (
     PreparedGeometryField,
     ProductionPairState,
     _apply_geo_topographic_phase_chunked,
-    _inherit_coregistration_residuals,
     _own_geo_valid_mask,
-    _produce_interferogram_pair,
     load_production_scene,
     read_prepared_geometry_field,
     stage_coregister,
@@ -24,6 +22,10 @@ from faninsar.missions.s1.processing import (
     stage_interferogram,
     stage_unwrap,
     stage_write,
+)
+from tests.missions.s1.processing.pair_runner import (
+    _inherit_coregistration_residuals,
+    _produce_interferogram_pair,
 )
 from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
 from faninsar.processing.errors import InvalidProcessingStateError
