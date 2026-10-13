@@ -20,15 +20,14 @@ if TYPE_CHECKING:
 
 from faninsar.logging import setup_logger
 from faninsar.missions.s1.search import select_orbit_bindings
-from faninsar.remote.catalog import _ADAPTERS
 from faninsar.remote.errors import RemoteAccessError
-from faninsar.remote.protocols import _CallLedger
 from faninsar.remote.providers.s1_orbits import (
     S1_ORBITS_CATALOG,
     S1_ORBITS_ORIGIN,
     S1OrbitsAdapter,
     S1OrbitsHttpError,
     ensure_s1_orbits_catalog,
+    get_s1_orbits_adapter,
 )
 from faninsar.remote.records import RemoteAsset, RemoteResourceBudget
 
@@ -242,13 +241,7 @@ def _raise_download_error(date_id: str, error: BaseException) -> None:
 
 def _adapter() -> S1OrbitsAdapter:
     """Return the registered anonymous s1-orbits adapter."""
-    ensure_s1_orbits_catalog()
-    adapter = _ADAPTERS[S1_ORBITS_CATALOG]
-    if not isinstance(adapter, S1OrbitsAdapter):
-        message = "catalog 's1-orbits' has an incompatible registration"
-        logger.error(message)
-        raise TypeError(message)
-    return adapter
+    return get_s1_orbits_adapter()
 
 
 def ensure_covering_orbit_paths(
@@ -323,7 +316,6 @@ def ensure_covering_orbit_paths(
 
     adapter = _adapter()
     budget = budget or RemoteResourceBudget()
-    ledger = _CallLedger(budget)
     listings: dict[tuple[str, str], list[str]] = {}
     fetched: dict[str, Path] = {}
     for date_id in missing:
@@ -345,7 +337,6 @@ def ensure_covering_orbit_paths(
                     listings[cache_key] = adapter.list_object_keys(
                         prefix,
                         budget=budget,
-                        ledger=ledger,
                     )
                 except (S1OrbitsHttpError, RemoteAccessError) as error:
                     _raise_download_error(date_id, error)
@@ -385,7 +376,6 @@ def ensure_covering_orbit_paths(
                 destination,
                 overwrite=overwrite,
                 budget=budget,
-                ledger=ledger,
             )
         except (S1OrbitsHttpError, RemoteAccessError) as error:
             _raise_download_error(date_id, error)

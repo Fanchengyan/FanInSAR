@@ -161,16 +161,12 @@ def _produce_s1_pair(
 
     primary_sources = primary_path._resolve()
     secondary_sources = secondary_path._resolve()
-
-    # Preserve the scalar callback shape for ordinary one-frame acquisitions;
-    # frame stacks remain tuples and are consumed by the production adapter.
     primary_input: Path | tuple[Path, ...] = (
         primary_sources[0] if len(primary_sources) == 1 else primary_sources
     )
     secondary_input: Path | tuple[Path, ...] = (
         secondary_sources[0] if len(secondary_sources) == 1 else secondary_sources
     )
-
     return _produce_interferogram_pair(
         primary_input,
         secondary_input,
@@ -869,6 +865,12 @@ class S1Stack(Stack):
         """Sentinel-1 NESD apply requires inverted date constants (F11)."""
         return self.config.coreg_mode == "nesd"
 
+    def _load_projection_scene(self, source_path: str, **kwargs: object) -> Any:
+        """Load a persisted radar projection scene at the S1 boundary."""
+        from faninsar.missions.s1.processing import load_production_scene
+
+        return load_production_scene(source_path, **kwargs)
+
     def _resolve_s1_nesd_selection(
         self,
     ) -> tuple[tuple[str, ...] | None, BurstSelection | None]:
@@ -876,8 +878,11 @@ class S1Stack(Stack):
 
         No ROI keeps the configured selection (``None`` means all). An ROI
         selects bursts by footprint intersection, including neighboring bursts
-        at edges, matching produce. The returned burst list is the full
-        overlap-strip selection, not an ROI crop.
+        at edges whose footprints overlap the ROI. Geometry apply still crops
+        to the ROI window; NESD measures the **full** overlap strips of those
+        selected bursts and does not require the overlap pixels to lie inside
+        the ROI crop. A single-burst interior ROI has no adjacent pair, so
+        measure warns and skips NESD.
         """
         cached = getattr(self, "_s1_nesd_selection", None)
         if cached is not None:
@@ -915,6 +920,9 @@ class S1Stack(Stack):
             dem=self.config.dem,
         )
         bursts = _burst_selection_from_resolved(resolved, len(ref_paths), swath_tuple)
+        bursts, swath_tuple = _drop_empty_swaths(bursts, swath_tuple)
+        if not swath_tuple:
+            reject_pair_configuration("ROI selection contains no bursts")
         result = (swath_tuple, bursts)
         self._s1_nesd_selection = result
         return result
@@ -989,6 +997,23 @@ def _burst_selection_from_resolved(
         {swath: list(resolved.get((frame, swath), [])) for swath in swaths}
         for frame in range(frame_count)
     ]
+
+
+def _drop_empty_swaths(
+    bursts: BurstSelection,
+    swaths: tuple[str, ...],
+) -> tuple[BurstSelection, tuple[str, ...]]:
+    """Drop swaths with no selected bursts so normalization does not reject."""
+    if isinstance(bursts, list):
+        kept = tuple(
+            swath for swath in swaths if any(frame.get(swath) for frame in bursts)
+        )
+        trimmed = [
+            {swath: list(frame.get(swath, [])) for swath in kept} for frame in bursts
+        ]
+        return trimmed, kept
+    kept = tuple(swath for swath in swaths if bursts.get(swath))
+    return {swath: list(bursts.get(swath, [])) for swath in kept}, kept
 
 
 __all__ = ["S1Stack"]

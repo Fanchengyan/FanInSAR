@@ -13,6 +13,7 @@ from faninsar.missions.nisar.adapter import (
     NisarAdmissionPolicy,
     NisarSensor,
     admit_nisar_source,
+    normalize_channel,
 )
 
 
@@ -30,4 +31,5 @@ __all__ = [
     "NisarAdmissionPolicy",
     "NisarSensor",
     "admit_nisar_source",
+    "normalize_channel",
 ]

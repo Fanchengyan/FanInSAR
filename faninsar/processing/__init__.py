@@ -19,11 +19,6 @@ from faninsar.missions.protocols import (
     ValidSampleMask,
     require_critical_metadata,
 )
-from faninsar.missions.s1.synthetic_slc import (
-    SyntheticSLCReader,
-    SyntheticSLCSpec,
-    write_synthetic_slc,
-)
 from faninsar.processing.geometry.coordinates import (
     ArrayDescriptor,
     ArrayRepresentation,
@@ -119,8 +114,6 @@ __all__ = [
     "SoftwareIdentity",
     "SourceSnapshotEntry",
     "StackProduct",
-    "SyntheticSLCReader",
-    "SyntheticSLCSpec",
     "TransformDirection",
     "TransformLUT",
     "UnwrapResult",
@@ -129,5 +122,4 @@ __all__ = [
     "lanczos_resample",
     "require_critical_metadata",
     "snapshot_local_source",
-    "write_synthetic_slc",
 ]

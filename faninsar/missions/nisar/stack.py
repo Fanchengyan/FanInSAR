@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from faninsar.core.acquisition import Acquisition
 from faninsar.logging import setup_logger
-from faninsar.missions.nisar.adapter import NisarSensor, _normalize_channel
+from faninsar.missions.nisar import NisarSensor, normalize_channel
 from faninsar.missions.nisar.provider import (
     make_nisar_scene_provider,
 )
@@ -146,8 +146,8 @@ class NISARStack(Stack):
 
         """
         source_paths = tuple(Path(path) for path in paths)
-        admitted_frequency = _normalize_channel(frequency, field="frequency")
-        admitted_polarization = _normalize_channel(
+        admitted_frequency = normalize_channel(frequency, field="frequency")
+        admitted_polarization = normalize_channel(
             polarization,
             field="polarization",
         )
@@ -187,11 +187,11 @@ class NISARStack(Stack):
                 polarization=admitted_polarization,
                 source_path=path,
             )
-            native_frequency = _normalize_channel(
+            native_frequency = normalize_channel(
                 result.mission_native.get("frequency"),
                 field="frequency",
             )
-            native_polarization = _normalize_channel(
+            native_polarization = normalize_channel(
                 result.mission_native.get("polarization"),
                 field="polarization",
             )

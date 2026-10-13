@@ -131,7 +131,7 @@ class S1OrbitsAdapter:
         prefix: str,
         *,
         budget: RemoteResourceBudget,
-        ledger: _CallLedger,
+        ledger: _CallLedger | None = None,
     ) -> list[str]:
         """Return AUX_POEORB/AUX_RESORB keys under one mission prefix."""
         if _LIST_PREFIX.fullmatch(prefix) is None:
@@ -139,6 +139,7 @@ class S1OrbitsAdapter:
             logger.error(message)
             _fail(RemoteAccessError, "invalid_listing_prefix", message)
         keys: list[str] = []
+        operation = ledger or _CallLedger(budget)
         token: str | None = None
         seen_tokens: set[str] = set()
         while True:
@@ -150,7 +151,7 @@ class S1OrbitsAdapter:
             if token is not None:
                 query["continuation-token"] = token
             url = f"{S1_ORBITS_ORIGIN}/?{urllib.parse.urlencode(query)}"
-            payload = self._anonymous_get(url, budget, ledger, listing=True)
+            payload = self._anonymous_get(url, budget, operation, listing=True)
             page, token, truncated = _parse_list_result(payload)
             for key in page:
                 safe = _safe_object_key(key)
@@ -216,6 +217,22 @@ class S1OrbitsAdapter:
         return bytes(payload)
 
 
+def get_s1_orbits_adapter() -> S1OrbitsAdapter:
+    """Return the validated adapter registered for the public orbit bucket.
+
+    Mission code uses this boundary instead of reaching into the remote
+    catalog registry.  Registration remains private to the remote package.
+    """
+    ensure_s1_orbits_catalog()
+    with _REGISTRY_LOCK:
+        adapter = _ADAPTERS.get(S1_ORBITS_CATALOG)
+    if not isinstance(adapter, S1OrbitsAdapter):
+        message = "catalog 's1-orbits' has an incompatible registration"
+        logger.error(message)
+        raise TypeError(message)
+    return adapter
+
+
 def ensure_s1_orbits_catalog(name: str | None = None) -> str:
     """Register or reuse the dedicated anonymous s1-orbits catalog."""
     catalog = name or S1_ORBITS_CATALOG
@@ -257,4 +274,5 @@ __all__ = [
     "S1OrbitsAdapter",
     "S1OrbitsHttpError",
     "ensure_s1_orbits_catalog",
+    "get_s1_orbits_adapter",
 ]

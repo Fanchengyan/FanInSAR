@@ -355,8 +355,8 @@ def _select_channel(handle: Any, frequency: str, polarization: str) -> tuple[str
         raise InvalidProcessingStateError(message)
     if isinstance(frequencies, str):
         frequencies = (frequencies,)
-    available = {_normalize_channel(item, field="frequency") for item in frequencies}
-    selected_frequency = _normalize_channel(frequency, field="frequency")
+    available = {normalize_channel(item, field="frequency") for item in frequencies}
+    selected_frequency = normalize_channel(frequency, field="frequency")
     if selected_frequency not in available:
         message = f"NISAR frequency {selected_frequency!r} is unavailable"
         logger.error(message)
@@ -373,8 +373,8 @@ def _select_channel(handle: Any, frequency: str, polarization: str) -> tuple[str
         raise InvalidProcessingStateError(message)
     if isinstance(values, str):
         values = (values,)
-    available_pols = {_normalize_channel(item, field="polarization") for item in values}
-    selected_polarization = _normalize_channel(polarization, field="polarization")
+    available_pols = {normalize_channel(item, field="polarization") for item in values}
+    selected_polarization = normalize_channel(polarization, field="polarization")
     if selected_polarization not in available_pols:
         message = (
             f"NISAR polarization {selected_polarization!r} is unavailable for "
@@ -485,7 +485,7 @@ def _doppler(handle: Any, frequency: str) -> DopplerCentroidPolynomial:
     )
 
 
-def _normalize_channel(value: str, *, field: str) -> str:
+def normalize_channel(value: str, *, field: str) -> str:
     """Normalize and validate one NISAR channel identifier.
 
     Parameters
@@ -712,16 +712,16 @@ class NisarSensor(Sensor):
         # run for a compatible-but-unadmitted handle.
         snapshot = _validate_admission(handle, expected_source=source_path)
         if "freq" in kwargs:
-            alias = _normalize_channel(kwargs.pop("freq"), field="frequency")
-            direct = _normalize_channel(frequency, field="frequency")
+            alias = normalize_channel(kwargs.pop("freq"), field="frequency")
+            direct = normalize_channel(frequency, field="frequency")
             if direct not in {"B", alias}:
                 message = "NISAR frequency and freq aliases specify different channels"
                 logger.error(message)
                 raise ValueError(message)
             frequency = alias
         if "pol" in kwargs:
-            alias = _normalize_channel(kwargs.pop("pol"), field="polarization")
-            direct = _normalize_channel(polarization, field="polarization")
+            alias = normalize_channel(kwargs.pop("pol"), field="polarization")
+            direct = normalize_channel(polarization, field="polarization")
             if direct not in {"HH", alias}:
                 message = (
                     "NISAR polarization and pol aliases specify different channels"
@@ -825,8 +825,8 @@ class NisarSensor(Sensor):
             If channel values, dataset shape, selection, or dtype are invalid.
 
         """
-        frequency = _normalize_channel(kwargs.pop("freq", frequency), field="frequency")
-        polarization = _normalize_channel(
+        frequency = normalize_channel(kwargs.pop("freq", frequency), field="frequency")
+        polarization = normalize_channel(
             kwargs.pop("pol", polarization), field="polarization"
         )
         if kwargs:

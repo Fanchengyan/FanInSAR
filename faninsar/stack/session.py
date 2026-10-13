@@ -78,7 +78,12 @@ from faninsar.stack.input_manifest import (
     write_manifest,
 )
 from faninsar.stack.mask_plan import MaskPlan, StageName
-from faninsar.stack.provider import SourceHandle
+from faninsar.stack.provider import SourceHandle, UnsupportedStackCapabilityError
+from faninsar.stack.registration import (
+    CoregistrationReport,
+    RegistrationCapability,
+    identity_digest,
+)
 from faninsar.stack.search import (
     MissionPreparedInputs,
     MissionSearchProfile,
@@ -801,6 +806,9 @@ class Stack(NetworkContract):
     scene_provider: StackSceneProvider | None = field(default=None, repr=False)
     arcs: list[MisregArc] = field(default_factory=list)
     date_misreg: DateMisreg | None = None
+    _coregistration_report: CoregistrationReport | None = field(
+        default=None, repr=False
+    )
     _nesd_skipped_no_windows: bool = False
     coreg_paths: dict[str, Path] = field(default_factory=dict)
     pair_states: dict[str, ProductionPairState] = field(default_factory=dict)
@@ -841,6 +849,11 @@ class Stack(NetworkContract):
         self._interferograms = None
         self._timeseries = None
         self._product_index = None
+
+    @property
+    def coregistration_report(self) -> CoregistrationReport | None:
+        """Return the latest mission-neutral coregistration report, if any."""
+        return self._coregistration_report
 
     @property
     def network(self) -> Network | None:
@@ -1891,9 +1904,7 @@ class Stack(NetworkContract):
         if not isinstance(source_path, str) or not source_path:
             reject_invalid_state("persisted radar projection context lacks source_path")
         try:
-            from faninsar.missions.s1.processing import load_production_scene
-
-            scene = load_production_scene(
+            scene = self._load_projection_scene(
                 source_path,
                 swath=str(record.get("swath", "IW1")),
                 burst_index=int(record.get("burst_index", 0)),
@@ -1921,6 +1932,26 @@ class Stack(NetworkContract):
             "reference_scene": record.get("reference_scene", self.reference),
             "master_grid": self.config.geo_grid,
         }
+
+    def _load_projection_scene(self, source_path: str, **kwargs: object) -> Any:
+        """Load one projection scene through the owning mission adapter.
+
+        The neutral Stack session does not import a mission implementation at
+        runtime.  Concrete adapters override this hook and perform their lazy
+        import at the mission boundary.
+
+        Raises
+        ------
+        UnsupportedStackCapabilityError
+            If the concrete mission has not admitted projection restoration.
+
+        """
+        del source_path, kwargs
+        raise UnsupportedStackCapabilityError(
+            self.__class__.__name__,
+            "radar-projection-restore",
+            "the mission adapter must provide a scene loader",
+        )
 
     def _reclaim_accelerator(self, kind: str) -> None:
         """Evaluate gpu_memory_reclaim on the CUDA-owning process."""
@@ -2399,12 +2430,22 @@ class Stack(NetworkContract):
         )
 
     def _apply_misreg_constants(self, date_id: str) -> tuple[float, float]:
-        """Return apply-time az/rg constants (0 for an omitted axis)."""
+        """Return apply-time az/rg constants and reject omitted NESD axes."""
         if self.date_misreg is None:
             return 0.0, 0.0
+        if date_id not in self.date_misreg.azimuth_px:
+            reject_invalid_state(
+                f"azimuth misregistration is omitted for {date_id}; "
+                "apply cannot substitute a numeric zero"
+            )
+        if date_id not in self.date_misreg.range_px:
+            reject_invalid_state(
+                f"range misregistration is omitted for {date_id}; "
+                "apply cannot substitute a numeric zero"
+            )
         return (
-            float(self.date_misreg.azimuth_px.get(date_id, 0.0)),
-            float(self.date_misreg.range_px.get(date_id, 0.0)),
+            float(self.date_misreg.azimuth_px[date_id]),
+            float(self.date_misreg.range_px[date_id]),
         )
 
     def _requires_inverted_nesd_constants(self) -> bool:
@@ -2481,8 +2522,8 @@ class Stack(NetworkContract):
     ) -> Any:
         """Resample one secondary date onto the Reference grid.
 
-        The base implementation uses the mission pair engine with ESD and
-        Ampcor measurement disabled. Sentinel-1 overrides this hook with
+        The base implementation uses the mission pair engine for apply-only
+        resampling. Sentinel-1 overrides this hook with
         :func:`~faninsar.missions.s1.coregister.coregister_s1_scene`.
         """
         pair_kwargs = dict(self._burst_kwargs())
@@ -2510,8 +2551,6 @@ class Stack(NetworkContract):
             output_dir=output_dir,
             multilook=self.config.multilook,
             goldstein_alpha=0.0,
-            esd_enabled=False,
-            amplitude_refinement_enabled=False,
             unwrap=False,
             overwrite=overwrite,
             misreg_az_px=misreg_az_px,
@@ -2714,21 +2753,17 @@ class Stack(NetworkContract):
                 "reference": self.reference,
                 "date": date_id,
                 "coreg_identity": coreg_identity,
+                "coreg_mode": self.config.coreg_mode,
                 "misreg_az_px": misreg_az,
                 "misreg_rg_px": misreg_rg,
                 "geometric_phase_removed": (
                     "topo" if self.config.dem is not None else "flat"
                 ),
-                "esd_enabled": False,
-                "amplitude_refinement_enabled": False,
                 **self._mask_lineage_record(),
             }
             if state is not None:
                 marker_payload.update(
                     {
-                        "esd_azimuth_shift_px": getattr(
-                            state, "esd_azimuth_shift_px", None
-                        ),
                         "range_shift_px": getattr(state, "range_shift_px", None),
                         "azimuth_shift_px": getattr(state, "azimuth_shift_px", None),
                         "stage_timings_s": getattr(state, "stage_timings_s", {}),
@@ -2752,6 +2787,46 @@ class Stack(NetworkContract):
                 gc.collect()
             self._reclaim_accelerator("persist")
         self._write_qualified_activation_record()
+        capability = RegistrationCapability(
+            mission=type(self).__name__,
+            product="stack-scenes",
+            grid=self.config.coregistration_grid,
+            strategy=self.config.coreg_mode,
+        )
+        identity = identity_digest(
+            {
+                "scenes": [self.reference, *target_dates],
+                "workflow": capability.as_dict(),
+                "grid": self.config.coregistration_grid,
+                "frame": (
+                    "radar" if self.config.coregistration_grid == "radar" else "map"
+                ),
+                "units": "pixel",
+                "provenance": {
+                    "orbit_paths": self.config.extra.get("orbit_paths", {}),
+                    "work_dir": str(self.config.work_dir),
+                },
+            }
+        )
+        self._coregistration_report = CoregistrationReport(
+            capability=capability,
+            scenes=(self.reference, *target_dates),
+            reference=self.reference,
+            grid=self.config.coregistration_grid,
+            frame="radar" if self.config.coregistration_grid == "radar" else "map",
+            units="pixel",
+            status="applied",
+            run_identity=identity,
+            correction_kind="date-constant" if self.date_misreg is not None else None,
+            provenance={"work_dir": str(self.config.work_dir)},
+            details={"dates": list(target_dates)},
+        )
+        report_path = self.config.work_dir / "coreg" / "coregistration_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(self._coregistration_report.as_dict(), indent=2),
+            encoding="utf-8",
+        )
         return self
 
     @_reclaim_after_stage
