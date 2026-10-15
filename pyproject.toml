@@ -216,6 +216,8 @@ exclude = [
   "dist",
   "docs",
   "notebooks",
+  "tmp",
+  ".omo",
   "tests",
   "examples",
   "data",
