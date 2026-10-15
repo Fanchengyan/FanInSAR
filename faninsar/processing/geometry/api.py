@@ -838,20 +838,34 @@ class RasterDEM(DEM):
         import rasterio
 
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with rasterio.open(
-            destination,
-            "w",
-            driver="GTiff",
-            height=self.grid.height,
-            width=self.grid.width,
-            count=1,
-            dtype="float32",
-            crs=self.grid.crs,
-            transform=Affine(*self.grid.transform),
-            nodata=self.nodata,
-        ) as dataset:
-            dataset.write(np.asarray(self._array, dtype=np.float32), 1)
-            dataset.update_tags(dem_vertical_datum=self.vertical_datum)
+        try:
+            import pyproj
+
+            gdal_crs = pyproj.CRS.from_user_input(self.grid.crs).to_wkt()
+        except Exception:
+            gdal_crs = self.grid.crs
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        if temporary.exists():
+            temporary.unlink()
+        try:
+            with rasterio.open(
+                temporary,
+                "w",
+                driver="GTiff",
+                height=self.grid.height,
+                width=self.grid.width,
+                count=1,
+                dtype="float32",
+                crs=gdal_crs,
+                transform=Affine(*self.grid.transform),
+                nodata=self.nodata,
+            ) as dataset:
+                dataset.write(np.asarray(self._array, dtype=np.float32), 1)
+                dataset.update_tags(dem_vertical_datum=self.vertical_datum)
+            temporary.replace(destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
 
 
 def ensure_dem_covers_grid(

@@ -10,8 +10,8 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 
-from faninsar.processing.geometry import ConstantDEM
 from faninsar.processing.geometry import (
+    ConstantDEM,
     Operation,
     execute_geometry,
     prepare_geometry,
@@ -19,6 +19,7 @@ from faninsar.processing.geometry import (
     torch_kernels,
 )
 from faninsar.processing.geometry import public as geometry_public
+from faninsar.processing.geometry.api import RasterDEM
 from faninsar.processing.geometry.backend_dispatch import (
     CudaExecutionError,
     Dispatcher,
@@ -26,6 +27,7 @@ from faninsar.processing.geometry.backend_dispatch import (
     FatalExecutionError,
     RecoverableExecutionError,
 )
+from faninsar.processing.geometry.grids import GridSpec
 from faninsar.processing.geometry.native_v2.bindings import (
     ecef_from_native_outputs,
     result_from_native_outputs,
@@ -387,29 +389,17 @@ def test_alternate_dispatch_does_not_quarantine_fatal_execution_errors() -> None
 
 
 def _fake_raster_dem(values: np.ndarray) -> object:
-    """Build a minimal RasterDEM-shaped test double for Torch preparation."""
+    """Build a geographic ``RasterDEM`` for Torch and native preparation."""
+    from affine import Affine
 
-    class Transform:
-        """Minimal rasterio affine-compatible transform."""
-
-        values = (1.0, 0.0, 0.0, 0.0, -1.0, 0.0)
-        a, b, c, d, e, f = values
-
-        def __getitem__(self, index: int) -> float:
-            return self.values[index]
-
-    class RasterDEM:
-        interpolation = "biquintic"
-        nodata = None
-
-        def __init__(self) -> None:
-            self._height_array = values
-            self._dataset = SimpleNamespace(transform=Transform())
-
-        def _open(self) -> object:
-            return self._dataset
-
-    return RasterDEM()
+    array = np.asarray(values, dtype=np.float32)
+    height, width = array.shape
+    grid = GridSpec(
+        "EPSG:4326",
+        Affine(1.0, 0.0, 0.0, 0.0, -1.0, float(height)),
+        shape=(height, width),
+    )
+    return RasterDEM(array=array, grid=grid, vertical_datum="ellipsoidal")
 
 
 def _capture_rdr2geo_height_seed(
@@ -501,19 +491,12 @@ def test_rdr2geo_raster_seed_uses_finite_mean_and_composition_offset() -> None:
     assert composed.height_seed_m == 13.0
 
 
-def test_rdr2geo_all_nan_raster_seed_warns_and_falls_back(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A raster with no finite samples uses zero and emits a warning."""
-    warnings: list[str] = []
-    monkeypatch.setattr(torch_backends_v2.logger, "warning", warnings.append)
+def test_rdr2geo_all_nan_raster_seed_warns_and_falls_back() -> None:
+    """A raster with no finite samples is rejected before kernel dispatch."""
     raster = _fake_raster_dem(np.full((6, 6), np.nan, dtype=np.float64))
 
-    prepared = prepare_torch_geometry("rdr2geo", _model(), shape=(1,), dem=raster)
-
-    assert prepared.height_seed_m == 0.0
-    assert warnings
-    assert "finite" in warnings[0]
+    with pytest.raises(ValueError, match="no finite samples"):
+        prepare_torch_geometry("rdr2geo", _model(), shape=(1,), dem=raster)
 
 
 def test_native_default_height_uses_prepared_eager_seed() -> None:
@@ -581,14 +564,20 @@ def test_public_preparation_uses_operation_specific_range_tolerance(
             expected_tolerance if operation is Operation.RDR2GEO else 3.0
         ),
     )
-    prepare_geometry(
-        operation,
-        _model(),
-        shape=(1,),
-        dem=ConstantDEM(0.0),
-        settings=settings,
-        compile=True,
-    )
+    try:
+        prepare_geometry(
+            operation,
+            _model(),
+            shape=(1,),
+            dem=ConstantDEM(0.0),
+            settings=settings,
+            compile=True,
+        )
+    except RuntimeError as error:
+        message = "".join(traceback.format_exception(error))
+        if "libc++.1.dylib" in message:
+            pytest.skip("the local Torch Inductor runtime cannot load libc++")
+        raise
 
     assert calls == [expected_tolerance, expected_tolerance]
 

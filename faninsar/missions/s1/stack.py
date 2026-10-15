@@ -729,6 +729,12 @@ class S1Stack(Stack):
             prepare(refresh=False)
         else:
             stack.prepare_scenes()
+        restore = getattr(stack, "_restore_dem_from_manifest", None)
+        if callable(restore):
+            restore(payload)
+        ensure = getattr(stack, "_ensure_raster_dem", None)
+        if callable(ensure):
+            ensure()
         return stack
 
     def prepare(self, *, refresh: bool = False) -> Self:
@@ -890,7 +896,7 @@ class S1Stack(Stack):
             ref_paths,
             swath_tuple,
             orbits=orbits,
-            dem=self.config.dem,
+            dem=self._geometry_dem(),
         )
         bursts = _burst_selection_from_resolved(resolved, len(ref_paths), swath_tuple)
         bursts, swath_tuple = _drop_empty_swaths(bursts, swath_tuple)
@@ -908,7 +914,7 @@ class S1Stack(Stack):
         return measure_s1_pair_misreg(
             _source_input(self.catalog.paths_for(primary)),
             _source_input(self.catalog.paths_for(secondary)),
-            dem=self.config.dem,
+            dem=self._geometry_dem(),
             swaths=swaths,
             bursts=bursts,
             coherence_threshold=self.config.esd_coherence_threshold,
@@ -939,7 +945,7 @@ class S1Stack(Stack):
             swaths=swaths,
             bursts=bursts,
             roi=self._effective_roi_with_mask().roi,
-            dem=self.config.dem,
+            dem=self._geometry_dem(),
             misreg_az_px=misreg_az_px,
             misreg_rg_px=misreg_rg_px,
             coregistration_grid=self.config.coregistration_grid,

@@ -835,6 +835,8 @@ class Stack(NetworkContract):
     _radar_mask_identities: dict[tuple[str, tuple[int, int], tuple[int, int]], str] = (
         field(default_factory=dict, repr=False)
     )
+    _dem_source: SourceDEM | None = field(default=None, repr=False)
+    _dem_wgs84: RasterDEM | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Initialize the inherited Network analysis surface lazily.
@@ -849,11 +851,24 @@ class Stack(NetworkContract):
         self._interferograms = None
         self._timeseries = None
         self._product_index = None
+        self._capture_dem_source()
 
     @property
     def coregistration_report(self) -> CoregistrationReport | None:
         """Return the latest mission-neutral coregistration report, if any."""
         return self._coregistration_report
+
+    @property
+    def dem(self) -> RasterDEM | object | None:
+        """Return the live DEM after preparation.
+
+        A source recipe stays private until it is materialized onto the Stack
+        grid. Constant and raster DEMs are returned as given.
+        """
+        current = self.config.dem
+        if current is None or isinstance(current, SourceDEM):
+            return None
+        return current
 
     @property
     def network(self) -> Network | None:
@@ -1000,6 +1015,285 @@ class Stack(NetworkContract):
             budget=self.config.resource_budget,
         )
 
+    def _capture_dem_source(self, dem: object | None = None) -> None:
+        """Remember a source recipe so reopen can rematerialize it."""
+        selected = self.config.dem if dem is None else dem
+        if isinstance(selected, SourceDEM):
+            self._dem_source = selected
+
+    def _has_stack_extent(self) -> bool:
+        """Return whether the Stack has an ROI or selected footprints."""
+        return self.config.roi is not None or self._selected_footprint_roi() is not None
+
+    def _stack_dem_raster_path(self) -> Path:
+        """Return the durable raster path owned by this Stack."""
+        return self.config.work_dir / "dem" / "stack.tif"
+
+    def _stack_dem_sidecar_path(self) -> Path:
+        """Return the sidecar that records source and raster identity."""
+        return self.config.work_dir / "dem" / "stack.json"
+
+    def _stack_wgs84_raster_path(self) -> Path:
+        """Return the geographic DEM used by rdr2geo."""
+        return self.config.work_dir / "dem" / "stack_wgs84.tif"
+
+    def _geometry_dem(self) -> RasterDEM | object | None:
+        """Return the DEM passed to radar geometry.
+
+        A native EPSG:4326 crop is preferred when Stack materialized one from
+        the source tiles.  Otherwise the public product raster is returned and
+        geometry backends build a private lon/lat view.
+        """
+        if self._dem_wgs84 is not None:
+            return self._dem_wgs84
+        return self.config.dem
+
+    def _source_record(self) -> dict[str, object] | None:
+        """Return the serializable source recipe, if one was captured."""
+        source = self._dem_source
+        if source is None:
+            return None
+        return {
+            "product": source.product,
+            "provider": source.provider,
+            "cache_dir": None if source.cache_dir is None else str(source.cache_dir),
+        }
+
+    def _persist_raster_dem(self, raster: RasterDEM) -> Path:
+        """Write the live raster when this Stack owns a source recipe."""
+        path = self._stack_dem_raster_path()
+        sidecar = self._stack_dem_sidecar_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            **(self._source_record() or {"kind": "raster"}),
+            "identity": raster.identity,
+            "vertical_datum": raster.vertical_datum,
+            "path": str(path),
+        }
+        if path.exists():
+            try:
+                existing = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                existing = {}
+            if existing.get("identity") != raster.identity:
+                path.unlink()
+        if not path.is_file():
+            raster.save(path)
+        self._persist_wgs84_dem()
+        if self._dem_wgs84 is not None and self._dem_wgs84 is not raster:
+            record["wgs84_path"] = str(self._stack_wgs84_raster_path())
+            record["wgs84_identity"] = self._dem_wgs84.identity
+        sidecar.write_text(json.dumps(record, indent=2) + chr(10), encoding="utf-8")
+        return path
+
+    def _persist_wgs84_dem(self) -> None:
+        """Write the geographic crop when it is distinct from the product DEM."""
+        wgs84 = self._dem_wgs84
+        if wgs84 is None or wgs84 is self.config.dem:
+            return
+        path = self._stack_wgs84_raster_path()
+        sidecar = self._stack_dem_sidecar_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        source_path = getattr(wgs84, "path", None)
+        if (
+            path.is_file()
+            and source_path is not None
+            and Path(source_path).resolve() == path.resolve()
+        ):
+            return
+        if path.exists():
+            try:
+                existing = json.loads(sidecar.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                existing = {}
+            if existing.get("wgs84_identity") == wgs84.identity and path.is_file():
+                return
+            path.unlink()
+        wgs84.save(path)
+
+    def _load_persisted_raster_dem(self) -> RasterDEM | None:
+        """Reload a previously materialized Stack raster, if it still matches."""
+        path = self._stack_dem_raster_path()
+        sidecar = self._stack_dem_sidecar_path()
+        if not path.is_file():
+            return None
+        try:
+            recorded = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            recorded = {}
+        source = self._source_record()
+        if source is not None and (
+            recorded.get("product") != source["product"]
+            or recorded.get("provider") != source["provider"]
+        ):
+            return None
+        datum = recorded.get("vertical_datum") or "ellipsoidal"
+        if not isinstance(datum, str):
+            datum = "ellipsoidal"
+        return RasterDEM(path=path, vertical_datum=datum)
+
+    def _load_persisted_wgs84_dem(self) -> RasterDEM | None:
+        """Reload the geographic crop when the source recipe still matches.
+
+        Content identity is not compared.  RasterDEM identity includes
+        path provenance, so a saved crop never hashes to the in-memory
+        identity recorded at materialization.
+        """
+        path = self._stack_wgs84_raster_path()
+        sidecar = self._stack_dem_sidecar_path()
+        if not path.is_file():
+            return None
+        try:
+            recorded = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            recorded = {}
+        source = self._source_record()
+        if source is not None and (
+            recorded.get("product") != source["product"]
+            or recorded.get("provider") != source["provider"]
+        ):
+            return None
+        datum = recorded.get("vertical_datum") or "ellipsoidal"
+        if not isinstance(datum, str):
+            datum = "ellipsoidal"
+        raster = RasterDEM(path=path, vertical_datum=datum)
+        from faninsar.processing.geometry.dem_view import is_geodetic_crs
+
+        if not is_geodetic_crs(raster.crs):
+            logger.warning(
+                "Persisted geographic DEM %s is not lon/lat (crs=%s); ignoring",
+                path,
+                raster.crs,
+            )
+            return None
+        return raster
+
+    def _align_raster_dem(self, raster: RasterDEM) -> RasterDEM:
+        """Regrid a raster onto the Stack grid when one exists."""
+        if self.config.grid == "auto" and not self._has_stack_extent():
+            self.config.dem = raster
+            return raster
+        from faninsar.processing.geometry import api as dem_api
+
+        if raster.grid != self.grid or raster.vertical_datum != "ellipsoidal":
+            dem_api.ensure_dem_covers_grid(raster, self.grid)
+            raster = raster.to_raster(
+                self.grid,
+                vertical_datum="ellipsoidal",
+                budget=self.config.resource_budget,
+            )
+        self.config.dem = raster
+        self._ensure_wgs84_dem(raster)
+        if self._dem_source is not None:
+            self._persist_raster_dem(raster)
+        return raster
+
+    def _dem_manifest_record(self, raster: object | None) -> object:
+        """Return the manifest DEM record, including source and raster path."""
+        record: dict[str, object] = {}
+        source = self._source_record()
+        if source is not None:
+            record.update({"kind": "source", **source})
+        if isinstance(raster, RasterDEM):
+            path = self._stack_dem_raster_path()
+            relative = path.name
+            try:
+                relative = str(path.relative_to(self.config.work_dir))
+            except ValueError:
+                relative = str(path)
+            record["raster"] = relative if path.is_file() else None
+            record["identity"] = raster.identity
+            record["vertical_datum"] = raster.vertical_datum
+            record.setdefault("kind", "raster")
+        if record:
+            return record
+        return self._manifest_identity(raster)
+
+    def _restore_dem_from_manifest(self, payload: Mapping[str, object]) -> None:
+        """Reattach a source recipe recorded in the input manifest."""
+        record = payload.get("dem")
+        if not isinstance(record, Mapping):
+            return
+        product = record.get("product")
+        if self._dem_source is None and isinstance(product, str) and product:
+            provider = record.get("provider")
+            selection = (
+                product
+                if not isinstance(provider, str) or not provider
+                else f"{product}:{provider}"
+            )
+            cache = record.get("cache_dir")
+            cache_dir = (
+                Path(cache) if isinstance(cache, str) else self.config.dem_cache_dir
+            )
+            self._dem_source = SourceDEM(selection, cache_dir=cache_dir)
+            if self.config.dem is None:
+                self.config.dem = self._dem_source
+
+    def _ensure_wgs84_dem(self, raster: RasterDEM) -> None:
+        """Materialize a native-spacing geographic crop for rdr2geo."""
+        from faninsar.processing.geometry.dem_view import (
+            geodetic_crop_grid,
+            is_geodetic_crs,
+            native_spacing_deg,
+        )
+
+        if is_geodetic_crs(raster.crs):
+            self._dem_wgs84 = raster
+            return
+        loaded = self._load_persisted_wgs84_dem()
+        if loaded is not None:
+            self._dem_wgs84 = loaded
+            logger.info("Reusing geographic DEM %s", self._stack_wgs84_raster_path())
+            return
+        source = self._dem_source
+        if source is None:
+            self._dem_wgs84 = None
+            return
+        cache_dir = self.config.dem_cache_dir or (self.config.work_dir / "dem-cache")
+        if source.cache_dir is None:
+            source.cache_dir = cache_dir
+        product = raster.provenance.get("product") or source.product
+        grid = geodetic_crop_grid(self.grid, native_spacing_deg(product))
+        logger.info("Materializing geographic DEM from source tiles onto %s", grid.crs)
+        self._dem_wgs84 = source.to_raster(
+            grid,
+            vertical_datum="ellipsoidal",
+            budget=self.config.resource_budget,
+        )
+
+    def _ensure_raster_dem(self) -> RasterDEM | object | None:
+        """Make the live Stack DEM a raster or leave a constant sampler.
+
+        Source recipes are materialized onto the authoritative grid and
+        persisted under ``work_dir/dem``.  ``ConstantDEM`` stays a sampler so
+        tests and flat-geometry campaigns do not allocate a scene-sized
+        raster.  Pair production may still promote a constant when it has an
+        extent.
+        """
+        self._capture_dem_source()
+        current = self.config.dem
+        if type(current).__name__ == "ConstantDEM":
+            return current
+        if isinstance(current, RasterDEM):
+            return self._align_raster_dem(current)
+        loaded = self._load_persisted_raster_dem()
+        if loaded is not None:
+            return self._align_raster_dem(loaded)
+        if (
+            current is None
+            and self.config.grid == "auto"
+            and not self._has_stack_extent()
+        ):
+            return None
+        raster = self.materialize_dem(current)
+        self.config.dem = raster
+        self._ensure_wgs84_dem(raster)
+        if self._dem_source is not None or isinstance(current, SourceDEM):
+            self._capture_dem_source(current)
+            self._persist_raster_dem(raster)
+        return raster
+
     @classmethod
     def _search_profile(cls) -> MissionSearchProfile:
         """Return the mission profile used by :meth:`search`.
@@ -1128,7 +1422,9 @@ class Stack(NetworkContract):
             "reference": self.reference,
             "roi": self._manifest_identity(self.config.roi),
             "grid": self._manifest_identity(self.config.grid),
-            "dem": self._manifest_identity(self.config.dem),
+            "dem": self._manifest_identity(
+                self._dem_source if self._dem_source is not None else self.config.dem
+            ),
             "mask": self.config.mask_plan.identity,
         }
 
@@ -1187,6 +1483,8 @@ class Stack(NetworkContract):
             if prepared.selected_footprints:
                 self.config.extra["selected_footprints"] = prepared.selected_footprints
             self.prepare_scenes()
+            self._restore_dem_from_manifest(manifest)
+            self._ensure_raster_dem()
             return self
 
         try:
@@ -1205,8 +1503,8 @@ class Stack(NetworkContract):
             ):
                 resolved_grid = self.resolve_grid()
             resolved_dem: object | None = None
-            if self.config.dem is not None and resolved_grid is not None:
-                resolved_dem = self.materialize_dem()
+            if resolved_grid is not None:
+                resolved_dem = self._ensure_raster_dem()
             mask_identity = tuple(
                 (stage, self.config.mask_plan.references(stage))
                 for stage in ("roi", "interferogram", "unwrap", "ionosphere")
@@ -1223,7 +1521,7 @@ class Stack(NetworkContract):
                 catalog_paths=self.catalog.paths,
                 prepared=prepared,
                 grid=self._manifest_identity(resolved_grid),
-                dem=self._manifest_identity(resolved_dem),
+                dem=self._dem_manifest_record(resolved_dem),
                 mask=self._manifest_identity(mask_identity),
                 processing_options=self._manifest_processing_options(),
                 verification=verification,
@@ -1591,7 +1889,7 @@ class Stack(NetworkContract):
                 reference_scene=context.get("reference_scene", self.reference),
                 lut=lut,
                 geometry=geometry,
-                dem=self.config.dem,
+                dem=self._geometry_dem(),
             )
             if projection_key not in self._radar_projected_masks:
                 self._radar_projected_masks[projection_key] = project_mask_to_radar(
@@ -1600,7 +1898,7 @@ class Stack(NetworkContract):
                     lut=lut,
                     geometry=geometry,
                     mask_transform=target.transform,
-                    dem=self.config.dem,
+                    dem=self._geometry_dem(),
                     device=self.config.device,
                     multilook=looks,
                     master_grid=target,
@@ -2002,49 +2300,15 @@ class Stack(NetworkContract):
                 reason,
             )
         options = dict(options)
-        # A Stack owns exactly one materialized DEM on its authoritative
-        # output grid.  Materialize a source recipe at the first production
-        # boundary and reuse that raster for every scene/LUT callback.
-        has_extent = (
-            self.config.roi is not None or self._selected_footprint_roi() is not None
-        )
-        if self.config.dem is None:
-            # A provider-only unit test (or another deliberately flat
-            # callback) may not declare an ROI or explicit grid.  There is no
-            # target grid on which an automatic DEM could be materialized in
-            # that case; defer DEM ownership until a concrete Stack grid is
-            # available.  Real projected/ROI runs always take the automatic
-            # source branch here.
-            if self.config.grid == "auto" and not has_extent:
-                logger.debug(
-                    "Stack DEM omitted without ROI or explicit grid; "
-                    "deferring automatic DEM materialization"
-                )
-            else:
-                self.config.dem = self.materialize_dem()
-        elif isinstance(self.config.dem, SourceDEM) or not isinstance(
-            self.config.dem, RasterDEM
-        ):
-            # Legacy bounded provider tests may intentionally use a constant
-            # geometry height without a geographic extent.  Keep that sampler
-            # intact; all source DEMs and extent-bearing runs materialize on
-            # the authoritative Stack grid.
-            if has_extent or type(self.config.dem).__name__ != "ConstantDEM":
-                self.config.dem = self.materialize_dem(self.config.dem)
-        elif (
-            self.config.dem.grid != self.grid
-            or self.config.dem.vertical_datum != "ellipsoidal"
-        ):
-            from faninsar.processing.geometry import api as dem_api
-
-            dem_api.ensure_dem_covers_grid(self.config.dem, self.grid)
-            self.config.dem = self.config.dem.to_raster(
-                self.grid,
-                vertical_datum="ellipsoidal",
-                budget=self.config.resource_budget,
-            )
+        # One live DEM on the Stack grid. Source recipes are materialized
+        # by _ensure_raster_dem; a constant sampler is promoted only when
+        # this production callback has a geographic extent.
+        self._ensure_raster_dem()
+        has_extent = self._has_stack_extent()
+        if type(self.config.dem).__name__ == "ConstantDEM" and has_extent:
+            self.config.dem = self.materialize_dem(self.config.dem)
         if self.config.dem is not None:
-            options.setdefault("dem", self.config.dem)
+            options.setdefault("dem", self._geometry_dem())
         return self.scene_provider(
             SourceHandle._from_source(primary_path),
             SourceHandle._from_source(secondary_path),
@@ -2578,6 +2842,7 @@ class Stack(NetworkContract):
             logger.info("measure_misreg skipped (coreg_mode=geometry)")
             return self
         self._ensure_precise_orbits()
+        self._ensure_raster_dem()
         use_pairs = pairs or self.misreg_pairs
         arcs_path = self._misreg_arcs_path()
         if arcs_path.is_file() and not overwrite:
@@ -2659,6 +2924,7 @@ class Stack(NetworkContract):
         """
         self._ensure_prepared()
         self._ensure_precise_orbits()
+        self._ensure_raster_dem()
         target_dates = (
             list(dates)
             if dates is not None

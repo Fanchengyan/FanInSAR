@@ -1,4 +1,4 @@
-# ruff: noqa: EM101, EM102, TRY003, PLR0911
+# ruff: noqa: EM102, TRY003, PLR0911
 
 """Ampcor-style production helper for P20/P25/P26 geometry (PROPOSAL-0031).
 
@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.geometry import ConstantDEM, GridSpec, RasterDEM
+from faninsar.processing.geometry import ConstantDEM, RasterDEM
 from faninsar.processing.geometry.backend_dispatch import (
     DispatchError,
     resolve_geometry_device,
@@ -833,97 +833,30 @@ def _dem_native_arrays(
     CUDA dispatch reorders that tuple to the native ABI. Constant-height DEMs
     become a coarse global raster so the six-point stencil stays in-bounds.
     """
-    sampler = ConstantDEM(0.0) if dem is None else dem
-    if isinstance(sampler, RasterDEM):
-        return _public_raster_dem_native_arrays(sampler)
-    if isinstance(sampler, ConstantDEM):
-        rows, cols = 80, 160
-        height = float(sampler.height)
-        values = np.full((rows, cols), height, dtype=np.float64)
-        metadata = np.array(
-            [90.0, -180.0, -180.0 / float(rows - 1), 360.0 / float(cols - 1)],
-            dtype=np.float64,
-        )
-        bounds = np.array([height, height], dtype=np.float64)
-        return values, metadata, bounds
-    message = f"unsupported DEM type for native CUDA rdr2geo: {type(sampler).__name__}"
-    raise DispatchError(message)
+    from faninsar.processing.geometry.dem_view import lonlat_dem_view
+
+    try:
+        view = lonlat_dem_view(dem)
+    except (TypeError, ValueError) as error:
+        raise DispatchError(str(error)) from error
+    metadata = np.array(
+        [
+            view.latitude_start_deg,
+            view.longitude_start_deg,
+            view.latitude_spacing_deg,
+            view.longitude_spacing_deg,
+        ],
+        dtype=np.float64,
+    )
+    bounds = np.array([view.height_min_m, view.height_max_m], dtype=np.float64)
+    return np.asarray(view.values, dtype=np.float64), metadata, bounds
 
 
 def _public_raster_dem_native_arrays(
     dem: RasterDEM,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build the private WGS84 execution view for a public ``RasterDEM``."""
-    from affine import Affine
-    from pyproj import Transformer
-
-    source = dem
-    if source.crs != "EPSG:4326":
-        transformer = Transformer.from_crs(source.crs, "EPSG:4326", always_xy=True)
-        west, south, east, north = source.bounds
-        longitudes, latitudes = transformer.transform(
-            [west, east, west, east], [south, south, north, north]
-        )
-        lon_min, lon_max = float(np.min(longitudes)), float(np.max(longitudes))
-        lat_min, lat_max = float(np.min(latitudes)), float(np.max(latitudes))
-        view_grid = GridSpec(
-            "EPSG:4326",
-            Affine(
-                (lon_max - lon_min) / source.width,
-                0.0,
-                lon_min,
-                0.0,
-                -(lat_max - lat_min) / source.height,
-                lat_max,
-            ),
-            shape=source.shape,
-        )
-        # Geometry owns a private geographic execution view.  Do not route a
-        # projected public RasterDEM through ``to_raster``: that would publish
-        # an EPSG:4326 staging raster and introduce a second public warp.  The
-        # source sampler is evaluated directly at the private view centres;
-        # the resulting arrays never leave this geometry preparation seam.
-        view_x, view_y = view_grid.xy_pixel_centers()
-        view_values = np.asarray(
-            dem.sample(np.asarray(view_y), np.asarray(view_x)),
-            dtype=np.float32,
-        )
-        # The lon/lat bounding box of a projected grid covers corner
-        # triangles outside the source footprint; sampling there is
-        # out-of-grid.  Native kernels require a finite DEM bucket while the
-        # host seam only masks non-finite samples, so void cells fall back to
-        # 0 m (sea level) before the arrays leave this seam.  Coverage of the
-        # queried footprint itself is admitted upstream by
-        # ``ensure_dem_covers_grid``; this fill only touches cells outside it.
-        void_count = int(np.count_nonzero(~np.isfinite(view_values)))
-        view_values[~np.isfinite(view_values)] = 0.0
-        if void_count:
-            logger.info(
-                "native geometry DEM view filled %d out-of-footprint cells with 0 m",
-                void_count,
-            )
-        source = RasterDEM(
-            array=view_values,
-            grid=view_grid,
-            vertical_datum=dem.vertical_datum,
-            provenance={"kind": "private-geometry-view"},
-        )
-    values = np.asarray(source.array, dtype=np.float64)
-    if values.ndim != 2 or min(values.shape) < 6:
-        raise DispatchError("native rdr2geo DEM must be at least 6x6")
-    finite = np.isfinite(values)
-    if not np.any(finite):
-        raise DispatchError("native rdr2geo DEM has no finite samples")
-    affine = Affine(*source.grid.transform)
-    metadata = np.array(
-        [float(affine.f), float(affine.c), float(affine.e), float(affine.a)],
-        dtype=np.float64,
-    )
-    bounds = np.array(
-        [float(np.min(values[finite])), float(np.max(values[finite]))],
-        dtype=np.float64,
-    )
-    return values, metadata, bounds
+    return _dem_native_arrays(dem)
 
 
 def _rdr2geo_native_manifest(

@@ -1,4 +1,4 @@
-# ruff: noqa: EM101, EM102, TRY003, TRY004, TRY301
+# ruff: noqa: EM101, EM102, TRY003, TRY004
 
 """Torch eager and explicitly prepared geometry adapters.
 
@@ -579,79 +579,30 @@ def prepare_torch_geometry(
     orbit_tensors = prepared_orbit_tensors(model, str(resolved_device))
     orbit_times, orbit_positions, orbit_velocities, sensing_offset_s = orbit_tensors
 
-    def raster_payload(value: object) -> tuple[object, ...]:
-        """Materialize one RasterDEM and its affine metadata."""
-        try:
-            interpolation = value.interpolation  # type: ignore[attr-defined]
-            if interpolation != "biquintic":
-                raise ValueError(
-                    "Torch RasterDEM supports only biquintic interpolation"
-                )
-            dataset = value._open()  # type: ignore[attr-defined]
-            samples = value._height_array  # type: ignore[attr-defined]
-            if samples is None:
-                samples = dataset.read(1).astype(np.float32, copy=False)
-                nodata = value.nodata  # type: ignore[attr-defined]
-                if nodata is None:
-                    nodata = dataset.nodata
-                if nodata is not None:
-                    samples = np.where(np.isclose(samples, nodata), np.nan, samples)
-                value._height_array = samples  # type: ignore[attr-defined]
-            transform = dataset.transform
-            if abs(float(transform.b)) > 1.0e-12 or abs(float(transform.d)) > 1.0e-12:
-                raise ValueError(
-                    "Torch RasterDEM requires an unrotated geographic affine transform"
-                )
-            samples = torch.as_tensor(
-                np.asarray(samples, dtype=np.float64),
-                dtype=torch.float64,
-                device=resolved_device,
-            ).contiguous()
-            if bool(torch.isinf(samples).any().item()):
-                raise ValueError("RasterDEM contains infinite heights")
-            if samples.ndim != 2 or min(samples.shape) < 6:
-                raise ValueError("RasterDEM must provide at least a 6x6 grid")
-            return (
-                samples,
-                float(transform.f),
-                float(transform.c),
-                float(transform.e),
-                float(transform.a),
-            )
-        except ValueError:
-            raise
-        except Exception as error:
-            logger.exception("failed to prepare RasterDEM for Torch geometry")
-            raise TypeError(
-                "RasterDEM could not be prepared for Torch geometry"
-            ) from error
-
     def dem_payload(value: object) -> tuple[object, ...]:
         """Materialize supported DEM compositions into one device payload."""
         kind = type(value).__name__
         if kind == "ConstantDEM":
             return ("constant", float(value.height))  # type: ignore[attr-defined]
         if kind == "RasterDEM":
-            if hasattr(value, "array") and hasattr(value, "grid"):
-                from affine import Affine
+            from faninsar.processing.geometry.dem_view import lonlat_dem_view
 
-                affine = Affine(*value.grid.transform)  # type: ignore[attr-defined]
-                samples = torch.as_tensor(
-                    np.asarray(value.array, dtype=np.float64),  # type: ignore[attr-defined]
-                    dtype=torch.float64,
-                    device=resolved_device,
-                ).contiguous()
-                if samples.ndim != 2 or min(samples.shape) < 6:
-                    raise ValueError("RasterDEM must provide at least a 6x6 grid")
-                return (
-                    "raster",
-                    samples,
-                    float(affine.f),
-                    float(affine.c),
-                    float(affine.e),
-                    float(affine.a),
-                )
-            return ("raster", *raster_payload(value))
+            view = lonlat_dem_view(value)
+            samples = torch.as_tensor(
+                np.asarray(view.values, dtype=np.float64),
+                dtype=torch.float64,
+                device=resolved_device,
+            ).contiguous()
+            if samples.ndim != 2 or min(samples.shape) < 6:
+                raise ValueError("RasterDEM must provide at least a 6x6 grid")
+            return (
+                "raster",
+                samples,
+                view.latitude_start_deg,
+                view.longitude_start_deg,
+                view.latitude_spacing_deg,
+                view.longitude_spacing_deg,
+            )
         # Datum-adjusted samplers remain useful as an internal geometry
         # composition.  Flatten the common raster-plus-constant case here so
         # the numerical kernel still receives one authoritative raster view.
