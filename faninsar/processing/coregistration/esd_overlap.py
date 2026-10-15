@@ -411,11 +411,26 @@ def estimate_overlap_esd(
         & (np.abs(dd) > 0.0)
     )
     n_valid = int(np.count_nonzero(valid))
+    finite_coh = np.asarray(coherence[np.isfinite(coherence)], dtype=np.float64)
+    n_finite = int(finite_coh.size)
+    if n_finite:
+        coh_p50 = float(np.percentile(finite_coh, 50))
+        coh_p90 = float(np.percentile(finite_coh, 90))
+        frac_above = float(np.mean(finite_coh >= coherence_threshold))
+    else:
+        coh_p50 = float("nan")
+        coh_p90 = float("nan")
+        frac_above = float("nan")
     if n_valid == 0:
         logger.warning(
-            "Overlap ESD has no samples above coherence threshold %.2f; "
+            "Overlap ESD has no samples above coherence threshold %.2f "
+            "(n_finite=%s coh_p50=%.3f coh_p90=%.3f frac>=thr=%.4f); "
             "omitting azimuth observation",
             coherence_threshold,
+            n_finite,
+            coh_p50,
+            coh_p90,
+            frac_above,
         )
         return None
 
@@ -431,11 +446,16 @@ def estimate_overlap_esd(
         consistency = float(np.median(np.abs(r_a[valid] - r_b[valid]) / denom))
 
     logger.info(
-        "Overlap ESD az_shift=%.4f px coherence=%.3f n_valid=%s R_B=%.3f rad/px",
+        "Overlap ESD az_shift=%.4f px coherence=%.3f n_valid=%s/%s "
+        "R_B=%.3f rad/px coh_p50=%.3f coh_p90=%.3f frac>=thr=%.4f",
         azimuth_shift_px,
         coherence_mean,
         n_valid,
+        n_finite,
         response_rb,
+        coh_p50,
+        coh_p90,
+        frac_above,
     )
     return OverlapESDRecord(
         top_index=data.top_index,

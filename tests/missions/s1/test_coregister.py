@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
+from faninsar.data.query import BoundingBox
 from faninsar.io.storage.scene_store import CoregisteredSceneStore
 from faninsar.missions.protocols import DopplerCentroidPolynomial
 from faninsar.missions.s1.coregister import coregister_s1_scene
@@ -245,8 +246,9 @@ def test_coregister_s1_scene_writes_store_without_measuring(
     )
 
     assert result == output
-    assert captured["esd_enabled"] is False
-    assert captured["amplitude_refinement_enabled"] is False
+    assert "esd_enabled" not in captured
+    assert "amplitude_refinement_enabled" not in captured
+    assert "force_esd_azimuth_shift_px" not in captured
     assert captured["misreg_az_px"] == pytest.approx(0.05)
     assert captured["misreg_rg_px"] == pytest.approx(-0.02)
     store = CoregisteredSceneStore.open(output)
@@ -264,3 +266,86 @@ def test_coregister_s1_scene_writes_store_without_measuring(
         secondary_arr,
         np.ones((_LINES, _SAMPLES), dtype=np.complex64) * (1.0 + 1.0j),
     )
+
+
+def test_coregister_keeps_explicit_bursts_when_roi_is_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ROI crops the apply window; it must not re-select bursts already resolved."""
+    reference = tmp_path / "S1A_IW_SLC__1SDV_20200101T000000.SAFE"
+    secondary = tmp_path / "S1A_IW_SLC__1SDV_20200113T000000.SAFE"
+    output = tmp_path / "scenes"
+    products = {reference: _product(reference), secondary: _product(secondary)}
+    select_calls: list[str] = []
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.open_safe_product",
+        lambda path, **_kwargs: products[Path(path)],
+        raising=False,
+    )
+
+    def fake_select(*_args: object, **_kwargs: object) -> dict[object, object]:
+        select_calls.append("roi")
+        pytest.fail("explicit bursts must not re-run ROI selection")
+
+    def fake_load(path: Path, **_kwargs: object) -> MagicMock:
+        scene_id = "20200101" if "20200101" in Path(path).name else "20200113"
+        return _fake_scene(Path(path), scene_id)
+
+    def fake_deramp(state: object, **_kwargs: object) -> object:
+        aligned = np.ones((_LINES, _SAMPLES), dtype=np.complex64)
+        state.primary_deramped = aligned
+        state.secondary_deramped = aligned
+        return state
+
+    def fake_coregister(state: object, **kwargs: object) -> object:
+        aligned = np.ones((_LINES, _SAMPLES), dtype=np.complex64)
+        state.primary_deramped = aligned
+        state.secondary_aligned = aligned
+        state.radar_roi_origin = None
+        state.scientific_lineage = []
+        state.phase_state = None
+        state.roi = kwargs.get("roi")
+        return state
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister._select_bursts_by_roi",
+        fake_select,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister._roi_burst_window",
+        lambda *_args, **_kwargs: (0, 0, _LINES, _SAMPLES),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.load_production_scene",
+        fake_load,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.stage_deramp",
+        fake_deramp,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.stage_coregister",
+        fake_coregister,
+        raising=False,
+    )
+
+    roi = BoundingBox(0.0, 0.0, 1.0, 1.0)
+    coregister_s1_scene(
+        reference,
+        secondary,
+        output_scenes=output,
+        dem=ConstantDEM(0.0),
+        misreg_az_px=0.0,
+        misreg_rg_px=0.0,
+        swaths=("IW1",),
+        bursts={"IW1": [0]},
+        roi=roi,
+    )
+
+    assert select_calls == []

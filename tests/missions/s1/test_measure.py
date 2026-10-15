@@ -6,15 +6,25 @@ import inspect
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.missions.protocols import DopplerCentroidPolynomial
-from faninsar.missions.s1.measure import measure_s1_pair_misreg
+from faninsar.missions.s1.io import BurstArray
+from faninsar.missions.s1.measure import (
+    _ampcor_one_strip,
+    _fit_ampcor_chip,
+    _resample_window_strip,
+    measure_s1_pair_misreg,
+)
 from faninsar.missions.s1.types import S1Burst, S1Product, S1Swath
 from faninsar.processing.coregistration.esd_overlap import OverlapESDRecord
 from faninsar.processing.coregistration.misreg_network import MisregArc
-from faninsar.processing.coregistration.offsets import PatchAmplitudeShiftResult
+from faninsar.processing.coregistration.offsets import (
+    OffsetFieldResult,
+    PatchAmplitudeShiftResult,
+)
 from faninsar.processing.geometry import ConstantDEM
 
 _ORIGIN = datetime(2020, 1, 1, tzinfo=UTC)
@@ -220,3 +230,113 @@ def test_measure_s1_pair_misreg_empty_ampcor_omits_range_keeps_azimuth(
     assert arc.range_shift_px is None
     assert arc.method == "overlap"
     assert arc.n_valid == 12
+
+
+def test_fit_ampcor_chip_skips_strips_shorter_than_minimum() -> None:
+    """A strip that cannot host a chip is omitted rather than stuffed as 0.0."""
+    assert _fit_ampcor_chip((7, 200)) is None
+
+
+def test_fit_ampcor_chip_shrinks_to_overlap_strip() -> None:
+    """A 20-line overlap hosts a chip with at least one azimuth centre."""
+    params = _fit_ampcor_chip((20, 200))
+    assert params is not None
+    assert params["window_az"] + 2 * params["search_az"] + 1 <= 20
+    assert params["window_rg"] + 2 * params["search_rg"] + 1 <= 200
+    assert params["n_az"] >= 1
+    assert params["n_rg"] >= 1
+
+
+def test_ampcor_one_strip_too_small_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Too-small Ampcor chips return None and never call the estimator."""
+    calls: list[str] = []
+
+    def fake_estimate(*_args: object, **_kwargs: object) -> None:
+        calls.append("estimate")
+        pytest.fail("too-small strips must not run Ampcor")
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.measure.estimate_patch_amplitude_shift",
+        fake_estimate,
+    )
+    tiny = np.ones((6, 20), dtype=np.complex64)
+    assert _ampcor_one_strip(tiny, tiny, snr_threshold=6.0, device="cpu") is None
+    assert calls == []
+
+
+def test_ampcor_one_strip_uses_auto_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlap Ampcor admits the Stack device instead of forcing NumPy."""
+    captured: dict[str, object] = {}
+
+    def fake_estimate(*_args: object, **kwargs: object) -> PatchAmplitudeShiftResult:
+        captured.update(kwargs)
+        return PatchAmplitudeShiftResult(
+            range_shift_px=0.1,
+            azimuth_shift_px=0.0,
+            n_valid=4,
+            snr_median=8.0,
+            n_attempted=4,
+        )
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.measure.estimate_patch_amplitude_shift",
+        fake_estimate,
+    )
+    strip = np.ones((32, 128), dtype=np.complex64)
+    result = _ampcor_one_strip(strip, strip, snr_threshold=6.0, device="cuda")
+    assert result is not None
+    assert captured["executor"] == "auto"
+    assert captured["device"] == "cuda"
+
+
+def _zero_offsets(shape: tuple[int, int]) -> OffsetFieldResult:
+    """Build a zero geometry field on ``shape``."""
+    zeros = np.zeros(shape, dtype=np.float64)
+    return OffsetFieldResult(
+        range_offset_px=zeros,
+        azimuth_offset_px=zeros.copy(),
+        coverage=np.ones(shape, dtype=bool),
+        uncertainty_px=zeros.copy(),
+    )
+
+
+def test_resample_window_strip_accepts_unequal_burst_widths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reference/secondary width mismatch crops the common native rectangle."""
+    ref = BurstArray(
+        samples=np.ones((20, 40), dtype=np.complex64),
+        row0=0,
+        col0=0,
+        burst_index=0,
+        valid_mask=np.ones((20, 40), dtype=bool),
+    )
+    secondary = np.full((20, 30), 2.0 + 0.0j, dtype=np.complex64)
+
+    def fake_resample(sec_pad: np.ndarray, **_kwargs: object) -> np.ndarray:
+        return sec_pad
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.measure.resample_complex_deramped_reramp",
+        fake_resample,
+    )
+    pack = _resample_window_strip(
+        native_row0=0,
+        native_col0=0,
+        n_lines=20,
+        n_samples=30,
+        reference=ref,
+        secondary_deramped=secondary,
+        secondary_col0=0,
+        secondary_carrier=object(),
+        offsets=_zero_offsets(ref.samples.shape),
+        device="cpu",
+    )
+    assert pack is not None
+    ref_crop, sec_crop, _az, _rg = pack
+    assert ref_crop.shape == (20, 30)
+    assert sec_crop.shape == (20, 30)

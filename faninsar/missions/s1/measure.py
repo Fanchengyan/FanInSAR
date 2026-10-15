@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.missions.s1.io import BurstArray, read_full_burst
 from faninsar.missions.s1.orbit import read_eof_orbit
-from faninsar.missions.s1.overlap import BurstOverlapWindow, burst_overlap_windows
+from faninsar.missions.s1.overlap import (
+    BurstOverlapWindow,
+    OverlapArrayEnvelope,
+    burst_overlap_windows,
+    intersect_overlap_window,
+)
 from faninsar.missions.s1.processing import (
     BurstSelection,
     ProductionScene,
@@ -376,10 +381,52 @@ def _geometry_resampled_overlap(
         )
         return None
 
+    clipped = intersect_overlap_window(
+        window,
+        extra_bursts=(
+            (sec_top.burst, "top"),
+            (sec_bot.burst, "bottom"),
+        ),
+        envelopes=(
+            _envelope("top", ref_top.array),
+            _envelope("bottom", ref_bot.array),
+            _envelope("top", sec_top.array),
+            _envelope("bottom", sec_bot.array),
+        ),
+    )
+    if clipped is None:
+        logger.warning(
+            "Skipping overlap %s/%s on %s: no common valid-sample crop "
+            "across dates (ref widths %s/%s, sec widths %s/%s)",
+            window.top_index,
+            window.bottom_index,
+            swath_name,
+            ref_top.array.samples.shape[1],
+            ref_bot.array.samples.shape[1],
+            sec_top.array.samples.shape[1],
+            sec_bot.array.samples.shape[1],
+        )
+        return None
+    if (
+        clipped.n_samples != window.n_samples
+        or clipped.n_lines != window.n_lines
+        or clipped.col0 != window.col0
+    ):
+        logger.info(
+            "Overlap %s/%s on %s clipped to common valid region "
+            "%sx%s at col0=%s (ISCE2 adjustCommonValidRegion)",
+            clipped.top_index,
+            clipped.bottom_index,
+            swath_name,
+            clipped.n_lines,
+            clipped.n_samples,
+            clipped.col0,
+        )
+
     sec_top_deramped = deramp(sec_top.array.samples, sec_top.carrier)
     sec_bot_deramped = deramp(sec_bot.array.samples, sec_bot.carrier)
     top_field = dense_geometry_offsets(
-        sec_top.array.samples.shape,
+        ref_top.array.samples.shape,
         reference_model=ref_top.geometry,
         secondary_model=sec_top.geometry,
         device=device,
@@ -389,7 +436,7 @@ def _geometry_resampled_overlap(
         col0=0,
     )
     bot_field = dense_geometry_offsets(
-        sec_bot.array.samples.shape,
+        ref_bot.array.samples.shape,
         reference_model=ref_bot.geometry,
         secondary_model=sec_bot.geometry,
         device=device,
@@ -399,32 +446,35 @@ def _geometry_resampled_overlap(
         col0=0,
     )
     top_pack = _resample_window_strip(
-        window_row0=window.top_row0,
-        window_col0=window.col0,
-        n_lines=window.n_lines,
-        n_samples=window.n_samples,
+        native_row0=clipped.top_row0,
+        native_col0=clipped.col0,
+        n_lines=clipped.n_lines,
+        n_samples=clipped.n_samples,
         reference=ref_top.array,
         secondary_deramped=sec_top_deramped,
+        secondary_col0=int(sec_top.array.col0),
         secondary_carrier=sec_top.carrier,
         offsets=top_field,
         device=device,
     )
     bot_pack = _resample_window_strip(
-        window_row0=window.bottom_row0,
-        window_col0=window.col0,
-        n_lines=window.n_lines,
-        n_samples=window.n_samples,
+        native_row0=clipped.bottom_row0,
+        native_col0=clipped.col0,
+        n_lines=clipped.n_lines,
+        n_samples=clipped.n_samples,
         reference=ref_bot.array,
         secondary_deramped=sec_bot_deramped,
+        secondary_col0=int(sec_bot.array.col0),
         secondary_carrier=sec_bot.carrier,
         offsets=bot_field,
         device=device,
     )
     if top_pack is None or bot_pack is None:
         logger.warning(
-            "Skipping overlap %s/%s on %s: window crop is outside a burst",
-            window.top_index,
-            window.bottom_index,
+            "Skipping overlap %s/%s on %s: window crop is outside a burst "
+            "after common-valid clip",
+            clipped.top_index,
+            clipped.bottom_index,
             swath_name,
         )
         return None
@@ -437,24 +487,24 @@ def _geometry_resampled_overlap(
         sec_bot=sec_bot_crop,
         sec_top_carrier=sec_top.carrier,
         sec_bot_carrier=sec_bot.carrier,
-        top_row0=window.top_row0,
-        bot_row0=window.bottom_row0,
-        top_col0=window.col0,
-        bot_col0=window.col0,
+        top_row0=clipped.top_row0,
+        bot_row0=clipped.bottom_row0,
+        top_col0=clipped.col0,
+        bot_col0=clipped.col0,
         top_native_height=int(sec_top.array.samples.shape[0]),
         bot_native_height=int(sec_bot.array.samples.shape[0]),
         top_offsets=(top_az, top_rg),
         bot_offsets=(bot_az, bot_rg),
         ref_top_carrier=ref_top.carrier,
         ref_bot_carrier=ref_bot.carrier,
-        ref_top_row0=window.top_row0,
-        ref_bot_row0=window.bottom_row0,
-        ref_top_col0=window.col0,
-        ref_bot_col0=window.col0,
+        ref_top_row0=clipped.top_row0,
+        ref_bot_row0=clipped.bottom_row0,
+        ref_top_col0=clipped.col0,
+        ref_bot_col0=clipped.col0,
         ref_top_native_height=int(ref_top.array.samples.shape[0]),
         ref_bot_native_height=int(ref_bot.array.samples.shape[0]),
-        top_index=window.top_index,
-        bottom_index=window.bottom_index,
+        top_index=clipped.top_index,
+        bottom_index=clipped.bottom_index,
     )
 
 
@@ -489,45 +539,67 @@ def _load_burst_scene(
     )
 
 
+def _envelope(
+    role: Literal["top", "bottom"], array: BurstArray
+) -> OverlapArrayEnvelope:
+    """Return the burst-local envelope of a loaded overlap array."""
+    height, width = array.samples.shape
+    return OverlapArrayEnvelope(
+        role=role,
+        col0=int(array.col0),
+        n_samples=int(width),
+        n_lines=int(height),
+    )
+
+
 def _resample_window_strip(
     *,
-    window_row0: int,
-    window_col0: int,
+    native_row0: int,
+    native_col0: int,
     n_lines: int,
     n_samples: int,
     reference: BurstArray,
     secondary_deramped: np.ndarray,
+    secondary_col0: int,
     secondary_carrier: object,
     offsets: OffsetFieldResult,
     device: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
     """Crop, halo-pad, and geometry-resample one overlap strip.
 
-    The secondary is deramped on the **full burst** before this crop; the
-    output secondary strip is original-domain (deramp-resample-reramp).
+    Reference and secondary may have unequal native widths. Coordinates are
+    burst-local; each array is sliced through its own ``col0``. The secondary
+    is deramped on the **full burst** before this crop; the output secondary
+    strip is original-domain (deramp-resample-reramp).
     """
-    height, width = reference.samples.shape
-    # Full-range radar reads place burst line 0 at samples[0]; window coordinates
-    # are burst-local. Range origin follows BurstArray.col0 when the array is
-    # a valid-sample envelope rather than a full-width read.
-    row0 = int(window_row0)
-    col0 = int(window_col0) - int(reference.col0)
+    height_r, width_r = reference.samples.shape
+    height_s, width_s = secondary_deramped.shape
+    if offsets.azimuth_offset_px.shape != reference.samples.shape:
+        return None
+    ref_r0 = int(native_row0)
+    ref_c0 = int(native_col0) - int(reference.col0)
+    sec_r0 = int(native_row0)
+    sec_c0 = int(native_col0) - int(secondary_col0)
     if (
-        row0 < 0
-        or col0 < 0
-        or row0 + n_lines > height
-        or col0 + n_samples > width
-        or secondary_deramped.shape != reference.samples.shape
-        or offsets.azimuth_offset_px.shape != reference.samples.shape
+        ref_r0 < 0
+        or ref_c0 < 0
+        or ref_r0 + n_lines > height_r
+        or ref_c0 + n_samples > width_r
+        or sec_r0 < 0
+        or sec_c0 < 0
+        or sec_r0 + n_lines > height_s
+        or sec_c0 + n_samples > width_s
     ):
         return None
 
     az_window = np.asarray(
-        offsets.azimuth_offset_px[row0 : row0 + n_lines, col0 : col0 + n_samples],
+        offsets.azimuth_offset_px[
+            ref_r0 : ref_r0 + n_lines, ref_c0 : ref_c0 + n_samples
+        ],
         dtype=np.float64,
     )
     rg_window = np.asarray(
-        offsets.range_offset_px[row0 : row0 + n_lines, col0 : col0 + n_samples],
+        offsets.range_offset_px[ref_r0 : ref_r0 + n_lines, ref_c0 : ref_c0 + n_samples],
         dtype=np.float64,
     )
     max_az = float(np.nanmax(np.abs(az_window))) if az_window.size else 0.0
@@ -538,13 +610,33 @@ def _resample_window_strip(
         max_rg = 0.0
     halo_az = int(np.ceil(_LANCZOS_A + max_az + _ESD_MULTILOOK[0]))
     halo_rg = int(np.ceil(_LANCZOS_A + max_rg + _ESD_MULTILOOK[1]))
-    pad_r0 = max(0, row0 - halo_az)
-    pad_r1 = min(height, row0 + n_lines + halo_az)
-    pad_c0 = max(0, col0 - halo_rg)
-    pad_c1 = min(width, col0 + n_samples + halo_rg)
-    sec_pad = secondary_deramped[pad_r0:pad_r1, pad_c0:pad_c1]
-    az_pad = offsets.azimuth_offset_px[pad_r0:pad_r1, pad_c0:pad_c1]
-    rg_pad = offsets.range_offset_px[pad_r0:pad_r1, pad_c0:pad_c1]
+    nat_r0 = int(native_row0)
+    nat_c0 = int(native_col0)
+    nat_r1 = nat_r0 + n_lines
+    nat_c1 = nat_c0 + n_samples
+    pad_r0 = max(0, nat_r0 - halo_az)
+    pad_r1 = min(height_r, height_s, nat_r1 + halo_az)
+    pad_c0 = max(int(reference.col0), int(secondary_col0), nat_c0 - halo_rg)
+    pad_c1 = min(
+        int(reference.col0) + width_r,
+        int(secondary_col0) + width_s,
+        nat_c1 + halo_rg,
+    )
+    if pad_r0 > nat_r0 or pad_c0 > nat_c0 or pad_r1 < nat_r1 or pad_c1 < nat_c1:
+        return None
+    ref_pr0 = pad_r0
+    ref_pc0 = pad_c0 - int(reference.col0)
+    sec_pr0 = pad_r0
+    sec_pc0 = pad_c0 - int(secondary_col0)
+    pad_h = pad_r1 - pad_r0
+    pad_w = pad_c1 - pad_c0
+    sec_pad = secondary_deramped[sec_pr0 : sec_pr0 + pad_h, sec_pc0 : sec_pc0 + pad_w]
+    az_pad = offsets.azimuth_offset_px[
+        ref_pr0 : ref_pr0 + pad_h, ref_pc0 : ref_pc0 + pad_w
+    ]
+    rg_pad = offsets.range_offset_px[
+        ref_pr0 : ref_pr0 + pad_h, ref_pc0 : ref_pc0 + pad_w
+    ]
     sec_resamp = resample_complex_deramped_reramp(
         sec_pad,
         secondary_carrier=secondary_carrier,
@@ -553,16 +645,16 @@ def _resample_window_strip(
         lanczos_a=_LANCZOS_A,
         device=device,
         row0=pad_r0,
-        col0=pad_c0 + int(reference.col0),
-        native_height=height,
+        col0=pad_c0,
+        native_height=height_s,
     )
-    inner_r0 = row0 - pad_r0
-    inner_c0 = col0 - pad_c0
+    inner_r0 = nat_r0 - pad_r0
+    inner_c0 = nat_c0 - pad_c0
     sec_crop = np.asarray(
         sec_resamp[inner_r0 : inner_r0 + n_lines, inner_c0 : inner_c0 + n_samples]
     )
     ref_crop = np.asarray(
-        reference.samples[row0 : row0 + n_lines, col0 : col0 + n_samples]
+        reference.samples[ref_r0 : ref_r0 + n_lines, ref_c0 : ref_c0 + n_samples]
     )
     return ref_crop, sec_crop, az_window, rg_window
 
@@ -618,17 +710,14 @@ def _ampcor_one_strip(
             reference.shape,
         )
         return None
+    ampcor_device = "cpu" if str(device).strip().lower() == "mps" else device
     try:
         return estimate_patch_amplitude_shift(
             reference,
             secondary,
             snr_threshold=snr_threshold,
-            executor="numpy",
-            device=(
-                "cpu"
-                if str(device).strip().lower() in {"auto", "cpu", "mps"}
-                else device
-            ),
+            executor="auto",
+            device=ampcor_device,
             **params,
         )
     except (InvalidProcessingStateError, AmpcorCandidateError, RuntimeError) as error:
@@ -653,8 +742,8 @@ def _fit_ampcor_chip(shape: tuple[int, int]) -> dict[str, int] | None:
     window_rg, search_rg = _shrink_axis(n_samples, window_rg, search_rg)
     if window_az is None or window_rg is None:
         return None
-    n_az = max(1, min(20, 1 + n_lines - window_az - 2 * search_az))
-    n_rg = max(1, min(40, 1 + n_samples - window_rg - 2 * search_rg))
+    n_az = max(1, min(20, n_lines - window_az - 2 * search_az))
+    n_rg = max(1, min(40, n_samples - window_rg - 2 * search_rg))
     return {
         "window_az": window_az,
         "window_rg": window_rg,
@@ -662,8 +751,8 @@ def _fit_ampcor_chip(shape: tuple[int, int]) -> dict[str, int] | None:
         "search_rg": search_rg,
         "n_az": n_az,
         "n_rg": n_rg,
-        "margin_rg": min(1000, max(0, n_samples // 8)),
-        "margin_az": max(0, window_az // 2),
+        "margin_rg": min(1000, window_rg // 2 + search_rg),
+        "margin_az": window_az // 2 + search_az,
     }
 
 
@@ -672,12 +761,16 @@ def _shrink_axis(
     window: int,
     search: int,
 ) -> tuple[int, int] | tuple[None, None]:
-    """Reduce window/search until ``window + 2 * search`` fits ``length``."""
-    while window + 2 * search > length and window > _AMPCOR_MIN_CHIP:
+    """Shrink until Ampcor linspace can place at least one patch centre.
+
+    ``estimate_patch_amplitude_shift`` uses ``linspace(margin, length-margin-1)``,
+    so a usable axis needs ``window + 2 * search + 1 <= length``.
+    """
+    while window + 2 * search + 1 > length and window > _AMPCOR_MIN_CHIP:
         window -= 1
-    while window + 2 * search > length and search > 1:
+    while window + 2 * search + 1 > length and search > 1:
         search -= 1
-    if window + 2 * search > length:
+    if window + 2 * search + 1 > length:
         return None, None
     return window, search
 

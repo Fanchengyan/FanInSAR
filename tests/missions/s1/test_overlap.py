@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.missions.protocols import DopplerCentroidPolynomial
-from faninsar.missions.s1.overlap import burst_overlap_windows
+from faninsar.missions.s1.overlap import (
+    OverlapArrayEnvelope,
+    burst_overlap_windows,
+    intersect_overlap_window,
+)
 from faninsar.missions.s1.types import S1Burst, S1Swath
 
 if TYPE_CHECKING:
@@ -222,3 +226,131 @@ def test_non_adjacent_burst_indices_are_not_paired() -> None:
     assert len(selected) == 1
     assert selected[0].top_index == 1
     assert selected[0].bottom_index == 2
+
+
+def test_intersect_overlap_window_is_identity_without_extras() -> None:
+    """A window with no extra dates or envelopes is unchanged."""
+    swath = _swath(_burst(0, start_line=0), _burst(1, start_line=80))
+    window = burst_overlap_windows(swath)[0]
+
+    assert intersect_overlap_window(window) == window
+
+
+def test_intersect_overlap_window_clips_to_secondary_valid_samples() -> None:
+    """Secondary valid-sample masks shrink the reference overlap (ISCE2-style)."""
+    swath = _swath(_burst(0, start_line=0), _burst(1, start_line=80))
+    window = burst_overlap_windows(swath)[0]
+    sec_top = _burst(0, start_line=0, first=10, last=40)
+    sec_bot = _burst(1, start_line=80, first=10, last=40)
+
+    clipped = intersect_overlap_window(
+        window,
+        extra_bursts=((sec_top, "top"), (sec_bot, "bottom")),
+    )
+
+    assert clipped is not None
+    assert clipped.col0 == 10
+    assert clipped.n_samples == 31
+    assert clipped.n_lines == window.n_lines
+
+
+def test_intersect_overlap_window_clips_unequal_array_widths() -> None:
+    """Loaded arrays with unequal widths keep the common columns.
+
+    Production analogue: a pair whose reference burst is wider than the
+    secondary (A100 22935 vs 22794) used to skip the window because crop
+    required identical full-burst shapes.
+    """
+    swath = _swath(_burst(0, start_line=0), _burst(1, start_line=80))
+    window = burst_overlap_windows(swath)[0]
+    envelopes = (
+        OverlapArrayEnvelope("top", col0=0, n_samples=40, n_lines=_LINES),
+        OverlapArrayEnvelope("bottom", col0=0, n_samples=40, n_lines=_LINES),
+        OverlapArrayEnvelope("top", col0=0, n_samples=30, n_lines=_LINES),
+        OverlapArrayEnvelope("bottom", col0=0, n_samples=30, n_lines=_LINES),
+    )
+
+    clipped = intersect_overlap_window(window, envelopes=envelopes)
+
+    assert clipped is not None
+    assert clipped.col0 == 0
+    assert clipped.n_samples == 30
+    assert clipped.n_lines == window.n_lines
+
+
+def test_intersect_overlap_window_none_when_envelopes_miss() -> None:
+    """A secondary envelope that misses the window omits that overlap."""
+    swath = _swath(_burst(0, start_line=0), _burst(1, start_line=80))
+    window = burst_overlap_windows(swath)[0]
+    envelopes = (
+        OverlapArrayEnvelope("top", col0=0, n_samples=80, n_lines=_LINES),
+        OverlapArrayEnvelope("bottom", col0=0, n_samples=80, n_lines=_LINES),
+        OverlapArrayEnvelope("top", col0=200, n_samples=10, n_lines=_LINES),
+        OverlapArrayEnvelope("bottom", col0=200, n_samples=10, n_lines=_LINES),
+    )
+
+    assert intersect_overlap_window(window, envelopes=envelopes) is None
+
+
+def test_intersect_overlap_window_trims_invalid_secondary_azimuth_lines() -> None:
+    """Trailing invalid lines on a later date shrink n_lines, not columns.
+
+    Production analogue: 20240705 IW1 burst 0 ends the overlap with three
+    ``first_valid_sample = -1`` lines.  Using ``min(last)`` over those
+    ``-1`` values used to empty the column intersection.
+    """
+    swath = _swath(_burst(0, start_line=0), _burst(1, start_line=80))
+    window = burst_overlap_windows(swath)[0]
+    invalid_top = range(window.top_row0 + window.n_lines - 3, _LINES)
+    sec_top = _burst(0, start_line=0, first=5, last=50, invalid=invalid_top)
+    sec_bot = _burst(1, start_line=80, first=5, last=50)
+
+    clipped = intersect_overlap_window(
+        window,
+        extra_bursts=((sec_top, "top"), (sec_bot, "bottom")),
+        min_lines=10,
+    )
+
+    assert clipped is not None
+    assert clipped.n_lines == window.n_lines - 3
+    assert clipped.top_row0 == window.top_row0
+    assert clipped.bottom_row0 == window.bottom_row0
+    assert clipped.col0 == 5
+    assert clipped.n_samples == 46
+
+
+def test_intersect_overlap_window_advances_past_leading_invalid_lines() -> None:
+    """Invalid lines at the start of the overlap keep the strips aligned."""
+    swath = _swath(_burst(0, start_line=0), _burst(1, start_line=80))
+    window = burst_overlap_windows(swath)[0]
+    invalid_top = range(window.top_row0, window.top_row0 + 4)
+    sec_top = _burst(0, start_line=0, invalid=invalid_top)
+    sec_bot = _burst(1, start_line=80)
+
+    clipped = intersect_overlap_window(
+        window,
+        extra_bursts=((sec_top, "top"), (sec_bot, "bottom")),
+        min_lines=10,
+    )
+
+    assert clipped is not None
+    assert clipped.n_lines == window.n_lines - 4
+    assert clipped.top_row0 == window.top_row0 + 4
+    assert clipped.bottom_row0 == window.bottom_row0 + 4
+
+
+def test_intersect_overlap_window_none_when_secondary_overlap_is_all_invalid() -> None:
+    """A secondary burst with no valid overlap lines is omitted."""
+    swath = _swath(_burst(0, start_line=0), _burst(1, start_line=80))
+    window = burst_overlap_windows(swath)[0]
+    invalid_top = range(window.top_row0, window.top_row0 + window.n_lines)
+    sec_top = _burst(0, start_line=0, invalid=invalid_top)
+    sec_bot = _burst(1, start_line=80)
+
+    clipped = intersect_overlap_window(
+        window,
+        extra_bursts=((sec_top, "top"), (sec_bot, "bottom")),
+        min_lines=10,
+    )
+
+    assert clipped is None

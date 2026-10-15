@@ -73,13 +73,17 @@ def coregister_s1_scene(
         Directory of the CoregisteredSceneStore to write.
     swaths : tuple of str, optional
         Sub-swaths to apply. ``None`` selects every sub-swath of the
-        reference product. Ignored when ``roi`` is set.
+        reference product. An explicit selection is kept even when ``roi``
+        is set so measure and apply share one BurstSelection.
     bursts : BurstSelection, optional
-        Per-swath burst selection. ``None`` selects every burst. Ignored
-        when ``roi`` is set.
+        Per-swath burst selection. ``None`` selects every burst, or the
+        ROI footprint set when ``roi`` is set and ``bursts`` is omitted.
     roi : BoundingBox or Polygons, optional
-        Apply-window crop. Burst selection follows footprint intersection
-        (including neighboring bursts at edges) when set.
+        Apply-window crop on the selected bursts. NESD does not require
+        the overlap strip to lie inside this crop; overlap is measured on
+        the full strips of the selected bursts. When ``bursts`` is omitted,
+        ROI footprint intersection (including neighboring bursts at edges)
+        selects the burst set.
     dem : DEM
         Height sampler for geometry offsets.
     misreg_az_px, misreg_rg_px : float
@@ -193,8 +197,6 @@ def coregister_s1_scene(
             burst_work_dir = None if geo_work_root is None else geo_work_root / tag
             state = stage_coregister(
                 state,
-                esd_enabled=False,
-                amplitude_refinement_enabled=False,
                 misreg_az_px=float(misreg_az_px),
                 misreg_rg_px=float(misreg_rg_px),
                 device=device,
@@ -289,9 +291,22 @@ def _resolve_apply_selection(
     ref_orbits: Sequence[Path | None],
     dem: DEM,
 ) -> tuple[tuple[str, ...], dict[tuple[int, str], list[int]]]:
-    """Resolve swaths and bursts; ROI wins over explicit selection."""
+    """Resolve swaths and bursts; explicit selection wins over ROI re-select.
+
+    ``roi`` still crops the apply window. NESD overlap is not required to
+    fall inside that crop; the burst set is the one already resolved by
+    the caller (or ROI footprints when the caller omitted ``bursts``).
+    """
+    if bursts is not None or swaths is not None:
+        swath_tuple = _resolve_swaths(primary_products, secondary_products, swaths)
+        resolved = _resolve_common_bursts(
+            primary_products,
+            secondary_products,
+            swath_tuple,
+            bursts,
+        )
+        return swath_tuple, resolved
     if roi is not None:
-        logger.info("ROI provided; explicit swaths/bursts selection ignored")
         ordered = sorted(
             primary_products[0].swaths,
             key=lambda item: item.slant_range_time_s,
@@ -319,7 +334,15 @@ def _resolve_apply_selection(
                     common[(frame_index, swath)] = selected
         if not any(common.values()):
             reject_invalid_state("ROI selection contains no common bursts")
-        return swath_tuple, common
+        kept = tuple(
+            swath
+            for swath in swath_tuple
+            if any(
+                common.get((frame_index, swath))
+                for frame_index in range(len(primary_products))
+            )
+        )
+        return kept, common
     swath_tuple = _resolve_swaths(primary_products, secondary_products, swaths)
     resolved = _resolve_common_bursts(
         primary_products,

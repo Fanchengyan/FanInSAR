@@ -59,7 +59,8 @@ def _forbid_produce_pair(stack: S1Stack) -> list[str]:
 
     def produce_pair(*_args: object, **_kwargs: object) -> None:
         calls.append("produce_pair")
-        raise AssertionError("NESD measure/apply must not call _produce_pair")
+        message = "NESD measure/apply must not call _produce_pair"
+        raise AssertionError(message)
 
     stack.scene_provider = StackSceneProvider(name="TEST", produce_pair=produce_pair)
     return calls
@@ -68,14 +69,15 @@ def _forbid_produce_pair(stack: S1Stack) -> list[str]:
 def test_geometry_measure_is_noop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """geometry mode skips measure and never touches the pair engine or NESD stage."""
+    """Geometry mode skips measure and never touches the pair engine or NESD stage."""
     stack = _two_date_stack(tmp_path, coreg_mode="geometry")
     produce_calls = _forbid_produce_pair(stack)
     measure_calls: list[str] = []
 
     def fake_measure(*_args: object, **_kwargs: object) -> MisregArc:
         measure_calls.append("measure")
-        raise AssertionError("geometry mode must not measure NESD")
+        message = "Geometry mode must not measure NESD"
+        raise AssertionError(message)
 
     monkeypatch.setattr(
         "faninsar.missions.s1.measure.measure_s1_pair_misreg",
@@ -93,7 +95,7 @@ def test_geometry_measure_is_noop(
 def test_nesd_invert_uses_optional_invert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """nesd invert projects mixed float|None arcs through the optional adapter."""
+    """Nesd invert projects mixed float|None arcs through the optional adapter."""
     stack = _two_date_stack(tmp_path)
     _forbid_produce_pair(stack)
     invert_calls: list[object] = []
@@ -120,7 +122,8 @@ def test_nesd_invert_uses_optional_invert(
         )
 
     def fake_joint(*_args: object, **_kwargs: object) -> DateMisreg:
-        raise AssertionError("nesd invert must not call invert_pair_misregistration")
+        message = "Nesd invert must not call invert_pair_misregistration"
+        raise AssertionError(message)
 
     monkeypatch.setattr(
         "faninsar.missions.s1.measure.measure_s1_pair_misreg",
@@ -142,8 +145,9 @@ def test_nesd_invert_uses_optional_invert(
     assert invert_calls, "invert_optional_pair_misregistration was not used"
     arcs, kwargs = invert_calls[0]
     assert kwargs["reference"] == "20160101"
-    assert list(arcs)[0].azimuth_shift_px is None
-    assert list(arcs)[0].range_shift_px == pytest.approx(0.2)
+    arc = next(iter(arcs))
+    assert arc.azimuth_shift_px is None
+    assert arc.range_shift_px == pytest.approx(0.2)
     assert stack.date_misreg is not None
     assert stack.date_misreg.azimuth_px["20160113"] == 0.0
     assert stack.date_misreg.range_px["20160113"] == pytest.approx(0.2)
@@ -285,7 +289,7 @@ def test_nesd_no_windows_warns_skips_and_zeros_dates(
 def test_coregister_nesd_without_date_misreg_rejects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """nesd apply fails closed when invert has not recorded date constants."""
+    """Nesd apply fails closed when invert has not recorded date constants."""
     stack = _two_date_stack(tmp_path)
     _forbid_produce_pair(stack)
     monkeypatch.setattr(
@@ -338,7 +342,7 @@ def test_coregister_allows_warned_no_window_path(
 def test_geometry_coregister_applies_zero_constants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """geometry apply never measures and injects 0, 0 date constants."""
+    """Geometry apply never measures and injects 0, 0 date constants."""
     stack = _two_date_stack(tmp_path, coreg_mode="geometry")
     produce_calls = _forbid_produce_pair(stack)
     captured: list[tuple[float, float]] = []
@@ -421,3 +425,104 @@ def test_measure_passes_thresholds_orbits_and_resolved_bursts(
     assert "esd_enabled" not in captured
     assert stack.arcs[0].azimuth_shift_px == pytest.approx(0.01)
     assert stack.arcs[0].range_shift_px is None
+
+
+def test_measure_and_apply_share_resolved_burst_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ROI-resolved bursts are reused; measure is not an ROI crop."""
+    stack = _two_date_stack(tmp_path)
+    _forbid_produce_pair(stack)
+    selection = (("IW1",), {"IW1": [0, 1]})
+    monkeypatch.setattr(stack, "_resolve_s1_nesd_selection", lambda: selection)
+    stack._s1_nesd_selection = selection
+    measure_kw: dict[str, object] = {}
+    apply_kw: dict[str, object] = {}
+
+    def fake_measure(*_args: object, **kwargs: object) -> MisregArc:
+        measure_kw.update(kwargs)
+        return MisregArc(
+            primary="20160101",
+            secondary="20160113",
+            azimuth_shift_px=None,
+            range_shift_px=None,
+            method="overlap",
+            n_valid=0,
+        )
+
+    def fake_coregister(
+        *_args: object,
+        output_scenes: Path,
+        **kwargs: object,
+    ) -> Path:
+        apply_kw.update(kwargs)
+        _write_fake_scene(
+            output_scenes,
+            date_id="20160113",
+            reference_id=stack.reference,
+        )
+        return Path(output_scenes)
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.measure.measure_s1_pair_misreg",
+        fake_measure,
+    )
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.coregister_s1_scene",
+        fake_coregister,
+    )
+
+    stack.measure_misreg(overwrite=True)
+    stack.coregister_scenes()
+
+    assert measure_kw["swaths"] == apply_kw["swaths"] == ("IW1",)
+    assert measure_kw["bursts"] == apply_kw["bursts"] == {"IW1": [0, 1]}
+    assert "roi" not in measure_kw
+    assert "esd_enabled" not in apply_kw
+    assert "force_esd_azimuth_shift_px" not in apply_kw
+
+
+def test_coreg_marker_records_coreg_mode_not_esd_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Apply markers persist coreg_mode and date constants, never esd_enabled."""
+    stack = _two_date_stack(tmp_path)
+    _forbid_produce_pair(stack)
+    stack.date_misreg = DateMisreg(
+        reference="20160101",
+        azimuth_px={"20160101": 0.0, "20160113": 0.05},
+        range_px={"20160101": 0.0, "20160113": -0.02},
+        metadata={},
+    )
+
+    def fake_coregister(
+        _reference_path: object,
+        secondary_path: object,
+        *,
+        output_scenes: Path,
+        **_kwargs: object,
+    ) -> Path:
+        date_id = Path(str(secondary_path)).name.split("_")[5][:8]
+        _write_fake_scene(
+            output_scenes,
+            date_id=date_id,
+            reference_id=stack.reference,
+        )
+        return Path(output_scenes)
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.coregister_s1_scene",
+        fake_coregister,
+    )
+    stack.coregister_scenes()
+    marker = json.loads(
+        (tmp_path / "out" / "coreg" / "20160113" / "coreg_done.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert marker["coreg_mode"] == "nesd"
+    assert marker["misreg_az_px"] == pytest.approx(0.05)
+    assert marker["misreg_rg_px"] == pytest.approx(-0.02)
+    assert "esd_enabled" not in marker
+    assert "amplitude_refinement_enabled" not in marker
+    assert "esd_azimuth_shift_px" not in marker
