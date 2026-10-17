@@ -14,6 +14,7 @@ from faninsar.processing.geometry import (
     ConstantDEM,
     RadarGeometryModel,
     TransformCacheKey,
+    dem_content_identity,
     read_transform_cache,
     write_transform_cache,
 )
@@ -108,7 +109,7 @@ class RadarSLC:
         cache_key = TransformCacheKey(
             product_id=self.product.acquisition_id,
             direction="rdr2geo",
-            dem_identity=type(dem_sampler).__name__,
+            dem_identity=dem_content_identity(dem_sampler),
             orbit_source=self.product.orbit.source,
             grid_shape=self.grid.shape,
         )

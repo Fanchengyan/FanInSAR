@@ -39,6 +39,7 @@ from faninsar.io.storage.scene_store import (
 from faninsar.logging import setup_logger
 from faninsar.network.network import Network, NetworkContract
 from faninsar.network.products import (
+    ASSET_KIND_GEOCODE_KERNELS,
     AcquisitionKey,
     AssetKind,
     AssetTransform,
@@ -107,6 +108,8 @@ if TYPE_CHECKING:
         CoregistrationGrid,
         ProductionPairState,
     )
+    from faninsar.processing.geocoding import GeocodeableProduct
+    from faninsar.processing.geocoding.geocoder import GeocodedRaster
     from faninsar.processing.geometry import DEM, GridSpec
     from faninsar.processing.geometry.prepared import (
         ActivationToken,
@@ -764,6 +767,292 @@ def _pairs_from_factory(
     return factory.from_interval(max_interval=max_interval, max_days=max_days)
 
 
+_GEOCODE_KINDS = ("complex", "phase", "continuous", "label")
+_GEOCODE_ROWS_PER_CHUNK = 256
+_GEOCODE_LAYOUT_SCHEMA = 1
+
+
+def _geocode_product_name(product: object) -> str:
+    """Return the validated persisted file stem of a geocode product."""
+    name = getattr(product, "name", None)
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+    ):
+        message = (
+            "geocode product must expose a 'name' that is one safe path "
+            f"component; got {name!r}"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    return name
+
+
+def _geocode_int_pair(product: object, attribute: str) -> tuple[int, int]:
+    """Return a validated two-integer product attribute."""
+    value = getattr(product, attribute, None)
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 2
+        or any(isinstance(entry, bool) or not isinstance(entry, int) for entry in value)
+    ):
+        message = (
+            f"geocode product attribute {attribute!r} must be a two-integer "
+            f"tuple; got {value!r}"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    return int(value[0]), int(value[1])
+
+
+def _geocode_resolve_kind(product: object, kind: str | None) -> tuple[str, str | None]:
+    """Resolve the resampling kernel from ``kind`` or the asset vocabulary.
+
+    Returns
+    -------
+    resolved_kind, asset_tag : tuple[str, str or None]
+        The kernel name and the normalized asset vocabulary tag used in the
+        persisted product identity.
+
+    """
+    raw = getattr(product, "asset_kind", None)
+    asset_tag = None if raw is None else str(raw)
+    if kind is not None:
+        if kind not in _GEOCODE_KINDS:
+            message = f"kind must be one of {_GEOCODE_KINDS}; got {kind!r}"
+            logger.error(message)
+            raise ValueError(message)
+        return kind, asset_tag
+    if raw is None:
+        message = (
+            "geocode could not infer a resampling kernel: the product carries "
+            "no asset_kind; pass kind= explicitly"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    try:
+        asset_kind = AssetKind(raw)
+    except ValueError as error:
+        message = (
+            "geocode could not infer a resampling kernel from asset_kind "
+            f"{raw!r}; pass kind= explicitly"
+        )
+        logger.exception(message)
+        raise ValueError(message) from error
+    kernel = ASSET_KIND_GEOCODE_KERNELS.get(asset_kind)
+    if kernel is None:
+        message = (
+            f"asset_kind {asset_kind!r} has no geocoding kernel mapping; "
+            "pass kind= explicitly"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    return str(kernel), asset_tag
+
+
+def _geocode_product_identity(
+    *,
+    name: str,
+    kind: str,
+    asset_tag: str | None,
+    grid: GridSpec,
+    full_radar_shape: tuple[int, int],
+    looks: tuple[int, int],
+    origin: tuple[int, int],
+    values: np.ndarray,
+) -> str:
+    """Return the qualified identity digest of one geocode request.
+
+    The digest covers the persisted name, the kernel, the destination grid at
+    full precision, the radar frame and its crop/multilook mapping, and the
+    source payload content — everything that would change the committed
+    product. The LUT cache identity is derived separately inside the builder.
+    """
+    array = np.ascontiguousarray(values)
+    payload = {
+        "schema": _GEOCODE_LAYOUT_SCHEMA,
+        "name": name,
+        "kind": kind,
+        "asset_kind": asset_tag,
+        "grid": {
+            "crs": str(grid.crs),
+            "transform": [float(value) for value in grid.transform],
+            "shape": [int(grid.height), int(grid.width)],
+        },
+        "full_radar_shape": [int(full_radar_shape[0]), int(full_radar_shape[1])],
+        "multilook": [int(looks[0]), int(looks[1])],
+        "origin": [int(origin[0]), int(origin[1])],
+        "values": {
+            "dtype": str(array.dtype),
+            "shape": [int(array.shape[0]), int(array.shape[1])],
+            "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
+        },
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _geocode_product_paths(target_dir: Path, name: str) -> tuple[Path, Path, Path]:
+    """Return the ``(values, valid, sidecar)`` paths of one geocode product."""
+    return (
+        target_dir / f"{name}.tif",
+        target_dir / f"{name}_valid.tif",
+        target_dir / f"{name}.json",
+    )
+
+
+def _read_geocode_identity(sidecar_path: Path, name: str) -> str:
+    """Return the recorded identity, failing actionably on a corrupt store."""
+    try:
+        record = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        message = (
+            f"persisted geocode product {name!r} has a missing or corrupt "
+            f"identity sidecar ({sidecar_path.name}); pass overwrite=True to "
+            "replace it"
+        )
+        logger.exception(message)
+        raise ValueError(message) from error
+    identity = record.get("identity") if isinstance(record, dict) else None
+    if not isinstance(identity, str):
+        message = (
+            f"persisted geocode product {name!r} identity sidecar is "
+            "incomplete; pass overwrite=True to replace it"
+        )
+        logger.error(message)
+        raise ValueError(message)  # noqa: TRY004
+    return identity
+
+
+def _load_geocoded_product(
+    target_dir: Path,
+    name: str,
+    identity: str,
+    grid: GridSpec,
+) -> GeocodedRaster | None:
+    """Return the persisted product when its identity matches, else ``None``.
+
+    A present target with a missing, corrupt, or mismatched identity fails
+    with an actionable error (the PROPOSAL-0033 overwrite contract); only a
+    matching identity is reused.
+    """
+    values_path, valid_path, sidecar_path = _geocode_product_paths(target_dir, name)
+    if not values_path.exists():
+        return None
+    recorded = _read_geocode_identity(sidecar_path, name)
+    if recorded != identity:
+        message = (
+            f"persisted geocode product {name!r} exists with a different "
+            "identity (grid, kernel, or source content changed); pass "
+            "overwrite=True to replace it"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    import rasterio
+
+    from faninsar.processing.geocoding.geocoder import GeocodedRaster
+
+    with rasterio.open(values_path) as source:
+        values = source.read(1)
+    with rasterio.open(valid_path) as source:
+        valid = source.read(1).astype(bool)
+    return GeocodedRaster(values=values, valid=valid, grid=grid)
+
+
+def _commit_geocoded_product(
+    target_dir: Path,
+    name: str,
+    identity: str,
+    raster: GeocodedRaster,
+    *,
+    overwrite: bool,
+) -> None:
+    """Persist one geocoded raster as COG values, COG validity, and identity.
+
+    Files are written into a hidden sibling staging directory and then moved
+    into place with the sidecar last, so the sidecar acts as the single
+    commit marker: an interrupted commit leaves the previous (or absent)
+    product with its old identity instead of a half-written store.
+    """
+    from affine import Affine
+
+    from faninsar.network.readers.raster_io import write_cog
+    from faninsar.processing.geometry.grids import GeoGrid
+
+    values_path, valid_path, sidecar_path = _geocode_product_paths(target_dir, name)
+    if values_path.exists() and not overwrite:
+        recorded = _read_geocode_identity(sidecar_path, name)
+        if recorded == identity:
+            logger.info("geocode: product %r already committed; keeping it", name)
+            return
+        message = (
+            f"persisted geocode product {name!r} exists with a different "
+            "identity; pass overwrite=True to replace it"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    values = np.asarray(raster.values)
+    if values.dtype == np.bool_:
+        values = values.astype(np.uint8)
+    if np.issubdtype(values.dtype, np.complexfloating):
+        nodata = None
+    elif np.issubdtype(values.dtype, np.floating):
+        nodata = float("nan")
+    else:
+        nodata = 0
+    geogrid = GeoGrid(
+        Affine(*raster.grid.transform),
+        raster.grid.shape,
+        raster.grid.crs,
+    )
+    staging = target_dir / f".{name}.staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    write_cog(
+        values,
+        staging / values_path.name,
+        geogrid,
+        nodata=nodata,
+        dtype=str(values.dtype),
+        overwrite=True,
+    )
+    write_cog(
+        raster.valid.astype(np.uint8),
+        staging / valid_path.name,
+        geogrid,
+        nodata=None,
+        dtype="uint8",
+        overwrite=True,
+    )
+    (staging / sidecar_path.name).write_text(
+        json.dumps(
+            {
+                "schema": _GEOCODE_LAYOUT_SCHEMA,
+                "identity": identity,
+                "name": name,
+                "grid": {
+                    "crs": str(raster.grid.crs),
+                    "transform": [float(value) for value in raster.grid.transform],
+                    "shape": [int(raster.grid.height), int(raster.grid.width)],
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (staging / values_path.name).replace(values_path)
+    (staging / valid_path.name).replace(valid_path)
+    (staging / sidecar_path.name).replace(sidecar_path)
+    shutil.rmtree(staging, ignore_errors=True)
+
+
 @dataclass
 class Stack(NetworkContract):
     """Multi-scene InSAR session with Reference-relative coregistration.
@@ -1014,6 +1303,245 @@ class Stack(NetworkContract):
             vertical_datum="ellipsoidal",
             budget=self.config.resource_budget,
         )
+
+    def geocode(
+        self,
+        product: GeocodeableProduct,
+        *,
+        grid: GridSpec | None = None,
+        resolution_m: float | None = None,
+        bounds: object | None = None,
+        kind: str | None = None,
+        overwrite: bool = False,
+    ) -> GeocodedRaster | GeocodeableProduct:
+        """Geocode one radar-domain product onto the Stack grid on demand.
+
+        This is the single entry point that turns any radar-domain result of
+        any stage into a geographic raster. It composes the shared geocoding
+        engine (:class:`~faninsar.processing.geocoding.Geocoder`) with the
+        authoritative Stack grid, the reference-scene radar geometry from the
+        coregistration context, and the Stack DEM. The kernel is fixed by the
+        physical ``kind`` — never by dtype — following
+        :data:`~faninsar.network.products.ASSET_KIND_GEOCODE_KERNELS`.
+
+        Parameters
+        ----------
+        product : GeocodeableProduct
+            Radar-domain product structurally exposing ``name``, ``values``
+            (2-D radar raster), ``asset_kind``, ``full_radar_shape``,
+            ``multilook``, and ``origin``; see
+            :class:`~faninsar.processing.geocoding.GeocodeableProduct` and
+            :class:`~faninsar.processing.geocoding.RadarDomainProduct`.
+            ``values.shape`` must match the layer frame implied by the
+            crop/multilook mapping (see
+            :func:`~faninsar.processing.geocoding.product.layer_frame_shape`).
+        grid : GridSpec, optional
+            Explicit destination grid. When omitted, the Stack grid resolves
+            through :meth:`resolve_grid` precedence (``StackConfig.grid``,
+            then ``bounds``/``StackConfig.roi``, then selected footprints).
+        resolution_m : float, optional
+            Automatic-grid spacing override; ignored with an explicit grid.
+        bounds : object, optional
+            WGS84 ROI used when the destination grid resolves automatically.
+            An explicit ``grid`` always wins.
+        kind : {"complex", "phase", "continuous", "label"}, optional
+            Resampling kernel. When omitted it is inferred from the product
+            ``asset_kind`` (complex interferograms keep Lanczos-4, wrapped
+            phase rides ``exp(i*phi)`` + Lanczos-4, smooth real quantities
+            are bilinear, hard labels nearest).
+        overwrite : bool, optional
+            Persistence flag shared by every persisting stage
+            (PROPOSAL-0033). The product commits to
+            ``<work_dir>/geocode/<name>.tif`` (COG) with a ``_valid`` mask
+            COG and an identity sidecar. A present target with a matching
+            identity is reused and returned without recomputing; a missing,
+            corrupt, or mismatched identity fails actionably. ``True``
+            recomputes into hidden staging and replaces the target.
+
+        Returns
+        -------
+        GeocodedRaster or GeocodeableProduct
+            Values, validity, and destination grid of the geocoded frame.
+            When ``product.crs`` is already geographic, the product is
+            returned unchanged after a warning.
+
+        Raises
+        ------
+        ValueError
+            If the product contract is malformed, the kernel cannot be
+            resolved, the destination grid cannot be resolved, the reference
+            radar geometry is unavailable, or a persisted target conflicts
+            with the request identity.
+
+        Notes
+        -----
+        The geo2rdr lookup table is content-addressed under
+        ``<work_dir>/cache/geo-lut/``; the readable namespace never enters
+        the on-disk identity. The returned raster always lives on the
+        resolved destination grid: product ``origin`` and ``multilook`` only
+        fold the source sampling coordinates into the product layer frame
+        through a single
+        :meth:`~faninsar.processing.geocoding.coordinates.RadarCoordinates.to_layer_frame`
+        mapping. Unwrapped phase geocodes with the bilinear
+        (``continuous``) kernel, which is locally unreliable across
+        connected-component boundaries where the field jumps by ``2*pi``.
+        Export never geocodes: geocoding happens here, on demand.
+
+        """
+        name = _geocode_product_name(product)
+        crs = getattr(product, "crs", None)
+        if crs is not None:
+            from pyproj import CRS
+
+            parsed = CRS.from_user_input(crs)
+            if parsed.is_geographic:
+                logger.warning(
+                    "geocode: product %r is already georeferenced in %s; "
+                    "returning it unchanged",
+                    name,
+                    parsed.to_string(),
+                )
+                return product
+            message = (
+                f"geocode: product {name!r} carries projected CRS "
+                f"{parsed.to_string()}; geocode expects a radar-domain "
+                "product (crs=None)"
+            )
+            logger.error(message)
+            raise ValueError(message)
+        resolved_kind, asset_tag = _geocode_resolve_kind(product, kind)
+        values = np.asarray(product.values)
+        full_radar_shape = _geocode_int_pair(product, "full_radar_shape")
+        looks = _geocode_int_pair(product, "multilook")
+        origin = _geocode_int_pair(product, "origin")
+        if any(value < 1 for value in looks):
+            message = f"multilook must contain positive integers; got {looks}"
+            logger.error(message)
+            raise ValueError(message)
+        if any(value < 0 for value in origin):
+            message = f"origin must contain non-negative integers; got {origin}"
+            logger.error(message)
+            raise ValueError(message)
+        from faninsar.processing.geocoding.product import layer_frame_shape
+
+        layer_shape = layer_frame_shape(
+            full_radar_shape, multilook=looks, origin=origin
+        )
+        if values.shape != layer_shape:
+            message = (
+                f"geocode product {name!r} values shape {values.shape} does not "
+                "match the layer frame implied by full_radar_shape="
+                f"{full_radar_shape}, origin={origin}, multilook={looks} "
+                f"(expected {layer_shape})"
+            )
+            logger.error(message)
+            raise ValueError(message)
+        destination = self._geocode_destination_grid(grid, resolution_m, bounds)
+        identity = _geocode_product_identity(
+            name=name,
+            kind=resolved_kind,
+            asset_tag=asset_tag,
+            grid=destination,
+            full_radar_shape=full_radar_shape,
+            looks=looks,
+            origin=origin,
+            values=values,
+        )
+        target_dir = self.config.work_dir / "geocode"
+        if not overwrite:
+            existing = _load_geocoded_product(target_dir, name, identity, destination)
+            if existing is not None:
+                logger.info("geocode: reusing persisted product %r", name)
+                return existing
+        geometry = self._geocode_geometry(full_radar_shape)
+        from faninsar.processing.geocoding import Geocoder
+
+        engine = Geocoder(
+            geometry,
+            destination,
+            dem=self._geometry_dem(),
+            full_radar_shape=full_radar_shape,
+            device=self.config.device,
+            cache_dir=self.config.work_dir / "cache" / "geo-lut",
+            cache_key=f"stack_{self.reference}",
+            storage_dir=self.config.work_dir / "geocode" / "lut",
+        )
+
+        def correction(coords: Any) -> Any:
+            """Map full-radar coordinates into the product layer frame."""
+            return coords.to_layer_frame(origin=origin, looks=looks)
+
+        raster = engine.apply(
+            values,
+            kind=resolved_kind,
+            correction=correction,
+            rows_per_chunk=_GEOCODE_ROWS_PER_CHUNK,
+        )
+        _commit_geocoded_product(
+            target_dir, name, identity, raster, overwrite=overwrite
+        )
+        return raster
+
+    def _geocode_destination_grid(
+        self,
+        grid: GridSpec | None,
+        resolution_m: float | None,
+        bounds: object | None,
+    ) -> GridSpec:
+        """Resolve the destination grid with :meth:`resolve_grid` precedence."""
+        from faninsar.processing.geometry import GridSpec as GridSpecClass
+        from faninsar.stack.grid import resolve_stack_grid
+
+        effective_grid = self.config.grid if grid is None else grid
+        effective_resolution = (
+            self.config.resolution_m if resolution_m is None else float(resolution_m)
+        )
+        selected_roi = self.config.roi if bounds is None else bounds
+        if selected_roi is None and effective_grid == "auto":
+            selected_roi = self._selected_footprint_roi()
+        if selected_roi is None and not isinstance(effective_grid, GridSpecClass):
+            message = (
+                "geocode requires an explicit grid, a configured "
+                "StackConfig.grid, or bounds/roi/footprints to resolve the "
+                "automatic grid"
+            )
+            logger.error(message)
+            raise ValueError(message)
+        return resolve_stack_grid(
+            effective_grid,
+            roi=selected_roi,
+            resolution_m=effective_resolution,
+            budget=self.config.resource_budget,
+            explicit_roi=bounds is not None or self.config.roi is not None,
+        )
+
+    def _geocode_geometry(self, full_radar_shape: tuple[int, int]) -> object:
+        """Return the reference-scene radar geometry from the Stack context."""
+        context = self._radar_projection_context
+        if context is None:
+            configured = self.config.extra.get("radar_projection_context")
+            context = configured if isinstance(configured, dict) else None
+        geometry = None if context is None else context.get("geometry")
+        if geometry is None:
+            message = (
+                "geocode requires the reference-scene radar geometry; run "
+                "coregister_scenes first or configure "
+                "StackConfig.extra['radar_projection_context']"
+            )
+            logger.error(message)
+            raise ValueError(message)
+        context_shape = context.get("full_radar_shape")
+        if context_shape is not None:
+            context_pair = tuple(int(value) for value in context_shape)
+            if context_pair != tuple(full_radar_shape):
+                message = (
+                    "geocode product declares full_radar_shape "
+                    f"{tuple(full_radar_shape)} but the Stack radar context "
+                    f"solved {context_pair}"
+                )
+                logger.error(message)
+                raise ValueError(message)
+        return geometry
 
     def _capture_dem_source(self, dem: object | None = None) -> None:
         """Remember a source recipe so reopen can rematerialize it."""

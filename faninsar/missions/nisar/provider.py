@@ -41,6 +41,7 @@ from faninsar.stack.provider import (
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
+    from faninsar.processing.geocoding.geocoder import Geocoder
     from faninsar.processing.geometry import DEM
     from faninsar.processing.slc.products import SLCProduct
     from faninsar.stack.provider import SceneProductionCallback
@@ -500,21 +501,20 @@ def _lanczos_source_coverage(
     return np.asarray(sampled, dtype=bool)
 
 
-def _geocode_aligned_radar_tile(
+def _tile_geo_geocoder(
     primary_product: SLCProduct,
-    reference: np.ndarray,
-    secondary: np.ndarray,
-    radar_bounds: tuple[int, int, int, int],
     target: GeoGrid,
     *,
     device: str,
     dem: DEM,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Forward-geocode aligned complex tiles through Geo2Rdr + Lanczos."""
-    from faninsar.processing.geocoding.geo_lut import build_geo2rdr_lut
-    from faninsar.processing.geocoding.geo_resample import (
-        resample_complex_at_coordinates,
-    )
+) -> Geocoder:
+    """Build the forward-geocoding engine shared by one radar tile's layers.
+
+    The engine owns exactly one Geo2Rdr LUT for the tile, so multi-layer
+    flows (aligned pair, interferogram-stage phase screen) reuse one solve.
+
+    """
+    from faninsar.processing.geocoding.geocoder import Geocoder
     from faninsar.processing.geometry import RadarGeometryModel
     from faninsar.processing.mosaicking.grid import GeoGridSpec
 
@@ -534,40 +534,84 @@ def _geocode_aligned_radar_tile(
         primary_product.grid,
         primary_product.orbit,
     )
-    lut = build_geo2rdr_lut(
-        geometry=geometry,
-        grid=grid,
-        full_radar_shape=primary_product.grid.shape,
+    return Geocoder(
+        geometry,
+        grid,
         dem=dem,
+        full_radar_shape=primary_product.grid.shape,
         device=device,
     )
+
+
+def _geocode_aligned_radar_tile(
+    primary_product: SLCProduct,
+    reference: np.ndarray,
+    secondary: np.ndarray,
+    radar_bounds: tuple[int, int, int, int],
+    target: GeoGrid,
+    *,
+    device: str,
+    dem: DEM,
+    geocoder: Geocoder | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Forward-geocode aligned complex tiles through Geo2Rdr + Lanczos.
+
+    Parameters
+    ----------
+    primary_product : SLCProduct
+        Reference product supplying the radar geometry and shape.
+    reference : numpy.ndarray
+        Aligned reference complex tile in the local radar frame.
+    secondary : numpy.ndarray
+        Aligned secondary complex tile in the local radar frame.
+    radar_bounds : tuple[int, int, int, int]
+        ``(row_start, row_stop, col_start, col_stop)`` of the radar tile;
+        LUT coordinates are shifted into this local frame.
+    target : GeoGrid
+        Geographic target grid of the tile.
+    device : str
+        Execution device for the LUT solve and the Lanczos kernels.
+    dem : DEM
+        Per-pixel ellipsoidal height source for the LUT solve.
+    geocoder : Geocoder, optional
+        Engine whose LUT is reused across the tile's layers; built from
+        ``primary_product``/``target`` when omitted.
+
+    """
+    from faninsar.processing.geocoding.geo_resample import sample
+
+    if geocoder is None:
+        geocoder = _tile_geo_geocoder(
+            primary_product,
+            target,
+            device=device,
+            dem=dem,
+        )
     row_start, _row_stop, col_start, _col_stop = radar_bounds
-    local_azimuth = np.asarray(lut.az_full, dtype=np.float64) - row_start
-    local_range = np.asarray(lut.rg_full, dtype=np.float64) - col_start
-    valid = np.asarray(lut.valid, dtype=bool)
-    primary_geo, primary_valid = resample_complex_at_coordinates(
+    coordinates = geocoder.coordinates().to_layer_frame(
+        origin=(row_start, col_start),
+    )
+    primary_geo, primary_valid = sample(
         reference,
-        local_azimuth,
-        local_range,
-        valid=valid,
+        coordinates,
+        kind="complex",
         device=device,
     )
-    secondary_geo, secondary_valid = resample_complex_at_coordinates(
+    secondary_geo, secondary_valid = sample(
         secondary,
-        local_azimuth,
-        local_range,
-        valid=valid,
+        coordinates,
+        kind="complex",
         device=device,
     )
     primary_valid &= _lanczos_source_coverage(
         reference,
-        local_azimuth,
-        local_range,
+        coordinates.az,
+        coordinates.rg,
     )
     secondary_valid &= _lanczos_source_coverage(
         secondary,
-        local_azimuth,
-        local_range,
+        coordinates.az,
+        coordinates.rg,
     )
     primary_geo[~primary_valid] = np.complex64(np.nan + 1j * np.nan)
     secondary_geo[~secondary_valid] = np.complex64(np.nan + 1j * np.nan)
@@ -1357,15 +1401,19 @@ def make_nisar_scene_provider(
                     )
                     dense_valid = dense_mapping.valid
                 else:
-                    from faninsar.processing.geocoding.geo_resample import (
-                        resample_complex_at_coordinates,
+                    from faninsar.processing.geocoding.coordinates import (
+                        RadarCoordinates,
                     )
+                    from faninsar.processing.geocoding.geo_resample import sample
 
-                    secondary_array, dense_valid = resample_complex_at_coordinates(
+                    secondary_array, dense_valid = sample(
                         np.asarray(secondary_samples, dtype=np.complex64),
-                        dense_mapping.azimuth,
-                        dense_mapping.range_index,
-                        valid=dense_mapping.valid,
+                        RadarCoordinates(
+                            dense_mapping.azimuth,
+                            dense_mapping.range_index,
+                            dense_mapping.valid,
+                        ),
+                        kind="complex",
                         device=device,
                     )
                     dense_valid &= _lanczos_source_coverage(
@@ -1464,6 +1512,14 @@ def make_nisar_scene_provider(
             else:
                 assert local_target is not None
                 if full_scene:
+                    # One Geo2Rdr LUT per tile, shared by the aligned pair and
+                    # the interferogram-stage phase screen.
+                    tile_geocoder = _tile_geo_geocoder(
+                        primary_product,
+                        local_target,
+                        device=device,
+                        dem=mapping_dem,
+                    )
                     primary_array, secondary_array = _geocode_aligned_radar_tile(
                         primary_product,
                         np.asarray(primary_array, dtype=np.complex64),
@@ -1472,6 +1528,7 @@ def make_nisar_scene_provider(
                         local_target,
                         device=device,
                         dem=mapping_dem,
+                        geocoder=tile_geocoder,
                     )
                     if requested_flatten_stage == "interferogram":
                         phase_factor = np.exp(1j * range_offset_phase).astype(
@@ -1486,6 +1543,7 @@ def make_nisar_scene_provider(
                             local_target,
                             device=device,
                             dem=mapping_dem,
+                            geocoder=tile_geocoder,
                         )
                         range_offset_phase = np.angle(phase_geo).astype(
                             np.float32,

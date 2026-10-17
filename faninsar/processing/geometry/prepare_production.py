@@ -990,6 +990,7 @@ def run_geo2rdr(
     *,
     device: DeviceLike,
     max_iter: int = 20,
+    extra_iter: int = 0,
     range_tol_m: float = 0.01,
     doppler_tol_hz: float = 0.1,
 ) -> TransformResult:
@@ -1014,6 +1015,7 @@ def run_geo2rdr(
         shape=flat_shape,
         settings=SolverSettings(
             max_iter=max_iter,
+            extra_iter=extra_iter,
             range_tolerance_m=range_tol_m,
             doppler_tolerance_hz=doppler_tol_hz,
         ),

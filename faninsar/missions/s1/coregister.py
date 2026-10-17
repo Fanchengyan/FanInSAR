@@ -53,6 +53,7 @@ def coregister_s1_scene(
     misreg_rg_px: float,
     coregistration_grid: Literal["radar", "geo"] = "radar",
     geo_grid: GeoGridSpec | None = None,
+    geo_lut_cache_dir: Path | None = None,
     primary_orbit_path: Path | None = None,
     secondary_orbit_path: Path | None = None,
     device: str = "auto",
@@ -92,6 +93,10 @@ def coregister_s1_scene(
         Grid on which aligned SLCs are produced. Default ``radar``.
     geo_grid : GeoGridSpec, optional
         Required when ``coregistration_grid="geo"``.
+    geo_lut_cache_dir : pathlib.Path, optional
+        Shared cache root for reference-scene geo2rdr LUTs. All bursts and
+        dates reuse one content-addressed entry per reference geometry
+        instead of re-solving per date under ``.geo_work``.
     primary_orbit_path, secondary_orbit_path : path, optional
         Precise ESA EOF orbits.
     device : {"auto", "cpu", "cuda", "mps"}, optional
@@ -203,6 +208,7 @@ def coregister_s1_scene(
                 coregistration_grid=coregistration_grid,
                 geo_grid=geo_grid,
                 geo_work_dir=burst_work_dir,
+                geo_lut_cache_dir=geo_lut_cache_dir,
                 roi=roi,
                 roi_window=roi_window,
             )

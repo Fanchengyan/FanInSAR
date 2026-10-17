@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from .api import DEM, ConstantDEM, DEMProduct, RasterDEM, SourceDEM, VerticalDatum
+from .api import (
+    DEM,
+    ConstantDEM,
+    DEMProduct,
+    RasterDEM,
+    SourceDEM,
+    VerticalDatum,
+    dem_content_identity,
+)
 from .baseline import BaselineComponents, geometric_baseline, zero_doppler_residual_hz
 from .boundary import (
     BoundaryDecision,
@@ -213,6 +221,7 @@ __all__ = [
     "bounds_from_xy",
     "conversion_models",
     "convert_heights",
+    "dem_content_identity",
     "ecef_to_llh",
     "evaluate_canonical_boundary",
     "execute_geometry",

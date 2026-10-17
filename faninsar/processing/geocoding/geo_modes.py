@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from faninsar.logging import setup_logger
-from faninsar.processing.geocoding.geo_resample import (
-    compose_secondary_coordinates,
-    resample_complex_at_coordinates,
-)
+from faninsar.processing.geocoding.coordinates import RadarCoordinates
+from faninsar.processing.geocoding.geo_resample import sample
 from faninsar.processing.runtime.memory import release_memmap_pages
 
 if TYPE_CHECKING:
@@ -80,7 +78,6 @@ def coregister_geocoded_slcs(
     secondary_carrier: TOPSCarrierModel,
     reference_lut: Geo2RdrLUT,
     offsets: OffsetFieldResult,
-    executor: Literal["torch"] = "torch",
     device: str = "auto",
     dask_client: Any | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -96,10 +93,9 @@ def coregister_geocoded_slcs(
         Reference radar coordinates at geographic pixel centres.
     offsets : OffsetFieldResult
         Dense reference-to-secondary radar offsets.
-    executor : {"torch"}, optional
-        Unified Torch Lanczos implementation.
     device : {"auto", "cpu", "cuda"}, optional
-        Torch device for the accelerated implementation.
+        Torch device for the secondary offset composition and the
+        accelerated Lanczos implementation.
     dask_client : object or None, optional
         Explicitly trusted Dask client for remote CUDA reramp tasks.
 
@@ -115,23 +111,25 @@ def coregister_geocoded_slcs(
     that interpolation.
 
     """
-    secondary_azimuth, secondary_range, secondary_valid = compose_secondary_coordinates(
-        reference_lut, offsets
-    )
-    reference_geo, reference_valid = resample_complex_at_coordinates(
-        reference_deramped,
+    reference_coordinates = RadarCoordinates(
         reference_lut.az_full,
         reference_lut.rg_full,
-        valid=reference_lut.valid,
-        executor=executor,
+        reference_lut.valid,
+    )
+    secondary_coordinates = reference_coordinates.minus_offsets(
+        offsets,
         device=device,
     )
-    secondary_geo, secondary_valid = resample_complex_at_coordinates(
+    reference_geo, reference_valid = sample(
+        reference_deramped,
+        reference_coordinates,
+        kind="complex",
+        device=device,
+    )
+    secondary_geo, secondary_valid = sample(
         secondary_deramped,
-        secondary_azimuth,
-        secondary_range,
-        valid=secondary_valid,
-        executor=executor,
+        secondary_coordinates,
+        kind="complex",
         device=device,
     )
     valid = (
@@ -154,8 +152,8 @@ def coregister_geocoded_slcs(
     secondary_geo = _apply_reramp(
         secondary_geo,
         secondary_carrier,
-        secondary_azimuth,
-        secondary_range,
+        secondary_coordinates.az,
+        secondary_coordinates.rg,
         native_height=secondary_deramped.shape[0],
         device=device,
         dask_client=dask_client,
@@ -176,7 +174,6 @@ def coregister_geocoded_slcs_chunked(
     offsets: OffsetFieldResult,
     output_dir: str | Path,
     row_chunk: int = 256,
-    executor: Literal["torch"] = "torch",
     device: str = "auto",
     dask_client: Any | None = None,
     watchdog: MemoryWatchdog | None = None,
@@ -192,13 +189,12 @@ def coregister_geocoded_slcs_chunked(
     reference_lut : Geo2RdrLUT
         Reference radar coordinates on the geographic grid.
     offsets : OffsetFieldResult
-        Dense reference-to-secondary offsets.
+        Dense reference-to-secondary radar offsets.
     output_dir : str or pathlib.Path
         Directory for disk-backed intermediate arrays.
     row_chunk : int, optional
-        Geographic rows processed per tile.
-    executor : {"torch"}, optional
-        Unified Torch Lanczos implementation.
+        Geographic rows processed per tile; each tile's secondary
+        coordinates are composed exactly once.
     device : {"auto", "cpu", "cuda", "mps"}, optional
         Torch device for accelerated Lanczos.
     dask_client : object or None, optional
@@ -260,7 +256,6 @@ def coregister_geocoded_slcs_chunked(
             secondary_carrier=secondary_carrier,
             reference_lut=tile_lut,
             offsets=offsets,
-            executor=executor,
             device=device,
             dask_client=dask_client,
         )

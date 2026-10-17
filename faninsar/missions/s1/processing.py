@@ -49,7 +49,6 @@ from faninsar.processing.geometry.baseline import BaselineComponents
 from faninsar.processing.geometry.coordinates import RadarGrid
 from faninsar.processing.geometry.prepare_production import (
     run_geo2rdr,
-    run_rdr2geo_chunked,
 )
 from faninsar.processing.interferometry.flatten import (
     azimuth_ramp_device_kwargs,
@@ -978,10 +977,8 @@ def _apply_geo_topographic_phase_chunked(
         Complete disk-backed geographic fields.
 
     """
-    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT, grid_lonlat_rows
-    from faninsar.processing.geocoding.geo_resample import (
-        compose_secondary_coordinates,
-    )
+    from faninsar.processing.geocoding.coordinates import RadarCoordinates
+    from faninsar.processing.geocoding.geo_lut import grid_lonlat_rows
 
     topo_phase = np.memmap(
         output_dir / "topographic_phase.float32",
@@ -998,23 +995,22 @@ def _apply_geo_topographic_phase_chunked(
             shape=lut.shape,
         )
     invalid = np.complex64(np.nan + 1j * np.nan)
+    frame_coordinates = RadarCoordinates(lut.az_full, lut.rg_full, lut.valid)
     for row_start in range(0, lut.shape[0], chunk_size):
         row_stop = min(row_start + chunk_size, lut.shape[0])
         rows = slice(row_start, row_stop)
-        tile_lut = Geo2RdrLUT(
-            az_full=lut.az_full[rows],
-            rg_full=lut.rg_full[rows],
-            valid=lut.valid[rows],
-            full_radar_shape=lut.full_radar_shape,
-            height_m=lut.height_m,
-            height_full=(None if lut.height_full is None else lut.height_full[rows]),
+        chunk_coordinates = RadarCoordinates(
+            frame_coordinates.az[rows],
+            frame_coordinates.rg[rows],
+            frame_coordinates.valid[rows],
         )
         compose_started = time.perf_counter()
-        secondary_azimuth, _, coordinate_valid = compose_secondary_coordinates(
-            tile_lut,
+        secondary_coordinates = chunk_coordinates.minus_offsets(
             offsets,
             device=device,
         )
+        secondary_azimuth = secondary_coordinates.az
+        coordinate_valid = secondary_coordinates.valid
         latitude, longitude = grid_lonlat_rows(
             grid,
             row_start + row0_offset,
@@ -1024,13 +1020,13 @@ def _apply_geo_topographic_phase_chunked(
         if col0_offset > 0 or col_stop < grid.width:
             latitude = latitude[:, col0_offset:col_stop]
             longitude = longitude[:, col0_offset:col_stop]
-        if tile_lut.height_full is None:
+        if lut.height_full is None:
             height = np.asarray(
                 state.dem.sample(latitude, longitude),
                 dtype=np.float64,
             )
         else:
-            height = np.asarray(tile_lut.height_full, dtype=np.float64)
+            height = np.asarray(lut.height_full[rows], dtype=np.float64)
         if timings_out is not None:
             timings_out["compose"] = timings_out.get("compose", 0.0) + (
                 time.perf_counter() - compose_started
@@ -1042,9 +1038,9 @@ def _apply_geo_topographic_phase_chunked(
             latitude,
             longitude,
             height,
-            tile_lut.az_full,
+            chunk_coordinates.az,
             secondary_azimuth,
-            reference_range_index=tile_lut.rg_full,
+            reference_range_index=chunk_coordinates.rg,
         )
         if timings_out is not None:
             timings_out["phase"] = timings_out.get("phase", 0.0) + (
@@ -1070,6 +1066,7 @@ def _apply_geo_topographic_phase_chunked(
         if lut.height_full is None:
             height_field[rows] = height
         del (
+            chunk_coordinates,
             corrected_secondary,
             coordinate_valid,
             height,
@@ -1190,8 +1187,10 @@ def stage_coregister(
     geo_work_dir : str or pathlib.Path, optional
         Directory for disk-backed Geo intermediate arrays.
     geo_lut_cache_dir : str or pathlib.Path, optional
-        Shared cache for reference-scene geo2rdr LUTs; entries are keyed by
-        scene, burst, and grid identity.
+        Shared cache for reference-scene geo2rdr LUTs. Entries are
+        content-addressed inside :func:`build_geo2rdr_lut`; the per-scene
+        key is only a readable namespace, so every date pair solving the
+        same reference geometry, DEM, and grid reuses one entry.
     geo_footprint_mask_enabled : bool, optional
         When True (default), crop the geo LUT with the eight-point burst
         hull and skip destination pixels outside the dilated footprint.
@@ -1628,25 +1627,20 @@ def stage_coregister(
         state.geo_bbox = (burst_row0, burst_row1, burst_col0, burst_col1)
         if prepared_geo_lut is None:
             substage_started = _clock_start(device)
-            from faninsar.processing.geocoding.geo_lut import geo_grid_hash
-
-            lut_cache_key = None
             lut_cache_dir = (
                 Path(geo_lut_cache_dir) if geo_lut_cache_dir is not None else None
             )
+            lut_cache_key = None
             if lut_cache_dir is not None:
                 reference_scene = str(state.primary.scene_id)
                 primary_swath = str(getattr(state.primary.swath, "swath", ""))
                 reference_burst = int(
                     getattr(getattr(state.primary, "burst", None), "index", 0)
                 )
-                mask_applied = footprint_lonlat is not None
-                lut_cache_key = (
-                    f"{reference_scene}_{primary_swath}_b{reference_burst}_"
-                    f"{geo_grid_hash(geo_grid)}_"
-                    f"m{int(geo_footprint_mask_enabled)}_"
-                    f"a{int(mask_applied)}_d64_8pt-hull-v1"
-                )
+                # Readable namespace only: the on-disk identity is derived
+                # from geometry/orbit/DEM/grid/solver content inside
+                # build_geo2rdr_lut, so this string cannot cause false hits.
+                lut_cache_key = f"{reference_scene}_{primary_swath}_b{reference_burst}"
             lut_timings: dict[str, float] = {}
             lut = build_geo2rdr_lut(
                 geometry=state.primary.geometry,
@@ -1685,7 +1679,6 @@ def stage_coregister(
             offsets=offsets,
             output_dir=work_directory / "slc",
             row_chunk=geo_chunk_size,
-            executor="torch",
             device=resolved_torch_device,
             dask_client=dask_client,
             watchdog=memory_watchdog,
@@ -2377,45 +2370,6 @@ def stage_baseline(state: ProductionPairState) -> ProductionPairState:
         f"BASELINE parallel={state.baseline.parallel_m:.1f} m "
         f"perp={state.baseline.perpendicular_m:.1f} m"
     )
-    return state
-
-
-def stage_geocode(
-    state: ProductionPairState,
-    *,
-    device: str,
-    chunk_size: tuple[int, int] = (256, 256),
-) -> ProductionPairState:
-    """Geocode unwrapped phase and coherence with chunked vectorized rdr2geo."""
-    if state.unwrapped_phase is None or state.coherence is None:
-        reject_invalid_state("geocode requires unwrap")
-    height, width = state.unwrapped_phase.shape
-    full_h, full_w = state.primary.array.samples.shape
-    az_scale = full_h / max(height, 1)
-    rg_scale = full_w / max(width, 1)
-    az = np.arange(height, dtype=np.float64) * az_scale
-    rg = np.arange(width, dtype=np.float64) * rg_scale
-    az_grid, rg_grid = np.meshgrid(az, rg, indexing="ij")
-    transform = run_rdr2geo_chunked(
-        state.primary.geometry,
-        az_grid,
-        rg_grid,
-        state.dem,
-        device=device,
-        chunk_size=chunk_size,
-    )
-    unw = np.where(transform.converged, state.unwrapped_phase, np.nan)
-    coh = np.where(transform.converged, state.coherence, np.nan)
-    state.geocoded = {
-        "unwrapped_phase": unw.astype(np.float32),
-        "coherence": coh.astype(np.float32),
-        "latitude_deg": transform.latitude_deg.astype(np.float64),
-        "longitude_deg": transform.longitude_deg.astype(np.float64),
-        "height_m": transform.height_m.astype(np.float64),
-        "converged": transform.converged.astype(np.uint8),
-    }
-    n_ok = int(np.count_nonzero(transform.converged))
-    state.note(f"GEOCODE converged={n_ok}/{transform.converged.size}")
     return state
 
 

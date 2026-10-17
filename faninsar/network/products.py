@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from faninsar.core.pair import Pair
+    from faninsar.processing.geocoding.geo_resample import GeocodeKind
 
 logger = setup_logger(__name__)
 
@@ -66,6 +67,26 @@ class AssetKind(StrEnum):
     # vocabulary.  StrEnum aliases do not create additional enum values.
     COMPLEX = "complex_interferogram"
     SCALAR = "displacement"
+
+
+# The geocoding resampling kernel is uniquely determined by the asset kind —
+# never inferred from a dtype.  Complex interferograms keep Lanczos-4 (phase
+# preserving); wrapped phase is cyclic and resamples exp(i*phi) before taking
+# the angle; every smooth real quantity is bilinear.  Unwrapped phase rides
+# the continuous kernel: bilinear is locally unreliable across connectivity
+# component boundaries (2*pi jumps between components), a documented
+# limitation rather than a different kernel.
+ASSET_KIND_GEOCODE_KERNELS: Mapping[AssetKind, GeocodeKind] = MappingProxyType(
+    {
+        AssetKind.COMPLEX_INTERFEROGRAM: "complex",
+        AssetKind.WRAPPED_PHASE: "phase",
+        AssetKind.UNWRAPPED_PHASE: "continuous",
+        AssetKind.DISPLACEMENT: "continuous",
+        AssetKind.LOS: "continuous",
+        AssetKind.AMPLITUDE: "continuous",
+        AssetKind.COHERENCE: "continuous",
+    }
+)
 
 
 class AssetTransformOperation(StrEnum):
@@ -589,6 +610,7 @@ class Interferogram:
 
 
 __all__ = [
+    "ASSET_KIND_GEOCODE_KERNELS",
     "AcquisitionKey",
     "AssetKind",
     "AssetTransform",

@@ -50,6 +50,11 @@ INTERFEROGRAM_ASSETS: tuple[InterferogramAssetName, ...] = (
     "conncomp",
 )
 
+# Reader assets resampled as smooth continuous fields (bilinear).  Wrapped
+# phase is intentionally absent: it is cyclic and rides the complex-average
+# path in PHASE_ASSETS instead.  Membership mirrors the Network kernel table
+# ``ASSET_KIND_GEOCODE_KERNELS`` in faninsar.network.products and is pinned
+# by tests/network/test_asset_kernel_map.py.
 CONTINUOUS_ASSETS: frozenset[str] = frozenset(
     {
         "incidence",
@@ -57,9 +62,9 @@ CONTINUOUS_ASSETS: frozenset[str] = frozenset(
         "heading",
         "dem",
         "unw_phase",
+        "coherence",
         "los_disp",
         "vert_disp",
-        "wrapped_phase",
         "amplitude",
     }
 )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -299,12 +300,19 @@ def footprint_polygon_mask(
 ) -> np.ndarray:
     """Return a bool mask of grid pixels inside the burst footprint polygon.
 
+    The inside test and the dilation are evaluated on a context box derived
+    only from the polygon bounding box, the dilation radius, and the grid —
+    never on the request window — so the mask for a window is exactly the
+    corresponding slice of the mask of any larger window. Cached LUT entries
+    and fresh small-window builds therefore agree bitwise at the hull edge.
+
     Parameters
     ----------
     grid : GeoGridSpec
         Geographic grid.
     row0, row1, col0, col1 : int
-        Bounding box to mask (half-open).
+        Bounding box to mask (half-open). This window only selects the
+        returned slice of the window-independent mask.
     footprint_lonlat : numpy.ndarray
         ``(N, 2)`` polygon vertices in (lon, lat).
     dilate_px : int, optional
@@ -322,10 +330,14 @@ def footprint_polygon_mask(
     from matplotlib.path import Path
     from pyproj import Transformer
 
+    window = np.zeros((row1 - row0, col1 - col0), dtype=bool)
+    polygon_lonlat = np.asarray(footprint_lonlat, dtype=np.float64)
+    if polygon_lonlat.size == 0:
+        return window
     transformer = Transformer.from_crs("EPSG:4326", grid.crs, always_xy=True)
     xs, ys = transformer.transform(
-        footprint_lonlat[:, 0],
-        footprint_lonlat[:, 1],
+        polygon_lonlat[:, 0],
+        polygon_lonlat[:, 1],
     )
     x0, dx, y0, dy = _grid_axes(grid)
     polygon = np.column_stack(
@@ -334,19 +346,45 @@ def footprint_polygon_mask(
             (y0 - np.asarray(ys)) / (-dy) - 0.5,
         ]
     )
+    dilate = int(dilate_px)
+    # Context covering the polygon plus its full dilation halo, clipped only
+    # to the grid. Clipping cannot truncate the halo: any grid pixel outside
+    # the context is farther than ``dilate_px`` from the polygon bounding box,
+    # so the context distance transform equals the full-grid one everywhere.
+    context_row0 = max(0, int(np.floor(polygon[:, 1].min())) - dilate)
+    context_row1 = min(
+        int(grid.height),
+        int(np.ceil(polygon[:, 1].max())) + 1 + dilate,
+    )
+    context_col0 = max(0, int(np.floor(polygon[:, 0].min())) - dilate)
+    context_col1 = min(
+        int(grid.width),
+        int(np.ceil(polygon[:, 0].max())) + 1 + dilate,
+    )
     path = Path(polygon)
-    rows = np.arange(row0, row1)
-    cols = np.arange(col0, col1)
+    rows = np.arange(context_row0, context_row1)
+    cols = np.arange(context_col0, context_col1)
     rr, cc = np.meshgrid(rows, cols, indexing="ij")
     pts = np.column_stack([cc.ravel(), rr.ravel()])
-    inside = path.contains_points(pts)
-    mask = inside.reshape(rr.shape)
-    if dilate_px > 0:
+    mask = path.contains_points(pts).reshape(rr.shape)
+    if dilate > 0:
         from scipy.ndimage import distance_transform_cdt
 
         distance = distance_transform_cdt(~mask, metric="chessboard")
-        mask = distance <= float(dilate_px)
-    return mask
+        mask = distance <= float(dilate)
+    intersect_row0 = max(row0, context_row0)
+    intersect_row1 = min(row1, context_row1)
+    intersect_col0 = max(col0, context_col0)
+    intersect_col1 = min(col1, context_col1)
+    if intersect_row0 < intersect_row1 and intersect_col0 < intersect_col1:
+        window[
+            intersect_row0 - row0 : intersect_row1 - row0,
+            intersect_col0 - col0 : intersect_col1 - col0,
+        ] = mask[
+            intersect_row0 - context_row0 : intersect_row1 - context_row0,
+            intersect_col0 - context_col0 : intersect_col1 - context_col0,
+        ]
+    return window
 
 
 def _lonlat_ring_to_grid_px(
@@ -513,201 +551,421 @@ def grid_lonlat_rows(
     )
 
 
-def geo_grid_hash(grid: GeoGridSpec) -> str:
-    """Return a stable short hash identifying the geographic grid layout."""
-    payload = "|".join(
-        str(part)
-        for part in (
-            grid.crs,
-            tuple(grid.transform),
-            int(grid.width),
-            int(grid.height),
-        )
-    )
-    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
-
-
 _LUT_CACHE_ARRAY_FILES = (
     "reference_azimuth.float64",
     "reference_range.float64",
     "reference_valid.bool",
     "height.float64",
 )
+_LUT_CACHE_ARRAY_DTYPES = {
+    "reference_azimuth.float64": np.float64,
+    "reference_range.float64": np.float64,
+    "reference_valid.bool": np.bool_,
+    "height.float64": np.float64,
+}
 _LUT_CACHE_META_NAME = "meta.json"
-_LUT_MASK_ALGORITHM = "8pt-hull-v1"
+# Schema pins every convention the stored content depends on: the pixel-centre
+# coordinate convention, the converged/in-bounds validity rule, the
+# window-independent eight-point hull prefilter constants and its
+# generation-per-entry publish layout, the float64/bool array dtypes, and the
+# fallback-filled mean-height rule used to recompute ``height_m`` on load.
+_LUT_CACHE_SCHEMA = "faninsar.geo2rdr-lut.v3:8pt-hull-v2:fallback-filled-mean-v1"
+# geo2rdr solver settings fixed by this builder, passed explicitly to
+# ``run_geo2rdr``, and folded into the content key so changed defaults can
+# never silently hit a stale entry. The values here are exactly what the
+# solver runs with on every (re)build.
+_LUT_GEO2RDR_SOLVER = {
+    "max_iter": 20,
+    "extra_iter": 0,
+    "range_tol_m": 0.01,
+    "doppler_tol_hz": 0.1,
+}
+_LUT_WINDOW_DIR_PATTERN = re.compile(r"^w(\d+)-(\d+)-(\d+)-(\d+)$")
+_LUT_GENERATION_DIR_PATTERN = re.compile(r"^g(\d+)$")
 
 
-def _lut_cache_path(
-    cache_dir: str | Path | None,
-    cache_key: str | None,
-) -> Path | None:
-    """Return the cache entry directory, or ``None`` when caching is off."""
-    if cache_dir is None and cache_key is None:
-        return None
-    if cache_dir is None or cache_key is None:
-        reject_invalid_state("geo2rdr LUT cache requires both cache_dir and cache_key")
-    safe_key = "".join(
-        ch if ch.isalnum() or ch in "-_." else "_" for ch in str(cache_key)
+def _canonical_digest(payload: object) -> str:
+    """Return a deterministic SHA-256 digest for JSON-compatible values."""
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     )
-    return Path(cache_dir) / safe_key
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _load_cached_lut(
-    cache_path: Path,
-    *,
-    crop_shape: tuple[int, int],
-    full_radar_shape: tuple[int, int],
-    grid: GeoGridSpec,
-    row0: int,
-    col0: int,
-    footprint_applied: bool = False,
-    footprint_dilate_px: int = 64,
-) -> tuple[float, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] | None:
-    """Load a cached LUT when its identity matches; otherwise return ``None``."""
-    mismatch = _lut_cache_mismatch_reason(
-        cache_path,
-        crop_shape=crop_shape,
-        full_radar_shape=full_radar_shape,
-        grid=grid,
-        row0=row0,
-        col0=col0,
-        footprint_applied=footprint_applied,
-        footprint_dilate_px=footprint_dilate_px,
+def _safe_cache_component(value: str) -> str:
+    """Sanitize one caller-supplied path component (readable namespace)."""
+    return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in str(value))
+
+
+def _window_dir_name(window: tuple[int, int, int, int]) -> str:
+    """Return the entry subdirectory name for a ``(row0, col0, row1, col1)`` window."""
+    row0, col0, row1, col1 = (int(value) for value in window)
+    return f"w{row0}-{col0}-{row1}-{col1}"
+
+
+def _parse_window_dir_name(name: str) -> tuple[int, int, int, int] | None:
+    """Parse a ``w{row0}-{col0}-{row1}-{col1}`` entry name, or return ``None``."""
+    match = _LUT_WINDOW_DIR_PATTERN.match(name)
+    if match is None:
+        return None
+    return (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3)),
+        int(match.group(4)),
     )
-    if mismatch is not None:
-        if mismatch != "missing":
-            logger.warning("geo2rdr LUT cache %s %s", cache_path, mismatch)
-        return None
-    meta_path = cache_path / _LUT_CACHE_META_NAME
+
+
+def _generation_dir(entry: Path, generation: int) -> Path:
+    """Return the array directory of one entry generation."""
+    return entry / f"g{int(generation)}"
+
+
+def _referenced_generation(entry: Path) -> int:
+    """Return the highest generation any on-disk state could reference.
+
+    Scans both the published ``meta.json`` and the generation directories so
+    a partially written generation from a crashed publisher is never reused:
+    the next publish always allocates a strictly higher number.
+    """
+    highest = 0
     try:
-        import json
-
-        meta = json.loads(meta_path.read_text())
-        arrays = []
-        for name in _LUT_CACHE_ARRAY_FILES:
-            path = cache_path / name
-            dtype = {
-                "reference_azimuth.float64": np.float64,
-                "reference_range.float64": np.float64,
-                "reference_valid.bool": np.bool_,
-                "height.float64": np.float64,
-            }[name]
-            arrays.append(np.memmap(path, mode="r", dtype=dtype, shape=crop_shape))
-        return float(meta["mean_height"]), (arrays[0], arrays[1], arrays[2], arrays[3])
-    except (OSError, ValueError, KeyError) as exc:
-        logger.warning("geo2rdr LUT cache %s unusable (%s); rebuilding", meta_path, exc)
-        return None
+        published = json.loads((entry / _LUT_CACHE_META_NAME).read_text())
+        generation = (
+            published.get("generation") if isinstance(published, dict) else None
+        )
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            highest = max(highest, int(generation))
+    except (OSError, ValueError, TypeError):
+        pass
+    if entry.is_dir():
+        for child in entry.iterdir():
+            match = _LUT_GENERATION_DIR_PATTERN.match(child.name)
+            if match is not None and child.is_dir():
+                highest = max(highest, int(match.group(1)))
+    return highest
 
 
-def _lut_cache_mismatch_reason(  # noqa: PLR0911
-    cache_path: Path,
+def _lut_identity_payload(
     *,
-    crop_shape: tuple[int, int],
-    full_radar_shape: tuple[int, int],
+    geometry: RadarGeometryModel,
     grid: GeoGridSpec,
-    row0: int,
-    col0: int,
-    footprint_applied: bool = False,
-    footprint_dilate_px: int = 64,
-) -> str | None:
-    """Return ``None`` when the cache entry is usable, else why it is not."""
-    import json
+    full_radar_shape: tuple[int, int],
+    height_m: float | np.ndarray,
+    dem: DEM | None,
+    footprint_lonlat: np.ndarray | None,
+    footprint_dilate_px: int,
+) -> tuple[dict[str, object], str]:
+    """Return the full content identity and its digest for one LUT build.
 
-    meta_path = cache_path / _LUT_CACHE_META_NAME
-    if not meta_path.exists():
-        return "missing"
-    try:
-        meta = json.loads(meta_path.read_text())
-    except OSError as exc:
-        return f"unreadable meta ({exc})"
-    expected: dict[str, object] = {
-        "crop_shape": [int(crop_shape[0]), int(crop_shape[1])],
+    The payload covers the schema version (coordinate convention, validity
+    rule, hull constants, dtypes, height rule), the geometry model and orbit
+    content, the DEM content identity, the fallback height, the grid CRS and
+    full-precision affine coefficients (shape excluded on purpose), the
+    pinned solver settings, the full radar shape, and the footprint-hull
+    prefilter marker. Request-specific choices (ROI polygon, ROI dilation,
+    chunking, and the destination window) are deliberately excluded: masks
+    are overlaid at load time and windows slice existing entries.
+    """
+    from faninsar.processing.geometry.api import dem_content_identity
+    from faninsar.processing.geometry.torch_backends_v2 import (
+        _array_digest,
+        _model_digests,
+    )
+
+    model_digest, orbit_digest = _model_digests(geometry)
+    if np.isscalar(height_m):
+        fallback_identity: dict[str, object] = {
+            "mode": "scalar",
+            "height_m": float(height_m),
+        }
+    else:
+        fallback_identity = {
+            "mode": "array",
+            "digest": _array_digest(np.asarray(height_m, dtype=np.float64)),
+        }
+    prefilter: dict[str, object] | None = None
+    if footprint_lonlat is not None:
+        prefilter = {
+            "polygon": _array_digest(np.asarray(footprint_lonlat, dtype=np.float64)),
+            "dilate_px": int(footprint_dilate_px),
+        }
+    payload: dict[str, object] = {
+        "schema": _LUT_CACHE_SCHEMA,
+        "geometry_model": model_digest,
+        "geometry_orbit": orbit_digest,
+        "dem": dem_content_identity(dem),
+        "fallback_height": fallback_identity,
+        "grid": {
+            "crs": str(grid.crs),
+            "transform": [float(value) for value in tuple(grid.transform)[:6]],
+        },
+        "solver": dict(_LUT_GEO2RDR_SOLVER),
         "full_radar_shape": [int(full_radar_shape[0]), int(full_radar_shape[1])],
-        "bbox": [int(row0), int(col0)],
-        "grid_hash": geo_grid_hash(grid),
+        "footprint_prefilter": prefilter,
     }
-    actual = {
-        "crop_shape": meta.get("crop_shape"),
-        "full_radar_shape": meta.get("full_radar_shape"),
-        "bbox": [
-            int(meta.get("row0", -1)),
-            int(meta.get("col0", -1)),
+    return payload, _canonical_digest(payload)
+
+
+def _lut_entry_meta(
+    *,
+    key_digest: str,
+    identity: dict[str, object],
+    window: tuple[int, int, int, int],
+    full_radar_shape: tuple[int, int],
+    fallback_height: float,
+) -> dict[str, object]:
+    """Return the published metadata for one cache entry."""
+    return {
+        "schema": _LUT_CACHE_SCHEMA,
+        "key_digest": key_digest,
+        "identity": identity,
+        "window": [int(value) for value in window],
+        "full_radar_shape": [
+            int(full_radar_shape[0]),
+            int(full_radar_shape[1]),
         ],
-        "grid_hash": str(meta.get("grid_hash")),
+        "fallback_height": float(fallback_height),
     }
-    for key, want in expected.items():
-        if actual[key] != want:
-            return f"{key} mismatch"
-    stored_algorithm = meta.get("mask_algorithm")
-    if stored_algorithm is None or stored_algorithm != _LUT_MASK_ALGORITHM:
-        return "mask_algorithm mismatch"
-    if "footprint_applied" not in meta:
-        return "footprint_applied missing"
-    if bool(meta["footprint_applied"]) != bool(footprint_applied):
-        return "footprint_applied mismatch"
-    if "footprint_dilate_px" not in meta:
-        return "footprint_dilate_px missing"
-    if int(meta["footprint_dilate_px"]) != int(footprint_dilate_px):
-        return "footprint_dilate_px mismatch"
-    missing_arrays = [
-        name for name in _LUT_CACHE_ARRAY_FILES if not (cache_path / name).exists()
-    ]
-    if missing_arrays:
-        return f"missing arrays {missing_arrays}"
-    return None
 
 
-def _materialize_work_lut_files(storage_dir: Path, cache_path: Path) -> None:
-    """Expose cached arrays under ``storage_dir`` for downstream reopen."""
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    for name in _LUT_CACHE_ARRAY_FILES:
-        src = cache_path / name
-        dst = storage_dir / name
-        if dst.exists():
+def _find_cached_lut_entry(
+    key_dir: Path,
+    window: tuple[int, int, int, int],
+) -> Path | None:
+    """Return the tightest entry directory whose window contains ``window``."""
+    if not key_dir.is_dir():
+        return None
+    row0, col0, row1, col1 = window
+    best: Path | None = None
+    best_area: int | None = None
+    for child in sorted(key_dir.iterdir()):
+        entry_window = _parse_window_dir_name(child.name)
+        if entry_window is None or not child.is_dir():
             continue
-        try:
-            os.link(src, dst)
-        except OSError:
-            shutil.copyfile(src, dst)
+        entry_row0, entry_col0, entry_row1, entry_col1 = entry_window
+        if (
+            entry_row0 <= row0
+            and entry_col0 <= col0
+            and entry_row1 >= row1
+            and entry_col1 >= col1
+        ):
+            area = (entry_row1 - entry_row0) * (entry_col1 - entry_col0)
+            if best_area is None or area < best_area:
+                best = child
+                best_area = area
+    return best
 
 
-def _store_lut_cache(
-    cache_path: Path,
-    storage_dir: Path,
+def _load_cached_lut_entry(
+    entry: Path,
     *,
-    crop_shape: tuple[int, int],
+    key_digest: str,
+    identity: dict[str, object],
     full_radar_shape: tuple[int, int],
-    grid: GeoGridSpec,
-    row0: int,
-    col0: int,
-    mean_height: float,
-    mask_algorithm: str = _LUT_MASK_ALGORITHM,
-    footprint_dilate_px: int = 64,
-    footprint_applied: bool = False,
-) -> None:
-    """Persist the freshly built LUT as a reusable cache entry."""
-    cache_path.mkdir(parents=True, exist_ok=True)
+) -> tuple[dict[str, object], dict[str, np.memmap]] | None:
+    """Load one entry read-only when its metadata validates; else ``None``.
+
+    Corrupted metadata (including ``JSONDecodeError``, a ``ValueError``
+    subclass), a digest/identity disagreement with the recomputed identity,
+    and any array disagreement — including a generation directory whose
+    files were cleaned up or never finished publishing — are treated as a
+    cache miss so the caller rebuilds and republishes the entry. The reader
+    opens only the files of the one generation named by the meta it read, so
+    it can never mix arrays across generations.
+    """
+    try:
+        meta = json.loads((entry / _LUT_CACHE_META_NAME).read_text())
+        if not isinstance(meta, dict):
+            reason = "meta is not a JSON object"
+        elif meta.get("schema") != _LUT_CACHE_SCHEMA:
+            reason = "schema mismatch"
+        elif meta.get("key_digest") != key_digest:
+            reason = "key_digest mismatch"
+        elif meta.get("identity") != identity:
+            reason = "stored identity mismatch"
+        elif tuple(
+            int(value) for value in meta.get("window", ())
+        ) != _parse_window_dir_name(entry.name):
+            reason = "window mismatch"
+        elif tuple(int(value) for value in meta.get("full_radar_shape", ())) != (
+            int(full_radar_shape[0]),
+            int(full_radar_shape[1]),
+        ):
+            reason = "full_radar_shape mismatch"
+        elif (
+            not isinstance(meta.get("generation"), int)
+            or isinstance(meta.get("generation"), bool)
+            or int(meta["generation"]) < 1
+        ):
+            reason = "invalid generation"
+        else:
+            reason = None
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # json.JSONDecodeError is a ValueError: truncated or corrupt entries
+        # are misses, never exceptions escaping into the build path.
+        logger.warning(
+            "geo2rdr LUT cache entry %s unreadable (%s); treating as miss",
+            entry,
+            exc,
+        )
+        return None
+    if reason is not None:
+        logger.warning(
+            "geo2rdr LUT cache entry %s unusable (%s); rebuilding",
+            entry,
+            reason,
+        )
+        return None
+    stored_window = tuple(int(value) for value in meta["window"])
+    rows = stored_window[2] - stored_window[0]
+    cols = stored_window[3] - stored_window[1]
+    generation_dir = _generation_dir(entry, int(meta["generation"]))
+    arrays: dict[str, np.memmap] = {}
     for name in _LUT_CACHE_ARRAY_FILES:
-        src = storage_dir / name
-        dst = cache_path / name
-        if dst.exists():
-            continue
+        path = generation_dir / name
+        expected_bytes = rows * cols * np.dtype(_LUT_CACHE_ARRAY_DTYPES[name]).itemsize
         try:
-            os.link(src, dst)
-        except OSError:
-            shutil.copyfile(src, dst)
-    meta = {
-        "crop_shape": [int(crop_shape[0]), int(crop_shape[1])],
-        "full_radar_shape": [int(full_radar_shape[0]), int(full_radar_shape[1])],
-        "grid_hash": geo_grid_hash(grid),
-        "row0": int(row0),
-        "col0": int(col0),
-        "mean_height": float(mean_height),
-        "mask_algorithm": str(mask_algorithm),
-        "footprint_dilate_px": int(footprint_dilate_px),
-        "footprint_applied": bool(footprint_applied),
-    }
-    (cache_path / _LUT_CACHE_META_NAME).write_text(json.dumps(meta))
+            if path.stat().st_size != expected_bytes:
+                logger.warning(
+                    "geo2rdr LUT cache entry %s unusable (array size mismatch: %s); "
+                    "rebuilding",
+                    entry,
+                    name,
+                )
+                return None
+            arrays[name] = np.memmap(
+                path,
+                mode="r",
+                dtype=_LUT_CACHE_ARRAY_DTYPES[name],
+                shape=(rows, cols),
+            )
+        except OSError as exc:
+            logger.warning(
+                "geo2rdr LUT cache entry %s unreadable (%s); treating as miss",
+                entry,
+                exc,
+            )
+            return None
+    return meta, arrays
+
+
+def _publish_lut_entry(
+    entry: Path,
+    arrays: dict[str, np.ndarray],
+    meta: dict[str, object],
+) -> None:
+    """Publish one cache entry as a new generation; ``meta.json`` lands last.
+
+    Arrays are written into a fresh ``g<N>`` generation directory that no
+    ``meta.json`` has ever referenced, so a concurrent reader can never see
+    partially replaced arrays: it either reads the previous generation named
+    by the old meta or the new one named by the new meta, both complete.
+    The generation number is allocated strictly above every number that any
+    on-disk meta or directory ever used, so a published generation is never
+    overwritten. Superseded generations are removed best-effort, keeping the
+    immediately previous one as a grace window for readers that read the old
+    meta but have not opened its files yet; POSIX readers holding open mmaps
+    of deleted files keep reading them, and readers that lose the race get a
+    miss and rebuild.
+    """
+    entry.mkdir(parents=True, exist_ok=True)
+    generation = _referenced_generation(entry) + 1
+    generation_dir = _generation_dir(entry, generation)
+    token = f".tmp-{os.getpid()}-{time.time_ns()}"
+    created = False
+    try:
+        generation_dir.mkdir()
+        created = True
+        for name, array in arrays.items():
+            np.ascontiguousarray(array).tofile(generation_dir / name)
+        published = {**meta, "generation": int(generation)}
+        temporary = entry / f"{_LUT_CACHE_META_NAME}{token}"
+        temporary.write_text(json.dumps(published, sort_keys=True))
+        temporary.replace(entry / _LUT_CACHE_META_NAME)
+    except BaseException:
+        if created:
+            shutil.rmtree(generation_dir, ignore_errors=True)
+        (entry / f"{_LUT_CACHE_META_NAME}{token}").unlink(missing_ok=True)
+        raise
+    # Best-effort retention of the current and immediately previous
+    # generations; failures never fail the publish.
+    keep = {generation, generation - 1}
+    for child in entry.iterdir():
+        match = _LUT_GENERATION_DIR_PATTERN.match(child.name)
+        if match is None or not child.is_dir():
+            continue
+        if int(match.group(1)) in keep:
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+
+
+def _allocate_lut_arrays(
+    storage_dir: Path | None,
+    crop_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Allocate fresh writable LUT arrays, memmap-backed when ``storage_dir`` is set."""
+    if storage_dir is None:
+        return (
+            np.full(crop_shape, np.nan, dtype=np.float64),
+            np.full(crop_shape, np.nan, dtype=np.float64),
+            np.zeros(crop_shape, dtype=bool),
+            np.full(crop_shape, np.nan, dtype=np.float64),
+        )
+    directory = Path(storage_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    return (
+        np.memmap(
+            directory / "reference_azimuth.float64",
+            mode="w+",
+            dtype=np.float64,
+            shape=crop_shape,
+        ),
+        np.memmap(
+            directory / "reference_range.float64",
+            mode="w+",
+            dtype=np.float64,
+            shape=crop_shape,
+        ),
+        np.memmap(
+            directory / "reference_valid.bool",
+            mode="w+",
+            dtype=np.bool_,
+            shape=crop_shape,
+        ),
+        np.memmap(
+            directory / "height.float64",
+            mode="w+",
+            dtype=np.float64,
+            shape=crop_shape,
+        ),
+    )
+
+
+def _apply_request_mask(
+    azimuth: np.ndarray,
+    range_index: np.ndarray,
+    valid: np.ndarray,
+    height_lookup: np.ndarray,
+    mask: np.ndarray,
+) -> None:
+    """Overlay a request-specific validity mask on LUT arrays in place."""
+    outside = ~np.asarray(mask, dtype=bool)
+    azimuth[outside] = np.nan
+    range_index[outside] = np.nan
+    height_lookup[outside] = np.nan
+    valid &= mask
+
+
+def _filled_mean_height(height_lookup: np.ndarray, fallback_height: float) -> float:
+    """Mean height after fallback-filling unsampled pixels (schema-pinned rule)."""
+    if height_lookup.size == 0:
+        return float(fallback_height)
+    filled = np.where(np.isfinite(height_lookup), height_lookup, fallback_height)
+    return float(np.mean(filled))
 
 
 def build_geo2rdr_lut(
@@ -732,6 +990,18 @@ def build_geo2rdr_lut(
 ) -> Geo2RdrLUT:
     """Build a reusable geographic-to-radar lookup table.
 
+    The disk cache is content-addressed: ``cache_key`` is only a readable
+    namespace, while the on-disk identity is derived inside this builder
+    from the schema version, geometry model and orbit content, DEM content,
+    fallback height, grid CRS and full-precision affine coefficients, pinned
+    solver settings, ``full_radar_shape``, and the footprint-hull prefilter.
+    The ROI polygon and its dilation are request-specific and never enter
+    the identity: entries are solved without them and the mask is overlaid
+    on the returned arrays at load time. Entries are stored per destination
+    window; a request whose window is contained in an existing entry is
+    served by slicing that entry, and a non-contained request publishes a
+    new entry instead of overwriting.
+
     Parameters
     ----------
     geometry : RadarGeometryModel
@@ -750,14 +1020,14 @@ def build_geo2rdr_lut(
         Destination rows processed per geometry call.
     storage_dir : str or pathlib.Path, optional
         Directory for disk-backed LUT arrays. In-memory arrays are used when
-        omitted.
+        omitted. Required when caching is enabled: the returned arrays always
+        live in this directory and cache entries are published as copies, so
+        work files and cache files never share storage.
     cache_dir : str or pathlib.Path, optional
-        Shared directory for reusable LUT caches keyed by ``cache_key``. When
-        a cache entry exists and matches the grid/radar shape it is loaded
-        instead of recomputing the geometry solve. Requires ``storage_dir``.
+        Shared directory for reusable LUT caches. Requires ``cache_key``.
     cache_key : str, optional
-        Identity of this LUT (reference scene + burst + grid). Required when
-        ``cache_dir`` is given.
+        Readable namespace (scene, swath, burst). Sanitized into one path
+        component; the entry identity itself is content-derived.
     row_range : tuple[int, int], optional
         Half-open row interval of the geographic grid to process. Rows outside
         are left NaN/invalid. When omitted the full grid is processed.
@@ -766,18 +1036,17 @@ def build_geo2rdr_lut(
         NaN/invalid.
     footprint_lonlat : numpy.ndarray, optional
         ``(N, 2)`` burst footprint polygon in (lon, lat). Pixels outside the
-        polygon are skipped without calling geo2rdr, saving most of the
-        wasted iterations in the bbox corners.
+        polygon are skipped without calling geo2rdr. This hull prefilter is
+        part of the cached content and its digest plus ``footprint_dilate_px``
+        enter the identity.
     roi_geometry : shapely Polygon or MultiPolygon, optional
         ROI polygon in (lon, lat). When given (and ``footprint_lonlat`` is
-        omitted) it replaces the footprint polygon as the prefilter mask,
-        allowing arbitrary polygons with holes and multi-part ROIs.
+        omitted) it is overlaid on the returned arrays as a request mask and
+        is excluded from the cache identity.
     polygon_dilate_px : int, optional
-        Dilation radius applied to the footprint mask so edge pixels stay
-        inside the crop and the optimization remains lossless.
+        Dilation radius applied to the request ROI mask.
     footprint_dilate_px : int, optional
-        Dilation applied to the eight-point hull mask, independent of ROI
-        ``polygon_dilate_px``.
+        Dilation applied to the eight-point hull mask; part of the identity.
     timings_out : dict, optional
         Exclusive LUT substages accumulated in seconds (``polygon_mask``,
         ``dem_sample``, ``geo2rdr``, ``store``). Nested observations of the
@@ -789,8 +1058,6 @@ def build_geo2rdr_lut(
         Full-resolution radar coordinates on the destination grid.
 
     """
-    from pathlib import Path
-
     row0, row1 = (
         (0, grid.height)
         if row_range is None
@@ -804,78 +1071,17 @@ def build_geo2rdr_lut(
     col0 = max(0, min(col0, grid.width))
     col1 = max(col0, min(col1, grid.width))
 
-    full_height, full_width = full_radar_shape
+    full_height = int(full_radar_shape[0])
+    full_width = int(full_radar_shape[1])
     crop_shape = (row1 - row0, col1 - col0)
     full_crop = (row_range is not None) or (col_range is not None)
-    cache_path = _lut_cache_path(cache_dir, cache_key)
-    if cache_path is not None:
-        if storage_dir is None:
-            reject_invalid_state(
-                "geo2rdr LUT cache requires storage_dir for downstream reopen"
-            )
-        cached = _load_cached_lut(
-            cache_path,
-            crop_shape=crop_shape,
-            full_radar_shape=(int(full_height), int(full_width)),
-            grid=grid,
-            row0=row0,
-            col0=col0,
-            footprint_applied=footprint_lonlat is not None,
-            footprint_dilate_px=int(footprint_dilate_px),
-        )
-        if cached is not None:
-            mean_height, arrays = cached
-            azimuth, range_index, valid, height_lookup = arrays
-            assert storage_dir is not None
-            _materialize_work_lut_files(Path(storage_dir), cache_path)
-            logger.info(
-                "Reused cached geo2rdr LUT %s: %d/%d valid, radar_shape=%s",
-                cache_key,
-                int(valid.sum()),
-                valid.size,
-                full_radar_shape,
-            )
-            return Geo2RdrLUT(
-                az_full=azimuth,
-                rg_full=range_index,
-                valid=valid,
-                full_radar_shape=(int(full_height), int(full_width)),
-                height_m=mean_height,
-                height_full=height_lookup,
-                row0=row0 if full_crop else 0,
-                col0=col0 if full_crop else 0,
-            )
-    if storage_dir is None:
-        azimuth = np.full(crop_shape, np.nan, dtype=np.float64)
-        range_index = np.full(crop_shape, np.nan, dtype=np.float64)
-        valid = np.zeros(crop_shape, dtype=bool)
-        height_lookup = np.full(crop_shape, np.nan, dtype=np.float64)
-    else:
-        directory = Path(storage_dir)
-        directory.mkdir(parents=True, exist_ok=True)
-        azimuth = np.memmap(
-            directory / "reference_azimuth.float64",
-            mode="w+",
-            dtype=np.float64,
-            shape=crop_shape,
-        )
-        range_index = np.memmap(
-            directory / "reference_range.float64",
-            mode="w+",
-            dtype=np.float64,
-            shape=crop_shape,
-        )
-        valid = np.memmap(
-            directory / "reference_valid.bool",
-            mode="w+",
-            dtype=np.bool_,
-            shape=crop_shape,
-        )
-        height_lookup = np.memmap(
-            directory / "height.float64",
-            mode="w+",
-            dtype=np.float64,
-            shape=crop_shape,
+    window = (row0, col0, row1, col1)
+
+    if (cache_dir is None) != (cache_key is None):
+        reject_invalid_state("geo2rdr LUT cache requires both cache_dir and cache_key")
+    if cache_dir is not None and storage_dir is None:
+        reject_invalid_state(
+            "geo2rdr LUT cache requires storage_dir for downstream reopen"
         )
 
     fallback_height = (
@@ -887,21 +1093,14 @@ def build_geo2rdr_lut(
             f"height_m shape {height_array.shape} does not match crop {crop_shape}"
         )
 
-    mean_heights: list[float] = []
-    polygon_mask: np.ndarray | None = None
+    # The ROI polygon is request-specific: it never bakes into the cached
+    # solve and is overlaid on the returned arrays on both the fresh and the
+    # cached path. The footprint hull stays inside the solve because it is
+    # content-determined and folded into the identity above.
     mask_started = time.perf_counter()
-    if footprint_lonlat is not None:
-        polygon_mask = footprint_polygon_mask(
-            grid,
-            row0,
-            row1,
-            col0,
-            col1,
-            np.asarray(footprint_lonlat),
-            dilate_px=footprint_dilate_px,
-        )
-    elif roi_geometry is not None:
-        polygon_mask = roi_geo_mask(
+    request_mask: np.ndarray | None = None
+    if footprint_lonlat is None and roi_geometry is not None:
+        request_mask = roi_geo_mask(
             roi_geometry,
             grid,
             row0,
@@ -909,6 +1108,89 @@ def build_geo2rdr_lut(
             col0,
             col1,
             dilate_px=polygon_dilate_px,
+        )
+    _add_timing(timings_out, "polygon_mask", mask_started)
+
+    key_dir: Path | None = None
+    if cache_dir is not None:
+        assert cache_key is not None
+        identity, key_digest = _lut_identity_payload(
+            geometry=geometry,
+            grid=grid,
+            full_radar_shape=(full_height, full_width),
+            height_m=height_m,
+            dem=dem,
+            footprint_lonlat=footprint_lonlat,
+            footprint_dilate_px=footprint_dilate_px,
+        )
+        key_dir = Path(cache_dir) / _safe_cache_component(str(cache_key)) / key_digest
+        entry = _find_cached_lut_entry(key_dir, window)
+        if entry is not None:
+            loaded = _load_cached_lut_entry(
+                entry,
+                key_digest=key_digest,
+                identity=identity,
+                full_radar_shape=(full_height, full_width),
+            )
+            if loaded is not None:
+                meta, stored = loaded
+                stored_window = [
+                    int(value)
+                    for value in meta["window"]  # type: ignore[union-attr]
+                ]
+                row_slice = slice(row0 - stored_window[0], row1 - stored_window[0])
+                col_slice = slice(col0 - stored_window[1], col1 - stored_window[1])
+                azimuth, range_index, valid, height_lookup = _allocate_lut_arrays(
+                    None if storage_dir is None else Path(storage_dir),
+                    crop_shape,
+                )
+                azimuth[:] = stored["reference_azimuth.float64"][row_slice, col_slice]
+                range_index[:] = stored["reference_range.float64"][row_slice, col_slice]
+                valid[:] = stored["reference_valid.bool"][row_slice, col_slice]
+                height_lookup[:] = stored["height.float64"][row_slice, col_slice]
+                del stored
+                if request_mask is not None:
+                    _apply_request_mask(
+                        azimuth, range_index, valid, height_lookup, request_mask
+                    )
+                for array in (azimuth, range_index, valid, height_lookup):
+                    if isinstance(array, np.memmap):
+                        array.flush()
+                mean_height = _filled_mean_height(height_lookup, fallback_height)
+                logger.info(
+                    "Reused cached geo2rdr LUT %s: %d/%d valid, radar_shape=%s",
+                    key_digest[:12],
+                    int(np.asarray(valid).sum()),
+                    valid.size,
+                    (full_height, full_width),
+                )
+                return Geo2RdrLUT(
+                    az_full=azimuth,
+                    rg_full=range_index,
+                    valid=valid,
+                    full_radar_shape=(full_height, full_width),
+                    height_m=mean_height,
+                    height_full=height_lookup,
+                    row0=row0 if full_crop else 0,
+                    col0=col0 if full_crop else 0,
+                )
+
+    azimuth, range_index, valid, height_lookup = _allocate_lut_arrays(
+        None if storage_dir is None else Path(storage_dir),
+        crop_shape,
+    )
+
+    mask_started = time.perf_counter()
+    hull_mask: np.ndarray | None = None
+    if footprint_lonlat is not None:
+        hull_mask = footprint_polygon_mask(
+            grid,
+            row0,
+            row1,
+            col0,
+            col1,
+            np.asarray(footprint_lonlat),
+            dilate_px=footprint_dilate_px,
         )
     _add_timing(timings_out, "polygon_mask", mask_started)
     for row_start in range(row0, row1, chunk_size):
@@ -924,15 +1206,15 @@ def build_geo2rdr_lut(
             longitude_chunk = longitude_chunk[:, col0:col1]
             finite_geo = finite_geo[:, col0:col1]
         grid_ok = finite_geo.copy()
-        if polygon_mask is not None:
+        if hull_mask is not None:
             poly_rows = slice(row_start - row0, row_stop - row0)
-            finite_geo &= polygon_mask[poly_rows, :]
+            finite_geo &= hull_mask[poly_rows, :]
         safe_latitude = np.where(finite_geo, latitude_chunk, 0.0)
         safe_longitude = np.where(finite_geo, longitude_chunk, 0.0)
         dem_started = time.perf_counter()
         if dem is not None:
             sampled_height = np.full(finite_geo.shape, np.nan, dtype=np.float64)
-            sample_mask = finite_geo if polygon_mask is not None else grid_ok
+            sample_mask = finite_geo if hull_mask is not None else grid_ok
             if sample_mask.any():
                 packed = np.asarray(
                     dem.sample(
@@ -963,8 +1245,6 @@ def build_geo2rdr_lut(
             raw_height = fallback_height
             height_chunk = fallback_height
         height_lookup[row_start - row0 : row_stop - row0, :] = raw_height
-        if not np.isscalar(height_chunk):
-            mean_heights.append(float(np.nanmean(height_chunk)))
         _add_timing(timings_out, "dem_sample", dem_started)
 
         geo2rdr_started = time.perf_counter()
@@ -978,6 +1258,10 @@ def build_geo2rdr_lut(
                 else np.full(finite_geo.shape, height_chunk).reshape(-1)
             ),
             device=device,
+            max_iter=_LUT_GEO2RDR_SOLVER["max_iter"],
+            extra_iter=_LUT_GEO2RDR_SOLVER["extra_iter"],
+            range_tol_m=_LUT_GEO2RDR_SOLVER["range_tol_m"],
+            doppler_tol_hz=_LUT_GEO2RDR_SOLVER["doppler_tol_hz"],
         )
         _add_timing(timings_out, "geo2rdr", geo2rdr_started)
         result_converged = np.asarray(result.converged).reshape(finite_geo.shape)
@@ -1011,43 +1295,52 @@ def build_geo2rdr_lut(
         _add_timing(timings_out, "store", store_started)
 
     flush_started = time.perf_counter()
-    if isinstance(azimuth, np.memmap):
-        azimuth.flush()
-    if isinstance(range_index, np.memmap):
-        range_index.flush()
-    if isinstance(valid, np.memmap):
-        valid.flush()
-    if isinstance(height_lookup, np.memmap):
-        height_lookup.flush()
-    mean_height = float(np.mean(mean_heights)) if mean_heights else fallback_height
-    if cache_path is not None:
+    for array in (azimuth, range_index, valid, height_lookup):
+        if isinstance(array, np.memmap):
+            array.flush()
+    if key_dir is not None:
         assert storage_dir is not None
-        _store_lut_cache(
-            cache_path,
-            Path(storage_dir),
-            crop_shape=crop_shape,
-            full_radar_shape=(int(full_height), int(full_width)),
-            grid=grid,
-            row0=row0,
-            col0=col0,
-            mean_height=mean_height,
-            mask_algorithm=_LUT_MASK_ALGORITHM,
-            footprint_dilate_px=int(footprint_dilate_px),
-            footprint_applied=footprint_lonlat is not None,
+        entry = key_dir / _window_dir_name(window)
+        entry_meta = _lut_entry_meta(
+            key_digest=key_digest,
+            identity=identity,
+            window=window,
+            full_radar_shape=(full_height, full_width),
+            fallback_height=fallback_height,
         )
+        try:
+            _publish_lut_entry(
+                entry,
+                {
+                    "reference_azimuth.float64": azimuth,
+                    "reference_range.float64": range_index,
+                    "reference_valid.bool": valid,
+                    "height.float64": height_lookup,
+                },
+                entry_meta,
+            )
+        except OSError as exc:
+            logger.warning(
+                "geo2rdr LUT cache publish %s failed (%s); continuing uncached",
+                entry,
+                exc,
+            )
     _add_timing(timings_out, "store", flush_started)
+    if request_mask is not None:
+        _apply_request_mask(azimuth, range_index, valid, height_lookup, request_mask)
+    mean_height = _filled_mean_height(height_lookup, fallback_height)
     logger.info(
         "Built geo2rdr LUT: %d/%d valid, radar_shape=%s, mean_height=%.1f m",
-        int(valid.sum()),
+        int(np.asarray(valid).sum()),
         valid.size,
-        full_radar_shape,
+        (full_height, full_width),
         mean_height,
     )
     return Geo2RdrLUT(
         az_full=azimuth,
         rg_full=range_index,
         valid=valid,
-        full_radar_shape=(int(full_height), int(full_width)),
+        full_radar_shape=(full_height, full_width),
         height_m=mean_height,
         height_full=height_lookup,
         row0=0 if not full_crop else row0,

@@ -938,6 +938,12 @@ class S1Stack(Stack):
         from faninsar.missions.s1.coregister import coregister_s1_scene
 
         swaths, bursts = self._resolve_s1_nesd_selection()
+        extra_cache_dir = self.config.extra.get("geo_lut_cache_dir")
+        geo_lut_cache_dir = (
+            Path(extra_cache_dir)
+            if extra_cache_dir is not None
+            else self.config.work_dir / "cache" / "geo-lut"
+        )
         coregister_s1_scene(
             _source_input(self.catalog.paths_for(self.reference)),
             _source_input(self.catalog.paths_for(date_id)),
@@ -950,6 +956,7 @@ class S1Stack(Stack):
             misreg_rg_px=misreg_rg_px,
             coregistration_grid=self.config.coregistration_grid,
             geo_grid=self.config.geo_grid,
+            geo_lut_cache_dir=geo_lut_cache_dir,
             primary_orbit_path=self._orbit_path_for(self.reference),
             secondary_orbit_path=self._orbit_path_for(date_id),
             device=self.config.device,

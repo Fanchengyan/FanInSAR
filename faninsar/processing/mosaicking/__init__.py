@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from .geocode_raster import GeocodedComplex, geocode_complex_to_grid
 from .grid import GeoGridSpec, build_geo_grid
 from .methods import MergeMethod, merge_bursts
 from .mosaic import merge_burst_products
@@ -40,7 +39,6 @@ from .unwrap_seam import (
 __all__ = [
     "BurstGeoProduct",
     "GeoGridSpec",
-    "GeocodedComplex",
     "MergeGraph",
     "MergeGraphStats",
     "MosaicProduct",
@@ -55,7 +53,6 @@ __all__ = [
     "correct_unwrapped_seam_cycles",
     "estimate_edge",
     "estimate_edges",
-    "geocode_complex_to_grid",
     "majority_cycle_align",
     "merge_burst_products",
     "merge_bursts",

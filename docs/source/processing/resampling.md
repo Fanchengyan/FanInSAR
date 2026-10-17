@@ -105,11 +105,12 @@ data type:
 |-----------|-------------------|----------------|-----------|
 | **SLC, wrapped ifg** (complex, full BW) | Lanczos $a=4$ | sinc (windowed), Lanczos $a=6$ | bilinear, nearest, bicubic(Keys) |
 | **Geocoded SLC / GSLC** (NISAR, CSLC) | sinc (raised-cosine windowed) | Lanczos | bilinear |
-| **Coherence (already estimated)** | bilinear | B-spline 4, nearest | sinc (overkill) |
+| **Wrapped phase** (real radians) | $\exp(i\varphi)$ → Lanczos $a=4$ → `angle` | — | bilinear on $\varphi$ (errors up to $\pi$ at jumps) |
+| **Coherence (already estimated, resampled)** | bilinear | B-spline 4, nearest | sinc (overkill) |
 | **Coherence (re-estimation on new grid)** | re-estimate $\gamma$ on resampled SLC pair | — | resample the $\gamma$ estimate |
 | **Amplitude** ($\sqrt{\text{intensity}}$) | Lanczos $a=4$ or B-spline 4 | bilinear | nearest |
 | **Intensity / backscatter** | **resample on $\sqrt{\text{intensity}}$, then square** | — | direct bilinear on intensity |
-| **Unwrapped phase** | bilinear or complex-average | nearest | — |
+| **Unwrapped phase** | bilinear | nearest | — |
 | **DEM / height** | B-spline order 4-5 | bilinear, cubic | nearest |
 | **Incidence / azimuth / heading angles** | bilinear | B-spline, nearest | — |
 | **Hard label mask** (conncomp, layover, water) | nearest | — | bilinear, sinc |
@@ -117,7 +118,44 @@ data type:
 | **Already-multilooked complex** (low BW) | bilinear OK | Lanczos, B-spline | nearest |
 | **Polarimetric C3/C4/T3/T4** | component-wise Lanczos + PD check | — | naive component-wise |
 
+## FanInSAR's geocoding kernel table
+
+FanInSAR fixes the geocoding kernel by the *physical kind* of the quantity —
+never by array dtype — through
+`faninsar.processing.geocoding.geo_resample.sample` and the on-demand entry
+point `Stack.geocode(...)`. The mapping from mission-neutral asset kinds is
+`faninsar.network.products.ASSET_KIND_GEOCODE_KERNELS`:
+
+| Geocode kind | Kernel | Asset kinds |
+|--------------|--------|-------------|
+| `complex` | Lanczos $a=4$ on the complex samples (phase-preserving) | complex interferogram |
+| `phase` | $\exp(i\varphi)$ → Lanczos $a=4$ → `angle`, returned as float32 radians | wrapped phase |
+| `continuous` | bilinear (`map_coordinates` order 1) | unwrapped phase, displacement, LOS, amplitude, coherence |
+| `label` | nearest (`map_coordinates` order 0) | hard integer/boolean classes (explicit `kind` only) |
+
+Notes on specific rows:
+
+- **Wrapped phase** never interpolates $\varphi$ directly: bilinear on the
+  angle produces errors up to $\pi$ wherever the field crosses the wrap.
+  The `phase` kernel averages unit vectors instead, zeroing the magnitude of
+  non-finite input samples and marking destinations invalid when the averaged
+  vector magnitude is negligible.
+- **Coherence** is *resampled*: FanInSAR bilinearly resamples the
+  already-estimated $\gamma$ field during geocoding. Re-estimating
+  $\gamma$ on a resampled SLC pair remains the higher-fidelity alternative
+  of the decision table above.
+- **Unwrapped phase** rides the `continuous` kernel. Bilinear interpolation
+  is *locally unreliable across connected-component boundaries*, where the
+  field jumps by $2\pi$ between components; geocoded products can show
+  ringing along those seams. This is a documented limitation, not a
+  different kernel.
+
 ## Using FanInSAR's resamplers
+
+For geocoding (radar → geographic), prefer the kind-driven engine over the
+primitives below: `faninsar.processing.geocoding.sample(layer, coords,
+kind=...)` and `Stack.geocode(...)` select the kernel from the table above
+and handle validity, dtype checks, and chunking.
 
 ### Lanczos for complex SLC / ifg
 

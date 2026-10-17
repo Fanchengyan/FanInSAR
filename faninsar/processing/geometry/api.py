@@ -868,6 +868,48 @@ class RasterDEM(DEM):
             raise
 
 
+def dem_content_identity(dem: DEM | None) -> str:
+    """Return a stable content identity for a DEM instance.
+
+    Cache identities must depend on DEM *content*, never on a class name:
+    two rasters or two constant heights must not share cache entries. The
+    identity covers materialized rasters through :attr:`RasterDEM.identity`,
+    constant DEMs through their height and vertical datum, and the absent
+    DEM as ``"none"``. Any other DEM type has no content contract yet and is
+    rejected instead of degrading to a type name.
+
+    Parameters
+    ----------
+    dem : DEM or None
+        DEM instance whose content is identified.
+
+    Returns
+    -------
+    str
+        Stable content-identity string suitable for cache keys.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the DEM type has no content-identity rule.
+
+    """
+    if dem is None:
+        return "none"
+    if isinstance(dem, RasterDEM):
+        return f"raster:{dem.identity}"
+    if isinstance(dem, ConstantDEM):
+        return f"constant:{float(dem.height)!r}:{dem.vertical_datum}"
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    message = (
+        f"{type(dem).__module__}.{type(dem).__qualname__} has no content "
+        "identity for cache keys; materialize it with to_raster() first"
+    )
+    logger.error(message)
+    raise InvalidProcessingStateError(message)
+
+
 def ensure_dem_covers_grid(
     dem: RasterDEM,
     grid: GridSpec,
@@ -968,5 +1010,6 @@ __all__ = [
     "RasterDEM",
     "SourceDEM",
     "VerticalDatum",
+    "dem_content_identity",
     "ensure_dem_covers_grid",
 ]

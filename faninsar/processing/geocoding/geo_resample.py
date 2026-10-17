@@ -1,4 +1,19 @@
-"""Resample radar fields through geographic lookup tables."""
+"""Resample radar fields through geographic lookup tables.
+
+The public kernel entry point is :func:`sample`: the resampling kernel is
+uniquely determined by the ``kind`` of the quantity being sampled — never
+inferred from the array dtype — so that every stage geocodes a given layer
+with the same physics:
+
+* ``complex`` — Lanczos-4 windowed sinc on the complex samples (preserves
+  phase; bilinear on real/imag attenuates in-band signal and leaks aliasing).
+* ``phase`` — cyclic wrapped phase: ``exp(i*phi)`` is resampled with
+  Lanczos-4 and the angle of the averaged vector is returned in radians.
+* ``continuous`` — SciPy bilinear for smooth real fields (unwrapped phase,
+  coherence, displacement, amplitude).
+* ``label`` — SciPy nearest for hard integer/boolean classes; interpolation
+  would invent invalid categories.
+"""
 
 from __future__ import annotations
 
@@ -12,17 +27,19 @@ from faninsar.processing.coregistration.resampling import lanczos_resample
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
-    from faninsar.processing.coregistration.offsets import OffsetFieldResult
-    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
+    from faninsar.processing.geocoding.coordinates import RadarCoordinates
 
 __all__ = [
-    "apply_lut_complex",
-    "apply_lut_real",
-    "compose_secondary_coordinates",
+    "GeocodeKind",
     "resample_complex_at_coordinates",
+    "sample",
 ]
 
 logger = setup_logger(__name__)
+
+GeocodeKind = Literal["complex", "phase", "continuous", "label"]
+
+_PHASE_MAGNITUDE_EPSILON = 1e-6
 
 
 def _resample_complex_opencv(
@@ -146,280 +163,195 @@ def resample_complex_at_coordinates(
     return output, coordinate_valid
 
 
-def compose_secondary_coordinates(
-    reference_lut: Geo2RdrLUT,
-    offsets: OffsetFieldResult,
+def sample(
+    layer: np.ndarray,
+    coords: RadarCoordinates,
     *,
-    device: str = "cpu",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compose reference geo2rdr coordinates with dense secondary offsets.
+    kind: GeocodeKind,
+    device: str = "auto",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample one radar layer at radar coordinates with the kernel for ``kind``.
 
-    Secondary radar coordinates follow the reference LUT minus the dense
-    reference-minus-secondary offset field. The offset field is interpolated
-    onto the geographic LUT; it is not a second geo2rdr solve.
+    The kernel is fixed by ``kind``; the layer dtype is validated against the
+    physical type and never used to pick the kernel. Samples outside the
+    layer window or marked invalid in ``coords`` come back NaN (0 for
+    integer labels) with ``valid=False``.
 
     Parameters
     ----------
-    reference_lut : Geo2RdrLUT
-        Reference radar coordinates on the geographic grid.
-    offsets : OffsetFieldResult
-        Dense offsets using ``offset = reference - secondary``.
-    device : str, optional
-        ``cpu`` uses SciPy bilinear ``map_coordinates``. An admitted CUDA
-        identity uses Torch ``grid_sample`` with ``align_corners=True``.
+    layer : numpy.ndarray
+        2-D radar-domain source layer.
+    coords : RadarCoordinates
+        Fractional source coordinates for the destination frame.
+    kind : {"complex", "phase", "continuous", "label"}
+        Physical kind selecting the kernel: ``complex`` (Lanczos-4 on the
+        complex samples), ``phase`` (cyclic wrapped phase through
+        ``exp(i*phi)`` + Lanczos-4 + angle, returned as float32 radians),
+        ``continuous`` (bilinear), or ``label`` (nearest).
+    device : {"auto", "cpu", "cuda"}, optional
+        Torch device for the accelerated Lanczos kernels (``complex`` and
+        ``phase``). The SciPy bilinear/nearest backends (``continuous`` and
+        ``label``) execute on CPU.
 
     Returns
     -------
-    secondary_azimuth, secondary_range, valid : tuple[numpy.ndarray, ...]
-        Fractional secondary source coordinates and validity mask.
+    values, valid : tuple[numpy.ndarray, numpy.ndarray]
+        Sampled destination frame and its validity mask.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If ``kind`` is unknown or the layer dtype does not match the
+        physical type required by ``kind``.
+
+    Notes
+    -----
+    Unwrapped phase sampled as ``continuous`` is locally unreliable across
+    connectivity-component boundaries, where the field jumps by ``2*pi``.
 
     """
-    identity = str(device)
-    if identity.startswith("cuda"):
-        return _compose_secondary_coordinates_torch(reference_lut, offsets, identity)
-    return _compose_secondary_coordinates_numpy(reference_lut, offsets)
+    layer = np.asarray(layer)
+    if kind == "complex":
+        _validate_dtype(layer, kind)
+        return resample_complex_at_coordinates(
+            layer,
+            coords.az,
+            coords.rg,
+            valid=coords.valid,
+            device=device,
+        )
+    if kind == "phase":
+        _validate_dtype(layer, kind)
+        return _sample_phase(layer, coords, device=device)
+    if kind == "continuous":
+        _validate_dtype(layer, kind)
+        return _sample_bilinear(layer, coords)
+    if kind != "label":
+        reject_invalid_state(f"unknown geocode resampling kind: {kind!r}")
+    _validate_dtype(layer, "label")
+    return _sample_nearest(layer, coords)
 
 
-def _compose_secondary_coordinates_numpy(
-    reference_lut: Geo2RdrLUT,
-    offsets: OffsetFieldResult,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """CPU bilinear compose used as the identity oracle."""
+def _validate_dtype(layer: np.ndarray, kind: GeocodeKind) -> None:
+    """Reject layers whose dtype does not match the physical kind."""
+    if kind == "complex":
+        if not np.iscomplexobj(layer):
+            reject_invalid_state(
+                f"kind='complex' requires a complex-valued layer; got {layer.dtype}"
+            )
+        return
+    if kind in ("phase", "continuous"):
+        if not np.issubdtype(layer.dtype, np.floating):
+            reject_invalid_state(
+                f"kind={kind!r} requires a floating-point layer; got {layer.dtype}"
+            )
+        return
+    if not (np.issubdtype(layer.dtype, np.integer) or layer.dtype == np.bool_):
+        reject_invalid_state(
+            f"kind='label' requires an integer or boolean layer; got {layer.dtype}"
+        )
+
+
+def _sample_phase(
+    layer: np.ndarray,
+    coords: RadarCoordinates,
+    *,
+    device: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resample cyclic wrapped phase through its complex representation.
+
+    Non-finite source phase gets zero magnitude so it contributes nothing to
+    the kernel average; the destination is valid only where the averaged
+    complex vector retains meaningful magnitude.
+    """
+    phase = np.asarray(layer, dtype=np.float32)
+    finite = np.isfinite(phase)
+    complex_source = np.where(
+        finite,
+        np.exp(1j * phase.astype(np.float64)),
+        0.0 + 0.0j,
+    ).astype(np.complex64)
+    complex_values, valid = resample_complex_at_coordinates(
+        complex_source,
+        coords.az,
+        coords.rg,
+        valid=coords.valid,
+        device=device,
+    )
+    valid = valid & (np.abs(complex_values) > _PHASE_MAGNITUDE_EPSILON)
+    values = np.full(complex_values.shape, np.nan, dtype=np.float32)
+    values[valid] = np.angle(complex_values[valid]).astype(np.float32)
+    return values, valid
+
+
+def _sample_bilinear(
+    layer: np.ndarray,
+    coords: RadarCoordinates,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bilinear (``map_coordinates`` order 1) sampling for smooth fields."""
+    values = np.full(coords.shape, np.nan, dtype=np.float32)
+    valid = _admissible(layer.shape, coords)
+    if not np.any(valid):
+        return values, valid
     coordinates = np.array(
-        [reference_lut.az_full.ravel(), reference_lut.rg_full.ravel()],
+        [np.asarray(coords.az)[valid], np.asarray(coords.rg)[valid]],
         dtype=np.float64,
     )
-    azimuth_offset = map_coordinates(
-        np.asarray(offsets.azimuth_offset_px, dtype=np.float32),
+    sampled = map_coordinates(
+        np.asarray(layer, dtype=np.float32),
         coordinates,
         order=1,
         mode="constant",
-        cval=np.nan,
-    ).reshape(reference_lut.shape)
-    range_offset = map_coordinates(
-        np.asarray(offsets.range_offset_px, dtype=np.float32),
-        coordinates,
-        order=1,
-        mode="constant",
-        cval=np.nan,
-    ).reshape(reference_lut.shape)
-    coverage = map_coordinates(
-        np.asarray(offsets.coverage, dtype=np.uint8),
+        cval=0.0,
+    )
+    values[valid] = sampled.astype(np.float32)
+    return values, valid
+
+
+def _sample_nearest(
+    layer: np.ndarray,
+    coords: RadarCoordinates,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest (``map_coordinates`` order 0) sampling for hard labels.
+
+    The layer is passed to SciPy in its own integer/boolean dtype: a
+    ``float32`` round trip would silently round label magnitudes above
+    ``2**24`` (SciPy keeps integer dtypes exactly up to the ``float64``
+    integer range).
+    """
+    values = np.zeros(coords.shape, dtype=layer.dtype)
+    valid = _admissible(layer.shape, coords)
+    if not np.any(valid):
+        return values, valid
+    coordinates = np.array(
+        [np.asarray(coords.az)[valid], np.asarray(coords.rg)[valid]],
+        dtype=np.float64,
+    )
+    sampled = map_coordinates(
+        np.asarray(layer),
         coordinates,
         order=0,
         mode="constant",
         cval=0,
-    ).reshape(reference_lut.shape)
-    return _finalize_composed_coordinates(
-        reference_lut, offsets, azimuth_offset, range_offset, coverage
     )
+    values[valid] = sampled.astype(layer.dtype, copy=False)
+    return values, valid
 
 
-def _compose_secondary_coordinates_torch(
-    reference_lut: Geo2RdrLUT,
-    offsets: OffsetFieldResult,
-    identity: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Same-device bilinear compose for an admitted CUDA identity."""
-    import torch
-    import torch.nn.functional as torch_functional
-
-    torch_device = torch.device(identity)
-    radar_h, radar_w = offsets.coverage.shape
-    az = torch.as_tensor(
-        np.asarray(reference_lut.az_full, dtype=np.float64),
-        device=torch_device,
-    )
-    rg = torch.as_tensor(
-        np.asarray(reference_lut.rg_full, dtype=np.float64),
-        device=torch_device,
-    )
-    denom_h = max(radar_h - 1, 1)
-    denom_w = max(radar_w - 1, 1)
-    grid_y = (2.0 * az / denom_h) - 1.0
-    grid_x = (2.0 * rg / denom_w) - 1.0
-    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).to(torch.float32)
-    az_field = torch.as_tensor(
-        np.asarray(offsets.azimuth_offset_px, dtype=np.float32),
-        device=torch_device,
-    ).view(1, 1, radar_h, radar_w)
-    rg_field = torch.as_tensor(
-        np.asarray(offsets.range_offset_px, dtype=np.float32),
-        device=torch_device,
-    ).view(1, 1, radar_h, radar_w)
-    cov_field = torch.as_tensor(
-        np.asarray(offsets.coverage, dtype=np.float32),
-        device=torch_device,
-    ).view(1, 1, radar_h, radar_w)
-    azimuth_offset = (
-        torch_functional.grid_sample(
-            az_field, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-        )
-        .squeeze(0)
-        .squeeze(0)
-        .to(torch.float64)
-    )
-    range_offset = (
-        torch_functional.grid_sample(
-            rg_field, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-        )
-        .squeeze(0)
-        .squeeze(0)
-        .to(torch.float64)
-    )
-    coverage = (
-        torch_functional.grid_sample(
-            cov_field, grid, mode="nearest", padding_mode="zeros", align_corners=True
-        )
-        .squeeze(0)
-        .squeeze(0)
-    )
-    finite_src = torch.isfinite(az) & torch.isfinite(rg)
-    azimuth_offset = torch.where(
-        finite_src, azimuth_offset, torch.full_like(azimuth_offset, float("nan"))
-    )
-    range_offset = torch.where(
-        finite_src, range_offset, torch.full_like(range_offset, float("nan"))
-    )
-    return _finalize_composed_coordinates(
-        reference_lut,
-        offsets,
-        azimuth_offset.detach().cpu().numpy(),
-        range_offset.detach().cpu().numpy(),
-        (coverage > 0.5).detach().cpu().numpy(),
-    )
-
-
-def _finalize_composed_coordinates(
-    reference_lut: Geo2RdrLUT,
-    offsets: OffsetFieldResult,
-    azimuth_offset: np.ndarray,
-    range_offset: np.ndarray,
-    coverage: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Apply the reference-minus-secondary offset convention and in-window mask."""
-    secondary_azimuth = reference_lut.az_full - azimuth_offset
-    secondary_range = reference_lut.rg_full - range_offset
-    height, width = offsets.coverage.shape
-    valid = (
-        reference_lut.valid
-        & coverage.astype(bool)
-        & np.isfinite(secondary_azimuth)
-        & np.isfinite(secondary_range)
-        & (secondary_azimuth >= 0.0)
-        & (secondary_azimuth <= height - 1.0)
-        & (secondary_range >= 0.0)
-        & (secondary_range <= width - 1.0)
-    )
-    return secondary_azimuth, secondary_range, valid
-
-
-def _multilook_coordinates(
-    source_shape: tuple[int, int],
-    lut: Geo2RdrLUT,
-    full_radar_shape: tuple[int, int] | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    full_height, full_width = full_radar_shape or lut.full_radar_shape
-    source_height, source_width = source_shape
-    azimuth = lut.az_full / max(full_height / max(source_height, 1), 1.0)
-    range_index = lut.rg_full / max(full_width / max(source_width, 1), 1.0)
-    valid = (
-        lut.valid
+def _admissible(
+    layer_shape: tuple[int, int],
+    coords: RadarCoordinates,
+) -> np.ndarray:
+    """Return the in-window, finite subset of the coordinate validity mask."""
+    azimuth = np.asarray(coords.az)
+    range_index = np.asarray(coords.rg)
+    height, width = layer_shape
+    return (
+        np.asarray(coords.valid, dtype=bool)
         & np.isfinite(azimuth)
         & np.isfinite(range_index)
         & (azimuth >= 0.0)
-        & (azimuth <= source_height - 1.0)
+        & (azimuth <= height - 1.0)
         & (range_index >= 0.0)
-        & (range_index <= source_width - 1.0)
+        & (range_index <= width - 1.0)
     )
-    return azimuth, range_index, valid
-
-
-def apply_lut_complex(
-    complex_radar: np.ndarray,
-    lut: Geo2RdrLUT,
-    *,
-    full_radar_shape: tuple[int, int] | None = None,
-    executor: Literal["torch", "opencv"] = "torch",
-    device: str = "auto",
-) -> tuple[np.ndarray, np.ndarray]:
-    """Lanczos-resample a complex radar field through a shared LUT.
-
-    Parameters
-    ----------
-    complex_radar : numpy.ndarray
-        Full-resolution or multilooked complex radar field.
-    lut : Geo2RdrLUT
-        Geographic-to-radar lookup table.
-    full_radar_shape : tuple[int, int], optional
-        Full-resolution shape used to infer look factors.
-    executor : {"torch", "opencv"}, optional
-        Resampling backend.
-    device : {"auto", "cpu", "cuda"}, optional
-        Torch device for the unified Torch backend.
-
-    Returns
-    -------
-    output, valid : tuple[numpy.ndarray, numpy.ndarray]
-        Geocoded complex field and validity mask.
-
-    """
-    azimuth, range_index, valid = _multilook_coordinates(
-        complex_radar.shape,
-        lut,
-        full_radar_shape,
-    )
-    return resample_complex_at_coordinates(
-        complex_radar,
-        azimuth,
-        range_index,
-        valid=valid,
-        executor=executor,
-        device=device,
-    )
-
-
-def apply_lut_real(
-    real_radar: np.ndarray,
-    lut: Geo2RdrLUT,
-    *,
-    full_radar_shape: tuple[int, int] | None = None,
-    order: int = 1,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Resample a real radar field through a shared LUT.
-
-    Parameters
-    ----------
-    real_radar : numpy.ndarray
-        Full-resolution or multilooked real radar field.
-    lut : Geo2RdrLUT
-        Geographic-to-radar lookup table.
-    full_radar_shape : tuple[int, int], optional
-        Full-resolution shape used to infer look factors.
-    order : int, optional
-        Spline interpolation order passed to SciPy.
-
-    Returns
-    -------
-    output, valid : tuple[numpy.ndarray, numpy.ndarray]
-        Geocoded real field and validity mask.
-
-    """
-    azimuth, range_index, valid = _multilook_coordinates(
-        real_radar.shape,
-        lut,
-        full_radar_shape,
-    )
-    output = np.full(lut.shape, np.nan, dtype=np.float32)
-    if not np.any(valid):
-        return output, valid
-    coordinates = np.array([azimuth[valid], range_index[valid]])
-    values = map_coordinates(
-        np.asarray(real_radar, dtype=np.float32),
-        coordinates,
-        order=order,
-        mode="constant",
-        cval=0.0,
-    )
-    output[valid] = values.astype(np.float32)
-    return output, valid
