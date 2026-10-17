@@ -42,6 +42,7 @@ def test_coregister_s1_scene_public_signature() -> None:
         "misreg_rg_px",
         "coregistration_grid",
         "geo_grid",
+        "geo_lut_cache_dir",
         "primary_orbit_path",
         "secondary_orbit_path",
         "device",
@@ -52,6 +53,7 @@ def test_coregister_s1_scene_public_signature() -> None:
     assert parameters["roi"].default is None
     assert parameters["coregistration_grid"].default == "radar"
     assert parameters["geo_grid"].default is None
+    assert parameters["geo_lut_cache_dir"].default is None
     assert parameters["primary_orbit_path"].default is None
     assert parameters["secondary_orbit_path"].default is None
     assert parameters["device"].default == "auto"

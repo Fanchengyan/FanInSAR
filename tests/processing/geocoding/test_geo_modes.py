@@ -9,9 +9,8 @@ import numpy as np
 import pytest
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
-from faninsar.processing.geometry.coordinates import RadarGrid
-from faninsar.processing.geometry import RadarGeometryModel
-from faninsar.processing.mosaicking.grid import GeoGridSpec
+from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
+from faninsar.processing.geocoding.coordinates import RadarCoordinates
 from faninsar.processing.geocoding.geo_lut import (
     build_geo2rdr_lut,
     grid_lonlat,
@@ -25,11 +24,12 @@ from faninsar.processing.geocoding.geo_modes import (
     coregister_geocoded_slcs_chunked,
 )
 from faninsar.processing.geocoding.geo_resample import (
-    apply_lut_complex,
-    compose_secondary_coordinates,
     resample_complex_at_coordinates,
+    sample,
 )
-from faninsar.processing.coregistration.tops.deramp import TOPSCarrierModel
+from faninsar.processing.geometry import RadarGeometryModel
+from faninsar.processing.geometry.coordinates import RadarGrid
+from faninsar.processing.mosaicking.grid import GeoGridSpec
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -215,67 +215,6 @@ def _carrier() -> TOPSCarrierModel:
     )
 
 
-def test_compose_secondary_coordinates_uses_source_offset_convention() -> None:
-    """Geo coordinates compose reference LUT and dense reference-minus-secondary."""
-    from faninsar.processing.coregistration.offsets import OffsetFieldResult
-    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
-
-    lut = Geo2RdrLUT(
-        az_full=np.array([[2.0, 3.0]], dtype=np.float64),
-        rg_full=np.array([[4.0, 5.0]], dtype=np.float64),
-        valid=np.ones((1, 2), dtype=bool),
-        full_radar_shape=(8, 10),
-        height_m=0.0,
-    )
-    offsets = OffsetFieldResult(
-        range_offset_px=np.full((8, 10), -1.25, dtype=np.float32),
-        azimuth_offset_px=np.full((8, 10), 0.5, dtype=np.float32),
-        coverage=np.ones((8, 10), dtype=bool),
-        uncertainty_px=np.zeros((8, 10), dtype=np.float32),
-    )
-    secondary_az, secondary_rg, valid = compose_secondary_coordinates(lut, offsets)
-    assert np.allclose(secondary_az, [[1.5, 2.5]])
-    assert np.allclose(secondary_rg, [[5.25, 6.25]])
-    assert valid.all()
-
-
-def test_compose_secondary_coordinates_torch_matches_numpy() -> None:
-    """CUDA compose matches the SciPy bilinear oracle on interior samples."""
-    pytest.importorskip("torch")
-    from faninsar.processing.coregistration.offsets import OffsetFieldResult
-    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
-    from faninsar.processing.geocoding.geo_resample import (
-        _compose_secondary_coordinates_torch,
-    )
-
-    rng = np.random.default_rng(0)
-    radar_shape = (16, 20)
-    az = rng.uniform(1.0, 14.0, size=(8, 10))
-    rg = rng.uniform(1.0, 18.0, size=(8, 10))
-    lut = Geo2RdrLUT(
-        az_full=az,
-        rg_full=rg,
-        valid=np.ones((8, 10), dtype=bool),
-        full_radar_shape=radar_shape,
-        height_m=0.0,
-    )
-    offsets = OffsetFieldResult(
-        range_offset_px=rng.normal(0.0, 0.4, size=radar_shape).astype(np.float32),
-        azimuth_offset_px=rng.normal(0.0, 0.4, size=radar_shape).astype(np.float32),
-        coverage=np.ones(radar_shape, dtype=bool),
-        uncertainty_px=np.zeros(radar_shape, dtype=np.float32),
-    )
-    numpy_az, numpy_rg, numpy_valid = compose_secondary_coordinates(lut, offsets)
-    torch_az, torch_rg, torch_valid = _compose_secondary_coordinates_torch(
-        lut, offsets, "cpu"
-    )
-    assert numpy_valid.shape == torch_valid.shape
-    common = numpy_valid & torch_valid
-    assert common.any()
-    assert np.allclose(numpy_az[common], torch_az[common], atol=1e-5, rtol=0.0)
-    assert np.allclose(numpy_rg[common], torch_rg[common], atol=1e-5, rtol=0.0)
-
-
 def test_coregister_geocoded_slcs_remaps_deramped_inputs_once() -> None:
     """Geo coregistration returns two reramped SLCs on the LUT grid."""
     from faninsar.processing.coregistration.offsets import OffsetFieldResult
@@ -430,8 +369,8 @@ def test_opencv_geo_resampling_preserves_smooth_complex_phase() -> None:
     assert float(np.max(np.abs(phase_delta))) < 1e-3
 
 
-def test_shared_lut_apply_twice_same_shape() -> None:
-    """Verify one LUT can resample independent complex fields."""
+def test_shared_coordinates_sample_two_layers() -> None:
+    """Verify one coordinate set can sample independent complex fields."""
     geom = _toy_geometry((32, 64))
     grid = _projected_grid()
     lut = build_geo2rdr_lut(
@@ -442,13 +381,15 @@ def test_shared_lut_apply_twice_same_shape() -> None:
         device="cpu",
         chunk_size=2,
     )
+    coordinates = RadarCoordinates(lut.az_full, lut.rg_full, lut.valid)
     a = np.ones((32, 64), dtype=np.complex64)
     b = np.full((32, 64), 2 + 0j, dtype=np.complex64)
-    ga, va = apply_lut_complex(a, lut)
-    gb, vb = apply_lut_complex(b, lut)
+    ga, va = sample(a, coordinates, kind="complex")
+    gb, vb = sample(b, coordinates, kind="complex")
     assert ga.shape == grid.shape
     assert gb.shape == grid.shape
     assert va.shape == vb.shape
+    np.testing.assert_allclose(gb.real[va & vb], 2 * ga.real[va & vb], atol=1e-6)
 
 
 def test_build_geo2rdr_lut_accepts_height_array() -> None:
