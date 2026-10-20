@@ -326,6 +326,47 @@ def _align_crop_end(end: int, start: int, stride: int, limit: int) -> int:
     return min(aligned, limit)
 
 
+def _conform_to_shape(values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Crop or zero-pad a 2-D array at its trailing edges to ``shape``."""
+    rows = min(values.shape[0], shape[0])
+    cols = min(values.shape[1], shape[1])
+    conformed = np.zeros(shape, dtype=values.dtype)
+    conformed[:rows, :cols] = values[:rows, :cols]
+    return conformed
+
+
+def reference_window_crop(
+    window: tuple[int, int, int, int],
+    shape: tuple[int, int],
+    control_spacing: int | None = None,
+) -> tuple[int, int, int, int]:
+    """Return the pair-independent Reference crop of one radar ROI window.
+
+    Every pair crop is built from the same window with a halo of at least
+    ``_WINDOW_HALO_FLOOR_PX`` (it only grows with the pair's offsets), so the
+    floor-halo crop is contained in every pair crop of the window. Persisting
+    the Reference and all secondaries on this crop keeps one Reference payload
+    valid for the whole Stack.
+
+    Parameters
+    ----------
+    window : tuple[int, int, int, int]
+        Radar ROI window ``(row0, row1, col0, col1)`` inside the burst.
+    shape : tuple[int, int]
+        Full deramped burst shape.
+    control_spacing : int, optional
+        Geometry control stride; ``None`` uses the coregistration default.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Crop ``(row0, row1, col0, col1)`` in burst coordinates.
+
+    """
+    stride = 8 if control_spacing is None else int(control_spacing)
+    return _window_crop_bounds(window, shape, stride, _WINDOW_HALO_FLOOR_PX)
+
+
 def _window_crop_bounds(
     window: tuple[int, int, int, int],
     shape: tuple[int, int],
@@ -770,6 +811,7 @@ def load_production_scene(
     orbit_path: str | Path | None = None,
     coregistration_grid: CoregistrationGrid = "radar",
     full_range: bool = False,
+    read_samples: bool = True,
 ) -> ProductionScene:
     """Load a full burst or full stitched sub-swath for production processing.
 
@@ -793,6 +835,9 @@ def load_production_scene(
         Read the full swath range extent (column 0 through the burst width)
         instead of the valid-sample envelope, matching ISCE2's full-width
         burst layout. Invalid samples are still zeroed via the valid mask.
+    read_samples : bool, optional
+        Read the burst pixels. ``False`` loads only placement, carrier, and
+        geometry (burst scope only).
 
     Returns
     -------
@@ -811,6 +856,7 @@ def load_production_scene(
             burst_index=burst_index,
             geocoding_layout=coregistration_grid == "geo",
             full_range=full_range,
+            read_samples=read_samples,
         )
         burst = s1_swath.bursts[burst_index]
     elif scope == "swath":
@@ -854,6 +900,7 @@ def stage_deramp(
     *,
     device: str = "auto",
     dask_client: Any | None = None,
+    secondary_only: bool = False,
 ) -> ProductionPairState:
     """Deramp both full scenes with annotation carriers.
 
@@ -866,6 +913,9 @@ def stage_deramp(
         the logged NumPy CPU fallback.
     dask_client : object or None, optional
         Explicitly trusted Dask client. Ambient clients are ignored.
+    secondary_only : bool, optional
+        Deramp only the secondary. The Reference was prepared once for the
+        whole Stack; its pixels are not read here.
 
     Returns
     -------
@@ -874,6 +924,26 @@ def stage_deramp(
 
     """
     from faninsar.processing.runtime.dask_gpu import should_accelerate
+
+    if secondary_only:
+        samples = state.secondary.array.samples
+        if not should_accelerate(device, dask_client, kernel="carrier_multiply"):
+            deramped = deramp(samples, state.secondary.carrier)
+        else:
+            from faninsar.processing.runtime.dask_gpu import run_carrier_multiply
+
+            deramped = run_carrier_multiply(
+                samples,
+                state.secondary.carrier,
+                sign=-1.0,
+                device=device,
+                client=dask_client,
+            )
+        state.secondary_deramped = np.where(
+            state.secondary.array.valid_mask, deramped, 0
+        )
+        state.note(f"DERAMP secondary shape={state.secondary_deramped.shape}")
+        return state
 
     primary_input = state.primary.array.samples
     secondary_input = state.secondary.array.samples
@@ -930,7 +1000,7 @@ def _apply_geo_topographic_phase_chunked(
     state: ProductionPairState,
     lut: Geo2RdrLUT,
     offsets: OffsetFieldResult,
-    reference_geo: np.memmap,
+    reference_geo: np.memmap | None,
     secondary_geo: np.memmap,
     valid: np.memmap,
     *,
@@ -1051,11 +1121,8 @@ def _apply_geo_topographic_phase_chunked(
         corrected_secondary = secondary_geo[rows] * np.exp(1j * phase).astype(
             np.complex64
         )
-        reference_geo[rows] = np.where(
-            tile_valid,
-            reference_geo[rows],
-            invalid,
-        ).astype(np.complex64)
+        # The reference keeps its own support: one Reference payload is shared
+        # by every secondary and must not inherit one pair's coverage.
         secondary_geo[rows] = np.where(
             tile_valid,
             corrected_secondary,
@@ -1082,7 +1149,8 @@ def _apply_geo_topographic_phase_chunked(
             valid,
             topo_phase,
         ):
-            release_memmap_pages(array)
+            if array is not None:
+                release_memmap_pages(array)
         for array in (height_field, lut.az_full, lut.rg_full, lut.valid):
             if isinstance(array, np.memmap):
                 release_memmap_pages(array)
@@ -1092,13 +1160,170 @@ def _apply_geo_topographic_phase_chunked(
             timings_out["apply"] = timings_out.get("apply", 0.0) + (
                 time.perf_counter() - apply_started
             )
-    reference_geo.flush()
+    if reference_geo is not None:
+        reference_geo.flush()
     secondary_geo.flush()
     valid.flush()
     topo_phase.flush()
     if isinstance(height_field, np.memmap):
         height_field.flush()
     return topo_phase, height_field
+
+
+def build_reference_geo_lut(
+    primary: ProductionScene,
+    *,
+    radar_shape: tuple[int, int],
+    dem: DEM,
+    geo_grid: GeoGridSpec,
+    storage_dir: str | Path,
+    geo_lut_cache_dir: str | Path | None = None,
+    roi: BoundingBox | Polygons | None = None,
+    roi_buffer_m: float = 320.0,
+    geo_footprint_mask_enabled: bool = True,
+    geo_height_m: float = 0.0,
+    geo_chunk_size: int = 128,
+    device: str = "auto",
+    timings: dict[str, float] | None = None,
+) -> Geo2RdrLUT:
+    """Build the geo2rdr LUT of one Reference burst on the Stack geo grid.
+
+    The LUT depends only on the Reference burst geometry, the DEM, the grid,
+    and the ROI, so a Stack builds it once per Reference burst and every
+    secondary date reuses it.
+
+    Parameters
+    ----------
+    primary : ProductionScene
+        Reference burst (pixels are not needed).
+    radar_shape : tuple[int, int]
+        Native Reference burst shape.
+    dem : DEM
+        Height sampler.
+    geo_grid : GeoGridSpec
+        Stack geographic grid.
+    storage_dir : path-like
+        Directory for the LUT memmaps when not served from the cache.
+    geo_lut_cache_dir : path-like, optional
+        Content-addressed LUT cache root.
+    roi : BoundingBox or Polygons, optional
+        Restricts the LUT window to the buffered ROI.
+    roi_buffer_m : float, optional
+        ROI buffer in metres.
+    geo_footprint_mask_enabled : bool, optional
+        Prefilter the LUT with the burst footprint hull (no ROI).
+    geo_height_m : float, optional
+        Fallback ellipsoidal height.
+    geo_chunk_size : int, optional
+        Destination rows per geometry call.
+    device : str, optional
+        Numerical device.
+    timings : dict, optional
+        Receives substage timings.
+
+    Returns
+    -------
+    Geo2RdrLUT
+        LUT whose ``row0``/``col0`` locate it on ``geo_grid``.
+
+    """
+    from faninsar.processing.geocoding.geo_lut import (
+        build_geo2rdr_lut,
+        burst_geo_footprint_lonlat,
+        burst_geo_quad_lonlat,
+        derive_burst_geo_bbox,
+        roi_geo_bbox,
+    )
+
+    timings = {} if timings is None else timings
+    bbox_started = _clock_start(device)
+    burst_row0, burst_row1, burst_col0, burst_col1 = derive_burst_geo_bbox(
+        geometry=primary.geometry,
+        radar_shape=radar_shape,
+        dem=dem,
+        grid=geo_grid,
+        device=device,
+    )
+    timings["geo_bbox"] = _clock_stop(device, bbox_started)
+    footprint_lonlat = None
+    roi_geometry = None
+    if geo_footprint_mask_enabled and roi is None:
+        footprint_started = _clock_start(device)
+        footprint_lonlat = burst_geo_footprint_lonlat(
+            geometry=primary.geometry,
+            radar_shape=radar_shape,
+            dem=dem,
+            grid=geo_grid,
+            device=device,
+        )
+        timings["geo_footprint"] = _clock_stop(device, footprint_started)
+        if footprint_lonlat is None:
+            logger.warning(
+                "burst footprint polygon could not be derived; "
+                "continuing without geo footprint mask"
+            )
+    if roi is not None:
+        from shapely.geometry import MultiPolygon
+        from shapely.geometry import Polygon as ShapelyPolygon
+
+        from faninsar.processing.geocoding.geo_lut import polygon_parts
+
+        burst_quad = burst_geo_quad_lonlat(
+            geometry=primary.geometry,
+            radar_shape=radar_shape,
+            dem=dem,
+            device=device,
+        )
+        if burst_quad is not None:
+            intersection = _roi_geometry(roi).intersection(
+                ShapelyPolygon(burst_quad).buffer(0)
+            )
+            parts = [part for part in polygon_parts(intersection) if not part.is_empty]
+            if parts:
+                roi_polygon = parts[0] if len(parts) == 1 else MultiPolygon(parts)
+                roi_geometry = _buffer_geometry_meters(
+                    roi_polygon,
+                    geo_grid.crs,
+                    roi_buffer_m,
+                )
+                burst_row0, burst_row1, burst_col0, burst_col1 = roi_geo_bbox(
+                    roi_geometry,
+                    geo_grid,
+                    margin_px=2,
+                )
+    lut_cache_dir = Path(geo_lut_cache_dir) if geo_lut_cache_dir is not None else None
+    lut_cache_key = None
+    if lut_cache_dir is not None:
+        primary_swath = str(getattr(primary.swath, "swath", ""))
+        reference_burst = int(getattr(getattr(primary, "burst", None), "index", 0))
+        # Readable namespace only: the on-disk identity is derived from
+        # geometry/orbit/DEM/grid/solver content inside build_geo2rdr_lut.
+        lut_cache_key = f"{primary.scene_id}_{primary_swath}_b{reference_burst}"
+    substage_started = _clock_start(device)
+    lut_timings: dict[str, float] = {}
+    lut = build_geo2rdr_lut(
+        geometry=primary.geometry,
+        grid=geo_grid,
+        full_radar_shape=radar_shape,
+        height_m=geo_height_m,
+        dem=dem,
+        device=device,
+        chunk_size=geo_chunk_size,
+        storage_dir=Path(storage_dir),
+        cache_dir=lut_cache_dir,
+        cache_key=lut_cache_key,
+        row_range=(burst_row0, burst_row1),
+        col_range=(burst_col0, burst_col1),
+        footprint_lonlat=footprint_lonlat,
+        roi_geometry=roi_geometry,
+        polygon_dilate_px=2,
+        footprint_dilate_px=64,
+        timings_out=lut_timings,
+    )
+    timings["geo2rdr_lut"] = _clock_stop(device, substage_started)
+    for key, value in lut_timings.items():
+        timings[f"geo2rdr_lut.{key}"] = float(value)
+    return lut
 
 
 def stage_coregister(
@@ -1128,6 +1353,9 @@ def stage_coregister(
     memory_watchdog: MemoryWatchdog | None = None,
     prepared_geometry_field: PreparedGeometryField | None = None,
     prepared_geo_lut: Geo2RdrLUT | None = None,
+    secondary_only: bool = False,
+    reference_shape: tuple[int, int] | None = None,
+    reference_geo_valid: np.ndarray | None = None,
 ) -> ProductionPairState:
     """Estimate dense offsets and coregister on a radar or geographic grid.
 
@@ -1215,23 +1443,51 @@ def stage_coregister(
         grid/view.  When supplied in geo mode, LUT construction and all
         footprint/ROI recomputation are skipped; its explicit crop origin is
         used for every downstream remap and topographic-phase tile.
+    secondary_only : bool, optional
+        Resample only the secondary. The Reference contributes its geometry,
+        carrier, and shape; its pixels are never read or deramped here
+        (PROPOSAL-0059). ESD and amplitude refinement need Reference pixels
+        and are rejected in this mode.
+    reference_shape : tuple[int, int], optional
+        Full deramped Reference burst shape; required with ``secondary_only``.
+    reference_geo_valid : numpy.ndarray, optional
+        Persisted Reference support on the geographic LUT rows; required with
+        ``secondary_only`` in geo mode.
 
     """
-    if state.primary_deramped is None or state.secondary_deramped is None:
+    if secondary_only:
+        if state.secondary_deramped is None:
+            reject_invalid_state("coregister requires a deramped secondary")
+        if reference_shape is None:
+            reject_invalid_state(
+                "secondary-only coregistration requires reference_shape"
+            )
+        if esd_enabled or amplitude_refinement_enabled:
+            reject_invalid_state(
+                "secondary-only coregistration cannot run ESD or amplitude "
+                "refinement; they read Reference pixels"
+            )
+        if coregistration_grid == "geo" and (
+            prepared_geo_lut is None or reference_geo_valid is None
+        ):
+            reject_invalid_state(
+                "secondary-only geo coregistration requires the Reference LUT "
+                "and support"
+            )
+        ref = np.broadcast_to(np.complex64(0), tuple(reference_shape))
+    elif state.primary_deramped is None or state.secondary_deramped is None:
         reject_invalid_state("coregister requires deramp")
+    else:
+        ref = state.primary_deramped
 
-    # Align secondary crop to reference shape if needed (same swath expected)
-    ref = state.primary_deramped
+    # The reference grid is never cropped: one Reference payload is shared by
+    # every secondary of a Stack. A secondary of another shape is conformed to
+    # it; padded samples are zero, the deramp stage's invalid-sample value.
     sec = state.secondary_deramped
     if ref.shape != sec.shape:
-        # crop to common shape (min)
-        h = min(ref.shape[0], sec.shape[0])
-        w = min(ref.shape[1], sec.shape[1])
-        ref = ref[:h, :w]
-        sec = sec[:h, :w]
-        state.primary_deramped = ref
+        sec = _conform_to_shape(sec, ref.shape)
         state.secondary_deramped = sec
-        state.note(f"COREG cropped both scenes to common shape {(h, w)}")
+        state.note(f"COREG conformed secondary to reference shape {ref.shape}")
 
     if prepared_geometry_field is not None:
         if coregistration_grid != "radar":
@@ -1293,6 +1549,10 @@ def stage_coregister(
             _WINDOW_HALO_FLOOR_PX,
             int(np.ceil(probe_extent)) + _LANCZOS_RADIUS_PX + _WINDOW_HALO_MARGIN_PX,
         )
+    # The carrier centre row is defined by the native Reference burst height.
+    reference_native_height = int(
+        reference_shape[0] if secondary_only else state.primary.array.samples.shape[0]
+    )
     ref_full = ref
     sec_full = sec
     growth_attempts = 0
@@ -1527,15 +1787,9 @@ def stage_coregister(
     if coregistration_grid == "geo":
         if geo_grid is None:
             reject_invalid_state("geo coregistration requires geo_grid")
-        from faninsar.processing.geocoding.geo_lut import (
-            build_geo2rdr_lut,
-            burst_geo_footprint_lonlat,
-            burst_geo_quad_lonlat,
-            derive_burst_geo_bbox,
-            roi_geo_bbox,
-        )
         from faninsar.processing.geocoding.geo_modes import (
             coregister_geocoded_slcs_chunked,
+            geocode_secondary_slc_chunked,
         )
 
         if geo_work_dir is None:
@@ -1547,142 +1801,68 @@ def stage_coregister(
                 reject_invalid_state(
                     "prepared Geo LUT radar shape does not match the product pair"
                 )
-            burst_row0 = int(prepared_geo_lut.row0)
-            burst_col0 = int(prepared_geo_lut.col0)
-            burst_row1 = burst_row0 + prepared_geo_lut.shape[0]
-            burst_col1 = burst_col0 + prepared_geo_lut.shape[1]
-            if burst_row1 > geo_grid.height or burst_col1 > geo_grid.width:
+            if (
+                prepared_geo_lut.row0 + prepared_geo_lut.shape[0] > geo_grid.height
+                or prepared_geo_lut.col0 + prepared_geo_lut.shape[1] > geo_grid.width
+            ):
                 reject_invalid_state(
                     "prepared Geo LUT crop lies outside the requested geo grid"
                 )
-            footprint_lonlat = None
-            roi_geometry = None
-            state.note("COREG reused provider-owned Geo LUT/view")
-        else:
-            bbox_started = _clock_start(device)
-            burst_row0, burst_row1, burst_col0, burst_col1 = derive_burst_geo_bbox(
-                geometry=state.primary.geometry,
-                radar_shape=ref.shape,
-                dem=state.dem,
-                grid=geo_grid,
-                device=device,
-            )
-            state.coregistration_timings_s["geo_bbox"] = _clock_stop(
-                device, bbox_started
-            )
-            footprint_lonlat = None
-            roi_geometry = None
-            if geo_footprint_mask_enabled and roi is None:
-                footprint_started = _clock_start(device)
-                footprint_lonlat = burst_geo_footprint_lonlat(
-                    geometry=state.primary.geometry,
-                    radar_shape=ref.shape,
-                    dem=state.dem,
-                    grid=geo_grid,
-                    device=device,
-                )
-                state.coregistration_timings_s["geo_footprint"] = _clock_stop(
-                    device, footprint_started
-                )
-                if footprint_lonlat is None:
-                    logger.warning(
-                        "burst footprint polygon could not be derived; "
-                        "continuing without geo footprint mask"
-                    )
-            if roi is not None:
-                from shapely.geometry import MultiPolygon
-                from shapely.geometry import Polygon as ShapelyPolygon
-
-                from faninsar.processing.geocoding.geo_lut import polygon_parts
-
-                burst_quad = burst_geo_quad_lonlat(
-                    geometry=state.primary.geometry,
-                    radar_shape=ref.shape,
-                    dem=state.dem,
-                    device=device,
-                )
-                if burst_quad is not None:
-                    intersection = _roi_geometry(roi).intersection(
-                        ShapelyPolygon(burst_quad).buffer(0)
-                    )
-                    parts = [
-                        part
-                        for part in polygon_parts(intersection)
-                        if not part.is_empty
-                    ]
-                    if parts:
-                        roi_polygon = (
-                            parts[0] if len(parts) == 1 else MultiPolygon(parts)
-                        )
-                        roi_geometry = _buffer_geometry_meters(
-                            roi_polygon,
-                            geo_grid.crs,
-                            roi_buffer_m,
-                        )
-                        burst_row0, burst_row1, burst_col0, burst_col1 = roi_geo_bbox(
-                            roi_geometry,
-                            geo_grid,
-                            margin_px=2,
-                        )
-        state.geo_bbox = (burst_row0, burst_row1, burst_col0, burst_col1)
-        if prepared_geo_lut is None:
-            substage_started = _clock_start(device)
-            lut_cache_dir = (
-                Path(geo_lut_cache_dir) if geo_lut_cache_dir is not None else None
-            )
-            lut_cache_key = None
-            if lut_cache_dir is not None:
-                reference_scene = str(state.primary.scene_id)
-                primary_swath = str(getattr(state.primary.swath, "swath", ""))
-                reference_burst = int(
-                    getattr(getattr(state.primary, "burst", None), "index", 0)
-                )
-                # Readable namespace only: the on-disk identity is derived
-                # from geometry/orbit/DEM/grid/solver content inside
-                # build_geo2rdr_lut, so this string cannot cause false hits.
-                lut_cache_key = f"{reference_scene}_{primary_swath}_b{reference_burst}"
-            lut_timings: dict[str, float] = {}
-            lut = build_geo2rdr_lut(
-                geometry=state.primary.geometry,
-                grid=geo_grid,
-                full_radar_shape=ref.shape,
-                height_m=geo_height_m,
-                dem=state.dem,
-                device=device,
-                chunk_size=geo_chunk_size,
-                storage_dir=work_directory / "lut",
-                cache_dir=lut_cache_dir,
-                cache_key=lut_cache_key,
-                row_range=(burst_row0, burst_row1),
-                col_range=(burst_col0, burst_col1),
-                footprint_lonlat=footprint_lonlat,
-                roi_geometry=roi_geometry,
-                polygon_dilate_px=2,
-                footprint_dilate_px=64,
-                timings_out=lut_timings,
-            )
-            state.coregistration_timings_s["geo2rdr_lut"] = _clock_stop(
-                device, substage_started
-            )
-            for key, value in lut_timings.items():
-                state.coregistration_timings_s[f"geo2rdr_lut.{key}"] = float(value)
-        else:
             lut = prepared_geo_lut
             state.coregistration_timings_s["geo2rdr_lut_reused"] = 0.0
-        substage_started = _clock_start(device)
-        reference_geo, secondary_geo, valid = coregister_geocoded_slcs_chunked(
-            ref,
-            sec,
-            reference_carrier=state.primary.carrier,
-            secondary_carrier=state.secondary.carrier,
-            reference_lut=lut,
-            offsets=offsets,
-            output_dir=work_directory / "slc",
-            row_chunk=geo_chunk_size,
-            device=resolved_torch_device,
-            dask_client=dask_client,
-            watchdog=memory_watchdog,
+            state.note("COREG reused prepared Reference Geo LUT")
+        else:
+            lut = build_reference_geo_lut(
+                state.primary,
+                radar_shape=ref.shape,
+                dem=state.dem,
+                geo_grid=geo_grid,
+                storage_dir=work_directory / "lut",
+                geo_lut_cache_dir=geo_lut_cache_dir,
+                roi=roi,
+                roi_buffer_m=roi_buffer_m,
+                geo_footprint_mask_enabled=geo_footprint_mask_enabled,
+                geo_height_m=geo_height_m,
+                geo_chunk_size=geo_chunk_size,
+                device=device,
+                timings=state.coregistration_timings_s,
+            )
+        burst_row0, burst_col0 = int(lut.row0), int(lut.col0)
+        state.geo_bbox = (
+            burst_row0,
+            burst_row0 + lut.shape[0],
+            burst_col0,
+            burst_col0 + lut.shape[1],
         )
+        substage_started = _clock_start(device)
+        if secondary_only:
+            secondary_geo, valid = geocode_secondary_slc_chunked(
+                sec,
+                secondary_carrier=state.secondary.carrier,
+                reference_lut=lut,
+                reference_valid=reference_geo_valid,
+                offsets=offsets,
+                output_dir=work_directory / "slc",
+                row_chunk=geo_chunk_size,
+                device=resolved_torch_device,
+                dask_client=dask_client,
+                watchdog=memory_watchdog,
+            )
+            reference_geo = None
+        else:
+            reference_geo, secondary_geo, valid = coregister_geocoded_slcs_chunked(
+                ref,
+                sec,
+                reference_carrier=state.primary.carrier,
+                secondary_carrier=state.secondary.carrier,
+                reference_lut=lut,
+                offsets=offsets,
+                output_dir=work_directory / "slc",
+                row_chunk=geo_chunk_size,
+                device=resolved_torch_device,
+                dask_client=dask_client,
+                watchdog=memory_watchdog,
+            )
         state.coregistration_timings_s["geo_slc_resample"] = _clock_stop(
             device, substage_started
         )
@@ -1777,7 +1957,7 @@ def stage_coregister(
         device=resolved_torch_device,
         row0=0 if window_origin is None else window_origin[0],
         col0=0 if window_origin is None else window_origin[1],
-        native_height=state.primary.array.samples.shape[0],
+        native_height=reference_native_height,
     )
     state.coregistration_timings_s["radar_resample"] = _clock_stop(
         device, substage_started
@@ -1814,7 +1994,9 @@ def stage_coregister(
     )
 
     reramp_started = _clock_start(device)
-    if should_accelerate(
+    if secondary_only:
+        state.primary_deramped = None
+    elif should_accelerate(
         resolved_torch_device,
         dask_client,
         kernel="carrier_multiply",
@@ -1825,7 +2007,7 @@ def stage_coregister(
             sign=1.0,
             row0=0 if window_origin is None else window_origin[0],
             col0=0 if window_origin is None else window_origin[1],
-            native_height=state.primary.array.samples.shape[0],
+            native_height=reference_native_height,
             device=resolved_torch_device,
             client=dask_client,
         )
@@ -1835,7 +2017,7 @@ def stage_coregister(
             state.primary.carrier,
             row0=0 if window_origin is None else window_origin[0],
             col0=0 if window_origin is None else window_origin[1],
-            native_height=state.primary.array.samples.shape[0],
+            native_height=reference_native_height,
         )
     state.coregistration_timings_s["radar_reramp"] = _clock_stop(device, reramp_started)
     state.secondary_aligned = sec_resamp

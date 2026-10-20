@@ -1229,3 +1229,76 @@ def test__produce_interferogram_pair_single_burst(tmp_path: Path) -> None:
     assert "complex_ifg" in root
     assert "coherence" in root
     assert "geocoded" not in root
+
+
+def test_stage_coregister_conforms_short_secondary_to_reference_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shorter secondary is padded; the shared Reference grid is never cropped."""
+    import faninsar.missions.s1.processing as production_mod
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
+
+    shape = (64, 96)
+    ref = _make_mock_scene(shape)
+    sec = _make_mock_scene((60, 96))
+    for scene in (ref, sec):
+        scene.geometry.range_spacing_m = 2.3
+        scene.geometry.wavelength_m = 0.056
+    observed: dict[str, tuple[int, int]] = {}
+
+    def fake_dense_geometry_offsets(**kwargs: object) -> OffsetFieldResult:
+        observed["geometry_shape"] = kwargs["shape"]  # type: ignore[assignment]
+        return OffsetFieldResult(
+            range_offset_px=np.zeros(shape, dtype=np.float32),
+            azimuth_offset_px=np.zeros(shape, dtype=np.float32),
+            coverage=np.ones(shape, dtype=bool),
+            uncertainty_px=np.zeros(shape, dtype=np.float32),
+        )
+
+    def fake_resample(samples: np.ndarray, **_kwargs: object) -> np.ndarray:
+        observed["secondary_shape"] = samples.shape
+        return samples.copy()
+
+    monkeypatch.setattr(
+        production_mod, "dense_geometry_offsets", fake_dense_geometry_offsets
+    )
+    monkeypatch.setattr(
+        production_mod, "resample_complex_deramped_reramp", fake_resample
+    )
+    state = ProductionPairState(
+        pair_id="short-secondary",
+        primary=ref,
+        secondary=sec,
+        dem=ConstantDEM(0.0),
+    )
+    state.primary_deramped = np.ones(shape, dtype=np.complex64)
+    state.secondary_deramped = np.ones((60, 96), dtype=np.complex64)
+
+    result = stage_coregister(state, device="cpu")
+
+    assert observed == {"geometry_shape": shape, "secondary_shape": shape}
+    assert result.primary_deramped is not None
+    assert result.primary_deramped.shape == shape
+    assert result.secondary_aligned is not None
+    assert result.secondary_aligned.shape == shape
+    assert np.all(result.secondary_aligned[60:] == 0)
+
+
+def test_reference_window_crop_is_contained_in_every_pair_crop() -> None:
+    """The persisted Reference ROI crop never depends on pair offsets."""
+    from faninsar.missions.s1.processing import (
+        _WINDOW_HALO_FLOOR_PX,
+        _window_crop_bounds,
+        reference_window_crop,
+    )
+
+    shape = (1500, 22000)
+    window = (300, 700, 5000, 9000)
+    reference = reference_window_crop(window, shape)
+    assert reference == _window_crop_bounds(window, shape, 8, _WINDOW_HALO_FLOOR_PX)
+    for halo in (_WINDOW_HALO_FLOOR_PX, 80, 157, 400):
+        pair = _window_crop_bounds(window, shape, 8, halo)
+        assert pair[0] <= reference[0]
+        assert pair[1] >= reference[1]
+        assert pair[2] <= reference[2]
+        assert pair[3] >= reference[3]

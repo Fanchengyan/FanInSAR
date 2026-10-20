@@ -29,6 +29,7 @@ from faninsar.io.storage.ifg_store import (
     _canonical_json,
     _digest_bytes,
     _is_sha256,
+    _is_source_identity,
     _store_root,
     _validate_json_mapping,
     _validate_shape,
@@ -305,7 +306,7 @@ class IonosphereArtifactStore:
             not isinstance(sources, dict)
             or not sources
             or any(
-                not isinstance(name, str) or not name or not _is_sha256(digest)
+                not isinstance(name, str) or not name or not _is_source_identity(digest)
                 for name, digest in sources.items()
             )
         ):
@@ -476,7 +477,7 @@ def write_ionosphere_artifact(
     _canonical_json(parameters)
     sources = dict(source_manifest_digests)
     if not sources or any(
-        not isinstance(name, str) or not name or not _is_sha256(digest)
+        not isinstance(name, str) or not name or not _is_source_identity(digest)
         for name, digest in sources.items()
     ):
         reject_invalid_state("ion artifact source manifest digests are invalid")

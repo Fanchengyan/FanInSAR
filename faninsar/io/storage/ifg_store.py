@@ -94,6 +94,13 @@ def _digest_file(path: Path) -> str:
     return digest_path(path)
 
 
+def _is_source_identity(value: object) -> bool:
+    """Return whether a value is a SHA-256 digest or a product write id."""
+    from faninsar.io.storage.product import is_write_id
+
+    return _is_sha256(value) or is_write_id(value)
+
+
 def _is_sha256(value: object) -> bool:
     """Return whether a value is a canonical lowercase SHA-256 digest."""
     return (
@@ -496,7 +503,7 @@ class InterferogramArtifactStore:
             not isinstance(sources, dict)
             or not sources
             or any(
-                not isinstance(name, str) or not name or not _is_sha256(digest)
+                not isinstance(name, str) or not name or not _is_source_identity(digest)
                 for name, digest in sources.items()
             )
         ):
@@ -948,7 +955,7 @@ def write_ifg_artifact(
     _canonical_json(parameters)
     sources = dict(source_manifest_digests)
     if not sources or any(
-        not isinstance(name, str) or not name or not _is_sha256(digest)
+        not isinstance(name, str) or not name or not _is_source_identity(digest)
         for name, digest in sources.items()
     ):
         reject_invalid_state("IFG artifact source manifest digests are invalid")

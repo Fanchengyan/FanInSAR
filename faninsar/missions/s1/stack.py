@@ -844,12 +844,6 @@ class S1Stack(Stack):
         """Sentinel-1 NESD apply requires inverted date constants (F11)."""
         return self.config.coreg_mode == "nesd"
 
-    def _load_projection_scene(self, source_path: str, **kwargs: object) -> Any:
-        """Load a persisted radar projection scene at the S1 boundary."""
-        from faninsar.missions.s1.processing import load_production_scene
-
-        return load_production_scene(source_path, **kwargs)
-
     def _resolve_s1_nesd_selection(
         self,
     ) -> tuple[tuple[str, ...] | None, BurstSelection | None]:
@@ -924,6 +918,33 @@ class S1Stack(Stack):
             device=self.config.device,
         )
 
+    def _geo_lut_cache_dir(self) -> Path:
+        """Return the shared content-addressed geo2rdr LUT cache."""
+        configured = self.config.extra.get("geo_lut_cache_dir")
+        if configured is not None:
+            return Path(configured)
+        return self.config.work_dir / "cache" / "geo-lut"
+
+    def _prepare_reference_scene(self, *, overwrite: bool) -> Any:
+        """Compute (or reuse) the Reference scene product once per run."""
+        from faninsar.missions.s1.coregister import prepare_s1_reference
+
+        swaths, bursts = self._resolve_s1_nesd_selection()
+        return prepare_s1_reference(
+            _source_input(self.catalog.paths_for(self.reference)),
+            output_scene=self._scene_dir(self.reference),
+            swaths=swaths,
+            bursts=bursts,
+            roi=self._effective_roi_with_mask().roi,
+            dem=self._geometry_dem(),
+            coregistration_grid=self.config.coregistration_grid,
+            geo_grid=self.config.geo_grid,
+            geo_lut_cache_dir=self._geo_lut_cache_dir(),
+            orbit_path=self._orbit_path_for(self.reference),
+            device=self.config.device,
+            overwrite=overwrite,
+        )
+
     def _coregister_one_scene(
         self,
         date_id: str,
@@ -932,34 +953,26 @@ class S1Stack(Stack):
         misreg_az_px: float,
         misreg_rg_px: float,
         overwrite: bool,
+        reference_context: Any = None,
+        inputs: Mapping[str, str] | None = None,
+        properties: Mapping[str, object] | None = None,
     ) -> Any:
-        """Apply geometry plus date constants via ``coregister_s1_scene``."""
-        del overwrite
-        from faninsar.missions.s1.coregister import coregister_s1_scene
+        """Resample one secondary onto the once-prepared Reference context."""
+        from faninsar.missions.s1.coregister import coregister_s1_secondary
 
-        swaths, bursts = self._resolve_s1_nesd_selection()
-        extra_cache_dir = self.config.extra.get("geo_lut_cache_dir")
-        geo_lut_cache_dir = (
-            Path(extra_cache_dir)
-            if extra_cache_dir is not None
-            else self.config.work_dir / "cache" / "geo-lut"
-        )
-        coregister_s1_scene(
-            _source_input(self.catalog.paths_for(self.reference)),
+        if reference_context is None:
+            reference_context = self._prepare_reference_scene(overwrite=False)
+        coregister_s1_secondary(
+            reference_context,
             _source_input(self.catalog.paths_for(date_id)),
-            output_scenes=output_dir / "scenes",
-            swaths=swaths,
-            bursts=bursts,
-            roi=self._effective_roi_with_mask().roi,
-            dem=self._geometry_dem(),
+            output_scene=output_dir,
             misreg_az_px=misreg_az_px,
             misreg_rg_px=misreg_rg_px,
-            coregistration_grid=self.config.coregistration_grid,
-            geo_grid=self.config.geo_grid,
-            geo_lut_cache_dir=geo_lut_cache_dir,
-            primary_orbit_path=self._orbit_path_for(self.reference),
             secondary_orbit_path=self._orbit_path_for(date_id),
             device=self.config.device,
+            inputs=inputs,
+            properties=properties,
+            overwrite=overwrite,
         )
         return None
 

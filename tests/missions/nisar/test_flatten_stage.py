@@ -13,8 +13,8 @@ from faninsar.missions.nisar.provider import _sanitize_phase_screen
 from faninsar.io.storage.scene_store import (
     CoregisteredSceneStore,
     form_merged_scene_interferogram,
-    write_scene_unit,
 )
+from tests.support.scene_stores import open_test_scene, write_test_scene
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -29,20 +29,17 @@ def _scene(
 ) -> CoregisteredSceneStore:
     """Write one minimal scene artifact and reopen its validated store."""
     samples = np.ones((2, 2), dtype=np.complex64)
-    write_scene_unit(
-        root,
-        date_id=date_id,
-        reference_id="20240101",
-        domain="radar",
-        tag="NISAR_b0",
-        primary=samples,
-        secondary=samples,
-        row_origin=0,
-        col_origin=0,
-        phase_state={"flatten_stage": stage},
-        phase_screen=phase_screen,
+    return open_test_scene(
+        write_test_scene(
+            root,
+            date_id=date_id,
+            reference_id="20240101",
+            payload=samples,
+            tag="NISAR_b0",
+            phase_state={"flatten_stage": stage},
+            phase_screen=phase_screen,
+        )
     )
-    return CoregisteredSceneStore.open(root)
 
 
 def test_stack_config_rejects_unknown_flatten_stage(tmp_path: Path) -> None:
@@ -72,9 +69,9 @@ def test_interferogram_stage_applies_screen_with_ifg_sign_and_preserves_amplitud
 ) -> None:
     """The persisted screen contributes exp(-j phase) before output formation."""
     phase = np.full((2, 2), 0.37, dtype=np.float32)
-    reference = _scene(tmp_path / "reference", "20240101", stage="interferogram")
+    reference = _scene(tmp_path, "20240101", stage="interferogram")
     secondary = _scene(
-        tmp_path / "secondary",
+        tmp_path,
         "20240113",
         stage="interferogram",
         phase_screen=phase,
@@ -82,8 +79,6 @@ def test_interferogram_stage_applies_screen_with_ifg_sign_and_preserves_amplitud
     product = form_merged_scene_interferogram(
         reference,
         secondary,
-        primary_role="primary",
-        secondary_role="secondary",
         multilook=(1, 1),
         flatten_stage="interferogram",
     )
@@ -95,17 +90,17 @@ def test_default_coregistration_remains_unflattened_at_ifg_boundary(
     tmp_path: Path,
 ) -> None:
     """Default scene formation retains its historical complex product."""
-    reference = _scene(tmp_path / "reference", "20240101")
-    secondary = _scene(tmp_path / "secondary", "20240113")
+    reference = _scene(tmp_path, "20240101")
+    secondary = _scene(tmp_path, "20240113")
     product = form_merged_scene_interferogram(reference, secondary, multilook=(1, 1))
     np.testing.assert_allclose(product.complex_ifg, 1.0 + 0.0j)
 
 
 def test_mixed_flattening_stages_fail_closed(tmp_path: Path) -> None:
     """A pair cannot combine scene generations from different stages."""
-    reference = _scene(tmp_path / "reference", "20240101")
+    reference = _scene(tmp_path, "20240101")
     secondary = _scene(
-        tmp_path / "secondary",
+        tmp_path,
         "20240113",
         stage="interferogram",
         phase_screen=np.zeros((2, 2), dtype=np.float32),

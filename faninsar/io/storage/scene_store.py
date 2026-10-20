@@ -1,23 +1,21 @@
-"""Manifest-bound Reference-aligned SLC scene storage for Stack formation."""
+"""Reference-aligned SLC scene products for Stack formation (PROPOSAL-0059)."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 import numpy as np
 
 from faninsar.io.storage._zarr_stac import (
-    digest_path,
     read_zarr_array,
     validate_spatial_metadata,
-    validate_stac_item,
-    write_stac_item,
     write_zarr_array,
 )
+from faninsar.io.storage.product import ProductWriter, open_product
 from faninsar.processing.errors import reject_invalid_state
 from faninsar.processing.interferometry.pair import (
     InterferogramProduct,
@@ -27,7 +25,7 @@ from faninsar.processing.interferometry.pair import (
     mask_invalid_looks,
 )
 
-SCENE_SCHEMA = "scene_artifact_v1"
+SCENE_KIND = "scene"
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -152,70 +150,9 @@ def scene_grid_identity(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _reject_symlink_components(path: Path) -> None:
-    """Reject a path whose existing components contain symbolic links.
-
-    Parameters
-    ----------
-    path : pathlib.Path
-        Path to validate. Missing leaf components are allowed so callers can
-        create a new store or payload after validation.
-
-    Raises
-    ------
-    InvalidProcessingStateError
-        If an existing path component is a symbolic link or cannot be
-        inspected safely.
-
-    """
-    absolute = path if path.is_absolute() else Path.cwd() / path
-    current = Path(absolute.anchor)
-    for component in absolute.parts[1:]:
-        current /= component
-        try:
-            if current.is_symlink():
-                reject_invalid_state(
-                    f"scene store path contains a symbolic link: {current}"
-                )
-        except OSError as error:
-            reject_invalid_state(f"scene store path cannot be inspected: {error}")
-
-
-def _validated_store_root(root: str | Path, *, create: bool) -> Path:
-    """Validate a caller-owned scene store root before reading or writing."""
-    path = Path(root)
-    _reject_symlink_components(path)
-    if path.exists():
-        if not path.is_dir():
-            reject_invalid_state(f"scene store root is not a directory: {path}")
-    elif create:
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
-            reject_invalid_state(f"scene store root cannot be created: {error}")
-        _reject_symlink_components(path)
-        if not path.is_dir() or path.is_symlink():
-            reject_invalid_state(f"scene store root is unsafe: {path}")
-    else:
-        reject_invalid_state(f"scene store root is missing: {path}")
-    return path
-
-
-def _safe_payload_path(root: Path, value: object, field: str) -> Path:
-    """Resolve a manifest payload filename without allowing path traversal."""
-    if not isinstance(value, str):
-        reject_invalid_state(f"scene manifest {field} must be a filename")
-    candidate = Path(value)
-    if (
-        candidate.is_absolute()
-        or len(candidate.parts) != 1
-        or candidate.name != value
-        or value in {"", ".", ".."}
-    ):
-        reject_invalid_state(f"scene manifest {field} must be a basename")
-    path = root / candidate
-    _reject_symlink_components(path)
-    return path
+def _scene_role(date_id: str, reference_id: str) -> str:
+    """Return the persisted role of one acquisition product."""
+    return "reference" if date_id == reference_id else "secondary"
 
 
 def _require_basename(value: object, field: str) -> str:
@@ -233,558 +170,580 @@ def _require_basename(value: object, field: str) -> str:
     return value
 
 
-def _sha256(path: Path) -> str:
-    return digest_path(path)
-
-
 @dataclass(frozen=True, slots=True)
 class SceneUnit:
-    """One immutable Reference-grid aligned SLC unit."""
+    """One Reference-grid aligned SLC unit (burst or tile) of one acquisition."""
 
     tag: str
-    primary_path: Path
-    secondary_path: Path
+    payload_path: Path
     shape: tuple[int, int]
     row_origin: int
     col_origin: int
-    payload_digest: str
     scientific_lineage: tuple[dict[str, str], ...] = ()
     phase_state: dict[str, object] | None = None
     phase_screen_path: Path | None = None
-    phase_screen_digest: str | None = None
 
     def __post_init__(self) -> None:
-        """Validate the unit's bounded shape and digest."""
+        """Validate the unit's bounded shape."""
         if (
             not self.tag
             or len(self.shape) != 2
             or any(size <= 0 for size in self.shape)
         ):
             reject_invalid_state("scene unit has an invalid tag or shape")
-        if len(self.payload_digest) != 64:
-            reject_invalid_state("scene unit payload digest is invalid")
 
 
 @dataclass(frozen=True, slots=True)
 class CoregisteredSceneStore:
-    """Read-only manifest-bound store for one Stack date."""
+    """One committed scene product: an acquisition on the Reference grid.
+
+    The Stack Reference is one product (``faninsar:role == "reference"``);
+    every other acquisition is one secondary product that binds the
+    Reference ``write_id`` it was aligned against.
+    """
 
     root: Path
     date_id: str
     reference_id: str
     domain: str
     units: tuple[SceneUnit, ...]
-    manifest_digest: str
+    write_id: str
     grid_shape: tuple[int, int]
     wavelength_m: float | None
     grid_identity: str
     crs: str | None = None
     transform: tuple[float, ...] | None = None
     flatten_stage: str = "coregistration"
+    inputs: dict[str, str] = field(default_factory=dict)
+    properties: dict[str, object] = field(default_factory=dict, repr=False)
+
+    @property
+    def manifest_digest(self) -> str:
+        """Return the commit identity used by downstream lineage records."""
+        return self.write_id
 
     @classmethod
     def open(cls, root: str | Path) -> CoregisteredSceneStore:
-        """Open and validate a complete scene artifact generation.
+        """Open one committed scene product.
 
         Parameters
         ----------
-        root
-            Caller-owned scene store directory containing ``manifest.json``.
+        root : path-like
+            Scene product directory containing ``item.json``.
 
         Returns
         -------
         CoregisteredSceneStore
-            Immutable read-only store metadata.
+            Read-only view of the product metadata.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If the directory is not a committed scene product or its metadata
+            is inconsistent.
 
         """
-        path = _validated_store_root(root, create=False)
-        manifest_path = path / "manifest.json"
-        if not manifest_path.is_file() or manifest_path.is_symlink():
-            reject_invalid_state(f"scene manifest missing or unsafe: {manifest_path}")
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            reject_invalid_state(f"scene manifest cannot be read: {error}")
-        if manifest.get("schema_version") != SCENE_SCHEMA:
-            reject_invalid_state("unsupported scene artifact schema")
-        if "master_id" in manifest or "master" in manifest:
-            reject_invalid_state(
-                "legacy scene manifest uses master terminology; rebuild with "
-                "reference_id"
-            )
-        if "reference_id" not in manifest:
-            reject_invalid_state("scene manifest reference_id is missing")
-        raw_units = manifest.get("units")
-        if not isinstance(raw_units, list):
-            reject_invalid_state("scene manifest units must be a list")
-        units: list[SceneUnit] = []
-        for raw in raw_units:
-            if not isinstance(raw, dict):
-                reject_invalid_state("scene manifest unit must be an object")
-            primary = _safe_payload_path(path, raw.get("primary_file"), "primary_file")
-            secondary = _safe_payload_path(
-                path, raw.get("secondary_file"), "secondary_file"
-            )
-            for payload in (primary, secondary):
-                if not payload.is_dir() or payload.is_symlink():
-                    reject_invalid_state(f"scene payload missing or unsafe: {payload}")
-            shape = (int(raw["rows"]), int(raw["cols"]))
-            units.append(
-                SceneUnit(
-                    tag=str(raw["tag"]),
-                    primary_path=primary,
-                    secondary_path=secondary,
-                    shape=shape,
-                    row_origin=int(raw["row_origin"]),
-                    col_origin=int(raw["col_origin"]),
-                    payload_digest=str(raw["payload_digest"]),
-                    scientific_lineage=tuple(
-                        item
-                        for item in raw.get("scientific_lineage", [])
-                        if isinstance(item, dict)
-                    ),
-                    phase_state=(
-                        dict(raw["phase_state"])
-                        if isinstance(raw.get("phase_state"), dict)
-                        else None
-                    ),
-                    phase_screen_path=(
-                        _safe_payload_path(
-                            path,
-                            raw["phase_screen_file"],
-                            "phase_screen_file",
-                        )
-                        if raw.get("phase_screen_file") is not None
-                        else None
-                    ),
-                    phase_screen_digest=(
-                        str(raw["phase_screen_digest"])
-                        if raw.get("phase_screen_digest") is not None
-                        else None
-                    ),
-                )
-            )
-            unit = units[-1]
-            if unit.phase_screen_path is not None:
-                if (
-                    not unit.phase_screen_path.is_dir()
-                    or unit.phase_screen_path.is_symlink()
-                    or unit.phase_screen_digest is None
-                    or _sha256(unit.phase_screen_path) != unit.phase_screen_digest
-                ):
-                    reject_invalid_state(
-                        f"scene phase screen missing or digest mismatch: {unit.tag}"
-                    )
-                try:
-                    screen = read_zarr_array(unit.phase_screen_path)
-                except (OSError, ValueError) as error:
-                    reject_invalid_state(
-                        f"scene phase screen cannot be read for {unit.tag!r}: {error}"
-                    )
-                if screen.shape != unit.shape or screen.dtype != np.float32:
-                    reject_invalid_state(
-                        f"scene phase screen shape or dtype mismatch for {unit.tag!r}"
-                    )
-            elif unit.phase_screen_digest is not None:
-                reject_invalid_state(
-                    f"scene phase screen digest has no payload for {unit.tag!r}"
-                )
-        if not units:
-            reject_invalid_state("scene store has no complete units")
-        expected_digest = str(manifest.get("manifest_digest", ""))
-        unsigned = dict(manifest)
-        unsigned.pop("manifest_digest", None)
-        actual_digest = hashlib.sha256(
-            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        if expected_digest != actual_digest:
-            reject_invalid_state("scene manifest digest mismatch")
-        raw_grid_shape = manifest.get("shape", manifest.get("grid_shape"))
-        if raw_grid_shape is None:
-            grid_shape = (
-                max(unit.row_origin + unit.shape[0] for unit in units),
-                max(unit.col_origin + unit.shape[1] for unit in units),
-            )
-        elif (
-            not isinstance(raw_grid_shape, list)
-            or len(raw_grid_shape) != 2
-            or any(
-                not isinstance(size, int) or isinstance(size, bool) or size <= 0
-                for size in raw_grid_shape
-            )
-        ):
-            reject_invalid_state("scene manifest grid_shape is invalid")
-        else:
-            grid_shape = (int(raw_grid_shape[0]), int(raw_grid_shape[1]))
-        if any(
-            unit.row_origin < 0
-            or unit.col_origin < 0
-            or unit.row_origin + unit.shape[0] > grid_shape[0]
-            or unit.col_origin + unit.shape[1] > grid_shape[1]
-            for unit in units
-        ):
-            reject_invalid_state("scene unit lies outside the declared common grid")
-        unit_stages = {
-            str((unit.phase_state or {}).get("flatten_stage", "coregistration"))
-            for unit in units
-        }
-        manifest_stage = str(
-            manifest.get("flatten_stage", next(iter(unit_stages), "coregistration"))
-        )
-        if manifest_stage not in {"coregistration", "interferogram"}:
-            reject_invalid_state("scene manifest flatten_stage is unsupported")
-        if unit_stages != {manifest_stage}:
-            reject_invalid_state("scene units mix flattening stages")
-        raw_wavelength = manifest.get("wavelength_m")
-        wavelength_m = None if raw_wavelength is None else float(raw_wavelength)
-        if wavelength_m is not None and (
-            not np.isfinite(wavelength_m) or wavelength_m <= 0.0
-        ):
-            reject_invalid_state("scene manifest wavelength_m is invalid")
-        domain = manifest.get("domain")
+        product = open_product(root, kind=SCENE_KIND)
+        properties = dict(product.properties)
+        date_id = str(properties["faninsar:date"])
+        reference_id = str(properties["faninsar:reference"])
+        role = properties.get("faninsar:role")
+        if role != _scene_role(date_id, reference_id):
+            reject_invalid_state("scene product role does not match its date")
+        domain = properties.get("faninsar:domain")
         if domain not in {"radar", "geo"}:
-            reject_invalid_state("scene manifest domain is invalid")
-        raw_grid_identity = manifest.get("grid_identity")
-        if domain == "geo" and raw_grid_identity is None:
-            reject_invalid_state(
-                "Geo scene manifest requires an explicit grid_identity"
+            reject_invalid_state("scene product domain is invalid")
+        raw_shape = properties.get("faninsar:shape")
+        if not isinstance(raw_shape, list) or len(raw_shape) != 2:
+            reject_invalid_state("scene product grid shape is invalid")
+        grid_shape = (int(raw_shape[0]), int(raw_shape[1]))
+        units: list[SceneUnit] = []
+        for name, asset in sorted(product.assets.items()):
+            if asset.get("faninsar:role") != "slc":
+                continue
+            phase_name = asset.get("faninsar:phase_screen")
+            unit = SceneUnit(
+                tag=str(name),
+                payload_path=product.asset_path(name),
+                shape=(int(asset["faninsar:rows"]), int(asset["faninsar:cols"])),
+                row_origin=int(asset["faninsar:row_origin"]),
+                col_origin=int(asset["faninsar:col_origin"]),
+                scientific_lineage=tuple(
+                    item
+                    for item in asset.get("faninsar:lineage", [])
+                    if isinstance(item, dict)
+                ),
+                phase_state=(
+                    dict(asset["faninsar:phase_state"])
+                    if isinstance(asset.get("faninsar:phase_state"), dict)
+                    else None
+                ),
+                phase_screen_path=(
+                    product.asset_path(str(phase_name)) if phase_name else None
+                ),
             )
-        grid_identity = str(
-            raw_grid_identity or scene_grid_identity(domain, grid_shape)
-        )
-        crs = manifest.get("crs")
-        transform = manifest.get("transform")
+            if (
+                unit.row_origin < 0
+                or unit.col_origin < 0
+                or unit.row_origin + unit.shape[0] > grid_shape[0]
+                or unit.col_origin + unit.shape[1] > grid_shape[1]
+            ):
+                reject_invalid_state("scene unit lies outside the declared common grid")
+            units.append(unit)
+        if not units:
+            reject_invalid_state("scene product has no units")
+        flatten_stage = str(properties.get("faninsar:flatten_stage", "coregistration"))
+        if flatten_stage not in {"coregistration", "interferogram"}:
+            reject_invalid_state("scene product flatten_stage is unsupported")
+        raw_wavelength = properties.get("faninsar:wavelength_m")
+        wavelength_m = None if raw_wavelength is None else float(raw_wavelength)
         _, _, grid_identity, crs, transform = validate_spatial_metadata(
             domain,
             grid_shape,
-            grid_identity,
-            crs=crs,
-            transform=transform,
-        )
-        validate_stac_item(
-            path / "stac-item.json",
-            item_id=f"scene-{manifest['date_id']}",
-            domain=domain,
-            shape=grid_shape,
-            grid_identity=grid_identity,
-            crs=crs,
-            transform=transform,
+            str(properties.get("faninsar:grid_identity")),
+            crs=properties.get("proj:code"),
+            transform=properties.get("proj:transform"),
         )
         return cls(
-            root=path,
-            date_id=str(manifest["date_id"]),
-            reference_id=str(manifest["reference_id"]),
+            root=Path(root),
+            date_id=date_id,
+            reference_id=reference_id,
             domain=domain,
             units=tuple(units),
-            manifest_digest=actual_digest,
+            write_id=product.write_id,
             grid_shape=grid_shape,
             wavelength_m=wavelength_m,
             grid_identity=grid_identity,
             crs=crs,
             transform=transform,
-            flatten_stage=manifest_stage,
+            flatten_stage=flatten_stage,
+            inputs=product.inputs,
+            properties=properties,
         )
+
+    @property
+    def role(self) -> str:
+        """Return ``"reference"`` for the Reference product, else ``"secondary"``."""
+        return _scene_role(self.date_id, self.reference_id)
+
+    @property
+    def is_reference(self) -> bool:
+        """Return whether this product holds the Stack Reference acquisition."""
+        return self.date_id == self.reference_id
+
+    @property
+    def radar_geometry(self) -> dict[str, object] | None:
+        """Return the persisted Reference frame geometry record, if any."""
+        value = self.properties.get("faninsar:radar_geometry")
+        return dict(value) if isinstance(value, dict) else None
+
+    def stale_inputs(self, current: Mapping[str, object]) -> list[str]:
+        """Return the bound upstream names whose ``write_id`` changed.
+
+        Parameters
+        ----------
+        current : mapping
+            Current upstream products or write ids by binding name.
+
+        """
+        stale = []
+        for name, write_id in sorted(self.inputs.items()):
+            upstream = current.get(name)
+            upstream_id = getattr(upstream, "write_id", upstream)
+            if upstream_id != write_id:
+                stale.append(name)
+        return stale
 
     def read_phase_screen(self, tag: str) -> np.ndarray | None:
         """Read one persisted range-offset phase screen, if present."""
         unit = self.unit_map().get(tag)
         if unit is None:
-            reject_invalid_state(f"scene unit {tag!r} is not in the manifest")
+            reject_invalid_state(f"scene unit {tag!r} is not in the product")
         if unit.phase_screen_path is None:
             return None
         screen = read_zarr_array(unit.phase_screen_path)
         if screen.shape != unit.shape or screen.dtype != np.float32:
             reject_invalid_state(f"scene phase screen shape mismatch for {tag!r}")
-        if _sha256(unit.phase_screen_path) != unit.phase_screen_digest:
-            reject_invalid_state(f"scene phase screen digest mismatch for {tag!r}")
         return np.asarray(screen, dtype=np.float32)
 
     def unit_map(self) -> dict[str, SceneUnit]:
         """Return units keyed by their stable burst tag."""
-        tags = [unit.tag for unit in self.units]
-        if len(tags) != len(set(tags)):
-            reject_invalid_state("scene store contains duplicate unit tags")
         return {unit.tag: unit for unit in self.units}
 
-    def read(self, tag: str) -> tuple[np.ndarray, np.ndarray, SceneUnit]:
-        """Read one unit after validating both payload bytes and shape."""
+    def read(self, tag: str) -> tuple[np.ndarray, SceneUnit]:
+        """Read one unit payload and validate its shape and dtype.
+
+        Parameters
+        ----------
+        tag : str
+            Stable unit identifier within the product.
+
+        Returns
+        -------
+        tuple[numpy.ndarray, SceneUnit]
+            The complex64 SLC payload of this acquisition and its unit record.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If the unit is unknown or its shape or dtype differs from the item.
+
+        """
         unit = self.unit_map().get(tag)
         if unit is None:
-            reject_invalid_state(f"scene unit {tag!r} is not in the manifest")
-        payload_digest = hashlib.sha256(
-            (_sha256(unit.primary_path) + _sha256(unit.secondary_path)).encode()
-        ).hexdigest()
-        if payload_digest != unit.payload_digest:
-            reject_invalid_state(f"scene unit {tag!r} payload digest mismatch")
-        primary = read_zarr_array(unit.primary_path)
-        secondary = read_zarr_array(unit.secondary_path)
-        if primary.shape != unit.shape or secondary.shape != unit.shape:
+            reject_invalid_state(f"scene unit {tag!r} is not in the product")
+        payload = read_zarr_array(unit.payload_path)
+        if payload.shape != unit.shape:
             reject_invalid_state(f"scene unit {tag!r} shape mismatch")
-        if primary.dtype != np.complex64 or secondary.dtype != np.complex64:
+        if payload.dtype != np.complex64:
             reject_invalid_state(f"scene unit {tag!r} dtype mismatch")
-        return primary, secondary, unit
+        return payload, unit
 
 
-def write_scene_unit(
+@dataclass(slots=True)
+class _PendingUnit:
+    """One staged unit awaiting product commit."""
+
+    tag: str
+    rows: int
+    cols: int
+    row_origin: int
+    col_origin: int
+    lineage: list[dict[str, str]]
+    phase_state: dict[str, object] | None
+    phase_screen: bool
+
+
+class SceneWriter:
+    """Stage the units of one scene product and commit it once.
+
+    Every unit of an acquisition is written into one staging directory; the
+    product (one ``item.json``) is published by :meth:`commit`. A crash
+    before commit leaves no scene product, so a partially coregistered date
+    is never mistaken for a complete one.
+
+    Parameters
+    ----------
+    root : path-like
+        Final scene product directory, ``<work_dir>/coreg/<date>``.
+    date_id, reference_id : str
+        Acquisition and Stack Reference identifiers.
+    domain : {"radar", "geo"}
+        Coordinate domain.
+    grid_shape : tuple[int, int]
+        Common scene grid dimensions.
+    wavelength_m : float, optional
+        Radar wavelength in metres.
+    grid_identity : str, optional
+        Canonical grid SHA-256; required for geo, derived for radar.
+    crs, transform : optional
+        Geographic CRS and affine transform (geo only).
+    overwrite : bool, optional
+        Replace an existing product on commit.
+
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        date_id: str,
+        reference_id: str,
+        domain: str,
+        grid_shape: tuple[int, int],
+        wavelength_m: float | None = None,
+        grid_identity: str | None = None,
+        crs: object = None,
+        transform: object = None,
+        overwrite: bool = False,
+    ) -> None:
+        """Validate the product header and open its staging directory."""
+        if domain not in {"radar", "geo"}:
+            reject_invalid_state("scene domain must be radar or geo")
+        if domain == "geo" and grid_identity is None:
+            reject_invalid_state(
+                "Geo scene publication requires an explicit grid_identity"
+            )
+        if wavelength_m is not None and (
+            not np.isfinite(wavelength_m) or wavelength_m <= 0.0
+        ):
+            reject_invalid_state("scene wavelength_m must be finite and positive")
+        shape = (int(grid_shape[0]), int(grid_shape[1]))
+        if any(size <= 0 for size in shape):
+            reject_invalid_state("scene grid shape must be positive")
+        identity = grid_identity or scene_grid_identity(domain, shape)
+        _, _, identity, resolved_crs, resolved_transform = validate_spatial_metadata(
+            domain, shape, identity, crs=crs, transform=transform
+        )
+        self.date_id = str(date_id)
+        self.reference_id = str(reference_id)
+        self.domain = domain
+        self.grid_shape = shape
+        self.wavelength_m = None if wavelength_m is None else float(wavelength_m)
+        self.grid_identity = identity
+        self.crs = resolved_crs
+        self.transform = resolved_transform
+        self._writer = ProductWriter(root, kind=SCENE_KIND, overwrite=overwrite)
+        self._units: dict[str, _PendingUnit] = {}
+
+    @property
+    def staging(self) -> Path:
+        """Return the staging directory (for scratch files owned by the unit)."""
+        return self._writer.staging
+
+    def add_unit(
+        self,
+        *,
+        tag: str,
+        payload: np.ndarray,
+        row_origin: int,
+        col_origin: int,
+        scientific_lineage: Sequence[Mapping[str, str]] | None = None,
+        phase_state: Mapping[str, object] | None = None,
+        phase_screen: np.ndarray | None = None,
+    ) -> None:
+        """Stage one aligned unit payload."""
+        _require_basename(tag, "tag")
+        if tag in self._units:
+            reject_invalid_state(f"scene unit {tag!r} staged twice")
+        if (
+            payload.ndim != 2
+            or any(size <= 0 for size in payload.shape)
+            or payload.dtype != np.complex64
+        ):
+            reject_invalid_state("aligned scene payload must be a 2-D complex64 array")
+        if (
+            row_origin < 0
+            or col_origin < 0
+            or row_origin + payload.shape[0] > self.grid_shape[0]
+            or col_origin + payload.shape[1] > self.grid_shape[1]
+        ):
+            reject_invalid_state("scene unit lies outside the declared common grid")
+        if phase_screen is not None and (
+            phase_screen.ndim != 2
+            or phase_screen.shape != payload.shape
+            or phase_screen.dtype != np.float32
+            or not np.all(np.isfinite(phase_screen))
+        ):
+            reject_invalid_state("phase screen must be finite matching float32 array")
+        write_zarr_array(self.staging / f"{tag}.slc.zarr", payload)
+        if phase_screen is not None:
+            write_zarr_array(self.staging / f"{tag}.phase.zarr", phase_screen)
+        self._units[tag] = _PendingUnit(
+            tag=tag,
+            rows=int(payload.shape[0]),
+            cols=int(payload.shape[1]),
+            row_origin=int(row_origin),
+            col_origin=int(col_origin),
+            lineage=[dict(item) for item in (scientific_lineage or ())],
+            phase_state=dict(phase_state) if phase_state is not None else None,
+            phase_screen=phase_screen is not None,
+        )
+
+    def commit(
+        self,
+        *,
+        inputs: Mapping[str, object] | None = None,
+        properties: Mapping[str, object] | None = None,
+    ) -> CoregisteredSceneStore:
+        """Publish the scene product and return it.
+
+        Parameters
+        ----------
+        inputs : mapping, optional
+            Upstream products or write ids (secondaries bind ``reference``
+            and, when NESD constants were applied, ``misreg``).
+        properties : mapping, optional
+            Extra ``faninsar:`` properties (radar geometry, coregistration
+            record).
+
+        """
+        if not self._units:
+            self._writer.abort()
+            reject_invalid_state("scene product has no units")
+        stages = {
+            str((unit.phase_state or {}).get("flatten_stage", "coregistration"))
+            for unit in self._units.values()
+        }
+        if len(stages) != 1:
+            self._writer.abort()
+            reject_invalid_state("scene units mix flattening stages")
+        flatten_stage = next(iter(stages))
+        if flatten_stage not in {"coregistration", "interferogram"}:
+            self._writer.abort()
+            reject_invalid_state("scene flatten_stage is unsupported")
+        for tag, unit in sorted(self._units.items()):
+            fields: dict[str, object] = {
+                "faninsar:role": "slc",
+                "faninsar:rows": unit.rows,
+                "faninsar:cols": unit.cols,
+                "faninsar:row_origin": unit.row_origin,
+                "faninsar:col_origin": unit.col_origin,
+                "faninsar:lineage": unit.lineage,
+                "faninsar:phase_state": unit.phase_state,
+            }
+            if unit.phase_screen:
+                fields["faninsar:phase_screen"] = f"{tag}.phase"
+                self._writer.add_asset(
+                    f"{tag}.phase", f"{tag}.phase.zarr", **{"faninsar:role": "phase"}
+                )
+            self._writer.add_asset(tag, f"{tag}.slc.zarr", **fields)
+        header: dict[str, object] = {
+            "faninsar:date": self.date_id,
+            "faninsar:reference": self.reference_id,
+            "faninsar:role": _scene_role(self.date_id, self.reference_id),
+            "faninsar:domain": self.domain,
+            "faninsar:shape": list(self.grid_shape),
+            "faninsar:wavelength_m": self.wavelength_m,
+            "faninsar:grid_identity": self.grid_identity,
+            "faninsar:flatten_stage": flatten_stage,
+            **dict(properties or {}),
+        }
+        if self.crs is not None:
+            header["proj:code"] = self.crs
+            header["proj:transform"] = list(self.transform or ())
+        product = self._writer.commit(header, inputs=inputs)  # type: ignore[arg-type]
+        return CoregisteredSceneStore.open(product.path)
+
+    def abort(self) -> None:
+        """Discard the staged product."""
+        self._writer.abort()
+
+    def __enter__(self) -> Self:
+        """Return the writer."""
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        """Abort an uncommitted product when the block raised."""
+        self._writer.__exit__(exc_type, exc, traceback)
+
+
+def write_scene(
     root: str | Path,
     *,
     date_id: str,
     reference_id: str,
     domain: str,
-    tag: str,
-    primary: np.ndarray,
-    secondary: np.ndarray,
-    row_origin: int,
-    col_origin: int,
+    units: Sequence[Mapping[str, object]],
     grid_shape: tuple[int, int] | None = None,
     wavelength_m: float | None = None,
     grid_identity: str | None = None,
     crs: object = None,
     transform: object = None,
-    scientific_lineage: Sequence[Mapping[str, str]] | None = None,
-    phase_state: Mapping[str, object] | None = None,
-    phase_screen: np.ndarray | None = None,
-    validate_existing_payloads: bool = True,
-) -> None:
-    """Atomically add one aligned unit and publish a complete manifest.
+    inputs: Mapping[str, object] | None = None,
+    properties: Mapping[str, object] | None = None,
+    overwrite: bool = False,
+) -> CoregisteredSceneStore:
+    """Write a complete scene product from in-memory units in one call.
 
     Parameters
     ----------
     root : path-like
-        Scene-store directory.
+        Final scene product directory.
     date_id, reference_id : str
-        Secondary acquisition and Stack Reference identifiers.
-    domain : str
-        Coordinate domain, either radar or geographic.
-    tag : str
-        Stable unit identifier within the store.
-    primary, secondary : numpy.ndarray
-        Matching complex64 scene arrays.
-    row_origin, col_origin : int
-        Unit origin within the declared common grid.
-    grid_shape : tuple of int, optional
-        Common scene dimensions. Defaults to the unit extent.
+        Acquisition and Stack Reference identifiers.
+    domain : {"radar", "geo"}
+        Coordinate domain.
+    units : sequence of mapping
+        Each mapping holds the :meth:`SceneWriter.add_unit` keyword arguments
+        (``tag``, ``payload``, ``row_origin``, ``col_origin`` and optional
+        lineage, phase state, and phase screen).
+    grid_shape : tuple[int, int], optional
+        Common grid; defaults to the union extent of the units.
     wavelength_m : float, optional
         Radar wavelength in metres.
     grid_identity : str, optional
-        Canonical coordinate-grid SHA-256.
-    crs : object, optional
-        Geographic CRS required for ``domain="geo"`` and forbidden for radar.
-    transform : object, optional
-        Six-value geographic affine transform required for ``domain="geo"``.
-    scientific_lineage : sequence of mappings, optional
-        Source and processing lineage attached to the unit.
-    phase_state : mapping, optional
-        Phase-correction state attached to the unit.
-    phase_screen : numpy.ndarray, optional
-        Exact finite float32 phase screen in radians for the unit.
-    validate_existing_payloads : bool, optional
-        Re-read all previously published payload bytes before appending. A
-        streaming producer that has already validated its resume tiles may set
-        this to ``False`` to avoid quadratic I/O while retaining manifest
-        validation. The default preserves the public fail-closed behavior.
+        Canonical grid SHA-256 (required for geo).
+    crs, transform : optional
+        Geographic CRS and affine transform (geo only).
+    inputs : mapping, optional
+        Upstream products or write ids.
+    properties : mapping, optional
+        Extra item properties.
+    overwrite : bool, optional
+        Replace an existing product.
+
+    Returns
+    -------
+    CoregisteredSceneStore
+        The committed scene product.
 
     """
-    path = _validated_store_root(root, create=True)
-    _require_basename(tag, "tag")
-    if (
-        primary.ndim != 2
-        or secondary.ndim != 2
-        or primary.shape != secondary.shape
-        or any(size <= 0 for size in primary.shape)
-        or primary.dtype != np.complex64
-        or secondary.dtype != np.complex64
-    ):
-        reject_invalid_state("aligned scene arrays must be matching complex64 arrays")
-    if phase_screen is not None and (
-        phase_screen.ndim != 2
-        or phase_screen.shape != primary.shape
-        or phase_screen.dtype != np.float32
-        or not np.all(np.isfinite(phase_screen))
-    ):
-        reject_invalid_state("phase screen must be finite matching float32 array")
-    resolved_grid_shape = grid_shape or (
-        int(row_origin) + int(primary.shape[0]),
-        int(col_origin) + int(primary.shape[1]),
-    )
-    if (
-        len(resolved_grid_shape) != 2
-        or any(size <= 0 for size in resolved_grid_shape)
-        or row_origin < 0
-        or col_origin < 0
-        or row_origin + primary.shape[0] > resolved_grid_shape[0]
-        or col_origin + primary.shape[1] > resolved_grid_shape[1]
-    ):
-        reject_invalid_state("scene unit lies outside the declared common grid")
-    if wavelength_m is not None and (
-        not np.isfinite(wavelength_m) or wavelength_m <= 0.0
-    ):
-        reject_invalid_state("scene wavelength_m must be finite and positive")
-    if domain not in {"radar", "geo"}:
-        reject_invalid_state("scene domain must be radar or geo")
-    if domain == "geo" and grid_identity is None:
-        reject_invalid_state("Geo scene publication requires an explicit grid_identity")
-    resolved_grid_identity = grid_identity or scene_grid_identity(
-        domain,
-        resolved_grid_shape,
-    )
-    if len(resolved_grid_identity) != 64 or any(
-        character not in "0123456789abcdef" for character in resolved_grid_identity
-    ):
-        reject_invalid_state("scene grid_identity must be a lowercase SHA-256")
-    _, _, resolved_grid_identity, resolved_crs, resolved_transform = (
-        validate_spatial_metadata(
-            domain,
-            (int(resolved_grid_shape[0]), int(resolved_grid_shape[1])),
-            resolved_grid_identity,
-            crs=crs,
-            transform=transform,
+    if grid_shape is None:
+        grid_shape = (
+            max(int(u["row_origin"]) + int(u["payload"].shape[0]) for u in units),  # type: ignore[union-attr]
+            max(int(u["col_origin"]) + int(u["payload"].shape[1]) for u in units),  # type: ignore[union-attr]
         )
-    )
-    manifest_path = path / "manifest.json"
-    existing: dict[str, object] = {}
-    if manifest_path.is_file():
-        existing_store = CoregisteredSceneStore.open(path)
-        if validate_existing_payloads:
-            for existing_unit in existing_store.units:
-                existing_store.read(existing_unit.tag)
-        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if (
-            existing.get("date_id") != date_id
-            or existing.get("reference_id") != reference_id
-            or existing.get("domain") != domain
-        ):
-            reject_invalid_state("scene units must share date, Reference, and domain")
-        existing_grid_shape = existing.get("grid_shape")
-        if existing_grid_shape is not None and existing_grid_shape != list(
-            resolved_grid_shape
-        ):
-            reject_invalid_state("scene units must share one common grid shape")
-        if existing.get("wavelength_m") != wavelength_m:
-            reject_invalid_state("scene units must share one radar wavelength")
-        existing_grid_identity = existing.get("grid_identity")
-        if existing_grid_identity is not None and (
-            existing_grid_identity != resolved_grid_identity
-        ):
-            reject_invalid_state("scene units must share one coordinate grid")
-        if existing.get("crs") != resolved_crs or existing.get("transform") != (
-            list(resolved_transform) if resolved_transform else None
-        ):
-            reject_invalid_state("scene units must share one spatial reference")
-    primary_path = path / f"{tag}.primary.zarr"
-    sec_path = path / f"{tag}.secondary.zarr"
-    for target, array in ((primary_path, primary), (sec_path, secondary)):
-        write_zarr_array(target, np.asarray(array, dtype=np.complex64))
-    phase_path: Path | None = None
-    phase_digest: str | None = None
-    if phase_screen is not None:
-        phase_path = path / f"{tag}.phase.zarr"
-        write_zarr_array(phase_path, np.asarray(phase_screen, dtype=np.float32))
-        phase_digest = _sha256(phase_path)
-    else:
-        import shutil
-
-        old_phase_path = path / f"{tag}.phase.zarr"
-        if old_phase_path.exists():
-            shutil.rmtree(old_phase_path)
-    units = [item for item in existing.get("units", []) if item.get("tag") != tag]
-    unit_record = {
-        "tag": tag,
-        "primary_file": primary_path.name,
-        "secondary_file": sec_path.name,
-        "rows": int(primary.shape[0]),
-        "cols": int(primary.shape[1]),
-        "row_origin": int(row_origin),
-        "col_origin": int(col_origin),
-        "payload_digest": hashlib.sha256(
-            (_sha256(primary_path) + _sha256(sec_path)).encode()
-        ).hexdigest(),
-        "scientific_lineage": [dict(item) for item in (scientific_lineage or ())],
-        "phase_state": dict(phase_state) if phase_state is not None else None,
-    }
-    if phase_path is not None:
-        unit_record["phase_screen_file"] = phase_path.name
-        unit_record["phase_screen_digest"] = phase_digest
-    units.append(unit_record)
-    flatten_stage = str((phase_state or {}).get("flatten_stage", "coregistration"))
-    if flatten_stage not in {"coregistration", "interferogram"}:
-        reject_invalid_state("scene flatten_stage is unsupported")
-    unsigned = {
-        "schema_version": SCENE_SCHEMA,
-        "status": "complete",
-        "date_id": date_id,
-        "reference_id": reference_id,
-        "domain": domain,
-        "shape": list(resolved_grid_shape),
-        "grid_shape": list(resolved_grid_shape),
-        "wavelength_m": wavelength_m,
-        "grid_identity": resolved_grid_identity,
-        "crs": resolved_crs,
-        "transform": list(resolved_transform) if resolved_transform else None,
-        "flatten_stage": flatten_stage,
-        "units": sorted(units, key=lambda item: str(item["tag"])),
-    }
-    manifest = {
-        **unsigned,
-        "manifest_digest": hashlib.sha256(
-            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
-    }
-    temporary_manifest = manifest_path.with_suffix(".json.tmp")
-    temporary_manifest.write_text(
-        json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary_manifest.replace(manifest_path)
-    assets = {
-        f"{unit['tag']}-{role}": unit[f"{role}_file"]
-        for unit in units
-        for role in ("primary", "secondary")
-    }
-    for unit in units:
-        if unit.get("phase_screen_file"):
-            assets[f"{unit['tag']}-phase"] = unit["phase_screen_file"]
-    write_stac_item(
-        path / "stac-item.json",
-        item_id=f"scene-{date_id}",
-        assets=assets,
+    with SceneWriter(
+        root,
+        date_id=date_id,
+        reference_id=reference_id,
         domain=domain,
-        shape=(int(resolved_grid_shape[0]), int(resolved_grid_shape[1])),
-        grid_identity=resolved_grid_identity,
-        crs=resolved_crs,
-        transform=resolved_transform,
-    )
+        grid_shape=grid_shape,
+        wavelength_m=wavelength_m,
+        grid_identity=grid_identity,
+        crs=crs,
+        transform=transform,
+        overwrite=overwrite,
+    ) as writer:
+        for unit in units:
+            writer.add_unit(**unit)  # type: ignore[arg-type]
+        return writer.commit(inputs=inputs, properties=properties)
 
 
-def copy_reference_units(source: str | Path, target: str | Path) -> None:
-    """Copy Reference payloads into the Reference store without source aliases."""
-    source_store = CoregisteredSceneStore.open(source)
-    destination = Path(target)
-    if (destination / "manifest.json").is_file():
-        existing_store = CoregisteredSceneStore.open(destination)
-        for existing_unit in existing_store.units:
-            existing_store.read(existing_unit.tag)
-    for unit in source_store.units:
-        primary, _, _ = source_store.read(unit.tag)
-        write_scene_unit(
-            destination,
-            date_id=source_store.reference_id,
-            reference_id=source_store.reference_id,
-            domain=source_store.domain,
-            tag=unit.tag,
-            primary=primary,
-            secondary=primary,
-            row_origin=unit.row_origin,
-            col_origin=unit.col_origin,
-            grid_shape=source_store.grid_shape,
-            wavelength_m=source_store.wavelength_m,
-            grid_identity=source_store.grid_identity,
-            crs=source_store.crs,
-            transform=source_store.transform,
-            scientific_lineage=unit.scientific_lineage,
-            phase_state=unit.phase_state,
-            phase_screen=None,
-            validate_existing_payloads=False,
+def validate_reference_binding(
+    reference_store: CoregisteredSceneStore,
+    secondary_store: CoregisteredSceneStore,
+) -> None:
+    """Validate that a secondary product was aligned against this Reference.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the products disagree on Reference, grid, domain, or unit
+        placement, or the secondary binds another Reference ``write_id``.
+
+    """
+    if not reference_store.is_reference:
+        reject_invalid_state("scene Reference binding requires a Reference product")
+    if secondary_store.is_reference:
+        reject_invalid_state("scene Reference binding requires a secondary product")
+    _validate_store_compatibility(reference_store, secondary_store)
+    if secondary_store.inputs.get("reference") != reference_store.write_id:
+        reject_invalid_state(
+            f"scene {secondary_store.date_id} was aligned against another "
+            "Reference; recoregister it with overwrite=True"
         )
+    reference_units = reference_store.unit_map()
+    for tag, unit in secondary_store.unit_map().items():
+        reference_unit = reference_units.get(tag)
+        if reference_unit is None:
+            reject_invalid_state(f"secondary scene unit {tag!r} has no Reference unit")
+        if (
+            unit.shape != reference_unit.shape
+            or unit.row_origin != reference_unit.row_origin
+            or unit.col_origin != reference_unit.col_origin
+        ):
+            reject_invalid_state(
+                f"scene unit {tag!r} grid placement differs from the Reference"
+            )
+
+
+def _validate_store_compatibility(
+    first: CoregisteredSceneStore,
+    second: CoregisteredSceneStore,
+) -> None:
+    """Reject scene products that do not share one Reference grid."""
+    if first.domain != second.domain:
+        reject_invalid_state("scene artifact domains do not match")
+    if first.reference_id != second.reference_id:
+        reject_invalid_state("scene artifacts use different References")
+    if first.grid_shape != second.grid_shape:
+        reject_invalid_state("scene artifact common grid shapes do not match")
+    if first.wavelength_m != second.wavelength_m:
+        reject_invalid_state("scene artifact radar wavelengths do not match")
+    if first.grid_identity != second.grid_identity:
+        reject_invalid_state("scene artifact coordinate grids do not match")
 
 
 def _tag_swath(tag: str) -> str:
@@ -797,53 +756,130 @@ def _tag_swath(tag: str) -> str:
     return parts[1]
 
 
-def _validate_nisar_geo_ownership(store: CoregisteredSceneStore) -> None:
-    """Validate deterministic, non-overlapping NISAR Geo tile ownership."""
+NISAR_GEO_COVERAGE_POLICY = "reference_first_valid_row_major_v1"
+
+
+def valid_samples(values: np.ndarray) -> np.ndarray:
+    """Return the finite, non-zero support mask of one complex payload."""
+    return np.isfinite(values.real) & np.isfinite(values.imag) & (np.abs(values) > 0)
+
+
+def _requires_nisar_geo_ownership(store: CoregisteredSceneStore) -> bool:
+    """Return whether a store carries tiled NISAR Geo ownership metadata."""
     if store.domain != "geo" or not any(
         unit.tag.startswith("NISAR_b") for unit in store.units
     ):
-        return
+        return False
     policies = {(unit.phase_state or {}).get("coverage_policy") for unit in store.units}
     if policies == {None}:
-        # Backward-compatible bounded NISAR generations predate tiled ownership.
-        return
-    if policies != {"joint_first_valid_row_major_v1"}:
+        # Bounded single-window NISAR generations have no tiled ownership.
+        return False
+    if policies != {NISAR_GEO_COVERAGE_POLICY}:
         reject_invalid_state("NISAR Geo scene mixes ownership contracts")
-    pair_owned = np.zeros(store.grid_shape, dtype=bool)
+    return True
+
+
+def _validate_nisar_geo_ownership(
+    store: CoregisteredSceneStore,
+    payloads: Mapping[str, np.ndarray],
+) -> None:
+    """Validate deterministic, non-overlapping NISAR Geo tile ownership.
+
+    Ownership is decided by the Reference alone: each Reference sample is
+    owned by the first tile (in tag order) that covers it with valid data, and
+    a secondary tile only carries samples its Reference tile owns. Both
+    therefore satisfy the same non-overlap and declared-count invariants.
+    """
+    owned = np.zeros(store.grid_shape, dtype=bool)
     for unit in sorted(store.units, key=lambda item: item.tag):
-        primary, secondary, _ = store.read(unit.tag)
+        valid = valid_samples(payloads[unit.tag])
+        declared_count = (unit.phase_state or {}).get("valid_pixels")
+        if declared_count != int(np.sum(valid)):
+            reject_invalid_state(
+                f"NISAR Geo scene unit {unit.tag!r} coverage count differs"
+            )
         row_slice = slice(unit.row_origin, unit.row_origin + unit.shape[0])
         col_slice = slice(unit.col_origin, unit.col_origin + unit.shape[1])
-        primary_valid = (
-            np.isfinite(primary.real)
-            & np.isfinite(primary.imag)
-            & (np.abs(primary) > 0.0)
-        )
-        secondary_valid = (
-            np.isfinite(secondary.real)
-            & np.isfinite(secondary.imag)
-            & (np.abs(secondary) > 0.0)
-        )
-        if not np.array_equal(primary_valid, secondary_valid):
-            reject_invalid_state(
-                f"NISAR Geo scene unit {unit.tag!r} has asymmetric pair ownership"
-            )
-        declared_count = (unit.phase_state or {}).get("pair_valid_pixels")
-        if declared_count != int(np.sum(primary_valid)):
-            reject_invalid_state(
-                f"NISAR Geo scene unit {unit.tag!r} pair coverage count differs"
-            )
-        if np.any(pair_owned[row_slice, col_slice] & primary_valid):
+        if np.any(owned[row_slice, col_slice] & valid):
             reject_invalid_state("NISAR Geo scene tiles have overlapping ownership")
-        pair_owned[row_slice, col_slice] |= primary_valid
+        owned[row_slice, col_slice] |= valid
+
+
+def _validate_pair_binding(
+    primary_store: CoregisteredSceneStore,
+    secondary_store: CoregisteredSceneStore,
+) -> list[str]:
+    """Validate that two acquisition products share one Reference.
+
+    Returns
+    -------
+    list[str]
+        Sorted unit tags present in both products. A unit one date does not
+        cover is left blank in the interferogram.
+
+    """
+    _validate_store_compatibility(primary_store, secondary_store)
+    primary_units = primary_store.unit_map()
+    secondary_units = secondary_store.unit_map()
+    common = sorted(set(primary_units) & set(secondary_units))
+    if not common:
+        reject_invalid_state("scene products share no unit")
+    for tag in common:
+        primary_unit = primary_units[tag]
+        secondary_unit = secondary_units[tag]
+        if (
+            primary_unit.shape != secondary_unit.shape
+            or primary_unit.row_origin != secondary_unit.row_origin
+            or primary_unit.col_origin != secondary_unit.col_origin
+        ):
+            reject_invalid_state(
+                f"scene unit {tag!r} grid placement differs across dates"
+            )
+    bound = {
+        store.write_id if store.is_reference else store.inputs.get("reference")
+        for store in (primary_store, secondary_store)
+    }
+    if len(bound) != 1:
+        reject_invalid_state(
+            "scene products were aligned against different Reference products"
+        )
+    return common
+
+
+def _phase_screen(store: CoregisteredSceneStore, tag: str) -> np.ndarray:
+    """Return one unit's range-offset phase screen, zero for the Reference."""
+    unit = store.unit_map()[tag]
+    screen = None if store.is_reference else store.read_phase_screen(tag)
+    if screen is None:
+        return np.zeros(unit.shape, dtype=np.float32)
+    return screen
+
+
+def validate_scene_ownership(store: CoregisteredSceneStore) -> None:
+    """Validate tiled NISAR Geo ownership of one store, if it declares any.
+
+    Parameters
+    ----------
+    store : CoregisteredSceneStore
+        Acquisition store to validate.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If tiles overlap or their declared coverage counts differ.
+
+    """
+    if _requires_nisar_geo_ownership(store):
+        _validate_nisar_geo_ownership(
+            store,
+            {tag: store.read(tag)[0] for tag in sorted(store.unit_map())},
+        )
 
 
 def form_merged_scene_interferogram(
     primary_store: CoregisteredSceneStore,
     secondary_store: CoregisteredSceneStore,
     *,
-    primary_role: str = "primary",
-    secondary_role: str = "secondary",
     multilook: tuple[int, int] = (1, 1),
     goldstein_alpha: float = 0.0,
     device: str = "auto",
@@ -863,9 +899,9 @@ def form_merged_scene_interferogram(
     Parameters
     ----------
     primary_store, secondary_store : CoregisteredSceneStore
-        Persisted Reference-aligned scene generations on one common grid.
-    primary_role, secondary_role : {"primary", "secondary"}, optional
-        Payload role selected from each generation.
+        Persisted acquisition stores of the pair's primary and secondary
+        dates. Either may be the single Stack Reference store; both must be
+        bound to the same Reference payloads.
     multilook : tuple[int, int], optional
         Azimuth and range boxcar look factors aligned to global origins.
     goldstein_alpha : float, optional
@@ -889,16 +925,7 @@ def form_merged_scene_interferogram(
         One merged common-grid interferogram and its quality layers.
 
     """
-    if primary_store.domain != secondary_store.domain:
-        reject_invalid_state("scene artifact domains do not match")
-    if primary_store.reference_id != secondary_store.reference_id:
-        reject_invalid_state("scene artifacts use different References")
-    if primary_store.grid_shape != secondary_store.grid_shape:
-        reject_invalid_state("scene artifact common grid shapes do not match")
-    if primary_store.wavelength_m != secondary_store.wavelength_m:
-        reject_invalid_state("scene artifact radar wavelengths do not match")
-    if primary_store.grid_identity != secondary_store.grid_identity:
-        reject_invalid_state("scene artifact coordinate grids do not match")
+    common = _validate_pair_binding(primary_store, secondary_store)
     if flatten_stage not in {"coregistration", "interferogram"}:
         reject_invalid_state("unsupported interferogram flattening stage")
     if (
@@ -906,12 +933,10 @@ def form_merged_scene_interferogram(
         or secondary_store.flatten_stage != flatten_stage
     ):
         reject_invalid_state("scene artifacts mix flattening stages")
-    _validate_nisar_geo_ownership(primary_store)
-    _validate_nisar_geo_ownership(secondary_store)
-    primary_units = primary_store.unit_map()
-    secondary_units = secondary_store.unit_map()
-    if set(primary_units) != set(secondary_units):
-        reject_invalid_state("scene artifact unit manifests differ")
+    validate_scene_ownership(primary_store)
+    validate_scene_ownership(secondary_store)
+    all_units = primary_store.unit_map()
+    primary_units = {tag: all_units[tag] for tag in common}
     az_looks, rg_looks = multilook
     if az_looks < 1 or rg_looks < 1:
         reject_invalid_state("multilook factors must be >= 1")
@@ -921,37 +946,18 @@ def form_merged_scene_interferogram(
         reject_invalid_state("multilook factors exceed the common scene grid")
     if len(primary_units) == 1:
         tag = next(iter(primary_units))
-        primary_ref, primary_sec, primary_unit = primary_store.read(tag)
-        secondary_ref, secondary_sec, secondary_unit = secondary_store.read(tag)
+        primary_unit = primary_units[tag]
         if (
-            primary_unit.shape == secondary_unit.shape
-            and primary_unit.row_origin == secondary_unit.row_origin
-            and primary_unit.col_origin == secondary_unit.col_origin
-            and primary_unit.row_origin == 0
+            primary_unit.row_origin == 0
             and primary_unit.col_origin == 0
             and primary_unit.shape == primary_store.grid_shape
         ):
-            valid_roles = {"primary", "secondary"}
-            if primary_role not in valid_roles or secondary_role not in valid_roles:
-                reject_invalid_state("unsupported scene payload role")
-            primary = primary_ref if primary_role == "primary" else primary_sec
-            secondary = secondary_ref if secondary_role == "primary" else secondary_sec
+            primary, _ = primary_store.read(tag)
+            secondary, _ = secondary_store.read(tag)
             if flatten_stage == "interferogram":
-                primary_screen = (
-                    primary_store.read_phase_screen(tag)
-                    if primary_role == "secondary"
-                    else None
+                screen = _phase_screen(secondary_store, tag) - _phase_screen(
+                    primary_store, tag
                 )
-                secondary_screen = (
-                    secondary_store.read_phase_screen(tag)
-                    if secondary_role == "secondary"
-                    else None
-                )
-                if primary_screen is None:
-                    primary_screen = np.zeros(primary.shape, dtype=np.float32)
-                if secondary_screen is None:
-                    secondary_screen = np.zeros(secondary.shape, dtype=np.float32)
-                screen = secondary_screen - primary_screen
                 # Multiplying the secondary by exp(+j screen) makes the
                 # resulting native IFG carry the required exp(-j screen)
                 # before the Pair kernel performs multilooking.
@@ -1039,38 +1045,17 @@ def form_merged_scene_interferogram(
         coherence_count = np.zeros((out_rows, out_cols), dtype=np.int32)
         claimed = np.zeros((out_rows, out_cols), dtype=np.int32)
         for tag in tags:
-            primary_ref, primary_sec, primary_unit = primary_store.read(tag)
-            secondary_ref, secondary_sec, secondary_unit = secondary_store.read(tag)
-            if (
-                primary_unit.shape != secondary_unit.shape
-                or primary_unit.row_origin != secondary_unit.row_origin
-                or primary_unit.col_origin != secondary_unit.col_origin
-            ):
-                reject_invalid_state(
-                    f"scene unit {tag!r} grid placement differs across dates"
-                )
-            primary = primary_ref if primary_role == "primary" else primary_sec
-            secondary = secondary_ref if secondary_role == "primary" else secondary_sec
-            valid_roles = {"primary", "secondary"}
-            if primary_role not in valid_roles or secondary_role not in valid_roles:
-                reject_invalid_state("unsupported scene payload role")
+            primary, primary_unit = primary_store.read(tag)
+            secondary, _ = secondary_store.read(tag)
             ifg = primary * np.conjugate(secondary)
             if flatten_stage == "interferogram":
-                primary_screen = (
-                    primary_store.read_phase_screen(tag)
-                    if primary_role == "secondary"
-                    else None
+                ifg *= np.exp(
+                    -1j
+                    * (
+                        _phase_screen(secondary_store, tag)
+                        - _phase_screen(primary_store, tag)
+                    )
                 )
-                secondary_screen = (
-                    secondary_store.read_phase_screen(tag)
-                    if secondary_role == "secondary"
-                    else None
-                )
-                if primary_screen is None:
-                    primary_screen = np.zeros(primary.shape, dtype=np.float32)
-                if secondary_screen is None:
-                    secondary_screen = np.zeros(secondary.shape, dtype=np.float32)
-                ifg *= np.exp(-1j * (secondary_screen - primary_screen))
             primary_power = primary.real**2 + primary.imag**2
             secondary_power = secondary.real**2 + secondary.imag**2
             valid = np.isfinite(ifg.real) & np.isfinite(ifg.imag) & (np.abs(ifg) > 0)
@@ -1210,8 +1195,6 @@ def form_scene_interferograms(
     primary_store: CoregisteredSceneStore,
     secondary_store: CoregisteredSceneStore,
     *,
-    primary_role: str = "primary",
-    secondary_role: str = "secondary",
     multilook: tuple[int, int] = (1, 1),
     goldstein_alpha: float = 0.0,
     device: str = "auto",
@@ -1222,9 +1205,7 @@ def form_scene_interferograms(
     Parameters
     ----------
     primary_store, secondary_store : CoregisteredSceneStore
-        Persisted Reference-aligned scene generations.
-    primary_role, secondary_role : str, optional
-        Payload role to consume from each generation.
+        Persisted acquisition stores bound to the same Reference payloads.
     multilook : tuple[int, int], optional
         Azimuth and range looks applied through the Pair interferogram kernel.
     goldstein_alpha : float, optional
@@ -1240,30 +1221,10 @@ def form_scene_interferograms(
         Multilooked and optionally filtered complex interferograms by burst tag.
 
     """
-    if primary_store.domain != secondary_store.domain:
-        reject_invalid_state("scene artifact domains do not match")
-    primary_units = primary_store.unit_map()
-    secondary_units = secondary_store.unit_map()
-    if set(primary_units) != set(secondary_units):
-        reject_invalid_state("scene artifact unit manifests differ")
     outputs: dict[str, np.ndarray] = {}
-    for tag in sorted(primary_units):
-        primary_ref, primary_sec, primary_unit = primary_store.read(tag)
-        secondary_ref, secondary_sec, secondary_unit = secondary_store.read(tag)
-        if primary_unit.shape != secondary_unit.shape:
-            reject_invalid_state(f"scene unit {tag!r} shape differs across dates")
-        if primary_role == "primary":
-            primary = primary_ref
-        elif primary_role == "secondary":
-            primary = primary_sec
-        else:
-            reject_invalid_state("unsupported primary scene role")
-        if secondary_role == "primary":
-            secondary = secondary_ref
-        elif secondary_role == "secondary":
-            secondary = secondary_sec
-        else:
-            reject_invalid_state("unsupported secondary scene role")
+    for tag in _validate_pair_binding(primary_store, secondary_store):
+        primary, _ = primary_store.read(tag)
+        secondary, _ = secondary_store.read(tag)
         complex_ifg = form_interferogram(
             primary,
             secondary,
@@ -1291,12 +1252,16 @@ def form_scene_interferograms(
 
 
 __all__ = [
-    "SCENE_SCHEMA",
+    "NISAR_GEO_COVERAGE_POLICY",
+    "SCENE_KIND",
     "CoregisteredSceneStore",
     "SceneUnit",
-    "copy_reference_units",
+    "SceneWriter",
     "form_merged_scene_interferogram",
     "form_scene_interferograms",
     "scene_grid_identity",
-    "write_scene_unit",
+    "valid_samples",
+    "validate_reference_binding",
+    "validate_scene_ownership",
+    "write_scene",
 ]

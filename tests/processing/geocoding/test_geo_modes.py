@@ -254,6 +254,53 @@ def test_coregister_geocoded_slcs_remaps_deramped_inputs_once() -> None:
     assert np.allclose(reference, secondary, atol=1e-6)
 
 
+def test_geo_reference_support_is_independent_of_secondary_coverage() -> None:
+    """Missing secondary samples never mask the shared Reference payload."""
+    from faninsar.processing.coregistration.offsets import OffsetFieldResult
+    from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
+
+    shape = (8, 10)
+    azimuth, range_index = np.meshgrid(
+        np.arange(1.0, 7.0),
+        np.arange(1.0, 9.0),
+        indexing="ij",
+    )
+    lut = Geo2RdrLUT(
+        az_full=azimuth,
+        rg_full=range_index,
+        valid=np.ones(azimuth.shape, dtype=bool),
+        full_radar_shape=shape,
+        height_m=0.0,
+    )
+    offsets = OffsetFieldResult(
+        range_offset_px=np.zeros(shape, dtype=np.float32),
+        azimuth_offset_px=np.zeros(shape, dtype=np.float32),
+        coverage=np.ones(shape, dtype=bool),
+        uncertainty_px=np.zeros(shape, dtype=np.float32),
+    )
+    reference_input = np.ones(shape, dtype=np.complex64)
+    secondary_input = reference_input.copy()
+    secondary_input[:, 5:] = np.complex64(np.nan + 1j * np.nan)
+    kwargs = {
+        "reference_carrier": _carrier(),
+        "secondary_carrier": _carrier(),
+        "reference_lut": lut,
+        "offsets": offsets,
+    }
+
+    full_reference, _, _ = coregister_geocoded_slcs(
+        reference_input, reference_input, **kwargs
+    )
+    reference, secondary, valid = coregister_geocoded_slcs(
+        reference_input, secondary_input, **kwargs
+    )
+
+    assert not valid.all()
+    assert np.isnan(secondary[~valid]).all()
+    np.testing.assert_array_equal(reference, full_reference)
+    assert np.isfinite(reference).all()
+
+
 def test_geo_reramp_keeps_nonqualified_stage_on_cpu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

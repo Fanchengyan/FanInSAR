@@ -15,7 +15,7 @@ from faninsar.io.storage.ifg_store import (
     write_ifg_artifact,
     write_unwrapped_artifact,
 )
-from faninsar.io.storage.scene_store import write_scene_unit
+from faninsar.io.storage.scene_store import write_scene
 from faninsar.missions.s1 import S1Stack
 from faninsar.network.products import AssetKind
 from faninsar.processing.geometry.prepared import (
@@ -32,6 +32,7 @@ from faninsar.stack import Stack, StackConfig, StackSceneProvider
 from faninsar.stack.activation import LocalActivationAuthority
 from faninsar.stack.catalog import SceneCatalog
 from faninsar.timeseries.io import write_timeseries_zarr
+from tests.support.scene_stores import write_test_scene
 
 if TYPE_CHECKING:
     from faninsar.stack.provider import SourceHandle
@@ -234,54 +235,6 @@ def test_s1_default_coreg_resume_identity_is_stable(tmp_path: Path) -> None:
     assert first == second
 
 
-def test_coreg_resume_restores_burst_array_shape_from_samples(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Radar resume accepts the production BurstArray shape contract."""
-    from types import SimpleNamespace
-
-    from faninsar.missions.s1.io import BurstArray
-
-    stack = _stack_with_three_date_network(tmp_path)
-    shape = (5, 7)
-    scene = SimpleNamespace(
-        array=BurstArray(
-            samples=np.ones(shape, dtype=np.complex64),
-            row0=0,
-            col0=0,
-            burst_index=0,
-            valid_mask=np.ones(shape, dtype=bool),
-        ),
-        geometry=object(),
-    )
-
-    def restore_scene(*_args: object, **_kwargs: object) -> object:
-        """Return a production-like scene with a BurstArray payload."""
-        return scene
-
-    monkeypatch.setattr(
-        "faninsar.missions.s1.processing.load_production_scene", restore_scene
-    )
-
-    stack._restore_radar_projection_context(
-        {
-            "radar_projection_context": {
-                "source_path": "scene.SAFE",
-                "swath": "IW1",
-                "burst_index": 0,
-                "orbit_path": None,
-                "full_range": True,
-                "full_radar_shape": list(shape),
-                "reference_scene": stack.reference,
-                "master_grid": {},
-            }
-        }
-    )
-
-    assert stack._radar_projection_context is not None
-    assert stack._radar_projection_context["full_radar_shape"] == shape
-
-
 def test_stack_runtime_identity_mutations_invalidate_coreg_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -357,19 +310,12 @@ def test_ifg_resume_binds_runtime_fingerprint(
     stack = _stack_with_three_date_network(tmp_path)
     data = np.ones((2, 2), dtype=np.complex64)
     for date_id in stack.catalog.dates:
-        root = stack.config.work_dir / "coreg" / date_id / "scenes"
-        write_scene_unit(
-            root,
+        write_test_scene(
+            stack.config.work_dir,
             date_id=date_id,
             reference_id=stack.reference,
-            domain="radar",
-            tag="f0_IW1_b0",
-            primary=data,
-            secondary=data,
-            row_origin=0,
-            col_origin=0,
+            payload=data,
         )
-        stack.coreg_paths[date_id] = root.parent
 
     stack.form_interferograms(multilook=(1, 1))
     store = InterferogramArtifactStore.open(stack.ifg_dirs[0])
@@ -386,14 +332,10 @@ def test_ifg_resume_binds_runtime_fingerprint(
         stack.form_interferograms(multilook=(1, 1))
 
 
-def test_coreg_resume_rejects_marker_after_provider_identity_change(
+def test_coreg_reuse_redoes_scene_after_provider_identity_change(
     tmp_path: Path,
 ) -> None:
-    """An old provider marker cannot authorize a changed source window."""
-    import json
-
-    from faninsar.processing.errors import InvalidProcessingStateError
-
+    """A scene coregistered under another source window is not reused."""
     stack = _stack_with_three_date_network(tmp_path)
     stack.config.extra.update({"mission": "NISAR", "nisar_window": (0, 16, 0, 16)})
     stack.scene_provider = SimpleNamespace(
@@ -403,91 +345,100 @@ def test_coreg_resume_rejects_marker_after_provider_identity_change(
         identity_metadata={"provider_revision": "v1"},
     )
     date_id = "20240113"
-    out = stack.config.work_dir / "coreg" / date_id
-    data = np.ones((2, 2), dtype=np.complex64)
-    write_scene_unit(
-        out / "scenes",
+    write_test_scene(
+        stack.config.work_dir,
         date_id=date_id,
         reference_id=stack.reference,
-        domain="radar",
-        tag="f0_IW1_b0",
-        primary=data,
-        secondary=data,
-        row_origin=0,
-        col_origin=0,
+        payload=np.ones((2, 2), dtype=np.complex64),
+        properties={
+            "faninsar:coreg_identity": stack._coreg_resume_identity(
+                date_id, misreg_az_px=0.0, misreg_rg_px=0.0
+            )
+        },
     )
-    marker = {
-        "reference": stack.reference,
-        "date": date_id,
-        "coreg_identity": stack._coreg_resume_identity(
-            date_id,
-            misreg_az_px=0.0,
-            misreg_rg_px=0.0,
-        ),
-    }
-    (out / "coreg_done.json").write_text(json.dumps(marker), encoding="utf-8")
+    current = stack._coreg_resume_identity(date_id, misreg_az_px=0.0, misreg_rg_px=0.0)
+    assert stack._reuse_scene(date_id, current)
     stack.config.extra["nisar_window"] = (0, 32, 0, 16)
+    changed = stack._coreg_resume_identity(date_id, misreg_az_px=0.0, misreg_rg_px=0.0)
+    assert changed != current
+    assert not stack._reuse_scene(date_id, changed)
 
-    with pytest.raises(InvalidProcessingStateError, match="current date"):
-        stack.coregister_scenes(dates=[date_id])
 
-
-def test_coregister_scenes_releases_prior_pair_before_next_date(
+def test_coregister_scenes_prepares_reference_once_for_all_dates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """S1 apply coregisters each date without routing through the pair engine."""
+    """S1 apply prepares the Reference once and never calls the pair engine."""
     from faninsar.processing.coregistration.misreg_network import DateMisreg
 
     stack = _stack_with_three_date_network(tmp_path)
     stack.date_misreg = DateMisreg(
         reference=stack.reference,
-        azimuth_px={date_id: 0.0 for date_id in stack.catalog.dates},
-        range_px={date_id: 0.0 for date_id in stack.catalog.dates},
+        azimuth_px=dict.fromkeys(stack.catalog.dates, 0.0),
+        range_px=dict.fromkeys(stack.catalog.dates, 0.0),
         metadata={},
     )
     produce_calls: list[str] = []
+    prepare_calls: list[Path] = []
     apply_dates: list[str] = []
 
     def fake_produce_pair(*_args: object, **_kwargs: object) -> None:
         produce_calls.append("produce_pair")
-        raise AssertionError("S1 coregister_scenes must not call _produce_pair")
+        message = "S1 coregister_scenes must not call _produce_pair"
+        raise AssertionError(message)
 
-    def fake_coregister(
-        _reference_path: object,
+    def fake_prepare(
+        _reference_path: object, *, output_scene: Path, **_k: object
+    ) -> str:
+        prepare_calls.append(Path(output_scene))
+        write_test_scene(
+            stack.config.work_dir,
+            date_id=stack.reference,
+            reference_id=stack.reference,
+            payload=np.ones((2, 2), dtype=np.complex64),
+        )
+        return "context"
+
+    def fake_secondary(
+        context: object,
         secondary_path: object,
         *,
-        output_scenes: Path,
+        output_scene: Path,
         **_kwargs: object,
-    ) -> Path:
+    ) -> None:
+        assert context == "context"
         date_id = Path(str(secondary_path)).name.split("_")[5][:8]
         apply_dates.append(date_id)
-        write_scene_unit(
-            output_scenes,
+        assert Path(output_scene) == stack.config.work_dir / "coreg" / date_id
+        write_test_scene(
+            stack.config.work_dir,
             date_id=date_id,
             reference_id=stack.reference,
-            domain="radar",
-            tag="f0_IW1_b0",
-            primary=np.ones((2, 2), dtype=np.complex64),
-            secondary=np.ones((2, 2), dtype=np.complex64),
-            row_origin=0,
-            col_origin=0,
+            payload=np.ones((2, 2), dtype=np.complex64),
         )
-        return Path(output_scenes)
 
     stack.scene_provider = StackSceneProvider(
         produce_pair=fake_produce_pair,
         name="TEST",
     )
     monkeypatch.setattr(
-        "faninsar.missions.s1.coregister.coregister_s1_scene",
-        fake_coregister,
+        "faninsar.missions.s1.coregister.prepare_s1_reference", fake_prepare
+    )
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.coregister_s1_secondary", fake_secondary
     )
 
     stack.coregister_scenes()
 
     assert produce_calls == []
+    assert prepare_calls == [stack.config.work_dir / "coreg" / stack.reference]
     assert apply_dates == ["20240113", "20240125"]
+    assert sorted(stack.scenes) == sorted(stack.catalog.dates)
+    assert stack.reference_scene is not None
+    assert stack.reference_scene.is_reference
+    assert stack.coreg_paths[stack.reference] == (
+        stack.config.work_dir / "coreg" / stack.reference
+    )
 
 
 def test_s1_default_scene_dispatch_uses_provider(
@@ -721,20 +672,16 @@ def test_stack_forms_all_persisted_burst_units(tmp_path: Path) -> None:
     reference = np.ones((2, 2), dtype=np.complex64)
     secondary = np.full((2, 2), 1.0 + 2.0j, dtype=np.complex64)
     for date_id in dates:
-        root = stack.config.work_dir / "coreg" / date_id / "scenes"
-        for tag in ("IW1_b0", "IW1_b1"):
-            write_scene_unit(
-                root,
-                date_id=date_id,
-                reference_id=dates[0],
-                domain="radar",
-                tag=tag,
-                primary=reference,
-                secondary=secondary,
-                row_origin=0,
-                col_origin=0,
-            )
-        stack.coreg_paths[date_id] = root.parent
+        write_test_scene(
+            stack.config.work_dir,
+            date_id=date_id,
+            reference_id=dates[0],
+            payload=reference if date_id == dates[0] else secondary,
+            reference_payload=reference,
+            tag=("IW1_b0", "IW1_b1"),
+            row_origin=0,
+            col_origin=0,
+        )
 
     stack.form_interferograms(multilook=(1, 1))
     output_root = stack.ifg_dirs[0]
@@ -783,19 +730,16 @@ def test_stack_applies_multilook_before_publishing_ifg(
         np.complex64
     )
     for date_id in dates:
-        root = stack.config.work_dir / "coreg" / date_id / "scenes"
-        write_scene_unit(
-            root,
+        write_test_scene(
+            stack.config.work_dir,
             date_id=date_id,
             reference_id=dates[0],
-            domain="radar",
+            payload=reference if date_id == dates[0] else secondary,
+            reference_payload=reference,
             tag="IW1_b0",
-            primary=reference,
-            secondary=secondary,
             row_origin=0,
             col_origin=0,
         )
-        stack.coreg_paths[date_id] = root.parent
 
     stack.form_interferograms(multilook=(2, 2), goldstein_alpha=0.5)
     assert observed["dask_client"] is client
@@ -910,19 +854,16 @@ def test_qualified_stack_form_requires_matching_activation_record(
     reference = np.ones((2, 2), dtype=np.complex64)
     secondary = np.full((2, 2), 1.0 + 2.0j, dtype=np.complex64)
     for date_id in dates:
-        root = stack.config.work_dir / "coreg" / date_id / "scenes"
-        write_scene_unit(
-            root,
+        write_test_scene(
+            stack.config.work_dir,
             date_id=date_id,
             reference_id=dates[0],
-            domain="radar",
+            payload=reference if date_id == dates[0] else secondary,
+            reference_payload=reference,
             tag="IW1_b0",
-            primary=reference,
-            secondary=secondary,
             row_origin=0,
             col_origin=0,
         )
-        stack.coreg_paths[date_id] = root.parent
     stack._write_qualified_activation_record()
 
     stack.form_interferograms(multilook=(1, 1))
@@ -1290,28 +1231,32 @@ def test_scene_artifacts_flow_through_merge_and_spatial_unwrap(
         "20240125": -0.55,
     }
     for date_id, phase in scene_phase.items():
-        root = stack.config.work_dir / "coreg" / date_id / "scenes"
         aligned = np.full(
             (2, 4),
             np.exp(1j * phase),
             dtype=np.complex64,
         )
         reference = np.ones((2, 4), dtype=np.complex64)
-        for tag, row_origin in (("f0_IW1_b0", 0), ("f0_IW1_b1", 2)):
-            write_scene_unit(
-                root,
-                date_id=date_id,
-                reference_id="20240101",
-                domain="radar",
-                tag=tag,
-                primary=reference,
-                secondary=aligned,
-                row_origin=row_origin,
-                col_origin=0,
-                grid_shape=(4, 4),
-                wavelength_m=0.056,
-            )
-        stack.coreg_paths[date_id] = root.parent
+        payload = reference if date_id == "20240101" else aligned
+        units = [
+            {"tag": tag, "payload": payload, "row_origin": row, "col_origin": 0}
+            for tag, row in (("f0_IW1_b0", 0), ("f0_IW1_b1", 2))
+        ]
+        bound = (
+            {}
+            if date_id == "20240101"
+            else {"reference": stack.scenes["20240101"].write_id}
+        )
+        write_scene(
+            stack.config.work_dir / "coreg" / date_id,
+            date_id=date_id,
+            reference_id="20240101",
+            domain="radar",
+            units=units,
+            grid_shape=(4, 4),
+            wavelength_m=0.056,
+            inputs=bound,
+        )
 
     stack.form_interferograms(multilook=(1, 1))
     stack.unwrap(SpatialIRLS())
@@ -1337,32 +1282,25 @@ def test_form_interferograms_rejects_stale_scene_lineage(tmp_path: Path) -> None
     ).prepare_scenes()
     data = np.ones((2, 2), dtype=np.complex64)
     for date_id in dates:
-        root = stack.config.work_dir / "coreg" / date_id / "scenes"
-        write_scene_unit(
-            root,
+        write_test_scene(
+            stack.config.work_dir,
             date_id=date_id,
             reference_id=dates[0],
-            domain="radar",
+            payload=data,
+            reference_payload=data,
             tag="f0_IW1_b0",
-            primary=data,
-            secondary=data,
             row_origin=0,
             col_origin=0,
             grid_shape=(2, 2),
         )
-        stack.coreg_paths[date_id] = root.parent
     stack.form_interferograms()
     changed = np.full((2, 2), 2.0 + 0.0j, dtype=np.complex64)
-    write_scene_unit(
-        stack.coreg_paths[dates[1]] / "scenes",
+    write_test_scene(
+        stack.config.work_dir,
         date_id=dates[1],
         reference_id=dates[0],
-        domain="radar",
-        tag="f0_IW1_b0",
-        primary=data,
-        secondary=changed,
-        row_origin=0,
-        col_origin=0,
+        payload=changed,
+        reference_payload=data,
         grid_shape=(2, 2),
     )
 
@@ -1438,78 +1376,71 @@ def test_stack_invert_rejects_unqualified_unwrap_artifacts(tmp_path: Path) -> No
         stack.invert_timeseries()
 
 
-def test_coregister_resume_rejects_scene_aligned_to_old_reference(
-    tmp_path: Path,
+def test_coregister_redoes_scene_aligned_to_another_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A work directory cannot resume scene artifacts from another Reference."""
-    import json
-
-    from faninsar.processing.errors import InvalidProcessingStateError
-
+    """A scene bound to another Reference is never reused; it is redone."""
     stack = _stack_with_three_date_network(tmp_path)
     date_id = "20240113"
-    out = stack.config.work_dir / "coreg" / date_id
     data = np.ones((2, 2), dtype=np.complex64)
-    write_scene_unit(
-        out / "scenes",
+    write_test_scene(
+        stack.config.work_dir,
+        date_id=stack.reference,
+        reference_id=stack.reference,
+        payload=data,
+    )
+    write_scene(
+        stack.config.work_dir / "coreg" / date_id,
         date_id=date_id,
         reference_id="20231220",
         domain="radar",
-        tag="f0_IW1_b0",
-        primary=data,
-        secondary=data,
-        row_origin=0,
-        col_origin=0,
+        units=[{"tag": "f0_IW1_b0", "payload": data, "row_origin": 0, "col_origin": 0}],
+        inputs={"reference": "0" * 26},
     )
-    (out / "coreg_done.json").write_text(
-        json.dumps({"reference": "20231220", "date": date_id}),
-        encoding="utf-8",
-    )
+    identity = stack._coreg_resume_identity(date_id, misreg_az_px=0.0, misreg_rg_px=0.0)
+    assert not stack._reuse_scene(date_id, identity)
+    redone: list[str] = []
 
-    with pytest.raises(InvalidProcessingStateError, match="Reference"):
-        stack.coregister_scenes(dates=[date_id])
+    def fake_one(date: str, **kwargs: object) -> None:
+        redone.append(date)
+        write_test_scene(
+            stack.config.work_dir,
+            date_id=date,
+            reference_id=stack.reference,
+            payload=data,
+            properties=dict(kwargs["properties"]),  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(stack, "_prepare_reference_scene", lambda **_k: None)
+    monkeypatch.setattr(stack, "_coregister_one_scene", fake_one)
+    monkeypatch.setattr(stack, "_reject_nesd_apply_without_constants", lambda: None)
+    stack.coregister_scenes(dates=[date_id])
+    assert redone == [date_id]
+    assert stack.scenes[date_id].reference_id == stack.reference
+    assert stack._reuse_scene(date_id, identity)
 
 
-def test_coregister_resume_rejects_changed_burst_request(tmp_path: Path) -> None:
-    """A marker for burst zero cannot authorize reuse for burst one."""
-    import json
-
-    from faninsar.processing.errors import InvalidProcessingStateError
-
+def test_coreg_reuse_rejects_changed_burst_request(tmp_path: Path) -> None:
+    """A scene coregistered for burst zero is not reused for burst one."""
     stack = _stack_with_three_date_network(tmp_path)
     date_id = "20240113"
-    out = stack.config.work_dir / "coreg" / date_id
-    data = np.ones((2, 2), dtype=np.complex64)
-    write_scene_unit(
-        out / "scenes",
-        date_id=date_id,
-        reference_id=stack.reference,
-        domain="radar",
-        tag="f0_IW1_b0",
-        primary=data,
-        secondary=data,
-        row_origin=0,
-        col_origin=0,
-    )
     initial_identity = stack._coreg_resume_identity(
         date_id,
         misreg_az_px=0.0,
         misreg_rg_px=0.0,
     )
-    (out / "coreg_done.json").write_text(
-        json.dumps(
-            {
-                "reference": stack.reference,
-                "date": date_id,
-                "coreg_identity": initial_identity,
-            }
-        ),
-        encoding="utf-8",
+    write_test_scene(
+        stack.config.work_dir,
+        date_id=date_id,
+        reference_id=stack.reference,
+        payload=np.ones((2, 2), dtype=np.complex64),
+        properties={"faninsar:coreg_identity": initial_identity},
     )
+    assert stack._reuse_scene(date_id, initial_identity)
     stack.config.bursts = {"IW1": [1]}
-
-    with pytest.raises(InvalidProcessingStateError, match="coregistration scene"):
-        stack.coregister_scenes(dates=[date_id])
+    changed = stack._coreg_resume_identity(date_id, misreg_az_px=0.0, misreg_rg_px=0.0)
+    assert changed != initial_identity
+    assert not stack._reuse_scene(date_id, changed)
 
 
 def test_coreg_resume_identity_captures_nested_dem_sampling_semantics(

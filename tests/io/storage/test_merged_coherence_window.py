@@ -6,12 +6,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from faninsar.io.storage.scene_store import (
-    CoregisteredSceneStore,
-    form_merged_scene_interferogram,
-    write_scene_unit,
-)
+from faninsar.io.storage.scene_store import form_merged_scene_interferogram
 from faninsar.processing.interferometry.pair import _sliding_coherence
+from tests.support.scene_stores import open_test_scene, write_test_scene
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -30,23 +27,21 @@ def test_merged_coherence_window_is_local_mle_not_single_sample(
         np.complex64
     )
     secondary = (reference + 1.5 * noise).astype(np.complex64)
-    for root, date in (("reference", "20240101"), ("secondary", "20240113")):
-        write_scene_unit(
-            tmp_path / root,
-            date_id=date,
-            reference_id="20240101",
-            domain="radar",
-            tag="IW1_b0",
-            primary=reference,
-            secondary=secondary,
-            row_origin=0,
-            col_origin=0,
-        )
-    first = CoregisteredSceneStore.open(tmp_path / "reference")
-    second = CoregisteredSceneStore.open(tmp_path / "secondary")
+    first = write_test_scene(
+        tmp_path, date_id="20240101", reference_id="20240101", payload=reference,
+        tag="IW1_b0",
+    )
+    second = write_test_scene(
+        tmp_path,
+        date_id="20240113",
+        reference_id="20240101",
+        payload=secondary,
+        reference_payload=reference,
+        tag="IW1_b0",
+    )
     product = form_merged_scene_interferogram(
-        first,
-        second,
+        open_test_scene(first),
+        open_test_scene(second),
         multilook=(1, 1),
         coherence_window=(5, 5),
     )

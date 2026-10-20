@@ -26,7 +26,6 @@ from faninsar.io.storage.ion_store import (
     write_ion_correction_artifact,
     write_ionosphere_artifact,
 )
-from faninsar.io.storage.scene_store import CoregisteredSceneStore
 from faninsar.logging import setup_logger
 from faninsar.processing.atmosphere.estimation import estimate_disp_nondisp
 from faninsar.processing.atmosphere.filter import (
@@ -41,6 +40,7 @@ from faninsar.processing.atmosphere.split_spectrum import split_range_spectrum
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
+    from faninsar.io.storage.scene_store import CoregisteredSceneStore
     from faninsar.processing.atmosphere.config import IonosphereEstimationConfig
     from faninsar.processing.unwrapping.snaphu_backend import SnaphuConfig
     from faninsar.stack.session import Stack
@@ -70,11 +70,11 @@ def _resolve_device(stack: Stack, device: str | None) -> str:
 
 def _scene_pair_store(stack: Stack, date_id: str) -> CoregisteredSceneStore:
     """Open one qualified single-unit radar-domain scene generation."""
-    if date_id not in stack.coreg_paths:
+    store = stack.scenes.get(date_id)
+    if store is None:
         reject_invalid_state(
-            f"Stack scene generation missing for {date_id}; run coregister_scenes first"
+            f"Stack scene product missing for {date_id}; run coregister_scenes first"
         )
-    store = CoregisteredSceneStore.open(stack.coreg_paths[date_id] / "scenes")
     if store.domain != "radar":
         reject_invalid_state(
             "ionosphere estimation requires radar-domain scene generations"
@@ -87,19 +87,11 @@ def _scene_pair_store(stack: Stack, date_id: str) -> CoregisteredSceneStore:
     return store
 
 
-def _load_role_payload(
-    store: CoregisteredSceneStore,
-    *,
-    date_id: str,
-    master: str,
-) -> np.ndarray:
-    """Load the exact payload role used by IFG formation for this date."""
-    role = "reference" if date_id == master else "secondary"
+def _load_scene_payload(store: CoregisteredSceneStore) -> np.ndarray:
+    """Load the single persisted payload of one acquisition store."""
     tag = next(iter(store.unit_map()))
-    reference_payload, secondary_payload, _ = store.read(tag)
-    if role == "reference":
-        return reference_payload
-    return secondary_payload
+    payload, _ = store.read(tag)
+    return payload
 
 
 def _ion_root(
@@ -254,12 +246,8 @@ def estimate_ionosphere(
                     f"scene generations disagree on {attribute}; ionosphere "
                     "estimation requires one common aligned grid"
                 )
-        primary_slc = _load_role_payload(
-            primary_store, date_id=primary, master=stack.reference
-        )
-        secondary_slc = _load_role_payload(
-            secondary_store, date_id=secondary, master=stack.reference
-        )
+        primary_slc = _load_scene_payload(primary_store)
+        secondary_slc = _load_scene_payload(secondary_store)
         if primary_slc.shape != secondary_slc.shape:
             reject_invalid_state("scene payloads do not share one grid")
 

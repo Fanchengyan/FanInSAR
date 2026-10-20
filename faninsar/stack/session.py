@@ -33,8 +33,8 @@ import numpy as np
 
 from faninsar.io.storage.scene_store import (
     CoregisteredSceneStore,
-    copy_reference_units,
     form_merged_scene_interferogram,
+    validate_reference_binding,
 )
 from faninsar.logging import setup_logger
 from faninsar.network.network import Network, NetworkContract
@@ -79,12 +79,7 @@ from faninsar.stack.input_manifest import (
     write_manifest,
 )
 from faninsar.stack.mask_plan import MaskPlan, StageName
-from faninsar.stack.provider import SourceHandle, UnsupportedStackCapabilityError
-from faninsar.stack.registration import (
-    CoregistrationReport,
-    RegistrationCapability,
-    identity_digest,
-)
+from faninsar.stack.provider import SourceHandle
 from faninsar.stack.search import (
     MissionPreparedInputs,
     MissionSearchProfile,
@@ -678,17 +673,15 @@ def _phase_screen_lineage(
     models: set[str] = set()
     digests: dict[str, dict[str, str]] = {}
     for role, store in stores:
+        # The IFG binds each scene by write id, so a screen is identified by
+        # its scene product and unit; the write id stands in for its digest.
         role_digests = {
-            unit.tag: unit.phase_screen_digest
+            unit.tag: store.write_id
             for unit in store.units
-            if unit.phase_screen_digest is not None
+            if unit.phase_screen_path is not None
         }
         if role_digests:
-            digests[role] = {
-                tag: digest
-                for tag, digest in sorted(role_digests.items())
-                if digest is not None
-            }
+            digests[role] = dict(sorted(role_digests.items()))
         for unit in store.units:
             state = unit.phase_state or {}
             model = state.get("range_offset_flatten", state.get("phase_screen_model"))
@@ -1095,11 +1088,7 @@ class Stack(NetworkContract):
     scene_provider: StackSceneProvider | None = field(default=None, repr=False)
     arcs: list[MisregArc] = field(default_factory=list)
     date_misreg: DateMisreg | None = None
-    _coregistration_report: CoregistrationReport | None = field(
-        default=None, repr=False
-    )
     _nesd_skipped_no_windows: bool = False
-    coreg_paths: dict[str, Path] = field(default_factory=dict)
     pair_states: dict[str, ProductionPairState] = field(default_factory=dict)
     ifg_dirs: list[Path] = field(default_factory=list)
     timeseries: TimeSeries | None = None
@@ -1114,9 +1103,6 @@ class Stack(NetworkContract):
     _effective_roi_resolution: _EffectiveRoi | None = field(default=None, repr=False)
     _materialized_masks: dict[tuple[tuple[str, ...], str], object] = field(
         default_factory=dict, repr=False
-    )
-    _radar_projection_context: dict[str, object] | None = field(
-        default=None, repr=False
     )
     _radar_projected_masks: dict[str, np.ndarray] = field(
         default_factory=dict, repr=False
@@ -1142,10 +1128,65 @@ class Stack(NetworkContract):
         self._product_index = None
         self._capture_dem_source()
 
+    def _scene_dir(self, date_id: str) -> Path:
+        """Return the scene product directory of one acquisition."""
+        return self.config.work_dir / "coreg" / date_id
+
     @property
-    def coregistration_report(self) -> CoregistrationReport | None:
-        """Return the latest mission-neutral coregistration report, if any."""
-        return self._coregistration_report
+    def scenes(self) -> dict[str, CoregisteredSceneStore]:
+        """Return the committed scene products by acquisition date.
+
+        Discovered from ``coreg/<date>/item.json``; the Reference is one of
+        them (see :attr:`reference_scene`).
+        """
+        from faninsar.io.storage.product import discover_products
+        from faninsar.io.storage.scene_store import SCENE_KIND
+
+        found: dict[str, CoregisteredSceneStore] = {}
+        for product in discover_products(
+            self.config.work_dir / "coreg", kind=SCENE_KIND
+        ):
+            store = CoregisteredSceneStore.open(product.path)
+            found[store.date_id] = store
+        return dict(sorted(found.items()))
+
+    @property
+    def reference_scene(self) -> CoregisteredSceneStore | None:
+        """Return the committed Reference scene product, if any."""
+        path = self._scene_dir(self.reference)
+        if not (path / "item.json").is_file():
+            return None
+        store = CoregisteredSceneStore.open(path)
+        if not store.is_reference:
+            reject_invalid_state(f"{path} does not hold the Stack Reference scene")
+        return store
+
+    @property
+    def coreg_paths(self) -> dict[str, Path]:
+        """Return the scene product directory of every coregistered date."""
+        return {date_id: store.root for date_id, store in self.scenes.items()}
+
+    def _reference_radar_geometry(self) -> tuple[object, tuple[int, int]]:
+        """Return the persisted Reference radar geometry and scene-grid shape.
+
+        Raises
+        ------
+        ValueError
+            If no radar Reference scene with a geometry record is committed.
+
+        """
+        from faninsar.processing.geometry.record import radar_geometry_from_record
+
+        reference = self.reference_scene
+        record = None if reference is None else reference.radar_geometry
+        if reference is None or reference.domain != "radar" or record is None:
+            message = (
+                "the Reference radar geometry is not available; run "
+                "coregister_scenes with coregistration_grid='radar' first"
+            )
+            logger.error(message)
+            raise ValueError(message)
+        return radar_geometry_from_record(record), reference.grid_shape
 
     @property
     def dem(self) -> RasterDEM | object | None:
@@ -1516,31 +1557,16 @@ class Stack(NetworkContract):
         )
 
     def _geocode_geometry(self, full_radar_shape: tuple[int, int]) -> object:
-        """Return the reference-scene radar geometry from the Stack context."""
-        context = self._radar_projection_context
-        if context is None:
-            configured = self.config.extra.get("radar_projection_context")
-            context = configured if isinstance(configured, dict) else None
-        geometry = None if context is None else context.get("geometry")
-        if geometry is None:
+        """Return the persisted Reference radar geometry for ``geocode``."""
+        geometry, grid_shape = self._reference_radar_geometry()
+        if tuple(full_radar_shape) != tuple(grid_shape):
             message = (
-                "geocode requires the reference-scene radar geometry; run "
-                "coregister_scenes first or configure "
-                "StackConfig.extra['radar_projection_context']"
+                "geocode product declares full_radar_shape "
+                f"{tuple(full_radar_shape)} but the Reference scene grid is "
+                f"{tuple(grid_shape)}"
             )
             logger.error(message)
             raise ValueError(message)
-        context_shape = context.get("full_radar_shape")
-        if context_shape is not None:
-            context_pair = tuple(int(value) for value in context_shape)
-            if context_pair != tuple(full_radar_shape):
-                message = (
-                    "geocode product declares full_radar_shape "
-                    f"{tuple(full_radar_shape)} but the Stack radar context "
-                    f"solved {context_pair}"
-                )
-                logger.error(message)
-                raise ValueError(message)
         return geometry
 
     def _capture_dem_source(self, dem: object | None = None) -> None:
@@ -2351,13 +2377,7 @@ class Stack(NetworkContract):
                 project_mask_to_radar,
             )
 
-            context = self._radar_projection_context
-            if context is None:
-                configured = self.config.extra.get("radar_projection_context")
-                context = configured if isinstance(configured, dict) else None
-            master = None if context is None else context.get("master_grid")
-            if master is None:
-                master = self.config.geo_grid
+            master = self.config.geo_grid
             if master is None:
                 message = (
                     "radar mask projection requires the authoritative geographic "
@@ -2382,30 +2402,12 @@ class Stack(NetworkContract):
             materialized = self._materialize_stage_mask(stage, target)
             if materialized is None:
                 return None
-            if context is None:
-                message = (
-                    "radar mask projection requires authoritative Stack radar "
-                    "geometry or LUT; run coregister_scenes first"
-                )
-                logger.error(message)
-                raise ValueError(message)
-            geometry = context.get("geometry")
-            lut = context.get("lut")
-            full_shape = context.get("full_radar_shape")
-            if full_shape is None:
-                message = "radar mask projection context is missing full_radar_shape"
-                logger.error(message)
-                raise ValueError(message)
-            if (geometry is None) == (lut is None):
-                message = (
-                    "radar mask projection context must provide exactly one "
-                    "authoritative geometry or LUT"
-                )
-                logger.error(message)
-                raise ValueError(message)
             from faninsar.processing.masking.radar_projection import (
                 radar_projection_cache_key,
             )
+
+            geometry, full_shape = self._reference_radar_geometry()
+            lut = None
 
             projection_key = radar_projection_cache_key(
                 source_mask_identity=materialized.identity,
@@ -2414,7 +2416,7 @@ class Stack(NetworkContract):
                     "shape": tuple(int(value) for value in full_shape),
                     "multilook": looks,
                 },
-                reference_scene=context.get("reference_scene", self.reference),
+                reference_scene=self.reference,
                 lut=lut,
                 geometry=geometry,
                 dem=self._geometry_dem(),
@@ -2430,7 +2432,7 @@ class Stack(NetworkContract):
                     device=self.config.device,
                     multilook=looks,
                     master_grid=target,
-                    reference_scene=context.get("reference_scene", self.reference),
+                    reference_scene=self.reference,
                 )
             projected_shape = tuple(
                 expected_shape or self._radar_projected_masks[projection_key].shape
@@ -2667,117 +2669,6 @@ class Stack(NetworkContract):
             "control_spacing": cfg.control_spacing,
             "n_jobs": cfg.n_jobs,
         }
-
-    def _radar_projection_context_record(self, state: Any) -> dict[str, object] | None:
-        """Return a durable descriptor for the authoritative radar context."""
-        scene = getattr(state, "primary", None)
-        geometry = getattr(scene, "geometry", None)
-        shape = _scene_array_shape(scene)
-        if geometry is None or shape is None:
-            logger.debug(
-                "scene provider did not publish radar projection context; "
-                "persisting a context-free radar marker"
-            )
-            return None
-        burst = getattr(scene, "burst", None)
-        swath = getattr(getattr(scene, "swath", None), "swath", None)
-        orbit_paths = self.config.extra.get("orbit_paths")
-        orbit_path = (
-            orbit_paths.get(self.reference) if isinstance(orbit_paths, dict) else None
-        )
-        return {
-            "source_path": str(
-                getattr(scene, "path", self.catalog.paths_for(self.reference))
-            ),
-            "swath": str(
-                swath or (self.config.swaths[0] if self.config.swaths else "IW1")
-            ),
-            "burst_index": int(getattr(burst, "index", 0)),
-            "orbit_path": None if orbit_path is None else str(orbit_path),
-            "full_range": True,
-            "full_radar_shape": [int(value) for value in shape],
-            "reference_scene": self.reference,
-            "master_grid": self._radar_master_grid_metadata(),
-        }
-
-    def _radar_master_grid_metadata(self) -> dict[str, object]:
-        """Return serializable metadata for the canonical radar mask master."""
-        grid = self.config.geo_grid
-        if grid is None:
-            return {}
-        return {
-            "crs": str(grid.crs),
-            "transform": [float(value) for value in grid.transform],
-            "shape": [int(value) for value in grid.shape],
-        }
-
-    def _restore_radar_projection_context(
-        self, marker_data: Mapping[str, object]
-    ) -> None:
-        """Restore radar geometry needed by masks after a coreg resume."""
-        configured = self.config.extra.get("radar_projection_context")
-        if isinstance(configured, dict) and configured.get("geometry") is not None:
-            self._radar_projection_context = dict(configured)
-            return
-        record = marker_data.get("radar_projection_context")
-        if not isinstance(record, dict):
-            # No context is allowed to degrade silently.  Keep the error at the
-            # projection boundary so callers without mask stages can still
-            # resume ordinary radar scenes.
-            self._radar_projection_context = None
-            return
-        source_path = record.get("source_path")
-        if not isinstance(source_path, str) or not source_path:
-            reject_invalid_state("persisted radar projection context lacks source_path")
-        try:
-            scene = self._load_projection_scene(
-                source_path,
-                swath=str(record.get("swath", "IW1")),
-                burst_index=int(record.get("burst_index", 0)),
-                orbit_path=record.get("orbit_path"),
-                coregistration_grid="radar",
-                full_range=bool(record.get("full_range", True)),
-            )
-        except Exception as error:
-            logger.exception("failed to restore radar projection geometry")
-            reject_invalid_state(
-                f"persisted radar projection context cannot be restored: {error}"
-            )
-        shape = tuple(int(value) for value in record.get("full_radar_shape", ()))
-        if len(shape) != 2 or any(value <= 0 for value in shape):
-            reject_invalid_state("persisted radar projection context shape is invalid")
-        restored_shape = _scene_array_shape(scene)
-        if restored_shape != shape:
-            reject_invalid_state(
-                "restored radar projection geometry shape differs from persisted "
-                "coregistration shape"
-            )
-        self._radar_projection_context = {
-            "geometry": scene.geometry,
-            "full_radar_shape": shape,
-            "reference_scene": record.get("reference_scene", self.reference),
-            "master_grid": self.config.geo_grid,
-        }
-
-    def _load_projection_scene(self, source_path: str, **kwargs: object) -> Any:
-        """Load one projection scene through the owning mission adapter.
-
-        The neutral Stack session does not import a mission implementation at
-        runtime.  Concrete adapters override this hook and perform their lazy
-        import at the mission boundary.
-
-        Raises
-        ------
-        UnsupportedStackCapabilityError
-            If the concrete mission has not admitted projection restoration.
-
-        """
-        del source_path, kwargs
-        raise UnsupportedStackCapabilityError(
-            self.__class__.__name__,
-            "radar-projection-restore",
-            "the mission adapter must provide a scene loader",
-        )
 
     def _reclaim_accelerator(self, kind: str) -> None:
         """Evaluate gpu_memory_reclaim on the CUDA-owning process."""
@@ -3167,30 +3058,42 @@ class Stack(NetworkContract):
         }
         return digest_payload(payload)
 
-    def _misreg_arcs_path(self) -> Path:
-        """Return the persisted pair-arc JSON path."""
-        return self.config.work_dir / "misreg" / "arcs.json"
+    def _misreg_dir(self) -> Path:
+        """Return the misreg product directory."""
+        return self.config.work_dir / "misreg"
 
-    def _nesd_skip_path(self) -> Path:
-        """Return the sidecar flag written when NESD is skipped for no windows."""
-        return self.config.work_dir / "misreg" / "no_overlap_windows.json"
+    def _persist_misreg(self) -> None:
+        """Commit arcs, constants, and the NESD skip outcome as one product."""
+        from faninsar.stack.misreg import write_misreg
 
-    def _write_nesd_skip_flag(self, skipped: bool) -> None:
-        """Persist or clear the no-overlap-window skip marker."""
-        path = self._nesd_skip_path()
-        if skipped:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("true\n", encoding="utf-8")
-            return
-        if path.is_file():
-            path.unlink()
+        write_misreg(
+            self._misreg_dir(),
+            arcs=list(self.arcs),
+            date_misreg=self.date_misreg,
+            skipped_no_windows=self._nesd_skipped_no_windows,
+        )
 
-    def _read_nesd_skip_flag(self) -> bool:
-        """Return True when a previous measure warned-and-skipped NESD."""
-        path = self._nesd_skip_path()
-        if not path.is_file():
+    def _restore_misreg(self) -> bool:
+        """Load the persisted misreg product into the Stack, if present."""
+        from faninsar.stack.misreg import read_misreg
+
+        record = read_misreg(self._misreg_dir())
+        if record is None:
             return False
-        return path.read_text(encoding="utf-8").strip().lower() in {"true", "1", "yes"}
+        self.arcs = list(record.arcs)
+        self.date_misreg = record.date_misreg
+        self._nesd_skipped_no_windows = record.skipped_no_windows
+        return True
+
+    @property
+    def _misreg_write_id(self) -> str | None:
+        """Return the misreg product write id NESD secondaries bind."""
+        if self.config.coreg_mode != "nesd":
+            return None
+        from faninsar.stack.misreg import read_misreg
+
+        record = read_misreg(self._misreg_dir())
+        return None if record is None else record.write_id
 
     def _zero_date_misreg(self, *, reason: str) -> DateMisreg:
         """Return geometry-zero constants for every catalog date."""
@@ -3200,25 +3103,6 @@ class Stack(NetworkContract):
             azimuth_px=dict.fromkeys(dates, 0.0),
             range_px=dict.fromkeys(dates, 0.0),
             metadata={"skipped": reason, "n_arcs": 0},
-        )
-
-    def _persist_date_misreg(self) -> None:
-        """Write :attr:`date_misreg` to the work directory."""
-        if self.date_misreg is None:
-            return
-        out = self.config.work_dir / "misreg" / "date_misreg.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(
-            json.dumps(
-                {
-                    "reference": self.date_misreg.reference,
-                    "azimuth_px": dict(self.date_misreg.azimuth_px),
-                    "range_px": dict(self.date_misreg.range_px),
-                    "metadata": dict(self.date_misreg.metadata),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
         )
 
     def _apply_misreg_constants(self, date_id: str) -> tuple[float, float]:
@@ -3303,6 +3187,18 @@ class Stack(NetworkContract):
             n_valid=n_valid,
         )
 
+    def _prepare_reference_scene(self, *, overwrite: bool) -> object | None:
+        """Compute the Reference scene product once for this run.
+
+        Missions that split Reference preparation from secondary resampling
+        (Sentinel-1) return a Reference context reused by every
+        :meth:`_coregister_one_scene` call. The default provider path
+        publishes the Reference inside its first pair call and returns
+        ``None``.
+        """
+        del overwrite
+        return None
+
     def _coregister_one_scene(
         self,
         date_id: str,
@@ -3311,13 +3207,20 @@ class Stack(NetworkContract):
         misreg_az_px: float,
         misreg_rg_px: float,
         overwrite: bool,
+        reference_context: object | None = None,
+        inputs: Mapping[str, str] | None = None,
+        properties: Mapping[str, object] | None = None,
     ) -> Any:
-        """Resample one secondary date onto the Reference grid.
+        """Resample one secondary date onto the Reference scene product.
 
-        The base implementation uses the mission pair engine for apply-only
-        resampling. Sentinel-1 overrides this hook with
-        :func:`~faninsar.missions.s1.coregister.coregister_s1_scene`.
+        The default implementation calls the mission pair provider with
+        ``scene_dir`` (the secondary product, ``coreg/<date>``) and
+        ``reference_scene_dir`` (``coreg/<reference>``). The provider writes
+        the Reference product once if it is missing, then the secondary
+        product bound to it with ``inputs`` and ``properties``. Sentinel-1
+        overrides this hook.
         """
+        del reference_context
         pair_kwargs = dict(self._burst_kwargs())
         orbit_paths = self.config.extra.get("orbit_paths")
         if isinstance(orbit_paths, dict):
@@ -3347,7 +3250,10 @@ class Stack(NetworkContract):
             overwrite=overwrite,
             misreg_az_px=misreg_az_px,
             misreg_rg_px=misreg_rg_px,
-            scene_store_dir=output_dir / "scenes",
+            scene_dir=output_dir,
+            reference_scene_dir=self._scene_dir(self.reference),
+            scene_inputs=dict(inputs or {}),
+            scene_properties=dict(properties or {}),
             **pair_kwargs,
         )
 
@@ -3372,11 +3278,8 @@ class Stack(NetworkContract):
         self._ensure_precise_orbits()
         self._ensure_raster_dem()
         use_pairs = pairs or self.misreg_pairs
-        arcs_path = self._misreg_arcs_path()
-        if arcs_path.is_file() and not overwrite:
-            self.arcs = _load_arcs(arcs_path)
-            self._nesd_skipped_no_windows = self._read_nesd_skip_flag()
-            logger.info("Loaded %s misreg arcs from cache", len(self.arcs))
+        if not overwrite and self._restore_misreg():
+            logger.info("Loaded %s misreg arcs from the misreg product", len(self.arcs))
             return self
 
         arcs: list[MisregArc] = []
@@ -3393,9 +3296,9 @@ class Stack(NetworkContract):
                 "skipping NESD (geometry constants)"
             )
         self._nesd_skipped_no_windows = skipped
-        self._write_nesd_skip_flag(skipped)
         self.arcs = arcs
-        _save_arcs(arcs_path, arcs)
+        self.date_misreg = None
+        self._persist_misreg()
         logger.info("Measured %s misreg arcs (method=overlap)", len(arcs))
         return self
 
@@ -3421,7 +3324,7 @@ class Stack(NetworkContract):
             self.measure_misreg()
         if self._nesd_skipped_no_windows:
             self.date_misreg = self._zero_date_misreg(reason="no_overlap_windows")
-            self._persist_date_misreg()
+            self._persist_misreg()
             return self
         ref = reference or self.reference
         try:
@@ -3433,7 +3336,7 @@ class Stack(NetworkContract):
         except Exception:
             logger.exception("misreg network inversion failed; aborting Stack")
             raise
-        self._persist_date_misreg()
+        self._persist_misreg()
         return self
 
     @_reclaim_after_stage
@@ -3443,7 +3346,12 @@ class Stack(NetworkContract):
         dates: Sequence[str] | None = None,
         overwrite: bool = False,
     ) -> Self:
-        """Coregister each non-Reference date onto the Reference grid and cache.
+        """Coregister each non-Reference date onto the Reference scene.
+
+        The Reference scene product (``coreg/<reference>``) is computed once;
+        every secondary product (``coreg/<date>``) binds its ``write_id``. A
+        persisted secondary is reused only while it is bound to the current
+        Reference and its coregistration identity matches this request.
 
         This stage does **not** form interferograms and never measures NESD.
         ``coreg_mode="nesd"`` requires :attr:`date_misreg` unless measure
@@ -3458,170 +3366,91 @@ class Stack(NetworkContract):
             if dates is not None
             else [d for d in self.catalog.dates if d != self.reference]
         )
-        reference_dir = self.config.work_dir / "coreg" / self.reference
-        reference_dir.mkdir(parents=True, exist_ok=True)
-        self.coreg_paths[self.reference] = reference_dir
-
+        if self.reference in target_dates:
+            reject_invalid_state(
+                "coregister_scenes dates must not include the Reference; its "
+                "scene product is computed once for the whole Stack"
+            )
         orbit_paths = self.config.extra.get("orbit_paths")
         if orbit_paths is not None and not isinstance(orbit_paths, dict):
             reject_invalid_state(
                 "Stack extra orbit_paths must be a date-to-path mapping"
             )
-
+        reference_context = (
+            self._prepare_reference_scene(overwrite=overwrite) if target_dates else None
+        )
         for date_id in target_dates:
-            out = self.config.work_dir / "coreg" / date_id
-            marker = out / "coreg_done.json"
+            out = self._scene_dir(date_id)
             misreg_az, misreg_rg = self._apply_misreg_constants(date_id)
             coreg_identity = self._coreg_resume_identity(
                 date_id,
                 misreg_az_px=misreg_az,
                 misreg_rg_px=misreg_rg,
             )
-            if marker.is_file() and not overwrite:
-                try:
-                    marker_data = json.loads(marker.read_text(encoding="utf-8"))
-                except (OSError, ValueError) as error:
-                    reject_invalid_state(
-                        f"coregistration marker cannot be validated: {error}"
-                    )
-                store = CoregisteredSceneStore.open(out / "scenes")
-                if (
-                    marker_data.get("reference") != self.reference
-                    or marker_data.get("date") != date_id
-                    or marker_data.get("coreg_identity") != coreg_identity
-                    or store.reference_id != self.reference
-                    or store.date_id != date_id
-                    or store.domain != self.config.coregistration_grid
-                ):
-                    reject_invalid_state(
-                        "persisted coregistration scene or marker does not match "
-                        "the current date, Reference, or coordinate domain"
-                    )
-                self.coreg_paths[date_id] = out
-                if self.config.coregistration_grid == "radar":
-                    self._restore_radar_projection_context(marker_data)
-                if date_id == target_dates[0]:
-                    copy_reference_units(out / "scenes", reference_dir / "scenes")
+            if not overwrite and self._reuse_scene(date_id, coreg_identity):
                 continue
             self._reject_nesd_apply_without_constants()
+            properties: dict[str, object] = {
+                "faninsar:coreg_identity": coreg_identity,
+                "faninsar:coreg_mode": self.config.coreg_mode,
+                "faninsar:geometric_phase_removed": (
+                    "topo" if self.config.dem is not None else "flat"
+                ),
+                "faninsar:mask_lineage": self._mask_lineage_record(),
+            }
+            inputs = self._scene_misreg_inputs()
             state = self._coregister_one_scene(
                 date_id,
                 output_dir=out,
                 misreg_az_px=misreg_az,
                 misreg_rg_px=misreg_rg,
-                overwrite=overwrite,
+                overwrite=True,
+                reference_context=reference_context,
+                inputs=inputs,
+                properties=properties,
             )
-            if state is not None and self.config.coregistration_grid == "radar":
-                primary = getattr(state, "primary", None)
-                if primary is not None:
-                    shape = _scene_array_shape(primary)
-                    geometry = getattr(primary, "geometry", None)
-                    if shape is not None and geometry is not None:
-                        self._radar_projection_context = {
-                            "geometry": geometry,
-                            "full_radar_shape": tuple(int(v) for v in shape),
-                            "reference_scene": self.reference,
-                            "master_grid": self.config.geo_grid,
-                        }
-                    else:
-                        reject_invalid_state(
-                            "radar coregistration did not produce projection geometry"
-                        )
-                else:
-                    logger.debug(
-                        "scene provider did not retain primary scene; "
-                        "skipping optional radar projection context"
-                    )
+            reference = self.reference_scene
+            if reference is None:
+                reject_invalid_state(
+                    "scene provider did not publish the Reference scene product"
+                )
+            validate_reference_binding(reference, CoregisteredSceneStore.open(out))
             if state is not None and self.config.retain_pair_states:
                 self.pair_states[f"{self.reference}_{date_id}"] = state
-            elif state is not None:
-                logger.info(
-                    "Released in-memory ProductionPairState for %s after scene "
-                    "publication",
-                    date_id,
-                )
-            self.coreg_paths[date_id] = out
-            if date_id == target_dates[0]:
-                copy_reference_units(out / "scenes", reference_dir / "scenes")
-            marker_payload: dict[str, object] = {
-                "reference": self.reference,
-                "date": date_id,
-                "coreg_identity": coreg_identity,
-                "coreg_mode": self.config.coreg_mode,
-                "misreg_az_px": misreg_az,
-                "misreg_rg_px": misreg_rg,
-                "geometric_phase_removed": (
-                    "topo" if self.config.dem is not None else "flat"
-                ),
-                **self._mask_lineage_record(),
-            }
-            if state is not None:
-                marker_payload.update(
-                    {
-                        "range_shift_px": getattr(state, "range_shift_px", None),
-                        "azimuth_shift_px": getattr(state, "azimuth_shift_px", None),
-                        "stage_timings_s": getattr(state, "stage_timings_s", {}),
-                        "coregistration_timings_s": getattr(
-                            state, "coregistration_timings_s", {}
-                        ),
-                        "radar_projection_context": (
-                            self._radar_projection_context_record(state)
-                            if self.config.coregistration_grid == "radar"
-                            else None
-                        ),
-                    }
-                )
-            marker.write_text(
-                json.dumps(marker_payload, indent=2, default=str),
-                encoding="utf-8",
-            )
             logger.info("Coregistered %s → Reference %s", date_id, self.reference)
-            if state is not None and not self.config.retain_pair_states:
-                del state
-                gc.collect()
+            del state
+            gc.collect()
             self._reclaim_accelerator("persist")
         self._write_qualified_activation_record()
-        capability = RegistrationCapability(
-            mission=type(self).__name__,
-            product="stack-scenes",
-            grid=self.config.coregistration_grid,
-            strategy=self.config.coreg_mode,
-        )
-        identity = identity_digest(
-            {
-                "scenes": [self.reference, *target_dates],
-                "workflow": capability.as_dict(),
-                "grid": self.config.coregistration_grid,
-                "frame": (
-                    "radar" if self.config.coregistration_grid == "radar" else "map"
-                ),
-                "units": "pixel",
-                "provenance": {
-                    "orbit_paths": self.config.extra.get("orbit_paths", {}),
-                    "work_dir": str(self.config.work_dir),
-                },
-            }
-        )
-        self._coregistration_report = CoregistrationReport(
-            capability=capability,
-            scenes=(self.reference, *target_dates),
-            reference=self.reference,
-            grid=self.config.coregistration_grid,
-            frame="radar" if self.config.coregistration_grid == "radar" else "map",
-            units="pixel",
-            status="applied",
-            run_identity=identity,
-            correction_kind="date-constant" if self.date_misreg is not None else None,
-            provenance={"work_dir": str(self.config.work_dir)},
-            details={"dates": list(target_dates)},
-        )
-        report_path = self.config.work_dir / "coreg" / "coregistration_report.json"
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(
-            json.dumps(self._coregistration_report.as_dict(), indent=2),
-            encoding="utf-8",
-        )
         return self
+
+    def _scene_misreg_inputs(self) -> dict[str, str]:
+        """Return the misreg product binding of a secondary scene, if any."""
+        misreg = self._misreg_write_id
+        return {} if misreg is None else {"misreg": misreg}
+
+    def _reuse_scene(self, date_id: str, coreg_identity: str) -> bool:
+        """Return whether the persisted secondary scene is current."""
+        out = self._scene_dir(date_id)
+        if not (out / "item.json").is_file():
+            return False
+        reference = self.reference_scene
+        if reference is None:
+            return False
+        store = CoregisteredSceneStore.open(out)
+        current = {"reference": reference.write_id, **self._scene_misreg_inputs()}
+        if (
+            store.date_id != date_id
+            or store.reference_id != self.reference
+            or store.domain != self.config.coregistration_grid
+            or store.properties.get("faninsar:coreg_identity") != coreg_identity
+            or store.stale_inputs(current)
+        ):
+            logger.info("Scene %s is stale; recoregistering", date_id)
+            return False
+        validate_reference_binding(reference, store)
+        logger.info("Reusing coregistered scene %s", date_id)
+        return True
 
     @_reclaim_after_stage
     def form_interferograms(
@@ -3749,6 +3578,7 @@ class Stack(NetworkContract):
             else None
         )
 
+        scenes = self.scenes
         for primary, secondary in _iter_pair_dates(use_pairs):
             if primary not in self.catalog.paths or secondary not in self.catalog.paths:
                 continue
@@ -3757,16 +3587,13 @@ class Stack(NetworkContract):
                 sub = base_out / f"ml_{az_l}x{rg_l}" / f"{primary}_{secondary}"
                 if sub.exists() and overwrite:
                     shutil.rmtree(sub)
-                if primary not in self.coreg_paths or secondary not in self.coreg_paths:
+                if primary not in scenes or secondary not in scenes:
                     reject_invalid_state(
-                        "Stack scene generation missing; run coregister_scenes first"
+                        f"scene product missing for {primary}_{secondary}; run "
+                        "coregister_scenes first"
                     )
-                primary_store = CoregisteredSceneStore.open(
-                    self.coreg_paths[primary] / "scenes"
-                )
-                secondary_store = CoregisteredSceneStore.open(
-                    self.coreg_paths[secondary] / "scenes"
-                )
+                primary_store = scenes[primary]
+                secondary_store = scenes[secondary]
                 if primary_store.flatten_stage != secondary_store.flatten_stage:
                     reject_invalid_state("scene artifacts mix flattening stages")
                 flatten_stage = primary_store.flatten_stage
@@ -3847,12 +3674,6 @@ class Stack(NetworkContract):
                     product = form_merged_scene_interferogram(
                         primary_store,
                         secondary_store,
-                        primary_role=(
-                            "primary" if primary == self.reference else "secondary"
-                        ),
-                        secondary_role=(
-                            "primary" if secondary == self.reference else "secondary"
-                        ),
                         multilook=looks,
                         goldstein_alpha=alpha,
                         coherence_window=selected_coherence_window,
@@ -5649,43 +5470,3 @@ def _optional_shift(value: object) -> float | None:
     if not np.isfinite(number):
         return None
     return number
-
-
-def _save_arcs(path: Path, arcs: list[MisregArc]) -> None:
-    """Persist pair arcs with JSON ``null`` for omitted components."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [
-        {
-            "primary": a.primary,
-            "secondary": a.secondary,
-            "azimuth_shift_px": _optional_shift(a.azimuth_shift_px),
-            "range_shift_px": _optional_shift(a.range_shift_px),
-            "azimuth_sigma_px": a.azimuth_sigma_px,
-            "range_sigma_px": a.range_sigma_px,
-            "method": a.method,
-            "n_valid": a.n_valid,
-        }
-        for a in arcs
-    ]
-    path.write_text(
-        json.dumps(payload, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
-
-
-def _load_arcs(path: Path) -> list[MisregArc]:
-    """Load pair arcs without coercing JSON ``null`` to ``0.0``."""
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return [
-        MisregArc(
-            primary=str(row["primary"]),
-            secondary=str(row["secondary"]),
-            azimuth_shift_px=_optional_shift(row.get("azimuth_shift_px")),
-            range_shift_px=_optional_shift(row.get("range_shift_px")),
-            azimuth_sigma_px=float(row.get("azimuth_sigma_px", 1.0)),
-            range_sigma_px=float(row.get("range_sigma_px", 1.0)),
-            method=str(row.get("method", "unknown")),
-            n_valid=int(row.get("n_valid", 0)),
-        )
-        for row in data
-    ]

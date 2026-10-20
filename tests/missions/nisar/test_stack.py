@@ -291,7 +291,7 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
         stack.measure_misreg()
     with pytest.raises(InvalidProcessingStateError, match="explicit DEM or height"):
         stack.coregister_scenes()
-    with pytest.raises(InvalidProcessingStateError, match="scene generation missing"):
+    with pytest.raises(InvalidProcessingStateError, match="scene product missing"):
         stack.form_interferograms()
 
 

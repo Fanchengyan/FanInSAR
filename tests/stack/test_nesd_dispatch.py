@@ -8,12 +8,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from faninsar.io.storage.scene_store import write_scene_unit
 from faninsar.missions.s1 import S1Stack
 from faninsar.processing.coregistration.misreg_network import DateMisreg, MisregArc
 from faninsar.processing.errors import InvalidProcessingStateError
+from faninsar.stack.misreg import read_misreg, write_misreg
 from faninsar.stack.provider import StackSceneProvider
-from faninsar.stack.session import _load_arcs, _save_arcs
+from tests.support.scene_stores import write_test_scene
 
 
 def _two_date_stack(tmp_path: Path, *, coreg_mode: str = "nesd") -> S1Stack:
@@ -37,19 +37,64 @@ def _two_date_stack(tmp_path: Path, *, coreg_mode: str = "nesd") -> S1Stack:
     return stack
 
 
-def _write_fake_scene(output_scenes: Path, *, date_id: str, reference_id: str) -> None:
-    """Write one radar scene unit so coregistration persistence can resume."""
-    data = np.ones((2, 2), dtype=np.complex64)
-    write_scene_unit(
-        output_scenes,
-        date_id=date_id,
-        reference_id=reference_id,
-        domain="radar",
-        tag="IW1_b0",
-        primary=data,
-        secondary=data,
-        row_origin=0,
-        col_origin=0,
+def _install_fake_apply(
+    stack: S1Stack,
+    monkeypatch: pytest.MonkeyPatch,
+    captured: list[dict[str, object]] | None = None,
+) -> None:
+    """Replace Reference preparation and secondary apply with scene writers."""
+    calls = [] if captured is None else captured
+
+    def fake_prepare(_reference_path: object, **kwargs: object) -> dict[str, object]:
+        if (Path(kwargs["output_scene"]) / "item.json").is_file():  # type: ignore[arg-type]
+            return {"prepare": kwargs}
+        write_test_scene(
+            stack.config.work_dir,
+            date_id=stack.reference,
+            reference_id=stack.reference,
+            payload=np.ones((2, 2), dtype=np.complex64),
+            tag="IW1_b0",
+        )
+        return {"prepare": kwargs}
+
+    def fake_secondary(
+        context: dict[str, object],
+        secondary_path: object,
+        *,
+        output_scene: Path,
+        misreg_az_px: float,
+        misreg_rg_px: float,
+        **kwargs: object,
+    ) -> None:
+        date_id = Path(str(secondary_path)).name.split("_")[5][:8]
+        prepare = context["prepare"]
+        calls.append(
+            {
+                "date_id": date_id,
+                "misreg_az_px": misreg_az_px,
+                "misreg_rg_px": misreg_rg_px,
+                "roi": prepare.get("roi"),  # type: ignore[union-attr]
+                "swaths": prepare.get("swaths"),  # type: ignore[union-attr]
+                "bursts": prepare.get("bursts"),  # type: ignore[union-attr]
+                "properties": kwargs.get("properties"),
+            }
+        )
+        assert Path(output_scene) == stack.config.work_dir / "coreg" / date_id
+        write_test_scene(
+            stack.config.work_dir,
+            date_id=date_id,
+            reference_id=stack.reference,
+            payload=np.ones((2, 2), dtype=np.complex64),
+            tag="IW1_b0",
+            properties=kwargs.get("properties"),
+            inputs=kwargs.get("inputs"),
+        )
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.prepare_s1_reference", fake_prepare
+    )
+    monkeypatch.setattr(
+        "faninsar.missions.s1.coregister.coregister_s1_secondary", fake_secondary
     )
 
 
@@ -156,7 +201,7 @@ def test_nesd_invert_uses_optional_invert(
 def test_coregister_does_not_call_produce_pair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Apply uses coregister_s1_scene per date and never the pair engine."""
+    """Apply uses the Reference-once S1 entry points, never the pair engine."""
     stack = _two_date_stack(tmp_path)
     produce_calls = _forbid_produce_pair(stack)
     stack.date_misreg = DateMisreg(
@@ -166,57 +211,22 @@ def test_coregister_does_not_call_produce_pair(
         metadata={},
     )
     captured: list[dict[str, object]] = []
-
-    def fake_coregister(
-        _reference_path: object,
-        secondary_path: object,
-        *,
-        output_scenes: Path,
-        misreg_az_px: float,
-        misreg_rg_px: float,
-        **kwargs: object,
-    ) -> Path:
-        date_id = Path(str(secondary_path)).name.split("_")[5][:8]
-        captured.append(
-            {
-                "date_id": date_id,
-                "misreg_az_px": misreg_az_px,
-                "misreg_rg_px": misreg_rg_px,
-                "roi": kwargs.get("roi"),
-                "swaths": kwargs.get("swaths"),
-                "bursts": kwargs.get("bursts"),
-            }
-        )
-        _write_fake_scene(
-            output_scenes,
-            date_id=date_id,
-            reference_id=stack.reference,
-        )
-        return Path(output_scenes)
-
-    monkeypatch.setattr(
-        "faninsar.missions.s1.coregister.coregister_s1_scene",
-        fake_coregister,
-    )
+    _install_fake_apply(stack, monkeypatch, captured)
 
     stack.coregister_scenes()
 
     assert produce_calls == []
-    assert captured == [
-        {
-            "date_id": "20160113",
-            "misreg_az_px": pytest.approx(0.05),
-            "misreg_rg_px": pytest.approx(-0.02),
-            "roi": None,
-            "swaths": None,
-            "bursts": None,
-        }
-    ]
+    assert len(captured) == 1
+    call = captured[0]
+    assert call["date_id"] == "20160113"
+    assert call["misreg_az_px"] == pytest.approx(0.05)
+    assert call["misreg_rg_px"] == pytest.approx(-0.02)
+    assert (call["roi"], call["swaths"], call["bursts"]) == (None, None, None)
 
 
-def test_arcs_json_round_trips_none(tmp_path: Path) -> None:
+def test_misreg_product_round_trips_none(tmp_path: Path) -> None:
     """Omitted components persist as JSON null and reload as None, never 0."""
-    path = tmp_path / "misreg" / "arcs.json"
+    root = tmp_path / "misreg"
     arcs = [
         MisregArc(
             primary="20160101",
@@ -237,18 +247,31 @@ def test_arcs_json_round_trips_none(tmp_path: Path) -> None:
             n_valid=3,
         ),
     ]
+    constants = DateMisreg(
+        reference="20160101",
+        azimuth_px={"20160101": 0.0, "20160113": 0.03},
+        range_px={"20160101": 0.0, "20160113": 0.2},
+        metadata={"n_arcs": 2},
+    )
 
-    _save_arcs(path, arcs)
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload[0]["azimuth_shift_px"] is None
-    assert payload[1]["range_shift_px"] is None
-    assert "null" in path.read_text(encoding="utf-8")
+    product = write_misreg(
+        root, arcs=arcs, date_misreg=constants, skipped_no_windows=False
+    )
+    payload = json.loads((root / "item.json").read_text(encoding="utf-8"))
+    stored = payload["properties"]["faninsar:arcs"]
+    assert stored[0]["azimuth_shift_px"] is None
+    assert stored[1]["range_shift_px"] is None
 
-    loaded = _load_arcs(path)
-    assert loaded[0].azimuth_shift_px is None
-    assert loaded[0].range_shift_px == pytest.approx(0.2)
-    assert loaded[1].azimuth_shift_px == pytest.approx(0.03)
-    assert loaded[1].range_shift_px is None
+    record = read_misreg(root)
+    assert record is not None
+    assert record.write_id == product.write_id
+    assert record.arcs[0].azimuth_shift_px is None
+    assert record.arcs[0].range_shift_px == pytest.approx(0.2)
+    assert record.arcs[1].azimuth_shift_px == pytest.approx(0.03)
+    assert record.arcs[1].range_shift_px is None
+    assert record.date_misreg == constants
+    assert record.skipped_no_windows is False
+    assert read_misreg(tmp_path / "absent") is None
 
 
 def test_nesd_no_windows_warns_skips_and_zeros_dates(
@@ -292,10 +315,7 @@ def test_coregister_nesd_without_date_misreg_rejects(
     """Nesd apply fails closed when invert has not recorded date constants."""
     stack = _two_date_stack(tmp_path)
     _forbid_produce_pair(stack)
-    monkeypatch.setattr(
-        "faninsar.missions.s1.coregister.coregister_s1_scene",
-        lambda *_args, **_kwargs: Path("unused"),
-    )
+    _install_fake_apply(stack, monkeypatch)
 
     with pytest.raises(InvalidProcessingStateError, match="date_misreg"):
         stack.coregister_scenes()
@@ -308,35 +328,13 @@ def test_coregister_allows_warned_no_window_path(
     stack = _two_date_stack(tmp_path)
     produce_calls = _forbid_produce_pair(stack)
     stack._nesd_skipped_no_windows = True
-    captured: list[tuple[float, float]] = []
-
-    def fake_coregister(
-        _reference_path: object,
-        secondary_path: object,
-        *,
-        output_scenes: Path,
-        misreg_az_px: float,
-        misreg_rg_px: float,
-        **_kwargs: object,
-    ) -> Path:
-        date_id = Path(str(secondary_path)).name.split("_")[5][:8]
-        captured.append((misreg_az_px, misreg_rg_px))
-        _write_fake_scene(
-            output_scenes,
-            date_id=date_id,
-            reference_id=stack.reference,
-        )
-        return Path(output_scenes)
-
-    monkeypatch.setattr(
-        "faninsar.missions.s1.coregister.coregister_s1_scene",
-        fake_coregister,
-    )
+    calls: list[dict[str, object]] = []
+    _install_fake_apply(stack, monkeypatch, calls)
 
     stack.coregister_scenes()
 
     assert produce_calls == []
-    assert captured == [(0.0, 0.0)]
+    assert [(c["misreg_az_px"], c["misreg_rg_px"]) for c in calls] == [(0.0, 0.0)]
 
 
 def test_geometry_coregister_applies_zero_constants(
@@ -345,35 +343,13 @@ def test_geometry_coregister_applies_zero_constants(
     """Geometry apply never measures and injects 0, 0 date constants."""
     stack = _two_date_stack(tmp_path, coreg_mode="geometry")
     produce_calls = _forbid_produce_pair(stack)
-    captured: list[tuple[float, float]] = []
-
-    def fake_coregister(
-        _reference_path: object,
-        secondary_path: object,
-        *,
-        output_scenes: Path,
-        misreg_az_px: float,
-        misreg_rg_px: float,
-        **_kwargs: object,
-    ) -> Path:
-        date_id = Path(str(secondary_path)).name.split("_")[5][:8]
-        captured.append((misreg_az_px, misreg_rg_px))
-        _write_fake_scene(
-            output_scenes,
-            date_id=date_id,
-            reference_id=stack.reference,
-        )
-        return Path(output_scenes)
-
-    monkeypatch.setattr(
-        "faninsar.missions.s1.coregister.coregister_s1_scene",
-        fake_coregister,
-    )
+    calls: list[dict[str, object]] = []
+    _install_fake_apply(stack, monkeypatch, calls)
 
     stack.coregister_scenes()
 
     assert produce_calls == []
-    assert captured == [(0.0, 0.0)]
+    assert [(c["misreg_az_px"], c["misreg_rg_px"]) for c in calls] == [(0.0, 0.0)]
     assert stack.date_misreg is None
 
 
@@ -437,7 +413,6 @@ def test_measure_and_apply_share_resolved_burst_selection(
     monkeypatch.setattr(stack, "_resolve_s1_nesd_selection", lambda: selection)
     stack._s1_nesd_selection = selection
     measure_kw: dict[str, object] = {}
-    apply_kw: dict[str, object] = {}
 
     def fake_measure(*_args: object, **kwargs: object) -> MisregArc:
         measure_kw.update(kwargs)
@@ -450,42 +425,26 @@ def test_measure_and_apply_share_resolved_burst_selection(
             n_valid=0,
         )
 
-    def fake_coregister(
-        *_args: object,
-        output_scenes: Path,
-        **kwargs: object,
-    ) -> Path:
-        apply_kw.update(kwargs)
-        _write_fake_scene(
-            output_scenes,
-            date_id="20160113",
-            reference_id=stack.reference,
-        )
-        return Path(output_scenes)
-
     monkeypatch.setattr(
         "faninsar.missions.s1.measure.measure_s1_pair_misreg",
         fake_measure,
     )
-    monkeypatch.setattr(
-        "faninsar.missions.s1.coregister.coregister_s1_scene",
-        fake_coregister,
-    )
+    calls: list[dict[str, object]] = []
+    _install_fake_apply(stack, monkeypatch, calls)
 
     stack.measure_misreg(overwrite=True)
     stack.coregister_scenes()
 
+    apply_kw = calls[0]
     assert measure_kw["swaths"] == apply_kw["swaths"] == ("IW1",)
     assert measure_kw["bursts"] == apply_kw["bursts"] == {"IW1": [0, 1]}
     assert "roi" not in measure_kw
-    assert "esd_enabled" not in apply_kw
-    assert "force_esd_azimuth_shift_px" not in apply_kw
 
 
-def test_coreg_marker_records_coreg_mode_not_esd_flags(
+def test_scene_item_records_coreg_mode_and_constants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Apply markers persist coreg_mode and date constants, never esd_enabled."""
+    """The secondary Item records coreg_mode and identity, never ESD flags."""
     stack = _two_date_stack(tmp_path)
     _forbid_produce_pair(stack)
     stack.date_misreg = DateMisreg(
@@ -494,35 +453,117 @@ def test_coreg_marker_records_coreg_mode_not_esd_flags(
         range_px={"20160101": 0.0, "20160113": -0.02},
         metadata={},
     )
+    _install_fake_apply(stack, monkeypatch)
+    stack.coregister_scenes()
+    scene = stack.scenes["20160113"]
+    assert not (scene.root / "coreg_done.json").exists()
+    assert scene.properties["faninsar:coreg_mode"] == "nesd"
+    assert isinstance(scene.properties["faninsar:coreg_identity"], str)
+    assert scene.inputs["reference"] == stack.reference_scene.write_id
+    for key in ("esd_enabled", "amplitude_refinement_enabled"):
+        assert f"faninsar:{key}" not in scene.properties
 
-    def fake_coregister(
-        _reference_path: object,
-        secondary_path: object,
-        *,
-        output_scenes: Path,
-        **_kwargs: object,
-    ) -> Path:
-        date_id = Path(str(secondary_path)).name.split("_")[5][:8]
-        _write_fake_scene(
-            output_scenes,
-            date_id=date_id,
-            reference_id=stack.reference,
-        )
-        return Path(output_scenes)
 
-    monkeypatch.setattr(
-        "faninsar.missions.s1.coregister.coregister_s1_scene",
-        fake_coregister,
+def test_coregister_reuses_current_scene_and_redoes_stale_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A current secondary is reused; a changed constant recoregisters it."""
+    stack = _two_date_stack(tmp_path, coreg_mode="geometry")
+    _forbid_produce_pair(stack)
+    calls: list[dict[str, object]] = []
+    _install_fake_apply(stack, monkeypatch, calls)
+    stack.coregister_scenes()
+    first = stack.scenes["20160113"].write_id
+    stack.coregister_scenes()
+    assert len(calls) == 1
+    assert stack.scenes["20160113"].write_id == first
+    monkeypatch.setattr(stack, "_apply_misreg_constants", lambda _d: (0.1, 0.0))
+    stack.coregister_scenes()
+    assert len(calls) == 2
+    assert stack.scenes["20160113"].write_id != first
+
+
+def test_rewritten_reference_invalidates_secondary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A secondary bound to an overwritten Reference is recoregistered."""
+    stack = _two_date_stack(tmp_path, coreg_mode="geometry")
+    _forbid_produce_pair(stack)
+    calls: list[dict[str, object]] = []
+    _install_fake_apply(stack, monkeypatch, calls)
+    stack.coregister_scenes()
+    write_test_scene(
+        stack.config.work_dir,
+        date_id=stack.reference,
+        reference_id=stack.reference,
+        payload=np.full((2, 2), 3.0, dtype=np.complex64),
+        tag="IW1_b0",
     )
     stack.coregister_scenes()
-    marker = json.loads(
-        (tmp_path / "out" / "coreg" / "20160113" / "coreg_done.json").read_text(
-            encoding="utf-8"
-        )
+    assert len(calls) == 2
+    assert (
+        stack.scenes["20160113"].inputs["reference"] == stack.reference_scene.write_id
     )
-    assert marker["coreg_mode"] == "nesd"
-    assert marker["misreg_az_px"] == pytest.approx(0.05)
-    assert marker["misreg_rg_px"] == pytest.approx(-0.02)
-    assert "esd_enabled" not in marker
-    assert "amplitude_refinement_enabled" not in marker
-    assert "esd_azimuth_shift_px" not in marker
+
+
+def test_reopened_stack_restores_nesd_skip_without_remeasuring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skipped NESD campaign is restored from disk, never re-measured."""
+    stack = _two_date_stack(tmp_path)
+    _forbid_produce_pair(stack)
+    calls: list[str] = []
+
+    def fake_measure(*_args: object, **_kwargs: object) -> MisregArc:
+        calls.append("measure")
+        return MisregArc(
+            primary="20160101",
+            secondary="20160113",
+            azimuth_shift_px=None,
+            range_shift_px=None,
+            method="overlap",
+            n_valid=0,
+        )
+
+    monkeypatch.setattr(
+        "faninsar.missions.s1.measure.measure_s1_pair_misreg", fake_measure
+    )
+    stack.measure_misreg()
+    stack.invert_misreg()
+    assert calls == ["measure"]
+
+    again = tmp_path / "again"
+    again.mkdir()
+    reopened = _two_date_stack(again)
+    reopened.config.work_dir = stack.config.work_dir
+    reopened.measure_misreg()
+    assert calls == ["measure"]
+    assert reopened._nesd_skipped_no_windows is True
+    assert reopened.date_misreg == stack.date_misreg
+    assert reopened._misreg_write_id == stack._misreg_write_id
+
+
+def test_nesd_secondary_binds_misreg_and_goes_stale_on_reinversion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new misreg product makes NESD secondaries stale and recoregisters."""
+    stack = _two_date_stack(tmp_path)
+    _forbid_produce_pair(stack)
+    stack.date_misreg = DateMisreg(
+        reference="20160101",
+        azimuth_px={"20160101": 0.0, "20160113": 0.0},
+        range_px={"20160101": 0.0, "20160113": 0.0},
+        metadata={},
+    )
+    stack._persist_misreg()
+    calls: list[dict[str, object]] = []
+    _install_fake_apply(stack, monkeypatch, calls)
+    stack.coregister_scenes()
+    first_misreg = stack._misreg_write_id
+    assert stack.scenes["20160113"].inputs["misreg"] == first_misreg
+    stack.coregister_scenes()
+    assert len(calls) == 1
+    stack._persist_misreg()
+    assert stack._misreg_write_id != first_misreg
+    stack.coregister_scenes()
+    assert len(calls) == 2

@@ -61,6 +61,7 @@ def read_full_burst(
     range_looks_crop: tuple[int, int] | None = None,
     geocoding_layout: bool = False,
     full_range: bool = False,
+    read_samples: bool = True,
 ) -> BurstArray:
     """Read a TOPS burst in radar or direct-geocoding layout.
 
@@ -81,6 +82,11 @@ def read_full_burst(
         instead of cropping to the valid-sample envelope, matching ISCE2's
         full-width burst layout.  Invalid samples are still zeroed via the
         valid mask.
+    read_samples : bool, optional
+        Read the measurement raster. ``False`` returns the exact placement
+        with zero-stride placeholder samples, for callers that need only the
+        burst geometry (for example the Stack Reference after it has been
+        persisted once).
 
     Returns
     -------
@@ -120,6 +126,14 @@ def read_full_burst(
 
     row0 = _burst_line_offset(swath, burst) + local_row0
     width = col1 - col0
+    if not read_samples:
+        return BurstArray(
+            samples=np.broadcast_to(np.complex64(0), (height, width)),
+            row0=row0,
+            col0=col0,
+            burst_index=burst_index,
+            valid_mask=np.broadcast_to(np.True_, (height, width)),
+        )
     import rasterio
 
     logger.info(

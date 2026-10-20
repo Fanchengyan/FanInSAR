@@ -18,6 +18,7 @@ import pytest
 
 from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.core.pair import Pairs
+from faninsar.io.storage.scene_store import write_scene
 from faninsar.network.products import AssetKind
 from faninsar.processing.geocoding import RadarDomainProduct
 from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
@@ -25,6 +26,7 @@ from faninsar.processing.geocoding.geocoder import Geocoder
 from faninsar.processing.geometry import ConstantDEM, RadarGeometryModel
 from faninsar.processing.geometry.coordinates import RadarGrid
 from faninsar.processing.geometry.prepare_production import run_rdr2geo
+from faninsar.processing.geometry.record import radar_geometry_record
 from faninsar.processing.mosaicking.grid import GeoGridSpec
 from faninsar.stack import Stack, StackConfig
 from faninsar.stack.catalog import SceneCatalog
@@ -36,8 +38,8 @@ RADAR_SHAPE = (64, 128)
 UTM = "EPSG:32631"
 
 
-def _toy_geometry() -> RadarGeometryModel:
-    """Return a synthetic right-looking geometry with a straight orbit."""
+def _toy_grid_and_orbit() -> tuple[RadarGrid, OrbitMetadata]:
+    """Return a synthetic right-looking radar grid with a straight orbit."""
     epoch = datetime(2020, 1, 1, tzinfo=UTC)
     vectors = tuple(
         OrbitStateVector(
@@ -57,7 +59,12 @@ def _toy_geometry() -> RadarGeometryModel:
         wavelength_m=0.0555,
         look_direction="right",
     )
-    return RadarGeometryModel.from_radar_grid(rgrid, orbit)
+    return rgrid, orbit
+
+
+def _toy_geometry() -> RadarGeometryModel:
+    """Return the synthetic geometry the persisted Reference record encodes."""
+    return RadarGeometryModel.from_radar_grid(*_toy_grid_and_orbit())
 
 
 def _scene_grid(model: RadarGeometryModel) -> GeoGridSpec:
@@ -84,7 +91,7 @@ def _scene_grid(model: RadarGeometryModel) -> GeoGridSpec:
 
 @pytest.fixture
 def stack(tmp_path: Path) -> Stack:
-    """Return a bare Stack with synthetic radar geometry in its context."""
+    """Return a Stack whose committed Reference scene carries the geometry."""
     paths = []
     for day in ("20240101", "20240113"):
         safe = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000.SAFE"
@@ -104,10 +111,24 @@ def stack(tmp_path: Path) -> Stack:
         misreg_pairs=Pairs.from_names(["20240101_20240113"]),
         reference="20240101",
     )
-    instance._radar_projection_context = {
-        "geometry": model,
-        "full_radar_shape": RADAR_SHAPE,
-    }
+    write_scene(
+        instance.config.work_dir / "coreg" / instance.reference,
+        date_id=instance.reference,
+        reference_id=instance.reference,
+        domain="radar",
+        grid_shape=RADAR_SHAPE,
+        units=[
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.ones(RADAR_SHAPE, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+            }
+        ],
+        properties={
+            "faninsar:radar_geometry": radar_geometry_record(*_toy_grid_and_orbit())
+        },
+    )
     return instance
 
 
@@ -147,7 +168,7 @@ def test_geocode_complex_product_roundtrip_and_reuse(
     # The entry point must match a directly constructed engine exactly (the
     # LUT is served from the content cache, so this build is cheap).
     reference = Geocoder(
-        stack._radar_projection_context["geometry"],
+        _toy_geometry(),
         stack.config.grid,
         dem=ConstantDEM(0.0),
         full_radar_shape=RADAR_SHAPE,
@@ -318,7 +339,7 @@ def test_geocode_applies_origin_and_multilook_mapping(stack: Stack) -> None:
     """
     from faninsar.processing.geocoding.geo_resample import sample
 
-    model = stack._radar_projection_context["geometry"]
+    model = _toy_geometry()
     reference = Geocoder(
         model,
         stack.config.grid,
@@ -330,9 +351,9 @@ def test_geocode_applies_origin_and_multilook_mapping(stack: Stack) -> None:
         (RADAR_SHAPE[0] - 2) // 2,
         (RADAR_SHAPE[1] - 4) // 2,
     )
-    layer = np.arange(
-        layer_shape[0] * layer_shape[1], dtype=np.float32
-    ).reshape(layer_shape)
+    layer = np.arange(layer_shape[0] * layer_shape[1], dtype=np.float32).reshape(
+        layer_shape
+    )
     product = RadarDomainProduct(
         name="ml",
         values=layer,
@@ -387,3 +408,60 @@ def test_geocode_rejects_frame_inconsistent_product(stack: Stack) -> None:
 
     with pytest.raises(ValueError, match="layer frame"):
         stack.geocode(_DuckProduct())
+
+
+def test_geocode_on_a_fresh_stack_reads_the_persisted_reference(
+    stack: Stack,
+) -> None:
+    """A new Stack object geocodes from disk alone (no coregistration run).
+
+    Regression: ``geocode`` used to require the in-memory projection context
+    of a coregistration run in the same process.
+    """
+    fresh = Stack(
+        catalog=stack.catalog,
+        config=stack.config,
+        pairs=stack.pairs,
+        misreg_pairs=stack.misreg_pairs,
+        reference=stack.reference,
+    )
+    product = RadarDomainProduct(
+        name="fresh",
+        values=np.ones(RADAR_SHAPE, dtype=np.float32),
+        full_radar_shape=RADAR_SHAPE,
+        asset_kind=AssetKind.AMPLITUDE,
+    )
+    raster = fresh.geocode(product)
+    assert raster.valid.any()
+
+
+def test_geocode_without_reference_scene_names_the_missing_stage(
+    stack: Stack,
+) -> None:
+    """Without a committed Reference scene the error says what to run."""
+    import shutil
+
+    shutil.rmtree(stack.config.work_dir / "coreg")
+    product = RadarDomainProduct(
+        name="none",
+        values=np.ones(RADAR_SHAPE, dtype=np.float32),
+        full_radar_shape=RADAR_SHAPE,
+        asset_kind=AssetKind.AMPLITUDE,
+    )
+    with pytest.raises(ValueError, match="coregister_scenes"):
+        stack.geocode(product)
+
+
+def test_geocode_rejects_a_shape_that_differs_from_the_reference(
+    stack: Stack,
+) -> None:
+    """A product declaring another full radar shape fails closed."""
+    shape = (RADAR_SHAPE[0] + 2, RADAR_SHAPE[1])
+    product = RadarDomainProduct(
+        name="bad",
+        values=np.ones(shape, dtype=np.float32),
+        full_radar_shape=shape,
+        asset_kind=AssetKind.AMPLITUDE,
+    )
+    with pytest.raises(ValueError, match="Reference scene grid"):
+        stack.geocode(product)

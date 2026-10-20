@@ -8,12 +8,13 @@ import numpy as np
 import pytest
 
 from faninsar.io.storage.ion_store import IonosphereArtifactStore
-from faninsar.io.storage.scene_store import write_scene_unit
+from faninsar.io.storage.scene_store import write_scene
 from faninsar.missions.s1 import S1Stack
 from faninsar.processing.atmosphere import IonosphereEstimationConfig
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.unwrapping import SpatialIRLS
 from faninsar.stack import Stack
+from tests.support.scene_stores import write_test_scene
 
 F0 = 1257.5e6
 BANDWIDTH = 28.0e6
@@ -70,23 +71,15 @@ def _stack_with_scene_units(tmp_path: Path) -> Stack:
     ).prepare_scenes()
     reference = stack.reference
     for date_id in DATES:
-        slc = _slc_with_subband_phases(DATE_ION[date_id])
-        ones = np.ones(GRID, dtype=np.complex64)
-        root = stack.config.work_dir / "coreg" / date_id / "scenes"
-        write_scene_unit(
-            root,
+        write_test_scene(
+            stack.config.work_dir,
             date_id=date_id,
             reference_id=reference,
-            domain="radar",
-            tag="f0_IW1_b0",
-            primary=slc if date_id == reference else ones,
-            secondary=ones if date_id == reference else slc,
-            row_origin=0,
-            col_origin=0,
+            payload=_slc_with_subband_phases(DATE_ION[date_id]),
+            reference_payload=_slc_with_subband_phases(DATE_ION[reference]),
             grid_shape=GRID,
             wavelength_m=0.236,
         )
-        stack.coreg_paths[date_id] = root.parent
     return stack
 
 
@@ -164,19 +157,21 @@ def test_estimate_apply_and_invert_end_to_end(tmp_path: Path) -> None:
 
 def test_estimate_rejects_multi_unit_scene_generations(tmp_path: Path) -> None:
     stack = _stack_with_scene_units(tmp_path)
-    second = stack.config.work_dir / "coreg" / stack.reference / "scenes"
-    write_scene_unit(
-        second,
+    reference = stack.reference_scene
+    assert reference is not None
+    payload = reference.read("f0_IW1_b0")[0]
+    write_scene(
+        reference.root,
         date_id=stack.reference,
         reference_id=stack.reference,
         domain="radar",
-        tag="f0_IW1_b1",
-        primary=np.ones(GRID, dtype=np.complex64),
-        secondary=np.ones(GRID, dtype=np.complex64),
-        row_origin=0,
-        col_origin=0,
+        units=[
+            {"tag": tag, "payload": payload, "row_origin": 0, "col_origin": 0}
+            for tag in ("f0_IW1_b0", "f0_IW1_b1")
+        ],
         grid_shape=GRID,
         wavelength_m=0.236,
+        overwrite=True,
     )
     with pytest.raises(InvalidProcessingStateError, match="single-unit"):
         stack.estimate_ionosphere(

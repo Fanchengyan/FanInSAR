@@ -182,9 +182,7 @@ def test_nisar_radar_provider_runs_shared_stack_lifecycle(
 
     stack.prepare_scenes().coregister_scenes().form_interferograms(multilook=(1, 1))
 
-    store = CoregisteredSceneStore.open(
-        tmp_path / "work" / "coreg" / "20240113" / "scenes"
-    )
+    store = CoregisteredSceneStore.open(tmp_path / "work" / "coreg" / "20240113")
     assert store.domain == "radar"
     assert store.grid_shape == (3, 4)
     assert stack.ifg_dirs == [
@@ -221,9 +219,7 @@ def test_nisar_geo_provider_uses_one_shared_geo_target(
 
     stack.prepare_scenes().coregister_scenes().form_interferograms(multilook=(1, 1))
 
-    store = CoregisteredSceneStore.open(
-        tmp_path / "work" / "coreg" / "20240113" / "scenes"
-    )
+    store = CoregisteredSceneStore.open(tmp_path / "work" / "coreg" / "20240113")
     assert store.domain == "geo"
     assert store.grid_shape == (2, 3)
     assert calls == [
@@ -337,11 +333,15 @@ def test_nisar_provider_maps_secondary_physical_window_and_metadata(
     )
     np.testing.assert_array_equal(secondary_crop.samples, secondary_array[3:6, 3:7])
 
-    manifest = (tmp_path / "pair" / "scenes" / "manifest.json").read_text()
-    assert "source_digest" in manifest
-    assert "source_id" in manifest
-    assert "dem_identity" in manifest
-    assert "B/HH" in manifest
+    item = (tmp_path / "pair" / "item.json").read_text()
+    assert "source_digest" in item
+    assert "source_id" in item
+    assert "dem_identity" in item
+    assert "B/HH" in item
+    reference = CoregisteredSceneStore.open(tmp_path / "20240101")
+    secondary = CoregisteredSceneStore.open(tmp_path / "pair")
+    assert reference.is_reference
+    assert secondary.inputs["reference"] == reference.write_id
 
 
 def test_nisar_geometry_mapping_passes_dem_and_device(
@@ -469,7 +469,7 @@ def test_nisar_geometry_mapping_materializes_noncontiguous_outputs(
 def test_nisar_geometry_mapping_rejects_full_window_outside_secondary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A mapped crop outside the secondary grid is rejected without clamping."""
+    """A mapped crop with no overlap of the secondary grid is rejected."""
     reference = _result(tmp_path / "reference.h5", "20240101").product
     secondary = _result(tmp_path / "secondary.h5", "20240113").product
 
@@ -563,7 +563,7 @@ def test_nisar_provider_promotes_full_scene_without_bounded_window(
         },
     )
 
-    store = CoregisteredSceneStore.open(tmp_path / "pair" / "scenes")
+    store = CoregisteredSceneStore.open(tmp_path / "pair")
     assert store.grid_shape == (4, 5)
     assert [unit.tag for unit in store.units] == ["NISAR_b000000"]
     assert store.units[0].row_origin == 0
@@ -631,7 +631,7 @@ def test_nisar_full_scene_uses_deterministic_row_major_tiles(
         options={"coregistration_grid": "radar", "device": "cpu"},
     )
 
-    store = CoregisteredSceneStore.open(tmp_path / "full" / "scenes")
+    store = CoregisteredSceneStore.open(tmp_path / "full")
     assert store.grid_shape == (4, 5)
     assert [unit.tag for unit in store.units] == [
         "NISAR_b000000",
@@ -646,6 +646,8 @@ def test_nisar_full_scene_uses_deterministic_row_major_tiles(
         (2, 3, (2, 2)),
     ]
     assert len(selections) == 8
+    reference = CoregisteredSceneStore.open(tmp_path / "20240101")
+    first_reference_id = reference.write_id
 
     callback(
         reference_path,
@@ -653,13 +655,18 @@ def test_nisar_full_scene_uses_deterministic_row_major_tiles(
         output_dir=tmp_path / "full",
         options={"coregistration_grid": "radar", "device": "cpu"},
     )
-    assert len(selections) == 8
+    # The committed Reference is reused, never re-read or rewritten; Stack
+    # (not the provider) decides whether a secondary is recomputed.
+    assert len(selections) == 16
+    assert CoregisteredSceneStore.open(tmp_path / "20240101").write_id == (
+        first_reference_id
+    )
 
 
 def test_nisar_full_scene_masks_edge_no_overlap_and_resumes_mixed_tiles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Edge tiles may be empty while valid dense tiles remain resumable."""
+    """Edge tiles may be empty while valid dense tiles still publish."""
     stack, paths, handles = _stack(tmp_path, monkeypatch)
     calls = 0
 
@@ -704,18 +711,20 @@ def test_nisar_full_scene_masks_edge_no_overlap_and_resumes_mixed_tiles(
     options = {"nisar_window": None, "coregistration_grid": "radar"}
     callback(paths[0], paths[1], output_dir=output_dir, options=options)
 
-    store = CoregisteredSceneStore.open(output_dir / "scenes")
-    _reference, empty_secondary, empty_unit = store.read("NISAR_b000001")
+    store = CoregisteredSceneStore.open(output_dir)
+    empty_secondary, empty_unit = store.read("NISAR_b000001")
     assert np.isnan(empty_secondary).all()
     assert empty_unit.phase_state is not None
     assert empty_unit.phase_state["pair_valid_pixels"] == 0
-    _reference, valid_secondary, valid_unit = store.read("NISAR_b000000")
+    valid_secondary, valid_unit = store.read("NISAR_b000000")
     assert np.isfinite(valid_secondary).all()
     assert valid_unit.phase_state is not None
     assert valid_unit.phase_state["pair_valid_pixels"] > 0
 
+    first_secondary = store.write_id
     callback(paths[0], paths[1], output_dir=output_dir, options=options)
     assert calls == 8
+    assert CoregisteredSceneStore.open(output_dir).write_id != first_secondary
 
 
 def test_nisar_full_scene_rejects_pair_without_physical_overlap(
@@ -1001,12 +1010,17 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
         multilook=(1, 1)
     )
     assert len(radar_stack.ifg_dirs) == 3
+    reference_write_id = radar_stack.reference_scene.write_id
     for date_id in dates:
-        store = CoregisteredSceneStore.open(
-            tmp_path / "radar_work" / "coreg" / date_id / "scenes"
-        )
+        store = radar_stack.scenes[date_id]
         assert store.grid_shape == (4, 5)
         assert len(store.units) == 4
+        assert store.is_reference == (date_id == radar_stack.reference)
+        if not store.is_reference:
+            assert store.inputs["reference"] == reference_write_id
+    assert radar_stack.coreg_paths[radar_stack.reference].name == (
+        radar_stack.reference
+    )
 
     full_geo_grid = GeoGrid(
         shape=(4, 5),
@@ -1086,31 +1100,40 @@ def test_nisar_three_date_multitile_radar_and_projected_geo_lifecycle(
     )
     geo_stack.prepare_scenes().coregister_scenes().form_interferograms(multilook=(1, 1))
     assert len(geo_stack.ifg_dirs) == 3
-    for date_id in dates:
-        store = CoregisteredSceneStore.open(
-            tmp_path / "geo_work" / "coreg" / date_id / "scenes"
+    reference_store = geo_stack.reference_scene
+    reference_coverage = np.zeros(reference_store.grid_shape, dtype=np.int8)
+    reference_valid: dict[str, np.ndarray] = {}
+    for unit in reference_store.units:
+        reference, _ = reference_store.read(unit.tag)
+        row_slice = slice(unit.row_origin, unit.row_origin + unit.shape[0])
+        col_slice = slice(unit.col_origin, unit.col_origin + unit.shape[1])
+        reference_valid[unit.tag] = np.isfinite(reference.real)
+        reference_coverage[row_slice, col_slice] += reference_valid[unit.tag]
+        assert unit.phase_state is not None
+        assert unit.phase_state["coverage_policy"] == (
+            "reference_first_valid_row_major_v1"
         )
-        reference_coverage = np.zeros(store.grid_shape, dtype=np.int8)
+    # Reference tiles own every grid sample exactly once, independent of any
+    # secondary's coverage.
+    assert np.all(reference_coverage == 1)
+    for date_id in dates:
+        if date_id == geo_stack.reference:
+            continue
+        store = geo_stack.scenes[date_id]
         secondary_coverage = np.zeros(store.grid_shape, dtype=np.int8)
         for unit in store.units:
-            reference, secondary, _ = store.read(unit.tag)
+            secondary, _ = store.read(unit.tag)
             row_slice = slice(unit.row_origin, unit.row_origin + unit.shape[0])
             col_slice = slice(unit.col_origin, unit.col_origin + unit.shape[1])
-            reference_coverage[row_slice, col_slice] += np.isfinite(reference.real)
-            secondary_coverage[row_slice, col_slice] += np.isfinite(secondary.real)
-            assert np.array_equal(
-                np.isfinite(reference.real),
-                np.isfinite(secondary.real),
-            )
+            secondary_valid = np.isfinite(secondary.real)
+            secondary_coverage[row_slice, col_slice] += secondary_valid
+            assert not np.any(secondary_valid & ~reference_valid[unit.tag])
             assert unit.phase_state is not None
-            assert unit.phase_state["coverage_policy"] == (
-                "joint_first_valid_row_major_v1"
-            )
-            assert unit.phase_state["pair_valid_pixels"] == int(
-                np.sum(np.isfinite(reference.real))
-            )
-        assert np.all(reference_coverage == 1)
-        assert np.all(secondary_coverage == 1)
+            assert unit.phase_state["pair_valid_pixels"] == int(np.sum(secondary_valid))
+        assert np.all(secondary_coverage <= 1)
+        # The reference-only overlap column is covered by the left tile's
+        # Reference, where this secondary is invalid.
+        assert np.count_nonzero(secondary_coverage) < secondary_coverage.size
     assert {date_id for date_id, _bounds in mapping_calls} == {
         "20240113",
         "20240125",
@@ -1166,3 +1189,81 @@ def test_nisar_provider_rejects_source_content_mutation_after_admission(
             output_dir=tmp_path / "pair",
             options={"coregistration_grid": "radar", "height": 0.0},
         )
+
+
+def test_nisar_window_reference_is_independent_of_secondary_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Reference-only window yields the same Reference whatever runs first.
+
+    The window fits the Reference but not the smaller secondary grid; the
+    Reference product is written once by the first secondary and reused by
+    the second, so its write id and payload never depend on the order.
+    """
+    dates = ("20240101", "20240113", "20240125")
+    shapes = {"20240101": (8, 8), "20240113": (6, 8), "20240125": (8, 8)}
+    paths = {date_id: tmp_path / f"NISAR_RSLC_{date_id}.h5" for date_id in dates}
+    products = {}
+    arrays = {}
+    for index, date_id in enumerate(dates):
+        paths[date_id].write_bytes(date_id.encode())
+        result = _result(paths[date_id], date_id)
+        grid = replace(result.product.grid, shape=shapes[date_id])
+        products[date_id] = replace(
+            result.product,
+            grid=grid,
+            samples=replace(result.product.samples, shape=grid.shape),
+        )
+        arrays[date_id] = np.full(shapes[date_id], index + 1.0, np.complex64)
+    handles = {paths[date_id]: date_id for date_id in dates}
+
+    class Sensor:
+        """Fake normalized NISAR window reader."""
+
+        def read_slc_window(
+            self, handle: str, window: tuple[slice, slice], **_kwargs: object
+        ) -> np.ndarray:
+            return arrays[handle][window]
+
+    monkeypatch.setattr(
+        "faninsar.missions.nisar.provider._geometry_shared_radar_window",
+        lambda _primary, _secondary, bounds, **_kwargs: bounds,
+    )
+
+    def run(order: tuple[str, ...], root: Path) -> list[str]:
+        callback = make_nisar_scene_provider(
+            sensor=Sensor(),
+            handles=handles,
+            products=products,
+            lineage={date_id: str(paths[date_id]) for date_id in dates},
+            reference="20240101",
+            channel=("B", "HH"),
+            configured_window=(1, 7, 0, 8),
+            configured_dem=ConstantDEM(0.0),
+        )
+        write_ids = []
+        for date_id in order:
+            callback(
+                paths["20240101"],
+                paths[date_id],
+                output_dir=root / date_id,
+                options={"coregistration_grid": "radar"},
+            )
+            write_ids.append(CoregisteredSceneStore.open(root / "20240101").write_id)
+        return write_ids
+
+    forward = run(("20240113", "20240125"), tmp_path / "forward")
+    backward = run(("20240125", "20240113"), tmp_path / "backward")
+    assert forward[0] == forward[1]
+    assert backward[0] == backward[1]
+    first = CoregisteredSceneStore.open(tmp_path / "forward" / "20240101")
+    second = CoregisteredSceneStore.open(tmp_path / "backward" / "20240101")
+    assert first.grid_shape == second.grid_shape == (6, 8)
+    for tag in first.unit_map():
+        np.testing.assert_array_equal(first.read(tag)[0], second.read(tag)[0])
+    short = CoregisteredSceneStore.open(tmp_path / "forward" / "20240113")
+    payload = short.read("NISAR_b0")[0]
+    # Window rows 1..6 on a 6-row secondary: its last row is outside the
+    # secondary grid and therefore invalid, never zero-filled.
+    assert np.isnan(payload[-1]).all()
+    assert np.isfinite(payload[:-1]).all()

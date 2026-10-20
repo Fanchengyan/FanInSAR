@@ -21,13 +21,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from faninsar.io.storage.scene_store import (
+    NISAR_GEO_COVERAGE_POLICY,
     CoregisteredSceneStore,
+    SceneWriter,
     scene_grid_identity,
-    write_scene_unit,
+    valid_samples,
 )
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import (
-    InvalidProcessingStateError,
     reject_invalid_state,
     reject_pair_configuration,
 )
@@ -712,46 +713,20 @@ def _geo_tile_for_radar_crop(
     return local, target_row_start, target_col_start
 
 
-def _scene_tile_exists(
-    root: Path,
-    *,
+def _persisted_reference_tile(
+    store: CoregisteredSceneStore,
     tag: str,
-    date_id: str,
-    reference_id: str,
-    domain: str,
-    grid_shape: tuple[int, int],
-    grid_identity: str,
-    row_origin: int,
-    col_origin: int,
     shape: tuple[int, int],
-    resume_identity: str,
-) -> bool:
-    """Return whether one prior tile is complete and matches this request."""
-    manifest = root / "manifest.json"
-    if not manifest.is_file():
-        return False
-    store = CoregisteredSceneStore.open(root)
-    if (
-        store.date_id != date_id
-        or store.reference_id != reference_id
-        or store.domain != domain
-        or store.grid_shape != grid_shape
-        or store.grid_identity != grid_identity
-    ):
-        reject_invalid_state("persisted NISAR tile store does not match this request")
+) -> np.ndarray:
+    """Return one tile of the already committed Reference scene product."""
     unit = store.unit_map().get(tag)
-    if unit is None:
-        return False
-    if (
-        unit.row_origin != row_origin
-        or unit.col_origin != col_origin
-        or unit.shape != shape
-    ):
-        reject_invalid_state(f"persisted NISAR tile {tag!r} has different placement")
-    if (unit.phase_state or {}).get("resume_identity") != resume_identity:
-        reject_invalid_state(f"persisted NISAR tile {tag!r} has a stale identity")
-    store.read(tag)
-    return True
+    if unit is None or unit.shape != tuple(shape):
+        reject_invalid_state(
+            f"persisted NISAR Reference has no tile {tag!r} of shape {shape}; "
+            "recoregister with overwrite=True"
+        )
+    payload, _ = store.read(tag)
+    return np.asarray(payload, dtype=np.complex64)
 
 
 def _tile_resume_identity(payload: Mapping[str, object]) -> str:
@@ -766,6 +741,53 @@ def _tile_resume_identity(payload: Mapping[str, object]) -> str:
     except (TypeError, ValueError) as error:
         reject_invalid_state(f"NISAR tile identity is not canonical: {error}")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_padded_window(
+    sensor: Any,
+    handle: object,
+    bounds: tuple[int, int, int, int],
+    shape: tuple[int, int],
+    *,
+    channel: tuple[str, str],
+) -> np.ndarray:
+    """Read ``bounds`` clipped to ``shape``; samples outside it are NaN.
+
+    The window is defined by the Reference, so it may extend past a
+    secondary grid; those samples are invalid rather than zero.
+    """
+    row_start, row_stop, col_start, col_stop = bounds
+    clipped = (
+        max(row_start, 0),
+        min(row_stop, shape[0]),
+        max(col_start, 0),
+        min(col_stop, shape[1]),
+    )
+    if clipped == bounds:
+        return np.asarray(
+            sensor.read_slc_window(
+                handle,
+                (slice(row_start, row_stop), slice(col_start, col_stop)),
+                frequency=channel[0],
+                polarization=channel[1],
+            ),
+            dtype=np.complex64,
+        )
+    output = np.full(
+        (row_stop - row_start, col_stop - col_start),
+        np.complex64(np.nan + 1j * np.nan),
+    )
+    if clipped[0] < clipped[1] and clipped[2] < clipped[3]:
+        output[
+            clipped[0] - row_start : clipped[1] - row_start,
+            clipped[2] - col_start : clipped[3] - col_start,
+        ] = sensor.read_slc_window(
+            handle,
+            (slice(clipped[0], clipped[1]), slice(clipped[2], clipped[3])),
+            frequency=channel[0],
+            polarization=channel[1],
+        )
+    return output
 
 
 def _radar_crop(
@@ -977,13 +999,17 @@ def _geometry_shared_radar_window(
         secondary_col_start,
         secondary_col_start + cols,
     )
-    try:
-        return _window(secondary_bounds, secondary_product.grid.shape)
-    except InvalidProcessingStateError as error:
+    rows_total, cols_total = secondary_product.grid.shape
+    if (
+        secondary_bounds[1] <= 0
+        or secondary_bounds[0] >= rows_total
+        or secondary_bounds[3] <= 0
+        or secondary_bounds[2] >= cols_total
+    ):
         reject_invalid_state(
-            "NISAR mapped secondary radar crop lies outside the source grid; "
-            f"full-window rejection: {error}"
+            "NISAR mapped secondary radar crop lies outside the source grid"
         )
+    return secondary_bounds
 
 
 def _geo_target(value: object) -> GeoGrid:
@@ -1212,11 +1238,9 @@ def make_nisar_scene_provider(
             tiles = tuple(_iter_tiles(bounds, resolved_tile_shape))
         else:
             resolved_tile_shape = None
-            source_shape = (
-                min(primary_product.grid.shape[0], secondary_product.grid.shape[0]),
-                min(primary_product.grid.shape[1], secondary_product.grid.shape[1]),
-            )
-            bounds = _window(requested_window, source_shape)
+            # The Reference alone defines the window so its product never
+            # depends on which secondary is coregistered first.
+            bounds = _window(requested_window, primary_product.grid.shape)
             tiles = (bounds,)
         if domain == "radar":
             grid_shape = (
@@ -1233,8 +1257,59 @@ def make_nisar_scene_provider(
                 grid_shape,
                 {"crs": target.crs, "transform": list(target.transform)},
             )
-        scenes = output_dir / "scenes"
-        pair_claimed = np.zeros(grid_shape, dtype=bool) if domain == "geo" else None
+        scene_dir = Path(options.get("scene_dir") or output_dir)
+        reference_dir = Path(
+            options.get("reference_scene_dir") or scene_dir.parent / str(primary_date)
+        )
+        reference_store = (
+            CoregisteredSceneStore.open(reference_dir)
+            if (reference_dir / "item.json").is_file()
+            else None
+        )
+        if reference_store is not None and (
+            reference_store.reference_id != primary_date
+            or not reference_store.is_reference
+            or reference_store.domain != domain
+            or reference_store.grid_shape != tuple(grid_shape)
+            or reference_store.grid_identity != grid_identity
+        ):
+            reject_invalid_state(
+                "persisted NISAR Reference scene does not match this request; "
+                "recoregister with overwrite=True"
+            )
+        header: dict[str, object] = {
+            "domain": domain,
+            "grid_shape": tuple(grid_shape),
+            "wavelength_m": float(primary_product.grid.wavelength_m),
+            "grid_identity": grid_identity,
+            "crs": str(target.crs) if domain == "geo" and target is not None else None,
+            "transform": (
+                tuple(float(value) for value in target.transform)
+                if domain == "geo" and target is not None
+                else None
+            ),
+        }
+        reference_writer = (
+            None
+            if reference_store is not None
+            else SceneWriter(
+                reference_dir,
+                date_id=primary_date,
+                reference_id=primary_date,
+                overwrite=True,
+                **header,  # type: ignore[arg-type]
+            )
+        )
+        secondary_writer = SceneWriter(
+            scene_dir,
+            date_id=secondary_date,
+            reference_id=primary_date,
+            overwrite=True,
+            **header,  # type: ignore[arg-type]
+        )
+        reference_claimed = (
+            np.zeros(grid_shape, dtype=bool) if domain == "geo" else None
+        )
         pair_valid_pixels = 0
         for tile_index, tile_bounds in enumerate(tiles):
             dense_mapping: _DenseRadarMapping | None = None
@@ -1318,53 +1393,6 @@ def make_nisar_scene_provider(
                 "flatten_stage": requested_flatten_stage,
             }
             resume_identity = _tile_resume_identity(resume_payload)
-            if _scene_tile_exists(
-                scenes,
-                tag=tag,
-                date_id=secondary_date,
-                reference_id=reference,
-                domain=domain,
-                grid_shape=grid_shape,
-                grid_identity=grid_identity,
-                row_origin=row_origin,
-                col_origin=col_origin,
-                shape=tile_output_shape,
-                resume_identity=resume_identity,
-            ):
-                existing = CoregisteredSceneStore.open(scenes)
-                existing_reference, existing_secondary, _ = existing.read(tag)
-                if domain == "geo":
-                    row_slice = slice(row_origin, row_origin + tile_output_shape[0])
-                    col_slice = slice(col_origin, col_origin + tile_output_shape[1])
-                    assert pair_claimed is not None
-                    primary_valid = (
-                        np.isfinite(existing_reference.real)
-                        & np.isfinite(existing_reference.imag)
-                        & (np.abs(existing_reference) > 0.0)
-                    )
-                    secondary_valid = (
-                        np.isfinite(existing_secondary.real)
-                        & np.isfinite(existing_secondary.imag)
-                        & (np.abs(existing_secondary) > 0.0)
-                    )
-                    if not np.array_equal(primary_valid, secondary_valid):
-                        reject_invalid_state(
-                            f"persisted NISAR Geo tile {tag!r} has asymmetric ownership"
-                        )
-                    pair_claimed[row_slice, col_slice] |= primary_valid
-                    pair_valid_pixels += int(np.count_nonzero(primary_valid))
-                elif full_scene:
-                    pair_valid_pixels += int(
-                        np.count_nonzero(
-                            np.isfinite(existing_reference.real)
-                            & np.isfinite(existing_reference.imag)
-                            & np.isfinite(existing_secondary.real)
-                            & np.isfinite(existing_secondary.imag)
-                            & (np.abs(existing_reference) > 0.0)
-                            & (np.abs(existing_secondary) > 0.0)
-                        )
-                    )
-                continue
             primary_window = (
                 slice(row_start, row_stop),
                 slice(col_start, col_stop),
@@ -1377,14 +1405,12 @@ def make_nisar_scene_provider(
                     polarization=channel[1],
                 )
                 if secondary_bounds is not None:
-                    secondary_samples = sensor.read_slc_window(
+                    secondary_samples = _read_padded_window(
+                        sensor,
                         handles[secondary_source],
-                        (
-                            slice(sec_row_start, sec_row_stop),
-                            slice(sec_col_start, sec_col_stop),
-                        ),
-                        frequency=channel[0],
-                        polarization=channel[1],
+                        secondary_bounds,
+                        secondary_product.grid.shape,
+                        channel=channel,
                     )
                 else:
                     secondary_samples = None
@@ -1422,14 +1448,13 @@ def make_nisar_scene_provider(
                         dense_mapping.range_index,
                     )
                     secondary_array[~dense_valid] = np.complex64(np.nan + 1j * np.nan)
-                dense_valid &= (
-                    np.isfinite(primary_radar.samples.real)
-                    & np.isfinite(primary_radar.samples.imag)
-                    & (np.abs(primary_radar.samples) > 0.0)
-                )
+                primary_own_valid = valid_samples(primary_radar.samples)
+                dense_valid &= primary_own_valid
                 secondary_array[~dense_valid] = np.complex64(np.nan + 1j * np.nan)
+                # The Reference keeps its own support; secondary coverage
+                # never masks the payload shared by every Stack date.
                 primary_array = np.where(
-                    dense_valid,
+                    primary_own_valid,
                     primary_radar.samples,
                     np.complex64(np.nan + 1j * np.nan),
                 ).astype(np.complex64, copy=False)
@@ -1582,85 +1607,86 @@ def make_nisar_scene_provider(
                             copy=False,
                         )
                         range_offset_phase = _sanitize_phase_screen(range_offset_phase)
-                assert pair_claimed is not None
+                assert reference_claimed is not None
                 row_slice = slice(row_origin, row_origin + tile_output_shape[0])
                 col_slice = slice(col_origin, col_origin + tile_output_shape[1])
-                primary_valid = (
-                    np.isfinite(primary_array.real)
-                    & np.isfinite(primary_array.imag)
-                    & (np.abs(primary_array) > 0.0)
-                )
-                secondary_valid = (
-                    np.isfinite(secondary_array.real)
-                    & np.isfinite(secondary_array.imag)
-                    & (np.abs(secondary_array) > 0.0)
-                )
-                pair_owner = (
-                    primary_valid
-                    & secondary_valid
-                    & ~pair_claimed[row_slice, col_slice]
-                )
+                # Ownership is decided by the Reference alone, so its tiles are
+                # identical for every secondary; the secondary follows them.
+                if reference_store is not None:
+                    primary_array = _persisted_reference_tile(
+                        reference_store, tag, tile_output_shape
+                    )
+                    reference_owner = valid_samples(primary_array)
+                else:
+                    reference_owner = (
+                        valid_samples(primary_array)
+                        & ~reference_claimed[row_slice, col_slice]
+                    )
                 primary_array = np.where(
-                    pair_owner,
+                    reference_owner,
                     primary_array,
                     np.complex64(np.nan + 1j * np.nan),
                 )
                 secondary_array = np.where(
-                    pair_owner,
+                    reference_owner & valid_samples(secondary_array),
                     secondary_array,
                     np.complex64(np.nan + 1j * np.nan),
                 )
-                pair_claimed[row_slice, col_slice] |= pair_owner
-            write_scene_unit(
-                scenes,
-                date_id=secondary_date,
-                reference_id=reference,
-                domain=domain,
+                reference_claimed[row_slice, col_slice] |= reference_owner
+            if domain == "radar" and reference_store is not None:
+                primary_array = _persisted_reference_tile(
+                    reference_store, tag, tile_output_shape
+                )
+            primary_array = np.asarray(primary_array, dtype=np.complex64)
+            secondary_array = np.asarray(secondary_array, dtype=np.complex64)
+            coverage_policy = (
+                NISAR_GEO_COVERAGE_POLICY if domain == "geo" else "nan_mask_v1"
+            )
+            reference_lineage = (
+                {
+                    "stage": "nisar_rslc_tile" if full_scene else "nisar_rslc_window",
+                    "source": str(primary_source),
+                    "source_id": admitted_sources[primary_date][0],
+                    "source_digest": admitted_sources[primary_date][1],
+                    "admission_policy": admission_lineage.get(primary_date, {}).get(
+                        "policy"
+                    ),
+                    "channel": f"{channel[0]}/{channel[1]}",
+                    "lineage": "primary",
+                    "dem_identity": dem_identity,
+                    "tile_grid": (
+                        None
+                        if local_target is None
+                        else {
+                            "crs": str(local_target.crs),
+                            "transform": [
+                                float(value) for value in local_target.transform
+                            ],
+                        }
+                    ),
+                    "window": f"{row_start}:{row_stop},{col_start}:{col_stop}",
+                },
+            )
+            if reference_writer is not None:
+                reference_writer.add_unit(
+                    tag=tag,
+                    payload=primary_array,
+                    row_origin=row_origin,
+                    col_origin=col_origin,
+                    scientific_lineage=reference_lineage,
+                    phase_state={
+                        "coverage_policy": coverage_policy,
+                        "geometry_method": resume_payload["geometry"],
+                        "flatten_stage": requested_flatten_stage,
+                        "valid_pixels": int(np.sum(valid_samples(primary_array))),
+                    },
+                )
+            secondary_writer.add_unit(
                 tag=tag,
-                primary=np.asarray(primary_array, dtype=np.complex64),
-                secondary=np.asarray(secondary_array, dtype=np.complex64),
+                payload=secondary_array,
                 row_origin=row_origin,
                 col_origin=col_origin,
-                grid_shape=grid_shape,
-                wavelength_m=primary_product.grid.wavelength_m,
-                grid_identity=grid_identity,
-                # Every tile belongs to one common scene grid.  Persist the
-                # requested scene CRS/transform; the local tile transform is
-                # only a processing detail and remains in lineage below.
-                crs=(
-                    str(target.crs) if domain == "geo" and target is not None else None
-                ),
-                transform=(
-                    tuple(float(value) for value in target.transform)
-                    if domain == "geo" and target is not None
-                    else None
-                ),
                 scientific_lineage=(
-                    {
-                        "stage": "nisar_rslc_tile"
-                        if full_scene
-                        else "nisar_rslc_window",
-                        "source": str(primary_source),
-                        "source_id": admitted_sources[primary_date][0],
-                        "source_digest": admitted_sources[primary_date][1],
-                        "admission_policy": admission_lineage.get(primary_date, {}).get(
-                            "policy"
-                        ),
-                        "channel": f"{channel[0]}/{channel[1]}",
-                        "lineage": "primary",
-                        "dem_identity": dem_identity,
-                        "tile_grid": (
-                            None
-                            if local_target is None
-                            else {
-                                "crs": str(local_target.crs),
-                                "transform": [
-                                    float(value) for value in local_target.transform
-                                ],
-                            }
-                        ),
-                        "window": f"{row_start}:{row_stop},{col_start}:{col_stop}",
-                    },
                     {
                         "stage": "nisar_rslc_tile"
                         if full_scene
@@ -1697,12 +1723,8 @@ def make_nisar_scene_provider(
                     },
                 ),
                 phase_state={
-                    "resume_identity": resume_identity,
-                    "coverage_policy": (
-                        "joint_first_valid_row_major_v1"
-                        if domain == "geo"
-                        else "nan_mask_v1"
-                    ),
+                    "tile_identity": resume_identity,
+                    "coverage_policy": coverage_policy,
                     "geometry_method": resume_payload["geometry"],
                     "range_offset_flatten": "nisar_ellipsoidal_v1",
                     "flatten_stage": requested_flatten_stage,
@@ -1716,28 +1738,11 @@ def make_nisar_scene_provider(
                         ).tobytes()
                     ).hexdigest(),
                     "range_offset_phase_rms_rad": float(np.nanstd(range_offset_phase)),
-                    "primary_valid_pixels": int(
-                        np.sum(
-                            np.isfinite(primary_array.real)
-                            & np.isfinite(primary_array.imag)
-                            & (np.abs(primary_array) > 0.0)
-                        )
-                    ),
-                    "secondary_valid_pixels": int(
-                        np.sum(
-                            np.isfinite(secondary_array.real)
-                            & np.isfinite(secondary_array.imag)
-                            & (np.abs(secondary_array) > 0.0)
-                        )
-                    ),
+                    "valid_pixels": int(np.sum(valid_samples(secondary_array))),
                     "pair_valid_pixels": int(
                         np.sum(
-                            np.isfinite(primary_array.real)
-                            & np.isfinite(primary_array.imag)
-                            & np.isfinite(secondary_array.real)
-                            & np.isfinite(secondary_array.imag)
-                            & (np.abs(primary_array) > 0.0)
-                            & (np.abs(secondary_array) > 0.0)
+                            valid_samples(primary_array)
+                            & valid_samples(secondary_array)
                         )
                     ),
                 },
@@ -1746,31 +1751,27 @@ def make_nisar_scene_provider(
                     if requested_flatten_stage == "interferogram"
                     else None
                 ),
-                validate_existing_payloads=not full_scene,
             )
-            if full_scene:
-                pair_valid_pixels += int(
-                    np.sum(
-                        np.isfinite(primary_array.real)
-                        & np.isfinite(primary_array.imag)
-                        & np.isfinite(secondary_array.real)
-                        & np.isfinite(secondary_array.imag)
-                        & (np.abs(primary_array) > 0.0)
-                        & (np.abs(secondary_array) > 0.0)
-                    )
-                )
-        if full_scene:
-            if domain == "geo":
-                has_pair_coverage = pair_claimed is not None and bool(
-                    np.any(pair_claimed)
-                )
-            else:
-                has_pair_coverage = pair_valid_pixels > 0
-            if not has_pair_coverage:
-                reject_invalid_state(
-                    "NISAR full-scene pair has no physical secondary overlap; "
-                    "all dense radar-to-geo-to-radar lanes were invalid"
-                )
+            pair_valid_pixels += int(
+                np.sum(valid_samples(primary_array) & valid_samples(secondary_array))
+            )
+        if full_scene and pair_valid_pixels == 0:
+            secondary_writer.abort()
+            if reference_writer is not None:
+                reference_writer.abort()
+            reject_invalid_state(
+                "NISAR full-scene pair has no physical secondary overlap; "
+                "all dense radar-to-geo-to-radar lanes were invalid"
+            )
+        if reference_writer is not None:
+            reference_store = reference_writer.commit()
+        secondary_writer.commit(
+            inputs={
+                **dict(options.get("scene_inputs") or {}),
+                "reference": reference_store.write_id,
+            },
+            properties=dict(options.get("scene_properties") or {}),
+        )
         return NisarPairState(
             pair_id=f"{primary_date}_{secondary_date}",
             stage_timings_s={},
