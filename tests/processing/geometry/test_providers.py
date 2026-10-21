@@ -44,6 +44,7 @@ def test_pc_plan_is_immutable_and_zero_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Planning records STAC identity but defers discovery to materialization."""
+
     def blocked(*args: object, **kwargs: object) -> None:
         raise AssertionError("PC planning must not touch the network")
 
@@ -151,7 +152,11 @@ def test_pc_materializes_signed_cog_directly_to_projected_grid(
 
     item = _SignedItem(
         "pc-tile",
-        {"data": _SignedAsset("https://elevationeuwest.blob.core.windows.net/tile.tif?sig=x", {})},
+        {
+            "data": _SignedAsset(
+                "https://elevationeuwest.blob.core.windows.net/tile.tif?sig=x", {}
+            )
+        },
     )
 
     class _Search:

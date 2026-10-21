@@ -64,10 +64,14 @@ def _eof_xml(start: str, stop: str) -> bytes:
     ).encode()
 
 
-def _list_xml(keys: list[str], *, truncated: bool = False, token: str | None = None) -> bytes:
+def _list_xml(
+    keys: list[str], *, truncated: bool = False, token: str | None = None
+) -> bytes:
     """Return a ListObjects v2 payload for the given keys."""
     contents = "".join(f"<Contents><Key>{key}</Key></Contents>" for key in keys)
-    token_xml = f"<NextContinuationToken>{token}</NextContinuationToken>" if token else ""
+    token_xml = (
+        f"<NextContinuationToken>{token}</NextContinuationToken>" if token else ""
+    )
     truncated_xml = "true" if truncated else "false"
     return (
         '<?xml version="1.0"?>'
@@ -110,7 +114,9 @@ class _FakeS3Opener:
         self.list_status = list_status
         self.requests: list[urllib.request.Request] = []
 
-    def open(self, request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
+    def open(
+        self, request: urllib.request.Request, timeout: float | None = None
+    ) -> _FakeResponse:
         """Serve one listing or object GET without leaving the test process."""
         del timeout
         self.requests.append(request)
@@ -118,9 +124,16 @@ class _FakeS3Opener:
         parsed = urllib.parse.urlsplit(url)
         host = (parsed.hostname or "").lower()
         if "s1qc" in host:
-            raise urllib.error.HTTPError(url, 401, "Unauthorized", hdrs={}, fp=io.BytesIO())
-        if host not in {"s1-orbits.s3.amazonaws.com", "s1-orbits.s3.us-west-2.amazonaws.com"}:
-            raise urllib.error.HTTPError(url, 404, "Not Found", hdrs={}, fp=io.BytesIO())
+            raise urllib.error.HTTPError(
+                url, 401, "Unauthorized", hdrs={}, fp=io.BytesIO()
+            )
+        if host not in {
+            "s1-orbits.s3.amazonaws.com",
+            "s1-orbits.s3.us-west-2.amazonaws.com",
+        }:
+            raise urllib.error.HTTPError(
+                url, 404, "Not Found", hdrs={}, fp=io.BytesIO()
+            )
         query = dict(urllib.parse.parse_qsl(parsed.query))
         if query.get("list-type") == "2":
             if self.list_status != 200:
@@ -134,12 +147,18 @@ class _FakeS3Opener:
         status = self.get_status.get(key, 200)
         if status != 200 or key not in self.objects:
             raise urllib.error.HTTPError(
-                url, status if status != 200 else 404, "object failed", hdrs={}, fp=io.BytesIO()
+                url,
+                status if status != 200 else 404,
+                "object failed",
+                hdrs={},
+                fp=io.BytesIO(),
             )
         return _FakeResponse(self.objects[key], url)
 
 
-def _install_fake_s3(monkeypatch: pytest.MonkeyPatch, opener: _FakeS3Opener) -> _FakeS3Opener:
+def _install_fake_s3(
+    monkeypatch: pytest.MonkeyPatch, opener: _FakeS3Opener
+) -> _FakeS3Opener:
     """Route both listing and complete-file GET through the in-memory opener."""
     monkeypatch.setattr("urllib.request.build_opener", lambda *_handlers: opener)
     monkeypatch.setattr("urllib.request.urlopen", opener.open)
@@ -254,14 +273,22 @@ def test_download_covering_orbits_gets_s1_orbits_anonymously(
         mission_ids={"20240101": "S1A"},
         cache_dir=cache,
     )
-    hosts = {urllib.parse.urlsplit(request.full_url).hostname for request in opener.requests}
-    paths = [urllib.parse.urlsplit(request.full_url).path for request in opener.requests]
+    hosts = {
+        urllib.parse.urlsplit(request.full_url).hostname for request in opener.requests
+    }
+    paths = [
+        urllib.parse.urlsplit(request.full_url).path for request in opener.requests
+    ]
     headers = [dict(request.header_items()) for request in opener.requests]
     assert hosts == {"s1-orbits.s3.amazonaws.com"}
     assert all("s1qc" not in (request.full_url or "") for request in opener.requests)
-    assert any(path.endswith(COVERING_POEORB.rsplit("/", 1)[1]) or COVERING_POEORB in path
-               for path in paths)
-    assert not any(NEIGHBOR_POEORB.rsplit("/", 1)[1] in path for path in paths if path != "/")
+    assert any(
+        path.endswith(COVERING_POEORB.rsplit("/", 1)[1]) or COVERING_POEORB in path
+        for path in paths
+    )
+    assert not any(
+        NEIGHBOR_POEORB.rsplit("/", 1)[1] in path for path in paths if path != "/"
+    )
     assert all("Authorization" not in header for header in headers)
     bound = selected["20240101"]
     assert bound.name.startswith("S1A_OPER_AUX_POEORB_")
@@ -280,10 +307,14 @@ def test_download_does_not_get_eof_bytes_from_s1qc(
         cache_dir=tmp_path / "orbits",
     )
     assert opener.requests
-    assert all("s1qc.asf.alaska.edu" not in request.full_url for request in opener.requests)
+    assert all(
+        "s1qc.asf.alaska.edu" not in request.full_url for request in opener.requests
+    )
 
 
-def test_http_404_is_a_download_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+def test_http_404_is_a_download_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
     """A failed EOF GET is a download error naming dates, host, and status."""
     opener = _install_fake_s3(
         monkeypatch,
@@ -305,7 +336,9 @@ def test_http_404_is_a_download_error(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert opener.requests
 
 
-def test_http_401_is_a_download_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+def test_http_401_is_a_download_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
     """Unauthorized listing or GET is reported as a download failure."""
     _install_fake_s3(
         monkeypatch,
@@ -323,7 +356,9 @@ def test_http_401_is_a_download_error(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert caught.value.status == 401
 
 
-def test_catalog_miss_leaves_embedded_vectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+def test_catalog_miss_leaves_embedded_vectors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
     """No covering key on s1-orbits keeps SAFE-embedded restituted vectors."""
     _install_fake_s3(monkeypatch, _FakeS3Opener({NEIGHBOR_POEORB: b"unused"}))
     selected = ensure_covering_orbit_paths(
@@ -342,7 +377,9 @@ def test_caller_covering_resorb_is_not_upgraded(
     restituted.write_bytes(_eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00"))
     opener = _install_fake_s3(
         monkeypatch,
-        _FakeS3Opener({COVERING_POEORB: _eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00")}),
+        _FakeS3Opener(
+            {COVERING_POEORB: _eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00")}
+        ),
     )
     selected = ensure_covering_orbit_paths(
         intervals={"20240101": _SCENE_INTERVAL},
@@ -382,11 +419,15 @@ def test_skip_if_present_reuses_cached_covering_file(
     assert object_gets == []
 
 
-def test_manifest_reuse_skips_auto_fetch(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+def test_manifest_reuse_skips_auto_fetch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
     """Published-stack reuse does not download unless refresh is requested."""
     opener = _install_fake_s3(
         monkeypatch,
-        _FakeS3Opener({COVERING_POEORB: _eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00")}),
+        _FakeS3Opener(
+            {COVERING_POEORB: _eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00")}
+        ),
     )
     selected = ensure_covering_orbit_paths(
         intervals={"20240101": _SCENE_INTERVAL},
@@ -437,7 +478,9 @@ def test_from_safes_prepare_does_not_fetch_orbits(
 
     opener = _install_fake_s3(
         monkeypatch,
-        _FakeS3Opener({COVERING_POEORB: _eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00")}),
+        _FakeS3Opener(
+            {COVERING_POEORB: _eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00")}
+        ),
     )
     monkeypatch.setattr(
         "faninsar.missions.s1.safe.open_safe_product",
@@ -500,7 +543,9 @@ def test_open_manifest_reuse_does_not_auto_fetch(
 
     opener = _install_fake_s3(
         monkeypatch,
-        _FakeS3Opener({COVERING_POEORB: _eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00")}),
+        _FakeS3Opener(
+            {COVERING_POEORB: _eof_xml("2023-12-31T23:00:00", "2024-01-01T01:00:00")}
+        ),
     )
     monkeypatch.setattr(
         "faninsar.missions.s1.safe.open_safe_product",

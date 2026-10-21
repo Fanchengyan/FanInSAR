@@ -127,15 +127,8 @@ def test_deramped_remap_fractional_shift_phase_error_bound() -> None:
     src_r = rows - off_az
     src_c = cols - off_rg
     # Interior valid for fractional sampling
-    interior = (
-        (src_r > 4)
-        & (src_r < height - 5)
-        & (src_c > 4)
-        & (src_c < width - 5)
-    )
-    expected = 0.5 * geo_phase - (-0.5) * (
-        0.03 * src_c + 0.008 * src_r
-    )
+    interior = (src_r > 4) & (src_r < height - 5) & (src_c > 4) & (src_c < width - 5)
+    expected = 0.5 * geo_phase - (-0.5) * (0.03 * src_c + 0.008 * src_r)
     # After form_interferogram (ref * conj(sec)) in original domain, carrier
     # should cancel if reramp uses ref carrier on both — residual ≈ geo only.
     dph = np.angle(ifg.complex_ifg * np.exp(-1j * expected))

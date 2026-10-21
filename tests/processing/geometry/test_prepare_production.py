@@ -397,20 +397,14 @@ def test_prepared_cache_misses_on_sensing_start_or_look(monkeypatch) -> None:
 
     monkeypatch.setattr(prepare_mod, "prepare_geometry", fake_prepare)
     model = _model()
-    prepare_production_geometry(
-        Operation.GEO2RDR, model, device="cpu", shape=(3, 3)
-    )
+    prepare_production_geometry(Operation.GEO2RDR, model, device="cpu", shape=(3, 3))
     shifted = replace(
         model,
         sensing_start=model.sensing_start + timedelta(seconds=1),
     )
-    prepare_production_geometry(
-        Operation.GEO2RDR, shifted, device="cpu", shape=(3, 3)
-    )
+    prepare_production_geometry(Operation.GEO2RDR, shifted, device="cpu", shape=(3, 3))
     looked = replace(model, look_direction="left")
-    prepare_production_geometry(
-        Operation.GEO2RDR, looked, device="cpu", shape=(3, 3)
-    )
+    prepare_production_geometry(Operation.GEO2RDR, looked, device="cpu", shape=(3, 3))
     assert len(calls) == 3
 
 
@@ -486,7 +480,9 @@ def test_gpu_dem_table_aliases_across_prepared_shapes(monkeypatch) -> None:
         "_require_device",
         lambda _device: SimpleNamespace(type="cuda"),
     )
-    monkeypatch.setattr(prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None))
+    monkeypatch.setattr(
+        prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None)
+    )
     monkeypatch.setattr(prepare_mod, "_try_load_cuda_module", lambda _op: object())
     dem = ConstantDEM(4.0)
     model = _model()
@@ -522,7 +518,9 @@ def test_rdr2geo_without_dem_context_does_not_admit_native(monkeypatch) -> None:
         "_require_device",
         lambda _device: SimpleNamespace(type="cuda"),
     )
-    monkeypatch.setattr(prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None))
+    monkeypatch.setattr(
+        prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None)
+    )
     monkeypatch.setattr(prepare_mod, "_try_load_cuda_module", lambda _op: object())
     prepare_production_geometry(
         Operation.RDR2GEO,
@@ -578,7 +576,9 @@ def test_native_rdr2geo_registers_dem_once_per_digest(monkeypatch) -> None:
         "_require_device",
         lambda _device: SimpleNamespace(type="cuda"),
     )
-    monkeypatch.setattr(prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None))
+    monkeypatch.setattr(
+        prepare_mod, "_cuda_uuids", lambda _resolved: ("gpu-uuid", None)
+    )
     monkeypatch.setattr(prepare_mod, "_try_load_cuda_module", lambda _op: object())
     dem = ConstantDEM(7.0)
     model = _model()

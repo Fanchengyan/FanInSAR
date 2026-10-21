@@ -48,9 +48,10 @@ def test_window_weighting_pulls_solution_toward_confident_pairs() -> None:
     unweighted = invert_ionosphere_network(screens, screening_iterations=0)
     weighted = invert_ionosphere_network(screens, confident, screening_iterations=0)
     assert weighted.screened_pair_ids == ()
-    assert np.abs(weighted.screens - chain.screens).max() < np.abs(
-        unweighted.screens - chain.screens
-    ).max()
+    assert (
+        np.abs(weighted.screens - chain.screens).max()
+        < np.abs(unweighted.screens - chain.screens).max()
+    )
 
 
 def test_zero_or_nan_window_pixels_exclude_the_pair_at_that_pixel() -> None:

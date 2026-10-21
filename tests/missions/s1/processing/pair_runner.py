@@ -80,6 +80,7 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
+
 def looks_dir(azimuth_looks: int, range_looks: int) -> str:
     """Return the deterministic per-config output subtree name."""
     return f"looks_{azimuth_looks}x{range_looks}"

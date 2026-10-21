@@ -116,6 +116,7 @@ def test_resample_complex_torch_cpu_does_not_use_numpy_dask() -> None:
         device="cpu",
     )
 
+
 @pytest.mark.skipif(
     not torch.backends.mps.is_available(),
     reason="MPS is not available",

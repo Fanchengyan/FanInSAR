@@ -30,7 +30,9 @@ def test_stream_to_cache_rejects_unknown_length_over_budget(tmp_path: Path) -> N
 
 def test_validate_https_origin_rejects_redirect_host() -> None:
     with pytest.raises(ValueError, match="origin"):
-        validate_https_origin("https://evil.example/a", {"planetarycomputer.microsoft.com"})
+        validate_https_origin(
+            "https://evil.example/a", {"planetarycomputer.microsoft.com"}
+        )
 
 
 def test_http_range_requires_exact_protocol_length(tmp_path: Path) -> None:

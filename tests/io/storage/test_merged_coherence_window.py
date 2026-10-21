@@ -28,7 +28,10 @@ def test_merged_coherence_window_is_local_mle_not_single_sample(
     )
     secondary = (reference + 1.5 * noise).astype(np.complex64)
     first = write_test_scene(
-        tmp_path, date_id="20240101", reference_id="20240101", payload=reference,
+        tmp_path,
+        date_id="20240101",
+        reference_id="20240101",
+        payload=reference,
         tag="IW1_b0",
     )
     second = write_test_scene(

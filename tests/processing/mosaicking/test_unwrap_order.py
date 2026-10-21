@@ -58,12 +58,24 @@ def _two_bursts_with_overlap(
     coh_j[mask_j] = 1.0
 
     p_i = BurstGeoProduct(
-        burst_id="a", path_id="T1_A", swath="IW1", date=date(2024, 1, 1),
-        grid=g, complex=z_i, weight=w_i, coherence=coh_i,
+        burst_id="a",
+        path_id="T1_A",
+        swath="IW1",
+        date=date(2024, 1, 1),
+        grid=g,
+        complex=z_i,
+        weight=w_i,
+        coherence=coh_i,
     )
     p_j = BurstGeoProduct(
-        burst_id="b", path_id="T1_A", swath="IW1", date=date(2024, 1, 1),
-        grid=g, complex=z_j, weight=w_j, coherence=coh_j,
+        burst_id="b",
+        path_id="T1_A",
+        swath="IW1",
+        date=date(2024, 1, 1),
+        grid=g,
+        complex=z_j,
+        weight=w_j,
+        coherence=coh_j,
     )
     return p_i, p_j
 
@@ -100,7 +112,7 @@ def _post_unwrap_merge_residual(p_i, p_j, k_j_func) -> float:
     for r in overlap_rows:
         n_cols = int(overlap[r].sum())
         k = k_j_func(int(r))
-        k_j[flat_idx:flat_idx + n_cols] = k
+        k_j[flat_idx : flat_idx + n_cols] = k
         flat_idx += n_cols
     psi_j = np.angle(p_j.complex[overlap]) + 2.0 * np.pi * k_j
     # Unwrapped-domain difference: the 2π step discontinuity survives here.

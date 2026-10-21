@@ -32,9 +32,7 @@ def _goldstein_werner_reference(
     height, width = interferogram.shape
     step = patch_size // 2
     axis = np.arange(patch_size, dtype=np.float32)
-    taper_1d = 1.0 - np.abs(
-        2.0 * (axis - patch_size / 2) / (patch_size + 1)
-    )
+    taper_1d = 1.0 - np.abs(2.0 * (axis - patch_size / 2) / (patch_size + 1))
     taper = np.outer(taper_1d, taper_1d)
     output = np.zeros_like(interferogram)
     for row in range(0, height, step):
@@ -95,8 +93,9 @@ def test_multilook_retains_partial_tail_with_actual_sample_count() -> None:
     assert product.complex_ifg[1, 2] == pytest.approx(3.0 + 0.0j)
 
 
-def test_direct_mle_marks_singleton_coherence_invalid_but_keeps_complex_support(
-) -> None:
+def test_direct_mle_marks_singleton_coherence_invalid_but_keeps_complex_support() -> (
+    None
+):
     """One valid sample supports an IFG, but not a two-sample MLE coherence."""
     primary = np.full((2, 2), np.nan + 1j * np.nan, dtype=np.complex64)
     secondary = np.full((2, 2), np.nan + 1j * np.nan, dtype=np.complex64)
@@ -176,9 +175,12 @@ def test_goldstein_werner_matches_isce2_reference_without_patch_normalization() 
         alpha=0.5,
         patch_size=16,
     )
-    actual = GoldsteinWerner(alpha=0.5, patch_size=16).apply(
-        torch.from_numpy(interferogram)
-    ).interferogram.cpu().numpy()
+    actual = (
+        GoldsteinWerner(alpha=0.5, patch_size=16)
+        .apply(torch.from_numpy(interferogram))
+        .interferogram.cpu()
+        .numpy()
+    )
     np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-5)
 
 

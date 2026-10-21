@@ -90,7 +90,9 @@ ALL_METHODS = [
 ]
 
 # Methods that perform an inter-burst phase alignment (constant offset).
-ALIGNING_METHODS = [m for m in ALL_METHODS if m not in ("complex_average", "gmtsar_cut")]
+ALIGNING_METHODS = [
+    m for m in ALL_METHODS if m not in ("complex_average", "gmtsar_cut")
+]
 
 
 @pytest.mark.parametrize("method", ALIGNING_METHODS)
@@ -131,7 +133,9 @@ def test_range_ramp_removed_by_faninsar_network() -> None:
     g = _grid()
     h, w = g.shape
     cols = np.arange(w, dtype=np.float64)
-    left = _make_product("lw", phase_offset_rad=0.0, valid_slice=(slice(0, 20), slice(0, 22)))
+    left = _make_product(
+        "lw", phase_offset_rad=0.0, valid_slice=(slice(0, 20), slice(0, 22))
+    )
     # Right burst: phase = 0.3 + 0.025 * col (relative to left's zero).
     z_right = np.zeros((h, w), dtype=np.complex64)
     mask_r = np.zeros((h, w), dtype=bool)
@@ -141,10 +145,14 @@ def test_range_ramp_removed_by_faninsar_network() -> None:
             z_right[:, c][mask_r[:, c]] = np.exp(
                 1j * (0.3 + 0.025 * c), dtype=np.complex64
             )
-    right = _make_product("rw", z_field=z_right, valid_slice=(slice(0, 20), slice(12, 40)))
+    right = _make_product(
+        "rw", z_field=z_right, valid_slice=(slice(0, 20), slice(12, 40))
+    )
     mosaic = merge_bursts(
-        [left, right], method="faninsar_network",
-        min_overlap_px=10, min_edge_coherence=0.0,
+        [left, right],
+        method="faninsar_network",
+        min_overlap_px=10,
+        min_edge_coherence=0.0,
     )
     z = mosaic.complex
     # Right-only region (cols 30..38): phase should be near left's 0 reference.
@@ -168,7 +176,9 @@ def test_range_ramp_not_removed_when_no_slope_method() -> None:
     """
     g = _grid()
     h, w = g.shape
-    left = _make_product("lw", phase_offset_rad=0.0, valid_slice=(slice(0, 20), slice(0, 22)))
+    left = _make_product(
+        "lw", phase_offset_rad=0.0, valid_slice=(slice(0, 20), slice(0, 22))
+    )
     z_right = np.zeros((h, w), dtype=np.complex64)
     mask_r = np.zeros((h, w), dtype=bool)
     mask_r[slice(0, 20), slice(12, 40)] = True
@@ -177,12 +187,16 @@ def test_range_ramp_not_removed_when_no_slope_method() -> None:
             z_right[:, c][mask_r[:, c]] = np.exp(
                 1j * (0.3 + 0.025 * c), dtype=np.complex64
             )
-    right = _make_product("rw", z_field=z_right, valid_slice=(slice(0, 20), slice(12, 40)))
+    right = _make_product(
+        "rw", z_field=z_right, valid_slice=(slice(0, 20), slice(12, 40))
+    )
 
     def _resid_std(method: MergeMethod) -> float:
         mosaic = merge_bursts(
-            [left, right], method=method,
-            min_overlap_px=10, min_edge_coherence=0.0,
+            [left, right],
+            method=method,
+            min_overlap_px=10,
+            min_edge_coherence=0.0,
         )
         z = mosaic.complex
         right_only = z[:, 30:38]
@@ -212,8 +226,10 @@ def test_legacy_mode_phase_network_maps_to_faninsar_network() -> None:
         [p_i, p_j], mode="phase_network", min_overlap_px=10, min_edge_coherence=0.0
     )
     direct = merge_bursts(
-        [p_i, p_j], method="faninsar_network",
-        min_overlap_px=10, min_edge_coherence=0.0,
+        [p_i, p_j],
+        method="faninsar_network",
+        min_overlap_px=10,
+        min_edge_coherence=0.0,
     )
     assert np.allclose(legacy.complex, direct.complex, atol=1e-6)
 
@@ -225,8 +241,10 @@ def test_legacy_mode_complex_average_maps_to_complex_average() -> None:
         [p_i, p_j], mode="complex_average", min_overlap_px=10, min_edge_coherence=0.0
     )
     direct = merge_bursts(
-        [p_i, p_j], method="complex_average",
-        min_overlap_px=10, min_edge_coherence=0.0,
+        [p_i, p_j],
+        method="complex_average",
+        min_overlap_px=10,
+        min_edge_coherence=0.0,
     )
     assert np.allclose(legacy.complex, direct.complex, atol=1e-6)
 

@@ -106,7 +106,7 @@ class TestPairsEdgeCases:
         assert len(empty_pairs) == 0
 
         # Test sort not inplace
-        sorted_pairs,_ = empty_pairs.sort(inplace=False)
+        sorted_pairs, _ = empty_pairs.sort(inplace=False)
         assert len(sorted_pairs) == 0
 
     def test_empty_pairs_gaps(self):
@@ -256,10 +256,12 @@ class TestPairsEdgeCases:
         """Test that dates are properly ordered in pairs."""
         # Test with reversed dates
         date1 = datetime(2020, 1, 15)  # Later date first
-        date2 = datetime(2020, 1, 1)   # Earlier date second
+        date2 = datetime(2020, 1, 1)  # Earlier date second
         pairs = Pairs([(date1, date2)])
 
         # Should be automatically reordered
         assert pairs.primary[0] == pd.Timestamp(date2)  # Earlier date becomes primary
         assert pairs.secondary[0] == pd.Timestamp(date1)  # Later date becomes secondary
-        assert pairs.names[0] == "20200101_20200115"  # Name should reflect correct order
+        assert (
+            pairs.names[0] == "20200101_20200115"
+        )  # Name should reflect correct order

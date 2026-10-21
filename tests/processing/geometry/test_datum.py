@@ -24,6 +24,8 @@ def test_cross_geoid_path_uses_both_in_order() -> None:
 def test_fetch_required_preserves_graph_order() -> None:
     """The conversion graph controls lazy fetch call order."""
     calls: list[str] = []
-    result = fetch_required("egm96", "egm2008", lambda model: calls.append(model) or model)
+    result = fetch_required(
+        "egm96", "egm2008", lambda model: calls.append(model) or model
+    )
     assert result == ("egm96", "egm2008")
     assert calls == ["egm96", "egm2008"]

@@ -44,7 +44,7 @@ def install_fake_reader(
 ) -> None:
     """Install an in-memory ``nisar.products.readers`` module for one test."""
     readers = ModuleType("nisar.products.readers")
-    readers.open_product = lambda uri, **_kwargs: (calls.append(uri) or handle)  # type: ignore[attr-defined]
+    readers.open_product = lambda uri, **_kwargs: calls.append(uri) or handle  # type: ignore[attr-defined]
     products = ModuleType("nisar.products")
     nisar = ModuleType("nisar")
     monkeypatch.setitem(sys.modules, "nisar", nisar)

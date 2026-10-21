@@ -312,7 +312,6 @@ class TestSentinel1:
             test_sar.frequency = Frequency(10.0, "GHz")  # type: ignore
 
 
-
 class TestWavelengthFrequencyConversion:
     """Test conversions between wavelength and frequency."""
 

@@ -82,9 +82,7 @@ def _item() -> _Item:
     )
 
 
-def test_planetary_computer_search_stays_unsigned_and_preserves_safe_identity() -> (
-    None
-):
+def test_planetary_computer_search_stays_unsigned_and_preserves_safe_identity() -> None:
     """STAC discovery emits a safe unsigned record for later transfer signing."""
     item = _item()
     calls: list[object] = []
@@ -233,6 +231,7 @@ def test_planetary_computer_download_signs_inside_the_mediated_stream(
 
     response.read = read  # type: ignore[method-assign]
     adapter = PlanetaryComputerAdapter(signer=lambda value: value)
+
     class _Opener:
         def open(self, *_args: object, **_kwargs: object) -> _Response:
             return response

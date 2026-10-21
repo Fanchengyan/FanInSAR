@@ -9,11 +9,7 @@ import pytest
 
 from faninsar.missions.s1.annotation import _parse_burst_footprints
 
-FIXTURE = (
-    Path(__file__).parent
-    / "data"
-    / "iw1-annotation-20161207-f121.xml"
-)
+FIXTURE = Path(__file__).parent / "data" / "iw1-annotation-20161207-f121.xml"
 SLC_ROOT = Path("/Volumes/DATA2/TEST_sentinel-1/sentinel-slc")
 SLC_ROOT_RAW = Path("/Volumes/DATA2/TEST_sentinel-1/Raw Data/sentinel-slc")
 SCENES = sorted(SLC_ROOT.glob("S1A_IW_SLC*.zip")) if SLC_ROOT.exists() else []

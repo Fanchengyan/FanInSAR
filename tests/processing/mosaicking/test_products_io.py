@@ -127,8 +127,12 @@ def test_path_catalog_same_path_only_filter() -> None:
 def test_path_catalog_look_direction_groups() -> None:
     """PathCatalog separates ascending and descending within a path."""
     products = [
-        _make_product("a1", 0.0, (slice(0, 20), slice(0, 10)), path_id="T1_A", look="ascending"),
-        _make_product("d1", 0.0, (slice(0, 20), slice(0, 10)), path_id="T1_D", look="descending"),
+        _make_product(
+            "a1", 0.0, (slice(0, 20), slice(0, 10)), path_id="T1_A", look="ascending"
+        ),
+        _make_product(
+            "d1", 0.0, (slice(0, 20), slice(0, 10)), path_id="T1_D", look="descending"
+        ),
     ]
     catalog = PathCatalog.from_products(products)
     asc = catalog.by_look_direction("ascending")

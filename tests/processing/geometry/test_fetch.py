@@ -103,7 +103,9 @@ def test_offline_missing_resource_fails_without_transport(
     assert calls == []
 
 
-def test_cache_root_environment_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_cache_root_environment_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """The environment override is expanded and normalized."""
     monkeypatch.setenv("FANINSAR_GEOID_CACHE", str(tmp_path / "cache"))
     assert resolve_cache_root() == (tmp_path / "cache").resolve()

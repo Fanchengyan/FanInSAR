@@ -280,12 +280,12 @@ def test_stage_coregister_forwards_ampcor_executor_and_device(
     monkeypatch.setattr(
         production_mod,
         "refine_shift_with_correlation",
-        lambda *_args, **kwargs: (captured.update(kwargs) or (0.25, -0.125)),
+        lambda *_args, **kwargs: captured.update(kwargs) or (0.25, -0.125),
     )
     monkeypatch.setattr(
         production_mod,
         "resample_complex_deramped_reramp",
-        lambda samples, **kwargs: (resample_kwargs.update(kwargs) or samples.copy()),
+        lambda samples, **kwargs: resample_kwargs.update(kwargs) or samples.copy(),
     )
     monkeypatch.setattr(
         "faninsar.processing.runtime.dask_gpu.should_accelerate",

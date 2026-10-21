@@ -320,9 +320,7 @@ class TestCredentialsAndRedirects:
                 )
             ],
         )
-        session.script_response(
-            "GET", redirect, [FakeResponse(status=200, body=body)]
-        )
+        session.script_response("GET", redirect, [FakeResponse(status=200, body=body)])
 
         class _Creds(CredentialProvider):
             def headers_for(self, url: str) -> dict[str, str]:
@@ -459,9 +457,7 @@ class TestEarthdataRangedExclusion:
             def headers_for(self, url: str) -> dict[str, str]:
                 return {}
 
-        session.script_response(
-            "GET", url, [FakeResponse(status=200, body=body)]
-        )
+        session.script_response("GET", url, [FakeResponse(status=200, body=body)])
         # A HEAD that would advertise ranges must never be issued.
         plan = TileSet(
             allowed_hosts=("data.lpdaac.earthdatacloud.nasa.gov",),
@@ -482,14 +478,24 @@ class TestEarthdataRangedExclusion:
         assert len(gets) == 1
         assert (tmp_path / "n00e006.dem.zip").read_bytes() == body
 
-    def test_ranged_mode_used_for_plain_hosts(self, tmp_path: Path, session: RecordingSession) -> None:
+    def test_ranged_mode_used_for_plain_hosts(
+        self, tmp_path: Path, session: RecordingSession
+    ) -> None:
         chunk = transport.CHUNK_SIZE_BYTES
         body = _payload(chunk + 10)
         url = "https://example.test/ranged-on.tif"
         session.script_response(
             "HEAD",
             url,
-            [FakeResponse(status=200, headers={"Content-Length": str(len(body)), "Accept-Ranges": "bytes"})],
+            [
+                FakeResponse(
+                    status=200,
+                    headers={
+                        "Content-Length": str(len(body)),
+                        "Accept-Ranges": "bytes",
+                    },
+                )
+            ],
         )
         total_chunks = (len(body) + chunk - 1) // chunk
         for index in range(total_chunks):
@@ -502,9 +508,7 @@ class TestEarthdataRangedExclusion:
                     FakeResponse(
                         status=206,
                         headers={
-                            "Content-Range": (
-                                f"bytes {start}-{end}/{len(body)}"
-                            ),
+                            "Content-Range": (f"bytes {start}-{end}/{len(body)}"),
                             "Content-Length": str(end - start + 1),
                         },
                         body=body[start : end + 1],
@@ -573,7 +577,9 @@ class TestFtpBranch:
         with pytest.raises(Exception, match="small|floor|bytes"):
             fetch_plan(plan, tmp_path)
 
-    def test_ftp_failure_raises_loud(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_ftp_failure_raises_loud(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         def fake_urlopen(url: str, timeout: float) -> object:
             raise URLError("ftp down")
 
@@ -620,7 +626,9 @@ class TestZipExpansion:
             safe_member_target,
         )
 
-        with pytest.raises(ValueError, match="traversal|contain|zip-slip|\\.\\.") as excinfo:
+        with pytest.raises(
+            ValueError, match="traversal|contain|zip-slip|\\.\\."
+        ) as excinfo:
             safe_member_target(staging, hostile_name)
         with pytest.raises(ValueError):
             extract_zip_members(
@@ -657,9 +665,7 @@ class TestZipExpansion:
         staging = tmp_path / "stage-corrupt"
         staging.mkdir(parents=True)
         with pytest.raises(Exception):  # BadZipFile CRC check failed
-            extract_zip_members(
-                corrupt, staging, members=None, member_pattern="*.tif"
-            )
+            extract_zip_members(corrupt, staging, members=None, member_pattern="*.tif")
 
     def test_only_matching_members_extracted(
         self,
@@ -735,7 +741,9 @@ class TestCredentialHygiene:
                 ),
             ),
         )
-        with caplog.at_level(logging.DEBUG, logger="faninsar.processing.geometry.dem_transport"):
+        with caplog.at_level(
+            logging.DEBUG, logger="faninsar.processing.geometry.dem_transport"
+        ):
             with pytest.raises(Exception) as excinfo:
                 fetch_plan(plan, tmp_path)
         rendered_logs = caplog.text
@@ -893,9 +901,7 @@ class TestExpectedDecompressedSize:
             expected_decompressed_bytes=len(raw) + delta,
         )
         plan = TileSet(allowed_hosts=("example.test",), tiles=(tile,))
-        with pytest.raises(
-            transport.InvalidProcessingStateError, match="decompressed"
-        ):
+        with pytest.raises(transport.InvalidProcessingStateError, match="decompressed"):
             fetch_plan(plan, tmp_path)
         assert not (tmp_path / "skadi" / "N34" / "N34E094.hgt.gz").is_file()
         assert not list(tmp_path.rglob("*.part"))

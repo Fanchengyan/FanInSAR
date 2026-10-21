@@ -51,6 +51,4 @@ def test_explicit_grid_wins_and_explicit_seam_fails() -> None:
     )
     assert resolve_stack_grid(grid, roi=(170.0, 10.0, -170.0, 11.0)).crs == "EPSG:3857"
     with pytest.raises(ExplicitAntimeridianError):
-        resolve_stack_grid(
-            "auto", roi=(170.0, 10.0, -170.0, 11.0), explicit_roi=True
-        )
+        resolve_stack_grid("auto", roi=(170.0, 10.0, -170.0, 11.0), explicit_roi=True)

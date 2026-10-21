@@ -70,7 +70,9 @@ def test_same_grid_datum_conversion_does_not_require_6x6_support(monkeypatch) ->
 
     from faninsar.processing.geometry import datum
 
-    def fake_convert(heights, longitude, latitude, source_datum, target_datum, **kwargs):
+    def fake_convert(
+        heights, longitude, latitude, source_datum, target_datum, **kwargs
+    ):
         assert source_datum == "egm2008"
         assert target_datum == "ellipsoidal"
         return np.asarray(heights, dtype=np.float64) + 7.5

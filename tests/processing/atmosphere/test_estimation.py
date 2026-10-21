@@ -273,8 +273,11 @@ class TestSolveGuidedSplit:
         coh = torch.ones(shape, dtype=torch.float64)
         astack_cfg = dataclasses.replace(fine_mode_config, solve_core="guided_split")
         disp, _ = estimate_disp_nondisp(
-            torch.ones(shape), torch.zeros(shape), astack_cfg,
-            valid_mask=valid, coherence=coh,
+            torch.ones(shape),
+            torch.zeros(shape),
+            astack_cfg,
+            valid_mask=valid,
+            coherence=coh,
         )
         assert bool(torch.isnan(disp[2:4, :]).all())
         assert not bool(torch.isnan(disp[:2, :]).any())
@@ -385,7 +388,10 @@ class TestSolveGuidedSplit:
         astack_cfg = dataclasses.replace(fine_mode_config, solve_core="guided_split")
         disp_direct, _ = solve_guided_split(low, high, coh, fine_mode_config)
         disp_routed, _ = estimate_disp_nondisp(
-            low, high, astack_cfg, coherence=coh,
+            low,
+            high,
+            astack_cfg,
+            coherence=coh,
         )
         torch.testing.assert_close(disp_direct, disp_routed, rtol=1e-12, atol=1e-12)
 
@@ -395,5 +401,7 @@ class TestSolveGuidedSplit:
         astack_cfg = dataclasses.replace(fine_mode_config, solve_core="guided_split")
         with pytest.raises(ValueError, match="requires a coherence"):
             estimate_disp_nondisp(
-                torch.zeros(4, 4), torch.zeros(4, 4), astack_cfg,
+                torch.zeros(4, 4),
+                torch.zeros(4, 4),
+                astack_cfg,
             )

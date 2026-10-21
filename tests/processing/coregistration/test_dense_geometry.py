@@ -182,7 +182,9 @@ def test_dense_geometry_offset_sign_matches_resample_complex() -> None:
     after_bad = form_interferogram(ref[sl], aligned_bad[sl], multilook=(2, 4))
     assert float(np.nanmean(after_ok.coherence)) > float(np.nanmean(before.coherence))
     assert float(np.nanmean(after_ok.coherence)) > 0.5
-    assert float(np.nanmean(after_ok.coherence)) > float(np.nanmean(after_bad.coherence))
+    assert float(np.nanmean(after_ok.coherence)) > float(
+        np.nanmean(after_bad.coherence)
+    )
 
 
 def test_dense_geometry_invalid_shape_raises() -> None:

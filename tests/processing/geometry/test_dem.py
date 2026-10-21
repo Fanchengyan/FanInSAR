@@ -325,4 +325,6 @@ def test_numpy_and_torch_natural_spline_six_match() -> None:
         torch.as_tensor(window, dtype=torch.float64),
         torch.as_tensor(fractions, dtype=torch.float64),
     )
-    np.testing.assert_allclose(numpy_out, torch_out.detach().cpu().numpy(), atol=1.0e-12)
+    np.testing.assert_allclose(
+        numpy_out, torch_out.detach().cpu().numpy(), atol=1.0e-12
+    )

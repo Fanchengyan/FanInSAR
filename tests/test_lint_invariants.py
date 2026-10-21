@@ -45,8 +45,10 @@ def test_core_does_not_import_missions_processing_timeseries_io_compute() -> Non
     tree = ast.parse(text)
     pure_imports: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith(
-            "faninsar."
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.startswith("faninsar.")
         ):
             pure_imports.add(node.module)
     forbidden = (

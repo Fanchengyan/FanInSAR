@@ -184,16 +184,16 @@ def test_fetch_dispatches_through_bounded_pool(
     observed_pools: list[int] = []
     original_init = ThreadPoolExecutor.__init__
 
-    def spy_init(self: ThreadPoolExecutor, max_workers: int | None = None, **kw: object) -> None:
+    def spy_init(
+        self: ThreadPoolExecutor, max_workers: int | None = None, **kw: object
+    ) -> None:
         observed_pools.append(int(max_workers or 0))
         original_init(self, max_workers=max_workers, **kw)
 
     ThreadPoolExecutor.__init__ = spy_init  # type: ignore[method-assign]
     try:
         payload = _payload(1 << 20)
-        urls = [
-            f"https://example.test/tile-{index}.tif" for index in range(4)
-        ]
+        urls = [f"https://example.test/tile-{index}.tif" for index in range(4)]
         for url in urls:
             patched_session.script_response(
                 "GET", url, [FakeResponse(status=200, body=payload)]
@@ -298,9 +298,7 @@ def test_certificate_verification_error_fails_fast(
     patched_session: FakeSession,
 ) -> None:
     """An SSLError wrapping SSLCertVerificationError never retries."""
-    cert_error = requests.exceptions.SSLError(
-        "bad handshake"
-    )
+    cert_error = requests.exceptions.SSLError("bad handshake")
     cert_error.__cause__ = OSError("certificate verify failed")
     # Give it the real ssl type so the unwrap finds a cert failure.
     import ssl
@@ -512,9 +510,7 @@ def test_ranged_mode_skipped_when_accept_ranges_missing(
         url,
         [FakeResponse(status=200, headers={"Content-Length": str(len(body))})],
     )
-    patched_session.script_response(
-        "GET", url, [FakeResponse(status=200, body=body)]
-    )
+    patched_session.script_response("GET", url, [FakeResponse(status=200, body=body)])
     target = tmp_path / "norange.tif"
     _fetch_paths([(url, target)], tmp_path, ranged=True)
     range_gets = [u for m, u in patched_session.calls if m == "GET"]
@@ -532,9 +528,7 @@ def test_head_probe_failure_falls_back_to_plain_stream(
     patched_session.script_response(
         "HEAD", url, [requests.exceptions.ConnectionError("no head")]
     )
-    patched_session.script_response(
-        "GET", url, [FakeResponse(status=200, body=body)]
-    )
+    patched_session.script_response("GET", url, [FakeResponse(status=200, body=body)])
     target = tmp_path / "nohead.tif"
     _fetch_paths([(url, target)], tmp_path, ranged=True)
     assert target.read_bytes() == body
@@ -629,9 +623,7 @@ def test_shared_stream_budget_bounds_in_flight_requests(
                     FakeResponse(
                         status=206,
                         headers={
-                            "Content-Range": (
-                                f"bytes {start}-{end}/{len(body)}"
-                            ),
+                            "Content-Range": (f"bytes {start}-{end}/{len(body)}"),
                             "Content-Length": str(end - start + 1),
                         },
                         body=body[start : end + 1],
@@ -660,9 +652,7 @@ def test_unique_part_names_published_via_replace(
     """.part names carry pid+uuid and only complete files are published."""
     body = _payload(1 << 20)
     url = "https://example.test/atomic.tif"
-    patched_session.script_response(
-        "GET", url, [FakeResponse(status=200, body=body)]
-    )
+    patched_session.script_response("GET", url, [FakeResponse(status=200, body=body)])
     seen_parts: set[str] = set()
     real_iterdir = Path.iterdir
 

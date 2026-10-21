@@ -100,12 +100,12 @@ def test_to_layer_frame_maps_block_centers_to_layer_indices() -> None:
         rg_looks,
     ).mean(axis=(1, 3))
 
-    center_az = (
-        np.arange(rows // az_looks) * az_looks + (az_looks - 1) / 2.0
-    )[:, None] * np.ones((1, cols // rg_looks))
-    center_rg = (
-        np.arange(cols // rg_looks) * rg_looks + (rg_looks - 1) / 2.0
-    )[None, :] * np.ones((rows // az_looks, 1))
+    center_az = (np.arange(rows // az_looks) * az_looks + (az_looks - 1) / 2.0)[
+        :, None
+    ] * np.ones((1, cols // rg_looks))
+    center_rg = (np.arange(cols // rg_looks) * rg_looks + (rg_looks - 1) / 2.0)[
+        None, :
+    ] * np.ones((rows // az_looks, 1))
     full_frame = RadarCoordinates(
         center_az,
         center_rg,
@@ -157,8 +157,10 @@ def test_minus_offsets_matches_retired_compose_semantics() -> None:
         offsets: OffsetFieldResult,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         coordinates = np.array(
-            [np.asarray(az, dtype=np.float64).ravel(),
-             np.asarray(rg, dtype=np.float64).ravel()],
+            [
+                np.asarray(az, dtype=np.float64).ravel(),
+                np.asarray(rg, dtype=np.float64).ravel(),
+            ],
         )
         azimuth_offset = map_coordinates(
             np.asarray(offsets.azimuth_offset_px, dtype=np.float32),

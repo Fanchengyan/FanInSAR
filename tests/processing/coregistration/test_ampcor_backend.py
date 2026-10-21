@@ -666,8 +666,9 @@ def test_candidate_executes_only_its_prepared_callable() -> None:
         backend="native",
         device="cpu",
         window_shape=(2, 2),
-        executor=lambda value: calls.append("native")
-        or torch_integral_energy(value, 2, 2),
+        executor=lambda value: (
+            calls.append("native") or torch_integral_energy(value, 2, 2)
+        ),
         input_shape=(1, 4, 4),
         abi_version=_NATIVE_ABI,
     )
@@ -718,8 +719,9 @@ def test_candidate_rejects_partial_batch_for_fixed_shape_compile() -> None:
         backend="compile",
         device="cpu",
         window_shape=(2, 2),
-        executor=lambda value: calls.append("compile")
-        or torch_integral_energy(value, 2, 2),
+        executor=lambda value: (
+            calls.append("compile") or torch_integral_energy(value, 2, 2)
+        ),
         input_shape=(4, 4, 4),
     )
     with pytest.raises(AmpcorCandidateError, match="shape"):
@@ -735,8 +737,9 @@ def test_candidate_rejects_spatial_shape_mismatch_before_execute() -> None:
         backend="native",
         device="cpu",
         window_shape=(2, 2),
-        executor=lambda value: calls.append("native")
-        or torch_integral_energy(value, 2, 2),
+        executor=lambda value: (
+            calls.append("native") or torch_integral_energy(value, 2, 2)
+        ),
         input_shape=(4, 4, 4),
         allow_partial_batch=True,
     )

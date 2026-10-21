@@ -365,9 +365,7 @@ class TestPgcQuadSource:
         parts = entry.parts
         assert len(parts) == 4
         expected = {
-            f"07_40_{row}_{col}_2m_v4.1_dem.tif"
-            for row in (1, 2)
-            for col in (1, 2)
+            f"07_40_{row}_{col}_2m_v4.1_dem.tif" for row in (1, 2) for col in (1, 2)
         }
         assert {part.cache_path.name for part in parts} == expected
         # The fan-out entry mirrors the first sub-tile's URL but every part

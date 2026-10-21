@@ -57,7 +57,9 @@ def _make_product(
 def test_asc_desc_not_phase_linked_by_default() -> None:
     """Ascending and descending bursts share the grid but are not phase-linked."""
     p_asc = _make_product("a1", "T1_A", "ascending", 0.0, (slice(0, 20), slice(0, 30)))
-    p_desc = _make_product("d1", "T1_D", "descending", 1.0, (slice(0, 20), slice(20, 60)))
+    p_desc = _make_product(
+        "d1", "T1_D", "descending", 1.0, (slice(0, 20), slice(20, 60))
+    )
     mosaic = merge_burst_products(
         [p_asc, p_desc],
         mode="phase_network",
@@ -79,7 +81,9 @@ def test_asc_desc_not_phase_linked_by_default() -> None:
 def test_asc_desc_phase_linked_when_opt_in() -> None:
     """When allow_asc_desc_phase_link=True, asc/desc are phase-linked."""
     p_asc = _make_product("a1", "T1_A", "ascending", 0.0, (slice(0, 20), slice(0, 30)))
-    p_desc = _make_product("d1", "T1_D", "descending", 0.5, (slice(0, 20), slice(20, 60)))
+    p_desc = _make_product(
+        "d1", "T1_D", "descending", 0.5, (slice(0, 20), slice(20, 60))
+    )
     mosaic = merge_burst_products(
         [p_asc, p_desc],
         mode="phase_network",

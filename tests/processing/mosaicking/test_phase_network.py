@@ -197,9 +197,7 @@ def test_solve_network_and_mosaic_remove_range_seam() -> None:
     from faninsar.processing.mosaicking.mosaic import merge_burst_products
 
     # Two side-by-side "swaths" with a relative range ramp in the overlap.
-    left = _make_product_with_range_ramp(
-        "IW2", 0.0, 0.0, (slice(0, 20), slice(0, 22))
-    )
+    left = _make_product_with_range_ramp("IW2", 0.0, 0.0, (slice(0, 20), slice(0, 22)))
     right = _make_product_with_range_ramp(
         "IW3", 0.3, 0.025, (slice(0, 20), slice(12, 40))
     )
@@ -244,4 +242,6 @@ def test_edge_dphi_converted_to_frame_centre_with_slope() -> None:
     # → Δφ(x)= -0.02*x, so at x_ref=19.5 → dphi_ref ≈ -0.39.
     x_ref = 0.5 * (40 - 1)
     expected = -0.02 * x_ref
-    assert edge.dphi_rad == pytest.approx(float(np.angle(np.exp(1j * expected))), abs=0.08)
+    assert edge.dphi_rad == pytest.approx(
+        float(np.angle(np.exp(1j * expected))), abs=0.08
+    )

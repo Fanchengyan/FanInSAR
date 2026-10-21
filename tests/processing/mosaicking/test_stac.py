@@ -106,9 +106,7 @@ def test_write_mosaic_stac_item(tmp_path: Path) -> None:
         min_overlap_px=10,
         min_edge_coherence=0.0,
     )
-    zarr_path = write_mosaic_zarr(
-        mosaic, tmp_path / "mosaic.zarr", pair_id="stac_test"
-    )
+    zarr_path = write_mosaic_zarr(mosaic, tmp_path / "mosaic.zarr", pair_id="stac_test")
     stac_path = write_mosaic_stac_item(
         mosaic,
         zarr_path,
@@ -134,11 +132,12 @@ def test_write_mosaic_stac_item_bbox_from_weight_sum(tmp_path: Path) -> None:
     """STAC bbox is derived from the weight_sum>0 footprint."""
     p = _make_product("a", "IW1", 0.0, (slice(5, 15), slice(5, 15)))
     mosaic = merge_burst_products([p], mode="complex_average")
-    zarr_path = write_mosaic_zarr(
-        mosaic, tmp_path / "m.zarr", pair_id="bbox_test"
-    )
+    zarr_path = write_mosaic_zarr(mosaic, tmp_path / "m.zarr", pair_id="bbox_test")
     stac_path = write_mosaic_stac_item(
-        mosaic, zarr_path, tmp_path / "item.json", pair_id="bbox_test",
+        mosaic,
+        zarr_path,
+        tmp_path / "item.json",
+        pair_id="bbox_test",
         source_burst_ids=["a"],
     )
     import json

@@ -2,6 +2,7 @@
 
 Covers a variety of norm and cmap types, including contourf mappables.
 """
+
 from __future__ import annotations
 
 import matplotlib
@@ -86,16 +87,18 @@ class TestHistColorbarDiscrete:
         rng = np.random.default_rng(2)
         data = rng.uniform(-2, 2, size=3000)
         boundaries = np.linspace(-2.0, 2.0, 9)  # 8 bins
-        cmap = colors.ListedColormap([
-            "#313695",
-            "#4575b4",
-            "#74add1",
-            "#abd9e9",
-            "#fee090",
-            "#fdae61",
-            "#f46d43",
-            "#d73027",
-        ])
+        cmap = colors.ListedColormap(
+            [
+                "#313695",
+                "#4575b4",
+                "#74add1",
+                "#abd9e9",
+                "#fee090",
+                "#fdae61",
+                "#f46d43",
+                "#d73027",
+            ]
+        )
         norm = colors.BoundaryNorm(boundaries, ncolors=cmap.N)
 
         fig, ax = plt.subplots()
@@ -155,15 +158,17 @@ class TestHistColorbarContourf:
         X, Y = np.meshgrid(x, y)
         Z = np.hypot(X, Y)
         levels = np.linspace(0.0, 3.5, 8)
-        cmap = colors.ListedColormap([
-            "#ffffcc",
-            "#c2e699",
-            "#78c679",
-            "#31a354",
-            "#006837",
-            "#004529",
-            "#002b13",
-        ])
+        cmap = colors.ListedColormap(
+            [
+                "#ffffcc",
+                "#c2e699",
+                "#78c679",
+                "#31a354",
+                "#006837",
+                "#004529",
+                "#002b13",
+            ]
+        )
 
         fig, ax = plt.subplots()
         cs = ax.contourf(X, Y, Z, levels=levels, cmap=cmap)

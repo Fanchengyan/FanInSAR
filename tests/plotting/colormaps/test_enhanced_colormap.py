@@ -107,7 +107,9 @@ class TestEnhancedLinearSegmentedColormap:
         transparentize_colors = transparentize(np.linspace(0, 1, 10))
 
         # RGB should be similar, alpha should be different
-        np.testing.assert_allclose(original_colors[:, :3], transparentize_colors[:, :3], rtol=1e-10)
+        np.testing.assert_allclose(
+            original_colors[:, :3], transparentize_colors[:, :3], rtol=1e-10
+        )
         assert np.allclose(transparentize_colors[:, 3], 0.5)
 
     def test_crop(self) -> None:
@@ -148,14 +150,18 @@ class TestEnhancedLinearSegmentedColormap:
         """Test creation from RGB array."""
         # Test with [0, 1] range
         rgb_array = np.array([[1, 0, 0], [1, 1, 1], [0, 0, 1]])  # Red, white, blue
-        enhanced_cmap = EnhancedLinearSegmentedColormap.from_rgb_array("test", rgb_array)
+        enhanced_cmap = EnhancedLinearSegmentedColormap.from_rgb_array(
+            "test", rgb_array
+        )
 
         assert isinstance(enhanced_cmap, EnhancedLinearSegmentedColormap)
         assert enhanced_cmap.name == "test"
 
         # Test with [0, 255] range
         rgb_array_255 = np.array([[255, 0, 0], [255, 255, 255], [0, 0, 255]])
-        enhanced_cmap_255 = EnhancedLinearSegmentedColormap.from_rgb_array("test255", rgb_array_255)
+        enhanced_cmap_255 = EnhancedLinearSegmentedColormap.from_rgb_array(
+            "test255", rgb_array_255
+        )
 
         assert isinstance(enhanced_cmap_255, EnhancedLinearSegmentedColormap)
         assert enhanced_cmap_255.name == "test255"
@@ -163,7 +169,9 @@ class TestEnhancedLinearSegmentedColormap:
     def test_from_hex_colors(self) -> None:
         """Test creation from hex colors."""
         hex_colors = ["#FF0000", "#FFFFFF", "#0000FF"]  # Red, white, blue
-        enhanced_cmap = EnhancedLinearSegmentedColormap.from_hex_colors("test_hex", hex_colors)
+        enhanced_cmap = EnhancedLinearSegmentedColormap.from_hex_colors(
+            "test_hex", hex_colors
+        )
 
         assert isinstance(enhanced_cmap, EnhancedLinearSegmentedColormap)
         assert enhanced_cmap.name == "test_hex"
@@ -216,16 +224,30 @@ class TestEnhancedColormapIntegration:
         # Create the custom colormaps directly
         white = "0.95"
         colors = ["#8f07ff", "#d5734a", white, "#0571b0", "#01ef6c"]
-        GnBu_RdPl = EnhancedLinearSegmentedColormap.from_list("GnBu_RdPl", colors, N=100)
+        GnBu_RdPl = EnhancedLinearSegmentedColormap.from_list(
+            "GnBu_RdPl", colors, N=100
+        )
 
-        colors = ["#68011f", "#bb2832", "#e48066", "#fbccb4", "#ededed", "#c2ddec", "#6bacd1", "#2a71b2", "#0d3061"]
+        colors = [
+            "#68011f",
+            "#bb2832",
+            "#e48066",
+            "#fbccb4",
+            "#ededed",
+            "#c2ddec",
+            "#6bacd1",
+            "#2a71b2",
+            "#0d3061",
+        ]
         RdGyBu = EnhancedLinearSegmentedColormap.from_list("RdGyBu", colors, N=100)
 
         colors = [white, "#0571b0", "#8f07ff", "#d5734a"]
         WtBuPl = EnhancedLinearSegmentedColormap.from_list("WtBuPl", colors, N=100)
 
         colors = [white, "#fff7b3", "#fb9d59", "#aa0526"]
-        WtHeatRed = EnhancedLinearSegmentedColormap.from_list("WtHeatRed", colors, N=100)
+        WtHeatRed = EnhancedLinearSegmentedColormap.from_list(
+            "WtHeatRed", colors, N=100
+        )
 
         # Test custom colormaps
         custom_cmaps = [
@@ -294,7 +316,9 @@ class TestEnhancedColormapErrorHandling:
 
         # Test with valid values in [0, 255] range - should work
         rgb_array_valid = np.array([[255, 0, 0], [0, 255, 0], [0, 0, 255]])
-        enhanced_cmap = EnhancedLinearSegmentedColormap.from_rgb_array("test_valid", rgb_array_valid)
+        enhanced_cmap = EnhancedLinearSegmentedColormap.from_rgb_array(
+            "test_valid", rgb_array_valid
+        )
         assert isinstance(enhanced_cmap, EnhancedLinearSegmentedColormap)
 
         # Test that the normalization worked
@@ -316,7 +340,7 @@ class TestCodeCompletion:
             "to_dict",
             "transparentize",
             "crop",
-            "crop_by_percent"
+            "crop_by_percent",
         ]
 
         for method in enhanced_methods:
@@ -325,15 +349,15 @@ class TestCodeCompletion:
 
     def test_enhanced_class_methods_code_completion(self) -> None:
         """Test that enhanced class methods appear in code completion."""
-        enhanced_class_methods = [
-            "from_list",
-            "from_rgb_array",
-            "from_hex_colors"
-        ]
+        enhanced_class_methods = ["from_list", "from_rgb_array", "from_hex_colors"]
 
         for method in enhanced_class_methods:
-            assert hasattr(EnhancedLinearSegmentedColormap, method), f"Class method {method} not found"
-            assert callable(getattr(EnhancedLinearSegmentedColormap, method)), f"Class method {method} not callable"
+            assert hasattr(EnhancedLinearSegmentedColormap, method), (
+                f"Class method {method} not found"
+            )
+            assert callable(getattr(EnhancedLinearSegmentedColormap, method)), (
+                f"Class method {method} not callable"
+            )
 
     def test_type_annotations_work(self) -> None:
         """Test that type annotations work correctly."""

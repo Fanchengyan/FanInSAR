@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 from faninsar.core.sar_tools import multi_look
 
+
 class TestMultiLook:
     """Test class for multi_look function."""
 
@@ -12,7 +13,7 @@ class TestMultiLook:
         #  [ 4,  5,  6,  7],
         #  [ 8,  9, 10, 11],
         #  [12, 13, 14, 15]]
-        
+
         # 2x2 multi-look
         res = multi_look(data, 2, 2)
         # Block (0,0): [[0, 1], [4, 5]] -> mean = 10/4 = 2.5
@@ -26,15 +27,15 @@ class TestMultiLook:
         """Test multi_look with 2D complex data."""
         data = np.arange(16).reshape(4, 4).astype(complex)
         data += 1j * (np.arange(16).reshape(4, 4) + 1)
-        
+
         res = multi_look(data, 2, 2)
-        
+
         # Real part same as test_2d_real
         # Imag part: [[1, 2], [5, 6]] -> mean = 14/4 = 3.5
         expected_real = np.array([[2.5, 4.5], [10.5, 12.5]])
         expected_imag = np.array([[3.5, 5.5], [11.5, 13.5]])
         expected = expected_real + 1j * expected_imag
-        
+
         np.testing.assert_allclose(res, expected)
 
     def test_non_divisible_shape(self):
@@ -49,7 +50,7 @@ class TestMultiLook:
         data = np.ones((2, 4, 4))
         data[0] *= 1
         data[1] *= 2
-        
+
         res = multi_look(data, 2, 2)
         assert res.shape == (2, 2, 2)
         np.testing.assert_allclose(res[0], np.ones((2, 2)) * 1)

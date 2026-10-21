@@ -98,9 +98,8 @@ class TestBaselinesPlot:
         """Test plotting with gaps."""
         # Remove some pairs
         date_gap = sample_pairs.dates[2]
-        idx_remove = (
-            (sample_pairs.primary <= date_gap)
-            & (sample_pairs.secondary >= date_gap)
+        idx_remove = (sample_pairs.primary <= date_gap) & (
+            sample_pairs.secondary >= date_gap
         )
         pairs_removed = sample_pairs[idx_remove]
 

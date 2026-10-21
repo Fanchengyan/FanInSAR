@@ -111,7 +111,9 @@ class TestGradientMagnitude:
         assert isinstance(grad_np, np.ndarray)
         assert grad_np.dtype == np.float64
 
-        img_tensor = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float32)
+        img_tensor = torch.tensor(
+            [[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float32
+        )
         grad_tensor = gradient_magnitude(img_tensor, dtype=torch.float64)
 
         assert isinstance(grad_tensor, torch.Tensor)
@@ -160,7 +162,9 @@ class TestPercentileValueRange:
     def test_basic_numpy_array(self) -> None:
         """Test basic functionality with numpy array."""
         data = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-        vmin, vmax = percentile_range(data, min_percent=0, max_percent=100, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=0, max_percent=100, symmetric=False
+        )
 
         assert vmin == 1.0
         assert vmax == 10.0
@@ -170,7 +174,9 @@ class TestPercentileValueRange:
     def test_torch_tensor(self) -> None:
         """Test with torch tensor."""
         data = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.float32)
-        vmin, vmax = percentile_range(data, min_percent=0, max_percent=100, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=0, max_percent=100, symmetric=False
+        )
 
         assert vmin == 1.0
         assert vmax == 10.0
@@ -178,7 +184,9 @@ class TestPercentileValueRange:
     def test_percentile_values(self) -> None:
         """Test with different percentile values."""
         data = np.arange(0, 101)  # 0 to 100
-        vmin, vmax = percentile_range(data, min_percent=10, max_percent=90, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=10, max_percent=90, symmetric=False
+        )
 
         assert vmin == 10.0
         assert vmax == 90.0
@@ -186,7 +194,9 @@ class TestPercentileValueRange:
     def test_symmetric_true(self) -> None:
         """Test symmetric bounds."""
         data = np.array([-5, -3, -1, 1, 3, 8])
-        vmin, vmax = percentile_range(data, min_percent=0, max_percent=100, symmetric=True)
+        vmin, vmax = percentile_range(
+            data, min_percent=0, max_percent=100, symmetric=True
+        )
 
         # Max absolute value is 8
         assert vmin == -8.0
@@ -195,7 +205,9 @@ class TestPercentileValueRange:
     def test_symmetric_false(self) -> None:
         """Test non-symmetric bounds."""
         data = np.array([-5, -3, -1, 1, 3, 8])
-        vmin, vmax = percentile_range(data, min_percent=0, max_percent=100, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=0, max_percent=100, symmetric=False
+        )
 
         assert vmin == -5.0
         assert vmax == 8.0
@@ -203,7 +215,9 @@ class TestPercentileValueRange:
     def test_with_nan_values(self) -> None:
         """Test with NaN values - should be ignored."""
         data = np.array([1, 2, np.nan, 4, 5, np.nan])
-        vmin, vmax = percentile_range(data, min_percent=0, max_percent=100, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=0, max_percent=100, symmetric=False
+        )
 
         assert vmin == 1.0
         assert vmax == 5.0
@@ -211,7 +225,9 @@ class TestPercentileValueRange:
     def test_with_inf_values(self) -> None:
         """Test with inf values - should be ignored."""
         data = np.array([1, 2, np.inf, 4, 5, -np.inf])
-        vmin, vmax = percentile_range(data, min_percent=0, max_percent=100, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=0, max_percent=100, symmetric=False
+        )
 
         assert vmin == 1.0
         assert vmax == 5.0
@@ -219,7 +235,9 @@ class TestPercentileValueRange:
     def test_2d_array(self) -> None:
         """Test with 2D array."""
         data = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
-        vmin, vmax = percentile_range(data, min_percent=0, max_percent=100, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=0, max_percent=100, symmetric=False
+        )
 
         assert vmin == 1.0
         assert vmax == 9.0
@@ -227,7 +245,9 @@ class TestPercentileValueRange:
     def test_list_input(self) -> None:
         """Test with list input."""
         data = [1, 2, 3, 4, 5]
-        vmin, vmax = percentile_range(data, min_percent=0, max_percent=100, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=0, max_percent=100, symmetric=False
+        )
 
         assert vmin == 1.0
         assert vmax == 5.0
@@ -235,7 +255,9 @@ class TestPercentileValueRange:
     def test_percentiles_swapped(self) -> None:
         """Test when min_percent > max_percent - should be sorted."""
         data = np.arange(0, 101)
-        vmin, vmax = percentile_range(data, min_percent=90, max_percent=10, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=90, max_percent=10, symmetric=False
+        )
 
         # Should be sorted internally
         assert vmin == 10.0
@@ -319,11 +341,15 @@ class TestPercentileValueRange:
         data = np.arange(0, 101)
 
         # 0th percentile
-        vmin, vmax = percentile_range(data, min_percent=0, max_percent=0, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=0, max_percent=0, symmetric=False
+        )
         assert vmin == 0.0
         assert vmax == 0.0
 
         # 100th percentile
-        vmin, vmax = percentile_range(data, min_percent=100, max_percent=100, symmetric=False)
+        vmin, vmax = percentile_range(
+            data, min_percent=100, max_percent=100, symmetric=False
+        )
         assert vmin == 100.0
         assert vmax == 100.0

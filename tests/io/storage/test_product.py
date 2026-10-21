@@ -196,8 +196,11 @@ def test_verify_detects_modified_payload(tmp_path: Path) -> None:
         write_payloads=_write_arrays({"a": np.ones((4, 4), dtype=np.float32)}),
     )
     assert verify_product(target) == []
-    chunk = next(path for path in (target / "a.zarr").rglob("*") if path.is_file()
-                 and path.name not in {"zarr.json", ".zarray", ".zattrs"})
+    chunk = next(
+        path
+        for path in (target / "a.zarr").rglob("*")
+        if path.is_file() and path.name not in {"zarr.json", ".zarray", ".zattrs"}
+    )
     chunk.write_bytes(chunk.read_bytes() + b"x")
     assert verify_product(target) == ["a"]
 
@@ -223,7 +226,9 @@ def test_discover_lists_committed_products_by_kind(tmp_path: Path) -> None:
     """Discovery returns committed children of one kind, sorted by name."""
     writer = _write_arrays({"a": np.ones((1, 1), dtype=np.float32)})
     for name in ("b", "a"):
-        commit_product(tmp_path / name, kind="scene", properties={}, write_payloads=writer)
+        commit_product(
+            tmp_path / name, kind="scene", properties={}, write_payloads=writer
+        )
     commit_product(tmp_path / "c", kind="other", properties={}, write_payloads=writer)
     found = discover_products(tmp_path, kind="scene")
     assert [product.path.name for product in found] == ["a", "b"]

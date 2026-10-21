@@ -74,7 +74,9 @@ def test_correct_unwrapped_seam_removes_2pi_east_step() -> None:
     assert report["median_unw_jump_after"] is not None
     assert abs(float(report["median_unw_jump_after"])) < 0.5
     # Complex unchanged
-    assert np.allclose(z, np.exp(1j * np.angle(z)).astype(np.complex64), atol=1e-5) or True
+    assert (
+        np.allclose(z, np.exp(1j * np.angle(z)).astype(np.complex64), atol=1e-5) or True
+    )
     # Unwrapped west unchanged
     assert np.allclose(fixed[:, :seam], unw[:, :seam], equal_nan=True)
 
@@ -121,7 +123,9 @@ def test_correct_unwrapped_seam_noop_when_already_aligned() -> None:
         per_row=False,
     )
     assert report["k_global"] == 0
-    assert report["applied"] is False or abs(report.get("median_unw_jump_after", 0)) < 0.5
+    assert (
+        report["applied"] is False or abs(report.get("median_unw_jump_after", 0)) < 0.5
+    )
 
 
 def test_reintegrate_removes_local_2pi_island() -> None:
@@ -227,9 +231,7 @@ def test_force_match_complex_removes_per_row_2pi_islands() -> None:
     assert p90_before > np.pi
 
     # Median L/R can look deceptively mild
-    med_jump = float(
-        np.nanmedian(unw[:, 55:65]) - np.nanmedian(unw[:, 30:40])
-    )
+    med_jump = float(np.nanmedian(unw[:, 55:65]) - np.nanmedian(unw[:, 30:40]))
     # Not required to be small, but force-fix must still clean row metrics.
 
     fixed, report = force_unwrapped_match_complex_along_range(

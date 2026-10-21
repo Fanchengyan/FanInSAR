@@ -6,7 +6,6 @@ from faninsar.core import Acquisition, DaySpan
 
 
 class TestAcquisition:
-
     @pytest.fixture(autouse=True)
     def setup(self):
         # Setup some sample data for testing
@@ -31,6 +30,7 @@ class TestAcquisition:
         assert stats["end"] == "2023-01-10"
         assert stats["unique"] == 10
         assert stats["total"] == 10
+
 
 class TestCreateDaysSpanIndex:
     """Test the creation of DaySpan with different type inputs."""
@@ -92,7 +92,6 @@ class TestCreateDaysSpanIndex:
 
 
 class TestDaysSpanIndex:
-
     @pytest.fixture(autouse=True)
     def setup(self):
         # Setup some sample data for testing
@@ -103,7 +102,6 @@ class TestDaysSpanIndex:
         # Test if the DaySpan instance is created correctly
         assert isinstance(self.days_span, DaySpan)
         assert len(self.days_span) == 10
-
 
     def test_to_xarray(self):
         # Test the to_xarray method
