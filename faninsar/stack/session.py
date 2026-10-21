@@ -18,7 +18,6 @@ import json
 import os
 import platform
 import re
-import shutil
 import sys
 import sysconfig
 from collections.abc import Iterable, Mapping
@@ -114,6 +113,8 @@ if TYPE_CHECKING:
     from faninsar.timeseries.results import TimeSeries
 
 logger = setup_logger(__name__)
+
+GEOCODED_KIND = "geocoded"
 
 
 def _scene_array_shape(scene: object) -> tuple[int, ...] | None:
@@ -1056,55 +1057,28 @@ def _geocode_product_identity(
     return hashlib.sha256(blob).hexdigest()
 
 
-def _geocode_product_paths(target_dir: Path, name: str) -> tuple[Path, Path, Path]:
-    """Return the ``(values, valid, sidecar)`` paths of one geocode product."""
-    return (
-        target_dir / f"{name}.tif",
-        target_dir / f"{name}_valid.tif",
-        target_dir / f"{name}.json",
-    )
-
-
-def _read_geocode_identity(sidecar_path: Path, name: str) -> str:
-    """Return the recorded identity, failing actionably on a corrupt store."""
-    try:
-        record = json.loads(sidecar_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        message = (
-            f"persisted geocode product {name!r} has a missing or corrupt "
-            f"identity sidecar ({sidecar_path.name}); pass overwrite=True to "
-            "replace it"
-        )
-        logger.exception(message)
-        raise ValueError(message) from error
-    identity = record.get("identity") if isinstance(record, dict) else None
-    if not isinstance(identity, str):
-        message = (
-            f"persisted geocode product {name!r} identity sidecar is "
-            "incomplete; pass overwrite=True to replace it"
-        )
-        logger.error(message)
-        raise ValueError(message)  # noqa: TRY004
-    return identity
-
-
 def _load_geocoded_product(
     target_dir: Path,
     name: str,
     identity: str,
     grid: GridSpec,
 ) -> GeocodedRaster | None:
-    """Return the persisted product when its identity matches, else ``None``.
+    """Return the committed geocoded child when its identity matches.
 
-    A present target with a missing, corrupt, or mismatched identity fails
-    with an actionable error (the PROPOSAL-0033 overwrite contract); only a
-    matching identity is reused.
+    A present child with a mismatched identity fails with an actionable
+    error; only a matching one is reused. A missing child returns ``None``.
     """
-    values_path, valid_path, sidecar_path = _geocode_product_paths(target_dir, name)
-    if not values_path.exists():
+    from faninsar.io.storage.product import open_product
+
+    item_path = target_dir / "item.json"
+    if not item_path.is_file():
         return None
-    recorded = _read_geocode_identity(sidecar_path, name)
-    if recorded != identity:
+    product = open_product(target_dir, kind=GEOCODED_KIND)
+    recorded = {
+        "identity": str(product.properties.get("faninsar:identity", "")),
+        "name": str(product.properties.get("faninsar:name", "")),
+    }
+    if recorded["identity"] != identity:
         message = (
             f"persisted geocode product {name!r} exists with a different "
             "identity (grid, kernel, or source content changed); pass "
@@ -1116,9 +1090,9 @@ def _load_geocoded_product(
 
     from faninsar.processing.geocoding.geocoder import GeocodedRaster
 
-    with rasterio.open(values_path) as source:
+    with rasterio.open(product.asset_path("values")) as source:
         values = source.read(1)
-    with rasterio.open(valid_path) as source:
+    with rasterio.open(product.asset_path("valid")) as source:
         valid = source.read(1).astype(bool)
     return GeocodedRaster(values=values, valid=valid, grid=grid)
 
@@ -1131,30 +1105,17 @@ def _commit_geocoded_product(
     *,
     overwrite: bool,
 ) -> None:
-    """Persist one geocoded raster as COG values, COG validity, and identity.
+    """Commit one geocoded child product (COG payloads and ``item.json``).
 
-    Files are written into a hidden sibling staging directory and then moved
-    into place with the sidecar last, so the sidecar acts as the single
-    commit marker: an interrupted commit leaves the previous (or absent)
-    product with its old identity instead of a half-written store.
+    Payloads are written into the kernel's staging directory and the Item
+    last, so an interrupted commit leaves the previous product intact.
     """
     from affine import Affine
 
+    from faninsar.io.storage.product import commit_product
     from faninsar.network.readers.raster_io import write_cog
     from faninsar.processing.geometry.grids import GeoGrid
 
-    values_path, valid_path, sidecar_path = _geocode_product_paths(target_dir, name)
-    if values_path.exists() and not overwrite:
-        recorded = _read_geocode_identity(sidecar_path, name)
-        if recorded == identity:
-            logger.info("geocode: product %r already committed; keeping it", name)
-            return
-        message = (
-            f"persisted geocode product {name!r} exists with a different "
-            "identity; pass overwrite=True to replace it"
-        )
-        logger.error(message)
-        raise ValueError(message)
     values = np.asarray(raster.values)
     if values.dtype == np.bool_:
         values = values.astype(np.uint8)
@@ -1169,49 +1130,65 @@ def _commit_geocoded_product(
         raster.grid.shape,
         raster.grid.crs,
     )
-    staging = target_dir / f".{name}.staging"
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
-    write_cog(
-        values,
-        staging / values_path.name,
-        geogrid,
-        nodata=nodata,
-        dtype=str(values.dtype),
-        overwrite=True,
-    )
-    write_cog(
-        raster.valid.astype(np.uint8),
-        staging / valid_path.name,
-        geogrid,
-        nodata=None,
-        dtype="uint8",
-        overwrite=True,
-    )
-    (staging / sidecar_path.name).write_text(
-        json.dumps(
-            {
-                "schema": _GEOCODE_LAYOUT_SCHEMA,
-                "identity": identity,
-                "name": name,
-                "grid": {
-                    "crs": str(raster.grid.crs),
-                    "transform": [float(value) for value in raster.grid.transform],
-                    "shape": [int(raster.grid.height), int(raster.grid.width)],
-                },
-            },
-            indent=2,
-            sort_keys=True,
+    if (target_dir / "item.json").is_file() and not overwrite:
+        from faninsar.io.storage.product import open_product
+
+        existing = open_product(target_dir, kind=GEOCODED_KIND)
+        if str(existing.properties.get("faninsar:identity")) == identity:
+            logger.info("geocode: product %r already committed; keeping it", name)
+            return
+        message = (
+            f"persisted geocode product {name!r} exists with a different "
+            "identity; pass overwrite=True to replace it"
         )
-        + "\n",
-        encoding="utf-8",
+        logger.error(message)
+        raise ValueError(message)
+
+    def write_payloads(staging: Path) -> dict[str, dict[str, str]]:
+        values_name = f"{name}.tif"
+        valid_name = f"{name}_valid.tif"
+        write_cog(
+            values,
+            staging / values_name,
+            geogrid,
+            nodata=nodata,
+            dtype=str(values.dtype),
+            overwrite=True,
+        )
+        write_cog(
+            raster.valid.astype(np.uint8),
+            staging / valid_name,
+            geogrid,
+            nodata=None,
+            dtype="uint8",
+            overwrite=True,
+        )
+        return {
+            "values": {
+                "href": values_name,
+                "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+            },
+            "valid": {
+                "href": valid_name,
+                "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+            },
+        }
+
+    commit_product(
+        target_dir,
+        kind=GEOCODED_KIND,
+        properties={
+            "faninsar:name": name,
+            "faninsar:identity": identity,
+            "faninsar:grid": {
+                "crs": str(raster.grid.crs),
+                "transform": [float(v) for v in raster.grid.transform],
+                "shape": [int(raster.grid.height), int(raster.grid.width)],
+            },
+        },
+        write_payloads=write_payloads,
+        overwrite=overwrite,
     )
-    target_dir.mkdir(parents=True, exist_ok=True)
-    (staging / values_path.name).replace(values_path)
-    (staging / valid_path.name).replace(valid_path)
-    (staging / sidecar_path.name).replace(sidecar_path)
-    shutil.rmtree(staging, ignore_errors=True)
 
 
 @dataclass
@@ -1741,11 +1718,11 @@ class Stack(NetworkContract):
         overwrite : bool, optional
             Persistence flag shared by every persisting stage
             (PROPOSAL-0033). The product commits to
-            ``<work_dir>/geocode/<name>.tif`` (COG) with a ``_valid`` mask
-            COG and an identity sidecar. A present target with a matching
-            identity is reused and returned without recomputing; a missing,
-            corrupt, or mismatched identity fails actionably. ``True``
-            recomputes into hidden staging and replaces the target.
+            ``<work_dir>/geocode/<name>/`` — a product directory with COG
+            payloads and an ``item.json`` recording the request identity. A
+            committed child with a matching identity is reused and returned
+            without recomputing; a missing or mismatched one fails
+            actionably. ``overwrite=True`` replaces it.
 
         Returns
         -------
@@ -1836,7 +1813,7 @@ class Stack(NetworkContract):
             origin=origin,
             values=values,
         )
-        target_dir = self.config.work_dir / "geocode"
+        target_dir = self.config.work_dir / "geocode" / name
         if not overwrite:
             existing = _load_geocoded_product(target_dir, name, identity, destination)
             if existing is not None:
@@ -1853,7 +1830,7 @@ class Stack(NetworkContract):
             device=self.config.device,
             cache_dir=self.config.work_dir / "cache" / "geo-lut",
             cache_key=f"stack_{self.reference}",
-            storage_dir=self.config.work_dir / "geocode" / "lut",
+            storage_dir=self.config.work_dir / "cache" / "geo-lut" / "storage",
         )
 
         def correction(coords: Any) -> Any:

@@ -56,6 +56,7 @@ radar_result.export("out/timeseries-radar", exporter="stac-zarr")
 radar_result.export("out/timeseries-netcdf", exporter="netcdf")
 ```
 
-There is no `publish_generation()` step in this workflow, and a live Stack
-does not need a manual `Network.open()` call. Use `Network.open(path)` only
-when opening a completed generation persisted elsewhere.
+There is no publish step in this workflow: every stage commits products
+(``ifg/``, ``unwrap/``, ``timeseries/``) directly into the work directory,
+and ``stack.network`` is a live view over them. ``Network.open(path)``
+reopens a completed work directory from its ``stack.json``.

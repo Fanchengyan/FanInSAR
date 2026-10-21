@@ -159,10 +159,10 @@ def test_geocode_complex_product_roundtrip_and_reuse(
     assert raster.valid.dtype == np.bool_
     assert raster.valid.any()
     assert raster.grid.crs == UTM
-    target = stack.config.work_dir / "geocode"
+    target = stack.config.work_dir / "geocode" / "pair_ifg"
     assert (target / "pair_ifg.tif").is_file()
     assert (target / "pair_ifg_valid.tif").is_file()
-    assert (target / "pair_ifg.json").is_file()
+    assert (target / "item.json").is_file()
     assert (stack.config.work_dir / "cache" / "geo-lut").is_dir()
 
     # The entry point must match a directly constructed engine exactly (the
@@ -310,16 +310,20 @@ def test_geocode_overwrite_semantics(stack: Stack) -> None:
         atol=1e-6,
     )
 
-    # A corrupt sidecar fails actionably without overwrite and heals with it.
-    (target / "unw.json").write_text("{not json", encoding="utf-8")
-    with pytest.raises(ValueError, match="identity sidecar"):
+    # A corrupt Item fails actionably without overwrite and heals with it.
+    (target / "unw" / "item.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(Exception, match="item.json"):
         stack.geocode(changed)
     stack.geocode(changed, overwrite=True)
-    record = json.loads((target / "unw.json").read_text(encoding="utf-8"))
-    assert record["identity"]
+    record = json.loads((target / "unw" / "item.json").read_text(encoding="utf-8"))
+    assert record["properties"]["faninsar:identity"]
 
-    # A missing values COG makes the store absent: it is rebuilt and commits.
-    (target / "unw.tif").unlink()
+    # A missing values COG makes the product invalid: it fails closed and
+    # heals with overwrite.
+    (target / "unw" / "unw.tif").unlink()
+    with pytest.raises(Exception):
+        stack.geocode(changed)
+    rebuilt = stack.geocode(changed, overwrite=True)
     rebuilt = stack.geocode(changed)
     np.testing.assert_array_equal(
         np.asarray(rebuilt.values)[rebuilt.valid],
