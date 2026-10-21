@@ -1025,15 +1025,17 @@ def _geocode_product_identity(
     looks: tuple[int, int],
     origin: tuple[int, int],
     values: np.ndarray,
+    bind_source: bool,
 ) -> str:
     """Return the qualified identity digest of one geocode request.
 
     The digest covers the persisted name, the kernel, the destination grid at
-    full precision, the radar frame and its crop/multilook mapping, and the
-    source payload content — everything that would change the committed
-    product. The LUT cache identity is derived separately inside the builder.
+    full precision, and the radar frame with its crop/multilook mapping.
+    A source-bound request omits the payload digest: the source product's
+    ``write_id`` recorded in the Item inputs stands in for its content, so
+    replacing the source makes the child stale through the usual binding
+    rule. The LUT cache identity is derived separately inside the builder.
     """
-    array = np.ascontiguousarray(values)
     payload = {
         "schema": _GEOCODE_LAYOUT_SCHEMA,
         "name": name,
@@ -1047,12 +1049,14 @@ def _geocode_product_identity(
         "full_radar_shape": [int(full_radar_shape[0]), int(full_radar_shape[1])],
         "multilook": [int(looks[0]), int(looks[1])],
         "origin": [int(origin[0]), int(origin[1])],
-        "values": {
+    }
+    if not bind_source:
+        array = np.ascontiguousarray(values)
+        payload["values"] = {
             "dtype": str(array.dtype),
             "shape": [int(array.shape[0]), int(array.shape[1])],
             "sha256": hashlib.sha256(array.tobytes()).hexdigest(),
-        },
-    }
+        }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
@@ -1062,11 +1066,14 @@ def _load_geocoded_product(
     name: str,
     identity: str,
     grid: GridSpec,
+    *,
+    inputs: Mapping[str, str] | None = None,
 ) -> GeocodedRaster | None:
     """Return the committed geocoded child when its identity matches.
 
-    A present child with a mismatched identity fails with an actionable
-    error; only a matching one is reused. A missing child returns ``None``.
+    A present child with a mismatched identity or a stale source binding
+    fails with an actionable error; only a matching one is reused. A
+    missing child returns ``None``.
     """
     from faninsar.io.storage.product import open_product
 
@@ -1083,6 +1090,19 @@ def _load_geocoded_product(
             f"persisted geocode product {name!r} exists with a different "
             "identity (grid, kernel, or source content changed); pass "
             "overwrite=True to replace it"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    if inputs is not None and product.inputs != inputs:
+        stale = [
+            key
+            for key, write_id in inputs.items()
+            if product.inputs.get(key) != write_id
+        ]
+        message = (
+            f"persisted geocode product {name!r} is bound to a replaced "
+            f"source ({', '.join(sorted(stale))}); pass overwrite=True to "
+            "regenerate it"
         )
         logger.error(message)
         raise ValueError(message)
@@ -1103,6 +1123,7 @@ def _commit_geocoded_product(
     identity: str,
     raster: GeocodedRaster,
     *,
+    inputs: Mapping[str, str] | None,
     overwrite: bool,
 ) -> None:
     """Commit one geocoded child product (COG payloads and ``item.json``).
@@ -1187,6 +1208,7 @@ def _commit_geocoded_product(
             },
         },
         write_payloads=write_payloads,
+        inputs=dict(inputs or {}),
         overwrite=overwrite,
     )
 
@@ -1674,6 +1696,7 @@ class Stack(NetworkContract):
         self,
         product: GeocodeableProduct,
         *,
+        source: Product | None = None,
         grid: GridSpec | None = None,
         resolution_m: float | None = None,
         bounds: object | None = None,
@@ -1715,14 +1738,17 @@ class Stack(NetworkContract):
             ``asset_kind`` (complex interferograms keep Lanczos-4, wrapped
             phase rides ``exp(i*phi)`` + Lanczos-4, smooth real quantities
             are bilinear, hard labels nearest).
+        source : Product, optional
+            The committed product this raster belongs to (a scene or IFG
+            product store). When given, the geocoded child commits to
+            ``<source>/geocoded/`` with an Item bound to the source
+            ``write_id``, so replacing the source makes the child stale and
+            deleting the source removes it. A matching child is reused;
+            a stale or mismatched one fails actionably.
         overwrite : bool, optional
-            Persistence flag shared by every persisting stage
-            (PROPOSAL-0033). The product commits to
-            ``<work_dir>/geocode/<name>/`` — a product directory with COG
-            payloads and an ``item.json`` recording the request identity. A
-            committed child with a matching identity is reused and returned
-            without recomputing; a missing or mismatched one fails
-            actionably. ``overwrite=True`` replaces it.
+            Regenerate the committed child instead of reusing or failing on
+            a stale one. Without ``source`` the result is one-off and is
+            returned in memory; nothing is committed.
 
         Returns
         -------
@@ -1803,19 +1829,40 @@ class Stack(NetworkContract):
             logger.error(message)
             raise ValueError(message)
         destination = self._geocode_destination_grid(grid, resolution_m, bounds)
-        identity = _geocode_product_identity(
-            name=name,
-            kind=resolved_kind,
-            asset_tag=asset_tag,
-            grid=destination,
-            full_radar_shape=full_radar_shape,
-            looks=looks,
-            origin=origin,
-            values=values,
-        )
-        target_dir = self.config.work_dir / "geocode" / name
-        if not overwrite:
-            existing = _load_geocoded_product(target_dir, name, identity, destination)
+        if source is not None:
+            # Source-attached child: <source>/geocoded/, bound to the source
+            # write_id. Replacing the source makes the child stale.
+            source_root = getattr(source, "root", None)
+            source_write_id = getattr(source, "write_id", None)
+            if not isinstance(source_root, Path) or not source_write_id:
+                message = (
+                    "geocode source must be a committed product exposing "
+                    "root and write_id"
+                )
+                logger.error(message)
+                raise ValueError(message)
+            target_dir = source_root / "geocoded"
+            identity = _geocode_product_identity(
+                name=name,
+                kind=resolved_kind,
+                asset_tag=asset_tag,
+                grid=destination,
+                full_radar_shape=full_radar_shape,
+                looks=looks,
+                origin=origin,
+                values=values,
+                bind_source=True,
+            )
+            inputs = {"source": source_write_id}
+        else:
+            # One-off geocode: returned in memory, never committed.
+            target_dir = None
+            identity = None
+            inputs = None
+        if source is not None and not overwrite:
+            existing = _load_geocoded_product(
+                target_dir, name, identity, destination, inputs=inputs
+            )
             if existing is not None:
                 logger.info("geocode: reusing persisted product %r", name)
                 return existing
@@ -1843,9 +1890,15 @@ class Stack(NetworkContract):
             correction=correction,
             rows_per_chunk=_GEOCODE_ROWS_PER_CHUNK,
         )
-        _commit_geocoded_product(
-            target_dir, name, identity, raster, overwrite=overwrite
-        )
+        if source is not None:
+            _commit_geocoded_product(
+                target_dir,
+                name,
+                identity,
+                raster,
+                inputs=inputs,
+                overwrite=overwrite,
+            )
         return raster
 
     def _geocode_destination_grid(

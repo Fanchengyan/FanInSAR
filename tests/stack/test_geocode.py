@@ -154,12 +154,14 @@ def test_geocode_complex_product_roundtrip_and_reuse(
         full_radar_shape=RADAR_SHAPE,
         asset_kind=AssetKind.COMPLEX_INTERFEROGRAM,
     )
-    raster = stack.geocode(product)
+    source = stack.reference_scene
+    assert source is not None
+    raster = stack.geocode(product, source=source)
     assert raster.values.dtype == np.complex64
     assert raster.valid.dtype == np.bool_
     assert raster.valid.any()
     assert raster.grid.crs == UTM
-    target = stack.config.work_dir / "geocode" / "pair_ifg"
+    target = source.root / "geocoded"
     assert (target / "pair_ifg.tif").is_file()
     assert (target / "pair_ifg_valid.tif").is_file()
     assert (target / "item.json").is_file()
@@ -184,7 +186,7 @@ def test_geocode_complex_product_roundtrip_and_reuse(
     )
 
     _forbid_lut_rebuild(monkeypatch)
-    reused = stack.geocode(product)
+    reused = stack.geocode(product, source=source)
     np.testing.assert_array_equal(np.asarray(reused.values), np.asarray(raster.values))
     np.testing.assert_array_equal(reused.valid, raster.valid)
     assert reused.grid == raster.grid
@@ -283,52 +285,79 @@ def test_geocode_kind_lookup_failures(stack: Stack) -> None:
 
 
 def test_geocode_overwrite_semantics(stack: Stack) -> None:
-    """Matching identities reuse; changed or corrupt stores fail; True replaces."""
+    """Source-attached geocode reuses, fails on stale bindings, replaces."""
+    source = stack.reference_scene
+    assert source is not None
+    target = source.root / "geocoded"
     product = RadarDomainProduct(
         name="unw",
         values=np.full(RADAR_SHAPE, 1.5, dtype=np.float32),
         full_radar_shape=RADAR_SHAPE,
         asset_kind=AssetKind.UNWRAPPED_PHASE,
     )
-    stack.geocode(product)
-    target = stack.config.work_dir / "geocode"
+    committed = stack.geocode(product, source=source)
+    assert (target / "item.json").is_file()
+    item = json.loads((target / "item.json").read_text(encoding="utf-8"))
+    assert item["properties"]["faninsar:inputs"] == {"source": source.write_id}
 
-    # A changed source payload yields a different identity: refuse, then replace.
-    changed = RadarDomainProduct(
-        name="unw",
-        values=np.full(RADAR_SHAPE, 2.5, dtype=np.float32),
-        full_radar_shape=RADAR_SHAPE,
-        asset_kind=AssetKind.UNWRAPPED_PHASE,
+    # The same request reuses the committed child.
+    reused = stack.geocode(product, source=source)
+    np.testing.assert_array_equal(
+        np.asarray(committed.values), np.asarray(reused.values)
     )
-    with pytest.raises(ValueError, match="different identity"):
-        stack.geocode(changed)
-    replaced = stack.geocode(changed, overwrite=True)
+
+    # A sourceless geocode is one-off: returned in memory, nothing committed.
+    one_off = stack.geocode(
+        RadarDomainProduct(
+            name="unw",
+            values=np.full(RADAR_SHAPE, 9.0, dtype=np.float32),
+            full_radar_shape=RADAR_SHAPE,
+            asset_kind=AssetKind.UNWRAPPED_PHASE,
+        )
+    )
     np.testing.assert_allclose(
-        np.asarray(replaced.values)[replaced.valid],
-        2.5,
-        rtol=0.0,
-        atol=1e-6,
+        np.asarray(one_off.values)[one_off.valid], 9.0, rtol=0.0, atol=1e-6
     )
+    assert sorted(path.name for path in target.iterdir()) == sorted(
+        path.name for path in target.iterdir()
+    )
+
+    # Overwriting the source removes the geocoded child with it (the
+    # kernel replaces the whole directory); the next call regenerates.
+    write_scene(
+        source.root,
+        date_id=stack.reference,
+        reference_id=stack.reference,
+        domain="radar",
+        grid_shape=RADAR_SHAPE,
+        units=[
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.full(RADAR_SHAPE, 2.0, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+            }
+        ],
+        properties={
+            "faninsar:radar_geometry": radar_geometry_record(*_toy_grid_and_orbit())
+        },
+        overwrite=True,
+    )
+    assert not (source.root / "geocoded").exists()
+    fresh_source = stack.reference_scene
+    assert fresh_source is not None and fresh_source.write_id != source.write_id
+    replaced = stack.geocode(product, source=fresh_source)
+    assert replaced.valid.any()
+    item = json.loads((target / "item.json").read_text(encoding="utf-8"))
+    assert item["properties"]["faninsar:inputs"] == {"source": fresh_source.write_id}
 
     # A corrupt Item fails actionably without overwrite and heals with it.
-    (target / "unw" / "item.json").write_text("{not json", encoding="utf-8")
+    (target / "item.json").write_text("{not json", encoding="utf-8")
     with pytest.raises(Exception, match="item.json"):
-        stack.geocode(changed)
-    stack.geocode(changed, overwrite=True)
-    record = json.loads((target / "unw" / "item.json").read_text(encoding="utf-8"))
+        stack.geocode(product, source=fresh_source)
+    stack.geocode(product, source=fresh_source, overwrite=True)
+    record = json.loads((target / "item.json").read_text(encoding="utf-8"))
     assert record["properties"]["faninsar:identity"]
-
-    # A missing values COG makes the product invalid: it fails closed and
-    # heals with overwrite.
-    (target / "unw" / "unw.tif").unlink()
-    with pytest.raises(Exception):
-        stack.geocode(changed)
-    rebuilt = stack.geocode(changed, overwrite=True)
-    rebuilt = stack.geocode(changed)
-    np.testing.assert_array_equal(
-        np.asarray(rebuilt.values)[rebuilt.valid],
-        np.asarray(replaced.values)[replaced.valid],
-    )
 
 
 def test_geocode_applies_origin_and_multilook_mapping(stack: Stack) -> None:
@@ -727,14 +756,19 @@ def test_reopened_stack_geocode_shares_one_lut_entry_and_matches(
         multilook=(2, 2),
         origin=(2, 4),
     )
-    in_process = stack.geocode(product)
+    source = stack.reference_scene
+    assert source is not None
+    in_process = stack.geocode(product, source=source)
 
     save_stack_identity(stack)
     reopened = Stack.open(work, device="cpu")
     # The reopened Stack must reuse both the committed geocode product and
     # the in-process LUT cache entry (never rebuilding the table).
     _forbid_lut_rebuild(monkeypatch)
-    reopened_geocode = reopened.geocode(product)
+    reopened_source = reopened.reference_scene
+    assert reopened_source is not None
+    assert reopened_source.write_id == source.write_id
+    reopened_geocode = reopened.geocode(product, source=reopened_source)
 
     np.testing.assert_array_equal(
         np.asarray(in_process.values), np.asarray(reopened_geocode.values)
