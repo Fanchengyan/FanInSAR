@@ -335,3 +335,27 @@ def test_replaced_ifg_blocks_analysis_until_unwrap_reruns(tmp_path: Path) -> Non
     np.testing.assert_allclose(
         stack.network.interferograms.open_stack("unw_phase").values[0], 0.4
     )
+
+
+def test_stack_unwrap_rejects_unplanned_pair_products(tmp_path: Path) -> None:
+    """An IFG product for a Pair outside the plan blocks unwrap entirely."""
+    stack = _stack_with_ifg(tmp_path)
+    phase = np.full((2, 3), 0.3, dtype=np.float32)
+    write_ifg_artifact(
+        stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240125",
+        pair=("20240101", "20240125"),
+        looks=(1, 1),
+        filter_name="none",
+        filter_parameters={},
+        source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
+        complex_ifg=np.exp(1j * phase).astype(np.complex64),
+        coherence=np.ones_like(phase),
+        wrapped_phase=phase,
+        amplitude=np.ones_like(phase),
+    )
+
+    with pytest.raises(InvalidProcessingStateError, match="Pair set"):
+        stack.unwrap(_IdentityUnwrapper())
+    assert not (
+        stack.config.work_dir / "unwrap" / "ml_1x1" / "20240101_20240113" / "item.json"
+    ).exists()

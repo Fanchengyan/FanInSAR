@@ -2502,10 +2502,7 @@ class Stack(NetworkContract):
     def prepare_scenes(self) -> Self:
         """Create work directories and validate the Reference acquisition."""
         self.config.work_dir.mkdir(parents=True, exist_ok=True)
-        (self.config.work_dir / "coreg").mkdir(exist_ok=True)
-        (self.config.work_dir / "misreg").mkdir(exist_ok=True)
-        (self.config.work_dir / "ifg").mkdir(exist_ok=True)
-        (self.config.work_dir / "pairs").mkdir(exist_ok=True)
+        # Product roots appear as their first product is committed.
         if self.reference not in self.catalog.paths:
             reject_invalid_state(f"reference {self.reference} missing from catalog")
         self._prepared = True
@@ -3857,9 +3854,13 @@ class Stack(NetworkContract):
             reserve_estimate,
         )
 
+        # A subset of the plan forms only the requested Pairs; Pairs outside
+        # the plan extend it (and rewrite stack.json) first.
         if pairs is not None:
             self._extend_plan(pairs)
-        use_pairs = self.pairs
+            use_pairs = pairs
+        else:
+            use_pairs = self.pairs
         looks_list = _normalize_multilook(multilook or self.config.multilook)
         # ``goldstein_alpha`` remains an internal transition path for existing
         # callers.  The public MVP API is ``phase_filter``; an explicit filter

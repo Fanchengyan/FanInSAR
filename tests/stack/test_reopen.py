@@ -23,9 +23,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _stack(tmp_path: Path, *, name: str = "out") -> S1Stack:
-    """Build a prepared two-date Stack with synthetic scene products."""
-    dates = ("20240101", "20240113")
+def _stack(
+    tmp_path: Path,
+    *,
+    name: str = "out",
+    dates: tuple[str, ...] = ("20240101", "20240113"),
+) -> S1Stack:
+    """Build a prepared Stack with synthetic scene products."""
     paths = []
     for date_id in dates:
         path = tmp_path / name / f"S1A_IW_SLC__1SDV_{date_id}T000000.SAFE"
@@ -35,7 +39,9 @@ def _stack(tmp_path: Path, *, name: str = "out") -> S1Stack:
         paths,
         work_dir=tmp_path / name / "work",
         activation_mode="reference",
-        pairs=Pairs.from_names(["20240101_20240113"]),
+        pairs=Pairs.from_names(
+            [f"{first}_{second}" for first, second in zip(dates, dates[1:])]
+        ),
         multilook=(1, 1),
         coreg_mode="geometry",
     )
@@ -45,10 +51,8 @@ def _stack(tmp_path: Path, *, name: str = "out") -> S1Stack:
         # coregister_scenes reuses every scene without touching the SAFEs.
         properties: dict[str, object] = {}
         if date_id != dates[0]:
-            properties["faninsar:coreg_identity"] = (
-                stack._coreg_resume_identity(
-                    date_id, misreg_az_px=0.0, misreg_rg_px=0.0
-                )
+            properties["faninsar:coreg_identity"] = stack._coreg_resume_identity(
+                date_id, misreg_az_px=0.0, misreg_rg_px=0.0
             )
         write_test_scene(
             stack.config.work_dir,
@@ -83,10 +87,11 @@ def _stack(tmp_path: Path, *, name: str = "out") -> S1Stack:
 
 
 def _orbit_fixtures(stack: S1Stack) -> dict[str, Path]:
-    """Write one empty orbit file per acquisition and key it by date."""
+    """Write one empty orbit file per acquisition, outside the work directory."""
     orbits: dict[str, Path] = {}
+    inputs = stack.config.work_dir.parent / "inputs"
     for date_id in stack.catalog.dates:
-        path = stack.config.work_dir / "orbit" / f"{date_id}.EOF"
+        path = inputs / "orbits" / f"{date_id}.EOF"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"")
         orbits[date_id] = path
@@ -127,10 +132,7 @@ def test_reopen_after_stages_reuses_committed_work(tmp_path: Path) -> None:
     stack.coregister_scenes()
     stack.form_interferograms()
     stack.unwrap(SpatialIRLS())
-    write_ids = {
-        product.canonical
-        for product in stack.network_product_index.products
-    }
+    write_ids = {product.canonical for product in stack.network_product_index.products}
 
     reopened = Stack.open(stack.config.work_dir)
 
@@ -239,16 +241,87 @@ def test_form_interferograms_pairs_outside_the_plan_extend_it(
     tmp_path: Path,
 ) -> None:
     """``pairs=`` with a Pair outside the plan extends it and rewrites stack.json."""
-    stack = _stack(tmp_path)
-    stack.prepare()
-    extended = Pairs.from_names(["20240113_20240101"])
-    stack.form_interferograms(pairs=extended)
+    from faninsar.processing.unwrapping.irls import SpatialIRLS
 
-    assert "20240101_20240113" in [str(p) for p in stack.pairs]
+    stack = _stack(tmp_path, dates=("20240101", "20240113", "20240125"), name="extend")
+    stack.prepare()
     document = json.loads(
         (stack.config.work_dir / STACK_JSON_NAME).read_text(encoding="utf-8")
     )
-    assert document["pairs"] == ["20240101_20240113"]
+    assert document["pairs"] == ["20240101_20240113", "20240113_20240125"]
+
+    # The requested Pair is outside the plan: the plan extends and the IFG
+    # product for the new Pair alone is committed.
+    stack.form_interferograms(pairs=Pairs.from_names(["20240101_20240125"]))
+
+    document = json.loads(
+        (stack.config.work_dir / STACK_JSON_NAME).read_text(encoding="utf-8")
+    )
+    assert sorted(document["pairs"]) == [
+        "20240101_20240113",
+        "20240101_20240125",
+        "20240113_20240125",
+    ]
+    committed = sorted(
+        path.parent.name
+        for path in (stack.config.work_dir / "ifg" / "ml_1x1").glob("*/item.json")
+    )
+    assert committed == ["20240101_20240125"]
+    reopened = Stack.open(stack.config.work_dir)
+    assert "20240113_20240125" in reopened.status()["interferograms"]["planned"]
+
+
+def test_form_interferograms_subset_forms_only_the_requested_pairs(
+    tmp_path: Path,
+) -> None:
+    """A subset of the plan forms only those Pairs and never shrinks the plan."""
+    from faninsar.processing.unwrapping.irls import SpatialIRLS
+
+    stack = _stack(tmp_path, dates=("20240101", "20240113", "20240125"), name="subset")
+    stack.prepare()
+    stack.form_interferograms(pairs=Pairs.from_names(["20240101_20240113"]))
+
+    committed = sorted(
+        path.parent.name
+        for path in (stack.config.work_dir / "ifg" / "ml_1x1").glob("*/item.json")
+    )
+    assert committed == ["20240101_20240113"]
+    document = json.loads(
+        (stack.config.work_dir / STACK_JSON_NAME).read_text(encoding="utf-8")
+    )
+    assert document["pairs"] == ["20240101_20240113", "20240113_20240125"]
+
+
+def test_finished_work_directory_holds_only_products(tmp_path: Path) -> None:
+    """A finished work directory holds only stack.json, products, and cache/."""
+    from faninsar.processing.unwrapping.irls import SpatialIRLS
+
+    stack = _stack(tmp_path, name="walk")
+    stack.prepare()
+    stack.coregister_scenes()
+    stack.form_interferograms()
+    stack.unwrap(SpatialIRLS())
+    stack.invert_timeseries()
+
+    work = stack.config.work_dir
+
+    def under(root: Path, path: Path) -> bool:
+        return root == path or root in path.parents
+
+    # Allowed: the identity, cache/, product directories (their payloads,
+    # including opaque Zarr subtrees), and ancestors of any of them.
+    allowed: list[Path] = [work, work / "cache"]
+    for item in work.rglob("item.json"):
+        allowed.append(item.parent)
+    zarr_roots = [path for path in work.rglob("*") if path.name.endswith(".zarr")]
+    allowed.extend(zarr_roots)
+
+    stray: list[str] = []
+    for path in sorted(work.rglob("*")):
+        if any(under(root, path) for root in allowed):
+            continue
+        stray.append(str(path.relative_to(work)))
+    assert stray == [], stray
 
 
 def test_identity_save_rejects_unserializable_science(tmp_path: Path) -> None:
@@ -266,7 +339,9 @@ def test_science_configuration_round_trips(tmp_path: Path) -> None:
     from faninsar.processing.mosaicking.grid import GeoGridSpec
 
     stack = _stack(tmp_path)
-    stack.config.roi = BoundingBox(458000.0, 4162000.0, 472000.0, 4174000.0, crs="EPSG:32633")
+    stack.config.roi = BoundingBox(
+        458000.0, 4162000.0, 472000.0, 4174000.0, crs="EPSG:32633"
+    )
     stack.config.geo_grid = GeoGridSpec(
         crs="EPSG:32633",
         transform=(454000.0, 40.0, 0.0, 4178000.0, 0.0, -40.0),
@@ -307,8 +382,12 @@ def test_unclassified_config_field_fails_at_save(
 
         future_option: AnyType | None = dc_field(default=None)
 
-    config = Extended(**{f.name: getattr(stack.config, f.name) for f in
-                         __import__("dataclasses").fields(StackConfig)})
+    config = Extended(
+        **{
+            f.name: getattr(stack.config, f.name)
+            for f in __import__("dataclasses").fields(StackConfig)
+        }
+    )
     config.work_dir = stack.config.work_dir
     monkeypatch.setattr(type(stack), "config", config, raising=False)
     object.__setattr__(stack, "config", config)

@@ -115,7 +115,7 @@ def test_stack_from_safes_defaults(tmp_path: Path) -> None:
     assert stack.reference == "20160101"
     assert len(stack.catalog) == 3
     stack.prepare_scenes()
-    assert (tmp_path / "out" / "coreg").is_dir()
+    assert stack.reference == "20160101"
     # geometry mode skips measure/invert
     stack.measure_misreg()
     stack.invert_misreg()
@@ -319,11 +319,10 @@ def test_ifg_resume_binds_runtime_fingerprint(
 
     stack.form_interferograms(multilook=(1, 1))
     store = InterferogramArtifactStore.open(stack.ifg_dirs[0])
-    assert (
-        store.source_manifest_digests["runtime"]
-        == session_module._runtime_fingerprint(
-            session_module._provider_callback(stack.scene_provider)
-        )
+    assert store.source_manifest_digests[
+        "runtime"
+    ] == session_module._runtime_fingerprint(
+        session_module._provider_callback(stack.scene_provider)
     )
 
     monkeypatch.setattr(
@@ -1166,6 +1165,34 @@ def test_partial_unwrap_set_never_becomes_analysis_ready(tmp_path: Path) -> None
     assert not stack.analysis_ready
     with pytest.raises(ValueError, match="unavailable"):
         stack.analyze_time_series()
+
+
+def test_invert_timeseries_rejects_pair_without_current_unwrap(
+    tmp_path: Path,
+) -> None:
+    """SBAS refuses to run when one planned Pair has no current unwrap."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phase = np.zeros((2, 2), dtype=np.float32)
+    pair_ids = ("20240101_20240113", "20240113_20240125", "20240101_20240125")
+    for pair_id in pair_ids[:2]:
+        _write_pair_artifact(stack, pair_id, phase)
+        store = InterferogramArtifactStore.open(
+            stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
+        )
+        write_unwrapped_artifact(
+            store.root,
+            unwrapped_phase=phase,
+            connected_components=np.ones((2, 2), dtype=np.int32),
+            method="test",
+            method_parameters={},
+            ifg_manifest_digest=store.write_id,
+        )
+    _write_pair_artifact(stack, pair_ids[2], phase)
+
+    with pytest.raises(InvalidProcessingStateError, match="no unwrap product"):
+        stack.invert_timeseries()
 
 
 def test_scene_artifacts_flow_through_merge_and_spatial_unwrap(
