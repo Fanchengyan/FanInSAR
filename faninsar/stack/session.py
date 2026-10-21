@@ -17,11 +17,10 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import shutil
-import subprocess
 import sys
 import sysconfig
-from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
@@ -31,6 +30,8 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, Self, TypeV
 
 import numpy as np
 
+from faninsar.io.storage.ifg_store import UNWRAP_KIND
+from faninsar.io.storage.product import open_product
 from faninsar.io.storage.scene_store import (
     CoregisteredSceneStore,
     form_merged_scene_interferogram,
@@ -54,6 +55,7 @@ from faninsar.processing.coregistration.misreg_network import (
     invert_optional_pair_misregistration,
 )
 from faninsar.processing.errors import (
+    InvalidProcessingStateError,
     reject_invalid_state,
 )
 from faninsar.processing.geometry import RasterDEM, SourceDEM
@@ -73,11 +75,6 @@ from faninsar.stack.config import (
     FlattenStage,
     StackConfig,
 )
-from faninsar.stack.input_manifest import (
-    build_manifest,
-    read_manifest,
-    write_manifest,
-)
 from faninsar.stack.mask_plan import MaskPlan, StageName
 from faninsar.stack.provider import SourceHandle
 from faninsar.stack.search import (
@@ -93,11 +90,8 @@ if TYPE_CHECKING:
     from faninsar.core.acquisition import Acquisition
     from faninsar.core.pair import Pairs
     from faninsar.data.query import BoundingBox, Points, Polygons
-    from faninsar.io.storage.ifg_store import (
-        InterferogramArtifactStore,
-        UnwrappedArtifact,
-    )
-    from faninsar.io.storage.stack_generation import StackResultGeneration
+    from faninsar.io.storage.ifg_store import InterferogramArtifactStore
+    from faninsar.io.storage.product import Product
     from faninsar.missions.s1.processing import (
         BurstSelection,
         CoregistrationGrid,
@@ -114,9 +108,8 @@ if TYPE_CHECKING:
     from faninsar.processing.runtime.device import GpuMemoryReclaim
     from faninsar.processing.runtime.resources import ResourceBudget
     from faninsar.processing.unwrapping.common import SpatialUnwrapper
-    from faninsar.processing.unwrapping.quality import StackQualityCriteria
-    from faninsar.processing.unwrapping.stack import SpatialExecutor, StackUnwrapResult
     from faninsar.remote.records import CatalogItem, RemoteResourceBudget
+    from faninsar.stack.misreg import MisregRecord
     from faninsar.stack.provider import StackSceneProvider
     from faninsar.timeseries.results import TimeSeries
 
@@ -497,21 +490,196 @@ def _loaded_module_version(names: tuple[str, ...]) -> str | None:
     return None
 
 
-def _faninsar_git_revision() -> str | None:
-    """Return the enclosing FanInSAR Git revision, when the checkout exposes it."""
-    repository = Path(__file__).resolve().parents[3]
-    try:
-        completed = subprocess.run(
-            ("git", "-C", str(repository), "rev-parse", "HEAD"),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-        )
-    except (OSError, subprocess.SubprocessError):
+_GIT_REVISION_CACHE: dict[str, str | None] = {}
+_GIT_REVISION_SENTINEL: object = object()
+
+
+def _read_git_revision(repository: Path) -> str | None:
+    """Read the checked-out revision of a git repository without subprocess.
+
+    Only plain checkouts (``.git/HEAD`` pointing at a ref file, or a detached
+    ``.git/HEAD``) are resolved; anything else returns ``None``.  The result
+    is deterministic for a given checkout, unlike a ``git`` subprocess whose
+    availability depends on the calling environment.
+    """
+    git_dir = repository / ".git"
+    if git_dir.is_file():
+        text = git_dir.read_text(encoding="utf-8", errors="replace").strip()
+        marker = "gitdir: "
+        if not text.startswith(marker):
+            return None
+        git_dir = repository / text[len(marker) :].strip()
+    head = git_dir / "HEAD"
+    if not head.is_file():
         return None
-    revision = completed.stdout.strip()
-    return revision or None
+    value = head.read_text(encoding="utf-8", errors="replace").strip()
+    if re.fullmatch(r"[0-9a-f]{40}", value):
+        return value
+    if not value.startswith("ref: "):
+        return None
+    return _read_git_ref(git_dir, value[len("ref: ") :].strip())
+
+
+def _read_git_ref(git_dir: Path, ref: str) -> str | None:
+    """Resolve one git ref name to a commit id, loose file or packed."""
+    if not re.fullmatch(r"[A-Za-z0-9/._-]+", ref):
+        return None
+    for candidate in (git_dir, _common_git_dir(git_dir)):
+        if candidate is None:
+            continue
+        ref_file = candidate / ref
+        if ref_file.is_file():
+            resolved = ref_file.read_text(encoding="utf-8", errors="replace").strip()
+            if resolved:
+                return resolved
+        packed = candidate / "packed-refs"
+        if packed.is_file():
+            for line in packed.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                if line.strip().endswith(f" {ref}"):
+                    return line.split()[0]
+    return None
+
+
+def _common_git_dir(git_dir: Path) -> Path | None:
+    """Return the common git directory of a possible worktree git dir."""
+    commondir = git_dir / "commondir"
+    if not commondir.is_file():
+        return None
+    value = commondir.read_text(encoding="utf-8", errors="replace").strip()
+    if not value:
+        return None
+    common = Path(value)
+    return common if common.is_absolute() else (git_dir / common).resolve()
+
+
+def _faninsar_git_revision() -> str | None:
+    """Return the enclosing FanInSAR Git revision, when the checkout has one.
+
+    The revision is resolved once per process: it cannot change while that
+    process runs, and resume identities must not depend on a transient
+    subprocess failure.
+    """
+    cached = _GIT_REVISION_CACHE.get("revision", _GIT_REVISION_SENTINEL)
+    if cached is not _GIT_REVISION_SENTINEL:
+        return cached  # type: ignore[return-value]
+    repository = Path(__file__).resolve().parents[2]
+    revision = None
+    try:
+        revision = _read_git_revision(repository)
+    except OSError:
+        revision = None
+    _GIT_REVISION_CACHE["revision"] = revision
+    return revision
+
+
+def _distribution_version(names: tuple[str, ...]) -> str | None:
+    """Read the first installed distribution version from a name allowlist."""
+    for name in names:
+        try:
+            return str(importlib.metadata.version(name))
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        except Exception:
+            logger.debug("Unable to inspect distribution version: %s", name)
+            continue
+    return None
+
+
+def _loaded_module_version(names: tuple[str, ...]) -> str | None:
+    """Read a version from an already-loaded optional module, if exposed."""
+    for name in names:
+        module = sys.modules.get(name)
+        value = getattr(module, "__version__", None) if module is not None else None
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _runtime_image_identity() -> dict[str, object]:
+    """Return bounded platform metadata identifying the runtime image."""
+    os_release: dict[str, str] = {}
+    try:
+        raw_release = platform.freedesktop_os_release()
+    except (AttributeError, OSError):
+        raw_release = {}
+    for name in ("ID", "VERSION_ID", "BUILD_ID", "IMAGE_ID", "IMAGE_VERSION"):
+        value = raw_release.get(name)
+        if value:
+            os_release[name.lower()] = str(value)
+    return {
+        "platform": platform.platform(aliased=True, terse=True),
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "os_release": os_release,
+    }
+
+
+def _cuda_runtime_identity() -> dict[str, object]:
+    """Return serializable CUDA availability and physical-device identity."""
+    identity: dict[str, object] = {
+        "available": False,
+        "driver": None,
+        "runtime": None,
+        "devices": [],
+    }
+    try:
+        import torch
+    except Exception:
+        return identity
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None:
+        return identity
+    try:
+        available = bool(cuda.is_available())
+    except Exception:
+        return identity
+    identity["available"] = available
+    version = getattr(torch, "version", None)
+    cuda_runtime = getattr(version, "cuda", None)
+    identity["runtime"] = None if cuda_runtime is None else str(cuda_runtime)
+    driver = getattr(cuda, "driver_version", None)
+    if driver is None:
+        driver = getattr(cuda, "get_driver_version", None)
+    try:
+        if callable(driver):
+            driver = driver()
+    except Exception:
+        driver = None
+    identity["driver"] = None if driver is None else str(driver)
+    if not available:
+        return identity
+    try:
+        count = int(cuda.device_count())
+    except Exception:
+        return identity
+    devices: list[dict[str, object]] = []
+    for index in range(max(0, count)):
+        try:
+            properties = cuda.get_device_properties(index)
+            devices.append(
+                {
+                    "index": index,
+                    "uuid": (
+                        None
+                        if getattr(properties, "uuid", None) is None
+                        else str(properties.uuid)
+                    ),
+                    "name": (
+                        None
+                        if getattr(properties, "name", None) is None
+                        else str(properties.name)
+                    ),
+                }
+            )
+        except Exception:
+            # An unavailable device is still represented by the count and the
+            # availability bit; never let diagnostics prevent S1 execution.
+            devices.append({"index": index, "uuid": None, "name": None})
+    identity["devices"] = devices
+    return identity
 
 
 def _runtime_image_identity() -> dict[str, object]:
@@ -1092,11 +1260,8 @@ class Stack(NetworkContract):
     pair_states: dict[str, ProductionPairState] = field(default_factory=dict)
     ifg_dirs: list[Path] = field(default_factory=list)
     timeseries: TimeSeries | None = None
-    unwrap_result: StackUnwrapResult | None = None
     _prepared: bool = False
     _mission_prepared: MissionPreparedInputs | None = field(default=None, repr=False)
-    _generation: StackResultGeneration | None = field(default=None, repr=False)
-    _unwrap_generation: Any | None = field(default=None, repr=False)
     _network_generation_id: str | None = field(default=None, repr=False)
     _network_product_index: NetworkProductIndex | None = field(default=None, repr=False)
     _network_view: Network | None = field(default=None, repr=False)
@@ -1166,6 +1331,201 @@ class Stack(NetworkContract):
         """Return the scene product directory of every coregistered date."""
         return {date_id: store.root for date_id, store in self.scenes.items()}
 
+    @property
+    def misreg(self) -> MisregRecord | None:
+        """Return the committed misregistration product, if any."""
+        from faninsar.stack.misreg import read_misreg
+
+        return read_misreg(self.config.work_dir / "misreg")
+
+    @property
+    def interferograms(self) -> Any:
+        """Return the read-only IFG product collection of this Stack.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If the planned Pair network has no complete IFG product set.
+
+        """
+        from faninsar.network.readers.stack import StackInterferogramCollection
+
+        return StackInterferogramCollection(self)
+
+    @property
+    def unwrapped(self) -> Any:
+        """Return the unwrapped-phase cube of every planned Pair.
+
+        Returns
+        -------
+        xarray.DataArray
+            ``(pair, y, x)`` cube read from the per-Pair unwrap products.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If any planned Pair has no current unwrap product.
+
+        """
+        return self.interferograms.open_stack("unw_phase")
+
+    def status(self) -> dict[str, object]:
+        """Compare the planned networks with the committed products.
+
+        Returns
+        -------
+        dict
+            Per-stage ``planned``, ``committed``, ``missing``, and ``stale``
+            identifiers. A stale product is bound to a replaced upstream;
+            only ``overwrite=True`` recomputes it.
+
+        """
+        from faninsar.io.storage.ifg_store import (
+            InterferogramArtifactStore,
+            unwrap_root,
+        )
+        from faninsar.io.storage.product import open_product
+
+        work = self.config.work_dir
+        looks = self.config.multilook
+        report: dict[str, object] = {
+            "work_dir": str(work),
+            "reference": self.reference,
+            "activation_mode": self.config.activation_mode,
+        }
+        planned_dates = sorted(self.catalog.paths)
+        scene_stale: list[str] = []
+        scene_committed: list[str] = []
+        try:
+            reference_id = self.reference_scene.write_id
+        except InvalidProcessingStateError:
+            reference_id = None
+        for date, store in sorted(self.scenes.items()):
+            scene_committed.append(date)
+            if date != self.reference and store.inputs.get("reference") != reference_id:
+                scene_stale.append(date)
+        report["scenes"] = {
+            "planned": planned_dates,
+            "committed": scene_committed,
+            "missing": [d for d in planned_dates if d not in scene_committed],
+            "stale": scene_stale,
+        }
+        misreg_record = self.misreg
+        report["misreg"] = {
+            "committed": misreg_record is not None,
+        }
+
+        ifg_root = work / "ifg" / f"ml_{looks[0]}x{looks[1]}"
+        planned_pairs = [
+            f"{first}_{second}" for first, second in _iter_pair_dates(self.pairs)
+        ]
+        ifg_committed: list[str] = []
+        ifg_stale: list[str] = []
+        scene_write_ids: dict[str, str] = {}
+        for date, store in sorted(self.scenes.items()):
+            scene_write_ids[date] = store.write_id
+        if ifg_root.is_dir():
+            for path in sorted(ifg_root.glob("*/item.json")):
+                pair_id = path.parent.name
+                ifg_committed.append(pair_id)
+                try:
+                    store = InterferogramArtifactStore.open(path.parent)
+                except InvalidProcessingStateError:
+                    ifg_stale.append(pair_id)
+                    continue
+                expected = {
+                    "primary": scene_write_ids.get(store.pair[0]),
+                    "secondary": scene_write_ids.get(store.pair[1]),
+                }
+                if any(
+                    store.source_manifest_digests.get(role) != write_id
+                    for role, write_id in expected.items()
+                ):
+                    ifg_stale.append(pair_id)
+        report["interferograms"] = {
+            "planned": planned_pairs,
+            "committed": ifg_committed,
+            "missing": [p for p in planned_pairs if p not in ifg_committed],
+            "stale": ifg_stale,
+        }
+
+        unwrap_committed: list[str] = []
+        unwrap_stale: list[str] = []
+        for pair_id in ifg_committed:
+            has_item = (ifg_root / pair_id).exists() and (
+                unwrap_root(ifg_root / pair_id) / "item.json"
+            ).is_file()
+            if pair_id in ifg_stale:
+                # Transitive staleness: the unwrap consumes the stale IFG.
+                if has_item:
+                    unwrap_stale.append(pair_id)
+                continue
+            store = InterferogramArtifactStore.open(ifg_root / pair_id)
+            try:
+                if store.has_unwrapped():
+                    unwrap_committed.append(pair_id)
+            except InvalidProcessingStateError:
+                if has_item:
+                    unwrap_stale.append(pair_id)
+            finally:
+                store.close()
+        report["unwrap"] = {
+            "planned": planned_pairs,
+            "committed": unwrap_committed,
+            "missing": [p for p in planned_pairs if p not in unwrap_committed],
+            "stale": unwrap_stale,
+        }
+
+        timeseries_path = work / "timeseries"
+        timeseries_committed = (timeseries_path / "item.json").is_file()
+        timeseries_stale = False
+        if timeseries_committed:
+            try:
+                item = open_product(timeseries_path)
+                current = self.interferograms.unwrap_write_ids()
+                timeseries_stale = any(
+                    item.inputs.get(pair) != write_id
+                    for pair, write_id in current.items()
+                )
+            except Exception:
+                logger.warning("timeseries product could not be checked", exc_info=True)
+                timeseries_stale = True
+        report["timeseries"] = {
+            "committed": timeseries_committed,
+            "stale": timeseries_stale,
+        }
+        report["analysis_ready"] = self.analysis_ready
+        return report
+
+    def verify(self) -> list[str]:
+        """Re-hash every committed product payload in this work directory.
+
+        Normal reads skip hashing; this method checks every ``file:checksum``
+        recorded in every ``item.json`` below the work directory (``cache/``
+        is skipped).
+
+        Returns
+        -------
+        list of str
+            One entry per damaged asset, ``"<product>: <asset>"``; empty
+            means every payload matches its write-time checksum.
+
+        """
+        from faninsar.io.storage.product import verify_product
+
+        problems: list[str] = []
+        for item_path in sorted(self.config.work_dir.rglob("item.json")):
+            relative = item_path.relative_to(self.config.work_dir)
+            if relative.parts[0] == "cache" or any(
+                part.startswith(".") for part in relative.parts
+            ):
+                continue
+            problems.extend(
+                f"{item_path.parent}: {asset}"
+                for asset in verify_product(item_path.parent)
+            )
+        return problems
+
     def _reference_radar_geometry(self) -> tuple[object, tuple[int, int]]:
         """Return the persisted Reference radar geometry and scene-grid shape.
 
@@ -1202,10 +1562,10 @@ class Stack(NetworkContract):
 
     @property
     def network(self) -> Network | None:
-        """Return this Stack's validated Network view.
+        """Return the Network view over this Stack's committed products.
 
-        The Stack and Network share one generation-scoped product index;
-        before publication the view is intentionally unavailable.
+        The Stack and Network share one product index; until every planned
+        Pair has a current IFG and unwrap product the view is unavailable.
         """
         if not self.analysis_ready:
             return None
@@ -1213,19 +1573,7 @@ class Stack(NetworkContract):
             self._network_view is None
             or self._network_view.network_generation_id != self._network_generation_id
         ):
-            from faninsar.network.readers.stack import StackInterferogramCollection
-
-            view = object.__new__(Network)
-            view._root = self._root
-            view._geometry = self._geometry
-            view._interferograms = StackInterferogramCollection(self)
-            view._timeseries = self._timeseries
-            view._product_index = self._network_product_index
-            view._network_generation_id = self._network_generation_id
-            view._network_product_index = self._network_product_index
-            view.manifest = {"generation_id": self._network_generation_id}
-            view.generation_root = self._root
-            self._network_view = view
+            self._network_view = Network._from_stack(self)
         return self._network_view
 
     @property
@@ -1742,48 +2090,6 @@ class Stack(NetworkContract):
             self._persist_raster_dem(raster)
         return raster
 
-    def _dem_manifest_record(self, raster: object | None) -> object:
-        """Return the manifest DEM record, including source and raster path."""
-        record: dict[str, object] = {}
-        source = self._source_record()
-        if source is not None:
-            record.update({"kind": "source", **source})
-        if isinstance(raster, RasterDEM):
-            path = self._stack_dem_raster_path()
-            relative = path.name
-            try:
-                relative = str(path.relative_to(self.config.work_dir))
-            except ValueError:
-                relative = str(path)
-            record["raster"] = relative if path.is_file() else None
-            record["identity"] = raster.identity
-            record["vertical_datum"] = raster.vertical_datum
-            record.setdefault("kind", "raster")
-        if record:
-            return record
-        return self._manifest_identity(raster)
-
-    def _restore_dem_from_manifest(self, payload: Mapping[str, object]) -> None:
-        """Reattach a source recipe recorded in the input manifest."""
-        record = payload.get("dem")
-        if not isinstance(record, Mapping):
-            return
-        product = record.get("product")
-        if self._dem_source is None and isinstance(product, str) and product:
-            provider = record.get("provider")
-            selection = (
-                product
-                if not isinstance(provider, str) or not provider
-                else f"{product}:{provider}"
-            )
-            cache = record.get("cache_dir")
-            cache_dir = (
-                Path(cache) if isinstance(cache, str) else self.config.dem_cache_dir
-            )
-            self._dem_source = SourceDEM(selection, cache_dir=cache_dir)
-            if self.config.dem is None:
-                self.config.dem = self._dem_source
-
     def _ensure_wgs84_dem(self, raster: RasterDEM) -> None:
         """Materialize a native-spacing geographic crop for rdr2geo."""
         from faninsar.processing.geometry.dem_view import (
@@ -1938,50 +2244,6 @@ class Stack(NetworkContract):
             selected = (selected,)
         return MissionPreparedInputs(selected_footprints=tuple(selected))
 
-    @staticmethod
-    def _manifest_identity(value: object) -> object:
-        """Return a bounded identity for common preparation values."""
-        result: object
-        if value is None or isinstance(value, (str, int, float, bool)):
-            result = value
-        elif isinstance(value, Path):
-            result = str(value)
-        elif hasattr(value, "__geo_interface__"):
-            result = Stack._manifest_identity(value.__geo_interface__)
-        elif isinstance(value, Mapping):
-            result = {
-                str(key): Stack._manifest_identity(item) for key, item in value.items()
-            }
-        elif isinstance(value, (tuple, list)):
-            result = [Stack._manifest_identity(item) for item in value]
-        else:
-            result = None
-            for attribute in ("identity", "digest"):
-                candidate = getattr(value, attribute, None)
-                if isinstance(candidate, str):
-                    result = candidate
-                    break
-        return result
-
-    def _manifest_processing_options(self) -> dict[str, object]:
-        """Return the complete user-controlled preparation identity."""
-        return {
-            "mission": self.__class__.__name__,
-            "product_type": self.config.extra.get("search_product_type"),
-            "polarizations": self.config.extra.get(
-                "search_polarizations", self.config.extra.get("polarizations")
-            ),
-            "coreg_mode": self.config.coreg_mode,
-            "multilook": self.config.multilook,
-            "reference": self.reference,
-            "roi": self._manifest_identity(self.config.roi),
-            "grid": self._manifest_identity(self.config.grid),
-            "dem": self._manifest_identity(
-                self._dem_source if self._dem_source is not None else self.config.dem
-            ),
-            "mask": self.config.mask_plan.identity,
-        }
-
     def _validate_mission_prepared(
         self,
         prepared: MissionPreparedInputs,
@@ -2002,45 +2264,18 @@ class Stack(NetworkContract):
                 raise FileNotFoundError(message)
         return prepared
 
-    def prepare(self, *, refresh: bool = False) -> Self:
-        """Prepare shared Stack inputs and publish the local input manifest.
+    def prepare(self) -> Self:
+        """Prepare shared Stack inputs and save the Stack identity.
 
-        The operation is idempotent when an existing manifest remains valid.
-        It uses a single temporary JSON file and an ``os.replace`` publication
-        boundary; no journal or deferred Stack state is introduced.
+        Mission preparation resolves local orbit and calibration bindings
+        (downloading missing orbits is allowed here, never on reopen), the
+        output grid is resolved and recorded, and the DEM recipe is
+        materialized onto it. The identity is then saved as ``stack.json``;
+        reopen goes through :meth:`Stack.open`, which never touches the
+        network.
         """
         self._prepared = False
         self._mission_prepared = None
-        manifest_path = self.config.work_dir / "input_manifest.json"
-        if not refresh and manifest_path.is_file():
-            options_match = True
-            try:
-                manifest = read_manifest(manifest_path)
-                expected_options = self._manifest_identity(
-                    self._manifest_processing_options()
-                )
-                recorded_options = manifest.get("processing_options")
-                options_match = recorded_options == expected_options
-            except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
-                message = f"Stack input manifest is invalid: {error}"
-                logger.exception(message)
-                raise ValueError(message) from error
-            if not options_match:
-                message = (
-                    "Stack input manifest processing options do not match "
-                    "the current Stack"
-                )
-                logger.error(message)
-                raise ValueError(message)
-            prepared = self._validate_mission_prepared(self._prepare_mission())
-            self._mission_prepared = prepared
-            if prepared.selected_footprints:
-                self.config.extra["selected_footprints"] = prepared.selected_footprints
-            self.prepare_scenes()
-            self._restore_dem_from_manifest(manifest)
-            self._ensure_raster_dem()
-            return self
-
         try:
             prepared = self._validate_mission_prepared(self._prepare_mission())
             self._mission_prepared = prepared
@@ -2049,43 +2284,130 @@ class Stack(NetworkContract):
 
             self.prepare_scenes()
 
-            resolved_grid: object | None = None
             if (
                 self.config.grid != "auto"
                 or self.config.roi is not None
                 or prepared.selected_footprints
             ):
-                resolved_grid = self.resolve_grid()
-            resolved_dem: object | None = None
-            if resolved_grid is not None:
-                resolved_dem = self._ensure_raster_dem()
-            mask_identity = tuple(
-                (stage, self.config.mask_plan.references(stage))
-                for stage in ("roi", "interferogram", "unwrap", "ionosphere")
-                if self.config.mask_plan.references(stage)
-            )
-            input_paths = [
-                path for paths in self.catalog.paths.values() for path in paths
-            ]
-            input_paths.extend(prepared.orbit_paths_by_acquisition.values())
-            input_paths.extend(prepared.calibration_paths)
-            verification = _input_verification_records(input_paths)
-            document = build_manifest(
-                mission=self.__class__.__name__,
-                catalog_paths=self.catalog.paths,
-                prepared=prepared,
-                grid=self._manifest_identity(resolved_grid),
-                dem=self._dem_manifest_record(resolved_dem),
-                mask=self._manifest_identity(mask_identity),
-                processing_options=self._manifest_processing_options(),
-                verification=verification,
-            )
-            write_manifest(manifest_path, document)
+                # Persist the resolved grid as the science value so a reopened
+                # Stack resolves the same geometry without the footprints.
+                self.config.grid = self.resolve_grid()
+            self._ensure_raster_dem()
+            from faninsar.stack.identity import save_stack_identity
+
+            save_stack_identity(self)
         except Exception:
             self._prepared = False
             self._mission_prepared = None
             raise
         return self
+
+    @classmethod
+    def open(cls, work_dir: str | Path, **runtime: Any) -> Stack:
+        """Reopen a Stack from ``stack.json`` in an existing work directory.
+
+        The method performs no remote search. Local inputs are checked by
+        stat (the recorded size must match); runtime values (device, dask
+        client, activation token and binding, provider callback) are supplied
+        as keyword arguments. Committed products are reused; a stage resumes
+        from the first Pair without one.
+
+        Parameters
+        ----------
+        work_dir : str or pathlib.Path
+            Work directory holding ``stack.json``.
+        **runtime : Any
+            Runtime-only :class:`StackConfig` values
+            (``device``, ``invert_device``, ``executor``, ``n_jobs``,
+            ``gpu_memory_reclaim``, ``resource_budget``,
+            ``activation_binding``, ``activation_token``,
+            ``activation_authority_root``).
+
+        Returns
+        -------
+        Stack
+            The reopened Stack with its science configuration restored and
+            every committed product discoverable through the views.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If ``stack.json`` is missing or is not a FanInSAR Stack identity
+            (rebuild the work directory), a local input is missing or its
+            size changed, the recorded science configuration cannot be
+            restored, or an unknown runtime keyword is supplied.
+
+        """
+        from faninsar.stack.catalog import SceneCatalog
+        from faninsar.stack.identity import (
+            RUNTIME_FIELDS,
+            decode_value,
+            read_stack_identity,
+        )
+
+        root = Path(work_dir)
+        document = read_stack_identity(root)
+        mission = str(document["mission"])
+        stack_cls = cls if mission == cls.__name__ else _mission_class(mission)
+        unknown = set(runtime) - RUNTIME_FIELDS - {"scene_provider"}
+        if unknown:
+            message = (
+                "Stack.open accepts runtime values only; science options are "
+                "fixed by stack.json: " + ", ".join(sorted(unknown))
+            )
+            logger.error(message)
+            raise TypeError(message)
+
+        sources: dict[str, list[Path]] = {}
+        for date, entries in document["inputs"]["sources"].items():
+            sources[date] = [_check_input(entry) for entry in entries]
+        orbits = {
+            date: _check_input(entry)
+            for date, entry in document["inputs"].get("orbits", {}).items()
+        }
+        calibrations = [
+            _check_input(entry) for entry in document["inputs"].get("calibrations", [])
+        ]
+
+        science = {
+            name: decode_value(value) for name, value in document["science"].items()
+        }
+        science["work_dir"] = root
+        science["activation_mode"] = document["activation_mode"]
+        science.update(
+            {name: value for name, value in runtime.items() if name != "scene_provider"}
+        )
+        extra = {
+            key: decode_value(value)
+            for key, value in document.get("science_extra", {}).items()
+        }
+        if orbits:
+            extra["orbit_paths"] = orbits
+        if calibrations:
+            extra["calibration_paths"] = calibrations
+        science["extra"] = extra
+        config = StackConfig(**science)
+
+        from faninsar import Pairs
+
+        stack = stack_cls(
+            catalog=SceneCatalog.from_paths(
+                [path for date in sorted(sources) for path in sources[date]]
+            ),
+            config=config,
+            pairs=Pairs.from_names(document["pairs"]),
+            misreg_pairs=Pairs.from_names(document["misreg_pairs"]),
+            reference=str(document["reference"]),
+        )
+        stack.scene_provider = (
+            runtime.get("scene_provider") or stack_cls._default_scene_provider()
+        )
+        stack.prepare_scenes()
+        stack._capture_dem_source()
+        stack._ensure_raster_dem()
+        stack._prepared = True
+        stack._refresh_network()
+        return stack
 
     @classmethod
     def _from_safes(
@@ -2193,6 +2515,11 @@ class Stack(NetworkContract):
             acquisitions=acq,
             dask_client=dask_client,
         )
+
+    @classmethod
+    def _default_scene_provider(cls) -> Any:
+        """Return the mission's default scene provider, if it defines one."""
+        return None
 
     @_reclaim_after_stage
     def prepare_scenes(self) -> Self:
@@ -3461,7 +3788,6 @@ class Stack(NetworkContract):
         coherence_window: tuple[int, int] | None = None,
         phase_filter: PhaseFilter | None = _DEFAULT_PHASE_FILTER,
         goldstein_alpha: float | None = None,
-        output_dir: str | Path | None = None,
         overwrite: bool = False,
     ) -> Self:
         """Form wrapped interferograms from persisted Reference-aligned scenes.
@@ -3501,16 +3827,15 @@ class Stack(NetworkContract):
             callers should use ``phase_filter=GoldsteinWerner(alpha=...)``.
             An explicitly supplied ``phase_filter`` (including ``None``)
             takes precedence.
-        output_dir : path-like, optional
-            Root directory for immutable per-pair IFG artifacts. ``None`` uses
-            ``config.work_dir / "ifg"``.
         overwrite : bool, default=False
-            Replace an existing complete artifact at the selected output path.
+            Replace existing IFG products (``work_dir/ifg/ml_AxR/<pair>``).
+            Without it a current product is reused and a stale or
+            differently configured one is rejected.
 
         Returns
         -------
         Stack
-            This Stack, with complete IFG artifact directories appended to its
+            This Stack, with complete IFG product directories appended to its
             product set.
 
         Raises
@@ -3555,7 +3880,9 @@ class Stack(NetworkContract):
             reserve_estimate,
         )
 
-        use_pairs = pairs or self.pairs
+        if pairs is not None:
+            self._extend_plan(pairs)
+        use_pairs = self.pairs
         looks_list = _normalize_multilook(multilook or self.config.multilook)
         # ``goldstein_alpha`` remains an internal transition path for existing
         # callers.  The public MVP API is ``phase_filter``; an explicit filter
@@ -3567,11 +3894,7 @@ class Stack(NetworkContract):
         selected_filter = None if legacy_filter else phase_filter
         selected_coherence_window = None if legacy_filter else coherence_window
         filter_name, filter_parameters = _phase_filter_metadata(selected_filter)
-        base_out = (
-            Path(output_dir)
-            if output_dir is not None
-            else (self.config.work_dir / "ifg")
-        )
+        base_out = self.config.work_dir / "ifg"
         formation_ledger = (
             ResourceAdmissionLedger(self.config.resource_budget, self.config.work_dir)
             if self.config.resource_budget is not None
@@ -3585,8 +3908,6 @@ class Stack(NetworkContract):
             for looks in looks_list:
                 az_l, rg_l = looks
                 sub = base_out / f"ml_{az_l}x{rg_l}" / f"{primary}_{secondary}"
-                if sub.exists() and overwrite:
-                    shutil.rmtree(sub)
                 if primary not in scenes or secondary not in scenes:
                     reject_invalid_state(
                         f"scene product missing for {primary}_{secondary}; run "
@@ -3625,41 +3946,66 @@ class Stack(NetworkContract):
                         ).identity
                 expected_filter_name = filter_name
                 expected_filter_parameters = filter_parameters
-                if (sub / "manifest.json").exists():
+                if (sub / "item.json").exists() and not overwrite:
                     from faninsar.io.storage.ifg_store import (
                         InterferogramArtifactStore,
                     )
 
                     existing_store = InterferogramArtifactStore.open(sub)
-                    if (
-                        existing_store.pair != (primary, secondary)
-                        or existing_store.looks != looks
-                        or existing_store.domain != primary_store.domain
-                        or existing_store.wavelength_m != primary_store.wavelength_m
-                        or existing_store.grid_identity != primary_store.grid_identity
-                        or existing_store.filter_name != expected_filter_name
-                        or existing_store.filter_parameters
-                        != expected_filter_parameters
-                        or existing_store.source_manifest_digests != expected_sources
-                        or existing_store.flatten_stage != flatten_stage
-                        or existing_store.phase_screen_model != phase_screen_model
-                        or existing_store.phase_screen_digests != phase_screen_digests
-                        or existing_store.phase_screen_domain != primary_store.domain
-                        or existing_store.phase_screen_grid_identity
-                        != primary_store.grid_identity
-                        or existing_store.mask_plan_identity != mask_plan_identity
-                        or existing_store.mask_identity != mask_identity
-                    ):
+                    observed = {
+                        "pair": existing_store.pair,
+                        "looks": existing_store.looks,
+                        "domain": existing_store.domain,
+                        "wavelength_m": existing_store.wavelength_m,
+                        "grid_identity": existing_store.grid_identity,
+                        "filter_name": existing_store.filter_name,
+                        "filter_parameters": existing_store.filter_parameters,
+                        "sources": existing_store.source_manifest_digests,
+                        "flatten_stage": existing_store.flatten_stage,
+                        "phase_screen_model": existing_store.phase_screen_model,
+                        "phase_screen_digests": existing_store.phase_screen_digests,
+                        "phase_screen_domain": existing_store.phase_screen_domain,
+                        "phase_screen_grid_identity": (
+                            existing_store.phase_screen_grid_identity
+                        ),
+                        "mask_plan_identity": existing_store.mask_plan_identity,
+                        "mask_identity": existing_store.mask_identity,
+                    }
+                    expected = {
+                        "pair": (primary, secondary),
+                        "looks": looks,
+                        "domain": primary_store.domain,
+                        "wavelength_m": primary_store.wavelength_m,
+                        "grid_identity": primary_store.grid_identity,
+                        "filter_name": expected_filter_name,
+                        "filter_parameters": expected_filter_parameters,
+                        "sources": expected_sources,
+                        "flatten_stage": flatten_stage,
+                        "phase_screen_model": phase_screen_model,
+                        "phase_screen_digests": phase_screen_digests,
+                        "phase_screen_domain": primary_store.domain,
+                        "phase_screen_grid_identity": primary_store.grid_identity,
+                        "mask_plan_identity": mask_plan_identity,
+                        "mask_identity": mask_identity,
+                    }
+                    mismatched = [
+                        name
+                        for name, expected_value in expected.items()
+                        if observed[name] != expected_value
+                    ]
+                    if mismatched:
                         reject_invalid_state(
                             "persisted IFG artifact does not match current scene "
-                            "lineage or processing parameters"
+                            "lineage or processing parameters: "
+                            f"{', '.join(sorted(mismatched))} differ"
                         )
                     existing_store.read()
                     self.ifg_dirs.append(sub)
                     continue
-                if sub.exists():
+                if sub.exists() and not overwrite:
                     reject_invalid_state(
-                        "partial IFG artifact directory exists without a manifest"
+                        f"{sub} exists without item.json; it is not an IFG product "
+                        "of this FanInSAR version (pass overwrite=True to replace it)"
                     )
                 reservation = None
                 if formation_ledger is not None:
@@ -3732,145 +4078,115 @@ class Stack(NetworkContract):
                     wrapped_phase=product.wrapped_phase,
                     amplitude=product.amplitude,
                     valid_mask=valid_mask,
+                    replace_existing=overwrite,
                 )
                 self.ifg_dirs.append(sub)
         return self
 
-    def _refresh_network_from_ifg_dirs(self) -> None:
-        """Refresh inherited Network state from complete IFG artifacts.
+    def _extend_plan(self, pairs: Pairs) -> None:
+        """Add Pairs outside the plan to the planned Pair network.
 
-        Product records are created only from manifest-validated artifact
-        stores.  Validation completes before the immutable Network index is
-        replaced, so a partial or mixed generation leaves the previous index
-        untouched.
+        A subset of the plan never shrinks it; the identity is rewritten so
+        the extended plan survives a reopen.
         """
-        from faninsar.io.storage.ifg_store import InterferogramArtifactStore
+        from faninsar import Pairs as PairsType
 
-        if not self.ifg_dirs:
-            reject_invalid_state(
-                "Stack cannot refresh Network products without IFG artifacts"
+        current = set(_iter_pair_dates(self.pairs))
+        requested = _iter_pair_dates(pairs)
+        added = [pair for pair in requested if pair not in current]
+        if not added:
+            return
+        merged = sorted(current | set(requested))
+        self.pairs = PairsType.from_names([f"{a}_{b}" for a, b in merged])
+        logger.info(
+            "Extended the planned Pair network with %s", [f"{a}_{b}" for a, b in added]
+        )
+        from faninsar.stack.identity import save_stack_identity
+
+        save_stack_identity(self)
+
+    def _refresh_network(self) -> None:
+        """Rebuild the Network index from the committed products.
+
+        The index exists only when every planned Pair has a current IFG and a
+        current unwrap product (bound to that IFG's ``write_id``), all from
+        one unwrap method. Otherwise the index is cleared: a missing, stale,
+        or mixed Pair blocks analysis instead of shrinking the network.
+        """
+        try:
+            stores = self._pair_artifact_stores(looks=self.config.multilook)
+        except InvalidProcessingStateError:
+            self._clear_network()
+            return
+        if not stores or not all(store.has_unwrapped() for store in stores):
+            self._clear_network()
+            return
+        unwraps = [store.unwrap_product() for store in stores]
+        methods = {
+            json.dumps(product.properties.get("faninsar:method"), sort_keys=True)
+            for product in unwraps
+        }
+        if len(methods) != 1:
+            logger.warning(
+                "Stack unwrap products mix methods; rerun unwrap(overwrite=True)"
             )
-
+            self._clear_network()
+            return
         dimensions = self.config.extra
-        expected_pairs = tuple(_iter_pair_dates(self.pairs))
-        expected_counts = Counter(expected_pairs)
         frame = str(dimensions.get("frame_id", "stack"))
         swath = str(dimensions.get("swath", "merged"))
         channel = str(dimensions.get("channel", "merged"))
         polarization = str(dimensions.get("polarization", "merged"))
         products: list[NetworkProduct] = []
-        manifest_digests: list[str] = []
-        unwrap_manifest_digests: list[str] = []
-        seen_paths: set[Path] = set()
-        actual_pairs: list[tuple[str, str]] = []
-        unique_ifg_paths = tuple(
-            dict.fromkeys(Path(raw_path) for raw_path in self.ifg_dirs)
-        )
-        unwrap_flags = [
-            (path / "unwrap_manifest.json").is_file() for path in unique_ifg_paths
-        ]
-        if any(unwrap_flags) and not all(unwrap_flags):
-            reject_invalid_state(
-                "Stack IFG generation contains a partial unwrap product set"
-            )
-        has_unwrapped_products = bool(unwrap_flags) and all(unwrap_flags)
-        unwrapped_artifacts: list[Any] = []
-        for raw_path in self.ifg_dirs:
-            path = Path(raw_path)
-            if path in seen_paths:
-                continue
-            seen_paths.add(path)
-            store = InterferogramArtifactStore.open(path)
-            try:
-                primary, secondary = store.pair
-                actual_pairs.append(_canonical_pair_strings((primary, secondary)))
-                primary_key = AcquisitionKey(
-                    actual_pairs[-1][0], frame, swath, channel, polarization
-                )
-                secondary_key = AcquisitionKey(
-                    actual_pairs[-1][1], frame, swath, channel, polarization
-                )
-                kind = AssetKind.COMPLEX_INTERFEROGRAM
+        for store, unwrap in zip(stores, unwraps, strict=True):
+            primary, secondary = _canonical_pair_strings(store.pair)
+            for kind, location, digest, lineage in (
+                (
+                    AssetKind.COMPLEX_INTERFEROGRAM,
+                    store.root / "complex_ifg.zarr",
+                    store.write_id,
+                    (store.write_id,),
+                ),
+                (
+                    AssetKind.UNWRAPPED_PHASE,
+                    store.unwrap_root / "unwrapped_phase.zarr",
+                    unwrap.write_id,
+                    (store.write_id, unwrap.write_id),
+                ),
+            ):
                 products.append(
                     NetworkProduct(
-                        key=NetworkProductKey(primary_key, secondary_key, kind),
-                        asset_location=str(store.generation_root / "complex_ifg.zarr"),
+                        key=NetworkProductKey(
+                            AcquisitionKey(
+                                primary, frame, swath, channel, polarization
+                            ),
+                            AcquisitionKey(
+                                secondary, frame, swath, channel, polarization
+                            ),
+                            kind,
+                        ),
+                        asset_location=str(location),
                         geometry_identity=store.grid_identity,
                         source_software="faninsar",
                         phase_convention=PhaseConvention.PRIMARY_MINUS_SECONDARY,
                         asset_transform=AssetTransform.for_convention(
                             kind, PhaseConvention.PRIMARY_MINUS_SECONDARY
                         ),
-                        content_digest=store.manifest_digest,
-                        lineage=(store.manifest_digest,),
+                        content_digest=digest,
+                        lineage=lineage,
                     )
                 )
-                manifest_digests.append(store.manifest_digest)
-                if has_unwrapped_products:
-                    unwrapped = store.read_unwrapped()
-                    unwrap_generation_id, unwrap_digest = (
-                        _read_unwrap_manifest_identity(store)
-                    )
-                    unwrap_manifest_digests.append(unwrap_digest)
-                    unwrapped_artifacts.append(unwrapped)
-                    unwrap_kind = AssetKind.UNWRAPPED_PHASE
-                    products.append(
-                        NetworkProduct(
-                            key=NetworkProductKey(
-                                primary_key,
-                                secondary_key,
-                                unwrap_kind,
-                            ),
-                            asset_location=str(
-                                store.root
-                                / ".unwrap_generations"
-                                / unwrap_generation_id
-                                / "unwrapped_phase.zarr"
-                            ),
-                            geometry_identity=store.grid_identity,
-                            source_software="faninsar",
-                            phase_convention=PhaseConvention.PRIMARY_MINUS_SECONDARY,
-                            asset_transform=AssetTransform.for_convention(
-                                unwrap_kind,
-                                PhaseConvention.PRIMARY_MINUS_SECONDARY,
-                            ),
-                            content_digest=unwrap_digest,
-                            lineage=(store.manifest_digest, unwrap_digest),
-                        )
-                    )
-            finally:
-                store.close()
+        self.refresh_generation(_network_snapshot_id(stores), tuple(products))
 
-        if not products:
-            reject_invalid_state("Stack IFG generation contains no products")
-        actual_counts = Counter(actual_pairs)
-        if actual_counts != expected_counts:
-            reject_invalid_state(
-                "Stack IFG product pair set does not exactly match the configured "
-                f"Pair network: expected={dict(expected_counts)!r}, "
-                f"discovered={dict(actual_counts)!r}"
-            )
-        if has_unwrapped_products:
-            expected_pair_ids = [
-                f"{primary}_{secondary}" for primary, secondary in expected_pairs
-            ]
-            expected_parameters = unwrapped_artifacts[0].method_parameters
-            for artifact in unwrapped_artifacts:
-                if (
-                    artifact.method_parameters != expected_parameters
-                    or artifact.method_parameters.get("pair_ids") != expected_pair_ids
-                ):
-                    reject_invalid_state(
-                        "Stack unwrap products do not form one consistent Pair network"
-                    )
-        generation_id = _network_generation_digest(
-            manifest_digests, unwrap_manifest_digests
-        )
-        self.refresh_generation(generation_id, tuple(products))
+    def _clear_network(self) -> None:
+        """Drop the Network index; the view is unavailable until a refresh."""
+        object.__setattr__(self, "_network_generation_id", None)
+        object.__setattr__(self, "_network_product_index", None)
+        self._network_view = None
 
     @property
     def network_generation_id(self) -> str | None:
-        """Return the committed Network generation visible to analysis."""
+        """Return the id of the product snapshot visible to analysis."""
         return self._network_generation_id
 
     @property
@@ -3880,195 +4196,39 @@ class Stack(NetworkContract):
 
     @property
     def analysis_ready(self) -> bool:
-        """Whether a complete Network generation is available for analysis."""
+        """Whether every planned Pair has current IFG and unwrap products."""
         return (
             self._network_generation_id is not None
             and self._network_product_index is not None
         )
 
-    def _refresh_network_generation(
+    def refresh_generation(
         self,
         generation_id: str,
         products: (
             NetworkProductIndex | tuple[NetworkProduct, ...] | list[NetworkProduct]
         ),
     ) -> Self:
-        """Atomically refresh the inherited Network product index."""
+        """Replace the Network index and rebind an already obtained view."""
         NetworkContract.refresh_generation(self, generation_id, products)
         view = getattr(self, "_network_view", None)
         if view is not None:
-            # Keep an already-obtained view current without exposing a partial
-            # index: NetworkContract.refresh_generation validated both fields
-            # before this synchronization point.
-            view._network_generation_id = self._network_generation_id
-            view._network_product_index = self._network_product_index
-            view._product_index = self._network_product_index
-            view.manifest = {"generation_id": self._network_generation_id}
-            view.generation_root = self._root
-            view._timeseries = self.timeseries
-        return self
-
-    def _refresh_network_from_unwrap_generation(self, generation: Any) -> None:
-        """Refresh Network products from one committed spatial unwrap root.
-
-        The root generation is the durable authority for unwrapped products.
-        Existing IFG product records supply the shared acquisition and grid
-        metadata; this method only adds the newly committed spatial layers.
-        """
-        from faninsar.io.storage.stack_generation import UnwrapResultGeneration
-
-        if not isinstance(generation, UnwrapResultGeneration):
-            logger.error("Stack unwrap refresh received an invalid generation")
-            message = "generation must be an UnwrapResultGeneration"
-            raise TypeError(message)
-        index = self.network_product_index
-        if index is None:
-            self._refresh_network_from_ifg_dirs()
-            index = self.network_product_index
-        if index is None:
-            reject_invalid_state("Stack unwrap refresh has no IFG Network products")
-        # The root unwrap snapshot is only admissible when every source binding
-        # still names the current IFG generation and exactly the same grid.
-        stores = self._pair_artifact_stores(
-            looks=self.config.multilook,
-            ifg_root=None,
-        )
-        try:
-            stores_by_pair = {
-                f"{store.pair[0]}_{store.pair[1]}": store for store in stores
-            }
-            if set(stores_by_pair) != set(generation.pair_ids):
-                reject_invalid_state(
-                    "Stack unwrap Pair network differs from current IFGs"
-                )
-            for pair_id in generation.pair_ids:
-                binding = generation.pair_bindings.get(pair_id)
-                store = stores_by_pair[pair_id]
-                if (
-                    not isinstance(binding, dict)
-                    or binding.get("ifg_generation_id") != store.generation_id
-                    or binding.get("ifg_manifest_digest") != store.manifest_digest
-                    or binding.get("grid_identity") != store.grid_identity
-                ):
-                    reject_invalid_state(
-                        f"Stack unwrap Pair {pair_id} is stale or not bound to its IFG"
-                    )
-        finally:
-            for store in stores:
-                store.close()
-        dimensions = self.config.extra
-        frame = str(dimensions.get("frame_id", "stack"))
-        swath = str(dimensions.get("swath", "merged"))
-        channel = str(dimensions.get("channel", "merged"))
-        polarization = str(dimensions.get("polarization", "merged"))
-        products = [
-            product
-            for product in index.products
-            if product.key.product_kind is not AssetKind.UNWRAPPED_PHASE
-        ]
-        for pair_id in generation.pair_ids:
-            try:
-                primary, secondary = pair_id.split("_", 1)
-            except ValueError as error:
-                reject_invalid_state(f"Stack unwrap Pair id is invalid: {pair_id!r}")
-                raise AssertionError from error
-            source = next(
-                (
-                    product
-                    for product in products
-                    if product.primary.acquisition_id == primary
-                    and product.secondary.acquisition_id == secondary
-                    and product.key.product_kind is AssetKind.COMPLEX_INTERFEROGRAM
-                ),
-                None,
-            )
-            if source is None:
-                reject_invalid_state(
-                    f"Stack unwrap has no IFG Network product for Pair {pair_id}"
-                )
-            key = NetworkProductKey(
-                AcquisitionKey(primary, frame, swath, channel, polarization),
-                AcquisitionKey(secondary, frame, swath, channel, polarization),
-                AssetKind.UNWRAPPED_PHASE,
-            )
-            products.append(
-                NetworkProduct(
-                    key=key,
-                    asset_location=str(
-                        generation.generation_root / pair_id / "unwrapped_phase.zarr"
-                    ),
-                    geometry_identity=source.geometry_identity,
-                    source_software="faninsar",
-                    phase_convention=PhaseConvention.PRIMARY_MINUS_SECONDARY,
-                    asset_transform=AssetTransform.for_convention(
-                        AssetKind.UNWRAPPED_PHASE,
-                        PhaseConvention.PRIMARY_MINUS_SECONDARY,
-                    ),
-                    content_digest=generation.manifest_digest,
-                    lineage=(
-                        source.content_digest or source.canonical,
-                        generation.manifest_digest,
-                    ),
-                )
-            )
-        generation_id = _network_generation_digest(
-            [
-                product.content_digest or product.canonical
-                for product in products
-                if product.key.product_kind is AssetKind.COMPLEX_INTERFEROGRAM
-            ],
-            [generation.manifest_digest],
-        )
-        self._refresh_network_generation(generation_id, products)
-
-    def refresh_unwrap_generation(self) -> Self:
-        """Rebuild the Network cache from the durable ``UNWRAP_CURRENT`` root."""
-        from faninsar.io.storage.stack_generation import open_unwrap_generation
-
-        generation = open_unwrap_generation(self.config.work_dir)
-        previous = self._unwrap_generation
-        try:
-            expected_plan = self.config.mask_plan.identity
-            expected_mask = None
-            if self.config.mask_plan.references("unwrap"):
-                stores = self._pair_artifact_stores(
-                    looks=self.config.multilook, ifg_root=None
-                )
-                try:
-                    expected_mask = self._unwrap_mask_identity(stores[0].shape)
-                finally:
-                    for store in stores:
-                        store.close()
-            if (
-                generation.mask_plan_identity != expected_plan
-                or generation.mask_identity != expected_mask
-            ):
-                message = (
-                    "persisted unwrap generation mask plan or materialized mask "
-                    "identity does not match the current Stack configuration"
-                )
-                logger.error(message)
-                reject_invalid_state(message)
-            self._refresh_network_from_unwrap_generation(generation)
-        except Exception:
-            generation.close()
-            raise
-        self._unwrap_generation = generation
-        if previous is not None:
-            previous.close()
+            view._bind_stack(self)
         return self
 
     @_reclaim_after_stage
     def unwrap(
         self,
         unwrapper: SpatialUnwrapper = _DEFAULT_UNWRAPPER,
+        *,
+        overwrite: bool = False,
     ) -> Self:
         """Spatially unwrap every persisted interferogram in this Stack.
 
-        ``Stack`` owns pair iteration, Dataset materialization, and one atomic
-        root-generation publication.  ``unwrapper`` owns the numerical solve
-        for one two-dimensional pair.  The complete ordered Pair snapshot is
-        frozen at call entry; this method has no temporal/network options and
+        ``Stack`` owns pair iteration, Dataset materialization, and one unwrap
+        product per Pair (``work_dir/unwrap/ml_AxR/<pair>``, bound to the IFG
+        ``write_id``).  ``unwrapper`` owns the numerical solve for one
+        two-dimensional pair.  This method has no temporal/network options and
         does not perform temporal reconciliation or time-series inversion.
 
         Parameters
@@ -4081,12 +4241,16 @@ class Stack(NetworkContract):
             must be a same-shape, same-device :class:`SpatialUnwrapResult`
             whose valid output is finite and is a subset of the Dataset
             support.
+        overwrite : bool, default=False
+            Recompute every Pair. Without it a Pair whose unwrap product is
+            bound to the current IFG with the same method and mask is reused,
+            and a stale or differently configured product is rejected.
 
         Returns
         -------
         Stack
-            This Stack after ``UNWRAP_CURRENT`` has been atomically advanced
-            and its Network cache rebuilt from that durable generation.
+            This Stack after every Pair's unwrap product is committed and its
+            Network index rebuilt from them.
 
         Raises
         ------
@@ -4097,16 +4261,19 @@ class Stack(NetworkContract):
             Propagated from the selected unwrapper before numerical work.
         UnwrapFailedError
             If an admitted strategy fails, returns ``converged=False``, or
-            publication cannot complete.  The failed result, when available,
-            is attached as ``error.result`` and is never published.
+            the product cannot be committed.  The failed result, when
+            available, is attached as ``error.result`` and is never committed.
+        InvalidProcessingStateError
+            If an existing unwrap product is stale or was produced by another
+            method or mask and ``overwrite`` is false.
 
         Notes
         -----
-        IFG stores are pinned before Dataset reads and remain open for the
-        whole call.  The result generation contains all expected Pairs under
-        one Stack-root ``UNWRAP_CURRENT`` pointer; no partial Pair result is
-        visible.  Normal Dataset reads do not recompute payload hashes.
-        With an active PROPOSAL-0039 mask, the inverted mask is the
+        Pairs are committed one at a time, so an interrupted call resumes from
+        the first Pair without a current product. The Network index exists
+        only when every planned Pair has one; a partial set never becomes
+        visible to analysis. Normal Dataset reads do not recompute payload
+        hashes. With an active PROPOSAL-0039 mask, the inverted mask is the
         caller-supplied mask of the PROPOSAL-0038 support rule: it is
         intersected with the persisted IFG mask before the strategy is
         invoked (finite phase and finite coherence remain the strategy's
@@ -4116,9 +4283,7 @@ class Stack(NetworkContract):
         import torch
 
         from faninsar.data.datasets.ifg import StackInterferogramDataset
-        from faninsar.io.storage.stack_generation import (
-            publish_unwrap_generation,
-        )
+        from faninsar.io.storage.ifg_store import write_unwrapped_artifact
         from faninsar.processing.runtime.device import parse_device
         from faninsar.processing.runtime.resources import (
             ResourceAdmissionError,
@@ -4149,12 +4314,9 @@ class Stack(NetworkContract):
         pair_ids = tuple(
             f"{primary}_{secondary}" for primary, secondary in expected_pairs
         )
-        stores = self._pair_artifact_stores(
-            looks=self.config.multilook,
-            ifg_root=None,
-        )
+        stores = self._pair_artifact_stores(looks=self.config.multilook)
         device = parse_device(self.config.device)
-        products: dict[str, dict[str, np.ndarray]] = {}
+        method_name, method_parameters = _unwrapper_metadata(unwrapper)
         failed_result: SpatialUnwrapResult | None = None
         # PROPOSAL-0039 (AC-5): the active mask is the caller-supplied mask of
         # the PROPOSAL-0038 authoritative support rule. The plane is resolved
@@ -4176,8 +4338,28 @@ class Stack(NetworkContract):
             if self.config.resource_budget is not None
             else None
         )
+        lineage = {
+            "faninsar:mask_plan_identity": mask_plan_identity,
+            "faninsar:mask_identity": mask_identity,
+        }
         try:
             for pair_id, store in zip(pair_ids, stores, strict=True):
+                if (store.unwrap_root / "item.json").is_file() and not overwrite:
+                    existing = open_product(store.unwrap_root, kind=UNWRAP_KIND)
+                    recorded = existing.properties
+                    if (
+                        existing.inputs.get("ifg") == store.write_id
+                        and recorded.get("faninsar:method")
+                        == {"name": method_name, "parameters": method_parameters}
+                        and all(
+                            recorded.get(key) == value for key, value in lineage.items()
+                        )
+                    ):
+                        continue
+                    reject_invalid_state(
+                        f"unwrap product for {pair_id} is stale or was produced by "
+                        "another unwrapper or mask; pass overwrite=True to recompute"
+                    )
                 decode_reservation = None
                 solver_reservation = None
                 if unwrap_ledger is not None:
@@ -4189,7 +4371,7 @@ class Stack(NetworkContract):
                         ),
                     )
                 try:
-                    dataset = StackInterferogramDataset.from_generation(store)
+                    dataset = StackInterferogramDataset.from_product(store)
                     wrapped_phase = torch.as_tensor(
                         dataset.wrapped_phase,
                         dtype=torch.float32,
@@ -4308,263 +4490,38 @@ class Stack(NetworkContract):
                         f"spatial unwrap did not converge for Pair {pair_id}",
                         result,
                     )
-                products[pair_id] = {
-                    "unwrapped_phase": result.phase.detach().cpu().numpy(),
-                    "valid_mask": result.valid_mask.detach().cpu().numpy(),
-                    "component_labels": result.component_labels.detach().cpu().numpy(),
-                    "reference_values": result.reference_values.detach().cpu().numpy(),
-                }
-            generation = publish_unwrap_generation(
-                self.config.work_dir,
-                pair_ids=pair_ids,
-                products=products,
-                pair_bindings={
-                    pair_id: {
-                        "ifg_generation_id": store.generation_id,
-                        "ifg_manifest_digest": store.manifest_digest,
-                        "grid_identity": store.grid_identity,
-                    }
-                    for pair_id, store in zip(pair_ids, stores, strict=True)
-                },
-                domain=stores[0].domain,
-                shape=stores[0].shape,
-                crs=stores[0].crs,
-                transform=stores[0].transform,
-                mask_plan_identity=mask_plan_identity,
-                mask_identity=mask_identity,
-            )
-            previous = self._unwrap_generation
-            self._unwrap_generation = generation
-            if previous is not None:
-                previous.close()
-            self._refresh_network_from_unwrap_generation(generation)
-        except (NoValidSupportError, ResourceAdmissionError, UnwrapFailedError):
+                write_unwrapped_artifact(
+                    store.root,
+                    unwrapped_phase=result.phase.detach().cpu().numpy(),
+                    connected_components=result.component_labels.detach().cpu().numpy(),
+                    method=method_name,
+                    method_parameters=method_parameters,
+                    ifg_manifest_digest=store.write_id,
+                    extra_layers={
+                        "valid_mask": result.valid_mask.detach().cpu().numpy(),
+                        "reference_values": result.reference_values.detach()
+                        .cpu()
+                        .numpy(),
+                    },
+                    properties=lineage,
+                    replace_existing=overwrite,
+                )
+        except (
+            NoValidSupportError,
+            ResourceAdmissionError,
+            UnwrapFailedError,
+            InvalidProcessingStateError,
+        ):
             raise
         except Exception as error:
-            logger.exception("Stack unwrap generation failed")
-            message = "Stack unwrap generation failed"
+            logger.exception("Stack unwrap failed")
+            message = "Stack unwrap failed"
             raise UnwrapFailedError(message, failed_result) from error
         finally:
-            for store in stores:
-                store.close()
-        return self
-
-    @_reclaim_after_stage
-    def _legacy_temporal_unwrap(
-        self,
-        *,
-        multilook: tuple[int, int] | None = None,
-        ifg_root: str | Path | None = None,
-        do_spatial: bool = True,
-        spatial_executor: SpatialExecutor = "serial",
-        spatial_device: str | None = None,
-        temporal_device: str | None = None,
-        spatial_kwargs: dict[str, Any] | None = None,
-        temporal_kwargs: dict[str, Any] | None = None,
-        quality_criteria: StackQualityCriteria | None = None,
-    ) -> Self:
-        """Spatially unwrap and temporally reconcile persisted pair artifacts.
-
-        The method consumes one complete, common-grid IFG artifact for every
-        pair in :attr:`pairs`. It never reopens SAFE products or reruns
-        co-registration. Missing pairs, additional pairs, mixed look factors,
-        and mixed grid shapes fail closed before numerical processing begins.
-
-        Parameters
-        ----------
-        multilook : tuple[int, int], optional
-            Artifact view to consume. Defaults to the configured look factors.
-        ifg_root : path, optional
-            Root containing pair artifact directories. Defaults to
-            ``work_dir/ifg/ml_<az>x<rg>``.
-        do_spatial : bool, optional
-            Run spatial IRLS before temporal reconciliation. ``False`` is
-            intended for already spatially unwrapped test or import products.
-        spatial_executor : {"serial", "dask"}, optional
-            Pair-level spatial scheduling mode.
-        spatial_device, temporal_device : str, optional
-            Explicit numerical devices. Defaults to the Stack inversion device.
-        spatial_kwargs, temporal_kwargs : dict, optional
-            Numerical options forwarded to the existing Stack unwrap
-            orchestrator.
-        quality_criteria : StackQualityCriteria, optional
-            Explicit physical quality limits. Exact algebraic publication
-            invariants are always enforced. A resumed artifact must have been
-            produced under the identical criteria.
-
-        Returns
-        -------
-        Stack
-            This session with :attr:`unwrap_result` populated.
-
-        """
-        from faninsar.io.storage.ifg_store import write_unwrapped_artifact
-        from faninsar.processing.unwrapping.quality import (
-            MetricDistribution,
-            StackQualityCriteria,
-            StackQualityReport,
-        )
-        from faninsar.processing.unwrapping.stack import unwrap_stack
-
-        requested_quality_criteria = asdict(quality_criteria or StackQualityCriteria())
-        looks = multilook or self.config.multilook
-        stores = self._pair_artifact_stores(looks=looks, ifg_root=ifg_root)
-        existing = [(store.root / "unwrap_manifest.json").exists() for store in stores]
-        if any(existing):
-            if not all(existing):
-                reject_invalid_state(
-                    "partial Stack unwrap generation detected; refusing to mix "
-                    "old and new temporal solutions"
-                )
-            unwrapped = self._qualified_unwrapped_artifacts(stores)
-            phase = np.stack(
-                [artifact.unwrapped_phase for artifact in unwrapped], axis=0
-            )
-            persisted_parameters = unwrapped[0].method_parameters
-            persisted_quality_criteria = {
-                key: value
-                for key, value in persisted_parameters["quality_criteria"].items()
-                if key
-                not in {
-                    "max_modulo_closure_p95_rad",
-                    "max_sbas_residual_p95_rad",
-                }
-            }
-            if persisted_quality_criteria != requested_quality_criteria:
-                reject_invalid_state(
-                    "persisted unwrap quality criteria do not match the requested "
-                    "quality policy"
-                )
-            persisted_quality = persisted_parameters["quality_report"]
-            quality_report = StackQualityReport(
-                passed=bool(persisted_quality["passed"]),
-                failures=tuple(str(value) for value in persisted_quality["failures"]),
-                observed_pixels=int(persisted_quality["observed_pixels"]),
-                full_rank_pixels=int(persisted_quality["full_rank_pixels"]),
-                rank_coverage_fraction=float(
-                    persisted_quality["rank_coverage_fraction"]
-                ),
-                published_pixels=int(persisted_quality["published_pixels"]),
-                published_full_rank_fraction=float(
-                    persisted_quality["published_full_rank_fraction"]
-                ),
-                converged_fraction=float(persisted_quality["converged_fraction"]),
-                cycle_count=int(persisted_quality["cycle_count"]),
-                modulo_closure_abs_rad=MetricDistribution(
-                    **persisted_quality["modulo_closure_abs_rad"]
-                ),
-                sbas_residual_abs_rad=MetricDistribution(
-                    **persisted_quality["sbas_residual_abs_rad"]
-                ),
-                integer_correction_max_error=persisted_quality[
-                    "integer_correction_max_error"
-                ],
-                phase_reconstruction_max_error_rad=persisted_quality[
-                    "phase_reconstruction_max_error_rad"
-                ],
-            )
-            if not quality_report.passed:
-                reject_invalid_state("persisted unwrap quality report did not pass")
-            persisted_mask = np.all(np.isfinite(phase), axis=0)
-            base_result = unwrap_stack(
-                phase,
-                _iter_pair_dates(self.pairs),
-                do_spatial=False,
-                do_temporal=False,
-                do_invert=False,
-            )
-            self.unwrap_result = replace(
-                base_result,
-                phase_2d_unw=None,
-                connected_components=None,
-                phase_1d_unw=phase,
-                temporal_applied=True,
-                temporal_iterations=int(persisted_parameters["temporal_iterations"]),
-                temporal_converged=bool(persisted_parameters["temporal_converged"]),
-                temporal_converged_mask=persisted_mask,
-                temporal_converged_pixels=int(
-                    persisted_parameters["temporal_converged_pixels"]
-                ),
-                temporal_unconverged_pixels=int(
-                    persisted_parameters["temporal_unconverged_pixels"]
-                ),
-                temporal_converged_fraction=float(
-                    persisted_parameters["temporal_converged_fraction"]
-                ),
-                quality_report=quality_report,
-            )
-            try:
-                self.ifg_dirs = [store.root for store in stores]
-                self._refresh_network_from_ifg_dirs()
-            finally:
-                for store in stores:
-                    store.close()
-            return self
-
-        wrapped_phase = np.stack(
-            [store.read().wrapped_phase for store in stores], axis=0
-        )
-        pair_dates = _iter_pair_dates(self.pairs)
-        result = unwrap_stack(
-            wrapped_phase,
-            pair_dates,
-            do_spatial=do_spatial,
-            do_temporal=True,
-            do_invert=False,
-            spatial_executor=spatial_executor,
-            spatial_device=spatial_device or self.config.invert_device,
-            temporal_device=temporal_device or self.config.invert_device,
-            spatial_kwargs=spatial_kwargs,
-            temporal_kwargs=temporal_kwargs,
-            quality_criteria=quality_criteria,
-        )
-        if result.phase_1d_unw is None:
-            reject_invalid_state("temporal Stack reconciliation produced no phase")
-        if result.temporal_converged_pixels < 1:
-            reject_invalid_state(
-                "temporal Stack reconciliation produced no converged pixels; "
-                "no unwrap artifact was published"
-            )
-        if result.connected_components is None:
-            reject_invalid_state("spatial Stack unwrap produced no component labels")
-        if result.quality_report is None or not result.quality_report.passed:
-            reject_invalid_state("temporal Stack produced no passing quality report")
-        method_parameters: dict[str, Any] = {
-            "pair_ids": list(result.pair_ids),
-            "spatial_method": result.spatial_method,
-            "spatial_applied": do_spatial,
-            "temporal_applied": result.temporal_applied,
-            "temporal_iterations": result.temporal_iterations,
-            "temporal_converged": result.temporal_converged,
-            "temporal_converged_pixels": result.temporal_converged_pixels,
-            "temporal_unconverged_pixels": result.temporal_unconverged_pixels,
-            "temporal_converged_fraction": result.temporal_converged_fraction,
-            "temporal_unconverged_masked": True,
-            "quality_criteria": requested_quality_criteria,
-            "quality_report": asdict(result.quality_report),
-        }
-        for index, store in enumerate(stores):
-            phase = np.asarray(result.phase_1d_unw[index], dtype=np.float32)
-            connected_components = np.asarray(
-                result.connected_components[index],
-                dtype=np.int32,
-            ).copy()
-            connected_components[~np.isfinite(phase)] = 0
-            write_unwrapped_artifact(
-                store.root,
-                unwrapped_phase=phase,
-                connected_components=connected_components,
-                method="stack_irls",
-                method_parameters=method_parameters,
-                ifg_manifest_digest=store.manifest_digest,
-            )
-        self.unwrap_result = result
-        try:
-            self.ifg_dirs = [store.root for store in stores]
-            self._refresh_network_from_ifg_dirs()
-        finally:
-            for store in stores:
-                store.close()
+            # A failed call may have committed some Pairs; the index is
+            # rebuilt only from a complete set.
+            self._clear_network()
+        self._refresh_network()
         return self
 
     @_reclaim_after_stage
@@ -4574,83 +4531,109 @@ class Stack(NetworkContract):
         pair_phases: dict[str, np.ndarray] | None = None,
         device: str | None = None,
         multilook: tuple[int, int] | None = None,
-        ifg_root: str | Path | None = None,
-        _artifact_stores: Sequence[InterferogramArtifactStore] | None = None,
+        ionosphere_corrected: bool = False,
+        pairs: Pairs | None = None,
+        overwrite: bool = False,
     ) -> TimeSeries:
-        """Invert persisted, temporally reconciled pair phases with SBAS.
+        """Invert the persisted unwrapped Pair network with SBAS.
 
-        ``pair_phases`` remains available for backwards compatibility. When it
-        is omitted, the exact configured pair network is loaded from immutable
-        unwrap artifacts without rerunning any upstream processing.
+        Parameters
+        ----------
+        pair_phases : dict[str, numpy.ndarray], optional
+            In-memory Pair phases to invert directly; nothing is persisted.
+        device : str, optional
+            Solver device. Defaults to :attr:`StackConfig.invert_device`.
+        multilook : tuple[int, int], optional
+            Product view to consume. Defaults to the configured look factors.
+        ionosphere_corrected : bool, default=False
+            Consume the ionosphere-corrected unwrap of every Pair instead of
+            the raw unwrap.
+        pairs : Pairs, optional
+            Pair subset to invert. Defaults to every planned Pair. The
+            canonical time-series product always reflects the latest call.
+        overwrite : bool, default=False
+            Replace an existing time-series product bound to other inputs.
+
+        Returns
+        -------
+        TimeSeries
+            The result, committed as ``work_dir/timeseries`` whose Item
+            records the ``write_id`` of every consumed unwrap product.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If a planned Pair has no current (or corrected) unwrap, or the
+            existing time-series product is bound to other inputs and
+            ``overwrite`` is false.
+
         """
-        from faninsar.timeseries.results import invert_unwrapped_pairs
+        from faninsar.timeseries.io import read_timeseries, write_timeseries_product
+        from faninsar.timeseries.results import SpatialMetadata, invert_unwrapped_pairs
 
-        if pair_phases is None:
-            stores = (
-                list(_artifact_stores)
-                if _artifact_stores is not None
-                else self._pair_artifact_stores(
-                    looks=multilook or self.config.multilook,
-                    ifg_root=ifg_root,
-                )
-            )
-            active_unwrap = self.unwrap_result
-            if active_unwrap is not None and active_unwrap.phase_1d_unw is not None:
-                expected_pair_ids = tuple(
-                    f"{store.pair[0]}_{store.pair[1]}" for store in stores
-                )
-                if active_unwrap.pair_ids != expected_pair_ids:
-                    reject_invalid_state(
-                        "in-memory temporal result does not match IFG pair order"
-                    )
-                qualified_phase_stack = active_unwrap.phase_1d_unw
-                pair_phases = {
-                    pair_id: np.asarray(qualified_phase_stack[index])
-                    for index, pair_id in enumerate(expected_pair_ids)
-                }
-            elif (
-                self._unwrap_generation is not None
-                and self._unwrap_generation.pair_ids
-                == tuple(f"{store.pair[0]}_{store.pair[1]}" for store in stores)
-            ):
-                # ``Stack.unwrap`` publishes spatial results in one atomic
-                # Stack-root generation.  Those arrays are the direct input
-                # to SBAS; requiring the private per-IFG temporal seam here
-                # made the public unwrap -> analyze path unusable.
-                pair_phases = {
-                    pair_id: np.asarray(
-                        self._unwrap_generation.products[pair_id]["unwrapped_phase"]
-                    )
-                    for pair_id in self._unwrap_generation.pair_ids
-                }
-            else:
-                unwrapped = self._qualified_unwrapped_artifacts(stores)
-                pair_phases = {
-                    f"{store.pair[0]}_{store.pair[1]}": artifact.unwrapped_phase
-                    for store, artifact in zip(stores, unwrapped, strict=True)
-                }
-            wavelengths = {store.wavelength_m for store in stores}
-            if len(wavelengths) != 1:
-                reject_invalid_state("Stack IFG artifacts use mixed wavelengths")
-            wavelength_m = next(iter(wavelengths))
-        else:
-            wavelength_m = None
-        if self.unwrap_result is not None:
-            self.unwrap_result = replace(
-                self.unwrap_result,
-                phase_2d_unw=None,
-                connected_components=None,
-                phase_1d_unw=None,
-                corrections_k=None,
-                temporal_converged_mask=None,
-                timeseries=None,
-            )
-        active_unwrap = None
-        self.timeseries = invert_unwrapped_pairs(
-            pair_phases,
-            device=device or self.config.invert_device,
-            wavelength_m=wavelength_m,
+        solver_device = device or self.config.invert_device
+        if pair_phases is not None:
+            self.timeseries = invert_unwrapped_pairs(pair_phases, device=solver_device)
+            return self.timeseries
+        looks = multilook or self.config.multilook
+        stores = self._pair_artifact_stores(looks=looks)
+        if pairs is not None:
+            selected = set(_iter_pair_dates(pairs))
+            stores = [store for store in stores if store.pair in selected]
+            if not stores:
+                reject_invalid_state("requested Pair subset matches no IFG product")
+        sources = _pair_phase_sources(
+            self.config.work_dir, stores, ionosphere_corrected=ionosphere_corrected
         )
+        inputs = {pair_id: source.write_id for pair_id, source in sources.items()}
+        phase_source = "ion_corrected" if ionosphere_corrected else "unwrap"
+        target = self.config.work_dir / "timeseries"
+        complete_network = pairs is None
+        if complete_network and (target / "item.json").is_file() and not overwrite:
+            existing = open_product(target)
+            if (
+                existing.inputs == inputs
+                and existing.properties.get("faninsar:phase_source") == phase_source
+            ):
+                self.timeseries = read_timeseries(target)
+                return self.timeseries
+            reject_invalid_state(
+                "the time-series product is bound to other unwrap products; "
+                "pass overwrite=True to recompute it"
+            )
+        wavelengths = {store.wavelength_m for store in stores}
+        if len(wavelengths) != 1:
+            reject_invalid_state("Stack IFG products use mixed wavelengths")
+        result = invert_unwrapped_pairs(
+            {
+                pair_id: source.read("unwrapped_phase")
+                for pair_id, source in sources.items()
+            },
+            device=solver_device,
+            wavelength_m=next(iter(wavelengths)),
+        )
+        first = stores[0]
+        result = replace(
+            result,
+            spatial=SpatialMetadata(
+                domain=first.domain,
+                shape=first.shape,
+                grid_identity=first.grid_identity,
+                crs=first.crs,
+                transform=first.transform,
+            ),
+        )
+        path = write_timeseries_product(
+            result,
+            target,
+            inputs=inputs,
+            properties={
+                "faninsar:phase_source": phase_source,
+                "faninsar:looks": [int(looks[0]), int(looks[1])],
+            },
+            overwrite=overwrite or (target / "item.json").is_file(),
+        )
+        self.timeseries = replace(result, canonical_path=path)
         if self._network_view is not None:
             self._network_view._timeseries = self.timeseries
         return self.timeseries
@@ -4662,12 +4645,7 @@ class Stack(NetworkContract):
         model: Any | None = None,
         **kwargs: Any,
     ) -> TimeSeries:
-        """Analyze the Stack's inherited Network products after unwrapping.
-
-        ``Stack`` owns the SLC-to-interferogram lifecycle.  Once the unwrap
-        stage has committed a complete product set, this method schedules the
-        existing SBAS time-series solver over that same pair network.  No
-        second Network instance or Dataset injection path is created.
+        """Analyze the Stack's Network products after unwrapping.
 
         Parameters
         ----------
@@ -4686,8 +4664,8 @@ class Stack(NetworkContract):
         Raises
         ------
         ValueError
-            If analysis is requested before unwrapped products are ready or
-            an unsupported solver is selected.
+            If analysis is requested before every planned Pair is unwrapped
+            or an unsupported solver is selected.
 
         """
         del model
@@ -4695,10 +4673,10 @@ class Stack(NetworkContract):
             message = f"unsupported Stack time-series solver {solver!r}"
             logger.error(message)
             raise ValueError(message)
-        if self.unwrap_result is None and self._unwrap_generation is None:
+        if not self.analysis_ready:
             message = (
-                "Stack Network analysis is unavailable before committed "
-                "interferograms are unwrapped"
+                "Stack Network analysis is unavailable before every planned Pair "
+                "has a current interferogram and unwrap product"
             )
             logger.error(message)
             raise ValueError(message)
@@ -4711,63 +4689,23 @@ class Stack(NetworkContract):
         generation_id: str,
         **kwargs: Any,
     ) -> TimeSeries:
-        """Run Stack's existing inversion after Network generation admission."""
-        # Keep the IFG generation pinned for the complete analysis call.  The
-        # solver reads the unwrap payloads before doing its numerical solve;
-        # closing the stores immediately after those reads would allow a
-        # concurrent collector to reclaim the generation while the solver is
-        # still consuming the resulting arrays.  Pure in-memory Network tests
-        # intentionally have no Stack config/catalog and retain their light
-        # weight inversion seam.
+        """Run the Stack inversion after checking the product snapshot.
+
+        Pure in-memory Network tests have no Stack config and keep the light
+        inversion seam.
+        """
         if not hasattr(self, "config") or not hasattr(self, "pairs"):
-            result = self.invert_timeseries(**kwargs)
-            return (
-                replace(result, revision_id=generation_id)
-                if is_dataclass(result)
-                else result
-            )
+            return self.invert_timeseries(**kwargs)
         stores = self._pair_artifact_stores(
-            looks=kwargs.get("multilook") or self.config.multilook,
-            ifg_root=kwargs.get("ifg_root"),
+            looks=kwargs.get("multilook") or self.config.multilook
         )
         try:
-            observed_generation_id = _observed_network_generation_digest(
-                stores,
-                _products,
-                unwrap_generation=self._unwrap_generation,
-            )
-            if observed_generation_id != generation_id:
+            if _network_snapshot_id(stores) != generation_id:
                 reject_invalid_state(
-                    "Stack IFG or unwrap artifacts changed after Network generation "
-                    "refresh"
+                    "Stack IFG or unwrap products changed after the Network index "
+                    "was built; reopen the Stack"
                 )
-            for store in stores:
-                store._lease.heartbeat()
-            result = self.invert_timeseries(
-                _artifact_stores=stores,
-                **kwargs,
-            )
-            # A heartbeat after the solve verifies that the reader remained
-            # valid for the whole call.  If renewal fails, fail closed rather
-            # than returning a result that was computed from an unpinned view.
-            for store in stores:
-                store._lease.heartbeat()
-            if (
-                _observed_network_generation_digest(
-                    stores,
-                    _products,
-                    unwrap_generation=self._unwrap_generation,
-                )
-                != generation_id
-            ):
-                reject_invalid_state(
-                    "Stack IFG or unwrap artifacts changed during Network analysis"
-                )
-            return (
-                replace(result, revision_id=generation_id)
-                if is_dataclass(result)
-                else result
-            )
+            return self.invert_timeseries(**kwargs)
         finally:
             for store in stores:
                 store.close()
@@ -4815,410 +4753,34 @@ class Stack(NetworkContract):
 
         return invert_ionosphere_dates(self, **kwargs)
 
-    def _publish_network_root(
-        self,
-        generation: StackResultGeneration,
-        stores: Sequence[InterferogramArtifactStore],
-    ) -> Path:
-        """Materialize the current Stack result as a canonical Network root.
-
-        The Network is a consumer-facing view of a completed Stack. Its
-        assets use the same STAC+Zarr payload contract as the source Stack
-        artifacts and are copied into the immutable Network generation.
-        """
-        from faninsar.io.storage._zarr_stac import digest_path, write_zarr_array
-        from faninsar.io.storage.artifact_transaction import (
-            commit_generation,
-            stage_generation,
-        )
-
-        network_root = self.config.work_dir / "network"
-        unwrap_generation = self._unwrap_generation
-        asset_count = 0
-        final_bytes = 4096
-        for store in stores:
-            for name in ("complex_ifg", "wrapped_phase", "amplitude", "coherence"):
-                source = store.generation_root / f"{name}.zarr"
-                if source.is_dir():
-                    asset_count += 1
-                    final_bytes += int(store.shape[0] * store.shape[1] * 8)
-            if unwrap_generation is not None:
-                source = (
-                    unwrap_generation.generation_root
-                    / f"{store.pair[0]}_{store.pair[1]}"
-                    / "unwrapped_phase.zarr"
-                )
-                if source.is_dir():
-                    asset_count += 1
-                    final_bytes += int(store.shape[0] * store.shape[1] * 4)
-            else:
-                final_bytes += int(store.shape[0] * store.shape[1] * 4)
-                asset_count += 1
-        final_bytes += asset_count * 2048
-
-        def publish_asset(
-            source: Path | None, target: Path, array: np.ndarray | None = None
-        ) -> str:
-            """Publish one asset and return its byte digest."""
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(f".{target.name}.tmp")
-            if temporary.is_dir():
-                shutil.rmtree(temporary)
-            else:
-                temporary.unlink(missing_ok=True)
-            if source is not None and source.is_dir():
-                source_path = Path(getattr(source, "_display_path", source))
-                shutil.copytree(source_path, temporary)
-            elif array is not None:
-                write_zarr_array(temporary, np.asarray(array))
-            else:
-                reject_invalid_state(f"Network export asset is missing: {target.name}")
-            temporary.replace(target)
-            return digest_path(target)
-
-        with stage_generation(
-            network_root,
-            "network",
-            final_bytes=final_bytes,
-            temporary_bytes=final_bytes,
-            file_count=asset_count + len(stores) + 3,
-        ) as (network_generation_id, staging):
-            interferograms_root = staging / "interferograms"
-            assets_by_pair: dict[str, list[str]] = {}
-            products: list[dict[str, Any]] = []
-            for store in stores:
-                pair_id = f"{store.pair[0]}_{store.pair[1]}"
-                pair_root = interferograms_root / pair_id
-                artifact = store.read()
-                source_assets: dict[str, tuple[Path | None, np.ndarray | None]] = {
-                    "complex_ifg": (
-                        store.generation_root / "complex_ifg.zarr",
-                        None,
-                    ),
-                    "wrapped_phase": (
-                        store.generation_root / "wrapped_phase.zarr",
-                        None,
-                    ),
-                    "amplitude": (
-                        store.generation_root / "amplitude.zarr",
-                        None,
-                    ),
-                    "coherence": (
-                        store.generation_root / "coherence.zarr"
-                        if artifact.coherence is not None
-                        else None,
-                        None,
-                    ),
-                }
-                if unwrap_generation is not None:
-                    unwrapped_path = (
-                        unwrap_generation.generation_root
-                        / pair_id
-                        / "unwrapped_phase.zarr"
-                    )
-                    source_assets["unw_phase"] = (unwrapped_path, None)
-                else:
-                    unwrapped = store.read_unwrapped()
-                    source_assets["unw_phase"] = (None, unwrapped.unwrapped_phase)
-
-                available: list[str] = []
-                for asset_name, (source, array) in source_assets.items():
-                    if source is None and array is None:
-                        continue
-                    target = pair_root / f"{asset_name}.zarr"
-                    digest = publish_asset(source, target, array)
-                    available.append(asset_name)
-                    product_kind = {
-                        "complex_ifg": AssetKind.COMPLEX_INTERFEROGRAM.value,
-                        "wrapped_phase": AssetKind.WRAPPED_PHASE.value,
-                        "amplitude": AssetKind.AMPLITUDE.value,
-                        "coherence": AssetKind.COHERENCE.value,
-                        "unw_phase": AssetKind.UNWRAPPED_PHASE.value,
-                    }[asset_name]
-                    lineage = [store.manifest_digest]
-                    if asset_name == "unw_phase":
-                        lineage.append(
-                            unwrap_generation.manifest_digest
-                            if unwrap_generation is not None
-                            else store.manifest_digest
-                        )
-                    products.append(
-                        {
-                            "id": f"{pair_id}:{asset_name}",
-                            "primary_id": store.pair[0],
-                            "secondary_id": store.pair[1],
-                            "product_kind": product_kind,
-                            "asset_location": (
-                                f"interferograms/{pair_id}/{asset_name}.zarr"
-                            ),
-                            "geometry_identity": store.grid_identity,
-                            "source_software": "faninsar",
-                            "phase_convention": (
-                                PhaseConvention.PRIMARY_MINUS_SECONDARY.value
-                            ),
-                            "content_digest": digest,
-                            "lineage": lineage,
-                        }
-                    )
-                assets_by_pair[pair_id] = available
-
-            index = {
-                "type": "NetworkInterferogramIndex",
-                "version": "stack_artifact_v1",
-                "pair_count": len(assets_by_pair),
-                "pairs": list(assets_by_pair),
-                "assets_by_pair": assets_by_pair,
-                "common_grid": True,
-            }
-            if stores:
-                first_store = stores[0]
-                spatial_metadata: dict[str, Any] = {
-                    "domain": first_store.domain,
-                    "shape": list(first_store.shape),
-                    "grid_identity": first_store.grid_identity,
-                }
-                if first_store.crs is not None:
-                    spatial_metadata["crs"] = first_store.crs
-                if first_store.transform is not None:
-                    spatial_metadata["transform"] = list(first_store.transform)
-                index["spatial_metadata"] = spatial_metadata
-            (interferograms_root / "interferograms_index.json").parent.mkdir(
-                parents=True, exist_ok=True
-            )
-            (interferograms_root / "interferograms_index.json").write_text(
-                json.dumps(index, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-            )
-            unsigned = {
-                "schema_version": "network_v1",
-                "status": "complete",
-                "generation_id": network_generation_id,
-                "stack_generation_id": generation.generation_id,
-                "index_type": "NetworkInterferogramIndex",
-                "phase_convention": PhaseConvention.PRIMARY_MINUS_SECONDARY.value,
-                "source_software": "faninsar",
-                "products": products,
-            }
-            manifest = {
-                **unsigned,
-                "manifest_digest": hashlib.sha256(
-                    json.dumps(
-                        unsigned,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        ensure_ascii=True,
-                    ).encode("utf-8")
-                ).hexdigest(),
-            }
-            (staging / "manifest.json").write_text(
-                json.dumps(manifest, sort_keys=True, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            commit_generation(
-                network_root,
-                "network",
-                network_generation_id,
-                staging,
-                manifest_digest=str(manifest["manifest_digest"]),
-                compatibility_manifest=manifest,
-            )
-        return network_root
-
-    def publish_generation(
-        self,
-        timeseries_root: str | Path,
-        *,
-        multilook: tuple[int, int] | None = None,
-        ifg_root: str | Path | None = None,
-    ) -> StackResultGeneration:
-        """Atomically publish the complete IFG, unwrap, and SBAS result set.
-
-        Parameters
-        ----------
-        timeseries_root : str or pathlib.Path
-            Immutable time-series transaction root produced by
-            :func:`~faninsar.timeseries.io.write_timeseries_zarr`.
-        multilook : tuple[int, int], optional
-            Artifact view to bind. Defaults to the configured look factors.
-        ifg_root : str or pathlib.Path, optional
-            Root containing the exact pair artifact set.
-
-        Returns
-        -------
-        StackResultGeneration
-            Pinned, hash-validated parent generation. Call :meth:`close` when
-            the generation is no longer needed.
-
-        """
-        from faninsar.io.storage.stack_generation import (
-            publish_stack_generation,
-        )
-
-        stores = self._pair_artifact_stores(
-            looks=multilook or self.config.multilook,
-            ifg_root=ifg_root,
-        )
-        try:
-            unwrap_generation = self._unwrap_generation
-            if unwrap_generation is None:
-                self._qualified_unwrapped_artifacts(stores)
-            expected_pair_ids = tuple(
-                f"{primary}_{secondary}"
-                for primary, secondary in _iter_pair_dates(self.pairs)
-            )
-            if (
-                self.timeseries is None
-                or len(self.timeseries.pair_ids) != len(expected_pair_ids)
-                or set(self.timeseries.pair_ids) != set(expected_pair_ids)
-            ):
-                reject_invalid_state(
-                    "Stack time-series result does not match the exact pair network"
-                )
-            generation = publish_stack_generation(
-                self.config.work_dir,
-                expected_pair_ids=expected_pair_ids,
-                stores=stores,
-                timeseries_root=timeseries_root,
-                unwrap_generation=unwrap_generation,
-            )
-            self._publish_network_root(generation, stores)
-            return generation
-        finally:
-            for store in stores:
-                store.close()
-
-    def open_generation(self) -> StackResultGeneration:
-        """Open the current complete derived-result generation for this Stack."""
-        from faninsar.io.storage.stack_generation import open_stack_generation
-
-        generation = open_stack_generation(self.config.work_dir)
-        expected_pair_ids = tuple(
-            f"{primary}_{secondary}"
-            for primary, secondary in _iter_pair_dates(self.pairs)
-        )
-        if generation.pair_ids != expected_pair_ids:
-            generation.close()
-            reject_invalid_state(
-                "current Stack generation does not match the configured pair network"
-            )
-        return generation
-
-    def refresh_generation(
-        self,
-        generation_id: str | None = None,
-        products: NetworkProductIndex
-        | tuple[NetworkProduct, ...]
-        | list[NetworkProduct]
-        | None = None,
-    ) -> StackResultGeneration | Self:
-        """Refresh the pinned derived-result generation from durable storage.
-
-        A caller that keeps a Stack object alive across a new publication can
-        use this hook to release the previous lease and atomically observe the
-        newest complete generation.  Validation remains delegated to
-        :meth:`open_generation`, so incomplete or mismatched generations fail
-        closed.
-        """
-        if generation_id is not None or products is not None:
-            if generation_id is None or products is None:
-                reject_invalid_state(
-                    "Network generation refresh requires id and products together"
-                )
-            return self._refresh_network_generation(generation_id, products)
-
-        previous = self._generation
-        if previous is not None:
-            previous.close()
-        current = self.open_generation()
-        self._generation = current
-        return current
-
-    def _qualified_unwrapped_artifacts(
-        self,
-        stores: Sequence[InterferogramArtifactStore],
-    ) -> list[UnwrappedArtifact]:
-        """Load one exact, temporally qualified unwrap network."""
-        expected_pair_ids = tuple(
-            f"{primary}_{secondary}"
-            for primary, secondary in _iter_pair_dates(self.pairs)
-        )
-        artifacts = [store.read_unwrapped() for store in stores]
-        if not artifacts:
-            reject_invalid_state("qualified temporal artifact network is empty")
-        expected_parameters = artifacts[0].method_parameters
-        required_numeric = (
-            "temporal_iterations",
-            "temporal_converged_pixels",
-            "temporal_unconverged_pixels",
-            "temporal_converged_fraction",
-        )
-        for artifact in artifacts:
-            parameters = artifact.method_parameters
-            quality_report = parameters.get("quality_report")
-            quality_criteria = parameters.get("quality_criteria")
-            if (
-                artifact.method != "stack_irls"
-                or parameters != expected_parameters
-                or parameters.get("pair_ids") != list(expected_pair_ids)
-                or parameters.get("temporal_unconverged_masked") is not True
-                or parameters.get("temporal_applied") is not True
-                or any(
-                    not isinstance(parameters.get(name), (int, float))
-                    for name in required_numeric
-                )
-                or int(parameters["temporal_converged_pixels"]) < 1
-                or not isinstance(quality_report, dict)
-                or quality_report.get("passed") is not True
-                or not isinstance(quality_criteria, dict)
-            ):
-                reject_invalid_state(
-                    "persisted unwrap artifact is not a qualified temporal network"
-                )
-        finite_pixels = int(
-            np.count_nonzero(
-                np.all(
-                    np.isfinite(
-                        np.stack(
-                            [artifact.unwrapped_phase for artifact in artifacts],
-                            axis=0,
-                        )
-                    ),
-                    axis=0,
-                )
-            )
-        )
-        if finite_pixels != int(expected_parameters["temporal_converged_pixels"]):
-            reject_invalid_state(
-                "persisted unwrap convergence count does not match payload bytes"
-            )
-        return artifacts
-
     def _pair_artifact_stores(
         self,
         *,
         looks: tuple[int, int],
-        ifg_root: str | Path | None,
     ) -> list[InterferogramArtifactStore]:
-        """Open the exact ordered common-grid artifact set for this Stack."""
+        """Open the exact planned IFG product set of one multilook view.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If a planned Pair has no IFG product, an unplanned one exists, or
+            the products do not share one grid.
+
+        """
         from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 
         azimuth_looks, range_looks = (int(looks[0]), int(looks[1]))
-        root = (
-            Path(ifg_root)
-            if ifg_root is not None
-            else self.config.work_dir / "ifg" / f"ml_{azimuth_looks}x{range_looks}"
-        )
+        root = self.config.work_dir / "ifg" / f"ml_{azimuth_looks}x{range_looks}"
         expected_pairs = _iter_pair_dates(self.pairs)
         expected_ids = [
             f"{primary}_{secondary}" for primary, secondary in expected_pairs
         ]
         if not root.is_dir():
-            reject_invalid_state(f"Stack IFG artifact view is missing: {root}")
-        discovered_ids = sorted(
-            path.parent.name for path in root.glob("*/manifest.json")
-        )
+            reject_invalid_state(f"Stack IFG product view is missing: {root}")
+        discovered_ids = sorted(path.parent.name for path in root.glob("*/item.json"))
         if sorted(expected_ids) != discovered_ids:
             reject_invalid_state(
-                "Stack IFG artifact pair set does not exactly match the configured "
+                "Stack IFG product Pair set does not exactly match the planned "
                 f"network: expected={sorted(expected_ids)!r}, "
                 f"discovered={discovered_ids!r}"
             )
@@ -5281,121 +4843,88 @@ def _canonical_pair_strings(values: tuple[str, str]) -> tuple[str, str]:
     return pair.primary_string(), pair.secondary_string()
 
 
-def _read_unwrap_manifest_identity(store: Any) -> tuple[str, str]:
-    """Read the validated unwrap generation and manifest identities."""
-    try:
-        manifest = json.loads(
-            (store.root / "unwrap_manifest.json").read_text(encoding="utf-8")
+def _unwrapper_metadata(unwrapper: object) -> tuple[str, dict[str, Any]]:
+    """Return the persisted identity of a spatial unwrapper.
+
+    The name is the class name; the parameters are its public attributes
+    that have a strict-JSON form (dataclass configurations included), so a
+    resumed unwrap reuses only products of the same method.
+    """
+    parameters: dict[str, Any] = {}
+    for name, value in sorted(getattr(unwrapper, "__dict__", {}).items()):
+        if name.startswith("_"):
+            continue
+        candidate = (
+            asdict(value)
+            if is_dataclass(value) and not isinstance(value, type)
+            else value
         )
-    except (OSError, UnicodeError, ValueError) as error:
-        reject_invalid_state(f"Stack unwrap manifest cannot be read: {error}")
-    if not isinstance(manifest, dict):
-        reject_invalid_state("Stack unwrap manifest must be a JSON object")
-    generation_id = manifest.get("generation_id")
-    manifest_digest = manifest.get("manifest_digest")
-    if not isinstance(generation_id, str) or not isinstance(manifest_digest, str):
-        reject_invalid_state("Stack unwrap manifest identity is incomplete")
-    return generation_id, manifest_digest
+        try:
+            parameters[name] = json.loads(json.dumps(candidate, allow_nan=False))
+        except (TypeError, ValueError):
+            continue
+    return type(unwrapper).__name__, parameters
 
 
-def _network_generation_digest(
-    ifg_manifest_digests: Iterable[str],
-    unwrap_manifest_digests: Iterable[str] = (),
-) -> str:
-    """Hash one unambiguous IFG-plus-unwrap Network generation identity."""
-    unwrap_digests = tuple(unwrap_manifest_digests)
-    if not unwrap_digests:
-        # Keep the lightweight in-memory Stack test seam deterministic while a
-        # persisted Stack always supplies unwrap identities after unwrap.
-        return hashlib.sha256(
-            "|".join(sorted(ifg_manifest_digests)).encode("utf-8")
-        ).hexdigest()
+def _pair_phase_sources(
+    work_dir: Path,
+    stores: Sequence[InterferogramArtifactStore],
+    *,
+    ionosphere_corrected: bool,
+) -> dict[str, Product]:
+    """Return the current unwrap (or corrected unwrap) product of each Pair.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If a Pair has no current unwrap, or its ionosphere correction is
+        missing or bound to a replaced unwrap or ion product.
+
+    """
+    from faninsar.io.storage.ion_store import (
+        ION_CORRECTED_NAME,
+        IonosphereArtifactStore,
+        ion_dir,
+        open_ion_correction,
+    )
+
+    sources: dict[str, Product] = {}
+    for store in stores:
+        pair_id = f"{store.pair[0]}_{store.pair[1]}"
+        if not store.has_unwrapped():
+            reject_invalid_state(
+                f"Pair {pair_id} has no unwrap product bound to its current IFG; "
+                "run unwrap() first"
+            )
+        if not ionosphere_corrected:
+            sources[pair_id] = store.unwrap_product()
+            continue
+        if not (store.unwrap_root / ION_CORRECTED_NAME / "item.json").is_file():
+            reject_invalid_state(
+                f"Pair {pair_id} has no ionosphere correction; run "
+                "apply_ionosphere_correction() first"
+            )
+        corrected = open_ion_correction(store.root)
+        looks = tuple(
+            int(value) for value in corrected.properties["faninsar:ion_looks"]
+        )
+        ion = IonosphereArtifactStore.open(ion_dir(work_dir, pair_id, looks))
+        if corrected.inputs.get("ion") != ion.write_id:
+            reject_invalid_state(
+                f"ionosphere correction of {pair_id} is bound to a replaced ion "
+                "product; rerun apply_ionosphere_correction(overwrite=True)"
+            )
+        sources[pair_id] = corrected
+    return sources
+
+
+def _network_snapshot_id(stores: Sequence[InterferogramArtifactStore]) -> str:
+    """Return the identity of one IFG-plus-unwrap product snapshot."""
     components = [
-        *(f"ifg:{digest}" for digest in ifg_manifest_digests),
-        *(f"unwrap:{digest}" for digest in unwrap_digests),
+        *(f"ifg:{store.write_id}" for store in stores),
+        *(f"unwrap:{store.unwrap_product().write_id}" for store in stores),
     ]
     return hashlib.sha256("|".join(sorted(components)).encode("utf-8")).hexdigest()
-
-
-def _observed_network_generation_digest(
-    stores: Sequence[InterferogramArtifactStore],
-    products: NetworkProductIndex,
-    unwrap_generation: Any | None = None,
-) -> str:
-    """Validate current stores against products and return their generation ID."""
-    ifg_manifest_digests = [store.manifest_digest for store in stores]
-    indexed_unwrapped = {
-        (
-            product.primary.acquisition_id,
-            product.secondary.acquisition_id,
-        ): product
-        for product in products.products
-        if product.key.product_kind is AssetKind.UNWRAPPED_PHASE
-    }
-    if not indexed_unwrapped:
-        roots = [getattr(store, "root", None) for store in stores]
-        if roots and all(
-            isinstance(root, Path) and (root / "unwrap_manifest.json").is_file()
-            for root in roots
-        ):
-            reject_invalid_state(
-                "Stack Network index is missing current unwrapped phase products"
-            )
-        return _network_generation_digest(ifg_manifest_digests)
-    if len(indexed_unwrapped) != len(stores):
-        reject_invalid_state(
-            "Stack Network index does not contain one unwrapped product per IFG"
-        )
-
-    if unwrap_generation is not None:
-        expected_pair_ids = tuple(
-            f"{store.pair[0]}_{store.pair[1]}" for store in stores
-        )
-        if tuple(unwrap_generation.pair_ids) != expected_pair_ids:
-            reject_invalid_state(
-                "Stack Network unwrap generation does not match current Pair order"
-            )
-        for store in stores:
-            pair = _canonical_pair_strings(store.pair)
-            product = indexed_unwrapped.get(pair)
-            if (
-                product is None
-                or product.content_digest != unwrap_generation.manifest_digest
-            ):
-                reject_invalid_state(
-                    "Stack Network unwrapped product does not match current unwrap"
-                )
-            if product.lineage != (
-                store.manifest_digest,
-                unwrap_generation.manifest_digest,
-            ):
-                reject_invalid_state(
-                    "Stack Network unwrapped product lineage does not match current "
-                    "artifacts"
-                )
-        return _network_generation_digest(
-            ifg_manifest_digests, [unwrap_generation.manifest_digest]
-        )
-
-    unwrap_manifest_digests: list[str] = []
-    for store in stores:
-        # read_unwrapped validates CURRENT, its manifest digest, payload hashes,
-        # and the binding back to this exact IFG before the digest is admitted.
-        store.read_unwrapped()
-        _generation_id, unwrap_digest = _read_unwrap_manifest_identity(store)
-        pair = _canonical_pair_strings(store.pair)
-        product = indexed_unwrapped.get(pair)
-        if product is None or product.content_digest != unwrap_digest:
-            reject_invalid_state(
-                "Stack Network unwrapped product does not match current unwrap"
-            )
-        if product.lineage != (store.manifest_digest, unwrap_digest):
-            reject_invalid_state(
-                "Stack Network unwrapped product lineage does not match current "
-                "artifacts"
-            )
-        unwrap_manifest_digests.append(unwrap_digest)
-    return _network_generation_digest(ifg_manifest_digests, unwrap_manifest_digests)
 
 
 def _normalize_multilook(
@@ -5441,20 +4970,6 @@ def _scale_geo_artifact_transform(
     return tuple(float(value) for value in scaled)[:6]
 
 
-def _input_verification_records(
-    paths: Iterable[str | Path],
-) -> dict[str, dict[str, object]]:
-    """Collect download-time verification records for manifest anchoring."""
-    from faninsar.remote.transfer import read_verification
-
-    records: dict[str, dict[str, object]] = {}
-    for path in paths:
-        record = read_verification(path)
-        if record:
-            records[str(Path(path))] = record
-    return records
-
-
 def _optional_shift(value: object) -> float | None:
     """Return a finite float observation, else ``None`` (F17).
 
@@ -5470,3 +4985,61 @@ def _optional_shift(value: object) -> float | None:
     if not np.isfinite(number):
         return None
     return number
+
+
+def _check_input(entry: object) -> Path:
+    """Stat-check one recorded Stack input and return its path.
+
+    The recorded size must match; the file is never re-hashed.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the input is missing or its size changed.
+
+    """
+    if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+        reject_invalid_state("stack.json input record is invalid")
+    path = Path(str(entry["path"]))
+    if not path.exists():
+        message = (
+            f"Stack input is missing: {path}; restore it or rebuild the work directory"
+        )
+        logger.error(message)
+        reject_invalid_state(message)
+    recorded = entry.get("size")
+    if isinstance(recorded, int) and path.stat().st_size != recorded:
+        message = (
+            f"Stack input changed on disk: {path} recorded {recorded} bytes, "
+            f"found {path.stat().st_size}"
+        )
+        logger.error(message)
+        reject_invalid_state(message)
+    return path
+
+
+def _mission_class(mission: str) -> type[Stack]:
+    """Return the Stack subclass recorded as the Stack mission.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the mission name does not name a known Stack subclass.
+
+    """
+    if mission == "Stack":
+        return Stack
+    if mission == "S1Stack":
+        from faninsar.missions.s1 import S1Stack
+
+        return S1Stack
+    if mission == "NISARStack":
+        from faninsar.missions.nisar import NISARStack
+
+        return NISARStack
+    message = (
+        f"stack.json mission {mission!r} is not a known Stack subclass; rebuild "
+        "this work directory with the FanInSAR version that created it"
+    )
+    logger.error(message)
+    raise InvalidProcessingStateError(message)

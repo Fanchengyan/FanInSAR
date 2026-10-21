@@ -31,7 +31,7 @@ from faninsar.processing.unwrapping.irls import SpatialIRLS
 from faninsar.stack import Stack, StackConfig, StackSceneProvider
 from faninsar.stack.activation import LocalActivationAuthority
 from faninsar.stack.catalog import SceneCatalog
-from faninsar.timeseries.io import write_timeseries_zarr
+
 from tests.support.scene_stores import write_test_scene
 
 if TYPE_CHECKING:
@@ -76,7 +76,7 @@ def _write_pair_artifact(
         looks=(1, 1),
         filter_name="none",
         filter_parameters={},
-        source_manifest_digests={"scenes": "a" * 64},
+        source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
         complex_ifg=complex_ifg,
         coherence=np.ones(phase.shape, dtype=np.float32),
         wrapped_phase=np.angle(complex_ifg).astype(np.float32),
@@ -319,9 +319,12 @@ def test_ifg_resume_binds_runtime_fingerprint(
 
     stack.form_interferograms(multilook=(1, 1))
     store = InterferogramArtifactStore.open(stack.ifg_dirs[0])
-    assert store.source_manifest_digests[
-        "runtime"
-    ] == session_module._runtime_fingerprint(stack.scene_provider.produce_pair)
+    assert (
+        store.source_manifest_digests["runtime"]
+        == session_module._runtime_fingerprint(
+            session_module._provider_callback(stack.scene_provider)
+        )
+    )
 
     monkeypatch.setattr(
         session_module, "_runtime_fingerprint", lambda _callback: "f" * 64
@@ -932,7 +935,7 @@ def test_live_stack_network_view_exposes_committed_ifg_pairs(
     ):
         _write_pair_artifact(stack, pair_id, phase)
 
-    stack._refresh_network_from_ifg_dirs()
+    stack.unwrap(SpatialIRLS())
 
     network = stack.network
     assert network is not None
@@ -958,10 +961,11 @@ def test_live_stack_network_view_exposes_committed_ifg_pairs(
     np.testing.assert_allclose(opened.values, np.stack([np.exp(1j * phase)] * 3))
 
 
-def test_publish_generation_exports_canonical_network_view(tmp_path: Path) -> None:
-    """A completed Stack generation can be admitted through Network.open."""
+def test_network_analysis_binds_timeseries_product_to_unwrap_write_ids(
+    tmp_path: Path,
+) -> None:
+    """Network analysis commits a time-series product bound to unwrap products."""
     from faninsar import Pairs
-    from faninsar.network import Network
 
     stack = _stack_with_three_date_network(tmp_path)
     phases = {
@@ -972,33 +976,27 @@ def test_publish_generation_exports_canonical_network_view(tmp_path: Path) -> No
     for pair_id, phase in phases.items():
         _write_pair_artifact(stack, pair_id, phase)
     stack.unwrap(SpatialIRLS())
-    timeseries_root = write_timeseries_zarr(
-        stack.invert_timeseries(), stack.config.work_dir / "timeseries.zarr"
-    )
 
-    generation = stack.publish_generation(timeseries_root)
-    try:
-        network = Network.open(stack.config.work_dir / "network")
-        assert network.manifest["stack_generation_id"] == generation.generation_id
-        assert network.interferograms.open_stack("unw_phase").shape == (3, 3, 4)
-        result = network.analyze_time_series()
-        assert result.revision_id == network.manifest["generation_id"]
-        subset = Pairs.from_names(["20240101_20240113", "20240113_20240125"])
-        subset_result = network.analyze_time_series(pairs=subset)
-        assert subset_result.pair_ids == tuple(subset.to_names().tolist())
-        nsbas_result = network.analyze_time_series(solver="nsbas")
-        assert nsbas_result.revision_id == network.manifest["generation_id"]
-        from faninsar.timeseries import TimeSeries
+    result = stack.analyze_time_series()
 
-        assert isinstance(nsbas_result, TimeSeries)
-    finally:
-        generation.close()
+    from faninsar.io.storage.product import open_product
+
+    item = open_product(stack.config.work_dir / "timeseries")
+    assert item.properties["faninsar:phase_source"] == "unwrap"
+    assert set(item.inputs) == set(phases)
+    assert item.inputs == stack.network.interferograms.unwrap_write_ids()
+    subset = Pairs.from_names(["20240101_20240113", "20240113_20240125"])
+    subset_result = stack.analyze_time_series(pairs=subset)
+    assert subset_result.pair_ids == tuple(subset.to_names().tolist())
+    nsbas_result = stack.analyze_time_series(solver="sbas", overwrite=True)
+    from faninsar.timeseries import TimeSeries
+
+    assert isinstance(nsbas_result, TimeSeries)
+    assert isinstance(result, TimeSeries)
 
 
-def test_network_revision_reads_its_own_generation_assets(tmp_path: Path) -> None:
-    """Selecting an old Network revision reads its immutable raster payloads."""
-    from faninsar.network import Network
-
+def test_replacing_an_ifg_blocks_analysis_until_unwrap_reruns(tmp_path: Path) -> None:
+    """A recomputed IFG clears the Network index; analysis is unavailable."""
     stack = _stack_with_three_date_network(tmp_path)
     phase = np.full((3, 4), 0.2, dtype=np.float32)
     for pair_id in (
@@ -1008,61 +1006,32 @@ def test_network_revision_reads_its_own_generation_assets(tmp_path: Path) -> Non
     ):
         _write_pair_artifact(stack, pair_id, phase)
     stack.unwrap(SpatialIRLS())
-    timeseries_root = write_timeseries_zarr(
-        stack.invert_timeseries(), stack.config.work_dir / "timeseries.zarr"
+    assert stack.analysis_ready
+
+    store = InterferogramArtifactStore.open(
+        stack.config.work_dir / "ifg/ml_1x1/20240101_20240113"
+    )
+    artifact = store.read()
+    write_ifg_artifact(
+        store.root,
+        pair=store.pair,
+        looks=store.looks,
+        filter_name=store.filter_name,
+        filter_parameters=store.filter_parameters,
+        source_manifest_digests=store.source_manifest_digests,
+        grid_identity=store.grid_identity,
+        complex_ifg=artifact.complex_ifg * 1.0,
+        coherence=artifact.coherence,
+        wrapped_phase=artifact.wrapped_phase,
+        amplitude=artifact.amplitude,
+        replace_existing=True,
     )
 
-    generation = stack.publish_generation(timeseries_root)
-    try:
-        network_root = stack.config.work_dir / "network"
-        first = Network.open(network_root)
-        first_revision = str(first.manifest["generation_id"])
-        first_pixels = first.interferograms.open(
-            "20240101_20240113", "complex_ifg"
-        ).values.copy()
-
-        store = InterferogramArtifactStore.open(
-            stack.config.work_dir / "ifg/ml_1x1/20240101_20240113"
-        )
-        try:
-            artifact = store.read()
-            replacement = np.exp(1j * np.full((3, 4), 0.8, dtype=np.float32))
-            write_ifg_artifact(
-                store.root,
-                pair=store.pair,
-                looks=store.looks,
-                filter_name=store.filter_name,
-                filter_parameters=store.filter_parameters,
-                source_manifest_digests=store.source_manifest_digests,
-                grid_identity=store.grid_identity,
-                complex_ifg=replacement.astype(np.complex64),
-                coherence=artifact.coherence,
-                wrapped_phase=np.angle(replacement).astype(np.float32),
-                amplitude=np.abs(replacement).astype(np.float32),
-                replace_existing=True,
-            )
-        finally:
-            store.close()
-
-        stores = stack._pair_artifact_stores(looks=(1, 1), ifg_root=None)
-        try:
-            stack._publish_network_root(generation, stores)
-        finally:
-            for item in stores:
-                item.close()
-
-        current = Network.open(network_root)
-        historical = Network.open(network_root, revision=first_revision)
-        current_pixels = current.interferograms.open(
-            "20240101_20240113", "complex_ifg"
-        ).values
-        historical_pixels = historical.interferograms.open(
-            "20240101_20240113", "complex_ifg"
-        ).values
-        assert np.allclose(historical_pixels, first_pixels)
-        assert not np.allclose(current_pixels, historical_pixels)
-    finally:
-        generation.close()
+    stack._refresh_network()
+    assert not stack.analysis_ready
+    assert stack.network is None
+    with pytest.raises(ValueError, match="unavailable"):
+        stack.analyze_time_series()
 
 
 def test_live_stack_network_declares_only_present_optional_assets(
@@ -1086,7 +1055,7 @@ def test_live_stack_network_declares_only_present_optional_assets(
             looks=(1, 1),
             filter_name="none",
             filter_parameters={},
-            source_manifest_digests={"scenes": "a" * 64},
+            source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
             complex_ifg=complex_ifg,
             coherence=None,
             wrapped_phase=phase,
@@ -1103,7 +1072,7 @@ def test_live_stack_network_declares_only_present_optional_assets(
 def test_live_stack_network_per_ifg_unwrap_surface_is_consistent(
     tmp_path: Path,
 ) -> None:
-    """Per-IFG unwrap generations agree across read, path, exists, and item."""
+    """Per-pair unwrap products agree across read, path, exists, and item."""
     from faninsar.network.readers.stack import StackInterferogramCollection
 
     stack = _stack_with_three_date_network(tmp_path)
@@ -1117,17 +1086,14 @@ def test_live_stack_network_per_ifg_unwrap_surface_is_consistent(
         _write_pair_artifact(stack, pair_id, phase)
         root = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
         store = InterferogramArtifactStore.open(root)
-        try:
-            write_unwrapped_artifact(
-                root,
-                unwrapped_phase=phase,
-                connected_components=np.ones(phase.shape, dtype=np.int32),
-                method="test",
-                method_parameters={"pair_ids": list(pair_ids)},
-                ifg_manifest_digest=store.manifest_digest,
-            )
-        finally:
-            store.close()
+        write_unwrapped_artifact(
+            root,
+            unwrapped_phase=phase,
+            connected_components=np.ones(phase.shape, dtype=np.int32),
+            method="test",
+            method_parameters={},
+            ifg_manifest_digest=store.write_id,
+        )
 
     collection = StackInterferogramCollection(stack)
     for pair_id in pair_ids:
@@ -1143,45 +1109,39 @@ def test_live_stack_network_per_ifg_unwrap_surface_is_consistent(
         assert {"complex_ifg", "unw_phase"}.issubset(item["assets"])
 
 
-def test_refresh_rejects_root_unwrap_bound_to_stale_ifg(tmp_path: Path) -> None:
-    """Refreshing a root unwrap cannot silently mix IFG generations."""
-    from faninsar.processing.errors import InvalidProcessingStateError
-
+def test_refresh_rejects_mixed_unwrap_methods(tmp_path: Path) -> None:
+    """A Network index never mixes Pairs unwrapped by different methods."""
     stack = _stack_with_three_date_network(tmp_path)
     phase = np.full((3, 4), 0.2, dtype=np.float32)
-    _write_pair_artifact(stack, "20240101_20240113", phase)
-    _write_pair_artifact(stack, "20240113_20240125", phase)
-    _write_pair_artifact(stack, "20240101_20240125", phase)
+    pair_ids = (
+        "20240101_20240113",
+        "20240113_20240125",
+        "20240101_20240125",
+    )
+    for pair_id in pair_ids:
+        _write_pair_artifact(stack, pair_id, phase)
     stack.unwrap(SpatialIRLS())
+    assert stack.analysis_ready
+
     store = InterferogramArtifactStore.open(
         stack.config.work_dir / "ifg/ml_1x1/20240101_20240113"
     )
-    try:
-        artifact = store.read()
-        write_ifg_artifact(
-            store.root,
-            pair=store.pair,
-            looks=store.looks,
-            filter_name=store.filter_name,
-            filter_parameters=store.filter_parameters,
-            source_manifest_digests=store.source_manifest_digests,
-            grid_identity=store.grid_identity,
-            complex_ifg=artifact.complex_ifg * 1.0,
-            coherence=artifact.coherence,
-            wrapped_phase=artifact.wrapped_phase,
-            amplitude=artifact.amplitude,
-            replace_existing=True,
-        )
-    finally:
-        store.close()
-    with pytest.raises(InvalidProcessingStateError, match="stale"):
-        stack.refresh_unwrap_generation()
+    write_unwrapped_artifact(
+        store.root,
+        unwrapped_phase=phase,
+        connected_components=np.ones((3, 4), dtype=np.int32),
+        method="other_method",
+        method_parameters={},
+        ifg_manifest_digest=store.write_id,
+        replace_existing=True,
+    )
+
+    stack._refresh_network()
+    assert not stack.analysis_ready
 
 
-def test_partial_unwrap_network_cannot_publish_stack_generation(tmp_path: Path) -> None:
-    """A crash-visible subset of unwrap children is never Stack-complete."""
-    from faninsar.processing.errors import InvalidProcessingStateError
-
+def test_partial_unwrap_set_never_becomes_analysis_ready(tmp_path: Path) -> None:
+    """A crash-visible subset of unwrap products never admits analysis."""
     stack = _stack_with_three_date_network(tmp_path)
     phases = {
         "20240101_20240113": np.full((3, 4), 0.2, dtype=np.float32),
@@ -1198,26 +1158,14 @@ def test_partial_unwrap_network_cannot_publish_stack_generation(tmp_path: Path) 
         unwrapped_phase=phases["20240101_20240113"],
         connected_components=np.ones((3, 4), dtype=np.int32),
         method="stack_irls",
-        method_parameters={"pair_ids": list(phases)},
-        ifg_manifest_digest=first_store.manifest_digest,
+        method_parameters={},
+        ifg_manifest_digest=first_store.write_id,
     )
-    first_store.close()
-    stack.ifg_dirs = [
-        stack.config.work_dir / "ifg" / "ml_1x1" / pair_id for pair_id in phases
-    ]
-    with pytest.raises(InvalidProcessingStateError, match="partial unwrap product set"):
-        stack._refresh_network_from_ifg_dirs()
+
+    stack._refresh_network()
     assert not stack.analysis_ready
-
-    timeseries_root = write_timeseries_zarr(
-        stack.invert_timeseries(pair_phases=phases),
-        stack.config.work_dir / "timeseries.zarr",
-    )
-
-    with pytest.raises(InvalidProcessingStateError):
-        stack.publish_generation(timeseries_root)
-
-    assert not (stack.config.work_dir / "STACK_CURRENT").exists()
+    with pytest.raises(ValueError, match="unavailable"):
+        stack.analyze_time_series()
 
 
 def test_scene_artifacts_flow_through_merge_and_spatial_unwrap(
@@ -1260,7 +1208,7 @@ def test_scene_artifacts_flow_through_merge_and_spatial_unwrap(
 
     stack.form_interferograms(multilook=(1, 1))
     stack.unwrap(SpatialIRLS())
-    assert all((directory / "manifest.json").is_file() for directory in stack.ifg_dirs)
+    assert all((directory / "item.json").is_file() for directory in stack.ifg_dirs)
     assert stack.analysis_ready
 
 
@@ -1319,7 +1267,7 @@ def test_stack_unwrap_fails_closed_for_incomplete_pair_network(
     _write_pair_artifact(stack, "20240101_20240113", phase)
     _write_pair_artifact(stack, "20240113_20240125", phase)
 
-    with pytest.raises(InvalidProcessingStateError, match="pair set"):
+    with pytest.raises(InvalidProcessingStateError, match="Pair set"):
         stack.unwrap(SpatialIRLS())
 
 
@@ -1348,10 +1296,15 @@ def test_stack_unwrap_fails_closed_for_mixed_common_grids(tmp_path: Path) -> Non
         stack.unwrap(SpatialIRLS())
 
 
-def test_stack_invert_rejects_unqualified_unwrap_artifacts(tmp_path: Path) -> None:
-    """Direct SBAS invocation cannot bypass temporal qualification metadata."""
-    from faninsar.processing.errors import InvalidProcessingStateError
+def test_stack_invert_reads_whatever_unwrap_method_is_current(
+    tmp_path: Path,
+) -> None:
+    """``invert_timeseries`` consumes the current unwrap of every Pair as-is.
 
+    PROPOSAL-0059 removed the distinct "qualified" temporal-reconciliation
+    marker; there is one unwrap product per Pair, and any committed method
+    is a valid SBAS input.
+    """
     stack = _stack_with_three_date_network(tmp_path)
     phase = np.zeros((2, 2), dtype=np.float32)
     for pair_id in (
@@ -1369,11 +1322,11 @@ def test_stack_invert_rejects_unqualified_unwrap_artifacts(tmp_path: Path) -> No
             connected_components=np.ones((2, 2), dtype=np.int32),
             method="legacy",
             method_parameters={},
-            ifg_manifest_digest=store.manifest_digest,
+            ifg_manifest_digest=store.write_id,
         )
 
-    with pytest.raises(InvalidProcessingStateError, match="qualified"):
-        stack.invert_timeseries()
+    result = stack.invert_timeseries()
+    np.testing.assert_allclose(result.phase_cumulative_rad, 0.0)
 
 
 def test_coregister_redoes_scene_aligned_to_another_reference(

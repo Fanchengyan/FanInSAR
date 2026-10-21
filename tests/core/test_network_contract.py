@@ -208,96 +208,80 @@ def test_stack_analysis_delegates_through_network_base(monkeypatch) -> None:
     assert stack.analyze_time_series() == "inversion-result"
 
 
-def test_stack_analysis_keeps_ifg_leases_until_solver_returns(monkeypatch) -> None:
-    """Stack pins, heartbeats, and releases IFG stores around the solver."""
+def test_stack_analysis_validates_snapshot_before_solver(monkeypatch) -> None:
+    """Stack admits the product snapshot, solves, then releases the stores."""
+    from faninsar.stack.session import _network_snapshot_id
+
     stack = object.__new__(Stack)
-    stack.refresh_generation("generation-a", (_product(),))
-    stack.unwrap_result = object()
     stack.config = SimpleNamespace(multilook=(1, 1))
     stack.pairs = object()
     events: list[str] = []
 
-    class Lease:
-        """Minimal lease double recording the analysis lifecycle."""
-
-        def heartbeat(self) -> None:
-            events.append("heartbeat")
-
     class Store:
-        """Minimal artifact store double with one durable lease."""
+        """Minimal product double recording the analysis lifecycle."""
 
-        _lease = Lease()
-        manifest_digest = "manifest-digest"
+        write_id = "ifg-write-id"
+
+        def unwrap_product(self) -> SimpleNamespace:
+            return SimpleNamespace(write_id="unwrap-write-id")
 
         def close(self) -> None:
             events.append("close")
 
     store = Store()
-    stack._network_generation_id = hashlib.sha256(
-        store.manifest_digest.encode()
-    ).hexdigest()
-    monkeypatch.setattr(
-        stack,
-        "_pair_artifact_stores",
-        lambda **_: [store],
-    )
+    stack.refresh_generation(_network_snapshot_id([store]), (_product(),))
+    monkeypatch.setattr(stack, "_pair_artifact_stores", lambda **_: [store])
 
     def solve(**kwargs: object) -> str:
-        assert kwargs["_artifact_stores"] == [store]
         events.append("solver")
-        assert events == ["heartbeat", "solver"]
         return "inversion-result"
 
     monkeypatch.setattr(stack, "invert_timeseries", solve)
     assert stack.analyze_time_series() == "inversion-result"
-    assert events == ["heartbeat", "solver", "heartbeat", "close"]
+    assert events == ["solver", "close"]
 
 
-def test_stack_analysis_closes_ifg_leases_when_heartbeat_fails(monkeypatch) -> None:
-    """A failed lease heartbeat aborts analysis and still releases stores."""
+def test_stack_analysis_rejects_replaced_products_and_releases_stores(
+    monkeypatch,
+) -> None:
+    """Replaced IFG or unwrap products abort analysis without solving."""
+    from faninsar.stack.session import _network_snapshot_id
+
     stack = object.__new__(Stack)
-    stack.refresh_generation("generation-a", (_product(),))
-    stack.unwrap_result = object()
     stack.config = SimpleNamespace(multilook=(1, 1))
     stack.pairs = object()
     events: list[str] = []
 
-    class Lease:
-        """Lease double that fails closed on admission heartbeat."""
-
-        def heartbeat(self) -> None:
-            events.append("heartbeat")
-            raise InvalidProcessingStateError("lease expired")
-
     class Store:
-        """Artifact store double used to verify cleanup after failure."""
+        """Product double whose write ids no longer match the index."""
 
-        _lease = Lease()
-        manifest_digest = "manifest-digest"
+        write_id = "replaced-ifg-id"
+
+        def unwrap_product(self) -> SimpleNamespace:
+            return SimpleNamespace(write_id="unwrap-write-id")
 
         def close(self) -> None:
             events.append("close")
 
     store = Store()
-    stack._network_generation_id = hashlib.sha256(
-        store.manifest_digest.encode()
-    ).hexdigest()
+    stack.refresh_generation(_network_snapshot_id([store]), (_product(),))
+    store.write_id = "recomputed-ifg-id"
     monkeypatch.setattr(stack, "_pair_artifact_stores", lambda **_: [store])
     monkeypatch.setattr(
         stack,
         "invert_timeseries",
-        lambda **_: pytest.fail("solver must not run after lease failure"),
+        lambda **_: pytest.fail("solver must not run after snapshot rejection"),
     )
-    with pytest.raises(InvalidProcessingStateError, match="expired"):
+    with pytest.raises(InvalidProcessingStateError, match="changed"):
         stack.analyze_time_series()
-    assert events == ["heartbeat", "close"]
+    assert events == ["close"]
 
 
 def test_stack_analysis_readiness_follows_unwrap_commit() -> None:
-    """IFG formation alone cannot publish the Network analysis generation."""
+    """IFG formation alone cannot publish the Network analysis index."""
     form_source = inspect.getsource(Stack.form_interferograms)
     unwrap_source = inspect.getsource(Stack.unwrap)
-    assert "_refresh_network_from_ifg_dirs" not in form_source
-    assert unwrap_source.index("publish_unwrap_generation") < unwrap_source.index(
-        "_refresh_network_from_unwrap_generation"
+    assert "_refresh_network" not in form_source
+    assert unwrap_source.index("write_unwrapped_artifact") < unwrap_source.index(
+        "self._refresh_network()"
     )

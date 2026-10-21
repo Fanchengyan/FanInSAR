@@ -11,6 +11,7 @@ import torch
 from faninsar import Pairs
 from faninsar.io.storage.ifg_store import write_ifg_artifact
 from faninsar.missions.s1 import S1Stack
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.runtime import device as device_runtime
 from faninsar.processing.runtime.resources import ResourceAdmissionError, ResourceBudget
 from faninsar.processing.unwrapping.common import SpatialUnwrapper, SpatialUnwrapResult
@@ -76,7 +77,7 @@ def _stack_with_ifg(tmp_path: Path) -> Stack:
         looks=(1, 1),
         filter_name="none",
         filter_parameters={},
-        source_manifest_digests={"scenes": "a" * 64},
+        source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
         complex_ifg=np.exp(1j * phase).astype(np.complex64),
         coherence=np.ones_like(phase),
         wrapped_phase=phase,
@@ -86,15 +87,22 @@ def _stack_with_ifg(tmp_path: Path) -> Stack:
     return stack
 
 
-def test_stack_unwrap_is_spatial_only_and_publishes_one_root_generation(
+def _unwrap_item(stack: Stack) -> Path:
+    return (
+        stack.config.work_dir / "unwrap" / "ml_1x1" / "20240101_20240113" / "item.json"
+    )
+
+
+def test_stack_unwrap_is_spatial_only_and_commits_one_product_per_pair(
     tmp_path: Path,
 ) -> None:
-    """Stack dispatches one spatial strategy and advances UNWRAP_CURRENT."""
+    """Stack dispatches one spatial strategy and commits a per-Pair product."""
     stack = _stack_with_ifg(tmp_path)
 
     stack.unwrap(_IdentityUnwrapper())
 
-    assert (stack.config.work_dir / "UNWRAP_CURRENT").is_file()
+    assert _unwrap_item(stack).is_file()
+    assert not (stack.config.work_dir / "UNWRAP_CURRENT").exists()
     assert stack.analysis_ready
     assert stack.network_product_index is not None
     assert len(stack.network_product_index.products) == 2
@@ -164,7 +172,7 @@ def test_stack_unwrap_accepts_concrete_device_for_generic_cuda_request(
 
     stack.unwrap(_IdentityUnwrapper())
 
-    assert (stack.config.work_dir / "UNWRAP_CURRENT").is_file()
+    assert _unwrap_item(stack).is_file()
 
 
 def test_stack_unwrap_connects_directly_to_time_series_analysis(tmp_path: Path) -> None:
@@ -218,7 +226,7 @@ def test_stack_unwrap_public_signature_has_no_temporal_controls() -> None:
     import inspect
 
     parameters = inspect.signature(Stack.unwrap).parameters
-    assert tuple(parameters)[:2] == ("self", "unwrapper")
+    assert tuple(parameters) == ("self", "unwrapper", "overwrite")
     assert not any(name.startswith("temporal") for name in parameters)
 
 
@@ -242,3 +250,88 @@ def test_stack_unwrap_rejects_decode_before_dataset_materialization(
 
     with pytest.raises(ResourceAdmissionError, match="decoded_bytes"):
         stack.unwrap(_IdentityUnwrapper())
+
+
+class _CountingUnwrapper(_IdentityUnwrapper):
+    """Identity strategy that records how many Pairs it solved."""
+
+    def __init__(self, offset: float = 0.0) -> None:
+        self.offset = offset
+        self.calls = 0
+
+    def unwrap(
+        self, wrapped_phase: torch.Tensor, **kwargs: object
+    ) -> SpatialUnwrapResult:
+        """Solve one Pair and shift the phase by ``offset``."""
+        self.calls += 1
+        result = super().unwrap(wrapped_phase, **kwargs)  # type: ignore[arg-type]
+        return SpatialUnwrapResult(
+            phase=result.phase + self.offset,
+            valid_mask=result.valid_mask,
+            component_labels=result.component_labels,
+            reference_values=result.reference_values,
+            converged=True,
+            iterations=0,
+            pcg_iterations=0,
+            residual_norm=0.0,
+            failure_reason=None,
+        )
+
+
+def test_stack_unwrap_resumes_committed_pairs(tmp_path: Path) -> None:
+    """A second call with the same method reuses the committed product."""
+    stack = _stack_with_ifg(tmp_path)
+    first = _CountingUnwrapper()
+    stack.unwrap(first)
+    write_id = stack.network_product_index.products[1].content_digest
+
+    again = _CountingUnwrapper()
+    stack.unwrap(again)
+
+    assert again.calls == 0
+    assert stack.network_product_index.products[1].content_digest == write_id
+
+
+def test_stack_unwrap_rejects_other_method_without_overwrite(tmp_path: Path) -> None:
+    """Changed unwrap parameters are never silently mixed with old products."""
+    stack = _stack_with_ifg(tmp_path)
+    stack.unwrap(_CountingUnwrapper(offset=0.0))
+
+    with pytest.raises(InvalidProcessingStateError, match="overwrite=True"):
+        stack.unwrap(_CountingUnwrapper(offset=1.0))
+
+    stack.unwrap(_CountingUnwrapper(offset=1.0), overwrite=True)
+    unwrapped = stack.network.interferograms.open_stack("unw_phase")
+    np.testing.assert_allclose(unwrapped.values[0], 1.2)
+
+
+def test_replaced_ifg_blocks_analysis_until_unwrap_reruns(tmp_path: Path) -> None:
+    """An IFG recompute makes its unwrap stale; analysis is unavailable."""
+    stack = _stack_with_ifg(tmp_path)
+    stack.unwrap(_IdentityUnwrapper())
+    root = stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113"
+    phase = np.full((2, 3), 0.4, dtype=np.float32)
+    write_ifg_artifact(
+        root,
+        pair=("20240101", "20240113"),
+        looks=(1, 1),
+        filter_name="none",
+        filter_parameters={},
+        source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
+        complex_ifg=np.exp(1j * phase).astype(np.complex64),
+        coherence=np.ones_like(phase),
+        wrapped_phase=phase,
+        amplitude=np.ones_like(phase),
+        replace_existing=True,
+    )
+
+    stack._refresh_network()
+    assert not stack.analysis_ready
+    assert stack.network is None
+    with pytest.raises(InvalidProcessingStateError, match="stale"):
+        stack.unwrap(_IdentityUnwrapper())
+    stack.unwrap(_IdentityUnwrapper(), overwrite=True)
+    assert stack.analysis_ready
+    np.testing.assert_allclose(
+        stack.network.interferograms.open_stack("unw_phase").values[0], 0.4
+    )

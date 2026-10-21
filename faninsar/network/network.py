@@ -1,61 +1,37 @@
-"""Canonical, path-based access to a FanInSAR acquisition Network.
+"""Path-based access to the acquisition Network of a Stack work directory.
 
-``Network`` is the strict public seam: a product must carry a versioned
-manifest, a complete immutable generation, and the canonical interferogram
-index type. Existing geometry, interferogram, and time-series Dataset
-components are reused internally; they do not define the Network lifecycle.
-External processor layouts are admitted through registered readers rather
-than a parallel hierarchy of processor-named Network classes.
+``Network`` is a view over the committed ``ifg/``, ``unwrap/``, and
+``timeseries/`` products of one Stack (PROPOSAL-0059); it copies nothing.
+Existing interferogram and time-series Dataset components are reused
+internally. External processor layouts are admitted through registered
+readers rather than a parallel hierarchy of processor-named Network classes.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
-import re
 from collections.abc import Mapping
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Self
 
 import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.network.products import (
-    AssetKind,
     NetworkProduct,
     NetworkProductIndex,
-    PhaseConvention,
     _require_text,
 )
-from faninsar.network.readers.geometry import NetworkGeometry
-from faninsar.network.readers.interferogram import InterferogramCollection
-from faninsar.network.readers.timeseries import NetworkTimeSeries
 
 if TYPE_CHECKING:
     from os import PathLike
 
+    from faninsar.network.readers.geometry import NetworkGeometry
+    from faninsar.network.readers.interferogram import InterferogramCollection
+    from faninsar.stack.session import Stack
     from faninsar.timeseries.models import TimeSeriesModels
 
 logger = setup_logger(__name__)
-
-NETWORK_SCHEMA_VERSION = "network_v1"
-NETWORK_MANIFEST_NAME = "manifest.json"
-NETWORK_CURRENT_NAME = "CURRENT"
-NETWORK_GENERATIONS_NAME = ".network_generations"
-NETWORK_INDEX_TYPE = "NetworkInterferogramIndex"
-NETWORK_CURRENT_SCHEMA_VERSION = "network_current_v1"
-_MAX_MANIFEST_BYTES = 1024 * 1024
-_REQUIRED_PRODUCT_FIELDS = (
-    "id",
-    "primary_id",
-    "secondary_id",
-    "product_kind",
-    "asset_location",
-    "geometry_identity",
-    "source_software",
-    "phase_convention",
-)
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class NetworkConstructionError(RuntimeError):
@@ -66,382 +42,22 @@ class NetworkPathError(NetworkConstructionError, FileNotFoundError):
     """Raised when the requested Network root is missing or not a directory."""
 
 
-class NetworkManifestError(NetworkConstructionError):
-    """Raised when a Network manifest is missing, malformed, or unsupported."""
-
-
 class NetworkAnalysisError(NetworkConstructionError):
     """Base error raised when a Network cannot be analyzed."""
 
 
-class NetworkGenerationError(NetworkConstructionError):
-    """Raised when the selected Network generation is absent or incomplete."""
-
-
-class NetworkCurrentError(NetworkGenerationError):
-    """Raised when the current-generation pointer is missing or inconsistent."""
-
-
-class UnknownNetworkIndexTypeError(NetworkManifestError):
-    """Raised when a product declares an index type outside the MVP contract."""
-
-
 class IncompleteNetworkProductError(NetworkAnalysisError):
-    """Raised when a Network has no non-empty interferogram product index."""
-
-
-class LegacyNetworkLayoutError(NetworkConstructionError):
-    """Raised when a path contains a pre-standardization Network layout."""
-
-    def __init__(self, root: Path, markers: tuple[Path, ...]) -> None:
-        """Initialize an error describing legacy paths found below *root*."""
-        self.root = root
-        self.markers = markers
-        marker_text = ", ".join(str(path) for path in markers)
-        super().__init__(
-            f"Legacy InSAR network layout under {root}: {marker_text}. "
-            "Publish a canonical versioned Network generation first."
-        )
-
-
-def _legacy_markers(root: Path) -> tuple[Path, ...]:
-    """Return legacy interferogram markers directly under *root*."""
-    candidates = (
-        root / "ifg",
-        root / "ifg_index.json",
-        root / "interferograms" / "ifg_index.json",
-    )
-    return tuple(path for path in candidates if path.exists())
-
-
-def _read_manifest(path: Path) -> dict[str, Any]:
-    """Read one bounded, regular JSON manifest object."""
-    if not path.is_file() or path.is_symlink():
-        message = f"Network manifest is missing or unsafe: {path}"
-        logger.error(message)
-        raise NetworkManifestError(message)
-    try:
-        size = path.stat().st_size
-    except OSError as exc:
-        message = f"Network manifest cannot be read: {path}"
-        logger.exception(message)
-        raise NetworkManifestError(message) from exc
-    if size > _MAX_MANIFEST_BYTES:
-        message = f"Network manifest exceeds size limit: {path}"
-        logger.error(message)
-        raise NetworkManifestError(message)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError) as exc:
-        message = f"Network manifest cannot be read: {path}"
-        logger.exception(message)
-        raise NetworkManifestError(message) from exc
-    if not isinstance(data, dict):
-        message = f"Network manifest must be an object: {path}"
-        logger.error(message)
-        raise NetworkManifestError(message)
-    return data
-
-
-def _canonical_manifest_digest(manifest: dict[str, Any]) -> str:
-    """Compute the digest over a manifest without its self-referential field."""
-    unsigned = dict(manifest)
-    unsigned.pop("manifest_digest", None)
-    encoded = json.dumps(
-        unsigned,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _validate_manifest_digest(manifest: dict[str, Any], *, path: Path) -> str:
-    """Require a valid SHA-256 digest for one immutable manifest."""
-    digest = manifest.get("manifest_digest")
-    if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
-        message = f"Network manifest_digest is invalid: {path}"
-        logger.error(message)
-        raise NetworkManifestError(message)
-    if digest != _canonical_manifest_digest(manifest):
-        message = f"Network manifest_digest mismatch: {path}"
-        logger.error(message)
-        raise NetworkManifestError(message)
-    return digest
-
-
-def _validate_asset_location(value: object, *, path: Path, product_id: str) -> None:
-    """Reject absolute, traversing, or platform-ambiguous asset locations."""
-    if not isinstance(value, str) or not value.strip() or value != value.strip():
-        message = f"Network product asset_location is invalid: {product_id!r}"
-        logger.error(message)
-        raise NetworkManifestError(message)
-    if "\\" in value:
-        message = f"Network product asset_location uses unsafe separators: {path}"
-        logger.error(message)
-        raise NetworkManifestError(message)
-    posix = PurePosixPath(value)
-    windows = PureWindowsPath(value)
-    if (
-        posix.is_absolute()
-        or windows.is_absolute()
-        or windows.drive
-        or ".." in posix.parts
-    ):
-        message = f"Network product asset_location must be a safe relative path: {path}"
-        logger.error(message)
-        raise NetworkManifestError(message)
-
-
-def _validate_manifest(
-    path: Path,
-    *,
-    expected_generation: str | None = None,
-) -> dict[str, Any]:
-    """Validate schema, complete status, generation identity, and index type."""
-    manifest = _read_manifest(path)
-    _validate_manifest_digest(manifest, path=path)
-    if manifest.get("schema_version") != NETWORK_SCHEMA_VERSION:
-        message = (
-            f"unsupported Network manifest version at {path}: "
-            f"{manifest.get('schema_version')!r}"
-        )
-        logger.error(message)
-        raise NetworkManifestError(message)
-    if manifest.get("status") != "complete":
-        message = f"Network manifest is not complete: {path}"
-        logger.error(message)
-        raise NetworkGenerationError(message)
-    generation_id = manifest.get("generation_id")
-    if not isinstance(generation_id, str) or not generation_id.strip():
-        message = f"Network manifest has no generation_id: {path}"
-        logger.error(message)
-        raise NetworkManifestError(message)
-    if expected_generation is not None and generation_id != expected_generation:
-        message = f"Network generation identity mismatch at {path}"
-        logger.error(message)
-        raise NetworkGenerationError(message)
-    index_type = manifest.get("index_type", manifest.get("type"))
-    if index_type != NETWORK_INDEX_TYPE:
-        message = f"unknown Network index type {index_type!r} at {path}"
-        logger.error(message)
-        raise UnknownNetworkIndexTypeError(message)
-    products = manifest.get("products")
-    if not isinstance(products, list) or not products:
-        message = f"Network product index is empty or missing: {path}"
-        logger.error(message)
-        raise IncompleteNetworkProductError(message)
-    phase_convention = manifest.get("phase_convention")
-    if not isinstance(phase_convention, str) or not phase_convention.strip():
-        message = f"Network manifest has no phase_convention: {path}"
-        logger.error(message)
-        raise NetworkManifestError(message)
-    try:
-        PhaseConvention(phase_convention)
-    except (TypeError, ValueError) as error:
-        message = f"unknown Network phase_convention {phase_convention!r}: {path}"
-        logger.exception(message)
-        raise NetworkManifestError(message) from error
-    product_ids: set[str] = set()
-    for position, product in enumerate(products):
-        if not isinstance(product, dict):
-            message = f"Network product record {position} is not an object: {path}"
-            logger.error(message)
-            raise NetworkManifestError(message)
-        for field_name in _REQUIRED_PRODUCT_FIELDS:
-            value = product.get(field_name)
-            if not isinstance(value, str) or not value.strip():
-                message = (
-                    f"Network product record {position} has no {field_name}: {path}"
-                )
-                logger.error(message)
-                raise NetworkManifestError(message)
-        product_id = product["id"]
-        content_digest = product.get("content_digest")
-        if (
-            not isinstance(content_digest, str)
-            or _SHA256_RE.fullmatch(content_digest) is None
-        ):
-            message = f"Network product record {position} has no content_digest: {path}"
-            logger.error(message)
-            raise NetworkManifestError(message)
-        lineage = product.get("lineage")
-        if (
-            not isinstance(lineage, list)
-            or not lineage
-            or any(
-                not isinstance(item, str) or not item.strip() or item != item.strip()
-                for item in lineage
-            )
-        ):
-            message = f"Network product lineage is invalid: {product_id!r}"
-            logger.error(message)
-            raise NetworkManifestError(message)
-        if product_id in product_ids:
-            message = f"Network product IDs are not unique: {product_id!r}"
-            logger.error(message)
-            raise NetworkManifestError(message)
-        product_ids.add(product_id)
-        _validate_asset_location(
-            product["asset_location"], path=path, product_id=product_id
-        )
-        if product["primary_id"] == product["secondary_id"]:
-            message = f"Network product has identical Pair roles: {product_id!r}"
-            logger.error(message)
-            raise NetworkManifestError(message)
-        try:
-            AssetKind(product["product_kind"])
-        except (TypeError, ValueError) as error:
-            message = (
-                f"unknown Network product_kind {product['product_kind']!r}: {path}"
-            )
-            logger.exception(message)
-            raise NetworkManifestError(message) from error
-        if product["phase_convention"] != phase_convention:
-            message = (
-                f"Network product phase_convention disagrees with manifest: {path}"
-            )
-            logger.error(message)
-            raise NetworkManifestError(message)
-    return manifest
-
-
-def _product_set(manifest: dict[str, Any]) -> tuple[str, ...]:
-    """Return a deterministic signature for a manifest's product records."""
-    products = manifest["products"]
-    return tuple(
-        sorted(
-            json.dumps(product, sort_keys=True, separators=(",", ":"))
-            for product in products
-        )
-    )
-
-
-def _validate_current(path: Path, *, expected_generation: str) -> dict[str, Any]:
-    """Validate the versioned pointer to the selected Network generation."""
-    current = _read_manifest(path)
-    if current.get("schema_version") != NETWORK_CURRENT_SCHEMA_VERSION:
-        message = f"unsupported Network CURRENT version at {path}"
-        logger.error(message)
-        raise NetworkCurrentError(message)
-    if current.get("status") != "complete":
-        message = f"Network CURRENT is not complete: {path}"
-        logger.error(message)
-        raise NetworkCurrentError(message)
-    generation_id = current.get("generation_id")
-    if not isinstance(generation_id, str) or not generation_id.strip():
-        message = f"Network CURRENT has no generation_id: {path}"
-        logger.error(message)
-        raise NetworkCurrentError(message)
-    if generation_id != expected_generation:
-        message = "Network CURRENT does not select the root manifest generation"
-        logger.error(message)
-        raise NetworkCurrentError(message)
-    manifest_digest = current.get("manifest_digest")
-    if (
-        not isinstance(manifest_digest, str)
-        or _SHA256_RE.fullmatch(manifest_digest) is None
-    ):
-        message = f"Network CURRENT manifest_digest is invalid: {path}"
-        logger.error(message)
-        raise NetworkCurrentError(message)
-    return current
-
-
-def _validate_network_layout(
-    root: Path,
-    *,
-    revision: str | None = None,
-) -> dict[str, Any]:
-    """Validate the canonical root manifest and selected immutable generation."""
-    markers = _legacy_markers(root)
-    if markers:
-        logger.error("Refusing legacy Network layout at %s; markers=%s", root, markers)
-        raise LegacyNetworkLayoutError(root, markers)
-
-    root_manifest = _validate_manifest(root / NETWORK_MANIFEST_NAME)
-    generations = root / NETWORK_GENERATIONS_NAME
-    if not generations.is_dir() or generations.is_symlink():
-        message = f"Network generation root is missing or unsafe: {generations}"
-        logger.error(message)
-        raise NetworkGenerationError(message)
-    current_path = root / NETWORK_CURRENT_NAME
-    generation_id = str(root_manifest["generation_id"])
-    if revision is None:
-        current = _validate_current(current_path, expected_generation=generation_id)
-    else:
-        # Historical generations are immutable and may no longer be selected
-        # by CURRENT.  Validate the requested generation directly while still
-        # validating the canonical root manifest above.
-        if (
-            not isinstance(revision, str)
-            or not revision.strip()
-            or revision != revision.strip()
-            or revision in {".", ".."}
-            or "/" in revision
-            or "\\" in revision
-        ):
-            message = f"Network revision is invalid: {revision!r}"
-            logger.error(message)
-            raise NetworkGenerationError(message)
-        generation_id = revision
-        current = None
-    generation_root = generations / str(generation_id)
-    if not generation_root.is_dir() or generation_root.is_symlink():
-        message = (
-            f"Network generation directory is missing or unsafe: {generation_root}"
-        )
-        logger.error(message)
-        raise NetworkCurrentError(message)
-    generation_manifest = _validate_manifest(
-        generation_root / NETWORK_MANIFEST_NAME,
-        expected_generation=generation_id,
-    )
-    if revision is None and _product_set(generation_manifest) != _product_set(
-        root_manifest
-    ):
-        message = "Network generation manifest does not match root product set"
-        logger.error(message)
-        raise NetworkGenerationError(message)
-    if (
-        revision is None
-        and generation_manifest["manifest_digest"] != root_manifest["manifest_digest"]
-    ):
-        message = "Network generation manifest_digest does not match root manifest"
-        logger.error(message)
-        raise NetworkGenerationError(message)
-    if (
-        current is not None
-        and current["manifest_digest"] != root_manifest["manifest_digest"]
-    ):
-        message = "Network CURRENT manifest_digest does not select root manifest"
-        logger.error(message)
-        raise NetworkCurrentError(message)
-    if generation_manifest["phase_convention"] != root_manifest["phase_convention"]:
-        message = "Network generation manifest phase convention mismatch"
-        logger.error(message)
-        raise NetworkGenerationError(message)
-    interferograms_in_generation = (generation_root / "interferograms").is_dir()
-    if revision is not None and not interferograms_in_generation:
-        message = "selected Network revision has no interferograms product collection"
-        logger.error(message)
-        raise IncompleteNetworkProductError(message)
-    if not interferograms_in_generation and not (root / "interferograms").is_dir():
-        message = "Network requires an interferograms/ product collection"
-        logger.error(message)
-        raise IncompleteNetworkProductError(message)
-    return generation_manifest
+    """Raised when a Network has no complete interferogram product set."""
 
 
 class NetworkContract:
-    """Small analysis base that owns a generation-scoped product index.
+    """Small analysis base that owns a snapshot of the product index.
 
     ``Network`` deliberately knows nothing about raster decoding.  A concrete
     Network or Stack supplies ``_analyze_network_products``; this base class
-    validates and snapshots the immutable product records before dispatching
-    analysis.  The snapshot prevents an index replacement from mixing product
-    generations during one call.
+    validates and snapshots the product records before dispatching analysis.
+    The snapshot id is derived from the products' write ids, so an index
+    replacement cannot mix product sets during one call.
     """
 
     _network_generation_id: str | None = None
@@ -449,7 +65,7 @@ class NetworkContract:
 
     @property
     def network_generation_id(self) -> str | None:
-        """Return the committed generation currently visible to analysis."""
+        """Return the id of the product snapshot visible to analysis."""
         return getattr(self, "_network_generation_id", None)
 
     @property
@@ -459,7 +75,7 @@ class NetworkContract:
 
     @property
     def analysis_ready(self) -> bool:
-        """Whether a complete, homogeneous Network generation is available."""
+        """Whether a complete, homogeneous product snapshot is available."""
         return (
             self.network_generation_id is not None
             and self.network_product_index is not None
@@ -472,20 +88,20 @@ class NetworkContract:
             NetworkProductIndex | tuple[NetworkProduct, ...] | list[NetworkProduct]
         ),
     ) -> Self:
-        """Atomically replace the product index for one committed generation.
+        """Atomically replace the product index with one validated snapshot.
 
         Parameters
         ----------
         generation_id : str
-            Stable committed generation identity.
+            Snapshot identity derived from the products' write ids.
         products : NetworkProductIndex or sequence of NetworkProduct
-            Products read from that generation.  Validation completes before
-            either field on this object is changed.
+            Products of that snapshot.  Validation completes before either
+            field on this object is changed.
 
         Raises
         ------
         ValueError
-            If the generation identity is empty or products are mixed.
+            If the identity is empty or products are mixed.
 
         """
         _require_text(generation_id, "generation_id")
@@ -495,8 +111,8 @@ class NetworkContract:
             else NetworkProductIndex(tuple(products))
         )
         if not index.products:
-            logger.error("Network generation contains no products")
-            message = "Network generation requires at least one product"
+            logger.error("Network snapshot contains no products")
+            message = "Network snapshot requires at least one product"
             raise ValueError(message)
         index.homogeneous()
         object.__setattr__(self, "_network_product_index", index)
@@ -504,13 +120,13 @@ class NetworkContract:
         return self
 
     def analyze_time_series(self, *args: Any, **kwargs: Any) -> Any:
-        """Analyze the currently refreshed generation through the concrete seam."""
+        """Analyze the currently refreshed snapshot through the concrete seam."""
         index = self.network_product_index
         generation_id = self.network_generation_id
         if generation_id is None or index is None:
-            logger.error("Network analysis requested before generation refresh")
+            logger.error("Network analysis requested before a product refresh")
             message = (
-                "Network analysis is unavailable before a complete generation refresh"
+                "Network analysis is unavailable before a complete product refresh"
             )
             raise RuntimeError(message)
         callback = getattr(self, "_analyze_network_products", None)
@@ -525,80 +141,65 @@ class NetworkContract:
 
 
 class Network(NetworkContract):
-    """Concrete path-based view of one canonical InSAR Network."""
+    """View of the acquisition Network of one Stack work directory.
+
+    Parameters
+    ----------
+    root : str or os.PathLike
+        A Stack work directory (it holds ``stack.json``).
+
+    Raises
+    ------
+    NetworkPathError
+        If ``root`` is not a directory.
+    IncompleteNetworkProductError
+        If the planned Pair network has no complete IFG product set.
+
+    """
 
     readers: ClassVar[Any]
 
-    def __init__(
-        self,
-        root: str | PathLike[str],
-        *,
-        revision: str | None = None,
-    ) -> None:
-        """Mount and validate a canonical Network product."""
+    def __init__(self, root: str | PathLike[str]) -> None:
+        """Open the Stack at ``root`` and bind its committed products."""
         try:
             resolved_root = Path(root)
         except TypeError as exc:
             message = f"Network root must be path-like, got {root!r}"
             logger.exception(message)
             raise NetworkConstructionError(message) from exc
-        if not resolved_root.exists() or not resolved_root.is_dir():
+        if not resolved_root.is_dir():
             message = f"Network directory not found: {resolved_root}"
             logger.error(message)
             raise NetworkPathError(message)
-        self.manifest = _validate_network_layout(resolved_root, revision=revision)
-        self.generation_root = (
-            resolved_root
-            / NETWORK_GENERATIONS_NAME
-            / str(self.manifest["generation_id"])
-        )
-        # Network owns the path-level data facade directly. Sharing the
-        # component Dataset readers avoids inheriting broader discovery and
-        # fallback rules from an unrelated lifecycle facade.
-        self._root = resolved_root
-        geometry_root = resolved_root / "geometry"
-        self._geometry = (
-            NetworkGeometry(geometry_root) if geometry_root.is_dir() else None
-        )
-        generation_interferograms_root = self.generation_root / "interferograms"
-        interferograms_root = generation_interferograms_root
-        if revision is None and not interferograms_root.is_dir():
-            interferograms_root = resolved_root / "interferograms"
-        index_path = interferograms_root / "interferograms_index.json"
-        index_version = None
-        if index_path.is_file():
-            try:
-                index_version = json.loads(index_path.read_text()).get("version")
-            except (OSError, UnicodeError, ValueError, AttributeError):
-                index_version = None
-        if index_version == "stack_artifact_v1":
-            from faninsar.network.readers.stack import StackInterferogramCollection
+        from faninsar.stack.session import Stack
 
-            self._interferograms = StackInterferogramCollection(
-                interferograms_root.parent
+        stack = Stack.open(resolved_root)
+        if not stack.analysis_ready:
+            message = (
+                f"Stack at {resolved_root} has no complete interferogram product set"
             )
-        else:
-            self._interferograms = InterferogramCollection(interferograms_root)
-        timeseries_root = resolved_root / "timeseries"
-        self._timeseries = (
-            NetworkTimeSeries(timeseries_root) if timeseries_root.is_dir() else None
-        )
-        self._product_index: Any = None
-        self._network_generation_id = str(self.manifest["generation_id"])
-        index = self.interferograms.index_metadata if self.interferograms else None
-        if index is None:
-            message = "Network interferograms have no canonical index"
             logger.error(message)
             raise IncompleteNetworkProductError(message)
-        index_type = index.get("type", index.get("index_type"))
-        if index_type != NETWORK_INDEX_TYPE:
-            message = f"unknown Network index type {index_type!r}"
-            logger.error(message)
-            raise UnknownNetworkIndexTypeError(message)
-        if len(self.interferograms.pairs().names) == 0:
-            message = "Network interferogram index contains no products"
-            logger.error(message)
-            raise IncompleteNetworkProductError(message)
+        self._bind_stack(stack)
+
+    @classmethod
+    def _from_stack(cls, stack: Stack) -> Self:
+        """Return a view over an open Stack without reopening it."""
+        view = cls.__new__(cls)
+        view._bind_stack(stack)
+        return view
+
+    def _bind_stack(self, stack: Stack) -> None:
+        """Share one Stack's product index and readers."""
+        from faninsar.network.readers.stack import StackInterferogramCollection
+
+        self._root = stack.config.work_dir
+        self._geometry = None
+        self._interferograms = StackInterferogramCollection(stack)
+        self._timeseries = stack.timeseries
+        self._product_index = stack.network_product_index
+        self._network_generation_id = stack.network_generation_id
+        self._network_product_index = stack.network_product_index
 
     @classmethod
     def open(
@@ -606,24 +207,19 @@ class Network(NetworkContract):
         path: str | PathLike[str],
         *,
         reader: object | None = None,
-        revision: str | None = None,
         registry: object | None = None,
     ) -> Any:
-        """Open a canonical Network or an explicitly selected reader.
+        """Open a Stack work directory or an explicitly selected reader.
 
         Parameters
         ----------
         path : str or os.PathLike
-            Canonical Network root, or a source understood by a custom reader.
+            Stack work directory, or a source understood by a custom reader.
         reader : str, type, or NetworkReader, optional
-            ``None`` selects only the canonical FanInSAR layout.  A string is
-            resolved through ``registry`` or :attr:`readers`; a reader class
-            is constructed without arguments; and a reader instance is used
+            ``None`` opens a Stack work directory.  A string is resolved
+            through ``registry`` or :attr:`readers`; a reader class is
+            constructed without arguments; and a reader instance is used
             directly.  External layouts are never auto-probed.
-        revision : str, optional
-            Immutable generation identifier.  Canonical reads accept the
-            current generation only; custom readers receive this value and
-            must reject it if their format cannot address snapshots.
         registry : ReaderRegistry, optional
             Isolated registry used only with a string ``reader`` selector.
 
@@ -636,8 +232,6 @@ class Network(NetworkContract):
         ------
         TypeError
             If ``registry`` is supplied without a string reader selector.
-        NetworkGenerationError
-            If a canonical revision does not match the current generation.
         NetworkConstructionError
             If a selected reader cannot be instantiated or does not expose
             the required ``read`` method.
@@ -651,7 +245,7 @@ class Network(NetworkContract):
         if reader is None:
             # Canonical mode intentionally does not consult the entry-point
             # registry and therefore cannot probe an external layout.
-            return cls(path, revision=revision)
+            return cls(path)
 
         selected: object
         if isinstance(reader, str):
@@ -672,16 +266,7 @@ class Network(NetworkContract):
             message = "selected Network reader must define a callable read method"
             logger.error(message)
             raise NetworkConstructionError(message)
-        try:
-            return read(path, revision=revision)
-        except TypeError:
-            # A reader that cannot honor the explicit revision must fail
-            # honestly instead of falling back to a mutable current view.
-            if revision is not None:
-                message = "selected Network reader cannot honor revision"
-                logger.exception(message)
-                raise NetworkGenerationError(message) from None
-            raise
+        return read(path)
 
     @staticmethod
     def _instantiate_reader(reader: object, name: str) -> object:
@@ -709,12 +294,12 @@ class Network(NetworkContract):
 
     @property
     def interferograms(self) -> InterferogramCollection:
-        """Return the validated interferogram Dataset facade."""
+        """Return the interferogram Dataset facade."""
         return self._interferograms
 
     @property
-    def timeseries(self) -> NetworkTimeSeries | None:
-        """Return the optional time-series Dataset facade."""
+    def timeseries(self) -> Any:
+        """Return the time series of this Network, if one exists."""
         return self._timeseries
 
     def to_ifg_stack(self, *, pairs: Any = None) -> Any:
@@ -790,14 +375,18 @@ class Network(NetworkContract):
             message = f"Network product registration rejected: {exc}"
             logger.exception(message)
             raise NetworkConstructionError(message) from exc
-        # Keep the Dataset-facing registration and the shared generation
-        # contract on one immutable snapshot.  Stack uses the same protected
+        # Keep the Dataset-facing registration and the shared snapshot
+        # contract on one immutable index.  Stack uses the same protected
         # refresh operation directly; external Networks use this public path.
-        NetworkContract.refresh_generation(
-            self,
-            str(self.manifest["generation_id"]),
-            index,
-        )
+        snapshot_id = hashlib.sha256(
+            "|".join(
+                sorted(
+                    product.content_digest or product.canonical
+                    for product in index.products
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        NetworkContract.refresh_generation(self, snapshot_id, index)
         self._product_index = index
         return index
 
@@ -855,7 +444,8 @@ class Network(NetworkContract):
         Returns
         -------
         TimeSeries
-            Self-describing phase time series bound to this Network revision.
+            Self-describing phase time series, committed as the Network's
+            time-series product bound to the unwrap products it consumed.
 
         Raises
         ------
@@ -891,7 +481,7 @@ class Network(NetworkContract):
                 pair_phases,
                 device=kwargs.pop("device", "cpu"),
             )
-            return self._bind_analysis_revision(result)
+            return self._persist_result(result)
 
         return self._run_nsbas(stack, model=normalized_model, **kwargs)
 
@@ -942,7 +532,7 @@ class Network(NetworkContract):
             phase_cumulative_rad=cumulative_array,
             metadata={"method": "nsbas", "n_pairs": len(stack.pairs)},
         )
-        return self._bind_analysis_revision(result)
+        return self._persist_result(result)
 
     @staticmethod
     def _normalize_inversion_model(
@@ -1074,31 +664,39 @@ class Network(NetworkContract):
 
         return self._run_nsbas(stack, model=None, **kwargs)
 
-    def _bind_analysis_revision(self, result: Any) -> Any:
-        """Attach this Network generation to a returned time-series result."""
-        revision = self.network_generation_id or str(self.manifest["generation_id"])
-        if hasattr(result, "revision_id"):
-            from dataclasses import replace
+    def _persist_result(self, result: Any) -> Any:
+        """Commit a time-series result as this Network's time-series product.
 
-            updates: dict[str, Any] = {"revision_id": revision}
-            if hasattr(result, "spatial"):
-                updates["spatial"] = self._spatial_metadata_for_result(result)
-            from faninsar.timeseries import write_timeseries_product
+        The product Item records the ``write_id`` of every unwrap product the
+        result consumed, so it becomes stale when one is replaced.
+        """
+        from dataclasses import is_dataclass, replace
 
-            canonical_path = self.root / "timeseries"
-            bound = replace(result, **updates)
-            write_timeseries_product(bound, canonical_path)
-            self._timeseries = NetworkTimeSeries(canonical_path)
-            return replace(bound, canonical_path=canonical_path)
-        return result
+        if not is_dataclass(result) or not hasattr(result, "spatial"):
+            return result
+        from faninsar.timeseries.io import write_timeseries_product
+
+        bound = replace(result, spatial=self._spatial_metadata_for_result(result))
+        source = getattr(self.interferograms, "unwrap_write_ids", None)
+        inputs: dict[str, str] = {}
+        if callable(source):
+            available = source()
+            inputs = {pair_id: available[pair_id] for pair_id in bound.pair_ids}
+        path = write_timeseries_product(
+            bound,
+            self.root / "timeseries",
+            inputs=inputs,
+            properties={"faninsar:phase_source": "unwrap"} if inputs else None,
+            overwrite=True,
+        )
+        persisted = replace(bound, canonical_path=path)
+        self._timeseries = persisted
+        return persisted
 
     def __repr__(self) -> str:
         """Return a concise Network summary."""
         pair_count = len(self.interferograms.pairs()) if self.interferograms else 0
-        return (
-            f"Network(root={self.root!r}, "
-            f"generation={self.manifest['generation_id']!r}, pairs={pair_count})"
-        )
+        return f"Network(root={self.root!r}, pairs={pair_count})"
 
 
 # Keep one process-wide default registry on the canonical data-backed class.
@@ -1111,13 +709,8 @@ Network.readers = ReaderRegistry()
 
 __all__ = [
     "IncompleteNetworkProductError",
-    "LegacyNetworkLayoutError",
     "Network",
     "NetworkAnalysisError",
     "NetworkConstructionError",
-    "NetworkCurrentError",
-    "NetworkGenerationError",
-    "NetworkManifestError",
     "NetworkPathError",
-    "UnknownNetworkIndexTypeError",
 ]

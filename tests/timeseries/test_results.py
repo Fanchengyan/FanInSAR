@@ -11,10 +11,9 @@ import zarr
 if TYPE_CHECKING:
     from pathlib import Path
 
-from faninsar.io.storage.ifg_store import ArtifactResourceLimits
 from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.timeseries import TimeSeries, invert_unwrapped_pairs
-from faninsar.timeseries.io import open_timeseries_zarr, write_timeseries_zarr
+from faninsar.timeseries.io import read_timeseries, write_timeseries_product
 
 
 def _result_for_write() -> TimeSeries:
@@ -47,14 +46,16 @@ def test_invert_three_pair_network_and_write_zarr(tmp_path: Path) -> None:
     assert np.isfinite(result.phase_increments_rad).all()
     assert result.metadata["phase_unit"] == "radian"
 
-    store = write_timeseries_zarr(result, tmp_path / "ts.zarr")
-    assert store.exists()
-    with open_timeseries_zarr(store) as pinned:
-        group = zarr.open_group(str(pinned.path), mode="r")
-        assert "increments" in group
-        assert "cumulative" in group
-        assert "residual_pairs" in group
-        assert list(group.attrs["pair_ids"]) == sorted(pair_phases)
+    path = write_timeseries_product(result, tmp_path / "ts")
+    assert path == tmp_path / "ts"
+    reopened = read_timeseries(path)
+    assert reopened.pair_ids == result.pair_ids
+    np.testing.assert_array_equal(
+        reopened.phase_increments_rad, result.phase_increments_rad
+    )
+    np.testing.assert_array_equal(
+        reopened.residual_phase_pairs_rad, result.residual_phase_pairs_rad
+    )
 
 
 def test_public_timeseries_surface_uses_canonical_result() -> None:
@@ -134,67 +135,37 @@ def test_invert_rejects_invalid_wavelength(wavelength_m: float) -> None:
         )
 
 
-def test_timeseries_zarr_uses_current_and_hash_validated_generation(
-    tmp_path: Path,
-) -> None:
-    """Zarr publication is immutable, reopenable, and manifest-bound."""
-    root = tmp_path / "timeseries.zarr"
-    write_timeseries_zarr(_result_for_write(), root)
+def test_timeseries_product_round_trips_spatial_metadata(tmp_path: Path) -> None:
+    """A committed time-series product preserves its spatial grid on reopen."""
+    from dataclasses import replace
 
-    assert (root / "TIMESERIES_CURRENT").stat().st_size < 4096
-    assert not (root / "zarr.json").exists()
-    with open_timeseries_zarr(root) as store:
-        assert store.path.parent == root / ".timeseries_generations"
-        group = zarr.open_group(str(store.path), mode="r")
-        assert "cumulative" in group
+    from faninsar.timeseries.results import SpatialMetadata
 
-
-def test_timeseries_current_and_payload_tampering_fail_closed(tmp_path: Path) -> None:
-    """Forged CURRENT and modified Zarr bytes are rejected before opening."""
-    import json
-
-    root = tmp_path / "timeseries.zarr"
-    write_timeseries_zarr(_result_for_write(), root)
-    current = json.loads((root / "TIMESERIES_CURRENT").read_text())
-    current["generation_id"] = "0" * 32
-    (root / "TIMESERIES_CURRENT").write_text(json.dumps(current), encoding="utf-8")
-    with pytest.raises(InvalidProcessingStateError, match="CURRENT"):
-        open_timeseries_zarr(root)
-
-    second_root = tmp_path / "second.zarr"
-    write_timeseries_zarr(_result_for_write(), second_root)
-    with open_timeseries_zarr(second_root) as second_store:
-        second_generation = second_store.path
-    payload = next(
-        path
-        for path in second_generation.rglob("*")
-        if path.is_file() and path.name != "artifact_manifest.json"
+    bound = replace(
+        _result_for_write(),
+        spatial=SpatialMetadata(
+            domain="radar", shape=(2, 2), grid_identity="grid-test"
+        ),
     )
-    payload.write_bytes(payload.read_bytes() + b"tampered")
-    with pytest.raises(InvalidProcessingStateError, match="corrupted"):
-        open_timeseries_zarr(second_root)
-    assert root.exists()
+    root = tmp_path / "timeseries"
+    write_timeseries_product(bound, root)
+
+    reopened = read_timeseries(root)
+    assert reopened.spatial is not None
+    assert reopened.spatial.domain == "radar"
+    assert reopened.canonical_path == root
 
 
-def test_timeseries_quota_and_legacy_layout_fail_before_publication(
+def test_timeseries_product_records_inputs_and_rejects_silent_overwrite(
     tmp_path: Path,
 ) -> None:
-    """Resource exhaustion and legacy direct stores never become cache hits."""
-    root = tmp_path / "timeseries.zarr"
-    with pytest.raises(InvalidProcessingStateError, match="quota"):
-        write_timeseries_zarr(
-            _result_for_write(),
-            root,
-            resource_limits=ArtifactResourceLimits(
-                max_final_bytes=1,
-                max_temporary_bytes=1,
-                min_free_bytes=0,
-            ),
-        )
-    assert not (root / "TIMESERIES_CURRENT").exists()
+    """Inputs are recorded in the Item; a second commit needs ``overwrite``."""
+    root = tmp_path / "timeseries"
+    write_timeseries_product(
+        _result_for_write(), root, inputs={"20161207_20161231": "0" * 26}
+    )
+    from faninsar.io.storage.product import open_product
 
-    legacy = tmp_path / "legacy.zarr"
-    legacy.mkdir()
-    (legacy / "zarr.json").write_text("{}", encoding="utf-8")
-    with pytest.raises(InvalidProcessingStateError, match="legacy direct"):
-        write_timeseries_zarr(_result_for_write(), legacy)
+    assert open_product(root).inputs == {"20161207_20161231": "0" * 26}
+    with pytest.raises(InvalidProcessingStateError, match="already exists"):
+        write_timeseries_product(_result_for_write(), root)

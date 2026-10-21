@@ -77,7 +77,7 @@ def test_invert_without_model_uses_sbas(
 
 
 def test_invert_persists_canonical_timeseries_product(tmp_path: Path) -> None:
-    """Network inversion returns a result backed by canonical STAC+Zarr."""
+    """Network inversion commits a result as the Network's time-series product."""
     network, _ = _network(tmp_path)
 
     result = network.invert()
@@ -86,34 +86,30 @@ def test_invert_persists_canonical_timeseries_product(tmp_path: Path) -> None:
     assert result.canonical_path == canonical
     assert (canonical / "item.json").is_file()
     assert (canonical / "timeseries.zarr").is_dir()
-    from faninsar.timeseries.io import open_timeseries_zarr
+    from faninsar.io.storage.product import open_product
 
-    with open_timeseries_zarr(canonical / "timeseries.zarr") as opened:
-        assert opened.generation_id
+    assert open_product(canonical).write_id
 
 
 def test_repeated_and_subset_inversion_advances_canonical_generation(
     tmp_path: Path,
 ) -> None:
-    """Repeated Network inversions replace only the current Zarr generation."""
+    """Repeated Network inversions replace the committed time-series product."""
     network, _ = _network(tmp_path)
-    from faninsar.timeseries.io import open_timeseries_zarr
+    from faninsar.io.storage.product import open_product
 
     network.invert()
-    canonical_zarr = tmp_path / "timeseries" / "timeseries.zarr"
-    with open_timeseries_zarr(canonical_zarr) as opened:
-        first_generation = opened.generation_id
+    canonical = tmp_path / "timeseries"
+    first_write_id = open_product(canonical).write_id
 
     network.invert()
-    with open_timeseries_zarr(canonical_zarr) as opened:
-        second_generation = opened.generation_id
-    assert second_generation != first_generation
+    second_write_id = open_product(canonical).write_id
+    assert second_write_id != first_write_id
 
     subset = Pairs.from_names(["20240101_20240113", "20240113_20240125"])
     result = network.invert(pairs=subset)
     assert result.pair_ids == tuple(subset.to_names().tolist())
-    with open_timeseries_zarr(canonical_zarr) as opened:
-        assert opened.generation_id not in {first_generation, second_generation}
+    assert open_product(canonical).write_id not in {first_write_id, second_write_id}
 
 
 def test_invert_preserves_facade_spatial_metadata(tmp_path: Path) -> None:

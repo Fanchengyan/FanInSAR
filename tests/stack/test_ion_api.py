@@ -7,7 +7,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from faninsar.io.storage.ion_store import IonosphereArtifactStore
+from faninsar.io.storage.ion_store import (
+    IonosphereArtifactStore,
+    read_ion_correction_artifact,
+)
+from faninsar.io.storage.product import open_product
 from faninsar.io.storage.scene_store import write_scene
 from faninsar.missions.s1 import S1Stack
 from faninsar.processing.atmosphere import IonosphereEstimationConfig
@@ -114,39 +118,41 @@ def test_estimate_apply_and_invert_end_to_end(tmp_path: Path) -> None:
         finally:
             store.close()
 
-    # Full IFG + unwrap generation on the same network.
+    # Full IFG + per-Pair unwrap products on the same network.
     stack.form_interferograms(multilook=(1, 1))
     stack.unwrap(SpatialIRLS())
-    # Correction consumes the durable root generation, including after the
-    # in-memory generation lease has been refreshed from ``UNWRAP_CURRENT``.
-    stack.refresh_unwrap_generation()
 
     corrected = stack.apply_ionosphere_correction(ion_multilook=(1, 1))
     assert set(corrected) == set(expected_pair_screens)
+    # A repeated call reuses the corrections bound to the current products.
+    assert stack.apply_ionosphere_correction(ion_multilook=(1, 1)) == corrected
     unwrapped_stack = stack.network.interferograms.open_stack("unw_phase")
     for store in stores:
-        try:
-            pair_id = f"{store.pair[0]}_{store.pair[1]}"
-            ifg_store_path = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
-            from faninsar.io.storage.ion_store import (
-                read_ion_correction_artifact,
+        pair_id = f"{store.pair[0]}_{store.pair[1]}"
+        ifg_store_path = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
+        unwrapped = unwrapped_stack.sel(pair=pair_id).values
+        ion_screen = (
+            IonosphereArtifactStore.open(
+                stack.config.work_dir / "ion" / "ml_1x1" / pair_id
             )
+            .read()
+            .ionosphere_phase
+        )
+        np.testing.assert_allclose(
+            read_ion_correction_artifact(ifg_store_path),
+            unwrapped - ion_screen,
+            atol=1e-6,
+        )
 
-            unwrapped = unwrapped_stack.sel(pair=pair_id).values
-            ion_screen = (
-                IonosphereArtifactStore.open(
-                    stack.config.work_dir / "ion" / "ml_1x1" / pair_id
-                )
-                .read()
-                .ionosphere_phase
-            )
-            np.testing.assert_allclose(
-                read_ion_correction_artifact(ifg_store_path),
-                unwrapped - ion_screen,
-                atol=1e-6,
-            )
-        finally:
-            store.close()
+    raw = stack.invert_timeseries()
+    ion_corrected = stack.invert_timeseries(ionosphere_corrected=True, overwrite=True)
+    item = open_product(stack.config.work_dir / "timeseries")
+    assert item.properties["faninsar:phase_source"] == "ion_corrected"
+    assert set(item.inputs) == set(expected_pair_screens)
+    assert not np.allclose(
+        np.nan_to_num(raw.phase_cumulative_rad),
+        np.nan_to_num(ion_corrected.phase_cumulative_rad),
+    )
 
     result = stack.invert_ionosphere_dates(ion_multilook=(1, 1))
     assert result.dates == DATES

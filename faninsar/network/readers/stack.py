@@ -1,179 +1,126 @@
-"""Network-facing views over committed Stack interferogram products."""
+"""Network-facing view over the committed products of a Stack (PROPOSAL-0059).
+
+The collection reads ``ifg/ml_AxR/<pair>`` and ``unwrap/ml_AxR/<pair>``
+products in place; nothing is copied into a second layout.
+"""
 
 from __future__ import annotations
 
-import json
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import xarray as xr
 
-from faninsar.io.storage._zarr_stac import read_zarr_array
-from faninsar.network.readers.interferogram import (
-    InterferogramCollection,
-)
+from faninsar.network.readers.interferogram import InterferogramCollection
 
 if TYPE_CHECKING:
+    from faninsar.io.storage.ifg_store import InterferogramArtifactStore
     from faninsar.stack.session import Stack
+
+_ASSETS = ("complex_ifg", "unw_phase", "wrapped_phase", "amplitude", "coherence")
 
 
 class StackInterferogramCollection(InterferogramCollection):
-    """Read-only interferogram collection backed by a committed Stack.
+    """Read-only interferogram collection backed by a Stack work directory.
 
-    The Stack artifact store is the canonical STAC+Zarr producer format. This collection
-    exposes the same pair-level Dataset surface used by :class:`Network`,
-    without copying products into a second on-disk layout.
+    Parameters
+    ----------
+    stack : Stack
+        The Stack whose planned Pair network and multilook select the
+        products.
+
     """
 
-    def __init__(self, stack: Stack | str | Path) -> None:
-        """Bind the collection to a Stack or an exported Stack root."""
-        self._stack = stack if hasattr(stack, "config") else None
-        self._root = Path(stack) / "interferograms" if self._stack is None else None
-        self._index = self.index_metadata
+    def __init__(self, stack: Stack) -> None:
+        """Bind the collection to a Stack."""
+        self._stack = stack
 
     @property
     def root(self) -> Path:
-        """Return the committed Stack IFG artifact view root."""
-        if self._root is not None:
-            return self._root
-        assert self._stack is not None
+        """Return the IFG product directory of the configured multilook."""
         looks = self._stack.config.multilook
         return self._stack.config.work_dir / "ifg" / f"ml_{looks[0]}x{looks[1]}"
 
     @property
     def index_metadata(self) -> dict[str, Any]:
         """Return the Network index metadata for the committed Pair set."""
-        if self._stack is None:
-            index_path = self.root / "interferograms_index.json"
-            if not index_path.is_file():
-                raise FileNotFoundError(index_path)
-            return json.loads(index_path.read_text(encoding="utf-8"))
-        assert self._stack is not None
-        pair_names = [f"{first}_{second}" for first, second in self._pair_dates()]
         stores = self._stores()
-        try:
-            assets_by_pair: dict[str, list[str]] = {}
-            for pair_name, store in zip(pair_names, stores, strict=True):
-                assets = ["complex_ifg", "wrapped_phase", "amplitude"]
-                if "coherence" in store._payloads:
-                    assets.append("coherence")
-                if (
-                    self._stack._unwrap_generation is not None
-                    or (store.root / "UNWRAP_CURRENT").is_file()
-                ):
-                    assets.append("unw_phase")
-                assets_by_pair[pair_name] = assets
-        finally:
-            for store in stores:
-                store.close()
+        assets_by_pair: dict[str, list[str]] = {}
+        for store in stores:
+            assets = ["complex_ifg", "wrapped_phase", "amplitude"]
+            if "coherence" in store._payloads:
+                assets.append("coherence")
+            if store.has_unwrapped():
+                assets.append("unw_phase")
+            assets_by_pair[_pair_id(store)] = assets
         return {
             "type": "NetworkInterferogramIndex",
-            "version": "stack_ifg_artifact_v1",
-            "pair_count": len(pair_names),
-            "pairs": pair_names,
+            "pair_count": len(stores),
+            "pairs": [_pair_id(store) for store in stores],
             "assets_by_pair": assets_by_pair,
             "common_grid": True,
         }
 
     @property
     def spatial_metadata(self) -> dict[str, Any]:
-        """Return common manifest-bound spatial metadata for this collection.
+        """Return the common spatial metadata of the IFG products.
 
         Returns
         -------
         dict
-            A read-only-by-convention mapping containing ``domain``, ``shape``,
-            ``grid_identity``, and optional ``crs``/``transform``. Radar
-            collections omit geographic metadata instead of fabricating it.
+            ``domain``, ``shape``, ``grid_identity``, and for geo products
+            ``crs``/``transform``. Radar collections omit geographic metadata
+            instead of fabricating it.
 
         """
-        if self._stack is None:
-            metadata = self.index_metadata.get("spatial_metadata", {})
-            if not isinstance(metadata, dict):
-                message = "Stack spatial metadata is invalid"
-                raise ValueError(message)
-            return dict(metadata)
         stores = self._stores()
-        try:
-            if not stores:
-                message = "Stack has no interferogram stores"
-                raise ValueError(message)
-            first = stores[0]
-            values = {
-                "domain": first.domain,
-                "shape": list(first.shape),
-                "grid_identity": first.grid_identity,
-            }
-            if first.crs is not None:
-                values["crs"] = first.crs
-            if first.transform is not None:
-                values["transform"] = list(first.transform)
-            return values
-        finally:
-            for store in stores:
-                store.close()
-
-    def _pair_dates(self) -> list[tuple[str, str]]:
-        """Return the Stack's immutable Pair order."""
-        assert self._stack is not None
-        from faninsar.stack.session import _iter_pair_dates
-
-        return _iter_pair_dates(self._stack.pairs)
+        if not stores:
+            message = "Stack has no interferogram products"
+            raise ValueError(message)
+        first = stores[0]
+        values: dict[str, Any] = {
+            "domain": first.domain,
+            "shape": list(first.shape),
+            "grid_identity": first.grid_identity,
+        }
+        if first.crs is not None:
+            values["crs"] = first.crs
+        if first.transform is not None:
+            values["transform"] = list(first.transform)
+        return values
 
     def pairs(self) -> Any:
-        """Return the committed Stack Pair graph."""
+        """Return the planned Stack Pair graph."""
         from faninsar.core import Pairs
+        from faninsar.stack.session import _iter_pair_dates
 
-        if self._stack is None:
-            return Pairs.from_names(self.index_metadata.get("pairs", []))
-        assert self._stack is not None
         return Pairs.from_names(
-            [f"{first}_{second}" for first, second in self._pair_dates()]
+            [
+                f"{first}_{second}"
+                for first, second in _iter_pair_dates(self._stack.pairs)
+            ]
         )
 
-    def _stores(self) -> list[Any]:
-        """Open the exact validated artifact set for this Stack."""
-        assert self._stack is not None
-        return self._stack._pair_artifact_stores(
-            looks=self._stack.config.multilook,
-            ifg_root=None,
-        )
+    def _stores(self) -> list[InterferogramArtifactStore]:
+        """Open the exact planned IFG product set."""
+        return self._stack._pair_artifact_stores(looks=self._stack.config.multilook)
 
-    def _array(self, store: Any, name: str) -> np.ndarray:
-        """Read one validated named layer from a pinned artifact store."""
-        if self._stack is None:
-            path = self.path(str(store), name)
-            try:
-                return read_zarr_array(path)
-            except (OSError, ValueError) as error:
-                raise FileNotFoundError(path) from error
-        assert self._stack is not None
+    def _array(self, store: InterferogramArtifactStore, name: str) -> np.ndarray:
+        """Read one named layer of one Pair."""
         if name == "unw_phase":
-            generation = self._stack._unwrap_generation
-            if generation is None:
-                return np.asarray(store.read_unwrapped().unwrapped_phase)
-            pair_id = f"{store.pair[0]}_{store.pair[1]}"
-            return np.asarray(generation.products[pair_id]["unwrapped_phase"])
+            return np.asarray(store.read_unwrapped().unwrapped_phase)
         artifact = store.read()
-        try:
-            if name == "coherence":
-                if artifact.coherence is None:
-                    message = "coherence is not present"
-                    raise FileNotFoundError(message)
-                value = artifact.coherence
-            elif name == "wrapped_phase":
-                value = artifact.wrapped_phase
-            elif name == "amplitude":
-                value = artifact.amplitude
-            elif name == "complex_ifg":
-                value = artifact.complex_ifg
-            else:
-                message = f"unknown Stack interferogram asset: {name}"
-                raise ValueError(message)
-        finally:
-            del artifact
-        return np.asarray(value)
+        if name == "coherence":
+            if artifact.coherence is None:
+                message = "coherence is not present"
+                raise FileNotFoundError(message)
+            return np.asarray(artifact.coherence)
+        if name not in {"wrapped_phase", "amplitude", "complex_ifg"}:
+            message = f"unknown Stack interferogram asset: {name}"
+            raise ValueError(message)
+        return np.asarray(getattr(artifact, name))
 
     def open_stack(
         self,
@@ -182,28 +129,15 @@ class StackInterferogramCollection(InterferogramCollection):
         pairs: Any = None,
         chunks: Any = None,
     ) -> xr.DataArray:
-        """Open a named Stack asset across the committed Pair network."""
+        """Open a named asset across the planned Pair network."""
         del chunks
         requested = (
             self.pairs().to_names().tolist()
             if pairs is None
             else pairs.to_names().tolist()
         )
-        if self._stack is None:
-            arrays = [self._array(pair, name) for pair in requested]
-            return xr.DataArray(
-                np.stack(arrays, axis=0),
-                dims=("pair", "y", "x"),
-                coords={"pair": requested},
-                name=name,
-            )
-        stores = self._stores()
-        try:
-            by_pair = {f"{store.pair[0]}_{store.pair[1]}": store for store in stores}
-            arrays = [self._array(by_pair[pair], name) for pair in requested]
-        finally:
-            for store in stores:
-                store.close()
+        by_pair = {_pair_id(store): store for store in self._stores()}
+        arrays = [self._array(by_pair[pair], name) for pair in requested]
         return xr.DataArray(
             np.stack(arrays, axis=0),
             dims=("pair", "y", "x"),
@@ -212,15 +146,9 @@ class StackInterferogramCollection(InterferogramCollection):
         )
 
     def open(self, pair: str, name: str, **kwargs: Any) -> xr.DataArray:
-        """Open one named Stack asset for a Pair."""
+        """Open one named asset of one Pair."""
         del kwargs
-        pair_name = str(pair)
-        if self._stack is None:
-            return xr.DataArray(
-                self._array(str(pair), name), dims=("y", "x"), name=name
-            )
-        data = self.open_stack(name)
-        return data.sel(pair=pair_name, drop=True)
+        return self.open_stack(name).sel(pair=str(pair), drop=True)
 
     def exists(self, pair: str, name: str) -> bool:
         """Return whether a named asset is committed for a Pair."""
@@ -231,48 +159,24 @@ class StackInterferogramCollection(InterferogramCollection):
         return True
 
     def path(self, pair: str, name: str) -> Path:
-        """Return the Stack artifact path for one pair asset."""
-        if name not in {
-            "unw_phase",
-            "wrapped_phase",
-            "amplitude",
-            "coherence",
-            "complex_ifg",
-        }:
+        """Return the product path of one Pair asset."""
+        if name not in _ASSETS:
             message = f"unknown Stack interferogram asset: {name}"
             raise ValueError(message)
-        if self._stack is not None:
-            stores = self._stores()
-            try:
-                selected = next(
-                    store
-                    for store in stores
-                    if f"{store.pair[0]}_{store.pair[1]}" == str(pair)
-                )
-                if name == "unw_phase":
-                    generation = self._stack._unwrap_generation
-                    if generation is None:
-                        from faninsar.io.storage.artifact_transaction import (
-                            open_current_generation,
-                        )
-
-                        if not (selected.root / "UNWRAP_CURRENT").is_file():
-                            raise FileNotFoundError(selected.root / "UNWRAP_CURRENT")
-                        opened = open_current_generation(selected.root, "unwrap")
-                        try:
-                            return opened.path / "unwrapped_phase.zarr"
-                        finally:
-                            opened.lease.close()
-                    pair_id = f"{selected.pair[0]}_{selected.pair[1]}"
-                    return generation.generation_root / pair_id / "unwrapped_phase.zarr"
-                return selected.generation_root / f"{name}.zarr"
-            finally:
-                for store in stores:
-                    store.close()
-        return self.root / str(pair) / f"{name}.zarr"
+        selected = next(
+            (store for store in self._stores() if _pair_id(store) == str(pair)),
+            None,
+        )
+        if selected is None:
+            raise KeyError(pair)
+        if name == "unw_phase":
+            if not selected.has_unwrapped():
+                raise FileNotFoundError(selected.unwrap_root)
+            return selected.unwrap_root / "unwrapped_phase.zarr"
+        return selected.root / f"{name}.zarr"
 
     def item(self, pair: str) -> dict[str, Any]:
-        """Return a generated item-like record for one Stack Pair."""
+        """Return an item-like record for one Stack Pair."""
         if str(pair) not in self.pairs().to_names().tolist():
             raise KeyError(pair)
         return {
@@ -280,45 +184,67 @@ class StackInterferogramCollection(InterferogramCollection):
             "pair": str(pair),
             "assets": {
                 name: {"href": str(self.path(str(pair), name))}
-                for name in (
-                    "complex_ifg",
-                    "unw_phase",
-                    "wrapped_phase",
-                    "amplitude",
-                    "coherence",
-                )
+                for name in _ASSETS
                 if self.exists(str(pair), name)
             },
         }
 
     def summary(self) -> dict[str, Any]:
-        """Return a summary of the committed Stack artifact collection."""
+        """Return a summary of the committed Stack products."""
+        index = self.index_metadata
         return {
             "root": str(self.root),
-            "pair_count": len(self.pairs()),
-            "pairs": self.pairs().to_names().tolist(),
-            "assets_by_pair": self.index_metadata.get("assets_by_pair", {}),
-            "common_grid": bool(self.index_metadata.get("common_grid", True)),
+            "pair_count": index["pair_count"],
+            "pairs": index["pairs"],
+            "assets_by_pair": index["assets_by_pair"],
+            "common_grid": True,
+        }
+
+    def unwrap_write_ids(self) -> dict[str, str]:
+        """Return the ``write_id`` of each Pair's current unwrap product."""
+        return {
+            _pair_id(store): store.unwrap_product().write_id for store in self._stores()
         }
 
     def to_zarr_stack(
         self,
         name: str = "unw_phase",
         *,
-        zarr_path: str | Path | None = None,
+        zarr_path: str | Path,
         chunks: tuple[int, int, int] = (1, 512, 512),
         overwrite: bool = False,
     ) -> Path:
-        """Write Stack NPY artifacts as one xarray Zarr cube."""
-        out = Path(zarr_path) if zarr_path is not None else self.root / f"{name}.zarr"
+        """Export one asset across the Pair network as an xarray Zarr cube.
+
+        Parameters
+        ----------
+        name : str, optional
+            Asset to export.
+        zarr_path : str or pathlib.Path
+            Destination outside the Stack product tree.
+        chunks : tuple[int, int, int], optional
+            ``(pair, y, x)`` chunking.
+        overwrite : bool, optional
+            Replace an existing destination.
+
+        Returns
+        -------
+        pathlib.Path
+            The written Zarr store.
+
+        """
+        out = Path(zarr_path)
         if out.exists() and not overwrite:
             raise FileExistsError(out)
         if out.exists():
-            import shutil
-
             shutil.rmtree(out)
         data = self.open_stack(name).chunk(
             {"pair": chunks[0], "y": chunks[1], "x": chunks[2]}
         )
         data.to_dataset(name=name).to_zarr(str(out), mode="w", consolidated=False)
         return out
+
+
+def _pair_id(store: InterferogramArtifactStore) -> str:
+    """Return the canonical Pair id of one IFG product."""
+    return f"{store.pair[0]}_{store.pair[1]}"

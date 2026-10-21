@@ -9,13 +9,11 @@ from faninsar.timeseries.export import (
     StacZarrExporter,
     TimeSeriesExporter,
     registry,
-    write_timeseries_product,
 )
 from faninsar.timeseries.invert import NSBAS, SBAS, invert
 from faninsar.timeseries.io import (
-    TimeSeriesZarrStore,
-    open_timeseries_zarr,
-    write_timeseries_zarr,
+    read_timeseries,
+    write_timeseries_product,
 )
 from faninsar.timeseries.models import (
     AnnualSemiannualSinusoidal,
@@ -71,7 +69,6 @@ __all__ = [
     "TimeSeries",
     "TimeSeriesExporter",
     "TimeSeriesModels",
-    "TimeSeriesZarrStore",
     "Uncertainty",
     "UncertaintyPropagation",
     "batch_lstsq",
@@ -83,9 +80,8 @@ __all__ = [
     "get_var_patch",
     "invert",
     "invert_unwrapped_pairs",
-    "open_timeseries_zarr",
+    "read_timeseries",
     "registry",
     "safe_remove",
     "write_timeseries_product",
-    "write_timeseries_zarr",
 ]

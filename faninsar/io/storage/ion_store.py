@@ -1,146 +1,46 @@
-"""Immutable manifest-bound storage for Stack ionosphere artifacts.
+"""Ionosphere products of a Stack (PROPOSAL-0036, PROPOSAL-0059).
 
-Ionosphere estimate stores live in their own namespace tree at
-``<ion_root>/ml_<az>x<rg>/<pair>/`` while correction generations are
-published inside the corresponding IFG pair directory (PROPOSAL-0036).
-They reuse the same transactional generation machinery as IFG and unwrap
-artifacts under the dedicated ``"ion"`` / ``"ion_correction"``
-namespaces, so qualified, degraded, and differently configured
-ionosphere generations can never silently resume or mix.
+A per-Pair ionosphere estimate is the product ``ion/ml_AxR/<pair>/`` (kind
+``ion``) bound to both scene write ids. The ionosphere-corrected unwrapped
+phase is the child product ``unwrap/ml_AxR/<pair>/ion_corrected/`` (kind
+``ion_corrected``) bound to the unwrap and ion write ids, so replacing the
+unwrap removes it and replacing the ion estimate makes it stale.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 import numpy as np
 
-from faninsar.io.storage.artifact_transaction import (
-    ArtifactResourceLimits,
-    GenerationLease,
-    commit_generation,
-    open_current_generation,
-    stage_generation,
-)
+from faninsar.io.storage._zarr_stac import read_zarr_array, write_zarr_array
 from faninsar.io.storage.ifg_store import (
-    _atomic_manifest,
-    _canonical_json,
-    _digest_bytes,
+    UNWRAP_KIND,
+    InterferogramArtifactStore,
+    _canonical_parameters,
     _is_sha256,
     _is_source_identity,
-    _store_root,
-    _validate_json_mapping,
-    _validate_shape,
-    _verified_manifest,
 )
+from faninsar.io.storage.product import Product, commit_product, open_product
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-    from pathlib import Path
 
 logger = setup_logger(__name__)
 
-
-def _atomic_save(path: Path, array: np.ndarray) -> None:
-    """Write one legacy ionosphere diagnostic as a durable NPY file.
-
-    Ionosphere artifacts retain their established diagnostic payload contract;
-    the STAC+Zarr migration applies to scene, IFG, and unwrap products only.
-    """
-    temporary = path.with_name(f".{path.name}.tmp")
-    with temporary.open("wb") as stream:
-        np.save(stream, array, allow_pickle=False)
-        stream.flush()
-        os.fsync(stream.fileno())
-    temporary.replace(path)
-
-
-def _ion_array_descriptor(path: Path, array: np.ndarray) -> dict[str, Any]:
-    """Build a descriptor for one NPY ionosphere diagnostic."""
-    from faninsar.io.storage._zarr_stac import digest_path
-
-    return {
-        "file": path.name,
-        "shape": [int(size) for size in array.shape],
-        "dtype": array.dtype.str,
-        "sha256": digest_path(path),
-    }
-
-
-def _validate_ion_payload_table(
-    root: Path,
-    raw_payloads: object,
-    expected_shape: tuple[int, int],
-) -> dict[str, dict[str, Any]]:
-    """Validate the NPY payload table used by ionosphere diagnostics."""
-    if not isinstance(raw_payloads, dict) or set(raw_payloads) != set(ION_FILENAMES):
-        reject_invalid_state("ion artifact payload table is incomplete")
-    payloads: dict[str, dict[str, Any]] = {}
-    for name, filename in ION_FILENAMES.items():
-        raw = raw_payloads[name]
-        if not isinstance(raw, dict) or raw.get("file") != filename:
-            reject_invalid_state(f"ion artifact payload descriptor is invalid: {name}")
-        if tuple(raw.get("shape", ())) != expected_shape:
-            reject_invalid_state(f"ion artifact payload shape mismatch: {name}")
-        try:
-            dtype = np.dtype(raw.get("dtype"))
-        except (TypeError, ValueError) as error:
-            reject_invalid_state(f"ion artifact payload dtype is invalid: {error}")
-        if dtype.hasobject or not _is_sha256(raw.get("sha256")):
-            reject_invalid_state(f"ion artifact payload metadata is unsafe: {name}")
-        path = root / filename
-        if not path.is_file() or path.is_symlink():
-            reject_invalid_state(f"ion artifact payload missing or unsafe: {path}")
-        payloads[name] = dict(raw)
-    return payloads
-
-
-def _read_ion_payloads(
-    root: Path,
-    descriptors: dict[str, dict[str, Any]],
-) -> dict[str, np.ndarray]:
-    """Hash, load, and validate NPY ionosphere diagnostics."""
-    from faninsar.io.storage._zarr_stac import digest_path
-
-    arrays: dict[str, np.ndarray] = {}
-    for name, descriptor in descriptors.items():
-        path = root / str(descriptor["file"])
-        if digest_path(path) != descriptor["sha256"]:
-            reject_invalid_state(f"ion artifact payload digest mismatch: {name}")
-        try:
-            array = np.load(path, allow_pickle=False)
-        except (OSError, ValueError, EOFError) as error:
-            reject_invalid_state(f"ion artifact payload cannot be loaded: {error}")
-        if (
-            array.shape != tuple(descriptor["shape"])
-            or array.dtype.str != descriptor["dtype"]
-        ):
-            reject_invalid_state(
-                f"ion artifact payload shape or dtype mismatch: {name}"
-            )
-        arrays[name] = array
-    return arrays
-
-
-ION_ARTIFACT_SCHEMA = "stack_ion_artifact_v1"
-ION_CORRECTION_SCHEMA = "stack_ion_correction_artifact_v1"
-ION_FILENAMES = {
-    "ionosphere_phase": "ionosphere_phase.npy",
-    "nondispersive_phase": "nondispersive_phase.npy",
-    "weight": "weight.npy",
-}
-ION_CORRECTION_FILENAMES = {
-    "corrected_unwrapped_phase": "corrected_unwrapped_phase.npy",
-}
+ION_KIND = "ion"
+ION_CORRECTED_KIND = "ion_corrected"
+ION_CORRECTED_NAME = "ion_corrected"
+_ION_LAYERS = ("ionosphere_phase", "nondispersive_phase", "weight")
 
 
 @dataclass(frozen=True, slots=True)
 class IonosphereArtifact:
-    """Validated arrays from one complete ionosphere generation.
+    """Layers of one ionosphere product.
 
     Attributes
     ----------
@@ -163,46 +63,44 @@ class IonosphereArtifact:
 
 @dataclass(frozen=True, slots=True)
 class IonosphereArtifactStore:
-    """Read-only validated access for one Stack pair ionosphere artifact.
+    """Read-only view of one committed ionosphere product.
 
     Attributes
     ----------
     root : pathlib.Path
-        Validated artifact directory.
+        Product directory ``ion/ml_AxR/<pair>``.
     pair : tuple[str, str]
         Primary and secondary acquisition identifiers.
     looks : tuple[int, int]
         Applied azimuth and range look factors of the ion grid.
     domain : str
-        Coordinate domain of the source scene generation.
+        Coordinate domain of the source scenes.
     wavelength_m : float | None
         Radar wavelength echoed from the source scenes.
     grid_identity : str
-        Canonical source scene coordinate-grid identity.
+        Source scene coordinate-grid identity.
     method_name : str
-        Estimation method recorded at publication.
+        Estimation method.
     method_parameters : dict[str, object]
-        Canonical JSON echo of the full lane configuration.
+        Strict-JSON echo of the lane configuration.
     degraded : bool
-        Whether this generation was published with the degraded flag.
+        Whether the estimate was committed as degraded.
     degradation_reason : str | None
-        Caller-supplied reason code required when ``degraded`` is true.
+        Reason code required when ``degraded`` is true.
     runtime_fingerprint : str
-        Canonical Stack runtime fingerprint bound at publication.
+        Stack runtime fingerprint bound at commit.
     devices : tuple[str, ...]
-        Resolved device list used by the estimation lane.
+        Devices used by the estimation lane.
     source_manifest_digests : dict[str, str]
-        Named source scene manifest digests.
+        Upstream scene write ids (``primary``/``secondary``).
     shape : tuple[int, int]
-        Shared ion-grid shape.
+        Ion-grid shape.
     manifest_digest : str
-        SHA-256 digest of the canonical manifest.
+        The product ``write_id`` (dependents bind it).
 
     """
 
     root: Path
-    generation_id: str
-    generation_root: Path
     pair: tuple[str, str]
     looks: tuple[int, int]
     domain: str
@@ -217,37 +115,33 @@ class IonosphereArtifactStore:
     source_manifest_digests: dict[str, str]
     shape: tuple[int, int]
     manifest_digest: str
-    _payloads: dict[str, dict[str, Any]]
-    _lease: GenerationLease
+
+    @property
+    def write_id(self) -> str:
+        """Return the product write id."""
+        return self.manifest_digest
 
     @classmethod
     def open(cls, root: str | Path) -> Self:
-        """Open and validate a complete ionosphere generation."""
-        path = _store_root(root, create=False)
-        direct_payloads = [path / filename for filename in ION_FILENAMES.values()]
-        if any(payload.exists() for payload in direct_payloads):
-            reject_invalid_state(
-                "direct ionosphere payload layout is not supported; ionosphere "
-                "artifacts are transactional generations"
-            )
-        opened = open_current_generation(path, "ion")
-        try:
-            manifest = _verified_manifest(
-                opened.path / "ion_manifest.json", ION_ARTIFACT_SCHEMA
-            )
-            if manifest.get("manifest_digest") != opened.manifest_digest:
-                reject_invalid_state("ion CURRENT digest does not match its generation")
-        except Exception:
-            opened.lease.close()
-            raise
-        raw_pair = manifest.get("pair")
+        """Open one committed ionosphere product.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If the directory is not a committed ion product or its metadata
+            is inconsistent.
+
+        """
+        product = open_product(root, kind=ION_KIND)
+        p = product.properties
+        raw_pair = p.get("faninsar:pair")
         if (
             not isinstance(raw_pair, list)
             or len(raw_pair) != 2
             or any(not isinstance(value, str) or not value for value in raw_pair)
         ):
             reject_invalid_state("ion artifact pair must contain two non-empty ids")
-        raw_looks = manifest.get("looks")
+        raw_looks = p.get("faninsar:looks")
         if (
             not isinstance(raw_looks, list)
             or len(raw_looks) != 2
@@ -257,110 +151,66 @@ class IonosphereArtifactStore:
             )
         ):
             reject_invalid_state("ion artifact looks must be two positive integers")
-        domain = manifest.get("domain")
-        if domain not in {"radar", "geo"}:
-            reject_invalid_state("ion artifact domain is invalid")
-        raw_wavelength = manifest.get("wavelength_m")
-        wavelength_m = None if raw_wavelength is None else float(raw_wavelength)
-        if wavelength_m is not None and (
-            not np.isfinite(wavelength_m) or wavelength_m <= 0.0
-        ):
-            reject_invalid_state("ion artifact wavelength_m is invalid")
-        grid_identity = manifest.get("grid_identity")
-        if not _is_sha256(grid_identity):
-            reject_invalid_state("ion artifact grid_identity is invalid")
-        raw_method = manifest.get("method")
+        raw_shape = p.get("faninsar:shape")
         if (
-            not isinstance(raw_method, dict)
-            or not isinstance(raw_method.get("name"), str)
-            or not raw_method["name"]
+            not isinstance(raw_shape, list)
+            or len(raw_shape) != 2
+            or any(not isinstance(value, int) or value <= 0 for value in raw_shape)
         ):
+            reject_invalid_state("ion artifact shape is invalid")
+        raw_method = p.get("faninsar:method")
+        if not isinstance(raw_method, dict) or not raw_method.get("name"):
             reject_invalid_state("ion artifact method metadata is invalid")
-        method_parameters = _validate_json_mapping(
-            raw_method.get("parameters"), "ion method parameters"
-        )
-        degraded = manifest.get("degraded")
+        degraded = p.get("faninsar:degraded")
         if not isinstance(degraded, dict) or not isinstance(degraded.get("flag"), bool):
             reject_invalid_state("ion artifact degraded metadata is invalid")
-        degradation_reason = degraded.get("reason")
-        if degraded["flag"] and (
-            not isinstance(degradation_reason, str) or not degradation_reason
-        ):
-            reject_invalid_state("degraded ion artifacts require a degradation reason")
-        if not degraded["flag"] and degradation_reason is not None:
-            reject_invalid_state(
-                "qualified ion artifacts must not carry a degradation reason"
-            )
-        runtime_fingerprint = manifest.get("runtime_fingerprint")
-        if not _is_sha256(runtime_fingerprint):
-            reject_invalid_state("ion artifact runtime fingerprint is invalid")
-        raw_devices = manifest.get("devices")
-        if (
-            not isinstance(raw_devices, list)
-            or not raw_devices
-            or any(not isinstance(value, str) or not value for value in raw_devices)
-        ):
-            reject_invalid_state("ion artifact device list is invalid")
-        sources = manifest.get("source_manifest_digests")
-        if (
-            not isinstance(sources, dict)
-            or not sources
-            or any(
-                not isinstance(name, str) or not name or not _is_source_identity(digest)
-                for name, digest in sources.items()
-            )
-        ):
-            reject_invalid_state("ion artifact source manifest digests are invalid")
-        shape = _validate_shape(manifest.get("shape"), "ion shape")
-        payloads = _validate_ion_payload_table(
-            opened.path, manifest.get("payloads"), shape
-        )
+        missing = [name for name in _ION_LAYERS if name not in product.assets]
+        if missing:
+            reject_invalid_state(f"ion product is missing layers: {missing}")
+        raw_wavelength = p.get("faninsar:wavelength_m")
+        reason = degraded.get("reason")
         return cls(
-            root=path,
-            generation_id=opened.generation_id,
-            generation_root=opened.path,
+            root=product.path,
             pair=(raw_pair[0], raw_pair[1]),
             looks=(raw_looks[0], raw_looks[1]),
-            domain=str(domain),
-            wavelength_m=wavelength_m,
-            grid_identity=str(grid_identity),
+            domain=str(p.get("faninsar:domain")),
+            wavelength_m=None if raw_wavelength is None else float(raw_wavelength),
+            grid_identity=str(p.get("faninsar:grid_identity")),
             method_name=str(raw_method["name"]),
-            method_parameters=method_parameters,
-            degraded=bool(degraded["flag"]),
-            degradation_reason=(
-                None if degradation_reason is None else str(degradation_reason)
+            method_parameters=_canonical_parameters(
+                raw_method.get("parameters", {}), "ion method parameters"
             ),
-            runtime_fingerprint=str(runtime_fingerprint),
-            devices=tuple(str(value) for value in raw_devices),
-            source_manifest_digests={str(k): str(v) for k, v in sources.items()},
-            shape=shape,
-            manifest_digest=str(manifest["manifest_digest"]),
-            _payloads=payloads,
-            _lease=opened.lease,
+            degraded=bool(degraded["flag"]),
+            degradation_reason=None if reason is None else str(reason),
+            runtime_fingerprint=str(p.get("faninsar:runtime_fingerprint")),
+            devices=tuple(str(value) for value in p.get("faninsar:devices", [])),
+            source_manifest_digests=dict(product.inputs),
+            shape=(raw_shape[0], raw_shape[1]),
+            manifest_digest=product.write_id,
         )
 
     def close(self) -> None:
-        """Release this store's durable reader pin."""
-        self._lease.close()
+        """Release nothing; products are not leased."""
 
     def __enter__(self) -> Self:
-        """Return this pinned store as a context manager."""
+        """Return the store."""
         return self
 
     def __exit__(self, *_: object) -> None:
-        """Release the generation pin on context-manager exit."""
-        self.close()
+        """Release nothing."""
 
     def read(self) -> IonosphereArtifact:
-        """Read all ionosphere layers after full payload revalidation."""
-        arrays = _read_ion_payloads(self.generation_root, self._payloads)
-        if any(arrays[name].dtype.kind != "f" for name in ION_FILENAMES):
-            reject_invalid_state("ion artifact layer dtypes are incompatible")
-        return IonosphereArtifact(
-            ionosphere_phase=arrays["ionosphere_phase"],
-            nondispersive_phase=arrays["nondispersive_phase"],
-            weight=arrays["weight"],
-        )
+        """Read all ionosphere layers after validating shapes and dtypes."""
+        product = open_product(self.root, kind=ION_KIND)
+        arrays = {
+            name: read_zarr_array(product.asset_path(name)) for name in _ION_LAYERS
+        }
+        if any(
+            array.shape != self.shape or array.dtype.kind != "f"
+            for array in arrays.values()
+        ):
+            reject_invalid_state("ion artifact layer shapes or dtypes are incompatible")
+        return IonosphereArtifact(**arrays)
 
 
 def write_ionosphere_artifact(
@@ -381,53 +231,48 @@ def write_ionosphere_artifact(
     ionosphere_phase: np.ndarray,
     nondispersive_phase: np.ndarray,
     weight: np.ndarray,
-    resource_limits: ArtifactResourceLimits | None = None,
     replace_existing: bool = False,
 ) -> IonosphereArtifactStore:
-    """Atomically persist one complete ionosphere generation.
+    """Commit one ionosphere product.
 
     Parameters
     ----------
     root : str or pathlib.Path
-        Destination artifact directory (``ml_<az>x<rg>/<pair>`` under the
-        ion artifact root).
+        Product directory ``ion/ml_AxR/<pair>``.
     pair : tuple[str, str]
         Primary and secondary acquisition identifiers.
     looks : tuple[int, int]
         Applied azimuth and range look factors of the ion grid.
     domain : {"radar", "geo"}
-        Coordinate domain of the source scene generation.
+        Coordinate domain of the source scenes.
     wavelength_m : float, optional
         Radar wavelength echoed from the source scenes.
     grid_identity : str
-        Canonical source scene coordinate-grid identity.
+        Source scene coordinate-grid identity (SHA-256).
     method_name : str
         Estimation method name (``"ionosphere_split_spectrum"``).
     method_parameters : mapping
-        Canonical JSON echo of the full lane configuration.
+        Strict-JSON echo of the lane configuration.
     degraded : bool
-        Whether this generation is marked degraded.
+        Whether this estimate is marked degraded.
     degradation_reason : str, optional
         Required non-empty reason when ``degraded`` is true; forbidden
         otherwise.
     runtime_fingerprint : str
-        Canonical Stack runtime fingerprint (SHA-256).
+        Stack runtime fingerprint (SHA-256).
     devices : sequence of str
-        Resolved device list used by the estimation lane.
+        Devices used by the estimation lane.
     source_manifest_digests : mapping[str, str]
-        Named SHA-256 digests of every consumed scene manifest.
+        Upstream scene write ids, recorded as Item inputs.
     ionosphere_phase, nondispersive_phase, weight : numpy.ndarray
         Matching two-dimensional float layers.
-    resource_limits : ArtifactResourceLimits, optional
-        Transactional generation resource bounds (leases, staging size).
     replace_existing : bool, optional
-        Republish over an already-published generation when true; the
-        default refuses to overwrite a current generation.
+        Replace an existing product.
 
     Returns
     -------
     IonosphereArtifactStore
-        Reopened, validated artifact store.
+        The committed product.
 
     """
     arrays = {
@@ -441,7 +286,7 @@ def write_ionosphere_artifact(
     shape = next(iter(shapes))
     if len(shape) != 2 or any(size <= 0 for size in shape):
         reject_invalid_state("ion artifact layers must be non-empty 2-D arrays")
-    if any(arrays[name].dtype.kind != "f" for name in arrays):
+    if any(array.dtype.kind != "f" for array in arrays.values()):
         reject_invalid_state("ion artifact layer dtypes must be floating point")
     devices_tuple = tuple(str(value) for value in devices)
     if (
@@ -473,219 +318,173 @@ def write_ionosphere_artifact(
         reject_invalid_state(
             "qualified ion artifacts must not carry a degradation reason"
         )
-    parameters = dict(method_parameters)
-    _canonical_json(parameters)
     sources = dict(source_manifest_digests)
     if not sources or any(
-        not isinstance(name, str) or not name or not _is_source_identity(digest)
-        for name, digest in sources.items()
+        not isinstance(name, str) or not name or not _is_source_identity(value)
+        for name, value in sources.items()
     ):
         reject_invalid_state("ion artifact source manifest digests are invalid")
+    properties = {
+        "faninsar:pair": list(pair),
+        "faninsar:looks": [int(looks[0]), int(looks[1])],
+        "faninsar:domain": domain,
+        "faninsar:shape": [int(shape[0]), int(shape[1])],
+        "faninsar:wavelength_m": wavelength_m,
+        "faninsar:grid_identity": grid_identity,
+        "faninsar:method": {
+            "name": method_name,
+            "parameters": _canonical_parameters(
+                dict(method_parameters), "ion method parameters"
+            ),
+        },
+        "faninsar:degraded": {"flag": bool(degraded), "reason": degradation_reason},
+        "faninsar:runtime_fingerprint": runtime_fingerprint,
+        "faninsar:devices": list(devices_tuple),
+    }
 
-    path = _store_root(root, create=True)
-    estimated_bytes = sum(int(array.nbytes) + 1024 for array in arrays.values())
-    with stage_generation(
-        path,
-        "ion",
-        final_bytes=estimated_bytes,
-        temporary_bytes=estimated_bytes,
-        file_count=len(arrays) + 1,
-        dimensions=(int(shape[0]), int(shape[1])),
-        limits=resource_limits,
-    ) as (generation_id, staging):
-        if not replace_existing and (
-            (path / "ION_CURRENT").exists() or (path / "ion_manifest.json").exists()
-        ):
-            reject_invalid_state("ion artifact generation is already published")
-        descriptors: dict[str, dict[str, Any]] = {}
-        for name, filename in ION_FILENAMES.items():
-            payload_path = staging / filename
-            _atomic_save(payload_path, arrays[name])
-            descriptors[name] = _ion_array_descriptor(payload_path, arrays[name])
-        unsigned: dict[str, Any] = {
-            "schema_version": ION_ARTIFACT_SCHEMA,
-            "status": "complete",
-            "generation_id": generation_id,
-            "pair": list(pair),
-            "looks": list(looks),
-            "domain": domain,
-            "wavelength_m": wavelength_m,
-            "grid_identity": grid_identity,
-            "method": {"name": method_name, "parameters": parameters},
-            "degraded": {"flag": bool(degraded), "reason": degradation_reason},
-            "runtime_fingerprint": runtime_fingerprint,
-            "devices": list(devices_tuple),
-            "source_manifest_digests": sources,
-            "shape": [int(shape[0]), int(shape[1])],
-            "payloads": descriptors,
-        }
-        manifest = {
-            **unsigned,
-            "manifest_digest": _digest_bytes(_canonical_json(unsigned)),
-        }
-        _atomic_manifest(staging / "ion_manifest.json", manifest)
-        commit_generation(
-            path,
-            "ion",
-            generation_id,
-            staging,
-            manifest_digest=str(manifest["manifest_digest"]),
-            compatibility_manifest=manifest,
-        )
-    logger.info("Published ion artifact %s for pair %s", path, pair)
-    return IonosphereArtifactStore.open(path)
+    def write(staging: Path) -> dict[str, dict[str, Any]]:
+        for name, array in arrays.items():
+            write_zarr_array(staging / f"{name}.zarr", array)
+        return {name: {"href": f"{name}.zarr"} for name in arrays}
+
+    product = commit_product(
+        root,
+        kind=ION_KIND,
+        properties=properties,
+        write_payloads=write,
+        inputs=sources,
+        overwrite=replace_existing,
+    )
+    logger.info("Committed ion product %s for pair %s", product.path, pair)
+    return IonosphereArtifactStore.open(product.path)
+
+
+def ion_dir(work_dir: str | Path, pair_id: str, looks: tuple[int, int]) -> Path:
+    """Return the ion product directory ``work_dir/ion/ml_AxR/<pair>``."""
+    return Path(work_dir) / "ion" / f"ml_{int(looks[0])}x{int(looks[1])}" / pair_id
+
+
+def _current_unwrap(store: InterferogramArtifactStore) -> Product:
+    """Open the unwrap product bound to this exact IFG."""
+    unwrap = open_product(store.unwrap_root, kind=UNWRAP_KIND)
+    if unwrap.inputs.get("ifg") != store.write_id:
+        reject_invalid_state("unwrap artifact is bound to a different IFG")
+    return unwrap
 
 
 def write_ion_correction_artifact(
     root: str | Path,
     *,
     unwrapped_phase: np.ndarray,
-    ion_manifest_digest: str,
-    ifg_manifest_digest: str,
+    unwrap_write_id: str,
+    ion_write_id: str,
+    ion_looks: tuple[int, int],
     degraded_consumed: bool,
-    resource_limits: ArtifactResourceLimits | None = None,
     replace_existing: bool = False,
-) -> None:
-    """Atomically persist ion-corrected unwrapped phase for one pair.
+) -> Product:
+    """Commit the ionosphere-corrected unwrapped phase of one Pair.
 
-    The correction generation is published under the ``ion_correction``
-    namespace of the owning IFG pair directory, distinct from the
-    date-level reconciled products. Upstream IFG, unwrap, and ion layers
-    are never rewritten.
+    The product is the ``ion_corrected`` child of the Pair's unwrap product;
+    upstream IFG, unwrap, and ion layers are never rewritten.
 
     Parameters
     ----------
     root : str or pathlib.Path
-        Owning complete IFG pair artifact directory.
+        The interferogram product directory ``ifg/ml_AxR/<pair>``.
     unwrapped_phase : numpy.ndarray
-        Ion-corrected unwrapped phase with the IFG unwrap grid shape.
-    ion_manifest_digest : str
-        Digest of the consumed ion generation manifest.
-    ifg_manifest_digest : str
-        Digest of the owning IFG generation manifest.
+        Corrected unwrapped phase on the unwrap grid.
+    unwrap_write_id : str
+        ``write_id`` of the unwrap product that was corrected.
+    ion_write_id : str
+        ``write_id`` of the ion product that was subtracted.
+    ion_looks : tuple[int, int]
+        Look factors of the consumed ion product.
     degraded_consumed : bool
-        Whether a degraded ion generation was consumed under an explicit
-        ``allow_degraded`` admission.
-    resource_limits : ArtifactResourceLimits, optional
-        Hard publication size, file-count, and free-space limits.
+        Whether a degraded ion product was consumed under explicit admission.
     replace_existing : bool, optional
-        Publish a new correction generation when true.
+        Replace an existing correction.
+
+    Returns
+    -------
+    Product
+        The committed correction product.
 
     """
-    from faninsar.io.storage.ifg_store import InterferogramArtifactStore
-
     store = InterferogramArtifactStore.open(root)
-    try:
-        phase = np.asarray(unwrapped_phase)
-        if phase.shape != store.shape or phase.dtype.kind != "f":
-            reject_invalid_state(
-                "corrected phase must match the IFG shape as a float array"
-            )
-        if (
-            not _is_sha256(ion_manifest_digest)
-            or not _is_sha256(ifg_manifest_digest)
-            or ifg_manifest_digest != store.manifest_digest
-        ):
-            reject_invalid_state("ion correction digest binding is invalid")
-        arrays = {"corrected_unwrapped_phase": phase.astype(np.float32)}
-        estimated_bytes = sum(int(array.nbytes) + 1024 for array in arrays.values())
-        with stage_generation(
-            store.root,
-            "ion_correction",
-            final_bytes=estimated_bytes,
-            temporary_bytes=estimated_bytes,
-            file_count=len(arrays) + 1,
-            dimensions=store.shape,
-            limits=resource_limits,
-        ) as (generation_id, staging):
-            if not replace_existing and (
-                (store.root / "ION_CORRECTION_CURRENT").exists()
-                or (store.root / "ion_correction_manifest.json").exists()
-            ):
-                reject_invalid_state("ion correction generation is already published")
-            descriptors: dict[str, dict[str, Any]] = {}
-            for name, filename in ION_CORRECTION_FILENAMES.items():
-                payload_path = staging / filename
-                _atomic_save(payload_path, arrays[name])
-                descriptors[name] = _ion_array_descriptor(payload_path, arrays[name])
-            unsigned: dict[str, Any] = {
-                "schema_version": ION_CORRECTION_SCHEMA,
-                "status": "complete",
-                "generation_id": generation_id,
-                "ifg_generation_id": store.generation_id,
-                "ifg_manifest_digest": store.manifest_digest,
-                "ion_manifest_digest": ion_manifest_digest,
-                "degraded_consumed": bool(degraded_consumed),
-                "shape": list(store.shape),
-                "payloads": descriptors,
-            }
-            manifest = {
-                **unsigned,
-                "manifest_digest": _digest_bytes(_canonical_json(unsigned)),
-            }
-            _atomic_manifest(staging / "ion_correction_manifest.json", manifest)
-            commit_generation(
-                store.root,
-                "ion_correction",
-                generation_id,
-                staging,
-                manifest_digest=str(manifest["manifest_digest"]),
-                compatibility_manifest=manifest,
-            )
-    finally:
-        store.close()
-    logger.info("Published ion correction artifact %s", root)
+    unwrap = _current_unwrap(store)
+    phase = np.asarray(unwrapped_phase)
+    if phase.shape != store.shape or phase.dtype.kind != "f":
+        reject_invalid_state(
+            "corrected phase must match the IFG shape as a float array"
+        )
+    if unwrap_write_id != unwrap.write_id or not _is_source_identity(ion_write_id):
+        reject_invalid_state("ion correction binding is invalid")
+    properties = {
+        "faninsar:pair": list(store.pair),
+        "faninsar:shape": list(store.shape),
+        "faninsar:ion_looks": [int(ion_looks[0]), int(ion_looks[1])],
+        "faninsar:degraded_consumed": bool(degraded_consumed),
+    }
+
+    def write(staging: Path) -> dict[str, dict[str, Any]]:
+        write_zarr_array(
+            staging / "unwrapped_phase.zarr", phase.astype(np.float32, copy=False)
+        )
+        return {"unwrapped_phase": {"href": "unwrapped_phase.zarr"}}
+
+    product = commit_product(
+        store.unwrap_root / ION_CORRECTED_NAME,
+        kind=ION_CORRECTED_KIND,
+        properties=properties,
+        write_payloads=write,
+        inputs={"unwrap": unwrap.write_id, "ion": ion_write_id},
+        overwrite=replace_existing,
+    )
+    logger.info("Committed ion correction %s", product.path)
+    return product
+
+
+def open_ion_correction(root: str | Path) -> Product:
+    """Open the ionosphere correction bound to the current unwrap of an IFG.
+
+    Parameters
+    ----------
+    root : str or pathlib.Path
+        The interferogram product directory ``ifg/ml_AxR/<pair>``.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the correction is missing or bound to another unwrap.
+
+    """
+    store = InterferogramArtifactStore.open(root)
+    unwrap = _current_unwrap(store)
+    corrected = open_product(
+        store.unwrap_root / ION_CORRECTED_NAME, kind=ION_CORRECTED_KIND
+    )
+    if corrected.inputs.get("unwrap") != unwrap.write_id:
+        reject_invalid_state("ion correction is bound to a different unwrap")
+    return corrected
 
 
 def read_ion_correction_artifact(root: str | Path) -> np.ndarray:
-    """Read the hash-validated ion-corrected unwrapped phase of one pair."""
-    path = _store_root(root, create=False)
-    opened = open_current_generation(path, "ion_correction")
-    try:
-        manifest = _verified_manifest(
-            opened.path / "ion_correction_manifest.json", ION_CORRECTION_SCHEMA
-        )
-        if manifest.get("manifest_digest") != opened.manifest_digest:
-            reject_invalid_state(
-                "ion correction CURRENT digest does not match its generation"
-            )
-        correction_shape = _validate_shape(
-            manifest.get("shape"), "ion correction shape"
-        )
-        raw_payloads = manifest.get("payloads")
-        if not isinstance(raw_payloads, dict) or set(raw_payloads) != set(
-            ION_CORRECTION_FILENAMES
-        ):
-            reject_invalid_state("ion correction payload table is incomplete")
-        descriptors: dict[str, dict[str, Any]] = {}
-        for name, filename in ION_CORRECTION_FILENAMES.items():
-            descriptor = raw_payloads[name]
-            if (
-                not isinstance(descriptor, dict)
-                or descriptor.get("file") != filename
-                or tuple(descriptor.get("shape", ())) != correction_shape
-                or not _is_sha256(descriptor.get("sha256"))
-            ):
-                reject_invalid_state(
-                    f"ion correction payload descriptor is invalid: {name}"
-                )
-            path = opened.path / filename
-            if not path.is_file() or path.is_symlink():
-                reject_invalid_state(
-                    f"ion correction payload missing or unsafe: {path}"
-                )
-            descriptors[name] = dict(descriptor)
-        arrays = _read_ion_payloads(opened.path, descriptors)
-    finally:
-        opened.lease.close()
-    return arrays["corrected_unwrapped_phase"]
+    """Read the ionosphere-corrected unwrapped phase of one Pair."""
+    corrected = open_ion_correction(root)
+    phase = read_zarr_array(corrected.asset_path("unwrapped_phase"))
+    expected = tuple(int(size) for size in corrected.properties["faninsar:shape"])
+    if phase.shape != expected or phase.dtype.kind != "f":
+        reject_invalid_state("ion correction layer shape or dtype is incompatible")
+    return phase
 
 
 __all__ = [
-    "ION_ARTIFACT_SCHEMA",
-    "ION_CORRECTION_SCHEMA",
+    "ION_CORRECTED_KIND",
+    "ION_KIND",
     "IonosphereArtifact",
     "IonosphereArtifactStore",
+    "ion_dir",
+    "open_ion_correction",
     "read_ion_correction_artifact",
     "write_ion_correction_artifact",
     "write_ionosphere_artifact",

@@ -19,15 +19,10 @@ from .products import (
 
 _NETWORK_EXPORTS = {
     "IncompleteNetworkProductError",
-    "LegacyNetworkLayoutError",
     "Network",
     "NetworkAnalysisError",
     "NetworkConstructionError",
-    "NetworkCurrentError",
-    "NetworkGenerationError",
-    "NetworkManifestError",
     "NetworkPathError",
-    "UnknownNetworkIndexTypeError",
 }
 _READER_EXPORTS = {
     "InterferogramCollection",
@@ -80,13 +75,9 @@ __all__ = [
     "Interferogram",
     "InterferogramCollection",
     "InvalidReaderError",
-    "LegacyNetworkLayoutError",
     "Network",
     "NetworkAnalysisError",
     "NetworkConstructionError",
-    "NetworkCurrentError",
-    "NetworkGenerationError",
-    "NetworkManifestError",
     "NetworkPathError",
     "NetworkProduct",
     "NetworkProductIndex",
@@ -97,5 +88,4 @@ __all__ = [
     "ReaderNotFoundError",
     "ReaderRegistry",
     "ReaderRegistryError",
-    "UnknownNetworkIndexTypeError",
 ]

@@ -300,9 +300,7 @@ class S1Stack(Stack):
             bursts=bursts,
             **kwargs,
         )
-        stack.scene_provider = StackSceneProvider(
-            name="Sentinel-1 SAFE",
-        )
+        stack.scene_provider = cls._default_scene_provider()
         stack.config.extra.update(extra)
         stack.config.extra.setdefault("polarizations", selected_polarizations)
         _configure_s1_bindings(
@@ -621,127 +619,15 @@ class S1Stack(Stack):
         return stack
 
     @classmethod
-    def open(cls, work_dir: str | Path, **processing_options: Any) -> Self:
-        """Reopen a local S1 Stack from ``input_manifest.json``.
-
-        The method deliberately performs no remote search.  It accepts the
-        compact manifest forms emitted by the shared Stack seam and delegates
-        local source validation to :meth:`from_safes`.
-        """
-        root = Path(work_dir)
-        manifest_path = root / "input_manifest.json"
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            logger.exception("cannot read S1 input manifest %s", manifest_path)
-            message = f"invalid S1 input manifest: {manifest_path}"
-            raise ValueError(message) from error
-        if not isinstance(payload, Mapping):
-            message = "S1 input manifest must contain a JSON object"
-            logger.error(message)
-            raise TypeError(message)
-        if payload.get("schema") is not None:
-            from faninsar.stack.input_manifest import read_manifest
-
-            try:
-                payload = read_manifest(manifest_path, work_dir=root)
-            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-                logger.exception("S1 input manifest validation failed")
-                message = f"invalid S1 input manifest: {manifest_path}"
-                raise ValueError(message) from error
-        sources = payload.get("sources")
-        raw_paths: list[str] | tuple[str, ...] | None = None
-        if isinstance(sources, Mapping):
-            source_values = [
-                entry["path"]
-                for entries in sources.values()
-                if isinstance(entries, (list, tuple))
-                for entry in entries
-                if isinstance(entry, Mapping) and isinstance(entry.get("path"), str)
-            ]
-            raw_paths = source_values
-        if raw_paths is None:
-            raw_paths = payload.get("safe_paths", payload.get("local_safe_paths"))
-        if raw_paths is None:
-            inputs = payload.get("inputs", ())
-            raw_paths = [
-                value.get("local_path")
-                for value in inputs
-                if isinstance(value, Mapping) and value.get("local_path")
-            ]
-        if not isinstance(raw_paths, (list, tuple)) or not raw_paths:
-            message = "S1 input manifest has no local SAFE paths"
-            logger.error(message)
-            raise ValueError(message)
-        paths = tuple(Path(path) for path in raw_paths)
-        if any(not path.exists() for path in paths):
-            missing = next(path for path in paths if not path.exists())
-            message = f"S1 SAFE input is missing: {missing}"
-            logger.error(message)
-            raise ValueError(message)
-        options = dict(processing_options)
-        manifest_options = payload.get("processing_options")
-        if isinstance(manifest_options, Mapping):
-            for key in ("coreg_mode", "multilook", "reference"):
-                if key not in options and key in manifest_options:
-                    options[key] = manifest_options[key]
-            extra = dict(options.get("extra", {}) or {})
-            for key in ("product_type", "polarizations"):
-                if key in manifest_options:
-                    extra[f"search_{key}"] = manifest_options[key]
-            options["extra"] = extra
-        manifest_orbits = payload.get("orbits")
-        if isinstance(manifest_orbits, Mapping):
-            orbit_paths = {
-                str(key): value["path"]
-                for key, value in manifest_orbits.items()
-                if isinstance(value, Mapping) and isinstance(value.get("path"), str)
-            }
-            if orbit_paths:
-                options.setdefault("orbit_paths", orbit_paths)
-        manifest_calibration = payload.get("calibration")
-        if isinstance(manifest_calibration, (list, tuple)):
-            options.setdefault(
-                "calibration_paths",
-                [
-                    value["path"]
-                    for value in manifest_calibration
-                    if isinstance(value, Mapping) and isinstance(value.get("path"), str)
-                ],
-            )
-        provenance = payload.get("provenance")
-        if isinstance(provenance, Mapping) and "polarizations" in provenance:
-            encoded = provenance["polarizations"]
-            if encoded == "all":
-                options.setdefault("polarizations", "all")
-            elif isinstance(encoded, str):
-                values = tuple(
-                    value.strip() for value in encoded.split(",") if value.strip()
-                )
-                options.setdefault("polarizations", normalize_polarizations(values))
-        options.pop("work_dir", None)
-        stack = cls.from_safes(paths, work_dir=root, **options)
-        extra = getattr(getattr(stack, "config", None), "extra", None)
-        if isinstance(extra, dict):
-            extra["orbit_auto_fetch"] = False
-        prepare = getattr(stack, "prepare", None)
-        if callable(prepare):
-            prepare(refresh=False)
-        else:
-            stack.prepare_scenes()
-        restore = getattr(stack, "_restore_dem_from_manifest", None)
-        if callable(restore):
-            restore(payload)
-        ensure = getattr(stack, "_ensure_raster_dem", None)
-        if callable(ensure):
-            ensure()
-        return stack
+    def _default_scene_provider(cls) -> Any:
+        """Return the Sentinel-1 SAFE production provider."""
+        return StackSceneProvider(name="Sentinel-1 SAFE")
 
     def prepare(self, *, refresh: bool = False) -> Self:
         """Prepare shared inputs, re-enabling orbit auto-fetch on refresh."""
         if refresh:
             self.config.extra["orbit_auto_fetch"] = True
-        return super().prepare(refresh=refresh)
+        return super().prepare()
 
     def _ensure_precise_orbits(self) -> None:
         """Download covering EOFs from s1-orbits before coregistration."""

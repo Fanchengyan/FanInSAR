@@ -1,34 +1,42 @@
-"""Immutable Zarr storage for canonical time-series results."""
+"""SBAS inversion and the time-series product (PROPOSAL-0059).
+
+A time-series product is a directory with one ``timeseries.zarr`` group and
+an ``item.json`` (kind ``timeseries``) written through
+:mod:`faninsar.io.storage.product`. Its inputs are the ``write_id`` of every
+unwrap (or ionosphere-corrected unwrap) product it consumed, keyed by Pair.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from faninsar.io.storage.artifact_transaction import (
-    ArtifactResourceLimits,
-    GenerationLease,
-    canonical_json,
-    commit_generation,
-    open_current_generation,
-    sha256_bytes,
-    stage_generation,
-)
+from faninsar.io.storage.product import commit_product, open_product
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
-from faninsar.timeseries.results import TimeSeries
+from faninsar.timeseries.results import SpatialMetadata, TimeSeries
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from pathlib import Path
 
 logger = setup_logger(__name__)
 
+TIMESERIES_KIND = "timeseries"
+_ZARR_NAME = "timeseries.zarr"
+_ARRAY_FIELDS = {
+    "increments": "phase_increments_rad",
+    "cumulative": "phase_cumulative_rad",
+    "residual_pairs": "residual_phase_pairs_rad",
+    "displacement_increments_m": "displacement_increments_m",
+    "displacement_cumulative_m": "displacement_cumulative_m",
+}
+
 
 def _json_safe_metadata(value: Any) -> Any:
-    """Return metadata with NumPy scalar values converted for Zarr attrs."""
+    """Return metadata with NumPy scalar values converted for JSON."""
     if isinstance(value, np.generic):
         return value.item()
     if isinstance(value, np.ndarray):
@@ -44,40 +52,40 @@ def _json_safe_metadata(value: Any) -> Any:
     return value
 
 
-@dataclass(frozen=True, slots=True)
-class TimeSeriesZarrStore:
-    """Pinned, hash-validated immutable time-series Zarr generation.
+def timeseries_properties(result: TimeSeries) -> dict[str, Any]:
+    """Return the STAC properties describing one time series.
 
-    Attributes
+    Parameters
     ----------
-    root : pathlib.Path
-        Transaction root containing ``TIMESERIES_CURRENT``.
-    generation_id : str
-        Explicit immutable generation identifier.
-    path : pathlib.Path
-        Validated Zarr generation path.
-    manifest_digest : str
-        Canonical generation-manifest digest.
+    result : TimeSeries
+        Scientific result.
+
+    Returns
+    -------
+    dict
+        Temporal extent, Pair and date axes, metadata, and spatial grid.
 
     """
-
-    root: Path
-    generation_id: str
-    path: Path
-    manifest_digest: str
-    _lease: GenerationLease
-
-    def close(self) -> None:
-        """Release this store's durable reader pin."""
-        self._lease.close()
-
-    def __enter__(self) -> Self:
-        """Return this store for context-managed reading."""
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        """Release the reader pin on context-manager exit."""
-        self.close()
+    properties: dict[str, Any] = {
+        "start_datetime": f"{result.dates[0][:4]}-{result.dates[0][4:6]}-"
+        f"{result.dates[0][6:]}T00:00:00Z",
+        "end_datetime": f"{result.dates[-1][:4]}-{result.dates[-1][4:6]}-"
+        f"{result.dates[-1][6:]}T00:00:00Z",
+        "faninsar:pair_ids": list(result.pair_ids),
+        "faninsar:dates": list(result.dates),
+    }
+    metadata = _json_safe_metadata(dict(result.metadata))
+    if metadata:
+        properties["faninsar:metadata"] = metadata
+    if result.spatial is not None:
+        spatial = _json_safe_metadata(result.spatial.to_dict())
+        properties["faninsar:domain"] = spatial["domain"]
+        properties["faninsar:shape"] = spatial["shape"]
+        properties["faninsar:grid_identity"] = spatial["grid_identity"]
+        for key in ("crs", "transform", "radar_coordinates"):
+            if key in spatial:
+                properties[f"faninsar:{key}"] = spatial[key]
+    return properties
 
 
 def _solve_connected_pixels(
@@ -271,195 +279,143 @@ def invert_unwrapped_pairs(
     )
 
 
-def _digest_file(path: Path) -> str:
-    """Hash one Zarr file without loading it into memory."""
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _timeseries_arrays(result: TimeSeries) -> dict[str, np.ndarray]:
-    """Return scientific arrays using their stable storage dataset names."""
-    arrays = {
-        "increments": result.phase_increments_rad,
-        "cumulative": result.phase_cumulative_rad,
-        "residual_pairs": result.residual_phase_pairs_rad,
-    }
-    if result.displacement_increments_m is not None:
-        arrays["displacement_increments_m"] = result.displacement_increments_m
-    if result.displacement_cumulative_m is not None:
-        arrays["displacement_cumulative_m"] = result.displacement_cumulative_m
-    return {name: np.asarray(array) for name, array in arrays.items()}
-
-
-def _write_generation_manifest(
-    generation: Path,
-    *,
-    generation_id: str,
-    arrays: dict[str, np.ndarray],
-) -> dict[str, Any]:
-    """Hash a complete Zarr tree and publish its manifest last."""
-    files: dict[str, dict[str, Any]] = {}
-    for path in sorted(generation.rglob("*")):
-        if not path.is_file() or path.is_symlink():
-            continue
-        relative = path.relative_to(generation).as_posix()
-        files[relative] = {"bytes": path.stat().st_size, "sha256": _digest_file(path)}
-    unsigned: dict[str, Any] = {
-        "schema_version": "stack_timeseries_zarr_v1",
-        "status": "complete",
-        "generation_id": generation_id,
-        "arrays": {
-            name: {"shape": list(array.shape), "dtype": array.dtype.str}
-            for name, array in sorted(arrays.items())
-        },
-        "files": files,
-    }
-    manifest = {**unsigned, "manifest_digest": sha256_bytes(canonical_json(unsigned))}
-    manifest_path = generation / "artifact_manifest.json"
-    descriptor = os.open(
-        manifest_path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(canonical_json(manifest) + b"\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    return manifest
-
-
-def _verified_timeseries_manifest(path: Path) -> dict[str, Any]:
-    """Read and validate a complete time-series generation manifest."""
-    manifest_path = path / "artifact_manifest.json"
-    try:
-        if manifest_path.is_symlink() or manifest_path.stat().st_size > 1024 * 1024:
-            reject_invalid_state("time-series manifest is missing or unsafe")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError) as error:
-        reject_invalid_state(f"time-series manifest cannot be read: {error}")
-    if not isinstance(manifest, dict):
-        reject_invalid_state("time-series manifest must be an object")
-    unsigned = dict(manifest)
-    expected = unsigned.pop("manifest_digest", None)
-    if (
-        manifest.get("schema_version") != "stack_timeseries_zarr_v1"
-        or manifest.get("status") != "complete"
-        or expected != sha256_bytes(canonical_json(unsigned))
-    ):
-        reject_invalid_state("time-series manifest is incomplete or tampered")
-    return manifest
-
-
-def open_timeseries_zarr(store_path: str | Path) -> TimeSeriesZarrStore:
-    """Open and pin the current hash-validated time-series generation."""
-    root = Path(store_path)
-    if (root / "zarr.json").exists() or (root / ".zgroup").exists():
-        reject_invalid_state("legacy direct time-series Zarr layout is quarantined")
-    opened = open_current_generation(root, "timeseries")
-    try:
-        manifest = _verified_timeseries_manifest(opened.path)
-        compatibility_path = root / "timeseries_manifest.json"
-        compatibility = json.loads(compatibility_path.read_text(encoding="utf-8"))
-        if (
-            manifest != compatibility
-            or manifest.get("manifest_digest") != opened.manifest_digest
-            or manifest.get("generation_id") != opened.generation_id
-        ):
-            reject_invalid_state("time-series CURRENT and manifest identities differ")
-        raw_files = manifest.get("files")
-        if not isinstance(raw_files, dict):
-            reject_invalid_state("time-series payload manifest is invalid")
-        for relative, descriptor in raw_files.items():
-            if (
-                not isinstance(relative, str)
-                or Path(relative).is_absolute()
-                or ".." in Path(relative).parts
-                or not isinstance(descriptor, dict)
-            ):
-                reject_invalid_state("time-series payload path is unsafe")
-            payload = opened.path / relative
-            if (
-                not payload.is_file()
-                or payload.is_symlink()
-                or payload.stat().st_size != descriptor.get("bytes")
-                or _digest_file(payload) != descriptor.get("sha256")
-            ):
-                reject_invalid_state("time-series payload is missing or corrupted")
-    except Exception:
-        opened.lease.close()
-        raise
-    return TimeSeriesZarrStore(
-        root=root,
-        generation_id=opened.generation_id,
-        path=opened.path,
-        manifest_digest=opened.manifest_digest,
-        _lease=opened.lease,
-    )
-
-
-def write_timeseries_zarr(
+def write_timeseries_product(
     result: TimeSeries,
-    store_path: str | Path,
+    path: str | Path,
     *,
-    resource_limits: ArtifactResourceLimits | None = None,
+    inputs: Mapping[str, str] | None = None,
+    properties: Mapping[str, Any] | None = None,
+    overwrite: bool = False,
 ) -> Path:
-    """Transactionally persist one immutable time-series Zarr generation.
+    """Commit one time-series product.
+
+    Parameters
+    ----------
+    result : TimeSeries
+        Scientific result to persist.
+    path : str or pathlib.Path
+        Product directory; it holds ``timeseries.zarr`` and ``item.json``.
+    inputs : mapping[str, str], optional
+        Pair id to the ``write_id`` of the unwrap product it consumed.
+    properties : mapping, optional
+        Extra ``faninsar:`` Item properties (for example the phase source).
+    overwrite : bool, optional
+        Replace an existing product.
 
     Returns
     -------
     pathlib.Path
-        The stable transaction root. Use :func:`open_timeseries_zarr` to
-        resolve and pin its current immutable Zarr generation.
+        The product directory.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the product exists and ``overwrite`` is false.
 
     """
     import zarr
 
-    root_path = Path(store_path)
-    if (root_path / "zarr.json").exists() or (root_path / ".zgroup").exists():
-        reject_invalid_state("legacy direct time-series Zarr layout is quarantined")
-    arrays = _timeseries_arrays(result)
-    final_bytes = sum(int(array.nbytes) for array in arrays.values())
-    dimensions = tuple(int(size) for array in arrays.values() for size in array.shape)
-    with stage_generation(
-        root_path,
-        "timeseries",
-        final_bytes=final_bytes + 1024 * (len(arrays) * 3 + 2),
-        temporary_bytes=final_bytes + 1024 * (len(arrays) * 3 + 2),
-        file_count=len(arrays) * 3 + 2,
-        dimensions=dimensions,
-        limits=resource_limits,
-    ) as (generation_id, staging):
-        group = zarr.open_group(str(staging), mode="w")
+    arrays = {
+        name: np.asarray(getattr(result, field))
+        for name, field in _ARRAY_FIELDS.items()
+        if getattr(result, field) is not None
+    }
+    attrs: dict[str, Any] = {
+        "pair_ids": list(result.pair_ids),
+        "dates": list(result.dates),
+        "metadata": _json_safe_metadata(result.metadata),
+    }
+    if result.spatial is not None:
+        attrs["spatial"] = result.spatial.to_dict()
+
+    def write(staging: Path) -> dict[str, dict[str, Any]]:
+        group = zarr.open_group(str(staging / _ZARR_NAME), mode="w")
         for name, array in arrays.items():
-            group.create_array(
-                name,
-                data=array,
-                chunks=array.shape,
-                overwrite=False,
-            )
-        attrs: dict[str, Any] = {
-            "pair_ids": list(result.pair_ids),
-            "dates": list(result.dates),
-            "metadata": _json_safe_metadata(result.metadata),
-        }
-        if result.spatial is not None:
-            attrs["spatial"] = result.spatial.to_dict()
+            group.create_array(name, data=array, chunks=array.shape)
         group.attrs.update(attrs)
-        manifest = _write_generation_manifest(
-            staging,
-            generation_id=generation_id,
-            arrays=arrays,
+        return {"timeseries": {"href": _ZARR_NAME, "type": "application/vnd+zarr"}}
+
+    product = commit_product(
+        path,
+        kind=TIMESERIES_KIND,
+        properties={**timeseries_properties(result), **dict(properties or {})},
+        write_payloads=write,
+        inputs=dict(inputs or {}),
+        overwrite=overwrite,
+    )
+    logger.info("Committed time-series product %s", product.path)
+    return product.path
+
+
+def read_timeseries(path: str | Path) -> TimeSeries:
+    """Read one committed time-series product.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Product directory written by :func:`write_timeseries_product`.
+
+    Returns
+    -------
+    TimeSeries
+        The persisted result with ``canonical_path`` set to ``path``.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the product is missing or its arrays are incomplete.
+
+    """
+    import zarr
+
+    product = open_product(path, kind=TIMESERIES_KIND)
+    group = zarr.open_group(str(product.asset_path("timeseries")), mode="r")
+    attrs = dict(group.attrs)
+    values: dict[str, np.ndarray] = {}
+    for name, field in _ARRAY_FIELDS.items():
+        if name in group:
+            values[field] = np.asarray(group[name][...])
+    missing = [
+        field
+        for field in (
+            "phase_increments_rad",
+            "phase_cumulative_rad",
+            "residual_phase_pairs_rad",
         )
-        generation_path = commit_generation(
-            root_path,
-            "timeseries",
-            generation_id,
-            staging,
-            manifest_digest=str(manifest["manifest_digest"]),
-            compatibility_manifest=manifest,
-        )
-    logger.info("Wrote immutable time-series Zarr generation: %s", generation_path)
-    return root_path
+        if field not in values
+    ]
+    if missing:
+        reject_invalid_state(f"time-series product is missing arrays: {missing}")
+    spatial = attrs.get("spatial")
+    return TimeSeries(
+        pair_ids=tuple(str(value) for value in attrs.get("pair_ids", [])),
+        dates=tuple(str(value) for value in attrs.get("dates", [])),
+        metadata=dict(attrs.get("metadata", {})),
+        spatial=(
+            None
+            if spatial is None
+            else SpatialMetadata(
+                domain=spatial["domain"],
+                shape=tuple(int(size) for size in spatial["shape"]),
+                grid_identity=spatial["grid_identity"],
+                crs=spatial.get("crs"),
+                transform=(
+                    None
+                    if spatial.get("transform") is None
+                    else tuple(float(value) for value in spatial["transform"])
+                ),
+                radar_coordinates=spatial.get("radar_coordinates"),
+            )
+        ),
+        canonical_path=product.path,
+        **values,
+    )
+
+
+__all__ = [
+    "TIMESERIES_KIND",
+    "invert_unwrapped_pairs",
+    "read_timeseries",
+    "timeseries_properties",
+    "write_timeseries_product",
+]

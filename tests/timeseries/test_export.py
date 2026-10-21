@@ -9,15 +9,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 import rasterio
-import zarr
 
-from faninsar.timeseries import (
-    SpatialMetadata,
-    TimeSeries,
-    open_timeseries_zarr,
-    write_timeseries_product,
-)
+from faninsar.timeseries import SpatialMetadata, TimeSeries, write_timeseries_product
 from faninsar.timeseries.export import ExporterRegistry, registry
+from faninsar.timeseries.io import read_timeseries
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -77,56 +72,44 @@ def test_default_export_rejects_radar_without_fallback(tmp_path: Path) -> None:
 
 
 def test_stac_zarr_export_writes_canonical_asset_and_metadata(tmp_path: Path) -> None:
-    """The explicit canonical exporter writes Zarr plus a STAC item."""
+    """The explicit canonical exporter writes a Zarr group plus a STAC item."""
     root = tmp_path / "result"
 
     _result(domain="radar").export(root, exporter="stac-zarr")
 
     item = json.loads((root / "item.json").read_text(encoding="utf-8"))
     assert item["properties"]["faninsar:domain"] == "radar"
-    zarr_root = root / "timeseries.zarr"
-    generation = next(zarr_root.glob(".timeseries_generations/*"))
-    group = zarr.open_group(str(generation), mode="r")
-    assert group.attrs["spatial"]["domain"] == "radar"
+    assert (root / "timeseries.zarr").is_dir()
+    assert read_timeseries(root).spatial.domain == "radar"
 
 
 def test_canonical_product_writer_creates_and_updates_one_root(tmp_path: Path) -> None:
-    """Canonical persistence supports repeated generation updates in place."""
+    """Canonical persistence supports repeated updates in place."""
     root = tmp_path / "canonical"
     first = _result(domain="radar")
 
     assert write_timeseries_product(first, root) == root
-    with open_timeseries_zarr(root / "timeseries.zarr") as pinned:
-        first_generation = pinned.generation_id
     first_item = json.loads((root / "item.json").read_text(encoding="utf-8"))
     assert first_item["properties"]["faninsar:metadata"] == {"phase_unit": "radian"}
+    first_write_id = first_item["properties"]["faninsar:write_id"]
 
     second = replace(first, metadata={"phase_unit": "radian", "revision": 2})
-    write_timeseries_product(second, root)
-    with open_timeseries_zarr(root / "timeseries.zarr") as pinned:
-        assert pinned.generation_id != first_generation
+    write_timeseries_product(second, root, overwrite=True)
     second_item = json.loads((root / "item.json").read_text(encoding="utf-8"))
+    assert second_item["properties"]["faninsar:write_id"] != first_write_id
     assert second_item["properties"]["faninsar:metadata"]["revision"] == 2
 
 
-def test_canonical_product_writer_publishes_stac_last(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_canonical_product_writer_requires_overwrite_to_replace(
+    tmp_path: Path,
 ) -> None:
-    """A failed STAC publication never leaves a falsely published Item."""
-    import importlib
+    """A second commit without ``overwrite`` is rejected, not silently applied."""
+    from faninsar.processing.errors import InvalidProcessingStateError
 
-    export_module = importlib.import_module("faninsar.timeseries.export")
-
-    def fail_stac(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise RuntimeError("synthetic STAC failure")
-
-    monkeypatch.setattr(export_module, "_write_stac", fail_stac)
-    root = tmp_path / "failed"
-    with pytest.raises(RuntimeError, match="synthetic STAC failure"):
+    root = tmp_path / "canonical"
+    write_timeseries_product(_result(domain="radar"), root)
+    with pytest.raises(InvalidProcessingStateError, match="already exists"):
         write_timeseries_product(_result(domain="radar"), root)
-    assert (root / "timeseries.zarr" / "TIMESERIES_CURRENT").is_file()
-    assert not (root / "item.json").exists()
 
 
 def test_canonical_path_is_a_validated_path_value() -> None:

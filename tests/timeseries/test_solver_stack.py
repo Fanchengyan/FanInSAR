@@ -20,7 +20,9 @@ def test_solver_from_stack() -> None:
     rng = np.random.default_rng(0)
     unw = rng.normal(size=(len(pairs), 5)).astype(np.float64)
     stack = InterferogramStack.from_unwrapped("synth", pairs, unw)
-    solver = NSBASSolver(stack, model=None, verbose=False, dtype=__import__("torch").float64)
+    solver = NSBASSolver(
+        stack, model=None, verbose=False, dtype=__import__("torch").float64
+    )
     assert solver is not None
     # d shape should match
     assert solver._d.shape[0] >= len(pairs)  # SBAS rows may equal n_pairs

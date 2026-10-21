@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import numpy as np
 
 from faninsar.logging import setup_logger
+from faninsar.timeseries.io import timeseries_properties, write_timeseries_product
 
 if TYPE_CHECKING:
     from faninsar.timeseries.results import TimeSeries
@@ -113,32 +114,6 @@ def _netcdf_attributes(result: TimeSeries) -> dict[str, Any]:
     }
 
 
-def _stac_properties(result: TimeSeries) -> dict[str, Any]:
-    """Build STAC properties without deriving a geographic footprint."""
-    properties: dict[str, Any] = {
-        "start_datetime": f"{result.dates[0][:4]}-{result.dates[0][4:6]}-"
-        f"{result.dates[0][6:]}T00:00:00Z",
-        "end_datetime": f"{result.dates[-1][:4]}-{result.dates[-1][4:6]}-"
-        f"{result.dates[-1][6:]}T00:00:00Z",
-        "faninsar:pair_ids": list(result.pair_ids),
-        "faninsar:dates": list(result.dates),
-    }
-    metadata = _json_safe(dict(result.metadata))
-    if metadata:
-        properties["faninsar:metadata"] = metadata
-    if result.revision_id is not None:
-        properties["faninsar:revision_id"] = result.revision_id
-    if result.spatial is not None:
-        spatial = _json_safe(result.spatial.to_dict())
-        properties["faninsar:domain"] = spatial["domain"]
-        properties["faninsar:shape"] = spatial["shape"]
-        properties["faninsar:grid_identity"] = spatial["grid_identity"]
-        for key in ("crs", "transform", "radar_coordinates"):
-            if key in spatial:
-                properties[f"faninsar:{key}"] = spatial[key]
-    return properties
-
-
 def _write_stac(
     result: TimeSeries,
     root: Path,
@@ -152,7 +127,7 @@ def _write_stac(
         geometry=None,
         bbox=None,
         datetime=None,
-        properties=_stac_properties(result),
+        properties=timeseries_properties(result),
     )
     for name, (href, media_type) in assets.items():
         item.add_asset(
@@ -193,17 +168,9 @@ def _arrays(result: TimeSeries) -> dict[str, np.ndarray]:
 
 
 def _write_stac_zarr(result: TimeSeries, root: Path, *, overwrite: bool) -> Path:
-    """Write canonical Zarr and a STAC Item."""
+    """Write the canonical time-series product (Zarr group and STAC Item)."""
     del overwrite
-    from faninsar.timeseries.io import write_timeseries_zarr
-
-    write_timeseries_zarr(result, root / "timeseries.zarr")
-    _write_stac(
-        result,
-        root,
-        {"timeseries": ("timeseries.zarr", "application/vnd+zarr")},
-    )
-    return root
+    return write_timeseries_product(result, root, overwrite=True)
 
 
 def _geo_grid(result: TimeSeries) -> tuple[Any, Any]:
@@ -358,43 +325,6 @@ class NetcdfExporter:
         return _write_netcdf(result, path, overwrite=overwrite)
 
 
-def write_timeseries_product(result: TimeSeries, path: str | Path) -> Path:
-    """Persist one canonical STAC+Zarr time-series product.
-
-    A repeated call to the same root creates a new immutable Zarr generation
-    and updates the one STAC Item in place; no generation or publication
-    choice is exposed to callers. The STAC Item is atomically replaced only
-    after the Zarr generation is complete.
-
-    Parameters
-    ----------
-    result : TimeSeries
-        Scientific result to persist.
-    path : str or pathlib.Path
-        Canonical product root containing ``timeseries.zarr`` and
-        ``item.json``.
-
-    Returns
-    -------
-    pathlib.Path
-        The canonical product root.
-
-    Raises
-    ------
-    ValueError
-        If ``path`` is an existing file or symbolic link.
-
-    """
-    root = Path(path)
-    if root.exists() and (root.is_symlink() or not root.is_dir()):
-        message = f"canonical time-series product root is not a directory: {root}"
-        logger.error(message)
-        raise ValueError(message)
-    root.mkdir(parents=True, exist_ok=True)
-    StacZarrExporter()(result, root, overwrite=True)
-    return root
-
-
 registry.register("stac-zarr", StacZarrExporter)
 registry.register("stac-cog", StacCogExporter)
 registry.register("netcdf", NetcdfExporter)
@@ -477,5 +407,4 @@ __all__ = [
     "TimeSeriesExporter",
     "export_timeseries",
     "registry",
-    "write_timeseries_product",
 ]

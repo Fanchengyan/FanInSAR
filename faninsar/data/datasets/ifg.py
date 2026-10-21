@@ -35,13 +35,12 @@ logger = setup_logger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class StackInterferogramDataset:
-    """Internal array view of one pinned Stack IFG generation.
+    """Internal array view of one committed Stack IFG product.
 
     This narrow Stack seam is intentionally separate from the path-discovery
-    :class:`InterferogramDataset`.  The supplied artifact store has already
-    selected and pinned one immutable generation.  Only the five named Stack
-    layers are read from that generation; this class never opens ``CURRENT``
-    and never recomputes payload digests during a normal read.
+    :class:`InterferogramDataset`.  Only the five named Stack layers are read
+    from the product directory; payload digests are not recomputed during a
+    normal read.
 
     Attributes
     ----------
@@ -77,15 +76,13 @@ class StackInterferogramDataset:
     valid_mask: np.ndarray
 
     @classmethod
-    def from_generation(cls, store: object) -> StackInterferogramDataset:
-        """Read the named layers from an already pinned IFG store.
+    def from_product(cls, store: object) -> StackInterferogramDataset:
+        """Read the named layers of a committed IFG product.
 
         Parameters
         ----------
         store : InterferogramArtifactStore
-            Open store whose ``generation_root`` identifies the immutable
-            generation to read.  The caller owns its lease and closes it
-            after the complete Stack operation.
+            Opened store whose ``root`` is the product directory.
 
         Returns
         -------
@@ -95,8 +92,7 @@ class StackInterferogramDataset:
         Raises
         ------
         TypeError
-            If ``store`` is not an opened artifact store with a generation
-            root.
+            If ``store`` is not an opened artifact store.
         ValueError
             If a named layer is missing, malformed, non-finite in a required
             structural field, has the wrong dtype, or layer shapes do not
@@ -104,14 +100,14 @@ class StackInterferogramDataset:
             common ``(azimuth, range)`` shape.
 
         """
-        generation_root = getattr(store, "generation_root", None)
-        if not isinstance(generation_root, Path):
+        product_root = getattr(store, "root", None)
+        if not isinstance(product_root, Path):
             message = "Stack IFG Dataset requires an opened artifact store"
             logger.error(message)
             raise TypeError(message)
 
         def load(name: str) -> np.ndarray:
-            path = generation_root / f"{name}.zarr"
+            path = product_root / f"{name}.zarr"
             try:
                 array = read_zarr_array(path)
             except (OSError, ValueError, EOFError) as error:
@@ -124,7 +120,7 @@ class StackInterferogramDataset:
             return np.asarray(array)
 
         complex_ifg = load("complex_ifg")
-        coherence_path = generation_root / "coherence.zarr"
+        coherence_path = product_root / "coherence.zarr"
         coherence = load("coherence") if coherence_path.is_dir() else None
         wrapped_phase = load("wrapped_phase")
         amplitude = load("amplitude")
@@ -142,7 +138,7 @@ class StackInterferogramDataset:
             message = "Stack IFG Dataset layers must share one shape"
             raise ValueError(message)
 
-        mask_path = generation_root / "valid_mask.zarr"
+        mask_path = product_root / "valid_mask.zarr"
         if mask_path.is_dir():
             valid_mask = load("valid_mask")
             if valid_mask.dtype != np.bool_ or valid_mask.shape != complex_ifg.shape:

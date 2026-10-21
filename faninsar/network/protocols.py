@@ -17,20 +17,10 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class NetworkReader(Protocol):
-    """Read one Network from a path or reader-specific source.
+    """Read one Network from a path or reader-specific source."""
 
-    Implementations may reject a non-``None`` revision when their source
-    format cannot address immutable snapshots.  They must not silently fall
-    back to a mutable current view.
-    """
-
-    def read(
-        self,
-        path: str | Path,
-        *,
-        revision: str | None = None,
-    ) -> Network:
-        """Read and return a logically immutable Network view."""
+    def read(self, path: str | Path) -> Network:
+        """Read and return a Network view."""
 
 
 __all__ = ["NetworkReader"]

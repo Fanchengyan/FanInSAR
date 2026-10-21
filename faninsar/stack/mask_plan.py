@@ -397,6 +397,40 @@ class MaskPlan:
         """Return immutable explicit stage references."""
         return self._stages
 
+    def to_mapping(self) -> dict[str, object]:
+        """Return the strict mapping this plan round-trips through.
+
+        Recipes serialize as ``{"masks": ..., "stages": ...}`` with absolute
+        source paths.  A plan holding materialized mask algebra objects is
+        not serializable and fails here instead of losing the recipe.
+
+        Raises
+        ------
+        ValueError
+            If any registered mask is a materialized object rather than a
+            recipe.
+
+        """
+        from faninsar.processing.masking.mask import Mask
+
+        masks: dict[str, object] = {}
+        for name, value in self._masks.items():
+            if isinstance(value, Mask):
+                _fail(
+                    "materialized mask objects are not serializable; configure "
+                    f"mask {name!r} from a raster, vector, or water recipe"
+                )
+            entry: dict[str, object] = {"kind": value.kind}
+            if value.path is not None:
+                entry["path"] = str(value.path)
+            if value.provider is not None:
+                entry["provider"] = value.provider
+            masks[name] = entry
+        return {
+            "masks": masks,
+            "stages": {stage: list(self._stages[stage]) for stage in STAGES},
+        }
+
     @property
     def identity(self) -> str:
         """Return the normalized SHA-256 identity of used stage masks."""
