@@ -1,4 +1,9 @@
-"""Burst-archive array writes recover from short ``tofile`` writes."""
+"""Burst-archive array writes recover from short ``tofile`` writes.
+
+The retired one-shot pair engine now lives only as the test helper
+``tests.missions.s1.processing.pair_runner``; the archive writer and its
+backoff knobs are tested there rather than in the production package.
+"""
 
 from __future__ import annotations
 
@@ -9,8 +14,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
-from faninsar.missions.s1 import processing as s1_processing
-from faninsar.missions.s1.processing import _archive_tofile
+from tests.missions.s1.processing import pair_runner
+from tests.missions.s1.processing.pair_runner import _archive_tofile
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -26,8 +31,8 @@ class _ShortWriteArray(np.ndarray):
 @pytest.fixture(autouse=True)
 def _no_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     """Collapse the ENOSPC backoff so tests fail fast."""
-    monkeypatch.setattr(s1_processing, "_ARCHIVE_WRITE_RETRIES", 1)
-    monkeypatch.setattr(s1_processing, "_ARCHIVE_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(pair_runner, "_ARCHIVE_WRITE_RETRIES", 1)
+    monkeypatch.setattr(pair_runner, "_ARCHIVE_RETRY_SECONDS", 0.0)
 
 
 def test_writes_payload_directly(tmp_path: Path) -> None:
@@ -69,7 +74,7 @@ def test_enospc_recovers_on_retry(
             raise OSError(errno.ENOSPC, "simulated transient full")
         return real_write(_fd, _data)
 
-    monkeypatch.setattr(s1_processing, "_ARCHIVE_WRITE_RETRIES", 3)
+    monkeypatch.setattr(pair_runner, "_ARCHIVE_WRITE_RETRIES", 3)
     monkeypatch.setattr(os, "write", flaky_write)
     _archive_tofile(payload.view(_ShortWriteArray), path, "tag")
 

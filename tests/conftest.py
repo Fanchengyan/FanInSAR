@@ -1,4 +1,8 @@
-"""Configure a compatible geospatial test environment."""
+"""Configure a compatible geospatial test environment.
+
+Network tests are opt-in: the suite skips ``network``-marked tests unless
+``--run-network`` is passed, so a default run never downloads remote data.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,8 @@ import os
 import subprocess
 import sys
 from typing import Final
+
+import pytest
 
 _PROJ_OVERRIDE_NAMES: Final = ("PROJ_DATA", "PROJ_LIB")
 _PROJ_PROBE: Final = (
@@ -45,3 +51,28 @@ for override_name in _PROJ_OVERRIDE_NAMES:
 
     if probe_result.returncode != 0:
         os.environ.pop(override_name, None)
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register the opt-in switch for remote-data tests."""
+    parser.addoption(
+        "--run-network",
+        action="store_true",
+        default=False,
+        help="run tests marked network (they download remote data)",
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Skip ``network``-marked tests unless ``--run-network`` is passed."""
+    if config.getoption("--run-network"):
+        return
+    skip_network = pytest.mark.skip(
+        reason="network test; pass --run-network to run it",
+    )
+    for item in items:
+        if "network" in item.keywords:
+            item.add_marker(skip_network)

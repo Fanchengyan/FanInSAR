@@ -1,7 +1,8 @@
 """Tests for remote burst extraction (ASF SAFE via ``requests``).
 
 These tests require network access and a valid ``~/.netrc`` entry for
-``urs.earthdata.nasa.gov``.  They are marked ``@slow``.
+``urs.earthdata.nasa.gov``.  They are marked ``@slow`` and ``@network``;
+the suite skips them unless ``--run-network`` is passed.
 """
 
 from __future__ import annotations

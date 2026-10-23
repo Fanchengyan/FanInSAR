@@ -7,6 +7,7 @@ legacy pair-engine tests only.
 
 from __future__ import annotations
 
+import errno
 import gc
 import json
 import os
