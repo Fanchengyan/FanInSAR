@@ -79,8 +79,6 @@ def _write_pair_artifact(
         source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
         complex_ifg=complex_ifg,
         coherence=np.ones(phase.shape, dtype=np.float32),
-        wrapped_phase=np.angle(complex_ifg).astype(np.float32),
-        amplitude=np.abs(complex_ifg).astype(np.float32),
     )
     if root not in stack.ifg_dirs:
         stack.ifg_dirs.append(root)
@@ -1021,8 +1019,6 @@ def test_replacing_an_ifg_blocks_analysis_until_unwrap_reruns(tmp_path: Path) ->
         grid_identity=store.grid_identity,
         complex_ifg=artifact.complex_ifg * 1.0,
         coherence=artifact.coherence,
-        wrapped_phase=artifact.wrapped_phase,
-        amplitude=artifact.amplitude,
         replace_existing=True,
     )
 
@@ -1057,8 +1053,6 @@ def test_live_stack_network_declares_only_present_optional_assets(
             source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
             complex_ifg=complex_ifg,
             coherence=None,
-            wrapped_phase=phase,
-            amplitude=np.abs(complex_ifg).astype(np.float32),
         )
         if root not in stack.ifg_dirs:
             stack.ifg_dirs.append(root)
@@ -1106,6 +1100,42 @@ def test_live_stack_network_per_ifg_unwrap_surface_is_consistent(
         )
         item = collection.item(pair_id)
         assert {"complex_ifg", "unw_phase"}.issubset(item["assets"])
+
+
+def test_live_stack_network_per_pair_reads_ignore_other_pairs(tmp_path: Path) -> None:
+    """A per-Pair query is not contaminated by other Pairs' missing assets."""
+    from faninsar.network.readers.stack import StackInterferogramCollection
+
+    stack = _stack_with_three_date_network(tmp_path)
+    phase = np.full((3, 4), 0.2, dtype=np.float32)
+    coherence = np.full((3, 4), 0.75, dtype=np.float32)
+    with_coherence = "20240101_20240113"
+    for pair_id in (
+        with_coherence,
+        "20240113_20240125",
+        "20240101_20240125",
+    ):
+        root = stack.config.work_dir / "ifg" / "ml_1x1" / pair_id
+        write_ifg_artifact(
+            root,
+            pair=tuple(pair_id.split("_")),  # type: ignore[arg-type]
+            looks=(1, 1),
+            filter_name="none",
+            filter_parameters={},
+            source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
+            complex_ifg=np.exp(1j * phase).astype(np.complex64),
+            coherence=coherence if pair_id == with_coherence else None,
+        )
+        if root not in stack.ifg_dirs:
+            stack.ifg_dirs.append(root)
+
+    collection = StackInterferogramCollection(stack)
+    assert collection.exists(with_coherence, "coherence")
+    assert not collection.exists("20240113_20240125", "coherence")
+    np.testing.assert_allclose(
+        collection.open(with_coherence, "coherence").values,
+        coherence,
+    )
 
 
 def test_refresh_rejects_mixed_unwrap_methods(tmp_path: Path) -> None:

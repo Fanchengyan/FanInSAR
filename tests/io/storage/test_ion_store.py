@@ -69,8 +69,6 @@ def _unwrapped_ifg(work) -> InterferogramArtifactStore:
         source_manifest_digests={"primary": _DIGEST, "secondary": _DIGEST},
         complex_ifg=np.exp(1j * phase.astype(np.float64)),
         coherence=np.ones((4, 4), dtype=np.float32),
-        wrapped_phase=phase,
-        amplitude=np.ones((4, 4), dtype=np.float32),
     )
     write_unwrapped_artifact(
         store.root,

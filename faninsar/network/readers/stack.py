@@ -17,9 +17,24 @@ from faninsar.network.readers.interferogram import InterferogramCollection
 
 if TYPE_CHECKING:
     from faninsar.io.storage.ifg_store import InterferogramArtifactStore
+    from faninsar.network.layers import InterferogramLayers
     from faninsar.stack.session import Stack
 
 _ASSETS = ("complex_ifg", "unw_phase", "wrapped_phase", "amplitude", "coherence")
+_READABLE_ASSETS = frozenset(_ASSETS)
+#: Short public layer spellings accepted alongside the internal asset names.
+_SHORT_ASSET_NAMES = {"wrapped": "wrapped_phase", "unwrapped": "unw_phase"}
+#: Layers derived at read time from ``complex_ifg``; no file exists for them.
+_VIRTUAL_ASSETS = ("wrapped_phase", "amplitude")
+
+
+def _canonical_asset_name(name: str) -> str:
+    """Map a short public name to its internal asset name and validate it."""
+    canonical = _SHORT_ASSET_NAMES.get(str(name), str(name))
+    if canonical not in _READABLE_ASSETS:
+        message = f"unknown Stack interferogram asset: {name}"
+        raise ValueError(message)
+    return canonical
 
 
 class StackInterferogramCollection(InterferogramCollection):
@@ -36,6 +51,76 @@ class StackInterferogramCollection(InterferogramCollection):
     def __init__(self, stack: Stack) -> None:
         """Bind the collection to a Stack."""
         self._stack = stack
+
+    def __getitem__(self, pair: str) -> InterferogramLayers:
+        """Return lazy, typed layers for one planned Pair.
+
+        Parameters
+        ----------
+        pair : str
+            Canonical date-pair identifier.
+
+        Returns
+        -------
+        InterferogramLayers
+            Flat view exposing ``wrapped``, ``complex_ifg``, ``coherence``,
+            ``amplitude``, ``unwrapped``, ``connected_components``, and the
+            accessible-name listing ``layers``. The ``wrapped`` and
+            ``amplitude`` layers are virtual and derive from the committed
+            complex IFG.
+
+        Raises
+        ------
+        KeyError
+            If the Pair is not part of this Stack.
+
+        """
+        from faninsar.io.storage.ifg_store import IFG_KIND, InterferogramArtifactStore
+        from faninsar.io.storage.product import open_product
+        from faninsar.io.storage.scene_store import SCENE_KIND, CoregisteredSceneStore
+        from faninsar.network.layers import InterferogramLayers
+        from faninsar.processing.errors import reject_invalid_state
+
+        pair_id = str(pair)
+        if pair_id not in self.pairs().to_names().tolist():
+            raise KeyError(pair_id)
+        store = InterferogramArtifactStore.open(self.root / pair_id)
+        reference = self._stack.reference_scene
+        if reference is None:
+            reject_invalid_state(
+                "the Reference scene is missing; run coregister_scenes"
+            )
+        if (
+            store.domain != reference.domain
+            or store.grid_identity != reference.grid_identity
+        ):
+            reject_invalid_state(
+                "IFG and Reference scene use different coordinate grids"
+            )
+        upstream = [open_product(reference.root)]
+        for role, date_id in zip(("primary", "secondary"), store.pair, strict=True):
+            if date_id == self._stack.reference:
+                expected = reference.write_id
+            else:
+                scene_product = open_product(
+                    self._stack.config.work_dir / "coreg" / date_id, kind=SCENE_KIND
+                )
+                scene = CoregisteredSceneStore.open(scene_product.path)
+                if scene.inputs.get("reference") != reference.write_id:
+                    reject_invalid_state("IFG source is bound to a replaced Reference")
+                expected = scene.write_id
+                upstream.append(scene_product)
+            if store.source_manifest_digests.get(role) != expected:
+                reject_invalid_state(
+                    "IFG source or Reference was replaced; recompute the IFG"
+                )
+        return InterferogramLayers(
+            open_product(store.root, kind=IFG_KIND),
+            reference.grid_shape,
+            store.looks,
+            store.crs,
+            tuple(upstream),
+        )
 
     @property
     def root(self) -> Path:
@@ -107,20 +192,60 @@ class StackInterferogramCollection(InterferogramCollection):
         """Open the exact planned IFG product set."""
         return self._stack._pair_artifact_stores(looks=self._stack.config.multilook)
 
+    def _pair_store(self, pair: str) -> InterferogramArtifactStore:
+        """Return the IFG product store of one planned Pair.
+
+        Only the requested Pair product is opened, and it is validated against
+        its own planned Pair identity, looks, and domain. Other Pairs of the
+        network are never consulted, so a missing or damaged product of another
+        Pair cannot block this query.
+
+        Raises
+        ------
+        KeyError
+            If the Pair is not part of this Stack.
+        InvalidProcessingStateError
+            If the requested Pair product is missing, damaged, or inconsistent
+            with the Stack configuration.
+
+        """
+        from faninsar.io.storage.ifg_store import InterferogramArtifactStore
+        from faninsar.processing.errors import reject_invalid_state
+
+        pair_id = str(pair)
+        if pair_id not in self.pairs().to_names().tolist():
+            raise KeyError(pair)
+        store = InterferogramArtifactStore.open(self.root / pair_id)
+        if _pair_id(store) != pair_id:
+            reject_invalid_state(
+                "Stack IFG artifact pair differs from the configured network"
+            )
+        azimuth_looks, range_looks = (
+            int(self._stack.config.multilook[0]),
+            int(self._stack.config.multilook[1]),
+        )
+        if store.looks != (azimuth_looks, range_looks):
+            reject_invalid_state("Stack IFG artifacts use mixed or unexpected looks")
+        if store.domain != self._stack.config.coregistration_grid:
+            reject_invalid_state("Stack IFG artifacts use mixed or unexpected domains")
+        return store
+
     def _array(self, store: InterferogramArtifactStore, name: str) -> np.ndarray:
-        """Read one named layer of one Pair."""
-        if name == "unw_phase":
-            return np.asarray(store.read_unwrapped().unwrapped_phase)
-        artifact = store.read()
-        if name == "coherence":
-            if artifact.coherence is None:
+        """Read one named layer of one Pair, loading only that layer."""
+        canonical = _canonical_asset_name(name)
+        if canonical == "unw_phase":
+            if not store.has_unwrapped():
+                raise FileNotFoundError(store.unwrap_root)
+            return np.asarray(store.read_unwrapped_layer("unwrapped_phase"))
+        if canonical == "coherence":
+            if "coherence" not in store._payloads:
                 message = "coherence is not present"
                 raise FileNotFoundError(message)
-            return np.asarray(artifact.coherence)
-        if name not in {"wrapped_phase", "amplitude", "complex_ifg"}:
-            message = f"unknown Stack interferogram asset: {name}"
-            raise ValueError(message)
-        return np.asarray(getattr(artifact, name))
+            return np.asarray(store.read_layer("coherence"))
+        if canonical in {"wrapped_phase", "amplitude", "complex_ifg"}:
+            return np.asarray(store.read_layer(canonical))
+        message = f"unknown Stack interferogram asset: {name}"
+        raise ValueError(message)
 
     def open_stack(
         self,
@@ -129,64 +254,122 @@ class StackInterferogramCollection(InterferogramCollection):
         pairs: Any = None,
         chunks: Any = None,
     ) -> xr.DataArray:
-        """Open a named asset across the planned Pair network."""
+        """Open a named asset across the planned Pair network.
+
+        Short public names (``wrapped``, ``unwrapped``) are accepted alongside
+        the internal asset names (``wrapped_phase``, ``unw_phase``).
+
+        An explicit ``pairs`` subset touches only the selected Pair products;
+        a whole-network read keeps the strict exact planned-set check.
+        """
         del chunks
         requested = (
             self.pairs().to_names().tolist()
             if pairs is None
             else pairs.to_names().tolist()
         )
-        by_pair = {_pair_id(store): store for store in self._stores()}
-        arrays = [self._array(by_pair[pair], name) for pair in requested]
+        canonical = _canonical_asset_name(name)
+        if pairs is None:
+            by_pair = {_pair_id(store): store for store in self._stores()}
+            stores = [by_pair[pair] for pair in requested]
+        else:
+            stores = [self._pair_store(pair) for pair in requested]
+        arrays = [self._array(store, canonical) for store in stores]
         return xr.DataArray(
             np.stack(arrays, axis=0),
             dims=("pair", "y", "x"),
             coords={"pair": requested},
-            name=name,
+            name=canonical,
         )
 
     def open(self, pair: str, name: str, **kwargs: Any) -> xr.DataArray:
-        """Open one named asset of one Pair."""
+        """Open one named asset of one Pair, loading only that layer.
+
+        The query is bound to the requested Pair product; other Pairs of the
+        network are never read and cannot affect the result.
+        """
         del kwargs
-        return self.open_stack(name).sel(pair=str(pair), drop=True)
+        canonical = _canonical_asset_name(name)
+        return xr.DataArray(
+            self._array(self._pair_store(str(pair)), canonical),
+            dims=("y", "x"),
+            name=canonical,
+        )
 
     def exists(self, pair: str, name: str) -> bool:
-        """Return whether a named asset is committed for a Pair."""
+        """Return whether a named asset is readable for a Pair.
+
+        The check reads product metadata of the requested Pair only; no raster
+        payload is loaded and other Pairs of the network are never consulted.
+
+        Computable virtual layers (``wrapped_phase``, ``amplitude``) count as
+        readable when their source ``complex_ifg`` is persisted; item/path
+        adapters still refuse to name a file for them.
+        """
         try:
-            self.open(str(pair), name)
+            canonical = _canonical_asset_name(name)
+            selected = self._pair_store(str(pair))
         except (FileNotFoundError, KeyError, ValueError):
             return False
-        return True
+        if canonical == "unw_phase":
+            return selected.has_unwrapped()
+        if canonical in _VIRTUAL_ASSETS:
+            return "complex_ifg" in selected._payloads
+        return canonical in selected._payloads
 
     def path(self, pair: str, name: str) -> Path:
-        """Return the product path of one Pair asset."""
-        if name not in _ASSETS:
+        """Return the product path of one Pair asset.
+
+        Virtual derived layers have no file; their paths raise
+        :class:`FileNotFoundError` instead of inventing a payload location.
+
+        Raises
+        ------
+        FileNotFoundError
+            For ``wrapped_phase``/``amplitude`` (derived from the committed
+            complex IFG), a missing unwrap product, or an optional payload
+            that was never persisted.
+
+        """
+        canonical = _canonical_asset_name(name)
+        if canonical not in _ASSETS:
             message = f"unknown Stack interferogram asset: {name}"
             raise ValueError(message)
-        selected = next(
-            (store for store in self._stores() if _pair_id(store) == str(pair)),
-            None,
-        )
-        if selected is None:
-            raise KeyError(pair)
-        if name == "unw_phase":
+        selected = self._pair_store(str(pair))
+        if canonical in _VIRTUAL_ASSETS:
+            message = (
+                f"{canonical} is a virtual layer derived from complex_ifg; "
+                f"no file exists for it in {selected.root}"
+            )
+            raise FileNotFoundError(message)
+        if canonical == "unw_phase":
             if not selected.has_unwrapped():
                 raise FileNotFoundError(selected.unwrap_root)
             return selected.unwrap_root / "unwrapped_phase.zarr"
-        return selected.root / f"{name}.zarr"
+        payload = selected._payloads.get(canonical)
+        if payload is None:
+            message = f"{canonical} is not present in the IFG product {selected.root}"
+            raise FileNotFoundError(message)
+        return selected.root / str(payload["href"])
 
     def item(self, pair: str) -> dict[str, Any]:
-        """Return an item-like record for one Stack Pair."""
+        """Return an item-like record for one Stack Pair.
+
+        Assets enumerate real payloads only: virtual derived layers are
+        omitted rather than given a fabricated href.
+        """
         if str(pair) not in self.pairs().to_names().tolist():
             raise KeyError(pair)
+        assets: dict[str, Any] = {}
+        for name in _ASSETS:
+            try:
+                assets[name] = {"href": str(self.path(str(pair), name))}
+            except FileNotFoundError:
+                continue
         return {
             "id": str(pair),
             "pair": str(pair),
-            "assets": {
-                name: {"href": str(self.path(str(pair), name))}
-                for name in _ASSETS
-                if self.exists(str(pair), name)
-            },
+            "assets": assets,
         }
 
     def summary(self) -> dict[str, Any]:

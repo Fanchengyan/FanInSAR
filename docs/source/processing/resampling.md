@@ -150,6 +150,69 @@ Notes on specific rows:
   ringing along those seams. This is a documented limitation, not a
   different kernel.
 
+## Geocoding Stack layers and derived arrays
+
+Access a committed Pair through `stack.interferograms[pair]`. Layer attributes
+are lazy: obtaining a handle reads metadata, while geocoding loads only the
+selected raster and its validity information.
+
+```python
+ifg = stack.interferograms["20240101_20240113"]
+
+wrapped = stack.geocode(ifg.wrapped)
+unwrapped = stack.geocode(ifg.unwrapped)
+coherence = stack.geocode(ifg.coherence)
+components = stack.geocode(ifg.connected_components)
+```
+
+Both phase layers contain real radians. Their types remain distinct:
+`str(ifg.wrapped.asset_kind)` is `"wrapped_phase"`, and
+`str(ifg.unwrapped.asset_kind)` is `"unwrapped_phase"`. The first selects cyclic
+interpolation, the second continuous interpolation. Component labels select
+nearest-neighbor sampling. `kind=` is needed for untyped derived fields;
+conflicting overrides on known physical types raise an error.
+`ifg.layers` lists the accessible layer names. `wrapped` and `amplitude` are
+virtual: they derive from the committed complex interferogram, store no
+payload, and report `path is None`. Accessing an unestimated optional result
+(`coherence`, `unwrapped`, `connected_components`) raises `FileNotFoundError`.
+
+On the Stack's standard grid, a committed layer saves to
+`<source>/geocoded/<asset>/`. Different layers have independent children.
+Matching results reuse the source and Reference write ids, grid, DEM context,
+and kernel without loading the input raster. Source replacement invalidates
+old handles; obtain a fresh handle from the Stack. A request on another grid
+returns in memory unless `path=` is explicit.
+
+For a derived array, supply its radar mapping once:
+
+```python
+from faninsar.network.products import AssetKind
+from faninsar.processing.geocoding import RadarDomainProduct
+
+product = RadarDomainProduct(
+    name="filtered_phase",
+    values=filtered_phase,
+    full_radar_shape=ifg.unwrapped.full_radar_shape,
+    multilook=ifg.unwrapped.multilook,
+    origin=ifg.unwrapped.origin,
+    asset_kind=AssetKind.UNWRAPPED_PHASE,
+)
+raster = stack.geocode(product)  # In-memory output.
+raster = stack.geocode(product, path="results/filtered_phase")
+```
+
+`path` names a complete product directory containing `item.json`, `values.tif`,
+and `valid.tif`; relative paths resolve from the current working directory.
+No input-array content digest is computed. An in-memory product never reuses
+an old output by pathname: an existing directory raises `FileExistsError`
+unless `overwrite=True` requests recomputation and replacement. Stored output
+checksums remain available to `stack.verify()`. All computations return the
+geocoded raster even when it is also saved.
+
+Already georeferenced products pass through with a warning when no output or
+resampling options are given. Explicit output or grid changes on those
+products raise an error; use raster reprojection or export for those operations.
+
 ## Using FanInSAR's resamplers
 
 For geocoding (radar → geographic), prefer the kind-driven engine over the

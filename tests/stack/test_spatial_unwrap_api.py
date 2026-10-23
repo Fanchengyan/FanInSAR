@@ -80,8 +80,6 @@ def _stack_with_ifg(tmp_path: Path) -> Stack:
         source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
         complex_ifg=np.exp(1j * phase).astype(np.complex64),
         coherence=np.ones_like(phase),
-        wrapped_phase=phase,
-        amplitude=np.ones_like(phase),
     )
     stack.ifg_dirs = [stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113"]
     return stack
@@ -320,8 +318,6 @@ def test_replaced_ifg_blocks_analysis_until_unwrap_reruns(tmp_path: Path) -> Non
         source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
         complex_ifg=np.exp(1j * phase).astype(np.complex64),
         coherence=np.ones_like(phase),
-        wrapped_phase=phase,
-        amplitude=np.ones_like(phase),
         replace_existing=True,
     )
 
@@ -350,8 +346,6 @@ def test_stack_unwrap_rejects_unplanned_pair_products(tmp_path: Path) -> None:
         source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
         complex_ifg=np.exp(1j * phase).astype(np.complex64),
         coherence=np.ones_like(phase),
-        wrapped_phase=phase,
-        amplitude=np.ones_like(phase),
     )
 
     with pytest.raises(InvalidProcessingStateError, match="Pair set"):

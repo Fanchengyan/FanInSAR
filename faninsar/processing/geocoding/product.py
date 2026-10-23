@@ -31,10 +31,11 @@ class GeocodeableProduct(Protocol):
     Notes
     -----
     All members are attributes; adapters may expose them as plain attributes
-    or as properties. ``crs`` is ``None`` for radar-domain products; a
-    geographic ``crs`` marks a product that is already geocoded and makes the
-    entry point a warned no-op. ``asset_kind`` holds the mission-neutral
-    asset vocabulary (a :class:`~faninsar.network.products.AssetKind` or its
+    or as properties. ``crs`` is ``None`` for radar-domain products; a map
+    ``crs`` marks a product that is already geocoded. It passes through only
+    when no output or resampling change is requested. ``asset_kind`` holds
+    the mission-neutral vocabulary (a
+    :class:`~faninsar.network.products.AssetKind` or its
     string value) used to infer the resampling kernel when the caller does
     not pass ``kind`` explicitly; it may be ``None`` when the caller always
     names the kernel.
@@ -43,7 +44,7 @@ class GeocodeableProduct(Protocol):
 
     @property
     def name(self) -> str:
-        """Return the stable product identity used as the persisted name."""
+        """Return the layer name recorded in output metadata."""
         ...
 
     @property
@@ -84,8 +85,8 @@ class RadarDomainProduct:
     Parameters
     ----------
     name : str
-        Stable product identity; used as the persisted file stem and must be
-        a single safe path component.
+        Human-readable layer name recorded in output metadata. It must be
+        a single safe path component and is not a content fingerprint.
     values : numpy.ndarray
         2-D radar-domain raster. Its dtype must match the physical kind
         selected for geocoding (complex for ``complex``, floating point for
@@ -102,7 +103,7 @@ class RadarDomainProduct:
         ``(row, column)`` origin of the cropped window in the full radar
         frame.
     crs : object, optional
-        Product CRS; ``None`` (the radar domain) or a geographic CRS.
+        Product CRS; ``None`` for the radar domain, otherwise a map CRS.
 
     Raises
     ------

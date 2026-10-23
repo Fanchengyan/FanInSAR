@@ -1,11 +1,14 @@
 """Interferogram and unwrap products of a Stack (PROPOSAL-0059).
 
 An interferogram product is ``ifg/ml_AxR/<pair>/`` with Zarr layers and one
-``item.json`` (kind ``ifg``) that binds both scene write ids. The
-spatially unwrapped phase of that Pair is a separate product at
-``unwrap/ml_AxR/<pair>/`` (kind ``unwrap``) bound to the IFG ``write_id``.
-Both are written through :mod:`faninsar.io.storage.product`; reads validate
-the Item, shapes, and dtypes without re-hashing payloads.
+``item.json`` (kind ``ifg``) that binds both scene write ids. The persisted
+layers are the canonical ``complex_ifg`` plus optional ``coherence`` and
+``valid_mask``; ``wrapped_phase`` and ``amplitude`` are virtual layers derived
+as ``angle(complex_ifg)`` and ``abs(complex_ifg)`` at read time and never
+materialize separate Zarr stores. The spatially unwrapped phase of that Pair
+is a separate product at ``unwrap/ml_AxR/<pair>`` (kind ``unwrap``) bound to
+the IFG ``write_id``. Both are written through :mod:`faninsar.io.storage.product`;
+reads validate the Item, shapes, and dtypes without re-hashing payloads.
 """
 
 from __future__ import annotations
@@ -37,9 +40,48 @@ logger = setup_logger(__name__)
 
 IFG_KIND = "ifg"
 UNWRAP_KIND = "unwrap"
-_IFG_LAYERS = ("complex_ifg", "coherence", "wrapped_phase", "amplitude", "valid_mask")
-_REQUIRED_IFG_LAYERS = ("complex_ifg", "wrapped_phase", "amplitude")
+#: Persisted IFG layers; ``wrapped_phase`` and ``amplitude`` are virtual.
+_IFG_LAYERS = ("complex_ifg", "coherence", "valid_mask")
+_REQUIRED_IFG_LAYERS = ("complex_ifg",)
+#: Virtual layers derived from the canonical ``complex_ifg``.
+_VIRTUAL_IFG_LAYERS = ("wrapped_phase", "amplitude")
 _UNWRAP_LAYERS = ("unwrapped_phase", "connected_components")
+
+
+def _derive_virtual_layer(
+    name: str,
+    complex_ifg: np.ndarray,
+    valid_mask: np.ndarray | None,
+) -> np.ndarray:
+    """Derive one virtual IFG layer from the canonical complex IFG.
+
+    ``wrapped_phase`` is ``angle(complex_ifg)`` and ``amplitude`` is
+    ``abs(complex_ifg)``, keeping the complex real precision. Samples where a
+    persisted ``valid_mask`` is False are NaN in both derived layers; NaN
+    complex samples propagate NaN naturally.
+
+    Parameters
+    ----------
+    name : {"wrapped_phase", "amplitude"}
+        Virtual layer to derive.
+    complex_ifg : numpy.ndarray
+        Canonical complex IFG samples.
+    valid_mask : numpy.ndarray or None
+        Persisted support mask; ``None`` derives without masking.
+
+    Returns
+    -------
+    numpy.ndarray
+        Derived floating-point layer.
+
+    """
+    if name == "wrapped_phase":
+        derived = np.asarray(np.angle(complex_ifg))
+    else:
+        derived = np.asarray(np.abs(complex_ifg))
+    if valid_mask is not None:
+        derived[~valid_mask] = np.nan
+    return derived
 
 
 def _canonical_parameters(value: object, field_name: str) -> dict[str, Any]:
@@ -108,8 +150,11 @@ class InterferogramArtifact:
 
     Attributes
     ----------
-    complex_ifg, wrapped_phase, amplitude : numpy.ndarray
-        Product layers sharing one grid.
+    complex_ifg : numpy.ndarray
+        Canonical complex IFG layer sharing one grid with the other layers.
+    wrapped_phase, amplitude : numpy.ndarray
+        Virtual layers derived from ``complex_ifg`` at read time as
+        ``angle`` and ``abs``; samples masked by ``valid_mask`` are NaN.
     coherence : numpy.ndarray or None
         Optional coherence layer.
     valid_mask : numpy.ndarray or None
@@ -334,26 +379,97 @@ class InterferogramArtifactStore:
             reject_invalid_state(f"IFG layer {name} shape differs from the Item")
         return array
 
-    def read(self) -> InterferogramArtifact:
-        """Read all IFG layers after validating shapes and dtypes."""
-        arrays = {name: self._layer(name) for name in self._payloads}
-        if (
-            arrays["complex_ifg"].dtype.kind != "c"
-            or any(
-                arrays[name].dtype.kind != "f"
-                for name in ("wrapped_phase", "amplitude")
-            )
-            or ("coherence" in arrays and arrays["coherence"].dtype.kind != "f")
-        ):
+    def _check_layer_dtype(self, name: str, array: np.ndarray) -> None:
+        """Validate the dtype of one persisted IFG layer."""
+        if name == "complex_ifg" and array.dtype.kind != "c":
             reject_invalid_state("artifact IFG layer dtypes are incompatible")
-        valid_mask = arrays.get("valid_mask")
-        if valid_mask is not None and valid_mask.dtype != np.bool_:
+        if name == "coherence" and array.dtype.kind != "f":
+            reject_invalid_state("artifact IFG layer dtypes are incompatible")
+        if name == "valid_mask" and array.dtype != np.bool_:
             reject_invalid_state("artifact IFG valid_mask dtype is incompatible")
+
+    def _read_persisted_layer(self, name: str) -> np.ndarray:
+        """Read and validate one persisted IFG layer."""
+        if name not in _IFG_LAYERS:
+            reject_invalid_state(f"unknown IFG layer: {name!r}")
+        if name not in self._payloads:
+            reject_invalid_state(f"IFG product has no layer {name!r}")
+        array = self._layer(name)
+        self._check_layer_dtype(name, array)
+        return array
+
+    def read_layer(self, name: str) -> np.ndarray:
+        """Read one canonical IFG layer by name.
+
+        Parameters
+        ----------
+        name : {"complex_ifg", "wrapped_phase", "amplitude", "coherence", "valid_mask"}
+            Canonical layer name. ``wrapped_phase`` and ``amplitude`` are
+            virtual layers derived from ``complex_ifg`` as ``angle`` and
+            ``abs``; they are never persisted. Where a persisted
+            ``valid_mask`` is False, derived samples are NaN. The other names
+            read their persisted payloads.
+
+        Returns
+        -------
+        numpy.ndarray
+            Layer samples in ``(azimuth, range)`` order; derived layers keep
+            the complex real precision.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If the layer name is unknown, the persisted layer is absent or
+            damaged, or its dtype or shape is unexpected.
+
+        """
+        if name in _VIRTUAL_IFG_LAYERS:
+            complex_ifg = self._read_persisted_layer("complex_ifg")
+            valid_mask = (
+                self._read_persisted_layer("valid_mask")
+                if "valid_mask" in self._payloads
+                else None
+            )
+            return _derive_virtual_layer(name, complex_ifg, valid_mask)
+        return self._read_persisted_layer(name)
+
+    def read(self) -> InterferogramArtifact:
+        """Read all IFG layers, deriving wrapped phase and amplitude.
+
+        The canonical ``complex_ifg`` is loaded once; ``wrapped_phase`` and
+        ``amplitude`` are derived from it and are NaN where a persisted
+        ``valid_mask`` is False.
+
+        Returns
+        -------
+        InterferogramArtifact
+            Validated layers sharing one grid.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If any persisted layer is damaged or has an unexpected dtype or
+            shape.
+
+        """
+        complex_ifg = self._read_persisted_layer("complex_ifg")
+        coherence = (
+            self._read_persisted_layer("coherence")
+            if "coherence" in self._payloads
+            else None
+        )
+        valid_mask = (
+            self._read_persisted_layer("valid_mask")
+            if "valid_mask" in self._payloads
+            else None
+        )
         return InterferogramArtifact(
-            complex_ifg=arrays["complex_ifg"],
-            coherence=arrays.get("coherence"),
-            wrapped_phase=arrays["wrapped_phase"],
-            amplitude=arrays["amplitude"],
+            complex_ifg=complex_ifg,
+            coherence=coherence,
+            wrapped_phase=_derive_virtual_layer(
+                "wrapped_phase", complex_ifg, valid_mask
+            ),
+            amplitude=_derive_virtual_layer("amplitude", complex_ifg, valid_mask),
             valid_mask=valid_mask,
         )
 
@@ -451,8 +567,6 @@ def write_ifg_artifact(
     phase_screen_grid_identity: str | None = None,
     complex_ifg: np.ndarray,
     coherence: np.ndarray | None,
-    wrapped_phase: np.ndarray,
-    amplitude: np.ndarray,
     valid_mask: np.ndarray | None = None,
     replace_existing: bool = False,
 ) -> InterferogramArtifactStore:
@@ -493,10 +607,12 @@ def write_ifg_artifact(
         Source role to unit to scene write id of the applied screens.
     phase_screen_domain, phase_screen_grid_identity : str, optional
         Must equal the IFG domain and grid when given.
-    complex_ifg, wrapped_phase, amplitude : numpy.ndarray
-        Required layers.
+    complex_ifg : numpy.ndarray
+        Required canonical complex layer.
     coherence, valid_mask : numpy.ndarray, optional
-        Optional layers.
+        Optional layers. ``wrapped_phase`` and ``amplitude`` are virtual
+        layers derived from ``complex_ifg`` at read time and are never
+        persisted.
     replace_existing : bool, optional
         Replace an existing product.
 
@@ -506,11 +622,7 @@ def write_ifg_artifact(
         The committed product.
 
     """
-    arrays: dict[str, np.ndarray] = {
-        "complex_ifg": np.asarray(complex_ifg),
-        "wrapped_phase": np.asarray(wrapped_phase),
-        "amplitude": np.asarray(amplitude),
-    }
+    arrays: dict[str, np.ndarray] = {"complex_ifg": np.asarray(complex_ifg)}
     if coherence is not None:
         arrays["coherence"] = np.asarray(coherence)
     if valid_mask is not None:
@@ -521,12 +633,8 @@ def write_ifg_artifact(
     shape = next(iter(shapes))
     if len(shape) != 2 or any(size <= 0 for size in shape):
         reject_invalid_state("IFG artifact layers must be non-empty 2-D arrays")
-    if (
-        arrays["complex_ifg"].dtype.kind != "c"
-        or any(
-            arrays[name].dtype.kind != "f" for name in ("wrapped_phase", "amplitude")
-        )
-        or (coherence is not None and arrays["coherence"].dtype.kind != "f")
+    if arrays["complex_ifg"].dtype.kind != "c" or (
+        coherence is not None and arrays["coherence"].dtype.kind != "f"
     ):
         reject_invalid_state("IFG artifact layer dtypes are incompatible")
     if valid_mask is not None and arrays["valid_mask"].dtype != np.bool_:

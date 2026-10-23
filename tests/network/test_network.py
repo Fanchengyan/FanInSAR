@@ -42,8 +42,6 @@ def _stack_with_network(tmp_path: Path) -> S1Stack:
         source_manifest_digests={"primary": "a" * 64, "secondary": "b" * 64},
         complex_ifg=np.exp(1j * phase).astype(np.complex64),
         coherence=np.ones_like(phase),
-        wrapped_phase=phase,
-        amplitude=np.ones_like(phase),
     )
     stack.ifg_dirs = [store.root]
     write_unwrapped_artifact(

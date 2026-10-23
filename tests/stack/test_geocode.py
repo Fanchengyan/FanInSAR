@@ -9,8 +9,8 @@ persistence semantics (PROPOSAL-0033).
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -32,7 +32,7 @@ from faninsar.stack import Stack, StackConfig
 from faninsar.stack.catalog import SceneCatalog
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from faninsar.io.storage.ifg_store import InterferogramArtifactStore
 
 RADAR_SHAPE = (64, 128)
 UTM = "EPSG:32631"
@@ -104,6 +104,7 @@ def stack(tmp_path: Path) -> Stack:
             work_dir=tmp_path / "work",
             activation_mode="reference",
             grid=_scene_grid(model),
+            multilook=(1, 1),
             dem=ConstantDEM(0.0),
             device="cpu",
         ),
@@ -142,28 +143,233 @@ def _forbid_lut_rebuild(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(geo_lut, "build_geo2rdr_lut", _forbidden)
 
 
+def _write_ifg(
+    stack: Stack, *, value: float = 0.7, overwrite: bool = False
+) -> InterferogramArtifactStore:
+    """Commit one full-frame Pair whose phase and amplitude are known."""
+    from faninsar.io.storage.ifg_store import write_ifg_artifact
+
+    reference = stack.reference_scene
+    assert reference is not None
+    secondary = stack.scenes.get("20240113")
+    if secondary is None:
+        secondary = write_scene(
+            stack.config.work_dir / "coreg" / "20240113",
+            date_id="20240113",
+            reference_id=stack.reference,
+            domain="radar",
+            grid_shape=RADAR_SHAPE,
+            units=[
+                {
+                    "tag": "f0_IW1_b0",
+                    "payload": np.ones(RADAR_SHAPE, dtype=np.complex64),
+                    "row_origin": 0,
+                    "col_origin": 0,
+                }
+            ],
+            inputs={"reference": reference.write_id},
+        )
+    return write_ifg_artifact(
+        stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113",
+        pair=("20240101", "20240113"),
+        looks=(1, 1),
+        grid_identity=reference.grid_identity,
+        filter_name="none",
+        filter_parameters={},
+        source_manifest_digests={
+            "primary": reference.write_id,
+            "secondary": secondary.write_id,
+        },
+        complex_ifg=np.full(RADAR_SHAPE, np.exp(1j * value), dtype=np.complex64),
+        coherence=np.full(RADAR_SHAPE, 0.5, dtype=np.float32),
+        valid_mask=np.ones(RADAR_SHAPE, dtype=bool),
+        replace_existing=overwrite,
+    )
+
+
+def test_pair_phase_attributes_retain_wrapped_and_unwrapped_semantics(
+    stack: Stack,
+) -> None:
+    """Short phase attributes carry the type and source required for geocoding."""
+    from faninsar.io.storage.ifg_store import write_unwrapped_artifact
+
+    store = _write_ifg(stack)
+    write_unwrapped_artifact(
+        store.root,
+        unwrapped_phase=np.full(RADAR_SHAPE, 10 * np.pi + 0.7, dtype=np.float32),
+        connected_components=np.ones(RADAR_SHAPE, dtype=np.uint32),
+        method="test",
+        method_parameters={},
+        ifg_manifest_digest=store.write_id,
+    )
+    ifg = stack.interferograms["20240101_20240113"]
+    assert str(ifg.wrapped.asset_kind) == "wrapped_phase"
+    assert str(ifg.unwrapped.asset_kind) == "unwrapped_phase"
+    assert ifg.wrapped.path is None
+    assert ifg.amplitude.path is None
+    assert ifg.complex_ifg.path.is_dir()
+    wrapped = stack.geocode(ifg.wrapped)
+    unwrapped = stack.geocode(ifg.unwrapped)
+    np.testing.assert_allclose(wrapped.values[wrapped.valid], 0.7, atol=1e-5)
+    np.testing.assert_allclose(
+        unwrapped.values[unwrapped.valid], 10 * np.pi + 0.7, atol=1e-5
+    )
+    assert (store.root / "geocoded" / "wrapped_phase" / "item.json").is_file()
+    assert (store.unwrap_root / "geocoded" / "unwrapped_phase" / "item.json").is_file()
+
+
+def test_flat_layer_surface_lists_names_and_keeps_virtual_paths_none(
+    stack: Stack,
+) -> None:
+    """``ifg.layers`` lists accessible names and virtual handles expose no path."""
+    from faninsar.io.storage.ifg_store import write_unwrapped_artifact
+
+    store = _write_ifg(stack)
+    ifg = stack.interferograms["20240101_20240113"]
+    assert ifg.layers == ["amplitude", "coherence", "complex_ifg", "wrapped"]
+    assert ifg.wrapped.path is None
+    assert ifg.amplitude.path is None
+    assert ifg.complex_ifg.path.is_dir()
+    np.testing.assert_allclose(ifg.wrapped.values, 0.7, atol=1e-5)
+    np.testing.assert_allclose(ifg.amplitude.values, 1.0, atol=1e-6)
+    assert ifg.wrapped.geocode_kind == "phase"
+    # Deriving values must never materialize a virtual payload on disk.
+    assert not (store.root / "wrapped_phase.zarr").exists()
+    assert not (store.root / "amplitude.zarr").exists()
+
+    write_unwrapped_artifact(
+        store.root,
+        unwrapped_phase=np.full(RADAR_SHAPE, 0.7, dtype=np.float32),
+        connected_components=np.ones(RADAR_SHAPE, dtype=np.uint32),
+        method="test",
+        method_parameters={},
+        ifg_manifest_digest=store.write_id,
+    )
+    assert stack.interferograms["20240101_20240113"].layers == [
+        "amplitude",
+        "coherence",
+        "complex_ifg",
+        "connected_components",
+        "unwrapped",
+        "wrapped",
+    ]
+    assert ifg.unwrapped.path.is_dir()
+    assert str(ifg.unwrapped.asset_kind) == "unwrapped_phase"
+    assert ifg.connected_components.geocode_kind == "label"
+    np.testing.assert_allclose(ifg.connected_components.values, 1, rtol=0.0, atol=1e-6)
+
+
+def test_missing_optional_layers_raise_file_not_found(stack: Stack) -> None:
+    """Unestimated optional layers name the missing result without staging runs."""
+    from faninsar.io.storage.ifg_store import write_ifg_artifact
+    from faninsar.io.storage.product import open_product
+
+    reference = stack.reference_scene
+    assert reference is not None
+    secondary_root = stack.config.work_dir / "coreg" / "20240113"
+    write_scene(
+        secondary_root,
+        date_id="20240113",
+        reference_id=stack.reference,
+        domain="radar",
+        grid_shape=RADAR_SHAPE,
+        units=[
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.ones(RADAR_SHAPE, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+            }
+        ],
+        inputs={"reference": reference.write_id},
+    )
+    secondary = open_product(secondary_root)
+    write_ifg_artifact(
+        stack.config.work_dir / "ifg" / "ml_1x1" / "20240101_20240113",
+        pair=("20240101", "20240113"),
+        looks=(1, 1),
+        grid_identity=reference.grid_identity,
+        filter_name="none",
+        filter_parameters={},
+        source_manifest_digests={
+            "primary": reference.write_id,
+            "secondary": secondary.write_id,
+        },
+        complex_ifg=np.ones(RADAR_SHAPE, dtype=np.complex64),
+        coherence=None,
+        valid_mask=None,
+    )
+    ifg = stack.interferograms["20240101_20240113"]
+    assert ifg.layers == ["amplitude", "complex_ifg", "wrapped"]
+    with pytest.raises(FileNotFoundError, match="coherence"):
+        ifg.coherence
+    with pytest.raises(FileNotFoundError, match="unwrapped"):
+        ifg.unwrapped
+    with pytest.raises(FileNotFoundError, match="unwrapped result"):
+        ifg.connected_components
+    assert not stack.interferograms.exists("20240101_20240113", "coherence")
+    # Item/path adapters must not invent a file for an unestimated optional
+    # payload: no coherence href may appear without a persisted coherence.zarr.
+    with pytest.raises(FileNotFoundError, match="coherence"):
+        stack.interferograms.path("20240101_20240113", "coherence")
+    item = stack.interferograms.item("20240101_20240113")
+    assert set(item["assets"]) == {"complex_ifg"}
+    assert all(Path(asset["href"]).exists() for asset in item["assets"].values())
+
+
+def test_collection_items_and_paths_never_invent_virtual_files(stack: Stack) -> None:
+    """Item assets enumerate real payloads only; short public names stay readable."""
+    from faninsar.io.storage.ifg_store import write_unwrapped_artifact
+
+    store = _write_ifg(stack)
+    collection = stack.interferograms
+    pair = "20240101_20240113"
+    item = collection.item(pair)
+    assert set(item["assets"]) == {"complex_ifg", "coherence"}
+    for name in ("wrapped", "wrapped_phase", "amplitude"):
+        with pytest.raises(FileNotFoundError, match="virtual"):
+            collection.path(pair, name)
+    np.testing.assert_allclose(
+        collection.open(pair, "wrapped").values,
+        collection.open(pair, "wrapped_phase").values,
+    )
+    write_unwrapped_artifact(
+        store.root,
+        unwrapped_phase=np.full(RADAR_SHAPE, 0.2, dtype=np.float32),
+        connected_components=np.ones(RADAR_SHAPE, dtype=np.uint32),
+        method="test",
+        method_parameters={},
+        ifg_manifest_digest=store.write_id,
+    )
+    assert set(collection.item(pair)["assets"]) == {
+        "complex_ifg",
+        "coherence",
+        "unw_phase",
+    }
+    assert collection.exists(pair, "unwrapped")
+    assert collection.path(pair, "unwrapped") == collection.path(pair, "unw_phase")
+    np.testing.assert_allclose(
+        collection.open_stack("unwrapped").values,
+        collection.open_stack("unw_phase").values,
+    )
+
+
 def test_geocode_complex_product_roundtrip_and_reuse(
     stack: Stack,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A complex product geocodes once, commits COGs, and reuses on re-call."""
-    values = np.full(RADAR_SHAPE, 0.25 + 0.75j, dtype=np.complex64)
-    product = RadarDomainProduct(
-        name="pair_ifg",
-        values=values,
-        full_radar_shape=RADAR_SHAPE,
-        asset_kind=AssetKind.COMPLEX_INTERFEROGRAM,
-    )
-    source = stack.reference_scene
-    assert source is not None
-    raster = stack.geocode(product, source=source)
+    store = _write_ifg(stack)
+    product = stack.interferograms["20240101_20240113"].complex_ifg
+    values = product.read()
+    raster = stack.geocode(product)
     assert raster.values.dtype == np.complex64
     assert raster.valid.dtype == np.bool_
     assert raster.valid.any()
     assert raster.grid.crs == UTM
-    target = source.root / "geocoded"
-    assert (target / "pair_ifg.tif").is_file()
-    assert (target / "pair_ifg_valid.tif").is_file()
+    target = store.root / "geocoded" / "complex_ifg"
+    assert (target / "values.tif").is_file()
+    assert (target / "valid.tif").is_file()
     assert (target / "item.json").is_file()
     assert (stack.config.work_dir / "cache" / "geo-lut").is_dir()
 
@@ -186,10 +392,37 @@ def test_geocode_complex_product_roundtrip_and_reuse(
     )
 
     _forbid_lut_rebuild(monkeypatch)
-    reused = stack.geocode(product, source=source)
+    reused = stack.geocode(product)
     np.testing.assert_array_equal(np.asarray(reused.values), np.asarray(raster.values))
     np.testing.assert_array_equal(reused.valid, raster.valid)
     assert reused.grid == raster.grid
+
+
+def test_memory_geocode_path_requires_explicit_replacement(stack: Stack) -> None:
+    """A destination never substitutes for the identity of an in-memory array."""
+    from faninsar.io.storage.product import open_product
+
+    values = np.full(RADAR_SHAPE, 1.5, dtype=np.float32)
+    product = RadarDomainProduct(
+        name="derived",
+        values=values,
+        full_radar_shape=RADAR_SHAPE,
+        asset_kind=AssetKind.UNWRAPPED_PHASE,
+    )
+    target = stack.config.work_dir / "results" / "derived"
+    first = stack.geocode(product, path=target)
+    original_id = open_product(target).write_id
+    values[:] = 9.0
+    with pytest.raises(FileExistsError, match="overwrite=True"):
+        stack.geocode(product, path=target)
+    assert open_product(target).write_id == original_id
+    replacement = stack.geocode(product, path=target, overwrite=True)
+    assert open_product(target).write_id != original_id
+    np.testing.assert_allclose(first.values[first.valid], 1.5, atol=1e-6)
+    np.testing.assert_allclose(replacement.values[replacement.valid], 9.0, atol=1e-6)
+    assert (target / "values.tif").is_file()
+    assert (target / "valid.tif").is_file()
+    assert open_product(target).inputs == {}
 
 
 def test_geocode_phase_product_returns_wrapped_radians(stack: Stack) -> None:
@@ -285,47 +518,176 @@ def test_geocode_kind_lookup_failures(stack: Stack) -> None:
 
 
 def test_geocode_overwrite_semantics(stack: Stack) -> None:
-    """Source-attached geocode reuses, fails on stale bindings, replaces."""
-    source = stack.reference_scene
-    assert source is not None
-    target = source.root / "geocoded"
+    """Source-attached children follow source replacement and explicit overwrite."""
+    from faninsar.io.storage.product import open_product
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    store = _write_ifg(stack)
+    product = stack.interferograms["20240101_20240113"].wrapped
+    target = store.root / "geocoded" / "wrapped_phase"
+    committed = stack.geocode(product)
+    original = open_product(target)
+    assert original.inputs["source"] == store.write_id
+    reused = stack.geocode(product)
+    assert open_product(target).write_id == original.write_id
+    np.testing.assert_array_equal(committed.values, reused.values)
+
+    fresh_store = _write_ifg(stack, value=1.2, overwrite=True)
+    assert not target.exists()
+    with pytest.raises(InvalidProcessingStateError, match="replaced source"):
+        stack.geocode(product)
+    fresh = stack.interferograms["20240101_20240113"].wrapped
+    replaced = stack.geocode(fresh)
+    np.testing.assert_allclose(replaced.values[replaced.valid], 1.2, atol=1e-5)
+    assert open_product(target).inputs["source"] == fresh_store.write_id
+
+    (target / "item.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(InvalidProcessingStateError, match="item.json"):
+        stack.geocode(fresh)
+    stack.geocode(fresh, overwrite=True)
+    assert open_product(target).properties["faninsar:geocode"]
+
+
+@pytest.mark.parametrize(
+    "asset_kind, incompatible",
+    [
+        (AssetKind.WRAPPED_PHASE, "continuous"),
+        (AssetKind.UNWRAPPED_PHASE, "phase"),
+    ],
+)
+def test_geocode_rejects_a_kernel_that_conflicts_with_phase_type(
+    stack: Stack, asset_kind: AssetKind, incompatible: str
+) -> None:
+    """Real-valued phases must retain their distinct interpolation rules."""
     product = RadarDomainProduct(
-        name="unw",
-        values=np.full(RADAR_SHAPE, 1.5, dtype=np.float32),
+        name="phase",
+        values=np.ones(RADAR_SHAPE, dtype=np.float32),
         full_radar_shape=RADAR_SHAPE,
-        asset_kind=AssetKind.UNWRAPPED_PHASE,
+        asset_kind=asset_kind,
     )
-    committed = stack.geocode(product, source=source)
-    assert (target / "item.json").is_file()
-    item = json.loads((target / "item.json").read_text(encoding="utf-8"))
-    assert item["properties"]["faninsar:inputs"] == {"source": source.write_id}
+    with pytest.raises(ValueError, match="conflicts"):
+        stack.geocode(product, kind=incompatible)
 
-    # The same request reuses the committed child.
-    reused = stack.geocode(product, source=source)
-    np.testing.assert_array_equal(
-        np.asarray(committed.values), np.asarray(reused.values)
-    )
 
-    # A sourceless geocode is one-off: returned in memory, nothing committed.
-    one_off = stack.geocode(
-        RadarDomainProduct(
-            name="unw",
-            values=np.full(RADAR_SHAPE, 9.0, dtype=np.float32),
-            full_radar_shape=RADAR_SHAPE,
-            asset_kind=AssetKind.UNWRAPPED_PHASE,
-        )
+@pytest.mark.parametrize("crs", ["EPSG:4326", UTM])
+def test_georeferenced_input_does_not_ignore_requested_output(
+    stack: Stack, crs: str
+) -> None:
+    """Pass-through is allowed only without an output or regridding request."""
+    product = RadarDomainProduct(
+        name="map_phase",
+        values=np.ones(RADAR_SHAPE, dtype=np.float32),
+        full_radar_shape=RADAR_SHAPE,
+        crs=crs,
     )
-    np.testing.assert_allclose(
-        np.asarray(one_off.values)[one_off.valid], 9.0, rtol=0.0, atol=1e-6
-    )
-    assert sorted(path.name for path in target.iterdir()) == sorted(
-        path.name for path in target.iterdir()
-    )
+    assert stack.geocode(product) is product
+    with pytest.raises(ValueError, match="already georeferenced"):
+        stack.geocode(product, path=stack.config.work_dir / "map_copy")
+    with pytest.raises(ValueError, match="already georeferenced"):
+        stack.geocode(product, grid=stack.grid)
 
-    # Overwriting the source removes the geocoded child with it (the
-    # kernel replaces the whole directory); the next call regenerates.
+
+def test_layer_cache_is_lazy_and_tracks_dem_context(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed hit reads no input raster and a changed DEM prevents reuse."""
+    from faninsar.io.storage.product import Product, open_product
+
+    store = _write_ifg(stack)
+    product = stack.interferograms["20240101_20240113"].wrapped
+    raster = stack.geocode(product)
+    target = store.root / "geocoded" / "wrapped_phase"
+    original = open_product(target).write_id
+
+    def forbid_payload(*_args, **_kwargs):
+        raise AssertionError("cached layer read input-array payloads")
+
+    monkeypatch.setattr(Product, "read", forbid_payload)
+    cached = stack.geocode(stack.interferograms["20240101_20240113"].wrapped)
+    np.testing.assert_array_equal(cached.values, raster.values)
+    assert open_product(target).write_id == original
+    stack.config.dem = ConstantDEM(20.0)
+    with pytest.raises(ValueError, match="different"):
+        stack.geocode(product)
+
+
+def test_alternate_grid_and_layer_outputs_do_not_replace_each_other(
+    stack: Stack,
+) -> None:
+    """Per-layer children are independent, and alternate grids are one-off."""
+    from faninsar.io.storage.product import open_product
+
+    store = _write_ifg(stack)
+    ifg = stack.interferograms["20240101_20240113"]
+    stack.geocode(ifg.wrapped)
+    phase_target = store.root / "geocoded" / "wrapped_phase"
+    original = open_product(phase_target).write_id
+    stack.geocode(ifg.coherence)
+    assert (store.root / "geocoded" / "coherence" / "item.json").is_file()
+    alternate = GeoGridSpec(
+        crs=stack.grid.crs,
+        transform=stack.grid.transform,
+        width=stack.grid.width - 1,
+        height=stack.grid.height,
+        resolution_m=stack.grid.resolution_m,
+    )
+    raster = stack.geocode(ifg.wrapped, grid=alternate)
+    assert raster.grid == alternate
+    assert open_product(phase_target).write_id == original
+    custom = stack.config.work_dir / "results" / "phase_alternate"
+    stack.geocode(ifg.wrapped, grid=alternate, path=custom)
+    assert open_product(custom).inputs["source"] == store.write_id
+    with pytest.raises(ValueError, match="source|ancestor"):
+        stack.geocode(ifg.wrapped, path=store.root, overwrite=True)
+    assert open_product(store.root).write_id == store.write_id
+
+
+def test_unwrapped_support_and_labels_follow_the_source(stack: Stack) -> None:
+    """Finite phase in excluded components must never become valid output."""
+    from faninsar.io.storage.ifg_store import write_unwrapped_artifact
+
+    store = _write_ifg(stack)
+    write_unwrapped_artifact(
+        store.root,
+        unwrapped_phase=np.full(RADAR_SHAPE, 9.0, dtype=np.float32),
+        connected_components=np.zeros(RADAR_SHAPE, dtype=np.uint32),
+        method="test",
+        method_parameters={},
+        ifg_manifest_digest=store.write_id,
+        extra_layers={"valid_mask": np.zeros(RADAR_SHAPE, dtype=bool)},
+    )
+    unwrapped = stack.interferograms["20240101_20240113"].unwrapped
+    raster = stack.geocode(unwrapped)
+    assert not raster.valid.any()
+    assert np.isnan(raster.values).all()
+    labels = stack.geocode(
+        stack.interferograms["20240101_20240113"].connected_components
+    )
+    assert labels.values.dtype == np.uint32
+    assert not labels.valid.any()
+
+
+def test_layer_values_are_detached_from_committed_provenance(stack: Stack) -> None:
+    """Changing a loaded array cannot silently change a source-bound request."""
+    _write_ifg(stack)
+    layer = stack.interferograms["20240101_20240113"].wrapped
+    detached = layer.read()
+    detached[:] = -1.0
+    assert not layer.values.flags.writeable
+    raster = stack.geocode(layer)
+    np.testing.assert_allclose(raster.values[raster.valid], 0.7, atol=1e-5)
+
+
+def test_layer_rejects_replacement_of_its_reference_frame(stack: Stack) -> None:
+    """A same-shaped replacement Reference does not make an old layer current."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    _write_ifg(stack)
+    layer = stack.interferograms["20240101_20240113"].wrapped
+    reference = stack.reference_scene
+    assert reference is not None
     write_scene(
-        source.root,
+        reference.root,
         date_id=stack.reference,
         reference_id=stack.reference,
         domain="radar",
@@ -333,7 +695,7 @@ def test_geocode_overwrite_semantics(stack: Stack) -> None:
         units=[
             {
                 "tag": "f0_IW1_b0",
-                "payload": np.full(RADAR_SHAPE, 2.0, dtype=np.complex64),
+                "payload": np.ones(RADAR_SHAPE, dtype=np.complex64),
                 "row_origin": 0,
                 "col_origin": 0,
             }
@@ -343,21 +705,53 @@ def test_geocode_overwrite_semantics(stack: Stack) -> None:
         },
         overwrite=True,
     )
-    assert not (source.root / "geocoded").exists()
-    fresh_source = stack.reference_scene
-    assert fresh_source is not None and fresh_source.write_id != source.write_id
-    replaced = stack.geocode(product, source=fresh_source)
-    assert replaced.valid.any()
-    item = json.loads((target / "item.json").read_text(encoding="utf-8"))
-    assert item["properties"]["faninsar:inputs"] == {"source": fresh_source.write_id}
+    with pytest.raises(InvalidProcessingStateError, match="replaced|Reference"):
+        stack.geocode(layer)
+    with pytest.raises(InvalidProcessingStateError, match="replaced|Reference"):
+        stack.interferograms["20240101_20240113"]
 
-    # A corrupt Item fails actionably without overwrite and heals with it.
-    (target / "item.json").write_text("{not json", encoding="utf-8")
-    with pytest.raises(Exception, match="item.json"):
-        stack.geocode(product, source=fresh_source)
-    stack.geocode(product, source=fresh_source, overwrite=True)
-    record = json.loads((target / "item.json").read_text(encoding="utf-8"))
-    assert record["properties"]["faninsar:identity"]
+
+def test_layer_rejects_a_different_stack_reference(
+    stack: Stack, tmp_path: Path
+) -> None:
+    """Equal array shapes do not make two Reference products interchangeable."""
+    from faninsar.processing.errors import InvalidProcessingStateError
+
+    _write_ifg(stack)
+    layer = stack.interferograms["20240101_20240113"].wrapped
+    other = Stack(
+        catalog=stack.catalog,
+        config=StackConfig(
+            work_dir=tmp_path / "other",
+            activation_mode="reference",
+            grid=stack.grid,
+            dem=ConstantDEM(0.0),
+            device="cpu",
+        ),
+        reference=stack.reference,
+        pairs=stack.pairs,
+        misreg_pairs=stack.misreg_pairs,
+    )
+    write_scene(
+        other.config.work_dir / "coreg" / other.reference,
+        date_id=other.reference,
+        reference_id=other.reference,
+        domain="radar",
+        grid_shape=RADAR_SHAPE,
+        units=[
+            {
+                "tag": "f0_IW1_b0",
+                "payload": np.ones(RADAR_SHAPE, dtype=np.complex64),
+                "row_origin": 0,
+                "col_origin": 0,
+            }
+        ],
+        properties={
+            "faninsar:radar_geometry": radar_geometry_record(*_toy_grid_and_orbit())
+        },
+    )
+    with pytest.raises(InvalidProcessingStateError, match="Reference"):
+        other.geocode(layer)
 
 
 def test_geocode_applies_origin_and_multilook_mapping(stack: Stack) -> None:
@@ -722,6 +1116,7 @@ def test_reopened_stack_geocode_shares_one_lut_entry_and_matches(
             work_dir=work,
             activation_mode="reference",
             grid=_scene_grid(model),
+            multilook=(1, 1),
             dem=ConstantDEM(0.0),
             device="cpu",
         ),
@@ -756,19 +1151,19 @@ def test_reopened_stack_geocode_shares_one_lut_entry_and_matches(
         multilook=(2, 2),
         origin=(2, 4),
     )
-    source = stack.reference_scene
-    assert source is not None
-    in_process = stack.geocode(product, source=source)
+    in_process = stack.geocode(product)
 
     save_stack_identity(stack)
     reopened = Stack.open(work, device="cpu")
-    # The reopened Stack must reuse both the committed geocode product and
-    # the in-process LUT cache entry (never rebuilding the table).
-    _forbid_lut_rebuild(monkeypatch)
-    reopened_source = reopened.reference_scene
-    assert reopened_source is not None
-    assert reopened_source.write_id == source.write_id
-    reopened_geocode = reopened.geocode(product, source=reopened_source)
+    from faninsar.processing.geocoding import geo_lut
+
+    def forbid_solve(*_args, **_kwargs):
+        raise AssertionError(
+            "reopened geocode solved geometry instead of reusing the LUT"
+        )
+
+    monkeypatch.setattr(geo_lut, "run_geo2rdr", forbid_solve)
+    reopened_geocode = reopened.geocode(product)
 
     np.testing.assert_array_equal(
         np.asarray(in_process.values), np.asarray(reopened_geocode.values)

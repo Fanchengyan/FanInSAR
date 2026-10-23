@@ -10,12 +10,14 @@ import numpy as np
 import pytest
 
 from faninsar.io.storage.ifg_store import (
+    IFG_KIND,
     InterferogramArtifactStore,
     unwrap_root,
     write_ifg_artifact,
     write_unwrapped_artifact,
 )
-from faninsar.io.storage.product import verify_product
+from faninsar.io.storage.product import open_product, verify_product
+from faninsar.network.layers import InterferogramLayers
 from faninsar.processing.errors import InvalidProcessingStateError
 
 if TYPE_CHECKING:
@@ -29,13 +31,16 @@ def _ifg_dir(tmp_path: Path) -> Path:
 
 
 def _ifg_arrays(shape: tuple[int, int] = (2, 3)) -> dict[str, np.ndarray]:
-    """Return one internally consistent small interferogram product."""
+    """Return the persisted layers of one small interferogram product.
+
+    ``wrapped_phase`` and ``amplitude`` are virtual layers and are never
+    persisted, so the fixture only carries the canonical complex IFG and the
+    optional coherence.
+    """
     complex_ifg = np.full(shape, 1.0 + 2.0j, dtype=np.complex64)
     return {
         "complex_ifg": complex_ifg,
         "coherence": np.full(shape, 0.75, dtype=np.float32),
-        "wrapped_phase": np.angle(complex_ifg).astype(np.float32),
-        "amplitude": np.abs(complex_ifg).astype(np.float32),
     }
 
 
@@ -65,6 +70,13 @@ def _unwrap(store: InterferogramArtifactStore, **overrides: object) -> None:
     write_unwrapped_artifact(store.root, **kwargs)  # type: ignore[arg-type]
 
 
+def _layers(store: InterferogramArtifactStore) -> InterferogramLayers:
+    """Return the flat per-Pair layer view of one committed IFG product."""
+    return InterferogramLayers(
+        open_product(store.root, kind=IFG_KIND), store.shape, store.looks
+    )
+
+
 def _edit_item(root: Path, **properties: object) -> None:
     path = root / "item.json"
     item = json.loads(path.read_text())
@@ -73,14 +85,20 @@ def _edit_item(root: Path, **properties: object) -> None:
 
 
 def test_ifg_artifact_round_trip_records_provenance(tmp_path: Path) -> None:
-    """All IFG layers and their processing provenance round-trip exactly."""
+    """Persisted layers round-trip; virtual layers derive without new assets."""
     root = _ifg_dir(tmp_path)
     store = _write_base(root)
 
     product = store.read()
     expected = _ifg_arrays()
-    for name in ("complex_ifg", "coherence", "wrapped_phase", "amplitude"):
-        np.testing.assert_array_equal(getattr(product, name), expected[name])
+    np.testing.assert_array_equal(product.complex_ifg, expected["complex_ifg"])
+    np.testing.assert_array_equal(product.coherence, expected["coherence"])
+    expected_wrapped = np.angle(expected["complex_ifg"]).astype(np.float32)
+    expected_amplitude = np.abs(expected["complex_ifg"]).astype(np.float32)
+    np.testing.assert_array_equal(product.wrapped_phase, expected_wrapped)
+    np.testing.assert_array_equal(product.amplitude, expected_amplitude)
+    assert product.wrapped_phase.dtype == np.float32
+    assert product.amplitude.dtype == np.float32
     assert store.pair == ("20240101", "20240113")
     assert store.looks == (2, 3)
     assert store.filter_name == "goldstein"
@@ -89,20 +107,132 @@ def test_ifg_artifact_round_trip_records_provenance(tmp_path: Path) -> None:
     item = json.loads((root / "item.json").read_text())
     assert item["properties"]["faninsar:kind"] == "ifg"
     assert item["properties"]["faninsar:inputs"] == _SOURCES
-    assert set(item["assets"]) == {
-        "amplitude",
-        "coherence",
-        "complex_ifg",
-        "wrapped_phase",
-    }
+    assert set(item["assets"]) == {"coherence", "complex_ifg"}
     assert sorted(path.name for path in root.iterdir()) == [
-        "amplitude.zarr",
         "coherence.zarr",
         "complex_ifg.zarr",
         "item.json",
-        "wrapped_phase.zarr",
     ]
     assert not [path for path in root.parent.iterdir() if path.name.startswith(".")]
+
+
+def test_read_layer_derives_virtual_layers_and_writes_nothing(tmp_path: Path) -> None:
+    """Virtual layers derive from the canonical complex IFG without writing."""
+    root = _ifg_dir(tmp_path)
+    complex_ifg = np.array(
+        [[1.0 + 2.0j, np.nan + 0.0j], [0.0 + 0.0j, -1.0 + 0.0j]],
+        dtype=np.complex64,
+    )
+    valid_mask = np.array([[True, True], [True, False]])
+    store = _write_base(
+        root,
+        complex_ifg=complex_ifg,
+        coherence=np.full((2, 2), 0.5, dtype=np.float32),
+        valid_mask=valid_mask,
+    )
+
+    wrapped_phase = store.read_layer("wrapped_phase")
+    amplitude = store.read_layer("amplitude")
+    expected_wrapped = np.angle(complex_ifg)
+    expected_amplitude = np.abs(complex_ifg)
+    expected_wrapped[~valid_mask] = np.nan
+    expected_amplitude[~valid_mask] = np.nan
+    np.testing.assert_array_equal(wrapped_phase, expected_wrapped)
+    np.testing.assert_array_equal(amplitude, expected_amplitude)
+    assert wrapped_phase.dtype == np.float32
+    assert amplitude.dtype == np.float32
+    # Zero complex samples keep exact zeros; NaN complex samples propagate NaN.
+    assert wrapped_phase[1, 0] == 0.0
+    assert amplitude[1, 0] == 0.0
+    assert np.isnan(wrapped_phase[0, 1]) and np.isnan(amplitude[0, 1])
+    # Invalid support becomes NaN even where the complex sample is finite.
+    assert np.isnan(wrapped_phase[1, 1]) and np.isnan(amplitude[1, 1])
+
+    artifact = store.read()
+    np.testing.assert_array_equal(artifact.wrapped_phase, wrapped_phase)
+    np.testing.assert_array_equal(artifact.amplitude, amplitude)
+    np.testing.assert_array_equal(artifact.valid_mask, valid_mask)
+    # Real assets only; virtual reads never write wrapped/amplitude stores.
+    assert sorted(path.name for path in root.iterdir()) == [
+        "coherence.zarr",
+        "complex_ifg.zarr",
+        "item.json",
+        "valid_mask.zarr",
+    ]
+    item = json.loads((root / "item.json").read_text())
+    assert set(item["assets"]) == {"coherence", "complex_ifg", "valid_mask"}
+
+
+def test_read_layer_focus_reads_only_the_requested_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A focused layer read must not load unrelated payloads."""
+    import faninsar.io.storage.ifg_store as ifg_store_module
+
+    root = _ifg_dir(tmp_path)
+    store = _write_base(root, valid_mask=np.ones((2, 3), dtype=bool))
+    seen: list[str] = []
+    original = ifg_store_module.read_zarr_array
+
+    def recording(path: Path) -> np.ndarray:
+        seen.append(path.name)
+        return original(path)
+
+    monkeypatch.setattr(ifg_store_module, "read_zarr_array", recording)
+    store.read_layer("coherence")
+    assert seen == ["coherence.zarr"]
+    seen.clear()
+    store.read_layer("wrapped_phase")
+    assert seen == ["complex_ifg.zarr", "valid_mask.zarr"]
+    seen.clear()
+    store.read()
+    # The canonical complex IFG is loaded once per read bundle.
+    assert seen == ["complex_ifg.zarr", "coherence.zarr", "valid_mask.zarr"]
+
+
+def test_read_layer_rejects_unknown_missing_and_damaged_layers(
+    tmp_path: Path,
+) -> None:
+    """Unknown names, absent optionals, and damaged payloads fail closed."""
+    import zarr
+
+    root = _ifg_dir(tmp_path)
+    store = _write_base(root)
+    with pytest.raises(InvalidProcessingStateError):
+        store.read_layer("phase")
+    with pytest.raises(InvalidProcessingStateError):
+        store.read_layer("valid_mask")
+
+    without_coherence = _write_base(tmp_path / "bare", coherence=None)
+    with pytest.raises(InvalidProcessingStateError):
+        without_coherence.read_layer("coherence")
+    assert without_coherence.read().coherence is None
+
+    # A dtype-damaged canonical complex layer invalidates derived reads too.
+    zarr.open_array(
+        store=str(root / "complex_ifg.zarr"), mode="w", shape=(2, 3), dtype=np.float32
+    )
+    for name in ("complex_ifg", "wrapped_phase", "amplitude"):
+        with pytest.raises(InvalidProcessingStateError):
+            store.read_layer(name)
+    with pytest.raises(InvalidProcessingStateError):
+        store.read()
+
+
+def test_read_layer_rejects_wrong_shape_mask_payload(tmp_path: Path) -> None:
+    """A wrong-shape ``valid_mask`` fails closed for mask and virtual reads."""
+    import zarr
+
+    root = _ifg_dir(tmp_path)
+    store = _write_base(root, valid_mask=np.ones((2, 3), dtype=bool))
+    zarr.open_array(
+        store=str(root / "valid_mask.zarr"), mode="w", shape=(1, 1), dtype=bool
+    )
+    with pytest.raises(InvalidProcessingStateError):
+        store.read_layer("valid_mask")
+    with pytest.raises(InvalidProcessingStateError):
+        store.read_layer("amplitude")
 
 
 def test_unwrap_is_a_separate_product_bound_to_the_ifg(tmp_path: Path) -> None:
@@ -241,15 +371,15 @@ def test_verify_detects_modified_payload(tmp_path: Path) -> None:
     assert verify_product(root) == []
     import zarr
 
-    array = zarr.open_array(store=str(root / "amplitude.zarr"), mode="r+")
+    array = zarr.open_array(store=str(root / "coherence.zarr"), mode="r+")
     array[0, 0] = 99.0
-    assert verify_product(root) == ["amplitude"]
+    assert verify_product(root) == ["coherence"]
 
 
 def test_ifg_artifact_rejects_inconsistent_arrays(tmp_path: Path) -> None:
     """A product whose layers do not share shape fails before commit."""
     arrays = _ifg_arrays()
-    arrays["amplitude"] = np.ones((1, 1), dtype=np.float32)
+    arrays["coherence"] = np.ones((1, 1), dtype=np.float32)
     with pytest.raises(InvalidProcessingStateError):
         _write_base(_ifg_dir(tmp_path), **arrays)
     assert not _ifg_dir(tmp_path).exists()
@@ -301,12 +431,24 @@ def test_replacing_the_ifg_makes_its_unwrap_stale(tmp_path: Path) -> None:
     replaced = _write_base(root, replace_existing=True)
 
     assert not replaced.has_unwrapped()
+    stale = _layers(replaced)
+    assert stale.layers == ["amplitude", "coherence", "complex_ifg", "wrapped"]
+    with pytest.raises(InvalidProcessingStateError, match="replaced IFG"):
+        stale.unwrapped
     with pytest.raises(InvalidProcessingStateError, match="different IFG"):
         replaced.read_unwrapped()
     with pytest.raises(InvalidProcessingStateError, match="already exists"):
         _unwrap(replaced)
     _unwrap(replaced, replace_existing=True)
     assert replaced.has_unwrapped()
+    assert _layers(replaced).layers == [
+        "amplitude",
+        "coherence",
+        "complex_ifg",
+        "connected_components",
+        "unwrapped",
+        "wrapped",
+    ]
 
 
 def test_unwrapped_artifact_damage_fails_closed(tmp_path: Path) -> None:
