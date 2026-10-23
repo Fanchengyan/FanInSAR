@@ -932,7 +932,6 @@ def _pairs_from_factory(
     return factory.from_interval(max_interval=max_interval, max_days=max_days)
 
 
-_GEOCODE_KINDS = ("complex", "phase", "continuous", "label")
 _GEOCODE_ROWS_PER_CHUNK = 256
 
 
@@ -972,43 +971,36 @@ def _geocode_int_pair(product: object, attribute: str) -> tuple[int, int]:
     return int(value[0]), int(value[1])
 
 
-def _geocode_resolve_kind(
-    product: object, kind: GeocodeKind | None
-) -> tuple[GeocodeKind, str | None]:
-    """Resolve the kernel without overriding a layer's physical meaning."""
-    from faninsar.network.layers import ProductLayer
+def _geocode_resolve_kind(product: object) -> tuple[GeocodeKind, str | None]:
+    """Resolve the kernel from the product's declared physical type.
 
+    The product is the only source of truth.  A raw array carries its type in
+    ``RadarDomainProduct.asset_kind``; a committed layer carries it in
+    ``ProductLayer.asset_kind``.  There is no per-call override, so the kernel
+    can never disagree with the declared physical meaning.
+    """
     raw = getattr(product, "asset_kind", None)
     asset_tag = None if raw is None else str(raw)
-    if kind is not None and kind not in _GEOCODE_KINDS:
-        message = f"kind must be one of {_GEOCODE_KINDS}; got {kind!r}"
+    if raw is None:
+        message = (
+            "geocode product must declare asset_kind; construct a "
+            "RadarDomainProduct with AssetKind.LABEL for label masks"
+        )
         logger.error(message)
         raise ValueError(message)
-    expected = None
-    if isinstance(product, ProductLayer):
-        expected = product.geocode_kind
-    elif raw is not None:
-        try:
-            expected = ASSET_KIND_GEOCODE_KERNELS.get(AssetKind(raw))
-        except (TypeError, ValueError):
-            expected = None
-    if expected is not None:
-        if kind is not None and kind != expected:
-            message = (
-                f"geocode kind {kind!r} conflicts with asset_kind {asset_tag!r}; "
-                f"this layer requires {expected!r}"
-            )
-            logger.error(message)
-            raise ValueError(message)
-        return expected, asset_tag
-    if kind is not None:
-        return kind, asset_tag
-    message = (
-        f"geocode could not infer a resampling kernel from asset_kind {raw!r}; "
-        "pass kind= explicitly for an untyped derived field"
-    )
-    logger.error(message)
-    raise ValueError(message)
+    resolved_kind: GeocodeKind | None
+    try:
+        resolved_kind = ASSET_KIND_GEOCODE_KERNELS.get(AssetKind(raw))
+    except (TypeError, ValueError):
+        resolved_kind = None
+    if resolved_kind is None:
+        message = (
+            f"geocode could not infer a resampling kernel from asset_kind "
+            f"{raw!r}; use a member of faninsar.network.products.AssetKind"
+        )
+        logger.error(message)
+        raise ValueError(message)
+    return resolved_kind, asset_tag
 
 
 def _geocode_product_identity(
@@ -1243,7 +1235,7 @@ class Stack(NetworkContract):
     -----
     ``grid`` is the authoritative shared output grid for DEMs, masks, and
     geographic products. An explicit ``StackConfig.grid`` always wins. With
-    ``grid="auto"``, ROI precedence is an explicit ``resolve_grid(roi=...)``
+    ``grid="utm_ups"``, ROI precedence is an explicit ``resolve_grid(roi=...)``
     override, then ``StackConfig.roi``, then the deterministic union of
     selected acquisition/swath/burst footprints. The centre chooses UTM or
     UPS. Cross-zone, UTM/UPS-boundary, antimeridian, and large projected
@@ -1595,7 +1587,12 @@ class Stack(NetworkContract):
         """
         return self.resolve_grid()
 
-    def resolve_grid(self, roi: object | None = None) -> GridSpec:
+    def resolve_grid(
+        self,
+        roi: object | None = None,
+        *,
+        resolution_m: float | None = None,
+    ) -> GridSpec:
         """Resolve the Stack output grid from config or a WGS84 ROI.
 
         Parameters
@@ -1603,6 +1600,10 @@ class Stack(NetworkContract):
         roi : object, optional
             Footprint/ROI override.  It is treated as caller-explicit and an
             antimeridian crossing therefore fails before source I/O.
+        resolution_m : float, optional
+            Automatic-grid spacing override.  ``None`` uses
+            :attr:`StackConfig.resolution_m`.  Ignored when the configured
+            grid is an explicit :class:`GridSpec`.
 
         Notes
         -----
@@ -1616,10 +1617,13 @@ class Stack(NetworkContract):
         selected_roi = self.config.roi if roi is None else roi
         if selected_roi is None:
             selected_roi = self._selected_footprint_roi()
+        effective_resolution = (
+            self.config.resolution_m if resolution_m is None else float(resolution_m)
+        )
         return resolve_stack_grid(
             self.config.grid,
             roi=selected_roi,
-            resolution_m=self.config.resolution_m,
+            resolution_m=effective_resolution,
             budget=self.config.resource_budget,
             explicit_roi=roi is not None or self.config.roi is not None,
         )
@@ -1705,16 +1709,14 @@ class Stack(NetworkContract):
         *,
         path: str | Path | None = None,
         grid: GridSpec | None = None,
-        resolution_m: float | None = None,
-        bounds: object | None = None,
-        kind: GeocodeKind | None = None,
         overwrite: bool = False,
     ) -> GeocodedRaster | GeocodeableProduct:
         """Geocode a committed layer or an in-memory radar product.
 
         The Stack supplies persisted Reference geometry, the DEM, and the
-        default destination grid. Physical layer types select the resampling
-        kernel; array dtype alone never determines phase semantics.
+        default destination grid. The product's declared ``asset_kind``
+        selects the resampling kernel; array dtype alone never determines
+        phase semantics.
 
         Parameters
         ----------
@@ -1724,6 +1726,9 @@ class Stack(NetworkContract):
             :class:`~faninsar.processing.geocoding.RadarDomainProduct`.
             Products carry ``name``, two-dimensional ``values``,
             ``asset_kind``, ``full_radar_shape``, ``multilook``, and ``origin``.
+            An in-memory radar product must declare ``asset_kind``;
+            :attr:`~faninsar.network.products.AssetKind.LABEL` is the label
+            class.
         path : str or pathlib.Path, optional
             Complete output product directory containing ``item.json``,
             ``values.tif``, and ``valid.tif``. Relative paths are relative to
@@ -1734,16 +1739,9 @@ class Stack(NetworkContract):
             input arrays are never hashed or reused by output pathname.
         grid : GridSpec, optional
             Explicit destination grid. Otherwise the configured Stack grid
-            wins over automatic ROI/footprint grid selection.
-        resolution_m : float, optional
-            Automatic-grid spacing override; ignored with an explicit grid.
-        bounds : object, optional
-            WGS84 ROI for automatic grid selection. An explicit grid wins.
-        kind : {"complex", "phase", "continuous", "label"}, optional
-            Kernel for an untyped derived field. Known types select their
-            kernel automatically and reject conflicting overrides. Wrapped
-            phase uses the cyclic ``phase`` kernel; unwrapped phase uses
-            ``continuous``. Component labels use ``label`` automatically.
+            wins over centre-selected UTM/UPS grid selection. Build automatic
+            grids with :meth:`resolve_grid` or
+            :func:`faninsar.stack.utm_ups_grid`.
         overwrite : bool, optional
             Recompute and replace an existing output. An in-memory product
             with an existing path raises unless this is true. Source-backed
@@ -1781,6 +1779,9 @@ class Stack(NetworkContract):
         >>> wrapped = stack.geocode(ifg.wrapped)
         >>> unwrapped = stack.geocode(ifg.unwrapped)
         >>> derived_geo = stack.geocode(derived, path="results/filtered_phase")
+        >>> coarser = stack.geocode(
+        ...     ifg.wrapped, grid=stack.resolve_grid(resolution_m=60.0)
+        ... )
 
         """
         from faninsar.network.layers import ProductLayer
@@ -1794,13 +1795,7 @@ class Stack(NetworkContract):
             from pyproj import CRS
 
             parsed = CRS.from_user_input(crs)
-            if (
-                any(
-                    value is not None
-                    for value in (path, grid, resolution_m, bounds, kind)
-                )
-                or overwrite
-            ):
+            if any(value is not None for value in (path, grid)) or overwrite:
                 message = (
                     f"geocode: product {name!r} is already georeferenced in "
                     f"{parsed.to_string()}; use raster reprojection or export "
@@ -1815,7 +1810,7 @@ class Stack(NetworkContract):
                 parsed.to_string(),
             )
             return product
-        resolved_kind, asset_tag = _geocode_resolve_kind(product, kind)
+        resolved_kind, asset_tag = _geocode_resolve_kind(product)
         full_radar_shape = _geocode_int_pair(product, "full_radar_shape")
         looks = _geocode_int_pair(product, "multilook")
         origin = _geocode_int_pair(product, "origin")
@@ -1847,7 +1842,7 @@ class Stack(NetworkContract):
             )
             logger.error(message)
             raise ValueError(message)
-        destination = self._geocode_destination_grid(grid, resolution_m, bounds)
+        destination = self._geocode_destination_grid(grid)
         target_dir = None if path is None else Path(path)
         if layer is not None and path is None and destination == self.grid:
             target_dir = layer.source.path / "geocoded" / layer.name
@@ -1948,38 +1943,13 @@ class Stack(NetworkContract):
             )
         return raster
 
-    def _geocode_destination_grid(
-        self,
-        grid: GridSpec | None,
-        resolution_m: float | None,
-        bounds: object | None,
-    ) -> GridSpec:
+    def _geocode_destination_grid(self, grid: GridSpec | None) -> GridSpec:
         """Resolve the destination grid with :meth:`resolve_grid` precedence."""
-        from faninsar.processing.geometry import GridSpec as GridSpecClass
+        if grid is None:
+            return self.resolve_grid()
         from faninsar.stack.grid import resolve_stack_grid
 
-        effective_grid = self.config.grid if grid is None else grid
-        effective_resolution = (
-            self.config.resolution_m if resolution_m is None else float(resolution_m)
-        )
-        selected_roi = self.config.roi if bounds is None else bounds
-        if selected_roi is None and effective_grid == "auto":
-            selected_roi = self._selected_footprint_roi()
-        if selected_roi is None and not isinstance(effective_grid, GridSpecClass):
-            message = (
-                "geocode requires an explicit grid, a configured "
-                "StackConfig.grid, or bounds/roi/footprints to resolve the "
-                "automatic grid"
-            )
-            logger.error(message)
-            raise ValueError(message)
-        return resolve_stack_grid(
-            effective_grid,
-            roi=selected_roi,
-            resolution_m=effective_resolution,
-            budget=self.config.resource_budget,
-            explicit_roi=bounds is not None or self.config.roi is not None,
-        )
+        return resolve_stack_grid(grid, budget=self.config.resource_budget)
 
     def _geocode_geometry(self, full_radar_shape: tuple[int, int]) -> object:
         """Return the persisted Reference radar geometry for ``geocode``."""
@@ -2149,7 +2119,7 @@ class Stack(NetworkContract):
 
     def _align_raster_dem(self, raster: RasterDEM) -> RasterDEM:
         """Regrid a raster onto the Stack grid when one exists."""
-        if self.config.grid == "auto" and not self._has_stack_extent():
+        if self.config.grid == "utm_ups" and not self._has_stack_extent():
             self.config.dem = raster
             return raster
         from faninsar.processing.geometry import api as dem_api
@@ -2219,7 +2189,7 @@ class Stack(NetworkContract):
             return self._align_raster_dem(loaded)
         if (
             current is None
-            and self.config.grid == "auto"
+            and self.config.grid == "utm_ups"
             and not self._has_stack_extent()
         ):
             return None
@@ -2362,7 +2332,7 @@ class Stack(NetworkContract):
             self.prepare_scenes()
 
             if (
-                self.config.grid != "auto"
+                self.config.grid != "utm_ups"
                 or self.config.roi is not None
                 or prepared.selected_footprints
             ):
@@ -2497,7 +2467,7 @@ class Stack(NetworkContract):
         reference: str | None = None,
         dem: DEM | None = None,
         geo_grid: GeoGridSpec | None = None,
-        grid: GridSpec | Literal["auto"] = "auto",
+        grid: GridSpec | Literal["utm_ups"] = "utm_ups",
         resolution_m: float = 30.0,
         dem_cache_dir: str | Path | None = None,
         roi: BoundingBox | Polygons | None = None,

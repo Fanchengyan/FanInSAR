@@ -83,6 +83,19 @@ def test_reverse_phase_convention_has_asset_specific_transform(
     assert transform.operation is operation
 
 
+@pytest.mark.parametrize(
+    "convention",
+    [
+        PhaseConvention.PRIMARY_MINUS_SECONDARY,
+        PhaseConvention.SECONDARY_MINUS_PRIMARY,
+    ],
+)
+def test_label_asset_has_no_phase_convention(convention: PhaseConvention) -> None:
+    """Labels are classes, not phase, so no transform is definable for them."""
+    with pytest.raises(ValueError, match="label assets"):
+        AssetTransform.for_convention(AssetKind.LABEL, convention)
+
+
 def test_phase_transforms_apply_expected_math() -> None:
     """Complex, wrapped, and unwrapped assets normalize with distinct rules."""
     complex_asset = np.asarray([1.0 + 2.0j], dtype=np.complex64)

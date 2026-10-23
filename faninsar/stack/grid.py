@@ -1,4 +1,4 @@
-"""Authoritative automatic projected-grid selection for Stack."""
+"""Authoritative centre-selected UTM/UPS grid for Stack."""
 
 # The project uses descriptive boundary errors in this small integration
 # module; the exception-message lint rules are intentionally disabled here.
@@ -106,7 +106,7 @@ def _coerce_budget(budget: object | None) -> ResourceBudget | None:
     raise TypeError("unsupported Stack resource budget")
 
 
-def automatic_grid(
+def utm_ups_grid(
     roi: object,
     *,
     resolution_m: float = 30.0,
@@ -114,7 +114,7 @@ def automatic_grid(
     budget: object | None = None,
     explicit: bool = False,
 ) -> GridSpec:
-    """Build Stack's deterministic UTM/UPS grid from a WGS84 ROI.
+    """Build Stack's centre-selected UTM/UPS grid from a WGS84 ROI.
 
     Parameters
     ----------
@@ -204,7 +204,7 @@ def resolve_stack_grid(
 
     Parameters
     ----------
-    grid : GridSpec or {"auto"}
+    grid : GridSpec or {"utm_ups"}
         Explicit grid wins and is returned after resource preflight.
     roi : object, optional
         WGS84 ROI used by the automatic centre-based selector.
@@ -231,9 +231,9 @@ def resolve_stack_grid(
     if isinstance(grid, GridSpec):
         preflight_grid(grid.height, grid.width, budget=_coerce_budget(budget))
         return grid
-    if str(grid).strip().lower() != "auto":
-        raise ValueError("Stack grid must be a GridSpec or 'auto'")
-    return automatic_grid(
+    if str(grid).strip().lower() != "utm_ups":
+        raise ValueError("Stack grid must be a GridSpec or 'utm_ups'")
+    return utm_ups_grid(
         roi,
         resolution_m=resolution_m,
         budget=budget,
@@ -241,4 +241,4 @@ def resolve_stack_grid(
     )
 
 
-__all__ = ["automatic_grid", "resolve_stack_grid"]
+__all__ = ["resolve_stack_grid", "utm_ups_grid"]

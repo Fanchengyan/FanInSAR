@@ -53,7 +53,13 @@ class PhaseConvention(StrEnum):
 
 
 class AssetKind(StrEnum):
-    """Kinds of assets whose phase orientation can require normalization."""
+    """Mission-neutral physical asset vocabulary.
+
+    Every member names the physical quantity an asset holds.  The vocabulary
+    drives both phase-convention normalization and the geocoding resampling
+    kernel, so it also carries the non-phase label class.
+
+    """
 
     COMPLEX_INTERFEROGRAM = "complex_interferogram"
     WRAPPED_PHASE = "wrapped_phase"
@@ -62,6 +68,7 @@ class AssetKind(StrEnum):
     LOS = "los"
     AMPLITUDE = "amplitude"
     COHERENCE = "coherence"
+    LABEL = "label"
 
     # Short aliases are useful to adapters while retaining one serialized
     # vocabulary.  StrEnum aliases do not create additional enum values.
@@ -85,6 +92,7 @@ ASSET_KIND_GEOCODE_KERNELS: Mapping[AssetKind, GeocodeKind] = MappingProxyType(
         AssetKind.LOS: "continuous",
         AssetKind.AMPLITUDE: "continuous",
         AssetKind.COHERENCE: "continuous",
+        AssetKind.LABEL: "label",
     }
 )
 
@@ -214,7 +222,19 @@ class AssetTransform:
         asset_kind: AssetKind,
         phase_convention: PhaseConvention,
     ) -> AssetTransformOperation:
-        """Return the only valid operation for an asset/convention pair."""
+        """Return the only valid operation for an asset/convention pair.
+
+        Raises
+        ------
+        ValueError
+            If the asset kind carries no phase orientation, such as
+            :attr:`AssetKind.LABEL`.
+
+        """
+        if asset_kind is AssetKind.LABEL:
+            message = "label assets do not carry a phase convention"
+            logger.error(message)
+            raise ValueError(message)
         if phase_convention is PhaseConvention.PRIMARY_MINUS_SECONDARY:
             return AssetTransformOperation.IDENTITY
         if asset_kind in {AssetKind.AMPLITUDE, AssetKind.COHERENCE}:

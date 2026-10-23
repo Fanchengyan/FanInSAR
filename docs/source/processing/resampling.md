@@ -159,18 +159,26 @@ selected raster and its validity information.
 ```python
 ifg = stack.interferograms["20240101_20240113"]
 
+wrapped = ifg.wrapped.geocode()
+unwrapped = ifg.unwrapped.geocode()
+coherence = ifg.coherence.geocode()
+components = ifg.connected_components.geocode()
+
+# A handle obtained outside a Stack has no session; pass it explicitly.
 wrapped = stack.geocode(ifg.wrapped)
-unwrapped = stack.geocode(ifg.unwrapped)
-coherence = stack.geocode(ifg.coherence)
-components = stack.geocode(ifg.connected_components)
 ```
+
+A handle returned by `stack.interferograms[pair]` is bound to its Stack, so it
+already carries the product and its physical type: `geocode()` takes only an
+optional `grid`, `path`, and `overwrite`. An unbound handle fails closed with
+`InvalidProcessingStateError`.
 
 Both phase layers contain real radians. Their types remain distinct:
 `str(ifg.wrapped.asset_kind)` is `"wrapped_phase"`, and
 `str(ifg.unwrapped.asset_kind)` is `"unwrapped_phase"`. The first selects cyclic
-interpolation, the second continuous interpolation. Component labels select
-nearest-neighbor sampling. `kind=` is needed for untyped derived fields;
-conflicting overrides on known physical types raise an error.
+interpolation, the second continuous interpolation. Component labels use
+`AssetKind.LABEL` and nearest-neighbor sampling. The kernel is always derived
+from the declared `asset_kind`; there is no per-call `kind` override.
 `ifg.layers` lists the accessible layer names. `wrapped` and `amplitude` are
 virtual: they derive from the committed complex interferogram, store no
 payload, and report `path is None`. Accessing an unestimated optional result
@@ -199,6 +207,14 @@ product = RadarDomainProduct(
 )
 raster = stack.geocode(product)  # In-memory output.
 raster = stack.geocode(product, path="results/filtered_phase")
+```
+
+A radar-domain `RadarDomainProduct` must declare `asset_kind`; only an
+already georeferenced product (`crs` set) may omit it. Build a non-default
+grid through the grid resolver rather than through `geocode`:
+
+```python
+coarser = stack.geocode(ifg.wrapped, grid=stack.resolve_grid(resolution_m=60.0))
 ```
 
 `path` names a complete product directory containing `item.json`, `values.tif`,

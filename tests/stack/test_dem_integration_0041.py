@@ -9,7 +9,7 @@ from affine import Affine
 from faninsar.processing.geometry import GridSpec
 from faninsar.processing.geometry.datum import convert_heights
 from faninsar.processing.geometry.seam import ExplicitAntimeridianError
-from faninsar.stack.grid import automatic_grid, resolve_stack_grid
+from faninsar.stack.grid import resolve_stack_grid, utm_ups_grid
 
 
 class _ConstantGeoid:
@@ -34,11 +34,11 @@ def test_datum_graph_converts_between_geoids_at_target_centres() -> None:
     assert np.isnan(result[0, 1])
 
 
-def test_automatic_grid_selects_utm_and_ups() -> None:
+def test_utm_ups_grid_selects_utm_and_ups() -> None:
     """Center policy selects the expected UTM, north UPS, and south UPS."""
-    assert automatic_grid((10.0, 40.0, 11.0, 41.0)).crs == "EPSG:32632"
-    assert automatic_grid((10.0, 84.0, 11.0, 85.0)).crs == "EPSG:32661"
-    assert automatic_grid((10.0, -85.0, 11.0, -84.0)).crs == "EPSG:32761"
+    assert utm_ups_grid((10.0, 40.0, 11.0, 41.0)).crs == "EPSG:32632"
+    assert utm_ups_grid((10.0, 84.0, 11.0, 85.0)).crs == "EPSG:32661"
+    assert utm_ups_grid((10.0, -85.0, 11.0, -84.0)).crs == "EPSG:32761"
 
 
 def test_explicit_grid_wins_and_explicit_seam_fails() -> None:
@@ -51,4 +51,4 @@ def test_explicit_grid_wins_and_explicit_seam_fails() -> None:
     )
     assert resolve_stack_grid(grid, roi=(170.0, 10.0, -170.0, 11.0)).crs == "EPSG:3857"
     with pytest.raises(ExplicitAntimeridianError):
-        resolve_stack_grid("auto", roi=(170.0, 10.0, -170.0, 11.0), explicit_roi=True)
+        resolve_stack_grid("utm_ups", roi=(170.0, 10.0, -170.0, 11.0), explicit_roi=True)

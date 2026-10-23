@@ -3298,13 +3298,13 @@ def resolve_auto_dem(
     )
     from shapely.geometry import box
 
-    from faninsar.stack.grid import automatic_grid
+    from faninsar.stack.grid import utm_ups_grid
 
     # Resolve the authoritative projected target before opening or fetching
     # source resources.  The provider then warps directly to this grid, so a
     # geographic source view remains logical/windowed rather than becoming a
     # full EPSG:4326 ndarray.
-    grid = automatic_grid(
+    grid = utm_ups_grid(
         box(west, south, east, north),
         resolution_m=30.0,
     )

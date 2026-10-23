@@ -43,7 +43,7 @@ outages, ambiguous local datum metadata, invalid grids, cache configuration,
 resource budgets, and overwrite attempts raise explicit errors; credentials
 and signed URLs are not included in diagnostics.
 
-For ``Stack(grid="auto")``, an explicit ``GridSpec`` wins. Otherwise the
+For ``Stack(grid="utm_ups")``, an explicit ``GridSpec`` wins. Otherwise the
 configured ``roi`` wins, followed by the deterministic union of selected
 acquisition/swath/burst footprints. The centre chooses UTM in ordinary
 latitudes and UPS in polar latitudes. Cross-zone, UTM/UPS-boundary,

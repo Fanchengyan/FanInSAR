@@ -20,6 +20,7 @@ from faninsar.core.orbit import OrbitMetadata, OrbitStateVector
 from faninsar.core.pair import Pairs
 from faninsar.io.storage.scene_store import write_scene
 from faninsar.network.products import AssetKind
+from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geocoding import RadarDomainProduct
 from faninsar.processing.geocoding.geo_lut import Geo2RdrLUT
 from faninsar.processing.geocoding.geocoder import Geocoder
@@ -443,7 +444,7 @@ def test_geocode_phase_product_returns_wrapped_radians(stack: Stack) -> None:
 
 
 def test_geocode_continuous_and_label_products(stack: Stack) -> None:
-    """Smooth fields ride bilinear via UNWRAPPED_PHASE; labels need kind=."""
+    """Smooth fields ride bilinear via UNWRAPPED_PHASE; labels use LABEL."""
     field = np.full(RADAR_SHAPE, 3.5, dtype=np.float32)
     unwrapped = RadarDomainProduct(
         name="unw",
@@ -459,10 +460,9 @@ def test_geocode_continuous_and_label_products(stack: Stack) -> None:
         name="conncomp",
         values=np.full(RADAR_SHAPE, 3, dtype=np.uint8),
         full_radar_shape=RADAR_SHAPE,
+        asset_kind=AssetKind.LABEL,
     )
-    with pytest.raises(ValueError, match="asset_kind"):
-        stack.geocode(labelled)
-    label_raster = stack.geocode(labelled, kind="label")
+    label_raster = stack.geocode(labelled)
     assert label_raster.values.dtype == np.uint8
     np.testing.assert_array_equal(label_raster.values[label_raster.valid], 3)
 
@@ -487,16 +487,14 @@ def test_geocode_geographic_product_warns_and_returns_unchanged(
 
 
 def test_geocode_kind_lookup_failures(stack: Stack) -> None:
-    """Unknown asset vocabularies and kernels fail with actionable errors."""
+    """Unknown asset vocabularies fail with actionable errors."""
     values = np.zeros(RADAR_SHAPE, dtype=np.float32)
-    with pytest.raises(ValueError, match="asset_kind"):
-        stack.geocode(
-            RadarDomainProduct(
-                name="no_kind",
-                values=values,
-                full_radar_shape=RADAR_SHAPE,
-                asset_kind=None,
-            )
+    with pytest.raises(InvalidProcessingStateError, match="asset_kind"):
+        RadarDomainProduct(
+            name="no_kind",
+            values=values,
+            full_radar_shape=RADAR_SHAPE,
+            asset_kind=None,
         )
     with pytest.raises(ValueError, match="asset_kind"):
         stack.geocode(
@@ -507,14 +505,38 @@ def test_geocode_kind_lookup_failures(stack: Stack) -> None:
                 asset_kind="not_an_asset",
             )
         )
+
+
+def test_geocode_rejects_removed_override_arguments(stack: Stack) -> None:
+    """Kind and grid-construction overrides belong to the product and grid."""
     product = RadarDomainProduct(
         name="explicit",
-        values=values,
+        values=np.zeros(RADAR_SHAPE, dtype=np.float32),
         full_radar_shape=RADAR_SHAPE,
         asset_kind=AssetKind.COHERENCE,
     )
-    with pytest.raises(ValueError, match="kind must be one of"):
-        stack.geocode(product, kind="bogus")
+    with pytest.raises(TypeError):
+        stack.geocode(product, kind="continuous")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        stack.geocode(product, bounds=(0.0, 0.0, 1.0, 1.0))  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        stack.geocode(product, resolution_m=10.0)  # type: ignore[call-arg]
+
+
+def test_resolve_grid_applies_resolution_override(stack: Stack) -> None:
+    """Automatic grid construction owns the spacing knob, not geocode."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    auto = SimpleNamespace(config=replace(stack.config, grid="utm_ups", roi=None))
+    native = Stack.resolve_grid(auto, roi=(10.0, 40.0, 11.0, 41.0))
+    coarser = Stack.resolve_grid(
+        auto, roi=(10.0, 40.0, 11.0, 41.0), resolution_m=20.0
+    )
+    assert native.crs == coarser.crs
+    assert native.resolution_m == (30.0, 30.0)
+    assert coarser.resolution_m == (20.0, 20.0)
+    assert native.shape != coarser.shape
 
 
 def test_geocode_overwrite_semantics(stack: Stack) -> None:
@@ -546,27 +568,6 @@ def test_geocode_overwrite_semantics(stack: Stack) -> None:
         stack.geocode(fresh)
     stack.geocode(fresh, overwrite=True)
     assert open_product(target).properties["faninsar:geocode"]
-
-
-@pytest.mark.parametrize(
-    "asset_kind, incompatible",
-    [
-        (AssetKind.WRAPPED_PHASE, "continuous"),
-        (AssetKind.UNWRAPPED_PHASE, "phase"),
-    ],
-)
-def test_geocode_rejects_a_kernel_that_conflicts_with_phase_type(
-    stack: Stack, asset_kind: AssetKind, incompatible: str
-) -> None:
-    """Real-valued phases must retain their distinct interpolation rules."""
-    product = RadarDomainProduct(
-        name="phase",
-        values=np.ones(RADAR_SHAPE, dtype=np.float32),
-        full_radar_shape=RADAR_SHAPE,
-        asset_kind=asset_kind,
-    )
-    with pytest.raises(ValueError, match="conflicts"):
-        stack.geocode(product, kind=incompatible)
 
 
 @pytest.mark.parametrize("crs", ["EPSG:4326", UTM])
@@ -1175,3 +1176,93 @@ def test_reopened_stack_geocode_shares_one_lut_entry_and_matches(
         if path.is_dir() and path.name != "storage"
     ]
     assert namespaces == ["stack_20240101"]
+
+
+def test_bound_layer_geocode_reuses_the_stack_child(stack: Stack) -> None:
+    """A bound handle geocodes without repeating product or kernel."""
+    import dataclasses
+
+    from faninsar.io.storage.product import open_product
+    from faninsar.network.layers import ProductLayer
+
+    store = _write_ifg(stack)
+    ifg = stack.interferograms["20240101_20240113"]
+    session_field = next(
+        field for field in dataclasses.fields(ProductLayer) if field.name == "_session"
+    )
+    assert session_field.compare is False
+
+    raster = ifg.wrapped.geocode()
+    np.testing.assert_allclose(raster.values[raster.valid], 0.7, atol=1e-5)
+    child = store.root / "geocoded" / "wrapped_phase"
+    assert (child / "item.json").is_file()
+
+    first_id = open_product(child).write_id
+    reused = stack.geocode(ifg.wrapped)
+    assert open_product(child).write_id == first_id
+    np.testing.assert_allclose(reused.values[reused.valid], 0.7, atol=1e-5)
+
+
+def test_bound_layer_geocode_routes_unwrap_layers_to_their_product(
+    stack: Stack,
+) -> None:
+    """Unwrap children live with the unwrap product, exactly as before."""
+    from faninsar.io.storage.ifg_store import write_unwrapped_artifact
+
+    store = _write_ifg(stack)
+    write_unwrapped_artifact(
+        store.root,
+        unwrapped_phase=np.full(RADAR_SHAPE, 1.25, dtype=np.float32),
+        connected_components=np.ones(RADAR_SHAPE, dtype=np.uint32),
+        method="test",
+        method_parameters={},
+        ifg_manifest_digest=store.write_id,
+    )
+    ifg = stack.interferograms["20240101_20240113"]
+    raster = ifg.unwrapped.geocode()
+    np.testing.assert_allclose(raster.values[raster.valid], 1.25, atol=1e-5)
+    assert (
+        store.unwrap_root / "geocoded" / "unwrapped_phase" / "item.json"
+    ).is_file()
+
+    labels = ifg.connected_components.geocode()
+    assert labels.values.dtype == np.uint32
+    assert labels.valid.any()
+
+
+def test_unbound_layer_handle_fails_closed(stack: Stack) -> None:
+    """A hand-built handle has no session and must not guess one."""
+    from faninsar.io.storage.ifg_store import IFG_KIND
+    from faninsar.io.storage.product import open_product
+    from faninsar.network.layers import InterferogramLayers
+
+    store = _write_ifg(stack)
+    handle = InterferogramLayers(
+        open_product(store.root, kind=IFG_KIND), store.shape, store.looks
+    )
+    with pytest.raises(InvalidProcessingStateError, match="not bound"):
+        handle.wrapped.geocode()
+
+
+def test_bound_layer_geocode_honours_grid_and_overwrite(stack: Stack) -> None:
+    """Handle geocoding forwards grid and overwrite to the Stack verb."""
+    from faninsar.io.storage.product import open_product
+
+    store = _write_ifg(stack)
+    ifg = stack.interferograms["20240101_20240113"]
+    child = store.root / "geocoded" / "wrapped_phase"
+    ifg.wrapped.geocode()
+    first_id = open_product(child).write_id
+    ifg.wrapped.geocode(overwrite=True)
+    assert open_product(child).write_id != first_id
+
+    alternate = GeoGridSpec(
+        crs=stack.grid.crs,
+        transform=stack.grid.transform,
+        width=stack.grid.width - 1,
+        height=stack.grid.height,
+        resolution_m=stack.grid.resolution_m,
+    )
+    raster = ifg.coherence.geocode(alternate)
+    assert raster.grid == alternate
+    assert not (store.root / "geocoded" / "coherence" / "item.json").exists()

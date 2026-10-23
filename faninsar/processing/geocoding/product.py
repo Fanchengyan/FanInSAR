@@ -13,14 +13,24 @@ full-radar coordinates.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import reject_invalid_state
 
-__all__ = ["GeocodeableProduct", "RadarDomainProduct", "layer_frame_shape"]
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from faninsar.processing.geocoding.geocoder import GeocodedRaster
+
+__all__ = [
+    "GeocodeSession",
+    "GeocodeableProduct",
+    "RadarDomainProduct",
+    "layer_frame_shape",
+]
 
 logger = setup_logger(__name__)
 
@@ -36,9 +46,9 @@ class GeocodeableProduct(Protocol):
     when no output or resampling change is requested. ``asset_kind`` holds
     the mission-neutral vocabulary (a
     :class:`~faninsar.network.products.AssetKind` or its
-    string value) used to infer the resampling kernel when the caller does
-    not pass ``kind`` explicitly; it may be ``None`` when the caller always
-    names the kernel.
+    string value) that determines the resampling kernel. It is required for
+    radar-domain products and may be ``None`` only for an already
+    georeferenced product, which is never resampled.
 
     """
 
@@ -78,6 +88,28 @@ class GeocodeableProduct(Protocol):
         ...
 
 
+class GeocodeSession(Protocol):
+    """A session that can geocode a product with its own geometry context.
+
+    ``Stack`` satisfies this protocol structurally. Committed layer handles
+    keep an opaque reference to the session that produced them, so
+    ``faninsar.network`` can offer ``layer.geocode()`` without importing the
+    ``faninsar.stack`` domain.
+
+    """
+
+    def geocode(
+        self,
+        product: GeocodeableProduct,
+        *,
+        grid: object = None,
+        path: str | Path | None = None,
+        overwrite: bool = False,
+    ) -> GeocodedRaster:
+        """Geocode ``product`` and return its geographic raster."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class RadarDomainProduct:
     """Canonical frozen carrier conforming to :class:`GeocodeableProduct`.
@@ -94,9 +126,12 @@ class RadarDomainProduct:
     full_radar_shape : tuple[int, int]
         Full-resolution ``(azimuth, range)`` radar shape the LUT solves
         against.
-    asset_kind : object, optional
-        Asset vocabulary tag (``AssetKind`` or string value) used to infer
-        the kernel when the caller omits ``kind``.
+    asset_kind : object
+        Asset vocabulary tag (``AssetKind`` or string value) that determines
+        the resampling kernel. Required for radar-domain products; use
+        :attr:`~faninsar.network.products.AssetKind.LABEL` for label masks.
+        May be ``None`` only when ``crs`` is set, because an already
+        georeferenced product passes through without resampling.
     multilook : tuple[int, int], optional
         Positive ``(azimuth, range)`` look factors of ``values``.
     origin : tuple[int, int], optional
@@ -109,10 +144,11 @@ class RadarDomainProduct:
     ------
     InvalidProcessingStateError
         If the name is not one safe path component, shapes are malformed,
-        look factors and origin are not non-negative integers, or
+        look factors and origin are not non-negative integers,
         ``values.shape`` does not match the layer frame implied by
         ``full_radar_shape``, ``origin``, and ``multilook`` (see
-        :func:`layer_frame_shape`).
+        :func:`layer_frame_shape`), or a radar-domain product omits
+        ``asset_kind``.
 
     """
 
@@ -157,6 +193,12 @@ class RadarDomainProduct:
                 f"product values shape {values.shape} does not match the layer "
                 f"frame implied by full_radar_shape={full_radar_shape}, "
                 f"origin={origin}, multilook={multilook} (expected {expected})"
+            )
+        if self.crs is None and self.asset_kind is None:
+            reject_invalid_state(
+                "a radar-domain product must declare asset_kind; use "
+                "AssetKind.LABEL for label masks, and leave asset_kind None "
+                "only for an already georeferenced product"
             )
 
     @property

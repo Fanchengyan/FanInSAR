@@ -120,6 +120,7 @@ class StackInterferogramCollection(InterferogramCollection):
             store.looks,
             store.crs,
             tuple(upstream),
+            _session=self._stack,
         )
 
     @property

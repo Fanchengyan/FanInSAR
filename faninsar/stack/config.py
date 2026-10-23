@@ -45,7 +45,7 @@ class StackConfig:
     ``mask_plan`` is the only mask configuration surface.  An empty plan is
     unmasked processing; every non-empty stage is explicit and normalized
     before this object is constructed. ``grid`` is either an explicit shared
-    :class:`~faninsar.processing.geometry.GridSpec` or ``"auto"``. In automatic
+    :class:`~faninsar.processing.geometry.GridSpec` or ``"utm_ups"``. In automatic
     mode, ``roi`` has precedence over selected acquisition/swath/burst
     footprints; the footprint centre selects UTM or UPS. Seam and large-range
     cases warn and continue, while an explicit seam-crossing ROI fails before
@@ -87,7 +87,7 @@ class StackConfig:
     record_scientific_lineage: bool = False
     gpu_memory_reclaim: GpuMemoryReclaim = "adaptive"
     resource_budget: ResourceBudget | None = None
-    grid: GridSpec | Literal["auto"] = "auto"
+    grid: GridSpec | Literal["utm_ups"] = "utm_ups"
     resolution_m: float = 30.0
     dem_cache_dir: Path | None = None
     extra: dict[str, object] = field(default_factory=dict)
@@ -104,11 +104,11 @@ class StackConfig:
             message = "resolution_m must be a finite positive number"
             logger.error(message)
             raise ValueError(message)
-        if self.grid != "auto":
+        if self.grid != "utm_ups":
             from faninsar.processing.geometry import GridSpec
 
             if not isinstance(self.grid, GridSpec):
-                message = "grid must be a GridSpec or 'auto'"
+                message = "grid must be a GridSpec or 'utm_ups'"
                 logger.error(message)
                 raise TypeError(message)
         if self.dem_cache_dir is not None:

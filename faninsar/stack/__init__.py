@@ -20,7 +20,7 @@ from faninsar.stack.config import (
     FlattenStage,
     StackConfig,
 )
-from faninsar.stack.grid import automatic_grid, resolve_stack_grid
+from faninsar.stack.grid import resolve_stack_grid, utm_ups_grid
 from faninsar.stack.mask_plan import (
     MASK_KINDS,
     STAGES,
@@ -72,9 +72,9 @@ __all__ = [
     "Stage",
     "UnsupportedStackCapabilityError",
     "UnwrappedArtifact",
-    "automatic_grid",
     "merge_profile_filters",
     "resolve_stack_grid",
     "unavailable_scene_provider",
     "unsupported_stack_capability",
+    "utm_ups_grid",
 ]

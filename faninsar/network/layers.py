@@ -16,6 +16,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from faninsar.processing.geocoding.geo_resample import GeocodeKind
+    from faninsar.processing.geocoding.geocoder import GeocodedRaster
+    from faninsar.processing.geocoding.product import GeocodeSession
+    from faninsar.processing.geometry.grids import GridSpec
 
 __all__ = ["InterferogramLayers", "ProductLayer"]
 
@@ -37,7 +40,9 @@ class ProductLayer:
     name : str
         Serialized asset name, independent of the short accessor spelling.
     asset_kind : AssetKind or None
-        Physical type used to select the resampling kernel.
+        Physical type used to select the resampling kernel. Every layer
+        produced by a Stack declares one; ``None`` only appears on a
+        hand-built handle.
     full_radar_shape, multilook, origin : tuple[int, int]
         Full radar frame and the layer's sampling within it.
     crs : str or None
@@ -62,8 +67,8 @@ class ProductLayer:
     multilook: tuple[int, int] = (1, 1)
     origin: tuple[int, int] = (0, 0)
     crs: str | None = None
-    _kind: GeocodeKind | None = field(default=None, repr=False)
     _upstream: tuple[Product, ...] = field(default=(), repr=False)
+    _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
 
     @property
     def source(self) -> Product:
@@ -92,11 +97,51 @@ class ProductLayer:
     @property
     def geocode_kind(self) -> GeocodeKind:
         """Return the physical resampling kernel, including hard labels."""
-        if self._kind is not None:
-            return self._kind
         if self.asset_kind is None:
             reject_invalid_state(f"layer {self.name!r} has no physical type")
         return ASSET_KIND_GEOCODE_KERNELS[self.asset_kind]
+
+    def geocode(
+        self,
+        grid: GridSpec | None = None,
+        *,
+        path: str | Path | None = None,
+        overwrite: bool = False,
+    ) -> GeocodedRaster:
+        """Geocode this layer through the Stack session that produced it.
+
+        The handle already carries the product and its physical type, so no
+        product or kernel argument is accepted.
+
+        Parameters
+        ----------
+        grid : GridSpec, optional
+            Explicit destination grid. The owning Stack's authoritative grid
+            is used when omitted.
+        path : str or pathlib.Path, optional
+            Complete output product directory. On the Stack grid, omitting it
+            saves to ``<source>/geocoded/<asset>/``.
+        overwrite : bool, optional
+            Replace an existing geocoded child instead of reusing it.
+
+        Returns
+        -------
+        GeocodedRaster
+            Values, validity, and destination grid.
+
+        Raises
+        ------
+        InvalidProcessingStateError
+            If this handle was not obtained from a Stack session.
+
+        """
+        session = self._session
+        if session is None:
+            reject_invalid_state(
+                f"layer {self.name!r} is not bound to a Stack session; "
+                "use stack.geocode(layer, ...) for an unbound handle"
+            )
+        return session.geocode(self, grid=grid, path=path, overwrite=overwrite)
 
     def validate_source(self) -> None:
         """Reject a handle whose owning or upstream product was replaced."""
@@ -217,6 +262,7 @@ class InterferogramLayers:
     multilook: tuple[int, int]
     crs: str | None = None
     _upstream: tuple[Product, ...] = field(default=(), repr=False)
+    _session: GeocodeSession | None = field(default=None, repr=False, compare=False)
 
     @property
     def root(self) -> Path:
@@ -248,7 +294,6 @@ class InterferogramLayers:
         name: str,
         asset_kind: AssetKind,
         *,
-        kind: GeocodeKind | None = None,
         virtual: bool = False,
     ) -> ProductLayer:
         if not virtual and name not in self._product.assets:
@@ -264,13 +309,11 @@ class InterferogramLayers:
             self.full_radar_shape,
             self.multilook,
             crs=self.crs,
-            _kind=kind,
             _upstream=self._upstream,
+            _session=self._session,
         )
 
-    def _unwrap_layer(
-        self, name: str, asset_kind: AssetKind | None, kind: GeocodeKind | None = None
-    ) -> ProductLayer:
+    def _unwrap_layer(self, name: str, asset_kind: AssetKind | None) -> ProductLayer:
         """Return one layer of the unwrap product bound to this IFG commit."""
         from faninsar.io.storage.ifg_store import UNWRAP_KIND, unwrap_root
 
@@ -296,8 +339,8 @@ class InterferogramLayers:
             self.full_radar_shape,
             self.multilook,
             crs=self.crs,
-            _kind=kind,
             _upstream=(self._product, *self._upstream),
+            _session=self._session,
         )
 
     @property
@@ -333,4 +376,4 @@ class InterferogramLayers:
     @property
     def connected_components(self) -> ProductLayer:
         """Return integer component labels sampled with nearest neighbors."""
-        return self._unwrap_layer("connected_components", None, "label")
+        return self._unwrap_layer("connected_components", AssetKind.LABEL)
