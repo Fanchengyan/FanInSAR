@@ -1,9 +1,15 @@
-"""Download-time verification recording (PROPOSAL-0055 slice 2)."""
+"""Download-time verification recording (PROPOSAL-0055 slice 2).
+
+Burst SAFE post-unzip ``manifest.safe`` member verification is
+PROPOSAL-0060 seam 4: a pure manifest parser and a member-verify function
+over the written zip, wired into the burst download/publication path.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import zipfile
 from typing import TYPE_CHECKING
 
 import pytest
@@ -209,3 +215,201 @@ def test_read_verification_returns_record_from_qualified_sibling(
         "size": 7,
     }
     assert read_verification(tmp_path / "absent.zip") is None
+
+
+# --- PROPOSAL-0060 seam 4: burst SAFE post-unzip manifest.safe members ---
+
+
+def test_parse_safe_manifest_returns_file_location_md5_pairs() -> None:
+    """A pure manifest.safe parser returns href -> MD5 for checksummed members.
+
+    The expected MD5 values are independent known-good digests of the literal
+    member bytes (not recomputed by the code under test), so the assertion can
+    disagree with a broken parser.
+    """
+    from faninsar.remote.transfer import parse_safe_manifest_checksums
+
+    manifest = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<xfdu:XFDU xmlns:xfdu="urn:ccsds:schema:xfdu:1">\n'
+        "  <xfdu:dataObjectSection>\n"
+        '    <xfdu:dataObject ID="measurement-a">\n'
+        "      <xfdu:byteStream>\n"
+        '        <xfdu:fileLocation href="./measurement-a.tiff"/>\n'
+        '        <xfdu:checksum checksumName="MD5">'
+        "4ae69c457a6534ddaf0f511c69a37ca6</xfdu:checksum>\n"
+        "      </xfdu:byteStream>\n"
+        "    </xfdu:dataObject>\n"
+        '    <xfdu:dataObject ID="measurement-b">\n'
+        "      <xfdu:byteStream>\n"
+        '        <xfdu:fileLocation href="./measurement-b.tiff"/>\n'
+        '        <xfdu:checksum checksumName="SHA-1">deadbeef</xfdu:checksum>\n'
+        "      </xfdu:byteStream>\n"
+        "    </xfdu:dataObject>\n"
+        "  </xfdu:dataObjectSection>\n"
+        "</xfdu:XFDU>\n"
+    )
+
+    pairs = parse_safe_manifest_checksums(manifest)
+
+    assert pairs == {"measurement-a.tiff": "4ae69c457a6534ddaf0f511c69a37ca6"}
+
+
+def _write_safe_zip(path: Path, members: dict[str, bytes], manifest: str) -> None:
+    """Write a tiny SAFE zip under the repository tmp/ tree."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, payload in members.items():
+            archive.writestr(name, payload)
+        archive.writestr("manifest.safe", manifest)
+
+
+def _manifest_for(members: dict[str, bytes]) -> str:
+    """Return a manifest.safe declaring the MD5 of each member (fixture only)."""
+    blocks = []
+    for name, payload in members.items():
+        md5 = hashlib.md5(payload).hexdigest()
+        blocks.append(
+            "<xfdu:byteStream>"
+            f'<xfdu:fileLocation href="./{name}"/>'
+            f'<xfdu:checksum checksumName="MD5">{md5}</xfdu:checksum>'
+            "</xfdu:byteStream>"
+        )
+    return (
+        '<xfdu:XFDU xmlns:xfdu="urn:ccsds:schema:xfdu:1">'
+        + "".join(blocks)
+        + "</xfdu:XFDU>"
+    )
+
+
+def test_member_verify_reports_matched_summary_for_all_match(tmp_path: Path) -> None:
+    """A SAFE whose members match the manifest reports checked/matched/verified."""
+    from faninsar.remote.transfer import verify_safe_members
+
+    members = {"measurement-a.tiff": b"tiff-a", "measurement-b.tiff": b"tiff-b"}
+    safe_zip = tmp_path / "burst.zip"
+    _write_safe_zip(safe_zip, members, _manifest_for(members))
+
+    summary, all_matched = verify_safe_members(safe_zip)
+
+    assert all_matched is True
+    assert summary == {"checked": 2, "matched": 2, "status": "verified"}
+
+
+def _safe_zip_bytes(members: dict[str, bytes], manifest: str) -> bytes:
+    """Return the bytes of a tiny SAFE zip (in-memory fixture)."""
+    import io
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, payload in members.items():
+            archive.writestr(name, payload)
+        archive.writestr("manifest.safe", manifest)
+    return buffer.getvalue()
+
+
+def _register_safe(name: str, payload: bytes, checksum: str | None = None) -> None:
+    """Register a one-asset fixture catalog whose data payload is a SAFE zip."""
+    asset: dict[object, object] = {
+        "href": "https://fixture.invalid/assets/burst.zip",
+        "data": payload,
+        "size": len(payload),
+    }
+    if checksum is not None:
+        asset["checksum"] = checksum
+    remote._register_fixture(
+        [
+            {
+                "id": "burst-1",
+                "collection": "slc-burst",
+                "geometry": Polygon(((-1, -1), (1, -1), (1, 1), (-1, 1))),
+                "assets": {"data": asset},
+            }
+        ],
+        name=name,
+    )
+
+
+def test_safe_all_match_gains_members_fact_container_unverifiable(
+    tmp_path: Path,
+) -> None:
+    """A SAFE zip whose members match keeps the container unverifiable.
+
+    The container gains an additive members sub-record.
+    """
+    name = "p0060-safe-match"
+    members = {"measurement-a.tiff": b"tiff-a", "measurement-b.tiff": b"tiff-b"}
+    payload = _safe_zip_bytes(members, _manifest_for(members))
+    _register_safe(name, payload)
+    asset = remote.search(Points([(0, 0)], crs=4326), catalog=name)[0].assets["data"]
+    destination = tmp_path / "burst.zip"
+
+    remote.download(asset, destination)
+
+    manifest = json.loads(remote._manifest_path(destination, asset).read_text())
+    verification = manifest["verification"]
+    assert verification["status"] == "unverifiable"
+    assert verification["size"] == len(payload)
+    assert verification["members"] == {
+        "checked": 2,
+        "matched": 2,
+        "status": "verified",
+    }
+    assert "checksum" not in verification
+
+
+def test_safe_corrupted_member_records_failed_and_excludes(tmp_path: Path) -> None:
+    """A SAFE member that mismatches its manifest MD5 records failed and raises."""
+    name = "p0060-safe-corrupt"
+    good = {"measurement-a.tiff": b"tiff-a", "measurement-b.tiff": b"tiff-b"}
+    # The manifest declares the MD5 of the original bytes, but the zip carries
+    # a corrupted measurement-a.tiff so the content check must fail.
+    manifest = _manifest_for(good)
+    corrupted = dict(good)
+    corrupted["measurement-a.tiff"] = b"CORRUPTED"
+    payload = _safe_zip_bytes(corrupted, manifest)
+    _register_safe(name, payload)
+    asset = remote.search(Points([(0, 0)], crs=4326), catalog=name)[0].assets["data"]
+    destination = tmp_path / "burst.zip"
+
+    with pytest.raises(remote.RemoteIntegrityError) as raised:
+        remote.download(asset, destination)
+
+    assert raised.value.reason == "checksum_mismatch"
+    assert not destination.exists()
+    manifest_record = json.loads(remote._manifest_path(destination, asset).read_text())
+    verification = manifest_record["verification"]
+    assert verification["status"] == "failed"
+    assert verification["members"] == {"checked": 2, "matched": 1, "status": "failed"}
+
+
+def test_safe_without_manifest_checksums_has_no_members_record(
+    tmp_path: Path,
+) -> None:
+    """A SAFE whose manifest declares no MD5 keeps the container unverifiable.
+
+    It gains no members sub-record.
+    """
+    name = "p0060-safe-nomanifest"
+    members = {"measurement-a.tiff": b"tiff-a", "annotation.xml": b"<xml/>"}
+    # A manifest.safe that lists members but declares no checksumName="MD5".
+    manifest = (
+        '<xfdu:XFDU xmlns:xfdu="urn:ccsds:schema:xfdu:1">'
+        "<xfdu:byteStream>"
+        '<xfdu:fileLocation href="./measurement-a.tiff"/>'
+        "</xfdu:byteStream>"
+        "</xfdu:XFDU>"
+    )
+    payload = _safe_zip_bytes(members, manifest)
+    _register_safe(name, payload)
+    asset = remote.search(Points([(0, 0)], crs=4326), catalog=name)[0].assets["data"]
+    destination = tmp_path / "burst.zip"
+
+    remote.download(asset, destination)
+
+    manifest_record = json.loads(remote._manifest_path(destination, asset).read_text())
+    verification = manifest_record["verification"]
+    assert verification["status"] == "unverifiable"
+    assert verification["size"] == len(payload)
+    assert "members" not in verification
+    assert "checksum" not in verification

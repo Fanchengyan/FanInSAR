@@ -298,12 +298,30 @@ def _decode_dem(payload: Mapping[str, object]) -> Any:
 
 
 def _input_record(path: Path) -> dict[str, object]:
-    """Return one stat record for a local input (path and size)."""
+    """Return one record for a local input: path, size, and verification.
+
+    The record carries the download-time PROPOSAL-0055 verification outcome
+    (``{status, algorithm, size}``) so the persisted ``stack.json`` surfaces
+    whether each input was ``verified``, ``failed``, or ``unverifiable`` at
+    download. An input with no download record (hand-acquired, or no provider
+    digest) is surfaced as ``unverifiable`` — the honest outcome.
+    """
     if not path.exists():
         message = f"Stack input is missing: {path}"
         logger.error(message)
         reject_invalid_state(message)
-    return {"path": str(path), "size": path.stat().st_size}
+    from faninsar.remote.transfer import read_verification
+
+    record = read_verification(path) or {}
+    return {
+        "path": str(path),
+        "size": path.stat().st_size,
+        "verification": {
+            "status": record.get("status", "unverifiable"),
+            "algorithm": record.get("algorithm"),
+            "size": record.get("size", path.stat().st_size),
+        },
+    }
 
 
 def stack_identity(stack: Stack) -> dict[str, object]:

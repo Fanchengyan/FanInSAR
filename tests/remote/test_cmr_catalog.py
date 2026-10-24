@@ -9,7 +9,11 @@ from typing import Any
 import pytest
 
 from faninsar import remote
-from faninsar.remote.cmr import CMRCollectionAdapter, _compact_size_bytes
+from faninsar.remote.cmr import (
+    CMRCollectionAdapter,
+    _compact_size_bytes,
+    normalize_cmr_granule,
+)
 
 
 class _ResponseFixture:
@@ -315,6 +319,77 @@ def test_umm_size_uses_only_exact_size_in_bytes() -> None:
     base["DataGranule"]["SizeInBytes"] = 123
     with_exact = adapter._normalize(base)
     assert with_exact["assets"]["data"]["size"] == 123
+
+
+def test_umm_md5sum_additional_attribute_maps_to_complete_asset_checksum() -> None:
+    """UMM ``MD5SUM`` becomes ``md5:<hex>`` on the complete SAFE asset."""
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    entry = {
+        "GranuleUR": "G1",
+        "CollectionReference": {"ShortName": "C123"},
+        "SpatialExtent": {
+            "HorizontalSpatialDomain": {
+                "Geometry": {
+                    "GPolygon": {
+                        "Boundary": {
+                            "Points": [
+                                {"Longitude": 0, "Latitude": 0},
+                                {"Longitude": 1, "Latitude": 0},
+                                {"Longitude": 1, "Latitude": 1},
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        "DataGranule": {
+            "RelatedUrls": [{"Type": "GET DATA", "URL": "https://cmr.invalid/data/g1"}],
+        },
+        "AdditionalAttributes": [
+            {"Name": "CENTER_LAT", "Values": ["0"]},
+            {"Name": "MD5SUM", "Values": [md5]},
+        ],
+    }
+    record = normalize_cmr_granule(
+        entry,
+        provider="ASF",
+        collection="C123",
+        data_origins=("https://cmr.invalid",),
+    )
+    assert record["assets"]["data"]["checksum"] == f"md5:{md5}"
+
+
+def test_umm_record_without_md5sum_leaves_checksum_none() -> None:
+    """A burst record with no ``MD5SUM`` keeps the asset unverifiable."""
+    entry = {
+        "GranuleUR": "B1",
+        "CollectionReference": {"ShortName": "C123"},
+        "SpatialExtent": {
+            "HorizontalSpatialDomain": {
+                "Geometry": {
+                    "GPolygon": {
+                        "Boundary": {
+                            "Points": [
+                                {"Longitude": 0, "Latitude": 0},
+                                {"Longitude": 1, "Latitude": 0},
+                                {"Longitude": 1, "Latitude": 1},
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        "DataGranule": {
+            "RelatedUrls": [{"Type": "GET DATA", "URL": "https://cmr.invalid/data/b1"}],
+        },
+    }
+    record = normalize_cmr_granule(
+        entry,
+        provider="ASF",
+        collection="C123",
+        data_origins=("https://cmr.invalid",),
+    )
+    assert record["assets"]["data"].get("checksum") is None
 
 
 def test_provider_candidate_filter_selects_valid_nisar_tiff() -> None:

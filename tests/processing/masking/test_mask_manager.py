@@ -103,6 +103,7 @@ class HttpFake:
         self.bodies: dict[str, bytes] = {}
         self.statuses: dict[str, int] = {}
         self.head_headers: dict[str, dict[str, str]] = {}
+        self.get_headers: dict[str, dict[str, str]] = {}
         self.calls: list[tuple[str, str]] = []
 
     def register_ok(
@@ -111,12 +112,20 @@ class HttpFake:
         body: bytes,
         *,
         head_headers: dict[str, str] | None = None,
+        get_headers: dict[str, str] | None = None,
     ) -> None:
-        """Serve 200 with ``body`` (and optional HEAD headers) for ``url``."""
+        """Serve 200 with ``body`` (and optional headers) for ``url``.
+
+        ``get_headers`` extend both scripted responses (the same object
+        serves HEAD and GET) and ``head_headers`` extend the HEAD response
+        only.
+        """
         self.statuses[url] = 200
         self.bodies[url] = body
         if head_headers:
             self.head_headers[url] = head_headers
+        if get_headers:
+            self.get_headers[url] = get_headers
 
     def register_missing(self, url: str) -> None:
         """Serve 404 for ``url``."""
@@ -140,23 +149,27 @@ class HttpFake:
         if method == "GET" and range_header:
             start_s, end_s = range_header.removeprefix("bytes=").split("-")
             start, end = int(start_s), int(end_s)
+            ranged_headers = {
+                "Content-Range": f"bytes {start}-{end}/{len(body)}",
+                "Content-Length": str(end - start + 1),
+            }
+            # GCS returns object-level headers (e.g. x-goog-hash) on ranged
+            # GETs too; model that so digest extraction is exercised on the
+            # ranged path.
+            ranged_headers.update(self.get_headers.get(url, {}))
             return FakeResponse(
                 status=206,
-                headers={
-                    "Content-Range": f"bytes {start}-{end}/{len(body)}",
-                    "Content-Length": str(end - start + 1),
-                },
+                headers=ranged_headers,
                 body=body[start : end + 1],
             )
         if method == "HEAD":
             head = {"Content-Length": str(len(body)), "Accept-Ranges": "bytes"}
+            head.update(self.get_headers.get(url, {}))
             head.update(self.head_headers.get(url, {}))
             return FakeResponse(status=200, headers=head)
-        return FakeResponse(
-            status=200,
-            headers={"Content-Length": str(len(body))},
-            body=body,
-        )
+        headers = {"Content-Length": str(len(body))}
+        headers.update(self.get_headers.get(url, {}))
+        return FakeResponse(status=200, headers=headers, body=body)
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> HttpFake:
         """Route transport sessions through this fake."""
@@ -854,3 +867,144 @@ class TestGetMaskManagerEnvironment:
         monkeypatch.setenv("FANINSAR_MASK_CACHE_DIR", str(tmp_path))
         monkeypatch.setenv("FANINSAR_MASK_SOURCE_URL", "https://mirror.test/gsw")
         assert get_mask_manager().source_entry.base_url == "https://mirror.test/gsw"
+
+
+# ---------------------------------------------------------------------------
+# 18. Provider digest recording (PROPOSAL-0060 seam 2): GSW x-goog-hash -> md5
+# ---------------------------------------------------------------------------
+
+
+class TestGswTileDigestRecording:
+    """The GSW fetch path records the provider md5 of each fetched tile."""
+
+    def test_fetched_gsw_tile_records_verified_digest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fetched GSW tile is verified against its ``x-goog-hash`` md5.
+
+        The GCS GET response carries ``x-goog-hash: md5=<base64>``; the
+        manager's fetch compares the tile bytes against that digest and
+        records the PROPOSAL-0055 verification entry readable by
+        :func:`faninsar.remote.transfer.read_verification`.
+        """
+        import base64
+        import hashlib
+
+        from faninsar.remote.transfer import read_verification
+
+        fake = _seed_single_tile(tmp_path, monkeypatch)
+        body = fake.bodies[_gsw_url(100, 30)]
+        md5_hex = hashlib.md5(body).hexdigest()
+        fake.register_ok(
+            _gsw_url(100, 30),
+            body,
+            get_headers={
+                "x-goog-hash": "md5="
+                + base64.b64encode(hashlib.md5(body).digest()).decode("ascii")
+            },
+        )
+        manager = MaskManager(tmp_path / "cache")
+
+        result = manager.fetch_water((100.2, 38.2, 100.8, 38.8))
+
+        tile = result.tiles[0]
+        assert read_verification(tile) == {
+            "algorithm": "md5",
+            "checksum": md5_hex,
+            "status": "verified",
+            "size": len(body),
+        }
+
+    def test_provider_digest_mismatch_fails_the_fetch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tile that does not match the observed provider digest fails.
+
+        The fetch is atomic: the failed verification is recorded before the
+        structured failure is raised.
+        """
+        import base64
+
+        from faninsar.remote.transfer import read_verification
+
+        fake = _seed_single_tile(tmp_path, monkeypatch)
+        body = fake.bodies[_gsw_url(100, 30)]
+        fake.register_ok(
+            _gsw_url(100, 30),
+            body,
+            get_headers={
+                "x-goog-hash": "md5=" + base64.b64encode(b"\x00" * 16).decode("ascii")
+            },
+        )
+        manager = MaskManager(tmp_path / "cache")
+
+        with pytest.raises(MaskProviderUnavailableError):
+            manager.fetch_water((100.2, 38.2, 100.8, 38.8))
+
+        tile = tmp_path / "cache" / "water-gsw" / "occurrence_100E_30N.tif"
+        assert read_verification(tile) == {
+            "algorithm": "md5",
+            "checksum": "00" * 16,
+            "status": "failed",
+            "size": len(body),
+        }
+
+    def test_multi_tile_fetch_verifies_each_tile_against_its_own_digest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A multi-tile fetch verifies each tile against its own digest.
+
+        GSW tiles are a 10-degree grid; a normal ROI spans several tiles, each
+        with its own ``x-goog-hash`` md5. Every fetched tile must be compared
+        against its OWN digest, not a single observed digest — applying one
+        tile's digest to another valid tile would falsely record ``failed``.
+        """
+        import base64
+        import hashlib
+
+        from faninsar.remote.transfer import read_verification
+
+        fake = HttpFake().install(monkeypatch)
+        body_a = _tile_body(tmp_path, "occurrence_100E_30N.tif", water_boxes=[BIG_LAKE])
+        body_b = _tile_body(
+            tmp_path,
+            "occurrence_110E_30N.tif",
+            water_boxes=[(110.2, 38.2, 111.0, 38.6)],
+            origin_lon=110.0,
+        )
+        assert body_a != body_b, "tiles must differ so a wrong digest is detectable"
+        fake.register_ok(
+            _gsw_url(100, 30),
+            body_a,
+            get_headers={
+                "x-goog-hash": "md5="
+                + base64.b64encode(hashlib.md5(body_a).digest()).decode("ascii")
+            },
+        )
+        fake.register_ok(
+            _gsw_url(110, 30),
+            body_b,
+            get_headers={
+                "x-goog-hash": "md5="
+                + base64.b64encode(hashlib.md5(body_b).digest()).decode("ascii")
+            },
+        )
+        manager = MaskManager(tmp_path / "cache")
+
+        # ROI spanning the 100E and 110E tiles (each tile's own digest is valid).
+        result = manager.fetch_water((105.2, 38.2, 115.8, 38.8))
+
+        assert len(result.tiles) == 2
+        by_name = {path.name: path for path in result.tiles}
+        assert read_verification(by_name["occurrence_100E_30N.tif"]) == {
+            "algorithm": "md5",
+            "checksum": hashlib.md5(body_a).hexdigest(),
+            "status": "verified",
+            "size": len(body_a),
+        }
+        assert read_verification(by_name["occurrence_110E_30N.tif"]) == {
+            "algorithm": "md5",
+            "checksum": hashlib.md5(body_b).hexdigest(),
+            "status": "verified",
+            "size": len(body_b),
+        }

@@ -392,3 +392,53 @@ def test_unclassified_config_field_fails_at_save(
     object.__setattr__(stack, "config", config)
     with pytest.raises(InvalidProcessingStateError, match="not classified"):
         save_stack_identity(stack)
+
+
+def test_persisted_inputs_carry_download_verification_status(tmp_path: Path) -> None:
+    """Each persisted input record carries its download-time verification.
+
+    PROPOSAL-0060 goal: ``verification.status`` is a *consumed* provenance
+    fact. The shared input manifest (``stack.json`` ``inputs`` block) records
+    each input's download-time verification so a reopened Stack reports which
+    inputs were verified, failed, or unverifiable. An input with no record is
+    surfaced as ``unverifiable``.
+    """
+    stack = _stack(tmp_path)
+    # Two orbit files registered as downloaded inputs.
+    orbits: dict[str, Path] = {}
+    inputs_dir = stack.config.work_dir.parent / "inputs"
+    for date_id in stack.catalog.dates:
+        path = inputs_dir / f"{date_id}.EOF"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"orbit")
+        orbits[date_id] = path
+    stack.config.extra["orbit_paths"] = dict(orbits)
+    # Mark the first orbit as verified at download time (the P0055 record).
+    verified_orbit = orbits[stack.catalog.dates[0]]
+    manifest = verified_orbit.with_name(
+        f"{verified_orbit.name}.faninsar.remote.abc.json"
+    )
+    manifest.write_text(
+        json.dumps(
+            {
+                "identity": "abc",
+                "verification": {
+                    "algorithm": "md5",
+                    "checksum": "d41d8cd98f00b204e9800998ecf8427e",
+                    "status": "verified",
+                    "size": 5,
+                },
+            }
+        )
+    )
+    stack.prepare()
+    document = json.loads(
+        (stack.config.work_dir / STACK_JSON_NAME).read_text(encoding="utf-8")
+    )
+    orbit_records = document["inputs"]["orbits"]
+    verified_record = orbit_records[stack.catalog.dates[0]]
+    assert verified_record["verification"]["status"] == "verified"
+    assert verified_record["verification"]["algorithm"] == "md5"
+    # The other orbit has no download record: surfaced as unverifiable.
+    other = orbit_records[stack.catalog.dates[1]]
+    assert other["verification"]["status"] == "unverifiable"

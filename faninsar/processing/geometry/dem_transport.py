@@ -29,6 +29,7 @@ Every transport concern for DEM fetching lives here; registry entries in
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -40,12 +41,15 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import requests
 
 from faninsar.logging import setup_logger
 from faninsar.processing.errors import InvalidProcessingStateError
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 logger = setup_logger(__name__)
 
@@ -120,6 +124,11 @@ class Tile:
         Defaults True for generic hosts; Earthdata tiles must set False.
     expected_decompressed_bytes
         Optional post-decompression size check (e.g. skadi HGT).
+    response_checksum
+        Optional provider digest expectation read from the GET response
+        headers at fetch time.  Currently only ``"x-goog-hash-md5"``
+        (Google Cloud Storage ``x-goog-hash: md5=<base64>``) is recognized;
+        ``None`` keeps the tile unverifiable.
 
     """
 
@@ -130,6 +139,8 @@ class Tile:
     expected_decompressed_bytes: int | None = None
     #: Tolerate a 404 for known-ocean tiles (skadi only).
     ocean_404_skip: bool = False
+    #: Provider digest expectation extracted from the response headers.
+    response_checksum: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,6 +650,92 @@ def _publish_target(target: Path, source_part: Path) -> None:
     source_part.replace(target)
 
 
+def _write_tile_verification(target: Path, verification: Mapping[str, object]) -> None:
+    """Write the PROPOSAL-0055 verification record of one published tile.
+
+    The record is stored as one qualified sibling manifest per tile
+    (``<name>.faninsar.remote.verification.json``, the same discovery
+    pattern as :func:`faninsar.remote.transfer.read_verification`) and
+    published atomically.  The manifest carries the verification entry
+    under its ``"verification"`` key; the tile file itself is the
+    downloaded payload.
+
+    Parameters
+    ----------
+    target : Path
+        The published tile path.
+    verification : Mapping[str, object]
+        The PROPOSAL-0055 verification record to persist.
+
+    """
+    manifest = target.with_name(f"{target.name}.faninsar.remote.verification.json")
+    temporary = manifest.with_name(f"{manifest.name}.{os.getpid()}.part")
+    payload = {"verification": dict(verification)}
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    temporary.replace(manifest)
+
+
+def _tile_has_verification(target: Path) -> bool:
+    """Return whether a published tile already carries a verification record.
+
+    The transport writes one qualified verification manifest per downloaded
+    tile. A tile served from cache (never re-downloaded) has no such record;
+    callers use this to backfill only the tiles the transport did not record,
+    without overwriting a real per-tile verification.
+    """
+    manifest = target.with_name(f"{target.name}.faninsar.remote.verification.json")
+    return manifest.is_file()
+
+
+def _record_tile_verification(target: Path, provider_checksum: str | None) -> None:
+    """Record the PROPOSAL-0055 verification entry of one published tile.
+
+    The transport compares the published bytes against ``provider_checksum``
+    (an expected ``"md5:<hex>"`` digest extracted from the provider response
+    headers) and writes the result next to the tile in the qualified
+    PROPOSAL-0055 form, readable by
+    :func:`faninsar.remote.transfer.read_verification`:
+
+    ``{algorithm, checksum, status, size}`` when the provider offered a
+    digest (``status`` is ``"verified"`` or ``"failed"``), and
+    ``{status: "unverifiable", size}`` when it did not.  Tiles whose bytes
+    are a post-decompression transformation of the response (gzip-skadi) are
+    recorded unverifiable because the response digest cannot describe the
+    published bytes.
+
+    Raises
+    ------
+    InvalidProcessingStateError
+        If the published bytes do not match the provider digest.
+
+    """
+    verification: dict[str, object] = {}
+    size = target.stat().st_size
+    if provider_checksum:
+        algorithm, expected = provider_checksum.split(":", 1)
+        actual = hashlib.new(algorithm)
+        with target.open("rb") as stream:
+            for block in iter(lambda: stream.read(1 << 20), b""):
+                actual.update(block)
+        status = "verified" if actual.hexdigest() == expected else "failed"
+        verification = {
+            "algorithm": algorithm,
+            "checksum": expected,
+            "status": status,
+            "size": size,
+        }
+    else:
+        verification = {"status": "unverifiable", "size": size}
+    _write_tile_verification(target, verification)
+    if verification["status"] == "failed":
+        message = (
+            f"checksum mismatch for {target.name}: expected "
+            f"{provider_checksum}, got md5:{actual.hexdigest()}"
+        )
+        logger.error(message)
+        raise InvalidProcessingStateError(message)
+
+
 def sweep_part_files(
     cache_dir: Path, max_age_s: float = DEFAULT_SWEEP_MAX_AGE_S
 ) -> int:
@@ -760,6 +857,41 @@ def extract_zip_members(
 # ---------------------------------------------------------------------------
 
 
+def _provider_checksum_from_headers(
+    expectation: str | None, headers: Mapping[str, str]
+) -> str | None:
+    """Extract the provider digest named by ``expectation`` from ``headers``.
+
+    The extraction is delegated to the provider-owned helper
+    :func:`faninsar.processing.masking.mask_sources.x_goog_hash_md5` for the
+    ``"x-goog-hash-md5"`` expectation (Google Cloud Storage
+    ``x-goog-hash: md5=<base64>``).  Unknown expectations and headers
+    without a decodable digest yield ``None`` (unverifiable), never an
+    error: a missing provider digest must not fail a fetch.
+
+    Parameters
+    ----------
+    expectation : str or None
+        The response-digest expectation recorded on the planned tile.
+    headers : Mapping[str, str]
+        Response header mapping of the completed transfer.
+
+    Returns
+    -------
+    str or None
+        The qualified ``"md5:<hex>"`` digest, or ``None``.
+
+    """
+    if expectation is None:
+        return None
+    if expectation == "x-goog-hash-md5":
+        from faninsar.processing.masking.mask_sources import x_goog_hash_md5
+
+        return x_goog_hash_md5(headers)
+    logger.warning("unknown response checksum expectation: %r", expectation)
+    return None
+
+
 def _stream_to_part(response: requests.Response, part: Path) -> int:
     """Stream a response body into ``part``; return byte count written."""
     written = 0
@@ -816,12 +948,20 @@ def _download_whole(
     credentials: CredentialProvider | None = None,
     allowed_hosts: set[str] | None = None,
     max_fetch_bytes: int = 2**33,
-) -> None:
+    response_checksum: str | None = None,
+) -> str | None:
     """Plain whole-file streaming download with integrity checks.
 
     Redirect hops are validated explicitly: cross-host targets are followed
     WITHOUT credentials, and any auth header that would attach cross-host
     is a hard error.
+
+    Returns
+    -------
+    str or None
+        The provider digest extracted from the response headers when
+        ``response_checksum`` names one, else ``None``.
+
     """
     current_url = url
     current_headers = dict(headers)
@@ -911,6 +1051,7 @@ def _download_whole(
             f"expected {expected_total}"
         )
         raise InvalidProcessingStateError(message)
+    return _provider_checksum_from_headers(response_checksum, response.headers)
 
 
 _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)")
@@ -925,12 +1066,23 @@ def _download_ranged(
     budget: ThreadPoolExecutor | None = None,
     max_workers: int = 4,
     max_fetch_bytes: int = 2**33,
-) -> None:
+    response_checksum: str | None = None,
+) -> str | None:
     """Ranged-chunk assembly with mandatory 206/Content-Range validation.
 
     Chunks are fetched serially when only one worker is in the shared
     budget; otherwise a small per-tile pool parallelizes chunk GETs while
     writes stay on the calling thread.
+
+    Returns
+    -------
+    str or None
+        The provider digest extracted from the ranged response headers via
+        ``response_checksum``, or ``None`` when the provider offered none
+        (recorded unverifiable). The digest describes the whole object, so it
+        is taken from the first chunk's response headers and compared against
+        the assembled bytes by the caller.
+
     """
     if total > max_fetch_bytes:
         raise InvalidProcessingStateError(
@@ -938,6 +1090,7 @@ def _download_ranged(
         )
     fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     handles: dict[int, int] = {}
+    discovered: list[str | None] = []
     try:
         os.ftruncate(fd, total)
         chunk_starts = list(range(0, total, CHUNK_SIZE_BYTES))
@@ -957,6 +1110,15 @@ def _download_ranged(
                         f"{redact_url(url)}; server ignored Range"
                     )
                     raise InvalidProcessingStateError(message)
+                # The object-level provider digest (e.g. GCS x-goog-hash) is the
+                # same on every ranged response; capture it from this chunk so
+                # the assembled bytes can be verified against it.
+                if not discovered:
+                    discovered.append(
+                        _provider_checksum_from_headers(
+                            response_checksum, response.headers
+                        )
+                    )
                 raw_range = response.headers.get("Content-Range", "")
                 match = _CONTENT_RANGE_RE.fullmatch(raw_range.strip())
                 if (
@@ -1013,6 +1175,7 @@ def _download_ranged(
             f"{actual} != Content-Length {total}"
         )
         raise InvalidProcessingStateError(message)
+    return discovered[0] if discovered else None
 
 
 def _write_chunk(fd: int, handles: dict[int, int], start: int, body: bytes) -> None:
@@ -1137,22 +1300,24 @@ def _execute_tile_set(
         ocean_skip = tile.ocean_404_skip or plan.ocean_404_skip
         target.parent.mkdir(parents=True, exist_ok=True)
         part = part_path(target)
+        provider_checksum: str | None = None
         try:
             if use_ranged:
                 length, accept_ranges = _head_content_length(
                     url, headers, surface_contract_errors=True
                 )
                 if length is not None and accept_ranges and length <= 64 << 30:
-                    _download_ranged(
+                    provider_checksum = _download_ranged(
                         url,
                         part,
                         length,
                         headers=headers,
                         max_workers=min(max_workers, 4),
                         max_fetch_bytes=max_fetch_bytes,
+                        response_checksum=tile.response_checksum,
                     )
                 else:
-                    _download_whole(
+                    provider_checksum = _download_whole(
                         url,
                         part,
                         headers=headers,
@@ -1160,9 +1325,10 @@ def _execute_tile_set(
                         credentials=credentials,
                         allowed_hosts=allowed,
                         max_fetch_bytes=max_fetch_bytes,
+                        response_checksum=tile.response_checksum,
                     )
             else:
-                _download_whole(
+                provider_checksum = _download_whole(
                     url,
                     part,
                     headers=headers,
@@ -1170,12 +1336,14 @@ def _execute_tile_set(
                     credentials=credentials,
                     allowed_hosts=allowed,
                     max_fetch_bytes=max_fetch_bytes,
+                    response_checksum=tile.response_checksum,
                 )
             if tile.expected_decompressed_bytes is not None:
                 _verify_tile_decompressed(part, tile.expected_decompressed_bytes)
             sha = hashlib.sha256(part.read_bytes()).hexdigest()
             logger.debug("tile sha256 %s: %s", target.name, sha)
             _publish_target(target, part)
+            _record_tile_verification(target, provider_checksum)
             return target  # noqa: TRY300
         except DemAuthProviderError as exc:
             part.unlink(missing_ok=True)

@@ -744,3 +744,268 @@ def test_transport_guard_rejects_traversal_targets(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="escapes"):
         validate_cache_target(tmp_path, outside)
     assert not outside.exists()
+
+
+# ---------------------------------------------------------------------------
+# Provider digest extraction from response headers (PROPOSAL-0060 seam 2)
+# ---------------------------------------------------------------------------
+
+
+def _x_goog_md5_base64(body: bytes) -> str:
+    """Independent spelling of the GCS base64 md5 entry for ``body``.
+
+    Expected values come from this separate source, not from the code under
+    test: raw md5 bytes -> stdlib base64.
+    """
+    import base64
+
+    return base64.b64encode(hashlib.md5(body).digest()).decode("ascii")
+
+
+def test_x_goog_hash_md5_response_records_verified_manifest(
+    tmp_path: Path,
+    patched_session: FakeSession,
+) -> None:
+    """A GSW tile fetch records a verified PROPOSAL-0055 manifest.
+
+    The GCS GET response carries ``x-goog-hash: md5=<base64>``; the fetched
+    tile is compared against that provider digest and the result is written
+    in the qualified verification-record form readable by
+    :func:`faninsar.remote.transfer.read_verification`.
+    """
+    from faninsar.remote.transfer import read_verification
+
+    body = _payload(1 << 20)
+    url = "https://storage.googleapis.com/bucket/occurrence_100E_30N.tif"
+    patched_session.script_response(
+        "GET",
+        url,
+        [
+            FakeResponse(
+                status=200,
+                headers={
+                    "Content-Length": str(len(body)),
+                    "x-goog-hash": f"crc32c=70q7iA==, md5={_x_goog_md5_base64(body)}",
+                },
+                body=body,
+            )
+        ],
+    )
+    plan = TileSet(
+        allowed_hosts=("storage.googleapis.com",),
+        tiles=(
+            Tile(
+                url=url,
+                cache_path=Path("water-gsw/occurrence_100E_30N.tif"),
+                min_bytes=len(body),
+                ranged=False,
+                response_checksum="x-goog-hash-md5",
+            ),
+        ),
+    )
+    target = tmp_path / "water-gsw" / "occurrence_100E_30N.tif"
+
+    fetch_plan(plan, tmp_path)
+
+    assert target.read_bytes() == body
+    assert read_verification(target) == {
+        "algorithm": "md5",
+        "checksum": hashlib.md5(body).hexdigest(),
+        "status": "verified",
+        "size": len(body),
+    }
+
+
+def test_x_goog_hash_md5_mismatch_fails_after_recording(
+    tmp_path: Path,
+    patched_session: FakeSession,
+) -> None:
+    """A provider digest mismatch fails the fetch and records ``failed``.
+
+    The failed attempt is persisted before the error is raised so the
+    exclusion is auditable (PROPOSAL-0055 failure semantics).
+    """
+    from faninsar.processing.errors import InvalidProcessingStateError
+    from faninsar.remote.transfer import read_verification
+
+    body = _payload(1 << 20)
+    wrong = b"\x00" * 16
+    import base64
+
+    url = "https://storage.googleapis.com/bucket/occurrence_110E_30N.tif"
+    patched_session.script_response(
+        "GET",
+        url,
+        [
+            FakeResponse(
+                status=200,
+                headers={
+                    "Content-Length": str(len(body)),
+                    "x-goog-hash": ("md5=" + base64.b64encode(wrong).decode("ascii")),
+                },
+                body=body,
+            )
+        ],
+    )
+    plan = TileSet(
+        allowed_hosts=("storage.googleapis.com",),
+        tiles=(
+            Tile(
+                url=url,
+                cache_path=Path("water-gsw/occurrence_110E_30N.tif"),
+                min_bytes=len(body),
+                ranged=False,
+                response_checksum="x-goog-hash-md5",
+            ),
+        ),
+    )
+    target = tmp_path / "water-gsw" / "occurrence_110E_30N.tif"
+
+    with pytest.raises(InvalidProcessingStateError, match="checksum mismatch"):
+        fetch_plan(plan, tmp_path)
+
+    assert read_verification(target) == {
+        "algorithm": "md5",
+        "checksum": wrong.hex(),
+        "status": "failed",
+        "size": len(body),
+    }
+
+
+def test_tile_without_response_checksum_records_unverifiable(
+    tmp_path: Path,
+    patched_session: FakeSession,
+) -> None:
+    """A tile with no provider digest expectation records unverifiable."""
+    from faninsar.remote.transfer import read_verification
+
+    body = _payload(1 << 20)
+    url = "https://example.test/plain.tif"
+    patched_session.script_response("GET", url, [FakeResponse(status=200, body=body)])
+    plan = TileSet(
+        allowed_hosts=("example.test",),
+        tiles=(
+            Tile(
+                url=url,
+                cache_path=Path("dem/plain.tif"),
+                min_bytes=len(body),
+                ranged=False,
+            ),
+        ),
+    )
+    target = tmp_path / "dem" / "plain.tif"
+
+    fetch_plan(plan, tmp_path)
+
+    assert read_verification(target) == {
+        "status": "unverifiable",
+        "size": len(body),
+    }
+
+
+def test_crc32c_only_response_without_md5_records_unverifiable(
+    tmp_path: Path,
+    patched_session: FakeSession,
+) -> None:
+    """A GCS response offering only crc32c records unverifiable (no md5)."""
+    from faninsar.remote.transfer import read_verification
+
+    body = _payload(1 << 20)
+    url = "https://storage.googleapis.com/bucket/occurrence_120E_30N.tif"
+    patched_session.script_response(
+        "GET",
+        url,
+        [
+            FakeResponse(
+                status=200,
+                headers={
+                    "Content-Length": str(len(body)),
+                    "x-goog-hash": "crc32c=70q7iA==",
+                },
+                body=body,
+            )
+        ],
+    )
+    plan = TileSet(
+        allowed_hosts=("storage.googleapis.com",),
+        tiles=(
+            Tile(
+                url=url,
+                cache_path=Path("water-gsw/occurrence_120E_30N.tif"),
+                min_bytes=len(body),
+                ranged=False,
+                response_checksum="x-goog-hash-md5",
+            ),
+        ),
+    )
+    target = tmp_path / "water-gsw" / "occurrence_120E_30N.tif"
+
+    fetch_plan(plan, tmp_path)
+
+    assert read_verification(target) == {
+        "status": "unverifiable",
+        "size": len(body),
+    }
+
+
+def test_ranged_download_captures_own_digest_and_records_verified(
+    tmp_path: Path,
+    patched_session: FakeSession,
+) -> None:
+    """A ranged download records ``verified`` against its own response digest.
+
+    PROPOSAL-0060 regression guard for the ranged branch: the object-level
+    provider digest (``x-goog-hash``) appears on the 206 chunk responses, the
+    ranged assembly captures it, and the assembled bytes are compared against
+    that SAME object's digest — recording ``verified``. This is the exact path
+    that previously recorded ``unverifiable`` because ``_download_ranged``
+    dropped the response digest.
+    """
+    from faninsar.remote.transfer import read_verification
+
+    body = _payload(_ONE_CHUNK * 2 + 11)
+    url = "https://storage.googleapis.com/bucket/occurrence_100E_30N.tif"
+    digest_header = {"x-goog-hash": f"md5={_x_goog_md5_base64(body)}"}
+    patched_session.script_response(
+        "HEAD",
+        url,
+        [FakeResponse(status=200, headers=_head_headers(len(body)))],
+    )
+    total_chunks = (len(body) + _ONE_CHUNK - 1) // _ONE_CHUNK
+    for index in range(total_chunks):
+        start = index * _ONE_CHUNK
+        end = min(start + _ONE_CHUNK, len(body)) - 1
+        chunk = body[start : end + 1]
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{len(body)}",
+            "Content-Length": str(end - start + 1),
+            **digest_header,
+        }
+        patched_session.script_response(
+            "GET",
+            url,
+            [FakeResponse(status=206, headers=headers, body=chunk)],
+        )
+    plan = TileSet(
+        allowed_hosts=("storage.googleapis.com",),
+        tiles=(
+            Tile(
+                url=url,
+                cache_path=Path("water-gsw/occurrence_100E_30N.tif"),
+                min_bytes=len(body),
+                ranged=True,
+                response_checksum="x-goog-hash-md5",
+            ),
+        ),
+    )
+    target = tmp_path / "water-gsw" / "occurrence_100E_30N.tif"
+
+    fetch_plan(plan, tmp_path)
+
+    assert target.read_bytes() == body
+    assert read_verification(target) == {
+        "algorithm": "md5",
+        "checksum": hashlib.md5(body).hexdigest(),
+        "status": "verified",
+        "size": len(body),
+    }

@@ -11,8 +11,10 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -66,6 +68,23 @@ class _RemotePollObservation:
     state: str
     url: str
     delay_seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class _FetchedPayload:
+    """One adapter ``fetch`` result that also carries a provider checksum.
+
+    Adapters that discover a provider digest while fetching (for example the
+    s1-orbits single-part S3 ``ETag``, PROPOSAL-0060 seam 1) return this
+    wrapper instead of bare bytes so the transfer layer can compare the
+    streamed bytes against the digest and record ``verified``/``failed``.
+    ``checksum`` is the qualified ``algorithm:hex`` spelling accepted by
+    :class:`~faninsar.remote.records.RemoteAsset`; ``None`` means the fetch
+    found no trustworthy digest and the download stays ``unverifiable``.
+    """
+
+    payload: Any
+    checksum: str | None = None
 
 
 def _poll_delay_seconds(
@@ -413,6 +432,8 @@ def _stream_and_verify(
 
     def result_chunks(result: Any) -> Iterable[bytes]:
         """Adapt provider result forms to a one-pass chunk iterable."""
+        if isinstance(result, _FetchedPayload):
+            return result_chunks(result.payload)
         if isinstance(result, (bytes, bytearray)):
             # Slice fixture bytes so publication follows the same bounded
             # sequential path as a real HTTP response.
@@ -442,6 +463,16 @@ def _stream_and_verify(
             else:
                 ledger.request()
                 result = fetcher(asset, budget)
+            if isinstance(result, _FetchedPayload) and result.checksum:
+                # The adapter discovered a provider digest during fetch
+                # (PROPOSAL-0060).  Adopt it for the comparison below; the
+                # streaming hasher is (re)built for its algorithm so the
+                # already-known asset checksum keeps precedence.
+                discovered = result.checksum
+                if not asset.checksum:
+                    asset = replace(asset, checksum=discovered)
+                    checksum_algorithm = discovered.split(":", 1)[0]
+                    checksum_hasher = hashlib.new(checksum_algorithm)
 
             if result is None and asset.auth_profile == "earthdata-asf":
                 authenticated_session = _facade_hook(
@@ -741,6 +772,204 @@ def _prepare_burst_for_standalone_download(
     return _fail(RemoteLimitError, "max_poll_attempts")
 
 
+def parse_safe_manifest_checksums(manifest_xml: str | bytes) -> dict[str, str]:
+    """Return the MD5 member checksums declared by one SAFE ``manifest.safe``.
+
+    A SAFE ``manifest.safe`` lists each internal file with a ``fileLocation``
+    ``href`` (a relative member path) and, when the provider supplies one, a
+    ``checksum checksumName="MD5"`` element.  This pure parser collects only
+    the MD5-declared members; members without an MD5 entry (or with a
+    different ``checksumName``) are omitted so they never produce a spurious
+    failure.  The href is normalized to a bare zip member path (leading
+    ``./`` stripped) to match the names inside the SAFE zip.
+
+    Parameters
+    ----------
+    manifest_xml : str or bytes
+        The decoded (or raw UTF-8) text of a SAFE ``manifest.safe`` document.
+
+    Returns
+    -------
+    dict of str to str
+        Mapping of normalized member path to its lowercase hex MD5 digest.
+        Empty when the manifest declares no MD5 checksums.
+
+    Examples
+    --------
+    >>> pairs = parse_safe_manifest_checksums(
+    ...     "<byteStream>"
+    ...     '<fileLocation href="./a.tiff"/>'
+    ...     '<checksum checksumName="MD5">'
+    ...     "4ae69c457a6534ddaf0f511c69a37ca6</checksum>"
+    ...     "</byteStream>"
+    ... )
+    >>> pairs
+    {'a.tiff': '4ae69c457a6534ddaf0f511c69a37ca6'}
+
+    """
+    if isinstance(manifest_xml, bytes):
+        text = manifest_xml.decode("utf-8", errors="replace")
+    else:
+        text = manifest_xml
+
+    def local_name(tag: str) -> str:
+        """Return the namespace-free local name of an element tag."""
+        return tag.rsplit("}", 1)[-1]
+
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return {}
+    pairs: dict[str, str] = {}
+    for byte_stream in root.iter():
+        if local_name(byte_stream.tag) != "byteStream":
+            continue
+        href: str | None = None
+        md5: str | None = None
+        for child in byte_stream:
+            name = local_name(child.tag)
+            if name == "fileLocation":
+                href = child.get("href") or child.get("HREF")
+            elif name == "checksum":
+                algorithm = (child.get("checksumName") or "").strip().upper()
+                if algorithm == "MD5":
+                    value = (child.text or "").strip().lower()
+                    if value:
+                        md5 = value
+        if href and md5:
+            member = href.strip().removeprefix("./")
+            pairs[member] = md5
+    return pairs
+
+
+def verify_safe_members(zip_path: Path) -> tuple[dict[str, object], bool]:
+    """Verify every ``manifest.safe``-checksummed member of a written SAFE zip.
+
+    The zip container itself carries no provider digest and stays
+    ``unverifiable``; this is a content check on the SAFE members listed in
+    the embedded ``manifest.safe`` (PROPOSAL-0060 seam 4).  Each member that
+    the manifest declares with an MD5 is streamed and compared; members
+    without a manifest MD5 are not checked.  The returned summary is the
+    additive ``members`` fact recorded alongside the unchanged P0055
+    three-state verification envelope.
+
+    Parameters
+    ----------
+    zip_path : Path
+        Path to the written SAFE zip.
+
+    Returns
+    -------
+    summary : dict
+        ``{'checked': N, 'matched': M, 'status': 'verified' | 'failed'}`` where
+        ``N`` is the number of manifest-MD5 members checked and ``M`` the
+        number whose bytes matched.  ``status`` is ``'verified'`` only when
+        every checked member matched (and at least one was checked).
+    all_matched : bool
+        ``True`` when at least one member was checked and every checked member
+        matched; ``False`` when a member mismatched or none were checkable.
+
+    Examples
+    --------
+    For a SAFE zip whose two members match the manifest MD5s, the summary is
+    ``{'checked': 2, 'matched': 2, 'status': 'verified'}`` and ``all_matched``
+    is ``True``.
+
+    """
+    with zipfile.ZipFile(zip_path) as archive:
+        names = archive.namelist()
+        manifest_name = next(
+            (name for name in names if name.rsplit("/", 1)[-1] == "manifest.safe"),
+            None,
+        )
+        if manifest_name is None:
+            return {"checked": 0, "matched": 0, "status": "unverifiable"}, False
+        pairs = parse_safe_manifest_checksums(archive.read(manifest_name))
+        checked = 0
+        matched = 0
+        for member, expected in pairs.items():
+            name = (
+                member
+                if member in names
+                else next(
+                    (
+                        candidate
+                        for candidate in names
+                        if candidate.endswith("/" + member) or candidate == member
+                    ),
+                    None,
+                )
+            )
+            if name is None:
+                checked += 1
+                continue
+            digest = hashlib.md5()
+            with archive.open(name) as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            checked += 1
+            if digest.hexdigest().lower() == expected.lower():
+                matched += 1
+        status = "verified" if checked > 0 and matched == checked else "failed"
+        summary = {"checked": checked, "matched": matched, "status": status}
+        return summary, bool(checked and matched == checked)
+
+
+def _apply_safe_member_verification(
+    staging: Path, verification: dict[str, object]
+) -> tuple[dict[str, object], bool]:
+    """Annotate a burst SAFE verification record with its member check.
+
+    After a SAFE zip is written and before publication, the embedded
+    ``manifest.safe`` MD5 members are verified (PROPOSAL-0060 seam 4).  The
+    container record keeps its P0055 three-state ``status`` (``unverifiable``,
+    since a SAFE zip has no container digest) and gains an additive
+    ``members`` sub-record only when the manifest declares at least one
+    checksummed member.  A member mismatch marks the container ``failed`` and
+    is returned as the second element so the caller applies P0055 skip
+    semantics (persist ``failed`` and raise).
+
+    Parameters
+    ----------
+    staging : Path
+        The written SAFE zip to check.
+    verification : dict
+        The P0055 verification record for the container.
+
+    Returns
+    -------
+    verification : dict
+        The record, possibly annotated with ``{'members': {...}}``.
+    member_failed : bool
+        ``True`` when a checksummed member mismatched its manifest MD5.
+
+    """
+    try:
+        is_zip = zipfile.is_zipfile(staging)
+    except OSError:
+        is_zip = False
+    if not is_zip:
+        return verification, False
+    with zipfile.ZipFile(staging) as archive:
+        names = archive.namelist()
+        has_manifest = any(name.rsplit("/", 1)[-1] == "manifest.safe" for name in names)
+    if not has_manifest:
+        return verification, False
+    summary, all_matched = verify_safe_members(staging)
+    if summary.get("checked", 0) == 0:
+        # No checksummed members: leave the record untouched (no members
+        # sub-record); the container stays unverifiable.
+        return verification, False
+    verification = dict(verification)
+    verification["members"] = summary
+    if not all_matched:
+        # A member mismatch is a content-verification failure: the record
+        # becomes ``failed`` (P0055 skip semantics) even though the container
+        # digest itself stays ``unverifiable``.
+        verification["status"] = "failed"
+    return verification, not all_matched
+
+
 def _publish_manifest(
     manifest: Path,
     identity: str,
@@ -897,6 +1126,17 @@ def download(
                 # Persist the failed verification before raising so the
                 # failed attempt is recorded and the mission layer can
                 # exclude this acquisition from processing.
+                _publish_manifest(
+                    manifest, _identity(asset), digest, size, verification
+                )
+                _fail(RemoteIntegrityError, "checksum_mismatch")
+            verification, member_failed = _apply_safe_member_verification(
+                temporary, verification
+            )
+            if member_failed:
+                # A burst SAFE member mismatched its manifest.safe MD5.  Record
+                # status failed (P0055 skip semantics) before raising so the
+                # mission layer excludes this acquisition from processing.
                 _publish_manifest(
                     manifest, _identity(asset), digest, size, verification
                 )

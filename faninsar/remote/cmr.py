@@ -320,6 +320,36 @@ def _umm_size_bytes(record: Mapping[str, Any]) -> int | None:
     return None
 
 
+def _umm_md5sum(record: Mapping[str, Any]) -> str | None:
+    """Return the complete-file MD5 from UMM ``AdditionalAttributes``.
+
+    ASF publishes the digest of the COMPLETE SLC/frame archive as the UMM
+    ``AdditionalAttributes[Name="MD5SUM"]`` value (mirrored by the ASF search
+    API's ``md5sum`` field).  The value is a bare hex digest; it is qualified
+    as ``md5:<hex>`` here so the shared ``_normalize_checksum`` grammar
+    accepts it.  Burst products carry no ``MD5SUM`` and stay unverifiable.
+    """
+    attributes = record.get("AdditionalAttributes")
+    if not isinstance(attributes, list):
+        return None
+    for attribute in attributes:
+        if not isinstance(attribute, Mapping):
+            continue
+        name = attribute.get("Name")
+        if not isinstance(name, str) or name.strip().upper() != "MD5SUM":
+            continue
+        values = attribute.get("Values")
+        if isinstance(values, list) and values and isinstance(values[0], str):
+            digest = values[0].strip()
+        elif isinstance(values, str):
+            digest = values.strip()
+        else:
+            continue
+        if digest:
+            return f"md5:{digest}"
+    return None
+
+
 def _compact_size_bytes(value: Any) -> int | None:
     """Convert compact CMR's MiB declaration to an exact byte count.
 
@@ -340,6 +370,23 @@ def _compact_size_bytes(value: Any) -> int | None:
     if not math.isfinite(size_bytes) or not size_bytes.is_integer():
         return None
     return int(size_bytes)
+
+
+def _compact_md5sum(record: Mapping[str, Any]) -> str | None:
+    """Return the complete-file MD5 from a compact ASF ``md5sum`` property.
+
+    The ASF search API's compact/GeoJSON representation exposes the complete
+    SLC/frame archive digest as ``properties.md5sum``.  The bare hex digest is
+    qualified as ``md5:<hex>`` for the shared checksum grammar.  Burst products
+    carry no ``md5sum`` and stay unverifiable.
+    """
+    properties = record.get("properties")
+    if not isinstance(properties, Mapping):
+        return None
+    digest = properties.get("md5sum")
+    if isinstance(digest, str) and digest.strip():
+        return f"md5:{digest.strip()}"
+    return None
 
 
 def _cmr_links(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -1038,6 +1085,8 @@ class CMRCollectionAdapter:
         if isinstance(size, int) and size >= 0:
             asset["size"] = size
         checksum = candidate.get("Checksum", candidate.get("checksum"))
+        if not isinstance(checksum, str):
+            checksum = _umm_md5sum(entry) or _compact_md5sum(entry)
         if isinstance(checksum, str):
             asset["checksum"] = checksum
         assets[key] = asset

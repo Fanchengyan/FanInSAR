@@ -93,6 +93,47 @@ def _excluded_acquisition_provenance(
     return {"excluded_acquisitions": json.dumps(payload, sort_keys=True)}
 
 
+def _input_verification_provenance(
+    paths: Sequence[str | Path],
+) -> dict[str, str]:
+    """Surface each downloaded input's verification record in provenance.
+
+    PROPOSAL-0060 makes ``verification.status`` a consumed provenance fact.
+    Reads the download-time PROPOSAL-0055 verification record of each input
+    (via :func:`faninsar.remote.transfer.read_verification`) and serializes
+    ``{path, status, algorithm, size}`` per input into one deterministic JSON
+    entry consumed by the shared input manifest's ``provenance`` block. An
+    input with no record is surfaced as ``status: unverifiable`` (the honest
+    outcome when no provider digest was available).
+
+    Parameters
+    ----------
+    paths : sequence of str or Path
+        Resolved local paths of the downloaded inputs.
+
+    Returns
+    -------
+    dict
+        Always one ``{"input_verification": <json>}`` entry.
+
+    """
+    from faninsar.remote.transfer import read_verification
+
+    entries: list[dict[str, object]] = []
+    for path in paths:
+        resolved = Path(path)
+        record = read_verification(resolved) or {}
+        entries.append(
+            {
+                "path": str(resolved),
+                "status": record.get("status", "unverifiable"),
+                "algorithm": record.get("algorithm"),
+                "size": record.get("size", resolved.stat().st_size),
+            }
+        )
+    return {"input_verification": json.dumps(entries, sort_keys=True)}
+
+
 def _configure_s1_bindings(
     stack: S1Stack,
     *,
@@ -690,8 +731,10 @@ class S1Stack(Stack):
         from faninsar.missions.s1.safe import open_safe_product
 
         footprints: list[object] = []
+        input_paths: list[Path] = []
         for date_id in self.catalog.dates:
             for path in self.catalog.paths_for(date_id):
+                input_paths.append(Path(path))
                 product = open_safe_product(
                     path,
                     polarizations=(
@@ -723,6 +766,7 @@ class S1Stack(Stack):
                     else ",".join(tuple(self.config.extra.get("polarizations", ())))
                 ),
                 **_excluded_acquisition_provenance(excluded),
+                **_input_verification_provenance(input_paths),
             },
         )
 

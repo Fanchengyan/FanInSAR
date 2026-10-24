@@ -598,3 +598,92 @@ class TestTileSnapping:
             n_lat = round((lat_band[1] - lat_band[0]) / size)
             plan = source.plan(bounds)
             assert len(plan.tiles) == n_lon * n_lat
+
+
+# ---------------------------------------------------------------------------
+# GSW digest extraction (PROPOSAL-0060 seam 2): x-goog-hash -> md5
+# ---------------------------------------------------------------------------
+
+
+class TestXGoogHashMd5:
+    """Provider digest extraction from the GCS ``x-goog-hash`` header.
+
+    GSW water tiles live on Google Cloud Storage and return
+    ``x-goog-hash: crc32c=...`` and ``x-goog-hash: md5=<base64>``.  The
+    settled decision (PROPOSAL-0060) decodes the base64 md5 to hex and
+    compares it as ``md5``.  Expected values are known-good literals:
+    ``OFj2IjCsPJFfMAxmQxLBHw==`` is the standard base64 spelling of the 16
+    md5 bytes ``38 58 f6 22 30 ac 3c 91 5f 30 0c 66 43 12 c1 1f`` (the md5
+    digest of ``foobar``).
+    """
+
+    def test_md5_entry_decodes_to_qualified_hex(self) -> None:
+        """A base64 md5 entry decodes to the qualified hex digest.
+
+        Headers come from a representative merged GCS response
+        (``crc32c`` + ``md5`` entries separated by ``,``).
+        """
+        from faninsar.processing.masking.mask_sources import x_goog_hash_md5
+
+        headers = {"x-goog-hash": "crc32c=70q7iA==, md5=OFj2IjCsPJFfMAxmQxLBHw=="}
+        assert x_goog_hash_md5(headers) == "md5:3858f62230ac3c915f300c664312c11f"
+
+    def test_crc32c_only_header_yields_no_checksum(self) -> None:
+        """A header with only the crc32c entry yields no md5 digest."""
+        from faninsar.processing.masking.mask_sources import x_goog_hash_md5
+
+        headers = {"x-goog-hash": "crc32c=70q7iA=="}
+        assert x_goog_hash_md5(headers) is None
+
+    def test_malformed_base64_md5_yields_no_checksum(self) -> None:
+        """A malformed base64 md5 value is undecodable and yields no digest."""
+        from faninsar.processing.masking.mask_sources import x_goog_hash_md5
+
+        headers = {"x-goog-hash": "md5=not base64!!"}
+        assert x_goog_hash_md5(headers) is None
+
+    def test_absent_header_yields_no_checksum(self) -> None:
+        """Headers without any x-goog-hash key yield no digest."""
+        from faninsar.processing.masking.mask_sources import x_goog_hash_md5
+
+        assert x_goog_hash_md5({"Content-Length": "123"}) is None
+        assert x_goog_hash_md5({}) is None
+
+    def test_split_headers_and_case_insensitive_key(self) -> None:
+        """Separate header occurrences and mixed-case keys still resolve."""
+        from faninsar.processing.masking.mask_sources import x_goog_hash_md5
+
+        headers = {
+            "X-Goog-Hash": "crc32c=70q7iA==",
+            "x-goog-hash": "md5=1B2M2Y8AsgTpgAmY7PhCfg==",
+        }
+        assert x_goog_hash_md5(headers) == "md5:d41d8cd98f00b204e9800998ecf8427e"
+
+    def test_wrong_length_md5_bytes_yields_no_checksum(self) -> None:
+        """A decodable value that is not 16 md5 bytes yields no digest."""
+        from faninsar.processing.masking.mask_sources import x_goog_hash_md5
+
+        # "Zm9v" decodes to b"foo" (3 bytes), not an md5 digest.
+        headers = {"x-goog-hash": "md5=Zm9v"}
+        assert x_goog_hash_md5(headers) is None
+
+    def test_gsw_plan_carries_response_checksum_expectation(self) -> None:
+        """The GSW plan requests the GCS response digest for each tile.
+
+        GSW tiles are served by Google Cloud Storage, whose GET responses
+        carry the object md5 in ``x-goog-hash``; the planned tile names that
+        extraction so the fetch can record a verified provider digest.
+        """
+        source = get_mask_source("gsw")
+        plan = source.plan(_bounds(100.0, 30.0, 101.0, 31.0))
+        assert isinstance(plan, TileSet)
+        assert len(plan.tiles) == 1
+        assert plan.tiles[0].response_checksum == "x-goog-hash-md5"
+
+    def test_worldcover_plan_keeps_no_response_checksum(self) -> None:
+        """WorldCover (S3) stays unverifiable: no digest expectation planned."""
+        source = get_mask_source("worldcover")
+        plan = source.plan(_bounds(100.0, 30.0, 101.0, 31.0))
+        assert isinstance(plan, TileSet)
+        assert plan.tiles
+        assert all(tile.response_checksum is None for tile in plan.tiles)

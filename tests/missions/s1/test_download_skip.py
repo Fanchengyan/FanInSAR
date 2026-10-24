@@ -21,6 +21,7 @@ from faninsar import remote
 from faninsar.missions.s1.stack import (
     S1Stack,
     _excluded_acquisition_provenance,
+    _input_verification_provenance,
 )
 
 if TYPE_CHECKING:
@@ -267,3 +268,53 @@ def test_exclusion_provenance_serialization_format() -> None:
         "excluded_acquisitions": json.dumps([record], sort_keys=True)
     }
     assert _excluded_acquisition_provenance(()) == {}
+
+
+def test_input_verification_provenance_surfaces_per_input_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each downloaded input's verification record is surfaced in provenance.
+
+    PROPOSAL-0060 goal: ``verification.status`` is a consumed provenance fact.
+    The helper reads the download-time verification record of each input and
+    serializes ``{status, algorithm, size}`` per input into one deterministic
+    entry, so the run summary reports which inputs were verified, failed, or
+    unverifiable. An input with no record carries ``status: unverifiable``.
+    """
+    # verified input
+    verified = tmp_path / "S1_VERIFIED.zip"
+    verified.write_bytes(b"verified-bytes")
+    manifest = verified.with_name(f"{verified.name}.faninsar.remote.abc.json")
+    manifest.write_text(
+        json.dumps(
+            {
+                "identity": "abc",
+                "verification": {
+                    "algorithm": "md5",
+                    "checksum": "d41d8cd98f00b204e9800998ecf8427e",
+                    "status": "verified",
+                    "size": 14,
+                },
+            }
+        )
+    )
+    # unverifiable input (no manifest)
+    unverifiable = tmp_path / "S1_NOVER.zip"
+    unverifiable.write_bytes(b"plain")
+
+    result = _input_verification_provenance((verified, unverifiable))
+
+    entries = json.loads(result["input_verification"])
+    by_path = {entry["path"]: entry for entry in entries}
+    assert by_path[str(verified)] == {
+        "path": str(verified),
+        "status": "verified",
+        "algorithm": "md5",
+        "size": 14,
+    }
+    assert by_path[str(unverifiable)] == {
+        "path": str(unverifiable),
+        "status": "unverifiable",
+        "algorithm": None,
+        "size": 5,
+    }

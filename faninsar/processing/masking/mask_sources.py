@@ -39,12 +39,14 @@ occurrence raster (threshold semantics, default 50), WorldCover is categorical
 
 from __future__ import annotations
 
+import base64
+import binascii
 import math
 import urllib.parse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from faninsar.data.query import BoundingBox
 from faninsar.logging import setup_logger
@@ -52,6 +54,9 @@ from faninsar.processing.errors import InvalidProcessingStateError
 from faninsar.processing.geometry import dem_sources as _dem_sources
 from faninsar.processing.geometry.dem_sources import _bounds_tuple
 from faninsar.processing.geometry.dem_transport import FetchPlan, Tile, TileSet
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 logger = setup_logger(__name__)
 
@@ -79,6 +84,7 @@ __all__ = [
     "parse_mask_selection",
     "tile_snap",
     "validate_mask_source_name",
+    "x_goog_hash_md5",
 ]
 
 #: Selection grammar: ``"water"`` / ``"water:<provider>"``; the ``auto``
@@ -284,6 +290,68 @@ def _hemisphere_letter(value: int, positive: str, negative: str) -> str:
     return positive if value >= 0 else negative
 
 
+def x_goog_hash_md5(headers: Mapping[str, str]) -> str | None:
+    """Extract the provider md5 digest from GCS ``x-goog-hash`` headers.
+
+    Google Cloud Storage objects (the JRC GSW water tiles among them) return
+    their digests in ``x-goog-hash`` as comma-joined
+    ``<algorithm>=<base64>`` entries.  The header may appear once with
+    several entries (``crc32c=..., md5=...``) or as separate occurrences.
+    Per the settled PROPOSAL-0060 decision, the ``md5`` entry is base64
+    decoded and reported as a hex digest in the qualified ``"md5:<hex>"``
+    spelling used by :class:`~faninsar.remote.records.RemoteAsset`
+    checksums.
+
+    This function is pure: it performs no I/O and only interprets the
+    supplied header mapping.
+
+    Parameters
+    ----------
+    headers : Mapping[str, str]
+        Response header mapping; keys are matched case-insensitively and
+        both single and merged ``x-goog-hash`` values are accepted.
+
+    Returns
+    -------
+    str or None
+        The qualified ``"md5:<hex>"`` digest, or ``None`` when no ``md5``
+        entry is present or its value does not base64-decode.
+
+    Examples
+    --------
+    >>> x_goog_hash_md5({"x-goog-hash": "md5=OFj2IjCsPJFfMAxmQxLBHw=="})
+    'md5:3858f62230ac3c915f300c664312c11f'
+
+    """
+    raw_values = [
+        value
+        for key, value in headers.items()
+        if key.lower() == "x-goog-hash" and isinstance(value, str)
+    ]
+    if not raw_values:
+        return None
+    entries = [
+        entry.strip()
+        for value in raw_values
+        for entry in value.split(",")
+        if entry.strip()
+    ]
+    for entry in entries:
+        algorithm, separator, encoded = entry.partition("=")
+        if not separator or algorithm.strip().lower() != "md5":
+            continue
+        try:
+            digest = base64.b64decode(encoded.strip(), validate=True)
+        except (binascii.Error, ValueError):
+            logger.warning("undecodable x-goog-hash md5 entry: %r", entry)
+            return None
+        if len(digest) != 16:
+            logger.warning("x-goog-hash md5 entry is not 16 bytes: %r", entry)
+            return None
+        return f"md5:{digest.hex()}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # MaskSource ABC + provider subclasses
 # ---------------------------------------------------------------------------
@@ -416,6 +484,7 @@ class GswOccurrenceSource(MaskSource):
                     min_bytes=self.min_bytes,
                     ranged=True,
                     ocean_404_skip=False,
+                    response_checksum="x-goog-hash-md5",
                 )
             )
         return TileSet(allowed_hosts=(host,), tiles=tuple(tiles))

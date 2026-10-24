@@ -588,6 +588,8 @@ class MaskManager:
     chunked_threshold: int = 4
     base_url: str | None = None
     source_entry: MaskSource = field(init=False, repr=False)
+    #: Provider digest (``"md5:<hex>"``) observed by the version probe.
+    _probe_checksum: str | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Resolve the selection, validate the buffer, apply the override."""
@@ -758,6 +760,7 @@ class MaskManager:
         band = snap_band(raw, entry.tile_size_deg)
         self._guard_seam(raw, band)
         plan = entry.plan(raw)
+        self._probe_checksum = None
         etag, last_modified = self._probe_version(plan)
         return band, plan, _normalize_version(etag, last_modified)
 
@@ -774,6 +777,7 @@ class MaskManager:
             return None, None
         url = expand_tile_parts(plan.tiles[0])[0].url
         from faninsar.processing.geometry import dem_transport as _transport
+        from faninsar.processing.masking.mask_sources import x_goog_hash_md5
 
         try:
             response = _transport.thread_local_session().head(
@@ -782,6 +786,7 @@ class MaskManager:
             status = int(response.status_code)
             etag = response.headers.get("ETag")
             last_modified = response.headers.get("Last-Modified")
+            self._probe_checksum = x_goog_hash_md5(response.headers)
             response.close()
         except AssertionError:
             raise
@@ -1063,6 +1068,43 @@ class MaskManager:
 
     # -- public entry points -------------------------------------------------
 
+    def _record_provider_digest(self, tiles: list[Path]) -> None:
+        """Backfill a verification record for tiles the transport did not record.
+
+        The transport records the PROPOSAL-0055 verification entry for every
+        tile it actually downloads, comparing each tile against its OWN
+        provider digest extracted from that tile's response headers. A tile
+        served from cache never reaches the transport's download path, so it
+        carries no per-tile response digest; this backfills such tiles with an
+        honest ``unverifiable`` record rather than leaving them with no entry.
+
+        A single observed digest is deliberately NOT applied across tiles: the
+        version probe (a HEAD on the first planned tile) observes only that
+        one tile's digest, so comparing any other tile against it would falsely
+        record ``failed`` for a perfectly valid tile. Each tile is verified
+        only against its own digest, at download time, by the transport.
+
+        Parameters
+        ----------
+        tiles : list of Path
+            Resolved tile paths of the completed fetch.
+
+        """
+        from faninsar.processing.geometry.dem_transport import (
+            _record_tile_verification,
+            _tile_has_verification,
+        )
+
+        try:
+            for tile in tiles:
+                if _tile_has_verification(tile):
+                    continue
+                _record_tile_verification(tile, None)
+        except AssertionError:
+            raise
+        except Exception as exc:
+            raise self._outage_error(exc) from exc
+
     def fetch_water(self, bounds: Bounds) -> FetchResult:
         """Execute the source plan for the bounds; atomic at the set level.
 
@@ -1096,6 +1138,7 @@ class MaskManager:
         """
         band, plan, version = self._prepare(bounds)
         tiles = self._resolve_tiles(plan)
+        self._record_provider_digest(tiles)
         return FetchResult(band=band, tiles=tuple(tiles), source_version=version)
 
     def get_water_layer(self, bounds: Bounds) -> WaterLayer:

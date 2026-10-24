@@ -20,7 +20,7 @@ from faninsar.remote.access import _response_is_complete, _url_origin, _validate
 from faninsar.remote.catalog import _ADAPTERS, _REGISTRY_LOCK
 from faninsar.remote.errors import RemoteAccessError, _fail
 from faninsar.remote.protocols import _CallLedger
-from faninsar.remote.transfer import _RedirectHandler
+from faninsar.remote.transfer import _FetchedPayload, _RedirectHandler
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -51,6 +51,58 @@ class S1OrbitsHttpError(RemoteAccessError):
         self.host = host
         self.url = url
         super().__init__("http_error", f"HTTP {status} from {host}")
+
+
+def _etag_to_checksum(etag: str | None) -> str | None:
+    """Return the provider checksum for one S3 ``ETag`` value.
+
+    A single-part upload's ETag (a 32-hex string with no ``-N`` suffix) equals
+    the object MD5, so it is returned as the qualified ``md5:<hex>``
+    checksum.  Multipart ETags (``<hex>-N``), absent values, and malformed
+    values yield ``None``: they must never drive a checksum comparison.
+
+    Parameters
+    ----------
+    etag : str or None
+        The raw ``ETag`` response header value.
+
+    Returns
+    -------
+    str or None
+        ``md5:<hex>`` for a single-part ETag, otherwise ``None``.
+
+    Examples
+    --------
+    >>> _etag_to_checksum("d41d8cd98f00b204e9800998ecf8427e")
+    'md5:d41d8cd98f00b204e9800998ecf8427e'
+    >>> _etag_to_checksum("d41d8cd98f00b204e9800998ecf8427e-21") is None
+    True
+
+    """
+    if not isinstance(etag, str):
+        return None
+    value = etag.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", value):
+        return None
+    return f"md5:{value.lower()}"
+
+
+def _response_etag(response: Any) -> str | None:
+    """Return the raw ``ETag`` header of one urllib response, if present."""
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    get = getattr(headers, "get", None)
+    if callable(get):
+        value = get("ETag") or get("etag")
+        return value if isinstance(value, str) else None
+    try:
+        for name, value in headers.items():
+            if str(name).lower() == "etag":
+                return value if isinstance(value, str) else None
+    except (TypeError, ValueError):
+        return None
+    return None
 
 
 def _local_tag(tag: str) -> str:
@@ -120,11 +172,21 @@ class S1OrbitsAdapter:
         *,
         ledger: _CallLedger | None = None,
     ) -> bytes:
-        """GET one EOF object without attaching scene-path credentials."""
+        """GET one EOF object without attaching scene-path credentials.
+
+        A single-part S3 ``ETag`` response header equals the object MD5 and is
+        surfaced as the download-time provider checksum (PROPOSAL-0060 seam
+        1); multipart and malformed ETags yield no checksum, so the transfer
+        layer records ``unverifiable`` rather than comparing a wrong digest.
+        """
         operation = ledger or _CallLedger(budget)
         if asset.auth_profile != "anonymous":
             _fail(RemoteAccessError, "unknown_auth_profile")
-        return self._anonymous_get(asset.href, budget, operation, listing=False)
+        payload, etag = self._anonymous_get(
+            asset.href, budget, operation, listing=False
+        )
+        checksum = _etag_to_checksum(etag)
+        return _FetchedPayload(payload, checksum)
 
     def list_object_keys(
         self,
@@ -151,7 +213,7 @@ class S1OrbitsAdapter:
             if token is not None:
                 query["continuation-token"] = token
             url = f"{S1_ORBITS_ORIGIN}/?{urllib.parse.urlencode(query)}"
-            payload = self._anonymous_get(url, budget, operation, listing=True)
+            payload, _etag = self._anonymous_get(url, budget, operation, listing=True)
             page, token, truncated = _parse_list_result(payload)
             for key in page:
                 safe = _safe_object_key(key)
@@ -184,8 +246,8 @@ class S1OrbitsAdapter:
         ledger: _CallLedger,
         *,
         listing: bool,
-    ) -> bytes:
-        """GET one listing page or object with the anonymous urllib branch."""
+    ) -> tuple[bytes, str | None]:
+        """GET one listing page or object, returning bytes and the ``ETag``."""
         if listing:
             target = self._validate_listing_url(url)
         else:
@@ -201,6 +263,7 @@ class S1OrbitsAdapter:
             with opener.open(request, timeout=budget.read_timeout_seconds) as response:
                 _response_is_complete(response)
                 payload = response.read()
+                etag = _response_etag(response)
         except urllib.error.HTTPError as error:
             host = urllib.parse.urlsplit(url).hostname or ""
             try:
@@ -214,7 +277,7 @@ class S1OrbitsAdapter:
             logger.exception("s1-orbits request failed")
             raise S1OrbitsHttpError(0, host, url) from error
         ledger.response_bytes(len(payload))
-        return bytes(payload)
+        return bytes(payload), etag
 
 
 def get_s1_orbits_adapter() -> S1OrbitsAdapter:

@@ -284,6 +284,52 @@ def test_asf_search_preserves_declared_complete_safe_size() -> None:
     assert items[0].assets["data"].size_bytes == 156_585_594
 
 
+def test_asf_search_maps_md5sum_to_complete_asset_checksum() -> None:
+    """ASF's published ``md5sum`` reaches the complete SAFE asset as ``md5:<hex>``."""
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    product = dict(_geojson_product())
+    product["properties"] = {**product["properties"], "md5sum": md5}
+    module = _ASFModule(product)
+    session = _Session(_Response(b'{"items":[1]}'))
+    adapter = ASFSearchAdapter(
+        collection="sentinel-1",
+        package=module,
+        session_factory=lambda: session,
+    )
+    remote._register_adapter("asf-md5sum", adapter)
+
+    items = remote.search(
+        remote.Points([(0.5, 0.5)], crs=4326),
+        catalog="asf-md5sum",
+        auth_profile="earthdata-asf",
+        limit=1,
+    )
+
+    assert items[0].assets["data"].checksum == f"md5:{md5}"
+
+
+def test_asf_search_without_md5sum_leaves_checksum_none() -> None:
+    """A burst record with no ``md5sum`` keeps the complete asset unverifiable."""
+    product = _geojson_product()
+    module = _ASFModule(product)
+    session = _Session(_Response(b'{"items":[1]}'))
+    adapter = ASFSearchAdapter(
+        collection="sentinel-1",
+        package=module,
+        session_factory=lambda: session,
+    )
+    remote._register_adapter("asf-no-md5sum", adapter)
+
+    items = remote.search(
+        remote.Points([(0.5, 0.5)], crs=4326),
+        catalog="asf-no-md5sum",
+        auth_profile="earthdata-asf",
+        limit=1,
+    )
+
+    assert items[0].assets["data"].checksum is None
+
+
 def test_asf_search_translates_common_direction_and_burst_filters() -> None:
     """Public common fields reach ASF's provider vocabulary exactly once."""
     module = _ASFModule(_product())
