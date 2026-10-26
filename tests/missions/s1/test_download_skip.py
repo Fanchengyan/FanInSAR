@@ -104,7 +104,9 @@ def test_checksum_mismatch_skips_acquisition_and_continues(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with caplog.at_level(logging.WARNING, logger="faninsar.missions.s1.stack"):
-        S1Stack.from_search(object(), work_dir=tmp_path, product_type="scene")
+        S1Stack.from_roi(
+            object(), work_dir=tmp_path, granularity="scene", provider="asf"
+        )
 
     assert len(captured) == 1
     paths, kwargs = captured[0]
@@ -156,7 +158,9 @@ def test_other_integrity_errors_still_fail_the_operation(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(remote.RemoteIntegrityError) as integrity_error:
-        S1Stack.from_search(object(), work_dir=tmp_path, product_type="scene")
+        S1Stack.from_roi(
+            object(), work_dir=tmp_path, granularity="scene", provider="asf"
+        )
     assert integrity_error.value.reason == "content_length_mismatch"
     assert not constructed
 
@@ -184,7 +188,9 @@ def test_network_transfer_failure_still_fails_the_operation(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(OSError, match="connection reset"):
-        S1Stack.from_search(object(), work_dir=tmp_path, product_type="scene")
+        S1Stack.from_roi(
+            object(), work_dir=tmp_path, granularity="scene", provider="asf"
+        )
 
 
 def test_all_acquisitions_failed_verification_raises_without_stack(
@@ -211,7 +217,9 @@ def test_all_acquisitions_failed_verification_raises_without_stack(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(ValueError, match="download verification"):
-        S1Stack.from_search(object(), work_dir=tmp_path, product_type="scene")
+        S1Stack.from_roi(
+            object(), work_dir=tmp_path, granularity="scene", provider="asf"
+        )
 
 
 def test_burst_poll_path_skips_verification_failure(
@@ -251,7 +259,7 @@ def test_burst_poll_path_skips_verification_failure(
         return _FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    S1Stack.from_search(object(), work_dir=tmp_path)
+    S1Stack.from_roi(object(), work_dir=tmp_path, granularity="burst", provider="asf")
 
     assert captured == [(tmp_path / "inputs" / "S1_BGOOD.zip",)]
 
@@ -271,7 +279,7 @@ def test_exclusion_provenance_serialization_format() -> None:
 
 
 def test_input_verification_provenance_surfaces_per_input_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     """Each downloaded input's verification record is surfaced in provenance.
 
