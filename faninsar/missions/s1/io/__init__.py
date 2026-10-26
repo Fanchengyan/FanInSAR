@@ -6,6 +6,7 @@ Submodules:
 - :mod:`faninsar.missions.s1.io.extract` — byte-offset burst extraction
 - :mod:`faninsar.missions.s1.io.remote` — remote ASF burst extraction
 - :mod:`faninsar.missions.s1.io.export`  — SAFE subset directory export
+- :mod:`faninsar.missions.s1.io.canvas`  — full-burst-height ROI SAFE canvases
 
 Public names are re-exported here so existing imports
 (``from faninsar.missions.s1.io import read_full_burst``) keep working
@@ -14,6 +15,12 @@ after the ``io.py`` -> ``io/`` package upgrade.
 
 from __future__ import annotations
 
+from faninsar.missions.s1.io.canvas import (
+    BurstFetchedWindow,
+    RoiSafeCanvas,
+    splice_overlap_into_canvas,
+    write_roi_safe_canvas,
+)
 from faninsar.missions.s1.io.export import (
     export_burst_safe,
     export_swath_bursts,
@@ -37,7 +44,9 @@ from faninsar.missions.s1.io.remote import (
 
 __all__ = [
     "BurstArray",
+    "BurstFetchedWindow",
     "RemoteSafe",
+    "RoiSafeCanvas",
     "estimate_burst_bytes",
     "export_burst_safe",
     "export_swath_bursts",
@@ -47,5 +56,7 @@ __all__ = [
     "read_burst_window",
     "read_full_burst",
     "read_swath_bursts",
+    "splice_overlap_into_canvas",
     "stitch_bursts",
+    "write_roi_safe_canvas",
 ]
