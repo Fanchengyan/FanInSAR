@@ -402,3 +402,19 @@ def test_aimd_window_ignores_401_and_halves_on_429() -> None:
     assert seed == (20, 20)
     assert after_auth == (20, 20)
     assert after_rate == (10, 10)
+
+
+def test_range_fetcher_has_no_chunk_bytes() -> None:
+    """RangeFetcher concatenates already-sized spans; it has no chunk_bytes."""
+    import inspect
+    from dataclasses import fields, is_dataclass
+
+    from faninsar.remote.fetch import RangeFetcher
+
+    assert "chunk_bytes" not in inspect.signature(RangeFetcher).parameters
+    assert not hasattr(RangeFetcher, "chunk_bytes")
+    fetcher = RangeFetcher()
+    assert "chunk_bytes" not in vars(fetcher)
+    assert not hasattr(fetcher, "chunk_bytes")
+    if is_dataclass(RangeFetcher):
+        assert all(field.name != "chunk_bytes" for field in fields(RangeFetcher))

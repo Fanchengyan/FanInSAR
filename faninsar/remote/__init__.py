@@ -1,7 +1,7 @@
 """Provider-neutral remote catalog and complete-file transfer facade.
 
 The implementation is organized by responsibility in :mod:`records`,
-:mod:`protocols`, :mod:`catalog`, :mod:`access`, :mod:`auth`, :mod:`transfer`,
+:mod:`protocols`, :mod:`catalog`, :mod:`access`, :mod:`auth`, :mod:`fetch`,
 :mod:`cache`, and :mod:`errors`.  This module remains the stable developer
 facade used by existing FanInSAR adapters.
 """
@@ -57,9 +57,9 @@ from .errors import (
     RemoteQueryError,
     _fail,
 )
+from .fetch.complete import _RedirectHandler, _stream_download, download, probe
 from .protocols import _accepts_ledger, _Adapter, _adapter_items, _CallLedger
 from .records import RemoteAsset, RemoteResourceBudget, _normalize_checksum, _sanitize
-from .transfer import _RedirectHandler, _stream_download, download, probe
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DEFAULT_CMR_ENDPOINT": ("faninsar.remote.cmr", "DEFAULT_CMR_ENDPOINT"),

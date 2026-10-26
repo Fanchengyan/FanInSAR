@@ -22,10 +22,10 @@ from faninsar.logging import setup_logger
 from faninsar.remote.access import _safe_url
 from faninsar.remote.catalog import _register_adapter
 from faninsar.remote.errors import RemoteAccessError, _fail
+from faninsar.remote.fetch.complete import _RedirectHandler
 from faninsar.remote.protocols import _CallLedger
 from faninsar.remote.records import RemoteResourceBudget
 from faninsar.remote.standards import MalformedSTACItemError, normalize_stac_item
-from faninsar.remote.transfer import _RedirectHandler
 
 logger = setup_logger(__name__)
 

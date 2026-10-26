@@ -162,7 +162,7 @@ class _ChecksumAdapter:
 
 def test_stream_download_keeps_pair_contract_on_mismatch(tmp_path: Path) -> None:
     """_stream_download still returns size/digest and raises on mismatch."""
-    from faninsar.remote.transfer import _stream_download
+    from faninsar.remote.fetch.complete import _stream_download
 
     name = "p0055-stream-contract"
     remote._register_adapter(name, _ChecksumAdapter())
@@ -189,7 +189,7 @@ def test_read_verification_returns_record_from_qualified_sibling(
     tmp_path: Path,
 ) -> None:
     """The manifest reader returns the verification record for one input."""
-    from faninsar.remote.transfer import read_verification
+    from faninsar.remote.fetch.complete import read_verification
 
     destination = tmp_path / "S1A.zip"
     destination.write_bytes(b"payload")
@@ -227,7 +227,7 @@ def test_parse_safe_manifest_returns_file_location_md5_pairs() -> None:
     member bytes (not recomputed by the code under test), so the assertion can
     disagree with a broken parser.
     """
-    from faninsar.remote.transfer import parse_safe_manifest_checksums
+    from faninsar.remote.fetch.complete import parse_safe_manifest_checksums
 
     manifest = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -284,7 +284,7 @@ def _manifest_for(members: dict[str, bytes]) -> str:
 
 def test_member_verify_reports_matched_summary_for_all_match(tmp_path: Path) -> None:
     """A SAFE whose members match the manifest reports checked/matched/verified."""
-    from faninsar.remote.transfer import verify_safe_members
+    from faninsar.remote.fetch.complete import verify_safe_members
 
     members = {"measurement-a.tiff": b"tiff-a", "measurement-b.tiff": b"tiff-b"}
     safe_zip = tmp_path / "burst.zip"

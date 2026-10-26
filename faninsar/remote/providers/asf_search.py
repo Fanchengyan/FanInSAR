@@ -334,7 +334,7 @@ def _probe_burst_safe_url(
     from urllib.request import Request, build_opener
 
     from faninsar.remote.access import _validate_url
-    from faninsar.remote.transfer import (
+    from faninsar.remote.fetch.complete import (
         _poll_delay_seconds,
         _RedirectHandler,
         _RemotePollObservation,
@@ -1081,7 +1081,7 @@ class ASFSearchAdapter:
             == urllib.parse.urlsplit(_SENTINEL1_BURST_ORIGIN).hostname
         ):
             return _probe_burst_safe_url(url, self, budget, ledger, attempt)
-        from faninsar.remote.transfer import _RemotePollObservation
+        from faninsar.remote.fetch.complete import _RemotePollObservation
 
         return _RemotePollObservation("ready", url)
 

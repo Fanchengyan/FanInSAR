@@ -218,7 +218,7 @@ def test_burst_poll_path_skips_verification_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The burst probe/download loop applies the same skip-and-record contract."""
-    from faninsar.remote.transfer import _RemotePollObservation
+    from faninsar.remote.fetch.complete import _RemotePollObservation
 
     failed = replace(_item(_asset("burst-failed")), item_id="S1_BFAILED")
     good = replace(_item(_asset("burst-good")), item_id="S1_BGOOD")

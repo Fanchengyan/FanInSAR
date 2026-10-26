@@ -100,7 +100,7 @@ def _input_verification_provenance(
 
     PROPOSAL-0060 makes ``verification.status`` a consumed provenance fact.
     Reads the download-time PROPOSAL-0055 verification record of each input
-    (via :func:`faninsar.remote.transfer.read_verification`) and serializes
+    (via :func:`faninsar.remote.fetch.complete.read_verification`) and serializes
     ``{path, status, algorithm, size}`` per input into one deterministic JSON
     entry consumed by the shared input manifest's ``provenance`` block. An
     input with no record is surfaced as ``status: unverifiable`` (the honest
@@ -117,7 +117,7 @@ def _input_verification_provenance(
         Always one ``{"input_verification": <json>}`` entry.
 
     """
-    from faninsar.remote.transfer import read_verification
+    from faninsar.remote.fetch.complete import read_verification
 
     entries: list[dict[str, object]] = []
     for path in paths:
@@ -453,7 +453,7 @@ class S1Stack(Stack):
         poll_scheduler = None
         poll_tokens: list[Any | None] = [None] * len(selected_items)
         if product_type == "burst":
-            from faninsar.remote.transfer import _BurstPollScheduler
+            from faninsar.remote.fetch.complete import _BurstPollScheduler
 
             poll_scheduler = _BurstPollScheduler()
             poll_tokens = [

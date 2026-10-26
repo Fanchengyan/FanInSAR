@@ -305,7 +305,7 @@ def test_asf_burst_download_returns_pending_without_sleep(
     monkeypatch.setattr(remote, "_asf_authenticated_session", authenticated_session)
     monkeypatch.setattr(remote, "_asf_request", asf_request)
     delays: list[float] = []
-    monkeypatch.setattr("faninsar.remote.transfer.time.sleep", delays.append)
+    monkeypatch.setattr("faninsar.remote.fetch.complete.time.sleep", delays.append)
 
     class _ASFAdapter:
         provider = "ASF"

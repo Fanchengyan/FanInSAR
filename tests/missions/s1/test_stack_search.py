@@ -328,7 +328,7 @@ def test_from_search_sweeps_burst_probes_oldest_first(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Stack retries due burst probes centrally, then downloads ready inputs."""
-    from faninsar.remote.transfer import _RemotePollObservation
+    from faninsar.remote.fetch.complete import _RemotePollObservation
 
     items = [
         _item(replace(_asset(f"burst-{index}"), item_id=f"S1_{index}"))
