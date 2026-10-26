@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, overload
 
 import numpy as np
 import psutil
@@ -12,7 +12,11 @@ from tqdm import tqdm
 
 from faninsar import Loops, Pairs, parse_device
 from faninsar.logging import setup_logger
-from faninsar.NSBAS.coherence_weight import WeightFunc, coherence_to_weight
+from faninsar.NSBAS.coherence_weight import (
+    WeightFunc,
+    coherence_to_weight,
+    normalize_weight_func,
+)
 from faninsar.NSBAS.tsmodels import TimeSeriesModels
 
 if TYPE_CHECKING:
@@ -100,9 +104,8 @@ class NSBASSolver:
     _unw: np.ndarray
     _coh: np.ndarray | None
     _coh_threshold: float
-    _weight_func: str
+    _weight_func: WeightFunc
     _n_looks: int
-    _inv_alg: Literal["ls", "wls"]
     _device: torch.device
     _dtype: torch.dtype
     _verbose: bool
@@ -115,7 +118,6 @@ class NSBASSolver:
         "_device",
         "_dtype",
         "_gamma",
-        "_inv_alg",
         "_model",
         "_n_looks",
         "_pairs",
@@ -131,7 +133,6 @@ class NSBASSolver:
         model: TimeSeriesModels | None = None,
         coh: NDArray[np.floating] | torch.Tensor | None = None,
         coh_threshold: float | None = None,
-        inv_alg: Literal["ls", "wls"] | None = None,
         weight_func: WeightFunc | str | None = None,
         n_looks: int | None = None,
         gamma: float = 0.0001,
@@ -158,15 +159,14 @@ class NSBASSolver:
             Coherence mask threshold. ``None`` keeps the internal default
             of ``0.4``. Pixels with ``coh <= coh_threshold`` are set to NaN
             before inversion.
-        inv_alg : {"ls", "wls"}, optional
-            ``None`` keeps ordinary least squares. ``wls`` selects weighted
-            least squares. If ``weight_func`` is still unset, ``wls`` uses
-            Fisher-information weights.
         weight_func : {"no", "coh", "fim", "var"}, optional
             Observation-weight definition. ``None`` keeps the unweighted
-            default. ``coh`` uses coherence, ``fim`` uses
+            default ``"no"``. ``coh`` uses coherence, ``fim`` uses
             ``2 L γ² / (1 - γ²)``, and ``var`` uses the inverse DS phase
-            variance.
+            variance. A weighted choice without ``coh`` raises
+            ``ValueError``.
+            ``sbas``/``uniform`` map to ``no``, ``lin`` to ``coh``, and
+            ``fisher``/``wls`` to ``fim``.
         n_looks : int, optional
             Independent looks ``L`` used by ``fim`` and ``var``. ``None``
             keeps the internal default of ``1``.
@@ -194,11 +194,8 @@ class NSBASSolver:
         self._unw = _to_numpy(unw)
         self._coh = None if coh is None else _to_numpy(coh)
         self._coh_threshold = 0.4 if coh_threshold is None else coh_threshold
-        self._inv_alg = "ls" if inv_alg is None else inv_alg
         self._n_looks = 1 if n_looks is None else n_looks
-        self._weight_func = "no" if weight_func is None else str(weight_func)
-        if self._inv_alg == "wls" and self._weight_func in {"no", "sbas", "uniform"}:
-            self._weight_func = "fim"
+        self._weight_func = normalize_weight_func(weight_func)
 
         if model is not None:
             _check_model(model)
@@ -376,6 +373,12 @@ class NSBASSolver:
             )
             raise ValueError(msg)
 
+        weighted = self._weight_func != "no"
+        if weighted and self._coh is None:
+            msg = "coherence is required when weight_func is not 'no'"
+            logger.error(msg, extra={"weight_func": self._weight_func})
+            raise ValueError(msg)
+
         if self._coh is not None:
             coh_np = np.asarray(self._coh, dtype=np.float64)
             if coh_np.shape != observations.shape:
@@ -390,7 +393,7 @@ class NSBASSolver:
                 np.nan,
                 observations,
             )
-            if self._weight_func not in {"no", "sbas", "uniform"}:
+            if weighted:
                 weight = coherence_to_weight(
                     coh_np,
                     weight_func=self._weight_func,
@@ -429,7 +432,6 @@ class NSBASSolver:
         *,
         coh: NDArray[np.floating] | torch.Tensor | None = None,
         coh_threshold: float | None = None,
-        inv_alg: Literal["ls", "wls"] | None = None,
         weight_func: WeightFunc | str | None = None,
         n_looks: int | None = None,
     ) -> tuple[
@@ -445,7 +447,6 @@ class NSBASSolver:
         *,
         coh: NDArray[np.floating] | torch.Tensor | None = None,
         coh_threshold: float | None = None,
-        inv_alg: Literal["ls", "wls"] | None = None,
         weight_func: WeightFunc | str | None = None,
         n_looks: int | None = None,
     ) -> tuple[
@@ -460,7 +461,6 @@ class NSBASSolver:
         *,
         coh: NDArray[np.floating] | torch.Tensor | None = None,
         coh_threshold: float | None = None,
-        inv_alg: Literal["ls", "wls"] | None = None,
         weight_func: WeightFunc | str | None = None,
         n_looks: int | None = None,
     ) -> (
@@ -478,11 +478,9 @@ class NSBASSolver:
             it replaces the coherence stored at construction time.
         coh_threshold : float, optional
             Override the coherence mask threshold.
-        inv_alg : {"ls", "wls"}, optional
-            Override the inversion algorithm. ``wls`` with the default
-            ``weight_func="no"`` selects Fisher-information weights.
         weight_func : {"no", "coh", "fim", "var"}, optional
-            Override the observation-weight definition.
+            Override the observation-weight definition. A weighted choice
+            without stored coherence raises ``ValueError``.
         n_looks : int, optional
             Override the independent-looks value used by ``fim`` and ``var``.
 
@@ -508,14 +506,8 @@ class NSBASSolver:
         if n_looks is not None:
             self._n_looks = n_looks
             rebuild = True
-        if inv_alg is not None:
-            self._inv_alg = inv_alg
-            rebuild = True
         if weight_func is not None:
-            self._weight_func = str(weight_func)
-            rebuild = True
-        if self._inv_alg == "wls" and self._weight_func in {"no", "sbas", "uniform"}:
-            self._weight_func = "fim"
+            self._weight_func = normalize_weight_func(weight_func)
             rebuild = True
         if rebuild:
             self._rebuild_system()

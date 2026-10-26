@@ -17,7 +17,32 @@ logger = setup_logger(__name__)
 
 WeightFunc = Literal["no", "coh", "fim", "var"]
 
-_VALID_WEIGHT_FUNCS = {"no", "sbas", "uniform", "coh", "lin", "fim", "fisher", "var"}
+_CANONICAL_WEIGHT_FUNCS = {"no", "coh", "fim", "var"}
+_WEIGHT_FUNC_ALIASES = {
+    "sbas": "no",
+    "uniform": "no",
+    "lin": "coh",
+    "fisher": "fim",
+    "wls": "fim",
+}
+
+
+def normalize_weight_func(weight_func: WeightFunc | str | None) -> WeightFunc:
+    """Return the canonical observation-weight name.
+
+    ``None`` keeps the unweighted default ``"no"``. Recognized aliases are
+    ``sbas``/``uniform`` → ``no``, ``lin`` → ``coh``, and
+    ``fisher``/``wls`` → ``fim``.
+    """
+    if weight_func is None:
+        return "no"
+    name = str(weight_func).lower()
+    name = _WEIGHT_FUNC_ALIASES.get(name, name)
+    if name not in _CANONICAL_WEIGHT_FUNCS:
+        msg = f"Unrecognized weight_func {weight_func!r}"
+        logger.error(msg, extra={"weight_func": weight_func})
+        raise ValueError(msg)
+    return name  # type: ignore[return-value]
 
 
 def coherence_to_weight(
@@ -59,17 +84,12 @@ def coherence_to_weight(
     coh_arr = np.clip(coh_arr, epsilon, 1.0 - epsilon)
     n_looks = max(int(n_looks), 1)
 
-    name = str(weight_func).lower()
-    if name not in _VALID_WEIGHT_FUNCS:
-        msg = f"Unrecognized weight_func {weight_func!r}"
-        logger.error(msg, extra={"weight_func": weight_func})
-        raise ValueError(msg)
-
-    if name in {"no", "sbas", "uniform"}:
+    name = normalize_weight_func(weight_func)
+    if name == "no":
         return np.ones_like(coh_arr)
-    if name in {"coh", "lin"}:
+    if name == "coh":
         return coh_arr
-    if name in {"fim", "fisher"}:
+    if name == "fim":
         return 2.0 * n_looks * np.square(coh_arr) / (1.0 - np.square(coh_arr))
     return 1.0 / _phase_variance_ds(coh_arr, n_looks)
 

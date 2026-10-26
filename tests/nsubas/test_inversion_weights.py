@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 
 import numpy as np
+import pytest
 
 from faninsar import Pairs
 from faninsar.NSBAS import LinearModel, NSBASSolver
@@ -143,12 +144,25 @@ def test_nsbas_constraint_rows_are_not_coherence_weighted() -> None:
 
 def test_constructor_and_inverse_default_shared_kwargs_to_none() -> None:
     """Constructor and inverse() must share None sentinels for weighting kwargs."""
-    shared = ("coh", "coh_threshold", "inv_alg", "weight_func", "n_looks")
+    shared = ("coh", "coh_threshold", "weight_func", "n_looks")
     ctor = inspect.signature(NSBASSolver.__init__)
     inverse = inspect.signature(NSBASSolver.inverse)
+    assert "inv_alg" not in ctor.parameters
+    assert "inv_alg" not in inverse.parameters
     for name in shared:
         assert ctor.parameters[name].default is None
         assert inverse.parameters[name].default is None
+
+
+def test_weighted_inversion_without_coherence_raises() -> None:
+    """Selecting a weight function without coherence must fail closed."""
+    pairs = _sample_pairs()
+    unw = _inconsistent_unw(pairs)
+    with pytest.raises(ValueError, match="coherence"):
+        NSBASSolver(unw, pairs, weight_func="fim", verbose=False, device="cpu")
+    solver = NSBASSolver(unw, pairs, verbose=False, device="cpu")
+    with pytest.raises(ValueError, match="coherence"):
+        solver.inverse(weight_func="var")
 
 
 def test_inverse_without_kwargs_keeps_constructor_weighting() -> None:
