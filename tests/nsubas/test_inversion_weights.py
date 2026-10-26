@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 
 from faninsar import Pairs
@@ -137,6 +139,46 @@ def test_nsbas_constraint_rows_are_not_coherence_weighted() -> None:
     )
     np.testing.assert_allclose(constraint[0], expected_bottom, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(constraint[1], expected_bottom, rtol=1e-6, atol=1e-6)
+
+
+def test_constructor_and_inverse_default_shared_kwargs_to_none() -> None:
+    """Constructor and inverse() must share None sentinels for weighting kwargs."""
+    shared = ("coh", "coh_threshold", "inv_alg", "weight_func", "n_looks")
+    ctor = inspect.signature(NSBASSolver.__init__)
+    inverse = inspect.signature(NSBASSolver.inverse)
+    for name in shared:
+        assert ctor.parameters[name].default is None
+        assert inverse.parameters[name].default is None
+
+
+def test_inverse_without_kwargs_keeps_constructor_weighting() -> None:
+    """Omitting inverse() kwargs must keep the constructor weighting, not reset it."""
+    pairs = _sample_pairs()
+    unw = _inconsistent_unw(pairs)
+    coh = np.array(
+        [[0.90, 0.80], [0.70, 0.95], [0.60, 0.85]],
+        dtype=np.float64,
+    )
+    n_looks = 4
+    weight = 2.0 * n_looks * coh**2 / (1.0 - coh**2)
+    expected_incs = _weighted_lstsq(
+        pairs.sbas_matrix().astype(np.float64),
+        unw,
+        np.sqrt(weight),
+    )
+
+    solver = NSBASSolver(
+        unw,
+        pairs,
+        coh=coh,
+        weight_func="fim",
+        n_looks=n_looks,
+        coh_threshold=0.0,
+        verbose=False,
+        device="cpu",
+    )
+    incs, *_ = solver.inverse()
+    np.testing.assert_allclose(incs, expected_incs, rtol=1e-8, atol=1e-8)
 
 
 def test_var_weights_are_below_fim_and_increase_with_coherence() -> None:

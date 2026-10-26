@@ -130,10 +130,10 @@ class NSBASSolver:
         pairs: Pairs | Sequence[str],
         model: TimeSeriesModels | None = None,
         coh: NDArray[np.floating] | torch.Tensor | None = None,
-        coh_threshold: float = 0.4,
-        inv_alg: Literal["ls", "wls"] = "ls",
-        weight_func: WeightFunc | str = "no",
-        n_looks: int = 1,
+        coh_threshold: float | None = None,
+        inv_alg: Literal["ls", "wls"] | None = None,
+        weight_func: WeightFunc | str | None = None,
+        n_looks: int | None = None,
         gamma: float = 0.0001,
         device: str | torch.device | None = None,
         dtype: torch.dtype = torch.float64,
@@ -150,22 +150,26 @@ class NSBASSolver:
         model : TimeSeriesModels, optional
             Parametric NSBAS model. Omit for pure SBAS.
         coh : ndarray or torch.Tensor, optional
-            Spatial coherence with the same shape as ``unw``. Values at or
-            below ``coh_threshold`` are treated as missing. When a weight
-            function is selected, ``coh`` is also converted to observation
-            weights.
+            Spatial coherence with the same shape as ``unw``. ``None`` means
+            no coherence is stored. Values at or below ``coh_threshold``
+            are treated as missing. When a weight function is selected,
+            ``coh`` is also converted to observation weights.
         coh_threshold : float, optional
-            Coherence mask threshold. Pixels with ``coh <= coh_threshold``
-            are set to NaN before inversion.
+            Coherence mask threshold. ``None`` keeps the internal default
+            of ``0.4``. Pixels with ``coh <= coh_threshold`` are set to NaN
+            before inversion.
         inv_alg : {"ls", "wls"}, optional
-            ``wls`` selects weighted least squares. If ``weight_func`` is
-            still ``"no"``, ``wls`` defaults to Fisher-information weights.
+            ``None`` keeps ordinary least squares. ``wls`` selects weighted
+            least squares. If ``weight_func`` is still unset, ``wls`` uses
+            Fisher-information weights.
         weight_func : {"no", "coh", "fim", "var"}, optional
-            Observation-weight definition. ``no`` is unweighted, ``coh``
-            uses coherence, ``fim`` uses ``2 L γ² / (1 - γ²)``, and
-            ``var`` uses the inverse DS phase variance.
+            Observation-weight definition. ``None`` keeps the unweighted
+            default. ``coh`` uses coherence, ``fim`` uses
+            ``2 L γ² / (1 - γ²)``, and ``var`` uses the inverse DS phase
+            variance.
         n_looks : int, optional
-            Independent looks ``L`` used by ``fim`` and ``var``.
+            Independent looks ``L`` used by ``fim`` and ``var``. ``None``
+            keeps the internal default of ``1``.
         gamma : float, optional
             Weight of the NSBAS model-constraint rows.
         device, dtype, verbose
@@ -189,11 +193,11 @@ class NSBASSolver:
         self._gamma = 0.0001
         self._unw = _to_numpy(unw)
         self._coh = None if coh is None else _to_numpy(coh)
-        self._coh_threshold = coh_threshold
-        self._inv_alg = inv_alg
-        self._n_looks = n_looks
-        self._weight_func = str(weight_func)
-        if inv_alg == "wls" and self._weight_func in {"no", "sbas", "uniform"}:
+        self._coh_threshold = 0.4 if coh_threshold is None else coh_threshold
+        self._inv_alg = "ls" if inv_alg is None else inv_alg
+        self._n_looks = 1 if n_looks is None else n_looks
+        self._weight_func = "no" if weight_func is None else str(weight_func)
+        if self._inv_alg == "wls" and self._weight_func in {"no", "sbas", "uniform"}:
             self._weight_func = "fim"
 
         if model is not None:
