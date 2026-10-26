@@ -269,6 +269,31 @@ class TestRoiCanvasRaster:
         )
         assert not np.any(raster[15:])
 
+    def test_canvas_is_tiled_deflate_and_smaller_than_uncompressed(
+        self,
+        parent: ParentInfo,
+        tmp_path: Path,
+    ) -> None:
+        """ROI canvases are tiled 512 + DEFLATE; unfetched pixels stay zero."""
+        swath, _memfile, xml_text, data = parent
+        handle = write_roi_safe_canvas(
+            swath,
+            _default_windows(data),
+            tmp_path,
+            annotation_xml=xml_text,
+            product_id="ROI_DEFLATE",
+        )
+        with rasterio.open(handle.measurement_path) as ds:
+            assert ds.profile["tiled"] is True
+            assert ds.profile["blockxsize"] == 512
+            assert ds.profile["blockysize"] == 512
+            assert str(ds.compression).lower().endswith("deflate")
+            raster = ds.read(1)
+        np.testing.assert_array_equal(raster[3:8, 20:60], data[43:48, 20:60])
+        assert not np.any(raster[:3])
+        uncompressed = 2 * LINES_PER_BURST * SAMPLES_PER_BURST * 8
+        assert handle.measurement_path.stat().st_size < uncompressed
+
 
 class TestRoiCanvasValidSampleMask:
     """Requirement 2/4: the valid-sample XML is the mask from_safes reads."""

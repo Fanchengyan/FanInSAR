@@ -19,7 +19,11 @@ from faninsar.stack.search import (
 )
 from faninsar.stack.session import Stack
 
-from .acquisition import materialize_cdse_roi_safes, resolve_roi_acquisition
+from .acquisition import (
+    materialize_cdse_roi_safes,
+    normalize_roi_wgs84,
+    resolve_roi_acquisition,
+)
 from .search import (
     S1PolarizationRequest,
     S1ProductType,
@@ -399,7 +403,10 @@ class S1Stack(Stack):
         Parameters
         ----------
         roi : Points, BoundingBox, or Polygons
-            FanInSAR spatial query.
+            FanInSAR spatial query.  A CRS is required; non-WGS84
+            coordinates are transformed to EPSG:4326.  A single
+            :class:`~faninsar.data.query.Points` query is buffered by
+            1 km on the ground before CDSE window inversion.
         datetime_range : tuple, optional
             Inclusive acquisition time range.
         granularity : {"roi", "burst", "scene"}, default="roi"
@@ -426,9 +433,9 @@ class S1Stack(Stack):
         Raises
         ------
         ValueError
-            If the granularity x provider pair is illegal, the query returns
-            no products, every download fails verification, or local
-            construction fails.
+            If the ROI has no CRS, the granularity x provider pair is
+            illegal, the query returns no products, every download fails
+            verification, or local construction fails.
 
         Notes
         -----
@@ -443,6 +450,7 @@ class S1Stack(Stack):
             granularity,
             provider,
         )
+        roi = normalize_roi_wgs84(roi)
         extra = dict(kwargs.pop("extra", {}) or {})
         extra["roi_granularity"] = resolved_granularity
         extra["roi_provider"] = resolved_provider

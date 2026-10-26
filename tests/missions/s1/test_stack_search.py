@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 import pytest
 
 from faninsar import remote
+from faninsar.data.query import BoundingBox
 from faninsar.missions.s1.search import (
     catalog_for_product,
     complete_safe_asset,
@@ -26,6 +27,8 @@ from faninsar.missions.s1.stack import S1Stack
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+ROI = BoundingBox(100.0, 40.0, 100.4, 40.4, crs="EPSG:4326")
 
 
 def _item(
@@ -273,7 +276,7 @@ def test_from_search_downloads_one_selected_safe_and_prepares(
         classmethod(lambda _cls, _paths, **_kwargs: FakeStack()),
     )
     result = S1Stack.from_roi(
-        object(), work_dir=tmp_path, granularity="burst", provider="asf"
+        ROI, work_dir=tmp_path, granularity="burst", provider="asf"
     )
     assert isinstance(result, FakeStack)
     assert downloaded == [tmp_path / "inputs" / "S1_TEST.zip"]
@@ -318,7 +321,7 @@ def test_from_search_downloads_safes_concurrently_in_selection_order(
         return FakeStack()
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
-    S1Stack.from_roi(object(), work_dir=tmp_path, granularity="burst", provider="asf")
+    S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
 
     assert completed == ["B_FAST.zip", "A_SLOW.zip"]
     assert captured == [
@@ -369,7 +372,7 @@ def test_from_search_sweeps_burst_probes_oldest_first(
         "from_safes",
         classmethod(lambda _cls, _paths, **_kwargs: FakeStack()),
     )
-    S1Stack.from_roi(object(), work_dir=tmp_path, granularity="burst", provider="asf")
+    S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
 
     assert sorted(index for index, attempt in probe_calls if attempt == 0) == [
         "S1_0",
@@ -415,9 +418,7 @@ def test_from_search_does_not_construct_stack_after_download_failure(
 
     monkeypatch.setattr(S1Stack, "from_safes", classmethod(from_safes))
     with pytest.raises(RuntimeError, match="burst generation failed"):
-        S1Stack.from_roi(
-            object(), work_dir=tmp_path, granularity="burst", provider="asf"
-        )
+        S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
     assert not stack_constructed
 
 
@@ -458,9 +459,7 @@ def test_from_search_rejects_tiff_xml_without_burst_extractor_safe(
     )
 
     with pytest.raises(ValueError, match="exactly one complete SAFE ZIP"):
-        S1Stack.from_roi(
-            object(), work_dir=tmp_path, granularity="burst", provider="asf"
-        )
+        S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
 
     assert downloads == []
 
@@ -486,8 +485,6 @@ def test_from_search_rejects_ambiguous_safe_zips_before_download(
     )
 
     with pytest.raises(ValueError, match="found 2"):
-        S1Stack.from_roi(
-            object(), work_dir=tmp_path, granularity="burst", provider="asf"
-        )
+        S1Stack.from_roi(ROI, work_dir=tmp_path, granularity="burst", provider="asf")
 
     assert downloads == []

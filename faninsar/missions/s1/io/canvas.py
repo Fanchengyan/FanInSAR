@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import rasterio
+from rasterio.transform import Affine
 from rasterio.windows import Window
 
 from faninsar.logging import setup_logger
@@ -34,7 +35,6 @@ from faninsar.missions.s1.errors import reject_product
 from faninsar.missions.s1.io.export import (
     _annotation_stem,
     _read_annotation_source,
-    _write_burst_tiff,
 )
 
 if TYPE_CHECKING:
@@ -334,11 +334,12 @@ def write_roi_safe_canvas(
     """Write a SAFE-subset canvas tree for ROI-fetched bursts.
 
     Every kept burst gets a full-burst-height x full-``samplesPerBurst``
-    zero canvas with its fetched rectangle placed at the original
-    burst-local ``(line, column)``.  The rewritten annotation marks
-    unfetched lines ``firstValidSample = -1`` and ROI lines with the fetched
-    column envelope, keeps parent ``linesPerBurst`` / ``azimuthTime`` /
-    ``byteOffset`` / ``samplesPerBurst``, sets
+    canvas with its fetched rectangle placed at the original burst-local
+    ``(line, column)``.  The GeoTIFF is tiled (512) and DEFLATE-compressed;
+    unfetched pixels are left empty and read back as zero.  The rewritten
+    annotation marks unfetched lines ``firstValidSample = -1`` and ROI
+    lines with the fetched column envelope, keeps parent ``linesPerBurst``
+    / ``azimuthTime`` / ``byteOffset`` / ``samplesPerBurst``, sets
     ``numberOfLines = n_kept * linesPerBurst``, and remaps the geolocation
     grid by original burst identity.
 
@@ -385,23 +386,18 @@ def write_roi_safe_canvas(
 
     lines_per_burst = int(swath.lines_per_burst)
     samples_per_burst = int(swath.samples_per_burst)
-    canvas = np.zeros(
-        (len(ordered) * lines_per_burst, samples_per_burst),
-        dtype=np.complex64,
-    )
+    height = len(ordered) * lines_per_burst
     kept_masks: list[tuple[int, tuple[list[int], list[int]]]] = []
+    placements: list[tuple[int, int, np.ndarray]] = []
     for slot, window in enumerate(ordered):
         if window.burst_index < 0 or window.burst_index >= len(swath.bursts):
             reject_product(
                 f"burst_index {window.burst_index} out of range for {swath.swath}"
             )
         samples = _checked_samples(window, lines_per_burst, samples_per_burst)
-        n_lines, n_cols = samples.shape
         row0, col0 = int(window.row0), int(window.col0)
         row_base = slot * lines_per_burst
-        canvas[row_base + row0 : row_base + row0 + n_lines, col0 : col0 + n_cols] = (
-            samples
-        )
+        placements.append((row_base + row0, col0, samples))
         kept_masks.append(
             (int(window.burst_index), _window_mask(window, lines_per_burst))
         )
@@ -414,7 +410,33 @@ def write_roi_safe_canvas(
     (safe_root / "annotation").mkdir(parents=True, exist_ok=True)
 
     tiff_path = safe_root / "measurement" / f"{stem}.tiff"
-    _write_burst_tiff(tiff_path, canvas)
+    with rasterio.open(
+        tiff_path,
+        "w",
+        driver="GTiff",
+        height=height,
+        width=samples_per_burst,
+        count=1,
+        dtype="complex64",
+        tiled=True,
+        blockxsize=512,
+        blockysize=512,
+        compress="deflate",
+        crs=None,
+        transform=Affine.identity(),
+    ) as dst:
+        for row_off, col_off, samples in placements:
+            n_lines, n_cols = samples.shape
+            dst.write(
+                samples,
+                1,
+                window=Window(
+                    col_off=col_off,
+                    row_off=row_off,
+                    width=n_cols,
+                    height=n_lines,
+                ),
+            )
 
     source = (
         annotation_xml if annotation_xml is not None else _read_annotation_source(swath)
@@ -430,7 +452,7 @@ def write_roi_safe_canvas(
         safe_root,
         len(ordered),
         list(kept_indices),
-        canvas.shape,
+        (height, samples_per_burst),
     )
     return RoiSafeCanvas(
         safe_root=safe_root,

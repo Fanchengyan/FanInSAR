@@ -43,7 +43,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
+from pyproj import Transformer
+from pyproj.crs import CRS
+from pyproj.exceptions import CRSError
 
+from faninsar.data.query import BoundingBox, Points, Polygons
 from faninsar.logging import setup_logger
 from faninsar.missions.s1.annotation import parse_annotation_xml
 from faninsar.missions.s1.errors import reject_product
@@ -61,7 +65,6 @@ if TYPE_CHECKING:
     from datetime import datetime
     from typing import TypeAlias
 
-    from faninsar.data.query import BoundingBox, Points, Polygons
     from faninsar.missions.s1.io.canvas import RoiSafeCanvas
     from faninsar.missions.s1.overlap import BurstOverlapWindow
     from faninsar.missions.s1.types import S1Swath
@@ -76,6 +79,11 @@ MERGE_FLOOR_BYTES = 256 * 1024
 
 HEADER_PROBE_BYTES = 16
 """Bytes probed at offset 0: classic (8 B) and BigTIFF (16 B) IFD pointers."""
+
+POINT_BUFFER_M = 1000.0
+"""Ground half-width applied to a point ROI before geolocation inversion."""
+
+_WGS84 = CRS.from_epsg(4326)
 
 _RowGroup: TypeAlias = tuple[int, int, int, int]
 """Half-open row group ``(line0, line1, byte_start, byte_end)``."""
@@ -814,6 +822,146 @@ def overlap_windows_for_canvas(
     return burst_overlap_windows(swath, burst_indices=sorted(kept), min_lines=1)
 
 
+def _is_wgs84(crs: object | None) -> bool:
+    """Return True when ``crs`` is geographic WGS 84 / EPSG:4326."""
+    if crs is None:
+        return False
+    try:
+        parsed = CRS.from_user_input(crs)
+    except (CRSError, TypeError, ValueError):
+        return False
+    epsg = parsed.to_epsg()
+    if epsg == 4326:
+        return True
+    return parsed.equals(_WGS84)
+
+
+def normalize_roi_wgs84(
+    roi: BoundingBox | Points | Polygons,
+) -> BoundingBox | Points | Polygons:
+    """Return ``roi`` in EPSG:4326, preserving its query type.
+
+    Parameters
+    ----------
+    roi : BoundingBox, Points, or Polygons
+        FanInSAR spatial query.  A CRS is required.
+
+    Returns
+    -------
+    BoundingBox, Points, or Polygons
+        The same type, with coordinates in EPSG:4326.
+
+    Raises
+    ------
+    ValueError
+        If ``roi`` has no CRS, or the CRS cannot be transformed to
+        EPSG:4326.
+
+    """
+    crs = getattr(roi, "crs", None)
+    if crs is None:
+        message = "ROI must declare a CRS; spatial queries cannot assume lon/lat"
+        logger.error(message)
+        raise ValueError(message)
+    if _is_wgs84(crs):
+        return roi
+    try:
+        return roi.to_crs(_WGS84)
+    except (CRSError, TypeError, ValueError) as exc:
+        message = "ROI CRS cannot be transformed to EPSG:4326"
+        logger.exception(message)
+        raise ValueError(message) from exc
+
+
+def _utm_ups_epsg(lon: float, lat: float) -> str:
+    """Return the UTM or UPS EPSG code for a WGS84 point."""
+    if lat >= 84:
+        return "EPSG:32661"
+    if lat < -80:
+        return "EPSG:32761"
+    zone = min(60, max(1, int((lon + 180) // 6) + 1))
+    return f"EPSG:{32600 + zone if lat >= 0 else 32700 + zone}"
+
+
+def _point_buffer_bounds(lon: float, lat: float) -> tuple[float, float, float, float]:
+    """Return a 1 km ground square around a WGS84 point as lon/lat bounds."""
+    projected = CRS.from_user_input(_utm_ups_epsg(lon, lat))
+    to_xy = Transformer.from_crs(_WGS84, projected, always_xy=True)
+    to_ll = Transformer.from_crs(projected, _WGS84, always_xy=True)
+    x, y = to_xy.transform(lon, lat)
+    corners = (
+        (x - POINT_BUFFER_M, y - POINT_BUFFER_M),
+        (x - POINT_BUFFER_M, y + POINT_BUFFER_M),
+        (x + POINT_BUFFER_M, y - POINT_BUFFER_M),
+        (x + POINT_BUFFER_M, y + POINT_BUFFER_M),
+    )
+    lons: list[float] = []
+    lats: list[float] = []
+    for easting, northing in corners:
+        corner_lon, corner_lat = to_ll.transform(easting, northing)
+        lons.append(float(corner_lon))
+        lats.append(float(corner_lat))
+    return min(lons), min(lats), max(lons), max(lats)
+
+
+def inversion_envelope(
+    roi: BoundingBox | Points | Polygons,
+) -> tuple[float, float, float, float]:
+    """Return a WGS84 ``(west, south, east, north)`` with positive area.
+
+    ``BoundingBox`` uses its four sides after CRS normalization.
+    ``Polygons`` uses the desired-minus-undesired bounds.
+    ``Points`` are expanded by :data:`POINT_BUFFER_M` on the local
+    UTM/UPS plane so a GPS pin is not inverted as a 1x1 radar pixel.
+
+    Parameters
+    ----------
+    roi : BoundingBox, Points, or Polygons
+        Spatial query.  A CRS is required.
+
+    Returns
+    -------
+    tuple of float
+        Inclusive-exclusive geographic envelope in EPSG:4326.
+
+    Raises
+    ------
+    ValueError
+        If ``roi`` has no CRS or cannot be transformed to EPSG:4326.
+
+    """
+    normalized = normalize_roi_wgs84(roi)
+    if isinstance(normalized, Points):
+        envelopes = [
+            _point_buffer_bounds(float(x), float(y)) for x, y in normalized.values
+        ]
+        if not envelopes:
+            message = "Points ROI is empty"
+            logger.error(message)
+            raise ValueError(message)
+        west = min(item[0] for item in envelopes)
+        south = min(item[1] for item in envelopes)
+        east = max(item[2] for item in envelopes)
+        north = max(item[3] for item in envelopes)
+        return west, south, east, north
+    if isinstance(normalized, Polygons):
+        geometry = (
+            normalized.to_desired() if normalized.is_mixed else normalized.desired
+        )
+        if len(geometry) == 0:
+            message = "Polygons ROI has no desired geometry"
+            logger.error(message)
+            raise ValueError(message)
+        bounds = geometry.to_geodataframe().total_bounds
+        return float(bounds[0]), float(bounds[1]), float(bounds[2]), float(bounds[3])
+    return (
+        float(normalized.left),
+        float(normalized.bottom),
+        float(normalized.right),
+        float(normalized.top),
+    )
+
+
 def invert_geolocation_grid(
     xml_text: str,
     roi: BoundingBox | Points | Polygons,
@@ -825,8 +973,9 @@ def invert_geolocation_grid(
     xml_text : str
         Annotation XML containing ``geolocationGridPoint`` entries.
     roi : BoundingBox, Points, or Polygons
-        Spatial query.  A :class:`~faninsar.data.query.BoundingBox` uses
-        its four corners; other geometries use their bounds.
+        Spatial query.  Coordinates are transformed to EPSG:4326.
+        A :class:`~faninsar.data.query.Points` query is buffered on the
+        ground before inversion; boxes and polygons use their bounds.
 
     Returns
     -------
@@ -838,12 +987,14 @@ def invert_geolocation_grid(
     ------
     Sentinel1ProductError
         If the annotation has no geolocation grid.
+    ValueError
+        If ``roi`` has no CRS.
 
     """
     points = _geolocation_points(xml_text)
     if not points:
         reject_product("annotation has no geolocationGrid points to invert")
-    left, bottom, right, top = _roi_bounds(roi)
+    left, bottom, right, top = inversion_envelope(roi)
     corners = (
         (left, bottom),
         (left, top),
@@ -899,9 +1050,10 @@ def materialize_cdse_roi_safes(
     Raises
     ------
     ValueError
-        If discovery returns no products.
+        If ``roi`` has no CRS, or discovery returns no products.
 
     """
+    roi = normalize_roi_wgs84(roi)
     items = discover_cdse_slc_items(
         roi,
         datetime_range=datetime_range,
@@ -1055,22 +1207,6 @@ def _geolocation_points(xml_text: str) -> list[tuple[int, int, float, float]]:
             )
         )
     return points
-
-
-def _roi_bounds(
-    roi: BoundingBox | Points | Polygons,
-) -> tuple[float, float, float, float]:
-    """Return ``(left, bottom, right, top)`` for a FanInSAR spatial query."""
-    left = getattr(roi, "left", None)
-    if left is not None:
-        return (
-            float(roi.left),
-            float(roi.bottom),
-            float(roi.right),
-            float(roi.top),
-        )
-    bounds = roi.to_geodataframe().total_bounds
-    return float(bounds[0]), float(bounds[1]), float(bounds[2]), float(bounds[3])
 
 
 def _full_intersecting_burst_lines(

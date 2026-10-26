@@ -20,7 +20,7 @@ import rasterio
 from rasterio.io import MemoryFile
 
 from faninsar import remote
-from faninsar.data.query import BoundingBox
+from faninsar.data.query import BoundingBox, Points
 from faninsar.missions.s1 import acquisition as acquisition_mod
 from faninsar.missions.s1.annotation import parse_annotation_xml
 from faninsar.missions.s1.errors import Sentinel1ProductError
@@ -896,3 +896,82 @@ class TestOverlapSpliceFromFetchedWindows:
         np.testing.assert_array_equal(bottom, data[50:53, 10:50])
         assert np.any(top)
         assert np.any(bottom)
+
+
+def _dense_geolocation_xml() -> str:
+    """Return a ~2 km geolocation grid around lon 100, lat 40."""
+    points = [
+        (0, 0, 39.99, 99.99),
+        (0, 50, 39.99, 100.00),
+        (0, 99, 39.99, 100.01),
+        (10, 0, 40.01, 99.99),
+        (10, 50, 40.01, 100.00),
+        (10, 99, 40.01, 100.01),
+    ]
+    body = "".join(
+        "<geolocationGridPoint>"
+        f"<line>{line}</line><pixel>{pixel}</pixel>"
+        f"<latitude>{lat}</latitude><longitude>{lon}</longitude>"
+        "</geolocationGridPoint>"
+        for line, pixel, lat, lon in points
+    )
+    return f"<product><geolocationGrid>{body}</geolocationGrid></product>"
+
+
+class TestRoiWgs84AndPointEnvelope:
+    """ROI must be WGS84; a single point is buffered before inversion."""
+
+    def test_missing_crs_is_rejected(self) -> None:
+        """A BoundingBox without CRS is not treated as lon/lat."""
+        with pytest.raises(ValueError, match="CRS"):
+            acquisition_mod.normalize_roi_wgs84(BoundingBox(100.0, 40.0, 100.4, 40.4))
+
+    def test_utm_bbox_inverts_like_wgs84_bbox(self) -> None:
+        """A projected bbox is transformed to EPSG:4326 before inversion."""
+        xml_text = _parent_xml()
+        wgs84 = BoundingBox(100.0, 40.0, 100.4, 40.4, crs="EPSG:4326")
+        utm = BoundingBox(
+            585360.4618427712,
+            4428236.06463309,
+            618805.2791234051,
+            4473095.679410577,
+            crs="EPSG:32647",
+        )
+        assert acquisition_mod.invert_geolocation_grid(
+            xml_text, utm
+        ) == acquisition_mod.invert_geolocation_grid(xml_text, wgs84)
+
+    def test_single_point_envelope_is_two_kilometres_across(self) -> None:
+        """A GPS point expands to a ~1 km ground square, not a degenerate box."""
+        from pyproj import Geod
+
+        point = Points([[100.0, 40.0]], crs="EPSG:4326")
+        west, south, east, north = acquisition_mod.inversion_envelope(point)
+        assert east > west
+        assert north > south
+        geod = Geod(ellps="WGS84")
+        _az12, _az21, width_m = geod.inv(west, 40.0, east, 40.0)
+        _az12, _az21, height_m = geod.inv(100.0, south, 100.0, north)
+        assert 1900 < abs(width_m) < 2100
+        assert 1900 < abs(height_m) < 2100
+
+    def test_single_point_inversion_covers_more_than_one_pixel(self) -> None:
+        """Buffered point inversion is not a 1x1 radar window."""
+        point = Points([[100.0, 40.0]], crs="EPSG:4326")
+        line0, line1, col0, col1 = acquisition_mod.invert_geolocation_grid(
+            _dense_geolocation_xml(),
+            point,
+        )
+        assert line1 - line0 > 1
+        assert col1 - col0 > 1
+
+    def test_normalize_keeps_points_type(self) -> None:
+        """Catalog search still sees a point, not a bounding box."""
+        point = Points([[585360.4618427712, 4428236.06463309]], crs="EPSG:32647")
+        normalized = acquisition_mod.normalize_roi_wgs84(point)
+        assert isinstance(normalized, Points)
+        assert normalized.crs is not None
+        assert normalized.crs.to_epsg() == 4326
+        lon, lat = float(normalized.values[0, 0]), float(normalized.values[0, 1])
+        assert abs(lon - 100.0) < 1e-5
+        assert abs(lat - 40.0) < 1e-5
