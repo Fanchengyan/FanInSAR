@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from faninsar import Loops, Pairs, parse_device
 from faninsar.logging import setup_logger
+from faninsar.NSBAS.coherence_weight import WeightFunc, coherence_to_weight
 from faninsar.NSBAS.tsmodels import TimeSeriesModels
 
 if TYPE_CHECKING:
@@ -96,19 +97,31 @@ class NSBASSolver:
     _gamma: float
     _G: torch.Tensor
     _d: torch.Tensor
+    _unw: np.ndarray
+    _coh: np.ndarray | None
+    _coh_threshold: float
+    _weight_func: str
+    _n_looks: int
+    _inv_alg: Literal["ls", "wls"]
     _device: torch.device
     _dtype: torch.dtype
     _verbose: bool
 
     __slots__ = [
         "_G",
+        "_coh",
+        "_coh_threshold",
         "_d",
         "_device",
         "_dtype",
         "_gamma",
+        "_inv_alg",
         "_model",
+        "_n_looks",
         "_pairs",
+        "_unw",
         "_verbose",
+        "_weight_func",
     ]
 
     def __init__(
@@ -119,12 +132,46 @@ class NSBASSolver:
         coh: NDArray[np.floating] | torch.Tensor | None = None,
         coh_threshold: float = 0.4,
         inv_alg: Literal["ls", "wls"] = "ls",
+        weight_func: WeightFunc | str = "no",
+        n_looks: int = 1,
         gamma: float = 0.0001,
         device: str | torch.device | None = None,
         dtype: torch.dtype = torch.float64,
         verbose: bool = True,
     ) -> None:
-        """Initialize NSBAS solver."""
+        """Initialize NSBAS solver.
+
+        Parameters
+        ----------
+        unw : ndarray or torch.Tensor
+            Unwrapped interferograms with shape ``(n_pair, n_pixel)``.
+        pairs : Pairs or Sequence[str]
+            Interferogram pairs corresponding to ``unw``.
+        model : TimeSeriesModels, optional
+            Parametric NSBAS model. Omit for pure SBAS.
+        coh : ndarray or torch.Tensor, optional
+            Spatial coherence with the same shape as ``unw``. Values at or
+            below ``coh_threshold`` are treated as missing. When a weight
+            function is selected, ``coh`` is also converted to observation
+            weights.
+        coh_threshold : float, optional
+            Coherence mask threshold. Pixels with ``coh <= coh_threshold``
+            are set to NaN before inversion.
+        inv_alg : {"ls", "wls"}, optional
+            ``wls`` selects weighted least squares. If ``weight_func`` is
+            still ``"no"``, ``wls`` defaults to Fisher-information weights.
+        weight_func : {"no", "coh", "fim", "var"}, optional
+            Observation-weight definition. ``no`` is unweighted, ``coh``
+            uses coherence, ``fim`` uses ``2 L γ² / (1 - γ²)``, and
+            ``var`` uses the inverse DS phase variance.
+        n_looks : int, optional
+            Independent looks ``L`` used by ``fim`` and ``var``.
+        gamma : float, optional
+            Weight of the NSBAS model-constraint rows.
+        device, dtype, verbose
+            Torch device, compute dtype, and progress-bar flag.
+
+        """
         if isinstance(pairs, Pairs):
             self._pairs = pairs
         elif isinstance(pairs, Sequence):
@@ -140,39 +187,22 @@ class NSBASSolver:
 
         self._model = None
         self._gamma = 0.0001
-
-        g_sbas = self._make_sbas_matrix()
-
-        if coh is not None:
-            if isinstance(coh, np.ndarray):
-                coh_np = coh
-            elif isinstance(coh, torch.Tensor):
-                coh_np = coh.detach().cpu().numpy()
-            else:
-                msg = "coh must be a numpy array or torch tensor"
-                logger.error(msg, extra={"coh_type": type(coh).__name__})
-                raise TypeError(msg)
-
-            # mask the unwrapped values by coherence
-            d = np.where(coh_np <= coh_threshold, np.nan, unw)
-
-            # currently only support sl and wsl for SBAS matrix
-            if inv_alg == "wls":
-                coh_2 = coh_np**2
-                w = coh_2 / (1 - coh_2)
-                d = d * w
-                g_sbas = (g_sbas[:, :, None] * w[:, None, :]).transpose(2, 0, 1)
+        self._unw = _to_numpy(unw)
+        self._coh = None if coh is None else _to_numpy(coh)
+        self._coh_threshold = coh_threshold
+        self._inv_alg = inv_alg
+        self._n_looks = n_looks
+        self._weight_func = str(weight_func)
+        if inv_alg == "wls" and self._weight_func in {"no", "sbas", "uniform"}:
+            self._weight_func = "fim"
 
         if model is not None:
             _check_model(model)
             _check_gamma(gamma)
             self._model = model
             self._gamma = gamma
-            self.set_G(self._make_nsbas_matrix(model.G_br, g_sbas, gamma))
 
-        else:
-            self.set_G(self._make_sbas_matrix())
-        self.set_d(d)
+        self._rebuild_system()
 
     def __str__(self) -> str:
         """Return string representation."""
@@ -229,7 +259,11 @@ class NSBASSolver:
         return self._d
 
     def set_d(self, unw: np.ndarray | torch.Tensor) -> None:
-        """Set d by appending model matrix part to input unw matrix."""
+        """Set unwrapped interferograms and rebuild ``G`` and ``d``.
+
+        The input is the raw unwrapped phases. Any current coherence mask
+        and observation weights are reapplied.
+        """
         if not isinstance(unw, (np.ndarray, torch.Tensor)):
             msg = "input unw must be a numpy array or torch tensor"
             logger.error(msg, extra={"unw_type": type(unw).__name__})
@@ -246,19 +280,8 @@ class NSBASSolver:
                 extra={"rows": unw_np.shape[0], "pairs": len(self.pairs)},
             )
             raise ValueError(msg)
-
-        if self.model is None:
-            self._d: Tensor = torch.as_tensor(
-                unw_np,
-                dtype=self._dtype,
-                device=self._device,
-            )
-        else:
-            self._d = torch.as_tensor(
-                self._restructure_unw(unw_np),
-                dtype=self._dtype,
-                device=self._device,
-            )
+        self._unw = unw_np
+        self._rebuild_system()
 
     @property
     def G(self) -> torch.Tensor:  # noqa: N802
@@ -337,9 +360,74 @@ class NSBASSolver:
             unw = np.vstack((unw, np.zeros((len(self.pairs.dates), unw.shape[1]))))
         return unw
 
+    def _rebuild_system(self) -> None:
+        """Rebuild ``G`` and ``d`` from stored unwrap, coherence, and weights."""
+        g_sbas = self._make_sbas_matrix().astype(np.float64, copy=False)
+        observations = np.array(self._unw, dtype=np.float64, copy=True)
+        if observations.shape[0] != len(self.pairs):
+            msg = "unwrapped interferograms must have the same rows as pairs"
+            logger.error(
+                msg,
+                extra={"rows": observations.shape[0], "pairs": len(self.pairs)},
+            )
+            raise ValueError(msg)
+
+        if self._coh is not None:
+            coh_np = np.asarray(self._coh, dtype=np.float64)
+            if coh_np.shape != observations.shape:
+                msg = "coh must have the same shape as unwrapped interferograms"
+                logger.error(
+                    msg,
+                    extra={"coh_shape": coh_np.shape, "unw_shape": observations.shape},
+                )
+                raise ValueError(msg)
+            observations = np.where(
+                coh_np <= self._coh_threshold,
+                np.nan,
+                observations,
+            )
+            if self._weight_func not in {"no", "sbas", "uniform"}:
+                weight = coherence_to_weight(
+                    coh_np,
+                    weight_func=self._weight_func,
+                    n_looks=self._n_looks,
+                )
+                weight_sqrt = np.sqrt(weight)
+                observations = observations * weight_sqrt
+                g_sbas = (g_sbas[:, :, None] * weight_sqrt[:, None, :]).transpose(
+                    2,
+                    0,
+                    1,
+                )
+
+        if self.model is not None:
+            self.set_G(self._make_nsbas_matrix(self.model.G_br, g_sbas, self._gamma))
+        else:
+            self.set_G(g_sbas)
+
+        if self.model is None:
+            self._d: Tensor = torch.as_tensor(
+                observations,
+                dtype=self._dtype,
+                device=self._device,
+            )
+        else:
+            self._d = torch.as_tensor(
+                self._restructure_unw(observations),
+                dtype=self._dtype,
+                device=self._device,
+            )
+
     @overload
     def inverse(
-        self, return_numpy: bool = True
+        self,
+        return_numpy: bool = True,
+        *,
+        coh: NDArray[np.floating] | torch.Tensor | None = None,
+        coh_threshold: float | None = None,
+        inv_alg: Literal["ls", "wls"] | None = None,
+        weight_func: WeightFunc | str | None = None,
+        n_looks: int | None = None,
     ) -> tuple[
         np.ndarray,
         np.ndarray,
@@ -348,7 +436,14 @@ class NSBASSolver:
     ]: ...
     @overload
     def inverse(
-        self, return_numpy: bool = False
+        self,
+        return_numpy: bool = False,
+        *,
+        coh: NDArray[np.floating] | torch.Tensor | None = None,
+        coh_threshold: float | None = None,
+        inv_alg: Literal["ls", "wls"] | None = None,
+        weight_func: WeightFunc | str | None = None,
+        n_looks: int | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -356,7 +451,14 @@ class NSBASSolver:
         torch.Tensor,
     ]: ...
     def inverse(
-        self, return_numpy: bool = True
+        self,
+        return_numpy: bool = True,
+        *,
+        coh: NDArray[np.floating] | torch.Tensor | None = None,
+        coh_threshold: float | None = None,
+        inv_alg: Literal["ls", "wls"] | None = None,
+        weight_func: WeightFunc | str | None = None,
+        n_looks: int | None = None,
     ) -> (
         tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -367,6 +469,18 @@ class NSBASSolver:
         ----------
         return_numpy : bool, optional
             Return numpy arrays if True, otherwise torch tensors, by default True.
+        coh : ndarray or torch.Tensor, optional
+            Spatial coherence used for masking and weighting. When provided,
+            it replaces the coherence stored at construction time.
+        coh_threshold : float, optional
+            Override the coherence mask threshold.
+        inv_alg : {"ls", "wls"}, optional
+            Override the inversion algorithm. ``wls`` with the default
+            ``weight_func="no"`` selects Fisher-information weights.
+        weight_func : {"no", "coh", "fim", "var"}, optional
+            Override the observation-weight definition.
+        n_looks : int, optional
+            Override the independent-looks value used by ``fim`` and ``var``.
 
         Returns
         -------
@@ -380,6 +494,28 @@ class NSBASSolver:
             residual between time-series model and model result
 
         """
+        rebuild = False
+        if coh is not None:
+            self._coh = _to_numpy(coh)
+            rebuild = True
+        if coh_threshold is not None:
+            self._coh_threshold = coh_threshold
+            rebuild = True
+        if n_looks is not None:
+            self._n_looks = n_looks
+            rebuild = True
+        if inv_alg is not None:
+            self._inv_alg = inv_alg
+            rebuild = True
+        if weight_func is not None:
+            self._weight_func = str(weight_func)
+            rebuild = True
+        if self._inv_alg == "wls" and self._weight_func in {"no", "sbas", "uniform"}:
+            self._weight_func = "fim"
+            rebuild = True
+        if rebuild:
+            self._rebuild_system()
+
         n_param = len(self.model.param_names) if self.model is not None else 0
         n_pair = len(self.pairs)
         result = batch_lstsq(
