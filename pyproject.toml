@@ -75,6 +75,7 @@ dependencies = [
   "rio-cogeo",
   "pystac>=1.8",
   "snaphu>=0.4.1; sys_platform != 'win32'",
+  "aiohttp>=3.14.3",
 ]
 
 

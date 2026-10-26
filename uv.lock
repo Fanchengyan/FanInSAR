@@ -1013,6 +1013,7 @@ wheels = [
 name = "faninsar"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "colorlog" },
     { name = "dask", extra = ["array", "distributed"] },
     { name = "data-downloader" },
@@ -1125,6 +1126,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.14.3" },
     { name = "asf-search", marker = "extra == 'asf'", specifier = ">=13,<14" },
     { name = "colorlog" },
     { name = "coverage", marker = "extra == 'test'" },
