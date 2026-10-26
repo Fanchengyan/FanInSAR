@@ -34,9 +34,9 @@ from .errors import (
     RemoteQueryError,
     _fail,
 )
+from .fetch.complete import _RedirectHandler
 from .protocols import _CallLedger
 from .records import RemoteResourceBudget
-from .transfer import _RedirectHandler
 
 logger = setup_logger(__name__)
 

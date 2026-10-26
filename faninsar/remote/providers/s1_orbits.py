@@ -19,8 +19,8 @@ from faninsar.logging import setup_logger
 from faninsar.remote.access import _response_is_complete, _url_origin, _validate_url
 from faninsar.remote.catalog import _ADAPTERS, _REGISTRY_LOCK
 from faninsar.remote.errors import RemoteAccessError, _fail
+from faninsar.remote.fetch.complete import _FetchedPayload, _RedirectHandler
 from faninsar.remote.protocols import _CallLedger
-from faninsar.remote.transfer import _FetchedPayload, _RedirectHandler
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping

@@ -310,7 +310,7 @@ def _input_record(path: Path) -> dict[str, object]:
         message = f"Stack input is missing: {path}"
         logger.error(message)
         reject_invalid_state(message)
-    from faninsar.remote.transfer import read_verification
+    from faninsar.remote.fetch.complete import read_verification
 
     record = read_verification(path) or {}
     return {

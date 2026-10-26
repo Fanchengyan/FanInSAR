@@ -885,12 +885,12 @@ class TestGswTileDigestRecording:
         The GCS GET response carries ``x-goog-hash: md5=<base64>``; the
         manager's fetch compares the tile bytes against that digest and
         records the PROPOSAL-0055 verification entry readable by
-        :func:`faninsar.remote.transfer.read_verification`.
+        :func:`faninsar.remote.fetch.complete.read_verification`.
         """
         import base64
         import hashlib
 
-        from faninsar.remote.transfer import read_verification
+        from faninsar.remote.fetch.complete import read_verification
 
         fake = _seed_single_tile(tmp_path, monkeypatch)
         body = fake.bodies[_gsw_url(100, 30)]
@@ -925,7 +925,7 @@ class TestGswTileDigestRecording:
         """
         import base64
 
-        from faninsar.remote.transfer import read_verification
+        from faninsar.remote.fetch.complete import read_verification
 
         fake = _seed_single_tile(tmp_path, monkeypatch)
         body = fake.bodies[_gsw_url(100, 30)]
@@ -962,7 +962,7 @@ class TestGswTileDigestRecording:
         import base64
         import hashlib
 
-        from faninsar.remote.transfer import read_verification
+        from faninsar.remote.fetch.complete import read_verification
 
         fake = HttpFake().install(monkeypatch)
         body_a = _tile_body(tmp_path, "occurrence_100E_30N.tif", water_boxes=[BIG_LAKE])

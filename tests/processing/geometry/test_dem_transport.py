@@ -771,9 +771,9 @@ def test_x_goog_hash_md5_response_records_verified_manifest(
     The GCS GET response carries ``x-goog-hash: md5=<base64>``; the fetched
     tile is compared against that provider digest and the result is written
     in the qualified verification-record form readable by
-    :func:`faninsar.remote.transfer.read_verification`.
+    :func:`faninsar.remote.fetch.complete.read_verification`.
     """
-    from faninsar.remote.transfer import read_verification
+    from faninsar.remote.fetch.complete import read_verification
 
     body = _payload(1 << 20)
     url = "https://storage.googleapis.com/bucket/occurrence_100E_30N.tif"
@@ -826,7 +826,7 @@ def test_x_goog_hash_md5_mismatch_fails_after_recording(
     exclusion is auditable (PROPOSAL-0055 failure semantics).
     """
     from faninsar.processing.errors import InvalidProcessingStateError
-    from faninsar.remote.transfer import read_verification
+    from faninsar.remote.fetch.complete import read_verification
 
     body = _payload(1 << 20)
     wrong = b"\x00" * 16
@@ -877,7 +877,7 @@ def test_tile_without_response_checksum_records_unverifiable(
     patched_session: FakeSession,
 ) -> None:
     """A tile with no provider digest expectation records unverifiable."""
-    from faninsar.remote.transfer import read_verification
+    from faninsar.remote.fetch.complete import read_verification
 
     body = _payload(1 << 20)
     url = "https://example.test/plain.tif"
@@ -908,7 +908,7 @@ def test_crc32c_only_response_without_md5_records_unverifiable(
     patched_session: FakeSession,
 ) -> None:
     """A GCS response offering only crc32c records unverifiable (no md5)."""
-    from faninsar.remote.transfer import read_verification
+    from faninsar.remote.fetch.complete import read_verification
 
     body = _payload(1 << 20)
     url = "https://storage.googleapis.com/bucket/occurrence_120E_30N.tif"
@@ -961,7 +961,7 @@ def test_ranged_download_captures_own_digest_and_records_verified(
     that previously recorded ``unverifiable`` because ``_download_ranged``
     dropped the response digest.
     """
-    from faninsar.remote.transfer import read_verification
+    from faninsar.remote.fetch.complete import read_verification
 
     body = _payload(_ONE_CHUNK * 2 + 11)
     url = "https://storage.googleapis.com/bucket/occurrence_100E_30N.tif"

@@ -15,13 +15,13 @@ import pytest
 from faninsar import remote
 from faninsar.missions.s1.search import ensure_asf_catalog
 from faninsar.remote.catalog import _ADAPTERS
+from faninsar.remote.fetch.complete import read_verification
 from faninsar.remote.providers.s1_orbits import (
     S1_ORBITS_CATALOG,
     S1_ORBITS_ORIGIN,
-    ensure_s1_orbits_catalog,
     _etag_to_checksum,
+    ensure_s1_orbits_catalog,
 )
-from faninsar.remote.transfer import read_verification
 
 # Independent known-good MD5 digest of b"" (RFC 1321 test-suite value).
 _EMPTY_MD5 = "d41d8cd98f00b204e9800998ecf8427e"

@@ -22,8 +22,7 @@ from typing import Any
 import requests
 
 from faninsar.logging import setup_logger
-
-from .access import (
+from faninsar.remote.access import (
     _SECRET_KEY,
     _has_signed_query,
     _redirect_headers,
@@ -36,16 +35,21 @@ from .access import (
     _validate_representation,
     _validate_url,
 )
-from .auth import (
+from faninsar.remote.auth import (
     _asf_authenticated_session,
     _asf_request,
     _drain_urllib_response,
     _lpdaac_request,
     _netrc_authorization,
 )
-from .cache import _identity, _is_qualified, _manifest_path, _matching_manifest
-from .catalog import _ADAPTERS, _DESTINATION_LOCKS, _REGISTRY_LOCK
-from .errors import (
+from faninsar.remote.cache import (
+    _identity,
+    _is_qualified,
+    _manifest_path,
+    _matching_manifest,
+)
+from faninsar.remote.catalog import _ADAPTERS, _DESTINATION_LOCKS, _REGISTRY_LOCK
+from faninsar.remote.errors import (
     BurstPendingError,
     RemoteAccessError,
     RemoteError,
@@ -53,8 +57,8 @@ from .errors import (
     RemoteLimitError,
     _fail,
 )
-from .protocols import _accepts_ledger, _Adapter, _CallLedger
-from .records import RemoteAsset, RemoteResourceBudget
+from faninsar.remote.protocols import _accepts_ledger, _Adapter, _CallLedger
+from faninsar.remote.records import RemoteAsset, RemoteResourceBudget
 
 logger = setup_logger(__name__)
 
