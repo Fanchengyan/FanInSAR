@@ -19,6 +19,7 @@ from faninsar.stack.search import (
 )
 from faninsar.stack.session import Stack
 
+from .acquisition import materialize_cdse_roi_safes, resolve_roi_acquisition
 from .search import (
     S1PolarizationRequest,
     S1ProductType,
@@ -352,7 +353,175 @@ class S1Stack(Stack):
         return stack  # type: ignore[return-value]
 
     @classmethod
-    def from_search(
+    def from_roi(
+        cls,
+        roi: Points | BoundingBox | Polygons,
+        datetime_range: tuple[datetime, datetime] | None = None,
+        *,
+        granularity: str = "roi",
+        provider: str | None = None,
+        polarizations: S1PolarizationRequest | Sequence[str] | str = ("VV",),
+        work_dir: str | Path,
+        orbit_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
+        calibration_paths: Sequence[str | Path] | None = None,
+        **kwargs: Any,
+    ) -> Self:
+        """Search, acquire, and prepare a Sentinel-1 Stack for one ROI.
+
+        Scientific granularity is the user-facing axis; the provider is
+        derived.  Bytes transferred depend on ROI shape and burst coverage;
+        this method does not promise a fixed byte fraction.
+
+        Provider x granularity table:
+
+        ============  ==========  =================  =================================
+        granularity   providers   inferred provider  notes
+        ============  ==========  =================  =================================
+        roi (default) cdse        cdse               byte-range windows; bytes depend
+                                                     on ROI shape
+        burst         cdse, asf   cdse               full-burst contiguous row ranges
+                                                     (cdse) or ASF burst products
+        scene         asf         asf                complete scene/frame products
+        ============  ==========  =================  =================================
+
+        Both ``granularity`` and ``provider`` omitted → ``roi`` + ``cdse``.
+        Illegal combinations (``roi``+``asf``, ``scene``+``cdse``) raise
+        :class:`ValueError` citing this table.  Overlap strips for NESD/ESD
+        are fetched internally and are not a user knob.  ``catalog`` /
+        ``collections`` are adapter configuration, not constructor
+        arguments.
+
+        CDSE paths (``roi`` and ``burst@cdse``) materialize a full-burst-
+        height SAFE-subset canvas, splice overlap rows, then call
+        :meth:`from_safes` → :meth:`prepare`.  ASF paths download complete
+        objects and follow the same ``from_safes`` → ``prepare`` join.
+
+        Parameters
+        ----------
+        roi : Points, BoundingBox, or Polygons
+            FanInSAR spatial query.
+        datetime_range : tuple, optional
+            Inclusive acquisition time range.
+        granularity : {"roi", "burst", "scene"}, default="roi"
+            Acquisition granularity (not a provider product type).
+        provider : {"cdse", "asf"} or None, optional
+            Explicit provider; inferred from ``granularity`` when omitted.
+        polarizations : sequence of str or "all", default=("VV",)
+            Sentinel-1 single/dual channels to retain.
+        work_dir : path-like
+            Stack work directory and local input cache.
+        orbit_paths, calibration_paths : optional
+            Explicit local orbit candidates/bindings and AUX_CAL files passed
+            to :meth:`from_safes`.
+        **kwargs : Any
+            Existing :meth:`from_safes` options plus internal ASF search
+            options (``flight_direction``, ``filters``, ``limit``,
+            ``budget``).  ``catalog`` / ``collections`` remain internal.
+
+        Returns
+        -------
+        S1Stack
+            A locally materialized and prepared Stack.
+
+        Raises
+        ------
+        ValueError
+            If the granularity x provider pair is illegal, the query returns
+            no products, every download fails verification, or local
+            construction fails.
+
+        Notes
+        -----
+        A download whose bytes fail provider checksum verification excludes
+        only that acquisition (PROPOSAL-0055): it is warned, recorded as
+        ``status: failed`` in ``config.extra["excluded_acquisitions"]``, and
+        excluded from pair formation.  Any other download error remains
+        operation-fatal.
+
+        """
+        resolved_granularity, resolved_provider = resolve_roi_acquisition(
+            granularity,
+            provider,
+        )
+        extra = dict(kwargs.pop("extra", {}) or {})
+        extra["roi_granularity"] = resolved_granularity
+        extra["roi_provider"] = resolved_provider
+        kwargs["extra"] = extra
+        if resolved_provider == "cdse":
+            return cls._from_cdse_roi(
+                roi,
+                datetime_range=datetime_range,
+                granularity=resolved_granularity,
+                polarizations=polarizations,
+                work_dir=work_dir,
+                orbit_paths=orbit_paths,
+                calibration_paths=calibration_paths,
+                **kwargs,
+            )
+        product_type: S1ProductType = (
+            "scene" if resolved_granularity == "scene" else "burst"
+        )
+        return cls._from_asf_complete(
+            roi,
+            work_dir=work_dir,
+            product_type=product_type,
+            polarizations=polarizations,
+            datetime_range=datetime_range,
+            orbit_paths=orbit_paths,
+            calibration_paths=calibration_paths,
+            **kwargs,
+        )
+
+    @classmethod
+    def _from_cdse_roi(
+        cls,
+        roi: Points | BoundingBox | Polygons,
+        *,
+        datetime_range: tuple[datetime, datetime] | None,
+        granularity: str,
+        polarizations: S1PolarizationRequest | Sequence[str] | str,
+        work_dir: str | Path,
+        orbit_paths: Mapping[str, object] | Sequence[str | Path] | None,
+        calibration_paths: Sequence[str | Path] | None,
+        **kwargs: Any,
+    ) -> Self:
+        """Materialize CDSE canvases then join through ``from_safes``."""
+        selected_polarizations = normalize_polarizations(polarizations)
+        root = Path(work_dir)
+        local_paths = materialize_cdse_roi_safes(
+            roi,
+            datetime_range=datetime_range,
+            polarizations=selected_polarizations,
+            work_dir=root,
+            granularity=granularity,
+        )
+        extra = dict(kwargs.pop("extra", {}) or {})
+        extra.update(
+            {
+                "search_product_type": granularity,
+                "search_polarizations": selected_polarizations,
+            }
+        )
+        if orbit_paths is not None:
+            kwargs["orbit_paths"] = orbit_paths
+        if calibration_paths is not None:
+            kwargs["calibration_paths"] = calibration_paths
+        kwargs["extra"] = extra
+        stack = cls.from_safes(
+            local_paths,
+            work_dir=root,
+            polarizations=selected_polarizations,
+            **kwargs,
+        )
+        prepare = getattr(stack, "prepare", None)
+        if callable(prepare):
+            prepare()
+        else:
+            stack.prepare_scenes()
+        return stack
+
+    @classmethod
+    def _from_asf_complete(
         cls,
         spatial: Points | BoundingBox | Polygons,
         *,
@@ -373,55 +542,9 @@ class S1Stack(Stack):
     ) -> Self:
         """Search ASF, download complete SAFE inputs, and prepare a Stack.
 
-        Parameters
-        ----------
-        spatial : Points, BoundingBox, or Polygons
-            FanInSAR spatial query.
-        work_dir : path-like
-            Stack work directory and local input cache.
-        product_type : {"burst", "scene"}, default="burst"
-            ASF virtual burst or complete full-scene/frame product family.
-        polarizations : sequence of str or "all", default=("VV",)
-            Sentinel-1 single/dual channels to retain.  ``"all"`` leaves
-            filtering to the local SAFE reader.
-        **kwargs : Any
-            Existing :meth:`from_safes` and Stack preparation options.
-        catalog, collections : str or sequence of str, optional
-            ASF catalog and collection identities.
-        datetime_range : tuple, optional
-            Inclusive acquisition time range.
-        flight_direction : {"ASCENDING", "DESCENDING"}, optional
-            Orbit direction filter.
-        filters : mapping, optional
-            Advanced ASF filters.
-        auth_profile : str, optional
-            Remote authentication profile.
-        limit : int, optional
-            Maximum candidate count.
-        budget : RemoteResourceBudget, optional
-            Remote request and transfer resource limits.
-        orbit_paths, calibration_paths : optional
-            Explicit local orbit candidates/bindings and AUX_CAL files passed
-            to :meth:`from_safes`.
-
-        Returns
-        -------
-        S1Stack
-            A locally downloaded and prepared Stack.
-
-        Raises
-        ------
-        ValueError
-            If the query has no complete SAFE representation, every download
-            fails verification, or local construction fails.
-
-        Notes
-        -----
-        A download whose bytes fail provider checksum verification excludes
-        only that acquisition (PROPOSAL-0055): it is warned, recorded as
-        ``status: failed`` in ``config.extra["excluded_acquisitions"]``, and
-        excluded from pair formation.  Any other download error remains
-        operation-fatal.
+        Absorbed from the deleted ``from_search`` constructor
+        (PROPOSAL-0061).  Burst products poll until ready; scene products
+        download immediately.
 
         """
         selected_polarizations = normalize_polarizations(polarizations)
