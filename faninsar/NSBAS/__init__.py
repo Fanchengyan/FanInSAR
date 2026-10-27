@@ -1,5 +1,12 @@
 from .freeze_thaw_process import FreezeThawCycle
-from .inversion import NSBASSolver, batch_lstsq, calculate_u, censored_lstsq
+from .inversion import (
+    LstsqDiagnostics,
+    NSBASResult,
+    NSBASSolver,
+    batch_lstsq,
+    calculate_u,
+    censored_lstsq,
+)
 from .tsmodels import (
     AnnualSemiannualSinusoidal,
     AnnualSinusoidalModel,
