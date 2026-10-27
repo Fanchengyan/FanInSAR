@@ -91,6 +91,18 @@ def test_hyp3_attaches_canonical_lv_theta(tmp_path: Path) -> None:
     assert not any("clipped" in name or "roi" in name for name in names)
 
 
+def test_hyp3_load_los_ratio_defaults_to_look_sine(tmp_path: Path) -> None:
+    """HyP3 lv_theta is look-vector elevation; default ratio is sin(θ)."""
+    _write_hyp3_product(tmp_path, "20210101", "20210113")
+    ds = HyP3S1(root_dir=tmp_path, verbose=False, nodata=0.0)
+    assert ds.los_angle_type == "look"
+    ratio = ds.load_los_ratio()
+    np.testing.assert_allclose(ratio, np.full((4, 4), np.sin(0.7)), rtol=1e-5, atol=1e-5)
+    wrong = ds.load_los_ratio(angle_type="incidence")
+    np.testing.assert_allclose(wrong, np.full((4, 4), np.cos(0.7)), rtol=1e-5, atol=1e-5)
+    assert not np.allclose(ratio, wrong)
+
+
 def test_hyp3_warns_when_lv_theta_missing(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

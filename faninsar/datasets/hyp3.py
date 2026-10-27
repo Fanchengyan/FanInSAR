@@ -20,8 +20,9 @@ class HyP3S1(InterferogramDataset, Sentinel1):
 
     pattern_unw = "*unw_phase.tif"
     pattern_coh = "*corr.tif"
+    #: HyP3 ``lv_theta`` is look-vector elevation from horizontal, in radians.
     pattern_los = "*_lv_theta.tif"
-    los_angle_type = "incidence"
+    los_angle_type = "look"
 
     def parse_baselines(self, pairs: Pairs | None = None) -> Baselines:
         """Parse the baseline of the interferogram for given pairs.
@@ -64,5 +65,6 @@ class HyP3S1Burst(InterferogramDataset, Sentinel1):
 
     pattern_unw = "*unw_phase.tif"
     pattern_coh = "*corr.tif"
+    #: HyP3 ``lv_theta`` is look-vector elevation from horizontal, in radians.
     pattern_los = "*_lv_theta.tif"
-    los_angle_type = "incidence"
+    los_angle_type = "look"

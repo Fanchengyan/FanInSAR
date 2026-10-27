@@ -122,10 +122,11 @@ class ApsDataset(TimeSeriesDataset, ABC):
             Reference points subtracted from every increment. Multiple points
             are averaged.
         los_ratio : array-like or float, optional
-            Incidence cosine used to convert zenith delay to line-of-sight.
-            ``increments / los_ratio`` is applied when provided. Use
+            Line-of-sight direction cosine used to convert zenith delay to
+            LOS. ``increments / los_ratio`` is applied when provided. For
+            HyP3 ``lv_theta`` (look-vector elevation from horizontal), use
             :meth:`faninsar.datasets.ifg.InterferogramDataset.load_los_ratio`
-            with ``angle_type="incidence"`` for HyP3 ``lv_theta`` files.
+            with the default ``angle_type="look"`` (``sin(θ)``).
         insert_ref_zero : bool, optional
             If True, prepend a zero row so the result has length ``n_date``
             for a cumulative time series. Default is False.
@@ -195,7 +196,10 @@ class ApsDataset(TimeSeriesDataset, ABC):
         ref_points : Points
             Reference points subtracted from every increment.
         los_ratio : array-like or float, optional
-            Incidence cosine used to convert zenith delay to line-of-sight.
+            Line-of-sight direction cosine used to convert zenith delay to
+            LOS. For HyP3 ``lv_theta``, use
+            :meth:`~faninsar.datasets.ifg.InterferogramDataset.load_los_ratio`
+            with the default ``angle_type="look"``.
 
         Returns
         -------

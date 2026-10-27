@@ -515,10 +515,11 @@ class InterferogramDataset(PairDataset):
     ) -> None:
         """Set the los dataset.
 
-        los file could be incidence angle (relative to vertical) or look angle
-        (relative to horizontal). This file is used to convert differential
-        atmospheric phase from vertical to line-of-sight (LOS) direction or
-        convert LOS deformation phase to vertical.
+        los file could be incidence angle (relative to vertical) or look
+        angle (relative to horizontal, including HyP3 ``lv_theta``). This
+        file is used to convert differential atmospheric phase from
+        vertical to line-of-sight (LOS) direction or convert LOS
+        deformation phase to vertical.
 
         Parameters
         ----------
@@ -597,18 +598,26 @@ class InterferogramDataset(PairDataset):
             region of interest to load. If None, the roi of the dataset will be
             used.
         angle_type : Literal['incidence', 'look'], optional
-            angle type, one of ['incidence', 'look']. 'incidence' means incidence
-            angle (relative to vertical) and 'look' means look angle (relative to
-            horizontal). Default is :attr:`los_angle_type`.
+            Angle type. ``incidence`` is from vertical and uses ``cos(θ)``.
+            ``look`` is from horizontal (HyP3 ``lv_theta``) and uses
+            ``sin(θ)``. Default is :attr:`los_angle_type` (``"look"`` on
+            HyP3 and the interferogram base class).
 
         """
         if self.los_dataset is None:
             return None
         if angle_type is None:
             angle_type = self.los_angle_type
+        if roi is None:
+            roi = self.roi if self.roi is not None else self.los_dataset.roi
 
         sample_theta = self.los_dataset[roi]
-        arr_theta = sample_theta.boxes.data.squeeze((0, 1))
+        arr_theta = np.asarray(sample_theta["data"], dtype=np.float64)
+        arr_theta = np.squeeze(arr_theta)
+        if arr_theta.ndim == 0:
+            arr_theta = arr_theta.reshape(1)
+        elif arr_theta.ndim > 2:
+            arr_theta = arr_theta[0]
         if angle_type == "incidence":
             los_ratio = np.cos(arr_theta)
         elif angle_type == "look":

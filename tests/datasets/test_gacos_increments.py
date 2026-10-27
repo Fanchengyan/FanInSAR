@@ -95,7 +95,7 @@ def test_increments_match_adjacent_ztd_minus_reference(gacos_ds: GACOS) -> None:
 
 
 def test_increments_divide_by_los_ratio(gacos_ds: GACOS) -> None:
-    """LOS conversion divides zenith increments by the incidence cosine."""
+    """LOS conversion divides zenith increments by the direction cosine."""
     dates = ["20210101", "20210113", "20210125"]
     query = Points([(0.5, 0.5), (3.5, 3.5)], crs=CRS.from_epsg(4326))
     ref_points = Points([(0.5, 0.5)], crs=CRS.from_epsg(4326))
