@@ -224,6 +224,19 @@ def burst_geo_quad_lonlat(
     lat = np.asarray(res.latitude_deg, dtype=np.float64)
     lon = np.asarray(res.longitude_deg, dtype=np.float64)
     ok = np.isfinite(lat) & np.isfinite(lon)
+    if dem is not None and not bool(ok.all()):
+        # Stack DEMs are ROI-bounded while the quad corners are full-burst
+        # edges; corners the DEM cannot bracket fall back to the ellipsoid.
+        fallback = run_rdr2geo(
+            geometry,
+            points[~ok, 0],
+            points[~ok, 1],
+            None,
+            device=device,
+        )
+        lat[~ok] = np.asarray(fallback.latitude_deg, dtype=np.float64)
+        lon[~ok] = np.asarray(fallback.longitude_deg, dtype=np.float64)
+        ok = np.isfinite(lat) & np.isfinite(lon)
     if int(ok.sum()) < 3:
         return None
     return np.column_stack([lon[ok], lat[ok]])
