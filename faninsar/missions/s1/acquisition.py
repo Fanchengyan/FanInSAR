@@ -1266,22 +1266,53 @@ def _swath_from_pair_suffix(suffix: str) -> str:
     return prefix.upper() if prefix.startswith("iw") else "IW1"
 
 
+def _lines_per_burst(xml_text: str) -> int | None:
+    """Return the annotation ``linesPerBurst``, or None when absent/invalid."""
+    root = ET.fromstring(xml_text)
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "linesPerBurst":
+            continue
+        try:
+            value = int((element.text or "").strip())
+        except ValueError:
+            return None
+        return value if value > 0 else None
+    return None
+
+
 def _roi_overlaps_geolocation(
     xml_text: str,
     roi: BoundingBox | Points | Polygons,
 ) -> bool:
-    """Return True when the ROI envelope overlaps the geolocation-grid bbox."""
+    """Return True when the ROI envelope overlaps a burst geolocation bbox.
+
+    The whole-strip geolocation bbox over-covers a diagonal Sentinel-1
+    strip, so the envelope is tested against each burst's own bbox,
+    grouped by ``linesPerBurst``; annotations without burst lengths keep
+    the conservative whole-strip bbox.
+    """
     points = _geolocation_points(xml_text)
     if not points:
         return False
-    west = min(point[3] for point in points)
-    east = max(point[3] for point in points)
-    south = min(point[2] for point in points)
-    north = max(point[2] for point in points)
     roi_west, roi_south, roi_east, roi_north = inversion_envelope(roi)
-    return not (
-        roi_east < west or roi_west > east or roi_north < south or roi_south > north
-    )
+    lines_per_burst = _lines_per_burst(xml_text)
+    first_line = min(point[0] for point in points)
+    groups: dict[int, list[tuple[int, int, float, float]]] = {}
+    for point in points:
+        key = (
+            0 if lines_per_burst is None else (point[0] - first_line) // lines_per_burst
+        )
+        groups.setdefault(key, []).append(point)
+    for burst_points in groups.values():
+        west = min(point[3] for point in burst_points)
+        east = max(point[3] for point in burst_points)
+        south = min(point[2] for point in burst_points)
+        north = max(point[2] for point in burst_points)
+        if not (
+            roi_east < west or roi_west > east or roi_north < south or roi_south > north
+        ):
+            return True
+    return False
 
 
 def _require_odata_value_href(href: str, *, role: str) -> None:

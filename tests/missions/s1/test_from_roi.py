@@ -87,7 +87,7 @@ def _parent_xml() -> str:
             f"<line>{k * LINES_PER_BURST + local}</line>"
             f"<pixel>{pixel}</pixel>"
             f"<latitude>{40.0 + k + 0.01 * local:.2f}</latitude>"
-            f"<longitude>{100.0 + k + 0.4 * pixel:.2f}</longitude>"
+            f"<longitude>{100.0 + 0.4 * pixel:.2f}</longitude>"
             "</geolocationGridPoint>"
             for local in (0, LINES_PER_BURST - 1)
             for pixel in (0, SAMPLES_PER_BURST - 1)
