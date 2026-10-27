@@ -51,6 +51,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "S1_ORBITS_ORIGIN": (".s1_orbits", "S1_ORBITS_ORIGIN"),
     "S1OrbitsAdapter": (".s1_orbits", "S1OrbitsAdapter"),
     "ensure_s1_orbits_catalog": (".s1_orbits", "ensure_s1_orbits_catalog"),
+    "CDSE_CATALOG": (".cdse", "CDSE_CATALOG"),
+    "CDSE_COLLECTION": (".cdse", "CDSE_COLLECTION"),
+    "CDSE_STAC_ENDPOINT": (".cdse", "CDSE_STAC_ENDPOINT"),
+    "CDSESearchAdapter": (".cdse", "CDSESearchAdapter"),
+    "ensure_cdse_catalog": (".cdse", "ensure_cdse_catalog"),
+    "register_cdse_catalog": (".cdse", "register_cdse_catalog"),
+    "request_cdse_token": (".cdse", "request_cdse_token"),
 }
 __all__ = list(_LAZY_EXPORTS)
 

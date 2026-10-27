@@ -41,6 +41,8 @@ def test_provider_registration_exports_share_catalog_registry() -> None:
 
     assert providers.register_asf_catalog is remote.register_asf_catalog
     assert providers.register_pc_catalog is remote.register_pc_catalog
+    assert providers.register_cdse_catalog is remote.register_cdse_catalog
+    assert providers.ensure_cdse_catalog is remote.ensure_cdse_catalog
 
 
 def test_optional_provider_construction_does_not_import_sdk() -> None:

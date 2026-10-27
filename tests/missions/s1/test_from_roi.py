@@ -262,6 +262,27 @@ class TestResolutionMatrix:
         assert provider in message
 
 
+def test_odata_annotation_stem_uses_nodes_filename() -> None:
+    """Canvas filenames come from ``Nodes(name.xml)``, not the ``$value`` leaf."""
+    from faninsar.missions.s1.io.export import _annotation_stem
+
+    url = (
+        "https://zipper.dataspace.copernicus.eu/odata/v1/"
+        "Products(078a8ae1-47f1-40ed-87f6-99a3e62ca665)/"
+        "Nodes(S1C_IW_SLC.SAFE)/Nodes(annotation)/"
+        "Nodes(s1c-iw1-slc-vv-20251120t111823-005097-004.xml)/$value"
+    )
+    assert _annotation_stem(url) == "s1c-iw1-slc-vv-20251120t111823-005097-004"
+    assert _annotation_stem("memory://parent-annotation.xml") == "parent-annotation"
+
+
+def test_roi_acquisition_extra_keys_are_classified() -> None:
+    """``from_roi`` records granularity/provider as classified derived extras."""
+    from faninsar.stack.identity import DERIVED_EXTRA_KEYS
+
+    assert {"roi_granularity", "roi_provider"} <= DERIVED_EXTRA_KEYS
+
+
 def test_from_search_is_gone() -> None:
     """``from_search`` is deleted with no deprecation shim."""
     assert not hasattr(S1Stack, "from_search")
@@ -722,6 +743,29 @@ class TestAssembleWindowSamples:
         )
         np.testing.assert_array_equal(assembled, full[:, 1:3])
 
+    def test_merged_gap_span_discards_interior_row_tails(self) -> None:
+        """Floor-merged tight rows include interior gaps that assembly discards."""
+        samples_per_burst = 6
+        col0, n_cols = 1, 2
+        full = np.arange(3 * samples_per_burst, dtype=np.float32).reshape(
+            3, samples_per_burst
+        ) + 1j * np.arange(3 * samples_per_burst, dtype=np.float32).reshape(
+            3, samples_per_burst
+        )
+        # Planner merge of three tight rows is first[col0:] + middle[:] + last[:col1].
+        col1 = col0 + n_cols
+        merged = np.concatenate([full[0, col0:], full[1], full[2, :col1]])
+        bodies = {"row-10-13": _complex_int16_bytes(merged)}
+        assembled = acquisition_mod._assemble_window_samples(
+            bodies,
+            parent_line0=10,
+            n_lines=3,
+            col0=col0,
+            n_cols=n_cols,
+            samples_per_burst=samples_per_burst,
+        )
+        np.testing.assert_array_equal(assembled, full[:, col0:col1])
+
 
 class TestFailClosedMeasurementFetch:
     """C2: compressed/tiled probes raise; they are not swallowed into zeros."""
@@ -756,18 +800,132 @@ class TestFailClosedMeasurementFetch:
                 samples=_DECODE_SAMPLES,
             )
 
+    def test_fetch_measurement_bodies_follows_tiff_header_ifd_pointer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """IFD probes start at the header pointer, not ``file_size - 16 KiB``."""
+        ifd_offset = 200_000
+        blob = _classic_le_strip_tiff(ifd_offset=ifd_offset)
+        file_size = len(blob)
+        eof_guess = max(
+            file_size - acquisition_mod._IFD_PROBE_BYTES,
+            acquisition_mod.HEADER_PROBE_BYTES,
+        )
+        assert eof_guess != ifd_offset
+        requested_ifd: list[int] = []
+
+        async def fake_fetch(spans: Any, *, fetcher: Any = None) -> dict[str, bytes]:
+            del fetcher
+            bodies: dict[str, bytes] = {}
+            for span in spans:
+                if span.label == "tiff-header":
+                    bodies[span.label] = blob[:16]
+                elif span.label.startswith("ifd-"):
+                    requested_ifd.append(span.start)
+                    bodies[span.label] = blob[ifd_offset:]
+                else:
+                    bodies[span.label] = b"\x00" * (span.end - span.start + 1)
+            return bodies
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
+        acquisition_mod._fetch_measurement_bodies(
+            MEASUREMENT_URL,
+            file_size=file_size,
+            line0=0,
+            line1=2,
+            col0=0,
+            col1=2,
+            samples=_DECODE_SAMPLES,
+        )
+        assert requested_ifd
+        assert requested_ifd[0] == ifd_offset
+
+    def test_many_tight_column_spans_are_fetched_as_whole_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A long narrow ROI is fetched as whole-row blocks, not hundreds of spans."""
+        n_rows = 200
+        samples = 21_118
+        row_stride = samples * 4
+        offsets = [1000 + index * row_stride for index in range(n_rows)]
+        counts = [row_stride] * n_rows
+        header = b"II" + struct.pack("<HI", 42, 16)
+        captured_row_spans: list[Any] = []
+
+        async def fake_fetch(spans: Any, *, fetcher: Any = None) -> dict[str, bytes]:
+            del fetcher
+            bodies: dict[str, bytes] = {}
+            for span in spans:
+                if span.label == "tiff-header":
+                    bodies[span.label] = header
+                elif span.label.startswith("row-"):
+                    captured_row_spans.append(span)
+                    bodies[span.label] = b"\x00" * (span.end - span.start + 1)
+                else:
+                    bodies[span.label] = b"\x00"
+            return bodies
+
+        def fake_tables(
+            _bodies: Any, *, samples: int
+        ) -> tuple[list[int], list[int], int]:
+            del samples
+            return list(offsets), list(counts), 1
+
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
+        monkeypatch.setattr(acquisition_mod, "_strip_tables_from_probes", fake_tables)
+        acquisition_mod._fetch_measurement_bodies(
+            MEASUREMENT_URL,
+            file_size=offsets[-1] + row_stride,
+            line0=0,
+            line1=n_rows,
+            col0=100,
+            col1=2000,
+            samples=samples,
+        )
+        assert captured_row_spans
+        assert len(captured_row_spans) < 32
+        for span in captured_row_spans:
+            assert (span.end - span.start + 1) % row_stride == 0
+
 
 class TestCdseCatalogAndODataBind:
-    """C3/I2: missing adapter fails fast; non-OData measurement hrefs are rejected."""
+    """C3/I2: CDSE auto-registers; non-OData measurement hrefs are rejected."""
 
-    def test_discover_fails_fast_when_cdse_adapter_is_missing(self) -> None:
-        """``sentinel1-cdse`` with no registered adapter is an explanatory error."""
-        with pytest.raises(RemoteAccessError, match="CDSE STAC adapter") as raised:
-            acquisition_mod.discover_cdse_slc_items(ROI)
-        message = str(raised.value)
-        assert "not registered" in message
-        assert "sentinel1-cdse" in message
-        assert raised.value.reason == "unknown_catalog"
+    def test_discover_auto_registers_catalog_and_binds_odata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``from_roi`` discovery registers ``sentinel1-cdse`` and binds OData hrefs."""
+        registered: list[str] = []
+
+        def fake_ensure(name: str | None = None) -> str:
+            del name
+            registered.append("sentinel1-cdse")
+            return "sentinel1-cdse"
+
+        item = _cdse_item(
+            _cdse_asset(
+                "annotation",
+                ANNOTATION_URL,
+                media_type="application/xml",
+                size_bytes=845_602,
+            ),
+            _cdse_asset(
+                "measurement",
+                MEASUREMENT_URL,
+                media_type="image/tiff",
+                size_bytes=1_135_276_112,
+                properties={"file:size": 1_135_276_112, "swath": "IW1"},
+            ),
+        )
+        monkeypatch.setattr(
+            "faninsar.remote.providers.cdse.ensure_cdse_catalog",
+            fake_ensure,
+        )
+        monkeypatch.setattr(remote, "search", lambda *_args, **_kwargs: [item])
+        items = acquisition_mod.discover_cdse_slc_items(ROI)
+        assert registered == ["sentinel1-cdse"]
+        assert items[0]["measurement_url"] == MEASUREMENT_URL
+        assert items[0]["measurement_size"] == 1_135_276_112
 
     def test_bind_rejects_s3_eodata_measurement_href(self) -> None:
         """S3 ``eodata`` measurement URLs are not OData range URLs."""
@@ -799,11 +957,55 @@ class TestCdseCatalogAndODataBind:
                 properties={"file:size": 16_000, "swath": "IW1"},
             ),
         )
-        binding = acquisition_mod._bind_cdse_item(item)
-        assert binding is not None
+        bindings = acquisition_mod._bind_cdse_item(item)
+        assert len(bindings) == 1
+        binding = bindings[0]
         assert binding["measurement_url"] == MEASUREMENT_URL
         assert binding["annotation_url"] == ANNOTATION_URL
         assert binding["measurement_size"] == 16_000
+
+    def test_bind_emits_one_row_per_swath_pair(self) -> None:
+        """Each measurement/annotation OData pair becomes its own canvas binding."""
+        iw2_measurement, iw2_annotation = (
+            MEASUREMENT_URL.replace("measurement.tiff", "iw2-vv.tiff"),
+            ANNOTATION_URL.replace("annotation.xml", "iw2-vv.xml"),
+        )
+        item = _cdse_item(
+            _cdse_asset(
+                "measurement-iw1-vv",
+                MEASUREMENT_URL,
+                media_type="image/tiff",
+                size_bytes=16_000,
+                properties={"file:size": 16_000, "swath": "IW1", "polarization": "VV"},
+            ),
+            _cdse_asset(
+                "annotation-iw1-vv",
+                ANNOTATION_URL,
+                media_type="application/xml",
+                size_bytes=2048,
+            ),
+            _cdse_asset(
+                "measurement-iw2-vv",
+                iw2_measurement,
+                media_type="image/tiff",
+                size_bytes=17_000,
+                properties={"file:size": 17_000, "swath": "IW2", "polarization": "VV"},
+            ),
+            _cdse_asset(
+                "annotation-iw2-vv",
+                iw2_annotation,
+                media_type="application/xml",
+                size_bytes=2048,
+            ),
+        )
+        bindings = acquisition_mod._bind_cdse_item(item)
+        assert {(row["swath"], row["polarization"]) for row in bindings} == {
+            ("IW1", "VV"),
+            ("IW2", "VV"),
+        }
+        by_swath = {row["swath"]: row for row in bindings}
+        assert by_swath["IW2"]["measurement_url"] == iw2_measurement
+        assert by_swath["IW2"]["measurement_size"] == 17_000
 
 
 class TestOverlapSpliceFromFetchedWindows:
@@ -898,6 +1100,22 @@ class TestOverlapSpliceFromFetchedWindows:
         assert np.any(bottom)
 
 
+def _sparse_burst_geolocation_xml() -> str:
+    """Return a one-line-per-burst geolocation grid like a CDSE IW annotation."""
+    lines = (0, 1493, 2986)
+    pixels = (0, 10_000, 20_000)
+    body = "".join(
+        "<geolocationGridPoint>"
+        f"<line>{line}</line><pixel>{pixel}</pixel>"
+        f"<latitude>{40.0 + 0.001 * line:.6f}</latitude>"
+        f"<longitude>{100.0 + 0.00005 * pixel:.6f}</longitude>"
+        "</geolocationGridPoint>"
+        for line in lines
+        for pixel in pixels
+    )
+    return f"<product><geolocationGrid>{body}</geolocationGrid></product>"
+
+
 def _dense_geolocation_xml() -> str:
     """Return a ~2 km geolocation grid around lon 100, lat 40."""
     points = [
@@ -964,6 +1182,17 @@ class TestRoiWgs84AndPointEnvelope:
         )
         assert line1 - line0 > 1
         assert col1 - col0 > 1
+
+    def test_sparse_burst_grid_interior_roi_covers_more_than_one_line(self) -> None:
+        """A one-line-per-burst grid does not collapse a small interior ROI to 1 row."""
+        roi = BoundingBox(100.4, 40.4, 100.6, 40.6, crs="EPSG:4326")
+        line0, line1, col0, col1 = acquisition_mod.invert_geolocation_grid(
+            _sparse_burst_geolocation_xml(),
+            roi,
+        )
+        assert line1 - line0 > 1
+        assert col1 - col0 > 1
+        assert line1 > 1
 
     def test_normalize_keeps_points_type(self) -> None:
         """Catalog search still sees a point, not a bounding box."""

@@ -163,6 +163,16 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "faninsar.remote.providers.planetary_computer",
         "register_planetary_computer",
     ),
+    "CDSE_CATALOG": ("faninsar.remote.providers.cdse", "CDSE_CATALOG"),
+    "CDSE_COLLECTION": ("faninsar.remote.providers.cdse", "CDSE_COLLECTION"),
+    "CDSE_STAC_ENDPOINT": ("faninsar.remote.providers.cdse", "CDSE_STAC_ENDPOINT"),
+    "CDSESearchAdapter": ("faninsar.remote.providers.cdse", "CDSESearchAdapter"),
+    "ensure_cdse_catalog": ("faninsar.remote.providers.cdse", "ensure_cdse_catalog"),
+    "register_cdse_catalog": (
+        "faninsar.remote.providers.cdse",
+        "register_cdse_catalog",
+    ),
+    "request_cdse_token": ("faninsar.remote.providers.cdse", "request_cdse_token"),
 }
 
 __all__ = [

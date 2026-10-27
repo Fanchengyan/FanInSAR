@@ -17,6 +17,7 @@ convenience on top of :mod:`faninsar.missions.s1.io.extract`.
 from __future__ import annotations
 
 import shutil
+import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -106,10 +107,31 @@ def _write_burst_tiff(
         dst.write(np.ascontiguousarray(samples), 1)
 
 
+def _odata_node_name(path: str) -> str | None:
+    """Return the last OData ``Nodes(...)`` filename, if present."""
+    marker = "Nodes("
+    start = path.rfind(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = path.find(")", start)
+    if end < 0:
+        return None
+    name = path[start:end].strip()
+    return name or None
+
+
 def _annotation_stem(annotation_path: str) -> str:
-    """Return the annotation filename stem (no extension)."""
-    from_path = str(annotation_path).split("/")[-1]
-    return from_path.removesuffix(".xml")
+    """Return the annotation filename stem (no extension).
+
+    CDSE OData ``Nodes(...)/$value`` URLs end in ``$value``; the real
+    annotation filename lives in the last ``Nodes(...)`` segment.
+    """
+    path = urllib.parse.unquote(str(annotation_path))
+    from_path = _odata_node_name(path) or path.rstrip("/").rsplit("/", 1)[-1]
+    if from_path in {"$value", ""}:
+        from_path = "annotation.xml"
+    return Path(from_path).stem
 
 
 def export_swath_bursts(

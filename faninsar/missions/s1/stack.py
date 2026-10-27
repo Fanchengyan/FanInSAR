@@ -496,12 +496,23 @@ class S1Stack(Stack):
         """Materialize CDSE canvases then join through ``from_safes``."""
         selected_polarizations = normalize_polarizations(polarizations)
         root = Path(work_dir)
+        kwargs.pop("collections", None)
+        search_keys = (
+            "filters",
+            "limit",
+            "budget",
+            "flight_direction",
+            "catalog",
+            "auth_profile",
+        )
+        search_kwargs = {key: kwargs.pop(key) for key in search_keys if key in kwargs}
         local_paths = materialize_cdse_roi_safes(
             roi,
             datetime_range=datetime_range,
             polarizations=selected_polarizations,
             work_dir=root,
             granularity=granularity,
+            **search_kwargs,
         )
         extra = dict(kwargs.pop("extra", {}) or {})
         extra.update(
@@ -514,6 +525,7 @@ class S1Stack(Stack):
             kwargs["orbit_paths"] = orbit_paths
         if calibration_paths is not None:
             kwargs["calibration_paths"] = calibration_paths
+        kwargs.setdefault("roi", roi)
         kwargs["extra"] = extra
         stack = cls.from_safes(
             local_paths,

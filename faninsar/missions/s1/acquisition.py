@@ -34,6 +34,8 @@ Contract (PROPOSAL-0061):
 from __future__ import annotations
 
 import asyncio
+import itertools
+import math
 import re
 import struct
 import threading
@@ -580,6 +582,14 @@ _CDSE_CATALOG = "sentinel1-cdse"
 _CDSE_AUTH_PROFILE = "cdse"
 _ANNOTATION_PROBE_BYTES = 2 * 1024 * 1024
 _IFD_PROBE_BYTES = 16 * 1024
+_MAX_IFD_PROBE_BYTES = 512 * 1024
+_MAX_TIGHT_RANGE_REQUESTS = 32
+_CDSE_RANGE_HOSTS = frozenset(
+    {
+        "zipper.dataspace.copernicus.eu",
+        "download.dataspace.copernicus.eu",
+    }
+)
 
 
 def resolve_roi_acquisition(
@@ -704,26 +714,30 @@ def discover_cdse_slc_items(
     datetime_range : tuple, optional
         Inclusive acquisition time range.
     polarizations : sequence of str or ``"all"``, optional
-        Local channels used only for logging; CDSE filtering stays in
-        ``kwargs["filters"]``.
+        Local channels kept as measurement bindings.  Default ``("VV",)``
+        retains every IW swath in VV; ``"all"`` keeps every OData pair.
     **kwargs : Any
         Advanced search options forwarded to :func:`faninsar.remote.search`
-        (``limit``, ``budget``, ``filters``, ``collections``).  ``catalog``
-        and ``auth_profile`` default to the internal CDSE binding.
+        (``limit``, ``budget``, ``filters``).  ``catalog`` and
+        ``auth_profile`` default to the internal CDSE binding.
 
     Returns
     -------
     list of dict
-        One binding per product with ``product_id``, ``annotation_url``,
-        ``measurement_url``, ``measurement_size``, ``polarization``, and
-        ``swath``.
+        One binding per measurement with ``product_id``, ``annotation_url``,
+        ``measurement_url``, ``measurement_size``, ``annotation_size``,
+        ``polarization``, and ``swath``.
 
     """
-    del polarizations
     from faninsar import remote
 
     catalog = str(kwargs.pop("catalog", _CDSE_CATALOG))
     auth_profile = str(kwargs.pop("auth_profile", _CDSE_AUTH_PROFILE))
+    kwargs.pop("collections", None)
+    if catalog == _CDSE_CATALOG:
+        from faninsar.remote.providers.cdse import ensure_cdse_catalog
+
+        ensure_cdse_catalog()
     try:
         items = remote.search(
             roi,
@@ -736,14 +750,28 @@ def discover_cdse_slc_items(
         if exc.reason == "unknown_catalog":
             message = (
                 f"CDSE STAC adapter is required and not registered for catalog "
-                f"{catalog!r}; cannot discover Sentinel-1 CDSE products"
+                f"{catalog!r}; cannot discover Sentinel-1 CDSE products. "
+                'Use granularity="burst", provider="asf" for ASF burst products.'
             )
             logger.exception(message)
             reason = "unknown_catalog"
             raise RemoteAccessError(reason, message) from exc
         raise
-    bindings = [_bind_cdse_item(item) for item in items]
-    return [binding for binding in bindings if binding is not None]
+    requested = (
+        None
+        if polarizations == "all"
+        else {str(value).upper() for value in polarizations}
+    )
+    bindings: list[dict[str, Any]] = []
+    for item in items:
+        bindings.extend(_bind_cdse_item(item))
+    if requested is None:
+        return bindings
+    return [
+        binding
+        for binding in bindings
+        if str(binding.get("polarization", "")).upper() in requested
+    ]
 
 
 def windows_from_cdse_fetch(
@@ -1001,14 +1029,17 @@ def invert_geolocation_grid(
         (right, bottom),
         (right, top),
     )
-    lines: list[int] = []
-    pixels: list[int] = []
+    grid = _GeolocationGrid.from_points(points)
+    lines: list[float] = []
+    pixels: list[float] = []
     for lon, lat in corners:
-        nearest = min(points, key=lambda p: (p[2] - lat) ** 2 + (p[3] - lon) ** 2)
-        lines.append(int(nearest[0]))
-        pixels.append(int(nearest[1]))
-    line0, line1 = min(lines), max(lines) + 1
-    col0, col1 = min(pixels), max(pixels) + 1
+        line, pixel = grid.invert(lat, lon)
+        lines.append(line)
+        pixels.append(pixel)
+    line0 = math.floor(min(lines))
+    line1 = math.ceil(max(lines)) + 1
+    col0 = math.floor(min(pixels))
+    col1 = math.ceil(max(pixels)) + 1
     if line1 <= line0:
         line1 = line0 + 1
     if col1 <= col0:
@@ -1069,18 +1100,32 @@ def materialize_cdse_roi_safes(
     paths: list[Path] = []
     for item in items:
         xml_text = _fetch_annotation_xml(item)
+        if not _roi_overlaps_geolocation(xml_text, roi):
+            logger.warning(
+                "Skipping CDSE measurement %s %s %s: "
+                "ROI is outside the geolocation envelope",
+                item.get("product_id", "?"),
+                item.get("swath", "?"),
+                item.get("polarization", "?"),
+            )
+            continue
         swath, windows, xml_text = windows_from_cdse_fetch(
             item,
             roi,
             xml_text=xml_text,
             granularity=granularity,
         )
+        if not windows:
+            continue
+        product_id = str(item.get("product_id", "S1_ROI"))
+        swath_name = str(item.get("swath", "IW1"))
+        polarization = str(item.get("polarization", "VV"))
         canvas = write_roi_safe_canvas(
             swath,
             windows,
             out_dir,
             annotation_xml=xml_text,
-            product_id=str(item.get("product_id", "S1_ROI")),
+            product_id=f"{product_id}-{swath_name}-{polarization}",
         )
         by_index = {int(window.burst_index): window for window in windows}
         for overlap in overlap_windows_for_canvas(swath, windows, canvas):
@@ -1106,6 +1151,10 @@ def materialize_cdse_roi_safes(
             splice_overlap_into_canvas(canvas, overlap, role="top", samples=top)
             splice_overlap_into_canvas(canvas, overlap, role="bottom", samples=bottom)
         paths.append(canvas.safe_root)
+    if not paths:
+        message = "Sentinel-1 CDSE search returned no products intersecting the ROI"
+        logger.error(message)
+        raise ValueError(message)
     return paths
 
 
@@ -1114,53 +1163,122 @@ def _fetch_annotation_xml(item: Mapping[str, Any]) -> str:
     url = str(item.get("annotation_url", ""))
     size = int(item.get("annotation_size") or _ANNOTATION_PROBE_BYTES)
     span = RangeSpan(url, 0, max(size - 1, 0), "annotation")
-    bodies = run_sync(fetch_ranges_async((span,)))
+    bodies = _fetch_cdse_ranges((span,))
     return bodies["annotation"].decode("utf-8")
 
 
-def _bind_cdse_item(item: Any) -> dict[str, Any] | None:
+def _bind_cdse_item(item: Any) -> list[dict[str, Any]]:
     """Bind one catalog item to OData annotation and measurement node URLs."""
     assets = getattr(item, "assets", {}) or {}
-    annotation = None
-    measurement = None
+    measurements: dict[str, Any] = {}
+    annotations: dict[str, Any] = {}
+    fallback_annotation = None
+    fallback_measurement = None
     for asset in assets.values():
         href = str(getattr(asset, "href", ""))
         key = str(getattr(asset, "key", "")).casefold()
         media = str(getattr(asset, "media_type", "") or "").casefold()
-        if annotation is None and (
+        is_annotation = (
             "annotation" in key or href.casefold().endswith(".xml") or "xml" in media
-        ):
-            annotation = asset
-        if measurement is None and (
+        )
+        is_measurement = (
             "measurement" in key
             or href.casefold().endswith((".tif", ".tiff"))
             or "tiff" in media
-        ):
-            measurement = asset
-    if annotation is None or measurement is None:
+        )
+        if is_annotation:
+            suffix = _asset_pair_suffix(key, "annotation")
+            if suffix:
+                annotations[suffix] = asset
+            elif fallback_annotation is None:
+                fallback_annotation = asset
+        if is_measurement:
+            suffix = _asset_pair_suffix(key, "measurement")
+            if suffix:
+                measurements[suffix] = asset
+            elif fallback_measurement is None:
+                fallback_measurement = asset
+    suffixes = sorted(set(measurements) & set(annotations))
+    if (
+        not suffixes
+        and fallback_annotation is not None
+        and fallback_measurement is not None
+    ):
+        suffixes = [""]
+        annotations[""] = fallback_annotation
+        measurements[""] = fallback_measurement
+    if not suffixes:
         logger.warning(
             "CDSE item %s is missing annotation or measurement OData node",
             getattr(item, "item_id", "?"),
         )
-        return None
-    annotation_url = str(annotation.href)
-    measurement_url = str(measurement.href)
-    _require_odata_value_href(annotation_url, role="annotation")
-    _require_odata_value_href(measurement_url, role="measurement")
-    properties = dict(getattr(measurement, "properties", {}) or {})
-    size = getattr(measurement, "size_bytes", None) or properties.get("file:size")
-    return {
-        "product_id": str(getattr(item, "item_id", "S1_ROI")),
-        "annotation_url": annotation_url,
-        "measurement_url": measurement_url,
-        "measurement_size": int(size or 0),
-        "polarization": str(
-            getattr(item, "raw_metadata", {}).get("polarization", "VV")
-            if hasattr(item, "raw_metadata")
-            else "VV"
-        ),
-        "swath": str(properties.get("swath", "IW1")),
-    }
+        return []
+    metadata = (
+        getattr(item, "raw_metadata", {}) if hasattr(item, "raw_metadata") else {}
+    )
+    bindings: list[dict[str, Any]] = []
+    for suffix in suffixes:
+        annotation = annotations[suffix]
+        measurement = measurements[suffix]
+        annotation_url = str(annotation.href)
+        measurement_url = str(measurement.href)
+        _require_odata_value_href(annotation_url, role="annotation")
+        _require_odata_value_href(measurement_url, role="measurement")
+        properties = dict(getattr(measurement, "properties", {}) or {})
+        size = getattr(measurement, "size_bytes", None) or properties.get("file:size")
+        annotation_properties = dict(getattr(annotation, "properties", {}) or {})
+        annotation_size = getattr(annotation, "size_bytes", None) or (
+            annotation_properties.get("file:size")
+        )
+        fallback_pol = (
+            suffix.rsplit("-", 1)[-1] if suffix else metadata.get("polarization", "VV")
+        )
+        polarization = str(properties.get("polarization") or fallback_pol).upper()
+        swath = str(properties.get("swath") or _swath_from_pair_suffix(suffix))
+        bindings.append(
+            {
+                "product_id": str(getattr(item, "item_id", "S1_ROI")),
+                "annotation_url": annotation_url,
+                "measurement_url": measurement_url,
+                "measurement_size": int(size or 0),
+                "annotation_size": int(annotation_size or 0),
+                "polarization": polarization,
+                "swath": swath,
+            }
+        )
+    return bindings
+
+
+def _asset_pair_suffix(key: str, role: str) -> str:
+    """Return the swath-pol suffix of ``measurement-iw1-vv`` / ``annotation-iw1-vv``."""
+    prefix = f"{role}-"
+    if key.startswith(prefix):
+        return key[len(prefix) :]
+    return ""
+
+
+def _swath_from_pair_suffix(suffix: str) -> str:
+    """Return ``IW1`` from a pair suffix such as ``iw1-vv``."""
+    prefix = suffix.split("-", 1)[0]
+    return prefix.upper() if prefix.startswith("iw") else "IW1"
+
+
+def _roi_overlaps_geolocation(
+    xml_text: str,
+    roi: BoundingBox | Points | Polygons,
+) -> bool:
+    """Return True when the ROI envelope overlaps the geolocation-grid bbox."""
+    points = _geolocation_points(xml_text)
+    if not points:
+        return False
+    west = min(point[3] for point in points)
+    east = max(point[3] for point in points)
+    south = min(point[2] for point in points)
+    north = max(point[2] for point in points)
+    roi_west, roi_south, roi_east, roi_north = inversion_envelope(roi)
+    return not (
+        roi_east < west or roi_west > east or roi_north < south or roi_south > north
+    )
 
 
 def _require_odata_value_href(href: str, *, role: str) -> None:
@@ -1207,6 +1325,95 @@ def _geolocation_points(xml_text: str) -> list[tuple[int, int, float, float]]:
             )
         )
     return points
+
+
+class _GeolocationGrid:
+    """Bilinear geolocation grid used to invert a WGS84 ROI to radar lines."""
+
+    def __init__(
+        self,
+        lines: Sequence[float],
+        pixels: Sequence[float],
+        table: Mapping[tuple[float, float], tuple[float, float]],
+    ) -> None:
+        self.lines = list(lines)
+        self.pixels = list(pixels)
+        self.table = dict(table)
+
+    @classmethod
+    def from_points(
+        cls, points: Sequence[tuple[int, int, float, float]]
+    ) -> _GeolocationGrid:
+        """Build a regular (line, pixel) table from annotation grid points."""
+        table: dict[tuple[float, float], tuple[float, float]] = {}
+        lines: set[float] = set()
+        pixels: set[float] = set()
+        for line, pixel, lat, lon in points:
+            key = (float(line), float(pixel))
+            table[key] = (float(lat), float(lon))
+            lines.add(float(line))
+            pixels.add(float(pixel))
+        return cls(sorted(lines), sorted(pixels), table)
+
+    def _bilinear(self, line: float, pixel: float) -> tuple[float, float]:
+        """Interpolate (lat, lon) at one radar coordinate."""
+        lines, pixels, table = self.lines, self.pixels, self.table
+        line0 = max((value for value in lines if value <= line), default=lines[0])
+        line1 = min((value for value in lines if value >= line), default=lines[-1])
+        pixel0 = max((value for value in pixels if value <= pixel), default=pixels[0])
+        pixel1 = min((value for value in pixels if value >= pixel), default=pixels[-1])
+        t_line = (line - line0) / (line1 - line0) if line1 > line0 else 0.0
+        t_pixel = (pixel - pixel0) / (pixel1 - pixel0) if pixel1 > pixel0 else 0.0
+        a = table[(line0, pixel0)]
+        b = table[(line0, pixel1)]
+        c = table[(line1, pixel0)]
+        d = table[(line1, pixel1)]
+        lat = (a[0] * (1.0 - t_pixel) + b[0] * t_pixel) * (1.0 - t_line) + (
+            c[0] * (1.0 - t_pixel) + d[0] * t_pixel
+        ) * t_line
+        lon = (a[1] * (1.0 - t_pixel) + b[1] * t_pixel) * (1.0 - t_line) + (
+            c[1] * (1.0 - t_pixel) + d[1] * t_pixel
+        ) * t_line
+        return lat, lon
+
+    def invert(self, lat: float, lon: float) -> tuple[float, float]:
+        """Coarse-to-fine search from (lat, lon) to (line, pixel)."""
+        lines, pixels = self.lines, self.pixels
+        line_pts = [
+            lines[0],
+            *[(a + b) / 2.0 for a, b in itertools.pairwise(lines)],
+            lines[-1],
+        ]
+        pixel_pts = [
+            pixels[0],
+            *[(a + b) / 2.0 for a, b in itertools.pairwise(pixels)],
+            pixels[-1],
+        ]
+        best: tuple[float, float, float] | None = None
+        for line in line_pts:
+            for pixel in pixel_pts:
+                sample_lat, sample_lon = self._bilinear(line, pixel)
+                distance = (sample_lat - lat) ** 2 + ((sample_lon - lon) * 0.7) ** 2
+                if best is None or distance < best[0]:
+                    best = (distance, line, pixel)
+        if best is None:
+            reject_product("geolocation grid inversion found no candidate")
+        _, line, pixel = best
+        for _step in range(8):
+            step_line = max(1.0, (lines[-1] - lines[0]) / 200.0)
+            step_pixel = max(1.0, (pixels[-1] - pixels[0]) / 300.0)
+            candidate = best
+            for delta_line in (-step_line, 0.0, step_line):
+                for delta_pixel in (-step_pixel, 0.0, step_pixel):
+                    trial_line = min(max(line + delta_line, lines[0]), lines[-1])
+                    trial_pixel = min(max(pixel + delta_pixel, pixels[0]), pixels[-1])
+                    sample_lat, sample_lon = self._bilinear(trial_line, trial_pixel)
+                    distance = (sample_lat - lat) ** 2 + ((sample_lon - lon) * 0.7) ** 2
+                    if distance < candidate[0]:
+                        candidate = (distance, trial_line, trial_pixel)
+            best = candidate
+            _, line, pixel = best
+        return line, pixel
 
 
 def _full_intersecting_burst_lines(
@@ -1292,13 +1499,22 @@ def _fetch_measurement_bodies(
     """Fetch IFD probes then bounded measurement spans for one ROI window."""
     if not url:
         reject_product("CDSE measurement fetch requires a non-empty object URL")
-    ifd_offset = max(file_size - _IFD_PROBE_BYTES, HEADER_PROBE_BYTES)
+    header_probe = (RangeSpan(url, 0, HEADER_PROBE_BYTES - 1, "tiff-header"),)
+    header_bodies = _fetch_cdse_ranges(header_probe)
+    ifd_offset, _endian, _bigtiff = _parse_tiff_header(header_bodies["tiff-header"])
+    if file_size > ifd_offset:
+        ifd_length = min(file_size - ifd_offset, _MAX_IFD_PROBE_BYTES)
+    else:
+        ifd_length = _IFD_PROBE_BYTES
     probes = plan_ifd_probe_spans(
         url,
         ifd_offset=ifd_offset,
-        ifd_length=_IFD_PROBE_BYTES,
+        ifd_length=max(ifd_length, _IFD_PROBE_BYTES),
     )
-    probe_bodies = run_sync(fetch_ranges_async(probes))
+    remaining = tuple(span for span in probes if span.label != "tiff-header")
+    probe_bodies = dict(header_bodies)
+    if remaining:
+        probe_bodies.update(_fetch_cdse_ranges(remaining))
     offsets, counts, rows_per_strip = _strip_tables_from_probes(
         probe_bodies, samples=samples
     )
@@ -1314,7 +1530,44 @@ def _fetch_measurement_bodies(
         col0=col0,
         col1=col1,
     )
-    return run_sync(fetch_ranges_async(spans))
+    if len(spans) > _MAX_TIGHT_RANGE_REQUESTS:
+        spans = plan_measurement_spans(
+            url=url,
+            strip_offsets=offsets,
+            strip_byte_counts=counts,
+            rows_per_strip=rows_per_strip,
+            samples=samples,
+            bytes_per_sample=_BYTES_PER_COMPLEX_INT16,
+            line0=line0,
+            line1=line1,
+            col0=0,
+            col1=samples,
+        )
+    return _fetch_cdse_ranges(spans)
+
+
+def _cdse_range_host(url: str) -> bool:
+    """Return True when ``url`` is a CDSE OData range origin that needs Bearer."""
+    host = (urllib.parse.urlsplit(url).hostname or "").casefold()
+    return host in _CDSE_RANGE_HOSTS
+
+
+def _fetch_cdse_ranges(spans: Sequence[RangeSpan]) -> dict[str, bytes]:
+    """Dispatch already-sized spans to remote fetch; CDSE OData uses Bearer.
+
+    Tests and fixture URLs keep the unauthenticated ``fetch_ranges_async``
+    path so existing patches still observe probe and measurement requests.
+    Live zipper/download OData nodes go through
+    :func:`faninsar.remote.providers.cdse.fetch_cdse_ranges`.
+    """
+    span_tuple = tuple(spans)
+    if not span_tuple:
+        return {}
+    if not _cdse_range_host(span_tuple[0].url):
+        return run_sync(fetch_ranges_async(span_tuple))
+    from faninsar.remote.providers.cdse import fetch_cdse_ranges
+
+    return run_sync(fetch_cdse_ranges(span_tuple))
 
 
 def _strip_tables_from_probes(
@@ -1677,17 +1930,55 @@ def _bytes_to_complex_span(
         reject_product("row span assembly requires a positive rectangle")
     expected_full = n_span_lines * samples_per_burst * _BYTES_PER_COMPLEX_INT16
     expected_slice = n_span_lines * n_cols * _BYTES_PER_COMPLEX_INT16
+    row_stride = samples_per_burst * _BYTES_PER_COMPLEX_INT16
+    merged_gap = (n_span_lines - 1) * row_stride + n_cols * _BYTES_PER_COMPLEX_INT16
     if len(raw) == expected_slice:
         pairs = np.frombuffer(raw, dtype="<i2").reshape(n_span_lines, n_cols, 2)
     elif len(raw) == expected_full:
         pairs = np.frombuffer(raw, dtype="<i2").reshape(
             n_span_lines, samples_per_burst, 2
         )[:, col0 : col0 + n_cols]
+    elif n_span_lines > 1 and len(raw) == merged_gap:
+        pairs = _pairs_from_merged_gap_span(
+            raw,
+            n_span_lines=n_span_lines,
+            samples_per_burst=samples_per_burst,
+            col0=col0,
+            n_cols=n_cols,
+        )
     else:
         reject_product(
             f"row span is {len(raw)} bytes, expected {expected_slice} "
-            f"(tight columns) or {expected_full} (whole rows)"
+            f"(tight columns), {merged_gap} (merged interior gaps), "
+            f"or {expected_full} (whole rows)"
         )
     real = pairs[..., 0].astype(np.float32)
     imag = pairs[..., 1].astype(np.float32)
     return (real + 1j * imag).astype(np.complex64)
+
+
+def _pairs_from_merged_gap_span(
+    raw: bytes,
+    *,
+    n_span_lines: int,
+    samples_per_burst: int,
+    col0: int,
+    n_cols: int,
+) -> np.ndarray:
+    """Slice floor-merged tight rows that include interior unused samples."""
+    values = np.frombuffer(raw, dtype="<i2")
+    pairs = np.empty((n_span_lines, n_cols, 2), dtype="<i2")
+    col1 = col0 + n_cols
+    cursor = 0
+    first = samples_per_burst - col0
+    pairs[0] = values[cursor : cursor + first * 2].reshape(first, 2)[:n_cols]
+    cursor += first * 2
+    for row in range(1, n_span_lines - 1):
+        full = values[cursor : cursor + samples_per_burst * 2].reshape(
+            samples_per_burst, 2
+        )
+        pairs[row] = full[col0:col1]
+        cursor += samples_per_burst * 2
+    last = values[cursor : cursor + col1 * 2].reshape(col1, 2)
+    pairs[-1] = last[col0:col1]
+    return pairs

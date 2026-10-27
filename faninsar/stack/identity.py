@@ -105,6 +105,8 @@ DERIVED_EXTRA_KEYS = frozenset(
         "search_product_type",
         "search_polarizations",
         "search_items",
+        "roi_granularity",
+        "roi_provider",
     }
 )
 
