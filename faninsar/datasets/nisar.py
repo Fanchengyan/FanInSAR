@@ -45,7 +45,6 @@ import xarray as xr
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 
-from faninsar._core.geo import geo_tools
 from faninsar._core.sar.baseline import Baselines
 from faninsar._core.sar.pairs import Pairs
 from faninsar.datasets.base import PairDataset
@@ -752,9 +751,13 @@ class NISAR(NisarH5Mixin, HierarchicalInterferogramDataset):
             data_vars["iono"] = iono_da
 
         ds = xr.Dataset(data_vars)
-        return geo_tools.write_geoinfo_into_ds(
-            ds, list(data_vars), crs=self.crs, x_dim="x", y_dim="y"
-        )
+        for name in data_vars:
+            ds[name] = ds[name].fis.set_spatial_ref(
+                crs=self.crs,
+                x_dim="x",
+                y_dim="y",
+            )
+        return ds
 
     def parse_baselines(self, pairs: Pairs | None = None) -> Baselines:
         """Parse the temporal baseline of pairs from the acquisition dates.
