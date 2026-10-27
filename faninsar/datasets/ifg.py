@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from pyproj.crs import CRS
 
     from faninsar._core.sar import Baselines, PhaseDeformationConverter
+    from faninsar.datasets.gacos import GACOS
 
 logger = setup_logger(__name__)
 
@@ -129,8 +130,12 @@ class InterferogramDataset(PairDataset):
     pattern_unw = "*"
     #: pattern used to find coherence files.
     pattern_coh = "*"
+    #: pattern used to find line-of-sight angle files. ``None`` skips auto-attach.
+    pattern_los: str | None = None
     #: value range of coherence.
     coh_range: tuple[float, float] = (0, 1)
+    #: default angle type for :meth:`load_los_ratio`.
+    los_angle_type: Literal["incidence", "look"] = "look"
 
     #: class used to create the coherence dataset. Subclasses can override
     #: this to inject a specialized coherence dataset (e.g. with custom file
@@ -141,6 +146,8 @@ class InterferogramDataset(PairDataset):
     _ds_dem: RasterDataset | None = None
     _ds_mask: RasterDataset | None = None
     _ds_aps: RasterDataset | None = None
+    _ds_los: RasterDataset | None = None
+    _ds_gacos: GACOS | None = None
 
     def __init__(
         self,
@@ -309,6 +316,9 @@ class InterferogramDataset(PairDataset):
         self._assign_pairs_from_paths()
 
         self._ds_coh._assign_pairs_from_paths()
+        self._ds_los = None
+        self._ds_gacos = None
+        self._attach_los_dataset()
 
     def _deduplicate_pairs(
         self, paths: np.ndarray, dataset_name: str
@@ -347,14 +357,18 @@ class InterferogramDataset(PairDataset):
         names = [Path(f).name for f in paths]
         pair_names = []
         for name in names:
-            match = re.search(r"_(\d{8})_(\d{8})_", name)
+            match = re.search(
+                r"_(\d{8})(?:T\d{6})?_(\d{8})(?:T\d{6})?_",
+                name,
+            )
             if match:
                 pair_name = f"{match.group(1)}_{match.group(2)}"
                 pair_names.append(pair_name)
             else:
                 msg = (
-                    f"Filename {name} does not contain *_YYYYMMDD_YYYYMMDD_* pattern."
-                    " Unable to parse pair name."
+                    f"Filename {name} does not contain "
+                    "*_YYYYMMDD[_THHMMSS]_YYYYMMDD[_THHMMSS]_* pattern. "
+                    "Unable to parse pair name."
                 )
                 logger.error(msg)
                 raise ValueError(msg)
@@ -377,6 +391,16 @@ class InterferogramDataset(PairDataset):
     def los_dataset(self) -> RasterDataset | None:
         """Return the theta dataset. If None, no theta data is used."""
         return self._ds_los
+
+    @property
+    def gacos_dataset(self) -> GACOS | None:
+        """Return the attached GACOS dataset. If None, no GACOS data is used."""
+        return self._ds_gacos
+
+    @property
+    def gacos(self) -> GACOS | None:
+        """Return the attached GACOS dataset. If None, no GACOS data is used."""
+        return self._ds_gacos
 
     @property
     def dem_dataset(self) -> RasterDataset | None:
@@ -455,6 +479,35 @@ class InterferogramDataset(PairDataset):
         kwargs.setdefault("ds_name", "ApsPairs")
         self._ds_aps = self._ensure_ds(aps_dataset, "aps_dataset", ApsPairs, **kwargs)
 
+    def set_gacos_dataset(
+        self,
+        gacos_dataset: GACOS | None = None,
+        **kwargs: dict,
+    ) -> None:
+        """Attach a GACOS dataset, inheriting crs, res, and roi from this dataset.
+
+        Parameters
+        ----------
+        gacos_dataset : GACOS, optional
+            An existing GACOS dataset. If None, a new GACOS object is created
+            from ``kwargs``.
+        **kwargs : dict, optional
+            Keyword arguments used to create a new GACOS object if
+            ``gacos_dataset`` is None. ``crs``, ``res``, and ``roi`` default
+            to this interferogram dataset.
+
+        """
+        from faninsar.datasets.gacos import GACOS
+
+        kwargs.setdefault("ds_name", "GACOS")
+        kwargs.setdefault("nodata", np.nan)
+        self._ds_gacos = self._ensure_ds(
+            gacos_dataset,
+            "gacos_dataset",
+            GACOS,
+            **kwargs,
+        )
+
     def set_los_dataset(
         self,
         los_dataset: RasterDataset | None = None,
@@ -478,6 +531,26 @@ class InterferogramDataset(PairDataset):
         """
         kwargs.setdefault("ds_name", "LOS")
         self._ds_los = self._ensure_ds(los_dataset, "los_dataset", **kwargs)
+
+    def _attach_los_dataset(self) -> None:
+        """Attach LOS files found under ``root_dir`` when ``pattern_los`` is set."""
+        if not self.pattern_los:
+            return
+        suffix = self.pattern_los.lstrip("*")
+        paths = sorted(
+            path
+            for path in Path(self.root_dir).rglob(f"*{suffix}")
+            if path.is_file() and path.name.endswith(suffix)
+        )
+        if not paths:
+            logger.warning(
+                "No LOS files matching %s found under %s; "
+                "los_dataset was not attached.",
+                self.pattern_los,
+                self.root_dir,
+            )
+            return
+        self.set_los_dataset(root_dir=self.root_dir, paths=paths, verbose=self.verbose)
 
     def set_dem_dataset(
         self,
@@ -510,7 +583,7 @@ class InterferogramDataset(PairDataset):
     def load_los_ratio(
         self,
         roi: BoundingBox | None = None,
-        angle_type: Literal["incidence", "look"] = "look",
+        angle_type: Literal["incidence", "look"] | None = None,
     ) -> np.ndarray:
         """Load and convert los angle map to ratio map for given region of interest.
 
@@ -526,11 +599,13 @@ class InterferogramDataset(PairDataset):
         angle_type : Literal['incidence', 'look'], optional
             angle type, one of ['incidence', 'look']. 'incidence' means incidence
             angle (relative to vertical) and 'look' means look angle (relative to
-            horizontal). Default is 'look'.
+            horizontal). Default is :attr:`los_angle_type`.
 
         """
         if self.los_dataset is None:
             return None
+        if angle_type is None:
+            angle_type = self.los_angle_type
 
         sample_theta = self.los_dataset[roi]
         arr_theta = sample_theta.boxes.data.squeeze((0, 1))
@@ -538,6 +613,10 @@ class InterferogramDataset(PairDataset):
             los_ratio = np.cos(arr_theta)
         elif angle_type == "look":
             los_ratio = np.sin(arr_theta)
+        else:
+            msg = f"angle_type must be 'incidence' or 'look', got {angle_type!r}"
+            logger.error(msg)
+            raise ValueError(msg)
         return los_ratio
 
     def get_nan_count(
