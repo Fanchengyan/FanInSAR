@@ -331,11 +331,13 @@ def test_from_roi_signature_matches_proposal() -> None:
         "work_dir",
         "orbit_paths",
         "calibration_paths",
+        "coreg_mode",
     ):
         assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["granularity"].default == "roi"
     assert parameters["provider"].default is None
     assert parameters["polarizations"].default == ("VV",)
+    assert parameters["coreg_mode"].default == "geometry"
 
 
 class TestCdseRoiCanvasOrder:
@@ -406,7 +408,7 @@ class TestCdseRoiCanvasOrder:
             order.append("write_canvas")
             handle = original_write(*args, **kwargs)
             with rasterio.open(handle.measurement_path) as dataset:
-                assert dataset.height == 2 * LINES_PER_BURST
+                assert dataset.height == N_BURSTS * LINES_PER_BURST
                 assert dataset.width == SAMPLES_PER_BURST
             return handle
 
@@ -426,7 +428,7 @@ class TestCdseRoiCanvasOrder:
             for path in paths:
                 measurement = next(Path(path).joinpath("measurement").glob("*.tiff"))
                 with rasterio.open(measurement) as dataset:
-                    assert dataset.height == 2 * LINES_PER_BURST
+                    assert dataset.height == N_BURSTS * LINES_PER_BURST
                     assert dataset.width == SAMPLES_PER_BURST
             return FakeStack()
 
@@ -482,7 +484,12 @@ class TestCdseRoiCanvasOrder:
         )
         monkeypatch.setattr(S1Stack, "from_safes", classmethod(fake_from_safes))
 
-        result = _from_roi(ROI, work_dir=tmp_path, granularity="roi")
+        result = _from_roi(
+            ROI,
+            work_dir=tmp_path,
+            granularity="roi",
+            coreg_mode="nesd",
+        )
         assert isinstance(result, FakeStack)
         assert prepared == [True]
         assert captured_paths
@@ -743,8 +750,8 @@ class TestAssembleWindowSamples:
         )
         np.testing.assert_array_equal(assembled, full[:, 1:3])
 
-    def test_merged_gap_span_discards_interior_row_tails(self) -> None:
-        """Floor-merged tight rows include interior gaps that assembly discards."""
+    def test_whole_row_block_slices_requested_columns(self) -> None:
+        """A multi-row whole-row body is sliced to the ROI columns after download."""
         samples_per_burst = 6
         col0, n_cols = 1, 2
         full = np.arange(3 * samples_per_burst, dtype=np.float32).reshape(
@@ -752,10 +759,7 @@ class TestAssembleWindowSamples:
         ) + 1j * np.arange(3 * samples_per_burst, dtype=np.float32).reshape(
             3, samples_per_burst
         )
-        # Planner merge of three tight rows is first[col0:] + middle[:] + last[:col1].
-        col1 = col0 + n_cols
-        merged = np.concatenate([full[0, col0:], full[1], full[2, :col1]])
-        bodies = {"row-10-13": _complex_int16_bytes(merged)}
+        bodies = {"row-10-13": _complex_int16_bytes(full)}
         assembled = acquisition_mod._assemble_window_samples(
             bodies,
             parent_line0=10,
@@ -764,7 +768,7 @@ class TestAssembleWindowSamples:
             n_cols=n_cols,
             samples_per_burst=samples_per_burst,
         )
-        np.testing.assert_array_equal(assembled, full[:, col0:col1])
+        np.testing.assert_array_equal(assembled, full[:, col0 : col0 + n_cols])
 
 
 class TestFailClosedMeasurementFetch:
@@ -843,7 +847,7 @@ class TestFailClosedMeasurementFetch:
     def test_many_tight_column_spans_are_fetched_as_whole_rows(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A long narrow ROI is fetched as whole-row blocks, not hundreds of spans."""
+        """A long narrow ROI is fetched as whole-row blocks without a 32-span fuse."""
         n_rows = 200
         samples = 21_118
         row_stride = samples * 4
@@ -1086,18 +1090,92 @@ class TestOverlapSpliceFromFetchedWindows:
         )
 
         paths = acquisition_mod.materialize_cdse_roi_safes(
-            ROI, work_dir=tmp_path, granularity="roi"
+            ROI,
+            work_dir=tmp_path,
+            granularity="roi",
+            coreg_mode="nesd",
         )
         measurement = next(paths[0].joinpath("measurement").glob("*.tiff"))
         with rasterio.open(measurement) as dataset:
             raster = dataset.read(1)
 
-        top = raster[7:10, 10:50]
-        bottom = raster[10:13, 10:50]
+        top = raster[47:50, 10:50]
+        bottom = raster[50:53, 10:50]
         np.testing.assert_array_equal(top, data[47:50, 10:50])
         np.testing.assert_array_equal(bottom, data[50:53, 10:50])
         assert np.any(top)
         assert np.any(bottom)
+
+    def test_geometry_materialize_skips_overlap_splice(
+        self,
+        parent_swath: tuple[Any, MemoryFile, str, np.ndarray],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Default geometry canvases list intersecting bursts and skip splice."""
+        _swath, _memfile, xml_text, data = parent_swath
+        windows = [
+            BurstFetchedWindow(
+                burst_index=4,
+                row0=0,
+                col0=0,
+                samples=np.ascontiguousarray(data[40:50, :]),
+            ),
+            BurstFetchedWindow(
+                burst_index=5,
+                row0=0,
+                col0=0,
+                samples=np.ascontiguousarray(data[50:60, :]),
+            ),
+        ]
+
+        def fake_discover(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "product_id": "S1A_TEST",
+                    "annotation_url": ANNOTATION_URL,
+                    "measurement_url": MEASUREMENT_URL,
+                    "measurement_size": 16_000,
+                    "polarization": "VV",
+                    "swath": "IW1",
+                }
+            ]
+
+        async def fake_fetch(spans: Any, *, fetcher: Any = None) -> dict[str, bytes]:
+            del fetcher
+            bodies: dict[str, bytes] = {}
+            for span in spans:
+                if span.url == ANNOTATION_URL:
+                    bodies[span.label] = xml_text.encode("utf-8")
+                    continue
+                message = f"geometry must not fetch overlap spans, got {span.label}"
+                raise AssertionError(message)
+            return bodies
+
+        def fake_windows(*_args: Any, **_kwargs: Any) -> Any:
+            return _swath, windows, xml_text
+
+        def boom(*_args: Any, **_kwargs: Any) -> None:
+            message = "geometry must not splice overlap"
+            raise AssertionError(message)
+
+        monkeypatch.setattr(acquisition_mod, "discover_cdse_slc_items", fake_discover)
+        monkeypatch.setattr(acquisition_mod, "fetch_ranges_async", fake_fetch)
+        monkeypatch.setattr(acquisition_mod, "windows_from_cdse_fetch", fake_windows)
+        monkeypatch.setattr(acquisition_mod, "overlap_windows_for_canvas", boom)
+        monkeypatch.setattr(acquisition_mod, "splice_overlap_into_canvas", boom)
+
+        paths = acquisition_mod.materialize_cdse_roi_safes(
+            ROI,
+            work_dir=tmp_path,
+            granularity="roi",
+        )
+        measurement = next(paths[0].joinpath("measurement").glob("*.tiff"))
+        with rasterio.open(measurement) as dataset:
+            assert dataset.height == 2 * LINES_PER_BURST
+            raster = dataset.read(1)
+        np.testing.assert_array_equal(raster[0:10], data[40:50])
+        np.testing.assert_array_equal(raster[10:20], data[50:60])
 
 
 def _sparse_burst_geolocation_xml() -> str:

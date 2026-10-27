@@ -17,7 +17,11 @@ from tests.support.scene_stores import write_test_scene
 
 
 def _two_date_stack(tmp_path: Path, *, coreg_mode: str = "nesd") -> S1Stack:
-    """Build a prepared two-date Stack with dummy SAFE directories."""
+    """Build a prepared two-date Stack with dummy SAFE directories.
+
+    NESD-path tests request ``coreg_mode="nesd"`` so they stay on the
+    measure/invert/apply path after the stack default became geometry.
+    """
     paths: list[Path] = []
     for day in ("20160101", "20160113"):
         path = tmp_path / f"S1A_IW_SLC__1SDV_{day}T000000_{day}T000001.SAFE"
@@ -403,15 +407,20 @@ def test_measure_passes_thresholds_orbits_and_resolved_bursts(
     assert stack.arcs[0].range_shift_px is None
 
 
-def test_measure_and_apply_share_resolved_burst_selection(
+def test_measure_lists_parent_slots_apply_keeps_roi_bursts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ROI-resolved bursts are reused; measure is not an ROI crop."""
+    """NESD measure lists parent slots; apply still uses the ROI burst set."""
     stack = _two_date_stack(tmp_path)
     _forbid_produce_pair(stack)
-    selection = (("IW1",), {"IW1": [0, 1]})
-    monkeypatch.setattr(stack, "_resolve_s1_nesd_selection", lambda: selection)
-    stack._s1_nesd_selection = selection
+    apply_selection = (("IW1",), {"IW1": [1]})
+    measure_selection = (("IW1",), {"IW1": [0, 1, 2]})
+    monkeypatch.setattr(
+        stack, "_resolve_s1_roi_burst_selection", lambda: apply_selection
+    )
+    monkeypatch.setattr(stack, "_resolve_s1_nesd_selection", lambda: measure_selection)
+    stack._s1_roi_burst_selection = apply_selection
+    stack._s1_nesd_selection = measure_selection
     measure_kw: dict[str, object] = {}
 
     def fake_measure(*_args: object, **kwargs: object) -> MisregArc:
@@ -437,7 +446,8 @@ def test_measure_and_apply_share_resolved_burst_selection(
 
     apply_kw = calls[0]
     assert measure_kw["swaths"] == apply_kw["swaths"] == ("IW1",)
-    assert measure_kw["bursts"] == apply_kw["bursts"] == {"IW1": [0, 1]}
+    assert measure_kw["bursts"] == {"IW1": [0, 1, 2]}
+    assert apply_kw["bursts"] == {"IW1": [1]}
     assert "roi" not in measure_kw
 
 

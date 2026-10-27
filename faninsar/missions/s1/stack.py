@@ -284,7 +284,7 @@ class S1Stack(Stack):
         polarizations: S1PolarizationRequest | Sequence[str] | str | None = None,
         orbit_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
         calibration_paths: Sequence[str | Path] | None = None,
-        coreg_mode: CoregMode = "nesd",
+        coreg_mode: CoregMode = "geometry",
         swaths: tuple[str, ...] | None = None,
         bursts: BurstSelection | None = None,
         **kwargs: Any,
@@ -304,7 +304,8 @@ class S1Stack(Stack):
         calibration_paths : sequence, optional
             Explicit local AUX_CAL/calibration files.
         coreg_mode : {"geometry", "nesd"}, optional
-            Stack coregistration mode. Defaults to ``"nesd"``.
+            Stack coregistration mode. Defaults to ``"geometry"``.
+            Tests that exercise NESD pass ``coreg_mode="nesd"``.
         swaths : tuple of str, optional
             Sub-swaths to process. ``None`` selects every sub-swath.
         bursts : BurstSelection, optional
@@ -368,6 +369,7 @@ class S1Stack(Stack):
         work_dir: str | Path,
         orbit_paths: Mapping[str, object] | Sequence[str | Path] | None = None,
         calibration_paths: Sequence[str | Path] | None = None,
+        coreg_mode: CoregMode = "geometry",
         **kwargs: Any,
     ) -> Self:
         """Search, acquire, and prepare a Sentinel-1 Stack for one ROI.
@@ -396,9 +398,12 @@ class S1Stack(Stack):
         arguments.
 
         CDSE paths (``roi`` and ``burst@cdse``) materialize a full-burst-
-        height SAFE-subset canvas, splice overlap rows, then call
-        :meth:`from_safes` → :meth:`prepare`.  ASF paths download complete
-        objects and follow the same ``from_safes`` → ``prepare`` join.
+        height SAFE-subset canvas then call :meth:`from_safes` →
+        :meth:`prepare`.  Geometry canvases list intersecting bursts and
+        skip overlap fetch; NESD canvases list every parent burst of the
+        intersecting swath and splice that frame's overlap strips.  ASF
+        paths download complete objects and follow the same
+        ``from_safes`` → ``prepare`` join.
 
         Parameters
         ----------
@@ -420,6 +425,9 @@ class S1Stack(Stack):
         orbit_paths, calibration_paths : optional
             Explicit local orbit candidates/bindings and AUX_CAL files passed
             to :meth:`from_safes`.
+        coreg_mode : {"geometry", "nesd"}, optional
+            Stack coregistration mode. Defaults to ``"geometry"``.
+            Tests that exercise NESD pass ``coreg_mode="nesd"``.
         **kwargs : Any
             Existing :meth:`from_safes` options plus internal ASF search
             options (``flight_direction``, ``filters``, ``limit``,
@@ -455,6 +463,7 @@ class S1Stack(Stack):
         extra["roi_granularity"] = resolved_granularity
         extra["roi_provider"] = resolved_provider
         kwargs["extra"] = extra
+        kwargs.setdefault("coreg_mode", coreg_mode)
         if resolved_provider == "cdse":
             return cls._from_cdse_roi(
                 roi,
@@ -506,12 +515,14 @@ class S1Stack(Stack):
             "auth_profile",
         )
         search_kwargs = {key: kwargs.pop(key) for key in search_keys if key in kwargs}
+        coreg_mode = kwargs.get("coreg_mode", "geometry")
         local_paths = materialize_cdse_roi_safes(
             roi,
             datetime_range=datetime_range,
             polarizations=selected_polarizations,
             work_dir=root,
             granularity=granularity,
+            coreg_mode=coreg_mode,
             **search_kwargs,
         )
         extra = dict(kwargs.pop("extra", {}) or {})
@@ -917,26 +928,23 @@ class S1Stack(Stack):
         """Sentinel-1 NESD apply requires inverted date constants (F11)."""
         return self.config.coreg_mode == "nesd"
 
-    def _resolve_s1_nesd_selection(
+    def _resolve_s1_roi_burst_selection(
         self,
     ) -> tuple[tuple[str, ...] | None, BurstSelection | None]:
-        """Resolve swaths/bursts for NESD measure and apply.
+        """Resolve swaths/bursts whose footprints intersect the ROI.
 
         No ROI keeps the configured selection (``None`` means all). An ROI
-        selects bursts by footprint intersection, including neighboring bursts
-        at edges whose footprints overlap the ROI. Geometry apply still crops
-        to the ROI window; NESD measures the **full** overlap strips of those
-        selected bursts and does not require the overlap pixels to lie inside
-        the ROI crop. A single-burst interior ROI has no adjacent pair, so
-        measure warns and skips NESD.
+        selects bursts by footprint intersection, including neighboring
+        bursts at edges whose footprints overlap the ROI. Geometry apply
+        still crops to the ROI window.
         """
-        cached = getattr(self, "_s1_nesd_selection", None)
+        cached = getattr(self, "_s1_roi_burst_selection", None)
         if cached is not None:
             return cached
         roi = self._effective_roi_with_mask().roi
         if roi is None:
             result = (self.config.swaths, self.config.bursts)
-            self._s1_nesd_selection = result
+            self._s1_roi_burst_selection = result
             return result
         from faninsar.missions.s1.processing import _select_bursts_by_roi
         from faninsar.missions.s1.safe import open_safe_product
@@ -957,7 +965,7 @@ class S1Stack(Stack):
         )
         swath_tuple = tuple(item.swath for item in ordered)
         ref_orbit = self._orbit_path_for(self.reference)
-        orbits = [ref_orbit] * len(ref_paths)
+        orbits = [ref_orbit] * len(products)
         resolved = _select_bursts_by_roi(
             roi,
             ref_paths,
@@ -965,11 +973,64 @@ class S1Stack(Stack):
             orbits=orbits,
             dem=self._geometry_dem(),
         )
-        bursts = _burst_selection_from_resolved(resolved, len(ref_paths), swath_tuple)
+        bursts = _burst_selection_from_resolved(resolved, len(products), swath_tuple)
         bursts, swath_tuple = _drop_empty_swaths(bursts, swath_tuple)
         if not swath_tuple:
             reject_pair_configuration("ROI selection contains no bursts")
         result = (swath_tuple, bursts)
+        self._s1_roi_burst_selection = result
+        return result
+
+    def _resolve_s1_nesd_selection(
+        self,
+    ) -> tuple[tuple[str, ...] | None, BurstSelection | None]:
+        """Resolve swaths/bursts for NESD measure.
+
+        Intersecting swaths keep **every listed parent burst** so NESD can
+        measure adjacent overlap strips, including slots that stay
+        ``firstValidSample = -1`` outside the fetched overlap. Apply still
+        uses :meth:`_resolve_s1_roi_burst_selection` and crops to the ROI.
+        A swath with fewer than two listed bursts has no adjacent pair, so
+        measure warns and skips NESD.
+        """
+        cached = getattr(self, "_s1_nesd_selection", None)
+        if cached is not None:
+            return cached
+        roi = self._effective_roi_with_mask().roi
+        swaths, bursts = self._resolve_s1_roi_burst_selection()
+        if roi is None:
+            self._s1_nesd_selection = (swaths, bursts)
+            return swaths, bursts
+        from faninsar.missions.s1.safe import open_safe_product
+
+        ref_paths = list(self.catalog.paths_for(self.reference))
+        polarizations = self.config.extra.get("polarizations")
+        selected_polarizations = (
+            None if polarizations == "all" else tuple(polarizations or ())
+        )
+        products = [
+            open_safe_product(path, polarizations=selected_polarizations)
+            for path in ref_paths
+        ]
+        swath_tuple = swaths or tuple(
+            item.swath
+            for item in sorted(
+                products[0].swaths,
+                key=lambda item: item.slant_range_time_s,
+            )
+        )
+        resolved: dict[tuple[int, str], list[int]] = {}
+        for frame_index, product in enumerate(products):
+            for swath_name in swath_tuple:
+                swath = product.swath(swath_name)
+                resolved[(frame_index, swath_name)] = [
+                    int(burst.index) for burst in swath.bursts
+                ]
+        expanded = _burst_selection_from_resolved(resolved, len(products), swath_tuple)
+        expanded, swath_tuple = _drop_empty_swaths(expanded, swath_tuple)
+        if not swath_tuple:
+            reject_pair_configuration("ROI selection contains no bursts")
+        result = (swath_tuple, expanded)
         self._s1_nesd_selection = result
         return result
 
@@ -1002,7 +1063,7 @@ class S1Stack(Stack):
         """Compute (or reuse) the Reference scene product once per run."""
         from faninsar.missions.s1.coregister import prepare_s1_reference
 
-        swaths, bursts = self._resolve_s1_nesd_selection()
+        swaths, bursts = self._resolve_s1_roi_burst_selection()
         return prepare_s1_reference(
             _source_input(self.catalog.paths_for(self.reference)),
             output_scene=self._scene_dir(self.reference),

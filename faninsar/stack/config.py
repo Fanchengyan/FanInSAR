@@ -53,13 +53,13 @@ class StackConfig:
     pixel edges are expanded to whole pixels around the projected ROI.
     ``dem_cache_dir`` supplies the source cache at materialization. An
     explicit ``GridSpec`` always wins over automatic ROI selection.
-    ``coreg_mode`` is ``"geometry"`` or ``"nesd"`` (default ``"nesd"``).
+    ``coreg_mode`` is ``"geometry"`` or ``"nesd"`` (default ``"geometry"``).
     ``swaths=None`` and ``bursts=None`` select every sub-swath and burst.
     """
 
     work_dir: Path
     activation_mode: ActivationMode
-    coreg_mode: CoregMode = "nesd"
+    coreg_mode: CoregMode = "geometry"
     flatten_stage: FlattenStage = "coregistration"
     coregistration_grid: CoregistrationGrid = "radar"
     esd_coherence_threshold: float = 0.85

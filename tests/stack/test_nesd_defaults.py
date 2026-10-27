@@ -1,4 +1,8 @@
-"""Stack NESD defaults and all-burst selection (PROPOSAL-0056)."""
+"""Stack coregistration defaults and all-burst selection.
+
+NESD is opt-in: tests that exercise measure/invert/apply pass
+``coreg_mode="nesd"`` and note why.  The production default is geometry.
+"""
 
 from __future__ import annotations
 
@@ -22,10 +26,12 @@ def _two_date_safe_paths(tmp_path: Path) -> list[Path]:
     return paths
 
 
-def test_stack_config_defaults_are_nesd_all_swaths_all_bursts(tmp_path: Path) -> None:
-    """StackConfig defaults to NESD with every sub-swath and burst selected."""
+def test_stack_config_defaults_are_geometry_all_swaths_all_bursts(
+    tmp_path: Path,
+) -> None:
+    """StackConfig defaults to geometry with every sub-swath and burst selected."""
     cfg = StackConfig(work_dir=tmp_path, activation_mode="reference")
-    assert cfg.coreg_mode == "nesd"
+    assert cfg.coreg_mode == "geometry"
     assert cfg.swaths is None
     assert cfg.bursts is None
     assert cfg.esd_coherence_threshold == 0.85
@@ -50,12 +56,12 @@ def test_stack_config_removes_esd_method() -> None:
     assert "EsdMethod" not in stack_config.__all__
 
 
-def test_from_safes_keyword_defaults_are_nesd_all_swaths_all_bursts(
+def test_from_safes_keyword_defaults_are_geometry_all_swaths_all_bursts(
     tmp_path: Path,
 ) -> None:
-    """Stack._from_safes and S1Stack.from_safes default to NESD all bursts."""
+    """Stack._from_safes and S1Stack.from_safes default to geometry all bursts."""
     stack_params = inspect.signature(Stack._from_safes).parameters
-    assert stack_params["coreg_mode"].default == "nesd"
+    assert stack_params["coreg_mode"].default == "geometry"
     assert stack_params["swaths"].default is None
     assert stack_params["bursts"].default is None
     assert "esd_method" not in stack_params
@@ -63,7 +69,7 @@ def test_from_safes_keyword_defaults_are_nesd_all_swaths_all_bursts(
     assert stack_params["ampcor_snr_threshold"].default == 6.0
 
     s1_params = inspect.signature(S1Stack.from_safes).parameters
-    assert s1_params["coreg_mode"].default == "nesd"
+    assert s1_params["coreg_mode"].default == "geometry"
     assert s1_params["swaths"].default is None
     assert s1_params["bursts"].default is None
 
@@ -72,7 +78,7 @@ def test_from_safes_keyword_defaults_are_nesd_all_swaths_all_bursts(
         work_dir=tmp_path / "out",
         activation_mode="reference",
     )
-    assert stack.config.coreg_mode == "nesd"
+    assert stack.config.coreg_mode == "geometry"
     assert stack.config.swaths is None
     assert stack.config.bursts is None
     assert stack.config.esd_coherence_threshold == 0.85

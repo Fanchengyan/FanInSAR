@@ -39,7 +39,11 @@ if TYPE_CHECKING:
 
 
 def _stack_with_three_date_network(tmp_path: Path) -> Stack:
-    """Create a prepared three-date Stack with an explicit triangle network."""
+    """Create a prepared three-date Stack with an explicit triangle network.
+
+    NESD resume/identity tests pass ``coreg_mode="nesd"`` after the stack
+    default became geometry.
+    """
     from faninsar import Pairs
 
     dates = ("20240101", "20240113", "20240125")
@@ -52,6 +56,7 @@ def _stack_with_three_date_network(tmp_path: Path) -> Stack:
         paths,
         work_dir=tmp_path / "out",
         activation_mode="reference",
+        coreg_mode="nesd",
         pairs=Pairs.from_names(
             ["20240101_20240113", "20240113_20240125", "20240101_20240125"]
         ),
@@ -146,6 +151,7 @@ def test_coreg_resume_identity_accepts_all_burst_token(tmp_path: Path) -> None:
         paths,
         work_dir=tmp_path / "out",
         activation_mode="reference",
+        # Identity includes coreg_mode; this is not testing NESD physics.
         coreg_mode="nesd",
         swaths=("IW1", "IW2"),
         bursts={"IW1": "all", "IW2": "all"},

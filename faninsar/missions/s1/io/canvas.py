@@ -86,12 +86,13 @@ class RoiSafeCanvas:
         Generated ``<product_id>.SAFE`` directory.
     measurement_path : pathlib.Path
         Canvas GeoTIFF of shape
-        ``(n_kept * lines_per_burst, samples_per_burst)``.
+        ``(n_listed * lines_per_burst, samples_per_burst)``.
     annotation_path : pathlib.Path
         Rewritten annotation XML (valid-sample mask + remapped grid).
     kept_indices : tuple of int
-        Original parent burst indices in ascending order; canvas slot ``j``
-        holds ``kept_indices[j]``.
+        Listed parent burst indices in ascending order; canvas slot ``j``
+        holds ``kept_indices[j]``.  Geometry canvases list intersecting
+        bursts only; NESD canvases list every parent burst of the swath.
     lines_per_burst : int
         Parent ``linesPerBurst`` (canvas burst height).
     samples_per_burst : int
@@ -280,9 +281,10 @@ def _build_canvas_annotation(
     Returns
     -------
     bytes
-        Rewritten annotation XML with only kept bursts, the fetched-column
-        valid-sample mask, ``numberOfLines = n_kept * linesPerBurst``, and a
-        geolocation grid remapped by original burst identity.
+        Rewritten annotation XML for the listed bursts, the fetched-column
+        valid-sample mask (``-1`` on unfetched lines and unfetched slots),
+        ``numberOfLines = n_listed * linesPerBurst``, and a geolocation grid
+        remapped by original burst identity.
 
     """
     root = ET.fromstring(xml_text)
@@ -330,17 +332,18 @@ def write_roi_safe_canvas(
     *,
     annotation_xml: str | None = None,
     product_id: str | None = None,
+    listed_indices: Sequence[int] | None = None,
 ) -> RoiSafeCanvas:
     """Write a SAFE-subset canvas tree for ROI-fetched bursts.
 
-    Every kept burst gets a full-burst-height x full-``samplesPerBurst``
-    canvas with its fetched rectangle placed at the original burst-local
+    Every listed burst gets a full-burst-height x full-``samplesPerBurst``
+    canvas slot.  Fetched rectangles are placed at the original burst-local
     ``(line, column)``.  The GeoTIFF is tiled (512) and DEFLATE-compressed;
     unfetched pixels are left empty and read back as zero.  The rewritten
     annotation marks unfetched lines ``firstValidSample = -1`` and ROI
     lines with the fetched column envelope, keeps parent ``linesPerBurst``
     / ``azimuthTime`` / ``byteOffset`` / ``samplesPerBurst``, sets
-    ``numberOfLines = n_kept * linesPerBurst``, and remaps the geolocation
+    ``numberOfLines = n_listed * linesPerBurst``, and remaps the geolocation
     grid by original burst identity.
 
     Parameters
@@ -348,8 +351,8 @@ def write_roi_safe_canvas(
     swath : S1Swath
         Parsed *parent* sub-swath whose burst geometry is inherited.
     windows : sequence of BurstFetchedWindow
-        Fetched rectangles, one per kept burst.  Order does not matter;
-        canvas slots follow ascending ``burst_index``.
+        Fetched rectangles.  Order does not matter; canvas slots follow
+        ascending listed burst indices.
     out_dir : str or pathlib.Path
         Parent directory; a ``<product_id>.SAFE`` folder is created inside.
     annotation_xml : str, optional
@@ -357,6 +360,11 @@ def write_roi_safe_canvas(
         ``swath.annotation_path`` (directory or ``/vsizip/`` source).
     product_id : str, optional
         SAFE product id (defaults to the annotation stem).
+    listed_indices : sequence of int, optional
+        Parent burst indices to list in ``burstList``.  Defaults to the
+        intersecting bursts present in ``windows`` (geometry canvases).
+        NESD canvases pass every parent burst of the swath; unfetched
+        slots stay ``firstValidSample = -1``.
 
     Returns
     -------
@@ -367,8 +375,9 @@ def write_roi_safe_canvas(
     Raises
     ------
     Sentinel1ProductError
-        If ``windows`` is empty, names an unknown or duplicate burst, or a
-        fetched rectangle exceeds the parent burst geometry.
+        If ``windows`` is empty, names an unknown or duplicate burst, a
+        fetched rectangle exceeds the parent burst geometry, or
+        ``listed_indices`` omits a fetched window.
 
     Examples
     --------
@@ -379,28 +388,44 @@ def write_roi_safe_canvas(
     """
     if not windows:
         reject_product("write_roi_safe_canvas requires at least one fetched window")
-    ordered = sorted(windows, key=lambda w: int(w.burst_index))
-    kept_indices = tuple(int(w.burst_index) for w in ordered)
-    if len(set(kept_indices)) != len(kept_indices):
-        reject_product(f"duplicate burst indices in fetched windows: {kept_indices}")
+    by_index = {int(window.burst_index): window for window in windows}
+    if len(by_index) != len(windows):
+        reject_product(
+            "duplicate burst indices in fetched windows: "
+            f"{tuple(int(window.burst_index) for window in windows)}"
+        )
+    if listed_indices is None:
+        listed = tuple(sorted(by_index))
+    else:
+        listed = tuple(sorted({int(index) for index in listed_indices}))
+        missing = set(by_index) - set(listed)
+        if missing:
+            reject_product(
+                "listed burst indices "
+                f"{list(listed)} omit fetched windows {sorted(missing)}"
+            )
+    if not listed:
+        reject_product("write_roi_safe_canvas requires at least one listed burst")
 
     lines_per_burst = int(swath.lines_per_burst)
     samples_per_burst = int(swath.samples_per_burst)
-    height = len(ordered) * lines_per_burst
+    height = len(listed) * lines_per_burst
     kept_masks: list[tuple[int, tuple[list[int], list[int]]]] = []
     placements: list[tuple[int, int, np.ndarray]] = []
-    for slot, window in enumerate(ordered):
-        if window.burst_index < 0 or window.burst_index >= len(swath.bursts):
-            reject_product(
-                f"burst_index {window.burst_index} out of range for {swath.swath}"
+    n_parent = len(swath.bursts)
+    for slot, burst_index in enumerate(listed):
+        if burst_index < 0 or burst_index >= n_parent:
+            reject_product(f"burst_index {burst_index} out of range for {swath.swath}")
+        window = by_index.get(burst_index)
+        if window is None:
+            kept_masks.append(
+                (burst_index, ([-1] * lines_per_burst, [-1] * lines_per_burst))
             )
+            continue
         samples = _checked_samples(window, lines_per_burst, samples_per_burst)
         row0, col0 = int(window.row0), int(window.col0)
-        row_base = slot * lines_per_burst
-        placements.append((row_base + row0, col0, samples))
-        kept_masks.append(
-            (int(window.burst_index), _window_mask(window, lines_per_burst))
-        )
+        placements.append((slot * lines_per_burst + row0, col0, samples))
+        kept_masks.append((burst_index, _window_mask(window, lines_per_burst)))
 
     out_dir = Path(out_dir)
     pid = product_id or _annotation_stem(swath.annotation_path)
@@ -450,15 +475,15 @@ def write_roi_safe_canvas(
     logger.info(
         "Wrote ROI SAFE canvas %s: %d kept burst(s) %s, shape %s",
         safe_root,
-        len(ordered),
-        list(kept_indices),
+        len(listed),
+        list(listed),
         (height, samples_per_burst),
     )
     return RoiSafeCanvas(
         safe_root=safe_root,
         measurement_path=tiff_path,
         annotation_path=ann_path,
-        kept_indices=kept_indices,
+        kept_indices=listed,
         lines_per_burst=lines_per_burst,
         samples_per_burst=samples_per_burst,
     )

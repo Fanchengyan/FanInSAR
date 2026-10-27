@@ -473,3 +473,39 @@ class TestFootprintRemap:
         assert subset.bursts[1].footprint == swath.bursts[5].footprint
         assert subset.bursts[0].footprint != swath.bursts[0].footprint
         assert subset.bursts[1].footprint != swath.bursts[1].footprint
+
+
+class TestNesdListedBurstSlots:
+    """NESD canvases list every parent burst; unfetched slots stay ``-1``."""
+
+    def test_listed_indices_keep_parent_slots_and_minus_one_mask(
+        self,
+        parent: ParentInfo,
+        tmp_path: Path,
+    ) -> None:
+        """A one-burst ROI still writes all parent burst slots for NESD."""
+        swath, _memfile, xml_text, data = parent
+        handle = write_roi_safe_canvas(
+            swath,
+            _default_windows(data),
+            tmp_path,
+            annotation_xml=xml_text,
+            product_id="ROI_NESD_SLOTS",
+            listed_indices=tuple(range(N_BURSTS)),
+        )
+        assert handle.kept_indices == tuple(range(N_BURSTS))
+        with rasterio.open(handle.measurement_path) as ds:
+            assert ds.height == N_BURSTS * LINES_PER_BURST
+            raster = ds.read(1)
+        np.testing.assert_array_equal(raster[43:48, 20:60], data[43:48, 20:60])
+        np.testing.assert_array_equal(raster[50:55, 10:50], data[50:55, 10:50])
+        assert not np.any(raster[:40])
+        subset = parse_annotation_xml(
+            handle.annotation_path.read_text(encoding="utf-8"),
+            annotation_path=str(handle.annotation_path),
+            measurement_path=str(handle.measurement_path),
+        )
+        assert len(subset.bursts) == N_BURSTS
+        assert [burst.index for burst in subset.bursts] == list(range(N_BURSTS))
+        assert all(value == -1 for value in subset.bursts[0].first_valid_sample)
+        assert subset.bursts[4].first_valid_sample[3] == 20

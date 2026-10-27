@@ -13,7 +13,6 @@ import pytest
 
 from faninsar.missions.s1.acquisition import (
     MAX_SPAN_BYTES,
-    MERGE_FLOOR_BYTES,
     plan_ifd_probe_spans,
     plan_measurement_spans,
 )
@@ -82,10 +81,9 @@ class TestWideColumn:
         assert spans == (RangeSpan(URL, 13000, 29000 - 1, "row-3-7"),)
 
     def test_adjacent_sub_floor_row_blocks_merge_into_one_span(self) -> None:
-        """Adjacent sub-floor row blocks merge and the floor never splits."""
+        """Adjacent whole rows coalesce; the 4 MiB cap is the only split."""
         # 8 strips of 4000 B and 70 strips of 4000 B must each coalesce into a
-        # single span: adjacent ranges below the 256 KiB floor merge, and the
-        # floor is never a split threshold for contiguous data.
+        # single span: contiguous whole rows are byte-adjacent.
         offsets, counts = _tables_8x1000x4()
         assert len(_plan(offsets, counts)) == 1
 
@@ -94,7 +92,6 @@ class TestWideColumn:
         counts70 = [stride] * 70
         spans = _plan(offsets70, counts70, line1=70)
         assert spans == (RangeSpan(URL, 0, 70 * stride - 1, "row-0-70"),)
-        assert spans[0].end - spans[0].start + 1 > MERGE_FLOOR_BYTES
         assert spans[0].end - spans[0].start + 1 < MAX_SPAN_BYTES
 
     def test_large_roi_splits_at_4mib_on_row_boundaries(self) -> None:
@@ -134,45 +131,31 @@ class TestWideColumn:
 
 
 class TestNarrowColumn:
-    """Narrow columns build tight per-row-group ranges meeting the floor."""
+    """Narrow ROI columns still fetch whole rows; assembly slices after download."""
 
-    def test_rows_group_until_requests_meet_floor(self) -> None:
-        """Consecutive rows merge into requests of at least 256 KiB."""
+    def test_narrow_columns_fetch_whole_row_blocks(self) -> None:
+        """A column slice does not trim the HTTP range; rows stay whole."""
         stride = 100000 * 4  # 400000 B rows
         offsets = [500 + i * stride for i in range(10)]
         counts = [stride] * 10
-        # Column slice of 100..1100 -> 4000 B per row, far below the floor.
         spans = _plan(offsets, counts, samples=100000, line1=10, col0=100, col1=1100)
-        assert spans == (
-            RangeSpan(URL, 900, 404899, "row-0-2"),
-            RangeSpan(URL, 800900, 1204899, "row-2-4"),
-            RangeSpan(URL, 1600900, 2004899, "row-4-6"),
-            RangeSpan(URL, 2400900, 2804899, "row-6-8"),
-            RangeSpan(URL, 3200900, 3604899, "row-8-10"),
-        )
-        for span in spans:
-            assert span.end - span.start + 1 >= MERGE_FLOOR_BYTES
-            assert span.end - span.start + 1 <= MAX_SPAN_BYTES
+        assert spans == (RangeSpan(URL, 500, 500 + 10 * stride - 1, "row-0-10"),)
+        assert (spans[0].end - spans[0].start + 1) % stride == 0
+        assert spans[0].end - spans[0].start + 1 <= MAX_SPAN_BYTES
 
-    def test_final_leftover_group_may_stay_below_floor(self) -> None:
-        """Only the final leftover group may stay below the 256 KiB floor."""
+    def test_narrow_partial_roi_is_still_whole_rows(self) -> None:
+        """Three narrow rows coalesce to one whole-row span, not a leftover trim."""
         stride = 100000 * 4
         offsets = [500 + i * stride for i in range(3)]
         counts = [stride] * 3
         spans = _plan(offsets, counts, samples=100000, line1=3, col0=100, col1=1100)
-        assert spans == (
-            RangeSpan(URL, 900, 404899, "row-0-2"),
-            RangeSpan(URL, 800900, 804899, "row-2-3"),
-        )
-        for span in spans[:-1]:
-            assert span.end - span.start + 1 >= MERGE_FLOOR_BYTES
-        assert spans[-1].end - spans[-1].start + 1 < MERGE_FLOOR_BYTES
+        assert spans == (RangeSpan(URL, 500, 500 + 3 * stride - 1, "row-0-3"),)
 
-    def test_tiny_roi_single_sub_floor_request_is_allowed(self) -> None:
-        """A ROI smaller than the floor yields one bounded sub-floor span."""
+    def test_tiny_roi_still_fetches_whole_rows(self) -> None:
+        """A two-row, ten-sample ROI still requests both full rows."""
         offsets, counts = _tables_8x1000x4()
         spans = _plan(offsets, counts, line0=0, line1=2, col0=0, col1=10)
-        assert spans == (RangeSpan(URL, 1000, 1000 + 4000 + 40 - 1, "row-0-2"),)
+        assert spans == (RangeSpan(URL, 1000, 1000 + 2 * 4000 - 1, "row-0-2"),)
 
 
 class TestFailClosed:

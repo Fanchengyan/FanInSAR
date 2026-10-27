@@ -18,16 +18,16 @@ Contract (PROPOSAL-0061):
 - fail closed on compressed or tiled TIFFs;
 - never emit a ``0..EOF`` span: every span is bounded by strip-table
   arithmetic or explicit probe lengths;
-- narrow columns fetch tight per-row-group ranges, each request at least
-  :data:`MERGE_FLOOR_BYTES` (256 KiB) unless the remaining ROI is smaller;
-- wide columns fetch whole-row blocks;
-- adjacent ranges below the 256 KiB floor merge;
+- every measurement span is a whole-row block; callers slice columns after
+  download;
 - any contiguous range is split into spans of at most
   :data:`MAX_SPAN_BYTES` (4 MiB) that end on row boundaries using the
   known row stride; a single row wider than the cap is the only exception
   and is emitted whole;
-- CDSE ROI/burst paths write a full-burst-height canvas, splice overlap
-  strips, then hand the SAFE tree to ``from_safes``.
+- CDSE ROI/burst paths write a full-burst-height canvas then hand the
+  SAFE tree to ``from_safes``.  Geometry canvases list intersecting
+  bursts only.  NESD canvases list every parent burst of the swath and
+  splice that frame's overlap strips.
 
 """
 
@@ -75,9 +75,6 @@ logger = setup_logger(__name__)
 
 MAX_SPAN_BYTES = 4 * 1024 * 1024
 """Retry quantum (PROPOSAL-0061): no span exceeds 4 MiB unless one row does."""
-
-MERGE_FLOOR_BYTES = 256 * 1024
-"""Adjacent sub-floor ranges merge; single requests stay above this floor."""
 
 HEADER_PROBE_BYTES = 16
 """Bytes probed at offset 0: classic (8 B) and BigTIFF (16 B) IFD pointers."""
@@ -182,14 +179,11 @@ def plan_measurement_spans(
     Returns
     -------
     tuple of RangeSpan
-        Bounded spans whose union covers every ROI byte.  Each span is at
-        most :data:`MAX_SPAN_BYTES`, ends on a row boundary, and
-        consecutive spans stay byte-adjacent within a group.  A narrow
-        column (fetched width below one row stride) yields tight
-        per-row-group ranges of at least :data:`MERGE_FLOOR_BYTES` — the
-        interior gaps between a group's rows are fetched and discarded by
-        assembly — except a final leftover group that may stay below the
-        floor.
+        Bounded whole-row spans whose union covers every ROI row.  Each span
+        is at most :data:`MAX_SPAN_BYTES`, ends on a row boundary, and
+        consecutive spans stay byte-adjacent within a group.  Column bounds
+        are validated here and sliced after download; they do not trim the
+        HTTP range.
 
     Raises
     ------
@@ -251,16 +245,12 @@ def plan_measurement_spans(
             f"ROI columns [{col0}, {col1}) fall outside {samples} samples per row"
         )
 
-    whole_rows = (col1 - col0) * bytes_per_sample >= row_stride
     intervals: list[_RowInterval] = [
         _row_byte_interval(
             line,
             strip_offsets=strip_offsets,
             rows_per_strip=rows_per_strip,
             row_stride=row_stride,
-            first_byte=col0 * bytes_per_sample,
-            last_byte=col1 * bytes_per_sample,
-            whole_rows=whole_rows,
         )
         for line in range(line0, line1)
     ]
@@ -433,11 +423,8 @@ def _row_byte_interval(
     strip_offsets: Sequence[int],
     rows_per_strip: int,
     row_stride: int,
-    first_byte: int,
-    last_byte: int,
-    whole_rows: bool,
 ) -> _RowInterval:
-    """Return the half-open byte interval of one ROI row.
+    """Return the half-open whole-row byte interval of one ROI row.
 
     Parameters
     ----------
@@ -447,24 +434,17 @@ def _row_byte_interval(
         TIFF ``StripOffsets``.
     rows_per_strip, row_stride : int
         Rows per strip and bytes per row.
-    first_byte, last_byte : int
-        Column bounds in row-relative bytes (``col * bytes_per_sample``).
-    whole_rows : bool
-        True to span the full row stride, False to span only the column
-        slice.
 
     Returns
     -------
     _RowInterval
-        Half-open ``(start, end)`` byte interval of the row.
+        Half-open ``(start, end)`` covering the full row stride.
 
     """
     row_start = (
         strip_offsets[line // rows_per_strip] + (line % rows_per_strip) * row_stride
     )
-    if whole_rows:
-        return row_start, row_start + row_stride
-    return row_start + first_byte, row_start + last_byte
+    return row_start, row_start + row_stride
 
 
 def _merge_row_groups(
@@ -473,11 +453,8 @@ def _merge_row_groups(
 ) -> list[_RowGroup]:
     """Coalesce per-row intervals into byte ranges.
 
-    Byte-adjacent rows always continue the current group.  A group still
-    below :data:`MERGE_FLOOR_BYTES` also absorbs the next row across an
-    interior gap, so each request reaches the floor unless it is the final
-    leftover of the ROI; a group at or above the floor starts a new range
-    at the next gap.
+    Byte-adjacent whole rows continue the current group.  A gap between
+    rows starts a new range so each span stays a contiguous byte interval.
 
     Parameters
     ----------
@@ -499,7 +476,7 @@ def _merge_row_groups(
             groups.append((line0 + index, line0 + index + 1, start, end))
             continue
         group_line0, group_line1, group_start, group_end = groups[-1]
-        if group_end == start or group_end - group_start < MERGE_FLOOR_BYTES:
+        if group_end == start:
             groups[-1] = (group_line0, group_line1 + 1, group_start, end)
         else:
             groups.append((line0 + index, line0 + index + 1, start, end))
@@ -583,7 +560,6 @@ _CDSE_AUTH_PROFILE = "cdse"
 _ANNOTATION_PROBE_BYTES = 2 * 1024 * 1024
 _IFD_PROBE_BYTES = 16 * 1024
 _MAX_IFD_PROBE_BYTES = 512 * 1024
-_MAX_TIGHT_RANGE_REQUESTS = 32
 _CDSE_RANGE_HOSTS = frozenset(
     {
         "zipper.dataspace.copernicus.eu",
@@ -835,16 +811,23 @@ def overlap_windows_for_canvas(
     swath: S1Swath,
     windows: Sequence[BurstFetchedWindow],
     canvas: RoiSafeCanvas | None = None,
+    *,
+    listed_indices: Sequence[int] | None = None,
 ) -> tuple[BurstOverlapWindow, ...]:
-    """Return parent overlap rectangles among kept canvas bursts.
+    """Return parent overlap rectangles among listed canvas bursts.
 
     Completeness is the parent :func:`burst_overlap_windows` rectangle,
     not a tight azimuth box.  A synthetic parent with no sensing-time
-    overlap yields an empty tuple.
+    overlap yields an empty tuple.  Geometry canvases pass the fetched
+    window set; NESD canvases pass every parent burst of the swath.
 
     """
     del canvas
-    kept = {int(window.burst_index) for window in windows}
+    kept = (
+        {int(index) for index in listed_indices}
+        if listed_indices is not None
+        else {int(window.burst_index) for window in windows}
+    )
     if len(kept) < 2:
         return ()
     return burst_overlap_windows(swath, burst_indices=sorted(kept), min_lines=1)
@@ -1054,13 +1037,17 @@ def materialize_cdse_roi_safes(
     polarizations: Sequence[str] | Literal["all"] = ("VV",),
     work_dir: str | Path,
     granularity: str = "roi",
+    coreg_mode: Literal["geometry", "nesd"] = "geometry",
     **kwargs: Any,
 ) -> list[Path]:
     """Materialize CDSE ROI/burst SAFE-subset canvases under ``work_dir``.
 
     Order (PROPOSAL-0061): fetch annotation ranges, assemble windows,
-    :func:`write_roi_safe_canvas`, splice parent overlap rectangles,
-    then return the ``.SAFE`` roots for ``from_safes``.
+    :func:`write_roi_safe_canvas`, optionally splice parent overlap
+    rectangles, then return the ``.SAFE`` roots for ``from_safes``.
+    Geometry canvases keep intersecting bursts and skip overlap fetch.
+    NESD canvases list every parent burst of the swath and splice that
+    frame's overlap strips.
 
     Parameters
     ----------
@@ -1070,6 +1057,8 @@ def materialize_cdse_roi_safes(
         Stack work directory; canvases are written under ``inputs/``.
     granularity : {"roi", "burst"}, optional
         CDSE acquisition granularity.
+    coreg_mode : {"geometry", "nesd"}, optional
+        Canvas listing and overlap policy.  Default ``"geometry"``.
     **kwargs : Any
         Forwarded to discovery.
 
@@ -1081,9 +1070,14 @@ def materialize_cdse_roi_safes(
     Raises
     ------
     ValueError
-        If ``roi`` has no CRS, or discovery returns no products.
+        If ``roi`` has no CRS, ``coreg_mode`` is unknown, or discovery
+        returns no products.
 
     """
+    if coreg_mode not in {"geometry", "nesd"}:
+        message = f"coreg_mode must be 'geometry' or 'nesd'; got {coreg_mode!r}"
+        logger.error(message)
+        raise ValueError(message)
     roi = normalize_roi_wgs84(roi)
     items = discover_cdse_slc_items(
         roi,
@@ -1120,36 +1114,45 @@ def materialize_cdse_roi_safes(
         product_id = str(item.get("product_id", "S1_ROI"))
         swath_name = str(item.get("swath", "IW1"))
         polarization = str(item.get("polarization", "VV"))
+        listed_indices = (
+            tuple(int(burst.index) for burst in swath.bursts)
+            if coreg_mode == "nesd"
+            else None
+        )
         canvas = write_roi_safe_canvas(
             swath,
             windows,
             out_dir,
             annotation_xml=xml_text,
             product_id=f"{product_id}-{swath_name}-{polarization}",
+            listed_indices=listed_indices,
         )
-        by_index = {int(window.burst_index): window for window in windows}
-        for overlap in overlap_windows_for_canvas(swath, windows, canvas):
-            if (
-                overlap.top_index not in by_index
-                or overlap.bottom_index not in by_index
+        if coreg_mode == "nesd":
+            by_index = {int(window.burst_index): window for window in windows}
+            for overlap in overlap_windows_for_canvas(
+                swath,
+                windows,
+                canvas,
+                listed_indices=listed_indices,
             ):
-                continue
-            top = _overlap_rectangle_samples(
-                item,
-                swath,
-                by_index[int(overlap.top_index)],
-                overlap,
-                role="top",
-            )
-            bottom = _overlap_rectangle_samples(
-                item,
-                swath,
-                by_index[int(overlap.bottom_index)],
-                overlap,
-                role="bottom",
-            )
-            splice_overlap_into_canvas(canvas, overlap, role="top", samples=top)
-            splice_overlap_into_canvas(canvas, overlap, role="bottom", samples=bottom)
+                top = _overlap_rectangle_samples(
+                    item,
+                    swath,
+                    overlap,
+                    role="top",
+                    window=by_index.get(int(overlap.top_index)),
+                )
+                bottom = _overlap_rectangle_samples(
+                    item,
+                    swath,
+                    overlap,
+                    role="bottom",
+                    window=by_index.get(int(overlap.bottom_index)),
+                )
+                splice_overlap_into_canvas(canvas, overlap, role="top", samples=top)
+                splice_overlap_into_canvas(
+                    canvas, overlap, role="bottom", samples=bottom
+                )
         paths.append(canvas.safe_root)
     if not paths:
         message = "Sentinel-1 CDSE search returned no products intersecting the ROI"
@@ -1530,19 +1533,6 @@ def _fetch_measurement_bodies(
         col0=col0,
         col1=col1,
     )
-    if len(spans) > _MAX_TIGHT_RANGE_REQUESTS:
-        spans = plan_measurement_spans(
-            url=url,
-            strip_offsets=offsets,
-            strip_byte_counts=counts,
-            rows_per_strip=rows_per_strip,
-            samples=samples,
-            bytes_per_sample=_BYTES_PER_COMPLEX_INT16,
-            line0=line0,
-            line1=line1,
-            col0=0,
-            col1=samples,
-        )
     return _fetch_cdse_ranges(spans)
 
 
@@ -1658,24 +1648,24 @@ def _assemble_window_samples(
 def _overlap_rectangle_samples(
     item: Mapping[str, Any],
     swath: S1Swath,
-    window: BurstFetchedWindow,
     overlap: BurstOverlapWindow,
     *,
     role: Literal["top", "bottom"],
+    window: BurstFetchedWindow | None = None,
 ) -> np.ndarray:
     """Return one overlap rectangle from a fetched window or a dedicated fetch."""
+    burst_index = int(overlap.top_index if role == "top" else overlap.bottom_index)
     burst_row0 = int(overlap.top_row0 if role == "top" else overlap.bottom_row0)
     burst_col0 = int(overlap.col0)
     n_lines = int(overlap.n_lines)
     n_samples = int(overlap.n_samples)
-    covered = _window_covers_rectangle(
+    if window is not None and _window_covers_rectangle(
         window,
         row0=burst_row0,
         col0=burst_col0,
         n_lines=n_lines,
         n_cols=n_samples,
-    )
-    if covered:
+    ):
         src_row0 = burst_row0 - int(window.row0)
         src_col0 = burst_col0 - int(window.col0)
         rectangle = window.samples[
@@ -1683,7 +1673,7 @@ def _overlap_rectangle_samples(
         ]
         return np.ascontiguousarray(rectangle, dtype=np.complex64)
     lpb = int(swath.lines_per_burst)
-    parent_line0 = int(window.burst_index) * lpb + burst_row0
+    parent_line0 = burst_index * lpb + burst_row0
     bodies = _fetch_measurement_bodies(
         str(item.get("measurement_url", "")),
         file_size=int(item.get("measurement_size") or 0),
@@ -1929,56 +1919,13 @@ def _bytes_to_complex_span(
     if n_span_lines <= 0 or n_cols <= 0:
         reject_product("row span assembly requires a positive rectangle")
     expected_full = n_span_lines * samples_per_burst * _BYTES_PER_COMPLEX_INT16
-    expected_slice = n_span_lines * n_cols * _BYTES_PER_COMPLEX_INT16
-    row_stride = samples_per_burst * _BYTES_PER_COMPLEX_INT16
-    merged_gap = (n_span_lines - 1) * row_stride + n_cols * _BYTES_PER_COMPLEX_INT16
-    if len(raw) == expected_slice:
-        pairs = np.frombuffer(raw, dtype="<i2").reshape(n_span_lines, n_cols, 2)
-    elif len(raw) == expected_full:
-        pairs = np.frombuffer(raw, dtype="<i2").reshape(
-            n_span_lines, samples_per_burst, 2
-        )[:, col0 : col0 + n_cols]
-    elif n_span_lines > 1 and len(raw) == merged_gap:
-        pairs = _pairs_from_merged_gap_span(
-            raw,
-            n_span_lines=n_span_lines,
-            samples_per_burst=samples_per_burst,
-            col0=col0,
-            n_cols=n_cols,
-        )
-    else:
+    if len(raw) != expected_full:
         reject_product(
-            f"row span is {len(raw)} bytes, expected {expected_slice} "
-            f"(tight columns), {merged_gap} (merged interior gaps), "
-            f"or {expected_full} (whole rows)"
+            f"row span is {len(raw)} bytes, expected {expected_full} whole-row bytes"
         )
+    pairs = np.frombuffer(raw, dtype="<i2").reshape(n_span_lines, samples_per_burst, 2)[
+        :, col0 : col0 + n_cols
+    ]
     real = pairs[..., 0].astype(np.float32)
     imag = pairs[..., 1].astype(np.float32)
     return (real + 1j * imag).astype(np.complex64)
-
-
-def _pairs_from_merged_gap_span(
-    raw: bytes,
-    *,
-    n_span_lines: int,
-    samples_per_burst: int,
-    col0: int,
-    n_cols: int,
-) -> np.ndarray:
-    """Slice floor-merged tight rows that include interior unused samples."""
-    values = np.frombuffer(raw, dtype="<i2")
-    pairs = np.empty((n_span_lines, n_cols, 2), dtype="<i2")
-    col1 = col0 + n_cols
-    cursor = 0
-    first = samples_per_burst - col0
-    pairs[0] = values[cursor : cursor + first * 2].reshape(first, 2)[:n_cols]
-    cursor += first * 2
-    for row in range(1, n_span_lines - 1):
-        full = values[cursor : cursor + samples_per_burst * 2].reshape(
-            samples_per_burst, 2
-        )
-        pairs[row] = full[col0:col1]
-        cursor += samples_per_burst * 2
-    last = values[cursor : cursor + col1 * 2].reshape(col1, 2)
-    pairs[-1] = last[col0:col1]
-    return pairs

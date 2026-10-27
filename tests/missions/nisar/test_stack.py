@@ -278,6 +278,8 @@ def test_nisar_stack_fails_closed_before_shared_s1_processing(
             }
         },
     )
+    # Fail-closed apply still goes through NESD; pin the old default.
+    stack.config.coreg_mode = "nesd"
 
     def fail_if_safe_opened(_path: object) -> object:
         pytest.fail("NISAR RSLC was routed to the SAFE opener")

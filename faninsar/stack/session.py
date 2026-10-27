@@ -2472,7 +2472,7 @@ class Stack(NetworkContract):
         dem_cache_dir: str | Path | None = None,
         roi: BoundingBox | Polygons | None = None,
         mask_plan: MaskPlan | None = None,
-        coreg_mode: CoregMode = "nesd",
+        coreg_mode: CoregMode = "geometry",
         flatten_stage: FlattenStage = "coregistration",
         coregistration_grid: CoregistrationGrid = "radar",
         multilook: tuple[int, int] = (5, 2),
