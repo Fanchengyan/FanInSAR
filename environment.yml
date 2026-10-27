@@ -17,6 +17,7 @@ dependencies:
   - rioxarray
   - netcdf4
   - h5netcdf
+  - h5py
   - tqdm
   - rtree
   - pykml

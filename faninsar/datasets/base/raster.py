@@ -870,7 +870,7 @@ class RasterDataset(GeoDataset):
             indexes=bands_idx,
             window=win,
             masked=True,
-            boundless=self.same_crs,
+            boundless=self.same_crs and not isinstance(vrt_fh, WarpedVRT),
             # WarpedVRT not supports boundless: https://github.com/rasterio/rasterio/issues/2084
         )
 
@@ -1264,17 +1264,24 @@ class RasterDataset(GeoDataset):
         """
         resolved_chunks = chunks if chunks is not None else self._chunks
         bbox_list = bbox if isinstance(bbox, list) else [bbox]
+        bbox_list = [self._ensure_query_crs(b) for b in bbox_list]
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
 
         # Create multi-file lazy reader
-        multi_reader = LazyMultiFileReader(paths, chunks=resolved_chunks)
+        with self._open_query_source(paths[0]) as src:
+            needs_warp = src.crs is not None and src.crs != self.crs
+        multi_reader = LazyMultiFileReader(
+            [self._to_read_path(p) for p in paths],
+            chunks=resolved_chunks,
+            warp_crs=self.crs if needs_warp else None,
+        )
 
         # Single bbox input (not a list) -> DataArray at root
         if not isinstance(bbox, list):
             single_bbox = bbox_list[0]
 
             # Calculate window using first file
-            with rasterio.open(paths[0]) as src:
+            with self._open_query_source(paths[0]) as src:
                 if src.crs != self.crs:
                     with WarpedVRT(src, crs=self.crs) as vrt:
                         win = vrt.window(*single_bbox)
@@ -1325,7 +1332,7 @@ class RasterDataset(GeoDataset):
         children = {}
         for i, single_bbox in enumerate(bbox_list):
             # Calculate window using first file
-            with rasterio.open(paths[0]) as src:
+            with self._open_query_source(paths[0]) as src:
                 if src.crs != self.crs:
                     with WarpedVRT(src, crs=self.crs) as vrt:
                         win = vrt.window(*single_bbox)
@@ -1406,7 +1413,13 @@ class RasterDataset(GeoDataset):
         resolved_chunks = chunks if chunks is not None else self._chunks
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
 
-        multi_reader = LazyMultiFileReader(paths, chunks=resolved_chunks)
+        with self._open_query_source(paths[0]) as src:
+            needs_warp = src.crs is not None and src.crs != self.crs
+        multi_reader = LazyMultiFileReader(
+            [self._to_read_path(p) for p in paths],
+            chunks=resolved_chunks,
+            warp_crs=self.crs if needs_warp else None,
+        )
 
         n_polygons = len(polygons)
         children = {}
@@ -1419,7 +1432,7 @@ class RasterDataset(GeoDataset):
             poly_bbox = BoundingBox(minx, miny, maxx, maxy, crs=polygons.crs)
 
             # Calculate window
-            with rasterio.open(paths[0]) as src:
+            with self._open_query_source(paths[0]) as src:
                 if src.crs != self.crs:
                     poly_bbox = poly_bbox.to_crs(self.crs)
                     with WarpedVRT(src, crs=self.crs) as vrt:
@@ -1758,6 +1771,7 @@ class RasterDataset(GeoDataset):
         """
         v = self._resolve_verbose(verbose)
         bbox_list = bbox if isinstance(bbox, list) else [bbox]
+        bbox_list = [self._ensure_query_crs(b) for b in bbox_list]
         resolved_indexes, paths, files_df = self._resolve_file_selection(indexes)
         vrt_fhs = self._paths2vrt_fhs(paths)
 
@@ -1905,6 +1919,50 @@ class RasterDataset(GeoDataset):
             src.close()
             return vrt
         return src
+
+    def _open_query_source(self, path: str) -> DatasetReader:
+        """Open a georeferenced source used to compute lazy query windows.
+
+        Parameters
+        ----------
+        path : str
+            path to the file to open.
+
+        Returns
+        -------
+        DatasetReader
+            opened dataset used to compute query windows and transforms.
+
+        Notes
+        -----
+        Subclasses can override this method to attach georeferencing or
+        other metadata that is not stored in the file itself (e.g. HDF5
+        subdatasets without embedded geotransforms).
+
+        """
+        return rasterio.open(path)
+
+    def _to_read_path(self, path: str) -> str:
+        """Return the path used by lazy readers to open a file.
+
+        Parameters
+        ----------
+        path : str
+            path stored in the dataset files metadata.
+
+        Returns
+        -------
+        str
+            path that can be opened directly by rasterio.
+
+        Notes
+        -----
+        Subclasses can override this method to convert stored paths into a
+        form readable by rasterio (e.g. restoring subdataset syntax mangled
+        by pathlib normalization).
+
+        """
+        return path
 
     def _indexes2paths(self, indexes: int | Iterable[int] | None) -> list[str]:
         """Convert file indexes to file paths.

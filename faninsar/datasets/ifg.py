@@ -133,6 +133,11 @@ class InterferogramDataset(PairDataset):
     #: value range of coherence.
     coh_range: tuple[float, float] = (0, 1)
 
+    #: class used to create the coherence dataset. Subclasses can override
+    #: this to inject a specialized coherence dataset (e.g. with custom file
+    #: handling for subdataset paths).
+    _coh_dataset_cls: type[CoherenceDataset] = CoherenceDataset
+
     _ds_coh: CoherenceDataset
     _ds_dem: RasterDataset | None = None
     _ds_mask: RasterDataset | None = None
@@ -274,7 +279,7 @@ class InterferogramDataset(PairDataset):
             chunks=chunks,
         )
 
-        self._ds_coh = CoherenceDataset(
+        self._ds_coh = self._coh_dataset_cls(
             root_dir=root_dir,
             paths=paths_coh,
             crs=self.crs,

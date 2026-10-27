@@ -13,4 +13,5 @@ from .hierarchical import HierarchicalDataset
 from .hyp3 import HyP3S1, HyP3S1Burst
 from .ifg import CoherenceDataset, InterferogramDataset
 from .licsar import LiCSAR
+from .nisar import NISAR, NISARIonosphere
 from .xarray_dataset import XarrayDataset

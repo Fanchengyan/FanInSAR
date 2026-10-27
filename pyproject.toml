@@ -57,6 +57,7 @@ dependencies = [
   "odc-geo",
   "netcdf4",
   "h5netcdf",
+  "h5py",
   "tqdm",
   "rtree",
   "pykml",
