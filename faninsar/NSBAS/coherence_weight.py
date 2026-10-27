@@ -30,9 +30,26 @@ _WEIGHT_FUNC_ALIASES = {
 def normalize_weight_func(weight_func: WeightFunc | str | None) -> WeightFunc:
     """Return the canonical observation-weight name.
 
-    ``None`` keeps the unweighted default ``"no"``. Recognized aliases are
-    ``sbas``/``uniform`` → ``no``, ``lin`` → ``coh``, and
+    Parameters
+    ----------
+    weight_func : {"no", "coh", "fim", "var"} or str, optional
+        Weight name or alias. ``None`` maps to ``"no"``.
+
+    Returns
+    -------
+    {"no", "coh", "fim", "var"}
+        Canonical name.
+
+    Raises
+    ------
+    ValueError
+        If ``weight_func`` is not recognized.
+
+    Notes
+    -----
+    Aliases: ``sbas``/``uniform`` → ``no``, ``lin`` → ``coh``, and
     ``fisher``/``wls`` → ``fim``.
+
     """
     if weight_func is None:
         return "no"
@@ -57,11 +74,12 @@ def coherence_to_weight(
     ----------
     coh : ndarray
         Spatial coherence, typically shaped ``(n_pair, n_pixel)``.
-    weight_func : {"no", "coh", "fim", "var"}, optional
+    weight_func : {"no", "coh", "fim", "var"} or str, optional
         Weight definition. ``coh`` uses coherence itself, ``fim`` uses the
         Fisher information index ``2 L γ² / (1 - γ²)`` (Seymour and Cumming,
         1994), and ``var`` uses the inverse DS phase variance (Tough et al.,
-        1995). ``no`` returns unit weights.
+        1995). ``no`` returns unit weights. Aliases: ``sbas``/``uniform``
+        → ``no``, ``lin`` → ``coh``, and ``fisher``/``wls`` → ``fim``.
     n_looks : int, optional
         Number of independent looks ``L``. Used by ``fim`` and ``var``.
         Values below 1 are raised to 1; values above 80 are capped at 80.

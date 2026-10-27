@@ -37,62 +37,95 @@ class NSBASSolver:
     see following paper for more details: `https://ens.hal.science/hal-02185213`_ ,
     `https://www.sciencedirect.com/science/article/pii/S0924271625000772`_
 
+    Observation weights are selected only through ``weight_func``. ``None`` on
+    the constructor or on :meth:`inverse` means "do not change stored state".
+    The first fill-in is unweighted (``"no"``). A weighted choice (``"coh"``,
+    ``"fim"``, or ``"var"``) without stored coherence raises ``ValueError``.
+    Interferogram rows are scaled by ``sqrt(weight)``; NSBAS model-constraint
+    rows stay at the original ``gamma`` scale.
 
     .. note::
 
-        After initialization, the ``d`` can still be updated by assigning a new
-        unwrapped interferograms matrix to ``d``. This is useful when the
-        unwrapped interferograms is divided into multiple patches and the NSBAS
-        matrix is calculated for each patch separately.
+        After initialization, the unwrapped interferograms can still be
+        replaced with :meth:`set_d`. This is useful when they are divided
+        into multiple patches and the NSBAS matrix is calculated for each
+        patch separately. The stored coherence mask and weights are reapplied.
 
     Examples
     --------
+    Unweighted NSBAS inversion:
+
     >>> import numpy as np
     >>> import faninsar as fis
     >>> from faninsar import NSBAS
-
-    >>> names = ['20170111_20170204',
-                '20170111_20170222',
-                '20170111_20170318',
-                '20170204_20170222',
-                '20170204_20170318',
-                '20170204_20170330',
-                '20170222_20170318',
-                '20170222_20170330',
-                '20170222_20170411',
-                '20170318_20170330']
-
+    >>> names = [
+    ...     "20170111_20170204",
+    ...     "20170111_20170222",
+    ...     "20170111_20170318",
+    ...     "20170204_20170222",
+    ...     "20170204_20170318",
+    ...     "20170204_20170330",
+    ...     "20170222_20170318",
+    ...     "20170222_20170330",
+    ...     "20170222_20170411",
+    ...     "20170318_20170330",
+    ... ]
     >>> pairs = fis.Pairs.from_names(names)
-    >>> unw = np.random.randint(0, 255, (len(pairs), 5))
+    >>> unw = np.random.default_rng(0).random((len(pairs), 5))
     >>> model = NSBAS.AnnualSinusoidalModel(pairs.dates)
-    >>> solver = NSBAS.NSBASSolver(unw, pairs, model)
+    >>> solver = NSBAS.NSBASSolver(unw, pairs, model, verbose=False, device="cpu")
     >>> solver
     NSBASSolver(
         pairs: Pairs(10)
         model: AnnualSinusoidalModel(dates: 6, unit: day)
         gamma: 0.0001
+        weight_func: no
         G shape: (16, 9)
         d shape: (16, 5)
     )
+    >>> incs, params, residual_pair, residual_tsm = solver.inverse()
 
+    Replace the unwrapped interferograms for another patch with the same
+    pairs:
 
-    Now we can perform NSBAS inversion to get the incremental deformation,
-    model parameters, and residuals:
-
-    >>> incs, params, residual_pair, residual_tsm = solver.inverse(return_numpy=True)
-
-    reset ``d`` by assigning a new unwrapped interferograms matrix with same pairs
-
-    >>> solver.set_d(np.random.randint(0, 255, (len(pairs), 10)))
+    >>> solver.set_d(np.random.default_rng(1).random((len(pairs), 10)))
     >>> solver
     NSBASSolver(
         pairs: Pairs(10)
         model: AnnualSinusoidalModel(dates: 6, unit: day)
         gamma: 0.0001
+        weight_func: no
         G shape: (16, 9)
         d shape: (16, 10)
     )
 
+    Set Fisher-information weights at construction, then switch to DS
+    variance weights in a later :meth:`inverse` call. Omitting a kwarg
+    keeps the stored value. Weighted inversion needs coherence with the
+    same shape as ``unw``:
+
+    >>> coh = np.full(unw.shape, 0.8)
+    >>> solver = NSBAS.NSBASSolver(
+    ...     unw,
+    ...     pairs,
+    ...     model,
+    ...     coh=coh,
+    ...     weight_func="fim",
+    ...     n_looks=20,
+    ...     verbose=False,
+    ...     device="cpu",
+    ... )
+    >>> solver
+    NSBASSolver(
+        pairs: Pairs(10)
+        model: AnnualSinusoidalModel(dates: 6, unit: day)
+        gamma: 0.0001
+        weight_func: fim
+        G shape: (5, 16, 9)
+        d shape: (16, 5)
+    )
+    >>> incs, params, residual_pair, residual_tsm = solver.inverse()
+    >>> incs, params, residual_pair, residual_tsm = solver.inverse(weight_func="var")
 
     """
 
@@ -175,6 +208,15 @@ class NSBASSolver:
         device, dtype, verbose
             Torch device, compute dtype, and progress-bar flag.
 
+        Raises
+        ------
+        TypeError
+            If ``pairs`` is not a :class:`~faninsar.Pairs` or sequence of
+            pair names.
+        ValueError
+            If ``weight_func`` is weighted and ``coh`` is omitted, or if
+            ``coh`` does not match the shape of ``unw``.
+
         """
         if isinstance(pairs, Pairs):
             self._pairs = pairs
@@ -219,8 +261,9 @@ class NSBASSolver:
             f"    pairs: {self.pairs}\n"
             f"    model: {self.model!s}\n"
             f"    gamma: {self.gamma}\n"
-            f"    G shape: {self.G.shape}\n"
-            f"    d shape: {self.d.shape}\n"
+            f"    weight_func: {self._weight_func}\n"
+            f"    G shape: {tuple(self.G.shape)}\n"
+            f"    d shape: {tuple(self.d.shape)}\n"
             ")"
         )
 
@@ -263,7 +306,22 @@ class NSBASSolver:
         """Set unwrapped interferograms and rebuild ``G`` and ``d``.
 
         The input is the raw unwrapped phases. Any current coherence mask
-        and observation weights are reapplied.
+        and observation weights are reapplied. If coherence is stored, the
+        new array must have the same shape as that coherence.
+
+        Parameters
+        ----------
+        unw : ndarray or torch.Tensor
+            Unwrapped interferograms with shape ``(n_pair, n_pixel)``.
+
+        Raises
+        ------
+        TypeError
+            If ``unw`` is not a NumPy array or torch tensor.
+        ValueError
+            If ``unw`` is not 2-D, does not match the pair count, or does
+            not match the stored coherence shape.
+
         """
         if not isinstance(unw, (np.ndarray, torch.Tensor)):
             msg = "input unw must be a numpy array or torch tensor"
@@ -474,15 +532,20 @@ class NSBASSolver:
         return_numpy : bool, optional
             Return numpy arrays if True, otherwise torch tensors, by default True.
         coh : ndarray or torch.Tensor, optional
-            Spatial coherence used for masking and weighting. When provided,
-            it replaces the coherence stored at construction time.
+            Spatial coherence used for masking and weighting. ``None`` keeps
+            the coherence stored at construction or by a previous call.
         coh_threshold : float, optional
-            Override the coherence mask threshold.
+            Override the coherence mask threshold. ``None`` keeps the stored
+            value.
         weight_func : {"no", "coh", "fim", "var"}, optional
-            Override the observation-weight definition. A weighted choice
-            without stored coherence raises ``ValueError``.
+            Override the observation-weight definition. ``None`` keeps the
+            stored choice. A weighted choice without stored coherence raises
+            ``ValueError``. Aliases match the constructor
+            (``sbas``/``uniform`` → ``no``, ``lin`` → ``coh``,
+            ``fisher``/``wls`` → ``fim``).
         n_looks : int, optional
             Override the independent-looks value used by ``fim`` and ``var``.
+            ``None`` keeps the stored value.
 
         Returns
         -------
@@ -494,6 +557,12 @@ class NSBASSolver:
             residual between interferograms and model result
         residual_tsm: np.ndarray | torch.Tensor     (n_date, n_pt)
             residual between time-series model and model result
+
+        Raises
+        ------
+        ValueError
+            If ``weight_func`` is weighted and no coherence is stored, or if
+            ``coh`` does not match the shape of the unwrapped interferograms.
 
         """
         rebuild = False

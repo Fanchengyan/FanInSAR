@@ -195,6 +195,25 @@ def test_inverse_without_kwargs_keeps_constructor_weighting() -> None:
     np.testing.assert_allclose(incs, expected_incs, rtol=1e-8, atol=1e-8)
 
 
+def test_repr_includes_weight_func() -> None:
+    """Solver repr must show the stored weight function."""
+    pairs = _sample_pairs()
+    unw = _inconsistent_unw(pairs)
+    solver = NSBASSolver(unw, pairs, verbose=False, device="cpu")
+    text = repr(solver)
+    assert "weight_func: no" in text
+    assert "G shape: (3, 2)" in text
+
+    coh = np.array(
+        [[0.90, 0.80], [0.70, 0.95], [0.60, 0.85]],
+        dtype=np.float64,
+    )
+    solver.inverse(coh=coh, weight_func="fim", coh_threshold=0.0)
+    text = repr(solver)
+    assert "weight_func: fim" in text
+    assert "G shape: (2, 3, 2)" in text
+
+
 def test_var_weights_are_below_fim_and_increase_with_coherence() -> None:
     """DS variance weights stay below the FIM/CRB and grow with coherence."""
     n_looks = 20
