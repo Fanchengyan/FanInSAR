@@ -314,9 +314,8 @@ class HistColorbar:
     label : str or None, optional
         Label for the colorbar axis.
     hist_label : str or None, optional
-        Label for the histogram axis. For vertical orientation, this appears
-        on the x-axis (count axis). For horizontal orientation, this appears
-        on the y-axis (count axis).
+        Label for the histogram axis. This appears on the x-axis (count axis)
+        for vertical orientation, and on the y-axis (count axis) for horizontal orientation.
     divider_style : dict or None, optional
         Style for the divider line between the colorbar and histogram. If None,
         uses a gray dashed line

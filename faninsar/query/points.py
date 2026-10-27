@@ -1,8 +1,7 @@
-"""A module for handling points query."""
+"""Utilities for handling spatial point queries."""
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Iterator, Sequence
 from collections.abc import Sequence as SequenceABC
 from typing import TYPE_CHECKING
@@ -93,7 +92,7 @@ class Points:
     """
 
     _values: np.ndarray
-    _crs: CRS | str | None
+    _crs: CRS | None
 
     __slots__ = ["_crs", "_values"]
 
@@ -124,8 +123,10 @@ class Points:
             If the shape of the points is not (n, 2).
 
         """
+        self._crs = None
         self._values = np.asarray(points, dtype=dtype)
-        self._crs = crs
+        if crs is not None:
+            self.set_crs(crs)
         if self._values.ndim == 1:
             self._values = self._values.reshape(1, -1)
         if self._values.ndim != 2 or self._values.shape[1] != 2:
@@ -165,17 +166,19 @@ class Points:
 
     def __str__(self) -> str:
         """Return the string representation of the Points."""
-        return f"Points(count={len(self)}, crs='{self.crs}')"
+        crs = self.crs.to_string() if self.crs else None
+        return f"Points(count={len(self)}, crs='{crs}')"
 
     def __repr__(self) -> str:
         """Return the string representation of the Points."""
         prefix = "Points:\n"
         middle = self.to_dataframe().to_string(max_rows=10)
-        suffix = f"\n[count={len(self)}, crs='{self.crs}']"
+        crs = self.crs.to_string() if self.crs else None
+        suffix = f"\n[count={len(self)}, crs='{crs}']"
 
         return f"{prefix}{middle}{suffix}"
 
-    def __array__(self, dtype: np.dtype | None = None) -> np.ndarray:
+    def __array__(self, dtype: np.dtype | None = None) -> np.ndarray:  # noqa: PLW3201
         """Return the values of the points as a numpy array."""
         if dtype is not None:
             return self._values.astype(dtype)
@@ -206,12 +209,12 @@ class Points:
             return None
         return Points(values, crs=crs_new)
 
-    def _ensure_points_crs(self, other: Points) -> tuple[Points, CRS]:
+    def _ensure_points_crs(self, other: Points) -> tuple[Points, CRS | None]:
         """Ensure the coordinate reference system of the points are the same."""
         if self.crs != other.crs:
             if self.crs is None or other.crs is None:
                 crs_new = self.crs or other.crs
-                warnings.warn(
+                logger.warning(
                     "Cannot find the coordinate reference system of the points. "
                     "The crs of two points will assume to be the same. ",
                     stacklevel=2,

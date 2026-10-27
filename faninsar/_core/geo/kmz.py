@@ -1,0 +1,1043 @@
+"""KMZ exporters for array-backed geospatial overlays."""
+
+from __future__ import annotations
+
+import io
+import math
+import posixpath
+import zipfile
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+import rioxarray  # noqa: F401
+from lxml import etree
+from matplotlib import ticker
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.cm import ScalarMappable
+from matplotlib.figure import Figure
+from pykml.factory import KML_ElementMaker as KML
+from pyproj.crs import CRS
+from rioxarray.exceptions import MissingSpatialDimensionError
+
+from faninsar._core.geo.coordinates import bounds_from_xy
+from faninsar.logging import setup_logger
+
+if TYPE_CHECKING:
+    from os import PathLike
+
+    import xarray as xr
+
+    from faninsar.query.bbox import BoundingBox
+
+logger = setup_logger(__name__)
+
+
+def _ensure_bounds_in_wgs84(
+    bounds: tuple[float, ...],
+) -> tuple[float, float, float, float]:
+    """Ensure the bounds are in WGS84 coordinate system."""
+    if len(bounds) != 4:
+        msg = (
+            f"bounds should be a tuple of (west, south, east, north), but got {bounds}"
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+    west, south, east, north = bounds
+    if west < -180 or east > 180 or south < -90 or north > 90:
+        msg = (
+            "bounds should be in WGS84 coordinate system, "
+            f"but got [{west}, {south}, {east}, {north}]"
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+    return west, south, east, north
+
+
+def _normalize_kml_bounds(
+    bounds: tuple[float, float, float, float] | BoundingBox,
+) -> BoundingBox:
+    """Normalize bounds to a WGS84 :class:`BoundingBox`.
+
+    Parameters
+    ----------
+    bounds : tuple[float, float, float, float] | BoundingBox
+        Bounds in ``(west, south, east, north)`` order or a bounding box instance.
+
+    Returns
+    -------
+    BoundingBox
+        Bounds normalized to WGS84.
+
+    Raises
+    ------
+    TypeError
+        If ``bounds`` is not an iterable of four floats or a bounding box.
+
+    """
+    from faninsar.query.bbox import BoundingBox
+
+    wgs84 = CRS.from_epsg(4326)
+    if isinstance(bounds, BoundingBox):
+        bounds_wgs84 = bounds
+    elif isinstance(bounds, Iterable):
+        bounds_wgs84 = BoundingBox(*_ensure_bounds_in_wgs84(tuple(bounds)), crs=wgs84)
+    else:
+        msg = (
+            "bounds should be a BoundingBox or an iterable of "
+            "(west, south, east, north)"
+        )
+        logger.error(msg)
+        raise TypeError(msg)
+
+    if bounds_wgs84.crs != wgs84:
+        bounds_wgs84 = bounds_wgs84.to_crs(wgs84)
+
+    return bounds_wgs84
+
+
+def _normalize_image_kwargs(
+    img_kwargs: dict[str, Any] | None,
+    *,
+    interpolation: str,
+) -> dict[str, Any]:
+    """Normalize image rendering keyword arguments.
+
+    Parameters
+    ----------
+    img_kwargs : dict[str, Any] | None
+        Keyword arguments passed to :func:`matplotlib.axes.Axes.imshow`.
+    interpolation : str
+        Default interpolation method to use when not provided by the caller.
+
+    Returns
+    -------
+    dict[str, Any]
+        A shallow copy of the input keyword arguments with defaults applied.
+
+    """
+    img_kwargs_new = {} if img_kwargs is None else dict(img_kwargs)
+    img_kwargs_new.setdefault("interpolation", interpolation)
+    return img_kwargs_new
+
+
+def _validate_render_scale(render_scale: int) -> int:
+    """Validate and normalize a render scale value.
+
+    Parameters
+    ----------
+    render_scale : int
+        Pixel repeat scale used before rendering.
+
+    Returns
+    -------
+    int
+        Render scale as a positive integer.
+
+    Raises
+    ------
+        If ``render_scale`` is not a positive integer value.
+
+    """
+    if render_scale <= 0:
+        msg = f"render_scale should be positive, but got {render_scale}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    if not float(render_scale).is_integer():
+        msg = (
+            "render_scale should be a positive integer value when source pixels "
+            f"are repeated, but got {render_scale}"
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+
+    return int(render_scale)
+
+
+def _repeat_source_pixels(arr: np.ndarray, render_scale: int) -> np.ndarray:
+    """Repeat source pixels before rendering.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Source array with spatial dimensions on the first two axes.
+    render_scale : int
+        Positive integer pixel repeat scale.
+
+    Returns
+    -------
+    np.ndarray
+        Array with repeated source pixels.
+
+    Raises
+    ------
+    ValueError
+        If ``render_scale`` is not a positive integer value.
+
+    """
+    scale = _validate_render_scale(render_scale)
+    if scale == 1:
+        return arr
+    return np.repeat(np.repeat(arr, scale, axis=0), scale, axis=1)
+
+
+def _get_dataarray_spatial_dimensions(data_array: xr.DataArray) -> tuple[str, str]:
+    """Get rioxarray spatial dimension names from a data array.
+
+    Parameters
+    ----------
+    data_array : xarray.DataArray
+        Data array with rioxarray spatial dimensions configured.
+
+    Returns
+    -------
+    tuple[str, str]
+        Spatial dimension names in ``(x_dim, y_dim)`` order.
+
+    Raises
+    ------
+    ValueError
+        If the data array has no rioxarray spatial dimension metadata.
+
+    """
+    try:
+        return data_array.rio.x_dim, data_array.rio.y_dim
+    except MissingSpatialDimensionError as exc:
+        msg = (
+            "data_array should have rioxarray spatial dimensions set with "
+            "data_array.rio.set_spatial_dims(x_dim=..., y_dim=...)."
+        )
+        logger.exception(msg)
+        raise ValueError(msg) from exc
+
+
+def _dataarray_to_wgs84_array_and_bounds(
+    data_array: xr.DataArray,
+) -> tuple[np.ndarray, BoundingBox]:
+    """Convert a data array to WGS84 image data and bounds.
+
+    Parameters
+    ----------
+    data_array : xarray.DataArray
+        Data array with rioxarray CRS and spatial dimension metadata.
+
+    Returns
+    -------
+    tuple[np.ndarray, BoundingBox]
+        Array values ordered as ``(y, x, ...)`` and WGS84 bounds.
+
+    Raises
+    ------
+    ValueError
+        If the data array has no CRS, no spatial dimension metadata, or fewer
+        than two dimensions.
+
+    """
+    wgs84 = CRS.from_epsg(4326)
+    x_dim, y_dim = _get_dataarray_spatial_dimensions(data_array)
+    crs = data_array.rio.crs
+    if crs is None:
+        msg = "data_array should have a CRS set with data_array.rio.write_crs(...)."
+        logger.error(msg)
+        raise ValueError(msg)
+    if data_array.ndim < 2:
+        msg = (
+            "data_array should have at least two spatial dimensions, "
+            f"but got shape {data_array.shape}."
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+
+    if CRS.from_user_input(crs) != wgs84:
+        reproject_kwargs: dict[str, Any] = {}
+        if data_array.rio.nodata is not None:
+            reproject_kwargs["nodata"] = data_array.rio.nodata
+        data_array = data_array.rio.reproject(wgs84, **reproject_kwargs)
+        x_dim, y_dim = _get_dataarray_spatial_dimensions(data_array)
+
+    spatial_dims = {x_dim, y_dim}
+    extra_dims = [dim for dim in data_array.dims if dim not in spatial_dims]
+    image_data = data_array.transpose(y_dim, x_dim, *extra_dims).values
+    bounds = bounds_from_xy(
+        data_array[x_dim].values,
+        data_array[y_dim].values,
+        crs=wgs84,
+    )
+    return np.asarray(image_data), bounds
+
+
+def _render_array_to_rgba(
+    arr: np.ndarray,
+    *,
+    img_kwargs: dict[str, Any] | None = None,
+    render_scale: int = 4,
+) -> tuple[Figure, ScalarMappable, np.ndarray]:
+    """Render an array to an exact-pixel RGBA image.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Array to render with :func:`matplotlib.axes.Axes.imshow`.
+    img_kwargs : dict[str, Any] | None, optional
+        Keyword arguments for :func:`matplotlib.axes.Axes.imshow`.
+    render_scale : int, optional
+        Positive integer scale factor used to repeat source pixels before
+        rendering, improving pixel-level clarity in Google Earth.
+
+    Returns
+    -------
+    tuple[Figure, ScalarMappable, np.ndarray]
+        Figure used for rendering, the ``imshow`` mappable, and the rendered
+        RGBA image as ``uint8``.
+
+    Raises
+    ------
+    ValueError
+        If ``render_scale`` is not a positive integer value.
+
+    """
+    if arr.ndim < 2:
+        msg = f"arr should have at least 2 dimensions, but got shape {arr.shape}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    arr = _repeat_source_pixels(arr, render_scale)
+    render_height, render_width = arr.shape[:2]
+    dpi = 100
+
+    fig = Figure(
+        figsize=(render_width / dpi, render_height / dpi),
+        dpi=dpi,
+        frameon=False,
+    )
+    FigureCanvasAgg(fig)
+    fig.patch.set_alpha(0)
+    ax = fig.add_axes((0, 0, 1, 1))
+    ax.set_axis_off()
+    mappable = ax.imshow(arr, **(img_kwargs or {}))
+    ax.set_aspect("auto")
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba()).copy()
+    return fig, mappable, rgba
+
+
+def _render_colorbar_to_png_bytes(
+    mappable: ScalarMappable,
+    **kwargs: Any,
+) -> bytes:
+    """Render a colorbar to PNG bytes.
+
+    Parameters
+    ----------
+    mappable : ScalarMappable
+        The scalar mappable used to build the colorbar.
+    **kwargs : Any
+        Keyword arguments accepted by :func:`save_colorbar`, excluding
+        ``out_file`` and ``mappable``.
+
+    Returns
+    -------
+    bytes
+        Encoded PNG data.
+
+    """
+    buffer = io.BytesIO()
+    colorbar_mappable = ScalarMappable(norm=mappable.norm, cmap=mappable.cmap)
+    array = mappable.get_array()
+    if array is not None:
+        colorbar_mappable.set_array(np.asarray(array))
+    colorbar_mappable.set_clim(*mappable.get_clim())
+    save_colorbar(buffer, colorbar_mappable, **kwargs)
+    return buffer.getvalue()
+
+
+def _rgba_to_png_bytes(arr: np.ndarray) -> bytes:
+    """Encode an RGBA array to PNG bytes.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        RGBA array to encode.
+
+    Returns
+    -------
+    bytes
+        Encoded PNG data.
+
+    """
+    buffer = io.BytesIO()
+    plt.imsave(buffer, arr, format="png")
+    return buffer.getvalue()
+
+
+def _resize_rgba_nearest(
+    arr: np.ndarray,
+    target_height: int,
+    target_width: int,
+) -> np.ndarray:
+    """Resize an RGBA array with nearest-neighbor sampling.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Input RGBA image.
+    target_height : int
+        Target height in pixels.
+    target_width : int
+        Target width in pixels.
+
+    Returns
+    -------
+    np.ndarray
+        Resized RGBA image.
+
+    """
+    if arr.shape[0] == target_height and arr.shape[1] == target_width:
+        return arr
+
+    row_idx = np.linspace(0, arr.shape[0] - 1, target_height).round().astype(int)
+    col_idx = np.linspace(0, arr.shape[1] - 1, target_width).round().astype(int)
+    return arr[row_idx][:, col_idx]
+
+
+def _pixel_window_to_bounds(
+    image_bounds: BoundingBox,
+    image_width: int,
+    image_height: int,
+    *,
+    x0: int,
+    x1: int,
+    y0: int,
+    y1: int,
+) -> BoundingBox:
+    """Convert a pixel window to geographic bounds.
+
+    Parameters
+    ----------
+    image_bounds : BoundingBox
+        Full image bounds in WGS84.
+    image_width : int
+        Full image width in pixels.
+    image_height : int
+        Full image height in pixels.
+    x0, x1, y0, y1 : int
+        Pixel window coordinates where ``x1`` and ``y1`` are exclusive.
+
+    Returns
+    -------
+    BoundingBox
+        Geographic bounds for the requested pixel window.
+
+    """
+    from faninsar.query.bbox import BoundingBox
+
+    lon_span = image_bounds.right - image_bounds.left
+    lat_span = image_bounds.top - image_bounds.bottom
+    west = image_bounds.left + lon_span * x0 / image_width
+    east = image_bounds.left + lon_span * x1 / image_width
+    north = image_bounds.top - lat_span * y0 / image_height
+    south = image_bounds.top - lat_span * y1 / image_height
+    return BoundingBox(west, south, east, north, crs=image_bounds.crs)
+
+
+def _node_lod(
+    *,
+    is_leaf: bool,
+    tile_size: int,
+) -> tuple[int, int]:
+    """Compute region LOD limits for a tile node.
+
+    Parameters
+    ----------
+    is_leaf : bool
+        Whether the node is a leaf tile.
+    tile_size : int
+        Maximum tile size in pixels.
+
+    Returns
+    -------
+    tuple[int, int]
+        ``(min_lod_pixels, max_lod_pixels)`` for the node overlay.
+
+    """
+    return (0, -1 if is_leaf else tile_size * 2)
+
+
+def _kml_latlon_box(bounds: BoundingBox) -> Any:
+    """Create a KML LatLonBox element.
+
+    Parameters
+    ----------
+    bounds : BoundingBox
+        Tile bounds in WGS84.
+
+    Returns
+    -------
+    Any
+        A ``pykml`` LatLonBox element.
+
+    """
+    return KML.LatLonBox(
+        KML.north(bounds.top),
+        KML.south(bounds.bottom),
+        KML.east(bounds.right),
+        KML.west(bounds.left),
+    )
+
+
+def _kml_region(
+    bounds: BoundingBox,
+    *,
+    min_lod_pixels: int,
+    max_lod_pixels: int,
+) -> Any:
+    """Create a KML Region element.
+
+    Parameters
+    ----------
+    bounds : BoundingBox
+        Region bounds in WGS84.
+    min_lod_pixels : int
+        Minimum number of screen pixels before the region loads.
+    max_lod_pixels : int
+        Maximum number of screen pixels before the region unloads.
+
+    Returns
+    -------
+    Any
+        A ``pykml`` Region element.
+
+    """
+    return KML.Region(
+        KML.LatLonAltBox(
+            KML.north(bounds.top),
+            KML.south(bounds.bottom),
+            KML.east(bounds.right),
+            KML.west(bounds.left),
+        ),
+        KML.Lod(
+            KML.minLodPixels(str(min_lod_pixels)),
+            KML.maxLodPixels(str(max_lod_pixels)),
+        ),
+    )
+
+
+def _relative_kml_href(source_path: str, target_path: str) -> str:
+    """Build a relative KML href.
+
+    Parameters
+    ----------
+    source_path : str
+        Source file path inside the KMZ.
+    target_path : str
+        Target file path inside the KMZ.
+
+    Returns
+    -------
+    str
+        Relative POSIX path from ``source_path`` to ``target_path``.
+
+    """
+    source_dir = posixpath.dirname(source_path) or "."
+    return posixpath.relpath(target_path, start=source_dir)
+
+
+@dataclass(slots=True)
+class _TiledKmzNode:
+    """Internal quadtree node used to build a tiled KMZ."""
+
+    level: int
+    x: int
+    y: int
+    x0: int
+    x1: int
+    y0: int
+    y1: int
+    bounds: BoundingBox
+    children: list[_TiledKmzNode] = field(default_factory=list)
+
+    @property
+    def width(self) -> int:
+        """Width of the node window in pixels."""
+        return self.x1 - self.x0
+
+    @property
+    def height(self) -> int:
+        """Height of the node window in pixels."""
+        return self.y1 - self.y0
+
+    @property
+    def is_leaf(self) -> bool:
+        """Whether the node has no children."""
+        return not self.children
+
+    @property
+    def kml_path(self) -> str:
+        """KMZ-internal KML path for the node."""
+        return f"tiles/{self.level}/{self.x}/{self.y}.kml"
+
+    @property
+    def png_path(self) -> str:
+        """KMZ-internal PNG path for the node."""
+        return f"tiles/{self.level}/{self.x}/{self.y}.png"
+
+
+def _build_tiled_kmz_tree(
+    *,
+    image_width: int,
+    image_height: int,
+    bounds: BoundingBox,
+    tile_size: int,
+) -> _TiledKmzNode:
+    """Build a quadtree over a rendered overlay image.
+
+    Parameters
+    ----------
+    image_width : int
+        Rendered image width in pixels.
+    image_height : int
+        Rendered image height in pixels.
+    bounds : BoundingBox
+        Image bounds in WGS84.
+    tile_size : int
+        Maximum tile size in pixels.
+
+    Returns
+    -------
+    _TiledKmzNode
+        Root node of the tile pyramid.
+
+    """
+
+    def build(
+        level: int,
+        x: int,
+        y: int,
+        x0: int,
+        x1: int,
+        y0: int,
+        y1: int,
+    ) -> _TiledKmzNode:
+        node_bounds = _pixel_window_to_bounds(
+            bounds,
+            image_width,
+            image_height,
+            x0=x0,
+            x1=x1,
+            y0=y0,
+            y1=y1,
+        )
+        node = _TiledKmzNode(level, x, y, x0, x1, y0, y1, node_bounds)
+        should_split = (
+            (node.width > tile_size or node.height > tile_size)
+            and node.width > 1
+            and node.height > 1
+        )
+        if not should_split:
+            return node
+
+        x_mid = x0 + node.width // 2
+        y_mid = y0 + node.height // 2
+        child_windows = [
+            (x0, x_mid, y0, y_mid),
+            (x_mid, x1, y0, y_mid),
+            (x0, x_mid, y_mid, y1),
+            (x_mid, x1, y_mid, y1),
+        ]
+        for child_x_offset, child_y_offset, child_window in zip(
+            (0, 1, 0, 1),
+            (0, 0, 1, 1),
+            child_windows,
+            strict=True,
+        ):
+            child_x0, child_x1, child_y0, child_y1 = child_window
+            if child_x0 == child_x1 or child_y0 == child_y1:
+                continue
+            node.children.append(
+                build(
+                    level + 1,
+                    x * 2 + child_x_offset,
+                    y * 2 + child_y_offset,
+                    child_x0,
+                    child_x1,
+                    child_y0,
+                    child_y1,
+                )
+            )
+        return node
+
+    return build(0, 0, 0, 0, image_width, 0, image_height)
+
+
+def _iter_tiled_kmz_nodes(node: _TiledKmzNode) -> Iterator[_TiledKmzNode]:
+    """Iterate through a tiled KMZ quadtree in depth-first order.
+
+    Parameters
+    ----------
+    node : _TiledKmzNode
+        Root or intermediate node.
+
+    Yields
+    ------
+    _TiledKmzNode
+        Each node in the tree.
+
+    """
+    yield node
+    for child in node.children:
+        yield from _iter_tiled_kmz_nodes(child)
+
+
+def _tile_image_for_node(
+    rgba: np.ndarray,
+    node: _TiledKmzNode,
+    *,
+    tile_size: int,
+) -> np.ndarray:
+    """Extract and downsample the tile image for a quadtree node.
+
+    Parameters
+    ----------
+    rgba : np.ndarray
+        Full rendered RGBA image.
+    node : _TiledKmzNode
+        Node describing the source window.
+    tile_size : int
+        Maximum tile size in pixels.
+
+    Returns
+    -------
+    np.ndarray
+        Tile RGBA image.
+
+    """
+    tile = rgba[node.y0 : node.y1, node.x0 : node.x1]
+    scale = max(tile.shape[1] / tile_size, tile.shape[0] / tile_size, 1.0)
+    target_width = max(1, math.ceil(tile.shape[1] / scale))
+    target_height = max(1, math.ceil(tile.shape[0] / scale))
+    return _resize_rgba_nearest(tile, target_height, target_width)
+
+
+def _tiled_kmz_tile_kml(
+    node: _TiledKmzNode,
+    *,
+    tile_size: int,
+    min_lod_pixels: int,
+) -> bytes:
+    """Build a tile KML document for a tiled KMZ node.
+
+    Parameters
+    ----------
+    node : _TiledKmzNode
+        Tile node to serialize.
+    tile_size : int
+        Maximum tile size in pixels.
+    min_lod_pixels : int
+        Minimum LOD threshold for child network links.
+
+    Returns
+    -------
+    bytes
+        Encoded KML document.
+
+    """
+    node_min_lod, node_max_lod = _node_lod(is_leaf=node.is_leaf, tile_size=tile_size)
+    document = KML.Document(
+        KML.GroundOverlay(
+            KML.name(f"tile_{node.level}_{node.x}_{node.y}"),
+            _kml_region(
+                node.bounds,
+                min_lod_pixels=node_min_lod,
+                max_lod_pixels=node_max_lod,
+            ),
+            KML.Icon(KML.href(posixpath.basename(node.png_path))),
+            _kml_latlon_box(node.bounds),
+        )
+    )
+
+    for child in node.children:
+        document.append(
+            KML.NetworkLink(
+                KML.name(f"tile_{child.level}_{child.x}_{child.y}"),
+                _kml_region(
+                    child.bounds,
+                    min_lod_pixels=min_lod_pixels,
+                    max_lod_pixels=-1,
+                ),
+                KML.Link(
+                    KML.href(_relative_kml_href(node.kml_path, child.kml_path)),
+                    KML.viewRefreshMode("onRegion"),
+                ),
+            )
+        )
+
+    return etree.tostring(
+        KML.kml(document),
+        pretty_print=True,
+        encoding="utf-8",
+        xml_declaration=True,
+    )
+
+
+def _tiled_kmz_root_kml(
+    root: _TiledKmzNode,
+    bounds: BoundingBox,
+    *,
+    colorbar_path: str,
+) -> bytes:
+    """Build the root KML document for a tiled KMZ.
+
+    Parameters
+    ----------
+    root : _TiledKmzNode
+        Root node of the tile pyramid.
+    bounds : BoundingBox
+        Full overlay bounds in WGS84.
+    colorbar_path : str
+        KMZ-internal path to the colorbar image.
+
+    Returns
+    -------
+    bytes
+        Encoded root KML document.
+
+    """
+    document = KML.Document(
+        KML.NetworkLink(
+            KML.name("root"),
+            _kml_region(bounds, min_lod_pixels=0, max_lod_pixels=-1),
+            KML.Link(
+                KML.href(root.kml_path),
+                KML.viewRefreshMode("onRegion"),
+            ),
+        ),
+        KML.ScreenOverlay(
+            KML.name("Color bar"),
+            KML.Icon(KML.href(colorbar_path)),
+            KML.overlayXY(x="1", y="0", xunits="fraction", yunits="fraction"),
+            KML.screenXY(x="1", y="0", xunits="fraction", yunits="fraction"),
+            KML.size(x="0", y="500", xunits="pixel", yunits="pixel"),
+        ),
+    )
+    return etree.tostring(
+        KML.kml(document),
+        pretty_print=True,
+        encoding="utf-8",
+        xml_declaration=True,
+    )
+
+
+def save_colorbar(
+    out_file: PathLike,
+    mappable: ScalarMappable,
+    figsize: tuple[float, float] = (0.18, 3.6),
+    label: str | None = None,
+    nbins: int | None = None,
+    alpha: float = 0.5,
+    **kwargs,
+) -> None:
+    """Save the colorbar to a file.
+
+    Parameters
+    ----------
+    out_file: str or Path
+        the path of the output colorbar file.
+    mappable: ScalarMappable
+        the ScalarMappable object to be used for the colorbar.
+    figsize: tuple
+        the size of the colorbar figure. Default is (0.18, 3.6).
+    label: str
+        the label of the colorbar. Default is None.
+    nbins: int
+        the number of bins of the colorbar. Default is None.
+    alpha: float
+        the transparency of the colorbar figure. Default is 0.5.
+    kwargs: dict
+        the keyword arguments for :func:`matplotlib.pyplot.colorbar` function.
+
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.axis("off")
+    kwargs.update({"fraction": 1})
+    cbar = fig.colorbar(mappable, ax=ax, **kwargs)
+
+    # update colorbar label and ticks
+    if label:
+        cbar.set_label(label, fontsize=12)
+    if nbins:
+        cbar.locator = ticker.MaxNLocator(nbins=nbins)
+        cbar.update_ticks()
+
+    cbar.ax.tick_params(which="both", labelsize=12)
+    fig.patch.set_facecolor("white")
+    fig.patch.set_alpha(alpha)
+    fig.savefig(out_file, bbox_inches="tight", dpi=300)
+
+
+def array2kmz(
+    arr: np.ndarray,
+    out_file: PathLike,
+    bounds: tuple[float, float, float, float] | BoundingBox,
+    render_scale: int = 4,
+    img_kwargs: dict | None = None,
+    cbar_kwargs: dict | None = None,
+    *,
+    tile_size: int = 256,
+    min_lod_pixels: int = 128,
+    verbose: bool = True,
+) -> None:
+    """Write an array into a tiled KMZ tile pyramid.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Array to export. The primary supported use case is a 2D scalar raster.
+    out_file : PathLike
+        Output KMZ path.
+    bounds : tuple[float, float, float, float] | BoundingBox
+        Bounds of the image in ``(west, south, east, north)`` order in WGS84.
+    render_scale : int, optional
+        Positive integer scale factor used to repeat source pixels before
+        rendering, improving pixel-level clarity in Google Earth.
+    img_kwargs : dict | None, optional
+        Keyword arguments forwarded to :func:`matplotlib.axes.Axes.imshow`.
+    cbar_kwargs : dict | None, optional
+        Keyword arguments forwarded to :func:`save_colorbar`, excluding
+        ``out_file`` and ``mappable``.
+    tile_size : int, optional
+        Maximum tile size in pixels for each tile image.
+    min_lod_pixels : int, optional
+        Minimum screen-space threshold used by child ``NetworkLink`` regions.
+
+    verbose : bool, optional
+        Whether to log the output file path.
+
+    Raises
+    ------
+    ValueError
+        If any tiling parameter is invalid.
+
+    """
+    if tile_size <= 0:
+        msg = f"tile_size should be positive, but got {tile_size}"
+        logger.error(msg)
+        raise ValueError(msg)
+    if min_lod_pixels < 0:
+        msg = f"min_lod_pixels should be non-negative, but got {min_lod_pixels}"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    bounds_norm = _normalize_kml_bounds(bounds)
+    img_kwargs_norm = _normalize_image_kwargs(img_kwargs, interpolation="nearest")
+    cbar_kwargs_norm = {} if cbar_kwargs is None else dict(cbar_kwargs)
+
+    fig, mappable, rgba = _render_array_to_rgba(
+        arr,
+        img_kwargs=img_kwargs_norm,
+        render_scale=render_scale,
+    )
+    try:
+        colorbar_png = _render_colorbar_to_png_bytes(mappable, **cbar_kwargs_norm)
+    finally:
+        plt.close(fig)
+
+    root = _build_tiled_kmz_tree(
+        image_width=rgba.shape[1],
+        image_height=rgba.shape[0],
+        bounds=bounds_norm,
+        tile_size=tile_size,
+    )
+
+    out_file = Path(out_file)
+    if out_file.suffix != ".kmz":
+        out_file = out_file.parent / (out_file.stem + ".kmz")
+
+    with zipfile.ZipFile(out_file, "w", compression=zipfile.ZIP_DEFLATED) as kmz:
+        kmz.writestr(
+            "doc.kml",
+            _tiled_kmz_root_kml(
+                root,
+                bounds_norm,
+                colorbar_path="legend/colorbar.png",
+            ),
+        )
+        kmz.writestr("legend/colorbar.png", colorbar_png)
+
+        for node in _iter_tiled_kmz_nodes(root):
+            kmz.writestr(
+                node.png_path,
+                _rgba_to_png_bytes(
+                    _tile_image_for_node(rgba, node, tile_size=tile_size)
+                ),
+            )
+            kmz.writestr(
+                node.kml_path,
+                _tiled_kmz_tile_kml(
+                    node,
+                    tile_size=tile_size,
+                    min_lod_pixels=min_lod_pixels,
+                ),
+            )
+
+    if verbose:
+        info = f"write tiled kmz file to {out_file}"
+        logger.info(info)
+
+
+def dataarray2kmz(
+    data_array: xr.DataArray,
+    out_file: PathLike,
+    render_scale: int = 4,
+    img_kwargs: dict | None = None,
+    cbar_kwargs: dict | None = None,
+    verbose: bool = True,
+    tile_size: int = 256,
+    min_lod_pixels: int = 128,
+) -> None:
+    """Write an xarray DataArray into a KMZ file.
+
+    Parameters
+    ----------
+    data_array : xarray.DataArray
+        Data array with rioxarray CRS and spatial dimension metadata. The array
+        is automatically reprojected to WGS84 before export when needed.
+    out_file : str or PathLike
+        Path of the KMZ file.
+    render_scale : int, optional
+        Positive integer scale factor used to repeat source pixels before
+        rendering, improving pixel-level clarity in Google Earth.
+    img_kwargs : dict | None, optional
+        Keyword arguments for :func:`matplotlib.pyplot.imshow`.
+    cbar_kwargs : dict | None, optional
+        Keyword arguments for :func:`save_colorbar`, excluding ``out_file`` and
+        ``mappable``.
+    verbose : bool, optional
+        Whether to log the output path.
+    tile_size : int, optional
+        Maximum tile size in pixels.
+    min_lod_pixels : int, optional
+        Minimum screen-space threshold used by child ``NetworkLink`` regions.
+
+    Raises
+    ------
+    ValueError
+        If ``data_array`` does not have rioxarray CRS or spatial dimension
+        metadata, or if any tiling parameter is invalid.
+
+    """
+    arr, bounds = _dataarray_to_wgs84_array_and_bounds(data_array)
+    array2kmz(
+        arr,
+        out_file,
+        bounds,
+        render_scale,
+        img_kwargs=img_kwargs,
+        cbar_kwargs=cbar_kwargs,
+        verbose=verbose,
+        tile_size=tile_size,
+        min_lod_pixels=min_lod_pixels,
+    )

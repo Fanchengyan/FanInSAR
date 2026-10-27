@@ -12,10 +12,16 @@ from tqdm import tqdm
 
 from faninsar import Loops, Pairs, parse_device
 from faninsar.logging import setup_logger
+from faninsar.NSBAS.coherence_weight import (
+    WeightFunc,
+    coherence_to_weight,
+    normalize_weight_func,
+)
 from faninsar.NSBAS.tsmodels import TimeSeriesModels
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+    from torch._tensor import Tensor
 
 
 logger = setup_logger(__name__)
@@ -95,19 +101,29 @@ class NSBASSolver:
     _gamma: float
     _G: torch.Tensor
     _d: torch.Tensor
+    _unw: np.ndarray
+    _coh: np.ndarray | None
+    _coh_threshold: float
+    _weight_func: WeightFunc
+    _n_looks: int
     _device: torch.device
     _dtype: torch.dtype
     _verbose: bool
 
     __slots__ = [
         "_G",
+        "_coh",
+        "_coh_threshold",
         "_d",
         "_device",
         "_dtype",
         "_gamma",
         "_model",
+        "_n_looks",
         "_pairs",
+        "_unw",
         "_verbose",
+        "_weight_func",
     ]
 
     def __init__(
@@ -115,12 +131,51 @@ class NSBASSolver:
         unw: NDArray[np.floating] | torch.Tensor,
         pairs: Pairs | Sequence[str],
         model: TimeSeriesModels | None = None,
+        coh: NDArray[np.floating] | torch.Tensor | None = None,
+        coh_threshold: float | None = None,
+        weight_func: WeightFunc | str | None = None,
+        n_looks: int | None = None,
         gamma: float = 0.0001,
         device: str | torch.device | None = None,
         dtype: torch.dtype = torch.float64,
         verbose: bool = True,
     ) -> None:
-        """Initialize NSBAS solver."""
+        """Initialize NSBAS solver.
+
+        Parameters
+        ----------
+        unw : ndarray or torch.Tensor
+            Unwrapped interferograms with shape ``(n_pair, n_pixel)``.
+        pairs : Pairs or Sequence[str]
+            Interferogram pairs corresponding to ``unw``.
+        model : TimeSeriesModels, optional
+            Parametric NSBAS model. Omit for pure SBAS.
+        coh : ndarray or torch.Tensor, optional
+            Spatial coherence with the same shape as ``unw``. ``None`` means
+            no coherence is stored. Values at or below ``coh_threshold``
+            are treated as missing. When a weight function is selected,
+            ``coh`` is also converted to observation weights.
+        coh_threshold : float, optional
+            Coherence mask threshold. ``None`` keeps the internal default
+            of ``0.4``. Pixels with ``coh <= coh_threshold`` are set to NaN
+            before inversion.
+        weight_func : {"no", "coh", "fim", "var"}, optional
+            Observation-weight definition. ``None`` keeps the unweighted
+            default ``"no"``. ``coh`` uses coherence, ``fim`` uses
+            ``2 L γ² / (1 - γ²)``, and ``var`` uses the inverse DS phase
+            variance. A weighted choice without ``coh`` raises
+            ``ValueError``.
+            ``sbas``/``uniform`` map to ``no``, ``lin`` to ``coh``, and
+            ``fisher``/``wls`` to ``fim``.
+        n_looks : int, optional
+            Independent looks ``L`` used by ``fim`` and ``var``. ``None``
+            keeps the internal default of ``1``.
+        gamma : float, optional
+            Weight of the NSBAS model-constraint rows.
+        device, dtype, verbose
+            Torch device, compute dtype, and progress-bar flag.
+
+        """
         if isinstance(pairs, Pairs):
             self._pairs = pairs
         elif isinstance(pairs, Sequence):
@@ -130,25 +185,25 @@ class NSBASSolver:
             logger.error(msg, extra={"pairs_type": type(pairs).__name__})
             raise TypeError(msg)
 
-        if isinstance(unw, np.ma.MaskedArray):
-            unw = unw.filled(np.nan)
-
         self._device = parse_device(device)
         self._dtype = dtype
         self._verbose = verbose
 
         self._model = None
         self._gamma = 0.0001
+        self._unw = _to_numpy(unw)
+        self._coh = None if coh is None else _to_numpy(coh)
+        self._coh_threshold = 0.4 if coh_threshold is None else coh_threshold
+        self._n_looks = 1 if n_looks is None else n_looks
+        self._weight_func = normalize_weight_func(weight_func)
 
         if model is not None:
             _check_model(model)
             _check_gamma(gamma)
             self._model = model
             self._gamma = gamma
-            self.set_G(self._make_nsbas_matrix(model.G_br, gamma))
-        else:
-            self.set_G(self._make_sbas_matrix())
-        self.set_d(unw)
+
+        self._rebuild_system()
 
     def __str__(self) -> str:
         """Return string representation."""
@@ -205,7 +260,11 @@ class NSBASSolver:
         return self._d
 
     def set_d(self, unw: np.ndarray | torch.Tensor) -> None:
-        """Set d by appending model matrix part to input unw matrix."""
+        """Set unwrapped interferograms and rebuild ``G`` and ``d``.
+
+        The input is the raw unwrapped phases. Any current coherence mask
+        and observation weights are reapplied.
+        """
         if not isinstance(unw, (np.ndarray, torch.Tensor)):
             msg = "input unw must be a numpy array or torch tensor"
             logger.error(msg, extra={"unw_type": type(unw).__name__})
@@ -222,19 +281,8 @@ class NSBASSolver:
                 extra={"rows": unw_np.shape[0], "pairs": len(self.pairs)},
             )
             raise ValueError(msg)
-
-        if self.model is None:
-            self._d = torch.as_tensor(
-                unw_np,
-                dtype=self._dtype,
-                device=self._device,
-            )
-        else:
-            self._d = torch.as_tensor(
-                self._restructure_unw(unw_np),
-                dtype=self._dtype,
-                device=self._device,
-            )
+        self._unw = unw_np
+        self._rebuild_system()
 
     @property
     def G(self) -> torch.Tensor:  # noqa: N802
@@ -248,32 +296,38 @@ class NSBASSolver:
             msg = "G must be a numpy array or torch tensor"
             logger.error(msg, extra={"G_type": type(G).__name__})
             raise TypeError(msg)
-        if self.model is not None and G.shape[0] != (
-            len(self.pairs) + len(self.pairs.dates)
-        ):
-            msg = (
-                "G must have the same number of rows as (n_pairs + n_dates)"
-                " if model is not None."
-            )
-            logger.error(
-                msg,
-                extra={
-                    "rows": G.shape[0],
-                    "expected_rows": len(self.pairs) + len(self.pairs.dates),
-                },
-            )
-            raise ValueError(msg)
 
         self._G = torch.as_tensor(G, dtype=self.dtype, device=self.device)
 
     def _make_nsbas_matrix(
         self,
         G_br: np.ndarray,
+        G_tl: np.ndarray,
         gamma: float,
     ) -> np.ndarray:
-        """Make NSBAS matrix by input G_br and gamma."""
+        """Make NSBAS matrix by input G_br, G_tl, and gamma.
+
+        Parameters
+        ----------
+        G_br : np.ndarray
+            The bottom right part of NSBAS matrix, which is the model matrix for
+            time-series model in NSBAS inversion.
+        G_tl : np.ndarray
+            The top left part of NSBAS matrix, which is the conventional SBAS
+            matrix mapping the incremental deformation to interferograms.
+        gamma : float
+            The weight for the bottom part of NSBAS matrix, which is used to
+            balance the data term and the model term in NSBAS inversion.
+            A smaller gamma means more weight on the data term. This value is
+            typically small enough to avoid affecting the data term.
+
+        Returns
+        -------
+        G : np.ndarray
+            The NSBAS matrix for NSBAS inversion.
+
+        """
         G_br = np.asarray(G_br, dtype=np.float32)  # noqa: N806
-        G_tl = self.pairs.sbas_matrix()  # noqa: N806
 
         if len(G_br.shape) == 1:
             G_br = G_br.reshape(-1, 1)  # noqa: N806
@@ -282,8 +336,17 @@ class NSBASSolver:
         n_date = len(self.pairs.dates)
         G_bl = np.tril(np.ones((n_date, n_date - 1), dtype=np.float32), k=-1)  # noqa: N806
         G_b = np.hstack((G_bl, G_br)) * gamma  # noqa: N806
-        G_t = np.hstack((G_tl, np.zeros((len(self._pairs), n_param))))  # noqa: N806
-        return np.vstack((G_t, G_b))
+        if G_tl.ndim == 2:
+            G_t = np.hstack((G_tl, np.zeros((len(self._pairs), n_param))))  # noqa: N806
+            return np.vstack((G_t, G_b))
+        if G_tl.ndim == 3:
+            n_pt = G_tl.shape[0]
+            G_t = np.concat((G_tl, np.zeros((n_pt, len(self._pairs), n_param))), axis=2)  # noqa: N806
+            G_b = np.repeat(G_b[None, :, :], n_pt, axis=0)  # noqa: N806
+            return np.concat((G_t, G_b), axis=1)
+        msg = "G_tl must be either 2D or 3D array"
+        logger.error(msg, extra={"G_tlshape": getattr(G_tl, "shape", None)})
+        raise ValueError(msg)
 
     def _make_sbas_matrix(self) -> np.ndarray:
         """Make SBAS matrix."""
@@ -298,9 +361,79 @@ class NSBASSolver:
             unw = np.vstack((unw, np.zeros((len(self.pairs.dates), unw.shape[1]))))
         return unw
 
+    def _rebuild_system(self) -> None:
+        """Rebuild ``G`` and ``d`` from stored unwrap, coherence, and weights."""
+        g_sbas = self._make_sbas_matrix().astype(np.float64, copy=False)
+        observations = np.array(self._unw, dtype=np.float64, copy=True)
+        if observations.shape[0] != len(self.pairs):
+            msg = "unwrapped interferograms must have the same rows as pairs"
+            logger.error(
+                msg,
+                extra={"rows": observations.shape[0], "pairs": len(self.pairs)},
+            )
+            raise ValueError(msg)
+
+        weighted = self._weight_func != "no"
+        if weighted and self._coh is None:
+            msg = "coherence is required when weight_func is not 'no'"
+            logger.error(msg, extra={"weight_func": self._weight_func})
+            raise ValueError(msg)
+
+        if self._coh is not None:
+            coh_np = np.asarray(self._coh, dtype=np.float64)
+            if coh_np.shape != observations.shape:
+                msg = "coh must have the same shape as unwrapped interferograms"
+                logger.error(
+                    msg,
+                    extra={"coh_shape": coh_np.shape, "unw_shape": observations.shape},
+                )
+                raise ValueError(msg)
+            observations = np.where(
+                coh_np <= self._coh_threshold,
+                np.nan,
+                observations,
+            )
+            if weighted:
+                weight = coherence_to_weight(
+                    coh_np,
+                    weight_func=self._weight_func,
+                    n_looks=self._n_looks,
+                )
+                weight_sqrt = np.sqrt(weight)
+                observations = observations * weight_sqrt
+                g_sbas = (g_sbas[:, :, None] * weight_sqrt[:, None, :]).transpose(
+                    2,
+                    0,
+                    1,
+                )
+
+        if self.model is not None:
+            self.set_G(self._make_nsbas_matrix(self.model.G_br, g_sbas, self._gamma))
+        else:
+            self.set_G(g_sbas)
+
+        if self.model is None:
+            self._d: Tensor = torch.as_tensor(
+                observations,
+                dtype=self._dtype,
+                device=self._device,
+            )
+        else:
+            self._d = torch.as_tensor(
+                self._restructure_unw(observations),
+                dtype=self._dtype,
+                device=self._device,
+            )
+
     @overload
     def inverse(
-        self, return_numpy: bool = True
+        self,
+        return_numpy: bool = True,
+        *,
+        coh: NDArray[np.floating] | torch.Tensor | None = None,
+        coh_threshold: float | None = None,
+        weight_func: WeightFunc | str | None = None,
+        n_looks: int | None = None,
     ) -> tuple[
         np.ndarray,
         np.ndarray,
@@ -309,7 +442,13 @@ class NSBASSolver:
     ]: ...
     @overload
     def inverse(
-        self, return_numpy: bool = False
+        self,
+        return_numpy: bool = False,
+        *,
+        coh: NDArray[np.floating] | torch.Tensor | None = None,
+        coh_threshold: float | None = None,
+        weight_func: WeightFunc | str | None = None,
+        n_looks: int | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -317,7 +456,13 @@ class NSBASSolver:
         torch.Tensor,
     ]: ...
     def inverse(
-        self, return_numpy: bool = True
+        self,
+        return_numpy: bool = True,
+        *,
+        coh: NDArray[np.floating] | torch.Tensor | None = None,
+        coh_threshold: float | None = None,
+        weight_func: WeightFunc | str | None = None,
+        n_looks: int | None = None,
     ) -> (
         tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -328,6 +473,16 @@ class NSBASSolver:
         ----------
         return_numpy : bool, optional
             Return numpy arrays if True, otherwise torch tensors, by default True.
+        coh : ndarray or torch.Tensor, optional
+            Spatial coherence used for masking and weighting. When provided,
+            it replaces the coherence stored at construction time.
+        coh_threshold : float, optional
+            Override the coherence mask threshold.
+        weight_func : {"no", "coh", "fim", "var"}, optional
+            Override the observation-weight definition. A weighted choice
+            without stored coherence raises ``ValueError``.
+        n_looks : int, optional
+            Override the independent-looks value used by ``fim`` and ``var``.
 
         Returns
         -------
@@ -341,6 +496,22 @@ class NSBASSolver:
             residual between time-series model and model result
 
         """
+        rebuild = False
+        if coh is not None:
+            self._coh = _to_numpy(coh)
+            rebuild = True
+        if coh_threshold is not None:
+            self._coh_threshold = coh_threshold
+            rebuild = True
+        if n_looks is not None:
+            self._n_looks = n_looks
+            rebuild = True
+        if weight_func is not None:
+            self._weight_func = normalize_weight_func(weight_func)
+            rebuild = True
+        if rebuild:
+            self._rebuild_system()
+
         n_param = len(self.model.param_names) if self.model is not None else 0
         n_pair = len(self.pairs)
         result = batch_lstsq(
@@ -350,15 +521,25 @@ class NSBASSolver:
             device=self.device,
             verbose=self.verbose,
             tqdm_args={"desc": "  NSBAS inversion"},
-            return_numpy=return_numpy,
+            return_numpy=False,
+        )
+        residual = _calculate_residual(
+            self.G,
+            self.d,
+            result,
+            dtype=self.dtype,
+            device=self.device,
         )
         if return_numpy:
-            residual = self.d.cpu().numpy() - np.dot(self.G.cpu().numpy(), result)
-        else:
-            residual = self.d - torch.matmul(self.G, result)
+            result = result.cpu().numpy()
+            residual = residual.cpu().numpy()
 
-        incs = result[:-n_param, :]
-        params = result[-n_param:, :]
+        if n_param == 0:
+            incs = result
+            params = result[0:0, :]
+        else:
+            incs = result[:-n_param, :]
+            params = result[-n_param:, :]
         residual_pair = residual[:n_pair]
         residual_tsm = residual[n_pair:]
 
@@ -451,33 +632,103 @@ def _get_patch_col(
         eg: [[0, 1234], [1235, 2469],... ]
 
     """
+    if G.ndim not in {2, 3}:
+        msg = "Dimension of G must be 2 or 3"
+        logger.error(msg, extra={"G_shape": getattr(G, "shape", None)})
+        raise ValueError(msg)
+    if d.ndim != 2:
+        msg = "d must be a 2D matrix"
+        logger.error(msg, extra={"d_shape": getattr(d, "shape", None)})
+        raise ValueError(msg)
+    if mem_size <= 0:
+        msg = "mem_size must be positive"
+        logger.error(msg, extra={"mem_size": mem_size})
+        raise ValueError(msg)
+    if safe_factor <= 0:
+        msg = "safe_factor must be positive"
+        logger.error(msg, extra={"safe_factor": safe_factor})
+        raise ValueError(msg)
+
     m, n = d.shape
     r = G.shape[-1]
+    if G.ndim == 3 and G.shape[0] != n:
+        msg = "The first dimension of 3D G must match the number of columns in d"
+        logger.error(msg, extra={"G_shape": G.shape, "d_shape": d.shape})
+        raise ValueError(msg)
 
-    # rough value of n_patch
-    n_patch = int(
-        np.ceil(
-            m
-            * n
-            * r**2
-            * torch.tensor([], dtype=dtype).element_size()
-            * safe_factor
-            / 2**20
-            / mem_size,
-        ),
+    value_size = torch.tensor([], dtype=dtype).element_size()
+    bool_size = torch.tensor([], dtype=torch.bool).element_size()
+    available_bytes = int(mem_size * 2**20 / safe_factor)
+
+    # Per-pixel tensors created in censored_lstsq include d, d_nan, M, x, rhs,
+    # T, and the weighted-G temporary used to build the normal equations.
+    per_col_bytes = (
+        (m + r + r + r**2) * value_size + (2 * m) * bool_size + (m * r) * value_size
     )
+    fixed_bytes = m * r * value_size
+    if G.ndim == 3:
+        per_col_bytes += m * r * value_size
+        fixed_bytes = 0
 
-    # accurate value of n_patch
-    row_spacing = int(np.ceil(n / n_patch))
-    n_patch = int(np.ceil(n / row_spacing))
+    row_spacing = max(1, int((available_bytes - fixed_bytes) // per_col_bytes))
+    row_spacing = min(n, row_spacing)
 
-    patch_col: list[list[int]] = []
-    for i in range(n_patch):
-        patch_col.append([i * row_spacing, (i + 1) * row_spacing])
-        if i == n_patch - 1:
-            patch_col[-1][-1] = n
+    return [[col, min(col + row_spacing, n)] for col in range(0, n, row_spacing)]
 
-    return patch_col
+
+def _calculate_residual(
+    G: torch.Tensor,
+    d: torch.Tensor,
+    result: torch.Tensor,
+    dtype: torch.dtype,
+    device: str | torch.device | None,
+) -> torch.Tensor:
+    """Calculate residuals without expanding 3D model matrices.
+
+    Parameters
+    ----------
+    G : torch.Tensor
+        Model matrix with shape ``(n_im, n_param)`` or
+        ``(n_pt, n_im, n_param)``.
+    d : torch.Tensor
+        Data matrix with shape ``(n_im, n_pt)``.
+    result : torch.Tensor
+        Least-squares result matrix with shape ``(n_param, n_pt)``.
+    dtype : torch.dtype
+        Data type used to estimate patch memory.
+    device : str | torch.device | None
+        Device used for residual calculation.
+
+    Returns
+    -------
+    residual : torch.Tensor
+        Residual matrix with shape ``(n_im, n_pt)``.
+
+    """
+    device = parse_device(device)
+    if G.ndim not in {2, 3}:
+        msg = "Dimension of G must be 2 or 3"
+        logger.error(msg, extra={"G_shape": getattr(G, "shape", None)})
+        raise ValueError(msg)
+    if d.ndim != 2:
+        msg = "d must be a 2D matrix"
+        logger.error(msg, extra={"d_shape": getattr(d, "shape", None)})
+        raise ValueError(msg)
+
+    residual = torch.empty(d.shape, dtype=dtype, device=device)
+    patch_col = _get_patch_col(G, d, device_mem_size(device), dtype)
+    if G.ndim == 2:
+        G_matrix = G.to(device=device, dtype=dtype)  # noqa: N806
+    for c0, c1 in patch_col:
+        result_patch = result[:, c0:c1].to(device=device, dtype=dtype)
+        d_patch = d[:, c0:c1].to(device=device, dtype=dtype)
+        if G.ndim == 2:
+            predicted = torch.matmul(G_matrix, result_patch)
+        else:
+            G_patch = G[c0:c1, :, :].to(device=device, dtype=dtype)  # noqa: N806
+            predicted = torch.einsum("pmr,rp->mp", G_patch, result_patch)
+        residual[:, c0:c1] = d_patch - predicted
+    return residual
 
 
 @overload
@@ -500,8 +751,6 @@ def batch_lstsq(
     tqdm_args: dict | None = None,
     return_numpy: bool = False,
 ) -> torch.Tensor: ...
-
-
 def batch_lstsq(
     G: np.ndarray | torch.Tensor,
     d: np.ndarray | torch.Tensor,
@@ -688,7 +937,7 @@ def calculate_u(
     device: str | torch.device | None = None,
     dtype: torch.dtype = torch.float64,
     return_numpy: bool = True,
-) -> NDArray[np.floating]:
+) -> NDArray[np.floating] | torch.Tensor:
     """Calculate correction matrix u by loop closure phase using least square.
 
     More details see paper:
@@ -741,8 +990,6 @@ def calculate_u(
     mask = loops.pairs.where(loops.diagonal_pairs)
     Cc = C[:, mask]  # noqa: N806
 
-    u = np.zeros_like(unw_phases)
-
     C = torch.as_tensor(C, dtype=dtype, device=device)  # noqa: N806
     unw_phases = torch.as_tensor(unw_phases, dtype=dtype, device=device)
     Cc = torch.as_tensor(Cc, dtype=dtype, device=device)  # noqa: N806
@@ -765,7 +1012,8 @@ def calculate_u(
     else:
         uc = torch.linalg.lstsq(Cc, closure_phase).solution
 
+    u = torch.zeros_like(unw_phases)
     u[mask] = uc / (2 * np.pi)
     if return_numpy:
-        u = u.numpy()
+        u = u.cpu().numpy()
     return u

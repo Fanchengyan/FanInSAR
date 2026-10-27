@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Literal, Sequence
+from typing import TYPE_CHECKING, Literal
 
 import geopandas as gpd
 import pandas as pd
@@ -13,6 +13,7 @@ from rasterio.errors import CRSError
 from faninsar.logging import setup_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from os import PathLike
 
     from matplotlib.axes import Axes
@@ -85,13 +86,15 @@ class Polygons:
 
     def __str__(self) -> str:
         """Return a string representation of the Polygons object."""
-        return f"Polygons(count={len(self)}, crs='{self.crs}')"
+        crs = self.crs.to_string() if self.crs else None
+        return f"Polygons(count={len(self)}, crs='{crs}')"
 
     def __repr__(self) -> str:
         """Return a string representation of the Polygons object."""
         prefix = "Polygons:\n"
         middle = self._gdf.__repr__()
-        suffix = f"\n[count={len(self)}, crs='{self.crs}']"
+        crs = self.crs.to_string() if self.crs else None
+        suffix = f"\n[count={len(self)}, crs='{crs}']"
 
         return f"{prefix}{middle}{suffix}"
 

@@ -32,6 +32,8 @@ class BoundingBox:
 
     """
 
+    _crs: CRS | None = None
+
     def __init__(
         self,
         left: float,
@@ -69,13 +71,15 @@ class BoundingBox:
         self.right = right
         self.bottom = bottom
         self.top = top
-        self._crs = crs
+        if crs is not None:
+            self.set_crs(crs)
 
     def __str__(self) -> str:
         """Return a string representation of the bounding box."""
+        crs = self.crs.to_string() if self.crs else None
         return (
             f"BoundingBox(left={self.left}, bottom={self.bottom}, "
-            f"right={self.right}, top={self.top}, crs={self.crs})"
+            f"right={self.right}, top={self.top}, crs={crs})"
         )
 
     def __repr__(self) -> str:

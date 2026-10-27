@@ -10,9 +10,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-from typing_extensions import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 # Optional imports with fallbacks
 try:
